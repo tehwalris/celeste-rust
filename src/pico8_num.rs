@@ -1,16 +1,19 @@
 // WARNING All the functions in this module are not really tested against pico8.
 
-use std::ops::{Add, Div, Mul, Sub};
+use std::{
+    fmt,
+    ops::{Add, Div, Mul, Sub},
+};
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Pico8Num(i32);
 
 impl Pico8Num {
-    pub fn from_i16(v: i16) -> Self {
+    pub const fn from_i16(v: i16) -> Self {
         Pico8Num((v as i32) << 16)
     }
 
-    pub fn as_i16(&self) -> Option<i16> {
+    pub const fn as_i16(&self) -> Option<i16> {
         if self.0 & 0xffff == 0 {
             Some((self.0 >> 16) as i16)
         } else {
@@ -18,12 +21,39 @@ impl Pico8Num {
         }
     }
 
-    pub fn from_raw_u32(v: u32) -> Self {
+    pub const fn from_raw_u32(v: u32) -> Self {
         Pico8Num(v as i32)
     }
 
-    pub fn as_raw_u32(&self) -> u32 {
+    pub const fn as_raw_u32(&self) -> u32 {
         self.0 as u32
+    }
+
+    pub const fn const_mul(&self, rhs: &Self) -> Self {
+        let high = (self.0 as i64).wrapping_mul(rhs.0 as i64);
+        let low = high >> 16;
+        Pico8Num(low as i32)
+    }
+}
+
+pub mod constants {
+    use super::Pico8Num;
+
+    pub const PICO8_NUM_0_6: Pico8Num = Pico8Num(0x0000_9999);
+    pub const PICO8_NUM_0_15: Pico8Num = Pico8Num(0x0000_2666);
+    pub const PICO8_NUM_0_4: Pico8Num = Pico8Num(0x0000_6666);
+    pub const PICO8_NUM_0_21: Pico8Num = Pico8Num(0x0000_35C2);
+    pub const PICO8_NUM_0_5: Pico8Num = Pico8Num(0x0000_8000);
+    pub const PICO8_NUM_0_70710678118: Pico8Num = Pico8Num(0x0000_B504);
+    pub const PICO8_NUM_1_5: Pico8Num = Pico8Num(0x0001_8000);
+    pub const PICO8_NUM_0_75: Pico8Num = Pico8Num(0x0000_C000);
+}
+
+impl fmt::Debug for Pico8Num {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Pico8Num")
+            .field(&format!("{:#06x}", self.0))
+            .finish()
     }
 }
 
@@ -47,9 +77,7 @@ impl Mul for Pico8Num {
     type Output = Self;
 
     fn mul(self, rhs: Self) -> Self::Output {
-        let high = (self.0 as i64).wrapping_mul(rhs.0 as i64);
-        let low = high >> 16;
-        Pico8Num(low as i32)
+        self.const_mul(&rhs)
     }
 }
 
@@ -63,7 +91,7 @@ impl Div for Pico8Num {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use crate::pico8_num::Pico8Num;
 
     #[test]
