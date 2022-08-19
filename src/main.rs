@@ -1,7 +1,7 @@
 extern crate bv;
 
 mod pico8_num;
-mod player;
+mod player_flags;
 
 fn main() {
     println!("Hello, world!");
