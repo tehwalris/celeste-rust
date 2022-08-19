@@ -2,7 +2,7 @@
 
 use std::{
     fmt,
-    ops::{Add, Div, Mul, Sub},
+    ops::{Add, AddAssign, Div, Mul, Neg, Sub},
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -10,7 +10,7 @@ pub struct Pico8Num(i32);
 
 impl Pico8Num {
     pub const fn from_i16(v: i16) -> Self {
-        Pico8Num((v as i32) << 16)
+        Self((v as i32) << 16)
     }
 
     pub const fn as_i16(&self) -> Option<i16> {
@@ -28,7 +28,11 @@ impl Pico8Num {
     pub const fn const_mul(&self, rhs: &Self) -> Self {
         let high = (self.0 as i64).wrapping_mul(rhs.0 as i64);
         let low = high >> 16;
-        Pico8Num(low as i32)
+        Self(low as i32)
+    }
+
+    pub const fn abs(self) -> Self {
+        Self(self.0.abs())
     }
 }
 
@@ -63,7 +67,7 @@ impl Add for Pico8Num {
     type Output = Self;
 
     fn add(self, rhs: Self) -> Self::Output {
-        Pico8Num(self.0.wrapping_add(rhs.0))
+        Self(self.0.wrapping_add(rhs.0))
     }
 }
 
@@ -71,7 +75,7 @@ impl Sub for Pico8Num {
     type Output = Self;
 
     fn sub(self, rhs: Self) -> Self::Output {
-        Pico8Num(self.0.wrapping_sub(rhs.0))
+        Self(self.0.wrapping_sub(rhs.0))
     }
 }
 
@@ -88,7 +92,15 @@ impl Div for Pico8Num {
 
     fn div(self, rhs: Self) -> Self::Output {
         let self_high = (self.0 as i64) << 16;
-        Pico8Num((self_high.wrapping_div(rhs.0 as i64)) as i32)
+        Self((self_high.wrapping_div(rhs.0 as i64)) as i32)
+    }
+}
+
+impl Neg for Pico8Num {
+    type Output = Self;
+
+    fn neg(self) -> Self::Output {
+        Self(-self.0)
     }
 }
 
