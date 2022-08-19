@@ -1,5 +1,3 @@
-use std::ops::Index;
-
 use crate::pico8_num::constants;
 
 use super::pico8_num::Pico8Num;
@@ -28,7 +26,7 @@ struct DashCombo {
     accel_y: Pico8Num,
 }
 
-const valid_dash_combos: [DashCombo; 8] = [
+const VALID_DASH_COMBOS: [DashCombo; 8] = [
     // input == -1 && v_input == -1
     // spd_x < 0 && spd_y < 0
     DashCombo {
@@ -104,7 +102,7 @@ const valid_dash_combos: [DashCombo; 8] = [
 const MAX_GRACE: i16 = 6;
 const MAX_DJUMP: i16 = 1;
 const MAX_DASH_TIME: i16 = 4;
-const MAX_DASH_I: i16 = ((MAX_DASH_TIME as usize) * valid_dash_combos.len()) as i16;
+const MAX_DASH_I: i16 = ((MAX_DASH_TIME as usize) * VALID_DASH_COMBOS.len()) as i16;
 
 impl PlayerFlags {
     fn adjust_before_compress(&mut self) {
@@ -141,7 +139,7 @@ impl PlayerFlags {
                 accel_x: self.dash_accel_x,
                 accel_y: self.dash_accel_y,
             };
-            valid_dash_combos.iter().position(|c| c == &dash_combo)
+            VALID_DASH_COMBOS.iter().position(|c| c == &dash_combo)
         };
         if dash_time == 0
             && (self.dash_target_x.as_i16() != Some(0)
@@ -157,7 +155,7 @@ impl PlayerFlags {
             0
         } else {
             i16::try_from(
-                1 + (dash_time as usize - 1) * valid_dash_combos.len() + dash_combo_index.unwrap(),
+                1 + (dash_time as usize - 1) * VALID_DASH_COMBOS.len() + dash_combo_index.unwrap(),
             )
             .unwrap()
         };
@@ -226,9 +224,9 @@ impl CompressedPlayerFlags {
             (0, None)
         } else {
             let temp = usize::try_from(dash_i).unwrap() - 1;
-            let dash_combo_index = temp % valid_dash_combos.len();
-            let dash_time = temp / valid_dash_combos.len() + 1;
-            (dash_time, Some(&valid_dash_combos[dash_combo_index]))
+            let dash_combo_index = temp % VALID_DASH_COMBOS.len();
+            let dash_time = temp / VALID_DASH_COMBOS.len() + 1;
+            (dash_time, Some(&VALID_DASH_COMBOS[dash_combo_index]))
         };
 
         Some(PlayerFlags {

@@ -21,10 +21,6 @@ impl Pico8Num {
         }
     }
 
-    pub const fn from_raw_u32(v: u32) -> Self {
-        Pico8Num(v as i32)
-    }
-
     pub const fn as_raw_u32(&self) -> u32 {
         self.0 as u32
     }
