@@ -32,6 +32,12 @@ impl Pico8Num {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pico8Vec2 {
+    pub x: Pico8Num,
+    pub y: Pico8Num,
+}
+
 pub mod constants {
     use super::Pico8Num;
 

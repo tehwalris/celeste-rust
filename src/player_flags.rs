@@ -1,4 +1,4 @@
-use crate::pico8_num::constants;
+use crate::pico8_num::{constants, Pico8Vec2};
 
 use super::pico8_num::Pico8Num;
 
@@ -20,44 +20,58 @@ pub struct CompressedPlayerFlags(usize);
 
 #[derive(PartialEq, Eq)]
 struct DashCombo {
-    target_x: Pico8Num,
-    target_y: Pico8Num,
-    accel_x: Pico8Num,
-    accel_y: Pico8Num,
+    target: Pico8Vec2,
+    accel: Pico8Vec2,
 }
 
 const VALID_DASH_COMBOS: [DashCombo; 8] = [
     // input == -1 && v_input == -1
     // spd_x < 0 && spd_y < 0
     DashCombo {
-        target_x: Pico8Num::from_i16(-2),
-        target_y: Pico8Num::from_i16(-2).const_mul(&constants::PICO8_NUM_0_75),
-        accel_x: constants::PICO8_NUM_1_5.const_mul(&constants::PICO8_NUM_0_70710678118),
-        accel_y: constants::PICO8_NUM_1_5.const_mul(&constants::PICO8_NUM_0_70710678118),
+        target: Pico8Vec2 {
+            x: Pico8Num::from_i16(-2),
+            y: Pico8Num::from_i16(-2).const_mul(&constants::PICO8_NUM_0_75),
+        },
+        accel: Pico8Vec2 {
+            x: constants::PICO8_NUM_1_5.const_mul(&constants::PICO8_NUM_0_70710678118),
+            y: constants::PICO8_NUM_1_5.const_mul(&constants::PICO8_NUM_0_70710678118),
+        },
     },
     // input == -1 && v_input == 0
     // spd_x < 0 && spd_y == 0
     DashCombo {
-        target_x: Pico8Num::from_i16(-2),
-        target_y: Pico8Num::from_i16(0),
-        accel_x: constants::PICO8_NUM_1_5,
-        accel_y: constants::PICO8_NUM_1_5.const_mul(&constants::PICO8_NUM_0_70710678118),
+        target: Pico8Vec2 {
+            x: Pico8Num::from_i16(-2),
+            y: Pico8Num::from_i16(0),
+        },
+        accel: Pico8Vec2 {
+            x: constants::PICO8_NUM_1_5,
+            y: constants::PICO8_NUM_1_5.const_mul(&constants::PICO8_NUM_0_70710678118),
+        },
     },
     // input == -1 && v_input == 1
     // spd_x < 0, spd_y > 0
     DashCombo {
-        target_x: Pico8Num::from_i16(-2),
-        target_y: Pico8Num::from_i16(2),
-        accel_x: constants::PICO8_NUM_1_5.const_mul(&constants::PICO8_NUM_0_70710678118),
-        accel_y: constants::PICO8_NUM_1_5.const_mul(&constants::PICO8_NUM_0_70710678118),
+        target: Pico8Vec2 {
+            x: Pico8Num::from_i16(-2),
+            y: Pico8Num::from_i16(2),
+        },
+        accel: Pico8Vec2 {
+            x: constants::PICO8_NUM_1_5.const_mul(&constants::PICO8_NUM_0_70710678118),
+            y: constants::PICO8_NUM_1_5.const_mul(&constants::PICO8_NUM_0_70710678118),
+        },
     },
     // input == 0 && v_input == -1
     // spd_x == 0 && spd_y < 0
     DashCombo {
-        target_x: Pico8Num::from_i16(0),
-        target_y: Pico8Num::from_i16(-2).const_mul(&constants::PICO8_NUM_0_75),
-        accel_x: constants::PICO8_NUM_1_5.const_mul(&constants::PICO8_NUM_0_70710678118),
-        accel_y: constants::PICO8_NUM_1_5,
+        target: Pico8Vec2 {
+            x: Pico8Num::from_i16(0),
+            y: Pico8Num::from_i16(-2).const_mul(&constants::PICO8_NUM_0_75),
+        },
+        accel: Pico8Vec2 {
+            x: constants::PICO8_NUM_1_5.const_mul(&constants::PICO8_NUM_0_70710678118),
+            y: constants::PICO8_NUM_1_5,
+        },
     },
     // input == 0 && v_input == 0 && this.flip.x
     // spd_x < 0 && spd_y == 0
@@ -68,34 +82,50 @@ const VALID_DASH_COMBOS: [DashCombo; 8] = [
     // input == 0 && v_input == 1
     // spd_x == 0 && spd_y > 0
     DashCombo {
-        target_x: Pico8Num::from_i16(0),
-        target_y: Pico8Num::from_i16(2),
-        accel_x: constants::PICO8_NUM_1_5.const_mul(&constants::PICO8_NUM_0_70710678118),
-        accel_y: constants::PICO8_NUM_1_5,
+        target: Pico8Vec2 {
+            x: Pico8Num::from_i16(0),
+            y: Pico8Num::from_i16(2),
+        },
+        accel: Pico8Vec2 {
+            x: constants::PICO8_NUM_1_5.const_mul(&constants::PICO8_NUM_0_70710678118),
+            y: constants::PICO8_NUM_1_5,
+        },
     },
     // input == 1 && v_input == -1
     // spd_x > 0 && spd_y < 0
     DashCombo {
-        target_x: Pico8Num::from_i16(2),
-        target_y: Pico8Num::from_i16(-2).const_mul(&constants::PICO8_NUM_0_75),
-        accel_x: constants::PICO8_NUM_1_5.const_mul(&constants::PICO8_NUM_0_70710678118),
-        accel_y: constants::PICO8_NUM_1_5.const_mul(&constants::PICO8_NUM_0_70710678118),
+        target: Pico8Vec2 {
+            x: Pico8Num::from_i16(2),
+            y: Pico8Num::from_i16(-2).const_mul(&constants::PICO8_NUM_0_75),
+        },
+        accel: Pico8Vec2 {
+            x: constants::PICO8_NUM_1_5.const_mul(&constants::PICO8_NUM_0_70710678118),
+            y: constants::PICO8_NUM_1_5.const_mul(&constants::PICO8_NUM_0_70710678118),
+        },
     },
     // input == 1 && v_input == 0
     // spd_x > 0 && spd_y == 0
     DashCombo {
-        target_x: Pico8Num::from_i16(2),
-        target_y: Pico8Num::from_i16(0),
-        accel_x: constants::PICO8_NUM_1_5,
-        accel_y: constants::PICO8_NUM_1_5.const_mul(&constants::PICO8_NUM_0_70710678118),
+        target: Pico8Vec2 {
+            x: Pico8Num::from_i16(2),
+            y: Pico8Num::from_i16(0),
+        },
+        accel: Pico8Vec2 {
+            x: constants::PICO8_NUM_1_5,
+            y: constants::PICO8_NUM_1_5.const_mul(&constants::PICO8_NUM_0_70710678118),
+        },
     },
     // input == 1 && v_input == 1
     // spd_x > 0 && spd_y > 0
     DashCombo {
-        target_x: Pico8Num::from_i16(2),
-        target_y: Pico8Num::from_i16(2),
-        accel_x: constants::PICO8_NUM_1_5.const_mul(&constants::PICO8_NUM_0_70710678118),
-        accel_y: constants::PICO8_NUM_1_5.const_mul(&constants::PICO8_NUM_0_70710678118),
+        target: Pico8Vec2 {
+            x: Pico8Num::from_i16(2),
+            y: Pico8Num::from_i16(2),
+        },
+        accel: Pico8Vec2 {
+            x: constants::PICO8_NUM_1_5.const_mul(&constants::PICO8_NUM_0_70710678118),
+            y: constants::PICO8_NUM_1_5.const_mul(&constants::PICO8_NUM_0_70710678118),
+        },
     },
 ];
 
@@ -134,10 +164,14 @@ impl PlayerFlags {
             None
         } else {
             let dash_combo = DashCombo {
-                target_x: self.dash_target_x,
-                target_y: self.dash_target_y,
-                accel_x: self.dash_accel_x,
-                accel_y: self.dash_accel_y,
+                target: Pico8Vec2 {
+                    x: self.dash_target_x,
+                    y: self.dash_target_y,
+                },
+                accel: Pico8Vec2 {
+                    x: self.dash_accel_x,
+                    y: self.dash_accel_y,
+                },
             };
             VALID_DASH_COMBOS.iter().position(|c| c == &dash_combo)
         };
@@ -236,16 +270,16 @@ impl CompressedPlayerFlags {
             djump: Pico8Num::from_i16(djump),
             dash_time: Pico8Num::from_i16(i16::try_from(dash_time).unwrap()),
             dash_target_x: dash_combo
-                .map(|v| v.target_x)
+                .map(|v| v.target.x)
                 .unwrap_or(Pico8Num::from_i16(0)),
             dash_target_y: dash_combo
-                .map(|v| v.target_y)
+                .map(|v| v.target.y)
                 .unwrap_or(Pico8Num::from_i16(0)),
             dash_accel_x: dash_combo
-                .map(|v| v.accel_x)
+                .map(|v| v.accel.x)
                 .unwrap_or(Pico8Num::from_i16(0)),
             dash_accel_y: dash_combo
-                .map(|v| v.accel_y)
+                .map(|v| v.accel.y)
                 .unwrap_or(Pico8Num::from_i16(0)),
         })
     }
