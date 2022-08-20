@@ -6,7 +6,7 @@ use std::{
     ops::{Add, AddAssign, Div, Mul, Neg, Rem, Sub},
 };
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Pico8Num(i32);
 
 impl Pico8Num {
@@ -50,7 +50,7 @@ pub const fn int(v: i16) -> Pico8Num {
     Pico8Num::from_i16(v)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Pico8Vec2 {
     pub x: Pico8Num,
     pub y: Pico8Num,

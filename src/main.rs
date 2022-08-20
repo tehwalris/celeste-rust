@@ -12,6 +12,7 @@ mod game;
 mod pico8_num;
 mod player_flags;
 mod room;
+mod state_table;
 mod tas;
 
 fn main() {
