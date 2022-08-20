@@ -15,6 +15,7 @@ pub struct PlayerFlags {
     pub p_jump: bool,
     pub p_dash: bool,
     pub grace: Pico8Num,
+    pub jbuffer: Pico8Num, // TODO maybe it's possible to remove this
     pub djump: Pico8Num,
     pub dash_time: Pico8Num,
     pub dash_target: Pico8Vec2,
@@ -137,6 +138,7 @@ const VALID_DASH_COMBOS: [DashCombo; 8] = [
 
 const MAX_FREEZE: i16 = 2;
 const MAX_GRACE: i16 = 6;
+const MAX_JBUFFER: i16 = 4;
 const MAX_DJUMP: i16 = 1;
 const MAX_DASH_TIME: i16 = 4;
 const MAX_DASH_I: i16 = ((MAX_DASH_TIME as usize) * VALID_DASH_COMBOS.len()) as i16;
@@ -149,6 +151,7 @@ impl PlayerFlags {
             p_jump: false,
             p_dash: false,
             grace: int(0),
+            jbuffer: int(0),
             djump: max_djump,
             dash_time: int(0),
             dash_target: Pico8Vec2::zero(),
@@ -173,6 +176,11 @@ impl PlayerFlags {
 
         let grace = self.grace.as_i16()?;
         if grace < 0 || grace > MAX_GRACE {
+            return None;
+        }
+
+        let jbuffer = self.jbuffer.as_i16()?;
+        if jbuffer < 0 || jbuffer > MAX_JBUFFER {
             return None;
         }
 
@@ -222,12 +230,13 @@ impl PlayerFlags {
         assert!(dash_i >= 0 && dash_i <= MAX_DASH_I);
 
         let mut compressed: usize = 0;
-        let parts: [(i16, i16); 7] = [
+        let parts: [(i16, i16); 8] = [
             (freeze, MAX_FREEZE),
             (self.flip_x as i16, 1),
             (self.p_jump as i16, 1),
             (self.p_dash as i16, 1),
             (grace, MAX_GRACE),
+            (jbuffer, MAX_JBUFFER),
             (djump, MAX_DJUMP),
             (dash_i, MAX_DASH_I),
         ];
@@ -242,7 +251,7 @@ impl PlayerFlags {
 }
 
 impl CompressedPlayerFlags {
-    pub const VALID_COUNT: usize = 11088;
+    pub const VALID_COUNT: usize = 55440;
 
     pub fn try_from_raw(compressed: usize) -> Option<CompressedPlayerFlags> {
         if Self::try_decompress(compressed).is_some() {
@@ -263,14 +272,16 @@ impl CompressedPlayerFlags {
         let mut p_jump = 0;
         let mut p_dash = 0;
         let mut grace = 0;
+        let mut jbuffer = 0;
         let mut djump = 0;
         let mut dash_i = 0;
-        let parts: [(&mut i16, i16); 7] = [
+        let parts: [(&mut i16, i16); 8] = [
             (&mut freeze, MAX_FREEZE),
             (&mut flip_x, 1),
             (&mut p_jump, 1),
             (&mut p_dash, 1),
             (&mut grace, MAX_GRACE),
+            (&mut jbuffer, MAX_JBUFFER),
             (&mut djump, MAX_DJUMP),
             (&mut dash_i, MAX_DASH_I),
         ];
@@ -305,6 +316,7 @@ impl CompressedPlayerFlags {
             p_jump: p_jump != 0,
             p_dash: p_dash != 0,
             grace: Pico8Num::from_i16(grace),
+            jbuffer: Pico8Num::from_i16(jbuffer),
             djump: Pico8Num::from_i16(djump),
             dash_time: Pico8Num::from_i16(i16::try_from(dash_time).unwrap()),
             dash_target: dash_combo

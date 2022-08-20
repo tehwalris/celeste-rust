@@ -6,6 +6,7 @@
     "djump",
     "fget",
     "hitbox",
+    "jbuffer",
     "maxfall",
     "maxrun",
     "Pico"

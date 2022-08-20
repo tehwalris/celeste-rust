@@ -166,6 +166,12 @@ fn run_player_update(
     let jump = input_flags.jump && !p.p_jump;
     p.p_jump = input_flags.jump;
 
+    if jump {
+        p.jbuffer = int(4);
+    } else if p.jbuffer > int(0) {
+        p.jbuffer = p.jbuffer - int(1);
+    }
+
     let dash = input_flags.dash && !p.p_dash;
     p.p_dash = input_flags.dash;
 
@@ -218,8 +224,9 @@ fn run_player_update(
             spd.y = appr(spd.y, maxfall, gravity);
         }
 
-        if jump {
+        if p.jbuffer > int(0) {
             if p.grace > int(0) {
+                p.jbuffer = int(0);
                 p.grace = int(0);
                 spd.y = int(-2);
             } else {
@@ -231,6 +238,7 @@ fn run_player_update(
                     0
                 });
                 if wall_dir != int(0) {
+                    p.jbuffer = int(0);
                     spd.y = int(-2);
                     spd.x = -wall_dir * (maxrun + int(1));
                 }
@@ -413,6 +421,7 @@ mod tests {
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tas/baseline/TAS2.tas"),
         )?;
         let tas = parse_tas_string(&tas)?;
+        let required_frames = 75;
 
         let update = |player_pos_spd: &mut PlayerPosSpd,
                       player_flags: &mut PlayerFlags,
@@ -479,8 +488,10 @@ mod tests {
 
         let mut debug_positions = Vec::new();
 
+        let mut did_ever_win = false;
+
         // TODO double check that the order is: init, update, draw, update, draw, ...
-        for input in tas.into_iter() {
+        for (i, input) in tas.iter().enumerate() {
             debug_positions.push((
                 player_pos_spd.pos.x.flr().as_i16().unwrap(),
                 player_pos_spd.pos.y.flr().as_i16().unwrap(),
@@ -488,8 +499,9 @@ mod tests {
 
             println!("pos {:?}", player_pos_spd.pos);
 
-            let did_win = update(&mut player_pos_spd, &mut player_flags, &mut rem, &input)?;
-            assert!(!did_win);
+            let did_win = update(&mut player_pos_spd, &mut player_flags, &mut rem, input)?;
+            did_ever_win = did_ever_win || did_win;
+            assert!(did_win == (i >= required_frames));
 
             println!("draw");
             draw(&mut player_pos_spd, &player_flags)?;
@@ -497,9 +509,11 @@ mod tests {
             println!("");
         }
 
-        // for (x, y) in debug_positions {
-        //     println!("{},{}", x, y);
-        // }
+        assert!(did_ever_win);
+
+        for (x, y) in debug_positions {
+            println!("{},{}", x, y);
+        }
 
         Ok(())
     }
