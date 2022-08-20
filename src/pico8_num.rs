@@ -1,8 +1,9 @@
 // WARNING All the functions in this module are not really tested against pico8.
 
+use anyhow::Result;
 use std::{
     fmt,
-    ops::{Add, AddAssign, Div, Mul, Neg, Sub},
+    ops::{Add, AddAssign, Div, Mul, Neg, Rem, Sub},
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -21,6 +22,11 @@ impl Pico8Num {
         }
     }
 
+    pub fn as_i16_or_err(&self) -> Result<i16> {
+        self.as_i16()
+            .ok_or(anyhow!("got {:?}, expected integer", self))
+    }
+
     pub const fn as_raw_u32(&self) -> u32 {
         self.0 as u32
     }
@@ -34,6 +40,14 @@ impl Pico8Num {
     pub const fn abs(self) -> Self {
         Self(self.0.abs())
     }
+
+    pub const fn flr(self) -> Self {
+        Self::from_i16((self.0 >> 16) as i16)
+    }
+}
+
+pub fn int(v: i16) -> Pico8Num {
+    Pico8Num::from_i16(v)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +107,19 @@ impl Div for Pico8Num {
     fn div(self, rhs: Self) -> Self::Output {
         let self_high = (self.0 as i64) << 16;
         Self((self_high.wrapping_div(rhs.0 as i64)) as i32)
+    }
+}
+
+impl Rem for Pico8Num {
+    type Output = Self;
+
+    fn rem(self, rhs: Self) -> Self::Output {
+        let lhs = self.as_i16().unwrap();
+        let rhs = rhs.as_i16().unwrap();
+        if lhs < 0 || rhs <= 0 {
+            panic!("Pico8Num::Rem not implemented for negative/non-positive numbers");
+        }
+        Self::from_i16(lhs % rhs)
     }
 }
 

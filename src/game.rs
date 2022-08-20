@@ -1,6 +1,6 @@
 use std::cmp;
 
-use crate::pico8_num::{constants, Pico8Num, Pico8Vec2};
+use crate::pico8_num::{constants, int, Pico8Num, Pico8Vec2};
 
 use super::player_flags::PlayerFlags;
 
@@ -31,10 +31,6 @@ pub enum PlayerUpdateResult {
         spd: Pico8Vec2,
     },
     Win,
-}
-
-fn int(v: i16) -> Pico8Num {
-    Pico8Num::from_i16(v)
 }
 
 fn appr(val: Pico8Num, target: Pico8Num, amount: Pico8Num) -> Pico8Num {

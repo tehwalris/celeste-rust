@@ -4,6 +4,7 @@
     "appr",
     "deccel",
     "djump",
+    "fget",
     "maxfall",
     "maxrun",
     "Pico"

@@ -11,6 +11,7 @@ mod cart_data;
 mod game;
 mod pico8_num;
 mod player_flags;
+mod room;
 
 fn main() {
     println!("Hello, world!");
