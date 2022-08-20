@@ -3,8 +3,8 @@ use crate::player_flags::PlayerFlags;
 use crate::room::Room;
 use anyhow::Result;
 use std::cmp;
-use std::path::is_separator;
 
+#[derive(Debug, PartialEq, Eq)]
 pub struct InputFlags {
     pub left: bool,
     pub right: bool,
@@ -14,6 +14,13 @@ pub struct InputFlags {
     pub dash: bool,
 }
 
+#[derive(Clone)]
+pub struct PlayerPosSpd {
+    pub pos: Pico8Vec2,
+    pub spd: Pico8Vec2,
+}
+
+#[derive(Debug)]
 pub struct PosSpdFlags {
     pub is_solid_1_0: bool,
     pub is_solid_neg_1_0: bool,
@@ -53,6 +60,11 @@ pub struct PlayerDrawResult {
     spd: Pico8Vec2,
 }
 
+pub struct MoveConcreteResult {
+    pos_spd: PlayerPosSpd,
+    rem: Pico8Vec2,
+}
+
 fn clamp(val: Pico8Num, a: Pico8Num, b: Pico8Num) -> Pico8Num {
     cmp::max(a, cmp::min(b, val))
 }
@@ -75,17 +87,15 @@ fn sign(v: Pico8Num) -> Pico8Num {
     })
 }
 
-impl PosSpdFlags {
-    pub fn new(pos: &Pico8Vec2, spd: &Pico8Vec2, room: &Room) -> Result<PosSpdFlags> {
+impl PlayerPosSpd {
+    pub fn flags(&self, room: &Room) -> Result<PosSpdFlags> {
         let is_solid = |ox: i16, oy: i16| {
-            Self::is_solid(
+            self.is_solid(
                 &Pico8Vec2 {
                     x: int(ox),
                     y: int(oy),
                 },
                 &room,
-                pos,
-                &PLAYER_HITBOX,
             )
         };
         Ok(PosSpdFlags {
@@ -94,31 +104,26 @@ impl PosSpdFlags {
             is_solid_0_1: is_solid(0, 1)?,
             is_solid_neg_3_0: is_solid(-3, 0)?,
             is_solid_3_0: is_solid(3, 0)?,
-            y_more_than_128: pos.y > int(128),
-            y_less_than_neg_4: pos.y < int(-4),
+            y_more_than_128: self.pos.y > int(128),
+            y_less_than_neg_4: self.pos.y < int(-4),
             spikes_at: room.spikes_at(
-                pos.x + PLAYER_HITBOX.x,
-                pos.y + PLAYER_HITBOX.y,
+                self.pos.x + PLAYER_HITBOX.x,
+                self.pos.y + PLAYER_HITBOX.y,
                 PLAYER_HITBOX.w,
                 PLAYER_HITBOX.h,
-                spd,
+                &self.spd,
             )?,
         })
     }
 
-    fn is_solid(
-        offset: &Pico8Vec2,
-        room: &Room,
-        pos: &Pico8Vec2,
-        hitbox: &Pico8Hitbox,
-    ) -> Result<bool> {
+    fn is_solid(&self, offset: &Pico8Vec2, room: &Room) -> Result<bool> {
         // TODO This is only checking against the room, because there are no
         // active objects except the player at the moment.
         room.solid_at(
-            pos.x + hitbox.x + offset.x,
-            pos.y + hitbox.y + offset.y,
-            hitbox.w,
-            hitbox.h,
+            self.pos.x + PLAYER_HITBOX.x + offset.x,
+            self.pos.y + PLAYER_HITBOX.y + offset.y,
+            PLAYER_HITBOX.w,
+            PLAYER_HITBOX.h,
         )
     }
 }
@@ -300,4 +305,202 @@ pub fn run_player_draw(mut pos: Pico8Vec2, mut spd: Pico8Vec2) -> PlayerDrawResu
     PlayerDrawResult { pos, spd }
 }
 
-pub fn run_move(mut ox: )
+pub fn run_move_concrete(
+    mut p: PlayerPosSpd,
+    mut rem: Pico8Vec2,
+    room: &Room,
+) -> Result<(PlayerPosSpd, Pico8Vec2)> {
+    // TODO Some objects are not solid, but player is and that's the only object
+    // that we currently have.
+    let solids = true;
+
+    rem.x = rem.x + p.spd.x;
+    let amount = (rem.x + constants::PICO8_NUM_0_5).flr();
+    rem.x = rem.x - amount;
+    move_x(&mut p, &mut rem, room, solids, amount, int(0))?;
+
+    rem.y = rem.y + p.spd.y;
+    let amount = (rem.y + constants::PICO8_NUM_0_5).flr();
+    rem.y = rem.y - amount;
+    move_y(&mut p, &mut rem, room, solids, amount)?;
+
+    Ok((p, rem))
+}
+
+fn move_x(
+    p: &mut PlayerPosSpd,
+    rem: &mut Pico8Vec2,
+    room: &Room,
+    solids: bool,
+    amount: Pico8Num,
+    start: Pico8Num,
+) -> Result<()> {
+    if solids {
+        let step = sign(amount);
+        for _ in start.as_i16_or_err()?..=amount.abs().as_i16_or_err()? {
+            if !p.is_solid(&Pico8Vec2 { x: step, y: int(0) }, room)? {
+                p.pos.x = p.pos.x + step;
+            } else {
+                p.spd.x = int(0);
+                rem.x = int(0);
+                break;
+            }
+        }
+    } else {
+        p.pos.x = p.pos.x + amount;
+    }
+    Ok(())
+}
+
+fn move_y(
+    p: &mut PlayerPosSpd,
+    rem: &mut Pico8Vec2,
+    room: &Room,
+    solids: bool,
+    amount: Pico8Num,
+) -> Result<()> {
+    if solids {
+        let step = sign(amount);
+        for _ in 0..=amount.abs().as_i16_or_err()? {
+            if !p.is_solid(&Pico8Vec2 { x: int(0), y: step }, room)? {
+                p.pos.y = p.pos.y + step;
+            } else {
+                p.spd.y = int(0);
+                rem.y = int(0);
+                break;
+            }
+        }
+    } else {
+        p.pos.y = p.pos.y + amount;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+    use std::{fs, path::PathBuf};
+
+    use crate::{
+        cart_data::CartData,
+        game::{
+            run_move_concrete, run_player_draw, run_player_update, InputFlags, PlayerPosSpd,
+            PlayerUpdateResult,
+        },
+        pico8_num::{int, Pico8Vec2},
+        player_flags::{self, PlayerFlags},
+        room::Room,
+        tas::parse_tas_string,
+    };
+
+    fn load_cart_data() -> Result<CartData> {
+        CartData::load(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("cart"))
+    }
+
+    #[test]
+    fn test_concrete_game() -> Result<()> {
+        let cart_data = load_cart_data()?;
+        let room = Room::from_position(&cart_data, int(1), int(0))?;
+
+        let mut player_pos_spd = PlayerPosSpd {
+            pos: room.spawn_pos(),
+            spd: Pico8Vec2::zero(),
+        };
+        let mut player_flags = PlayerFlags::spawn(int(0), int(1));
+        let mut rem = Pico8Vec2::zero();
+
+        let tas = fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tas/baseline/TAS2.tas"),
+        )?;
+        let tas = parse_tas_string(&tas)?;
+
+        let update = |player_pos_spd: &mut PlayerPosSpd,
+                      player_flags: &mut PlayerFlags,
+                      rem: &mut Pico8Vec2,
+                      input: &InputFlags|
+         -> Result<bool> {
+            if player_flags.freeze > int(0) {
+                player_flags.freeze = player_flags.freeze - int(1);
+                return Ok(false);
+            }
+
+            println!("run_move_concrete");
+            if player_pos_spd.spd.x != int(0) || player_pos_spd.spd.y != int(0) {
+                (*player_pos_spd, *rem) =
+                    run_move_concrete(player_pos_spd.clone(), rem.clone(), &room)?;
+            }
+
+            println!("pos {:?}", player_pos_spd.pos);
+            println!("spd {:?}", player_pos_spd.spd);
+
+            println!("pos_spd_flags {:?}", player_pos_spd.flags(&room));
+            println!("input {:?}", input);
+
+            println!("run_player_update");
+            let player_update_result = run_player_update(
+                player_flags.clone(),
+                &player_pos_spd.flags(&room)?,
+                input,
+                player_pos_spd.spd.clone(),
+            );
+            match player_update_result {
+                PlayerUpdateResult::Die => panic!("unexpected death"),
+                PlayerUpdateResult::KeepPlaying {
+                    player_flags: new_player_flags,
+                    spd: new_spd,
+                } => {
+                    *player_flags = new_player_flags;
+                    player_pos_spd.spd = new_spd;
+
+                    println!("flags {:?}", player_flags);
+                    println!("spd {:?}", player_pos_spd.spd);
+
+                    Ok(false)
+                }
+                PlayerUpdateResult::Win => Ok(true),
+            }
+        };
+
+        let draw = |player_pos_spd: &mut PlayerPosSpd, player_flags: &PlayerFlags| -> Result<()> {
+            if player_flags.freeze > int(0) {
+                return Ok(());
+            }
+
+            let draw_result =
+                run_player_draw(player_pos_spd.pos.clone(), player_pos_spd.spd.clone());
+            player_pos_spd.pos = draw_result.pos;
+            player_pos_spd.spd = draw_result.spd;
+
+            println!("pos {:?}", player_pos_spd.pos);
+            println!("spd {:?}", player_pos_spd.spd);
+
+            Ok(())
+        };
+
+        let mut debug_positions = Vec::new();
+
+        // TODO double check that the order is: init, update, draw, update, draw, ...
+        for input in tas.into_iter() {
+            debug_positions.push((
+                player_pos_spd.pos.x.flr().as_i16().unwrap(),
+                player_pos_spd.pos.y.flr().as_i16().unwrap(),
+            ));
+
+            println!("pos {:?}", player_pos_spd.pos);
+
+            let did_win = update(&mut player_pos_spd, &mut player_flags, &mut rem, &input)?;
+            assert!(!did_win);
+
+            println!("draw");
+            draw(&mut player_pos_spd, &player_flags)?;
+
+            println!("");
+        }
+
+        // for (x, y) in debug_positions {
+        //     println!("{},{}", x, y);
+        // }
+
+        Ok(())
+    }
+}

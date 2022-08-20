@@ -56,6 +56,15 @@ pub struct Pico8Vec2 {
     pub y: Pico8Num,
 }
 
+impl Pico8Vec2 {
+    pub fn zero() -> Pico8Vec2 {
+        Pico8Vec2 {
+            x: int(0),
+            y: int(0),
+        }
+    }
+}
+
 pub mod constants {
     use super::Pico8Num;
 
@@ -133,7 +142,7 @@ impl Neg for Pico8Num {
 
 #[cfg(test)]
 mod tests {
-    use crate::pico8_num::Pico8Num;
+    use crate::pico8_num::{constants, int, Pico8Num};
 
     #[test]
     fn test_from_i16() {
@@ -168,6 +177,28 @@ mod tests {
         assert_eq!(
             (Pico8Num::from_i16(-100) / Pico8Num::from_i16(7)).as_i16(),
             None
+        );
+    }
+
+    #[test]
+    fn test_flr() {
+        assert_eq!((int(4) + constants::PICO8_NUM_0_15).flr(), int(4));
+        assert_eq!(int(4).flr(), int(4));
+        assert_eq!((int(-2) - constants::PICO8_NUM_0_15).flr(), int(-3));
+        assert_eq!(int(-2).flr(), int(-2));
+    }
+
+    #[test]
+    fn test_abs() {
+        assert_eq!(int(4).abs(), int(4));
+        assert_eq!(int(-4).abs(), int(4));
+        assert_eq!(
+            (int(4) + constants::PICO8_NUM_0_15).abs(),
+            int(4) + constants::PICO8_NUM_0_15
+        );
+        assert_eq!(
+            (int(-4) - constants::PICO8_NUM_0_15).abs(),
+            int(4) + constants::PICO8_NUM_0_15
         );
     }
 }

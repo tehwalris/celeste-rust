@@ -1,4 +1,4 @@
-use crate::pico8_num::{constants, Pico8Vec2};
+use crate::pico8_num::{constants, int, Pico8Vec2};
 
 use super::pico8_num::Pico8Num;
 
@@ -142,6 +142,20 @@ const MAX_DASH_TIME: i16 = 4;
 const MAX_DASH_I: i16 = ((MAX_DASH_TIME as usize) * VALID_DASH_COMBOS.len()) as i16;
 
 impl PlayerFlags {
+    pub fn spawn(freeze: Pico8Num, max_djump: Pico8Num) -> PlayerFlags {
+        PlayerFlags {
+            freeze,
+            flip_x: false,
+            p_jump: false,
+            p_dash: false,
+            grace: int(0),
+            djump: max_djump,
+            dash_time: int(0),
+            dash_target: Pico8Vec2::zero(),
+            dash_accel: Pico8Vec2::zero(),
+        }
+    }
+
     fn adjust_before_compress(&mut self) {
         if self.dash_time.as_i16() == Some(0) {
             self.dash_target.x = Pico8Num::from_i16(0);
@@ -151,7 +165,7 @@ impl PlayerFlags {
         }
     }
 
-    fn compress(&self) -> Option<CompressedPlayerFlags> {
+    pub fn compress(&self) -> Option<CompressedPlayerFlags> {
         let freeze = self.freeze.as_i16()?;
         if freeze < 0 || freeze > MAX_FREEZE {
             return None;
