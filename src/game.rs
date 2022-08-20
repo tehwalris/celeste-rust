@@ -60,11 +60,6 @@ pub struct PlayerDrawResult {
     spd: Pico8Vec2,
 }
 
-pub struct MoveConcreteResult {
-    pos_spd: PlayerPosSpd,
-    rem: Pico8Vec2,
-}
-
 fn clamp(val: Pico8Num, a: Pico8Num, b: Pico8Num) -> Pico8Num {
     cmp::max(a, cmp::min(b, val))
 }
