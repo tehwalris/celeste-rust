@@ -61,7 +61,7 @@ fn appr(val: Pico8Num, target: Pico8Num, amount: Pico8Num) -> Pico8Num {
     if val > target {
         cmp::max(val - amount, target)
     } else {
-        cmp::max(val + amount, target)
+        cmp::min(val + amount, target)
     }
 }
 
