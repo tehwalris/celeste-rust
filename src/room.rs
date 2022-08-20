@@ -61,7 +61,7 @@ impl<'a> Room<'a> {
         y: Pico8Num,
         w: Pico8Num,
         h: Pico8Num,
-        spd: Pico8Vec2,
+        spd: &Pico8Vec2,
     ) -> Result<bool> {
         for i in cmp::max(int(0), (x / int(8)).flr()).as_i16_or_err()?
             ..=cmp::min(int(15), (x + w - int(1)) / int(8)).as_i16_or_err()?

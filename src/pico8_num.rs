@@ -46,7 +46,7 @@ impl Pico8Num {
     }
 }
 
-pub fn int(v: i16) -> Pico8Num {
+pub const fn int(v: i16) -> Pico8Num {
     Pico8Num::from_i16(v)
 }
 
