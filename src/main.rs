@@ -100,7 +100,7 @@ fn add_reachable_to_dst_frame_cached<'a>(
                         );
                         dst_spd_map
                             .get_mut_or_insert_with(dst_spd, PlayerFlagBitVec::new)
-                            .mut_or(&dst_player_flags)
+                            .mut_or(&dst_player_flags);
                     }
                 }
             }
@@ -109,14 +109,54 @@ fn add_reachable_to_dst_frame_cached<'a>(
     Ok(())
 }
 
+fn should_skip_run(player_flags: &PlayerFlags, input: &InputFlags) -> bool {
+    // Left and right cancel out
+    if input.left && input.right {
+        return true;
+    }
+
+    // Up and down cancel out
+    if input.up && input.down {
+        return true;
+    }
+
+    // Jump will be ignored if it was pressed last frame
+    if input.jump && player_flags.p_jump {
+        return true;
+    }
+
+    // Dash will be ignored if it was pressed last frame
+    if input.dash && player_flags.p_dash {
+        return true;
+    }
+
+    false
+}
+
+fn should_skip_save(player_flags: &PlayerFlags) -> bool {
+    // Can press jump later instead of buffering a jump
+    // TODO double check that this is equivalent
+    if player_flags.jbuffer == int(4) {
+        return true;
+    }
+    assert!(player_flags.jbuffer == int(0));
+
+    false
+}
+
 fn add_reachable_to_dst_frame_direct<'a>(
     src_frame: &StateTable,
     dst_frame_keep_playing: &'a mut StateTable,
     dst_frame_freeze: &'a mut StateTable,
     room: &Room,
 ) -> Result<()> {
+    let mut potential_runs = 0;
+    let mut actual_runs = 0;
+    let mut potential_saves = 0;
+    let mut actual_saves = 0;
+
     for (src_pos, src_spd_map) in src_frame.iter() {
-        for (src_spd, src_player_flags) in src_spd_map.iter() {
+        for (src_spd, src_player_flags_vec) in src_spd_map.iter() {
             for rem in ALL_DIFFERENT_REMS_FOR_MOVE {
                 let (post_move_pos_spd, post_move_rem) = run_move_concrete(
                     game::PlayerPosSpd {
@@ -139,22 +179,36 @@ fn add_reachable_to_dst_frame_direct<'a>(
                 let post_move_pos_spd_flags = post_move_pos_spd.flags(&room)?;
 
                 for src_compressed_player_flags in CompressedPlayerFlags::iter() {
-                    if !src_player_flags.get(src_compressed_player_flags) {
+                    if !src_player_flags_vec.get(src_compressed_player_flags) {
                         continue;
                     }
+                    let src_player_flags = src_compressed_player_flags.decompress();
                     for input in InputFlags::iter() {
+                        potential_runs += 1;
+                        if should_skip_run(&src_player_flags, &input) {
+                            continue;
+                        }
+                        actual_runs += 1;
+
                         let update_result = run_player_update(
-                            src_compressed_player_flags.decompress(),
+                            src_player_flags.clone(),
                             &post_move_pos_spd_flags,
                             &input,
                             post_move_pos_spd.spd.clone(),
                         );
+
                         if let PlayerUpdateResult::KeepPlaying {
                             freeze,
                             player_flags: mut dst_player_flags,
                             spd: post_update_spd,
                         } = update_result
                         {
+                            potential_saves += 1;
+                            if should_skip_save(&dst_player_flags) {
+                                continue;
+                            }
+                            actual_saves += 1;
+
                             dst_player_flags.adjust_before_compress();
                             let dst_compressed_player_flags = dst_player_flags
                                 .compress()
@@ -178,7 +232,7 @@ fn add_reachable_to_dst_frame_direct<'a>(
                                 Pico8Vec2Map::new,
                             );
                             dst_spd_map
-                                .get_mut_or_insert_with(dst_spd, PlayerFlagBitVec::new)
+                                .get_mut_or_insert_with(dst_spd.clone(), PlayerFlagBitVec::new)
                                 .set(dst_compressed_player_flags, true);
                         }
                     }
@@ -186,6 +240,12 @@ fn add_reachable_to_dst_frame_direct<'a>(
             }
         }
     }
+
+    println!(
+        "potential_runs: {}, actual_runs: {}, potential_saves: {}, actual_saves: {}",
+        potential_runs, actual_runs, potential_saves, actual_saves
+    );
+
     Ok(())
 }
 
