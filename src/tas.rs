@@ -64,35 +64,6 @@ pub fn parse_tas_string(s: &str) -> Result<Vec<InputFlags>> {
     }
 }
 
-impl InputFlags {
-    fn none() -> InputFlags {
-        InputFlags {
-            left: false,
-            right: false,
-            up: false,
-            down: false,
-            jump: false,
-            dash: false,
-        }
-    }
-
-    fn from_tas_keycode(c: usize) -> Result<InputFlags> {
-        if c < (1 << 6) {
-            let bit = |i: usize| c & (1 << i) != 0;
-            Ok(InputFlags {
-                left: bit(0),
-                right: bit(1),
-                up: bit(2),
-                down: bit(3),
-                jump: bit(4),
-                dash: bit(5),
-            })
-        } else {
-            Err(anyhow!("invalid keycode"))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::{game::InputFlags, tas::parse_tas_string};

@@ -20,6 +20,7 @@ mod player_flags;
 mod room;
 mod state_table;
 mod tas;
+mod transition_cache;
 
 use anyhow::Result;
 
@@ -27,7 +28,7 @@ fn set_initial_state(frame: &mut StateTable, room: &Room) -> Result<()> {
     let pos = room.spawn_pos();
     let spd = Pico8Vec2::zero();
 
-    let mut player_flags = PlayerFlags::spawn(int(0), int(1));
+    let mut player_flags = PlayerFlags::spawn(int(1));
     player_flags.adjust_before_compress();
     let compressed_player_flags = player_flags
         .compress()

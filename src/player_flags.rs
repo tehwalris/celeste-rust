@@ -6,10 +6,6 @@ use super::pico8_num::Pico8Num;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlayerFlags {
-    // TODO Should be moved out of PlayerFlags for performance and closeness to
-    // the real code, but this is simpler for now.
-    pub freeze: Pico8Num,
-
     // Common to all objects
     pub flip_x: bool,
 
@@ -138,7 +134,6 @@ const VALID_DASH_COMBOS: [DashCombo; 8] = [
     },
 ];
 
-const MAX_FREEZE: i16 = 2;
 const MAX_GRACE: i16 = 6;
 const MAX_JBUFFER: i16 = 4;
 const MAX_DJUMP: i16 = 1;
@@ -146,9 +141,8 @@ const MAX_DASH_TIME: i16 = 4;
 const MAX_DASH_I: i16 = ((MAX_DASH_TIME as usize) * VALID_DASH_COMBOS.len()) as i16;
 
 impl PlayerFlags {
-    pub fn spawn(freeze: Pico8Num, max_djump: Pico8Num) -> PlayerFlags {
+    pub fn spawn(max_djump: Pico8Num) -> PlayerFlags {
         PlayerFlags {
-            freeze,
             flip_x: false,
             p_jump: false,
             p_dash: false,
@@ -171,11 +165,6 @@ impl PlayerFlags {
     }
 
     pub fn compress(&self) -> Option<CompressedPlayerFlags> {
-        let freeze = self.freeze.as_i16()?;
-        if freeze < 0 || freeze > MAX_FREEZE {
-            return None;
-        }
-
         let grace = self.grace.as_i16()?;
         if grace < 0 || grace > MAX_GRACE {
             return None;
@@ -232,8 +221,7 @@ impl PlayerFlags {
         assert!(dash_i >= 0 && dash_i <= MAX_DASH_I);
 
         let mut compressed: usize = 0;
-        let parts: [(i16, i16); 8] = [
-            (freeze, MAX_FREEZE),
+        let parts: [(i16, i16); 7] = [
             (self.flip_x as i16, 1),
             (self.p_jump as i16, 1),
             (self.p_dash as i16, 1),
@@ -253,7 +241,7 @@ impl PlayerFlags {
 }
 
 impl CompressedPlayerFlags {
-    pub const VALID_COUNT: usize = 55440;
+    pub const VALID_COUNT: usize = 18480;
 
     pub fn try_from_raw(compressed: usize) -> Option<CompressedPlayerFlags> {
         if Self::try_decompress(compressed).is_some() {
@@ -269,7 +257,6 @@ impl CompressedPlayerFlags {
 
     fn try_decompress(compressed: usize) -> Option<PlayerFlags> {
         let mut partially_compressed: usize = compressed;
-        let mut freeze = 0;
         let mut flip_x = 0;
         let mut p_jump = 0;
         let mut p_dash = 0;
@@ -277,8 +264,7 @@ impl CompressedPlayerFlags {
         let mut jbuffer = 0;
         let mut djump = 0;
         let mut dash_i = 0;
-        let parts: [(&mut i16, i16); 8] = [
-            (&mut freeze, MAX_FREEZE),
+        let parts: [(&mut i16, i16); 7] = [
             (&mut flip_x, 1),
             (&mut p_jump, 1),
             (&mut p_dash, 1),
@@ -313,7 +299,6 @@ impl CompressedPlayerFlags {
             y: Pico8Num::from_i16(0),
         };
         Some(PlayerFlags {
-            freeze: Pico8Num::from_i16(freeze),
             flip_x: flip_x != 0,
             p_jump: p_jump != 0,
             p_dash: p_dash != 0,
@@ -328,6 +313,10 @@ impl CompressedPlayerFlags {
                 .map(|v| v.accel.clone())
                 .unwrap_or(zero_vec.clone()),
         })
+    }
+
+    pub fn iter() -> impl Iterator<Item = CompressedPlayerFlags> {
+        (0..Self::VALID_COUNT).map(|v| CompressedPlayerFlags(v))
     }
 }
 

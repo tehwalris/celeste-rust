@@ -14,13 +14,46 @@ pub struct InputFlags {
     pub dash: bool,
 }
 
+impl InputFlags {
+    pub fn none() -> InputFlags {
+        InputFlags {
+            left: false,
+            right: false,
+            up: false,
+            down: false,
+            jump: false,
+            dash: false,
+        }
+    }
+
+    pub fn from_tas_keycode(c: usize) -> Result<InputFlags> {
+        if c < (1 << 6) {
+            let bit = |i: usize| c & (1 << i) != 0;
+            Ok(InputFlags {
+                left: bit(0),
+                right: bit(1),
+                up: bit(2),
+                down: bit(3),
+                jump: bit(4),
+                dash: bit(5),
+            })
+        } else {
+            Err(anyhow!("invalid keycode"))
+        }
+    }
+
+    pub fn iter() -> impl Iterator<Item = InputFlags> {
+        (0..(1 << 6)).map(|c| Self::from_tas_keycode(c).unwrap())
+    }
+}
+
 #[derive(Clone)]
 pub struct PlayerPosSpd {
     pub pos: Pico8Vec2,
     pub spd: Pico8Vec2,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Hash, PartialEq, Eq)]
 pub struct PosSpdFlags {
     pub is_solid_1_0: bool,
     pub is_solid_neg_1_0: bool,
@@ -49,6 +82,7 @@ const PLAYER_HITBOX: Pico8Hitbox = Pico8Hitbox {
 pub enum PlayerUpdateResult {
     Die,
     KeepPlaying {
+        freeze: bool,
         player_flags: PlayerFlags,
         spd: Pico8Vec2,
     },
@@ -123,22 +157,16 @@ impl PlayerPosSpd {
     }
 }
 
-fn run_player_update(
+pub fn run_player_update(
     mut p: PlayerFlags,
     pos_spd_flags: &PosSpdFlags,
     input_flags: &InputFlags,
     mut spd: Pico8Vec2,
 ) -> PlayerUpdateResult {
-    // TODO remember to handle freeze in game update
-
     // TODO add support for double dash
     let max_djump = int(1);
 
-    // TODO move this to the global update function
-    // if player_flags.freeze > Pico8Num::from_i16(0) {
-    //     player_flags.freeze = player_flags.freeze - Pico8Num::from_i16(1);
-    //     return PlayerUpdateResult::Alive { player_flags, spd };
-    // }
+    let mut freeze = false;
 
     let input = int(if input_flags.right {
         1
@@ -269,7 +297,7 @@ fn run_player_update(
                 spd.y = int(0);
             }
 
-            p.freeze = int(2);
+            freeze = true;
             p.dash_target.x = int(2) * sign(spd.x);
             p.dash_target.y = int(2) * sign(spd.y);
             p.dash_accel.x = constants::PICO8_NUM_1_5;
@@ -294,6 +322,7 @@ fn run_player_update(
     }
 
     PlayerUpdateResult::KeepPlaying {
+        freeze,
         player_flags: p,
         spd,
     }
@@ -390,7 +419,7 @@ mod tests {
             run_move_concrete, run_player_draw, run_player_update, InputFlags, PlayerPosSpd,
             PlayerUpdateResult,
         },
-        pico8_num::{int, Pico8Vec2},
+        pico8_num::{int, Pico8Num, Pico8Vec2},
         player_flags::{self, PlayerFlags},
         room::Room,
         tas::parse_tas_string,
@@ -405,26 +434,14 @@ mod tests {
         let cart_data = load_cart_data()?;
         let room = Room::from_position(&cart_data, int(1), int(0))?;
 
-        let mut player_pos_spd = PlayerPosSpd {
-            pos: room.spawn_pos(),
-            spd: Pico8Vec2::zero(),
-        };
-        let mut player_flags = PlayerFlags::spawn(int(0), int(1));
-        let mut rem = Pico8Vec2::zero();
-
-        let tas = fs::read_to_string(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tas/baseline/TAS2.tas"),
-        )?;
-        let tas = parse_tas_string(&tas)?;
-        let required_frames = 75;
-
         let update = |player_pos_spd: &mut PlayerPosSpd,
                       player_flags: &mut PlayerFlags,
                       rem: &mut Pico8Vec2,
+                      freeze: &mut Pico8Num,
                       input: &InputFlags|
          -> Result<bool> {
-            if player_flags.freeze > int(0) {
-                player_flags.freeze = player_flags.freeze - int(1);
+            if *freeze > int(0) {
+                *freeze = *freeze - int(1);
                 return Ok(false);
             }
 
@@ -442,9 +459,11 @@ mod tests {
             match player_update_result {
                 PlayerUpdateResult::Die => panic!("unexpected death"),
                 PlayerUpdateResult::KeepPlaying {
+                    freeze: new_freeze,
                     player_flags: new_player_flags,
                     spd: new_spd,
                 } => {
+                    *freeze = int(if new_freeze { 2 } else { 0 });
                     *player_flags = new_player_flags;
                     player_pos_spd.spd = new_spd;
 
@@ -454,8 +473,8 @@ mod tests {
             }
         };
 
-        let draw = |player_pos_spd: &mut PlayerPosSpd, player_flags: &PlayerFlags| -> Result<()> {
-            if player_flags.freeze > int(0) {
+        let draw = |player_pos_spd: &mut PlayerPosSpd, freeze: Pico8Num| -> Result<()> {
+            if freeze > int(0) {
                 return Ok(());
             }
 
@@ -467,15 +486,34 @@ mod tests {
             Ok(())
         };
 
+        let tas = fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tas/baseline/TAS2.tas"),
+        )?;
+        let tas = parse_tas_string(&tas)?;
+        let required_frames = 75;
+
+        let mut player_pos_spd = PlayerPosSpd {
+            pos: room.spawn_pos(),
+            spd: Pico8Vec2::zero(),
+        };
+        let mut player_flags = PlayerFlags::spawn(int(1));
+        let mut rem = Pico8Vec2::zero();
+        let mut freeze = int(0);
         let mut did_ever_win = false;
 
         // TODO double check that the order is: init, update, draw, update, draw, ...
         for (i, input) in tas.iter().enumerate() {
-            let did_win = update(&mut player_pos_spd, &mut player_flags, &mut rem, input)?;
+            let did_win = update(
+                &mut player_pos_spd,
+                &mut player_flags,
+                &mut rem,
+                &mut freeze,
+                input,
+            )?;
             did_ever_win = did_ever_win || did_win;
             assert!(did_win == (i >= required_frames));
 
-            draw(&mut player_pos_spd, &player_flags)?;
+            draw(&mut player_pos_spd, freeze)?;
         }
 
         assert!(did_ever_win);
