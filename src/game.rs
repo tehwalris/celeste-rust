@@ -79,6 +79,8 @@ const PLAYER_HITBOX: Pico8Hitbox = Pico8Hitbox {
     h: int(5),
 };
 
+pub const FREEZE_FRAME_COUNT: usize = 2;
+
 pub enum PlayerUpdateResult {
     Die,
     KeepPlaying {
@@ -438,7 +440,7 @@ mod tests {
         cart_data::CartData,
         game::{
             run_move_concrete, run_player_draw, run_player_update, InputFlags, PlayerPosSpd,
-            PlayerUpdateResult,
+            PlayerUpdateResult, FREEZE_FRAME_COUNT,
         },
         pico8_num::{int, Pico8Num, Pico8Vec2},
         player_flags::{self, PlayerFlags},
@@ -484,7 +486,11 @@ mod tests {
                     player_flags: new_player_flags,
                     spd: new_spd,
                 } => {
-                    *freeze = int(if new_freeze { 2 } else { 0 });
+                    *freeze = int(if new_freeze {
+                        FREEZE_FRAME_COUNT as i16
+                    } else {
+                        0
+                    });
                     *player_flags = new_player_flags;
                     player_pos_spd.spd = new_spd;
 

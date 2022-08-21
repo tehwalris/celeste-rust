@@ -1,3 +1,5 @@
+use std::future;
+
 use cart_data::CartData;
 use pico8_num::{int, Pico8Vec2};
 use player_flags::{PlayerFlagBitMatrix, PlayerFlagBitVec, PlayerFlags};
@@ -26,8 +28,8 @@ use anyhow::Result;
 
 use crate::{
     game::{
-        run_move_concrete, run_player_draw, PlayerDrawResult, ALL_DIFFERENT_REMS_FOR_MOVE, MAX_REM,
-        MIN_REM,
+        run_move_concrete, run_player_draw, PlayerDrawResult, ALL_DIFFERENT_REMS_FOR_MOVE,
+        FREEZE_FRAME_COUNT, MAX_REM, MIN_REM,
     },
     transition_cache::TransitionCache,
 };
@@ -83,8 +85,8 @@ fn add_reachable_to_dst_frame<'a>(
                 let transition =
                     transition_cache.get_or_calculate_transition(&post_move_pos_spd)?;
                 for (matrices_by_spd, dst_frame) in [
-                    (&transition.freeze, &mut *dst_frame_freeze),
                     (&transition.keep_playing, &mut *dst_frame_keep_playing),
+                    (&transition.freeze, &mut *dst_frame_freeze),
                 ] {
                     for (post_update_spd, matrix) in matrices_by_spd.iter() {
                         let dst_player_flags = matrix.calculate_reachable(src_player_flags);
@@ -116,19 +118,33 @@ fn main() -> Result<()> {
 
     let mut transition_cache = TransitionCache::new(&room);
 
-    let mut src_frame: StateTable = PosMap::new();
-    set_initial_state(&mut src_frame, &room)?;
+    let mut frames: Vec<Option<StateTable>> = (0..1 + FREEZE_FRAME_COUNT)
+        .map(|_| Some(StateTable::new()))
+        .collect();
+    set_initial_state(frames[0].as_mut().unwrap(), &room)?;
 
-    let mut dst_frame_keep_playing: StateTable = PosMap::new();
-    let mut dst_frame_freeze: StateTable = PosMap::new();
+    for i in 0..5 {
+        println!("i {}", i);
 
-    add_reachable_to_dst_frame(
-        &src_frame,
-        &mut dst_frame_keep_playing,
-        &mut &mut dst_frame_freeze,
-        &room,
-        &mut transition_cache,
-    )?;
+        frames.push(Some(StateTable::new()));
+
+        let future_frames = &mut frames[i..];
+        let (src_frame, future_frames) = future_frames.split_first_mut().unwrap();
+        let (dst_frame_keep_playing, future_frames) = future_frames.split_first_mut().unwrap();
+        let dst_frame_freeze = &mut future_frames[FREEZE_FRAME_COUNT - 1];
+
+        let src_frame = src_frame.as_ref().unwrap();
+        let dst_frame_keep_playing = dst_frame_keep_playing.as_mut().unwrap();
+        let dst_frame_freeze = dst_frame_freeze.as_mut().unwrap();
+
+        add_reachable_to_dst_frame(
+            src_frame,
+            dst_frame_keep_playing,
+            dst_frame_freeze,
+            &room,
+            &mut transition_cache,
+        )?;
+    }
 
     println!("done");
 
