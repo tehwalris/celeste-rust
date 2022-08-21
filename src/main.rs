@@ -26,9 +26,10 @@ use anyhow::Result;
 
 use crate::{
     game::{
-        run_move_concrete, run_player_draw, PlayerDrawResult, ALL_DIFFERENT_REMS_FOR_MOVE,
-        FREEZE_FRAME_COUNT, MAX_REM, MIN_REM,
+        run_move_concrete, run_player_draw, run_player_update, InputFlags, PlayerDrawResult,
+        PlayerUpdateResult, ALL_DIFFERENT_REMS_FOR_MOVE, FREEZE_FRAME_COUNT, MAX_REM, MIN_REM,
     },
+    player_flags::CompressedPlayerFlags,
     transition_cache::TransitionCache,
 };
 
@@ -52,7 +53,7 @@ fn set_initial_state(frame: &mut StateTable, room: &Room) -> Result<()> {
     Ok(())
 }
 
-fn add_reachable_to_dst_frame<'a>(
+fn add_reachable_to_dst_frame_cached<'a>(
     src_frame: &StateTable,
     dst_frame_keep_playing: &'a mut StateTable,
     dst_frame_freeze: &'a mut StateTable,
@@ -108,6 +109,86 @@ fn add_reachable_to_dst_frame<'a>(
     Ok(())
 }
 
+fn add_reachable_to_dst_frame_direct<'a>(
+    src_frame: &StateTable,
+    dst_frame_keep_playing: &'a mut StateTable,
+    dst_frame_freeze: &'a mut StateTable,
+    room: &Room,
+) -> Result<()> {
+    for (src_pos, src_spd_map) in src_frame.iter() {
+        for (src_spd, src_player_flags) in src_spd_map.iter() {
+            for rem in ALL_DIFFERENT_REMS_FOR_MOVE {
+                let (post_move_pos_spd, post_move_rem) = run_move_concrete(
+                    game::PlayerPosSpd {
+                        pos: Pico8Vec2 {
+                            x: int(src_pos.0),
+                            y: int(src_pos.1),
+                        },
+                        spd: src_spd.clone(),
+                    },
+                    rem,
+                    &room,
+                )?;
+                assert!(
+                    post_move_rem.x >= MIN_REM
+                        && post_move_rem.x <= MAX_REM
+                        && post_move_rem.y >= MIN_REM
+                        && post_move_rem.y <= MAX_REM
+                );
+
+                let post_move_pos_spd_flags = post_move_pos_spd.flags(&room)?;
+
+                for src_compressed_player_flags in CompressedPlayerFlags::iter() {
+                    if !src_player_flags.get(src_compressed_player_flags) {
+                        continue;
+                    }
+                    for input in InputFlags::iter() {
+                        let update_result = run_player_update(
+                            src_compressed_player_flags.decompress(),
+                            &post_move_pos_spd_flags,
+                            &input,
+                            post_move_pos_spd.spd.clone(),
+                        );
+                        if let PlayerUpdateResult::KeepPlaying {
+                            freeze,
+                            player_flags: mut dst_player_flags,
+                            spd: post_update_spd,
+                        } = update_result
+                        {
+                            dst_player_flags.adjust_before_compress();
+                            let dst_compressed_player_flags = dst_player_flags
+                                .compress()
+                                .ok_or(anyhow!("could not compress dst_player_flags"))?;
+
+                            let PlayerDrawResult {
+                                pos: dst_pos,
+                                spd: dst_spd,
+                            } = run_player_draw(
+                                post_move_pos_spd.pos.clone(),
+                                post_update_spd.clone(),
+                            );
+
+                            let dst_frame = if freeze {
+                                &mut *dst_frame_freeze
+                            } else {
+                                &mut *dst_frame_keep_playing
+                            };
+                            let dst_spd_map = dst_frame.get_mut_or_insert_with(
+                                (dst_pos.x.as_i16_or_err()?, dst_pos.y.as_i16_or_err()?),
+                                Pico8Vec2Map::new,
+                            );
+                            dst_spd_map
+                                .get_mut_or_insert_with(dst_spd, PlayerFlagBitVec::new)
+                                .set(dst_compressed_player_flags, true);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let current_dir = std::env::current_dir()?;
 
@@ -121,7 +202,7 @@ fn main() -> Result<()> {
         .collect();
     set_initial_state(frames[0].as_mut().unwrap(), &room)?;
 
-    for i in 0..5 {
+    for i in 0..50 {
         println!("i {}", i);
 
         frames.push(Some(StateTable::new()));
@@ -135,12 +216,11 @@ fn main() -> Result<()> {
         let dst_frame_keep_playing = dst_frame_keep_playing.as_mut().unwrap();
         let dst_frame_freeze = dst_frame_freeze.as_mut().unwrap();
 
-        add_reachable_to_dst_frame(
+        add_reachable_to_dst_frame_direct(
             src_frame,
             dst_frame_keep_playing,
             dst_frame_freeze,
             &room,
-            &mut transition_cache,
         )?;
 
         println!("src_frame stats:");
