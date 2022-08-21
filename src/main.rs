@@ -150,11 +150,13 @@ fn add_reachable_to_dst_frame_direct<'a>(
     dst_frame_keep_playing: &'a mut StateTable,
     dst_frame_freeze: &'a mut StateTable,
     room: &Room,
-) -> Result<()> {
+) -> Result<bool> {
     let mut potential_runs = 0;
     let mut actual_runs = 0;
     let mut potential_saves = 0;
     let mut actual_saves = 0;
+
+    let mut did_win = false;
 
     for (src_pos, src_spd_map) in src_frame.iter() {
         for (src_spd, src_player_flags_vec) in src_spd_map.iter() {
@@ -197,6 +199,10 @@ fn add_reachable_to_dst_frame_direct<'a>(
                             &input,
                             post_move_pos_spd.spd.clone(),
                         );
+
+                        if let PlayerUpdateResult::Win = update_result {
+                            did_win = true;
+                        }
 
                         if let PlayerUpdateResult::KeepPlaying {
                             freeze,
@@ -247,7 +253,7 @@ fn add_reachable_to_dst_frame_direct<'a>(
         potential_runs, actual_runs, potential_saves, actual_saves
     );
 
-    Ok(())
+    Ok(did_win)
 }
 
 fn main() -> Result<()> {
@@ -263,8 +269,12 @@ fn main() -> Result<()> {
         .collect();
     set_initial_state(frames[0].as_mut().unwrap(), &room)?;
 
-    for i in 0..50 {
+    for i in 0..1000 {
         println!("i {}", i);
+
+        if i > 0 {
+            frames[i - 1] = None;
+        }
 
         frames.push(Some(StateTable::new()));
 
@@ -278,7 +288,7 @@ fn main() -> Result<()> {
         let dst_frame_freeze = dst_frame_freeze.as_mut().unwrap();
 
         let before_update = std::time::Instant::now();
-        add_reachable_to_dst_frame_direct(
+        let did_win = add_reachable_to_dst_frame_direct(
             src_frame,
             dst_frame_keep_playing,
             dst_frame_freeze,
@@ -286,7 +296,10 @@ fn main() -> Result<()> {
         )?;
         let update_elapsed = before_update.elapsed();
 
-        println!("update_elapsed: {:?}", update_elapsed,);
+        println!(
+            "update_elapsed: {:?}, did_win: {:?}",
+            update_elapsed, did_win
+        );
 
         println!("src_frame stats:");
         src_frame.print_stats();
@@ -296,6 +309,8 @@ fn main() -> Result<()> {
         dst_frame_freeze.print_stats();
         println!("transition_cache stats:");
         transition_cache.print_stats();
+
+        println!();
     }
 
     println!("done");
