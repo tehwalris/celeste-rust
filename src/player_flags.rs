@@ -1,3 +1,5 @@
+use std::mem;
+
 use bv::{BitVec, Bits, BitsExt};
 
 use crate::pico8_num::{constants, int, Pico8Vec2};
@@ -20,7 +22,7 @@ pub struct PlayerFlags {
     pub dash_accel: Pico8Vec2,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompressedPlayerFlags(usize);
 
 #[derive(PartialEq, Eq)]
@@ -347,6 +349,11 @@ impl PlayerFlagBitVec {
         }
         true
     }
+
+    pub fn mut_or(&mut self, other: &PlayerFlagBitVec) {
+        let self_0 = mem::take(&mut self.0);
+        self.0 = other.0.bit_or(self_0).to_bit_vec();
+    }
 }
 
 #[derive(Clone)]
@@ -374,11 +381,11 @@ impl PlayerFlagBitMatrix {
         self.dest_vecs_by_src[src_key.0].get(dst_key)
     }
 
-    pub fn calculate_reachable(&mut self, src_vec: &PlayerFlagBitVec) -> PlayerFlagBitVec {
+    pub fn calculate_reachable(&self, src_vec: &PlayerFlagBitVec) -> PlayerFlagBitVec {
         let mut dst_vec = PlayerFlagBitVec::new();
         for i in 0..CompressedPlayerFlags::VALID_COUNT {
             if src_vec.get(CompressedPlayerFlags(i)) {
-                dst_vec.0 = self.dest_vecs_by_src[i].0.bit_or(dst_vec.0).to_bit_vec();
+                dst_vec.mut_or(&self.dest_vecs_by_src[i]);
             }
         }
         dst_vec

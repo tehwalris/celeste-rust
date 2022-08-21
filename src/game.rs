@@ -90,8 +90,8 @@ pub enum PlayerUpdateResult {
 }
 
 pub struct PlayerDrawResult {
-    pos: Pico8Vec2,
-    spd: Pico8Vec2,
+    pub pos: Pico8Vec2,
+    pub spd: Pico8Vec2,
 }
 
 fn clamp(val: Pico8Num, a: Pico8Num, b: Pico8Num) -> Pico8Num {
@@ -358,6 +358,27 @@ pub fn run_move_concrete(
 
     Ok((p, rem))
 }
+
+pub const MIN_REM: Pico8Num = constants::PICO8_NUM_0_5.const_neg();
+pub const MAX_REM: Pico8Num = constants::PICO8_NUM_0_5.next_smallest();
+pub const ALL_DIFFERENT_REMS_FOR_MOVE: [Pico8Vec2; 4] = [
+    Pico8Vec2 {
+        x: MIN_REM,
+        y: MIN_REM,
+    },
+    Pico8Vec2 {
+        x: MIN_REM,
+        y: MAX_REM,
+    },
+    Pico8Vec2 {
+        x: MAX_REM,
+        y: MIN_REM,
+    },
+    Pico8Vec2 {
+        x: MAX_REM,
+        y: MAX_REM,
+    },
+];
 
 fn move_x(
     p: &mut PlayerPosSpd,

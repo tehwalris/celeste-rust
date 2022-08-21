@@ -6,6 +6,7 @@ use crate::{
     pico8_num::Pico8Vec2,
     player_flags::{CompressedPlayerFlags, PlayerFlagBitMatrix},
     room::Room,
+    state_table::Pico8Vec2Map,
 };
 
 #[derive(Hash, PartialEq, Eq)]
@@ -15,8 +16,8 @@ struct TransitionCacheKey {
 }
 
 pub struct Transition {
-    pub keep_playing: PlayerFlagBitMatrix,
-    pub freeze: PlayerFlagBitMatrix,
+    pub keep_playing: Pico8Vec2Map<PlayerFlagBitMatrix>,
+    pub freeze: Pico8Vec2Map<PlayerFlagBitMatrix>,
 }
 
 pub struct TransitionCache<'a> {
@@ -52,9 +53,9 @@ impl<'a> TransitionCache<'a> {
     fn calculate_transition(src_pos_spd: &PlayerPosSpd, room: &Room) -> Result<Transition> {
         let src_pos_spd_flags = src_pos_spd.flags(room)?;
 
-        let transition = Transition {
-            keep_playing: PlayerFlagBitMatrix::new(),
-            freeze: PlayerFlagBitMatrix::new(),
+        let mut transition = Transition {
+            keep_playing: Pico8Vec2Map::new(),
+            freeze: Pico8Vec2Map::new(),
         };
         for src_compressed_player_flags in CompressedPlayerFlags::iter() {
             let src_player_flags = src_compressed_player_flags.decompress();
@@ -67,10 +68,27 @@ impl<'a> TransitionCache<'a> {
                 );
                 if let PlayerUpdateResult::KeepPlaying {
                     freeze,
-                    player_flags: dst_player_flags,
+                    player_flags: mut dst_player_flags,
                     spd: dst_spd,
                 } = result
-                {}
+                {
+                    dst_player_flags.adjust_before_compress();
+                    let dst_compressed_player_flags = dst_player_flags
+                        .compress()
+                        .ok_or(anyhow!("could not compress dst_player_flags"))?;
+                    let dst_spd_map = if freeze {
+                        &mut transition.freeze
+                    } else {
+                        &mut transition.keep_playing
+                    };
+                    let matrix =
+                        dst_spd_map.get_mut_or_insert_with(dst_spd, || PlayerFlagBitMatrix::new());
+                    matrix.set(
+                        src_compressed_player_flags,
+                        dst_compressed_player_flags,
+                        true,
+                    );
+                }
             }
         }
 

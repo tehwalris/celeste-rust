@@ -37,12 +37,20 @@ impl Pico8Num {
         Self(low as i32)
     }
 
+    pub const fn const_neg(self) -> Self {
+        Self(-self.0)
+    }
+
     pub const fn abs(self) -> Self {
         Self(self.0.abs())
     }
 
     pub const fn flr(self) -> Self {
         Self::from_i16((self.0 >> 16) as i16)
+    }
+
+    pub const fn next_smallest(self) -> Self {
+        Self(self.0 - 1)
     }
 }
 
@@ -136,7 +144,7 @@ impl Neg for Pico8Num {
     type Output = Self;
 
     fn neg(self) -> Self::Output {
-        Self(-self.0)
+        self.const_neg()
     }
 }
 

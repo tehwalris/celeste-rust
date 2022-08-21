@@ -24,6 +24,14 @@ mod transition_cache;
 
 use anyhow::Result;
 
+use crate::{
+    game::{
+        run_move_concrete, run_player_draw, PlayerDrawResult, ALL_DIFFERENT_REMS_FOR_MOVE, MAX_REM,
+        MIN_REM,
+    },
+    transition_cache::TransitionCache,
+};
+
 fn set_initial_state(frame: &mut StateTable, room: &Room) -> Result<()> {
     let pos = room.spawn_pos();
     let spd = Pico8Vec2::zero();
@@ -34,28 +42,70 @@ fn set_initial_state(frame: &mut StateTable, room: &Room) -> Result<()> {
         .compress()
         .ok_or(anyhow!("failed to compress initial player_flags"))?;
 
-    let spd_map = frame
-        .get_mut_or_insert_with((pos.x.as_i16_or_err()?, pos.y.as_i16_or_err()?), || {
-            Pico8Vec2Map::new()
-        });
-    let flag_vec = spd_map.get_mut_or_insert_with(spd, || PlayerFlagBitVec::new());
+    let spd_map = frame.get_mut_or_insert_with(
+        (pos.x.as_i16_or_err()?, pos.y.as_i16_or_err()?),
+        Pico8Vec2Map::new,
+    );
+    let flag_vec = spd_map.get_mut_or_insert_with(spd, PlayerFlagBitVec::new);
     flag_vec.set(compressed_player_flags, true);
 
     Ok(())
 }
 
-fn add_reachable_to_dst_frame(
+fn add_reachable_to_dst_frame<'a>(
     src_frame: &StateTable,
-    dst_frame: &mut StateTable,
+    dst_frame_keep_playing: &'a mut StateTable,
+    dst_frame_freeze: &'a mut StateTable,
     room: &Room,
+    transition_cache: &mut TransitionCache,
 ) -> Result<()> {
     for (src_pos, src_spd_map) in src_frame.iter() {
         for (src_spd, src_player_flags) in src_spd_map.iter() {
-            // TODO freeze will probably need special handling
+            for rem in ALL_DIFFERENT_REMS_FOR_MOVE {
+                let (post_move_pos_spd, post_move_rem) = run_move_concrete(
+                    game::PlayerPosSpd {
+                        pos: Pico8Vec2 {
+                            x: int(src_pos.0),
+                            y: int(src_pos.1),
+                        },
+                        spd: src_spd.clone(),
+                    },
+                    rem,
+                    &room,
+                )?;
+                assert!(
+                    post_move_rem.x >= MIN_REM
+                        && post_move_rem.x <= MAX_REM
+                        && post_move_rem.y >= MIN_REM
+                        && post_move_rem.y <= MAX_REM
+                );
+
+                let transition =
+                    transition_cache.get_or_calculate_transition(&post_move_pos_spd)?;
+                for (matrices_by_spd, dst_frame) in [
+                    (&transition.freeze, &mut *dst_frame_freeze),
+                    (&transition.keep_playing, &mut *dst_frame_keep_playing),
+                ] {
+                    for (post_update_spd, matrix) in matrices_by_spd.iter() {
+                        let dst_player_flags = matrix.calculate_reachable(src_player_flags);
+                        let PlayerDrawResult {
+                            pos: dst_pos,
+                            spd: dst_spd,
+                        } = run_player_draw(post_move_pos_spd.pos.clone(), post_update_spd.clone());
+
+                        let dst_spd_map = dst_frame.get_mut_or_insert_with(
+                            (dst_pos.x.as_i16_or_err()?, dst_pos.y.as_i16_or_err()?),
+                            Pico8Vec2Map::new,
+                        );
+                        dst_spd_map
+                            .get_mut_or_insert_with(dst_spd, PlayerFlagBitVec::new)
+                            .mut_or(&dst_player_flags)
+                    }
+                }
+            }
         }
     }
-
-    todo!()
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -64,12 +114,21 @@ fn main() -> Result<()> {
     let cart_data = CartData::load(current_dir.join("cart"))?;
     let room = Room::from_position(&cart_data, int(1), int(0))?;
 
+    let mut transition_cache = TransitionCache::new(&room);
+
     let mut src_frame: StateTable = PosMap::new();
     set_initial_state(&mut src_frame, &room)?;
 
-    let mut dst_frame: StateTable = PosMap::new();
+    let mut dst_frame_keep_playing: StateTable = PosMap::new();
+    let mut dst_frame_freeze: StateTable = PosMap::new();
 
-    add_reachable_to_dst_frame(&src_frame, &mut dst_frame, &room)?;
+    add_reachable_to_dst_frame(
+        &src_frame,
+        &mut dst_frame_keep_playing,
+        &mut &mut dst_frame_freeze,
+        &room,
+        &mut transition_cache,
+    )?;
 
     println!("done");
 
