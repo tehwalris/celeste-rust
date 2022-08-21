@@ -150,7 +150,6 @@ fn add_reachable_to_dst_frame_direct<'a>(
     dst_frame_keep_playing: &'a mut StateTable,
     dst_frame_freeze: &'a mut StateTable,
     room: &Room,
-    skip_all_saves: bool,
 ) -> Result<()> {
     let mut potential_runs = 0;
     let mut actual_runs = 0;
@@ -206,7 +205,7 @@ fn add_reachable_to_dst_frame_direct<'a>(
                         } = update_result
                         {
                             potential_saves += 1;
-                            if should_skip_save(&dst_player_flags) || skip_all_saves {
+                            if should_skip_save(&dst_player_flags) {
                                 continue;
                             }
                             actual_saves += 1;
@@ -278,40 +277,16 @@ fn main() -> Result<()> {
         let dst_frame_keep_playing = dst_frame_keep_playing.as_mut().unwrap();
         let dst_frame_freeze = dst_frame_freeze.as_mut().unwrap();
 
-        let before_first_pass = std::time::Instant::now();
+        let before_update = std::time::Instant::now();
         add_reachable_to_dst_frame_direct(
             src_frame,
             dst_frame_keep_playing,
             dst_frame_freeze,
             &room,
-            false,
         )?;
-        let first_pass_elapsed = before_first_pass.elapsed();
+        let update_elapsed = before_update.elapsed();
 
-        let before_second_pass = std::time::Instant::now();
-        add_reachable_to_dst_frame_direct(
-            src_frame,
-            dst_frame_keep_playing,
-            dst_frame_freeze,
-            &room,
-            false,
-        )?;
-        let second_pass_elapsed = before_second_pass.elapsed();
-
-        let before_third_pass = std::time::Instant::now();
-        add_reachable_to_dst_frame_direct(
-            src_frame,
-            dst_frame_keep_playing,
-            dst_frame_freeze,
-            &room,
-            true,
-        )?;
-        let third_pass_elapsed = before_third_pass.elapsed();
-
-        println!(
-            "first_pass_elapsed: {:?}, second_pass_elapsed: {:?}, third_pass_elapsed: {:?}",
-            first_pass_elapsed, second_pass_elapsed, third_pass_elapsed
-        );
+        println!("update_elapsed: {:?}", update_elapsed,);
 
         println!("src_frame stats:");
         src_frame.print_stats();
