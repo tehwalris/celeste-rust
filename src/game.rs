@@ -469,8 +469,9 @@ mod tests {
             }
 
             if player_pos_spd.spd.x != int(0) || player_pos_spd.spd.y != int(0) {
-                (*player_pos_spd, *rem) =
-                    run_move_concrete(player_pos_spd.clone(), rem.clone(), &room)?;
+                let move_result = run_move_concrete(player_pos_spd.clone(), rem.clone(), &room)?;
+                *player_pos_spd = move_result.0;
+                *rem = move_result.1;
             }
 
             let player_update_result = run_player_update(
