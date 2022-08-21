@@ -354,6 +354,14 @@ impl PlayerFlagBitVec {
         let self_0 = mem::take(&mut self.0);
         self.0 = other.0.bit_or(self_0).to_bit_vec();
     }
+
+    pub fn count_ones(&self) -> usize {
+        let mut ones = 0;
+        for i in 0..self.0.block_len() {
+            ones += self.0.get_block(i).count_ones() as usize;
+        }
+        ones
+    }
 }
 
 #[derive(Clone)]

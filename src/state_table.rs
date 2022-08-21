@@ -4,6 +4,25 @@ use crate::{pico8_num::Pico8Vec2, player_flags::PlayerFlagBitVec};
 
 pub type StateTable = PosMap<Pico8Vec2Map<PlayerFlagBitVec>>;
 
+impl StateTable {
+    pub fn print_stats(&self) {
+        let mut positions = 0;
+        let mut position_speed_pairs = 0;
+        let mut reachable_states = 0;
+        for (_pos, spd_map) in self.iter() {
+            positions += 1;
+            for (_spd, vec) in spd_map.iter() {
+                position_speed_pairs += 1;
+                reachable_states += vec.count_ones();
+            }
+        }
+        println!(
+            "positions: {}, position_speed_pairs: {}, reachable_states: {}",
+            positions, position_speed_pairs, reachable_states
+        );
+    }
+}
+
 struct PosMapRange {
     min_x: i16,
     max_x: i16,
@@ -128,5 +147,9 @@ impl<T> Pico8Vec2Map<T> {
 
     pub fn iter(&self) -> impl Iterator<Item = (&Pico8Vec2, &T)> {
         self.0.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
     }
 }

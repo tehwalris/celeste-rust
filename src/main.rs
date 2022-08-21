@@ -1,10 +1,8 @@
-use std::future;
-
 use cart_data::CartData;
 use pico8_num::{int, Pico8Vec2};
-use player_flags::{PlayerFlagBitMatrix, PlayerFlagBitVec, PlayerFlags};
+use player_flags::{PlayerFlagBitVec, PlayerFlags};
 use room::Room;
-use state_table::{Pico8Vec2Map, PosMap, StateTable};
+use state_table::{Pico8Vec2Map, StateTable};
 
 // TODO remove unused dependencies
 #[macro_use(anyhow)]
@@ -144,6 +142,15 @@ fn main() -> Result<()> {
             &room,
             &mut transition_cache,
         )?;
+
+        println!("src_frame stats:");
+        src_frame.print_stats();
+        println!("dst_frame_keep_playing stats:");
+        dst_frame_keep_playing.print_stats();
+        println!("dst_frame_freeze stats:");
+        dst_frame_freeze.print_stats();
+        println!("transition_cache stats:");
+        transition_cache.print_stats();
     }
 
     println!("done");

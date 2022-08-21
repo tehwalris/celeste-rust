@@ -7,6 +7,7 @@ use crate::{
     player_flags::{CompressedPlayerFlags, PlayerFlagBitMatrix},
     room::Room,
     state_table::Pico8Vec2Map,
+    transition_cache,
 };
 
 #[derive(Hash, PartialEq, Eq)]
@@ -41,6 +42,9 @@ impl<'a> TransitionCache<'a> {
     }
 
     pub fn get_or_calculate_transition(&mut self, pos_spd: &PlayerPosSpd) -> Result<&Transition> {
+        // TODO HACK
+        self.matrices = HashMap::new();
+
         let key = self.make_key(pos_spd)?;
         let transition = self
             .matrices
@@ -51,6 +55,8 @@ impl<'a> TransitionCache<'a> {
     }
 
     fn calculate_transition(src_pos_spd: &PlayerPosSpd, room: &Room) -> Result<Transition> {
+        let mut occupancy = 0;
+
         let src_pos_spd_flags = src_pos_spd.flags(room)?;
 
         let mut transition = Transition {
@@ -88,10 +94,25 @@ impl<'a> TransitionCache<'a> {
                         dst_compressed_player_flags,
                         true,
                     );
+                    occupancy += 1;
                 }
             }
         }
 
+        println!("calculate_transition occupancy {}", occupancy);
+
         Ok(transition)
+    }
+
+    pub fn print_stats(&self) {
+        println!(
+            "transitions: {}, matrices: {}",
+            self.matrices.len(),
+            self.matrices
+                .iter()
+                .flat_map(|(_, v)| [&v.freeze, &v.keep_playing])
+                .map(|v| v.len())
+                .sum::<usize>()
+        );
     }
 }
