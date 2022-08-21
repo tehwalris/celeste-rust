@@ -22,7 +22,7 @@ pub struct PlayerFlags {
     pub dash_accel: Pico8Vec2,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CompressedPlayerFlags(usize);
 
 #[derive(PartialEq, Eq)]

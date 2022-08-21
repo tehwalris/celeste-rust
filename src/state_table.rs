@@ -1,26 +1,19 @@
-use std::collections::HashMap;
+use crate::{pico8_num::Pico8Vec2, player_flags::CompressedPlayerFlags};
+use rustc_hash::FxHashSet;
 
-use rustc_hash::FxHashMap;
-
-use crate::{pico8_num::Pico8Vec2, player_flags::PlayerFlagBitVec};
-
-pub type StateTable = PosMap<Pico8Vec2Map<PlayerFlagBitVec>>;
+pub type StateTable = PosMap<FxHashSet<(Pico8Vec2, CompressedPlayerFlags)>>;
 
 impl StateTable {
     pub fn print_stats(&self) {
         let mut positions = 0;
-        let mut position_speed_pairs = 0;
         let mut reachable_states = 0;
-        for (_pos, spd_map) in self.iter() {
+        for (_pos, spd_player_flags_set) in self.iter() {
             positions += 1;
-            for (_spd, vec) in spd_map.iter() {
-                position_speed_pairs += 1;
-                reachable_states += vec.count_ones();
-            }
+            reachable_states += spd_player_flags_set.len();
         }
         println!(
-            "positions: {}, position_speed_pairs: {}, reachable_states: {}",
-            positions, position_speed_pairs, reachable_states
+            "positions: {}, reachable_states: {}",
+            positions, reachable_states
         );
     }
 }
@@ -44,6 +37,15 @@ impl<T> PosMap<T> {
             max_x: 132,
             min_y: -8,
             max_y: 132,
+        })
+    }
+
+    pub fn new_wide() -> Self {
+        Self::new_for_range(PosMapRange {
+            min_x: -16,
+            max_x: 144,
+            min_y: -16,
+            max_y: 144,
         })
     }
 
@@ -96,6 +98,18 @@ impl<T> PosMap<T> {
         }
     }
 
+    pub fn fill<F>(&mut self, get_value: F)
+    where
+        F: Fn(i16, i16) -> T,
+    {
+        for y in self.range.min_y..=self.range.max_y {
+            for x in self.range.min_x..=self.range.max_x {
+                let i = self.index_from_pos((x, y)).unwrap();
+                self.data[i] = Some(get_value(x, y));
+            }
+        }
+    }
+
     pub fn iter<'a>(&'a self) -> PosMapIterator<'a, T> {
         PosMapIterator {
             pos_map: self,
@@ -129,29 +143,5 @@ impl<'a, T> Iterator for PosMapIterator<'a, T> {
                 return result;
             }
         }
-    }
-}
-
-pub struct Pico8Vec2Map<T>(FxHashMap<Pico8Vec2, T>);
-
-impl<T> Pico8Vec2Map<T> {
-    pub fn new() -> Self {
-        Pico8Vec2Map(FxHashMap::default())
-    }
-
-    pub fn get_mut_or_insert_with<F>(&mut self, key: Pico8Vec2, make_default: F) -> &mut T
-    where
-        F: FnOnce() -> T,
-    {
-        self.0.entry(key.clone()).or_insert_with(make_default);
-        self.0.get_mut(&key).unwrap()
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = (&Pico8Vec2, &T)> {
-        self.0.iter()
-    }
-
-    pub fn len(&self) -> usize {
-        self.0.len()
     }
 }

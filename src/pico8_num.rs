@@ -65,11 +65,19 @@ pub struct Pico8Vec2 {
 }
 
 impl Pico8Vec2 {
-    pub fn zero() -> Pico8Vec2 {
-        Pico8Vec2 {
-            x: int(0),
-            y: int(0),
+    pub const fn from_i16s(x: i16, y: i16) -> Self {
+        Self {
+            x: int(x),
+            y: int(y),
         }
+    }
+
+    pub fn as_i16s_or_err(&self) -> Result<(i16, i16)> {
+        Ok((self.x.as_i16_or_err()?, self.y.as_i16_or_err()?))
+    }
+
+    pub const fn zero() -> Pico8Vec2 {
+        Self::from_i16s(0, 0)
     }
 }
 

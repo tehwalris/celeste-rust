@@ -1,8 +1,9 @@
 use cart_data::CartData;
 use pico8_num::{int, Pico8Vec2};
-use player_flags::{PlayerFlagBitVec, PlayerFlags};
+use player_flags::PlayerFlags;
 use room::Room;
-use state_table::{Pico8Vec2Map, StateTable};
+use rustc_hash::FxHashSet;
+use state_table::StateTable;
 
 // TODO remove unused dependencies
 #[macro_use(anyhow)]
@@ -19,19 +20,16 @@ mod game;
 mod pico8_num;
 mod player_flags;
 mod room;
+mod sign;
 mod state_table;
 mod tas;
-mod transition_cache;
 
 use anyhow::Result;
 
-use crate::{
-    game::{
-        run_move_concrete, run_player_draw, run_player_update, InputFlags, PlayerDrawResult,
-        PlayerUpdateResult, ALL_DIFFERENT_REMS_FOR_MOVE, FREEZE_FRAME_COUNT, MAX_REM, MIN_REM,
-    },
-    player_flags::CompressedPlayerFlags,
-    transition_cache::TransitionCache,
+use crate::game::{
+    run_move_concrete, run_player_draw, run_player_update, InputFlags, PlayerDrawResult,
+    PlayerSolidSpikesCache, PlayerUpdateResult, ALL_DIFFERENT_REMS_FOR_MOVE, FREEZE_FRAME_COUNT,
+    MAX_REM, MIN_REM,
 };
 
 fn set_initial_state(frame: &mut StateTable, room: &Room) -> Result<()> {
@@ -44,69 +42,12 @@ fn set_initial_state(frame: &mut StateTable, room: &Room) -> Result<()> {
         .compress()
         .ok_or(anyhow!("failed to compress initial player_flags"))?;
 
-    let spd_map = frame.get_mut_or_insert_with(
+    let spd_player_flag_map = frame.get_mut_or_insert_with(
         (pos.x.as_i16_or_err()?, pos.y.as_i16_or_err()?),
-        Pico8Vec2Map::new,
+        FxHashSet::default,
     );
-    let flag_vec = spd_map.get_mut_or_insert_with(spd, PlayerFlagBitVec::new);
-    flag_vec.set(compressed_player_flags, true);
+    spd_player_flag_map.insert((spd, compressed_player_flags));
 
-    Ok(())
-}
-
-fn add_reachable_to_dst_frame_cached<'a>(
-    src_frame: &StateTable,
-    dst_frame_keep_playing: &'a mut StateTable,
-    dst_frame_freeze: &'a mut StateTable,
-    room: &Room,
-    transition_cache: &mut TransitionCache,
-) -> Result<()> {
-    for (src_pos, src_spd_map) in src_frame.iter() {
-        for (src_spd, src_player_flags) in src_spd_map.iter() {
-            for rem in ALL_DIFFERENT_REMS_FOR_MOVE {
-                let (post_move_pos_spd, post_move_rem) = run_move_concrete(
-                    game::PlayerPosSpd {
-                        pos: Pico8Vec2 {
-                            x: int(src_pos.0),
-                            y: int(src_pos.1),
-                        },
-                        spd: src_spd.clone(),
-                    },
-                    rem,
-                    &room,
-                )?;
-                assert!(
-                    post_move_rem.x >= MIN_REM
-                        && post_move_rem.x <= MAX_REM
-                        && post_move_rem.y >= MIN_REM
-                        && post_move_rem.y <= MAX_REM
-                );
-
-                let transition =
-                    transition_cache.get_or_calculate_transition(&post_move_pos_spd)?;
-                for (matrices_by_spd, dst_frame) in [
-                    (&transition.keep_playing, &mut *dst_frame_keep_playing),
-                    (&transition.freeze, &mut *dst_frame_freeze),
-                ] {
-                    for (post_update_spd, matrix) in matrices_by_spd.iter() {
-                        let dst_player_flags = matrix.calculate_reachable(src_player_flags);
-                        let PlayerDrawResult {
-                            pos: dst_pos,
-                            spd: dst_spd,
-                        } = run_player_draw(post_move_pos_spd.pos.clone(), post_update_spd.clone());
-
-                        let dst_spd_map = dst_frame.get_mut_or_insert_with(
-                            (dst_pos.x.as_i16_or_err()?, dst_pos.y.as_i16_or_err()?),
-                            Pico8Vec2Map::new,
-                        );
-                        dst_spd_map
-                            .get_mut_or_insert_with(dst_spd, PlayerFlagBitVec::new)
-                            .mut_or(&dst_player_flags);
-                    }
-                }
-            }
-        }
-    }
     Ok(())
 }
 
@@ -149,7 +90,7 @@ fn add_reachable_to_dst_frame_direct<'a>(
     src_frame: &StateTable,
     dst_frame_keep_playing: &'a mut StateTable,
     dst_frame_freeze: &'a mut StateTable,
-    room: &Room,
+    solid_spikes_cache: &PlayerSolidSpikesCache,
 ) -> Result<bool> {
     let mut potential_runs = 0;
     let mut actual_runs = 0;
@@ -158,8 +99,11 @@ fn add_reachable_to_dst_frame_direct<'a>(
 
     let mut did_win = false;
 
-    for (src_pos, src_spd_map) in src_frame.iter() {
-        for (src_spd, src_player_flags_vec) in src_spd_map.iter() {
+    let before_update = std::time::Instant::now();
+    for (src_pos, src_spd_player_flags_set) in src_frame.iter() {
+        for (src_spd, src_compressed_player_flags) in src_spd_player_flags_set.iter() {
+            let src_player_flags = src_compressed_player_flags.decompress();
+
             for rem in ALL_DIFFERENT_REMS_FOR_MOVE {
                 let (post_move_pos_spd, post_move_rem) = run_move_concrete(
                     game::PlayerPosSpd {
@@ -170,7 +114,7 @@ fn add_reachable_to_dst_frame_direct<'a>(
                         spd: src_spd.clone(),
                     },
                     rem,
-                    &room,
+                    &solid_spikes_cache,
                 )?;
                 assert!(
                     post_move_rem.x >= MIN_REM
@@ -179,75 +123,72 @@ fn add_reachable_to_dst_frame_direct<'a>(
                         && post_move_rem.y <= MAX_REM
                 );
 
-                let post_move_pos_spd_flags = post_move_pos_spd.flags(&room)?;
+                let post_move_pos_spd_flags = post_move_pos_spd.flags(&solid_spikes_cache)?;
 
-                for src_compressed_player_flags in CompressedPlayerFlags::iter() {
-                    if !src_player_flags_vec.get(src_compressed_player_flags) {
+                for input in InputFlags::iter() {
+                    potential_runs += 1;
+                    if should_skip_run(&src_player_flags, &input) {
                         continue;
                     }
-                    let src_player_flags = src_compressed_player_flags.decompress();
-                    for input in InputFlags::iter() {
-                        potential_runs += 1;
-                        if should_skip_run(&src_player_flags, &input) {
+                    actual_runs += 1;
+
+                    let update_result = run_player_update(
+                        src_player_flags.clone(),
+                        &post_move_pos_spd_flags,
+                        &input,
+                        post_move_pos_spd.spd.clone(),
+                    );
+
+                    if let PlayerUpdateResult::Win = update_result {
+                        did_win = true;
+                    }
+
+                    if let PlayerUpdateResult::KeepPlaying {
+                        freeze,
+                        player_flags: mut dst_player_flags,
+                        spd: post_update_spd,
+                    } = update_result
+                    {
+                        potential_saves += 1;
+                        if should_skip_save(&dst_player_flags) {
                             continue;
                         }
-                        actual_runs += 1;
+                        actual_saves += 1;
 
-                        let update_result = run_player_update(
-                            src_player_flags.clone(),
-                            &post_move_pos_spd_flags,
-                            &input,
-                            post_move_pos_spd.spd.clone(),
+                        dst_player_flags.adjust_before_compress();
+                        let dst_compressed_player_flags = dst_player_flags
+                            .compress()
+                            .ok_or(anyhow!("could not compress dst_player_flags"))?;
+
+                        let PlayerDrawResult {
+                            pos: dst_pos,
+                            spd: dst_spd,
+                        } = run_player_draw(post_move_pos_spd.pos.clone(), post_update_spd.clone());
+
+                        let dst_frame = if freeze {
+                            &mut *dst_frame_freeze
+                        } else {
+                            &mut *dst_frame_keep_playing
+                        };
+                        let dst_spd_player_flags_set = dst_frame.get_mut_or_insert_with(
+                            (dst_pos.x.as_i16_or_err()?, dst_pos.y.as_i16_or_err()?),
+                            FxHashSet::default,
                         );
-
-                        if let PlayerUpdateResult::Win = update_result {
-                            did_win = true;
-                        }
-
-                        if let PlayerUpdateResult::KeepPlaying {
-                            freeze,
-                            player_flags: mut dst_player_flags,
-                            spd: post_update_spd,
-                        } = update_result
-                        {
-                            potential_saves += 1;
-                            if should_skip_save(&dst_player_flags) {
-                                continue;
-                            }
-                            actual_saves += 1;
-
-                            dst_player_flags.adjust_before_compress();
-                            let dst_compressed_player_flags = dst_player_flags
-                                .compress()
-                                .ok_or(anyhow!("could not compress dst_player_flags"))?;
-
-                            let PlayerDrawResult {
-                                pos: dst_pos,
-                                spd: dst_spd,
-                            } = run_player_draw(
-                                post_move_pos_spd.pos.clone(),
-                                post_update_spd.clone(),
-                            );
-
-                            let dst_frame = if freeze {
-                                &mut *dst_frame_freeze
-                            } else {
-                                &mut *dst_frame_keep_playing
-                            };
-                            let dst_spd_map = dst_frame.get_mut_or_insert_with(
-                                (dst_pos.x.as_i16_or_err()?, dst_pos.y.as_i16_or_err()?),
-                                Pico8Vec2Map::new,
-                            );
-                            dst_spd_map
-                                .get_mut_or_insert_with(dst_spd.clone(), PlayerFlagBitVec::new)
-                                .set(dst_compressed_player_flags, true);
-                        }
+                        dst_spd_player_flags_set
+                            .insert((dst_spd.clone(), dst_compressed_player_flags));
                     }
                 }
             }
         }
     }
+    let update_elapsed = before_update.elapsed();
 
+    println!(
+        "update_elapsed: {:?}, update_elapsed / actual_runs: {:?}, did_win: {:?}",
+        update_elapsed,
+        update_elapsed / actual_runs,
+        did_win
+    );
     println!(
         "potential_runs: {}, actual_runs: {}, potential_saves: {}, actual_saves: {}",
         potential_runs, actual_runs, potential_saves, actual_saves
@@ -262,7 +203,7 @@ fn main() -> Result<()> {
     let cart_data = CartData::load(current_dir.join("cart"))?;
     let room = Room::from_position(&cart_data, int(1), int(0))?;
 
-    let mut transition_cache = TransitionCache::new(&room);
+    let solid_spikes_cache = PlayerSolidSpikesCache::calculate(&room);
 
     let mut frames: Vec<Option<StateTable>> = (0..1 + FREEZE_FRAME_COUNT)
         .map(|_| Some(StateTable::new()))
@@ -287,19 +228,12 @@ fn main() -> Result<()> {
         let dst_frame_keep_playing = dst_frame_keep_playing.as_mut().unwrap();
         let dst_frame_freeze = dst_frame_freeze.as_mut().unwrap();
 
-        let before_update = std::time::Instant::now();
-        let did_win = add_reachable_to_dst_frame_direct(
+        let _did_win = add_reachable_to_dst_frame_direct(
             src_frame,
             dst_frame_keep_playing,
             dst_frame_freeze,
-            &room,
+            &solid_spikes_cache,
         )?;
-        let update_elapsed = before_update.elapsed();
-
-        println!(
-            "update_elapsed: {:?}, did_win: {:?}",
-            update_elapsed, did_win
-        );
 
         println!("src_frame stats:");
         src_frame.print_stats();
@@ -307,8 +241,6 @@ fn main() -> Result<()> {
         dst_frame_keep_playing.print_stats();
         println!("dst_frame_freeze stats:");
         dst_frame_freeze.print_stats();
-        println!("transition_cache stats:");
-        transition_cache.print_stats();
 
         println!();
     }

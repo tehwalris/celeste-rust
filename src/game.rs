@@ -1,6 +1,8 @@
 use crate::pico8_num::{constants, int, Pico8Num, Pico8Vec2};
 use crate::player_flags::PlayerFlags;
 use crate::room::Room;
+use crate::sign::{SignVec2, SignVec2Map};
+use crate::state_table::PosMap;
 use anyhow::Result;
 use std::cmp;
 
@@ -118,17 +120,75 @@ fn sign(v: Pico8Num) -> Pico8Num {
     })
 }
 
+pub struct PlayerSolidSpikesCache {
+    solid_at_data: PosMap<bool>,
+    spikes_at_data: SignVec2Map<PosMap<bool>>,
+}
+
+impl PlayerSolidSpikesCache {
+    pub fn calculate(room: &Room) -> Self {
+        let mut solid_at_data = PosMap::new_wide();
+        solid_at_data
+            .fill(|x, y| Self::solid_at_uncached(&Pico8Vec2::from_i16s(x, y), room).unwrap());
+
+        let spikes_at_data = SignVec2Map::new(|spd| {
+            let mut spikes_at_inner_data = PosMap::new_wide();
+            spikes_at_inner_data.fill(|x, y| {
+                Self::spikes_at_uncached(&Pico8Vec2::from_i16s(x, y), spd, room).unwrap()
+            });
+            spikes_at_inner_data
+        });
+
+        Self {
+            solid_at_data,
+            spikes_at_data,
+        }
+    }
+
+    fn solid_at(&self, pos_with_offset: &Pico8Vec2) -> Result<bool> {
+        if let Some(&v) = self.solid_at_data.get(pos_with_offset.as_i16s_or_err()?) {
+            Ok(v)
+        } else {
+            Err(anyhow!(
+                "pos_with_offset out of range: {:?}",
+                pos_with_offset
+            ))
+        }
+    }
+
+    fn spikes_at(&self, pos: &Pico8Vec2, spd: SignVec2) -> Result<bool> {
+        if let Some(&v) = self.spikes_at_data.get(spd).get(pos.as_i16s_or_err()?) {
+            Ok(v)
+        } else {
+            Err(anyhow!("pos out of range: {:?}", pos))
+        }
+    }
+
+    fn solid_at_uncached(pos_with_offset: &Pico8Vec2, room: &Room) -> Result<bool> {
+        // TODO This is only checking against the room, because there are no
+        // active objects except the player at the moment.
+        room.solid_at(
+            pos_with_offset.x + PLAYER_HITBOX.x,
+            pos_with_offset.y + PLAYER_HITBOX.y,
+            PLAYER_HITBOX.w,
+            PLAYER_HITBOX.h,
+        )
+    }
+
+    fn spikes_at_uncached(pos: &Pico8Vec2, spd: SignVec2, room: &Room) -> Result<bool> {
+        room.spikes_at(
+            pos.x + PLAYER_HITBOX.x,
+            pos.y + PLAYER_HITBOX.y,
+            PLAYER_HITBOX.w,
+            PLAYER_HITBOX.h,
+            spd,
+        )
+    }
+}
+
 impl PlayerPosSpd {
-    pub fn flags(&self, room: &Room) -> Result<PosSpdFlags> {
-        let is_solid = |ox: i16, oy: i16| {
-            self.is_solid(
-                &Pico8Vec2 {
-                    x: int(ox),
-                    y: int(oy),
-                },
-                &room,
-            )
-        };
+    pub fn flags(&self, cache: &PlayerSolidSpikesCache) -> Result<PosSpdFlags> {
+        let is_solid = |ox: i16, oy: i16| self.is_solid(&Pico8Vec2::from_i16s(ox, oy), cache);
         Ok(PosSpdFlags {
             is_solid_1_0: is_solid(1, 0)?,
             is_solid_neg_1_0: is_solid(-1, 0)?,
@@ -137,25 +197,17 @@ impl PlayerPosSpd {
             is_solid_3_0: is_solid(3, 0)?,
             y_more_than_128: self.pos.y > int(128),
             y_less_than_neg_4: self.pos.y < int(-4),
-            spikes_at: room.spikes_at(
-                self.pos.x + PLAYER_HITBOX.x,
-                self.pos.y + PLAYER_HITBOX.y,
-                PLAYER_HITBOX.w,
-                PLAYER_HITBOX.h,
-                &self.spd,
-            )?,
+            spikes_at: cache.spikes_at(&self.pos, SignVec2::from_pico8(&self.spd))?,
         })
     }
 
-    fn is_solid(&self, offset: &Pico8Vec2, room: &Room) -> Result<bool> {
+    fn is_solid(&self, offset: &Pico8Vec2, cache: &PlayerSolidSpikesCache) -> Result<bool> {
         // TODO This is only checking against the room, because there are no
         // active objects except the player at the moment.
-        room.solid_at(
-            self.pos.x + PLAYER_HITBOX.x + offset.x,
-            self.pos.y + PLAYER_HITBOX.y + offset.y,
-            PLAYER_HITBOX.w,
-            PLAYER_HITBOX.h,
-        )
+        cache.solid_at(&Pico8Vec2 {
+            x: self.pos.x + offset.x,
+            y: self.pos.y + offset.y,
+        })
     }
 }
 
@@ -342,7 +394,7 @@ pub fn run_player_draw(mut pos: Pico8Vec2, mut spd: Pico8Vec2) -> PlayerDrawResu
 pub fn run_move_concrete(
     mut p: PlayerPosSpd,
     mut rem: Pico8Vec2,
-    room: &Room,
+    solid_spikes_cache: &PlayerSolidSpikesCache,
 ) -> Result<(PlayerPosSpd, Pico8Vec2)> {
     // TODO Some objects are not solid, but player is and that's the only object
     // that we currently have.
@@ -351,12 +403,12 @@ pub fn run_move_concrete(
     rem.x = rem.x + p.spd.x;
     let amount = (rem.x + constants::PICO8_NUM_0_5).flr();
     rem.x = rem.x - amount;
-    move_x(&mut p, &mut rem, room, solids, amount, int(0))?;
+    move_x(&mut p, &mut rem, solid_spikes_cache, solids, amount, int(0))?;
 
     rem.y = rem.y + p.spd.y;
     let amount = (rem.y + constants::PICO8_NUM_0_5).flr();
     rem.y = rem.y - amount;
-    move_y(&mut p, &mut rem, room, solids, amount)?;
+    move_y(&mut p, &mut rem, solid_spikes_cache, solids, amount)?;
 
     Ok((p, rem))
 }
@@ -385,7 +437,7 @@ pub const ALL_DIFFERENT_REMS_FOR_MOVE: [Pico8Vec2; 4] = [
 fn move_x(
     p: &mut PlayerPosSpd,
     rem: &mut Pico8Vec2,
-    room: &Room,
+    solid_spikes_cache: &PlayerSolidSpikesCache,
     solids: bool,
     amount: Pico8Num,
     start: Pico8Num,
@@ -393,7 +445,7 @@ fn move_x(
     if solids {
         let step = sign(amount);
         for _ in start.as_i16_or_err()?..=amount.abs().as_i16_or_err()? {
-            if !p.is_solid(&Pico8Vec2 { x: step, y: int(0) }, room)? {
+            if !p.is_solid(&Pico8Vec2 { x: step, y: int(0) }, solid_spikes_cache)? {
                 p.pos.x = p.pos.x + step;
             } else {
                 p.spd.x = int(0);
@@ -410,14 +462,14 @@ fn move_x(
 fn move_y(
     p: &mut PlayerPosSpd,
     rem: &mut Pico8Vec2,
-    room: &Room,
+    solid_spikes_cache: &PlayerSolidSpikesCache,
     solids: bool,
     amount: Pico8Num,
 ) -> Result<()> {
     if solids {
         let step = sign(amount);
         for _ in 0..=amount.abs().as_i16_or_err()? {
-            if !p.is_solid(&Pico8Vec2 { x: int(0), y: step }, room)? {
+            if !p.is_solid(&Pico8Vec2 { x: int(0), y: step }, solid_spikes_cache)? {
                 p.pos.y = p.pos.y + step;
             } else {
                 p.spd.y = int(0);
@@ -440,10 +492,10 @@ mod tests {
         cart_data::CartData,
         game::{
             run_move_concrete, run_player_draw, run_player_update, InputFlags, PlayerPosSpd,
-            PlayerUpdateResult, FREEZE_FRAME_COUNT,
+            PlayerSolidSpikesCache, PlayerUpdateResult, FREEZE_FRAME_COUNT,
         },
         pico8_num::{int, Pico8Num, Pico8Vec2},
-        player_flags::{self, PlayerFlags},
+        player_flags::PlayerFlags,
         room::Room,
         tas::parse_tas_string,
     };
@@ -457,6 +509,8 @@ mod tests {
         let cart_data = load_cart_data()?;
         let room = Room::from_position(&cart_data, int(1), int(0))?;
 
+        let solid_spikes_cache = PlayerSolidSpikesCache::calculate(&room);
+
         let update = |player_pos_spd: &mut PlayerPosSpd,
                       player_flags: &mut PlayerFlags,
                       rem: &mut Pico8Vec2,
@@ -469,14 +523,15 @@ mod tests {
             }
 
             if player_pos_spd.spd.x != int(0) || player_pos_spd.spd.y != int(0) {
-                let move_result = run_move_concrete(player_pos_spd.clone(), rem.clone(), &room)?;
+                let move_result =
+                    run_move_concrete(player_pos_spd.clone(), rem.clone(), &solid_spikes_cache)?;
                 *player_pos_spd = move_result.0;
                 *rem = move_result.1;
             }
 
             let player_update_result = run_player_update(
                 player_flags.clone(),
-                &player_pos_spd.flags(&room)?,
+                &player_pos_spd.flags(&solid_spikes_cache)?,
                 input,
                 player_pos_spd.spd.clone(),
             );

@@ -4,6 +4,7 @@ use std::{any, cmp};
 use crate::{
     cart_data::{self, CartData},
     pico8_num::{int, Pico8Num, Pico8Vec2},
+    sign::SignVec2,
 };
 
 pub struct Room<'a> {
@@ -74,7 +75,7 @@ impl<'a> Room<'a> {
         y: Pico8Num,
         w: Pico8Num,
         h: Pico8Num,
-        spd: &Pico8Vec2,
+        spd: SignVec2,
     ) -> Result<bool> {
         for i in cmp::max(int(0), (x / int(8)).flr()).as_i16_or_err()?
             ..=cmp::min(int(15), (x + w - int(1)) / int(8))
@@ -91,16 +92,16 @@ impl<'a> Room<'a> {
                 let tile = int(i16::from(self.tile_at(i, j)?));
                 if tile == int(17)
                     && ((y + h - int(1)) % int(8) >= int(6) || y + h == j * int(8) + int(8))
-                    && spd.y >= int(0)
+                    && spd.y.greater_equal_zero()
                 {
                     return Ok(true);
-                } else if tile == int(27) && y % int(8) <= int(2) && spd.y <= int(0) {
+                } else if tile == int(27) && y % int(8) <= int(2) && spd.y.smaller_equal_zero() {
                     return Ok(true);
-                } else if tile == int(43) && y % int(8) <= int(2) && spd.x <= int(0) {
+                } else if tile == int(43) && y % int(8) <= int(2) && spd.x.smaller_equal_zero() {
                     return Ok(true);
                 } else if tile == int(59)
                     && ((x + w - int(1)) % int(8) >= int(6) || x + w == i * int(8) + int(8))
-                    && spd.x >= int(0)
+                    && spd.x.greater_equal_zero()
                 {
                     return Ok(true);
                 }
