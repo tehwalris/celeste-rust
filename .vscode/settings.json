@@ -10,6 +10,7 @@
     "maxfall",
     "maxrun",
     "Pico",
+    "rustc",
     "vecs"
   ],
   "nixEnvSelector.nixFile": "${workspaceRoot}/shell.nix"

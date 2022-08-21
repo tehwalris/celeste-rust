@@ -12,6 +12,7 @@ extern crate bv;
 extern crate lazy_static;
 extern crate hex;
 extern crate regex;
+extern crate rustc_hash;
 
 mod cart_data;
 mod game;

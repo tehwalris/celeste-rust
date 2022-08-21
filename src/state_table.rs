@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use rustc_hash::FxHashMap;
+
 use crate::{pico8_num::Pico8Vec2, player_flags::PlayerFlagBitVec};
 
 pub type StateTable = PosMap<Pico8Vec2Map<PlayerFlagBitVec>>;
@@ -130,11 +132,11 @@ impl<'a, T> Iterator for PosMapIterator<'a, T> {
     }
 }
 
-pub struct Pico8Vec2Map<T>(HashMap<Pico8Vec2, T>);
+pub struct Pico8Vec2Map<T>(FxHashMap<Pico8Vec2, T>);
 
 impl<T> Pico8Vec2Map<T> {
     pub fn new() -> Self {
-        Pico8Vec2Map(HashMap::new())
+        Pico8Vec2Map(FxHashMap::default())
     }
 
     pub fn get_mut_or_insert_with<F>(&mut self, key: Pico8Vec2, make_default: F) -> &mut T
