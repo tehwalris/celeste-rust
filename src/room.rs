@@ -93,9 +93,17 @@ impl<'a> Room<'a> {
                     && ((y + h - int(1)) % int(8) >= int(6) || y + h == j * int(8) + int(8))
                     && spd.y >= int(0)
                 {
-                    // TODO
+                    return Ok(true);
+                } else if tile == int(27) && y % int(8) <= int(2) && spd.y <= int(0) {
+                    return Ok(true);
+                } else if tile == int(43) && y % int(8) <= int(2) && spd.x <= int(0) {
+                    return Ok(true);
+                } else if tile == int(59)
+                    && ((x + w - int(1)) % int(8) >= int(6) || x + w == i * int(8) + int(8))
+                    && spd.x >= int(0)
+                {
+                    return Ok(true);
                 }
-                // TODO
             }
         }
         Ok(false)
