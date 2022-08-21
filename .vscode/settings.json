@@ -9,7 +9,8 @@
     "jbuffer",
     "maxfall",
     "maxrun",
-    "Pico"
+    "Pico",
+    "vecs"
   ],
   "nixEnvSelector.nixFile": "${workspaceRoot}/shell.nix"
 }

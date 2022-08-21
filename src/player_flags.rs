@@ -1,3 +1,5 @@
+use bv::{BitVec, Bits, BitsExt};
+
 use crate::pico8_num::{constants, int, Pico8Vec2};
 
 use super::pico8_num::Pico8Num;
@@ -159,7 +161,7 @@ impl PlayerFlags {
         }
     }
 
-    fn adjust_before_compress(&mut self) {
+    pub fn adjust_before_compress(&mut self) {
         if self.dash_time.as_i16() == Some(0) {
             self.dash_target.x = Pico8Num::from_i16(0);
             self.dash_target.y = Pico8Num::from_i16(0);
@@ -326,6 +328,71 @@ impl CompressedPlayerFlags {
                 .map(|v| v.accel.clone())
                 .unwrap_or(zero_vec.clone()),
         })
+    }
+}
+
+#[derive(Clone)]
+pub struct PlayerFlagBitVec(BitVec);
+
+impl PlayerFlagBitVec {
+    pub fn new() -> Self {
+        Self(BitVec::new_fill(
+            false,
+            CompressedPlayerFlags::VALID_COUNT as u64,
+        ))
+    }
+
+    pub fn set(&mut self, key: CompressedPlayerFlags, value: bool) {
+        self.0.set(key.0 as u64, value);
+    }
+
+    pub fn get(&self, key: CompressedPlayerFlags) -> bool {
+        self.0.get(key.0 as u64)
+    }
+
+    pub fn is_all_false(&self) -> bool {
+        for i in 0..self.0.block_len() {
+            if self.0.get_block(i) != 0 {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+#[derive(Clone)]
+pub struct PlayerFlagBitMatrix {
+    dest_vecs_by_src: Vec<PlayerFlagBitVec>,
+}
+
+impl PlayerFlagBitMatrix {
+    pub fn new() -> Self {
+        Self {
+            dest_vecs_by_src: vec![PlayerFlagBitVec::new(); CompressedPlayerFlags::VALID_COUNT],
+        }
+    }
+
+    pub fn set(
+        &mut self,
+        src_key: CompressedPlayerFlags,
+        dst_key: CompressedPlayerFlags,
+        value: bool,
+    ) {
+        self.dest_vecs_by_src[src_key.0].set(dst_key, value);
+    }
+
+    pub fn get(&mut self, src_key: CompressedPlayerFlags, dst_key: CompressedPlayerFlags) -> bool {
+        self.dest_vecs_by_src[src_key.0].get(dst_key)
+    }
+
+    pub fn calculate_reachable(&mut self, src_vec: &PlayerFlagBitVec) -> PlayerFlagBitVec {
+        let mut dst_vec = PlayerFlagBitVec::new();
+        for i in 0..CompressedPlayerFlags::VALID_COUNT {
+            if src_vec.get(CompressedPlayerFlags(i)) {
+                dst_vec.0 = self.dest_vecs_by_src[i].0.bit_or(dst_vec.0).to_bit_vec();
+            }
+        }
+        dst_vec
     }
 }
 
