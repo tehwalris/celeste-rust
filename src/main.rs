@@ -350,26 +350,6 @@ fn add_reachable_to_dst_frame_direct_parallel<'a>(
     Ok((did_win, stats))
 }
 
-fn main_temp() {
-    let handles: Vec<_> = (0..10)
-        .map(|i| {
-            thread::spawn(move || {
-                println!("hi number {} from the spawned thread!", i);
-                thread::sleep(Duration::from_millis(1000));
-            })
-        })
-        .collect();
-
-    for h in handles {
-        h.join().unwrap();
-    }
-
-    // for i in 1..5 {
-    //     println!("hi number {} from the main thread!", i);
-    //     thread::sleep(Duration::from_millis(1));
-    // }
-}
-
 fn main() -> Result<()> {
     let current_dir = std::env::current_dir()?;
 
