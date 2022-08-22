@@ -36,10 +36,10 @@ impl StateTable {
 
 #[derive(Hash, PartialEq, Eq, Debug, Clone)]
 pub struct PosMapRange {
-    min_x: i16,
-    max_x: i16,
-    min_y: i16,
-    max_y: i16,
+    pub min_x: i16,
+    pub max_x: i16,
+    pub min_y: i16,
+    pub max_y: i16,
 }
 
 impl PosMapRange {
@@ -69,7 +69,7 @@ impl PosMapRange {
             .map(move |v| (v, cmp::min(max, v + i16::try_from(chunk_size).unwrap() - 1)))
     }
 
-    fn into_positions(self) -> impl Iterator<Item = (i16, i16)> {
+    pub fn into_positions(self) -> impl Iterator<Item = (i16, i16)> {
         Self::make_range(1, self.min_y, self.max_y).flat_map(move |(min_y, max_y)| {
             assert!(min_y == max_y);
             let y = min_y;

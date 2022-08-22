@@ -8,6 +8,7 @@ use std::{
 
 use anyhow::Result;
 use cart_data::CartData;
+use image::{ImageBuffer, Luma};
 use pico8_num::{int, Pico8Vec2};
 use player_flags::PlayerFlags;
 use room::Room;
@@ -350,6 +351,35 @@ fn add_reachable_to_dst_frame_direct_parallel<'a>(
     Ok((did_win, stats))
 }
 
+fn save_debug_image(frame: &StateTable, frame_i: usize) -> Result<()> {
+    let range = frame.range();
+
+    let data: Vec<_> = range
+        .clone()
+        .into_positions()
+        .map(|pos| {
+            if let Some(stuff) = frame.get(pos) {
+                stuff.len()
+            } else {
+                0
+            }
+        })
+        .collect();
+    let data_max = *data.iter().max().unwrap();
+
+    let debug_img = ImageBuffer::<Luma<u8>, Vec<u8>>::from_raw(
+        (range.max_x - range.min_x + 1) as u32,
+        (range.max_y - range.min_y + 1) as u32,
+        data.into_iter()
+            .map(|v| (v as f32) / (data_max as f32) * 0.5 + if v == 0 { 0.0 } else { 0.5 })
+            .map(|v| (v * 255.0) as u8)
+            .collect(),
+    )
+    .ok_or(anyhow!("size mismatch"))?;
+    debug_img.save(format!("output/frame-{}.png", frame_i))?;
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let current_dir = std::env::current_dir()?;
 
@@ -403,6 +433,8 @@ fn main() -> Result<()> {
         dst_frame_keep_playing.print_stats();
         println!("dst_frame_freeze stats:");
         dst_frame_freeze.print_stats();
+
+        save_debug_image(&src_frame, i)?;
 
         println!();
     }
