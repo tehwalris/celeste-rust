@@ -1,3 +1,5 @@
+use std::{cmp, mem};
+
 use crate::{pico8_num::Pico8Vec2, player_flags::CompressedPlayerFlags};
 use rustc_hash::FxHashSet;
 
@@ -16,13 +18,68 @@ impl StateTable {
             positions, reachable_states
         );
     }
+
+    pub fn extend(&mut self, mut other: StateTable) {
+        for pos in other.range().clone().into_positions() {
+            if let Some(other_data) = other.take(pos) {
+                if self.get(pos).is_some() {
+                    // HACK should not really be using _or_insert_with
+                    let self_data = self.get_mut_or_insert_with(pos, FxHashSet::default);
+                    self_data.extend(other_data.into_iter());
+                } else {
+                    self.get_mut_or_insert_with(pos, move || other_data);
+                }
+            }
+        }
+    }
 }
 
-struct PosMapRange {
+#[derive(Hash, PartialEq, Eq, Debug, Clone)]
+pub struct PosMapRange {
     min_x: i16,
     max_x: i16,
     min_y: i16,
     max_y: i16,
+}
+
+impl PosMapRange {
+    pub fn contains_pos(&self, (x, y): (i16, i16)) -> bool {
+        x >= self.min_x && x <= self.max_x && y >= self.min_y && y <= self.max_y
+    }
+
+    pub fn chunks<'a>(&'a self, chunk_size: usize) -> impl Iterator<Item = PosMapRange> + 'a {
+        assert!(chunk_size >= 1);
+
+        Self::make_range(chunk_size, self.min_y, self.max_y).flat_map(move |(min_y, max_y)| {
+            Self::make_range(chunk_size, self.min_x, self.max_x).map(move |(min_x, max_x)| {
+                PosMapRange {
+                    min_x,
+                    max_x,
+                    min_y,
+                    max_y,
+                }
+            })
+        })
+    }
+
+    fn make_range(chunk_size: usize, min: i16, max: i16) -> impl Iterator<Item = (i16, i16)> {
+        assert!(min <= max);
+        (min..=max)
+            .step_by(chunk_size)
+            .map(move |v| (v, cmp::min(max, v + i16::try_from(chunk_size).unwrap() - 1)))
+    }
+
+    fn into_positions(self) -> impl Iterator<Item = (i16, i16)> {
+        Self::make_range(1, self.min_y, self.max_y).flat_map(move |(min_y, max_y)| {
+            assert!(min_y == max_y);
+            let y = min_y;
+            Self::make_range(1, self.min_x, self.max_x).map(move |(min_x, max_x)| {
+                assert!(min_x == max_x);
+                let x = min_x;
+                (x, y)
+            })
+        })
+    }
 }
 
 pub struct PosMap<T> {
@@ -49,6 +106,10 @@ impl<T> PosMap<T> {
         })
     }
 
+    pub fn range(&self) -> &PosMapRange {
+        &self.range
+    }
+
     fn new_for_range(range: PosMapRange) -> Self {
         assert!(range.min_x <= range.max_x);
         assert!(range.min_y <= range.max_y);
@@ -62,7 +123,7 @@ impl<T> PosMap<T> {
 
     fn index_from_pos(&self, (x, y): (i16, i16)) -> Option<usize> {
         let r = &self.range;
-        if x >= r.min_x && x <= r.max_x && y >= r.min_y && y <= r.max_y {
+        if r.contains_pos((x, y)) {
             Some(
                 ((x - r.min_x) as usize)
                     + ((y - r.min_y) as usize) * ((r.max_x - r.min_x) as usize),
@@ -75,6 +136,14 @@ impl<T> PosMap<T> {
     pub fn get(&self, pos: (i16, i16)) -> Option<&T> {
         if let Some(i) = self.index_from_pos(pos) {
             self.data[i].as_ref()
+        } else {
+            None
+        }
+    }
+
+    pub fn take(&mut self, pos: (i16, i16)) -> Option<T> {
+        if let Some(i) = self.index_from_pos(pos) {
+            mem::take(&mut self.data[i])
         } else {
             None
         }
@@ -143,5 +212,40 @@ impl<'a, T> Iterator for PosMapIterator<'a, T> {
                 return result;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashSet, ops::Add, sync::atomic::AtomicU16};
+
+    use super::PosMapRange;
+
+    #[test]
+    fn test_pos_map_range_chunks() {
+        let whole_range = PosMapRange {
+            min_x: -8,
+            max_x: 10,
+            min_y: -5,
+            max_y: 2,
+        };
+
+        let mut expected_chunks = HashSet::new();
+        expected_chunks.insert(PosMapRange {
+            min_x: -8,
+            max_x: 1,
+            min_y: -5,
+            max_y: 2,
+        });
+        expected_chunks.insert(PosMapRange {
+            min_x: 2,
+            max_x: 10,
+            min_y: -5,
+            max_y: 2,
+        });
+
+        let actual_chunks: HashSet<_> = whole_range.chunks(10).collect();
+
+        assert_eq!(actual_chunks, expected_chunks);
     }
 }

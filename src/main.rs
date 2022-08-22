@@ -1,9 +1,18 @@
+use std::{
+    ops::{Add, DerefMut},
+    rc::Rc,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
+use anyhow::Result;
 use cart_data::CartData;
 use pico8_num::{int, Pico8Vec2};
 use player_flags::PlayerFlags;
 use room::Room;
 use rustc_hash::FxHashSet;
-use state_table::StateTable;
+use state_table::{PosMapRange, StateTable};
+use work_queue::Queue;
 
 // TODO remove unused dependencies
 #[macro_use(anyhow)]
@@ -14,6 +23,7 @@ extern crate lazy_static;
 extern crate hex;
 extern crate regex;
 extern crate rustc_hash;
+extern crate work_queue;
 
 mod cart_data;
 mod game;
@@ -23,8 +33,6 @@ mod room;
 mod sign;
 mod state_table;
 mod tas;
-
-use anyhow::Result;
 
 use crate::game::{
     run_move_concrete, run_player_draw, run_player_update, InputFlags, PlayerDrawResult,
@@ -86,21 +94,65 @@ fn should_skip_save(player_flags: &PlayerFlags) -> bool {
     false
 }
 
-fn add_reachable_to_dst_frame_direct<'a>(
+struct AddReachableStats {
+    potential_runs: usize,
+    actual_runs: usize,
+    potential_saves: usize,
+    actual_saves: usize,
+    elapsed: Option<Duration>,
+}
+
+impl AddReachableStats {
+    fn new() -> Self {
+        Self {
+            potential_runs: 0,
+            actual_runs: 0,
+            potential_saves: 0,
+            actual_saves: 0,
+            elapsed: None,
+        }
+    }
+
+    fn print(&self) {
+        if let Some(elapsed) = self.elapsed {
+            println!(
+                "elapsed: {:?}, elapsed / actual_runs: {:?}",
+                elapsed,
+                elapsed.div_f64(self.actual_runs as f64),
+            );
+        }
+        println!(
+            "potential_runs: {}, actual_runs: {}, potential_saves: {}, actual_saves: {}",
+            self.potential_runs, self.actual_runs, self.potential_saves, self.actual_saves
+        );
+    }
+
+    fn add(&mut self, other: &Self) {
+        self.potential_runs += other.potential_runs;
+        self.actual_runs += other.actual_runs;
+        self.potential_saves += other.potential_saves;
+        self.actual_saves += other.actual_saves;
+        self.elapsed = None;
+    }
+}
+
+fn add_reachable_to_dst_frame_direct_serial<'a>(
     src_frame: &StateTable,
+    src_pos_filter: impl Fn((i16, i16)) -> bool,
     dst_frame_keep_playing: &'a mut StateTable,
     dst_frame_freeze: &'a mut StateTable,
     solid_spikes_cache: &PlayerSolidSpikesCache,
-) -> Result<bool> {
-    let mut potential_runs = 0;
-    let mut actual_runs = 0;
-    let mut potential_saves = 0;
-    let mut actual_saves = 0;
+) -> Result<(bool, AddReachableStats)> {
+    let mut stats = AddReachableStats::new();
 
     let mut did_win = false;
 
-    let before_update = std::time::Instant::now();
+    let before_update = Instant::now();
     for (src_pos, src_spd_player_flags_set) in src_frame.iter() {
+        if !src_pos_filter(src_pos) {
+            continue;
+        }
+
         for (src_spd, src_compressed_player_flags) in src_spd_player_flags_set.iter() {
             let src_player_flags = src_compressed_player_flags.decompress();
 
@@ -126,11 +178,11 @@ fn add_reachable_to_dst_frame_direct<'a>(
                 let post_move_pos_spd_flags = post_move_pos_spd.flags(&solid_spikes_cache)?;
 
                 for input in InputFlags::iter() {
-                    potential_runs += 1;
+                    stats.potential_runs += 1;
                     if should_skip_run(&src_player_flags, &input) {
                         continue;
                     }
-                    actual_runs += 1;
+                    stats.actual_runs += 1;
 
                     let update_result = run_player_update(
                         src_player_flags.clone(),
@@ -149,11 +201,11 @@ fn add_reachable_to_dst_frame_direct<'a>(
                         spd: post_update_spd,
                     } = update_result
                     {
-                        potential_saves += 1;
+                        stats.potential_saves += 1;
                         if should_skip_save(&dst_player_flags) {
                             continue;
                         }
-                        actual_saves += 1;
+                        stats.actual_saves += 1;
 
                         dst_player_flags.adjust_before_compress();
                         let dst_compressed_player_flags = dst_player_flags
@@ -181,20 +233,78 @@ fn add_reachable_to_dst_frame_direct<'a>(
             }
         }
     }
-    let update_elapsed = before_update.elapsed();
+    stats.elapsed = Some(before_update.elapsed());
 
-    println!(
-        "update_elapsed: {:?}, update_elapsed / actual_runs: {:?}, did_win: {:?}",
-        update_elapsed,
-        update_elapsed / actual_runs,
-        did_win
-    );
-    println!(
-        "potential_runs: {}, actual_runs: {}, potential_saves: {}, actual_saves: {}",
-        potential_runs, actual_runs, potential_saves, actual_saves
-    );
+    Ok((did_win, stats))
+}
 
-    Ok(did_win)
+fn add_reachable_to_dst_frame_direct_parallel<'a>(
+    src_frame: Arc<StateTable>,
+    dst_frame_keep_playing: &mut StateTable,
+    dst_frame_freeze: &mut StateTable,
+    solid_spikes_cache: Arc<PlayerSolidSpikesCache>,
+) -> Result<(bool, AddReachableStats)> {
+    let threads = 8;
+    let local_queue_size = 2;
+    let chunk_size = 8;
+
+    let queue: Queue<PosMapRange> = Queue::new(threads, local_queue_size);
+
+    for range in src_frame.range().chunks(chunk_size) {
+        queue.push(range);
+    }
+
+    let before_spawn = Instant::now();
+    let handles = queue.local_queues().map(|mut local_queue| {
+        let src_frame = src_frame.clone();
+        let solid_spikes_cache = solid_spikes_cache.clone();
+
+        std::thread::spawn(
+            move || -> Result<(StateTable, StateTable, bool, AddReachableStats)> {
+                let mut local_dst_frame_keep_playing = StateTable::new();
+                let mut local_dst_frame_freeze = StateTable::new();
+
+                let mut did_win = false;
+                let mut stats = AddReachableStats::new();
+
+                while let Some(range) = local_queue.pop() {
+                    let (chunk_did_win, chunk_stats) = add_reachable_to_dst_frame_direct_serial(
+                        &src_frame,
+                        |p| range.contains_pos(p),
+                        &mut local_dst_frame_keep_playing,
+                        &mut local_dst_frame_freeze,
+                        &solid_spikes_cache,
+                    )?;
+                    did_win = did_win || chunk_did_win;
+                    stats.add(&chunk_stats);
+                }
+
+                Ok((
+                    local_dst_frame_keep_playing,
+                    local_dst_frame_freeze,
+                    did_win,
+                    stats,
+                ))
+            },
+        )
+    });
+
+    let mut did_win = false;
+    let mut stats = AddReachableStats::new();
+    for handle in handles {
+        let (local_dst_frame_keep_playing, local_dst_frame_freeze, local_did_win, local_stats) =
+            handle.join().unwrap()?;
+
+        did_win = did_win || local_did_win;
+        stats.add(&local_stats);
+
+        dst_frame_keep_playing.extend(local_dst_frame_keep_playing);
+        dst_frame_freeze.extend(local_dst_frame_freeze);
+    }
+
+    stats.elapsed = Some(before_spawn.elapsed());
+
+    Ok((did_win, stats))
 }
 
 fn main() -> Result<()> {
@@ -203,12 +313,15 @@ fn main() -> Result<()> {
     let cart_data = CartData::load(current_dir.join("cart"))?;
     let room = Room::from_position(&cart_data, int(1), int(0))?;
 
-    let solid_spikes_cache = PlayerSolidSpikesCache::calculate(&room);
+    let solid_spikes_cache = Arc::new(PlayerSolidSpikesCache::calculate(&room));
 
-    let mut frames: Vec<Option<StateTable>> = (0..1 + FREEZE_FRAME_COUNT)
-        .map(|_| Some(StateTable::new()))
+    let mut frames: Vec<Option<Arc<StateTable>>> = (0..1 + FREEZE_FRAME_COUNT)
+        .map(|_| Some(Arc::new(StateTable::new())))
         .collect();
-    set_initial_state(frames[0].as_mut().unwrap(), &room)?;
+    set_initial_state(
+        &mut Arc::get_mut(frames[0].as_mut().unwrap()).unwrap(),
+        &room,
+    )?;
 
     for i in 0..1000 {
         println!("i {}", i);
@@ -217,7 +330,7 @@ fn main() -> Result<()> {
             frames[i - 1] = None;
         }
 
-        frames.push(Some(StateTable::new()));
+        frames.push(Some(Arc::new(StateTable::new())));
 
         let future_frames = &mut frames[i..];
         let (src_frame, future_frames) = future_frames.split_first_mut().unwrap();
@@ -228,13 +341,15 @@ fn main() -> Result<()> {
         let dst_frame_keep_playing = dst_frame_keep_playing.as_mut().unwrap();
         let dst_frame_freeze = dst_frame_freeze.as_mut().unwrap();
 
-        let _did_win = add_reachable_to_dst_frame_direct(
-            src_frame,
-            dst_frame_keep_playing,
-            dst_frame_freeze,
-            &solid_spikes_cache,
+        let (did_win, add_reachable_stats) = add_reachable_to_dst_frame_direct_parallel(
+            Arc::clone(src_frame),
+            Arc::get_mut(dst_frame_keep_playing).unwrap(),
+            Arc::get_mut(dst_frame_freeze).unwrap(),
+            Arc::clone(&solid_spikes_cache),
         )?;
 
+        add_reachable_stats.print();
+        println!("did_win: {:?}", did_win);
         println!("src_frame stats:");
         src_frame.print_stats();
         println!("dst_frame_keep_playing stats:");
