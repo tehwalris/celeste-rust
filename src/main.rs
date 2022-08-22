@@ -2,7 +2,8 @@ use std::{
     ops::{Add, DerefMut},
     rc::Rc,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Result;
@@ -94,12 +95,14 @@ fn should_skip_save(player_flags: &PlayerFlags) -> bool {
     false
 }
 
+#[derive(Clone)]
 struct AddReachableStats {
     potential_runs: usize,
     actual_runs: usize,
     potential_saves: usize,
     actual_saves: usize,
     elapsed: Option<Duration>,
+    thread_stats: Vec<AddReachableStats>,
 }
 
 impl AddReachableStats {
@@ -110,6 +113,7 @@ impl AddReachableStats {
             potential_saves: 0,
             actual_saves: 0,
             elapsed: None,
+            thread_stats: Vec::new(),
         }
     }
 
@@ -244,9 +248,9 @@ fn add_reachable_to_dst_frame_direct_parallel<'a>(
     dst_frame_freeze: &mut StateTable,
     solid_spikes_cache: Arc<PlayerSolidSpikesCache>,
 ) -> Result<(bool, AddReachableStats)> {
-    let threads = 8;
-    let local_queue_size = 2;
-    let chunk_size = 8;
+    let threads = 4;
+    let local_queue_size = 8;
+    let chunk_size = 4;
 
     let queue: Queue<PosMapRange> = Queue::new(threads, local_queue_size);
 
@@ -255,39 +259,45 @@ fn add_reachable_to_dst_frame_direct_parallel<'a>(
     }
 
     let before_spawn = Instant::now();
-    let handles = queue.local_queues().map(|mut local_queue| {
-        let src_frame = src_frame.clone();
-        let solid_spikes_cache = solid_spikes_cache.clone();
+    let handles: Vec<_> = queue
+        .local_queues()
+        .map(|mut local_queue| {
+            let src_frame = src_frame.clone();
+            let solid_spikes_cache = solid_spikes_cache.clone();
 
-        std::thread::spawn(
-            move || -> Result<(StateTable, StateTable, bool, AddReachableStats)> {
-                let mut local_dst_frame_keep_playing = StateTable::new();
-                let mut local_dst_frame_freeze = StateTable::new();
+            let handle = std::thread::spawn(
+                move || -> Result<(StateTable, StateTable, bool, AddReachableStats)> {
+                    let mut local_dst_frame_keep_playing = StateTable::new();
+                    let mut local_dst_frame_freeze = StateTable::new();
 
-                let mut did_win = false;
-                let mut stats = AddReachableStats::new();
+                    let mut did_win = false;
+                    let mut stats = AddReachableStats::new();
 
-                while let Some(range) = local_queue.pop() {
-                    let (chunk_did_win, chunk_stats) = add_reachable_to_dst_frame_direct_serial(
-                        &src_frame,
-                        |p| range.contains_pos(p),
-                        &mut local_dst_frame_keep_playing,
-                        &mut local_dst_frame_freeze,
-                        &solid_spikes_cache,
-                    )?;
-                    did_win = did_win || chunk_did_win;
-                    stats.add(&chunk_stats);
-                }
+                    while let Some(range) = local_queue.pop() {
+                        let (chunk_did_win, chunk_stats) =
+                            add_reachable_to_dst_frame_direct_serial(
+                                &src_frame,
+                                |p| range.contains_pos(p),
+                                &mut local_dst_frame_keep_playing,
+                                &mut local_dst_frame_freeze,
+                                &solid_spikes_cache,
+                            )?;
+                        did_win = did_win || chunk_did_win;
+                        stats.add(&chunk_stats);
+                    }
 
-                Ok((
-                    local_dst_frame_keep_playing,
-                    local_dst_frame_freeze,
-                    did_win,
-                    stats,
-                ))
-            },
-        )
-    });
+                    Ok((
+                        local_dst_frame_keep_playing,
+                        local_dst_frame_freeze,
+                        did_win,
+                        stats,
+                    ))
+                },
+            );
+
+            handle
+        })
+        .collect();
 
     let mut did_win = false;
     let mut stats = AddReachableStats::new();
@@ -297,6 +307,7 @@ fn add_reachable_to_dst_frame_direct_parallel<'a>(
 
         did_win = did_win || local_did_win;
         stats.add(&local_stats);
+        stats.thread_stats.push(local_stats.clone());
 
         dst_frame_keep_playing.extend(local_dst_frame_keep_playing);
         dst_frame_freeze.extend(local_dst_frame_freeze);
@@ -305,6 +316,26 @@ fn add_reachable_to_dst_frame_direct_parallel<'a>(
     stats.elapsed = Some(before_spawn.elapsed());
 
     Ok((did_win, stats))
+}
+
+fn main_temp() {
+    let handles: Vec<_> = (0..10)
+        .map(|i| {
+            thread::spawn(move || {
+                println!("hi number {} from the spawned thread!", i);
+                thread::sleep(Duration::from_millis(1000));
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // for i in 1..5 {
+    //     println!("hi number {} from the main thread!", i);
+    //     thread::sleep(Duration::from_millis(1));
+    // }
 }
 
 fn main() -> Result<()> {
@@ -349,6 +380,10 @@ fn main() -> Result<()> {
         )?;
 
         add_reachable_stats.print();
+        for (i, local_stats) in add_reachable_stats.thread_stats.iter().enumerate() {
+            print!("  thread {}: ", i);
+            local_stats.print();
+        }
         println!("did_win: {:?}", did_win);
         println!("src_frame stats:");
         src_frame.print_stats();
