@@ -121,11 +121,16 @@ impl AddReachableStats {
 
     fn print(&self) {
         if let Some(elapsed) = self.elapsed {
+            println!("elapsed: {:?}", elapsed,);
             println!(
-                "elapsed: {:?}, elapsed / potential_runs: {:?}, elapsed / actual_runs: {:?}",
-                elapsed,
+                "  elapsed / potential_runs: {:?}, elapsed / actual_runs: {:?}",
                 elapsed.div_f64(self.potential_runs as f64),
                 elapsed.div_f64(self.actual_runs as f64),
+            );
+            println!(
+                "  elapsed / potential_saves: {:?}, elapsed / actual_saves: {:?}",
+                elapsed.div_f64(self.potential_saves as f64),
+                elapsed.div_f64(self.actual_saves as f64),
             );
         }
         if let Some(single_threaded_elapsed) = self.single_threaded_elapsed {
@@ -222,11 +227,10 @@ fn add_reachable_to_dst_frame_direct_serial<'a>(
                         spd: post_update_spd,
                     } = update_result
                     {
-                        stats.potential_saves += 1;
+                        stats.potential_saves += post_move_pos_vec.len();
                         if should_skip_save(&dst_player_flags) {
                             continue;
                         }
-                        stats.actual_saves += 1;
 
                         dst_player_flags.adjust_before_compress();
                         let dst_compressed_player_flags = dst_player_flags
@@ -240,6 +244,8 @@ fn add_reachable_to_dst_frame_direct_serial<'a>(
                         };
 
                         for post_move_pos in &post_move_pos_vec {
+                            stats.actual_saves += 1;
+
                             let PlayerDrawResult {
                                 pos: dst_pos,
                                 spd: dst_spd,
