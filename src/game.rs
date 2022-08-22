@@ -55,7 +55,7 @@ pub struct PlayerPosSpd {
     pub spd: Pico8Vec2,
 }
 
-#[derive(Debug, Hash, PartialEq, Eq)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
 pub struct PosSpdFlags {
     pub is_solid_1_0: bool,
     pub is_solid_neg_1_0: bool,

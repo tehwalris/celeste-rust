@@ -11,7 +11,7 @@ use cart_data::CartData;
 use pico8_num::{int, Pico8Vec2};
 use player_flags::PlayerFlags;
 use room::Room;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use state_table::{PosMapRange, StateTable};
 use work_queue::Queue;
 
@@ -122,8 +122,9 @@ impl AddReachableStats {
     fn print(&self) {
         if let Some(elapsed) = self.elapsed {
             println!(
-                "elapsed: {:?}, elapsed / actual_runs: {:?}",
+                "elapsed: {:?}, elapsed / potential_runs: {:?}, elapsed / actual_runs: {:?}",
                 elapsed,
+                elapsed.div_f64(self.potential_runs as f64),
                 elapsed.div_f64(self.actual_runs as f64),
             );
         }
@@ -165,6 +166,15 @@ fn add_reachable_to_dst_frame_direct_serial<'a>(
         for (src_spd, src_compressed_player_flags) in src_spd_player_flags_set.iter() {
             let src_player_flags = src_compressed_player_flags.decompress();
 
+            let mut inputs_without_skipped = Vec::new();
+            for input in InputFlags::iter() {
+                stats.potential_runs += ALL_DIFFERENT_REMS_FOR_MOVE.len();
+                if !should_skip_run(&src_player_flags, &input) {
+                    inputs_without_skipped.push(input);
+                }
+            }
+
+            let mut post_move_groups: FxHashMap<_, Vec<_>> = FxHashMap::default();
             for rem in ALL_DIFFERENT_REMS_FOR_MOVE {
                 let (post_move_pos_spd, post_move_rem) = run_move_concrete(
                     game::PlayerPosSpd {
@@ -185,19 +195,21 @@ fn add_reachable_to_dst_frame_direct_serial<'a>(
                 );
 
                 let post_move_pos_spd_flags = post_move_pos_spd.flags(&solid_spikes_cache)?;
+                post_move_groups
+                    .entry((post_move_pos_spd_flags, post_move_pos_spd.spd))
+                    .or_default()
+                    .push(post_move_pos_spd.pos);
+            }
 
-                for input in InputFlags::iter() {
-                    stats.potential_runs += 1;
-                    if should_skip_run(&src_player_flags, &input) {
-                        continue;
-                    }
+            for ((post_move_pos_spd_flags, post_move_spd), post_move_pos_vec) in post_move_groups {
+                for input in &inputs_without_skipped {
                     stats.actual_runs += 1;
 
                     let update_result = run_player_update(
                         src_player_flags.clone(),
                         &post_move_pos_spd_flags,
                         &input,
-                        post_move_pos_spd.spd.clone(),
+                        post_move_spd.clone(),
                     );
 
                     if let PlayerUpdateResult::Win = update_result {
@@ -221,22 +233,25 @@ fn add_reachable_to_dst_frame_direct_serial<'a>(
                             .compress()
                             .ok_or(anyhow!("could not compress dst_player_flags"))?;
 
-                        let PlayerDrawResult {
-                            pos: dst_pos,
-                            spd: dst_spd,
-                        } = run_player_draw(post_move_pos_spd.pos.clone(), post_update_spd.clone());
-
                         let dst_frame = if freeze {
                             &mut *dst_frame_freeze
                         } else {
                             &mut *dst_frame_keep_playing
                         };
-                        let dst_spd_player_flags_set = dst_frame.get_mut_or_insert_with(
-                            (dst_pos.x.as_i16_or_err()?, dst_pos.y.as_i16_or_err()?),
-                            FxHashSet::default,
-                        );
-                        dst_spd_player_flags_set
-                            .insert((dst_spd.clone(), dst_compressed_player_flags));
+
+                        for post_move_pos in &post_move_pos_vec {
+                            let PlayerDrawResult {
+                                pos: dst_pos,
+                                spd: dst_spd,
+                            } = run_player_draw(post_move_pos.clone(), post_update_spd.clone());
+
+                            let dst_spd_player_flags_set = dst_frame.get_mut_or_insert_with(
+                                (dst_pos.x.as_i16_or_err()?, dst_pos.y.as_i16_or_err()?),
+                                FxHashSet::default,
+                            );
+                            dst_spd_player_flags_set
+                                .insert((dst_spd.clone(), dst_compressed_player_flags));
+                        }
                     }
                 }
             }
