@@ -102,6 +102,7 @@ struct AddReachableStats {
     potential_saves: usize,
     actual_saves: usize,
     elapsed: Option<Duration>,
+    single_threaded_elapsed: Option<Duration>,
     thread_stats: Vec<AddReachableStats>,
 }
 
@@ -113,6 +114,7 @@ impl AddReachableStats {
             potential_saves: 0,
             actual_saves: 0,
             elapsed: None,
+            single_threaded_elapsed: None,
             thread_stats: Vec::new(),
         }
     }
@@ -124,6 +126,9 @@ impl AddReachableStats {
                 elapsed,
                 elapsed.div_f64(self.actual_runs as f64),
             );
+        }
+        if let Some(single_threaded_elapsed) = self.single_threaded_elapsed {
+            println!("single_threaded_elapsed: {:?}", single_threaded_elapsed);
         }
         println!(
             "potential_runs: {}, actual_runs: {}, potential_saves: {}, actual_saves: {}",
@@ -299,12 +304,17 @@ fn add_reachable_to_dst_frame_direct_parallel<'a>(
         })
         .collect();
 
+    let mut local_results = Vec::new();
+    for handle in handles {
+        local_results.push(handle.join().unwrap()?);
+    }
+
     let mut did_win = false;
     let mut stats = AddReachableStats::new();
-    for handle in handles {
-        let (local_dst_frame_keep_playing, local_dst_frame_freeze, local_did_win, local_stats) =
-            handle.join().unwrap()?;
-
+    let before_join = Instant::now();
+    for (local_dst_frame_keep_playing, local_dst_frame_freeze, local_did_win, local_stats) in
+        local_results
+    {
         did_win = did_win || local_did_win;
         stats.add(&local_stats);
         stats.thread_stats.push(local_stats.clone());
@@ -314,6 +324,7 @@ fn add_reachable_to_dst_frame_direct_parallel<'a>(
     }
 
     stats.elapsed = Some(before_spawn.elapsed());
+    stats.single_threaded_elapsed = Some(before_join.elapsed());
 
     Ok((did_win, stats))
 }
