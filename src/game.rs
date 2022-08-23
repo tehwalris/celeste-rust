@@ -31,17 +31,29 @@ impl InputFlags {
     pub fn from_tas_keycode(c: usize) -> Result<InputFlags> {
         if c < (1 << 6) {
             let bit = |i: usize| c & (1 << i) != 0;
-            Ok(InputFlags {
+            let result = InputFlags {
                 left: bit(0),
                 right: bit(1),
                 up: bit(2),
                 down: bit(3),
                 jump: bit(4),
                 dash: bit(5),
-            })
+            };
+            assert!(result.to_tas_keycode() == c);
+            Ok(result)
         } else {
             Err(anyhow!("invalid keycode"))
         }
+    }
+
+    pub fn to_tas_keycode(&self) -> usize {
+        let bit = |i: usize, v: bool| if v { 1 << i } else { 0 };
+        bit(0, self.left)
+            | bit(1, self.right)
+            | bit(2, self.up)
+            | bit(3, self.down)
+            | bit(4, self.jump)
+            | bit(5, self.dash)
     }
 
     pub fn iter() -> impl Iterator<Item = InputFlags> {
@@ -49,7 +61,7 @@ impl InputFlags {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Hash, PartialEq, Eq)]
 pub struct PlayerPosSpd {
     pub pos: Pico8Vec2,
     pub spd: Pico8Vec2,

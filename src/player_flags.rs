@@ -6,7 +6,7 @@ use crate::pico8_num::{constants, int, Pico8Vec2};
 
 use super::pico8_num::Pico8Num;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PlayerFlags {
     // Common to all objects
     pub flip_x: bool,

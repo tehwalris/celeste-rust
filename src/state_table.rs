@@ -32,6 +32,24 @@ impl StateTable {
             }
         }
     }
+
+    pub fn is_empty(&self) -> bool {
+        for (pos, spd_player_flag_set) in self.iter() {
+            if !spd_player_flag_set.is_empty() {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl Clone for StateTable {
+    fn clone(&self) -> Self {
+        Self {
+            data: self.data.clone(),
+            range: self.range.clone(),
+        }
+    }
 }
 
 #[derive(Hash, PartialEq, Eq, Debug, Clone)]
@@ -146,6 +164,17 @@ impl<T> PosMap<T> {
             mem::take(&mut self.data[i])
         } else {
             None
+        }
+    }
+
+    pub fn set(&mut self, pos: (i16, i16), v: T) {
+        if let Some(i) = self.index_from_pos(pos) {
+            self.data[i] = Some(v);
+        } else {
+            panic!(
+                "pos {:?} is out of range and resizing is not implemented",
+                pos
+            )
         }
     }
 

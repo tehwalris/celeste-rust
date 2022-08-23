@@ -36,10 +36,13 @@ mod sign;
 mod state_table;
 mod tas;
 
-use crate::game::{
-    run_move_concrete, run_player_draw, run_player_update, InputFlags, PlayerDrawResult,
-    PlayerSolidSpikesCache, PlayerUpdateResult, ALL_DIFFERENT_REMS_FOR_MOVE, FREEZE_FRAME_COUNT,
-    MAX_REM, MIN_REM,
+use crate::{
+    game::{
+        run_move_concrete, run_player_draw, run_player_update, InputFlags, PlayerDrawResult,
+        PlayerPosSpd, PlayerSolidSpikesCache, PlayerUpdateResult, ALL_DIFFERENT_REMS_FOR_MOVE,
+        FREEZE_FRAME_COUNT, MAX_REM, MIN_REM,
+    },
+    pico8_num::Pico8Num,
 };
 
 fn set_initial_state(frame: &mut StateTable, room: &Room) -> Result<()> {
@@ -52,11 +55,11 @@ fn set_initial_state(frame: &mut StateTable, room: &Room) -> Result<()> {
         .compress()
         .ok_or(anyhow!("failed to compress initial player_flags"))?;
 
-    let spd_player_flag_map = frame.get_mut_or_insert_with(
+    let spd_player_flag_set = frame.get_mut_or_insert_with(
         (pos.x.as_i16_or_err()?, pos.y.as_i16_or_err()?),
         FxHashSet::default,
     );
-    spd_player_flag_map.insert((spd, compressed_player_flags));
+    spd_player_flag_set.insert((spd, compressed_player_flags));
 
     Ok(())
 }
@@ -157,13 +160,26 @@ fn mark_in_frame(
     pos: &Pico8Vec2,
     spd: Pico8Vec2,
     player_flags: CompressedPlayerFlags,
-) -> Result<bool> {
+) -> Result<()> {
     let player_flags_set = frame.get_mut_or_insert_with(
         (pos.x.as_i16_or_err()?, pos.y.as_i16_or_err()?),
         FxHashSet::default,
     );
-    let exists = player_flags_set.insert((spd.clone(), player_flags));
-    Ok(exists)
+    player_flags_set.insert((spd.clone(), player_flags));
+    Ok(())
+}
+
+fn has_in_frame(
+    frame: &StateTable,
+    pos: &Pico8Vec2,
+    spd: Pico8Vec2,
+    player_flags: CompressedPlayerFlags,
+) -> Result<bool> {
+    if let Some(player_flags_set) = frame.get((pos.x.as_i16_or_err()?, pos.y.as_i16_or_err()?)) {
+        Ok(player_flags_set.contains(&(spd.clone(), player_flags)))
+    } else {
+        Ok(false)
+    }
 }
 
 fn add_reachable_to_dst_frame_direct_serial<'a>(
@@ -267,17 +283,14 @@ fn add_reachable_to_dst_frame_direct_serial<'a>(
                                 spd: dst_spd,
                             } = run_player_draw(post_move_pos.clone(), post_update_spd.clone());
 
-                            let exists = mark_in_frame(
-                                dst_frame,
-                                &dst_pos,
-                                dst_spd,
-                                dst_compressed_player_flags,
-                            )?;
-
-                            if exists {
-                                if let Some(&mut ref mut src_frame_mark_exists) =
-                                    src_frame_mark_exists
-                                {
+                            if let Some(&mut ref mut src_frame_mark_exists) = src_frame_mark_exists
+                            {
+                                if has_in_frame(
+                                    dst_frame,
+                                    &dst_pos,
+                                    dst_spd,
+                                    dst_compressed_player_flags,
+                                )? {
                                     mark_in_frame(
                                         &mut *src_frame_mark_exists,
                                         &Pico8Vec2::from_i16s(src_pos.0, src_pos.1),
@@ -285,6 +298,13 @@ fn add_reachable_to_dst_frame_direct_serial<'a>(
                                         src_compressed_player_flags.clone(),
                                     )?;
                                 }
+                            } else {
+                                mark_in_frame(
+                                    dst_frame,
+                                    &dst_pos,
+                                    dst_spd,
+                                    dst_compressed_player_flags,
+                                )?;
                             }
                         }
                     }
@@ -323,12 +343,12 @@ fn add_reachable_to_dst_frame_direct_parallel<'a>(
             let src_frame = src_frame.clone();
             let solid_spikes_cache = solid_spikes_cache.clone();
 
+            let mut local_src_frame_mark_exists = if src_frame_mark_exists_is_some { Some(StateTable::new()) } else { None };
+            let mut local_dst_frame_keep_playing = if src_frame_mark_exists_is_some { dst_frame_keep_playing.clone() } else { StateTable::new() };
+            let mut local_dst_frame_freeze = if src_frame_mark_exists_is_some { dst_frame_freeze.clone() } else { StateTable::new() };
+
             let handle = std::thread::spawn(
                 move || -> Result<(Option<StateTable>, StateTable, StateTable, bool, AddReachableStats)> {
-                    let mut local_src_frame_mark_exists = if src_frame_mark_exists_is_some { Some(StateTable::new()) } else { None };
-                    let mut local_dst_frame_keep_playing = StateTable::new();
-                    let mut local_dst_frame_freeze = StateTable::new();
-
                     let mut did_win = false;
                     let mut stats = AddReachableStats::new();
 
@@ -393,7 +413,7 @@ fn add_reachable_to_dst_frame_direct_parallel<'a>(
     Ok((did_win, stats))
 }
 
-fn save_debug_image(frame: &StateTable, frame_i: usize) -> Result<()> {
+fn save_debug_image(frame: &StateTable, name: &str) -> Result<()> {
     let range = frame.range();
 
     let data: Vec<_> = range
@@ -418,8 +438,165 @@ fn save_debug_image(frame: &StateTable, frame_i: usize) -> Result<()> {
             .collect(),
     )
     .ok_or(anyhow!("size mismatch"))?;
-    debug_img.save(format!("output/frame-{}.png", frame_i))?;
+    debug_img.save(format!("output/{}.png", name))?;
     Ok(())
+}
+
+// TODO use real win check
+fn is_win_state(pos: (i16, i16)) -> bool {
+    pos == (17, 101)
+}
+
+fn get_win_states(all_states: &StateTable) -> StateTable {
+    let mut win_states = StateTable::new();
+    for (pos, spd_player_flag_set) in all_states.iter() {
+        if is_win_state(pos) {
+            win_states.set(pos, spd_player_flag_set.clone());
+        }
+    }
+    win_states
+}
+
+fn guided_brute_force(
+    room: &Room,
+    solid_spikes_cache: &PlayerSolidSpikesCache,
+    frames: &Vec<StateTable>,
+) -> Result<Option<Vec<InputFlags>>> {
+    #[derive(Clone, Hash, PartialEq, Eq)]
+    struct State {
+        player_pos_spd: PlayerPosSpd,
+        player_flags: PlayerFlags,
+        rem: Pico8Vec2,
+        freeze: Pico8Num,
+    }
+
+    let update = |s: &mut State, input: &InputFlags| -> Result<bool> {
+        if s.freeze > int(0) {
+            s.freeze = s.freeze - int(1);
+            return Ok(false);
+        }
+
+        if s.player_pos_spd.spd.x != int(0) || s.player_pos_spd.spd.y != int(0) {
+            let move_result =
+                run_move_concrete(s.player_pos_spd.clone(), s.rem.clone(), &solid_spikes_cache)?;
+            s.player_pos_spd = move_result.0;
+            s.rem = move_result.1;
+        }
+
+        let player_update_result = run_player_update(
+            s.player_flags.clone(),
+            &s.player_pos_spd.flags(&solid_spikes_cache)?,
+            input,
+            s.player_pos_spd.spd.clone(),
+        );
+        match player_update_result {
+            PlayerUpdateResult::Die => panic!("unexpected death"),
+            PlayerUpdateResult::KeepPlaying {
+                freeze: new_freeze,
+                player_flags: new_player_flags,
+                spd: new_spd,
+            } => {
+                s.freeze = int(if new_freeze {
+                    FREEZE_FRAME_COUNT as i16
+                } else {
+                    0
+                });
+                s.player_flags = new_player_flags;
+                s.player_pos_spd.spd = new_spd;
+
+                Ok(false)
+            }
+            PlayerUpdateResult::Win => Ok(true),
+        }
+    };
+
+    let draw = |s: &mut State| {
+        if s.freeze > int(0) {
+            return;
+        }
+
+        let draw_result =
+            run_player_draw(s.player_pos_spd.pos.clone(), s.player_pos_spd.spd.clone());
+        s.player_pos_spd.pos = draw_result.pos;
+        s.player_pos_spd.spd = draw_result.spd;
+    };
+
+    let mut states = Vec::new();
+    let mut inputs: Vec<InputFlags> = Vec::new();
+    let mut queue: Vec<(usize, Option<InputFlags>, State)> = vec![(
+        0,
+        None,
+        State {
+            player_pos_spd: PlayerPosSpd {
+                pos: room.spawn_pos(),
+                spd: Pico8Vec2::zero(),
+            },
+            player_flags: PlayerFlags::spawn(int(1)),
+            rem: Pico8Vec2::zero(),
+            freeze: int(0),
+        },
+    )];
+
+    let mut highest_frame_i = 0;
+
+    while let Some((frame_i, last_input, last_state)) = queue.pop() {
+        while inputs.len() + if last_input.is_some() { 1 } else { 0 } > frame_i {
+            states.pop().unwrap();
+            inputs.pop().unwrap();
+        }
+        if let Some(input) = last_input {
+            inputs.push(input);
+        }
+        states.push(last_state.clone());
+        assert!(inputs.len() == frame_i);
+        assert!(inputs.len() + 1 == states.len());
+
+        if frame_i > highest_frame_i {
+            println!("brute force reached frame {}", highest_frame_i);
+            highest_frame_i = frame_i;
+        }
+
+        if last_state.freeze.as_i16_or_err()? > 0 {
+            queue.push((
+                frame_i + 1,
+                Some(InputFlags::none()),
+                State {
+                    freeze: last_state.freeze - int(1),
+                    ..last_state
+                },
+            ));
+            continue;
+        }
+
+        let mut next_states = FxHashSet::default();
+        for input in InputFlags::iter() {
+            let mut next_state = last_state.clone();
+            let _real_did_win = update(&mut next_state, &input)?;
+            if is_win_state(next_state.player_pos_spd.pos.as_i16s_or_err()?) {
+                inputs.push(input);
+                return Ok(Some(inputs));
+            }
+            draw(&mut next_state);
+
+            let mut player_flags_for_lookup = next_state.player_flags.clone();
+            player_flags_for_lookup.adjust_before_compress();
+            if !has_in_frame(
+                &frames[frame_i + 1 + (next_state.freeze.as_i16_or_err()? as usize)],
+                &next_state.player_pos_spd.pos,
+                next_state.player_pos_spd.spd.clone(),
+                player_flags_for_lookup.compress().unwrap(),
+            )? {
+                continue;
+            }
+
+            let is_new = next_states.insert(next_state.clone());
+            if is_new {
+                queue.push((frame_i + 1, Some(input), next_state))
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 fn main() -> Result<()> {
@@ -430,59 +607,128 @@ fn main() -> Result<()> {
 
     let solid_spikes_cache = Arc::new(PlayerSolidSpikesCache::calculate(&room));
 
-    let mut frames: Vec<Option<Arc<StateTable>>> = (0..1 + FREEZE_FRAME_COUNT)
+    let mut forward_frames: Vec<Option<Arc<StateTable>>> = (0..=FREEZE_FRAME_COUNT)
         .map(|_| Some(Arc::new(StateTable::new())))
         .collect();
     set_initial_state(
-        &mut Arc::get_mut(frames[0].as_mut().unwrap()).unwrap(),
+        &mut Arc::get_mut(forward_frames[0].as_mut().unwrap()).unwrap(),
         &room,
     )?;
 
-    for i in 0..1000 {
-        println!("i {}", i);
+    for forward_i in 0..1000 {
+        let frame_name = format!("forward-{}", forward_i);
+        println!("{}", frame_name);
 
-        if i > 0 {
-            frames[i - 1] = None;
+        // if forward_i > 0 {
+        //     forward_frames[forward_i - 1] = None;
+        // }
+
+        forward_frames.push(Some(Arc::new(StateTable::new())));
+
+        {
+            let future_frames = &mut forward_frames[forward_i..];
+            let (src_frame, future_frames) = future_frames.split_first_mut().unwrap();
+            let (dst_frame_keep_playing, future_frames) = future_frames.split_first_mut().unwrap();
+            let dst_frame_freeze = &mut future_frames[FREEZE_FRAME_COUNT - 1];
+
+            let src_frame = src_frame.as_ref().unwrap();
+            let dst_frame_keep_playing = dst_frame_keep_playing.as_mut().unwrap();
+            let dst_frame_freeze = dst_frame_freeze.as_mut().unwrap();
+
+            let (did_win, add_reachable_stats) = add_reachable_to_dst_frame_direct_parallel(
+                Arc::clone(src_frame),
+                None,
+                Arc::get_mut(dst_frame_keep_playing).unwrap(),
+                Arc::get_mut(dst_frame_freeze).unwrap(),
+                Arc::clone(&solid_spikes_cache),
+            )?;
+
+            add_reachable_stats.print();
+            for (i, local_stats) in add_reachable_stats.thread_stats.iter().enumerate() {
+                print!("  thread {}: ", i);
+                local_stats.print();
+            }
+            println!("did_win: {:?}", did_win);
+            println!("src_frame stats:");
+            src_frame.print_stats();
+            println!("dst_frame_keep_playing stats:");
+            dst_frame_keep_playing.print_stats();
+            println!("dst_frame_freeze stats:");
+            dst_frame_freeze.print_stats();
+            println!();
+
+            save_debug_image(&src_frame, &frame_name)?;
         }
 
-        frames.push(Some(Arc::new(StateTable::new())));
+        {
+            let win_frame = get_win_states(&forward_frames[forward_i + 1].as_ref().unwrap());
+            if win_frame.is_empty() {
+                continue;
+            }
 
-        let future_frames = &mut frames[i..];
-        let (src_frame, future_frames) = future_frames.split_first_mut().unwrap();
-        let (dst_frame_keep_playing, future_frames) = future_frames.split_first_mut().unwrap();
-        let dst_frame_freeze = &mut future_frames[FREEZE_FRAME_COUNT - 1];
+            let mut backward_frames: Vec<_> = (0..=forward_i + 2 + FREEZE_FRAME_COUNT)
+                .map(|_| StateTable::new())
+                .collect();
+            backward_frames[forward_i + 1] = win_frame;
 
-        let src_frame = src_frame.as_ref().unwrap();
-        let dst_frame_keep_playing = dst_frame_keep_playing.as_mut().unwrap();
-        let dst_frame_freeze = dst_frame_freeze.as_mut().unwrap();
+            for backward_i in (0..=forward_i).rev() {
+                let frame_name = format!("forward-{} backward-{}", forward_i, backward_i);
+                println!("{}", frame_name);
 
-        let (did_win, add_reachable_stats) = add_reachable_to_dst_frame_direct_parallel(
-            Arc::clone(src_frame),
-            None,
-            Arc::get_mut(dst_frame_keep_playing).unwrap(),
-            Arc::get_mut(dst_frame_freeze).unwrap(),
-            Arc::clone(&solid_spikes_cache),
-        )?;
+                let src_frame = forward_frames[backward_i].as_ref().unwrap();
 
-        add_reachable_stats.print();
-        for (i, local_stats) in add_reachable_stats.thread_stats.iter().enumerate() {
-            print!("  thread {}: ", i);
-            local_stats.print();
+                let future_frames = &mut backward_frames[backward_i..];
+                let (src_frame_mark_exists, future_frames) =
+                    future_frames.split_first_mut().unwrap();
+                let (dst_frame_keep_playing, future_frames) =
+                    future_frames.split_first_mut().unwrap();
+                let dst_frame_freeze = &mut future_frames[FREEZE_FRAME_COUNT - 1];
+
+                let (_, add_reachable_stats) = add_reachable_to_dst_frame_direct_parallel(
+                    Arc::clone(src_frame),
+                    Some(src_frame_mark_exists),
+                    dst_frame_keep_playing,
+                    dst_frame_freeze,
+                    Arc::clone(&solid_spikes_cache),
+                )?;
+
+                add_reachable_stats.print();
+                for (i, local_stats) in add_reachable_stats.thread_stats.iter().enumerate() {
+                    print!("  thread {}: ", i);
+                    local_stats.print();
+                }
+                println!("src_frame stats:");
+                src_frame.print_stats();
+                println!("src_frame_mark_exists stats:");
+                src_frame_mark_exists.print_stats();
+                println!("dst_frame_keep_playing stats:");
+                dst_frame_keep_playing.print_stats();
+                println!("dst_frame_freeze stats:");
+                dst_frame_freeze.print_stats();
+                println!();
+
+                save_debug_image(&src_frame_mark_exists, &frame_name)?;
+
+                assert!(!src_frame_mark_exists.is_empty());
+            }
+
+            if let Some(winning_inputs) =
+                guided_brute_force(&room, &solid_spikes_cache, &backward_frames)?
+            {
+                println!("won in frame {}!", forward_i);
+                println!(
+                    "winning_inputs: {}",
+                    winning_inputs
+                        .iter()
+                        .map(|input| input.to_tas_keycode().to_string() + ",")
+                        .collect::<String>()
+                );
+                return Ok(());
+            } else {
+                println!("wining in frame {} is not possible", forward_i);
+            }
         }
-        println!("did_win: {:?}", did_win);
-        println!("src_frame stats:");
-        src_frame.print_stats();
-        println!("dst_frame_keep_playing stats:");
-        dst_frame_keep_playing.print_stats();
-        println!("dst_frame_freeze stats:");
-        dst_frame_freeze.print_stats();
-
-        save_debug_image(&src_frame, i)?;
-
-        println!();
     }
-
-    println!("done");
 
     Ok(())
 }
