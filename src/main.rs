@@ -10,7 +10,7 @@ use anyhow::Result;
 use cart_data::CartData;
 use image::{ImageBuffer, Luma};
 use pico8_num::{int, Pico8Vec2};
-use player_flags::PlayerFlags;
+use player_flags::{CompressedPlayerFlags, PlayerFlags};
 use room::Room;
 use rustc_hash::{FxHashMap, FxHashSet};
 use state_table::{PosMapRange, StateTable};
@@ -152,8 +152,23 @@ impl AddReachableStats {
     }
 }
 
+fn mark_in_frame(
+    frame: &mut StateTable,
+    pos: &Pico8Vec2,
+    spd: Pico8Vec2,
+    player_flags: CompressedPlayerFlags,
+) -> Result<bool> {
+    let player_flags_set = frame.get_mut_or_insert_with(
+        (pos.x.as_i16_or_err()?, pos.y.as_i16_or_err()?),
+        FxHashSet::default,
+    );
+    let exists = player_flags_set.insert((spd.clone(), player_flags));
+    Ok(exists)
+}
+
 fn add_reachable_to_dst_frame_direct_serial<'a>(
     src_frame: &StateTable,
+    src_frame_mark_exists: Option<&mut StateTable>,
     src_pos_filter: impl Fn((i16, i16)) -> bool,
     dst_frame_keep_playing: &'a mut StateTable,
     dst_frame_freeze: &'a mut StateTable,
@@ -252,12 +267,25 @@ fn add_reachable_to_dst_frame_direct_serial<'a>(
                                 spd: dst_spd,
                             } = run_player_draw(post_move_pos.clone(), post_update_spd.clone());
 
-                            let dst_spd_player_flags_set = dst_frame.get_mut_or_insert_with(
-                                (dst_pos.x.as_i16_or_err()?, dst_pos.y.as_i16_or_err()?),
-                                FxHashSet::default,
-                            );
-                            dst_spd_player_flags_set
-                                .insert((dst_spd.clone(), dst_compressed_player_flags));
+                            let exists = mark_in_frame(
+                                dst_frame,
+                                &dst_pos,
+                                dst_spd,
+                                dst_compressed_player_flags,
+                            )?;
+
+                            if exists {
+                                if let Some(&mut ref mut src_frame_mark_exists) =
+                                    src_frame_mark_exists
+                                {
+                                    mark_in_frame(
+                                        &mut *src_frame_mark_exists,
+                                        &Pico8Vec2::from_i16s(src_pos.0, src_pos.1),
+                                        src_spd.clone(),
+                                        src_compressed_player_flags.clone(),
+                                    )?;
+                                }
+                            }
                         }
                     }
                 }
@@ -271,6 +299,7 @@ fn add_reachable_to_dst_frame_direct_serial<'a>(
 
 fn add_reachable_to_dst_frame_direct_parallel<'a>(
     src_frame: Arc<StateTable>,
+    src_frame_mark_exists: Option<&mut StateTable>,
     dst_frame_keep_playing: &mut StateTable,
     dst_frame_freeze: &mut StateTable,
     solid_spikes_cache: Arc<PlayerSolidSpikesCache>,
@@ -285,6 +314,8 @@ fn add_reachable_to_dst_frame_direct_parallel<'a>(
         queue.push(range);
     }
 
+    let src_frame_mark_exists_is_some = src_frame_mark_exists.is_some();
+
     let before_spawn = Instant::now();
     let handles: Vec<_> = queue
         .local_queues()
@@ -293,7 +324,8 @@ fn add_reachable_to_dst_frame_direct_parallel<'a>(
             let solid_spikes_cache = solid_spikes_cache.clone();
 
             let handle = std::thread::spawn(
-                move || -> Result<(StateTable, StateTable, bool, AddReachableStats)> {
+                move || -> Result<(Option<StateTable>, StateTable, StateTable, bool, AddReachableStats)> {
+                    let mut local_src_frame_mark_exists = if src_frame_mark_exists_is_some { Some(StateTable::new()) } else { None };
                     let mut local_dst_frame_keep_playing = StateTable::new();
                     let mut local_dst_frame_freeze = StateTable::new();
 
@@ -304,6 +336,7 @@ fn add_reachable_to_dst_frame_direct_parallel<'a>(
                         let (chunk_did_win, chunk_stats) =
                             add_reachable_to_dst_frame_direct_serial(
                                 &src_frame,
+                                local_src_frame_mark_exists.as_mut(),
                                 |p| range.contains_pos(p),
                                 &mut local_dst_frame_keep_playing,
                                 &mut local_dst_frame_freeze,
@@ -314,6 +347,7 @@ fn add_reachable_to_dst_frame_direct_parallel<'a>(
                     }
 
                     Ok((
+                        local_src_frame_mark_exists,
                         local_dst_frame_keep_playing,
                         local_dst_frame_freeze,
                         did_win,
@@ -334,13 +368,21 @@ fn add_reachable_to_dst_frame_direct_parallel<'a>(
     let mut did_win = false;
     let mut stats = AddReachableStats::new();
     let before_join = Instant::now();
-    for (local_dst_frame_keep_playing, local_dst_frame_freeze, local_did_win, local_stats) in
-        local_results
+    for (
+        local_src_frame_mark_exists,
+        local_dst_frame_keep_playing,
+        local_dst_frame_freeze,
+        local_did_win,
+        local_stats,
+    ) in local_results
     {
         did_win = did_win || local_did_win;
         stats.add(&local_stats);
         stats.thread_stats.push(local_stats.clone());
 
+        if let Some(&mut ref mut src_frame_mark_exists) = src_frame_mark_exists {
+            src_frame_mark_exists.extend(local_src_frame_mark_exists.unwrap());
+        }
         dst_frame_keep_playing.extend(local_dst_frame_keep_playing);
         dst_frame_freeze.extend(local_dst_frame_freeze);
     }
@@ -416,6 +458,7 @@ fn main() -> Result<()> {
 
         let (did_win, add_reachable_stats) = add_reachable_to_dst_frame_direct_parallel(
             Arc::clone(src_frame),
+            None,
             Arc::get_mut(dst_frame_keep_playing).unwrap(),
             Arc::get_mut(dst_frame_freeze).unwrap(),
             Arc::clone(&solid_spikes_cache),
