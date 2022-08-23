@@ -442,9 +442,8 @@ fn save_debug_image(frame: &StateTable, name: &str) -> Result<()> {
     Ok(())
 }
 
-// TODO use real win check
 fn is_win_state(pos: (i16, i16)) -> bool {
-    pos == (17, 101)
+    pos.1 < -4
 }
 
 fn get_win_states(all_states: &StateTable) -> StateTable {
@@ -570,6 +569,10 @@ fn guided_brute_force(
 
         let mut next_states = FxHashSet::default();
         for input in InputFlags::iter() {
+            if should_skip_run(&last_state.player_flags, &input) {
+                continue;
+            }
+
             let mut next_state = last_state.clone();
             let _real_did_win = update(&mut next_state, &input)?;
             if is_win_state(next_state.player_pos_spd.pos.as_i16s_or_err()?) {
@@ -577,6 +580,10 @@ fn guided_brute_force(
                 return Ok(Some(inputs));
             }
             draw(&mut next_state);
+
+            if should_skip_save(&next_state.player_flags) {
+                continue;
+            }
 
             let mut player_flags_for_lookup = next_state.player_flags.clone();
             player_flags_for_lookup.adjust_before_compress();
@@ -619,6 +626,7 @@ fn main() -> Result<()> {
         let frame_name = format!("forward-{}", forward_i);
         println!("{}", frame_name);
 
+        // HACK You need a lot of RAM or swap to run this without deleting frames from memory.
         // if forward_i > 0 {
         //     forward_frames[forward_i - 1] = None;
         // }
@@ -708,9 +716,9 @@ fn main() -> Result<()> {
                 println!();
 
                 save_debug_image(&src_frame_mark_exists, &frame_name)?;
-
-                assert!(!src_frame_mark_exists.is_empty());
             }
+
+            assert!(!backward_frames[0].is_empty());
 
             if let Some(winning_inputs) =
                 guided_brute_force(&room, &solid_spikes_cache, &backward_frames)?
@@ -726,6 +734,7 @@ fn main() -> Result<()> {
                 return Ok(());
             } else {
                 println!("wining in frame {} is not possible", forward_i);
+                println!();
             }
         }
     }
