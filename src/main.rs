@@ -465,7 +465,7 @@ fn save_debug_image(frame: &StateTable, name: &str) -> Result<()> {
 }
 
 fn is_extra_win_state(pos: (i16, i16)) -> bool {
-    pos == (37, 97)
+    false
 }
 
 fn guided_brute_force(
@@ -700,6 +700,7 @@ fn main() -> Result<()> {
             }
             println!("did_win: {:?}", did_win);
 
+            let before_fast_forward_pass_extras = Instant::now();
             if fast_forward_pass {
                 seen_states.extend(src_frame_new.as_ref().clone());
                 seen_win_states.extend(src_frame_mark_win.clone());
@@ -736,7 +737,12 @@ fn main() -> Result<()> {
                     full_frame.extend(seen_states.clone());
                 }
             }
+            let fast_forward_pass_extras_elapsed = before_fast_forward_pass_extras.elapsed();
 
+            println!(
+                "fast_forward_pass_extras_elapsed: {:?}",
+                fast_forward_pass_extras_elapsed
+            );
             println!("src_frame_new stats:");
             src_frame_new.print_stats();
             println!("dst_frame_keep_playing_new stats:");
