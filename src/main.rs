@@ -77,13 +77,20 @@ fn should_skip_run(player_flags: &PlayerFlags, input: &InputFlags) -> bool {
         return true;
     }
 
+    // Up and down do nothing without dash
+    if (input.up || input.down) && !input.dash {
+        return true;
+    }
+
     // Jump will be ignored if it was pressed last frame
     if input.jump && player_flags.p_jump {
         return true;
     }
 
-    // Dash will be ignored if it was pressed last frame
-    if input.dash && player_flags.p_dash {
+    // Dash will be ignored if already dashing, have no dash, or dash was pressed last frame
+    if input.dash
+        && (player_flags.p_dash || player_flags.dash_time > int(0) || player_flags.djump == int(0))
+    {
         return true;
     }
 
@@ -97,6 +104,11 @@ fn should_skip_save(player_flags: &PlayerFlags) -> bool {
         return true;
     }
     assert!(player_flags.jbuffer == int(0));
+
+    // Pressed dash, but didn't actually dash
+    if player_flags.p_dash && player_flags.dash_time != int(4) {
+        return true;
+    }
 
     false
 }
@@ -464,7 +476,7 @@ fn save_debug_bool_image(frame: &PosMap<bool>, name: &str) -> Result<()> {
 }
 
 fn is_extra_win_state(pos: (i16, i16)) -> bool {
-    pos == (31, 97)
+    pos == (31, 66)
 }
 
 fn guided_brute_force(
