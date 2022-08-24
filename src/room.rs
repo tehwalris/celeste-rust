@@ -31,6 +31,11 @@ impl<'a> Room<'a> {
         }
     }
 
+    pub fn is_world_still(&self) -> bool {
+        // TODO This is only valid for room 2
+        true
+    }
+
     pub fn tile_at(&self, x: Pico8Num, y: Pico8Num) -> Result<u8> {
         self.cart_data
             .mget(self.x * int(16) + x, self.y * int(16) + y)

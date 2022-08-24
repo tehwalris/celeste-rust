@@ -629,10 +629,19 @@ fn main() -> Result<()> {
     let mut forward_frames: Vec<Option<Arc<StateTable>>> = (0..=FREEZE_FRAME_COUNT)
         .map(|_| Some(Arc::new(StateTable::new())))
         .collect();
-    set_initial_state(
-        &mut Arc::get_mut(forward_frames[0].as_mut().unwrap()).unwrap(),
-        &room,
-    )?;
+    let mut forward_frames_new: Vec<Option<Arc<StateTable>>> = (0..=FREEZE_FRAME_COUNT)
+        .map(|_| Some(Arc::new(StateTable::new())))
+        .collect();
+    for frames in [&mut forward_frames, &mut forward_frames_new] {
+        set_initial_state(
+            &mut Arc::get_mut(frames[0].as_mut().unwrap()).unwrap(),
+            &room,
+        )?;
+    }
+
+    let fast_forward_pass = room.is_world_still();
+    let mut seen_states = StateTable::new();
+    let mut seen_win_states = StateTable::new();
 
     for forward_i in 0..1000 {
         let frame_name = format!("forward-{}", forward_i);
@@ -642,8 +651,12 @@ fn main() -> Result<()> {
         // if forward_i > 0 {
         //     forward_frames[forward_i - 1] = None;
         // }
+        if forward_i > 0 {
+            forward_frames_new[forward_i - 1] = None;
+        }
 
         forward_frames.push(Some(Arc::new(StateTable::new())));
+        forward_frames_new.push(Some(Arc::new(StateTable::new())));
 
         let mut src_frame_mark_win = StateTable::new();
         {
@@ -656,8 +669,22 @@ fn main() -> Result<()> {
             let dst_frame_keep_playing = dst_frame_keep_playing.as_mut().unwrap();
             let dst_frame_freeze = dst_frame_freeze.as_mut().unwrap();
 
+            let future_frames = &mut forward_frames_new[forward_i..];
+            let (src_frame_new, future_frames) = future_frames.split_first_mut().unwrap();
+            let (dst_frame_keep_playing_new, future_frames) =
+                future_frames.split_first_mut().unwrap();
+            let dst_frame_freeze_new = &mut future_frames[FREEZE_FRAME_COUNT - 1];
+
+            let src_frame_new = src_frame_new.as_ref().unwrap();
+            let dst_frame_keep_playing_new = dst_frame_keep_playing_new.as_mut().unwrap();
+            let dst_frame_freeze_new = dst_frame_freeze_new.as_mut().unwrap();
+
             let (did_win, add_reachable_stats) = add_reachable_to_dst_frame_direct_parallel(
-                Arc::clone(src_frame),
+                Arc::clone(if fast_forward_pass {
+                    src_frame_new
+                } else {
+                    src_frame
+                }),
                 None,
                 Some(&mut src_frame_mark_win),
                 Arc::get_mut(dst_frame_keep_playing).unwrap(),
@@ -672,15 +699,59 @@ fn main() -> Result<()> {
                 local_stats.print();
             }
             println!("did_win: {:?}", did_win);
+
+            if fast_forward_pass {
+                seen_states.extend(src_frame_new.as_ref().clone());
+                seen_win_states.extend(src_frame_mark_win.clone());
+                src_frame_mark_win = seen_win_states.clone();
+
+                for (full_frame, new_frame) in [
+                    (
+                        Arc::get_mut(dst_frame_keep_playing).unwrap(),
+                        Arc::get_mut(dst_frame_keep_playing_new).unwrap(),
+                    ),
+                    (
+                        Arc::get_mut(dst_frame_freeze).unwrap(),
+                        Arc::get_mut(dst_frame_freeze_new).unwrap(),
+                    ),
+                ] {
+                    for (pos, spd_player_flag_set) in full_frame.iter() {
+                        for (spd, compressed_player_flags) in spd_player_flag_set {
+                            if !has_in_frame(
+                                &seen_states,
+                                &Pico8Vec2::from_i16s(pos.0, pos.1),
+                                spd.clone(),
+                                *compressed_player_flags,
+                            )? {
+                                mark_in_frame(
+                                    new_frame,
+                                    &Pico8Vec2::from_i16s(pos.0, pos.1),
+                                    spd.clone(),
+                                    *compressed_player_flags,
+                                )?;
+                            }
+                        }
+                    }
+
+                    full_frame.extend(seen_states.clone());
+                }
+            }
+
+            println!("src_frame_new stats:");
+            src_frame_new.print_stats();
+            println!("dst_frame_keep_playing_new stats:");
+            dst_frame_keep_playing_new.print_stats();
+            println!("dst_frame_freeze_new stats:");
+            dst_frame_freeze_new.print_stats();
+            save_debug_image(&src_frame_new, &format!("{} src_frame_new", frame_name))?;
             println!("src_frame stats:");
             src_frame.print_stats();
             println!("dst_frame_keep_playing stats:");
             dst_frame_keep_playing.print_stats();
             println!("dst_frame_freeze stats:");
             dst_frame_freeze.print_stats();
+            save_debug_image(&src_frame, &format!("{} src_frame", frame_name))?;
             println!();
-
-            save_debug_image(&src_frame, &frame_name)?;
         }
 
         if src_frame_mark_win.is_empty() {
