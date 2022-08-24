@@ -814,9 +814,10 @@ fn main() -> Result<()> {
                     &format!("{} src_frame_filtered", frame_name),
                 )?;
                 assert!(!src_frame_filtered.is_empty());
+                let src_frame_filtered = Arc::new(src_frame_filtered);
 
                 let (_, add_reachable_stats) = add_reachable_to_dst_frame_direct_parallel(
-                    Arc::clone(src_frame),
+                    Arc::clone(&src_frame_filtered),
                     Some(src_frame_mark_exists),
                     None,
                     dst_frame_keep_playing,
