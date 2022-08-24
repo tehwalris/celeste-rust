@@ -185,6 +185,7 @@ fn has_in_frame(
 fn add_reachable_to_dst_frame_direct_serial<'a>(
     src_frame: &StateTable,
     src_frame_mark_exists: Option<&mut StateTable>,
+    src_frame_mark_win: Option<&mut StateTable>,
     src_pos_filter: impl Fn((i16, i16)) -> bool,
     dst_frame_keep_playing: &'a mut StateTable,
     dst_frame_freeze: &'a mut StateTable,
@@ -249,8 +250,20 @@ fn add_reachable_to_dst_frame_direct_serial<'a>(
                         post_move_spd.clone(),
                     );
 
-                    if let PlayerUpdateResult::Win = update_result {
+                    if matches!(update_result, PlayerUpdateResult::Win)
+                        || post_move_pos_vec
+                            .iter()
+                            .any(|pos| is_extra_win_state(pos.as_i16s_or_err().unwrap()))
+                    {
                         did_win = true;
+                        if let Some(&mut ref mut src_frame_mark_win) = src_frame_mark_win {
+                            mark_in_frame(
+                                src_frame_mark_win,
+                                &Pico8Vec2::from_i16s(src_pos.0, src_pos.1),
+                                src_spd.clone(),
+                                src_compressed_player_flags.clone(),
+                            )?;
+                        }
                     }
 
                     if let PlayerUpdateResult::KeepPlaying {
@@ -320,6 +333,7 @@ fn add_reachable_to_dst_frame_direct_serial<'a>(
 fn add_reachable_to_dst_frame_direct_parallel<'a>(
     src_frame: Arc<StateTable>,
     src_frame_mark_exists: Option<&mut StateTable>,
+    src_frame_mark_win: Option<&mut StateTable>,
     dst_frame_keep_playing: &mut StateTable,
     dst_frame_freeze: &mut StateTable,
     solid_spikes_cache: Arc<PlayerSolidSpikesCache>,
@@ -335,6 +349,7 @@ fn add_reachable_to_dst_frame_direct_parallel<'a>(
     }
 
     let src_frame_mark_exists_is_some = src_frame_mark_exists.is_some();
+    let src_frame_mark_win_is_some = src_frame_mark_win.is_some();
 
     let before_spawn = Instant::now();
     let handles: Vec<_> = queue
@@ -344,11 +359,12 @@ fn add_reachable_to_dst_frame_direct_parallel<'a>(
             let solid_spikes_cache = solid_spikes_cache.clone();
 
             let mut local_src_frame_mark_exists = if src_frame_mark_exists_is_some { Some(StateTable::new()) } else { None };
+            let mut local_src_frame_mark_win = if src_frame_mark_win_is_some { Some(StateTable::new()) } else { None };
             let mut local_dst_frame_keep_playing = if src_frame_mark_exists_is_some { dst_frame_keep_playing.clone() } else { StateTable::new() };
             let mut local_dst_frame_freeze = if src_frame_mark_exists_is_some { dst_frame_freeze.clone() } else { StateTable::new() };
 
             let handle = std::thread::spawn(
-                move || -> Result<(Option<StateTable>, StateTable, StateTable, bool, AddReachableStats)> {
+                move || -> Result<(Option<StateTable>, Option<StateTable>, StateTable, StateTable, bool, AddReachableStats)> {
                     let mut did_win = false;
                     let mut stats = AddReachableStats::new();
 
@@ -357,6 +373,7 @@ fn add_reachable_to_dst_frame_direct_parallel<'a>(
                             add_reachable_to_dst_frame_direct_serial(
                                 &src_frame,
                                 local_src_frame_mark_exists.as_mut(),
+                                local_src_frame_mark_win.as_mut(),
                                 |p| range.contains_pos(p),
                                 &mut local_dst_frame_keep_playing,
                                 &mut local_dst_frame_freeze,
@@ -368,6 +385,7 @@ fn add_reachable_to_dst_frame_direct_parallel<'a>(
 
                     Ok((
                         local_src_frame_mark_exists,
+                        local_src_frame_mark_win,
                         local_dst_frame_keep_playing,
                         local_dst_frame_freeze,
                         did_win,
@@ -390,6 +408,7 @@ fn add_reachable_to_dst_frame_direct_parallel<'a>(
     let before_join = Instant::now();
     for (
         local_src_frame_mark_exists,
+        local_src_frame_mark_win,
         local_dst_frame_keep_playing,
         local_dst_frame_freeze,
         local_did_win,
@@ -402,6 +421,9 @@ fn add_reachable_to_dst_frame_direct_parallel<'a>(
 
         if let Some(&mut ref mut src_frame_mark_exists) = src_frame_mark_exists {
             src_frame_mark_exists.extend(local_src_frame_mark_exists.unwrap());
+        }
+        if let Some(&mut ref mut src_frame_mark_win) = src_frame_mark_win {
+            src_frame_mark_win.extend(local_src_frame_mark_win.unwrap());
         }
         dst_frame_keep_playing.extend(local_dst_frame_keep_playing);
         dst_frame_freeze.extend(local_dst_frame_freeze);
@@ -442,18 +464,8 @@ fn save_debug_image(frame: &StateTable, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn is_win_state(pos: (i16, i16)) -> bool {
-    pos.1 < -4
-}
-
-fn get_win_states(all_states: &StateTable) -> StateTable {
-    let mut win_states = StateTable::new();
-    for (pos, spd_player_flag_set) in all_states.iter() {
-        if is_win_state(pos) {
-            win_states.set(pos, spd_player_flag_set.clone());
-        }
-    }
-    win_states
+fn is_extra_win_state(pos: (i16, i16)) -> bool {
+    pos == (37, 97)
 }
 
 fn guided_brute_force(
@@ -574,8 +586,8 @@ fn guided_brute_force(
             }
 
             let mut next_state = last_state.clone();
-            let _real_did_win = update(&mut next_state, &input)?;
-            if is_win_state(next_state.player_pos_spd.pos.as_i16s_or_err()?) {
+            let did_win = update(&mut next_state, &input)?;
+            if did_win || is_extra_win_state(next_state.player_pos_spd.pos.as_i16s_or_err()?) {
                 inputs.push(input);
                 return Ok(Some(inputs));
             }
@@ -633,6 +645,7 @@ fn main() -> Result<()> {
 
         forward_frames.push(Some(Arc::new(StateTable::new())));
 
+        let mut src_frame_mark_win = StateTable::new();
         {
             let future_frames = &mut forward_frames[forward_i..];
             let (src_frame, future_frames) = future_frames.split_first_mut().unwrap();
@@ -646,10 +659,12 @@ fn main() -> Result<()> {
             let (did_win, add_reachable_stats) = add_reachable_to_dst_frame_direct_parallel(
                 Arc::clone(src_frame),
                 None,
+                Some(&mut src_frame_mark_win),
                 Arc::get_mut(dst_frame_keep_playing).unwrap(),
                 Arc::get_mut(dst_frame_freeze).unwrap(),
                 Arc::clone(&solid_spikes_cache),
             )?;
+            assert!(src_frame_mark_win.is_empty() != did_win);
 
             add_reachable_stats.print();
             for (i, local_stats) in add_reachable_stats.thread_stats.iter().enumerate() {
@@ -668,18 +683,17 @@ fn main() -> Result<()> {
             save_debug_image(&src_frame, &frame_name)?;
         }
 
-        {
-            let win_frame = get_win_states(&forward_frames[forward_i + 1].as_ref().unwrap());
-            if win_frame.is_empty() {
-                continue;
-            }
+        if src_frame_mark_win.is_empty() {
+            continue;
+        }
 
-            let mut backward_frames: Vec<_> = (0..=forward_i + 2 + FREEZE_FRAME_COUNT)
+        {
+            let mut backward_frames: Vec<_> = (0..=forward_i + 1 + FREEZE_FRAME_COUNT)
                 .map(|_| StateTable::new())
                 .collect();
-            backward_frames[forward_i + 1] = win_frame;
+            backward_frames[forward_i] = src_frame_mark_win;
 
-            for backward_i in (0..=forward_i).rev() {
+            for backward_i in (0..forward_i).rev() {
                 let frame_name = format!("forward-{} backward-{}", forward_i, backward_i);
                 println!("{}", frame_name);
 
@@ -695,6 +709,7 @@ fn main() -> Result<()> {
                 let (_, add_reachable_stats) = add_reachable_to_dst_frame_direct_parallel(
                     Arc::clone(src_frame),
                     Some(src_frame_mark_exists),
+                    None,
                     dst_frame_keep_playing,
                     dst_frame_freeze,
                     Arc::clone(&solid_spikes_cache),
