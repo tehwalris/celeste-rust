@@ -141,12 +141,12 @@ impl PlayerSolidSpikesCache {
     pub fn calculate(room: &Room) -> Self {
         let mut solid_at_data = PosMap::new_wide();
         solid_at_data
-            .fill(|x, y| Self::solid_at_uncached(&Pico8Vec2::from_i16s(x, y), room).unwrap());
+            .fill(|x, y| Some(Self::solid_at_uncached(&Pico8Vec2::from_i16s(x, y), room).unwrap()));
 
         let spikes_at_data = SignVec2Map::new(|spd| {
             let mut spikes_at_inner_data = PosMap::new_wide();
             spikes_at_inner_data.fill(|x, y| {
-                Self::spikes_at_uncached(&Pico8Vec2::from_i16s(x, y), spd, room).unwrap()
+                Some(Self::spikes_at_uncached(&Pico8Vec2::from_i16s(x, y), spd, room).unwrap())
             });
             spikes_at_inner_data
         });

@@ -43,6 +43,7 @@ use crate::{
         FREEZE_FRAME_COUNT, MAX_REM, MIN_REM,
     },
     pico8_num::Pico8Num,
+    state_table::PosMap,
 };
 
 fn set_initial_state(frame: &mut StateTable, room: &Room) -> Result<()> {
@@ -55,11 +56,12 @@ fn set_initial_state(frame: &mut StateTable, room: &Room) -> Result<()> {
         .compress()
         .ok_or(anyhow!("failed to compress initial player_flags"))?;
 
-    let spd_player_flag_set = frame.get_mut_or_insert_with(
-        (pos.x.as_i16_or_err()?, pos.y.as_i16_or_err()?),
-        FxHashSet::default,
-    );
-    spd_player_flag_set.insert((spd, compressed_player_flags));
+    frame.mark_state(
+        pos.as_i16s_or_err()?,
+        pos.as_i16s_or_err()?,
+        spd,
+        compressed_player_flags,
+    )?;
 
     Ok(())
 }
@@ -155,33 +157,6 @@ impl AddReachableStats {
     }
 }
 
-fn mark_in_frame(
-    frame: &mut StateTable,
-    pos: &Pico8Vec2,
-    spd: Pico8Vec2,
-    player_flags: CompressedPlayerFlags,
-) -> Result<()> {
-    let player_flags_set = frame.get_mut_or_insert_with(
-        (pos.x.as_i16_or_err()?, pos.y.as_i16_or_err()?),
-        FxHashSet::default,
-    );
-    player_flags_set.insert((spd.clone(), player_flags));
-    Ok(())
-}
-
-fn has_in_frame(
-    frame: &StateTable,
-    pos: &Pico8Vec2,
-    spd: Pico8Vec2,
-    player_flags: CompressedPlayerFlags,
-) -> Result<bool> {
-    if let Some(player_flags_set) = frame.get((pos.x.as_i16_or_err()?, pos.y.as_i16_or_err()?)) {
-        Ok(player_flags_set.contains(&(spd.clone(), player_flags)))
-    } else {
-        Ok(false)
-    }
-}
-
 fn add_reachable_to_dst_frame_direct_serial<'a>(
     src_frame: &StateTable,
     src_frame_mark_exists: Option<&mut StateTable>,
@@ -196,12 +171,12 @@ fn add_reachable_to_dst_frame_direct_serial<'a>(
     let mut did_win = false;
 
     let before_update = Instant::now();
-    for (src_pos, src_spd_player_flags_set) in src_frame.iter() {
+    for (src_pos, cell) in src_frame.iter() {
         if !src_pos_filter(src_pos) {
             continue;
         }
 
-        for (src_spd, src_compressed_player_flags) in src_spd_player_flags_set.iter() {
+        for (src_spd, src_compressed_player_flags) in cell.spd_player_flags_set().iter() {
             let src_player_flags = src_compressed_player_flags.decompress();
 
             let mut inputs_without_skipped = Vec::new();
@@ -257,9 +232,9 @@ fn add_reachable_to_dst_frame_direct_serial<'a>(
                     {
                         did_win = true;
                         if let Some(&mut ref mut src_frame_mark_win) = src_frame_mark_win {
-                            mark_in_frame(
-                                src_frame_mark_win,
-                                &Pico8Vec2::from_i16s(src_pos.0, src_pos.1),
+                            src_frame_mark_win.mark_state(
+                                src_pos,
+                                src_pos,
                                 src_spd.clone(),
                                 src_compressed_player_flags.clone(),
                             )?;
@@ -296,25 +271,26 @@ fn add_reachable_to_dst_frame_direct_serial<'a>(
                                 spd: dst_spd,
                             } = run_player_draw(post_move_pos.clone(), post_update_spd.clone());
 
+                            let dst_pos = dst_pos.as_i16s_or_err()?;
+
                             if let Some(&mut ref mut src_frame_mark_exists) = src_frame_mark_exists
                             {
-                                if has_in_frame(
-                                    dst_frame,
-                                    &dst_pos,
+                                if dst_frame.has_state(
+                                    dst_pos,
                                     dst_spd,
                                     dst_compressed_player_flags,
                                 )? {
-                                    mark_in_frame(
-                                        &mut *src_frame_mark_exists,
-                                        &Pico8Vec2::from_i16s(src_pos.0, src_pos.1),
+                                    src_frame_mark_exists.mark_state(
+                                        dst_pos,
+                                        src_pos,
                                         src_spd.clone(),
                                         src_compressed_player_flags.clone(),
                                     )?;
                                 }
                             } else {
-                                mark_in_frame(
-                                    dst_frame,
-                                    &dst_pos,
+                                dst_frame.mark_state(
+                                    src_pos,
+                                    dst_pos,
                                     dst_spd,
                                     dst_compressed_player_flags,
                                 )?;
@@ -442,8 +418,8 @@ fn save_debug_image(frame: &StateTable, name: &str) -> Result<()> {
         .clone()
         .into_positions()
         .map(|pos| {
-            if let Some(stuff) = frame.get(pos) {
-                stuff.len()
+            if let Some(cell) = frame.get(pos) {
+                cell.spd_player_flags_set().len()
             } else {
                 0
             }
@@ -464,8 +440,31 @@ fn save_debug_image(frame: &StateTable, name: &str) -> Result<()> {
     Ok(())
 }
 
+fn save_debug_bool_image(frame: &PosMap<bool>, name: &str) -> Result<()> {
+    let range = frame.range();
+
+    let debug_img = ImageBuffer::<Luma<u8>, Vec<u8>>::from_raw(
+        (range.max_x - range.min_x + 1) as u32,
+        (range.max_y - range.min_y + 1) as u32,
+        range
+            .clone()
+            .into_positions()
+            .map(|pos| {
+                if let Some(&true) = frame.get(pos) {
+                    255
+                } else {
+                    0
+                }
+            })
+            .collect(),
+    )
+    .ok_or(anyhow!("size mismatch"))?;
+    debug_img.save(format!("output/{}.png", name))?;
+    Ok(())
+}
+
 fn is_extra_win_state(pos: (i16, i16)) -> bool {
-    false
+    pos == (31, 97)
 }
 
 fn guided_brute_force(
@@ -599,9 +598,8 @@ fn guided_brute_force(
 
             let mut player_flags_for_lookup = next_state.player_flags.clone();
             player_flags_for_lookup.adjust_before_compress();
-            if !has_in_frame(
-                &frames[frame_i + 1 + (next_state.freeze.as_i16_or_err()? as usize)],
-                &next_state.player_pos_spd.pos,
+            if !frames[frame_i + 1 + (next_state.freeze.as_i16_or_err()? as usize)].has_state(
+                next_state.player_pos_spd.pos.as_i16s_or_err()?,
                 next_state.player_pos_spd.spd.clone(),
                 player_flags_for_lookup.compress().unwrap(),
             )? {
@@ -716,17 +714,12 @@ fn main() -> Result<()> {
                         Arc::get_mut(dst_frame_freeze_new).unwrap(),
                     ),
                 ] {
-                    for (pos, spd_player_flag_set) in full_frame.iter() {
-                        for (spd, compressed_player_flags) in spd_player_flag_set {
-                            if !has_in_frame(
-                                &seen_states,
-                                &Pico8Vec2::from_i16s(pos.0, pos.1),
-                                spd.clone(),
-                                *compressed_player_flags,
-                            )? {
-                                mark_in_frame(
-                                    new_frame,
-                                    &Pico8Vec2::from_i16s(pos.0, pos.1),
+                    for (pos, cell) in full_frame.iter() {
+                        for (spd, compressed_player_flags) in cell.spd_player_flags_set() {
+                            if !seen_states.has_state(pos, spd.clone(), *compressed_player_flags)? {
+                                new_frame.copy_state(
+                                    cell,
+                                    pos,
                                     spd.clone(),
                                     *compressed_player_flags,
                                 )?;
@@ -775,6 +768,7 @@ fn main() -> Result<()> {
                 println!("{}", frame_name);
 
                 let src_frame = forward_frames[backward_i].as_ref().unwrap();
+                save_debug_image(&src_frame, &format!("{} src_frame", frame_name))?;
 
                 let future_frames = &mut backward_frames[backward_i..];
                 let (src_frame_mark_exists, future_frames) =
@@ -782,6 +776,44 @@ fn main() -> Result<()> {
                 let (dst_frame_keep_playing, future_frames) =
                     future_frames.split_first_mut().unwrap();
                 let dst_frame_freeze = &mut future_frames[FREEZE_FRAME_COUNT - 1];
+
+                let dst_frame_keep_playing_forward =
+                    forward_frames[backward_i + 1].as_ref().unwrap();
+                let dst_frame_freeze_forward = forward_frames[backward_i + 1 + FREEZE_FRAME_COUNT]
+                    .as_ref()
+                    .unwrap();
+
+                let mut possible_src_mask = PosMap::new();
+                for (backward_frame, forward_frame) in [
+                    (&*dst_frame_keep_playing, dst_frame_keep_playing_forward),
+                    (&*dst_frame_freeze, dst_frame_freeze_forward),
+                ] {
+                    for (pos, _) in backward_frame.iter() {
+                        forward_frame
+                            .get(pos)
+                            .unwrap()
+                            .add_to_possible_src_mask(&mut possible_src_mask);
+                    }
+                }
+                save_debug_bool_image(
+                    &possible_src_mask,
+                    &format!("{} possible_src_mask", frame_name),
+                )?;
+                assert!(possible_src_mask.iter().any(|(_, v)| *v));
+
+                let mut src_frame_filtered = StateTable::new();
+                src_frame_filtered.fill(|x, y| {
+                    if possible_src_mask.get((x, y)) == Some(&true) {
+                        src_frame.get((x, y)).cloned()
+                    } else {
+                        None
+                    }
+                });
+                save_debug_image(
+                    &src_frame_filtered,
+                    &format!("{} src_frame_filtered", frame_name),
+                )?;
+                assert!(!src_frame_filtered.is_empty());
 
                 let (_, add_reachable_stats) = add_reachable_to_dst_frame_direct_parallel(
                     Arc::clone(src_frame),
@@ -792,6 +824,10 @@ fn main() -> Result<()> {
                     Arc::clone(&solid_spikes_cache),
                 )?;
 
+                for (pos, _) in src_frame_mark_exists.iter() {
+                    assert!(src_frame.get(pos).is_some());
+                }
+
                 add_reachable_stats.print();
                 for (i, local_stats) in add_reachable_stats.thread_stats.iter().enumerate() {
                     print!("  thread {}: ", i);
@@ -799,6 +835,8 @@ fn main() -> Result<()> {
                 }
                 println!("src_frame stats:");
                 src_frame.print_stats();
+                println!("src_frame_filtered stats:");
+                src_frame_filtered.print_stats();
                 println!("src_frame_mark_exists stats:");
                 src_frame_mark_exists.print_stats();
                 println!("dst_frame_keep_playing stats:");
@@ -807,7 +845,10 @@ fn main() -> Result<()> {
                 dst_frame_freeze.print_stats();
                 println!();
 
-                save_debug_image(&src_frame_mark_exists, &frame_name)?;
+                save_debug_image(
+                    &src_frame_mark_exists,
+                    &format!("{} src_frame_mark_exists", frame_name),
+                )?;
             }
 
             assert!(!backward_frames[0].is_empty());

@@ -79,7 +79,7 @@ impl<T> SignVec2Map<T> {
             Sign::Positive => 2,
         };
         let i = index_from_sign(key.x) + 3 * index_from_sign(key.y);
-        assert!(i >= 0 && i < Self::INDEX_COUNT);
+        assert!(i < Self::INDEX_COUNT);
         assert!(Self::key_from_index(i) == key);
         i
     }

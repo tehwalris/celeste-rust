@@ -1,21 +1,26 @@
+use crate::{pico8_num::Pico8Vec2, player_flags::CompressedPlayerFlags};
+use anyhow::Result;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::{cmp, mem};
 
-use crate::{pico8_num::Pico8Vec2, player_flags::CompressedPlayerFlags};
-use rustc_hash::FxHashSet;
-
-pub type StateTable = PosMap<FxHashSet<(Pico8Vec2, CompressedPlayerFlags)>>;
+pub type StateTable = PosMap<StateTableCell>;
 
 impl StateTable {
     pub fn print_stats(&self) {
         let mut positions = 0;
         let mut reachable_states = 0;
-        for (_pos, spd_player_flags_set) in self.iter() {
+        let mut max_squared_distance = 0;
+        for (_pos, cell) in self.iter() {
             positions += 1;
-            reachable_states += spd_player_flags_set.len();
+            reachable_states += cell.spd_player_flags_set.len();
+            max_squared_distance = cmp::max(
+                cell.src_dst_distance.max_squared_distance,
+                max_squared_distance,
+            );
         }
         println!(
-            "positions: {}, reachable_states: {}",
-            positions, reachable_states
+            "positions: {}, reachable_states: {}, max_squared_distance: {}",
+            positions, reachable_states, max_squared_distance
         );
     }
 
@@ -24,8 +29,8 @@ impl StateTable {
             if let Some(other_data) = other.take(pos) {
                 if self.get(pos).is_some() {
                     // HACK should not really be using _or_insert_with
-                    let self_data = self.get_mut_or_insert_with(pos, FxHashSet::default);
-                    self_data.extend(other_data.into_iter());
+                    let self_data = self.get_mut_or_insert_with(pos, || StateTableCell::new(pos));
+                    self_data.extend(other_data);
                 } else {
                     self.get_mut_or_insert_with(pos, move || other_data);
                 }
@@ -34,12 +39,131 @@ impl StateTable {
     }
 
     pub fn is_empty(&self) -> bool {
-        for (pos, spd_player_flag_set) in self.iter() {
-            if !spd_player_flag_set.is_empty() {
+        for (_, cell) in self.iter() {
+            if !cell.spd_player_flags_set.is_empty() {
                 return false;
             }
         }
         true
+    }
+
+    pub fn mark_state(
+        self: &mut StateTable,
+        src_pos: (i16, i16),
+        pos: (i16, i16),
+        spd: Pico8Vec2,
+        player_flags: CompressedPlayerFlags,
+    ) -> Result<()> {
+        let cell = self.get_mut_or_insert_with(pos, || StateTableCell::new(pos));
+        cell.src_dst_distance.track(src_pos);
+        cell.spd_player_flags_set
+            .insert((spd.clone(), player_flags));
+        Ok(())
+    }
+
+    pub fn copy_state(
+        self: &mut StateTable,
+        original_cell: &StateTableCell,
+        pos: (i16, i16),
+        spd: Pico8Vec2,
+        player_flags: CompressedPlayerFlags,
+    ) -> Result<()> {
+        let cell = self.get_mut_or_insert_with(pos, || StateTableCell::new(pos));
+        cell.src_dst_distance
+            .extend(original_cell.src_dst_distance.clone());
+        cell.spd_player_flags_set
+            .insert((spd.clone(), player_flags));
+        Ok(())
+    }
+
+    pub fn has_state(
+        self: &StateTable,
+        pos: (i16, i16),
+        spd: Pico8Vec2,
+        player_flags: CompressedPlayerFlags,
+    ) -> Result<bool> {
+        if let Some(cell) = self.get(pos) {
+            Ok(cell
+                .spd_player_flags_set
+                .contains(&(spd.clone(), player_flags)))
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct StateTableCell {
+    src_dst_distance: DistanceTracker,
+    spd_player_flags_set: FxHashSet<(Pico8Vec2, CompressedPlayerFlags)>,
+}
+
+impl StateTableCell {
+    fn new(pos: (i16, i16)) -> Self {
+        Self {
+            src_dst_distance: DistanceTracker::new(pos),
+            spd_player_flags_set: FxHashSet::default(),
+        }
+    }
+
+    fn extend(&mut self, other: Self) {
+        self.src_dst_distance.extend(other.src_dst_distance);
+        self.spd_player_flags_set.extend(other.spd_player_flags_set);
+    }
+
+    pub fn spd_player_flags_set(&self) -> &FxHashSet<(Pico8Vec2, CompressedPlayerFlags)> {
+        &self.spd_player_flags_set
+    }
+
+    pub fn add_to_possible_src_mask(&self, possible_src_mask: &mut PosMap<bool>) {
+        for src_pos in self.src_dst_distance.iter_possible_src() {
+            possible_src_mask.set(src_pos, true);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct DistanceTracker {
+    pos: (i16, i16),
+    max_squared_distance: i32,
+}
+
+impl DistanceTracker {
+    fn new(pos: (i16, i16)) -> Self {
+        Self {
+            pos,
+            max_squared_distance: 0,
+        }
+    }
+
+    fn extend(&mut self, other: Self) {
+        assert!(self.pos == other.pos);
+        self.max_squared_distance = cmp::max(self.max_squared_distance, other.max_squared_distance);
+    }
+
+    fn track(&mut self, src: (i16, i16)) {
+        self.max_squared_distance = cmp::max(
+            self.max_squared_distance,
+            Self::squared_distance(src, self.pos),
+        );
+    }
+
+    fn squared_distance(src: (i16, i16), dst: (i16, i16)) -> i32 {
+        i32::pow((src.0 - dst.0) as i32, 2) + i32::pow((src.1 - dst.1) as i32, 2)
+    }
+
+    fn iter_possible_src(&self) -> impl Iterator<Item = (i16, i16)> + '_ {
+        let max_distance = f64::ceil(f64::sqrt(self.max_squared_distance as f64)) as i16;
+        assert!(max_distance >= 0 && i32::pow(max_distance as i32, 2) >= self.max_squared_distance);
+        let outer_range = PosMapRange {
+            min_x: self.pos.0 - max_distance,
+            max_x: self.pos.0 + max_distance,
+            min_y: self.pos.1 - max_distance,
+            max_y: self.pos.1 + max_distance,
+        };
+        outer_range
+            .into_positions()
+            .filter(move |&src| Self::squared_distance(src, self.pos) <= self.max_squared_distance)
     }
 }
 
@@ -198,12 +322,12 @@ impl<T> PosMap<T> {
 
     pub fn fill<F>(&mut self, get_value: F)
     where
-        F: Fn(i16, i16) -> T,
+        F: Fn(i16, i16) -> Option<T>,
     {
         for y in self.range.min_y..=self.range.max_y {
             for x in self.range.min_x..=self.range.max_x {
                 let i = self.index_from_pos((x, y)).unwrap();
-                self.data[i] = Some(get_value(x, y));
+                self.data[i] = get_value(x, y);
             }
         }
     }
