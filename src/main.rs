@@ -476,7 +476,7 @@ fn save_debug_bool_image(frame: &PosMap<bool>, name: &str) -> Result<()> {
 }
 
 fn is_extra_win_state(pos: (i16, i16)) -> bool {
-    pos == (31, 66)
+    false
 }
 
 fn guided_brute_force(
@@ -492,10 +492,10 @@ fn guided_brute_force(
         freeze: Pico8Num,
     }
 
-    let update = |s: &mut State, input: &InputFlags| -> Result<bool> {
+    let update = |s: &mut State, input: &InputFlags| -> Result<(bool, bool)> {
         if s.freeze > int(0) {
             s.freeze = s.freeze - int(1);
-            return Ok(false);
+            return Ok((false, false));
         }
 
         if s.player_pos_spd.spd.x != int(0) || s.player_pos_spd.spd.y != int(0) {
@@ -512,7 +512,7 @@ fn guided_brute_force(
             s.player_pos_spd.spd.clone(),
         );
         match player_update_result {
-            PlayerUpdateResult::Die => panic!("unexpected death"),
+            PlayerUpdateResult::Die => Ok((false, true)),
             PlayerUpdateResult::KeepPlaying {
                 freeze: new_freeze,
                 player_flags: new_player_flags,
@@ -526,9 +526,9 @@ fn guided_brute_force(
                 s.player_flags = new_player_flags;
                 s.player_pos_spd.spd = new_spd;
 
-                Ok(false)
+                Ok((false, false))
             }
-            PlayerUpdateResult::Win => Ok(true),
+            PlayerUpdateResult::Win => Ok((true, false)),
         }
     };
 
@@ -597,7 +597,13 @@ fn guided_brute_force(
             }
 
             let mut next_state = last_state.clone();
-            let did_win = update(&mut next_state, &input)?;
+            let (did_win, did_die) = update(&mut next_state, &input)?;
+            assert!(!(did_win && did_die));
+
+            if did_die {
+                continue;
+            }
+
             if did_win || is_extra_win_state(next_state.player_pos_spd.pos.as_i16s_or_err()?) {
                 inputs.push(input);
                 return Ok(Some(inputs));
@@ -766,6 +772,12 @@ fn main() -> Result<()> {
         }
 
         if src_frame_mark_win.is_empty() {
+            continue;
+        }
+
+        if forward_i < 71 {
+            // TODO HACK
+            println!("WARNING skipping possibly good solution for testing");
             continue;
         }
 

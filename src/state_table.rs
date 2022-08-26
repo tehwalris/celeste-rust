@@ -234,16 +234,16 @@ impl<T> PosMap<T> {
         Self::new_for_range(PosMapRange {
             min_x: -8,
             max_x: 132,
-            min_y: -8,
-            max_y: 132,
+            min_y: -24,
+            max_y: 152,
         })
     }
 
     pub fn new_wide() -> Self {
         Self::new_for_range(PosMapRange {
-            min_x: -16,
+            min_x: -32,
             max_x: 144,
-            min_y: -16,
+            min_y: -32,
             max_y: 144,
         })
     }
