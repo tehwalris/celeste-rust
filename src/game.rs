@@ -243,6 +243,7 @@ pub fn run_player_update(
     });
 
     if pos_spd_flags.spikes_at {
+        // TODO This is wrong, because technically it may be possible to die and win in the same frame.
         return PlayerUpdateResult::Die;
     }
 
