@@ -3,7 +3,7 @@
 use anyhow::Result;
 use std::{
     fmt,
-    ops::{Add, AddAssign, Div, Mul, Neg, Rem, Sub},
+    ops::{Add, Div, Mul, Neg, Rem, Sub},
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

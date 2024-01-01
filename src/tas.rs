@@ -1,4 +1,4 @@
-use crate::game::InputFlags;
+use crate::input::InputFlags;
 use anyhow::Result;
 
 struct CharParser<'a> {
@@ -66,7 +66,7 @@ pub fn parse_tas_string(s: &str) -> Result<Vec<InputFlags>> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{game::InputFlags, tas::parse_tas_string};
+    use crate::{input::InputFlags, tas::parse_tas_string};
 
     fn inp<F>(f: F) -> InputFlags
     where
