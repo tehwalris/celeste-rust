@@ -14,6 +14,7 @@ extern crate work_queue;
 
 mod cart_data;
 mod input;
+mod ir;
 mod pico8_num;
 mod tas;
 
