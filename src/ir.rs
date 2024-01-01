@@ -87,7 +87,7 @@ pub enum Instruction {
     },
     GetField {
         receiver: LocalId,
-        name: String,
+        field: String,
         create_if_missing: bool,
     },
     GetIndex {
@@ -151,11 +151,11 @@ impl Instruction {
             },
             Self::GetField {
                 receiver,
-                name,
+                field,
                 create_if_missing,
             } => Self::GetField {
                 receiver: f(*receiver),
-                name: name.clone(),
+                field: field.clone(),
                 create_if_missing: *create_if_missing,
             },
             &Self::GetIndex {

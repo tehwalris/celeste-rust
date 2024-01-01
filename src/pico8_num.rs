@@ -22,13 +22,41 @@ impl Pico8Num {
         }
     }
 
+    pub const fn whole_part_as_i16(&self) -> i16 {
+        (self.0 >> 16) as i16
+    }
+
+    pub const fn fraction_part_as_u16(&self) -> u16 {
+        (self.0 & 0xffff) as u16
+    }
+
     pub fn as_i16_or_err(&self) -> Result<i16> {
         self.as_i16()
             .ok_or(anyhow!("got {:?}, expected integer", self))
     }
 
+    pub fn from_parts(whole_n: i16, fraction_n: u16) -> Self {
+        let pico_n = Self(((whole_n as i32) << 16) | (fraction_n as i32));
+        assert_eq!(pico_n.whole_part_as_i16(), whole_n);
+        assert_eq!(pico_n.fraction_part_as_u16(), fraction_n);
+        pico_n
+    }
+
     pub const fn as_raw_u32(&self) -> u32 {
         self.0 as u32
+    }
+
+    pub fn from_f32(n: f32) -> Self {
+        // TODO this is probably not accurate
+        if n < 0. {
+            Self::from_f32(-n).const_neg()
+        } else {
+            Self::from_parts(n as i16, ((n - n.floor()) * 65536.) as u16)
+        }
+    }
+
+    pub fn from_str(s: &str) -> Result<Self> {
+        Ok(Self::from_f32(s.parse()?))
     }
 
     pub const fn const_mul(&self, rhs: &Self) -> Self {
@@ -164,7 +192,10 @@ mod tests {
     fn test_from_i16() {
         let cases: Vec<(i16, u32)> = vec![(-1, 0xffff_0000), (0, 0x0000_0000), (1, 0x0001_0000)];
         for (i16, raw_u32) in cases {
-            assert_eq!(Pico8Num::from_i16(i16).as_raw_u32(), raw_u32);
+            let pico_n = Pico8Num::from_i16(i16);
+            assert_eq!(pico_n.as_raw_u32(), raw_u32);
+            assert_eq!(pico_n.whole_part_as_i16(), i16);
+            assert_eq!(pico_n.fraction_part_as_u16(), 0);
         }
     }
 

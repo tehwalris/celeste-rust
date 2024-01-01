@@ -1,14 +1,18 @@
-use std::{collections::HashMap, hash::Hash};
+use std::{collections::HashMap, hash::Hash, ops::Index, process::id};
 
 use anyhow::{bail, Result};
 use full_moon::{
     ast,
-    tokenizer::{TokenKind, TokenReference, TokenType},
+    tokenizer::{Symbol, TokenKind, TokenReference, TokenType},
 };
+use regex::internal::Inst;
 
-use crate::ir::{
-    Block, Cfg, FunDef, GlobalIdGenerator, Instruction, Label, LabelGenerator, LocalId,
-    LocalIdGenerator, Terminator,
+use crate::{
+    ir::{
+        Block, Cfg, FunDef, GlobalIdGenerator, Instruction, Label, LabelGenerator, LocalId,
+        LocalIdGenerator, Terminator,
+    },
+    pico8_num::Pico8Num,
 };
 
 #[derive(Clone, Debug)]
@@ -150,6 +154,13 @@ impl Stream {
     }
 }
 
+fn identifier_from_token_reference(token_reference: &TokenReference) -> Result<&str> {
+    match token_reference.token_type() {
+        TokenType::Identifier { identifier } => Ok(identifier),
+        _ => bail!("Expected identifier, found {:?}", token_reference),
+    }
+}
+
 struct Compiler {
     local_id_generator: LocalIdGenerator,
     global_id_generator: GlobalIdGenerator,
@@ -180,55 +191,6 @@ impl Compiler {
             terminator,
         ));
     }
-
-    /*
-      let rec compile_lhs_expression (c : Ctxt.t) (expr : ast)
-      (create_if_missing : bool) : Ir.local_id * string option * stream =
-    match expr with
-    | Ident name -> (
-        match Ctxt.lookup_opt name c with
-        | Some id -> (id, Some name, [])
-        | None ->
-            let id, stream =
-              gen_id_and_stream (Ir.GetGlobal (name, create_if_missing))
-            in
-            (id, Some name, stream))
-    | Clist [ lhs_expr; Key1 rhs_expr ] ->
-        let lhs_id, lhs_hint, lhs_stream =
-          compile_rhs_expression c lhs_expr None
-        in
-        let rhs_id, rhs_hint, rhs_stream =
-          compile_rhs_expression c rhs_expr None
-        in
-        let hint =
-          match (lhs_hint, rhs_hint) with
-          | Some lhs_hint, Some rhs_hint -> Some (lhs_hint ^ "[" ^ rhs_hint ^ "]")
-          | Some lhs_hint, None -> Some lhs_hint
-          | None, Some rhs_hint -> Some rhs_hint
-          | None, None -> None
-        in
-        let result_id = gen_local_id () in
-        ( result_id,
-          hint,
-          lhs_stream >@ rhs_stream
-          >:: I (result_id, Ir.GetIndex (lhs_id, rhs_id, create_if_missing)) )
-    | Clist [ lhs_expr; Key2 (Ident field_name) ] ->
-        let lhs_id, lhs_hint, lhs_stream =
-          compile_rhs_expression c lhs_expr None
-        in
-        let hint =
-          match lhs_hint with
-          | Some h -> Some (h ^ "." ^ field_name)
-          | None -> Some field_name
-        in
-        let result_id = gen_local_id () in
-        ( result_id,
-          hint,
-          lhs_stream
-          >:: I (result_id, Ir.GetField (lhs_id, field_name, create_if_missing))
-        )
-    | _ -> unsupported_ast expr
-    */
 
     fn compile_identifier(
         &mut self,
@@ -312,17 +274,128 @@ impl Compiler {
                                 index: rhs_id,
                                 create_if_missing,
                             });
-                        (result_id, hint, result_stream)
+                        Ok((result_id, hint, result_stream))
                     }
-                    ast::Suffix::Index(ast::Index::Dot { dot: _, name }) => todo!(),
-                    _ => Err(anyhow!("not implemented"))?,
-                };
-
-                todo!()
+                    ast::Suffix::Index(ast::Index::Dot { dot: _, name }) => {
+                        let hint = match lhs_hint {
+                            Some(lhs_hint) => Some(format!("{}.{}", lhs_hint, name)),
+                            None => Some(name.to_string()),
+                        };
+                        let (result_id, result_stream) =
+                            self.gen_id_and_stream(Instruction::GetField {
+                                receiver: lhs_id,
+                                field: name.to_string(),
+                                create_if_missing,
+                            });
+                        Ok((result_id, hint, result_stream))
+                    }
+                    _ => Err(anyhow!("not implemented")),
+                }
             }
             _ => unimplemented!(),
         }
     }
+
+    /*
+      and compile_rhs_expression (c : Ctxt.t) (expr : ast)
+      (hint_from_parent : string option) : Ir.local_id * string option * stream =
+    let no_hint (id, stream) = (id, None, stream) in
+    match expr with
+    | Table (Elist assignments) ->
+        let table_id = gen_local_id () in
+        let assignment_code =
+          List.concat_map
+            (function
+              | Assign (Ident field_name, value_expr) ->
+                  let field_id = gen_local_id () in
+                  let hint =
+                    match hint_from_parent with
+                    | Some h -> Some (h ^ "." ^ field_name)
+                    | None -> Some field_name
+                  in
+                  let value_id, _, value_code =
+                    compile_rhs_expression c value_expr hint
+                  in
+                  value_code
+                  >:: I (field_id, Ir.GetField (table_id, field_name, true))
+                  >:: I (gen_local_id (), Ir.Store (field_id, value_id))
+              | _ -> failwith "only Assign is allowed in Table expression")
+            (List.rev assignments)
+        in
+        ( table_id,
+          None,
+          List.rev
+            [
+              I (table_id, Ir.Alloc);
+              I (gen_local_id (), Ir.StoreEmptyTable table_id);
+            ]
+          >@ assignment_code )
+    | Number s ->
+        no_hint @@ gen_id_and_stream (Ir.NumberConstant (Pico_number.of_string s))
+    | Bool "true" -> no_hint @@ gen_id_and_stream (Ir.BoolConstant true)
+    | Bool "false" -> no_hint @@ gen_id_and_stream (Ir.BoolConstant false)
+    | Bool "nil" -> no_hint @@ gen_id_and_stream Ir.NilConstant
+    | String s ->
+        no_hint @@ gen_id_and_stream (Ir.StringConstant (parse_lua_string s))
+    | Unop (op, inner_expr) ->
+        let inner_id, inner_hint, inner_stream =
+          compile_rhs_expression c inner_expr hint_from_parent
+        in
+        let result_id, result_stream =
+          gen_id_and_stream (UnaryOp (String.trim op, inner_id))
+        in
+        (result_id, inner_hint, inner_stream >@ result_stream)
+    | Binop ("and", left_expr, right_expr) ->
+        no_hint @@ compile_and_or true c left_expr right_expr
+    | Binop ("or", left_expr, right_expr) ->
+        no_hint @@ compile_and_or false c left_expr right_expr
+    | Binop (op, left_expr, right_expr) ->
+        let left_id, lhs_hint, left_stream =
+          compile_rhs_expression c left_expr hint_from_parent
+        in
+        let right_id, _, right_stream =
+          compile_rhs_expression c right_expr
+            (match op with "=" -> lhs_hint | _ -> hint_from_parent)
+        in
+        let result_id, binop_stream =
+          gen_id_and_stream (BinaryOp (left_id, String.trim op, right_id))
+        in
+        (result_id, None, left_stream >@ right_stream >@ binop_stream)
+    | FunctionE fun_ast ->
+        let name =
+          match hint_from_parent with
+          | Some name -> Some name
+          | None -> Some "anonymous"
+        in
+        no_hint @@ compile_closure c fun_ast name
+    | Pexp inner_expr -> compile_rhs_expression c inner_expr hint_from_parent
+    | Clist [ callee_expr; Args (Elist arg_exprs) ] ->
+        let callee_id, callee_hint, callee_code =
+          compile_rhs_expression c callee_expr hint_from_parent
+        in
+        let arg_ids, arg_codes =
+          List.split
+          @@ List.map
+               (fun expr ->
+                 let id, _, stream =
+                   compile_rhs_expression c expr hint_from_parent
+                 in
+                 (id, stream))
+               arg_exprs
+        in
+        let result_id = gen_local_id () in
+        ( result_id,
+          callee_hint,
+          callee_code
+          >@ List.concat @@ List.rev arg_codes
+          >:: I (result_id, Ir.Call (callee_id, arg_ids)) )
+    | _ ->
+        let lhs_id, lhs_hint, lhs_stream = compile_lhs_expression c expr false in
+        if lhs_id == -1 then unsupported_ast expr
+        else
+          let rhs_id = gen_local_id () in
+          (rhs_id, lhs_hint, lhs_stream >:: I (rhs_id, Ir.Load lhs_id))
+       */
 
     fn compile_rhs_expression(
         &mut self,
@@ -330,6 +403,95 @@ impl Compiler {
         locals: &HashMap<String, LocalId>,
         hint_from_parent: Option<String>,
     ) -> Result<(LocalId, Option<String>, Stream)> {
-        todo!()
+        match expression {
+            ast::Expression::TableConstructor(table) => {
+                let table_id = self.local_id_generator.next();
+                let mut stream = Stream(vec![
+                    StreamElement::Instruction(table_id, Instruction::Alloc),
+                    StreamElement::Instruction(
+                        self.local_id_generator.next(),
+                        Instruction::StoreEmptyTable { target: table_id },
+                    ),
+                ]);
+                for field in table.fields() {
+                    match field {
+                        ast::Field::NameKey {
+                            key,
+                            equal: _,
+                            value,
+                        } => {
+                            let name = identifier_from_token_reference(key)?;
+                            let field_id = self.local_id_generator.next();
+                            let hint = match &hint_from_parent {
+                                Some(h) => Some(format!("{}.{}", h, name)),
+                                None => Some(name.to_string()),
+                            };
+                            let (value_id, _, value_stream) =
+                                self.compile_rhs_expression(value, locals, hint)?;
+                            stream.0.push(StreamElement::Instruction(
+                                field_id,
+                                Instruction::GetField {
+                                    receiver: table_id,
+                                    field: name.to_string(),
+                                    create_if_missing: true,
+                                },
+                            ));
+                            stream.0.push(StreamElement::Instruction(
+                                self.local_id_generator.next(),
+                                Instruction::Store {
+                                    target: field_id,
+                                    source: value_id,
+                                },
+                            ));
+                        }
+                        _ => unimplemented!(),
+                    }
+                }
+                Ok((table_id, None, stream))
+            }
+            ast::Expression::Number(number) => {
+                let (id, stream) = self.gen_id_and_stream(Instruction::NumberConstant {
+                    value: match number.token_type() {
+                        TokenType::Number { text } => Pico8Num::from_str(text)?,
+                        _ => bail!("expected number literal"),
+                    },
+                });
+                Ok((id, None, stream))
+            }
+            ast::Expression::Symbol(symbol) => {
+                let instruction = match symbol.token_type() {
+                    TokenType::Symbol {
+                        symbol: Symbol::True,
+                    } => Instruction::BoolConstant { value: true },
+                    TokenType::Symbol {
+                        symbol: Symbol::False,
+                    } => Instruction::BoolConstant { value: false },
+                    TokenType::Symbol {
+                        symbol: Symbol::Nil,
+                    } => Instruction::NilConstant,
+                    _ => bail!("unsupported symbol {:?}", symbol),
+                };
+                let (id, stream) = self.gen_id_and_stream(instruction);
+                Ok((id, None, stream))
+            }
+            ast::Expression::String(string) => {
+                let string = match string.token_type() {
+                    TokenType::StringLiteral {
+                        literal,
+                        multi_line: None,
+                        quote_type: _,
+                    } => literal.to_string(),
+                    TokenType::StringLiteral {
+                        multi_line: Some(_),
+                        ..
+                    } => bail!("multiline strings are not supported"),
+                    _ => bail!("expected string literal"),
+                };
+                let (id, stream) =
+                    self.gen_id_and_stream(Instruction::StringConstant { value: string });
+                Ok((id, None, stream))
+            }
+            _ => unimplemented!(),
+        }
     }
 }
