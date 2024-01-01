@@ -3,16 +3,68 @@ use std::collections::HashMap;
 use crate::pico8_num::Pico8Num;
 
 #[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
-struct LocalId(i32);
+pub struct LocalId(i32);
+
+pub struct LocalIdGenerator {
+    next_id: i32,
+}
+
+impl LocalIdGenerator {
+    pub fn new() -> Self {
+        Self { next_id: 0 }
+    }
+
+    pub fn next(&mut self) -> LocalId {
+        let id = LocalId(self.next_id);
+        self.next_id += 1;
+        id
+    }
+}
+
+pub struct UniqueStringGenerator<T: From<String>> {
+    _item_type: std::marker::PhantomData<T>,
+    next_id: i32,
+}
+
+impl<T: From<String>> UniqueStringGenerator<T> {
+    pub fn new() -> Self {
+        Self {
+            _item_type: std::marker::PhantomData,
+            next_id: 0,
+        }
+    }
+
+    pub fn next(&mut self, base_name: String) -> T {
+        let id = T::from(format!("{}_{}", base_name, self.next_id));
+        self.next_id += 1;
+        id
+    }
+}
 
 #[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug)]
-struct GlobalId(String);
+pub struct GlobalId(String);
+
+impl From<String> for GlobalId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+pub type GlobalIdGenerator = UniqueStringGenerator<GlobalId>;
 
 #[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug)]
-struct Label(String);
+pub struct Label(String);
+
+impl From<String> for Label {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+pub type LabelGenerator = UniqueStringGenerator<Label>;
 
 #[derive(Clone, Debug)]
-enum Instruction {
+pub enum Instruction {
     Alloc,
     GetGlobal(String, bool),
     Load(LocalId),
@@ -32,7 +84,7 @@ enum Instruction {
 }
 
 impl Instruction {
-    fn map_local_ids(&self, f: impl Fn(LocalId) -> LocalId) -> Self {
+    pub fn map_local_ids(&self, f: impl Fn(LocalId) -> LocalId) -> Self {
         match self {
             Self::Alloc => Self::Alloc,
             Self::GetGlobal(name, flag) => Self::GetGlobal(name.clone(), *flag),
@@ -72,14 +124,14 @@ impl Instruction {
 }
 
 #[derive(Clone, Debug)]
-enum Terminator {
+pub enum Terminator {
     Ret(Option<LocalId>),
     Br(Label),
     Cbr(LocalId, Label, Label),
 }
 
 impl Terminator {
-    fn map_local_ids(&self, f: impl Fn(LocalId) -> LocalId) -> Self {
+    pub fn map_local_ids(&self, f: impl Fn(LocalId) -> LocalId) -> Self {
         match self {
             Self::Ret(Some(id)) => Self::Ret(Some(f(*id))),
             Self::Ret(None) => Self::Ret(None),
@@ -92,14 +144,14 @@ impl Terminator {
 }
 
 #[derive(Clone, Debug)]
-struct Block {
-    instructions: Vec<(LocalId, Instruction)>,
-    terminator: (LocalId, Terminator),
-    hint_normalize: bool,
+pub struct Block {
+    pub instructions: Vec<(LocalId, Instruction)>,
+    pub terminator: (LocalId, Terminator),
+    pub hint_normalize: bool,
 }
 
 impl Block {
-    fn split_block_phi_instructions(
+    pub fn split_block_phi_instructions(
         &self,
     ) -> (&[(LocalId, Instruction)], &[(LocalId, Instruction)]) {
         let split_index = self
@@ -128,17 +180,17 @@ impl Block {
 }
 
 #[derive(Clone, Debug)]
-struct Cfg {
-    entry: Block,
-    named: HashMap<Label, Block>,
+pub struct Cfg {
+    pub entry: Block,
+    pub named: HashMap<Label, Block>,
 }
 
 impl Cfg {
-    fn iter_blocks(&self) -> impl Iterator<Item = &Block> {
+    pub fn iter_blocks(&self) -> impl Iterator<Item = &Block> {
         std::iter::once(&self.entry).chain(self.named.values())
     }
 
-    fn map_blocks(&self, f: impl Fn(&Block) -> Block) -> Self {
+    pub fn map_blocks(&self, f: impl Fn(&Block) -> Block) -> Self {
         Self {
             entry: f(&self.entry),
             named: self.named.iter().map(|(k, v)| (k.clone(), f(v))).collect(),
@@ -147,9 +199,9 @@ impl Cfg {
 }
 
 #[derive(Clone, Debug)]
-struct FunDef {
-    name: GlobalId,
-    capture_ids: Vec<LocalId>,
-    arg_ids: Vec<Option<LocalId>>,
-    cfg: Cfg,
+pub struct FunDef {
+    pub name: GlobalId,
+    pub capture_ids: Vec<LocalId>,
+    pub arg_ids: Vec<Option<LocalId>>,
+    pub cfg: Cfg,
 }

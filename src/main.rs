@@ -13,6 +13,7 @@ extern crate rustc_hash;
 extern crate work_queue;
 
 mod cart_data;
+mod frontend;
 mod input;
 mod ir;
 mod pico8_num;
