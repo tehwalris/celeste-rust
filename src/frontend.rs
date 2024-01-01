@@ -239,10 +239,10 @@ impl Compiler {
         match locals.get(identifier) {
             Some(&id) => Ok((id, Some(identifier.to_string()), Stream(vec![]))),
             None => {
-                let (id, stream) = self.gen_id_and_stream(Instruction::GetGlobal(
-                    identifier.to_string(),
+                let (id, stream) = self.gen_id_and_stream(Instruction::GetGlobal {
+                    name: identifier.to_string(),
                     create_if_missing,
-                ));
+                });
                 Ok((id, Some(identifier.to_string()), stream))
             }
         }
@@ -306,9 +306,12 @@ impl Compiler {
                             (None, Some(rhs_hint)) => Some(rhs_hint),
                             (None, None) => None,
                         };
-                        let (result_id, result_stream) = self.gen_id_and_stream(
-                            Instruction::GetIndex(lhs_id, rhs_id, create_if_missing),
-                        );
+                        let (result_id, result_stream) =
+                            self.gen_id_and_stream(Instruction::GetIndex {
+                                receiver: lhs_id,
+                                index: rhs_id,
+                                create_if_missing,
+                            });
                         (result_id, hint, result_stream)
                     }
                     ast::Suffix::Index(ast::Index::Dot { dot: _, name }) => todo!(),

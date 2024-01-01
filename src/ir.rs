@@ -66,79 +66,169 @@ pub type LabelGenerator = UniqueStringGenerator<Label>;
 #[derive(Clone, Debug)]
 pub enum Instruction {
     Alloc,
-    GetGlobal(String, bool),
-    Load(LocalId),
-    Store(LocalId, LocalId),
-    StoreEmptyTable(LocalId),
-    StoreClosure(LocalId, GlobalId, Vec<LocalId>),
-    GetField(LocalId, String, bool),
-    GetIndex(LocalId, LocalId, bool),
-    NumberConstant(Pico8Num),
-    BoolConstant(bool),
-    StringConstant(String),
+    GetGlobal {
+        name: String,
+        create_if_missing: bool,
+    },
+    Load {
+        source: LocalId,
+    },
+    Store {
+        target: LocalId,
+        source: LocalId,
+    },
+    StoreEmptyTable {
+        target: LocalId,
+    },
+    StoreClosure {
+        target: LocalId,
+        fun_def: GlobalId,
+        captures: Vec<LocalId>,
+    },
+    GetField {
+        receiver: LocalId,
+        name: String,
+        create_if_missing: bool,
+    },
+    GetIndex {
+        receiver: LocalId,
+        index: LocalId,
+        create_if_missing: bool,
+    },
+    NumberConstant {
+        value: Pico8Num,
+    },
+    BoolConstant {
+        value: bool,
+    },
+    StringConstant {
+        value: String,
+    },
     NilConstant,
-    Call(LocalId, Vec<LocalId>),
-    UnaryOp(String, LocalId),
-    BinaryOp(LocalId, String, LocalId),
-    Phi(Vec<(Label, LocalId)>),
+    Call {
+        closure: LocalId,
+        args: Vec<LocalId>,
+    },
+    UnaryOp {
+        op: String,
+        arg: LocalId,
+    },
+    BinaryOp {
+        left: LocalId,
+        op: String,
+        right: LocalId,
+    },
+    Phi {
+        branches: Vec<(Label, LocalId)>,
+    },
 }
 
 impl Instruction {
     pub fn map_local_ids(&self, f: impl Fn(LocalId) -> LocalId) -> Self {
         match self {
             Self::Alloc => Self::Alloc,
-            Self::GetGlobal(name, flag) => Self::GetGlobal(name.clone(), *flag),
-            Self::Load(var_id) => Self::Load(f(*var_id)),
-            Self::Store(var_id, val_id) => Self::Store(f(*var_id), f(*val_id)),
-            Self::StoreEmptyTable(var_id) => Self::StoreEmptyTable(f(*var_id)),
-            Self::StoreClosure(var_id, closure_id, capture_ids) => Self::StoreClosure(
-                f(*var_id),
-                closure_id.clone(),
-                capture_ids.iter().map(|id| f(*id)).collect(),
-            ),
-            Self::GetField(var_id, field_name, create_if_missing) => {
-                Self::GetField(f(*var_id), field_name.clone(), *create_if_missing)
-            }
-            Self::GetIndex(var_id, index_id, create_if_missing) => {
-                Self::GetIndex(f(*var_id), f(*index_id), *create_if_missing)
-            }
-            Self::NumberConstant(value) => Self::NumberConstant(*value),
-            Self::BoolConstant(value) => Self::BoolConstant(*value),
-            Self::StringConstant(value) => Self::StringConstant(value.clone()),
+            Self::GetGlobal {
+                name,
+                create_if_missing,
+            } => Self::GetGlobal {
+                name: name.clone(),
+                create_if_missing: *create_if_missing,
+            },
+            Self::Load { source } => Self::Load { source: f(*source) },
+            Self::Store { target, source } => Self::Store {
+                target: f(*target),
+                source: f(*source),
+            },
+            Self::StoreEmptyTable { target } => Self::StoreEmptyTable { target: f(*target) },
+            Self::StoreClosure {
+                target,
+                fun_def,
+                captures,
+            } => Self::StoreClosure {
+                target: f(*target),
+                fun_def: fun_def.clone(),
+                captures: captures.iter().map(|id| f(*id)).collect(),
+            },
+            Self::GetField {
+                receiver,
+                name,
+                create_if_missing,
+            } => Self::GetField {
+                receiver: f(*receiver),
+                name: name.clone(),
+                create_if_missing: *create_if_missing,
+            },
+            &Self::GetIndex {
+                receiver,
+                index,
+                create_if_missing,
+            } => Self::GetIndex {
+                receiver: f(receiver),
+                index: f(index),
+                create_if_missing: create_if_missing,
+            },
+            Self::NumberConstant { value } => Self::NumberConstant { value: *value },
+            Self::BoolConstant { value } => Self::BoolConstant { value: *value },
+            Self::StringConstant { value } => Self::StringConstant {
+                value: value.clone(),
+            },
             Self::NilConstant => Self::NilConstant,
-            Self::Call(closure_id, arg_ids) => {
-                Self::Call(f(*closure_id), arg_ids.iter().map(|id| f(*id)).collect())
-            }
-            Self::UnaryOp(op, arg_id) => Self::UnaryOp(op.clone(), f(*arg_id)),
-            Self::BinaryOp(left_id, op, right_id) => {
-                Self::BinaryOp(f(*left_id), op.clone(), f(*right_id))
-            }
-            Self::Phi(branches) => Self::Phi(
-                branches
+            Self::Call { closure, args } => Self::Call {
+                closure: f(*closure),
+                args: args.iter().map(|id| f(*id)).collect(),
+            },
+            Self::UnaryOp { op, arg } => Self::UnaryOp {
+                op: op.clone(),
+                arg: f(*arg),
+            },
+            Self::BinaryOp { left, op, right } => Self::BinaryOp {
+                left: f(*left),
+                op: op.clone(),
+                right: f(*right),
+            },
+            Self::Phi { branches } => Self::Phi {
+                branches: branches
                     .iter()
                     .map(|(label, id)| (label.clone(), f(*id)))
                     .collect(),
-            ),
+            },
         }
     }
 }
 
 #[derive(Clone, Debug)]
 pub enum Terminator {
-    Ret(Option<LocalId>),
-    Br(Label),
-    Cbr(LocalId, Label, Label),
+    Return {
+        value: Option<LocalId>,
+    },
+    UnconditionalBranch {
+        target: Label,
+    },
+    ConditionalBranch {
+        condition: LocalId,
+        true_target: Label,
+        false_target: Label,
+    },
 }
 
 impl Terminator {
     pub fn map_local_ids(&self, f: impl Fn(LocalId) -> LocalId) -> Self {
         match self {
-            Self::Ret(Some(id)) => Self::Ret(Some(f(*id))),
-            Self::Ret(None) => Self::Ret(None),
-            Self::Br(label) => Self::Br(label.clone()),
-            Self::Cbr(val_id, l_true, l_false) => {
-                Self::Cbr(f(*val_id), l_true.clone(), l_false.clone())
-            }
+            Self::Return { value } => Self::Return {
+                value: value.map(|id| f(id)),
+            },
+            Self::UnconditionalBranch { target } => Self::UnconditionalBranch {
+                target: target.clone(),
+            },
+            Self::ConditionalBranch {
+                condition,
+                true_target,
+                false_target,
+            } => Self::ConditionalBranch {
+                condition: f(*condition),
+                true_target: true_target.clone(),
+                false_target: false_target.clone(),
+            },
         }
     }
 }
@@ -154,24 +244,20 @@ impl Block {
     pub fn split_block_phi_instructions(
         &self,
     ) -> (&[(LocalId, Instruction)], &[(LocalId, Instruction)]) {
+        let is_phi = |id_and_instr| match id_and_instr {
+            &(_, Instruction::Phi { .. }) => true,
+            _ => false,
+        };
+
         let split_index = self
             .instructions
             .iter()
-            .position(|&(_, ref instr)| match instr {
-                Instruction::Phi(_) => false,
-                _ => true,
-            })
+            .position(is_phi)
             .unwrap_or(self.instructions.len());
 
         let (phi_instructions, non_phi_instructions) = self.instructions.split_at(split_index);
 
-        if non_phi_instructions
-            .iter()
-            .any(|&(_, ref instr)| match instr {
-                Instruction::Phi(_) => true,
-                _ => false,
-            })
-        {
+        if non_phi_instructions.iter().any(is_phi) {
             panic!("Phi instructions are not at the beginning of the block");
         }
 
