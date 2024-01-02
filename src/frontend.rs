@@ -1,4 +1,9 @@
-use std::{collections::HashMap, hash::Hash, ops::Index, process::id};
+use std::{
+    collections::{HashMap, HashSet},
+    hash::Hash,
+    ops::Index,
+    process::id,
+};
 
 use anyhow::{bail, Result};
 use full_moon::{
@@ -296,33 +301,6 @@ impl Compiler {
         }
     }
 
-    /*
-      and compile_and_or (is_and : bool) (c : Ctxt.t) (left_expr : ast)
-      (right_expr : ast) : Ir.local_id * stream =
-    let left_id, _, left_stream = compile_rhs_expression c left_expr None in
-    let right_id, _, right_stream = compile_rhs_expression c right_expr None in
-    let result_id = gen_local_id () in
-    let left_label = gen_label "and_or_left" in
-    let right_label = gen_label "and_or_right" in
-    let continue_label = gen_label "and_or_continue" in
-    let join_label = gen_label "and_or_join" in
-    let true_label, false_label =
-      if is_and then (continue_label, join_label) else (join_label, continue_label)
-    in
-    ( result_id,
-      left_stream
-      >:: T (gen_local_id (), Ir.Br left_label)
-      >:: L left_label
-      >:: T (gen_local_id (), Ir.Cbr (left_id, true_label, false_label))
-      >:: L continue_label >@ right_stream
-      >:: T (gen_local_id (), Ir.Br right_label)
-      >:: L right_label
-      >:: T (gen_local_id (), Ir.Br join_label)
-      >:: L join_label
-      >:: I (result_id, Ir.Phi [ (left_label, left_id); (right_label, right_id) ])
-    )
-       */
-
     fn compile_and_or(
         &mut self,
         is_and: bool,
@@ -390,105 +368,119 @@ impl Compiler {
     }
 
     /*
-      and compile_rhs_expression (c : Ctxt.t) (expr : ast)
-      (hint_from_parent : string option) : Ir.local_id * string option * stream =
-    let no_hint (id, stream) = (id, None, stream) in
-    match expr with
-    | Table (Elist assignments) ->
-        let table_id = gen_local_id () in
-        let assignment_code =
-          List.concat_map
-            (function
-              | Assign (Ident field_name, value_expr) ->
-                  let field_id = gen_local_id () in
-                  let hint =
-                    match hint_from_parent with
-                    | Some h -> Some (h ^ "." ^ field_name)
-                    | None -> Some field_name
-                  in
-                  let value_id, _, value_code =
-                    compile_rhs_expression c value_expr hint
-                  in
-                  value_code
-                  >:: I (field_id, Ir.GetField (table_id, field_name, true))
-                  >:: I (gen_local_id (), Ir.Store (field_id, value_id))
-              | _ -> failwith "only Assign is allowed in Table expression")
-            (List.rev assignments)
-        in
-        ( table_id,
-          None,
-          List.rev
-            [
-              I (table_id, Ir.Alloc);
-              I (gen_local_id (), Ir.StoreEmptyTable table_id);
-            ]
-          >@ assignment_code )
-    | Number s ->
-        no_hint @@ gen_id_and_stream (Ir.NumberConstant (Pico_number.of_string s))
-    | Bool "true" -> no_hint @@ gen_id_and_stream (Ir.BoolConstant true)
-    | Bool "false" -> no_hint @@ gen_id_and_stream (Ir.BoolConstant false)
-    | Bool "nil" -> no_hint @@ gen_id_and_stream Ir.NilConstant
-    | String s ->
-        no_hint @@ gen_id_and_stream (Ir.StringConstant (parse_lua_string s))
-    | Unop (op, inner_expr) ->
-        let inner_id, inner_hint, inner_stream =
-          compile_rhs_expression c inner_expr hint_from_parent
-        in
-        let result_id, result_stream =
-          gen_id_and_stream (UnaryOp (String.trim op, inner_id))
-        in
-        (result_id, inner_hint, inner_stream >@ result_stream)
-    | Binop ("and", left_expr, right_expr) ->
-        no_hint @@ compile_and_or true c left_expr right_expr
-    | Binop ("or", left_expr, right_expr) ->
-        no_hint @@ compile_and_or false c left_expr right_expr
-    | Binop (op, left_expr, right_expr) ->
-        let left_id, lhs_hint, left_stream =
-          compile_rhs_expression c left_expr hint_from_parent
-        in
-        let right_id, _, right_stream =
-          compile_rhs_expression c right_expr
-            (match op with "=" -> lhs_hint | _ -> hint_from_parent)
-        in
-        let result_id, binop_stream =
-          gen_id_and_stream (BinaryOp (left_id, String.trim op, right_id))
-        in
-        (result_id, None, left_stream >@ right_stream >@ binop_stream)
-    | FunctionE fun_ast ->
-        let name =
-          match hint_from_parent with
-          | Some name -> Some name
-          | None -> Some "anonymous"
-        in
-        no_hint @@ compile_closure c fun_ast name
-    | Pexp inner_expr -> compile_rhs_expression c inner_expr hint_from_parent
-    | Clist [ callee_expr; Args (Elist arg_exprs) ] ->
-        let callee_id, callee_hint, callee_code =
-          compile_rhs_expression c callee_expr hint_from_parent
-        in
-        let arg_ids, arg_codes =
-          List.split
-          @@ List.map
-               (fun expr ->
-                 let id, _, stream =
-                   compile_rhs_expression c expr hint_from_parent
-                 in
-                 (id, stream))
-               arg_exprs
-        in
-        let result_id = gen_local_id () in
-        ( result_id,
-          callee_hint,
-          callee_code
-          >@ List.concat @@ List.rev arg_codes
-          >:: I (result_id, Ir.Call (callee_id, arg_ids)) )
-    | _ ->
-        let lhs_id, lhs_hint, lhs_stream = compile_lhs_expression c expr false in
-        if lhs_id == -1 then unsupported_ast expr
-        else
-          let rhs_id = gen_local_id () in
-          (rhs_id, lhs_hint, lhs_stream >:: I (rhs_id, Ir.Load lhs_id))
-       */
+    and compile_closure (c : Ctxt.t) (fun_ast : ast) (name_hint : string option) :
+        Ir.local_id * stream =
+      let fun_args, fun_statements =
+        match fun_ast with
+        | Fbody (Elist fun_args, Slist fun_statements) -> (fun_args, fun_statements)
+        | _ -> failwith "unsupported ast for fun_ast"
+      in
+      let fun_args =
+        List.map
+          (function Ident name -> name | _ -> failwith "arguments must be Ident")
+          fun_args
+      in
+      let _, fun_args_has_duplicates =
+        List.fold_left
+          (fun (seen, has_duplicates) s ->
+            (s :: seen, has_duplicates || List.mem s seen))
+          ([], false) fun_args
+      in
+      assert (not fun_args_has_duplicates);
+      let inner_arg_val_ids = List.map (fun _ -> gen_local_id ()) fun_args in
+      let inner_arg_var_ids = List.map (fun _ -> gen_local_id ()) fun_args in
+      let arg_var_code =
+        List.fold_left2
+          (fun code val_id var_id ->
+            code
+            >:: I (var_id, Ir.Alloc)
+            >:: I (gen_local_id (), Ir.Store (var_id, val_id)))
+          [] inner_arg_val_ids inner_arg_var_ids
+      in
+      let c_no_duplicates =
+        List.fold_left
+          (fun c_no_duplicates (name, local_id) ->
+            if Option.is_some (Ctxt.lookup_opt name c_no_duplicates) then
+              c_no_duplicates
+            else Ctxt.add c_no_duplicates name local_id)
+          Ctxt.empty c
+      in
+      let inner_capture_ids = List.map (fun _ -> gen_local_id ()) c_no_duplicates in
+      let inner_c =
+        List.fold_left2
+          (fun c (name, _) inner_id -> (name, inner_id) :: c)
+          Ctxt.empty c_no_duplicates inner_capture_ids
+      in
+      let inner_c =
+        List.fold_left2
+          (fun c name inner_id -> (name, inner_id) :: c)
+          inner_c fun_args inner_arg_var_ids
+      in
+      let inner_code =
+        (snd @@ compile_statements inner_c None fun_statements) @ arg_var_code
+      in
+      let inner_code =
+        match inner_code with
+        | T (_, Ret _) :: _ -> inner_code
+        | _ -> inner_code >:: T (gen_local_id (), Ret None)
+      in
+      let cfg, inner_fun_defs, new_ids_by_old_ids = cfg_of_stream inner_code in
+      let inner_capture_ids =
+        List.map
+          (fun old_id -> Ir.LocalIdMap.find_opt old_id new_ids_by_old_ids)
+          inner_capture_ids
+      in
+      let inner_arg_val_ids =
+        List.map
+          (fun old_id -> Ir.LocalIdMap.find_opt old_id new_ids_by_old_ids)
+          inner_arg_val_ids
+      in
+      let outer_capture_ids =
+        List.map2
+          (fun (_, outer_id) inner_id ->
+            match inner_id with Some _ -> Some outer_id | None -> None)
+          c_no_duplicates inner_capture_ids
+        |> List.filter_map (fun v -> v)
+      in
+      let inner_capture_ids = List.filter_map (fun v -> v) inner_capture_ids in
+      let fun_name = gen_global_id (Option.value name_hint ~default:"anonymous") in
+      let fun_def : Ir.fun_def =
+        {
+          name = fun_name;
+          capture_ids = inner_capture_ids;
+          arg_ids = inner_arg_val_ids;
+          cfg;
+        }
+      in
+      let closure_id = gen_local_id () in
+      ( closure_id,
+        List.map (fun d -> F d) (fun_def :: inner_fun_defs)
+        >:: I (closure_id, Ir.Alloc)
+        >:: I
+              ( gen_local_id (),
+                Ir.StoreClosure (closure_id, fun_name, outer_capture_ids) ) )
+         */
+
+    fn compile_closure(
+        &mut self,
+        function: &ast::FunctionBody,
+        name: &str,
+        locals: &HashMap<String, LocalId>,
+    ) -> Result<(LocalId, Stream)> {
+        let params = function
+            .parameters()
+            .iter()
+            .map(|param| match param {
+                ast::Parameter::Name(name) => identifier_from_token_reference(name),
+                _ => bail!("unsupported parameter {:?}", param),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let unique_params: HashSet<&str> = params.iter().cloned().collect();
+        assert!(params.len() == unique_params.len());
+
+        // TODO you were here
+        todo!()
+    }
 
     fn compile_rhs_expression(
         &mut self,
@@ -656,6 +648,14 @@ impl Compiler {
                     lhs_hint,
                     Stream::from_streams(vec![lhs_stream, rhs_stream, result_stream]),
                 ))
+            }
+            ast::Expression::Function((_, function)) => {
+                let name = match hint_from_parent {
+                    Some(name) => name,
+                    None => "anonymous",
+                };
+                let (id, stream) = self.compile_closure(function, name, locals)?;
+                Ok((id, None, stream))
             }
             _ => unimplemented!(),
         }
