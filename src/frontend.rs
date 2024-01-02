@@ -297,6 +297,99 @@ impl Compiler {
     }
 
     /*
+      and compile_and_or (is_and : bool) (c : Ctxt.t) (left_expr : ast)
+      (right_expr : ast) : Ir.local_id * stream =
+    let left_id, _, left_stream = compile_rhs_expression c left_expr None in
+    let right_id, _, right_stream = compile_rhs_expression c right_expr None in
+    let result_id = gen_local_id () in
+    let left_label = gen_label "and_or_left" in
+    let right_label = gen_label "and_or_right" in
+    let continue_label = gen_label "and_or_continue" in
+    let join_label = gen_label "and_or_join" in
+    let true_label, false_label =
+      if is_and then (continue_label, join_label) else (join_label, continue_label)
+    in
+    ( result_id,
+      left_stream
+      >:: T (gen_local_id (), Ir.Br left_label)
+      >:: L left_label
+      >:: T (gen_local_id (), Ir.Cbr (left_id, true_label, false_label))
+      >:: L continue_label >@ right_stream
+      >:: T (gen_local_id (), Ir.Br right_label)
+      >:: L right_label
+      >:: T (gen_local_id (), Ir.Br join_label)
+      >:: L join_label
+      >:: I (result_id, Ir.Phi [ (left_label, left_id); (right_label, right_id) ])
+    )
+       */
+
+    fn compile_and_or(
+        &mut self,
+        is_and: bool,
+        left_expr: &ast::Expression,
+        right_expr: &ast::Expression,
+        locals: &HashMap<String, LocalId>,
+    ) -> Result<(LocalId, Stream)> {
+        let (left_id, _, left_stream) = self.compile_rhs_expression(left_expr, locals, None)?;
+        let (right_id, _, right_stream) = self.compile_rhs_expression(right_expr, locals, None)?;
+        let result_id = self.local_id_generator.next();
+        let left_label = self.label_generator.next("and_or_left");
+        let right_label = self.label_generator.next("and_or_right");
+        let continue_label = self.label_generator.next("and_or_continue");
+        let join_label = self.label_generator.next("and_or_join");
+        let (true_label, false_label) = if is_and {
+            (continue_label.clone(), join_label.clone())
+        } else {
+            (join_label.clone(), continue_label.clone())
+        };
+        let result_stream = Stream::from_streams(vec![
+            left_stream,
+            Stream(vec![
+                StreamElement::Terminator(
+                    self.local_id_generator.next(),
+                    Terminator::UnconditionalBranch {
+                        target: left_label.clone(),
+                    },
+                ),
+                StreamElement::Label(left_label.clone()),
+                StreamElement::Terminator(
+                    self.local_id_generator.next(),
+                    Terminator::ConditionalBranch {
+                        condition: left_id,
+                        true_target: true_label.clone(),
+                        false_target: false_label.clone(),
+                    },
+                ),
+                StreamElement::Label(continue_label),
+            ]),
+            right_stream,
+            Stream(vec![
+                StreamElement::Terminator(
+                    self.local_id_generator.next(),
+                    Terminator::UnconditionalBranch {
+                        target: right_label.clone(),
+                    },
+                ),
+                StreamElement::Label(right_label.clone()),
+                StreamElement::Terminator(
+                    self.local_id_generator.next(),
+                    Terminator::UnconditionalBranch {
+                        target: join_label.clone(),
+                    },
+                ),
+                StreamElement::Label(join_label.clone()),
+                StreamElement::Instruction(
+                    result_id,
+                    Instruction::Phi {
+                        branches: vec![(left_label, left_id), (right_label, right_id)],
+                    },
+                ),
+            ]),
+        ]);
+        Ok((result_id, result_stream))
+    }
+
+    /*
       and compile_rhs_expression (c : Ctxt.t) (expr : ast)
       (hint_from_parent : string option) : Ir.local_id * string option * stream =
     let no_hint (id, stream) = (id, None, stream) in
@@ -489,6 +582,41 @@ impl Compiler {
                 };
                 let (id, stream) =
                     self.gen_id_and_stream(Instruction::StringConstant { value: string });
+                Ok((id, None, stream))
+            }
+            ast::Expression::UnaryOperator { unop, expression } => {
+                let (inner_id, inner_hint, inner_stream) =
+                    self.compile_rhs_expression(expression, locals, hint_from_parent)?;
+                let (result_id, result_stream) = self.gen_id_and_stream(Instruction::UnaryOp {
+                    op: match unop {
+                        ast::UnOp::Minus(_) => "-",
+                        ast::UnOp::Not(_) => "not",
+                        ast::UnOp::Hash(_) => "#",
+                        _ => bail!("unsupported unary operator {:?}", unop),
+                    }
+                    .to_string(),
+                    arg: inner_id,
+                });
+                Ok((
+                    result_id,
+                    inner_hint,
+                    Stream::from_streams(vec![inner_stream, result_stream]),
+                ))
+            }
+            ast::Expression::BinaryOperator {
+                lhs,
+                binop: ast::BinOp::And { .. },
+                rhs,
+            } => {
+                let (id, stream) = self.compile_and_or(true, lhs, rhs, locals)?;
+                Ok((id, None, stream))
+            }
+            ast::Expression::BinaryOperator {
+                lhs,
+                binop: ast::BinOp::Or { .. },
+                rhs,
+            } => {
+                let (id, stream) = self.compile_and_or(false, lhs, rhs, locals)?;
                 Ok((id, None, stream))
             }
             _ => unimplemented!(),

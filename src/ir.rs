@@ -34,7 +34,7 @@ impl<T: From<String>> UniqueStringGenerator<T> {
         }
     }
 
-    pub fn next(&mut self, base_name: String) -> T {
+    pub fn next(&mut self, base_name: &str) -> T {
         let id = T::from(format!("{}_{}", base_name, self.next_id));
         self.next_id += 1;
         id
