@@ -494,7 +494,7 @@ impl Compiler {
         &mut self,
         expression: &ast::Expression,
         locals: &HashMap<String, LocalId>,
-        hint_from_parent: Option<String>,
+        hint_from_parent: Option<&str>,
     ) -> Result<(LocalId, Option<String>, Stream)> {
         match expression {
             ast::Expression::TableConstructor(table) => {
@@ -519,8 +519,12 @@ impl Compiler {
                                 Some(h) => Some(format!("{}.{}", h, name)),
                                 None => Some(name.to_string()),
                             };
-                            let (value_id, _, value_stream) =
-                                self.compile_rhs_expression(value, locals, hint)?;
+                            let (value_id, _, value_stream) = self.compile_rhs_expression(
+                                value,
+                                locals,
+                                hint.as_ref().map(|s| s.as_str()),
+                            )?;
+                            stream.0.extend(value_stream.0);
                             stream.0.push(StreamElement::Instruction(
                                 field_id,
                                 Instruction::GetField {
@@ -618,6 +622,40 @@ impl Compiler {
             } => {
                 let (id, stream) = self.compile_and_or(false, lhs, rhs, locals)?;
                 Ok((id, None, stream))
+            }
+            ast::Expression::BinaryOperator { lhs, binop, rhs } => {
+                let (lhs_id, lhs_hint, lhs_stream) =
+                    self.compile_rhs_expression(lhs, locals, hint_from_parent)?;
+                let (rhs_id, _, rhs_stream) =
+                    self.compile_rhs_expression(rhs, locals, hint_from_parent)?;
+                let (result_id, result_stream) = self.gen_id_and_stream(Instruction::BinaryOp {
+                    left: lhs_id,
+                    op: match binop {
+                        ast::BinOp::And(_) => unreachable!(),
+                        ast::BinOp::Caret(_) => "^",
+                        ast::BinOp::GreaterThan(_) => ">",
+                        ast::BinOp::GreaterThanEqual(_) => ">=",
+                        ast::BinOp::LessThan(_) => "<",
+                        ast::BinOp::LessThanEqual(_) => "<=",
+                        ast::BinOp::Minus(_) => "-",
+                        ast::BinOp::Or(_) => unreachable!(),
+                        ast::BinOp::Percent(_) => "%",
+                        ast::BinOp::Plus(_) => "+",
+                        ast::BinOp::Slash(_) => "/",
+                        ast::BinOp::Star(_) => "*",
+                        ast::BinOp::TildeEqual(_) => "~=",
+                        ast::BinOp::TwoDots(_) => "..",
+                        ast::BinOp::TwoEqual(_) => "==",
+                        _ => bail!("unsupported binary operator {:?}", binop),
+                    }
+                    .to_string(),
+                    right: rhs_id,
+                });
+                Ok((
+                    result_id,
+                    lhs_hint,
+                    Stream::from_streams(vec![lhs_stream, rhs_stream, result_stream]),
+                ))
             }
             _ => unimplemented!(),
         }
