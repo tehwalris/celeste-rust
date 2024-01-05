@@ -7,9 +7,10 @@ use std::{
 
 use anyhow::{bail, Result};
 use full_moon::{
-    ast,
+    ast::{self, Return},
     tokenizer::{Symbol, TokenKind, TokenReference, TokenType},
 };
+use itertools::Itertools;
 use regex::internal::Inst;
 
 use crate::{
@@ -367,104 +368,10 @@ impl Compiler {
         Ok((result_id, result_stream))
     }
 
-    /*
-    and compile_closure (c : Ctxt.t) (fun_ast : ast) (name_hint : string option) :
-        Ir.local_id * stream =
-      let fun_args, fun_statements =
-        match fun_ast with
-        | Fbody (Elist fun_args, Slist fun_statements) -> (fun_args, fun_statements)
-        | _ -> failwith "unsupported ast for fun_ast"
-      in
-      let fun_args =
-        List.map
-          (function Ident name -> name | _ -> failwith "arguments must be Ident")
-          fun_args
-      in
-      let _, fun_args_has_duplicates =
-        List.fold_left
-          (fun (seen, has_duplicates) s ->
-            (s :: seen, has_duplicates || List.mem s seen))
-          ([], false) fun_args
-      in
-      assert (not fun_args_has_duplicates);
-      let inner_arg_val_ids = List.map (fun _ -> gen_local_id ()) fun_args in
-      let inner_arg_var_ids = List.map (fun _ -> gen_local_id ()) fun_args in
-      let arg_var_code =
-        List.fold_left2
-          (fun code val_id var_id ->
-            code
-            >:: I (var_id, Ir.Alloc)
-            >:: I (gen_local_id (), Ir.Store (var_id, val_id)))
-          [] inner_arg_val_ids inner_arg_var_ids
-      in
-      let c_no_duplicates =
-        List.fold_left
-          (fun c_no_duplicates (name, local_id) ->
-            if Option.is_some (Ctxt.lookup_opt name c_no_duplicates) then
-              c_no_duplicates
-            else Ctxt.add c_no_duplicates name local_id)
-          Ctxt.empty c
-      in
-      let inner_capture_ids = List.map (fun _ -> gen_local_id ()) c_no_duplicates in
-      let inner_c =
-        List.fold_left2
-          (fun c (name, _) inner_id -> (name, inner_id) :: c)
-          Ctxt.empty c_no_duplicates inner_capture_ids
-      in
-      let inner_c =
-        List.fold_left2
-          (fun c name inner_id -> (name, inner_id) :: c)
-          inner_c fun_args inner_arg_var_ids
-      in
-      let inner_code =
-        (snd @@ compile_statements inner_c None fun_statements) @ arg_var_code
-      in
-      let inner_code =
-        match inner_code with
-        | T (_, Ret _) :: _ -> inner_code
-        | _ -> inner_code >:: T (gen_local_id (), Ret None)
-      in
-      let cfg, inner_fun_defs, new_ids_by_old_ids = cfg_of_stream inner_code in
-      let inner_capture_ids =
-        List.map
-          (fun old_id -> Ir.LocalIdMap.find_opt old_id new_ids_by_old_ids)
-          inner_capture_ids
-      in
-      let inner_arg_val_ids =
-        List.map
-          (fun old_id -> Ir.LocalIdMap.find_opt old_id new_ids_by_old_ids)
-          inner_arg_val_ids
-      in
-      let outer_capture_ids =
-        List.map2
-          (fun (_, outer_id) inner_id ->
-            match inner_id with Some _ -> Some outer_id | None -> None)
-          c_no_duplicates inner_capture_ids
-        |> List.filter_map (fun v -> v)
-      in
-      let inner_capture_ids = List.filter_map (fun v -> v) inner_capture_ids in
-      let fun_name = gen_global_id (Option.value name_hint ~default:"anonymous") in
-      let fun_def : Ir.fun_def =
-        {
-          name = fun_name;
-          capture_ids = inner_capture_ids;
-          arg_ids = inner_arg_val_ids;
-          cfg;
-        }
-      in
-      let closure_id = gen_local_id () in
-      ( closure_id,
-        List.map (fun d -> F d) (fun_def :: inner_fun_defs)
-        >:: I (closure_id, Ir.Alloc)
-        >:: I
-              ( gen_local_id (),
-                Ir.StoreClosure (closure_id, fun_name, outer_capture_ids) ) )
-         */
-
     fn compile_closure(
         &mut self,
         function: &ast::FunctionBody,
-        name: &str,
+        base_name: &str,
         locals: &HashMap<String, LocalId>,
     ) -> Result<(LocalId, Stream)> {
         let params = function
@@ -478,8 +385,112 @@ impl Compiler {
         let unique_params: HashSet<&str> = params.iter().cloned().collect();
         assert!(params.len() == unique_params.len());
 
-        // TODO you were here
-        todo!()
+        let inner_arg_val_ids: Vec<_> = params
+            .iter()
+            .map(|_| self.local_id_generator.next())
+            .collect();
+        let inner_arg_var_ids: Vec<_> = params
+            .iter()
+            .map(|_| self.local_id_generator.next())
+            .collect();
+
+        let mut arg_var_stream = Stream::new();
+        for (val_id, var_id) in inner_arg_val_ids.iter().zip_eq(inner_arg_var_ids.iter()) {
+            arg_var_stream
+                .0
+                .push(StreamElement::Instruction(*var_id, Instruction::Alloc));
+            arg_var_stream.0.push(StreamElement::Instruction(
+                self.local_id_generator.next(),
+                Instruction::Store {
+                    target: *var_id,
+                    source: *val_id,
+                },
+            ));
+        }
+
+        let sorted_outer_locals: Vec<_> = locals
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .sorted_by_key(|(k, _)| k.clone())
+            .collect();
+
+        let inner_capture_ids: Vec<_> = sorted_outer_locals
+            .iter()
+            .map(|_| self.local_id_generator.next())
+            .collect();
+        let mut inner_locals = HashMap::new();
+        for ((name, _outer_id), inner_id) in
+            sorted_outer_locals.iter().zip_eq(inner_capture_ids.iter())
+        {
+            inner_locals.insert(name.to_string(), *inner_id);
+        }
+        for (name, inner_id) in params.iter().zip_eq(inner_arg_var_ids.iter()) {
+            inner_locals.insert(name.to_string(), *inner_id);
+        }
+
+        let mut inner_stream = self.compile_block(function.block(), None, &inner_locals)?;
+
+        inner_stream.0.extend(arg_var_stream.0);
+        match inner_stream.0.last() {
+            Some(StreamElement::Terminator(_, Terminator::Return { .. })) => {}
+            _ => {
+                inner_stream.0.push(StreamElement::Terminator(
+                    self.local_id_generator.next(),
+                    Terminator::Return { value: None },
+                ));
+            }
+        }
+
+        let inner_build_result = inner_stream.build();
+        let inner_capture_ids_remapped: Vec<_> = inner_capture_ids
+            .into_iter()
+            .map(|id| inner_build_result.new_ids_by_old_ids.get(&id).cloned())
+            .collect();
+        let outer_capture_ids: Vec<_> = sorted_outer_locals
+            .iter()
+            .zip_eq(inner_capture_ids_remapped.iter())
+            .filter_map(|((_, outer_id), inner_id)| match inner_id {
+                Some(_) => Some(*outer_id),
+                None => None,
+            })
+            .collect();
+
+        let global_name = self.global_id_generator.next(base_name);
+        let fun_def = FunDef {
+            name: global_name.clone(),
+            capture_ids: inner_capture_ids_remapped
+                .into_iter()
+                .filter_map(|id| id)
+                .collect(),
+            arg_ids: inner_arg_val_ids
+                .into_iter()
+                .map(|id| inner_build_result.new_ids_by_old_ids.get(&id).cloned())
+                .collect(),
+            cfg: inner_build_result.cfg,
+        };
+
+        let closure_id = self.local_id_generator.next();
+        let mut outer_stream = Stream(
+            inner_build_result
+                .fun_defs
+                .into_iter()
+                .map(|fun_def| StreamElement::Function(fun_def))
+                .collect(),
+        );
+        outer_stream.0.push(StreamElement::Function(fun_def));
+        outer_stream
+            .0
+            .push(StreamElement::Instruction(closure_id, Instruction::Alloc));
+        outer_stream.0.push(StreamElement::Instruction(
+            self.local_id_generator.next(),
+            Instruction::StoreClosure {
+                target: closure_id,
+                fun_def: global_name,
+                captures: outer_capture_ids,
+            },
+        ));
+
+        Ok((closure_id, outer_stream))
     }
 
     fn compile_rhs_expression(
@@ -659,5 +670,44 @@ impl Compiler {
             }
             _ => unimplemented!(),
         }
+    }
+
+    fn compile_block(
+        &mut self,
+        block: &ast::Block,
+        break_label: Option<&Label>,
+        locals: &HashMap<String, LocalId>,
+    ) -> Result<Stream> {
+        let mut stream = Stream::new();
+        let mut locals = locals.clone();
+        for statement in block.stmts() {
+            let (extra_stream, new_locals) =
+                self.compile_statement(statement, break_label, locals)?;
+            stream.0.extend(extra_stream.0);
+            locals = new_locals;
+        }
+        if let Some(last_statement) = block.last_stmt() {
+            let extra_stream = self.compile_last_statement(last_statement, break_label, locals)?;
+            stream.0.extend(extra_stream.0);
+        }
+        Ok(stream)
+    }
+
+    fn compile_statement(
+        &mut self,
+        statement: &ast::Stmt,
+        break_label: Option<&Label>,
+        locals: HashMap<String, LocalId>,
+    ) -> Result<(Stream, HashMap<String, LocalId>)> {
+        todo!()
+    }
+
+    fn compile_last_statement(
+        &mut self,
+        statement: &ast::LastStmt,
+        break_label: Option<&Label>,
+        locals: HashMap<String, LocalId>,
+    ) -> Result<Stream> {
+        todo!()
     }
 }
