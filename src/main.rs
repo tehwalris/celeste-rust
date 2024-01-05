@@ -1,3 +1,7 @@
+// TODO don't allow later
+#![allow(dead_code)]
+#![allow(unused_variables)]
+
 use anyhow::Result;
 use cart_data::CartData;
 
@@ -5,8 +9,6 @@ use cart_data::CartData;
 #[macro_use(anyhow)]
 extern crate anyhow;
 extern crate bv;
-#[macro_use(lazy_static)]
-extern crate lazy_static;
 extern crate hex;
 extern crate regex;
 extern crate rustc_hash;

@@ -1,17 +1,11 @@
-use std::{
-    collections::{HashMap, HashSet},
-    hash::Hash,
-    ops::Index,
-    process::id,
-};
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{bail, Result};
 use full_moon::{
-    ast::{self, Return},
-    tokenizer::{Symbol, TokenKind, TokenReference, TokenType},
+    ast::{self},
+    tokenizer::{Symbol, TokenReference, TokenType},
 };
 use itertools::Itertools;
-use regex::internal::Inst;
 
 use crate::{
     ir::{
