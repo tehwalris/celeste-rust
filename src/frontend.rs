@@ -1097,7 +1097,12 @@ impl Compiler {
     ) -> Result<Stream> {
         match statement {
             ast::LastStmt::Return(return_stmt) => {
-                match return_stmt.returns().iter().at_most_one()? {
+                match return_stmt
+                    .returns()
+                    .iter()
+                    .at_most_one()
+                    .or(Err(anyhow!("multiple return values are not supported")))?
+                {
                     Some(expr) => {
                         let (expr_id, _, expr_stream) =
                             self.compile_rhs_expression(expr, &locals, None)?;
