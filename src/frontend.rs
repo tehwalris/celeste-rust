@@ -224,26 +224,53 @@ impl Compiler {
         }
     }
 
-    fn compile_lhs_expression(
+    fn compile_prefix_as_lhs(
         &mut self,
-        expression: &ast::Expression,
+        prefix: &ast::Prefix,
         locals: &HashMap<String, LocalId>,
         create_if_missing: bool,
     ) -> Result<(LocalId, Option<String>, Stream)> {
-        match expression {
-            ast::Expression::Var(ast::Var::Name(identifier)) => {
+        match prefix {
+            ast::Prefix::Expression(expression) => {
+                self.compile_lhs_expression(expression, locals, create_if_missing)
+            }
+            ast::Prefix::Name(name) => {
+                self.compile_token_reference(name, locals, create_if_missing)
+            }
+            _ => Err(anyhow!("not implemented")),
+        }
+    }
+
+    fn compile_prefix_as_rhs(
+        &mut self,
+        prefix: &ast::Prefix,
+        locals: &HashMap<String, LocalId>,
+        create_if_missing: bool,
+    ) -> Result<(LocalId, Option<String>, Stream)> {
+        let (lhs_id, lhs_hint, lhs_stream) =
+            self.compile_prefix_as_lhs(prefix, locals, create_if_missing)?;
+        let (result_id, result_stream) =
+            self.gen_id_and_stream(Instruction::Load { source: lhs_id });
+        Ok((
+            result_id,
+            lhs_hint,
+            Stream::from_streams(vec![lhs_stream, result_stream]),
+        ))
+    }
+
+    fn compile_var(
+        &mut self,
+        var: &ast::Var,
+        locals: &HashMap<String, LocalId>,
+        create_if_missing: bool,
+    ) -> Result<(LocalId, Option<String>, Stream)> {
+        match var {
+            ast::Var::Name(identifier) => {
                 self.compile_token_reference(identifier, locals, create_if_missing)
             }
-            ast::Expression::Var(ast::Var::Expression(expression)) => {
-                let (lhs_id, lhs_hint, lhs_stream) = match expression.prefix() {
-                    ast::Prefix::Expression(expression) => {
-                        self.compile_lhs_expression(expression, locals, create_if_missing)?
-                    }
-                    ast::Prefix::Name(name) => {
-                        self.compile_token_reference(name, locals, create_if_missing)?
-                    }
-                    _ => Err(anyhow!("not implemented"))?,
-                };
+            ast::Var::Expression(expression) => {
+                let (lhs_id, lhs_hint, lhs_stream) =
+                    self.compile_prefix_as_lhs(expression.prefix(), locals, create_if_missing)?;
                 let only_suffix = match expression.suffixes().collect::<Vec<_>>().as_slice() {
                     &[suffix] => suffix,
                     _ => bail!(
@@ -292,6 +319,18 @@ impl Compiler {
                     _ => Err(anyhow!("not implemented")),
                 }
             }
+            _ => unimplemented!(),
+        }
+    }
+
+    fn compile_lhs_expression(
+        &mut self,
+        expression: &ast::Expression,
+        locals: &HashMap<String, LocalId>,
+        create_if_missing: bool,
+    ) -> Result<(LocalId, Option<String>, Stream)> {
+        match expression {
+            ast::Expression::Var(var) => self.compile_var(var, locals, create_if_missing),
             _ => unimplemented!(),
         }
     }
@@ -662,7 +701,54 @@ impl Compiler {
                 let (id, stream) = self.compile_closure(function, name, locals)?;
                 Ok((id, None, stream))
             }
-            _ => unimplemented!(),
+            ast::Expression::Parentheses {
+                contained: _,
+                expression,
+            } => self.compile_rhs_expression(expression, locals, hint_from_parent),
+            ast::Expression::FunctionCall(call) => {
+                let (callee_id, callee_hint, callee_stream) =
+                    self.compile_prefix_as_rhs(call.prefix(), locals, false)?;
+                let arguments = match call.suffixes().collect::<Vec<_>>().as_slice() {
+                    &[ast::Suffix::Call(ast::Call::AnonymousCall(
+                        ast::FunctionArgs::Parentheses {
+                            parentheses: _,
+                            arguments,
+                        },
+                    ))] => arguments,
+                    _ => bail!("expected single anonymous function call suffix"),
+                };
+                let (arg_ids, arg_streams): (Vec<_>, Vec<_>) = arguments
+                    .iter()
+                    .map(|arg| self.compile_rhs_expression(arg, locals, None))
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .map(|(id, _, stream)| (id, stream))
+                    .unzip();
+                let (result_id, result_stream) = self.gen_id_and_stream(Instruction::Call {
+                    closure: callee_id,
+                    args: arg_ids,
+                });
+                Ok((
+                    result_id,
+                    callee_hint,
+                    Stream::from_streams(vec![
+                        callee_stream,
+                        Stream::from_streams(arg_streams),
+                        result_stream,
+                    ]),
+                ))
+            }
+            _ => {
+                let (lhs_id, lhs_hint, lhs_stream) =
+                    self.compile_lhs_expression(expression, locals, false)?;
+                let (result_id, result_stream) =
+                    self.gen_id_and_stream(Instruction::Load { source: lhs_id });
+                Ok((
+                    result_id,
+                    lhs_hint,
+                    Stream::from_streams(vec![lhs_stream, result_stream]),
+                ))
+            }
         }
     }
 
@@ -691,9 +777,87 @@ impl Compiler {
         &mut self,
         statement: &ast::Stmt,
         break_label: Option<&Label>,
-        locals: HashMap<String, LocalId>,
+        mut locals: HashMap<String, LocalId>,
     ) -> Result<(Stream, HashMap<String, LocalId>)> {
-        todo!()
+        match statement {
+            ast::Stmt::Assignment(assignment) => {
+                let (lhs_id, lhs_hint, lhs_stream) = self.compile_var(
+                    assignment
+                        .variables()
+                        .iter()
+                        .exactly_one()
+                        .or(Err(anyhow!("expected exactly one variable")))?,
+                    &locals,
+                    true,
+                )?;
+                let (rhs_id, _, rhs_stream) = self.compile_rhs_expression(
+                    assignment
+                        .expressions()
+                        .iter()
+                        .exactly_one()
+                        .or(Err(anyhow!("expected exactly one expression")))?,
+                    &locals,
+                    lhs_hint.as_ref().map(|s| s.as_str()),
+                )?;
+                let stream = Stream::from_streams(vec![
+                    lhs_stream,
+                    rhs_stream,
+                    Stream::from_element(StreamElement::Instruction(
+                        self.local_id_generator.next(),
+                        Instruction::Store {
+                            target: lhs_id,
+                            source: rhs_id,
+                        },
+                    )),
+                ]);
+                Ok((stream, locals))
+            }
+            ast::Stmt::LocalAssignment(local_assignment) => {
+                let name = identifier_from_token_reference(
+                    local_assignment
+                        .names()
+                        .iter()
+                        .exactly_one()
+                        .or(Err(anyhow!("expected exactly one variable")))?,
+                )?;
+                let expression = local_assignment
+                    .expressions()
+                    .iter()
+                    .at_most_one()
+                    .or(Err(anyhow!("expected at most one expression")))?;
+                let (lhs_id, mut stream) = self.gen_id_and_stream(Instruction::Alloc);
+                locals.insert(name.to_string(), lhs_id);
+                if let Some(expression) = expression {
+                    let (rhs_id, _, rhs_stream) =
+                        self.compile_rhs_expression(expression, &locals, None)?;
+                    stream.0.push(StreamElement::Instruction(
+                        lhs_id,
+                        Instruction::Store {
+                            target: lhs_id,
+                            source: rhs_id,
+                        },
+                    ));
+                }
+                Ok((stream, locals))
+            }
+            ast::Stmt::FunctionCall(call) => {
+                if let ast::Prefix::Name(name) = call.prefix() {
+                    if identifier_from_token_reference(name)? == "_hint_normalize" {
+                        return Ok((
+                            Stream::from_element(StreamElement::Hint(Hint::Normalize)),
+                            locals,
+                        ));
+                    }
+                }
+                let (_, _, stream) = self.compile_rhs_expression(
+                    &ast::Expression::FunctionCall(call.clone()),
+                    &locals,
+                    None,
+                )?;
+                Ok((stream, locals))
+            }
+            _ => unimplemented!(),
+        }
     }
 
     fn compile_last_statement(
@@ -702,6 +866,14 @@ impl Compiler {
         break_label: Option<&Label>,
         locals: HashMap<String, LocalId>,
     ) -> Result<Stream> {
-        todo!()
+        match statement {
+            ast::LastStmt::Return(return_stmt) => {
+                todo!()
+            }
+            ast::LastStmt::Break(_) => {
+                todo!()
+            }
+            _ => unimplemented!(),
+        }
     }
 }
