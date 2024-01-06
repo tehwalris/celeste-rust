@@ -856,6 +856,235 @@ impl Compiler {
                 )?;
                 Ok((stream, locals))
             }
+            ast::Stmt::If(if_statement) => {
+                let mut branches: Vec<(&ast::Expression, &ast::Block)> = vec![];
+                branches.push((if_statement.condition(), if_statement.block()));
+                if let Some(else_ifs) = if_statement.else_if() {
+                    for else_if in else_ifs {
+                        branches.push((else_if.condition(), else_if.block()));
+                    }
+                }
+                let true_expression =
+                    ast::Expression::Symbol(TokenReference::symbol("true").unwrap());
+                if let Some(else_block) = if_statement.else_block() {
+                    branches.push((&true_expression, else_block));
+                }
+
+                let condition_labels: Vec<_> = branches
+                    .iter()
+                    .map(|_| self.label_generator.next("if_condition"))
+                    .collect();
+                let body_labels: Vec<_> = branches
+                    .iter()
+                    .map(|_| self.label_generator.next("if_body"))
+                    .collect();
+                let join_label = self.label_generator.next("if_join");
+
+                let first_condition_label = condition_labels.first().unwrap().clone();
+                let condition_label_pairs = condition_labels
+                    .into_iter()
+                    .chain(std::iter::once(join_label.clone()))
+                    .tuple_windows();
+
+                let stream = Stream::from_streams(vec![
+                    Stream::from_element(StreamElement::Terminator(
+                        self.local_id_generator.next(),
+                        Terminator::UnconditionalBranch {
+                            target: first_condition_label,
+                        },
+                    )),
+                    Stream::from_streams(
+                        branches
+                            .iter()
+                            .zip_eq(condition_label_pairs)
+                            .zip_eq(body_labels.into_iter())
+                            .map(
+                                |(
+                                    ((condition, body), (condition_label, next_condition_label)),
+                                    body_label,
+                                )| {
+                                    let (condition_id, _, condition_stream) =
+                                        self.compile_rhs_expression(condition, &locals, None)?;
+                                    let mut body_stream =
+                                        self.compile_block(body, break_label, &locals)?;
+                                    self.add_terminator_if_needed(
+                                        &mut body_stream,
+                                        Terminator::UnconditionalBranch {
+                                            target: join_label.clone(),
+                                        },
+                                    );
+                                    Ok(Stream::from_streams(vec![
+                                        Stream::from_element(StreamElement::Label(condition_label)),
+                                        condition_stream,
+                                        Stream::from_element(StreamElement::Terminator(
+                                            self.local_id_generator.next(),
+                                            Terminator::ConditionalBranch {
+                                                condition: condition_id,
+                                                true_target: body_label.clone(),
+                                                false_target: next_condition_label,
+                                            },
+                                        )),
+                                        Stream::from_element(StreamElement::Label(body_label)),
+                                        body_stream,
+                                    ]))
+                                },
+                            )
+                            .collect::<Result<Vec<_>>>()?,
+                    ),
+                    Stream::from_element(StreamElement::Label(join_label)),
+                ]);
+
+                Ok((stream, locals))
+            }
+            ast::Stmt::FunctionDeclaration(function) => {
+                if function.name().method_name().is_some() {
+                    return Err(anyhow!("methods are not supported"));
+                }
+                // TODO What happens if you declare "local x" and then write "function x() end"?
+                // Will the function be local or global?
+                let name = identifier_from_token_reference(
+                    function
+                        .name()
+                        .names()
+                        .iter()
+                        .exactly_one()
+                        .or(Err(anyhow!("expected exactly one name")))?,
+                )?;
+                let (name_id, _, name_stream) = self.compile_identifier(name, &locals, true)?;
+
+                let (closure_id, closure_stream) =
+                    self.compile_closure(function.body(), name, &locals)?;
+
+                Ok((
+                    Stream::from_streams(vec![
+                        closure_stream,
+                        name_stream,
+                        Stream::from_element(StreamElement::Instruction(
+                            self.local_id_generator.next(),
+                            Instruction::Store {
+                                target: name_id,
+                                source: closure_id,
+                            },
+                        )),
+                    ]),
+                    locals,
+                ))
+            }
+            ast::Stmt::NumericFor(for_statement) => {
+                if for_statement.step().is_some() {
+                    return Err(anyhow!("explicit step is not supported"));
+                }
+
+                let (start_id, _, start_stream) =
+                    self.compile_rhs_expression(for_statement.start(), &locals, None)?;
+                let (end_id, _, end_stream) =
+                    self.compile_rhs_expression(for_statement.end(), &locals, None)?;
+
+                let val_id = self.local_id_generator.next();
+                let var_id = self.local_id_generator.next();
+                let step_id = self.local_id_generator.next();
+                let next_val_id = self.local_id_generator.next();
+                let continue_id = self.local_id_generator.next();
+                let init_end_label = self.label_generator.next("for_init_end");
+                let head_label = self.label_generator.next("for_head");
+                let body_start_label = self.label_generator.next("for_body_start");
+                let body_end_label = self.label_generator.next("for_body_end");
+                let join_label = self.label_generator.next("for_join");
+
+                let mut locals_for_body = locals.clone();
+                locals_for_body.insert(
+                    identifier_from_token_reference(for_statement.index_variable())?.to_string(),
+                    var_id,
+                );
+                let body_stream =
+                    self.compile_block(for_statement.block(), Some(&join_label), &locals_for_body)?;
+
+                let stream = Stream::from_streams(vec![
+                    start_stream,
+                    end_stream,
+                    Stream(vec![
+                        StreamElement::Instruction(
+                            step_id,
+                            Instruction::NumberConstant {
+                                value: Pico8Num::from_i16(1),
+                            },
+                        ),
+                        StreamElement::Terminator(
+                            self.local_id_generator.next(),
+                            Terminator::UnconditionalBranch {
+                                target: init_end_label.clone(),
+                            },
+                        ),
+                        StreamElement::Label(init_end_label.clone()),
+                        StreamElement::Terminator(
+                            self.local_id_generator.next(),
+                            Terminator::UnconditionalBranch {
+                                target: head_label.clone(),
+                            },
+                        ),
+                        StreamElement::Label(head_label.clone()),
+                        StreamElement::Instruction(
+                            val_id,
+                            Instruction::Phi {
+                                branches: vec![
+                                    (init_end_label.clone(), start_id),
+                                    (body_end_label.clone(), next_val_id),
+                                ],
+                            },
+                        ),
+                        StreamElement::Instruction(
+                            continue_id,
+                            Instruction::BinaryOp {
+                                left: val_id,
+                                op: "<=".to_string(),
+                                right: end_id,
+                            },
+                        ),
+                        StreamElement::Terminator(
+                            self.local_id_generator.next(),
+                            Terminator::ConditionalBranch {
+                                condition: continue_id,
+                                true_target: body_start_label.clone(),
+                                false_target: join_label.clone(),
+                            },
+                        ),
+                        StreamElement::Label(body_start_label),
+                        StreamElement::Instruction(var_id, Instruction::Alloc),
+                        StreamElement::Instruction(
+                            self.local_id_generator.next(),
+                            Instruction::Store {
+                                target: var_id,
+                                source: val_id,
+                            },
+                        ),
+                    ]),
+                    body_stream,
+                    Stream(vec![
+                        StreamElement::Instruction(
+                            next_val_id,
+                            Instruction::BinaryOp {
+                                left: val_id,
+                                op: "+".to_string(),
+                                right: step_id,
+                            },
+                        ),
+                        StreamElement::Terminator(
+                            self.local_id_generator.next(),
+                            Terminator::UnconditionalBranch {
+                                target: body_end_label.clone(),
+                            },
+                        ),
+                        StreamElement::Label(body_end_label),
+                        StreamElement::Terminator(
+                            self.local_id_generator.next(),
+                            Terminator::UnconditionalBranch { target: head_label },
+                        ),
+                        StreamElement::Label(join_label),
+                    ]),
+                ]);
+
+                Ok((stream, locals))
+            }
             _ => unimplemented!(),
         }
     }
@@ -868,11 +1097,32 @@ impl Compiler {
     ) -> Result<Stream> {
         match statement {
             ast::LastStmt::Return(return_stmt) => {
-                todo!()
+                match return_stmt.returns().iter().at_most_one()? {
+                    Some(expr) => {
+                        let (expr_id, _, expr_stream) =
+                            self.compile_rhs_expression(expr, &locals, None)?;
+                        Ok(Stream::from_streams(vec![
+                            expr_stream,
+                            Stream::from_element(StreamElement::Terminator(
+                                self.local_id_generator.next(),
+                                Terminator::Return {
+                                    value: Some(expr_id),
+                                },
+                            )),
+                        ]))
+                    }
+                    None => Ok(Stream::from_element(StreamElement::Terminator(
+                        self.local_id_generator.next(),
+                        Terminator::Return { value: None },
+                    ))),
+                }
             }
-            ast::LastStmt::Break(_) => {
-                todo!()
-            }
+            ast::LastStmt::Break(_) => Ok(Stream::from_element(StreamElement::Terminator(
+                self.local_id_generator.next(),
+                Terminator::UnconditionalBranch {
+                    target: break_label.unwrap().clone(),
+                },
+            ))),
             _ => unimplemented!(),
         }
     }
