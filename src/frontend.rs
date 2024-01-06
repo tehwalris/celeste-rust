@@ -1132,3 +1132,10 @@ impl Compiler {
         }
     }
 }
+
+pub fn compile(ast: &ast::Ast) -> Result<(Cfg, Vec<FunDef>)> {
+    let mut compiler = Compiler::new();
+    let stream = compiler.compile_block(ast.nodes(), None, &HashMap::new())?;
+    let build_result = stream.build();
+    Ok((build_result.cfg, build_result.fun_defs))
+}

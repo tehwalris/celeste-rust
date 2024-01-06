@@ -2,6 +2,7 @@
   "cSpell.words": [
     "accels",
     "appr",
+    "binop",
     "deccel",
     "djump",
     "fget",
@@ -13,6 +14,7 @@
     "maxrun",
     "Pico",
     "rustc",
+    "unop",
     "vecs"
   ],
   "nixEnvSelector.nixFile": "${workspaceRoot}/shell.nix"
