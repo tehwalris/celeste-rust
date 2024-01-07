@@ -9,8 +9,8 @@ use itertools::Itertools;
 
 use crate::{
     ir::{
-        Block, Cfg, FunDef, GlobalIdGenerator, Instruction, Label, LabelGenerator, LocalId,
-        LocalIdGenerator, Terminator,
+        BinaryOp, Block, Cfg, FunDef, GlobalIdGenerator, Instruction, Label, LabelGenerator,
+        LocalId, LocalIdGenerator, Terminator, UnaryOp,
     },
     pico8_num::Pico8Num,
 };
@@ -629,12 +629,11 @@ impl Compiler {
                     self.compile_rhs_expression(expression, locals, hint_from_parent)?;
                 let (result_id, result_stream) = self.gen_id_and_stream(Instruction::UnaryOp {
                     op: match unop {
-                        ast::UnOp::Minus(_) => "-",
-                        ast::UnOp::Not(_) => "not",
-                        ast::UnOp::Hash(_) => "#",
+                        ast::UnOp::Minus(_) => UnaryOp::Minus,
+                        ast::UnOp::Not(_) => UnaryOp::Not,
+                        ast::UnOp::Hash(_) => UnaryOp::Hash,
                         _ => bail!("unsupported unary operator {:?}", unop),
-                    }
-                    .to_string(),
+                    },
                     arg: inner_id,
                 });
                 Ok((
@@ -668,23 +667,22 @@ impl Compiler {
                     left: lhs_id,
                     op: match binop {
                         ast::BinOp::And(_) => unreachable!(),
-                        ast::BinOp::Caret(_) => "^",
-                        ast::BinOp::GreaterThan(_) => ">",
-                        ast::BinOp::GreaterThanEqual(_) => ">=",
-                        ast::BinOp::LessThan(_) => "<",
-                        ast::BinOp::LessThanEqual(_) => "<=",
-                        ast::BinOp::Minus(_) => "-",
+                        ast::BinOp::Caret(_) => BinaryOp::Caret,
+                        ast::BinOp::GreaterThan(_) => BinaryOp::GreaterThan,
+                        ast::BinOp::GreaterThanEqual(_) => BinaryOp::GreaterThanEqual,
+                        ast::BinOp::LessThan(_) => BinaryOp::LessThan,
+                        ast::BinOp::LessThanEqual(_) => BinaryOp::LessThanEqual,
+                        ast::BinOp::Minus(_) => BinaryOp::Minus,
                         ast::BinOp::Or(_) => unreachable!(),
-                        ast::BinOp::Percent(_) => "%",
-                        ast::BinOp::Plus(_) => "+",
-                        ast::BinOp::Slash(_) => "/",
-                        ast::BinOp::Star(_) => "*",
-                        ast::BinOp::TildeEqual(_) => "~=",
-                        ast::BinOp::TwoDots(_) => "..",
-                        ast::BinOp::TwoEqual(_) => "==",
+                        ast::BinOp::Percent(_) => BinaryOp::Percent,
+                        ast::BinOp::Plus(_) => BinaryOp::Plus,
+                        ast::BinOp::Slash(_) => BinaryOp::Slash,
+                        ast::BinOp::Star(_) => BinaryOp::Star,
+                        ast::BinOp::TildeEqual(_) => BinaryOp::TildeEqual,
+                        ast::BinOp::TwoDots(_) => BinaryOp::TwoDots,
+                        ast::BinOp::TwoEqual(_) => BinaryOp::TwoEqual,
                         _ => bail!("unsupported binary operator {:?}", binop),
-                    }
-                    .to_string(),
+                    },
                     right: rhs_id,
                 });
                 Ok((
@@ -1036,7 +1034,7 @@ impl Compiler {
                             continue_id,
                             Instruction::BinaryOp {
                                 left: val_id,
-                                op: "<=".to_string(),
+                                op: BinaryOp::LessThanEqual,
                                 right: end_id,
                             },
                         ),
@@ -1064,7 +1062,7 @@ impl Compiler {
                             next_val_id,
                             Instruction::BinaryOp {
                                 left: val_id,
-                                op: "+".to_string(),
+                                op: BinaryOp::Plus,
                                 right: step_id,
                             },
                         ),

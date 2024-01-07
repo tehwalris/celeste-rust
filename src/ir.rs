@@ -63,6 +63,30 @@ impl From<String> for Label {
 
 pub type LabelGenerator = UniqueStringGenerator<Label>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnaryOp {
+    Minus,
+    Not,
+    Hash,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BinaryOp {
+    Caret,
+    GreaterThan,
+    GreaterThanEqual,
+    LessThan,
+    LessThanEqual,
+    Minus,
+    Percent,
+    Plus,
+    Slash,
+    Star,
+    TildeEqual,
+    TwoDots,
+    TwoEqual,
+}
+
 #[derive(Clone, Debug)]
 pub enum Instruction {
     Alloc,
@@ -110,12 +134,12 @@ pub enum Instruction {
         args: Vec<LocalId>,
     },
     UnaryOp {
-        op: String,
+        op: UnaryOp,
         arg: LocalId,
     },
     BinaryOp {
         left: LocalId,
-        op: String,
+        op: BinaryOp,
         right: LocalId,
     },
     Phi {
