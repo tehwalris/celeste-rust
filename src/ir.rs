@@ -3,10 +3,10 @@ use std::collections::HashMap;
 use crate::pico8_num::Pico8Num;
 
 #[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
-pub struct LocalId(i32);
+pub struct LocalId(usize);
 
 pub struct LocalIdGenerator {
-    next_id: i32,
+    next_id: usize,
 }
 
 impl LocalIdGenerator {
@@ -23,7 +23,7 @@ impl LocalIdGenerator {
 
 pub struct UniqueStringGenerator<T: From<String>> {
     _item_type: std::marker::PhantomData<T>,
-    next_id: i32,
+    next_id: usize,
 }
 
 impl<T: From<String>> UniqueStringGenerator<T> {
