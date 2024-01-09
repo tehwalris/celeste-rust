@@ -1,7 +1,9 @@
+use std::collections::HashMap;
+
 use itertools::Itertools;
 
 use super::heap::HeapId;
-use crate::pico8_num::Pico8Num;
+use crate::{ir::GlobalId, pico8_num::Pico8Num};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MaybeVector<T: std::fmt::Debug + Clone + PartialEq + Eq> {
@@ -43,4 +45,14 @@ pub enum Value {
     Nil(Option<String>),
     Pointer(HeapId),
     NilPointer(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeapValue {
+    Value(Value),
+    ObjectTable(HashMap<String, HeapId>),
+    ArrayTable(Vec<Pico8Num>),
+    UnknownTable,
+    Closure(GlobalId, Vec<Value>),
+    BuiltinFun(String),
 }

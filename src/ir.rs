@@ -5,6 +5,12 @@ use crate::pico8_num::Pico8Num;
 #[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
 pub struct LocalId(usize);
 
+impl From<LocalId> for usize {
+    fn from(id: LocalId) -> Self {
+        id.0
+    }
+}
+
 pub struct LocalIdGenerator {
     next_id: usize,
 }
