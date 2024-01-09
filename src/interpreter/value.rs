@@ -1,3 +1,5 @@
+use itertools::Itertools;
+
 use super::heap::HeapId;
 use crate::pico8_num::Pico8Num;
 
@@ -13,6 +15,20 @@ impl<T: std::fmt::Debug + Clone + PartialEq + Eq> MaybeVector<T> {
         match self {
             MaybeVector::Scalar(v) => MaybeVector::Scalar(f(v)),
             MaybeVector::Vector(v) => MaybeVector::Vector(v.iter().map(f).collect()),
+        }
+    }
+
+    pub fn map2<O: std::fmt::Debug + Clone + PartialEq + Eq>(
+        a: &Self,
+        b: &Self,
+        f: impl Fn(&T, &T) -> O,
+    ) -> MaybeVector<O> {
+        match (a, b) {
+            (MaybeVector::Scalar(a), MaybeVector::Scalar(b)) => MaybeVector::Scalar(f(a, b)),
+            (MaybeVector::Vector(a), MaybeVector::Vector(b)) => {
+                MaybeVector::Vector(a.iter().zip_eq(b.iter()).map(|(a, b)| f(a, b)).collect())
+            }
+            _ => panic!("Mismatched vector sizes"),
         }
     }
 }
