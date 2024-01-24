@@ -30,7 +30,7 @@ pub fn interpret_unary_op(state: &State, op: UnaryOp, v: &Value) -> Result<Value
         _ => Err(anyhow!("Unsupported unary op: {:?} {:?}", op, v)),
     }
 }
-fn interpret_binary_op(l: &Value, op: BinaryOp, r: &Value) -> Result<Value> {
+pub fn interpret_binary_op(l: &Value, op: BinaryOp, r: &Value) -> Result<Value> {
     let sb = |b| Ok(Value::Bool(MaybeVector::Scalar(b)));
     match (l, op, r) {
         (_, BinaryOp::TildeEqual, _) => {

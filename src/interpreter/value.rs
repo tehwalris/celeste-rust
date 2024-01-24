@@ -51,7 +51,7 @@ pub enum Value {
 pub enum HeapValue {
     Value(Value),
     ObjectTable(HashMap<String, HeapId>),
-    ArrayTable(Vec<Pico8Num>),
+    ArrayTable(Vec<HeapId>),
     UnknownTable,
     Closure(GlobalId, Vec<Value>),
     BuiltinFun(String),
