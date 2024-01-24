@@ -13,17 +13,6 @@ pub struct CoreInterpreter {
     state: State,
 }
 
-/* let failwith_not_pointer (v : value) =
-match v with
-| Scalar (SPointer _) | Scalar (SNilPointer _) ->
-    failwith "failwith_not_pointer called with pointer"
-| Scalar (SNil (Some hint)) ->
-    failwith
-    @@ Printf.sprintf "Value is not a pointer (value is nil; %s)" hint
-| Scalar (SNil None) ->
-    failwith @@ Printf.sprintf "Value is not a pointer (value is nil)"
-| _ -> failwith "Value is not a pointer" */
-
 fn make_non_pointer_error(value: &Value) -> anyhow::Error {
     match value {
         Value::Pointer(_) | Value::NilPointer(_) => {
