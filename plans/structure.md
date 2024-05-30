@@ -1,0 +1,31 @@
+- interpreter (not used yet?)
+  - core_interpreter.rs
+    - runs individual instructions
+    - doesn't do graph stuff
+  - heap.rs
+    - data structure
+  - local_env.rs
+    - data structure
+  - mod.rs
+    - not much
+  - op.rs
+    - runs unary/binary ops
+  - state.rs
+    - data structure (heap + local_env + ...)
+  - value.rs
+    - variable types (bool, string, etc)
+    - scalar/vector wrappers
+- cart_data.rs
+  - loading data for mget and fget
+- frontend.rs
+  - converting ast to ir (as main cfg + function defs)
+- input.rs
+  - loading keycodes from tas files
+- ir.rs
+  - ir including map/iter helpers
+- main.rs
+  - not much
+- pico8_num.rs
+  - fixed point math
+- tas.rs
+  - loading tas files together with input.rs
