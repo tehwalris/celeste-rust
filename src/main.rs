@@ -15,6 +15,7 @@ extern crate rustc_hash;
 extern crate work_queue;
 
 mod cart_data;
+mod fixed_point;
 mod frontend;
 mod input;
 mod interpreter;
