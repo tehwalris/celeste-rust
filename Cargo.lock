@@ -108,6 +108,7 @@ dependencies = [
  "full_moon",
  "hex",
  "image",
+ "indexmap 2.2.6",
  "itertools",
  "lazy_static",
  "petgraph",

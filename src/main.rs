@@ -14,6 +14,7 @@ extern crate regex;
 extern crate rustc_hash;
 extern crate work_queue;
 
+mod block_flow;
 mod cart_data;
 mod fixed_point;
 mod frontend;

@@ -7,7 +7,7 @@ use petgraph::prelude::GraphMap;
 use petgraph::visit::IntoEdgeReferences;
 use petgraph::Directed;
 
-pub trait Analysis<V: Debug, D: Debug> {
+pub trait Analysis<V: Debug, D: Debug, F: Fn(&D) -> D> {
     fn new_empty() -> D;
     fn is_empty(data: &D) -> bool;
 
@@ -18,38 +18,40 @@ pub trait Analysis<V: Debug, D: Debug> {
     fn join(existing: &mut D, new: &D);
     fn accumulate(accumulated: &D, potentially_new: &D) -> (D, D); // (accumulated, actually_new)
 
-    fn analyze(source_vertex: &V, target_vertex: &V, source_data: &D) -> D; // target_data
+    fn bind_analyze(edge: &(V, V)) -> F;
 }
 
-struct PreparedNode<V> {
+struct PreparedNode<V, F> {
     original_node: V,
-    pred_edges: Vec<(usize, (V, V))>,
+    pred_edges: Vec<(usize, F)>,
     succ_nodes: Vec<usize>,
     succ_edges: Vec<usize>,
 }
 
-pub struct PreparedAnalysis<V, D, A>
+pub struct PreparedAnalysis<V, D, F, A>
 where
     V: Debug + Eq + Hash + Copy + Ord,
     D: Debug + Clone,
-    A: Analysis<V, D>,
+    F: Fn(&D) -> D,
+    A: Analysis<V, D, F>,
 {
     _a: std::marker::PhantomData<A>,
     m_data_acc: Vec<Option<D>>,
     m_data_new: Vec<D>,
-    nodes: Vec<PreparedNode<V>>,
+    nodes: Vec<PreparedNode<V, F>>,
     nodes_by_original: HashMap<V, usize>,
     wl: BTreeSet<usize>,
 }
 
-pub fn prepare_analysis<V, D, A>(
+pub fn prepare_analysis<V, D, F, A>(
     analysis: A,
     graph: &GraphMap<V, (), Directed>,
-) -> Result<PreparedAnalysis<V, D, A>>
+) -> Result<PreparedAnalysis<V, D, F, A>>
 where
     V: Debug + Eq + Hash + Copy + Ord,
     D: Debug + Clone,
-    A: Analysis<V, D>,
+    F: Fn(&D) -> D,
+    A: Analysis<V, D, F>,
 {
     let nodes_by_original: HashMap<V, usize> = petgraph::algo::toposort(graph, None)
         .map_err(|_| anyhow::anyhow!("toposort failed due to cycle"))?
@@ -69,7 +71,7 @@ where
     let mut m_data_acc = vec![None; node_count];
     let m_data_new = vec![A::new_empty(); edge_count];
 
-    let mut nodes: Vec<Option<PreparedNode<V>>> =
+    let mut nodes: Vec<Option<PreparedNode<V, F>>> =
         (0..nodes_by_original.len()).map(|_| None).collect();
     let mut wl = BTreeSet::new();
 
@@ -84,7 +86,7 @@ where
             original_node,
             pred_edges: graph
                 .edges_directed(original_node, petgraph::Direction::Incoming)
-                .map(|(s, t, _)| (edges_by_original[&(s, t)], (s, t)))
+                .map(|(s, t, _)| (edges_by_original[&(s, t)], A::bind_analyze(&(s, t))))
                 .collect(),
             succ_nodes: graph
                 .neighbors(original_node)
@@ -107,8 +109,12 @@ where
     })
 }
 
-impl<V: Debug + Eq + Hash + Copy + Ord, D: Debug + Clone, A: Analysis<V, D>>
-    PreparedAnalysis<V, D, A>
+impl<V, D, F, A> PreparedAnalysis<V, D, F, A>
+where
+    V: Debug + Eq + Hash + Copy + Ord,
+    D: Debug + Clone,
+    F: Fn(&D) -> D,
+    A: Analysis<V, D, F>,
 {
     pub fn run<I: Fn(&V) -> D>(&self, initialize: I) {
         let mut m_data_acc = self.m_data_acc.clone();
@@ -128,8 +134,8 @@ impl<V: Debug + Eq + Hash + Copy + Ord, D: Debug + Clone, A: Analysis<V, D>>
                 let prepared_node = &self.nodes[node];
 
                 let mut potentially_new = A::new_empty();
-                for (pred_edge, (s, t)) in &prepared_node.pred_edges {
-                    let potentially_new_part = A::analyze(s, t, &m_data_new[*pred_edge]);
+                for (pred_edge, analyze) in &prepared_node.pred_edges {
+                    let potentially_new_part = analyze(&m_data_new[*pred_edge]);
                     m_data_new[*pred_edge] = A::new_empty();
                     A::join(&mut potentially_new, &potentially_new_part);
                 }
