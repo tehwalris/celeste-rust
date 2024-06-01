@@ -84,7 +84,7 @@ pub trait UnboundSplitBlockFlow<T, B: BoundSplitBlockFlow<T>> {
         target_block: &Block,
     ) -> Result<B>;
     fn flow_block_post_phi(&self, target_block: &Block) -> Result<B>;
-    fn flow_branch(&self, terminator: &Terminator, label: &Label) -> Result<B>;
+    fn flow_branch(&self, terminator: &Terminator, flow_target: &Label) -> Result<B>;
     fn flow_return(&self, terminator: &Terminator) -> Result<B>;
 }
 

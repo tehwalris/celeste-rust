@@ -6,7 +6,7 @@ use itertools::Itertools;
 use crate::{
     block_flow::{BoundSplitBlockFlow, UnboundSplitBlockFlow},
     instruction_flow::FlowSide,
-    ir::{Block, Instruction, Label, LocalId},
+    ir::{Block, Instruction, Label, LocalId, Terminator},
     liveness::LivenessAnalysisResult,
 };
 
@@ -29,7 +29,11 @@ pub enum BoundInterpreterFlow {
     BlockPostPhi {
         non_phi_instructions: Vec<(LocalId, Instruction)>,
     },
-    Branch,
+    BranchUnconditional,
+    BranchConditional {
+        condition_local_id: LocalId,
+        condition_from_flow_edge: bool,
+    },
     Return,
 }
 
@@ -86,12 +90,68 @@ impl UnboundSplitBlockFlow<FlowData, BoundInterpreterFlow> for InterpreterFlowAd
         })
     }
 
+    /*
+      and flow_branch (terminator : Ir.terminator) (flow_target : Ir.label) :
+      LazyStateSet.t -> LazyStateSet.t =
+    match terminator with
+    | Ir.Br terminator_target when terminator_target = flow_target ->
+        fun states -> states
+    | Ir.Cbr (local_id, true_label, false_label)
+      when flow_target = true_label || flow_target = false_label ->
+        fun states ->
+          LazyStateSet.filter_map
+            (fun state ->
+              match Ir.LocalIdMap.find local_id state.local_env with
+              | Scalar (SBool false) | Scalar (SNil _) ->
+                  if flow_target = false_label then Some state else None
+              | Scalar SUnknownBool -> Some state
+              | Scalar _ -> if flow_target = true_label then Some state else None
+              | Vector (VBool vec) ->
+                  Perf.count_and_time Perf.global_counters.cbr_filter @@ fun () ->
+                  assert (Array.length vec = state.vector_size);
+                  let filter_value = flow_target = true_label in
+                  let mask = Array.map (fun v -> v = filter_value) vec in
+                  let mask_true_count =
+                    Array.fold_left
+                      (fun acc v -> if v then acc + 1 else acc)
+                      0 mask
+                  in
+                  if mask_true_count = 0 then None
+                  else
+                    let filtered_state =
+                      state_map_values
+                        (function
+                          | Scalar s -> Scalar s
+                          | Vector vec -> Option.get @@ filter_vector mask vec)
+                        state
+                    in
+                    Some { filtered_state with vector_size = mask_true_count }
+              | Vector _ -> if flow_target = true_label then Some state else None)
+            states
+    | _ -> failwith "Unexpected flow"
+       */
+
     fn flow_branch(
         &self,
         terminator: &crate::ir::Terminator,
-        label: &crate::ir::Label,
+        flow_target: &crate::ir::Label,
     ) -> Result<BoundInterpreterFlow> {
-        todo!()
+        match terminator {
+            Terminator::UnconditionalBranch { target } if target == flow_target => {
+                Ok(BoundInterpreterFlow::BranchUnconditional)
+            }
+            Terminator::ConditionalBranch {
+                condition,
+                true_target,
+                false_target,
+            } if flow_target == true_target || flow_target == false_target => {
+                Ok(BoundInterpreterFlow::BranchConditional {
+                    condition_local_id: *condition,
+                    condition_from_flow_edge: flow_target == true_target,
+                })
+            }
+            _ => panic!("Unexpected flow"),
+        }
     }
 
     fn flow_return(&self, terminator: &crate::ir::Terminator) -> Result<BoundInterpreterFlow> {
@@ -136,9 +196,16 @@ impl BoundInterpreterFlow {
                     }
                     states = new_states;
                 }
-                Ok(FlowData::States(vec![state]))
+                Ok(FlowData::States(states))
             }
-            Self::Branch => todo!(),
+            Self::BranchUnconditional => Ok(FlowData::States(vec![state])),
+            Self::BranchConditional {
+                condition_local_id,
+                condition_from_flow_edge,
+            } => {
+                let v = state.local_env.get(*condition_local_id);
+                todo!()
+            }
             Self::Return => todo!(),
         }
     }
