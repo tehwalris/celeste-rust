@@ -43,7 +43,7 @@ impl CoreInterpreter {
         }
     }
 
-    pub fn interpret_non_call_instruction(
+    fn interpret_non_call_instruction_no_assign(
         &mut self,
         instruction: &Instruction,
     ) -> Result<Option<Value>> {
@@ -237,7 +237,11 @@ impl CoreInterpreter {
         }
     }
 
-    fn interpret_call_instruction(self, instruction: &Instruction) -> Result<Vec<(State, Value)>> {
+    pub fn interpret_non_call_instruction(&mut self, instruction: &Instruction) -> Result<()> {
+        todo!()
+    }
+
+    pub fn interpret_call_instruction(self, instruction: &Instruction) -> Result<Vec<State>> {
         let (closure, args) = match instruction {
             Instruction::Call { closure, args } => (closure, args),
             _ => panic!("Non-call instruction passed to interpret_call_instruction"),
