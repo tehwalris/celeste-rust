@@ -19,8 +19,10 @@ mod cart_data;
 mod fixed_point;
 mod frontend;
 mod input;
+mod instruction_flow;
 mod interpreter;
 mod ir;
+mod liveness;
 mod pico8_num;
 mod tas;
 

@@ -17,4 +17,12 @@ impl LocalEnv {
     pub fn set(&mut self, id: LocalId, value: Value) {
         self.0[usize::from(id)] = Some(value);
     }
+
+    pub fn retain(&mut self, f: impl Fn(LocalId) -> bool) {
+        for (i, value) in self.0.iter_mut().enumerate() {
+            if value.is_some() && !f(LocalId::from(i)) {
+                *value = None;
+            }
+        }
+    }
 }

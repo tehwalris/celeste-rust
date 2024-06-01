@@ -11,6 +11,12 @@ impl From<LocalId> for usize {
     }
 }
 
+impl From<usize> for LocalId {
+    fn from(id: usize) -> Self {
+        Self(id)
+    }
+}
+
 pub struct LocalIdGenerator {
     next_id: usize,
 }

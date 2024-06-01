@@ -1,8 +1,14 @@
+use std::collections::HashSet;
+
 use anyhow::Result;
 use indexmap::IndexSet;
 use petgraph::{graphmap::GraphMap, Directed};
 
-use crate::ir::{Block, Cfg, Label, Terminator};
+use crate::{
+    instruction_flow::FlowSide,
+    ir::{Block, Cfg, Label, LocalId, Terminator},
+    liveness::LivenessAnalysisResult,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum FlowNode {
@@ -74,8 +80,8 @@ pub fn flow_graph_of_cfg(cfg: &Cfg) -> Result<(GraphMap<FlowNode, (), Directed>,
 }
 
 pub trait UnboundSplitBlockFlow<T, B: BoundSplitBlockFlow<T>> {
-    fn flow_block_phi(&self, label: &Label, block: &Block) -> B;
-    fn flow_block_before_join(&self, block: &Block) -> B;
+    fn flow_block_phi(&self, source_block_name: &Label, target_block: &Block) -> B;
+    fn flow_block_before_join(&self, liveness: &LivenessAnalysisResult, target_block: &Block) -> B;
     fn flow_block_post_phi(&self, block: &Block) -> B;
     fn flow_branch(&self, terminator: &Terminator, label: &Label) -> B;
     fn flow_return(&self, terminator: &Terminator) -> B;
@@ -89,6 +95,7 @@ pub fn make_bound_flow_function<T, B: BoundSplitBlockFlow<T>>(
     unbound_split_block_flow: impl UnboundSplitBlockFlow<T, B>,
     cfg: &Cfg,
     labels: &IndexSet<Label>,
+    liveness: &LivenessAnalysisResult,
     edge: &(FlowNode, FlowNode),
 ) -> impl Fn(T) -> T {
     let parts = match edge {
@@ -108,7 +115,7 @@ pub fn make_bound_flow_function<T, B: BoundSplitBlockFlow<T>>(
             let target_block = cfg.named.get(target_name).unwrap();
             vec![
                 unbound_split_block_flow.flow_branch(terminator, target_name),
-                unbound_split_block_flow.flow_block_before_join(target_block),
+                unbound_split_block_flow.flow_block_before_join(liveness, target_block),
             ]
         }
         &(FlowNode::AfterNamedBlock(source_index), FlowNode::BeforeNamedBlock(target_index)) => {
@@ -120,7 +127,7 @@ pub fn make_bound_flow_function<T, B: BoundSplitBlockFlow<T>>(
             vec![
                 unbound_split_block_flow.flow_branch(terminator, target_name),
                 unbound_split_block_flow.flow_block_phi(source_name, target_block),
-                unbound_split_block_flow.flow_block_before_join(target_block),
+                unbound_split_block_flow.flow_block_before_join(liveness, target_block),
             ]
         }
         &(FlowNode::AfterEntryBlock, FlowNode::Return) => {

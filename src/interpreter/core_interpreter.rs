@@ -43,7 +43,10 @@ impl CoreInterpreter {
         }
     }
 
-    pub fn interpret_instruction(&mut self, instruction: &Instruction) -> Result<Option<Value>> {
+    pub fn interpret_non_call_instruction(
+        &mut self,
+        instruction: &Instruction,
+    ) -> Result<Option<Value>> {
         match instruction {
             Instruction::Alloc => {
                 let heap_id = self.state.heap.alloc();
@@ -216,7 +219,9 @@ impl CoreInterpreter {
             }
             Instruction::StringConstant { value } => Ok(Some(Value::String(value.clone()))),
             Instruction::NilConstant => Ok(Some(Value::Nil(None))),
-            Instruction::Call { closure, args } => todo!(),
+            Instruction::Call { .. } => {
+                panic!("Call instruction passed to interpret_non_call_instruction")
+            }
             Instruction::UnaryOp { op, arg } => {
                 let arg = self.state.local_env.get(*arg);
                 interpret_unary_op(&self.state, *op, arg).map(Some)
@@ -230,5 +235,14 @@ impl CoreInterpreter {
                 panic!("Phi nodes should not be handled at this level")
             }
         }
+    }
+
+    fn interpret_call_instruction(self, instruction: &Instruction) -> Result<Vec<(State, Value)>> {
+        let (closure, args) = match instruction {
+            Instruction::Call { closure, args } => (closure, args),
+            _ => panic!("Non-call instruction passed to interpret_call_instruction"),
+        };
+
+        todo!()
     }
 }
