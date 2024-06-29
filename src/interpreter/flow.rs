@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use itertools::Itertools;
 
 use crate::{
@@ -189,7 +189,7 @@ impl BoundInterpreterFlow {
                 } else {
                     vec![]
                 })),
-                Value::NilPointer(_) => panic!("NilPointer probably shouldn't be here"),
+                Value::NilPointer(_) => Err(anyhow!("Nil pointer in condition")),
                 Value::Bool(MaybeVector::Vector(bool_vector)) => {
                     let mask_true_count = bool_vector
                         .iter()
@@ -227,6 +227,42 @@ impl BoundInterpreterFlow {
 
 impl BoundSplitBlockFlow<FlowData> for BoundInterpreterFlow {
     fn flow(&self, v: FlowData) -> Result<FlowData> {
-        todo!()
+        let out_parts = match &v {
+            FlowData::States(states) => states
+                .iter()
+                .map(|state| self.flow_single_state(state.clone()))
+                .collect::<Result<Vec<FlowData>>>()?,
+            FlowData::StatesAndReturns(_) => {
+                return Err(anyhow!("Return value in unexpected part of CFG"))
+            }
+        };
+
+        match out_parts.first() {
+            Some(FlowData::States(_)) => Ok(FlowData::States(
+                out_parts
+                    .iter()
+                    .map(|part| match part {
+                        FlowData::States(states) => states.clone(),
+                        FlowData::StatesAndReturns(_) => {
+                            panic!("Mix of States and StatesAndReturns")
+                        }
+                    })
+                    .flatten()
+                    .collect(),
+            )),
+            Some(FlowData::StatesAndReturns(_)) => Ok(FlowData::StatesAndReturns(
+                out_parts
+                    .iter()
+                    .map(|part| match part {
+                        FlowData::States(_) => panic!("Mix of States and StatesAndReturns"),
+                        FlowData::StatesAndReturns(states_and_returns) => {
+                            states_and_returns.clone()
+                        }
+                    })
+                    .flatten()
+                    .collect(),
+            )),
+            None => Ok(FlowData::States(vec![])),
+        }
     }
 }
