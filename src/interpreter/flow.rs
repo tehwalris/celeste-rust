@@ -10,7 +10,11 @@ use crate::{
     liveness::LivenessAnalysisResult,
 };
 
-use super::{core_interpreter::CoreInterpreter, state::State, value::Value};
+use super::{
+    core_interpreter::CoreInterpreter,
+    state::State,
+    value::{MaybeVector, Value},
+};
 
 struct InterpreterFlowAdapter {}
 
@@ -90,47 +94,6 @@ impl UnboundSplitBlockFlow<FlowData, BoundInterpreterFlow> for InterpreterFlowAd
         })
     }
 
-    /*
-      and flow_branch (terminator : Ir.terminator) (flow_target : Ir.label) :
-      LazyStateSet.t -> LazyStateSet.t =
-    match terminator with
-    | Ir.Br terminator_target when terminator_target = flow_target ->
-        fun states -> states
-    | Ir.Cbr (local_id, true_label, false_label)
-      when flow_target = true_label || flow_target = false_label ->
-        fun states ->
-          LazyStateSet.filter_map
-            (fun state ->
-              match Ir.LocalIdMap.find local_id state.local_env with
-              | Scalar (SBool false) | Scalar (SNil _) ->
-                  if flow_target = false_label then Some state else None
-              | Scalar SUnknownBool -> Some state
-              | Scalar _ -> if flow_target = true_label then Some state else None
-              | Vector (VBool vec) ->
-                  Perf.count_and_time Perf.global_counters.cbr_filter @@ fun () ->
-                  assert (Array.length vec = state.vector_size);
-                  let filter_value = flow_target = true_label in
-                  let mask = Array.map (fun v -> v = filter_value) vec in
-                  let mask_true_count =
-                    Array.fold_left
-                      (fun acc v -> if v then acc + 1 else acc)
-                      0 mask
-                  in
-                  if mask_true_count = 0 then None
-                  else
-                    let filtered_state =
-                      state_map_values
-                        (function
-                          | Scalar s -> Scalar s
-                          | Vector vec -> Option.get @@ filter_vector mask vec)
-                        state
-                    in
-                    Some { filtered_state with vector_size = mask_true_count }
-              | Vector _ -> if flow_target = true_label then Some state else None)
-            states
-    | _ -> failwith "Unexpected flow"
-       */
-
     fn flow_branch(
         &self,
         terminator: &crate::ir::Terminator,
@@ -202,10 +165,44 @@ impl BoundInterpreterFlow {
             Self::BranchConditional {
                 condition_local_id,
                 condition_from_flow_edge,
-            } => {
-                let v = state.local_env.get(*condition_local_id);
-                todo!()
-            }
+            } => match &state.local_env.get(*condition_local_id) {
+                Value::Bool(MaybeVector::Scalar(false)) | Value::Nil(_) => {
+                    Ok(FlowData::States(if *condition_from_flow_edge {
+                        vec![]
+                    } else {
+                        vec![state]
+                    }))
+                }
+                Value::UnknownBool => Ok(FlowData::States(vec![state])),
+                Value::Number(_)
+                | Value::Bool(MaybeVector::Scalar(true))
+                | Value::String(_)
+                | Value::Pointer(_) => Ok(FlowData::States(if *condition_from_flow_edge {
+                    vec![state]
+                } else {
+                    vec![]
+                })),
+                Value::NilPointer(_) => panic!("NilPointer probably shouldn't be here"),
+                Value::Bool(MaybeVector::Vector(bool_vector)) => {
+                    let mask_true_count = bool_vector
+                        .iter()
+                        .filter(|v| **v == *condition_from_flow_edge)
+                        .count();
+
+                    if mask_true_count == 0 {
+                        Ok(FlowData::States(vec![]))
+                    } else if mask_true_count == bool_vector.len() {
+                        Ok(FlowData::States(vec![state]))
+                    } else {
+                        let mask: Vec<bool> = bool_vector
+                            .iter()
+                            .map(|v| *v == *condition_from_flow_edge)
+                            .collect();
+                        state.map_values_in_place(|v| v.filter_vectors(&mask));
+                        Ok(FlowData::States(vec![state]))
+                    }
+                }
+            },
             Self::Return => todo!(),
         }
     }

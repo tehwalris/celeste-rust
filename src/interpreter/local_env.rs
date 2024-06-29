@@ -25,4 +25,13 @@ impl LocalEnv {
             }
         }
     }
+
+    pub fn map_in_place(&mut self, f: impl Fn(Value) -> Value) {
+        for value in self.0.iter_mut() {
+            let old_value = value.take();
+            if let Some(old_value) = old_value {
+                *value = Some(f(old_value));
+            }
+        }
+    }
 }
