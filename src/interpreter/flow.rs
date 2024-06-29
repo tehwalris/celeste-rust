@@ -182,7 +182,7 @@ impl BoundInterpreterFlow {
                 for (local_id, instruction) in non_phi_instructions {
                     let mut new_states = vec![];
                     for old_state in states {
-                        let mut interpreter = CoreInterpreter::new(state);
+                        let mut interpreter = CoreInterpreter::new(old_state);
                         match instruction {
                             Instruction::Call { .. } => {
                                 new_states

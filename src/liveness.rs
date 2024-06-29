@@ -1,9 +1,6 @@
 use std::collections::HashSet;
 
-use crate::{
-    instruction_flow::FlowSide,
-    ir::{Label, LocalId},
-};
+use crate::{instruction_flow::FlowSide, ir::LocalId};
 
 pub struct LivenessAnalysisResult {}
 
