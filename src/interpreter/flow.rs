@@ -38,7 +38,9 @@ pub enum BoundInterpreterFlow {
         condition_local_id: LocalId,
         condition_from_flow_edge: bool,
     },
-    Return,
+    Return {
+        return_local_id: Option<LocalId>,
+    },
 }
 
 impl UnboundSplitBlockFlow<FlowData, BoundInterpreterFlow> for InterpreterFlowAdapter {
@@ -68,7 +70,7 @@ impl UnboundSplitBlockFlow<FlowData, BoundInterpreterFlow> for InterpreterFlowAd
     fn flow_block_before_join(
         &self,
         liveness: &LivenessAnalysisResult,
-        block: &crate::ir::Block,
+        block: &Block,
     ) -> Result<BoundInterpreterFlow> {
         let (terminator_local_id, _) = block.terminator;
         let first_non_phi_local_id = block
@@ -87,7 +89,7 @@ impl UnboundSplitBlockFlow<FlowData, BoundInterpreterFlow> for InterpreterFlowAd
         })
     }
 
-    fn flow_block_post_phi(&self, target_block: &crate::ir::Block) -> Result<BoundInterpreterFlow> {
+    fn flow_block_post_phi(&self, target_block: &Block) -> Result<BoundInterpreterFlow> {
         let (_, non_phi_instructions) = target_block.split_block_phi_instructions();
         Ok(BoundInterpreterFlow::BlockPostPhi {
             non_phi_instructions: non_phi_instructions.to_vec(),
@@ -96,8 +98,8 @@ impl UnboundSplitBlockFlow<FlowData, BoundInterpreterFlow> for InterpreterFlowAd
 
     fn flow_branch(
         &self,
-        terminator: &crate::ir::Terminator,
-        flow_target: &crate::ir::Label,
+        terminator: &Terminator,
+        flow_target: &Label,
     ) -> Result<BoundInterpreterFlow> {
         match terminator {
             Terminator::UnconditionalBranch { target } if target == flow_target => {
@@ -117,8 +119,13 @@ impl UnboundSplitBlockFlow<FlowData, BoundInterpreterFlow> for InterpreterFlowAd
         }
     }
 
-    fn flow_return(&self, terminator: &crate::ir::Terminator) -> Result<BoundInterpreterFlow> {
-        todo!()
+    fn flow_return(&self, terminator: &Terminator) -> Result<BoundInterpreterFlow> {
+        match terminator {
+            Terminator::Return { value } => Ok(BoundInterpreterFlow::Return {
+                return_local_id: *value,
+            }),
+            _ => panic!("Unexpected flow"),
+        }
     }
 }
 
@@ -203,7 +210,17 @@ impl BoundInterpreterFlow {
                     }
                 }
             },
-            Self::Return => todo!(),
+            Self::Return { return_local_id } => match *return_local_id {
+                Some(return_local_id) => {
+                    state.local_env.retain(|id| id == return_local_id);
+                    let value = state.local_env.get(return_local_id).clone();
+                    Ok(FlowData::StatesAndReturns(vec![(state, value)]))
+                }
+                None => {
+                    state.local_env.clear();
+                    Ok(FlowData::States(vec![state]))
+                }
+            },
         }
     }
 }

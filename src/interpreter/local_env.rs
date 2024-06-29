@@ -26,6 +26,10 @@ impl LocalEnv {
         }
     }
 
+    pub fn clear(&mut self) {
+        self.retain(|_| false);
+    }
+
     pub fn map_in_place(&mut self, f: impl Fn(Value) -> Value) {
         for value in self.0.iter_mut() {
             let old_value = value.take();
