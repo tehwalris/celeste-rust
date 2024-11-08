@@ -15,14 +15,22 @@
   - value.rs
     - variable types (bool, string, etc)
     - scalar/vector wrappers
+- block_flow.rs
+  - adapters for doing flow analysis on cfg blocks
 - cart_data.rs
   - loading data for mget and fget
+- fixed_point.rs
+  - core flow analysis algorithm
 - frontend.rs
   - converting ast to ir (as main cfg + function defs)
 - input.rs
   - loading keycodes from tas files
+- instruction_flow.rs
+  - not much yet
 - ir.rs
   - ir including map/iter helpers
+- liveness.rs
+  - not much yet
 - main.rs
   - not much
 - pico8_num.rs
