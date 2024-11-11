@@ -3,6 +3,7 @@ use indexmap::IndexSet;
 use petgraph::{graphmap::GraphMap, Directed};
 
 use crate::{
+    fixed_point::BoundAnalyze,
     ir::{Block, Cfg, Label, Terminator},
     liveness::LivenessAnalysisResult,
 };
@@ -92,61 +93,83 @@ pub trait BoundSplitBlockFlow<T> {
     fn flow(&self, v: T) -> Result<T>;
 }
 
-pub fn make_bound_flow_function<T, B: BoundSplitBlockFlow<T>>(
-    unbound_split_block_flow: impl UnboundSplitBlockFlow<T, B>,
-    cfg: &Cfg,
-    labels: &IndexSet<Label>,
-    liveness: &LivenessAnalysisResult,
-    edge: &(FlowNode, FlowNode),
-) -> Result<impl Fn(T) -> Result<T>> {
-    let parts = match edge {
-        &(FlowNode::BeforeEntryBlock, FlowNode::AfterEntryBlock) => {
-            vec![unbound_split_block_flow.flow_block_post_phi(&cfg.entry)?]
-        }
-        &(FlowNode::BeforeNamedBlock(index), FlowNode::AfterNamedBlock(other_index))
-            if index == other_index =>
-        {
-            let name = &labels[index];
-            let block = cfg.named.get(name).unwrap();
-            vec![unbound_split_block_flow.flow_block_post_phi(block)?]
-        }
-        &(FlowNode::AfterEntryBlock, FlowNode::BeforeNamedBlock(target_index)) => {
-            let target_name = &labels[target_index];
-            let (_, terminator) = &cfg.entry.terminator;
-            let target_block = cfg.named.get(target_name).unwrap();
-            vec![
-                unbound_split_block_flow.flow_branch(terminator, target_name)?,
-                unbound_split_block_flow.flow_block_before_join(liveness, target_block)?,
-            ]
-        }
-        &(FlowNode::AfterNamedBlock(source_index), FlowNode::BeforeNamedBlock(target_index)) => {
-            let source_name = &labels[source_index];
-            let target_name = &labels[target_index];
-            let source_block = cfg.named.get(source_name).unwrap();
-            let target_block = cfg.named.get(target_name).unwrap();
-            let (_, terminator) = &source_block.terminator;
-            vec![
-                unbound_split_block_flow.flow_branch(terminator, target_name)?,
-                unbound_split_block_flow.flow_block_phi(source_name, target_block)?,
-                unbound_split_block_flow.flow_block_before_join(liveness, target_block)?,
-            ]
-        }
-        &(FlowNode::AfterEntryBlock, FlowNode::Return) => {
-            let (_, terminator) = &cfg.entry.terminator;
-            vec![unbound_split_block_flow.flow_return(terminator)?]
-        }
-        &(FlowNode::AfterNamedBlock(source_index), FlowNode::Return) => {
-            let source_name = &labels[source_index];
-            let source_block = cfg.named.get(source_name).unwrap();
-            let (_, terminator) = &source_block.terminator;
-            vec![unbound_split_block_flow.flow_return(terminator)?]
-        }
-        _ => panic!("flow has unexpected edge"),
-    };
+pub struct BoundMergedBlockFlow<T, B: BoundSplitBlockFlow<T>> {
+    _t: std::marker::PhantomData<T>,
+    parts: Vec<B>,
+}
 
-    Ok(move |v| {
-        parts
+impl<T, B: BoundSplitBlockFlow<T>> BoundMergedBlockFlow<T, B> {
+    pub fn new(
+        unbound_split_block_flow: &impl UnboundSplitBlockFlow<T, B>,
+        cfg: &Cfg,
+        labels: &IndexSet<Label>,
+        liveness: &LivenessAnalysisResult,
+        edge: &(FlowNode, FlowNode),
+    ) -> Result<BoundMergedBlockFlow<T, B>> {
+        let parts = match edge {
+            &(FlowNode::BeforeEntryBlock, FlowNode::AfterEntryBlock) => {
+                vec![unbound_split_block_flow.flow_block_post_phi(&cfg.entry)?]
+            }
+            &(FlowNode::BeforeNamedBlock(index), FlowNode::AfterNamedBlock(other_index))
+                if index == other_index =>
+            {
+                let name = &labels[index];
+                let block = cfg.named.get(name).unwrap();
+                vec![unbound_split_block_flow.flow_block_post_phi(block)?]
+            }
+            &(FlowNode::AfterEntryBlock, FlowNode::BeforeNamedBlock(target_index)) => {
+                let target_name = &labels[target_index];
+                let (_, terminator) = &cfg.entry.terminator;
+                let target_block = cfg.named.get(target_name).unwrap();
+                vec![
+                    unbound_split_block_flow.flow_branch(terminator, target_name)?,
+                    unbound_split_block_flow.flow_block_before_join(liveness, target_block)?,
+                ]
+            }
+            &(
+                FlowNode::AfterNamedBlock(source_index),
+                FlowNode::BeforeNamedBlock(target_index),
+            ) => {
+                let source_name = &labels[source_index];
+                let target_name = &labels[target_index];
+                let source_block = cfg.named.get(source_name).unwrap();
+                let target_block = cfg.named.get(target_name).unwrap();
+                let (_, terminator) = &source_block.terminator;
+                vec![
+                    unbound_split_block_flow.flow_branch(terminator, target_name)?,
+                    unbound_split_block_flow.flow_block_phi(source_name, target_block)?,
+                    unbound_split_block_flow.flow_block_before_join(liveness, target_block)?,
+                ]
+            }
+            &(FlowNode::AfterEntryBlock, FlowNode::Return) => {
+                let (_, terminator) = &cfg.entry.terminator;
+                vec![unbound_split_block_flow.flow_return(terminator)?]
+            }
+            &(FlowNode::AfterNamedBlock(source_index), FlowNode::Return) => {
+                let source_name = &labels[source_index];
+                let source_block = cfg.named.get(source_name).unwrap();
+                let (_, terminator) = &source_block.terminator;
+                vec![unbound_split_block_flow.flow_return(terminator)?]
+            }
+            _ => panic!("flow has unexpected edge"),
+        };
+
+        Ok(BoundMergedBlockFlow {
+            _t: std::marker::PhantomData,
+            parts,
+        })
+    }
+
+    fn flow_required(&self, v: T) -> Result<T> {
+        self.parts
             .iter()
             .fold(Ok(v), |v, part| v.and_then(|v| part.flow(v)))
-    })
+    }
+}
+
+impl<T, B: BoundSplitBlockFlow<T>> BoundAnalyze<Option<T>> for BoundMergedBlockFlow<T, B> {
+    fn call(&self, v: Option<T>) -> Option<T> {
+        // TODO don't unwrap
+        v.map(|v| self.flow_required(v).unwrap())
+    }
 }

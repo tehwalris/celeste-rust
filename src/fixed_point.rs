@@ -7,18 +7,24 @@ use petgraph::prelude::GraphMap;
 use petgraph::visit::IntoEdgeReferences;
 use petgraph::Directed;
 
-pub trait Analysis<V: Debug, D: Debug, F: Fn(&D) -> D> {
-    fn new_empty() -> D;
-    fn is_empty(data: &D) -> bool;
+pub trait BoundAnalyze<D> {
+    fn call(&self, in_data: D) -> D;
+}
 
-    fn is_input(vertex: &V) -> bool;
-    fn is_output(vertex: &V) -> bool;
-    fn hint_normalize(vertex: &V) -> bool;
+pub trait Analysis<V: Debug, D, F: BoundAnalyze<D>> {
+    fn graph(&self) -> &GraphMap<V, (), Directed>;
 
-    fn join(existing: &mut D, new: &D);
-    fn accumulate(accumulated: &D, potentially_new: &D) -> (D, D); // (accumulated, actually_new)
+    fn new_empty(&self) -> D;
+    fn is_empty(&self, data: &D) -> bool;
 
-    fn bind_analyze(edge: &(V, V)) -> F;
+    fn is_input(&self, vertex: &V) -> bool;
+    fn is_output(&self, vertex: &V) -> bool;
+    fn hint_normalize(&self, vertex: &V) -> bool;
+
+    fn join_mut(&self, existing: &mut D, new: &D);
+    fn accumulate(&self, accumulated: &D, potentially_new: &D) -> (D, D); // (accumulated, actually_new)
+
+    fn bind_analyze(&self, edge: &(V, V)) -> F;
 }
 
 struct PreparedNode<V, F> {
@@ -32,10 +38,10 @@ pub struct PreparedAnalysis<V, D, F, A>
 where
     V: Debug + Eq + Hash + Copy + Ord,
     D: Debug + Clone,
-    F: Fn(&D) -> D,
+    F: BoundAnalyze<D>,
     A: Analysis<V, D, F>,
 {
-    _a: std::marker::PhantomData<A>,
+    analysis: A,
     m_data_acc: Vec<Option<D>>,
     m_data_new: Vec<D>,
     nodes: Vec<PreparedNode<V, F>>,
@@ -43,16 +49,15 @@ where
     wl: BTreeSet<usize>,
 }
 
-pub fn prepare_analysis<V, D, F, A>(
-    analysis: A,
-    graph: &GraphMap<V, (), Directed>,
-) -> Result<PreparedAnalysis<V, D, F, A>>
+pub fn prepare_analysis<V, D, F, A>(analysis: A) -> Result<PreparedAnalysis<V, D, F, A>>
 where
     V: Debug + Eq + Hash + Copy + Ord,
     D: Debug + Clone,
-    F: Fn(&D) -> D,
+    F: BoundAnalyze<D>,
     A: Analysis<V, D, F>,
 {
+    let graph = analysis.graph();
+
     let nodes_by_original: HashMap<V, usize> = petgraph::algo::toposort(graph, None)
         .map_err(|_| anyhow::anyhow!("toposort failed due to cycle"))?
         .iter()
@@ -69,24 +74,24 @@ where
     let edge_count = edges_by_original.len();
 
     let mut m_data_acc = vec![None; node_count];
-    let m_data_new = vec![A::new_empty(); edge_count];
+    let m_data_new = vec![analysis.new_empty(); edge_count];
 
     let mut nodes: Vec<Option<PreparedNode<V, F>>> =
         (0..nodes_by_original.len()).map(|_| None).collect();
     let mut wl = BTreeSet::new();
 
     for (&original_node, &node) in nodes_by_original.iter() {
-        if A::is_input(&original_node) {
+        if analysis.is_input(&original_node) {
             wl.insert(node);
         }
-        if A::is_output(&original_node) || A::hint_normalize(&original_node) {
-            m_data_acc[node] = Some(A::new_empty());
+        if analysis.is_output(&original_node) || analysis.hint_normalize(&original_node) {
+            m_data_acc[node] = Some(analysis.new_empty());
         }
         nodes[node] = Some(PreparedNode {
             original_node,
             pred_edges: graph
                 .edges_directed(original_node, petgraph::Direction::Incoming)
-                .map(|(s, t, _)| (edges_by_original[&(s, t)], A::bind_analyze(&(s, t))))
+                .map(|(s, t, _)| (edges_by_original[&(s, t)], analysis.bind_analyze(&(s, t))))
                 .collect(),
             succ_nodes: graph
                 .neighbors(original_node)
@@ -100,7 +105,7 @@ where
     }
 
     Ok(PreparedAnalysis {
-        _a: std::marker::PhantomData,
+        analysis,
         m_data_acc,
         m_data_new,
         nodes: nodes.into_iter().map(|n| n.unwrap()).collect(),
@@ -113,7 +118,7 @@ impl<V, D, F, A> PreparedAnalysis<V, D, F, A>
 where
     V: Debug + Eq + Hash + Copy + Ord,
     D: Debug + Clone,
-    F: Fn(&D) -> D,
+    F: BoundAnalyze<D>,
     A: Analysis<V, D, F>,
 {
     pub fn run<I: Fn(&V) -> D>(&self, initialize: I) {
@@ -133,16 +138,18 @@ where
             for &node in &prepared_wl_node.succ_nodes {
                 let prepared_node = &self.nodes[node];
 
-                let mut potentially_new = A::new_empty();
+                let mut potentially_new = self.analysis.new_empty();
                 for (pred_edge, analyze) in &prepared_node.pred_edges {
-                    let potentially_new_part = analyze(&m_data_new[*pred_edge]);
-                    m_data_new[*pred_edge] = A::new_empty();
-                    A::join(&mut potentially_new, &potentially_new_part);
+                    let in_data =
+                        std::mem::replace(&mut m_data_new[*pred_edge], self.analysis.new_empty());
+                    let potentially_new_part = analyze.call(in_data);
+                    self.analysis
+                        .join_mut(&mut potentially_new, &potentially_new_part);
                 }
 
                 let mut process_successors = |data: D| {
                     for &succ_edge in &prepared_node.succ_edges {
-                        A::join(&mut m_data_new[succ_edge], &data);
+                        self.analysis.join_mut(&mut m_data_new[succ_edge], &data);
                     }
                     for &succ_node in &prepared_wl_node.succ_nodes {
                         wl.insert(succ_node);
@@ -150,13 +157,14 @@ where
                 };
 
                 if let Some(data_acc) = m_data_acc[wl_node].as_mut() {
-                    let (data_acc_new, actually_new) = A::accumulate(&data_acc, &potentially_new);
-                    if !A::is_empty(&actually_new) {
+                    let (data_acc_new, actually_new) =
+                        self.analysis.accumulate(&data_acc, &potentially_new);
+                    if !self.analysis.is_empty(&actually_new) {
                         *data_acc = data_acc_new;
                         process_successors(actually_new);
                     }
                 } else {
-                    if !A::is_empty(&potentially_new) {
+                    if !self.analysis.is_empty(&potentially_new) {
                         process_successors(potentially_new);
                     }
                 }

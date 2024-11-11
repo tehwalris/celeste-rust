@@ -16,11 +16,34 @@ use super::{
     value::{MaybeVector, Value},
 };
 
-struct InterpreterFlowAdapter {}
+pub struct InterpreterFlowAdapter {}
 
+#[derive(Clone)]
 pub enum FlowData {
     States(Vec<State>),
     StatesAndReturns(Vec<(State, Value)>),
+}
+
+impl FlowData {
+    pub fn is_empty(&self) -> bool {
+        match self {
+            FlowData::States(states) => states.is_empty(),
+            FlowData::StatesAndReturns(states_and_returns) => states_and_returns.is_empty(),
+        }
+    }
+
+    pub fn join_mut(&mut self, other: Self) {
+        // TODO there's probably meant to be deduplication and stuff here
+        match (self, other) {
+            (FlowData::States(a), FlowData::States(b)) => {
+                a.extend(b);
+            }
+            (FlowData::StatesAndReturns(a), FlowData::StatesAndReturns(b)) => {
+                a.extend(b);
+            }
+            _ => panic!("Cannot join States and StatesAndReturns"),
+        }
+    }
 }
 
 pub enum BoundInterpreterFlow {
