@@ -6,7 +6,11 @@ use super::value::Value;
 pub struct LocalEnv(Vec<Option<Value>>);
 
 impl LocalEnv {
-    pub fn new(max_locals: usize) -> Self {
+    pub fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    pub fn with_capacity(max_locals: usize) -> Self {
         Self(vec![None; max_locals])
     }
 
@@ -15,7 +19,11 @@ impl LocalEnv {
     }
 
     pub fn set(&mut self, id: LocalId, value: Value) {
-        self.0[usize::from(id)] = Some(value);
+        let idx = usize::from(id);
+        if idx >= self.0.len() {
+            self.0.resize(idx + 1, None);
+        }
+        self.0[idx] = Some(value);
     }
 
     pub fn retain(&mut self, f: impl Fn(LocalId) -> bool) {

@@ -182,7 +182,7 @@ impl BoundInterpreterFlow {
                                     .extend(interpreter.interpret_call_instruction(instruction)?);
                             }
                             _ => {
-                                interpreter.interpret_non_call_instruction(instruction)?;
+                                interpreter.interpret_non_call_instruction(*local_id, instruction)?;
                                 new_states.push(interpreter.into_state());
                             }
                         }

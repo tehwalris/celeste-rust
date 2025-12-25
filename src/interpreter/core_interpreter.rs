@@ -237,8 +237,15 @@ impl CoreInterpreter {
         }
     }
 
-    pub fn interpret_non_call_instruction(&mut self, instruction: &Instruction) -> Result<()> {
-        todo!()
+    pub fn interpret_non_call_instruction(
+        &mut self,
+        local_id: LocalId,
+        instruction: &Instruction,
+    ) -> Result<()> {
+        if let Some(value) = self.interpret_non_call_instruction_no_assign(instruction)? {
+            self.state.local_env.set(local_id, value);
+        }
+        Ok(())
     }
 
     pub fn interpret_call_instruction(self, instruction: &Instruction) -> Result<Vec<State>> {

@@ -10,11 +10,23 @@ use super::{
 pub struct State {
     pub heap: Heap,
     pub local_env: LocalEnv,
-    // TODO add commented fields
-    // pub outer_local_envs: Vec<HashMap<LocalId, Value>>,
+    pub outer_local_envs: Vec<LocalEnv>,
     pub global_env: HashMap<String, HeapId>,
-    // pub prints: Vec<String>,
-    // pub vector_size: usize,
+    pub prints: Vec<String>,
+    pub vector_size: usize,
+}
+
+impl State {
+    pub fn new() -> Self {
+        Self {
+            heap: Heap::new(),
+            local_env: LocalEnv::new(),
+            outer_local_envs: Vec::new(),
+            global_env: HashMap::new(),
+            prints: Vec::new(),
+            vector_size: 1,
+        }
+    }
 }
 
 impl State {
@@ -31,6 +43,8 @@ impl State {
             | HeapValue::BuiltinFun(_) => v,
         });
         self.local_env.map_in_place(f);
-        // TODO outer_local_envs
+        for env in &mut self.outer_local_envs {
+            env.map_in_place(f);
+        }
     }
 }

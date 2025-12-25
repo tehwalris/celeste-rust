@@ -1,8 +1,8 @@
 mod core_interpreter;
 mod flow;
-mod glue;
-mod heap;
-mod local_env;
+pub mod glue;
+pub mod heap;
+pub mod local_env;
 mod op;
-mod state;
-mod value;
+pub mod state;
+pub mod value;
