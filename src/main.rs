@@ -702,4 +702,178 @@ __print(function_a ~= function_b)
             ]
         );
     }
+
+    #[test]
+    fn test_interpret_for_range() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // From lua_tests/for_range.lua (first part)
+        let code = r#"
+for i=0,5 do
+    __print(i)
+end
+"#;
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        assert_eq!(result_states.len(), 1);
+        // Should print 0, 1, 2, 3, 4, 5
+        assert_eq!(
+            result_states[0].0.prints,
+            vec!["0", "1", "2", "3", "4", "5"]
+        );
+    }
+
+    #[test]
+    fn test_interpret_for_break() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // From lua_tests/for_break.lua
+        let code = r#"
+for i=0,5 do
+    if i == 3 then
+        break
+    end
+    __print(i)
+end
+__print("end")
+"#;
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        assert_eq!(result_states.len(), 1);
+        // Should print 0, 1, 2, then break, then "end"
+        assert_eq!(
+            result_states[0].0.prints,
+            vec!["0", "1", "2", "end"]
+        );
+    }
+
+    #[test]
+    fn test_interpret_simple_table() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // Simple nested table test
+        let code = r#"
+a = { b = 10 }
+__print(a.b)
+a.b = 20
+__print(a.b)
+"#;
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        assert_eq!(result_states.len(), 1);
+        assert_eq!(
+            result_states[0].0.prints,
+            vec!["10", "20"]
+        );
+    }
+
+    #[test]
+    fn test_interpret_properties() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // From lua_tests/properties.lua
+        let code = r#"
+a = { b = { c = 0, d = nil } }
+__print(a.b.c)
+a.b.c = 123
+__print(a.b.c)
+__print(a.b.d)
+a.b.d = 456
+__print(a.b.d)
+"#;
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        assert_eq!(result_states.len(), 1);
+        assert_eq!(
+            result_states[0].0.prints,
+            vec!["0", "123", "nil", "456"]
+        );
+    }
+
+    #[test]
+    fn test_interpret_tables_object() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // From lua_tests/tables.lua (first two parts, without array tables)
+        let code = r#"
+x = {}
+x.a = 1
+x.b = 7
+x.c = 'hello'
+__print(x.a)
+__print(x.b)
+__print(x.c)
+x.c = 'world'
+__print(x.c)
+
+y = {a = 1, b = 7, c = 'hello'}
+__print(y.a)
+__print(y.b)
+__print(y.c)
+y.c = 'world'
+__print(y.c)
+"#;
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        assert_eq!(result_states.len(), 1);
+        assert_eq!(
+            result_states[0].0.prints,
+            vec!["1", "7", "hello", "world", "1", "7", "hello", "world"]
+        );
+    }
 }

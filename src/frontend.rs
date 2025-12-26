@@ -277,15 +277,83 @@ impl Compiler {
                 self.compile_token_reference(identifier, locals, create_if_missing)
             }
             ast::Var::Expression(expression) => {
-                let (lhs_id, lhs_hint, lhs_stream) =
-                    self.compile_prefix_as_lhs(expression.prefix(), locals, create_if_missing)?;
-                let only_suffix = match expression.suffixes().collect::<Vec<_>>().as_slice() {
-                    &[suffix] => suffix,
-                    _ => bail!(
-                        "expressions with multiple suffixes (call/indexing) are not supported"
-                    ),
-                };
-                match only_suffix {
+                let suffixes: Vec<_> = expression.suffixes().collect();
+                if suffixes.is_empty() {
+                    bail!("expression with no suffixes");
+                }
+
+                // All suffixes except the last one should be compiled as RHS (load the value)
+                // The last suffix is compiled as LHS (we want the pointer to the location)
+                let (init_suffixes, last_suffix) = suffixes.split_at(suffixes.len() - 1);
+
+                // Start by getting the prefix as RHS (we need its value to access the next level)
+                let (mut current_id, mut current_hint, mut accumulated_stream) =
+                    self.compile_prefix_as_rhs(expression.prefix(), locals, false)?;
+
+                // Process all intermediate suffixes as RHS (get values)
+                for suffix in init_suffixes {
+                    match suffix {
+                        ast::Suffix::Call(_) => {
+                            bail!("calls in the middle of a suffix chain are not supported as LHS");
+                        }
+                        ast::Suffix::Index(ast::Index::Brackets {
+                            brackets: _,
+                            expression,
+                        }) => {
+                            let (rhs_id, rhs_hint, rhs_stream) =
+                                self.compile_rhs_expression(expression, locals, None)?;
+                            current_hint = match (current_hint, rhs_hint) {
+                                (Some(lhs_hint), Some(rhs_hint)) => {
+                                    Some(format!("{}[{}]", lhs_hint, rhs_hint))
+                                }
+                                (Some(lhs_hint), None) => Some(lhs_hint),
+                                (None, Some(rhs_hint)) => Some(rhs_hint),
+                                (None, None) => None,
+                            };
+                            let (ptr_id, ptr_stream) =
+                                self.gen_id_and_stream(Instruction::GetIndex {
+                                    receiver: current_id,
+                                    index: rhs_id,
+                                    create_if_missing: false,
+                                });
+                            let (val_id, val_stream) =
+                                self.gen_id_and_stream(Instruction::Load { source: ptr_id });
+                            accumulated_stream = Stream::from_streams(vec![
+                                accumulated_stream,
+                                rhs_stream,
+                                ptr_stream,
+                                val_stream,
+                            ]);
+                            current_id = val_id;
+                        }
+                        ast::Suffix::Index(ast::Index::Dot { dot: _, name }) => {
+                            let field_name = identifier_from_token_reference(name)?;
+                            current_hint = match current_hint {
+                                Some(lhs_hint) => Some(format!("{}.{}", lhs_hint, field_name)),
+                                None => Some(field_name.to_string()),
+                            };
+                            let (ptr_id, ptr_stream) =
+                                self.gen_id_and_stream(Instruction::GetField {
+                                    receiver: current_id,
+                                    field: field_name.to_string(),
+                                    create_if_missing: false,
+                                });
+                            let (val_id, val_stream) =
+                                self.gen_id_and_stream(Instruction::Load { source: ptr_id });
+                            accumulated_stream = Stream::from_streams(vec![
+                                accumulated_stream,
+                                ptr_stream,
+                                val_stream,
+                            ]);
+                            current_id = val_id;
+                        }
+                        _ => bail!("unsupported suffix type"),
+                    }
+                }
+
+                // Process the last suffix as LHS (get the pointer, not the value)
+                let last_suffix = &last_suffix[0];
+                match last_suffix {
                     ast::Suffix::Call(_) => {
                         panic!("calls should not be compiled as LHS expressions")
                     }
@@ -295,7 +363,7 @@ impl Compiler {
                     }) => {
                         let (rhs_id, rhs_hint, rhs_stream) =
                             self.compile_rhs_expression(expression, locals, None)?;
-                        let hint = match (lhs_hint, rhs_hint) {
+                        let hint = match (current_hint, rhs_hint) {
                             (Some(lhs_hint), Some(rhs_hint)) => {
                                 Some(format!("{}[{}]", lhs_hint, rhs_hint))
                             }
@@ -305,24 +373,37 @@ impl Compiler {
                         };
                         let (result_id, result_stream) =
                             self.gen_id_and_stream(Instruction::GetIndex {
-                                receiver: lhs_id,
+                                receiver: current_id,
                                 index: rhs_id,
                                 create_if_missing,
                             });
-                        Ok((result_id, hint, result_stream))
+                        Ok((
+                            result_id,
+                            hint,
+                            Stream::from_streams(vec![
+                                accumulated_stream,
+                                rhs_stream,
+                                result_stream,
+                            ]),
+                        ))
                     }
                     ast::Suffix::Index(ast::Index::Dot { dot: _, name }) => {
-                        let hint = match lhs_hint {
-                            Some(lhs_hint) => Some(format!("{}.{}", lhs_hint, name)),
-                            None => Some(name.to_string()),
+                        let field_name = identifier_from_token_reference(name)?;
+                        let hint = match current_hint {
+                            Some(lhs_hint) => Some(format!("{}.{}", lhs_hint, field_name)),
+                            None => Some(field_name.to_string()),
                         };
                         let (result_id, result_stream) =
                             self.gen_id_and_stream(Instruction::GetField {
-                                receiver: lhs_id,
-                                field: name.to_string(),
+                                receiver: current_id,
+                                field: field_name.to_string(),
                                 create_if_missing,
                             });
-                        Ok((result_id, hint, result_stream))
+                        Ok((
+                            result_id,
+                            hint,
+                            Stream::from_streams(vec![accumulated_stream, result_stream]),
+                        ))
                     }
                     _ => Err(anyhow!("not implemented")),
                 }
