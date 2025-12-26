@@ -11,6 +11,10 @@ impl Heap {
         Self(Vec::new())
     }
 
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
     pub fn alloc(&mut self) -> HeapId {
         let id = HeapId(self.0.len());
         self.0.push(None);

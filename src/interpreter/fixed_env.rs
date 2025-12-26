@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::ir::{Cfg, FunDef, GlobalId};
+use indexmap::IndexSet;
+
+use crate::ir::{Cfg, FunDef, GlobalId, Label};
 
 use super::{state::State, value::Value};
 
@@ -9,16 +11,22 @@ use super::{state::State, value::Value};
 /// Multiple pairs are returned when the function can branch (e.g., on UnknownBool).
 pub type BuiltinFun = Arc<dyn Fn(State, Vec<Value>) -> anyhow::Result<Vec<(State, Value)>> + Send + Sync>;
 
-/// PreparedCfg holds a CFG along with any precomputed analysis data.
-/// In OCaml this holds the `analyze` function, but in Rust we'll compute it on demand.
+/// PreparedCfg holds a CFG along with precomputed analysis data.
+/// This caches the label set to avoid recomputing it on every interpret_cfg call.
 #[derive(Clone)]
 pub struct PreparedCfg {
     pub cfg: Cfg,
+    pub labels: IndexSet<Label>,
 }
 
 impl PreparedCfg {
     pub fn new(cfg: Cfg) -> Self {
-        Self { cfg }
+        // Pre-compute the label set (same logic as in flow_graph_of_cfg)
+        let mut labels = IndexSet::new();
+        for name in cfg.named.keys() {
+            labels.insert_full(name.clone());
+        }
+        Self { cfg, labels }
     }
 }
 

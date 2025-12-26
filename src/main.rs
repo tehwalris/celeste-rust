@@ -185,6 +185,60 @@ mod tests {
         }
     }
 
+    /// Builtin __split_by_flr: splits values by their floor
+    /// For abstract interpretation, this would split number intervals into
+    /// separate ranges by floor value. For concrete numbers, it just returns the value.
+    /// For vectors, it groups elements by floor and produces separate states.
+    fn builtin_split_by_flr(state: State, args: Vec<Value>) -> anyhow::Result<Vec<(State, Value)>> {
+        use std::collections::BTreeMap;
+
+        if args.len() != 1 {
+            return Err(anyhow!("__split_by_flr requires 1 argument"));
+        }
+
+        match &args[0] {
+            Value::Number(MaybeVector::Scalar(n)) => {
+                // For a single scalar number, there's only one floor value,
+                // so just return the state unchanged
+                Ok(vec![(state, Value::Number(MaybeVector::Scalar(*n)))])
+            }
+            Value::Number(MaybeVector::Vector(nums)) => {
+                // Group vector elements by their floor value
+                // Each group becomes a separate state
+                let mut by_floor: BTreeMap<Pico8Num, Vec<(usize, Pico8Num)>> = BTreeMap::new();
+                for (i, n) in nums.iter().enumerate() {
+                    let floor = n.flr();
+                    by_floor.entry(floor).or_default().push((i, *n));
+                }
+
+                // Create a separate state for each floor group
+                let mut results = Vec::new();
+                for (_floor, group) in by_floor {
+                    // Build a mask for which elements are in this group
+                    let mask: Vec<bool> = (0..nums.len())
+                        .map(|i| group.iter().any(|(gi, _)| *gi == i))
+                        .collect();
+
+                    // Filter the state's values by this mask
+                    let filtered_state = state.filter_by_mask(&mask);
+
+                    // Create the result value for this group
+                    let result_nums: Vec<Pico8Num> = group.into_iter().map(|(_, n)| n).collect();
+                    let result_value = if result_nums.len() == 1 {
+                        Value::Number(MaybeVector::Scalar(result_nums[0]))
+                    } else {
+                        Value::Number(MaybeVector::Vector(result_nums))
+                    };
+
+                    results.push((filtered_state, result_value));
+                }
+
+                Ok(results)
+            }
+            _ => Err(anyhow!("__split_by_flr: argument must be a number")),
+        }
+    }
+
     /// Builtin error: throws an error (crashes the interpreter)
     fn builtin_error(_state: State, args: Vec<Value>) -> anyhow::Result<Vec<(State, Value)>> {
         match args.as_slice() {
@@ -312,6 +366,7 @@ mod tests {
         fixed_env.add_builtin("max", builtin_max);
         fixed_env.add_builtin("abs", builtin_abs);
         fixed_env.add_builtin("flr", builtin_flr);
+        fixed_env.add_builtin("__split_by_flr", builtin_split_by_flr);
         // Level 3 builtins (implemented in Lua, but add as Rust for test convenience)
         fixed_env.add_builtin("add", builtin_add);
         fixed_env.add_builtin("print", builtin_print);
@@ -1973,5 +2028,80 @@ __reset_button_states()
 
         // The game should produce at least one state
         assert!(!result_states.is_empty(), "Game should produce at least one state");
+    }
+
+    #[test]
+    #[ignore] // Ignore until performance is good enough
+    fn test_run_celeste_game_frame() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // Load and compile the game
+        let level_3 = std::fs::read_to_string("lua/builtin_level_3.lua")
+            .expect("Failed to read builtin_level_3.lua");
+        let level_4 = std::fs::read_to_string("lua/builtin_level_4.lua")
+            .expect("Failed to read builtin_level_4.lua");
+        let game = std::fs::read_to_string("lua/celeste-minimal.lua")
+            .expect("Failed to read celeste-minimal.lua");
+
+        // Suffix code to call _init
+        let init_suffix = r#"
+_init()
+__reset_button_states()
+"#;
+
+        let full_code = format!("{}\n{}\n{}\n{}\n", level_3, level_4, game, init_suffix);
+
+        let ast = full_moon::parse(&full_code).expect("Failed to parse game code");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile game");
+
+        let mut fixed_env = create_fixed_env_with_game_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        println!("Running game init...");
+        let start = std::time::Instant::now();
+        let init_result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Init interpretation failed");
+        println!("Game init completed in {:?}", start.elapsed());
+        println!("States after init: {}", init_result_states.len());
+
+        // Compile frame code (update + draw + reset buttons)
+        let frame_code = r#"
+_update()
+_draw()
+__reset_button_states()
+"#;
+        let frame_ast = full_moon::parse(frame_code).expect("Failed to parse frame code");
+        let (frame_cfg, frame_fun_defs) = frontend::compile(&frame_ast).expect("Failed to compile frame");
+        assert!(frame_fun_defs.is_empty(), "Frame code should not define new functions");
+
+        // Run frames
+        let num_frames = 10;
+        let mut states: Vec<_> = init_result_states.into_iter().map(|(s, _)| s).collect();
+
+        for frame_num in 1..=num_frames {
+            println!("\nFrame {}:", frame_num);
+            println!("  Input states: {}", states.len());
+
+            let start = std::time::Instant::now();
+            let mut new_states = Vec::new();
+
+            for state in states {
+                let result = interpret_cfg(frame_cfg.clone(), state, &fixed_env)
+                    .expect("Frame interpretation failed");
+                new_states.extend(result.into_iter().map(|(s, _)| s));
+            }
+
+            println!("  Output states: {}", new_states.len());
+            println!("  Frame completed in {:?}", start.elapsed());
+
+            states = new_states;
+        }
+
+        assert!(!states.is_empty(), "Should have at least one state after frames");
+        println!("\nTotal states after {} frames: {}", num_frames, states.len());
     }
 }

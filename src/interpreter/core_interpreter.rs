@@ -311,13 +311,12 @@ impl<'a> CoreInterpreter<'a> {
                 Ok(states)
             }
             HeapValue::Closure(fun_def_name, captured_values) => {
-                // Look up the function definition
-                let (fun_def, _prepared_cfg) = self
+                // Look up the function definition with prepared CFG
+                let (fun_def, prepared_cfg) = self
                     .fixed_env
                     .fun_defs
                     .get(&fun_def_name)
                     .ok_or_else(|| anyhow!("Unknown function: {:?}", fun_def_name))?;
-                let fun_cfg = fun_def.cfg.clone();
 
                 // Create a new local_env for the function body
                 let mut new_local_env = super::local_env::LocalEnv::new();
@@ -350,9 +349,9 @@ impl<'a> CoreInterpreter<'a> {
                     vector_size: self.state.vector_size,
                 };
 
-                // Recursively interpret the function's CFG
+                // Recursively interpret the function's prepared CFG (uses cached labels)
                 let result_states =
-                    super::glue::interpret_cfg(fun_cfg, function_state, self.fixed_env)?;
+                    super::glue::interpret_prepared_cfg(prepared_cfg, function_state, self.fixed_env)?;
 
                 // For each result state, create an output state that:
                 // 1. Takes the heap, global_env, and prints from the function execution

@@ -122,21 +122,33 @@ impl<'a>
     }
 }
 
-use super::{state::State, value::Value};
+use super::{state::State, value::Value, fixed_env::PreparedCfg};
 use crate::ir::Terminator;
 
 /// Interprets a CFG with the given initial state and fixed environment.
 /// Returns the resulting states after execution, each with an optional return value.
 ///
-/// This is a simplified interpreter that handles linear CFGs and simple branches.
-/// It doesn't use the full fixed-point analysis machinery.
+/// This version takes a raw Cfg and computes labels on demand - use interpret_prepared_cfg
+/// for better performance when the CFG will be interpreted multiple times.
 pub fn interpret_cfg(
     cfg: Cfg,
     initial_state: State,
     fixed_env: &FixedEnv,
 ) -> Result<Vec<(State, Option<Value>)>> {
+    let prepared = PreparedCfg::new(cfg);
+    interpret_prepared_cfg(&prepared, initial_state, fixed_env)
+}
+
+/// Interprets a prepared CFG with cached labels.
+/// This is faster than interpret_cfg when interpreting the same CFG multiple times.
+pub fn interpret_prepared_cfg(
+    prepared: &PreparedCfg,
+    initial_state: State,
+    fixed_env: &FixedEnv,
+) -> Result<Vec<(State, Option<Value>)>> {
     let adapter = InterpreterFlowAdapter { fixed_env };
-    let (_, labels) = flow_graph_of_cfg(&cfg)?;
+    let cfg = &prepared.cfg;
+    let labels = &prepared.labels;
     let fake_liveness = LivenessAnalysisResult::all_live();
 
     // Start with the entry block

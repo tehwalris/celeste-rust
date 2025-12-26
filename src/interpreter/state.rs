@@ -47,4 +47,35 @@ impl State {
             env.map_in_place(f);
         }
     }
+
+    /// Filters all vector values in the state by a mask.
+    /// The resulting state's vector_size will be the number of true values in the mask.
+    pub fn filter_by_mask(&self, mask: &[bool]) -> Self {
+        let new_vector_size = mask.iter().filter(|&&b| b).count();
+
+        let mut new_state = self.clone();
+        new_state.vector_size = new_vector_size;
+
+        // Filter values in heap
+        new_state.heap.map_in_place(|v| match v {
+            HeapValue::Value(val) => HeapValue::Value(val.filter_vectors(mask)),
+            HeapValue::Closure(id, values) => {
+                HeapValue::Closure(id, values.into_iter().map(|v| v.filter_vectors(mask)).collect())
+            }
+            HeapValue::ObjectTable(_)
+            | HeapValue::ArrayTable(_)
+            | HeapValue::UnknownTable
+            | HeapValue::BuiltinFun(_) => v,
+        });
+
+        // Filter values in local env
+        new_state.local_env.map_in_place(|v| v.filter_vectors(mask));
+
+        // Filter values in outer local envs
+        for env in &mut new_state.outer_local_envs {
+            env.map_in_place(|v| v.filter_vectors(mask));
+        }
+
+        new_state
+    }
 }
