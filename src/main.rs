@@ -1848,4 +1848,34 @@ end
             assert_eq!(state.prints, Vec::<String>::new());
         }
     }
+
+    #[test]
+    #[ignore] // Ignore until all builtins are implemented
+    fn test_load_and_compile_celeste_game() {
+        // Test that we can parse and compile the celeste-minimal.lua game
+        let level_3 = std::fs::read_to_string("lua/builtin_level_3.lua")
+            .expect("Failed to read builtin_level_3.lua");
+        let level_4 = std::fs::read_to_string("lua/builtin_level_4.lua")
+            .expect("Failed to read builtin_level_4.lua");
+        let game = std::fs::read_to_string("lua/celeste-minimal.lua")
+            .expect("Failed to read celeste-minimal.lua");
+
+        // Suffix code to call _init
+        let suffix = r#"
+_init()
+__reset_button_states()
+"#;
+
+        let full_code = format!("{}\n{}\n{}\n{}\n", level_3, level_4, game, suffix);
+
+        let ast = full_moon::parse(&full_code).expect("Failed to parse game code");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile game");
+
+        println!("Game compiled successfully!");
+        println!("  CFG entry instructions: {}", cfg.entry.instructions.len());
+        println!("  Function definitions: {}", fun_defs.len());
+
+        // Just test that compilation works for now
+        assert!(!fun_defs.is_empty(), "Game should have function definitions");
+    }
 }

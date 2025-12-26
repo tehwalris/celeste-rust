@@ -293,8 +293,38 @@ impl Compiler {
                 // Process all intermediate suffixes as RHS (get values)
                 for suffix in init_suffixes {
                     match suffix {
+                        ast::Suffix::Call(ast::Call::AnonymousCall(
+                            ast::FunctionArgs::Parentheses {
+                                parentheses: _,
+                                arguments,
+                            },
+                        )) => {
+                            // Compile function call - the result becomes the new current value
+                            let (arg_ids, arg_streams): (Vec<_>, Vec<_>) = arguments
+                                .iter()
+                                .map(|arg| self.compile_rhs_expression(arg, locals, None))
+                                .collect::<Result<Vec<_>>>()?
+                                .into_iter()
+                                .map(|(id, _, stream)| (id, stream))
+                                .unzip();
+                            let (result_id, result_stream) =
+                                self.gen_id_and_stream(Instruction::Call {
+                                    closure: current_id,
+                                    args: arg_ids,
+                                });
+                            accumulated_stream = Stream::from_streams(vec![
+                                accumulated_stream,
+                                Stream::from_streams(arg_streams),
+                                result_stream,
+                            ]);
+                            current_id = result_id;
+                            current_hint = match current_hint {
+                                Some(h) => Some(format!("{}()", h)),
+                                None => None,
+                            };
+                        }
                         ast::Suffix::Call(_) => {
-                            bail!("calls in the middle of a suffix chain are not supported as LHS");
+                            bail!("unsupported call type in suffix chain (expected parentheses call)");
                         }
                         ast::Suffix::Index(ast::Index::Brackets {
                             brackets: _,
@@ -795,17 +825,88 @@ impl Compiler {
                 expression,
             } => self.compile_rhs_expression(expression, locals, hint_from_parent),
             ast::Expression::FunctionCall(call) => {
-                let (callee_id, callee_hint, callee_stream) =
+                // Handle function calls with potential suffix chains like obj.method(args)
+                let suffixes: Vec<_> = call.suffixes().collect();
+                if suffixes.is_empty() {
+                    bail!("function call with no suffixes");
+                }
+
+                // Start with the prefix
+                let (mut current_id, mut current_hint, mut accumulated_stream) =
                     self.compile_prefix_as_rhs(call.prefix(), locals, false)?;
-                let arguments = match call.suffixes().collect::<Vec<_>>().as_slice() {
-                    &[ast::Suffix::Call(ast::Call::AnonymousCall(
+
+                // Process all but the last suffix (which must be the Call)
+                for suffix in &suffixes[..suffixes.len() - 1] {
+                    match suffix {
+                        ast::Suffix::Index(ast::Index::Dot { dot: _, name }) => {
+                            let field_name = identifier_from_token_reference(name)?;
+                            current_hint = match current_hint {
+                                Some(lhs_hint) => Some(format!("{}.{}", lhs_hint, field_name)),
+                                None => Some(field_name.to_string()),
+                            };
+                            let (ptr_id, ptr_stream) =
+                                self.gen_id_and_stream(Instruction::GetField {
+                                    receiver: current_id,
+                                    field: field_name.to_string(),
+                                    create_if_missing: false,
+                                });
+                            let (val_id, val_stream) =
+                                self.gen_id_and_stream(Instruction::Load { source: ptr_id });
+                            accumulated_stream = Stream::from_streams(vec![
+                                accumulated_stream,
+                                ptr_stream,
+                                val_stream,
+                            ]);
+                            current_id = val_id;
+                        }
+                        ast::Suffix::Index(ast::Index::Brackets {
+                            brackets: _,
+                            expression,
+                        }) => {
+                            let (rhs_id, rhs_hint, rhs_stream) =
+                                self.compile_rhs_expression(expression, locals, None)?;
+                            current_hint = match (current_hint, rhs_hint) {
+                                (Some(lhs_hint), Some(rhs_hint)) => {
+                                    Some(format!("{}[{}]", lhs_hint, rhs_hint))
+                                }
+                                (Some(lhs_hint), None) => Some(lhs_hint),
+                                (None, Some(rhs_hint)) => Some(rhs_hint),
+                                (None, None) => None,
+                            };
+                            let (ptr_id, ptr_stream) =
+                                self.gen_id_and_stream(Instruction::GetIndex {
+                                    receiver: current_id,
+                                    index: rhs_id,
+                                    create_if_missing: false,
+                                });
+                            let (val_id, val_stream) =
+                                self.gen_id_and_stream(Instruction::Load { source: ptr_id });
+                            accumulated_stream = Stream::from_streams(vec![
+                                accumulated_stream,
+                                rhs_stream,
+                                ptr_stream,
+                                val_stream,
+                            ]);
+                            current_id = val_id;
+                        }
+                        ast::Suffix::Call(_) => {
+                            bail!("nested function call in suffix chain is not yet supported");
+                        }
+                        _ => bail!("unsupported suffix type in function call chain"),
+                    }
+                }
+
+                // The last suffix must be the Call
+                let arguments = match &suffixes[suffixes.len() - 1] {
+                    ast::Suffix::Call(ast::Call::AnonymousCall(
                         ast::FunctionArgs::Parentheses {
                             parentheses: _,
                             arguments,
                         },
-                    ))] => arguments,
-                    _ => bail!("expected single anonymous function call suffix"),
+                    )) => arguments,
+                    _ => bail!("expected function call as last suffix"),
                 };
+
                 let (arg_ids, arg_streams): (Vec<_>, Vec<_>) = arguments
                     .iter()
                     .map(|arg| self.compile_rhs_expression(arg, locals, None))
@@ -814,14 +915,14 @@ impl Compiler {
                     .map(|(id, _, stream)| (id, stream))
                     .unzip();
                 let (result_id, result_stream) = self.gen_id_and_stream(Instruction::Call {
-                    closure: callee_id,
+                    closure: current_id,
                     args: arg_ids,
                 });
                 Ok((
                     result_id,
-                    callee_hint,
+                    current_hint,
                     Stream::from_streams(vec![
-                        callee_stream,
+                        accumulated_stream,
                         Stream::from_streams(arg_streams),
                         result_stream,
                     ]),
