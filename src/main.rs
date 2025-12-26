@@ -110,11 +110,20 @@ mod tests {
         Ok(vec![(state, Value::Nil(None))])
     }
 
+    /// Builtin __new_unknown_boolean: returns an unknown boolean (could be either true or false)
+    fn builtin_new_unknown_boolean(state: State, args: Vec<Value>) -> anyhow::Result<Vec<(State, Value)>> {
+        if !args.is_empty() {
+            return Err(anyhow!("__new_unknown_boolean takes no arguments"));
+        }
+        Ok(vec![(state, Value::UnknownBool)])
+    }
+
     fn create_fixed_env_with_builtins() -> FixedEnv {
         let mut fixed_env = FixedEnv::new();
         fixed_env.add_builtin("__print", builtin_print);
         fixed_env.add_builtin("print", builtin_print);
         fixed_env.add_builtin("add", builtin_add);
+        fixed_env.add_builtin("__new_unknown_boolean", builtin_new_unknown_boolean);
         fixed_env
     }
 
@@ -948,5 +957,62 @@ __print(z[3])
             result_states[0].0.prints,
             vec!["1", "7", "hello", "world"]
         );
+    }
+
+    #[test]
+    fn test_interpret_abstract_boolean_no_call() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // From lua_tests/abstract_boolean_no_call.lua
+        let code = r#"
+v = __new_unknown_boolean()
+if v then
+  __print("a")
+else
+  __print("b")
+end
+if v then
+  __print("c")
+else
+  __print("d")
+end
+"#;
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        // With unknown boolean v, we should get 4 possible outcomes:
+        // - v=true in both ifs: ["a", "c"]
+        // - v=true then false: ["a", "d"]
+        // - v=false then true: ["b", "c"]
+        // - v=false then false: ["b", "d"]
+        // However since v is the *same* unknown boolean, it could be either true or false
+        // and the interpreter should explore both branches independently at each if statement.
+        // This should result in 4 distinct output states.
+
+        let mut output_sets: Vec<Vec<String>> = result_states
+            .iter()
+            .map(|(state, _)| state.prints.clone())
+            .collect();
+        output_sets.sort();
+
+        let mut expected_sets = vec![
+            vec!["a".to_string(), "c".to_string()],
+            vec!["a".to_string(), "d".to_string()],
+            vec!["b".to_string(), "c".to_string()],
+            vec!["b".to_string(), "d".to_string()],
+        ];
+        expected_sets.sort();
+
+        assert_eq!(output_sets, expected_sets);
     }
 }
