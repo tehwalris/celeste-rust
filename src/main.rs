@@ -44,6 +44,7 @@ mod tests {
     };
 
     use crate::interpreter::value::MaybeVector;
+    use crate::pico8_num::Pico8Num;
 
     fn format_scalar_number(n: &crate::pico8_num::Pico8Num) -> String {
         let whole = n.whole_part_as_i16();
@@ -258,6 +259,46 @@ mod tests {
         Ok(vec![(state, Value::Nil(None))])
     }
 
+    /// Create mget builtin with cart data
+    fn make_builtin_mget(
+        cart_data: std::sync::Arc<cart_data::CartData>,
+    ) -> impl Fn(State, Vec<Value>) -> anyhow::Result<Vec<(State, Value)>> {
+        move |state: State, args: Vec<Value>| {
+            if args.len() != 2 {
+                return Err(anyhow!("mget requires 2 arguments"));
+            }
+            match (&args[0], &args[1]) {
+                (Value::Number(x), Value::Number(y)) => {
+                    let result = MaybeVector::map2(x, y, |x, y| {
+                        Pico8Num::from_i16(cart_data.mget(*x, *y).expect("mget failed") as i16)
+                    });
+                    Ok(vec![(state, Value::Number(result))])
+                }
+                _ => Err(anyhow!("mget: arguments must be numbers")),
+            }
+        }
+    }
+
+    /// Create fget builtin with cart data
+    fn make_builtin_fget(
+        cart_data: std::sync::Arc<cart_data::CartData>,
+    ) -> impl Fn(State, Vec<Value>) -> anyhow::Result<Vec<(State, Value)>> {
+        move |state: State, args: Vec<Value>| {
+            if args.len() != 2 {
+                return Err(anyhow!("fget requires 2 arguments"));
+            }
+            match (&args[0], &args[1]) {
+                (Value::Number(i), Value::Number(b)) => {
+                    let result = MaybeVector::map2(i, b, |i, b| {
+                        cart_data.fget(*i, *b).expect("fget failed")
+                    });
+                    Ok(vec![(state, Value::Bool(result))])
+                }
+                _ => Err(anyhow!("fget: arguments must be numbers")),
+            }
+        }
+    }
+
     fn create_fixed_env_with_builtins() -> FixedEnv {
         let mut fixed_env = FixedEnv::new();
         // Level 1 builtins
@@ -274,6 +315,18 @@ mod tests {
         // Level 3 builtins (implemented in Lua, but add as Rust for test convenience)
         fixed_env.add_builtin("add", builtin_add);
         fixed_env.add_builtin("print", builtin_print);
+        fixed_env
+    }
+
+    fn create_fixed_env_with_game_builtins() -> FixedEnv {
+        let mut fixed_env = create_fixed_env_with_builtins();
+
+        // Level 5 builtins (cart data)
+        let cart_data =
+            std::sync::Arc::new(cart_data::CartData::load("cart").expect("Failed to load cart data"));
+        fixed_env.add_builtin("mget", make_builtin_mget(cart_data.clone()));
+        fixed_env.add_builtin("fget", make_builtin_fget(cart_data));
+
         fixed_env
     }
 
@@ -1850,7 +1903,6 @@ end
     }
 
     #[test]
-    #[ignore] // Ignore until all builtins are implemented
     fn test_load_and_compile_celeste_game() {
         // Test that we can parse and compile the celeste-minimal.lua game
         let level_3 = std::fs::read_to_string("lua/builtin_level_3.lua")
@@ -1877,5 +1929,49 @@ __reset_button_states()
 
         // Just test that compilation works for now
         assert!(!fun_defs.is_empty(), "Game should have function definitions");
+    }
+
+    #[test]
+    #[ignore] // Ignore until performance is good enough
+    fn test_run_celeste_game_init() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // Load and compile the game
+        let level_3 = std::fs::read_to_string("lua/builtin_level_3.lua")
+            .expect("Failed to read builtin_level_3.lua");
+        let level_4 = std::fs::read_to_string("lua/builtin_level_4.lua")
+            .expect("Failed to read builtin_level_4.lua");
+        let game = std::fs::read_to_string("lua/celeste-minimal.lua")
+            .expect("Failed to read celeste-minimal.lua");
+
+        // Suffix code to call _init
+        let suffix = r#"
+_init()
+__reset_button_states()
+"#;
+
+        let full_code = format!("{}\n{}\n{}\n{}\n", level_3, level_4, game, suffix);
+
+        let ast = full_moon::parse(&full_code).expect("Failed to parse game code");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile game");
+
+        let mut fixed_env = create_fixed_env_with_game_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        println!("Starting game interpretation...");
+        let start = std::time::Instant::now();
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+        let elapsed = start.elapsed();
+
+        println!("Game init completed in {:?}", elapsed);
+        println!("Result states: {}", result_states.len());
+
+        // The game should produce at least one state
+        assert!(!result_states.is_empty(), "Game should produce at least one state");
     }
 }
