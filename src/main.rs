@@ -43,6 +43,18 @@ mod tests {
         value::{HeapValue, Value},
     };
 
+    use crate::interpreter::value::MaybeVector;
+
+    fn format_scalar_number(n: &crate::pico8_num::Pico8Num) -> String {
+        let whole = n.whole_part_as_i16();
+        let frac = n.fraction_part_as_u16();
+        if frac == 0 {
+            format!("{}", whole)
+        } else {
+            format!("{}.{}", whole, frac)
+        }
+    }
+
     /// Builtin __print: collects the printed value into the state's prints list
     fn builtin_print(mut state: State, args: Vec<Value>) -> anyhow::Result<Vec<(State, Value)>> {
         let printed = if args.is_empty() {
@@ -50,21 +62,23 @@ mod tests {
         } else {
             match &args[0] {
                 Value::String(s) => s.clone(),
-                Value::Number(crate::interpreter::value::MaybeVector::Scalar(n)) => {
-                    let whole = n.whole_part_as_i16();
-                    let frac = n.fraction_part_as_u16();
-                    if frac == 0 {
-                        format!("{}", whole)
-                    } else {
-                        format!("{}.{}", whole, frac)
-                    }
+                Value::Number(MaybeVector::Scalar(n)) => format_scalar_number(n),
+                Value::Number(MaybeVector::Vector(nums)) => {
+                    let inner: Vec<String> = nums.iter().map(format_scalar_number).collect();
+                    format!("V[{}]", inner.join(", "))
                 }
-                Value::Bool(crate::interpreter::value::MaybeVector::Scalar(b)) => {
+                Value::Bool(MaybeVector::Scalar(b)) => {
                     if *b {
                         "true".to_string()
                     } else {
                         "false".to_string()
                     }
+                }
+                Value::Bool(MaybeVector::Vector(bools)) => {
+                    let inner: Vec<String> = bools.iter()
+                        .map(|b| if *b { "true".to_string() } else { "false".to_string() })
+                        .collect();
+                    format!("V[{}]", inner.join(", "))
                 }
                 Value::Nil(_) => "nil".to_string(),
                 other => format!("{:?}", other),
@@ -118,12 +132,51 @@ mod tests {
         Ok(vec![(state, Value::UnknownBool)])
     }
 
+    /// Builtin __new_vector: creates a vector from an array table
+    fn builtin_new_vector(state: State, args: Vec<Value>) -> anyhow::Result<Vec<(State, Value)>> {
+        if args.len() != 1 {
+            return Err(anyhow!("__new_vector requires 1 argument"));
+        }
+        let table_heap_id = match &args[0] {
+            Value::Pointer(heap_id) => *heap_id,
+            _ => return Err(anyhow!("__new_vector: argument must be a table")),
+        };
+
+        let item_heap_ids = match state.heap.get(table_heap_id) {
+            HeapValue::ArrayTable(items) => items.clone(),
+            _ => return Err(anyhow!("__new_vector: argument must be an array table")),
+        };
+
+        if item_heap_ids.is_empty() {
+            return Err(anyhow!("Cannot make a vector with no values"));
+        }
+
+        // Collect values and determine the type
+        let mut numbers: Vec<crate::pico8_num::Pico8Num> = Vec::new();
+        for heap_id in item_heap_ids {
+            match state.heap.get(heap_id) {
+                HeapValue::Value(Value::Number(MaybeVector::Scalar(n))) => {
+                    numbers.push(*n);
+                }
+                other => {
+                    return Err(anyhow!(
+                        "__new_vector: all values must be scalar numbers, got {:?}",
+                        other
+                    ))
+                }
+            }
+        }
+
+        Ok(vec![(state, Value::Number(MaybeVector::Vector(numbers)))])
+    }
+
     fn create_fixed_env_with_builtins() -> FixedEnv {
         let mut fixed_env = FixedEnv::new();
         fixed_env.add_builtin("__print", builtin_print);
         fixed_env.add_builtin("print", builtin_print);
         fixed_env.add_builtin("add", builtin_add);
         fixed_env.add_builtin("__new_unknown_boolean", builtin_new_unknown_boolean);
+        fixed_env.add_builtin("__new_vector", builtin_new_vector);
         fixed_env
     }
 
@@ -1014,5 +1067,64 @@ end
         expected_sets.sort();
 
         assert_eq!(output_sets, expected_sets);
+    }
+
+    #[test]
+    fn test_interpret_vectors() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // From lua_tests/vector.lua
+        let code = r#"
+x_values = {}
+add(x_values, 6)
+add(x_values, 3)
+add(x_values, 8)
+x = __new_vector(x_values)
+
+y_values = {}
+add(y_values, 2)
+add(y_values, 4)
+add(y_values, 6)
+y = __new_vector(y_values)
+
+function f(v)
+  return v + 1
+end
+
+__print(x)
+__print(x + y)
+__print(x + 3)
+__print(3 + x)
+__print((x + 0.5) + (y + 0.5))
+x = y
+__print(x + y)
+__print(f(x))
+"#;
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        assert_eq!(result_states.len(), 1);
+        assert_eq!(
+            result_states[0].0.prints,
+            vec![
+                "V[6, 3, 8]",
+                "V[8, 7, 14]",
+                "V[9, 6, 11]",
+                "V[9, 6, 11]",
+                "V[9, 8, 15]",
+                "V[4, 8, 12]",
+                "V[3, 5, 7]",
+            ]
+        );
     }
 }

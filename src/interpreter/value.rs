@@ -30,7 +30,13 @@ impl<T: std::fmt::Debug + Clone + PartialEq + Eq> MaybeVector<T> {
             (MaybeVector::Vector(a), MaybeVector::Vector(b)) => {
                 MaybeVector::Vector(a.iter().zip_eq(b.iter()).map(|(a, b)| f(a, b)).collect())
             }
-            _ => panic!("Mismatched vector sizes"),
+            // Broadcast scalar to match vector size
+            (MaybeVector::Scalar(a), MaybeVector::Vector(b)) => {
+                MaybeVector::Vector(b.iter().map(|bi| f(a, bi)).collect())
+            }
+            (MaybeVector::Vector(a), MaybeVector::Scalar(b)) => {
+                MaybeVector::Vector(a.iter().map(|ai| f(ai, b)).collect())
+            }
         }
     }
 }
