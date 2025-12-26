@@ -160,7 +160,7 @@ pub enum Instruction {
 }
 
 impl Instruction {
-    pub fn map_local_ids(&self, f: impl Fn(LocalId) -> LocalId) -> Self {
+    pub fn map_local_ids(&self, mut f: impl FnMut(LocalId) -> LocalId) -> Self {
         match self {
             Self::Alloc => Self::Alloc,
             Self::GetGlobal {
@@ -248,7 +248,7 @@ pub enum Terminator {
 }
 
 impl Terminator {
-    pub fn map_local_ids(&self, f: impl Fn(LocalId) -> LocalId) -> Self {
+    pub fn map_local_ids(&self, mut f: impl FnMut(LocalId) -> LocalId) -> Self {
         match self {
             Self::Return { value } => Self::Return {
                 value: value.map(|id| f(id)),

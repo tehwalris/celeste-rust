@@ -317,13 +317,7 @@ impl<'a> CoreInterpreter<'a> {
                     .fun_defs
                     .get(&fun_def_name)
                     .ok_or_else(|| anyhow!("Unknown function: {:?}", fun_def_name))?;
-
-                // Push the current local_env onto outer_local_envs
-                let outer_local_envs = {
-                    let mut outer = self.state.outer_local_envs.clone();
-                    outer.push(self.state.local_env.clone());
-                    outer
-                };
+                let fun_cfg = fun_def.cfg.clone();
 
                 // Create a new local_env for the function body
                 let mut new_local_env = super::local_env::LocalEnv::new();
@@ -345,25 +339,45 @@ impl<'a> CoreInterpreter<'a> {
                 }
 
                 // Create the state for executing the function body
+                // Note: We don't push outer_local_envs since functions get a fresh scope
+                // and captures are handled via the captured_values
                 let function_state = State {
                     heap: self.state.heap.clone(),
                     local_env: new_local_env,
-                    outer_local_envs,
+                    outer_local_envs: Vec::new(), // Functions start with empty outer envs
                     global_env: self.state.global_env.clone(),
                     prints: self.state.prints.clone(),
                     vector_size: self.state.vector_size,
                 };
 
-                // TODO: Actually interpret the function's CFG
-                // For now, we need a mechanism to recursively interpret CFGs.
-                // This requires restructuring to allow glue.rs to provide a callback
-                // for CFG interpretation.
-                //
-                // For now, return an error indicating this is not yet implemented.
-                Err(anyhow!(
-                    "User-defined function calls not yet implemented: {:?}",
-                    fun_def_name
-                ))
+                // Recursively interpret the function's CFG
+                let result_states =
+                    super::glue::interpret_cfg(fun_cfg, function_state, self.fixed_env)?;
+
+                // For each result state, create an output state that:
+                // 1. Takes the heap, global_env, and prints from the function execution
+                // 2. Restores the caller's local_env
+                // 3. Sets the return value at local_id
+                let states = result_states
+                    .into_iter()
+                    .map(|function_result_state| {
+                        let mut caller_state = State {
+                            heap: function_result_state.heap,
+                            local_env: self.state.local_env.clone(),
+                            outer_local_envs: self.state.outer_local_envs.clone(),
+                            global_env: function_result_state.global_env,
+                            prints: function_result_state.prints,
+                            vector_size: self.state.vector_size,
+                        };
+                        // Functions that don't return a value return nil
+                        caller_state
+                            .local_env
+                            .set(local_id, Value::Nil(Some("no return value".to_string())));
+                        caller_state
+                    })
+                    .collect();
+
+                Ok(states)
             }
             _ => Err(anyhow!(
                 "Attempt to call something that is not a function: {:?}",

@@ -33,9 +33,13 @@ impl StreamElement {
     fn map_local_ids(&self, mut f: impl FnMut(LocalId) -> LocalId) -> Self {
         match self {
             Self::Label(_) => self.clone(),
-            Self::Instruction(id, instruction) => Self::Instruction(f(*id), instruction.clone()),
+            Self::Instruction(id, instruction) => {
+                Self::Instruction(f(*id), instruction.map_local_ids(&mut f))
+            }
             Self::Hint(_) => self.clone(),
-            Self::Terminator(id, terminator) => Self::Terminator(f(*id), terminator.clone()),
+            Self::Terminator(id, terminator) => {
+                Self::Terminator(f(*id), terminator.map_local_ids(&mut f))
+            }
             // Intentionally not mapping the ids in fun_def because they refer to the inner
             // CFG, not the one that this stream is for.
             Self::Function(fun_def) => Self::Function(fun_def.clone()),
@@ -465,9 +469,11 @@ impl Compiler {
             inner_locals.insert(name.to_string(), *inner_id);
         }
 
-        let mut inner_stream = self.compile_block(function.block(), None, &inner_locals)?;
+        let body_stream = self.compile_block(function.block(), None, &inner_locals)?;
 
-        inner_stream.0.extend(arg_var_stream.0);
+        // The argument setup must come before the body
+        let mut inner_stream = arg_var_stream;
+        inner_stream.0.extend(body_stream.0);
         match inner_stream.0.last() {
             Some(StreamElement::Terminator(_, Terminator::Return { .. })) => {}
             _ => {
