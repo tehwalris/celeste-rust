@@ -5,27 +5,10 @@
 use anyhow::Result;
 use clap::Parser;
 
-// TODO remove unused dependencies
-#[macro_use(anyhow)]
-extern crate anyhow;
-extern crate bv;
-extern crate hex;
-extern crate regex;
-extern crate rustc_hash;
-extern crate work_queue;
-
-mod block_flow;
-mod cart_data;
-mod fixed_point;
-mod frontend;
-mod game_runner;
-mod input;
-mod instruction_flow;
-mod interpreter;
-mod ir;
-mod liveness;
-mod pico8_num;
-mod tas;
+use celeste_rust::frontend;
+use celeste_rust::game_runner;
+use celeste_rust::interpreter;
+use celeste_rust::pico8_num;
 
 #[derive(Parser, Debug)]
 #[command(name = "celeste-rust")]
@@ -1979,5 +1962,142 @@ __reset_button_states()
         // Run 26 frames (enough to see player spawn at frame 25)
         // For longer runs, use the binary: cargo run -- -n 30
         run_game_frames(26, 25, 26, None).expect("Game frames should complete");
+    }
+
+    #[test]
+    fn test_obj_move_basic() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // Test that obj.move correctly updates position
+        let code = std::fs::read_to_string("lua_tests/obj_move_test.lua")
+            .expect("Failed to read obj_move_test.lua");
+
+        let ast = full_moon::parse(&code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        assert_eq!(result_states.len(), 1);
+        println!("obj_move_test output:");
+        for line in &result_states[0].0.prints {
+            println!("  {}", line);
+        }
+
+        // Verify that x changed after move(2, 0)
+        // Test 1 output should be: "Test 1", "8", "10"
+        let prints = &result_states[0].0.prints;
+        // After move(2, 0), x should be 10 (8 + 2)
+        assert!(prints.contains(&"10".to_string()),
+            "Expected position to change to 10 after move(2,0), got: {:?}", prints);
+    }
+
+    #[test]
+    fn test_foreach_move() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // Test foreach with objects, simulating _update loop
+        let code = std::fs::read_to_string("lua_tests/foreach_move_test.lua")
+            .expect("Failed to read foreach_move_test.lua");
+
+        let ast = full_moon::parse(&code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        assert_eq!(result_states.len(), 1);
+        println!("foreach_move_test output:");
+        for line in &result_states[0].0.prints {
+            println!("  {}", line);
+        }
+
+        let prints = &result_states[0].0.prints;
+        // Test 1: 8 -> 10
+        // Test 2: 8 -> 8 (no move)
+        // Test 3: 8 -> 6
+        // Test 4: 10 and 9
+        assert!(prints.contains(&"10".to_string()), "Test 1 failed: {:?}", prints);
+        assert!(prints.contains(&"6".to_string()), "Test 3 failed: {:?}", prints);
+        assert!(prints.contains(&"9".to_string()), "Test 4 failed: {:?}", prints);
+    }
+
+    #[test]
+    fn test_move_y() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        let code = std::fs::read_to_string("lua_tests/move_y_test.lua")
+            .expect("Failed to read move_y_test.lua");
+
+        let ast = full_moon::parse(&code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        assert_eq!(result_states.len(), 1);
+        println!("move_y_test output:");
+        for line in &result_states[0].0.prints {
+            println!("  {}", line);
+        }
+
+        let prints = &result_states[0].0.prints;
+        // Y should change from 112 to 110 after move(0, -2)
+        assert!(prints.iter().any(|s| s.contains("110")),
+            "Expected y to be 110 after move with spd.y=-2, got: {:?}", prints);
+    }
+
+    #[test]
+    fn test_jump_trajectory() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        let code = std::fs::read_to_string("lua_tests/jump_trajectory_test.lua")
+            .expect("Failed to read jump_trajectory_test.lua");
+
+        let ast = full_moon::parse(&code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        assert_eq!(result_states.len(), 1);
+        println!("jump_trajectory_test output:");
+        for line in &result_states[0].0.prints {
+            println!("  {}", line);
+        }
+
+        // After jumping for 5 frames with spd_y=-2, y should be 104
+        // Frame 1: y=112 (no move yet), Frame 2: y=110, Frame 3: y=108, Frame 4: y=106, Frame 5: y=104
+        let prints = &result_states[0].0.prints;
+        assert!(prints.iter().any(|s| s.contains("y=104")),
+            "Expected y to reach 104 after jumping, got: {:?}", prints);
     }
 }

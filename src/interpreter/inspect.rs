@@ -3,6 +3,26 @@
 //! Also provides state summarization for debugging and visualization.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
+
+/// Error type for heap inspection operations
+#[derive(Debug, Clone)]
+pub enum InspectError {
+    /// Expected an ArrayTable but got something else
+    ExpectedArrayTable { heap_id: HeapId, actual: String },
+}
+
+impl fmt::Display for InspectError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            InspectError::ExpectedArrayTable { heap_id, actual } => {
+                write!(f, "expected ArrayTable at {:?}, got {}", heap_id, actual)
+            }
+        }
+    }
+}
+
+impl std::error::Error for InspectError {}
 
 use serde::{Deserialize, Serialize};
 
@@ -117,6 +137,7 @@ pub struct FrameDump {
 
 impl<'a> StateHelper<'a> {
     /// Extract a number from a heap value
+    /// For vectors, computes the actual min/max range across all elements
     fn extract_num(&self, heap_id: HeapId) -> Option<NumOrInterval> {
         match self.load(heap_id) {
             HeapValue::Value(Value::Number(mv)) => {
@@ -125,10 +146,19 @@ impl<'a> StateHelper<'a> {
                         value: (*n).into()
                     }),
                     MaybeVector::Vector(nums) if !nums.is_empty() => {
-                        // For vectors, just take the first value for summary
-                        Some(NumOrInterval::Number {
-                            value: nums[0].into()
-                        })
+                        // Compute actual min/max of all vector elements
+                        let min = nums.iter().min().copied().unwrap();
+                        let max = nums.iter().max().copied().unwrap();
+                        if min == max {
+                            Some(NumOrInterval::Number {
+                                value: min.into()
+                            })
+                        } else {
+                            Some(NumOrInterval::Interval {
+                                low: min.into(),
+                                high: max.into(),
+                            })
+                        }
                     }
                     _ => None,
                 }
@@ -140,9 +170,12 @@ impl<'a> StateHelper<'a> {
                         high: interval.high.into(),
                     }),
                     MaybeVector::Vector(intervals) if !intervals.is_empty() => {
+                        // Compute actual min/max across all intervals
+                        let min = intervals.iter().map(|i| i.low).min().unwrap();
+                        let max = intervals.iter().map(|i| i.high).max().unwrap();
                         Some(NumOrInterval::Interval {
-                            low: intervals[0].low.into(),
-                            high: intervals[0].high.into(),
+                            low: min.into(),
+                            high: max.into(),
                         })
                     }
                     _ => None,
@@ -220,7 +253,7 @@ impl<'a> StateHelper<'a> {
         // Find player
         let player = objects_array_id
             .and_then(|arr_id| {
-                let players = self.find_objects_by_type(arr_id, "player");
+                let players = self.find_objects_by_type(arr_id, "player").ok()?;
                 players.first().copied()
             })
             .and_then(|id| self.extract_player_summary(id));
@@ -228,7 +261,7 @@ impl<'a> StateHelper<'a> {
         // Find player_spawn
         let player_spawn = objects_array_id
             .and_then(|arr_id| {
-                let spawns = self.find_objects_by_type(arr_id, "player_spawn");
+                let spawns = self.find_objects_by_type(arr_id, "player_spawn").ok()?;
                 spawns.first().copied()
             })
             .and_then(|id| self.extract_player_spawn_summary(id));
@@ -346,11 +379,15 @@ impl<'a> StateHelper<'a> {
         }
     }
 
-    /// Find objects in an array table that have a specific type
-    pub fn find_objects_by_type(&self, array_id: HeapId, type_name: &str) -> Vec<HeapId> {
+    /// Find objects in an array table that have a specific type.
+    /// Returns an error if array_id doesn't point to an ArrayTable.
+    pub fn find_objects_by_type(&self, array_id: HeapId, type_name: &str) -> Result<Vec<HeapId>, InspectError> {
         let items = match self.load(array_id) {
             HeapValue::ArrayTable(items) => items,
-            _ => return vec![],
+            other => return Err(InspectError::ExpectedArrayTable {
+                heap_id: array_id,
+                actual: format!("{:?}", other),
+            }),
         };
 
         // Get the type function's heap ID by dereferencing the global
@@ -362,7 +399,7 @@ impl<'a> StateHelper<'a> {
 
         let global_type_target = match global_type_target {
             Some(id) => id,
-            None => return vec![],
+            None => return Ok(vec![]),  // Type not found is valid (no matches)
         };
 
         let mut results = Vec::new();
@@ -380,7 +417,7 @@ impl<'a> StateHelper<'a> {
                 }
             }
         }
-        results
+        Ok(results)
     }
 }
 
@@ -412,8 +449,10 @@ pub fn mark_heap(state: &State) -> HeapMarks {
     let helper = StateHelper::new(state);
 
     // Find player objects
-    if let Some(objects_array_id) = helper.find_global("objects") {
-        for player_heap_id in helper.find_objects_by_type(objects_array_id, "player") {
+    if let Some(objects_array_id) = helper.get_objects_array_id() {
+        let players = helper.find_objects_by_type(objects_array_id, "player")
+            .expect("get_objects_array_id returned non-ArrayTable");
+        for player_heap_id in players {
             if let HeapValue::ObjectTable(player) = helper.load(player_heap_id) {
                 // Get player.rem
                 if let Some(rem_ptr) = player.get("rem") {

@@ -6,7 +6,7 @@ use crate::interpreter::{
     state::State,
     value::{HeapValue, Value, MaybeVector},
 };
-use crate::pico8_num::Pico8Num;
+use crate::pico8_num::{Pico8Num, Pico8NumInterval};
 use crate::cart_data;
 
 fn format_scalar_number(n: &Pico8Num) -> String {
@@ -112,8 +112,64 @@ fn builtin_flr(state: State, args: Vec<Value>) -> Result<Vec<(State, Value)>> {
             let result = nums.map(|n| n.flr());
             Ok(vec![(state, Value::Number(result))])
         }
+        Value::NumberInterval(MaybeVector::Scalar(interval)) => {
+            // For an interval, flr only works if all values have the same floor
+            let low_flr = interval.low.flr();
+            let high_flr = interval.high.flr();
+            if low_flr != high_flr {
+                return Err(anyhow!(
+                    "flr of interval [{:?}, {:?}] spans multiple floors ({:?} to {:?}). Call __split_by_flr first.",
+                    interval.low, interval.high, low_flr, high_flr
+                ));
+            }
+            Ok(vec![(state, Value::Number(MaybeVector::Scalar(low_flr)))])
+        }
+        Value::NumberInterval(MaybeVector::Vector(intervals)) => {
+            // For a vector of intervals, each must have a single floor value
+            let mut floors = Vec::with_capacity(intervals.len());
+            for interval in intervals {
+                let low_flr = interval.low.flr();
+                let high_flr = interval.high.flr();
+                if low_flr != high_flr {
+                    return Err(anyhow!(
+                        "flr of interval [{:?}, {:?}] spans multiple floors. Call __split_by_flr first.",
+                        interval.low, interval.high
+                    ));
+                }
+                floors.push(low_flr);
+            }
+            let result = if floors.len() == 1 {
+                Value::Number(MaybeVector::Scalar(floors[0]))
+            } else {
+                Value::Number(MaybeVector::Vector(floors))
+            };
+            Ok(vec![(state, result)])
+        }
         _ => Err(anyhow!("flr: argument must be a number")),
     }
+}
+
+/// Split an interval into sub-intervals where all values have the same floor.
+/// Returns a sequence of non-overlapping intervals covering the original.
+fn split_interval_by_floor(interval: Pico8NumInterval) -> Vec<Pico8NumInterval> {
+    let one = Pico8Num::from_i16(1);
+    let mut results = Vec::new();
+    let mut current = interval.low;
+
+    while current <= interval.high {
+        let floor_val = current.flr();
+        let next_floor = floor_val + one;
+        // largest_with_same_floor is floor_val + 0.ffff = next_floor - epsilon
+        let largest_with_same_floor = next_floor.next_smallest();
+
+        let sub_low = current;
+        let sub_high = interval.high.min(largest_with_same_floor);
+
+        results.push(Pico8NumInterval::new(sub_low, sub_high));
+        current = next_floor;
+    }
+
+    results
 }
 
 fn builtin_split_by_flr(state: State, args: Vec<Value>) -> Result<Vec<(State, Value)>> {
@@ -142,6 +198,63 @@ fn builtin_split_by_flr(state: State, args: Vec<Value>) -> Result<Vec<(State, Va
                     Value::Number(MaybeVector::Scalar(result_nums[0]))
                 } else {
                     Value::Number(MaybeVector::Vector(result_nums))
+                };
+                results.push((filtered_state, result_value));
+            }
+            Ok(results)
+        }
+        Value::NumberInterval(MaybeVector::Scalar(interval)) => {
+            // Split interval into sub-intervals by floor value
+            let sub_intervals = split_interval_by_floor(*interval);
+            let results: Vec<(State, Value)> = sub_intervals
+                .into_iter()
+                .map(|sub| (state.clone(), Value::NumberInterval(MaybeVector::Scalar(sub))))
+                .collect();
+            Ok(results)
+        }
+        Value::NumberInterval(MaybeVector::Vector(intervals)) => {
+            // For a vector of intervals:
+            // 1. Take the union of all intervals
+            // 2. Split the union into same-floor sub-intervals
+            // 3. For each sub-interval, filter to elements that intersect
+            if intervals.is_empty() {
+                return Ok(vec![(state, Value::NumberInterval(MaybeVector::Vector(vec![])))]);
+            }
+
+            // Compute union of all intervals
+            let common_interval = intervals.iter().cloned().reduce(|a, b| a.union(&b)).unwrap();
+
+            // Split into same-floor sub-intervals
+            let sub_intervals = split_interval_by_floor(common_interval);
+
+            let mut results = Vec::new();
+            for sub in sub_intervals {
+                // For each vector element, compute intersection with sub
+                let intersections: Vec<Option<Pico8NumInterval>> = intervals
+                    .iter()
+                    .map(|int| int.intersect(&sub))
+                    .collect();
+
+                // Create mask: true if this element intersects
+                let mask: Vec<bool> = intersections.iter().map(|opt| opt.is_some()).collect();
+                let mask_count = mask.iter().filter(|&&b| b).count();
+
+                if mask_count == 0 {
+                    continue; // No elements in this floor range
+                }
+
+                let filtered_state = state.filter_by_mask(&mask);
+
+                // Collect the intersected intervals (non-None values)
+                let result_intervals: Vec<Pico8NumInterval> = intersections
+                    .into_iter()
+                    .filter_map(|opt| opt)
+                    .collect();
+
+                let result_value = if result_intervals.len() == 1 {
+                    Value::NumberInterval(MaybeVector::Scalar(result_intervals[0]))
+                } else {
+                    Value::NumberInterval(MaybeVector::Vector(result_intervals))
                 };
                 results.push((filtered_state, result_value));
             }
