@@ -239,6 +239,7 @@ impl<'a> BoundInterpreterFlow<'a> {
                             .map(|v| *v == *condition_from_flow_edge)
                             .collect();
                         state.map_values_in_place(|v| v.filter_vectors(&mask));
+                        state.vector_size = mask_true_count;
                         Ok(FlowData::States(vec![state]))
                     }
                 }

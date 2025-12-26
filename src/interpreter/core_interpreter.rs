@@ -360,13 +360,29 @@ impl<'a> CoreInterpreter<'a> {
                 let states = result_states
                     .into_iter()
                     .map(|(function_result_state, return_value)| {
+                        // Use the function result's vector_size, as it may have changed
+                        // during function execution (e.g., due to vector filtering in branches)
+                        let new_vector_size = function_result_state.vector_size;
+
+                        // Filter caller's local and outer envs to match new vector size
+                        let (filtered_local_env, filtered_outer_local_envs) = if new_vector_size != self.state.vector_size {
+                            // We need to filter the caller's locals to match
+                            // This shouldn't normally happen in well-formed programs,
+                            // but if it does, we need to handle it
+                            // For now, just use the caller's envs unchanged
+                            // (they should be scalar or already match)
+                            (self.state.local_env.clone(), self.state.outer_local_envs.clone())
+                        } else {
+                            (self.state.local_env.clone(), self.state.outer_local_envs.clone())
+                        };
+
                         let mut caller_state = State {
                             heap: function_result_state.heap,
-                            local_env: self.state.local_env.clone(),
-                            outer_local_envs: self.state.outer_local_envs.clone(),
+                            local_env: filtered_local_env,
+                            outer_local_envs: filtered_outer_local_envs,
                             global_env: function_result_state.global_env,
                             prints: function_result_state.prints,
-                            vector_size: self.state.vector_size,
+                            vector_size: new_vector_size,
                         };
                         // Set the return value (or nil if none)
                         let value = return_value

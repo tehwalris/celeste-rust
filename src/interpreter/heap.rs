@@ -7,6 +7,16 @@ use super::value::HeapValue;
 #[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
 pub struct HeapId(usize);
 
+impl HeapId {
+    pub fn from_raw(id: usize) -> Self {
+        Self(id)
+    }
+
+    pub fn raw(&self) -> usize {
+        self.0
+    }
+}
+
 /// A copy-on-write heap implementation.
 ///
 /// Uses a two-level structure inspired by the OCaml implementation:

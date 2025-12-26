@@ -2237,7 +2237,8 @@ __reset_button_states()
 
         for frame_num in 1..=num_frames {
             println!("\nFrame {}:", frame_num);
-            println!("  Input states: {}", states.len());
+            let expanded_input: usize = states.iter().map(|s| s.vector_size).sum();
+            println!("  Input states: {} ({} if expanding vectors)", states.len(), expanded_input);
 
             let start = std::time::Instant::now();
             let mut new_states = Vec::new();
@@ -2248,7 +2249,11 @@ __reset_button_states()
                 new_states.extend(result.into_iter().map(|(s, _)| s));
             }
 
-            println!("  Output states: {}", new_states.len());
+            // Vectorize states to combine states with the same shape
+            new_states = crate::interpreter::vectorize::vectorize_states(new_states);
+
+            let expanded_output: usize = new_states.iter().map(|s| s.vector_size).sum();
+            println!("  Output states: {} ({} if expanding vectors)", new_states.len(), expanded_output);
             println!("  Frame completed in {:?}", start.elapsed());
 
             states = new_states;

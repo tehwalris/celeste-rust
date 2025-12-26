@@ -41,4 +41,19 @@ impl LocalEnv {
             .map(|(k, v)| (*k, f(v.clone())))
             .collect();
     }
+
+    /// Iterate over all (raw_id, value) pairs
+    pub fn iter(&self) -> impl Iterator<Item = (usize, &Value)> {
+        self.0.iter().map(|(id, v)| (usize::from(*id), v))
+    }
+
+    /// Get value by raw usize id
+    pub fn get_by_raw_id(&self, raw_id: usize) -> &Value {
+        self.get(LocalId::from(raw_id))
+    }
+
+    /// Set value by raw usize id
+    pub fn set_by_raw_id(&mut self, raw_id: usize, value: Value) {
+        self.set(LocalId::from(raw_id), value);
+    }
 }

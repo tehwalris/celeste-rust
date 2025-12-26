@@ -7,3 +7,4 @@ pub mod local_env;
 mod op;
 pub mod state;
 pub mod value;
+pub mod vectorize;
