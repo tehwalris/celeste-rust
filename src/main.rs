@@ -1127,4 +1127,54 @@ __print(f(x))
             ]
         );
     }
+
+    #[test]
+    fn test_interpret_undefined_fields() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // Simplified undefined_fields.lua test
+        let code = r#"
+x = {}
+__print(x.y)
+
+x = {y='a', z=nil}
+__print(x.y)
+__print(x.z)
+__print(x.a)
+__print(x.a == nil)
+__print(x.z == nil)
+__print(x.a == x.z)
+
+__print(global_which_does_not_exist)
+__print(x.a == global_which_does_not_exist)
+"#;
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        assert_eq!(result_states.len(), 1);
+        assert_eq!(
+            result_states[0].0.prints,
+            vec![
+                "nil",      // x.y (undefined)
+                "a",        // x.y
+                "nil",      // x.z (explicitly nil)
+                "nil",      // x.a (undefined)
+                "true",     // x.a == nil
+                "true",     // x.z == nil
+                "true",     // x.a == x.z (both nil)
+                "nil",      // global_which_does_not_exist
+                "true",     // x.a == global_which_does_not_exist
+            ]
+        );
+    }
 }
