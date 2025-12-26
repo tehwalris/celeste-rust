@@ -53,22 +53,29 @@ pub enum Value {
     NilPointer(String),
 }
 
-fn filter_vec_by_mask<T>(vec: Vec<T>, mask: &[bool]) -> Vec<T> {
-    vec.into_iter()
+fn filter_vec_by_mask<T: Clone + PartialEq>(vec: Vec<T>, mask: &[bool]) -> MaybeVector<T>
+where
+    T: std::fmt::Debug + Clone + PartialEq + Eq,
+{
+    let filtered: Vec<T> = vec
+        .into_iter()
         .zip(mask.iter())
         .filter_map(|(v, m)| if *m { Some(v) } else { None })
-        .collect()
+        .collect();
+
+    // Convert single-element vectors back to scalars (like OCaml's value_unvectorize_if_possible)
+    if filtered.len() == 1 {
+        MaybeVector::Scalar(filtered.into_iter().next().unwrap())
+    } else {
+        MaybeVector::Vector(filtered)
+    }
 }
 
 impl Value {
     pub fn filter_vectors(self, mask: &[bool]) -> Self {
         match self {
-            Value::Bool(MaybeVector::Vector(vec)) => {
-                Value::Bool(MaybeVector::Vector(filter_vec_by_mask(vec, mask)))
-            }
-            Value::Number(MaybeVector::Vector(vec)) => {
-                Value::Number(MaybeVector::Vector(filter_vec_by_mask(vec, mask)))
-            }
+            Value::Bool(MaybeVector::Vector(vec)) => Value::Bool(filter_vec_by_mask(vec, mask)),
+            Value::Number(MaybeVector::Vector(vec)) => Value::Number(filter_vec_by_mask(vec, mask)),
             _ => self,
         }
     }

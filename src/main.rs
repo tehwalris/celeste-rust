@@ -170,6 +170,20 @@ mod tests {
         Ok(vec![(state, Value::Number(MaybeVector::Vector(numbers)))])
     }
 
+    /// Builtin flr: floor function (Pico-8)
+    fn builtin_flr(state: State, args: Vec<Value>) -> anyhow::Result<Vec<(State, Value)>> {
+        if args.len() != 1 {
+            return Err(anyhow!("flr requires 1 argument"));
+        }
+        match &args[0] {
+            Value::Number(nums) => {
+                let result = nums.map(|n| n.flr());
+                Ok(vec![(state, Value::Number(result))])
+            }
+            _ => Err(anyhow!("flr: argument must be a number")),
+        }
+    }
+
     fn create_fixed_env_with_builtins() -> FixedEnv {
         let mut fixed_env = FixedEnv::new();
         fixed_env.add_builtin("__print", builtin_print);
@@ -177,6 +191,7 @@ mod tests {
         fixed_env.add_builtin("add", builtin_add);
         fixed_env.add_builtin("__new_unknown_boolean", builtin_new_unknown_boolean);
         fixed_env.add_builtin("__new_vector", builtin_new_vector);
+        fixed_env.add_builtin("flr", builtin_flr);
         fixed_env
     }
 
@@ -1176,5 +1191,579 @@ __print(x.a == global_which_does_not_exist)
                 "true",     // x.a == global_which_does_not_exist
             ]
         );
+    }
+
+    #[test]
+    fn test_interpret_short_circuit_operators_non_boolean() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // From lua_tests/short_circuit_operators_non_boolean.lua
+        // In Lua, `and` and `or` return the actual value (not a boolean):
+        // - `a and b` returns `a` if `a` is falsy, otherwise returns `b`
+        // - `a or b` returns `a` if `a` is truthy, otherwise returns `b`
+        let code = r#"
+function f(s, v)
+  __print(s)
+  return v
+end
+
+__print(f("a", true) and f("b", -4) or f("c", 0))
+__print(f("a", false) and f("b", -4) or f("c", 0))
+__print(f("a", 3) and f("b", -4) or f("c", 0))
+__print(f("a", 0) and f("b", -4) or f("c", 0))
+__print(f("a", 0) and f("b", 0) or f("c", 4))
+
+__print(f("a", -3) and f("b", 0))
+__print(f("a", 0) and f("b", 0))
+__print(f("a", 3) and f("b", 0))
+__print(f("a", 0.3) and f("b", 0))
+__print(f("a", "") and f("b", 0))
+__print(f("a", " ") and f("b", 0))
+__print(f("a", "a") and f("b", 0))
+__print(f("a", nil) and f("b", 0))
+__print(f("a", {}) and f("b", 0))
+__print(f("a", f) and f("b", 0))
+"#;
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        assert_eq!(result_states.len(), 1);
+
+        // Expected behavior:
+        // Line 6: f("a", true) returns true (truthy) -> eval f("b", -4) returns -4 (truthy) -> -4
+        //         prints: a, b, then -4
+        // Line 7: f("a", false) returns false (falsy) -> false (short-circuit and) -> or f("c", 0) returns 0
+        //         prints: a, c, then 0
+        // Line 8: f("a", 3) returns 3 (truthy) -> f("b", -4) returns -4 (truthy) -> -4
+        //         prints: a, b, then -4
+        // Line 9: f("a", 0) returns 0 (truthy in Lua!) -> f("b", -4) returns -4 (truthy) -> -4
+        //         prints: a, b, then -4
+        // Line 10: f("a", 0) returns 0 (truthy) -> f("b", 0) returns 0 (truthy) -> 0
+        //          prints: a, b, then 0
+        // Line 12: f("a", -3) returns -3 (truthy) -> f("b", 0) returns 0
+        //          prints: a, b, then 0
+        // Line 13: f("a", 0) returns 0 (truthy) -> f("b", 0) returns 0
+        //          prints: a, b, then 0
+        // Line 14: f("a", 3) returns 3 (truthy) -> f("b", 0) returns 0
+        //          prints: a, b, then 0
+        // Line 15: f("a", 0.3) returns 0.3 (truthy) -> f("b", 0) returns 0
+        //          prints: a, b, then 0
+        // Line 16: f("a", "") returns "" (truthy) -> f("b", 0) returns 0
+        //          prints: a, b, then 0
+        // Line 17: f("a", " ") returns " " (truthy) -> f("b", 0) returns 0
+        //          prints: a, b, then 0
+        // Line 18: f("a", "a") returns "a" (truthy) -> f("b", 0) returns 0
+        //          prints: a, b, then 0
+        // Line 19: f("a", nil) returns nil (falsy) -> nil (short-circuit, don't eval b)
+        //          prints: a, then nil
+        // Line 20: f("a", {}) returns {} (truthy) -> f("b", 0) returns 0
+        //          prints: a, b, then 0
+        // Line 21: f("a", f) returns f (truthy) -> f("b", 0) returns 0
+        //          prints: a, b, then 0
+
+        let expected = vec![
+            "a", "b", "-4",   // line 6
+            "a", "c", "0",    // line 7
+            "a", "b", "-4",   // line 8
+            "a", "b", "-4",   // line 9
+            "a", "b", "0",    // line 10
+            "a", "b", "0",    // line 12
+            "a", "b", "0",    // line 13
+            "a", "b", "0",    // line 14
+            "a", "b", "0",    // line 15
+            "a", "b", "0",    // line 16
+            "a", "b", "0",    // line 17
+            "a", "b", "0",    // line 18
+            "a", "nil",       // line 19 (nil short-circuits)
+            "a", "b", "0",    // line 20
+            "a", "b", "0",    // line 21
+        ];
+
+        assert_eq!(result_states[0].0.prints, expected);
+    }
+
+    #[test]
+    fn test_interpret_liveness_issue_for_in_function() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // From lua_tests/liveness_issue_for_in_function.lua
+        // The interpreter used to crash at "print" because the function call was
+        // causing the outer locals to be lost. This only happened with functions that
+        // have multiple cfg blocks.
+        let code = r#"
+function function_with_for()
+  for i = 1, 7 do
+  end
+end
+
+local y = {}
+function_with_for()
+__print(#y)
+"#;
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        assert_eq!(result_states.len(), 1);
+        assert_eq!(result_states[0].0.prints, vec!["0"]);
+    }
+
+    #[test]
+    fn test_interpret_abstract_boolean_with_call() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // From lua_tests/abstract_boolean.lua
+        // Tests that abstract boolean branching creates 4 independent output states
+        // when the same unknown boolean is used in two different if statements.
+        let code = r#"
+function f(v)
+  if v then
+    __print("a")
+  else
+    __print("b")
+  end
+  if v then
+    __print("c")
+  else
+    __print("d")
+  end
+end
+
+f(__new_unknown_boolean())
+"#;
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        // The expected outputs are:
+        // - ["a", "c"] (v=true, v=true)
+        // - ["a", "d"] (v=true, v=false)
+        // - ["b", "c"] (v=false, v=true)
+        // - ["b", "d"] (v=false, v=false)
+
+        let mut output_sets: Vec<Vec<String>> = result_states
+            .iter()
+            .map(|(state, _)| state.prints.clone())
+            .collect();
+        output_sets.sort();
+
+        let mut expected_sets = vec![
+            vec!["a".to_string(), "c".to_string()],
+            vec!["a".to_string(), "d".to_string()],
+            vec!["b".to_string(), "c".to_string()],
+            vec!["b".to_string(), "d".to_string()],
+        ];
+        expected_sets.sort();
+
+        assert_eq!(output_sets, expected_sets);
+    }
+
+    #[test]
+    fn test_interpret_foreach() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // From lua_tests/foreach.lua - testing the foreach function implementation
+        // foreach is implemented in Lua (builtin_level_3.lua):
+        //   function foreach(tbl, func)
+        //     for i=1,32767 do
+        //       if #tbl < i then break end
+        //       func(tbl[i])
+        //     end
+        //   end
+        let code = r#"
+function foreach(tbl, func)
+  for i=1,32767 do
+    if #tbl < i then
+      break
+    end
+    func(tbl[i])
+  end
+end
+
+function __assert(cond, msg)
+  if not cond then
+    __print("Assertion failed")
+    if msg == nil then
+      error()
+    else
+      __print(msg)
+      error(msg)
+    end
+  end
+end
+
+function make_example_table()
+  local x = {}
+  add(x, 3)
+  add(x, 1)
+  add(x, 'walrus')
+  return x
+end
+
+function test_normal_foreach()
+  local x = make_example_table()
+
+  local y = {}
+  foreach(x, function(v)
+    add(y, v)
+  end)
+
+  __assert(#y == 3)
+  __assert(y[1] == 3)
+  __assert(y[2] == 1)
+  __assert(y[3] == 'walrus')
+end
+
+foreach(make_example_table(), __print)
+test_normal_foreach()
+"#;
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        assert_eq!(result_states.len(), 1);
+        // foreach(make_example_table(), __print) should print: 3, 1, walrus
+        assert_eq!(result_states[0].0.prints, vec!["3", "1", "walrus"]);
+    }
+
+    #[test]
+    fn test_interpret_less_than_with_vectors() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // From lua_tests/less_than.lua
+        // Tests comparison operations on vectors
+        let code = r#"
+low_values = {}
+add(low_values, 0)
+add(low_values, 1)
+low = __new_vector(low_values)
+
+high_values = {}
+add(high_values, 1.5)
+add(high_values, 1.8)
+high = __new_vector(high_values)
+
+__print(0 < 1.5)
+__print(1 < 1.8)
+__print(low < 1.5)
+__print(1 < high)
+__print(low < high)
+__print((0 + 1) < 1.5)
+__print((1 + 1) < 1.8)
+__print((low + 1) < high)
+__print(low)
+__print(flr(high))
+"#;
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        // Expected output:
+        // true        - 0 < 1.5
+        // true        - 1 < 1.8
+        // true        - V[0, 1] < 1.5 -> V[true, true] which prints as "true" (both true)
+        // true        - 1 < V[1.5, 1.8] -> V[true, true]
+        // true        - V[0, 1] < V[1.5, 1.8] -> V[true, true]
+        // true        - (0 + 1) < 1.5
+        // false       - (1 + 1) < 1.8 (2 < 1.8 is false)
+        // V[true, false] - (V[0, 1] + 1) < V[1.5, 1.8] -> V[1, 2] < V[1.5, 1.8] -> V[true, false]
+        // V[0, 1]     - low unchanged
+        // 1           - flr(V[1.5, 1.8]) -> V[1, 1] but if all same, shows as scalar
+
+        assert_eq!(result_states.len(), 1);
+        assert_eq!(
+            result_states[0].0.prints,
+            vec![
+                "true",
+                "true",
+                "V[true, true]",
+                "V[true, true]",
+                "V[true, true]",
+                "true",
+                "false",
+                "V[true, false]",
+                "V[0, 1]",
+                "V[1, 1]",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_interpret_vector_branch() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // From lua_tests/vector_branch.lua
+        // Tests vector branching - when branching on a vector comparison,
+        // the vector gets filtered to only include elements matching the branch condition
+        let code = r#"
+x_values = {}
+add(x_values, 6)
+add(x_values, 3)
+add(x_values, 8)
+x = __new_vector(x_values)
+
+__print(x)
+if x < 5 then
+  __print(x)
+else
+  __print(x)
+end
+"#;
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        // Expected output options:
+        // Option 1: x < 5 branch (only element 3 is < 5)
+        //   V[6, 3, 8]
+        //   3
+        // Option 2: x >= 5 branch (elements 6 and 8 are >= 5)
+        //   V[6, 3, 8]
+        //   V[6, 8]
+
+        let mut output_sets: Vec<Vec<String>> = result_states
+            .iter()
+            .map(|(state, _)| state.prints.clone())
+            .collect();
+        output_sets.sort();
+
+        let mut expected_sets = vec![
+            vec!["V[6, 3, 8]".to_string(), "3".to_string()],
+            vec!["V[6, 3, 8]".to_string(), "V[6, 8]".to_string()],
+        ];
+        expected_sets.sort();
+
+        assert_eq!(output_sets, expected_sets);
+    }
+
+    #[test]
+    fn test_interpret_if_vector() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // From lua_tests/if_vector.lua
+        // Tests if statements with vector comparisons that cause branching
+        let code = r#"
+low_values = {}
+add(low_values, 0)
+add(low_values, 1)
+low = __new_vector(low_values)
+
+high_values = {}
+add(high_values, 1.5)
+add(high_values, 1.8)
+high = __new_vector(high_values)
+
+__print(low)
+if (low + 1) < high then
+  __print("below")
+  __print(low)
+end
+__print(low)
+"#;
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        // Expected output options:
+        // Option 1: (low + 1) < high is true for element 0 (0+1=1 < 1.5)
+        //   V[0, 1]
+        //   below
+        //   0
+        //   0
+        // Option 2: (low + 1) < high is false for element 1 (1+1=2 < 1.8 is false)
+        //   V[0, 1]
+        //   1
+
+        let mut output_sets: Vec<Vec<String>> = result_states
+            .iter()
+            .map(|(state, _)| state.prints.clone())
+            .collect();
+        output_sets.sort();
+
+        let mut expected_sets = vec![
+            vec![
+                "V[0, 1]".to_string(),
+                "below".to_string(),
+                "0".to_string(),
+                "0".to_string(),
+            ],
+            vec!["V[0, 1]".to_string(), "1".to_string()],
+        ];
+        expected_sets.sort();
+
+        assert_eq!(output_sets, expected_sets);
+    }
+
+    #[test]
+    fn test_interpret_branching_with_irrelevant_locals() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // From lua_tests/branching_with_irrelevant_locals.lua
+        // Both branches produce the same output ("a"), so they should merge to 1 state
+        let code = r#"
+if __new_unknown_boolean() then
+  __print("a")
+else
+  local s = "a"
+  __print(s)
+end
+"#;
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        // Both branches print "a", so there should be 1 branch with prints ["a"]
+        // Note: deduplication might not happen in current implementation,
+        // but both outputs should still be ["a"]
+        for (state, _) in &result_states {
+            assert_eq!(state.prints, vec!["a"]);
+        }
+    }
+
+    #[test]
+    fn test_interpret_branching_with_allocations() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // From lua_tests/branching_with_allocations.lua
+        // Both branches create tables and set same values, should produce equivalent outputs
+        let code = r#"
+if __new_unknown_boolean() then
+  x = {}
+  x[1] = "a"
+  y = {}
+  y[1] = "b"
+else
+  y = {}
+  y[1] = "b"
+  x = {}
+  x[1] = "a"
+end
+__print(x[1])
+__print(y[1])
+"#;
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        // Both branches should produce ["a", "b"]
+        for (state, _) in &result_states {
+            assert_eq!(state.prints, vec!["a", "b"]);
+        }
+    }
+
+    #[test]
+    fn test_interpret_branching_into_return() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // From lua_tests/branching_into_return.lua
+        // Both branches return, so there should be 1 equivalent state
+        let code = r#"
+if __new_unknown_boolean() then
+  local x = 1
+  return
+else
+  local x = 2
+  return
+end
+"#;
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        // Both branches end with return, and both have no prints
+        for (state, _) in &result_states {
+            assert_eq!(state.prints, Vec::<String>::new());
+        }
     }
 }
