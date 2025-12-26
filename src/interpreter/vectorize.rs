@@ -66,7 +66,8 @@ fn can_vectorize_value(value: &Value) -> bool {
 
 fn normalize_value_for_shape(value: &Value) -> ValueShape {
     if !can_vectorize_value(value) {
-        // Non-vectorizable values keep their identity
+        // Non-vectorizable values keep their identity for shape comparison
+        // States with different non-vectorizable values cannot be merged
         match value {
             Value::String(s) => ValueShape::String(s.clone()),
             Value::Nil(hint) => ValueShape::Nil(hint.clone()),
@@ -113,14 +114,21 @@ fn shape_of_state(state: &State) -> StateShape {
         heap_structure.push((id, shape));
     }
 
-    // Get local env structure
-    let local_env_structure = state.local_env.iter()
+    // Get local env structure (sorted for consistent comparison)
+    let mut local_env_structure: Vec<_> = state.local_env.iter()
         .map(|(k, v)| (k, normalize_value_for_shape(v)))
         .collect();
+    local_env_structure.sort_by_key(|(k, _)| *k);
 
-    // Get outer local envs structure
-    let outer_local_envs_structure = state.outer_local_envs.iter()
-        .map(|env| env.iter().map(|(k, v)| (k, normalize_value_for_shape(v))).collect())
+    // Get outer local envs structure (sorted for consistent comparison)
+    let outer_local_envs_structure: Vec<Vec<_>> = state.outer_local_envs.iter()
+        .map(|env| {
+            let mut entries: Vec<_> = env.iter()
+                .map(|(k, v)| (k, normalize_value_for_shape(v)))
+                .collect();
+            entries.sort_by_key(|(k, _)| *k);
+            entries
+        })
         .collect();
 
     StateShape {
