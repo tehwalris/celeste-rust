@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use super::{
+    fixed_env::FixedEnv,
     heap::HeapId,
     op::{interpret_binary_op, interpret_unary_op},
     state::State,
@@ -9,8 +10,9 @@ use super::{
 use crate::ir::{Instruction, LocalId};
 use anyhow::{anyhow, Result};
 
-pub struct CoreInterpreter {
+pub struct CoreInterpreter<'a> {
     state: State,
+    fixed_env: &'a FixedEnv,
 }
 
 fn make_non_pointer_error(value: &Value) -> anyhow::Error {
@@ -26,9 +28,9 @@ fn make_non_pointer_error(value: &Value) -> anyhow::Error {
     }
 }
 
-impl CoreInterpreter {
-    pub fn new(state: State) -> Self {
-        Self { state }
+impl<'a> CoreInterpreter<'a> {
+    pub fn new(state: State, fixed_env: &'a FixedEnv) -> Self {
+        Self { state, fixed_env }
     }
 
     pub fn into_state(self) -> State {
@@ -70,9 +72,16 @@ impl CoreInterpreter {
             Instruction::Load { source } => match self.state.local_env.get(*source) {
                 Value::Pointer(heap_id) => match self.state.heap.get(*heap_id) {
                     HeapValue::Value(value) => Ok(Some(value.clone())),
-                    _ => Err(anyhow!(
-                        "Value is of a type that can not be stored in a local"
-                    )),
+                    // Closures and builtins are returned as pointers - they are callable
+                    HeapValue::Closure(_, _) | HeapValue::BuiltinFun(_) => {
+                        Ok(Some(Value::Pointer(*heap_id)))
+                    }
+                    HeapValue::ObjectTable(_)
+                    | HeapValue::ArrayTable(_)
+                    | HeapValue::UnknownTable => {
+                        // Tables are returned as pointers
+                        Ok(Some(Value::Pointer(*heap_id)))
+                    }
                 },
                 Value::NilPointer(hint) => {
                     Ok(Some(Value::Nil(Some(format!("nil pointer to {}", hint)))))
@@ -248,12 +257,118 @@ impl CoreInterpreter {
         Ok(())
     }
 
-    pub fn interpret_call_instruction(self, instruction: &Instruction) -> Result<Vec<State>> {
-        let (closure, args) = match instruction {
+    pub fn interpret_call_instruction(
+        self,
+        local_id: LocalId,
+        instruction: &Instruction,
+    ) -> Result<Vec<State>> {
+        let (closure_local_id, arg_local_ids) = match instruction {
             Instruction::Call { closure, args } => (closure, args),
             _ => panic!("Non-call instruction passed to interpret_call_instruction"),
         };
 
-        todo!()
+        // Get the closure value from the local environment
+        let closure_heap_id = match self.state.local_env.get(*closure_local_id) {
+            Value::Pointer(heap_id) => *heap_id,
+            Value::NilPointer(hint) => {
+                return Err(anyhow!("Attempt to call nil ({})", hint));
+            }
+            value => {
+                return Err(make_non_pointer_error(value));
+            }
+        };
+
+        // Get the heap value
+        let heap_value = self.state.heap.get(closure_heap_id).clone();
+
+        // Gather argument values
+        let arg_values: Vec<Value> = arg_local_ids
+            .iter()
+            .map(|id| self.state.local_env.get(*id).clone())
+            .collect();
+
+        match heap_value {
+            HeapValue::BuiltinFun(name) => {
+                // Look up the builtin function
+                let builtin_fn = self
+                    .fixed_env
+                    .builtin_funs
+                    .get(&name)
+                    .ok_or_else(|| anyhow!("Unknown builtin function: {}", name))?;
+
+                // Call the builtin, which returns multiple (state, return_value) pairs
+                let results = builtin_fn(self.state, arg_values)?;
+
+                // Set the return value in each state's local_env at the local_id
+                let states = results
+                    .into_iter()
+                    .map(|(mut state, return_value)| {
+                        state.local_env.set(local_id, return_value);
+                        state
+                    })
+                    .collect();
+
+                Ok(states)
+            }
+            HeapValue::Closure(fun_def_name, captured_values) => {
+                // Look up the function definition
+                let (fun_def, _prepared_cfg) = self
+                    .fixed_env
+                    .fun_defs
+                    .get(&fun_def_name)
+                    .ok_or_else(|| anyhow!("Unknown function: {:?}", fun_def_name))?;
+
+                // Push the current local_env onto outer_local_envs
+                let outer_local_envs = {
+                    let mut outer = self.state.outer_local_envs.clone();
+                    outer.push(self.state.local_env.clone());
+                    outer
+                };
+
+                // Create a new local_env for the function body
+                let mut new_local_env = super::local_env::LocalEnv::new();
+
+                // Set up captured values
+                for (capture_id, value) in fun_def.capture_ids.iter().zip(captured_values.iter()) {
+                    new_local_env.set(*capture_id, value.clone());
+                }
+
+                // Set up argument values (padding with Nil if needed)
+                for (i, arg_id) in fun_def.arg_ids.iter().enumerate() {
+                    if let Some(arg_id) = arg_id {
+                        let value = arg_values
+                            .get(i)
+                            .cloned()
+                            .unwrap_or(Value::Nil(Some("missing argument".to_string())));
+                        new_local_env.set(*arg_id, value);
+                    }
+                }
+
+                // Create the state for executing the function body
+                let function_state = State {
+                    heap: self.state.heap.clone(),
+                    local_env: new_local_env,
+                    outer_local_envs,
+                    global_env: self.state.global_env.clone(),
+                    prints: self.state.prints.clone(),
+                    vector_size: self.state.vector_size,
+                };
+
+                // TODO: Actually interpret the function's CFG
+                // For now, we need a mechanism to recursively interpret CFGs.
+                // This requires restructuring to allow glue.rs to provide a callback
+                // for CFG interpretation.
+                //
+                // For now, return an error indicating this is not yet implemented.
+                Err(anyhow!(
+                    "User-defined function calls not yet implemented: {:?}",
+                    fun_def_name
+                ))
+            }
+            _ => Err(anyhow!(
+                "Attempt to call something that is not a function: {:?}",
+                heap_value
+            )),
+        }
     }
 }

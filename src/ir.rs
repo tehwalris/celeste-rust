@@ -277,6 +277,8 @@ pub struct Block {
 }
 
 impl Block {
+    /// Splits block instructions into (phi_instructions, non_phi_instructions).
+    /// Phi instructions must come first in the block, followed by non-phi instructions.
     pub fn split_block_phi_instructions(
         &self,
     ) -> (&[(LocalId, Instruction)], &[(LocalId, Instruction)]) {
@@ -285,16 +287,23 @@ impl Block {
             _ => false,
         };
 
+        // Find the first non-phi instruction
         let split_index = self
             .instructions
             .iter()
-            .position(is_phi)
+            .position(|instr| !is_phi(instr))
             .unwrap_or(self.instructions.len());
 
         let (phi_instructions, non_phi_instructions) = self.instructions.split_at(split_index);
 
+        // Verify all phi instructions are before the split
+        if phi_instructions.iter().any(|instr| !is_phi(instr)) {
+            panic!("Non-phi instructions found before phi instructions in the block");
+        }
+
+        // Verify no phi instructions after the split
         if non_phi_instructions.iter().any(is_phi) {
-            panic!("Phi instructions are not at the beginning of the block");
+            panic!("Phi instructions found after non-phi instructions in the block");
         }
 
         (phi_instructions, non_phi_instructions)

@@ -12,11 +12,14 @@ use crate::{
 
 use super::{
     core_interpreter::CoreInterpreter,
+    fixed_env::FixedEnv,
     state::State,
     value::{MaybeVector, Value},
 };
 
-pub struct InterpreterFlowAdapter {}
+pub struct InterpreterFlowAdapter<'a> {
+    pub fixed_env: &'a FixedEnv,
+}
 
 #[derive(Clone)]
 pub enum FlowData {
@@ -46,7 +49,7 @@ impl FlowData {
     }
 }
 
-pub enum BoundInterpreterFlow {
+pub enum BoundInterpreterFlow<'a> {
     BlockPhi {
         phi_instructions: Vec<(LocalId, LocalId)>, // (instruction_local_id, source_local_id)
     },
@@ -54,6 +57,7 @@ pub enum BoundInterpreterFlow {
         live_variables: HashSet<LocalId>,
     },
     BlockPostPhi {
+        fixed_env: &'a FixedEnv,
         non_phi_instructions: Vec<(LocalId, Instruction)>,
     },
     BranchUnconditional,
@@ -66,12 +70,12 @@ pub enum BoundInterpreterFlow {
     },
 }
 
-impl UnboundSplitBlockFlow<FlowData, BoundInterpreterFlow> for InterpreterFlowAdapter {
+impl<'a> UnboundSplitBlockFlow<FlowData, BoundInterpreterFlow<'a>> for InterpreterFlowAdapter<'a> {
     fn flow_block_phi(
         &self,
         source_block_name: &Label,
         target_block: &Block,
-    ) -> Result<BoundInterpreterFlow> {
+    ) -> Result<BoundInterpreterFlow<'a>> {
         let (phi_instructions, _) = target_block.split_block_phi_instructions();
         let phi_instructions = phi_instructions
             .iter()
@@ -94,7 +98,7 @@ impl UnboundSplitBlockFlow<FlowData, BoundInterpreterFlow> for InterpreterFlowAd
         &self,
         liveness: &LivenessAnalysisResult,
         block: &Block,
-    ) -> Result<BoundInterpreterFlow> {
+    ) -> Result<BoundInterpreterFlow<'a>> {
         let (terminator_local_id, _) = block.terminator;
         let first_non_phi_local_id = block
             .instructions
@@ -112,9 +116,10 @@ impl UnboundSplitBlockFlow<FlowData, BoundInterpreterFlow> for InterpreterFlowAd
         })
     }
 
-    fn flow_block_post_phi(&self, target_block: &Block) -> Result<BoundInterpreterFlow> {
+    fn flow_block_post_phi(&self, target_block: &Block) -> Result<BoundInterpreterFlow<'a>> {
         let (_, non_phi_instructions) = target_block.split_block_phi_instructions();
         Ok(BoundInterpreterFlow::BlockPostPhi {
+            fixed_env: self.fixed_env,
             non_phi_instructions: non_phi_instructions.to_vec(),
         })
     }
@@ -123,7 +128,7 @@ impl UnboundSplitBlockFlow<FlowData, BoundInterpreterFlow> for InterpreterFlowAd
         &self,
         terminator: &Terminator,
         flow_target: &Label,
-    ) -> Result<BoundInterpreterFlow> {
+    ) -> Result<BoundInterpreterFlow<'a>> {
         match terminator {
             Terminator::UnconditionalBranch { target } if target == flow_target => {
                 Ok(BoundInterpreterFlow::BranchUnconditional)
@@ -142,7 +147,7 @@ impl UnboundSplitBlockFlow<FlowData, BoundInterpreterFlow> for InterpreterFlowAd
         }
     }
 
-    fn flow_return(&self, terminator: &Terminator) -> Result<BoundInterpreterFlow> {
+    fn flow_return(&self, terminator: &Terminator) -> Result<BoundInterpreterFlow<'a>> {
         match terminator {
             Terminator::Return { value } => Ok(BoundInterpreterFlow::Return {
                 return_local_id: *value,
@@ -152,7 +157,7 @@ impl UnboundSplitBlockFlow<FlowData, BoundInterpreterFlow> for InterpreterFlowAd
     }
 }
 
-impl BoundInterpreterFlow {
+impl<'a> BoundInterpreterFlow<'a> {
     fn flow_single_state(&self, mut state: State) -> Result<FlowData> {
         match self {
             Self::BlockPhi { phi_instructions } => {
@@ -169,19 +174,22 @@ impl BoundInterpreterFlow {
                 Ok(FlowData::States(vec![state]))
             }
             Self::BlockPostPhi {
+                fixed_env,
                 non_phi_instructions,
             } => {
                 let mut states = vec![state];
                 for (local_id, instruction) in non_phi_instructions {
                     let mut new_states = vec![];
                     for old_state in states {
-                        let mut interpreter = CoreInterpreter::new(old_state);
+                        let interpreter = CoreInterpreter::new(old_state, fixed_env);
                         match instruction {
                             Instruction::Call { .. } => {
-                                new_states
-                                    .extend(interpreter.interpret_call_instruction(instruction)?);
+                                new_states.extend(
+                                    interpreter.interpret_call_instruction(*local_id, instruction)?,
+                                );
                             }
                             _ => {
+                                let mut interpreter = interpreter;
                                 interpreter.interpret_non_call_instruction(*local_id, instruction)?;
                                 new_states.push(interpreter.into_state());
                             }
@@ -248,7 +256,7 @@ impl BoundInterpreterFlow {
     }
 }
 
-impl BoundSplitBlockFlow<FlowData> for BoundInterpreterFlow {
+impl<'a> BoundSplitBlockFlow<FlowData> for BoundInterpreterFlow<'a> {
     fn flow(&self, v: FlowData) -> Result<FlowData> {
         let out_parts = match &v {
             FlowData::States(states) => states

@@ -99,8 +99,12 @@ impl Stream {
             }
 
             fn build_and_clear(&mut self) -> Block {
+                // Instructions were pushed in reverse order due to .rev() iteration,
+                // so we need to reverse them back to execution order
+                let mut instructions = std::mem::take(&mut self.instructions);
+                instructions.reverse();
                 Block {
-                    instructions: std::mem::take(&mut self.instructions),
+                    instructions,
                     terminator: self.terminator.take().unwrap(),
                     hint_normalize: std::mem::take(&mut self.hint_normalize),
                 }
@@ -1133,7 +1137,9 @@ impl Compiler {
 
 pub fn compile(ast: &ast::Ast) -> Result<(Cfg, Vec<FunDef>)> {
     let mut compiler = Compiler::new();
-    let stream = compiler.compile_block(ast.nodes(), None, &HashMap::new())?;
+    let mut stream = compiler.compile_block(ast.nodes(), None, &HashMap::new())?;
+    // Add an implicit return at the end of the toplevel if there isn't one
+    compiler.add_terminator_if_needed(&mut stream, Terminator::Return { value: None });
     let build_result = stream.build();
     Ok((build_result.cfg, build_result.fun_defs))
 }
