@@ -1987,7 +1987,6 @@ __reset_button_states()
     }
 
     #[test]
-    #[ignore] // Ignore until performance is good enough
     fn test_run_celeste_game_init() {
         use crate::interpreter::glue::interpret_cfg;
 
@@ -2031,7 +2030,6 @@ __reset_button_states()
     }
 
     #[test]
-    #[ignore] // Ignore until performance is good enough
     fn test_run_celeste_game_frame() {
         use crate::interpreter::glue::interpret_cfg;
 

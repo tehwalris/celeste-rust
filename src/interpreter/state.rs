@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use im::HashMap as ImHashMap;
 
 use super::{
     heap::{Heap, HeapId},
@@ -11,7 +11,7 @@ pub struct State {
     pub heap: Heap,
     pub local_env: LocalEnv,
     pub outer_local_envs: Vec<LocalEnv>,
-    pub global_env: HashMap<String, HeapId>,
+    pub global_env: ImHashMap<String, HeapId>,
     pub prints: Vec<String>,
     pub vector_size: usize,
 }
@@ -22,7 +22,7 @@ impl State {
             heap: Heap::new(),
             local_env: LocalEnv::new(),
             outer_local_envs: Vec::new(),
-            global_env: HashMap::new(),
+            global_env: ImHashMap::new(),
             prints: Vec::new(),
             vector_size: 1,
         }
