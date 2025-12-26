@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use im::HashMap as ImHashMap;
 
 use super::{
@@ -5,6 +7,7 @@ use super::{
     local_env::LocalEnv,
     value::{HeapValue, Value},
 };
+use crate::ir::LocalId;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct State {
@@ -77,5 +80,147 @@ impl State {
         }
 
         new_state
+    }
+
+    /// Garbage collect the heap and renumber HeapIds deterministically.
+    /// This ensures that states with the same logical structure will have
+    /// the same heap IDs, which is critical for vectorization to work correctly.
+    ///
+    /// The algorithm:
+    /// 1. Visit all reachable heap values from global_env, local_env, outer_local_envs
+    /// 2. Assign new HeapIds in the order values are visited
+    /// 3. Create a compacted heap with only reachable values
+    pub fn gc(&mut self) {
+        let mut old_to_new: HashMap<HeapId, HeapId> = HashMap::new();
+        let mut new_heap_values: Vec<HeapValue> = Vec::new();
+
+        // Visit a heap ID, assigning a new ID if not yet visited
+        // Returns the new ID
+        fn visit(
+            old_id: HeapId,
+            old_heap: &Heap,
+            old_to_new: &mut HashMap<HeapId, HeapId>,
+            new_heap_values: &mut Vec<HeapValue>,
+        ) -> HeapId {
+            if let Some(&new_id) = old_to_new.get(&old_id) {
+                return new_id;
+            }
+
+            // Assign new ID
+            let new_id = HeapId::from_raw(new_heap_values.len());
+            old_to_new.insert(old_id, new_id);
+
+            // Placeholder - will be replaced after recursing
+            new_heap_values.push(HeapValue::UnknownTable);
+
+            // Get the old value and recurse on references
+            let old_value = old_heap.get(old_id).clone();
+            let new_value = map_heap_value_references(&old_value, |ref_id| {
+                visit(ref_id, old_heap, old_to_new, new_heap_values)
+            });
+
+            // Replace placeholder with actual value
+            new_heap_values[new_id.raw()] = new_value;
+
+            new_id
+        }
+
+        // Map Value references
+        fn map_value_references(value: &Value, f: &mut impl FnMut(HeapId) -> HeapId) -> Value {
+            match value {
+                Value::Pointer(id) => Value::Pointer(f(*id)),
+                Value::Number(_)
+                | Value::NumberInterval(_)
+                | Value::Bool(_)
+                | Value::UnknownBool
+                | Value::String(_)
+                | Value::Nil(_)
+                | Value::NilPointer(_) => value.clone(),
+            }
+        }
+
+        // Map HeapValue references
+        fn map_heap_value_references(
+            value: &HeapValue,
+            mut f: impl FnMut(HeapId) -> HeapId,
+        ) -> HeapValue {
+            match value {
+                HeapValue::Value(v) => HeapValue::Value(map_value_references(v, &mut f)),
+                HeapValue::ObjectTable(table) => {
+                    // IMPORTANT: Sort keys for deterministic traversal order!
+                    let mut keys: Vec<_> = table.keys().cloned().collect();
+                    keys.sort();
+                    let new_table: std::collections::HashMap<String, HeapId> = keys
+                        .into_iter()
+                        .map(|k| {
+                            let v = table[&k];
+                            (k, f(v))
+                        })
+                        .collect();
+                    HeapValue::ObjectTable(new_table)
+                }
+                HeapValue::ArrayTable(items) => {
+                    HeapValue::ArrayTable(items.iter().map(|id| f(*id)).collect())
+                }
+                HeapValue::UnknownTable => HeapValue::UnknownTable,
+                HeapValue::Closure(id, captures) => {
+                    let new_captures: Vec<Value> = captures
+                        .iter()
+                        .map(|v| map_value_references(v, &mut f))
+                        .collect();
+                    HeapValue::Closure(id.clone(), new_captures)
+                }
+                HeapValue::BuiltinFun(name) => HeapValue::BuiltinFun(name.clone()),
+            }
+        }
+
+        // Visit all roots from global_env (sorted for deterministic order)
+        let mut global_keys: Vec<_> = self.global_env.keys().cloned().collect();
+        global_keys.sort();
+        let mut new_global_env = ImHashMap::new();
+        for key in global_keys {
+            let old_id = self.global_env[&key];
+            let new_id = visit(old_id, &self.heap, &mut old_to_new, &mut new_heap_values);
+            new_global_env.insert(key, new_id);
+        }
+
+        // Visit all roots from local_env (sorted for deterministic order)
+        let mut local_entries: Vec<_> = self.local_env.iter().collect();
+        local_entries.sort_by_key(|(k, _)| *k);
+        let mut new_local_env = LocalEnv::new();
+        for (raw_id, value) in local_entries {
+            let new_value = map_value_references(value, &mut |id| {
+                visit(id, &self.heap, &mut old_to_new, &mut new_heap_values)
+            });
+            new_local_env.set(LocalId::from(raw_id), new_value);
+        }
+
+        // Visit all roots from outer_local_envs
+        let mut new_outer_local_envs = Vec::new();
+        for env in &self.outer_local_envs {
+            let mut entries: Vec<_> = env.iter().collect();
+            entries.sort_by_key(|(k, _)| *k);
+            let mut new_env = LocalEnv::new();
+            for (raw_id, value) in entries {
+                let new_value = map_value_references(value, &mut |id| {
+                    visit(id, &self.heap, &mut old_to_new, &mut new_heap_values)
+                });
+                new_env.set(LocalId::from(raw_id), new_value);
+            }
+            new_outer_local_envs.push(new_env);
+        }
+
+        // Build the new compacted heap
+        let mut new_heap = Heap::new();
+        for value in new_heap_values {
+            let id = new_heap.alloc();
+            new_heap.set(id, value);
+        }
+
+        // Update state
+        self.heap = new_heap;
+        self.global_env = new_global_env;
+        self.local_env = new_local_env;
+        self.outer_local_envs = new_outer_local_envs;
     }
 }

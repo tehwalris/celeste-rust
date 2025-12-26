@@ -6,7 +6,7 @@ use super::{
 };
 use crate::{
     ir::{BinaryOp, UnaryOp},
-    pico8_num::Pico8Num,
+    pico8_num::{Pico8Num, Pico8NumInterval},
 };
 
 fn interpret_not(v: &Value) -> Result<Value> {
@@ -20,6 +20,10 @@ fn interpret_not(v: &Value) -> Result<Value> {
 pub fn interpret_unary_op(state: &State, op: UnaryOp, v: &Value) -> Result<Value> {
     match (op, v) {
         (UnaryOp::Minus, Value::Number(v)) => Ok(Value::Number(v.map(|v| -*v))),
+        (UnaryOp::Minus, Value::NumberInterval(v)) => Ok(Value::NumberInterval(v.map(|v| {
+            // Negating an interval [a,b] gives [-b, -a]
+            Pico8NumInterval::new(-v.high, -v.low)
+        }))),
         (UnaryOp::Not, v) => interpret_not(v),
         (UnaryOp::Hash, Value::String(v)) => Ok(Value::Number(MaybeVector::Scalar(
             Pico8Num::from_i16(v.len().try_into().unwrap()),
@@ -43,9 +47,37 @@ pub fn interpret_unary_op(state: &State, op: UnaryOp, v: &Value) -> Result<Value
         _ => Err(anyhow!("Unsupported unary op: {:?} {:?}", op, v)),
     }
 }
+
+/// Helper to lift a number to an interval
+fn lift_to_interval(v: &MaybeVector<Pico8Num>) -> MaybeVector<Pico8NumInterval> {
+    v.map_to(|n| Pico8NumInterval::from_number(*n))
+}
 pub fn interpret_binary_op(l: &Value, op: BinaryOp, r: &Value) -> Result<Value> {
     let sb = |b| Ok(Value::Bool(MaybeVector::Scalar(b)));
+
+    // Handle mixed Number/NumberInterval by lifting Number to NumberInterval
     match (l, op, r) {
+        // Number op NumberInterval -> lift to interval
+        (Value::Number(l), op, Value::NumberInterval(r))
+            if matches!(op, BinaryOp::Plus | BinaryOp::Minus) =>
+        {
+            interpret_binary_op(
+                &Value::NumberInterval(lift_to_interval(l)),
+                op,
+                &Value::NumberInterval(r.clone()),
+            )
+        }
+        // NumberInterval op Number -> lift to interval
+        (Value::NumberInterval(l), op, Value::Number(r))
+            if matches!(op, BinaryOp::Plus | BinaryOp::Minus) =>
+        {
+            interpret_binary_op(
+                &Value::NumberInterval(l.clone()),
+                op,
+                &Value::NumberInterval(lift_to_interval(r)),
+            )
+        }
+
         (_, BinaryOp::TildeEqual, _) => {
             interpret_not(&interpret_binary_op(l, BinaryOp::TwoEqual, r)?)
         }
@@ -56,8 +88,8 @@ pub fn interpret_binary_op(l: &Value, op: BinaryOp, r: &Value) -> Result<Value> 
         }
         (Value::Number(_), BinaryOp::TwoEqual, _) => sb(false),
 
-        // NumberInterval == _
-        // TODO
+        // NumberInterval == _ (can't compare intervals for equality in general)
+        (Value::NumberInterval(_), BinaryOp::TwoEqual, _) => sb(false),
 
         // Bool == _
         (Value::Bool(l), BinaryOp::TwoEqual, Value::Bool(r)) => {
@@ -82,15 +114,6 @@ pub fn interpret_binary_op(l: &Value, op: BinaryOp, r: &Value) -> Result<Value> 
         // Pointer == _
         (Value::Pointer(l), BinaryOp::TwoEqual, Value::Pointer(r)) => sb(l == r),
         (Value::Pointer(_), BinaryOp::TwoEqual, _) => sb(false),
-
-        // Number _ NumberInterval
-        // TODO
-
-        // NumberInterval _ Number
-        // TODO
-
-        // NumberInterval _ NumberInterval
-        // TODO
 
         // _ .. _
         (Value::String(l), BinaryOp::TwoDots, Value::String(r)) => {
@@ -119,8 +142,14 @@ pub fn interpret_binary_op(l: &Value, op: BinaryOp, r: &Value) -> Result<Value> 
         (Value::Number(l), BinaryOp::Percent, Value::Number(r)) => {
             Ok(Value::Number(MaybeVector::map2(l, r, |l, r| *l % *r)))
         }
-        // Power operation is not yet implemented
-        // (Value::Number(l), BinaryOp::Caret, Value::Number(r)) => { ... }
+
+        // Arithmetic operations on intervals
+        (Value::NumberInterval(l), BinaryOp::Plus, Value::NumberInterval(r)) => {
+            Ok(Value::NumberInterval(MaybeVector::map2(l, r, |l, r| *l + *r)))
+        }
+        (Value::NumberInterval(l), BinaryOp::Minus, Value::NumberInterval(r)) => {
+            Ok(Value::NumberInterval(MaybeVector::map2(l, r, |l, r| *l - *r)))
+        }
 
         // Comparison operations on numbers
         (Value::Number(l), BinaryOp::LessThan, Value::Number(r)) => {

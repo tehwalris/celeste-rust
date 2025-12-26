@@ -215,6 +215,7 @@ impl<'a> BoundInterpreterFlow<'a> {
                 }
                 Value::UnknownBool => Ok(FlowData::States(vec![state])),
                 Value::Number(_)
+                | Value::NumberInterval(_)
                 | Value::Bool(MaybeVector::Scalar(true))
                 | Value::String(_)
                 | Value::Pointer(_) => Ok(FlowData::States(if *condition_from_flow_edge {

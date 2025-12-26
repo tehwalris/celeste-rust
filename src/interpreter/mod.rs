@@ -3,6 +3,7 @@ pub mod fixed_env;
 mod flow;
 pub mod glue;
 pub mod heap;
+pub mod inspect;
 pub mod local_env;
 mod op;
 pub mod state;

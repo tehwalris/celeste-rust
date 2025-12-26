@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use itertools::Itertools;
 
 use super::heap::HeapId;
-use crate::{ir::GlobalId, pico8_num::Pico8Num};
+use crate::{ir::GlobalId, pico8_num::{Pico8Num, Pico8NumInterval}};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MaybeVector<T: std::fmt::Debug + Clone + PartialEq + Eq> {
@@ -14,6 +14,17 @@ pub enum MaybeVector<T: std::fmt::Debug + Clone + PartialEq + Eq> {
 
 impl<T: std::fmt::Debug + Clone + PartialEq + Eq> MaybeVector<T> {
     pub fn map(&self, f: impl Fn(&T) -> T) -> Self {
+        match self {
+            MaybeVector::Scalar(v) => MaybeVector::Scalar(f(v)),
+            MaybeVector::Vector(v) => MaybeVector::Vector(v.iter().map(f).collect()),
+        }
+    }
+
+    /// Maps over values, potentially changing the type
+    pub fn map_to<O: std::fmt::Debug + Clone + PartialEq + Eq>(
+        &self,
+        f: impl Fn(&T) -> O,
+    ) -> MaybeVector<O> {
         match self {
             MaybeVector::Scalar(v) => MaybeVector::Scalar(f(v)),
             MaybeVector::Vector(v) => MaybeVector::Vector(v.iter().map(f).collect()),
@@ -44,7 +55,7 @@ impl<T: std::fmt::Debug + Clone + PartialEq + Eq> MaybeVector<T> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Value {
     Number(MaybeVector<Pico8Num>),
-    // NumberInterval(MaybeVector<PicoNumberInterval>), // TODO
+    NumberInterval(MaybeVector<Pico8NumInterval>),
     Bool(MaybeVector<bool>),
     UnknownBool,
     String(String),
@@ -76,8 +87,19 @@ impl Value {
         match self {
             Value::Bool(MaybeVector::Vector(vec)) => Value::Bool(filter_vec_by_mask(vec, mask)),
             Value::Number(MaybeVector::Vector(vec)) => Value::Number(filter_vec_by_mask(vec, mask)),
+            Value::NumberInterval(MaybeVector::Vector(vec)) => {
+                Value::NumberInterval(filter_vec_by_mask(vec, mask))
+            }
             _ => self,
         }
+    }
+
+    /// Returns true if this value type can be vectorized (combined with other values)
+    pub fn can_vectorize(&self) -> bool {
+        matches!(
+            self,
+            Value::Number(_) | Value::NumberInterval(_) | Value::Bool(_)
+        )
     }
 }
 

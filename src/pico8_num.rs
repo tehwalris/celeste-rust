@@ -184,9 +184,90 @@ impl Neg for Pico8Num {
     }
 }
 
+/// Represents an interval [low, high] of Pico8Num values for abstract interpretation.
+/// This is used to track uncertainty in values (e.g., player's sub-pixel position).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Pico8NumInterval {
+    pub low: Pico8Num,
+    pub high: Pico8Num,
+}
+
+impl Pico8NumInterval {
+    pub fn new(low: Pico8Num, high: Pico8Num) -> Self {
+        assert!(low <= high, "Interval low must be <= high");
+        Self { low, high }
+    }
+
+    pub fn from_number(n: Pico8Num) -> Self {
+        Self { low: n, high: n }
+    }
+
+    pub fn to_number(&self) -> Option<Pico8Num> {
+        if self.low == self.high {
+            Some(self.low)
+        } else {
+            None
+        }
+    }
+
+    pub fn contains_number(&self, n: Pico8Num) -> bool {
+        n >= self.low && n <= self.high
+    }
+
+    pub fn contains_interval(&self, other: &Self) -> bool {
+        other.low >= self.low && other.high <= self.high
+    }
+
+    pub fn union(&self, other: &Self) -> Self {
+        Self {
+            low: std::cmp::min(self.low, other.low),
+            high: std::cmp::max(self.high, other.high),
+        }
+    }
+
+    pub fn intersect(&self, other: &Self) -> Option<Self> {
+        if self.low <= other.high && other.low <= self.high {
+            Some(Self {
+                low: std::cmp::max(self.low, other.low),
+                high: std::cmp::min(self.high, other.high),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl Add for Pico8NumInterval {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        Self {
+            low: self.low + rhs.low,
+            high: self.high + rhs.high,
+        }
+    }
+}
+
+impl Sub for Pico8NumInterval {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self {
+            low: self.low - rhs.high,
+            high: self.high - rhs.low,
+        }
+    }
+}
+
+impl fmt::Debug for Pico8NumInterval {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Interval[{:?}, {:?}]", self.low, self.high)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::pico8_num::{constants, int, Pico8Num};
+    use crate::pico8_num::{constants, int, Pico8Num, Pico8NumInterval};
 
     #[test]
     fn test_from_i16() {

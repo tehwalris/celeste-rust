@@ -1,0 +1,521 @@
+//! Heap inspection utilities for abstract interpretation.
+//! Used to mark and transform heap values (e.g., make player position abstract).
+//! Also provides state summarization for debugging and visualization.
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+use serde::{Deserialize, Serialize};
+
+use super::{
+    heap::HeapId,
+    state::State,
+    value::{HeapValue, MaybeVector, Value},
+};
+use crate::pico8_num::{Pico8Num, Pico8NumInterval};
+
+// ============================================================================
+// State Summary Types (for JSONL dumps)
+// ============================================================================
+
+/// A number that can be serialized to JSON (as a string to preserve precision)
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SerializableNum {
+    /// The raw 32-bit fixed-point value
+    pub raw: i32,
+    /// Human-readable representation
+    pub display: String,
+}
+
+impl From<Pico8Num> for SerializableNum {
+    fn from(n: Pico8Num) -> Self {
+        // Convert to human-readable fixed-point format
+        let whole = n.whole_part_as_i16();
+        let frac = n.fraction_part_as_u16();
+        let display = if frac == 0 {
+            format!("{}", whole)
+        } else {
+            // Convert fraction to decimal (approx)
+            let frac_decimal = (frac as f64) / 65536.0;
+            format!("{:.4}", (whole as f64) + frac_decimal)
+        };
+        Self {
+            raw: n.as_raw_u32() as i32,
+            display,
+        }
+    }
+}
+
+/// A number or interval
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum NumOrInterval {
+    Number { value: SerializableNum },
+    Interval { low: SerializableNum, high: SerializableNum },
+}
+
+/// Position (x, y) - can be concrete or interval
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Position {
+    pub x: NumOrInterval,
+    pub y: NumOrInterval,
+}
+
+/// Player state summary
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PlayerSummary {
+    pub x: NumOrInterval,
+    pub y: NumOrInterval,
+    pub spd_x: NumOrInterval,
+    pub spd_y: NumOrInterval,
+}
+
+/// Player spawn state summary
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PlayerSpawnSummary {
+    pub x: NumOrInterval,
+    pub y: NumOrInterval,
+    pub state: NumOrInterval,
+    pub delay: NumOrInterval,
+}
+
+/// Summary of a single state's key fields
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct StateSummary {
+    pub object_count: usize,
+    pub player: Option<PlayerSummary>,
+    pub player_spawn: Option<PlayerSpawnSummary>,
+}
+
+/// A group of states that share the same shape
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StateGroup {
+    /// Shape identifier (hash of the shape for grouping)
+    pub shape_hash: u64,
+    /// Number of State objects in this group
+    pub state_count: usize,
+    /// Total vector size (sum of all state.vector_size)
+    pub expanded_count: usize,
+    /// Summaries for each state in this group
+    pub summaries: Vec<StateSummary>,
+}
+
+/// Dump of all states for a single frame
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FrameDump {
+    pub frame: u32,
+    /// Total State objects this frame
+    pub total_states: usize,
+    /// Total expanded count (sum of vector_size)
+    pub total_expanded: usize,
+    /// States grouped by shape
+    pub groups: Vec<StateGroup>,
+}
+
+// ============================================================================
+// State Summary Extraction
+// ============================================================================
+
+impl<'a> StateHelper<'a> {
+    /// Extract a number from a heap value
+    fn extract_num(&self, heap_id: HeapId) -> Option<NumOrInterval> {
+        match self.load(heap_id) {
+            HeapValue::Value(Value::Number(mv)) => {
+                match mv {
+                    MaybeVector::Scalar(n) => Some(NumOrInterval::Number {
+                        value: (*n).into()
+                    }),
+                    MaybeVector::Vector(nums) if !nums.is_empty() => {
+                        // For vectors, just take the first value for summary
+                        Some(NumOrInterval::Number {
+                            value: nums[0].into()
+                        })
+                    }
+                    _ => None,
+                }
+            }
+            HeapValue::Value(Value::NumberInterval(mv)) => {
+                match mv {
+                    MaybeVector::Scalar(interval) => Some(NumOrInterval::Interval {
+                        low: interval.low.into(),
+                        high: interval.high.into(),
+                    }),
+                    MaybeVector::Vector(intervals) if !intervals.is_empty() => {
+                        Some(NumOrInterval::Interval {
+                            low: intervals[0].low.into(),
+                            high: intervals[0].high.into(),
+                        })
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Extract a number from an object table field
+    fn extract_field_num(&self, obj: &HashMap<String, HeapId>, field: &str) -> Option<NumOrInterval> {
+        let heap_id = *obj.get(field)?;
+        self.extract_num(heap_id)
+    }
+
+    /// Extract player summary from a player object
+    fn extract_player_summary(&self, player_heap_id: HeapId) -> Option<PlayerSummary> {
+        let player = match self.load(player_heap_id) {
+            HeapValue::ObjectTable(obj) => obj,
+            _ => return None,
+        };
+
+        let x = self.extract_field_num(player, "x")?;
+        let y = self.extract_field_num(player, "y")?;
+
+        // Get spd.x and spd.y
+        let spd_ptr = player.get("spd")?;
+        let spd_heap_id = self.unwrap_pointer(self.load(*spd_ptr))?;
+        let spd = match self.load(spd_heap_id) {
+            HeapValue::ObjectTable(obj) => obj,
+            _ => return None,
+        };
+        let spd_x = self.extract_field_num(spd, "x")?;
+        let spd_y = self.extract_field_num(spd, "y")?;
+
+        Some(PlayerSummary { x, y, spd_x, spd_y })
+    }
+
+    /// Extract player_spawn summary from a player_spawn object
+    fn extract_player_spawn_summary(&self, spawn_heap_id: HeapId) -> Option<PlayerSpawnSummary> {
+        let spawn = match self.load(spawn_heap_id) {
+            HeapValue::ObjectTable(obj) => obj,
+            _ => return None,
+        };
+
+        let x = self.extract_field_num(spawn, "x")?;
+        let y = self.extract_field_num(spawn, "y")?;
+        let state = self.extract_field_num(spawn, "state")?;
+        let delay = self.extract_field_num(spawn, "delay")?;
+
+        Some(PlayerSpawnSummary { x, y, state, delay })
+    }
+
+    /// Get the objects array HeapId (dereferencing the global pointer)
+    fn get_objects_array_id(&self) -> Option<HeapId> {
+        let global_id = self.find_global("objects")?;
+        match self.load(global_id) {
+            HeapValue::Value(Value::Pointer(arr_id)) => Some(*arr_id),
+            _ => None,
+        }
+    }
+
+    /// Extract a full state summary
+    pub fn extract_summary(&self) -> StateSummary {
+        let objects_array_id = self.get_objects_array_id();
+
+        // Count objects
+        let object_count = objects_array_id
+            .and_then(|arr_id| match self.load(arr_id) {
+                HeapValue::ArrayTable(items) => Some(items.len()),
+                _ => None,
+            })
+            .unwrap_or(0);
+
+        // Find player
+        let player = objects_array_id
+            .and_then(|arr_id| {
+                let players = self.find_objects_by_type(arr_id, "player");
+                players.first().copied()
+            })
+            .and_then(|id| self.extract_player_summary(id));
+
+        // Find player_spawn
+        let player_spawn = objects_array_id
+            .and_then(|arr_id| {
+                let spawns = self.find_objects_by_type(arr_id, "player_spawn");
+                spawns.first().copied()
+            })
+            .and_then(|id| self.extract_player_spawn_summary(id));
+
+        StateSummary {
+            object_count,
+            player,
+            player_spawn,
+        }
+    }
+}
+
+/// Extract a state summary from a state
+pub fn extract_state_summary(state: &State) -> StateSummary {
+    StateHelper::new(state).extract_summary()
+}
+
+/// Create a frame dump from a list of states
+/// States are grouped by a simple shape hash (heap length + vector_size for now)
+pub fn create_frame_dump(frame: u32, states: &[State]) -> FrameDump {
+    let total_states = states.len();
+    let total_expanded: usize = states.iter().map(|s| s.vector_size).sum();
+
+    // Group states by a simple shape key (heap_len, vector_size)
+    // In the future, use proper shape extraction
+    let mut groups_map: BTreeMap<(usize, usize), Vec<(usize, StateSummary)>> = BTreeMap::new();
+
+    for (idx, state) in states.iter().enumerate() {
+        let key = (state.heap.len(), state.vector_size);
+        let summary = extract_state_summary(state);
+        groups_map.entry(key).or_default().push((state.vector_size, summary));
+    }
+
+    let groups: Vec<StateGroup> = groups_map
+        .into_iter()
+        .map(|((heap_len, _vec_size), entries)| {
+            use std::hash::{Hash, Hasher};
+            use std::collections::hash_map::DefaultHasher;
+
+            let mut hasher = DefaultHasher::new();
+            heap_len.hash(&mut hasher);
+            let shape_hash = hasher.finish();
+
+            let state_count = entries.len();
+            let expanded_count: usize = entries.iter().map(|(vs, _)| *vs).sum();
+            let summaries: Vec<StateSummary> = entries.into_iter().map(|(_, s)| s).collect();
+
+            StateGroup {
+                shape_hash,
+                state_count,
+                expanded_count,
+                summaries,
+            }
+        })
+        .collect();
+
+    FrameDump {
+        frame,
+        total_states,
+        total_expanded,
+        groups,
+    }
+}
+
+/// Write a frame dump as a JSONL line
+pub fn write_frame_dump_jsonl(dump: &FrameDump, writer: &mut impl std::io::Write) -> std::io::Result<()> {
+    serde_json::to_writer(&mut *writer, dump)?;
+    writeln!(writer)?;
+    Ok(())
+}
+
+/// Helper for navigating and inspecting heap structure
+pub struct StateHelper<'a> {
+    state: &'a State,
+}
+
+impl<'a> StateHelper<'a> {
+    pub fn new(state: &'a State) -> Self {
+        Self { state }
+    }
+
+    /// Get a global variable's heap ID
+    pub fn find_global(&self, name: &str) -> Option<HeapId> {
+        self.state.global_env.get(name).copied()
+    }
+
+    /// Load a heap value
+    pub fn load(&self, id: HeapId) -> &HeapValue {
+        self.state.heap.get(id)
+    }
+
+    /// Load a global as an object table
+    pub fn load_global_object(&self, name: &str) -> Option<&HashMap<String, HeapId>> {
+        let id = self.find_global(name)?;
+        match self.load(id) {
+            HeapValue::ObjectTable(table) => Some(table),
+            _ => None,
+        }
+    }
+
+    /// Load a global as an array table
+    pub fn load_global_array(&self, name: &str) -> Option<&Vec<HeapId>> {
+        let id = self.find_global(name)?;
+        match self.load(id) {
+            HeapValue::ArrayTable(items) => Some(items),
+            _ => None,
+        }
+    }
+
+    /// Get a pointer from a heap value (unwrap Value::Pointer)
+    pub fn unwrap_pointer(&self, value: &HeapValue) -> Option<HeapId> {
+        match value {
+            HeapValue::Value(Value::Pointer(id)) => Some(*id),
+            _ => None,
+        }
+    }
+
+    /// Find objects in an array table that have a specific type
+    pub fn find_objects_by_type(&self, array_id: HeapId, type_name: &str) -> Vec<HeapId> {
+        let items = match self.load(array_id) {
+            HeapValue::ArrayTable(items) => items,
+            _ => return vec![],
+        };
+
+        // Get the type function's heap ID by dereferencing the global
+        let global_type_target = self.find_global(type_name)
+            .and_then(|global_heap_id| match self.load(global_heap_id) {
+                HeapValue::Value(Value::Pointer(target_id)) => Some(*target_id),
+                _ => None,
+            });
+
+        let global_type_target = match global_type_target {
+            Some(id) => id,
+            None => return vec![],
+        };
+
+        let mut results = Vec::new();
+        for item_ptr in items {
+            if let HeapValue::Value(Value::Pointer(obj_id)) = self.load(*item_ptr) {
+                if let HeapValue::ObjectTable(obj) = self.load(*obj_id) {
+                    if let Some(type_ptr) = obj.get("type") {
+                        if let HeapValue::Value(Value::Pointer(type_heap_id)) = self.load(*type_ptr) {
+                            // Check if this matches our type
+                            if *type_heap_id == global_type_target {
+                                results.push(*obj_id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        results
+    }
+}
+
+/// Marks to apply when making state abstract
+pub struct HeapMarks {
+    /// Map from mark name to set of heap IDs that should get that mark
+    pub marks: HashMap<String, HashSet<HeapId>>,
+}
+
+impl HeapMarks {
+    pub fn new() -> Self {
+        Self {
+            marks: HashMap::new(),
+        }
+    }
+
+    pub fn add_mark(&mut self, mark_name: &str, heap_id: HeapId) {
+        self.marks
+            .entry(mark_name.to_string())
+            .or_insert_with(HashSet::new)
+            .insert(heap_id);
+    }
+}
+
+/// Mark heap locations that should be made abstract.
+/// Currently marks player.rem.x and player.rem.y as "player_rem_xy".
+pub fn mark_heap(state: &State) -> HeapMarks {
+    let mut marks = HeapMarks::new();
+    let helper = StateHelper::new(state);
+
+    // Find player objects
+    if let Some(objects_array_id) = helper.find_global("objects") {
+        for player_heap_id in helper.find_objects_by_type(objects_array_id, "player") {
+            if let HeapValue::ObjectTable(player) = helper.load(player_heap_id) {
+                // Get player.rem
+                if let Some(rem_ptr) = player.get("rem") {
+                    if let Some(rem_heap_id) = helper.unwrap_pointer(helper.load(*rem_ptr)) {
+                        if let HeapValue::ObjectTable(rem) = helper.load(rem_heap_id) {
+                            // Mark rem.x and rem.y
+                            for key in ["x", "y"] {
+                                if let Some(coord_ptr) = rem.get(key) {
+                                    marks.add_mark("player_rem_xy", *coord_ptr);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    marks
+}
+
+/// Make marked heap values abstract by replacing concrete numbers with intervals.
+/// This is the key function for abstract interpretation - it widens concrete values
+/// to represent uncertainty (e.g., player's sub-pixel position can be anywhere in [-0.5, 0.5)).
+pub fn make_state_abstract(mut state: State) -> State {
+    let marks = mark_heap(&state);
+
+    // The player_rem_xy interval: [-0.5, 0.5)
+    // In Pico-8, 0.5 is 0x8000 in the fractional part
+    let half = Pico8Num::from_parts(0, 0x8000);
+    let neg_half = -half;
+    let half_below = half.next_smallest(); // 0.5 - epsilon
+    let wide_interval = Pico8NumInterval::new(neg_half, half_below);
+
+    // Apply abstractions based on marks
+    if let Some(heap_ids) = marks.marks.get("player_rem_xy") {
+        for &heap_id in heap_ids {
+            let heap_value = state.heap.get(heap_id);
+            if let HeapValue::Value(value) = heap_value {
+                let new_value = match value {
+                    Value::Number(MaybeVector::Scalar(n)) => {
+                        assert!(
+                            wide_interval.contains_number(*n),
+                            "player_rem value {:?} not in expected interval",
+                            n
+                        );
+                        Value::NumberInterval(MaybeVector::Scalar(wide_interval))
+                    }
+                    Value::Number(MaybeVector::Vector(nums)) => {
+                        for n in nums {
+                            assert!(
+                                wide_interval.contains_number(*n),
+                                "player_rem value {:?} not in expected interval",
+                                n
+                            );
+                        }
+                        Value::NumberInterval(MaybeVector::Vector(vec![wide_interval; nums.len()]))
+                    }
+                    Value::NumberInterval(MaybeVector::Scalar(interval)) => {
+                        assert!(
+                            wide_interval.contains_interval(interval),
+                            "player_rem interval {:?} not in expected interval",
+                            interval
+                        );
+                        Value::NumberInterval(MaybeVector::Scalar(wide_interval))
+                    }
+                    Value::NumberInterval(MaybeVector::Vector(intervals)) => {
+                        for interval in intervals {
+                            assert!(
+                                wide_interval.contains_interval(interval),
+                                "player_rem interval {:?} not in expected interval",
+                                interval
+                            );
+                        }
+                        Value::NumberInterval(MaybeVector::Vector(vec![wide_interval; intervals.len()]))
+                    }
+                    other => {
+                        panic!("Unexpected value type for player_rem: {:?}", other);
+                    }
+                };
+                state.heap.set(heap_id, HeapValue::Value(new_value));
+            }
+        }
+    }
+
+    state
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pico8_interval_half() {
+        let half = Pico8Num::from_parts(0, 0x8000);
+        let neg_half = -half;
+        assert_eq!(half + neg_half, Pico8Num::from_i16(0));
+
+        let interval = Pico8NumInterval::new(neg_half, half.next_smallest());
+        assert!(interval.contains_number(Pico8Num::from_i16(0)));
+        assert!(interval.contains_number(Pico8Num::from_parts(0, 0x4000))); // 0.25
+        assert!(interval.contains_number(neg_half));
+        assert!(!interval.contains_number(half)); // 0.5 is not included (we use < 0.5)
+    }
+}

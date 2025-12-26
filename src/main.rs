@@ -3,7 +3,7 @@
 #![allow(unused_variables)]
 
 use anyhow::Result;
-use cart_data::CartData;
+use clap::Parser;
 
 // TODO remove unused dependencies
 #[macro_use(anyhow)]
@@ -18,6 +18,7 @@ mod block_flow;
 mod cart_data;
 mod fixed_point;
 mod frontend;
+mod game_runner;
 mod input;
 mod instruction_flow;
 mod interpreter;
@@ -26,10 +27,151 @@ mod liveness;
 mod pico8_num;
 mod tas;
 
-fn main() -> Result<()> {
-    let current_dir = std::env::current_dir()?;
+#[derive(Parser, Debug)]
+#[command(name = "celeste-rust")]
+#[command(about = "Abstract interpreter for PICO-8 Celeste")]
+struct Args {
+    /// Number of frames to run
+    #[arg(short = 'n', long, default_value_t = 30)]
+    frames: u32,
 
-    let cart_data = CartData::load(current_dir.join("cart"))?;
+    /// Show detailed state info for frames starting at this number
+    #[arg(long, default_value_t = 25)]
+    detail_from: u32,
+
+    /// Show detailed state info for frames up to this number
+    #[arg(long, default_value_t = 27)]
+    detail_to: u32,
+
+    /// Output JSONL file for frame dumps (state summaries)
+    #[arg(long)]
+    dump: Option<String>,
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+    run_game_frames(args.frames, args.detail_from, args.detail_to, args.dump.as_deref())
+}
+
+fn run_game_frames(num_frames: u32, detail_from: u32, detail_to: u32, dump_path: Option<&str>) -> Result<()> {
+    use crate::interpreter::glue::interpret_cfg;
+    use crate::interpreter::inspect::{make_state_abstract, create_frame_dump, write_frame_dump_jsonl};
+    use crate::game_runner::{create_fixed_env_with_game_builtins, create_initial_state_with_builtins};
+    use std::io::BufWriter;
+    use std::fs::File;
+
+    // Load and compile the game
+    let level_3 = std::fs::read_to_string("lua/builtin_level_3.lua")
+        .expect("Failed to read builtin_level_3.lua");
+    let level_4 = std::fs::read_to_string("lua/builtin_level_4.lua")
+        .expect("Failed to read builtin_level_4.lua");
+    let game = std::fs::read_to_string("lua/celeste-minimal.lua")
+        .expect("Failed to read celeste-minimal.lua");
+
+    // Suffix code to call _init
+    let init_suffix = r#"
+_init()
+__reset_button_states()
+"#;
+
+    let full_code = format!("{}\n{}\n{}\n{}\n", level_3, level_4, game, init_suffix);
+
+    let ast = full_moon::parse(&full_code).expect("Failed to parse game code");
+    let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile game");
+
+    let mut fixed_env = create_fixed_env_with_game_builtins();
+    for fun_def in fun_defs {
+        fixed_env.add_fun_def(fun_def);
+    }
+
+    let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+    println!("Running game init...");
+    let start = std::time::Instant::now();
+    let init_result_states =
+        interpret_cfg(cfg, initial_state, &fixed_env).expect("Init interpretation failed");
+    println!("Game init completed in {:?}", start.elapsed());
+    println!("States after init: {}", init_result_states.len());
+
+    // Compile frame code (update + draw + reset buttons)
+    let frame_code = r#"
+_update()
+_draw()
+__reset_button_states()
+"#;
+    let frame_ast = full_moon::parse(frame_code).expect("Failed to parse frame code");
+    let (frame_cfg, frame_fun_defs) = frontend::compile(&frame_ast).expect("Failed to compile frame");
+    assert!(frame_fun_defs.is_empty(), "Frame code should not define new functions");
+
+    let mut states: Vec<_> = init_result_states.into_iter().map(|(s, _)| s).collect();
+
+    // Open dump file if requested
+    let mut dump_writer = dump_path.map(|path| {
+        let file = File::create(path).expect("Failed to create dump file");
+        BufWriter::new(file)
+    });
+
+    // Dump frame 0 (init state)
+    if let Some(ref mut writer) = dump_writer {
+        let dump = create_frame_dump(0, &states);
+        write_frame_dump_jsonl(&dump, writer).expect("Failed to write dump");
+    }
+
+    for frame_num in 1..=num_frames {
+        let expanded_input: usize = states.iter().map(|s| s.vector_size).sum();
+        print!("Frame {}: ", frame_num);
+
+        let start = std::time::Instant::now();
+        let mut new_states = Vec::new();
+
+        for state in states {
+            let result = interpret_cfg(frame_cfg.clone(), state, &fixed_env)
+                .expect("Frame interpretation failed");
+            new_states.extend(result.into_iter().map(|(s, _)| s));
+        }
+
+        // GC and normalize states before vectorization
+        for state in &mut new_states {
+            state.gc();
+        }
+
+        // Make states abstract (widen player.rem to interval)
+        new_states = new_states.into_iter().map(make_state_abstract).collect();
+
+        // Vectorize states to combine states with the same shape
+        new_states = crate::interpreter::vectorize::vectorize_states(new_states);
+
+        let expanded_output: usize = new_states.iter().map(|s| s.vector_size).sum();
+        println!("{} states ({} expanded) in {:?}",
+            new_states.len(), expanded_output, start.elapsed());
+
+        // Show detailed state info for specified frame range
+        if frame_num >= detail_from && frame_num <= detail_to {
+            for (i, state) in new_states.iter().enumerate() {
+                println!("  State {}: vector_size={}, heap_len={}",
+                    i, state.vector_size, state.heap.len());
+            }
+        }
+
+        // Dump frame data
+        if let Some(ref mut writer) = dump_writer {
+            let dump = create_frame_dump(frame_num, &new_states);
+            write_frame_dump_jsonl(&dump, writer).expect("Failed to write dump");
+        }
+
+        states = new_states;
+    }
+
+    // Flush dump file
+    if let Some(ref mut writer) = dump_writer {
+        use std::io::Write;
+        writer.flush().expect("Failed to flush dump file");
+    }
+
+    println!("\nTotal: {} states ({} expanded) after {} frames",
+        states.len(),
+        states.iter().map(|s| s.vector_size).sum::<usize>(),
+        num_frames);
 
     Ok(())
 }
@@ -37,6 +179,11 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game_runner::{
+        create_fixed_env_with_builtins,
+        create_fixed_env_with_game_builtins,
+        create_initial_state_with_builtins,
+    };
     use crate::interpreter::{
         fixed_env::FixedEnv,
         state::State,
@@ -44,363 +191,6 @@ mod tests {
     };
 
     use crate::interpreter::value::MaybeVector;
-    use crate::pico8_num::Pico8Num;
-
-    fn format_scalar_number(n: &crate::pico8_num::Pico8Num) -> String {
-        let whole = n.whole_part_as_i16();
-        let frac = n.fraction_part_as_u16();
-        if frac == 0 {
-            format!("{}", whole)
-        } else {
-            format!("{}.{}", whole, frac)
-        }
-    }
-
-    /// Builtin __print: collects the printed value into the state's prints list
-    fn builtin_print(mut state: State, args: Vec<Value>) -> anyhow::Result<Vec<(State, Value)>> {
-        let printed = if args.is_empty() {
-            "".to_string()
-        } else {
-            match &args[0] {
-                Value::String(s) => s.clone(),
-                Value::Number(MaybeVector::Scalar(n)) => format_scalar_number(n),
-                Value::Number(MaybeVector::Vector(nums)) => {
-                    let inner: Vec<String> = nums.iter().map(format_scalar_number).collect();
-                    format!("V[{}]", inner.join(", "))
-                }
-                Value::Bool(MaybeVector::Scalar(b)) => {
-                    if *b {
-                        "true".to_string()
-                    } else {
-                        "false".to_string()
-                    }
-                }
-                Value::Bool(MaybeVector::Vector(bools)) => {
-                    let inner: Vec<String> = bools.iter()
-                        .map(|b| if *b { "true".to_string() } else { "false".to_string() })
-                        .collect();
-                    format!("V[{}]", inner.join(", "))
-                }
-                Value::Nil(_) => "nil".to_string(),
-                other => format!("{:?}", other),
-            }
-        };
-        state.prints.push(printed);
-        Ok(vec![(state, Value::Nil(None))])
-    }
-
-    /// Builtin add: adds a value to the end of an array table
-    /// In Lua: function add(t, v) t[#t + 1] = v end
-    fn builtin_add(mut state: State, args: Vec<Value>) -> anyhow::Result<Vec<(State, Value)>> {
-        if args.len() != 2 {
-            return Err(anyhow!("add requires 2 arguments"));
-        }
-        let table_heap_id = match &args[0] {
-            Value::Pointer(heap_id) => *heap_id,
-            _ => return Err(anyhow!("add: first argument must be a table")),
-        };
-        let value = args[1].clone();
-
-        // Allocate a new heap slot for the value
-        let value_heap_id = state.heap.alloc();
-        state
-            .heap
-            .set(value_heap_id, HeapValue::Value(value));
-
-        // Get the table and add the value
-        match state.heap.get_mut(table_heap_id) {
-            HeapValue::ArrayTable(items) => {
-                items.push(value_heap_id);
-            }
-            HeapValue::UnknownTable => {
-                // Convert unknown table to array table
-                state.heap.set(
-                    table_heap_id,
-                    HeapValue::ArrayTable(vec![value_heap_id]),
-                );
-            }
-            other => return Err(anyhow!("add: first argument is not an array table: {:?}", other)),
-        }
-
-        Ok(vec![(state, Value::Nil(None))])
-    }
-
-    /// Builtin __new_unknown_boolean: returns an unknown boolean (could be either true or false)
-    fn builtin_new_unknown_boolean(state: State, args: Vec<Value>) -> anyhow::Result<Vec<(State, Value)>> {
-        if !args.is_empty() {
-            return Err(anyhow!("__new_unknown_boolean takes no arguments"));
-        }
-        Ok(vec![(state, Value::UnknownBool)])
-    }
-
-    /// Builtin __new_vector: creates a vector from an array table
-    fn builtin_new_vector(state: State, args: Vec<Value>) -> anyhow::Result<Vec<(State, Value)>> {
-        if args.len() != 1 {
-            return Err(anyhow!("__new_vector requires 1 argument"));
-        }
-        let table_heap_id = match &args[0] {
-            Value::Pointer(heap_id) => *heap_id,
-            _ => return Err(anyhow!("__new_vector: argument must be a table")),
-        };
-
-        let item_heap_ids = match state.heap.get(table_heap_id) {
-            HeapValue::ArrayTable(items) => items.clone(),
-            _ => return Err(anyhow!("__new_vector: argument must be an array table")),
-        };
-
-        if item_heap_ids.is_empty() {
-            return Err(anyhow!("Cannot make a vector with no values"));
-        }
-
-        // Collect values and determine the type
-        let mut numbers: Vec<crate::pico8_num::Pico8Num> = Vec::new();
-        for heap_id in item_heap_ids {
-            match state.heap.get(heap_id) {
-                HeapValue::Value(Value::Number(MaybeVector::Scalar(n))) => {
-                    numbers.push(*n);
-                }
-                other => {
-                    return Err(anyhow!(
-                        "__new_vector: all values must be scalar numbers, got {:?}",
-                        other
-                    ))
-                }
-            }
-        }
-
-        Ok(vec![(state, Value::Number(MaybeVector::Vector(numbers)))])
-    }
-
-    /// Builtin flr: floor function (Pico-8)
-    fn builtin_flr(state: State, args: Vec<Value>) -> anyhow::Result<Vec<(State, Value)>> {
-        if args.len() != 1 {
-            return Err(anyhow!("flr requires 1 argument"));
-        }
-        match &args[0] {
-            Value::Number(nums) => {
-                let result = nums.map(|n| n.flr());
-                Ok(vec![(state, Value::Number(result))])
-            }
-            _ => Err(anyhow!("flr: argument must be a number")),
-        }
-    }
-
-    /// Builtin __split_by_flr: splits values by their floor
-    /// For abstract interpretation, this would split number intervals into
-    /// separate ranges by floor value. For concrete numbers, it just returns the value.
-    /// For vectors, it groups elements by floor and produces separate states.
-    fn builtin_split_by_flr(state: State, args: Vec<Value>) -> anyhow::Result<Vec<(State, Value)>> {
-        use std::collections::BTreeMap;
-
-        if args.len() != 1 {
-            return Err(anyhow!("__split_by_flr requires 1 argument"));
-        }
-
-        match &args[0] {
-            Value::Number(MaybeVector::Scalar(n)) => {
-                // For a single scalar number, there's only one floor value,
-                // so just return the state unchanged
-                Ok(vec![(state, Value::Number(MaybeVector::Scalar(*n)))])
-            }
-            Value::Number(MaybeVector::Vector(nums)) => {
-                // Group vector elements by their floor value
-                // Each group becomes a separate state
-                let mut by_floor: BTreeMap<Pico8Num, Vec<(usize, Pico8Num)>> = BTreeMap::new();
-                for (i, n) in nums.iter().enumerate() {
-                    let floor = n.flr();
-                    by_floor.entry(floor).or_default().push((i, *n));
-                }
-
-                // Create a separate state for each floor group
-                let mut results = Vec::new();
-                for (_floor, group) in by_floor {
-                    // Build a mask for which elements are in this group
-                    let mask: Vec<bool> = (0..nums.len())
-                        .map(|i| group.iter().any(|(gi, _)| *gi == i))
-                        .collect();
-
-                    // Filter the state's values by this mask
-                    let filtered_state = state.filter_by_mask(&mask);
-
-                    // Create the result value for this group
-                    let result_nums: Vec<Pico8Num> = group.into_iter().map(|(_, n)| n).collect();
-                    let result_value = if result_nums.len() == 1 {
-                        Value::Number(MaybeVector::Scalar(result_nums[0]))
-                    } else {
-                        Value::Number(MaybeVector::Vector(result_nums))
-                    };
-
-                    results.push((filtered_state, result_value));
-                }
-
-                Ok(results)
-            }
-            _ => Err(anyhow!("__split_by_flr: argument must be a number")),
-        }
-    }
-
-    /// Builtin error: throws an error (crashes the interpreter)
-    fn builtin_error(_state: State, args: Vec<Value>) -> anyhow::Result<Vec<(State, Value)>> {
-        match args.as_slice() {
-            [] => Err(anyhow!("error called")),
-            [Value::String(s)] => Err(anyhow!("error called: {}", s)),
-            _ => Err(anyhow!("error: wrong arguments")),
-        }
-    }
-
-    /// Builtin min: minimum of two numbers
-    fn builtin_min(state: State, args: Vec<Value>) -> anyhow::Result<Vec<(State, Value)>> {
-        if args.len() != 2 {
-            return Err(anyhow!("min requires 2 arguments"));
-        }
-        match (&args[0], &args[1]) {
-            (Value::Number(a), Value::Number(b)) => {
-                let result = MaybeVector::map2(a, b, |a, b| (*a).min(*b));
-                Ok(vec![(state, Value::Number(result))])
-            }
-            _ => Err(anyhow!("min: arguments must be numbers")),
-        }
-    }
-
-    /// Builtin max: maximum of two numbers
-    fn builtin_max(state: State, args: Vec<Value>) -> anyhow::Result<Vec<(State, Value)>> {
-        if args.len() != 2 {
-            return Err(anyhow!("max requires 2 arguments"));
-        }
-        match (&args[0], &args[1]) {
-            (Value::Number(a), Value::Number(b)) => {
-                let result = MaybeVector::map2(a, b, |a, b| (*a).max(*b));
-                Ok(vec![(state, Value::Number(result))])
-            }
-            _ => Err(anyhow!("max: arguments must be numbers")),
-        }
-    }
-
-    /// Builtin abs: absolute value
-    fn builtin_abs(state: State, args: Vec<Value>) -> anyhow::Result<Vec<(State, Value)>> {
-        if args.len() != 1 {
-            return Err(anyhow!("abs requires 1 argument"));
-        }
-        match &args[0] {
-            Value::Number(nums) => {
-                let result = nums.map(|n| n.abs());
-                Ok(vec![(state, Value::Number(result))])
-            }
-            _ => Err(anyhow!("abs: argument must be a number")),
-        }
-    }
-
-    /// Builtin __array_table_drop_last: removes the last element from an array table
-    fn builtin_array_table_drop_last(mut state: State, args: Vec<Value>) -> anyhow::Result<Vec<(State, Value)>> {
-        if args.len() != 1 {
-            return Err(anyhow!("__array_table_drop_last requires 1 argument"));
-        }
-        let table_heap_id = match &args[0] {
-            Value::Pointer(heap_id) => *heap_id,
-            _ => return Err(anyhow!("__array_table_drop_last: argument must be a table")),
-        };
-
-        match state.heap.get_mut(table_heap_id) {
-            HeapValue::ArrayTable(items) => {
-                if items.is_empty() {
-                    return Err(anyhow!("Cannot drop last element of empty array table"));
-                }
-                items.pop();
-            }
-            _ => return Err(anyhow!("__array_table_drop_last: expected array table")),
-        }
-
-        Ok(vec![(state, Value::Nil(None))])
-    }
-
-    /// Create mget builtin with cart data
-    fn make_builtin_mget(
-        cart_data: std::sync::Arc<cart_data::CartData>,
-    ) -> impl Fn(State, Vec<Value>) -> anyhow::Result<Vec<(State, Value)>> {
-        move |state: State, args: Vec<Value>| {
-            if args.len() != 2 {
-                return Err(anyhow!("mget requires 2 arguments"));
-            }
-            match (&args[0], &args[1]) {
-                (Value::Number(x), Value::Number(y)) => {
-                    let result = MaybeVector::map2(x, y, |x, y| {
-                        Pico8Num::from_i16(cart_data.mget(*x, *y).expect("mget failed") as i16)
-                    });
-                    Ok(vec![(state, Value::Number(result))])
-                }
-                _ => Err(anyhow!("mget: arguments must be numbers")),
-            }
-        }
-    }
-
-    /// Create fget builtin with cart data
-    fn make_builtin_fget(
-        cart_data: std::sync::Arc<cart_data::CartData>,
-    ) -> impl Fn(State, Vec<Value>) -> anyhow::Result<Vec<(State, Value)>> {
-        move |state: State, args: Vec<Value>| {
-            if args.len() != 2 {
-                return Err(anyhow!("fget requires 2 arguments"));
-            }
-            match (&args[0], &args[1]) {
-                (Value::Number(i), Value::Number(b)) => {
-                    let result = MaybeVector::map2(i, b, |i, b| {
-                        cart_data.fget(*i, *b).expect("fget failed")
-                    });
-                    Ok(vec![(state, Value::Bool(result))])
-                }
-                _ => Err(anyhow!("fget: arguments must be numbers")),
-            }
-        }
-    }
-
-    fn create_fixed_env_with_builtins() -> FixedEnv {
-        let mut fixed_env = FixedEnv::new();
-        // Level 1 builtins
-        fixed_env.add_builtin("__print", builtin_print);
-        fixed_env.add_builtin("__new_unknown_boolean", builtin_new_unknown_boolean);
-        fixed_env.add_builtin("__new_vector", builtin_new_vector);
-        fixed_env.add_builtin("__array_table_drop_last", builtin_array_table_drop_last);
-        // Level 2 builtins
-        fixed_env.add_builtin("error", builtin_error);
-        fixed_env.add_builtin("min", builtin_min);
-        fixed_env.add_builtin("max", builtin_max);
-        fixed_env.add_builtin("abs", builtin_abs);
-        fixed_env.add_builtin("flr", builtin_flr);
-        fixed_env.add_builtin("__split_by_flr", builtin_split_by_flr);
-        // Level 3 builtins (implemented in Lua, but add as Rust for test convenience)
-        fixed_env.add_builtin("add", builtin_add);
-        fixed_env.add_builtin("print", builtin_print);
-        fixed_env
-    }
-
-    fn create_fixed_env_with_game_builtins() -> FixedEnv {
-        let mut fixed_env = create_fixed_env_with_builtins();
-
-        // Level 5 builtins (cart data)
-        let cart_data =
-            std::sync::Arc::new(cart_data::CartData::load("cart").expect("Failed to load cart data"));
-        fixed_env.add_builtin("mget", make_builtin_mget(cart_data.clone()));
-        fixed_env.add_builtin("fget", make_builtin_fget(cart_data));
-
-        fixed_env
-    }
-
-    fn create_initial_state_with_builtins(fixed_env: &FixedEnv) -> State {
-        let mut state = State::new();
-
-        // Add builtin functions to global_env
-        // In the OCaml code, builtins are stored in the heap and their names are in the global scope
-        for name in fixed_env.builtin_funs.keys() {
-            let heap_id = state.heap.alloc();
-            state
-                .heap
-                .set(heap_id, HeapValue::BuiltinFun(name.clone()));
-            state.global_env.insert(name.clone(), heap_id);
-        }
-
-        state
-    }
-
     #[test]
     fn test_parse_hello_world() {
         let code = r#"__print("walrus")"#;
@@ -2186,80 +1976,8 @@ __reset_button_states()
 
     #[test]
     fn test_run_celeste_game_frame() {
-        use crate::interpreter::glue::interpret_cfg;
-
-        // Load and compile the game
-        let level_3 = std::fs::read_to_string("lua/builtin_level_3.lua")
-            .expect("Failed to read builtin_level_3.lua");
-        let level_4 = std::fs::read_to_string("lua/builtin_level_4.lua")
-            .expect("Failed to read builtin_level_4.lua");
-        let game = std::fs::read_to_string("lua/celeste-minimal.lua")
-            .expect("Failed to read celeste-minimal.lua");
-
-        // Suffix code to call _init
-        let init_suffix = r#"
-_init()
-__reset_button_states()
-"#;
-
-        let full_code = format!("{}\n{}\n{}\n{}\n", level_3, level_4, game, init_suffix);
-
-        let ast = full_moon::parse(&full_code).expect("Failed to parse game code");
-        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile game");
-
-        let mut fixed_env = create_fixed_env_with_game_builtins();
-        for fun_def in fun_defs {
-            fixed_env.add_fun_def(fun_def);
-        }
-
-        let initial_state = create_initial_state_with_builtins(&fixed_env);
-
-        println!("Running game init...");
-        let start = std::time::Instant::now();
-        let init_result_states =
-            interpret_cfg(cfg, initial_state, &fixed_env).expect("Init interpretation failed");
-        println!("Game init completed in {:?}", start.elapsed());
-        println!("States after init: {}", init_result_states.len());
-
-        // Compile frame code (update + draw + reset buttons)
-        let frame_code = r#"
-_update()
-_draw()
-__reset_button_states()
-"#;
-        let frame_ast = full_moon::parse(frame_code).expect("Failed to parse frame code");
-        let (frame_cfg, frame_fun_defs) = frontend::compile(&frame_ast).expect("Failed to compile frame");
-        assert!(frame_fun_defs.is_empty(), "Frame code should not define new functions");
-
-        // Run frames
-        let num_frames = 10;
-        let mut states: Vec<_> = init_result_states.into_iter().map(|(s, _)| s).collect();
-
-        for frame_num in 1..=num_frames {
-            println!("\nFrame {}:", frame_num);
-            let expanded_input: usize = states.iter().map(|s| s.vector_size).sum();
-            println!("  Input states: {} ({} if expanding vectors)", states.len(), expanded_input);
-
-            let start = std::time::Instant::now();
-            let mut new_states = Vec::new();
-
-            for state in states {
-                let result = interpret_cfg(frame_cfg.clone(), state, &fixed_env)
-                    .expect("Frame interpretation failed");
-                new_states.extend(result.into_iter().map(|(s, _)| s));
-            }
-
-            // Vectorize states to combine states with the same shape
-            new_states = crate::interpreter::vectorize::vectorize_states(new_states);
-
-            let expanded_output: usize = new_states.iter().map(|s| s.vector_size).sum();
-            println!("  Output states: {} ({} if expanding vectors)", new_states.len(), expanded_output);
-            println!("  Frame completed in {:?}", start.elapsed());
-
-            states = new_states;
-        }
-
-        assert!(!states.is_empty(), "Should have at least one state after frames");
-        println!("\nTotal states after {} frames: {}", num_frames, states.len());
+        // Run 26 frames (enough to see player spawn at frame 25)
+        // For longer runs, use the binary: cargo run -- -n 30
+        run_game_frames(26, 25, 26, None).expect("Game frames should complete");
     }
 }
