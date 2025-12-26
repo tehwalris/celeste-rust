@@ -109,7 +109,7 @@ impl<'a>
         edge: &(FlowNode, FlowNode),
     ) -> BoundMergedBlockFlow<FlowData, BoundInterpreterFlow<'a>> {
         // TODO
-        let fake_liveness_result = LivenessAnalysisResult {};
+        let fake_liveness_result = LivenessAnalysisResult::all_live();
         // TODO don't unwrap
         BoundMergedBlockFlow::new(
             &self.adapter,
@@ -137,7 +137,7 @@ pub fn interpret_cfg(
 ) -> Result<Vec<(State, Option<Value>)>> {
     let adapter = InterpreterFlowAdapter { fixed_env };
     let (_, labels) = flow_graph_of_cfg(&cfg)?;
-    let fake_liveness = LivenessAnalysisResult {};
+    let fake_liveness = LivenessAnalysisResult::all_live();
 
     // Start with the entry block
     let mut pending_blocks: Vec<(Option<Label>, FlowData)> = vec![(

@@ -838,8 +838,10 @@ impl Compiler {
                 if let Some(expression) = expression {
                     let (rhs_id, _, rhs_stream) =
                         self.compile_rhs_expression(expression, &locals, None)?;
+                    stream.0.extend(rhs_stream.0);
+                    let store_id = self.local_id_generator.next();
                     stream.0.push(StreamElement::Instruction(
-                        lhs_id,
+                        store_id,
                         Instruction::Store {
                             target: lhs_id,
                             source: rhs_id,

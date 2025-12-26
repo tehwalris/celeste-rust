@@ -54,7 +54,8 @@ pub enum BoundInterpreterFlow<'a> {
         phi_instructions: Vec<(LocalId, LocalId)>, // (instruction_local_id, source_local_id)
     },
     BlockBeforeJoin {
-        live_variables: HashSet<LocalId>,
+        /// None means "keep all variables" (used when liveness analysis is not available)
+        live_variables: Option<HashSet<LocalId>>,
     },
     BlockPostPhi {
         fixed_env: &'a FixedEnv,
@@ -110,10 +111,8 @@ impl<'a> UnboundSplitBlockFlow<FlowData, BoundInterpreterFlow<'a>> for Interpret
             .unwrap_or(terminator_local_id);
         let live_variables = liveness
             .get_live_variables(FlowSide::Before, first_non_phi_local_id)
-            .unwrap();
-        Ok(BoundInterpreterFlow::BlockBeforeJoin {
-            live_variables: live_variables.clone(),
-        })
+            .cloned();
+        Ok(BoundInterpreterFlow::BlockBeforeJoin { live_variables })
     }
 
     fn flow_block_post_phi(&self, target_block: &Block) -> Result<BoundInterpreterFlow<'a>> {
@@ -168,9 +167,12 @@ impl<'a> BoundInterpreterFlow<'a> {
                 Ok(FlowData::States(vec![state]))
             }
             Self::BlockBeforeJoin { live_variables } => {
-                state
-                    .local_env
-                    .retain(|local_id| live_variables.contains(&local_id));
+                // Only prune if we have liveness information; None means keep all
+                if let Some(live_variables) = live_variables {
+                    state
+                        .local_env
+                        .retain(|local_id| live_variables.contains(&local_id));
+                }
                 Ok(FlowData::States(vec![state]))
             }
             Self::BlockPostPhi {
