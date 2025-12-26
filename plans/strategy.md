@@ -53,9 +53,10 @@ Widening is always safe: worst case, you over-approximate so much that solving b
 - Key optimizations: input pruning, state pruning, spatial parallelization, compressed state representation
 - **Not viable for other levels**: Hardcoding doesn't scale, correctness is hard to argue when you're not interpreting original Lua
 
-### 2. OCaml Abstract Interpreter
+### 2. OCaml Abstract Interpreter (`frontend_example.ml`)
 
 - General-purpose abstract interpreter that runs the original Lua
+- Entry point: `dune exec ./frontend_example.exe` (not `celeste_ocaml.ml` which is broken)
 - Can run ~30 frames of first room before memory/performance issues
 - Has enough features for most of first room, but full game would need more
 - More principled: interpreting original code makes correctness arguments easier

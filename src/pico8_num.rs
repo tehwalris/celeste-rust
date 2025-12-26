@@ -1,12 +1,13 @@
 // WARNING All the functions in this module are not really tested against pico8.
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use std::{
     fmt,
     ops::{Add, Div, Mul, Neg, Rem, Sub},
 };
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Pico8Num(i32);
 
 impl Pico8Num {
@@ -186,7 +187,7 @@ impl Neg for Pico8Num {
 
 /// Represents an interval [low, high] of Pico8Num values for abstract interpretation.
 /// This is used to track uncertainty in values (e.g., player's sub-pixel position).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Pico8NumInterval {
     pub low: Pico8Num,
     pub high: Pico8Num,

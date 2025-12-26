@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+use std::io::{BufRead, Write};
 
 /// Error type for heap inspection operations
 #[derive(Debug, Clone)]
@@ -541,6 +542,70 @@ pub fn make_state_abstract(mut state: State) -> State {
     state
 }
 
+// ============================================================================
+// Full State Serialization (for debugging)
+// ============================================================================
+
+/// Dump a single state to JSON string
+pub fn state_to_json(state: &State) -> serde_json::Result<String> {
+    serde_json::to_string(state)
+}
+
+/// Dump a single state to pretty JSON string
+pub fn state_to_json_pretty(state: &State) -> serde_json::Result<String> {
+    serde_json::to_string_pretty(state)
+}
+
+/// Load a state from JSON string
+pub fn state_from_json(json: &str) -> serde_json::Result<State> {
+    serde_json::from_str(json)
+}
+
+/// Dump multiple states to JSONL (one state per line)
+pub fn states_to_jsonl(states: &[State], writer: &mut impl std::io::Write) -> std::io::Result<()> {
+    for state in states {
+        serde_json::to_writer(&mut *writer, state)?;
+        writeln!(writer)?;
+    }
+    Ok(())
+}
+
+/// Load multiple states from JSONL
+pub fn states_from_jsonl(reader: impl std::io::BufRead) -> std::io::Result<Vec<State>> {
+    let mut states = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let state: State = serde_json::from_str(&line).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+        })?;
+        states.push(state);
+    }
+    Ok(states)
+}
+
+/// Dump states to a JSONL file
+pub fn dump_states_to_file(states: &[State], path: &str) -> std::io::Result<()> {
+    use std::fs::File;
+    use std::io::BufWriter;
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+    states_to_jsonl(states, &mut writer)?;
+    writer.flush()?;
+    Ok(())
+}
+
+/// Load states from a JSONL file
+pub fn load_states_from_file(path: &str) -> std::io::Result<Vec<State>> {
+    use std::fs::File;
+    use std::io::BufReader;
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    states_from_jsonl(reader)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,5 +621,19 @@ mod tests {
         assert!(interval.contains_number(Pico8Num::from_parts(0, 0x4000))); // 0.25
         assert!(interval.contains_number(neg_half));
         assert!(!interval.contains_number(half)); // 0.5 is not included (we use < 0.5)
+    }
+
+    #[test]
+    fn test_state_json_roundtrip() {
+        // Create a simple state
+        let mut state = State::new();
+        state.vector_size = 3;
+
+        // Serialize and deserialize
+        let json = state_to_json(&state).expect("serialization failed");
+        let restored = state_from_json(&json).expect("deserialization failed");
+
+        assert_eq!(state.vector_size, restored.vector_size);
+        assert_eq!(state.heap.len(), restored.heap.len());
     }
 }

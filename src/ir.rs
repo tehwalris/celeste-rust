@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::pico8_num::Pico8Num;
 
-#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
+#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct LocalId(usize);
 
 impl From<LocalId> for usize {
@@ -53,7 +55,7 @@ impl<T: From<String>> UniqueStringGenerator<T> {
     }
 }
 
-#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug)]
+#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug, Serialize, Deserialize)]
 pub struct GlobalId(String);
 
 impl From<String> for GlobalId {

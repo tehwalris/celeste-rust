@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
 use im::HashMap as ImHashMap;
+use serde::{Deserialize, Serialize};
 
 use super::value::HeapValue;
 
-#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
+#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct HeapId(usize);
 
 impl HeapId {
@@ -35,6 +36,33 @@ pub struct Heap {
     new_values: ImHashMap<usize, Option<HeapValue>>,
     /// The next HeapId to allocate
     next_id: usize,
+}
+
+impl Serialize for Heap {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // Serialize as a simple Vec of Option<HeapValue>
+        let values: Vec<Option<HeapValue>> = (0..self.next_id)
+            .map(|i| self.get_opt(HeapId(i)).cloned())
+            .collect();
+        values.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Heap {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let values: Vec<Option<HeapValue>> = Vec::deserialize(deserializer)?;
+        Ok(Heap {
+            old_values: Arc::new(values.clone()),
+            new_values: ImHashMap::new(),
+            next_id: values.len(),
+        })
+    }
 }
 
 impl PartialEq for Heap {

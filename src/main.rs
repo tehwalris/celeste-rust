@@ -29,16 +29,38 @@ struct Args {
     /// Output JSONL file for frame dumps (state summaries)
     #[arg(long)]
     dump: Option<String>,
+
+    /// Dump full states to JSONL file at this frame number
+    #[arg(long)]
+    dump_states_at: Option<u32>,
+
+    /// Output file for full state dump (use with --dump-states-at)
+    #[arg(long)]
+    states_file: Option<String>,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    run_game_frames(args.frames, args.detail_from, args.detail_to, args.dump.as_deref())
+    run_game_frames(
+        args.frames,
+        args.detail_from,
+        args.detail_to,
+        args.dump.as_deref(),
+        args.dump_states_at,
+        args.states_file.as_deref(),
+    )
 }
 
-fn run_game_frames(num_frames: u32, detail_from: u32, detail_to: u32, dump_path: Option<&str>) -> Result<()> {
+fn run_game_frames(
+    num_frames: u32,
+    detail_from: u32,
+    detail_to: u32,
+    dump_path: Option<&str>,
+    dump_states_at: Option<u32>,
+    states_file: Option<&str>,
+) -> Result<()> {
     use crate::interpreter::glue::interpret_cfg;
-    use crate::interpreter::inspect::{make_state_abstract, create_frame_dump, write_frame_dump_jsonl};
+    use crate::interpreter::inspect::{make_state_abstract, create_frame_dump, write_frame_dump_jsonl, dump_states_to_file};
     use crate::game_runner::{create_fixed_env_with_game_builtins, create_initial_state_with_builtins};
     use std::io::BufWriter;
     use std::fs::File;
@@ -140,6 +162,13 @@ __reset_button_states()
         if let Some(ref mut writer) = dump_writer {
             let dump = create_frame_dump(frame_num, &new_states);
             write_frame_dump_jsonl(&dump, writer).expect("Failed to write dump");
+        }
+
+        // Dump full states at specified frame
+        if dump_states_at == Some(frame_num) {
+            let output_path = states_file.unwrap_or("/tmp/states_dump.jsonl");
+            println!("Dumping {} full states to {}", new_states.len(), output_path);
+            dump_states_to_file(&new_states, output_path).expect("Failed to dump states");
         }
 
         states = new_states;
@@ -1961,7 +1990,7 @@ __reset_button_states()
     fn test_run_celeste_game_frame() {
         // Run 26 frames (enough to see player spawn at frame 25)
         // For longer runs, use the binary: cargo run -- -n 30
-        run_game_frames(26, 25, 26, None).expect("Game frames should complete");
+        run_game_frames(26, 25, 26, None, None, None).expect("Game frames should complete");
     }
 
     #[test]

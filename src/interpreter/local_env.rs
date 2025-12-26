@@ -1,4 +1,5 @@
 use im::HashMap as ImHashMap;
+use serde::{Deserialize, Serialize};
 
 use crate::ir::LocalId;
 
@@ -6,7 +7,7 @@ use super::value::Value;
 
 /// A local environment storing local variable bindings.
 /// Uses a persistent HashMap for efficient cloning through structural sharing.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalEnv(ImHashMap<LocalId, Value>);
 
 impl LocalEnv {

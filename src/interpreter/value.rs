@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 
 use itertools::Itertools;
+use serde::{Deserialize, Serialize};
 
 use super::heap::HeapId;
 use crate::{ir::GlobalId, pico8_num::{Pico8Num, Pico8NumInterval}};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MaybeVector<T: std::fmt::Debug + Clone + PartialEq + Eq> {
     Scalar(T),
     // TODO do we want a link to some kind of size provider?
@@ -52,7 +53,7 @@ impl<T: std::fmt::Debug + Clone + PartialEq + Eq> MaybeVector<T> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Value {
     Number(MaybeVector<Pico8Num>),
     NumberInterval(MaybeVector<Pico8NumInterval>),
@@ -103,7 +104,7 @@ impl Value {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HeapValue {
     Value(Value),
     ObjectTable(HashMap<String, HeapId>),

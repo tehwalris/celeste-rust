@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use im::HashMap as ImHashMap;
+use serde::{Deserialize, Serialize};
 
 use super::{
     heap::{Heap, HeapId},
@@ -9,7 +10,7 @@ use super::{
 };
 use crate::ir::LocalId;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct State {
     pub heap: Heap,
     pub local_env: LocalEnv,
