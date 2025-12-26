@@ -184,14 +184,96 @@ mod tests {
         }
     }
 
+    /// Builtin error: throws an error (crashes the interpreter)
+    fn builtin_error(_state: State, args: Vec<Value>) -> anyhow::Result<Vec<(State, Value)>> {
+        match args.as_slice() {
+            [] => Err(anyhow!("error called")),
+            [Value::String(s)] => Err(anyhow!("error called: {}", s)),
+            _ => Err(anyhow!("error: wrong arguments")),
+        }
+    }
+
+    /// Builtin min: minimum of two numbers
+    fn builtin_min(state: State, args: Vec<Value>) -> anyhow::Result<Vec<(State, Value)>> {
+        if args.len() != 2 {
+            return Err(anyhow!("min requires 2 arguments"));
+        }
+        match (&args[0], &args[1]) {
+            (Value::Number(a), Value::Number(b)) => {
+                let result = MaybeVector::map2(a, b, |a, b| (*a).min(*b));
+                Ok(vec![(state, Value::Number(result))])
+            }
+            _ => Err(anyhow!("min: arguments must be numbers")),
+        }
+    }
+
+    /// Builtin max: maximum of two numbers
+    fn builtin_max(state: State, args: Vec<Value>) -> anyhow::Result<Vec<(State, Value)>> {
+        if args.len() != 2 {
+            return Err(anyhow!("max requires 2 arguments"));
+        }
+        match (&args[0], &args[1]) {
+            (Value::Number(a), Value::Number(b)) => {
+                let result = MaybeVector::map2(a, b, |a, b| (*a).max(*b));
+                Ok(vec![(state, Value::Number(result))])
+            }
+            _ => Err(anyhow!("max: arguments must be numbers")),
+        }
+    }
+
+    /// Builtin abs: absolute value
+    fn builtin_abs(state: State, args: Vec<Value>) -> anyhow::Result<Vec<(State, Value)>> {
+        if args.len() != 1 {
+            return Err(anyhow!("abs requires 1 argument"));
+        }
+        match &args[0] {
+            Value::Number(nums) => {
+                let result = nums.map(|n| n.abs());
+                Ok(vec![(state, Value::Number(result))])
+            }
+            _ => Err(anyhow!("abs: argument must be a number")),
+        }
+    }
+
+    /// Builtin __array_table_drop_last: removes the last element from an array table
+    fn builtin_array_table_drop_last(mut state: State, args: Vec<Value>) -> anyhow::Result<Vec<(State, Value)>> {
+        if args.len() != 1 {
+            return Err(anyhow!("__array_table_drop_last requires 1 argument"));
+        }
+        let table_heap_id = match &args[0] {
+            Value::Pointer(heap_id) => *heap_id,
+            _ => return Err(anyhow!("__array_table_drop_last: argument must be a table")),
+        };
+
+        match state.heap.get_mut(table_heap_id) {
+            HeapValue::ArrayTable(items) => {
+                if items.is_empty() {
+                    return Err(anyhow!("Cannot drop last element of empty array table"));
+                }
+                items.pop();
+            }
+            _ => return Err(anyhow!("__array_table_drop_last: expected array table")),
+        }
+
+        Ok(vec![(state, Value::Nil(None))])
+    }
+
     fn create_fixed_env_with_builtins() -> FixedEnv {
         let mut fixed_env = FixedEnv::new();
+        // Level 1 builtins
         fixed_env.add_builtin("__print", builtin_print);
-        fixed_env.add_builtin("print", builtin_print);
-        fixed_env.add_builtin("add", builtin_add);
         fixed_env.add_builtin("__new_unknown_boolean", builtin_new_unknown_boolean);
         fixed_env.add_builtin("__new_vector", builtin_new_vector);
+        fixed_env.add_builtin("__array_table_drop_last", builtin_array_table_drop_last);
+        // Level 2 builtins
+        fixed_env.add_builtin("error", builtin_error);
+        fixed_env.add_builtin("min", builtin_min);
+        fixed_env.add_builtin("max", builtin_max);
+        fixed_env.add_builtin("abs", builtin_abs);
         fixed_env.add_builtin("flr", builtin_flr);
+        // Level 3 builtins (implemented in Lua, but add as Rust for test convenience)
+        fixed_env.add_builtin("add", builtin_add);
+        fixed_env.add_builtin("print", builtin_print);
         fixed_env
     }
 
