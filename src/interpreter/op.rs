@@ -2,7 +2,7 @@ use anyhow::Result;
 
 use super::{
     state::State,
-    value::{MaybeVector, Value},
+    value::{HeapValue, MaybeVector, Value},
 };
 use crate::{
     ir::{BinaryOp, UnaryOp},
@@ -25,7 +25,20 @@ pub fn interpret_unary_op(state: &State, op: UnaryOp, v: &Value) -> Result<Value
             Pico8Num::from_i16(v.len().try_into().unwrap()),
         ))),
         (UnaryOp::Hash, Value::Pointer(heap_id)) => {
-            todo!()
+            match state.heap.get(*heap_id) {
+                HeapValue::ArrayTable(items) => Ok(Value::Number(MaybeVector::Scalar(
+                    Pico8Num::from_i16(items.len().try_into().unwrap()),
+                ))),
+                HeapValue::ObjectTable(_) => {
+                    // In Lua, # on object tables returns 0 (no array part)
+                    Ok(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(0))))
+                }
+                HeapValue::UnknownTable => {
+                    // Empty/unknown tables have length 0
+                    Ok(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(0))))
+                }
+                other => Err(anyhow!("Hash operator on non-table pointer: {:?}", other)),
+            }
         }
         _ => Err(anyhow!("Unsupported unary op: {:?} {:?}", op, v)),
     }

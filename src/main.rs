@@ -74,10 +74,47 @@ mod tests {
         Ok(vec![(state, Value::Nil(None))])
     }
 
+    /// Builtin add: adds a value to the end of an array table
+    /// In Lua: function add(t, v) t[#t + 1] = v end
+    fn builtin_add(mut state: State, args: Vec<Value>) -> anyhow::Result<Vec<(State, Value)>> {
+        if args.len() != 2 {
+            return Err(anyhow!("add requires 2 arguments"));
+        }
+        let table_heap_id = match &args[0] {
+            Value::Pointer(heap_id) => *heap_id,
+            _ => return Err(anyhow!("add: first argument must be a table")),
+        };
+        let value = args[1].clone();
+
+        // Allocate a new heap slot for the value
+        let value_heap_id = state.heap.alloc();
+        state
+            .heap
+            .set(value_heap_id, HeapValue::Value(value));
+
+        // Get the table and add the value
+        match state.heap.get_mut(table_heap_id) {
+            HeapValue::ArrayTable(items) => {
+                items.push(value_heap_id);
+            }
+            HeapValue::UnknownTable => {
+                // Convert unknown table to array table
+                state.heap.set(
+                    table_heap_id,
+                    HeapValue::ArrayTable(vec![value_heap_id]),
+                );
+            }
+            other => return Err(anyhow!("add: first argument is not an array table: {:?}", other)),
+        }
+
+        Ok(vec![(state, Value::Nil(None))])
+    }
+
     fn create_fixed_env_with_builtins() -> FixedEnv {
         let mut fixed_env = FixedEnv::new();
         fixed_env.add_builtin("__print", builtin_print);
         fixed_env.add_builtin("print", builtin_print);
+        fixed_env.add_builtin("add", builtin_add);
         fixed_env
     }
 
@@ -874,6 +911,42 @@ __print(y.c)
         assert_eq!(
             result_states[0].0.prints,
             vec!["1", "7", "hello", "world", "1", "7", "hello", "world"]
+        );
+    }
+
+    #[test]
+    fn test_interpret_tables_array() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // From lua_tests/tables.lua (array part)
+        let code = r#"
+z = {}
+add(z, 1)
+add(z, 7)
+add(z, 'hello')
+__print(z[1])
+__print(z[2])
+__print(z[3])
+z[3] = 'world'
+__print(z[3])
+"#;
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        assert_eq!(result_states.len(), 1);
+        assert_eq!(
+            result_states[0].0.prints,
+            vec!["1", "7", "hello", "world"]
         );
     }
 }
