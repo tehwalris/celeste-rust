@@ -1074,6 +1074,161 @@ __print("end")
     }
 
     #[test]
+    fn test_interpret_for_range_vector_low() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // From lua_tests/for_range_vector_low.lua
+        // Tests for loops with vector start values
+        let code = r#"
+low_values = {}
+add(low_values, 0)
+add(low_values, 1)
+low = __new_vector(low_values)
+
+for i=low,1.5 do
+  __print("low")
+  __print(low)
+  __print("i")
+  __print(i)
+end
+__print("low after loop")
+__print(low)
+"#;
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        // Expected output options from OCaml tests:
+        // Option 1: for vector element 1 (starts at 1, 1 <= 1.5, print and exit loop)
+        //   low, V[0, 1], i, V[0, 1], low after loop, 1
+        // Option 2: for vector element 0 (starts at 0, iterates twice: 0 and 1)
+        //   low, V[0, 1], i, V[0, 1], low, 0, i, 1, low after loop, 0
+
+        let mut output_sets: Vec<Vec<String>> = result_states
+            .iter()
+            .map(|(state, _)| state.prints.clone())
+            .collect();
+        output_sets.sort();
+
+        let mut expected_sets = vec![
+            // Element 1: iterates once (1 <= 1.5)
+            vec![
+                "low".to_string(),
+                "V[0, 1]".to_string(),
+                "i".to_string(),
+                "V[0, 1]".to_string(),
+                "low after loop".to_string(),
+                "1".to_string(),
+            ],
+            // Element 0: iterates twice (0 and 1 both <= 1.5)
+            vec![
+                "low".to_string(),
+                "V[0, 1]".to_string(),
+                "i".to_string(),
+                "V[0, 1]".to_string(),
+                "low".to_string(),
+                "0".to_string(),
+                "i".to_string(),
+                "1".to_string(),
+                "low after loop".to_string(),
+                "0".to_string(),
+            ],
+        ];
+        expected_sets.sort();
+
+        assert_eq!(output_sets, expected_sets);
+    }
+
+    #[test]
+    fn test_interpret_for_range_vector_both() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // From lua_tests/for_range_vector_both.lua
+        // Tests for loops with vector start and end values
+        let code = r#"
+low_values = {}
+add(low_values, 0)
+add(low_values, 1)
+low = __new_vector(low_values)
+
+high_values = {}
+add(high_values, 1.5)
+add(high_values, 1.8)
+high = __new_vector(high_values)
+
+for i=low,high do
+  __print("low")
+  __print(low)
+  __print("i")
+  __print(i)
+end
+__print("low after loop")
+__print(low)
+"#;
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        // Expected output options from OCaml tests:
+        // Option 1: both elements iterate once (low <= high for both)
+        //   low, V[0, 1], i, V[0, 1], low after loop, 1
+        // Option 2: element 0 iterates twice (0 and 1 both <= 1.5)
+        //   low, V[0, 1], i, V[0, 1], low, 0, i, 1, low after loop, 0
+
+        let mut output_sets: Vec<Vec<String>> = result_states
+            .iter()
+            .map(|(state, _)| state.prints.clone())
+            .collect();
+        output_sets.sort();
+
+        let mut expected_sets = vec![
+            // Element 1: iterates once (1 <= 1.8)
+            vec![
+                "low".to_string(),
+                "V[0, 1]".to_string(),
+                "i".to_string(),
+                "V[0, 1]".to_string(),
+                "low after loop".to_string(),
+                "1".to_string(),
+            ],
+            // Element 0: iterates twice (0 and 1 both <= 1.5)
+            vec![
+                "low".to_string(),
+                "V[0, 1]".to_string(),
+                "i".to_string(),
+                "V[0, 1]".to_string(),
+                "low".to_string(),
+                "0".to_string(),
+                "i".to_string(),
+                "1".to_string(),
+                "low after loop".to_string(),
+                "0".to_string(),
+            ],
+        ];
+        expected_sets.sort();
+
+        assert_eq!(output_sets, expected_sets);
+    }
+
+    #[test]
     fn test_interpret_simple_table() {
         use crate::interpreter::glue::interpret_cfg;
 
