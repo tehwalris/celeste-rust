@@ -45,10 +45,13 @@ Widening is always safe: worst case, you over-approximate so much that solving b
 
 ### 1. Old Hardcoded Rust (main branch)
 
-- Rust port of a game subset with exactly one hardcoded branching point
+- Rust port of a game subset with hardcoded game logic (not an interpreter)
 - Actually completed first room and proved existing TAS is optimal
-- Has iterative refinement implemented
-- **Not viable for other levels**: Branching gets nested/complex, hardcoding doesn't scale, and correctness is hard to argue when you're not interpreting original Lua
+- Uses **bidirectional DP** (forward + backward pass), not iterative precision refinement
+- Forward pass: explores all reachable states with 4 rem corner values (not intervals)
+- Backward pass: from goal, marks states that can reach goal; prunes states not on winning paths
+- Key optimizations: input pruning, state pruning, spatial parallelization, compressed state representation
+- **Not viable for other levels**: Hardcoding doesn't scale, correctness is hard to argue when you're not interpreting original Lua
 
 ### 2. OCaml Abstract Interpreter
 
@@ -62,8 +65,13 @@ Widening is always safe: worst case, you over-approximate so much that solving b
 
 - Port of OCaml implementation
 - Goal: Match OCaml semantics but with better performance
-- Currently diverges from OCaml around frame 26 (likely missing features like liveness-based variable removal)
-- No iterative refinement yet
+- Currently doing forward-only abstract interpretation:
+  - Only abstraction: `player.rem.x` and `player.rem.y` → interval `[-0.5, 0.5)` after each frame
+  - Uses `__split_by_flr` to split states by floor value when needed
+  - Vectorization merges same-shape states; deduplication removes identical vector elements
+- State counts at frame 30: ~2141 states (vs old Rust's ~254 positions with ~many states each)
+- Likely has more states than OCaml due to missing features (liveness-based variable removal, better GC)
+- No backward pass yet, no iterative refinement yet
 
 ## Correctness Layers
 
@@ -77,7 +85,14 @@ This is the foundation. Currently likely has bugs and is hard to verify without 
 
 **Property**: When mapping states from precision N+1 to precision N, if a state at N+1 could be on an optimal path, the corresponding state at N must be marked.
 
-Not yet implemented in the abstract interpreter codebases.
+**Full refinement chain** (for a fixed path length):
+1. Forward pass at coarsest abstraction (e.g., fully abstract rem)
+2. Backward pass: mark states that can reach goal
+3. Forward pass at finer abstraction, only exploring states that map to marked coarse states
+4. Backward pass: mark states that can reach goal
+5. Repeat until fully concrete (or state set becomes empty → path length impossible)
+
+This interleaving of forward/backward passes at increasing precision is the key to tractability. Not yet implemented in any abstract interpreter codebase.
 
 ### Layer C: Implementation Correctness (Optimizations)
 
@@ -100,6 +115,15 @@ The biggest blocker is lack of debugging/inspection infrastructure:
 - Viewer for exploring abstract states (heap structure, shapes, values)
 - "Is this concrete state contained in this abstract state?" queries
 - Integration with correctness testing
+
+### State Count / Deduplication Quality
+
+New Rust interpreter has more states than expected at frame 30 (~2141 vs old Rust's ~254 unique positions). This is partly expected (abstract vs concrete), but likely also due to:
+- Missing liveness analysis (dead variables not removed from closures)
+- Less aggressive GC (keeping more heap objects alive)
+- Different shape hashing (may not merge states that should merge)
+
+**TODO**: Compare state counts with OCaml interpreter to understand deduplication quality.
 
 ### Concrete-Abstract Testing Infrastructure
 
