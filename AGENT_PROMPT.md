@@ -27,4 +27,4 @@ Get the actual game running. See `frontend_example.ml` in the OCaml project for 
 
 ## How to Work
 
-Explore the codebase, understand the current state, and make progress. This could mean fixing bugs, implementing missing features, improving code quality, or adding tests.
+Explore the codebase, understand the current state, and make progress. This could mean fixing bugs, implementing missing features, improving code quality, improving performance, or adding tests.
