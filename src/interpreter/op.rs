@@ -90,6 +90,39 @@ pub fn interpret_binary_op(l: &Value, op: BinaryOp, r: &Value) -> Result<Value> 
             Ok(Value::String(format!("{}{}", l.as_i16_or_err()?, r)))
         }
 
+        // Arithmetic operations on numbers
+        (Value::Number(l), BinaryOp::Plus, Value::Number(r)) => {
+            Ok(Value::Number(MaybeVector::map2(l, r, |l, r| *l + *r)))
+        }
+        (Value::Number(l), BinaryOp::Minus, Value::Number(r)) => {
+            Ok(Value::Number(MaybeVector::map2(l, r, |l, r| *l - *r)))
+        }
+        (Value::Number(l), BinaryOp::Star, Value::Number(r)) => {
+            Ok(Value::Number(MaybeVector::map2(l, r, |l, r| *l * *r)))
+        }
+        (Value::Number(l), BinaryOp::Slash, Value::Number(r)) => {
+            Ok(Value::Number(MaybeVector::map2(l, r, |l, r| *l / *r)))
+        }
+        (Value::Number(l), BinaryOp::Percent, Value::Number(r)) => {
+            Ok(Value::Number(MaybeVector::map2(l, r, |l, r| *l % *r)))
+        }
+        // Power operation is not yet implemented
+        // (Value::Number(l), BinaryOp::Caret, Value::Number(r)) => { ... }
+
+        // Comparison operations on numbers
+        (Value::Number(l), BinaryOp::LessThan, Value::Number(r)) => {
+            Ok(Value::Bool(MaybeVector::map2(l, r, |l, r| l < r)))
+        }
+        (Value::Number(l), BinaryOp::GreaterThan, Value::Number(r)) => {
+            Ok(Value::Bool(MaybeVector::map2(l, r, |l, r| l > r)))
+        }
+        (Value::Number(l), BinaryOp::LessThanEqual, Value::Number(r)) => {
+            Ok(Value::Bool(MaybeVector::map2(l, r, |l, r| l <= r)))
+        }
+        (Value::Number(l), BinaryOp::GreaterThanEqual, Value::Number(r)) => {
+            Ok(Value::Bool(MaybeVector::map2(l, r, |l, r| l >= r)))
+        }
+
         _ => Err(anyhow!("Unsupported binary op: {:?} {:?} {:?}", l, op, r)),
     }
 }

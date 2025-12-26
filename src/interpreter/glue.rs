@@ -122,15 +122,19 @@ impl<'a>
     }
 }
 
-use super::state::State;
+use super::{state::State, value::Value};
 use crate::ir::Terminator;
 
 /// Interprets a CFG with the given initial state and fixed environment.
-/// Returns the resulting states after execution.
+/// Returns the resulting states after execution, each with an optional return value.
 ///
 /// This is a simplified interpreter that handles linear CFGs and simple branches.
 /// It doesn't use the full fixed-point analysis machinery.
-pub fn interpret_cfg(cfg: Cfg, initial_state: State, fixed_env: &FixedEnv) -> Result<Vec<State>> {
+pub fn interpret_cfg(
+    cfg: Cfg,
+    initial_state: State,
+    fixed_env: &FixedEnv,
+) -> Result<Vec<(State, Option<Value>)>> {
     let adapter = InterpreterFlowAdapter { fixed_env };
     let (_, labels) = flow_graph_of_cfg(&cfg)?;
     let fake_liveness = LivenessAnalysisResult {};
@@ -140,7 +144,7 @@ pub fn interpret_cfg(cfg: Cfg, initial_state: State, fixed_env: &FixedEnv) -> Re
         None, // None means entry block
         FlowData::States(vec![initial_state]),
     )];
-    let mut results: Vec<State> = vec![];
+    let mut results: Vec<(State, Option<Value>)> = vec![];
 
     while let Some((block_label, flow_data)) = pending_blocks.pop() {
         let block = match &block_label {
@@ -157,16 +161,21 @@ pub fn interpret_cfg(cfg: Cfg, initial_state: State, fixed_env: &FixedEnv) -> Re
         // Handle the terminator
         let (_, terminator) = &block.terminator;
         match terminator {
-            Terminator::Return { value } => {
-                // Collect the resulting states
+            Terminator::Return { value: _ } => {
+                // Collect the resulting states with their return values
                 let bound_return = adapter.flow_return(terminator)?;
                 match bound_return.flow(flow_data)? {
                     FlowData::States(states) => {
-                        results.extend(states);
+                        // No return value
+                        results.extend(states.into_iter().map(|s| (s, None)));
                     }
                     FlowData::StatesAndReturns(states_and_returns) => {
-                        // For returns with values, we just take the states
-                        results.extend(states_and_returns.into_iter().map(|(s, _)| s));
+                        // With return values
+                        results.extend(
+                            states_and_returns
+                                .into_iter()
+                                .map(|(s, v)| (s, Some(v))),
+                        );
                     }
                 }
             }

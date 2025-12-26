@@ -156,7 +156,7 @@ mod tests {
         assert_eq!(result_states.len(), 1);
 
         // Check that "walrus" was printed
-        assert_eq!(result_states[0].prints, vec!["walrus"]);
+        assert_eq!(result_states[0].0.prints, vec!["walrus"]);
     }
 
     #[test]
@@ -191,6 +191,34 @@ greet("bob")
         assert_eq!(result_states.len(), 1);
 
         // Check that "bob" was printed
-        assert_eq!(result_states[0].prints, vec!["bob"]);
+        assert_eq!(result_states[0].0.prints, vec!["bob"]);
+    }
+
+    #[test]
+    fn test_interpret_function_with_return() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        let code = r#"
+function add_one(x)
+    return x + 1
+end
+
+__print(add_one(5))
+"#;
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        assert_eq!(result_states.len(), 1);
+        assert_eq!(result_states[0].0.prints, vec!["6"]);
     }
 }

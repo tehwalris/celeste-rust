@@ -360,7 +360,7 @@ impl<'a> CoreInterpreter<'a> {
                 // 3. Sets the return value at local_id
                 let states = result_states
                     .into_iter()
-                    .map(|function_result_state| {
+                    .map(|(function_result_state, return_value)| {
                         let mut caller_state = State {
                             heap: function_result_state.heap,
                             local_env: self.state.local_env.clone(),
@@ -369,10 +369,10 @@ impl<'a> CoreInterpreter<'a> {
                             prints: function_result_state.prints,
                             vector_size: self.state.vector_size,
                         };
-                        // Functions that don't return a value return nil
-                        caller_state
-                            .local_env
-                            .set(local_id, Value::Nil(Some("no return value".to_string())));
+                        // Set the return value (or nil if none)
+                        let value = return_value
+                            .unwrap_or_else(|| Value::Nil(Some("no return value".to_string())));
+                        caller_state.local_env.set(local_id, value);
                         caller_state
                     })
                     .collect();
