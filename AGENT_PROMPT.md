@@ -2,11 +2,13 @@
 
 You are working on porting an OCaml abstract interpreter to Rust. The goal is running the **100m room** (first room of Celeste Classic) correctly and fast.
 
+The OCaml project is at `~/src/github.com/tehwalris/celeste_ocaml`.
+
 ## Phases
 
 ### Phase 1: All Tests Passing
 
-Port the OCaml Lua tests (`~/src/github.com/tehwalris/celeste_ocaml/lua_tests/`) to Rust and get them all passing. See `lua_tests.ml` for test structure.
+Port all tests from the OCaml project to Rust and get them passing. The OCaml tests are in `lua_tests.ml`.
 
 No `todo!()` should remain in the interpreter when done.
 
@@ -25,16 +27,4 @@ Get the actual game running. See `frontend_example.ml` in the OCaml project for 
 
 ## How to Work
 
-1. Explore the codebase to understand current state
-2. Run `cargo test` to see what's passing/failing
-3. Pick the next blocker and fix it
-4. Verify with tests
-5. Commit and repeat
-
-## OCaml Reference
-
-The OCaml project is at `~/src/github.com/tehwalris/celeste_ocaml`. Key files:
-- `interpreter.ml` - main interpreter
-- `builtin.ml` - builtins
-- `lua_tests.ml` - test harness
-- `frontend_example.ml` - 100m room runner
+Explore the codebase, understand the current state, and make progress. This could mean fixing bugs, implementing missing features, improving code quality, or adding tests.
