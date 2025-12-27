@@ -94,14 +94,6 @@ impl Value {
             _ => self,
         }
     }
-
-    /// Returns true if this value type can be vectorized (combined with other values)
-    pub fn can_vectorize(&self) -> bool {
-        matches!(
-            self,
-            Value::Number(_) | Value::NumberInterval(_) | Value::Bool(_)
-        )
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

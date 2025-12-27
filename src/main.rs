@@ -143,8 +143,17 @@ __reset_button_states()
         // Make states abstract (widen player.rem to interval)
         new_states = new_states.into_iter().map(make_state_abstract).collect();
 
+        let before_vec = new_states.len();
+
         // Vectorize states to combine states with the same shape
         new_states = crate::interpreter::vectorize::vectorize_states(new_states);
+
+        let after_vec = new_states.len();
+        if before_vec != after_vec {
+            let avg_vs: f64 = new_states.iter().map(|s| s.vector_size as f64).sum::<f64>() / new_states.len() as f64;
+            println!("  (vec: {} -> {} states, merged {}, avg_vs={:.1})",
+                before_vec, after_vec, before_vec - after_vec, avg_vs);
+        }
 
         let expanded_output: usize = new_states.iter().map(|s| s.vector_size).sum();
         println!("{} states ({} expanded) in {:?}",

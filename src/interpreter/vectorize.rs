@@ -47,10 +47,8 @@ enum ValueShape {
     // Vectorizable values are normalized to a placeholder
     VectorizableNumber,
     VectorizableNumberInterval,
+    VectorizableBool,
     // Non-vectorizable values keep their actual value for shape comparison
-    // Bool values (scalar or vector) are kept as-is - states with different Bool values have different shapes
-    BoolScalar(bool),
-    BoolVector(Vec<bool>),
     UnknownBool,
     String(String),
     Nil(Option<String>),
@@ -59,36 +57,31 @@ enum ValueShape {
 }
 
 /// Can this value be vectorized (combined with others into a vector)?
-///
-/// Only Number and NumberInterval are vectorizable, matching OCaml's behavior.
-/// Bool and UnknownBool are NOT vectorizable - states with different Bool values
-/// will have different shapes and cannot be merged.
 fn can_vectorize_value(value: &Value) -> bool {
     matches!(
         value,
-        Value::Number(_) | Value::NumberInterval(_)
+        Value::Number(_) | Value::NumberInterval(_) | Value::Bool(_)
     )
 }
 
 fn normalize_value_for_shape(value: &Value) -> ValueShape {
-    if !can_vectorize_value(value) {
+    if can_vectorize_value(value) {
+        match value {
+            Value::Number(_) => ValueShape::VectorizableNumber,
+            Value::NumberInterval(_) => ValueShape::VectorizableNumberInterval,
+            Value::Bool(_) => ValueShape::VectorizableBool,
+            _ => unreachable!(),
+        }
+    } else {
         // Non-vectorizable values keep their identity for shape comparison
         // States with different non-vectorizable values cannot be merged
         match value {
-            Value::Bool(MaybeVector::Scalar(b)) => ValueShape::BoolScalar(*b),
-            Value::Bool(MaybeVector::Vector(bools)) => ValueShape::BoolVector(bools.clone()),
             Value::UnknownBool => ValueShape::UnknownBool,
             Value::String(s) => ValueShape::String(s.clone()),
             Value::Nil(hint) => ValueShape::Nil(hint.clone()),
             Value::Pointer(id) => ValueShape::Pointer(*id),
             Value::NilPointer(s) => ValueShape::NilPointer(s.clone()),
             _ => unreachable!("Should be vectorizable: {:?}", value),
-        }
-    } else {
-        match value {
-            Value::Number(_) => ValueShape::VectorizableNumber,
-            Value::NumberInterval(_) => ValueShape::VectorizableNumberInterval,
-            _ => unreachable!(),
         }
     }
 }
@@ -200,7 +193,7 @@ enum ScalarValue {
 
 impl ScalarValue {
     fn is_vectorizable(&self) -> bool {
-        matches!(self, ScalarValue::Number(_) | ScalarValue::NumberInterval(_))
+        matches!(self, ScalarValue::Number(_) | ScalarValue::NumberInterval(_) | ScalarValue::Bool(_))
     }
 }
 
@@ -252,7 +245,7 @@ fn value_from_scalars(scalars: Vec<ScalarValue>) -> Value {
             ScalarValue::UnknownBool => Value::UnknownBool,
         }
     } else {
-        // Build a vector - only Number and NumberInterval are vectorizable
+        // Build a vector
         match first {
             ScalarValue::Number(_) => {
                 let nums: Vec<Pico8Num> = scalars.into_iter()
@@ -272,8 +265,17 @@ fn value_from_scalars(scalars: Vec<ScalarValue>) -> Value {
                     .collect();
                 Value::NumberInterval(MaybeVector::Vector(nums))
             }
+            ScalarValue::Bool(_) => {
+                let bools: Vec<bool> = scalars.into_iter()
+                    .map(|s| match s {
+                        ScalarValue::Bool(b) => b,
+                        _ => panic!("Mixed types in vector"),
+                    })
+                    .collect();
+                Value::Bool(MaybeVector::Vector(bools))
+            }
             _ => {
-                // Bool, UnknownBool, String, etc. are not vectorizable
+                // UnknownBool, String, etc. are not vectorizable
                 // States with different values should have different shapes and never reach here
                 panic!("Values are not equal and not vectorizable");
             }
@@ -476,8 +478,6 @@ fn dedup_vectorized_state(mut state: State) -> State {
 }
 
 /// Collect all vectorizable vector values from a state for dedup purposes.
-/// Only Number and NumberInterval are vectorizable - Bool vectors are NOT included
-/// since they're not resized during state merging.
 fn collect_vector_values(state: &State) -> Vec<VectorRef> {
     let mut vectors = Vec::new();
 
@@ -491,7 +491,9 @@ fn collect_vector_values(state: &State) -> Vec<VectorRef> {
             HeapValue::Value(Value::NumberInterval(MaybeVector::Vector(v))) => {
                 vectors.push(VectorRef::NumberIntervals(v.clone()));
             }
-            // Bool vectors are NOT collected - they're not vectorizable
+            HeapValue::Value(Value::Bool(MaybeVector::Vector(v))) => {
+                vectors.push(VectorRef::Bools(v.clone()));
+            }
             HeapValue::Closure(_, captures) => {
                 for cap in captures {
                     match cap {
@@ -501,7 +503,9 @@ fn collect_vector_values(state: &State) -> Vec<VectorRef> {
                         Value::NumberInterval(MaybeVector::Vector(v)) => {
                             vectors.push(VectorRef::NumberIntervals(v.clone()));
                         }
-                        // Bool vectors are NOT collected
+                        Value::Bool(MaybeVector::Vector(v)) => {
+                            vectors.push(VectorRef::Bools(v.clone()));
+                        }
                         _ => {}
                     }
                 }
@@ -519,7 +523,9 @@ fn collect_vector_values(state: &State) -> Vec<VectorRef> {
             Value::NumberInterval(MaybeVector::Vector(nums)) => {
                 vectors.push(VectorRef::NumberIntervals(nums.clone()));
             }
-            // Bool vectors are NOT collected
+            Value::Bool(MaybeVector::Vector(bools)) => {
+                vectors.push(VectorRef::Bools(bools.clone()));
+            }
             _ => {}
         }
     }
@@ -534,7 +540,9 @@ fn collect_vector_values(state: &State) -> Vec<VectorRef> {
                 Value::NumberInterval(MaybeVector::Vector(nums)) => {
                     vectors.push(VectorRef::NumberIntervals(nums.clone()));
                 }
-                // Bool vectors are NOT collected
+                Value::Bool(MaybeVector::Vector(bools)) => {
+                    vectors.push(VectorRef::Bools(bools.clone()));
+                }
                 _ => {}
             }
         }
@@ -547,12 +555,14 @@ fn collect_vector_values(state: &State) -> Vec<VectorRef> {
 enum VectorRef {
     Numbers(Vec<Pico8Num>),
     NumberIntervals(Vec<Pico8NumInterval>),
+    Bools(Vec<bool>),
 }
 
 fn scalar_at_index(vec: &VectorRef, index: usize) -> ScalarValue {
     match vec {
         VectorRef::Numbers(nums) => ScalarValue::Number(nums[index]),
         VectorRef::NumberIntervals(nums) => ScalarValue::NumberInterval(nums[index]),
+        VectorRef::Bools(bools) => ScalarValue::Bool(bools[index]),
     }
 }
 
@@ -579,12 +589,10 @@ fn unvectorize_if_possible(mut state: State) -> State {
 }
 
 /// Assert that all vectorizable vector values in a state have the correct length.
-/// Only checks Number and NumberInterval vectors - Bool vectors are NOT checked
-/// since they're not vectorizable and can have different lengths after state merging.
 fn assert_state_vector_lengths(state: &State) {
     let expected_len = state.vector_size;
 
-    // Check heap - only Number and NumberInterval are vectorizable
+    // Check heap
     for i in 0..state.heap.len() {
         let id = HeapId::from_raw(i);
         match state.heap.get(id) {
@@ -594,7 +602,9 @@ fn assert_state_vector_lengths(state: &State) {
             HeapValue::Value(Value::NumberInterval(MaybeVector::Vector(v))) => {
                 assert_eq!(v.len(), expected_len, "Vector length mismatch in heap (number intervals)");
             }
-            // Bool vectors are NOT checked - they're not vectorizable
+            HeapValue::Value(Value::Bool(MaybeVector::Vector(v))) => {
+                assert_eq!(v.len(), expected_len, "Vector length mismatch in heap (bools)");
+            }
             HeapValue::Closure(_, captures) => {
                 for cap in captures {
                     match cap {
@@ -604,7 +614,9 @@ fn assert_state_vector_lengths(state: &State) {
                         Value::NumberInterval(MaybeVector::Vector(v)) => {
                             assert_eq!(v.len(), expected_len, "Vector length mismatch in closure (number intervals)");
                         }
-                        // Bool vectors are NOT checked
+                        Value::Bool(MaybeVector::Vector(v)) => {
+                            assert_eq!(v.len(), expected_len, "Vector length mismatch in closure (bools)");
+                        }
                         _ => {}
                     }
                 }
@@ -613,7 +625,7 @@ fn assert_state_vector_lengths(state: &State) {
         }
     }
 
-    // Check local_env - only Number and NumberInterval
+    // Check local_env
     for (_, v) in state.local_env.iter() {
         match v {
             Value::Number(MaybeVector::Vector(vec)) => {
@@ -622,12 +634,14 @@ fn assert_state_vector_lengths(state: &State) {
             Value::NumberInterval(MaybeVector::Vector(vec)) => {
                 assert_eq!(vec.len(), expected_len, "Vector length mismatch in local_env (number intervals)");
             }
-            // Bool vectors are NOT checked
+            Value::Bool(MaybeVector::Vector(vec)) => {
+                assert_eq!(vec.len(), expected_len, "Vector length mismatch in local_env (bools)");
+            }
             _ => {}
         }
     }
 
-    // Check outer_local_envs - only Number and NumberInterval
+    // Check outer_local_envs
     for env in &state.outer_local_envs {
         for (_, v) in env.iter() {
             match v {
@@ -637,7 +651,9 @@ fn assert_state_vector_lengths(state: &State) {
                 Value::NumberInterval(MaybeVector::Vector(nums)) => {
                     assert_eq!(nums.len(), expected_len, "Vector length mismatch in outer_local_env (number intervals)");
                 }
-                // Bool vectors are NOT checked
+                Value::Bool(MaybeVector::Vector(bools)) => {
+                    assert_eq!(bools.len(), expected_len, "Vector length mismatch in outer_local_env (bools)");
+                }
                 _ => {}
             }
         }
@@ -685,6 +701,63 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interpreter::inspect::load_states_from_file;
+
+    #[test]
+    fn test_vectorize_real_states() {
+        // Load states that Python analysis says should merge
+        let states = match load_states_from_file("/tmp/test_merge_states.jsonl") {
+            Ok(s) => s,
+            Err(_) => {
+                println!("Skipping test - no test file");
+                return;
+            }
+        };
+
+        println!("Loaded {} states", states.len());
+        for (i, s) in states.iter().enumerate() {
+            println!("  State {}: vector_size={}, heap_len={}", i, s.vector_size, s.heap.len());
+        }
+
+        // Get shapes
+        let shape1 = shape_of_state(&states[0]);
+        let shape2 = shape_of_state(&states[1]);
+
+        println!("\nShapes equal: {}", shape1 == shape2);
+
+        if shape1 != shape2 {
+            // Find where they differ
+            println!("Heap structure lengths: {} vs {}",
+                shape1.heap_structure.len(), shape2.heap_structure.len());
+
+            for (i, (a, b)) in shape1.heap_structure.iter()
+                .zip(shape2.heap_structure.iter()).enumerate() {
+                if a != b {
+                    println!("  Differ at heap[{}]:", i);
+                    println!("    s1: {:?}", a);
+                    println!("    s2: {:?}", b);
+                    if i > 3 { break; }  // Just show first few
+                }
+            }
+
+            println!("\nLocal env: {:?} vs {:?}",
+                shape1.local_env_structure.len(), shape2.local_env_structure.len());
+            println!("Outer envs: {:?} vs {:?}",
+                shape1.outer_local_envs_structure.len(), shape2.outer_local_envs_structure.len());
+            println!("Global env: {} vs {}",
+                shape1.global_env.len(), shape2.global_env.len());
+            println!("Prints: {:?} vs {:?}", shape1.prints, shape2.prints);
+        }
+
+        // Try vectorizing
+        let vectorized = vectorize_states(states.clone());
+        println!("\nAfter vectorization: {} states", vectorized.len());
+
+        // If they didn't merge, that's a bug
+        if states.len() == 2 && vectorized.len() == 2 && shape1 != shape2 {
+            panic!("States have different shapes but Python says they should merge!");
+        }
+    }
 
     #[test]
     fn test_vectorize_two_scalar_states() {
@@ -733,5 +806,148 @@ mod tests {
             HeapValue::Value(Value::Number(MaybeVector::Scalar(_))) => {}
             _ => panic!("Expected scalar after dedup"),
         }
+    }
+
+    #[test]
+    fn test_dedup_row_level() {
+        // Test that dedup works at row level, not column level
+        // State 1: x=1, y=10
+        // State 2: x=2, y=20
+        // State 3: x=1, y=10 (duplicate of state 1)
+        // After merge+dedup: x=[1,2], y=[10,20] (not x=[1,2,1], y=[10,20,10])
+
+        let mut state1 = State::new();
+        state1.vector_size = 1;
+        let x1 = state1.heap.alloc();
+        let y1 = state1.heap.alloc();
+        state1.heap.set(x1, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(1)))));
+        state1.heap.set(y1, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(10)))));
+
+        let mut state2 = State::new();
+        state2.vector_size = 1;
+        let x2 = state2.heap.alloc();
+        let y2 = state2.heap.alloc();
+        state2.heap.set(x2, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(2)))));
+        state2.heap.set(y2, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(20)))));
+
+        let mut state3 = State::new();
+        state3.vector_size = 1;
+        let x3 = state3.heap.alloc();
+        let y3 = state3.heap.alloc();
+        state3.heap.set(x3, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(1)))));
+        state3.heap.set(y3, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(10)))));
+
+        let result = vectorize_states(vec![state1, state2, state3]);
+        assert_eq!(result.len(), 1);
+        let state = &result[0];
+        assert_eq!(state.vector_size, 2, "Should have 2 unique rows, not 3");
+
+        // Verify the values
+        match state.heap.get(HeapId::from_raw(0)) {
+            HeapValue::Value(Value::Number(MaybeVector::Vector(nums))) => {
+                assert_eq!(nums.len(), 2);
+            }
+            _ => panic!("Expected vector for x"),
+        }
+        match state.heap.get(HeapId::from_raw(1)) {
+            HeapValue::Value(Value::Number(MaybeVector::Vector(nums))) => {
+                assert_eq!(nums.len(), 2);
+            }
+            _ => panic!("Expected vector for y"),
+        }
+    }
+
+    #[test]
+    fn test_dedup_partial_overlap() {
+        // State 1: x=1, y=10
+        // State 2: x=1, y=20  (same x, different y - NOT a duplicate)
+        // State 3: x=2, y=10  (different x, same y - NOT a duplicate)
+        // After merge+dedup: should have all 3 unique rows
+
+        let mut state1 = State::new();
+        state1.vector_size = 1;
+        let x1 = state1.heap.alloc();
+        let y1 = state1.heap.alloc();
+        state1.heap.set(x1, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(1)))));
+        state1.heap.set(y1, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(10)))));
+
+        let mut state2 = State::new();
+        state2.vector_size = 1;
+        let x2 = state2.heap.alloc();
+        let y2 = state2.heap.alloc();
+        state2.heap.set(x2, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(1)))));
+        state2.heap.set(y2, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(20)))));
+
+        let mut state3 = State::new();
+        state3.vector_size = 1;
+        let x3 = state3.heap.alloc();
+        let y3 = state3.heap.alloc();
+        state3.heap.set(x3, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(2)))));
+        state3.heap.set(y3, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(10)))));
+
+        let result = vectorize_states(vec![state1, state2, state3]);
+        assert_eq!(result.len(), 1);
+        let state = &result[0];
+        assert_eq!(state.vector_size, 3, "All 3 rows are unique");
+    }
+
+    #[test]
+    fn test_merge_different_vector_sizes() {
+        // State 1: x=[1,2] (vector_size=2)
+        // State 2: x=3 (vector_size=1)
+        // After merge: x=[1,2,3] (vector_size=3)
+
+        let mut state1 = State::new();
+        state1.vector_size = 2;
+        let x1 = state1.heap.alloc();
+        state1.heap.set(x1, HeapValue::Value(Value::Number(MaybeVector::Vector(vec![
+            Pico8Num::from_i16(1),
+            Pico8Num::from_i16(2),
+        ]))));
+
+        let mut state2 = State::new();
+        state2.vector_size = 1;
+        let x2 = state2.heap.alloc();
+        state2.heap.set(x2, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(3)))));
+
+        let result = vectorize_states(vec![state1, state2]);
+        assert_eq!(result.len(), 1);
+        let state = &result[0];
+        assert_eq!(state.vector_size, 3);
+
+        match state.heap.get(HeapId::from_raw(0)) {
+            HeapValue::Value(Value::Number(MaybeVector::Vector(nums))) => {
+                assert_eq!(nums.len(), 3);
+                assert_eq!(nums[0], Pico8Num::from_i16(1));
+                assert_eq!(nums[1], Pico8Num::from_i16(2));
+                assert_eq!(nums[2], Pico8Num::from_i16(3));
+            }
+            _ => panic!("Expected vector"),
+        }
+    }
+
+    #[test]
+    fn test_merge_different_vector_sizes_with_dedup() {
+        // State 1: x=[1,2] (vector_size=2)
+        // State 2: x=2 (vector_size=1, duplicate of element in state1)
+        // After merge+dedup: x=[1,2] (vector_size=2)
+
+        let mut state1 = State::new();
+        state1.vector_size = 2;
+        let x1 = state1.heap.alloc();
+        state1.heap.set(x1, HeapValue::Value(Value::Number(MaybeVector::Vector(vec![
+            Pico8Num::from_i16(1),
+            Pico8Num::from_i16(2),
+        ]))));
+
+        let mut state2 = State::new();
+        state2.vector_size = 1;
+        let x2 = state2.heap.alloc();
+        state2.heap.set(x2, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(2)))));
+
+        let result = vectorize_states(vec![state1, state2]);
+        assert_eq!(result.len(), 1);
+        let state = &result[0];
+        assert_eq!(state.vector_size, 2, "Duplicate should be removed");
     }
 }
