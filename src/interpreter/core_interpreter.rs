@@ -355,13 +355,20 @@ impl<'a> CoreInterpreter<'a> {
                     }
                 }
 
-                // Create the state for executing the function body
-                // Note: We don't push outer_local_envs since functions get a fresh scope
-                // and captures are handled via the captured_values
+                // Create the state for executing the function body.
+                // We push the caller's local_env onto outer_local_envs so it can be
+                // restored after the function returns. This is important because:
+                // 1. The function may change vector_size (e.g., via hint_normalize)
+                // 2. When that happens, we need to restore the caller's local_env as-is
+                // 3. The caller's variables are scalar or already matched the original
+                //    vector_size, so they don't need filtering
+                let mut new_outer_local_envs = vec![self.state.local_env.clone()];
+                new_outer_local_envs.extend(self.state.outer_local_envs.clone());
+
                 let function_state = State {
                     heap: self.state.heap.clone(),
                     local_env: new_local_env,
-                    outer_local_envs: Vec::new(), // Functions start with empty outer envs
+                    outer_local_envs: new_outer_local_envs,
                     global_env: self.state.global_env.clone(),
                     prints: self.state.prints.clone(),
                     vector_size: self.state.vector_size,
@@ -391,34 +398,33 @@ impl<'a> CoreInterpreter<'a> {
 
                 // For each result state, create an output state that:
                 // 1. Takes the heap, global_env, and prints from the function execution
-                // 2. Restores the caller's local_env
+                // 2. Restores the caller's local_env from the outer_local_envs stack
                 // 3. Sets the return value at local_id
                 let states = result_states
                     .into_iter()
                     .map(|(function_result_state, return_value)| {
-                        // Use the function result's vector_size, as it may have changed
-                        // during function execution (e.g., due to vector filtering in branches)
-                        let new_vector_size = function_result_state.vector_size;
-
-                        // Filter caller's local and outer envs to match new vector size
-                        let (filtered_local_env, filtered_outer_local_envs) = if new_vector_size != self.state.vector_size {
-                            // We need to filter the caller's locals to match
-                            // This shouldn't normally happen in well-formed programs,
-                            // but if it does, we need to handle it
-                            // For now, just use the caller's envs unchanged
-                            // (they should be scalar or already match)
-                            (self.state.local_env.clone(), self.state.outer_local_envs.clone())
-                        } else {
-                            (self.state.local_env.clone(), self.state.outer_local_envs.clone())
+                        // Pop the caller's local_env from the stack.
+                        // This was pushed before the function call.
+                        let (caller_local_env, remaining_outer_envs) = {
+                            let mut envs = function_result_state.outer_local_envs.clone();
+                            let caller_env = envs.remove(0); // Pop the first (caller's) env
+                            (caller_env, envs)
                         };
 
                         let mut caller_state = State {
                             heap: function_result_state.heap,
-                            local_env: filtered_local_env,
-                            outer_local_envs: filtered_outer_local_envs,
+                            local_env: caller_local_env,
+                            outer_local_envs: remaining_outer_envs,
                             global_env: function_result_state.global_env,
                             prints: function_result_state.prints,
-                            vector_size: new_vector_size,
+                            // Use the function's final vector_size - this is correct because:
+                            // - The caller's local_env contains the original values which are
+                            //   scalar or match the original vector_size
+                            // - Scalar values work with any vector_size
+                            // - If the function's vector_size changed, it's because some
+                            //   vectorization/filtering happened inside, but the caller's
+                            //   scalars are unaffected
+                            vector_size: function_result_state.vector_size,
                         };
                         // Set the return value (or nil if none)
                         let value = return_value

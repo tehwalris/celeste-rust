@@ -15,7 +15,23 @@ use super::{
     fixed_env::FixedEnv,
     flow::{BoundInterpreterFlow, FlowData, InterpreterFlowAdapter},
     profiling::{DagOperation, FixedPointGuard, SpanGuard, with_profiler},
+    vectorize::vectorize_states,
 };
+
+/// Helper to vectorize states within FlowData
+fn vectorize_flow_data(data: &FlowData) -> FlowData {
+    match data {
+        FlowData::States(states) => {
+            FlowData::States(vectorize_states(states.clone()))
+        }
+        FlowData::StatesAndReturns(states_and_returns) => {
+            // For StatesAndReturns, we can't easily vectorize because the return values
+            // may differ. For now, just return as-is.
+            // TODO: Consider grouping by return value shape and vectorizing within groups
+            FlowData::StatesAndReturns(states_and_returns.clone())
+        }
+    }
+}
 
 struct InterpreterAnalysis<'a> {
     adapter: InterpreterFlowAdapter<'a>,
@@ -94,17 +110,43 @@ impl<'a>
         accumulated: &Option<FlowData>,
         potentially_new: &Option<FlowData>,
     ) -> (Option<FlowData>, Option<FlowData>) {
-        // For now, a simple implementation that:
-        // - Joins potentially_new into accumulated
-        // - Returns all potentially_new as actually_new (no deduplication)
+        // At hint_normalize blocks, we vectorize states to merge those with the same shape.
+        // This reduces state explosion during execution.
         //
-        // A more sophisticated version would deduplicate states and only return
-        // truly new states. This is needed for loops to terminate.
+        // We combine accumulated and potentially_new, vectorize them together,
+        // then return the vectorized result as both the new accumulated and actually_new.
         //
-        // TODO: Implement proper state deduplication for loop termination.
-        let mut new_accumulated = accumulated.clone();
-        self.join_mut(&mut new_accumulated, potentially_new);
-        (new_accumulated, potentially_new.clone())
+        // Note: This doesn't provide exact deduplication for loop termination (which would
+        // require tracking exact state equality). But it does reduce state count significantly
+        // by merging states with compatible shapes.
+
+        #[cfg(test)]
+        eprintln!("[accumulate] called with accumulated={:?} states, potentially_new={:?} states",
+            accumulated.as_ref().map(|d| d.counts()),
+            potentially_new.as_ref().map(|d| d.counts()));
+
+        match (accumulated, potentially_new) {
+            (None, None) => (None, None),
+            (None, Some(new)) => {
+                let vectorized = vectorize_flow_data(new);
+                #[cfg(test)]
+                eprintln!("[accumulate] vectorized from {:?} to {:?}", new.counts(), vectorized.counts());
+                (Some(vectorized.clone()), Some(vectorized))
+            }
+            (Some(acc), None) => (Some(acc.clone()), None),
+            (Some(acc), Some(new)) => {
+                // Combine and vectorize
+                let mut combined = acc.clone();
+                combined.join_mut(new.clone());
+                let vectorized = vectorize_flow_data(&combined);
+                #[cfg(test)]
+                eprintln!("[accumulate] combined {:?} + {:?} -> vectorized {:?}",
+                    acc.counts(), new.counts(), vectorized.counts());
+                // Return vectorized as both accumulated and new
+                // (we don't track what's "actually new" vs "already seen")
+                (Some(vectorized.clone()), Some(vectorized))
+            }
+        }
     }
 
     fn bind_analyze(
@@ -168,6 +210,8 @@ fn interpret_prepared_cfg_inner(
     fixed_env: &FixedEnv,
     name: Option<String>,
 ) -> Result<Vec<(State, Option<Value>)>> {
+    use std::collections::HashMap;
+
     // Create profiling guard for this fixed-point invocation
     let fp_guard = FixedPointGuard::new(name.clone());
     let _span = SpanGuard::new(
@@ -198,14 +242,81 @@ fn interpret_prepared_cfg_inner(
     });
 
     // Start with the entry block
+    // For hint_normalize blocks, we accumulate states before processing
     let mut pending_blocks: Vec<(Option<Label>, FlowData, Option<u64>)> = vec![(
         None, // None means entry block
         FlowData::States(vec![initial_state]),
         Some(parent_dag_id),
     )];
+    // Accumulator for hint_normalize blocks - we collect states here before processing
+    let mut hint_normalize_accumulators: HashMap<Label, (FlowData, Vec<Option<u64>>)> = HashMap::new();
     let mut results: Vec<(State, Option<Value>)> = vec![];
 
-    while let Some((block_label, flow_data, dag_parent_id)) = pending_blocks.pop() {
+    // Helper to queue states for a target block
+    // Returns true if states were queued to pending_blocks, false if accumulated for later
+    let queue_for_block = |
+        target: &Label,
+        flow_data: FlowData,
+        dag_id: Option<u64>,
+        pending: &mut Vec<(Option<Label>, FlowData, Option<u64>)>,
+        accumulators: &mut HashMap<Label, (FlowData, Vec<Option<u64>>)>,
+        cfg: &Cfg,
+    | {
+        let target_block = cfg.named.get(target);
+        let is_hint_normalize = target_block.map(|b| b.hint_normalize).unwrap_or(false);
+
+        if is_hint_normalize {
+            // Accumulate states for hint_normalize blocks
+            match accumulators.entry(target.clone()) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    let (existing_data, dag_ids) = e.get_mut();
+                    existing_data.join_mut(flow_data);
+                    dag_ids.push(dag_id);
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert((flow_data, vec![dag_id]));
+                }
+            }
+        } else {
+            // Normal blocks go straight to pending
+            pending.push((Some(target.clone()), flow_data, dag_id));
+        }
+    };
+
+    loop {
+        // First, try to pop from pending_blocks
+        // If empty, check if there are accumulated states for hint_normalize blocks
+        let (block_label, flow_data, dag_parent_id) = match pending_blocks.pop() {
+            Some(item) => item,
+            None => {
+                // Check accumulators - drain one if available
+                if let Some((label, (accumulated_data, dag_ids))) = hint_normalize_accumulators.drain().next() {
+                    // Vectorize the accumulated states before processing
+                    let (before_count, before_expanded) = accumulated_data.counts();
+                    let vectorized = vectorize_flow_data(&accumulated_data);
+                    let (after_count, after_expanded) = vectorized.counts();
+
+                    // Create a DAG node for the vectorization if states were actually merged
+                    let vec_dag_id = if after_count < before_count {
+                        Some(with_profiler(|p| {
+                            p.create_dag_node(
+                                after_count,
+                                after_expanded,
+                                DagOperation::Vectorization,
+                                dag_ids.into_iter().flatten().next(), // Use first parent if any
+                            )
+                        }))
+                    } else {
+                        dag_ids.into_iter().flatten().next()
+                    };
+
+                    (Some(label), vectorized, vec_dag_id)
+                } else {
+                    // Nothing left to process
+                    break;
+                }
+            }
+        };
         iterations += 1;
         let (state_count, expanded_count) = flow_data.counts();
         states_processed += state_count;
@@ -233,6 +344,7 @@ fn interpret_prepared_cfg_inner(
         };
 
         // Execute the block's instructions (post-phi flow)
+        // Note: For hint_normalize blocks, states were already vectorized when pulled from accumulators
         let instruction_count = block.instructions.len();
         let bound_post_phi = adapter.flow_block_post_phi(block)?;
         let flow_data = bound_post_phi.flow(flow_data)?;
@@ -291,8 +403,15 @@ fn interpret_prepared_cfg_inner(
                 let bound_before_join = adapter.flow_block_before_join(&fake_liveness, target_block)?;
                 let flow_data = bound_before_join.flow(flow_data)?;
 
-                // Queue the target block
-                pending_blocks.push((Some(target.clone()), flow_data, Some(block_dag_id)));
+                // Queue the target block (using accumulator for hint_normalize blocks)
+                queue_for_block(
+                    target,
+                    flow_data,
+                    Some(block_dag_id),
+                    &mut pending_blocks,
+                    &mut hint_normalize_accumulators,
+                    cfg,
+                );
             }
             Terminator::ConditionalBranch {
                 condition: _,
@@ -332,8 +451,15 @@ fn interpret_prepared_cfg_inner(
                         let bound_before_join = adapter.flow_block_before_join(&fake_liveness, target_block)?;
                         let branch_flow_data = bound_before_join.flow(branch_flow_data)?;
 
-                        // Queue the target block
-                        pending_blocks.push((Some(target.clone()), branch_flow_data, Some(branch_dag_id)));
+                        // Queue the target block (using accumulator for hint_normalize blocks)
+                        queue_for_block(
+                            target,
+                            branch_flow_data,
+                            Some(branch_dag_id),
+                            &mut pending_blocks,
+                            &mut hint_normalize_accumulators,
+                            cfg,
+                        );
                     }
                 }
             }

@@ -589,7 +589,7 @@ fn unvectorize_if_possible(mut state: State) -> State {
 }
 
 /// Assert that all vectorizable vector values in a state have the correct length.
-fn assert_state_vector_lengths(state: &State) {
+pub fn assert_state_vector_lengths(state: &State) {
     let expected_len = state.vector_size;
 
     // Check heap
@@ -660,6 +660,40 @@ fn assert_state_vector_lengths(state: &State) {
     }
 }
 
+/// Clean states by removing local_env entries that don't appear in all states.
+/// This allows states with different dead temporaries to merge.
+///
+/// IMPORTANT: Only cleans scalar states (vector_size=1) to avoid issues with
+/// states that have internal vector values.
+fn clean_local_envs_for_merging(states: Vec<State>) -> Vec<State> {
+    use std::collections::HashSet;
+    use crate::ir::LocalId;
+
+    if states.len() <= 1 {
+        return states;
+    }
+
+    // Only clean states that are all scalar (vector_size=1)
+    // Vectorized states might have internal vector values with different lengths
+    let all_scalar = states.iter().all(|s| s.vector_size == 1);
+    if !all_scalar {
+        return states;
+    }
+
+    // Find the intersection of all local_env keys
+    let mut common_keys: HashSet<usize> = states[0].local_env.iter().map(|(k, _)| k).collect();
+    for state in &states[1..] {
+        let state_keys: HashSet<usize> = state.local_env.iter().map(|(k, _)| k).collect();
+        common_keys = common_keys.intersection(&state_keys).copied().collect();
+    }
+
+    // Remove keys that aren't in the intersection
+    states.into_iter().map(|mut state| {
+        state.local_env.retain(|key: LocalId| common_keys.contains(&usize::from(key)));
+        state
+    }).collect()
+}
+
 /// Vectorize a collection of states.
 /// States with the same "shape" are merged into single states with vector values.
 /// This reduces the number of states while preserving all the information.
@@ -672,6 +706,10 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
     for state in &states {
         assert_state_vector_lengths(state);
     }
+
+    // Clean local_envs: remove variables that don't appear in all states.
+    // This allows states with different dead temporaries to merge.
+    let states = clean_local_envs_for_merging(states);
 
     // Group states by shape
     let mut states_by_shape: HashMap<StateShape, Vec<State>> = HashMap::new();

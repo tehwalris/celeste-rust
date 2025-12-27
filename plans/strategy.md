@@ -186,8 +186,7 @@ Open question: Is there a formulation based on subgraphs or something that's "sa
 ### Vectorization
 
 States with the same "shape" can be merged:
-- Numbers and NumberIntervals are vectorizable (merged into vectors)
-- Bools are NOT vectorizable (different bool values = different shapes)
+- Numbers, NumberIntervals, and Bools are vectorizable (merged into vectors)
 - This is a performance optimization that should not affect correctness
 
 ### Keeping Correctness Scope Narrow

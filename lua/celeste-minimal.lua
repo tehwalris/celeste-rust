@@ -796,6 +796,7 @@ function _update()
 			end
 		end
 	end
+	_hint_normalize()
 end
 
 -- drawing functions --
@@ -809,13 +810,14 @@ function _draw()
 			draw_object(o)
 		end
 	end)
-	
+
 	-- draw objects
 	foreach(objects, function(o)
 		if o.type~=platform and o.type~=big_chest then
 			draw_object(o)
 		end
 	end)
+	_hint_normalize()
 end
 
 function draw_object(obj)

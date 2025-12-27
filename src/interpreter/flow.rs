@@ -255,6 +255,7 @@ impl<'a> BoundInterpreterFlow<'a> {
                             .iter()
                             .map(|v| *v == *condition_from_flow_edge)
                             .collect();
+
                         state.map_values_in_place(|v| v.filter_vectors(&mask));
                         state.vector_size = mask_true_count;
                         Ok(FlowData::States(vec![state]))
@@ -288,8 +289,8 @@ impl<'a> BoundSplitBlockFlow<FlowData> for BoundInterpreterFlow<'a> {
             }
         };
 
-        match out_parts.first() {
-            Some(FlowData::States(_)) => Ok(FlowData::States(
+        let result = match out_parts.first() {
+            Some(FlowData::States(_)) => FlowData::States(
                 out_parts
                     .iter()
                     .map(|part| match part {
@@ -300,8 +301,8 @@ impl<'a> BoundSplitBlockFlow<FlowData> for BoundInterpreterFlow<'a> {
                     })
                     .flatten()
                     .collect(),
-            )),
-            Some(FlowData::StatesAndReturns(_)) => Ok(FlowData::StatesAndReturns(
+            ),
+            Some(FlowData::StatesAndReturns(_)) => FlowData::StatesAndReturns(
                 out_parts
                     .iter()
                     .map(|part| match part {
@@ -312,8 +313,10 @@ impl<'a> BoundSplitBlockFlow<FlowData> for BoundInterpreterFlow<'a> {
                     })
                     .flatten()
                     .collect(),
-            )),
-            None => Ok(FlowData::States(vec![])),
-        }
+            ),
+            None => FlowData::States(vec![]),
+        };
+
+        Ok(result)
     }
 }

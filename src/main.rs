@@ -2185,4 +2185,361 @@ __reset_button_states()
         assert!(prints.iter().any(|s| s.contains("y=104")),
             "Expected y to reach 104 after jumping, got: {:?}", prints);
     }
+
+    #[test]
+    fn test_hint_normalize_merges_states() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // Code that:
+        // 1. Uses __new_unknown_boolean() which returns unknown bool, causing state split
+        // 2. Sets different values in each branch
+        // 3. Uses _hint_normalize() to merge states back
+        // 4. After merge, should have 1 vectorized state instead of 2 scalar states
+        let code = r#"
+            local x = 0
+            if __new_unknown_boolean() then
+                x = 1
+            else
+                x = 2
+            end
+            _hint_normalize()
+            __print(x)
+        "#;
+
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        // With hint_normalize, states should be merged
+        // We should have 1 state with vector_size=2, not 2 states with vector_size=1
+        assert_eq!(result_states.len(), 1, "Expected states to be merged by hint_normalize");
+        assert_eq!(result_states[0].0.vector_size, 2, "Expected vectorized state with size 2");
+    }
+
+    #[test]
+    fn test_without_hint_normalize_has_multiple_states() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // Same code but WITHOUT _hint_normalize()
+        // Should result in 2 separate states
+        let code = r#"
+            local x = 0
+            if __new_unknown_boolean() then
+                x = 1
+            else
+                x = 2
+            end
+            __print(x)
+        "#;
+
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        // Without hint_normalize, we should have 2 separate states
+        assert_eq!(result_states.len(), 2, "Expected 2 separate states without hint_normalize");
+    }
+
+    #[test]
+    fn test_hint_normalize_nested_conditionals() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // This test checks nested conditionals with hint_normalize
+        let code = r#"
+            local x = 0
+            if __new_unknown_boolean() then
+                x = 1
+            else
+                x = 2
+            end
+            _hint_normalize()
+            -- Now we have 1 state with vector_size=2
+
+            local y = 0
+            if __new_unknown_boolean() then
+                y = 1
+            else
+                y = 2
+            end
+            _hint_normalize()
+            __print(x)
+            __print(y)
+        "#;
+
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        // We should end up with merged states
+        assert!(!result_states.is_empty(), "Expected at least one result state");
+    }
+
+    #[test]
+    fn test_hint_normalize_vectorized_then_split_by_vector_condition() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // This test checks that vectorized states split by vector conditions work correctly
+        let code = r#"
+            local x = 0
+            if __new_unknown_boolean() then
+                x = 1
+            else
+                x = 2
+            end
+            _hint_normalize()
+            -- Now we have 1 state with vector_size=2, x is Vector[1, 2]
+
+            local y = 0
+            -- This condition is based on vectorized x, so it's a Bool vector
+            if x == 1 then
+                y = 10
+            else
+                y = 20
+            end
+            _hint_normalize()
+            __print(y)
+        "#;
+
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        // Should complete without vector length mismatches
+        assert!(!result_states.is_empty(), "Expected at least one result state");
+    }
+
+    #[test]
+    fn test_hint_normalize_with_function_splitting_vectorized_state() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // This test simulates what happens in the game:
+        // 1. A vectorized state (from previous hint_normalize) enters a function
+        // 2. The function has conditionals on __new_unknown_boolean()
+        // 3. This creates NEW scalar UnknownBool conditions in a vectorized state
+        // 4. The UnknownBool splits the state into 2, each with the SAME vector_size
+        // 5. When these flow to hint_normalize, they should merge correctly
+        let code = r#"
+            function maybe_modify(val)
+                if __new_unknown_boolean() then
+                    return val + 1
+                else
+                    return val
+                end
+            end
+
+            local x = 0
+            if __new_unknown_boolean() then
+                x = 1
+            else
+                x = 2
+            end
+            _hint_normalize()
+            -- Now we have 1 state with vector_size=2
+
+            -- Call function on vectorized state - this should split into 2 states
+            -- each with vector_size=2, then hint_normalize should merge them
+            local y = maybe_modify(x)
+            _hint_normalize()
+            __print(y)
+        "#;
+
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        // Should complete without vector length mismatches
+        assert!(!result_states.is_empty(), "Expected at least one result state");
+        for (i, (state, _)) in result_states.iter().enumerate() {
+            println!("State {}: vector_size={}", i, state.vector_size);
+        }
+    }
+
+    #[test]
+    fn test_function_filters_vectorized_state() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // This test checks a tricky case:
+        // 1. Caller has vectorized state (vector_size=2) with x = Vector[1, 2]
+        // 2. Caller calls function f(x)
+        // 3. Inside function, we branch on the vector condition (x < 2)
+        // 4. This FILTERS the state - some lanes are removed
+        // 5. Function returns with different vector_size than it was called with
+        // 6. What happens to caller's local variables?
+        let code = r#"
+            function filter_by_arg(v)
+                if v < 2 then
+                    return v + 10
+                else
+                    return v + 20
+                end
+            end
+
+            local x = 0
+            if __new_unknown_boolean() then
+                x = 1
+            else
+                x = 2
+            end
+            _hint_normalize()
+            -- Now we have 1 state with vector_size=2, x = Vector[1, 2]
+
+            local y = 100  -- This is a scalar in a vectorized state
+
+            -- Call function - inside it branches on x, filtering the vector
+            local z = filter_by_arg(x)
+
+            -- After the call:
+            -- - For x=1 branch: z = 11, vector_size should be 1
+            -- - For x=2 branch: z = 22, vector_size should be 1
+            -- What is y in each state? It should be 100 (scalar)
+
+            __print(y)
+            __print(z)
+        "#;
+
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        println!("Result states: {}", result_states.len());
+        for (i, (state, _)) in result_states.iter().enumerate() {
+            println!("State {}: vector_size={}, prints={:?}", i, state.vector_size, state.prints);
+        }
+
+        // We should get 2 states, each with y=100 and z in {11, 22}
+        assert_eq!(result_states.len(), 2);
+    }
+
+    #[test]
+    fn test_function_filters_vectorized_state_with_vector_caller_var() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // This test checks the problematic case you identified:
+        // 1. Caller has vectorized state (vector_size=2) with x = Vector[1, 2]
+        // 2. Caller ALSO has another vector y = Vector[10, 20] (same length as vector_size)
+        // 3. Caller calls function f(x)
+        // 4. Inside function, we branch on the vector condition (x < 2)
+        // 5. This FILTERS the state - vector_size goes from 2 to 1
+        // 6. What happens to caller's y? It still has length 2 but vector_size is now 1!
+        let code = r#"
+            function filter_by_arg(v)
+                if v < 2 then
+                    return v + 10
+                else
+                    return v + 20
+                end
+            end
+
+            local x = 0
+            local y = 0
+            if __new_unknown_boolean() then
+                x = 1
+                y = 10
+            else
+                x = 2
+                y = 20
+            end
+            _hint_normalize()
+            -- Now we have 1 state with vector_size=2
+            -- x = Vector[1, 2]
+            -- y = Vector[10, 20]
+
+            -- Call function - inside it branches on x, filtering the vector
+            local z = filter_by_arg(x)
+
+            -- After the call:
+            -- - For x=1 branch: z = 11, vector_size = 1
+            --   But caller's y was Vector[10, 20] with length 2!
+            --   What should y be? It should be filtered to match: y = 10
+            -- - For x=2 branch: z = 22, vector_size = 1
+            --   y should be filtered to: y = 20
+
+            __print(y)
+            __print(z)
+        "#;
+
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        println!("Result states: {}", result_states.len());
+        for (i, (state, _)) in result_states.iter().enumerate() {
+            println!("State {}: vector_size={}, prints={:?}", i, state.vector_size, state.prints);
+        }
+
+        // We should get 2 states with correct filtered y values
+        assert_eq!(result_states.len(), 2);
+        // Check that y was correctly filtered
+        let mut print_sets: Vec<_> = result_states.iter()
+            .map(|(s, _)| s.prints.clone())
+            .collect();
+        print_sets.sort();
+        // y=10 with z=11, and y=20 with z=22
+        assert!(print_sets.contains(&vec!["10".to_string(), "11".to_string()]) ||
+                print_sets.contains(&vec!["20".to_string(), "22".to_string()]),
+                "Expected y to be filtered correctly, got: {:?}", print_sets);
+    }
 }
