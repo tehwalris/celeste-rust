@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Profiling Tree Viewer</title>
+    <style>
+        body {
+            font-family: monospace;
+            margin: 20px;
+            background: #1e1e1e;
+            color: #d4d4d4;
+        }
+        h1 { color: #569cd6; }
+        h2 { color: #4ec9b0; margin-top: 30px; }
+        .controls {
+            margin-bottom: 20px;
+            padding: 10px;
+            background: #252526;
+            border-radius: 4px;
+        }
+        .controls label {
+            margin-right: 20px;
+        }
+        .controls select, .controls input {
+            background: #3c3c3c;
+            color: #d4d4d4;
+            border: 1px solid #555;
+            padding: 5px;
+            margin-left: 5px;
+        }
+        .tree-node {
+            margin-left: 20px;
+            border-left: 1px solid #555;
+            padding-left: 10px;
+        }
+        .tree-node.collapsed > .tree-children {
+            display: none;
+        }
+        .node-header {
+            cursor: pointer;
+            padding: 2px 5px;
+            margin: 1px 0;
+        }
+        .node-header:hover {
+            background: #2d2d30;
+        }
+        .toggle {
+            display: inline-block;
+            width: 15px;
+            color: #808080;
+        }
+        .name { color: #dcdcaa; }
+        .stats { color: #808080; font-size: 0.9em; }
+        .time { color: #b5cea8; }
+        .states { color: #ce9178; }
+        .summary {
+            background: #252526;
+            padding: 15px;
+            border-radius: 4px;
+            margin-bottom: 20px;
+        }
+        .summary-item {
+            display: inline-block;
+            margin-right: 30px;
+            padding: 5px 10px;
+            background: #2d2d30;
+            border-radius: 4px;
+        }
+        .summary-label { color: #808080; }
+        .summary-value { color: #4ec9b0; font-weight: bold; }
+        #loading { color: #569cd6; }
+        #error { color: #f44747; }
+        .dag-node {
+            padding: 3px 8px;
+            margin: 2px 0;
+            background: #2d2d30;
+            border-radius: 3px;
+            display: inline-block;
+        }
+        .dag-op { color: #c586c0; }
+    </style>
+</head>
+<body>
+    <h1>Profiling Viewer</h1>
+
+    <div class="controls">
+        <label>
+            Profile:
+            <select id="profile-select">
+                <option value="test3">test3 (latest)</option>
+                <option value="test2">test2</option>
+                <option value="test">test</option>
+                <option value=".">root profiles</option>
+            </select>
+        </label>
+        <label>
+            View:
+            <select id="view-select">
+                <option value="tree">Tree</option>
+                <option value="dag">DAG Summary</option>
+            </select>
+        </label>
+        <label>
+            Max depth:
+            <input type="number" id="max-depth" value="5" min="1" max="20">
+        </label>
+        <button onclick="loadData()">Load</button>
+    </div>
+
+    <div id="loading" style="display: none;">Loading...</div>
+    <div id="error" style="display: none;"></div>
+
+    <div id="summary" class="summary" style="display: none;"></div>
+    <div id="content"></div>
+
+    <script>
+        let treeData = null;
+        let dagData = null;
+
+        async function loadData() {
+            const profile = document.getElementById('profile-select').value;
+            const basePath = profile === '.' ? '' : profile + '/';
+
+            document.getElementById('loading').style.display = 'block';
+            document.getElementById('error').style.display = 'none';
+            document.getElementById('content').innerHTML = '';
+            document.getElementById('summary').style.display = 'none';
+
+            try {
+                const [treeResp, dagResp] = await Promise.all([
+                    fetch(basePath + 'tree.json'),
+                    fetch(basePath + 'dag.json')
+                ]);
+
+                if (!treeResp.ok || !dagResp.ok) {
+                    throw new Error('Failed to load profile data');
+                }
+
+                treeData = await treeResp.json();
+                dagData = await dagResp.json();
+
+                renderView();
+            } catch (e) {
+                document.getElementById('error').textContent = 'Error: ' + e.message;
+                document.getElementById('error').style.display = 'block';
+            } finally {
+                document.getElementById('loading').style.display = 'none';
+            }
+        }
+
+        function renderView() {
+            const view = document.getElementById('view-select').value;
+
+            if (view === 'tree') {
+                renderTree();
+            } else {
+                renderDagSummary();
+            }
+        }
+
+        function renderTree() {
+            if (!treeData) return;
+
+            const maxDepth = parseInt(document.getElementById('max-depth').value);
+
+            // treeData is an array of nodes
+            const nodes = Array.isArray(treeData) ? treeData : treeData.nodes;
+            const maxTreeDepth = Math.max(...nodes.map(n => n.depth || 0));
+
+            // Summary
+            const summary = document.getElementById('summary');
+            summary.style.display = 'block';
+            summary.innerHTML = `
+                <div class="summary-item">
+                    <span class="summary-label">Nodes:</span>
+                    <span class="summary-value">${nodes.length}</span>
+                </div>
+                <div class="summary-item">
+                    <span class="summary-label">Max Depth:</span>
+                    <span class="summary-value">${maxTreeDepth}</span>
+                </div>
+            `;
+
+            // Build tree structure using children array from the data
+            const nodeMap = new Map();
+            nodes.forEach(n => nodeMap.set(n.id, {...n, childNodes: []}));
+
+            // Use the children array from each node to build child references
+            nodes.forEach(n => {
+                const node = nodeMap.get(n.id);
+                if (n.children) {
+                    node.childNodes = n.children.map(childId => nodeMap.get(childId)).filter(Boolean);
+                }
+            });
+
+            const roots = nodes.filter(n => n.parent_id === null).map(n => nodeMap.get(n.id));
+
+            const content = document.getElementById('content');
+            content.innerHTML = '<h2>Call Tree</h2>';
+            roots.forEach(root => {
+                content.appendChild(renderTreeNode(root, 0, maxDepth));
+            });
+        }
+
+        function renderTreeNode(node, depth, maxDepth) {
+            const div = document.createElement('div');
+            div.className = 'tree-node' + (depth >= 2 ? ' collapsed' : '');
+
+            const header = document.createElement('div');
+            header.className = 'node-header';
+
+            const hasChildren = node.childNodes && node.childNodes.length > 0;
+            const toggle = hasChildren ? (depth >= 2 ? '+' : '-') : ' ';
+
+            // Calculate duration from total_time
+            let duration = '';
+            if (node.total_time) {
+                const ms = node.total_time.secs * 1000 + node.total_time.nanos / 1e6;
+                duration = ms.toFixed(2) + 'ms';
+            }
+            const states = node.states_processed || '';
+
+            header.innerHTML = `
+                <span class="toggle">${toggle}</span>
+                <span class="name">${node.name || 'anonymous'}</span>
+                <span class="stats">
+                    ${duration ? `<span class="time">${duration}</span>` : ''}
+                    ${states ? `<span class="states">${states} states</span>` : ''}
+                </span>
+            `;
+
+            if (hasChildren) {
+                header.onclick = () => {
+                    div.classList.toggle('collapsed');
+                    header.querySelector('.toggle').textContent =
+                        div.classList.contains('collapsed') ? '+' : '-';
+                };
+            }
+
+            div.appendChild(header);
+
+            if (hasChildren && depth < maxDepth) {
+                const childrenDiv = document.createElement('div');
+                childrenDiv.className = 'tree-children';
+                node.childNodes.forEach(child => {
+                    childrenDiv.appendChild(renderTreeNode(child, depth + 1, maxDepth));
+                });
+                div.appendChild(childrenDiv);
+            }
+
+            return div;
+        }
+
+        function renderDagSummary() {
+            if (!dagData) return;
+
+            // dagData is an array of nodes
+            const nodes = Array.isArray(dagData) ? dagData : dagData.nodes;
+
+            // Count operations
+            const opCounts = {};
+            nodes.forEach(n => {
+                const op = typeof n.operation === 'string' ? n.operation : Object.keys(n.operation)[0];
+                opCounts[op] = (opCounts[op] || 0) + 1;
+            });
+
+            const summary = document.getElementById('summary');
+            summary.style.display = 'block';
+            summary.innerHTML = `
+                <div class="summary-item">
+                    <span class="summary-label">DAG Nodes:</span>
+                    <span class="summary-value">${nodes.length}</span>
+                </div>
+            `;
+
+            const content = document.getElementById('content');
+            content.innerHTML = '<h2>DAG Operation Counts</h2>';
+
+            Object.entries(opCounts)
+                .sort((a, b) => b[1] - a[1])
+                .forEach(([op, count]) => {
+                    const div = document.createElement('div');
+                    div.className = 'dag-node';
+                    div.innerHTML = `<span class="dag-op">${op}</span>: ${count}`;
+                    content.appendChild(div);
+                    content.appendChild(document.createTextNode(' '));
+                });
+        }
+
+        document.getElementById('view-select').onchange = renderView;
+        document.getElementById('max-depth').onchange = renderView;
+
+        // Auto-load on page load
+        loadData();
+    </script>
+</body>
+</html>
