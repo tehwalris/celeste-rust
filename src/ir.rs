@@ -58,6 +58,12 @@ impl<T: From<String>> UniqueStringGenerator<T> {
 #[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug, Serialize, Deserialize)]
 pub struct GlobalId(String);
 
+impl GlobalId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 impl From<String> for GlobalId {
     fn from(s: String) -> Self {
         Self(s)
@@ -68,6 +74,12 @@ pub type GlobalIdGenerator = UniqueStringGenerator<GlobalId>;
 
 #[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug)]
 pub struct Label(String);
+
+impl Label {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 impl From<String> for Label {
     fn from(s: String) -> Self {

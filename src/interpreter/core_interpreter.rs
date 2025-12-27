@@ -4,6 +4,7 @@ use super::{
     fixed_env::FixedEnv,
     heap::HeapId,
     op::{interpret_binary_op, interpret_unary_op},
+    profiling::{DagOperation, SpanGuard, with_profiler},
     state::State,
     value::{HeapValue, MaybeVector, Value},
 };
@@ -289,6 +290,8 @@ impl<'a> CoreInterpreter<'a> {
 
         match heap_value {
             HeapValue::BuiltinFun(name) => {
+                let _span = SpanGuard::new(&format!("builtin:{}", name), "call");
+
                 // Look up the builtin function
                 let builtin_fn = self
                     .fixed_env
@@ -298,6 +301,19 @@ impl<'a> CoreInterpreter<'a> {
 
                 // Call the builtin, which returns multiple (state, return_value) pairs
                 let results = builtin_fn(self.state, arg_values)?;
+
+                // Track if this builtin caused a state split
+                if results.len() > 1 {
+                    let expanded_count: usize = results.iter().map(|(s, _)| s.vector_size).sum();
+                    with_profiler(|p| {
+                        p.create_dag_node(
+                            results.len(),
+                            expanded_count,
+                            DagOperation::BuiltinSplit { builtin_name: name.clone() },
+                            p.current_dag_node(),
+                        )
+                    });
+                }
 
                 // Set the return value in each state's local_env at the local_id
                 let states = results
@@ -311,6 +327,8 @@ impl<'a> CoreInterpreter<'a> {
                 Ok(states)
             }
             HeapValue::Closure(fun_def_name, captured_values) => {
+                let _span = SpanGuard::new(&format!("closure:{}", fun_def_name.as_str()), "call");
+
                 // Look up the function definition with prepared CFG
                 let (fun_def, prepared_cfg) = self
                     .fixed_env
@@ -350,8 +368,26 @@ impl<'a> CoreInterpreter<'a> {
                 };
 
                 // Recursively interpret the function's prepared CFG (uses cached labels)
-                let result_states =
-                    super::glue::interpret_prepared_cfg(prepared_cfg, function_state, self.fixed_env)?;
+                // Pass function name for profiling
+                let result_states = super::glue::interpret_prepared_cfg_with_name(
+                    prepared_cfg,
+                    function_state,
+                    self.fixed_env,
+                    Some(fun_def_name.as_str().to_string()),
+                )?;
+
+                // Track if this closure call caused a state split
+                if result_states.len() > 1 {
+                    let expanded_count: usize = result_states.iter().map(|(s, _)| s.vector_size).sum();
+                    with_profiler(|p| {
+                        p.create_dag_node(
+                            result_states.len(),
+                            expanded_count,
+                            DagOperation::ClosureSplit { function_name: fun_def_name.as_str().to_string() },
+                            p.current_dag_node(),
+                        )
+                    });
+                }
 
                 // For each result state, create an output state that:
                 // 1. Takes the heap, global_env, and prints from the function execution

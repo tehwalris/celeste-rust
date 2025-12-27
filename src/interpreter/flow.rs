@@ -35,6 +35,22 @@ impl FlowData {
         }
     }
 
+    /// Returns (state_count, expanded_count)
+    pub fn counts(&self) -> (usize, usize) {
+        match self {
+            FlowData::States(states) => {
+                let state_count = states.len();
+                let expanded_count = states.iter().map(|s| s.vector_size).sum();
+                (state_count, expanded_count)
+            }
+            FlowData::StatesAndReturns(states_and_returns) => {
+                let state_count = states_and_returns.len();
+                let expanded_count = states_and_returns.iter().map(|(s, _)| s.vector_size).sum();
+                (state_count, expanded_count)
+            }
+        }
+    }
+
     pub fn join_mut(&mut self, other: Self) {
         // TODO there's probably meant to be deduplication and stuff here
         match (self, other) {

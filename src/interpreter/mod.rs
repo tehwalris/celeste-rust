@@ -6,6 +6,7 @@ pub mod heap;
 pub mod inspect;
 pub mod local_env;
 mod op;
+pub mod profiling;
 pub mod state;
 pub mod value;
 pub mod vectorize;

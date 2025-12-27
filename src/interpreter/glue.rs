@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use anyhow::Result;
 use indexmap::IndexSet;
 use petgraph::prelude::GraphMap;
@@ -12,6 +14,7 @@ use crate::{
 use super::{
     fixed_env::FixedEnv,
     flow::{BoundInterpreterFlow, FlowData, InterpreterFlowAdapter},
+    profiling::{DagOperation, FixedPointGuard, SpanGuard, with_profiler},
 };
 
 struct InterpreterAnalysis<'a> {
@@ -146,19 +149,82 @@ pub fn interpret_prepared_cfg(
     initial_state: State,
     fixed_env: &FixedEnv,
 ) -> Result<Vec<(State, Option<Value>)>> {
+    interpret_prepared_cfg_inner(prepared, initial_state, fixed_env, None)
+}
+
+/// Internal implementation with optional function name for profiling
+pub fn interpret_prepared_cfg_with_name(
+    prepared: &PreparedCfg,
+    initial_state: State,
+    fixed_env: &FixedEnv,
+    name: Option<String>,
+) -> Result<Vec<(State, Option<Value>)>> {
+    interpret_prepared_cfg_inner(prepared, initial_state, fixed_env, name)
+}
+
+fn interpret_prepared_cfg_inner(
+    prepared: &PreparedCfg,
+    initial_state: State,
+    fixed_env: &FixedEnv,
+    name: Option<String>,
+) -> Result<Vec<(State, Option<Value>)>> {
+    // Create profiling guard for this fixed-point invocation
+    let fp_guard = FixedPointGuard::new(name.clone());
+    let _span = SpanGuard::new(
+        &name.as_deref().unwrap_or("interpret_cfg"),
+        "fixed_point",
+    );
+
     let adapter = InterpreterFlowAdapter { fixed_env };
     let cfg = &prepared.cfg;
     let labels = &prepared.labels;
     let fake_liveness = LivenessAnalysisResult::all_live();
 
+    // Track profiling stats
+    let mut iterations = 0;
+    let mut states_processed = 0;
+    let mut blocks_executed = 0;
+
+    // Create initial DAG node
+    let initial_state_count = 1;
+    let initial_expanded = initial_state.vector_size;
+    let parent_dag_id = with_profiler(|p| {
+        p.create_dag_node(
+            initial_state_count,
+            initial_expanded,
+            DagOperation::Entry,
+            None,
+        )
+    });
+
     // Start with the entry block
-    let mut pending_blocks: Vec<(Option<Label>, FlowData)> = vec![(
+    let mut pending_blocks: Vec<(Option<Label>, FlowData, Option<u64>)> = vec![(
         None, // None means entry block
         FlowData::States(vec![initial_state]),
+        Some(parent_dag_id),
     )];
     let mut results: Vec<(State, Option<Value>)> = vec![];
 
-    while let Some((block_label, flow_data)) = pending_blocks.pop() {
+    while let Some((block_label, flow_data, dag_parent_id)) = pending_blocks.pop() {
+        iterations += 1;
+        let (state_count, expanded_count) = flow_data.counts();
+        states_processed += state_count;
+        blocks_executed += 1;
+
+        let block_name = block_label.as_ref().map(|l| l.as_str().to_string());
+        let block_start = Instant::now();
+
+        // Create DAG node for this block execution
+        let block_dag_id = with_profiler(|p| {
+            p.create_dag_node(
+                state_count,
+                expanded_count,
+                DagOperation::BlockExecution { block_name: block_name.clone() },
+                dag_parent_id,
+            )
+        });
+        with_profiler(|p| p.set_current_dag_node(Some(block_dag_id)));
+
         let block = match &block_label {
             None => &cfg.entry,
             Some(label) => cfg.named.get(label).ok_or_else(|| {
@@ -167,8 +233,19 @@ pub fn interpret_prepared_cfg(
         };
 
         // Execute the block's instructions (post-phi flow)
+        let instruction_count = block.instructions.len();
         let bound_post_phi = adapter.flow_block_post_phi(block)?;
         let flow_data = bound_post_phi.flow(flow_data)?;
+
+        // Update DAG node with processing stats
+        with_profiler(|p| {
+            p.update_dag_node(
+                block_dag_id,
+                block_start.elapsed(),
+                instruction_count,
+                0, // call count tracked in flow
+            );
+        });
 
         // Handle the terminator
         let (_, terminator) = &block.terminator;
@@ -215,7 +292,7 @@ pub fn interpret_prepared_cfg(
                 let flow_data = bound_before_join.flow(flow_data)?;
 
                 // Queue the target block
-                pending_blocks.push((Some(target.clone()), flow_data));
+                pending_blocks.push((Some(target.clone()), flow_data, Some(block_dag_id)));
             }
             Terminator::ConditionalBranch {
                 condition: _,
@@ -223,7 +300,7 @@ pub fn interpret_prepared_cfg(
                 false_target,
             } => {
                 // For each branch, apply the appropriate flow and queue
-                for target in [true_target, false_target] {
+                for (is_true_branch, target) in [(true, true_target), (false, false_target)] {
                     let target_block = cfg.named.get(target).ok_or_else(|| {
                         anyhow::anyhow!("Target block not found: {:?}", target)
                     })?;
@@ -233,6 +310,17 @@ pub fn interpret_prepared_cfg(
                     let branch_flow_data = bound_branch.flow(flow_data.clone())?;
 
                     if !branch_flow_data.is_empty() {
+                        // Create DAG node for the branch split
+                        let (branch_state_count, branch_expanded) = branch_flow_data.counts();
+                        let branch_dag_id = with_profiler(|p| {
+                            p.create_dag_node(
+                                branch_state_count,
+                                branch_expanded,
+                                DagOperation::ConditionalSplit { branch: is_true_branch },
+                                Some(block_dag_id),
+                            )
+                        });
+
                         // Apply phi instructions
                         let source_label = block_label.clone().unwrap_or_else(|| {
                             Label::from("__entry".to_string())
@@ -245,12 +333,16 @@ pub fn interpret_prepared_cfg(
                         let branch_flow_data = bound_before_join.flow(branch_flow_data)?;
 
                         // Queue the target block
-                        pending_blocks.push((Some(target.clone()), branch_flow_data));
+                        pending_blocks.push((Some(target.clone()), branch_flow_data, Some(branch_dag_id)));
                     }
                 }
             }
         }
     }
+
+    // Update fixed-point stats
+    fp_guard.update_stats(iterations, states_processed, blocks_executed);
+    with_profiler(|p| p.set_current_dag_node(None));
 
     Ok(results)
 }
