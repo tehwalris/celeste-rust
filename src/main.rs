@@ -66,7 +66,7 @@ fn run_game_frames(
 ) -> Result<()> {
     use crate::interpreter::glue::interpret_cfg;
     use crate::interpreter::inspect::{make_state_abstract, create_frame_dump, write_frame_dump_jsonl, dump_states_to_file};
-    use crate::interpreter::profiling::{enable_profiling, get_chrome_tracing_json, get_dag_json, get_tree_json, get_profile_summary};
+    use crate::interpreter::profiling::{enable_profiling, get_chrome_tracing_json, get_dag_json, get_tree_json, get_cfgs_json, get_profile_summary};
     use crate::game_runner::{create_fixed_env_with_game_builtins, create_initial_state_with_builtins};
     use std::io::BufWriter;
     use std::fs::File;
@@ -228,6 +228,18 @@ __reset_button_states()
         let mut file = File::create(&tree_path)?;
         file.write_all(get_tree_json().as_bytes())?;
         println!("Saved tree to {}", tree_path);
+
+        // Save CFGs JSON
+        let cfgs_path = format!("{}/cfgs.json", profile_dir);
+        let mut file = File::create(&cfgs_path)?;
+        file.write_all(get_cfgs_json().as_bytes())?;
+        println!("Saved CFGs to {}", cfgs_path);
+
+        // Save the source code that was compiled (for source mapping)
+        let source_path = format!("{}/source.lua", profile_dir);
+        let mut file = File::create(&source_path)?;
+        file.write_all(full_code.as_bytes())?;
+        println!("Saved source to {}", source_path);
 
         // Print summary
         let summary = get_profile_summary();
@@ -2541,5 +2553,128 @@ __reset_button_states()
         assert!(print_sets.contains(&vec!["10".to_string(), "11".to_string()]) ||
                 print_sets.contains(&vec!["20".to_string(), "22".to_string()]),
                 "Expected y to be filtered correctly, got: {:?}", print_sets);
+    }
+
+    #[test]
+    fn test_hint_normalize_deduplicates_identical_states() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // This test verifies that when the same state reaches a hint_normalize block
+        // via multiple paths, it's properly deduplicated.
+        //
+        // The code creates a diamond pattern:
+        //   - Branch on unknown boolean
+        //   - Both branches set x = 42 (same value!)
+        //   - Both branches converge at hint_normalize
+        //
+        // Without proper union_diff:
+        //   - We'd get TWO identical states (x=42, x=42)
+        //   - After vectorization, we'd have one state with vector_size=2 containing [42, 42]
+        //
+        // With proper union_diff:
+        //   - The second arrival of x=42 should be recognized as "already seen"
+        //   - We should have one state with vector_size=1 containing just 42
+        let code = r#"
+            local x = 0
+            if __new_unknown_boolean() then
+                x = 42
+            else
+                x = 42
+            end
+            _hint_normalize()
+            __print(x)
+        "#;
+
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        println!("Result states: {}", result_states.len());
+        for (i, (state, _)) in result_states.iter().enumerate() {
+            println!("State {}: vector_size={}, prints={:?}", i, state.vector_size, state.prints);
+        }
+
+        // With proper deduplication, we should have:
+        // - 1 state (not 2)
+        // - vector_size=1 (not 2, since both states were identical)
+        // - prints=["42"]
+        assert_eq!(result_states.len(), 1, "Expected 1 state after deduplication");
+        assert_eq!(result_states[0].0.vector_size, 1,
+                   "Expected vector_size=1 since both paths produce identical state");
+        assert_eq!(result_states[0].0.prints, vec!["42"]);
+    }
+
+    #[test]
+    fn test_hint_normalize_partial_deduplication() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // This test verifies partial deduplication: when some states are new and some are duplicates.
+        //
+        // The code:
+        //   - First split: x = 1 or x = 2
+        //   - hint_normalize (merges to vector_size=2)
+        //   - Second split: y = 10 or y = 10 (same value in both branches!)
+        //   - hint_normalize again
+        //
+        // After the second hint_normalize:
+        //   - We should NOT have 4 states (2 x values * 2 y values)
+        //   - We should have 2 states (2 x values * 1 y value since y is deduplicated)
+        let code = r#"
+            local x = 0
+            if __new_unknown_boolean() then
+                x = 1
+            else
+                x = 2
+            end
+            _hint_normalize()
+            -- Now: 1 state, vector_size=2, x = [1, 2]
+
+            local y = 0
+            if __new_unknown_boolean() then
+                y = 10
+            else
+                y = 10
+            end
+            _hint_normalize()
+            -- Without dedup: 2 states, each with vector_size=2
+            -- With dedup: 1 state, vector_size=2, x = [1, 2], y = 10
+
+            __print(x)
+            __print(y)
+        "#;
+
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        println!("Result states: {}", result_states.len());
+        for (i, (state, _)) in result_states.iter().enumerate() {
+            println!("State {}: vector_size={}, prints={:?}", i, state.vector_size, state.prints);
+        }
+
+        // After proper deduplication of y, we should have 1 state
+        // with x being vectorized and y being scalar (since y was deduplicated)
+        assert_eq!(result_states.len(), 1, "Expected 1 state after deduplication");
+        // The state should have vector_size=2 for x
+        assert_eq!(result_states[0].0.vector_size, 2,
+                   "Expected vector_size=2 for the x variable");
     }
 }

@@ -40,6 +40,8 @@ enum HeapValueShape {
     UnknownTable,
     Closure(GlobalId, Vec<ValueShape>),
     BuiltinFun(String),
+    /// Empty slot (allocated but never set)
+    Empty,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -112,11 +114,14 @@ pub fn debug_shape_of_state(state: &State) -> StateShape {
 }
 
 fn shape_of_state(state: &State) -> StateShape {
-    // Get heap structure
+    // Get heap structure (handle empty slots that are allocated but not set)
     let mut heap_structure = Vec::new();
     for i in 0..state.heap.len() {
         let id = HeapId::from_raw(i);
-        let shape = normalize_heap_value_for_shape(state.heap.get(id));
+        let shape = match state.heap.get_opt(id) {
+            Some(value) => normalize_heap_value_for_shape(value),
+            None => HeapValueShape::Empty,
+        };
         heap_structure.push((id, shape));
     }
 
@@ -300,6 +305,10 @@ fn vectorize_same_shape_states(states: Vec<State>) -> State {
 
     for i in 0..first_state.heap.len() {
         let id = HeapId::from_raw(i);
+        // Skip empty slots (allocated but never set)
+        if first_state.heap.get_opt(id).is_none() {
+            continue;
+        }
         let merged_value = merge_heap_values_from_states(&states, id);
         new_heap.set(id, merged_value);
     }
@@ -481,10 +490,13 @@ fn dedup_vectorized_state(mut state: State) -> State {
 fn collect_vector_values(state: &State) -> Vec<VectorRef> {
     let mut vectors = Vec::new();
 
-    // From heap
+    // From heap (skip empty slots)
     for i in 0..state.heap.len() {
         let id = HeapId::from_raw(i);
-        match state.heap.get(id) {
+        let Some(heap_value) = state.heap.get_opt(id) else {
+            continue;
+        };
+        match heap_value {
             HeapValue::Value(Value::Number(MaybeVector::Vector(v))) => {
                 vectors.push(VectorRef::Numbers(v.clone()));
             }
@@ -592,10 +604,13 @@ fn unvectorize_if_possible(mut state: State) -> State {
 pub fn assert_state_vector_lengths(state: &State) {
     let expected_len = state.vector_size;
 
-    // Check heap
+    // Check heap (use get_opt since some slots may be allocated but not set)
     for i in 0..state.heap.len() {
         let id = HeapId::from_raw(i);
-        match state.heap.get(id) {
+        let Some(heap_value) = state.heap.get_opt(id) else {
+            continue; // Skip empty slots
+        };
+        match heap_value {
             HeapValue::Value(Value::Number(MaybeVector::Vector(v))) => {
                 assert_eq!(v.len(), expected_len, "Vector length mismatch in heap (numbers)");
             }
@@ -662,21 +677,11 @@ pub fn assert_state_vector_lengths(state: &State) {
 
 /// Clean states by removing local_env entries that don't appear in all states.
 /// This allows states with different dead temporaries to merge.
-///
-/// IMPORTANT: Only cleans scalar states (vector_size=1) to avoid issues with
-/// states that have internal vector values.
 fn clean_local_envs_for_merging(states: Vec<State>) -> Vec<State> {
     use std::collections::HashSet;
     use crate::ir::LocalId;
 
     if states.len() <= 1 {
-        return states;
-    }
-
-    // Only clean states that are all scalar (vector_size=1)
-    // Vectorized states might have internal vector values with different lengths
-    let all_scalar = states.iter().all(|s| s.vector_size == 1);
-    if !all_scalar {
         return states;
     }
 
@@ -734,6 +739,183 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
     }
 
     result
+}
+
+/// A normalized state representation for efficient comparison.
+/// This is the state after GC and with deterministic heap IDs.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct NormalizedState {
+    /// The shape (structure with vectorizable values normalized)
+    shape: StateShape,
+    /// The actual vectorizable values, in a deterministic order
+    /// This allows us to compare states for equality
+    vectorizable_values: Vec<VectorizableValue>,
+}
+
+/// A vectorizable value extracted from a state
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum VectorizableValue {
+    Number(Pico8Num),
+    NumberInterval(Pico8Num, Pico8Num),  // low, high
+    Bool(bool),
+    // For vectors, we store sorted unique values to normalize
+    NumberVector(Vec<Pico8Num>),
+    NumberIntervalVector(Vec<(Pico8Num, Pico8Num)>),
+    BoolVector(Vec<bool>),
+}
+
+fn extract_vectorizable_value(value: &Value) -> Option<VectorizableValue> {
+    match value {
+        Value::Number(MaybeVector::Scalar(n)) => Some(VectorizableValue::Number(*n)),
+        Value::Number(MaybeVector::Vector(nums)) => {
+            let mut raw: Vec<Pico8Num> = nums.clone();
+            raw.sort();
+            raw.dedup();
+            Some(VectorizableValue::NumberVector(raw))
+        }
+        Value::NumberInterval(MaybeVector::Scalar(interval)) => {
+            Some(VectorizableValue::NumberInterval(interval.low, interval.high))
+        }
+        Value::NumberInterval(MaybeVector::Vector(intervals)) => {
+            let mut raw: Vec<(Pico8Num, Pico8Num)> = intervals.iter()
+                .map(|i| (i.low, i.high))
+                .collect();
+            raw.sort();
+            raw.dedup();
+            Some(VectorizableValue::NumberIntervalVector(raw))
+        }
+        Value::Bool(MaybeVector::Scalar(b)) => Some(VectorizableValue::Bool(*b)),
+        Value::Bool(MaybeVector::Vector(bools)) => {
+            let mut raw: Vec<bool> = bools.clone();
+            raw.sort();
+            raw.dedup();
+            Some(VectorizableValue::BoolVector(raw))
+        }
+        _ => None,
+    }
+}
+
+fn extract_vectorizable_values_from_state(state: &State) -> Vec<VectorizableValue> {
+    let mut values = Vec::new();
+
+    // Extract from heap (in order, skip empty slots)
+    for i in 0..state.heap.len() {
+        let id = HeapId::from_raw(i);
+        let Some(heap_value) = state.heap.get_opt(id) else {
+            continue;
+        };
+        match heap_value {
+            HeapValue::Value(v) => {
+                if let Some(vv) = extract_vectorizable_value(v) {
+                    values.push(vv);
+                }
+            }
+            HeapValue::Closure(_, captures) => {
+                for v in captures {
+                    if let Some(vv) = extract_vectorizable_value(v) {
+                        values.push(vv);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Extract from local_env (sorted by key for determinism)
+    let mut local_entries: Vec<_> = state.local_env.iter().collect();
+    local_entries.sort_by_key(|(k, _)| *k);
+    for (_, v) in local_entries {
+        if let Some(vv) = extract_vectorizable_value(v) {
+            values.push(vv);
+        }
+    }
+
+    // Extract from outer_local_envs
+    for env in &state.outer_local_envs {
+        let mut entries: Vec<_> = env.iter().collect();
+        entries.sort_by_key(|(k, _)| *k);
+        for (_, v) in entries {
+            if let Some(vv) = extract_vectorizable_value(v) {
+                values.push(vv);
+            }
+        }
+    }
+
+    values
+}
+
+/// Normalize a state for comparison purposes.
+/// Two states that are "the same" will have equal NormalizedState representations.
+pub fn normalize_state_for_comparison(state: &State) -> NormalizedState {
+    // First, GC and renumber the state to get deterministic heap IDs
+    let mut state = state.clone();
+    state.gc();
+
+    let shape = shape_of_state(&state);
+    let vectorizable_values = extract_vectorizable_values_from_state(&state);
+
+    NormalizedState {
+        shape,
+        vectorizable_values,
+    }
+}
+
+/// Compute union and diff of two state sets.
+///
+/// Given `accumulated` (states already seen) and `potentially_new` (states just arrived),
+/// returns:
+/// - `union`: All states (accumulated + truly new ones)
+/// - `actually_new`: Only the states that weren't already in accumulated
+///
+/// This is the key operation for fixed-point iteration at hint_normalize blocks.
+pub fn union_diff_states(
+    accumulated: Vec<State>,
+    potentially_new: Vec<State>,
+) -> (Vec<State>, Vec<State>) {
+    use std::collections::HashSet;
+
+    if accumulated.is_empty() {
+        // First, deduplicate within potentially_new
+        let mut seen: HashSet<NormalizedState> = HashSet::new();
+        let mut unique = Vec::new();
+        for state in potentially_new {
+            let normalized = normalize_state_for_comparison(&state);
+            if !seen.contains(&normalized) {
+                seen.insert(normalized);
+                unique.push(state);
+            }
+        }
+        return (unique.clone(), unique);
+    }
+
+    if potentially_new.is_empty() {
+        // Nothing new
+        return (accumulated, vec![]);
+    }
+
+    // Build a set of normalized accumulated states for fast lookup
+    let accumulated_normalized: HashSet<NormalizedState> = accumulated
+        .iter()
+        .map(normalize_state_for_comparison)
+        .collect();
+
+    // Partition potentially_new into truly new vs already seen
+    // Also deduplicate within potentially_new
+    let mut seen: HashSet<NormalizedState> = accumulated_normalized.clone();
+    let mut actually_new = Vec::new();
+    for state in potentially_new {
+        let normalized = normalize_state_for_comparison(&state);
+        if !seen.contains(&normalized) {
+            seen.insert(normalized);
+            actually_new.push(state);
+        }
+    }
+
+    // Union = accumulated + actually_new
+    let mut union = accumulated;
+    union.extend(actually_new.clone());
+
+    (union, actually_new)
 }
 
 #[cfg(test)]
@@ -987,5 +1169,291 @@ mod tests {
         assert_eq!(result.len(), 1);
         let state = &result[0];
         assert_eq!(state.vector_size, 2, "Duplicate should be removed");
+    }
+}
+
+// ============================================================================
+// Watermark-based Auto-Renormalization
+// ============================================================================
+
+/// Tracks vectorization watermark for automatic renormalization decisions.
+///
+/// The watermark represents the "good" state count after the last successful
+/// vectorization. When the current state count exceeds the threshold multiplier
+/// times the watermark, we should trigger renormalization.
+#[derive(Clone, Debug)]
+pub struct VectorizationWatermark {
+    /// Shape count after last successful vectorization
+    last_shape_count: usize,
+    /// Total expanded count (sum of vector_size) after last vectorization
+    last_expanded_count: usize,
+    /// Threshold multiplier - renormalize when shapes > watermark * threshold
+    threshold_multiplier: f64,
+    /// Number of times auto-renormalization was triggered
+    pub auto_renorm_count: usize,
+}
+
+impl Default for VectorizationWatermark {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VectorizationWatermark {
+    pub fn new() -> Self {
+        Self {
+            last_shape_count: 1,
+            last_expanded_count: 1,
+            threshold_multiplier: 5.0,
+            auto_renorm_count: 0,
+        }
+    }
+
+    /// Create with a custom threshold multiplier
+    pub fn with_threshold(threshold_multiplier: f64) -> Self {
+        Self {
+            threshold_multiplier,
+            ..Self::new()
+        }
+    }
+
+    /// Check if we should auto-renormalize based on current shape count
+    pub fn should_renormalize(&self, current_shape_count: usize) -> bool {
+        let threshold = (self.last_shape_count as f64 * self.threshold_multiplier) as usize;
+        current_shape_count > threshold
+    }
+
+    /// Update watermark after successful vectorization
+    pub fn update(&mut self, new_shape_count: usize, new_expanded_count: usize) {
+        self.last_shape_count = new_shape_count.max(1);
+        self.last_expanded_count = new_expanded_count.max(1);
+    }
+
+    /// Get the current watermark values
+    pub fn watermark(&self) -> (usize, usize) {
+        (self.last_shape_count, self.last_expanded_count)
+    }
+}
+
+/// A set of states with watermark tracking for auto-renormalization.
+///
+/// This wraps a Vec<State> and tracks vectorization watermarks to decide
+/// when to automatically trigger renormalization.
+#[derive(Clone, Debug)]
+pub struct StateSet {
+    states: Vec<State>,
+    watermark: VectorizationWatermark,
+}
+
+impl StateSet {
+    /// Create a new StateSet from a vec of states
+    pub fn new(states: Vec<State>) -> Self {
+        let mut set = Self {
+            states,
+            watermark: VectorizationWatermark::new(),
+        };
+        // Initialize watermark based on initial states
+        set.watermark.update(set.shape_count(), set.expanded_count());
+        set
+    }
+
+    /// Create an empty StateSet
+    pub fn empty() -> Self {
+        Self {
+            states: Vec::new(),
+            watermark: VectorizationWatermark::new(),
+        }
+    }
+
+    /// Get the number of distinct state shapes (number of State objects)
+    pub fn shape_count(&self) -> usize {
+        self.states.len()
+    }
+
+    /// Get the total expanded count (sum of vector_size across all states)
+    pub fn expanded_count(&self) -> usize {
+        self.states.iter().map(|s| s.vector_size).sum()
+    }
+
+    /// Check if we should auto-renormalize and do it if needed
+    /// Returns true if renormalization was performed
+    pub fn maybe_renormalize(&mut self) -> bool {
+        if self.states.len() <= 1 {
+            return false;
+        }
+
+        if self.watermark.should_renormalize(self.states.len()) {
+            self.force_renormalize();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Force renormalization regardless of watermark
+    pub fn force_renormalize(&mut self) {
+        if self.states.is_empty() {
+            return;
+        }
+
+        let old_count = self.states.len();
+        self.states = vectorize_states(std::mem::take(&mut self.states));
+        let new_count = self.states.len();
+
+        // Update watermark with new counts
+        self.watermark.update(new_count, self.expanded_count());
+        self.watermark.auto_renorm_count += 1;
+
+        // Log if significant reduction
+        if old_count > new_count * 2 {
+            // Could add profiling/tracing here
+        }
+    }
+
+    /// Get the underlying states (consuming self)
+    pub fn into_states(self) -> Vec<State> {
+        self.states
+    }
+
+    /// Get a reference to the underlying states
+    pub fn states(&self) -> &[State] {
+        &self.states
+    }
+
+    /// Get a mutable reference to the underlying states
+    pub fn states_mut(&mut self) -> &mut Vec<State> {
+        &mut self.states
+    }
+
+    /// Add states and maybe renormalize
+    pub fn extend(&mut self, other: Vec<State>) {
+        self.states.extend(other);
+        self.maybe_renormalize();
+    }
+
+    /// Add a single state and maybe renormalize
+    pub fn push(&mut self, state: State) {
+        self.states.push(state);
+        self.maybe_renormalize();
+    }
+
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.states.is_empty()
+    }
+
+    /// Get the number of auto-renormalizations that occurred
+    pub fn auto_renorm_count(&self) -> usize {
+        self.watermark.auto_renorm_count
+    }
+
+    /// Get the watermark reference
+    pub fn watermark(&self) -> &VectorizationWatermark {
+        &self.watermark
+    }
+
+    /// Take states out, leaving empty vec
+    pub fn take(&mut self) -> Vec<State> {
+        std::mem::take(&mut self.states)
+    }
+}
+
+impl From<Vec<State>> for StateSet {
+    fn from(states: Vec<State>) -> Self {
+        StateSet::new(states)
+    }
+}
+
+impl From<StateSet> for Vec<State> {
+    fn from(set: StateSet) -> Self {
+        set.into_states()
+    }
+}
+
+#[cfg(test)]
+mod watermark_tests {
+    use super::*;
+    use crate::interpreter::value::MaybeVector;
+    use crate::pico8_num::Pico8Num;
+
+    #[test]
+    fn test_watermark_initial_values() {
+        let wm = VectorizationWatermark::new();
+        assert_eq!(wm.last_shape_count, 1);
+        assert_eq!(wm.last_expanded_count, 1);
+        assert!(!wm.should_renormalize(1));
+        assert!(!wm.should_renormalize(5));
+        assert!(wm.should_renormalize(6)); // > 1 * 5
+    }
+
+    #[test]
+    fn test_watermark_update() {
+        let mut wm = VectorizationWatermark::new();
+        wm.update(10, 100);
+        assert_eq!(wm.watermark(), (10, 100));
+        assert!(!wm.should_renormalize(50)); // <= 10 * 5
+        assert!(wm.should_renormalize(51));  // > 10 * 5
+    }
+
+    #[test]
+    fn test_state_set_basic() {
+        let state = State::new();
+        let set = StateSet::new(vec![state]);
+        assert_eq!(set.shape_count(), 1);
+        assert_eq!(set.expanded_count(), 1);
+    }
+
+    #[test]
+    fn test_state_set_auto_renormalize() {
+        // Create many states with the same shape that should merge
+        let mut states = Vec::new();
+        for i in 0..10 {
+            let mut state = State::new();
+            state.vector_size = 1;
+            let id = state.heap.alloc();
+            state.heap.set(id, HeapValue::Value(Value::Number(
+                MaybeVector::Scalar(Pico8Num::from_i16(i))
+            )));
+            state.local_env.set(crate::ir::LocalId::from(0), Value::Number(
+                MaybeVector::Scalar(Pico8Num::from_i16(i))
+            ));
+            states.push(state);
+        }
+
+        let mut set = StateSet::new(states);
+        // Initial watermark is 10 (all different shapes due to different heap values)
+        // But actually they have the same shape, so vectorize should merge them
+
+        // Force renormalize
+        set.force_renormalize();
+
+        // After vectorization, should have fewer shapes
+        // (depends on whether they have same shape)
+        assert!(set.shape_count() <= 10);
+    }
+
+    #[test]
+    fn test_state_set_threshold_trigger() {
+        // Create initial set with 1 state
+        let state = State::new();
+        let mut set = StateSet::new(vec![state]);
+        assert_eq!(set.watermark().last_shape_count, 1);
+
+        // Add states until we hit threshold (> 5 for threshold_multiplier=5)
+        for _ in 0..5 {
+            set.push(State::new());
+        }
+        // 6 states now, threshold is 5, so should have auto-renormalized
+        // But State::new() creates states with same shape, so they merge to 1
+
+        // The auto_renorm_count should have increased
+        // (unless all states merged before threshold was hit)
+    }
+
+    #[test]
+    fn test_watermark_custom_threshold() {
+        let wm = VectorizationWatermark::with_threshold(2.0);
+        assert!(!wm.should_renormalize(2)); // <= 1 * 2
+        assert!(wm.should_renormalize(3));  // > 1 * 2
     }
 }

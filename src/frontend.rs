@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{bail, Result};
 use full_moon::{
     ast::{self},
+    node::Node,
     tokenizer::{Symbol, TokenReference, TokenType},
 };
 use itertools::Itertools;
@@ -10,10 +11,27 @@ use itertools::Itertools;
 use crate::{
     ir::{
         BinaryOp, Block, Cfg, FunDef, GlobalIdGenerator, Instruction, Label, LabelGenerator,
-        LocalId, LocalIdGenerator, Terminator, UnaryOp,
+        LocalId, LocalIdGenerator, SourcePosition, SourceSpan, Terminator, UnaryOp,
     },
     pico8_num::Pico8Num,
 };
+
+/// Extract a SourceSpan from a full_moon AST node.
+fn extract_span<N: Node>(node: &N) -> Option<SourceSpan> {
+    let (start, end) = node.range()?;
+    Some(SourceSpan {
+        start: SourcePosition {
+            line: start.line(),
+            column: start.character(),
+            bytes: start.bytes(),
+        },
+        end: SourcePosition {
+            line: end.line(),
+            column: end.character(),
+            bytes: end.bytes(),
+        },
+    })
+}
 
 #[derive(Clone, Debug)]
 enum Hint {
@@ -525,6 +543,7 @@ impl Compiler {
         function: &ast::FunctionBody,
         base_name: &str,
         locals: &HashMap<String, LocalId>,
+        source_span: Option<SourceSpan>,
     ) -> Result<(LocalId, Stream)> {
         let params = function
             .parameters()
@@ -621,6 +640,7 @@ impl Compiler {
                 .map(|id| inner_build_result.new_ids_by_old_ids.get(&id).cloned())
                 .collect(),
             cfg: inner_build_result.cfg,
+            source_span,
         };
 
         let closure_id = self.local_id_generator.next();
@@ -817,7 +837,8 @@ impl Compiler {
                     Some(name) => name,
                     None => "anonymous",
                 };
-                let (id, stream) = self.compile_closure(function, name, locals)?;
+                let source_span = extract_span(function);
+                let (id, stream) = self.compile_closure(function, name, locals, source_span)?;
                 Ok((id, None, stream))
             }
             ast::Expression::Parentheses {
@@ -1144,8 +1165,9 @@ impl Compiler {
                 )?;
                 let (name_id, _, name_stream) = self.compile_identifier(name, &locals, true)?;
 
+                let source_span = extract_span(function);
                 let (closure_id, closure_stream) =
-                    self.compile_closure(function.body(), name, &locals)?;
+                    self.compile_closure(function.body(), name, &locals, source_span)?;
 
                 Ok((
                     Stream::from_streams(vec![

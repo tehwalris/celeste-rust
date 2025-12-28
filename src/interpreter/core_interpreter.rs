@@ -327,14 +327,18 @@ impl<'a> CoreInterpreter<'a> {
                 Ok(states)
             }
             HeapValue::Closure(fun_def_name, captured_values) => {
-                let _span = SpanGuard::new(&format!("closure:{}", fun_def_name.as_str()), "call");
-
                 // Look up the function definition with prepared CFG
                 let (fun_def, prepared_cfg) = self
                     .fixed_env
                     .fun_defs
                     .get(&fun_def_name)
                     .ok_or_else(|| anyhow!("Unknown function: {:?}", fun_def_name))?;
+
+                let _span = SpanGuard::new_with_source(
+                    &format!("closure:{}", fun_def_name.as_str()),
+                    "call",
+                    fun_def.source_span.as_ref(),
+                );
 
                 // Create a new local_env for the function body
                 let mut new_local_env = super::local_env::LocalEnv::new();
@@ -375,12 +379,13 @@ impl<'a> CoreInterpreter<'a> {
                 };
 
                 // Recursively interpret the function's prepared CFG (uses cached labels)
-                // Pass function name for profiling
+                // Pass function name and source span for profiling
                 let result_states = super::glue::interpret_prepared_cfg_with_name(
                     prepared_cfg,
                     function_state,
                     self.fixed_env,
                     Some(fun_def_name.as_str().to_string()),
+                    fun_def.source_span,
                 )?;
 
                 // Track if this closure call caused a state split
@@ -395,6 +400,11 @@ impl<'a> CoreInterpreter<'a> {
                         )
                     });
                 }
+
+                // NOTE: We intentionally do NOT auto-renormalize here because:
+                // 1. Each state is paired with its specific return value
+                // 2. Vectorizing states would lose the state-to-return-value association
+                // 3. Auto-renormalization happens in flow.rs and glue.rs after calls complete
 
                 // For each result state, create an output state that:
                 // 1. Takes the heap, global_env, and prints from the function execution

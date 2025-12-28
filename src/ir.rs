@@ -4,6 +4,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::pico8_num::Pico8Num;
 
+/// A source location representing a position in the original Lua source code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourcePosition {
+    /// 1-indexed line number
+    pub line: usize,
+    /// 1-indexed column number (character on the line)
+    pub column: usize,
+    /// Byte offset from the start of the file
+    pub bytes: usize,
+}
+
+/// A span in the source code, from start to end position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceSpan {
+    pub start: SourcePosition,
+    pub end: SourcePosition,
+}
+
 #[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct LocalId(usize);
 
@@ -349,4 +367,6 @@ pub struct FunDef {
     pub capture_ids: Vec<LocalId>,
     pub arg_ids: Vec<Option<LocalId>>,
     pub cfg: Cfg,
+    /// Source span of the function definition in the original Lua source
+    pub source_span: Option<SourceSpan>,
 }

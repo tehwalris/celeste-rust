@@ -6,9 +6,172 @@
 //! 3. Chrome Tracing - wall-clock span-based profiling
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
+
+use crate::ir::{Block, Cfg, FunDef, Instruction, Label, SourceSpan, Terminator};
+
+// ============================================================================
+// CFG Structure Export
+// ============================================================================
+
+/// Serializable representation of a CFG for visualization
+#[derive(Debug, Clone, Serialize)]
+pub struct CfgExport {
+    /// The function name (GlobalId)
+    pub name: String,
+    /// Entry block
+    pub entry_block: BlockExport,
+    /// Named blocks (label -> block)
+    pub named_blocks: Vec<(String, BlockExport)>,
+    /// Edges between blocks: (source, target, edge_type)
+    pub edges: Vec<CfgEdge>,
+    /// Source location of the function definition
+    pub source_span: Option<SourceSpan>,
+}
+
+/// Serializable representation of a CFG block
+#[derive(Debug, Clone, Serialize)]
+pub struct BlockExport {
+    /// Block label (None for entry block)
+    pub label: Option<String>,
+    /// Number of instructions (including phi)
+    pub instruction_count: usize,
+    /// Whether this is a hint_normalize block
+    pub hint_normalize: bool,
+    /// Terminator type for visualization
+    pub terminator_type: String,
+    /// Brief summary of instructions
+    pub instruction_summary: Vec<String>,
+}
+
+/// An edge in the CFG
+#[derive(Debug, Clone, Serialize)]
+pub struct CfgEdge {
+    /// Source block label (None for entry)
+    pub source: Option<String>,
+    /// Target block label
+    pub target: String,
+    /// Type of edge: "unconditional", "true", "false"
+    pub edge_type: String,
+}
+
+impl BlockExport {
+    pub fn from_block(block: &Block, label: Option<&Label>) -> Self {
+        let terminator_type = match &block.terminator.1 {
+            Terminator::Return { .. } => "return".to_string(),
+            Terminator::UnconditionalBranch { .. } => "unconditional".to_string(),
+            Terminator::ConditionalBranch { .. } => "conditional".to_string(),
+        };
+
+        // Create brief instruction summaries (just the type)
+        let instruction_summary: Vec<String> = block
+            .instructions
+            .iter()
+            .take(5) // Limit to first 5 for brevity
+            .map(|(_, instr)| instruction_type_name(instr))
+            .collect();
+
+        Self {
+            label: label.map(|l| l.as_str().to_string()),
+            instruction_count: block.instructions.len(),
+            hint_normalize: block.hint_normalize,
+            terminator_type,
+            instruction_summary,
+        }
+    }
+}
+
+fn instruction_type_name(instr: &Instruction) -> String {
+    match instr {
+        Instruction::Alloc => "Alloc".to_string(),
+        Instruction::GetGlobal { name, .. } => format!("GetGlobal({})", name),
+        Instruction::Load { .. } => "Load".to_string(),
+        Instruction::Store { .. } => "Store".to_string(),
+        Instruction::StoreEmptyTable { .. } => "StoreEmptyTable".to_string(),
+        Instruction::StoreClosure { fun_def, .. } => format!("StoreClosure({})", fun_def.as_str()),
+        Instruction::GetField { field, .. } => format!("GetField({})", field),
+        Instruction::GetIndex { .. } => "GetIndex".to_string(),
+        Instruction::NumberConstant { value } => format!("Num({:?})", value),
+        Instruction::BoolConstant { value } => format!("Bool({})", value),
+        Instruction::StringConstant { value } => format!("Str({})", &value[..value.len().min(10)]),
+        Instruction::NilConstant => "Nil".to_string(),
+        Instruction::Call { .. } => "Call".to_string(),
+        Instruction::UnaryOp { op, .. } => format!("UnaryOp({:?})", op),
+        Instruction::BinaryOp { op, .. } => format!("BinaryOp({:?})", op),
+        Instruction::Phi { .. } => "Phi".to_string(),
+    }
+}
+
+impl CfgExport {
+    pub fn from_cfg(cfg: &Cfg, name: &str, source_span: Option<SourceSpan>) -> Self {
+        let entry_block = BlockExport::from_block(&cfg.entry, None);
+
+        let named_blocks: Vec<(String, BlockExport)> = cfg
+            .named
+            .iter()
+            .map(|(label, block)| {
+                (label.as_str().to_string(), BlockExport::from_block(block, Some(label)))
+            })
+            .collect();
+
+        // Build edges from terminators
+        let mut edges = Vec::new();
+
+        // Entry block edges
+        Self::add_edges_for_block(&mut edges, None, &cfg.entry);
+
+        // Named block edges
+        for (label, block) in &cfg.named {
+            Self::add_edges_for_block(&mut edges, Some(label.as_str().to_string()), block);
+        }
+
+        Self {
+            name: name.to_string(),
+            entry_block,
+            named_blocks,
+            edges,
+            source_span,
+        }
+    }
+
+    fn add_edges_for_block(edges: &mut Vec<CfgEdge>, source: Option<String>, block: &Block) {
+        match &block.terminator.1 {
+            Terminator::Return { .. } => {
+                // No edges for return
+            }
+            Terminator::UnconditionalBranch { target } => {
+                edges.push(CfgEdge {
+                    source,
+                    target: target.as_str().to_string(),
+                    edge_type: "unconditional".to_string(),
+                });
+            }
+            Terminator::ConditionalBranch {
+                true_target,
+                false_target,
+                ..
+            } => {
+                edges.push(CfgEdge {
+                    source: source.clone(),
+                    target: true_target.as_str().to_string(),
+                    edge_type: "true".to_string(),
+                });
+                edges.push(CfgEdge {
+                    source,
+                    target: false_target.as_str().to_string(),
+                    edge_type: "false".to_string(),
+                });
+            }
+        }
+    }
+
+    pub fn from_fun_def(fun_def: &FunDef) -> Self {
+        Self::from_cfg(&fun_def.cfg, fun_def.name.as_str(), fun_def.source_span)
+    }
+}
 
 // ============================================================================
 // State Flow DAG
@@ -18,6 +181,8 @@ use serde::Serialize;
 #[derive(Debug, Clone, Serialize)]
 pub struct DagNode {
     pub id: u64,
+    /// Global execution step (monotonically increasing order)
+    pub step: u64,
     /// Number of State objects at this node
     pub state_count: usize,
     /// Total vector_size across all states
@@ -26,6 +191,10 @@ pub struct DagNode {
     pub operation: DagOperation,
     /// Time spent processing states at this node (not including children)
     pub processing_time: Duration,
+    /// Wall clock start time in microseconds from profiling start
+    pub start_time_us: u64,
+    /// Wall clock end time in microseconds from profiling start
+    pub end_time_us: u64,
     /// Number of instructions executed at this node
     pub instruction_count: usize,
     /// Number of function calls made at this node
@@ -36,6 +205,8 @@ pub struct DagNode {
     pub merged_from: Vec<u64>,
     /// Fixed-point tree node ID that contains this DAG node
     pub tree_node_id: Option<u64>,
+    /// The CFG name this DAG node belongs to
+    pub cfg_name: Option<String>,
 }
 
 /// What operation created a DAG node
@@ -55,6 +226,8 @@ pub enum DagOperation {
     Vectorization,
     /// States joined at a block entry
     Join,
+    /// States merged via auto-renormalization (watermark-based)
+    AutoRenormalization { trigger: String },
 }
 
 // ============================================================================
@@ -127,6 +300,8 @@ pub struct Profiler {
     next_dag_id: u64,
     /// Next ID for tree nodes
     next_tree_id: u64,
+    /// Global execution step counter
+    next_step: u64,
     /// All DAG nodes
     dag_nodes: Vec<DagNode>,
     /// All tree nodes
@@ -136,9 +311,14 @@ pub struct Profiler {
     /// Stack of active tree node IDs (for tracking nesting)
     tree_stack: Vec<u64>,
     /// Stack of active span start times (for computing durations)
-    span_stack: Vec<(String, String, Instant, Option<u64>, Option<u64>)>,
+    /// Tuple: (name, category, start_instant, dag_node_id, tree_node_id, start_step)
+    span_stack: Vec<(String, String, Instant, Option<u64>, Option<u64>, u64)>,
     /// Current DAG node being processed (if any)
     current_dag_node: Option<u64>,
+    /// Stack of CFG names (for tracking nested calls)
+    cfg_stack: Vec<String>,
+    /// Exported CFGs for visualization
+    cfgs: HashMap<String, CfgExport>,
 }
 
 impl Default for Profiler {
@@ -154,12 +334,15 @@ impl Profiler {
             start_time: Instant::now(),
             next_dag_id: 0,
             next_tree_id: 0,
+            next_step: 0,
             dag_nodes: Vec::new(),
             tree_nodes: Vec::new(),
             spans: Vec::new(),
             tree_stack: Vec::new(),
             span_stack: Vec::new(),
             current_dag_node: None,
+            cfg_stack: Vec::new(),
+            cfgs: HashMap::new(),
         }
     }
 
@@ -177,12 +360,50 @@ impl Profiler {
         self.start_time = Instant::now();
         self.next_dag_id = 0;
         self.next_tree_id = 0;
+        self.next_step = 0;
         self.dag_nodes.clear();
         self.tree_nodes.clear();
         self.spans.clear();
         self.tree_stack.clear();
         self.span_stack.clear();
         self.current_dag_node = None;
+        self.cfg_stack.clear();
+        self.cfgs.clear();
+    }
+
+    // ========================================================================
+    // CFG Registration
+    // ========================================================================
+
+    /// Register a CFG for visualization
+    pub fn register_cfg(&mut self, cfg: &Cfg, name: &str, source_span: Option<SourceSpan>) {
+        if !self.enabled {
+            return;
+        }
+        if !self.cfgs.contains_key(name) {
+            self.cfgs.insert(name.to_string(), CfgExport::from_cfg(cfg, name, source_span));
+        }
+    }
+
+    /// Push a CFG onto the stack when entering it
+    pub fn push_cfg(&mut self, name: String) {
+        if !self.enabled {
+            return;
+        }
+        self.cfg_stack.push(name);
+    }
+
+    /// Pop a CFG from the stack when leaving it
+    pub fn pop_cfg(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        self.cfg_stack.pop();
+    }
+
+    /// Get the current CFG name (top of stack)
+    pub fn current_cfg_name(&self) -> Option<&str> {
+        self.cfg_stack.last().map(|s| s.as_str())
     }
 
     // ========================================================================
@@ -202,19 +423,27 @@ impl Profiler {
         }
         let id = self.next_dag_id;
         self.next_dag_id += 1;
+        let step = self.next_step;
+        self.next_step += 1;
         let tree_node_id = self.tree_stack.last().copied();
+        let cfg_name = self.cfg_stack.last().cloned();
+        let start_time_us = Instant::now().duration_since(self.start_time).as_micros() as u64;
 
         let node = DagNode {
             id,
+            step,
             state_count,
             expanded_count,
             operation,
             processing_time: Duration::ZERO,
+            start_time_us,
+            end_time_us: start_time_us, // Will be updated later
             instruction_count: 0,
             call_count: 0,
             parent_id,
             merged_from: Vec::new(),
             tree_node_id,
+            cfg_name,
         };
         self.dag_nodes.push(node);
 
@@ -241,19 +470,27 @@ impl Profiler {
         }
         let id = self.next_dag_id;
         self.next_dag_id += 1;
+        let step = self.next_step;
+        self.next_step += 1;
         let tree_node_id = self.tree_stack.last().copied();
+        let cfg_name = self.cfg_stack.last().cloned();
+        let start_time_us = Instant::now().duration_since(self.start_time).as_micros() as u64;
 
         let node = DagNode {
             id,
+            step,
             state_count,
             expanded_count,
             operation,
             processing_time: Duration::ZERO,
+            start_time_us,
+            end_time_us: start_time_us, // Will be updated later
             instruction_count: 0,
             call_count: 0,
             parent_id: None,
             merged_from,
             tree_node_id,
+            cfg_name,
         };
         self.dag_nodes.push(node);
 
@@ -277,8 +514,10 @@ impl Profiler {
         if !self.enabled {
             return;
         }
+        let end_time_us = Instant::now().duration_since(self.start_time).as_micros() as u64;
         if let Some(node) = self.dag_nodes.iter_mut().find(|n| n.id == id) {
             node.processing_time = processing_time;
+            node.end_time_us = end_time_us;
             node.instruction_count = instruction_count;
             node.call_count = call_count;
         }
@@ -290,6 +529,11 @@ impl Profiler {
 
     pub fn current_dag_node(&self) -> Option<u64> {
         self.current_dag_node
+    }
+
+    /// Get the current step number (next step that will be assigned)
+    pub fn current_step(&self) -> u64 {
+        self.next_step
     }
 
     // ========================================================================
@@ -373,12 +617,14 @@ impl Profiler {
         }
         let dag_node_id = self.current_dag_node;
         let tree_node_id = self.tree_stack.last().copied();
+        let start_step = self.next_step;
         self.span_stack.push((
             name.to_string(),
             category.to_string(),
             Instant::now(),
             dag_node_id,
             tree_node_id,
+            start_step,
         ));
     }
 
@@ -388,15 +634,20 @@ impl Profiler {
     }
 
     /// End the current span with additional metadata
-    pub fn end_span_with_args(&mut self, args: std::collections::HashMap<String, String>) {
+    pub fn end_span_with_args(&mut self, mut args: std::collections::HashMap<String, String>) {
         if !self.enabled {
             return;
         }
-        if let Some((name, category, start, dag_node_id, tree_node_id)) = self.span_stack.pop() {
+        if let Some((name, category, start, dag_node_id, tree_node_id, start_step)) = self.span_stack.pop() {
             let end = Instant::now();
             let duration = end.duration_since(start);
             let start_us = start.duration_since(self.start_time).as_micros() as u64;
             let duration_us = duration.as_micros() as u64;
+            let end_step = self.next_step;
+
+            // Add step range to args
+            args.insert("start_step".to_string(), start_step.to_string());
+            args.insert("end_step".to_string(), end_step.to_string());
 
             self.spans.push(Span {
                 name,
@@ -464,6 +715,16 @@ impl Profiler {
     /// Export tree to JSON
     pub fn tree_to_json(&self) -> String {
         serde_json::to_string_pretty(&self.tree_nodes).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    /// Export CFGs to JSON
+    pub fn cfgs_to_json(&self) -> String {
+        serde_json::to_string_pretty(&self.cfgs).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Get all registered CFGs
+    pub fn cfgs(&self) -> &HashMap<String, CfgExport> {
+        &self.cfgs
     }
 
     /// Get summary statistics
@@ -588,6 +849,11 @@ pub fn get_tree_json() -> String {
     PROFILER.with(|p| p.borrow().tree_to_json())
 }
 
+/// Get CFGs JSON
+pub fn get_cfgs_json() -> String {
+    PROFILER.with(|p| p.borrow().cfgs_to_json())
+}
+
 // ============================================================================
 // Convenience macros and RAII guards
 // ============================================================================
@@ -595,6 +861,7 @@ pub fn get_tree_json() -> String {
 /// RAII guard for a span
 pub struct SpanGuard {
     active: bool,
+    args: std::collections::HashMap<String, String>,
 }
 
 impl SpanGuard {
@@ -603,11 +870,37 @@ impl SpanGuard {
         if active {
             with_profiler(|p| p.start_span(name, category));
         }
-        Self { active }
+        Self {
+            active,
+            args: std::collections::HashMap::new(),
+        }
     }
 
-    pub fn end_with_args(mut self, args: std::collections::HashMap<String, String>) {
+    /// Create a span with source location info
+    pub fn new_with_source(name: &str, category: &str, source_span: Option<&crate::ir::SourceSpan>) -> Self {
+        let active = is_profiling_enabled();
+        if active {
+            with_profiler(|p| p.start_span(name, category));
+        }
+        let mut args = std::collections::HashMap::new();
+        if let Some(span) = source_span {
+            args.insert("line".to_string(), span.start.line.to_string());
+            args.insert("end_line".to_string(), span.end.line.to_string());
+        }
+        Self { active, args }
+    }
+
+    /// Add an argument to be included when the span ends
+    pub fn add_arg(&mut self, key: &str, value: &str) {
+        self.args.insert(key.to_string(), value.to_string());
+    }
+
+    pub fn end_with_args(mut self, mut args: std::collections::HashMap<String, String>) {
         if self.active {
+            // Merge stored args with provided args
+            for (k, v) in self.args.drain() {
+                args.entry(k).or_insert(v);
+            }
             with_profiler(|p| p.end_span_with_args(args));
             self.active = false;
         }
@@ -617,7 +910,9 @@ impl SpanGuard {
 impl Drop for SpanGuard {
     fn drop(&mut self) {
         if self.active {
-            with_profiler(|p| p.end_span());
+            // Pass stored args when dropping
+            let args = std::mem::take(&mut self.args);
+            with_profiler(|p| p.end_span_with_args(args));
         }
     }
 }

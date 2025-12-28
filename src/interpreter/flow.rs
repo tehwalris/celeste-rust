@@ -13,8 +13,10 @@ use crate::{
 use super::{
     core_interpreter::CoreInterpreter,
     fixed_env::FixedEnv,
+    profiling::{DagOperation, with_profiler},
     state::State,
     value::{MaybeVector, Value},
+    vectorize::vectorize_states,
 };
 
 pub struct InterpreterFlowAdapter<'a> {
@@ -213,6 +215,24 @@ impl<'a> BoundInterpreterFlow<'a> {
                             }
                         }
                     }
+
+                    // Auto-renormalize if state count exploded after a call
+                    // This prevents state explosion from propagating through subsequent instructions
+                    if new_states.len() > 10 {
+                        let old_count = new_states.len();
+                        new_states = vectorize_states(new_states);
+                        if new_states.len() < old_count {
+                            with_profiler(|p| {
+                                p.create_dag_node(
+                                    new_states.len(),
+                                    new_states.iter().map(|s| s.vector_size).sum(),
+                                    DagOperation::AutoRenormalization { trigger: "post_call".to_string() },
+                                    p.current_dag_node(),
+                                )
+                            });
+                        }
+                    }
+
                     states = new_states;
                 }
                 Ok(FlowData::States(states))

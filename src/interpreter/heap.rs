@@ -103,7 +103,7 @@ impl Heap {
         id
     }
 
-    fn get_opt(&self, id: HeapId) -> Option<&HeapValue> {
+    pub fn get_opt(&self, id: HeapId) -> Option<&HeapValue> {
         // First check the overlay
         if let Some(value) = self.new_values.get(&id.0) {
             return value.as_ref();
