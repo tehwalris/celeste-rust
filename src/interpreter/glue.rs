@@ -239,12 +239,6 @@ fn interpret_prepared_cfg_inner(
     let mut states_processed = 0;
     let mut blocks_executed = 0;
 
-    // Watermark for auto-renormalization
-    // Track the "good" state count and renormalize when count exceeds threshold
-    let mut watermark_state_count: usize = 1;
-    let watermark_threshold_multiplier: f64 = 5.0;
-    let mut auto_renorm_count: usize = 0;
-
     // Create initial DAG node
     let initial_state_count = 1;
     let initial_expanded = initial_state.vector_size;
@@ -346,10 +340,6 @@ fn interpret_prepared_cfg_inner(
                     // Update the accumulator with the union (persists for next iteration)
                     *accumulated_states = new_union;
 
-                    // Update watermark after hint_normalize vectorization
-                    // This is a "good" state count to use as baseline
-                    watermark_state_count = actually_new.len().max(1);
-
                     // Only process actually_new states
                     if actually_new.is_empty() {
                         // No new states - continue looking for other accumulators
@@ -409,43 +399,7 @@ fn interpret_prepared_cfg_inner(
         // Note: For hint_normalize blocks, states were already vectorized when pulled from accumulators
         let instruction_count = block.instructions.len();
         let bound_post_phi = adapter.flow_block_post_phi(block)?;
-        let mut flow_data = bound_post_phi.flow(flow_data)?;
-
-        // Auto-renormalize if state count exceeds watermark threshold
-        // This prevents state explosion from propagating between blocks
-        let (current_state_count, _) = flow_data.counts();
-        let threshold = (watermark_state_count as f64 * watermark_threshold_multiplier) as usize;
-        if current_state_count > threshold {
-            flow_data = match flow_data {
-                FlowData::States(states) => {
-                    let old_count = states.len();
-                    let vectorized = vectorize_states(states);
-                    let new_count = vectorized.len();
-
-                    if new_count < old_count {
-                        auto_renorm_count += 1;
-                        with_profiler(|p| {
-                            p.create_dag_node(
-                                new_count,
-                                vectorized.iter().map(|s| s.vector_size).sum(),
-                                DagOperation::AutoRenormalization {
-                                    trigger: format!("watermark_exceeded({}>{}, block={})",
-                                        old_count, threshold,
-                                        block_name.as_deref().unwrap_or("entry"))
-                                },
-                                Some(block_dag_id),
-                            )
-                        });
-
-                        // Update watermark after successful renormalization
-                        watermark_state_count = new_count.max(1);
-                    }
-
-                    FlowData::States(vectorized)
-                }
-                other => other, // Can't vectorize StatesAndReturns easily
-            };
-        }
+        let flow_data = bound_post_phi.flow(flow_data)?;
 
         // Update DAG node with processing stats
         with_profiler(|p| {
@@ -569,16 +523,6 @@ fn interpret_prepared_cfg_inner(
     with_profiler(|p| {
         p.set_current_dag_node(None);
         p.pop_cfg();
-
-        // Log auto-renormalization stats if any occurred
-        if p.is_enabled() && auto_renorm_count > 0 {
-            eprintln!(
-                "[auto-renorm] {} in CFG {:?} (final watermark: {})",
-                auto_renorm_count,
-                name.as_deref().unwrap_or("__main"),
-                watermark_state_count
-            );
-        }
     });
 
     Ok(results)
