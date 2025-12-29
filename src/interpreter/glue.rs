@@ -15,6 +15,7 @@ use super::{
     fixed_env::FixedEnv,
     flow::{BoundInterpreterFlow, FlowData, InterpreterFlowAdapter},
     profiling::{DagOperation, FixedPointGuard, SpanGuard, with_profiler},
+    state::State,
     vectorize::{vectorize_states, union_diff_states},
 };
 
@@ -167,7 +168,7 @@ impl<'a>
     }
 }
 
-use super::{state::State, value::Value, fixed_env::PreparedCfg};
+use super::{value::Value, fixed_env::PreparedCfg};
 use crate::ir::Terminator;
 
 /// Interprets a CFG with the given initial state and fixed environment.

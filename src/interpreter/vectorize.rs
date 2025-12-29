@@ -702,28 +702,76 @@ fn clean_local_envs_for_merging(states: Vec<State>) -> Vec<State> {
 /// Vectorize a collection of states.
 /// States with the same "shape" are merged into single states with vector values.
 /// This reduces the number of states while preserving all the information.
+/// Timing stats for vectorize_states (for profiling)
+#[derive(Default)]
+pub struct VectorizeTimingStats {
+    pub input_validation_ns: u64,
+    pub clean_local_envs_ns: u64,
+    pub shape_grouping_ns: u64,
+    pub vectorize_groups_ns: u64,
+    pub output_validation_ns: u64,
+    pub input_count: usize,
+    pub output_count: usize,
+    pub group_count: usize,
+}
+
+thread_local! {
+    static LAST_VECTORIZE_STATS: std::cell::RefCell<Option<VectorizeTimingStats>> = std::cell::RefCell::new(None);
+}
+
+pub fn get_last_vectorize_stats() -> Option<VectorizeTimingStats> {
+    LAST_VECTORIZE_STATS.with(|s| s.borrow().clone())
+}
+
+impl Clone for VectorizeTimingStats {
+    fn clone(&self) -> Self {
+        Self {
+            input_validation_ns: self.input_validation_ns,
+            clean_local_envs_ns: self.clean_local_envs_ns,
+            shape_grouping_ns: self.shape_grouping_ns,
+            vectorize_groups_ns: self.vectorize_groups_ns,
+            output_validation_ns: self.output_validation_ns,
+            input_count: self.input_count,
+            output_count: self.output_count,
+            group_count: self.group_count,
+        }
+    }
+}
+
 pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
+    let mut stats = VectorizeTimingStats::default();
+    stats.input_count = states.len();
+
     if states.is_empty() {
+        LAST_VECTORIZE_STATS.with(|s| *s.borrow_mut() = Some(stats));
         return states;
     }
 
     // Validate input states
+    let t0 = std::time::Instant::now();
     for state in &states {
         assert_state_vector_lengths(state);
     }
+    stats.input_validation_ns = t0.elapsed().as_nanos() as u64;
 
     // Clean local_envs: remove variables that don't appear in all states.
     // This allows states with different dead temporaries to merge.
+    let t1 = std::time::Instant::now();
     let states = clean_local_envs_for_merging(states);
+    stats.clean_local_envs_ns = t1.elapsed().as_nanos() as u64;
 
     // Group states by shape
+    let t2 = std::time::Instant::now();
     let mut states_by_shape: HashMap<StateShape, Vec<State>> = HashMap::new();
     for state in states {
         let shape = shape_of_state(&state);
         states_by_shape.entry(shape).or_insert_with(Vec::new).push(state);
     }
+    stats.shape_grouping_ns = t2.elapsed().as_nanos() as u64;
+    stats.group_count = states_by_shape.len();
 
     // Vectorize each group
+    let t3 = std::time::Instant::now();
     let result: Vec<State> = states_by_shape
         .into_iter()
         .map(|(_, group)| {
@@ -732,12 +780,17 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
             unvectorize_if_possible(deduped)
         })
         .collect();
+    stats.vectorize_groups_ns = t3.elapsed().as_nanos() as u64;
 
     // Validate output states
+    let t4 = std::time::Instant::now();
     for state in &result {
         assert_state_vector_lengths(state);
     }
+    stats.output_validation_ns = t4.elapsed().as_nanos() as u64;
+    stats.output_count = result.len();
 
+    LAST_VECTORIZE_STATS.with(|s| *s.borrow_mut() = Some(stats));
     result
 }
 

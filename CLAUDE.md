@@ -16,3 +16,7 @@ Use `./safe-run.sh` for cargo commands to prevent OOM from killing your session 
 ```
 
 Exit code 137 means OOM.
+
+## Installing packages
+
+Feel free to install pacman packages when needed (e.g., for profiling tools like `perf`).
