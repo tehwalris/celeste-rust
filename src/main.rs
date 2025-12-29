@@ -40,6 +40,18 @@ struct Args {
     /// Enable profiling and save results to this directory
     #[arg(long)]
     profile: Option<String>,
+
+    /// Directory for checkpoints (enables checkpoint saving)
+    #[arg(long)]
+    checkpoint_dir: Option<String>,
+
+    /// Save checkpoint every N frames (default: 1 = every frame)
+    #[arg(long, default_value_t = 1)]
+    checkpoint_interval: u32,
+
+    /// Resume from the latest checkpoint in the checkpoint directory
+    #[arg(long)]
+    resume: bool,
 }
 
 fn main() -> Result<()> {
@@ -58,7 +70,38 @@ fn main() -> Result<()> {
         args.dump_states_at,
         args.states_file.as_deref(),
         args.profile.as_deref(),
+        args.checkpoint_dir.as_deref(),
+        args.checkpoint_interval,
+        args.resume,
     )
+}
+
+/// Find the latest checkpoint in a directory
+fn find_latest_checkpoint(dir: &str) -> Option<(String, u32)> {
+    let mut latest: Option<(String, u32)> = None;
+
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
+                // Parse checkpoint_frameNNNN.jsonl.zst
+                if filename.starts_with("checkpoint_frame") && filename.ends_with(".jsonl.zst") {
+                    if let Some(frame_str) = filename
+                        .strip_prefix("checkpoint_frame")
+                        .and_then(|s| s.strip_suffix(".jsonl.zst"))
+                    {
+                        if let Ok(frame) = frame_str.parse::<u32>() {
+                            if latest.is_none() || frame > latest.as_ref().unwrap().1 {
+                                latest = Some((path.to_string_lossy().to_string(), frame));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    latest
 }
 
 fn run_game_frames(
@@ -69,9 +112,12 @@ fn run_game_frames(
     dump_states_at: Option<u32>,
     states_file: Option<&str>,
     profile_dir: Option<&str>,
+    checkpoint_dir: Option<&str>,
+    checkpoint_interval: u32,
+    resume: bool,
 ) -> Result<()> {
     use crate::interpreter::glue::interpret_cfg;
-    use crate::interpreter::inspect::{make_state_abstract, create_frame_dump, write_frame_dump_jsonl, dump_states_to_file};
+    use crate::interpreter::inspect::{make_state_abstract, create_frame_dump, write_frame_dump_jsonl, dump_states_to_file, save_checkpoint, load_checkpoint, checkpoint_filename, Checkpoint};
     use crate::interpreter::profiling::{enable_profiling, get_chrome_tracing_json, get_dag_json, get_tree_json, get_cfgs_json, get_profile_summary};
     use crate::game_runner::{create_fixed_env_with_game_builtins, create_initial_state_with_builtins};
     use std::io::BufWriter;
@@ -81,6 +127,11 @@ fn run_game_frames(
     if profile_dir.is_some() {
         enable_profiling();
         println!("Profiling enabled");
+    }
+
+    // Create checkpoint directory if needed
+    if let Some(dir) = checkpoint_dir {
+        std::fs::create_dir_all(dir)?;
     }
 
     // Load and compile the game
@@ -107,15 +158,6 @@ __reset_button_states()
         fixed_env.add_fun_def(fun_def);
     }
 
-    let initial_state = create_initial_state_with_builtins(&fixed_env);
-
-    println!("Running game init...");
-    let start = std::time::Instant::now();
-    let init_result_states =
-        interpret_cfg(cfg, initial_state, &fixed_env).expect("Init interpretation failed");
-    println!("Game init completed in {:?}", start.elapsed());
-    println!("States after init: {}", init_result_states.len());
-
     // Compile frame code (update + draw + reset buttons)
     let frame_code = r#"
 _update()
@@ -126,7 +168,43 @@ __reset_button_states()
     let (frame_cfg, frame_fun_defs) = frontend::compile(&frame_ast).expect("Failed to compile frame");
     assert!(frame_fun_defs.is_empty(), "Frame code should not define new functions");
 
-    let mut states: Vec<_> = init_result_states.into_iter().map(|(s, _)| s).collect();
+    // Try to resume from checkpoint if requested
+    let (mut states, start_frame) = if resume && checkpoint_dir.is_some() {
+        let dir = checkpoint_dir.unwrap();
+        match find_latest_checkpoint(dir) {
+            Some((checkpoint_path, frame)) => {
+                println!("Resuming from checkpoint: {} (frame {})", checkpoint_path, frame);
+                let load_start = std::time::Instant::now();
+                let checkpoint = load_checkpoint(&checkpoint_path)
+                    .expect("Failed to load checkpoint");
+                println!("Loaded {} states ({} expanded) in {:?}",
+                    checkpoint.states.len(),
+                    checkpoint.states.iter().map(|s| s.vector_size).sum::<usize>(),
+                    load_start.elapsed());
+                (checkpoint.states, frame + 1)
+            }
+            None => {
+                println!("No checkpoint found, starting from init");
+                let initial_state = create_initial_state_with_builtins(&fixed_env);
+                println!("Running game init...");
+                let start = std::time::Instant::now();
+                let init_result_states =
+                    interpret_cfg(cfg.clone(), initial_state, &fixed_env).expect("Init interpretation failed");
+                println!("Game init completed in {:?}", start.elapsed());
+                println!("States after init: {}", init_result_states.len());
+                (init_result_states.into_iter().map(|(s, _)| s).collect(), 1)
+            }
+        }
+    } else {
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+        println!("Running game init...");
+        let start = std::time::Instant::now();
+        let init_result_states =
+            interpret_cfg(cfg.clone(), initial_state, &fixed_env).expect("Init interpretation failed");
+        println!("Game init completed in {:?}", start.elapsed());
+        println!("States after init: {}", init_result_states.len());
+        (init_result_states.into_iter().map(|(s, _)| s).collect(), 1)
+    };
 
     // Open dump file if requested
     let mut dump_writer = dump_path.map(|path| {
@@ -134,13 +212,15 @@ __reset_button_states()
         BufWriter::new(file)
     });
 
-    // Dump frame 0 (init state)
-    if let Some(ref mut writer) = dump_writer {
-        let dump = create_frame_dump(0, &states);
-        write_frame_dump_jsonl(&dump, writer).expect("Failed to write dump");
+    // Dump frame 0 (init state) only if starting fresh
+    if start_frame == 1 {
+        if let Some(ref mut writer) = dump_writer {
+            let dump = create_frame_dump(0, &states);
+            write_frame_dump_jsonl(&dump, writer).expect("Failed to write dump");
+        }
     }
 
-    for frame_num in 1..=num_frames {
+    for frame_num in start_frame..=num_frames {
         let expanded_input: usize = states.iter().map(|s| s.vector_size).sum();
         print!("Frame {}: ", frame_num);
 
@@ -199,6 +279,26 @@ __reset_button_states()
         }
 
         states = new_states;
+
+        // Save checkpoint if at interval
+        if let Some(dir) = checkpoint_dir {
+            if checkpoint_interval > 0 && frame_num % checkpoint_interval == 0 {
+                let checkpoint_path = format!("{}/{}", dir, checkpoint_filename(frame_num));
+                print!("  Saving checkpoint to {}... ", checkpoint_path);
+                std::io::Write::flush(&mut std::io::stdout()).ok();
+                let save_start = std::time::Instant::now();
+                let checkpoint = Checkpoint {
+                    frame: frame_num,
+                    states: states.clone(),
+                };
+                save_checkpoint(&checkpoint, &checkpoint_path)
+                    .expect("Failed to save checkpoint");
+                let file_size = std::fs::metadata(&checkpoint_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                println!("done ({} bytes) in {:?}", file_size, save_start.elapsed());
+            }
+        }
     }
 
     // Flush dump file

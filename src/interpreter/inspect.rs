@@ -606,6 +606,80 @@ pub fn load_states_from_file(path: &str) -> std::io::Result<Vec<State>> {
     states_from_jsonl(reader)
 }
 
+// ============================================================================
+// Checkpoint Serialization (for resumable runs)
+// ============================================================================
+
+/// Checkpoint data saved at frame boundaries
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Checkpoint {
+    /// Frame number (after this frame was completed)
+    pub frame: u32,
+    /// All states at this point
+    pub states: Vec<State>,
+}
+
+/// Save a checkpoint to a zstd-compressed JSONL file
+pub fn save_checkpoint(checkpoint: &Checkpoint, path: &str) -> std::io::Result<()> {
+    use std::fs::File;
+    use std::io::BufWriter;
+
+    let file = File::create(path)?;
+    let encoder = zstd::stream::Encoder::new(file, 19)?; // High compression
+    let mut writer = BufWriter::new(encoder);
+
+    // Write frame number as first line
+    serde_json::to_writer(&mut writer, &checkpoint.frame)?;
+    writeln!(writer)?;
+
+    // Write each state as subsequent lines
+    for state in &checkpoint.states {
+        serde_json::to_writer(&mut writer, state)?;
+        writeln!(writer)?;
+    }
+
+    let encoder = writer.into_inner().map_err(|e| e.into_error())?;
+    encoder.finish()?;
+    Ok(())
+}
+
+/// Load a checkpoint from a zstd-compressed JSONL file
+pub fn load_checkpoint(path: &str) -> std::io::Result<Checkpoint> {
+    use std::fs::File;
+    use std::io::BufReader;
+
+    let file = File::open(path)?;
+    let decoder = zstd::stream::Decoder::new(file)?;
+    let reader = BufReader::new(decoder);
+
+    let mut lines = reader.lines();
+
+    // Read frame number from first line
+    let frame_line = lines.next()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Empty checkpoint file"))??;
+    let frame: u32 = serde_json::from_str(&frame_line)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    // Read states from remaining lines
+    let mut states = Vec::new();
+    for line in lines {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let state: State = serde_json::from_str(&line)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        states.push(state);
+    }
+
+    Ok(Checkpoint { frame, states })
+}
+
+/// Get checkpoint filename for a given frame
+pub fn checkpoint_filename(frame: u32) -> String {
+    format!("checkpoint_frame{:04}.jsonl.zst", frame)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
