@@ -43,6 +43,12 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    // Initialize rayon thread pool with limited parallelism
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(32)
+        .build_global()
+        .expect("Failed to initialize rayon thread pool");
+
     let args = Args::parse();
     run_game_frames(
         args.frames,

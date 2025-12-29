@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use anyhow::{anyhow, Result};
 use itertools::Itertools;
+use rayon::prelude::*;
 
 use crate::{
     block_flow::{BoundSplitBlockFlow, UnboundSplitBlockFlow},
@@ -282,7 +283,7 @@ impl<'a> BoundSplitBlockFlow<FlowData> for BoundInterpreterFlow<'a> {
     fn flow(&self, v: FlowData) -> Result<FlowData> {
         let out_parts = match &v {
             FlowData::States(states) => states
-                .iter()
+                .par_iter()
                 .map(|state| self.flow_single_state(state.clone()))
                 .collect::<Result<Vec<FlowData>>>()?,
             FlowData::StatesAndReturns(_) => {
@@ -293,26 +294,22 @@ impl<'a> BoundSplitBlockFlow<FlowData> for BoundInterpreterFlow<'a> {
         let result = match out_parts.first() {
             Some(FlowData::States(_)) => FlowData::States(
                 out_parts
-                    .iter()
-                    .map(|part| match part {
-                        FlowData::States(states) => states.clone(),
+                    .into_iter()
+                    .flat_map(|part| match part {
+                        FlowData::States(states) => states,
                         FlowData::StatesAndReturns(_) => {
                             panic!("Mix of States and StatesAndReturns")
                         }
                     })
-                    .flatten()
                     .collect(),
             ),
             Some(FlowData::StatesAndReturns(_)) => FlowData::StatesAndReturns(
                 out_parts
-                    .iter()
-                    .map(|part| match part {
+                    .into_iter()
+                    .flat_map(|part| match part {
                         FlowData::States(_) => panic!("Mix of States and StatesAndReturns"),
-                        FlowData::StatesAndReturns(states_and_returns) => {
-                            states_and_returns.clone()
-                        }
+                        FlowData::StatesAndReturns(states_and_returns) => states_and_returns,
                     })
-                    .flatten()
                     .collect(),
             ),
             None => FlowData::States(vec![]),

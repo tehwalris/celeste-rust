@@ -2,3 +2,4 @@
 /output
 /profiles
 perf.data*
+perf_*.data*
