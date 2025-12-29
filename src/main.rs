@@ -2164,7 +2164,7 @@ __reset_button_states()
     fn test_run_celeste_game_frame() {
         // Run 26 frames (enough to see player spawn at frame 25)
         // For longer runs, use the binary: cargo run -- -n 30
-        run_game_frames(26, 25, 26, None, None, None, None).expect("Game frames should complete");
+        run_game_frames(26, 25, 26, None, None, None, None, None, 1, false).expect("Game frames should complete");
     }
 
     #[test]

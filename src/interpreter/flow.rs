@@ -18,8 +18,20 @@ use super::{
     value::{MaybeVector, Value},
 };
 
+/// Threshold below which we stop using parallel iteration.
+/// This reduces crossbeam overhead for deep recursive calls.
+const PARALLEL_BUDGET_THRESHOLD: f64 = 0.01;
+
+/// Minimum number of states required to use parallel iteration.
+/// Below this, sequential is faster due to parallelization overhead.
+const MIN_STATES_FOR_PARALLEL: usize = 128;
+
 pub struct InterpreterFlowAdapter<'a> {
     pub fixed_env: &'a FixedEnv,
+    /// Budget for parallel execution. Starts at 1.0 at the top level and is
+    /// divided as we recurse. When below PARALLEL_BUDGET_THRESHOLD, we use
+    /// sequential iteration instead of parallel.
+    pub parallel_budget: f64,
 }
 
 #[derive(Clone)]
@@ -69,23 +81,43 @@ impl FlowData {
 pub enum BoundInterpreterFlow<'a> {
     BlockPhi {
         phi_instructions: Vec<(LocalId, LocalId)>, // (instruction_local_id, source_local_id)
+        parallel_budget: f64,
     },
     BlockBeforeJoin {
         /// None means "keep all variables" (used when liveness analysis is not available)
         live_variables: Option<HashSet<LocalId>>,
+        parallel_budget: f64,
     },
     BlockPostPhi {
         fixed_env: &'a FixedEnv,
         non_phi_instructions: Vec<(LocalId, Instruction)>,
+        parallel_budget: f64,
     },
-    BranchUnconditional,
+    BranchUnconditional {
+        parallel_budget: f64,
+    },
     BranchConditional {
         condition_local_id: LocalId,
         condition_from_flow_edge: bool,
+        parallel_budget: f64,
     },
     Return {
         return_local_id: Option<LocalId>,
+        parallel_budget: f64,
     },
+}
+
+impl<'a> BoundInterpreterFlow<'a> {
+    fn parallel_budget(&self) -> f64 {
+        match self {
+            Self::BlockPhi { parallel_budget, .. } => *parallel_budget,
+            Self::BlockBeforeJoin { parallel_budget, .. } => *parallel_budget,
+            Self::BlockPostPhi { parallel_budget, .. } => *parallel_budget,
+            Self::BranchUnconditional { parallel_budget } => *parallel_budget,
+            Self::BranchConditional { parallel_budget, .. } => *parallel_budget,
+            Self::Return { parallel_budget, .. } => *parallel_budget,
+        }
+    }
 }
 
 impl<'a> UnboundSplitBlockFlow<FlowData, BoundInterpreterFlow<'a>> for InterpreterFlowAdapter<'a> {
@@ -109,7 +141,10 @@ impl<'a> UnboundSplitBlockFlow<FlowData, BoundInterpreterFlow<'a>> for Interpret
                 _ => panic!("Expected Phi instruction"),
             })
             .collect();
-        Ok(BoundInterpreterFlow::BlockPhi { phi_instructions })
+        Ok(BoundInterpreterFlow::BlockPhi {
+            phi_instructions,
+            parallel_budget: self.parallel_budget,
+        })
     }
 
     fn flow_block_before_join(
@@ -129,7 +164,10 @@ impl<'a> UnboundSplitBlockFlow<FlowData, BoundInterpreterFlow<'a>> for Interpret
         let live_variables = liveness
             .get_live_variables(FlowSide::Before, first_non_phi_local_id)
             .cloned();
-        Ok(BoundInterpreterFlow::BlockBeforeJoin { live_variables })
+        Ok(BoundInterpreterFlow::BlockBeforeJoin {
+            live_variables,
+            parallel_budget: self.parallel_budget,
+        })
     }
 
     fn flow_block_post_phi(&self, target_block: &Block) -> Result<BoundInterpreterFlow<'a>> {
@@ -137,6 +175,7 @@ impl<'a> UnboundSplitBlockFlow<FlowData, BoundInterpreterFlow<'a>> for Interpret
         Ok(BoundInterpreterFlow::BlockPostPhi {
             fixed_env: self.fixed_env,
             non_phi_instructions: non_phi_instructions.to_vec(),
+            parallel_budget: self.parallel_budget,
         })
     }
 
@@ -147,7 +186,9 @@ impl<'a> UnboundSplitBlockFlow<FlowData, BoundInterpreterFlow<'a>> for Interpret
     ) -> Result<BoundInterpreterFlow<'a>> {
         match terminator {
             Terminator::UnconditionalBranch { target } if target == flow_target => {
-                Ok(BoundInterpreterFlow::BranchUnconditional)
+                Ok(BoundInterpreterFlow::BranchUnconditional {
+                    parallel_budget: self.parallel_budget,
+                })
             }
             Terminator::ConditionalBranch {
                 condition,
@@ -157,6 +198,7 @@ impl<'a> UnboundSplitBlockFlow<FlowData, BoundInterpreterFlow<'a>> for Interpret
                 Ok(BoundInterpreterFlow::BranchConditional {
                     condition_local_id: *condition,
                     condition_from_flow_edge: flow_target == true_target,
+                    parallel_budget: self.parallel_budget,
                 })
             }
             _ => panic!("Unexpected flow"),
@@ -167,6 +209,7 @@ impl<'a> UnboundSplitBlockFlow<FlowData, BoundInterpreterFlow<'a>> for Interpret
         match terminator {
             Terminator::Return { value } => Ok(BoundInterpreterFlow::Return {
                 return_local_id: *value,
+                parallel_budget: self.parallel_budget,
             }),
             _ => panic!("Unexpected flow"),
         }
@@ -176,14 +219,14 @@ impl<'a> UnboundSplitBlockFlow<FlowData, BoundInterpreterFlow<'a>> for Interpret
 impl<'a> BoundInterpreterFlow<'a> {
     fn flow_single_state(&self, mut state: State) -> Result<FlowData> {
         match self {
-            Self::BlockPhi { phi_instructions } => {
+            Self::BlockPhi { phi_instructions, .. } => {
                 for &(instruction_local_id, source_local_id) in phi_instructions {
                     let value = state.local_env.get(source_local_id).clone();
                     state.local_env.set(instruction_local_id, value);
                 }
                 Ok(FlowData::States(vec![state]))
             }
-            Self::BlockBeforeJoin { live_variables } => {
+            Self::BlockBeforeJoin { live_variables, .. } => {
                 // Only prune if we have liveness information; None means keep all
                 if let Some(live_variables) = live_variables {
                     state
@@ -195,12 +238,17 @@ impl<'a> BoundInterpreterFlow<'a> {
             Self::BlockPostPhi {
                 fixed_env,
                 non_phi_instructions,
+                parallel_budget,
             } => {
                 let mut states = vec![state];
                 for (local_id, instruction) in non_phi_instructions {
                     let mut new_states = vec![];
                     for old_state in states {
-                        let interpreter = CoreInterpreter::new(old_state, fixed_env);
+                        let interpreter = CoreInterpreter::new_with_parallel_budget(
+                            old_state,
+                            fixed_env,
+                            *parallel_budget,
+                        );
                         match instruction {
                             Instruction::Call { .. } => {
                                 new_states.extend(
@@ -219,10 +267,11 @@ impl<'a> BoundInterpreterFlow<'a> {
                 }
                 Ok(FlowData::States(states))
             }
-            Self::BranchUnconditional => Ok(FlowData::States(vec![state])),
+            Self::BranchUnconditional { .. } => Ok(FlowData::States(vec![state])),
             Self::BranchConditional {
                 condition_local_id,
                 condition_from_flow_edge,
+                ..
             } => match &state.local_env.get(*condition_local_id) {
                 Value::Bool(MaybeVector::Scalar(false)) | Value::Nil(_) => {
                     Ok(FlowData::States(if *condition_from_flow_edge {
@@ -264,7 +313,7 @@ impl<'a> BoundInterpreterFlow<'a> {
                     }
                 }
             },
-            Self::Return { return_local_id } => match *return_local_id {
+            Self::Return { return_local_id, .. } => match *return_local_id {
                 Some(return_local_id) => {
                     state.local_env.retain(|id| id == return_local_id);
                     let value = state.local_env.get(return_local_id).clone();
@@ -281,11 +330,29 @@ impl<'a> BoundInterpreterFlow<'a> {
 
 impl<'a> BoundSplitBlockFlow<FlowData> for BoundInterpreterFlow<'a> {
     fn flow(&self, v: FlowData) -> Result<FlowData> {
+        let budget = self.parallel_budget();
+
         let out_parts = match &v {
-            FlowData::States(states) => states
-                .par_iter()
-                .map(|state| self.flow_single_state(state.clone()))
-                .collect::<Result<Vec<FlowData>>>()?,
+            FlowData::States(states) => {
+                // Only parallelize if:
+                // 1. Budget is above threshold (not too deep in recursion)
+                // 2. We have enough states to justify the overhead
+                let use_parallel = budget >= PARALLEL_BUDGET_THRESHOLD
+                    && states.len() >= MIN_STATES_FOR_PARALLEL;
+
+                if use_parallel {
+                    states
+                        .par_iter()
+                        .map(|state| self.flow_single_state(state.clone()))
+                        .collect::<Result<Vec<FlowData>>>()?
+                } else {
+                    // Sequential: below budget threshold or too few states
+                    states
+                        .iter()
+                        .map(|state| self.flow_single_state(state.clone()))
+                        .collect::<Result<Vec<FlowData>>>()?
+                }
+            }
             FlowData::StatesAndReturns(_) => {
                 return Err(anyhow!("Return value in unexpected part of CFG"))
             }

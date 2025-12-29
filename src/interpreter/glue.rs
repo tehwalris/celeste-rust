@@ -45,7 +45,7 @@ impl<'a> InterpreterAnalysis<'a> {
     pub fn new(cfg: Cfg, fixed_env: &'a FixedEnv) -> Result<Self> {
         let (graph, labels) = flow_graph_of_cfg(&cfg).unwrap();
         Ok(Self {
-            adapter: InterpreterFlowAdapter { fixed_env },
+            adapter: InterpreterFlowAdapter { fixed_env, parallel_budget: 1.0 },
             cfg,
             graph,
             labels,
@@ -192,7 +192,7 @@ pub fn interpret_prepared_cfg(
     initial_state: State,
     fixed_env: &FixedEnv,
 ) -> Result<Vec<(State, Option<Value>)>> {
-    interpret_prepared_cfg_inner(prepared, initial_state, fixed_env, None, None)
+    interpret_prepared_cfg_inner(prepared, initial_state, fixed_env, None, None, 1.0)
 }
 
 /// Internal implementation with optional function name for profiling
@@ -202,8 +202,9 @@ pub fn interpret_prepared_cfg_with_name(
     fixed_env: &FixedEnv,
     name: Option<String>,
     source_span: Option<crate::ir::SourceSpan>,
+    parallel_budget: f64,
 ) -> Result<Vec<(State, Option<Value>)>> {
-    interpret_prepared_cfg_inner(prepared, initial_state, fixed_env, name, source_span)
+    interpret_prepared_cfg_inner(prepared, initial_state, fixed_env, name, source_span, parallel_budget)
 }
 
 fn interpret_prepared_cfg_inner(
@@ -212,6 +213,7 @@ fn interpret_prepared_cfg_inner(
     fixed_env: &FixedEnv,
     name: Option<String>,
     source_span: Option<crate::ir::SourceSpan>,
+    parallel_budget: f64,
 ) -> Result<Vec<(State, Option<Value>)>> {
     use std::collections::HashMap;
 
@@ -223,7 +225,7 @@ fn interpret_prepared_cfg_inner(
         source_span.as_ref(),
     );
 
-    let adapter = InterpreterFlowAdapter { fixed_env };
+    let adapter = InterpreterFlowAdapter { fixed_env, parallel_budget };
     let cfg = &prepared.cfg;
     let labels = &prepared.labels;
 
