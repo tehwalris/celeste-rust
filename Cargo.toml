@@ -35,3 +35,7 @@ path = "src/bin/compare_frames.rs"
 [[bin]]
 name = "concrete_run"
 path = "src/bin/concrete_run.rs"
+
+[[bin]]
+name = "trace_test"
+path = "src/bin/trace_test.rs"

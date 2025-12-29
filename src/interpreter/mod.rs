@@ -1,4 +1,4 @@
-mod core_interpreter;
+pub mod core_interpreter;
 pub mod fixed_env;
 mod flow;
 pub mod glue;

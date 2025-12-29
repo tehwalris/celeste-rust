@@ -21,4 +21,5 @@ pub mod interpreter;
 pub mod ir;
 pub mod liveness;
 pub mod pico8_num;
+pub mod symbolic_tracing;
 pub mod tas;
