@@ -7,7 +7,7 @@
 //! 3. Deduplicate vectors (remove duplicate elements)
 //! 4. If vector size becomes 1, convert back to scalars
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use super::{
     heap::{Heap, HeapId},
@@ -762,7 +762,7 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
 
     // Group states by shape
     let t2 = std::time::Instant::now();
-    let mut states_by_shape: HashMap<StateShape, Vec<State>> = HashMap::new();
+    let mut states_by_shape: FxHashMap<StateShape, Vec<State>> = FxHashMap::default();
     for state in states {
         let shape = shape_of_state(&state);
         states_by_shape.entry(shape).or_insert_with(Vec::new).push(state);
