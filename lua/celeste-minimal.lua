@@ -779,7 +779,8 @@ function _update()
 			obj.move(obj.spd.x,obj.spd.y)
 		end
 		if obj.type.update~=nil then
-			obj.type.update(obj) 
+			_hint_normalize()
+			obj.type.update(obj)
 		end
 	end)
 	
