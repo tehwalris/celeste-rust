@@ -5,7 +5,6 @@
 //! 2. Fixed-Point Tree - tracks recursion through function calls
 //! 3. Chrome Tracing - wall-clock span-based profiling
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -294,8 +293,8 @@ pub struct Span {
 pub struct Profiler {
     /// Whether profiling is enabled
     enabled: bool,
-    /// Start time for computing relative timestamps
-    start_time: Instant,
+    /// Start time for computing relative timestamps (None until profiling is enabled)
+    start_time: Option<Instant>,
     /// Next ID for DAG nodes
     next_dag_id: u64,
     /// Next ID for tree nodes
@@ -331,7 +330,7 @@ impl Profiler {
     pub fn new() -> Self {
         Self {
             enabled: false,
-            start_time: Instant::now(),
+            start_time: None,
             next_dag_id: 0,
             next_tree_id: 0,
             next_step: 0,
@@ -348,7 +347,7 @@ impl Profiler {
 
     pub fn enable(&mut self) {
         self.enabled = true;
-        self.start_time = Instant::now();
+        self.start_time = Some(Instant::now());
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -357,7 +356,7 @@ impl Profiler {
 
     /// Reset all profiling data
     pub fn reset(&mut self) {
-        self.start_time = Instant::now();
+        self.start_time = Some(Instant::now());
         self.next_dag_id = 0;
         self.next_tree_id = 0;
         self.next_step = 0;
@@ -427,7 +426,7 @@ impl Profiler {
         self.next_step += 1;
         let tree_node_id = self.tree_stack.last().copied();
         let cfg_name = self.cfg_stack.last().cloned();
-        let start_time_us = Instant::now().duration_since(self.start_time).as_micros() as u64;
+        let start_time_us = Instant::now().duration_since(self.start_time.unwrap()).as_micros() as u64;
 
         let node = DagNode {
             id,
@@ -474,7 +473,7 @@ impl Profiler {
         self.next_step += 1;
         let tree_node_id = self.tree_stack.last().copied();
         let cfg_name = self.cfg_stack.last().cloned();
-        let start_time_us = Instant::now().duration_since(self.start_time).as_micros() as u64;
+        let start_time_us = Instant::now().duration_since(self.start_time.unwrap()).as_micros() as u64;
 
         let node = DagNode {
             id,
@@ -514,7 +513,7 @@ impl Profiler {
         if !self.enabled {
             return;
         }
-        let end_time_us = Instant::now().duration_since(self.start_time).as_micros() as u64;
+        let end_time_us = Instant::now().duration_since(self.start_time.unwrap()).as_micros() as u64;
         if let Some(node) = self.dag_nodes.iter_mut().find(|n| n.id == id) {
             node.processing_time = processing_time;
             node.end_time_us = end_time_us;
@@ -641,7 +640,7 @@ impl Profiler {
         if let Some((name, category, start, dag_node_id, tree_node_id, start_step)) = self.span_stack.pop() {
             let end = Instant::now();
             let duration = end.duration_since(start);
-            let start_us = start.duration_since(self.start_time).as_micros() as u64;
+            let start_us = start.duration_since(self.start_time.unwrap()).as_micros() as u64;
             let duration_us = duration.as_micros() as u64;
             let end_step = self.next_step;
 
@@ -799,59 +798,62 @@ struct ChromeTraceEvent {
 }
 
 // ============================================================================
-// Thread-Local Profiler
+// Global Profiler (using Mutex for safe single-threaded access)
 // ============================================================================
 
-thread_local! {
-    static PROFILER: RefCell<Profiler> = RefCell::new(Profiler::new());
+use std::sync::Mutex;
+
+lazy_static::lazy_static! {
+    static ref PROFILER: Mutex<Profiler> = Mutex::new(Profiler::new());
 }
 
-/// Enable profiling for the current thread
+/// Enable profiling
 pub fn enable_profiling() {
-    PROFILER.with(|p| p.borrow_mut().enable());
+    PROFILER.lock().unwrap().enable();
 }
 
 /// Check if profiling is enabled
 pub fn is_profiling_enabled() -> bool {
-    PROFILER.with(|p| p.borrow().is_enabled())
+    PROFILER.lock().unwrap().is_enabled()
 }
 
 /// Reset profiling data
 pub fn reset_profiling() {
-    PROFILER.with(|p| p.borrow_mut().reset());
+    PROFILER.lock().unwrap().reset();
 }
 
 /// Access the profiler
+#[inline]
 pub fn with_profiler<F, R>(f: F) -> R
 where
     F: FnOnce(&mut Profiler) -> R,
 {
-    PROFILER.with(|p| f(&mut p.borrow_mut()))
+    f(&mut PROFILER.lock().unwrap())
 }
 
 /// Get a copy of the profiler's summary
 pub fn get_profile_summary() -> ProfileSummary {
-    PROFILER.with(|p| p.borrow().summary())
+    PROFILER.lock().unwrap().summary()
 }
 
 /// Get Chrome tracing JSON
 pub fn get_chrome_tracing_json() -> String {
-    PROFILER.with(|p| p.borrow().to_chrome_tracing_json())
+    PROFILER.lock().unwrap().to_chrome_tracing_json()
 }
 
 /// Get DAG JSON
 pub fn get_dag_json() -> String {
-    PROFILER.with(|p| p.borrow().dag_to_json())
+    PROFILER.lock().unwrap().dag_to_json()
 }
 
 /// Get tree JSON
 pub fn get_tree_json() -> String {
-    PROFILER.with(|p| p.borrow().tree_to_json())
+    PROFILER.lock().unwrap().tree_to_json()
 }
 
 /// Get CFGs JSON
 pub fn get_cfgs_json() -> String {
-    PROFILER.with(|p| p.borrow().cfgs_to_json())
+    PROFILER.lock().unwrap().cfgs_to_json()
 }
 
 // ============================================================================
