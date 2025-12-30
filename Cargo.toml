@@ -39,5 +39,6 @@ name = "concrete_run"
 path = "src/bin/concrete_run.rs"
 
 [profile.release]
-lto = true
+lto = "fat"
 codegen-units = 1
+panic = "abort"
