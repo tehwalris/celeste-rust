@@ -468,18 +468,11 @@ fn dedup_vectorized_state(mut state: State) -> State {
         return state;
     }
 
-    // Create mask for filtering
+    // Create mask for filtering - set true for indices we want to keep
     let mut mask = vec![false; state.vector_size];
     for i in &unique_indices {
-        // We need to pick indices in a way that maintains some order
         mask[*i] = true;
     }
-
-    // Actually, we need to filter based on unique_indices properly
-    // The indices in unique_indices are the ones we want to keep
-    let mask: Vec<bool> = (0..state.vector_size)
-        .map(|i| unique_indices.contains(&i))
-        .collect();
 
     state.filter_by_mask(&mask)
 }
