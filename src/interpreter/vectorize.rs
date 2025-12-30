@@ -20,7 +20,7 @@ use crate::pico8_num::{Pico8Num, Pico8NumInterval};
 
 /// A "shape" is a state with all vectorizable values normalized to placeholder values.
 /// States with the same shape can be merged by vectorizing their values.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug)]
 pub struct StateShape {
     // For shape comparison, we normalize all vectorizable values to placeholders
     // but keep the structure (heap IDs, table shapes, etc.)
@@ -30,6 +30,31 @@ pub struct StateShape {
     // global_env as sorted Vec for consistent hashing (ImHashMap's Hash is buggy)
     global_env: Vec<(String, HeapId)>,
     prints: Vec<String>,
+    // Cached hash for O(1) hashing after construction
+    cached_hash: u64,
+}
+
+impl PartialEq for StateShape {
+    fn eq(&self, other: &Self) -> bool {
+        // First check cached hash for fast rejection
+        if self.cached_hash != other.cached_hash {
+            return false;
+        }
+        // Then do full comparison
+        self.heap_structure == other.heap_structure
+            && self.local_env_structure == other.local_env_structure
+            && self.outer_local_envs_structure == other.outer_local_envs_structure
+            && self.global_env == other.global_env
+            && self.prints == other.prints
+    }
+}
+
+impl Eq for StateShape {}
+
+impl std::hash::Hash for StateShape {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.cached_hash.hash(state);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -154,12 +179,23 @@ fn shape_of_state(state: &State) -> StateShape {
         global_env.push((k.clone(), *v));
     }
 
+    // Compute hash once during construction
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+    heap_structure.hash(&mut hasher);
+    local_env_structure.hash(&mut hasher);
+    outer_local_envs_structure.hash(&mut hasher);
+    global_env.hash(&mut hasher);
+    state.prints.hash(&mut hasher);
+    let cached_hash = hasher.finish();
+
     StateShape {
         heap_structure,
         local_env_structure,
         outer_local_envs_structure,
         global_env,
         prints: state.prints.clone(),
+        cached_hash,
     }
 }
 
