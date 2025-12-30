@@ -1,8 +1,12 @@
+use std::hash::BuildHasherDefault;
 use std::time::Instant;
 
 use anyhow::Result;
 use indexmap::IndexSet;
 use petgraph::prelude::GraphMap;
+use rustc_hash::FxHasher;
+
+type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 use crate::{
     block_flow::{flow_graph_of_cfg, BoundMergedBlockFlow, BoundSplitBlockFlow, FlowNode, UnboundSplitBlockFlow},
@@ -215,8 +219,6 @@ fn interpret_prepared_cfg_inner(
     source_span: Option<crate::ir::SourceSpan>,
     parallel_budget: f64,
 ) -> Result<Vec<(State, Option<Value>)>> {
-    use std::collections::HashMap;
-
     // Create profiling guard for this fixed-point invocation
     let fp_guard = FixedPointGuard::new(name.clone());
     let _span = SpanGuard::new_with_source(
@@ -264,7 +266,7 @@ fn interpret_prepared_cfg_inner(
     // Accumulator for hint_normalize blocks - we collect states here before processing
     // The "accumulated" field persists across iterations and contains all states seen so far
     // The "pending" field contains states that arrived since last processing
-    let mut hint_normalize_accumulators: HashMap<Label, (Vec<State>, Vec<State>, Vec<Option<u64>>)> = HashMap::new();
+    let mut hint_normalize_accumulators: FxHashMap<Label, (Vec<State>, Vec<State>, Vec<Option<u64>>)> = FxHashMap::default();
     // ^-- (accumulated_states, pending_states, dag_ids)
     let mut results: Vec<(State, Option<Value>)> = vec![];
 
@@ -275,7 +277,7 @@ fn interpret_prepared_cfg_inner(
         flow_data: FlowData,
         dag_id: Option<u64>,
         pending: &mut Vec<(Option<Label>, FlowData, Option<u64>)>,
-        accumulators: &mut HashMap<Label, (Vec<State>, Vec<State>, Vec<Option<u64>>)>,
+        accumulators: &mut FxHashMap<Label, (Vec<State>, Vec<State>, Vec<Option<u64>>)>,
         cfg: &Cfg,
     | {
         let target_block = cfg.named.get(target);
@@ -473,15 +475,17 @@ fn interpret_prepared_cfg_inner(
                 true_target,
                 false_target,
             } => {
-                // For each branch, apply the appropriate flow and queue
-                for (is_true_branch, target) in [(true, true_target), (false, false_target)] {
+                // Process true branch with cloned data, false branch with original
+                // This avoids one unnecessary clone
+                let source_label = block_label.clone().unwrap_or_else(|| {
+                    Label::from("__entry".to_string())
+                });
+
+                // Helper to process a branch
+                let mut process_branch = |is_true_branch: bool, target: &Label, branch_flow_data: FlowData| -> Result<()> {
                     let target_block = cfg.named.get(target).ok_or_else(|| {
                         anyhow::anyhow!("Target block not found: {:?}", target)
                     })?;
-
-                    // Apply branch flow (this filters states based on condition)
-                    let bound_branch = adapter.flow_branch(terminator, target)?;
-                    let branch_flow_data = bound_branch.flow(flow_data.clone())?;
 
                     if !branch_flow_data.is_empty() {
                         // Create DAG node for the branch split
@@ -496,9 +500,6 @@ fn interpret_prepared_cfg_inner(
                         });
 
                         // Apply phi instructions
-                        let source_label = block_label.clone().unwrap_or_else(|| {
-                            Label::from("__entry".to_string())
-                        });
                         let bound_phi = adapter.flow_block_phi(&source_label, target_block)?;
                         let branch_flow_data = bound_phi.flow(branch_flow_data)?;
 
@@ -516,7 +517,18 @@ fn interpret_prepared_cfg_inner(
                             cfg,
                         );
                     }
-                }
+                    Ok(())
+                };
+
+                // True branch: clone the flow_data
+                let bound_true = adapter.flow_branch(terminator, true_target)?;
+                let true_flow_data = bound_true.flow(flow_data.clone())?;
+                process_branch(true, true_target, true_flow_data)?;
+
+                // False branch: consume the original flow_data
+                let bound_false = adapter.flow_branch(terminator, false_target)?;
+                let false_flow_data = bound_false.flow(flow_data)?;
+                process_branch(false, false_target, false_flow_data)?;
             }
         }
     }
