@@ -317,9 +317,9 @@ impl<'a> BoundInterpreterFlow<'a> {
                             .map(|v| *v == *condition_from_flow_edge)
                             .collect();
 
-                        state.map_values_in_place(|v| v.filter_vectors(&mask));
-                        state.vector_size = mask_true_count;
-                        Ok(FlowData::States(vec![state]))
+                        // Use optimized filter_by_mask that avoids cloning non-vector values
+                        let filtered_state = state.filter_by_mask(&mask);
+                        Ok(FlowData::States(vec![filtered_state]))
                     }
                 }
             },
