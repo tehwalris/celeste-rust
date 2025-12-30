@@ -385,19 +385,97 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
     let (first_value, _) = &values[0];
 
     // Check if vectorizable based on the value type
-    if can_vectorize_value(first_value) {
-        // Expand all values to their scalar forms, then combine into a vector
-        let all_scalars: Vec<ScalarValue> = values.iter()
-            .flat_map(|(v, size)| expand_value_to_scalars(v, *size))
-            .collect();
-        value_from_scalars(all_scalars)
-    } else {
+    if !can_vectorize_value(first_value) {
         // Non-vectorizable: all values must be equal (as whole Values)
-        let all_values: Vec<&Value> = values.iter().map(|(v, _)| v).collect();
-        if !all_values.iter().all(|v| *v == first_value) {
-            panic!("Non-vectorizable values are not equal: {:?}", all_values);
+        #[cfg(debug_assertions)]
+        {
+            for (v, _) in values {
+                if v != first_value {
+                    panic!("Non-vectorizable values are not equal");
+                }
+            }
         }
-        first_value.clone()
+        return first_value.clone();
+    }
+
+    // Calculate total size to pre-allocate
+    let total_size: usize = values.iter().map(|(_, size)| size).sum();
+
+    // Merge vectorizable values directly without creating intermediate ScalarValue
+    match first_value {
+        Value::Number(_) => {
+            let mut result = Vec::with_capacity(total_size);
+            for (v, size) in values {
+                match v {
+                    Value::Number(MaybeVector::Scalar(n)) => {
+                        for _ in 0..*size {
+                            result.push(*n);
+                        }
+                    }
+                    Value::Number(MaybeVector::Vector(nums)) => {
+                        result.extend_from_slice(nums);
+                    }
+                    _ => panic!("Type mismatch in merge"),
+                }
+            }
+            // Check if all identical
+            if result.len() > 1 && result.iter().all(|n| *n == result[0]) {
+                Value::Number(MaybeVector::Scalar(result[0]))
+            } else if result.len() == 1 {
+                Value::Number(MaybeVector::Scalar(result[0]))
+            } else {
+                Value::Number(MaybeVector::Vector(result))
+            }
+        }
+        Value::NumberInterval(_) => {
+            let mut result = Vec::with_capacity(total_size);
+            for (v, size) in values {
+                match v {
+                    Value::NumberInterval(MaybeVector::Scalar(n)) => {
+                        for _ in 0..*size {
+                            result.push(*n);
+                        }
+                    }
+                    Value::NumberInterval(MaybeVector::Vector(nums)) => {
+                        result.extend_from_slice(nums);
+                    }
+                    _ => panic!("Type mismatch in merge"),
+                }
+            }
+            // Check if all identical
+            if result.len() > 1 && result.iter().all(|n| *n == result[0]) {
+                Value::NumberInterval(MaybeVector::Scalar(result[0]))
+            } else if result.len() == 1 {
+                Value::NumberInterval(MaybeVector::Scalar(result[0]))
+            } else {
+                Value::NumberInterval(MaybeVector::Vector(result))
+            }
+        }
+        Value::Bool(_) => {
+            let mut result = Vec::with_capacity(total_size);
+            for (v, size) in values {
+                match v {
+                    Value::Bool(MaybeVector::Scalar(b)) => {
+                        for _ in 0..*size {
+                            result.push(*b);
+                        }
+                    }
+                    Value::Bool(MaybeVector::Vector(bools)) => {
+                        result.extend_from_slice(bools);
+                    }
+                    _ => panic!("Type mismatch in merge"),
+                }
+            }
+            // Check if all identical
+            if result.len() > 1 && result.iter().all(|b| *b == result[0]) {
+                Value::Bool(MaybeVector::Scalar(result[0]))
+            } else if result.len() == 1 {
+                Value::Bool(MaybeVector::Scalar(result[0]))
+            } else {
+                Value::Bool(MaybeVector::Vector(result))
+            }
+        }
+        _ => panic!("Unexpected value type for merge"),
     }
 }
 
