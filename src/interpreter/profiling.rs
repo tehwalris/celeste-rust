@@ -802,19 +802,26 @@ struct ChromeTraceEvent {
 // ============================================================================
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 lazy_static::lazy_static! {
     static ref PROFILER: Mutex<Profiler> = Mutex::new(Profiler::new());
 }
 
+/// Atomic flag to check if profiling is enabled without acquiring the mutex.
+/// This is checked first to avoid mutex overhead when profiling is disabled.
+static PROFILING_ENABLED: AtomicBool = AtomicBool::new(false);
+
 /// Enable profiling
 pub fn enable_profiling() {
+    PROFILING_ENABLED.store(true, Ordering::Release);
     PROFILER.lock().unwrap().enable();
 }
 
-/// Check if profiling is enabled
+/// Check if profiling is enabled (cheap check without mutex)
+#[inline]
 pub fn is_profiling_enabled() -> bool {
-    PROFILER.lock().unwrap().is_enabled()
+    PROFILING_ENABLED.load(Ordering::Acquire)
 }
 
 /// Reset profiling data
@@ -823,11 +830,17 @@ pub fn reset_profiling() {
 }
 
 /// Access the profiler
+/// This is a no-op if profiling is disabled, avoiding mutex overhead.
 #[inline]
 pub fn with_profiler<F, R>(f: F) -> R
 where
     F: FnOnce(&mut Profiler) -> R,
+    R: Default,
 {
+    // Fast path: skip entirely if profiling is disabled
+    if !PROFILING_ENABLED.load(Ordering::Acquire) {
+        return R::default();
+    }
     f(&mut PROFILER.lock().unwrap())
 }
 
