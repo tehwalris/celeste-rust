@@ -257,28 +257,39 @@ impl<'a> BoundInterpreterFlow<'a> {
                 })),
                 Value::NilPointer(_) => Err(anyhow!("Nil pointer in condition")),
                 Value::Bool(MaybeVector::Vector(bool_vector)) => {
-                    // Build mask and count in a single pass
+                    // LAZY MASKING: compose masks instead of filtering immediately
                     let condition_target = *condition_from_flow_edge;
-                    let mut mask_true_count = 0usize;
-                    let mask: Vec<bool> = bool_vector
-                        .iter()
-                        .map(|v| {
-                            let matches = *v == condition_target;
-                            if matches {
-                                mask_true_count += 1;
-                            }
-                            matches
-                        })
-                        .collect();
 
-                    if mask_true_count == 0 {
+                    // Count how many ACTIVE lanes will go this direction
+                    let old_vector_size = state.vector_size;
+                    let old_original_size = state.original_size;
+                    let active_matching = match &state.mask {
+                        None => {
+                            bool_vector.iter().filter(|&&v| v == condition_target).count()
+                        }
+                        Some(mask) => {
+                            mask.iter()
+                                .zip(bool_vector.iter())
+                                .filter(|(&m, &v)| m && v == condition_target)
+                                .count()
+                        }
+                    };
+
+                    if active_matching == 0 {
                         Ok(FlowData::States(vec![]))
-                    } else if mask_true_count == bool_vector.len() {
+                    } else if active_matching == old_vector_size {
+                        // ALL active lanes go this direction - no mask change needed
                         Ok(FlowData::States(vec![state]))
                     } else {
-                        // Use optimized filter_by_mask that avoids cloning non-vector values
-                        let filtered_state = state.filter_by_mask(&mask);
-                        Ok(FlowData::States(vec![filtered_state]))
+                        // Mixed: apply lazy mask
+                        let condition_mask: Vec<bool> = bool_vector
+                            .iter()
+                            .map(|v| *v == condition_target)
+                            .collect();
+
+                        let mut new_state = state;
+                        new_state.apply_lazy_mask(&condition_mask);
+                        Ok(FlowData::States(vec![new_state]))
                     }
                 }
             },
@@ -332,5 +343,273 @@ impl<'a> BoundSplitBlockFlow<FlowData> for BoundInterpreterFlow<'a> {
         } else {
             Ok(FlowData::States(result_states))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pico8_num::Pico8Num;
+
+    /// Test lazy masking with a vectorized bool condition
+    #[test]
+    fn test_branch_conditional_lazy_mask_basic() {
+        // Create a state with vector_size = 4
+        // local_env[0] = Bool([true, false, true, false])  <- condition
+        // local_env[1] = Number([1, 2, 3, 4])              <- data
+        let mut state = State::new();
+        state.original_size = 4;
+        state.vector_size = 4;
+        state.mask = None;
+
+        let condition_local_id = LocalId::from(0);
+        let data_local_id = LocalId::from(1);
+
+        state.local_env.set(condition_local_id, Value::Bool(MaybeVector::Vector(vec![
+            true, false, true, false
+        ])));
+        state.local_env.set(data_local_id, Value::Number(MaybeVector::Vector(vec![
+            Pico8Num::from_i16(1),
+            Pico8Num::from_i16(2),
+            Pico8Num::from_i16(3),
+            Pico8Num::from_i16(4),
+        ])));
+
+        // Create true branch flow
+        let true_branch = BoundInterpreterFlow::BranchConditional {
+            condition_local_id,
+            condition_from_flow_edge: true,
+        };
+
+        // Create false branch flow
+        let false_branch = BoundInterpreterFlow::BranchConditional {
+            condition_local_id,
+            condition_from_flow_edge: false,
+        };
+
+        // Clone state for false branch
+        let state_for_false = state.clone();
+
+        // Execute true branch
+        let true_result = true_branch.flow_single_state(state).unwrap();
+        let true_states = match true_result {
+            FlowData::States(s) => s,
+            _ => panic!("Expected States"),
+        };
+
+        assert_eq!(true_states.len(), 1, "True branch should return 1 state");
+        let true_state = &true_states[0];
+        assert_eq!(true_state.vector_size, 2, "True branch should have 2 active lanes");
+        assert_eq!(true_state.original_size, 4, "Original size should still be 4 (lazy masking)");
+        assert!(true_state.mask.is_some(), "Should have a mask set");
+        assert_eq!(
+            true_state.mask.as_ref().unwrap(),
+            &vec![true, false, true, false],
+            "Mask should match condition"
+        );
+
+        // Execute false branch
+        let false_result = false_branch.flow_single_state(state_for_false).unwrap();
+        let false_states = match false_result {
+            FlowData::States(s) => s,
+            _ => panic!("Expected States"),
+        };
+
+        assert_eq!(false_states.len(), 1, "False branch should return 1 state");
+        let false_state = &false_states[0];
+        assert_eq!(false_state.vector_size, 2, "False branch should have 2 active lanes");
+        assert_eq!(false_state.original_size, 4, "Original size should still be 4 (lazy masking)");
+        assert!(false_state.mask.is_some(), "Should have a mask set");
+        assert_eq!(
+            false_state.mask.as_ref().unwrap(),
+            &vec![false, true, false, true],
+            "Mask should match inverted condition"
+        );
+
+        // Total expanded count should equal original
+        let total_expanded = true_state.vector_size + false_state.vector_size;
+        assert_eq!(total_expanded, 4, "Total lanes should equal original (2 + 2 = 4)");
+    }
+
+    /// Test that materialize produces the correct filtered vectors
+    #[test]
+    fn test_materialize_after_branch() {
+        let mut state = State::new();
+        state.original_size = 4;
+        state.vector_size = 4;
+        state.mask = None;
+
+        let condition_local_id = LocalId::from(0);
+        let data_local_id = LocalId::from(1);
+
+        state.local_env.set(condition_local_id, Value::Bool(MaybeVector::Vector(vec![
+            true, false, true, false
+        ])));
+        state.local_env.set(data_local_id, Value::Number(MaybeVector::Vector(vec![
+            Pico8Num::from_i16(1),
+            Pico8Num::from_i16(2),
+            Pico8Num::from_i16(3),
+            Pico8Num::from_i16(4),
+        ])));
+
+        // Take true branch
+        let true_branch = BoundInterpreterFlow::BranchConditional {
+            condition_local_id,
+            condition_from_flow_edge: true,
+        };
+
+        let result = true_branch.flow_single_state(state).unwrap();
+        let mut true_state = match result {
+            FlowData::States(mut s) => s.pop().unwrap(),
+            _ => panic!("Expected States"),
+        };
+
+        // Before materialize: vectors still have original size
+        assert_eq!(true_state.original_size, 4);
+        assert_eq!(true_state.vector_size, 2);
+        assert!(true_state.mask.is_some());
+
+        // Check data vector still has original length
+        match true_state.local_env.get(data_local_id) {
+            Value::Number(MaybeVector::Vector(nums)) => {
+                assert_eq!(nums.len(), 4, "Before materialize: vector should have original length");
+            }
+            _ => panic!("Expected Number vector"),
+        }
+
+        // Materialize
+        true_state.materialize();
+
+        // After materialize: vectors should be filtered
+        assert_eq!(true_state.original_size, 2, "After materialize: original_size = 2");
+        assert_eq!(true_state.vector_size, 2, "After materialize: vector_size = 2");
+        assert!(true_state.mask.is_none(), "After materialize: mask should be None");
+
+        // Check data vector is now filtered
+        match true_state.local_env.get(data_local_id) {
+            Value::Number(MaybeVector::Vector(nums)) => {
+                assert_eq!(nums.len(), 2, "After materialize: vector should have filtered length");
+                assert_eq!(nums[0], Pico8Num::from_i16(1), "First active lane");
+                assert_eq!(nums[1], Pico8Num::from_i16(3), "Second active lane");
+            }
+            _ => panic!("Expected Number vector"),
+        }
+    }
+
+    /// Test sequential branches compose masks correctly
+    #[test]
+    fn test_sequential_branches_compose_mask() {
+        // Start with 4 lanes, branch twice
+        let mut state = State::new();
+        state.original_size = 4;
+        state.vector_size = 4;
+        state.mask = None;
+
+        let cond1_id = LocalId::from(0);
+        let cond2_id = LocalId::from(1);
+
+        // First condition: [true, true, false, false]
+        state.local_env.set(cond1_id, Value::Bool(MaybeVector::Vector(vec![
+            true, true, false, false
+        ])));
+        // Second condition: [true, false, true, false]
+        state.local_env.set(cond2_id, Value::Bool(MaybeVector::Vector(vec![
+            true, false, true, false
+        ])));
+
+        // First branch: take true path (lanes 0, 1 active)
+        let branch1 = BoundInterpreterFlow::BranchConditional {
+            condition_local_id: cond1_id,
+            condition_from_flow_edge: true,
+        };
+
+        let result1 = branch1.flow_single_state(state).unwrap();
+        let state_after_branch1 = match result1 {
+            FlowData::States(mut s) => s.pop().unwrap(),
+            _ => panic!("Expected States"),
+        };
+
+        assert_eq!(state_after_branch1.vector_size, 2, "After branch1: 2 active");
+        assert_eq!(state_after_branch1.mask.as_ref().unwrap(), &vec![true, true, false, false]);
+
+        // Second branch: take true path (lane 0 active from first, lane 2 was inactive)
+        let branch2 = BoundInterpreterFlow::BranchConditional {
+            condition_local_id: cond2_id,
+            condition_from_flow_edge: true,
+        };
+
+        let result2 = branch2.flow_single_state(state_after_branch1).unwrap();
+        let state_after_branch2 = match result2 {
+            FlowData::States(mut s) => s.pop().unwrap(),
+            _ => panic!("Expected States"),
+        };
+
+        // After two branches: only lane 0 should be active
+        // mask1 = [true, true, false, false]
+        // cond2 = [true, false, true, false]
+        // composed = mask1 && cond2 = [true, false, false, false]
+        assert_eq!(state_after_branch2.vector_size, 1, "After branch2: 1 active");
+        assert_eq!(state_after_branch2.mask.as_ref().unwrap(), &vec![true, false, false, false]);
+
+        // Materialize and check
+        let mut final_state = state_after_branch2;
+        final_state.materialize();
+        assert_eq!(final_state.vector_size, 1);
+        assert_eq!(final_state.original_size, 1);
+    }
+
+    /// Test that all lanes going true direction returns unchanged state
+    #[test]
+    fn test_branch_all_true() {
+        let mut state = State::new();
+        state.original_size = 3;
+        state.vector_size = 3;
+        state.mask = None;
+
+        let cond_id = LocalId::from(0);
+        // All true
+        state.local_env.set(cond_id, Value::Bool(MaybeVector::Vector(vec![true, true, true])));
+
+        let branch = BoundInterpreterFlow::BranchConditional {
+            condition_local_id: cond_id,
+            condition_from_flow_edge: true,
+        };
+
+        let result = branch.flow_single_state(state).unwrap();
+        let result_state = match result {
+            FlowData::States(mut s) => s.pop().unwrap(),
+            _ => panic!("Expected States"),
+        };
+
+        // Should return unchanged (no mask applied)
+        assert_eq!(result_state.vector_size, 3);
+        assert_eq!(result_state.original_size, 3);
+        assert!(result_state.mask.is_none(), "All-true branch should not set mask");
+    }
+
+    /// Test that no lanes going our direction returns empty
+    #[test]
+    fn test_branch_all_opposite() {
+        let mut state = State::new();
+        state.original_size = 3;
+        state.vector_size = 3;
+        state.mask = None;
+
+        let cond_id = LocalId::from(0);
+        // All true, but we're taking false branch
+        state.local_env.set(cond_id, Value::Bool(MaybeVector::Vector(vec![true, true, true])));
+
+        let branch = BoundInterpreterFlow::BranchConditional {
+            condition_local_id: cond_id,
+            condition_from_flow_edge: false, // Taking false branch
+        };
+
+        let result = branch.flow_single_state(state).unwrap();
+        let states = match result {
+            FlowData::States(s) => s,
+            _ => panic!("Expected States"),
+        };
+
+        assert!(states.is_empty(), "No lanes go to false branch, should be empty");
     }
 }

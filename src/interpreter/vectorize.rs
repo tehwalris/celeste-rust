@@ -380,6 +380,8 @@ fn vectorize_same_shape_states(states: Vec<State>) -> State {
         outer_local_envs: merged_outer_local_envs,
         global_env: first_state.global_env.clone(),
         prints: first_state.prints.clone(),
+        original_size: total_vector_size,
+        mask: None, // All lanes active after fresh merge
         vector_size: total_vector_size,
     }
 }
@@ -947,6 +949,11 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
     let mut stats = VectorizeTimingStats::default();
     stats.input_count = states.len();
 
+    // Materialize any pending masks before vectorization.
+    // This ensures all states have actual filtered vectors, not lazy masks.
+    // (GC also calls materialize, but we need it even when GC is skipped)
+    let states: Vec<State> = states.into_iter().map(|mut s| { s.materialize(); s }).collect();
+
     // GC all states before shape grouping when input is large enough.
     // This removes garbage from heaps, allowing states to match shapes better.
     // Typical improvement: 12k groups -> 24 groups, 5x speedup.
@@ -1178,7 +1185,7 @@ pub fn union_diff_states(
 
     // Partition potentially_new into truly new vs already seen
     // Also deduplicate within potentially_new
-    let mut seen: FxHashSet<NormalizedState> = accumulated_normalized.clone();
+    let mut seen: FxHashSet<NormalizedState> = accumulated_normalized;
     let mut actually_new = Vec::new();
     for state in potentially_new {
         let normalized = normalize_state_for_comparison(&state);

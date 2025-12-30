@@ -276,7 +276,7 @@ impl<'a> CoreInterpreter<'a> {
     }
 
     pub fn interpret_call_instruction(
-        self,
+        mut self,
         local_id: LocalId,
         instruction: &Instruction,
     ) -> Result<Vec<State>> {
@@ -298,6 +298,10 @@ impl<'a> CoreInterpreter<'a> {
 
         // Get the heap value
         let heap_value = self.state.heap.get(closure_heap_id).clone();
+
+        // Materialize before any call (builtin or closure) to ensure vectors
+        // have consistent lengths matching original_size.
+        self.state.materialize();
 
         // Gather argument values
         let arg_values: Vec<Value> = arg_local_ids
@@ -381,11 +385,9 @@ impl<'a> CoreInterpreter<'a> {
 
                 // Create the state for executing the function body.
                 // We push the caller's local_env onto outer_local_envs so it can be
-                // restored after the function returns. This is important because:
-                // 1. The function may change vector_size (e.g., via hint_normalize)
-                // 2. When that happens, we need to restore the caller's local_env as-is
-                // 3. The caller's variables are scalar or already matched the original
-                //    vector_size, so they don't need filtering
+                // restored after the function returns.
+                // Note: materialize() was already called before the match, so vectors
+                // have consistent lengths matching original_size.
                 let mut new_outer_local_envs = vec![self.state.local_env.clone()];
                 new_outer_local_envs.extend(self.state.outer_local_envs.clone());
 
@@ -395,6 +397,8 @@ impl<'a> CoreInterpreter<'a> {
                     outer_local_envs: new_outer_local_envs,
                     global_env: self.state.global_env.clone(),
                     prints: self.state.prints.clone(),
+                    original_size: self.state.original_size,
+                    mask: self.state.mask.clone(),
                     vector_size: self.state.vector_size,
                 };
 
@@ -447,6 +451,8 @@ impl<'a> CoreInterpreter<'a> {
                             outer_local_envs: remaining_outer_envs,
                             global_env: function_result_state.global_env,
                             prints: function_result_state.prints,
+                            original_size: function_result_state.original_size,
+                            mask: function_result_state.mask,
                             // Use the function's final vector_size - this is correct because:
                             // - The caller's local_env contains the original values which are
                             //   scalar or match the original vector_size
