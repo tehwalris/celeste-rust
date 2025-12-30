@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 use crate::{instruction_flow::FlowSide, ir::LocalId};
 
@@ -7,7 +7,7 @@ use crate::{instruction_flow::FlowSide, ir::LocalId};
 /// TODO: Implement proper liveness analysis.
 pub struct LivenessAnalysisResult {
     /// If set, return this set for all queries (used for "all live" stub)
-    all_live: Option<HashSet<LocalId>>,
+    all_live: Option<FxHashSet<LocalId>>,
 }
 
 impl LivenessAnalysisResult {
@@ -15,7 +15,7 @@ impl LivenessAnalysisResult {
     /// This is conservative - it won't prune any variables.
     pub fn all_live() -> Self {
         Self {
-            all_live: Some(HashSet::new()),
+            all_live: Some(FxHashSet::default()),
         }
     }
 
@@ -23,7 +23,7 @@ impl LivenessAnalysisResult {
         &self,
         _side: FlowSide,
         _instruction_id: LocalId,
-    ) -> Option<&HashSet<LocalId>> {
+    ) -> Option<&FxHashSet<LocalId>> {
         // For the stub, return an empty set which means "keep all" since
         // the flow code retains variables that are in the live set.
         // Actually, an empty set would prune everything. We need the opposite.

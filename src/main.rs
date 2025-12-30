@@ -2,6 +2,10 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
 
+// Use mimalloc as the global allocator for better performance
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use anyhow::Result;
 use clap::Parser;
 
@@ -52,6 +56,14 @@ struct Args {
     /// Resume from the latest checkpoint in the checkpoint directory
     #[arg(long)]
     resume: bool,
+
+    /// Capture function calls at this frame (saves to /tmp/captured_calls.json)
+    #[arg(long)]
+    capture_at: Option<u32>,
+
+    /// Function name prefix to capture (e.g., "sign")
+    #[arg(long, default_value = "sign")]
+    capture_function: String,
 }
 
 fn main() -> Result<()> {
@@ -73,6 +85,8 @@ fn main() -> Result<()> {
         args.checkpoint_dir.as_deref(),
         args.checkpoint_interval,
         args.resume,
+        args.capture_at,
+        &args.capture_function,
     )
 }
 
@@ -115,8 +129,11 @@ fn run_game_frames(
     checkpoint_dir: Option<&str>,
     checkpoint_interval: u32,
     resume: bool,
+    capture_at: Option<u32>,
+    capture_function: &str,
 ) -> Result<()> {
     use crate::interpreter::glue::interpret_cfg;
+    use crate::interpreter::input_capture::{enable_capture, disable_capture_and_get};
     use crate::interpreter::inspect::{make_state_abstract, create_frame_dump, write_frame_dump_jsonl, dump_states_to_file, save_checkpoint, load_checkpoint, checkpoint_filename, Checkpoint};
     use crate::interpreter::profiling::{enable_profiling, get_chrome_tracing_json, get_dag_json, get_tree_json, get_cfgs_json, get_profile_summary};
     use crate::game_runner::{create_fixed_env_with_game_builtins, create_initial_state_with_builtins};
@@ -224,6 +241,12 @@ __reset_button_states()
         let expanded_input: usize = states.iter().map(|s| s.vector_size).sum();
         print!("Frame {}: ", frame_num);
 
+        // Enable capture if this is the target frame
+        if capture_at == Some(frame_num) {
+            println!("(capturing {} calls)", capture_function);
+            enable_capture(capture_function);
+        }
+
         let start = std::time::Instant::now();
         let mut new_states = Vec::new();
 
@@ -231,6 +254,16 @@ __reset_button_states()
             let result = interpret_cfg(frame_cfg.clone(), state, &fixed_env)
                 .expect("Frame interpretation failed");
             new_states.extend(result.into_iter().map(|(s, _)| s));
+        }
+
+        // Disable capture and save if this was the target frame
+        if capture_at == Some(frame_num) {
+            let captured = disable_capture_and_get();
+            println!("  Captured {} calls to {}", captured.len(), capture_function);
+            let output_path = "/tmp/captured_calls.json";
+            let json = serde_json::to_string_pretty(&captured).expect("Failed to serialize");
+            std::fs::write(output_path, &json).expect("Failed to write");
+            println!("  Saved to {}", output_path);
         }
 
         // GC and normalize states before vectorization

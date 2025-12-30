@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+mimalloc = { version = "0.1", default-features = false }
 bv = "0.11.1"
 anyhow = "1.0.62"
 im = { version = "15.1.0", features = ["serde"] }
@@ -23,6 +24,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rayon = "1.10"
 zstd = "0.13"
+elsa = "1.10"
 
 [[bin]]
 name = "view_frames"

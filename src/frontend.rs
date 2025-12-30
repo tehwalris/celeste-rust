@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasherDefault;
 
 use anyhow::{bail, Result};
 use full_moon::{
@@ -6,7 +7,11 @@ use full_moon::{
     node::Node,
     tokenizer::{Symbol, TokenReference, TokenType},
 };
+use rustc_hash::FxHasher;
+
 use itertools::Itertools;
+
+type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 use crate::{
     ir::{
@@ -134,7 +139,7 @@ impl Stream {
         }
 
         let mut block_builder = BlockBuilder::new();
-        let mut named_blocks = HashMap::new();
+        let mut named_blocks = FxHashMap::default();
         let mut fun_defs = Vec::new();
 
         for el in self.0.into_iter().rev() {

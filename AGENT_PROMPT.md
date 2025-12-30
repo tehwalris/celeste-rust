@@ -1,30 +1,54 @@
-# Agent Prompt: Celeste Rust Interpreter
+# Agent Prompt: Performance Optimization Loop
 
-You are working on porting an OCaml abstract interpreter to Rust. The goal is running the **100m room** (first room of Celeste Classic) correctly and fast.
+You are optimizing a Rust abstract interpreter for PICO-8 Celeste. Your goal is to maximize throughput: complete as many frames as possible within **60 seconds** and **80GB memory**.
 
-The OCaml project is at `~/src/github.com/tehwalris/celeste_ocaml`.
+## Benchmark
 
-## Phases
+Run `./safe-run.sh -- timeout 60s ./target/release/celeste-rust --frames 100` to measure performance.
 
-### Phase 1: All Tests Passing
+**Goal**: Maximize the highest frame number completed within 60 seconds.
 
-Port all tests from the OCaml project to Rust and get them passing. The OCaml tests are in `lua_tests.ml`.
+## Correctness Constraint
 
-No `todo!()` should remain in the interpreter when done.
+**The expanded state count per frame MUST remain identical.** For example:
+- Frame 27: 878 expanded
+- Frame 28: 2864 expanded
+- Frame 29: 7260 expanded
+- Frame 30: 15250 expanded
+- Frame 31: 27024 expanded
 
-### Phase 2: 100m Room Running
-
-Get the actual game running. See `frontend_example.ml` in the OCaml project for how this works.
-
-**Success metric**: State counts per frame matching OCaml output, running in reasonable time.
+If state counts change, the optimization broke correctness and must be reverted.
 
 ## Approach
 
-1. Follow OCaml architecture - match the overall structure
-2. Use existing Rust infrastructure - don't bypass it with simpler implementations
-3. When unsure, read the OCaml code and/or create comparison tests
-4. Commit often - this branch is yours
+Any optimization technique is fair game as long as correctness is preserved. Profile first to identify bottlenecks, then optimize based on data. The codebase is in `src/interpreter/`.
 
-## How to Work
+Use `./safe-run.sh` to run commands with memory limits. Use `perf` for profiling.
 
-Explore the codebase, understand the current state, and make progress. This could mean fixing bugs, implementing missing features, improving code quality, improving performance, or adding tests.
+## Workflow
+
+Each iteration:
+
+1. **Profile** to identify hotspots
+
+2. **Implement** one optimization
+
+3. **Measure** and verify:
+   - State counts identical (correctness)
+   - Frame count same or higher
+   - Timing improved
+
+4. **Commit**:
+   - If BETTER and CORRECT:
+     ```bash
+     git add -A && git commit -m "perf: <description>"
+     git push
+     ```
+   - If WORSE or INCORRECT:
+     ```bash
+     git add -A && git commit -m "experiment: <description> (reverting)"
+     git revert HEAD --no-edit
+     git push
+     ```
+
+Begin by profiling the current state and making your first optimization attempt.

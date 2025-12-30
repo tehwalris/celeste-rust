@@ -3,6 +3,7 @@ pub mod fixed_env;
 mod flow;
 pub mod glue;
 pub mod heap;
+pub mod input_capture;
 pub mod inspect;
 pub mod local_env;
 mod op;

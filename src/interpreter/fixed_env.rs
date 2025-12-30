@@ -1,11 +1,15 @@
-use std::collections::HashMap;
+use std::hash::BuildHasherDefault;
 use std::sync::Arc;
 
 use indexmap::IndexSet;
+use rustc_hash::FxHasher;
 
 use crate::ir::{Cfg, FunDef, GlobalId, Label};
 
 use super::{state::State, value::Value};
+
+// Use FxHashMap for faster hashing in FixedEnv
+type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 /// A builtin function takes a state and argument values, returns multiple possible (state, return_value) pairs.
 /// Multiple pairs are returned when the function can branch (e.g., on UnknownBool).
@@ -34,15 +38,15 @@ impl PreparedCfg {
 /// - Function definitions (with their prepared CFGs)
 /// - Builtin function implementations
 pub struct FixedEnv {
-    pub fun_defs: HashMap<GlobalId, (FunDef, PreparedCfg)>,
-    pub builtin_funs: HashMap<String, BuiltinFun>,
+    pub fun_defs: FxHashMap<GlobalId, (FunDef, PreparedCfg)>,
+    pub builtin_funs: FxHashMap<String, BuiltinFun>,
 }
 
 impl FixedEnv {
     pub fn new() -> Self {
         Self {
-            fun_defs: HashMap::new(),
-            builtin_funs: HashMap::new(),
+            fun_defs: FxHashMap::default(),
+            builtin_funs: FxHashMap::default(),
         }
     }
 

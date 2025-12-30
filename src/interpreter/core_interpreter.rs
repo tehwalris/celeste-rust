@@ -1,8 +1,11 @@
-use std::collections::HashMap;
+use std::hash::BuildHasherDefault;
+
+use rustc_hash::FxHasher;
 
 use super::{
     fixed_env::FixedEnv,
     heap::HeapId,
+    input_capture,
     op::{interpret_binary_op, interpret_unary_op},
     profiling::{DagOperation, SpanGuard, with_profiler},
     state::State,
@@ -10,6 +13,8 @@ use super::{
 };
 use crate::ir::{Instruction, LocalId};
 use anyhow::{anyhow, Result};
+
+type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 pub struct CoreInterpreter<'a> {
     state: State,
@@ -160,12 +165,17 @@ impl<'a> CoreInterpreter<'a> {
                     self.state
                         .heap
                         .set(field_heap_id, HeapValue::Value(Value::Nil(None)));
-                    match self.state.heap.get_mut(table_heap_id) {
-                        HeapValue::ObjectTable(fields) => {
-                            fields.insert(field.clone(), field_heap_id);
+                    match self.state.heap.get(table_heap_id) {
+                        HeapValue::ObjectTable(_) => {
+                            let field = field.clone();
+                            self.state.heap.modify(table_heap_id, |v| {
+                                if let HeapValue::ObjectTable(fields) = v {
+                                    fields.insert(field, field_heap_id);
+                                }
+                            });
                         }
                         HeapValue::UnknownTable => {
-                            let mut fields = HashMap::new();
+                            let mut fields = FxHashMap::default();
                             fields.insert(field.clone(), field_heap_id);
                             self.state
                                 .heap
@@ -215,12 +225,16 @@ impl<'a> CoreInterpreter<'a> {
                     self.state
                         .heap
                         .set(field_heap_id, HeapValue::Value(Value::Nil(None)));
-                    match self.state.heap.get_mut(table_heap_id) {
+                    match self.state.heap.get(table_heap_id) {
                         HeapValue::ArrayTable(fields) => {
                             if index as usize != fields.len() + 1 {
                                 return Err(anyhow!("Index is not the next index in the array"));
                             }
-                            fields.push(field_heap_id);
+                            self.state.heap.modify(table_heap_id, |v| {
+                                if let HeapValue::ArrayTable(fields) = v {
+                                    fields.push(field_heap_id);
+                                }
+                            });
                         }
                         HeapValue::UnknownTable => {
                             if index as usize != 1 {
@@ -345,6 +359,9 @@ impl<'a> CoreInterpreter<'a> {
                 Ok(states)
             }
             HeapValue::Closure(fun_def_name, captured_values) => {
+                // Capture inputs for benchmarking if enabled
+                input_capture::maybe_capture(fun_def_name.as_str(), arg_values.clone());
+
                 // Look up the function definition with prepared CFG
                 let (fun_def, prepared_cfg) = self
                     .fixed_env
