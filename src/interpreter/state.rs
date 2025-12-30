@@ -133,18 +133,19 @@ impl State {
     /// Filters all vector values in the state by a mask in place.
     /// The resulting state's vector_size will be the number of true values in the mask.
     fn filter_by_mask_in_place(&mut self, mask: &[bool]) {
-        let new_vector_size = mask.iter().filter(|&&b| b).count();
+        use super::value::count_true;
+        let new_vector_size = count_true(mask);
         self.vector_size = new_vector_size;
 
         // Filter values in heap - use optimized method that only clones vectors
-        self.heap.filter_vectors_in_place(mask);
+        self.heap.filter_vectors_in_place(mask, new_vector_size);
 
         // Filter values in local env - use optimized method
-        self.local_env.filter_vectors_in_place(mask);
+        self.local_env.filter_vectors_in_place(mask, new_vector_size);
 
         // Filter values in outer local envs
         for env in &mut self.outer_local_envs {
-            env.filter_vectors_in_place(mask);
+            env.filter_vectors_in_place(mask, new_vector_size);
         }
     }
 

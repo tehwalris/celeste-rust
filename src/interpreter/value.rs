@@ -69,13 +69,19 @@ pub enum Value {
     NilPointer(String),
 }
 
-fn filter_vec_by_mask<T: Clone + PartialEq>(vec: Vec<T>, mask: &[bool]) -> MaybeVector<T>
+/// Count true values in a mask using SIMD-friendly byte sum
+#[inline(always)]
+pub fn count_true(mask: &[bool]) -> usize {
+    // Since bool is represented as 0 or 1, we can sum directly
+    // This is more SIMD-friendly than filter().count()
+    mask.iter().map(|&b| b as usize).sum()
+}
+
+#[inline]
+fn filter_vec_by_mask<T: Clone + PartialEq>(vec: Vec<T>, mask: &[bool], true_count: usize) -> MaybeVector<T>
 where
     T: std::fmt::Debug + Clone + PartialEq + Eq,
 {
-    // Count true values to pre-allocate exact capacity
-    let true_count = mask.iter().filter(|&&b| b).count();
-
     if true_count == 1 {
         // Single element - find it and return as scalar
         for (v, &m) in vec.into_iter().zip(mask.iter()) {
@@ -97,13 +103,11 @@ where
 }
 
 /// Filter a vector by mask, cloning elements (for use with references)
-fn filter_vec_by_mask_ref<T: Clone + PartialEq>(vec: &[T], mask: &[bool]) -> MaybeVector<T>
+#[inline]
+fn filter_vec_by_mask_ref<T: Clone + PartialEq>(vec: &[T], mask: &[bool], true_count: usize) -> MaybeVector<T>
 where
     T: std::fmt::Debug + Clone + PartialEq + Eq,
 {
-    // Count true values to pre-allocate exact capacity
-    let true_count = mask.iter().filter(|&&b| b).count();
-
     if true_count == 1 {
         // Single element - find it and return as scalar
         for (v, &m) in vec.iter().zip(mask.iter()) {
@@ -125,12 +129,12 @@ where
 }
 
 impl Value {
-    pub fn filter_vectors(self, mask: &[bool]) -> Self {
+    pub fn filter_vectors(self, mask: &[bool], true_count: usize) -> Self {
         match self {
-            Value::Bool(MaybeVector::Vector(vec)) => Value::Bool(filter_vec_by_mask(vec, mask)),
-            Value::Number(MaybeVector::Vector(vec)) => Value::Number(filter_vec_by_mask(vec, mask)),
+            Value::Bool(MaybeVector::Vector(vec)) => Value::Bool(filter_vec_by_mask(vec, mask, true_count)),
+            Value::Number(MaybeVector::Vector(vec)) => Value::Number(filter_vec_by_mask(vec, mask, true_count)),
             Value::NumberInterval(MaybeVector::Vector(vec)) => {
-                Value::NumberInterval(filter_vec_by_mask(vec, mask))
+                Value::NumberInterval(filter_vec_by_mask(vec, mask, true_count))
             }
             _ => self,
         }
@@ -139,12 +143,13 @@ impl Value {
     /// Filter vectors, returning Some(new_value) only if the value is a vector.
     /// Returns None for scalars (no transformation needed).
     /// This avoids cloning scalar values that don't need transformation.
-    pub fn filter_vectors_if_vector(&self, mask: &[bool]) -> Option<Self> {
+    #[inline]
+    pub fn filter_vectors_if_vector(&self, mask: &[bool], true_count: usize) -> Option<Self> {
         match self {
-            Value::Bool(MaybeVector::Vector(vec)) => Some(Value::Bool(filter_vec_by_mask_ref(vec, mask))),
-            Value::Number(MaybeVector::Vector(vec)) => Some(Value::Number(filter_vec_by_mask_ref(vec, mask))),
+            Value::Bool(MaybeVector::Vector(vec)) => Some(Value::Bool(filter_vec_by_mask_ref(vec, mask, true_count))),
+            Value::Number(MaybeVector::Vector(vec)) => Some(Value::Number(filter_vec_by_mask_ref(vec, mask, true_count))),
             Value::NumberInterval(MaybeVector::Vector(vec)) => {
-                Some(Value::NumberInterval(filter_vec_by_mask_ref(vec, mask)))
+                Some(Value::NumberInterval(filter_vec_by_mask_ref(vec, mask, true_count)))
             }
             _ => None,
         }
@@ -165,9 +170,10 @@ impl HeapValue {
     /// Filter vectors in this heap value, returning Some(new_value) only if transformation is needed.
     /// Returns None for values that don't contain vectors (no transformation needed).
     /// This avoids cloning non-vector values during filter operations.
-    pub fn filter_vectors_if_needed(&self, mask: &[bool]) -> Option<Self> {
+    #[inline]
+    pub fn filter_vectors_if_needed(&self, mask: &[bool], true_count: usize) -> Option<Self> {
         match self {
-            HeapValue::Value(v) => v.filter_vectors_if_vector(mask).map(HeapValue::Value),
+            HeapValue::Value(v) => v.filter_vectors_if_vector(mask, true_count).map(HeapValue::Value),
             HeapValue::Closure(id, captures) => {
                 // Check if any capture is a vector
                 let mut any_vector = false;
@@ -185,7 +191,7 @@ impl HeapValue {
                     // Need to transform - clone and filter
                     let new_captures: Vec<Value> = captures
                         .iter()
-                        .map(|v| v.filter_vectors_if_vector(mask).unwrap_or_else(|| v.clone()))
+                        .map(|v| v.filter_vectors_if_vector(mask, true_count).unwrap_or_else(|| v.clone()))
                         .collect();
                     Some(HeapValue::Closure(id.clone(), new_captures))
                 } else {

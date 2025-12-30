@@ -249,7 +249,7 @@ impl Heap {
     /// Filter vectors by mask, only cloning values that need transformation.
     /// This is more efficient than map_in_place for filter_vectors operations
     /// because it avoids cloning values that don't contain vectors.
-    pub fn filter_vectors_in_place(&mut self, mask: &[bool]) {
+    pub fn filter_vectors_in_place(&mut self, mask: &[bool], true_count: usize) {
         // For filter operations, we only need to update values that contain vectors.
         // Non-vector values can keep their existing storage indices.
 
@@ -276,7 +276,7 @@ impl Heap {
             let value = self.storage.get(old_storage_idx).expect("valid storage index");
 
             // Check if this value needs transformation
-            if let Some(new_value) = value.filter_vectors_if_needed(mask) {
+            if let Some(new_value) = value.filter_vectors_if_needed(mask, true_count) {
                 // Value was transformed - store the new value
                 let new_storage_idx = self.storage.len();
                 self.storage.push(Box::new(new_value));
