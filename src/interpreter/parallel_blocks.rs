@@ -256,13 +256,67 @@ pub fn partition_states_into_blocks(
     blocks
 }
 
-/// Process a frame in parallel using output partitioning
+/// Slice a vectorized state into smaller pieces.
+/// Each slice will have at most `max_size` elements.
+/// Uses the same filter_by_mask mechanism as control flow branching.
+fn slice_vectorized_state(state: &State, max_size: usize) -> Vec<State> {
+    let vector_size = state.vector_size;
+
+    if vector_size <= max_size {
+        return vec![state.clone()];
+    }
+
+    // Calculate number of slices needed
+    let num_slices = (vector_size + max_size - 1) / max_size;
+    let mut slices = Vec::with_capacity(num_slices);
+
+    for i in 0..num_slices {
+        let start = i * max_size;
+        let end = ((i + 1) * max_size).min(vector_size);
+        let slice_size = end - start;
+
+        // Create a mask for this slice (same as branching uses)
+        let mask: Vec<bool> = (0..vector_size)
+            .map(|idx| idx >= start && idx < end)
+            .collect();
+
+        // Filter the state by this mask (same operation as control flow branching)
+        let sliced_state = state.filter_by_mask_clone(&mask);
+        debug_assert_eq!(sliced_state.vector_size, slice_size);
+        slices.push(sliced_state);
+    }
+
+    slices
+}
+
+/// Slice all vectorized states into smaller pieces for parallel processing.
+fn slice_states_for_parallelism(states: Vec<State>, num_blocks: usize) -> Vec<State> {
+    let _trace = TraceSpan::new("slice_states", "parallel");
+
+    // Calculate total expanded size
+    let total_expanded: usize = states.iter().map(|s| s.vector_size).sum();
+
+    if total_expanded == 0 || num_blocks <= 1 {
+        return states;
+    }
+
+    // Target size per slice
+    let target_size = (total_expanded + num_blocks - 1) / num_blocks;
+    let target_size = target_size.max(16); // Don't create tiny slices
+
+    // Slice all states
+    states
+        .iter()
+        .flat_map(|state| slice_vectorized_state(state, target_size))
+        .collect()
+}
+
+/// Process a frame in parallel by slicing vectorized input states
 ///
-/// This is the main entry point for parallel frame processing.
 /// Strategy:
-/// 1. Process input states sequentially (because vectorized states share heap structure)
-/// 2. GC all output states in parallel (each state independently)
-/// 3. Vectorize states sequentially (must compare shapes)
+/// 1. Slice large vectorized states into smaller pieces (using filter_by_mask)
+/// 2. Process each slice in parallel
+/// 3. GC and vectorize results
 pub fn process_frame_parallel<F>(
     states: Vec<State>,
     config: &ParallelBlockConfig,
@@ -277,41 +331,55 @@ where
         return vec![];
     }
 
-    // Step 1: Process input states sequentially to get output states
-    // (Vectorized states share heap structure and can't be safely split)
-    let output_states: Vec<State> = {
-        let _trace_interpret = TraceSpan::new("interpret_states", "parallel");
-        states.into_iter().flat_map(&process_state).collect()
-    };
+    // Step 1: Slice large vectorized states into smaller pieces
+    let sliced_states = slice_states_for_parallelism(states, config.num_blocks);
+    let num_slices = sliced_states.len();
 
-    let num_output = output_states.len();
+    println!("  [parallel] sliced into {} pieces", num_slices);
 
-    if num_output <= config.min_block_size {
-        // Not enough states to parallelize - process sequentially
-        let mut results = output_states;
+    if num_slices <= 1 {
+        // Single slice, process sequentially
+        let state = sliced_states.into_iter().next().unwrap();
+        let mut results: Vec<State> = process_state(state);
         for state in &mut results {
             state.gc();
         }
         return vectorize_states(results);
     }
 
-    // Step 2: GC all output states in parallel
-    // Each state is independent after interpretation, so GC can run in parallel
-    let gc_results: Vec<State> = {
-        let _trace_parallel_gc = TraceSpan::new("parallel_gc", "parallel");
+    // Step 2: Process slices in parallel
+    let block_results: Vec<Vec<State>> = {
+        let _trace_parallel = TraceSpan::new("parallel_interpret", "parallel");
 
-        output_states
+        sliced_states
             .into_par_iter()
-            .map(|mut state: State| {
-                state.gc();
-                state
+            .enumerate()
+            .map(|(i, state): (usize, State)| {
+                let _trace_block = TraceSpan::new("interpret_slice", "parallel");
+                println!("    [slice {}] vector_size={}", i, state.vector_size);
+
+                // Process this slice
+                let mut block_output: Vec<State> = process_state(state);
+
+                // GC within block
+                block_output.iter_mut().for_each(|s| s.gc());
+
+                // Vectorize within block
+                vectorize_states(block_output)
             })
             .collect()
     };
 
-    // Step 3: Vectorize states (must be sequential to compare shapes correctly)
-    let _trace_vectorize = TraceSpan::new("vectorize", "parallel");
-    vectorize_states(gc_results)
+    // Step 3: Merge all block results
+    let mut all_results: Vec<State> = {
+        let _trace_merge = TraceSpan::new("merge_block_results", "parallel");
+        block_results.into_iter().flatten().collect()
+    };
+
+    // Final vectorization across all blocks
+    let _trace_final_vec = TraceSpan::new("final_vectorize", "parallel");
+    all_results.iter_mut().for_each(|s: &mut State| s.gc());
+    vectorize_states(all_results)
 }
 
 #[cfg(test)]
@@ -340,5 +408,91 @@ mod tests {
         let config = ParallelBlockConfig::default();
         let blocks = partition_states_into_blocks(vec![], &config);
         assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn test_slice_vectorized_state() {
+        use crate::interpreter::heap::HeapId;
+        use crate::interpreter::value::{MaybeVector, Value};
+        use crate::pico8_num::Pico8Num;
+
+        // Create a state with vector_size = 10
+        let mut state = State::new();
+        state.vector_size = 10;
+
+        // Add a vector number to the heap
+        let nums: Vec<Pico8Num> = (0..10).map(|i| Pico8Num::from_i16(i)).collect();
+        let id = state.heap.alloc();
+        state.heap.set(id, HeapValue::Value(Value::Number(MaybeVector::Vector(nums))));
+        state.global_env.insert("test".to_string(), id);
+
+        // Slice into 2 pieces
+        let slices = slice_vectorized_state(&state, 5);
+        assert_eq!(slices.len(), 2);
+
+        // First slice should have elements 0-4
+        assert_eq!(slices[0].vector_size, 5);
+        let val0 = slices[0].heap.get(*slices[0].global_env.get("test").unwrap());
+        match val0 {
+            HeapValue::Value(Value::Number(MaybeVector::Vector(nums))) => {
+                assert_eq!(nums.len(), 5);
+                for i in 0..5 {
+                    assert_eq!(nums[i], Pico8Num::from_i16(i as i16));
+                }
+            }
+            _ => panic!("Expected vector number"),
+        }
+
+        // Second slice should have elements 5-9
+        assert_eq!(slices[1].vector_size, 5);
+        let val1 = slices[1].heap.get(*slices[1].global_env.get("test").unwrap());
+        match val1 {
+            HeapValue::Value(Value::Number(MaybeVector::Vector(nums))) => {
+                assert_eq!(nums.len(), 5);
+                for i in 0..5 {
+                    assert_eq!(nums[i], Pico8Num::from_i16((i + 5) as i16));
+                }
+            }
+            _ => panic!("Expected vector number"),
+        }
+    }
+
+    #[test]
+    fn test_slice_preserves_scalars() {
+        use crate::interpreter::heap::HeapId;
+        use crate::interpreter::value::{MaybeVector, Value};
+        use crate::pico8_num::Pico8Num;
+
+        // Create a state with vector_size = 10 but some scalar values
+        let mut state = State::new();
+        state.vector_size = 10;
+
+        // Add a scalar number (same value for all lanes)
+        let scalar_id = state.heap.alloc();
+        state.heap.set(scalar_id, HeapValue::Value(Value::Number(
+            MaybeVector::Scalar(Pico8Num::from_i16(42))
+        )));
+        state.global_env.insert("scalar".to_string(), scalar_id);
+
+        // Add a vector number (different values per lane)
+        let vector_id = state.heap.alloc();
+        let nums: Vec<Pico8Num> = (0..10).map(|i| Pico8Num::from_i16(i)).collect();
+        state.heap.set(vector_id, HeapValue::Value(Value::Number(MaybeVector::Vector(nums))));
+        state.global_env.insert("vector".to_string(), vector_id);
+
+        // Slice into 2 pieces
+        let slices = slice_vectorized_state(&state, 5);
+        assert_eq!(slices.len(), 2);
+
+        // Check that scalar is preserved in both slices
+        for (i, slice) in slices.iter().enumerate() {
+            let scalar_val = slice.heap.get(*slice.global_env.get("scalar").unwrap());
+            match scalar_val {
+                HeapValue::Value(Value::Number(MaybeVector::Scalar(n))) => {
+                    assert_eq!(*n, Pico8Num::from_i16(42), "Slice {} scalar mismatch", i);
+                }
+                _ => panic!("Slice {} - Expected scalar number, got {:?}", i, scalar_val),
+            }
+        }
     }
 }

@@ -78,8 +78,8 @@ impl<'de> Deserialize<'de> for Heap {
 
         for value_opt in &values {
             if let Some(value) = value_opt {
-                let idx = storage.len();
-                storage.push(Box::new(value.clone()));
+                // Use push_get_index for consistency (even though this isn't shared yet)
+                let idx = storage.push_get_index(Box::new(value.clone()));
                 base_index.push(idx);
             } else {
                 base_index.push(usize::MAX); // Sentinel for None
@@ -164,8 +164,9 @@ impl Heap {
     }
 
     pub fn set(&mut self, id: HeapId, value: HeapValue) {
-        let storage_idx = self.storage.len();
-        self.storage.push(Box::new(value));
+        // Use push_get_index to atomically get the index while pushing
+        // This avoids race conditions when multiple threads share the storage Arc
+        let storage_idx = self.storage.push_get_index(Box::new(value));
 
         // Update overlay, keeping it sorted
         match self.overlay.binary_search_by_key(&id.0, |&(k, _)| k) {
@@ -233,8 +234,8 @@ impl Heap {
         for id in 0..self.next_id {
             if let Some(value) = self.get_opt(HeapId(id)) {
                 let new_value = f(value.clone());
-                let storage_idx = self.storage.len();
-                self.storage.push(Box::new(new_value));
+                // Use push_get_index for atomic index assignment
+                let storage_idx = self.storage.push_get_index(Box::new(new_value));
                 new_base.push(storage_idx);
             } else {
                 new_base.push(usize::MAX); // Sentinel for None
@@ -278,8 +279,8 @@ impl Heap {
             // Check if this value needs transformation
             if let Some(new_value) = value.filter_vectors_if_needed(mask, true_count) {
                 // Value was transformed - store the new value
-                let new_storage_idx = self.storage.len();
-                self.storage.push(Box::new(new_value));
+                // Use push_get_index for atomic index assignment
+                let new_storage_idx = self.storage.push_get_index(Box::new(new_value));
                 new_base.push(new_storage_idx);
             } else {
                 // Value unchanged - keep the old storage index
