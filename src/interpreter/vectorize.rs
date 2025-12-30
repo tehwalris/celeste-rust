@@ -115,35 +115,39 @@ pub fn debug_shape_of_state(state: &State) -> StateShape {
 
 fn shape_of_state(state: &State) -> StateShape {
     // Get heap structure (handle empty slots that are allocated but not set)
-    let heap_structure: Vec<_> = (0..state.heap.len())
-        .map(|i| {
-            let id = HeapId::from_raw(i);
-            let shape = match state.heap.get_opt(id) {
-                Some(value) => normalize_heap_value_for_shape(value),
-                None => HeapValueShape::Empty,
-            };
-            (id, shape)
-        })
-        .collect();
+    let heap_len = state.heap.len();
+    let mut heap_structure = Vec::with_capacity(heap_len);
+    for i in 0..heap_len {
+        let id = HeapId::from_raw(i);
+        let shape = match state.heap.get_opt(id) {
+            Some(value) => normalize_heap_value_for_shape(value),
+            None => HeapValueShape::Empty,
+        };
+        heap_structure.push((id, shape));
+    }
 
     // Local env is already sorted by index (uses Vec internally)
-    let local_env_structure: Vec<_> = state.local_env.iter()
-        .map(|(k, v)| (k, normalize_value_for_shape(v)))
-        .collect();
+    let mut local_env_structure = Vec::new();
+    for (k, v) in state.local_env.iter() {
+        local_env_structure.push((k, normalize_value_for_shape(v)));
+    }
 
     // Outer local envs are also already sorted by index
-    let outer_local_envs_structure: Vec<Vec<_>> = state.outer_local_envs.iter()
-        .map(|env| {
-            env.iter()
-                .map(|(k, v)| (k, normalize_value_for_shape(v)))
-                .collect()
-        })
-        .collect();
+    let mut outer_local_envs_structure = Vec::with_capacity(state.outer_local_envs.len());
+    for env in &state.outer_local_envs {
+        let mut env_structure = Vec::new();
+        for (k, v) in env.iter() {
+            env_structure.push((k, normalize_value_for_shape(v)));
+        }
+        outer_local_envs_structure.push(env_structure);
+    }
 
     // Convert global_env to sorted Vec for consistent hashing
-    let mut global_env: Vec<_> = state.global_env.iter()
-        .map(|(k, v)| (k.clone(), *v))
-        .collect();
+    let global_env_len = state.global_env.len();
+    let mut global_env = Vec::with_capacity(global_env_len);
+    for (k, v) in state.global_env.iter() {
+        global_env.push((k.clone(), *v));
+    }
     global_env.sort_by(|a, b| a.0.cmp(&b.0));
 
     StateShape {
