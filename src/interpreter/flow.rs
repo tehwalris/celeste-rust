@@ -1,8 +1,6 @@
-use std::collections::HashSet;
-
 use anyhow::{anyhow, Result};
 use itertools::Itertools;
-use rayon::prelude::*;
+use rustc_hash::FxHashSet;
 
 use crate::{
     block_flow::{BoundSplitBlockFlow, UnboundSplitBlockFlow},
@@ -85,7 +83,7 @@ pub enum BoundInterpreterFlow<'a> {
     },
     BlockBeforeJoin {
         /// None means "keep all variables" (used when liveness analysis is not available)
-        live_variables: Option<HashSet<LocalId>>,
+        live_variables: Option<FxHashSet<LocalId>>,
         parallel_budget: f64,
     },
     BlockPostPhi {
@@ -330,28 +328,13 @@ impl<'a> BoundInterpreterFlow<'a> {
 
 impl<'a> BoundSplitBlockFlow<FlowData> for BoundInterpreterFlow<'a> {
     fn flow(&self, v: FlowData) -> Result<FlowData> {
-        let budget = self.parallel_budget();
-
-        let out_parts = match &v {
+        let out_parts = match v {
             FlowData::States(states) => {
-                // Only parallelize if:
-                // 1. Budget is above threshold (not too deep in recursion)
-                // 2. We have enough states to justify the overhead
-                let use_parallel = budget >= PARALLEL_BUDGET_THRESHOLD
-                    && states.len() >= MIN_STATES_FOR_PARALLEL;
-
-                if use_parallel {
-                    states
-                        .par_iter()
-                        .map(|state| self.flow_single_state(state.clone()))
-                        .collect::<Result<Vec<FlowData>>>()?
-                } else {
-                    // Sequential: below budget threshold or too few states
-                    states
-                        .iter()
-                        .map(|state| self.flow_single_state(state.clone()))
-                        .collect::<Result<Vec<FlowData>>>()?
-                }
+                // Use into_iter to take ownership and avoid cloning
+                states
+                    .into_iter()
+                    .map(|state| self.flow_single_state(state))
+                    .collect::<Result<Vec<FlowData>>>()?
             }
             FlowData::StatesAndReturns(_) => {
                 return Err(anyhow!("Return value in unexpected part of CFG"))
