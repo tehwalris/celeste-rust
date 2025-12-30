@@ -136,24 +136,15 @@ impl State {
         let new_vector_size = mask.iter().filter(|&&b| b).count();
         self.vector_size = new_vector_size;
 
-        // Filter values in heap
-        self.heap.map_in_place(|v| match v {
-            HeapValue::Value(val) => HeapValue::Value(val.filter_vectors(mask)),
-            HeapValue::Closure(id, values) => {
-                HeapValue::Closure(id, values.into_iter().map(|v| v.filter_vectors(mask)).collect())
-            }
-            HeapValue::ObjectTable(_)
-            | HeapValue::ArrayTable(_)
-            | HeapValue::UnknownTable
-            | HeapValue::BuiltinFun(_) => v,
-        });
+        // Filter values in heap - use optimized method that only clones vectors
+        self.heap.filter_vectors_in_place(mask);
 
-        // Filter values in local env
-        self.local_env.map_in_place(|v| v.filter_vectors(mask));
+        // Filter values in local env - use optimized method
+        self.local_env.filter_vectors_in_place(mask);
 
         // Filter values in outer local envs
         for env in &mut self.outer_local_envs {
-            env.map_in_place(|v| v.filter_vectors(mask));
+            env.filter_vectors_in_place(mask);
         }
     }
 

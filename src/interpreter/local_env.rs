@@ -117,6 +117,21 @@ impl LocalEnv {
         }
     }
 
+    /// Filter vectors by mask, only transforming values that are vectors.
+    /// This is more efficient than map_in_place for filter_vectors operations.
+    #[inline]
+    pub fn filter_vectors_in_place(&mut self, mask: &[bool]) {
+        let data = Rc::make_mut(&mut self.data);
+        for v in data.iter_mut() {
+            if let Some(val) = v.as_ref() {
+                if let Some(new_val) = val.filter_vectors_if_vector(mask) {
+                    *v = Some(new_val);
+                }
+                // If None returned, value is unchanged - no modification needed
+            }
+        }
+    }
+
     /// Iterate over all (raw_id, value) pairs
     pub fn iter(&self) -> impl Iterator<Item = (usize, &Value)> {
         self.data

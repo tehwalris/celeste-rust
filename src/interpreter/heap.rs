@@ -246,6 +246,50 @@ impl Heap {
         self.overlay.clear();
     }
 
+    /// Filter vectors by mask, only cloning values that need transformation.
+    /// This is more efficient than map_in_place for filter_vectors operations
+    /// because it avoids cloning values that don't contain vectors.
+    pub fn filter_vectors_in_place(&mut self, mask: &[bool]) {
+        // For filter operations, we only need to update values that contain vectors.
+        // Non-vector values can keep their existing storage indices.
+
+        // Check if we have any overlay entries - if so, compact first for simplicity
+        if !self.overlay.is_empty() {
+            self.compact();
+        }
+
+        // Now build new base index, only updating entries that need transformation
+        let mut new_base = Vec::with_capacity(self.next_id);
+
+        for id in 0..self.next_id {
+            let old_storage_idx = if id < self.base_index.len() {
+                self.base_index[id]
+            } else {
+                usize::MAX
+            };
+
+            if old_storage_idx == usize::MAX {
+                new_base.push(usize::MAX);
+                continue;
+            }
+
+            let value = self.storage.get(old_storage_idx).expect("valid storage index");
+
+            // Check if this value needs transformation
+            if let Some(new_value) = value.filter_vectors_if_needed(mask) {
+                // Value was transformed - store the new value
+                let new_storage_idx = self.storage.len();
+                self.storage.push(Box::new(new_value));
+                new_base.push(new_storage_idx);
+            } else {
+                // Value unchanged - keep the old storage index
+                new_base.push(old_storage_idx);
+            }
+        }
+
+        self.base_index = Arc::new(new_base);
+    }
+
     /// Freeze is a no-op for this implementation since storage is already shared.
     pub fn freeze(&mut self) {
         // Compact to reduce overlay size for future clones
