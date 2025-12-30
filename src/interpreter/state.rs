@@ -299,3 +299,16 @@ impl State {
         self.outer_local_envs = new_outer_local_envs;
     }
 }
+
+#[cfg(test)]
+mod send_tests {
+    use super::*;
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
+
+    #[test]
+    fn test_state_is_send() {
+        assert_send::<State>();
+        assert_sync::<State>();
+    }
+}

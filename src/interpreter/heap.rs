@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use elsa::FrozenVec;
+use elsa::sync::FrozenVec;
 use serde::{Deserialize, Serialize};
 
 use super::value::HeapValue;

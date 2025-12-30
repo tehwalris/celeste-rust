@@ -59,6 +59,13 @@ impl std::hash::Hash for StateShape {
     }
 }
 
+impl StateShape {
+    /// Get the cached hash value for this shape
+    pub fn cached_hash(&self) -> u64 {
+        self.cached_hash
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum HeapValueShape {
     Value(ValueShape),
@@ -140,7 +147,8 @@ pub fn debug_shape_of_state(state: &State) -> StateShape {
     shape_of_state(state)
 }
 
-fn shape_of_state(state: &State) -> StateShape {
+/// Get the shape of a state for vectorization grouping
+pub fn shape_of_state(state: &State) -> StateShape {
     // Get heap structure (handle empty slots that are allocated but not set)
     let heap_len = state.heap.len();
     let mut heap_structure = Vec::with_capacity(heap_len);

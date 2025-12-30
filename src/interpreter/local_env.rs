@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::ir::LocalId;
@@ -6,20 +6,19 @@ use crate::ir::LocalId;
 use super::value::Value;
 
 /// A local environment storing local variable bindings.
-/// Uses Rc<Vec> with copy-on-write for efficient cloning while
+/// Uses Arc<Vec> with copy-on-write for efficient cloning while
 /// maintaining O(1) lookup by LocalId (which are contiguous integers).
-/// Note: Rc is used instead of Arc since interpretation is single-threaded,
-/// which avoids atomic operation overhead.
+/// Arc is used for thread-safety during parallel frame processing.
 #[derive(Clone, Debug)]
 pub struct LocalEnv {
     // Copy-on-write vector for storing local variables
-    data: Rc<Vec<Option<Value>>>,
+    data: Arc<Vec<Option<Value>>>,
 }
 
 impl PartialEq for LocalEnv {
     fn eq(&self, other: &Self) -> bool {
-        // If same Rc, they're equal
-        if Rc::ptr_eq(&self.data, &other.data) {
+        // If same Arc, they're equal
+        if Arc::ptr_eq(&self.data, &other.data) {
             return true;
         }
         self.data == other.data
@@ -55,14 +54,14 @@ impl<'de> Deserialize<'de> for LocalEnv {
         for (k, v) in pairs {
             vec[usize::from(k)] = Some(v);
         }
-        Ok(LocalEnv { data: Rc::new(vec) })
+        Ok(LocalEnv { data: Arc::new(vec) })
     }
 }
 
 impl LocalEnv {
     pub fn new() -> Self {
         Self {
-            data: Rc::new(Vec::new()),
+            data: Arc::new(Vec::new()),
         }
     }
 
@@ -84,7 +83,7 @@ impl LocalEnv {
         let idx = usize::from(id);
 
         // Make data unique if needed (copy-on-write)
-        let data = Rc::make_mut(&mut self.data);
+        let data = Arc::make_mut(&mut self.data);
 
         // Extend if needed
         if idx >= data.len() {
@@ -94,7 +93,7 @@ impl LocalEnv {
     }
 
     pub fn retain(&mut self, f: impl Fn(LocalId) -> bool) {
-        let data = Rc::make_mut(&mut self.data);
+        let data = Arc::make_mut(&mut self.data);
         for (i, v) in data.iter_mut().enumerate() {
             if v.is_some() && !f(LocalId::from(i)) {
                 *v = None;
@@ -104,12 +103,12 @@ impl LocalEnv {
 
     pub fn clear(&mut self) {
         // Just create a new empty Rc, don't modify shared data
-        self.data = Rc::new(Vec::new());
+        self.data = Arc::new(Vec::new());
     }
 
     #[inline]
     pub fn map_in_place(&mut self, f: impl Fn(Value) -> Value) {
-        let data = Rc::make_mut(&mut self.data);
+        let data = Arc::make_mut(&mut self.data);
         for v in data.iter_mut() {
             if let Some(val) = v.take() {
                 *v = Some(f(val));
@@ -121,7 +120,7 @@ impl LocalEnv {
     /// This is more efficient than map_in_place for filter_vectors operations.
     #[inline]
     pub fn filter_vectors_in_place(&mut self, mask: &[bool], true_count: usize) {
-        let data = Rc::make_mut(&mut self.data);
+        let data = Arc::make_mut(&mut self.data);
         for v in data.iter_mut() {
             if let Some(val) = v.as_ref() {
                 if let Some(new_val) = val.filter_vectors_if_vector(mask, true_count) {
