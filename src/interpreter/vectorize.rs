@@ -478,7 +478,7 @@ fn dedup_vectorized_state(mut state: State) -> State {
 }
 
 /// Collect all vectorizable vector values from a state for dedup purposes.
-fn collect_vector_values(state: &State) -> Vec<VectorRef> {
+fn collect_vector_values(state: &State) -> Vec<VectorRef<'_>> {
     let mut vectors = Vec::new();
 
     // From heap (skip empty slots)
@@ -489,25 +489,25 @@ fn collect_vector_values(state: &State) -> Vec<VectorRef> {
         };
         match heap_value {
             HeapValue::Value(Value::Number(MaybeVector::Vector(v))) => {
-                vectors.push(VectorRef::Numbers(v.clone()));
+                vectors.push(VectorRef::Numbers(v.as_slice()));
             }
             HeapValue::Value(Value::NumberInterval(MaybeVector::Vector(v))) => {
-                vectors.push(VectorRef::NumberIntervals(v.clone()));
+                vectors.push(VectorRef::NumberIntervals(v.as_slice()));
             }
             HeapValue::Value(Value::Bool(MaybeVector::Vector(v))) => {
-                vectors.push(VectorRef::Bools(v.clone()));
+                vectors.push(VectorRef::Bools(v.as_slice()));
             }
             HeapValue::Closure(_, captures) => {
                 for cap in captures {
                     match cap {
                         Value::Number(MaybeVector::Vector(v)) => {
-                            vectors.push(VectorRef::Numbers(v.clone()));
+                            vectors.push(VectorRef::Numbers(v.as_slice()));
                         }
                         Value::NumberInterval(MaybeVector::Vector(v)) => {
-                            vectors.push(VectorRef::NumberIntervals(v.clone()));
+                            vectors.push(VectorRef::NumberIntervals(v.as_slice()));
                         }
                         Value::Bool(MaybeVector::Vector(v)) => {
-                            vectors.push(VectorRef::Bools(v.clone()));
+                            vectors.push(VectorRef::Bools(v.as_slice()));
                         }
                         _ => {}
                     }
@@ -521,13 +521,13 @@ fn collect_vector_values(state: &State) -> Vec<VectorRef> {
     for (_, v) in state.local_env.iter() {
         match v {
             Value::Number(MaybeVector::Vector(nums)) => {
-                vectors.push(VectorRef::Numbers(nums.clone()));
+                vectors.push(VectorRef::Numbers(nums.as_slice()));
             }
             Value::NumberInterval(MaybeVector::Vector(nums)) => {
-                vectors.push(VectorRef::NumberIntervals(nums.clone()));
+                vectors.push(VectorRef::NumberIntervals(nums.as_slice()));
             }
             Value::Bool(MaybeVector::Vector(bools)) => {
-                vectors.push(VectorRef::Bools(bools.clone()));
+                vectors.push(VectorRef::Bools(bools.as_slice()));
             }
             _ => {}
         }
@@ -538,13 +538,13 @@ fn collect_vector_values(state: &State) -> Vec<VectorRef> {
         for (_, v) in env.iter() {
             match v {
                 Value::Number(MaybeVector::Vector(nums)) => {
-                    vectors.push(VectorRef::Numbers(nums.clone()));
+                    vectors.push(VectorRef::Numbers(nums.as_slice()));
                 }
                 Value::NumberInterval(MaybeVector::Vector(nums)) => {
-                    vectors.push(VectorRef::NumberIntervals(nums.clone()));
+                    vectors.push(VectorRef::NumberIntervals(nums.as_slice()));
                 }
                 Value::Bool(MaybeVector::Vector(bools)) => {
-                    vectors.push(VectorRef::Bools(bools.clone()));
+                    vectors.push(VectorRef::Bools(bools.as_slice()));
                 }
                 _ => {}
             }
@@ -554,11 +554,10 @@ fn collect_vector_values(state: &State) -> Vec<VectorRef> {
     vectors
 }
 
-#[derive(Clone)]
-enum VectorRef {
-    Numbers(Vec<Pico8Num>),
-    NumberIntervals(Vec<Pico8NumInterval>),
-    Bools(Vec<bool>),
+enum VectorRef<'a> {
+    Numbers(&'a [Pico8Num]),
+    NumberIntervals(&'a [Pico8NumInterval]),
+    Bools(&'a [bool]),
 }
 
 fn scalar_at_index(vec: &VectorRef, index: usize) -> ScalarValue {
