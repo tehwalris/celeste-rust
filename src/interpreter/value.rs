@@ -73,16 +73,25 @@ fn filter_vec_by_mask<T: Clone + PartialEq>(vec: Vec<T>, mask: &[bool]) -> Maybe
 where
     T: std::fmt::Debug + Clone + PartialEq + Eq,
 {
-    let filtered: Vec<T> = vec
-        .into_iter()
-        .zip(mask.iter())
-        .filter_map(|(v, m)| if *m { Some(v) } else { None })
-        .collect();
+    // Count true values to pre-allocate exact capacity
+    let true_count = mask.iter().filter(|&&b| b).count();
 
-    // Convert single-element vectors back to scalars (like OCaml's value_unvectorize_if_possible)
-    if filtered.len() == 1 {
-        MaybeVector::Scalar(filtered.into_iter().next().unwrap())
+    if true_count == 1 {
+        // Single element - find it and return as scalar
+        for (v, &m) in vec.into_iter().zip(mask.iter()) {
+            if m {
+                return MaybeVector::Scalar(v);
+            }
+        }
+        unreachable!("true_count was 1 but no true found")
     } else {
+        // Multiple elements - collect into pre-allocated Vec
+        let mut filtered = Vec::with_capacity(true_count);
+        for (v, &m) in vec.into_iter().zip(mask.iter()) {
+            if m {
+                filtered.push(v);
+            }
+        }
         MaybeVector::Vector(filtered)
     }
 }
