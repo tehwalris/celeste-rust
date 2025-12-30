@@ -19,8 +19,6 @@ type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHash
 pub struct CoreInterpreter<'a> {
     state: State,
     fixed_env: &'a FixedEnv,
-    /// Budget for parallel execution, divided when recursing into function calls
-    parallel_budget: f64,
 }
 
 fn make_non_pointer_error(value: &Value) -> anyhow::Error {
@@ -41,19 +39,6 @@ impl<'a> CoreInterpreter<'a> {
         Self {
             state,
             fixed_env,
-            parallel_budget: 1.0,
-        }
-    }
-
-    pub fn new_with_parallel_budget(
-        state: State,
-        fixed_env: &'a FixedEnv,
-        parallel_budget: f64,
-    ) -> Self {
-        Self {
-            state,
-            fixed_env,
-            parallel_budget,
         }
     }
 
@@ -415,15 +400,12 @@ impl<'a> CoreInterpreter<'a> {
 
                 // Recursively interpret the function's prepared CFG (uses cached labels)
                 // Pass function name and source span for profiling
-                // Reduce parallel budget for recursive calls to avoid deep parallelization
-                let child_budget = self.parallel_budget / 2.0;
                 let result_states = super::glue::interpret_prepared_cfg_with_name(
                     prepared_cfg,
                     function_state,
                     self.fixed_env,
                     Some(fun_def_name.as_str().to_string()),
                     fun_def.source_span,
-                    child_budget,
                 )?;
 
                 // Track if this closure call caused a state split

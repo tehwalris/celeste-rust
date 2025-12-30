@@ -50,7 +50,7 @@ impl<'a> InterpreterAnalysis<'a> {
     pub fn new(cfg: Cfg, fixed_env: &'a FixedEnv) -> Result<Self> {
         let (graph, labels) = flow_graph_of_cfg(&cfg).unwrap();
         Ok(Self {
-            adapter: InterpreterFlowAdapter { fixed_env, parallel_budget: 1.0 },
+            adapter: InterpreterFlowAdapter { fixed_env },
             cfg,
             graph,
             labels,
@@ -197,7 +197,7 @@ pub fn interpret_prepared_cfg(
     initial_state: State,
     fixed_env: &FixedEnv,
 ) -> Result<Vec<(State, Option<Value>)>> {
-    interpret_prepared_cfg_inner(prepared, initial_state, fixed_env, None, None, 1.0)
+    interpret_prepared_cfg_inner(prepared, initial_state, fixed_env, None, None)
 }
 
 /// Internal implementation with optional function name for profiling
@@ -207,9 +207,8 @@ pub fn interpret_prepared_cfg_with_name(
     fixed_env: &FixedEnv,
     name: Option<String>,
     source_span: Option<crate::ir::SourceSpan>,
-    parallel_budget: f64,
 ) -> Result<Vec<(State, Option<Value>)>> {
-    interpret_prepared_cfg_inner(prepared, initial_state, fixed_env, name, source_span, parallel_budget)
+    interpret_prepared_cfg_inner(prepared, initial_state, fixed_env, name, source_span)
 }
 
 fn interpret_prepared_cfg_inner(
@@ -218,7 +217,6 @@ fn interpret_prepared_cfg_inner(
     fixed_env: &FixedEnv,
     name: Option<String>,
     source_span: Option<crate::ir::SourceSpan>,
-    parallel_budget: f64,
 ) -> Result<Vec<(State, Option<Value>)>> {
     // Lightweight tracing span for CFG execution (low overhead)
     let _trace = TraceSpan::new(name.as_deref().unwrap_or("__main"), "cfg");
@@ -231,7 +229,7 @@ fn interpret_prepared_cfg_inner(
         source_span.as_ref(),
     );
 
-    let adapter = InterpreterFlowAdapter { fixed_env, parallel_budget };
+    let adapter = InterpreterFlowAdapter { fixed_env };
     let cfg = &prepared.cfg;
     let labels = &prepared.labels;
 

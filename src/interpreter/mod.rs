@@ -7,7 +7,6 @@ pub mod input_capture;
 pub mod inspect;
 pub mod local_env;
 mod op;
-pub mod parallel_blocks;
 pub mod profiling;
 pub mod state;
 pub mod tracing;

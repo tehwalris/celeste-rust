@@ -69,19 +69,9 @@ struct Args {
     /// Function name prefix to capture (e.g., "sign")
     #[arg(long, default_value = "sign")]
     capture_function: String,
-
-    /// Number of parallel blocks for coarse-grained parallelization (0 = disabled)
-    #[arg(long, default_value_t = 0)]
-    num_blocks: usize,
 }
 
 fn main() -> Result<()> {
-    // Initialize rayon thread pool with limited parallelism
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(32)
-        .build_global()
-        .expect("Failed to initialize rayon thread pool");
-
     let args = Args::parse();
     run_game_frames(
         args.frames,
@@ -97,7 +87,6 @@ fn main() -> Result<()> {
         args.resume,
         args.capture_at,
         &args.capture_function,
-        args.num_blocks,
     )
 }
 
@@ -143,14 +132,12 @@ fn run_game_frames(
     resume: bool,
     capture_at: Option<u32>,
     capture_function: &str,
-    num_blocks: usize,
 ) -> Result<()> {
     use crate::interpreter::glue::interpret_cfg;
     use crate::interpreter::input_capture::{enable_capture, disable_capture_and_get};
     use crate::interpreter::inspect::{make_state_abstract, create_frame_dump, write_frame_dump_jsonl, dump_states_to_file, save_checkpoint, load_checkpoint, checkpoint_filename, Checkpoint};
     use crate::interpreter::profiling::{enable_profiling, get_chrome_tracing_json, get_dag_json, get_tree_json, get_cfgs_json, get_profile_summary};
     use crate::interpreter::tracing::{enable_tracing, get_tracing_json, collect_thread_spans};
-    use crate::interpreter::parallel_blocks::{ParallelBlockConfig, process_frame_parallel};
     use crate::game_runner::{create_fixed_env_with_game_builtins, create_initial_state_with_builtins};
     use std::io::BufWriter;
     use std::fs::File;
@@ -271,73 +258,42 @@ __reset_button_states()
 
         let start = std::time::Instant::now();
 
-        let (new_states, before_vec) = if num_blocks > 0 {
-            // Parallel block processing
-            let config = ParallelBlockConfig {
-                num_blocks,
-                min_block_size: 16,
-            };
+        let mut new_states = Vec::new();
 
-            // Process using parallel blocks (includes GC and vectorization)
-            let frame_cfg_ref = &frame_cfg;
-            let fixed_env_ref = &fixed_env;
-            let new_states = process_frame_parallel(states, &config, |state| {
-                let result = interpret_cfg(frame_cfg_ref.clone(), state, fixed_env_ref)
-                    .expect("Frame interpretation failed");
-                result.into_iter()
-                    .map(|(s, _)| make_state_abstract(s))
-                    .collect()
-            });
+        for state in states {
+            let result = interpret_cfg(frame_cfg.clone(), state, &fixed_env)
+                .expect("Frame interpretation failed");
+            new_states.extend(result.into_iter().map(|(s, _)| s));
+        }
 
-            // Note: before_vec not meaningful for parallel since vectorization happens per-block
-            (new_states, 0usize)
-        } else {
-            // Sequential processing (original path)
-            let mut new_states = Vec::new();
+        // Disable capture and save if this was the target frame
+        if capture_at == Some(frame_num) {
+            let captured = disable_capture_and_get();
+            println!("  Captured {} calls to {}", captured.len(), capture_function);
+            let output_path = "/tmp/captured_calls.json";
+            let json = serde_json::to_string_pretty(&captured).expect("Failed to serialize");
+            std::fs::write(output_path, &json).expect("Failed to write");
+            println!("  Saved to {}", output_path);
+        }
 
-            for state in states {
-                let result = interpret_cfg(frame_cfg.clone(), state, &fixed_env)
-                    .expect("Frame interpretation failed");
-                new_states.extend(result.into_iter().map(|(s, _)| s));
-            }
+        // GC and normalize states before vectorization
+        for state in &mut new_states {
+            state.gc();
+        }
 
-            // Disable capture and save if this was the target frame
-            if capture_at == Some(frame_num) {
-                let captured = disable_capture_and_get();
-                println!("  Captured {} calls to {}", captured.len(), capture_function);
-                let output_path = "/tmp/captured_calls.json";
-                let json = serde_json::to_string_pretty(&captured).expect("Failed to serialize");
-                std::fs::write(output_path, &json).expect("Failed to write");
-                println!("  Saved to {}", output_path);
-            }
+        // Make states abstract (widen player.rem to interval)
+        new_states = new_states.into_iter().map(make_state_abstract).collect();
 
-            // GC and normalize states before vectorization
-            for state in &mut new_states {
-                state.gc();
-            }
+        let before_vec = new_states.len();
 
-            // Make states abstract (widen player.rem to interval)
-            new_states = new_states.into_iter().map(make_state_abstract).collect();
-
-            let before_vec = new_states.len();
-
-            // Vectorize states to combine states with the same shape
-            let new_states = crate::interpreter::vectorize::vectorize_states(new_states);
-
-            (new_states, before_vec)
-        };
+        // Vectorize states to combine states with the same shape
+        let new_states = crate::interpreter::vectorize::vectorize_states(new_states);
 
         let after_vec = new_states.len();
         if before_vec > 0 && before_vec != after_vec {
-            // Sequential mode: show vectorization stats
             let avg_vs: f64 = new_states.iter().map(|s| s.vector_size as f64).sum::<f64>() / new_states.len() as f64;
             println!("  (vec: {} -> {} states, merged {}, avg_vs={:.1})",
                 before_vec, after_vec, before_vec - after_vec, avg_vs);
-        } else if num_blocks > 0 && !new_states.is_empty() {
-            // Parallel mode: show parallel GC info
-            let avg_vs: f64 = new_states.iter().map(|s| s.vector_size as f64).sum::<f64>() / new_states.len() as f64;
-            println!("  (parallel GC, {} output groups, avg_vs={:.1})",
-                after_vec, avg_vs);
         }
 
         let expanded_output: usize = new_states.iter().map(|s| s.vector_size).sum();
@@ -483,13 +439,7 @@ mod tests {
         create_fixed_env_with_game_builtins,
         create_initial_state_with_builtins,
     };
-    use crate::interpreter::{
-        fixed_env::FixedEnv,
-        state::State,
-        value::{HeapValue, Value},
-    };
-
-    use crate::interpreter::value::MaybeVector;
+    use crate::interpreter::value::HeapValue;
     #[test]
     fn test_parse_hello_world() {
         let code = r#"__print("walrus")"#;
@@ -2277,7 +2227,7 @@ __reset_button_states()
     fn test_run_celeste_game_frame() {
         // Run 26 frames (enough to see player spawn at frame 25)
         // For longer runs, use the binary: cargo run -- -n 30
-        run_game_frames(26, 25, 26, None, None, None, None, None, None, 1, false, None, "", 0).expect("Game frames should complete");
+        run_game_frames(26, 25, 26, None, None, None, None, None, None, 1, false, None, "").expect("Game frames should complete");
     }
 
     #[test]
