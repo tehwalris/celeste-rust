@@ -416,9 +416,9 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
             for (v, size) in values {
                 match v {
                     Value::Number(MaybeVector::Scalar(n)) => {
-                        for _ in 0..*size {
-                            result.push(*n);
-                        }
+                        // Use resize which is more efficient for Copy types
+                        let new_len = result.len() + size;
+                        result.resize(new_len, *n);
                     }
                     Value::Number(MaybeVector::Vector(nums)) => {
                         result.extend_from_slice(nums);
@@ -440,9 +440,9 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
             for (v, size) in values {
                 match v {
                     Value::NumberInterval(MaybeVector::Scalar(n)) => {
-                        for _ in 0..*size {
-                            result.push(*n);
-                        }
+                        // Use resize which is more efficient for Copy types
+                        let new_len = result.len() + size;
+                        result.resize(new_len, *n);
                     }
                     Value::NumberInterval(MaybeVector::Vector(nums)) => {
                         result.extend_from_slice(nums);
@@ -464,9 +464,9 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
             for (v, size) in values {
                 match v {
                     Value::Bool(MaybeVector::Scalar(b)) => {
-                        for _ in 0..*size {
-                            result.push(*b);
-                        }
+                        // Use resize which is more efficient for Copy types
+                        let new_len = result.len() + size;
+                        result.resize(new_len, *b);
                     }
                     Value::Bool(MaybeVector::Vector(bools)) => {
                         result.extend_from_slice(bools);
@@ -505,20 +505,31 @@ where
     merged
 }
 
-/// Hash a row by combining the scalar values at a given index across all vectors.
+/// Hash a row by combining the values at a given index across all vectors.
+/// Optimized to hash directly without creating intermediate ScalarValue objects.
 fn hash_row(vector_values: &[VectorRef], index: usize) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = rustc_hash::FxHasher::default();
     for vec in vector_values {
-        scalar_at_index(vec, index).hash(&mut hasher);
+        match vec {
+            VectorRef::Numbers(nums) => nums[index].hash(&mut hasher),
+            VectorRef::NumberIntervals(nums) => nums[index].hash(&mut hasher),
+            VectorRef::Bools(bools) => bools[index].hash(&mut hasher),
+        }
     }
     hasher.finish()
 }
 
-/// Compare two rows by their scalar values at the given indices.
+/// Compare two rows by their values at the given indices.
+/// Optimized to compare directly without creating intermediate ScalarValue objects.
 fn rows_equal(vector_values: &[VectorRef], idx1: usize, idx2: usize) -> bool {
     for vec in vector_values {
-        if scalar_at_index(vec, idx1) != scalar_at_index(vec, idx2) {
+        let equal = match vec {
+            VectorRef::Numbers(nums) => nums[idx1] == nums[idx2],
+            VectorRef::NumberIntervals(nums) => nums[idx1] == nums[idx2],
+            VectorRef::Bools(bools) => bools[idx1] == bools[idx2],
+        };
+        if !equal {
             return false;
         }
     }

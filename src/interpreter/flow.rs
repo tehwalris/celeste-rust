@@ -302,21 +302,25 @@ impl<'a> BoundInterpreterFlow<'a> {
                 })),
                 Value::NilPointer(_) => Err(anyhow!("Nil pointer in condition")),
                 Value::Bool(MaybeVector::Vector(bool_vector)) => {
-                    let mask_true_count = bool_vector
+                    // Build mask and count in a single pass
+                    let condition_target = *condition_from_flow_edge;
+                    let mut mask_true_count = 0usize;
+                    let mask: Vec<bool> = bool_vector
                         .iter()
-                        .filter(|v| **v == *condition_from_flow_edge)
-                        .count();
+                        .map(|v| {
+                            let matches = *v == condition_target;
+                            if matches {
+                                mask_true_count += 1;
+                            }
+                            matches
+                        })
+                        .collect();
 
                     if mask_true_count == 0 {
                         Ok(FlowData::States(vec![]))
                     } else if mask_true_count == bool_vector.len() {
                         Ok(FlowData::States(vec![state]))
                     } else {
-                        let mask: Vec<bool> = bool_vector
-                            .iter()
-                            .map(|v| *v == *condition_from_flow_edge)
-                            .collect();
-
                         // Use optimized filter_by_mask that avoids cloning non-vector values
                         let filtered_state = state.filter_by_mask(&mask);
                         Ok(FlowData::States(vec![filtered_state]))
