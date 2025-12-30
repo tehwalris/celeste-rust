@@ -419,6 +419,26 @@ where
     merged
 }
 
+/// Hash a row by combining the scalar values at a given index across all vectors.
+fn hash_row(vector_values: &[VectorRef], index: usize) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+    for vec in vector_values {
+        scalar_at_index(vec, index).hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Compare two rows by their scalar values at the given indices.
+fn rows_equal(vector_values: &[VectorRef], idx1: usize, idx2: usize) -> bool {
+    for vec in vector_values {
+        if scalar_at_index(vec, idx1) != scalar_at_index(vec, idx2) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Deduplicate a vectorized state by removing duplicate vector elements.
 /// Returns a new state with unique vector elements.
 fn dedup_vectorized_state(mut state: State) -> State {
@@ -436,42 +456,29 @@ fn dedup_vectorized_state(mut state: State) -> State {
         return state;
     }
 
-    // For each index, create a tuple of all vector values at that index
-    // Then sort and dedup by this tuple
-    let indices: Vec<usize> = (0..state.vector_size).collect();
+    // Use hash-based deduplication to avoid allocating Vec<ScalarValue> for each row.
+    // Map from hash -> list of unique row indices with that hash
+    let mut hash_to_indices: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
+    let mut mask = vec![false; state.vector_size];
+    let mut unique_count = 0;
 
-    // Create a comparison key for each index
-    let mut index_keys: Vec<(usize, Vec<ScalarValue>)> = indices
-        .iter()
-        .map(|&i| {
-            let key: Vec<ScalarValue> = vector_values
-                .iter()
-                .map(|vec| scalar_at_index(vec, i))
-                .collect();
-            (i, key)
-        })
-        .collect();
+    for i in 0..state.vector_size {
+        let row_hash = hash_row(&vector_values, i);
+        let indices = hash_to_indices.entry(row_hash).or_insert_with(Vec::new);
 
-    // Sort by key and keep only unique indices
-    index_keys.sort_by(|a, b| a.1.cmp(&b.1));
-    let mut unique_indices: Vec<usize> = Vec::new();
-    let mut last_key: Option<Vec<ScalarValue>> = None;
-    for (i, key) in index_keys {
-        if last_key.as_ref() != Some(&key) {
-            unique_indices.push(i);
-            last_key = Some(key);
+        // Check if this row matches any existing row with the same hash
+        let is_duplicate = indices.iter().any(|&prev_idx| rows_equal(&vector_values, prev_idx, i));
+
+        if !is_duplicate {
+            indices.push(i);
+            mask[i] = true;
+            unique_count += 1;
         }
     }
 
-    if unique_indices.len() == state.vector_size {
+    if unique_count == state.vector_size {
         // No duplicates found
         return state;
-    }
-
-    // Create mask for filtering - set true for indices we want to keep
-    let mut mask = vec![false; state.vector_size];
-    for i in &unique_indices {
-        mask[*i] = true;
     }
 
     state.filter_by_mask(&mask)
