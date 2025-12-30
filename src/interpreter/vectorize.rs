@@ -555,7 +555,9 @@ fn dedup_vectorized_state(mut state: State) -> State {
 
     // Use hash-based deduplication to avoid allocating Vec<ScalarValue> for each row.
     // Map from hash -> list of unique row indices with that hash
-    let mut hash_to_indices: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
+    // Pre-allocate with estimated capacity to reduce rehashing
+    let mut hash_to_indices: FxHashMap<u64, Vec<usize>> =
+        FxHashMap::with_capacity_and_hasher(state.vector_size / 2, Default::default());
     let mut mask = vec![false; state.vector_size];
     let mut unique_count = 0;
 
