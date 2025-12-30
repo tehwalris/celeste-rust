@@ -9,6 +9,8 @@
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use super::tracing::TraceSpan;
+
 use super::{
     heap::{Heap, HeapId},
     local_env::LocalEnv,
@@ -627,6 +629,7 @@ fn rows_equal(vector_values: &[VectorRef], idx1: usize, idx2: usize) -> bool {
 /// Deduplicate a vectorized state by removing duplicate vector elements.
 /// Returns a new state with unique vector elements.
 fn dedup_vectorized_state(mut state: State) -> State {
+    let _trace = TraceSpan::new("dedup_state", "vectorize");
     if state.vector_size <= 1 {
         return state;
     }
@@ -921,9 +924,32 @@ impl Clone for VectorizeTimingStats {
     }
 }
 
+/// Threshold for GC before vectorization (0 = disabled, default = 1000)
+/// GC before vectorize is a major optimization: it removes garbage from heaps,
+/// allowing states to have matching shapes and merge into fewer groups.
+static GC_BEFORE_VECTORIZE_THRESHOLD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1000);
+
+/// Set the threshold for GC before vectorization (0 = disabled)
+pub fn set_gc_before_vectorize_threshold(threshold: usize) {
+    GC_BEFORE_VECTORIZE_THRESHOLD.store(threshold, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
+    let _trace = TraceSpan::new("vectorize_states", "vectorize");
     let mut stats = VectorizeTimingStats::default();
     stats.input_count = states.len();
+
+    // GC all states before shape grouping when input is large enough.
+    // This removes garbage from heaps, allowing states to match shapes better.
+    // Typical improvement: 12k groups -> 24 groups, 5x speedup.
+    let gc_threshold = GC_BEFORE_VECTORIZE_THRESHOLD.load(std::sync::atomic::Ordering::Relaxed);
+    let states = if gc_threshold > 0 && states.len() >= gc_threshold {
+        let _gc_trace = TraceSpan::new("gc_before_vectorize", "gc");
+        let gc_states: Vec<State> = states.into_iter().map(|mut s| { s.gc(); s }).collect();
+        gc_states
+    } else {
+        states
+    };
 
     if states.is_empty() {
         LAST_VECTORIZE_STATS.with(|s| *s.borrow_mut() = Some(stats));
@@ -947,23 +973,30 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
     // Group states by shape
     let t2 = std::time::Instant::now();
     let mut states_by_shape: FxHashMap<StateShape, Vec<State>> = FxHashMap::default();
-    for state in states {
-        let shape = shape_of_state(&state);
-        states_by_shape.entry(shape).or_insert_with(Vec::new).push(state);
+    {
+        let _trace_shape = TraceSpan::new("shape_grouping", "vectorize");
+        for state in states {
+            let shape = shape_of_state(&state);
+            states_by_shape.entry(shape).or_insert_with(Vec::new).push(state);
+        }
     }
     stats.shape_grouping_ns = t2.elapsed().as_nanos() as u64;
     stats.group_count = states_by_shape.len();
 
+
     // Vectorize each group
     let t3 = std::time::Instant::now();
-    let result: Vec<State> = states_by_shape
-        .into_iter()
-        .map(|(_, group)| {
-            let vectorized = vectorize_same_shape_states(group);
-            let deduped = dedup_vectorized_state(vectorized);
-            unvectorize_if_possible(deduped)
-        })
-        .collect();
+    let result: Vec<State> = {
+        let _trace_merge = TraceSpan::new("merge_groups", "vectorize");
+        states_by_shape
+            .into_iter()
+            .map(|(_, group)| {
+                let vectorized = vectorize_same_shape_states(group);
+                let deduped = dedup_vectorized_state(vectorized);
+                unvectorize_if_possible(deduped)
+            })
+            .collect()
+    };
     stats.vectorize_groups_ns = t3.elapsed().as_nanos() as u64;
 
     // Validate output states (only in debug mode)

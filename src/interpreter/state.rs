@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     heap::{Heap, HeapId},
     local_env::LocalEnv,
+    tracing::TraceSpan,
     value::{HeapValue, Value},
 };
 use crate::ir::LocalId;
@@ -133,6 +134,7 @@ impl State {
     /// Filters all vector values in the state by a mask in place.
     /// The resulting state's vector_size will be the number of true values in the mask.
     fn filter_by_mask_in_place(&mut self, mask: &[bool]) {
+        let _trace = TraceSpan::new("filter_by_mask", "filter");
         use super::value::count_true;
         let new_vector_size = count_true(mask);
         self.vector_size = new_vector_size;
@@ -166,6 +168,7 @@ impl State {
     /// 2. Assign new HeapIds in the order values are visited
     /// 3. Create a compacted heap with only reachable values
     pub fn gc(&mut self) {
+        let _trace = TraceSpan::new("gc", "gc");
         let mut old_to_new: FxHashMap<HeapId, HeapId> = FxHashMap::default();
         let mut new_heap_values: Vec<HeapValue> = Vec::new();
 
