@@ -238,10 +238,20 @@ impl<'a> BoundInterpreterFlow<'a> {
                 non_phi_instructions,
                 parallel_budget,
             } => {
-                let mut states = vec![state];
+                // Use two buffers and swap between them to avoid repeated allocations
+                let mut states_a = vec![state];
+                let mut states_b = Vec::new();
+                let mut current_is_a = true;
+
                 for (local_id, instruction) in non_phi_instructions {
-                    let mut new_states = vec![];
-                    for old_state in states {
+                    let (src, dst) = if current_is_a {
+                        (&mut states_a, &mut states_b)
+                    } else {
+                        (&mut states_b, &mut states_a)
+                    };
+                    dst.clear();
+
+                    for old_state in src.drain(..) {
                         let interpreter = CoreInterpreter::new_with_parallel_budget(
                             old_state,
                             fixed_env,
@@ -249,21 +259,23 @@ impl<'a> BoundInterpreterFlow<'a> {
                         );
                         match instruction {
                             Instruction::Call { .. } => {
-                                new_states.extend(
+                                dst.extend(
                                     interpreter.interpret_call_instruction(*local_id, instruction)?,
                                 );
                             }
                             _ => {
                                 let mut interpreter = interpreter;
                                 interpreter.interpret_non_call_instruction(*local_id, instruction)?;
-                                new_states.push(interpreter.into_state());
+                                dst.push(interpreter.into_state());
                             }
                         }
                     }
 
-                    states = new_states;
+                    current_is_a = !current_is_a;
                 }
-                Ok(FlowData::States(states))
+
+                let final_states = if current_is_a { states_a } else { states_b };
+                Ok(FlowData::States(final_states))
             }
             Self::BranchUnconditional { .. } => Ok(FlowData::States(vec![state])),
             Self::BranchConditional {
