@@ -127,28 +127,32 @@ fn shape_of_state(state: &State) -> StateShape {
     }
 
     // Local env is already sorted by index (uses Vec internally)
-    let mut local_env_structure = Vec::new();
-    for (k, v) in state.local_env.iter() {
+    // Pre-allocate based on iterator hint
+    let local_env_iter = state.local_env.iter();
+    let (lower_bound, _) = local_env_iter.size_hint();
+    let mut local_env_structure = Vec::with_capacity(lower_bound);
+    for (k, v) in local_env_iter {
         local_env_structure.push((k, normalize_value_for_shape(v)));
     }
 
     // Outer local envs are also already sorted by index
     let mut outer_local_envs_structure = Vec::with_capacity(state.outer_local_envs.len());
     for env in &state.outer_local_envs {
-        let mut env_structure = Vec::new();
-        for (k, v) in env.iter() {
+        let env_iter = env.iter();
+        let (lower_bound, _) = env_iter.size_hint();
+        let mut env_structure = Vec::with_capacity(lower_bound);
+        for (k, v) in env_iter {
             env_structure.push((k, normalize_value_for_shape(v)));
         }
         outer_local_envs_structure.push(env_structure);
     }
 
-    // Convert global_env to sorted Vec for consistent hashing
+    // global_env uses OrdMap which is already sorted, so no need to sort
     let global_env_len = state.global_env.len();
     let mut global_env = Vec::with_capacity(global_env_len);
     for (k, v) in state.global_env.iter() {
         global_env.push((k.clone(), *v));
     }
-    global_env.sort_by(|a, b| a.0.cmp(&b.0));
 
     StateShape {
         heap_structure,

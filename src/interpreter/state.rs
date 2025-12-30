@@ -12,19 +12,18 @@ use crate::ir::LocalId;
 
 // Use FxHash for faster hashing
 type FxBuildHasher = BuildHasherDefault<FxHasher>;
-type ImHashMap<K, V> = im::HashMap<K, V, FxBuildHasher>;
 type FxHashMap<K, V> = std::collections::HashMap<K, V, FxBuildHasher>;
 
-fn new_imhashmap<K: Clone + Eq + std::hash::Hash, V: Clone>() -> ImHashMap<K, V> {
-    ImHashMap::with_hasher(BuildHasherDefault::default())
-}
+// OrdMap is a sorted map, so iteration is already in sorted order.
+// This eliminates the need to sort in shape_of_state.
+type ImOrdMap<K, V> = im::OrdMap<K, V>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct State {
     pub heap: Heap,
     pub local_env: LocalEnv,
     pub outer_local_envs: Vec<LocalEnv>,
-    pub global_env: ImHashMap<String, HeapId>,
+    pub global_env: ImOrdMap<String, HeapId>,
     pub prints: Vec<String>,
     pub vector_size: usize,
 }
@@ -76,7 +75,7 @@ impl<'de> Deserialize<'de> for State {
         }
 
         let s = StateDeserialize::deserialize(deserializer)?;
-        let mut global_env = new_imhashmap();
+        let mut global_env = ImOrdMap::new();
         for (k, v) in s.global_env {
             global_env.insert(k, v);
         }
@@ -98,7 +97,7 @@ impl State {
             heap: Heap::new(),
             local_env: LocalEnv::new(),
             outer_local_envs: Vec::new(),
-            global_env: new_imhashmap(),
+            global_env: ImOrdMap::new(),
             prints: Vec::new(),
             vector_size: 1,
         }
@@ -258,14 +257,11 @@ impl State {
             }
         }
 
-        // Visit all roots from global_env (sorted for deterministic order)
-        let mut global_keys: Vec<_> = self.global_env.keys().cloned().collect();
-        global_keys.sort();
-        let mut new_global_env = new_imhashmap();
-        for key in global_keys {
-            let old_id = self.global_env[&key];
+        // Visit all roots from global_env (OrdMap is already sorted)
+        let mut new_global_env = ImOrdMap::new();
+        for (key, &old_id) in self.global_env.iter() {
             let new_id = visit(old_id, &self.heap, &mut old_to_new, &mut new_heap_values);
-            new_global_env.insert(key, new_id);
+            new_global_env.insert(key.clone(), new_id);
         }
 
         // Visit all roots from local_env (sorted for deterministic order)
