@@ -1,4 +1,4 @@
-use im::HashMap as ImHashMap;
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::ir::LocalId;
@@ -6,54 +6,133 @@ use crate::ir::LocalId;
 use super::value::Value;
 
 /// A local environment storing local variable bindings.
-/// Uses a persistent HashMap for efficient cloning through structural sharing.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LocalEnv(ImHashMap<LocalId, Value>);
+/// Uses Arc<Vec> with copy-on-write for efficient cloning while
+/// maintaining O(1) lookup by LocalId (which are contiguous integers).
+#[derive(Clone, Debug)]
+pub struct LocalEnv {
+    // Copy-on-write vector for storing local variables
+    data: Arc<Vec<Option<Value>>>,
+    // Track if this instance owns a unique Arc (can mutate in place)
+    // If multiple clones exist, we need to clone the data before mutation
+}
+
+impl PartialEq for LocalEnv {
+    fn eq(&self, other: &Self) -> bool {
+        // If same Arc, they're equal
+        if Arc::ptr_eq(&self.data, &other.data) {
+            return true;
+        }
+        self.data == other.data
+    }
+}
+
+impl Eq for LocalEnv {}
+
+impl Serialize for LocalEnv {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // Serialize as Vec of (LocalId, Value) pairs (only non-None values)
+        let pairs: Vec<(LocalId, Value)> = self
+            .data
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| v.as_ref().map(|v| (LocalId::from(i), v.clone())))
+            .collect();
+        pairs.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for LocalEnv {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let pairs: Vec<(LocalId, Value)> = Vec::deserialize(deserializer)?;
+        let max_id = pairs.iter().map(|(id, _)| usize::from(*id)).max();
+        let mut vec = vec![None; max_id.map_or(0, |m| m + 1)];
+        for (k, v) in pairs {
+            vec[usize::from(k)] = Some(v);
+        }
+        Ok(LocalEnv { data: Arc::new(vec) })
+    }
+}
 
 impl LocalEnv {
     pub fn new() -> Self {
-        Self(ImHashMap::new())
+        Self {
+            data: Arc::new(Vec::new()),
+        }
     }
 
     pub fn with_capacity(_max_locals: usize) -> Self {
-        // im::HashMap doesn't have a capacity hint, but it doesn't need it
         Self::new()
     }
 
+    #[inline]
     pub fn get(&self, id: LocalId) -> &Value {
-        self.0.get(&id).expect("LocalId should be set before get")
+        let idx = usize::from(id);
+        self.data
+            .get(idx)
+            .and_then(|v| v.as_ref())
+            .expect("LocalId should be set before get")
     }
 
+    #[inline]
     pub fn set(&mut self, id: LocalId, value: Value) {
-        self.0.insert(id, value);
+        let idx = usize::from(id);
+
+        // Make data unique if needed (copy-on-write)
+        let data = Arc::make_mut(&mut self.data);
+
+        // Extend if needed
+        if idx >= data.len() {
+            data.resize(idx + 1, None);
+        }
+        data[idx] = Some(value);
     }
 
     pub fn retain(&mut self, f: impl Fn(LocalId) -> bool) {
-        self.0.retain(|id, _| f(*id));
+        let data = Arc::make_mut(&mut self.data);
+        for (i, v) in data.iter_mut().enumerate() {
+            if v.is_some() && !f(LocalId::from(i)) {
+                *v = None;
+            }
+        }
     }
 
     pub fn clear(&mut self) {
-        self.0.clear();
+        // Just create a new empty Arc, don't modify shared data
+        self.data = Arc::new(Vec::new());
     }
 
+    #[inline]
     pub fn map_in_place(&mut self, f: impl Fn(Value) -> Value) {
-        // im::HashMap doesn't have a map_in_place, so we need to collect and update
-        self.0 = self.0.iter()
-            .map(|(k, v)| (*k, f(v.clone())))
-            .collect();
+        let data = Arc::make_mut(&mut self.data);
+        for v in data.iter_mut() {
+            if let Some(val) = v.take() {
+                *v = Some(f(val));
+            }
+        }
     }
 
     /// Iterate over all (raw_id, value) pairs
     pub fn iter(&self) -> impl Iterator<Item = (usize, &Value)> {
-        self.0.iter().map(|(id, v)| (usize::from(*id), v))
+        self.data
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| v.as_ref().map(|v| (i, v)))
     }
 
     /// Get value by raw usize id
+    #[inline]
     pub fn get_by_raw_id(&self, raw_id: usize) -> &Value {
         self.get(LocalId::from(raw_id))
     }
 
     /// Set value by raw usize id
+    #[inline]
     pub fn set_by_raw_id(&mut self, raw_id: usize, value: Value) {
         self.set(LocalId::from(raw_id), value);
     }
