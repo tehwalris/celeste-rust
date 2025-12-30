@@ -37,3 +37,7 @@ path = "src/bin/compare_frames.rs"
 [[bin]]
 name = "concrete_run"
 path = "src/bin/concrete_run.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
