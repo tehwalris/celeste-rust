@@ -20,6 +20,7 @@ use super::{
     flow::{BoundInterpreterFlow, FlowData, InterpreterFlowAdapter},
     profiling::{DagOperation, FixedPointGuard, SpanGuard, with_profiler},
     state::State,
+    tracing::TraceSpan,
     vectorize::{vectorize_states, union_diff_states},
 };
 
@@ -219,7 +220,10 @@ fn interpret_prepared_cfg_inner(
     source_span: Option<crate::ir::SourceSpan>,
     parallel_budget: f64,
 ) -> Result<Vec<(State, Option<Value>)>> {
-    // Create profiling guard for this fixed-point invocation
+    // Lightweight tracing span for CFG execution (low overhead)
+    let _trace = TraceSpan::new(name.as_deref().unwrap_or("__main"), "cfg");
+
+    // Create profiling guard for this fixed-point invocation (full profiler)
     let fp_guard = FixedPointGuard::new(name.clone());
     let _span = SpanGuard::new_with_source(
         &name.as_deref().unwrap_or("interpret_cfg"),

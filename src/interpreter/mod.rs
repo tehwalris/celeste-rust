@@ -9,5 +9,6 @@ pub mod local_env;
 mod op;
 pub mod profiling;
 pub mod state;
+pub mod tracing;
 pub mod value;
 pub mod vectorize;

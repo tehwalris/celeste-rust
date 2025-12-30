@@ -45,6 +45,11 @@ struct Args {
     #[arg(long)]
     profile: Option<String>,
 
+    /// Enable lightweight tracing and save Chrome trace to this file
+    /// (lower overhead than --profile, only tracks CFG execution times)
+    #[arg(long)]
+    trace: Option<String>,
+
     /// Directory for checkpoints (enables checkpoint saving)
     #[arg(long)]
     checkpoint_dir: Option<String>,
@@ -82,6 +87,7 @@ fn main() -> Result<()> {
         args.dump_states_at,
         args.states_file.as_deref(),
         args.profile.as_deref(),
+        args.trace.as_deref(),
         args.checkpoint_dir.as_deref(),
         args.checkpoint_interval,
         args.resume,
@@ -126,6 +132,7 @@ fn run_game_frames(
     dump_states_at: Option<u32>,
     states_file: Option<&str>,
     profile_dir: Option<&str>,
+    trace_file: Option<&str>,
     checkpoint_dir: Option<&str>,
     checkpoint_interval: u32,
     resume: bool,
@@ -136,6 +143,7 @@ fn run_game_frames(
     use crate::interpreter::input_capture::{enable_capture, disable_capture_and_get};
     use crate::interpreter::inspect::{make_state_abstract, create_frame_dump, write_frame_dump_jsonl, dump_states_to_file, save_checkpoint, load_checkpoint, checkpoint_filename, Checkpoint};
     use crate::interpreter::profiling::{enable_profiling, get_chrome_tracing_json, get_dag_json, get_tree_json, get_cfgs_json, get_profile_summary};
+    use crate::interpreter::tracing::{enable_tracing, get_tracing_json, collect_thread_spans};
     use crate::game_runner::{create_fixed_env_with_game_builtins, create_initial_state_with_builtins};
     use std::io::BufWriter;
     use std::fs::File;
@@ -144,6 +152,12 @@ fn run_game_frames(
     if profile_dir.is_some() {
         enable_profiling();
         println!("Profiling enabled");
+    }
+
+    // Enable lightweight tracing if requested
+    if trace_file.is_some() {
+        enable_tracing();
+        println!("Lightweight tracing enabled");
     }
 
     // Create checkpoint directory if needed
@@ -390,6 +404,32 @@ __reset_button_states()
         println!("  Closure splits: {}", summary.closure_splits);
         println!("  Conditional splits: {}", summary.conditional_splits);
         println!("  Vectorizations: {}", summary.vectorizations);
+    }
+
+    // Save lightweight tracing data if enabled
+    if let Some(trace_file) = trace_file {
+        use std::io::Write;
+
+        // Collect any remaining thread-local spans
+        collect_thread_spans();
+
+        // Get trace JSON
+        let trace_json = get_tracing_json();
+
+        // Check if output should be compressed
+        if trace_file.ends_with(".zst") {
+            // Write zstd-compressed output
+            let file = File::create(trace_file)?;
+            let mut encoder = zstd::stream::Encoder::new(file, 3)?; // Level 3 is a good balance
+            encoder.write_all(trace_json.as_bytes())?;
+            encoder.finish()?;
+            println!("Saved lightweight trace (zstd) to {}", trace_file);
+        } else {
+            // Write uncompressed output
+            let mut file = File::create(trace_file)?;
+            file.write_all(trace_json.as_bytes())?;
+            println!("Saved lightweight trace to {}", trace_file);
+        }
     }
 
     Ok(())
