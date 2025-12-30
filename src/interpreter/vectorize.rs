@@ -446,74 +446,126 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
     let total_size: usize = values.iter().map(|(_, size)| size).sum();
 
     // Merge vectorizable values directly without creating intermediate ScalarValue
+    // Track whether all values are identical during merge to avoid post-scan
     match first_value {
         Value::Number(_) => {
+            // Get reference value for comparison
+            let ref_val = match &values[0].0 {
+                Value::Number(MaybeVector::Scalar(n)) => Some(*n),
+                Value::Number(MaybeVector::Vector(nums)) if !nums.is_empty() => Some(nums[0]),
+                _ => None,
+            };
+
             let mut result = Vec::with_capacity(total_size);
+            let mut all_same = ref_val.is_some();
+            let ref_val = ref_val.unwrap_or(Pico8Num::from_i16(0));
+
             for (v, size) in values {
                 match v {
                     Value::Number(MaybeVector::Scalar(n)) => {
-                        // Use resize which is more efficient for Copy types
+                        if all_same && *n != ref_val {
+                            all_same = false;
+                        }
                         let new_len = result.len() + size;
                         result.resize(new_len, *n);
                     }
                     Value::Number(MaybeVector::Vector(nums)) => {
+                        if all_same {
+                            for n in nums {
+                                if *n != ref_val {
+                                    all_same = false;
+                                    break;
+                                }
+                            }
+                        }
                         result.extend_from_slice(nums);
                     }
                     _ => panic!("Type mismatch in merge"),
                 }
             }
-            // Check if all identical
-            if result.len() > 1 && result.iter().all(|n| *n == result[0]) {
-                Value::Number(MaybeVector::Scalar(result[0]))
-            } else if result.len() == 1 {
+            if result.len() == 1 || (all_same && result.len() > 1) {
                 Value::Number(MaybeVector::Scalar(result[0]))
             } else {
                 Value::Number(MaybeVector::Vector(result))
             }
         }
         Value::NumberInterval(_) => {
+            // Get reference value for comparison
+            let ref_val = match &values[0].0 {
+                Value::NumberInterval(MaybeVector::Scalar(n)) => Some(*n),
+                Value::NumberInterval(MaybeVector::Vector(nums)) if !nums.is_empty() => Some(nums[0]),
+                _ => None,
+            };
+
             let mut result = Vec::with_capacity(total_size);
+            let mut all_same = ref_val.is_some();
+            let ref_val = ref_val.unwrap_or(Pico8NumInterval::new(Pico8Num::from_i16(0), Pico8Num::from_i16(0)));
+
             for (v, size) in values {
                 match v {
                     Value::NumberInterval(MaybeVector::Scalar(n)) => {
-                        // Use resize which is more efficient for Copy types
+                        if all_same && *n != ref_val {
+                            all_same = false;
+                        }
                         let new_len = result.len() + size;
                         result.resize(new_len, *n);
                     }
                     Value::NumberInterval(MaybeVector::Vector(nums)) => {
+                        if all_same {
+                            for n in nums {
+                                if *n != ref_val {
+                                    all_same = false;
+                                    break;
+                                }
+                            }
+                        }
                         result.extend_from_slice(nums);
                     }
                     _ => panic!("Type mismatch in merge"),
                 }
             }
-            // Check if all identical
-            if result.len() > 1 && result.iter().all(|n| *n == result[0]) {
-                Value::NumberInterval(MaybeVector::Scalar(result[0]))
-            } else if result.len() == 1 {
+            if result.len() == 1 || (all_same && result.len() > 1) {
                 Value::NumberInterval(MaybeVector::Scalar(result[0]))
             } else {
                 Value::NumberInterval(MaybeVector::Vector(result))
             }
         }
         Value::Bool(_) => {
+            // Get reference value for comparison
+            let ref_val = match &values[0].0 {
+                Value::Bool(MaybeVector::Scalar(b)) => Some(*b),
+                Value::Bool(MaybeVector::Vector(bools)) if !bools.is_empty() => Some(bools[0]),
+                _ => None,
+            };
+
             let mut result = Vec::with_capacity(total_size);
+            let mut all_same = ref_val.is_some();
+            let ref_val = ref_val.unwrap_or(false);
+
             for (v, size) in values {
                 match v {
                     Value::Bool(MaybeVector::Scalar(b)) => {
-                        // Use resize which is more efficient for Copy types
+                        if all_same && *b != ref_val {
+                            all_same = false;
+                        }
                         let new_len = result.len() + size;
                         result.resize(new_len, *b);
                     }
                     Value::Bool(MaybeVector::Vector(bools)) => {
+                        if all_same {
+                            for b in bools {
+                                if *b != ref_val {
+                                    all_same = false;
+                                    break;
+                                }
+                            }
+                        }
                         result.extend_from_slice(bools);
                     }
                     _ => panic!("Type mismatch in merge"),
                 }
             }
-            // Check if all identical
-            if result.len() > 1 && result.iter().all(|b| *b == result[0]) {
-                Value::Bool(MaybeVector::Scalar(result[0]))
-            } else if result.len() == 1 {
+            if result.len() == 1 || (all_same && result.len() > 1) {
                 Value::Bool(MaybeVector::Scalar(result[0]))
             } else {
                 Value::Bool(MaybeVector::Vector(result))
