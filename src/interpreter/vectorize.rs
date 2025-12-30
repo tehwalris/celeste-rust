@@ -7,7 +7,7 @@
 //! 3. Deduplicate vectors (remove duplicate elements)
 //! 4. If vector size becomes 1, convert back to scalars
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{
     heap::{Heap, HeapId},
@@ -115,30 +115,28 @@ pub fn debug_shape_of_state(state: &State) -> StateShape {
 
 fn shape_of_state(state: &State) -> StateShape {
     // Get heap structure (handle empty slots that are allocated but not set)
-    let mut heap_structure = Vec::new();
-    for i in 0..state.heap.len() {
-        let id = HeapId::from_raw(i);
-        let shape = match state.heap.get_opt(id) {
-            Some(value) => normalize_heap_value_for_shape(value),
-            None => HeapValueShape::Empty,
-        };
-        heap_structure.push((id, shape));
-    }
+    let heap_structure: Vec<_> = (0..state.heap.len())
+        .map(|i| {
+            let id = HeapId::from_raw(i);
+            let shape = match state.heap.get_opt(id) {
+                Some(value) => normalize_heap_value_for_shape(value),
+                None => HeapValueShape::Empty,
+            };
+            (id, shape)
+        })
+        .collect();
 
-    // Get local env structure (sorted for consistent comparison)
-    let mut local_env_structure: Vec<_> = state.local_env.iter()
+    // Local env is already sorted by index (uses Vec internally)
+    let local_env_structure: Vec<_> = state.local_env.iter()
         .map(|(k, v)| (k, normalize_value_for_shape(v)))
         .collect();
-    local_env_structure.sort_by_key(|(k, _)| *k);
 
-    // Get outer local envs structure (sorted for consistent comparison)
+    // Outer local envs are also already sorted by index
     let outer_local_envs_structure: Vec<Vec<_>> = state.outer_local_envs.iter()
         .map(|env| {
-            let mut entries: Vec<_> = env.iter()
+            env.iter()
                 .map(|(k, v)| (k, normalize_value_for_shape(v)))
-                .collect();
-            entries.sort_by_key(|(k, _)| *k);
-            entries
+                .collect()
         })
         .collect();
 
@@ -678,7 +676,6 @@ pub fn assert_state_vector_lengths(state: &State) {
 /// Clean states by removing local_env entries that don't appear in all states.
 /// This allows states with different dead temporaries to merge.
 fn clean_local_envs_for_merging(states: Vec<State>) -> Vec<State> {
-    use std::collections::HashSet;
     use crate::ir::LocalId;
 
     if states.len() <= 1 {
@@ -686,9 +683,9 @@ fn clean_local_envs_for_merging(states: Vec<State>) -> Vec<State> {
     }
 
     // Find the intersection of all local_env keys
-    let mut common_keys: HashSet<usize> = states[0].local_env.iter().map(|(k, _)| k).collect();
+    let mut common_keys: FxHashSet<usize> = states[0].local_env.iter().map(|(k, _)| k).collect();
     for state in &states[1..] {
-        let state_keys: HashSet<usize> = state.local_env.iter().map(|(k, _)| k).collect();
+        let state_keys: FxHashSet<usize> = state.local_env.iter().map(|(k, _)| k).collect();
         common_keys = common_keys.intersection(&state_keys).copied().collect();
     }
 
@@ -747,8 +744,9 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
         return states;
     }
 
-    // Validate input states
+    // Validate input states (only in debug mode)
     let t0 = std::time::Instant::now();
+    #[cfg(debug_assertions)]
     for state in &states {
         assert_state_vector_lengths(state);
     }
@@ -782,8 +780,9 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
         .collect();
     stats.vectorize_groups_ns = t3.elapsed().as_nanos() as u64;
 
-    // Validate output states
+    // Validate output states (only in debug mode)
     let t4 = std::time::Instant::now();
+    #[cfg(debug_assertions)]
     for state in &result {
         assert_state_vector_lengths(state);
     }
@@ -925,11 +924,9 @@ pub fn union_diff_states(
     accumulated: Vec<State>,
     potentially_new: Vec<State>,
 ) -> (Vec<State>, Vec<State>) {
-    use std::collections::HashSet;
-
     if accumulated.is_empty() {
         // First, deduplicate within potentially_new
-        let mut seen: HashSet<NormalizedState> = HashSet::new();
+        let mut seen: FxHashSet<NormalizedState> = FxHashSet::default();
         let mut unique = Vec::new();
         for state in potentially_new {
             let normalized = normalize_state_for_comparison(&state);
@@ -947,14 +944,14 @@ pub fn union_diff_states(
     }
 
     // Build a set of normalized accumulated states for fast lookup
-    let accumulated_normalized: HashSet<NormalizedState> = accumulated
+    let accumulated_normalized: FxHashSet<NormalizedState> = accumulated
         .iter()
         .map(normalize_state_for_comparison)
         .collect();
 
     // Partition potentially_new into truly new vs already seen
     // Also deduplicate within potentially_new
-    let mut seen: HashSet<NormalizedState> = accumulated_normalized.clone();
+    let mut seen: FxHashSet<NormalizedState> = accumulated_normalized.clone();
     let mut actually_new = Vec::new();
     for state in potentially_new {
         let normalized = normalize_state_for_comparison(&state);
