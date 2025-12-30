@@ -328,43 +328,38 @@ impl<'a> BoundInterpreterFlow<'a> {
 
 impl<'a> BoundSplitBlockFlow<FlowData> for BoundInterpreterFlow<'a> {
     fn flow(&self, v: FlowData) -> Result<FlowData> {
-        let out_parts = match v {
-            FlowData::States(states) => {
-                // Use into_iter to take ownership and avoid cloning
-                states
-                    .into_iter()
-                    .map(|state| self.flow_single_state(state))
-                    .collect::<Result<Vec<FlowData>>>()?
-            }
+        let states = match v {
+            FlowData::States(states) => states,
             FlowData::StatesAndReturns(_) => {
                 return Err(anyhow!("Return value in unexpected part of CFG"))
             }
         };
 
-        let result = match out_parts.first() {
-            Some(FlowData::States(_)) => FlowData::States(
-                out_parts
-                    .into_iter()
-                    .flat_map(|part| match part {
-                        FlowData::States(states) => states,
-                        FlowData::StatesAndReturns(_) => {
-                            panic!("Mix of States and StatesAndReturns")
-                        }
-                    })
-                    .collect(),
-            ),
-            Some(FlowData::StatesAndReturns(_)) => FlowData::StatesAndReturns(
-                out_parts
-                    .into_iter()
-                    .flat_map(|part| match part {
-                        FlowData::States(_) => panic!("Mix of States and StatesAndReturns"),
-                        FlowData::StatesAndReturns(states_and_returns) => states_and_returns,
-                    })
-                    .collect(),
-            ),
-            None => FlowData::States(vec![]),
-        };
+        // Pre-compute total capacity to avoid reallocations
+        // Most flow operations return a single state, so estimate 1 per input
+        let mut result_states: Vec<State> = Vec::with_capacity(states.len());
+        let mut result_returns: Vec<(State, Value)> = Vec::new();
+        let mut has_returns = false;
 
-        Ok(result)
+        for state in states {
+            match self.flow_single_state(state)? {
+                FlowData::States(new_states) => {
+                    result_states.extend(new_states);
+                }
+                FlowData::StatesAndReturns(new_returns) => {
+                    has_returns = true;
+                    result_returns.extend(new_returns);
+                }
+            }
+        }
+
+        if has_returns {
+            if !result_states.is_empty() {
+                panic!("Mix of States and StatesAndReturns");
+            }
+            Ok(FlowData::StatesAndReturns(result_returns))
+        } else {
+            Ok(FlowData::States(result_states))
+        }
     }
 }
