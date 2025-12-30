@@ -61,8 +61,14 @@ fn builtin_add(mut state: State, args: Vec<Value>) -> Result<Vec<(State, Value)>
     let value_heap_id = state.heap.alloc();
     state.heap.set(value_heap_id, HeapValue::Value(value));
 
-    match state.heap.get_mut(table_heap_id) {
-        HeapValue::ArrayTable(items) => { items.push(value_heap_id); }
+    match state.heap.get(table_heap_id) {
+        HeapValue::ArrayTable(_) => {
+            state.heap.modify(table_heap_id, |v| {
+                if let HeapValue::ArrayTable(items) = v {
+                    items.push(value_heap_id);
+                }
+            });
+        }
         HeapValue::UnknownTable => {
             state.heap.set(table_heap_id, HeapValue::ArrayTable(vec![value_heap_id]));
         }
@@ -192,7 +198,7 @@ fn builtin_split_by_flr(state: State, args: Vec<Value>) -> Result<Vec<(State, Va
                 let mask: Vec<bool> = (0..nums.len())
                     .map(|i| group.iter().any(|(gi, _)| *gi == i))
                     .collect();
-                let filtered_state = state.filter_by_mask(&mask);
+                let filtered_state = state.filter_by_mask_clone(&mask);
                 let result_nums: Vec<Pico8Num> = group.into_iter().map(|(_, n)| n).collect();
                 let result_value = if result_nums.len() == 1 {
                     Value::Number(MaybeVector::Scalar(result_nums[0]))
@@ -243,7 +249,7 @@ fn builtin_split_by_flr(state: State, args: Vec<Value>) -> Result<Vec<(State, Va
                     continue; // No elements in this floor range
                 }
 
-                let filtered_state = state.filter_by_mask(&mask);
+                let filtered_state = state.filter_by_mask_clone(&mask);
 
                 // Collect the intersected intervals (non-None values)
                 let result_intervals: Vec<Pico8NumInterval> = intersections
@@ -311,10 +317,14 @@ fn builtin_array_table_drop_last(mut state: State, args: Vec<Value>) -> Result<V
         Value::Pointer(heap_id) => *heap_id,
         _ => return Err(anyhow!("__array_table_drop_last: argument must be a table")),
     };
-    match state.heap.get_mut(table_heap_id) {
+    match state.heap.get(table_heap_id) {
         HeapValue::ArrayTable(items) => {
             if items.is_empty() { return Err(anyhow!("Cannot drop last element of empty array table")); }
-            items.pop();
+            state.heap.modify(table_heap_id, |v| {
+                if let HeapValue::ArrayTable(items) = v {
+                    items.pop();
+                }
+            });
         }
         _ => return Err(anyhow!("__array_table_drop_last: expected array table")),
     }

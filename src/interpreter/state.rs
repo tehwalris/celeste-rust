@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::hash::BuildHasherDefault;
 
-use im::HashMap as ImHashMap;
+use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -10,7 +10,16 @@ use super::{
 };
 use crate::ir::LocalId;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+// Use FxHash for faster hashing
+type FxBuildHasher = BuildHasherDefault<FxHasher>;
+type ImHashMap<K, V> = im::HashMap<K, V, FxBuildHasher>;
+type FxHashMap<K, V> = std::collections::HashMap<K, V, FxBuildHasher>;
+
+fn new_imhashmap<K: Clone + Eq + std::hash::Hash, V: Clone>() -> ImHashMap<K, V> {
+    ImHashMap::with_hasher(BuildHasherDefault::default())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct State {
     pub heap: Heap,
     pub local_env: LocalEnv,
@@ -20,13 +29,76 @@ pub struct State {
     pub vector_size: usize,
 }
 
+impl Serialize for State {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // Create a serializable representation
+        #[derive(Serialize)]
+        struct StateSerialize<'a> {
+            heap: &'a Heap,
+            local_env: &'a LocalEnv,
+            outer_local_envs: &'a Vec<LocalEnv>,
+            global_env: Vec<(String, HeapId)>,
+            prints: &'a Vec<String>,
+            vector_size: usize,
+        }
+
+        let global_env: Vec<(String, HeapId)> = self.global_env.iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+
+        StateSerialize {
+            heap: &self.heap,
+            local_env: &self.local_env,
+            outer_local_envs: &self.outer_local_envs,
+            global_env,
+            prints: &self.prints,
+            vector_size: self.vector_size,
+        }.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for State {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct StateDeserialize {
+            heap: Heap,
+            local_env: LocalEnv,
+            outer_local_envs: Vec<LocalEnv>,
+            global_env: Vec<(String, HeapId)>,
+            prints: Vec<String>,
+            vector_size: usize,
+        }
+
+        let s = StateDeserialize::deserialize(deserializer)?;
+        let mut global_env = new_imhashmap();
+        for (k, v) in s.global_env {
+            global_env.insert(k, v);
+        }
+
+        Ok(State {
+            heap: s.heap,
+            local_env: s.local_env,
+            outer_local_envs: s.outer_local_envs,
+            global_env,
+            prints: s.prints,
+            vector_size: s.vector_size,
+        })
+    }
+}
+
 impl State {
     pub fn new() -> Self {
         Self {
             heap: Heap::new(),
             local_env: LocalEnv::new(),
             outer_local_envs: Vec::new(),
-            global_env: ImHashMap::new(),
+            global_env: new_imhashmap(),
             prints: Vec::new(),
             vector_size: 1,
         }
@@ -52,16 +124,21 @@ impl State {
         }
     }
 
-    /// Filters all vector values in the state by a mask.
+    /// Filters all vector values in the state by a mask, consuming self.
     /// The resulting state's vector_size will be the number of true values in the mask.
-    pub fn filter_by_mask(&self, mask: &[bool]) -> Self {
-        let new_vector_size = mask.iter().filter(|&&b| b).count();
+    pub fn filter_by_mask(mut self, mask: &[bool]) -> Self {
+        self.filter_by_mask_in_place(mask);
+        self
+    }
 
-        let mut new_state = self.clone();
-        new_state.vector_size = new_vector_size;
+    /// Filters all vector values in the state by a mask in place.
+    /// The resulting state's vector_size will be the number of true values in the mask.
+    fn filter_by_mask_in_place(&mut self, mask: &[bool]) {
+        let new_vector_size = mask.iter().filter(|&&b| b).count();
+        self.vector_size = new_vector_size;
 
         // Filter values in heap
-        new_state.heap.map_in_place(|v| match v {
+        self.heap.map_in_place(|v| match v {
             HeapValue::Value(val) => HeapValue::Value(val.filter_vectors(mask)),
             HeapValue::Closure(id, values) => {
                 HeapValue::Closure(id, values.into_iter().map(|v| v.filter_vectors(mask)).collect())
@@ -73,13 +150,19 @@ impl State {
         });
 
         // Filter values in local env
-        new_state.local_env.map_in_place(|v| v.filter_vectors(mask));
+        self.local_env.map_in_place(|v| v.filter_vectors(mask));
 
         // Filter values in outer local envs
-        for env in &mut new_state.outer_local_envs {
+        for env in &mut self.outer_local_envs {
             env.map_in_place(|v| v.filter_vectors(mask));
         }
+    }
 
+    /// Filters all vector values in the state by a mask, cloning first.
+    /// The resulting state's vector_size will be the number of true values in the mask.
+    pub fn filter_by_mask_clone(&self, mask: &[bool]) -> Self {
+        let mut new_state = self.clone();
+        new_state.filter_by_mask_in_place(mask);
         new_state
     }
 
@@ -92,7 +175,7 @@ impl State {
     /// 2. Assign new HeapIds in the order values are visited
     /// 3. Create a compacted heap with only reachable values
     pub fn gc(&mut self) {
-        let mut old_to_new: HashMap<HeapId, HeapId> = HashMap::new();
+        let mut old_to_new: FxHashMap<HeapId, HeapId> = FxHashMap::default();
         let mut new_heap_values: Vec<HeapValue> = Vec::new();
 
         // Visit a heap ID, assigning a new ID if not yet visited
@@ -100,7 +183,7 @@ impl State {
         fn visit(
             old_id: HeapId,
             old_heap: &Heap,
-            old_to_new: &mut HashMap<HeapId, HeapId>,
+            old_to_new: &mut FxHashMap<HeapId, HeapId>,
             new_heap_values: &mut Vec<HeapValue>,
         ) -> HeapId {
             if let Some(&new_id) = old_to_new.get(&old_id) {
@@ -151,7 +234,7 @@ impl State {
                     // IMPORTANT: Sort keys for deterministic traversal order!
                     let mut keys: Vec<_> = table.keys().cloned().collect();
                     keys.sort();
-                    let new_table: std::collections::HashMap<String, HeapId> = keys
+                    let new_table: FxHashMap<String, HeapId> = keys
                         .into_iter()
                         .map(|k| {
                             let v = table[&k];
@@ -178,7 +261,7 @@ impl State {
         // Visit all roots from global_env (sorted for deterministic order)
         let mut global_keys: Vec<_> = self.global_env.keys().cloned().collect();
         global_keys.sort();
-        let mut new_global_env = ImHashMap::new();
+        let mut new_global_env = new_imhashmap();
         for key in global_keys {
             let old_id = self.global_env[&key];
             let new_id = visit(old_id, &self.heap, &mut old_to_new, &mut new_heap_values);
