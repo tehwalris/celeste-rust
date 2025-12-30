@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use im::HashMap as ImHashMap;
+use elsa::FrozenVec;
 use serde::{Deserialize, Serialize};
 
 use super::value::HeapValue;
@@ -18,24 +18,40 @@ impl HeapId {
     }
 }
 
-/// A copy-on-write heap implementation.
+/// A copy-on-write heap implementation optimized for cheap cloning.
 ///
-/// Uses a two-level structure inspired by the OCaml implementation:
-/// - `old_values`: An immutable Arc<Vec> of values that was frozen at some point.
-///   This is shared across all cloned states without copying.
-/// - `new_values`: A persistent HashMap (from `im` crate) that overlays new or
-///   changed values. This allows efficient cloning by structural sharing.
+/// Uses an append-only FrozenVec shared via Arc for stable storage,
+/// with a small Vec overlay for local modifications. This provides:
+/// - Very cheap cloning: Arc::clone + small Vec clone
+/// - Fast lookups: Linear scan of small overlay + O(1) FrozenVec access
+/// - Efficient writes: Append to overlay, compact when too large
 ///
-/// The total size is `old_values.len() + next_new_id`, where values in the
-/// `new_values` overlay can either be new allocations or modifications to old values.
-#[derive(Clone, Debug)]
+/// The overlay is kept small (< 64 entries) by compacting into the base
+/// when it grows too large.
+#[derive(Clone)]
 pub struct Heap {
-    /// Immutable base values, shared via Arc across cloned states
-    old_values: Arc<Vec<Option<HeapValue>>>,
-    /// Overlay of new or changed values using a persistent HashMap
-    new_values: ImHashMap<usize, Option<HeapValue>>,
+    /// Append-only storage shared across all cloned states.
+    storage: Arc<FrozenVec<Box<HeapValue>>>,
+    /// Small overlay mapping HeapId -> storage index.
+    /// Kept sorted by HeapId for binary search.
+    /// When this grows too large, we compact into a new storage.
+    overlay: Vec<(usize, usize)>,
+    /// Base index: maps HeapId -> storage index for values not in overlay.
+    /// This is the "frozen" part that's shared via Arc.
+    base_index: Arc<Vec<usize>>,
     /// The next HeapId to allocate
     next_id: usize,
+}
+
+// Custom Debug implementation since FrozenVec doesn't implement Debug
+impl std::fmt::Debug for Heap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Heap")
+            .field("next_id", &self.next_id)
+            .field("overlay_len", &self.overlay.len())
+            .field("storage_len", &self.storage.len())
+            .finish()
+    }
 }
 
 impl Serialize for Heap {
@@ -57,9 +73,23 @@ impl<'de> Deserialize<'de> for Heap {
         D: serde::Deserializer<'de>,
     {
         let values: Vec<Option<HeapValue>> = Vec::deserialize(deserializer)?;
+        let storage = Arc::new(FrozenVec::new());
+        let mut base_index = Vec::with_capacity(values.len());
+
+        for value_opt in &values {
+            if let Some(value) = value_opt {
+                let idx = storage.len();
+                storage.push(Box::new(value.clone()));
+                base_index.push(idx);
+            } else {
+                base_index.push(usize::MAX); // Sentinel for None
+            }
+        }
+
         Ok(Heap {
-            old_values: Arc::new(values.clone()),
-            new_values: ImHashMap::new(),
+            storage,
+            overlay: Vec::new(),
+            base_index: Arc::new(base_index),
             next_id: values.len(),
         })
     }
@@ -67,7 +97,6 @@ impl<'de> Deserialize<'de> for Heap {
 
 impl PartialEq for Heap {
     fn eq(&self, other: &Self) -> bool {
-        // For PartialEq we need to compare actual contents
         if self.len() != other.len() {
             return false;
         }
@@ -86,8 +115,9 @@ impl Eq for Heap {}
 impl Heap {
     pub fn new() -> Self {
         Self {
-            old_values: Arc::new(Vec::new()),
-            new_values: ImHashMap::new(),
+            storage: Arc::new(FrozenVec::new()),
+            overlay: Vec::new(),
+            base_index: Arc::new(Vec::new()),
             next_id: 0,
         }
     }
@@ -99,85 +129,128 @@ impl Heap {
     pub fn alloc(&mut self) -> HeapId {
         let id = HeapId(self.next_id);
         self.next_id += 1;
-        // Don't store anything yet - it will be set via set()
         id
     }
 
+    /// Look up storage index in overlay using binary search
+    #[inline]
+    fn overlay_get(&self, id: usize) -> Option<usize> {
+        match self.overlay.binary_search_by_key(&id, |&(k, _)| k) {
+            Ok(pos) => Some(self.overlay[pos].1),
+            Err(_) => None,
+        }
+    }
+
     pub fn get_opt(&self, id: HeapId) -> Option<&HeapValue> {
-        // First check the overlay
-        if let Some(value) = self.new_values.get(&id.0) {
-            return value.as_ref();
+        // First check overlay
+        if let Some(storage_idx) = self.overlay_get(id.0) {
+            return self.storage.get(storage_idx);
         }
-        // Fall back to old values
-        if id.0 < self.old_values.len() {
-            self.old_values[id.0].as_ref()
-        } else {
-            None
+
+        // Fall back to base index
+        if id.0 < self.base_index.len() {
+            let storage_idx = self.base_index[id.0];
+            if storage_idx != usize::MAX {
+                return self.storage.get(storage_idx);
+            }
         }
+
+        None
     }
 
     pub fn get(&self, id: HeapId) -> &HeapValue {
-        self.get_opt(id).expect("HeapId should point to a valid value")
-    }
-
-    pub fn get_mut(&mut self, id: HeapId) -> &mut HeapValue {
-        // Ensure the value is in the overlay so we can mutate it
-        if !self.new_values.contains_key(&id.0) {
-            // Copy from old_values into the overlay
-            let value = if id.0 < self.old_values.len() {
-                self.old_values[id.0].clone()
-            } else {
-                None
-            };
-            self.new_values.insert(id.0, value);
-        }
-        self.new_values.get_mut(&id.0).unwrap().as_mut().unwrap()
+        self.get_opt(id)
+            .expect("HeapId should point to a valid value")
     }
 
     pub fn set(&mut self, id: HeapId, value: HeapValue) {
-        self.new_values.insert(id.0, Some(value));
+        let storage_idx = self.storage.len();
+        self.storage.push(Box::new(value));
+
+        // Update overlay, keeping it sorted
+        match self.overlay.binary_search_by_key(&id.0, |&(k, _)| k) {
+            Ok(pos) => {
+                // Update existing entry
+                self.overlay[pos].1 = storage_idx;
+            }
+            Err(pos) => {
+                // Insert new entry at sorted position
+                self.overlay.insert(pos, (id.0, storage_idx));
+            }
+        }
+
+        // Compact if overlay is too large
+        if self.overlay.len() > 64 {
+            self.compact();
+        }
+    }
+
+    /// Compact the overlay into the base index
+    fn compact(&mut self) {
+        if self.overlay.is_empty() {
+            return;
+        }
+
+        // Build new base index by merging overlay with existing base_index
+        // Since overlay is sorted, we can do this efficiently without lookups
+        let mut new_base = Vec::with_capacity(self.next_id);
+        let mut overlay_idx = 0;
+        let overlay = &self.overlay;
+        let base = &self.base_index;
+
+        for id in 0..self.next_id {
+            // Check if this id is in overlay (overlay is sorted)
+            if overlay_idx < overlay.len() && overlay[overlay_idx].0 == id {
+                new_base.push(overlay[overlay_idx].1);
+                overlay_idx += 1;
+            } else if id < base.len() {
+                new_base.push(base[id]);
+            } else {
+                new_base.push(usize::MAX);
+            }
+        }
+
+        self.base_index = Arc::new(new_base);
+        self.overlay.clear();
+    }
+
+    /// Modify a heap value in place using a closure.
+    /// This clones the value, applies the closure, and sets it back.
+    pub fn modify<F>(&mut self, id: HeapId, f: F)
+    where
+        F: FnOnce(&mut HeapValue),
+    {
+        let mut value = self.get(id).clone();
+        f(&mut value);
+        self.set(id, value);
     }
 
     pub fn map_in_place(&mut self, f: impl Fn(HeapValue) -> HeapValue) {
-        // First, apply to old values that aren't overridden
-        for i in 0..self.old_values.len() {
-            if !self.new_values.contains_key(&i) {
-                if let Some(value) = &self.old_values[i] {
-                    self.new_values.insert(i, Some(f(value.clone())));
-                }
+        // Build new base index directly instead of updating overlay incrementally.
+        // This avoids O(n^2) behavior from repeated overlay.insert() calls.
+        let mut new_base = Vec::with_capacity(self.next_id);
+
+        for id in 0..self.next_id {
+            if let Some(value) = self.get_opt(HeapId(id)) {
+                let new_value = f(value.clone());
+                let storage_idx = self.storage.len();
+                self.storage.push(Box::new(new_value));
+                new_base.push(storage_idx);
+            } else {
+                new_base.push(usize::MAX); // Sentinel for None
             }
         }
-        // Then apply to overlay values
-        self.new_values = self.new_values.iter()
-            .map(|(k, v)| {
-                let new_v = match v {
-                    Some(val) => Some(f(val.clone())),
-                    None => None,
-                };
-                (*k, new_v)
-            })
-            .collect();
+
+        // Replace base index and clear overlay
+        self.base_index = Arc::new(new_base);
+        self.overlay.clear();
     }
 
-    /// Freeze the current state, compacting everything into old_values.
-    /// This is useful when you want to establish a new baseline for sharing.
-    /// Call this before cloning when the heap won't change much.
+    /// Freeze is a no-op for this implementation since storage is already shared.
     pub fn freeze(&mut self) {
-        if self.new_values.is_empty() && self.next_id == self.old_values.len() {
-            return; // Already frozen
+        // Compact to reduce overlay size for future clones
+        if !self.overlay.is_empty() {
+            self.compact();
         }
-
-        let mut new_vec = Vec::with_capacity(self.next_id);
-        for i in 0..self.next_id {
-            if let Some(value) = self.new_values.get(&i) {
-                new_vec.push(value.clone());
-            } else if i < self.old_values.len() {
-                new_vec.push(self.old_values[i].clone());
-            } else {
-                new_vec.push(None);
-            }
-        }
-        self.old_values = Arc::new(new_vec);
-        self.new_values = ImHashMap::new();
     }
 }
