@@ -1,5 +1,7 @@
 /target
 /output
 /profiles
+/checkpoints
+/server
 perf.data*
 perf_*.data*
