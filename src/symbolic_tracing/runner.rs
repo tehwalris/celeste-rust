@@ -143,14 +143,18 @@ pub fn run_traced(
     while let Some(pending_state) = pending.pop_front() {
         stats.states_processed += 1;
 
-        // Try cache lookup
-        if let Some(cached) = cache.get(&pending_state.shape, &pending_state.path) {
-            stats.cache_hits += 1;
-            // For now, just use the cached output directly
-            // TODO: In Phase 3, substitute symbolic values
-            output_states.push(cached.output_state.clone());
-            continue;
-        }
+        // NOTE: Cache is disabled for now because Phase 1 caching is incorrect.
+        // We cache concrete outputs, but different inputs produce different concrete outputs
+        // even when taking the same path. Need symbolic expressions to fix this.
+        //
+        // // Try cache lookup
+        // if let Some(cached) = cache.get(&pending_state.shape, &pending_state.path) {
+        //     stats.cache_hits += 1;
+        //     // For now, just use the cached output directly
+        //     // TODO: In Phase 3, substitute symbolic values
+        //     output_states.push(cached.output_state.clone());
+        //     continue;
+        // }
         stats.cache_misses += 1;
 
         // Execute with tracing

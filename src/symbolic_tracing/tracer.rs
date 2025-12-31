@@ -1,87 +1,42 @@
-//! TracingInterpreter: executes a concrete state through a CFG while tracking the path.
+//! TracingInterpreter: executes a concrete state through CFGs while tracking the path.
 //!
-//! Unlike the standard interpreter which uses vectorization to track multiple possibilities,
-//! this interpreter:
-//! 1. Always works with concrete states (vector_size = 1)
-//! 2. When encountering abstract conditionals, picks one branch using PathCounter
-//! 3. When functions return multiple/vectorized states, splits and picks one
-//! 4. Records the path taken for caching and later exploration
+//! Key design:
+//! 1. Non-recursive: uses an explicit call stack instead of Rust recursion
+//! 2. Path counter persists across call boundaries
+//! 3. Always works with concrete scalar states (vector_size = 1)
+//! 4. Abstract conditionals use path counter to pick a branch
+
+use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
 
 use crate::interpreter::{
-    core_interpreter::CoreInterpreter,
     fixed_env::FixedEnv,
     heap::HeapId,
+    local_env::LocalEnv,
     state::State,
     value::{HeapValue, MaybeVector, Value},
 };
-use crate::ir::{Cfg, Instruction, Label, Terminator};
+use crate::ir::{Cfg, Instruction, Label, LocalId, Terminator};
 
 use super::PathCounter;
 
-/// Split a vectorized state (vector_size > 1) into individual scalar states.
-/// Each returned state has vector_size = 1.
-fn split_vectorized_state(state: State) -> Vec<State> {
-    if state.vector_size <= 1 {
-        return vec![state];
-    }
-
-    let n = state.vector_size;
-    let mut result = Vec::with_capacity(n);
-
-    for idx in 0..n {
-        let mut new_state = State {
-            heap: state.heap.clone(),
-            local_env: state.local_env.clone(),
-            outer_local_envs: state.outer_local_envs.clone(),
-            global_env: state.global_env.clone(),
-            prints: state.prints.clone(),
-            vector_size: 1,
-        };
-
-        // Extract element at index `idx` from all vectors
-        new_state.map_values_in_place(|v| extract_scalar_at_index(v, idx));
-
-        // Also process heap values
-        for i in 0..new_state.heap.len() {
-            let id = HeapId::from_raw(i);
-            if let Some(heap_value) = new_state.heap.get_opt(id) {
-                let new_heap_value = match heap_value {
-                    HeapValue::Value(v) => HeapValue::Value(extract_scalar_at_index(v.clone(), idx)),
-                    HeapValue::Closure(name, captures) => {
-                        let new_captures: Vec<Value> = captures.iter()
-                            .map(|v| extract_scalar_at_index(v.clone(), idx))
-                            .collect();
-                        HeapValue::Closure(name.clone(), new_captures)
-                    }
-                    other => other.clone(),
-                };
-                new_state.heap.set(id, new_heap_value);
-            }
-        }
-
-        result.push(new_state);
-    }
-
-    result
-}
-
-/// Extract the scalar value at index `idx` from a potentially vectorized value.
-fn extract_scalar_at_index(value: Value, idx: usize) -> Value {
-    match value {
-        Value::Number(MaybeVector::Vector(nums)) => {
-            Value::Number(MaybeVector::Scalar(nums[idx]))
-        }
-        Value::NumberInterval(MaybeVector::Vector(intervals)) => {
-            Value::NumberInterval(MaybeVector::Scalar(intervals[idx]))
-        }
-        Value::Bool(MaybeVector::Vector(bools)) => {
-            Value::Bool(MaybeVector::Scalar(bools[idx]))
-        }
-        // Already scalar or non-vectorizable - return as-is
-        other => other,
-    }
+/// A stack frame for the tracing interpreter.
+#[derive(Clone)]
+struct CallFrame {
+    /// The CFG we're executing
+    cfg: Cfg,
+    /// Current block label (None = entry block)
+    current_block: Option<Label>,
+    /// Previous block label (for Phi resolution on return)
+    previous_block: Option<Label>,
+    /// Index of the call instruction within the block's non-phi instructions
+    /// On return, we resume from instruction_index + 1
+    instruction_index: usize,
+    /// Where to store the return value
+    return_local_id: LocalId,
+    /// The caller's local_env (restored on return)
+    caller_local_env: LocalEnv,
 }
 
 /// Result of tracing a concrete state through a CFG.
@@ -94,55 +49,127 @@ pub struct TracingResult {
     /// The path taken through the code.
     pub path: PathCounter,
     /// Number of "forced" choices where condition was truly abstract.
-    /// If 0, this state had no ambiguous branches.
     pub forced_choices: usize,
 }
 
-/// Interprets a concrete state through a CFG, tracking the path taken.
+/// Interprets a concrete state through CFGs, tracking the path taken.
+/// Uses an explicit call stack instead of recursion.
 pub struct TracingInterpreter<'a> {
     fixed_env: &'a FixedEnv,
-    /// The path counter for making/tracking choices.
+    /// The mutable state being traced
+    state: State,
+    /// The path counter for making/tracking choices (persists across calls)
     path: PathCounter,
-    /// Current position in the path (for replaying).
+    /// Current position in the path (for replaying)
     choice_position: usize,
-    /// Number of forced choices made.
+    /// Number of forced choices made
     forced_choices: usize,
+    /// Call stack
+    call_stack: Vec<CallFrame>,
+    /// Current CFG (None only before interpret() is called)
+    current_cfg: Option<Cfg>,
+    /// Current block label (None = entry block)
+    current_block: Option<Label>,
+    /// Previous block label (for Phi node resolution)
+    previous_block: Option<Label>,
+    /// Resume instruction index (skip this many non-phi instructions when entering a block)
+    resume_instruction_index: usize,
 }
 
 impl<'a> TracingInterpreter<'a> {
     /// Create a new tracing interpreter.
-    /// If `path` is provided, we replay those choices; otherwise we explore with all-zeros.
     pub fn new(fixed_env: &'a FixedEnv, path: Option<PathCounter>) -> Self {
         Self {
             fixed_env,
+            state: State::new(), // Will be replaced in interpret()
             path: path.unwrap_or_default(),
             choice_position: 0,
             forced_choices: 0,
+            call_stack: Vec::new(),
+            current_cfg: None, // Will be set in interpret()
+            current_block: None,
+            previous_block: None,
+            resume_instruction_index: 0,
         }
     }
 
-    /// Interpret a prepared CFG with a concrete state.
-    pub fn interpret(
-        mut self,
-        cfg: &Cfg,
-        mut state: State,
-    ) -> Result<TracingResult> {
-        // Start with the entry block
-        let mut current_block_label: Option<Label> = None;
+    /// Interpret a CFG with a concrete state.
+    pub fn interpret(mut self, cfg: &Cfg, state: State) -> Result<TracingResult> {
+        debug_assert_eq!(state.vector_size, 1, "Tracing requires scalar state");
 
+        self.state = state;
+        self.current_cfg = Some(cfg.clone());
+        self.current_block = None;
+        self.previous_block = None;
+
+        // Main interpretation loop
         loop {
+            let current_cfg = self.current_cfg.as_ref().expect("current_cfg should be set");
+
             // Get the current block
-            let block = if let Some(ref label) = current_block_label {
-                cfg.named.get(label).ok_or_else(|| {
+            let block = if let Some(ref label) = self.current_block {
+                current_cfg.named.get(label).ok_or_else(|| {
                     anyhow!("Block not found: {:?}", label)
-                })?
+                })?.clone()
             } else {
-                &cfg.entry
+                current_cfg.entry.clone()
             };
 
-            // Execute all instructions in the block
-            for (local_id, instruction) in &block.instructions {
-                state = self.interpret_instruction(state, *local_id, instruction)?;
+            // Split into phi and non-phi instructions
+            let (phi_instructions, non_phi_instructions) = block.split_block_phi_instructions();
+
+            // Skip phi instructions if resuming from a call return
+            // (phi instructions were already processed before the call)
+            if self.resume_instruction_index == 0 {
+                // Process phi instructions if we have a previous block
+                for (local_id, instruction) in phi_instructions {
+                    match instruction {
+                        Instruction::Phi { branches } => {
+                            // Find the branch matching our previous block
+                            let source_local_id = if let Some(ref prev_label) = self.previous_block {
+                                branches
+                                    .iter()
+                                    .find(|(label, _)| label == prev_label)
+                                    .map(|(_, local_id)| *local_id)
+                                    .ok_or_else(|| anyhow!(
+                                        "No Phi branch for previous block {:?}", prev_label
+                                    ))?
+                            } else {
+                                // Entry block - should not have phi instructions
+                                return Err(anyhow!("Phi instruction in entry block"));
+                            };
+                            let value = self.state.local_env.get(source_local_id).clone();
+                            self.state.local_env.set(*local_id, value);
+                        }
+                        _ => return Err(anyhow!("Expected Phi instruction")),
+                    }
+                }
+            }
+
+            // Execute non-phi instructions (skip those before resume_instruction_index)
+            let mut cfg_changed = false;
+            let mut call_instruction_index = 0;
+            for (idx, (local_id, instruction)) in non_phi_instructions.iter().enumerate() {
+                if idx < self.resume_instruction_index {
+                    continue; // Skip already-executed instructions
+                }
+                call_instruction_index = idx;
+                if self.interpret_instruction(*local_id, instruction)? {
+                    cfg_changed = true;
+                    break; // CFG changed (closure call), restart loop
+                }
+            }
+
+            // Reset resume index - if we continue from here, we've finished this block
+            self.resume_instruction_index = 0;
+
+            if cfg_changed {
+                // Save the instruction index for when we return
+                // The top of call_stack was just pushed by interpret_call
+                if let Some(frame) = self.call_stack.last_mut() {
+                    frame.instruction_index = call_instruction_index;
+                }
+                continue; // Restart with new CFG
             }
 
             // Handle the terminator
@@ -150,34 +177,58 @@ impl<'a> TracingInterpreter<'a> {
             match terminator {
                 Terminator::Return { value } => {
                     // Get return value if present
-                    let return_value = value.map(|id| state.local_env.get(id).clone());
+                    let return_value = value.map(|id| self.state.local_env.get(id).clone());
 
-                    // Truncate path to actual choices made
-                    self.path.truncate(self.choice_position);
+                    // Pop from call stack
+                    if let Some(frame) = self.call_stack.pop() {
+                        // Restore caller's local_env and set return value
+                        self.state.local_env = frame.caller_local_env;
+                        let value = return_value
+                            .unwrap_or_else(|| Value::Nil(Some("no return value".to_string())));
+                        self.state.local_env.set(frame.return_local_id, value);
 
-                    return Ok(TracingResult {
-                        output_state: state,
-                        return_value,
-                        path: self.path,
-                        forced_choices: self.forced_choices,
-                    });
+                        // Continue in caller's CFG from after the call instruction
+                        self.current_cfg = Some(frame.cfg);
+                        self.current_block = frame.current_block;
+                        self.previous_block = frame.previous_block;
+                        // Resume from the instruction AFTER the call
+                        self.resume_instruction_index = frame.instruction_index + 1;
+
+                        continue;
+                    } else {
+                        // Top-level return - we're done
+                        self.path.truncate(self.choice_position);
+
+                        return Ok(TracingResult {
+                            output_state: self.state,
+                            return_value,
+                            path: self.path,
+                            forced_choices: self.forced_choices,
+                        });
+                    }
                 }
                 Terminator::UnconditionalBranch { target } => {
-                    current_block_label = Some(target.clone());
+                    // Use synthetic "__entry" label for entry block
+                    self.previous_block = Some(self.current_block.clone()
+                        .unwrap_or_else(|| Label::from("__entry".to_string())));
+                    self.current_block = Some(target.clone());
                 }
                 Terminator::ConditionalBranch {
                     condition,
                     true_target,
                     false_target,
                 } => {
-                    let cond_value = state.local_env.get(*condition);
-                    let (take_true, is_forced) = self.evaluate_condition(cond_value)?;
+                    let cond_value = self.state.local_env.get(*condition).clone();
+                    let (take_true, is_forced) = self.evaluate_condition(&cond_value)?;
 
                     if is_forced {
                         self.forced_choices += 1;
                     }
 
-                    current_block_label = Some(if take_true {
+                    // Use synthetic "__entry" label for entry block
+                    self.previous_block = Some(self.current_block.clone()
+                        .unwrap_or_else(|| Label::from("__entry".to_string())));
+                    self.current_block = Some(if take_true {
                         true_target.clone()
                     } else {
                         false_target.clone()
@@ -204,31 +255,14 @@ impl<'a> TracingInterpreter<'a> {
             }
             // Abstract boolean -> need to make a choice
             Value::UnknownBool => {
-                // 2 options: true (0) or false (1)
                 let choice = self.path.record_choice(2, self.choice_position);
                 self.choice_position += 1;
                 let take_true = choice == 0;
                 Ok((take_true, true))
             }
-            // Vector of bools -> need to make a choice about which branch
-            Value::Bool(MaybeVector::Vector(bools)) => {
-                // Check if all same
-                let has_true = bools.iter().any(|b| *b);
-                let has_false = bools.iter().any(|b| !*b);
-
-                if has_true && has_false {
-                    // Mixed: need to choose
-                    let choice = self.path.record_choice(2, self.choice_position);
-                    self.choice_position += 1;
-                    let take_true = choice == 0;
-                    Ok((take_true, true))
-                } else if has_true {
-                    // All true
-                    Ok((true, false))
-                } else {
-                    // All false
-                    Ok((false, false))
-                }
+            // Vector of bools - shouldn't happen in scalar tracing
+            Value::Bool(MaybeVector::Vector(_)) => {
+                Err(anyhow!("Vector bool in scalar tracing - state should be scalar"))
             }
             Value::NilPointer(_) => {
                 Err(anyhow!("Nil pointer in condition"))
@@ -237,59 +271,271 @@ impl<'a> TracingInterpreter<'a> {
     }
 
     /// Interpret a single instruction.
+    /// Returns Ok(true) if the CFG changed (we switched to a callee's CFG) and
+    /// the main loop should restart immediately. Returns Ok(false) to continue normally.
     fn interpret_instruction(
         &mut self,
-        state: State,
-        local_id: crate::ir::LocalId,
+        local_id: LocalId,
         instruction: &Instruction,
-    ) -> Result<State> {
+    ) -> Result<bool> {
         match instruction {
-            Instruction::Call { .. } => {
-                // For calls, use the existing interpreter but split vectorized results
-                let interpreter = CoreInterpreter::new(state, self.fixed_env);
-                let result_states = interpreter.interpret_call_instruction(local_id, instruction)?;
-
-                if result_states.is_empty() {
-                    return Err(anyhow!("Call returned no states"));
-                }
-
-                // Split any vectorized states into individual concrete states
-                let mut all_concrete_states: Vec<State> = Vec::new();
-                for result_state in result_states {
-                    all_concrete_states.extend(split_vectorized_state(result_state));
-                }
-
-                // Now choose one concrete state based on path counter
-                if all_concrete_states.len() == 1 {
-                    Ok(all_concrete_states.into_iter().next().unwrap())
+            Instruction::Call { closure, args } => {
+                return self.interpret_call(local_id, *closure, args);
+            }
+            Instruction::Alloc => {
+                let heap_id = self.state.heap.alloc();
+                self.state.local_env.set(local_id, Value::Pointer(heap_id));
+            }
+            Instruction::GetGlobal { name, create_if_missing } => {
+                let heap_id = self.state.global_env.get(name);
+                if let Some(&heap_id) = heap_id {
+                    self.state.local_env.set(local_id, Value::Pointer(heap_id));
+                } else if *create_if_missing {
+                    let heap_id = self.state.heap.alloc();
+                    self.state.global_env.insert(name.clone(), heap_id);
+                    self.state.local_env.set(local_id, Value::Pointer(heap_id));
                 } else {
-                    // Multiple states: need to choose
-                    let choice = self.path.record_choice(all_concrete_states.len(), self.choice_position);
-                    self.choice_position += 1;
-                    self.forced_choices += 1;
-                    Ok(all_concrete_states.into_iter().nth(choice).unwrap())
+                    self.state.local_env.set(local_id, Value::NilPointer(format!("global {}", name)));
                 }
             }
-            _ => {
-                // Non-call instructions: use existing interpreter
-                let mut interpreter = CoreInterpreter::new(state, self.fixed_env);
-                interpreter.interpret_non_call_instruction(local_id, instruction)?;
-                let result_state = interpreter.into_state();
-
-                // Split if vectorized (shouldn't happen for non-call, but be safe)
-                if result_state.vector_size > 1 {
-                    let concrete_states = split_vectorized_state(result_state);
-                    if concrete_states.len() == 1 {
-                        Ok(concrete_states.into_iter().next().unwrap())
-                    } else {
-                        let choice = self.path.record_choice(concrete_states.len(), self.choice_position);
-                        self.choice_position += 1;
-                        self.forced_choices += 1;
-                        Ok(concrete_states.into_iter().nth(choice).unwrap())
+            Instruction::Load { source } => {
+                let value = match self.state.local_env.get(*source) {
+                    Value::Pointer(heap_id) => match self.state.heap.get(*heap_id) {
+                        HeapValue::Value(value) => value.clone(),
+                        HeapValue::Closure(_, _) | HeapValue::BuiltinFun(_) => {
+                            Value::Pointer(*heap_id)
+                        }
+                        HeapValue::ObjectTable(_)
+                        | HeapValue::ArrayTable(_)
+                        | HeapValue::UnknownTable => Value::Pointer(*heap_id),
+                    },
+                    Value::NilPointer(hint) => {
+                        Value::Nil(Some(format!("nil pointer to {}", hint)))
                     }
+                    value => return Err(anyhow!("Load from non-pointer: {:?}", value)),
+                };
+                self.state.local_env.set(local_id, value);
+            }
+            Instruction::Store { target, source } => {
+                let heap_id = self.get_heap_id(*target)?;
+                let source_value = self.state.local_env.get(*source).clone();
+                self.state.heap.set(heap_id, HeapValue::Value(source_value));
+            }
+            Instruction::StoreEmptyTable { target } => {
+                let heap_id = self.get_heap_id(*target)?;
+                self.state.heap.set(heap_id, HeapValue::UnknownTable);
+            }
+            Instruction::StoreClosure { target, fun_def, captures } => {
+                let heap_id = self.get_heap_id(*target)?;
+                let captured_values: Vec<Value> = captures
+                    .iter()
+                    .map(|id| self.state.local_env.get(*id).clone())
+                    .collect();
+                self.state.heap.set(heap_id, HeapValue::Closure(fun_def.clone(), captured_values));
+            }
+            Instruction::GetField { receiver, field, create_if_missing } => {
+                let table_heap_id = self.get_heap_id(*receiver)?;
+                let field_heap_id = match self.state.heap.get(table_heap_id) {
+                    HeapValue::ObjectTable(fields) => fields.get(field).copied(),
+                    HeapValue::UnknownTable => None,
+                    _ => return Err(anyhow!("GetField on non-object")),
+                };
+                if let Some(field_heap_id) = field_heap_id {
+                    self.state.local_env.set(local_id, Value::Pointer(field_heap_id));
+                } else if *create_if_missing {
+                    let field_heap_id = self.state.heap.alloc();
+                    self.state.heap.set(field_heap_id, HeapValue::Value(Value::Nil(None)));
+                    let field_clone = field.clone();
+                    let hv = self.state.heap.get_mut(table_heap_id);
+                    match hv {
+                        HeapValue::ObjectTable(fields) => {
+                            fields.insert(field_clone, field_heap_id);
+                        }
+                        HeapValue::UnknownTable => {
+                            let mut fields = HashMap::new();
+                            fields.insert(field_clone, field_heap_id);
+                            *hv = HeapValue::ObjectTable(fields);
+                        }
+                        _ => {}
+                    }
+                    self.state.local_env.set(local_id, Value::Pointer(field_heap_id));
                 } else {
-                    Ok(result_state)
+                    self.state.local_env.set(local_id, Value::NilPointer(format!("field {}", field)));
                 }
+            }
+            Instruction::GetIndex { receiver, index, create_if_missing } => {
+                let table_heap_id = self.get_heap_id(*receiver)?;
+                let index_val = match self.state.local_env.get(*index) {
+                    Value::Number(MaybeVector::Scalar(n)) => n.as_i16()
+                        .ok_or_else(|| anyhow!("Index is not an integer"))?,
+                    _ => return Err(anyhow!("Index is not a scalar number")),
+                };
+                if index_val < 1 {
+                    return Err(anyhow!("Index {} is less than 1", index_val));
+                }
+                let field_heap_id = match self.state.heap.get(table_heap_id) {
+                    HeapValue::ArrayTable(items) => items.get(index_val as usize - 1).copied(),
+                    HeapValue::UnknownTable => None,
+                    _ => return Err(anyhow!("GetIndex on non-array")),
+                };
+                if let Some(field_heap_id) = field_heap_id {
+                    self.state.local_env.set(local_id, Value::Pointer(field_heap_id));
+                } else if *create_if_missing {
+                    let field_heap_id = self.state.heap.alloc();
+                    self.state.heap.set(field_heap_id, HeapValue::Value(Value::Nil(None)));
+                    let hv = self.state.heap.get_mut(table_heap_id);
+                    match hv {
+                        HeapValue::ArrayTable(items) => {
+                            if index_val as usize == items.len() + 1 {
+                                items.push(field_heap_id);
+                            }
+                        }
+                        HeapValue::UnknownTable => {
+                            if index_val == 1 {
+                                *hv = HeapValue::ArrayTable(vec![field_heap_id]);
+                            }
+                        }
+                        _ => {}
+                    }
+                    self.state.local_env.set(local_id, Value::Pointer(field_heap_id));
+                } else {
+                    self.state.local_env.set(local_id, Value::NilPointer(format!("index {}", index_val)));
+                }
+            }
+            Instruction::NumberConstant { value } => {
+                self.state.local_env.set(local_id, Value::Number(MaybeVector::Scalar(*value)));
+            }
+            Instruction::BoolConstant { value } => {
+                self.state.local_env.set(local_id, Value::Bool(MaybeVector::Scalar(*value)));
+            }
+            Instruction::StringConstant { value } => {
+                self.state.local_env.set(local_id, Value::String(value.clone()));
+            }
+            Instruction::NilConstant => {
+                self.state.local_env.set(local_id, Value::Nil(None));
+            }
+            Instruction::UnaryOp { op, arg } => {
+                let arg_val = self.state.local_env.get(*arg);
+                let result = crate::interpreter::op::interpret_unary_op(&self.state, *op, arg_val)?;
+                self.state.local_env.set(local_id, result);
+            }
+            Instruction::BinaryOp { left, op, right } => {
+                let left_val = self.state.local_env.get(*left);
+                let right_val = self.state.local_env.get(*right);
+                let result = crate::interpreter::op::interpret_binary_op(left_val, *op, right_val)?;
+                self.state.local_env.set(local_id, result);
+            }
+            Instruction::Phi { .. } => {
+                return Err(anyhow!("Phi nodes should not appear in tracing"));
+            }
+        }
+        Ok(false)
+    }
+
+    /// Get HeapId from a pointer local
+    fn get_heap_id(&self, local_id: LocalId) -> Result<HeapId> {
+        match self.state.local_env.get(local_id) {
+            Value::Pointer(heap_id) => Ok(*heap_id),
+            Value::NilPointer(hint) => Err(anyhow!("Nil pointer: {}", hint)),
+            value => Err(anyhow!("Expected pointer, got {:?}", value)),
+        }
+    }
+
+    /// Interpret a call instruction.
+    /// Returns Ok(true) if we switched to a callee's CFG (closure call).
+    /// Returns Ok(false) if we handled the call inline (builtin).
+    fn interpret_call(
+        &mut self,
+        return_local_id: LocalId,
+        closure_local_id: LocalId,
+        arg_local_ids: &[LocalId],
+    ) -> Result<bool> {
+        // Get the closure value
+        let closure_heap_id = match self.state.local_env.get(closure_local_id) {
+            Value::Pointer(heap_id) => *heap_id,
+            Value::NilPointer(hint) => return Err(anyhow!("Call on nil: {}", hint)),
+            value => return Err(anyhow!("Call on non-pointer: {:?}", value)),
+        };
+
+        let heap_value = self.state.heap.get(closure_heap_id).clone();
+
+        // Gather argument values
+        let arg_values: Vec<Value> = arg_local_ids
+            .iter()
+            .map(|id| self.state.local_env.get(*id).clone())
+            .collect();
+
+        match heap_value {
+            HeapValue::BuiltinFun(name) => {
+                // Call builtin directly
+                let builtin_fn = self.fixed_env.builtin_funs.get(&name)
+                    .ok_or_else(|| anyhow!("Unknown builtin: {}", name))?;
+
+                // Builtins can return multiple states - we need to choose one
+                let results = builtin_fn(self.state.clone(), arg_values)?;
+
+                if results.is_empty() {
+                    return Err(anyhow!("Builtin {} returned no states", name));
+                }
+
+                if results.len() == 1 {
+                    let (new_state, return_value) = results.into_iter().next().unwrap();
+                    self.state = new_state;
+                    self.state.local_env.set(return_local_id, return_value);
+                } else {
+                    // Multiple results - use path counter to choose
+                    let choice = self.path.record_choice(results.len(), self.choice_position);
+                    self.choice_position += 1;
+                    self.forced_choices += 1;
+
+                    let (new_state, return_value) = results.into_iter().nth(choice).unwrap();
+                    self.state = new_state;
+                    self.state.local_env.set(return_local_id, return_value);
+                }
+                return Ok(false); // Builtin handled inline, continue normally
+            }
+            HeapValue::Closure(fun_def_name, captured_values) => {
+                // Look up the function definition
+                let (fun_def, prepared_cfg) = self.fixed_env.fun_defs.get(&fun_def_name)
+                    .ok_or_else(|| anyhow!("Unknown function: {:?}", fun_def_name))?;
+
+                // Save current frame
+                let caller_frame = CallFrame {
+                    cfg: self.current_cfg.clone().expect("current_cfg should be set"),
+                    current_block: self.current_block.clone(),
+                    previous_block: self.previous_block.clone(),
+                    instruction_index: 0, // Will be updated by interpret() after this returns
+                    return_local_id,
+                    caller_local_env: self.state.local_env.clone(),
+                };
+                self.call_stack.push(caller_frame);
+
+                // Set up callee's local_env
+                let mut new_local_env = LocalEnv::new();
+
+                // Set up captured values
+                for (capture_id, value) in fun_def.capture_ids.iter().zip(captured_values.iter()) {
+                    new_local_env.set(*capture_id, value.clone());
+                }
+
+                // Set up argument values
+                for (i, arg_id) in fun_def.arg_ids.iter().enumerate() {
+                    if let Some(arg_id) = arg_id {
+                        let value = arg_values.get(i).cloned()
+                            .unwrap_or(Value::Nil(Some("missing argument".to_string())));
+                        new_local_env.set(*arg_id, value);
+                    }
+                }
+
+                // Switch to callee's context
+                self.state.local_env = new_local_env;
+                self.current_cfg = Some(prepared_cfg.cfg.clone());
+                self.current_block = None; // Start at entry block
+                self.previous_block = None; // Entry block has no predecessor
+                return Ok(true); // CFG changed, restart main loop
+            }
+            _ => {
+                return Err(anyhow!("Call on non-callable: {:?}", heap_value));
             }
         }
     }
@@ -297,8 +543,5 @@ impl<'a> TracingInterpreter<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    // Basic tests would go here
-    // For now, we'll test through integration tests
+    // Integration tests via trace_test binary
 }

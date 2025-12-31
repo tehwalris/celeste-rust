@@ -5,7 +5,7 @@ pub mod glue;
 pub mod heap;
 pub mod inspect;
 pub mod local_env;
-mod op;
+pub mod op;
 pub mod profiling;
 pub mod state;
 pub mod symbolic;
