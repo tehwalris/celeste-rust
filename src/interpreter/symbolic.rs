@@ -234,6 +234,628 @@ impl SymbolGenerator {
     }
 }
 
+/// Substitution map for evaluating symbolic expressions.
+pub type Substitution = std::collections::HashMap<SymbolId, ConcreteValue>;
+
+/// Evaluate a symbolic expression with a substitution map.
+/// Returns the concrete value resulting from the evaluation.
+pub fn evaluate_sym_expr(expr: &SymExpr, subst: &Substitution) -> ConcreteValue {
+    match expr {
+        SymExpr::Input(sym_id) => {
+            subst.get(sym_id).cloned().unwrap_or(ConcreteValue::Nil)
+        }
+        SymExpr::Const(value) => value.clone(),
+
+        // Arithmetic operations
+        SymExpr::Add(left, right) => {
+            let l = evaluate_sym_expr(left, subst);
+            let r = evaluate_sym_expr(right, subst);
+            eval_add(l, r)
+        }
+        SymExpr::Sub(left, right) => {
+            let l = evaluate_sym_expr(left, subst);
+            let r = evaluate_sym_expr(right, subst);
+            eval_sub(l, r)
+        }
+        SymExpr::Mul(left, right) => {
+            let l = evaluate_sym_expr(left, subst);
+            let r = evaluate_sym_expr(right, subst);
+            eval_mul(l, r)
+        }
+        SymExpr::Div(left, right) => {
+            let l = evaluate_sym_expr(left, subst);
+            let r = evaluate_sym_expr(right, subst);
+            eval_div(l, r)
+        }
+        SymExpr::Mod(left, right) => {
+            let l = evaluate_sym_expr(left, subst);
+            let r = evaluate_sym_expr(right, subst);
+            eval_mod(l, r)
+        }
+        SymExpr::Neg(arg) => {
+            let a = evaluate_sym_expr(arg, subst);
+            eval_neg(a)
+        }
+        SymExpr::Flr(arg) => {
+            let a = evaluate_sym_expr(arg, subst);
+            eval_flr(a)
+        }
+
+        // Comparison operations
+        SymExpr::Lt(left, right) => {
+            let l = evaluate_sym_expr(left, subst);
+            let r = evaluate_sym_expr(right, subst);
+            eval_lt(l, r)
+        }
+        SymExpr::Le(left, right) => {
+            let l = evaluate_sym_expr(left, subst);
+            let r = evaluate_sym_expr(right, subst);
+            eval_le(l, r)
+        }
+        SymExpr::Gt(left, right) => {
+            let l = evaluate_sym_expr(left, subst);
+            let r = evaluate_sym_expr(right, subst);
+            eval_gt(l, r)
+        }
+        SymExpr::Ge(left, right) => {
+            let l = evaluate_sym_expr(left, subst);
+            let r = evaluate_sym_expr(right, subst);
+            eval_ge(l, r)
+        }
+        SymExpr::Eq(left, right) => {
+            let l = evaluate_sym_expr(left, subst);
+            let r = evaluate_sym_expr(right, subst);
+            eval_eq(l, r)
+        }
+        SymExpr::Ne(left, right) => {
+            let l = evaluate_sym_expr(left, subst);
+            let r = evaluate_sym_expr(right, subst);
+            eval_ne(l, r)
+        }
+
+        // Boolean operations
+        SymExpr::And(left, right) => {
+            let l = evaluate_sym_expr(left, subst);
+            let r = evaluate_sym_expr(right, subst);
+            eval_and(l, r)
+        }
+        SymExpr::Or(left, right) => {
+            let l = evaluate_sym_expr(left, subst);
+            let r = evaluate_sym_expr(right, subst);
+            eval_or(l, r)
+        }
+        SymExpr::Not(arg) => {
+            let a = evaluate_sym_expr(arg, subst);
+            eval_not(a)
+        }
+
+        // Bitwise operations
+        SymExpr::Band(left, right) => {
+            let l = evaluate_sym_expr(left, subst);
+            let r = evaluate_sym_expr(right, subst);
+            eval_band(l, r)
+        }
+        SymExpr::Bor(left, right) => {
+            let l = evaluate_sym_expr(left, subst);
+            let r = evaluate_sym_expr(right, subst);
+            eval_bor(l, r)
+        }
+        SymExpr::Bxor(left, right) => {
+            let l = evaluate_sym_expr(left, subst);
+            let r = evaluate_sym_expr(right, subst);
+            eval_bxor(l, r)
+        }
+        SymExpr::Bnot(arg) => {
+            let a = evaluate_sym_expr(arg, subst);
+            eval_bnot(a)
+        }
+        SymExpr::Shl(left, right) => {
+            let l = evaluate_sym_expr(left, subst);
+            let r = evaluate_sym_expr(right, subst);
+            eval_shl(l, r)
+        }
+        SymExpr::Shr(left, right) => {
+            let l = evaluate_sym_expr(left, subst);
+            let r = evaluate_sym_expr(right, subst);
+            eval_shr(l, r)
+        }
+        SymExpr::Lshr(left, right) => {
+            let l = evaluate_sym_expr(left, subst);
+            let r = evaluate_sym_expr(right, subst);
+            eval_lshr(l, r)
+        }
+        SymExpr::Rotl(left, right) => {
+            let l = evaluate_sym_expr(left, subst);
+            let r = evaluate_sym_expr(right, subst);
+            eval_rotl(l, r)
+        }
+        SymExpr::Rotr(left, right) => {
+            let l = evaluate_sym_expr(left, subst);
+            let r = evaluate_sym_expr(right, subst);
+            eval_rotr(l, r)
+        }
+
+        // Math functions
+        SymExpr::Abs(arg) => {
+            let a = evaluate_sym_expr(arg, subst);
+            eval_abs(a)
+        }
+        SymExpr::Sgn(arg) => {
+            let a = evaluate_sym_expr(arg, subst);
+            eval_sgn(a)
+        }
+        SymExpr::Min(left, right) => {
+            let l = evaluate_sym_expr(left, subst);
+            let r = evaluate_sym_expr(right, subst);
+            eval_min(l, r)
+        }
+        SymExpr::Max(left, right) => {
+            let l = evaluate_sym_expr(left, subst);
+            let r = evaluate_sym_expr(right, subst);
+            eval_max(l, r)
+        }
+        SymExpr::Mid(a, b, c) => {
+            let av = evaluate_sym_expr(a, subst);
+            let bv = evaluate_sym_expr(b, subst);
+            let cv = evaluate_sym_expr(c, subst);
+            eval_mid(av, bv, cv)
+        }
+        SymExpr::Sin(arg) => {
+            let a = evaluate_sym_expr(arg, subst);
+            eval_sin(a)
+        }
+        SymExpr::Cos(arg) => {
+            let a = evaluate_sym_expr(arg, subst);
+            eval_cos(a)
+        }
+        SymExpr::Atan2(left, right) => {
+            let l = evaluate_sym_expr(left, subst);
+            let r = evaluate_sym_expr(right, subst);
+            eval_atan2(l, r)
+        }
+        SymExpr::Sqrt(arg) => {
+            let a = evaluate_sym_expr(arg, subst);
+            eval_sqrt(a)
+        }
+        SymExpr::Rnd(arg) => {
+            // Random - just return the argument for deterministic behavior
+            evaluate_sym_expr(arg, subst)
+        }
+
+        // String operations
+        SymExpr::Sub8(s, start, len) => {
+            let sv = evaluate_sym_expr(s, subst);
+            let startv = evaluate_sym_expr(start, subst);
+            let lenv = evaluate_sym_expr(len, subst);
+            eval_sub8(sv, startv, lenv)
+        }
+        SymExpr::Concat(left, right) => {
+            let l = evaluate_sym_expr(left, subst);
+            let r = evaluate_sym_expr(right, subst);
+            eval_concat(l, r)
+        }
+
+        // Type conversions
+        SymExpr::Tonum(arg) => {
+            let a = evaluate_sym_expr(arg, subst);
+            eval_tonum(a)
+        }
+        SymExpr::Tostr(arg) => {
+            let a = evaluate_sym_expr(arg, subst);
+            eval_tostr(a)
+        }
+        SymExpr::Chr(arg) => {
+            let a = evaluate_sym_expr(arg, subst);
+            eval_chr(a)
+        }
+        SymExpr::Ord(arg) => {
+            let a = evaluate_sym_expr(arg, subst);
+            eval_ord(a)
+        }
+
+        // Conditional
+        SymExpr::IfThenElse(cond, then_expr, else_expr) => {
+            let c = evaluate_sym_expr(cond, subst);
+            if is_truthy(&c) {
+                evaluate_sym_expr(then_expr, subst)
+            } else {
+                evaluate_sym_expr(else_expr, subst)
+            }
+        }
+
+        // Interval operations
+        SymExpr::IntervalLow(arg) => {
+            let a = evaluate_sym_expr(arg, subst);
+            eval_interval_low(a)
+        }
+        SymExpr::IntervalHigh(arg) => {
+            let a = evaluate_sym_expr(arg, subst);
+            eval_interval_high(a)
+        }
+        SymExpr::MakeInterval(low, high) => {
+            let l = evaluate_sym_expr(low, subst);
+            let h = evaluate_sym_expr(high, subst);
+            eval_make_interval(l, h)
+        }
+    }
+}
+
+// Helper evaluation functions
+fn is_truthy(v: &ConcreteValue) -> bool {
+    match v {
+        ConcreteValue::Nil => false,
+        ConcreteValue::Bool(b) => *b,
+        _ => true,
+    }
+}
+
+fn get_num(v: &ConcreteValue) -> Option<Pico8Num> {
+    match v {
+        ConcreteValue::Number(n) => Some(*n),
+        _ => None,
+    }
+}
+
+fn eval_add(l: ConcreteValue, r: ConcreteValue) -> ConcreteValue {
+    match (get_num(&l), get_num(&r)) {
+        (Some(a), Some(b)) => ConcreteValue::Number(a + b),
+        _ => ConcreteValue::Nil,
+    }
+}
+
+fn eval_sub(l: ConcreteValue, r: ConcreteValue) -> ConcreteValue {
+    match (get_num(&l), get_num(&r)) {
+        (Some(a), Some(b)) => ConcreteValue::Number(a - b),
+        _ => ConcreteValue::Nil,
+    }
+}
+
+fn eval_mul(l: ConcreteValue, r: ConcreteValue) -> ConcreteValue {
+    match (get_num(&l), get_num(&r)) {
+        (Some(a), Some(b)) => ConcreteValue::Number(a * b),
+        _ => ConcreteValue::Nil,
+    }
+}
+
+fn eval_div(l: ConcreteValue, r: ConcreteValue) -> ConcreteValue {
+    match (get_num(&l), get_num(&r)) {
+        (Some(a), Some(b)) => ConcreteValue::Number(a / b),
+        _ => ConcreteValue::Nil,
+    }
+}
+
+fn eval_mod(l: ConcreteValue, r: ConcreteValue) -> ConcreteValue {
+    match (get_num(&l), get_num(&r)) {
+        (Some(a), Some(b)) => ConcreteValue::Number(a % b),
+        _ => ConcreteValue::Nil,
+    }
+}
+
+fn eval_neg(a: ConcreteValue) -> ConcreteValue {
+    match get_num(&a) {
+        Some(n) => ConcreteValue::Number(-n),
+        _ => ConcreteValue::Nil,
+    }
+}
+
+fn eval_flr(a: ConcreteValue) -> ConcreteValue {
+    match get_num(&a) {
+        Some(n) => ConcreteValue::Number(n.flr()),
+        _ => ConcreteValue::Nil,
+    }
+}
+
+fn eval_lt(l: ConcreteValue, r: ConcreteValue) -> ConcreteValue {
+    match (get_num(&l), get_num(&r)) {
+        (Some(a), Some(b)) => ConcreteValue::Bool(a < b),
+        _ => ConcreteValue::Bool(false),
+    }
+}
+
+fn eval_le(l: ConcreteValue, r: ConcreteValue) -> ConcreteValue {
+    match (get_num(&l), get_num(&r)) {
+        (Some(a), Some(b)) => ConcreteValue::Bool(a <= b),
+        _ => ConcreteValue::Bool(false),
+    }
+}
+
+fn eval_gt(l: ConcreteValue, r: ConcreteValue) -> ConcreteValue {
+    match (get_num(&l), get_num(&r)) {
+        (Some(a), Some(b)) => ConcreteValue::Bool(a > b),
+        _ => ConcreteValue::Bool(false),
+    }
+}
+
+fn eval_ge(l: ConcreteValue, r: ConcreteValue) -> ConcreteValue {
+    match (get_num(&l), get_num(&r)) {
+        (Some(a), Some(b)) => ConcreteValue::Bool(a >= b),
+        _ => ConcreteValue::Bool(false),
+    }
+}
+
+fn eval_eq(l: ConcreteValue, r: ConcreteValue) -> ConcreteValue {
+    ConcreteValue::Bool(l == r)
+}
+
+fn eval_ne(l: ConcreteValue, r: ConcreteValue) -> ConcreteValue {
+    ConcreteValue::Bool(l != r)
+}
+
+fn eval_and(l: ConcreteValue, r: ConcreteValue) -> ConcreteValue {
+    if is_truthy(&l) { r } else { l }
+}
+
+fn eval_or(l: ConcreteValue, r: ConcreteValue) -> ConcreteValue {
+    if is_truthy(&l) { l } else { r }
+}
+
+fn eval_not(a: ConcreteValue) -> ConcreteValue {
+    ConcreteValue::Bool(!is_truthy(&a))
+}
+
+fn eval_band(l: ConcreteValue, r: ConcreteValue) -> ConcreteValue {
+    match (&l, &r) {
+        (ConcreteValue::Number(a), ConcreteValue::Number(b)) => {
+            // Bitwise AND on raw i32 values
+            ConcreteValue::Number(Pico8Num::from_raw(a.as_raw_i32() & b.as_raw_i32()))
+        }
+        _ => ConcreteValue::Nil,
+    }
+}
+
+fn eval_bor(l: ConcreteValue, r: ConcreteValue) -> ConcreteValue {
+    match (&l, &r) {
+        (ConcreteValue::Number(a), ConcreteValue::Number(b)) => {
+            ConcreteValue::Number(Pico8Num::from_raw(a.as_raw_i32() | b.as_raw_i32()))
+        }
+        _ => ConcreteValue::Nil,
+    }
+}
+
+fn eval_bxor(l: ConcreteValue, r: ConcreteValue) -> ConcreteValue {
+    match (&l, &r) {
+        (ConcreteValue::Number(a), ConcreteValue::Number(b)) => {
+            ConcreteValue::Number(Pico8Num::from_raw(a.as_raw_i32() ^ b.as_raw_i32()))
+        }
+        _ => ConcreteValue::Nil,
+    }
+}
+
+fn eval_bnot(a: ConcreteValue) -> ConcreteValue {
+    match &a {
+        ConcreteValue::Number(n) => {
+            ConcreteValue::Number(Pico8Num::from_raw(!n.as_raw_i32()))
+        }
+        _ => ConcreteValue::Nil,
+    }
+}
+
+fn eval_shl(l: ConcreteValue, r: ConcreteValue) -> ConcreteValue {
+    match (&l, &r) {
+        (ConcreteValue::Number(a), ConcreteValue::Number(b)) => {
+            if let Some(shift) = b.as_i16() {
+                let shift = shift.clamp(0, 31) as u32;
+                ConcreteValue::Number(Pico8Num::from_raw(a.as_raw_i32() << shift))
+            } else {
+                ConcreteValue::Nil
+            }
+        }
+        _ => ConcreteValue::Nil,
+    }
+}
+
+fn eval_shr(l: ConcreteValue, r: ConcreteValue) -> ConcreteValue {
+    match (&l, &r) {
+        (ConcreteValue::Number(a), ConcreteValue::Number(b)) => {
+            if let Some(shift) = b.as_i16() {
+                let shift = shift.clamp(0, 31) as u32;
+                ConcreteValue::Number(Pico8Num::from_raw(a.as_raw_i32() >> shift))
+            } else {
+                ConcreteValue::Nil
+            }
+        }
+        _ => ConcreteValue::Nil,
+    }
+}
+
+fn eval_lshr(l: ConcreteValue, r: ConcreteValue) -> ConcreteValue {
+    match (&l, &r) {
+        (ConcreteValue::Number(a), ConcreteValue::Number(b)) => {
+            if let Some(shift) = b.as_i16() {
+                let shift = shift.clamp(0, 31) as u32;
+                ConcreteValue::Number(Pico8Num::from_raw((a.as_raw_u32() >> shift) as i32))
+            } else {
+                ConcreteValue::Nil
+            }
+        }
+        _ => ConcreteValue::Nil,
+    }
+}
+
+fn eval_rotl(l: ConcreteValue, r: ConcreteValue) -> ConcreteValue {
+    match (&l, &r) {
+        (ConcreteValue::Number(a), ConcreteValue::Number(b)) => {
+            if let Some(shift) = b.as_i16() {
+                let shift = (shift as u32) % 32;
+                let v = a.as_raw_u32();
+                ConcreteValue::Number(Pico8Num::from_raw((v.rotate_left(shift)) as i32))
+            } else {
+                ConcreteValue::Nil
+            }
+        }
+        _ => ConcreteValue::Nil,
+    }
+}
+
+fn eval_rotr(l: ConcreteValue, r: ConcreteValue) -> ConcreteValue {
+    match (&l, &r) {
+        (ConcreteValue::Number(a), ConcreteValue::Number(b)) => {
+            if let Some(shift) = b.as_i16() {
+                let shift = (shift as u32) % 32;
+                let v = a.as_raw_u32();
+                ConcreteValue::Number(Pico8Num::from_raw((v.rotate_right(shift)) as i32))
+            } else {
+                ConcreteValue::Nil
+            }
+        }
+        _ => ConcreteValue::Nil,
+    }
+}
+
+fn eval_abs(a: ConcreteValue) -> ConcreteValue {
+    match get_num(&a) {
+        Some(n) => ConcreteValue::Number(n.abs()),
+        _ => ConcreteValue::Nil,
+    }
+}
+
+fn eval_sgn(a: ConcreteValue) -> ConcreteValue {
+    match get_num(&a) {
+        Some(n) => ConcreteValue::Number(n.sgn()),
+        _ => ConcreteValue::Nil,
+    }
+}
+
+fn eval_min(l: ConcreteValue, r: ConcreteValue) -> ConcreteValue {
+    match (get_num(&l), get_num(&r)) {
+        (Some(a), Some(b)) => ConcreteValue::Number(a.min(b)),
+        _ => ConcreteValue::Nil,
+    }
+}
+
+fn eval_max(l: ConcreteValue, r: ConcreteValue) -> ConcreteValue {
+    match (get_num(&l), get_num(&r)) {
+        (Some(a), Some(b)) => ConcreteValue::Number(a.max(b)),
+        _ => ConcreteValue::Nil,
+    }
+}
+
+fn eval_mid(a: ConcreteValue, b: ConcreteValue, c: ConcreteValue) -> ConcreteValue {
+    match (get_num(&a), get_num(&b), get_num(&c)) {
+        (Some(x), Some(y), Some(z)) => ConcreteValue::Number(x.mid(y, z)),
+        _ => ConcreteValue::Nil,
+    }
+}
+
+fn eval_sin(a: ConcreteValue) -> ConcreteValue {
+    match get_num(&a) {
+        Some(n) => ConcreteValue::Number(n.sin()),
+        _ => ConcreteValue::Nil,
+    }
+}
+
+fn eval_cos(a: ConcreteValue) -> ConcreteValue {
+    match get_num(&a) {
+        Some(n) => ConcreteValue::Number(n.cos()),
+        _ => ConcreteValue::Nil,
+    }
+}
+
+fn eval_atan2(l: ConcreteValue, r: ConcreteValue) -> ConcreteValue {
+    match (get_num(&l), get_num(&r)) {
+        (Some(a), Some(b)) => ConcreteValue::Number(a.atan2(b)),
+        _ => ConcreteValue::Nil,
+    }
+}
+
+fn eval_sqrt(a: ConcreteValue) -> ConcreteValue {
+    match get_num(&a) {
+        Some(n) => ConcreteValue::Number(n.sqrt()),
+        _ => ConcreteValue::Nil,
+    }
+}
+
+fn eval_sub8(_s: ConcreteValue, _start: ConcreteValue, _len: ConcreteValue) -> ConcreteValue {
+    // String substring - simplified for now
+    ConcreteValue::String(Arc::new(String::new()))
+}
+
+fn eval_concat(l: ConcreteValue, r: ConcreteValue) -> ConcreteValue {
+    match (l, r) {
+        (ConcreteValue::String(a), ConcreteValue::String(b)) => {
+            ConcreteValue::String(Arc::new(format!("{}{}", a, b)))
+        }
+        _ => ConcreteValue::String(Arc::new(String::new())),
+    }
+}
+
+fn eval_tonum(a: ConcreteValue) -> ConcreteValue {
+    match a {
+        ConcreteValue::Number(n) => ConcreteValue::Number(n),
+        ConcreteValue::String(s) => {
+            if let Ok(n) = s.parse::<f64>() {
+                ConcreteValue::Number(Pico8Num::from_f64(n))
+            } else {
+                ConcreteValue::Nil
+            }
+        }
+        _ => ConcreteValue::Nil,
+    }
+}
+
+fn eval_tostr(a: ConcreteValue) -> ConcreteValue {
+    match a {
+        ConcreteValue::Number(n) => ConcreteValue::String(Arc::new(format!("{}", n.to_f64()))),
+        ConcreteValue::String(s) => ConcreteValue::String(s),
+        ConcreteValue::Bool(b) => ConcreteValue::String(Arc::new(if b { "true" } else { "false" }.to_string())),
+        ConcreteValue::Nil => ConcreteValue::String(Arc::new("nil".to_string())),
+        _ => ConcreteValue::String(Arc::new(String::new())),
+    }
+}
+
+fn eval_chr(a: ConcreteValue) -> ConcreteValue {
+    match get_num(&a) {
+        Some(n) => {
+            if let Some(i) = n.as_i16() {
+                if i >= 0 && i <= 127 {
+                    ConcreteValue::String(Arc::new((i as u8 as char).to_string()))
+                } else {
+                    ConcreteValue::String(Arc::new(String::new()))
+                }
+            } else {
+                ConcreteValue::String(Arc::new(String::new()))
+            }
+        }
+        _ => ConcreteValue::String(Arc::new(String::new())),
+    }
+}
+
+fn eval_ord(a: ConcreteValue) -> ConcreteValue {
+    match a {
+        ConcreteValue::String(s) => {
+            if let Some(c) = s.chars().next() {
+                ConcreteValue::Number(Pico8Num::from_i16(c as i16))
+            } else {
+                ConcreteValue::Nil
+            }
+        }
+        _ => ConcreteValue::Nil,
+    }
+}
+
+fn eval_interval_low(a: ConcreteValue) -> ConcreteValue {
+    match a {
+        ConcreteValue::NumberInterval(interval) => ConcreteValue::Number(interval.low),
+        ConcreteValue::Number(n) => ConcreteValue::Number(n),
+        _ => ConcreteValue::Nil,
+    }
+}
+
+fn eval_interval_high(a: ConcreteValue) -> ConcreteValue {
+    match a {
+        ConcreteValue::NumberInterval(interval) => ConcreteValue::Number(interval.high),
+        ConcreteValue::Number(n) => ConcreteValue::Number(n),
+        _ => ConcreteValue::Nil,
+    }
+}
+
+fn eval_make_interval(l: ConcreteValue, h: ConcreteValue) -> ConcreteValue {
+    match (get_num(&l), get_num(&h)) {
+        (Some(low), Some(high)) => ConcreteValue::NumberInterval(Pico8NumInterval { low, high }),
+        _ => ConcreteValue::Nil,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

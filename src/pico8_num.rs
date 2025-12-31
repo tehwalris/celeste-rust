@@ -47,6 +47,14 @@ impl Pico8Num {
         self.0 as u32
     }
 
+    pub const fn as_raw_i32(&self) -> i32 {
+        self.0
+    }
+
+    pub const fn from_raw(raw: i32) -> Self {
+        Self(raw)
+    }
+
     pub fn from_f32(n: f32) -> Self {
         // TODO this is probably not accurate
         if n < 0. {
@@ -80,6 +88,66 @@ impl Pico8Num {
 
     pub const fn next_smallest(self) -> Self {
         Self(self.0 - 1)
+    }
+
+    /// Sign function: returns -1, 0, or 1
+    pub fn sgn(self) -> Self {
+        if self.0 > 0 {
+            Self::from_i16(1)
+        } else if self.0 < 0 {
+            Self::from_i16(-1)
+        } else {
+            Self::from_i16(0)
+        }
+    }
+
+    /// Mid (median) of three values
+    pub fn mid(self, b: Self, c: Self) -> Self {
+        let a = self;
+        if a <= b {
+            if b <= c { b } else if a <= c { c } else { a }
+        } else {
+            if a <= c { a } else if b <= c { c } else { b }
+        }
+    }
+
+    /// Sine function (PICO-8 uses 0-1 range, not 0-2π)
+    pub fn sin(self) -> Self {
+        let radians = self.to_f64() * 2.0 * std::f64::consts::PI;
+        Self::from_f64(-radians.sin())  // PICO-8 sin is inverted
+    }
+
+    /// Cosine function (PICO-8 uses 0-1 range, not 0-2π)
+    pub fn cos(self) -> Self {
+        let radians = self.to_f64() * 2.0 * std::f64::consts::PI;
+        Self::from_f64(radians.cos())
+    }
+
+    /// Atan2 function (returns 0-1 range)
+    pub fn atan2(self, other: Self) -> Self {
+        let dx = other.to_f64();
+        let dy = self.to_f64();
+        let angle = dy.atan2(dx);
+        Self::from_f64(angle / (2.0 * std::f64::consts::PI))
+    }
+
+    /// Square root
+    pub fn sqrt(self) -> Self {
+        if self.0 < 0 {
+            Self::from_i16(0)
+        } else {
+            Self::from_f64(self.to_f64().sqrt())
+        }
+    }
+
+    /// Convert to f64
+    pub fn to_f64(self) -> f64 {
+        (self.0 as f64) / 65536.0
+    }
+
+    /// Convert from f64
+    pub fn from_f64(n: f64) -> Self {
+        Self((n * 65536.0) as i32)
     }
 }
 

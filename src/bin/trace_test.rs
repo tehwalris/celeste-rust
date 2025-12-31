@@ -184,6 +184,8 @@ _draw()
             total_stats.cache_hits += stats.cache_hits;
             total_stats.cache_misses += stats.cache_misses;
             total_stats.forced_choices += stats.forced_choices;
+            total_stats.unique_shape_paths += stats.unique_shape_paths;
+            total_stats.potential_cache_hits += stats.potential_cache_hits;
         }
     }
 
@@ -202,10 +204,11 @@ _draw()
         println!("\nSymbolic tracing stats:");
         println!("  States processed: {}", total_stats.states_processed);
         println!("  New traces: {}", total_stats.new_traces);
-        println!("  Cache hits: {}", total_stats.cache_hits);
-        println!("  Cache misses: {}", total_stats.cache_misses);
+        println!("  Unique (shape,path) pairs: {}", total_stats.unique_shape_paths);
+        println!("  Potential cache hits: {} ({:.1}%)",
+                 total_stats.potential_cache_hits,
+                 100.0 * total_stats.potential_cache_hits as f64 / total_stats.states_processed.max(1) as f64);
         println!("  Cache size: {} traces", cache.len());
-        println!("  {}", cache.stats());
     }
 
     if run_reference && run_symbolic {

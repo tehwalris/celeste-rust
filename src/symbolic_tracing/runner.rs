@@ -8,7 +8,7 @@
 //! Key design: NO VECTORIZATION. Every state has vector_size = 1.
 //! Efficiency comes from cache hits, not from merging states.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use anyhow::Result;
 
 use crate::interpreter::{
@@ -101,6 +101,10 @@ pub struct RunStats {
     pub forced_choices: usize,
     /// Number of output states produced.
     pub output_states: usize,
+    /// Number of unique (shape, path) pairs seen
+    pub unique_shape_paths: usize,
+    /// Number of potential cache hits (same shape+path seen again)
+    pub potential_cache_hits: usize,
 }
 
 /// Pending work item: a state with its exploration counter.
@@ -120,6 +124,9 @@ pub fn run_traced(
 ) -> Result<(Vec<State>, RunStats)> {
     let mut stats = RunStats::default();
     let mut output_states: Vec<State> = Vec::new();
+
+    // Track seen (shape, path) pairs for potential cache hit analysis
+    let mut seen_shape_paths: HashSet<(StateShape, Vec<(usize, usize)>)> = HashSet::new();
 
     // Queue of states to process
     let mut pending: VecDeque<PendingState> = VecDeque::new();
@@ -142,6 +149,15 @@ pub fn run_traced(
     // Process states
     while let Some(pending_state) = pending.pop_front() {
         stats.states_processed += 1;
+
+        // Track potential cache hits
+        let shape_path_key = (pending_state.shape.clone(), pending_state.path.choices().to_vec());
+        if seen_shape_paths.contains(&shape_path_key) {
+            stats.potential_cache_hits += 1;
+        } else {
+            seen_shape_paths.insert(shape_path_key);
+            stats.unique_shape_paths += 1;
+        }
 
         // NOTE: Cache is disabled for now because Phase 1 caching is incorrect.
         // We cache concrete outputs, but different inputs produce different concrete outputs
