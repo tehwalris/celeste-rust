@@ -156,14 +156,4 @@ impl LocalEnv {
     pub fn set_by_raw_id(&mut self, raw_id: usize, value: Value) {
         self.set(LocalId::from(raw_id), value);
     }
-
-    /// Materialize all lazy vectors in this local environment
-    pub fn materialize_lazy_vectors(&mut self) {
-        let data = Arc::make_mut(&mut self.data);
-        for v in data.iter_mut() {
-            if let Some(val) = v {
-                val.materialize_lazy();
-            }
-        }
-    }
 }

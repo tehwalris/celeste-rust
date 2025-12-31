@@ -24,7 +24,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 zstd = "0.13"
 elsa = "1.10"
-rand = "0.9.2"
 
 [[bin]]
 name = "view_frames"

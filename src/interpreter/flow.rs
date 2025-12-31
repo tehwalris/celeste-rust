@@ -278,32 +278,6 @@ impl<'a> BoundInterpreterFlow<'a> {
                         Ok(FlowData::States(vec![new_state]))
                     }
                 }
-                Value::Bool(MaybeVector::LazyVector { data, mask, len }) => {
-                    let condition_target = *condition_from_flow_edge;
-
-                    // Build a mask for lanes matching this condition
-                    // We need to iterate over the masked data (active elements only)
-                    let condition_mask: Vec<bool> = data
-                        .iter()
-                        .zip(mask.iter())
-                        .filter_map(|(v, &m)| if m { Some(*v == condition_target) } else { None })
-                        .collect();
-
-                    debug_assert_eq!(condition_mask.len(), *len);
-
-                    let matching_count = condition_mask.iter().filter(|&&b| b).count();
-
-                    if matching_count == 0 {
-                        Ok(FlowData::States(vec![]))
-                    } else if matching_count == state.vector_size {
-                        // ALL lanes go this direction - no filtering needed
-                        Ok(FlowData::States(vec![state]))
-                    } else {
-                        // Mixed: filter the state immediately
-                        let new_state = state.filter_by_mask(&condition_mask);
-                        Ok(FlowData::States(vec![new_state]))
-                    }
-                }
             },
             Self::Return { return_local_id } => match *return_local_id {
                 Some(return_local_id) => {
@@ -362,7 +336,6 @@ impl<'a> BoundSplitBlockFlow<FlowData> for BoundInterpreterFlow<'a> {
 mod tests {
     use super::*;
     use crate::pico8_num::Pico8Num;
-    use std::sync::Arc;
 
     /// Test immediate filtering with a vectorized bool condition
     #[test]
@@ -376,15 +349,15 @@ mod tests {
         let condition_local_id = LocalId::from(0);
         let data_local_id = LocalId::from(1);
 
-        state.local_env.set(condition_local_id, Value::Bool(MaybeVector::Vector(Arc::new(vec![
+        state.local_env.set(condition_local_id, Value::Bool(MaybeVector::Vector(vec![
             true, false, true, false
-        ]))));
-        state.local_env.set(data_local_id, Value::Number(MaybeVector::Vector(Arc::new(vec![
+        ])));
+        state.local_env.set(data_local_id, Value::Number(MaybeVector::Vector(vec![
             Pico8Num::from_i16(1),
             Pico8Num::from_i16(2),
             Pico8Num::from_i16(3),
             Pico8Num::from_i16(4),
-        ]))));
+        ])));
 
         // Create true branch flow
         let true_branch = BoundInterpreterFlow::BranchConditional {
@@ -413,9 +386,7 @@ mod tests {
         assert_eq!(true_state.vector_size, 2, "True branch should have 2 lanes");
 
         // Vectors should be immediately filtered
-        // Note: May be LazyVector due to filtering optimization
-        let true_data_value = true_state.local_env.get(data_local_id).materialize_if_lazy();
-        match true_data_value {
+        match true_state.local_env.get(data_local_id) {
             Value::Number(MaybeVector::Vector(nums)) => {
                 assert_eq!(nums.len(), 2, "Vector should be filtered to 2 elements");
                 assert_eq!(nums[0], Pico8Num::from_i16(1), "First element");
@@ -436,9 +407,7 @@ mod tests {
         assert_eq!(false_state.vector_size, 2, "False branch should have 2 lanes");
 
         // Vectors should be immediately filtered
-        // Note: May be LazyVector due to filtering optimization
-        let false_data_value = false_state.local_env.get(data_local_id).materialize_if_lazy();
-        match false_data_value {
+        match false_state.local_env.get(data_local_id) {
             Value::Number(MaybeVector::Vector(nums)) => {
                 assert_eq!(nums.len(), 2, "Vector should be filtered to 2 elements");
                 assert_eq!(nums[0], Pico8Num::from_i16(2), "First element");
@@ -460,7 +429,7 @@ mod tests {
 
         let cond_id = LocalId::from(0);
         // All true
-        state.local_env.set(cond_id, Value::Bool(MaybeVector::Vector(Arc::new(vec![true, true, true]))));
+        state.local_env.set(cond_id, Value::Bool(MaybeVector::Vector(vec![true, true, true])));
 
         let branch = BoundInterpreterFlow::BranchConditional {
             condition_local_id: cond_id,
@@ -485,7 +454,7 @@ mod tests {
 
         let cond_id = LocalId::from(0);
         // All true, but we're taking false branch
-        state.local_env.set(cond_id, Value::Bool(MaybeVector::Vector(Arc::new(vec![true, true, true]))));
+        state.local_env.set(cond_id, Value::Bool(MaybeVector::Vector(vec![true, true, true])));
 
         let branch = BoundInterpreterFlow::BranchConditional {
             condition_local_id: cond_id,
