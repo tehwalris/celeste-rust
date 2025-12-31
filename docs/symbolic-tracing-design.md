@@ -1,0 +1,196 @@
+# Symbolic Tracing Design
+
+## Motivation
+
+The current SIMT-style vectorized interpreter has a bottleneck: filtering during every tiny branch. Even when most vector lanes "go the same way", the filtering overhead is significant because it happens at every branch point, function call boundary, etc.
+
+The new approach:
+1. **Trace once** with symbols to get a "recipe" (symbolic DAG + path taken)
+2. **Find all vector elements** that would take the same path
+3. **Apply the recipe** to all of them at once (one "filter" up front, not thousands during execution)
+
+## Core Concepts
+
+### Symbolic Values
+
+During tracing, every `Value` carries both:
+- **Concrete value**: The actual runtime value (used for branch decisions)
+- **Symbol**: A symbolic expression showing how this value was computed from inputs
+
+At frame start, all values get fresh input symbols. At frame end, values contain derived symbols like `add(a, sub(b, c))` where `a`, `b`, `c` are input symbols.
+
+### Counting DFS for Path Enumeration
+
+When tracing hits a branch with an abstract value (like `UnknownBool`), we use counting DFS to enumerate all paths:
+
+- Path counter: `[(0, 2), (1, 3), (0, 2)]` means:
+  - First abstract branch had 2 options, we took option 0
+  - Second abstract branch had 3 options, we took option 1
+  - Third abstract branch had 2 options, we took option 0
+
+- To explore all paths, we "increment" the counter like an odometer
+- New branches can extend the counter as we explore
+
+This replaces the current `flow.rs` approach for handling abstract branching.
+
+### Path Conditions
+
+Each traced path produces boolean symbolic expressions (path conditions) that must be satisfied for that path to be valid. When replaying onto a concrete state, we evaluate these conditions to verify compatibility.
+
+## Execution Flow
+
+```
+Frame N states (vectorized, compact storage)
+    │
+    ▼
+┌─────────────────────────────────────────────────────┐
+│ All elements start with path_counter = []           │
+│                                                     │
+│ While any elements are not "done":                  │
+│   1. Pick an unfinished element                     │
+│   2. Trace it with counting DFS until frame ends    │
+│      - Record symbolic transformations              │
+│      - Record path conditions                       │
+│      - Record final path_counter                    │
+│   3. Find all other elements with:                  │
+│      - Same path_counter structure                  │
+│      - Path conditions satisfied by their values    │
+│   4. Apply symbolic transformation to all matches   │
+│   5. Mark matched elements as "done"                │
+│   6. GC the traced result                           │
+└─────────────────────────────────────────────────────┘
+    │
+    ▼
+Frame N+1 states (re-vectorized for storage)
+```
+
+### Scope of Tracing
+
+Initially: trace an entire frame at once.
+
+Later optimization: could trace finer regions (e.g., one `foreach` loop iteration inside `_update` or `_draw`).
+
+## Data Structures
+
+### Symbolic Expressions
+
+```rust
+// A symbolic identifier for an input value
+#[derive(Clone, Hash, Eq, PartialEq)]
+struct SymbolId(u32);
+
+// Symbolic expression DAG node
+enum SymExpr {
+    // Input symbol (created at frame start)
+    Input(SymbolId),
+    // Primitive operations
+    Add(Box<SymExpr>, Box<SymExpr>),
+    Sub(Box<SymExpr>, Box<SymExpr>),
+    Mul(Box<SymExpr>, Box<SymExpr>),
+    Div(Box<SymExpr>, Box<SymExpr>),
+    Lt(Box<SymExpr>, Box<SymExpr>),
+    Eq(Box<SymExpr>, Box<SymExpr>),
+    And(Box<SymExpr>, Box<SymExpr>),
+    Or(Box<SymExpr>, Box<SymExpr>),
+    Not(Box<SymExpr>),
+    // ... other ops matching interpreter primitives
+    // Constant (for literals, nil, etc.)
+    Const(ConcreteValue),
+}
+```
+
+### Traced Values
+
+```rust
+// A traced value: concrete result + how we got there
+struct TracedValue {
+    concrete: ConcreteValue,  // The actual value (for path decisions)
+    symbol: SymExpr,          // How to compute it from inputs
+}
+```
+
+### Path Counter
+
+```rust
+// Path counter: sequence of (branch_taken, num_branches)
+type PathCounter = Vec<(usize, usize)>;
+```
+
+### Traced Path Result
+
+```rust
+// Result of tracing one path through a frame
+struct TracedPath {
+    path_counter: PathCounter,
+    path_conditions: Vec<SymExpr>,  // Boolean exprs that must be true
+    output_state: TracedState,      // State with TracedValues
+}
+```
+
+## Heap Handling
+
+Vectorized states already have the same heap structure (same HeapIds point to same logical objects). This is preserved:
+
+1. **During tracing**: Heap operations work normally. Values written to heap carry their symbols.
+2. **After tracing**: GC the traced state to get a clean heap.
+3. **During replay**: Map over the GC'd heap, replacing values by applying symbolic transforms to the replayed-onto state's concrete values.
+
+Multiple writes to the same HeapId: the last write's symbol wins (same as current behavior).
+
+Creating new heap entries: these get HeapIds during tracing, and the recipe includes "create entry at HeapId X with symbol Y".
+
+## Side Effects
+
+- **Prints**: Collected during tracing for debugging. Not replayed (prints are just for debugging).
+- **Other side effects**: Handle similarly - execute during trace, skip during replay.
+
+## Applying Transformations
+
+When we have a `TracedPath` and want to apply it to element `i`:
+
+```rust
+fn apply_traced_path(
+    input_state: &ConcreteState,  // Element i's state at frame start
+    traced: &TracedPath,
+) -> ConcreteState {
+    // Build substitution: SymbolId -> ConcreteValue from input_state
+    let subst: HashMap<SymbolId, ConcreteValue> = /* map input symbols to input_state values */;
+
+    // Evaluate each output symbol with this substitution
+    let output_state = traced.output_state.map_values(|traced_val| {
+        evaluate_symbol(&traced_val.symbol, &subst)
+    });
+
+    output_state
+}
+```
+
+## Why This Is Faster
+
+Current approach: Execute N vector lanes in lockstep, filtering at every branch creates subsets that execute separately. Many tiny filters accumulate overhead.
+
+New approach:
+1. **Many lanes share the same path** (likely true - most game states follow similar control flow)
+2. **Applying transformation is cheaper** (no filtering during each step of execution, just once up front when we match elements to a traced path)
+3. **Path matching is cheap** (compare path counters, evaluate path conditions)
+
+Key insight: **Split up front to match a traced state is much cheaper than continuously splitting within many tiny branches and function calls.**
+
+## Implementation Plan
+
+1. Create branch, write this design doc
+2. Implement core data structures (`SymExpr`, `TracedValue`, `PathCounter`)
+3. Port existing tests to the new system where applicable
+4. Get all tests passing
+5. Run the full game for a few frames
+6. Compare resulting state counts per frame to old implementation
+7. Get counts to match
+
+**Success metric**: Get as many correctly count-matched frames executed in 60s / 80GB limits as possible. First optimize for correctness (matching frame counts), then for speed (more frames in the time limit).
+
+## State Representation
+
+- **Within a frame**: Interpreter works with scalar states + symbols (no `MaybeVector`)
+- **Between frames**: Vectorized storage for compactness (same as current)
+
+The path counter is purely a "within frame" concept. We finish executing the frame once we've covered all counters and vectorized the results into one set of vectorized states like what we started with.
