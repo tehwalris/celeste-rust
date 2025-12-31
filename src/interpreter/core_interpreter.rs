@@ -304,9 +304,11 @@ impl<'a> CoreInterpreter<'a> {
         // is less than the cost of filtering all vectors.
         // Builtins that need exact vector lengths (like __split_by_flr) call
         // materialize_with_args themselves.
-        if self.state.mask.is_some() {
+        // NOTE: Setting to 0.0 causes OOM - vectors grow unbounded with dead lanes.
+        const MATERIALIZE_THRESHOLD: f64 = 0.75;
+        if self.state.mask.is_some() && MATERIALIZE_THRESHOLD > 0.0 {
             let live_ratio = self.state.vector_size as f64 / self.state.original_size as f64;
-            if live_ratio < 0.75 {
+            if live_ratio < MATERIALIZE_THRESHOLD {
                 self.state.materialize();
             }
         }
