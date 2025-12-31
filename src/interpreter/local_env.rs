@@ -58,6 +58,12 @@ impl<'de> Deserialize<'de> for LocalEnv {
     }
 }
 
+impl Default for LocalEnv {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LocalEnv {
     pub fn new() -> Self {
         Self {

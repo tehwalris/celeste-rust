@@ -183,7 +183,7 @@ impl<'a> CoreInterpreter<'a> {
                     Value::Number(MaybeVector::Scalar(index)) => {
                         let index = index
                             .as_i16()
-                            .ok_or(anyhow!("Index is a scalar number, but not an integer"))?;
+                            .ok_or_else(|| anyhow!("Index is a scalar number, but not an integer"))?;
                         if index < 1 {
                             return Err(anyhow!("Index is less than 1"));
                         }
@@ -359,6 +359,19 @@ impl<'a> CoreInterpreter<'a> {
                 // Capture inputs for benchmarking if enabled
                 input_capture::maybe_capture(fun_def_name.as_str(), arg_values.clone());
 
+                // For slow call capture: clone state before we modify it
+                let capture_slow = input_capture::should_capture_slow_call(fun_def_name.as_str());
+                let state_before = if capture_slow {
+                    Some((self.state.clone(), arg_values.clone()))
+                } else {
+                    None
+                };
+                let call_start = if capture_slow {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+
                 // Look up the function definition with prepared CFG
                 let (fun_def, prepared_cfg) = self
                     .fixed_env
@@ -396,17 +409,20 @@ impl<'a> CoreInterpreter<'a> {
                 // restored after the function returns.
                 // Note: The mask and original_size are passed to the new state. If <75%
                 // lanes were live, we materialized above; otherwise garbage may remain.
-                let mut new_outer_local_envs = vec![self.state.local_env.clone()];
-                new_outer_local_envs.extend(self.state.outer_local_envs.clone());
+                //
+                // We use std::mem::take to move fields instead of cloning - this is safe
+                // because interpret_call_instruction takes `self` by value, so we own the state.
+                let mut new_outer_local_envs = vec![std::mem::take(&mut self.state.local_env)];
+                new_outer_local_envs.extend(std::mem::take(&mut self.state.outer_local_envs));
 
                 let function_state = State {
-                    heap: self.state.heap.clone(),
+                    heap: std::mem::take(&mut self.state.heap),
                     local_env: new_local_env,
                     outer_local_envs: new_outer_local_envs,
-                    global_env: self.state.global_env.clone(),
-                    prints: self.state.prints.clone(),
+                    global_env: std::mem::take(&mut self.state.global_env),
+                    prints: std::mem::take(&mut self.state.prints),
                     original_size: self.state.original_size,
-                    mask: self.state.mask.clone(),
+                    mask: std::mem::take(&mut self.state.mask),
                     vector_size: self.state.vector_size,
                 };
 
@@ -419,6 +435,17 @@ impl<'a> CoreInterpreter<'a> {
                     Some(fun_def_name.as_str().to_string()),
                     fun_def.source_span,
                 )?;
+
+                // Record slow call if it exceeded threshold
+                if let (Some((state, args)), Some(start)) = (state_before, call_start) {
+                    let duration_us = start.elapsed().as_micros() as u64;
+                    input_capture::maybe_record_slow_call(
+                        fun_def_name.as_str(),
+                        args,
+                        state,
+                        duration_us,
+                    );
+                }
 
                 // Track if this closure call caused a state split
                 if result_states.len() > 1 {
@@ -447,8 +474,9 @@ impl<'a> CoreInterpreter<'a> {
                     .map(|(function_result_state, return_value)| {
                         // Pop the caller's local_env from the stack.
                         // This was pushed before the function call.
+                        // We own function_result_state from into_iter(), so take ownership (no clone).
                         let (caller_local_env, remaining_outer_envs) = {
-                            let mut envs = function_result_state.outer_local_envs.clone();
+                            let mut envs = function_result_state.outer_local_envs;
                             let caller_env = envs.remove(0); // Pop the first (caller's) env
                             (caller_env, envs)
                         };

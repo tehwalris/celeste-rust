@@ -112,6 +112,12 @@ impl PartialEq for Heap {
 
 impl Eq for Heap {}
 
+impl Default for Heap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Heap {
     pub fn new() -> Self {
         Self {

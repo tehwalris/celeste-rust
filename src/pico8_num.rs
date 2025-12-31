@@ -32,8 +32,9 @@ impl Pico8Num {
     }
 
     pub fn as_i16_or_err(&self) -> Result<i16> {
+        // Use ok_or_else for lazy error message construction
         self.as_i16()
-            .ok_or(anyhow!("got {:?}, expected integer", self))
+            .ok_or_else(|| anyhow!("got {:?}, expected integer", self))
     }
 
     pub fn from_parts(whole_n: i16, fraction_n: u16) -> Self {

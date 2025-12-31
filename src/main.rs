@@ -69,6 +69,22 @@ struct Args {
     /// Function name prefix to capture (e.g., "sign")
     #[arg(long, default_value = "sign")]
     capture_function: String,
+
+    /// Capture slow call at this frame (saves to /tmp/slow_call.json.zst)
+    #[arg(long)]
+    capture_slow_at: Option<u32>,
+
+    /// Function name prefix for slow call capture (e.g., "tile_flag_at")
+    #[arg(long, default_value = "tile_flag_at")]
+    slow_call_function: String,
+
+    /// Threshold in ms for slow call capture (default: 30ms)
+    #[arg(long, default_value_t = 30)]
+    slow_call_threshold_ms: u64,
+
+    /// Skip the first N slow calls before capturing (use to target a specific call)
+    #[arg(long, default_value_t = 0)]
+    slow_call_offset: u32,
 }
 
 fn main() -> Result<()> {
@@ -87,6 +103,10 @@ fn main() -> Result<()> {
         args.resume,
         args.capture_at,
         &args.capture_function,
+        args.capture_slow_at,
+        &args.slow_call_function,
+        args.slow_call_threshold_ms,
+        args.slow_call_offset,
     )
 }
 
@@ -132,9 +152,13 @@ fn run_game_frames(
     resume: bool,
     capture_at: Option<u32>,
     capture_function: &str,
+    capture_slow_at: Option<u32>,
+    slow_call_function: &str,
+    slow_call_threshold_ms: u64,
+    slow_call_offset: u32,
 ) -> Result<()> {
     use crate::interpreter::glue::interpret_cfg;
-    use crate::interpreter::input_capture::{enable_capture, disable_capture_and_get};
+    use crate::interpreter::input_capture::{enable_capture, disable_capture_and_get, enable_slow_call_capture, save_slow_call};
     use crate::interpreter::inspect::{make_state_abstract, create_frame_dump, write_frame_dump_jsonl, dump_states_to_file, save_checkpoint, load_checkpoint, checkpoint_filename, Checkpoint};
     use crate::interpreter::profiling::{enable_profiling, get_chrome_tracing_json, get_dag_json, get_tree_json, get_cfgs_json, get_profile_summary};
     use crate::interpreter::tracing::{enable_tracing, get_tracing_json, collect_thread_spans};
@@ -255,6 +279,12 @@ __reset_button_states()
             enable_capture(capture_function);
         }
 
+        // Enable slow call capture if this is the target frame
+        if capture_slow_at == Some(frame_num) {
+            println!("(capturing slow {} calls, threshold={}ms, offset={})",
+                slow_call_function, slow_call_threshold_ms, slow_call_offset);
+            enable_slow_call_capture(slow_call_function, slow_call_threshold_ms, slow_call_offset);
+        }
 
         let start = std::time::Instant::now();
 
@@ -274,6 +304,16 @@ __reset_button_states()
             let json = serde_json::to_string_pretty(&captured).expect("Failed to serialize");
             std::fs::write(output_path, &json).expect("Failed to write");
             println!("  Saved to {}", output_path);
+        }
+
+        // Save slow call if this was the target frame
+        if capture_slow_at == Some(frame_num) {
+            let output_path = "/tmp/slow_call.json.zst";
+            match save_slow_call(output_path) {
+                Ok(true) => println!("  Saved slow call to {}", output_path),
+                Ok(false) => println!("  No slow call captured (none exceeded threshold)"),
+                Err(e) => println!("  Failed to save slow call: {}", e),
+            }
         }
 
         // Make states abstract (widen player.rem to interval)
