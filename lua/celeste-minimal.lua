@@ -45,7 +45,7 @@ function title_screen()
 	max_djump=1
 	start_game=false
 	start_game_flash=0
-	
+
 	load_room(7,3)
 end
 
@@ -68,9 +68,9 @@ end
 -- player entity --
 -------------------
 
-player = 
+player =
 {
-	init=function(this) 
+	init=function(this)
 		this.p_jump=false
 		this.p_dash=false
 		this.grace=0
@@ -85,26 +85,26 @@ player =
 		if (pause_player) then
 			return
 		end
-		
+
 		local input = btn(k_right) and 1 or (btn(k_left) and -1 or 0)
-		
+
 		-- spikes collide
 		if spikes_at(this.x+this.hitbox.x,this.y+this.hitbox.y,this.hitbox.w,this.hitbox.h,this.spd.x,this.spd.y) then
 		 kill_player(this) end
-		 
+
 		-- bottom death
 		if this.y>128 then
 			kill_player(this) end
 
 		local on_ground=this.is_solid(0,1)
 		local on_ice=this.is_ice(0,1)
-		
+
 		local jump = btn(k_jump) and not this.p_jump
 		this.p_jump = btn(k_jump)
-		
+
 		local dash = btn(k_dash) and not this.p_dash
 		this.p_dash = btn(k_dash)
-		
+
 		if on_ground then
 			this.grace=6
 			if this.djump<max_djump then
@@ -118,26 +118,25 @@ player =
   if this.dash_time > 0 then
   	this.dash_time = this.dash_time - (1)
   	this.spd.x=appr(this.spd.x,this.dash_target.x,this.dash_accel.x)
-  	this.spd.y=appr(this.spd.y,this.dash_target.y,this.dash_accel.y)  
+  	this.spd.y=appr(this.spd.y,this.dash_target.y,this.dash_accel.y)
   else
-
 			-- move
 			local maxrun=1
 			local accel=0.6
 			local deccel=0.15
-			
+
 			if not on_ground then
 				accel=0.4
 			elseif on_ice then
 				accel=0.05
 			end
-		
+
 			if abs(this.spd.x) > maxrun then
 		 	this.spd.x=appr(this.spd.x,sign(this.spd.x)*maxrun,deccel)
 			else
 				this.spd.x=appr(this.spd.x,input*maxrun,accel)
 			end
-			
+
 			--facing
 			if this.spd.x~=0 then
 				this.flip.x=(this.spd.x<0)
@@ -150,7 +149,7 @@ player =
   	if abs(this.spd.y) <= 0.15 then
    	gravity = gravity * (0.5)
 			end
-		
+
 			-- wall slide
 			if input~=0 and this.is_solid(input,0) and not this.is_ice(input,0) then
 		 	maxfall=0.4
@@ -175,11 +174,11 @@ player =
 					end
 				end
 			end
-		
+
 			-- dash
 			local d_full=5
 			local d_half=d_full*0.70710678118
-		
+
 			if this.djump>0 and dash then
 		 	this.djump = this.djump - (1		)
 		 	this.dash_time=4
@@ -201,35 +200,34 @@ player =
 		 		this.spd.x=(this.flip.x and -1 or 1)
 		  	this.spd.y=0
 		 	end
-		 	
+
 		 	freeze=2
 		 	this.dash_target.x=2*sign(this.spd.x)
 		 	this.dash_target.y=2*sign(this.spd.y)
 		 	this.dash_accel.x=1.5
 		 	this.dash_accel.y=1.5
-		 	
+
 		 	if this.spd.y<0 then
 		 	 this.dash_target.y = this.dash_target.y * (.75)
 		 	end
-		 	
+
 		 	if this.spd.y~=0 then
 		 	 this.dash_accel.x = this.dash_accel.x * (0.70710678118)
 		 	end
 		 	if this.spd.x~=0 then
 		 	 this.dash_accel.y = this.dash_accel.y * (0.70710678118)
-		 	end	 	 
+		 	end
 			end
-		
 		end
-		
+
 		-- next level
 		if this.y<-4 and level_index()<30 then next_room() end
-		
+
 	end, --<end update loop
-	
+
 	draw=function(this)
 		-- clamp in screen
-		if this.x<-1 or this.x>121 then 
+		if this.x<-1 or this.x>121 then
 			this.x=clamp(this.x,-1,121)
 			this.spd.x=0
 		end
@@ -302,18 +300,18 @@ spring = {
 				hit.spd.y=-3
 				hit.djump=max_djump
 				this.delay=10
-				
+
 				-- breakable below us
 				local below=this.collide(fall_floor,0,1)
 				if below~=nil then
 					break_fall_floor(below)
 				end
-				
+
 			end
 		elseif this.delay>0 then
 			this.delay = this.delay - (1)
-			if this.delay<=0 then 
-				this.spr=18 
+			if this.delay<=0 then
+				this.spr=18
 			end
 		end
 		-- begin hiding
@@ -334,13 +332,13 @@ end
 
 balloon = {
 	tile=22,
-	init=function(this) 
+	init=function(this)
 		this.offset=rnd(1)
 		this.start=this.y
 		this.timer=0
 		this.hitbox={x=-1,y=-1,w=10,h=10}
 	end,
-	update=function(this) 
+	update=function(this)
 		if this.spr==22 then
 			this.offset = this.offset + (0.01)
 			this.y=this.start+sin(this.offset)*2
@@ -352,8 +350,8 @@ balloon = {
 			end
 		elseif this.timer>0 then
 			this.timer = this.timer - (1)
-		else 
-			this.spr=22 
+		else
+			this.spr=22
 		end
 	end,
 }
@@ -405,7 +403,7 @@ end
 fruit={
 	tile=26,
 	if_not_fruit=true,
-	init=function(this) 
+	init=function(this)
 		this.start=this.y
 		this.off=0
 	end,
@@ -425,7 +423,7 @@ add(types,fruit)
 fly_fruit={
 	tile=28,
 	if_not_fruit=true,
-	init=function(this) 
+	init=function(this)
 		this.start=this.y
 		this.fly=false
 		this.step=0.5
@@ -610,30 +608,30 @@ function init_object(type,x,y)
 		 or obj.check(fall_floor,ox,oy)
 		 or obj.check(fake_wall,ox,oy)
 	end
-	
+
 	obj.is_ice=function(ox,oy)
 		return ice_at(obj.x+obj.hitbox.x+ox,obj.y+obj.hitbox.y+oy,obj.hitbox.w,obj.hitbox.h)
 	end
-	
+
 	obj.collide=function(type,ox,oy)
 		local other
 		for i=1,count(objects) do
 			other=objects[i]
 			if other ~=nil and other.type == type and other ~= obj and other.collideable and
-				other.x+other.hitbox.x+other.hitbox.w > obj.x+obj.hitbox.x+ox and 
+				other.x+other.hitbox.x+other.hitbox.w > obj.x+obj.hitbox.x+ox and
 				other.y+other.hitbox.y+other.hitbox.h > obj.y+obj.hitbox.y+oy and
-				other.x+other.hitbox.x < obj.x+obj.hitbox.x+obj.hitbox.w+ox and 
+				other.x+other.hitbox.x < obj.x+obj.hitbox.x+obj.hitbox.w+ox and
 				other.y+other.hitbox.y < obj.y+obj.hitbox.y+obj.hitbox.h+oy then
 				return other
 			end
 		end
 		return nil
 	end
-	
+
 	obj.check=function(type,ox,oy)
 		return obj.collide(type,ox,oy) ~=nil
 	end
-	
+
 	obj.move=function(ox,oy)
 		local amount
 		-- [x] get move amount
@@ -642,7 +640,7 @@ function init_object(type,x,y)
 		amount = flr(obj.rem.x)
 		obj.rem.x = obj.rem.x - 0.5 - (amount)
 		obj.move_x(amount,0)
-		
+
 		-- [y] get move amount
 		obj.rem.y = obj.rem.y + (oy) + 0.5
 		obj.rem.y = __split_by_flr(obj.rem.y)
@@ -650,7 +648,7 @@ function init_object(type,x,y)
 		obj.rem.y = obj.rem.y - 0.5 - (amount)
 		obj.move_y(amount)
 	end
-	
+
 	obj.move_x=function(amount,start)
 		if obj.solids then
 			local step = sign(amount)
@@ -667,7 +665,7 @@ function init_object(type,x,y)
 			obj.x = obj.x + (amount)
 		end
 	end
-	
+
 	obj.move_y=function(amount)
 		if obj.solids then
 			local step = sign(amount)
@@ -738,11 +736,11 @@ function load_room(x,y)
 			elseif tile==12 then
 				init_object(platform,tx*8,ty*8).dir=1
 			else
-				foreach(types, 
-				function(type) 
+				foreach(types,
+				function(type)
 					if type.tile == tile then
-						init_object(type,tx*8,ty*8) 
-					end 
+						init_object(type,tx*8,ty*8)
+					end
 				end)
 			end
 		end
@@ -760,7 +758,7 @@ function _update()
 			minutes = minutes + (1)
 		end
 	end
-	
+
 	-- cancel if freeze
 	if freeze>0 then freeze = freeze - 1 return end
 
@@ -783,7 +781,11 @@ function _update()
 			obj.type.update(obj)
 		end
 	end)
-	
+
+	if true then
+    	_hint_normalize()
+    end
+
 	-- start game
 	if is_title() then
 		if not start_game and (btn(k_jump) or btn(k_dash)) then
@@ -797,7 +799,6 @@ function _update()
 			end
 		end
 	end
-	_hint_normalize()
 end
 
 -- drawing functions --
@@ -818,7 +819,6 @@ function _draw()
 			draw_object(o)
 		end
 	end)
-	_hint_normalize()
 end
 
 function draw_object(obj)
@@ -835,8 +835,8 @@ function clamp(val,a,b)
 end
 
 function appr(val,target,amount)
- return val > target 
- 	and max(val - amount, target) 
+ return val > target
+ 	and max(val - amount, target)
  	or min(val + amount, target)
 end
 

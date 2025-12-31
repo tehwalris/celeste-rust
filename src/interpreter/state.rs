@@ -124,7 +124,7 @@ impl State {
     /// Applies the pending mask to actually filter all vectors.
     /// After this, original_size = vector_size and mask = None.
     pub fn materialize(&mut self) {
-        let _trace = TraceSpan::new("materialize", "materialize");
+        let _trace = TraceSpan::new("materialize", "gc");
         if let Some(mask) = self.mask.take() {
             use super::value::count_true;
             let true_count = count_true(&mask);
@@ -268,9 +268,10 @@ impl State {
     pub fn gc(&mut self) {
         let _trace = TraceSpan::new("gc", "gc");
 
-        // Materialize any pending mask before GC
-        // (masked lanes may have garbage that could confuse GC)
-        self.materialize();
+        // We materialize at the END of GC, not the beginning.
+        // This is safe because Pointers are scalar (not vectorized),
+        // so GC's reachability traversal is unaffected by masked lanes.
+        // It's more efficient because GC removes dead heap values first.
         let mut old_to_new: FxHashMap<HeapId, HeapId> = FxHashMap::default();
         let mut new_heap_values: Vec<HeapValue> = Vec::new();
 
@@ -294,8 +295,8 @@ impl State {
             new_heap_values.push(HeapValue::UnknownTable);
 
             // Get the old value and recurse on references
-            let old_value = old_heap.get(old_id).clone();
-            let new_value = map_heap_value_references(&old_value, |ref_id| {
+            // Note: We must clone from heap (FrozenVec doesn't support taking ownership)
+            let new_value = map_heap_value(old_heap.get(old_id).clone(), |ref_id| {
                 visit(ref_id, old_heap, old_to_new, new_heap_values)
             });
 
@@ -305,27 +306,29 @@ impl State {
             new_id
         }
 
-        // Map Value references
-        fn map_value_references(value: &Value, f: &mut impl FnMut(HeapId) -> HeapId) -> Value {
+        // Map Value references - takes ownership, returns unchanged if no HeapIds
+        #[inline]
+        fn map_value(value: Value, f: &mut impl FnMut(HeapId) -> HeapId) -> Value {
             match value {
-                Value::Pointer(id) => Value::Pointer(f(*id)),
-                Value::Number(_)
+                Value::Pointer(id) => Value::Pointer(f(id)),
+                // These don't contain HeapIds, pass through unchanged (no clone!)
+                v @ (Value::Number(_)
                 | Value::NumberInterval(_)
                 | Value::Bool(_)
                 | Value::UnknownBool
                 | Value::String(_)
                 | Value::Nil(_)
-                | Value::NilPointer(_) => value.clone(),
+                | Value::NilPointer(_)) => v,
             }
         }
 
-        // Map HeapValue references
-        fn map_heap_value_references(
-            value: &HeapValue,
+        // Map HeapValue references - takes ownership
+        fn map_heap_value(
+            value: HeapValue,
             mut f: impl FnMut(HeapId) -> HeapId,
         ) -> HeapValue {
             match value {
-                HeapValue::Value(v) => HeapValue::Value(map_value_references(v, &mut f)),
+                HeapValue::Value(v) => HeapValue::Value(map_value(v, &mut f)),
                 HeapValue::ObjectTable(table) => {
                     // IMPORTANT: Sort keys for deterministic traversal order!
                     let mut keys: Vec<_> = table.keys().cloned().collect();
@@ -340,17 +343,17 @@ impl State {
                     HeapValue::ObjectTable(new_table)
                 }
                 HeapValue::ArrayTable(items) => {
-                    HeapValue::ArrayTable(items.iter().map(|id| f(*id)).collect())
+                    HeapValue::ArrayTable(items.into_iter().map(|id| f(id)).collect())
                 }
                 HeapValue::UnknownTable => HeapValue::UnknownTable,
                 HeapValue::Closure(id, captures) => {
                     let new_captures: Vec<Value> = captures
-                        .iter()
-                        .map(|v| map_value_references(v, &mut f))
+                        .into_iter()
+                        .map(|v| map_value(v, &mut f))
                         .collect();
-                    HeapValue::Closure(id.clone(), new_captures)
+                    HeapValue::Closure(id, new_captures)
                 }
-                HeapValue::BuiltinFun(name) => HeapValue::BuiltinFun(name.clone()),
+                HeapValue::BuiltinFun(name) => HeapValue::BuiltinFun(name),
             }
         }
 
@@ -362,11 +365,12 @@ impl State {
         }
 
         // Visit all roots from local_env (sorted for deterministic order)
+        // Note: We must clone values since LocalEnv doesn't support draining
         let mut local_entries: Vec<_> = self.local_env.iter().collect();
         local_entries.sort_by_key(|(k, _)| *k);
         let mut new_local_env = LocalEnv::new();
         for (raw_id, value) in local_entries {
-            let new_value = map_value_references(value, &mut |id| {
+            let new_value = map_value(value.clone(), &mut |id| {
                 visit(id, &self.heap, &mut old_to_new, &mut new_heap_values)
             });
             new_local_env.set(LocalId::from(raw_id), new_value);
@@ -379,7 +383,7 @@ impl State {
             entries.sort_by_key(|(k, _)| *k);
             let mut new_env = LocalEnv::new();
             for (raw_id, value) in entries {
-                let new_value = map_value_references(value, &mut |id| {
+                let new_value = map_value(value.clone(), &mut |id| {
                     visit(id, &self.heap, &mut old_to_new, &mut new_heap_values)
                 });
                 new_env.set(LocalId::from(raw_id), new_value);
@@ -399,6 +403,12 @@ impl State {
         self.global_env = new_global_env;
         self.local_env = new_local_env;
         self.outer_local_envs = new_outer_local_envs;
+
+        // Materialize any pending mask AFTER GC.
+        // This is more efficient than materializing before GC because:
+        // - GC removes dead heap values, so there are fewer HeapValues to iterate
+        // - Pointers are scalar (not vectorized), so GC traversal is unaffected by the mask
+        self.materialize();
     }
 }
 
