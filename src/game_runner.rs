@@ -183,6 +183,8 @@ fn builtin_split_by_flr(state: State, args: Vec<Value>) -> Result<Vec<(State, Va
     if args.len() != 1 {
         return Err(anyhow!("__split_by_flr requires 1 argument"));
     }
+    // Note: materialize() is called before all function calls in core_interpreter,
+    // so args already have correct lengths and state has no pending mask.
     match &args[0] {
         Value::Number(MaybeVector::Scalar(n)) => {
             Ok(vec![(state, Value::Number(MaybeVector::Scalar(*n)))])

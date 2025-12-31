@@ -148,6 +148,30 @@ impl State {
         }
     }
 
+    /// Materialize the state and filter a Vec<Value> to match.
+    /// Use this in builtins that create masks based on arg vector lengths.
+    ///
+    /// If there's no pending mask, returns args unchanged.
+    /// If there's a pending mask, filters args to remove dead lanes, then materializes state.
+    pub fn materialize_with_args(&mut self, args: Vec<Value>) -> Vec<Value> {
+        use super::value::count_true;
+
+        if let Some(ref mask) = self.mask {
+            let true_count = count_true(mask);
+            let filtered_args = args
+                .into_iter()
+                .map(|v| {
+                    v.filter_vectors_if_vector(mask, true_count)
+                        .unwrap_or(v)
+                })
+                .collect();
+            self.materialize();
+            filtered_args
+        } else {
+            args
+        }
+    }
+
     /// Apply a lazy mask for branching. Instead of filtering all vectors,
     /// just compose this mask with the existing mask.
     /// Returns the new vector_size (count of true values in composed mask).
