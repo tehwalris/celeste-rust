@@ -949,21 +949,20 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
     let mut stats = VectorizeTimingStats::default();
     stats.input_count = states.len();
 
-    // Materialize any pending masks before vectorization.
-    // This ensures all states have actual filtered vectors, not lazy masks.
-    // (GC also calls materialize, but we need it even when GC is skipped)
-    let states: Vec<State> = states.into_iter().map(|mut s| { s.materialize(); s }).collect();
-
     // GC all states before shape grouping when input is large enough.
     // This removes garbage from heaps, allowing states to match shapes better.
     // Typical improvement: 12k groups -> 24 groups, 5x speedup.
+    // Note: gc() internally calls materialize(), so we only need explicit
+    // materialize when GC is skipped.
     let gc_threshold = GC_BEFORE_VECTORIZE_THRESHOLD.load(std::sync::atomic::Ordering::Relaxed);
     let states = if gc_threshold > 0 && states.len() >= gc_threshold {
         let _gc_trace = TraceSpan::new("gc_before_vectorize", "gc");
         let gc_states: Vec<State> = states.into_iter().map(|mut s| { s.gc(); s }).collect();
         gc_states
     } else {
-        states
+        // Materialize any pending masks before vectorization.
+        // This ensures all states have actual filtered vectors, not lazy masks.
+        states.into_iter().map(|mut s| { s.materialize(); s }).collect()
     };
 
     if states.is_empty() {
