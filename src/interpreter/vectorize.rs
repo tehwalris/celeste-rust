@@ -934,35 +934,25 @@ impl Clone for VectorizeTimingStats {
     }
 }
 
-/// Threshold for GC before vectorization (0 = disabled, default = 1000)
-/// GC before vectorize is a major optimization: it removes garbage from heaps,
-/// allowing states to have matching shapes and merge into fewer groups.
-static GC_BEFORE_VECTORIZE_THRESHOLD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1000);
-
-/// Set the threshold for GC before vectorization (0 = disabled)
-pub fn set_gc_before_vectorize_threshold(threshold: usize) {
-    GC_BEFORE_VECTORIZE_THRESHOLD.store(threshold, std::sync::atomic::Ordering::Relaxed);
-}
-
+/// Vectorize states: GC + materialize + merge by shape.
+///
+/// This is the main entry point for combining multiple states into fewer
+/// vectorized states. It:
+/// 1. GCs all states (removes heap garbage, calls materialize internally)
+/// 2. Groups states by shape (structure with values normalized)
+/// 3. Merges each group into a single vectorized state
+/// 4. Deduplicates rows within each merged state
 pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
     let _trace = TraceSpan::new("vectorize_states", "vectorize");
     let mut stats = VectorizeTimingStats::default();
     stats.input_count = states.len();
 
-    // GC all states before shape grouping when input is large enough.
+    // GC all states before shape grouping.
     // This removes garbage from heaps, allowing states to match shapes better.
-    // Typical improvement: 12k groups -> 24 groups, 5x speedup.
-    // Note: gc() internally calls materialize(), so we only need explicit
-    // materialize when GC is skipped.
-    let gc_threshold = GC_BEFORE_VECTORIZE_THRESHOLD.load(std::sync::atomic::Ordering::Relaxed);
-    let states = if gc_threshold > 0 && states.len() >= gc_threshold {
+    // GC internally calls materialize(), ensuring vectors are compacted.
+    let states: Vec<State> = {
         let _gc_trace = TraceSpan::new("gc_before_vectorize", "gc");
-        let gc_states: Vec<State> = states.into_iter().map(|mut s| { s.gc(); s }).collect();
-        gc_states
-    } else {
-        // Materialize any pending masks before vectorization.
-        // This ensures all states have actual filtered vectors, not lazy masks.
-        states.into_iter().map(|mut s| { s.materialize(); s }).collect()
+        states.into_iter().map(|mut s| { s.gc(); s }).collect()
     };
 
     if states.is_empty() {

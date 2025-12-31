@@ -276,17 +276,12 @@ __reset_button_states()
             println!("  Saved to {}", output_path);
         }
 
-        // GC and normalize states before vectorization
-        for state in &mut new_states {
-            state.gc();
-        }
-
         // Make states abstract (widen player.rem to interval)
         new_states = new_states.into_iter().map(make_state_abstract).collect();
 
         let before_vec = new_states.len();
 
-        // Vectorize states to combine states with the same shape
+        // Vectorize states (GC + materialize + merge by shape)
         let new_states = crate::interpreter::vectorize::vectorize_states(new_states);
 
         let after_vec = new_states.len();
