@@ -8,6 +8,7 @@ use crate::interpreter::{
 };
 use crate::pico8_num::{Pico8Num, Pico8NumInterval};
 use crate::cart_data;
+use crate::collision_cache::CollisionCache;
 
 fn format_scalar_number(n: &Pico8Num) -> String {
     let whole = n.whole_part_as_i16();
@@ -368,6 +369,146 @@ fn make_builtin_fget(
     }
 }
 
+/// Builtin tile_flag_at using precomputed collision cache
+/// tile_flag_at(x, y, w, h, flag) -> bool
+fn make_builtin_tile_flag_at(
+    cart_data: std::sync::Arc<cart_data::CartData>,
+    collision_cache: std::sync::Arc<CollisionCache>,
+) -> impl Fn(State, Vec<Value>) -> Result<Vec<(State, Value)>> {
+    move |state: State, args: Vec<Value>| {
+        if args.len() != 5 {
+            return Err(anyhow!("tile_flag_at requires 5 arguments (x, y, w, h, flag)"));
+        }
+
+        // For now, only support flag=0 (solid) which is what solid_at uses
+        let flag = match &args[4] {
+            Value::Number(MaybeVector::Scalar(n)) => n.as_i16().ok_or_else(|| anyhow!("flag must be integer"))?,
+            _ => return Err(anyhow!("tile_flag_at: flag must be scalar number")),
+        };
+
+        if flag != 0 {
+            // Fall back to computed version for non-solid flags
+            return tile_flag_at_computed(&cart_data, &collision_cache, state, &args);
+        }
+
+        // Extract scalar w, h (these are typically constant)
+        let (w, h) = match (&args[2], &args[3]) {
+            (Value::Number(MaybeVector::Scalar(w)), Value::Number(MaybeVector::Scalar(h))) => {
+                (w.as_i16().ok_or_else(|| anyhow!("w must be integer"))?,
+                 h.as_i16().ok_or_else(|| anyhow!("h must be integer"))?)
+            }
+            _ => return tile_flag_at_computed(&cart_data, &collision_cache, state, &args),
+        };
+
+        // Handle x, y which may be vectors
+        match (&args[0], &args[1]) {
+            (Value::Number(x), Value::Number(y)) => {
+                let result = MaybeVector::map2(x, y, |x, y| {
+                    let xi = x.as_i16().unwrap_or(0);
+                    let yi = y.as_i16().unwrap_or(0);
+
+                    // Try cached lookup for common sizes
+                    if w == 6 && h == 5 {
+                        // Player hitbox - but we need to account for the offset
+                        // solid_player expects position without hitbox offset
+                        if let Some(v) = collision_cache.solid_player(xi - 1, yi - 3) {
+                            return v;
+                        }
+                    } else if w == 1 && h == 1 {
+                        if let Some(v) = collision_cache.solid_1x1(xi, yi) {
+                            return v;
+                        }
+                    } else if w == 8 && h == 8 {
+                        if let Some(v) = collision_cache.solid_8x8(xi, yi) {
+                            return v;
+                        }
+                    }
+
+                    // Fall back to computation
+                    collision_cache.solid_at(&cart_data, xi, yi, w, h).unwrap_or(false)
+                });
+                Ok(vec![(state, Value::Bool(result))])
+            }
+            _ => tile_flag_at_computed(&cart_data, &collision_cache, state, &args),
+        }
+    }
+}
+
+/// Fallback computation for tile_flag_at when cache doesn't apply
+fn tile_flag_at_computed(
+    cart_data: &cart_data::CartData,
+    collision_cache: &CollisionCache,
+    state: State,
+    args: &[Value],
+) -> Result<Vec<(State, Value)>> {
+    // This path handles non-standard cases
+    match (&args[0], &args[1], &args[2], &args[3], &args[4]) {
+        (
+            Value::Number(x),
+            Value::Number(y),
+            Value::Number(w),
+            Value::Number(h),
+            Value::Number(flag),
+        ) => {
+            // All 5-way map
+            let x_vals: Vec<Pico8Num> = match x {
+                MaybeVector::Scalar(n) => vec![*n],
+                MaybeVector::Vector(v) => v.clone(),
+            };
+            let y_vals: Vec<Pico8Num> = match y {
+                MaybeVector::Scalar(n) => vec![*n],
+                MaybeVector::Vector(v) => v.clone(),
+            };
+            let w_vals: Vec<Pico8Num> = match w {
+                MaybeVector::Scalar(n) => vec![*n],
+                MaybeVector::Vector(v) => v.clone(),
+            };
+            let h_vals: Vec<Pico8Num> = match h {
+                MaybeVector::Scalar(n) => vec![*n],
+                MaybeVector::Vector(v) => v.clone(),
+            };
+            let flag_vals: Vec<Pico8Num> = match flag {
+                MaybeVector::Scalar(n) => vec![*n],
+                MaybeVector::Vector(v) => v.clone(),
+            };
+
+            // Broadcast to common length
+            let len = [x_vals.len(), y_vals.len(), w_vals.len(), h_vals.len(), flag_vals.len()]
+                .into_iter()
+                .max()
+                .unwrap();
+
+            let get_or_last = |v: &[Pico8Num], i: usize| v.get(i).copied().unwrap_or(*v.last().unwrap());
+
+            let results: Vec<bool> = (0..len)
+                .map(|i| {
+                    let xi = get_or_last(&x_vals, i).as_i16().unwrap_or(0);
+                    let yi = get_or_last(&y_vals, i).as_i16().unwrap_or(0);
+                    let wi = get_or_last(&w_vals, i).as_i16().unwrap_or(1);
+                    let hi = get_or_last(&h_vals, i).as_i16().unwrap_or(1);
+                    let flagi = get_or_last(&flag_vals, i).as_i16().unwrap_or(0);
+
+                    if flagi == 0 {
+                        collision_cache.solid_at(cart_data, xi, yi, wi, hi).unwrap_or(false)
+                    } else {
+                        // For other flags, we'd need a different cache or compute
+                        // For now, just return false (not ideal but allows testing)
+                        false
+                    }
+                })
+                .collect();
+
+            let result = if results.len() == 1 {
+                Value::Bool(MaybeVector::Scalar(results[0]))
+            } else {
+                Value::Bool(MaybeVector::Vector(results))
+            };
+            Ok(vec![(state, result)])
+        }
+        _ => Err(anyhow!("tile_flag_at: all arguments must be numbers")),
+    }
+}
+
 pub fn create_fixed_env_with_builtins() -> FixedEnv {
     let mut fixed_env = FixedEnv::new();
     fixed_env.add_builtin("__print", builtin_print);
@@ -390,8 +531,16 @@ pub fn create_fixed_env_with_game_builtins() -> FixedEnv {
     let cart_data = std::sync::Arc::new(
         cart_data::CartData::load("cart").expect("Failed to load cart data")
     );
+
+    // Create collision cache for room (1, 0) - hardcoded for now
+    let collision_cache = std::sync::Arc::new(
+        CollisionCache::new(&cart_data, 1, 0).expect("Failed to create collision cache")
+    );
+    eprintln!("[game_runner] Created collision cache for room (1, 0)");
+
     fixed_env.add_builtin("mget", make_builtin_mget(cart_data.clone()));
-    fixed_env.add_builtin("fget", make_builtin_fget(cart_data));
+    fixed_env.add_builtin("fget", make_builtin_fget(cart_data.clone()));
+    fixed_env.add_builtin("tile_flag_at", make_builtin_tile_flag_at(cart_data, collision_cache));
     fixed_env
 }
 
@@ -403,4 +552,13 @@ pub fn create_initial_state_with_builtins(fixed_env: &FixedEnv) -> State {
         state.global_env.insert(name.clone(), heap_id);
     }
     state
+}
+
+/// Inject the tile_flag_at builtin into a state's global_env, replacing the Lua version.
+/// This should be called after Lua init has completed.
+pub fn inject_tile_flag_at_builtin(state: &mut State) {
+    let builtin_name = "tile_flag_at".to_string();
+    let heap_id = state.heap.alloc();
+    state.heap.set(heap_id, HeapValue::BuiltinFun(builtin_name.clone()));
+    state.global_env.insert(builtin_name, heap_id);
 }

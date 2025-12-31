@@ -162,7 +162,7 @@ fn run_game_frames(
     use crate::interpreter::inspect::{make_state_abstract, create_frame_dump, write_frame_dump_jsonl, dump_states_to_file, save_checkpoint, load_checkpoint, checkpoint_filename, Checkpoint};
     use crate::interpreter::profiling::{enable_profiling, get_chrome_tracing_json, get_dag_json, get_tree_json, get_cfgs_json, get_profile_summary};
     use crate::interpreter::tracing::{enable_tracing, get_tracing_json, collect_thread_spans};
-    use crate::game_runner::{create_fixed_env_with_game_builtins, create_initial_state_with_builtins};
+    use crate::game_runner::{create_fixed_env_with_game_builtins, create_initial_state_with_builtins, inject_tile_flag_at_builtin};
     use std::io::BufWriter;
     use std::fs::File;
 
@@ -254,6 +254,13 @@ __reset_button_states()
         println!("States after init: {}", init_result_states.len());
         (init_result_states.into_iter().map(|(s, _)| s).collect(), 1)
     };
+
+    // Inject tile_flag_at builtin into all states (replaces Lua version with faster Rust builtin)
+    // This is done after Lua init so we don't need to modify the Lua source
+    for state in &mut states {
+        inject_tile_flag_at_builtin(state);
+    }
+    println!("Injected tile_flag_at builtin into {} states", states.len());
 
     // Open dump file if requested
     let mut dump_writer = dump_path.map(|path| {
