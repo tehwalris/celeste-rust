@@ -3,3 +3,5 @@
 /profiles
 perf.data*
 perf_*.data*
+checkpoints/
+server/
