@@ -1,5 +1,5 @@
 use std::hash::BuildHasherDefault;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use itertools::Itertools;
 use rustc_hash::FxHasher;
@@ -21,17 +21,11 @@ pub enum MaybeVector<T: std::fmt::Debug + Clone + PartialEq + Eq> {
     /// Lazy filtered vector - stores original data and a mask.
     /// The effective elements are those where mask[i] is true.
     /// This avoids materializing filtered data until it's actually needed.
-    /// The `materialized` cache is shared across clones - once any clone
-    /// materializes the vector, all clones can use the cached result.
     LazyVector {
         data: Arc<Vec<T>>,
         mask: Arc<Vec<bool>>,
         /// Cached count of true values in mask (= effective length)
         len: usize,
-        /// Cached materialized result - shared across clones via Arc<OnceLock<...>>.
-        /// Using OnceLock ensures thread-safe one-time initialization.
-        /// The inner Arc<Vec<T>> allows cheap cloning of the result.
-        materialized: Arc<OnceLock<Arc<Vec<T>>>>,
     },
 }
 
@@ -109,15 +103,11 @@ impl<T: std::fmt::Debug + Clone + PartialEq + Eq> MaybeVector<T> {
 
     /// Materialize a lazy vector into a regular vector (or scalar if len=1)
     /// Returns self unchanged if not lazy.
-    ///
-    /// Uses a shared cache so that multiple clones of the same LazyVector
-    /// only compute the materialization once.
     pub fn materialize_if_lazy(&self) -> Self {
         match self {
-            MaybeVector::LazyVector { data, mask, len, materialized } => {
+            MaybeVector::LazyVector { data, mask, len } => {
                 if *len == 1 {
                     // Single element - find it and return as scalar
-                    // (No caching needed for scalars - they're cheap)
                     for (v, &m) in data.iter().zip(mask.iter()) {
                         if m {
                             return MaybeVector::Scalar(v.clone());
@@ -125,19 +115,14 @@ impl<T: std::fmt::Debug + Clone + PartialEq + Eq> MaybeVector<T> {
                     }
                     unreachable!("len was 1 but no true found in mask")
                 } else {
-                    // Check cache first (via get_or_init for thread-safety)
-                    let cached = materialized.get_or_init(|| {
-                        // Compute the filtered vector
-                        let mut filtered = Vec::with_capacity(*len);
-                        for (v, &m) in data.iter().zip(mask.iter()) {
-                            if m {
-                                filtered.push(v.clone());
-                            }
+                    // Multiple elements - collect into Vec
+                    let mut filtered = Vec::with_capacity(*len);
+                    for (v, &m) in data.iter().zip(mask.iter()) {
+                        if m {
+                            filtered.push(v.clone());
                         }
-                        Arc::new(filtered)
-                    });
-                    // Return a Vector sharing the cached Arc - just an Arc::clone!
-                    MaybeVector::Vector(Arc::clone(cached))
+                    }
+                    MaybeVector::Vector(Arc::new(filtered))
                 }
             }
             // Already materialized
@@ -152,15 +137,8 @@ impl<T: std::fmt::Debug + Clone + PartialEq + Eq> MaybeVector<T> {
         }
     }
 
-    /// Sparsity threshold: if active elements / original length < this ratio,
-    /// eagerly materialize instead of creating a lazy vector.
-    /// This prevents keeping huge original vectors around for small results.
-    /// Higher values = more aggressive eager materialization.
-    const SPARSITY_THRESHOLD: f64 = 1.0;
-
     /// Apply a filter mask to create a lazy vector.
     /// If already lazy, combines masks efficiently.
-    /// If the result would be too sparse (< SPARSITY_THRESHOLD), eagerly materializes.
     pub fn filter_lazy(self, new_mask: &[bool], new_len: usize) -> Self {
         if new_len == 0 {
             panic!("Cannot filter to zero elements");
@@ -185,34 +163,20 @@ impl<T: std::fmt::Debug + Clone + PartialEq + Eq> MaybeVector<T> {
                     // No filtering needed
                     MaybeVector::Vector(v)
                 } else {
-                    // Check sparsity - if too sparse, materialize eagerly
-                    let sparsity = new_len as f64 / v.len() as f64;
-                    if sparsity < Self::SPARSITY_THRESHOLD {
-                        // Eagerly materialize
-                        let mut filtered = Vec::with_capacity(new_len);
-                        for (val, &m) in v.iter().zip(new_mask.iter()) {
-                            if m {
-                                filtered.push(val.clone());
-                            }
-                        }
-                        MaybeVector::Vector(Arc::new(filtered))
-                    } else {
-                        // Create lazy vector - v is already Arc<Vec<T>>
-                        MaybeVector::LazyVector {
-                            data: v,
-                            mask: Arc::new(new_mask.to_vec()),
-                            len: new_len,
-                            materialized: Arc::new(OnceLock::new()),
-                        }
+                    // Create lazy vector - v is already Arc<Vec<T>>
+                    MaybeVector::LazyVector {
+                        data: v,
+                        mask: Arc::new(new_mask.to_vec()),
+                        len: new_len,
                     }
                 }
             }
-            MaybeVector::LazyVector { data, mask, len: old_len, materialized } => {
+            MaybeVector::LazyVector { data, mask, len: old_len } => {
                 debug_assert_eq!(new_mask.len(), old_len);
 
                 if new_len == old_len {
                     // No change
-                    return MaybeVector::LazyVector { data, mask, len: old_len, materialized };
+                    return MaybeVector::LazyVector { data, mask, len: old_len };
                 }
 
                 // Combine masks: for each position in the new mask (which has old_len positions),
@@ -241,25 +205,10 @@ impl<T: std::fmt::Debug + Clone + PartialEq + Eq> MaybeVector<T> {
                     unreachable!("new_len was 1 but no true found")
                 }
 
-                // Check sparsity relative to ORIGINAL data length
-                let sparsity = new_len as f64 / data.len() as f64;
-                if sparsity < Self::SPARSITY_THRESHOLD {
-                    // Too sparse - eagerly materialize to avoid keeping huge original data
-                    let mut filtered = Vec::with_capacity(new_len);
-                    for (val, &m) in data.iter().zip(combined_mask.iter()) {
-                        if m {
-                            filtered.push(val.clone());
-                        }
-                    }
-                    MaybeVector::Vector(Arc::new(filtered))
-                } else {
-                    // When combining masks, the cache is invalidated (new mask = new result)
-                    MaybeVector::LazyVector {
-                        data,
-                        mask: Arc::new(combined_mask),
-                        len: new_len,
-                        materialized: Arc::new(OnceLock::new()),
-                    }
+                MaybeVector::LazyVector {
+                    data,
+                    mask: Arc::new(combined_mask),
+                    len: new_len,
                 }
             }
         }
@@ -287,37 +236,22 @@ impl<T: std::fmt::Debug + Clone + PartialEq + Eq> MaybeVector<T> {
                 } else if new_len == v.len() {
                     MaybeVector::Vector(Arc::clone(v))
                 } else {
-                    // Check sparsity - if too sparse, materialize eagerly
-                    let sparsity = new_len as f64 / v.len() as f64;
-                    if sparsity < Self::SPARSITY_THRESHOLD {
-                        let mut filtered = Vec::with_capacity(new_len);
-                        for (val, &m) in v.iter().zip(new_mask.iter()) {
-                            if m {
-                                filtered.push(val.clone());
-                            }
-                        }
-                        MaybeVector::Vector(Arc::new(filtered))
-                    } else {
-                        // Share the existing Arc, don't clone the Vec
-                        MaybeVector::LazyVector {
-                            data: Arc::clone(v),
-                            mask: Arc::new(new_mask.to_vec()),
-                            len: new_len,
-                            materialized: Arc::new(OnceLock::new()),
-                        }
+                    // Share the existing Arc, don't clone the Vec
+                    MaybeVector::LazyVector {
+                        data: Arc::clone(v),
+                        mask: Arc::new(new_mask.to_vec()),
+                        len: new_len,
                     }
                 }
             }
-            MaybeVector::LazyVector { data, mask, len: old_len, materialized } => {
+            MaybeVector::LazyVector { data, mask, len: old_len } => {
                 debug_assert_eq!(new_mask.len(), *old_len);
 
                 if new_len == *old_len {
-                    // No change - return a clone sharing the same cache
                     return MaybeVector::LazyVector {
                         data: Arc::clone(data),
                         mask: Arc::clone(mask),
-                        len: *old_len,
-                        materialized: Arc::clone(materialized),
+                        len: *old_len
                     };
                 }
 
@@ -342,25 +276,10 @@ impl<T: std::fmt::Debug + Clone + PartialEq + Eq> MaybeVector<T> {
                     unreachable!("new_len was 1 but no true found")
                 }
 
-                // Check sparsity relative to ORIGINAL data length
-                let sparsity = new_len as f64 / data.len() as f64;
-                if sparsity < Self::SPARSITY_THRESHOLD {
-                    // Too sparse - eagerly materialize
-                    let mut filtered = Vec::with_capacity(new_len);
-                    for (val, &m) in data.iter().zip(combined_mask.iter()) {
-                        if m {
-                            filtered.push(val.clone());
-                        }
-                    }
-                    MaybeVector::Vector(Arc::new(filtered))
-                } else {
-                    // New mask = new cache
-                    MaybeVector::LazyVector {
-                        data: Arc::clone(data),
-                        mask: Arc::new(combined_mask),
-                        len: new_len,
-                        materialized: Arc::new(OnceLock::new()),
-                    }
+                MaybeVector::LazyVector {
+                    data: Arc::clone(data),
+                    mask: Arc::new(combined_mask),
+                    len: new_len,
                 }
             }
         }
@@ -370,7 +289,7 @@ impl<T: std::fmt::Debug + Clone + PartialEq + Eq> MaybeVector<T> {
         match self {
             MaybeVector::Scalar(v) => MaybeVector::Scalar(f(v)),
             MaybeVector::Vector(v) => MaybeVector::Vector(Arc::new(v.iter().map(f).collect())),
-            MaybeVector::LazyVector { data, mask, len, .. } => {
+            MaybeVector::LazyVector { data, mask, len } => {
                 // Only map the active elements
                 let mut result = Vec::with_capacity(*len);
                 for (v, &m) in data.iter().zip(mask.iter()) {
@@ -395,7 +314,7 @@ impl<T: std::fmt::Debug + Clone + PartialEq + Eq> MaybeVector<T> {
         match self {
             MaybeVector::Scalar(v) => MaybeVector::Scalar(f(v)),
             MaybeVector::Vector(v) => MaybeVector::Vector(Arc::new(v.iter().map(f).collect())),
-            MaybeVector::LazyVector { data, mask, len, .. } => {
+            MaybeVector::LazyVector { data, mask, len } => {
                 let mut result = Vec::with_capacity(*len);
                 for (v, &m) in data.iter().zip(mask.iter()) {
                     if m {

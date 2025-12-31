@@ -278,7 +278,7 @@ impl<'a> BoundInterpreterFlow<'a> {
                         Ok(FlowData::States(vec![new_state]))
                     }
                 }
-                Value::Bool(MaybeVector::LazyVector { data, mask, len, .. }) => {
+                Value::Bool(MaybeVector::LazyVector { data, mask, len }) => {
                     let condition_target = *condition_from_flow_edge;
 
                     // Build a mask for lanes matching this condition
