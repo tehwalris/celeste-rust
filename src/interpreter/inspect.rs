@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::hash::BuildHasherDefault;
 use std::io::{BufRead, Write};
+use std::sync::Arc;
 
 use rustc_hash::FxHasher;
 
@@ -154,8 +155,8 @@ impl<'a> StateHelper<'a> {
                     }),
                     MaybeVector::Vector(nums) if !nums.is_empty() => {
                         // Compute actual min/max of all vector elements
-                        let min = nums.iter().min().copied().unwrap();
-                        let max = nums.iter().max().copied().unwrap();
+                        let min = nums.as_ref().iter().min().copied().unwrap();
+                        let max = nums.as_ref().iter().max().copied().unwrap();
                         if min == max {
                             Some(NumOrInterval::Number {
                                 value: min.into()
@@ -178,8 +179,8 @@ impl<'a> StateHelper<'a> {
                     }),
                     MaybeVector::Vector(intervals) if !intervals.is_empty() => {
                         // Compute actual min/max across all intervals
-                        let min = intervals.iter().map(|i| i.low).min().unwrap();
-                        let max = intervals.iter().map(|i| i.high).max().unwrap();
+                        let min = intervals.as_ref().iter().map(|i| i.low).min().unwrap();
+                        let max = intervals.as_ref().iter().map(|i| i.high).max().unwrap();
                         Some(NumOrInterval::Interval {
                             low: min.into(),
                             high: max.into(),
@@ -499,7 +500,13 @@ pub fn make_state_abstract(mut state: State) -> State {
         for &heap_id in heap_ids {
             let heap_value = state.heap.get(heap_id);
             if let HeapValue::Value(value) = heap_value {
-                let new_value = match value {
+                // Materialize lazy vectors first
+                let value = match value {
+                    Value::Number(mv) => Value::Number(mv.materialize_if_lazy()),
+                    Value::NumberInterval(mv) => Value::NumberInterval(mv.materialize_if_lazy()),
+                    other => other.clone(),
+                };
+                let new_value = match &value {
                     Value::Number(MaybeVector::Scalar(n)) => {
                         assert!(
                             wide_interval.contains_number(*n),
@@ -509,14 +516,14 @@ pub fn make_state_abstract(mut state: State) -> State {
                         Value::NumberInterval(MaybeVector::Scalar(wide_interval))
                     }
                     Value::Number(MaybeVector::Vector(nums)) => {
-                        for n in nums {
+                        for n in nums.as_ref() {
                             assert!(
                                 wide_interval.contains_number(*n),
                                 "player_rem value {:?} not in expected interval",
                                 n
                             );
                         }
-                        Value::NumberInterval(MaybeVector::Vector(vec![wide_interval; nums.len()]))
+                        Value::NumberInterval(MaybeVector::Vector(Arc::new(vec![wide_interval; nums.len()])))
                     }
                     Value::NumberInterval(MaybeVector::Scalar(interval)) => {
                         assert!(
@@ -527,14 +534,14 @@ pub fn make_state_abstract(mut state: State) -> State {
                         Value::NumberInterval(MaybeVector::Scalar(wide_interval))
                     }
                     Value::NumberInterval(MaybeVector::Vector(intervals)) => {
-                        for interval in intervals {
+                        for interval in intervals.as_ref() {
                             assert!(
                                 wide_interval.contains_interval(interval),
                                 "player_rem interval {:?} not in expected interval",
                                 interval
                             );
                         }
-                        Value::NumberInterval(MaybeVector::Vector(vec![wide_interval; intervals.len()]))
+                        Value::NumberInterval(MaybeVector::Vector(Arc::new(vec![wide_interval; intervals.len()])))
                     }
                     other => {
                         panic!("Unexpected value type for player_rem: {:?}", other);

@@ -304,4 +304,32 @@ impl Heap {
             self.compact();
         }
     }
+
+    /// Materialize all lazy vectors in all heap values
+    pub fn materialize_lazy_vectors(&mut self) {
+        // For each value in storage, materialize lazy vectors in place
+        for i in 0..self.next_id {
+            let old_storage_idx = if i < self.base_index.len() {
+                self.base_index[i]
+            } else {
+                usize::MAX
+            };
+
+            if old_storage_idx == usize::MAX {
+                continue;
+            }
+
+            let value = self.storage.get(old_storage_idx).expect("valid storage index").clone();
+            let mut new_value = value;
+            new_value.materialize_lazy_vectors();
+
+            // Update storage
+            let new_storage_idx = self.storage.push_get_index(Box::new(new_value));
+            self.base_index = Arc::new({
+                let mut new_base = self.base_index.as_ref().clone();
+                new_base[i] = new_storage_idx;
+                new_base
+            });
+        }
+    }
 }

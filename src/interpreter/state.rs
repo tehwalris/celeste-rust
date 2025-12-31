@@ -304,6 +304,15 @@ impl State {
         self.local_env = new_local_env;
         self.outer_local_envs = new_outer_local_envs;
     }
+
+    /// Materialize all lazy vectors in this state into concrete vectors
+    pub fn materialize_lazy_vectors(&mut self) {
+        self.heap.materialize_lazy_vectors();
+        self.local_env.materialize_lazy_vectors();
+        for env in &mut self.outer_local_envs {
+            env.materialize_lazy_vectors();
+        }
+    }
 }
 
 #[cfg(test)]

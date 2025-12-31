@@ -1,6 +1,7 @@
 //! Game runner module - sets up and runs the Celeste game interpreter
 
 use anyhow::Result;
+use std::sync::Arc;
 use crate::interpreter::{
     fixed_env::FixedEnv,
     state::State,
@@ -109,7 +110,7 @@ fn builtin_new_vector(mut state: State, args: Vec<Value>) -> Result<Vec<(State, 
     }
     // Update state's vector_size to match the vector length
     state.vector_size = numbers.len();
-    Ok(vec![(state, Value::Number(MaybeVector::Vector(numbers)))])
+    Ok(vec![(state, Value::Number(MaybeVector::Vector(Arc::new(numbers))))])
 }
 
 fn builtin_flr(state: State, args: Vec<Value>) -> Result<Vec<(State, Value)>> {
@@ -136,7 +137,7 @@ fn builtin_flr(state: State, args: Vec<Value>) -> Result<Vec<(State, Value)>> {
         Value::NumberInterval(MaybeVector::Vector(intervals)) => {
             // For a vector of intervals, each must have a single floor value
             let mut floors = Vec::with_capacity(intervals.len());
-            for interval in intervals {
+            for interval in intervals.iter() {
                 let low_flr = interval.low.flr();
                 let high_flr = interval.high.flr();
                 if low_flr != high_flr {
@@ -150,7 +151,7 @@ fn builtin_flr(state: State, args: Vec<Value>) -> Result<Vec<(State, Value)>> {
             let result = if floors.len() == 1 {
                 Value::Number(MaybeVector::Scalar(floors[0]))
             } else {
-                Value::Number(MaybeVector::Vector(floors))
+                Value::Number(MaybeVector::Vector(Arc::new(floors)))
             };
             Ok(vec![(state, result)])
         }
@@ -206,7 +207,7 @@ fn builtin_split_by_flr(state: State, args: Vec<Value>) -> Result<Vec<(State, Va
                 let result_value = if result_nums.len() == 1 {
                     Value::Number(MaybeVector::Scalar(result_nums[0]))
                 } else {
-                    Value::Number(MaybeVector::Vector(result_nums))
+                    Value::Number(MaybeVector::Vector(Arc::new(result_nums)))
                 };
                 results.push((filtered_state, result_value));
             }
@@ -227,7 +228,7 @@ fn builtin_split_by_flr(state: State, args: Vec<Value>) -> Result<Vec<(State, Va
             // 2. Split the union into same-floor sub-intervals
             // 3. For each sub-interval, filter to elements that intersect
             if intervals.is_empty() {
-                return Ok(vec![(state, Value::NumberInterval(MaybeVector::Vector(vec![])))]);
+                return Ok(vec![(state, Value::NumberInterval(MaybeVector::Vector(Arc::new(vec![]))))]);
             }
 
             // Compute union of all intervals
@@ -263,7 +264,7 @@ fn builtin_split_by_flr(state: State, args: Vec<Value>) -> Result<Vec<(State, Va
                 let result_value = if result_intervals.len() == 1 {
                     Value::NumberInterval(MaybeVector::Scalar(result_intervals[0]))
                 } else {
-                    Value::NumberInterval(MaybeVector::Vector(result_intervals))
+                    Value::NumberInterval(MaybeVector::Vector(Arc::new(result_intervals)))
                 };
                 results.push((filtered_state, result_value));
             }
@@ -449,26 +450,37 @@ fn tile_flag_at_computed(
             Value::Number(h),
             Value::Number(flag),
         ) => {
-            // All 5-way map
-            let x_vals: Vec<Pico8Num> = match x {
+            // All 5-way map - materialize any lazy vectors first
+            let x_mat = x.materialize_if_lazy();
+            let y_mat = y.materialize_if_lazy();
+            let w_mat = w.materialize_if_lazy();
+            let h_mat = h.materialize_if_lazy();
+            let flag_mat = flag.materialize_if_lazy();
+
+            let x_vals: Vec<Pico8Num> = match &x_mat {
                 MaybeVector::Scalar(n) => vec![*n],
-                MaybeVector::Vector(v) => v.clone(),
+                MaybeVector::Vector(v) => v.to_vec(),
+                MaybeVector::LazyVector { .. } => unreachable!("materialize_if_lazy should have converted this"),
             };
-            let y_vals: Vec<Pico8Num> = match y {
+            let y_vals: Vec<Pico8Num> = match &y_mat {
                 MaybeVector::Scalar(n) => vec![*n],
-                MaybeVector::Vector(v) => v.clone(),
+                MaybeVector::Vector(v) => v.to_vec(),
+                MaybeVector::LazyVector { .. } => unreachable!("materialize_if_lazy should have converted this"),
             };
-            let w_vals: Vec<Pico8Num> = match w {
+            let w_vals: Vec<Pico8Num> = match &w_mat {
                 MaybeVector::Scalar(n) => vec![*n],
-                MaybeVector::Vector(v) => v.clone(),
+                MaybeVector::Vector(v) => v.to_vec(),
+                MaybeVector::LazyVector { .. } => unreachable!("materialize_if_lazy should have converted this"),
             };
-            let h_vals: Vec<Pico8Num> = match h {
+            let h_vals: Vec<Pico8Num> = match &h_mat {
                 MaybeVector::Scalar(n) => vec![*n],
-                MaybeVector::Vector(v) => v.clone(),
+                MaybeVector::Vector(v) => v.to_vec(),
+                MaybeVector::LazyVector { .. } => unreachable!("materialize_if_lazy should have converted this"),
             };
-            let flag_vals: Vec<Pico8Num> = match flag {
+            let flag_vals: Vec<Pico8Num> = match &flag_mat {
                 MaybeVector::Scalar(n) => vec![*n],
-                MaybeVector::Vector(v) => v.clone(),
+                MaybeVector::Vector(v) => v.to_vec(),
+                MaybeVector::LazyVector { .. } => unreachable!("materialize_if_lazy should have converted this"),
             };
 
             // Broadcast to common length
@@ -500,7 +512,7 @@ fn tile_flag_at_computed(
             let result = if results.len() == 1 {
                 Value::Bool(MaybeVector::Scalar(results[0]))
             } else {
-                Value::Bool(MaybeVector::Vector(results))
+                Value::Bool(MaybeVector::Vector(Arc::new(results)))
             };
             Ok(vec![(state, result)])
         }

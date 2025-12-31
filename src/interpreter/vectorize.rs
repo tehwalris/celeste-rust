@@ -7,6 +7,7 @@
 //! 3. Deduplicate vectors (remove duplicate elements)
 //! 4. If vector size becomes 1, convert back to scalars
 
+use std::sync::Arc;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::tracing::TraceSpan;
@@ -217,15 +218,30 @@ fn expand_value_to_scalars(value: &Value, size: usize) -> Vec<ScalarValue> {
             assert_eq!(nums.len(), size);
             nums.iter().map(|n| ScalarValue::Number(*n)).collect()
         }
+        Value::Number(MaybeVector::LazyVector { .. }) => {
+            // Materialize lazy vector before expanding
+            let materialized = value.materialize_if_lazy();
+            expand_value_to_scalars(&materialized, size)
+        }
         Value::NumberInterval(MaybeVector::Scalar(n)) => vec![ScalarValue::NumberInterval(*n); size],
         Value::NumberInterval(MaybeVector::Vector(nums)) => {
             assert_eq!(nums.len(), size);
             nums.iter().map(|n| ScalarValue::NumberInterval(*n)).collect()
         }
+        Value::NumberInterval(MaybeVector::LazyVector { .. }) => {
+            // Materialize lazy vector before expanding
+            let materialized = value.materialize_if_lazy();
+            expand_value_to_scalars(&materialized, size)
+        }
         Value::Bool(MaybeVector::Scalar(b)) => vec![ScalarValue::Bool(*b); size],
         Value::Bool(MaybeVector::Vector(bools)) => {
             assert_eq!(bools.len(), size);
             bools.iter().map(|b| ScalarValue::Bool(*b)).collect()
+        }
+        Value::Bool(MaybeVector::LazyVector { .. }) => {
+            // Materialize lazy vector before expanding
+            let materialized = value.materialize_if_lazy();
+            expand_value_to_scalars(&materialized, size)
         }
         Value::String(s) => vec![ScalarValue::String(s.clone()); size],
         Value::Nil(hint) => vec![ScalarValue::Nil(hint.clone()); size],
@@ -261,15 +277,30 @@ fn scalar_value_from_value(value: &Value) -> ScalarValue {
             assert_eq!(nums.len(), 1);
             ScalarValue::Number(nums[0])
         }
+        Value::Number(MaybeVector::LazyVector { .. }) => {
+            // Materialize lazy vector before extracting
+            let materialized = value.materialize_if_lazy();
+            scalar_value_from_value(&materialized)
+        }
         Value::NumberInterval(MaybeVector::Scalar(n)) => ScalarValue::NumberInterval(*n),
         Value::NumberInterval(MaybeVector::Vector(nums)) => {
             assert_eq!(nums.len(), 1);
             ScalarValue::NumberInterval(nums[0])
         }
+        Value::NumberInterval(MaybeVector::LazyVector { .. }) => {
+            // Materialize lazy vector before extracting
+            let materialized = value.materialize_if_lazy();
+            scalar_value_from_value(&materialized)
+        }
         Value::Bool(MaybeVector::Scalar(b)) => ScalarValue::Bool(*b),
         Value::Bool(MaybeVector::Vector(bools)) => {
             assert_eq!(bools.len(), 1);
             ScalarValue::Bool(bools[0])
+        }
+        Value::Bool(MaybeVector::LazyVector { .. }) => {
+            // Materialize lazy vector before extracting
+            let materialized = value.materialize_if_lazy();
+            scalar_value_from_value(&materialized)
         }
         Value::String(s) => ScalarValue::String(s.clone()),
         Value::Nil(hint) => ScalarValue::Nil(hint.clone()),
@@ -311,7 +342,7 @@ fn value_from_scalars(scalars: Vec<ScalarValue>) -> Value {
                         _ => panic!("Mixed types in vector"),
                     })
                     .collect();
-                Value::Number(MaybeVector::Vector(nums))
+                Value::Number(MaybeVector::Vector(Arc::new(nums)))
             }
             ScalarValue::NumberInterval(_) => {
                 let nums: Vec<Pico8NumInterval> = scalars.into_iter()
@@ -320,7 +351,7 @@ fn value_from_scalars(scalars: Vec<ScalarValue>) -> Value {
                         _ => panic!("Mixed types in vector"),
                     })
                     .collect();
-                Value::NumberInterval(MaybeVector::Vector(nums))
+                Value::NumberInterval(MaybeVector::Vector(Arc::new(nums)))
             }
             ScalarValue::Bool(_) => {
                 let bools: Vec<bool> = scalars.into_iter()
@@ -329,7 +360,7 @@ fn value_from_scalars(scalars: Vec<ScalarValue>) -> Value {
                         _ => panic!("Mixed types in vector"),
                     })
                     .collect();
-                Value::Bool(MaybeVector::Vector(bools))
+                Value::Bool(MaybeVector::Vector(Arc::new(bools)))
             }
             _ => {
                 // UnknownBool, String, etc. are not vectorizable
@@ -471,7 +502,12 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
             let ref_val = ref_val.unwrap_or(Pico8Num::from_i16(0));
 
             for (v, size) in values {
-                match v {
+                // Materialize lazy vectors for merging
+                let v = match v {
+                    Value::Number(mv) => Value::Number(mv.materialize_if_lazy()),
+                    other => other.clone(),
+                };
+                match &v {
                     Value::Number(MaybeVector::Scalar(n)) => {
                         if all_same && *n != ref_val {
                             all_same = false;
@@ -481,7 +517,7 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
                     }
                     Value::Number(MaybeVector::Vector(nums)) => {
                         if all_same {
-                            for n in nums {
+                            for n in nums.iter() {
                                 if *n != ref_val {
                                     all_same = false;
                                     break;
@@ -496,7 +532,7 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
             if result.len() == 1 || (all_same && result.len() > 1) {
                 Value::Number(MaybeVector::Scalar(result[0]))
             } else {
-                Value::Number(MaybeVector::Vector(result))
+                Value::Number(MaybeVector::Vector(Arc::new(result)))
             }
         }
         Value::NumberInterval(_) => {
@@ -512,7 +548,12 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
             let ref_val = ref_val.unwrap_or(Pico8NumInterval::new(Pico8Num::from_i16(0), Pico8Num::from_i16(0)));
 
             for (v, size) in values {
-                match v {
+                // Materialize lazy vectors for merging
+                let v = match v {
+                    Value::NumberInterval(mv) => Value::NumberInterval(mv.materialize_if_lazy()),
+                    other => other.clone(),
+                };
+                match &v {
                     Value::NumberInterval(MaybeVector::Scalar(n)) => {
                         if all_same && *n != ref_val {
                             all_same = false;
@@ -522,7 +563,7 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
                     }
                     Value::NumberInterval(MaybeVector::Vector(nums)) => {
                         if all_same {
-                            for n in nums {
+                            for n in nums.iter() {
                                 if *n != ref_val {
                                     all_same = false;
                                     break;
@@ -537,7 +578,7 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
             if result.len() == 1 || (all_same && result.len() > 1) {
                 Value::NumberInterval(MaybeVector::Scalar(result[0]))
             } else {
-                Value::NumberInterval(MaybeVector::Vector(result))
+                Value::NumberInterval(MaybeVector::Vector(Arc::new(result)))
             }
         }
         Value::Bool(_) => {
@@ -553,7 +594,12 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
             let ref_val = ref_val.unwrap_or(false);
 
             for (v, size) in values {
-                match v {
+                // Materialize lazy vectors for merging
+                let v = match v {
+                    Value::Bool(mv) => Value::Bool(mv.materialize_if_lazy()),
+                    other => other.clone(),
+                };
+                match &v {
                     Value::Bool(MaybeVector::Scalar(b)) => {
                         if all_same && *b != ref_val {
                             all_same = false;
@@ -563,7 +609,7 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
                     }
                     Value::Bool(MaybeVector::Vector(bools)) => {
                         if all_same {
-                            for b in bools {
+                            for b in bools.iter() {
                                 if *b != ref_val {
                                     all_same = false;
                                     break;
@@ -578,7 +624,7 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
             if result.len() == 1 || (all_same && result.len() > 1) {
                 Value::Bool(MaybeVector::Scalar(result[0]))
             } else {
-                Value::Bool(MaybeVector::Vector(result))
+                Value::Bool(MaybeVector::Vector(Arc::new(result)))
             }
         }
         _ => panic!("Unexpected value type for merge"),
@@ -1040,7 +1086,7 @@ fn extract_vectorizable_value(value: &Value) -> Option<VectorizableValue> {
     match value {
         Value::Number(MaybeVector::Scalar(n)) => Some(VectorizableValue::Number(*n)),
         Value::Number(MaybeVector::Vector(nums)) => {
-            let mut raw: Vec<Pico8Num> = nums.clone();
+            let mut raw: Vec<Pico8Num> = (**nums).clone();
             raw.sort();
             raw.dedup();
             Some(VectorizableValue::NumberVector(raw))
@@ -1058,7 +1104,7 @@ fn extract_vectorizable_value(value: &Value) -> Option<VectorizableValue> {
         }
         Value::Bool(MaybeVector::Scalar(b)) => Some(VectorizableValue::Bool(*b)),
         Value::Bool(MaybeVector::Vector(bools)) => {
-            let mut raw: Vec<bool> = bools.clone();
+            let mut raw: Vec<bool> = (**bools).clone();
             raw.sort();
             raw.dedup();
             Some(VectorizableValue::BoolVector(raw))
@@ -1339,10 +1385,13 @@ mod tests {
         state3.global_env.insert("x".to_string(), x3);
         state3.global_env.insert("y".to_string(), y3);
 
-        let result = vectorize_states(vec![state1, state2, state3]);
+        let mut result = vectorize_states(vec![state1, state2, state3]);
         assert_eq!(result.len(), 1);
-        let state = &result[0];
+        let state = &mut result[0];
         assert_eq!(state.vector_size, 2, "Should have 2 unique rows, not 3");
+
+        // Materialize lazy vectors if needed
+        state.materialize_lazy_vectors();
 
         // Verify the values
         let x_id = state.global_env.get("x").unwrap();
@@ -1350,7 +1399,7 @@ mod tests {
             HeapValue::Value(Value::Number(MaybeVector::Vector(nums))) => {
                 assert_eq!(nums.len(), 2);
             }
-            _ => panic!("Expected vector for x"),
+            other => panic!("Expected vector for x, got: {:?}", other),
         }
         let y_id = state.global_env.get("y").unwrap();
         match state.heap.get(*y_id) {
@@ -1410,10 +1459,10 @@ mod tests {
         let mut state1 = State::new();
         state1.vector_size = 2;
         let x1 = state1.heap.alloc();
-        state1.heap.set(x1, HeapValue::Value(Value::Number(MaybeVector::Vector(vec![
+        state1.heap.set(x1, HeapValue::Value(Value::Number(MaybeVector::Vector(Arc::new(vec![
             Pico8Num::from_i16(1),
             Pico8Num::from_i16(2),
-        ]))));
+        ])))));
         state1.global_env.insert("x".to_string(), x1);
 
         let mut state2 = State::new();
@@ -1448,10 +1497,10 @@ mod tests {
         let mut state1 = State::new();
         state1.vector_size = 2;
         let x1 = state1.heap.alloc();
-        state1.heap.set(x1, HeapValue::Value(Value::Number(MaybeVector::Vector(vec![
+        state1.heap.set(x1, HeapValue::Value(Value::Number(MaybeVector::Vector(Arc::new(vec![
             Pico8Num::from_i16(1),
             Pico8Num::from_i16(2),
-        ]))));
+        ])))));
         state1.global_env.insert("x".to_string(), x1);
 
         let mut state2 = State::new();
