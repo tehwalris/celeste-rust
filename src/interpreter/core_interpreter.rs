@@ -299,20 +299,6 @@ impl<'a> CoreInterpreter<'a> {
         // Get the heap value
         let heap_value = self.state.heap.get(closure_heap_id).clone();
 
-        // Only materialize if <75% of lanes are live (i.e., >25% garbage).
-        // When most lanes are active, the overhead of processing some garbage
-        // is less than the cost of filtering all vectors.
-        // Builtins that need exact vector lengths (like __split_by_flr) call
-        // materialize_with_args themselves.
-        // NOTE: Setting to 0.0 causes OOM - vectors grow unbounded with dead lanes.
-        const MATERIALIZE_THRESHOLD: f64 = 0.75;
-        if self.state.mask.is_some() && MATERIALIZE_THRESHOLD > 0.0 {
-            let live_ratio = self.state.vector_size as f64 / self.state.original_size as f64;
-            if live_ratio < MATERIALIZE_THRESHOLD {
-                self.state.materialize();
-            }
-        }
-
         // Gather argument values
         let arg_values: Vec<Value> = arg_local_ids
             .iter()
@@ -409,8 +395,6 @@ impl<'a> CoreInterpreter<'a> {
                 // Create the state for executing the function body.
                 // We push the caller's local_env onto outer_local_envs so it can be
                 // restored after the function returns.
-                // Note: The mask and original_size are passed to the new state. If <75%
-                // lanes were live, we materialized above; otherwise garbage may remain.
                 //
                 // We use std::mem::take to move fields instead of cloning - this is safe
                 // because interpret_call_instruction takes `self` by value, so we own the state.
@@ -423,8 +407,6 @@ impl<'a> CoreInterpreter<'a> {
                     outer_local_envs: new_outer_local_envs,
                     global_env: std::mem::take(&mut self.state.global_env),
                     prints: std::mem::take(&mut self.state.prints),
-                    original_size: self.state.original_size,
-                    mask: std::mem::take(&mut self.state.mask),
                     vector_size: self.state.vector_size,
                 };
 
@@ -489,15 +471,6 @@ impl<'a> CoreInterpreter<'a> {
                             outer_local_envs: remaining_outer_envs,
                             global_env: function_result_state.global_env,
                             prints: function_result_state.prints,
-                            original_size: function_result_state.original_size,
-                            mask: function_result_state.mask,
-                            // Use the function's final vector_size - this is correct because:
-                            // - The caller's local_env contains the original values which are
-                            //   scalar or match the original vector_size
-                            // - Scalar values work with any vector_size
-                            // - If the function's vector_size changed, it's because some
-                            //   vectorization/filtering happened inside, but the caller's
-                            //   scalars are unaffected
                             vector_size: function_result_state.vector_size,
                         };
                         // Set the return value (or nil if none)

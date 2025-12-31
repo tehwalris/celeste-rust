@@ -139,8 +139,6 @@ fn setup_function_state(
         outer_local_envs: new_outer_local_envs,
         global_env: original_state.global_env.clone(),
         prints: original_state.prints.clone(),
-        original_size: original_state.original_size,
-        mask: original_state.mask.clone(),
         vector_size: original_state.vector_size,
     }
 }

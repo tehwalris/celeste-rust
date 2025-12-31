@@ -26,11 +26,7 @@ pub struct State {
     pub outer_local_envs: Vec<LocalEnv>,
     pub global_env: ImOrdMap<String, HeapId>,
     pub prints: Vec<String>,
-    /// Actual length of stored vectors (never changes during interpretation, only at vectorization/materialize)
-    pub original_size: usize,
-    /// Which lanes are active (length = original_size). None means all-true (optimization).
-    pub mask: Option<Vec<bool>>,
-    /// Effective number of active lanes = count_true(mask) or original_size if mask is None
+    /// Length of stored vectors (changes when vectors are filtered by branching or GC)
     pub vector_size: usize,
 }
 
@@ -47,8 +43,6 @@ impl Serialize for State {
             outer_local_envs: &'a Vec<LocalEnv>,
             global_env: Vec<(String, HeapId)>,
             prints: &'a Vec<String>,
-            original_size: usize,
-            mask: &'a Option<Vec<bool>>,
             vector_size: usize,
         }
 
@@ -62,8 +56,6 @@ impl Serialize for State {
             outer_local_envs: &self.outer_local_envs,
             global_env,
             prints: &self.prints,
-            original_size: self.original_size,
-            mask: &self.mask,
             vector_size: self.vector_size,
         }.serialize(serializer)
     }
@@ -81,8 +73,6 @@ impl<'de> Deserialize<'de> for State {
             outer_local_envs: Vec<LocalEnv>,
             global_env: Vec<(String, HeapId)>,
             prints: Vec<String>,
-            original_size: usize,
-            mask: Option<Vec<bool>>,
             vector_size: usize,
         }
 
@@ -98,8 +88,6 @@ impl<'de> Deserialize<'de> for State {
             outer_local_envs: s.outer_local_envs,
             global_env,
             prints: s.prints,
-            original_size: s.original_size,
-            mask: s.mask,
             vector_size: s.vector_size,
         })
     }
@@ -113,92 +101,12 @@ impl State {
             outer_local_envs: Vec::new(),
             global_env: ImOrdMap::new(),
             prints: Vec::new(),
-            original_size: 1,
-            mask: None, // None means all-true
             vector_size: 1,
         }
     }
 }
 
 impl State {
-    /// Applies the pending mask to actually filter all vectors.
-    /// After this, original_size = vector_size and mask = None.
-    pub fn materialize(&mut self) {
-        let _trace = TraceSpan::new("materialize", "gc");
-        if let Some(mask) = self.mask.take() {
-            use super::value::count_true;
-            let true_count = count_true(&mask);
-
-            // Filter values in heap
-            self.heap.filter_vectors_in_place(&mask, true_count);
-
-            // Filter values in local env
-            self.local_env.filter_vectors_in_place(&mask, true_count);
-
-            // Filter values in outer local envs
-            for env in &mut self.outer_local_envs {
-                env.filter_vectors_in_place(&mask, true_count);
-            }
-
-            // Reset to materialized state
-            self.original_size = true_count;
-            // mask is already None from take()
-            // vector_size should already equal true_count
-            debug_assert_eq!(self.vector_size, true_count);
-        }
-    }
-
-    /// Materialize the state and filter a Vec<Value> to match.
-    /// Use this in builtins that create masks based on arg vector lengths.
-    ///
-    /// If there's no pending mask, returns args unchanged.
-    /// If there's a pending mask, filters args to remove dead lanes, then materializes state.
-    pub fn materialize_with_args(&mut self, args: Vec<Value>) -> Vec<Value> {
-        use super::value::count_true;
-
-        if let Some(ref mask) = self.mask {
-            let true_count = count_true(mask);
-            let filtered_args = args
-                .into_iter()
-                .map(|v| {
-                    v.filter_vectors_if_vector(mask, true_count)
-                        .unwrap_or(v)
-                })
-                .collect();
-            self.materialize();
-            filtered_args
-        } else {
-            args
-        }
-    }
-
-    /// Apply a lazy mask for branching. Instead of filtering all vectors,
-    /// just compose this mask with the existing mask.
-    /// Returns the new vector_size (count of true values in composed mask).
-    pub fn apply_lazy_mask(&mut self, condition_mask: &[bool]) -> usize {
-        use super::value::count_true;
-
-        let new_mask = match &self.mask {
-            None => {
-                // No existing mask, condition_mask becomes the mask
-                condition_mask.to_vec()
-            }
-            Some(existing) => {
-                // Compose: new[i] = existing[i] && condition_mask[i]
-                // Both have length original_size
-                existing.iter()
-                    .zip(condition_mask.iter())
-                    .map(|(&e, &c)| e && c)
-                    .collect()
-            }
-        };
-
-        let new_count = count_true(&new_mask);
-        self.mask = Some(new_mask);
-        self.vector_size = new_count;
-        new_count
-    }
-
     pub fn map_values_in_place(&mut self, f: impl Fn(Value) -> Value) {
         let f = &f;
         self.heap.map_in_place(|v| match v {
@@ -225,8 +133,7 @@ impl State {
     }
 
     /// Filters all vector values in the state by a mask in place.
-    /// The resulting state's vector_size and original_size will be the number of true values in the mask.
-    /// The mask is cleared (set to None) since all vectors are now at their final size.
+    /// The resulting state's vector_size will be the number of true values in the mask.
     fn filter_by_mask_in_place(&mut self, mask: &[bool]) {
         let _trace = TraceSpan::new("filter_by_mask", "filter");
         use super::value::count_true;
@@ -243,10 +150,7 @@ impl State {
             env.filter_vectors_in_place(mask, new_vector_size);
         }
 
-        // Update all size fields to be consistent
-        self.original_size = new_vector_size;
         self.vector_size = new_vector_size;
-        self.mask = None; // All vectors are now at final size, no mask needed
     }
 
     /// Filters all vector values in the state by a mask, cloning first.
@@ -268,10 +172,6 @@ impl State {
     pub fn gc(&mut self) {
         let _trace = TraceSpan::new("gc", "gc");
 
-        // We materialize at the END of GC, not the beginning.
-        // This is safe because Pointers are scalar (not vectorized),
-        // so GC's reachability traversal is unaffected by masked lanes.
-        // It's more efficient because GC removes dead heap values first.
         let mut old_to_new: FxHashMap<HeapId, HeapId> = FxHashMap::default();
         let mut new_heap_values: Vec<HeapValue> = Vec::new();
 
@@ -403,12 +303,6 @@ impl State {
         self.global_env = new_global_env;
         self.local_env = new_local_env;
         self.outer_local_envs = new_outer_local_envs;
-
-        // Materialize any pending mask AFTER GC.
-        // This is more efficient than materializing before GC because:
-        // - GC removes dead heap values, so there are fewer HeapValues to iterate
-        // - Pointers are scalar (not vectorized), so GC traversal is unaffected by the mask
-        self.materialize();
     }
 }
 

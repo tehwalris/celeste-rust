@@ -380,8 +380,6 @@ fn vectorize_same_shape_states(states: Vec<State>) -> State {
         outer_local_envs: merged_outer_local_envs,
         global_env: first_state.global_env.clone(),
         prints: first_state.prints.clone(),
-        original_size: total_vector_size,
-        mask: None, // All lanes active after fresh merge
         vector_size: total_vector_size,
     }
 }
@@ -934,11 +932,11 @@ impl Clone for VectorizeTimingStats {
     }
 }
 
-/// Vectorize states: GC + materialize + merge by shape.
+/// Vectorize states: GC + merge by shape.
 ///
 /// This is the main entry point for combining multiple states into fewer
 /// vectorized states. It:
-/// 1. GCs all states (removes heap garbage, calls materialize internally)
+/// 1. GCs all states (removes heap garbage)
 /// 2. Groups states by shape (structure with values normalized)
 /// 3. Merges each group into a single vectorized state
 /// 4. Deduplicates rows within each merged state
@@ -949,7 +947,6 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
 
     // GC all states before shape grouping.
     // This removes garbage from heaps, allowing states to match shapes better.
-    // GC internally calls materialize(), ensuring vectors are compacted.
     let states: Vec<State> = {
         let _gc_trace = TraceSpan::new("gc_before_vectorize", "gc");
         states.into_iter().map(|mut s| { s.gc(); s }).collect()
@@ -1258,18 +1255,21 @@ mod tests {
         state1.vector_size = 1;
         let id = state1.heap.alloc();
         state1.heap.set(id, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(5)))));
+        state1.global_env.insert("x".to_string(), id);
 
         let mut state2 = State::new();
         state2.vector_size = 1;
         let id2 = state2.heap.alloc();
         state2.heap.set(id2, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(3)))));
+        state2.global_env.insert("x".to_string(), id2);
 
         let result = vectorize_states(vec![state1, state2]);
         assert_eq!(result.len(), 1);
         let state = &result[0];
         assert_eq!(state.vector_size, 2);
 
-        match state.heap.get(HeapId::from_raw(0)) {
+        let x_id = state.global_env.get("x").unwrap();
+        match state.heap.get(*x_id) {
             HeapValue::Value(Value::Number(MaybeVector::Vector(nums))) => {
                 assert_eq!(nums.len(), 2);
             }
@@ -1283,11 +1283,13 @@ mod tests {
         state1.vector_size = 1;
         let id = state1.heap.alloc();
         state1.heap.set(id, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(5)))));
+        state1.global_env.insert("x".to_string(), id);
 
         let mut state2 = State::new();
         state2.vector_size = 1;
         let id2 = state2.heap.alloc();
         state2.heap.set(id2, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(5)))));
+        state2.global_env.insert("x".to_string(), id2);
 
         let result = vectorize_states(vec![state1, state2]);
         assert_eq!(result.len(), 1);
@@ -1295,7 +1297,8 @@ mod tests {
         // After dedup, should be back to scalar since both values were the same
         assert_eq!(state.vector_size, 1);
 
-        match state.heap.get(HeapId::from_raw(0)) {
+        let x_id = state.global_env.get("x").unwrap();
+        match state.heap.get(*x_id) {
             HeapValue::Value(Value::Number(MaybeVector::Scalar(_))) => {}
             _ => panic!("Expected scalar after dedup"),
         }
@@ -1315,6 +1318,8 @@ mod tests {
         let y1 = state1.heap.alloc();
         state1.heap.set(x1, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(1)))));
         state1.heap.set(y1, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(10)))));
+        state1.global_env.insert("x".to_string(), x1);
+        state1.global_env.insert("y".to_string(), y1);
 
         let mut state2 = State::new();
         state2.vector_size = 1;
@@ -1322,6 +1327,8 @@ mod tests {
         let y2 = state2.heap.alloc();
         state2.heap.set(x2, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(2)))));
         state2.heap.set(y2, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(20)))));
+        state2.global_env.insert("x".to_string(), x2);
+        state2.global_env.insert("y".to_string(), y2);
 
         let mut state3 = State::new();
         state3.vector_size = 1;
@@ -1329,6 +1336,8 @@ mod tests {
         let y3 = state3.heap.alloc();
         state3.heap.set(x3, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(1)))));
         state3.heap.set(y3, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(10)))));
+        state3.global_env.insert("x".to_string(), x3);
+        state3.global_env.insert("y".to_string(), y3);
 
         let result = vectorize_states(vec![state1, state2, state3]);
         assert_eq!(result.len(), 1);
@@ -1336,13 +1345,15 @@ mod tests {
         assert_eq!(state.vector_size, 2, "Should have 2 unique rows, not 3");
 
         // Verify the values
-        match state.heap.get(HeapId::from_raw(0)) {
+        let x_id = state.global_env.get("x").unwrap();
+        match state.heap.get(*x_id) {
             HeapValue::Value(Value::Number(MaybeVector::Vector(nums))) => {
                 assert_eq!(nums.len(), 2);
             }
             _ => panic!("Expected vector for x"),
         }
-        match state.heap.get(HeapId::from_raw(1)) {
+        let y_id = state.global_env.get("y").unwrap();
+        match state.heap.get(*y_id) {
             HeapValue::Value(Value::Number(MaybeVector::Vector(nums))) => {
                 assert_eq!(nums.len(), 2);
             }
@@ -1363,6 +1374,8 @@ mod tests {
         let y1 = state1.heap.alloc();
         state1.heap.set(x1, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(1)))));
         state1.heap.set(y1, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(10)))));
+        state1.global_env.insert("x".to_string(), x1);
+        state1.global_env.insert("y".to_string(), y1);
 
         let mut state2 = State::new();
         state2.vector_size = 1;
@@ -1370,6 +1383,8 @@ mod tests {
         let y2 = state2.heap.alloc();
         state2.heap.set(x2, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(1)))));
         state2.heap.set(y2, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(20)))));
+        state2.global_env.insert("x".to_string(), x2);
+        state2.global_env.insert("y".to_string(), y2);
 
         let mut state3 = State::new();
         state3.vector_size = 1;
@@ -1377,6 +1392,8 @@ mod tests {
         let y3 = state3.heap.alloc();
         state3.heap.set(x3, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(2)))));
         state3.heap.set(y3, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(10)))));
+        state3.global_env.insert("x".to_string(), x3);
+        state3.global_env.insert("y".to_string(), y3);
 
         let result = vectorize_states(vec![state1, state2, state3]);
         assert_eq!(result.len(), 1);
@@ -1397,18 +1414,21 @@ mod tests {
             Pico8Num::from_i16(1),
             Pico8Num::from_i16(2),
         ]))));
+        state1.global_env.insert("x".to_string(), x1);
 
         let mut state2 = State::new();
         state2.vector_size = 1;
         let x2 = state2.heap.alloc();
         state2.heap.set(x2, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(3)))));
+        state2.global_env.insert("x".to_string(), x2);
 
         let result = vectorize_states(vec![state1, state2]);
         assert_eq!(result.len(), 1);
         let state = &result[0];
         assert_eq!(state.vector_size, 3);
 
-        match state.heap.get(HeapId::from_raw(0)) {
+        let x_id = state.global_env.get("x").unwrap();
+        match state.heap.get(*x_id) {
             HeapValue::Value(Value::Number(MaybeVector::Vector(nums))) => {
                 assert_eq!(nums.len(), 3);
                 assert_eq!(nums[0], Pico8Num::from_i16(1));
@@ -1432,11 +1452,13 @@ mod tests {
             Pico8Num::from_i16(1),
             Pico8Num::from_i16(2),
         ]))));
+        state1.global_env.insert("x".to_string(), x1);
 
         let mut state2 = State::new();
         state2.vector_size = 1;
         let x2 = state2.heap.alloc();
         state2.heap.set(x2, HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(2)))));
+        state2.global_env.insert("x".to_string(), x2);
 
         let result = vectorize_states(vec![state1, state2]);
         assert_eq!(result.len(), 1);

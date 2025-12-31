@@ -145,8 +145,9 @@ pub fn is_tracing_enabled() -> bool {
     TRACING_ENABLED.load(Ordering::Acquire)
 }
 
-/// Reset tracing, clearing all collected data
+/// Reset tracing, clearing all collected data and disabling tracing
 pub fn reset_tracing() {
+    TRACING_ENABLED.store(false, Ordering::Release);
     let now = Instant::now();
     *EPOCH_INSTANT.lock().unwrap() = Some(now);
     LOCAL_EPOCH.with(|e| *e.borrow_mut() = Some(now));
@@ -160,11 +161,9 @@ pub fn reset_tracing() {
 
 /// Collect spans from the current thread's buffer into the global collection.
 /// Call this at the end of execution on each thread.
+/// Note: We always collect spans regardless of whether tracing is currently enabled,
+/// since spans may have been recorded when tracing was enabled.
 pub fn collect_thread_spans() {
-    if !is_tracing_enabled() {
-        return;
-    }
-
     THREAD_BUFFER.with(|buf| {
         let mut buf = buf.borrow_mut();
         if !buf.spans.is_empty() {
@@ -290,6 +289,8 @@ mod tests {
 
     #[test]
     fn test_tracing_disabled_by_default() {
+        // Reset to ensure test isolation (other tests may have enabled tracing)
+        reset_tracing();
         assert!(!is_tracing_enabled());
     }
 
