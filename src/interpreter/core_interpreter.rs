@@ -299,9 +299,17 @@ impl<'a> CoreInterpreter<'a> {
         // Get the heap value
         let heap_value = self.state.heap.get(closure_heap_id).clone();
 
-        // Materialize before any call (builtin or closure) to ensure vectors
-        // have consistent lengths matching original_size.
-        self.state.materialize();
+        // Only materialize if <75% of lanes are live (i.e., >25% garbage).
+        // When most lanes are active, the overhead of processing some garbage
+        // is less than the cost of filtering all vectors.
+        // Builtins that need exact vector lengths (like __split_by_flr) call
+        // materialize_with_args themselves.
+        if self.state.mask.is_some() {
+            let live_ratio = self.state.vector_size as f64 / self.state.original_size as f64;
+            if live_ratio < 0.75 {
+                self.state.materialize();
+            }
+        }
 
         // Gather argument values
         let arg_values: Vec<Value> = arg_local_ids
@@ -386,8 +394,8 @@ impl<'a> CoreInterpreter<'a> {
                 // Create the state for executing the function body.
                 // We push the caller's local_env onto outer_local_envs so it can be
                 // restored after the function returns.
-                // Note: materialize() was already called before the match, so vectors
-                // have consistent lengths matching original_size.
+                // Note: The mask and original_size are passed to the new state. If <75%
+                // lanes were live, we materialized above; otherwise garbage may remain.
                 let mut new_outer_local_envs = vec![self.state.local_env.clone()];
                 new_outer_local_envs.extend(self.state.outer_local_envs.clone());
 

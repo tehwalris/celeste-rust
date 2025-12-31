@@ -178,13 +178,14 @@ fn split_interval_by_floor(interval: Pico8NumInterval) -> Vec<Pico8NumInterval> 
     results
 }
 
-fn builtin_split_by_flr(state: State, args: Vec<Value>) -> Result<Vec<(State, Value)>> {
+fn builtin_split_by_flr(mut state: State, args: Vec<Value>) -> Result<Vec<(State, Value)>> {
     use std::collections::BTreeMap;
     if args.len() != 1 {
         return Err(anyhow!("__split_by_flr requires 1 argument"));
     }
-    // Note: materialize() is called before all function calls in core_interpreter,
-    // so args already have correct lengths and state has no pending mask.
+    // This builtin creates masks based on arg vector lengths, so we need to
+    // ensure any pending mask is materialized first to get correct vector lengths.
+    let args = state.materialize_with_args(args);
     match &args[0] {
         Value::Number(MaybeVector::Scalar(n)) => {
             Ok(vec![(state, Value::Number(MaybeVector::Scalar(*n)))])
