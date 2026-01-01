@@ -41,6 +41,7 @@ impl CachedTrace {
         // Build substitution map: SymbolId -> ConcreteValue
         let substitution = self.build_substitution(input_state);
 
+
         // Clone the template output state
         let mut output_state = self.output_state.clone();
 

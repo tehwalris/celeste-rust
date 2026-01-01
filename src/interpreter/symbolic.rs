@@ -492,27 +492,92 @@ fn is_truthy(v: &ConcreteValue) -> bool {
 fn get_num(v: &ConcreteValue) -> Option<Pico8Num> {
     match v {
         ConcreteValue::Number(n) => Some(*n),
+        ConcreteValue::Bool(b) => Some(if *b { Pico8Num::from_i16(1) } else { Pico8Num::from_i16(0) }),
+        _ => None,
+    }
+}
+
+/// Numeric value that can be either a concrete number or an interval
+enum NumericValue {
+    Number(Pico8Num),
+    Interval(Pico8NumInterval),
+}
+
+fn get_numeric(v: &ConcreteValue) -> Option<NumericValue> {
+    match v {
+        ConcreteValue::Number(n) => Some(NumericValue::Number(*n)),
+        ConcreteValue::NumberInterval(i) => Some(NumericValue::Interval(*i)),
+        ConcreteValue::Bool(b) => Some(NumericValue::Number(if *b { Pico8Num::from_i16(1) } else { Pico8Num::from_i16(0) })),
         _ => None,
     }
 }
 
 fn eval_add(l: ConcreteValue, r: ConcreteValue) -> ConcreteValue {
-    match (get_num(&l), get_num(&r)) {
-        (Some(a), Some(b)) => ConcreteValue::Number(a + b),
+    match (get_numeric(&l), get_numeric(&r)) {
+        (Some(NumericValue::Number(a)), Some(NumericValue::Number(b))) => {
+            ConcreteValue::Number(a + b)
+        }
+        (Some(NumericValue::Number(a)), Some(NumericValue::Interval(b))) => {
+            // a + [lo, hi] = [a + lo, a + hi]
+            ConcreteValue::NumberInterval(Pico8NumInterval::new(a + b.low, a + b.high))
+        }
+        (Some(NumericValue::Interval(a)), Some(NumericValue::Number(b))) => {
+            // [lo, hi] + b = [lo + b, hi + b]
+            ConcreteValue::NumberInterval(Pico8NumInterval::new(a.low + b, a.high + b))
+        }
+        (Some(NumericValue::Interval(a)), Some(NumericValue::Interval(b))) => {
+            ConcreteValue::NumberInterval(a + b)
+        }
         _ => ConcreteValue::Nil,
     }
 }
 
 fn eval_sub(l: ConcreteValue, r: ConcreteValue) -> ConcreteValue {
-    match (get_num(&l), get_num(&r)) {
-        (Some(a), Some(b)) => ConcreteValue::Number(a - b),
+    match (get_numeric(&l), get_numeric(&r)) {
+        (Some(NumericValue::Number(a)), Some(NumericValue::Number(b))) => {
+            ConcreteValue::Number(a - b)
+        }
+        (Some(NumericValue::Number(a)), Some(NumericValue::Interval(b))) => {
+            // a - [lo, hi] = [a - hi, a - lo]
+            ConcreteValue::NumberInterval(Pico8NumInterval::new(a - b.high, a - b.low))
+        }
+        (Some(NumericValue::Interval(a)), Some(NumericValue::Number(b))) => {
+            // [lo, hi] - b = [lo - b, hi - b]
+            ConcreteValue::NumberInterval(Pico8NumInterval::new(a.low - b, a.high - b))
+        }
+        (Some(NumericValue::Interval(a)), Some(NumericValue::Interval(b))) => {
+            ConcreteValue::NumberInterval(a - b)
+        }
         _ => ConcreteValue::Nil,
     }
 }
 
 fn eval_mul(l: ConcreteValue, r: ConcreteValue) -> ConcreteValue {
-    match (get_num(&l), get_num(&r)) {
-        (Some(a), Some(b)) => ConcreteValue::Number(a * b),
+    match (get_numeric(&l), get_numeric(&r)) {
+        (Some(NumericValue::Number(a)), Some(NumericValue::Number(b))) => {
+            ConcreteValue::Number(a * b)
+        }
+        (Some(NumericValue::Number(a)), Some(NumericValue::Interval(b))) => {
+            // a * [lo, hi] - need to consider sign of a
+            let products = [a * b.low, a * b.high];
+            let min = products.iter().copied().min().unwrap();
+            let max = products.iter().copied().max().unwrap();
+            ConcreteValue::NumberInterval(Pico8NumInterval::new(min, max))
+        }
+        (Some(NumericValue::Interval(a)), Some(NumericValue::Number(b))) => {
+            // [lo, hi] * b - need to consider sign of b
+            let products = [a.low * b, a.high * b];
+            let min = products.iter().copied().min().unwrap();
+            let max = products.iter().copied().max().unwrap();
+            ConcreteValue::NumberInterval(Pico8NumInterval::new(min, max))
+        }
+        (Some(NumericValue::Interval(a)), Some(NumericValue::Interval(b))) => {
+            // [a.lo, a.hi] * [b.lo, b.hi] = all 4 products, take min/max
+            let products = [a.low * b.low, a.low * b.high, a.high * b.low, a.high * b.high];
+            let min = products.iter().copied().min().unwrap();
+            let max = products.iter().copied().max().unwrap();
+            ConcreteValue::NumberInterval(Pico8NumInterval::new(min, max))
+        }
         _ => ConcreteValue::Nil,
     }
 }

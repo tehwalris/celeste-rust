@@ -147,6 +147,9 @@ __reset_button_states()
 
         // Run symbolic tracing
         let (sym_count, sym_time, stats) = if run_symbolic {
+            // Clear cache between frames - HeapIds change after GC
+            cache.clear();
+
             let start = Instant::now();
             let (mut new_states, stats) = run_traced(
                 &frame_cfg,

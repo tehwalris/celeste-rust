@@ -176,12 +176,19 @@ pub fn run_traced(
         }
 
         // Try cache lookup with symbolic substitution (Phase 3)
-        // TODO: Cache is disabled because CachedTrace::apply clones the template's heap,
-        // which has frozen HeapIds from the first execution. After GC, heap layouts change,
-        // so the cached template's heap structure doesn't match the new input state's heap.
-        // To fix: apply() should build output heap from input heap + symbolic mapping,
-        // not clone the template heap.
-        if false && cache.get(&pending_state.shape, &pending_state.path).is_some() {
+        // IMPORTANT: Cache is only valid for re-exploring alternative paths.
+        // We can only use cache when:
+        // 1. We have a non-empty starting path (we're replaying, not discovering)
+        // 2. The cache has an entry for this (shape, path)
+        //
+        // If starting path is empty, we're discovering the path for the first time.
+        // Different states may discover different paths depending on their values.
+        // DISABLED: Cache apply still has type mismatches (Number + Pointer, etc.)
+        // The symbolic tracer records operations that may not be type-safe when
+        // operand types change between input states.
+        let cache_hit = false;
+
+        if cache_hit {
             let cached = cache.get(&pending_state.shape, &pending_state.path).unwrap();
             stats.cache_hits += 1;
             stats.forced_choices += cached.forced_choices;
@@ -211,6 +218,12 @@ pub fn run_traced(
         let result = tracer.interpret(cfg, pending_state.state.clone())?;
 
         stats.forced_choices += result.forced_choices;
+
+        // Debug: show what path was discovered (disabled)
+        // if result.forced_choices > 0 || pending_state.path.choices().is_empty() {
+        //     eprintln!("DEBUG: Traced path {:?} -> {:?} (forced={})",
+        //               pending_state.path.choices(), result.path.choices(), result.forced_choices);
+        // }
 
         // Cache the result with symbolic information
         cache.insert(
