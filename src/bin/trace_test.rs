@@ -67,13 +67,13 @@ fn run_reference_frame(
         }
     }
 
-    // GC states (like main.rs)
-    for state in &mut all_results {
+    // GC states (like main.rs) - parallelize for many states
+    all_results.par_iter_mut().for_each(|state| {
         state.gc();
-    }
+    });
 
     // Make states abstract - widen player.rem to interval (like main.rs)
-    all_results = all_results.into_iter().map(make_state_abstract).collect();
+    all_results = all_results.into_par_iter().map(make_state_abstract).collect();
 
     // Vectorize states to combine similar ones (like main.rs)
     all_results = vectorize_states(all_results);
