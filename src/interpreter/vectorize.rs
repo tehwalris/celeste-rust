@@ -7,6 +7,7 @@
 //! 3. Deduplicate vectors (remove duplicate elements)
 //! 4. If vector size becomes 1, convert back to scalars
 
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use super::{
@@ -288,8 +289,52 @@ fn value_from_scalars(scalars: Vec<ScalarValue>) -> Value {
     }
 }
 
+/// Chunk size for chunked vectorization (to avoid O(n²) dedup on huge groups)
+const VECTORIZE_CHUNK_SIZE: usize = 5000;
+
 /// Merge multiple states with the same shape into one vectorized state.
+/// Uses chunking to avoid O(n²) behavior on large groups.
 fn vectorize_same_shape_states(states: Vec<State>) -> State {
+    if states.len() == 1 {
+        return states.into_iter().next().unwrap();
+    }
+
+    // For small groups, use direct merge
+    if states.len() <= VECTORIZE_CHUNK_SIZE {
+        return vectorize_same_shape_states_direct(states);
+    }
+
+    // For large groups, process in chunks to avoid O(n²) dedup
+    // Process chunks in parallel since they're independent
+    let chunk_vecs: Vec<Vec<State>> = states
+        .chunks(VECTORIZE_CHUNK_SIZE)
+        .map(|chunk| chunk.to_vec())
+        .collect();
+
+    let mut chunks: Vec<State> = chunk_vecs
+        .into_par_iter()
+        .map(|chunk| {
+            let merged = vectorize_same_shape_states_direct(chunk);
+            dedup_vectorized_state(merged)
+        })
+        .collect();
+
+    // Recursively merge chunks (now they're much smaller)
+    while chunks.len() > 1 {
+        let mut next_chunks = Vec::new();
+        for pair in chunks.chunks(2) {
+            let merged = vectorize_same_shape_states_direct(pair.to_vec());
+            let deduped = dedup_vectorized_state(merged);
+            next_chunks.push(deduped);
+        }
+        chunks = next_chunks;
+    }
+
+    chunks.into_iter().next().unwrap()
+}
+
+/// Direct vectorization (no chunking) - used internally.
+fn vectorize_same_shape_states_direct(states: Vec<State>) -> State {
     if states.len() == 1 {
         return states.into_iter().next().unwrap();
     }
@@ -470,18 +515,11 @@ fn dedup_vectorized_state(mut state: State) -> State {
         return state;
     }
 
-    // Create mask for filtering
+    // Create mask for filtering (use the first occurrence of each unique row)
     let mut mask = vec![false; state.vector_size];
     for i in &unique_indices {
-        // We need to pick indices in a way that maintains some order
         mask[*i] = true;
     }
-
-    // Actually, we need to filter based on unique_indices properly
-    // The indices in unique_indices are the ones we want to keep
-    let mask: Vec<bool> = (0..state.vector_size)
-        .map(|i| unique_indices.contains(&i))
-        .collect();
 
     state.filter_by_mask(&mask)
 }
@@ -770,11 +808,20 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
     stats.shape_grouping_ns = t2.elapsed().as_nanos() as u64;
     stats.group_count = states_by_shape.len();
 
-    // Vectorize each group
+    // Vectorize each group (in parallel since groups are independent)
     let t3 = std::time::Instant::now();
-    let result: Vec<State> = states_by_shape
-        .into_iter()
-        .map(|(_, group)| {
+    let mut groups: Vec<Vec<State>> = states_by_shape.into_values().collect();
+
+    // Log group sizes for profiling (only for large inputs)
+    if stats.input_count > 10000 {
+        groups.sort_by_key(|g| std::cmp::Reverse(g.len()));
+        let top_sizes: Vec<usize> = groups.iter().take(10).map(|g| g.len()).collect();
+        eprintln!("Vectorize: {} groups, top sizes: {:?}", groups.len(), top_sizes);
+    }
+
+    let result: Vec<State> = groups
+        .into_par_iter()
+        .map(|group| {
             let vectorized = vectorize_same_shape_states(group);
             let deduped = dedup_vectorized_state(vectorized);
             unvectorize_if_possible(deduped)

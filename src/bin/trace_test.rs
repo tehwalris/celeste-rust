@@ -10,6 +10,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use clap::Parser;
+use rayon::prelude::*;
 
 use celeste_rust::{
     frontend,
@@ -158,11 +159,11 @@ __reset_button_states()
         };
 
         // Run symbolic tracing
-        let (sym_count, sym_time, stats) = if run_symbolic {
+        let (sym_count, sym_time, stats, trace_ms, gc_ms, abstract_ms, vectorize_ms) = if run_symbolic {
             // Clear cache between frames - HeapIds change after GC
             cache.clear();
 
-            let start = Instant::now();
+            let trace_start = Instant::now();
             let (mut new_states, stats) = if args.cached {
                 run_traced_parallel_cached(
                     frame_cfg.clone(),
@@ -185,23 +186,33 @@ __reset_button_states()
                     &mut cache,
                 )?
             };
+            let trace_ms = trace_start.elapsed().as_millis();
 
             // Apply same post-processing as reference: GC, abstract, vectorize
-            for state in &mut new_states {
+            // Use parallel GC since we have many states
+            let gc_start = Instant::now();
+            new_states.par_iter_mut().for_each(|state| {
                 state.gc();
-            }
-            new_states = new_states.into_iter().map(make_state_abstract).collect();
-            new_states = vectorize_states(new_states);
+            });
+            let gc_ms = gc_start.elapsed().as_millis();
 
-            let elapsed = start.elapsed();
+            let abstract_start = Instant::now();
+            new_states = new_states.into_par_iter().map(make_state_abstract).collect();
+            let abstract_ms = abstract_start.elapsed().as_millis();
+
+            let vectorize_start = Instant::now();
+            new_states = vectorize_states(new_states);
+            let vectorize_ms = vectorize_start.elapsed().as_millis();
+
+            let elapsed = trace_start.elapsed();
 
             // Count expanded states (sum of vector_size after vectorization)
             let count = count_expanded(&new_states);
             sym_states = new_states;
 
-            (count, elapsed.as_millis(), Some(stats))
+            (count, elapsed.as_millis(), Some(stats), trace_ms, gc_ms, abstract_ms, vectorize_ms)
         } else {
-            (0, 0, None)
+            (0, 0, None, 0, 0, 0, 0)
         };
 
         // Compare
@@ -232,6 +243,12 @@ __reset_button_states()
                  match_str,
                  if run_reference { format!("{}", ref_time) } else { "-".to_string() },
                  if run_symbolic { format!("{}", sym_time) } else { "-".to_string() });
+
+        // For larger frames, show timing breakdown
+        if run_symbolic && sym_time > 1000 {
+            println!("      Timing: trace={}ms gc={}ms abstract={}ms vectorize={}ms",
+                     trace_ms, gc_ms, abstract_ms, vectorize_ms);
+        }
     }
 
     let total_time = total_start.elapsed();
