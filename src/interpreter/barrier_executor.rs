@@ -462,9 +462,38 @@ impl StateAccumulator {
         }
         pending
     }
+
+    /// Vectorize accumulated states in place to reduce memory and speed up future comparisons.
+    /// This merges states with identical shapes into vectorized states.
+    fn vectorize_in_place(&mut self) {
+        for states in self.states_by_dest.values_mut() {
+            if states.len() > 1 {
+                // Vectorize the states
+                let vectorized = vectorize_states(std::mem::take(states));
+                *states = vectorized;
+
+                // Rebuild the seen_normalized set based on vectorized states
+                // This is needed because vectorization may change state representation
+            }
+        }
+
+        // Rebuild seen_normalized from current states
+        self.seen_normalized.clear();
+        for (dest, states) in &self.states_by_dest {
+            let seen_set = self.seen_normalized.entry(dest.clone()).or_default();
+            for state in states {
+                let normalized = normalize_gc_state_for_comparison(state);
+                seen_set.insert(normalized);
+            }
+        }
+    }
 }
 
 /// Process a single lane and all its paths, returning an accumulator with results.
+///
+/// Optimization: Periodically vectorize accumulated results during path enumeration.
+/// This reduces the number of states we need to track and speeds up deduplication
+/// by leveraging vectorized state comparison.
 fn process_lane(
     cfg: &Cfg,
     vec_state: &State,
@@ -479,6 +508,9 @@ fn process_lane(
 
     // Run with PathCounter to enumerate all paths
     let mut path_counter = PathCounter::new();
+    let mut paths_since_vectorize = 0;
+    const VECTORIZE_BATCH_SIZE: usize = 64; // Vectorize every N paths
+
     loop {
         // Clone the scalar state for this path
         let run_state = scalar_state.clone();
@@ -494,6 +526,13 @@ fn process_lane(
 
         // Add to accumulator with deduplication
         accumulator.add_state(run_result.destination, run_result.state);
+        paths_since_vectorize += 1;
+
+        // Periodically vectorize to compress accumulated states
+        if paths_since_vectorize >= VECTORIZE_BATCH_SIZE {
+            accumulator.vectorize_in_place();
+            paths_since_vectorize = 0;
+        }
 
         // Try next path
         if !path_counter.increment() {

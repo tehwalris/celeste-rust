@@ -250,38 +250,21 @@ The barrier-based executor is implemented and verified correct in `src/interpret
 
 ### Performance Status
 
-After optimization, barrier-based is **~2.1x slower** than flow-based:
+After optimization, barrier-based is **~25% faster** than flow-based:
 - Flow-based Frame 28: 1090 states before merge (4.8s)
-- Barrier-based Frame 28: 41000 paths → 8088 unique states (10.2s)
+- Barrier-based Frame 28: ~12600 paths → ~800 vectorized states (3.6s)
 
-The path explosion (80% dedup) is inherent to the path enumeration approach.
+The key optimization is **batched intermediate vectorization**: during path enumeration,
+we periodically vectorize accumulated states (every 64 paths). This reduces the number
+of paths explored from 41000 to ~12600 and increases deduplication rate to ~94%.
 
 ### Optimizations Applied
 
-1. **Parallel Lane Processing**: All lanes processed in parallel via rayon
-2. **Fast State Normalization**: `normalize_gc_state_for_comparison()` avoids redundant clone+GC
-3. **FxHashSet for Deduplication**: Uses faster hash function than SIP
-4. **Early Deduplication**: States are deduplicated as generated, not batched
-
-### Why It's Still Slower
-
-The fundamental issue is that PathCounter enumerates all 2^n paths for n UnknownBool
-choices. Each path requires:
-1. State cloning (persistent data structure operations)
-2. Running the interpreter
-3. GC and normalization for deduplication
-
-Flow-based avoids this by keeping states vectorized throughout - it never splits on
-UnknownBool, instead using vector masks to represent both branches simultaneously.
-
-### Profile Breakdown (Frame 28)
-- 13% - HAMT bitmap iteration (im library)
-- 6.5% - SIP hashing
-- 6% - HAMT hash_key operations
-- 3% - interpret_call_with_path_counter
-- 2.8% - HAMT Entry cloning
-- 2.6% - LocalEnv::get
-- 2.2% - Kernel lock contention (parallelism)
+1. **Batched Intermediate Vectorization**: Vectorize accumulated states every 64 paths during enumeration. This merges duplicate states early, reducing total path count by ~70%.
+2. **Parallel Lane Processing**: All lanes processed in parallel via rayon
+3. **Fast State Normalization**: `normalize_gc_state_for_comparison()` avoids redundant clone+GC
+4. **FxHashSet for Deduplication**: Uses faster hash function than SIP
+5. **Early Deduplication**: States are deduplicated as generated, not batched
 
 ## Expected Benefits
 
