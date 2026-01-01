@@ -26,17 +26,17 @@ If state counts change, the optimization broke correctness and must be reverted.
 
 ## Approach
 
-Any optimization technique is fair game as long as correctness is preserved. Profile first to identify bottlenecks, then optimize based on data. The barrier executor is in `src/interpreter/barrier_executor.rs`.
+Any optimization technique is fair game as long as correctness is preserved. The barrier executor is in `src/interpreter/barrier_executor.rs`.
 
-Use `./safe-run.sh` to run commands with memory limits. Use `perf` for profiling.
+Use `./safe-run.sh` to run commands with memory limits.
 
 ## Workflow
 
 Each iteration:
 
-1. **Profile** to identify hotspots
+1. **Investigate** and decide on an optimization to try
 
-2. **Implement** one optimization
+2. **Implement** the optimization
 
 3. **Measure** and verify:
    - State counts identical (correctness)
@@ -56,4 +56,4 @@ Each iteration:
      git push
      ```
 
-Begin by profiling the current state and making your first optimization attempt.
+Begin by investigating and making your first optimization attempt.
