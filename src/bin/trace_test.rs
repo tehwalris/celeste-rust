@@ -224,25 +224,31 @@ __reset_button_states()
         println!("  Cache hits: {}", total_stats.cache_hits);
         println!("  Cache misses: {}", total_stats.cache_misses);
         let cache_stats = cache.stats();
-        println!("  Condition checks: {}", cache_stats.condition_checks);
-        println!("  Avg checks per lookup: {:.1}",
+        println!("  No-template misses: {}", cache_stats.no_template_misses);
+        println!("  Trace-not-found misses: {}", cache_stats.trace_not_found_misses);
+        println!("  Condition evals: {}", cache_stats.condition_evals);
+        println!("  Avg evals per lookup: {:.1}",
                  if total_stats.states_processed > 0 {
-                     cache_stats.condition_checks as f64 / total_stats.states_processed as f64
+                     cache_stats.condition_evals as f64 / total_stats.states_processed as f64
                  } else { 0.0 });
         println!("  Reusable traces (no concrete branches): {}", total_stats.reusable_traces);
         println!("  Unreusable traces (has concrete branches): {}", total_stats.unreusable_traces);
+        println!("  Total concrete branches: {} (avg {:.1} per trace)",
+                 total_stats.total_concrete_branches,
+                 if total_stats.new_traces > 0 {
+                     total_stats.total_concrete_branches as f64 / total_stats.new_traces as f64
+                 } else { 0.0 });
         println!("  Unique (shape,path) pairs: {}", total_stats.unique_shape_paths);
+        println!("  Unique (shape,path,concrete_path) tuples: {}", total_stats.unique_full_paths);
+        println!("  Template mismatches: {}", total_stats.template_mismatches);
         println!("  Potential cache hits: {} ({:.1}%)",
                  total_stats.potential_cache_hits,
                  if total_stats.states_processed > 0 {
                      100.0 * total_stats.potential_cache_hits as f64 / total_stats.states_processed as f64
                  } else { 0.0 });
-        println!("  Cache: {} traces in {} keys (avg {:.1} per key)",
+        println!("  Cache: {} traces, {} templates",
                  cache.len(),
-                 cache.num_keys(),
-                 if cache.num_keys() > 0 {
-                     cache.len() as f64 / cache.num_keys() as f64
-                 } else { 0.0 });
+                 cache.num_templates());
     }
 
     if run_reference && run_symbolic {

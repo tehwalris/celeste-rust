@@ -75,6 +75,9 @@ pub struct TracingResult {
     pub input_symbols: InputSymbolMap,
     /// Path conditions that must be satisfied for this path.
     pub path_conditions: Vec<SymExpr>,
+    /// Symbolic condition expressions for concrete branches (without Not wrapper).
+    /// Used to build branch templates for cache lookup.
+    pub concrete_branch_conditions: Vec<SymExpr>,
     /// HeapIds that were allocated during tracing (not present in input).
     /// These need to be re-allocated when applying the cached trace.
     pub allocated_heap_ids: Vec<HeapId>,
@@ -118,6 +121,8 @@ pub struct TracingInterpreter<'a> {
     input_symbols: InputSymbolMap,
     /// Path conditions for this execution path (boolean expressions that must be true)
     path_conditions: Vec<SymExpr>,
+    /// Concrete branch condition expressions (raw, without Not wrapper)
+    concrete_branch_conditions: Vec<SymExpr>,
     /// HeapIds that existed in the input state (before tracing)
     input_heap_ids: std::collections::HashSet<HeapId>,
     /// HeapIds that were allocated during tracing
@@ -146,6 +151,7 @@ impl<'a> TracingInterpreter<'a> {
             heap_symbols: HashMap::new(),
             input_symbols: HashMap::new(),
             path_conditions: Vec::new(),
+            concrete_branch_conditions: Vec::new(),
             input_heap_ids: std::collections::HashSet::new(),
             allocated_heap_ids: Vec::new(),
         }
@@ -287,6 +293,7 @@ impl<'a> TracingInterpreter<'a> {
                             heap_symbols: self.heap_symbols,
                             input_symbols: self.input_symbols,
                             path_conditions: self.path_conditions,
+                            concrete_branch_conditions: self.concrete_branch_conditions,
                             allocated_heap_ids: self.allocated_heap_ids,
                         });
                     }
@@ -332,6 +339,9 @@ impl<'a> TracingInterpreter<'a> {
                             // Also record path condition for concrete branches
                             // This enables cache reuse by checking conditions
                             if let Some(cond_sym) = cond_sym.cloned() {
+                                // Store raw condition (for branch template)
+                                self.concrete_branch_conditions.push(cond_sym.clone());
+                                // Store full path condition (with Not if false branch)
                                 let path_cond = if take_true {
                                     cond_sym
                                 } else {

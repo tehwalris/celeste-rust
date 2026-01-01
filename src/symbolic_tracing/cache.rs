@@ -1,11 +1,16 @@
 //! TraceCache: caches execution traces for reuse.
 //!
-//! Phase 3: Symbolic caching with path condition checking.
+//! Phase 4: Full path caching with branch templates.
 //!
-//! The cache stores traces indexed by (shape, abstract_path). Multiple traces
-//! can exist for the same key if they take different concrete branches.
-//! When looking up, we check if the input state satisfies any cached trace's
-//! path conditions (symbolic expressions that were true during tracing).
+//! The cache uses a two-level structure:
+//! 1. BranchTemplate: For each (shape, abstract_path), stores the sequence of
+//!    symbolic condition expressions for concrete branches.
+//! 2. TraceCache: Maps (shape, abstract_path, concrete_path) directly to traces.
+//!
+//! When looking up:
+//! 1. Find or create BranchTemplate for (shape, abstract_path)
+//! 2. Evaluate branch conditions to compute concrete_path
+//! 3. Look up (shape, abstract_path, concrete_path) for O(1) cache hit
 
 use rustc_hash::FxHashMap;
 
@@ -42,6 +47,8 @@ pub struct CachedTrace {
     /// Path conditions: symbolic boolean expressions that must all evaluate to true
     /// for this trace to be applicable to an input state.
     pub path_conditions: Vec<SymExpr>,
+    /// Symbolic condition expressions for concrete branches (without Not wrapper).
+    pub concrete_branch_conditions: Vec<SymExpr>,
     /// HeapIds that were allocated during the original trace.
     /// When applying, we need to allocate new HeapIds and map old -> new.
     pub allocated_heap_ids: Vec<HeapId>,
@@ -258,8 +265,75 @@ fn remap_value(value: Value, heap_id_map: &rustc_hash::FxHashMap<HeapId, HeapId>
     }
 }
 
-/// Cache key: (shape, abstract_path) - no concrete_path!
-/// Multiple traces with different concrete paths can exist for the same key.
+/// Key for branch templates: (shape, abstract_path)
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TemplateKey {
+    pub shape: StateShape,
+    /// Abstract path choices (for UnknownBool branches)
+    pub path: Vec<(usize, usize)>,
+}
+
+/// A branch template stores the symbolic condition expressions for concrete branches.
+/// All traces with the same (shape, abstract_path) encounter the same branches in the same order.
+#[derive(Clone, Debug)]
+pub struct BranchTemplate {
+    /// Symbolic condition expressions for each concrete branch point.
+    /// Evaluating these in order with a state's values gives the concrete_path.
+    pub conditions: Vec<SymExpr>,
+    /// Mapping from input symbols to source heap locations (shared by all traces with this template).
+    pub input_symbols: InputSymbolMap,
+}
+
+impl BranchTemplate {
+    /// Compute the concrete_path for a given input state by evaluating all conditions.
+    pub fn compute_concrete_path(&self, input_state: &State) -> ConcretePath {
+        let substitution = self.build_substitution(input_state);
+        let mut concrete_path = Vec::with_capacity(self.conditions.len());
+
+        for condition in &self.conditions {
+            let result = evaluate_sym_expr(condition, &substitution);
+            let is_true = match result {
+                ConcreteValue::Bool(b) => b,
+                // Non-boolean conditions default to truthy (like the interpreter)
+                ConcreteValue::Nil => false,
+                _ => true,
+            };
+            concrete_path.push(is_true);
+        }
+
+        concrete_path
+    }
+
+    /// Build a substitution map from the input state.
+    fn build_substitution(&self, input_state: &State) -> Substitution {
+        let mut subst = Substitution::new();
+
+        for (&sym_id, &heap_id) in &self.input_symbols {
+            if let Some(heap_val) = input_state.heap.get_opt(heap_id) {
+                if let HeapValue::Value(value) = heap_val {
+                    if let Some(concrete) = value_to_concrete_value(value) {
+                        subst.insert(sym_id, concrete);
+                    }
+                }
+            }
+        }
+
+        subst
+    }
+}
+
+/// Full cache key: (shape, abstract_path, concrete_path)
+/// This provides O(1) cache lookup without condition checking.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FullCacheKey {
+    pub shape: StateShape,
+    /// Abstract path choices (for UnknownBool branches)
+    pub abstract_path: Vec<(usize, usize)>,
+    /// Concrete branch outcomes (value-dependent branches)
+    pub concrete_path: ConcretePath,
+}
+
+/// Legacy cache key for backwards compatibility
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CacheKey {
     pub shape: StateShape,
@@ -269,31 +343,162 @@ pub struct CacheKey {
 
 /// Cache for execution traces.
 ///
-/// The cache maps (shape, abstract_path) to a list of traces. When looking up,
-/// we check each trace's path conditions against the input state to find a match.
+/// Uses a two-level structure:
+/// 1. templates: Maps (shape, abstract_path) -> BranchTemplate
+/// 2. traces: Maps (shape, abstract_path, concrete_path) -> CachedTrace
+///
+/// Lookup process:
+/// 1. Get template for (shape, abstract_path)
+/// 2. Evaluate conditions to compute concrete_path
+/// 3. Look up full key for O(1) hit
 pub struct TraceCache {
-    /// Traces indexed by (shape, path). Multiple traces per key are possible.
-    traces: FxHashMap<CacheKey, Vec<CachedTrace>>,
+    /// Branch templates indexed by (shape, abstract_path).
+    templates: FxHashMap<TemplateKey, BranchTemplate>,
+    /// Traces indexed by full key (shape, abstract_path, concrete_path).
+    /// Only one trace per full key (they're deterministic).
+    traces: FxHashMap<FullCacheKey, CachedTrace>,
+    /// Legacy storage for backwards compatibility (will be removed)
+    legacy_traces: FxHashMap<CacheKey, Vec<CachedTrace>>,
     /// Statistics
     pub hits: usize,
     pub misses: usize,
-    /// Number of condition checks performed
+    /// Number of times we had no template (first encounter of shape+path)
+    pub no_template_misses: usize,
+    /// Number of times template existed but trace not found
+    pub trace_not_found_misses: usize,
+    /// Number of condition evaluations (for computing concrete_path)
+    pub condition_evals: usize,
+    /// Number of condition checks performed (legacy)
     pub condition_checks: usize,
+}
+
+/// Result of a cache lookup with debug information
+pub struct CacheLookupResult<'a> {
+    pub trace: Option<&'a CachedTrace>,
+    pub no_template: bool,
+    pub computed_concrete_path: Option<ConcretePath>,
 }
 
 impl TraceCache {
     pub fn new() -> Self {
         Self {
+            templates: FxHashMap::default(),
             traces: FxHashMap::default(),
+            legacy_traces: FxHashMap::default(),
             hits: 0,
             misses: 0,
+            no_template_misses: 0,
+            trace_not_found_misses: 0,
+            condition_evals: 0,
             condition_checks: 0,
         }
     }
 
-    /// Look up a cached trace for the given shape and abstract path.
+    /// Look up a cached trace using the new full-path approach.
+    /// Returns Some(trace) if found, None if miss.
+    pub fn get_full_path(
+        &mut self,
+        shape: &StateShape,
+        abstract_path: &PathCounter,
+        input_state: &State,
+    ) -> Option<&CachedTrace> {
+        self.get_full_path_debug(shape, abstract_path, input_state).trace
+    }
+
+    /// Debug version of get_full_path that returns additional info
+    pub fn get_full_path_debug(
+        &mut self,
+        shape: &StateShape,
+        abstract_path: &PathCounter,
+        input_state: &State,
+    ) -> CacheLookupResult<'_> {
+        let template_key = TemplateKey {
+            shape: shape.clone(),
+            path: abstract_path.choices().to_vec(),
+        };
+
+        // Get the template - if none exists, this is definitely a miss
+        let template = match self.templates.get(&template_key) {
+            Some(t) => t,
+            None => {
+                // No template yet - will create on insert
+                self.no_template_misses += 1;
+                return CacheLookupResult {
+                    trace: None,
+                    no_template: true,
+                    computed_concrete_path: None,
+                };
+            }
+        };
+
+        // Compute concrete_path by evaluating conditions
+        let concrete_path = template.compute_concrete_path(input_state);
+        self.condition_evals += template.conditions.len();
+
+        // Look up full key
+        let full_key = FullCacheKey {
+            shape: shape.clone(),
+            abstract_path: abstract_path.choices().to_vec(),
+            concrete_path: concrete_path.clone(),
+        };
+
+        if let Some(trace) = self.traces.get(&full_key) {
+            self.hits += 1;
+            CacheLookupResult {
+                trace: Some(trace),
+                no_template: false,
+                computed_concrete_path: Some(concrete_path),
+            }
+        } else {
+            self.misses += 1;
+            self.trace_not_found_misses += 1;
+            CacheLookupResult {
+                trace: None,
+                no_template: false,
+                computed_concrete_path: Some(concrete_path),
+            }
+        }
+    }
+
+    /// Insert a trace with the new full-path approach.
+    /// Also creates/updates the branch template.
+    pub fn insert_full_path(
+        &mut self,
+        shape: StateShape,
+        abstract_path: PathCounter,
+        trace: CachedTrace,
+    ) {
+        let template_key = TemplateKey {
+            shape: shape.clone(),
+            path: abstract_path.choices().to_vec(),
+        };
+
+        // Create or verify branch template
+        // All traces with the same template key should have the same branch structure
+        if !self.templates.contains_key(&template_key) {
+            self.templates.insert(template_key.clone(), BranchTemplate {
+                conditions: trace.concrete_branch_conditions.clone(),
+                input_symbols: trace.input_symbols.clone(),
+            });
+        }
+
+        // Store trace by full key
+        // Note: abstract_path here is pending_state.path (what we knew at lookup time),
+        // NOT the full result.path. The trace itself contains result.path for
+        // path enumeration purposes.
+        let full_key = FullCacheKey {
+            shape,
+            abstract_path: abstract_path.choices().to_vec(),
+            concrete_path: trace.concrete_path.clone(),
+        };
+
+        self.traces.insert(full_key, trace);
+    }
+
+    /// Look up a cached trace for the given shape and abstract path (legacy method).
     /// Checks path conditions to find a matching trace.
     /// Returns the matching trace if found.
+    #[allow(dead_code)]
     pub fn get_matching(
         &mut self,
         shape: &StateShape,
@@ -305,7 +510,7 @@ impl TraceCache {
             path: path.choices().to_vec(),
         };
 
-        if let Some(traces) = self.traces.get(&key) {
+        if let Some(traces) = self.legacy_traces.get(&key) {
             for trace in traces {
                 self.condition_checks += 1;
                 if trace.check_conditions(input_state) {
@@ -319,7 +524,8 @@ impl TraceCache {
         None
     }
 
-    /// Insert a new trace into the cache.
+    /// Insert a new trace into the cache (legacy method - use insert_full_path for new code).
+    #[allow(dead_code)]
     pub fn insert(
         &mut self,
         shape: StateShape,
@@ -331,6 +537,7 @@ impl TraceCache {
         heap_symbols: HeapSymbolMap,
         input_symbols: InputSymbolMap,
         path_conditions: Vec<SymExpr>,
+        concrete_branch_conditions: Vec<SymExpr>,
         allocated_heap_ids: Vec<HeapId>,
     ) {
         let key = CacheKey {
@@ -347,20 +554,54 @@ impl TraceCache {
             heap_symbols,
             input_symbols,
             path_conditions,
+            concrete_branch_conditions,
             allocated_heap_ids,
         };
 
-        self.traces.entry(key).or_insert_with(Vec::new).push(trace);
+        self.legacy_traces.entry(key).or_insert_with(Vec::new).push(trace);
     }
 
-    /// Get the number of cached trace entries (total traces across all keys).
+    /// Get the number of cached trace entries.
     pub fn len(&self) -> usize {
-        self.traces.values().map(|v| v.len()).sum()
+        self.traces.len()
     }
 
-    /// Get the number of unique cache keys.
+    /// Get the number of unique full cache keys.
     pub fn num_keys(&self) -> usize {
         self.traces.len()
+    }
+
+    /// Get the number of branch templates.
+    pub fn num_templates(&self) -> usize {
+        self.templates.len()
+    }
+
+    /// Check if a template exists and has a different condition count than expected.
+    /// Returns true if there's a mismatch.
+    pub fn check_template_mismatch(
+        &self,
+        key: &(StateShape, Vec<(usize, usize)>),
+        expected_branches: usize,
+    ) -> bool {
+        let template_key = TemplateKey {
+            shape: key.0.clone(),
+            path: key.1.clone(),
+        };
+        if let Some(template) = self.templates.get(&template_key) {
+            template.conditions.len() != expected_branches
+        } else {
+            false // No template yet, so no mismatch
+        }
+    }
+
+    /// Get the condition count for a template key.
+    #[allow(dead_code)]
+    pub fn get_template_condition_count(&self, key: &(StateShape, Vec<(usize, usize)>)) -> usize {
+        let template_key = TemplateKey {
+            shape: key.0.clone(),
+            path: key.1.clone(),
+        };
+        self.templates.get(&template_key).map(|t| t.conditions.len()).unwrap_or(0)
     }
 
     /// Check if the cache is empty.
@@ -373,8 +614,12 @@ impl TraceCache {
         CacheStats {
             num_traces: self.len(),
             num_keys: self.num_keys(),
+            num_templates: self.num_templates(),
             hits: self.hits,
             misses: self.misses,
+            no_template_misses: self.no_template_misses,
+            trace_not_found_misses: self.trace_not_found_misses,
+            condition_evals: self.condition_evals,
             condition_checks: self.condition_checks,
             hit_rate: if self.hits + self.misses > 0 {
                 self.hits as f64 / (self.hits + self.misses) as f64
@@ -388,12 +633,17 @@ impl TraceCache {
     pub fn reset_stats(&mut self) {
         self.hits = 0;
         self.misses = 0;
+        self.no_template_misses = 0;
+        self.trace_not_found_misses = 0;
+        self.condition_evals = 0;
         self.condition_checks = 0;
     }
 
-    /// Clear all cached traces.
+    /// Clear all cached traces and templates.
     pub fn clear(&mut self) {
+        self.templates.clear();
         self.traces.clear();
+        self.legacy_traces.clear();
         self.reset_stats();
     }
 }
@@ -409,8 +659,12 @@ impl Default for TraceCache {
 pub struct CacheStats {
     pub num_traces: usize,
     pub num_keys: usize,
+    pub num_templates: usize,
     pub hits: usize,
     pub misses: usize,
+    pub no_template_misses: usize,
+    pub trace_not_found_misses: usize,
+    pub condition_evals: usize,
     pub condition_checks: usize,
     pub hit_rate: f64,
 }
@@ -419,13 +673,13 @@ impl std::fmt::Display for CacheStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Cache: {} traces in {} keys, {} hits, {} misses ({:.1}% hit rate), {} condition checks",
+            "Cache: {} traces, {} templates, {} hits, {} misses ({:.1}% hit rate), {} condition evals",
             self.num_traces,
-            self.num_keys,
+            self.num_templates,
             self.hits,
             self.misses,
             self.hit_rate * 100.0,
-            self.condition_checks
+            self.condition_evals
         )
     }
 }

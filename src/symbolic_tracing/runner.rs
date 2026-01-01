@@ -114,6 +114,12 @@ pub struct RunStats {
     pub reusable_traces: usize,
     /// Number of traces with concrete branches (not reusable).
     pub unreusable_traces: usize,
+    /// Total concrete branches across all traces (for analysis)
+    pub total_concrete_branches: usize,
+    /// Number of unique (shape, abstract_path, concrete_path) tuples
+    pub unique_full_paths: usize,
+    /// Number of template mismatches (different concrete branch counts for same template key)
+    pub template_mismatches: usize,
 }
 
 impl RunStats {
@@ -130,6 +136,9 @@ impl RunStats {
             potential_cache_hits: self.potential_cache_hits + other.potential_cache_hits,
             reusable_traces: self.reusable_traces + other.reusable_traces,
             unreusable_traces: self.unreusable_traces + other.unreusable_traces,
+            total_concrete_branches: self.total_concrete_branches + other.total_concrete_branches,
+            unique_full_paths: self.unique_full_paths + other.unique_full_paths,
+            template_mismatches: self.template_mismatches + other.template_mismatches,
         }
     }
 }
@@ -154,6 +163,8 @@ pub fn run_traced(
 
     // Track seen (shape, path) pairs for potential cache hit analysis
     let mut seen_shape_paths: HashSet<(StateShape, Vec<(usize, usize)>)> = HashSet::new();
+    // Track seen (shape, abstract_path, concrete_path) tuples
+    let mut seen_full_paths: HashSet<(StateShape, Vec<(usize, usize)>, Vec<bool>)> = HashSet::new();
 
     // Queue of states to process
     let mut pending: VecDeque<PendingState> = VecDeque::new();
@@ -186,14 +197,12 @@ pub fn run_traced(
             stats.unique_shape_paths += 1;
         }
 
-        // NOTE: Cache lookup disabled (see insert note above)
-        // if let Some(cached) = cache.get_matching(
-        //     &pending_state.shape,
-        //     &pending_state.path,
-        //     &pending_state.state,
-        // ) { ... }
+        // NOTE: Template-based caching is disabled because branches are path-dependent.
+        // Different traces with the same (shape, pending_path) can have different numbers of
+        // concrete branches, making templates invalid.
+        // TODO: Consider alternative caching strategies or focus on tracing performance.
 
-        // Cache miss - need to trace
+        // Always trace (cache disabled)
         stats.cache_misses += 1;
 
         // Execute with tracing
@@ -201,32 +210,26 @@ pub fn run_traced(
         let result = tracer.interpret(cfg, pending_state.state.clone())?;
 
         stats.forced_choices += result.forced_choices;
-
-        // NOTE: Caching is disabled because:
-        // 1. Memory usage explodes (15,000+ traces per frame)
-        // 2. Cache hit rate is only ~3.5% (663/19092)
-        // 3. Cache lookup overhead (32 condition checks/lookup) is high
-        //
-        // Future: Consider not caching, or use a more memory-efficient approach
-        //
-        // cache.insert(
-        //     pending_state.shape.clone(),
-        //     result.path.clone(),
-        //     result.concrete_path.clone(),
-        //     result.forced_choices,
-        //     result.concrete_branches,
-        //     result.output_state.clone(),
-        //     result.heap_symbols,
-        //     result.input_symbols,
-        //     result.path_conditions,
-        //     result.allocated_heap_ids,
-        // );
         stats.new_traces += 1;
+        stats.total_concrete_branches += result.concrete_branches;
         if result.concrete_branches == 0 {
             stats.reusable_traces += 1;
         } else {
             stats.unreusable_traces += 1;
         }
+
+        // Track unique full paths (shape + abstract_path + concrete_path)
+        let full_path_key = (
+            pending_state.shape.clone(),
+            result.path.choices().to_vec(),
+            result.concrete_path.clone(),
+        );
+        if !seen_full_paths.contains(&full_path_key) {
+            seen_full_paths.insert(full_path_key);
+            stats.unique_full_paths += 1;
+        }
+
+        // NOTE: Cache insert disabled - see note above about path-dependent branches
 
         // Add output to results - should always be concrete
         debug_assert_eq!(result.output_state.vector_size, 1, "Output state should be concrete");
