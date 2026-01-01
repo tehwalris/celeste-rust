@@ -235,6 +235,34 @@ struct WaitingState {
   - Inside object iteration loops
   - Between major game phases
 
+## Current Implementation Status (COMPLETE)
+
+The barrier-based executor is implemented and verified correct in `src/interpreter/barrier_executor.rs`.
+
+### Key Implementation Details
+
+1. **PathCounter Threading**: PathCounter passes through ALL function call levels via `interpret_call_with_path_counter()` and `run_cfg_to_completion()`.
+
+2. **PHI Node Handling**: Must track `incoming_label` (source block) separately from `current_block_label` (current block). Uses fake `"__entry"` label for blocks entered from CFG entry point.
+
+3. **Verified Correctness**: Produces identical state counts to flow-based executor:
+   - Frame 25: 24, Frame 26: 204, Frame 27: 878, Frame 28: 2864
+
+### Current Performance Issue
+
+The barrier-based executor generates **exponentially more intermediate states** than flow-based:
+- Flow-based Frame 28: 1090 states before merge (4.85s)
+- Barrier-based Frame 28: 41000 states before merge (257s)
+
+This is because PathCounter enumerates all 2^n paths for n UnknownBool choices, while flow-based uses abstract interpretation more efficiently.
+
+### Optimization Opportunities
+
+1. **Early Path Merging**: Merge states during PathCounter enumeration, not just at barriers
+2. **Parallel Lane Processing**: Process vector lanes in parallel (currently sequential)
+3. **Caching**: Cache results of function calls with same inputs
+4. **Path Pruning**: Skip paths that lead to identical states
+
 ## Expected Benefits
 
 1. **Memory control**: Vectorization at barriers reduces state explosion

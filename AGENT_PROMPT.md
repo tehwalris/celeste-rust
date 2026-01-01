@@ -1,53 +1,70 @@
-# Agent Prompt: Celeste Rust Interpreter
+# Agent Prompt: Celeste Rust Interpreter - Speed Optimization
 
 You are working on a Rust abstract interpreter for PICO-8 Celeste. The goal is running the **100m room** (first room of Celeste Classic) correctly and fast.
 
-## Approach: Barrier-Based Parallel Execution
+## Current State
 
-**Read first**: `docs/barrier-based-execution.md`
+**Read first**: `docs/barrier-based-execution.md` (especially "Current Implementation Status" section)
 
-The core idea:
-1. Fast scalar interpretation with PathCounter for abstract path enumeration
-2. Explicit barriers in code where states synchronize
-3. At barriers: GC + Vectorize (+ Abstraction at end-of-frame)
-4. Process one barrier at a time, all states at that barrier in parallel
+The barrier-based executor is **implemented and verified correct**. It produces identical state counts to the flow-based executor:
+- Frame 25: 24, Frame 26: 204, Frame 27: 878, Frame 28: 2864
 
-This replaces hintNormalize entirely. Barriers are the new mechanism for both synchronization and vectorization.
+**The problem**: It's much slower than flow-based due to exponential path enumeration:
+- Flow-based Frame 28: 1090 states before merge (4.85s)
+- Barrier-based Frame 28: 41000 states before merge (257s)
+
+## Your Task: Optimize Barrier-Based Execution
+
+Key optimization opportunities:
+
+1. **Early Path Merging**: Currently states are only merged at barriers. Merge during PathCounter enumeration when states become identical (same heap, local_env structure after gc).
+
+2. **Parallel Lane Processing**: Currently vector lanes are processed sequentially. Use rayon to process lanes in parallel.
+
+3. **Path Pruning**: Skip paths that would produce duplicate states. Hash states after each path segment.
+
+4. **Caching**: Cache function call results when inputs are identical.
+
+The flow-based approach achieves efficiency by working with vectorized states throughout. The barrier approach enumerates scalar paths which explodes exponentially. Find ways to reduce this explosion while keeping the barrier architecture.
 
 ## Reference State Counts
 
-Expanded state counts (sum of vector_size) from the vectorized Rust implementation:
+| Frame | Expanded | Flow Time | Target |
+|-------|----------|-----------|--------|
+| 1-24  | 1        | ~1ms      | <1ms   |
+| 25    | 24       | 15ms      | <20ms  |
+| 26    | 204      | 157ms     | <200ms |
+| 27    | 878      | 1.1s      | <1.5s  |
+| 28    | 2864     | 4.6s      | <6s    |
 
-| Frame | Expanded | Time    |
-|-------|----------|---------|
-| 1-24  | 1        | ~1ms    |
-| 25    | 24       | 15ms    |
-| 26    | 204      | 157ms   |
-| 27    | 878      | 1.1s    |
-| 28    | 2864     | 4.6s    |
-| 29    | 7260     | 8.0s    |
-| 30    | 15250    | 17.1s   |
-| 31    | 27024    | 28.9s   |
-| 32    | 44558    | 46.4s   |
-| 33    | 66194    | 69.1s   |
-| 34    | 92717    | 99.4s   |
-| 35    | 132117   | 156.6s  |
+## Key Files
 
-States grow ~1.5-3x per frame after movement starts.
+- `src/interpreter/barrier_executor.rs` - The barrier executor (optimize this)
+- `src/interpreter/flow.rs` - Flow-based executor (for comparison/inspiration)
+- `src/interpreter/vectorize.rs` - State vectorization/merging
+- `src/interpreter/state.rs` - State with gc() method
+
+## How to Test
+
+```bash
+# Run barrier-based (what you're optimizing)
+./safe-run.sh -- cargo run --release --bin celeste-rust -- --barrier -n 28
+
+# Run flow-based (baseline to beat)
+./safe-run.sh -- cargo run --release --bin celeste-rust -- -n 28
+```
+
+Verify correctness: expanded state counts must match between both modes.
 
 ## Success Metric
 
-Maximize frames executed correctly in 60s / 80GB.
-
-"Correctly" = state counts per frame match the reference. Use the first 28 frames for correctness testing.
-
-## Resources
-
-- OCaml reference implementation: `~/src/github.com/tehwalris/celeste_ocaml`
-- OCaml has `hint_normalize` in IR blocks - we're replacing this with barriers
+Get barrier-based execution to within 2x of flow-based time while maintaining correct state counts.
 
 ## How to Work
 
-Explore the codebase, understand the current state, and make progress. This could mean fixing bugs, implementing missing features, improving code quality, improving performance, or adding tests.
+1. Profile to understand where time is spent
+2. Implement optimizations incrementally
+3. Verify correctness after each change (state counts must match)
+4. Commit working improvements often
 
-Commit often - this branch is yours.
+This branch is yours - commit frequently.
