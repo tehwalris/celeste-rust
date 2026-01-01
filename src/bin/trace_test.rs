@@ -1,8 +1,12 @@
-//! Test binary for the symbolic tracing approach.
+//! Test binary for comparing symbolic tracing against reference interpreter.
 //!
-//! Runs the game using symbolic tracing and compares with the reference implementation.
+//! Run with: cargo run --release --bin trace_test -- --compare -n 28
+//!
+//! This tests that symbolic tracing produces the same state counts as the
+//! reference vectorized interpreter for each frame.
 
 use std::time::Instant;
+
 use anyhow::Result;
 use clap::Parser;
 
@@ -18,24 +22,22 @@ use celeste_rust::{
 };
 
 #[derive(Parser)]
-#[command(name = "trace_test")]
-#[command(about = "Test symbolic tracing on Celeste")]
 struct Args {
     /// Number of frames to run
-    #[arg(short = 'n', long, default_value_t = 30)]
-    num_frames: u32,
+    #[arg(short = 'n', long, default_value = "28")]
+    num_frames: usize,
 
-    /// Run reference implementation for comparison
-    #[arg(long)]
-    compare: bool,
-
-    /// Run only reference (for baseline timing)
+    /// Only run reference interpreter (skip symbolic)
     #[arg(long)]
     reference_only: bool,
 
-    /// Run only symbolic tracing
+    /// Only run symbolic tracing (skip reference)
     #[arg(long)]
     symbolic_only: bool,
+
+    /// Run both and compare (default)
+    #[arg(long)]
+    compare: bool,
 }
 
 /// Run the reference (vectorized) implementation for one frame
@@ -77,35 +79,32 @@ fn main() -> Result<()> {
 
     println!("=== Symbolic Tracing Test ===\n");
 
-    // Load and compile the game
+    // Parse and compile the game (same as main.rs)
+    println!("Parsing and compiling game...");
     let level_3 = std::fs::read_to_string("lua/builtin_level_3.lua")?;
     let level_4 = std::fs::read_to_string("lua/builtin_level_4.lua")?;
     let game = std::fs::read_to_string("lua/celeste-minimal.lua")?;
-
     let init_suffix = r#"
 _init()
 __reset_button_states()
 "#;
-
     let full_code = format!("{}\n{}\n{}\n{}\n", level_3, level_4, game, init_suffix);
-
-    println!("Parsing and compiling game...");
     let ast = full_moon::parse(&full_code)?;
     let (cfg, fun_defs) = frontend::compile(&ast)?;
 
+    // Create fixed environment with game builtins
     let mut fixed_env = create_fixed_env_with_game_builtins();
     for fun_def in fun_defs {
         fixed_env.add_fun_def(fun_def);
     }
 
-    let initial_state = create_initial_state_with_builtins(&fixed_env);
-
-    // Initialize the game (_init function)
+    // Initialize game state
     println!("Initializing game...");
-    let init_result = interpret_cfg(cfg, initial_state, &fixed_env)?;
-    let init_states: Vec<_> = init_result.into_iter().map(|(s, _)| s).collect();
-    println!("After _init: {} states ({} expanded)\n",
-             init_states.len(), count_expanded(&init_states));
+    let init_state = create_initial_state_with_builtins(&fixed_env);
+    let init_results = interpret_cfg(cfg.clone(), init_state, &fixed_env)?;
+    let init_states: Vec<State> = init_results.into_iter().map(|(s, _)| s).collect();
+    let init_expanded: usize = init_states.iter().map(|s| s.vector_size).sum();
+    println!("After _init: {} states ({} expanded)\n", init_states.len(), init_expanded);
 
     // Compile the frame code (must match main.rs order)
     let frame_code = r#"
@@ -123,6 +122,7 @@ __reset_button_states()
     // Initialize state for each implementation
     let mut ref_states = if run_reference { init_states.clone() } else { Vec::new() };
     let mut sym_states = if run_symbolic { init_states } else { Vec::new() };
+
     let mut cache = TraceCache::new();
     let mut total_stats = RunStats::default();
 
@@ -179,43 +179,34 @@ __reset_button_states()
         } else {
             true
         };
-
         if !matched {
             all_matched = false;
         }
 
-        let match_str = if !run_reference || !run_symbolic {
-            "-"
-        } else if matched {
-            "✓"
-        } else {
-            "✗"
-        };
+        // Update cumulative stats
+        if let Some(stats) = stats {
+            total_stats = total_stats.merge(&stats);
+        }
 
+        // Print row
+        let match_str = if run_reference && run_symbolic {
+            if matched { "✓" } else { "✗" }
+        } else {
+            "-"
+        };
         println!("{:>5} {:>12} {:>12} {:>10} {:>10} {:>8}",
                  frame,
-                 if run_reference { ref_count.to_string() } else { "-".to_string() },
-                 if run_symbolic { sym_count.to_string() } else { "-".to_string() },
+                 if run_reference { format!("{}", ref_count) } else { "-".to_string() },
+                 if run_symbolic { format!("{}", sym_count) } else { "-".to_string() },
                  match_str,
-                 if run_reference { ref_time.to_string() } else { "-".to_string() },
-                 if run_symbolic { sym_time.to_string() } else { "-".to_string() });
-
-        // Update totals
-        if let Some(stats) = stats {
-            total_stats.states_processed += stats.states_processed;
-            total_stats.new_traces += stats.new_traces;
-            total_stats.cache_hits += stats.cache_hits;
-            total_stats.cache_misses += stats.cache_misses;
-            total_stats.forced_choices += stats.forced_choices;
-            total_stats.unique_shape_paths += stats.unique_shape_paths;
-            total_stats.potential_cache_hits += stats.potential_cache_hits;
-        }
+                 if run_reference { format!("{}", ref_time) } else { "-".to_string() },
+                 if run_symbolic { format!("{}", sym_time) } else { "-".to_string() });
     }
 
-    let total_elapsed = total_start.elapsed();
+    let total_time = total_start.elapsed();
 
     println!("\n=== Summary ===");
-    println!("Total time: {:.2}s", total_elapsed.as_secs_f64());
+    println!("Total time: {:.2}s", total_time.as_secs_f64());
 
     if run_reference {
         println!("Reference final: {} states ({} expanded)",
@@ -230,12 +221,14 @@ __reset_button_states()
         println!("  Unique (shape,path) pairs: {}", total_stats.unique_shape_paths);
         println!("  Potential cache hits: {} ({:.1}%)",
                  total_stats.potential_cache_hits,
-                 100.0 * total_stats.potential_cache_hits as f64 / total_stats.states_processed.max(1) as f64);
+                 if total_stats.states_processed > 0 {
+                     100.0 * total_stats.potential_cache_hits as f64 / total_stats.states_processed as f64
+                 } else { 0.0 });
         println!("  Cache size: {} traces", cache.len());
     }
 
     if run_reference && run_symbolic {
-        println!("\nComparison: {}", if all_matched { "ALL MATCHED ✓" } else { "MISMATCH ✗" });
+        println!("\nComparison: {}", if all_matched { "MATCH ✓" } else { "MISMATCH ✗" });
     }
 
     Ok(())

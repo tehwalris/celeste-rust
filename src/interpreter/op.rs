@@ -165,6 +165,29 @@ pub fn interpret_binary_op(l: &Value, op: BinaryOp, r: &Value) -> Result<Value> 
             Ok(Value::Bool(MaybeVector::map2(l, r, |l, r| l >= r)))
         }
 
+        // Comparison operations involving intervals produce UnknownBool
+        // (interval compared to number or interval compared to interval)
+        (Value::NumberInterval(_), BinaryOp::LessThan, Value::Number(_))
+        | (Value::NumberInterval(_), BinaryOp::LessThan, Value::NumberInterval(_))
+        | (Value::Number(_), BinaryOp::LessThan, Value::NumberInterval(_)) => {
+            Ok(Value::UnknownBool)
+        }
+        (Value::NumberInterval(_), BinaryOp::GreaterThan, Value::Number(_))
+        | (Value::NumberInterval(_), BinaryOp::GreaterThan, Value::NumberInterval(_))
+        | (Value::Number(_), BinaryOp::GreaterThan, Value::NumberInterval(_)) => {
+            Ok(Value::UnknownBool)
+        }
+        (Value::NumberInterval(_), BinaryOp::LessThanEqual, Value::Number(_))
+        | (Value::NumberInterval(_), BinaryOp::LessThanEqual, Value::NumberInterval(_))
+        | (Value::Number(_), BinaryOp::LessThanEqual, Value::NumberInterval(_)) => {
+            Ok(Value::UnknownBool)
+        }
+        (Value::NumberInterval(_), BinaryOp::GreaterThanEqual, Value::Number(_))
+        | (Value::NumberInterval(_), BinaryOp::GreaterThanEqual, Value::NumberInterval(_))
+        | (Value::Number(_), BinaryOp::GreaterThanEqual, Value::NumberInterval(_)) => {
+            Ok(Value::UnknownBool)
+        }
+
         _ => Err(anyhow!("Unsupported binary op: {:?} {:?} {:?}", l, op, r)),
     }
 }

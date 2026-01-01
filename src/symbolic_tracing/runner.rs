@@ -107,6 +107,22 @@ pub struct RunStats {
     pub potential_cache_hits: usize,
 }
 
+impl RunStats {
+    /// Merge two RunStats by adding their fields.
+    pub fn merge(&self, other: &RunStats) -> RunStats {
+        RunStats {
+            states_processed: self.states_processed + other.states_processed,
+            new_traces: self.new_traces + other.new_traces,
+            cache_hits: self.cache_hits + other.cache_hits,
+            cache_misses: self.cache_misses + other.cache_misses,
+            forced_choices: self.forced_choices + other.forced_choices,
+            output_states: self.output_states + other.output_states,
+            unique_shape_paths: self.unique_shape_paths + other.unique_shape_paths,
+            potential_cache_hits: self.potential_cache_hits + other.potential_cache_hits,
+        }
+    }
+}
+
 /// Pending work item: a state with its exploration counter.
 #[derive(Clone)]
 struct PendingState {
@@ -159,18 +175,35 @@ pub fn run_traced(
             stats.unique_shape_paths += 1;
         }
 
-        // NOTE: Cache is disabled for now because Phase 1 caching is incorrect.
-        // We cache concrete outputs, but different inputs produce different concrete outputs
-        // even when taking the same path. Need symbolic expressions to fix this.
-        //
-        // // Try cache lookup
-        // if let Some(cached) = cache.get(&pending_state.shape, &pending_state.path) {
-        //     stats.cache_hits += 1;
-        //     // For now, just use the cached output directly
-        //     // TODO: In Phase 3, substitute symbolic values
-        //     output_states.push(cached.output_state.clone());
-        //     continue;
-        // }
+        // Try cache lookup with symbolic substitution (Phase 3)
+        // TODO: Cache is disabled because CachedTrace::apply clones the template's heap,
+        // which has frozen HeapIds from the first execution. After GC, heap layouts change,
+        // so the cached template's heap structure doesn't match the new input state's heap.
+        // To fix: apply() should build output heap from input heap + symbolic mapping,
+        // not clone the template heap.
+        if false && cache.get(&pending_state.shape, &pending_state.path).is_some() {
+            let cached = cache.get(&pending_state.shape, &pending_state.path).unwrap();
+            stats.cache_hits += 1;
+            stats.forced_choices += cached.forced_choices;
+
+            // Apply the cached trace to the new input state
+            let output = cached.apply(&pending_state.state);
+            output_states.push(output);
+            stats.output_states += 1;
+
+            // If there were forced choices on this path, explore the next path
+            if cached.forced_choices > 0 {
+                let mut next_path = cached.path.clone();
+                if next_path.increment() {
+                    pending.push_back(PendingState {
+                        state: pending_state.state,
+                        path: next_path,
+                        shape: pending_state.shape,
+                    });
+                }
+            }
+            continue;
+        }
         stats.cache_misses += 1;
 
         // Execute with tracing
@@ -179,11 +212,14 @@ pub fn run_traced(
 
         stats.forced_choices += result.forced_choices;
 
-        // Cache the result
+        // Cache the result with symbolic information
         cache.insert(
             pending_state.shape.clone(),
             result.path.clone(),
+            result.forced_choices,
             result.output_state.clone(),
+            result.heap_symbols,
+            result.input_symbols,
         );
         stats.new_traces += 1;
 

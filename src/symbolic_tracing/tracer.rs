@@ -223,6 +223,12 @@ impl<'a> TracingInterpreter<'a> {
 
                     // Pop from call stack
                     if let Some(frame) = self.call_stack.pop() {
+                        // Pop the caller's local_env from outer_local_envs
+                        // (it was pushed when we entered this function)
+                        if !self.state.outer_local_envs.is_empty() {
+                            self.state.outer_local_envs.remove(0);
+                        }
+
                         // Restore caller's local_env and set return value
                         self.state.local_env = frame.caller_local_env;
                         let value = return_value
@@ -603,6 +609,11 @@ impl<'a> TracingInterpreter<'a> {
                 }
 
                 // Switch to callee's context
+                // Push caller's local_env onto outer_local_envs (for GC to find roots)
+                let mut new_outer_local_envs = vec![self.state.local_env.clone()];
+                new_outer_local_envs.extend(self.state.outer_local_envs.clone());
+                self.state.outer_local_envs = new_outer_local_envs;
+
                 self.state.local_env = new_local_env;
                 self.current_cfg = Some(prepared_cfg.cfg.clone());
                 self.current_block = None; // Start at entry block
