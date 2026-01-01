@@ -250,15 +250,18 @@ The barrier-based executor is implemented and verified correct in `src/interpret
 
 ### Performance Status
 
-After optimization, barrier-based is **~30% faster at Frame 28** but **slower at larger frames**:
+After optimization (including FxHasher for all im::HashMap instances), barrier-based is **~32% faster than flow-based at Frame 28**:
 
 | Frame | Barrier | Flow | Notes |
 |-------|---------|------|-------|
-| 28 | 3.1s | 4.9s | Barrier 36% faster |
-| 29 | 12.2s | 8.0s | Flow 52% faster |
-| 30 | 35.5s | 18.7s | Flow 90% faster |
+| 25 | 28ms | 14ms | Flow 50% faster |
+| 26 | 115ms | 128ms | Barrier 10% faster |
+| 27 | 481ms | 825ms | Barrier 42% faster |
+| 28 | 2.1s | 3.1s | Barrier 32% faster |
+| 29 | ~8s | ~8s | Similar (path explosion starts hurting) |
+| 30 | ~25s | ~19s | Flow 32% faster |
 
-The path explosion is the problem: 12572 → 53434 → 180008 paths at frames 28/29/30.
+At higher frames, the path explosion becomes problematic: 12572 → 53434 → 180008 paths at frames 28/29/30.
 
 ### KNOWN LIMITATION: Barriers Inside Function Calls Are Ignored!
 
@@ -280,21 +283,18 @@ To fix this, we need to either:
 2. **Inline all function calls** (would make CFG huge)
 3. **Add barriers at the frame-CFG level** (workaround - add `__barrier` between function calls)
 
-The key optimizations applied so far are:
-1. **Batched intermediate vectorization** reduces paths explored from 41000 to ~12600
-2. **Heap::from_values** builds heaps directly from Vec, avoiding im::HashMap overhead
-
 ### Optimizations Applied
 
-1. **Batched Intermediate Vectorization**: Vectorize accumulated states every 64 paths during enumeration. This merges duplicate states early, reducing total path count by ~70%.
-2. **Parallel Lane Processing**: All lanes processed in parallel via rayon
-3. **Fast State Normalization**: `normalize_gc_state_for_comparison()` avoids redundant clone+GC
-4. **FxHashSet for Deduplication**: Uses faster hash function than SIP
-5. **Early Deduplication**: States are deduplicated as generated, not batched
-6. **FxHasher for im::HashMap**: Use FxHasher instead of SipHash for persistent collections
-7. **Optimized Lane Extraction**: `extract_at_index` directly extracts single lane values instead of filter_by_mask
-8. **Heap::from_values**: Build heaps directly from Vec<Option<HeapValue>> to avoid im::HashMap insert overhead
-9. **Static Labels**: Use LazyLock for frequently-used labels and barrier IDs to avoid repeated allocations
+1. **Batched Intermediate Vectorization**: Vectorize accumulated states every 64 paths during enumeration. This merges duplicate states early, reducing total path count by ~70% (41000→12600).
+2. **Parallel Lane Processing**: All lanes processed in parallel via rayon.
+3. **Fast State Normalization**: `normalize_gc_state_for_comparison()` avoids redundant clone+GC.
+4. **FxHashSet for Deduplication**: Uses faster hash function than SIP.
+5. **Early Deduplication**: States are deduplicated as generated, not batched.
+6. **FxHasher for All im::HashMap Instances**: LocalEnv, Heap's new_values overlay, and global_env all use FxHasher instead of SipHash. This reduced Frame 28 time from 3.1s to 2.1s (~32% faster).
+7. **Optimized Lane Extraction**: `extract_at_index` directly extracts single lane values instead of filter_by_mask.
+8. **Heap::from_values**: Build heaps directly from Vec<Option<HeapValue>> to avoid im::HashMap insert overhead.
+9. **Heap Freezing**: Freeze heaps after vectorization to move values from im::HashMap overlay to Arc<Vec> for O(1) access.
+10. **Static Labels**: Use LazyLock for frequently-used labels and barrier IDs to avoid repeated allocations.
 
 ## Expected Benefits
 
