@@ -17,7 +17,6 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use anyhow::Result;
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
 
 use crate::interpreter::{
     fixed_env::FixedEnv,
