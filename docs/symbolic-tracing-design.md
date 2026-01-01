@@ -346,17 +346,25 @@ The fundamental issue is that branch conditions are path-dependent. Taking branc
    - **Parallel chunk processing**: Process vectorization chunks in parallel
    - **Result**: Frame 30 total: 110s → 60s (45% faster)
 
-   Updated timing with post-processing optimizations:
+5. **Incremental vectorization during tracing** (completed, 2026-01-01):
+   - **Problem**: All 211,644 traces accumulated before final vectorization
+   - **Solution**: Periodically vectorize accumulated outputs during tracing
+     (every 20,000 outputs)
+   - **Result**: Frame 30 vectorization time: 31s → 1.8s (16x improvement)
+   - Pre-vectorize states reduced from 211,644 to 7,333 (29x reduction)
+   - Total frame 30 time: 60s → 57.7s (modest improvement, now trace-bound)
+
+   Updated timing with incremental vectorization:
    | Frame | Trace (ms) | GC (ms) | Vectorize (ms) | Total (ms) |
    |-------|------------|---------|----------------|------------|
-   | 28    | 2,100      | 215     | 2,650          | 5,000      |
-   | 29    | 8,900      | 965     | 10,330         | 20,260     |
-   | 30    | 25,400     | 2,980   | 31,580         | 60,000     |
+   | 28    | 2,139      | 217     | 2,629          | 4,994      |
+   | 29    | 15,282     | 173     | 2,116          | 17,577     |
+   | 30    | 55,694     | 155     | 1,847          | 57,702     |
 
    Observations:
-   - Tracing is now only ~40% of total time (was ~25% before, but total time reduced)
-   - Vectorization is still the largest single component (~50% of time)
-   - Frame 31 still OOMs due to trace count explosion (not post-processing)
+   - Vectorization is no longer the bottleneck (~3% of time)
+   - Tracing is now ~96% of time - the fundamental path enumeration overhead
+   - Reference vs symbolic: 11.5s vs 57.7s for frame 30 (5x slower)
 
 ### Trace Explosion Analysis
 
@@ -382,15 +390,15 @@ The fundamental issue is that branch conditions are path-dependent. Taking branc
 
 | Metric           | Reference | Symbolic (parallel) |
 |------------------|-----------|---------------------|
-| Frame 30 time    | 12.5s     | 60s                 |
-| Frame 31         | 19.8s     | OOM                 |
-| Frames in 60s    | 31        | 30                  |
-| 35 frames total  | 230s      | N/A (OOM)           |
+| Frame 28 time    | 4.1s      | 5.0s                |
+| Frame 29 time    | 5.2s      | 17.6s               |
+| Frame 30 time    | 11.5s     | 57.7s               |
+| Ratio            | 1x        | ~5x slower          |
 
 **Key insight**: Symbolic tracing was designed to enable caching, but:
 1. Caching doesn't work due to path-dependent branches (216+ concrete branches per trace)
 2. Without caching, symbolic tracing is just a slower version of the reference
-3. Path enumeration adds 14x overhead without benefit
+3. Path enumeration adds 14x overhead (211,644 traces for 15,250 states)
 
 **Recommendation**: For maximum performance without caching, use the reference interpreter directly.
 
