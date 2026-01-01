@@ -2,6 +2,11 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
 
+use tikv_jemallocator::Jemalloc;
+
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 use anyhow::Result;
 use clap::Parser;
 
