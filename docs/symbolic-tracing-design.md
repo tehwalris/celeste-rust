@@ -271,11 +271,15 @@ This means we can't predict `concrete_path` without actually tracing. The potent
 **Current state** (after optimizations, with fast mode and parallel):
 | Frame | Ref (ms) | Sym Seq (ms) | Sym Parallel (ms) | Parallel Ratio |
 |-------|----------|--------------|-------------------|----------------|
-| 28    | 4,722    | 15,671       | 8,003             | 1.7x           |
-| 29    | 7,633    | 71,000+      | 36,633            | 4.8x           |
-| 30    | 16,715   | 230,000+     | 111,343           | 6.7x           |
+| 28    | 4,761    | 15,198       | 7,955             | 1.7x           |
+| 29    | 7,658    | 69,856       | 36,342            | 4.7x           |
+| 30    | 16,845   | 216,013      | 112,346           | 6.7x           |
 
 Note: Frame 30 now completes (was OOM at 100GB before fast mode).
+
+8. **Vec-based heap overlay (REVERTED)** (attempted but reverted)
+   - Idea: Replace ImHashMap overlay with Vec during tracing for faster writes
+   - Result: SLOWER (22.3s vs 15.2s for frame 28) - Option<Vec> check overhead worse than HAMT
 
 Profile breakdown (sequential, with fast mode):
 - **Bitmap iteration** (im-rs internal): ~10%
