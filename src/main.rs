@@ -4,6 +4,7 @@
 
 use anyhow::Result;
 use clap::Parser;
+use rayon::prelude::*;
 
 use celeste_rust::frontend;
 use celeste_rust::game_runner;
@@ -233,13 +234,13 @@ __reset_button_states()
             new_states.extend(result.into_iter().map(|(s, _)| s));
         }
 
-        // GC and normalize states before vectorization
-        for state in &mut new_states {
+        // GC and normalize states before vectorization (parallel)
+        new_states.par_iter_mut().for_each(|state| {
             state.gc();
-        }
+        });
 
-        // Make states abstract (widen player.rem to interval)
-        new_states = new_states.into_iter().map(make_state_abstract).collect();
+        // Make states abstract (widen player.rem to interval) (parallel)
+        new_states = new_states.into_par_iter().map(make_state_abstract).collect();
 
         let before_vec = new_states.len();
 
