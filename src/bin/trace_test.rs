@@ -5,6 +5,11 @@
 //! This tests that symbolic tracing produces the same state counts as the
 //! reference vectorized interpreter for each frame.
 
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 use std::sync::Arc;
 use std::time::Instant;
 

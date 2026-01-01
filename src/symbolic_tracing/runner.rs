@@ -149,9 +149,11 @@ impl RunStats {
 }
 
 /// Pending work item: a state with its exploration counter.
+/// Uses Arc<State> to share the input state across multiple path explorations.
 #[derive(Clone)]
 struct PendingState {
-    state: State,
+    /// The input state (shared via Arc across all paths for this input)
+    state: Arc<State>,
     path: PathCounter,
     shape: StateShape,
 }
@@ -184,7 +186,7 @@ pub fn run_traced(
             concrete_state.heap.freeze();
             let shape = debug_shape_of_state(&concrete_state);
             pending.push_back(PendingState {
-                state: concrete_state,
+                state: Arc::new(concrete_state),
                 path: PathCounter::new(),
                 shape,
             });
@@ -214,7 +216,8 @@ pub fn run_traced(
 
         // Execute with tracing (fast mode - no symbolic tracking since cache is disabled)
         let tracer = TracingInterpreter::new_fast(fixed_env, Some(pending_state.path.clone()));
-        let result = tracer.interpret(cfg.clone(), pending_state.state.clone())?;
+        // Clone the Arc's contents - this is necessary because interpret takes ownership
+        let result = tracer.interpret(cfg.clone(), (*pending_state.state).clone())?;
 
         stats.forced_choices += result.forced_choices;
         stats.new_traces += 1;
@@ -280,13 +283,18 @@ struct TraceResult {
     path: PathCounter,
     concrete_path: Vec<bool>,
     /// If forced_choices > 0, this contains the next path and original state for re-exploration
-    next_exploration: Option<(State, PathCounter, StateShape)>,
+    /// Uses Arc<State> to share input state across explorations
+    next_exploration: Option<(Arc<State>, PathCounter, StateShape)>,
 }
 
 /// Batch size for incremental vectorization during tracing.
 /// After accumulating this many output states, we vectorize to reduce memory and final vectorization cost.
 /// Set higher to reduce vectorization frequency (at cost of more memory).
-const INCREMENTAL_VECTORIZE_BATCH_SIZE: usize = 20000;
+const INCREMENTAL_VECTORIZE_BATCH_SIZE: usize = 5000;
+
+/// Maximum number of pending states to process in one batch.
+/// This limits memory usage from the pending queue.
+const MAX_PENDING_BATCH_SIZE: usize = 1000;
 
 /// Runs multiple states through a CFG using symbolic tracing, with parallel execution.
 pub fn run_traced_parallel(
@@ -304,7 +312,7 @@ pub fn run_traced_parallel(
     // Track seen (shape, abstract_path, concrete_path) tuples
     let mut seen_full_paths: HashSet<(StateShape, Vec<(usize, usize)>, Vec<bool>)> = HashSet::new();
 
-    // Initialize pending states
+    // Initialize pending states with Arc<State> for sharing
     let mut pending: Vec<PendingState> = Vec::new();
     for state in input_states {
         let concrete_states = split_vectorized_state(state);
@@ -313,7 +321,7 @@ pub fn run_traced_parallel(
             concrete_state.heap.freeze();
             let shape = debug_shape_of_state(&concrete_state);
             pending.push(PendingState {
-                state: concrete_state,
+                state: Arc::new(concrete_state),
                 path: PathCounter::new(),
                 shape,
             });
@@ -322,8 +330,12 @@ pub fn run_traced_parallel(
 
     // Process in batches using parallel execution
     while !pending.is_empty() {
-        // Take current batch
-        let batch: Vec<_> = std::mem::take(&mut pending);
+        // Take current batch (limited size to control memory usage)
+        let batch: Vec<_> = if pending.len() <= MAX_PENDING_BATCH_SIZE {
+            std::mem::take(&mut pending)
+        } else {
+            pending.drain(..MAX_PENDING_BATCH_SIZE).collect()
+        };
         let batch_size = batch.len();
 
         // Update stats for potential cache hits (before parallel processing)
@@ -344,9 +356,11 @@ pub fn run_traced_parallel(
             .into_par_iter()
             .map(|pending_state| {
                 let tracer = TracingInterpreter::new_fast(fixed_env, Some(pending_state.path.clone()));
-                let result = tracer.interpret(cfg.clone(), pending_state.state.clone())?;
+                // Clone the Arc contents - interpret takes ownership
+                let result = tracer.interpret(cfg.clone(), (*pending_state.state).clone())?;
 
                 // Compute next exploration if needed
+                // Share the input state via Arc
                 let next_exploration = if result.forced_choices > 0 {
                     let mut next_path = result.path.clone();
                     if next_path.increment() {
@@ -454,7 +468,7 @@ pub fn run_traced_parallel_cached(
     let mut seen_shape_paths: HashSet<(StateShape, Vec<(usize, usize)>)> = HashSet::new();
     let mut seen_full_paths: HashSet<(StateShape, Vec<(usize, usize)>, Vec<bool>)> = HashSet::new();
 
-    // Initialize pending states
+    // Initialize pending states with Arc<State> for sharing
     let mut pending: Vec<PendingState> = Vec::new();
     for state in input_states {
         let concrete_states = split_vectorized_state(state);
@@ -463,7 +477,7 @@ pub fn run_traced_parallel_cached(
             concrete_state.heap.freeze();
             let shape = debug_shape_of_state(&concrete_state);
             pending.push(PendingState {
-                state: concrete_state,
+                state: Arc::new(concrete_state),
                 path: PathCounter::new(),
                 shape,
             });
@@ -493,7 +507,7 @@ pub fn run_traced_parallel_cached(
 
         for ps in batch {
             // Try to look up using full path cache
-            let lookup_result = cache.get_full_path_debug(&ps.shape, &ps.path, &ps.state);
+            let lookup_result = cache.get_full_path_debug(&ps.shape, &ps.path, &*ps.state);
             if let Some(trace) = lookup_result.trace {
                 cache_hits.push((ps, trace.clone()));
             } else {
@@ -506,7 +520,7 @@ pub fn run_traced_parallel_cached(
 
         // Process cache hits: apply cached trace to get output
         for (ps, trace) in cache_hits {
-            let output_state = trace.apply(&ps.state);
+            let output_state = trace.apply(&*ps.state);
             debug_assert_eq!(output_state.vector_size, 1, "Output state should be concrete");
             output_states.push(output_state);
             stats.output_states += 1;
@@ -531,7 +545,8 @@ pub fn run_traced_parallel_cached(
                 .map(|pending_state| {
                     // Use symbolic tracking mode for caching
                     let tracer = TracingInterpreter::new(fixed_env, Some(pending_state.path.clone()));
-                    let result = tracer.interpret(cfg.clone(), pending_state.state.clone())?;
+                    // Clone from Arc - interpret takes ownership
+                    let result = tracer.interpret(cfg.clone(), (*pending_state.state).clone())?;
 
                     // Create cached trace for later reuse
                     let cached_trace = CachedTrace {
@@ -547,7 +562,7 @@ pub fn run_traced_parallel_cached(
                         allocated_heap_ids: result.allocated_heap_ids,
                     };
 
-                    // Compute next exploration if needed
+                    // Compute next exploration if needed - share input state via Arc
                     let next_exploration = if result.forced_choices > 0 {
                         let mut next_path = result.path.clone();
                         if next_path.increment() {
@@ -634,7 +649,8 @@ struct TraceResultWithCache {
     function_calls: usize,
     path: PathCounter,
     concrete_path: Vec<bool>,
-    next_exploration: Option<(State, PathCounter, StateShape)>,
+    /// Uses Arc<State> to share input state across explorations
+    next_exploration: Option<(Arc<State>, PathCounter, StateShape)>,
     cache_key: SimpleCacheKey,
     shape: StateShape,
     abstract_path: PathCounter,

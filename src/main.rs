@@ -2,6 +2,11 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
 
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 use anyhow::Result;
 use clap::Parser;
 use rayon::prelude::*;
