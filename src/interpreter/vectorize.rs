@@ -153,7 +153,7 @@ fn shape_of_state(state: &State) -> StateShape {
         local_env_structure,
         outer_local_envs_structure,
         global_env,
-        prints: state.prints.clone(),
+        prints: state.prints.as_slice().to_vec(),
     }
 }
 

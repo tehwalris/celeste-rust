@@ -1,4 +1,5 @@
 use std::hash::BuildHasherDefault;
+use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
 
@@ -19,13 +20,52 @@ type FxBuildHasher = BuildHasherDefault<FxHasher>;
 /// im::HashMap using FxHasher for faster hashing
 type FxImHashMap<K, V> = ImHashMap<K, V, FxBuildHasher>;
 
+/// Wrapper for prints Vec with Arc for O(1) cloning and COW semantics.
+/// Uses Arc internally for efficient structural sharing.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Prints {
+    inner: Arc<Vec<String>>,
+}
+
+impl Prints {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Vec::new()),
+        }
+    }
+
+    pub fn push(&mut self, s: String) {
+        Arc::make_mut(&mut self.inner).push(s);
+    }
+
+    pub fn as_slice(&self) -> &[String] {
+        &self.inner
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+}
+
+impl PartialEq for Prints {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner) || *self.inner == *other.inner
+    }
+}
+
+impl Eq for Prints {}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct State {
     pub heap: Heap,
     pub local_env: LocalEnv,
     pub outer_local_envs: Vec<LocalEnv>,
     pub global_env: FxImHashMap<String, HeapId>,
-    pub prints: Vec<String>,
+    pub prints: Prints,
     pub vector_size: usize,
 }
 
@@ -36,7 +76,7 @@ impl State {
             local_env: LocalEnv::new(),
             outer_local_envs: Vec::new(),
             global_env: FxImHashMap::default(),
-            prints: Vec::new(),
+            prints: Prints::new(),
             vector_size: 1,
         }
     }
