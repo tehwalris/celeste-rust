@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::hash::BuildHasherDefault;
 
 use im::HashMap as ImHashMap;
+use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -10,12 +12,18 @@ use super::{
 };
 use crate::ir::LocalId;
 
+/// FxHasher-based BuildHasher for im::HashMap
+type FxBuildHasher = BuildHasherDefault<FxHasher>;
+
+/// im::HashMap using FxHasher for faster hashing
+type FxImHashMap<K, V> = ImHashMap<K, V, FxBuildHasher>;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct State {
     pub heap: Heap,
     pub local_env: LocalEnv,
     pub outer_local_envs: Vec<LocalEnv>,
-    pub global_env: ImHashMap<String, HeapId>,
+    pub global_env: FxImHashMap<String, HeapId>,
     pub prints: Vec<String>,
     pub vector_size: usize,
 }
@@ -26,7 +34,7 @@ impl State {
             heap: Heap::new(),
             local_env: LocalEnv::new(),
             outer_local_envs: Vec::new(),
-            global_env: ImHashMap::new(),
+            global_env: FxImHashMap::default(),
             prints: Vec::new(),
             vector_size: 1,
         }
@@ -178,7 +186,7 @@ impl State {
         // Visit all roots from global_env (sorted for deterministic order)
         let mut global_keys: Vec<_> = self.global_env.keys().cloned().collect();
         global_keys.sort();
-        let mut new_global_env = ImHashMap::new();
+        let mut new_global_env = FxImHashMap::default();
         for key in global_keys {
             let old_id = self.global_env[&key];
             let new_id = visit(old_id, &self.heap, &mut old_to_new, &mut new_heap_values);
