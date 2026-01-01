@@ -250,8 +250,8 @@ The barrier-based executor is implemented and verified correct in `src/interpret
 
 ### Performance Status
 
-After optimization, barrier-based is **~25% faster** than flow-based:
-- Flow-based Frame 28: 1090 states before merge (4.8s)
+After optimization, barrier-based is **~27% faster** than flow-based:
+- Flow-based Frame 28: 1090 states before merge (4.9s)
 - Barrier-based Frame 28: ~12600 paths → ~800 vectorized states (3.6s)
 
 The key optimization is **batched intermediate vectorization**: during path enumeration,
@@ -265,6 +265,7 @@ of paths explored from 41000 to ~12600 and increases deduplication rate to ~94%.
 3. **Fast State Normalization**: `normalize_gc_state_for_comparison()` avoids redundant clone+GC
 4. **FxHashSet for Deduplication**: Uses faster hash function than SIP
 5. **Early Deduplication**: States are deduplicated as generated, not batched
+6. **FxHasher for im::HashMap**: Use FxHasher instead of SipHash for persistent collections
 
 ## Expected Benefits
 
