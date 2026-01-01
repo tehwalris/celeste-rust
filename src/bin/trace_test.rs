@@ -12,6 +12,8 @@ use celeste_rust::{
     interpreter::glue::interpret_cfg,
     interpreter::state::State,
     interpreter::fixed_env::FixedEnv,
+    interpreter::inspect::make_state_abstract,
+    interpreter::vectorize::vectorize_states,
     symbolic_tracing::{TraceCache, run_traced, RunStats},
 };
 
@@ -37,6 +39,7 @@ struct Args {
 }
 
 /// Run the reference (vectorized) implementation for one frame
+/// This matches main.rs exactly: interpret, GC, abstract, vectorize
 fn run_reference_frame(
     frame_cfg: &celeste_rust::ir::Cfg,
     states: Vec<State>,
@@ -49,6 +52,18 @@ fn run_reference_frame(
             all_results.push(s);
         }
     }
+
+    // GC states (like main.rs)
+    for state in &mut all_results {
+        state.gc();
+    }
+
+    // Make states abstract - widen player.rem to interval (like main.rs)
+    all_results = all_results.into_iter().map(make_state_abstract).collect();
+
+    // Vectorize states to combine similar ones (like main.rs)
+    all_results = vectorize_states(all_results);
+
     Ok(all_results)
 }
 
@@ -92,11 +107,11 @@ __reset_button_states()
     println!("After _init: {} states ({} expanded)\n",
              init_states.len(), count_expanded(&init_states));
 
-    // Compile the frame code
+    // Compile the frame code (must match main.rs order)
     let frame_code = r#"
-__reset_button_states()
 _update()
 _draw()
+__reset_button_states()
 "#;
     let frame_ast = full_moon::parse(frame_code)?;
     let (frame_cfg, frame_fun_defs) = frontend::compile(&frame_ast)?;
@@ -133,16 +148,24 @@ _draw()
         // Run symbolic tracing
         let (sym_count, sym_time, stats) = if run_symbolic {
             let start = Instant::now();
-            let (new_states, stats) = run_traced(
+            let (mut new_states, stats) = run_traced(
                 &frame_cfg,
                 sym_states,
                 &fixed_env,
                 &mut cache,
             )?;
+
+            // Apply same post-processing as reference: GC, abstract, vectorize
+            for state in &mut new_states {
+                state.gc();
+            }
+            new_states = new_states.into_iter().map(make_state_abstract).collect();
+            new_states = vectorize_states(new_states);
+
             let elapsed = start.elapsed();
 
-            // Symbolic tracing returns scalar states, so count = len
-            let count = new_states.len();
+            // Count expanded states (sum of vector_size after vectorization)
+            let count = count_expanded(&new_states);
             sym_states = new_states;
 
             (count, elapsed.as_millis(), Some(stats))
