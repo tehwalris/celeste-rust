@@ -59,11 +59,94 @@ impl PartialEq for Prints {
 
 impl Eq for Prints {}
 
+/// Wrapper for outer_local_envs Vec with Arc for O(1) cloning and COW semantics.
+/// Outer local envs is a stack of caller's local environments, used for closures.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OuterLocalEnvs {
+    inner: Arc<Vec<LocalEnv>>,
+}
+
+impl OuterLocalEnvs {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Vec::new()),
+        }
+    }
+
+    pub fn from_vec(envs: Vec<LocalEnv>) -> Self {
+        Self {
+            inner: Arc::new(envs),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &LocalEnv> {
+        self.inner.iter()
+    }
+
+    pub fn get(&self, index: usize) -> Option<&LocalEnv> {
+        self.inner.get(index)
+    }
+
+    /// Push the caller's local_env to create a new stack for a function call.
+    /// Returns a new OuterLocalEnvs with the caller's env prepended.
+    pub fn push_caller_env(&self, caller_env: LocalEnv) -> Self {
+        let mut new_envs = vec![caller_env];
+        new_envs.extend(self.inner.iter().cloned());
+        Self {
+            inner: Arc::new(new_envs),
+        }
+    }
+
+    /// Pop the caller's local_env from the stack after a function returns.
+    /// Returns (caller_local_env, remaining_outer_envs).
+    pub fn pop_caller_env(&self) -> (LocalEnv, Self) {
+        if self.inner.is_empty() {
+            return (LocalEnv::new(), Self::new());
+        }
+        let caller_env = self.inner[0].clone();
+        let remaining = Self {
+            inner: Arc::new(self.inner[1..].to_vec()),
+        };
+        (caller_env, remaining)
+    }
+
+    /// Map a function over all LocalEnvs in place
+    pub fn map_in_place(&mut self, f: impl Fn(&LocalEnv) -> LocalEnv) {
+        let new_envs: Vec<LocalEnv> = self.inner.iter().map(f).collect();
+        self.inner = Arc::new(new_envs);
+    }
+}
+
+impl PartialEq for OuterLocalEnvs {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner) || *self.inner == *other.inner
+    }
+}
+
+impl Eq for OuterLocalEnvs {}
+
+impl<'a> IntoIterator for &'a OuterLocalEnvs {
+    type Item = &'a LocalEnv;
+    type IntoIter = std::slice::Iter<'a, LocalEnv>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.inner.iter()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct State {
     pub heap: Heap,
     pub local_env: LocalEnv,
-    pub outer_local_envs: Vec<LocalEnv>,
+    pub outer_local_envs: OuterLocalEnvs,
     pub global_env: FxImHashMap<String, HeapId>,
     pub prints: Prints,
     pub vector_size: usize,
@@ -74,7 +157,7 @@ impl State {
         Self {
             heap: Heap::new(),
             local_env: LocalEnv::new(),
-            outer_local_envs: Vec::new(),
+            outer_local_envs: OuterLocalEnvs::new(),
             global_env: FxImHashMap::default(),
             prints: Prints::new(),
             vector_size: 1,
@@ -96,9 +179,11 @@ impl State {
             | HeapValue::BuiltinFun(_) => v,
         });
         self.local_env.map_in_place(f);
-        for env in &mut self.outer_local_envs {
-            env.map_in_place(f);
-        }
+        self.outer_local_envs.map_in_place(|env| {
+            let mut new_env = env.clone();
+            new_env.map_in_place(f);
+            new_env
+        });
     }
 
     /// Filters all vector values in the state by a mask.
@@ -125,9 +210,11 @@ impl State {
         new_state.local_env.map_in_place(|v| v.filter_vectors(mask));
 
         // Filter values in outer local envs
-        for env in &mut new_state.outer_local_envs {
-            env.map_in_place(|v| v.filter_vectors(mask));
-        }
+        new_state.outer_local_envs.map_in_place(|env| {
+            let mut new_env = env.clone();
+            new_env.map_in_place(|v| v.filter_vectors(mask));
+            new_env
+        });
 
         new_state
     }
@@ -156,16 +243,17 @@ impl State {
         );
 
         // Build new outer_local_envs with extracted values
-        let new_outer_local_envs: Vec<LocalEnv> = self
-            .outer_local_envs
-            .iter()
-            .map(|env| {
-                LocalEnv::from_iter(
-                    env.iter()
-                        .map(|(raw_id, value)| (LocalId::from(raw_id), value.extract_at_index(lane_idx))),
-                )
-            })
-            .collect();
+        let new_outer_local_envs = OuterLocalEnvs::from_vec(
+            self.outer_local_envs
+                .iter()
+                .map(|env| {
+                    LocalEnv::from_iter(
+                        env.iter()
+                            .map(|(raw_id, value)| (LocalId::from(raw_id), value.extract_at_index(lane_idx))),
+                    )
+                })
+                .collect()
+        );
 
         State {
             heap: new_heap,
@@ -293,20 +381,22 @@ impl State {
         );
 
         // Visit all roots from outer_local_envs
-        let new_outer_local_envs: Vec<LocalEnv> = self.outer_local_envs.iter()
-            .map(|env| {
-                let mut entries: Vec<_> = env.iter().collect();
-                entries.sort_unstable_by_key(|(k, _)| *k);
-                LocalEnv::from_iter(
-                    entries.into_iter().map(|(raw_id, value)| {
-                        let new_value = map_value_references(value, &mut |id| {
-                            visit(id, &self.heap, &mut old_to_new, &mut new_heap_values)
-                        });
-                        (LocalId::from(raw_id), new_value)
-                    })
-                )
-            })
-            .collect();
+        let new_outer_local_envs = OuterLocalEnvs::from_vec(
+            self.outer_local_envs.iter()
+                .map(|env| {
+                    let mut entries: Vec<_> = env.iter().collect();
+                    entries.sort_unstable_by_key(|(k, _)| *k);
+                    LocalEnv::from_iter(
+                        entries.into_iter().map(|(raw_id, value)| {
+                            let new_value = map_value_references(value, &mut |id| {
+                                visit(id, &self.heap, &mut old_to_new, &mut new_heap_values)
+                            });
+                            (LocalId::from(raw_id), new_value)
+                        })
+                    )
+                })
+                .collect()
+        );
 
         // Build the new compacted heap directly from values (avoids repeated alloc+set)
         let new_heap = Heap::from_values(new_heap_values.into_iter().map(Some).collect());

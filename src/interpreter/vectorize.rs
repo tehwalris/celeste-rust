@@ -321,9 +321,11 @@ fn vectorize_same_shape_states(states: Vec<State>) -> State {
 
     // Build vectorized outer_local_envs
     let num_outer = first_state.outer_local_envs.len();
-    let merged_outer_local_envs: Vec<LocalEnv> = (0..num_outer)
-        .map(|i| merge_local_envs(&states, |s| &s.outer_local_envs[i]))
-        .collect();
+    let merged_outer_local_envs = crate::interpreter::state::OuterLocalEnvs::from_vec(
+        (0..num_outer)
+            .map(|i| merge_local_envs(&states, |s| s.outer_local_envs.get(i).unwrap()))
+            .collect()
+    );
 
     State {
         heap: new_heap,

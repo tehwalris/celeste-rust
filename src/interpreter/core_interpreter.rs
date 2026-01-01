@@ -384,8 +384,7 @@ impl<'a> CoreInterpreter<'a> {
                 // 2. When that happens, we need to restore the caller's local_env as-is
                 // 3. The caller's variables are scalar or already matched the original
                 //    vector_size, so they don't need filtering
-                let mut new_outer_local_envs = vec![self.state.local_env.clone()];
-                new_outer_local_envs.extend(self.state.outer_local_envs.clone());
+                let new_outer_local_envs = self.state.outer_local_envs.push_caller_env(self.state.local_env.clone());
 
                 let function_state = State {
                     heap: self.state.heap.clone(),
@@ -436,11 +435,7 @@ impl<'a> CoreInterpreter<'a> {
                     .map(|(function_result_state, return_value)| {
                         // Pop the caller's local_env from the stack.
                         // This was pushed before the function call.
-                        let (caller_local_env, remaining_outer_envs) = {
-                            let mut envs = function_result_state.outer_local_envs.clone();
-                            let caller_env = envs.remove(0); // Pop the first (caller's) env
-                            (caller_env, envs)
-                        };
+                        let (caller_local_env, remaining_outer_envs) = function_result_state.outer_local_envs.pop_caller_env();
 
                         let mut caller_state = State {
                             heap: function_result_state.heap,

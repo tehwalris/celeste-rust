@@ -357,8 +357,7 @@ fn interpret_call_with_path_counter(
             }
 
             // Create the state for executing the function body
-            let mut new_outer_local_envs = vec![state.local_env.clone()];
-            new_outer_local_envs.extend(state.outer_local_envs.clone());
+            let new_outer_local_envs = state.outer_local_envs.push_caller_env(state.local_env.clone());
 
             let function_state = State {
                 heap: state.heap.clone(),
@@ -383,12 +382,7 @@ fn interpret_call_with_path_counter(
             match cfg_result {
                 CfgRunResult::Completed { state: result_state, return_value } => {
                     // Function completed normally - restore caller state
-                    let mut outer_local_envs = result_state.outer_local_envs;
-                    let caller_local_env = if !outer_local_envs.is_empty() {
-                        outer_local_envs.remove(0)
-                    } else {
-                        LocalEnv::new()
-                    };
+                    let (caller_local_env, outer_local_envs) = result_state.outer_local_envs.pop_caller_env();
 
                     let mut caller_state = State {
                         heap: result_state.heap,
@@ -1084,12 +1078,7 @@ fn resume_call_stack(
         match result {
             CfgRunResult::Completed { state: result_state, return_value } => {
                 // Function completed - restore caller's state and continue with parent
-                let mut outer_local_envs = result_state.outer_local_envs;
-                let caller_local_env = if !outer_local_envs.is_empty() {
-                    outer_local_envs.remove(0)
-                } else {
-                    LocalEnv::new()
-                };
+                let (caller_local_env, outer_local_envs) = result_state.outer_local_envs.pop_caller_env();
 
                 let mut caller_state = State {
                     heap: result_state.heap,
