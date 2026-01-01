@@ -250,12 +250,19 @@ This means we can't predict `concrete_path` without actually tracing. The potent
      freeze heap before tracing for fast get_opt (Vec lookup instead of HashMap)
    - Result: Frame 28: 21.7s → 18.4s (15% faster)
 
-**Current state** (after optimizations):
-| Frame | Ref (ms) | Sym (ms) | Ratio |
-|-------|----------|----------|-------|
-| 28    | 4,706    | 18,376   | 3.9x  |
+5. **Parallel tracing with rayon** (commit 0369517)
+   - Problem: Single-threaded tracing doesn't utilize multi-core systems
+   - Solution: Process trace batches in parallel using rayon's par_iter
+   - Result: Frame 28: 18.5s → 7.9s (2.3x speedup with multi-core)
 
-Profile breakdown (current):
+**Current state** (after optimizations, with parallel enabled):
+| Frame | Ref (ms) | Sym (ms) | Sym Parallel (ms) | Parallel Ratio |
+|-------|----------|----------|-------------------|----------------|
+| 28    | 4,725    | 18,539   | 7,859             | 1.7x           |
+| 29    | 7,558    | 83,650   | 35,218            | 4.7x           |
+| 30    | 16,457   | 269,359  | 108,571           | 6.6x           |
+
+Profile breakdown (sequential, current):
 - **Hashing** (im-rs HAMT operations): ~17%
 - **Bitmap iteration** (im-rs internal): ~8%
 - **HAMT insert**: ~5%
