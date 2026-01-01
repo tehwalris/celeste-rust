@@ -186,37 +186,12 @@ pub fn run_traced(
             stats.unique_shape_paths += 1;
         }
 
-        // Try cache lookup - check path conditions against this state's values
-        if let Some(cached) = cache.get_matching(
-            &pending_state.shape,
-            &pending_state.path,
-            &pending_state.state,
-        ) {
-            // Cache hit! Apply the cached trace to get the output state.
-            stats.cache_hits += 1;
-            let output_state = cached.apply(&pending_state.state);
-            let forced_choices = cached.forced_choices;
-            let path = cached.path.clone();
-
-            debug_assert_eq!(output_state.vector_size, 1, "Output state should be concrete");
-            output_states.push(output_state);
-            stats.output_states += 1;
-
-            // If there were forced choices, we need to explore other paths
-            if forced_choices > 0 {
-                stats.forced_choices += forced_choices;
-                let mut next_path = path;
-                if next_path.increment() {
-                    // More paths to explore
-                    pending.push_back(PendingState {
-                        state: pending_state.state,
-                        path: next_path,
-                        shape: pending_state.shape,
-                    });
-                }
-            }
-            continue;
-        }
+        // NOTE: Cache lookup disabled (see insert note above)
+        // if let Some(cached) = cache.get_matching(
+        //     &pending_state.shape,
+        //     &pending_state.path,
+        //     &pending_state.state,
+        // ) { ... }
 
         // Cache miss - need to trace
         stats.cache_misses += 1;
@@ -227,19 +202,25 @@ pub fn run_traced(
 
         stats.forced_choices += result.forced_choices;
 
-        // Cache the result with symbolic information
-        cache.insert(
-            pending_state.shape.clone(),
-            result.path.clone(),
-            result.concrete_path.clone(),
-            result.forced_choices,
-            result.concrete_branches,
-            result.output_state.clone(),
-            result.heap_symbols,
-            result.input_symbols,
-            result.path_conditions,
-            result.allocated_heap_ids,
-        );
+        // NOTE: Caching is disabled because:
+        // 1. Memory usage explodes (15,000+ traces per frame)
+        // 2. Cache hit rate is only ~3.5% (663/19092)
+        // 3. Cache lookup overhead (32 condition checks/lookup) is high
+        //
+        // Future: Consider not caching, or use a more memory-efficient approach
+        //
+        // cache.insert(
+        //     pending_state.shape.clone(),
+        //     result.path.clone(),
+        //     result.concrete_path.clone(),
+        //     result.forced_choices,
+        //     result.concrete_branches,
+        //     result.output_state.clone(),
+        //     result.heap_symbols,
+        //     result.input_symbols,
+        //     result.path_conditions,
+        //     result.allocated_heap_ids,
+        // );
         stats.new_traces += 1;
         if result.concrete_branches == 0 {
             stats.reusable_traces += 1;
