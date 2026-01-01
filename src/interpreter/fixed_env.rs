@@ -1,7 +1,7 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use indexmap::IndexSet;
+use rustc_hash::FxHashMap;
 
 use crate::ir::{Cfg, FunDef, GlobalId, Label};
 
@@ -34,15 +34,15 @@ impl PreparedCfg {
 /// - Function definitions (with their prepared CFGs)
 /// - Builtin function implementations
 pub struct FixedEnv {
-    pub fun_defs: HashMap<GlobalId, (FunDef, PreparedCfg)>,
-    pub builtin_funs: HashMap<String, BuiltinFun>,
+    pub fun_defs: FxHashMap<GlobalId, (FunDef, PreparedCfg)>,
+    pub builtin_funs: FxHashMap<String, BuiltinFun>,
 }
 
 impl FixedEnv {
     pub fn new() -> Self {
         Self {
-            fun_defs: HashMap::new(),
-            builtin_funs: HashMap::new(),
+            fun_defs: FxHashMap::default(),
+            builtin_funs: FxHashMap::default(),
         }
     }
 

@@ -84,6 +84,15 @@ impl LocalEnv {
         }
     }
 
+    /// Ensure the underlying Vec can hold at least `capacity` elements.
+    /// Call this before a series of set() operations to avoid repeated resizes.
+    pub fn ensure_capacity(&mut self, capacity: usize) {
+        let values = Arc::make_mut(&mut self.values);
+        if capacity > values.len() {
+            values.resize(capacity, None);
+        }
+    }
+
     /// Build a LocalEnv from an iterator of (LocalId, Value) pairs.
     /// This is more efficient than creating an empty LocalEnv and calling set() repeatedly.
     pub fn from_iter(iter: impl Iterator<Item = (LocalId, Value)>) -> Self {

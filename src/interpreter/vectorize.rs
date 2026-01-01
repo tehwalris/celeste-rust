@@ -692,7 +692,7 @@ fn assert_state_vector_lengths_impl(state: &State) {
 /// Clean states by removing local_env entries that don't appear in all states.
 /// This allows states with different dead temporaries to merge.
 fn clean_local_envs_for_merging(states: Vec<State>) -> Vec<State> {
-    use std::collections::HashSet;
+    use rustc_hash::FxHashSet;
     use crate::ir::LocalId;
 
     if states.len() <= 1 {
@@ -700,9 +700,9 @@ fn clean_local_envs_for_merging(states: Vec<State>) -> Vec<State> {
     }
 
     // Find the intersection of all local_env keys
-    let mut common_keys: HashSet<usize> = states[0].local_env.iter().map(|(k, _)| k).collect();
+    let mut common_keys: FxHashSet<usize> = states[0].local_env.iter().map(|(k, _)| k).collect();
     for state in &states[1..] {
-        let state_keys: HashSet<usize> = state.local_env.iter().map(|(k, _)| k).collect();
+        let state_keys: FxHashSet<usize> = state.local_env.iter().map(|(k, _)| k).collect();
         common_keys = common_keys.intersection(&state_keys).copied().collect();
     }
 
@@ -951,11 +951,11 @@ pub fn union_diff_states(
     accumulated: Vec<State>,
     potentially_new: Vec<State>,
 ) -> (Vec<State>, Vec<State>) {
-    use std::collections::HashSet;
+    use rustc_hash::FxHashSet;
 
     if accumulated.is_empty() {
         // First, deduplicate within potentially_new
-        let mut seen: HashSet<NormalizedState> = HashSet::new();
+        let mut seen: FxHashSet<NormalizedState> = FxHashSet::default();
         let mut unique = Vec::new();
         for state in potentially_new {
             let normalized = normalize_state_for_comparison(&state);
@@ -973,14 +973,14 @@ pub fn union_diff_states(
     }
 
     // Build a set of normalized accumulated states for fast lookup
-    let accumulated_normalized: HashSet<NormalizedState> = accumulated
+    let accumulated_normalized: FxHashSet<NormalizedState> = accumulated
         .iter()
         .map(normalize_state_for_comparison)
         .collect();
 
     // Partition potentially_new into truly new vs already seen
     // Also deduplicate within potentially_new
-    let mut seen: HashSet<NormalizedState> = accumulated_normalized.clone();
+    let mut seen: FxHashSet<NormalizedState> = accumulated_normalized.clone();
     let mut actually_new = Vec::new();
     for state in potentially_new {
         let normalized = normalize_state_for_comparison(&state);
