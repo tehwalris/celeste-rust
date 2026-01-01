@@ -182,15 +182,16 @@ impl<'a> TracingInterpreter<'a> {
 
         // Main interpretation loop
         loop {
-            let current_cfg = self.current_cfg.as_ref().expect("current_cfg should be set");
+            // Clone the Arc (cheap refcount bump) so we can borrow the block across mutations
+            let current_cfg = self.current_cfg.clone().expect("current_cfg should be set");
 
-            // Get the current block
+            // Get a reference to the current block (no cloning!)
             let block = if let Some(ref label) = self.current_block {
                 current_cfg.named.get(label).ok_or_else(|| {
                     anyhow!("Block not found: {:?}", label)
-                })?.clone()
+                })?
             } else {
-                current_cfg.entry.clone()
+                &current_cfg.entry
             };
 
             // Split into phi and non-phi instructions
