@@ -115,8 +115,10 @@ pub fn debug_shape_of_state(state: &State) -> StateShape {
 
 fn shape_of_state(state: &State) -> StateShape {
     // Get heap structure (handle empty slots that are allocated but not set)
-    let mut heap_structure = Vec::new();
-    for i in 0..state.heap.len() {
+    // Pre-allocate with known capacity
+    let heap_len = state.heap.len();
+    let mut heap_structure = Vec::with_capacity(heap_len);
+    for i in 0..heap_len {
         let id = HeapId::from_raw(i);
         let shape = match state.heap.get_opt(id) {
             Some(value) => normalize_heap_value_for_shape(value),
@@ -126,10 +128,11 @@ fn shape_of_state(state: &State) -> StateShape {
     }
 
     // Get local env structure (sorted for consistent comparison)
+    // The local_env iter already returns entries in index order, so sorting is often a no-op
     let mut local_env_structure: Vec<_> = state.local_env.iter()
         .map(|(k, v)| (k, normalize_value_for_shape(v)))
         .collect();
-    local_env_structure.sort_by_key(|(k, _)| *k);
+    local_env_structure.sort_unstable_by_key(|(k, _)| *k);
 
     // Get outer local envs structure (sorted for consistent comparison)
     let outer_local_envs_structure: Vec<Vec<_>> = state.outer_local_envs.iter()
@@ -137,7 +140,7 @@ fn shape_of_state(state: &State) -> StateShape {
             let mut entries: Vec<_> = env.iter()
                 .map(|(k, v)| (k, normalize_value_for_shape(v)))
                 .collect();
-            entries.sort_by_key(|(k, _)| *k);
+            entries.sort_unstable_by_key(|(k, _)| *k);
             entries
         })
         .collect();
@@ -146,7 +149,7 @@ fn shape_of_state(state: &State) -> StateShape {
     let mut global_env: Vec<_> = state.global_env.iter()
         .map(|(k, v)| (k.clone(), *v))
         .collect();
-    global_env.sort_by(|a, b| a.0.cmp(&b.0));
+    global_env.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
     StateShape {
         heap_structure,
