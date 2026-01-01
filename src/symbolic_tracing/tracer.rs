@@ -75,6 +75,9 @@ pub struct TracingResult {
     pub input_symbols: InputSymbolMap,
     /// Path conditions that must be satisfied for this path.
     pub path_conditions: Vec<SymExpr>,
+    /// HeapIds that were allocated during tracing (not present in input).
+    /// These need to be re-allocated when applying the cached trace.
+    pub allocated_heap_ids: Vec<HeapId>,
 }
 
 /// Interprets a concrete state through CFGs, tracking the path taken.
@@ -115,6 +118,10 @@ pub struct TracingInterpreter<'a> {
     input_symbols: InputSymbolMap,
     /// Path conditions for this execution path (boolean expressions that must be true)
     path_conditions: Vec<SymExpr>,
+    /// HeapIds that existed in the input state (before tracing)
+    input_heap_ids: std::collections::HashSet<HeapId>,
+    /// HeapIds that were allocated during tracing
+    allocated_heap_ids: Vec<HeapId>,
 }
 
 impl<'a> TracingInterpreter<'a> {
@@ -139,6 +146,8 @@ impl<'a> TracingInterpreter<'a> {
             heap_symbols: HashMap::new(),
             input_symbols: HashMap::new(),
             path_conditions: Vec::new(),
+            input_heap_ids: std::collections::HashSet::new(),
+            allocated_heap_ids: Vec::new(),
         }
     }
 
@@ -150,6 +159,12 @@ impl<'a> TracingInterpreter<'a> {
         self.current_cfg = Some(cfg.clone());
         self.current_block = None;
         self.previous_block = None;
+
+        // Record all HeapIds that exist in the input state
+        // Any HeapIds allocated later are "new" and need to be re-allocated during apply()
+        self.input_heap_ids = (0..self.state.heap.len())
+            .map(HeapId::from_raw)
+            .collect();
 
         // Initialize input symbols for all heap values reachable from globals
         self.initialize_input_symbols();
@@ -272,6 +287,7 @@ impl<'a> TracingInterpreter<'a> {
                             heap_symbols: self.heap_symbols,
                             input_symbols: self.input_symbols,
                             path_conditions: self.path_conditions,
+                            allocated_heap_ids: self.allocated_heap_ids,
                         });
                     }
                 }
@@ -384,7 +400,7 @@ impl<'a> TracingInterpreter<'a> {
                 return self.interpret_call(local_id, *closure, args);
             }
             Instruction::Alloc => {
-                let heap_id = self.state.heap.alloc();
+                let heap_id = self.tracked_alloc();
                 self.state.local_env.set(local_id, Value::Pointer(heap_id));
             }
             Instruction::GetGlobal { name, create_if_missing } => {
@@ -392,7 +408,7 @@ impl<'a> TracingInterpreter<'a> {
                 if let Some(&heap_id) = heap_id {
                     self.state.local_env.set(local_id, Value::Pointer(heap_id));
                 } else if *create_if_missing {
-                    let heap_id = self.state.heap.alloc();
+                    let heap_id = self.tracked_alloc();
                     self.state.global_env.insert(name.clone(), heap_id);
                     self.state.local_env.set(local_id, Value::Pointer(heap_id));
                 } else {
@@ -454,7 +470,7 @@ impl<'a> TracingInterpreter<'a> {
                 if let Some(field_heap_id) = field_heap_id {
                     self.state.local_env.set(local_id, Value::Pointer(field_heap_id));
                 } else if *create_if_missing {
-                    let field_heap_id = self.state.heap.alloc();
+                    let field_heap_id = self.tracked_alloc();
                     self.state.heap.set(field_heap_id, HeapValue::Value(Value::Nil(None)));
                     let field_clone = field.clone();
                     let hv = self.state.heap.get_mut(table_heap_id);
@@ -492,7 +508,7 @@ impl<'a> TracingInterpreter<'a> {
                 if let Some(field_heap_id) = field_heap_id {
                     self.state.local_env.set(local_id, Value::Pointer(field_heap_id));
                 } else if *create_if_missing {
-                    let field_heap_id = self.state.heap.alloc();
+                    let field_heap_id = self.tracked_alloc();
                     self.state.heap.set(field_heap_id, HeapValue::Value(Value::Nil(None)));
                     let hv = self.state.heap.get_mut(table_heap_id);
                     match hv {
@@ -561,6 +577,13 @@ impl<'a> TracingInterpreter<'a> {
             Value::NilPointer(hint) => Err(anyhow!("Nil pointer: {}", hint)),
             value => Err(anyhow!("Expected pointer, got {:?}", value)),
         }
+    }
+
+    /// Allocate a new HeapId and track it as an allocation.
+    fn tracked_alloc(&mut self) -> HeapId {
+        let heap_id = self.state.heap.alloc();
+        self.allocated_heap_ids.push(heap_id);
+        heap_id
     }
 
     /// Interpret a call instruction.

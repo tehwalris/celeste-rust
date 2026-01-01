@@ -186,23 +186,37 @@ pub fn run_traced(
             stats.unique_shape_paths += 1;
         }
 
-        // TODO: Cache hits are disabled because apply() doesn't handle allocations.
-        //
-        // The issue: When a trace allocates new heap entries, those HeapIds are
-        // specific to that trace. When applying to a different input state, the
-        // HeapIds don't exist or point to different things.
-        //
-        // To fix this, we need to:
-        // 1. Track which HeapIds were allocated during tracing
-        // 2. When applying, allocate new HeapIds in the target state
-        // 3. Map old HeapIds to new HeapIds when evaluating symbolic expressions
-        //
-        // For now, we just trace every time (no cache hits).
-        let _ = cache.get_matching(
+        // Try cache lookup - check path conditions against this state's values
+        if let Some(cached) = cache.get_matching(
             &pending_state.shape,
             &pending_state.path,
             &pending_state.state,
-        );
+        ) {
+            // Cache hit! Apply the cached trace to get the output state.
+            stats.cache_hits += 1;
+            let output_state = cached.apply(&pending_state.state);
+            let forced_choices = cached.forced_choices;
+            let path = cached.path.clone();
+
+            debug_assert_eq!(output_state.vector_size, 1, "Output state should be concrete");
+            output_states.push(output_state);
+            stats.output_states += 1;
+
+            // If there were forced choices, we need to explore other paths
+            if forced_choices > 0 {
+                stats.forced_choices += forced_choices;
+                let mut next_path = path;
+                if next_path.increment() {
+                    // More paths to explore
+                    pending.push_back(PendingState {
+                        state: pending_state.state,
+                        path: next_path,
+                        shape: pending_state.shape,
+                    });
+                }
+            }
+            continue;
+        }
 
         // Cache miss - need to trace
         stats.cache_misses += 1;
@@ -224,6 +238,7 @@ pub fn run_traced(
             result.heap_symbols,
             result.input_symbols,
             result.path_conditions,
+            result.allocated_heap_ids,
         );
         stats.new_traces += 1;
         if result.concrete_branches == 0 {

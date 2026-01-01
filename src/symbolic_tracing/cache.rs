@@ -15,6 +15,8 @@ use crate::interpreter::symbolic::{ConcreteValue, SymExpr, Substitution, evaluat
 use crate::interpreter::value::{Value, HeapValue, MaybeVector};
 
 use super::PathCounter;
+use crate::interpreter::heap::HeapId;
+
 use super::tracer::{ConcretePath, InputSymbolMap, HeapSymbolMap};
 
 /// A cached execution trace with symbolic information.
@@ -40,6 +42,9 @@ pub struct CachedTrace {
     /// Path conditions: symbolic boolean expressions that must all evaluate to true
     /// for this trace to be applicable to an input state.
     pub path_conditions: Vec<SymExpr>,
+    /// HeapIds that were allocated during the original trace.
+    /// When applying, we need to allocate new HeapIds and map old -> new.
+    pub allocated_heap_ids: Vec<HeapId>,
 }
 
 impl CachedTrace {
@@ -67,25 +72,75 @@ impl CachedTrace {
 
     /// Apply this cached trace to a new input state, producing an output state.
     ///
-    /// 1. Build substitution: for each input symbol, get the concrete value from input_state
-    /// 2. Clone the template output state
-    /// 3. For each heap value with a symbol, evaluate the symbol and update the value
+    /// This is a complex operation because the cached trace may have allocated
+    /// heap entries that don't exist in the input state. We handle this by:
+    /// 1. Allocating new HeapIds in the input state's heap for each allocation
+    /// 2. Building a mapping from old (cached) HeapIds to new HeapIds
+    /// 3. Cloning the output state template
+    /// 4. Replacing allocated HeapIds with new ones in the heap structure
+    /// 5. Evaluating symbolic expressions with both value substitution and HeapId mapping
     pub fn apply(&self, input_state: &State) -> State {
+        use rustc_hash::FxHashMap;
+
+        // Start with the input state as the base
+        let mut output_state = input_state.clone();
+
+        // Allocate new HeapIds for each one that was allocated during the original trace
+        let mut heap_id_map: FxHashMap<HeapId, HeapId> = FxHashMap::default();
+        for &old_id in &self.allocated_heap_ids {
+            let new_id = output_state.heap.alloc();
+            heap_id_map.insert(old_id, new_id);
+
+            // Copy the heap value from the cached output state, but remap any HeapIds
+            if let Some(old_heap_val) = self.output_state.heap.get_opt(old_id) {
+                let new_heap_val = remap_heap_value(old_heap_val.clone(), &heap_id_map);
+                output_state.heap.set(new_id, new_heap_val);
+            }
+        }
+
         // Build substitution map: SymbolId -> ConcreteValue
         let substitution = self.build_substitution(input_state);
 
-        // Clone the template output state
-        let mut output_state = self.output_state.clone();
-
-        // Apply substitutions to heap values
+        // Apply substitutions to heap values, remapping HeapIds in pointer values
         for (&heap_id, sym_expr) in &self.heap_symbols {
+            // Skip allocated HeapIds - they were already handled above
+            if self.allocated_heap_ids.contains(&heap_id) {
+                continue;
+            }
+
             let concrete_value = evaluate_sym_expr(sym_expr, &substitution);
+            // Remap any pointer HeapIds in the result
+            let concrete_value = remap_concrete_value(concrete_value, &heap_id_map);
             let new_value = concrete_value_to_value(concrete_value);
 
             // Update the heap value
-            if let Some(heap_val) = output_state.heap.get_opt(heap_id) {
-                if let HeapValue::Value(_) = heap_val {
-                    output_state.heap.set(heap_id, HeapValue::Value(new_value));
+            if output_state.heap.get_opt(heap_id).is_some() {
+                output_state.heap.set(heap_id, HeapValue::Value(new_value));
+            }
+        }
+
+        // Also need to copy non-value heap entries from the template
+        // (like ObjectTable, ArrayTable, Closure structures)
+        // For entries that existed in input but were modified (non-Value types)
+        for i in 0..self.output_state.heap.len() {
+            let id = HeapId::from_raw(i);
+            // Skip allocated HeapIds (already handled) and skip entries with symbolic values
+            if self.allocated_heap_ids.contains(&id) || self.heap_symbols.contains_key(&id) {
+                continue;
+            }
+            if let Some(heap_val) = self.output_state.heap.get_opt(id) {
+                // Copy non-Value heap entries (tables, closures, etc.)
+                // that may have been modified during the trace
+                match heap_val {
+                    HeapValue::Value(_) => {
+                        // Value entries without symbols should be copied as-is
+                        // (they weren't modified during tracing)
+                    }
+                    _ => {
+                        // Remap HeapIds in the heap value
+                        let remapped = remap_heap_value(heap_val.clone(), &heap_id_map);
+                        output_state.heap.set(id, remapped);
+                    }
                 }
             }
         }
@@ -137,6 +192,64 @@ fn concrete_value_to_value(concrete: ConcreteValue) -> Value {
         ConcreteValue::String(s) => Value::String((*s).clone()),
         ConcreteValue::Nil => Value::Nil(None),
         ConcreteValue::Pointer(h) => Value::Pointer(h),
+    }
+}
+
+/// Remap HeapIds in a ConcreteValue using the given mapping.
+fn remap_concrete_value(
+    value: ConcreteValue,
+    heap_id_map: &rustc_hash::FxHashMap<HeapId, HeapId>,
+) -> ConcreteValue {
+    match value {
+        ConcreteValue::Pointer(old_id) => {
+            let new_id = heap_id_map.get(&old_id).copied().unwrap_or(old_id);
+            ConcreteValue::Pointer(new_id)
+        }
+        other => other,
+    }
+}
+
+/// Remap HeapIds in a HeapValue using the given mapping.
+fn remap_heap_value(
+    value: HeapValue,
+    heap_id_map: &rustc_hash::FxHashMap<HeapId, HeapId>,
+) -> HeapValue {
+    match value {
+        HeapValue::Value(v) => HeapValue::Value(remap_value(v, heap_id_map)),
+        HeapValue::ObjectTable(fields) => {
+            let new_fields = fields.into_iter()
+                .map(|(k, old_id)| {
+                    let new_id = heap_id_map.get(&old_id).copied().unwrap_or(old_id);
+                    (k, new_id)
+                })
+                .collect();
+            HeapValue::ObjectTable(new_fields)
+        }
+        HeapValue::ArrayTable(items) => {
+            let new_items = items.into_iter()
+                .map(|old_id| heap_id_map.get(&old_id).copied().unwrap_or(old_id))
+                .collect();
+            HeapValue::ArrayTable(new_items)
+        }
+        HeapValue::Closure(name, captures) => {
+            let new_captures = captures.into_iter()
+                .map(|v| remap_value(v, heap_id_map))
+                .collect();
+            HeapValue::Closure(name, new_captures)
+        }
+        HeapValue::UnknownTable => HeapValue::UnknownTable,
+        HeapValue::BuiltinFun(name) => HeapValue::BuiltinFun(name),
+    }
+}
+
+/// Remap HeapIds in a Value using the given mapping.
+fn remap_value(value: Value, heap_id_map: &rustc_hash::FxHashMap<HeapId, HeapId>) -> Value {
+    match value {
+        Value::Pointer(old_id) => {
+            let new_id = heap_id_map.get(&old_id).copied().unwrap_or(old_id);
+            Value::Pointer(new_id)
+        }
+        other => other,
     }
 }
 
@@ -213,6 +326,7 @@ impl TraceCache {
         heap_symbols: HeapSymbolMap,
         input_symbols: InputSymbolMap,
         path_conditions: Vec<SymExpr>,
+        allocated_heap_ids: Vec<HeapId>,
     ) {
         let key = CacheKey {
             shape,
@@ -228,6 +342,7 @@ impl TraceCache {
             heap_symbols,
             input_symbols,
             path_conditions,
+            allocated_heap_ids,
         };
 
         self.traces.entry(key).or_insert_with(Vec::new).push(trace);
