@@ -248,20 +248,40 @@ The barrier-based executor is implemented and verified correct in `src/interpret
 3. **Verified Correctness**: Produces identical state counts to flow-based executor:
    - Frame 25: 24, Frame 26: 204, Frame 27: 878, Frame 28: 2864
 
-### Current Performance Issue
+### Performance Status
 
-The barrier-based executor generates **exponentially more intermediate states** than flow-based:
-- Flow-based Frame 28: 1090 states before merge (4.85s)
-- Barrier-based Frame 28: 41000 states before merge (257s)
+After optimization, barrier-based is **~2.1x slower** than flow-based:
+- Flow-based Frame 28: 1090 states before merge (4.8s)
+- Barrier-based Frame 28: 41000 paths → 8088 unique states (10.2s)
 
-This is because PathCounter enumerates all 2^n paths for n UnknownBool choices, while flow-based uses abstract interpretation more efficiently.
+The path explosion (80% dedup) is inherent to the path enumeration approach.
 
-### Optimization Opportunities
+### Optimizations Applied
 
-1. **Early Path Merging**: Merge states during PathCounter enumeration, not just at barriers
-2. **Parallel Lane Processing**: Process vector lanes in parallel (currently sequential)
-3. **Caching**: Cache results of function calls with same inputs
-4. **Path Pruning**: Skip paths that lead to identical states
+1. **Parallel Lane Processing**: All lanes processed in parallel via rayon
+2. **Fast State Normalization**: `normalize_gc_state_for_comparison()` avoids redundant clone+GC
+3. **FxHashSet for Deduplication**: Uses faster hash function than SIP
+4. **Early Deduplication**: States are deduplicated as generated, not batched
+
+### Why It's Still Slower
+
+The fundamental issue is that PathCounter enumerates all 2^n paths for n UnknownBool
+choices. Each path requires:
+1. State cloning (persistent data structure operations)
+2. Running the interpreter
+3. GC and normalization for deduplication
+
+Flow-based avoids this by keeping states vectorized throughout - it never splits on
+UnknownBool, instead using vector masks to represent both branches simultaneously.
+
+### Profile Breakdown (Frame 28)
+- 13% - HAMT bitmap iteration (im library)
+- 6.5% - SIP hashing
+- 6% - HAMT hash_key operations
+- 3% - interpret_call_with_path_counter
+- 2.8% - HAMT Entry cloning
+- 2.6% - LocalEnv::get
+- 2.2% - Kernel lock contention (parallelism)
 
 ## Expected Benefits
 
