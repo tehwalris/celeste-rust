@@ -377,3 +377,32 @@ The fundamental issue is that branch conditions are path-dependent. Taking branc
 - When hitting UnknownBool, reference just continues (takes "both branches" implicitly)
 - No path enumeration, no 14x expansion
 - Vectorization at frame end handles the combination of paths
+
+### Comparison: Reference vs Symbolic Tracing
+
+| Metric           | Reference | Symbolic (parallel) |
+|------------------|-----------|---------------------|
+| Frame 30 time    | 12.5s     | 60s                 |
+| Frame 31         | 19.8s     | OOM                 |
+| Frames in 60s    | 31        | 30                  |
+| 35 frames total  | 230s      | N/A (OOM)           |
+
+**Key insight**: Symbolic tracing was designed to enable caching, but:
+1. Caching doesn't work due to path-dependent branches (216+ concrete branches per trace)
+2. Without caching, symbolic tracing is just a slower version of the reference
+3. Path enumeration adds 14x overhead without benefit
+
+**Recommendation**: For maximum performance without caching, use the reference interpreter directly.
+
+### Potential Future Improvements
+
+If symbolic tracing is to be revived, the key change would be:
+
+**Vectorized symbolic execution**:
+1. Keep states vectorized during tracing (don't split to scalars)
+2. Handle branches by filtering vector lanes (like reference)
+3. Skip explicit path enumeration for UnknownBool
+4. This would be essentially identical to reference + symbolic expression tracking
+5. Could enable block-level or expression-level caching (smaller units = less path dependence)
+
+The fundamental issue with the current approach is that full-trace caching requires predicting the entire path through thousands of branches, which is infeasible due to path-dependence.
