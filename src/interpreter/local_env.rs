@@ -20,6 +20,12 @@ impl LocalEnv {
         Self::new()
     }
 
+    /// Build a LocalEnv from an iterator of (LocalId, Value) pairs.
+    /// This is more efficient than creating an empty LocalEnv and calling set() repeatedly.
+    pub fn from_iter(iter: impl Iterator<Item = (LocalId, Value)>) -> Self {
+        Self(iter.collect())
+    }
+
     pub fn get(&self, id: LocalId) -> &Value {
         self.0.get(&id).expect("LocalId should be set before get")
     }

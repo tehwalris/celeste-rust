@@ -107,22 +107,22 @@ impl State {
             .collect();
         let new_heap = Heap::from_values(heap_values);
 
-        // Build new local_env with extracted values
-        let mut new_local_env = LocalEnv::new();
-        for (raw_id, value) in self.local_env.iter() {
-            new_local_env.set(LocalId::from(raw_id), value.extract_at_index(lane_idx));
-        }
+        // Build new local_env with extracted values (avoids repeated im::HashMap inserts)
+        let new_local_env = LocalEnv::from_iter(
+            self.local_env
+                .iter()
+                .map(|(raw_id, value)| (LocalId::from(raw_id), value.extract_at_index(lane_idx))),
+        );
 
         // Build new outer_local_envs with extracted values
         let new_outer_local_envs: Vec<LocalEnv> = self
             .outer_local_envs
             .iter()
             .map(|env| {
-                let mut new_env = LocalEnv::new();
-                for (raw_id, value) in env.iter() {
-                    new_env.set(LocalId::from(raw_id), value.extract_at_index(lane_idx));
-                }
-                new_env
+                LocalEnv::from_iter(
+                    env.iter()
+                        .map(|(raw_id, value)| (LocalId::from(raw_id), value.extract_at_index(lane_idx))),
+                )
             })
             .collect();
 
