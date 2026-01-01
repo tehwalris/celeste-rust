@@ -10,12 +10,17 @@
 //! - Path deduplication: Duplicate states are detected and merged during enumeration
 
 use std::collections::BTreeMap;
+use std::sync::LazyLock;
 
 use anyhow::{anyhow, Result};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use crate::ir::{BarrierId, Block, Cfg, Instruction, Label, LocalId, Terminator};
+
+/// Static entry label to avoid repeated String allocations.
+/// Used for PHI node resolution when entering a block from the CFG entry point.
+static ENTRY_LABEL: LazyLock<Label> = LazyLock::new(|| Label::from("__entry".to_string()));
 
 use super::{
     fixed_env::FixedEnv,
@@ -191,10 +196,7 @@ fn interpret_call_with_path_counter(
             // Set up argument values (padding with Nil if needed)
             for (i, arg_id) in fun_def.arg_ids.iter().enumerate() {
                 if let Some(arg_id) = arg_id {
-                    let value = arg_values
-                        .get(i)
-                        .cloned()
-                        .unwrap_or(Value::Nil(Some("missing argument".to_string())));
+                    let value = arg_values.get(i).cloned().unwrap_or(Value::Nil(None));
                     new_local_env.set(*arg_id, value);
                 }
             }
@@ -217,17 +219,18 @@ fn interpret_call_with_path_counter(
             let (result_state, return_value) =
                 run_cfg_to_completion(&prepared_cfg.cfg, function_state, fixed_env, path_counter)?;
 
-            // Restore caller's local_env from outer_local_envs
-            let (caller_local_env, remaining_outer_envs) = {
-                let mut envs = result_state.outer_local_envs.clone();
-                let caller_env = envs.remove(0);
-                (caller_env, envs)
+            // Restore caller's local_env from outer_local_envs (avoid unnecessary clone)
+            let mut outer_local_envs = result_state.outer_local_envs;
+            let caller_local_env = if !outer_local_envs.is_empty() {
+                outer_local_envs.remove(0)
+            } else {
+                LocalEnv::new()
             };
 
             let mut caller_state = State {
                 heap: result_state.heap,
                 local_env: caller_local_env,
-                outer_local_envs: remaining_outer_envs,
+                outer_local_envs,
                 global_env: result_state.global_env,
                 prints: result_state.prints,
                 vector_size: result_state.vector_size,
@@ -251,9 +254,6 @@ fn run_cfg_to_completion(
     fixed_env: &FixedEnv,
     path_counter: &mut PathCounter,
 ) -> Result<(State, Option<Value>)> {
-    // Use a fake label for the entry block (needed for PHI nodes in successors)
-    let entry_label = Label::from("__entry".to_string());
-
     let mut current_block = &cfg.entry;
     let mut current_block_label: Option<&Label> = None; // None = entry block
     let mut incoming_label: Option<&Label> = None; // Label of block we came FROM (for PHI)
@@ -304,7 +304,7 @@ fn run_cfg_to_completion(
             }
             Terminator::UnconditionalBranch { target } => {
                 // Set incoming_label to current block's label (for PHI in target)
-                incoming_label = current_block_label.or(Some(&entry_label));
+                incoming_label = current_block_label.or(Some(&ENTRY_LABEL));
                 current_block_label = Some(target);
                 current_block = cfg
                     .named
@@ -334,7 +334,7 @@ fn run_cfg_to_completion(
 
                 let target = if take_true { true_target } else { false_target };
                 // Set incoming_label to current block's label (for PHI in target)
-                incoming_label = current_block_label.or(Some(&entry_label));
+                incoming_label = current_block_label.or(Some(&ENTRY_LABEL));
                 current_block_label = Some(target);
                 current_block = cfg
                     .named
@@ -362,13 +362,17 @@ pub struct WaitingState {
 }
 
 /// The implicit "END" barrier for states that complete execution
+static END_BARRIER_ID: LazyLock<BarrierId> = LazyLock::new(|| BarrierId::new(vec![i32::MAX]));
+
 pub fn end_barrier_id() -> BarrierId {
-    BarrierId::new(vec![i32::MAX])
+    END_BARRIER_ID.clone()
 }
 
 /// The implicit "START" barrier for initial states
+static START_BARRIER_ID: LazyLock<BarrierId> = LazyLock::new(|| BarrierId::new(vec![i32::MIN]));
+
 pub fn start_barrier_id() -> BarrierId {
-    BarrierId::new(vec![i32::MIN])
+    START_BARRIER_ID.clone()
 }
 
 /// Result of running a scalar state from one barrier to the next
@@ -722,9 +726,6 @@ fn run_to_next_barrier(
     path_counter: &mut PathCounter,
     start_block: Option<&Label>,
 ) -> Result<BarrierRunResult> {
-    // Use a fake label for the entry block (needed for PHI nodes in successors)
-    let entry_label = Label::from("__entry".to_string());
-
     // Initialize with the starting block
     let (mut current_block, mut current_block_label): (&Block, Option<&Label>) = match start_block
     {
@@ -806,7 +807,7 @@ fn run_to_next_barrier(
             }
             Terminator::UnconditionalBranch { target } => {
                 // Set incoming_label to current block's label (for PHI in target)
-                incoming_label = current_block_label.or(Some(&entry_label));
+                incoming_label = current_block_label.or(Some(&ENTRY_LABEL));
                 current_block_label = Some(target);
                 current_block = cfg
                     .named
@@ -836,7 +837,7 @@ fn run_to_next_barrier(
 
                 let target = if take_true { true_target } else { false_target };
                 // Set incoming_label to current block's label (for PHI in target)
-                incoming_label = current_block_label.or(Some(&entry_label));
+                incoming_label = current_block_label.or(Some(&ENTRY_LABEL));
                 current_block_label = Some(target);
                 current_block = cfg
                     .named
