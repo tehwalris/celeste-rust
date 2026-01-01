@@ -256,20 +256,25 @@ The barrier-based executor is implemented and verified correct in `src/interpret
 
 ### Performance Status
 
-Barrier-based is currently **slower** than flow-based at larger frames due to the overhead of tracking call stacks and resume contexts:
+Barrier-based is currently **slower** than flow-based at larger frames due to the overhead of path enumeration:
 
 | Frame | Barrier | Flow | Ratio |
 |-------|---------|------|-------|
-| 27 | 1.2s | 0.8s | 1.5x slower |
-| 28 | 6.8s | 3.1s | 2.2x slower |
-| 29 | 28s | 5.0s | 5.6x slower |
-| 30 | 75s | 11.2s | 6.7x slower |
+| 27 | 1.1s | 0.8s | 1.4x slower |
+| 28 | 5.9s | 2.7s | 2.2x slower |
+| 29 | 25s | 4.6s | 5.4x slower |
+| 30 | 107s | 10.4s | 10x slower |
 
 The barrier-based approach is slower because:
-1. It processes barriers in strict order, which serializes some work
-2. There's overhead from tracking and cloning ResumeContext/CallStack structures
-3. The PathCounter enumeration approach is less efficient than flow-based fixed-point iteration
+1. **Exponential path enumeration**: PathCounter enumerates all 2^n paths for n UnknownBool branches
+2. It processes barriers in strict order, which serializes some work
+3. There's overhead from tracking and cloning ResumeContext/CallStack structures
 4. States with different resume contexts can't be merged, reducing vectorization benefits
+
+The gap widens at higher frames because the number of paths grows faster than the flow-based approach can handle:
+- Frame 28: 40,942 paths (67% dedup rate)
+- Frame 29: 173,076 paths (68% dedup rate)
+- Frame 30: 463,994 paths (68% dedup rate)
 
 ### Optimizations Applied
 
@@ -283,6 +288,8 @@ The barrier-based approach is slower because:
 8. **Heap::from_values**: Build heaps directly from Vec<Option<HeapValue>> to avoid im::HashMap insert overhead.
 9. **Heap Freezing**: Freeze heaps after vectorization to move values from im::HashMap overlay to Arc<Vec> for O(1) access.
 10. **Static Labels**: Use LazyLock for frequently-used labels and barrier IDs to avoid repeated allocations.
+11. **jemalloc Allocator**: Use jemalloc instead of glibc malloc to reduce memory allocation overhead (~10% improvement).
+12. **FxHashMap for GC and ObjectTable**: Use FxHashMap in state GC and ObjectTable operations for faster hashing.
 
 ## Expected Benefits
 
