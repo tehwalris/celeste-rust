@@ -292,8 +292,8 @@ fn interpret_call_with_path_counter(
         }
     };
 
-    // Get the heap value
-    let heap_value = state.heap.get(closure_heap_id).clone();
+    // Get the heap value - avoid clone by matching on reference first
+    let heap_value = state.heap.get(closure_heap_id);
 
     // Gather argument values
     let arg_values: Vec<Value> = arg_local_ids
@@ -303,6 +303,7 @@ fn interpret_call_with_path_counter(
 
     match heap_value {
         HeapValue::BuiltinFun(name) => {
+            let name = name.clone(); // Clone only the name, not the whole HeapValue
             // Look up the builtin function
             let builtin_fn = fixed_env
                 .builtin_funs
@@ -337,7 +338,7 @@ fn interpret_call_with_path_counter(
             // Look up the function definition with prepared CFG
             let (fun_def, prepared_cfg) = fixed_env
                 .fun_defs
-                .get(&fun_def_name)
+                .get(fun_def_name)
                 .ok_or_else(|| anyhow!("Unknown function: {:?}", fun_def_name))?;
 
             // Create a new local_env for the function body
