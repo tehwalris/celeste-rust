@@ -9,10 +9,11 @@
 //! - Parallel lane processing: Vector lanes are processed in parallel using rayon
 //! - Path deduplication: Duplicate states are detected and merged during enumeration
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use anyhow::{anyhow, Result};
 use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 
 use crate::ir::{BarrierId, Block, Cfg, Instruction, Label, LocalId, Terminator};
 
@@ -26,8 +27,8 @@ use super::{
 
 /// Build a map from BarrierId to the block that has that barrier.
 /// Returns None for entry block, Some(label) for named blocks.
-fn build_barrier_map(cfg: &Cfg) -> HashMap<BarrierId, Option<Label>> {
-    let mut map = HashMap::new();
+fn build_barrier_map(cfg: &Cfg) -> FxHashMap<BarrierId, Option<Label>> {
+    let mut map = FxHashMap::default();
 
     // Check entry block
     if let Some(barrier_id) = &cfg.entry.barrier {
@@ -385,9 +386,9 @@ pub struct BarrierRunResult {
 /// Uses normalized state comparison to detect and merge duplicate states.
 struct StateAccumulator {
     /// States grouped by destination barrier
-    states_by_dest: HashMap<BarrierId, Vec<State>>,
+    states_by_dest: FxHashMap<BarrierId, Vec<State>>,
     /// Normalized state signatures for deduplication (per destination)
-    seen_normalized: HashMap<BarrierId, rustc_hash::FxHashSet<NormalizedState>>,
+    seen_normalized: FxHashMap<BarrierId, rustc_hash::FxHashSet<NormalizedState>>,
     /// Count of states that were deduplicated (for stats)
     dedup_count: usize,
 }
@@ -395,8 +396,8 @@ struct StateAccumulator {
 impl StateAccumulator {
     fn new() -> Self {
         Self {
-            states_by_dest: HashMap::new(),
-            seen_normalized: HashMap::new(),
+            states_by_dest: FxHashMap::default(),
+            seen_normalized: FxHashMap::default(),
             dedup_count: 0,
         }
     }
@@ -443,7 +444,7 @@ impl StateAccumulator {
     }
 
     /// Convert to pending map format
-    fn into_pending(self, barrier_map: &HashMap<BarrierId, Option<Label>>) -> BTreeMap<BarrierKey, Vec<(State, Option<Label>)>> {
+    fn into_pending(self, barrier_map: &FxHashMap<BarrierId, Option<Label>>) -> BTreeMap<BarrierKey, Vec<(State, Option<Label>)>> {
         let mut pending = BTreeMap::new();
         for (dest, states) in self.states_by_dest {
             let dest_block = if dest == end_barrier_id() {
@@ -570,7 +571,7 @@ pub fn execute_with_barriers(
 
     // Track per-state hit counts (state hash -> hit count per barrier)
     // For now, use a simpler approach: global hit count per barrier
-    let mut barrier_hit_counts: HashMap<BarrierId, usize> = HashMap::new();
+    let mut barrier_hit_counts: FxHashMap<BarrierId, usize> = FxHashMap::default();
 
     // Initialize with states at START barrier (they will start from entry block)
     let start_key = BarrierKey {
