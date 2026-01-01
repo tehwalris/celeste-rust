@@ -20,7 +20,7 @@ use celeste_rust::{
     interpreter::inspect::make_state_abstract,
     interpreter::vectorize::vectorize_states,
     ir::Cfg,
-    symbolic_tracing::{TraceCache, run_traced, RunStats},
+    symbolic_tracing::{TraceCache, run_traced, run_traced_parallel, RunStats},
 };
 
 #[derive(Parser)]
@@ -40,6 +40,10 @@ struct Args {
     /// Run both and compare (default)
     #[arg(long)]
     compare: bool,
+
+    /// Use parallel tracing (multi-threaded)
+    #[arg(long)]
+    parallel: bool,
 }
 
 /// Run the reference (vectorized) implementation for one frame
@@ -155,12 +159,21 @@ __reset_button_states()
             cache.clear();
 
             let start = Instant::now();
-            let (mut new_states, stats) = run_traced(
-                frame_cfg.clone(),
-                sym_states,
-                &fixed_env,
-                &mut cache,
-            )?;
+            let (mut new_states, stats) = if args.parallel {
+                run_traced_parallel(
+                    frame_cfg.clone(),
+                    sym_states,
+                    &fixed_env,
+                    &mut cache,
+                )?
+            } else {
+                run_traced(
+                    frame_cfg.clone(),
+                    sym_states,
+                    &fixed_env,
+                    &mut cache,
+                )?
+            };
 
             // Apply same post-processing as reference: GC, abstract, vectorize
             for state in &mut new_states {

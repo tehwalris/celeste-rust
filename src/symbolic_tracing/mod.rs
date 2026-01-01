@@ -9,4 +9,4 @@ mod runner;
 pub use path_counter::PathCounter;
 pub use tracer::{TracingInterpreter, TracingResult};
 pub use cache::{TraceCache, CachedTrace, CacheStats};
-pub use runner::{run_traced, run_frame_traced, RunStats};
+pub use runner::{run_traced, run_traced_parallel, run_frame_traced, RunStats};

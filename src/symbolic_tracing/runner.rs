@@ -16,6 +16,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use anyhow::Result;
+use rayon::prelude::*;
 
 use crate::interpreter::{
     fixed_env::FixedEnv,
@@ -268,4 +269,143 @@ pub fn run_frame_traced(
     cache: &mut TraceCache,
 ) -> Result<(Vec<State>, RunStats)> {
     run_traced(frame_cfg, input_states, fixed_env, cache)
+}
+
+/// Result of tracing a single state (used for parallel processing).
+struct TraceResult {
+    output_state: State,
+    forced_choices: usize,
+    concrete_branches: usize,
+    function_calls: usize,
+    path: PathCounter,
+    concrete_path: Vec<bool>,
+    /// If forced_choices > 0, this contains the next path and original state for re-exploration
+    next_exploration: Option<(State, PathCounter, StateShape)>,
+}
+
+/// Runs multiple states through a CFG using symbolic tracing, with parallel execution.
+pub fn run_traced_parallel(
+    cfg: Arc<Cfg>,
+    input_states: Vec<State>,
+    fixed_env: &FixedEnv,
+    _cache: &mut TraceCache, // Cache unused but kept for API compatibility
+) -> Result<(Vec<State>, RunStats)> {
+    let mut stats = RunStats::default();
+    let mut output_states: Vec<State> = Vec::new();
+
+    // Track seen (shape, path) pairs for potential cache hit analysis
+    let mut seen_shape_paths: HashSet<(StateShape, Vec<(usize, usize)>)> = HashSet::new();
+    // Track seen (shape, abstract_path, concrete_path) tuples
+    let mut seen_full_paths: HashSet<(StateShape, Vec<(usize, usize)>, Vec<bool>)> = HashSet::new();
+
+    // Initialize pending states
+    let mut pending: Vec<PendingState> = Vec::new();
+    for state in input_states {
+        let concrete_states = split_vectorized_state(state);
+        for mut concrete_state in concrete_states {
+            debug_assert_eq!(concrete_state.vector_size, 1, "State should be concrete after splitting");
+            concrete_state.heap.freeze();
+            let shape = debug_shape_of_state(&concrete_state);
+            pending.push(PendingState {
+                state: concrete_state,
+                path: PathCounter::new(),
+                shape,
+            });
+        }
+    }
+
+    // Process in batches using parallel execution
+    while !pending.is_empty() {
+        // Take current batch
+        let batch: Vec<_> = std::mem::take(&mut pending);
+        let batch_size = batch.len();
+
+        // Update stats for potential cache hits (before parallel processing)
+        for ps in &batch {
+            let shape_path_key = (ps.shape.clone(), ps.path.choices().to_vec());
+            if seen_shape_paths.contains(&shape_path_key) {
+                stats.potential_cache_hits += 1;
+            } else {
+                seen_shape_paths.insert(shape_path_key);
+                stats.unique_shape_paths += 1;
+            }
+        }
+        stats.states_processed += batch_size;
+        stats.cache_misses += batch_size;
+
+        // Process batch in parallel
+        let results: Vec<Result<TraceResult>> = batch
+            .into_par_iter()
+            .map(|pending_state| {
+                let tracer = TracingInterpreter::new(fixed_env, Some(pending_state.path.clone()));
+                let result = tracer.interpret(cfg.clone(), pending_state.state.clone())?;
+
+                // Compute next exploration if needed
+                let next_exploration = if result.forced_choices > 0 {
+                    let mut next_path = result.path.clone();
+                    if next_path.increment() {
+                        Some((pending_state.state, next_path, pending_state.shape))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                Ok(TraceResult {
+                    output_state: result.output_state,
+                    forced_choices: result.forced_choices,
+                    concrete_branches: result.concrete_branches,
+                    function_calls: result.function_calls,
+                    path: result.path,
+                    concrete_path: result.concrete_path,
+                    next_exploration,
+                })
+            })
+            .collect();
+
+        // Collect results and queue new work
+        for result in results {
+            let result = result?;
+
+            stats.forced_choices += result.forced_choices;
+            stats.new_traces += 1;
+            stats.total_concrete_branches += result.concrete_branches;
+            stats.total_function_calls += result.function_calls;
+
+            if result.concrete_branches == 0 {
+                stats.reusable_traces += 1;
+            } else {
+                stats.unreusable_traces += 1;
+            }
+
+            // Track unique full paths
+            // Note: We rebuild the shape from next_exploration if available,
+            // or compute it from output_state
+            let shape = result.next_exploration.as_ref()
+                .map(|(_, _, s)| s.clone())
+                .unwrap_or_else(|| debug_shape_of_state(&result.output_state));
+
+            let full_path_key = (
+                shape,
+                result.path.choices().to_vec(),
+                result.concrete_path,
+            );
+            if !seen_full_paths.contains(&full_path_key) {
+                seen_full_paths.insert(full_path_key);
+                stats.unique_full_paths += 1;
+            }
+
+            debug_assert_eq!(result.output_state.vector_size, 1, "Output state should be concrete");
+            output_states.push(result.output_state);
+            stats.output_states += 1;
+
+            // Queue next exploration if needed
+            if let Some((state, path, shape)) = result.next_exploration {
+                pending.push(PendingState { state, path, shape });
+            }
+        }
+    }
+
+    Ok((output_states, stats))
 }
