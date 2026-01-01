@@ -3,10 +3,16 @@
 //!
 //! Key design: PathCounter is passed through ALL levels of function calls,
 //! so the path enumeration works across the entire call stack.
+//!
+//! Optimizations:
+//! - Early path merging: States are merged incrementally as paths complete
+//! - Parallel lane processing: Vector lanes are processed in parallel using rayon
+//! - Path deduplication: Duplicate states are detected and merged during enumeration
 
 use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{anyhow, Result};
+use rayon::prelude::*;
 
 use crate::ir::{BarrierId, Block, Cfg, Instruction, Label, LocalId, Terminator};
 
@@ -15,7 +21,7 @@ use super::{
     local_env::LocalEnv,
     state::State,
     value::{HeapValue, MaybeVector, Value},
-    vectorize::vectorize_states,
+    vectorize::{vectorize_states, normalize_state_for_comparison, NormalizedState},
 };
 
 /// Build a map from BarrierId to the block that has that barrier.
@@ -375,6 +381,129 @@ pub struct BarrierRunResult {
     pub return_value: Option<Value>,
 }
 
+/// Accumulator for collecting states with early deduplication.
+/// Uses normalized state comparison to detect and merge duplicate states.
+struct StateAccumulator {
+    /// States grouped by destination barrier
+    states_by_dest: HashMap<BarrierId, Vec<State>>,
+    /// Normalized state signatures for deduplication (per destination)
+    seen_normalized: HashMap<BarrierId, std::collections::HashSet<NormalizedState>>,
+    /// Count of states that were deduplicated (for stats)
+    dedup_count: usize,
+}
+
+impl StateAccumulator {
+    fn new() -> Self {
+        Self {
+            states_by_dest: HashMap::new(),
+            seen_normalized: HashMap::new(),
+            dedup_count: 0,
+        }
+    }
+
+    /// Add a state to the accumulator with deduplication.
+    /// Returns true if the state was added (new), false if it was a duplicate.
+    fn add_state(&mut self, dest: BarrierId, mut state: State) -> bool {
+        // GC the state first to get deterministic heap IDs
+        state.gc();
+
+        // Compute normalized form for deduplication
+        let normalized = normalize_state_for_comparison(&state);
+
+        // Check if we've seen this state before
+        let seen_set = self.seen_normalized.entry(dest.clone()).or_default();
+        if seen_set.contains(&normalized) {
+            self.dedup_count += 1;
+            return false;
+        }
+
+        // Add to seen set and states
+        seen_set.insert(normalized);
+        self.states_by_dest.entry(dest).or_default().push(state);
+        true
+    }
+
+    /// Merge another accumulator into this one
+    fn merge(&mut self, other: StateAccumulator) {
+        for (dest, states) in other.states_by_dest {
+            for state in states {
+                // Re-check for duplicates when merging
+                let normalized = normalize_state_for_comparison(&state);
+                let seen_set = self.seen_normalized.entry(dest.clone()).or_default();
+                if !seen_set.contains(&normalized) {
+                    seen_set.insert(normalized);
+                    self.states_by_dest.entry(dest.clone()).or_default().push(state);
+                } else {
+                    self.dedup_count += 1;
+                }
+            }
+        }
+        self.dedup_count += other.dedup_count;
+    }
+
+    /// Convert to pending map format
+    fn into_pending(self, barrier_map: &HashMap<BarrierId, Option<Label>>) -> BTreeMap<BarrierKey, Vec<(State, Option<Label>)>> {
+        let mut pending = BTreeMap::new();
+        for (dest, states) in self.states_by_dest {
+            let dest_block = if dest == end_barrier_id() {
+                None
+            } else {
+                barrier_map.get(&dest).cloned().flatten()
+            };
+            let dest_key = BarrierKey {
+                barrier_id: dest,
+                hit_count: 0, // Will be updated in main loop
+            };
+            pending.insert(
+                dest_key,
+                states.into_iter().map(|s| (s, dest_block.clone())).collect(),
+            );
+        }
+        pending
+    }
+}
+
+/// Process a single lane and all its paths, returning an accumulator with results.
+fn process_lane(
+    cfg: &Cfg,
+    vec_state: &State,
+    lane_idx: usize,
+    fixed_env: &FixedEnv,
+    start_block: Option<&Label>,
+) -> Result<StateAccumulator> {
+    let mut accumulator = StateAccumulator::new();
+
+    // Extract scalar state for this lane
+    let scalar_state = extract_scalar_lane(vec_state, lane_idx);
+
+    // Run with PathCounter to enumerate all paths
+    let mut path_counter = PathCounter::new();
+    loop {
+        // Clone the scalar state for this path
+        let run_state = scalar_state.clone();
+
+        // Run until next barrier or completion
+        let run_result = run_to_next_barrier(
+            cfg,
+            run_state,
+            fixed_env,
+            &mut path_counter,
+            start_block,
+        )?;
+
+        // Add to accumulator with deduplication
+        accumulator.add_state(run_result.destination, run_result.state);
+
+        // Try next path
+        if !path_counter.increment() {
+            break;
+        }
+        path_counter.reset_for_new_run();
+    }
+
+    Ok(accumulator)
+}
+
 /// Execute states through a CFG using barrier-based execution.
 ///
 /// This replaces the flow-based fixed-point algorithm with a simpler approach:
@@ -383,6 +512,11 @@ pub struct BarrierRunResult {
 /// 3. For each scalar lane, enumerate all abstract paths using PathCounter
 /// 4. Collect output states at their destination barriers
 /// 5. Repeat until all states reach END barrier
+///
+/// Optimizations:
+/// - Parallel lane processing: All lanes of a vector state are processed in parallel
+/// - Early deduplication: States are deduplicated as they are generated
+/// - GC before dedup: States are GC'd to normalize heap IDs before comparison
 pub fn execute_with_barriers(
     cfg: &Cfg,
     initial_states: Vec<State>,
@@ -410,6 +544,10 @@ pub fn execute_with_barriers(
 
     // Collect results (states that reached END)
     let mut results: Vec<(State, Option<Value>)> = Vec::new();
+
+    // Stats
+    let mut total_paths_enumerated = 0usize;
+    let mut total_dedup_count = 0usize;
 
     loop {
         // Find the lowest barrier key with pending states
@@ -451,72 +589,73 @@ pub fn execute_with_barriers(
         // Vectorize the states at this barrier
         let vectorized = vectorize_states(states);
 
+        let expanded_count: usize = vectorized.iter().map(|s| s.vector_size).sum();
         println!(
             "  Barrier {:?} hit={}: {} vectorized states ({} expanded)",
             current_key.barrier_id.0,
             current_key.hit_count,
             vectorized.len(),
-            vectorized.iter().map(|s| s.vector_size).sum::<usize>()
+            expanded_count
         );
 
-        // Process each vectorized state
-        for vec_state in vectorized {
-            // For each scalar lane in the vector
-            for lane_idx in 0..vec_state.vector_size {
-                // Extract scalar state for this lane
-                let scalar_state = extract_scalar_lane(&vec_state, lane_idx);
+        // Collect all (vec_state_ref, lane_idx) pairs for parallel processing
+        let lane_tasks: Vec<(&State, usize)> = vectorized
+            .iter()
+            .flat_map(|vec_state| {
+                (0..vec_state.vector_size).map(move |lane_idx| (vec_state, lane_idx))
+            })
+            .collect();
 
-                // Run with PathCounter to enumerate all paths
-                let mut path_counter = PathCounter::new();
-                loop {
-                    // Clone the scalar state for this path
-                    let run_state = scalar_state.clone();
+        // Process all lanes in parallel
+        let start_block_ref = start_block.as_ref();
+        let lane_results: Vec<Result<StateAccumulator>> = lane_tasks
+            .par_iter()
+            .map(|(vec_state, lane_idx)| {
+                process_lane(cfg, vec_state, *lane_idx, fixed_env, start_block_ref)
+            })
+            .collect();
 
-                    // Run until next barrier or completion
-                    let run_result = run_to_next_barrier(
-                        cfg,
-                        run_state,
-                        fixed_env,
-                        &mut path_counter,
-                        start_block.as_ref(),
-                    )?;
+        // Merge all lane results
+        let mut combined_accumulator = StateAccumulator::new();
+        for result in lane_results {
+            let accumulator = result?;
+            total_paths_enumerated += accumulator.states_by_dest.values().map(|v| v.len()).sum::<usize>() + accumulator.dedup_count;
+            combined_accumulator.merge(accumulator);
+        }
+        total_dedup_count += combined_accumulator.dedup_count;
 
-                    // Determine destination key
-                    let dest_hit = barrier_hit_counts
-                        .get(&run_result.destination)
-                        .copied()
-                        .unwrap_or(0);
-                    let dest_key = BarrierKey {
-                        barrier_id: run_result.destination.clone(),
-                        hit_count: dest_hit,
-                    };
-
-                    // Add to pending at destination (with the destination block for continuation)
-                    let dest_block = if run_result.destination == end_barrier_id() {
-                        None
-                    } else {
-                        barrier_map
-                            .get(&run_result.destination)
-                            .cloned()
-                            .flatten()
-                    };
-                    pending
-                        .entry(dest_key)
-                        .or_default()
-                        .push((run_result.state, dest_block));
-
-                    // Try next path
-                    if !path_counter.increment() {
-                        break;
-                    }
-                    path_counter.reset_for_new_run();
-                }
-            }
+        // Get destination hit counts and add to pending
+        for (dest, states) in combined_accumulator.states_by_dest {
+            let dest_hit = barrier_hit_counts.get(&dest).copied().unwrap_or(0);
+            let dest_key = BarrierKey {
+                barrier_id: dest.clone(),
+                hit_count: dest_hit,
+            };
+            let dest_block = if dest == end_barrier_id() {
+                None
+            } else {
+                barrier_map.get(&dest).cloned().flatten()
+            };
+            pending
+                .entry(dest_key)
+                .or_default()
+                .extend(states.into_iter().map(|s| (s, dest_block.clone())));
         }
 
         // Increment hit count for this barrier
         *barrier_hit_counts.entry(current_key.barrier_id).or_insert(0) += 1;
     }
+
+    println!(
+        "  [Stats] Paths enumerated: {}, deduplicated: {} ({:.1}% reduction)",
+        total_paths_enumerated,
+        total_dedup_count,
+        if total_paths_enumerated > 0 {
+            100.0 * total_dedup_count as f64 / total_paths_enumerated as f64
+        } else {
+            0.0
+        }
+    );
 
     Ok(results)
 }
