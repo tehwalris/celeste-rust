@@ -1,17 +1,8 @@
-use std::hash::BuildHasherDefault;
 use std::sync::Arc;
 
-use im::HashMap as ImHashMap;
-use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
 
 use super::value::HeapValue;
-
-/// FxHasher-based BuildHasher for im::HashMap
-type FxBuildHasher = BuildHasherDefault<FxHasher>;
-
-/// im::HashMap using FxHasher for faster hashing
-type FxImHashMap<K, V> = ImHashMap<K, V, FxBuildHasher>;
 
 #[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct HeapId(usize);
@@ -26,23 +17,26 @@ impl HeapId {
     }
 }
 
+/// A slot in the heap overlay. None means "use base value", Some(v) means "override with v".
+type OverlaySlot = Option<Option<HeapValue>>;
+
 /// A copy-on-write heap implementation.
 ///
 /// Uses a two-level structure inspired by the OCaml implementation:
 /// - `old_values`: An immutable Arc<Vec> of values that was frozen at some point.
 ///   This is shared across all cloned states without copying.
-/// - `new_values`: A persistent HashMap (from `im` crate) that overlays new or
-///   changed values. This allows efficient cloning by structural sharing.
+/// - `new_values`: A COW Vec overlay that tracks new or changed values.
+///   Uses Arc for O(1) cloning and COW on mutation.
 ///
-/// The total size is `old_values.len() + next_new_id`, where values in the
-/// `new_values` overlay can either be new allocations or modifications to old values.
+/// The total size is `next_id`, where values in the overlay can either be
+/// new allocations or modifications to old values.
 #[derive(Clone, Debug)]
 pub struct Heap {
     /// Immutable base values, shared via Arc across cloned states
     old_values: Arc<Vec<Option<HeapValue>>>,
-    /// Overlay of new or changed values using a persistent HashMap.
-    /// Uses FxHasher for faster hashing.
-    new_values: FxImHashMap<usize, Option<HeapValue>>,
+    /// Overlay of new or changed values using Arc<Vec> with COW semantics.
+    /// None = use old_values, Some(v) = use v (which can be None for empty slot)
+    new_values: Arc<Vec<OverlaySlot>>,
     /// The next HeapId to allocate
     next_id: usize,
 }
@@ -66,10 +60,11 @@ impl<'de> Deserialize<'de> for Heap {
         D: serde::Deserializer<'de>,
     {
         let values: Vec<Option<HeapValue>> = Vec::deserialize(deserializer)?;
+        let next_id = values.len();
         Ok(Heap {
-            old_values: Arc::new(values.clone()),
-            new_values: FxImHashMap::default(),
-            next_id: values.len(),
+            old_values: Arc::new(values),
+            new_values: Arc::new(Vec::new()),
+            next_id,
         })
     }
 }
@@ -96,7 +91,7 @@ impl Heap {
     pub fn new() -> Self {
         Self {
             old_values: Arc::new(Vec::new()),
-            new_values: FxImHashMap::default(),
+            new_values: Arc::new(Vec::new()),
             next_id: 0,
         }
     }
@@ -112,10 +107,13 @@ impl Heap {
         id
     }
 
+    #[inline]
     pub fn get_opt(&self, id: HeapId) -> Option<&HeapValue> {
-        // First check the overlay
-        if let Some(value) = self.new_values.get(&id.0) {
-            return value.as_ref();
+        // First check the overlay if index is in range
+        if id.0 < self.new_values.len() {
+            if let Some(overlay_value) = &self.new_values[id.0] {
+                return overlay_value.as_ref();
+            }
         }
         // Fall back to old values
         if id.0 < self.old_values.len() {
@@ -125,47 +123,67 @@ impl Heap {
         }
     }
 
+    #[inline]
     pub fn get(&self, id: HeapId) -> &HeapValue {
         self.get_opt(id).expect("HeapId should point to a valid value")
     }
 
     pub fn get_mut(&mut self, id: HeapId) -> &mut HeapValue {
-        // Ensure the value is in the overlay so we can mutate it
-        if !self.new_values.contains_key(&id.0) {
-            // Copy from old_values into the overlay
+        let new_values = Arc::make_mut(&mut self.new_values);
+
+        // Ensure overlay is large enough
+        if id.0 >= new_values.len() {
+            new_values.resize(id.0 + 1, None);
+        }
+
+        // If not in overlay yet, copy from old_values
+        if new_values[id.0].is_none() {
             let value = if id.0 < self.old_values.len() {
                 self.old_values[id.0].clone()
             } else {
                 None
             };
-            self.new_values.insert(id.0, value);
+            new_values[id.0] = Some(value);
         }
-        self.new_values.get_mut(&id.0).unwrap().as_mut().unwrap()
+
+        new_values[id.0].as_mut().unwrap().as_mut().unwrap()
     }
 
+    #[inline]
     pub fn set(&mut self, id: HeapId, value: HeapValue) {
-        self.new_values.insert(id.0, Some(value));
+        let new_values = Arc::make_mut(&mut self.new_values);
+
+        // Ensure overlay is large enough
+        if id.0 >= new_values.len() {
+            new_values.resize(id.0 + 1, None);
+        }
+
+        new_values[id.0] = Some(Some(value));
     }
 
     pub fn map_in_place(&mut self, f: impl Fn(HeapValue) -> HeapValue) {
-        // First, apply to old values that aren't overridden
-        for i in 0..self.old_values.len() {
-            if !self.new_values.contains_key(&i) {
-                if let Some(value) = &self.old_values[i] {
-                    self.new_values.insert(i, Some(f(value.clone())));
-                }
+        let new_values = Arc::make_mut(&mut self.new_values);
+
+        // Ensure overlay covers all ids
+        if new_values.len() < self.next_id {
+            new_values.resize(self.next_id, None);
+        }
+
+        for i in 0..self.next_id {
+            // Get current value (from overlay or old_values)
+            let current = if let Some(overlay) = &new_values[i] {
+                overlay.clone()
+            } else if i < self.old_values.len() {
+                self.old_values[i].clone()
+            } else {
+                None
+            };
+
+            // Apply f and store in overlay
+            if let Some(val) = current {
+                new_values[i] = Some(Some(f(val)));
             }
         }
-        // Then apply to overlay values
-        self.new_values = self.new_values.iter()
-            .map(|(k, v)| {
-                let new_v = match v {
-                    Some(val) => Some(f(val.clone())),
-                    None => None,
-                };
-                (*k, new_v)
-            })
-            .collect();
     }
 
     /// Create a heap directly from a vector of values.
@@ -174,7 +192,7 @@ impl Heap {
         let next_id = values.len();
         Self {
             old_values: Arc::new(values),
-            new_values: FxImHashMap::default(),
+            new_values: Arc::new(Vec::new()),
             next_id,
         }
     }
@@ -189,15 +207,21 @@ impl Heap {
 
         let mut new_vec = Vec::with_capacity(self.next_id);
         for i in 0..self.next_id {
-            if let Some(value) = self.new_values.get(&i) {
-                new_vec.push(value.clone());
-            } else if i < self.old_values.len() {
+            // Check overlay first
+            if i < self.new_values.len() {
+                if let Some(overlay_value) = &self.new_values[i] {
+                    new_vec.push(overlay_value.clone());
+                    continue;
+                }
+            }
+            // Fall back to old values
+            if i < self.old_values.len() {
                 new_vec.push(self.old_values[i].clone());
             } else {
                 new_vec.push(None);
             }
         }
         self.old_values = Arc::new(new_vec);
-        self.new_values = FxImHashMap::default();
+        self.new_values = Arc::new(Vec::new());
     }
 }
