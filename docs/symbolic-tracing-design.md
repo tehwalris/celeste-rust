@@ -319,17 +319,20 @@ The fundamental issue is that branch conditions are path-dependent. Taking branc
 
 ### Next Steps
 
-1. **Further data structure optimizations**:
-   - Use simpler (non-persistent) heap for scalar tracing
-   - Consider custom LocalEnv for tracer with Vec storage
-   - These could improve tracer performance directly
+1. **Further data structure optimizations** (attempted, limited success):
+   - Vec-based heap overlay: REVERTED - overhead of Option check worse than HAMT
+   - The im-rs HAMT is reasonably optimized for our sparse update pattern
+   - Future: Consider alternate approaches like arena allocation
 
 2. **Alternative caching approaches**:
    - **Hash-based memoization**: Cache by hash of input values (exact matches only)
    - **Post-hoc deduplication**: After tracing, deduplicate outputs before GC/vectorization
    - **Block-level caching**: Cache at smaller code units with less path dependence
 
-3. **Vectorized symbolic execution**:
-   - Instead of tracing scalars, trace with vector values
-   - Split only at concrete branches
-   - This is essentially what the reference interpreter does
+3. **Vectorized symbolic execution** (most promising):
+   - Current approach: Split all vectorized states into scalars, trace individually
+   - Problem: Frame 30 has 15,250 expanded states → 300,888 traces (20x expansion)
+   - Better approach: Keep vector values during tracing, split only when lanes differ
+   - The reference interpreter already does this (see `flow.rs` lines 294-314)
+   - Would require significant changes to TracingInterpreter to handle vector values
+   - Potential: Could reduce traces by 10-50x for typical cases
