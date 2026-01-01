@@ -159,6 +159,17 @@ impl Heap {
             .collect();
     }
 
+    /// Create a heap directly from a vector of values.
+    /// This is more efficient than creating an empty heap and calling set() repeatedly.
+    pub fn from_values(values: Vec<Option<HeapValue>>) -> Self {
+        let next_id = values.len();
+        Self {
+            old_values: Arc::new(values),
+            new_values: ImHashMap::new(),
+            next_id,
+        }
+    }
+
     /// Freeze the current state, compacting everything into old_values.
     /// This is useful when you want to establish a new baseline for sharing.
     /// Call this before cloning when the heap won't change much.

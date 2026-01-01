@@ -98,17 +98,14 @@ impl State {
             return self.clone();
         }
 
-        // Build new heap with extracted values
-        let mut new_heap = Heap::new();
-        for i in 0..self.heap.len() {
-            new_heap.alloc();
-        }
-        for i in 0..self.heap.len() {
-            let id = HeapId::from_raw(i);
-            if let Some(heap_value) = self.heap.get_opt(id) {
-                new_heap.set(id, heap_value.extract_at_index(lane_idx));
-            }
-        }
+        // Build new heap with extracted values directly (avoids im::HashMap overhead)
+        let heap_values: Vec<Option<HeapValue>> = (0..self.heap.len())
+            .map(|i| {
+                let id = HeapId::from_raw(i);
+                self.heap.get_opt(id).map(|hv| hv.extract_at_index(lane_idx))
+            })
+            .collect();
+        let new_heap = Heap::from_values(heap_values);
 
         // Build new local_env with extracted values
         let mut new_local_env = LocalEnv::new();
