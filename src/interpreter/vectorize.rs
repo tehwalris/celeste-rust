@@ -601,7 +601,21 @@ fn unvectorize_if_possible(mut state: State) -> State {
 }
 
 /// Assert that all vectorizable vector values in a state have the correct length.
+/// This is a debug-only check that's skipped in release builds for performance.
+#[inline]
 pub fn assert_state_vector_lengths(state: &State) {
+    // Skip validation in release builds for performance
+    #[cfg(debug_assertions)]
+    assert_state_vector_lengths_impl(state);
+
+    // Avoid unused variable warning in release
+    #[cfg(not(debug_assertions))]
+    let _ = state;
+}
+
+/// The actual implementation of vector length validation (debug only).
+#[cfg(debug_assertions)]
+fn assert_state_vector_lengths_impl(state: &State) {
     let expected_len = state.vector_size;
 
     // Check heap (use get_opt since some slots may be allocated but not set)

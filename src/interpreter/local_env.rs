@@ -1,69 +1,155 @@
-use std::hash::BuildHasherDefault;
+use std::sync::Arc;
 
-use im::HashMap as ImHashMap;
-use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
 
 use crate::ir::LocalId;
 
 use super::value::Value;
 
-/// FxHasher-based BuildHasher for im::HashMap
-type FxBuildHasher = BuildHasherDefault<FxHasher>;
-
-/// im::HashMap using FxHasher for faster hashing
-type FxImHashMap<K, V> = ImHashMap<K, V, FxBuildHasher>;
-
 /// A local environment storing local variable bindings.
-/// Uses a persistent HashMap for efficient cloning through structural sharing.
-/// Uses FxHasher instead of SipHash for faster hashing.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LocalEnv(FxImHashMap<LocalId, Value>);
+///
+/// Uses a Vec-based copy-on-write implementation for performance:
+/// - O(1) get and set operations
+/// - O(1) clone via Arc (structural sharing)
+/// - O(n) iteration (much faster than HAMT iteration)
+/// - Copy-on-write semantics for mutation
+///
+/// The Vec stores Option<Value> to allow sparse storage without paying
+/// the cost of hash-based lookups.
+#[derive(Clone, Debug)]
+pub struct LocalEnv {
+    /// The underlying storage. Uses Arc for O(1) cloning.
+    values: Arc<Vec<Option<Value>>>,
+}
+
+impl Serialize for LocalEnv {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // Serialize as a Vec of (LocalId, Value) pairs (only non-None values)
+        let pairs: Vec<(usize, &Value)> = self.iter().collect();
+        pairs.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for LocalEnv {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let pairs: Vec<(usize, Value)> = Vec::deserialize(deserializer)?;
+        let max_id = pairs.iter().map(|(id, _)| *id).max().unwrap_or(0);
+        let mut values = vec![None; max_id + 1];
+        for (id, value) in pairs {
+            values[id] = Some(value);
+        }
+        Ok(LocalEnv {
+            values: Arc::new(values),
+        })
+    }
+}
+
+impl PartialEq for LocalEnv {
+    fn eq(&self, other: &Self) -> bool {
+        // Fast path: same Arc means definitely equal
+        if Arc::ptr_eq(&self.values, &other.values) {
+            return true;
+        }
+        // Compare contents (only non-None values matter)
+        let max_len = self.values.len().max(other.values.len());
+        for i in 0..max_len {
+            let a = self.values.get(i).and_then(|v| v.as_ref());
+            let b = other.values.get(i).and_then(|v| v.as_ref());
+            if a != b {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl Eq for LocalEnv {}
 
 impl LocalEnv {
     pub fn new() -> Self {
-        Self(FxImHashMap::default())
+        Self {
+            values: Arc::new(Vec::new()),
+        }
     }
 
-    pub fn with_capacity(_max_locals: usize) -> Self {
-        // im::HashMap doesn't have a capacity hint, but it doesn't need it
-        Self::new()
+    pub fn with_capacity(max_locals: usize) -> Self {
+        Self {
+            values: Arc::new(vec![None; max_locals]),
+        }
     }
 
     /// Build a LocalEnv from an iterator of (LocalId, Value) pairs.
     /// This is more efficient than creating an empty LocalEnv and calling set() repeatedly.
     pub fn from_iter(iter: impl Iterator<Item = (LocalId, Value)>) -> Self {
-        Self(iter.collect())
+        let pairs: Vec<_> = iter.collect();
+        if pairs.is_empty() {
+            return Self::new();
+        }
+        let max_id = pairs.iter().map(|(id, _)| usize::from(*id)).max().unwrap();
+        let mut values = vec![None; max_id + 1];
+        for (id, value) in pairs {
+            values[usize::from(id)] = Some(value);
+        }
+        Self {
+            values: Arc::new(values),
+        }
     }
 
     #[inline]
     pub fn get(&self, id: LocalId) -> &Value {
-        self.0.get(&id).expect("LocalId should be set before get")
+        let idx = usize::from(id);
+        self.values
+            .get(idx)
+            .and_then(|v| v.as_ref())
+            .expect("LocalId should be set before get")
     }
 
     #[inline]
     pub fn set(&mut self, id: LocalId, value: Value) {
-        self.0.insert(id, value);
+        let idx = usize::from(id);
+
+        // Ensure the Vec is large enough
+        let values = Arc::make_mut(&mut self.values);
+        if idx >= values.len() {
+            values.resize(idx + 1, None);
+        }
+        values[idx] = Some(value);
     }
 
     pub fn retain(&mut self, f: impl Fn(LocalId) -> bool) {
-        self.0.retain(|id, _| f(*id));
+        let values = Arc::make_mut(&mut self.values);
+        for (i, v) in values.iter_mut().enumerate() {
+            if v.is_some() && !f(LocalId::from(i)) {
+                *v = None;
+            }
+        }
     }
 
     pub fn clear(&mut self) {
-        self.0.clear();
+        self.values = Arc::new(Vec::new());
     }
 
     pub fn map_in_place(&mut self, f: impl Fn(Value) -> Value) {
-        // im::HashMap doesn't have a map_in_place, so we need to collect and update
-        self.0 = self.0.iter()
-            .map(|(k, v)| (*k, f(v.clone())))
-            .collect();
+        let values = Arc::make_mut(&mut self.values);
+        for v in values.iter_mut() {
+            if let Some(val) = v.take() {
+                *v = Some(f(val));
+            }
+        }
     }
 
-    /// Iterate over all (raw_id, value) pairs
+    /// Iterate over all (raw_id, value) pairs (only non-None values)
     pub fn iter(&self) -> impl Iterator<Item = (usize, &Value)> {
-        self.0.iter().map(|(id, v)| (usize::from(*id), v))
+        self.values
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| v.as_ref().map(|val| (i, val)))
     }
 
     /// Get value by raw usize id
