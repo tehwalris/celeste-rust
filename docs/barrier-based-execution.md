@@ -256,14 +256,16 @@ The barrier-based executor is implemented and verified correct in `src/interpret
 
 ### Performance Status
 
-Barrier-based is currently **slower** than flow-based at larger frames due to the overhead of path enumeration:
+After Vec-based COW optimizations (LocalEnv and Heap overlay), barrier-based performance is greatly improved:
 
 | Frame | Barrier | Flow | Ratio |
 |-------|---------|------|-------|
-| 27 | 1.1s | 0.8s | 1.4x slower |
-| 28 | 5.9s | 2.7s | 2.2x slower |
-| 29 | 25s | 4.6s | 5.4x slower |
-| 30 | 107s | 10.4s | 10x slower |
+| 27 | 0.65s | 0.8s | 0.8x (faster!) |
+| 28 | 3.5s | 2.7s | 1.3x slower |
+| 29 | 15.4s | 4.6s | 3.3x slower |
+| 30 | 44s | 10.4s | 4.2x slower |
+
+This is a **40% improvement** from the previous barrier-based performance (Frame 29: 25s → 15.4s).
 
 The barrier-based approach is slower because:
 1. **Exponential path enumeration**: PathCounter enumerates all 2^n paths for n UnknownBool branches
@@ -290,6 +292,8 @@ The gap widens at higher frames because the number of paths grows faster than th
 10. **Static Labels**: Use LazyLock for frequently-used labels and barrier IDs to avoid repeated allocations.
 11. **jemalloc Allocator**: Use jemalloc instead of glibc malloc to reduce memory allocation overhead (~10% improvement).
 12. **FxHashMap for GC and ObjectTable**: Use FxHashMap in state GC and ObjectTable operations for faster hashing.
+13. **Vec-based LocalEnv**: Replace im::HashMap with Arc<Vec<Option<Value>>> for O(1) get/set and faster iteration.
+14. **Vec-based Heap Overlay**: Replace im::HashMap overlay with Arc<Vec<Option<Option<HeapValue>>>> for O(1) access and COW semantics.
 
 ## Expected Benefits
 

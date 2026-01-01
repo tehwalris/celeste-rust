@@ -170,10 +170,12 @@ impl Heap {
         }
 
         for i in 0..self.next_id {
-            // Get current value (from overlay or old_values)
-            let current = if let Some(overlay) = &new_values[i] {
-                overlay.clone()
+            // Get current value, taking from overlay if present to avoid clone
+            let current = if new_values[i].is_some() {
+                // Take from overlay to avoid clone
+                new_values[i].take().unwrap()
             } else if i < self.old_values.len() {
+                // Must clone from old_values
                 self.old_values[i].clone()
             } else {
                 None
