@@ -606,22 +606,50 @@ pub fn execute_with_barriers(
             })
             .collect();
 
-        // Process all lanes in parallel
-        let start_block_ref = start_block.as_ref();
-        let lane_results: Vec<Result<StateAccumulator>> = lane_tasks
-            .par_iter()
-            .map(|(vec_state, lane_idx)| {
-                process_lane(cfg, vec_state, *lane_idx, fixed_env, start_block_ref)
-            })
-            .collect();
+        // Process lanes in batches with intermediate vectorization
+        // This reduces memory and allows more effective deduplication
+        const BATCH_SIZE: usize = 64;
 
-        // Merge all lane results
+        let start_block_ref = start_block.as_ref();
         let mut combined_accumulator = StateAccumulator::new();
-        for result in lane_results {
-            let accumulator = result?;
-            total_paths_enumerated += accumulator.states_by_dest.values().map(|v| v.len()).sum::<usize>() + accumulator.dedup_count;
-            combined_accumulator.merge(accumulator);
+
+        for batch in lane_tasks.chunks(BATCH_SIZE) {
+            // Process this batch in parallel
+            let batch_results: Vec<Result<StateAccumulator>> = batch
+                .par_iter()
+                .map(|(vec_state, lane_idx)| {
+                    process_lane(cfg, vec_state, *lane_idx, fixed_env, start_block_ref)
+                })
+                .collect();
+
+            // Merge batch results into combined accumulator
+            for result in batch_results {
+                let accumulator = result?;
+                total_paths_enumerated += accumulator.states_by_dest.values().map(|v| v.len()).sum::<usize>() + accumulator.dedup_count;
+                combined_accumulator.merge(accumulator);
+            }
+
+            // Intermediate vectorization: reduce states after each batch
+            // This helps limit state explosion and improve dedup effectiveness
+            if combined_accumulator.states_by_dest.values().map(|v| v.len()).sum::<usize>() > 256 {
+                for (dest, states) in &mut combined_accumulator.states_by_dest {
+                    if states.len() > 64 {
+                        let before = states.len();
+                        *states = vectorize_states(std::mem::take(states));
+                        let after = states.len();
+                        if after < before {
+                            // Update the seen set with the newly vectorized states
+                            let seen_set = combined_accumulator.seen_normalized.entry(dest.clone()).or_default();
+                            seen_set.clear();
+                            for state in states.iter() {
+                                seen_set.insert(normalize_state_for_comparison(state));
+                            }
+                        }
+                    }
+                }
+            }
         }
+
         total_dedup_count += combined_accumulator.dedup_count;
 
         // Get destination hit counts and add to pending
