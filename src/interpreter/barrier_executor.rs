@@ -21,7 +21,7 @@ use super::{
     local_env::LocalEnv,
     state::State,
     value::{HeapValue, MaybeVector, Value},
-    vectorize::{vectorize_states, normalize_state_for_comparison, NormalizedState},
+    vectorize::{vectorize_states, normalize_gc_state_for_comparison, NormalizedState},
 };
 
 /// Build a map from BarrierId to the block that has that barrier.
@@ -50,11 +50,11 @@ fn build_barrier_map(cfg: &Cfg) -> HashMap<BarrierId, Option<Label>> {
 #[derive(Clone, Debug)]
 pub struct PathCounter {
     /// Current path: bit i = true means take "true" branch for choice i
-    current_path: u64,
+    pub current_path: u64,
     /// Number of choices made so far in this run
-    choices_made: usize,
+    pub choices_made: usize,
     /// Maximum choices seen in any path (for knowing when we're done)
-    max_choices: usize,
+    pub max_choices: usize,
 }
 
 impl PathCounter {
@@ -387,7 +387,7 @@ struct StateAccumulator {
     /// States grouped by destination barrier
     states_by_dest: HashMap<BarrierId, Vec<State>>,
     /// Normalized state signatures for deduplication (per destination)
-    seen_normalized: HashMap<BarrierId, std::collections::HashSet<NormalizedState>>,
+    seen_normalized: HashMap<BarrierId, rustc_hash::FxHashSet<NormalizedState>>,
     /// Count of states that were deduplicated (for stats)
     dedup_count: usize,
 }
@@ -407,8 +407,8 @@ impl StateAccumulator {
         // GC the state first to get deterministic heap IDs
         state.gc();
 
-        // Compute normalized form for deduplication
-        let normalized = normalize_state_for_comparison(&state);
+        // Compute normalized form for deduplication (state is already GC'd)
+        let normalized = normalize_gc_state_for_comparison(&state);
 
         // Check if we've seen this state before
         let seen_set = self.seen_normalized.entry(dest.clone()).or_default();
@@ -428,7 +428,8 @@ impl StateAccumulator {
         for (dest, states) in other.states_by_dest {
             for state in states {
                 // Re-check for duplicates when merging
-                let normalized = normalize_state_for_comparison(&state);
+                // States are already GC'd from when they were added to the other accumulator
+                let normalized = normalize_gc_state_for_comparison(&state);
                 let seen_set = self.seen_normalized.entry(dest.clone()).or_default();
                 if !seen_set.contains(&normalized) {
                     seen_set.insert(normalized);
@@ -606,48 +607,22 @@ pub fn execute_with_barriers(
             })
             .collect();
 
-        // Process lanes in batches with intermediate vectorization
-        // This reduces memory and allows more effective deduplication
-        const BATCH_SIZE: usize = 64;
-
         let start_block_ref = start_block.as_ref();
         let mut combined_accumulator = StateAccumulator::new();
 
-        for batch in lane_tasks.chunks(BATCH_SIZE) {
-            // Process this batch in parallel
-            let batch_results: Vec<Result<StateAccumulator>> = batch
-                .par_iter()
-                .map(|(vec_state, lane_idx)| {
-                    process_lane(cfg, vec_state, *lane_idx, fixed_env, start_block_ref)
-                })
-                .collect();
+        // Process all lanes in parallel using rayon (no batching for simplicity)
+        let lane_results: Vec<Result<StateAccumulator>> = lane_tasks
+            .par_iter()
+            .map(|(vec_state, lane_idx)| {
+                process_lane(cfg, vec_state, *lane_idx, fixed_env, start_block_ref)
+            })
+            .collect();
 
-            // Merge batch results into combined accumulator
-            for result in batch_results {
-                let accumulator = result?;
-                total_paths_enumerated += accumulator.states_by_dest.values().map(|v| v.len()).sum::<usize>() + accumulator.dedup_count;
-                combined_accumulator.merge(accumulator);
-            }
-
-            // Intermediate vectorization: reduce states after each batch
-            // This helps limit state explosion and improve dedup effectiveness
-            if combined_accumulator.states_by_dest.values().map(|v| v.len()).sum::<usize>() > 256 {
-                for (dest, states) in &mut combined_accumulator.states_by_dest {
-                    if states.len() > 64 {
-                        let before = states.len();
-                        *states = vectorize_states(std::mem::take(states));
-                        let after = states.len();
-                        if after < before {
-                            // Update the seen set with the newly vectorized states
-                            let seen_set = combined_accumulator.seen_normalized.entry(dest.clone()).or_default();
-                            seen_set.clear();
-                            for state in states.iter() {
-                                seen_set.insert(normalize_state_for_comparison(state));
-                            }
-                        }
-                    }
-                }
-            }
+        // Merge results into combined accumulator
+        for result in lane_results {
+            let accumulator = result?;
+            total_paths_enumerated += accumulator.states_by_dest.values().map(|v| v.len()).sum::<usize>() + accumulator.dedup_count;
+            combined_accumulator.merge(accumulator);
         }
 
         total_dedup_count += combined_accumulator.dedup_count;
@@ -675,7 +650,7 @@ pub fn execute_with_barriers(
     }
 
     println!(
-        "  [Stats] Paths enumerated: {}, deduplicated: {} ({:.1}% reduction)",
+        "  [Stats] Paths: {}, dedup: {} ({:.1}%)",
         total_paths_enumerated,
         total_dedup_count,
         if total_paths_enumerated > 0 {

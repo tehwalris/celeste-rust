@@ -913,6 +913,18 @@ pub fn normalize_state_for_comparison(state: &State) -> NormalizedState {
     }
 }
 
+/// Normalize a state that has already been GC'd.
+/// This is faster than `normalize_state_for_comparison` because it doesn't clone.
+pub fn normalize_gc_state_for_comparison(state: &State) -> NormalizedState {
+    let shape = shape_of_state(state);
+    let vectorizable_values = extract_vectorizable_values_from_state(state);
+
+    NormalizedState {
+        shape,
+        vectorizable_values,
+    }
+}
+
 /// Compute union and diff of two state sets.
 ///
 /// Given `accumulated` (states already seen) and `potentially_new` (states just arrived),
