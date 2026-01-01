@@ -159,7 +159,7 @@ __reset_button_states()
         };
 
         // Run symbolic tracing
-        let (sym_count, sym_time, stats, trace_ms, gc_ms, abstract_ms, vectorize_ms) = if run_symbolic {
+        let (sym_count, sym_time, stats, trace_ms, gc_ms, abstract_ms, vectorize_ms, pre_vectorize_count) = if run_symbolic {
             // Clear cache between frames - HeapIds change after GC
             cache.clear();
 
@@ -200,6 +200,9 @@ __reset_button_states()
             new_states = new_states.into_par_iter().map(make_state_abstract).collect();
             let abstract_ms = abstract_start.elapsed().as_millis();
 
+            // Log state count before vectorization for larger frames
+            let pre_vectorize_count = new_states.len();
+
             let vectorize_start = Instant::now();
             new_states = vectorize_states(new_states);
             let vectorize_ms = vectorize_start.elapsed().as_millis();
@@ -210,9 +213,9 @@ __reset_button_states()
             let count = count_expanded(&new_states);
             sym_states = new_states;
 
-            (count, elapsed.as_millis(), Some(stats), trace_ms, gc_ms, abstract_ms, vectorize_ms)
+            (count, elapsed.as_millis(), Some(stats), trace_ms, gc_ms, abstract_ms, vectorize_ms, pre_vectorize_count)
         } else {
-            (0, 0, None, 0, 0, 0, 0)
+            (0, 0, None, 0, 0, 0, 0, 0)
         };
 
         // Compare
@@ -226,7 +229,7 @@ __reset_button_states()
         }
 
         // Update cumulative stats
-        if let Some(stats) = stats {
+        if let Some(ref stats) = stats {
             total_stats = total_stats.merge(&stats);
         }
 
@@ -246,6 +249,10 @@ __reset_button_states()
 
         // For larger frames, show timing breakdown
         if run_symbolic && sym_time > 1000 {
+            if let Some(ref s) = stats {
+                println!("      Stats: {} traces, {} forced_choices, {} pre-vectorize states",
+                         s.new_traces, s.forced_choices, pre_vectorize_count);
+            }
             println!("      Timing: trace={}ms gc={}ms abstract={}ms vectorize={}ms",
                      trace_ms, gc_ms, abstract_ms, vectorize_ms);
         }
@@ -266,6 +273,7 @@ __reset_button_states()
         println!("\nSymbolic tracing stats:");
         println!("  States processed: {}", total_stats.states_processed);
         println!("  New traces: {}", total_stats.new_traces);
+        println!("  Forced choices (path forks): {}", total_stats.forced_choices);
         println!("  Cache hits: {}", total_stats.cache_hits);
         println!("  Cache misses: {}", total_stats.cache_misses);
         let cache_stats = cache.stats();
