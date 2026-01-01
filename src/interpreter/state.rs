@@ -168,9 +168,10 @@ impl State {
             // Placeholder - will be replaced after recursing
             new_heap_values.push(HeapValue::UnknownTable);
 
-            // Get the old value and recurse on references
-            let old_value = old_heap.get(old_id).clone();
-            let new_value = map_heap_value_references(&old_value, |ref_id| {
+            // Get the old value reference and recurse on references
+            // Note: map_heap_value_references takes a reference, avoiding clone
+            let old_value_ref = old_heap.get(old_id);
+            let new_value = map_heap_value_references(old_value_ref, |ref_id| {
                 visit(ref_id, old_heap, old_to_new, new_heap_values)
             });
 
