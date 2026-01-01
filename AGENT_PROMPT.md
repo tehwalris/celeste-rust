@@ -1,20 +1,16 @@
 # Agent Prompt: Barrier Executor Optimization
 
-You are optimizing the barrier-based executor for a Rust abstract interpreter of PICO-8 Celeste. Your goal is to make barrier-based execution competitive with flow-based execution.
+You are optimizing the barrier-based executor for a Rust abstract interpreter of PICO-8 Celeste. Your goal is to maximize throughput: complete as many frames as possible within **60 seconds** and **80GB memory**.
 
 See `docs/barrier-based-execution.md` for design documentation.
 
 ## Benchmark
 
 ```bash
-# Barrier-based (what you're optimizing)
-./safe-run.sh -- cargo run --release --bin celeste-rust -- --barrier -n 30
-
-# Flow-based (baseline to compare against)
-./safe-run.sh -- cargo run --release --bin celeste-rust -- -n 30
+./safe-run.sh -- timeout 60s cargo run --release --bin celeste-rust -- --barrier --frames 100
 ```
 
-**Goal**: Reduce barrier execution time to be closer to flow-based.
+**Goal**: Maximize the highest frame number completed within 60 seconds.
 
 ## Correctness Constraint
 
@@ -44,6 +40,7 @@ Each iteration:
 
 3. **Measure** and verify:
    - State counts identical (correctness)
+   - Frame count same or higher
    - Timing improved
 
 4. **Commit**:
