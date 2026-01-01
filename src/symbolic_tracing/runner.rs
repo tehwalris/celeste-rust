@@ -283,6 +283,11 @@ struct TraceResult {
     next_exploration: Option<(State, PathCounter, StateShape)>,
 }
 
+/// Batch size for incremental vectorization during tracing.
+/// After accumulating this many output states, we vectorize to reduce memory and final vectorization cost.
+/// Set higher to reduce vectorization frequency (at cost of more memory).
+const INCREMENTAL_VECTORIZE_BATCH_SIZE: usize = 20000;
+
 /// Runs multiple states through a CFG using symbolic tracing, with parallel execution.
 pub fn run_traced_parallel(
     cfg: Arc<Cfg>,
@@ -292,6 +297,7 @@ pub fn run_traced_parallel(
 ) -> Result<(Vec<State>, RunStats)> {
     let mut stats = RunStats::default();
     let mut output_states: Vec<State> = Vec::new();
+    let mut pending_outputs: Vec<State> = Vec::new(); // Accumulator for incremental vectorization
 
     // Track seen (shape, path) pairs for potential cache hit analysis
     let mut seen_shape_paths: HashSet<(StateShape, Vec<(usize, usize)>)> = HashSet::new();
@@ -397,7 +403,7 @@ pub fn run_traced_parallel(
             }
 
             debug_assert_eq!(result.output_state.vector_size, 1, "Output state should be concrete");
-            output_states.push(result.output_state);
+            pending_outputs.push(result.output_state);
             stats.output_states += 1;
 
             // Queue next exploration if needed
@@ -405,6 +411,19 @@ pub fn run_traced_parallel(
                 pending.push(PendingState { state, path, shape });
             }
         }
+
+        // Incremental vectorization: periodically merge accumulated outputs
+        // This reduces memory usage and speeds up final vectorization
+        if pending_outputs.len() >= INCREMENTAL_VECTORIZE_BATCH_SIZE {
+            // Combine with existing output_states and vectorize
+            output_states.append(&mut pending_outputs);
+            output_states = crate::interpreter::vectorize::vectorize_states(output_states);
+        }
+    }
+
+    // Final merge of any remaining pending outputs
+    if !pending_outputs.is_empty() {
+        output_states.append(&mut pending_outputs);
     }
 
     Ok((output_states, stats))
