@@ -52,6 +52,10 @@ struct Args {
     /// Resume from the latest checkpoint in the checkpoint directory
     #[arg(long)]
     resume: bool,
+
+    /// Use barrier-based execution instead of flow-based
+    #[arg(long)]
+    barrier: bool,
 }
 
 fn main() -> Result<()> {
@@ -73,6 +77,7 @@ fn main() -> Result<()> {
         args.checkpoint_dir.as_deref(),
         args.checkpoint_interval,
         args.resume,
+        args.barrier,
     )
 }
 
@@ -115,13 +120,19 @@ fn run_game_frames(
     checkpoint_dir: Option<&str>,
     checkpoint_interval: u32,
     resume: bool,
+    use_barrier: bool,
 ) -> Result<()> {
     use crate::interpreter::glue::interpret_cfg;
+    use crate::interpreter::barrier_executor::execute_with_barriers;
     use crate::interpreter::inspect::{make_state_abstract, create_frame_dump, write_frame_dump_jsonl, dump_states_to_file, save_checkpoint, load_checkpoint, checkpoint_filename, Checkpoint};
     use crate::interpreter::profiling::{enable_profiling, get_chrome_tracing_json, get_dag_json, get_tree_json, get_cfgs_json, get_profile_summary};
     use crate::game_runner::{create_fixed_env_with_game_builtins, create_initial_state_with_builtins};
     use std::io::BufWriter;
     use std::fs::File;
+
+    if use_barrier {
+        println!("Using barrier-based execution");
+    }
 
     // Enable profiling if requested
     if profile_dir.is_some() {
@@ -188,8 +199,13 @@ __reset_button_states()
                 let initial_state = create_initial_state_with_builtins(&fixed_env);
                 println!("Running game init...");
                 let start = std::time::Instant::now();
-                let init_result_states =
-                    interpret_cfg(cfg.clone(), initial_state, &fixed_env).expect("Init interpretation failed");
+                let init_result_states = if use_barrier {
+                    execute_with_barriers(&cfg, vec![initial_state], &fixed_env)
+                        .expect("Init interpretation failed")
+                } else {
+                    interpret_cfg(cfg.clone(), initial_state, &fixed_env)
+                        .expect("Init interpretation failed")
+                };
                 println!("Game init completed in {:?}", start.elapsed());
                 println!("States after init: {}", init_result_states.len());
                 (init_result_states.into_iter().map(|(s, _)| s).collect(), 1)
@@ -199,8 +215,13 @@ __reset_button_states()
         let initial_state = create_initial_state_with_builtins(&fixed_env);
         println!("Running game init...");
         let start = std::time::Instant::now();
-        let init_result_states =
-            interpret_cfg(cfg.clone(), initial_state, &fixed_env).expect("Init interpretation failed");
+        let init_result_states = if use_barrier {
+            execute_with_barriers(&cfg, vec![initial_state], &fixed_env)
+                .expect("Init interpretation failed")
+        } else {
+            interpret_cfg(cfg.clone(), initial_state, &fixed_env)
+                .expect("Init interpretation failed")
+        };
         println!("Game init completed in {:?}", start.elapsed());
         println!("States after init: {}", init_result_states.len());
         (init_result_states.into_iter().map(|(s, _)| s).collect(), 1)
@@ -227,10 +248,18 @@ __reset_button_states()
         let start = std::time::Instant::now();
         let mut new_states = Vec::new();
 
-        for state in states {
-            let result = interpret_cfg(frame_cfg.clone(), state, &fixed_env)
+        if use_barrier {
+            // Barrier-based execution: process all states together
+            let result = execute_with_barriers(&frame_cfg, states, &fixed_env)
                 .expect("Frame interpretation failed");
-            new_states.extend(result.into_iter().map(|(s, _)| s));
+            new_states = result.into_iter().map(|(s, _)| s).collect();
+        } else {
+            // Flow-based execution: process states one at a time
+            for state in states {
+                let result = interpret_cfg(frame_cfg.clone(), state, &fixed_env)
+                    .expect("Frame interpretation failed");
+                new_states.extend(result.into_iter().map(|(s, _)| s));
+            }
         }
 
         // GC and normalize states before vectorization
@@ -2164,7 +2193,7 @@ __reset_button_states()
     fn test_run_celeste_game_frame() {
         // Run 26 frames (enough to see player spawn at frame 25)
         // For longer runs, use the binary: cargo run -- -n 30
-        run_game_frames(26, 25, 26, None, None, None, None, None, 1, false).expect("Game frames should complete");
+        run_game_frames(26, 25, 26, None, None, None, None, None, 1, false, false).expect("Game frames should complete");
     }
 
     #[test]
@@ -2859,5 +2888,69 @@ __reset_button_states()
 
         assert_eq!(result_states.len(), 1, "Expected states to be merged by __barrier");
         assert_eq!(result_states[0].0.vector_size, 2, "Expected vectorized state with size 2");
+    }
+
+    #[test]
+    fn test_barrier_executor_simple() {
+        use crate::interpreter::barrier_executor::execute_with_barriers;
+
+        // Simple test: no branches, just a barrier
+        let code = r#"
+            local x = 42
+            __barrier({1})
+            __print(x)
+        "#;
+
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            execute_with_barriers(&cfg, vec![initial_state], &fixed_env).expect("Execution failed");
+
+        assert_eq!(result_states.len(), 1, "Expected 1 result state");
+        let prints = &result_states[0].0.prints;
+        assert!(prints.contains(&"42".to_string()), "Expected print of 42, got: {:?}", prints);
+    }
+
+    #[test]
+    fn test_barrier_executor_with_branch() {
+        use crate::interpreter::barrier_executor::execute_with_barriers;
+
+        // Test with a branch that creates two paths
+        let code = r#"
+            local x = 0
+            if __new_unknown_boolean() then
+                x = 1
+            else
+                x = 2
+            end
+            __barrier({1})
+            __print(x)
+        "#;
+
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            execute_with_barriers(&cfg, vec![initial_state], &fixed_env).expect("Execution failed");
+
+        // With barrier executor, we should get 2 states (one for each path from UnknownBool)
+        // or 1 vectorized state with size 2
+        let total_expanded: usize = result_states.iter().map(|(s, _)| s.vector_size).sum();
+        assert_eq!(total_expanded, 2, "Expected 2 expanded states (two paths from UnknownBool)");
     }
 }

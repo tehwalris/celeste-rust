@@ -1,18 +1,42 @@
 //! Barrier-based execution: process states through barriers in order,
 //! using PathCounter for abstract path enumeration.
+//!
+//! Key design: PathCounter is passed through ALL levels of function calls,
+//! so the path enumeration works across the entire call stack.
 
 use std::collections::{BTreeMap, HashMap};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 
-use crate::ir::{BarrierId, Cfg, Label};
+use crate::ir::{BarrierId, Block, Cfg, Instruction, Label, LocalId, Terminator};
 
 use super::{
     fixed_env::FixedEnv,
+    local_env::LocalEnv,
     state::State,
-    value::Value,
+    value::{HeapValue, MaybeVector, Value},
     vectorize::vectorize_states,
 };
+
+/// Build a map from BarrierId to the block that has that barrier.
+/// Returns None for entry block, Some(label) for named blocks.
+fn build_barrier_map(cfg: &Cfg) -> HashMap<BarrierId, Option<Label>> {
+    let mut map = HashMap::new();
+
+    // Check entry block
+    if let Some(barrier_id) = &cfg.entry.barrier {
+        map.insert(barrier_id.clone(), None);
+    }
+
+    // Check named blocks
+    for (label, block) in &cfg.named {
+        if let Some(barrier_id) = &block.barrier {
+            map.insert(barrier_id.clone(), Some(label.clone()));
+        }
+    }
+
+    map
+}
 
 /// PathCounter tracks which abstract path we're exploring.
 /// When encountering UnknownBool, we consult the counter to pick true/false.
@@ -83,6 +107,237 @@ impl PathCounter {
     }
 }
 
+/// Execute a call instruction using PathCounter for all branching decisions.
+/// This function is called by run_to_next_barrier for function calls.
+/// PathCounter is passed through to nested function calls.
+fn interpret_call_with_path_counter(
+    state: State,
+    local_id: LocalId,
+    closure_local_id: LocalId,
+    arg_local_ids: &[LocalId],
+    fixed_env: &FixedEnv,
+    path_counter: &mut PathCounter,
+) -> Result<State> {
+    // Get the closure value from the local environment
+    let closure_heap_id = match state.local_env.get(closure_local_id) {
+        Value::Pointer(heap_id) => *heap_id,
+        Value::NilPointer(hint) => {
+            return Err(anyhow!("Attempt to call nil ({})", hint));
+        }
+        _ => {
+            return Err(anyhow!("Expected pointer for closure"));
+        }
+    };
+
+    // Get the heap value
+    let heap_value = state.heap.get(closure_heap_id).clone();
+
+    // Gather argument values
+    let arg_values: Vec<Value> = arg_local_ids
+        .iter()
+        .map(|id| state.local_env.get(*id).clone())
+        .collect();
+
+    match heap_value {
+        HeapValue::BuiltinFun(name) => {
+            // Look up the builtin function
+            let builtin_fn = fixed_env
+                .builtin_funs
+                .get(&name)
+                .ok_or_else(|| anyhow!("Unknown builtin function: {}", name))?;
+
+            // Call the builtin, which returns multiple (state, return_value) pairs
+            let results = builtin_fn(state, arg_values)?;
+
+            if results.is_empty() {
+                return Err(anyhow!("Builtin {} returned no results", name));
+            }
+
+            // Use PathCounter to pick one result
+            let choice = if results.len() > 1 {
+                path_counter.get_choice()
+            } else {
+                false
+            };
+            let idx = if choice { 1.min(results.len() - 1) } else { 0 };
+            let (mut result_state, return_value) = results.into_iter().nth(idx).unwrap();
+
+            // Set the return value
+            result_state.local_env.set(local_id, return_value);
+            Ok(result_state)
+        }
+        HeapValue::Closure(fun_def_name, captured_values) => {
+            // Look up the function definition with prepared CFG
+            let (fun_def, prepared_cfg) = fixed_env
+                .fun_defs
+                .get(&fun_def_name)
+                .ok_or_else(|| anyhow!("Unknown function: {:?}", fun_def_name))?;
+
+            // Create a new local_env for the function body
+            let mut new_local_env = LocalEnv::new();
+
+            // Set up captured values
+            for (capture_id, value) in fun_def.capture_ids.iter().zip(captured_values.iter()) {
+                new_local_env.set(*capture_id, value.clone());
+            }
+
+            // Set up argument values (padding with Nil if needed)
+            for (i, arg_id) in fun_def.arg_ids.iter().enumerate() {
+                if let Some(arg_id) = arg_id {
+                    let value = arg_values
+                        .get(i)
+                        .cloned()
+                        .unwrap_or(Value::Nil(Some("missing argument".to_string())));
+                    new_local_env.set(*arg_id, value);
+                }
+            }
+
+            // Create the state for executing the function body
+            let mut new_outer_local_envs = vec![state.local_env.clone()];
+            new_outer_local_envs.extend(state.outer_local_envs.clone());
+
+            let function_state = State {
+                heap: state.heap.clone(),
+                local_env: new_local_env,
+                outer_local_envs: new_outer_local_envs,
+                global_env: state.global_env.clone(),
+                prints: state.prints.clone(),
+                vector_size: state.vector_size,
+            };
+
+            // Recursively interpret the function's CFG using PathCounter
+            // This runs the entire function and returns when it completes
+            let (result_state, return_value) =
+                run_cfg_to_completion(&prepared_cfg.cfg, function_state, fixed_env, path_counter)?;
+
+            // Restore caller's local_env from outer_local_envs
+            let (caller_local_env, remaining_outer_envs) = {
+                let mut envs = result_state.outer_local_envs.clone();
+                let caller_env = envs.remove(0);
+                (caller_env, envs)
+            };
+
+            let mut caller_state = State {
+                heap: result_state.heap,
+                local_env: caller_local_env,
+                outer_local_envs: remaining_outer_envs,
+                global_env: result_state.global_env,
+                prints: result_state.prints,
+                vector_size: result_state.vector_size,
+            };
+
+            // Set the return value
+            caller_state
+                .local_env
+                .set(local_id, return_value.unwrap_or(Value::Nil(None)));
+            Ok(caller_state)
+        }
+        _ => Err(anyhow!("Expected closure or builtin function")),
+    }
+}
+
+/// Run a CFG to completion using PathCounter for branching decisions.
+/// Used for function calls - runs until a Return is encountered.
+fn run_cfg_to_completion(
+    cfg: &Cfg,
+    mut state: State,
+    fixed_env: &FixedEnv,
+    path_counter: &mut PathCounter,
+) -> Result<(State, Option<Value>)> {
+    // Use a fake label for the entry block (needed for PHI nodes in successors)
+    let entry_label = Label::from("__entry".to_string());
+
+    let mut current_block = &cfg.entry;
+    let mut current_block_label: Option<&Label> = None; // None = entry block
+    let mut incoming_label: Option<&Label> = None; // Label of block we came FROM (for PHI)
+
+    loop {
+        // Execute all instructions in the block
+        for (local_id, instruction) in &current_block.instructions {
+            // Handle phi nodes - use incoming_label to pick the right branch
+            if let Instruction::Phi { branches } = instruction {
+                if let Some(from_label) = incoming_label {
+                    for (branch_label, value_id) in branches {
+                        if branch_label == from_label {
+                            let value = state.local_env.get(*value_id).clone();
+                            state.local_env.set(*local_id, value);
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Handle calls with PathCounter
+            if let Instruction::Call { closure, args } = instruction {
+                state = interpret_call_with_path_counter(
+                    state,
+                    *local_id,
+                    *closure,
+                    args,
+                    fixed_env,
+                    path_counter,
+                )?;
+                continue;
+            }
+
+            // Handle other instructions using CoreInterpreter
+            let mut interpreter =
+                super::core_interpreter::CoreInterpreter::new(state, fixed_env);
+            interpreter.interpret_non_call_instruction(*local_id, instruction)?;
+            state = interpreter.into_state();
+        }
+
+        // Handle terminator
+        let (_, terminator) = &current_block.terminator;
+        match terminator {
+            Terminator::Return { value } => {
+                let return_value = value.map(|id| state.local_env.get(id).clone());
+                return Ok((state, return_value));
+            }
+            Terminator::UnconditionalBranch { target } => {
+                // Set incoming_label to current block's label (for PHI in target)
+                incoming_label = current_block_label.or(Some(&entry_label));
+                current_block_label = Some(target);
+                current_block = cfg
+                    .named
+                    .get(target)
+                    .ok_or_else(|| anyhow!("Unknown block label: {:?}", target))?;
+            }
+            Terminator::ConditionalBranch {
+                condition,
+                true_target,
+                false_target,
+            } => {
+                let condition_value = state.local_env.get(*condition);
+
+                let take_true = match condition_value {
+                    Value::Bool(MaybeVector::Scalar(b)) => *b,
+                    Value::Bool(MaybeVector::Vector(_)) => {
+                        panic!("Unexpected vector bool in scalar execution");
+                    }
+                    Value::UnknownBool => path_counter.get_choice(),
+                    Value::Nil(_) => false,
+                    Value::Number(_)
+                    | Value::NumberInterval(_)
+                    | Value::String(_)
+                    | Value::Pointer(_) => true,
+                    Value::NilPointer(_) => return Err(anyhow!("Nil pointer in condition")),
+                };
+
+                let target = if take_true { true_target } else { false_target };
+                // Set incoming_label to current block's label (for PHI in target)
+                incoming_label = current_block_label.or(Some(&entry_label));
+                current_block_label = Some(target);
+                current_block = cfg
+                    .named
+                    .get(target)
+                    .ok_or_else(|| anyhow!("Unknown block label: {:?}", target))?;
+            }
+        }
+    }
+}
+
 /// Key for ordering barrier processing: (barrier_id, hit_count)
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BarrierKey {
@@ -90,11 +345,13 @@ pub struct BarrierKey {
     pub hit_count: usize,
 }
 
-/// A state waiting at a barrier
+/// A state waiting at a barrier, along with the block to start executing from.
 #[derive(Clone, Debug)]
 pub struct WaitingState {
     pub state: State,
     pub barrier_key: BarrierKey,
+    /// The block to start executing from. None means entry block.
+    pub start_block: Option<Label>,
 }
 
 /// The implicit "END" barrier for states that complete execution
@@ -131,26 +388,33 @@ pub fn execute_with_barriers(
     initial_states: Vec<State>,
     fixed_env: &FixedEnv,
 ) -> Result<Vec<(State, Option<Value>)>> {
-    // Map from barrier key to waiting states
-    let mut pending: BTreeMap<BarrierKey, Vec<State>> = BTreeMap::new();
+    // Build map from barrier ID to block label
+    let barrier_map = build_barrier_map(cfg);
+
+    // Map from barrier key to waiting states with their starting blocks
+    let mut pending: BTreeMap<BarrierKey, Vec<(State, Option<Label>)>> = BTreeMap::new();
 
     // Track per-state hit counts (state hash -> hit count per barrier)
     // For now, use a simpler approach: global hit count per barrier
     let mut barrier_hit_counts: HashMap<BarrierId, usize> = HashMap::new();
 
-    // Initialize with states at START barrier
+    // Initialize with states at START barrier (they will start from entry block)
     let start_key = BarrierKey {
         barrier_id: start_barrier_id(),
         hit_count: 0,
     };
-    pending.insert(start_key, initial_states);
+    pending.insert(
+        start_key,
+        initial_states.into_iter().map(|s| (s, None)).collect(),
+    );
 
     // Collect results (states that reached END)
     let mut results: Vec<(State, Option<Value>)> = Vec::new();
 
     loop {
         // Find the lowest barrier key with pending states
-        let next_key = pending.iter()
+        let next_key = pending
+            .iter()
             .find(|(_, states)| !states.is_empty())
             .map(|(k, _)| k.clone());
 
@@ -160,19 +424,29 @@ pub fn execute_with_barriers(
         };
 
         // Take the states at this barrier
-        let states = pending.remove(&current_key).unwrap_or_default();
-        if states.is_empty() {
+        let states_with_blocks = pending.remove(&current_key).unwrap_or_default();
+        if states_with_blocks.is_empty() {
             continue;
         }
 
         // Check if this is the END barrier
         if current_key.barrier_id == end_barrier_id() {
             // These states are done
-            for state in states {
+            for (state, _) in states_with_blocks {
                 results.push((state, None));
             }
             continue;
         }
+
+        // Determine starting block for this barrier
+        let start_block = if current_key.barrier_id == start_barrier_id() {
+            None // Start from entry block
+        } else {
+            barrier_map.get(&current_key.barrier_id).cloned().flatten()
+        };
+
+        // Extract just the states for vectorization
+        let states: Vec<State> = states_with_blocks.into_iter().map(|(s, _)| s).collect();
 
         // Vectorize the states at this barrier
         let vectorized = vectorize_states(states);
@@ -204,7 +478,7 @@ pub fn execute_with_barriers(
                         run_state,
                         fixed_env,
                         &mut path_counter,
-                        &current_key.barrier_id,
+                        start_block.as_ref(),
                     )?;
 
                     // Determine destination key
@@ -217,10 +491,19 @@ pub fn execute_with_barriers(
                         hit_count: dest_hit,
                     };
 
-                    // Add to pending at destination
-                    pending.entry(dest_key)
+                    // Add to pending at destination (with the destination block for continuation)
+                    let dest_block = if run_result.destination == end_barrier_id() {
+                        None
+                    } else {
+                        barrier_map
+                            .get(&run_result.destination)
+                            .cloned()
+                            .flatten()
+                    };
+                    pending
+                        .entry(dest_key)
                         .or_default()
-                        .push(run_result.state);
+                        .push((run_result.state, dest_block));
 
                     // Try next path
                     if !path_counter.increment() {
@@ -238,42 +521,166 @@ pub fn execute_with_barriers(
     Ok(results)
 }
 
-/// Extract a scalar state from a vectorized state at the given lane index
+/// Extract a scalar state from a vectorized state at the given lane index.
+/// Creates a mask with only lane_idx set to true and filters the state.
 fn extract_scalar_lane(state: &State, lane_idx: usize) -> State {
     if state.vector_size == 1 {
         return state.clone();
     }
 
-    // TODO: Implement proper scalar extraction
-    // For now, just return the state as-is (this will be incorrect for vectors)
-    // This needs to extract lane `lane_idx` from all MaybeVector values
-    let mut scalar = state.clone();
-    scalar.vector_size = 1;
-    scalar
+    // Create a mask with only lane_idx set to true
+    let mut mask = vec![false; state.vector_size];
+    mask[lane_idx] = true;
+
+    // Use the existing filter_by_mask method
+    state.filter_by_mask(&mask)
 }
 
-/// Run a scalar state from the current position until it hits a barrier or completes.
-/// Uses the PathCounter to resolve UnknownBool branches.
+/// Run a scalar state from the given block until it hits a barrier or completes.
+/// Uses PathCounter for ALL branching decisions, including within function calls.
+///
+/// `start_block`: None means start from entry block, Some(label) means start from that block.
+///
+/// Returns a single result (PathCounter ensures deterministic path selection).
 fn run_to_next_barrier(
     cfg: &Cfg,
-    state: State,
+    mut state: State,
     fixed_env: &FixedEnv,
     path_counter: &mut PathCounter,
-    current_barrier: &BarrierId,
+    start_block: Option<&Label>,
 ) -> Result<BarrierRunResult> {
-    // TODO: Implement the actual interpreter run
-    // For now, just return immediately at END barrier
-    // This is a placeholder - the real implementation needs to:
-    // 1. Run the interpreter block by block
-    // 2. On UnknownBool branches, use path_counter.get_choice() to decide
-    // 3. Stop when hitting a barrier block or Return
-    // 4. Return the state and destination
+    // Use a fake label for the entry block (needed for PHI nodes in successors)
+    let entry_label = Label::from("__entry".to_string());
 
-    Ok(BarrierRunResult {
-        state,
-        destination: end_barrier_id(),
-        return_value: None,
-    })
+    // Initialize with the starting block
+    let (mut current_block, mut current_block_label): (&Block, Option<&Label>) = match start_block
+    {
+        None => (&cfg.entry, None),
+        Some(label) => {
+            let block = cfg
+                .named
+                .get(label)
+                .ok_or_else(|| anyhow!("Unknown start block: {:?}", label))?;
+            (block, Some(label))
+        }
+    };
+
+    // Track the label of the block we came FROM (for PHI resolution)
+    let mut incoming_label: Option<&Label> = None;
+
+    // Track if this is the first block (skip barrier check at entry since we just passed it)
+    let mut first_block = true;
+
+    loop {
+        // Execute all instructions in the block
+        for (local_id, instruction) in &current_block.instructions {
+            // Handle phi nodes - use incoming_label to pick the right branch
+            if let Instruction::Phi { branches } = instruction {
+                if let Some(from_label) = incoming_label {
+                    for (branch_label, value_id) in branches {
+                        if branch_label == from_label {
+                            let value = state.local_env.get(*value_id).clone();
+                            state.local_env.set(*local_id, value);
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Handle calls with PathCounter (passes through to nested calls)
+            if let Instruction::Call { closure, args } = instruction {
+                state = interpret_call_with_path_counter(
+                    state,
+                    *local_id,
+                    *closure,
+                    args,
+                    fixed_env,
+                    path_counter,
+                )?;
+                continue;
+            }
+
+            // Handle other instructions using CoreInterpreter
+            let mut interpreter =
+                super::core_interpreter::CoreInterpreter::new(state, fixed_env);
+            interpreter.interpret_non_call_instruction(*local_id, instruction)?;
+            state = interpreter.into_state();
+        }
+
+        // Check if this block has a barrier (skip on first block)
+        if !first_block {
+            if let Some(barrier_id) = &current_block.barrier {
+                return Ok(BarrierRunResult {
+                    state,
+                    destination: barrier_id.clone(),
+                    return_value: None,
+                });
+            }
+        }
+        first_block = false;
+
+        // Handle terminator
+        let (_, terminator) = &current_block.terminator;
+        match terminator {
+            Terminator::Return { value } => {
+                let return_value = value.map(|id| state.local_env.get(id).clone());
+                return Ok(BarrierRunResult {
+                    state,
+                    destination: end_barrier_id(),
+                    return_value,
+                });
+            }
+            Terminator::UnconditionalBranch { target } => {
+                // Set incoming_label to current block's label (for PHI in target)
+                incoming_label = current_block_label.or(Some(&entry_label));
+                current_block_label = Some(target);
+                current_block = cfg
+                    .named
+                    .get(target)
+                    .ok_or_else(|| anyhow!("Unknown block label: {:?}", target))?;
+            }
+            Terminator::ConditionalBranch {
+                condition,
+                true_target,
+                false_target,
+            } => {
+                let condition_value = state.local_env.get(*condition);
+
+                let take_true = match condition_value {
+                    Value::Bool(MaybeVector::Scalar(b)) => *b,
+                    Value::Bool(MaybeVector::Vector(_)) => {
+                        panic!("Unexpected vector bool in scalar execution");
+                    }
+                    Value::UnknownBool => path_counter.get_choice(),
+                    Value::Nil(_) => false,
+                    Value::Number(_)
+                    | Value::NumberInterval(_)
+                    | Value::String(_)
+                    | Value::Pointer(_) => true,
+                    Value::NilPointer(_) => return Err(anyhow!("Nil pointer in condition")),
+                };
+
+                let target = if take_true { true_target } else { false_target };
+                // Set incoming_label to current block's label (for PHI in target)
+                incoming_label = current_block_label.or(Some(&entry_label));
+                current_block_label = Some(target);
+                current_block = cfg
+                    .named
+                    .get(target)
+                    .ok_or_else(|| anyhow!("Unknown block label: {:?}", target))?;
+            }
+        }
+
+        // Check if the new block has a barrier at entry
+        if let Some(barrier_id) = &current_block.barrier {
+            return Ok(BarrierRunResult {
+                state,
+                destination: barrier_id.clone(),
+                return_value: None,
+            });
+        }
+    }
 }
 
 #[cfg(test)]
