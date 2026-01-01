@@ -91,6 +91,54 @@ impl State {
         new_state
     }
 
+    /// Extract a single lane from a vectorized state at the given index.
+    /// This is more efficient than filter_by_mask for single-element extraction.
+    pub fn extract_scalar_lane(&self, lane_idx: usize) -> Self {
+        if self.vector_size == 1 {
+            return self.clone();
+        }
+
+        // Build new heap with extracted values
+        let mut new_heap = Heap::new();
+        for i in 0..self.heap.len() {
+            new_heap.alloc();
+        }
+        for i in 0..self.heap.len() {
+            let id = HeapId::from_raw(i);
+            if let Some(heap_value) = self.heap.get_opt(id) {
+                new_heap.set(id, heap_value.extract_at_index(lane_idx));
+            }
+        }
+
+        // Build new local_env with extracted values
+        let mut new_local_env = LocalEnv::new();
+        for (raw_id, value) in self.local_env.iter() {
+            new_local_env.set(LocalId::from(raw_id), value.extract_at_index(lane_idx));
+        }
+
+        // Build new outer_local_envs with extracted values
+        let new_outer_local_envs: Vec<LocalEnv> = self
+            .outer_local_envs
+            .iter()
+            .map(|env| {
+                let mut new_env = LocalEnv::new();
+                for (raw_id, value) in env.iter() {
+                    new_env.set(LocalId::from(raw_id), value.extract_at_index(lane_idx));
+                }
+                new_env
+            })
+            .collect();
+
+        State {
+            heap: new_heap,
+            local_env: new_local_env,
+            outer_local_envs: new_outer_local_envs,
+            global_env: self.global_env.clone(),
+            prints: self.prints.clone(),
+            vector_size: 1,
+        }
+    }
+
     /// Garbage collect the heap and renumber HeapIds deterministically.
     /// This ensures that states with the same logical structure will have
     /// the same heap IDs, which is critical for vectorization to work correctly.

@@ -703,18 +703,9 @@ pub fn execute_with_barriers(
 }
 
 /// Extract a scalar state from a vectorized state at the given lane index.
-/// Creates a mask with only lane_idx set to true and filters the state.
+/// Uses the optimized extract_scalar_lane method on State.
 fn extract_scalar_lane(state: &State, lane_idx: usize) -> State {
-    if state.vector_size == 1 {
-        return state.clone();
-    }
-
-    // Create a mask with only lane_idx set to true
-    let mut mask = vec![false; state.vector_size];
-    mask[lane_idx] = true;
-
-    // Use the existing filter_by_mask method
-    state.filter_by_mask(&mask)
+    state.extract_scalar_lane(lane_idx)
 }
 
 /// Run a scalar state from the given block until it hits a barrier or completes.

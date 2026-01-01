@@ -94,6 +94,24 @@ impl Value {
             _ => self,
         }
     }
+
+    /// Extract a single element from a vectorized value at the given index.
+    /// For scalar values, returns a clone regardless of index.
+    /// This is more efficient than filter_vectors for single-element extraction.
+    pub fn extract_at_index(&self, index: usize) -> Self {
+        match self {
+            Value::Bool(MaybeVector::Vector(vec)) => {
+                Value::Bool(MaybeVector::Scalar(vec[index]))
+            }
+            Value::Number(MaybeVector::Vector(vec)) => {
+                Value::Number(MaybeVector::Scalar(vec[index]))
+            }
+            Value::NumberInterval(MaybeVector::Vector(vec)) => {
+                Value::NumberInterval(MaybeVector::Scalar(vec[index]))
+            }
+            _ => self.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,4 +122,24 @@ pub enum HeapValue {
     UnknownTable,
     Closure(GlobalId, Vec<Value>),
     BuiltinFun(String),
+}
+
+impl HeapValue {
+    /// Extract a single element from vectorized values in this HeapValue at the given index.
+    pub fn extract_at_index(&self, index: usize) -> Self {
+        match self {
+            HeapValue::Value(v) => HeapValue::Value(v.extract_at_index(index)),
+            HeapValue::Closure(id, captures) => {
+                HeapValue::Closure(
+                    id.clone(),
+                    captures.iter().map(|v| v.extract_at_index(index)).collect(),
+                )
+            }
+            // Non-vectorizable values are just cloned
+            HeapValue::ObjectTable(t) => HeapValue::ObjectTable(t.clone()),
+            HeapValue::ArrayTable(a) => HeapValue::ArrayTable(a.clone()),
+            HeapValue::UnknownTable => HeapValue::UnknownTable,
+            HeapValue::BuiltinFun(n) => HeapValue::BuiltinFun(n.clone()),
+        }
+    }
 }
