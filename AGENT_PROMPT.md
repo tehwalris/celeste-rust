@@ -1,65 +1,70 @@
-# Agent Prompt: Celeste Rust Interpreter - Speed Optimization
+# Agent Prompt: Barrier Executor Optimization
 
-You are working on a Rust abstract interpreter for PICO-8 Celeste. The goal is running the **100m room** (first room of Celeste Classic) correctly and fast.
+You are optimizing the barrier-based executor for a Rust abstract interpreter of PICO-8 Celeste. The goal is to make barrier-based execution competitive with flow-based execution.
 
-## Current State
+## Benchmark
 
-**Read first**: `docs/barrier-based-execution.md` (especially "Current Implementation Status" section)
+```bash
+# Barrier-based (what you're optimizing)
+./safe-run.sh -- cargo run --release --bin celeste-rust -- --barrier -n 30
 
-The barrier-based executor is **implemented and correct**. It produces identical state counts to the flow-based executor through Frame 30.
+# Flow-based (baseline to compare against)
+./safe-run.sh -- cargo run --release --bin celeste-rust -- -n 30
+```
 
-## Current Performance
+**Current performance** (barrier vs flow):
+- Frame 28: ~7s vs ~3s (2.2x slower)
+- Frame 29: ~28s vs ~5s (5.6x slower)
+- Frame 30: ~75s vs ~11s (6.7x slower)
 
-| Frame | Barrier | Flow | Ratio |
-|-------|---------|------|-------|
-| 28 | ~7s | ~3s | 2.2x slower |
-| 29 | ~28s | ~5s | 5.6x slower |
-| 30 | ~75s | ~11s | 6.7x slower |
+**Goal**: Reduce barrier execution time to be closer to flow-based.
 
-The barrier approach is slower due to:
-1. PathCounter enumerates all 2^n paths for n UnknownBool branches
-2. States with different ResumeContexts can't be merged (different call sites)
-3. CallStack tracking and cloning overhead
+## Correctness Constraint
 
-## Your Task: Optimize
+**The expanded state count per frame MUST remain identical.** For example:
+- Frame 25: 24 expanded
+- Frame 26: 204 expanded
+- Frame 27: 878 expanded
+- Frame 28: 2864 expanded
+- Frame 29: 7260 expanded
+- Frame 30: 15250 expanded
 
-Key optimization opportunities:
-
-1. **Better path pruning**: Detect infeasible paths earlier, skip redundant paths
-2. **Resume context merging**: Find ways to merge states with compatible resume contexts
-3. **Reduce CallStack overhead**: More efficient representation or fewer clones
-4. **Caching**: Cache function call results when inputs are identical
-5. **Parallel barrier processing**: Process independent barriers concurrently
+If state counts change, the optimization broke correctness and must be reverted.
 
 ## Key Files
 
 - `src/interpreter/barrier_executor.rs` - The barrier executor (optimize this)
-- `src/interpreter/flow.rs` - Flow-based executor (for comparison/inspiration)
-- `src/interpreter/vectorize.rs` - State vectorization/merging
-- `src/interpreter/state.rs` - State with gc() method
+- `src/interpreter/flow.rs` - Flow-based executor (for comparison)
+- `docs/barrier-based-execution.md` - Design documentation
 
-## How to Test
+## Approach
 
-```bash
-# Run barrier-based (what you're optimizing)
-./safe-run.sh -- cargo run --release --bin celeste-rust -- --barrier -n 28
+Profile first to identify bottlenecks, then optimize based on data. Key areas:
+- PathCounter enumeration (2^n paths for n UnknownBool branches)
+- CallStack/ResumeContext tracking overhead
+- State deduplication and vectorization
 
-# Run flow-based (baseline to compare against)
-./safe-run.sh -- cargo run --release --bin celeste-rust -- -n 28
-```
+## Workflow
 
-Verify correctness: expanded state counts must match between both modes.
-- Frame 25: 24, Frame 26: 204, Frame 27: 878, Frame 28: 2864
+Each iteration:
 
-## Success Metric
+1. **Profile** to identify hotspots
 
-Get barrier-based execution closer to flow-based time while maintaining correct state counts.
+2. **Implement** one optimization
 
-## How to Work
+3. **Measure** and verify:
+   - State counts identical (correctness)
+   - Timing improved
 
-1. Profile to understand where time is spent
-2. Implement optimizations incrementally
-3. Verify correctness after each change (state counts must match)
-4. Commit working improvements often
+4. **Commit**:
+   - If BETTER and CORRECT:
+     ```bash
+     git add -A && git commit -m "perf: <description>"
+     git push
+     ```
+   - If WORSE or INCORRECT:
+     ```bash
+     git checkout -- .
+     ```
 
-This branch is yours - commit frequently.
+Begin by profiling the current state and making your first optimization attempt.
