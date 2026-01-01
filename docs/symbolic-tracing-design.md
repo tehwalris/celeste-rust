@@ -194,3 +194,58 @@ Key insight: **Split up front to match a traced state is much cheaper than conti
 - **Between frames**: Vectorized storage for compactness (same as current)
 
 The path counter is purely a "within frame" concept. We finish executing the frame once we've covered all counters and vectorized the results into one set of vectorized states like what we started with.
+
+## Implementation Status (2026-01-01)
+
+### Completed
+- Core data structures: `SymExpr`, `TracedValue`, `PathCounter`, `TracingInterpreter`
+- Non-recursive tracing interpreter with explicit call stack
+- Path enumeration via counting DFS
+- Symbolic expression tracking for all operations
+- Path condition collection for branches
+- Heap allocation tracking
+
+### Key Findings
+
+#### Caching Challenge: Path-Dependent Branches
+The original design assumed caching based on `(shape, abstract_path)` would work. However, **branch conditions are path-dependent**:
+
+- Different traces taking different concrete branches encounter different subsequent branches
+- A trace with `concrete_path = [true, false, true]` sees different conditions than one with `[false, true, true]`
+- Templates (condition sequences) created from the first trace don't apply to subsequent traces
+- Result: 95%+ of traces have mismatched branch counts vs their template
+
+This means we can't predict `concrete_path` without actually tracing. The potential cache hit rate is 99.8%, but we'd need to trace to know the path.
+
+#### Performance Bottlenecks (from profiling)
+Tracing is ~8-32x slower than the reference interpreter:
+
+| Frame | States | Ref (ms) | Sym (ms) | Ratio |
+|-------|--------|----------|----------|-------|
+| 28    | 2,864  | 4,596    | 40,327   | 8.8x  |
+| 29    | 7,260  | 8,127    | 179,907  | 22.1x |
+| 30    | 15,250 | 17,081   | 550,994  | 32.3x |
+
+Profile breakdown:
+- **Cloning** (Vec, String, CFG, Block): 12%+
+- **Hashing** (HashMap, im-rs HAMT): 11%+
+- **Memory allocation** (malloc/free): 7%
+- **Dropping** (Instruction, Block, Value): 6%+
+- **Actual interpretation**: ~4%
+
+Root cause: The tracer uses the same `State` structure as the reference interpreter, which uses persistent data structures (im-rs HAMT) for vectorized execution. This adds overhead for scalar tracing.
+
+### Next Steps
+
+1. **Alternative caching strategy**: Instead of templates, explore:
+   - Post-hoc caching (store by full path, accept ~2x reuse factor)
+   - Block-level caching (smaller units, less path dependence)
+
+2. **Optimize data structures**:
+   - Use `Arc<PreparedCfg>` instead of cloning CFGs
+   - Use simpler (non-persistent) heap for scalar tracing
+   - Reduce HashMap operations in hot paths
+
+3. **Consider hybrid approach**:
+   - Use symbolic tracing only for specific code regions
+   - Fall back to reference interpreter for complex branching
