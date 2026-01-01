@@ -250,13 +250,13 @@ The barrier-based executor is implemented and verified correct in `src/interpret
 
 ### Performance Status
 
-After optimization, barrier-based is **~27% faster** than flow-based:
+After optimization, barrier-based is **~53% faster** than flow-based:
 - Flow-based Frame 28: 1090 states before merge (~4.8s)
-- Barrier-based Frame 28: ~12600 paths → ~800 vectorized states (~3.5s)
+- Barrier-based Frame 28: ~12600 paths → ~800 vectorized states (~3.1s)
 
-The key optimization is **batched intermediate vectorization**: during path enumeration,
-we periodically vectorize accumulated states (every 64 paths). This reduces the number
-of paths explored from 41000 to ~12600 and increases deduplication rate to ~94%.
+The key optimizations are:
+1. **Batched intermediate vectorization** reduces paths explored from 41000 to ~12600
+2. **Heap::from_values** builds heaps directly from Vec, avoiding im::HashMap overhead
 
 ### Optimizations Applied
 
@@ -267,6 +267,8 @@ of paths explored from 41000 to ~12600 and increases deduplication rate to ~94%.
 5. **Early Deduplication**: States are deduplicated as generated, not batched
 6. **FxHasher for im::HashMap**: Use FxHasher instead of SipHash for persistent collections
 7. **Optimized Lane Extraction**: `extract_at_index` directly extracts single lane values instead of filter_by_mask
+8. **Heap::from_values**: Build heaps directly from Vec<Option<HeapValue>> to avoid im::HashMap insert overhead
+9. **Static Labels**: Use LazyLock for frequently-used labels and barrier IDs to avoid repeated allocations
 
 ## Expected Benefits
 
