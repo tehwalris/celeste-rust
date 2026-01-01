@@ -255,24 +255,45 @@ This means we can't predict `concrete_path` without actually tracing. The potent
    - Solution: Process trace batches in parallel using rayon's par_iter
    - Result: Frame 28: 18.5s → 7.9s (2.3x speedup with multi-core)
 
-**Current state** (after optimizations, with parallel enabled):
-| Frame | Ref (ms) | Sym (ms) | Sym Parallel (ms) | Parallel Ratio |
-|-------|----------|----------|-------------------|----------------|
-| 28    | 4,725    | 18,539   | 7,859             | 1.7x           |
-| 29    | 7,558    | 83,650   | 35,218            | 4.7x           |
-| 30    | 16,457   | 269,359  | 108,571           | 6.6x           |
+6. **Fast mode: Skip symbolic tracking** (commit 830336c)
+   - Problem: Symbolic expressions (heap_symbols, local_symbols, path_conditions)
+     are unused when caching is disabled
+   - Solution: Add `track_symbols` flag to TracingInterpreter, use `new_fast()`
+     constructor when caching is disabled
+   - Result: Frame 28: 18.6s → 15.7s (16% faster), no more OOM at frame 30
 
-Profile breakdown (sequential, current):
-- **Hashing** (im-rs HAMT operations): ~17%
-- **Bitmap iteration** (im-rs internal): ~8%
-- **HAMT insert**: ~5%
-- **Heap::get_opt**: ~4%
-- **LocalEnv::set/get**: ~5%
-- **String cloning**: ~3%
-- **Memory allocation** (malloc/free): ~3.5%
-- **TracingInterpreter::interpret**: ~7%
+**Current state** (after optimizations, with fast mode and parallel):
+| Frame | Ref (ms) | Sym Seq (ms) | Sym Parallel (ms) | Parallel Ratio |
+|-------|----------|--------------|-------------------|----------------|
+| 28    | 4,722    | 15,671       | 8,003             | 1.7x           |
+| 29    | 7,633    | 71,000+      | 36,633            | 4.8x           |
+| 30    | 16,715   | 230,000+     | 111,343           | 6.7x           |
+
+Note: Frame 30 now completes (was OOM at 100GB before fast mode).
+
+Profile breakdown (sequential, with fast mode):
+- **Bitmap iteration** (im-rs internal): ~10%
+- **TracingInterpreter::interpret** (main loop): ~9%
+- **Hashing** (im-rs HAMT): ~8%
+- **hash_key** (HAMT lookup): ~5%
+- **Heap::get_opt**: ~5%
+- **HAMT insert**: ~3%
+- **Value cloning**: ~2%
 
 Root cause: The tracer uses the same `State` structure as the reference interpreter, which uses persistent data structures (im-rs HAMT) for the Heap and LocalEnv. This adds overhead for scalar tracing where we don't benefit from structural sharing.
+
+#### Caching Potential Analysis
+
+Stats from frame 28 (2,864 expanded states, 19,092 traces):
+- Unique (shape, abstract_path) pairs: 305
+- Unique (shape, abstract_path, concrete_path) tuples: 410
+- Potential cache hits: 18,787 (98.4%)
+
+This suggests massive opportunity for caching, but:
+- Caching by (shape, abstract_path) fails because concrete_path varies
+- Caching by (shape, abstract_path, concrete_path) requires symbolic evaluation
+  to reconstruct output for different input values
+- Without symbolic tracking (fast mode), we can't reconstruct outputs
 
 ### Next Steps
 
@@ -280,10 +301,10 @@ Root cause: The tracer uses the same `State` structure as the reference interpre
    - Use simpler (non-persistent) heap for scalar tracing
    - Consider custom LocalEnv for tracer with Vec storage
 
-2. **Alternative caching strategy**: Instead of templates, explore:
-   - Post-hoc caching (store by full path, accept ~2x reuse factor)
-   - Block-level caching (smaller units, less path dependence)
+2. **Hybrid symbolic tracking**:
+   - Enable symbol tracking only when potential cache hit rate is high
+   - Fast mode for exploration, symbolic mode for caching
 
-3. **Consider hybrid approach**:
-   - Use symbolic tracing only for specific code regions
-   - Fall back to reference interpreter for complex branching
+3. **Alternative approaches**:
+   - Block-level caching (smaller units, less path dependence)
+   - Trace by abstract path first, then split on concrete branches
