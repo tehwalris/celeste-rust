@@ -1,3 +1,4 @@
+pub mod barrier_executor;
 mod core_interpreter;
 pub mod fixed_env;
 mod flow;
