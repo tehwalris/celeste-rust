@@ -301,11 +301,25 @@ impl Terminator {
     }
 }
 
+/// A barrier identifier - a tuple of integers that provides total ordering.
+/// Examples: vec![1], vec![1, 2], vec![2, 0, 1]
+/// Barriers are ordered lexicographically.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BarrierId(pub Vec<i32>);
+
+impl BarrierId {
+    pub fn new(ids: Vec<i32>) -> Self {
+        Self(ids)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Block {
     pub instructions: Vec<(LocalId, Instruction)>,
     pub terminator: (LocalId, Terminator),
-    pub hint_normalize: bool,
+    /// If Some, this block is a barrier point where states synchronize.
+    /// Replaces the old hint_normalize mechanism.
+    pub barrier: Option<BarrierId>,
 }
 
 impl Block {

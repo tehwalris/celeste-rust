@@ -82,11 +82,11 @@ impl<'a>
 
     fn hint_normalize(&self, vertex: &FlowNode) -> bool {
         match vertex {
-            FlowNode::BeforeEntryBlock => self.cfg.entry.hint_normalize,
+            FlowNode::BeforeEntryBlock => self.cfg.entry.barrier.is_some(),
             FlowNode::BeforeNamedBlock(name_index) => {
                 let name = self.labels.get_index(*name_index).unwrap();
                 let block = self.cfg.named.get(name).unwrap();
-                block.hint_normalize
+                block.barrier.is_some()
             }
             _ => false,
         }
@@ -279,14 +279,14 @@ fn interpret_prepared_cfg_inner(
         cfg: &Cfg,
     | {
         let target_block = cfg.named.get(target);
-        let is_hint_normalize = target_block.map(|b| b.hint_normalize).unwrap_or(false);
+        let is_barrier = target_block.map(|b| b.barrier.is_some()).unwrap_or(false);
 
-        if is_hint_normalize {
+        if is_barrier {
             // Extract states from flow_data
             let new_states = match flow_data {
                 FlowData::States(states) => states,
                 FlowData::StatesAndReturns(_) => {
-                    panic!("StatesAndReturns not expected at hint_normalize block")
+                    panic!("StatesAndReturns not expected at barrier block")
                 }
             };
 

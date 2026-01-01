@@ -38,8 +38,10 @@ pub struct BlockExport {
     pub label: Option<String>,
     /// Number of instructions (including phi)
     pub instruction_count: usize,
-    /// Whether this is a hint_normalize block
-    pub hint_normalize: bool,
+    /// Whether this is a barrier block (replaces old hint_normalize)
+    pub is_barrier: bool,
+    /// Barrier ID if this is a barrier block
+    pub barrier_id: Option<Vec<i32>>,
     /// Terminator type for visualization
     pub terminator_type: String,
     /// Brief summary of instructions
@@ -76,7 +78,8 @@ impl BlockExport {
         Self {
             label: label.map(|l| l.as_str().to_string()),
             instruction_count: block.instructions.len(),
-            hint_normalize: block.hint_normalize,
+            is_barrier: block.barrier.is_some(),
+            barrier_id: block.barrier.as_ref().map(|b| b.0.clone()),
             terminator_type,
             instruction_summary,
         }

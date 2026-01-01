@@ -33,9 +33,14 @@ fn extract_span<N: Node>(node: &N) -> Option<SourceSpan> {
     })
 }
 
+use crate::ir::BarrierId;
+
 #[derive(Clone, Debug)]
 enum Hint {
+    /// Legacy: will be removed once all code uses Barrier
     Normalize,
+    /// A barrier with an explicit ID tuple
+    Barrier(BarrierId),
 }
 
 #[derive(Clone, Debug)]
@@ -108,7 +113,7 @@ impl Stream {
         struct BlockBuilder {
             instructions: Vec<(LocalId, Instruction)>,
             terminator: Option<(LocalId, Terminator)>,
-            hint_normalize: bool,
+            barrier: Option<BarrierId>,
         }
 
         impl BlockBuilder {
@@ -116,7 +121,7 @@ impl Stream {
                 Self {
                     instructions: Vec::new(),
                     terminator: None,
-                    hint_normalize: false,
+                    barrier: None,
                 }
             }
 
@@ -128,7 +133,7 @@ impl Stream {
                 Block {
                     instructions,
                     terminator: self.terminator.take().unwrap(),
-                    hint_normalize: std::mem::take(&mut self.hint_normalize),
+                    barrier: std::mem::take(&mut self.barrier),
                 }
             }
         }
@@ -146,8 +151,13 @@ impl Stream {
                 StreamElement::Instruction(id, instruction) => {
                     block_builder.instructions.push((id, instruction));
                 }
-                StreamElement::Hint(Hint::Normalize) => {
-                    block_builder.hint_normalize = true;
+                StreamElement::Hint(hint) => {
+                    let barrier_id = match hint {
+                        // Legacy: treat _hint_normalize() as barrier with ID [0]
+                        Hint::Normalize => BarrierId::new(vec![0]),
+                        Hint::Barrier(id) => id,
+                    };
+                    block_builder.barrier = Some(barrier_id);
                 }
                 StreamElement::Terminator(id, terminator) => {
                     block_builder.terminator = Some((id, terminator));
