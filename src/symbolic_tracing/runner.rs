@@ -212,8 +212,8 @@ pub fn run_traced(
         // Always trace (cache disabled)
         stats.cache_misses += 1;
 
-        // Execute with tracing
-        let tracer = TracingInterpreter::new(fixed_env, Some(pending_state.path.clone()));
+        // Execute with tracing (fast mode - no symbolic tracking since cache is disabled)
+        let tracer = TracingInterpreter::new_fast(fixed_env, Some(pending_state.path.clone()));
         let result = tracer.interpret(cfg.clone(), pending_state.state.clone())?;
 
         stats.forced_choices += result.forced_choices;
@@ -333,11 +333,11 @@ pub fn run_traced_parallel(
         stats.states_processed += batch_size;
         stats.cache_misses += batch_size;
 
-        // Process batch in parallel
+        // Process batch in parallel (fast mode - no symbolic tracking since cache is disabled)
         let results: Vec<Result<TraceResult>> = batch
             .into_par_iter()
             .map(|pending_state| {
-                let tracer = TracingInterpreter::new(fixed_env, Some(pending_state.path.clone()));
+                let tracer = TracingInterpreter::new_fast(fixed_env, Some(pending_state.path.clone()));
                 let result = tracer.interpret(cfg.clone(), pending_state.state.clone())?;
 
                 // Compute next exploration if needed

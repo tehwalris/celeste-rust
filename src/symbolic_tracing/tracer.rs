@@ -111,8 +111,12 @@ pub struct TracingInterpreter<'a> {
     previous_block: Option<Label>,
     /// Resume instruction index (skip this many non-phi instructions when entering a block)
     resume_instruction_index: usize,
+    /// Number of function calls made
+    function_calls: usize,
 
-    // === Symbolic tracking ===
+    // === Symbolic tracking (only used when track_symbols is true) ===
+    /// Whether to track symbolic expressions (disabled for fast mode)
+    track_symbols: bool,
     /// Generator for fresh symbol IDs
     symbol_gen: SymbolGenerator,
     /// Symbolic expressions for local variables (indexed by LocalId raw value)
@@ -127,13 +131,21 @@ pub struct TracingInterpreter<'a> {
     concrete_branch_conditions: Vec<SymExpr>,
     /// HeapIds that were allocated during tracing
     allocated_heap_ids: Vec<HeapId>,
-    /// Number of function calls made
-    function_calls: usize,
 }
 
 impl<'a> TracingInterpreter<'a> {
-    /// Create a new tracing interpreter.
+    /// Create a new tracing interpreter with symbolic tracking enabled.
     pub fn new(fixed_env: &'a FixedEnv, path: Option<PathCounter>) -> Self {
+        Self::new_inner(fixed_env, path, true)
+    }
+
+    /// Create a new tracing interpreter in "fast mode" - no symbolic tracking.
+    /// Use this when caching is disabled and we only need path enumeration.
+    pub fn new_fast(fixed_env: &'a FixedEnv, path: Option<PathCounter>) -> Self {
+        Self::new_inner(fixed_env, path, false)
+    }
+
+    fn new_inner(fixed_env: &'a FixedEnv, path: Option<PathCounter>, track_symbols: bool) -> Self {
         Self {
             fixed_env,
             state: State::new(), // Will be replaced in interpret()
@@ -147,7 +159,9 @@ impl<'a> TracingInterpreter<'a> {
             current_block: None,
             previous_block: None,
             resume_instruction_index: 0,
+            function_calls: 0,
             // Symbolic tracking
+            track_symbols,
             symbol_gen: SymbolGenerator::new(),
             local_symbols: Vec::new(),
             heap_symbols: Vec::new(),
@@ -155,7 +169,6 @@ impl<'a> TracingInterpreter<'a> {
             path_conditions: Vec::new(),
             concrete_branch_conditions: Vec::new(),
             allocated_heap_ids: Vec::new(),
-            function_calls: 0,
         }
     }
 
@@ -168,12 +181,14 @@ impl<'a> TracingInterpreter<'a> {
         self.current_block = None;
         self.previous_block = None;
 
-        // Pre-allocate heap_symbols to avoid resizing during tracing
-        let heap_size = self.state.heap.len();
-        self.heap_symbols.resize(heap_size, None);
+        if self.track_symbols {
+            // Pre-allocate heap_symbols to avoid resizing during tracing
+            let heap_size = self.state.heap.len();
+            self.heap_symbols.resize(heap_size, None);
 
-        // Initialize input symbols for all heap values reachable from globals
-        self.initialize_input_symbols();
+            // Initialize input symbols for all heap values reachable from globals
+            self.initialize_input_symbols();
+        }
 
         // Main interpretation loop
         loop {
@@ -215,9 +230,11 @@ impl<'a> TracingInterpreter<'a> {
                             // Copy value
                             let value = self.state.local_env.get(source_local_id).clone();
                             self.state.local_env.set(*local_id, value);
-                            // Copy symbol
-                            if let Some(sym) = self.get_local_symbol_opt(source_local_id) {
-                                self.set_local_symbol(*local_id, sym);
+                            // Copy symbol (only if tracking)
+                            if self.track_symbols {
+                                if let Some(sym) = self.get_local_symbol_opt(source_local_id) {
+                                    self.set_local_symbol(*local_id, sym);
+                                }
                             }
                         }
                         _ => return Err(anyhow!("Expected Phi instruction")),
@@ -325,21 +342,24 @@ impl<'a> TracingInterpreter<'a> {
 
                     if is_forced {
                         self.forced_choices += 1;
-                        // Record path condition for abstract branches
-                        if let Some(cond_sym) = self.get_local_symbol_opt(*condition) {
-                            let path_cond = if take_true {
-                                cond_sym
-                            } else {
-                                SymExpr::Not(Arc::new(cond_sym))
-                            };
-                            self.path_conditions.push(path_cond);
+                        // Record path condition for abstract branches (only if tracking symbols)
+                        if self.track_symbols {
+                            if let Some(cond_sym) = self.get_local_symbol_opt(*condition) {
+                                let path_cond = if take_true {
+                                    cond_sym
+                                } else {
+                                    SymExpr::Not(Arc::new(cond_sym))
+                                };
+                                self.path_conditions.push(path_cond);
+                            }
                         }
                     }
 
                     // A concrete branch is only "value-dependent" if the condition's
                     // symbolic expression depends on input values. Pure constants
                     // (like `if true then`) are not value-dependent.
-                    if is_concrete {
+                    // In fast mode (no symbol tracking), we skip this tracking entirely.
+                    if is_concrete && self.track_symbols {
                         let cond_sym = self.get_local_symbol_opt(*condition);
                         let depends_on_inputs = cond_sym
                             .as_ref()
@@ -438,37 +458,46 @@ impl<'a> TracingInterpreter<'a> {
                 }
             }
             Instruction::Load { source } => {
-                let (value, sym) = match self.state.local_env.get(*source) {
+                let (value, maybe_sym) = match self.state.local_env.get(*source) {
                     Value::Pointer(heap_id) => match self.state.heap.get(*heap_id) {
-                        HeapValue::Value(value) => {
-                            // Get symbol from heap_symbols if available
-                            let sym = self.get_heap_symbol_opt(*heap_id)
-                                .unwrap_or_else(|| self.value_to_const_sym(value));
-                            (value.clone(), sym)
+                        HeapValue::Value(v) => {
+                            let cloned_value = v.clone();
+                            // Get symbol from heap_symbols if available (only if tracking)
+                            let sym = if self.track_symbols {
+                                Some(self.get_heap_symbol_opt(*heap_id)
+                                    .unwrap_or_else(|| self.value_to_const_sym(&cloned_value)))
+                            } else {
+                                None
+                            };
+                            (cloned_value, sym)
                         }
                         HeapValue::Closure(_, _) | HeapValue::BuiltinFun(_) => {
-                            (Value::Pointer(*heap_id), SymExpr::pointer(*heap_id))
+                            (Value::Pointer(*heap_id), None)
                         }
                         HeapValue::ObjectTable(_)
                         | HeapValue::ArrayTable(_)
                         | HeapValue::UnknownTable => {
-                            (Value::Pointer(*heap_id), SymExpr::pointer(*heap_id))
+                            (Value::Pointer(*heap_id), None)
                         }
                     },
                     Value::NilPointer(hint) => {
-                        (Value::Nil(Some(format!("nil pointer to {}", hint))), SymExpr::nil())
+                        (Value::Nil(Some(format!("nil pointer to {}", hint))), None)
                     }
                     value => return Err(anyhow!("Load from non-pointer: {:?}", value)),
                 };
                 self.state.local_env.set(local_id, value);
-                self.set_local_symbol(local_id, sym);
+                if let Some(sym) = maybe_sym {
+                    self.set_local_symbol(local_id, sym);
+                }
             }
             Instruction::Store { target, source } => {
                 let heap_id = self.get_heap_id(*target)?;
                 let source_value = self.state.local_env.get(*source).clone();
-                let source_sym = self.get_local_symbol(*source);
                 self.state.heap.set(heap_id, HeapValue::Value(source_value));
-                self.set_heap_symbol(heap_id, source_sym);
+                if self.track_symbols {
+                    let source_sym = self.get_local_symbol(*source);
+                    self.set_heap_symbol(heap_id, source_sym);
+                }
             }
             Instruction::StoreEmptyTable { target } => {
                 let heap_id = self.get_heap_id(*target)?;
@@ -553,37 +582,49 @@ impl<'a> TracingInterpreter<'a> {
             }
             Instruction::NumberConstant { value } => {
                 self.state.local_env.set(local_id, Value::Number(MaybeVector::Scalar(*value)));
-                self.set_local_symbol(local_id, SymExpr::num(*value));
+                if self.track_symbols {
+                    self.set_local_symbol(local_id, SymExpr::num(*value));
+                }
             }
             Instruction::BoolConstant { value } => {
                 self.state.local_env.set(local_id, Value::Bool(MaybeVector::Scalar(*value)));
-                self.set_local_symbol(local_id, SymExpr::bool(*value));
+                if self.track_symbols {
+                    self.set_local_symbol(local_id, SymExpr::bool(*value));
+                }
             }
             Instruction::StringConstant { value } => {
                 self.state.local_env.set(local_id, Value::String(value.clone()));
-                self.set_local_symbol(local_id, SymExpr::Const(ConcreteValue::String(Arc::new(value.clone()))));
+                if self.track_symbols {
+                    self.set_local_symbol(local_id, SymExpr::Const(ConcreteValue::String(Arc::new(value.clone()))));
+                }
             }
             Instruction::NilConstant => {
                 self.state.local_env.set(local_id, Value::Nil(None));
-                self.set_local_symbol(local_id, SymExpr::nil());
+                if self.track_symbols {
+                    self.set_local_symbol(local_id, SymExpr::nil());
+                }
             }
             Instruction::UnaryOp { op, arg } => {
                 let arg_val = self.state.local_env.get(*arg);
                 let result = crate::interpreter::op::interpret_unary_op(&self.state, *op, arg_val)?;
-                let arg_sym = self.get_local_symbol(*arg);
-                let result_sym = self.build_unary_sym(*op, arg_sym);
                 self.state.local_env.set(local_id, result);
-                self.set_local_symbol(local_id, result_sym);
+                if self.track_symbols {
+                    let arg_sym = self.get_local_symbol(*arg);
+                    let result_sym = self.build_unary_sym(*op, arg_sym);
+                    self.set_local_symbol(local_id, result_sym);
+                }
             }
             Instruction::BinaryOp { left, op, right } => {
                 let left_val = self.state.local_env.get(*left);
                 let right_val = self.state.local_env.get(*right);
                 let result = crate::interpreter::op::interpret_binary_op(left_val, *op, right_val)?;
-                let left_sym = self.get_local_symbol(*left);
-                let right_sym = self.get_local_symbol(*right);
-                let result_sym = self.build_binary_sym(left_sym, *op, right_sym);
                 self.state.local_env.set(local_id, result);
-                self.set_local_symbol(local_id, result_sym);
+                if self.track_symbols {
+                    let left_sym = self.get_local_symbol(*left);
+                    let right_sym = self.get_local_symbol(*right);
+                    let result_sym = self.build_binary_sym(left_sym, *op, right_sym);
+                    self.set_local_symbol(local_id, result_sym);
+                }
             }
             Instruction::Phi { .. } => {
                 return Err(anyhow!("Phi nodes should not appear in tracing"));
