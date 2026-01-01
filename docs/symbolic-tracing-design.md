@@ -244,27 +244,34 @@ This means we can't predict `concrete_path` without actually tracing. The potent
    - Solution: Use Vec<Option<SymExpr>> indexed by LocalId
    - Result: Frame 28: 22.8s → 21.7s (5% faster)
 
+4. **Vec for heap_symbols + heap freeze** (commit 6b379b1)
+   - Problem: heap_symbols HashMap overhead, input_heap_ids HashSet unused
+   - Solution: Use Vec<Option<SymExpr>> indexed by HeapId, pre-allocate Vec,
+     freeze heap before tracing for fast get_opt (Vec lookup instead of HashMap)
+   - Result: Frame 28: 21.7s → 18.4s (15% faster)
+
 **Current state** (after optimizations):
 | Frame | Ref (ms) | Sym (ms) | Ratio |
 |-------|----------|----------|-------|
-| 28    | 4,556    | 21,677   | 4.8x  |
+| 28    | 4,706    | 18,376   | 3.9x  |
 
 Profile breakdown (current):
-- **Cloning** (Vec, String): 9%
-- **Hashing** (HashMap, im-rs HAMT): 9%
-- **Memory allocation** (malloc/free): 7%
-- **Dropping**: 4%
-- **Heap::get_opt** (im-rs lookup): 2%
-- **Actual interpretation**: ~4%
+- **Hashing** (im-rs HAMT operations): ~17%
+- **Bitmap iteration** (im-rs internal): ~8%
+- **HAMT insert**: ~5%
+- **Heap::get_opt**: ~4%
+- **LocalEnv::set/get**: ~5%
+- **String cloning**: ~3%
+- **Memory allocation** (malloc/free): ~3.5%
+- **TracingInterpreter::interpret**: ~7%
 
-Root cause: The tracer uses the same `State` structure as the reference interpreter, which uses persistent data structures (im-rs HAMT) for vectorized execution. This adds overhead for scalar tracing.
+Root cause: The tracer uses the same `State` structure as the reference interpreter, which uses persistent data structures (im-rs HAMT) for the Heap and LocalEnv. This adds overhead for scalar tracing where we don't benefit from structural sharing.
 
 ### Next Steps
 
 1. **Further data structure optimizations**:
    - Use simpler (non-persistent) heap for scalar tracing
-   - Replace HashMap with Vec for local_symbols (LocalId is usize)
-   - Replace HashMap with Vec for heap_symbols (HeapId is usize)
+   - Consider custom LocalEnv for tracer with Vec storage
 
 2. **Alternative caching strategy**: Instead of templates, explore:
    - Post-hoc caching (store by full path, accept ~2x reuse factor)
