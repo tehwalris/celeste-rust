@@ -1,6 +1,5 @@
-use std::collections::HashMap;
-
 use itertools::Itertools;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use super::heap::HeapId;
@@ -117,7 +116,7 @@ impl Value {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HeapValue {
     Value(Value),
-    ObjectTable(HashMap<String, HeapId>),
+    ObjectTable(FxHashMap<String, HeapId>),
     ArrayTable(Vec<HeapId>),
     UnknownTable,
     Closure(GlobalId, Vec<Value>),

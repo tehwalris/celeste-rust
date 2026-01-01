@@ -241,47 +241,35 @@ The barrier-based executor is implemented and verified correct in `src/interpret
 
 ### Key Implementation Details
 
-1. **PathCounter Threading**: PathCounter passes through ALL function call levels via `interpret_call_with_path_counter()` and `run_cfg_to_completion()`.
+1. **PathCounter Threading**: PathCounter passes through ALL function call levels via `interpret_call_with_path_counter()` and `run_cfg_to_barrier_or_completion()`.
 
 2. **PHI Node Handling**: Must track `incoming_label` (source block) separately from `current_block_label` (current block). Uses fake `"__entry"` label for blocks entered from CFG entry point.
 
-3. **Verified Correctness**: Produces identical state counts to flow-based executor:
-   - Frame 25: 24, Frame 26: 204, Frame 27: 878, Frame 28: 2864
+3. **Barriers Inside Function Calls**: When a barrier is hit inside a nested function call, execution yields back with a `CallStack` that records where to resume. The `ResumeContext` structure tracks:
+   - `top_level_resume_block` and `top_level_instruction_index`: Where to resume in the top-level CFG
+   - `call_stack`: Stack of `CallFrame`s representing suspended function calls
+
+4. **Resume Context Keying**: States at the same barrier but with different resume contexts (e.g., called from different call sites) are kept separate and not merged. This is critical for correctness - states with different call stacks cannot be merged.
+
+5. **Verified Correctness**: Produces identical state counts to flow-based executor:
+   - Frame 25: 24, Frame 26: 204, Frame 27: 878, Frame 28: 2864, Frame 29: 7260, Frame 30: 15250
 
 ### Performance Status
 
-After optimization (including FxHasher for all im::HashMap instances), barrier-based is **~32% faster than flow-based at Frame 28**:
+Barrier-based is currently **slower** than flow-based at larger frames due to the overhead of tracking call stacks and resume contexts:
 
-| Frame | Barrier | Flow | Notes |
+| Frame | Barrier | Flow | Ratio |
 |-------|---------|------|-------|
-| 25 | 28ms | 14ms | Flow 50% faster |
-| 26 | 115ms | 128ms | Barrier 10% faster |
-| 27 | 481ms | 825ms | Barrier 42% faster |
-| 28 | 2.1s | 3.1s | Barrier 32% faster |
-| 29 | ~8s | ~8s | Similar (path explosion starts hurting) |
-| 30 | ~25s | ~19s | Flow 32% faster |
+| 27 | 1.2s | 0.8s | 1.5x slower |
+| 28 | 6.8s | 3.1s | 2.2x slower |
+| 29 | 28s | 5.0s | 5.6x slower |
+| 30 | 75s | 11.2s | 6.7x slower |
 
-At higher frames, the path explosion becomes problematic: 12572 → 53434 → 180008 paths at frames 28/29/30.
-
-### KNOWN LIMITATION: Barriers Inside Function Calls Are Ignored!
-
-**Critical issue**: The current implementation does NOT yield at barriers inside function calls.
-
-When `run_to_next_barrier` encounters a Call instruction, it calls `interpret_call_with_path_counter`,
-which uses `run_cfg_to_completion`. This function runs the **entire function to completion ignoring all barriers**!
-
-As a result:
-- The `_hint_normalize()` calls inside `_update()` and `_draw()` produce `Hint::Barrier(BarrierId([0]))`
-- But these are never yielded at because they're inside function calls
-- We only see the END barrier ([-2147483648]) at frame boundaries
-- All path explosion happens between START and END with no intermediate merging
-
-**This is why barrier-based loses at larger frames** - it's essentially doing no intermediate vectorization!
-
-To fix this, we need to either:
-1. **Propagate barrier yields through the call stack** (complex - requires suspending/resuming calls)
-2. **Inline all function calls** (would make CFG huge)
-3. **Add barriers at the frame-CFG level** (workaround - add `__barrier` between function calls)
+The barrier-based approach is slower because:
+1. It processes barriers in strict order, which serializes some work
+2. There's overhead from tracking and cloning ResumeContext/CallStack structures
+3. The PathCounter enumeration approach is less efficient than flow-based fixed-point iteration
+4. States with different resume contexts can't be merged, reducing vectorization benefits
 
 ### Optimizations Applied
 

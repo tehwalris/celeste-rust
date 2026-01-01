@@ -2,7 +2,8 @@
 //! Used to mark and transform heap values (e.g., make player position abstract).
 //! Also provides state summarization for debugging and visualization.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
+use rustc_hash::FxHashMap;
 use std::fmt;
 use std::io::{BufRead, Write};
 
@@ -187,7 +188,7 @@ impl<'a> StateHelper<'a> {
     }
 
     /// Extract a number from an object table field
-    fn extract_field_num(&self, obj: &HashMap<String, HeapId>, field: &str) -> Option<NumOrInterval> {
+    fn extract_field_num(&self, obj: &FxHashMap<String, HeapId>, field: &str) -> Option<NumOrInterval> {
         let heap_id = *obj.get(field)?;
         self.extract_num(heap_id)
     }
@@ -355,7 +356,7 @@ impl<'a> StateHelper<'a> {
     }
 
     /// Load a global as an object table
-    pub fn load_global_object(&self, name: &str) -> Option<&HashMap<String, HeapId>> {
+    pub fn load_global_object(&self, name: &str) -> Option<&FxHashMap<String, HeapId>> {
         let id = self.find_global(name)?;
         match self.load(id) {
             HeapValue::ObjectTable(table) => Some(table),
@@ -425,13 +426,13 @@ impl<'a> StateHelper<'a> {
 /// Marks to apply when making state abstract
 pub struct HeapMarks {
     /// Map from mark name to set of heap IDs that should get that mark
-    pub marks: HashMap<String, HashSet<HeapId>>,
+    pub marks: FxHashMap<String, HashSet<HeapId>>,
 }
 
 impl HeapMarks {
     pub fn new() -> Self {
         Self {
-            marks: HashMap::new(),
+            marks: FxHashMap::default(),
         }
     }
 

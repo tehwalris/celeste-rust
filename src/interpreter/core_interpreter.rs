@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use super::{
     fixed_env::FixedEnv,
@@ -165,7 +165,7 @@ impl<'a> CoreInterpreter<'a> {
                             fields.insert(field.clone(), field_heap_id);
                         }
                         HeapValue::UnknownTable => {
-                            let mut fields = HashMap::new();
+                            let mut fields = FxHashMap::default();
                             fields.insert(field.clone(), field_heap_id);
                             self.state
                                 .heap

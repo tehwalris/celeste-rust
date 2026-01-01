@@ -1,5 +1,6 @@
-use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
+
+use rustc_hash::FxHashMap;
 
 use im::HashMap as ImHashMap;
 use rustc_hash::FxHasher;
@@ -145,7 +146,7 @@ impl State {
     /// 2. Assign new HeapIds in the order values are visited
     /// 3. Create a compacted heap with only reachable values
     pub fn gc(&mut self) {
-        let mut old_to_new: HashMap<HeapId, HeapId> = HashMap::new();
+        let mut old_to_new: FxHashMap<HeapId, HeapId> = FxHashMap::default();
         let mut new_heap_values: Vec<HeapValue> = Vec::new();
 
         // Visit a heap ID, assigning a new ID if not yet visited
@@ -153,7 +154,7 @@ impl State {
         fn visit(
             old_id: HeapId,
             old_heap: &Heap,
-            old_to_new: &mut HashMap<HeapId, HeapId>,
+            old_to_new: &mut FxHashMap<HeapId, HeapId>,
             new_heap_values: &mut Vec<HeapValue>,
         ) -> HeapId {
             if let Some(&new_id) = old_to_new.get(&old_id) {
@@ -204,7 +205,7 @@ impl State {
                     // IMPORTANT: Sort keys for deterministic traversal order!
                     let mut keys: Vec<_> = table.keys().cloned().collect();
                     keys.sort();
-                    let new_table: std::collections::HashMap<String, HeapId> = keys
+                    let new_table: FxHashMap<String, HeapId> = keys
                         .into_iter()
                         .map(|k| {
                             let v = table[&k];
