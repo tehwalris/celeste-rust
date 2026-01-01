@@ -2783,4 +2783,81 @@ __reset_button_states()
         assert_eq!(result_states[0].0.vector_size, 2,
                    "Expected vector_size=2 for the x variable");
     }
+
+    #[test]
+    fn test_barrier_syntax_works_like_hint_normalize() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // Test that __barrier({1}) works the same as _hint_normalize()
+        let code = r#"
+            local x = 0
+            if __new_unknown_boolean() then
+                x = 1
+            else
+                x = 2
+            end
+            __barrier({1})
+            __print(x)
+        "#;
+
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        // With barrier, states should be merged just like with hint_normalize
+        assert_eq!(result_states.len(), 1, "Expected states to be merged by __barrier");
+        assert_eq!(result_states[0].0.vector_size, 2, "Expected vectorized state with size 2");
+    }
+
+    #[test]
+    fn test_barrier_with_multiple_ids() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        // Test that __barrier({1, 2, 3}) parses correctly
+        let code = r#"
+            local x = 0
+            if __new_unknown_boolean() then
+                x = 1
+            else
+                x = 2
+            end
+            __barrier({1, 2, 3})
+            __print(x)
+        "#;
+
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        // Verify the barrier ID is correct by checking the entry block's barrier
+        assert!(cfg.entry.barrier.is_none(), "Entry block should not have a barrier");
+
+        // The block after the conditional should have the barrier
+        let barrier_block = cfg.named.values().find(|b| b.barrier.is_some());
+        assert!(barrier_block.is_some(), "Expected a block with a barrier");
+        let barrier_id = barrier_block.unwrap().barrier.as_ref().unwrap();
+        assert_eq!(barrier_id.0, vec![1, 2, 3], "Expected barrier ID [1, 2, 3]");
+
+        // Also verify it works at runtime
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        assert_eq!(result_states.len(), 1, "Expected states to be merged by __barrier");
+        assert_eq!(result_states[0].0.vector_size, 2, "Expected vectorized state with size 2");
+    }
 }

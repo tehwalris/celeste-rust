@@ -228,6 +228,82 @@ impl Compiler {
         ));
     }
 
+    /// Parse the arguments to __barrier({1, 2, 3}) and extract the barrier ID tuple
+    fn parse_barrier_args(&self, call: &ast::FunctionCall) -> Result<BarrierId> {
+        use full_moon::ast::{Call, FunctionArgs, Suffix};
+
+        let suffixes: Vec<_> = call.suffixes().collect();
+        if suffixes.len() != 1 {
+            bail!("__barrier expects exactly one argument group");
+        }
+
+        let args = match &suffixes[0] {
+            Suffix::Call(Call::AnonymousCall(FunctionArgs::Parentheses {
+                parentheses: _,
+                arguments,
+            })) => arguments,
+            Suffix::Call(Call::AnonymousCall(FunctionArgs::TableConstructor(table))) => {
+                // __barrier{1, 2, 3} syntax (no parentheses)
+                return self.parse_barrier_table(table);
+            }
+            _ => bail!("__barrier expects parenthesized arguments or table constructor"),
+        };
+
+        // Should have exactly one argument: the table constructor
+        let args_vec: Vec<_> = args.iter().collect();
+        if args_vec.len() != 1 {
+            bail!("__barrier expects exactly one table argument, got {}", args_vec.len());
+        }
+
+        match args_vec[0] {
+            ast::Expression::TableConstructor(table) => self.parse_barrier_table(table),
+            _ => bail!("__barrier argument must be a table constructor like {{1, 2, 3}}"),
+        }
+    }
+
+    /// Parse a table constructor {1, 2, 3} into a BarrierId
+    fn parse_barrier_table(&self, table: &ast::TableConstructor) -> Result<BarrierId> {
+        let mut ids = Vec::new();
+        for field in table.fields() {
+            match field {
+                ast::Field::NoKey(expr) => {
+                    let value = self.parse_number_literal(expr)?;
+                    ids.push(value as i32);
+                }
+                _ => bail!("__barrier table must contain only number literals, not key-value pairs"),
+            }
+        }
+        if ids.is_empty() {
+            bail!("__barrier table must contain at least one number");
+        }
+        Ok(BarrierId::new(ids))
+    }
+
+    /// Parse a number literal expression into an i64
+    fn parse_number_literal(&self, expr: &ast::Expression) -> Result<i64> {
+        match expr {
+            ast::Expression::Number(token) => {
+                let text = match token.token_type() {
+                    full_moon::tokenizer::TokenType::Number { text } => text,
+                    _ => bail!("Expected number token"),
+                };
+                text.parse::<i64>()
+                    .map_err(|e| anyhow!("Failed to parse number '{}': {}", text, e))
+            }
+            ast::Expression::UnaryOperator { unop, expression } => {
+                // Handle negative numbers like -1
+                match unop {
+                    ast::UnOp::Minus(_) => {
+                        let value = self.parse_number_literal(expression)?;
+                        Ok(-value)
+                    }
+                    _ => bail!("Unsupported unary operator in barrier argument"),
+                }
+            }
+            _ => bail!("__barrier table must contain only number literals"),
+        }
+    }
+
     fn compile_identifier(
         &mut self,
         identifier: &str,
@@ -1065,9 +1141,21 @@ impl Compiler {
             }
             ast::Stmt::FunctionCall(call) => {
                 if let ast::Prefix::Name(name) = call.prefix() {
-                    if identifier_from_token_reference(name)? == "_hint_normalize" {
+                    let fn_name = identifier_from_token_reference(name)?;
+
+                    // Legacy _hint_normalize() support
+                    if fn_name == "_hint_normalize" {
                         return Ok((
                             Stream::from_element(StreamElement::Hint(Hint::Normalize)),
+                            locals,
+                        ));
+                    }
+
+                    // New __barrier({1, 2, 3}) syntax
+                    if fn_name == "__barrier" {
+                        let barrier_id = self.parse_barrier_args(call)?;
+                        return Ok((
+                            Stream::from_element(StreamElement::Hint(Hint::Barrier(barrier_id))),
                             locals,
                         ));
                     }
