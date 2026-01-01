@@ -17,6 +17,7 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use anyhow::Result;
 use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 
 use crate::interpreter::{
     fixed_env::FixedEnv,
@@ -27,7 +28,7 @@ use crate::interpreter::{
 };
 use crate::ir::Cfg;
 
-use super::{PathCounter, TraceCache, TracingInterpreter};
+use super::{CachedTrace, PathCounter, TraceCache, TracingInterpreter};
 
 /// Split a vectorized state (vector_size > 1) into individual scalar states.
 /// Each returned state has vector_size = 1.
@@ -408,4 +409,216 @@ pub fn run_traced_parallel(
     }
 
     Ok((output_states, stats))
+}
+
+/// Cache key for simple (shape, abstract_path) caching.
+/// Since concrete_branches = 0, this uniquely identifies a trace.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SimpleCacheKey {
+    shape: StateShape,
+    abstract_path: Vec<(usize, usize)>,
+}
+
+/// Runs multiple states through a CFG using symbolic tracing with full path caching.
+///
+/// This version caches by (shape, abstract_path, concrete_path) using the template
+/// system to compute concrete_path for new states.
+pub fn run_traced_parallel_cached(
+    cfg: Arc<Cfg>,
+    input_states: Vec<State>,
+    fixed_env: &FixedEnv,
+    cache: &mut TraceCache,
+) -> Result<(Vec<State>, RunStats)> {
+    let mut stats = RunStats::default();
+    let mut output_states: Vec<State> = Vec::new();
+
+    // Track seen (shape, path) pairs for statistics
+    let mut seen_shape_paths: HashSet<(StateShape, Vec<(usize, usize)>)> = HashSet::new();
+    let mut seen_full_paths: HashSet<(StateShape, Vec<(usize, usize)>, Vec<bool>)> = HashSet::new();
+
+    // Initialize pending states
+    let mut pending: Vec<PendingState> = Vec::new();
+    for state in input_states {
+        let concrete_states = split_vectorized_state(state);
+        for mut concrete_state in concrete_states {
+            debug_assert_eq!(concrete_state.vector_size, 1, "State should be concrete after splitting");
+            concrete_state.heap.freeze();
+            let shape = debug_shape_of_state(&concrete_state);
+            pending.push(PendingState {
+                state: concrete_state,
+                path: PathCounter::new(),
+                shape,
+            });
+        }
+    }
+
+    // Process states one at a time (to maintain cache consistency)
+    while !pending.is_empty() {
+        let batch: Vec<_> = std::mem::take(&mut pending);
+        let batch_size = batch.len();
+
+        // Track stats for potential cache hits
+        for ps in &batch {
+            let shape_path_key = (ps.shape.clone(), ps.path.choices().to_vec());
+            if seen_shape_paths.contains(&shape_path_key) {
+                stats.potential_cache_hits += 1;
+            } else {
+                seen_shape_paths.insert(shape_path_key);
+                stats.unique_shape_paths += 1;
+            }
+        }
+        stats.states_processed += batch_size;
+
+        // Check cache for each state
+        let mut cache_hits: Vec<(PendingState, CachedTrace)> = Vec::new();
+        let mut cache_misses: Vec<PendingState> = Vec::new();
+
+        for ps in batch {
+            // Try to look up using full path cache
+            let lookup_result = cache.get_full_path_debug(&ps.shape, &ps.path, &ps.state);
+            if let Some(trace) = lookup_result.trace {
+                cache_hits.push((ps, trace.clone()));
+            } else {
+                cache_misses.push(ps);
+            }
+        }
+
+        stats.cache_hits += cache_hits.len();
+        stats.cache_misses += cache_misses.len();
+
+        // Process cache hits: apply cached trace to get output
+        for (ps, trace) in cache_hits {
+            let output_state = trace.apply(&ps.state);
+            debug_assert_eq!(output_state.vector_size, 1, "Output state should be concrete");
+            output_states.push(output_state);
+            stats.output_states += 1;
+
+            // If the cached trace had forced choices, we need to explore other paths
+            if trace.forced_choices > 0 {
+                let mut next_path = trace.path.clone();
+                if next_path.increment() {
+                    pending.push(PendingState {
+                        state: ps.state,
+                        path: next_path,
+                        shape: ps.shape,
+                    });
+                }
+            }
+        }
+
+        // Process cache misses in parallel (with symbol tracking for caching)
+        if !cache_misses.is_empty() {
+            let results: Vec<Result<TraceResultWithCache>> = cache_misses
+                .into_par_iter()
+                .map(|pending_state| {
+                    // Use symbolic tracking mode for caching
+                    let tracer = TracingInterpreter::new(fixed_env, Some(pending_state.path.clone()));
+                    let result = tracer.interpret(cfg.clone(), pending_state.state.clone())?;
+
+                    // Create cached trace for later reuse
+                    let cached_trace = CachedTrace {
+                        path: result.path.clone(),
+                        concrete_path: result.concrete_path.clone(),
+                        forced_choices: result.forced_choices,
+                        concrete_branches: result.concrete_branches,
+                        output_state: result.output_state.clone(),
+                        heap_symbols: result.heap_symbols,
+                        input_symbols: result.input_symbols,
+                        path_conditions: result.path_conditions,
+                        concrete_branch_conditions: result.concrete_branch_conditions,
+                        allocated_heap_ids: result.allocated_heap_ids,
+                    };
+
+                    // Compute next exploration if needed
+                    let next_exploration = if result.forced_choices > 0 {
+                        let mut next_path = result.path.clone();
+                        if next_path.increment() {
+                            Some((pending_state.state, next_path, pending_state.shape.clone()))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    Ok(TraceResultWithCache {
+                        output_state: result.output_state,
+                        forced_choices: result.forced_choices,
+                        concrete_branches: result.concrete_branches,
+                        function_calls: result.function_calls,
+                        path: result.path,
+                        concrete_path: result.concrete_path,
+                        next_exploration,
+                        cache_key: SimpleCacheKey {
+                            shape: pending_state.shape.clone(),
+                            abstract_path: pending_state.path.choices().to_vec(),
+                        },
+                        shape: pending_state.shape,
+                        abstract_path: pending_state.path,
+                        cached_trace,
+                    })
+                })
+                .collect();
+
+            // Collect results and update cache
+            for result in results {
+                let result = result?;
+
+                stats.forced_choices += result.forced_choices;
+                stats.new_traces += 1;
+                stats.total_concrete_branches += result.concrete_branches;
+                stats.total_function_calls += result.function_calls;
+
+                if result.concrete_branches == 0 {
+                    stats.reusable_traces += 1;
+                } else {
+                    stats.unreusable_traces += 1;
+                }
+
+                // Track unique full paths
+                let shape = result.next_exploration.as_ref()
+                    .map(|(_, _, s)| s.clone())
+                    .unwrap_or(result.cache_key.shape.clone());
+
+                let full_path_key = (
+                    shape,
+                    result.path.choices().to_vec(),
+                    result.concrete_path,
+                );
+                if !seen_full_paths.contains(&full_path_key) {
+                    seen_full_paths.insert(full_path_key);
+                    stats.unique_full_paths += 1;
+                }
+
+                // Insert into full path cache
+                cache.insert_full_path(result.shape, result.abstract_path, result.cached_trace);
+
+                debug_assert_eq!(result.output_state.vector_size, 1, "Output state should be concrete");
+                output_states.push(result.output_state);
+                stats.output_states += 1;
+
+                // Queue next exploration if needed
+                if let Some((state, path, shape)) = result.next_exploration {
+                    pending.push(PendingState { state, path, shape });
+                }
+            }
+        }
+    }
+
+    Ok((output_states, stats))
+}
+
+/// Result of tracing with cache info for the cached parallel version.
+struct TraceResultWithCache {
+    output_state: State,
+    forced_choices: usize,
+    concrete_branches: usize,
+    function_calls: usize,
+    path: PathCounter,
+    concrete_path: Vec<bool>,
+    next_exploration: Option<(State, PathCounter, StateShape)>,
+    cache_key: SimpleCacheKey,
+    shape: StateShape,
+    abstract_path: PathCounter,
+    cached_trace: CachedTrace,
 }

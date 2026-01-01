@@ -292,25 +292,40 @@ Root cause: The tracer uses the same `State` structure as the reference interpre
 
 Stats from frame 28 (2,864 expanded states, 19,092 traces):
 - Unique (shape, abstract_path) pairs: 305
-- Unique (shape, abstract_path, concrete_path) tuples: 410
-- Potential cache hits: 18,787 (98.4%)
+- Unique (shape, abstract_path, concrete_path) tuples: 410 (fast mode) / 6,794 (symbolic mode)
+- Potential cache hits: 18,787 (98.4%) by (shape, abstract_path)
 
-This suggests massive opportunity for caching, but:
-- Caching by (shape, abstract_path) fails because concrete_path varies
-- Caching by (shape, abstract_path, concrete_path) requires symbolic evaluation
-  to reconstruct output for different input values
-- Without symbolic tracking (fast mode), we can't reconstruct outputs
+**Key insight**: The "0 concrete branches" stat in fast mode is misleading - fast mode simply doesn't track them. With symbolic tracking enabled, there are ~216 concrete branches per trace on average.
+
+This means:
+- (shape, abstract_path) does NOT uniquely identify a trace
+- Template-based prediction fails because different values lead to different branch sequences
+- Even with templates, only ~5,292 traces are cached vs. 6,794 unique full paths
+
+**Attempted caching implementation** (commit run_traced_parallel_cached):
+- Uses full-path caching by (shape, abstract_path, concrete_path)
+- Template system computes concrete_path by evaluating symbolic conditions
+- Result: 0% cache hit rate due to template mismatch problem
+  - First trace creates template with N conditions
+  - Subsequent traces may have M != N conditions due to different concrete paths
+  - Computed concrete_path never matches cached entries
+
+**Why caching doesn't work**:
+The fundamental issue is that branch conditions are path-dependent. Taking branch B1 leads to seeing condition C2, while taking !B1 leads to condition C3. We can't know which conditions a state will see without tracing it.
 
 ### Next Steps
 
 1. **Further data structure optimizations**:
    - Use simpler (non-persistent) heap for scalar tracing
    - Consider custom LocalEnv for tracer with Vec storage
+   - These could improve tracer performance directly
 
-2. **Hybrid symbolic tracking**:
-   - Enable symbol tracking only when potential cache hit rate is high
-   - Fast mode for exploration, symbolic mode for caching
+2. **Alternative caching approaches**:
+   - **Hash-based memoization**: Cache by hash of input values (exact matches only)
+   - **Post-hoc deduplication**: After tracing, deduplicate outputs before GC/vectorization
+   - **Block-level caching**: Cache at smaller code units with less path dependence
 
-3. **Alternative approaches**:
-   - Block-level caching (smaller units, less path dependence)
-   - Trace by abstract path first, then split on concrete branches
+3. **Vectorized symbolic execution**:
+   - Instead of tracing scalars, trace with vector values
+   - Split only at concrete branches
+   - This is essentially what the reference interpreter does
