@@ -2,11 +2,16 @@
 //!
 //! This orchestrates the execution of many states, managing:
 //! - Path exploration (using PathCounter)
-//! - Cache lookups and insertions
+//! - Cache lookups (checking path conditions for cache hits)
+//! - Cache insertions (storing traces for reuse)
 //! - Tracking which states need more exploration
 //!
-//! Key design: NO VECTORIZATION. Every state has vector_size = 1.
-//! Efficiency comes from cache hits, not from merging states.
+//! ## Caching Strategy
+//!
+//! The cache maps (shape, abstract_path) to a list of traces. Each trace includes
+//! path conditions (symbolic boolean expressions that were true during tracing).
+//! When looking up, we check if the input state satisfies any cached trace's
+//! path conditions. If so, we can reuse the trace instead of re-executing.
 
 use std::collections::{HashSet, VecDeque};
 use anyhow::Result;
@@ -105,6 +110,10 @@ pub struct RunStats {
     pub unique_shape_paths: usize,
     /// Number of potential cache hits (same shape+path seen again)
     pub potential_cache_hits: usize,
+    /// Number of traces with no concrete branches (reusable).
+    pub reusable_traces: usize,
+    /// Number of traces with concrete branches (not reusable).
+    pub unreusable_traces: usize,
 }
 
 impl RunStats {
@@ -119,6 +128,8 @@ impl RunStats {
             output_states: self.output_states + other.output_states,
             unique_shape_paths: self.unique_shape_paths + other.unique_shape_paths,
             potential_cache_hits: self.potential_cache_hits + other.potential_cache_hits,
+            reusable_traces: self.reusable_traces + other.reusable_traces,
+            unreusable_traces: self.unreusable_traces + other.unreusable_traces,
         }
     }
 }
@@ -175,47 +186,25 @@ pub fn run_traced(
             stats.unique_shape_paths += 1;
         }
 
-        // CACHE DISABLED - Fundamental design limitation:
+        // TODO: Cache hits are disabled because apply() doesn't handle allocations.
         //
-        // The cache key (shape, path) is insufficient to guarantee identical execution.
-        // The 'path' only records ABSTRACT branches (UnknownBool conditions), but
-        // CONCRETE branches (based on actual values like `x > 5`) are not tracked.
+        // The issue: When a trace allocates new heap entries, those HeapIds are
+        // specific to that trace. When applying to a different input state, the
+        // HeapIds don't exist or point to different things.
         //
-        // Two states with the same shape and path can take different concrete branches
-        // if their actual values differ. This leads to:
-        // 1. Different output heap structures
-        // 2. Different types in symbolic expressions (e.g., Number vs Pointer)
-        // 3. Type errors when applying cached expressions to different states
+        // To fix this, we need to:
+        // 1. Track which HeapIds were allocated during tracing
+        // 2. When applying, allocate new HeapIds in the target state
+        // 3. Map old HeapIds to new HeapIds when evaluating symbolic expressions
         //
-        // To fix properly, we'd need to either:
-        // - Track ALL branches (concrete + abstract) in the path
-        // - Use path conditions that cover concrete comparisons
-        // - Only cache when the traced path has NO concrete branches
-        let cache_hit = false;
+        // For now, we just trace every time (no cache hits).
+        let _ = cache.get_matching(
+            &pending_state.shape,
+            &pending_state.path,
+            &pending_state.state,
+        );
 
-        if cache_hit {
-            let cached = cache.get(&pending_state.shape, &pending_state.path).unwrap();
-            stats.cache_hits += 1;
-            stats.forced_choices += cached.forced_choices;
-
-            // Apply the cached trace to the new input state
-            let output = cached.apply(&pending_state.state);
-            output_states.push(output);
-            stats.output_states += 1;
-
-            // If there were forced choices on this path, explore the next path
-            if cached.forced_choices > 0 {
-                let mut next_path = cached.path.clone();
-                if next_path.increment() {
-                    pending.push_back(PendingState {
-                        state: pending_state.state,
-                        path: next_path,
-                        shape: pending_state.shape,
-                    });
-                }
-            }
-            continue;
-        }
+        // Cache miss - need to trace
         stats.cache_misses += 1;
 
         // Execute with tracing
@@ -224,22 +213,24 @@ pub fn run_traced(
 
         stats.forced_choices += result.forced_choices;
 
-        // Debug: show what path was discovered (disabled)
-        // if result.forced_choices > 0 || pending_state.path.choices().is_empty() {
-        //     eprintln!("DEBUG: Traced path {:?} -> {:?} (forced={})",
-        //               pending_state.path.choices(), result.path.choices(), result.forced_choices);
-        // }
-
         // Cache the result with symbolic information
         cache.insert(
             pending_state.shape.clone(),
             result.path.clone(),
+            result.concrete_path.clone(),
             result.forced_choices,
+            result.concrete_branches,
             result.output_state.clone(),
             result.heap_symbols,
             result.input_symbols,
+            result.path_conditions,
         );
         stats.new_traces += 1;
+        if result.concrete_branches == 0 {
+            stats.reusable_traces += 1;
+        } else {
+            stats.unreusable_traces += 1;
+        }
 
         // Add output to results - should always be concrete
         debug_assert_eq!(result.output_state.vector_size, 1, "Output state should be concrete");

@@ -49,6 +49,10 @@ pub type InputSymbolMap = HashMap<SymbolId, HeapId>;
 /// Mapping from HeapId to its symbolic expression.
 pub type HeapSymbolMap = HashMap<HeapId, SymExpr>;
 
+/// Tracks the concrete (value-dependent) branch outcomes during execution.
+/// Each element is true if the branch went true, false if it went false.
+pub type ConcretePath = Vec<bool>;
+
 /// Result of tracing a concrete state through a CFG.
 #[derive(Clone, Debug)]
 pub struct TracingResult {
@@ -56,10 +60,15 @@ pub struct TracingResult {
     pub output_state: State,
     /// The return value (if the function returned a value).
     pub return_value: Option<Value>,
-    /// The path taken through the code.
+    /// The path taken through abstract branches (UnknownBool).
     pub path: PathCounter,
+    /// The outcomes of concrete (value-dependent) branches.
+    pub concrete_path: ConcretePath,
     /// Number of "forced" choices where condition was truly abstract.
     pub forced_choices: usize,
+    /// Number of concrete branches taken (value-dependent, not abstract).
+    /// If > 0, cache reuse requires matching concrete_path.
+    pub concrete_branches: usize,
     /// Symbolic expressions for output heap values (how they're computed from inputs).
     pub heap_symbols: HeapSymbolMap,
     /// Mapping from input symbols to source heap locations.
@@ -80,6 +89,10 @@ pub struct TracingInterpreter<'a> {
     choice_position: usize,
     /// Number of forced choices made
     forced_choices: usize,
+    /// Number of concrete branches taken (value-dependent decisions)
+    concrete_branches: usize,
+    /// Outcomes of concrete (value-dependent) branches
+    concrete_path: ConcretePath,
     /// Call stack
     call_stack: Vec<CallFrame>,
     /// Current CFG (None only before interpret() is called)
@@ -113,6 +126,8 @@ impl<'a> TracingInterpreter<'a> {
             path: path.unwrap_or_default(),
             choice_position: 0,
             forced_choices: 0,
+            concrete_branches: 0,
+            concrete_path: Vec::new(),
             call_stack: Vec::new(),
             current_cfg: None, // Will be set in interpret()
             current_block: None,
@@ -251,7 +266,9 @@ impl<'a> TracingInterpreter<'a> {
                             output_state: self.state,
                             return_value,
                             path: self.path,
+                            concrete_path: self.concrete_path,
                             forced_choices: self.forced_choices,
+                            concrete_branches: self.concrete_branches,
                             heap_symbols: self.heap_symbols,
                             input_symbols: self.input_symbols,
                             path_conditions: self.path_conditions,
@@ -270,7 +287,7 @@ impl<'a> TracingInterpreter<'a> {
                     false_target,
                 } => {
                     let cond_value = self.state.local_env.get(*condition).clone();
-                    let (take_true, is_forced) = self.evaluate_condition(&cond_value)?;
+                    let (take_true, is_forced, is_concrete) = self.evaluate_condition(&cond_value)?;
 
                     if is_forced {
                         self.forced_choices += 1;
@@ -282,6 +299,30 @@ impl<'a> TracingInterpreter<'a> {
                                 SymExpr::Not(Arc::new(cond_sym))
                             };
                             self.path_conditions.push(path_cond);
+                        }
+                    }
+
+                    // A concrete branch is only "value-dependent" if the condition's
+                    // symbolic expression depends on input values. Pure constants
+                    // (like `if true then`) are not value-dependent.
+                    if is_concrete {
+                        let cond_sym = self.local_symbols.get(condition);
+                        let depends_on_inputs = cond_sym
+                            .map(|sym| sym.has_inputs())
+                            .unwrap_or(false);
+                        if depends_on_inputs {
+                            self.concrete_branches += 1;
+                            self.concrete_path.push(take_true);
+                            // Also record path condition for concrete branches
+                            // This enables cache reuse by checking conditions
+                            if let Some(cond_sym) = cond_sym.cloned() {
+                                let path_cond = if take_true {
+                                    cond_sym
+                                } else {
+                                    SymExpr::Not(Arc::new(cond_sym))
+                                };
+                                self.path_conditions.push(path_cond);
+                            }
                         }
                     }
 
@@ -298,12 +339,12 @@ impl<'a> TracingInterpreter<'a> {
         }
     }
 
-    /// Evaluate a condition, returning (take_true_branch, is_forced_choice).
-    fn evaluate_condition(&mut self, value: &Value) -> Result<(bool, bool)> {
+    /// Evaluate a condition, returning (take_true_branch, is_forced_choice, is_concrete_branch).
+    fn evaluate_condition(&mut self, value: &Value) -> Result<(bool, bool, bool)> {
         match value {
             // Concrete false or nil -> take false branch
             Value::Bool(MaybeVector::Scalar(false)) | Value::Nil(_) => {
-                Ok((false, false))
+                Ok((false, false, true))
             }
             // Concrete true or truthy value -> take true branch
             Value::Number(_)
@@ -311,14 +352,14 @@ impl<'a> TracingInterpreter<'a> {
             | Value::Bool(MaybeVector::Scalar(true))
             | Value::String(_)
             | Value::Pointer(_) => {
-                Ok((true, false))
+                Ok((true, false, true))
             }
             // Abstract boolean -> need to make a choice
             Value::UnknownBool => {
                 let choice = self.path.record_choice(2, self.choice_position);
                 self.choice_position += 1;
                 let take_true = choice == 0;
-                Ok((take_true, true))
+                Ok((take_true, true, false))
             }
             // Vector of bools - shouldn't happen in scalar tracing
             Value::Bool(MaybeVector::Vector(_)) => {
@@ -708,9 +749,8 @@ impl<'a> TracingInterpreter<'a> {
                 SymExpr::Const(ConcreteValue::Pointer(*heap_id))
             }
             Value::UnknownBool => {
-                // Abstract bool - create a constant for "unknown"
-                // This shouldn't normally happen during symbol tracking
-                SymExpr::Const(ConcreteValue::Bool(false)) // Placeholder
+                // Abstract bool - preserve as UnknownBool
+                SymExpr::Const(ConcreteValue::UnknownBool)
             }
             Value::NilPointer(_) => SymExpr::nil(),
             Value::Number(MaybeVector::Vector(_))

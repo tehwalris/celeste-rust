@@ -221,6 +221,10 @@ __reset_button_states()
         println!("\nSymbolic tracing stats:");
         println!("  States processed: {}", total_stats.states_processed);
         println!("  New traces: {}", total_stats.new_traces);
+        println!("  Cache hits: {}", total_stats.cache_hits);
+        println!("  Cache misses: {}", total_stats.cache_misses);
+        println!("  Reusable traces (no concrete branches): {}", total_stats.reusable_traces);
+        println!("  Unreusable traces (has concrete branches): {}", total_stats.unreusable_traces);
         println!("  Unique (shape,path) pairs: {}", total_stats.unique_shape_paths);
         println!("  Potential cache hits: {} ({:.1}%)",
                  total_stats.potential_cache_hits,

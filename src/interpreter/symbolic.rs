@@ -23,6 +23,9 @@ pub enum ConcreteValue {
     Number(Pico8Num),
     NumberInterval(Pico8NumInterval),
     Bool(bool),
+    /// Abstract boolean - the value is unknown at trace time.
+    /// When evaluated, produces UnknownBool.
+    UnknownBool,
     String(Arc<String>),
     Nil,
     Pointer(HeapId),
@@ -185,6 +188,38 @@ impl SymExpr {
     }
     pub fn neg(a: SymExpr) -> SymExpr {
         Self::unop(SymExpr::Neg, a)
+    }
+
+    /// Check if this expression contains any Input symbols.
+    /// If false, the expression is a pure constant that doesn't depend on input values.
+    pub fn has_inputs(&self) -> bool {
+        match self {
+            SymExpr::Input(_) => true,
+            SymExpr::Const(_) => false,
+            // Unary operations
+            SymExpr::Neg(a) | SymExpr::Flr(a) | SymExpr::Abs(a) | SymExpr::Sgn(a)
+            | SymExpr::Sin(a) | SymExpr::Cos(a) | SymExpr::Sqrt(a) | SymExpr::Rnd(a)
+            | SymExpr::Tonum(a) | SymExpr::Tostr(a) | SymExpr::Chr(a) | SymExpr::Ord(a)
+            | SymExpr::Not(a) | SymExpr::Bnot(a)
+            | SymExpr::IntervalLow(a) | SymExpr::IntervalHigh(a) => a.has_inputs(),
+            // Binary operations
+            SymExpr::Add(a, b) | SymExpr::Sub(a, b) | SymExpr::Mul(a, b)
+            | SymExpr::Div(a, b) | SymExpr::Mod(a, b)
+            | SymExpr::Lt(a, b) | SymExpr::Le(a, b) | SymExpr::Gt(a, b) | SymExpr::Ge(a, b)
+            | SymExpr::Eq(a, b) | SymExpr::Ne(a, b)
+            | SymExpr::And(a, b) | SymExpr::Or(a, b)
+            | SymExpr::Band(a, b) | SymExpr::Bor(a, b) | SymExpr::Bxor(a, b)
+            | SymExpr::Shl(a, b) | SymExpr::Shr(a, b) | SymExpr::Lshr(a, b)
+            | SymExpr::Rotl(a, b) | SymExpr::Rotr(a, b)
+            | SymExpr::Min(a, b) | SymExpr::Max(a, b) | SymExpr::Atan2(a, b)
+            | SymExpr::Concat(a, b) | SymExpr::MakeInterval(a, b) => {
+                a.has_inputs() || b.has_inputs()
+            }
+            // Ternary operations
+            SymExpr::Mid(a, b, c) | SymExpr::Sub8(a, b, c) | SymExpr::IfThenElse(a, b, c) => {
+                a.has_inputs() || b.has_inputs() || c.has_inputs()
+            }
+        }
     }
 }
 
