@@ -632,7 +632,13 @@ pub fn execute_with_barriers(
         let states: Vec<State> = states_with_blocks.into_iter().map(|(s, _)| s).collect();
 
         // Vectorize the states at this barrier
-        let vectorized = vectorize_states(states);
+        let mut vectorized = vectorize_states(states);
+
+        // Freeze heaps to move values from im::HashMap overlay to Arc<Vec> base.
+        // This makes subsequent get_opt() calls O(1) instead of O(log n).
+        for state in &mut vectorized {
+            state.heap.freeze();
+        }
 
         let expanded_count: usize = vectorized.iter().map(|s| s.vector_size).sum();
         println!(

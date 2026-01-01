@@ -1,70 +1,90 @@
-# Agent Prompt: Celeste Rust Interpreter - Speed Optimization
+# Agent Prompt: Fix Barrier Executor - Barriers Inside Functions Are Ignored!
 
-You are working on a Rust abstract interpreter for PICO-8 Celeste. The goal is running the **100m room** (first room of Celeste Classic) correctly and fast.
+## The Critical Issue
 
-## Current State
+**Read first**: `docs/barrier-based-execution.md` (see "KNOWN LIMITATION" section)
 
-**Read first**: `docs/barrier-based-execution.md` (especially "Current Implementation Status" section)
+The barrier-based executor has a **critical architectural flaw**: barriers inside function calls are completely ignored!
 
-The barrier-based executor is **implemented and verified correct**. It produces identical state counts to the flow-based executor:
-- Frame 25: 24, Frame 26: 204, Frame 27: 878, Frame 28: 2864
+When `run_to_next_barrier` encounters a Call instruction, it calls `interpret_call_with_path_counter`,
+which uses `run_cfg_to_completion`. This function runs the **entire function to completion ignoring all barriers**!
 
-**The problem**: It's much slower than flow-based due to exponential path enumeration:
-- Flow-based Frame 28: 1090 states before merge (4.85s)
-- Barrier-based Frame 28: 41000 states before merge (257s)
+### Evidence
 
-## Your Task: Optimize Barrier-Based Execution
+Run with verbose output to see:
+```bash
+./safe-run.sh -- cargo run --release --bin celeste-rust -- --barrier -n 26 2>&1 | grep Barrier
+```
 
-Key optimization opportunities:
+Output shows ONLY the END barrier ([-2147483648]) - no intermediate barriers:
+```
+Barrier [-2147483648] hit=0: 1 vectorized states (1 expanded)
+Barrier [-2147483648] hit=0: 1 vectorized states (24 expanded)
+...
+```
 
-1. **Early Path Merging**: Currently states are only merged at barriers. Merge during PathCounter enumeration when states become identical (same heap, local_env structure after gc).
+But `_update()` contains `_hint_normalize()` calls which compile to `Barrier([0])`. These are never hit!
 
-2. **Parallel Lane Processing**: Currently vector lanes are processed sequentially. Use rayon to process lanes in parallel.
+### The Impact
 
-3. **Path Pruning**: Skip paths that would produce duplicate states. Hash states after each path segment.
+| Frame | Barrier | Flow | Barrier's Problem |
+|-------|---------|------|-------------------|
+| 28 | 3.1s | 4.9s | Fast (but lucky) |
+| 29 | 12.2s | 8.0s | Path explosion starts |
+| 30 | 35.5s | 18.7s | Unbounded explosion |
 
-4. **Caching**: Cache function call results when inputs are identical.
+Paths grow: 12572 → 53434 → 180008 with no intermediate merging!
 
-The flow-based approach achieves efficiency by working with vectorized states throughout. The barrier approach enumerates scalar paths which explodes exponentially. Find ways to reduce this explosion while keeping the barrier architecture.
+## Your Task: Fix This
 
-## Reference State Counts
+**Option A - Propagate Barrier Yields Through Call Stack** (recommended):
+1. Change `run_cfg_to_completion` to yield at barriers like `run_to_next_barrier` does
+2. When a barrier is hit inside a function call, propagate it up through `interpret_call_with_path_counter`
+3. The caller must then suspend and resume execution when the barrier is processed
 
-| Frame | Expanded | Flow Time | Target |
-|-------|----------|-----------|--------|
-| 1-24  | 1        | ~1ms      | <1ms   |
-| 25    | 24       | 15ms      | <20ms  |
-| 26    | 204      | 157ms     | <200ms |
-| 27    | 878      | 1.1s      | <1.5s  |
-| 28    | 2864     | 4.6s      | <6s    |
+This is complex because it requires:
+- Saving call stack state when yielding at a barrier
+- Restoring call stack state when resuming
+
+**Option B - Inline Function Calls**:
+- Before barrier execution, inline all function bodies into a single CFG
+- Simpler to implement but makes CFG much larger
+
+**Option C - Add Barriers at Frame CFG Level** (workaround):
+- Modify `main.rs` to add `__barrier()` calls between `_update()` and `_draw()`
+- Doesn't fix the root issue but may help somewhat
 
 ## Key Files
 
-- `src/interpreter/barrier_executor.rs` - The barrier executor (optimize this)
-- `src/interpreter/flow.rs` - Flow-based executor (for comparison/inspiration)
-- `src/interpreter/vectorize.rs` - State vectorization/merging
-- `src/interpreter/state.rs` - State with gc() method
+- `src/interpreter/barrier_executor.rs`:
+  - `run_to_next_barrier()` - yields at barriers (lines 728-860)
+  - `run_cfg_to_completion()` - does NOT yield at barriers (lines 249-346)
+  - `interpret_call_with_path_counter()` - calls run_cfg_to_completion (lines 125-247)
+
+- `src/ir.rs`:
+  - `Block.barrier: Option<BarrierId>` - barrier on blocks (line 322)
 
 ## How to Test
 
 ```bash
-# Run barrier-based (what you're optimizing)
+# Run barrier-based (should now show intermediate barriers)
 ./safe-run.sh -- cargo run --release --bin celeste-rust -- --barrier -n 28
 
-# Run flow-based (baseline to beat)
+# Verify correctness - state counts must match
 ./safe-run.sh -- cargo run --release --bin celeste-rust -- -n 28
 ```
 
-Verify correctness: expanded state counts must match between both modes.
+Frame 25-28 expanded counts: 24, 204, 878, 2864
 
 ## Success Metric
 
-Get barrier-based execution to within 2x of flow-based time while maintaining correct state counts.
+1. Barrier output should show intermediate barriers (not just END barrier)
+2. State counts must still match flow-based
+3. Performance at Frame 30 should improve (currently 35.5s barrier vs 18.7s flow)
 
-## How to Work
+## Notes
 
-1. Profile to understand where time is spent
-2. Implement optimizations incrementally
-3. Verify correctness after each change (state counts must match)
-4. Commit working improvements often
-
-This branch is yours - commit frequently.
+- This is a significant architectural change - take your time
+- The existing batched vectorization (every 64 paths) helps but isn't enough
+- The PathCounter must thread through properly when resuming
+- Consider looking at how `flow.rs` handles the same problem

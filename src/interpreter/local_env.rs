@@ -1,18 +1,28 @@
+use std::hash::BuildHasherDefault;
+
 use im::HashMap as ImHashMap;
+use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
 
 use crate::ir::LocalId;
 
 use super::value::Value;
 
+/// FxHasher-based BuildHasher for im::HashMap
+type FxBuildHasher = BuildHasherDefault<FxHasher>;
+
+/// im::HashMap using FxHasher for faster hashing
+type FxImHashMap<K, V> = ImHashMap<K, V, FxBuildHasher>;
+
 /// A local environment storing local variable bindings.
 /// Uses a persistent HashMap for efficient cloning through structural sharing.
+/// Uses FxHasher instead of SipHash for faster hashing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LocalEnv(ImHashMap<LocalId, Value>);
+pub struct LocalEnv(FxImHashMap<LocalId, Value>);
 
 impl LocalEnv {
     pub fn new() -> Self {
-        Self(ImHashMap::new())
+        Self(FxImHashMap::default())
     }
 
     pub fn with_capacity(_max_locals: usize) -> Self {

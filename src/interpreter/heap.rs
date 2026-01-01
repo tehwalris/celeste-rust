@@ -1,9 +1,17 @@
+use std::hash::BuildHasherDefault;
 use std::sync::Arc;
 
 use im::HashMap as ImHashMap;
+use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
 
 use super::value::HeapValue;
+
+/// FxHasher-based BuildHasher for im::HashMap
+type FxBuildHasher = BuildHasherDefault<FxHasher>;
+
+/// im::HashMap using FxHasher for faster hashing
+type FxImHashMap<K, V> = ImHashMap<K, V, FxBuildHasher>;
 
 #[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct HeapId(usize);
@@ -32,8 +40,9 @@ impl HeapId {
 pub struct Heap {
     /// Immutable base values, shared via Arc across cloned states
     old_values: Arc<Vec<Option<HeapValue>>>,
-    /// Overlay of new or changed values using a persistent HashMap
-    new_values: ImHashMap<usize, Option<HeapValue>>,
+    /// Overlay of new or changed values using a persistent HashMap.
+    /// Uses FxHasher for faster hashing.
+    new_values: FxImHashMap<usize, Option<HeapValue>>,
     /// The next HeapId to allocate
     next_id: usize,
 }
@@ -59,7 +68,7 @@ impl<'de> Deserialize<'de> for Heap {
         let values: Vec<Option<HeapValue>> = Vec::deserialize(deserializer)?;
         Ok(Heap {
             old_values: Arc::new(values.clone()),
-            new_values: ImHashMap::new(),
+            new_values: FxImHashMap::default(),
             next_id: values.len(),
         })
     }
@@ -87,7 +96,7 @@ impl Heap {
     pub fn new() -> Self {
         Self {
             old_values: Arc::new(Vec::new()),
-            new_values: ImHashMap::new(),
+            new_values: FxImHashMap::default(),
             next_id: 0,
         }
     }
@@ -165,7 +174,7 @@ impl Heap {
         let next_id = values.len();
         Self {
             old_values: Arc::new(values),
-            new_values: ImHashMap::new(),
+            new_values: FxImHashMap::default(),
             next_id,
         }
     }
@@ -189,6 +198,6 @@ impl Heap {
             }
         }
         self.old_values = Arc::new(new_vec);
-        self.new_values = ImHashMap::new();
+        self.new_values = FxImHashMap::default();
     }
 }

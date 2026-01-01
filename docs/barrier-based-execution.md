@@ -250,11 +250,37 @@ The barrier-based executor is implemented and verified correct in `src/interpret
 
 ### Performance Status
 
-After optimization, barrier-based is **~53% faster** than flow-based:
-- Flow-based Frame 28: 1090 states before merge (~4.8s)
-- Barrier-based Frame 28: ~12600 paths → ~800 vectorized states (~3.1s)
+After optimization, barrier-based is **~30% faster at Frame 28** but **slower at larger frames**:
 
-The key optimizations are:
+| Frame | Barrier | Flow | Notes |
+|-------|---------|------|-------|
+| 28 | 3.1s | 4.9s | Barrier 36% faster |
+| 29 | 12.2s | 8.0s | Flow 52% faster |
+| 30 | 35.5s | 18.7s | Flow 90% faster |
+
+The path explosion is the problem: 12572 → 53434 → 180008 paths at frames 28/29/30.
+
+### KNOWN LIMITATION: Barriers Inside Function Calls Are Ignored!
+
+**Critical issue**: The current implementation does NOT yield at barriers inside function calls.
+
+When `run_to_next_barrier` encounters a Call instruction, it calls `interpret_call_with_path_counter`,
+which uses `run_cfg_to_completion`. This function runs the **entire function to completion ignoring all barriers**!
+
+As a result:
+- The `_hint_normalize()` calls inside `_update()` and `_draw()` produce `Hint::Barrier(BarrierId([0]))`
+- But these are never yielded at because they're inside function calls
+- We only see the END barrier ([-2147483648]) at frame boundaries
+- All path explosion happens between START and END with no intermediate merging
+
+**This is why barrier-based loses at larger frames** - it's essentially doing no intermediate vectorization!
+
+To fix this, we need to either:
+1. **Propagate barrier yields through the call stack** (complex - requires suspending/resuming calls)
+2. **Inline all function calls** (would make CFG huge)
+3. **Add barriers at the frame-CFG level** (workaround - add `__barrier` between function calls)
+
+The key optimizations applied so far are:
 1. **Batched intermediate vectorization** reduces paths explored from 41000 to ~12600
 2. **Heap::from_values** builds heaps directly from Vec, avoiding im::HashMap overhead
 
