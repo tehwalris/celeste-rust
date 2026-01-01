@@ -780,24 +780,26 @@ impl StateAccumulator {
     /// Vectorize accumulated states in place to reduce memory and speed up future comparisons.
     /// This merges states with identical shapes into vectorized states.
     fn vectorize_in_place(&mut self) {
+        let mut did_vectorize = false;
         for states in self.states_by_dest.values_mut() {
             if states.len() > 1 {
                 // Vectorize the states
                 let vectorized = vectorize_states(std::mem::take(states));
                 *states = vectorized;
-
-                // Rebuild the seen_normalized set based on vectorized states
-                // This is needed because vectorization may change state representation
+                did_vectorize = true;
             }
         }
 
-        // Rebuild seen_normalized from current states
-        self.seen_normalized.clear();
-        for (key, states) in &self.states_by_dest {
-            let seen_set = self.seen_normalized.entry(key.clone()).or_default();
-            for state in states {
-                let normalized = normalize_gc_state_for_comparison(state);
-                seen_set.insert(normalized);
+        // Only rebuild seen_normalized if we actually vectorized something
+        // This avoids O(n) work when nothing changed
+        if did_vectorize {
+            self.seen_normalized.clear();
+            for (key, states) in &self.states_by_dest {
+                let seen_set = self.seen_normalized.entry(key.clone()).or_default();
+                for state in states {
+                    let normalized = normalize_gc_state_for_comparison(state);
+                    seen_set.insert(normalized);
+                }
             }
         }
     }
