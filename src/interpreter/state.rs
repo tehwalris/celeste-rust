@@ -245,7 +245,7 @@ impl State {
                 HeapValue::ObjectTable(table) => {
                     // IMPORTANT: Sort keys for deterministic traversal order!
                     let mut keys: Vec<_> = table.keys().cloned().collect();
-                    keys.sort();
+                    keys.sort_unstable();
                     let new_table: FxHashMap<String, HeapId> = keys
                         .into_iter()
                         .map(|k| {
@@ -272,7 +272,7 @@ impl State {
 
         // Visit all roots from global_env (sorted for deterministic order)
         let mut global_keys: Vec<_> = self.global_env.keys().cloned().collect();
-        global_keys.sort();
+        global_keys.sort_unstable();
         let mut new_global_env = FxImHashMap::default();
         for key in global_keys {
             let old_id = self.global_env[&key];
@@ -282,36 +282,34 @@ impl State {
 
         // Visit all roots from local_env (sorted for deterministic order)
         let mut local_entries: Vec<_> = self.local_env.iter().collect();
-        local_entries.sort_by_key(|(k, _)| *k);
-        let mut new_local_env = LocalEnv::new();
-        for (raw_id, value) in local_entries {
-            let new_value = map_value_references(value, &mut |id| {
-                visit(id, &self.heap, &mut old_to_new, &mut new_heap_values)
-            });
-            new_local_env.set(LocalId::from(raw_id), new_value);
-        }
-
-        // Visit all roots from outer_local_envs
-        let mut new_outer_local_envs = Vec::new();
-        for env in &self.outer_local_envs {
-            let mut entries: Vec<_> = env.iter().collect();
-            entries.sort_by_key(|(k, _)| *k);
-            let mut new_env = LocalEnv::new();
-            for (raw_id, value) in entries {
+        local_entries.sort_unstable_by_key(|(k, _)| *k);
+        let new_local_env = LocalEnv::from_iter(
+            local_entries.into_iter().map(|(raw_id, value)| {
                 let new_value = map_value_references(value, &mut |id| {
                     visit(id, &self.heap, &mut old_to_new, &mut new_heap_values)
                 });
-                new_env.set(LocalId::from(raw_id), new_value);
-            }
-            new_outer_local_envs.push(new_env);
-        }
+                (LocalId::from(raw_id), new_value)
+            })
+        );
 
-        // Build the new compacted heap
-        let mut new_heap = Heap::new();
-        for value in new_heap_values {
-            let id = new_heap.alloc();
-            new_heap.set(id, value);
-        }
+        // Visit all roots from outer_local_envs
+        let new_outer_local_envs: Vec<LocalEnv> = self.outer_local_envs.iter()
+            .map(|env| {
+                let mut entries: Vec<_> = env.iter().collect();
+                entries.sort_unstable_by_key(|(k, _)| *k);
+                LocalEnv::from_iter(
+                    entries.into_iter().map(|(raw_id, value)| {
+                        let new_value = map_value_references(value, &mut |id| {
+                            visit(id, &self.heap, &mut old_to_new, &mut new_heap_values)
+                        });
+                        (LocalId::from(raw_id), new_value)
+                    })
+                )
+            })
+            .collect();
+
+        // Build the new compacted heap directly from values (avoids repeated alloc+set)
+        let new_heap = Heap::from_values(new_heap_values.into_iter().map(Some).collect());
 
         // Update state
         self.heap = new_heap;
