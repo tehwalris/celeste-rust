@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     heap::{Heap, HeapId},
     local_env::LocalEnv,
-    value::{HeapValue, Value},
+    value::{CapturedValues, HeapValue, Value},
 };
 use crate::ir::LocalId;
 
@@ -348,7 +348,7 @@ impl State {
                 }
                 HeapValue::UnknownTable => HeapValue::UnknownTable,
                 HeapValue::Closure(id, captures) => {
-                    let new_captures: Vec<Value> = captures
+                    let new_captures: CapturedValues = captures
                         .iter()
                         .map(|v| map_value_references(v, &mut f))
                         .collect();

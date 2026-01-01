@@ -13,7 +13,7 @@ use super::{
     heap::{Heap, HeapId},
     local_env::LocalEnv,
     state::State,
-    value::{HeapValue, MaybeVector, Value},
+    value::{CapturedValues, HeapValue, MaybeVector, Value},
 };
 use crate::ir::GlobalId;
 use crate::pico8_num::{Pico8Num, Pico8NumInterval};
@@ -369,7 +369,7 @@ fn merge_heap_values(values: &[(HeapValue, usize)]) -> HeapValue {
         HeapValue::Closure(id, captures) => {
             // Merge captured values
             let num_captures = captures.len();
-            let merged_captures: Vec<Value> = (0..num_captures)
+            let merged_captures: CapturedValues = (0..num_captures)
                 .map(|i| {
                     let capture_values: Vec<_> = values.iter()
                         .map(|(hv, size)| {

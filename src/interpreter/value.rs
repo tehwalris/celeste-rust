@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use itertools::Itertools;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
@@ -113,13 +115,87 @@ impl Value {
     }
 }
 
+/// Wrapper for closure captured values using Arc for O(1) cloning.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CapturedValues(Arc<Vec<Value>>);
+
+impl CapturedValues {
+    pub fn new(values: Vec<Value>) -> Self {
+        Self(Arc::new(values))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Value> {
+        self.0.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn get(&self, index: usize) -> Option<&Value> {
+        self.0.get(index)
+    }
+
+    /// Map each value, creating new CapturedValues with the results.
+    pub fn map(&self, f: impl Fn(&Value) -> Value) -> Self {
+        Self(Arc::new(self.0.iter().map(f).collect()))
+    }
+}
+
+impl PartialEq for CapturedValues {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || *self.0 == *other.0
+    }
+}
+
+impl Eq for CapturedValues {}
+
+impl FromIterator<Value> for CapturedValues {
+    fn from_iter<T: IntoIterator<Item = Value>>(iter: T) -> Self {
+        Self(Arc::new(iter.into_iter().collect()))
+    }
+}
+
+impl IntoIterator for CapturedValues {
+    type Item = Value;
+    type IntoIter = std::vec::IntoIter<Value>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        // Note: this clones the Vec if Arc is shared
+        Arc::try_unwrap(self.0)
+            .unwrap_or_else(|arc| (*arc).clone())
+            .into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a CapturedValues {
+    type Item = &'a Value;
+    type IntoIter = std::slice::Iter<'a, Value>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl std::ops::Index<usize> for CapturedValues {
+    type Output = Value;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.0[index]
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HeapValue {
     Value(Value),
     ObjectTable(FxHashMap<String, HeapId>),
     ArrayTable(Vec<HeapId>),
     UnknownTable,
-    Closure(GlobalId, Vec<Value>),
+    Closure(GlobalId, CapturedValues),
     BuiltinFun(String),
 }
 
