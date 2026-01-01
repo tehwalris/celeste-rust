@@ -13,9 +13,10 @@ pub type BuiltinFun = Arc<dyn Fn(State, Vec<Value>) -> anyhow::Result<Vec<(State
 
 /// PreparedCfg holds a CFG along with precomputed analysis data.
 /// This caches the label set to avoid recomputing it on every interpret_cfg call.
+/// The CFG is wrapped in Arc to enable cheap cloning during function calls.
 #[derive(Clone)]
 pub struct PreparedCfg {
-    pub cfg: Cfg,
+    pub cfg: Arc<Cfg>,
     pub labels: IndexSet<Label>,
 }
 
@@ -26,7 +27,7 @@ impl PreparedCfg {
         for name in cfg.named.keys() {
             labels.insert_full(name.clone());
         }
-        Self { cfg, labels }
+        Self { cfg: Arc::new(cfg), labels }
     }
 }
 

@@ -5,6 +5,7 @@
 //! This tests that symbolic tracing produces the same state counts as the
 //! reference vectorized interpreter for each frame.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -18,6 +19,7 @@ use celeste_rust::{
     interpreter::fixed_env::FixedEnv,
     interpreter::inspect::make_state_abstract,
     interpreter::vectorize::vectorize_states,
+    ir::Cfg,
     symbolic_tracing::{TraceCache, run_traced, RunStats},
 };
 
@@ -43,13 +45,14 @@ struct Args {
 /// Run the reference (vectorized) implementation for one frame
 /// This matches main.rs exactly: interpret, GC, abstract, vectorize
 fn run_reference_frame(
-    frame_cfg: &celeste_rust::ir::Cfg,
+    frame_cfg: &Arc<celeste_rust::ir::Cfg>,
     states: Vec<State>,
     fixed_env: &FixedEnv,
 ) -> Result<Vec<State>> {
     let mut all_results = Vec::new();
     for state in states {
-        let results = interpret_cfg(frame_cfg.clone(), state, fixed_env)?;
+        // Reference interpreter takes owned Cfg, so clone the inner value
+        let results = interpret_cfg(Cfg::clone(&*frame_cfg), state, fixed_env)?;
         for (s, _) in results {
             all_results.push(s);
         }
@@ -114,6 +117,7 @@ __reset_button_states()
 "#;
     let frame_ast = full_moon::parse(frame_code)?;
     let (frame_cfg, frame_fun_defs) = frontend::compile(&frame_ast)?;
+    let frame_cfg = Arc::new(frame_cfg);  // Wrap in Arc to avoid cloning
     assert!(frame_fun_defs.is_empty(), "Frame code shouldn't define new functions");
 
     let run_reference = !args.symbolic_only;
@@ -152,7 +156,7 @@ __reset_button_states()
 
             let start = Instant::now();
             let (mut new_states, stats) = run_traced(
-                &frame_cfg,
+                frame_cfg.clone(),
                 sym_states,
                 &fixed_env,
                 &mut cache,
@@ -237,6 +241,11 @@ __reset_button_states()
                  total_stats.total_concrete_branches,
                  if total_stats.new_traces > 0 {
                      total_stats.total_concrete_branches as f64 / total_stats.new_traces as f64
+                 } else { 0.0 });
+        println!("  Total function calls: {} (avg {:.1} per trace)",
+                 total_stats.total_function_calls,
+                 if total_stats.new_traces > 0 {
+                     total_stats.total_function_calls as f64 / total_stats.new_traces as f64
                  } else { 0.0 });
         println!("  Unique (shape,path) pairs: {}", total_stats.unique_shape_paths);
         println!("  Unique (shape,path,concrete_path) tuples: {}", total_stats.unique_full_paths);

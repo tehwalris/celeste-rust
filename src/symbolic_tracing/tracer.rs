@@ -28,8 +28,8 @@ use super::PathCounter;
 /// A stack frame for the tracing interpreter.
 #[derive(Clone)]
 struct CallFrame {
-    /// The CFG we're executing
-    cfg: Cfg,
+    /// The CFG we're executing (Arc for cheap cloning)
+    cfg: Arc<Cfg>,
     /// Current block label (None = entry block)
     current_block: Option<Label>,
     /// Previous block label (for Phi resolution on return)
@@ -69,6 +69,8 @@ pub struct TracingResult {
     /// Number of concrete branches taken (value-dependent, not abstract).
     /// If > 0, cache reuse requires matching concrete_path.
     pub concrete_branches: usize,
+    /// Number of function calls made during tracing.
+    pub function_calls: usize,
     /// Symbolic expressions for output heap values (how they're computed from inputs).
     pub heap_symbols: HeapSymbolMap,
     /// Mapping from input symbols to source heap locations.
@@ -102,7 +104,7 @@ pub struct TracingInterpreter<'a> {
     /// Call stack
     call_stack: Vec<CallFrame>,
     /// Current CFG (None only before interpret() is called)
-    current_cfg: Option<Cfg>,
+    current_cfg: Option<Arc<Cfg>>,
     /// Current block label (None = entry block)
     current_block: Option<Label>,
     /// Previous block label (for Phi node resolution)
@@ -127,6 +129,8 @@ pub struct TracingInterpreter<'a> {
     input_heap_ids: std::collections::HashSet<HeapId>,
     /// HeapIds that were allocated during tracing
     allocated_heap_ids: Vec<HeapId>,
+    /// Number of function calls made
+    function_calls: usize,
 }
 
 impl<'a> TracingInterpreter<'a> {
@@ -154,15 +158,16 @@ impl<'a> TracingInterpreter<'a> {
             concrete_branch_conditions: Vec::new(),
             input_heap_ids: std::collections::HashSet::new(),
             allocated_heap_ids: Vec::new(),
+            function_calls: 0,
         }
     }
 
     /// Interpret a CFG with a concrete state.
-    pub fn interpret(mut self, cfg: &Cfg, state: State) -> Result<TracingResult> {
+    pub fn interpret(mut self, cfg: Arc<Cfg>, state: State) -> Result<TracingResult> {
         debug_assert_eq!(state.vector_size, 1, "Tracing requires scalar state");
 
         self.state = state;
-        self.current_cfg = Some(cfg.clone());
+        self.current_cfg = Some(cfg);
         self.current_block = None;
         self.previous_block = None;
 
@@ -290,6 +295,7 @@ impl<'a> TracingInterpreter<'a> {
                             concrete_path: self.concrete_path,
                             forced_choices: self.forced_choices,
                             concrete_branches: self.concrete_branches,
+                            function_calls: self.function_calls,
                             heap_symbols: self.heap_symbols,
                             input_symbols: self.input_symbols,
                             path_conditions: self.path_conditions,
@@ -605,6 +611,8 @@ impl<'a> TracingInterpreter<'a> {
         closure_local_id: LocalId,
         arg_local_ids: &[LocalId],
     ) -> Result<bool> {
+        self.function_calls += 1;
+
         // Get the closure value
         let closure_heap_id = match self.state.local_env.get(closure_local_id) {
             Value::Pointer(heap_id) => *heap_id,

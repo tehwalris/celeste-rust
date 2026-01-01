@@ -14,6 +14,7 @@
 //! path conditions. If so, we can reuse the trace instead of re-executing.
 
 use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
 use anyhow::Result;
 
 use crate::interpreter::{
@@ -120,6 +121,8 @@ pub struct RunStats {
     pub unique_full_paths: usize,
     /// Number of template mismatches (different concrete branch counts for same template key)
     pub template_mismatches: usize,
+    /// Total function calls across all traces
+    pub total_function_calls: usize,
 }
 
 impl RunStats {
@@ -139,6 +142,7 @@ impl RunStats {
             total_concrete_branches: self.total_concrete_branches + other.total_concrete_branches,
             unique_full_paths: self.unique_full_paths + other.unique_full_paths,
             template_mismatches: self.template_mismatches + other.template_mismatches,
+            total_function_calls: self.total_function_calls + other.total_function_calls,
         }
     }
 }
@@ -153,7 +157,7 @@ struct PendingState {
 
 /// Runs multiple states through a CFG using symbolic tracing.
 pub fn run_traced(
-    cfg: &Cfg,
+    cfg: Arc<Cfg>,
     input_states: Vec<State>,
     fixed_env: &FixedEnv,
     cache: &mut TraceCache,
@@ -207,11 +211,12 @@ pub fn run_traced(
 
         // Execute with tracing
         let tracer = TracingInterpreter::new(fixed_env, Some(pending_state.path.clone()));
-        let result = tracer.interpret(cfg, pending_state.state.clone())?;
+        let result = tracer.interpret(cfg.clone(), pending_state.state.clone())?;
 
         stats.forced_choices += result.forced_choices;
         stats.new_traces += 1;
         stats.total_concrete_branches += result.concrete_branches;
+        stats.total_function_calls += result.function_calls;
         if result.concrete_branches == 0 {
             stats.reusable_traces += 1;
         } else {
@@ -255,7 +260,7 @@ pub fn run_traced(
 
 /// Runs a single frame (game loop iteration) using symbolic tracing.
 pub fn run_frame_traced(
-    frame_cfg: &Cfg,
+    frame_cfg: Arc<Cfg>,
     input_states: Vec<State>,
     fixed_env: &FixedEnv,
     cache: &mut TraceCache,
