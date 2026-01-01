@@ -48,17 +48,15 @@ pub struct CachedTrace {
 }
 
 impl CachedTrace {
-    /// Check if this trace's path conditions are satisfied by the given input state.
+    /// Check if this trace's path conditions are satisfied using a pre-built substitution.
     /// Returns true if all path conditions evaluate to true.
-    pub fn check_conditions(&self, input_state: &State) -> bool {
+    pub fn check_conditions_with_substitution(&self, substitution: &Substitution) -> bool {
         if self.path_conditions.is_empty() {
             return true;
         }
 
-        let substitution = self.build_substitution(input_state);
-
         for condition in &self.path_conditions {
-            let result = evaluate_sym_expr(condition, &substitution);
+            let result = evaluate_sym_expr(condition, substitution);
             match result {
                 ConcreteValue::Bool(true) => continue,
                 ConcreteValue::Bool(false) => return false,
@@ -68,6 +66,13 @@ impl CachedTrace {
         }
 
         true
+    }
+
+    /// Check if this trace's path conditions are satisfied by the given input state.
+    /// Returns true if all path conditions evaluate to true.
+    pub fn check_conditions(&self, input_state: &State) -> bool {
+        let substitution = self.build_substitution(input_state);
+        self.check_conditions_with_substitution(&substitution)
     }
 
     /// Apply this cached trace to a new input state, producing an output state.

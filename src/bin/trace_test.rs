@@ -223,6 +223,12 @@ __reset_button_states()
         println!("  New traces: {}", total_stats.new_traces);
         println!("  Cache hits: {}", total_stats.cache_hits);
         println!("  Cache misses: {}", total_stats.cache_misses);
+        let cache_stats = cache.stats();
+        println!("  Condition checks: {}", cache_stats.condition_checks);
+        println!("  Avg checks per lookup: {:.1}",
+                 if total_stats.states_processed > 0 {
+                     cache_stats.condition_checks as f64 / total_stats.states_processed as f64
+                 } else { 0.0 });
         println!("  Reusable traces (no concrete branches): {}", total_stats.reusable_traces);
         println!("  Unreusable traces (has concrete branches): {}", total_stats.unreusable_traces);
         println!("  Unique (shape,path) pairs: {}", total_stats.unique_shape_paths);
@@ -231,7 +237,12 @@ __reset_button_states()
                  if total_stats.states_processed > 0 {
                      100.0 * total_stats.potential_cache_hits as f64 / total_stats.states_processed as f64
                  } else { 0.0 });
-        println!("  Cache size: {} traces", cache.len());
+        println!("  Cache: {} traces in {} keys (avg {:.1} per key)",
+                 cache.len(),
+                 cache.num_keys(),
+                 if cache.num_keys() > 0 {
+                     cache.len() as f64 / cache.num_keys() as f64
+                 } else { 0.0 });
     }
 
     if run_reference && run_symbolic {
