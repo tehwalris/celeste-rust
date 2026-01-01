@@ -336,3 +336,44 @@ The fundamental issue is that branch conditions are path-dependent. Taking branc
    - The reference interpreter already does this (see `flow.rs` lines 294-314)
    - Would require significant changes to TracingInterpreter to handle vector values
    - Potential: Could reduce traces by 10-50x for typical cases
+
+4. **Post-processing optimizations** (completed, 2024-01-01):
+   - **Parallel GC**: Use rayon to parallelize garbage collection across output states
+     - Frame 30 GC: 31s → 3s (10x faster)
+   - **Parallel abstraction**: Parallelize make_state_abstract step
+   - **Chunked vectorization**: Process large groups in chunks to avoid O(n²) dedup
+     - Frame 30 vectorize: 64s → 32s (2x faster)
+   - **Parallel chunk processing**: Process vectorization chunks in parallel
+   - **Result**: Frame 30 total: 110s → 60s (45% faster)
+
+   Updated timing with post-processing optimizations:
+   | Frame | Trace (ms) | GC (ms) | Vectorize (ms) | Total (ms) |
+   |-------|------------|---------|----------------|------------|
+   | 28    | 2,100      | 215     | 2,650          | 5,000      |
+   | 29    | 8,900      | 965     | 10,330         | 20,260     |
+   | 30    | 25,400     | 2,980   | 31,580         | 60,000     |
+
+   Observations:
+   - Tracing is now only ~40% of total time (was ~25% before, but total time reduced)
+   - Vectorization is still the largest single component (~50% of time)
+   - Frame 31 still OOMs due to trace count explosion (not post-processing)
+
+### Trace Explosion Analysis
+
+**Frame 30 breakdown** (15,250 expanded input states):
+- Split to scalars: 15,250 scalar states
+- Traces produced: 211,644 (~13.9 per input state)
+- Forced choices (path forks): 1,335,712 (~6.3 per trace)
+- Pre-vectorize states: 211,644
+- Post-vectorize: 15,250 expanded states (back to input count)
+
+**Root cause**: Path enumeration from UnknownBool branches
+- Each scalar state explores ~13.9 abstract paths on average
+- This causes 15,250 → 211,644 expansion (14x)
+- The vectorization then collapses back to 15,250 unique combinations
+
+**Why the reference is faster**:
+- Reference keeps vectors together during execution
+- When hitting UnknownBool, reference just continues (takes "both branches" implicitly)
+- No path enumeration, no 14x expansion
+- Vectorization at frame end handles the combination of paths
