@@ -175,17 +175,22 @@ pub fn run_traced(
             stats.unique_shape_paths += 1;
         }
 
-        // Try cache lookup with symbolic substitution (Phase 3)
-        // IMPORTANT: Cache is only valid for re-exploring alternative paths.
-        // We can only use cache when:
-        // 1. We have a non-empty starting path (we're replaying, not discovering)
-        // 2. The cache has an entry for this (shape, path)
+        // CACHE DISABLED - Fundamental design limitation:
         //
-        // If starting path is empty, we're discovering the path for the first time.
-        // Different states may discover different paths depending on their values.
-        // DISABLED: Cache apply still has type mismatches (Number + Pointer, etc.)
-        // The symbolic tracer records operations that may not be type-safe when
-        // operand types change between input states.
+        // The cache key (shape, path) is insufficient to guarantee identical execution.
+        // The 'path' only records ABSTRACT branches (UnknownBool conditions), but
+        // CONCRETE branches (based on actual values like `x > 5`) are not tracked.
+        //
+        // Two states with the same shape and path can take different concrete branches
+        // if their actual values differ. This leads to:
+        // 1. Different output heap structures
+        // 2. Different types in symbolic expressions (e.g., Number vs Pointer)
+        // 3. Type errors when applying cached expressions to different states
+        //
+        // To fix properly, we'd need to either:
+        // - Track ALL branches (concrete + abstract) in the path
+        // - Use path conditions that cover concrete comparisons
+        // - Only cache when the traced path has NO concrete branches
         let cache_hit = false;
 
         if cache_hit {
