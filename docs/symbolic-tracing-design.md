@@ -239,10 +239,15 @@ This means we can't predict `concrete_path` without actually tracing. The potent
    - Solution: Clone Arc<Cfg> (cheap) and borrow Block reference
    - Result: Frame 28: 24.9s → 22.5s (10% faster)
 
+3. **Vec for local_symbols** (commit 5579612)
+   - Problem: HashMap overhead for local symbol lookups/inserts
+   - Solution: Use Vec<Option<SymExpr>> indexed by LocalId
+   - Result: Frame 28: 22.8s → 21.7s (5% faster)
+
 **Current state** (after optimizations):
 | Frame | Ref (ms) | Sym (ms) | Ratio |
 |-------|----------|----------|-------|
-| 28    | 4,606    | 22,816   | 5.0x  |
+| 28    | 4,556    | 21,677   | 4.8x  |
 
 Profile breakdown (current):
 - **Cloning** (Vec, String): 9%
