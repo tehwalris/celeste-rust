@@ -36,10 +36,12 @@ impl LocalEnv {
         Self(iter.collect())
     }
 
+    #[inline]
     pub fn get(&self, id: LocalId) -> &Value {
         self.0.get(&id).expect("LocalId should be set before get")
     }
 
+    #[inline]
     pub fn set(&mut self, id: LocalId, value: Value) {
         self.0.insert(id, value);
     }
