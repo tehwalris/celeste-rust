@@ -117,16 +117,14 @@ pub struct TracingInterpreter<'a> {
     symbol_gen: SymbolGenerator,
     /// Symbolic expressions for local variables (indexed by LocalId raw value)
     local_symbols: Vec<Option<SymExpr>>,
-    /// Symbolic expressions for heap values
-    heap_symbols: HeapSymbolMap,
+    /// Symbolic expressions for heap values (indexed by HeapId raw value)
+    heap_symbols: Vec<Option<SymExpr>>,
     /// Mapping from input symbols to their source heap locations
     input_symbols: InputSymbolMap,
     /// Path conditions for this execution path (boolean expressions that must be true)
     path_conditions: Vec<SymExpr>,
     /// Concrete branch condition expressions (raw, without Not wrapper)
     concrete_branch_conditions: Vec<SymExpr>,
-    /// HeapIds that existed in the input state (before tracing)
-    input_heap_ids: std::collections::HashSet<HeapId>,
     /// HeapIds that were allocated during tracing
     allocated_heap_ids: Vec<HeapId>,
     /// Number of function calls made
@@ -152,11 +150,10 @@ impl<'a> TracingInterpreter<'a> {
             // Symbolic tracking
             symbol_gen: SymbolGenerator::new(),
             local_symbols: Vec::new(),
-            heap_symbols: HashMap::new(),
+            heap_symbols: Vec::new(),
             input_symbols: HashMap::new(),
             path_conditions: Vec::new(),
             concrete_branch_conditions: Vec::new(),
-            input_heap_ids: std::collections::HashSet::new(),
             allocated_heap_ids: Vec::new(),
             function_calls: 0,
         }
@@ -171,11 +168,9 @@ impl<'a> TracingInterpreter<'a> {
         self.current_block = None;
         self.previous_block = None;
 
-        // Record all HeapIds that exist in the input state
-        // Any HeapIds allocated later are "new" and need to be re-allocated during apply()
-        self.input_heap_ids = (0..self.state.heap.len())
-            .map(HeapId::from_raw)
-            .collect();
+        // Pre-allocate heap_symbols to avoid resizing during tracing
+        let heap_size = self.state.heap.len();
+        self.heap_symbols.resize(heap_size, None);
 
         // Initialize input symbols for all heap values reachable from globals
         self.initialize_input_symbols();
@@ -289,6 +284,15 @@ impl<'a> TracingInterpreter<'a> {
                         // Top-level return - we're done
                         self.path.truncate(self.choice_position);
 
+                        // Convert Vec<Option<SymExpr>> to HashMap<HeapId, SymExpr>
+                        let heap_symbols_map: HeapSymbolMap = self.heap_symbols
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, sym)| {
+                                sym.as_ref().map(|s| (HeapId::from_raw(i), s.clone()))
+                            })
+                            .collect();
+
                         return Ok(TracingResult {
                             output_state: self.state,
                             return_value,
@@ -297,7 +301,7 @@ impl<'a> TracingInterpreter<'a> {
                             forced_choices: self.forced_choices,
                             concrete_branches: self.concrete_branches,
                             function_calls: self.function_calls,
-                            heap_symbols: self.heap_symbols,
+                            heap_symbols: heap_symbols_map,
                             input_symbols: self.input_symbols,
                             path_conditions: self.path_conditions,
                             concrete_branch_conditions: self.concrete_branch_conditions,
@@ -438,7 +442,7 @@ impl<'a> TracingInterpreter<'a> {
                     Value::Pointer(heap_id) => match self.state.heap.get(*heap_id) {
                         HeapValue::Value(value) => {
                             // Get symbol from heap_symbols if available
-                            let sym = self.heap_symbols.get(heap_id).cloned()
+                            let sym = self.get_heap_symbol_opt(*heap_id)
                                 .unwrap_or_else(|| self.value_to_const_sym(value));
                             (value.clone(), sym)
                         }
@@ -464,7 +468,7 @@ impl<'a> TracingInterpreter<'a> {
                 let source_value = self.state.local_env.get(*source).clone();
                 let source_sym = self.get_local_symbol(*source);
                 self.state.heap.set(heap_id, HeapValue::Value(source_value));
-                self.heap_symbols.insert(heap_id, source_sym);
+                self.set_heap_symbol(heap_id, source_sym);
             }
             Instruction::StoreEmptyTable { target } => {
                 let heap_id = self.get_heap_id(*target)?;
@@ -733,7 +737,7 @@ impl<'a> TracingInterpreter<'a> {
                     // Create input symbol for this value
                     let sym_id = self.symbol_gen.fresh();
                     self.input_symbols.insert(sym_id, heap_id);
-                    self.heap_symbols.insert(heap_id, SymExpr::Input(sym_id));
+                    self.set_heap_symbol(heap_id, SymExpr::Input(sym_id));
                 }
                 HeapValue::ObjectTable(fields) => {
                     // Visit all field heap IDs
@@ -791,6 +795,25 @@ impl<'a> TracingInterpreter<'a> {
         } else {
             None
         }
+    }
+
+    /// Get the symbol for a heap value if it exists.
+    fn get_heap_symbol_opt(&self, heap_id: HeapId) -> Option<SymExpr> {
+        let idx = heap_id.raw();
+        if idx < self.heap_symbols.len() {
+            self.heap_symbols[idx].clone()
+        } else {
+            None
+        }
+    }
+
+    /// Set the symbol for a heap value.
+    fn set_heap_symbol(&mut self, heap_id: HeapId, sym: SymExpr) {
+        let idx = heap_id.raw();
+        if idx >= self.heap_symbols.len() {
+            self.heap_symbols.resize(idx + 1, None);
+        }
+        self.heap_symbols[idx] = Some(sym);
     }
 
     /// Convert a concrete Value to a constant SymExpr.

@@ -177,8 +177,10 @@ pub fn run_traced(
     for state in input_states {
         // Split vectorized states into individual concrete states
         let concrete_states = split_vectorized_state(state);
-        for concrete_state in concrete_states {
+        for mut concrete_state in concrete_states {
             debug_assert_eq!(concrete_state.vector_size, 1, "State should be concrete after splitting");
+            // Freeze the heap before tracing to make get_opt fast (Vec lookup instead of HashMap)
+            concrete_state.heap.freeze();
             let shape = debug_shape_of_state(&concrete_state);
             pending.push_back(PendingState {
                 state: concrete_state,
