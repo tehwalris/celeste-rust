@@ -262,6 +262,12 @@ This means we can't predict `concrete_path` without actually tracing. The potent
      constructor when caching is disabled
    - Result: Frame 28: 18.6s → 15.7s (16% faster), no more OOM at frame 30
 
+7. **Skip outer_local_envs updates during tracing** (commit de9c1d0)
+   - Problem: Maintaining outer_local_envs requires cloning LocalEnv on every
+     function call for GC roots, but we don't GC during tracing
+   - Solution: Skip outer_local_envs updates entirely during trace
+   - Result: Minor improvement (frame 28: 8.0s → 7.97s)
+
 **Current state** (after optimizations, with fast mode and parallel):
 | Frame | Ref (ms) | Sym Seq (ms) | Sym Parallel (ms) | Parallel Ratio |
 |-------|----------|--------------|-------------------|----------------|
