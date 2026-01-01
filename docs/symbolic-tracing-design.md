@@ -217,8 +217,9 @@ The original design assumed caching based on `(shape, abstract_path)` would work
 
 This means we can't predict `concrete_path` without actually tracing. The potential cache hit rate is 99.8%, but we'd need to trace to know the path.
 
-#### Performance Bottlenecks (from profiling)
-Tracing is ~8-32x slower than the reference interpreter:
+#### Performance Bottlenecks and Optimizations
+
+**Initial state**: ~8-32x slower than reference interpreter
 
 | Frame | States | Ref (ms) | Sym (ms) | Ratio |
 |-------|--------|----------|----------|-------|
@@ -226,25 +227,43 @@ Tracing is ~8-32x slower than the reference interpreter:
 | 29    | 7,260  | 8,127    | 179,907  | 22.1x |
 | 30    | 15,250 | 17,081   | 550,994  | 32.3x |
 
-Profile breakdown:
-- **Cloning** (Vec, String, CFG, Block): 12%+
-- **Hashing** (HashMap, im-rs HAMT): 11%+
+**Optimizations applied**:
+
+1. **Arc<Cfg> for function calls** (commit 26a908f)
+   - Problem: 4.5M CFG clones (236.8 function calls × 19,092 traces)
+   - Solution: Store CFG in Arc, cloning is now a refcount bump
+   - Result: Frame 28: 40.3s → 24.9s (38% faster)
+
+2. **Avoid Block cloning** (commit fe010ad)
+   - Problem: Cloned Block struct on every iteration of main loop
+   - Solution: Clone Arc<Cfg> (cheap) and borrow Block reference
+   - Result: Frame 28: 24.9s → 22.5s (10% faster)
+
+**Current state** (after optimizations):
+| Frame | Ref (ms) | Sym (ms) | Ratio |
+|-------|----------|----------|-------|
+| 28    | 4,606    | 22,816   | 5.0x  |
+
+Profile breakdown (current):
+- **Cloning** (Vec, String): 9%
+- **Hashing** (HashMap, im-rs HAMT): 9%
 - **Memory allocation** (malloc/free): 7%
-- **Dropping** (Instruction, Block, Value): 6%+
+- **Dropping**: 4%
+- **Heap::get_opt** (im-rs lookup): 2%
 - **Actual interpretation**: ~4%
 
 Root cause: The tracer uses the same `State` structure as the reference interpreter, which uses persistent data structures (im-rs HAMT) for vectorized execution. This adds overhead for scalar tracing.
 
 ### Next Steps
 
-1. **Alternative caching strategy**: Instead of templates, explore:
+1. **Further data structure optimizations**:
+   - Use simpler (non-persistent) heap for scalar tracing
+   - Replace HashMap with Vec for local_symbols (LocalId is usize)
+   - Replace HashMap with Vec for heap_symbols (HeapId is usize)
+
+2. **Alternative caching strategy**: Instead of templates, explore:
    - Post-hoc caching (store by full path, accept ~2x reuse factor)
    - Block-level caching (smaller units, less path dependence)
-
-2. **Optimize data structures**:
-   - Use `Arc<PreparedCfg>` instead of cloning CFGs
-   - Use simpler (non-persistent) heap for scalar tracing
-   - Reduce HashMap operations in hot paths
 
 3. **Consider hybrid approach**:
    - Use symbolic tracing only for specific code regions
