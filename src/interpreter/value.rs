@@ -189,6 +189,51 @@ impl std::ops::Index<usize> for CapturedValues {
     }
 }
 
+/// Arc-wrapped builtin function name for O(1) cloning.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BuiltinName(Arc<String>);
+
+impl BuiltinName {
+    pub fn new(s: String) -> Self {
+        Self(Arc::new(s))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for BuiltinName {
+    fn from(s: String) -> Self {
+        Self::new(s)
+    }
+}
+
+impl std::fmt::Display for BuiltinName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl Serialize for BuiltinName {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for BuiltinName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(Self(Arc::new(s)))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HeapValue {
     Value(Value),
@@ -196,7 +241,7 @@ pub enum HeapValue {
     ArrayTable(Vec<HeapId>),
     UnknownTable,
     Closure(GlobalId, CapturedValues),
-    BuiltinFun(String),
+    BuiltinFun(BuiltinName),
 }
 
 impl HeapValue {

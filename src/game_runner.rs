@@ -386,7 +386,7 @@ pub fn create_initial_state_with_builtins(fixed_env: &FixedEnv) -> State {
     let mut state = State::new();
     for name in fixed_env.builtin_funs.keys() {
         let heap_id = state.heap.alloc();
-        state.heap.set(heap_id, HeapValue::BuiltinFun(name.clone()));
+        state.heap.set(heap_id, HeapValue::BuiltinFun(name.clone().into()));
         state.global_env.insert(name.clone(), heap_id);
     }
     state

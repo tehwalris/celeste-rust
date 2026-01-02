@@ -308,14 +308,15 @@ impl<'a> CoreInterpreter<'a> {
 
         match heap_value {
             HeapValue::BuiltinFun(name) => {
-                let _span = SpanGuard::new(&format!("builtin:{}", name), "call");
+                let name_str = name.as_str();
+                let _span = SpanGuard::new(&format!("builtin:{}", name_str), "call");
 
                 // Look up the builtin function
                 let builtin_fn = self
                     .fixed_env
                     .builtin_funs
-                    .get(&name)
-                    .ok_or_else(|| anyhow!("Unknown builtin function: {}", name))?;
+                    .get(name_str)
+                    .ok_or_else(|| anyhow!("Unknown builtin function: {}", name_str))?;
 
                 // Call the builtin, which returns multiple (state, return_value) pairs
                 let results = builtin_fn(self.state, arg_values)?;
@@ -327,7 +328,7 @@ impl<'a> CoreInterpreter<'a> {
                         p.create_dag_node(
                             results.len(),
                             expanded_count,
-                            DagOperation::BuiltinSplit { builtin_name: name.clone() },
+                            DagOperation::BuiltinSplit { builtin_name: name_str.to_string() },
                             p.current_dag_node(),
                         )
                     });

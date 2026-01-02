@@ -105,7 +105,7 @@ fn normalize_heap_value_for_shape(value: &HeapValue) -> HeapValueShape {
                 captures.iter().map(normalize_value_for_shape).collect(),
             )
         }
-        HeapValue::BuiltinFun(name) => HeapValueShape::BuiltinFun(name.clone()),
+        HeapValue::BuiltinFun(name) => HeapValueShape::BuiltinFun(name.as_str().to_string()),
     }
 }
 

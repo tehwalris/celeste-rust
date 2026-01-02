@@ -251,19 +251,19 @@ fn interpret_call_with_path_counter(
 
     match heap_value {
         HeapValue::BuiltinFun(name) => {
-            let name = name.clone(); // Clone only the name, not the whole HeapValue
+            let name = name.clone(); // Clone the Arc-wrapped name so we can use it after moving state
             // Look up the builtin function
             let builtin_fn = fixed_env
                 .builtin_funs
-                .get(&name)
-                .ok_or_else(|| anyhow!("Unknown builtin function: {}", name))?;
+                .get(name.as_str())
+                .ok_or_else(|| anyhow!("Unknown builtin function: {}", name.as_str()))?;
 
             // Call the builtin, which returns multiple (state, return_value) pairs
             // Builtins never hit barriers - they complete immediately
             let results = builtin_fn(state, arg_values)?;
 
             if results.is_empty() {
-                return Err(anyhow!("Builtin {} returned no results", name));
+                return Err(anyhow!("Builtin {} returned no results", name.as_str()));
             }
 
             // Use PathCounter to pick one result
