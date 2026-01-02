@@ -706,14 +706,12 @@ impl StateAccumulator {
     /// Add a state to the accumulator with deduplication.
     /// Returns true if the state was added (new), false if it was a duplicate.
     #[inline]
-    fn add_state(&mut self, dest: BarrierId, mut state: State, resume_ctx: ResumeContext) -> bool {
-        // GC the state first to get deterministic heap IDs (required for vectorization)
-        state.gc();
-
+    fn add_state(&mut self, dest: BarrierId, state: State, resume_ctx: ResumeContext) -> bool {
+        // Don't GC here - defer to vectorize_in_place for batching
         // Key by (BarrierId, ResumeContext) - states with different resume contexts cannot be merged
         let key = (dest, resume_ctx);
 
-        // Add directly - dedup will happen during vectorization
+        // Add directly - GC and dedup will happen during vectorization
         self.states_by_dest.entry(key).or_default().push(state);
         true
     }
@@ -742,8 +740,13 @@ impl StateAccumulator {
 
     /// Vectorize accumulated states in place to reduce memory and speed up future comparisons.
     /// This merges states with identical shapes into vectorized states.
+    /// Also GCs states before vectorization to get deterministic heap IDs.
     fn vectorize_in_place(&mut self) {
         for states in self.states_by_dest.values_mut() {
+            // GC all states first to get deterministic heap IDs (required for vectorization)
+            for state in states.iter_mut() {
+                state.gc();
+            }
             if states.len() > 1 {
                 // Vectorize the states (this also does deduplication)
                 let vectorized = vectorize_states(std::mem::take(states));
@@ -817,6 +820,9 @@ fn process_lane(
         }
         path_counter.reset_for_new_run();
     }
+
+    // Final vectorization to GC any remaining states that weren't in a batch
+    accumulator.vectorize_in_place();
 
     Ok(accumulator)
 }
@@ -964,6 +970,7 @@ pub fn execute_with_barriers(
         total_dedup_count += combined_accumulator.dedup_count;
 
         // Get destination hit counts and add to pending
+        // Note: States are already GC'd from vectorize_in_place in process_lane
         for ((dest, dest_resume_ctx), states) in combined_accumulator.states_by_dest {
             let dest_hit = barrier_hit_counts.get(&dest).copied().unwrap_or(0);
             let dest_key = BarrierKey {
