@@ -429,11 +429,10 @@ impl State {
             new_global_env.insert(key, new_id);
         }
 
-        // Visit all roots from local_env (sorted for deterministic order)
-        let mut local_entries: Vec<_> = self.local_env.iter().collect();
-        local_entries.sort_unstable_by_key(|(k, _)| *k);
+        // Visit all roots from local_env
+        // Note: local_env.iter() already returns entries in index order (sorted), no need to sort
         let new_local_env = LocalEnv::from_iter(
-            local_entries.into_iter().map(|(raw_id, value)| {
+            self.local_env.iter().map(|(raw_id, value)| {
                 let new_value = map_value_references(value, &mut |id| {
                     visit(id, &self.heap, &mut old_to_new, &mut new_heap_values)
                 });
@@ -442,13 +441,12 @@ impl State {
         );
 
         // Visit all roots from outer_local_envs
+        // Note: LocalEnv.iter() already returns entries in index order (sorted), no need to sort
         let new_outer_local_envs = OuterLocalEnvs::from_vec(
             self.outer_local_envs.iter()
                 .map(|env| {
-                    let mut entries: Vec<_> = env.iter().collect();
-                    entries.sort_unstable_by_key(|(k, _)| *k);
                     LocalEnv::from_iter(
-                        entries.into_iter().map(|(raw_id, value)| {
+                        env.iter().map(|(raw_id, value)| {
                             let new_value = map_value_references(value, &mut |id| {
                                 visit(id, &self.heap, &mut old_to_new, &mut new_heap_values)
                             });
