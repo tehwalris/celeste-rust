@@ -31,7 +31,7 @@ use super::{
     local_env::LocalEnv,
     state::State,
     value::{HeapValue, MaybeVector, Value},
-    vectorize::{vectorize_states, normalize_gc_state_for_comparison, NormalizedState},
+    vectorize::vectorize_states,
 };
 
 /// Build a map from BarrierId to the block that has that barrier.
@@ -696,17 +696,17 @@ impl ResumeContext {
     }
 }
 
-/// Accumulator for collecting states with early deduplication.
-/// Uses normalized state comparison to detect and merge duplicate states.
+/// Accumulator for collecting states.
 ///
 /// States are grouped by (BarrierId, ResumeContext) since states at the same
 /// barrier but with different resume contexts cannot be merged - they represent
 /// different program points (e.g., same barrier called from different call sites).
+///
+/// Deduplication happens during vectorization, not at collection time.
+/// This reduces per-state overhead (no normalize for every state).
 struct StateAccumulator {
     /// States grouped by (destination barrier, resume context)
     states_by_dest: FxHashMap<(BarrierId, ResumeContext), Vec<State>>,
-    /// Normalized state signatures for deduplication (per destination + resume ctx)
-    seen_normalized: FxHashMap<(BarrierId, ResumeContext), rustc_hash::FxHashSet<NormalizedState>>,
     /// Count of states that were deduplicated (for stats)
     dedup_count: usize,
 }
@@ -715,7 +715,6 @@ impl StateAccumulator {
     fn new() -> Self {
         Self {
             states_by_dest: FxHashMap::default(),
-            seen_normalized: FxHashMap::default(),
             dedup_count: 0,
         }
     }
@@ -723,43 +722,22 @@ impl StateAccumulator {
     /// Add a state to the accumulator with deduplication.
     /// Returns true if the state was added (new), false if it was a duplicate.
     fn add_state(&mut self, dest: BarrierId, mut state: State, resume_ctx: ResumeContext) -> bool {
-        // GC the state first to get deterministic heap IDs
+        // GC the state first to get deterministic heap IDs (required for vectorization)
         state.gc();
-
-        // Compute normalized form for deduplication (state is already GC'd)
-        let normalized = normalize_gc_state_for_comparison(&state);
 
         // Key by (BarrierId, ResumeContext) - states with different resume contexts cannot be merged
         let key = (dest, resume_ctx);
 
-        // Check if we've seen this state before
-        let seen_set = self.seen_normalized.entry(key.clone()).or_default();
-        if seen_set.contains(&normalized) {
-            self.dedup_count += 1;
-            return false;
-        }
-
-        // Add to seen set and states
-        seen_set.insert(normalized);
+        // Add directly - dedup will happen during vectorization
         self.states_by_dest.entry(key).or_default().push(state);
         true
     }
 
     /// Merge another accumulator into this one
     fn merge(&mut self, other: StateAccumulator) {
-        for (key, states) in other.states_by_dest {
-            for state in states {
-                // Re-check for duplicates when merging
-                // States are already GC'd from when they were added to the other accumulator
-                let normalized = normalize_gc_state_for_comparison(&state);
-                let seen_set = self.seen_normalized.entry(key.clone()).or_default();
-                if !seen_set.contains(&normalized) {
-                    seen_set.insert(normalized);
-                    self.states_by_dest.entry(key.clone()).or_default().push(state);
-                } else {
-                    self.dedup_count += 1;
-                }
-            }
+        for (key, mut states) in other.states_by_dest {
+            // Append directly - dedup will happen during vectorization
+            self.states_by_dest.entry(key).or_default().append(&mut states);
         }
         self.dedup_count += other.dedup_count;
     }
@@ -780,26 +758,11 @@ impl StateAccumulator {
     /// Vectorize accumulated states in place to reduce memory and speed up future comparisons.
     /// This merges states with identical shapes into vectorized states.
     fn vectorize_in_place(&mut self) {
-        let mut did_vectorize = false;
         for states in self.states_by_dest.values_mut() {
             if states.len() > 1 {
-                // Vectorize the states
+                // Vectorize the states (this also does deduplication)
                 let vectorized = vectorize_states(std::mem::take(states));
                 *states = vectorized;
-                did_vectorize = true;
-            }
-        }
-
-        // Only rebuild seen_normalized if we actually vectorized something
-        // This avoids O(n) work when nothing changed
-        if did_vectorize {
-            self.seen_normalized.clear();
-            for (key, states) in &self.states_by_dest {
-                let seen_set = self.seen_normalized.entry(key.clone()).or_default();
-                for state in states {
-                    let normalized = normalize_gc_state_for_comparison(state);
-                    seen_set.insert(normalized);
-                }
             }
         }
     }
@@ -825,7 +788,7 @@ fn process_lane(
     // Run with PathCounter to enumerate all paths
     let mut path_counter = PathCounter::new();
     let mut paths_since_vectorize = 0;
-    const VECTORIZE_BATCH_SIZE: usize = 16; // Vectorize every N paths
+    const VECTORIZE_BATCH_SIZE: usize = 4; // Vectorize every N paths (small batch for frequent merging)
 
     loop {
         // Clone the scalar state for this path
