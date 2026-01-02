@@ -80,10 +80,11 @@ impl LocalEnvStack {
 
     /// Convert to (local_env, outer_local_envs) by popping and reversing.
     /// Consumes the stack.
-    pub fn into_state_components(mut self) -> (LocalEnv, OuterLocalEnvs) {
-        let local_env = self.pop().expect("stack should not be empty");
-        // Reverse: we need index 0 to be most recent caller
+    pub fn into_state_components(self) -> (LocalEnv, OuterLocalEnvs) {
+        // Try to unwrap the Arc first to avoid cloning
         let mut envs = Arc::try_unwrap(self.inner).unwrap_or_else(|arc| (*arc).clone());
+        let local_env = envs.pop().expect("stack should not be empty");
+        // Reverse: we need index 0 to be most recent caller
         envs.reverse();
         (local_env, OuterLocalEnvs::from_vec(envs))
     }
