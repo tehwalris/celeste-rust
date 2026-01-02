@@ -311,22 +311,37 @@ fn vectorize_same_shape_states(states: Vec<State>) -> State {
 
     let total_vector_size: usize = states.iter().map(|s| s.vector_size).sum();
     let first_state = &states[0];
+    let heap_len = first_state.heap.len();
 
-    // Build vectorized heap
-    let mut new_heap = Heap::new();
-    for i in 0..first_state.heap.len() {
-        new_heap.alloc();
-    }
+    // Collect indices of non-empty heap slots
+    let non_empty_ids: Vec<usize> = (0..heap_len)
+        .filter(|&i| first_state.heap.get_opt(HeapId::from_raw(i)).is_some())
+        .collect();
 
-    for i in 0..first_state.heap.len() {
-        let id = HeapId::from_raw(i);
-        // Skip empty slots (allocated but never set)
-        if first_state.heap.get_opt(id).is_none() {
-            continue;
-        }
-        let merged_value = merge_heap_values_from_states(&states, id);
-        new_heap.set(id, merged_value);
-    }
+    // Merge heap values in parallel when there are many states
+    let merged_heap_values: Vec<(usize, HeapValue)> = if states.len() > 1000 {
+        non_empty_ids.par_iter()
+            .map(|&i| {
+                let id = HeapId::from_raw(i);
+                (i, merge_heap_values_from_states(&states, id))
+            })
+            .collect()
+    } else {
+        non_empty_ids.iter()
+            .map(|&i| {
+                let id = HeapId::from_raw(i);
+                (i, merge_heap_values_from_states(&states, id))
+            })
+            .collect()
+    };
+
+    // Build the heap from merged values using a HashMap for O(1) lookup
+    let merged_map: rustc_hash::FxHashMap<usize, HeapValue> = merged_heap_values.into_iter().collect();
+    let new_heap = Heap::from_values(
+        (0..heap_len)
+            .map(|i| merged_map.get(&i).cloned())
+            .collect()
+    );
 
     // Build vectorized local_env
     let merged_local_env = merge_local_envs(&states, |s| &s.local_env);
