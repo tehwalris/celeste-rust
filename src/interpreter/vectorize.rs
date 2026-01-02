@@ -93,7 +93,7 @@ fn normalize_heap_value_for_shape(value: &HeapValue) -> HeapValueShape {
         HeapValue::Value(v) => HeapValueShape::Value(normalize_value_for_shape(v)),
         HeapValue::ObjectTable(table) => {
             let mut entries: Vec<_> = table.iter().map(|(k, v)| (k.clone(), *v)).collect();
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
             HeapValueShape::ObjectTable(entries)
         }
         HeapValue::ArrayTable(items) => HeapValueShape::ArrayTable(items.clone()),
@@ -142,9 +142,10 @@ fn shape_of_state(state: &State) -> StateShape {
         .collect();
 
     // Convert global_env to sorted Vec for consistent hashing
-    let mut global_env: Vec<_> = state.global_env.iter()
-        .map(|(k, v)| (k.clone(), *v))
-        .collect();
+    // Pre-allocate with known capacity
+    let global_env_len = state.global_env.len();
+    let mut global_env: Vec<_> = Vec::with_capacity(global_env_len);
+    global_env.extend(state.global_env.iter().map(|(k, v)| (k.clone(), *v)));
     global_env.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
     StateShape {

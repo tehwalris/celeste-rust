@@ -956,7 +956,7 @@ pub fn execute_with_barriers(
 
             let resume_ctx_ref = &resume_ctx;
 
-            // Process all lanes in parallel using rayon (no batching for simplicity)
+            // Process all lanes in parallel using rayon
             let lane_results: Vec<Result<StateAccumulator>> = lane_tasks
                 .par_iter()
                 .map(|(vec_state, lane_idx)| {
