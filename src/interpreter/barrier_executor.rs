@@ -796,7 +796,7 @@ fn process_lane(
     // Run with PathCounter to enumerate all paths
     let mut path_counter = PathCounter::new();
     let mut paths_since_vectorize = 0;
-    const VECTORIZE_BATCH_SIZE: usize = 16; // Vectorize every N paths
+    const VECTORIZE_BATCH_SIZE: usize = 32; // Vectorize every N paths (tuned: 32 is optimal)
 
     loop {
         // Clone the scalar state for this path
