@@ -72,6 +72,7 @@ enum ValueShape {
 }
 
 /// Can this value be vectorized (combined with others into a vector)?
+#[inline]
 fn can_vectorize_value(value: &Value) -> bool {
     matches!(
         value,
@@ -79,6 +80,7 @@ fn can_vectorize_value(value: &Value) -> bool {
     )
 }
 
+#[inline]
 fn normalize_value_for_shape(value: &Value) -> ValueShape {
     if can_vectorize_value(value) {
         match value {
