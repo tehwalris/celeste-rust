@@ -14,7 +14,7 @@
 //! - Path deduplication: Duplicate states are detected and merged during enumeration
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
 use anyhow::{anyhow, Result};
 use rayon::prelude::*;
@@ -142,52 +142,82 @@ pub struct CallFrame {
 /// A stack of call frames representing suspended execution.
 /// The innermost (most recently called) function is at the end.
 ///
-/// Uses im::Vector for O(log n) push/pop with structural sharing - important
-/// for path enumeration where we modify and clone the call stack frequently.
+/// Uses a simple Vec wrapped in an option for efficient cloning when empty.
+/// Most call stacks are empty or small, so Vec is more efficient than im::Vector.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct CallStack {
-    frames: im::Vector<CallFrame>,
+    /// None represents empty stack (avoids Vec allocation for common case)
+    frames: Option<Vec<CallFrame>>,
 }
 
 impl CallStack {
+    #[inline]
     pub fn new() -> Self {
-        Self { frames: im::Vector::new() }
+        Self { frames: None }
     }
 
     pub fn from_frames(frames: Vec<CallFrame>) -> Self {
-        Self { frames: frames.into_iter().collect() }
+        if frames.is_empty() {
+            Self { frames: None }
+        } else {
+            Self { frames: Some(frames) }
+        }
     }
 
+    #[inline]
     pub fn push(&mut self, frame: CallFrame) {
-        self.frames.push_back(frame);
+        match &mut self.frames {
+            Some(frames) => frames.push(frame),
+            None => self.frames = Some(vec![frame]),
+        }
     }
 
+    #[inline]
     pub fn pop(&mut self) -> Option<CallFrame> {
-        self.frames.pop_back()
+        match &mut self.frames {
+            Some(frames) => {
+                let result = frames.pop();
+                if frames.is_empty() {
+                    self.frames = None;
+                }
+                result
+            }
+            None => None,
+        }
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.frames.is_empty()
+        self.frames.as_ref().map_or(true, |f| f.is_empty())
     }
 
     /// Get the number of frames in the stack.
+    #[inline]
     pub fn len(&self) -> usize {
-        self.frames.len()
+        self.frames.as_ref().map_or(0, |f| f.len())
     }
 
     /// Get an iterator over the frames (from outermost to innermost).
     pub fn iter(&self) -> impl Iterator<Item = &CallFrame> {
-        self.frames.iter()
+        self.frames.as_ref().map(|f| f.iter()).into_iter().flatten()
     }
 
     /// Insert a frame at the front (making it the outermost frame).
     pub fn insert_front(&mut self, frame: CallFrame) {
-        self.frames.push_front(frame);
+        match &mut self.frames {
+            Some(frames) => frames.insert(0, frame),
+            None => self.frames = Some(vec![frame]),
+        }
     }
 
     /// Extend with frames from another CallStack.
     pub fn extend(&mut self, other: CallStack) {
-        self.frames.append(other.frames);
+        if let Some(other_frames) = other.frames {
+            match &mut self.frames {
+                Some(frames) => frames.extend(other_frames),
+                None => self.frames = Some(other_frames),
+            }
+        }
     }
 }
 
@@ -736,7 +766,7 @@ fn process_lane(
     // Run with PathCounter to enumerate all paths
     let mut path_counter = PathCounter::new();
     let mut paths_since_vectorize = 0;
-    const VECTORIZE_BATCH_SIZE: usize = 16; // Vectorize every N paths (tuned: 16 is slightly better than 4)
+    const VECTORIZE_BATCH_SIZE: usize = 16; // Vectorize every N paths (tuned: 16 is optimal)
 
     loop {
         // Clone the scalar state for this path
