@@ -64,6 +64,7 @@ impl<'a> CoreInterpreter<'a> {
         }
     }
 
+    #[inline]
     fn interpret_non_call_instruction_no_assign(
         &mut self,
         instruction: &Instruction,
@@ -265,6 +266,7 @@ impl<'a> CoreInterpreter<'a> {
         }
     }
 
+    #[inline]
     pub fn interpret_non_call_instruction(
         &mut self,
         local_id: LocalId,
