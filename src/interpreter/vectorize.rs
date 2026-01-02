@@ -693,11 +693,15 @@ fn clean_local_envs_for_merging(states: Vec<State>) -> Vec<State> {
         return states;
     }
 
-    // Find the intersection of all local_env keys
+    // Find the intersection of all local_env keys - use retain to avoid allocating new sets
     let mut common_keys: FxHashSet<usize> = states[0].local_env.iter().map(|(k, _)| k).collect();
     for state in &states[1..] {
-        let state_keys: FxHashSet<usize> = state.local_env.iter().map(|(k, _)| k).collect();
-        common_keys = common_keys.intersection(&state_keys).copied().collect();
+        // Retain only keys that exist in the current state's local_env
+        common_keys.retain(|k| state.local_env.contains_raw_id(*k));
+        // Early exit if no common keys remain
+        if common_keys.is_empty() {
+            break;
+        }
     }
 
     // Remove keys that aren't in the intersection

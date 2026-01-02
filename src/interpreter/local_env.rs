@@ -172,6 +172,12 @@ impl LocalEnv {
         self.get(LocalId::from(raw_id))
     }
 
+    /// Check if a raw id has a value set
+    #[inline]
+    pub fn contains_raw_id(&self, raw_id: usize) -> bool {
+        self.values.get(raw_id).map_or(false, |v| v.is_some())
+    }
+
     /// Set value by raw usize id
     pub fn set_by_raw_id(&mut self, raw_id: usize, value: Value) {
         self.set(LocalId::from(raw_id), value);
