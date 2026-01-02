@@ -253,7 +253,7 @@ impl<'a> CoreInterpreter<'a> {
             }
             Instruction::UnaryOp { op, arg } => {
                 let arg = self.state.local_env.get(*arg);
-                interpret_unary_op(&self.state, *op, arg).map(Some)
+                interpret_unary_op(&self.state.heap, *op, arg).map(Some)
             }
             Instruction::BinaryOp { left, op, right } => {
                 let left = self.state.local_env.get(*left);

@@ -24,7 +24,7 @@ use crate::ir::{BarrierId, Block, Cfg, Instruction, Label, LocalId, Terminator, 
 
 /// Static entry label to avoid repeated String allocations.
 /// Used for PHI node resolution when entering a block from the CFG entry point.
-static ENTRY_LABEL: LazyLock<Label> = LazyLock::new(|| Label::from("__entry".to_string()));
+pub(crate) static ENTRY_LABEL: LazyLock<Label> = LazyLock::new(|| Label::from("__entry".to_string()));
 
 use super::{
     fixed_env::FixedEnv,
@@ -777,6 +777,9 @@ impl StateAccumulator {
 /// Optimization: Periodically vectorize accumulated results during path enumeration.
 /// This reduces the number of states we need to track and speeds up deduplication
 /// by leveraging vectorized state comparison.
+///
+/// Uses ScalarRuntime for lightweight execution - function calls just push/pop
+/// local environments instead of cloning entire States.
 fn process_lane(
     cfg: &Cfg,
     vec_state: &State,
@@ -784,6 +787,8 @@ fn process_lane(
     fixed_env: &FixedEnv,
     resume_ctx: &ResumeContext,
 ) -> Result<StateAccumulator> {
+    use super::scalar_runtime::run_to_next_barrier_scalar;
+
     let mut accumulator = StateAccumulator::new();
 
     // Extract scalar state for this lane
@@ -802,8 +807,8 @@ fn process_lane(
         // Clone the scalar state for this path
         let run_state = scalar_state.clone();
 
-        // Run until next barrier or completion
-        let run_result = run_to_next_barrier(
+        // Run until next barrier or completion using the lightweight ScalarRuntime
+        let run_result = run_to_next_barrier_scalar(
             cfg,
             run_state,
             fixed_env,

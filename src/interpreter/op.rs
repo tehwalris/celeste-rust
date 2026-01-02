@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use super::{
-    state::State,
+    heap::Heap,
     value::{HeapValue, MaybeVector, Value},
 };
 use crate::{
@@ -18,7 +18,7 @@ fn interpret_not(v: &Value) -> Result<Value> {
 }
 
 #[inline]
-pub fn interpret_unary_op(state: &State, op: UnaryOp, v: &Value) -> Result<Value> {
+pub fn interpret_unary_op(heap: &Heap, op: UnaryOp, v: &Value) -> Result<Value> {
     match (op, v) {
         (UnaryOp::Minus, Value::Number(v)) => Ok(Value::Number(v.map(|v| -*v))),
         (UnaryOp::Minus, Value::NumberInterval(v)) => Ok(Value::NumberInterval(v.map(|v| {
@@ -30,7 +30,7 @@ pub fn interpret_unary_op(state: &State, op: UnaryOp, v: &Value) -> Result<Value
             Pico8Num::from_i16(v.len().try_into().unwrap()),
         ))),
         (UnaryOp::Hash, Value::Pointer(heap_id)) => {
-            match state.heap.get(*heap_id) {
+            match heap.get(*heap_id) {
                 HeapValue::ArrayTable(items) => Ok(Value::Number(MaybeVector::Scalar(
                     Pico8Num::from_i16(items.len().try_into().unwrap()),
                 ))),

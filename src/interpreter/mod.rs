@@ -8,6 +8,7 @@ pub mod inspect;
 pub mod local_env;
 mod op;
 pub mod profiling;
+mod scalar_runtime;
 pub mod state;
 pub mod value;
 pub mod vectorize;
