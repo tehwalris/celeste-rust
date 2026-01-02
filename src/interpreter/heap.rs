@@ -103,6 +103,13 @@ impl Heap {
         self.next_id
     }
 
+    /// Check if the heap is "clean" - i.e., it has no overlay modifications.
+    /// A clean heap has already deterministic structure and doesn't need GC.
+    #[inline]
+    pub fn is_clean(&self) -> bool {
+        self.new_values.is_empty()
+    }
+
     #[inline]
     pub fn alloc(&mut self) -> HeapId {
         let id = HeapId(self.next_id);

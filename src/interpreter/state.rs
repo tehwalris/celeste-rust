@@ -393,6 +393,12 @@ impl State {
     /// 2. Assign new HeapIds in the order values are visited
     /// 3. Create a compacted heap with only reachable values
     pub fn gc(&mut self) {
+        // OPTIMIZATION: Skip GC if heap is already clean (frozen, no modifications)
+        // A clean heap already has deterministic structure from a previous GC/freeze.
+        if self.heap.is_clean() {
+            return;
+        }
+
         // Pre-allocate with capacity based on current heap size
         let heap_len = self.heap.len();
         // Use Vec instead of HashMap for O(1) lookup - HeapIds are sequential 0..heap_len
