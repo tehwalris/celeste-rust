@@ -98,6 +98,16 @@ impl LocalEnvStack {
         stack.push(local_env);
         Self::from_vec(stack)
     }
+
+    /// Make all LocalEnvs unique to avoid COW overhead during mutations.
+    /// Call this after cloning/restoring to front-load COW cost.
+    #[inline]
+    pub fn make_unique(&mut self) {
+        let envs = Arc::make_mut(&mut self.inner);
+        for env in envs.iter_mut() {
+            env.make_unique();
+        }
+    }
 }
 
 /// A mutable runtime for scalar execution between barriers.
@@ -173,6 +183,8 @@ impl RuntimeCheckpoint {
         runtime.global_env = self.global_env.clone();
         runtime.prints = self.prints.clone();
         runtime.local_env_stack = self.local_env_stack.clone();
+        // Make local_env_stack unique to avoid repeated COW checks during execution
+        runtime.local_env_stack.make_unique();
         // Only reset choices_made for the new run, don't touch current_path or max_choices
         runtime.path_counter.choices_made = 0;
     }
