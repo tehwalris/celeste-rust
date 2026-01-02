@@ -90,8 +90,9 @@ impl From<String> for GlobalId {
 
 pub type GlobalIdGenerator = UniqueStringGenerator<GlobalId>;
 
-#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug)]
-pub struct Label(String);
+/// Block label using Arc<String> for O(1) cloning in hot paths.
+#[derive(Clone, Debug)]
+pub struct Label(std::sync::Arc<String>);
 
 impl Label {
     pub fn as_str(&self) -> &str {
@@ -99,9 +100,35 @@ impl Label {
     }
 }
 
+impl PartialEq for Label {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0) || *self.0 == *other.0
+    }
+}
+
+impl Eq for Label {}
+
+impl PartialOrd for Label {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Label {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+impl std::hash::Hash for Label {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
 impl From<String> for Label {
     fn from(s: String) -> Self {
-        Self(s)
+        Self(std::sync::Arc::new(s))
     }
 }
 
