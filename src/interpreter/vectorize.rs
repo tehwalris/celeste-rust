@@ -543,20 +543,33 @@ fn value_from_bool_vec(bools: Vec<bool>) -> Value {
 
 fn merge_local_envs<F>(states: &[State], get_env: F) -> LocalEnv
 where
-    F: Fn(&State) -> &LocalEnv,
+    F: Fn(&State) -> &LocalEnv + Sync,
 {
     let first_env = get_env(&states[0]);
-    let mut merged = LocalEnv::new();
+    let local_ids: Vec<usize> = first_env.iter().map(|(id, _)| id).collect();
 
-    for (local_id, first_value) in first_env.iter() {
-        let value_and_sizes: Vec<_> = states.iter()
-            .map(|s| (get_env(s).get_by_raw_id(local_id).clone(), s.vector_size))
-            .collect();
-        let merged_value = merge_values(&value_and_sizes);
-        merged.set_by_raw_id(local_id, merged_value);
-    }
+    // Parallelize merging when there are many states and variables
+    let merged_values: Vec<(usize, Value)> = if states.len() > 1000 && local_ids.len() > 10 {
+        local_ids.par_iter()
+            .map(|&local_id| {
+                let value_and_sizes: Vec<_> = states.iter()
+                    .map(|s| (get_env(s).get_by_raw_id(local_id).clone(), s.vector_size))
+                    .collect();
+                (local_id, merge_values(&value_and_sizes))
+            })
+            .collect()
+    } else {
+        local_ids.iter()
+            .map(|&local_id| {
+                let value_and_sizes: Vec<_> = states.iter()
+                    .map(|s| (get_env(s).get_by_raw_id(local_id).clone(), s.vector_size))
+                    .collect();
+                (local_id, merge_values(&value_and_sizes))
+            })
+            .collect()
+    };
 
-    merged
+    LocalEnv::from_iter(merged_values.into_iter().map(|(id, v)| (crate::ir::LocalId::from(id), v)))
 }
 
 /// Deduplicate a vectorized state by removing duplicate vector elements.
