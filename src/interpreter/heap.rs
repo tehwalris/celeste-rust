@@ -142,6 +142,7 @@ impl Heap {
         self.get_opt(id).expect("HeapId should point to a valid value")
     }
 
+    #[inline]
     pub fn get_mut(&mut self, id: HeapId) -> &mut HeapValue {
         // Ensure overlay is large enough
         while self.new_values.len() <= id.0 {
