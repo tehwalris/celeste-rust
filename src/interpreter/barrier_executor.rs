@@ -768,7 +768,11 @@ fn process_lane(
     let mut accumulator = StateAccumulator::new();
 
     // Extract scalar state for this lane
-    let scalar_state = extract_scalar_lane(vec_state, lane_idx);
+    let mut scalar_state = extract_scalar_lane(vec_state, lane_idx);
+
+    // Freeze the heap to minimize clone cost during path enumeration.
+    // This moves all values from the overlay to old_values, so clones only copy Arc pointers.
+    scalar_state.heap.freeze();
 
     // Run with PathCounter to enumerate all paths
     let mut path_counter = PathCounter::new();
