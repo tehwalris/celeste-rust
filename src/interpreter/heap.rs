@@ -114,7 +114,16 @@ impl Heap {
 
     #[inline]
     pub fn get_opt(&self, id: HeapId) -> Option<&HeapValue> {
-        // First check the overlay if index is in range
+        // Fast path: if overlay is empty (common after freeze), go directly to old_values
+        if self.new_values.is_empty() {
+            return if id.0 < self.old_values.len() {
+                self.old_values[id.0].as_ref()
+            } else {
+                None
+            };
+        }
+
+        // Check the overlay if index is in range
         if id.0 < self.new_values.len() {
             if let Some(overlay_value) = &self.new_values[id.0] {
                 return overlay_value.as_ref();
