@@ -706,11 +706,18 @@ fn clean_local_envs_for_merging(states: Vec<State>) -> Vec<State> {
         }
     }
 
-    // Remove keys that aren't in the intersection
-    states.into_iter().map(|mut state| {
-        state.local_env.retain(|key: LocalId| common_keys.contains(&usize::from(key)));
-        state
-    }).collect()
+    // Remove keys that aren't in the intersection - parallelize for many states
+    if states.len() > 100 {
+        states.into_par_iter().map(|mut state| {
+            state.local_env.retain(|key: LocalId| common_keys.contains(&usize::from(key)));
+            state
+        }).collect()
+    } else {
+        states.into_iter().map(|mut state| {
+            state.local_env.retain(|key: LocalId| common_keys.contains(&usize::from(key)));
+            state
+        }).collect()
+    }
 }
 
 /// Vectorize a collection of states.
