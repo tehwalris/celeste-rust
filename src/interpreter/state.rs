@@ -369,17 +369,13 @@ impl State {
             new_id
         }
 
-        // Map Value references
+        // Map Value references - only clones if value contains a pointer
+        #[inline]
         fn map_value_references(value: &Value, f: &mut impl FnMut(HeapId) -> HeapId) -> Value {
             match value {
                 Value::Pointer(id) => Value::Pointer(f(*id)),
-                Value::Number(_)
-                | Value::NumberInterval(_)
-                | Value::Bool(_)
-                | Value::UnknownBool
-                | Value::String(_)
-                | Value::Nil(_)
-                | Value::NilPointer(_) => value.clone(),
+                // Non-pointer values can use cheap clone (all use Arc internally)
+                other => other.clone(),
             }
         }
 

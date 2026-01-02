@@ -142,104 +142,52 @@ pub struct CallFrame {
 /// A stack of call frames representing suspended execution.
 /// The innermost (most recently called) function is at the end.
 ///
-/// Uses Arc internally for O(1) cloning - important for path enumeration
-/// where we clone the call stack for each path.
-#[derive(Clone, Debug, Default)]
+/// Uses im::Vector for O(log n) push/pop with structural sharing - important
+/// for path enumeration where we modify and clone the call stack frequently.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct CallStack {
-    /// Arc-wrapped frames for efficient cloning. None means empty.
-    frames: Option<Arc<Vec<CallFrame>>>,
-}
-
-impl PartialEq for CallStack {
-    fn eq(&self, other: &Self) -> bool {
-        match (&self.frames, &other.frames) {
-            (None, None) => true,
-            (Some(a), Some(b)) => Arc::ptr_eq(a, b) || **a == **b,
-            _ => false,
-        }
-    }
-}
-
-impl Eq for CallStack {}
-
-impl std::hash::Hash for CallStack {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        match &self.frames {
-            None => 0usize.hash(state),
-            Some(frames) => frames.hash(state),
-        }
-    }
+    frames: im::Vector<CallFrame>,
 }
 
 impl CallStack {
     pub fn new() -> Self {
-        Self { frames: None }
+        Self { frames: im::Vector::new() }
     }
 
     pub fn from_frames(frames: Vec<CallFrame>) -> Self {
-        if frames.is_empty() {
-            Self { frames: None }
-        } else {
-            Self { frames: Some(Arc::new(frames)) }
-        }
+        Self { frames: frames.into_iter().collect() }
     }
 
     pub fn push(&mut self, frame: CallFrame) {
-        let mut frames = match self.frames.take() {
-            None => Vec::new(),
-            Some(arc) => Arc::try_unwrap(arc).unwrap_or_else(|arc| (*arc).clone()),
-        };
-        frames.push(frame);
-        self.frames = Some(Arc::new(frames));
+        self.frames.push_back(frame);
     }
 
     pub fn pop(&mut self) -> Option<CallFrame> {
-        let arc = self.frames.take()?;
-        let mut frames = Arc::try_unwrap(arc).unwrap_or_else(|arc| (*arc).clone());
-        let result = frames.pop();
-        if !frames.is_empty() {
-            self.frames = Some(Arc::new(frames));
-        }
-        result
+        self.frames.pop_back()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.frames.is_none()
+        self.frames.is_empty()
     }
 
     /// Get the number of frames in the stack.
     pub fn len(&self) -> usize {
-        match &self.frames {
-            None => 0,
-            Some(frames) => frames.len(),
-        }
+        self.frames.len()
     }
 
     /// Get an iterator over the frames (from outermost to innermost).
     pub fn iter(&self) -> impl Iterator<Item = &CallFrame> {
-        self.frames.iter().flat_map(|frames| frames.iter())
+        self.frames.iter()
     }
 
     /// Insert a frame at the front (making it the outermost frame).
     pub fn insert_front(&mut self, frame: CallFrame) {
-        let mut frames = match self.frames.take() {
-            None => Vec::new(),
-            Some(arc) => Arc::try_unwrap(arc).unwrap_or_else(|arc| (*arc).clone()),
-        };
-        frames.insert(0, frame);
-        self.frames = Some(Arc::new(frames));
+        self.frames.push_front(frame);
     }
 
     /// Extend with frames from another CallStack.
     pub fn extend(&mut self, other: CallStack) {
-        if let Some(other_frames) = other.frames {
-            let mut frames = match self.frames.take() {
-                None => Vec::new(),
-                Some(arc) => Arc::try_unwrap(arc).unwrap_or_else(|arc| (*arc).clone()),
-            };
-            frames.extend(other_frames.iter().cloned());
-            self.frames = Some(Arc::new(frames));
-        }
+        self.frames.append(other.frames);
     }
 }
 
