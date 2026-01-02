@@ -3,6 +3,10 @@ name = "celeste-rust"
 version = "0.1.0"
 edition = "2021"
 
+[profile.release]
+lto = true
+codegen-units = 1
+
 [dependencies]
 tikv-jemallocator = "0.6"
 bv = "0.11.1"
