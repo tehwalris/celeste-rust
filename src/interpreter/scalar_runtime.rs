@@ -7,6 +7,8 @@
 //! Key optimization: Function calls just push/pop on local_env_stack (O(1)) instead
 //! of cloning State components.
 
+use std::sync::Arc;
+
 use rustc_hash::FxHashMap;
 
 use anyhow::{anyhow, Result};
@@ -23,6 +25,80 @@ use super::{
     value::{HeapValue, MaybeVector, Value},
 };
 
+/// A COW (copy-on-write) stack of local environments for O(1) cloning.
+/// Uses Arc<Vec<LocalEnv>> internally so cloning is O(1) instead of O(n).
+/// Mutations trigger COW via Arc::make_mut.
+#[derive(Clone, Debug)]
+pub struct LocalEnvStack {
+    inner: Arc<Vec<LocalEnv>>,
+}
+
+impl LocalEnvStack {
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Vec::new()),
+        }
+    }
+
+    #[inline]
+    pub fn from_vec(envs: Vec<LocalEnv>) -> Self {
+        Self {
+            inner: Arc::new(envs),
+        }
+    }
+
+    #[inline]
+    pub fn push(&mut self, env: LocalEnv) {
+        Arc::make_mut(&mut self.inner).push(env);
+    }
+
+    #[inline]
+    pub fn pop(&mut self) -> Option<LocalEnv> {
+        Arc::make_mut(&mut self.inner).pop()
+    }
+
+    #[inline]
+    pub fn last(&self) -> Option<&LocalEnv> {
+        self.inner.last()
+    }
+
+    #[inline]
+    pub fn last_mut(&mut self) -> Option<&mut LocalEnv> {
+        Arc::make_mut(&mut self.inner).last_mut()
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Convert to (local_env, outer_local_envs) by popping and reversing.
+    /// Consumes the stack.
+    pub fn into_state_components(mut self) -> (LocalEnv, OuterLocalEnvs) {
+        let local_env = self.pop().expect("stack should not be empty");
+        // Reverse: we need index 0 to be most recent caller
+        let mut envs = Arc::try_unwrap(self.inner).unwrap_or_else(|arc| (*arc).clone());
+        envs.reverse();
+        (local_env, OuterLocalEnvs::from_vec(envs))
+    }
+
+    /// Create from State's outer_local_envs and local_env.
+    pub fn from_state_components(outer: &OuterLocalEnvs, local_env: LocalEnv) -> Self {
+        // outer_local_envs has most recent caller at index 0
+        // We want oldest at index 0, so reverse
+        let mut stack: Vec<LocalEnv> = outer.iter().cloned().collect();
+        stack.reverse();
+        stack.push(local_env);
+        Self::from_vec(stack)
+    }
+}
+
 /// A mutable runtime for scalar execution between barriers.
 ///
 /// This is designed to be lightweight - function calls just push/pop on the
@@ -37,7 +113,8 @@ pub struct ScalarRuntime<'a> {
     /// Stack of local environments. Last element = current function.
     /// On function call: push new local_env
     /// On return: pop
-    pub local_env_stack: Vec<LocalEnv>,
+    /// Uses Arc<Vec> for O(1) cloning during checkpoint/restore.
+    pub local_env_stack: LocalEnvStack,
     /// The fixed environment (function definitions, builtins)
     pub fixed_env: &'a FixedEnv,
     /// Path counter for abstract branching decisions
@@ -52,7 +129,7 @@ pub struct RuntimeCheckpoint {
     heap: Heap,
     global_env: GlobalEnv,
     prints: Prints,
-    local_env_stack: Vec<LocalEnv>,
+    local_env_stack: LocalEnvStack,
     /// PathCounter state at checkpoint time
     path_counter_state: PathCounterCheckpoint,
 }
@@ -104,12 +181,7 @@ impl<'a> ScalarRuntime<'a> {
     /// Create a new scalar runtime from a State.
     pub fn from_state(state: State, fixed_env: &'a FixedEnv, path_counter: &'a mut PathCounter) -> Self {
         // Convert outer_local_envs + local_env into a stack
-        // Stack order: [oldest outer, ..., newest outer, current]
-        let mut local_env_stack: Vec<LocalEnv> = state.outer_local_envs.iter().cloned().collect();
-        // outer_local_envs is stored with caller at index 0 (most recent caller)
-        // We want oldest at index 0, so reverse
-        local_env_stack.reverse();
-        local_env_stack.push(state.local_env);
+        let local_env_stack = LocalEnvStack::from_state_components(&state.outer_local_envs, state.local_env);
 
         Self {
             heap: state.heap,
@@ -122,11 +194,8 @@ impl<'a> ScalarRuntime<'a> {
     }
 
     /// Convert the runtime back to a State.
-    pub fn into_state(mut self) -> State {
-        let local_env = self.local_env_stack.pop().expect("local_env_stack should not be empty");
-        // Reverse back: index 0 becomes most recent caller
-        self.local_env_stack.reverse();
-        let outer_local_envs = OuterLocalEnvs::from_vec(self.local_env_stack);
+    pub fn into_state(self) -> State {
+        let (local_env, outer_local_envs) = self.local_env_stack.into_state_components();
 
         State {
             heap: self.heap,
@@ -151,14 +220,12 @@ impl<'a> ScalarRuntime<'a> {
     }
 
     /// Push a new local environment for a function call.
-    /// This is O(1) amortized - no cloning of heap/global_env/prints!
     #[inline]
     pub fn push_local_env(&mut self, local_env: LocalEnv) {
         self.local_env_stack.push(local_env);
     }
 
     /// Pop the current function's local environment (for return).
-    /// This is O(1) - no cloning!
     #[inline]
     pub fn pop_local_env(&mut self) -> LocalEnv {
         self.local_env_stack.pop().expect("local_env_stack should not be empty")
@@ -521,11 +588,9 @@ impl<'a> ScalarRuntime<'a> {
 
     /// Create a State snapshot from current runtime state.
     /// This clones the runtime state to create a new State.
+    /// Uses Arc-based cloning for O(1) local_env_stack clone.
     pub fn snapshot_to_state(&self) -> State {
-        let mut local_env_stack = self.local_env_stack.clone();
-        let local_env = local_env_stack.pop().expect("stack not empty");
-        local_env_stack.reverse();
-        let outer_local_envs = OuterLocalEnvs::from_vec(local_env_stack);
+        let (local_env, outer_local_envs) = self.local_env_stack.clone().into_state_components();
 
         State {
             heap: self.heap.clone(),
@@ -543,10 +608,7 @@ impl<'a> ScalarRuntime<'a> {
         self.global_env = state.global_env;
         self.prints = state.prints;
         // Restore local_env_stack
-        let mut new_stack: Vec<LocalEnv> = state.outer_local_envs.iter().cloned().collect();
-        new_stack.reverse();
-        new_stack.push(state.local_env);
-        self.local_env_stack = new_stack;
+        self.local_env_stack = LocalEnvStack::from_state_components(&state.outer_local_envs, state.local_env);
     }
 }
 
