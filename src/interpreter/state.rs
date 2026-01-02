@@ -107,6 +107,11 @@ impl Prints {
     pub fn len(&self) -> usize {
         self.inner.len()
     }
+
+    /// Get a reference to the inner Arc for efficient cloning in shapes.
+    pub fn inner_arc(&self) -> &Arc<Vec<String>> {
+        &self.inner
+    }
 }
 
 impl PartialEq for Prints {

@@ -21,7 +21,7 @@ use crate::pico8_num::{Pico8Num, Pico8NumInterval};
 
 /// A "shape" is a state with all vectorizable values normalized to placeholder values.
 /// States with the same shape can be merged by vectorizing their values.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StateShape {
     // For shape comparison, we normalize all vectorizable values to placeholders
     // but keep the structure (heap IDs, table shapes, etc.)
@@ -30,7 +30,19 @@ pub struct StateShape {
     outer_local_envs_structure: Vec<Vec<(usize, ValueShape)>>,
     // global_env as sorted Vec for consistent hashing (ImHashMap's Hash is buggy)
     global_env: Vec<(String, HeapId)>,
-    prints: Vec<String>,
+    // Use Arc for prints to avoid cloning the Vec
+    prints: std::sync::Arc<Vec<String>>,
+}
+
+impl std::hash::Hash for StateShape {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.heap_structure.hash(state);
+        self.local_env_structure.hash(state);
+        self.outer_local_envs_structure.hash(state);
+        self.global_env.hash(state);
+        // Hash the Vec contents, not the Arc pointer
+        (*self.prints).hash(state);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -154,7 +166,7 @@ fn shape_of_state(state: &State) -> StateShape {
         local_env_structure,
         outer_local_envs_structure,
         global_env,
-        prints: state.prints.as_slice().to_vec(),
+        prints: state.prints.inner_arc().clone(),
     }
 }
 
