@@ -774,11 +774,25 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
     let states = clean_local_envs_for_merging(states);
     stats.clean_local_envs_ns = t1.elapsed().as_nanos() as u64;
 
-    // Group states by shape
+    // Group states by shape - compute shapes in parallel for many states
     let t2 = std::time::Instant::now();
+    let states_with_shapes: Vec<(StateShape, State)> = if states.len() > 100 {
+        states.into_par_iter()
+            .map(|state| {
+                let shape = shape_of_state(&state);
+                (shape, state)
+            })
+            .collect()
+    } else {
+        states.into_iter()
+            .map(|state| {
+                let shape = shape_of_state(&state);
+                (shape, state)
+            })
+            .collect()
+    };
     let mut states_by_shape: FxHashMap<StateShape, Vec<State>> = FxHashMap::default();
-    for state in states {
-        let shape = shape_of_state(&state);
+    for (shape, state) in states_with_shapes {
         states_by_shape.entry(shape).or_insert_with(Vec::new).push(state);
     }
     stats.shape_grouping_ns = t2.elapsed().as_nanos() as u64;
