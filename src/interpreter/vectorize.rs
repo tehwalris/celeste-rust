@@ -14,7 +14,7 @@ use super::{
     heap::{Heap, HeapId},
     local_env::LocalEnv,
     state::State,
-    value::{CapturedValues, HeapValue, MaybeVector, Value},
+    value::{BuiltinName, CapturedValues, HeapValue, MaybeVector, Value},
 };
 use crate::ir::GlobalId;
 use crate::pico8_num::{Pico8Num, Pico8NumInterval};
@@ -52,7 +52,7 @@ enum HeapValueShape {
     ArrayTable(Vec<HeapId>),
     UnknownTable,
     Closure(GlobalId, Vec<ValueShape>),
-    BuiltinFun(String),
+    BuiltinFun(BuiltinName),
     /// Empty slot (allocated but never set)
     Empty,
 }
@@ -117,7 +117,7 @@ fn normalize_heap_value_for_shape(value: &HeapValue) -> HeapValueShape {
                 captures.iter().map(normalize_value_for_shape).collect(),
             )
         }
-        HeapValue::BuiltinFun(name) => HeapValueShape::BuiltinFun(name.as_str().to_string()),
+        HeapValue::BuiltinFun(name) => HeapValueShape::BuiltinFun(name.clone()),
     }
 }
 
