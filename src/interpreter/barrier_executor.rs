@@ -836,7 +836,6 @@ fn process_lane(
         if !runtime.path_counter.increment() {
             break;
         }
-        runtime.path_counter.reset_for_new_run();
     }
 
     accumulator.vectorize_in_place();

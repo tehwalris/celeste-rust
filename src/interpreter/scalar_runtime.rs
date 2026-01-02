@@ -85,16 +85,18 @@ impl RuntimeCheckpoint {
 
     /// Restore runtime state from this checkpoint.
     /// This is O(1) - just replaces Arc pointers.
-    /// Also restores PathCounter state so function calls work correctly.
+    ///
+    /// NOTE: This only restores the execution state (heap, envs, etc.) and
+    /// resets choices_made for the new run. It does NOT restore current_path
+    /// or max_choices because those are used for path enumeration.
     #[inline]
     pub fn restore_to(&self, runtime: &mut ScalarRuntime) {
         runtime.heap = self.heap.clone();
         runtime.global_env = self.global_env.clone();
         runtime.prints = self.prints.clone();
         runtime.local_env_stack = self.local_env_stack.clone();
-        runtime.path_counter.current_path = self.path_counter_state.current_path;
-        runtime.path_counter.choices_made = self.path_counter_state.choices_made;
-        runtime.path_counter.max_choices = self.path_counter_state.max_choices;
+        // Only reset choices_made for the new run, don't touch current_path or max_choices
+        runtime.path_counter.choices_made = 0;
     }
 }
 
