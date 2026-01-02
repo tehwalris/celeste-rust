@@ -123,7 +123,17 @@ impl LocalEnv {
     pub fn set(&mut self, id: LocalId, value: Value) {
         let idx = usize::from(id);
 
-        // Ensure the Vec is large enough
+        // Fast path: if we have unique ownership, we can mutate in place
+        // Arc::get_mut returns Some only if strong_count == 1 and weak_count == 0
+        if let Some(values) = Arc::get_mut(&mut self.values) {
+            if idx >= values.len() {
+                values.resize(idx + 1, None);
+            }
+            values[idx] = Some(value);
+            return;
+        }
+
+        // Slow path: need COW
         let values = Arc::make_mut(&mut self.values);
         if idx >= values.len() {
             values.resize(idx + 1, None);
@@ -181,5 +191,12 @@ impl LocalEnv {
     /// Set value by raw usize id
     pub fn set_by_raw_id(&mut self, raw_id: usize, value: Value) {
         self.set(LocalId::from(raw_id), value);
+    }
+
+    /// Make the underlying Vec unique, so subsequent mutations don't need COW.
+    /// Call this after cloning if you know you'll be mutating the environment.
+    #[inline]
+    pub fn make_unique(&mut self) {
+        Arc::make_mut(&mut self.values);
     }
 }
