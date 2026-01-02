@@ -365,6 +365,17 @@ fn vectorize_same_shape_states(states: Vec<State>) -> State {
 }
 
 fn merge_heap_values_from_states(states: &[State], id: HeapId) -> HeapValue {
+    // Fast path: check if first value is a non-vectorizable type
+    // that doesn't need merging (just return the first one)
+    let first_heap_value = states[0].heap.get(id);
+    match first_heap_value {
+        HeapValue::ObjectTable(_) | HeapValue::ArrayTable(_) | HeapValue::UnknownTable | HeapValue::BuiltinFun(_) => {
+            // These types don't merge - just return the first one (they should all be identical)
+            return first_heap_value.clone();
+        }
+        _ => {}
+    }
+
     let values: Vec<_> = states.iter()
         .map(|s| (s.heap.get(id).clone(), s.vector_size))
         .collect();
