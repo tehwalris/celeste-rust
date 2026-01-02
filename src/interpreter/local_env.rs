@@ -161,6 +161,12 @@ impl LocalEnv {
             .filter_map(|(i, v)| v.as_ref().map(|val| (i, val)))
     }
 
+    /// Get the capacity (total slots, including None) of the local env
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.values.len()
+    }
+
     /// Get value by raw usize id
     pub fn get_by_raw_id(&self, raw_id: usize) -> &Value {
         self.get(LocalId::from(raw_id))
