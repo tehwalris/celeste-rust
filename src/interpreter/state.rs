@@ -332,8 +332,10 @@ impl State {
     /// 2. Assign new HeapIds in the order values are visited
     /// 3. Create a compacted heap with only reachable values
     pub fn gc(&mut self) {
-        let mut old_to_new: FxHashMap<HeapId, HeapId> = FxHashMap::default();
-        let mut new_heap_values: Vec<HeapValue> = Vec::new();
+        // Pre-allocate with capacity based on current heap size
+        let heap_len = self.heap.len();
+        let mut old_to_new: FxHashMap<HeapId, HeapId> = FxHashMap::with_capacity_and_hasher(heap_len, Default::default());
+        let mut new_heap_values: Vec<HeapValue> = Vec::with_capacity(heap_len);
 
         // Visit a heap ID, assigning a new ID if not yet visited
         // Returns the new ID
