@@ -9,10 +9,12 @@ use super::value::HeapValue;
 pub struct HeapId(usize);
 
 impl HeapId {
+    #[inline]
     pub fn from_raw(id: usize) -> Self {
         Self(id)
     }
 
+    #[inline]
     pub fn raw(&self) -> usize {
         self.0
     }
@@ -97,10 +99,12 @@ impl Heap {
         }
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         self.next_id
     }
 
+    #[inline]
     pub fn alloc(&mut self) -> HeapId {
         let id = HeapId(self.next_id);
         self.next_id += 1;
