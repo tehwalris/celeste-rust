@@ -1,10 +1,6 @@
-use std::hash::BuildHasherDefault;
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
-
-use im::HashMap as ImHashMap;
-use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -14,11 +10,73 @@ use super::{
 };
 use crate::ir::LocalId;
 
-/// FxHasher-based BuildHasher for im::HashMap
-type FxBuildHasher = BuildHasherDefault<FxHasher>;
+/// A global environment wrapping FxHashMap in Arc for O(1) cloning.
+/// Uses COW semantics - mutations require cloning if the Arc is shared.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GlobalEnv {
+    inner: Arc<FxHashMap<String, HeapId>>,
+}
 
-/// im::HashMap using FxHasher for faster hashing
-type FxImHashMap<K, V> = ImHashMap<K, V, FxBuildHasher>;
+impl GlobalEnv {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(FxHashMap::default()),
+        }
+    }
+
+    #[inline]
+    pub fn get(&self, key: &str) -> Option<&HeapId> {
+        self.inner.get(key)
+    }
+
+    pub fn insert(&mut self, key: String, value: HeapId) {
+        Arc::make_mut(&mut self.inner).insert(key, value);
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &HeapId)> {
+        self.inner.iter()
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &String> {
+        self.inner.keys()
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+}
+
+impl Default for GlobalEnv {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PartialEq for GlobalEnv {
+    fn eq(&self, other: &Self) -> bool {
+        // Fast path: same Arc means definitely equal
+        if Arc::ptr_eq(&self.inner, &other.inner) {
+            return true;
+        }
+        // Compare contents
+        *self.inner == *other.inner
+    }
+}
+
+impl Eq for GlobalEnv {}
+
+impl std::ops::Index<&str> for GlobalEnv {
+    type Output = HeapId;
+
+    fn index(&self, key: &str) -> &Self::Output {
+        &self.inner[key]
+    }
+}
 
 /// Wrapper for prints Vec with Arc for O(1) cloning and COW semantics.
 /// Uses Arc internally for efficient structural sharing.
@@ -147,7 +205,7 @@ pub struct State {
     pub heap: Heap,
     pub local_env: LocalEnv,
     pub outer_local_envs: OuterLocalEnvs,
-    pub global_env: FxImHashMap<String, HeapId>,
+    pub global_env: GlobalEnv,
     pub prints: Prints,
     pub vector_size: usize,
 }
@@ -158,7 +216,7 @@ impl State {
             heap: Heap::new(),
             local_env: LocalEnv::new(),
             outer_local_envs: OuterLocalEnvs::new(),
-            global_env: FxImHashMap::default(),
+            global_env: GlobalEnv::new(),
             prints: Prints::new(),
             vector_size: 1,
         }
@@ -361,7 +419,7 @@ impl State {
         // Visit all roots from global_env (sorted for deterministic order)
         let mut global_keys: Vec<_> = self.global_env.keys().cloned().collect();
         global_keys.sort_unstable();
-        let mut new_global_env = FxImHashMap::default();
+        let mut new_global_env = GlobalEnv::new();
         for key in global_keys {
             let old_id = self.global_env[&key];
             let new_id = visit(old_id, &self.heap, &mut old_to_new, &mut new_heap_values);
