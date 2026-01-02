@@ -7,6 +7,7 @@
 //! 3. Deduplicate vectors (remove duplicate elements)
 //! 4. If vector size becomes 1, convert back to scalars
 
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use super::{
@@ -783,16 +784,30 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
     stats.shape_grouping_ns = t2.elapsed().as_nanos() as u64;
     stats.group_count = states_by_shape.len();
 
-    // Vectorize each group
+    // Vectorize each group in parallel (for many groups, parallelism helps)
     let t3 = std::time::Instant::now();
-    let result: Vec<State> = states_by_shape
-        .into_iter()
-        .map(|(_, group)| {
-            let vectorized = vectorize_same_shape_states(group);
-            let deduped = dedup_vectorized_state(vectorized);
-            unvectorize_if_possible(deduped)
-        })
-        .collect();
+    let groups: Vec<Vec<State>> = states_by_shape.into_values().collect();
+    let result: Vec<State> = if groups.len() > 4 {
+        // Use parallel processing for many groups
+        groups
+            .into_par_iter()
+            .map(|group| {
+                let vectorized = vectorize_same_shape_states(group);
+                let deduped = dedup_vectorized_state(vectorized);
+                unvectorize_if_possible(deduped)
+            })
+            .collect()
+    } else {
+        // Sequential for few groups to avoid parallel overhead
+        groups
+            .into_iter()
+            .map(|group| {
+                let vectorized = vectorize_same_shape_states(group);
+                let deduped = dedup_vectorized_state(vectorized);
+                unvectorize_if_possible(deduped)
+            })
+            .collect()
+    };
     stats.vectorize_groups_ns = t3.elapsed().as_nanos() as u64;
 
     // Validate output states
