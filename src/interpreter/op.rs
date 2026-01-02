@@ -17,6 +17,7 @@ fn interpret_not(v: &Value) -> Result<Value> {
     }
 }
 
+#[inline]
 pub fn interpret_unary_op(state: &State, op: UnaryOp, v: &Value) -> Result<Value> {
     match (op, v) {
         (UnaryOp::Minus, Value::Number(v)) => Ok(Value::Number(v.map(|v| -*v))),
@@ -52,6 +53,7 @@ pub fn interpret_unary_op(state: &State, op: UnaryOp, v: &Value) -> Result<Value
 fn lift_to_interval(v: &MaybeVector<Pico8Num>) -> MaybeVector<Pico8NumInterval> {
     v.map_to(|n| Pico8NumInterval::from_number(*n))
 }
+#[inline]
 pub fn interpret_binary_op(l: &Value, op: BinaryOp, r: &Value) -> Result<Value> {
     let sb = |b| Ok(Value::Bool(MaybeVector::Scalar(b)));
 
