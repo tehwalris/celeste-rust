@@ -394,21 +394,21 @@ impl<'a> ScalarRuntime<'a> {
                     .get(&fun_def_name)
                     .ok_or_else(|| anyhow!("Unknown function: {:?}", fun_def_name))?;
 
-                // Create new local_env for the function
-                let mut new_local_env = LocalEnv::new();
+                // Build new local_env efficiently using from_iter (single allocation)
+                let capture_bindings = fun_def.capture_ids.iter()
+                    .zip(captured_values.iter())
+                    .map(|(id, value)| (*id, value.clone()));
 
-                // Set up captured values
-                for (capture_id, value) in fun_def.capture_ids.iter().zip(captured_values.iter()) {
-                    new_local_env.set(*capture_id, value.clone());
-                }
+                let arg_bindings = fun_def.arg_ids.iter()
+                    .enumerate()
+                    .filter_map(|(i, arg_id)| {
+                        arg_id.map(|id| {
+                            let value = arg_values.get(i).cloned().unwrap_or(Value::Nil(None));
+                            (id, value)
+                        })
+                    });
 
-                // Set up argument values
-                for (i, arg_id) in fun_def.arg_ids.iter().enumerate() {
-                    if let Some(arg_id) = arg_id {
-                        let value = arg_values.get(i).cloned().unwrap_or(Value::Nil(None));
-                        new_local_env.set(*arg_id, value);
-                    }
-                }
+                let new_local_env = LocalEnv::from_iter(capture_bindings.chain(arg_bindings));
 
                 // Push new local_env (this is the key optimization - no State cloning!)
                 self.push_local_env(new_local_env);

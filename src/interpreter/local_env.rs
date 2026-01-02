@@ -127,7 +127,9 @@ impl LocalEnv {
         // Arc::get_mut returns Some only if strong_count == 1 and weak_count == 0
         if let Some(values) = Arc::get_mut(&mut self.values) {
             if idx >= values.len() {
-                values.resize(idx + 1, None);
+                // Grow by at least 2x to amortize resize costs
+                let new_len = (idx + 1).max(values.len() * 2).max(16);
+                values.resize(new_len, None);
             }
             values[idx] = Some(value);
             return;
@@ -136,7 +138,9 @@ impl LocalEnv {
         // Slow path: need COW
         let values = Arc::make_mut(&mut self.values);
         if idx >= values.len() {
-            values.resize(idx + 1, None);
+            // Grow by at least 2x to amortize resize costs
+            let new_len = (idx + 1).max(values.len() * 2).max(16);
+            values.resize(new_len, None);
         }
         values[idx] = Some(value);
     }
