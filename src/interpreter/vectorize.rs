@@ -405,18 +405,113 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
 
     // Check if vectorizable based on the value type
     if can_vectorize_value(first_value) {
-        // Expand all values to their scalar forms, then combine into a vector
-        let all_scalars: Vec<ScalarValue> = values.iter()
-            .flat_map(|(v, size)| expand_value_to_scalars(v, *size))
-            .collect();
-        value_from_scalars(all_scalars)
+        // Pre-calculate total size for efficient allocation
+        let total_size: usize = values.iter().map(|(_, size)| *size).sum();
+
+        // Build the vector directly without intermediate allocations
+        match first_value {
+            Value::Number(_) => {
+                let mut nums = Vec::with_capacity(total_size);
+                for (v, size) in values {
+                    match v {
+                        Value::Number(MaybeVector::Scalar(n)) => {
+                            nums.extend(std::iter::repeat(*n).take(*size));
+                        }
+                        Value::Number(MaybeVector::Vector(vec)) => {
+                            nums.extend(vec.iter().copied());
+                        }
+                        _ => panic!("Mixed types in vector merge"),
+                    }
+                }
+                value_from_number_vec(nums)
+            }
+            Value::NumberInterval(_) => {
+                let mut intervals = Vec::with_capacity(total_size);
+                for (v, size) in values {
+                    match v {
+                        Value::NumberInterval(MaybeVector::Scalar(n)) => {
+                            intervals.extend(std::iter::repeat(*n).take(*size));
+                        }
+                        Value::NumberInterval(MaybeVector::Vector(vec)) => {
+                            intervals.extend(vec.iter().copied());
+                        }
+                        _ => panic!("Mixed types in vector merge"),
+                    }
+                }
+                value_from_interval_vec(intervals)
+            }
+            Value::Bool(_) => {
+                let mut bools = Vec::with_capacity(total_size);
+                for (v, size) in values {
+                    match v {
+                        Value::Bool(MaybeVector::Scalar(b)) => {
+                            bools.extend(std::iter::repeat(*b).take(*size));
+                        }
+                        Value::Bool(MaybeVector::Vector(vec)) => {
+                            bools.extend(vec.iter().copied());
+                        }
+                        _ => panic!("Mixed types in vector merge"),
+                    }
+                }
+                value_from_bool_vec(bools)
+            }
+            _ => unreachable!("can_vectorize_value returned true for non-vectorizable type"),
+        }
     } else {
         // Non-vectorizable: all values must be equal (as whole Values)
-        let all_values: Vec<&Value> = values.iter().map(|(v, _)| v).collect();
-        if !all_values.iter().all(|v| *v == first_value) {
-            panic!("Non-vectorizable values are not equal: {:?}", all_values);
+        for (v, _) in values.iter().skip(1) {
+            if v != first_value {
+                panic!("Non-vectorizable values are not equal");
+            }
         }
         first_value.clone()
+    }
+}
+
+// Helper functions to convert Vecs directly to Values, avoiding ScalarValue intermediate
+fn value_from_number_vec(nums: Vec<Pico8Num>) -> Value {
+    if nums.is_empty() {
+        panic!("Cannot build value from empty vec");
+    }
+    if nums.len() == 1 {
+        return Value::Number(MaybeVector::Scalar(nums[0]));
+    }
+    // Check if all identical
+    let first = nums[0];
+    if nums.iter().all(|n| *n == first) {
+        Value::Number(MaybeVector::Scalar(first))
+    } else {
+        Value::Number(MaybeVector::Vector(nums))
+    }
+}
+
+fn value_from_interval_vec(intervals: Vec<Pico8NumInterval>) -> Value {
+    if intervals.is_empty() {
+        panic!("Cannot build value from empty vec");
+    }
+    if intervals.len() == 1 {
+        return Value::NumberInterval(MaybeVector::Scalar(intervals[0]));
+    }
+    let first = intervals[0];
+    if intervals.iter().all(|n| *n == first) {
+        Value::NumberInterval(MaybeVector::Scalar(first))
+    } else {
+        Value::NumberInterval(MaybeVector::Vector(intervals))
+    }
+}
+
+fn value_from_bool_vec(bools: Vec<bool>) -> Value {
+    if bools.is_empty() {
+        panic!("Cannot build value from empty vec");
+    }
+    if bools.len() == 1 {
+        return Value::Bool(MaybeVector::Scalar(bools[0]));
+    }
+    let first = bools[0];
+    if bools.iter().all(|b| *b == first) {
+        Value::Bool(MaybeVector::Scalar(first))
+    } else {
+        Value::Bool(MaybeVector::Vector(bools))
     }
 }
 
