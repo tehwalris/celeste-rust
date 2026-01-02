@@ -73,8 +73,9 @@ impl<T: From<String>> UniqueStringGenerator<T> {
     }
 }
 
-#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug, Serialize, Deserialize)]
-pub struct GlobalId(String);
+/// Global identifier using Arc<String> for O(1) cloning in hot paths.
+#[derive(Clone, Debug)]
+pub struct GlobalId(std::sync::Arc<String>);
 
 impl GlobalId {
     pub fn as_str(&self) -> &str {
@@ -82,9 +83,56 @@ impl GlobalId {
     }
 }
 
+impl PartialEq for GlobalId {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0) || *self.0 == *other.0
+    }
+}
+
+impl Eq for GlobalId {}
+
+impl PartialOrd for GlobalId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for GlobalId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+impl std::hash::Hash for GlobalId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
 impl From<String> for GlobalId {
     fn from(s: String) -> Self {
-        Self(s)
+        Self(std::sync::Arc::new(s))
+    }
+}
+
+// Custom Serialize that serializes just the string content
+impl Serialize for GlobalId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+// Custom Deserialize that wraps in Arc
+impl<'de> Deserialize<'de> for GlobalId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(Self(std::sync::Arc::new(s)))
     }
 }
 
