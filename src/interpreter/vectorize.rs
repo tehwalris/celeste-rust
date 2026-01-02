@@ -127,21 +127,17 @@ fn shape_of_state(state: &State) -> StateShape {
         heap_structure.push((id, shape));
     }
 
-    // Get local env structure (sorted for consistent comparison)
-    // The local_env iter already returns entries in index order, so sorting is often a no-op
-    let mut local_env_structure: Vec<_> = state.local_env.iter()
+    // Get local env structure (already in deterministic order since LocalEnv iterates by index)
+    let local_env_structure: Vec<_> = state.local_env.iter()
         .map(|(k, v)| (k, normalize_value_for_shape(v)))
         .collect();
-    local_env_structure.sort_unstable_by_key(|(k, _)| *k);
 
-    // Get outer local envs structure (sorted for consistent comparison)
+    // Get outer local envs structure (already in deterministic order)
     let outer_local_envs_structure: Vec<Vec<_>> = state.outer_local_envs.iter()
         .map(|env| {
-            let mut entries: Vec<_> = env.iter()
+            env.iter()
                 .map(|(k, v)| (k, normalize_value_for_shape(v)))
-                .collect();
-            entries.sort_unstable_by_key(|(k, _)| *k);
-            entries
+                .collect()
         })
         .collect();
 
@@ -893,20 +889,16 @@ fn extract_vectorizable_values_from_state(state: &State) -> Vec<VectorizableValu
         }
     }
 
-    // Extract from local_env (sorted by key for determinism)
-    let mut local_entries: Vec<_> = state.local_env.iter().collect();
-    local_entries.sort_by_key(|(k, _)| *k);
-    for (_, v) in local_entries {
+    // Extract from local_env (already in deterministic order since LocalEnv iterates by index)
+    for (_, v) in state.local_env.iter() {
         if let Some(vv) = extract_vectorizable_value(v) {
             values.push(vv);
         }
     }
 
-    // Extract from outer_local_envs
-    for env in &state.outer_local_envs {
-        let mut entries: Vec<_> = env.iter().collect();
-        entries.sort_by_key(|(k, _)| *k);
-        for (_, v) in entries {
+    // Extract from outer_local_envs (already in deterministic order)
+    for env in state.outer_local_envs.iter() {
+        for (_, v) in env.iter() {
             if let Some(vv) = extract_vectorizable_value(v) {
                 values.push(vv);
             }
