@@ -442,29 +442,19 @@ fn dedup_vectorized_state(mut state: State) -> State {
     }
 
     // For each index, create a tuple of all vector values at that index
-    // Then sort and dedup by this tuple
-    let indices: Vec<usize> = (0..state.vector_size).collect();
+    // Use HashSet for O(n) deduplication instead of O(n log n) sorting
+    use rustc_hash::FxHashSet;
 
-    // Create a comparison key for each index
-    let mut index_keys: Vec<(usize, Vec<ScalarValue>)> = indices
-        .iter()
-        .map(|&i| {
-            let key: Vec<ScalarValue> = vector_values
-                .iter()
-                .map(|vec| scalar_at_index(vec, i))
-                .collect();
-            (i, key)
-        })
-        .collect();
-
-    // Sort by key and keep only unique indices
-    index_keys.sort_by(|a, b| a.1.cmp(&b.1));
+    let mut seen: FxHashSet<Vec<ScalarValue>> = FxHashSet::default();
     let mut unique_indices: Vec<usize> = Vec::new();
-    let mut last_key: Option<Vec<ScalarValue>> = None;
-    for (i, key) in index_keys {
-        if last_key.as_ref() != Some(&key) {
+
+    for i in 0..state.vector_size {
+        let key: Vec<ScalarValue> = vector_values
+            .iter()
+            .map(|vec| scalar_at_index(vec, i))
+            .collect();
+        if seen.insert(key) {
             unique_indices.push(i);
-            last_key = Some(key);
         }
     }
 
