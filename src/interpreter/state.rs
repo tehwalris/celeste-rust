@@ -392,13 +392,14 @@ impl State {
                 HeapValue::Value(v) => HeapValue::Value(map_value_references(v, &mut f)),
                 HeapValue::ObjectTable(table) => {
                     // IMPORTANT: Sort keys for deterministic traversal order!
-                    let mut keys: Vec<_> = table.keys().cloned().collect();
+                    // Collect references to avoid cloning strings until we build the new table
+                    let mut keys: Vec<_> = table.keys().collect();
                     keys.sort_unstable();
                     let new_table: FxHashMap<String, HeapId> = keys
                         .into_iter()
                         .map(|k| {
-                            let v = table[&k];
-                            (k, f(v))
+                            let v = table[k];
+                            (k.clone(), f(v))
                         })
                         .collect();
                     HeapValue::ObjectTable(new_table)
