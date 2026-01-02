@@ -751,10 +751,17 @@ impl StateAccumulator {
     /// This merges states with identical shapes into vectorized states.
     /// Also GCs states before vectorization to get deterministic heap IDs.
     fn vectorize_in_place(&mut self) {
+        use rayon::prelude::*;
+
         for states in self.states_by_dest.values_mut() {
             // GC all states first to get deterministic heap IDs (required for vectorization)
-            for state in states.iter_mut() {
-                state.gc();
+            // Parallelize GC when there are many states
+            if states.len() > 100 {
+                states.par_iter_mut().for_each(|state| state.gc());
+            } else {
+                for state in states.iter_mut() {
+                    state.gc();
+                }
             }
             if states.len() > 1 {
                 // Vectorize the states (this also does deduplication)
