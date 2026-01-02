@@ -148,12 +148,13 @@ pub struct CallFrame {
 /// A stack of call frames representing suspended execution.
 /// The innermost (most recently called) function is at the end.
 ///
-/// Uses a simple Vec wrapped in an option for efficient cloning when empty.
-/// Most call stacks are empty or small, so Vec is more efficient than im::Vector.
+/// Uses Arc<Vec> for O(1) cloning via reference counting.
+/// The COW semantics ensure that mutations create new copies only when necessary.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct CallStack {
-    /// None represents empty stack (avoids Vec allocation for common case)
-    frames: Option<Vec<CallFrame>>,
+    /// None represents empty stack (avoids allocation for common case)
+    /// Some(Arc<Vec>) for non-empty stacks, allowing O(1) clone
+    frames: Option<std::sync::Arc<Vec<CallFrame>>>,
 }
 
 impl CallStack {
@@ -166,22 +167,23 @@ impl CallStack {
         if frames.is_empty() {
             Self { frames: None }
         } else {
-            Self { frames: Some(frames) }
+            Self { frames: Some(std::sync::Arc::new(frames)) }
         }
     }
 
     #[inline]
     pub fn push(&mut self, frame: CallFrame) {
         match &mut self.frames {
-            Some(frames) => frames.push(frame),
-            None => self.frames = Some(vec![frame]),
+            Some(arc) => std::sync::Arc::make_mut(arc).push(frame),
+            None => self.frames = Some(std::sync::Arc::new(vec![frame])),
         }
     }
 
     #[inline]
     pub fn pop(&mut self) -> Option<CallFrame> {
         match &mut self.frames {
-            Some(frames) => {
+            Some(arc) => {
+                let frames = std::sync::Arc::make_mut(arc);
                 let result = frames.pop();
                 if frames.is_empty() {
                     self.frames = None;
@@ -205,23 +207,30 @@ impl CallStack {
 
     /// Get an iterator over the frames (from outermost to innermost).
     pub fn iter(&self) -> impl Iterator<Item = &CallFrame> {
-        self.frames.as_ref().map(|f| f.iter()).into_iter().flatten()
+        self.frames.as_deref().into_iter().flatten()
     }
 
     /// Insert a frame at the front (making it the outermost frame).
     pub fn insert_front(&mut self, frame: CallFrame) {
         match &mut self.frames {
-            Some(frames) => frames.insert(0, frame),
-            None => self.frames = Some(vec![frame]),
+            Some(arc) => std::sync::Arc::make_mut(arc).insert(0, frame),
+            None => self.frames = Some(std::sync::Arc::new(vec![frame])),
         }
     }
 
     /// Extend with frames from another CallStack.
     pub fn extend(&mut self, other: CallStack) {
-        if let Some(other_frames) = other.frames {
+        if let Some(other_arc) = other.frames {
             match &mut self.frames {
-                Some(frames) => frames.extend(other_frames),
-                None => self.frames = Some(other_frames),
+                Some(arc) => {
+                    let frames = std::sync::Arc::make_mut(arc);
+                    // Unwrap the Arc or clone its contents
+                    match std::sync::Arc::try_unwrap(other_arc) {
+                        Ok(other_frames) => frames.extend(other_frames),
+                        Err(arc) => frames.extend(arc.iter().cloned()),
+                    }
+                }
+                None => self.frames = Some(other_arc),
             }
         }
     }
