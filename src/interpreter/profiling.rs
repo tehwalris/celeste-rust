@@ -41,7 +41,7 @@ pub struct BlockExport {
     /// Whether this is a barrier block (replaces old hint_normalize)
     pub is_barrier: bool,
     /// Barrier ID if this is a barrier block
-    pub barrier_id: Option<Vec<i32>>,
+    pub barrier_id: Option<std::sync::Arc<Vec<i32>>>,
     /// Terminator type for visualization
     pub terminator_type: String,
     /// Brief summary of instructions

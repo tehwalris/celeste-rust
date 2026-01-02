@@ -304,12 +304,39 @@ impl Terminator {
 /// A barrier identifier - a tuple of integers that provides total ordering.
 /// Examples: vec![1], vec![1, 2], vec![2, 0, 1]
 /// Barriers are ordered lexicographically.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct BarrierId(pub Vec<i32>);
+/// Uses Arc for O(1) cloning in hot paths.
+#[derive(Clone, Debug)]
+pub struct BarrierId(pub std::sync::Arc<Vec<i32>>);
 
 impl BarrierId {
     pub fn new(ids: Vec<i32>) -> Self {
-        Self(ids)
+        Self(std::sync::Arc::new(ids))
+    }
+}
+
+impl PartialEq for BarrierId {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0) || *self.0 == *other.0
+    }
+}
+
+impl Eq for BarrierId {}
+
+impl PartialOrd for BarrierId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for BarrierId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+impl std::hash::Hash for BarrierId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
     }
 }
 
