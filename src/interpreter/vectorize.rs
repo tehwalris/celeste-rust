@@ -382,9 +382,9 @@ fn merge_heap_values_from_states(states: &[State], id: HeapId) -> HeapValue {
         _ => {}
     }
 
-    let values: Vec<_> = states.iter()
-        .map(|s| (s.heap.get(id).clone(), s.vector_size))
-        .collect();
+    let mut values: Vec<(HeapValue, usize)> = Vec::with_capacity(states.len());
+    values.extend(states.iter()
+        .map(|s| (s.heap.get(id).clone(), s.vector_size)));
 
     merge_heap_values(&values)
 }
@@ -553,23 +553,24 @@ where
 {
     let first_env = get_env(&states[0]);
     let local_ids: Vec<usize> = first_env.iter().map(|(id, _)| id).collect();
+    let num_states = states.len();
 
     // Parallelize merging when there are many states and variables
-    let merged_values: Vec<(usize, Value)> = if states.len() > 1000 && local_ids.len() > 10 {
+    let merged_values: Vec<(usize, Value)> = if num_states > 1000 && local_ids.len() > 10 {
         local_ids.par_iter()
             .map(|&local_id| {
-                let value_and_sizes: Vec<_> = states.iter()
-                    .map(|s| (get_env(s).get_by_raw_id(local_id).clone(), s.vector_size))
-                    .collect();
+                let mut value_and_sizes: Vec<(Value, usize)> = Vec::with_capacity(num_states);
+                value_and_sizes.extend(states.iter()
+                    .map(|s| (get_env(s).get_by_raw_id(local_id).clone(), s.vector_size)));
                 (local_id, merge_values(&value_and_sizes))
             })
             .collect()
     } else {
         local_ids.iter()
             .map(|&local_id| {
-                let value_and_sizes: Vec<_> = states.iter()
-                    .map(|s| (get_env(s).get_by_raw_id(local_id).clone(), s.vector_size))
-                    .collect();
+                let mut value_and_sizes: Vec<(Value, usize)> = Vec::with_capacity(num_states);
+                value_and_sizes.extend(states.iter()
+                    .map(|s| (get_env(s).get_by_raw_id(local_id).clone(), s.vector_size)));
                 (local_id, merge_values(&value_and_sizes))
             })
             .collect()
