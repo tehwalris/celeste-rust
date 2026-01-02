@@ -215,6 +215,18 @@ impl std::fmt::Display for BuiltinName {
     }
 }
 
+impl PartialEq<str> for BuiltinName {
+    fn eq(&self, other: &str) -> bool {
+        self.0.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for BuiltinName {
+    fn eq(&self, other: &&str) -> bool {
+        self.0.as_str() == *other
+    }
+}
+
 impl Serialize for BuiltinName {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where

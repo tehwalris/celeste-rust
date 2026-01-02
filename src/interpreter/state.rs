@@ -49,6 +49,10 @@ impl GlobalEnv {
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
+
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.inner.contains_key(key)
+    }
 }
 
 impl Default for GlobalEnv {
@@ -112,6 +116,43 @@ impl Prints {
     pub fn inner_arc(&self) -> &Arc<Vec<String>> {
         &self.inner
     }
+
+    /// Check if this Prints contains a specific string.
+    pub fn contains(&self, s: &str) -> bool {
+        self.inner.iter().any(|x| x == s)
+    }
+
+    /// Get an iterator over the prints.
+    pub fn iter(&self) -> std::slice::Iter<'_, String> {
+        self.inner.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a Prints {
+    type Item = &'a String;
+    type IntoIter = std::slice::Iter<'a, String>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.inner.iter()
+    }
+}
+
+impl Ord for Prints {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.inner.cmp(&other.inner)
+    }
+}
+
+impl PartialOrd for Prints {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl From<Prints> for Vec<String> {
+    fn from(p: Prints) -> Vec<String> {
+        (*p.inner).clone()
+    }
 }
 
 impl PartialEq for Prints {
@@ -121,6 +162,21 @@ impl PartialEq for Prints {
 }
 
 impl Eq for Prints {}
+
+impl PartialEq<Vec<&str>> for Prints {
+    fn eq(&self, other: &Vec<&str>) -> bool {
+        if self.inner.len() != other.len() {
+            return false;
+        }
+        self.inner.iter().zip(other.iter()).all(|(a, b)| a == *b)
+    }
+}
+
+impl PartialEq<Vec<String>> for Prints {
+    fn eq(&self, other: &Vec<String>) -> bool {
+        *self.inner == *other
+    }
+}
 
 /// Wrapper for outer_local_envs Vec with Arc for O(1) cloning and COW semantics.
 /// Outer local envs is a stack of caller's local environments, used for closures.

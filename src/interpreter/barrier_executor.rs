@@ -143,6 +143,8 @@ pub struct CallFrame {
     /// Index of the next instruction to execute in the resume block
     /// (after all instructions in the block up to barrier have been executed)
     pub instruction_index: usize,
+    /// The incoming label for PHI node resolution (the block we branched from)
+    pub incoming_label: Option<Label>,
 }
 
 /// A stack of call frames representing suspended execution.
@@ -428,6 +430,7 @@ fn interpret_call_with_path_counter(
                         return_local_id: local_id,
                         resume_block,
                         instruction_index,
+                        incoming_label: None, // Not used in old recursive path
                     });
 
                     // Propagate the yield up with the augmented call stack
@@ -774,12 +777,13 @@ impl StateAccumulator {
 
 /// Process a single lane and all its paths, returning an accumulator with results.
 ///
-/// Optimization: Periodically vectorize accumulated results during path enumeration.
-/// This reduces the number of states we need to track and speeds up deduplication
-/// by leveraging vectorized state comparison.
+/// Optimization: Uses checkpoint/restore pattern for path enumeration.
+/// Instead of cloning State for each path, we:
+/// 1. Create a ScalarRuntime once
+/// 2. Checkpoint its state (including PathCounter)
+/// 3. For each path: restore from checkpoint, run, extract result
 ///
-/// Uses ScalarRuntime for lightweight execution - function calls just push/pop
-/// local environments instead of cloning entire States.
+/// This eliminates the State->ScalarRuntime->State conversion overhead per path.
 fn process_lane(
     cfg: &Cfg,
     vec_state: &State,
@@ -787,64 +791,55 @@ fn process_lane(
     fixed_env: &FixedEnv,
     resume_ctx: &ResumeContext,
 ) -> Result<StateAccumulator> {
-    use super::scalar_runtime::run_to_next_barrier_scalar;
+    use super::scalar_runtime::{run_to_next_barrier_flat_inplace, RuntimeCheckpoint, ScalarRuntime};
 
     let mut accumulator = StateAccumulator::new();
 
     // Extract scalar state for this lane
     let mut scalar_state = extract_scalar_lane(vec_state, lane_idx);
-
-    // Freeze the heap to minimize clone cost during path enumeration.
-    // This moves all values from the overlay to old_values, so clones only copy Arc pointers.
     scalar_state.heap.freeze();
 
-    // Run with PathCounter to enumerate all paths
     let mut path_counter = PathCounter::new();
     let mut paths_since_vectorize = 0;
-    const VECTORIZE_BATCH_SIZE: usize = 32; // Vectorize every N paths (tuned: 32 is optimal)
+    const VECTORIZE_BATCH_SIZE: usize = 32;
+
+    let mut runtime = ScalarRuntime::from_state(scalar_state, fixed_env, &mut path_counter);
+    let checkpoint = RuntimeCheckpoint::from_runtime(&runtime);
 
     loop {
-        // Clone the scalar state for this path
-        let run_state = scalar_state.clone();
+        checkpoint.restore_to(&mut runtime);
 
-        // Run until next barrier or completion using the lightweight ScalarRuntime
-        let run_result = run_to_next_barrier_scalar(
+        // Use the new flat execution loop
+        let run_result = run_to_next_barrier_flat_inplace(
             cfg,
-            run_state,
-            fixed_env,
-            &mut path_counter,
+            &mut runtime,
             resume_ctx.top_level_resume_block.as_ref(),
             resume_ctx.top_level_instruction_index,
             resume_ctx.call_stack.clone(),
         )?;
 
-        // Build resume context for the destination
         let dest_resume_ctx = ResumeContext {
             top_level_resume_block: run_result.top_level_resume_block,
             top_level_instruction_index: run_result.top_level_instruction_index,
             call_stack: run_result.call_stack,
         };
 
-        // Add to accumulator with deduplication
-        accumulator.add_state(run_result.destination, run_result.state, dest_resume_ctx);
+        let result_state = runtime.snapshot_to_state();
+        accumulator.add_state(run_result.destination, result_state, dest_resume_ctx);
         paths_since_vectorize += 1;
 
-        // Periodically vectorize to compress accumulated states
         if paths_since_vectorize >= VECTORIZE_BATCH_SIZE {
             accumulator.vectorize_in_place();
             paths_since_vectorize = 0;
         }
 
-        // Try next path
-        if !path_counter.increment() {
+        if !runtime.path_counter.increment() {
             break;
         }
-        path_counter.reset_for_new_run();
+        runtime.path_counter.reset_for_new_run();
     }
 
-    // Final vectorization to GC any remaining states that weren't in a batch
     accumulator.vectorize_in_place();
-
     Ok(accumulator)
 }
 
@@ -1105,6 +1100,7 @@ fn resume_call_stack(
                     return_local_id: frame.return_local_id,
                     resume_block,
                     instruction_index,
+                    incoming_label: None, // Not used in old recursive path
                 });
 
                 // Add inner frames from nested calls
