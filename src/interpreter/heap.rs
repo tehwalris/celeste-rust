@@ -190,15 +190,14 @@ impl Heap {
 
     /// Create a heap directly from a vector of values.
     /// This is more efficient than creating an empty heap and calling set() repeatedly.
-    /// Pre-allocates the overlay with same capacity to avoid resizes during execution.
+    /// Starts with an empty overlay to minimize clone cost on first mutation.
     pub fn from_values(values: Vec<Option<HeapValue>>) -> Self {
         let next_id = values.len();
-        // Pre-allocate overlay with capacity to avoid resizes during execution
-        let mut overlay = Vec::with_capacity(next_id);
-        overlay.resize(next_id, None);
+        // Start with empty overlay - will grow on demand when mutated.
+        // This minimizes clone cost when Arc::make_mut is called on shared state.
         Self {
             old_values: Arc::new(values),
-            new_values: Arc::new(overlay),
+            new_values: Arc::new(Vec::new()),
             next_id,
         }
     }
