@@ -339,7 +339,8 @@ impl State {
     pub fn gc(&mut self) {
         // Pre-allocate with capacity based on current heap size
         let heap_len = self.heap.len();
-        let mut old_to_new: FxHashMap<HeapId, HeapId> = FxHashMap::with_capacity_and_hasher(heap_len, Default::default());
+        // Use Vec instead of HashMap for O(1) lookup - HeapIds are sequential 0..heap_len
+        let mut old_to_new: Vec<Option<HeapId>> = vec![None; heap_len];
         let mut new_heap_values: Vec<HeapValue> = Vec::with_capacity(heap_len);
 
         // Visit a heap ID, assigning a new ID if not yet visited
@@ -347,16 +348,16 @@ impl State {
         fn visit(
             old_id: HeapId,
             old_heap: &Heap,
-            old_to_new: &mut FxHashMap<HeapId, HeapId>,
+            old_to_new: &mut [Option<HeapId>],
             new_heap_values: &mut Vec<HeapValue>,
         ) -> HeapId {
-            if let Some(&new_id) = old_to_new.get(&old_id) {
+            if let Some(new_id) = old_to_new[old_id.raw()] {
                 return new_id;
             }
 
             // Assign new ID
             let new_id = HeapId::from_raw(new_heap_values.len());
-            old_to_new.insert(old_id, new_id);
+            old_to_new[old_id.raw()] = Some(new_id);
 
             // Placeholder - will be replaced after recursing
             new_heap_values.push(HeapValue::UnknownTable);
