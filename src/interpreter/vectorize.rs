@@ -346,13 +346,19 @@ fn vectorize_same_shape_states(states: Vec<State>) -> State {
     // Build vectorized local_env
     let merged_local_env = merge_local_envs(&states, |s| &s.local_env);
 
-    // Build vectorized outer_local_envs
+    // Build vectorized outer_local_envs - parallelize when there are many states
     let num_outer = first_state.outer_local_envs.len();
-    let merged_outer_local_envs = crate::interpreter::state::OuterLocalEnvs::from_vec(
+    let merged_outer_envs: Vec<LocalEnv> = if states.len() > 1000 && num_outer > 1 {
+        (0..num_outer)
+            .into_par_iter()
+            .map(|i| merge_local_envs(&states, |s| s.outer_local_envs.get(i).unwrap()))
+            .collect()
+    } else {
         (0..num_outer)
             .map(|i| merge_local_envs(&states, |s| s.outer_local_envs.get(i).unwrap()))
             .collect()
-    );
+    };
+    let merged_outer_local_envs = crate::interpreter::state::OuterLocalEnvs::from_vec(merged_outer_envs);
 
     State {
         heap: new_heap,
