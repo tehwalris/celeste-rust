@@ -43,17 +43,16 @@ Each iteration:
    - Frame count same or higher
    - Timing improved
 
-4. **Commit**:
-   - If BETTER and CORRECT:
+4. **Commit** (only if at least **5% speedup** achieved):
+   - If BETTER (≥5% faster) and CORRECT:
      ```bash
      git add -A && git commit -m "perf: <description>"
      git push
      ```
-   - If WORSE or INCORRECT:
+   - If WORSE, <5% improvement, or INCORRECT:
      ```bash
-     git add -A && git commit -m "experiment: <description> (reverting)"
-     git revert HEAD --no-edit
-     git push
+     git checkout -- .
      ```
+     (discard changes and try a different approach)
 
 Begin by investigating and making your first optimization attempt.
