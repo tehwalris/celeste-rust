@@ -68,6 +68,7 @@ pub struct PathCounter {
 }
 
 impl PathCounter {
+    #[inline]
     pub fn new() -> Self {
         Self {
             current_path: 0,
@@ -78,6 +79,7 @@ impl PathCounter {
 
     /// Get the choice for the next UnknownBool branch.
     /// Returns true or false based on the current path.
+    #[inline]
     pub fn get_choice(&mut self) -> bool {
         let choice = (self.current_path >> self.choices_made) & 1 == 1;
         self.choices_made += 1;
@@ -86,17 +88,20 @@ impl PathCounter {
     }
 
     /// Check if the choice at index `choice_idx` is true in current path
+    #[inline]
     pub fn peek_choice(&self, choice_idx: usize) -> bool {
         (self.current_path >> choice_idx) & 1 == 1
     }
 
     /// Reset for a new run (called at barrier)
+    #[inline]
     pub fn reset_for_new_run(&mut self) {
         self.choices_made = 0;
     }
 
     /// Try to increment to the next path.
     /// Returns true if there are more paths to explore, false if exhausted.
+    #[inline]
     pub fn increment(&mut self) -> bool {
         if self.max_choices == 0 {
             // No choices were made - only one path exists
@@ -117,6 +122,7 @@ impl PathCounter {
     }
 
     /// Check if this path is still valid (haven't made impossible choices)
+    #[inline]
     pub fn is_valid(&self) -> bool {
         // A path becomes invalid if we've made more choices than the path encoding allows
         self.choices_made <= 64
@@ -699,6 +705,7 @@ impl StateAccumulator {
 
     /// Add a state to the accumulator with deduplication.
     /// Returns true if the state was added (new), false if it was a duplicate.
+    #[inline]
     fn add_state(&mut self, dest: BarrierId, mut state: State, resume_ctx: ResumeContext) -> bool {
         // GC the state first to get deterministic heap IDs (required for vectorization)
         state.gc();
