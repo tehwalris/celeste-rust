@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -461,7 +461,7 @@ impl Block {
 #[derive(Clone, Debug)]
 pub struct Cfg {
     pub entry: Block,
-    pub named: HashMap<Label, Block>,
+    pub named: FxHashMap<Label, Block>,
 }
 
 impl Cfg {

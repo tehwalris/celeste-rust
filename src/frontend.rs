@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use rustc_hash::FxHashMap;
 
 use anyhow::{bail, Result};
 use full_moon::{
@@ -139,7 +140,7 @@ impl Stream {
         }
 
         let mut block_builder = BlockBuilder::new();
-        let mut named_blocks = HashMap::new();
+        let mut named_blocks = FxHashMap::default();
         let mut fun_defs = Vec::new();
 
         for el in self.0.into_iter().rev() {
