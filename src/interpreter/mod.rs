@@ -1,7 +1,9 @@
 pub mod block_coalesce;
 pub mod call_resolution;
 pub mod cfg_analysis;
+pub mod cfg_validation;
 mod core_interpreter;
+pub mod dce;
 pub mod heap_elimination;
 pub mod fixed_env;
 pub mod inlining;

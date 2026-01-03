@@ -67,7 +67,10 @@ pub fn coalesce_blocks(cfg: &Cfg) -> CoalesceResult {
                 let target_label = target.clone();
                 if let Some(target_block) = new_cfg.named.remove(&target_label) {
                     // Merge: append target's instructions and terminator to entry
-                    merge_blocks(&mut new_cfg.entry, &target_block, &target_label);
+                    // Source is entry block (None for source_label)
+                    let phi_replacements = merge_blocks(&mut new_cfg.entry, &target_block, &target_label, None);
+                    // Apply phi replacements globally (resolved phis need to update all uses)
+                    apply_phi_replacements_globally(&mut new_cfg, &phi_replacements);
                     // Update phis that reference target_label to use __entry
                     // (the interpreter uses __entry as the label for entry block in phi resolution)
                     let entry_label = Label::from("__entry".to_string());
@@ -89,7 +92,9 @@ pub fn coalesce_blocks(cfg: &Cfg) -> CoalesceResult {
                         if let Some(target_block) = new_cfg.named.remove(&target_label) {
                             // Merge target into source
                             let source_block = new_cfg.named.get_mut(&label).unwrap();
-                            merge_blocks(source_block, &target_block, &target_label);
+                            let phi_replacements = merge_blocks(source_block, &target_block, &target_label, Some(&label));
+                            // Apply phi replacements globally (resolved phis need to update all uses)
+                            apply_phi_replacements_globally(&mut new_cfg, &phi_replacements);
                             // Update phi nodes that reference target_label to use source label instead
                             update_phi_nodes_for_removed_block(&mut new_cfg, &target_label, Some(&label));
                             blocks_removed += 1;
@@ -156,32 +161,59 @@ enum BlockSource {
     Named(Label),
 }
 
+/// Apply local ID replacements across the entire CFG.
+/// This is used when phis are resolved during block merging - the resolved
+/// phi's local ID needs to be replaced with its value throughout the CFG.
+fn apply_phi_replacements_globally(cfg: &mut Cfg, replacements: &HashMap<LocalId, LocalId>) {
+    if replacements.is_empty() {
+        return;
+    }
+
+    let apply = |id: LocalId| replacements.get(&id).copied().unwrap_or(id);
+
+    // Update entry block
+    for (_, instr) in &mut cfg.entry.instructions {
+        *instr = instr.map_local_ids(&apply);
+    }
+    let (term_id, term) = &cfg.entry.terminator;
+    cfg.entry.terminator = (*term_id, term.map_local_ids(&apply));
+
+    // Update named blocks
+    for (_, block) in cfg.named.iter_mut() {
+        for (_, instr) in &mut block.instructions {
+            *instr = instr.map_local_ids(&apply);
+        }
+        let (term_id, term) = &block.terminator;
+        block.terminator = (*term_id, term.map_local_ids(&apply));
+    }
+}
+
 /// Merge the target block into the source block.
 /// Updates phi nodes to remove references to the target label.
-fn merge_blocks(source: &mut Block, target: &Block, target_label: &Label) {
+/// `source_label` is the label of the source block (None for entry block, which uses "__entry" in phis).
+/// Returns a map of phi replacements that should be applied globally.
+fn merge_blocks(source: &mut Block, target: &Block, _target_label: &Label, source_label: Option<&Label>) -> HashMap<LocalId, LocalId> {
     // Remove phi nodes from target - they reference the source which is now the same block
     // After coalescing, we don't need phi nodes for branches from the source block
     let (target_phis, target_non_phis) = target.split_block_phi_instructions();
 
+    // The source block's label as it appears in phi nodes
+    // Entry block is referenced as "__entry" in phi nodes
+    let source_ref = source_label
+        .map(|l| l.as_str().to_string())
+        .unwrap_or_else(|| "__entry".to_string());
+
     // For each phi in target, we need to resolve it to the value from source
-    // Since source is the only predecessor, each phi has exactly one incoming value
+    // Since source is the only predecessor, we find the branch matching source's label
     let mut phi_replacements: HashMap<LocalId, LocalId> = HashMap::new();
     for (target_id, instr) in target_phis {
         if let Instruction::Phi { branches } = instr {
-            // Find the branch for source (the only predecessor after removing target's label)
-            // After merge, all references to target_label become references to source's label
-            // But since we're merging, we need to find which value the phi would receive
-            // In our case, the phi should have one branch for each predecessor,
-            // and after coalescing, we have exactly one: the source block
-
-            // Actually, the phi nodes in target reference the label of the block that
-            // branches to target. Since source is the only predecessor, we look for
-            // the source's label (or entry block which doesn't have a label in phi)
-
-            // For now, handle the common case: single-predecessor means single branch in phi
-            if branches.len() == 1 {
-                let (_, value) = &branches[0];
-                phi_replacements.insert(*target_id, *value);
+            // Find the branch that matches the source block's label
+            for (label, value) in branches {
+                if label.as_str() == source_ref {
+                    phi_replacements.insert(*target_id, *value);
+                    break;
+                }
             }
         }
     }
@@ -203,6 +235,8 @@ fn merge_blocks(source: &mut Block, target: &Block, target_label: &Label) {
 
     // Preserve hint_normalize if either block has it
     source.hint_normalize = source.hint_normalize || target.hint_normalize;
+
+    phi_replacements
 }
 
 /// Compute predecessors for each block

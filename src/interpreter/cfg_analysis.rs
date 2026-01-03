@@ -69,6 +69,12 @@ pub struct OptimizationResult {
     pub heap_elimination: HeapEliminationStatus,
     /// Result of block coalescing pass
     pub block_coalesce: BlockCoalesceStatus,
+    /// Result of call resolution pass
+    pub call_resolution: CallResolutionStatus,
+    /// Result of inlining pass
+    pub inlining: InliningStatus,
+    /// Result of dead code elimination pass
+    pub dce: DceStatus,
 }
 
 /// Status of the block coalescing pass
@@ -100,6 +106,45 @@ pub enum Mem2RegStatus {
         cells_promoted: usize,
         cells_failed: usize,
     },
+}
+
+/// Status of the call resolution pass
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub enum CallResolutionStatus {
+    #[default]
+    NotAttempted,
+    /// Successfully resolved calls
+    Success {
+        calls_resolved: usize,
+    },
+    /// No calls to resolve
+    NoChange,
+}
+
+/// Status of the inlining pass
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub enum InliningStatus {
+    #[default]
+    NotAttempted,
+    /// Successfully inlined calls
+    Success {
+        calls_inlined: usize,
+    },
+    /// No calls to inline
+    NoChange,
+}
+
+/// Status of the dead code elimination pass
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub enum DceStatus {
+    #[default]
+    NotAttempted,
+    /// Successfully eliminated dead code
+    Success {
+        instructions_removed: usize,
+    },
+    /// No dead code found
+    NoChange,
 }
 
 /// Counts of each instruction type in a CFG.
@@ -272,6 +317,9 @@ pub struct OptimizationCfgs {
     pub after_mem2reg: Option<Cfg>,
     pub after_heap_elim: Option<Cfg>,
     pub after_block_coalesce: Option<Cfg>,
+    pub after_call_resolution: Option<Cfg>,
+    pub after_inlining: Option<Cfg>,
+    pub after_dce: Option<Cfg>,
 }
 
 /// Run the full optimization pipeline on a CFG.
@@ -306,7 +354,7 @@ pub fn run_optimization_pipeline_full(
     let mut cfgs = OptimizationCfgs::default();
 
     // Stage 1: mem2reg - eliminate local cells
-    let mut local_gen = LocalIdGenerator::new();
+    let mut local_gen = LocalIdGenerator::from_cfg(cfg);
     let (after_mem2reg, mem2reg_status) = if analysis.local_only_allocs > 0 {
         match mem2reg(cfg, &mut local_gen) {
             Mem2RegResult::Success { cfg: new_cfg, cells_promoted } => {
@@ -379,6 +427,450 @@ pub fn run_optimization_pipeline_full(
         CoalesceResult::NoChange => {
             result.block_coalesce = BlockCoalesceStatus::NoChange;
         }
+    }
+
+    (result, cfgs)
+}
+
+/// Optimized function definition with its CFG.
+#[derive(Clone, Debug)]
+pub struct OptimizedFunDef {
+    pub name: crate::ir::GlobalId,
+    pub cfg: Cfg,
+}
+
+/// Optimize all function definitions with proper dependency ordering.
+///
+/// This ensures that when we inline function A into function B, we use the
+/// already-optimized version of A. Functions are processed in topological order
+/// (callees before callers).
+///
+/// Returns a map from function name to optimized CFG.
+pub fn optimize_all_functions(
+    fun_defs: &[&crate::ir::FunDef],
+    global_closure_map: &crate::interpreter::call_resolution::GlobalClosureMap,
+) -> std::collections::HashMap<crate::ir::GlobalId, OptimizedFunDef, std::hash::BuildHasherDefault<rustc_hash::FxHasher>> {
+    use crate::interpreter::block_coalesce::{coalesce_blocks, CoalesceResult};
+    use crate::interpreter::call_resolution::{resolve_calls, CallResolutionResult};
+    use crate::interpreter::dce::{eliminate_dead_code, DceResult};
+    use crate::interpreter::inlining::{inline_calls, InliningResult};
+    use crate::interpreter::mem2reg::{mem2reg, Mem2RegResult};
+    use crate::ir::{GlobalId, LabelGenerator, LocalIdGenerator};
+    use std::hash::BuildHasherDefault;
+    use rustc_hash::FxHasher;
+
+    type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
+
+    // Step 1: Build call graph to determine processing order
+    // For each function, collect which functions it calls (after call resolution)
+    let mut call_graph: FxHashMap<GlobalId, Vec<GlobalId>> = FxHashMap::default();
+    let mut all_names: Vec<GlobalId> = Vec::new();
+
+    for fun_def in fun_defs {
+        all_names.push(fun_def.name.clone());
+
+        // First run call resolution to see what functions this calls
+        let analysis = analyze_cfg(&fun_def.cfg);
+        let mut local_gen = LocalIdGenerator::from_cfg(&fun_def.cfg);
+        let cfg_after_mem2reg = if analysis.local_only_allocs > 0 {
+            match mem2reg(&fun_def.cfg, &mut local_gen) {
+                Mem2RegResult::Success { cfg, .. } | Mem2RegResult::PartialSuccess { cfg, .. } => cfg,
+                Mem2RegResult::NoCells => fun_def.cfg.clone(),
+            }
+        } else {
+            fun_def.cfg.clone()
+        };
+
+        let cfg_after_call_res = match resolve_calls(&cfg_after_mem2reg, global_closure_map) {
+            CallResolutionResult::Success { cfg, .. } => cfg,
+            CallResolutionResult::NoChange => cfg_after_mem2reg,
+        };
+
+        // Extract CallResolved targets
+        let mut callees = Vec::new();
+        for block in cfg_after_call_res.iter_blocks() {
+            for (_, instr) in &block.instructions {
+                if let crate::ir::Instruction::CallResolved { fun_name, .. } = instr {
+                    callees.push(fun_name.clone());
+                }
+            }
+        }
+        call_graph.insert(fun_def.name.clone(), callees);
+    }
+
+    // Step 2: Topological sort (callees before callers)
+    let sorted_names = topological_sort(&all_names, &call_graph);
+
+    // Step 3: Process functions in order, building up optimized versions
+    let mut optimized: FxHashMap<GlobalId, crate::ir::FunDef> = FxHashMap::default();
+    let mut result: FxHashMap<GlobalId, OptimizedFunDef> = FxHashMap::default();
+
+    // Build initial fun_def map
+    let fun_def_by_name: FxHashMap<GlobalId, &crate::ir::FunDef> = fun_defs
+        .iter()
+        .map(|fd| (fd.name.clone(), *fd))
+        .collect();
+
+    for name in sorted_names {
+        let original_fun_def = fun_def_by_name.get(&name).unwrap();
+        let mut local_gen = LocalIdGenerator::from_cfg(&original_fun_def.cfg);
+        let mut label_gen = LabelGenerator::new();
+        let fn_name = name.as_str();
+        // Combine arg_ids and capture_ids - both are available as "external" locals
+        // arg_ids are Option<LocalId> because some args may be unused (None)
+        let external_ids: Vec<_> = original_fun_def.arg_ids.iter()
+            .filter_map(|id| *id)
+            .chain(original_fun_def.capture_ids.iter().copied())
+            .collect();
+
+        // Validate input CFG
+        crate::interpreter::cfg_validation::assert_valid_cfg_with_args(
+            &original_fun_def.cfg,
+            &external_ids,
+            &format!("{} original", fn_name),
+        );
+
+        // Stage 1: mem2reg
+        let analysis = analyze_cfg(&original_fun_def.cfg);
+        let mut current_cfg = if analysis.local_only_allocs > 0 {
+            match mem2reg(&original_fun_def.cfg, &mut local_gen) {
+                Mem2RegResult::Success { cfg, .. } | Mem2RegResult::PartialSuccess { cfg, .. } => {
+                    crate::interpreter::cfg_validation::assert_valid_cfg_with_args(
+                        &cfg,
+                        &external_ids,
+                        &format!("{} after mem2reg", fn_name),
+                    );
+                    cfg
+                }
+                Mem2RegResult::NoCells => original_fun_def.cfg.clone(),
+            }
+        } else {
+            original_fun_def.cfg.clone()
+        };
+
+        // Iterate call resolution + inlining until no more progress
+        let max_rounds = 10; // Safety limit
+        for round in 0..max_rounds {
+            // Stage 2: call resolution
+            current_cfg = match resolve_calls(&current_cfg, global_closure_map) {
+                CallResolutionResult::Success { cfg, .. } => {
+                    crate::interpreter::cfg_validation::assert_valid_cfg_with_args(
+                        &cfg,
+                        &external_ids,
+                        &format!("{} after call_resolution round {}", fn_name, round),
+                    );
+                    cfg
+                }
+                CallResolutionResult::NoChange => current_cfg,
+            };
+
+            // Stage 3: inlining (using already-optimized callees!)
+            match inline_calls(&current_cfg, &optimized, &mut local_gen, &mut label_gen) {
+                InliningResult::Success { cfg, .. } => {
+                    crate::interpreter::cfg_validation::assert_valid_cfg_with_args(
+                        &cfg,
+                        &external_ids,
+                        &format!("{} after inlining round {}", fn_name, round),
+                    );
+                    current_cfg = cfg;
+                    // Continue to next round - might have more calls to resolve/inline
+                }
+                InliningResult::NoChange => {
+                    break; // No more inlining possible
+                }
+            }
+        }
+
+        // Stage 4: Dead code elimination
+        // After inlining, there may be unused GetGlobal/Load instructions
+        // that were only used to set up the original Call
+        current_cfg = match eliminate_dead_code(&current_cfg) {
+            DceResult::Success { cfg, .. } => {
+                crate::interpreter::cfg_validation::assert_valid_cfg_with_args(
+                    &cfg,
+                    &external_ids,
+                    &format!("{} after dce", fn_name),
+                );
+                cfg
+            }
+            DceResult::NoChange => current_cfg,
+        };
+
+        // Stage 5: block coalescing
+        current_cfg = match coalesce_blocks(&current_cfg) {
+            CoalesceResult::Success { cfg, .. } => {
+                crate::interpreter::cfg_validation::assert_valid_cfg_with_args(
+                    &cfg,
+                    &external_ids,
+                    &format!("{} after block_coalesce", fn_name),
+                );
+                cfg
+            }
+            CoalesceResult::NoChange => current_cfg,
+        };
+
+        // Final validation
+        crate::interpreter::cfg_validation::assert_valid_cfg_with_args(
+            &current_cfg,
+            &external_ids,
+            &format!("{} final", fn_name),
+        );
+
+        // Store the optimized version for use by later functions
+        let optimized_fun_def = crate::ir::FunDef {
+            name: original_fun_def.name.clone(),
+            capture_ids: original_fun_def.capture_ids.clone(),
+            arg_ids: original_fun_def.arg_ids.clone(),
+            cfg: current_cfg.clone(),
+            source_span: original_fun_def.source_span.clone(),
+        };
+        optimized.insert(name.clone(), optimized_fun_def);
+
+        result.insert(name.clone(), OptimizedFunDef {
+            name: name.clone(),
+            cfg: current_cfg,
+        });
+    }
+
+    result
+}
+
+/// Topological sort of function names based on call graph.
+/// Returns functions in order such that callees come before callers.
+fn topological_sort(
+    names: &[crate::ir::GlobalId],
+    call_graph: &std::collections::HashMap<crate::ir::GlobalId, Vec<crate::ir::GlobalId>, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>,
+) -> Vec<crate::ir::GlobalId> {
+    use std::collections::HashSet;
+
+    let name_set: HashSet<_> = names.iter().cloned().collect();
+    let mut visited = HashSet::new();
+    let mut result = Vec::new();
+
+    fn visit(
+        name: &crate::ir::GlobalId,
+        call_graph: &std::collections::HashMap<crate::ir::GlobalId, Vec<crate::ir::GlobalId>, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>,
+        name_set: &HashSet<crate::ir::GlobalId>,
+        visited: &mut HashSet<crate::ir::GlobalId>,
+        result: &mut Vec<crate::ir::GlobalId>,
+    ) {
+        if visited.contains(name) {
+            return;
+        }
+        visited.insert(name.clone());
+
+        // Visit callees first
+        if let Some(callees) = call_graph.get(name) {
+            for callee in callees {
+                // Only visit if it's in our set of functions (not builtins)
+                if name_set.contains(callee) {
+                    visit(callee, call_graph, name_set, visited, result);
+                }
+            }
+        }
+
+        result.push(name.clone());
+    }
+
+    for name in names {
+        visit(name, call_graph, &name_set, &mut visited, &mut result);
+    }
+
+    result
+}
+
+/// Run the optimization pipeline with inter-procedural passes (call resolution and inlining).
+///
+/// This version uses pre-optimized function definitions for inlining, ensuring
+/// that inlined code is already optimized.
+///
+/// Pipeline stages:
+/// 1. mem2reg: Promote local cells (non-escaping allocations) to SSA
+/// 2. call_resolution + inlining: Iteratively resolve and inline calls
+/// 3. block_coalesce: Merge straight-line blocks
+/// 4. heap_elimination: Eliminate global heap operations with known shapes
+pub fn run_optimization_pipeline_with_interprocedural(
+    cfg: &Cfg,
+    analysis: &CfgAnalysisResult,
+    global_closure_map: &crate::interpreter::call_resolution::GlobalClosureMap,
+    optimized_fun_defs: &std::collections::HashMap<crate::ir::GlobalId, crate::ir::FunDef, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>,
+) -> (OptimizationResult, OptimizationCfgs) {
+    use crate::interpreter::block_coalesce::{coalesce_blocks, CoalesceResult};
+    use crate::interpreter::call_resolution::{resolve_calls, CallResolutionResult};
+    use crate::interpreter::dce::{eliminate_dead_code, DceResult};
+    use crate::interpreter::heap_elimination::{
+        eliminate_heap, HeapEliminationResult, HeapShape, ValueShape,
+    };
+    use crate::interpreter::inlining::{inline_calls, InliningResult};
+    use crate::interpreter::mem2reg::{mem2reg, Mem2RegResult};
+    use crate::ir::{LabelGenerator, LocalIdGenerator};
+
+    let mut result = OptimizationResult::default();
+    let mut cfgs = OptimizationCfgs::default();
+    let mut local_gen = LocalIdGenerator::from_cfg(cfg);
+    let mut label_gen = LabelGenerator::new();
+
+    // Stage 1: mem2reg - eliminate local cells
+    let (after_mem2reg, mem2reg_status) = if analysis.local_only_allocs > 0 {
+        match mem2reg(cfg, &mut local_gen) {
+            Mem2RegResult::Success { cfg: new_cfg, cells_promoted } => {
+                (Some(new_cfg), Mem2RegStatus::Success { cells_promoted })
+            }
+            Mem2RegResult::NoCells => {
+                (None, Mem2RegStatus::NoCells)
+            }
+            Mem2RegResult::PartialSuccess { cfg: new_cfg, cells_promoted, cells_failed, .. } => {
+                (Some(new_cfg), Mem2RegStatus::Partial { cells_promoted, cells_failed })
+            }
+        }
+    } else {
+        (None, Mem2RegStatus::NoCells)
+    };
+    result.mem2reg = mem2reg_status;
+    cfgs.after_mem2reg = after_mem2reg.clone();
+
+    // Get the CFG for call resolution
+    let cfg_for_call_res = after_mem2reg.as_ref().unwrap_or(cfg);
+
+    // Stage 2: call resolution - convert Call to CallResolved
+    let after_call_resolution = match resolve_calls(cfg_for_call_res, global_closure_map) {
+        CallResolutionResult::Success { cfg: new_cfg, calls_resolved } => {
+            result.call_resolution = CallResolutionStatus::Success { calls_resolved };
+            Some(new_cfg)
+        }
+        CallResolutionResult::NoChange => {
+            result.call_resolution = CallResolutionStatus::NoChange;
+            None
+        }
+    };
+    cfgs.after_call_resolution = after_call_resolution.clone();
+
+    // Get the CFG for inlining
+    let cfg_for_inlining = after_call_resolution
+        .as_ref()
+        .or(after_mem2reg.as_ref())
+        .unwrap_or(cfg);
+
+    // Stage 3: inlining - inline CallResolved calls using optimized callees
+    // Iterate until no more progress (handles calls from inlined code)
+    let mut current_cfg = cfg_for_inlining.clone();
+    let mut total_calls_inlined = 0;
+    let max_rounds = 10;
+
+    for _ in 0..max_rounds {
+        // Re-run call resolution to pick up any new calls from inlined code
+        current_cfg = match resolve_calls(&current_cfg, global_closure_map) {
+            CallResolutionResult::Success { cfg, calls_resolved } => {
+                if total_calls_inlined == 0 {
+                    // First round - update the count
+                    result.call_resolution = CallResolutionStatus::Success { calls_resolved };
+                }
+                cfg
+            }
+            CallResolutionResult::NoChange => current_cfg,
+        };
+
+        match inline_calls(&current_cfg, optimized_fun_defs, &mut local_gen, &mut label_gen) {
+            InliningResult::Success { cfg: new_cfg, calls_inlined } => {
+                current_cfg = new_cfg;
+                total_calls_inlined += calls_inlined;
+            }
+            InliningResult::NoChange => {
+                break;
+            }
+        }
+    }
+
+    let after_inlining = if total_calls_inlined > 0 {
+        result.inlining = InliningStatus::Success { calls_inlined: total_calls_inlined };
+        Some(current_cfg.clone())
+    } else {
+        result.inlining = InliningStatus::NoChange;
+        None
+    };
+    cfgs.after_inlining = after_inlining.clone();
+
+    // Stage 4: Dead code elimination
+    // After inlining, there may be unused GetGlobal/Load instructions that were only used
+    // to set up the original Call (which has been replaced by inlined code)
+    let cfg_for_dce = after_inlining
+        .as_ref()
+        .or(after_call_resolution.as_ref())
+        .or(after_mem2reg.as_ref())
+        .unwrap_or(cfg);
+
+    let after_dce = match eliminate_dead_code(cfg_for_dce) {
+        DceResult::Success { cfg: new_cfg, instructions_removed } => {
+            result.dce = DceStatus::Success { instructions_removed };
+            Some(new_cfg)
+        }
+        DceResult::NoChange => {
+            result.dce = DceStatus::NoChange;
+            None
+        }
+    };
+    cfgs.after_dce = after_dce.clone();
+
+    // Stage 5: block coalescing - merge straight-line blocks
+    let cfg_for_coalesce = after_dce
+        .as_ref()
+        .or(after_inlining.as_ref())
+        .or(after_call_resolution.as_ref())
+        .or(after_mem2reg.as_ref())
+        .unwrap_or(cfg);
+
+    let after_block_coalesce = match coalesce_blocks(cfg_for_coalesce) {
+        CoalesceResult::Success { cfg: new_cfg, blocks_removed } => {
+            result.block_coalesce = BlockCoalesceStatus::Success { blocks_removed };
+            Some(new_cfg)
+        }
+        CoalesceResult::NoChange => {
+            result.block_coalesce = BlockCoalesceStatus::NoChange;
+            None
+        }
+    };
+    cfgs.after_block_coalesce = after_block_coalesce.clone();
+
+    // Stage 6: heap elimination - for globals (after other transformations)
+    let cfg_for_heap_elim = after_block_coalesce
+        .as_ref()
+        .or(after_dce.as_ref())
+        .or(after_inlining.as_ref())
+        .or(after_call_resolution.as_ref())
+        .or(after_mem2reg.as_ref())
+        .unwrap_or(cfg);
+
+    // Re-analyze the CFG to get current accessed_globals (inlining may have added new ones)
+    let current_analysis = analyze_cfg(cfg_for_heap_elim);
+
+    if !current_analysis.accessed_globals.is_empty() {
+        // Create a simple shape where each global is a leaf value
+        let mut shape = HeapShape::new();
+        for global in &current_analysis.accessed_globals {
+            shape.globals.insert(global.clone(), ValueShape::Leaf);
+        }
+
+        match eliminate_heap(cfg_for_heap_elim, &shape, local_gen, label_gen) {
+            HeapEliminationResult::Success(transformed) => {
+                result.heap_elimination = HeapEliminationStatus::Success {
+                    unpack_count: transformed.unpack_slots.len(),
+                    modified_count: transformed.modified_slots.len(),
+                };
+                cfgs.after_heap_elim = Some(transformed.cfg);
+            }
+            HeapEliminationResult::ShapeNotPreserved(reason) => {
+                result.heap_elimination = HeapEliminationStatus::Failed(reason);
+            }
+            HeapEliminationResult::HasExternalCalls(funcs) => {
+                let reason = format!("External calls: {}", funcs.join(", "));
+                result.heap_elimination = HeapEliminationStatus::Failed(reason);
+            }
+            HeapEliminationResult::NotApplicable => {
+                result.heap_elimination = HeapEliminationStatus::NotApplicable;
+            }
+        }
+    } else {
+        result.heap_elimination = HeapEliminationStatus::NotApplicable;
     }
 
     (result, cfgs)
@@ -751,6 +1243,12 @@ pub struct CfgTestCase {
     pub after_heap_elim: Option<SerializableCfg>,
     /// CFG after block coalescing pass (if any transformation occurred)
     pub after_block_coalesce: Option<SerializableCfg>,
+    /// CFG after call resolution pass (if any transformation occurred)
+    pub after_call_resolution: Option<SerializableCfg>,
+    /// CFG after inlining pass (if any transformation occurred)
+    pub after_inlining: Option<SerializableCfg>,
+    /// CFG after dead code elimination pass (if any transformation occurred)
+    pub after_dce: Option<SerializableCfg>,
     /// Final optimized CFG (whichever stage succeeded last)
     pub optimized_cfg: SerializableCfg,
     /// Analysis results
@@ -940,5 +1438,153 @@ mod tests {
             "number_constant"
         );
         assert!(serializable.named_blocks.is_empty());
+    }
+
+    #[test]
+    fn test_topological_sort() {
+        // Test that topological sort orders callees before callers
+        use crate::ir::GlobalId;
+
+        let names = vec![
+            GlobalId::from("a".to_string()),
+            GlobalId::from("b".to_string()),
+            GlobalId::from("c".to_string()),
+        ];
+
+        // Call graph: a calls b, b calls c
+        // So order should be: c, b, a (callees before callers)
+        let mut call_graph: FxHashMap<GlobalId, Vec<GlobalId>> = FxHashMap::default();
+        call_graph.insert(GlobalId::from("a".to_string()), vec![GlobalId::from("b".to_string())]);
+        call_graph.insert(GlobalId::from("b".to_string()), vec![GlobalId::from("c".to_string())]);
+        call_graph.insert(GlobalId::from("c".to_string()), vec![]);
+
+        let sorted = topological_sort(&names, &call_graph);
+
+        // c should come before b, b should come before a
+        let c_pos = sorted.iter().position(|n| n.as_str() == "c").unwrap();
+        let b_pos = sorted.iter().position(|n| n.as_str() == "b").unwrap();
+        let a_pos = sorted.iter().position(|n| n.as_str() == "a").unwrap();
+
+        assert!(c_pos < b_pos, "c should come before b (c calls nothing, b calls c)");
+        assert!(b_pos < a_pos, "b should come before a (a calls b)");
+    }
+
+    #[test]
+    fn test_optimize_all_functions_uses_optimized_callees() {
+        // Test that when inlining, we use the optimized version of callees
+        //
+        // Setup:
+        // - Function `inner`: returns 1 + 1 (simple, will be optimized)
+        // - Function `outer`: calls inner via CallResolved
+        //
+        // When we inline `inner` into `outer`, we should get the optimized
+        // version of `inner` (which has already had mem2reg etc. applied)
+        use crate::ir::{BinaryOp, FunDef, GlobalId};
+        use crate::interpreter::call_resolution::GlobalClosure;
+
+        // Create inner function: %0 = 1, %1 = 1, %2 = %0 + %1, return %2
+        let inner_cfg = Cfg {
+            entry: Block {
+                instructions: vec![
+                    (
+                        LocalId::from(0),
+                        Instruction::NumberConstant { value: Pico8Num::from_i16(1) },
+                    ),
+                    (
+                        LocalId::from(1),
+                        Instruction::NumberConstant { value: Pico8Num::from_i16(1) },
+                    ),
+                    (
+                        LocalId::from(2),
+                        Instruction::BinaryOp {
+                            left: LocalId::from(0),
+                            op: BinaryOp::Plus,
+                            right: LocalId::from(1),
+                        },
+                    ),
+                ],
+                terminator: (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
+                hint_normalize: false,
+            },
+            named: FxHashMap::default(),
+        };
+
+        let inner_def = FunDef {
+            name: GlobalId::from("inner_1".to_string()),
+            capture_ids: vec![],
+            arg_ids: vec![],
+            cfg: inner_cfg,
+            source_span: None,
+        };
+
+        // Create outer function that calls inner:
+        // %0 = GetGlobal("inner"), %1 = Load(%0), %2 = Call(%1, [])
+        // This pattern will be resolved to CallResolved by call_resolution
+        let outer_cfg = Cfg {
+            entry: Block {
+                instructions: vec![
+                    (
+                        LocalId::from(0),
+                        Instruction::GetGlobal { name: "inner".to_string(), create_if_missing: false },
+                    ),
+                    (
+                        LocalId::from(1),
+                        Instruction::Load { source: LocalId::from(0) },
+                    ),
+                    (
+                        LocalId::from(2),
+                        Instruction::Call { closure: LocalId::from(1), args: vec![] },
+                    ),
+                ],
+                terminator: (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
+                hint_normalize: false,
+            },
+            named: FxHashMap::default(),
+        };
+
+        let outer_def = FunDef {
+            name: GlobalId::from("outer_2".to_string()),
+            capture_ids: vec![],
+            arg_ids: vec![],
+            cfg: outer_cfg,
+            source_span: None,
+        };
+
+        // Build global closure map
+        let mut global_closure_map: FxHashMap<String, GlobalClosure> = FxHashMap::default();
+        global_closure_map.insert("inner".to_string(), GlobalClosure {
+            fun_name: GlobalId::from("inner_1".to_string()),
+            has_captures: false,
+        });
+
+        // Run optimize_all_functions
+        let fun_defs = vec![&inner_def, &outer_def];
+        let optimized = optimize_all_functions(&fun_defs, &global_closure_map);
+
+        // Check that both functions are in the result
+        assert!(optimized.contains_key(&GlobalId::from("inner_1".to_string())));
+        assert!(optimized.contains_key(&GlobalId::from("outer_2".to_string())));
+
+        // The outer function should have been modified (call resolved and inlined)
+        let optimized_outer = optimized.get(&GlobalId::from("outer_2".to_string())).unwrap();
+
+        // After optimization, outer should NOT contain a Call or CallResolved instruction
+        // (it should have been inlined)
+        let has_call = optimized_outer.cfg.iter_blocks().any(|block| {
+            block.instructions.iter().any(|(_, instr)| {
+                matches!(instr, Instruction::Call { .. } | Instruction::CallResolved { .. })
+            })
+        });
+
+        assert!(!has_call, "outer should have the call to inner inlined");
+
+        // The inlined code should contain the body of inner (BinaryOp Plus)
+        let has_plus = optimized_outer.cfg.iter_blocks().any(|block| {
+            block.instructions.iter().any(|(_, instr)| {
+                matches!(instr, Instruction::BinaryOp { op: BinaryOp::Plus, .. })
+            })
+        });
+
+        assert!(has_plus, "outer should contain the inlined Plus operation from inner");
     }
 }

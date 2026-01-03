@@ -4,11 +4,12 @@ use std::sync::Arc;
 use indexmap::IndexSet;
 use rustc_hash::FxHasher;
 
-use crate::ir::{Cfg, FunDef, GlobalId, Label, LabelGenerator, LocalIdGenerator};
+use crate::ir::{Cfg, FunDef, GlobalId, Label, LocalId, LocalIdGenerator};
 
 use super::block_coalesce::{coalesce_blocks, CoalesceResult};
-use super::call_resolution::{build_global_closure_map_from_fun_defs, resolve_calls, CallResolutionResult};
-use super::inlining::{inline_calls, InliningResult};
+use super::call_resolution::build_global_closure_map_from_fun_defs;
+use super::cfg_analysis::optimize_all_functions;
+use super::cfg_validation::assert_valid_cfg_with_args;
 use super::mem2reg::{mem2reg, Mem2RegResult};
 use super::{state::State, value::Value};
 
@@ -44,7 +45,10 @@ impl PreparedCfg {
 /// Passes applied:
 /// 1. mem2reg - Promote local cells (non-escaping allocations) to SSA
 /// 2. block_coalesce - Merge straight-line blocks
-pub fn optimize_cfg(cfg: &Cfg) -> Cfg {
+///
+/// The `arg_ids` parameter is used for validation - these are the function's
+/// argument local IDs which are defined externally.
+pub fn optimize_cfg(cfg: &Cfg, arg_ids: &[LocalId]) -> Cfg {
     let mut current_cfg = cfg.clone();
     let mut local_gen = LocalIdGenerator::new();
 
@@ -54,12 +58,14 @@ pub fn optimize_cfg(cfg: &Cfg) -> Cfg {
         Mem2RegResult::PartialSuccess { cfg: optimized, .. } => optimized,
         Mem2RegResult::NoCells => current_cfg,
     };
+    assert_valid_cfg_with_args(&current_cfg, arg_ids, "optimize_cfg: after mem2reg");
 
     // Pass 2: block coalescing - merge straight-line blocks
     current_cfg = match coalesce_blocks(&current_cfg) {
         CoalesceResult::Success { cfg: optimized, .. } => optimized,
         CoalesceResult::NoChange => current_cfg,
     };
+    assert_valid_cfg_with_args(&current_cfg, arg_ids, "optimize_cfg: after block_coalesce");
 
     current_cfg
 }
@@ -100,7 +106,10 @@ impl FixedEnv {
     pub fn add_fun_def(&mut self, mut fun_def: FunDef) {
         // Apply shape-independent optimizations if enabled
         if self.optimize_cfgs {
-            fun_def.cfg = optimize_cfg(&fun_def.cfg);
+            // Collect external IDs for validation (capture_ids + arg_ids are defined externally)
+            let mut external_ids: Vec<LocalId> = fun_def.capture_ids.clone();
+            external_ids.extend(fun_def.arg_ids.iter().filter_map(|opt| *opt));
+            fun_def.cfg = optimize_cfg(&fun_def.cfg, &external_ids);
         }
 
         let prepared = PreparedCfg::new(fun_def.cfg.clone());
@@ -118,7 +127,9 @@ impl FixedEnv {
     /// Apply inter-procedural optimizations after all function definitions are loaded.
     ///
     /// This runs call resolution and inlining passes which require knowledge of all
-    /// function definitions to work properly.
+    /// function definitions to work properly. Functions are processed in topological
+    /// order (callees before callers) to ensure that when we inline a function, we
+    /// use its already-optimized version.
     ///
     /// Call this after all `add_fun_def` calls are complete.
     pub fn apply_interprocedural_optimizations(&mut self) {
@@ -127,48 +138,28 @@ impl FixedEnv {
             self.fun_defs.values().map(|(fun_def, _)| fun_def),
         );
 
-        // Build a map of just the FunDefs for inlining lookup
-        let fun_def_map: FxHashMap<GlobalId, FunDef> = self
+        // Collect all function definitions
+        let fun_def_refs: Vec<&FunDef> = self
             .fun_defs
-            .iter()
-            .map(|(name, (fun_def, _))| (name.clone(), fun_def.clone()))
+            .values()
+            .map(|(fun_def, _)| fun_def)
             .collect();
 
-        // Apply call resolution and inlining to each function
+        // Optimize all functions in dependency order
+        // This ensures callees are optimized before they are inlined into callers
+        let optimized = optimize_all_functions(&fun_def_refs, &global_closure_map);
+
+        // Update all function definitions with their optimized versions
+        for (name, (fun_def, _)) in self.fun_defs.iter_mut() {
+            if let Some(optimized_fun) = optimized.get(name) {
+                fun_def.cfg = optimized_fun.cfg.clone();
+            }
+        }
+
+        // Re-prepare all CFGs (update the cached label sets)
         let names: Vec<GlobalId> = self.fun_defs.keys().cloned().collect();
         for name in names {
-            let (mut fun_def, _) = self.fun_defs.remove(&name).unwrap();
-
-            // Apply call resolution
-            fun_def.cfg = match resolve_calls(&fun_def.cfg, &global_closure_map) {
-                CallResolutionResult::Success { cfg, calls_resolved: _ } => cfg,
-                CallResolutionResult::NoChange => fun_def.cfg,
-            };
-
-            // Apply inlining (may run multiple rounds for nested inlining)
-            let mut local_gen = LocalIdGenerator::new();
-            let mut label_gen = LabelGenerator::new();
-            let max_inline_rounds = 3; // Limit to avoid infinite expansion
-
-            for _ in 0..max_inline_rounds {
-                match inline_calls(&fun_def.cfg, &fun_def_map, &mut local_gen, &mut label_gen) {
-                    InliningResult::Success { cfg, calls_inlined: _ } => {
-                        fun_def.cfg = cfg;
-                        // Continue for another round in case of nested calls
-                    }
-                    InliningResult::NoChange => {
-                        break; // No more inlining possible
-                    }
-                }
-            }
-
-            // Run block coalescing to clean up after inlining
-            fun_def.cfg = match coalesce_blocks(&fun_def.cfg) {
-                CoalesceResult::Success { cfg, .. } => cfg,
-                CoalesceResult::NoChange => fun_def.cfg,
-            };
-
-            // Re-add the optimized function definition
+            let (fun_def, _) = self.fun_defs.remove(&name).unwrap();
             let prepared = PreparedCfg::new(fun_def.cfg.clone());
             self.fun_defs.insert(name, (fun_def, prepared));
         }

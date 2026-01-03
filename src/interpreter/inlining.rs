@@ -79,9 +79,19 @@ impl<'a> InlineContext<'a> {
         self.local_mapping.insert(callee_local, caller_local);
     }
 
-    /// Remap an instruction, translating all local IDs.
+    /// Remap an instruction, translating all local IDs and labels (for phi nodes).
     fn remap_instruction(&mut self, instruction: &Instruction) -> Instruction {
-        instruction.map_local_ids(|id| self.map_local(id))
+        let remapped = instruction.map_local_ids(|id| self.map_local(id));
+        // Also remap labels in phi nodes
+        match remapped {
+            Instruction::Phi { branches } => Instruction::Phi {
+                branches: branches
+                    .into_iter()
+                    .map(|(label, id)| (self.map_label(&label), id))
+                    .collect(),
+            },
+            other => other,
+        }
     }
 
     /// Remap a terminator, translating local IDs and labels.
@@ -194,6 +204,10 @@ fn inline_calls_in_block(
                     // Create inline context
                     let mut ctx = InlineContext::new(local_gen, label_gen);
 
+                    // Map the callee's entry block label (__entry) to the new inlined entry label
+                    // This is needed for phi nodes in the callee that reference __entry
+                    ctx.label_mapping.insert(Label::from("__entry".to_string()), entry_label.clone());
+
                     // Map captures: callee capture IDs -> caller capture locals
                     for (callee_capture_id, caller_capture_local) in
                         callee.capture_ids.iter().zip(captures.iter())
@@ -202,18 +216,27 @@ fn inline_calls_in_block(
                     }
 
                     // Map arguments: callee arg IDs -> caller arg locals
-                    for (callee_arg_opt, caller_arg_local) in
-                        callee.arg_ids.iter().zip(args.iter())
-                    {
+                    // In Lua, if fewer args are provided than parameters, the extras are nil
+                    for (i, callee_arg_opt) in callee.arg_ids.iter().enumerate() {
                         if let Some(callee_arg_id) = callee_arg_opt {
-                            ctx.set_local_mapping(*callee_arg_id, *caller_arg_local);
+                            if i < args.len() {
+                                // Arg provided by caller
+                                ctx.set_local_mapping(*callee_arg_id, args[i]);
+                            } else {
+                                // Missing arg - create a nil constant
+                                let nil_local = ctx.local_gen.next();
+                                new_instructions.push((nil_local, Instruction::NilConstant));
+                                ctx.set_local_mapping(*callee_arg_id, nil_local);
+                            }
                         }
                     }
 
                     // Collect return info from all blocks for the phi node
                     let mut return_infos: Vec<(Label, LocalId)> = Vec::new();
 
-                    // Inline the entry block of the callee
+                    // Inline the entry block of the callee as a separate block
+                    // (We used to merge it into the current block, but this caused
+                    // issues with phi nodes referencing a non-existent block label)
                     let (inlined_entry_instrs, inlined_entry_term, entry_return_info) =
                         inline_block_body(&callee.cfg.entry, &mut ctx, &entry_label, &continuation_label);
 
@@ -221,8 +244,13 @@ fn inline_calls_in_block(
                         return_infos.push(info);
                     }
 
-                    // Add the inlined entry instructions to our current block
-                    new_instructions.extend(inlined_entry_instrs);
+                    // Create a separate block for the inlined entry
+                    let inlined_entry_block = Block {
+                        instructions: inlined_entry_instrs,
+                        terminator: inlined_entry_term,
+                        hint_normalize: callee.cfg.entry.hint_normalize,
+                    };
+                    new_blocks.push((entry_label.clone(), inlined_entry_block));
 
                     // Create inlined named blocks
                     for (callee_label, callee_block) in &callee.cfg.named {
@@ -267,11 +295,13 @@ fn inline_calls_in_block(
                     };
                     new_blocks.push((continuation_label.clone(), continuation_block));
 
-                    // The current block now ends with the inlined entry's terminator
-                    // (which will either be a branch to continuation or to an inlined block)
+                    // The current block now branches to the inlined entry block
                     let result_block = Block {
                         instructions: new_instructions,
-                        terminator: inlined_entry_term,
+                        terminator: (
+                            ctx.local_gen.next(),
+                            Terminator::UnconditionalBranch { target: entry_label.clone() },
+                        ),
                         hint_normalize: block.hint_normalize,
                     };
 

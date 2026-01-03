@@ -17,9 +17,11 @@ use clap::Parser;
 
 use celeste_rust::frontend;
 use celeste_rust::interpreter::cfg_analysis::{
-    analyze_cfg, run_optimization_pipeline_full, BlockCoalesceStatus, CfgTestCase, CfgTestCases,
-    HeapEliminationStatus, Mem2RegStatus, SerializableCfg,
+    analyze_cfg, optimize_all_functions, run_optimization_pipeline_with_interprocedural,
+    BlockCoalesceStatus, CfgTestCase, CfgTestCases, DceStatus, HeapEliminationStatus, Mem2RegStatus,
+    CallResolutionStatus, InliningStatus, SerializableCfg,
 };
+use celeste_rust::interpreter::call_resolution::build_global_closure_map_from_fun_defs;
 
 #[derive(Parser, Debug)]
 #[command(name = "cfg_viewer")]
@@ -65,6 +67,45 @@ fn main() -> Result<()> {
 
     println!("Found {} function definitions", fun_defs.len());
 
+    // Build global closure map for call resolution
+    let global_closure_map = build_global_closure_map_from_fun_defs(fun_defs.iter());
+
+    // Pre-optimize all functions in dependency order (callees before callers)
+    // This ensures that when we inline, we use the already-optimized version of callees
+    println!("Optimizing all functions in dependency order...");
+    let fun_def_refs: Vec<_> = fun_defs.iter().collect();
+    let _optimized_funs = optimize_all_functions(&fun_def_refs, &global_closure_map);
+
+    // Build optimized function definition map for inlining
+    // The optimized map contains FunDefs with already-optimized CFGs
+    use std::hash::BuildHasherDefault;
+    use rustc_hash::FxHasher;
+    type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
+
+    // We need to build a map of optimized FunDefs for the pipeline
+    // First, get the optimized CFGs and create FunDefs from them
+    let optimized_fun_def_map: FxHashMap<_, _> = fun_defs
+        .iter()
+        .map(|fd| {
+            // Look up the optimized version if it exists
+            let optimized_cfg = _optimized_funs
+                .get(&fd.name)
+                .map(|opt| opt.cfg.clone())
+                .unwrap_or_else(|| fd.cfg.clone());
+
+            let optimized_fd = celeste_rust::ir::FunDef {
+                name: fd.name.clone(),
+                capture_ids: fd.capture_ids.clone(),
+                arg_ids: fd.arg_ids.clone(),
+                cfg: optimized_cfg,
+                source_span: fd.source_span.clone(),
+            };
+            (fd.name.clone(), optimized_fd)
+        })
+        .collect();
+
+    println!("Built inter-procedural analysis maps");
+
     // Analyze each function
     let mut test_cases = CfgTestCases::new();
     let mut stats = AnalysisStats::default();
@@ -109,8 +150,14 @@ fn main() -> Result<()> {
             stats.modifies_heap_shape += 1;
         }
 
-        // Run optimization pipeline
-        let (opt_result, cfgs) = run_optimization_pipeline_full(&fun_def.cfg, &analysis);
+        // Run optimization pipeline with inter-procedural passes
+        // Uses pre-optimized callees so inlined code is already optimized
+        let (opt_result, cfgs) = run_optimization_pipeline_with_interprocedural(
+            &fun_def.cfg,
+            &analysis,
+            &global_closure_map,
+            &optimized_fun_def_map,
+        );
 
         // Update analysis with heap elimination status for legacy compatibility
         let mut analysis = analysis;
@@ -140,6 +187,27 @@ fn main() -> Result<()> {
             }
             _ => {}
         }
+        match &opt_result.call_resolution {
+            CallResolutionStatus::Success { calls_resolved } => {
+                stats.call_resolution_success += 1;
+                stats.calls_resolved += calls_resolved;
+            }
+            _ => {}
+        }
+        match &opt_result.inlining {
+            InliningStatus::Success { calls_inlined } => {
+                stats.inlining_success += 1;
+                stats.calls_inlined += calls_inlined;
+            }
+            _ => {}
+        }
+        match &opt_result.dce {
+            DceStatus::Success { instructions_removed } => {
+                stats.dce_success += 1;
+                stats.instructions_removed += instructions_removed;
+            }
+            _ => {}
+        }
 
         if args.verbose {
             println!("\n=== {} ===", name);
@@ -166,13 +234,19 @@ fn main() -> Result<()> {
         // Create serializable CFGs
         let original_cfg: SerializableCfg = (&fun_def.cfg).into();
         let after_mem2reg_cfg = cfgs.after_mem2reg.as_ref().map(|c| c.into());
-        let after_heap_elim_cfg = cfgs.after_heap_elim.as_ref().map(|c| c.into());
+        let after_call_resolution_cfg = cfgs.after_call_resolution.as_ref().map(|c| c.into());
+        let after_inlining_cfg = cfgs.after_inlining.as_ref().map(|c| c.into());
+        let after_dce_cfg = cfgs.after_dce.as_ref().map(|c| c.into());
         let after_block_coalesce_cfg = cfgs.after_block_coalesce.as_ref().map(|c| c.into());
+        let after_heap_elim_cfg = cfgs.after_heap_elim.as_ref().map(|c| c.into());
 
         // Determine final optimized CFG (use the latest successful pass)
-        let optimized_cfg = after_block_coalesce_cfg
+        let optimized_cfg = after_heap_elim_cfg
             .clone()
-            .or_else(|| after_heap_elim_cfg.clone())
+            .or_else(|| after_block_coalesce_cfg.clone())
+            .or_else(|| after_dce_cfg.clone())
+            .or_else(|| after_inlining_cfg.clone())
+            .or_else(|| after_call_resolution_cfg.clone())
             .or_else(|| after_mem2reg_cfg.clone())
             .unwrap_or_else(|| original_cfg.clone());
 
@@ -185,6 +259,9 @@ fn main() -> Result<()> {
             after_mem2reg: after_mem2reg_cfg,
             after_heap_elim: after_heap_elim_cfg,
             after_block_coalesce: after_block_coalesce_cfg,
+            after_call_resolution: after_call_resolution_cfg,
+            after_inlining: after_inlining_cfg,
+            after_dce: after_dce_cfg,
             optimized_cfg,
             analysis,
             optimization_result: opt_result,
@@ -218,6 +295,18 @@ fn main() -> Result<()> {
     println!("  Success: {} ({:.1}%)", stats.block_coalesce_success, pct(stats.block_coalesce_success, stats.total));
     println!("  Blocks removed: {}", stats.blocks_removed);
 
+    println!("\n=== Call Resolution ===");
+    println!("  Success: {} ({:.1}%)", stats.call_resolution_success, pct(stats.call_resolution_success, stats.total));
+    println!("  Calls resolved: {}", stats.calls_resolved);
+
+    println!("\n=== Inlining ===");
+    println!("  Success: {} ({:.1}%)", stats.inlining_success, pct(stats.inlining_success, stats.total));
+    println!("  Calls inlined: {}", stats.calls_inlined);
+
+    println!("\n=== Dead Code Elimination ===");
+    println!("  Success: {} ({:.1}%)", stats.dce_success, pct(stats.dce_success, stats.total));
+    println!("  Instructions removed: {}", stats.instructions_removed);
+
     // Write output
     println!("\nWriting to {}...", args.output);
     let json = serde_json::to_string_pretty(&test_cases)?;
@@ -247,4 +336,10 @@ struct AnalysisStats {
     heap_elim_failed: usize,
     block_coalesce_success: usize,
     blocks_removed: usize,
+    call_resolution_success: usize,
+    calls_resolved: usize,
+    inlining_success: usize,
+    calls_inlined: usize,
+    dce_success: usize,
+    instructions_removed: usize,
 }

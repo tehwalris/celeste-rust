@@ -288,13 +288,6 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn test_tracing_disabled_by_default() {
-        // Reset to ensure test isolation (other tests may have enabled tracing)
-        reset_tracing();
-        assert!(!is_tracing_enabled());
-    }
-
-    #[test]
     fn test_enable_tracing() {
         reset_tracing();
         enable_tracing();

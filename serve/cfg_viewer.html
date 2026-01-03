@@ -484,14 +484,20 @@
 
             const tabs = document.getElementById('cfg-tabs');
             const hasMem2reg = c.after_mem2reg != null;
-            const hasHeapElim = c.after_heap_elim != null;
+            const hasCallResolution = c.after_call_resolution != null;
+            const hasInlining = c.after_inlining != null;
+            const hasDce = c.after_dce != null;
             const hasBlockCoalesce = c.after_block_coalesce != null;
+            const hasHeapElim = c.after_heap_elim != null;
 
             tabs.innerHTML = `
                 <button class="cfg-tab ${currentStage === 'original' ? 'active' : ''}" data-stage="original">Original</button>
-                <button class="cfg-tab ${!hasMem2reg ? 'disabled' : ''} ${currentStage === 'mem2reg' ? 'active' : ''}" data-stage="mem2reg">After mem2reg</button>
-                <button class="cfg-tab ${!hasHeapElim ? 'disabled' : ''} ${currentStage === 'heap_elim' ? 'active' : ''}" data-stage="heap_elim">After heap elim</button>
-                <button class="cfg-tab ${!hasBlockCoalesce ? 'disabled' : ''} ${currentStage === 'block_coalesce' ? 'active' : ''}" data-stage="block_coalesce">After coalesce</button>
+                <button class="cfg-tab ${!hasMem2reg ? 'disabled' : ''} ${currentStage === 'mem2reg' ? 'active' : ''}" data-stage="mem2reg">mem2reg</button>
+                <button class="cfg-tab ${!hasCallResolution ? 'disabled' : ''} ${currentStage === 'call_resolution' ? 'active' : ''}" data-stage="call_resolution">call res</button>
+                <button class="cfg-tab ${!hasInlining ? 'disabled' : ''} ${currentStage === 'inlining' ? 'active' : ''}" data-stage="inlining">inlining</button>
+                <button class="cfg-tab ${!hasDce ? 'disabled' : ''} ${currentStage === 'dce' ? 'active' : ''}" data-stage="dce">DCE</button>
+                <button class="cfg-tab ${!hasBlockCoalesce ? 'disabled' : ''} ${currentStage === 'block_coalesce' ? 'active' : ''}" data-stage="block_coalesce">coalesce</button>
+                <button class="cfg-tab ${!hasHeapElim ? 'disabled' : ''} ${currentStage === 'heap_elim' ? 'active' : ''}" data-stage="heap_elim">heap elim</button>
             `;
 
             // Add click handlers
@@ -514,10 +520,16 @@
             switch (currentStage) {
                 case 'mem2reg':
                     return c.after_mem2reg;
-                case 'heap_elim':
-                    return c.after_heap_elim;
+                case 'call_resolution':
+                    return c.after_call_resolution;
+                case 'inlining':
+                    return c.after_inlining;
+                case 'dce':
+                    return c.after_dce;
                 case 'block_coalesce':
                     return c.after_block_coalesce;
+                case 'heap_elim':
+                    return c.after_heap_elim;
                 default:
                     return c.original_cfg;
             }
@@ -570,7 +582,7 @@
                         modifies_heap_shape = true;
                     }
                     // Has calls
-                    if (type === 'call') {
+                    if (type === 'call' || type === 'call_resolved') {
                         has_calls = true;
                     }
                 }
@@ -662,8 +674,11 @@
             const stageLabels = {
                 'original': 'Original',
                 'mem2reg': 'After mem2reg',
-                'heap_elim': 'After heap elim',
-                'block_coalesce': 'After coalesce'
+                'call_resolution': 'After call resolution',
+                'inlining': 'After inlining',
+                'dce': 'After DCE',
+                'block_coalesce': 'After coalesce',
+                'heap_elim': 'After heap elim'
             };
 
             let html = `<h3>Analysis: ${c.name}</h3>`;
@@ -742,6 +757,74 @@
                 html += `<div style="margin-bottom: 8px; ${m2rActive}">
                     <div style="color: #888; font-size: 11px; text-transform: uppercase; margin-bottom: 3px;">mem2reg (local cells)${currentStage === 'mem2reg' ? ' ◀' : ''}</div>
                     <div class="value ${m2rClass}" style="font-size: 12px;">${m2rHtml}</div>
+                </div>`;
+
+                // Call resolution status
+                let crHtml = '';
+                let crClass = '';
+                if (opt.call_resolution === 'NoChange') {
+                    crHtml = 'No calls to resolve';
+                    crClass = '';
+                } else if (opt.call_resolution?.Success) {
+                    const calls = opt.call_resolution.Success.calls_resolved;
+                    crHtml = `✓ ${calls} call${calls !== 1 ? 's' : ''} resolved`;
+                    crClass = 'true';
+                }
+                const crActive = currentStage === 'call_resolution' ? 'border-left: 3px solid #00d9ff; padding-left: 8px;' : '';
+                html += `<div style="margin-bottom: 8px; ${crActive}">
+                    <div style="color: #888; font-size: 11px; text-transform: uppercase; margin-bottom: 3px;">Call Resolution${currentStage === 'call_resolution' ? ' ◀' : ''}</div>
+                    <div class="value ${crClass}" style="font-size: 12px;">${crHtml}</div>
+                </div>`;
+
+                // Inlining status
+                let inlHtml = '';
+                let inlClass = '';
+                if (opt.inlining === 'NoChange') {
+                    inlHtml = 'No calls to inline';
+                    inlClass = '';
+                } else if (opt.inlining?.Success) {
+                    const calls = opt.inlining.Success.calls_inlined;
+                    inlHtml = `✓ ${calls} call${calls !== 1 ? 's' : ''} inlined`;
+                    inlClass = 'true';
+                }
+                const inlActive = currentStage === 'inlining' ? 'border-left: 3px solid #00d9ff; padding-left: 8px;' : '';
+                html += `<div style="margin-bottom: 8px; ${inlActive}">
+                    <div style="color: #888; font-size: 11px; text-transform: uppercase; margin-bottom: 3px;">Inlining${currentStage === 'inlining' ? ' ◀' : ''}</div>
+                    <div class="value ${inlClass}" style="font-size: 12px;">${inlHtml}</div>
+                </div>`;
+
+                // DCE status
+                let dceHtml = '';
+                let dceClass = '';
+                if (opt.dce === 'NoChange') {
+                    dceHtml = 'No dead code';
+                    dceClass = '';
+                } else if (opt.dce?.Success) {
+                    const removed = opt.dce.Success.instructions_removed;
+                    dceHtml = `✓ ${removed} instruction${removed !== 1 ? 's' : ''} removed`;
+                    dceClass = 'true';
+                }
+                const dceActive = currentStage === 'dce' ? 'border-left: 3px solid #00d9ff; padding-left: 8px;' : '';
+                html += `<div style="margin-bottom: 8px; ${dceActive}">
+                    <div style="color: #888; font-size: 11px; text-transform: uppercase; margin-bottom: 3px;">DCE (dead code elim)${currentStage === 'dce' ? ' ◀' : ''}</div>
+                    <div class="value ${dceClass}" style="font-size: 12px;">${dceHtml}</div>
+                </div>`;
+
+                // Block coalesce status
+                let bcHtml = '';
+                let bcClass = '';
+                if (opt.block_coalesce === 'NoChange') {
+                    bcHtml = 'No blocks to merge';
+                    bcClass = '';
+                } else if (opt.block_coalesce?.Success) {
+                    const removed = opt.block_coalesce.Success.blocks_removed;
+                    bcHtml = `✓ ${removed} block${removed !== 1 ? 's' : ''} removed`;
+                    bcClass = 'true';
+                }
+                const bcActive = currentStage === 'block_coalesce' ? 'border-left: 3px solid #00d9ff; padding-left: 8px;' : '';
+                html += `<div style="margin-bottom: 8px; ${bcActive}">
+                    <div style="color: #888; font-size: 11px; text-transform: uppercase; margin-bottom: 3px;">Block Coalesce${currentStage === 'block_coalesce' ? ' ◀' : ''}</div>
+                    <div class="value ${bcClass}" style="font-size: 12px;">${bcHtml}</div>
                 </div>`;
 
                 // Heap elimination status

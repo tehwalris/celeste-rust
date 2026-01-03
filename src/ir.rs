@@ -49,6 +49,20 @@ impl LocalIdGenerator {
         Self { next_id: 0 }
     }
 
+    /// Create a generator that starts from a value higher than any existing local ID in the CFG.
+    /// This prevents ID conflicts when generating new locals for transformations like inlining.
+    pub fn from_cfg(cfg: &Cfg) -> Self {
+        let mut max_id = 0;
+        for block in cfg.iter_blocks() {
+            for (local_id, _) in &block.instructions {
+                max_id = max_id.max(local_id.0 + 1);
+            }
+            // Also check terminator
+            max_id = max_id.max(block.terminator.0.0 + 1);
+        }
+        Self { next_id: max_id }
+    }
+
     pub fn next(&mut self) -> LocalId {
         let id = LocalId(self.next_id);
         self.next_id += 1;
