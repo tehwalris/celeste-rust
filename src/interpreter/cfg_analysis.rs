@@ -46,6 +46,15 @@ pub struct CfgAnalysisResult {
     pub heap_elimination_status: HeapEliminationStatus,
 }
 
+/// A serializable mapping from a heap slot path to its initial SSA LocalId
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SlotMapping {
+    /// Human-readable path (e.g., "arg0.x", "_G.player.spd.x")
+    pub path: String,
+    /// The LocalId assigned to this slot's initial value
+    pub local_id: u32,
+}
+
 /// Status of attempting heap elimination on a CFG
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub enum HeapEliminationStatus {
@@ -57,6 +66,10 @@ pub enum HeapEliminationStatus {
         unpack_count: usize,
         /// Number of slots that were modified
         modified_count: usize,
+        /// Mapping from heap slot paths to their initial SSA LocalIds
+        /// This explains what synthetic LocalIds like %52, %53 represent
+        #[serde(default)]
+        slot_mappings: Vec<SlotMapping>,
     },
     /// Transformation failed with reason
     Failed(String),
@@ -427,11 +440,19 @@ pub fn run_optimization_pipeline_full(
 
         let label_gen = LabelGenerator::new();
 
-        match eliminate_heap(cfg_for_heap_elim, &shape, local_gen, label_gen) {
+        match eliminate_heap(cfg_for_heap_elim, &shape, &[], local_gen, label_gen) {
             HeapEliminationResult::Success(transformed) => {
+                let slot_mappings: Vec<SlotMapping> = transformed.unpack_slots
+                    .iter()
+                    .map(|(slot, local_id)| SlotMapping {
+                        path: slot.to_string(),
+                        local_id: usize::from(*local_id) as u32,
+                    })
+                    .collect();
                 result.heap_elimination = HeapEliminationStatus::Success {
                     unpack_count: transformed.unpack_slots.len(),
                     modified_count: transformed.modified_slots.len(),
+                    slot_mappings,
                 };
                 Some(transformed.cfg)
             }
@@ -780,12 +801,18 @@ fn build_celeste_heap_shape(accessed_globals: &[String]) -> crate::interpreter::
 /// 3. dce: Dead code elimination
 /// 4. block_coalesce: Merge straight-line blocks
 /// 5. heap_elimination: Eliminate global heap operations with known shapes
+///
+/// # Arguments
+/// * `arg_ids` - LocalIds for function arguments (Some if defined, None if unused/varargs)
+/// * `arg_shapes` - Optional shapes for function arguments (e.g., `self` in method calls)
 pub fn run_optimization_pipeline_with_interprocedural(
     cfg: &Cfg,
     analysis: &CfgAnalysisResult,
     global_closure_map: &crate::interpreter::call_resolution::GlobalClosureMap,
     optimized_fun_defs: &std::collections::HashMap<crate::ir::GlobalId, crate::ir::FunDef, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>,
     builtin_set: Option<&crate::interpreter::builtin_resolution::BuiltinSet>,
+    arg_ids: &[Option<crate::ir::LocalId>],
+    arg_shapes: &[Option<crate::interpreter::heap_elimination::ValueShape>],
 ) -> (OptimizationResult, OptimizationCfgs) {
     use crate::interpreter::block_coalesce::{coalesce_blocks, CoalesceResult};
     use crate::interpreter::builtin_resolution::{resolve_builtins, BuiltinResolutionResult};
@@ -970,16 +997,29 @@ pub fn run_optimization_pipeline_with_interprocedural(
     // Re-analyze the CFG to get current accessed_globals (inlining may have added new ones)
     let current_analysis = analyze_cfg(cfg_for_heap_elim);
 
-    if !current_analysis.accessed_globals.is_empty() {
-        // Build a heap shape based on Celeste game's actual global structure
-        // This is an example shape matching frame 28 checkpoint
-        let shape = build_celeste_heap_shape(&current_analysis.accessed_globals);
+    // Build heap shape including both globals and args
+    let has_globals = !current_analysis.accessed_globals.is_empty();
+    let has_args = arg_shapes.iter().any(|s| s.is_some());
 
-        match eliminate_heap(cfg_for_heap_elim, &shape, local_gen, label_gen) {
+    if has_globals || has_args {
+        // Build a heap shape based on Celeste game's actual global structure
+        let mut shape = build_celeste_heap_shape(&current_analysis.accessed_globals);
+        // Add arg shapes
+        shape.args = arg_shapes.to_vec();
+
+        match eliminate_heap(cfg_for_heap_elim, &shape, arg_ids, local_gen, label_gen) {
             HeapEliminationResult::Success(transformed) => {
+                let slot_mappings: Vec<SlotMapping> = transformed.unpack_slots
+                    .iter()
+                    .map(|(slot, local_id)| SlotMapping {
+                        path: slot.to_string(),
+                        local_id: usize::from(*local_id) as u32,
+                    })
+                    .collect();
                 result.heap_elimination = HeapEliminationStatus::Success {
                     unpack_count: transformed.unpack_slots.len(),
                     modified_count: transformed.modified_slots.len(),
+                    slot_mappings,
                 };
                 // Run DCE again after heap elimination to clean up dead GetGlobal/Load/GetField
                 let final_cfg = match eliminate_dead_code(&transformed.cfg) {
@@ -1033,6 +1073,7 @@ pub fn try_heap_elimination(
             HeapEliminationStatus::Success {
                 unpack_count: *cells_promoted,
                 modified_count: 0,
+                slot_mappings: Vec::new(), // mem2reg doesn't track slot mappings
             },
             after_mem2reg,
         );
@@ -1811,6 +1852,8 @@ mod tests {
             &global_closure_map,
             &optimized_fun_defs,
             Some(&builtin_set),
+            &[],  // no arg_ids for this test
+            &[],  // no arg_shapes for this test
         );
 
         // Verify builtin resolution succeeded

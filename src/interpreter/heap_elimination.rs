@@ -13,9 +13,11 @@
 //! Uses the Braun algorithm for on-demand SSA construction.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::hash::BuildHasherDefault;
 
 use rustc_hash::FxHasher;
+use serde::{Deserialize, Serialize};
 
 use crate::ir::{
     Block, Cfg, GlobalId, Instruction, Label, LabelGenerator, LocalId, LocalIdGenerator, Terminator,
@@ -26,10 +28,12 @@ type FxHashSet<T> = HashSet<T, BuildHasherDefault<FxHasher>>;
 
 /// A path into the heap, representing a specific memory location.
 /// For example: `player.pos.x` or `globals.room`
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum HeapPath {
     /// A global variable: _G["name"]
     Global(String),
+    /// A function argument by index (0-based)
+    Arg(usize),
     /// A field access: base.field
     Field(Box<HeapPath>, String),
     /// An index access with a known constant index: base[index]
@@ -37,7 +41,7 @@ pub enum HeapPath {
 }
 
 /// An index into a table - either a string field or numeric index
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum HeapIndex {
     String(String),
     Number(i32),
@@ -46,6 +50,10 @@ pub enum HeapIndex {
 impl HeapPath {
     pub fn global(name: &str) -> Self {
         HeapPath::Global(name.to_string())
+    }
+
+    pub fn arg(index: usize) -> Self {
+        HeapPath::Arg(index)
     }
 
     pub fn field(self, field: &str) -> Self {
@@ -63,7 +71,7 @@ impl HeapPath {
 
 /// A heap slot identifier - uniquely identifies a memory location in the abstract heap.
 /// This is similar to HeapPath but normalized and used as a key during transformation.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HeapSlot(HeapPath);
 
 impl HeapSlot {
@@ -73,6 +81,24 @@ impl HeapSlot {
 
     pub fn path(&self) -> &HeapPath {
         &self.0
+    }
+}
+
+impl fmt::Display for HeapPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HeapPath::Global(name) => write!(f, "_G.{}", name),
+            HeapPath::Arg(idx) => write!(f, "arg{}", idx),
+            HeapPath::Field(base, field) => write!(f, "{}.{}", base, field),
+            HeapPath::Index(base, HeapIndex::String(s)) => write!(f, "{}[\"{}\"]", base, s),
+            HeapPath::Index(base, HeapIndex::Number(n)) => write!(f, "{}[{}]", base, n),
+        }
+    }
+}
+
+impl fmt::Display for HeapSlot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -113,12 +139,24 @@ impl HeapShape {
     pub fn collect_leaf_slots(&self) -> Vec<HeapSlot> {
         let mut slots = Vec::new();
 
+        // Collect from globals
         for (name, shape) in &self.globals {
             self.collect_slots_recursive(
                 HeapPath::Global(name.clone()),
                 shape,
                 &mut slots,
             );
+        }
+
+        // Collect from args
+        for (index, maybe_shape) in self.args.iter().enumerate() {
+            if let Some(shape) = maybe_shape {
+                self.collect_slots_recursive(
+                    HeapPath::Arg(index),
+                    shape,
+                    &mut slots,
+                );
+            }
         }
 
         slots
@@ -154,16 +192,27 @@ impl HeapShape {
         }
     }
 
-    /// Check if a heap path corresponds to a leaf value in this shape.
-    /// Returns true if the path points to a Leaf, false if it points to a Table or other compound type.
+    /// Check if a heap path corresponds to a *known* leaf value in this shape.
+    /// Returns true if the path points to a known Leaf in the shape.
+    /// Returns false if:
+    /// - The path points to a Table or other compound type
+    /// - The path is unknown (not in the shape) - we don't track unknown paths
     pub fn is_leaf_path(&self, path: &HeapPath) -> bool {
         match path {
             HeapPath::Global(name) => {
                 if let Some(shape) = self.globals.get(name) {
                     matches!(shape, ValueShape::Leaf)
                 } else {
-                    // Unknown global - assume leaf for safety
-                    true
+                    // Unknown global - don't track (return false to keep original ops)
+                    false
+                }
+            }
+            HeapPath::Arg(index) => {
+                if let Some(Some(shape)) = self.args.get(*index) {
+                    matches!(shape, ValueShape::Leaf)
+                } else {
+                    // Unknown arg - don't track
+                    false
                 }
             }
             HeapPath::Field(base, field) => {
@@ -174,16 +223,17 @@ impl HeapShape {
                             if let Some(field_shape) = fields.get(field) {
                                 matches!(field_shape, ValueShape::Leaf)
                             } else {
-                                true // Unknown field - assume leaf
+                                // Unknown field - don't track (might be dynamically added)
+                                false
                             }
                         }
-                        _ => true // Non-table base - assume leaf
+                        _ => false // Non-table base - don't track
                     }
                 } else {
-                    true // Unknown base - assume leaf
+                    false // Unknown base - don't track
                 }
             }
-            HeapPath::Index { .. } => true, // Dynamic index - assume leaf
+            HeapPath::Index { .. } => false, // Dynamic index - don't track
         }
     }
 
@@ -191,6 +241,7 @@ impl HeapShape {
     fn get_shape_at_path(&self, path: &HeapPath) -> Option<&ValueShape> {
         match path {
             HeapPath::Global(name) => self.globals.get(name),
+            HeapPath::Arg(index) => self.args.get(*index).and_then(|o| o.as_ref()),
             HeapPath::Field(base, field) => {
                 if let Some(base_shape) = self.get_shape_at_path(base) {
                     match base_shape {
@@ -202,6 +253,18 @@ impl HeapShape {
                 }
             }
             _ => None
+        }
+    }
+
+    /// Check if a field exists at a given path (for create_if_missing checks)
+    pub fn field_exists_at_path(&self, base_path: &HeapPath, field: &str) -> bool {
+        if let Some(base_shape) = self.get_shape_at_path(base_path) {
+            match base_shape {
+                ValueShape::Table(fields) => fields.contains_key(field),
+                _ => false
+            }
+        } else {
+            false
         }
     }
 }
@@ -384,18 +447,19 @@ fn compute_predecessors(cfg: &Cfg) -> FxHashMap<BlockId, Vec<(BlockId, Label)>> 
     };
 
     // Process entry block
+    // Note: Use Label::entry() which provides the canonical name for the entry block in phi nodes
     match &cfg.entry.terminator.1 {
         Terminator::Return { .. } => {}
         Terminator::UnconditionalBranch { target } => {
-            add_pred(target, BlockId::Entry, Label::from("entry".to_string()));
+            add_pred(target, BlockId::Entry, Label::entry());
         }
         Terminator::ConditionalBranch {
             true_target,
             false_target,
             ..
         } => {
-            add_pred(true_target, BlockId::Entry, Label::from("entry".to_string()));
-            add_pred(false_target, BlockId::Entry, Label::from("entry".to_string()));
+            add_pred(true_target, BlockId::Entry, Label::entry());
+            add_pred(false_target, BlockId::Entry, Label::entry());
         }
     }
 
@@ -450,7 +514,7 @@ fn find_exit_blocks(cfg: &Cfg) -> Vec<BlockId> {
 /// - Side effects: print, __print, error
 /// - Value creators: __new_unknown_boolean, __new_vector (may allocate)
 fn is_pure_builtin(name: &str) -> bool {
-    matches!(name, "min" | "max" | "abs" | "flr" | "__split_by_flr" | "mget" | "fget")
+    matches!(name, "min" | "max" | "abs" | "flr" | "__split_by_flr" | "mget" | "fget" | "tile_flag_at" | "tile_at")
 }
 
 /// Mapping from LocalId to the heap slot it represents (if any)
@@ -551,8 +615,17 @@ fn transform_block(
             }
 
             Instruction::GetField { receiver, field, create_if_missing } => {
+                // Check if create_if_missing is safe given the known shape
                 if *create_if_missing {
-                    return Err(format!("Shape-modifying GetField: {}", field));
+                    // Check if the field already exists in the known shape
+                    if let Some(base_slot) = id_mapping.get_slot(*receiver) {
+                        if !shape.field_exists_at_path(base_slot.path(), field) {
+                            return Err(format!("Shape-modifying GetField: {}", field));
+                        }
+                    } else {
+                        // Unknown base - can't verify field exists
+                        return Err(format!("Shape-modifying GetField on unknown base: {}", field));
+                    }
                 }
                 // Extend the path from receiver
                 if let Some(base_slot) = id_mapping.get_slot(*receiver).cloned() {
@@ -633,9 +706,17 @@ fn transform_block(
 }
 
 /// Attempt to eliminate heap operations from a CFG given a concrete heap shape.
+///
+/// # Arguments
+/// * `cfg` - The CFG to transform
+/// * `shape` - The concrete shape of globals and arguments
+/// * `arg_ids` - LocalIds for function arguments (Some if defined, None if unused/varargs)
+/// * `local_gen` - Generator for fresh LocalIds
+/// * `label_gen` - Generator for fresh Labels
 pub fn eliminate_heap(
     cfg: &Cfg,
     shape: &HeapShape,
+    arg_ids: &[Option<LocalId>],
     local_gen: LocalIdGenerator,
     label_gen: LabelGenerator,
 ) -> HeapEliminationResult {
@@ -666,6 +747,16 @@ pub fn eliminate_heap(
 
     // Transform blocks
     let mut id_mapping = LocalIdMapping::new();
+
+    // Initialize arg mappings - map argument LocalIds to their slots
+    for (index, maybe_arg_id) in arg_ids.iter().enumerate() {
+        if let Some(arg_id) = maybe_arg_id {
+            if shape.args.get(index).map_or(false, |s| s.is_some()) {
+                let slot = HeapSlot::new(HeapPath::Arg(index));
+                id_mapping.set_slot(*arg_id, slot);
+            }
+        }
+    }
     let mut modified_slots: FxHashSet<HeapSlot> = FxHashSet::default();
 
     // Transform entry block
@@ -844,7 +935,7 @@ mod tests {
         let local_gen = make_local_gen();
         let label_gen = make_label_gen();
 
-        let result = eliminate_heap(&cfg, &shape, local_gen, label_gen);
+        let result = eliminate_heap(&cfg, &shape, &[], local_gen, label_gen);
         assert!(matches!(result, HeapEliminationResult::NotApplicable));
     }
 
@@ -883,7 +974,7 @@ mod tests {
         let local_gen = make_local_gen();
         let label_gen = make_label_gen();
 
-        let result = eliminate_heap(&cfg, &shape, local_gen, label_gen);
+        let result = eliminate_heap(&cfg, &shape, &[], local_gen, label_gen);
         match result {
             HeapEliminationResult::Success(transformed) => {
                 assert_eq!(transformed.unpack_slots.len(), 1);
@@ -920,7 +1011,7 @@ mod tests {
         let local_gen = make_local_gen();
         let label_gen = make_label_gen();
 
-        let result = eliminate_heap(&cfg, &shape, local_gen, label_gen);
+        let result = eliminate_heap(&cfg, &shape, &[], local_gen, label_gen);
         assert!(matches!(result, HeapEliminationResult::ShapeNotPreserved(_)));
     }
 
@@ -966,7 +1057,7 @@ mod tests {
         let local_gen = make_local_gen();
         let label_gen = make_label_gen();
 
-        let result = eliminate_heap(&cfg, &shape, local_gen, label_gen);
+        let result = eliminate_heap(&cfg, &shape, &[], local_gen, label_gen);
         // Should succeed because max is a pure builtin
         assert!(matches!(result, HeapEliminationResult::Success(_)));
     }
@@ -1013,7 +1104,7 @@ mod tests {
         let local_gen = make_local_gen();
         let label_gen = make_label_gen();
 
-        let result = eliminate_heap(&cfg, &shape, local_gen, label_gen);
+        let result = eliminate_heap(&cfg, &shape, &[], local_gen, label_gen);
         // Should fail because add modifies the heap
         match result {
             HeapEliminationResult::ShapeNotPreserved(msg) => {
@@ -1033,9 +1124,10 @@ mod tests {
         assert!(is_pure_builtin("__split_by_flr"));
         assert!(is_pure_builtin("mget"));
         assert!(is_pure_builtin("fget"));
+        assert!(is_pure_builtin("tile_flag_at"));
+        assert!(is_pure_builtin("tile_at"));
 
         // Impure builtins
-        assert!(!is_pure_builtin("tile_flag_at"));
         assert!(!is_pure_builtin("add"));
         assert!(!is_pure_builtin("print"));
         assert!(!is_pure_builtin("__print"));

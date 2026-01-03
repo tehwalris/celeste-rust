@@ -453,7 +453,7 @@ fn interpret_prepared_cfg_inner(
                     // Entry block doesn't have a label, but we need one for phi
                     // This case shouldn't happen in practice as entry block
                     // typically doesn't branch to blocks with phis
-                    Label::from("__entry".to_string())
+                    Label::entry()
                 });
                 let bound_phi = adapter.flow_block_phi(&source_label, target_block)?;
                 let flow_data = bound_phi.flow(flow_data)?;
@@ -480,7 +480,7 @@ fn interpret_prepared_cfg_inner(
                 // Process true branch with cloned data, false branch with original
                 // This avoids one unnecessary clone
                 let source_label = block_label.clone().unwrap_or_else(|| {
-                    Label::from("__entry".to_string())
+                    Label::entry()
                 });
 
                 // Helper to process a branch

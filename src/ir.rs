@@ -107,12 +107,22 @@ impl From<String> for GlobalId {
 
 pub type GlobalIdGenerator = UniqueStringGenerator<GlobalId>;
 
+/// The canonical name for the entry block when referenced in phi nodes.
+/// This is a convention used throughout the codebase - the entry block
+/// doesn't have a Label in cfg.named, but phi nodes need to reference it.
+pub const ENTRY_BLOCK_LABEL: &str = "__entry";
+
 #[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug)]
 pub struct Label(String);
 
 impl Label {
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Get the label used to reference the entry block in phi nodes.
+    pub fn entry() -> Self {
+        Self(ENTRY_BLOCK_LABEL.to_string())
     }
 }
 

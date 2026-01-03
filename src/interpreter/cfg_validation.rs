@@ -91,12 +91,14 @@ pub fn validate_cfg(cfg: &Cfg) -> ValidationResult {
 
 /// Validate a CFG, treating the given local IDs as already defined (function arguments)
 pub fn validate_cfg_with_args(cfg: &Cfg, arg_ids: &[LocalId]) -> ValidationResult {
+    use crate::ir::ENTRY_BLOCK_LABEL;
+
     let mut errors = Vec::new();
 
     // Collect all block names
     let mut block_names: FxHashSet<String> = FxHashSet::default();
-    // The entry block can be referenced as "__entry" in phi nodes
-    block_names.insert("__entry".to_string());
+    // The entry block can be referenced by its canonical name in phi nodes
+    block_names.insert(ENTRY_BLOCK_LABEL.to_string());
     for label in cfg.named.keys() {
         block_names.insert(label.as_str().to_string());
     }
@@ -169,17 +171,19 @@ fn collect_definitions(
 
 /// Build a map from block name to its predecessors
 fn build_predecessor_map(cfg: &Cfg) -> FxHashMap<String, FxHashSet<String>> {
+    use crate::ir::ENTRY_BLOCK_LABEL;
+
     let mut predecessors: FxHashMap<String, FxHashSet<String>> = FxHashMap::default();
 
     // Initialize all blocks with empty predecessor sets
-    // The entry block is referenced as "__entry" in phi nodes
-    predecessors.insert("__entry".to_string(), FxHashSet::default());
+    // The entry block is referenced by ENTRY_BLOCK_LABEL in phi nodes
+    predecessors.insert(ENTRY_BLOCK_LABEL.to_string(), FxHashSet::default());
     for label in cfg.named.keys() {
         predecessors.insert(label.as_str().to_string(), FxHashSet::default());
     }
 
-    // Add predecessors from entry block (using "__entry" to match phi references)
-    add_predecessors_from_terminator(&cfg.entry.terminator.1, "__entry", &mut predecessors);
+    // Add predecessors from entry block
+    add_predecessors_from_terminator(&cfg.entry.terminator.1, ENTRY_BLOCK_LABEL, &mut predecessors);
 
     // Add predecessors from named blocks
     for (label, block) in &cfg.named {

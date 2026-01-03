@@ -204,9 +204,9 @@ fn inline_calls_in_block(
                     // Create inline context
                     let mut ctx = InlineContext::new(local_gen, label_gen);
 
-                    // Map the callee's entry block label (__entry) to the new inlined entry label
-                    // This is needed for phi nodes in the callee that reference __entry
-                    ctx.label_mapping.insert(Label::from("__entry".to_string()), entry_label.clone());
+                    // Map the callee's entry block label to the new inlined entry label
+                    // This is needed for phi nodes in the callee that reference the entry block
+                    ctx.label_mapping.insert(Label::entry(), entry_label.clone());
 
                     // Map captures: callee capture IDs -> caller capture locals
                     for (callee_capture_id, caller_capture_local) in

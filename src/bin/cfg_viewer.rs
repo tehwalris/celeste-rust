@@ -23,6 +23,7 @@ use celeste_rust::interpreter::cfg_analysis::{
     CallResolutionStatus, InliningStatus, SerializableCfg,
 };
 use celeste_rust::interpreter::call_resolution::build_global_closure_map_from_fun_defs;
+use celeste_rust::interpreter::heap_elimination::ValueShape;
 
 #[derive(Parser, Debug)]
 #[command(name = "cfg_viewer")]
@@ -158,6 +159,10 @@ fn main() -> Result<()> {
             stats.modifies_heap_shape += 1;
         }
 
+        // Build arg shapes based on function name
+        // Methods like player.update, obj.move_x, etc. have a 'self' argument
+        let arg_shapes = build_arg_shapes_for_function(name);
+
         // Run optimization pipeline with inter-procedural passes
         // Uses pre-optimized callees so inlined code is already optimized
         let (opt_result, cfgs) = run_optimization_pipeline_with_interprocedural(
@@ -166,6 +171,8 @@ fn main() -> Result<()> {
             &global_closure_map,
             &optimized_fun_def_map,
             Some(&builtin_set),
+            &fun_def.arg_ids,
+            &arg_shapes,
         );
 
         // Update analysis with heap elimination status for legacy compatibility
@@ -354,4 +361,154 @@ struct AnalysisStats {
     calls_inlined: usize,
     dce_success: usize,
     instructions_removed: usize,
+}
+
+/// Build argument shapes for a function based on its name.
+///
+/// Methods in Celeste follow a naming pattern like "player.update_21", "obj.move_x_52", etc.
+/// The first argument to these methods is typically `self`, which is a table with known fields.
+fn build_arg_shapes_for_function(name: &str) -> Vec<Option<ValueShape>> {
+    use std::hash::BuildHasherDefault;
+    use rustc_hash::FxHasher;
+    type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
+
+    // Parse the function name to determine if it's a method
+    // Pattern: "type.method_N" where N is a number
+    let parts: Vec<&str> = name.split('.').collect();
+    if parts.len() != 2 {
+        // Not a method - no special arg shapes
+        return vec![];
+    }
+
+    let type_name = parts[0];
+    let method_part = parts[1];
+
+    // Extract method name (remove trailing _N suffix) - for future use
+    let _method_name = method_part
+        .rfind('_')
+        .map(|i| &method_part[..i])
+        .unwrap_or(method_part);
+
+    // Build the shape for 'self' based on the type
+    let self_shape = match type_name {
+        "player" => {
+            // Player has fields: x, y, spd (which has x, y), etc.
+            let mut fields = FxHashMap::default();
+            fields.insert("x".to_string(), ValueShape::Leaf);
+            fields.insert("y".to_string(), ValueShape::Leaf);
+            fields.insert("flip".to_string(), ValueShape::Leaf);
+            fields.insert("spr".to_string(), ValueShape::Leaf);
+            fields.insert("djump".to_string(), ValueShape::Leaf);
+            fields.insert("dash_time".to_string(), ValueShape::Leaf);
+            fields.insert("dash_target".to_string(), ValueShape::Leaf);
+            fields.insert("dash_accel".to_string(), ValueShape::Leaf);
+            fields.insert("dash_effect_time".to_string(), ValueShape::Leaf);
+            fields.insert("grace".to_string(), ValueShape::Leaf);
+            fields.insert("jbuffer".to_string(), ValueShape::Leaf);
+            fields.insert("was_on_ground".to_string(), ValueShape::Leaf);
+            fields.insert("solids".to_string(), ValueShape::Leaf);
+            fields.insert("state".to_string(), ValueShape::Leaf);
+            fields.insert("p_jump".to_string(), ValueShape::Leaf);
+            fields.insert("p_dash".to_string(), ValueShape::Leaf);
+            fields.insert("spr_off".to_string(), ValueShape::Leaf);
+            // spd is a table with x, y
+            let mut spd_fields = FxHashMap::default();
+            spd_fields.insert("x".to_string(), ValueShape::Leaf);
+            spd_fields.insert("y".to_string(), ValueShape::Leaf);
+            fields.insert("spd".to_string(), ValueShape::Table(spd_fields));
+            // rem is a table with x, y
+            let mut rem_fields = FxHashMap::default();
+            rem_fields.insert("x".to_string(), ValueShape::Leaf);
+            rem_fields.insert("y".to_string(), ValueShape::Leaf);
+            fields.insert("rem".to_string(), ValueShape::Table(rem_fields));
+            // hitbox is a table with x, y, w, h
+            let mut hitbox_fields = FxHashMap::default();
+            hitbox_fields.insert("x".to_string(), ValueShape::Leaf);
+            hitbox_fields.insert("y".to_string(), ValueShape::Leaf);
+            hitbox_fields.insert("w".to_string(), ValueShape::Leaf);
+            hitbox_fields.insert("h".to_string(), ValueShape::Leaf);
+            fields.insert("hitbox".to_string(), ValueShape::Table(hitbox_fields));
+            // hair is a nested table - for now just mark as Leaf since we don't deeply track it
+            fields.insert("hair".to_string(), ValueShape::Leaf);
+            ValueShape::Table(fields)
+        }
+        "obj" => {
+            // Generic object shape used by obj.move_x, obj.collide, etc.
+            let mut fields = FxHashMap::default();
+            fields.insert("x".to_string(), ValueShape::Leaf);
+            fields.insert("y".to_string(), ValueShape::Leaf);
+            fields.insert("type".to_string(), ValueShape::Leaf);
+            fields.insert("collideable".to_string(), ValueShape::Leaf);
+            fields.insert("solids".to_string(), ValueShape::Leaf);
+            fields.insert("flip".to_string(), ValueShape::Leaf);
+            // spd is a table with x, y
+            let mut spd_fields = FxHashMap::default();
+            spd_fields.insert("x".to_string(), ValueShape::Leaf);
+            spd_fields.insert("y".to_string(), ValueShape::Leaf);
+            fields.insert("spd".to_string(), ValueShape::Table(spd_fields));
+            // rem is a table with x, y
+            let mut rem_fields = FxHashMap::default();
+            rem_fields.insert("x".to_string(), ValueShape::Leaf);
+            rem_fields.insert("y".to_string(), ValueShape::Leaf);
+            fields.insert("rem".to_string(), ValueShape::Table(rem_fields));
+            // hitbox is a table with x, y, w, h
+            let mut hitbox_fields = FxHashMap::default();
+            hitbox_fields.insert("x".to_string(), ValueShape::Leaf);
+            hitbox_fields.insert("y".to_string(), ValueShape::Leaf);
+            hitbox_fields.insert("w".to_string(), ValueShape::Leaf);
+            hitbox_fields.insert("h".to_string(), ValueShape::Leaf);
+            fields.insert("hitbox".to_string(), ValueShape::Table(hitbox_fields));
+            ValueShape::Table(fields)
+        }
+        "spring" | "balloon" | "fall_floor" | "fruit" | "fly_fruit" | "fake_wall"
+        | "key" | "chest" | "platform" | "big_chest" | "orb" | "player_spawn" => {
+            // Object-like types with standard fields
+            let mut fields = FxHashMap::default();
+            fields.insert("x".to_string(), ValueShape::Leaf);
+            fields.insert("y".to_string(), ValueShape::Leaf);
+            fields.insert("spr".to_string(), ValueShape::Leaf);
+            fields.insert("type".to_string(), ValueShape::Leaf);
+            fields.insert("state".to_string(), ValueShape::Leaf);
+            fields.insert("delay".to_string(), ValueShape::Leaf);
+            fields.insert("target".to_string(), ValueShape::Leaf);
+            fields.insert("timer".to_string(), ValueShape::Leaf);
+            fields.insert("start".to_string(), ValueShape::Leaf);
+            fields.insert("dir".to_string(), ValueShape::Leaf);
+            fields.insert("collideable".to_string(), ValueShape::Leaf);
+            fields.insert("flip".to_string(), ValueShape::Leaf);
+            fields.insert("solids".to_string(), ValueShape::Leaf);
+            fields.insert("hide_in".to_string(), ValueShape::Leaf);
+            fields.insert("hide_for".to_string(), ValueShape::Leaf);
+            fields.insert("last".to_string(), ValueShape::Leaf);
+            fields.insert("particles".to_string(), ValueShape::Leaf);
+            fields.insert("draw".to_string(), ValueShape::Leaf);
+            fields.insert("update".to_string(), ValueShape::Leaf);
+            fields.insert("init".to_string(), ValueShape::Leaf);
+            // spd is a table with x, y
+            let mut spd_fields = FxHashMap::default();
+            spd_fields.insert("x".to_string(), ValueShape::Leaf);
+            spd_fields.insert("y".to_string(), ValueShape::Leaf);
+            fields.insert("spd".to_string(), ValueShape::Table(spd_fields));
+            // rem is a table with x, y
+            let mut rem_fields = FxHashMap::default();
+            rem_fields.insert("x".to_string(), ValueShape::Leaf);
+            rem_fields.insert("y".to_string(), ValueShape::Leaf);
+            fields.insert("rem".to_string(), ValueShape::Table(rem_fields));
+            // hitbox is a table with x, y, w, h
+            let mut hitbox_fields = FxHashMap::default();
+            hitbox_fields.insert("x".to_string(), ValueShape::Leaf);
+            hitbox_fields.insert("y".to_string(), ValueShape::Leaf);
+            hitbox_fields.insert("w".to_string(), ValueShape::Leaf);
+            hitbox_fields.insert("h".to_string(), ValueShape::Leaf);
+            fields.insert("hitbox".to_string(), ValueShape::Table(hitbox_fields));
+            ValueShape::Table(fields)
+        }
+        _ => {
+            // Unknown type - no shape tracking
+            return vec![];
+        }
+    };
+
+    // The first argument is 'self' with the determined shape
+    vec![Some(self_shape)]
 }

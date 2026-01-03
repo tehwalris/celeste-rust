@@ -11002,7 +11002,17 @@
         "heap_elimination_status": {
           "Success": {
             "unpack_count": 2,
-            "modified_count": 0
+            "modified_count": 0,
+            "slot_mappings": [
+              {
+                "path": "_G.room.x",
+                "local_id": 26
+              },
+              {
+                "path": "_G.room.y",
+                "local_id": 27
+              }
+            ]
           }
         }
       },
@@ -11015,7 +11025,17 @@
         "heap_elimination": {
           "Success": {
             "unpack_count": 2,
-            "modified_count": 0
+            "modified_count": 0,
+            "slot_mappings": [
+              {
+                "path": "_G.room.x",
+                "local_id": 26
+              },
+              {
+                "path": "_G.room.y",
+                "local_id": 27
+              }
+            ]
           }
         },
         "block_coalesce": "NoChange",
@@ -113003,7 +113023,178 @@
         },
         "named_blocks": []
       },
-      "after_heap_elim": null,
+      "after_heap_elim": {
+        "entry_block": {
+          "instructions": [
+            {
+              "target_id": 8,
+              "instruction_text": "Load(9)",
+              "instruction_type": "load"
+            },
+            {
+              "target_id": 10,
+              "instruction_text": "GetField(8, x)",
+              "instruction_type": "get_field"
+            },
+            {
+              "target_id": 11,
+              "instruction_text": "Load(10)",
+              "instruction_type": "load"
+            },
+            {
+              "target_id": 12,
+              "instruction_text": "Load(9)",
+              "instruction_type": "load"
+            },
+            {
+              "target_id": 13,
+              "instruction_text": "GetField(12, hitbox)",
+              "instruction_type": "get_field"
+            },
+            {
+              "target_id": 14,
+              "instruction_text": "Load(13)",
+              "instruction_type": "load"
+            },
+            {
+              "target_id": 15,
+              "instruction_text": "GetField(14, x)",
+              "instruction_type": "get_field"
+            },
+            {
+              "target_id": 16,
+              "instruction_text": "Load(15)",
+              "instruction_type": "load"
+            },
+            {
+              "target_id": 17,
+              "instruction_text": "BinaryOp(11, Plus, 16)",
+              "instruction_type": "binary_op"
+            },
+            {
+              "target_id": 19,
+              "instruction_text": "BinaryOp(17, Plus, 2)",
+              "instruction_type": "binary_op"
+            },
+            {
+              "target_id": 20,
+              "instruction_text": "Load(9)",
+              "instruction_type": "load"
+            },
+            {
+              "target_id": 21,
+              "instruction_text": "GetField(20, y)",
+              "instruction_type": "get_field"
+            },
+            {
+              "target_id": 22,
+              "instruction_text": "Load(21)",
+              "instruction_type": "load"
+            },
+            {
+              "target_id": 23,
+              "instruction_text": "Load(9)",
+              "instruction_type": "load"
+            },
+            {
+              "target_id": 24,
+              "instruction_text": "GetField(23, hitbox)",
+              "instruction_type": "get_field"
+            },
+            {
+              "target_id": 25,
+              "instruction_text": "Load(24)",
+              "instruction_type": "load"
+            },
+            {
+              "target_id": 26,
+              "instruction_text": "GetField(25, y)",
+              "instruction_type": "get_field"
+            },
+            {
+              "target_id": 27,
+              "instruction_text": "Load(26)",
+              "instruction_type": "load"
+            },
+            {
+              "target_id": 28,
+              "instruction_text": "BinaryOp(22, Plus, 27)",
+              "instruction_type": "binary_op"
+            },
+            {
+              "target_id": 30,
+              "instruction_text": "BinaryOp(28, Plus, 5)",
+              "instruction_type": "binary_op"
+            },
+            {
+              "target_id": 31,
+              "instruction_text": "Load(9)",
+              "instruction_type": "load"
+            },
+            {
+              "target_id": 32,
+              "instruction_text": "GetField(31, hitbox)",
+              "instruction_type": "get_field"
+            },
+            {
+              "target_id": 33,
+              "instruction_text": "Load(32)",
+              "instruction_type": "load"
+            },
+            {
+              "target_id": 34,
+              "instruction_text": "GetField(33, w)",
+              "instruction_type": "get_field"
+            },
+            {
+              "target_id": 35,
+              "instruction_text": "Load(34)",
+              "instruction_type": "load"
+            },
+            {
+              "target_id": 36,
+              "instruction_text": "Load(9)",
+              "instruction_type": "load"
+            },
+            {
+              "target_id": 37,
+              "instruction_text": "GetField(36, hitbox)",
+              "instruction_type": "get_field"
+            },
+            {
+              "target_id": 38,
+              "instruction_text": "Load(37)",
+              "instruction_type": "load"
+            },
+            {
+              "target_id": 39,
+              "instruction_text": "GetField(38, h)",
+              "instruction_type": "get_field"
+            },
+            {
+              "target_id": 40,
+              "instruction_text": "Load(39)",
+              "instruction_type": "load"
+            },
+            {
+              "target_id": 43,
+              "instruction_text": "NumberConstant(Pico8Num(\"0x40000\"))",
+              "instruction_type": "number_constant"
+            },
+            {
+              "target_id": 44,
+              "instruction_text": "CallBuiltin(tile_flag_at, [19, 30, 35, 40, 43])",
+              "instruction_type": "call_builtin"
+            }
+          ],
+          "terminator": {
+            "target_id": 42,
+            "terminator_text": "Return(44)"
+          },
+          "hint_normalize": false
+        },
+        "named_blocks": []
+      },
       "after_block_coalesce": {
         "entry_block": {
           "instructions": [
@@ -113974,7 +114165,70 @@
         "accessed_globals": [
           "ice_at"
         ],
-        "heap_elimination_status": "NotApplicable"
+        "heap_elimination_status": {
+          "Success": {
+            "unpack_count": 14,
+            "modified_count": 0,
+            "slot_mappings": [
+              {
+                "path": "arg0.solids",
+                "local_id": 47
+              },
+              {
+                "path": "arg0.flip",
+                "local_id": 48
+              },
+              {
+                "path": "arg0.rem.x",
+                "local_id": 49
+              },
+              {
+                "path": "arg0.rem.y",
+                "local_id": 50
+              },
+              {
+                "path": "arg0.hitbox.y",
+                "local_id": 51
+              },
+              {
+                "path": "arg0.hitbox.h",
+                "local_id": 52
+              },
+              {
+                "path": "arg0.hitbox.x",
+                "local_id": 53
+              },
+              {
+                "path": "arg0.hitbox.w",
+                "local_id": 54
+              },
+              {
+                "path": "arg0.collideable",
+                "local_id": 55
+              },
+              {
+                "path": "arg0.spd.x",
+                "local_id": 56
+              },
+              {
+                "path": "arg0.spd.y",
+                "local_id": 57
+              },
+              {
+                "path": "arg0.y",
+                "local_id": 58
+              },
+              {
+                "path": "arg0.x",
+                "local_id": 59
+              },
+              {
+                "path": "arg0.type",
+                "local_id": 60
+              }
+            ]
+          }
+        }
       },
       "optimization_result": {
         "mem2reg": {
@@ -113982,7 +114236,70 @@
             "cells_promoted": 2
           }
         },
-        "heap_elimination": "NotApplicable",
+        "heap_elimination": {
+          "Success": {
+            "unpack_count": 14,
+            "modified_count": 0,
+            "slot_mappings": [
+              {
+                "path": "arg0.solids",
+                "local_id": 47
+              },
+              {
+                "path": "arg0.flip",
+                "local_id": 48
+              },
+              {
+                "path": "arg0.rem.x",
+                "local_id": 49
+              },
+              {
+                "path": "arg0.rem.y",
+                "local_id": 50
+              },
+              {
+                "path": "arg0.hitbox.y",
+                "local_id": 51
+              },
+              {
+                "path": "arg0.hitbox.h",
+                "local_id": 52
+              },
+              {
+                "path": "arg0.hitbox.x",
+                "local_id": 53
+              },
+              {
+                "path": "arg0.hitbox.w",
+                "local_id": 54
+              },
+              {
+                "path": "arg0.collideable",
+                "local_id": 55
+              },
+              {
+                "path": "arg0.spd.x",
+                "local_id": 56
+              },
+              {
+                "path": "arg0.spd.y",
+                "local_id": 57
+              },
+              {
+                "path": "arg0.y",
+                "local_id": 58
+              },
+              {
+                "path": "arg0.x",
+                "local_id": 59
+              },
+              {
+                "path": "arg0.type",
+                "local_id": 60
+              }
+            ]
+          }
+        },
         "block_coalesce": {
           "Success": {
             "blocks_removed": 2
@@ -122087,7 +122404,9 @@
         },
         "called_functions": [],
         "accessed_globals": [],
-        "heap_elimination_status": "NotApplicable"
+        "heap_elimination_status": {
+          "Failed": "Call instruction - may have side effects"
+        }
       },
       "optimization_result": {
         "mem2reg": {
@@ -122095,7 +122414,9 @@
             "cells_promoted": 3
           }
         },
-        "heap_elimination": "NotApplicable",
+        "heap_elimination": {
+          "Failed": "Call instruction - may have side effects"
+        },
         "block_coalesce": "NoChange",
         "builtin_resolution": "NoChange",
         "call_resolution": "NoChange",
@@ -124769,7 +125090,9 @@
           "__split_by_flr",
           "flr"
         ],
-        "heap_elimination_status": "NotApplicable"
+        "heap_elimination_status": {
+          "Failed": "Shape-modifying GetField on unknown base: x"
+        }
       },
       "optimization_result": {
         "mem2reg": {
@@ -124777,7 +125100,9 @@
             "cells_promoted": 3
           }
         },
-        "heap_elimination": "NotApplicable",
+        "heap_elimination": {
+          "Failed": "Shape-modifying GetField on unknown base: x"
+        },
         "block_coalesce": "NoChange",
         "builtin_resolution": {
           "Success": {
@@ -129013,7 +129338,9 @@
           "abs",
           "sign"
         ],
-        "heap_elimination_status": "NotApplicable"
+        "heap_elimination_status": {
+          "Failed": "Shape-modifying GetField on unknown base: x"
+        }
       },
       "optimization_result": {
         "mem2reg": {
@@ -129021,7 +129348,9 @@
             "cells_promoted": 2
           }
         },
-        "heap_elimination": "NotApplicable",
+        "heap_elimination": {
+          "Failed": "Shape-modifying GetField on unknown base: x"
+        },
         "block_coalesce": {
           "Success": {
             "blocks_removed": 6
@@ -133294,7 +133623,9 @@
           "abs",
           "sign"
         ],
-        "heap_elimination_status": "NotApplicable"
+        "heap_elimination_status": {
+          "Failed": "Alloc instruction - may modify heap shape"
+        }
       },
       "optimization_result": {
         "mem2reg": {
@@ -133302,7 +133633,9 @@
             "cells_promoted": 1
           }
         },
-        "heap_elimination": "NotApplicable",
+        "heap_elimination": {
+          "Failed": "Alloc instruction - may modify heap shape"
+        },
         "block_coalesce": {
           "Success": {
             "blocks_removed": 6
@@ -137693,7 +138026,7 @@
           "player"
         ],
         "heap_elimination_status": {
-          "Failed": "Shape-modifying GetField: y"
+          "Failed": "Alloc instruction - may modify heap shape"
         }
       },
       "optimization_result": {
@@ -137703,7 +138036,7 @@
           }
         },
         "heap_elimination": {
-          "Failed": "Shape-modifying GetField: y"
+          "Failed": "Alloc instruction - may modify heap shape"
         },
         "block_coalesce": {
           "Success": {
@@ -137869,7 +138202,17 @@
         },
         "named_blocks": []
       },
-      "after_heap_elim": null,
+      "after_heap_elim": {
+        "entry_block": {
+          "instructions": [],
+          "terminator": {
+            "target_id": 14,
+            "terminator_text": "Return"
+          },
+          "hint_normalize": false
+        },
+        "named_blocks": []
+      },
       "after_block_coalesce": null,
       "after_builtin_resolution": null,
       "after_call_resolution": null,
@@ -137877,53 +138220,7 @@
       "after_dce": null,
       "optimized_cfg": {
         "entry_block": {
-          "instructions": [
-            {
-              "target_id": 4,
-              "instruction_text": "GetField(2, spd)",
-              "instruction_type": "get_field"
-            },
-            {
-              "target_id": 5,
-              "instruction_text": "Load(4)",
-              "instruction_type": "load"
-            },
-            {
-              "target_id": 6,
-              "instruction_text": "GetField(5, y, create)",
-              "instruction_type": "get_field"
-            },
-            {
-              "target_id": 7,
-              "instruction_text": "NumberConstant(Pico8Num(\"0x40000\"))",
-              "instruction_type": "number_constant"
-            },
-            {
-              "target_id": 8,
-              "instruction_text": "UnaryOp(Minus, 7)",
-              "instruction_type": "unary_op"
-            },
-            {
-              "target_id": 9,
-              "instruction_text": "Store(6, 8)",
-              "instruction_type": "store"
-            },
-            {
-              "target_id": 11,
-              "instruction_text": "GetField(2, solids, create)",
-              "instruction_type": "get_field"
-            },
-            {
-              "target_id": 12,
-              "instruction_text": "BoolConstant(false)",
-              "instruction_type": "bool_constant"
-            },
-            {
-              "target_id": 13,
-              "instruction_text": "Store(11, 12)",
-              "instruction_type": "store"
-            }
-          ],
+          "instructions": [],
           "terminator": {
             "target_id": 14,
             "terminator_text": "Return"
@@ -137964,7 +138261,126 @@
         },
         "called_functions": [],
         "accessed_globals": [],
-        "heap_elimination_status": "NotApplicable"
+        "heap_elimination_status": {
+          "Success": {
+            "unpack_count": 28,
+            "modified_count": 2,
+            "slot_mappings": [
+              {
+                "path": "arg0.update",
+                "local_id": 15
+              },
+              {
+                "path": "arg0.solids",
+                "local_id": 16
+              },
+              {
+                "path": "arg0.rem.x",
+                "local_id": 17
+              },
+              {
+                "path": "arg0.rem.y",
+                "local_id": 18
+              },
+              {
+                "path": "arg0.timer",
+                "local_id": 19
+              },
+              {
+                "path": "arg0.start",
+                "local_id": 20
+              },
+              {
+                "path": "arg0.collideable",
+                "local_id": 21
+              },
+              {
+                "path": "arg0.dir",
+                "local_id": 22
+              },
+              {
+                "path": "arg0.draw",
+                "local_id": 23
+              },
+              {
+                "path": "arg0.x",
+                "local_id": 24
+              },
+              {
+                "path": "arg0.delay",
+                "local_id": 25
+              },
+              {
+                "path": "arg0.state",
+                "local_id": 26
+              },
+              {
+                "path": "arg0.init",
+                "local_id": 27
+              },
+              {
+                "path": "arg0.target",
+                "local_id": 28
+              },
+              {
+                "path": "arg0.flip",
+                "local_id": 29
+              },
+              {
+                "path": "arg0.last",
+                "local_id": 30
+              },
+              {
+                "path": "arg0.particles",
+                "local_id": 31
+              },
+              {
+                "path": "arg0.hitbox.y",
+                "local_id": 32
+              },
+              {
+                "path": "arg0.hitbox.h",
+                "local_id": 33
+              },
+              {
+                "path": "arg0.hitbox.x",
+                "local_id": 34
+              },
+              {
+                "path": "arg0.hitbox.w",
+                "local_id": 35
+              },
+              {
+                "path": "arg0.spr",
+                "local_id": 36
+              },
+              {
+                "path": "arg0.hide_for",
+                "local_id": 37
+              },
+              {
+                "path": "arg0.spd.x",
+                "local_id": 38
+              },
+              {
+                "path": "arg0.spd.y",
+                "local_id": 39
+              },
+              {
+                "path": "arg0.y",
+                "local_id": 40
+              },
+              {
+                "path": "arg0.hide_in",
+                "local_id": 41
+              },
+              {
+                "path": "arg0.type",
+                "local_id": 42
+              }
+            ]
+          }
+        }
       },
       "optimization_result": {
         "mem2reg": {
@@ -137972,12 +138388,135 @@
             "cells_promoted": 1
           }
         },
-        "heap_elimination": "NotApplicable",
+        "heap_elimination": {
+          "Success": {
+            "unpack_count": 28,
+            "modified_count": 2,
+            "slot_mappings": [
+              {
+                "path": "arg0.update",
+                "local_id": 15
+              },
+              {
+                "path": "arg0.solids",
+                "local_id": 16
+              },
+              {
+                "path": "arg0.rem.x",
+                "local_id": 17
+              },
+              {
+                "path": "arg0.rem.y",
+                "local_id": 18
+              },
+              {
+                "path": "arg0.timer",
+                "local_id": 19
+              },
+              {
+                "path": "arg0.start",
+                "local_id": 20
+              },
+              {
+                "path": "arg0.collideable",
+                "local_id": 21
+              },
+              {
+                "path": "arg0.dir",
+                "local_id": 22
+              },
+              {
+                "path": "arg0.draw",
+                "local_id": 23
+              },
+              {
+                "path": "arg0.x",
+                "local_id": 24
+              },
+              {
+                "path": "arg0.delay",
+                "local_id": 25
+              },
+              {
+                "path": "arg0.state",
+                "local_id": 26
+              },
+              {
+                "path": "arg0.init",
+                "local_id": 27
+              },
+              {
+                "path": "arg0.target",
+                "local_id": 28
+              },
+              {
+                "path": "arg0.flip",
+                "local_id": 29
+              },
+              {
+                "path": "arg0.last",
+                "local_id": 30
+              },
+              {
+                "path": "arg0.particles",
+                "local_id": 31
+              },
+              {
+                "path": "arg0.hitbox.y",
+                "local_id": 32
+              },
+              {
+                "path": "arg0.hitbox.h",
+                "local_id": 33
+              },
+              {
+                "path": "arg0.hitbox.x",
+                "local_id": 34
+              },
+              {
+                "path": "arg0.hitbox.w",
+                "local_id": 35
+              },
+              {
+                "path": "arg0.spr",
+                "local_id": 36
+              },
+              {
+                "path": "arg0.hide_for",
+                "local_id": 37
+              },
+              {
+                "path": "arg0.spd.x",
+                "local_id": 38
+              },
+              {
+                "path": "arg0.spd.y",
+                "local_id": 39
+              },
+              {
+                "path": "arg0.y",
+                "local_id": 40
+              },
+              {
+                "path": "arg0.hide_in",
+                "local_id": 41
+              },
+              {
+                "path": "arg0.type",
+                "local_id": 42
+              }
+            ]
+          }
+        },
         "block_coalesce": "NoChange",
         "builtin_resolution": "NoChange",
         "call_resolution": "NoChange",
         "inlining": "NoChange",
-        "dce": "NoChange"
+        "dce": {
+          "Success": {
+            "instructions_removed": 7
+          }
+        }
       },
       "reference_shape": null,
       "source_span": [
@@ -145528,7 +146067,17 @@
         },
         "named_blocks": []
       },
-      "after_heap_elim": null,
+      "after_heap_elim": {
+        "entry_block": {
+          "instructions": [],
+          "terminator": {
+            "target_id": 13,
+            "terminator_text": "Return"
+          },
+          "hint_normalize": false
+        },
+        "named_blocks": []
+      },
       "after_block_coalesce": null,
       "after_builtin_resolution": null,
       "after_call_resolution": null,
@@ -145536,48 +146085,7 @@
       "after_dce": null,
       "optimized_cfg": {
         "entry_block": {
-          "instructions": [
-            {
-              "target_id": 4,
-              "instruction_text": "GetField(2, state, create)",
-              "instruction_type": "get_field"
-            },
-            {
-              "target_id": 5,
-              "instruction_text": "NumberConstant(Pico8Num(\"0x0000\"))",
-              "instruction_type": "number_constant"
-            },
-            {
-              "target_id": 6,
-              "instruction_text": "Store(4, 5)",
-              "instruction_type": "store"
-            },
-            {
-              "target_id": 8,
-              "instruction_text": "GetField(2, hitbox)",
-              "instruction_type": "get_field"
-            },
-            {
-              "target_id": 9,
-              "instruction_text": "Load(8)",
-              "instruction_type": "load"
-            },
-            {
-              "target_id": 10,
-              "instruction_text": "GetField(9, w, create)",
-              "instruction_type": "get_field"
-            },
-            {
-              "target_id": 11,
-              "instruction_text": "NumberConstant(Pico8Num(\"0x100000\"))",
-              "instruction_type": "number_constant"
-            },
-            {
-              "target_id": 12,
-              "instruction_text": "Store(10, 11)",
-              "instruction_type": "store"
-            }
-          ],
+          "instructions": [],
           "terminator": {
             "target_id": 13,
             "terminator_text": "Return"
@@ -145618,7 +146126,126 @@
         },
         "called_functions": [],
         "accessed_globals": [],
-        "heap_elimination_status": "NotApplicable"
+        "heap_elimination_status": {
+          "Success": {
+            "unpack_count": 28,
+            "modified_count": 2,
+            "slot_mappings": [
+              {
+                "path": "arg0.update",
+                "local_id": 14
+              },
+              {
+                "path": "arg0.solids",
+                "local_id": 15
+              },
+              {
+                "path": "arg0.rem.x",
+                "local_id": 16
+              },
+              {
+                "path": "arg0.rem.y",
+                "local_id": 17
+              },
+              {
+                "path": "arg0.timer",
+                "local_id": 18
+              },
+              {
+                "path": "arg0.start",
+                "local_id": 19
+              },
+              {
+                "path": "arg0.collideable",
+                "local_id": 20
+              },
+              {
+                "path": "arg0.dir",
+                "local_id": 21
+              },
+              {
+                "path": "arg0.draw",
+                "local_id": 22
+              },
+              {
+                "path": "arg0.x",
+                "local_id": 23
+              },
+              {
+                "path": "arg0.delay",
+                "local_id": 24
+              },
+              {
+                "path": "arg0.state",
+                "local_id": 25
+              },
+              {
+                "path": "arg0.init",
+                "local_id": 26
+              },
+              {
+                "path": "arg0.target",
+                "local_id": 27
+              },
+              {
+                "path": "arg0.flip",
+                "local_id": 28
+              },
+              {
+                "path": "arg0.last",
+                "local_id": 29
+              },
+              {
+                "path": "arg0.particles",
+                "local_id": 30
+              },
+              {
+                "path": "arg0.hitbox.y",
+                "local_id": 31
+              },
+              {
+                "path": "arg0.hitbox.h",
+                "local_id": 32
+              },
+              {
+                "path": "arg0.hitbox.x",
+                "local_id": 33
+              },
+              {
+                "path": "arg0.hitbox.w",
+                "local_id": 34
+              },
+              {
+                "path": "arg0.spr",
+                "local_id": 35
+              },
+              {
+                "path": "arg0.hide_for",
+                "local_id": 36
+              },
+              {
+                "path": "arg0.spd.x",
+                "local_id": 37
+              },
+              {
+                "path": "arg0.spd.y",
+                "local_id": 38
+              },
+              {
+                "path": "arg0.y",
+                "local_id": 39
+              },
+              {
+                "path": "arg0.hide_in",
+                "local_id": 40
+              },
+              {
+                "path": "arg0.type",
+                "local_id": 41
+              }
+            ]
+          }
+        }
       },
       "optimization_result": {
         "mem2reg": {
@@ -145626,12 +146253,135 @@
             "cells_promoted": 1
           }
         },
-        "heap_elimination": "NotApplicable",
+        "heap_elimination": {
+          "Success": {
+            "unpack_count": 28,
+            "modified_count": 2,
+            "slot_mappings": [
+              {
+                "path": "arg0.update",
+                "local_id": 14
+              },
+              {
+                "path": "arg0.solids",
+                "local_id": 15
+              },
+              {
+                "path": "arg0.rem.x",
+                "local_id": 16
+              },
+              {
+                "path": "arg0.rem.y",
+                "local_id": 17
+              },
+              {
+                "path": "arg0.timer",
+                "local_id": 18
+              },
+              {
+                "path": "arg0.start",
+                "local_id": 19
+              },
+              {
+                "path": "arg0.collideable",
+                "local_id": 20
+              },
+              {
+                "path": "arg0.dir",
+                "local_id": 21
+              },
+              {
+                "path": "arg0.draw",
+                "local_id": 22
+              },
+              {
+                "path": "arg0.x",
+                "local_id": 23
+              },
+              {
+                "path": "arg0.delay",
+                "local_id": 24
+              },
+              {
+                "path": "arg0.state",
+                "local_id": 25
+              },
+              {
+                "path": "arg0.init",
+                "local_id": 26
+              },
+              {
+                "path": "arg0.target",
+                "local_id": 27
+              },
+              {
+                "path": "arg0.flip",
+                "local_id": 28
+              },
+              {
+                "path": "arg0.last",
+                "local_id": 29
+              },
+              {
+                "path": "arg0.particles",
+                "local_id": 30
+              },
+              {
+                "path": "arg0.hitbox.y",
+                "local_id": 31
+              },
+              {
+                "path": "arg0.hitbox.h",
+                "local_id": 32
+              },
+              {
+                "path": "arg0.hitbox.x",
+                "local_id": 33
+              },
+              {
+                "path": "arg0.hitbox.w",
+                "local_id": 34
+              },
+              {
+                "path": "arg0.spr",
+                "local_id": 35
+              },
+              {
+                "path": "arg0.hide_for",
+                "local_id": 36
+              },
+              {
+                "path": "arg0.spd.x",
+                "local_id": 37
+              },
+              {
+                "path": "arg0.spd.y",
+                "local_id": 38
+              },
+              {
+                "path": "arg0.y",
+                "local_id": 39
+              },
+              {
+                "path": "arg0.hide_in",
+                "local_id": 40
+              },
+              {
+                "path": "arg0.type",
+                "local_id": 41
+              }
+            ]
+          }
+        },
         "block_coalesce": "NoChange",
         "builtin_resolution": "NoChange",
         "call_resolution": "NoChange",
         "inlining": "NoChange",
-        "dce": "NoChange"
+        "dce": {
+          "Success": {
+            "instructions_removed": 6
+          }
+        }
       },
       "reference_shape": null,
       "source_span": [
@@ -147433,7 +148183,7 @@
           "player"
         ],
         "heap_elimination_status": {
-          "Failed": "Shape-modifying GetField: x"
+          "Failed": "Alloc instruction - may modify heap shape"
         }
       },
       "optimization_result": {
@@ -147443,7 +148193,7 @@
           }
         },
         "heap_elimination": {
-          "Failed": "Shape-modifying GetField: x"
+          "Failed": "Alloc instruction - may modify heap shape"
         },
         "block_coalesce": {
           "Success": {
@@ -147707,7 +148457,17 @@
         },
         "named_blocks": []
       },
-      "after_heap_elim": null,
+      "after_heap_elim": {
+        "entry_block": {
+          "instructions": [],
+          "terminator": {
+            "target_id": 27,
+            "terminator_text": "Return"
+          },
+          "hint_normalize": false
+        },
+        "named_blocks": []
+      },
       "after_block_coalesce": null,
       "after_builtin_resolution": null,
       "after_call_resolution": null,
@@ -147715,98 +148475,7 @@
       "after_dce": null,
       "optimized_cfg": {
         "entry_block": {
-          "instructions": [
-            {
-              "target_id": 4,
-              "instruction_text": "GetField(2, x, create)",
-              "instruction_type": "get_field"
-            },
-            {
-              "target_id": 6,
-              "instruction_text": "GetField(2, x)",
-              "instruction_type": "get_field"
-            },
-            {
-              "target_id": 7,
-              "instruction_text": "Load(6)",
-              "instruction_type": "load"
-            },
-            {
-              "target_id": 8,
-              "instruction_text": "NumberConstant(Pico8Num(\"0x40000\"))",
-              "instruction_type": "number_constant"
-            },
-            {
-              "target_id": 9,
-              "instruction_text": "BinaryOp(7, Minus, 8)",
-              "instruction_type": "binary_op"
-            },
-            {
-              "target_id": 10,
-              "instruction_text": "Store(4, 9)",
-              "instruction_type": "store"
-            },
-            {
-              "target_id": 12,
-              "instruction_text": "GetField(2, solids, create)",
-              "instruction_type": "get_field"
-            },
-            {
-              "target_id": 13,
-              "instruction_text": "BoolConstant(false)",
-              "instruction_type": "bool_constant"
-            },
-            {
-              "target_id": 14,
-              "instruction_text": "Store(12, 13)",
-              "instruction_type": "store"
-            },
-            {
-              "target_id": 16,
-              "instruction_text": "GetField(2, hitbox)",
-              "instruction_type": "get_field"
-            },
-            {
-              "target_id": 17,
-              "instruction_text": "Load(16)",
-              "instruction_type": "load"
-            },
-            {
-              "target_id": 18,
-              "instruction_text": "GetField(17, w, create)",
-              "instruction_type": "get_field"
-            },
-            {
-              "target_id": 19,
-              "instruction_text": "NumberConstant(Pico8Num(\"0x100000\"))",
-              "instruction_type": "number_constant"
-            },
-            {
-              "target_id": 20,
-              "instruction_text": "Store(18, 19)",
-              "instruction_type": "store"
-            },
-            {
-              "target_id": 22,
-              "instruction_text": "GetField(2, last, create)",
-              "instruction_type": "get_field"
-            },
-            {
-              "target_id": 24,
-              "instruction_text": "GetField(2, x)",
-              "instruction_type": "get_field"
-            },
-            {
-              "target_id": 25,
-              "instruction_text": "Load(24)",
-              "instruction_type": "load"
-            },
-            {
-              "target_id": 26,
-              "instruction_text": "Store(22, 25)",
-              "instruction_type": "store"
-            }
-          ],
+          "instructions": [],
           "terminator": {
             "target_id": 27,
             "terminator_text": "Return"
@@ -147847,7 +148516,126 @@
         },
         "called_functions": [],
         "accessed_globals": [],
-        "heap_elimination_status": "NotApplicable"
+        "heap_elimination_status": {
+          "Success": {
+            "unpack_count": 28,
+            "modified_count": 3,
+            "slot_mappings": [
+              {
+                "path": "arg0.update",
+                "local_id": 28
+              },
+              {
+                "path": "arg0.solids",
+                "local_id": 29
+              },
+              {
+                "path": "arg0.rem.x",
+                "local_id": 30
+              },
+              {
+                "path": "arg0.rem.y",
+                "local_id": 31
+              },
+              {
+                "path": "arg0.timer",
+                "local_id": 32
+              },
+              {
+                "path": "arg0.start",
+                "local_id": 33
+              },
+              {
+                "path": "arg0.collideable",
+                "local_id": 34
+              },
+              {
+                "path": "arg0.dir",
+                "local_id": 35
+              },
+              {
+                "path": "arg0.draw",
+                "local_id": 36
+              },
+              {
+                "path": "arg0.x",
+                "local_id": 37
+              },
+              {
+                "path": "arg0.delay",
+                "local_id": 38
+              },
+              {
+                "path": "arg0.state",
+                "local_id": 39
+              },
+              {
+                "path": "arg0.init",
+                "local_id": 40
+              },
+              {
+                "path": "arg0.target",
+                "local_id": 41
+              },
+              {
+                "path": "arg0.flip",
+                "local_id": 42
+              },
+              {
+                "path": "arg0.last",
+                "local_id": 43
+              },
+              {
+                "path": "arg0.particles",
+                "local_id": 44
+              },
+              {
+                "path": "arg0.hitbox.y",
+                "local_id": 45
+              },
+              {
+                "path": "arg0.hitbox.h",
+                "local_id": 46
+              },
+              {
+                "path": "arg0.hitbox.x",
+                "local_id": 47
+              },
+              {
+                "path": "arg0.hitbox.w",
+                "local_id": 48
+              },
+              {
+                "path": "arg0.spr",
+                "local_id": 49
+              },
+              {
+                "path": "arg0.hide_for",
+                "local_id": 50
+              },
+              {
+                "path": "arg0.spd.x",
+                "local_id": 51
+              },
+              {
+                "path": "arg0.spd.y",
+                "local_id": 52
+              },
+              {
+                "path": "arg0.y",
+                "local_id": 53
+              },
+              {
+                "path": "arg0.hide_in",
+                "local_id": 54
+              },
+              {
+                "path": "arg0.type",
+                "local_id": 55
+              }
+            ]
+          }
+        }
       },
       "optimization_result": {
         "mem2reg": {
@@ -147855,12 +148643,135 @@
             "cells_promoted": 1
           }
         },
-        "heap_elimination": "NotApplicable",
+        "heap_elimination": {
+          "Success": {
+            "unpack_count": 28,
+            "modified_count": 3,
+            "slot_mappings": [
+              {
+                "path": "arg0.update",
+                "local_id": 28
+              },
+              {
+                "path": "arg0.solids",
+                "local_id": 29
+              },
+              {
+                "path": "arg0.rem.x",
+                "local_id": 30
+              },
+              {
+                "path": "arg0.rem.y",
+                "local_id": 31
+              },
+              {
+                "path": "arg0.timer",
+                "local_id": 32
+              },
+              {
+                "path": "arg0.start",
+                "local_id": 33
+              },
+              {
+                "path": "arg0.collideable",
+                "local_id": 34
+              },
+              {
+                "path": "arg0.dir",
+                "local_id": 35
+              },
+              {
+                "path": "arg0.draw",
+                "local_id": 36
+              },
+              {
+                "path": "arg0.x",
+                "local_id": 37
+              },
+              {
+                "path": "arg0.delay",
+                "local_id": 38
+              },
+              {
+                "path": "arg0.state",
+                "local_id": 39
+              },
+              {
+                "path": "arg0.init",
+                "local_id": 40
+              },
+              {
+                "path": "arg0.target",
+                "local_id": 41
+              },
+              {
+                "path": "arg0.flip",
+                "local_id": 42
+              },
+              {
+                "path": "arg0.last",
+                "local_id": 43
+              },
+              {
+                "path": "arg0.particles",
+                "local_id": 44
+              },
+              {
+                "path": "arg0.hitbox.y",
+                "local_id": 45
+              },
+              {
+                "path": "arg0.hitbox.h",
+                "local_id": 46
+              },
+              {
+                "path": "arg0.hitbox.x",
+                "local_id": 47
+              },
+              {
+                "path": "arg0.hitbox.w",
+                "local_id": 48
+              },
+              {
+                "path": "arg0.spr",
+                "local_id": 49
+              },
+              {
+                "path": "arg0.hide_for",
+                "local_id": 50
+              },
+              {
+                "path": "arg0.spd.x",
+                "local_id": 51
+              },
+              {
+                "path": "arg0.spd.y",
+                "local_id": 52
+              },
+              {
+                "path": "arg0.y",
+                "local_id": 53
+              },
+              {
+                "path": "arg0.hide_in",
+                "local_id": 54
+              },
+              {
+                "path": "arg0.type",
+                "local_id": 55
+              }
+            ]
+          }
+        },
         "block_coalesce": "NoChange",
         "builtin_resolution": "NoChange",
         "call_resolution": "NoChange",
         "inlining": "NoChange",
-        "dce": "NoChange"
+        "dce": {
+          "Success": {
+            "instructions_removed": 14
+          }
+        }
       },
       "reference_shape": null,
       "source_span": [
@@ -155286,7 +156197,17 @@
         },
         "named_blocks": []
       },
-      "after_heap_elim": null,
+      "after_heap_elim": {
+        "entry_block": {
+          "instructions": [],
+          "terminator": {
+            "target_id": 21,
+            "terminator_text": "Return"
+          },
+          "hint_normalize": false
+        },
+        "named_blocks": []
+      },
       "after_block_coalesce": null,
       "after_builtin_resolution": null,
       "after_call_resolution": null,
@@ -155294,73 +156215,7 @@
       "after_dce": null,
       "optimized_cfg": {
         "entry_block": {
-          "instructions": [
-            {
-              "target_id": 4,
-              "instruction_text": "GetField(2, x, create)",
-              "instruction_type": "get_field"
-            },
-            {
-              "target_id": 6,
-              "instruction_text": "GetField(2, x)",
-              "instruction_type": "get_field"
-            },
-            {
-              "target_id": 7,
-              "instruction_text": "Load(6)",
-              "instruction_type": "load"
-            },
-            {
-              "target_id": 8,
-              "instruction_text": "NumberConstant(Pico8Num(\"0x40000\"))",
-              "instruction_type": "number_constant"
-            },
-            {
-              "target_id": 9,
-              "instruction_text": "BinaryOp(7, Minus, 8)",
-              "instruction_type": "binary_op"
-            },
-            {
-              "target_id": 10,
-              "instruction_text": "Store(4, 9)",
-              "instruction_type": "store"
-            },
-            {
-              "target_id": 12,
-              "instruction_text": "GetField(2, start, create)",
-              "instruction_type": "get_field"
-            },
-            {
-              "target_id": 14,
-              "instruction_text": "GetField(2, x)",
-              "instruction_type": "get_field"
-            },
-            {
-              "target_id": 15,
-              "instruction_text": "Load(14)",
-              "instruction_type": "load"
-            },
-            {
-              "target_id": 16,
-              "instruction_text": "Store(12, 15)",
-              "instruction_type": "store"
-            },
-            {
-              "target_id": 18,
-              "instruction_text": "GetField(2, timer, create)",
-              "instruction_type": "get_field"
-            },
-            {
-              "target_id": 19,
-              "instruction_text": "NumberConstant(Pico8Num(\"0x140000\"))",
-              "instruction_type": "number_constant"
-            },
-            {
-              "target_id": 20,
-              "instruction_text": "Store(18, 19)",
-              "instruction_type": "store"
-            }
-          ],
+          "instructions": [],
           "terminator": {
             "target_id": 21,
             "terminator_text": "Return"
@@ -155401,7 +156256,126 @@
         },
         "called_functions": [],
         "accessed_globals": [],
-        "heap_elimination_status": "NotApplicable"
+        "heap_elimination_status": {
+          "Success": {
+            "unpack_count": 28,
+            "modified_count": 2,
+            "slot_mappings": [
+              {
+                "path": "arg0.update",
+                "local_id": 22
+              },
+              {
+                "path": "arg0.solids",
+                "local_id": 23
+              },
+              {
+                "path": "arg0.rem.x",
+                "local_id": 24
+              },
+              {
+                "path": "arg0.rem.y",
+                "local_id": 25
+              },
+              {
+                "path": "arg0.timer",
+                "local_id": 26
+              },
+              {
+                "path": "arg0.start",
+                "local_id": 27
+              },
+              {
+                "path": "arg0.collideable",
+                "local_id": 28
+              },
+              {
+                "path": "arg0.dir",
+                "local_id": 29
+              },
+              {
+                "path": "arg0.draw",
+                "local_id": 30
+              },
+              {
+                "path": "arg0.x",
+                "local_id": 31
+              },
+              {
+                "path": "arg0.delay",
+                "local_id": 32
+              },
+              {
+                "path": "arg0.state",
+                "local_id": 33
+              },
+              {
+                "path": "arg0.init",
+                "local_id": 34
+              },
+              {
+                "path": "arg0.target",
+                "local_id": 35
+              },
+              {
+                "path": "arg0.flip",
+                "local_id": 36
+              },
+              {
+                "path": "arg0.last",
+                "local_id": 37
+              },
+              {
+                "path": "arg0.particles",
+                "local_id": 38
+              },
+              {
+                "path": "arg0.hitbox.y",
+                "local_id": 39
+              },
+              {
+                "path": "arg0.hitbox.h",
+                "local_id": 40
+              },
+              {
+                "path": "arg0.hitbox.x",
+                "local_id": 41
+              },
+              {
+                "path": "arg0.hitbox.w",
+                "local_id": 42
+              },
+              {
+                "path": "arg0.spr",
+                "local_id": 43
+              },
+              {
+                "path": "arg0.hide_for",
+                "local_id": 44
+              },
+              {
+                "path": "arg0.spd.x",
+                "local_id": 45
+              },
+              {
+                "path": "arg0.spd.y",
+                "local_id": 46
+              },
+              {
+                "path": "arg0.y",
+                "local_id": 47
+              },
+              {
+                "path": "arg0.hide_in",
+                "local_id": 48
+              },
+              {
+                "path": "arg0.type",
+                "local_id": 49
+              }
+            ]
+          }
+        }
       },
       "optimization_result": {
         "mem2reg": {
@@ -155409,12 +156383,135 @@
             "cells_promoted": 1
           }
         },
-        "heap_elimination": "NotApplicable",
+        "heap_elimination": {
+          "Success": {
+            "unpack_count": 28,
+            "modified_count": 2,
+            "slot_mappings": [
+              {
+                "path": "arg0.update",
+                "local_id": 22
+              },
+              {
+                "path": "arg0.solids",
+                "local_id": 23
+              },
+              {
+                "path": "arg0.rem.x",
+                "local_id": 24
+              },
+              {
+                "path": "arg0.rem.y",
+                "local_id": 25
+              },
+              {
+                "path": "arg0.timer",
+                "local_id": 26
+              },
+              {
+                "path": "arg0.start",
+                "local_id": 27
+              },
+              {
+                "path": "arg0.collideable",
+                "local_id": 28
+              },
+              {
+                "path": "arg0.dir",
+                "local_id": 29
+              },
+              {
+                "path": "arg0.draw",
+                "local_id": 30
+              },
+              {
+                "path": "arg0.x",
+                "local_id": 31
+              },
+              {
+                "path": "arg0.delay",
+                "local_id": 32
+              },
+              {
+                "path": "arg0.state",
+                "local_id": 33
+              },
+              {
+                "path": "arg0.init",
+                "local_id": 34
+              },
+              {
+                "path": "arg0.target",
+                "local_id": 35
+              },
+              {
+                "path": "arg0.flip",
+                "local_id": 36
+              },
+              {
+                "path": "arg0.last",
+                "local_id": 37
+              },
+              {
+                "path": "arg0.particles",
+                "local_id": 38
+              },
+              {
+                "path": "arg0.hitbox.y",
+                "local_id": 39
+              },
+              {
+                "path": "arg0.hitbox.h",
+                "local_id": 40
+              },
+              {
+                "path": "arg0.hitbox.x",
+                "local_id": 41
+              },
+              {
+                "path": "arg0.hitbox.w",
+                "local_id": 42
+              },
+              {
+                "path": "arg0.spr",
+                "local_id": 43
+              },
+              {
+                "path": "arg0.hide_for",
+                "local_id": 44
+              },
+              {
+                "path": "arg0.spd.x",
+                "local_id": 45
+              },
+              {
+                "path": "arg0.spd.y",
+                "local_id": 46
+              },
+              {
+                "path": "arg0.y",
+                "local_id": 47
+              },
+              {
+                "path": "arg0.hide_in",
+                "local_id": 48
+              },
+              {
+                "path": "arg0.type",
+                "local_id": 49
+              }
+            ]
+          }
+        },
         "block_coalesce": "NoChange",
         "builtin_resolution": "NoChange",
         "call_resolution": "NoChange",
         "inlining": "NoChange",
-        "dce": "NoChange"
+        "dce": {
+          "Success": {
+            "instructions_removed": 10
+          }
+        }
       },
       "reference_shape": null,
       "source_span": [
@@ -160361,7 +161458,7 @@
           "sin"
         ],
         "heap_elimination_status": {
-          "Failed": "Shape-modifying GetField: spr"
+          "Failed": "Call instruction - may have side effects"
         }
       },
       "optimization_result": {
@@ -160371,7 +161468,7 @@
           }
         },
         "heap_elimination": {
-          "Failed": "Shape-modifying GetField: spr"
+          "Failed": "Call instruction - may have side effects"
         },
         "block_coalesce": {
           "Success": {
@@ -170108,7 +171205,7 @@
           "sign"
         ],
         "heap_elimination_status": {
-          "Failed": "Shape-modifying GetField: hitbox"
+          "Failed": "Alloc instruction - may modify heap shape"
         }
       },
       "optimization_result": {
@@ -170118,7 +171215,7 @@
           }
         },
         "heap_elimination": {
-          "Failed": "Shape-modifying GetField: hitbox"
+          "Failed": "Alloc instruction - may modify heap shape"
         },
         "block_coalesce": {
           "Success": {
@@ -178844,7 +179941,9 @@
         },
         "called_functions": [],
         "accessed_globals": [],
-        "heap_elimination_status": "NotApplicable"
+        "heap_elimination_status": {
+          "Failed": "Shape-modifying GetField: fly"
+        }
       },
       "optimization_result": {
         "mem2reg": {
@@ -178852,7 +179951,9 @@
             "cells_promoted": 1
           }
         },
-        "heap_elimination": "NotApplicable",
+        "heap_elimination": {
+          "Failed": "Shape-modifying GetField: fly"
+        },
         "block_coalesce": "NoChange",
         "builtin_resolution": "NoChange",
         "call_resolution": "NoChange",
@@ -183309,7 +184410,9 @@
         },
         "called_functions": [],
         "accessed_globals": [],
-        "heap_elimination_status": "NotApplicable"
+        "heap_elimination_status": {
+          "Failed": "Shape-modifying GetField: off"
+        }
       },
       "optimization_result": {
         "mem2reg": {
@@ -183317,7 +184420,9 @@
             "cells_promoted": 1
           }
         },
-        "heap_elimination": "NotApplicable",
+        "heap_elimination": {
+          "Failed": "Shape-modifying GetField: off"
+        },
         "block_coalesce": "NoChange",
         "builtin_resolution": "NoChange",
         "call_resolution": "NoChange",
@@ -184941,7 +186046,7 @@
           "spring"
         ],
         "heap_elimination_status": {
-          "Failed": "Shape-modifying GetField: hide_in"
+          "Failed": "Shape-modifying GetField on unknown base: hide_in"
         }
       },
       "optimization_result": {
@@ -184951,7 +186056,7 @@
           }
         },
         "heap_elimination": {
-          "Failed": "Shape-modifying GetField: hide_in"
+          "Failed": "Shape-modifying GetField on unknown base: hide_in"
         },
         "block_coalesce": {
           "Success": {
@@ -191159,7 +192264,9 @@
         },
         "called_functions": [],
         "accessed_globals": [],
-        "heap_elimination_status": "NotApplicable"
+        "heap_elimination_status": {
+          "Failed": "Shape-modifying GetField: solid"
+        }
       },
       "optimization_result": {
         "mem2reg": {
@@ -191167,7 +192274,9 @@
             "cells_promoted": 1
           }
         },
-        "heap_elimination": "NotApplicable",
+        "heap_elimination": {
+          "Failed": "Shape-modifying GetField: solid"
+        },
         "block_coalesce": "NoChange",
         "builtin_resolution": "NoChange",
         "call_resolution": "NoChange",
@@ -193234,7 +194343,7 @@
           "sin"
         ],
         "heap_elimination_status": {
-          "Failed": "Shape-modifying GetField: djump"
+          "Failed": "Shape-modifying GetField on unknown base: djump"
         }
       },
       "optimization_result": {
@@ -193244,7 +194353,7 @@
           }
         },
         "heap_elimination": {
-          "Failed": "Shape-modifying GetField: djump"
+          "Failed": "Shape-modifying GetField on unknown base: djump"
         },
         "block_coalesce": {
           "Success": {
@@ -201861,7 +202970,7 @@
           "player"
         ],
         "heap_elimination_status": {
-          "Failed": "Shape-modifying GetField: spr"
+          "Failed": "Shape-modifying GetField on unknown base: y"
         }
       },
       "optimization_result": {
@@ -201871,7 +202980,7 @@
           }
         },
         "heap_elimination": {
-          "Failed": "Shape-modifying GetField: spr"
+          "Failed": "Shape-modifying GetField on unknown base: y"
         },
         "block_coalesce": {
           "Success": {
@@ -202007,7 +203116,17 @@
         },
         "named_blocks": []
       },
-      "after_heap_elim": null,
+      "after_heap_elim": {
+        "entry_block": {
+          "instructions": [],
+          "terminator": {
+            "target_id": 11,
+            "terminator_text": "Return"
+          },
+          "hint_normalize": false
+        },
+        "named_blocks": []
+      },
       "after_block_coalesce": null,
       "after_builtin_resolution": null,
       "after_call_resolution": null,
@@ -202015,38 +203134,7 @@
       "after_dce": null,
       "optimized_cfg": {
         "entry_block": {
-          "instructions": [
-            {
-              "target_id": 4,
-              "instruction_text": "GetField(2, hide_in, create)",
-              "instruction_type": "get_field"
-            },
-            {
-              "target_id": 5,
-              "instruction_text": "NumberConstant(Pico8Num(\"0x0000\"))",
-              "instruction_type": "number_constant"
-            },
-            {
-              "target_id": 6,
-              "instruction_text": "Store(4, 5)",
-              "instruction_type": "store"
-            },
-            {
-              "target_id": 8,
-              "instruction_text": "GetField(2, hide_for, create)",
-              "instruction_type": "get_field"
-            },
-            {
-              "target_id": 9,
-              "instruction_text": "NumberConstant(Pico8Num(\"0x0000\"))",
-              "instruction_type": "number_constant"
-            },
-            {
-              "target_id": 10,
-              "instruction_text": "Store(8, 9)",
-              "instruction_type": "store"
-            }
-          ],
+          "instructions": [],
           "terminator": {
             "target_id": 11,
             "terminator_text": "Return"
@@ -202087,7 +203175,126 @@
         },
         "called_functions": [],
         "accessed_globals": [],
-        "heap_elimination_status": "NotApplicable"
+        "heap_elimination_status": {
+          "Success": {
+            "unpack_count": 28,
+            "modified_count": 2,
+            "slot_mappings": [
+              {
+                "path": "arg0.update",
+                "local_id": 12
+              },
+              {
+                "path": "arg0.solids",
+                "local_id": 13
+              },
+              {
+                "path": "arg0.rem.x",
+                "local_id": 14
+              },
+              {
+                "path": "arg0.rem.y",
+                "local_id": 15
+              },
+              {
+                "path": "arg0.timer",
+                "local_id": 16
+              },
+              {
+                "path": "arg0.start",
+                "local_id": 17
+              },
+              {
+                "path": "arg0.collideable",
+                "local_id": 18
+              },
+              {
+                "path": "arg0.dir",
+                "local_id": 19
+              },
+              {
+                "path": "arg0.draw",
+                "local_id": 20
+              },
+              {
+                "path": "arg0.x",
+                "local_id": 21
+              },
+              {
+                "path": "arg0.delay",
+                "local_id": 22
+              },
+              {
+                "path": "arg0.state",
+                "local_id": 23
+              },
+              {
+                "path": "arg0.init",
+                "local_id": 24
+              },
+              {
+                "path": "arg0.target",
+                "local_id": 25
+              },
+              {
+                "path": "arg0.flip",
+                "local_id": 26
+              },
+              {
+                "path": "arg0.last",
+                "local_id": 27
+              },
+              {
+                "path": "arg0.particles",
+                "local_id": 28
+              },
+              {
+                "path": "arg0.hitbox.y",
+                "local_id": 29
+              },
+              {
+                "path": "arg0.hitbox.h",
+                "local_id": 30
+              },
+              {
+                "path": "arg0.hitbox.x",
+                "local_id": 31
+              },
+              {
+                "path": "arg0.hitbox.w",
+                "local_id": 32
+              },
+              {
+                "path": "arg0.spr",
+                "local_id": 33
+              },
+              {
+                "path": "arg0.hide_for",
+                "local_id": 34
+              },
+              {
+                "path": "arg0.spd.x",
+                "local_id": 35
+              },
+              {
+                "path": "arg0.spd.y",
+                "local_id": 36
+              },
+              {
+                "path": "arg0.y",
+                "local_id": 37
+              },
+              {
+                "path": "arg0.hide_in",
+                "local_id": 38
+              },
+              {
+                "path": "arg0.type",
+                "local_id": 39
+              }
+            ]
+          }
+        }
       },
       "optimization_result": {
         "mem2reg": {
@@ -202095,12 +203302,135 @@
             "cells_promoted": 1
           }
         },
-        "heap_elimination": "NotApplicable",
+        "heap_elimination": {
+          "Success": {
+            "unpack_count": 28,
+            "modified_count": 2,
+            "slot_mappings": [
+              {
+                "path": "arg0.update",
+                "local_id": 12
+              },
+              {
+                "path": "arg0.solids",
+                "local_id": 13
+              },
+              {
+                "path": "arg0.rem.x",
+                "local_id": 14
+              },
+              {
+                "path": "arg0.rem.y",
+                "local_id": 15
+              },
+              {
+                "path": "arg0.timer",
+                "local_id": 16
+              },
+              {
+                "path": "arg0.start",
+                "local_id": 17
+              },
+              {
+                "path": "arg0.collideable",
+                "local_id": 18
+              },
+              {
+                "path": "arg0.dir",
+                "local_id": 19
+              },
+              {
+                "path": "arg0.draw",
+                "local_id": 20
+              },
+              {
+                "path": "arg0.x",
+                "local_id": 21
+              },
+              {
+                "path": "arg0.delay",
+                "local_id": 22
+              },
+              {
+                "path": "arg0.state",
+                "local_id": 23
+              },
+              {
+                "path": "arg0.init",
+                "local_id": 24
+              },
+              {
+                "path": "arg0.target",
+                "local_id": 25
+              },
+              {
+                "path": "arg0.flip",
+                "local_id": 26
+              },
+              {
+                "path": "arg0.last",
+                "local_id": 27
+              },
+              {
+                "path": "arg0.particles",
+                "local_id": 28
+              },
+              {
+                "path": "arg0.hitbox.y",
+                "local_id": 29
+              },
+              {
+                "path": "arg0.hitbox.h",
+                "local_id": 30
+              },
+              {
+                "path": "arg0.hitbox.x",
+                "local_id": 31
+              },
+              {
+                "path": "arg0.hitbox.w",
+                "local_id": 32
+              },
+              {
+                "path": "arg0.spr",
+                "local_id": 33
+              },
+              {
+                "path": "arg0.hide_for",
+                "local_id": 34
+              },
+              {
+                "path": "arg0.spd.x",
+                "local_id": 35
+              },
+              {
+                "path": "arg0.spd.y",
+                "local_id": 36
+              },
+              {
+                "path": "arg0.y",
+                "local_id": 37
+              },
+              {
+                "path": "arg0.hide_in",
+                "local_id": 38
+              },
+              {
+                "path": "arg0.type",
+                "local_id": 39
+              }
+            ]
+          }
+        },
         "block_coalesce": "NoChange",
         "builtin_resolution": "NoChange",
         "call_resolution": "NoChange",
         "inlining": "NoChange",
-        "dce": "NoChange"
+        "dce": {
+          "Success": {
+            "instructions_removed": 4
+          }
+        }
       },
       "reference_shape": null,
       "source_span": [
@@ -214521,7 +215851,9 @@
         },
         "called_functions": [],
         "accessed_globals": [],
-        "heap_elimination_status": "NotApplicable"
+        "heap_elimination_status": {
+          "Failed": "Alloc instruction - may modify heap shape"
+        }
       },
       "optimization_result": {
         "mem2reg": {
@@ -214529,7 +215861,9 @@
             "cells_promoted": 1
           }
         },
-        "heap_elimination": "NotApplicable",
+        "heap_elimination": {
+          "Failed": "Alloc instruction - may modify heap shape"
+        },
         "block_coalesce": "NoChange",
         "builtin_resolution": "NoChange",
         "call_resolution": "NoChange",
@@ -215016,7 +216350,141 @@
           ]
         ]
       },
-      "after_heap_elim": null,
+      "after_heap_elim": {
+        "entry_block": {
+          "instructions": [
+            {
+              "target_id": 6,
+              "instruction_text": "Load(53)",
+              "instruction_type": "load"
+            },
+            {
+              "target_id": 7,
+              "instruction_text": "NumberConstant(Pico8Num(\"0x10000\"))",
+              "instruction_type": "number_constant"
+            },
+            {
+              "target_id": 8,
+              "instruction_text": "UnaryOp(Minus, 7)",
+              "instruction_type": "unary_op"
+            },
+            {
+              "target_id": 9,
+              "instruction_text": "BinaryOp(6, LessThan, 8)",
+              "instruction_type": "binary_op"
+            }
+          ],
+          "terminator": {
+            "target_id": 11,
+            "terminator_text": "CondBranch(9, true:and_or_join_226, false:and_or_continue_225)"
+          },
+          "hint_normalize": false
+        },
+        "named_blocks": [
+          [
+            "and_or_continue_225",
+            {
+              "instructions": [
+                {
+                  "target_id": 14,
+                  "instruction_text": "Load(53)",
+                  "instruction_type": "load"
+                },
+                {
+                  "target_id": 15,
+                  "instruction_text": "NumberConstant(Pico8Num(\"0x790000\"))",
+                  "instruction_type": "number_constant"
+                },
+                {
+                  "target_id": 16,
+                  "instruction_text": "BinaryOp(14, GreaterThan, 15)",
+                  "instruction_type": "binary_op"
+                }
+              ],
+              "terminator": {
+                "target_id": 18,
+                "terminator_text": "Branch(and_or_join_226)"
+              },
+              "hint_normalize": false
+            }
+          ],
+          [
+            "and_or_join_226",
+            {
+              "instructions": [
+                {
+                  "target_id": 71,
+                  "instruction_text": "Phi([__entry:53, and_or_continue_225:53])",
+                  "instruction_type": "phi"
+                },
+                {
+                  "target_id": 19,
+                  "instruction_text": "Phi([__entry:9, and_or_continue_225:16])",
+                  "instruction_type": "phi"
+                }
+              ],
+              "terminator": {
+                "target_id": 20,
+                "terminator_text": "CondBranch(19, true:if_body_221, false:if_join_222)"
+              },
+              "hint_normalize": false
+            }
+          ],
+          [
+            "if_body_221",
+            {
+              "instructions": [
+                {
+                  "target_id": 27,
+                  "instruction_text": "Load(71)",
+                  "instruction_type": "load"
+                },
+                {
+                  "target_id": 28,
+                  "instruction_text": "NumberConstant(Pico8Num(\"0x10000\"))",
+                  "instruction_type": "number_constant"
+                },
+                {
+                  "target_id": 29,
+                  "instruction_text": "UnaryOp(Minus, 28)",
+                  "instruction_type": "unary_op"
+                },
+                {
+                  "target_id": 30,
+                  "instruction_text": "NumberConstant(Pico8Num(\"0x790000\"))",
+                  "instruction_type": "number_constant"
+                },
+                {
+                  "target_id": 41,
+                  "instruction_text": "CallBuiltin(min, [30, 27])",
+                  "instruction_type": "call_builtin"
+                },
+                {
+                  "target_id": 42,
+                  "instruction_text": "CallBuiltin(max, [29, 41])",
+                  "instruction_type": "call_builtin"
+                }
+              ],
+              "terminator": {
+                "target_id": 39,
+                "terminator_text": "Branch(if_join_222)"
+              },
+              "hint_normalize": false
+            }
+          ],
+          [
+            "if_join_222",
+            {
+              "instructions": [],
+              "terminator": {
+                "target_id": 40,
+                "terminator_text": "Return"
+              },
+              "hint_normalize": false
+            }
+          ]
+        ]
+      },
       "after_block_coalesce": {
         "entry_block": {
           "instructions": [
@@ -215914,13 +217382,8 @@
         "entry_block": {
           "instructions": [
             {
-              "target_id": 5,
-              "instruction_text": "GetField(2, x)",
-              "instruction_type": "get_field"
-            },
-            {
               "target_id": 6,
-              "instruction_text": "Load(5)",
+              "instruction_text": "Load(53)",
               "instruction_type": "load"
             },
             {
@@ -215951,13 +217414,8 @@
             {
               "instructions": [
                 {
-                  "target_id": 13,
-                  "instruction_text": "GetField(2, x)",
-                  "instruction_type": "get_field"
-                },
-                {
                   "target_id": 14,
-                  "instruction_text": "Load(13)",
+                  "instruction_text": "Load(53)",
                   "instruction_type": "load"
                 },
                 {
@@ -215983,6 +217441,11 @@
             {
               "instructions": [
                 {
+                  "target_id": 71,
+                  "instruction_text": "Phi([__entry:53, and_or_continue_225:53])",
+                  "instruction_type": "phi"
+                },
+                {
                   "target_id": 19,
                   "instruction_text": "Phi([__entry:9, and_or_continue_225:16])",
                   "instruction_type": "phi"
@@ -216000,18 +217463,8 @@
             {
               "instructions": [
                 {
-                  "target_id": 22,
-                  "instruction_text": "GetField(2, x, create)",
-                  "instruction_type": "get_field"
-                },
-                {
-                  "target_id": 26,
-                  "instruction_text": "GetField(2, x)",
-                  "instruction_type": "get_field"
-                },
-                {
                   "target_id": 27,
-                  "instruction_text": "Load(26)",
+                  "instruction_text": "Load(71)",
                   "instruction_type": "load"
                 },
                 {
@@ -216038,36 +217491,6 @@
                   "target_id": 42,
                   "instruction_text": "CallBuiltin(max, [29, 41])",
                   "instruction_type": "call_builtin"
-                },
-                {
-                  "target_id": 32,
-                  "instruction_text": "Store(22, 42)",
-                  "instruction_type": "store"
-                },
-                {
-                  "target_id": 34,
-                  "instruction_text": "GetField(2, spd)",
-                  "instruction_type": "get_field"
-                },
-                {
-                  "target_id": 35,
-                  "instruction_text": "Load(34)",
-                  "instruction_type": "load"
-                },
-                {
-                  "target_id": 36,
-                  "instruction_text": "GetField(35, x, create)",
-                  "instruction_type": "get_field"
-                },
-                {
-                  "target_id": 37,
-                  "instruction_text": "NumberConstant(Pico8Num(\"0x0000\"))",
-                  "instruction_type": "number_constant"
-                },
-                {
-                  "target_id": 38,
-                  "instruction_text": "Store(36, 37)",
-                  "instruction_type": "store"
                 }
               ],
               "terminator": {
@@ -216124,7 +217547,118 @@
         "accessed_globals": [
           "clamp"
         ],
-        "heap_elimination_status": "NotApplicable"
+        "heap_elimination_status": {
+          "Success": {
+            "unpack_count": 26,
+            "modified_count": 26,
+            "slot_mappings": [
+              {
+                "path": "arg0.dash_effect_time",
+                "local_id": 45
+              },
+              {
+                "path": "arg0.dash_accel",
+                "local_id": 46
+              },
+              {
+                "path": "arg0.solids",
+                "local_id": 47
+              },
+              {
+                "path": "arg0.p_dash",
+                "local_id": 48
+              },
+              {
+                "path": "arg0.spr_off",
+                "local_id": 49
+              },
+              {
+                "path": "arg0.rem.x",
+                "local_id": 50
+              },
+              {
+                "path": "arg0.rem.y",
+                "local_id": 51
+              },
+              {
+                "path": "arg0.p_jump",
+                "local_id": 52
+              },
+              {
+                "path": "arg0.x",
+                "local_id": 53
+              },
+              {
+                "path": "arg0.was_on_ground",
+                "local_id": 54
+              },
+              {
+                "path": "arg0.state",
+                "local_id": 55
+              },
+              {
+                "path": "arg0.jbuffer",
+                "local_id": 56
+              },
+              {
+                "path": "arg0.flip",
+                "local_id": 57
+              },
+              {
+                "path": "arg0.dash_time",
+                "local_id": 58
+              },
+              {
+                "path": "arg0.djump",
+                "local_id": 59
+              },
+              {
+                "path": "arg0.hitbox.y",
+                "local_id": 60
+              },
+              {
+                "path": "arg0.hitbox.h",
+                "local_id": 61
+              },
+              {
+                "path": "arg0.hitbox.x",
+                "local_id": 62
+              },
+              {
+                "path": "arg0.hitbox.w",
+                "local_id": 63
+              },
+              {
+                "path": "arg0.hair",
+                "local_id": 64
+              },
+              {
+                "path": "arg0.spr",
+                "local_id": 65
+              },
+              {
+                "path": "arg0.dash_target",
+                "local_id": 66
+              },
+              {
+                "path": "arg0.spd.x",
+                "local_id": 67
+              },
+              {
+                "path": "arg0.spd.y",
+                "local_id": 68
+              },
+              {
+                "path": "arg0.y",
+                "local_id": 69
+              },
+              {
+                "path": "arg0.grace",
+                "local_id": 70
+              }
+            ]
+          }
+        }
       },
       "optimization_result": {
         "mem2reg": {
@@ -216132,7 +217666,118 @@
             "cells_promoted": 1
           }
         },
-        "heap_elimination": "NotApplicable",
+        "heap_elimination": {
+          "Success": {
+            "unpack_count": 26,
+            "modified_count": 26,
+            "slot_mappings": [
+              {
+                "path": "arg0.dash_effect_time",
+                "local_id": 45
+              },
+              {
+                "path": "arg0.dash_accel",
+                "local_id": 46
+              },
+              {
+                "path": "arg0.solids",
+                "local_id": 47
+              },
+              {
+                "path": "arg0.p_dash",
+                "local_id": 48
+              },
+              {
+                "path": "arg0.spr_off",
+                "local_id": 49
+              },
+              {
+                "path": "arg0.rem.x",
+                "local_id": 50
+              },
+              {
+                "path": "arg0.rem.y",
+                "local_id": 51
+              },
+              {
+                "path": "arg0.p_jump",
+                "local_id": 52
+              },
+              {
+                "path": "arg0.x",
+                "local_id": 53
+              },
+              {
+                "path": "arg0.was_on_ground",
+                "local_id": 54
+              },
+              {
+                "path": "arg0.state",
+                "local_id": 55
+              },
+              {
+                "path": "arg0.jbuffer",
+                "local_id": 56
+              },
+              {
+                "path": "arg0.flip",
+                "local_id": 57
+              },
+              {
+                "path": "arg0.dash_time",
+                "local_id": 58
+              },
+              {
+                "path": "arg0.djump",
+                "local_id": 59
+              },
+              {
+                "path": "arg0.hitbox.y",
+                "local_id": 60
+              },
+              {
+                "path": "arg0.hitbox.h",
+                "local_id": 61
+              },
+              {
+                "path": "arg0.hitbox.x",
+                "local_id": 62
+              },
+              {
+                "path": "arg0.hitbox.w",
+                "local_id": 63
+              },
+              {
+                "path": "arg0.hair",
+                "local_id": 64
+              },
+              {
+                "path": "arg0.spr",
+                "local_id": 65
+              },
+              {
+                "path": "arg0.dash_target",
+                "local_id": 66
+              },
+              {
+                "path": "arg0.spd.x",
+                "local_id": 67
+              },
+              {
+                "path": "arg0.spd.y",
+                "local_id": 68
+              },
+              {
+                "path": "arg0.y",
+                "local_id": 69
+              },
+              {
+                "path": "arg0.grace",
+                "local_id": 70
+              }
+            ]
+          }
+        },
         "block_coalesce": {
           "Success": {
             "blocks_removed": 5
@@ -216151,7 +217796,7 @@
         },
         "dce": {
           "Success": {
-            "instructions_removed": 2
+            "instructions_removed": 61
           }
         }
       },
@@ -303677,7 +305322,7 @@
           "max_djump"
         ],
         "heap_elimination_status": {
-          "Failed": "Shape-modifying GetField: p_jump"
+          "Failed": "Alloc instruction - may modify heap shape"
         }
       },
       "optimization_result": {
@@ -303687,7 +305332,7 @@
           }
         },
         "heap_elimination": {
-          "Failed": "Shape-modifying GetField: p_jump"
+          "Failed": "Alloc instruction - may modify heap shape"
         },
         "block_coalesce": "NoChange",
         "builtin_resolution": "NoChange",
@@ -304260,7 +305905,17 @@
         "heap_elimination_status": {
           "Success": {
             "unpack_count": 2,
-            "modified_count": 0
+            "modified_count": 0,
+            "slot_mappings": [
+              {
+                "path": "_G.room.x",
+                "local_id": 21
+              },
+              {
+                "path": "_G.room.y",
+                "local_id": 22
+              }
+            ]
           }
         }
       },
@@ -304269,7 +305924,17 @@
         "heap_elimination": {
           "Success": {
             "unpack_count": 2,
-            "modified_count": 0
+            "modified_count": 0,
+            "slot_mappings": [
+              {
+                "path": "_G.room.x",
+                "local_id": 21
+              },
+              {
+                "path": "_G.room.y",
+                "local_id": 22
+              }
+            ]
           }
         },
         "block_coalesce": {
@@ -304516,7 +306181,17 @@
         "heap_elimination_status": {
           "Success": {
             "unpack_count": 2,
-            "modified_count": 0
+            "modified_count": 0,
+            "slot_mappings": [
+              {
+                "path": "_G.room.x",
+                "local_id": 14
+              },
+              {
+                "path": "_G.room.y",
+                "local_id": 15
+              }
+            ]
           }
         }
       },
@@ -304525,7 +306200,17 @@
         "heap_elimination": {
           "Success": {
             "unpack_count": 2,
-            "modified_count": 0
+            "modified_count": 0,
+            "slot_mappings": [
+              {
+                "path": "_G.room.x",
+                "local_id": 14
+              },
+              {
+                "path": "_G.room.y",
+                "local_id": 15
+              }
+            ]
           }
         },
         "block_coalesce": "NoChange",
@@ -348444,5 +350129,5 @@
       ]
     }
   ],
-  "generated_at": "1767474066"
+  "generated_at": "1767481863"
 }

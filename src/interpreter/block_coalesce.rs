@@ -71,10 +71,8 @@ pub fn coalesce_blocks(cfg: &Cfg) -> CoalesceResult {
                     let phi_replacements = merge_blocks(&mut new_cfg.entry, &target_block, &target_label, None);
                     // Apply phi replacements globally (resolved phis need to update all uses)
                     apply_phi_replacements_globally(&mut new_cfg, &phi_replacements);
-                    // Update phis that reference target_label to use __entry
-                    // (the interpreter uses __entry as the label for entry block in phi resolution)
-                    let entry_label = Label::from("__entry".to_string());
-                    update_phi_nodes_for_removed_block(&mut new_cfg, &target_label, Some(&entry_label));
+                    // Update phis that reference target_label to use the entry block label
+                    update_phi_nodes_for_removed_block(&mut new_cfg, &target_label, Some(&Label::entry()));
                     blocks_removed += 1;
                     merged = true;
                 }
@@ -190,18 +188,20 @@ fn apply_phi_replacements_globally(cfg: &mut Cfg, replacements: &HashMap<LocalId
 
 /// Merge the target block into the source block.
 /// Updates phi nodes to remove references to the target label.
-/// `source_label` is the label of the source block (None for entry block, which uses "__entry" in phis).
+/// `source_label` is the label of the source block (None for entry block).
 /// Returns a map of phi replacements that should be applied globally.
 fn merge_blocks(source: &mut Block, target: &Block, _target_label: &Label, source_label: Option<&Label>) -> HashMap<LocalId, LocalId> {
+    use crate::ir::ENTRY_BLOCK_LABEL;
+
     // Remove phi nodes from target - they reference the source which is now the same block
     // After coalescing, we don't need phi nodes for branches from the source block
     let (target_phis, target_non_phis) = target.split_block_phi_instructions();
 
     // The source block's label as it appears in phi nodes
-    // Entry block is referenced as "__entry" in phi nodes
+    // Entry block uses ENTRY_BLOCK_LABEL in phi nodes
     let source_ref = source_label
         .map(|l| l.as_str().to_string())
-        .unwrap_or_else(|| "__entry".to_string());
+        .unwrap_or_else(|| ENTRY_BLOCK_LABEL.to_string());
 
     // For each phi in target, we need to resolve it to the value from source
     // Since source is the only predecessor, we find the branch matching source's label

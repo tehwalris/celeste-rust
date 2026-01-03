@@ -834,6 +834,7 @@
                 // Heap elimination status
                 let heapHtml = '';
                 let heapClass = '';
+                let slotMappingsHtml = '';
                 if (opt.heap_elimination === 'NotAttempted') {
                     heapHtml = 'Not Attempted';
                     heapClass = '';
@@ -844,6 +845,16 @@
                     const s = opt.heap_elimination.Success;
                     heapHtml = `✓ ${s.unpack_count} slots, ${s.modified_count} modified`;
                     heapClass = 'true';
+                    // Display slot mappings if available
+                    if (s.slot_mappings && s.slot_mappings.length > 0) {
+                        slotMappingsHtml = '<div style="margin-top: 6px; font-size: 11px; font-family: monospace;">';
+                        slotMappingsHtml += '<div style="color: #888; margin-bottom: 4px;">Slot → LocalId:</div>';
+                        for (const mapping of s.slot_mappings) {
+                            slotMappingsHtml += `<div style="color: #8af;">%${mapping.local_id}</div>`;
+                            slotMappingsHtml += `<div style="padding-left: 12px; color: #aaa; margin-bottom: 2px;">${escapeHtml(mapping.path)}</div>`;
+                        }
+                        slotMappingsHtml += '</div>';
+                    }
                 } else if (opt.heap_elimination?.Failed) {
                     heapHtml = `✗ ${opt.heap_elimination.Failed}`;
                     heapClass = 'false';
@@ -852,6 +863,7 @@
                 html += `<div style="${heapActive}">
                     <div style="color: #888; font-size: 11px; text-transform: uppercase; margin-bottom: 3px;">Heap Elimination (globals)${currentStage === 'heap_elim' ? ' ◀' : ''}</div>
                     <div class="value ${heapClass}" style="font-size: 12px;">${heapHtml}</div>
+                    ${slotMappingsHtml}
                 </div>`;
 
                 html += `</div>`;
