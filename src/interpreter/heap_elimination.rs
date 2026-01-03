@@ -523,6 +523,14 @@ fn transform_block(
                 ));
             }
 
+            Instruction::CallBuiltin { name, .. } => {
+                // CallBuiltin is still a call - may have side effects
+                return Err(format!(
+                    "CallBuiltin instruction ({}) - may have side effects",
+                    name
+                ));
+            }
+
             // Pure operations - pass through
             Instruction::NumberConstant { .. }
             | Instruction::BoolConstant { .. }

@@ -16,6 +16,7 @@ use anyhow::Result;
 use clap::Parser;
 
 use celeste_rust::frontend;
+use celeste_rust::interpreter::builtin_resolution::BuiltinSet;
 use celeste_rust::interpreter::cfg_analysis::{
     analyze_cfg, optimize_all_functions, run_optimization_pipeline_with_interprocedural,
     BlockCoalesceStatus, CfgTestCase, CfgTestCases, DceStatus, HeapEliminationStatus, Mem2RegStatus,
@@ -70,11 +71,18 @@ fn main() -> Result<()> {
     // Build global closure map for call resolution
     let global_closure_map = build_global_closure_map_from_fun_defs(fun_defs.iter());
 
+    // Build builtin set (same names as in game_runner.rs)
+    let builtin_set: BuiltinSet = [
+        "__print", "__new_unknown_boolean", "__new_vector", "__array_table_drop_last",
+        "error", "min", "max", "abs", "flr", "__split_by_flr", "add", "print",
+        "mget", "fget", "tile_flag_at",
+    ].iter().map(|s| s.to_string()).collect();
+
     // Pre-optimize all functions in dependency order (callees before callers)
     // This ensures that when we inline, we use the already-optimized version of callees
     println!("Optimizing all functions in dependency order...");
     let fun_def_refs: Vec<_> = fun_defs.iter().collect();
-    let _optimized_funs = optimize_all_functions(&fun_def_refs, &global_closure_map);
+    let _optimized_funs = optimize_all_functions(&fun_def_refs, &global_closure_map, Some(&builtin_set));
 
     // Build optimized function definition map for inlining
     // The optimized map contains FunDefs with already-optimized CFGs
@@ -259,6 +267,7 @@ fn main() -> Result<()> {
             after_mem2reg: after_mem2reg_cfg,
             after_heap_elim: after_heap_elim_cfg,
             after_block_coalesce: after_block_coalesce_cfg,
+            after_builtin_resolution: None, // TODO: Track this once we pass builtin set to pipeline
             after_call_resolution: after_call_resolution_cfg,
             after_inlining: after_inlining_cfg,
             after_dce: after_dce_cfg,

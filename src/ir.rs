@@ -202,6 +202,13 @@ pub enum Instruction {
         captures: Vec<LocalId>,
         args: Vec<LocalId>,
     },
+    /// A call to a known builtin function.
+    /// This is produced by builtin resolution when we know statically that the
+    /// global contains a builtin function. This eliminates the GetGlobal + Load overhead.
+    CallBuiltin {
+        name: String,
+        args: Vec<LocalId>,
+    },
     UnaryOp {
         op: UnaryOp,
         arg: LocalId,
@@ -277,6 +284,10 @@ impl Instruction {
             } => Self::CallResolved {
                 fun_name: fun_name.clone(),
                 captures: captures.iter().map(|id| f(*id)).collect(),
+                args: args.iter().map(|id| f(*id)).collect(),
+            },
+            Self::CallBuiltin { name, args } => Self::CallBuiltin {
+                name: name.clone(),
                 args: args.iter().map(|id| f(*id)).collect(),
             },
             Self::UnaryOp { op, arg } => Self::UnaryOp {

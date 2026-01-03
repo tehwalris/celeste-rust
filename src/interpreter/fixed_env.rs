@@ -7,6 +7,7 @@ use rustc_hash::FxHasher;
 use crate::ir::{Cfg, FunDef, GlobalId, Label, LocalId, LocalIdGenerator};
 
 use super::block_coalesce::{coalesce_blocks, CoalesceResult};
+use super::builtin_resolution::BuiltinSet;
 use super::call_resolution::build_global_closure_map_from_fun_defs;
 use super::cfg_analysis::optimize_all_functions;
 use super::cfg_validation::assert_valid_cfg_with_args;
@@ -138,6 +139,9 @@ impl FixedEnv {
             self.fun_defs.values().map(|(fun_def, _)| fun_def),
         );
 
+        // Build the builtin set from registered builtin names
+        let builtin_set: BuiltinSet = self.builtin_funs.keys().cloned().collect();
+
         // Collect all function definitions
         let fun_def_refs: Vec<&FunDef> = self
             .fun_defs
@@ -147,7 +151,7 @@ impl FixedEnv {
 
         // Optimize all functions in dependency order
         // This ensures callees are optimized before they are inlined into callers
-        let optimized = optimize_all_functions(&fun_def_refs, &global_closure_map);
+        let optimized = optimize_all_functions(&fun_def_refs, &global_closure_map, Some(&builtin_set));
 
         // Update all function definitions with their optimized versions
         for (name, (fun_def, _)) in self.fun_defs.iter_mut() {

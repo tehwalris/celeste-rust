@@ -354,6 +354,9 @@ fn get_used_locals(instruction: &Instruction) -> Vec<LocalId> {
             result.extend(captures.iter().copied());
             result.extend(args.iter().copied());
         }
+        Instruction::CallBuiltin { args, .. } => {
+            result.extend(args.iter().copied());
+        }
         Instruction::Phi { branches } => {
             for (_, local) in branches {
                 result.push(*local);

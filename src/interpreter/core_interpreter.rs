@@ -246,7 +246,7 @@ impl<'a> CoreInterpreter<'a> {
             }
             Instruction::StringConstant { value } => Ok(Some(Value::String(value.clone()))),
             Instruction::NilConstant => Ok(Some(Value::Nil(None))),
-            Instruction::Call { .. } | Instruction::CallResolved { .. } => {
+            Instruction::Call { .. } | Instruction::CallResolved { .. } | Instruction::CallBuiltin { .. } => {
                 panic!("Call instruction passed to interpret_non_call_instruction")
             }
             Instruction::UnaryOp { op, arg } => {
@@ -350,6 +350,15 @@ impl<'a> CoreInterpreter<'a> {
                 };
 
                 (target, arg_values)
+            }
+            Instruction::CallBuiltin { name, args } => {
+                // Gather argument values - no heap lookup needed!
+                let arg_values: Vec<Value> = args
+                    .iter()
+                    .map(|id| self.state.local_env.get(*id).clone())
+                    .collect();
+
+                (CallTarget::Builtin(name.clone()), arg_values)
             }
             _ => panic!("Non-call instruction passed to interpret_call_instruction"),
         };

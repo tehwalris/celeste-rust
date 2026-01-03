@@ -99,6 +99,7 @@ fn instruction_type_name(instr: &Instruction) -> String {
         Instruction::NilConstant => "Nil".to_string(),
         Instruction::Call { .. } => "Call".to_string(),
         Instruction::CallResolved { fun_name, .. } => format!("CallResolved({})", fun_name.as_str()),
+        Instruction::CallBuiltin { name, .. } => format!("CallBuiltin({})", name),
         Instruction::UnaryOp { op, .. } => format!("UnaryOp({:?})", op),
         Instruction::BinaryOp { op, .. } => format!("BinaryOp({:?})", op),
         Instruction::Phi { .. } => "Phi".to_string(),

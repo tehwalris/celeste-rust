@@ -36,6 +36,7 @@ fn has_side_effects(instruction: &Instruction) -> bool {
         Instruction::StoreClosure { .. } => true,
         Instruction::Call { .. } => true,
         Instruction::CallResolved { .. } => true,
+        Instruction::CallBuiltin { .. } => true,
 
         // These are pure - they only compute a value
         Instruction::Alloc => false, // Pure if not stored to
@@ -97,6 +98,9 @@ fn get_used_locals(instruction: &Instruction) -> Vec<LocalId> {
         }
         Instruction::CallResolved { captures, args, .. } => {
             result.extend(captures.iter().copied());
+            result.extend(args.iter().copied());
+        }
+        Instruction::CallBuiltin { args, .. } => {
             result.extend(args.iter().copied());
         }
         Instruction::Phi { branches } => {

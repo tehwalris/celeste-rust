@@ -69,6 +69,8 @@ pub struct OptimizationResult {
     pub heap_elimination: HeapEliminationStatus,
     /// Result of block coalescing pass
     pub block_coalesce: BlockCoalesceStatus,
+    /// Result of builtin resolution pass
+    pub builtin_resolution: BuiltinResolutionStatus,
     /// Result of call resolution pass
     pub call_resolution: CallResolutionStatus,
     /// Result of inlining pass
@@ -147,6 +149,19 @@ pub enum DceStatus {
     NoChange,
 }
 
+/// Status of the builtin resolution pass
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub enum BuiltinResolutionStatus {
+    #[default]
+    NotAttempted,
+    /// Successfully resolved builtin calls
+    Success {
+        calls_resolved: usize,
+    },
+    /// No builtin calls to resolve
+    NoChange,
+}
+
 /// Counts of each instruction type in a CFG.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct InstructionCounts {
@@ -163,6 +178,7 @@ pub struct InstructionCounts {
     pub string_constant: usize,
     pub nil_constant: usize,
     pub call: usize,
+    pub call_builtin: usize,
     pub unary_op: usize,
     pub binary_op: usize,
     pub phi: usize,
@@ -294,6 +310,24 @@ fn check_instruction_escapes(
             }
         }
 
+        // CallBuiltin arguments: any allocation passed to a builtin call escapes
+        Instruction::CallBuiltin { args, .. } => {
+            for arg in args {
+                if allocations.contains(arg) {
+                    escaping.insert(*arg);
+                }
+            }
+        }
+
+        // CallResolved arguments and captures: any allocation passed escapes
+        Instruction::CallResolved { captures, args, .. } => {
+            for arg in args.iter().chain(captures.iter()) {
+                if allocations.contains(arg) {
+                    escaping.insert(*arg);
+                }
+            }
+        }
+
         // StoreClosure captures: any captured allocation escapes
         Instruction::StoreClosure { captures, .. } => {
             for cap in captures {
@@ -317,6 +351,7 @@ pub struct OptimizationCfgs {
     pub after_mem2reg: Option<Cfg>,
     pub after_heap_elim: Option<Cfg>,
     pub after_block_coalesce: Option<Cfg>,
+    pub after_builtin_resolution: Option<Cfg>,
     pub after_call_resolution: Option<Cfg>,
     pub after_inlining: Option<Cfg>,
     pub after_dce: Option<Cfg>,
@@ -445,12 +480,17 @@ pub struct OptimizedFunDef {
 /// already-optimized version of A. Functions are processed in topological order
 /// (callees before callers).
 ///
+/// The `builtin_set` parameter is optional; if provided, builtin calls will be resolved
+/// to `CallBuiltin` instructions, eliminating the GetGlobal + Load overhead.
+///
 /// Returns a map from function name to optimized CFG.
 pub fn optimize_all_functions(
     fun_defs: &[&crate::ir::FunDef],
     global_closure_map: &crate::interpreter::call_resolution::GlobalClosureMap,
+    builtin_set: Option<&crate::interpreter::builtin_resolution::BuiltinSet>,
 ) -> std::collections::HashMap<crate::ir::GlobalId, OptimizedFunDef, std::hash::BuildHasherDefault<rustc_hash::FxHasher>> {
     use crate::interpreter::block_coalesce::{coalesce_blocks, CoalesceResult};
+    use crate::interpreter::builtin_resolution::{resolve_builtins, BuiltinResolutionResult};
     use crate::interpreter::call_resolution::{resolve_calls, CallResolutionResult};
     use crate::interpreter::dce::{eliminate_dead_code, DceResult};
     use crate::interpreter::inlining::{inline_calls, InliningResult};
@@ -548,10 +588,25 @@ pub fn optimize_all_functions(
             original_fun_def.cfg.clone()
         };
 
-        // Iterate call resolution + inlining until no more progress
+        // Iterate builtin resolution + call resolution + inlining until no more progress
         let max_rounds = 10; // Safety limit
         for round in 0..max_rounds {
-            // Stage 2: call resolution
+            // Stage 2a: builtin resolution (if builtin set is provided)
+            if let Some(builtins) = builtin_set {
+                current_cfg = match resolve_builtins(&current_cfg, builtins) {
+                    BuiltinResolutionResult::Success { cfg, .. } => {
+                        crate::interpreter::cfg_validation::assert_valid_cfg_with_args(
+                            &cfg,
+                            &external_ids,
+                            &format!("{} after builtin_resolution round {}", fn_name, round),
+                        );
+                        cfg
+                    }
+                    BuiltinResolutionResult::NoChange => current_cfg,
+                };
+            }
+
+            // Stage 2b: call resolution (for user-defined functions)
             current_cfg = match resolve_calls(&current_cfg, global_closure_map) {
                 CallResolutionResult::Success { cfg, .. } => {
                     crate::interpreter::cfg_validation::assert_valid_cfg_with_args(
@@ -981,6 +1036,11 @@ fn analyze_instruction(
             // CallResolved is a direct call, no closure local to track
             result.instruction_counts.call += 1;
         }
+        Instruction::CallBuiltin { .. } => {
+            result.has_calls = true;
+            // CallBuiltin is a direct call to a builtin, no closure local to track
+            result.instruction_counts.call_builtin += 1;
+        }
         Instruction::UnaryOp { .. } => {
             result.instruction_counts.unary_op += 1;
         }
@@ -1162,6 +1222,10 @@ fn format_instruction(instr: &Instruction) -> String {
                 arg_strs.join(", ")
             )
         }
+        Instruction::CallBuiltin { name, args } => {
+            let arg_strs: Vec<_> = args.iter().map(|id| usize::from(*id).to_string()).collect();
+            format!("CallBuiltin({}, [{}])", name, arg_strs.join(", "))
+        }
         Instruction::UnaryOp { op, arg } => format!("UnaryOp({:?}, {})", op, usize::from(*arg)),
         Instruction::BinaryOp { left, op, right } => {
             format!(
@@ -1224,6 +1288,7 @@ fn instruction_type_name(instr: &Instruction) -> &'static str {
         Instruction::NilConstant => "nil_constant",
         Instruction::Call { .. } => "call",
         Instruction::CallResolved { .. } => "call_resolved",
+        Instruction::CallBuiltin { .. } => "call_builtin",
         Instruction::UnaryOp { .. } => "unary_op",
         Instruction::BinaryOp { .. } => "binary_op",
         Instruction::Phi { .. } => "phi",
@@ -1243,6 +1308,8 @@ pub struct CfgTestCase {
     pub after_heap_elim: Option<SerializableCfg>,
     /// CFG after block coalescing pass (if any transformation occurred)
     pub after_block_coalesce: Option<SerializableCfg>,
+    /// CFG after builtin resolution pass (if any transformation occurred)
+    pub after_builtin_resolution: Option<SerializableCfg>,
     /// CFG after call resolution pass (if any transformation occurred)
     pub after_call_resolution: Option<SerializableCfg>,
     /// CFG after inlining pass (if any transformation occurred)
@@ -1559,7 +1626,7 @@ mod tests {
 
         // Run optimize_all_functions
         let fun_defs = vec![&inner_def, &outer_def];
-        let optimized = optimize_all_functions(&fun_defs, &global_closure_map);
+        let optimized = optimize_all_functions(&fun_defs, &global_closure_map, None);
 
         // Check that both functions are in the result
         assert!(optimized.contains_key(&GlobalId::from("inner_1".to_string())));
