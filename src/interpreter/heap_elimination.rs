@@ -153,6 +153,57 @@ impl HeapShape {
             }
         }
     }
+
+    /// Check if a heap path corresponds to a leaf value in this shape.
+    /// Returns true if the path points to a Leaf, false if it points to a Table or other compound type.
+    pub fn is_leaf_path(&self, path: &HeapPath) -> bool {
+        match path {
+            HeapPath::Global(name) => {
+                if let Some(shape) = self.globals.get(name) {
+                    matches!(shape, ValueShape::Leaf)
+                } else {
+                    // Unknown global - assume leaf for safety
+                    true
+                }
+            }
+            HeapPath::Field(base, field) => {
+                // First find the base shape, then look up the field
+                if let Some(base_shape) = self.get_shape_at_path(base) {
+                    match base_shape {
+                        ValueShape::Table(fields) => {
+                            if let Some(field_shape) = fields.get(field) {
+                                matches!(field_shape, ValueShape::Leaf)
+                            } else {
+                                true // Unknown field - assume leaf
+                            }
+                        }
+                        _ => true // Non-table base - assume leaf
+                    }
+                } else {
+                    true // Unknown base - assume leaf
+                }
+            }
+            HeapPath::Index { .. } => true, // Dynamic index - assume leaf
+        }
+    }
+
+    /// Get the shape at a given path
+    fn get_shape_at_path(&self, path: &HeapPath) -> Option<&ValueShape> {
+        match path {
+            HeapPath::Global(name) => self.globals.get(name),
+            HeapPath::Field(base, field) => {
+                if let Some(base_shape) = self.get_shape_at_path(base) {
+                    match base_shape {
+                        ValueShape::Table(fields) => fields.get(field),
+                        _ => None
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None
+        }
+    }
 }
 
 /// Result of attempting the heap elimination transformation
@@ -387,6 +438,21 @@ fn find_exit_blocks(cfg: &Cfg) -> Vec<BlockId> {
     exits
 }
 
+/// Check if a builtin is pure for heap elimination purposes.
+///
+/// Pure builtins (allowed):
+/// - Math operations: min, max, abs, flr
+/// - Number operations: __split_by_flr
+/// - Game data readers: mget, fget (read from ROM-like data, not tracked heap)
+///
+/// Impure builtins (rejected):
+/// - Heap modifiers: add, __array_table_drop_last (mutate tables)
+/// - Side effects: print, __print, error
+/// - Value creators: __new_unknown_boolean, __new_vector (may allocate)
+fn is_pure_builtin(name: &str) -> bool {
+    matches!(name, "min" | "max" | "abs" | "flr" | "__split_by_flr" | "mget" | "fget")
+}
+
 /// Mapping from LocalId to the heap slot it represents (if any)
 struct LocalIdMapping {
     /// LocalId -> HeapSlot for pointer-typed locals
@@ -446,16 +512,24 @@ fn transform_block(
             Instruction::Load { source } => {
                 // Load dereferences a pointer - get the value from the slot
                 if let Some(slot) = id_mapping.get_slot(*source).cloned() {
-                    // Get the SSA version of this slot
-                    let ssa_var = ssa_builder.get_at_end(block_id, &slot);
-                    // Map the target to this value
-                    id_mapping.set_value(*target_id, ssa_var);
-                    // Replace with a copy operation (or just track the mapping)
-                    // For now, emit a "virtual" load that will be resolved
-                    new_instructions.push((
-                        *target_id,
-                        Instruction::Load { source: ssa_var },
-                    ));
+                    // Check if this is a leaf slot (has an SSA version) or a table slot
+                    if shape.is_leaf_path(slot.path()) {
+                        // Leaf slot - get the SSA version
+                        let ssa_var = ssa_builder.get_at_end(block_id, &slot);
+                        // Map the target to this value
+                        id_mapping.set_value(*target_id, ssa_var);
+                        // Replace with a load from the SSA variable
+                        new_instructions.push((
+                            *target_id,
+                            Instruction::Load { source: ssa_var },
+                        ));
+                    } else {
+                        // Table slot - keep the slot mapping so GetField can extend it
+                        // The loaded value "points to" the same slot (for path extension)
+                        id_mapping.set_slot(*target_id, slot);
+                        // Keep the original instruction
+                        new_instructions.push((*target_id, instruction.clone()));
+                    }
                 } else {
                     // Loading from a non-tracked pointer - keep as is
                     new_instructions.push((*target_id, instruction.clone()));
@@ -524,11 +598,18 @@ fn transform_block(
             }
 
             Instruction::CallBuiltin { name, .. } => {
-                // CallBuiltin is still a call - may have side effects
-                return Err(format!(
-                    "CallBuiltin instruction ({}) - may have side effects",
-                    name
-                ));
+                // Only allow truly pure builtins that compute solely from their arguments
+                // and don't read or write any heap state
+                if is_pure_builtin(name) {
+                    // Pure builtin - just emit it, heap state is unchanged
+                    new_instructions.push((*target_id, instruction.clone()));
+                } else {
+                    // Impure builtin - reject the transformation
+                    return Err(format!(
+                        "CallBuiltin instruction ({}) - not a pure builtin",
+                        name
+                    ));
+                }
             }
 
             // Pure operations - pass through
@@ -841,5 +922,126 @@ mod tests {
 
         let result = eliminate_heap(&cfg, &shape, local_gen, label_gen);
         assert!(matches!(result, HeapEliminationResult::ShapeNotPreserved(_)));
+    }
+
+    #[test]
+    fn test_pure_builtin_allowed() {
+        // CFG: %0 = GetGlobal("x"); %1 = Load(%0); %2 = CallBuiltin("max", [%1, %1]); return %2
+        // Pure builtins like max should be allowed
+        let entry = Block {
+            instructions: vec![
+                (
+                    LocalId::from(0),
+                    Instruction::GetGlobal {
+                        name: "x".to_string(),
+                        create_if_missing: false,
+                    },
+                ),
+                (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
+                (
+                    LocalId::from(2),
+                    Instruction::CallBuiltin {
+                        name: "max".to_string(),
+                        args: vec![LocalId::from(1), LocalId::from(1)],
+                    },
+                ),
+            ],
+            terminator: (
+                LocalId::from(3),
+                Terminator::Return {
+                    value: Some(LocalId::from(2)),
+                },
+            ),
+            hint_normalize: false,
+        };
+
+        let cfg = Cfg {
+            entry,
+            named: FxHashMap::default(),
+        };
+
+        let mut shape = HeapShape::new();
+        shape.globals.insert("x".to_string(), ValueShape::Leaf);
+
+        let local_gen = make_local_gen();
+        let label_gen = make_label_gen();
+
+        let result = eliminate_heap(&cfg, &shape, local_gen, label_gen);
+        // Should succeed because max is a pure builtin
+        assert!(matches!(result, HeapEliminationResult::Success(_)));
+    }
+
+    #[test]
+    fn test_impure_builtin_rejected() {
+        // CFG: %0 = GetGlobal("x"); %1 = Load(%0); %2 = CallBuiltin("add", [%1, %1]); return %2
+        // Impure builtins like add (modifies tables) should be rejected
+        let entry = Block {
+            instructions: vec![
+                (
+                    LocalId::from(0),
+                    Instruction::GetGlobal {
+                        name: "x".to_string(),
+                        create_if_missing: false,
+                    },
+                ),
+                (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
+                (
+                    LocalId::from(2),
+                    Instruction::CallBuiltin {
+                        name: "add".to_string(),
+                        args: vec![LocalId::from(1), LocalId::from(1)],
+                    },
+                ),
+            ],
+            terminator: (
+                LocalId::from(3),
+                Terminator::Return {
+                    value: Some(LocalId::from(2)),
+                },
+            ),
+            hint_normalize: false,
+        };
+
+        let cfg = Cfg {
+            entry,
+            named: FxHashMap::default(),
+        };
+
+        let mut shape = HeapShape::new();
+        shape.globals.insert("x".to_string(), ValueShape::Leaf);
+
+        let local_gen = make_local_gen();
+        let label_gen = make_label_gen();
+
+        let result = eliminate_heap(&cfg, &shape, local_gen, label_gen);
+        // Should fail because add modifies the heap
+        match result {
+            HeapEliminationResult::ShapeNotPreserved(msg) => {
+                assert!(msg.contains("add"), "Error should mention add: {}", msg);
+            }
+            other => panic!("Expected ShapeNotPreserved, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_is_pure_builtin() {
+        // Pure builtins
+        assert!(is_pure_builtin("min"));
+        assert!(is_pure_builtin("max"));
+        assert!(is_pure_builtin("abs"));
+        assert!(is_pure_builtin("flr"));
+        assert!(is_pure_builtin("__split_by_flr"));
+        assert!(is_pure_builtin("mget"));
+        assert!(is_pure_builtin("fget"));
+
+        // Impure builtins
+        assert!(!is_pure_builtin("tile_flag_at"));
+        assert!(!is_pure_builtin("add"));
+        assert!(!is_pure_builtin("print"));
+        assert!(!is_pure_builtin("__print"));
+        assert!(!is_pure_builtin("error"));
+        assert!(!is_pure_builtin("__new_unknown_boolean"));
+        assert!(!is_pure_builtin("__new_vector"));
+        assert!(!is_pure_builtin("__array_table_drop_last"));
     }
 }

@@ -165,6 +165,7 @@ fn main() -> Result<()> {
             &analysis,
             &global_closure_map,
             &optimized_fun_def_map,
+            Some(&builtin_set),
         );
 
         // Update analysis with heap elimination status for legacy compatibility
@@ -242,6 +243,7 @@ fn main() -> Result<()> {
         // Create serializable CFGs
         let original_cfg: SerializableCfg = (&fun_def.cfg).into();
         let after_mem2reg_cfg = cfgs.after_mem2reg.as_ref().map(|c| c.into());
+        let after_builtin_resolution_cfg = cfgs.after_builtin_resolution.as_ref().map(|c| c.into());
         let after_call_resolution_cfg = cfgs.after_call_resolution.as_ref().map(|c| c.into());
         let after_inlining_cfg = cfgs.after_inlining.as_ref().map(|c| c.into());
         let after_dce_cfg = cfgs.after_dce.as_ref().map(|c| c.into());
@@ -255,6 +257,7 @@ fn main() -> Result<()> {
             .or_else(|| after_dce_cfg.clone())
             .or_else(|| after_inlining_cfg.clone())
             .or_else(|| after_call_resolution_cfg.clone())
+            .or_else(|| after_builtin_resolution_cfg.clone())
             .or_else(|| after_mem2reg_cfg.clone())
             .unwrap_or_else(|| original_cfg.clone());
 
@@ -267,7 +270,7 @@ fn main() -> Result<()> {
             after_mem2reg: after_mem2reg_cfg,
             after_heap_elim: after_heap_elim_cfg,
             after_block_coalesce: after_block_coalesce_cfg,
-            after_builtin_resolution: None, // TODO: Track this once we pass builtin set to pipeline
+            after_builtin_resolution: after_builtin_resolution_cfg,
             after_call_resolution: after_call_resolution_cfg,
             after_inlining: after_inlining_cfg,
             after_dce: after_dce_cfg,

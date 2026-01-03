@@ -7,11 +7,15 @@
 //! - Whether it can modify the heap shape (allocations, table operations)
 //! - Whether it contains function calls
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasherDefault;
 
+use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
 
 use crate::ir::{Block, Cfg, Instruction, LocalId, Terminator};
+
+type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 /// Results of analyzing a CFG for heap-related operations.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -160,6 +164,8 @@ pub enum BuiltinResolutionStatus {
     },
     /// No builtin calls to resolve
     NoChange,
+    /// Skipped because no builtin set was provided
+    Skipped,
 }
 
 /// Counts of each instruction type in a CFG.
@@ -734,6 +740,35 @@ fn topological_sort(
     result
 }
 
+/// Build a HeapShape for Celeste game globals based on frame 28 checkpoint structure.
+///
+/// This maps global names to their ValueShape:
+/// - `room` is a table with `x` and `y` fields (both numbers)
+/// - Most other globals are simple leaf values
+fn build_celeste_heap_shape(accessed_globals: &[String]) -> crate::interpreter::heap_elimination::HeapShape {
+    use crate::interpreter::heap_elimination::{HeapShape, ValueShape};
+
+    let mut shape = HeapShape::new();
+
+    for global in accessed_globals {
+        let value_shape = match global.as_str() {
+            // room is a table with x and y fields (room = { x=0, y=0 })
+            "room" => {
+                let mut fields = FxHashMap::default();
+                fields.insert("x".to_string(), ValueShape::Leaf);
+                fields.insert("y".to_string(), ValueShape::Leaf);
+                ValueShape::Table(fields)
+            }
+            // Most other Celeste globals are simple values (numbers, booleans, etc.)
+            // or complex structures we don't need to track
+            _ => ValueShape::Leaf,
+        };
+        shape.globals.insert(global.clone(), value_shape);
+    }
+
+    shape
+}
+
 /// Run the optimization pipeline with inter-procedural passes (call resolution and inlining).
 ///
 /// This version uses pre-optimized function definitions for inlining, ensuring
@@ -741,21 +776,22 @@ fn topological_sort(
 ///
 /// Pipeline stages:
 /// 1. mem2reg: Promote local cells (non-escaping allocations) to SSA
-/// 2. call_resolution + inlining: Iteratively resolve and inline calls
-/// 3. block_coalesce: Merge straight-line blocks
-/// 4. heap_elimination: Eliminate global heap operations with known shapes
+/// 2. builtin_resolution + call_resolution + inlining: Iteratively resolve and inline calls
+/// 3. dce: Dead code elimination
+/// 4. block_coalesce: Merge straight-line blocks
+/// 5. heap_elimination: Eliminate global heap operations with known shapes
 pub fn run_optimization_pipeline_with_interprocedural(
     cfg: &Cfg,
     analysis: &CfgAnalysisResult,
     global_closure_map: &crate::interpreter::call_resolution::GlobalClosureMap,
     optimized_fun_defs: &std::collections::HashMap<crate::ir::GlobalId, crate::ir::FunDef, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>,
+    builtin_set: Option<&crate::interpreter::builtin_resolution::BuiltinSet>,
 ) -> (OptimizationResult, OptimizationCfgs) {
     use crate::interpreter::block_coalesce::{coalesce_blocks, CoalesceResult};
+    use crate::interpreter::builtin_resolution::{resolve_builtins, BuiltinResolutionResult};
     use crate::interpreter::call_resolution::{resolve_calls, CallResolutionResult};
     use crate::interpreter::dce::{eliminate_dead_code, DceResult};
-    use crate::interpreter::heap_elimination::{
-        eliminate_heap, HeapEliminationResult, HeapShape, ValueShape,
-    };
+    use crate::interpreter::heap_elimination::{eliminate_heap, HeapEliminationResult};
     use crate::interpreter::inlining::{inline_calls, InliningResult};
     use crate::interpreter::mem2reg::{mem2reg, Mem2RegResult};
     use crate::ir::{LabelGenerator, LocalIdGenerator};
@@ -784,8 +820,32 @@ pub fn run_optimization_pipeline_with_interprocedural(
     result.mem2reg = mem2reg_status;
     cfgs.after_mem2reg = after_mem2reg.clone();
 
+    // Get the CFG for builtin resolution
+    let cfg_for_builtin_res = after_mem2reg.as_ref().unwrap_or(cfg);
+
+    // Stage 1b: builtin resolution - convert GetGlobal+Load+Call to CallBuiltin
+    let after_builtin_resolution = if let Some(builtins) = builtin_set {
+        match resolve_builtins(cfg_for_builtin_res, builtins) {
+            BuiltinResolutionResult::Success { cfg: new_cfg, calls_resolved } => {
+                result.builtin_resolution = BuiltinResolutionStatus::Success { calls_resolved };
+                Some(new_cfg)
+            }
+            BuiltinResolutionResult::NoChange => {
+                result.builtin_resolution = BuiltinResolutionStatus::NoChange;
+                None
+            }
+        }
+    } else {
+        result.builtin_resolution = BuiltinResolutionStatus::Skipped;
+        None
+    };
+    cfgs.after_builtin_resolution = after_builtin_resolution.clone();
+
     // Get the CFG for call resolution
-    let cfg_for_call_res = after_mem2reg.as_ref().unwrap_or(cfg);
+    let cfg_for_call_res = after_builtin_resolution
+        .as_ref()
+        .or(after_mem2reg.as_ref())
+        .unwrap_or(cfg);
 
     // Stage 2: call resolution - convert Call to CallResolved
     let after_call_resolution = match resolve_calls(cfg_for_call_res, global_closure_map) {
@@ -803,6 +863,7 @@ pub fn run_optimization_pipeline_with_interprocedural(
     // Get the CFG for inlining
     let cfg_for_inlining = after_call_resolution
         .as_ref()
+        .or(after_builtin_resolution.as_ref())
         .or(after_mem2reg.as_ref())
         .unwrap_or(cfg);
 
@@ -813,6 +874,14 @@ pub fn run_optimization_pipeline_with_interprocedural(
     let max_rounds = 10;
 
     for _ in 0..max_rounds {
+        // Re-run builtin resolution to pick up any new calls from inlined code
+        if let Some(builtins) = builtin_set {
+            current_cfg = match resolve_builtins(&current_cfg, builtins) {
+                BuiltinResolutionResult::Success { cfg, .. } => cfg,
+                BuiltinResolutionResult::NoChange => current_cfg,
+            };
+        }
+
         // Re-run call resolution to pick up any new calls from inlined code
         current_cfg = match resolve_calls(&current_cfg, global_closure_map) {
             CallResolutionResult::Success { cfg, calls_resolved } => {
@@ -851,6 +920,7 @@ pub fn run_optimization_pipeline_with_interprocedural(
     let cfg_for_dce = after_inlining
         .as_ref()
         .or(after_call_resolution.as_ref())
+        .or(after_builtin_resolution.as_ref())
         .or(after_mem2reg.as_ref())
         .unwrap_or(cfg);
 
@@ -871,6 +941,7 @@ pub fn run_optimization_pipeline_with_interprocedural(
         .as_ref()
         .or(after_inlining.as_ref())
         .or(after_call_resolution.as_ref())
+        .or(after_builtin_resolution.as_ref())
         .or(after_mem2reg.as_ref())
         .unwrap_or(cfg);
 
@@ -892,6 +963,7 @@ pub fn run_optimization_pipeline_with_interprocedural(
         .or(after_dce.as_ref())
         .or(after_inlining.as_ref())
         .or(after_call_resolution.as_ref())
+        .or(after_builtin_resolution.as_ref())
         .or(after_mem2reg.as_ref())
         .unwrap_or(cfg);
 
@@ -899,11 +971,9 @@ pub fn run_optimization_pipeline_with_interprocedural(
     let current_analysis = analyze_cfg(cfg_for_heap_elim);
 
     if !current_analysis.accessed_globals.is_empty() {
-        // Create a simple shape where each global is a leaf value
-        let mut shape = HeapShape::new();
-        for global in &current_analysis.accessed_globals {
-            shape.globals.insert(global.clone(), ValueShape::Leaf);
-        }
+        // Build a heap shape based on Celeste game's actual global structure
+        // This is an example shape matching frame 28 checkpoint
+        let shape = build_celeste_heap_shape(&current_analysis.accessed_globals);
 
         match eliminate_heap(cfg_for_heap_elim, &shape, local_gen, label_gen) {
             HeapEliminationResult::Success(transformed) => {
@@ -911,7 +981,20 @@ pub fn run_optimization_pipeline_with_interprocedural(
                     unpack_count: transformed.unpack_slots.len(),
                     modified_count: transformed.modified_slots.len(),
                 };
-                cfgs.after_heap_elim = Some(transformed.cfg);
+                // Run DCE again after heap elimination to clean up dead GetGlobal/Load/GetField
+                let final_cfg = match eliminate_dead_code(&transformed.cfg) {
+                    DceResult::Success { cfg: cleaned_cfg, instructions_removed } => {
+                        // Add to the DCE count
+                        if let DceStatus::Success { instructions_removed: prev } = &result.dce {
+                            result.dce = DceStatus::Success { instructions_removed: prev + instructions_removed };
+                        } else {
+                            result.dce = DceStatus::Success { instructions_removed };
+                        }
+                        cleaned_cfg
+                    }
+                    DceResult::NoChange => transformed.cfg,
+                };
+                cfgs.after_heap_elim = Some(final_cfg);
             }
             HeapEliminationResult::ShapeNotPreserved(reason) => {
                 result.heap_elimination = HeapEliminationStatus::Failed(reason);
@@ -1653,5 +1736,111 @@ mod tests {
         });
 
         assert!(has_plus, "outer should contain the inlined Plus operation from inner");
+    }
+
+    #[test]
+    fn test_builtin_resolution_in_pipeline() {
+        // Test that run_optimization_pipeline_with_interprocedural properly resolves
+        // builtin calls even for standalone functions (not just when inlined)
+
+        use crate::interpreter::builtin_resolution::BuiltinSet;
+
+        // Create a function that calls a builtin (max)
+        // fn test_func(a, b) { return max(a, b) }
+        //
+        // This requires:
+        // 1. GetGlobal(max) -> cell
+        // 2. Load(cell) -> func
+        // 3. Call(closure, [a, b]) where closure was created from Load
+        //
+        // We use arg IDs 0 and 1 as the function arguments
+
+        let a_id = LocalId::from(0);
+        let b_id = LocalId::from(1);
+        let cell_id = LocalId::from(2);
+        let func_id = LocalId::from(3);
+        let result_id = LocalId::from(4);
+        let terminator_id = LocalId::from(5);
+
+        // Entry block:
+        // cell = GetGlobal(max)
+        // func = Load(cell)
+        // result = Call(func, [a, b])
+        // Return(result)
+        let entry = Block {
+            instructions: vec![
+                (
+                    cell_id,
+                    Instruction::GetGlobal {
+                        name: "max".to_string(),
+                        create_if_missing: false,
+                    },
+                ),
+                (func_id, Instruction::Load { source: cell_id }),
+                (
+                    result_id,
+                    Instruction::Call {
+                        closure: func_id,
+                        args: vec![a_id, b_id],
+                    },
+                ),
+            ],
+            terminator: (terminator_id, Terminator::Return { value: Some(result_id) }),
+            hint_normalize: false,
+        };
+
+        let cfg = Cfg {
+            entry,
+            named: FxHashMap::default(),
+        };
+
+        // Analyze and run the pipeline with builtin set
+        let analysis = analyze_cfg(&cfg);
+
+        // Create empty maps (no user-defined functions to resolve)
+        let global_closure_map = FxHashMap::default();
+        let optimized_fun_defs: FxHashMap<crate::ir::GlobalId, crate::ir::FunDef> = FxHashMap::default();
+
+        // Create builtin set with "max"
+        let builtin_set: BuiltinSet = ["max"].iter().map(|s| s.to_string()).collect();
+
+        // Run the pipeline
+        let (result, cfgs) = run_optimization_pipeline_with_interprocedural(
+            &cfg,
+            &analysis,
+            &global_closure_map,
+            &optimized_fun_defs,
+            Some(&builtin_set),
+        );
+
+        // Verify builtin resolution succeeded
+        assert!(
+            matches!(result.builtin_resolution, BuiltinResolutionStatus::Success { calls_resolved: 1 }),
+            "Expected builtin resolution to resolve 1 call, got {:?}",
+            result.builtin_resolution
+        );
+
+        // Verify the intermediate CFG was recorded
+        assert!(
+            cfgs.after_builtin_resolution.is_some(),
+            "Expected after_builtin_resolution CFG to be recorded"
+        );
+
+        // Verify the CFG now contains CallBuiltin instead of Call
+        let final_cfg = cfgs.after_builtin_resolution.as_ref().unwrap();
+        let has_call_builtin = final_cfg.iter_blocks().any(|block| {
+            block.instructions.iter().any(|(_, instr)| {
+                matches!(instr, Instruction::CallBuiltin { name, .. } if name == "max")
+            })
+        });
+        assert!(has_call_builtin, "Expected CallBuiltin(max, ...) in the resolved CFG");
+
+        // Verify no regular Call remains
+        let has_regular_call = final_cfg.iter_blocks().any(|block| {
+            block.instructions.iter().any(|(_, instr)| {
+                matches!(instr, Instruction::Call { .. })
+            })
+        });
+        assert!(!has_regular_call, "Expected no regular Call in the resolved CFG");
     }
 }

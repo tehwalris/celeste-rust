@@ -6,13 +6,13 @@
 - OCaml source is at `~/src/github.com/tehwalris/celeste_ocaml`
 - Read OCaml code as reference when implementing Rust equivalents.
 
-## Running tests safely
+## Running safely
 
 Use `./safe-run.sh` for cargo commands to prevent OOM from killing your session (100G limit by default):
 
 ```bash
 ./safe-run.sh -- cargo test
-./safe-run.sh -- cargo test test_run_celeste_game_frame
+./safe-run.sh -- ./target/release/celeste-rust -n 100  # Run 100 frames
 ```
 
 Exit code 137 means OOM.
