@@ -37,6 +37,10 @@ path = "src/bin/compare_frames.rs"
 name = "concrete_run"
 path = "src/bin/concrete_run.rs"
 
+[[bin]]
+name = "cfg_viewer"
+path = "src/bin/cfg_viewer.rs"
+
 [profile.release]
 lto = "fat"
 codegen-units = 1

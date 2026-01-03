@@ -1,5 +1,8 @@
+pub mod cfg_analysis;
 mod core_interpreter;
+pub mod heap_elimination;
 pub mod fixed_env;
+pub mod mem2reg;
 mod flow;
 pub mod glue;
 pub mod heap;

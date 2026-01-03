@@ -1,0 +1,766 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CFG Analysis Viewer</title>
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: #1a1a2e;
+            color: #eee;
+            min-height: 100vh;
+        }
+        h1 {
+            margin: 0 0 20px 0;
+            color: #00d9ff;
+        }
+        .controls {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        .controls input, .controls select {
+            padding: 8px 12px;
+            border: 1px solid #444;
+            border-radius: 4px;
+            background: #2a2a4a;
+            color: #eee;
+            font-size: 14px;
+        }
+        .controls input:focus, .controls select:focus {
+            outline: none;
+            border-color: #00d9ff;
+        }
+        .controls button {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 4px;
+            background: #00d9ff;
+            color: #1a1a2e;
+            cursor: pointer;
+            font-weight: bold;
+        }
+        .controls button:hover {
+            background: #00b8d9;
+        }
+        .controls button:disabled {
+            background: #444;
+            color: #888;
+            cursor: not-allowed;
+        }
+        .nav-info {
+            color: #888;
+            font-size: 14px;
+        }
+        .main-container {
+            display: grid;
+            grid-template-columns: 250px 1fr 350px;
+            gap: 20px;
+            height: calc(100vh - 150px);
+        }
+        .function-list {
+            background: #2a2a4a;
+            border-radius: 8px;
+            overflow: auto;
+            padding: 10px;
+        }
+        .function-item {
+            padding: 8px 12px;
+            cursor: pointer;
+            border-radius: 4px;
+            margin-bottom: 4px;
+            font-size: 13px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .function-item:hover {
+            background: #3a3a5a;
+        }
+        .function-item.selected {
+            background: #00d9ff;
+            color: #1a1a2e;
+        }
+        .function-item .badges {
+            display: flex;
+            gap: 4px;
+        }
+        .badge {
+            font-size: 10px;
+            padding: 2px 6px;
+            border-radius: 10px;
+            background: #444;
+        }
+        .badge.pure { background: #2ecc71; color: #1a1a2e; }
+        .badge.heap-free { background: #3498db; color: #1a1a2e; }
+        .badge.has-calls { background: #e74c3c; }
+        .badge.writes { background: #f39c12; color: #1a1a2e; }
+        .badge.ssa { background: #9b59b6; color: white; }
+        .badge.m2r { background: #e91e63; color: white; }
+
+        .cfg-tabs {
+            display: flex;
+            gap: 2px;
+            margin-bottom: 10px;
+        }
+        .cfg-tab {
+            padding: 6px 12px;
+            border: none;
+            border-radius: 4px 4px 0 0;
+            background: #1a1a2e;
+            color: #888;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: bold;
+        }
+        .cfg-tab:hover {
+            background: #3a3a5a;
+            color: #ccc;
+        }
+        .cfg-tab.active {
+            background: #00d9ff;
+            color: #1a1a2e;
+        }
+        .cfg-tab.disabled {
+            color: #555;
+            cursor: not-allowed;
+        }
+        .cfg-tab.disabled:hover {
+            background: #1a1a2e;
+            color: #555;
+        }
+
+        .cfg-panel {
+            background: #2a2a4a;
+            border-radius: 8px;
+            overflow: auto;
+            padding: 15px;
+        }
+        .cfg-panel h3 {
+            margin: 0 0 15px 0;
+            color: #00d9ff;
+            font-size: 14px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        .block {
+            background: #1a1a2e;
+            border-radius: 6px;
+            margin-bottom: 15px;
+            overflow: hidden;
+        }
+        .block-header {
+            background: #3a3a5a;
+            padding: 8px 12px;
+            font-weight: bold;
+            font-size: 13px;
+            display: flex;
+            justify-content: space-between;
+        }
+        .block-header .hint {
+            color: #f39c12;
+            font-weight: normal;
+            font-size: 11px;
+        }
+        .instruction {
+            padding: 4px 12px;
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+            font-size: 12px;
+            border-bottom: 1px solid #2a2a4a;
+        }
+        .instruction:last-child {
+            border-bottom: none;
+        }
+        .instruction .id {
+            color: #888;
+            margin-right: 8px;
+        }
+        .instruction.terminator {
+            background: #3a3a5a;
+            color: #f39c12;
+        }
+        /* Instruction type colors */
+        .instruction.alloc { color: #e74c3c; }
+        .instruction.load, .instruction.get_field, .instruction.get_index { color: #3498db; }
+        .instruction.store, .instruction.store_empty_table, .instruction.store_closure { color: #e67e22; }
+        .instruction.call { color: #9b59b6; }
+        .instruction.get_global { color: #1abc9c; }
+        .instruction.number_constant, .instruction.bool_constant, .instruction.string_constant, .instruction.nil_constant { color: #95a5a6; }
+        .instruction.binary_op, .instruction.unary_op { color: #f1c40f; }
+        .instruction.phi { color: #e91e63; }
+
+        .analysis-panel {
+            background: #2a2a4a;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 20px;
+        }
+        .analysis-panel h3 {
+            margin: 0 0 15px 0;
+            color: #00d9ff;
+            font-size: 14px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        .analysis-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+            gap: 10px;
+        }
+        .analysis-item {
+            background: #1a1a2e;
+            padding: 10px;
+            border-radius: 6px;
+        }
+        .analysis-item .label {
+            font-size: 11px;
+            color: #888;
+            text-transform: uppercase;
+            margin-bottom: 4px;
+        }
+        .analysis-item .value {
+            font-size: 18px;
+            font-weight: bold;
+        }
+        .analysis-item .value.true { color: #2ecc71; }
+        .analysis-item .value.false { color: #e74c3c; }
+
+        .stats-bar {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 15px;
+            font-size: 13px;
+            color: #888;
+        }
+        .stats-bar span {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+        .stats-bar .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+        }
+        .stats-bar .dot.pure { background: #2ecc71; }
+        .stats-bar .dot.heap-free { background: #3498db; }
+        .stats-bar .dot.has-calls { background: #e74c3c; }
+
+        .no-data {
+            color: #888;
+            text-align: center;
+            padding: 40px;
+        }
+
+        #filter {
+            flex: 1;
+            max-width: 300px;
+        }
+
+        /* Mobile responsive styles */
+        @media (max-width: 1024px) {
+            .main-container {
+                grid-template-columns: 1fr;
+                height: auto;
+            }
+            .function-list {
+                max-height: 200px;
+            }
+            .cfg-panel {
+                max-height: 400px;
+            }
+        }
+
+        @media (max-width: 600px) {
+            body {
+                padding: 10px;
+            }
+            h1 {
+                font-size: 1.4em;
+            }
+            .controls {
+                flex-direction: column;
+                align-items: stretch;
+            }
+            #filter {
+                max-width: none;
+            }
+            .controls button {
+                padding: 12px;
+            }
+            .stats-bar {
+                flex-wrap: wrap;
+                gap: 8px;
+            }
+            .function-list {
+                max-height: 150px;
+            }
+            .function-item {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 4px;
+            }
+            .analysis-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+            .instruction {
+                font-size: 11px;
+                padding: 3px 8px;
+                word-break: break-all;
+            }
+        }
+    </style>
+</head>
+<body>
+    <h1>CFG Analysis Viewer</h1>
+
+    <div class="stats-bar" id="stats-bar">
+        Loading...
+    </div>
+
+    <div class="controls">
+        <input type="text" id="filter" placeholder="Filter functions..." />
+        <select id="filter-type">
+            <option value="all">All Functions</option>
+            <option value="pure">Pure Only</option>
+            <option value="heap-free">Heap-Free Only</option>
+            <option value="has-heap">Has Heap Ops</option>
+            <option value="has-calls">Has Calls</option>
+        </select>
+        <button id="prev-btn" disabled>&larr; Prev</button>
+        <button id="next-btn" disabled>Next &rarr;</button>
+        <span class="nav-info" id="nav-info">0 / 0</span>
+    </div>
+
+    <div class="main-container">
+        <div class="function-list" id="function-list">
+            <div class="no-data">Loading...</div>
+        </div>
+
+        <div class="cfg-panel" id="cfg-panel">
+            <div class="cfg-tabs" id="cfg-tabs">
+                <button class="cfg-tab active" data-stage="original">Original</button>
+                <button class="cfg-tab disabled" data-stage="mem2reg">After mem2reg</button>
+                <button class="cfg-tab disabled" data-stage="heap_elim">After heap elim</button>
+            </div>
+            <div id="cfg-content">
+                <div class="no-data">Select a function</div>
+            </div>
+        </div>
+
+        <div>
+            <div class="analysis-panel" id="analysis-panel">
+                <h3>Analysis</h3>
+                <div class="no-data">Select a function</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let data = null;
+        let filteredCases = [];
+        let currentIndex = 0;
+        let currentStage = 'original';
+        let currentCase = null;
+
+        async function loadData() {
+            try {
+                const response = await fetch('cfg_analysis.json');
+                data = await response.json();
+                console.log('Loaded', data.test_cases.length, 'test cases');
+                updateStats();
+                applyFilters();
+            } catch (error) {
+                console.error('Failed to load data:', error);
+                document.getElementById('function-list').innerHTML =
+                    '<div class="no-data">Failed to load cfg_analysis.json<br><br>Run: cargo run --release --bin cfg_viewer</div>';
+            }
+        }
+
+        function updateStats() {
+            if (!data) return;
+            const cases = data.test_cases;
+            const pure = cases.filter(c => c.analysis.is_pure || (!c.analysis.writes_heap && !c.analysis.modifies_heap_shape && !c.analysis.has_calls)).length;
+            const heapFree = cases.filter(c => !c.analysis.reads_heap && !c.analysis.writes_heap && !c.analysis.modifies_heap_shape).length;
+            const hasCalls = cases.filter(c => c.analysis.has_calls).length;
+
+            document.getElementById('stats-bar').innerHTML = `
+                <span><span class="dot pure"></span> Pure: ${pure}/${cases.length}</span>
+                <span><span class="dot heap-free"></span> Heap-Free: ${heapFree}/${cases.length}</span>
+                <span><span class="dot has-calls"></span> Has Calls: ${hasCalls}/${cases.length}</span>
+                <span>Generated: ${new Date(parseInt(data.generated_at) * 1000).toLocaleString()}</span>
+            `;
+        }
+
+        function applyFilters() {
+            if (!data) return;
+
+            const filterText = document.getElementById('filter').value.toLowerCase();
+            const filterType = document.getElementById('filter-type').value;
+
+            filteredCases = data.test_cases.filter(c => {
+                // Text filter
+                if (filterText && !c.name.toLowerCase().includes(filterText)) {
+                    return false;
+                }
+
+                // Type filter
+                const isPure = !c.analysis.writes_heap && !c.analysis.modifies_heap_shape && !c.analysis.has_calls;
+                const isHeapFree = !c.analysis.reads_heap && !c.analysis.writes_heap && !c.analysis.modifies_heap_shape;
+
+                switch (filterType) {
+                    case 'pure': return isPure;
+                    case 'heap-free': return isHeapFree;
+                    case 'has-heap': return !isHeapFree;
+                    case 'has-calls': return c.analysis.has_calls;
+                    default: return true;
+                }
+            });
+
+            currentIndex = 0;
+            renderFunctionList();
+            updateNavigation();
+            if (filteredCases.length > 0) {
+                selectFunction(0);
+            } else {
+                clearSelection();
+            }
+        }
+
+        function renderFunctionList() {
+            const list = document.getElementById('function-list');
+
+            if (filteredCases.length === 0) {
+                list.innerHTML = '<div class="no-data">No functions match filter</div>';
+                return;
+            }
+
+            list.innerHTML = filteredCases.map((c, i) => {
+                const isPure = !c.analysis.writes_heap && !c.analysis.modifies_heap_shape && !c.analysis.has_calls;
+                const isHeapFree = !c.analysis.reads_heap && !c.analysis.writes_heap && !c.analysis.modifies_heap_shape;
+
+                let badges = '';
+                if (isPure) badges += '<span class="badge pure">pure</span>';
+                else if (isHeapFree) badges += '<span class="badge heap-free">heap-free</span>';
+                if (c.analysis.has_calls) badges += '<span class="badge has-calls">calls</span>';
+                if (c.analysis.writes_heap) badges += '<span class="badge writes">writes</span>';
+                if (c.optimization_result?.mem2reg?.Success) badges += '<span class="badge m2r">m2r</span>';
+                if (c.analysis.heap_elimination_status?.Success) badges += '<span class="badge ssa">SSA</span>';
+
+                return `<div class="function-item ${i === currentIndex ? 'selected' : ''}" onclick="selectFunction(${i})">
+                    <span>${c.name}</span>
+                    <span class="badges">${badges}</span>
+                </div>`;
+            }).join('');
+        }
+
+        function selectFunction(index) {
+            currentIndex = index;
+            renderFunctionList();
+            updateNavigation();
+
+            const c = filteredCases[index];
+            if (!c) return;
+
+            currentCase = c;
+            currentStage = 'original';
+            updateCfgTabs();
+            renderCurrentCfg();
+            renderAnalysis(c);
+        }
+
+        function updateCfgTabs() {
+            const c = currentCase;
+            if (!c) return;
+
+            const tabs = document.getElementById('cfg-tabs');
+            const hasMem2reg = c.after_mem2reg != null;
+            const hasHeapElim = c.after_heap_elim != null;
+
+            tabs.innerHTML = `
+                <button class="cfg-tab ${currentStage === 'original' ? 'active' : ''}" data-stage="original">Original</button>
+                <button class="cfg-tab ${!hasMem2reg ? 'disabled' : ''} ${currentStage === 'mem2reg' ? 'active' : ''}" data-stage="mem2reg">After mem2reg</button>
+                <button class="cfg-tab ${!hasHeapElim ? 'disabled' : ''} ${currentStage === 'heap_elim' ? 'active' : ''}" data-stage="heap_elim">After heap elim</button>
+            `;
+
+            // Add click handlers
+            tabs.querySelectorAll('.cfg-tab').forEach(tab => {
+                tab.addEventListener('click', () => {
+                    const stage = tab.dataset.stage;
+                    if (tab.classList.contains('disabled')) return;
+                    currentStage = stage;
+                    updateCfgTabs();
+                    renderCurrentCfg();
+                    renderAnalysis(currentCase);
+                });
+            });
+        }
+
+        function getCurrentCfg() {
+            const c = currentCase;
+            if (!c) return null;
+
+            switch (currentStage) {
+                case 'mem2reg':
+                    return c.after_mem2reg;
+                case 'heap_elim':
+                    return c.after_heap_elim;
+                default:
+                    return c.original_cfg;
+            }
+        }
+
+        function renderCurrentCfg() {
+            const cfg = getCurrentCfg();
+
+            if (cfg) {
+                renderCfgToElement('cfg-content', cfg);
+            } else {
+                document.getElementById('cfg-content').innerHTML = '<div class="no-data">Not available</div>';
+            }
+        }
+
+        function countCfgStats(cfg) {
+            if (!cfg) return { blocks: 0, instructions: 0 };
+            let blocks = 1; // entry block
+            let instructions = cfg.entry_block.instructions.length + 1; // +1 for terminator
+            for (const [_, block] of cfg.named_blocks) {
+                blocks++;
+                instructions += block.instructions.length + 1;
+            }
+            return { blocks, instructions };
+        }
+
+        function clearSelection() {
+            currentCase = null;
+            document.getElementById('cfg-content').innerHTML = '<div class="no-data">Select a function</div>';
+            document.getElementById('analysis-panel').innerHTML = '<h3>Analysis</h3><div class="no-data">Select a function</div>';
+        }
+
+        function renderCfgToElement(elementId, cfg) {
+            const container = document.getElementById(elementId);
+
+            let html = '';
+
+            // Entry block
+            html += renderBlock('entry', cfg.entry_block);
+
+            // Named blocks
+            for (const [name, block] of cfg.named_blocks) {
+                html += renderBlock(name, block);
+            }
+
+            container.innerHTML = html;
+        }
+
+        function renderBlock(name, block) {
+            const hint = block.hint_normalize ? '<span class="hint">hint_normalize</span>' : '';
+
+            let html = `<div class="block">
+                <div class="block-header">
+                    <span>${name}</span>
+                    ${hint}
+                </div>`;
+
+            for (const instr of block.instructions) {
+                html += `<div class="instruction ${instr.instruction_type}">
+                    <span class="id">%${instr.target_id}</span>
+                    ${escapeHtml(instr.instruction_text)}
+                </div>`;
+            }
+
+            html += `<div class="instruction terminator">
+                <span class="id">%${block.terminator.target_id}</span>
+                ${escapeHtml(block.terminator.terminator_text)}
+            </div>`;
+
+            html += '</div>';
+            return html;
+        }
+
+        function renderAnalysis(c) {
+            const a = c.analysis;
+            const isPure = !a.writes_heap && !a.modifies_heap_shape && !a.has_calls;
+            const isHeapFree = !a.reads_heap && !a.writes_heap && !a.modifies_heap_shape;
+
+            // Get stats for the currently displayed CFG
+            const currentCfg = getCurrentCfg();
+            const currentStats = countCfgStats(currentCfg);
+            const originalStats = countCfgStats(c.original_cfg);
+
+            // Calculate reduction
+            const instrReduction = originalStats.instructions - currentStats.instructions;
+            const instrReductionPct = originalStats.instructions > 0
+                ? Math.round(100 * instrReduction / originalStats.instructions)
+                : 0;
+
+            // Stage label
+            const stageLabels = {
+                'original': 'Original',
+                'mem2reg': 'After mem2reg',
+                'heap_elim': 'After heap elim'
+            };
+
+            let html = `<h3>Analysis: ${c.name}</h3>`;
+
+            if (c.source_span) {
+                html += `<div style="color: #888; margin-bottom: 5px; font-size: 12px;">Lines ${c.source_span[0]}-${c.source_span[1]}</div>`;
+            }
+
+            // Show current viewing stage
+            html += `<div style="color: #00d9ff; margin-bottom: 10px; font-size: 12px; font-weight: bold;">Viewing: ${stageLabels[currentStage] || 'Original'}</div>`;
+
+            html += `<div class="analysis-grid">
+                <div class="analysis-item">
+                    <div class="label">Reads Heap</div>
+                    <div class="value ${a.reads_heap}">${a.reads_heap}</div>
+                </div>
+                <div class="analysis-item">
+                    <div class="label">Writes Heap</div>
+                    <div class="value ${a.writes_heap}">${a.writes_heap}</div>
+                </div>
+                <div class="analysis-item">
+                    <div class="label">Modifies Shape</div>
+                    <div class="value ${a.modifies_heap_shape}">${a.modifies_heap_shape}</div>
+                </div>
+                <div class="analysis-item">
+                    <div class="label">Has Calls</div>
+                    <div class="value ${a.has_calls}">${a.has_calls}</div>
+                </div>
+                <div class="analysis-item">
+                    <div class="label">Is Pure</div>
+                    <div class="value ${isPure}">${isPure}</div>
+                </div>
+                <div class="analysis-item">
+                    <div class="label">Is Heap-Free</div>
+                    <div class="value ${isHeapFree}">${isHeapFree}</div>
+                </div>
+                <div class="analysis-item">
+                    <div class="label">Blocks</div>
+                    <div class="value">${currentStats.blocks}${currentStage !== 'original' && currentStats.blocks !== originalStats.blocks ? ` <span style="color: #888; font-size: 12px;">(was ${originalStats.blocks})</span>` : ''}</div>
+                </div>
+                <div class="analysis-item">
+                    <div class="label">Instructions</div>
+                    <div class="value">${currentStats.instructions}${instrReduction > 0 ? ` <span style="color: #2ecc71; font-size: 12px;">(-${instrReduction}, ${instrReductionPct}%)</span>` : ''}</div>
+                </div>
+            </div>`;
+
+            if (a.accessed_globals && a.accessed_globals.length > 0) {
+                html += `<div style="margin-top: 15px;">
+                    <div style="color: #888; font-size: 11px; text-transform: uppercase; margin-bottom: 5px;">Accessed Globals</div>
+                    <div style="font-size: 12px; color: #1abc9c;">${a.accessed_globals.join(', ')}</div>
+                </div>`;
+            }
+
+            // Show optimization pipeline results
+            const opt = c.optimization_result;
+            if (opt) {
+                html += `<div style="margin-top: 15px; border-top: 1px solid #444; padding-top: 15px;">
+                    <div style="color: #00d9ff; font-size: 12px; font-weight: bold; margin-bottom: 10px;">Optimization Pipeline</div>`;
+
+                // mem2reg status
+                let m2rHtml = '';
+                let m2rClass = '';
+                if (opt.mem2reg === 'NoCells') {
+                    m2rHtml = 'No cells to promote';
+                    m2rClass = '';
+                } else if (opt.mem2reg?.Success) {
+                    const cells = opt.mem2reg.Success.cells_promoted;
+                    m2rHtml = `✓ ${cells} cell${cells !== 1 ? 's' : ''} promoted`;
+                    m2rClass = 'true';
+                } else if (opt.mem2reg?.Partial) {
+                    const p = opt.mem2reg.Partial;
+                    m2rHtml = `⚠ ${p.cells_promoted} promoted, ${p.cells_failed} failed`;
+                    m2rClass = '';
+                }
+                const m2rActive = currentStage === 'mem2reg' ? 'border-left: 3px solid #00d9ff; padding-left: 8px;' : '';
+                html += `<div style="margin-bottom: 8px; ${m2rActive}">
+                    <div style="color: #888; font-size: 11px; text-transform: uppercase; margin-bottom: 3px;">mem2reg (local cells)${currentStage === 'mem2reg' ? ' ◀' : ''}</div>
+                    <div class="value ${m2rClass}" style="font-size: 12px;">${m2rHtml}</div>
+                </div>`;
+
+                // Heap elimination status
+                let heapHtml = '';
+                let heapClass = '';
+                if (opt.heap_elimination === 'NotAttempted') {
+                    heapHtml = 'Not Attempted';
+                    heapClass = '';
+                } else if (opt.heap_elimination === 'NotApplicable') {
+                    heapHtml = 'Not Applicable';
+                    heapClass = '';
+                } else if (opt.heap_elimination?.Success) {
+                    const s = opt.heap_elimination.Success;
+                    heapHtml = `✓ ${s.unpack_count} slots, ${s.modified_count} modified`;
+                    heapClass = 'true';
+                } else if (opt.heap_elimination?.Failed) {
+                    heapHtml = `✗ ${opt.heap_elimination.Failed}`;
+                    heapClass = 'false';
+                }
+                const heapActive = currentStage === 'heap_elim' ? 'border-left: 3px solid #00d9ff; padding-left: 8px;' : '';
+                html += `<div style="${heapActive}">
+                    <div style="color: #888; font-size: 11px; text-transform: uppercase; margin-bottom: 3px;">Heap Elimination (globals)${currentStage === 'heap_elim' ? ' ◀' : ''}</div>
+                    <div class="value ${heapClass}" style="font-size: 12px;">${heapHtml}</div>
+                </div>`;
+
+                html += `</div>`;
+            }
+
+            document.getElementById('analysis-panel').innerHTML = html;
+        }
+
+        function updateNavigation() {
+            document.getElementById('nav-info').textContent =
+                filteredCases.length > 0
+                    ? `${currentIndex + 1} / ${filteredCases.length}`
+                    : '0 / 0';
+
+            document.getElementById('prev-btn').disabled = currentIndex <= 0;
+            document.getElementById('next-btn').disabled = currentIndex >= filteredCases.length - 1;
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // Event listeners
+        document.getElementById('filter').addEventListener('input', applyFilters);
+        document.getElementById('filter-type').addEventListener('change', applyFilters);
+
+        document.getElementById('prev-btn').addEventListener('click', () => {
+            if (currentIndex > 0) {
+                selectFunction(currentIndex - 1);
+            }
+        });
+
+        document.getElementById('next-btn').addEventListener('click', () => {
+            if (currentIndex < filteredCases.length - 1) {
+                selectFunction(currentIndex + 1);
+            }
+        });
+
+        // Keyboard navigation
+        document.addEventListener('keydown', (e) => {
+            if (e.target.tagName === 'INPUT') return;
+
+            if (e.key === 'ArrowLeft' || e.key === 'k') {
+                if (currentIndex > 0) selectFunction(currentIndex - 1);
+            } else if (e.key === 'ArrowRight' || e.key === 'j') {
+                if (currentIndex < filteredCases.length - 1) selectFunction(currentIndex + 1);
+            }
+        });
+
+        // Load data on page load
+        loadData();
+    </script>
+</body>
+</html>
