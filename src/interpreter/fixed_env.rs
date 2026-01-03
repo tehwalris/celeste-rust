@@ -4,8 +4,10 @@ use std::sync::Arc;
 use indexmap::IndexSet;
 use rustc_hash::FxHasher;
 
-use crate::ir::{Cfg, FunDef, GlobalId, Label};
+use crate::ir::{Cfg, FunDef, GlobalId, Label, LocalIdGenerator};
 
+use super::block_coalesce::{coalesce_blocks, CoalesceResult};
+use super::mem2reg::{mem2reg, Mem2RegResult};
 use super::{state::State, value::Value};
 
 // Use FxHashMap for faster hashing in FixedEnv
@@ -34,12 +36,40 @@ impl PreparedCfg {
     }
 }
 
+/// Apply shape-independent optimizations to a CFG.
+/// These passes don't depend on the shape of the heap and can always be applied.
+///
+/// Passes applied:
+/// 1. mem2reg - Promote local cells (non-escaping allocations) to SSA
+/// 2. block_coalesce - Merge straight-line blocks
+pub fn optimize_cfg(cfg: &Cfg) -> Cfg {
+    let mut current_cfg = cfg.clone();
+    let mut local_gen = LocalIdGenerator::new();
+
+    // Pass 1: mem2reg - eliminate local cells
+    current_cfg = match mem2reg(&current_cfg, &mut local_gen) {
+        Mem2RegResult::Success { cfg: optimized, .. } => optimized,
+        Mem2RegResult::PartialSuccess { cfg: optimized, .. } => optimized,
+        Mem2RegResult::NoCells => current_cfg,
+    };
+
+    // Pass 2: block coalescing - merge straight-line blocks
+    current_cfg = match coalesce_blocks(&current_cfg) {
+        CoalesceResult::Success { cfg: optimized, .. } => optimized,
+        CoalesceResult::NoChange => current_cfg,
+    };
+
+    current_cfg
+}
+
 /// FixedEnv contains the static environment for interpretation:
 /// - Function definitions (with their prepared CFGs)
 /// - Builtin function implementations
 pub struct FixedEnv {
     pub fun_defs: FxHashMap<GlobalId, (FunDef, PreparedCfg)>,
     pub builtin_funs: FxHashMap<String, BuiltinFun>,
+    /// Whether to apply shape-independent optimizations to CFGs
+    optimize_cfgs: bool,
 }
 
 impl FixedEnv {
@@ -47,10 +77,30 @@ impl FixedEnv {
         Self {
             fun_defs: FxHashMap::default(),
             builtin_funs: FxHashMap::default(),
+            optimize_cfgs: false,
         }
     }
 
-    pub fn add_fun_def(&mut self, fun_def: FunDef) {
+    /// Create a new FixedEnv with shape-independent CFG optimizations enabled.
+    pub fn new_with_optimizations() -> Self {
+        Self {
+            fun_defs: FxHashMap::default(),
+            builtin_funs: FxHashMap::default(),
+            optimize_cfgs: true,
+        }
+    }
+
+    /// Enable or disable shape-independent CFG optimizations.
+    pub fn set_optimize_cfgs(&mut self, optimize: bool) {
+        self.optimize_cfgs = optimize;
+    }
+
+    pub fn add_fun_def(&mut self, mut fun_def: FunDef) {
+        // Apply shape-independent optimizations if enabled
+        if self.optimize_cfgs {
+            fun_def.cfg = optimize_cfg(&fun_def.cfg);
+        }
+
         let prepared = PreparedCfg::new(fun_def.cfg.clone());
         self.fun_defs
             .insert(fun_def.name.clone(), (fun_def, prepared));

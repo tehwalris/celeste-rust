@@ -67,6 +67,21 @@ pub struct OptimizationResult {
     pub mem2reg: Mem2RegStatus,
     /// Result of heap elimination pass (for globals)
     pub heap_elimination: HeapEliminationStatus,
+    /// Result of block coalescing pass
+    pub block_coalesce: BlockCoalesceStatus,
+}
+
+/// Status of the block coalescing pass
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub enum BlockCoalesceStatus {
+    #[default]
+    NotAttempted,
+    /// Successfully coalesced blocks
+    Success {
+        blocks_removed: usize,
+    },
+    /// No blocks to coalesce
+    NoChange,
 }
 
 /// Status of the mem2reg pass
@@ -251,17 +266,36 @@ fn check_instruction_escapes(
     }
 }
 
+/// Intermediate CFG results from the optimization pipeline
+#[derive(Clone, Debug, Default)]
+pub struct OptimizationCfgs {
+    pub after_mem2reg: Option<Cfg>,
+    pub after_heap_elim: Option<Cfg>,
+    pub after_block_coalesce: Option<Cfg>,
+}
+
 /// Run the full optimization pipeline on a CFG.
 ///
 /// Pipeline stages:
 /// 1. mem2reg: Promote local cells (non-escaping allocations) to SSA
 /// 2. heap_elimination: Eliminate global heap operations with known shapes
+/// 3. block_coalesce: Merge straight-line blocks
 ///
 /// Returns the optimization result and intermediate CFGs for visualization.
 pub fn run_optimization_pipeline(
     cfg: &Cfg,
     analysis: &CfgAnalysisResult,
 ) -> (OptimizationResult, Option<Cfg>, Option<Cfg>) {
+    let (result, cfgs) = run_optimization_pipeline_full(cfg, analysis);
+    (result, cfgs.after_mem2reg, cfgs.after_heap_elim)
+}
+
+/// Run the full optimization pipeline, returning all intermediate CFGs.
+pub fn run_optimization_pipeline_full(
+    cfg: &Cfg,
+    analysis: &CfgAnalysisResult,
+) -> (OptimizationResult, OptimizationCfgs) {
+    use crate::interpreter::block_coalesce::{coalesce_blocks, CoalesceResult};
     use crate::interpreter::heap_elimination::{
         eliminate_heap, HeapEliminationResult, HeapShape, ValueShape,
     };
@@ -269,6 +303,7 @@ pub fn run_optimization_pipeline(
     use crate::ir::{LabelGenerator, LocalIdGenerator};
 
     let mut result = OptimizationResult::default();
+    let mut cfgs = OptimizationCfgs::default();
 
     // Stage 1: mem2reg - eliminate local cells
     let mut local_gen = LocalIdGenerator::new();
@@ -288,6 +323,7 @@ pub fn run_optimization_pipeline(
         (None, Mem2RegStatus::NoCells)
     };
     result.mem2reg = mem2reg_status;
+    cfgs.after_mem2reg = after_mem2reg.clone();
 
     // Get the CFG to use for heap elimination (after mem2reg or original)
     let cfg_for_heap_elim = after_mem2reg.as_ref().unwrap_or(cfg);
@@ -328,8 +364,24 @@ pub fn run_optimization_pipeline(
         result.heap_elimination = HeapEliminationStatus::NotApplicable;
         None
     };
+    cfgs.after_heap_elim = after_heap_elim.clone();
 
-    (result, after_mem2reg, after_heap_elim)
+    // Stage 3: block coalescing - merge straight-line blocks
+    let cfg_for_coalesce = after_heap_elim.as_ref()
+        .or(after_mem2reg.as_ref())
+        .unwrap_or(cfg);
+
+    match coalesce_blocks(cfg_for_coalesce) {
+        CoalesceResult::Success { cfg: new_cfg, blocks_removed } => {
+            result.block_coalesce = BlockCoalesceStatus::Success { blocks_removed };
+            cfgs.after_block_coalesce = Some(new_cfg);
+        }
+        CoalesceResult::NoChange => {
+            result.block_coalesce = BlockCoalesceStatus::NoChange;
+        }
+    }
+
+    (result, cfgs)
 }
 
 /// Try to apply heap elimination transformation to a CFG (legacy interface).
@@ -677,6 +729,8 @@ pub struct CfgTestCase {
     pub after_mem2reg: Option<SerializableCfg>,
     /// CFG after heap elimination pass (if any transformation occurred)
     pub after_heap_elim: Option<SerializableCfg>,
+    /// CFG after block coalescing pass (if any transformation occurred)
+    pub after_block_coalesce: Option<SerializableCfg>,
     /// Final optimized CFG (whichever stage succeeded last)
     pub optimized_cfg: SerializableCfg,
     /// Analysis results

@@ -509,7 +509,8 @@ fn tile_flag_at_computed(
 }
 
 pub fn create_fixed_env_with_builtins() -> FixedEnv {
-    let mut fixed_env = FixedEnv::new();
+    // Use the optimized FixedEnv with shape-independent CFG passes enabled
+    let mut fixed_env = FixedEnv::new_with_optimizations();
     fixed_env.add_builtin("__print", builtin_print);
     fixed_env.add_builtin("__new_unknown_boolean", builtin_new_unknown_boolean);
     fixed_env.add_builtin("__new_vector", builtin_new_vector);

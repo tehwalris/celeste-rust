@@ -101,7 +101,15 @@ impl<'a> UnboundSplitBlockFlow<FlowData, BoundInterpreterFlow<'a>> for Interpret
                         .iter()
                         .filter(|(branch_label, _)| branch_label == source_block_name)
                         .exactly_one()
-                        .unwrap();
+                        .unwrap_or_else(|_| {
+                            let branch_labels: Vec<_> = branches.iter().map(|(l, _)| l.as_str()).collect();
+                            panic!(
+                                "Phi node missing branch for source '{}'.\n\
+                                 Available branches: {:?}",
+                                source_block_name.as_str(),
+                                branch_labels
+                            )
+                        });
                     (*instruction_local_id, *source_local_id)
                 }
                 _ => panic!("Expected Phi instruction"),

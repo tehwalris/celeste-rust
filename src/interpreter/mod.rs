@@ -1,3 +1,4 @@
+pub mod block_coalesce;
 pub mod cfg_analysis;
 mod core_interpreter;
 pub mod heap_elimination;

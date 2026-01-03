@@ -17,8 +17,8 @@ use clap::Parser;
 
 use celeste_rust::frontend;
 use celeste_rust::interpreter::cfg_analysis::{
-    analyze_cfg, run_optimization_pipeline, CfgTestCase, CfgTestCases, HeapEliminationStatus,
-    Mem2RegStatus, SerializableCfg,
+    analyze_cfg, run_optimization_pipeline_full, BlockCoalesceStatus, CfgTestCase, CfgTestCases,
+    HeapEliminationStatus, Mem2RegStatus, SerializableCfg,
 };
 
 #[derive(Parser, Debug)]
@@ -110,8 +110,7 @@ fn main() -> Result<()> {
         }
 
         // Run optimization pipeline
-        let (opt_result, after_mem2reg, after_heap_elim) =
-            run_optimization_pipeline(&fun_def.cfg, &analysis);
+        let (opt_result, cfgs) = run_optimization_pipeline_full(&fun_def.cfg, &analysis);
 
         // Update analysis with heap elimination status for legacy compatibility
         let mut analysis = analysis;
@@ -134,6 +133,13 @@ fn main() -> Result<()> {
             HeapEliminationStatus::Failed(_) => stats.heap_elim_failed += 1,
             _ => {}
         }
+        match &opt_result.block_coalesce {
+            BlockCoalesceStatus::Success { blocks_removed } => {
+                stats.block_coalesce_success += 1;
+                stats.blocks_removed += blocks_removed;
+            }
+            _ => {}
+        }
 
         if args.verbose {
             println!("\n=== {} ===", name);
@@ -151,6 +157,7 @@ fn main() -> Result<()> {
             println!("  Local cells: {}", analysis.local_only_allocs);
             println!("  mem2reg: {:?}", opt_result.mem2reg);
             println!("  Heap elimination: {:?}", opt_result.heap_elimination);
+            println!("  Block coalesce: {:?}", opt_result.block_coalesce);
             if !analysis.accessed_globals.is_empty() {
                 println!("  Globals: {:?}", analysis.accessed_globals);
             }
@@ -158,12 +165,14 @@ fn main() -> Result<()> {
 
         // Create serializable CFGs
         let original_cfg: SerializableCfg = (&fun_def.cfg).into();
-        let after_mem2reg_cfg = after_mem2reg.as_ref().map(|c| c.into());
-        let after_heap_elim_cfg = after_heap_elim.as_ref().map(|c| c.into());
+        let after_mem2reg_cfg = cfgs.after_mem2reg.as_ref().map(|c| c.into());
+        let after_heap_elim_cfg = cfgs.after_heap_elim.as_ref().map(|c| c.into());
+        let after_block_coalesce_cfg = cfgs.after_block_coalesce.as_ref().map(|c| c.into());
 
-        // Determine final optimized CFG
-        let optimized_cfg = after_heap_elim_cfg
+        // Determine final optimized CFG (use the latest successful pass)
+        let optimized_cfg = after_block_coalesce_cfg
             .clone()
+            .or_else(|| after_heap_elim_cfg.clone())
             .or_else(|| after_mem2reg_cfg.clone())
             .unwrap_or_else(|| original_cfg.clone());
 
@@ -175,6 +184,7 @@ fn main() -> Result<()> {
             original_cfg,
             after_mem2reg: after_mem2reg_cfg,
             after_heap_elim: after_heap_elim_cfg,
+            after_block_coalesce: after_block_coalesce_cfg,
             optimized_cfg,
             analysis,
             optimization_result: opt_result,
@@ -204,6 +214,10 @@ fn main() -> Result<()> {
     println!("  Success: {} ({:.1}%)", stats.heap_elim_success, pct(stats.heap_elim_success, stats.total));
     println!("  Failed: {} ({:.1}%)", stats.heap_elim_failed, pct(stats.heap_elim_failed, stats.total));
 
+    println!("\n=== Block Coalescing ===");
+    println!("  Success: {} ({:.1}%)", stats.block_coalesce_success, pct(stats.block_coalesce_success, stats.total));
+    println!("  Blocks removed: {}", stats.blocks_removed);
+
     // Write output
     println!("\nWriting to {}...", args.output);
     let json = serde_json::to_string_pretty(&test_cases)?;
@@ -231,4 +245,6 @@ struct AnalysisStats {
     cells_promoted: usize,
     heap_elim_success: usize,
     heap_elim_failed: usize,
+    block_coalesce_success: usize,
+    blocks_removed: usize,
 }
