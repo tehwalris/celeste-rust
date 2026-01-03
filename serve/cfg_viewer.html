@@ -544,6 +544,54 @@
             return { blocks, instructions };
         }
 
+        // Analyze a CFG to compute reads_heap, writes_heap, etc.
+        // This re-analyzes the CFG client-side to show accurate values for optimized stages
+        function analyzeCfg(cfg) {
+            if (!cfg) return null;
+
+            let reads_heap = false;
+            let writes_heap = false;
+            let modifies_heap_shape = false;
+            let has_calls = false;
+
+            function analyzeBlock(block) {
+                for (const instr of block.instructions) {
+                    const type = instr.instruction_type;
+                    // Reads heap: load, get_field, get_index, get_global
+                    if (type === 'load' || type === 'get_field' || type === 'get_index' || type === 'get_global') {
+                        reads_heap = true;
+                    }
+                    // Writes heap: store, store_empty_table, store_closure
+                    if (type === 'store' || type === 'store_empty_table' || type === 'store_closure') {
+                        writes_heap = true;
+                    }
+                    // Modifies heap shape: alloc, store_empty_table, store_closure
+                    if (type === 'alloc' || type === 'store_empty_table' || type === 'store_closure') {
+                        modifies_heap_shape = true;
+                    }
+                    // Has calls
+                    if (type === 'call') {
+                        has_calls = true;
+                    }
+                }
+            }
+
+            // Analyze entry block
+            analyzeBlock(cfg.entry_block);
+
+            // Analyze named blocks
+            for (const [_, block] of cfg.named_blocks) {
+                analyzeBlock(block);
+            }
+
+            return {
+                reads_heap,
+                writes_heap,
+                modifies_heap_shape,
+                has_calls
+            };
+        }
+
         function clearSelection() {
             currentCase = null;
             document.getElementById('cfg-content').innerHTML = '<div class="no-data">Select a function</div>';
@@ -592,14 +640,17 @@
         }
 
         function renderAnalysis(c) {
-            const a = c.analysis;
-            const isPure = !a.writes_heap && !a.modifies_heap_shape && !a.has_calls;
-            const isHeapFree = !a.reads_heap && !a.writes_heap && !a.modifies_heap_shape;
-
             // Get stats for the currently displayed CFG
             const currentCfg = getCurrentCfg();
             const currentStats = countCfgStats(currentCfg);
             const originalStats = countCfgStats(c.original_cfg);
+
+            // Re-analyze the current CFG to get accurate heap/call flags
+            const currentAnalysis = analyzeCfg(currentCfg);
+            // Use re-analyzed values for current stage, fall back to original analysis
+            const a = currentAnalysis || c.analysis;
+            const isPure = !a.writes_heap && !a.modifies_heap_shape && !a.has_calls;
+            const isHeapFree = !a.reads_heap && !a.writes_heap && !a.modifies_heap_shape;
 
             // Calculate reduction
             const instrReduction = originalStats.instructions - currentStats.instructions;
