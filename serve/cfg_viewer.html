@@ -350,6 +350,7 @@
                 <button class="cfg-tab active" data-stage="original">Original</button>
                 <button class="cfg-tab disabled" data-stage="mem2reg">After mem2reg</button>
                 <button class="cfg-tab disabled" data-stage="heap_elim">After heap elim</button>
+                <button class="cfg-tab disabled" data-stage="block_coalesce">After coalesce</button>
             </div>
             <div id="cfg-content">
                 <div class="no-data">Select a function</div>
@@ -484,11 +485,13 @@
             const tabs = document.getElementById('cfg-tabs');
             const hasMem2reg = c.after_mem2reg != null;
             const hasHeapElim = c.after_heap_elim != null;
+            const hasBlockCoalesce = c.after_block_coalesce != null;
 
             tabs.innerHTML = `
                 <button class="cfg-tab ${currentStage === 'original' ? 'active' : ''}" data-stage="original">Original</button>
                 <button class="cfg-tab ${!hasMem2reg ? 'disabled' : ''} ${currentStage === 'mem2reg' ? 'active' : ''}" data-stage="mem2reg">After mem2reg</button>
                 <button class="cfg-tab ${!hasHeapElim ? 'disabled' : ''} ${currentStage === 'heap_elim' ? 'active' : ''}" data-stage="heap_elim">After heap elim</button>
+                <button class="cfg-tab ${!hasBlockCoalesce ? 'disabled' : ''} ${currentStage === 'block_coalesce' ? 'active' : ''}" data-stage="block_coalesce">After coalesce</button>
             `;
 
             // Add click handlers
@@ -513,6 +516,8 @@
                     return c.after_mem2reg;
                 case 'heap_elim':
                     return c.after_heap_elim;
+                case 'block_coalesce':
+                    return c.after_block_coalesce;
                 default:
                     return c.original_cfg;
             }
@@ -606,7 +611,8 @@
             const stageLabels = {
                 'original': 'Original',
                 'mem2reg': 'After mem2reg',
-                'heap_elim': 'After heap elim'
+                'heap_elim': 'After heap elim',
+                'block_coalesce': 'After coalesce'
             };
 
             let html = `<h3>Analysis: ${c.name}</h3>`;
