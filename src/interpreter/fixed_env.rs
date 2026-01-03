@@ -4,9 +4,11 @@ use std::sync::Arc;
 use indexmap::IndexSet;
 use rustc_hash::FxHasher;
 
-use crate::ir::{Cfg, FunDef, GlobalId, Label, LocalIdGenerator};
+use crate::ir::{Cfg, FunDef, GlobalId, Label, LabelGenerator, LocalIdGenerator};
 
 use super::block_coalesce::{coalesce_blocks, CoalesceResult};
+use super::call_resolution::{build_global_closure_map_from_fun_defs, resolve_calls, CallResolutionResult};
+use super::inlining::{inline_calls, InliningResult};
 use super::mem2reg::{mem2reg, Mem2RegResult};
 use super::{state::State, value::Value};
 
@@ -111,5 +113,64 @@ impl FixedEnv {
         F: Fn(State, Vec<Value>) -> anyhow::Result<Vec<(State, Value)>> + Send + Sync + 'static,
     {
         self.builtin_funs.insert(name.to_string(), Arc::new(f));
+    }
+
+    /// Apply inter-procedural optimizations after all function definitions are loaded.
+    ///
+    /// This runs call resolution and inlining passes which require knowledge of all
+    /// function definitions to work properly.
+    ///
+    /// Call this after all `add_fun_def` calls are complete.
+    pub fn apply_interprocedural_optimizations(&mut self) {
+        // Build the global closure map from all function definitions
+        let global_closure_map = build_global_closure_map_from_fun_defs(
+            self.fun_defs.values().map(|(fun_def, _)| fun_def),
+        );
+
+        // Build a map of just the FunDefs for inlining lookup
+        let fun_def_map: FxHashMap<GlobalId, FunDef> = self
+            .fun_defs
+            .iter()
+            .map(|(name, (fun_def, _))| (name.clone(), fun_def.clone()))
+            .collect();
+
+        // Apply call resolution and inlining to each function
+        let names: Vec<GlobalId> = self.fun_defs.keys().cloned().collect();
+        for name in names {
+            let (mut fun_def, _) = self.fun_defs.remove(&name).unwrap();
+
+            // Apply call resolution
+            fun_def.cfg = match resolve_calls(&fun_def.cfg, &global_closure_map) {
+                CallResolutionResult::Success { cfg, calls_resolved: _ } => cfg,
+                CallResolutionResult::NoChange => fun_def.cfg,
+            };
+
+            // Apply inlining (may run multiple rounds for nested inlining)
+            let mut local_gen = LocalIdGenerator::new();
+            let mut label_gen = LabelGenerator::new();
+            let max_inline_rounds = 3; // Limit to avoid infinite expansion
+
+            for _ in 0..max_inline_rounds {
+                match inline_calls(&fun_def.cfg, &fun_def_map, &mut local_gen, &mut label_gen) {
+                    InliningResult::Success { cfg, calls_inlined: _ } => {
+                        fun_def.cfg = cfg;
+                        // Continue for another round in case of nested calls
+                    }
+                    InliningResult::NoChange => {
+                        break; // No more inlining possible
+                    }
+                }
+            }
+
+            // Run block coalescing to clean up after inlining
+            fun_def.cfg = match coalesce_blocks(&fun_def.cfg) {
+                CoalesceResult::Success { cfg, .. } => cfg,
+                CoalesceResult::NoChange => fun_def.cfg,
+            };
+
+            // Re-add the optimized function definition
+            let prepared = PreparedCfg::new(fun_def.cfg.clone());
+            self.fun_defs.insert(name, (fun_def, prepared));
+        }
     }
 }

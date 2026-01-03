@@ -484,6 +484,11 @@ fn analyze_instruction(
             called_closures.insert(usize::from(*closure));
             result.instruction_counts.call += 1;
         }
+        Instruction::CallResolved { .. } => {
+            result.has_calls = true;
+            // CallResolved is a direct call, no closure local to track
+            result.instruction_counts.call += 1;
+        }
         Instruction::UnaryOp { .. } => {
             result.instruction_counts.unary_op += 1;
         }
@@ -651,6 +656,20 @@ fn format_instruction(instr: &Instruction) -> String {
             let arg_strs: Vec<_> = args.iter().map(|id| usize::from(*id).to_string()).collect();
             format!("Call({}, [{}])", usize::from(*closure), arg_strs.join(", "))
         }
+        Instruction::CallResolved {
+            fun_name,
+            captures,
+            args,
+        } => {
+            let cap_strs: Vec<_> = captures.iter().map(|id| usize::from(*id).to_string()).collect();
+            let arg_strs: Vec<_> = args.iter().map(|id| usize::from(*id).to_string()).collect();
+            format!(
+                "CallResolved({}, caps=[{}], args=[{}])",
+                fun_name.as_str(),
+                cap_strs.join(", "),
+                arg_strs.join(", ")
+            )
+        }
         Instruction::UnaryOp { op, arg } => format!("UnaryOp({:?}, {})", op, usize::from(*arg)),
         Instruction::BinaryOp { left, op, right } => {
             format!(
@@ -712,6 +731,7 @@ fn instruction_type_name(instr: &Instruction) -> &'static str {
         Instruction::StringConstant { .. } => "string_constant",
         Instruction::NilConstant => "nil_constant",
         Instruction::Call { .. } => "call",
+        Instruction::CallResolved { .. } => "call_resolved",
         Instruction::UnaryOp { .. } => "unary_op",
         Instruction::BinaryOp { .. } => "binary_op",
         Instruction::Phi { .. } => "phi",

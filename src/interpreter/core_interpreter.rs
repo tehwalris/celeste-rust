@@ -11,7 +11,7 @@ use super::{
     state::State,
     value::{HeapValue, MaybeVector, Value},
 };
-use crate::ir::{Instruction, LocalId};
+use crate::ir::{GlobalId, Instruction, LocalId};
 use anyhow::{anyhow, Result};
 
 type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
@@ -246,7 +246,7 @@ impl<'a> CoreInterpreter<'a> {
             }
             Instruction::StringConstant { value } => Ok(Some(Value::String(value.clone()))),
             Instruction::NilConstant => Ok(Some(Value::Nil(None))),
-            Instruction::Call { .. } => {
+            Instruction::Call { .. } | Instruction::CallResolved { .. } => {
                 panic!("Call instruction passed to interpret_non_call_instruction")
             }
             Instruction::UnaryOp { op, arg } => {
@@ -280,33 +280,82 @@ impl<'a> CoreInterpreter<'a> {
         local_id: LocalId,
         instruction: &Instruction,
     ) -> Result<Vec<State>> {
-        let (closure_local_id, arg_local_ids) = match instruction {
-            Instruction::Call { closure, args } => (closure, args),
+        // Determine call target: either resolve from heap (Call) or use directly (CallResolved)
+        enum CallTarget {
+            Builtin(String),
+            Closure {
+                fun_name: GlobalId,
+                captured_values: Vec<Value>,
+            },
+        }
+
+        let (call_target, arg_values): (CallTarget, Vec<Value>) = match instruction {
+            Instruction::Call { closure, args } => {
+                // Get the closure value from the local environment
+                let closure_heap_id = match self.state.local_env.get(*closure) {
+                    Value::Pointer(heap_id) => *heap_id,
+                    Value::NilPointer(hint) => {
+                        return Err(anyhow!("Attempt to call nil ({})", hint));
+                    }
+                    value => {
+                        return Err(make_non_pointer_error(value));
+                    }
+                };
+
+                // Get the heap value
+                let heap_value = self.state.heap.get(closure_heap_id).clone();
+
+                // Gather argument values
+                let arg_values: Vec<Value> = args
+                    .iter()
+                    .map(|id| self.state.local_env.get(*id).clone())
+                    .collect();
+
+                let target = match heap_value {
+                    HeapValue::BuiltinFun(name) => CallTarget::Builtin(name),
+                    HeapValue::Closure(fun_name, captured_values) => CallTarget::Closure {
+                        fun_name,
+                        captured_values,
+                    },
+                    _ => {
+                        return Err(anyhow!(
+                            "Attempt to call something that is not a function: {:?}",
+                            heap_value
+                        ));
+                    }
+                };
+
+                (target, arg_values)
+            }
+            Instruction::CallResolved {
+                fun_name,
+                captures,
+                args,
+            } => {
+                // Get capture values from local environment
+                let captured_values: Vec<Value> = captures
+                    .iter()
+                    .map(|id| self.state.local_env.get(*id).clone())
+                    .collect();
+
+                // Gather argument values
+                let arg_values: Vec<Value> = args
+                    .iter()
+                    .map(|id| self.state.local_env.get(*id).clone())
+                    .collect();
+
+                let target = CallTarget::Closure {
+                    fun_name: fun_name.clone(),
+                    captured_values,
+                };
+
+                (target, arg_values)
+            }
             _ => panic!("Non-call instruction passed to interpret_call_instruction"),
         };
 
-        // Get the closure value from the local environment
-        let closure_heap_id = match self.state.local_env.get(*closure_local_id) {
-            Value::Pointer(heap_id) => *heap_id,
-            Value::NilPointer(hint) => {
-                return Err(anyhow!("Attempt to call nil ({})", hint));
-            }
-            value => {
-                return Err(make_non_pointer_error(value));
-            }
-        };
-
-        // Get the heap value
-        let heap_value = self.state.heap.get(closure_heap_id).clone();
-
-        // Gather argument values
-        let arg_values: Vec<Value> = arg_local_ids
-            .iter()
-            .map(|id| self.state.local_env.get(*id).clone())
-            .collect();
-
-        match heap_value {
-            HeapValue::BuiltinFun(name) => {
+        match call_target {
+            CallTarget::Builtin(name) => {
                 let _span = SpanGuard::new(&format!("builtin:{}", name), "call");
 
                 // Look up the builtin function
@@ -343,7 +392,10 @@ impl<'a> CoreInterpreter<'a> {
 
                 Ok(states)
             }
-            HeapValue::Closure(fun_def_name, captured_values) => {
+            CallTarget::Closure {
+                fun_name: fun_def_name,
+                captured_values,
+            } => {
                 // Capture inputs for benchmarking if enabled
                 input_capture::maybe_capture(fun_def_name.as_str(), arg_values.clone());
 
@@ -483,10 +535,6 @@ impl<'a> CoreInterpreter<'a> {
 
                 Ok(states)
             }
-            _ => Err(anyhow!(
-                "Attempt to call something that is not a function: {:?}",
-                heap_value
-            )),
         }
     }
 }

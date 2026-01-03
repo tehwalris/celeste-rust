@@ -180,6 +180,14 @@ pub enum Instruction {
         closure: LocalId,
         args: Vec<LocalId>,
     },
+    /// A resolved call to a known function.
+    /// This is produced by call resolution when we know statically which function
+    /// will be called. The captures are explicit SSA values (not loaded from heap).
+    CallResolved {
+        fun_name: GlobalId,
+        captures: Vec<LocalId>,
+        args: Vec<LocalId>,
+    },
     UnaryOp {
         op: UnaryOp,
         arg: LocalId,
@@ -246,6 +254,15 @@ impl Instruction {
             Self::NilConstant => Self::NilConstant,
             Self::Call { closure, args } => Self::Call {
                 closure: f(*closure),
+                args: args.iter().map(|id| f(*id)).collect(),
+            },
+            Self::CallResolved {
+                fun_name,
+                captures,
+                args,
+            } => Self::CallResolved {
+                fun_name: fun_name.clone(),
+                captures: captures.iter().map(|id| f(*id)).collect(),
                 args: args.iter().map(|id| f(*id)).collect(),
             },
             Self::UnaryOp { op, arg } => Self::UnaryOp {

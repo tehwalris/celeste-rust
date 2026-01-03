@@ -18,7 +18,7 @@ use std::hash::BuildHasherDefault;
 use rustc_hash::FxHasher;
 
 use crate::ir::{
-    Block, Cfg, Instruction, Label, LabelGenerator, LocalId, LocalIdGenerator, Terminator,
+    Block, Cfg, GlobalId, Instruction, Label, LabelGenerator, LocalId, LocalIdGenerator, Terminator,
 };
 
 type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
@@ -77,14 +77,17 @@ impl HeapSlot {
 }
 
 /// The known shape of a value in the heap
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValueShape {
     /// A leaf value (number, string, boolean, nil) - these are abstract
     Leaf,
     /// A table with known fields
     Table(FxHashMap<String, ValueShape>),
-    /// A closure - we don't transform through these
-    Closure,
+    /// A closure with its function name and capture shapes
+    Closure {
+        fun_name: GlobalId,
+        capture_shapes: Vec<ValueShape>,
+    },
     /// A pointer to another heap location (aliasing)
     Pointer(HeapSlot),
 }
@@ -140,8 +143,9 @@ impl HeapShape {
                     );
                 }
             }
-            ValueShape::Closure => {
-                // Closures are not transformed
+            ValueShape::Closure { .. } => {
+                // Closures are not transformed - we know which function they refer to
+                // but we don't need to unpack their captures
             }
             ValueShape::Pointer(target) => {
                 // Pointers create aliasing - use the target slot
@@ -509,6 +513,14 @@ fn transform_block(
             Instruction::Call { closure, args } => {
                 // Calls may have side effects - need to check if the callee is pure
                 return Err("Call instruction - may have side effects".to_string());
+            }
+
+            Instruction::CallResolved { fun_name, .. } => {
+                // CallResolved is still a call - may have side effects
+                return Err(format!(
+                    "CallResolved instruction ({}) - may have side effects",
+                    fun_name.as_str()
+                ));
             }
 
             // Pure operations - pass through
