@@ -5,6 +5,7 @@
 //! - Phi nodes referencing non-existent predecessor blocks
 //! - Branch targets pointing to non-existent blocks
 //! - Duplicate local ID definitions
+//! - Type mismatches (e.g., Load from a value instead of pointer)
 
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasherDefault;
@@ -15,6 +16,17 @@ use crate::ir::{Block, Cfg, Instruction, Label, LocalId, Terminator};
 
 type FxHashSet<T> = HashSet<T, BuildHasherDefault<FxHasher>>;
 type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
+
+/// The "type" of a value in SSA form - used for validation
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SsaType {
+    /// A pointer/reference that can be dereferenced with Load
+    Pointer,
+    /// A value (number, bool, string, nil, or computed result)
+    Value,
+    /// Unknown - for args or when type cannot be determined
+    Unknown,
+}
 
 /// Validation error types
 #[derive(Debug, Clone)]
@@ -48,6 +60,21 @@ pub enum ValidationError {
         first_block: String,
         second_block: String,
     },
+    /// Load from a non-pointer (e.g., Load from Phi result which is a value)
+    LoadFromNonPointer {
+        block: String,
+        load_local: LocalId,
+        source_local: LocalId,
+        source_type: SsaType,
+        source_instruction: String,
+    },
+    /// Store to a non-pointer
+    StoreToNonPointer {
+        block: String,
+        store_local: LocalId,
+        target_local: LocalId,
+        target_type: SsaType,
+    },
 }
 
 impl std::fmt::Display for ValidationError {
@@ -67,6 +94,14 @@ impl std::fmt::Display for ValidationError {
             }
             ValidationError::DuplicateDefinition { local_id, first_block, second_block } => {
                 write!(f, "Local %{} defined in both '{}' and '{}'", usize::from(*local_id), first_block, second_block)
+            }
+            ValidationError::LoadFromNonPointer { block, load_local, source_local, source_type, source_instruction } => {
+                write!(f, "Load %{} in block '{}' reads from %{} which is {:?} ({}), not a pointer",
+                    usize::from(*load_local), block, usize::from(*source_local), source_type, source_instruction)
+            }
+            ValidationError::StoreToNonPointer { block, store_local, target_local, target_type } => {
+                write!(f, "Store %{} in block '{}' writes to %{} which is {:?}, not a pointer",
+                    usize::from(*store_local), block, usize::from(*target_local), target_type)
             }
         }
     }
@@ -200,7 +235,7 @@ fn add_predecessors_from_terminator(
     predecessors: &mut FxHashMap<String, FxHashSet<String>>,
 ) {
     match terminator {
-        Terminator::Return { .. } => {}
+        Terminator::Return { .. } | Terminator::Deopt { .. } => {}
         Terminator::UnconditionalBranch { target } => {
             if let Some(preds) = predecessors.get_mut(target.as_str()) {
                 preds.insert(from_block.to_string());
@@ -286,7 +321,7 @@ fn validate_branch_targets(
     errors: &mut Vec<ValidationError>,
 ) {
     match &block.terminator.1 {
-        Terminator::Return { .. } => {}
+        Terminator::Return { .. } | Terminator::Deopt { .. } => {}
         Terminator::UnconditionalBranch { target } => {
             if !block_names.contains(target.as_str()) {
                 errors.push(ValidationError::BranchTargetNotFound {
@@ -377,7 +412,153 @@ fn get_terminator_used_locals(terminator: &Terminator) -> Vec<LocalId> {
         Terminator::Return { value: None } => vec![],
         Terminator::UnconditionalBranch { .. } => vec![],
         Terminator::ConditionalBranch { condition, .. } => vec![*condition],
+        Terminator::Deopt { .. } => vec![],
     }
+}
+
+/// Classify an instruction by its SSA type (what kind of value it produces)
+fn classify_instruction(instruction: &Instruction) -> SsaType {
+    match instruction {
+        // Pointer-producing instructions
+        Instruction::Alloc => SsaType::Pointer,
+        Instruction::GetGlobal { .. } => SsaType::Pointer,
+        Instruction::GetField { .. } => SsaType::Pointer,
+        Instruction::GetIndex { .. } => SsaType::Pointer,
+
+        // Value-producing instructions
+        Instruction::NumberConstant { .. } => SsaType::Value,
+        Instruction::BoolConstant { .. } => SsaType::Value,
+        Instruction::StringConstant { .. } => SsaType::Value,
+        Instruction::NilConstant => SsaType::Value,
+        Instruction::BinaryOp { .. } => SsaType::Value,
+        Instruction::UnaryOp { .. } => SsaType::Value,
+        Instruction::Load { .. } => SsaType::Value, // Load dereferences a pointer to get a value
+        Instruction::Phi { .. } => SsaType::Value, // Phi merges values (in SSA form after heap elim)
+
+        // These don't produce meaningful values for Load/Store purposes
+        Instruction::Store { .. } => SsaType::Value, // Store returns unit/nil
+        Instruction::StoreEmptyTable { .. } => SsaType::Value,
+        Instruction::StoreClosure { .. } => SsaType::Value,
+
+        // Calls can return anything - we don't know statically
+        Instruction::Call { .. } => SsaType::Unknown,
+        Instruction::CallResolved { .. } => SsaType::Unknown,
+        Instruction::CallBuiltin { .. } => SsaType::Unknown,
+    }
+}
+
+/// Get a short description of an instruction for error messages
+fn describe_instruction(instruction: &Instruction) -> String {
+    match instruction {
+        Instruction::Alloc => "Alloc".to_string(),
+        Instruction::GetGlobal { name, .. } => format!("GetGlobal({})", name),
+        Instruction::GetField { field, .. } => format!("GetField(.{})", field),
+        Instruction::GetIndex { .. } => "GetIndex".to_string(),
+        Instruction::NumberConstant { .. } => "NumberConstant".to_string(),
+        Instruction::BoolConstant { value } => format!("BoolConstant({})", value),
+        Instruction::StringConstant { value } => format!("StringConstant({:?})", value),
+        Instruction::NilConstant => "NilConstant".to_string(),
+        Instruction::BinaryOp { op, .. } => format!("BinaryOp({:?})", op),
+        Instruction::UnaryOp { op, .. } => format!("UnaryOp({:?})", op),
+        Instruction::Load { .. } => "Load".to_string(),
+        Instruction::Store { .. } => "Store".to_string(),
+        Instruction::StoreEmptyTable { .. } => "StoreEmptyTable".to_string(),
+        Instruction::StoreClosure { fun_def, .. } => format!("StoreClosure({})", fun_def.as_str()),
+        Instruction::Phi { branches } => format!("Phi({} branches)", branches.len()),
+        Instruction::Call { .. } => "Call".to_string(),
+        Instruction::CallResolved { fun_name, .. } => format!("CallResolved({})", fun_name.as_str()),
+        Instruction::CallBuiltin { name, .. } => format!("CallBuiltin({})", name),
+    }
+}
+
+/// Validate type constraints in a CFG (e.g., Load must read from a pointer)
+pub fn validate_types(cfg: &Cfg, arg_types: &[(LocalId, SsaType)]) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+
+    // Build a map of local ID -> (SsaType, description)
+    let mut local_types: FxHashMap<LocalId, (SsaType, String)> = FxHashMap::default();
+
+    // Add argument types
+    for (local_id, ssa_type) in arg_types {
+        local_types.insert(*local_id, (*ssa_type, "<arg>".to_string()));
+    }
+
+    // Collect types from entry block
+    collect_types(&cfg.entry, &mut local_types);
+
+    // Collect types from named blocks
+    for (_, block) in &cfg.named {
+        collect_types(block, &mut local_types);
+    }
+
+    // Validate types in entry block
+    validate_block_types(&cfg.entry, "entry", &local_types, &mut errors);
+
+    // Validate types in named blocks
+    for (label, block) in &cfg.named {
+        validate_block_types(block, label.as_str(), &local_types, &mut errors);
+    }
+
+    errors
+}
+
+/// Collect SSA types from a block
+fn collect_types(block: &Block, local_types: &mut FxHashMap<LocalId, (SsaType, String)>) {
+    for (local_id, instruction) in &block.instructions {
+        let ssa_type = classify_instruction(instruction);
+        let description = describe_instruction(instruction);
+        local_types.insert(*local_id, (ssa_type, description));
+    }
+}
+
+/// Validate type constraints in a block
+fn validate_block_types(
+    block: &Block,
+    block_name: &str,
+    local_types: &FxHashMap<LocalId, (SsaType, String)>,
+    errors: &mut Vec<ValidationError>,
+) {
+    for (local_id, instruction) in &block.instructions {
+        match instruction {
+            Instruction::Load { source } => {
+                if let Some((source_type, source_desc)) = local_types.get(source) {
+                    if *source_type == SsaType::Value {
+                        errors.push(ValidationError::LoadFromNonPointer {
+                            block: block_name.to_string(),
+                            load_local: *local_id,
+                            source_local: *source,
+                            source_type: *source_type,
+                            source_instruction: source_desc.clone(),
+                        });
+                    }
+                }
+            }
+            Instruction::Store { target, .. } => {
+                if let Some((target_type, _)) = local_types.get(target) {
+                    if *target_type == SsaType::Value {
+                        errors.push(ValidationError::StoreToNonPointer {
+                            block: block_name.to_string(),
+                            store_local: *local_id,
+                            target_local: *target,
+                            target_type: *target_type,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Validate a CFG fully (structural + type checks)
+pub fn validate_cfg_full(cfg: &Cfg, arg_ids: &[LocalId], arg_types: &[(LocalId, SsaType)]) -> ValidationResult {
+    let mut result = validate_cfg_with_args(cfg, arg_ids);
+
+    // Add type validation errors
+    let type_errors = validate_types(cfg, arg_types);
+    result.errors.extend(type_errors);
+
+    result
 }
 
 /// Validate a CFG and panic with details if invalid
@@ -518,5 +699,126 @@ mod tests {
         let result = validate_cfg(&cfg);
         assert!(!result.is_valid());
         assert!(result.errors.iter().any(|e| matches!(e, ValidationError::BranchTargetNotFound { .. })));
+    }
+
+    #[test]
+    fn test_load_from_phi_is_type_error() {
+        // This tests the Load(Phi) pattern that heap elimination produces
+        // Phi produces a VALUE, not a pointer, so Load(Phi) is a type error
+        type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
+
+        let mut named = FxHashMap::default();
+        named.insert(
+            Label::from("join".to_string()),
+            Block {
+                instructions: vec![
+                    // Phi merges values from two branches
+                    (LocalId::from(3), Instruction::Phi {
+                        branches: vec![
+                            (Label::from("__entry".to_string()), LocalId::from(0)),
+                            (Label::from("other".to_string()), LocalId::from(2)),
+                        ],
+                    }),
+                    // BUG: Load from Phi result - Phi is a VALUE, not a pointer!
+                    (LocalId::from(4), Instruction::Load { source: LocalId::from(3) }),
+                ],
+                terminator: (LocalId::from(5), Terminator::Return { value: Some(LocalId::from(4)) }),
+                hint_normalize: false,
+            },
+        );
+        named.insert(
+            Label::from("other".to_string()),
+            Block {
+                instructions: vec![
+                    (LocalId::from(2), Instruction::NumberConstant { value: Pico8Num::from_i16(99) }),
+                ],
+                terminator: (LocalId::from(6), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
+                hint_normalize: false,
+            },
+        );
+
+        let cfg = Cfg {
+            entry: Block {
+                instructions: vec![
+                    (LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(42) }),
+                ],
+                terminator: (LocalId::from(1), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
+                hint_normalize: false,
+            },
+            named,
+        };
+
+        // Structural validation should pass
+        let structural_result = validate_cfg(&cfg);
+        assert!(structural_result.is_valid(), "Structural validation should pass: {:?}", structural_result.errors);
+
+        // Type validation should catch Load(Phi)
+        let type_errors = validate_types(&cfg, &[]);
+        assert!(!type_errors.is_empty(), "Expected type errors for Load(Phi)");
+        assert!(type_errors.iter().any(|e| matches!(e, ValidationError::LoadFromNonPointer { source_instruction, .. } if source_instruction.contains("Phi"))),
+            "Expected LoadFromNonPointer error for Phi source: {:?}", type_errors);
+    }
+
+    #[test]
+    fn test_load_from_alloc_is_valid() {
+        // Load from Alloc is valid - Alloc produces a pointer
+        let cfg = Cfg {
+            entry: Block {
+                instructions: vec![
+                    (LocalId::from(0), Instruction::Alloc),
+                    (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
+                ],
+                terminator: (LocalId::from(2), Terminator::Return { value: Some(LocalId::from(1)) }),
+                hint_normalize: false,
+            },
+            named: Default::default(),
+        };
+
+        let type_errors = validate_types(&cfg, &[]);
+        assert!(type_errors.is_empty(), "Load from Alloc should be valid: {:?}", type_errors);
+    }
+
+    #[test]
+    fn test_load_from_getfield_is_valid() {
+        // Load from GetField is valid - GetField produces a pointer
+        let cfg = Cfg {
+            entry: Block {
+                instructions: vec![
+                    (LocalId::from(0), Instruction::Alloc),
+                    (LocalId::from(1), Instruction::GetField {
+                        receiver: LocalId::from(0),
+                        field: "x".to_string(),
+                        create_if_missing: false,
+                    }),
+                    (LocalId::from(2), Instruction::Load { source: LocalId::from(1) }),
+                ],
+                terminator: (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
+                hint_normalize: false,
+            },
+            named: Default::default(),
+        };
+
+        let type_errors = validate_types(&cfg, &[]);
+        assert!(type_errors.is_empty(), "Load from GetField should be valid: {:?}", type_errors);
+    }
+
+    #[test]
+    fn test_load_from_number_constant_is_type_error() {
+        // Load from NumberConstant is a type error
+        let cfg = Cfg {
+            entry: Block {
+                instructions: vec![
+                    (LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(42) }),
+                    (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
+                ],
+                terminator: (LocalId::from(2), Terminator::Return { value: Some(LocalId::from(1)) }),
+                hint_normalize: false,
+            },
+            named: Default::default(),
+        };
+
+        let type_errors = validate_types(&cfg, &[]);
+        assert!(!type_errors.is_empty(), "Expected type error for Load(NumberConstant)");
+        assert!(type_errors.iter().any(|e| matches!(e, ValidationError::LoadFromNonPointer { .. })));
     }
 }

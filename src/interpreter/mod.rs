@@ -5,6 +5,7 @@ pub mod cfg_analysis;
 pub mod cfg_validation;
 mod core_interpreter;
 pub mod dce;
+pub mod deopt_unsafe_builtins;
 pub mod heap_elimination;
 pub mod fixed_env;
 pub mod inlining;
@@ -21,3 +22,6 @@ pub mod state;
 pub mod tracing;
 pub mod value;
 pub mod vectorize;
+
+#[cfg(test)]
+mod heap_elim_test;
