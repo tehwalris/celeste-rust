@@ -746,7 +746,7 @@ mod tests {
     /// Test that the type validation catches Load(Phi) issues
     #[test]
     fn test_type_validation_catches_load_phi() {
-        use crate::interpreter::cfg_validation::{validate_types, ValidationError, SsaType};
+        use crate::interpreter::cfg_validation::{validate_types, SsaType};
         use crate::ir::LocalIdGenerator;
 
         let cfg = make_simple_field_access_cfg();
@@ -781,18 +781,13 @@ mod tests {
                 println!("  - {}", error);
             }
 
-            // We expect to find Load(Phi) errors
-            let load_from_phi_errors: Vec<_> = type_errors.iter()
-                .filter(|e| matches!(e, ValidationError::LoadFromNonPointer { source_instruction, .. }
-                    if source_instruction.contains("Phi")))
-                .collect();
+            // After the Load(Phi) fix, heap elimination should produce valid SSA
+            // with no type errors
+            assert!(type_errors.is_empty(),
+                "Heap elimination should produce valid SSA with no type errors, but found: {:?}",
+                type_errors);
 
-            assert!(!load_from_phi_errors.is_empty(),
-                "Expected type validation to catch Load(Phi) errors, but found none. \
-                 This means heap elimination is now producing valid SSA! \
-                 (or we're not testing the right case)");
-
-            println!("\n✓ Type validation correctly caught {} Load(Phi) error(s)", load_from_phi_errors.len());
+            println!("\n✓ Heap elimination produces valid SSA - no type errors found");
         } else {
             panic!("Heap elimination failed");
         }

@@ -760,34 +760,46 @@ fn transform_block(
         // Macro to handle blocking operation - either deopt or stop based on mode
         macro_rules! needs_deopt {
             ($reason:expr) => {
-                match deopt_mode {
-                    DeoptMode::Insert => {
-                        return BlockTransformResult::NeedsDeopt {
-                            instructions: new_instructions,
-                            reason: $reason,
-                            terminator_id: *target_id,
-                            calls_resolved,
+                {
+                    // Apply id_mapping rewriting to instructions accumulated so far
+                    let rewrite = |id: LocalId| -> LocalId {
+                        id_mapping.get_value(id).unwrap_or(id)
+                    };
+                    let rewritten: Vec<_> = new_instructions
+                        .into_iter()
+                        .map(|(target_id, instr)| (target_id, instr.map_local_ids(rewrite)))
+                        .collect();
+
+                    match deopt_mode {
+                        DeoptMode::Insert => {
+                            return BlockTransformResult::NeedsDeopt {
+                                instructions: rewritten,
+                                reason: $reason,
+                                terminator_id: *target_id,
+                                calls_resolved,
+                            }
                         }
-                    }
-                    DeoptMode::Stop => {
-                        // In soft mode, return the block with instructions so far
-                        // plus remaining instructions unchanged
-                        let mut final_instrs = new_instructions;
-                        // Add current and remaining instructions unchanged
-                        let current_idx = block.instructions.iter()
-                            .position(|(id, _)| id == target_id)
-                            .unwrap();
-                        for (id, instr) in &block.instructions[current_idx..] {
-                            final_instrs.push((*id, instr.clone()));
-                        }
-                        return BlockTransformResult::Stopped {
-                            block: Block {
-                                instructions: final_instrs,
-                                terminator: block.terminator.clone(),
-                                hint_normalize: block.hint_normalize,
-                            },
-                            calls_resolved,
-                            reason: $reason,
+                        DeoptMode::Stop => {
+                            // In soft mode, return the block with instructions so far
+                            // plus remaining instructions unchanged
+                            let mut final_instrs = rewritten;
+                            // Add current and remaining instructions unchanged
+                            let current_idx = block.instructions.iter()
+                                .position(|(id, _)| id == target_id)
+                                .unwrap();
+                            for (id, instr) in &block.instructions[current_idx..] {
+                                final_instrs.push((*id, instr.clone()));
+                            }
+                            let rewritten_terminator = block.terminator.1.map_local_ids(rewrite);
+                            return BlockTransformResult::Stopped {
+                                block: Block {
+                                    instructions: final_instrs,
+                                    terminator: (block.terminator.0, rewritten_terminator),
+                                    hint_normalize: block.hint_normalize,
+                                },
+                                calls_resolved,
+                                reason: $reason,
+                            }
                         }
                     }
                 }
@@ -819,15 +831,15 @@ fn transform_block(
                         // Map the target to itself (it's the constant value now)
                         id_mapping.set_value(*target_id, *target_id);
                     } else if shape.is_leaf_path(slot.path()) {
-                        // Leaf slot - get the SSA version
+                        // Leaf slot - get the SSA version via Braun algorithm
+                        // The SSA variable already contains the VALUE (from HeapRead or Phi),
+                        // so we don't need to emit a Load instruction - the value is already available.
+                        // We just map the target to the SSA variable so subsequent uses reference it directly.
                         let ssa_var = ssa_builder.get_at_end(block_id, &slot);
-                        // Map the target to this value
                         id_mapping.set_value(*target_id, ssa_var);
-                        // Replace with a load from the SSA variable
-                        new_instructions.push((
-                            *target_id,
-                            Instruction::Load { source: ssa_var },
-                        ));
+                        // Note: We do NOT emit a Load instruction here because ssa_var is already a value.
+                        // Emitting Load { source: ssa_var } would be semantically wrong since
+                        // ssa_var is a value (from HeapRead/Phi), not a pointer.
                     } else {
                         // Table slot - keep the slot mapping so GetField can extend it
                         // The loaded value "points to" the same slot (for path extension)
@@ -973,10 +985,29 @@ fn transform_block(
         }
     }
 
+    // Rewrite all LocalId references using id_mapping
+    // This is essential for cases where we remove an instruction but map its target
+    // to another LocalId (e.g., when Load of a leaf slot maps to the SSA variable directly)
+    let rewrite_local_id = |id: LocalId| -> LocalId {
+        id_mapping.get_value(id).unwrap_or(id)
+    };
+
+    let rewritten_instructions: Vec<_> = new_instructions
+        .into_iter()
+        .map(|(target_id, instr)| {
+            (target_id, instr.map_local_ids(rewrite_local_id))
+        })
+        .collect();
+
+    let rewritten_terminator = (
+        block.terminator.0,
+        block.terminator.1.map_local_ids(rewrite_local_id),
+    );
+
     BlockTransformResult::Success {
         block: Block {
-            instructions: new_instructions,
-            terminator: block.terminator.clone(),
+            instructions: rewritten_instructions,
+            terminator: rewritten_terminator,
             hint_normalize: block.hint_normalize,
         },
         calls_resolved,
@@ -1684,11 +1715,13 @@ mod tests {
                 });
                 assert!(has_number_constant, "Expected NumberConstant(0) for k_left");
 
-                // Should have exactly one Load (for x, not k_left)
+                // After the Load(Phi) fix, leaf slot Loads don't emit Load instructions
+                // - they map directly to the SSA variable. So there should be 0 Loads
+                // (k_left is constant -> NumberConstant, x is leaf -> direct SSA mapping)
                 let load_count = transformed.cfg.entry.instructions.iter()
                     .filter(|(_, instr)| matches!(instr, Instruction::Load { .. }))
                     .count();
-                assert_eq!(load_count, 1, "Expected exactly one Load (for x), got {}", load_count);
+                assert_eq!(load_count, 0, "Expected no Loads (leaf slots map directly to SSA vars), got {}", load_count);
             }
             other => panic!("Expected Success, got {:?}", other),
         }
@@ -1911,13 +1944,14 @@ mod tests {
                 assert_eq!(transformed.deopt_count, 0, "Expected no deopt");
                 // Should have one unpack slot for "x"
                 assert_eq!(transformed.unpack_slots.len(), 1);
-                // Should have two Loads:
-                // 1. Load from SSA variable for "x" (SSA promoted)
-                // 2. Load from %2 for "unknown" (kept as-is)
+                // After the Load(Phi) fix:
+                // - Load for "x" (leaf slot) is eliminated - maps directly to SSA variable
+                // - Load for "unknown" (unknown global) is kept as-is
+                // So we expect exactly 1 Load
                 let load_count = transformed.cfg.entry.instructions.iter()
                     .filter(|(_, instr)| matches!(instr, Instruction::Load { .. }))
                     .count();
-                assert_eq!(load_count, 2, "Expected two Loads");
+                assert_eq!(load_count, 1, "Expected one Load (for unknown global only)");
                 // Check that the Load for "unknown" is still from %2
                 let has_load_from_2 = transformed.cfg.entry.instructions.iter()
                     .any(|(_, instr)| matches!(instr, Instruction::Load { source } if *source == LocalId::from(2)));
