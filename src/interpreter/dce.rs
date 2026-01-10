@@ -5,7 +5,7 @@
 //! instructions that were only used to set up the original Call.
 
 use crate::interpreter::common::{FxHashMap, FxHashSet};
-use crate::ir::{Block, Cfg, Instruction, Label, LocalId, Terminator};
+use crate::ir::{Block, Cfg, Instruction, Label, LocalId};
 
 /// Result of the DCE pass.
 #[derive(Debug)]
@@ -52,10 +52,12 @@ fn has_side_effects(instruction: &Instruction) -> bool {
 /// Returns the set of reachable block labels (entry is always reachable).
 fn compute_reachable_blocks(cfg: &Cfg) -> FxHashSet<Label> {
     let mut reachable: FxHashSet<Label> = FxHashSet::default();
-    let mut worklist: Vec<&Label> = Vec::new();
-
-    // Process entry block's successors
-    add_terminator_successors(cfg.entry.terminator_kind(), &mut worklist, &cfg.named);
+    let mut worklist: Vec<&Label> = cfg
+        .entry
+        .terminator_kind()
+        .get_successor_labels()
+        .filter(|label| cfg.named.contains_key(*label))
+        .collect();
 
     while let Some(label) = worklist.pop() {
         if reachable.contains(label) {
@@ -64,37 +66,15 @@ fn compute_reachable_blocks(cfg: &Cfg) -> FxHashSet<Label> {
         reachable.insert(label.clone());
 
         if let Some(block) = cfg.named.get(label) {
-            add_terminator_successors(block.terminator_kind(), &mut worklist, &cfg.named);
+            for succ in block.terminator_kind().get_successor_labels() {
+                if cfg.named.contains_key(succ) {
+                    worklist.push(succ);
+                }
+            }
         }
     }
 
     reachable
-}
-
-/// Add successor labels from a terminator to the worklist.
-fn add_terminator_successors<'a>(
-    terminator: &'a Terminator,
-    worklist: &mut Vec<&'a Label>,
-    named: &'a FxHashMap<Label, Block>,
-) {
-    match terminator {
-        Terminator::Return { .. } | Terminator::Deopt { .. } => {
-            // No successors
-        }
-        Terminator::UnconditionalBranch { target } => {
-            if named.contains_key(target) {
-                worklist.push(target);
-            }
-        }
-        Terminator::ConditionalBranch { true_target, false_target, .. } => {
-            if named.contains_key(true_target) {
-                worklist.push(true_target);
-            }
-            if named.contains_key(false_target) {
-                worklist.push(false_target);
-            }
-        }
-    }
 }
 
 /// Run dead code elimination on a CFG.

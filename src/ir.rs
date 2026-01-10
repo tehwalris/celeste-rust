@@ -476,6 +476,25 @@ impl Terminator {
             },
         }
     }
+
+    /// Get the successor labels of this terminator.
+    ///
+    /// Returns references to all labels this terminator can branch to.
+    /// For Return and Deopt, this returns an empty iterator.
+    /// For UnconditionalBranch, returns a single target.
+    /// For ConditionalBranch, returns both true and false targets.
+    pub fn get_successor_labels(&self) -> impl Iterator<Item = &Label> {
+        let (first, second) = match self {
+            Self::Return { .. } | Self::Deopt { .. } => (None, None),
+            Self::UnconditionalBranch { target } => (Some(target), None),
+            Self::ConditionalBranch {
+                true_target,
+                false_target,
+                ..
+            } => (Some(true_target), Some(false_target)),
+        };
+        first.into_iter().chain(second)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -593,38 +612,14 @@ impl Cfg {
 
         // Add predecessors from each block's terminator
         for (block_id, block) in self.iter_blocks_with_id() {
-            Self::add_successors_as_predecessors(block.terminator_kind(), block_id, &mut preds);
+            for succ_label in block.terminator_kind().get_successor_labels() {
+                if let Some(p) = preds.get_mut(&BlockId::Named(succ_label.clone())) {
+                    p.push(block_id.clone());
+                }
+            }
         }
 
         preds
-    }
-
-    /// Helper to add predecessor edges from a terminator.
-    fn add_successors_as_predecessors(
-        terminator: &Terminator,
-        from: BlockId,
-        preds: &mut FxHashMap<BlockId, Vec<BlockId>>,
-    ) {
-        match terminator {
-            Terminator::Return { .. } | Terminator::Deopt { .. } => {}
-            Terminator::UnconditionalBranch { target } => {
-                if let Some(p) = preds.get_mut(&BlockId::Named(target.clone())) {
-                    p.push(from);
-                }
-            }
-            Terminator::ConditionalBranch {
-                true_target,
-                false_target,
-                ..
-            } => {
-                if let Some(p) = preds.get_mut(&BlockId::Named(true_target.clone())) {
-                    p.push(from.clone());
-                }
-                if let Some(p) = preds.get_mut(&BlockId::Named(false_target.clone())) {
-                    p.push(from);
-                }
-            }
-        }
     }
 }
 
