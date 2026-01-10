@@ -472,7 +472,7 @@ mod tests {
                 // At the join point, we don't know if %1 is valid
                 (LocalId::from(3), Instruction::num_const(0)),
             ],
-            (LocalId::from(96), Terminator::Return { value: Some(LocalId::from(3)) }),
+            (LocalId::from(96), Terminator::ret(Some(LocalId::from(3)))),
         );
 
         let cfg = Cfg {

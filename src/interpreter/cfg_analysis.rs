@@ -1723,7 +1723,7 @@ mod tests {
                     ),
                 ),
             ],
-            (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
+            (LocalId::from(3), Terminator::ret(Some(LocalId::from(2)))),
         ));
 
         let inner_def = FunDef {

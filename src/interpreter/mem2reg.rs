@@ -895,7 +895,7 @@ mod tests {
                     LocalId::from(3),
                 )),
             ],
-            (LocalId::from(5), Terminator::Return { value: Some(LocalId::from(4)) }),
+            (LocalId::from(5), Terminator::ret(Some(LocalId::from(4)))),
         );
 
         let cfg = Cfg::single_entry(entry);
@@ -928,7 +928,7 @@ mod tests {
             vec![
                 (LocalId::from(0), Instruction::num_const(5)),
             ],
-            (LocalId::from(1), Terminator::Return { value: Some(LocalId::from(0)) }),
+            (LocalId::from(1), Terminator::ret(Some(LocalId::from(0)))),
         );
 
         let cfg = Cfg::single_entry(entry);
@@ -994,7 +994,7 @@ mod tests {
                 (LocalId::from(8), Instruction::store(LocalId::from(0), LocalId::from(7))),  // i = i + 1 (SECOND STORE)
                 (LocalId::from(9), Instruction::load(LocalId::from(0))),  // Load modified i
             ],
-            (LocalId::from(10), Terminator::Return { value: Some(LocalId::from(9)) }),
+            (LocalId::from(10), Terminator::ret(Some(LocalId::from(9)))),
         );
 
         let mut named: FxHashMap<Label, Block> = FxHashMap::default();
@@ -1094,7 +1094,7 @@ mod tests {
             vec![
                 (LocalId::from(3), Instruction::load(LocalId::from(0))),
             ],
-            (LocalId::from(30), Terminator::Return { value: Some(LocalId::from(3)) }),
+            (LocalId::from(30), Terminator::ret(Some(LocalId::from(3)))),
         );
 
         let mut named: FxHashMap<Label, Block> = FxHashMap::default();

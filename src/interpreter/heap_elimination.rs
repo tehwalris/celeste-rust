@@ -1701,7 +1701,7 @@ mod tests {
                     Instruction::store(arg0_id, LocalId::from(0)),
                 ),
             ],
-            (LocalId::from(2), Terminator::Return { value: None }),
+            (LocalId::from(2), Terminator::ret(None)),
         );
 
         let cfg = Cfg::single_entry(entry);
@@ -2085,10 +2085,7 @@ mod tests {
                     },
                 ),
             ],
-            (
-                LocalId::from(7),
-                Terminator::Return { value: Some(LocalId::from(6)) },
-            ),
+            (LocalId::from(7), Terminator::ret(Some(LocalId::from(6)))),
         );
 
         let cfg = Cfg::single_entry(entry);
@@ -2343,10 +2340,7 @@ mod tests {
                 ),
                 (LocalId::from(3), Instruction::load(LocalId::from(2))),
             ],
-            (
-                LocalId::from(4),
-                Terminator::Return { value: Some(LocalId::from(3)) },
-            ),
+            (LocalId::from(4), Terminator::ret(Some(LocalId::from(3)))),
         );
 
         let cfg = Cfg::single_entry(entry);

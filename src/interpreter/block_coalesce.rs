@@ -264,17 +264,14 @@ mod tests {
             vec![
                 (LocalId::from(0), Instruction::num_const(5)),
             ],
-            (
-                LocalId::from(1),
-                Terminator::UnconditionalBranch { target: Label::from("block_a".to_string()) },
-            ),
+            (LocalId::from(1), Terminator::branch("block_a")),
         );
 
         let block_a = Block::new_for_test(
             vec![
                 (LocalId::from(2), Instruction::num_const(10)),
             ],
-            (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
+            (LocalId::from(3), Terminator::ret(Some(LocalId::from(2)))),
         );
 
         let mut named: FxHashMap<Label, Block> = FxHashMap::default();
@@ -308,7 +305,7 @@ mod tests {
 
         let block_a = Block::new_for_test(
             vec![],
-            (LocalId::from(2), Terminator::Return { value: None }),
+            (LocalId::from(2), Terminator::ret(None)),
         );
 
         let mut named: FxHashMap<Label, Block> = FxHashMap::default();
@@ -329,27 +326,21 @@ mod tests {
             vec![
                 (LocalId::from(0), Instruction::num_const(1)),
             ],
-            (
-                LocalId::from(1),
-                Terminator::UnconditionalBranch { target: Label::from("block_a".to_string()) },
-            ),
+            (LocalId::from(1), Terminator::branch("block_a")),
         );
 
         let block_a = Block::new_for_test(
             vec![
                 (LocalId::from(2), Instruction::num_const(2)),
             ],
-            (
-                LocalId::from(3),
-                Terminator::UnconditionalBranch { target: Label::from("block_b".to_string()) },
-            ),
+            (LocalId::from(3), Terminator::branch("block_b")),
         );
 
         let block_b = Block::new_for_test(
             vec![
                 (LocalId::from(4), Instruction::num_const(3)),
             ],
-            (LocalId::from(5), Terminator::Return { value: Some(LocalId::from(4)) }),
+            (LocalId::from(5), Terminator::ret(Some(LocalId::from(4)))),
         );
 
         let mut named: FxHashMap<Label, Block> = FxHashMap::default();

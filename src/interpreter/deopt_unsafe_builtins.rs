@@ -138,7 +138,7 @@ mod tests {
                     Instruction::call_builtin("add", vec![LocalId::from(0)]),
                 ),
             ],
-            (LocalId::from(2), Terminator::Return { value: None }),
+            (LocalId::from(2), Terminator::ret(None)),
         );
 
         let cfg = Cfg::single_entry(entry);
