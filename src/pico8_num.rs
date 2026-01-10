@@ -157,6 +157,10 @@ impl Mul for Pico8Num {
 impl Div for Pico8Num {
     type Output = Self;
 
+    // The << 16 is intentional: PICO-8 uses 16.16 fixed-point arithmetic.
+    // Division requires scaling the dividend up by 2^16 before dividing to
+    // preserve the fixed-point representation.
+    #[allow(clippy::suspicious_arithmetic_impl)]
     fn div(self, rhs: Self) -> Self::Output {
         let self_high = (self.0 as i64) << 16;
         Self((self_high.wrapping_div(rhs.0 as i64)) as i32)

@@ -7,6 +7,17 @@ use crate::pico8_num::Pico8Num;
 use anyhow::Result;
 use std::cmp;
 
+/// Rectangle parameters for tile_flag_at queries
+struct TileFlagQuery {
+    room_x: i16,
+    room_y: i16,
+    x: i16,
+    y: i16,
+    w: i16,
+    h: i16,
+    flag: i16,
+}
+
 /// Range for position map
 #[derive(Clone)]
 pub struct PosMapRange {
@@ -108,18 +119,42 @@ impl CollisionCache {
         // Precompute tile_flag_at for different hitbox sizes
         solid_player_hitbox.fill(|x, y| {
             // Player hitbox: x+1, y+3, w=6, h=5
-            Self::tile_flag_at_impl(cart_data, room_x, room_y, x + 1, y + 3, 6, 5, 0)
-                .unwrap_or(false)
+            let query = TileFlagQuery {
+                room_x,
+                room_y,
+                x: x + 1,
+                y: y + 3,
+                w: 6,
+                h: 5,
+                flag: 0,
+            };
+            Self::tile_flag_at_impl(cart_data, &query).unwrap_or(false)
         });
 
         solid_1x1.fill(|x, y| {
-            Self::tile_flag_at_impl(cart_data, room_x, room_y, x, y, 1, 1, 0)
-                .unwrap_or(false)
+            let query = TileFlagQuery {
+                room_x,
+                room_y,
+                x,
+                y,
+                w: 1,
+                h: 1,
+                flag: 0,
+            };
+            Self::tile_flag_at_impl(cart_data, &query).unwrap_or(false)
         });
 
         solid_8x8.fill(|x, y| {
-            Self::tile_flag_at_impl(cart_data, room_x, room_y, x, y, 8, 8, 0)
-                .unwrap_or(false)
+            let query = TileFlagQuery {
+                room_x,
+                room_y,
+                x,
+                y,
+                w: 8,
+                h: 8,
+                flag: 0,
+            };
+            Self::tile_flag_at_impl(cart_data, &query).unwrap_or(false)
         });
 
         Ok(Self {
@@ -170,30 +205,30 @@ impl CollisionCache {
         }
 
         // Fall back to computation
-        Self::tile_flag_at_impl(cart_data, self.room_x, self.room_y, x, y, w, h, 0)
+        let query = TileFlagQuery {
+            room_x: self.room_x,
+            room_y: self.room_y,
+            x,
+            y,
+            w,
+            h,
+            flag: 0,
+        };
+        Self::tile_flag_at_impl(cart_data, &query)
     }
 
     /// Implementation of tile_flag_at - checks if any tile in the rectangle has the given flag
-    fn tile_flag_at_impl(
-        cart_data: &CartData,
-        room_x: i16,
-        room_y: i16,
-        x: i16,
-        y: i16,
-        w: i16,
-        h: i16,
-        flag: i16,
-    ) -> Result<bool> {
-        let tile_min_x = cmp::max(0, x / 8);
-        let tile_max_x = cmp::min(15, (x + w - 1) / 8);
-        let tile_min_y = cmp::max(0, y / 8);
-        let tile_max_y = cmp::min(15, (y + h - 1) / 8);
+    fn tile_flag_at_impl(cart_data: &CartData, query: &TileFlagQuery) -> Result<bool> {
+        let tile_min_x = cmp::max(0, query.x / 8);
+        let tile_max_x = cmp::min(15, (query.x + query.w - 1) / 8);
+        let tile_min_y = cmp::max(0, query.y / 8);
+        let tile_max_y = cmp::min(15, (query.y + query.h - 1) / 8);
 
         for ty in tile_min_y..=tile_max_y {
             for tx in tile_min_x..=tile_max_x {
                 // Get tile at room-relative position
-                let world_tx = room_x * 16 + tx;
-                let world_ty = room_y * 16 + ty;
+                let world_tx = query.room_x * 16 + tx;
+                let world_ty = query.room_y * 16 + ty;
 
                 let tile = cart_data.mget(
                     Pico8Num::from_i16(world_tx),
@@ -202,7 +237,7 @@ impl CollisionCache {
 
                 if cart_data.fget(
                     Pico8Num::from_i16(tile as i16),
-                    Pico8Num::from_i16(flag),
+                    Pico8Num::from_i16(query.flag),
                 )? {
                     return Ok(true);
                 }
