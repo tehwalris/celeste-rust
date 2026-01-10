@@ -544,7 +544,12 @@ pub fn optimize_all_functions(
             &external_ids,
         );
         if !validation_result.is_valid() {
-            eprintln!("Warning: Skipping {} - validation failed: {} errors", fn_name, validation_result.errors.len());
+            eprintln!(
+                "Warning: Skipping {} - validation failed: {} errors\n  First few: {:?}",
+                fn_name,
+                validation_result.errors.len(),
+                validation_result.errors.iter().take(3).collect::<Vec<_>>()
+            );
             continue;
         }
 
@@ -558,7 +563,12 @@ pub fn optimize_all_functions(
                         &external_ids,
                     );
                     if !validation.is_valid() {
-                        eprintln!("Warning: Skipping {} - mem2reg validation failed: {} errors", fn_name, validation.errors.len());
+                        eprintln!(
+                            "Warning: Skipping {} - mem2reg validation failed: {} errors\n  First few: {:?}",
+                            fn_name,
+                            validation.errors.len(),
+                            validation.errors.iter().take(3).collect::<Vec<_>>()
+                        );
                         continue;
                     }
                     cfg
@@ -577,7 +587,13 @@ pub fn optimize_all_functions(
                     &external_ids,
                 );
                 if !validation.is_valid() {
-                    eprintln!("Warning: Skipping {} - {} validation failed: {} errors", fn_name, $context, validation.errors.len());
+                    eprintln!(
+                        "Warning: Skipping {} - {} validation failed: {} errors\n  First few: {:?}",
+                        fn_name,
+                        $context,
+                        validation.errors.len(),
+                        validation.errors.iter().take(3).collect::<Vec<_>>()
+                    );
                     continue 'function_loop;
                 }
             }};
