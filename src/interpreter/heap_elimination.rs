@@ -125,6 +125,12 @@ pub struct HeapShape {
     pub args: Vec<Option<ValueShape>>,
 }
 
+impl Default for HeapShape {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HeapShape {
     pub fn new() -> Self {
         HeapShape {
@@ -1137,7 +1143,7 @@ pub fn eliminate_heap(
     // Initialize arg mappings - map argument LocalIds to their slots
     for (index, maybe_arg_id) in arg_ids.iter().enumerate() {
         if let Some(arg_id) = maybe_arg_id {
-            if shape.args.get(index).map_or(false, |s| s.is_some()) {
+            if shape.args.get(index).is_some_and(|s| s.is_some()) {
                 let slot = HeapSlot::new(HeapPath::Arg(index));
                 id_mapping.set_slot(*arg_id, slot);
             }

@@ -357,7 +357,7 @@ _draw()
         state = reset_result.into_iter().next().unwrap().0;
 
         // Print state
-        let freeze = get_freeze(&state).map(|n| format_num(n)).unwrap_or("?".to_string());
+        let freeze = get_freeze(&state).map(format_num).unwrap_or("?".to_string());
 
         if let Some((x, y)) = get_player_position(&state) {
             let (spd_x, spd_y) = get_player_speed(&state).unwrap_or((Pico8Num::from_i16(0), Pico8Num::from_i16(0)));

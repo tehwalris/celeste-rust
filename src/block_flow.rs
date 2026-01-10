@@ -108,18 +108,18 @@ impl<T, B: BoundSplitBlockFlow<T>> BoundMergedBlockFlow<T, B> {
         liveness: &LivenessAnalysisResult,
         edge: &(FlowNode, FlowNode),
     ) -> Result<BoundMergedBlockFlow<T, B>> {
-        let parts = match edge {
-            &(FlowNode::BeforeEntryBlock, FlowNode::AfterEntryBlock) => {
+        let parts = match *edge {
+            (FlowNode::BeforeEntryBlock, FlowNode::AfterEntryBlock) => {
                 vec![unbound_split_block_flow.flow_block_post_phi(&cfg.entry)?]
             }
-            &(FlowNode::BeforeNamedBlock(index), FlowNode::AfterNamedBlock(other_index))
+            (FlowNode::BeforeNamedBlock(index), FlowNode::AfterNamedBlock(other_index))
                 if index == other_index =>
             {
                 let name = &labels[index];
                 let block = cfg.named.get(name).unwrap();
                 vec![unbound_split_block_flow.flow_block_post_phi(block)?]
             }
-            &(FlowNode::AfterEntryBlock, FlowNode::BeforeNamedBlock(target_index)) => {
+            (FlowNode::AfterEntryBlock, FlowNode::BeforeNamedBlock(target_index)) => {
                 let target_name = &labels[target_index];
                 let (_, terminator) = &cfg.entry.terminator;
                 let target_block = cfg.named.get(target_name).unwrap();
@@ -128,7 +128,7 @@ impl<T, B: BoundSplitBlockFlow<T>> BoundMergedBlockFlow<T, B> {
                     unbound_split_block_flow.flow_block_before_join(liveness, target_block)?,
                 ]
             }
-            &(
+            (
                 FlowNode::AfterNamedBlock(source_index),
                 FlowNode::BeforeNamedBlock(target_index),
             ) => {
@@ -143,11 +143,11 @@ impl<T, B: BoundSplitBlockFlow<T>> BoundMergedBlockFlow<T, B> {
                     unbound_split_block_flow.flow_block_before_join(liveness, target_block)?,
                 ]
             }
-            &(FlowNode::AfterEntryBlock, FlowNode::Return) => {
+            (FlowNode::AfterEntryBlock, FlowNode::Return) => {
                 let (_, terminator) = &cfg.entry.terminator;
                 vec![unbound_split_block_flow.flow_return(terminator)?]
             }
-            &(FlowNode::AfterNamedBlock(source_index), FlowNode::Return) => {
+            (FlowNode::AfterNamedBlock(source_index), FlowNode::Return) => {
                 let source_name = &labels[source_index];
                 let source_block = cfg.named.get(source_name).unwrap();
                 let (_, terminator) = &source_block.terminator;
@@ -165,7 +165,7 @@ impl<T, B: BoundSplitBlockFlow<T>> BoundMergedBlockFlow<T, B> {
     fn flow_required(&self, v: T) -> Result<T> {
         self.parts
             .iter()
-            .fold(Ok(v), |v, part| v.and_then(|v| part.flow(v)))
+            .try_fold(v, |v, part| part.flow(v))
     }
 }
 

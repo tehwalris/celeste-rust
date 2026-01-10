@@ -339,10 +339,7 @@ impl Compiler {
                                 result_stream,
                             ]);
                             current_id = result_id;
-                            current_hint = match current_hint {
-                                Some(h) => Some(format!("{}()", h)),
-                                None => None,
-                            };
+                            current_hint = current_hint.map(|h| format!("{}()", h));
                         }
                         ast::Suffix::Call(_) => {
                             bail!("unsupported call type in suffix chain (expected parentheses call)");
@@ -584,7 +581,7 @@ impl Compiler {
 
         let sorted_outer_locals: Vec<_> = locals
             .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(k, v)| (k.clone(), *v))
             .sorted_by_key(|(k, _)| k.clone())
             .collect();
 
@@ -625,10 +622,7 @@ impl Compiler {
         let outer_capture_ids: Vec<_> = sorted_outer_locals
             .iter()
             .zip_eq(inner_capture_ids_remapped.iter())
-            .filter_map(|((_, outer_id), inner_id)| match inner_id {
-                Some(_) => Some(*outer_id),
-                None => None,
-            })
+            .filter_map(|((_, outer_id), inner_id)| inner_id.as_ref().map(|_| *outer_id))
             .collect();
 
         let global_name = self.global_id_generator.next(base_name);
@@ -636,7 +630,7 @@ impl Compiler {
             name: global_name.clone(),
             capture_ids: inner_capture_ids_remapped
                 .into_iter()
-                .filter_map(|id| id)
+                .flatten()
                 .collect(),
             arg_ids: inner_arg_val_ids
                 .into_iter()
@@ -651,7 +645,7 @@ impl Compiler {
             inner_build_result
                 .fun_defs
                 .into_iter()
-                .map(|fun_def| StreamElement::Function(fun_def))
+                .map(StreamElement::Function)
                 .collect(),
         );
         outer_stream.0.push(StreamElement::Function(fun_def));
@@ -702,7 +696,7 @@ impl Compiler {
                             let (value_id, _, value_stream) = self.compile_rhs_expression(
                                 value,
                                 locals,
-                                hint.as_ref().map(|s| s.as_str()),
+                                hint.as_deref(),
                             )?;
                             stream.0.extend(value_stream.0);
                             stream.0.push(StreamElement::Instruction(
@@ -836,10 +830,7 @@ impl Compiler {
                 ))
             }
             ast::Expression::Function((_, function)) => {
-                let name = match hint_from_parent {
-                    Some(name) => name,
-                    None => "anonymous",
-                };
+                let name = hint_from_parent.unwrap_or("anonymous");
                 let source_span = extract_span(function);
                 let (id, stream) = self.compile_closure(function, name, locals, source_span)?;
                 Ok((id, None, stream))
@@ -1011,7 +1002,7 @@ impl Compiler {
                         .exactly_one()
                         .or(Err(anyhow!("expected exactly one expression")))?,
                     &locals,
-                    lhs_hint.as_ref().map(|s| s.as_str()),
+                    lhs_hint.as_deref(),
                 )?;
                 let stream = Stream::from_streams(vec![
                     lhs_stream,

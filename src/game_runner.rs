@@ -257,7 +257,7 @@ fn builtin_split_by_flr(state: State, args: Vec<Value>) -> Result<Vec<(State, Va
                 // Collect the intersected intervals (non-None values)
                 let result_intervals: Vec<Pico8NumInterval> = intersections
                     .into_iter()
-                    .filter_map(|opt| opt)
+                    .flatten()
                     .collect();
 
                 let result_value = if result_intervals.len() == 1 {

@@ -660,9 +660,10 @@ fn dedup_vectorized_state(mut state: State) -> State {
     let mut mask = vec![false; state.vector_size];
     let mut unique_count = 0;
 
+    #[allow(clippy::needless_range_loop)] // We need the index for multiple purposes
     for i in 0..state.vector_size {
         let row_hash = hash_row(&vector_values, i);
-        let indices = hash_to_indices.entry(row_hash).or_insert_with(Vec::new);
+        let indices = hash_to_indices.entry(row_hash).or_default();
 
         // Check if this row matches any existing row with the same hash
         let is_duplicate = indices.iter().any(|&prev_idx| rows_equal(&vector_values, prev_idx, i));
@@ -910,7 +911,7 @@ pub struct VectorizeTimingStats {
 }
 
 thread_local! {
-    static LAST_VECTORIZE_STATS: std::cell::RefCell<Option<VectorizeTimingStats>> = std::cell::RefCell::new(None);
+    static LAST_VECTORIZE_STATS: std::cell::RefCell<Option<VectorizeTimingStats>> = const { std::cell::RefCell::new(None) };
 }
 
 pub fn get_last_vectorize_stats() -> Option<VectorizeTimingStats> {
@@ -942,8 +943,10 @@ impl Clone for VectorizeTimingStats {
 /// 4. Deduplicates rows within each merged state
 pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
     let _trace = TraceSpan::new("vectorize_states", "vectorize");
-    let mut stats = VectorizeTimingStats::default();
-    stats.input_count = states.len();
+    let mut stats = VectorizeTimingStats {
+        input_count: states.len(),
+        ..Default::default()
+    };
 
     // GC all states before shape grouping.
     // This removes garbage from heaps, allowing states to match shapes better.
@@ -978,7 +981,7 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
         let _trace_shape = TraceSpan::new("shape_grouping", "vectorize");
         for state in states {
             let shape = shape_of_state(&state);
-            states_by_shape.entry(shape).or_insert_with(Vec::new).push(state);
+            states_by_shape.entry(shape).or_default().push(state);
         }
     }
     stats.shape_grouping_ns = t2.elapsed().as_nanos() as u64;
@@ -989,9 +992,7 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
     let t3 = std::time::Instant::now();
     let result: Vec<State> = {
         let _trace_merge = TraceSpan::new("merge_groups", "vectorize");
-        states_by_shape
-            .into_iter()
-            .map(|(_, group)| {
+        states_by_shape.into_values().map(|group| {
                 let vectorized = vectorize_same_shape_states(group);
                 let deduped = dedup_vectorized_state(vectorized);
                 unvectorize_if_possible(deduped)

@@ -55,7 +55,7 @@ pub fn parse_tas_string(s: &str) -> Result<Vec<InputFlags>> {
         inputs.push(InputFlags::from_tas_keycode(keycode)?)
     }
 
-    while let Some(_) = p.try_take_char(|c| c.is_ascii_whitespace()) {}
+    while p.try_take_char(|c| c.is_ascii_whitespace()).is_some() {}
 
     if p.done() {
         Ok(inputs)

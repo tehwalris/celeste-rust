@@ -21,6 +21,12 @@ pub struct SlotMapping {
     pub known_slots: FxHashMap<LocalId, HeapSlot>,
 }
 
+impl Default for SlotMapping {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SlotMapping {
     pub fn new() -> Self {
         Self {
@@ -118,11 +124,9 @@ fn is_slot_in_shape(slot: &HeapSlot, shape: &HeapShape, arg_shapes: &[Option<Val
         HeapPath::Global(name) => shape.globals.contains_key(name),
         HeapPath::Field(base, _) => {
             // Check if the path leads to a known shape
-            if let Some(val_shape) = get_shape_at_path(slot.path(), shape, arg_shapes) {
-                !matches!(val_shape, None)
-            } else {
-                false
-            }
+            get_shape_at_path(slot.path(), shape, arg_shapes)
+                .map(|val_shape| val_shape.is_some())
+                .unwrap_or(false)
         }
         HeapPath::Arg(idx) => {
             arg_shapes.get(*idx).map(|s| s.is_some()).unwrap_or(false)
@@ -144,10 +148,10 @@ fn get_shape_at_path<'a>(
         HeapPath::Global(name) => Some(shape.globals.get(name)),
         HeapPath::Arg(idx) => Some(arg_shapes.get(*idx).and_then(|s| s.as_ref())),
         HeapPath::Field(base, field) => {
-            if let Some(Some(base_shape)) = get_shape_at_path(base, shape, arg_shapes) {
-                if let ValueShape::Table(fields) = base_shape {
-                    return Some(fields.get(field));
-                }
+            if let Some(Some(ValueShape::Table(fields))) =
+                get_shape_at_path(base, shape, arg_shapes)
+            {
+                return Some(fields.get(field));
             }
             Some(None)
         }
@@ -167,11 +171,7 @@ fn get_closure_from_slot(
 ) -> Option<(GlobalId, bool)> {  // Returns (fun_name, has_captures)
     // Convert slot path to the format used by GlobalClosureMap (e.g., "_G.foo" -> "foo")
     let slot_key = slot.to_string();
-    let global_key = if slot_key.starts_with("_G.") {
-        &slot_key[3..]  // Strip "_G." prefix
-    } else {
-        &slot_key[..]
-    };
+    let global_key = slot_key.strip_prefix("_G.").unwrap_or(&slot_key);
 
     if let Some(closure_info) = global_closure_map.get(global_key) {
         // Found in GlobalClosureMap - return actual function name

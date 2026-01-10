@@ -220,8 +220,7 @@ impl<'a> CoreInterpreter<'a> {
                             if index as usize != 1 {
                                 return Err(anyhow!("Index is not the next index in the array"));
                             }
-                            let mut fields = Vec::new();
-                            fields.push(field_heap_id);
+                            let fields = vec![field_heap_id];
                             self.state
                                 .heap
                                 .set(table_heap_id, HeapValue::ArrayTable(fields));

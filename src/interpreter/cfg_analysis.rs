@@ -141,10 +141,10 @@ fn cleanup_phis_with_undefined_locals(cfg: &Cfg, predefined_locals: &[LocalId]) 
         }
     }
 
-    let final_entry = remap_block(&new_entry, &remap);
+    let final_entry = remap_block(&new_entry, remap);
     let final_named: FxHashMap<_, _> = new_named
         .into_iter()
-        .map(|(label, block)| (label, remap_block(&block, &remap)))
+        .map(|(label, block)| (label, remap_block(&block, remap)))
         .collect();
 
     Cfg {
@@ -418,7 +418,7 @@ pub fn analyze_cfg(cfg: &Cfg) -> CfgAnalysisResult {
     result.instruction_counts.total_blocks += 1;
 
     // Analyze named blocks
-    for (_, block) in &cfg.named {
+    for block in cfg.named.values() {
         analyze_block(block, &mut result, &mut accessed_globals, &mut called_closures);
         result.instruction_counts.total_blocks += 1;
     }
@@ -907,7 +907,7 @@ pub fn optimize_all_functions(
             capture_ids: original_fun_def.capture_ids.clone(),
             arg_ids: original_fun_def.arg_ids.clone(),
             cfg: current_cfg.clone(),
-            source_span: original_fun_def.source_span.clone(),
+            source_span: original_fun_def.source_span,
         };
         optimized.insert(name.clone(), optimized_fun_def);
 
@@ -1878,6 +1878,12 @@ pub struct CfgTestCase {
 pub struct CfgTestCases {
     pub test_cases: Vec<CfgTestCase>,
     pub generated_at: String,
+}
+
+impl Default for CfgTestCases {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CfgTestCases {

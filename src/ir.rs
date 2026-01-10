@@ -41,6 +41,12 @@ pub struct LocalIdGenerator {
     next_id: usize,
 }
 
+impl Default for LocalIdGenerator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LocalIdGenerator {
     pub fn new() -> Self {
         Self { next_id: 0 }
@@ -71,6 +77,12 @@ impl LocalIdGenerator {
 pub struct UniqueStringGenerator<T: From<String>> {
     _item_type: std::marker::PhantomData<T>,
     next_id: usize,
+}
+
+impl<T: From<String>> Default for UniqueStringGenerator<T> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<T: From<String>> UniqueStringGenerator<T> {
@@ -293,7 +305,7 @@ impl Instruction {
             } => Self::GetIndex {
                 receiver: f(receiver),
                 index: f(index),
-                create_if_missing: create_if_missing,
+                create_if_missing,
             },
             Self::NumberConstant { value } => Self::NumberConstant { value: *value },
             Self::BoolConstant { value } => Self::BoolConstant { value: *value },
@@ -319,12 +331,12 @@ impl Instruction {
                 args: args.iter().map(|id| f(*id)).collect(),
             },
             Self::UnaryOp { op, arg } => Self::UnaryOp {
-                op: op.clone(),
+                op: *op,
                 arg: f(*arg),
             },
             Self::BinaryOp { left, op, right } => Self::BinaryOp {
                 left: f(*left),
-                op: op.clone(),
+                op: *op,
                 right: f(*right),
             },
             Self::Phi { branches } => Self::Phi {
@@ -365,7 +377,7 @@ impl Terminator {
     pub fn map_local_ids(&self, mut f: impl FnMut(LocalId) -> LocalId) -> Self {
         match self {
             Self::Return { value } => Self::Return {
-                value: value.map(|id| f(id)),
+                value: value.map(&mut f),
             },
             Self::UnconditionalBranch { target } => Self::UnconditionalBranch {
                 target: target.clone(),
@@ -399,9 +411,8 @@ impl Block {
     pub fn split_block_phi_instructions(
         &self,
     ) -> (&[(LocalId, Instruction)], &[(LocalId, Instruction)]) {
-        let is_phi = |id_and_instr| match id_and_instr {
-            &(_, Instruction::Phi { .. }) => true,
-            _ => false,
+        let is_phi = |id_and_instr: &(LocalId, Instruction)| {
+            matches!(id_and_instr, (_, Instruction::Phi { .. }))
         };
 
         // Find the first non-phi instruction

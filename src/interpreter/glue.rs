@@ -221,7 +221,7 @@ fn interpret_prepared_cfg_inner(
     // Create profiling guard for this fixed-point invocation (full profiler)
     let fp_guard = FixedPointGuard::new(name.clone());
     let _span = SpanGuard::new_with_source(
-        &name.as_deref().unwrap_or("interpret_cfg"),
+        name.as_deref().unwrap_or("interpret_cfg"),
         "fixed_point",
         source_span.as_ref(),
     );

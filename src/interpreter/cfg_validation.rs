@@ -480,7 +480,7 @@ pub fn validate_types(cfg: &Cfg, arg_types: &[(LocalId, SsaType)]) -> Vec<Valida
     collect_types(&cfg.entry, &mut local_types);
 
     // Collect types from named blocks
-    for (_, block) in &cfg.named {
+    for block in cfg.named.values() {
         collect_types(block, &mut local_types);
     }
 

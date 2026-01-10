@@ -132,6 +132,10 @@ impl Heap {
         self.next_id
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.next_id == 0
+    }
+
     pub fn alloc(&mut self) -> HeapId {
         let id = HeapId(self.next_id);
         self.next_id += 1;

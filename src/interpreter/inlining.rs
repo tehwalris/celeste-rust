@@ -268,7 +268,7 @@ fn inline_calls_in_block(
                     // Now we need to handle the rest of the current block's instructions
                     // after the call. These go into the continuation block.
                     let remaining_instructions: Vec<_> =
-                        block.instructions[i + 1..].iter().cloned().collect();
+                        block.instructions[i + 1..].to_vec();
 
                     // Build the continuation block with a phi node for the return value
                     let mut continuation_instructions = Vec::new();

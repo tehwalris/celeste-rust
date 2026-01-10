@@ -430,6 +430,12 @@ pub struct HeapMarks {
     pub marks: HashMap<String, HashSet<HeapId>>,
 }
 
+impl Default for HeapMarks {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HeapMarks {
     pub fn new() -> Self {
         Self {
@@ -440,7 +446,7 @@ impl HeapMarks {
     pub fn add_mark(&mut self, mark_name: &str, heap_id: HeapId) {
         self.marks
             .entry(mark_name.to_string())
-            .or_insert_with(HashSet::new)
+            .or_default()
             .insert(heap_id);
     }
 }

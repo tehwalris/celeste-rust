@@ -87,6 +87,12 @@ impl<'de> Deserialize<'de> for State {
     }
 }
 
+impl Default for State {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl State {
     pub fn new() -> Self {
         Self {
@@ -237,7 +243,7 @@ impl State {
                     HeapValue::ObjectTable(new_table)
                 }
                 HeapValue::ArrayTable(items) => {
-                    HeapValue::ArrayTable(items.into_iter().map(|id| f(id)).collect())
+                    HeapValue::ArrayTable(items.into_iter().map(&mut f).collect())
                 }
                 HeapValue::UnknownTable => HeapValue::UnknownTable,
                 HeapValue::Closure(id, captures) => {

@@ -73,7 +73,7 @@ pub fn count_true(mask: &[bool]) -> usize {
 }
 
 #[inline]
-fn filter_vec_by_mask<T: Clone + PartialEq>(vec: Vec<T>, mask: &[bool], true_count: usize) -> MaybeVector<T>
+fn filter_vec_by_mask<T>(vec: Vec<T>, mask: &[bool], true_count: usize) -> MaybeVector<T>
 where
     T: std::fmt::Debug + Clone + PartialEq + Eq,
 {
@@ -99,7 +99,7 @@ where
 
 /// Filter a vector by mask, cloning elements (for use with references)
 #[inline]
-fn filter_vec_by_mask_ref<T: Clone + PartialEq>(vec: &[T], mask: &[bool], true_count: usize) -> MaybeVector<T>
+fn filter_vec_by_mask_ref<T>(vec: &[T], mask: &[bool], true_count: usize) -> MaybeVector<T>
 where
     T: std::fmt::Debug + Clone + PartialEq + Eq,
 {

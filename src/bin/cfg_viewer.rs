@@ -108,7 +108,7 @@ fn main() -> Result<()> {
                 capture_ids: fd.capture_ids.clone(),
                 arg_ids: fd.arg_ids.clone(),
                 cfg: optimized_cfg,
-                source_span: fd.source_span.clone(),
+                source_span: fd.source_span,
             };
             (fd.name.clone(), optimized_fd)
         })
@@ -198,33 +198,21 @@ fn main() -> Result<()> {
             HeapEliminationStatus::Failed(_) => stats.heap_elim_failed += 1,
             _ => {}
         }
-        match &opt_result.block_coalesce {
-            BlockCoalesceStatus::Success { blocks_removed } => {
-                stats.block_coalesce_success += 1;
-                stats.blocks_removed += blocks_removed;
-            }
-            _ => {}
+        if let BlockCoalesceStatus::Success { blocks_removed } = &opt_result.block_coalesce {
+            stats.block_coalesce_success += 1;
+            stats.blocks_removed += blocks_removed;
         }
-        match &opt_result.call_resolution {
-            CallResolutionStatus::Success { calls_resolved } => {
-                stats.call_resolution_success += 1;
-                stats.calls_resolved += calls_resolved;
-            }
-            _ => {}
+        if let CallResolutionStatus::Success { calls_resolved } = &opt_result.call_resolution {
+            stats.call_resolution_success += 1;
+            stats.calls_resolved += calls_resolved;
         }
-        match &opt_result.inlining {
-            InliningStatus::Success { calls_inlined } => {
-                stats.inlining_success += 1;
-                stats.calls_inlined += calls_inlined;
-            }
-            _ => {}
+        if let InliningStatus::Success { calls_inlined } = &opt_result.inlining {
+            stats.inlining_success += 1;
+            stats.calls_inlined += calls_inlined;
         }
-        match &opt_result.dce {
-            DceStatus::Success { instructions_removed } => {
-                stats.dce_success += 1;
-                stats.instructions_removed += instructions_removed;
-            }
-            _ => {}
+        if let DceStatus::Success { instructions_removed } = &opt_result.dce {
+            stats.dce_success += 1;
+            stats.instructions_removed += instructions_removed;
         }
 
         if args.verbose {

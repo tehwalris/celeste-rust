@@ -77,6 +77,12 @@ pub struct FixedEnv {
     optimize_cfgs: bool,
 }
 
+impl Default for FixedEnv {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FixedEnv {
     pub fn new() -> Self {
         Self {

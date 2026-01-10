@@ -155,11 +155,11 @@ pub fn save_slow_call(path: &str) -> std::io::Result<bool> {
     let slow_call = CAPTURE_STATE.lock().unwrap().slow_call.clone();
     if let Some(call) = slow_call {
         let json = serde_json::to_string(&call).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, e)
+            std::io::Error::other(e)
         })?;
         // Compress with zstd
         let compressed = zstd::encode_all(json.as_bytes(), 3).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, e)
+            std::io::Error::other(e)
         })?;
         std::fs::write(path, &compressed)?;
         eprintln!("[input_capture] Saved slow call to {} ({} bytes)", path, compressed.len());
@@ -173,10 +173,10 @@ pub fn save_slow_call(path: &str) -> std::io::Result<bool> {
 pub fn load_slow_call(path: &str) -> std::io::Result<CapturedSlowCall> {
     let compressed = std::fs::read(path)?;
     let json = zstd::decode_all(&compressed[..]).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::Other, e)
+        std::io::Error::other(e)
     })?;
     let call: CapturedSlowCall = serde_json::from_slice(&json).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::Other, e)
+        std::io::Error::other(e)
     })?;
     Ok(call)
 }

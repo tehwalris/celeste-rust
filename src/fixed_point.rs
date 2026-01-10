@@ -158,15 +158,13 @@ where
 
                 if let Some(data_acc) = m_data_acc[wl_node].as_mut() {
                     let (data_acc_new, actually_new) =
-                        self.analysis.accumulate(&data_acc, &potentially_new);
+                        self.analysis.accumulate(data_acc, &potentially_new);
                     if !self.analysis.is_empty(&actually_new) {
                         *data_acc = data_acc_new;
                         process_successors(actually_new);
                     }
-                } else {
-                    if !self.analysis.is_empty(&potentially_new) {
-                        process_successors(potentially_new);
-                    }
+                } else if !self.analysis.is_empty(&potentially_new) {
+                    process_successors(potentially_new);
                 }
             }
         }
