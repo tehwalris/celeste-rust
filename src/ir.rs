@@ -428,6 +428,49 @@ impl Instruction {
         }
     }
 
+    /// Test helper to create a NilConstant instruction.
+    ///
+    /// This is a convenience method for tests that need to create nil
+    /// constants. It's more concise than `Instruction::NilConstant`.
+    #[cfg(test)]
+    pub fn nil_const() -> Self {
+        Self::NilConstant
+    }
+
+    /// Test helper to create a StringConstant instruction.
+    ///
+    /// This is a convenience method for tests that need to create string
+    /// constants. It's more concise than `Instruction::StringConstant { value: "...".to_string() }`.
+    #[cfg(test)]
+    pub fn string_const(value: &str) -> Self {
+        Self::StringConstant {
+            value: value.to_string(),
+        }
+    }
+
+    /// Test helper to create a StoreEmptyTable instruction.
+    ///
+    /// This is a convenience method for tests that need to create store_empty_table
+    /// instructions. It's more concise than the verbose struct literal.
+    #[cfg(test)]
+    pub fn store_empty_table(target: LocalId) -> Self {
+        Self::StoreEmptyTable { target }
+    }
+
+    /// Test helper to create a StoreClosure instruction.
+    ///
+    /// This is a convenience method for tests that need to create store_closure
+    /// instructions. It's more concise than the verbose struct literal with
+    /// `GlobalId::from()`.
+    #[cfg(test)]
+    pub fn store_closure(target: LocalId, fun_def: &str, captures: Vec<LocalId>) -> Self {
+        Self::StoreClosure {
+            target,
+            fun_def: GlobalId::from(fun_def.to_string()),
+            captures,
+        }
+    }
+
     /// Get all local IDs used by this instruction.
     ///
     /// This returns all LocalIds that this instruction reads from (its operands).
@@ -782,6 +825,17 @@ impl Terminator {
             condition,
             true_target: Label::from(true_target.to_string()),
             false_target: Label::from(false_target.to_string()),
+        }
+    }
+
+    /// Test helper to create a Deopt terminator.
+    ///
+    /// This is a convenience method for tests that need to create deopt
+    /// terminators. It's more concise than `Terminator::Deopt { reason: "...".to_string() }`.
+    #[cfg(test)]
+    pub fn deopt(reason: &str) -> Self {
+        Self::Deopt {
+            reason: reason.to_string(),
         }
     }
 

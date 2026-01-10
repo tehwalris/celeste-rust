@@ -366,7 +366,7 @@ mod tests {
         // Block A now has Deopt terminator (doesn't branch to join anymore)
         let block_a = Block::new_for_test(
             vec![(LocalId::from(1), Instruction::num_const(1))],
-            (LocalId::from(10), Terminator::Deopt { reason: "test".to_string() }),
+            (LocalId::from(10), Terminator::deopt("test")),
         );
 
         // Block B still branches to join
@@ -423,12 +423,12 @@ mod tests {
 
         let block_a = Block::new_for_test(
             vec![(LocalId::from(1), Instruction::num_const(1))],
-            (LocalId::from(10), Terminator::Deopt { reason: "a".to_string() }),
+            (LocalId::from(10), Terminator::deopt("a")),
         );
 
         let block_b = Block::new_for_test(
             vec![(LocalId::from(2), Instruction::num_const(2))],
-            (LocalId::from(11), Terminator::Deopt { reason: "b".to_string() }),
+            (LocalId::from(11), Terminator::deopt("b")),
         );
 
         let join = Block::new_for_test(
@@ -489,7 +489,7 @@ mod tests {
 
         let block_a = Block::new_for_test(
             vec![(LocalId::from(1), Instruction::num_const(1))],
-            (LocalId::from(10), Terminator::Deopt { reason: "a".to_string() }), // Deopt'd!
+            (LocalId::from(10), Terminator::deopt("a")), // Deopt'd!
         );
 
         let block_b = Block::new_for_test(
