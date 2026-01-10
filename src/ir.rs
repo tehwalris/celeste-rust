@@ -1155,6 +1155,29 @@ impl Cfg {
             named: crate::interpreter::common::FxHashMap::default(),
         }
     }
+
+    /// Test helper to create a CFG with named blocks.
+    ///
+    /// Takes an entry block and an array of (label, block) pairs for named blocks.
+    /// This simplifies the common test pattern of building CFGs with control flow.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let cfg = Cfg::with_blocks(entry, [
+    ///     ("block_a", block_a),
+    ///     ("block_b", block_b),
+    /// ]);
+    /// ```
+    #[cfg(test)]
+    pub fn with_blocks<const N: usize>(entry: Block, named_blocks: [(&str, Block); N]) -> Self {
+        Self {
+            entry,
+            named: named_blocks
+                .into_iter()
+                .map(|(label, block)| (Label::from(label.to_string()), block))
+                .collect(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

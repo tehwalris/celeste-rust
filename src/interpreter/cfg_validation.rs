@@ -452,26 +452,18 @@ mod tests {
 
     #[test]
     fn test_duplicate_definition() {
-        let mut named = FxHashMap::default();
-        named.insert(
-            Label::from("block1".to_string()),
-            Block::new_for_test(
-                vec![
-                    (LocalId::from(0), Instruction::num_const(1)), // Same ID as entry
-                ],
-                (LocalId::from(2), Terminator::ret(Some(LocalId::from(0)))),
-            ),
+        let entry = Block::new_for_test(
+            vec![(LocalId::from(0), Instruction::num_const(42))],
+            (LocalId::from(1), Terminator::branch("block1")),
+        );
+        let block1 = Block::new_for_test(
+            vec![
+                (LocalId::from(0), Instruction::num_const(1)), // Same ID as entry
+            ],
+            (LocalId::from(2), Terminator::ret(Some(LocalId::from(0)))),
         );
 
-        let cfg = Cfg {
-            entry: Block::new_for_test(
-                vec![
-                    (LocalId::from(0), Instruction::num_const(42)),
-                ],
-                (LocalId::from(1), Terminator::branch("block1")),
-            ),
-            named,
-        };
+        let cfg = Cfg::with_blocks(entry, [("block1", block1)]);
 
         let result = validate_cfg(&cfg);
         assert!(!result.is_valid());
@@ -480,27 +472,19 @@ mod tests {
 
     #[test]
     fn test_phi_references_nonexistent_block() {
-        let mut named = FxHashMap::default();
-        named.insert(
-            Label::from("join".to_string()),
-            Block::new_for_test(
-                vec![(
-                    LocalId::from(2),
-                    Instruction::phi(vec![(Label::from("nonexistent".to_string()), LocalId::from(0))]),
-                )],
-                (LocalId::from(3), Terminator::ret(Some(LocalId::from(2)))),
-            ),
+        let entry = Block::new_for_test(
+            vec![(LocalId::from(0), Instruction::num_const(42))],
+            (LocalId::from(1), Terminator::branch("join")),
+        );
+        let join = Block::new_for_test(
+            vec![(
+                LocalId::from(2),
+                Instruction::phi(vec![(Label::from("nonexistent".to_string()), LocalId::from(0))]),
+            )],
+            (LocalId::from(3), Terminator::ret(Some(LocalId::from(2)))),
         );
 
-        let cfg = Cfg {
-            entry: Block::new_for_test(
-                vec![
-                    (LocalId::from(0), Instruction::num_const(42)),
-                ],
-                (LocalId::from(1), Terminator::branch("join")),
-            ),
-            named,
-        };
+        let cfg = Cfg::with_blocks(entry, [("join", join)]);
 
         let result = validate_cfg(&cfg);
         assert!(!result.is_valid());
@@ -523,45 +507,32 @@ mod tests {
     fn test_load_from_phi_is_type_error() {
         // This tests the Load(Phi) pattern that heap elimination produces
         // Phi produces a VALUE, not a pointer, so Load(Phi) is a type error
-        let mut named = FxHashMap::default();
-        named.insert(
-            Label::from("join".to_string()),
-            Block::new_for_test(
-                vec![
-                    // Phi merges values from two branches
-                    (
-                        LocalId::from(3),
-                        Instruction::phi(vec![
-                            (Label::from("__entry".to_string()), LocalId::from(0)),
-                            (Label::from("other".to_string()), LocalId::from(2)),
-                        ]),
-                    ),
-                    // This is the type error being tested: Load from Phi result.
-                    // Phi produces a VALUE, not a pointer, so this should be flagged.
-                    (LocalId::from(4), Instruction::load(LocalId::from(3))),
-                ],
-                (LocalId::from(5), Terminator::ret(Some(LocalId::from(4)))),
-            ),
+        let entry = Block::new_for_test(
+            vec![(LocalId::from(0), Instruction::num_const(42))],
+            (LocalId::from(1), Terminator::branch("join")),
         );
-        named.insert(
-            Label::from("other".to_string()),
-            Block::new_for_test(
-                vec![
-                    (LocalId::from(2), Instruction::num_const(99)),
-                ],
-                (LocalId::from(6), Terminator::branch("join")),
-            ),
+        let other = Block::new_for_test(
+            vec![(LocalId::from(2), Instruction::num_const(99))],
+            (LocalId::from(6), Terminator::branch("join")),
+        );
+        let join = Block::new_for_test(
+            vec![
+                // Phi merges values from two branches
+                (
+                    LocalId::from(3),
+                    Instruction::phi(vec![
+                        (Label::from("__entry".to_string()), LocalId::from(0)),
+                        (Label::from("other".to_string()), LocalId::from(2)),
+                    ]),
+                ),
+                // This is the type error being tested: Load from Phi result.
+                // Phi produces a VALUE, not a pointer, so this should be flagged.
+                (LocalId::from(4), Instruction::load(LocalId::from(3))),
+            ],
+            (LocalId::from(5), Terminator::ret(Some(LocalId::from(4)))),
         );
 
-        let cfg = Cfg {
-            entry: Block::new_for_test(
-                vec![
-                    (LocalId::from(0), Instruction::num_const(42)),
-                ],
-                (LocalId::from(1), Terminator::branch("join")),
-            ),
-            named,
-        };
+        let cfg = Cfg::with_blocks(entry, [("other", other), ("join", join)]);
 
         // Structural validation should pass
         let structural_result = validate_cfg(&cfg);
@@ -669,43 +640,30 @@ mod tests {
     #[test]
     fn test_phi_references_non_predecessor() {
         // A phi that references a block that exists but is not a predecessor
-        let mut named = FxHashMap::default();
-        named.insert(
-            Label::from("unreachable".to_string()),
-            Block::new_for_test(
-                vec![
-                    (LocalId::from(2), Instruction::num_const(99)),
-                ],
-                (LocalId::from(3), Terminator::ret(Some(LocalId::from(2)))),
-            ),
+        let entry = Block::new_for_test(
+            vec![(LocalId::from(0), Instruction::num_const(42))],
+            // Entry jumps to join, not to unreachable
+            (LocalId::from(1), Terminator::branch("join")),
         );
-        named.insert(
-            Label::from("join".to_string()),
-            Block::new_for_test(
-                vec![
-                    // Phi references "unreachable" which exists but is NOT a predecessor of "join"
-                    (
-                        LocalId::from(4),
-                        Instruction::phi(vec![
-                            (Label::from("__entry".to_string()), LocalId::from(0)),
-                            (Label::from("unreachable".to_string()), LocalId::from(2)),
-                        ]),
-                    ),
-                ],
-                (LocalId::from(5), Terminator::ret(Some(LocalId::from(4)))),
-            ),
+        let unreachable = Block::new_for_test(
+            vec![(LocalId::from(2), Instruction::num_const(99))],
+            (LocalId::from(3), Terminator::ret(Some(LocalId::from(2)))),
+        );
+        let join = Block::new_for_test(
+            vec![
+                // Phi references "unreachable" which exists but is NOT a predecessor of "join"
+                (
+                    LocalId::from(4),
+                    Instruction::phi(vec![
+                        (Label::from("__entry".to_string()), LocalId::from(0)),
+                        (Label::from("unreachable".to_string()), LocalId::from(2)),
+                    ]),
+                ),
+            ],
+            (LocalId::from(5), Terminator::ret(Some(LocalId::from(4)))),
         );
 
-        let cfg = Cfg {
-            entry: Block::new_for_test(
-                vec![
-                    (LocalId::from(0), Instruction::num_const(42)),
-                ],
-                // Entry jumps to join, not to unreachable
-                (LocalId::from(1), Terminator::branch("join")),
-            ),
-            named,
-        };
+        let cfg = Cfg::with_blocks(entry, [("unreachable", unreachable), ("join", join)]);
 
         let result = validate_cfg(&cfg);
         assert!(!result.is_valid(), "Expected validation errors");

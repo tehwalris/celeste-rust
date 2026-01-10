@@ -333,7 +333,7 @@ mod tests {
     use super::*;
     use crate::interpreter::call_resolution::GlobalClosure;
     use crate::interpreter::heap_elimination::ValueShape;
-    use crate::ir::{Block, Cfg, Instruction, Label, LocalId, Terminator};
+    use crate::ir::{Block, Cfg, Instruction, LocalId, Terminator};
 
     #[test]
     fn test_resolve_simple_global_call() {
@@ -475,14 +475,11 @@ mod tests {
             (LocalId::from(96), Terminator::ret(Some(LocalId::from(3)))),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: [
-                (Label::from("true_branch".to_string()), true_branch),
-                (Label::from("false_branch".to_string()), false_branch),
-                (Label::from("join".to_string()), join),
-            ].into_iter().collect(),
-        };
+        let cfg = Cfg::with_blocks(entry, [
+            ("true_branch", true_branch),
+            ("false_branch", false_branch),
+            ("join", join),
+        ]);
 
         let mut shape = HeapShape::new();
         shape.globals.insert("foo".to_string(), ValueShape::Leaf);

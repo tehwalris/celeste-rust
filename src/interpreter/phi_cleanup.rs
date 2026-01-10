@@ -388,16 +388,11 @@ mod tests {
             (LocalId::from(return_terminator_id), Terminator::ret(Some(phi_id))),
         );
 
-        Cfg {
-            entry,
-            named: [
-                (Label::from(branch_a.label.to_string()), block_a),
-                (Label::from(branch_b.label.to_string()), block_b),
-                (Label::from("join".to_string()), join),
-            ]
-            .into_iter()
-            .collect(),
-        }
+        Cfg::with_blocks(entry, [
+            (branch_a.label, block_a),
+            (branch_b.label, block_b),
+            ("join", join),
+        ])
     }
 
     // ==================== Tests ====================
@@ -425,13 +420,10 @@ mod tests {
             (LocalId::from(3), Terminator::ret(Some(LocalId::from(2)))),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: [
-                (Label::from("block_a".to_string()), block_a),
-                (Label::from("block_b".to_string()), block_b),
-            ].into_iter().collect(),
-        };
+        let cfg = Cfg::with_blocks(entry, [
+            ("block_a", block_a),
+            ("block_b", block_b),
+        ]);
 
         let result = cleanup_phis(&cfg);
 
@@ -550,18 +542,13 @@ mod tests {
             (LocalId::from(13), Terminator::ret(Some(LocalId::from(4)))),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: [
-                (Label::from("dispatch".to_string()), dispatch),
-                (Label::from("block_a".to_string()), block_a),
-                (Label::from("block_b".to_string()), block_b),
-                (Label::from("block_c".to_string()), block_c),
-                (Label::from("join".to_string()), join),
-            ]
-            .into_iter()
-            .collect(),
-        };
+        let cfg = Cfg::with_blocks(entry, [
+            ("dispatch", dispatch),
+            ("block_a", block_a),
+            ("block_b", block_b),
+            ("block_c", block_c),
+            ("join", join),
+        ]);
 
         let result = cleanup_phis(&cfg);
 
@@ -615,10 +602,7 @@ mod tests {
             (LocalId::from(10), Terminator::ret(Some(LocalId::from(3)))),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: [(Label::from("block_b".to_string()), block_b)].into_iter().collect(),
-        };
+        let cfg = Cfg::with_blocks(entry, [("block_b", block_b)]);
 
         let result = cleanup_phis(&cfg);
 
@@ -685,14 +669,11 @@ mod tests {
             (LocalId::from(96), Terminator::ret(Some(LocalId::from(4)))),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: [
-                (Label::from("block_a".to_string()), block_a),
-                (Label::from("block_b".to_string()), block_b),
-                (Label::from("block_c".to_string()), block_c),
-            ].into_iter().collect(),
-        };
+        let cfg = Cfg::with_blocks(entry, [
+            ("block_a", block_a),
+            ("block_b", block_b),
+            ("block_c", block_c),
+        ]);
 
         let result = cleanup_phis(&cfg);
 
