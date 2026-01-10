@@ -425,11 +425,11 @@ mod tests {
                 (LocalId::from(1), Instruction::num_const(1)),
                 (
                     LocalId::from(2),
-                    Instruction::BinaryOp {
-                        left: LocalId::from(0),
-                        op: crate::ir::BinaryOp::Plus,
-                        right: LocalId::from(1),
-                    },
+                    Instruction::binary_op(
+                        crate::ir::BinaryOp::Plus,
+                        LocalId::from(0),
+                        LocalId::from(1),
+                    ),
                 ),
             ],
             (

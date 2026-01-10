@@ -890,10 +890,10 @@ mod tests {
                 (LocalId::from(0), Instruction::Alloc),
                 (LocalId::from(1), Instruction::store(LocalId::from(0), LocalId::from(2))),
                 (LocalId::from(3), Instruction::load(LocalId::from(0))),
-                (LocalId::from(4), Instruction::UnaryOp {
-                    op: UnaryOp::Hash,
-                    arg: LocalId::from(3)
-                }),
+                (LocalId::from(4), Instruction::unary_op(
+                    UnaryOp::Hash,
+                    LocalId::from(3),
+                )),
             ],
             (LocalId::from(5), Terminator::Return { value: Some(LocalId::from(4)) }),
         );
@@ -986,11 +986,11 @@ mod tests {
             vec![
                 (LocalId::from(5), Instruction::load(LocalId::from(0))),  // Load i
                 (LocalId::from(6), Instruction::num_const(1)),
-                (LocalId::from(7), Instruction::BinaryOp {
-                    op: BinaryOp::Plus,
-                    left: LocalId::from(5),
-                    right: LocalId::from(6),
-                }),  // i + 1
+                (LocalId::from(7), Instruction::binary_op(
+                    BinaryOp::Plus,
+                    LocalId::from(5),
+                    LocalId::from(6),
+                )),  // i + 1
                 (LocalId::from(8), Instruction::store(LocalId::from(0), LocalId::from(7))),  // i = i + 1 (SECOND STORE)
                 (LocalId::from(9), Instruction::load(LocalId::from(0))),  // Load modified i
             ],

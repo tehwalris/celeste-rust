@@ -569,11 +569,11 @@ mod tests {
                 (LocalId::from(2), Instruction::num_const(2)),
                 (
                     LocalId::from(3),
-                    Instruction::BinaryOp {
-                        op: BinaryOp::Plus,
-                        left: LocalId::from(1), // References the Phi
-                        right: LocalId::from(2),
-                    },
+                    Instruction::binary_op(
+                        BinaryOp::Plus,
+                        LocalId::from(1), // References the Phi
+                        LocalId::from(2),
+                    ),
                 ),
             ],
             (LocalId::from(10), Terminator::ret(Some(LocalId::from(3)))),
@@ -639,11 +639,11 @@ mod tests {
                 // This BinaryOp uses %3 (the Phi result), which should become %1 after transitive remapping
                 (
                     LocalId::from(4),
-                    Instruction::BinaryOp {
-                        op: BinaryOp::Plus,
-                        left: LocalId::from(3),
-                        right: LocalId::from(0),
-                    },
+                    Instruction::binary_op(
+                        BinaryOp::Plus,
+                        LocalId::from(3),
+                        LocalId::from(0),
+                    ),
                 ),
             ],
             (LocalId::from(96), Terminator::ret(Some(LocalId::from(4)))),

@@ -1681,11 +1681,11 @@ mod tests {
                 (LocalId::from(3), Instruction::load(LocalId::from(2))),
                 (
                     LocalId::from(4),
-                    Instruction::BinaryOp {
-                        left: LocalId::from(1),
-                        op: crate::ir::BinaryOp::Plus,
-                        right: LocalId::from(3),
-                    },
+                    Instruction::binary_op(
+                        crate::ir::BinaryOp::Plus,
+                        LocalId::from(1),
+                        LocalId::from(3),
+                    ),
                 ),
             ],
             (
@@ -2066,11 +2066,11 @@ mod tests {
                 (LocalId::from(3), Instruction::load(LocalId::from(2))),
                 (
                     LocalId::from(4),
-                    Instruction::BinaryOp {
-                        left: LocalId::from(1),
-                        op: crate::ir::BinaryOp::Plus,
-                        right: LocalId::from(3),
-                    },
+                    Instruction::binary_op(
+                        crate::ir::BinaryOp::Plus,
+                        LocalId::from(1),
+                        LocalId::from(3),
+                    ),
                 ),
             ],
             (LocalId::from(5), Terminator::Return { value: Some(LocalId::from(4)) }),
@@ -2354,11 +2354,11 @@ mod tests {
                 (LocalId::from(9), Instruction::load(LocalId::from(8))),
                 (
                     LocalId::from(10),
-                    Instruction::BinaryOp {
-                        left: LocalId::from(6),
-                        op: crate::ir::BinaryOp::Plus,
-                        right: LocalId::from(9),
-                    },
+                    Instruction::binary_op(
+                        crate::ir::BinaryOp::Plus,
+                        LocalId::from(6),
+                        LocalId::from(9),
+                    ),
                 ),
             ],
             (

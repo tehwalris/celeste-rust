@@ -358,6 +358,24 @@ impl Instruction {
         Self::Call { closure, args }
     }
 
+    /// Test helper to create a BinaryOp instruction.
+    ///
+    /// This is a convenience method for tests that need to create binary
+    /// operation instructions. It's more concise than the verbose struct literal.
+    #[cfg(test)]
+    pub fn binary_op(op: BinaryOp, left: LocalId, right: LocalId) -> Self {
+        Self::BinaryOp { left, op, right }
+    }
+
+    /// Test helper to create a UnaryOp instruction.
+    ///
+    /// This is a convenience method for tests that need to create unary
+    /// operation instructions. It's more concise than the verbose struct literal.
+    #[cfg(test)]
+    pub fn unary_op(op: UnaryOp, arg: LocalId) -> Self {
+        Self::UnaryOp { op, arg }
+    }
+
     /// Get all local IDs used by this instruction.
     ///
     /// This returns all LocalIds that this instruction reads from (its operands).

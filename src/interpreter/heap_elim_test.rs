@@ -218,11 +218,11 @@ mod tests {
                 }),
                 (LocalId::from(2), Instruction::load(LocalId::from(1))),
                 (LocalId::from(3), Instruction::num_const(0)),
-                (LocalId::from(4), Instruction::BinaryOp {
-                    left: LocalId::from(2),
-                    op: BinaryOp::GreaterThan,
-                    right: LocalId::from(3),
-                }),
+                (LocalId::from(4), Instruction::binary_op(
+                    BinaryOp::GreaterThan,
+                    LocalId::from(2),
+                    LocalId::from(3),
+                )),
             ],
             (LocalId::from(5), Terminator::ConditionalBranch {
                 condition: LocalId::from(4),
@@ -240,11 +240,11 @@ mod tests {
         let if_true = Block::new_for_test(
             vec![
                 (LocalId::from(6), Instruction::num_const(1)),
-                (LocalId::from(7), Instruction::BinaryOp {
-                    left: LocalId::from(2),
-                    op: BinaryOp::Plus,
-                    right: LocalId::from(6),
-                }),
+                (LocalId::from(7), Instruction::binary_op(
+                    BinaryOp::Plus,
+                    LocalId::from(2),
+                    LocalId::from(6),
+                )),
                 (LocalId::from(8), Instruction::GetField {
                     receiver: LocalId::from(0),
                     field: "x".to_string(),
