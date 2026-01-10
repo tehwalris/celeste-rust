@@ -731,7 +731,7 @@ impl Compiler {
             ast::Expression::Number(number) => {
                 let (id, stream) = self.gen_id_and_stream(Instruction::NumberConstant {
                     value: match number.token_type() {
-                        TokenType::Number { text } => Pico8Num::from_str(text)?,
+                        TokenType::Number { text } => text.parse()?,
                         _ => bail!("expected number literal"),
                     },
                 });
