@@ -1010,7 +1010,7 @@ mod tests {
                 assert!(matches!(instr, Instruction::NumberConstant { .. }));
 
                 // block_a should have NumberConstant and BinaryOp (Load and Store removed)
-                let block_a = new_cfg.named.get(&Label::from("block_a".to_string())).unwrap();
+                let block_a = new_cfg.named.get(&Label::from("block_a")).unwrap();
                 assert_eq!(block_a.instructions.len(), 2);
 
                 // BinaryOp should use %1 directly (not %5 which was a Load)
@@ -1100,7 +1100,7 @@ mod tests {
                 assert_eq!(cells_promoted, 1, "Expected 1 cell promoted");
 
                 // block_c should have a phi node at the beginning
-                let block_c = new_cfg.named.get(&Label::from("block_c".to_string())).unwrap();
+                let block_c = new_cfg.named.get(&Label::from("block_c")).unwrap();
 
                 // First instruction should be a Phi
                 let (phi_id, phi_instr) = &block_c.instructions[0];

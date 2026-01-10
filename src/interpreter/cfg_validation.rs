@@ -479,7 +479,7 @@ mod tests {
         let join = Block::new_for_test(
             vec![(
                 LocalId::from(2),
-                Instruction::phi(vec![(Label::from("nonexistent".to_string()), LocalId::from(0))]),
+                Instruction::phi(vec![(Label::from("nonexistent"), LocalId::from(0))]),
             )],
             (LocalId::from(3), Terminator::ret(Some(LocalId::from(2)))),
         );
@@ -521,8 +521,8 @@ mod tests {
                 (
                     LocalId::from(3),
                     Instruction::phi(vec![
-                        (Label::from("__entry".to_string()), LocalId::from(0)),
-                        (Label::from("other".to_string()), LocalId::from(2)),
+                        (Label::from("__entry"), LocalId::from(0)),
+                        (Label::from("other"), LocalId::from(2)),
                     ]),
                 ),
                 // This is the type error being tested: Load from Phi result.
@@ -651,8 +651,8 @@ mod tests {
                 (
                     LocalId::from(4),
                     Instruction::phi(vec![
-                        (Label::from("__entry".to_string()), LocalId::from(0)),
-                        (Label::from("unreachable".to_string()), LocalId::from(2)),
+                        (Label::from("__entry"), LocalId::from(0)),
+                        (Label::from("unreachable"), LocalId::from(2)),
                     ]),
                 ),
             ],

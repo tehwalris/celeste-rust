@@ -143,6 +143,12 @@ impl From<String> for Label {
     }
 }
 
+impl From<&str> for Label {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+
 pub type LabelGenerator = UniqueStringGenerator<Label>;
 
 impl LabelGenerator {
@@ -805,26 +811,24 @@ impl Terminator {
     /// Test helper to create an UnconditionalBranch terminator.
     ///
     /// This is a convenience method for tests that need to create unconditional
-    /// branch terminators. It's more concise than the verbose struct literal
-    /// with `Label::from("name".to_string())`.
+    /// branch terminators.
     #[cfg(test)]
     pub fn branch(target: &str) -> Self {
         Self::UnconditionalBranch {
-            target: Label::from(target.to_string()),
+            target: Label::from(target),
         }
     }
 
     /// Test helper to create a ConditionalBranch terminator.
     ///
     /// This is a convenience method for tests that need to create conditional
-    /// branch terminators. It's more concise than the verbose struct literal
-    /// with multiple `Label::from("name".to_string())` calls.
+    /// branch terminators.
     #[cfg(test)]
     pub fn cond_branch(condition: LocalId, true_target: &str, false_target: &str) -> Self {
         Self::ConditionalBranch {
             condition,
-            true_target: Label::from(true_target.to_string()),
-            false_target: Label::from(false_target.to_string()),
+            true_target: Label::from(true_target),
+            false_target: Label::from(false_target),
         }
     }
 
@@ -1174,7 +1178,7 @@ impl Cfg {
             entry,
             named: named_blocks
                 .into_iter()
-                .map(|(label, block)| (Label::from(label.to_string()), block))
+                .map(|(label, block)| (Label::from(label), block))
                 .collect(),
         }
     }

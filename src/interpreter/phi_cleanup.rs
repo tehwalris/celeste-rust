@@ -381,8 +381,8 @@ mod tests {
             vec![(
                 phi_id,
                 Instruction::phi(vec![
-                    (Label::from(branch_a.label.to_string()), branch_a.local_id),
-                    (Label::from(branch_b.label.to_string()), branch_b.local_id),
+                    (Label::from(branch_a.label), branch_a.local_id),
+                    (Label::from(branch_b.label), branch_b.local_id),
                 ]),
             )],
             (LocalId::from(return_terminator_id), Terminator::ret(Some(phi_id))),
@@ -415,7 +415,7 @@ mod tests {
         let block_b = Block::new_for_test(
             vec![(
                 LocalId::from(2),
-                Instruction::phi(vec![(Label::from("block_a".to_string()), LocalId::from(0))]),
+                Instruction::phi(vec![(Label::from("block_a"), LocalId::from(0))]),
             )],
             (LocalId::from(3), Terminator::ret(Some(LocalId::from(2)))),
         );
@@ -436,7 +436,7 @@ mod tests {
         assert_eq!(result.collapsed_mappings.get(&LocalId::from(2)), Some(&LocalId::from(0)));
 
         // The return should now reference %0 directly
-        match result.cfg.named.get(&Label::from("block_b".to_string())).unwrap().terminator_kind() {
+        match result.cfg.named.get(&Label::from("block_b")).unwrap().terminator_kind() {
             Terminator::Return { value: Some(v) } => assert_eq!(*v, LocalId::from(0)),
             _ => panic!("Expected return terminator"),
         }
@@ -490,7 +490,7 @@ mod tests {
         assert_eq!(result.phis_collapsed, 0);
 
         // The Phi should still exist but with empty branches
-        let join_block = result.cfg.named.get(&Label::from("join".to_string())).unwrap();
+        let join_block = result.cfg.named.get(&Label::from("join")).unwrap();
         match &join_block.instructions[0].1 {
             Instruction::Phi { branches } => {
                 assert!(branches.is_empty());
@@ -534,9 +534,9 @@ mod tests {
             vec![(
                 LocalId::from(4),
                 Instruction::phi(vec![
-                    (Label::from("block_a".to_string()), LocalId::from(1)),
-                    (Label::from("block_b".to_string()), LocalId::from(2)),
-                    (Label::from("block_c".to_string()), LocalId::from(3)),
+                    (Label::from("block_a"), LocalId::from(1)),
+                    (Label::from("block_b"), LocalId::from(2)),
+                    (Label::from("block_c"), LocalId::from(3)),
                 ]),
             )],
             (LocalId::from(13), Terminator::ret(Some(LocalId::from(4)))),
@@ -559,7 +559,7 @@ mod tests {
         assert_eq!(result.phis_emptied, 0);
 
         // Check the Phi now has only B and C
-        let join_block = result.cfg.named.get(&Label::from("join".to_string())).unwrap();
+        let join_block = result.cfg.named.get(&Label::from("join")).unwrap();
         match &join_block.instructions[0].1 {
             Instruction::Phi { branches } => {
                 assert_eq!(branches.len(), 2);
@@ -610,7 +610,7 @@ mod tests {
         assert_eq!(result.collapsed_mappings.get(&LocalId::from(1)), Some(&LocalId::from(0)));
 
         // Check that BinaryOp now references %0 instead of %1
-        let block_b = result.cfg.named.get(&Label::from("block_b".to_string())).unwrap();
+        let block_b = result.cfg.named.get(&Label::from("block_b")).unwrap();
         // Find the BinaryOp instruction
         let binary_op = block_b.instructions.iter().find(|(_, i)| matches!(i, Instruction::BinaryOp { .. }));
         match binary_op {
@@ -643,7 +643,7 @@ mod tests {
         let block_b = Block::new_for_test(
             vec![(
                 LocalId::from(2),
-                Instruction::phi(vec![(Label::from("block_a".to_string()), LocalId::from(1))]),
+                Instruction::phi(vec![(Label::from("block_a"), LocalId::from(1))]),
             )],
             (LocalId::from(97), Terminator::branch("block_c")),
         );
@@ -654,7 +654,7 @@ mod tests {
             vec![
                 (
                     LocalId::from(3),
-                    Instruction::phi(vec![(Label::from("block_b".to_string()), LocalId::from(2))]),
+                    Instruction::phi(vec![(Label::from("block_b"), LocalId::from(2))]),
                 ),
                 // This BinaryOp uses %3 (the Phi result), which should become %1 after transitive remapping
                 (
@@ -687,7 +687,7 @@ mod tests {
         assert_eq!(result.collapsed_mappings.get(&LocalId::from(3)), Some(&LocalId::from(1)));
 
         // Check that the BinaryOp in block_c now references %1 (not %3 or %2)
-        let block_c = result.cfg.named.get(&Label::from("block_c".to_string())).unwrap();
+        let block_c = result.cfg.named.get(&Label::from("block_c")).unwrap();
         let binary_op = block_c.instructions.iter().find(|(_, i)| matches!(i, Instruction::BinaryOp { .. }));
         match binary_op {
             Some((_, Instruction::BinaryOp { left, .. })) => {
@@ -739,7 +739,7 @@ mod tests {
         assert_eq!(result.collapsed_mappings.get(&LocalId::from(3)), Some(&LocalId::from(2)));
 
         // The return should now reference %2 directly
-        match result.cfg.named.get(&Label::from("join".to_string())).unwrap().terminator_kind() {
+        match result.cfg.named.get(&Label::from("join")).unwrap().terminator_kind() {
             Terminator::Return { value: Some(v) } => assert_eq!(*v, LocalId::from(2)),
             _ => panic!("Expected return terminator"),
         }
@@ -775,7 +775,7 @@ mod tests {
         assert_eq!(result.phis_collapsed, 0);
 
         // The Phi should still exist but with empty branches
-        let join_block = result.cfg.named.get(&Label::from("join".to_string())).unwrap();
+        let join_block = result.cfg.named.get(&Label::from("join")).unwrap();
         match &join_block.instructions[0].1 {
             Instruction::Phi { branches } => {
                 assert!(branches.is_empty());

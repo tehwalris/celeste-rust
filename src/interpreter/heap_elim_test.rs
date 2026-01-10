@@ -75,7 +75,7 @@ mod tests {
 
         // Execute starting from entry
         let mut current_block = &cfg.entry;
-        let mut current_label = Label::from("__entry".to_string());
+        let mut current_label = Label::from("__entry");
 
         loop {
             // Execute instructions
@@ -297,7 +297,7 @@ mod tests {
 
         // Verify the transformation preserved the structure we expect
         // The if_join block should have a Phi for the x value
-        if let Some(if_join) = transformed.cfg.named.get(&Label::from("if_join".to_string())) {
+        if let Some(if_join) = transformed.cfg.named.get(&Label::from("if_join")) {
             let has_phi = if_join.instructions.iter()
                 .any(|(_, instr)| matches!(instr, Instruction::Phi { .. }));
             println!("if_join has Phi: {}", has_phi);
