@@ -153,11 +153,9 @@ pub fn build_builtin_set<'a>(builtin_names: impl Iterator<Item = &'a String>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::FxHashMap;
     use crate::ir::{LocalId, Terminator};
     use crate::pico8_num::Pico8Num;
-
-    type FxHashMap<K, V> =
-        std::collections::HashMap<K, V, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
 
     #[test]
     fn test_resolve_simple_builtin_call() {

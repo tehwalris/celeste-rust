@@ -265,13 +265,9 @@ fn has_single_predecessor(preds: &FxHashMap<Label, usize>, label: &Label) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::FxHashMap;
     use crate::ir::{Block, Cfg, Instruction, LocalId, Terminator};
     use crate::pico8_num::Pico8Num;
-    use std::collections::HashMap as StdHashMap;
-    use std::hash::BuildHasherDefault;
-    use rustc_hash::FxHasher;
-
-    type FxHashMap<K, V> = StdHashMap<K, V, BuildHasherDefault<FxHasher>>;
 
     #[test]
     fn test_simple_coalesce() {

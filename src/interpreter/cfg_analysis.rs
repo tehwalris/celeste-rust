@@ -475,10 +475,6 @@ pub fn optimize_all_functions(
     use crate::interpreter::inlining::{inline_calls, InliningResult};
     use crate::interpreter::mem2reg::{mem2reg, Mem2RegResult};
     use crate::ir::{GlobalId, LabelGenerator, LocalIdGenerator};
-    use std::hash::BuildHasherDefault;
-    use rustc_hash::FxHasher;
-
-    type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
     // Step 1: Build call graph to determine processing order
     // For each function, collect which functions it calls (after call resolution)
@@ -1614,10 +1610,6 @@ mod tests {
     use super::*;
     use crate::ir::LocalId;
     use crate::pico8_num::Pico8Num;
-    use std::hash::BuildHasherDefault;
-    use rustc_hash::FxHasher;
-
-    type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
     fn make_simple_cfg() -> Cfg {
         // A simple CFG: %0 = NumberConstant(5); return %0

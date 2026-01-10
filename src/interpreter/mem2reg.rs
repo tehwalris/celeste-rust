@@ -881,13 +881,9 @@ fn rewrite_block_for_cell(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::FxHashMap;
     use crate::ir::{Block, Cfg, Instruction, LocalId, Terminator, UnaryOp};
     use crate::pico8_num::Pico8Num;
-    use std::collections::HashMap as StdHashMap;
-    use std::hash::BuildHasherDefault;
-    use rustc_hash::FxHasher;
-
-    type FxHashMap<K, V> = StdHashMap<K, V, BuildHasherDefault<FxHasher>>;
 
     #[test]
     fn test_simple_cell_promotion() {

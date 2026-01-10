@@ -34,16 +34,12 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::common::FxHashMap;
     use crate::ir::{Block, Cfg, Instruction, Label, LocalId, Terminator, BinaryOp};
     use crate::interpreter::heap_elimination::{
         eliminate_heap, DeoptMode, HeapEliminationResult, HeapShape, ValueShape,
     };
     use crate::pico8_num::Pico8Num;
-    use std::collections::HashMap;
-    use std::hash::BuildHasherDefault;
-    use rustc_hash::FxHasher;
-
-    type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
     /// A simple value type for SSA interpretation
     #[derive(Clone, Debug, PartialEq)]

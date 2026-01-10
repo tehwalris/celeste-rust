@@ -15,6 +15,7 @@ use std::fs;
 use anyhow::Result;
 use clap::Parser;
 
+use celeste_rust::common::FxHashMap;
 use celeste_rust::frontend;
 use celeste_rust::interpreter::builtin_resolution::BuiltinSet;
 use celeste_rust::interpreter::cfg_analysis::{
@@ -89,10 +90,6 @@ fn main() -> Result<()> {
 
     // Build optimized function definition map for inlining
     // The optimized map contains FunDefs with already-optimized CFGs
-    use std::hash::BuildHasherDefault;
-    use rustc_hash::FxHasher;
-    type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
-
     // We need to build a map of optimized FunDefs for the pipeline
     // First, get the optimized CFGs and create FunDefs from them
     let optimized_fun_def_map: FxHashMap<_, _> = fun_defs
@@ -366,7 +363,7 @@ struct AnalysisStats {
 
 /// Add common obj methods as Closure shapes to a fields map.
 /// These are methods inherited from obj by all object types.
-fn add_obj_method_closures(fields: &mut std::collections::HashMap<String, ValueShape, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>) {
+fn add_obj_method_closures(fields: &mut FxHashMap<String, ValueShape>) {
     // These methods are defined on obj and inherited by all object types
     fields.insert("is_solid".to_string(), ValueShape::Closure {
         fun_name: GlobalId::from("obj.is_solid_47".to_string()),
@@ -403,10 +400,6 @@ fn add_obj_method_closures(fields: &mut std::collections::HashMap<String, ValueS
 /// Methods in Celeste follow a naming pattern like "player.update_21", "obj.move_x_52", etc.
 /// The first argument to these methods is typically `self`, which is a table with known fields.
 fn build_arg_shapes_for_function(name: &str) -> Vec<Option<ValueShape>> {
-    use std::hash::BuildHasherDefault;
-    use rustc_hash::FxHasher;
-    type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
-
     // Parse the function name to determine if it's a method
     // Pattern: "type.method_N" where N is a number
     let parts: Vec<&str> = name.split('.').collect();

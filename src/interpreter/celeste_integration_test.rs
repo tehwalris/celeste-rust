@@ -10,6 +10,7 @@
 mod tests {
     use std::fs;
 
+    use crate::common::FxHashMap;
     use crate::frontend;
     use crate::interpreter::builtin_resolution::BuiltinSet;
     use crate::interpreter::call_resolution::build_global_closure_map_from_fun_defs;
@@ -164,9 +165,6 @@ mod tests {
         let builtin_set = builtin_set();
 
         // Build optimized function map (empty for this test - we test functions individually)
-        use std::hash::BuildHasherDefault;
-        use rustc_hash::FxHasher;
-        type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
         let optimized_fun_def_map: FxHashMap<GlobalId, FunDef> = FxHashMap::default();
 
         // Functions expected to optimize successfully (at least mem2reg)
@@ -263,9 +261,6 @@ mod tests {
         let global_closure_map = build_global_closure_map_from_fun_defs(fun_defs.iter());
         let builtin_set = builtin_set();
 
-        use std::hash::BuildHasherDefault;
-        use rustc_hash::FxHasher;
-        type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
         let optimized_fun_def_map: FxHashMap<GlobalId, FunDef> = FxHashMap::default();
 
         let mut total_calls_resolved = 0;
