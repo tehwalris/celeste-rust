@@ -313,6 +313,51 @@ impl Instruction {
         Self::Store { target, source }
     }
 
+    /// Test helper to create an Alloc instruction.
+    ///
+    /// This is a convenience method for tests that need to create alloc
+    /// instructions. It's more concise than `Instruction::Alloc`.
+    #[cfg(test)]
+    pub fn alloc() -> Self {
+        Self::Alloc
+    }
+
+    /// Test helper to create a GetField instruction.
+    ///
+    /// This is a convenience method for tests that need to create get_field
+    /// instructions. It's more concise than the verbose struct literal with
+    /// `field.to_string()`.
+    #[cfg(test)]
+    pub fn get_field(receiver: LocalId, field: &str, create_if_missing: bool) -> Self {
+        Self::GetField {
+            receiver,
+            field: field.to_string(),
+            create_if_missing,
+        }
+    }
+
+    /// Test helper to create a GetIndex instruction.
+    ///
+    /// This is a convenience method for tests that need to create get_index
+    /// instructions. It's more concise than the verbose struct literal.
+    #[cfg(test)]
+    pub fn get_index(receiver: LocalId, index: LocalId, create_if_missing: bool) -> Self {
+        Self::GetIndex {
+            receiver,
+            index,
+            create_if_missing,
+        }
+    }
+
+    /// Test helper to create a Call instruction.
+    ///
+    /// This is a convenience method for tests that need to create call
+    /// instructions. It's more concise than the verbose struct literal.
+    #[cfg(test)]
+    pub fn call(closure: LocalId, args: Vec<LocalId>) -> Self {
+        Self::Call { closure, args }
+    }
+
     /// Get all local IDs used by this instruction.
     ///
     /// This returns all LocalIds that this instruction reads from (its operands).
