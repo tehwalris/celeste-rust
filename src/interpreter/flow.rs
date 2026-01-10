@@ -53,7 +53,7 @@ impl FlowData {
     pub fn join_mut(&mut self, other: Self) {
         // Intentionally a simple append without deduplication.
         // State deduplication is handled via vectorization at hint_normalize blocks
-        // in glue.rs::InterpreterAnalysis::accumulate().
+        // in the interpreter's main loop (glue.rs).
         match (self, other) {
             (FlowData::States(a), FlowData::States(b)) => {
                 a.extend(b);

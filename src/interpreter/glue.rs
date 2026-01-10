@@ -1,20 +1,17 @@
 use std::time::Instant;
 
 use anyhow::Result;
-use indexmap::IndexSet;
-use petgraph::prelude::GraphMap;
 
 use crate::interpreter::common::FxHashMap;
 use crate::{
-    block_flow::{flow_graph_of_cfg, BoundMergedBlockFlow, BoundSplitBlockFlow, FlowNode, UnboundSplitBlockFlow},
-    fixed_point::Analysis,
+    block_flow::{BoundSplitBlockFlow, UnboundSplitBlockFlow},
     ir::{Cfg, Label},
     liveness::LivenessAnalysisResult,
 };
 
 use super::{
     fixed_env::FixedEnv,
-    flow::{BoundInterpreterFlow, FlowData, InterpreterFlowAdapter},
+    flow::{FlowData, InterpreterFlowAdapter},
     profiling::{DagOperation, FixedPointGuard, SpanGuard, with_profiler},
     state::State,
     tracing::TraceSpan,
@@ -23,155 +20,6 @@ use super::{
 
 /// Accumulator for hint_normalize blocks: (accumulated_states, pending_states, dag_ids)
 type HintNormalizeAccumulator = (Vec<State>, Vec<State>, Vec<Option<u64>>);
-
-/// Helper to vectorize states within FlowData
-fn vectorize_flow_data(data: &FlowData) -> FlowData {
-    match data {
-        FlowData::States(states) => {
-            FlowData::States(vectorize_states(states.clone()))
-        }
-        FlowData::StatesAndReturns(states_and_returns) => {
-            // For StatesAndReturns, we can't easily vectorize because the return values
-            // may differ. For now, just return as-is.
-            // TODO: Consider grouping by return value shape and vectorizing within groups
-            FlowData::StatesAndReturns(states_and_returns.clone())
-        }
-    }
-}
-
-struct InterpreterAnalysis<'a> {
-    adapter: InterpreterFlowAdapter<'a>,
-    cfg: Cfg,
-    graph: GraphMap<FlowNode, (), petgraph::Directed>,
-    labels: IndexSet<Label>,
-}
-
-impl<'a> InterpreterAnalysis<'a> {
-    pub fn new(cfg: Cfg, fixed_env: &'a FixedEnv) -> Result<Self> {
-        let (graph, labels) = flow_graph_of_cfg(&cfg).unwrap();
-        Ok(Self {
-            adapter: InterpreterFlowAdapter { fixed_env },
-            cfg,
-            graph,
-            labels,
-        })
-    }
-}
-
-impl<'a>
-    Analysis<FlowNode, Option<FlowData>, BoundMergedBlockFlow<FlowData, BoundInterpreterFlow<'a>>>
-    for InterpreterAnalysis<'a>
-{
-    fn graph(&self) -> &GraphMap<FlowNode, (), petgraph::Directed> {
-        &self.graph
-    }
-
-    fn new_empty(&self) -> Option<FlowData> {
-        None
-    }
-
-    fn is_empty(&self, data: &Option<FlowData>) -> bool {
-        match data {
-            Some(data) => data.is_empty(),
-            None => true,
-        }
-    }
-
-    fn is_input(&self, vertex: &FlowNode) -> bool {
-        vertex == &FlowNode::BeforeEntryBlock
-    }
-
-    fn is_output(&self, vertex: &FlowNode) -> bool {
-        vertex == &FlowNode::Return
-    }
-
-    fn hint_normalize(&self, vertex: &FlowNode) -> bool {
-        match vertex {
-            FlowNode::BeforeEntryBlock => self.cfg.entry.hint_normalize,
-            FlowNode::BeforeNamedBlock(name_index) => {
-                let name = self.labels.get_index(*name_index).unwrap();
-                let block = self.cfg.named.get(name).unwrap();
-                block.hint_normalize
-            }
-            _ => false,
-        }
-    }
-
-    fn join_mut(&self, existing: &mut Option<FlowData>, new: &Option<FlowData>) {
-        // TODO can we avoid cloning here?
-        match (existing.as_mut(), new.clone()) {
-            (Some(existing), Some(new)) => {
-                existing.join_mut(new);
-            }
-            (Some(existing), None) => {}
-            (None, Some(new)) => {
-                *existing = Some(new);
-            }
-            (None, None) => {}
-        }
-    }
-
-    fn accumulate(
-        &self,
-        accumulated: &Option<FlowData>,
-        potentially_new: &Option<FlowData>,
-    ) -> (Option<FlowData>, Option<FlowData>) {
-        // At hint_normalize blocks, we vectorize states to merge those with the same shape.
-        // This reduces state explosion during execution.
-        //
-        // We combine accumulated and potentially_new, vectorize them together,
-        // then return the vectorized result as both the new accumulated and actually_new.
-        //
-        // Note: This doesn't provide exact deduplication for loop termination (which would
-        // require tracking exact state equality). But it does reduce state count significantly
-        // by merging states with compatible shapes.
-
-        #[cfg(test)]
-        eprintln!("[accumulate] called with accumulated={:?} states, potentially_new={:?} states",
-            accumulated.as_ref().map(|d| d.counts()),
-            potentially_new.as_ref().map(|d| d.counts()));
-
-        match (accumulated, potentially_new) {
-            (None, None) => (None, None),
-            (None, Some(new)) => {
-                let vectorized = vectorize_flow_data(new);
-                #[cfg(test)]
-                eprintln!("[accumulate] vectorized from {:?} to {:?}", new.counts(), vectorized.counts());
-                (Some(vectorized.clone()), Some(vectorized))
-            }
-            (Some(acc), None) => (Some(acc.clone()), None),
-            (Some(acc), Some(new)) => {
-                // Combine and vectorize
-                let mut combined = acc.clone();
-                combined.join_mut(new.clone());
-                let vectorized = vectorize_flow_data(&combined);
-                #[cfg(test)]
-                eprintln!("[accumulate] combined {:?} + {:?} -> vectorized {:?}",
-                    acc.counts(), new.counts(), vectorized.counts());
-                // Return vectorized as both accumulated and new
-                // (we don't track what's "actually new" vs "already seen")
-                (Some(vectorized.clone()), Some(vectorized))
-            }
-        }
-    }
-
-    fn bind_analyze(
-        &self,
-        edge: &(FlowNode, FlowNode),
-    ) -> BoundMergedBlockFlow<FlowData, BoundInterpreterFlow<'a>> {
-        // TODO
-        let fake_liveness_result = LivenessAnalysisResult::all_live();
-        // TODO don't unwrap
-        BoundMergedBlockFlow::new(
-            &self.adapter,
-            &self.cfg,
-            &self.labels,
-            &fake_liveness_result,
-            edge,
-        )
-        .unwrap()
-    }
-}
 
 use super::{value::Value, fixed_env::PreparedCfg};
 use crate::ir::Terminator;
