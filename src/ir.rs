@@ -531,6 +531,40 @@ impl Terminator {
         }
     }
 
+    /// Format this terminator for display in the CFG viewer.
+    ///
+    /// This provides a detailed string representation including all local IDs and labels,
+    /// suitable for visualization and debugging purposes.
+    pub fn format(&self) -> String {
+        match self {
+            Self::Return { value } => {
+                if let Some(id) = value {
+                    format!("Return({})", usize::from(*id))
+                } else {
+                    "Return".to_string()
+                }
+            }
+            Self::UnconditionalBranch { target } => {
+                format!("Branch({})", target.as_str())
+            }
+            Self::ConditionalBranch {
+                condition,
+                true_target,
+                false_target,
+            } => {
+                format!(
+                    "CondBranch({}, true:{}, false:{})",
+                    usize::from(*condition),
+                    true_target.as_str(),
+                    false_target.as_str()
+                )
+            }
+            Self::Deopt { reason } => {
+                format!("Deopt(\"{}\")", reason)
+            }
+        }
+    }
+
     /// Get the successor labels of this terminator.
     ///
     /// Returns references to all labels this terminator can branch to.

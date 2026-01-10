@@ -1391,7 +1391,7 @@ impl From<&Block> for SerializableBlock {
         let (term_id, term) = &block.terminator;
         let terminator = SerializableTerminator {
             target_id: usize::from(*term_id),
-            terminator_text: format_terminator(term),
+            terminator_text: term.format(),
         };
 
         SerializableBlock {
@@ -1487,36 +1487,6 @@ fn format_instruction(instr: &Instruction) -> String {
                 .map(|(label, id)| format!("{}:{}", label.as_str(), usize::from(*id)))
                 .collect();
             format!("Phi([{}])", branch_strs.join(", "))
-        }
-    }
-}
-
-fn format_terminator(term: &Terminator) -> String {
-    match term {
-        Terminator::Return { value } => {
-            if let Some(id) = value {
-                format!("Return({})", usize::from(*id))
-            } else {
-                "Return".to_string()
-            }
-        }
-        Terminator::UnconditionalBranch { target } => {
-            format!("Branch({})", target.as_str())
-        }
-        Terminator::ConditionalBranch {
-            condition,
-            true_target,
-            false_target,
-        } => {
-            format!(
-                "CondBranch({}, true:{}, false:{})",
-                usize::from(*condition),
-                true_target.as_str(),
-                false_target.as_str()
-            )
-        }
-        Terminator::Deopt { reason } => {
-            format!("Deopt(\"{}\")", reason)
         }
     }
 }
