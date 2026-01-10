@@ -1271,12 +1271,32 @@ mod tests {
     use super::*;
     use crate::pico8_num::Pico8Num;
 
-    fn make_local_gen() -> LocalIdGenerator {
-        LocalIdGenerator::new()
+    /// Run heap elimination with default settings (no args, DeoptMode::Insert).
+    /// This is the most common pattern used in tests.
+    fn run_heap_elim(cfg: &Cfg, shape: &HeapShape) -> HeapEliminationResult {
+        run_heap_elim_with_args(cfg, shape, &[])
     }
 
-    fn make_label_gen() -> LabelGenerator {
-        LabelGenerator::new()
+    /// Run heap elimination with custom arg_ids and DeoptMode::Insert.
+    fn run_heap_elim_with_args(
+        cfg: &Cfg,
+        shape: &HeapShape,
+        arg_ids: &[Option<LocalId>],
+    ) -> HeapEliminationResult {
+        let local_gen = LocalIdGenerator::new();
+        let label_gen = LabelGenerator::new();
+        eliminate_heap(cfg, shape, arg_ids, local_gen, label_gen, DeoptMode::Insert)
+    }
+
+    /// Run heap elimination with DeoptMode::Stop (abort on first deopt).
+    fn run_heap_elim_stop_on_deopt(
+        cfg: &Cfg,
+        shape: &HeapShape,
+        arg_ids: &[Option<LocalId>],
+    ) -> HeapEliminationResult {
+        let local_gen = LocalIdGenerator::new();
+        let label_gen = LabelGenerator::new();
+        eliminate_heap(cfg, shape, arg_ids, local_gen, label_gen, DeoptMode::Stop)
     }
 
     /// Create a HeapShape with a single global as a Leaf.
@@ -1360,10 +1380,8 @@ mod tests {
         let cfg = Cfg::single_entry(entry);
 
         let shape = HeapShape::new(); // Empty shape
-        let local_gen = make_local_gen();
-        let label_gen = make_label_gen();
 
-        let result = eliminate_heap(&cfg, &shape, &[], local_gen, label_gen, DeoptMode::Insert);
+        let result = run_heap_elim(&cfg, &shape);
         assert!(matches!(result, HeapEliminationResult::NotApplicable));
     }
 
@@ -1382,10 +1400,7 @@ mod tests {
 
         let shape = make_global_leaf_shape("x");
 
-        let local_gen = make_local_gen();
-        let label_gen = make_label_gen();
-
-        let result = eliminate_heap(&cfg, &shape, &[], local_gen, label_gen, DeoptMode::Insert);
+        let result = run_heap_elim(&cfg, &shape);
         match result {
             HeapEliminationResult::Success(transformed) => {
                 assert_eq!(transformed.unpack_slots.len(), 1);
@@ -1411,10 +1426,7 @@ mod tests {
 
         let shape = make_global_leaf_shape("x");
 
-        let local_gen = make_local_gen();
-        let label_gen = make_label_gen();
-
-        let result = eliminate_heap(&cfg, &shape, &[], local_gen, label_gen, DeoptMode::Insert);
+        let result = run_heap_elim(&cfg, &shape);
         // Should succeed without deopt - create_if_missing doesn't affect tracking
         match result {
             HeapEliminationResult::Success(transformed) => {
@@ -1447,10 +1459,7 @@ mod tests {
 
         let shape = make_global_leaf_shape("x");
 
-        let local_gen = make_local_gen();
-        let label_gen = make_label_gen();
-
-        let result = eliminate_heap(&cfg, &shape, &[], local_gen, label_gen, DeoptMode::Insert);
+        let result = run_heap_elim(&cfg, &shape);
         // Should succeed because max is a pure builtin
         assert!(matches!(result, HeapEliminationResult::Success(_)));
     }
@@ -1475,10 +1484,7 @@ mod tests {
 
         let shape = make_global_leaf_shape("x");
 
-        let local_gen = make_local_gen();
-        let label_gen = make_label_gen();
-
-        let result = eliminate_heap(&cfg, &shape, &[], local_gen, label_gen, DeoptMode::Insert);
+        let result = run_heap_elim(&cfg, &shape);
         // Should succeed with deopt inserted because add is impure
         match result {
             HeapEliminationResult::Success(transformed) => {
@@ -1536,10 +1542,7 @@ mod tests {
         // k_left = 0 (constant)
         shape.globals.insert("k_left".to_string(), ValueShape::Constant(Pico8Num::from_i16(0)));
 
-        let local_gen = make_local_gen();
-        let label_gen = make_label_gen();
-
-        let result = eliminate_heap(&cfg, &shape, &[], local_gen, label_gen, DeoptMode::Insert);
+        let result = run_heap_elim(&cfg, &shape);
         match result {
             HeapEliminationResult::Success(transformed) => {
                 // Check that the Load was replaced with NumberConstant
@@ -1578,10 +1581,7 @@ mod tests {
         // k_left = 0 (constant)
         shape.globals.insert("k_left".to_string(), ValueShape::Constant(Pico8Num::from_i16(0)));
 
-        let local_gen = make_local_gen();
-        let label_gen = make_label_gen();
-
-        let result = eliminate_heap(&cfg, &shape, &[], local_gen, label_gen, DeoptMode::Insert);
+        let result = run_heap_elim(&cfg, &shape);
         match result {
             HeapEliminationResult::ConstantViolation(msg) => {
                 assert!(msg.contains("k_left"), "Error should mention k_left: {}", msg);
@@ -1615,10 +1615,7 @@ mod tests {
         // x is a mutable leaf
         shape.globals.insert("x".to_string(), ValueShape::Leaf);
 
-        let local_gen = make_local_gen();
-        let label_gen = make_label_gen();
-
-        let result = eliminate_heap(&cfg, &shape, &[], local_gen, label_gen, DeoptMode::Insert);
+        let result = run_heap_elim(&cfg, &shape);
         match result {
             HeapEliminationResult::Success(transformed) => {
                 // Should have NumberConstant for k_left
@@ -1666,12 +1663,9 @@ mod tests {
         // arg0 = 42 (constant)
         shape.args = vec![Some(ValueShape::Constant(Pico8Num::from_i16(42)))];
 
-        let local_gen = make_local_gen();
-        let label_gen = make_label_gen();
-
         let arg_ids = vec![Some(arg0_id)];
 
-        let result = eliminate_heap(&cfg, &shape, &arg_ids, local_gen, label_gen, DeoptMode::Insert);
+        let result = run_heap_elim_with_args(&cfg, &shape, &arg_ids);
         match result {
             HeapEliminationResult::Success(transformed) => {
                 // Check that the Load was replaced with NumberConstant
@@ -1716,12 +1710,9 @@ mod tests {
         // arg0 = 42 (constant)
         shape.args = vec![Some(ValueShape::Constant(Pico8Num::from_i16(42)))];
 
-        let local_gen = make_local_gen();
-        let label_gen = make_label_gen();
-
         let arg_ids = vec![Some(arg0_id)];
 
-        let result = eliminate_heap(&cfg, &shape, &arg_ids, local_gen, label_gen, DeoptMode::Insert);
+        let result = run_heap_elim_with_args(&cfg, &shape, &arg_ids);
         match result {
             HeapEliminationResult::ConstantViolation(msg) => {
                 // The message should mention the arg (either "arg0" or "arg[0]")
@@ -1775,12 +1766,9 @@ mod tests {
             ValueShape::Constant(Pico8Num::from_i16(7)),
         )]))];
 
-        let local_gen = make_local_gen();
-        let label_gen = make_label_gen();
-
         let arg_ids = vec![Some(arg0_id)];
 
-        let result = eliminate_heap(&cfg, &shape, &arg_ids, local_gen, label_gen, DeoptMode::Insert);
+        let result = run_heap_elim_with_args(&cfg, &shape, &arg_ids);
         match result {
             HeapEliminationResult::Success(transformed) => {
                 // Check that the Load was replaced with NumberConstant
@@ -1867,13 +1855,10 @@ mod tests {
             ("x", ValueShape::Leaf), // Need at least one leaf
         ]))];
 
-        let local_gen = make_local_gen();
-        let label_gen = make_label_gen();
-
         // Use arg_ids to map the argument LocalId
         let arg_ids = vec![Some(arg0_id)];
 
-        let result = eliminate_heap(&cfg, &shape, &arg_ids, local_gen, label_gen, DeoptMode::Insert);
+        let result = run_heap_elim_with_args(&cfg, &shape, &arg_ids);
         match result {
             HeapEliminationResult::Success(transformed) => {
                 // Check that the Call was replaced with CallResolved
@@ -1920,10 +1905,7 @@ mod tests {
         // Empty shape - "unknown" is not pre-declared
         let shape = HeapShape::new();
 
-        let local_gen = make_local_gen();
-        let label_gen = make_label_gen();
-
-        let result = eliminate_heap(&cfg, &shape, &[], local_gen, label_gen, DeoptMode::Insert);
+        let result = run_heap_elim(&cfg, &shape);
         match result {
             HeapEliminationResult::Success(transformed) => {
                 // Should succeed without any deopt
@@ -1965,10 +1947,7 @@ mod tests {
         // "x" is known, "unknown" is NOT in the shape
         let shape = make_global_leaf_shape("x");
 
-        let local_gen = make_local_gen();
-        let label_gen = make_label_gen();
-
-        let result = eliminate_heap(&cfg, &shape, &[], local_gen, label_gen, DeoptMode::Insert);
+        let result = run_heap_elim(&cfg, &shape);
         match result {
             HeapEliminationResult::Success(transformed) => {
                 assert_eq!(transformed.deopt_count, 0, "Expected no deopt");
@@ -2033,10 +2012,7 @@ mod tests {
 
         let shape = make_player_x_shape();
 
-        let local_gen = make_local_gen();
-        let label_gen = make_label_gen();
-
-        let result = eliminate_heap(&cfg, &shape, &[], local_gen, label_gen, DeoptMode::Insert);
+        let result = run_heap_elim(&cfg, &shape);
 
         match result {
             HeapEliminationResult::Success(transformed) => {
@@ -2130,13 +2106,10 @@ mod tests {
             ("x", ValueShape::Leaf),
         ]))];
 
-        let local_gen = make_local_gen();
-        let label_gen = make_label_gen();
-
         // arg_ids contains the VALUE id (what the compiler does)
         let arg_ids = vec![Some(value_id)];
 
-        let result = eliminate_heap(&cfg, &shape, &arg_ids, local_gen, label_gen, DeoptMode::Stop);
+        let result = run_heap_elim_stop_on_deopt(&cfg, &shape, &arg_ids);
 
         match result {
             HeapEliminationResult::Success(transformed) => {
@@ -2203,10 +2176,7 @@ mod tests {
 
         let shape = make_player_xy_shape();
 
-        let local_gen = make_local_gen();
-        let label_gen = make_label_gen();
-
-        let result = eliminate_heap(&cfg, &shape, &[], local_gen, label_gen, DeoptMode::Insert);
+        let result = run_heap_elim(&cfg, &shape);
 
         match result {
             HeapEliminationResult::Success(transformed) => {
@@ -2274,10 +2244,7 @@ mod tests {
         shape.globals.insert("player1".to_string(), make_table_with_x());
         shape.globals.insert("player2".to_string(), make_table_with_x());
 
-        let local_gen = make_local_gen();
-        let label_gen = make_label_gen();
-
-        let result = eliminate_heap(&cfg, &shape, &[], local_gen, label_gen, DeoptMode::Insert);
+        let result = run_heap_elim(&cfg, &shape);
 
         match result {
             HeapEliminationResult::Success(transformed) => {
@@ -2334,10 +2301,7 @@ mod tests {
 
         let shape = make_player_x_shape();
 
-        let local_gen = make_local_gen();
-        let label_gen = make_label_gen();
-
-        let result = eliminate_heap(&cfg, &shape, &[], local_gen, label_gen, DeoptMode::Insert);
+        let result = run_heap_elim(&cfg, &shape);
 
         match result {
             HeapEliminationResult::Success(transformed) => {
@@ -2390,11 +2354,8 @@ mod tests {
         // Empty shape - nothing to track
         let shape = HeapShape::new();
 
-        let local_gen = make_local_gen();
-        let label_gen = make_label_gen();
-
         // Should not panic
-        let result = eliminate_heap(&cfg, &shape, &[], local_gen, label_gen, DeoptMode::Insert);
+        let result = run_heap_elim(&cfg, &shape);
 
         // NotApplicable is fine (no tracked slots), Success with no changes is also fine
         match result {
@@ -2432,11 +2393,8 @@ mod tests {
         // Shape: btn is a Leaf (this causes Load to be SSA-promoted)
         let shape = make_global_leaf_shape("btn");
 
-        let local_gen = make_local_gen();
-        let label_gen = make_label_gen();
-
         // Run in Stop mode - this is where the bug manifests
-        let result = eliminate_heap(&cfg, &shape, &[], local_gen, label_gen, DeoptMode::Stop);
+        let result = run_heap_elim_stop_on_deopt(&cfg, &shape, &[]);
 
         match result {
             HeapEliminationResult::Success(transformed) => {
