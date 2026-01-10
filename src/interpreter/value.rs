@@ -72,14 +72,17 @@ pub fn count_true(mask: &[bool]) -> usize {
     mask.iter().map(|&b| b as usize).sum()
 }
 
+/// Filter elements by mask using an iterator that yields owned values.
+/// Works with both owned vectors (via `into_iter()`) and references (via `iter().cloned()`).
 #[inline]
-fn filter_vec_by_mask<T>(vec: Vec<T>, mask: &[bool], true_count: usize) -> MaybeVector<T>
+fn filter_by_mask_iter<T, I>(iter: I, mask: &[bool], true_count: usize) -> MaybeVector<T>
 where
     T: std::fmt::Debug + Clone + PartialEq + Eq,
+    I: Iterator<Item = T>,
 {
     if true_count == 1 {
         // Single element - find it and return as scalar
-        for (v, &m) in vec.into_iter().zip(mask.iter()) {
+        for (v, &m) in iter.zip(mask.iter()) {
             if m {
                 return MaybeVector::Scalar(v);
             }
@@ -88,7 +91,7 @@ where
     } else {
         // Multiple elements - collect into pre-allocated Vec
         let mut filtered = Vec::with_capacity(true_count);
-        for (v, &m) in vec.into_iter().zip(mask.iter()) {
+        for (v, &m) in iter.zip(mask.iter()) {
             if m {
                 filtered.push(v);
             }
@@ -97,30 +100,22 @@ where
     }
 }
 
+/// Filter a vector by mask, consuming the vector
+#[inline]
+fn filter_vec_by_mask<T>(vec: Vec<T>, mask: &[bool], true_count: usize) -> MaybeVector<T>
+where
+    T: std::fmt::Debug + Clone + PartialEq + Eq,
+{
+    filter_by_mask_iter(vec.into_iter(), mask, true_count)
+}
+
 /// Filter a vector by mask, cloning elements (for use with references)
 #[inline]
 fn filter_vec_by_mask_ref<T>(vec: &[T], mask: &[bool], true_count: usize) -> MaybeVector<T>
 where
     T: std::fmt::Debug + Clone + PartialEq + Eq,
 {
-    if true_count == 1 {
-        // Single element - find it and return as scalar
-        for (v, &m) in vec.iter().zip(mask.iter()) {
-            if m {
-                return MaybeVector::Scalar(v.clone());
-            }
-        }
-        unreachable!("true_count was 1 but no true found")
-    } else {
-        // Multiple elements - collect into pre-allocated Vec
-        let mut filtered = Vec::with_capacity(true_count);
-        for (v, &m) in vec.iter().zip(mask.iter()) {
-            if m {
-                filtered.push(v.clone());
-            }
-        }
-        MaybeVector::Vector(filtered)
-    }
+    filter_by_mask_iter(vec.iter().cloned(), mask, true_count)
 }
 
 impl Value {
