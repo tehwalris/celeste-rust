@@ -200,8 +200,6 @@ mod tests {
         //   end
         //   return arg0.x
 
-        let mut named = FxHashMap::default();
-
         // Entry block:
         //   %0 = arg0 (from arg_ids)
         //   %1 = GetField(%0, "x")
@@ -238,14 +236,9 @@ mod tests {
                     LocalId::from(6),
                 )),
                 (LocalId::from(8), Instruction::get_field(LocalId::from(0), "x", false)),
-                (LocalId::from(9), Instruction::Store {
-                    target: LocalId::from(8),
-                    source: LocalId::from(7),
-                }),
+                (LocalId::from(9), Instruction::store(LocalId::from(8), LocalId::from(7))),
             ],
-            (LocalId::from(10), Terminator::UnconditionalBranch {
-                target: Label::from("if_join".to_string()),
-            }),
+            (LocalId::from(10), Terminator::branch("if_join")),
         );
 
         // if_join block:
@@ -260,10 +253,7 @@ mod tests {
             (LocalId::from(13), Terminator::ret(Some(LocalId::from(12)))),
         );
 
-        named.insert(Label::from("if_true".to_string()), if_true);
-        named.insert(Label::from("if_join".to_string()), if_join);
-
-        Cfg { entry, named }
+        Cfg::with_blocks(entry, [("if_true", if_true), ("if_join", if_join)])
     }
 
     #[test]
