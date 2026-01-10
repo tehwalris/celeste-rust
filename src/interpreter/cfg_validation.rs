@@ -428,15 +428,12 @@ mod tests {
 
     #[test]
     fn test_valid_simple_cfg() {
-        let cfg = Cfg {
-            entry: Block::new_for_test(
-                vec![
-                    (LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(42) }),
-                ],
-                (LocalId::from(1), Terminator::Return { value: Some(LocalId::from(0)) }),
-            ),
-            named: Default::default(),
-        };
+        let cfg = Cfg::single_entry(Block::new_for_test(
+            vec![
+                (LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(42) }),
+            ],
+            (LocalId::from(1), Terminator::Return { value: Some(LocalId::from(0)) }),
+        ));
 
         let result = validate_cfg(&cfg);
         assert!(result.is_valid(), "Expected valid CFG, got errors: {:?}", result.errors);
@@ -444,13 +441,10 @@ mod tests {
 
     #[test]
     fn test_undefined_local() {
-        let cfg = Cfg {
-            entry: Block::new_for_test(
-                vec![],
-                (LocalId::from(0), Terminator::Return { value: Some(LocalId::from(99)) }), // 99 is undefined
-            ),
-            named: Default::default(),
-        };
+        let cfg = Cfg::single_entry(Block::new_for_test(
+            vec![],
+            (LocalId::from(0), Terminator::Return { value: Some(LocalId::from(99)) }), // 99 is undefined
+        ));
 
         let result = validate_cfg(&cfg);
         assert!(!result.is_valid());
@@ -519,13 +513,10 @@ mod tests {
 
     #[test]
     fn test_branch_target_not_found() {
-        let cfg = Cfg {
-            entry: Block::new_for_test(
-                vec![],
-                (LocalId::from(0), Terminator::UnconditionalBranch { target: Label::from("nonexistent".to_string()) }),
-            ),
-            named: Default::default(),
-        };
+        let cfg = Cfg::single_entry(Block::new_for_test(
+            vec![],
+            (LocalId::from(0), Terminator::UnconditionalBranch { target: Label::from("nonexistent".to_string()) }),
+        ));
 
         let result = validate_cfg(&cfg);
         assert!(!result.is_valid());
@@ -589,16 +580,13 @@ mod tests {
     #[test]
     fn test_load_from_alloc_is_valid() {
         // Load from Alloc is valid - Alloc produces a pointer
-        let cfg = Cfg {
-            entry: Block::new_for_test(
-                vec![
-                    (LocalId::from(0), Instruction::Alloc),
-                    (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
-                ],
-                (LocalId::from(2), Terminator::Return { value: Some(LocalId::from(1)) }),
-            ),
-            named: Default::default(),
-        };
+        let cfg = Cfg::single_entry(Block::new_for_test(
+            vec![
+                (LocalId::from(0), Instruction::Alloc),
+                (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
+            ],
+            (LocalId::from(2), Terminator::Return { value: Some(LocalId::from(1)) }),
+        ));
 
         let type_errors = validate_types(&cfg, &[]);
         assert!(type_errors.is_empty(), "Load from Alloc should be valid: {:?}", type_errors);
@@ -607,21 +595,18 @@ mod tests {
     #[test]
     fn test_load_from_getfield_is_valid() {
         // Load from GetField is valid - GetField produces a pointer
-        let cfg = Cfg {
-            entry: Block::new_for_test(
-                vec![
-                    (LocalId::from(0), Instruction::Alloc),
-                    (LocalId::from(1), Instruction::GetField {
-                        receiver: LocalId::from(0),
-                        field: "x".to_string(),
-                        create_if_missing: false,
-                    }),
-                    (LocalId::from(2), Instruction::Load { source: LocalId::from(1) }),
-                ],
-                (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
-            ),
-            named: Default::default(),
-        };
+        let cfg = Cfg::single_entry(Block::new_for_test(
+            vec![
+                (LocalId::from(0), Instruction::Alloc),
+                (LocalId::from(1), Instruction::GetField {
+                    receiver: LocalId::from(0),
+                    field: "x".to_string(),
+                    create_if_missing: false,
+                }),
+                (LocalId::from(2), Instruction::Load { source: LocalId::from(1) }),
+            ],
+            (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
+        ));
 
         let type_errors = validate_types(&cfg, &[]);
         assert!(type_errors.is_empty(), "Load from GetField should be valid: {:?}", type_errors);
@@ -630,16 +615,13 @@ mod tests {
     #[test]
     fn test_load_from_number_constant_is_type_error() {
         // Load from NumberConstant is a type error
-        let cfg = Cfg {
-            entry: Block::new_for_test(
-                vec![
-                    (LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(42) }),
-                    (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
-                ],
-                (LocalId::from(2), Terminator::Return { value: Some(LocalId::from(1)) }),
-            ),
-            named: Default::default(),
-        };
+        let cfg = Cfg::single_entry(Block::new_for_test(
+            vec![
+                (LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(42) }),
+                (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
+            ],
+            (LocalId::from(2), Terminator::Return { value: Some(LocalId::from(1)) }),
+        ));
 
         let type_errors = validate_types(&cfg, &[]);
         assert!(!type_errors.is_empty(), "Expected type error for Load(NumberConstant)");
@@ -649,19 +631,16 @@ mod tests {
     #[test]
     fn test_store_to_number_constant_is_type_error() {
         // Store to NumberConstant is a type error - you can only store to pointers
-        let cfg = Cfg {
-            entry: Block::new_for_test(
-                vec![
-                    (LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(42) }),
-                    (LocalId::from(1), Instruction::NumberConstant { value: Pico8Num::from_i16(99) }),
-                    // This is the type error being tested: Store to a NumberConstant.
-                    // NumberConstant produces a VALUE, not a pointer, so this should be flagged.
-                    (LocalId::from(2), Instruction::Store { target: LocalId::from(0), source: LocalId::from(1) }),
-                ],
-                (LocalId::from(3), Terminator::Return { value: None }),
-            ),
-            named: Default::default(),
-        };
+        let cfg = Cfg::single_entry(Block::new_for_test(
+            vec![
+                (LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(42) }),
+                (LocalId::from(1), Instruction::NumberConstant { value: Pico8Num::from_i16(99) }),
+                // This is the type error being tested: Store to a NumberConstant.
+                // NumberConstant produces a VALUE, not a pointer, so this should be flagged.
+                (LocalId::from(2), Instruction::Store { target: LocalId::from(0), source: LocalId::from(1) }),
+            ],
+            (LocalId::from(3), Terminator::Return { value: None }),
+        ));
 
         // Structural validation should pass
         let structural_result = validate_cfg(&cfg);
@@ -677,17 +656,14 @@ mod tests {
     #[test]
     fn test_store_to_alloc_is_valid() {
         // Store to Alloc is valid - Alloc produces a pointer
-        let cfg = Cfg {
-            entry: Block::new_for_test(
-                vec![
-                    (LocalId::from(0), Instruction::Alloc),
-                    (LocalId::from(1), Instruction::NumberConstant { value: Pico8Num::from_i16(42) }),
-                    (LocalId::from(2), Instruction::Store { target: LocalId::from(0), source: LocalId::from(1) }),
-                ],
-                (LocalId::from(3), Terminator::Return { value: None }),
-            ),
-            named: Default::default(),
-        };
+        let cfg = Cfg::single_entry(Block::new_for_test(
+            vec![
+                (LocalId::from(0), Instruction::Alloc),
+                (LocalId::from(1), Instruction::NumberConstant { value: Pico8Num::from_i16(42) }),
+                (LocalId::from(2), Instruction::Store { target: LocalId::from(0), source: LocalId::from(1) }),
+            ],
+            (LocalId::from(3), Terminator::Return { value: None }),
+        ));
 
         let type_errors = validate_types(&cfg, &[]);
         assert!(type_errors.is_empty(), "Store to Alloc should be valid: {:?}", type_errors);
