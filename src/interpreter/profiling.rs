@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-use crate::ir::{Block, Cfg, FunDef, Instruction, Label, SourceSpan, Terminator};
+use crate::ir::{Block, Cfg, FunDef, Label, SourceSpan, Terminator};
 
 /// Entry in the profiling span stack: (name, category, start_instant, dag_node_id, tree_node_id, start_step)
 type SpanStackEntry = (String, String, Instant, Option<u64>, Option<u64>, u64);
@@ -74,7 +74,7 @@ impl BlockExport {
             .instructions
             .iter()
             .take(5) // Limit to first 5 for brevity
-            .map(|(_, instr)| instruction_type_name(instr))
+            .map(|(_, instr)| instr.describe())
             .collect();
 
         Self {
@@ -84,29 +84,6 @@ impl BlockExport {
             terminator_type,
             instruction_summary,
         }
-    }
-}
-
-fn instruction_type_name(instr: &Instruction) -> String {
-    match instr {
-        Instruction::Alloc => "Alloc".to_string(),
-        Instruction::GetGlobal { name, .. } => format!("GetGlobal({})", name),
-        Instruction::Load { .. } => "Load".to_string(),
-        Instruction::Store { .. } => "Store".to_string(),
-        Instruction::StoreEmptyTable { .. } => "StoreEmptyTable".to_string(),
-        Instruction::StoreClosure { fun_def, .. } => format!("StoreClosure({})", fun_def.as_str()),
-        Instruction::GetField { field, .. } => format!("GetField({})", field),
-        Instruction::GetIndex { .. } => "GetIndex".to_string(),
-        Instruction::NumberConstant { value } => format!("Num({:?})", value),
-        Instruction::BoolConstant { value } => format!("Bool({})", value),
-        Instruction::StringConstant { value } => format!("Str({})", &value[..value.len().min(10)]),
-        Instruction::NilConstant => "Nil".to_string(),
-        Instruction::Call { .. } => "Call".to_string(),
-        Instruction::CallResolved { fun_name, .. } => format!("CallResolved({})", fun_name.as_str()),
-        Instruction::CallBuiltin { name, .. } => format!("CallBuiltin({})", name),
-        Instruction::UnaryOp { op, .. } => format!("UnaryOp({:?})", op),
-        Instruction::BinaryOp { op, .. } => format!("BinaryOp({:?})", op),
-        Instruction::Phi { .. } => "Phi".to_string(),
     }
 }
 

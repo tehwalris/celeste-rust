@@ -1384,7 +1384,7 @@ impl From<&Block> for SerializableBlock {
             .map(|(id, instr)| SerializableInstruction {
                 target_id: usize::from(*id),
                 instruction_text: format_instruction(instr),
-                instruction_type: instruction_type_name(instr).to_string(),
+                instruction_type: instr.type_name().to_string(),
             })
             .collect();
 
@@ -1518,29 +1518,6 @@ fn format_terminator(term: &Terminator) -> String {
         Terminator::Deopt { reason } => {
             format!("Deopt(\"{}\")", reason)
         }
-    }
-}
-
-fn instruction_type_name(instr: &Instruction) -> &'static str {
-    match instr {
-        Instruction::Alloc => "alloc",
-        Instruction::GetGlobal { .. } => "get_global",
-        Instruction::Load { .. } => "load",
-        Instruction::Store { .. } => "store",
-        Instruction::StoreEmptyTable { .. } => "store_empty_table",
-        Instruction::StoreClosure { .. } => "store_closure",
-        Instruction::GetField { .. } => "get_field",
-        Instruction::GetIndex { .. } => "get_index",
-        Instruction::NumberConstant { .. } => "number_constant",
-        Instruction::BoolConstant { .. } => "bool_constant",
-        Instruction::StringConstant { .. } => "string_constant",
-        Instruction::NilConstant => "nil_constant",
-        Instruction::Call { .. } => "call",
-        Instruction::CallResolved { .. } => "call_resolved",
-        Instruction::CallBuiltin { .. } => "call_builtin",
-        Instruction::UnaryOp { .. } => "unary_op",
-        Instruction::BinaryOp { .. } => "binary_op",
-        Instruction::Phi { .. } => "phi",
     }
 }
 

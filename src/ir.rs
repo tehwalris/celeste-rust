@@ -412,6 +412,60 @@ impl Instruction {
             },
         }
     }
+
+    /// Get a short type name for this instruction (lowercase snake_case).
+    ///
+    /// This is useful for profiling and statistics where you want to group
+    /// instructions by type without specific parameter details.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Self::Alloc => "alloc",
+            Self::GetGlobal { .. } => "get_global",
+            Self::Load { .. } => "load",
+            Self::Store { .. } => "store",
+            Self::StoreEmptyTable { .. } => "store_empty_table",
+            Self::StoreClosure { .. } => "store_closure",
+            Self::GetField { .. } => "get_field",
+            Self::GetIndex { .. } => "get_index",
+            Self::NumberConstant { .. } => "number_constant",
+            Self::BoolConstant { .. } => "bool_constant",
+            Self::StringConstant { .. } => "string_constant",
+            Self::NilConstant => "nil_constant",
+            Self::Call { .. } => "call",
+            Self::CallResolved { .. } => "call_resolved",
+            Self::CallBuiltin { .. } => "call_builtin",
+            Self::UnaryOp { .. } => "unary_op",
+            Self::BinaryOp { .. } => "binary_op",
+            Self::Phi { .. } => "phi",
+        }
+    }
+
+    /// Get a human-readable description of this instruction for error messages and debugging.
+    ///
+    /// This includes relevant parameter details (e.g., function names, field names, operators)
+    /// to help identify specific instructions in logs and error messages.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Alloc => "Alloc".to_string(),
+            Self::GetGlobal { name, .. } => format!("GetGlobal({})", name),
+            Self::Load { .. } => "Load".to_string(),
+            Self::Store { .. } => "Store".to_string(),
+            Self::StoreEmptyTable { .. } => "StoreEmptyTable".to_string(),
+            Self::StoreClosure { fun_def, .. } => format!("StoreClosure({})", fun_def.as_str()),
+            Self::GetField { field, .. } => format!("GetField(.{})", field),
+            Self::GetIndex { .. } => "GetIndex".to_string(),
+            Self::NumberConstant { value } => format!("NumberConstant({:?})", value),
+            Self::BoolConstant { value } => format!("BoolConstant({})", value),
+            Self::StringConstant { value } => format!("StringConstant({:?})", value),
+            Self::NilConstant => "NilConstant".to_string(),
+            Self::Call { .. } => "Call".to_string(),
+            Self::CallResolved { fun_name, .. } => format!("CallResolved({})", fun_name.as_str()),
+            Self::CallBuiltin { name, .. } => format!("CallBuiltin({})", name),
+            Self::UnaryOp { op, .. } => format!("UnaryOp({:?})", op),
+            Self::BinaryOp { op, .. } => format!("BinaryOp({:?})", op),
+            Self::Phi { branches } => format!("Phi({} branches)", branches.len()),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

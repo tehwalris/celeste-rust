@@ -319,30 +319,6 @@ fn classify_instruction(instruction: &Instruction) -> SsaType {
     }
 }
 
-/// Get a short description of an instruction for error messages
-fn describe_instruction(instruction: &Instruction) -> String {
-    match instruction {
-        Instruction::Alloc => "Alloc".to_string(),
-        Instruction::GetGlobal { name, .. } => format!("GetGlobal({})", name),
-        Instruction::GetField { field, .. } => format!("GetField(.{})", field),
-        Instruction::GetIndex { .. } => "GetIndex".to_string(),
-        Instruction::NumberConstant { .. } => "NumberConstant".to_string(),
-        Instruction::BoolConstant { value } => format!("BoolConstant({})", value),
-        Instruction::StringConstant { value } => format!("StringConstant({:?})", value),
-        Instruction::NilConstant => "NilConstant".to_string(),
-        Instruction::BinaryOp { op, .. } => format!("BinaryOp({:?})", op),
-        Instruction::UnaryOp { op, .. } => format!("UnaryOp({:?})", op),
-        Instruction::Load { .. } => "Load".to_string(),
-        Instruction::Store { .. } => "Store".to_string(),
-        Instruction::StoreEmptyTable { .. } => "StoreEmptyTable".to_string(),
-        Instruction::StoreClosure { fun_def, .. } => format!("StoreClosure({})", fun_def.as_str()),
-        Instruction::Phi { branches } => format!("Phi({} branches)", branches.len()),
-        Instruction::Call { .. } => "Call".to_string(),
-        Instruction::CallResolved { fun_name, .. } => format!("CallResolved({})", fun_name.as_str()),
-        Instruction::CallBuiltin { name, .. } => format!("CallBuiltin({})", name),
-    }
-}
-
 /// Validate type constraints in a CFG (e.g., Load must read from a pointer)
 pub fn validate_types(cfg: &Cfg, arg_types: &[(LocalId, SsaType)]) -> Vec<ValidationError> {
     let mut errors = Vec::new();
@@ -372,7 +348,7 @@ pub fn validate_types(cfg: &Cfg, arg_types: &[(LocalId, SsaType)]) -> Vec<Valida
 fn collect_types(block: &Block, local_types: &mut FxHashMap<LocalId, (SsaType, String)>) {
     for (local_id, instruction) in &block.instructions {
         let ssa_type = classify_instruction(instruction);
-        let description = describe_instruction(instruction);
+        let description = instruction.describe();
         local_types.insert(*local_id, (ssa_type, description));
     }
 }
