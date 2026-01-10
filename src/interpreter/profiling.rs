@@ -977,6 +977,14 @@ impl Drop for FixedPointGuard {
 mod tests {
     use super::*;
 
+    /// Creates a new profiler with profiling enabled.
+    /// Most tests need an enabled profiler, so this reduces boilerplate.
+    fn enabled_profiler() -> Profiler {
+        let mut profiler = Profiler::new();
+        profiler.enable();
+        profiler
+    }
+
     #[test]
     fn test_profiler_disabled_by_default() {
         let profiler = Profiler::new();
@@ -985,15 +993,13 @@ mod tests {
 
     #[test]
     fn test_profiler_enable() {
-        let mut profiler = Profiler::new();
-        profiler.enable();
+        let profiler = enabled_profiler();
         assert!(profiler.is_enabled());
     }
 
     #[test]
     fn test_dag_node_creation() {
-        let mut profiler = Profiler::new();
-        profiler.enable();
+        let mut profiler = enabled_profiler();
 
         let id = profiler.create_dag_node(5, 100, DagOperation::Entry, None);
         assert_eq!(id, 0);
@@ -1006,8 +1012,7 @@ mod tests {
 
     #[test]
     fn test_dag_node_parent_child() {
-        let mut profiler = Profiler::new();
-        profiler.enable();
+        let mut profiler = enabled_profiler();
 
         let parent_id = profiler.create_dag_node(1, 10, DagOperation::Entry, None);
         let child_id = profiler.create_dag_node(
@@ -1023,8 +1028,7 @@ mod tests {
 
     #[test]
     fn test_merged_dag_node() {
-        let mut profiler = Profiler::new();
-        profiler.enable();
+        let mut profiler = enabled_profiler();
 
         let id1 = profiler.create_dag_node(1, 10, DagOperation::Entry, None);
         let id2 = profiler.create_dag_node(2, 20, DagOperation::Entry, None);
@@ -1041,8 +1045,7 @@ mod tests {
 
     #[test]
     fn test_tree_node_creation() {
-        let mut profiler = Profiler::new();
-        profiler.enable();
+        let mut profiler = enabled_profiler();
 
         let id = profiler.enter_fixed_point(Some("test_fn".to_string()));
         assert_eq!(id, 0);
@@ -1060,8 +1063,7 @@ mod tests {
 
     #[test]
     fn test_tree_nesting() {
-        let mut profiler = Profiler::new();
-        profiler.enable();
+        let mut profiler = enabled_profiler();
 
         let parent_id = profiler.enter_fixed_point(Some("parent".to_string()));
         let child_id = profiler.enter_fixed_point(Some("child".to_string()));
@@ -1079,8 +1081,7 @@ mod tests {
 
     #[test]
     fn test_spans() {
-        let mut profiler = Profiler::new();
-        profiler.enable();
+        let mut profiler = enabled_profiler();
 
         profiler.start_span("test_span", "test_category");
         std::thread::sleep(Duration::from_millis(10));
@@ -1095,8 +1096,7 @@ mod tests {
 
     #[test]
     fn test_span_with_args() {
-        let mut profiler = Profiler::new();
-        profiler.enable();
+        let mut profiler = enabled_profiler();
 
         profiler.start_span("test_span", "test_category");
         let mut args = std::collections::HashMap::new();
@@ -1109,8 +1109,7 @@ mod tests {
 
     #[test]
     fn test_chrome_tracing_json() {
-        let mut profiler = Profiler::new();
-        profiler.enable();
+        let mut profiler = enabled_profiler();
 
         profiler.start_span("test", "cat");
         profiler.end_span();
@@ -1123,8 +1122,7 @@ mod tests {
 
     #[test]
     fn test_summary() {
-        let mut profiler = Profiler::new();
-        profiler.enable();
+        let mut profiler = enabled_profiler();
 
         profiler.create_dag_node(1, 10, DagOperation::Entry, None);
         profiler.create_dag_node(2, 20, DagOperation::BuiltinSplit { builtin_name: "test".to_string() }, None);
@@ -1144,8 +1142,7 @@ mod tests {
     fn test_span_guard() {
         // Test the RAII span behavior using a local profiler to avoid global state races.
         // SpanGuard wraps start_span/end_span_with_args, which we test directly.
-        let mut profiler = Profiler::new();
-        profiler.enable();
+        let mut profiler = enabled_profiler();
 
         // Simulate what SpanGuard does: start span, then end with args on drop
         profiler.start_span("test", "cat");
@@ -1160,8 +1157,7 @@ mod tests {
     fn test_fixed_point_guard() {
         // Test the RAII fixed point behavior using a local profiler to avoid global state races.
         // FixedPointGuard wraps enter_fixed_point/update_tree_node/exit_fixed_point.
-        let mut profiler = Profiler::new();
-        profiler.enable();
+        let mut profiler = enabled_profiler();
 
         // Simulate what FixedPointGuard does
         let id = profiler.enter_fixed_point(Some("test_fn".to_string()));
@@ -1175,8 +1171,7 @@ mod tests {
 
     #[test]
     fn test_dag_tree_association() {
-        let mut profiler = Profiler::new();
-        profiler.enable();
+        let mut profiler = enabled_profiler();
 
         let tree_id = profiler.enter_fixed_point(Some("test".to_string()));
         let dag_id = profiler.create_dag_node(1, 10, DagOperation::Entry, None);
