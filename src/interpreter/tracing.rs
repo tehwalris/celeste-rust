@@ -27,7 +27,7 @@ static TRACING_ENABLED: AtomicBool = AtomicBool::new(false);
 /// Stored as nanos since some arbitrary point.
 static TRACE_EPOCH_NANOS: AtomicU64 = AtomicU64::new(0);
 
-/// Thread-local instant for the trace epoch
+// Thread-local instant for the trace epoch
 thread_local! {
     static LOCAL_EPOCH: RefCell<Option<Instant>> = const { RefCell::new(None) };
 }

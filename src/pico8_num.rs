@@ -269,7 +269,7 @@ impl fmt::Debug for Pico8NumInterval {
 
 #[cfg(test)]
 mod tests {
-    use crate::pico8_num::{constants, int, Pico8Num, Pico8NumInterval};
+    use crate::pico8_num::{constants, int, Pico8Num};
 
     #[test]
     fn test_from_i16() {

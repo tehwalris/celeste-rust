@@ -68,18 +68,17 @@ struct PlayerSummary {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct PlayerSpawnSummary {
     x: NumOrInterval,
     y: NumOrInterval,
-    #[allow(dead_code)]
     state: NumOrInterval,
-    #[allow(dead_code)]
     delay: NumOrInterval,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct StateSummary {
-    #[allow(dead_code)]
     object_count: usize,
     player: Option<PlayerSummary>,
     player_spawn: Option<PlayerSpawnSummary>,
@@ -108,6 +107,7 @@ struct NewFrameDump {
 
 // Types for reference format
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ReferencePosition {
     x: i32,
     y: i32,
