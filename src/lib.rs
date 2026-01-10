@@ -13,6 +13,7 @@ extern crate work_queue;
 pub mod block_flow;
 pub mod cart_data;
 pub mod collision_cache;
+pub mod common;
 pub mod fixed_point;
 pub mod frontend;
 pub mod game_runner;

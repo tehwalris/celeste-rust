@@ -16,15 +16,8 @@
 //!
 //! This eliminates heap lookups for builtin function calls.
 
-use std::collections::{HashMap, HashSet};
-use std::hash::BuildHasherDefault;
-
-use rustc_hash::FxHasher;
-
+use crate::interpreter::common::{FxHashMap, FxHashSet};
 use crate::ir::{Block, Cfg, Instruction, LocalId};
-
-type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
-type FxHashSet<T> = HashSet<T, BuildHasherDefault<FxHasher>>;
 
 /// A set of known builtin function names.
 pub type BuiltinSet = FxHashSet<String>;

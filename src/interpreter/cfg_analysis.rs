@@ -7,16 +7,12 @@
 //! - Whether it can modify the heap shape (allocations, table operations)
 //! - Whether it contains function calls
 
-use std::collections::{HashMap, HashSet};
-use std::hash::BuildHasherDefault;
+use std::collections::HashSet;
 
-use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
 
+use crate::interpreter::common::{FxHashMap, FxHashSet};
 use crate::ir::{Block, Cfg, Instruction, LocalId, Terminator};
-
-type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
-type FxHashSet<T> = HashSet<T, BuildHasherDefault<FxHasher>>;
 
 /// Clean up phi nodes that reference undefined locals.
 ///

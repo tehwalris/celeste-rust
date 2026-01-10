@@ -2,15 +2,11 @@
 //! Used to mark and transform heap values (e.g., make player position abstract).
 //! Also provides state summarization for debugging and visualization.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
-use std::hash::BuildHasherDefault;
 use std::io::{BufRead, Write};
 
-use rustc_hash::FxHasher;
-
-type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
-type HashMap<K, V> = std::collections::HashMap<K, V>;
+use crate::interpreter::common::FxHashMap;
 
 /// Error type for heap inspection operations
 #[derive(Debug, Clone)]

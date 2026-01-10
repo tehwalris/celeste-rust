@@ -11,17 +11,11 @@
 //! - Arguments mapped to the provided argument values
 //! - Returns converted to assignments + branches to a continuation block
 
-use std::collections::HashMap;
-use std::hash::BuildHasherDefault;
-
-use rustc_hash::FxHasher;
-
+use crate::interpreter::common::FxHashMap;
 use crate::ir::{
     Block, Cfg, FunDef, GlobalId, Instruction, Label, LabelGenerator, LocalId, LocalIdGenerator,
     Terminator,
 };
-
-type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 /// Result of the inlining pass.
 #[derive(Debug)]

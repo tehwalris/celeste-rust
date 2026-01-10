@@ -4,15 +4,8 @@
 //! After call resolution and inlining, we often have dead `GetGlobal` and `Load`
 //! instructions that were only used to set up the original Call.
 
-use std::collections::{HashMap, HashSet};
-use std::hash::BuildHasherDefault;
-
-use rustc_hash::FxHasher;
-
+use crate::interpreter::common::{FxHashMap, FxHashSet};
 use crate::ir::{Block, Cfg, Instruction, Label, LocalId, Terminator};
-
-type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
-type FxHashSet<T> = HashSet<T, BuildHasherDefault<FxHasher>>;
 
 /// Result of the DCE pass.
 #[derive(Debug)]

@@ -1,6 +1,7 @@
 pub mod block_coalesce;
 pub mod builtin_resolution;
 pub mod call_resolution;
+pub mod common;
 pub mod cfg_analysis;
 pub mod cfg_validation;
 mod core_interpreter;

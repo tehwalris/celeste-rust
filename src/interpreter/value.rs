@@ -1,14 +1,9 @@
-use std::hash::BuildHasherDefault;
-
 use itertools::Itertools;
-use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
 
+use super::common::FxHashMap;
 use super::heap::HeapId;
 use crate::{ir::GlobalId, pico8_num::{Pico8Num, Pico8NumInterval}};
-
-// Use FxHashMap for faster hashing in ObjectTable
-type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MaybeVector<T: std::fmt::Debug + Clone + PartialEq + Eq> {

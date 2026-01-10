@@ -9,16 +9,10 @@
 //! This is sufficient for call resolution, which only needs to know WHERE a closure
 //! comes from (which slot), not WHAT its value is.
 
-use std::collections::HashMap;
-use std::hash::BuildHasherDefault;
-
-use rustc_hash::FxHasher;
-
 use crate::interpreter::call_resolution::GlobalClosureMap;
+use crate::interpreter::common::FxHashMap;
 use crate::interpreter::heap_elimination::{HeapPath, HeapShape, HeapSlot, ValueShape};
 use crate::ir::{Block, Cfg, GlobalId, Instruction, Label, LocalId, Terminator};
-
-type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 /// Tracks which LocalId points to which HeapSlot (or unknown)
 #[derive(Debug, Clone)]

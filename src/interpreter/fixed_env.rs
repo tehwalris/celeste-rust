@@ -1,8 +1,6 @@
-use std::hash::BuildHasherDefault;
 use std::sync::Arc;
 
 use indexmap::IndexSet;
-use rustc_hash::FxHasher;
 
 use crate::ir::{Cfg, FunDef, GlobalId, Label, LocalId, LocalIdGenerator};
 
@@ -11,11 +9,9 @@ use super::builtin_resolution::BuiltinSet;
 use super::call_resolution::build_global_closure_map_from_fun_defs;
 use super::cfg_analysis::optimize_all_functions;
 use super::cfg_validation::assert_valid_cfg_with_args;
+use super::common::FxHashMap;
 use super::mem2reg::{mem2reg, Mem2RegResult};
 use super::{state::State, value::Value};
-
-// Use FxHashMap for faster hashing in FixedEnv
-type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 /// A builtin function takes a state and argument values, returns multiple possible (state, return_value) pairs.
 /// Multiple pairs are returned when the function can branch (e.g., on UnknownBool).

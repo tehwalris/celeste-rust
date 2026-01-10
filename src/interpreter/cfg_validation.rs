@@ -7,15 +7,8 @@
 //! - Duplicate local ID definitions
 //! - Type mismatches (e.g., Load from a value instead of pointer)
 
-use std::collections::{HashMap, HashSet};
-use std::hash::BuildHasherDefault;
-
-use rustc_hash::FxHasher;
-
+use crate::interpreter::common::{FxHashMap, FxHashSet};
 use crate::ir::{Block, Cfg, Instruction, Label, LocalId, Terminator};
-
-type FxHashSet<T> = HashSet<T, BuildHasherDefault<FxHasher>>;
-type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 /// The "type" of a value in SSA form - used for validation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -619,8 +612,6 @@ mod tests {
 
     #[test]
     fn test_duplicate_definition() {
-        type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
-
         let mut named = FxHashMap::default();
         named.insert(
             Label::from("block1".to_string()),
@@ -651,8 +642,6 @@ mod tests {
 
     #[test]
     fn test_phi_references_nonexistent_block() {
-        type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
-
         let mut named = FxHashMap::default();
         named.insert(
             Label::from("join".to_string()),
@@ -705,8 +694,6 @@ mod tests {
     fn test_load_from_phi_is_type_error() {
         // This tests the Load(Phi) pattern that heap elimination produces
         // Phi produces a VALUE, not a pointer, so Load(Phi) is a type error
-        type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
-
         let mut named = FxHashMap::default();
         named.insert(
             Label::from("join".to_string()),

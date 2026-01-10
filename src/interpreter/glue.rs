@@ -1,13 +1,10 @@
-use std::hash::BuildHasherDefault;
 use std::time::Instant;
 
 use anyhow::Result;
 use indexmap::IndexSet;
 use petgraph::prelude::GraphMap;
-use rustc_hash::FxHasher;
 
-type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
-
+use crate::interpreter::common::FxHashMap;
 use crate::{
     block_flow::{flow_graph_of_cfg, BoundMergedBlockFlow, BoundSplitBlockFlow, FlowNode, UnboundSplitBlockFlow},
     fixed_point::Analysis,

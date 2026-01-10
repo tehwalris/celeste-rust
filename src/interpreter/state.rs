@@ -1,8 +1,6 @@
-use std::hash::BuildHasherDefault;
-
-use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
 
+use super::common::FxHashMap;
 use super::{
     heap::{Heap, HeapId},
     local_env::LocalEnv,
@@ -10,10 +8,6 @@ use super::{
     value::{HeapValue, Value},
 };
 use crate::ir::LocalId;
-
-// Use FxHash for faster hashing
-type FxBuildHasher = BuildHasherDefault<FxHasher>;
-type FxHashMap<K, V> = std::collections::HashMap<K, V, FxBuildHasher>;
 
 // OrdMap is a sorted map, so iteration is already in sorted order.
 // This eliminates the need to sort in shape_of_state.

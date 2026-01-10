@@ -32,14 +32,8 @@
 //!
 //! This enables subsequent inlining and eliminates heap lookups.
 
-use std::collections::HashMap;
-use std::hash::BuildHasherDefault;
-
-use rustc_hash::FxHasher;
-
+use crate::interpreter::common::FxHashMap;
 use crate::ir::{Block, Cfg, GlobalId, Instruction, LocalId};
-
-type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 /// Information about a closure stored in a global.
 #[derive(Clone, Debug)]

@@ -12,20 +12,15 @@
 //!
 //! Uses the Braun algorithm for on-demand SSA construction.
 
-use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::hash::BuildHasherDefault;
 
-use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
 
+use crate::interpreter::common::{FxHashMap, FxHashSet};
 use crate::ir::{
     Block, Cfg, GlobalId, Instruction, Label, LabelGenerator, LocalId, LocalIdGenerator, Terminator,
 };
 use crate::pico8_num::Pico8Num;
-
-type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
-type FxHashSet<T> = HashSet<T, BuildHasherDefault<FxHasher>>;
 
 /// A path into the heap, representing a specific memory location.
 /// For example: `player.pos.x` or `globals.room`
@@ -1333,8 +1328,6 @@ pub fn eliminate_heap(
 mod tests {
     use super::*;
     use crate::pico8_num::Pico8Num;
-
-    type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
     fn make_local_gen() -> LocalIdGenerator {
         LocalIdGenerator::new()

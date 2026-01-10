@@ -1,7 +1,4 @@
-use std::hash::BuildHasherDefault;
-
-use rustc_hash::FxHasher;
-
+use super::common::FxHashMap;
 use super::{
     fixed_env::FixedEnv,
     heap::HeapId,
@@ -13,8 +10,6 @@ use super::{
 };
 use crate::ir::{GlobalId, Instruction, LocalId};
 use anyhow::{anyhow, Result};
-
-type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 pub struct CoreInterpreter<'a> {
     state: State,

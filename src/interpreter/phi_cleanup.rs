@@ -8,17 +8,10 @@
 //!
 //! This is intentionally strict - it only handles Phi cleanup, nothing else.
 
-use std::collections::{HashMap, HashSet};
-use std::hash::BuildHasherDefault;
-
-use rustc_hash::FxHasher;
-
+use crate::interpreter::common::{FxHashMap, FxHashSet};
 use crate::ir::{Block, Cfg, Instruction, Label, LocalId, Terminator};
 #[cfg(test)]
 use crate::ir::BinaryOp;
-
-type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
-type FxHashSet<T> = HashSet<T, BuildHasherDefault<FxHasher>>;
 
 /// Result of phi cleanup
 #[derive(Debug)]

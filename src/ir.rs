@@ -1,11 +1,7 @@
-use std::hash::BuildHasherDefault;
-
-use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
 
+use crate::common::FxHashMap;
 use crate::pico8_num::Pico8Num;
-
-type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 /// A source location representing a position in the original Lua source code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

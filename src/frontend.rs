@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::hash::BuildHasherDefault;
 
 use anyhow::{bail, Result};
 use full_moon::{
@@ -7,11 +6,10 @@ use full_moon::{
     node::Node,
     tokenizer::{Symbol, TokenReference, TokenType},
 };
-use rustc_hash::FxHasher;
 
 use itertools::Itertools;
 
-type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
+use crate::common::FxHashMap;
 
 use crate::{
     ir::{
