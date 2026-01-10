@@ -57,7 +57,7 @@ impl<'a> InlineContext<'a> {
         *self
             .local_mapping
             .entry(callee_local)
-            .or_insert_with(|| self.local_gen.next())
+            .or_insert_with(|| self.local_gen.fresh_id())
     }
 
     /// Get or create a caller label for a callee label.
@@ -219,7 +219,7 @@ fn inline_calls_in_block(
                                 ctx.set_local_mapping(*callee_arg_id, args[i]);
                             } else {
                                 // Missing arg - create a nil constant
-                                let nil_local = ctx.local_gen.next();
+                                let nil_local = ctx.local_gen.fresh_id();
                                 new_instructions.push((nil_local, Instruction::NilConstant));
                                 ctx.set_local_mapping(*callee_arg_id, nil_local);
                             }
@@ -294,7 +294,7 @@ fn inline_calls_in_block(
                     let result_block = Block {
                         instructions: new_instructions,
                         terminator: (
-                            ctx.local_gen.next(),
+                            ctx.local_gen.fresh_id(),
                             Terminator::UnconditionalBranch { target: entry_label.clone() },
                         ),
                         hint_normalize: block.hint_normalize,
@@ -355,7 +355,7 @@ fn inline_block_body(
                 ctx.map_local(*return_value_local)
             } else {
                 // No return value - create a nil constant
-                let nil_local = ctx.local_gen.next();
+                let nil_local = ctx.local_gen.fresh_id();
                 new_instructions.push((nil_local, Instruction::NilConstant));
                 nil_local
             };
@@ -504,7 +504,7 @@ mod tests {
         let mut local_gen = LocalIdGenerator::new();
         // Skip the first few IDs that the caller already uses
         for _ in 0..10 {
-            local_gen.next();
+            local_gen.fresh_id();
         }
         let mut label_gen = LabelGenerator::new();
 

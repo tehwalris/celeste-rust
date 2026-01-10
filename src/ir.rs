@@ -66,7 +66,8 @@ impl LocalIdGenerator {
         Self { next_id: max_id }
     }
 
-    pub fn next(&mut self) -> LocalId {
+    /// Generate a fresh unique LocalId
+    pub fn fresh_id(&mut self) -> LocalId {
         let id = LocalId(self.next_id);
         self.next_id += 1;
         id

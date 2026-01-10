@@ -484,7 +484,7 @@ impl SsaBuilder {
         // First, check for cycles
         if self.in_progress.contains(&key) {
             // We're in a cycle - create a placeholder phi node
-            let phi_id = self.local_gen.next();
+            let phi_id = self.local_gen.fresh_id();
             self.slot_versions.insert(key.clone(), phi_id);
             return phi_id;
         }
@@ -493,7 +493,7 @@ impl SsaBuilder {
         self.in_progress.insert(key.clone());
 
         // Create phi node with placeholder
-        let phi_id = self.local_gen.next();
+        let phi_id = self.local_gen.fresh_id();
         self.slot_versions.insert(key.clone(), phi_id);
 
         // Collect incoming values from predecessors
@@ -797,7 +797,7 @@ fn transform_block(
                         DeoptMode::Insert => {
                             // Generate a fresh ID for the Deopt terminator
                             // (can't use *target_id - it might already be used by an instruction we included)
-                            let deopt_terminator_id = ssa_builder.local_gen.next();
+                            let deopt_terminator_id = ssa_builder.local_gen.fresh_id();
                             return BlockTransformResult::NeedsDeopt {
                                 instructions: rewritten,
                                 reason: $reason,
@@ -1129,7 +1129,7 @@ pub fn eliminate_heap(
     // Create initial versions for all slots (unpack phase conceptually)
     let mut unpack_slots = Vec::new();
     for slot in &leaf_slots {
-        let initial_id = ssa_builder.local_gen.next();
+        let initial_id = ssa_builder.local_gen.fresh_id();
         ssa_builder.set_initial_version(slot.clone(), initial_id);
         unpack_slots.push((slot.clone(), initial_id));
     }

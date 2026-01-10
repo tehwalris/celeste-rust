@@ -630,7 +630,7 @@ fn promote_cell_with_ssa(
                             return false;
                         }
 
-                        let phi_id = local_gen.next();
+                        let phi_id = local_gen.fresh_id();
                         phi_nodes.insert(block_id.clone(), (phi_id, phi_branches));
                         load_replacements.insert(*load_target, phi_id);
                     }

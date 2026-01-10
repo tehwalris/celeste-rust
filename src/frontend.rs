@@ -99,7 +99,7 @@ impl Stream {
         let stream = self.map_local_ids(|old_id| match new_ids_by_old_ids.get(&old_id) {
             Some(new_id) => *new_id,
             None => {
-                let new_id = id_generator.next();
+                let new_id = id_generator.fresh_id();
                 new_ids_by_old_ids.insert(old_id, new_id);
                 new_id
             }
@@ -206,7 +206,7 @@ impl Compiler {
     }
 
     fn gen_id_and_stream(&mut self, instruction: Instruction) -> (LocalId, Stream) {
-        let id = self.local_id_generator.next();
+        let id = self.local_id_generator.fresh_id();
         let stream = Stream::from_element(StreamElement::Instruction(id, instruction));
         (id, stream)
     }
@@ -216,7 +216,7 @@ impl Compiler {
             return;
         }
         stream.0.push(StreamElement::Terminator(
-            self.local_id_generator.next(),
+            self.local_id_generator.fresh_id(),
             terminator,
         ));
     }
@@ -481,7 +481,7 @@ impl Compiler {
     ) -> Result<(LocalId, Stream)> {
         let (left_id, _, left_stream) = self.compile_rhs_expression(left_expr, locals, None)?;
         let (right_id, _, right_stream) = self.compile_rhs_expression(right_expr, locals, None)?;
-        let result_id = self.local_id_generator.next();
+        let result_id = self.local_id_generator.fresh_id();
         let left_label = self.label_generator.next("and_or_left");
         let right_label = self.label_generator.next("and_or_right");
         let continue_label = self.label_generator.next("and_or_continue");
@@ -495,14 +495,14 @@ impl Compiler {
             left_stream,
             Stream(vec![
                 StreamElement::Terminator(
-                    self.local_id_generator.next(),
+                    self.local_id_generator.fresh_id(),
                     Terminator::UnconditionalBranch {
                         target: left_label.clone(),
                     },
                 ),
                 StreamElement::Label(left_label.clone()),
                 StreamElement::Terminator(
-                    self.local_id_generator.next(),
+                    self.local_id_generator.fresh_id(),
                     Terminator::ConditionalBranch {
                         condition: left_id,
                         true_target: true_label.clone(),
@@ -514,14 +514,14 @@ impl Compiler {
             right_stream,
             Stream(vec![
                 StreamElement::Terminator(
-                    self.local_id_generator.next(),
+                    self.local_id_generator.fresh_id(),
                     Terminator::UnconditionalBranch {
                         target: right_label.clone(),
                     },
                 ),
                 StreamElement::Label(right_label.clone()),
                 StreamElement::Terminator(
-                    self.local_id_generator.next(),
+                    self.local_id_generator.fresh_id(),
                     Terminator::UnconditionalBranch {
                         target: join_label.clone(),
                     },
@@ -558,11 +558,11 @@ impl Compiler {
 
         let inner_arg_val_ids: Vec<_> = params
             .iter()
-            .map(|_| self.local_id_generator.next())
+            .map(|_| self.local_id_generator.fresh_id())
             .collect();
         let inner_arg_var_ids: Vec<_> = params
             .iter()
-            .map(|_| self.local_id_generator.next())
+            .map(|_| self.local_id_generator.fresh_id())
             .collect();
 
         let mut arg_var_stream = Stream::new();
@@ -571,7 +571,7 @@ impl Compiler {
                 .0
                 .push(StreamElement::Instruction(*var_id, Instruction::Alloc));
             arg_var_stream.0.push(StreamElement::Instruction(
-                self.local_id_generator.next(),
+                self.local_id_generator.fresh_id(),
                 Instruction::Store {
                     target: *var_id,
                     source: *val_id,
@@ -587,7 +587,7 @@ impl Compiler {
 
         let inner_capture_ids: Vec<_> = sorted_outer_locals
             .iter()
-            .map(|_| self.local_id_generator.next())
+            .map(|_| self.local_id_generator.fresh_id())
             .collect();
         let mut inner_locals = HashMap::new();
         for ((name, _outer_id), inner_id) in
@@ -608,7 +608,7 @@ impl Compiler {
             Some(StreamElement::Terminator(_, Terminator::Return { .. })) => {}
             _ => {
                 inner_stream.0.push(StreamElement::Terminator(
-                    self.local_id_generator.next(),
+                    self.local_id_generator.fresh_id(),
                     Terminator::Return { value: None },
                 ));
             }
@@ -640,7 +640,7 @@ impl Compiler {
             source_span,
         };
 
-        let closure_id = self.local_id_generator.next();
+        let closure_id = self.local_id_generator.fresh_id();
         let mut outer_stream = Stream(
             inner_build_result
                 .fun_defs
@@ -653,7 +653,7 @@ impl Compiler {
             .0
             .push(StreamElement::Instruction(closure_id, Instruction::Alloc));
         outer_stream.0.push(StreamElement::Instruction(
-            self.local_id_generator.next(),
+            self.local_id_generator.fresh_id(),
             Instruction::StoreClosure {
                 target: closure_id,
                 fun_def: global_name,
@@ -672,11 +672,11 @@ impl Compiler {
     ) -> Result<(LocalId, Option<String>, Stream)> {
         match expression {
             ast::Expression::TableConstructor(table) => {
-                let table_id = self.local_id_generator.next();
+                let table_id = self.local_id_generator.fresh_id();
                 let mut stream = Stream(vec![
                     StreamElement::Instruction(table_id, Instruction::Alloc),
                     StreamElement::Instruction(
-                        self.local_id_generator.next(),
+                        self.local_id_generator.fresh_id(),
                         Instruction::StoreEmptyTable { target: table_id },
                     ),
                 ]);
@@ -688,7 +688,7 @@ impl Compiler {
                             value,
                         } => {
                             let name = identifier_from_token_reference(key)?;
-                            let field_id = self.local_id_generator.next();
+                            let field_id = self.local_id_generator.fresh_id();
                             let hint = match &hint_from_parent {
                                 Some(h) => Some(format!("{}.{}", h, name)),
                                 None => Some(name.to_string()),
@@ -708,7 +708,7 @@ impl Compiler {
                                 },
                             ));
                             stream.0.push(StreamElement::Instruction(
-                                self.local_id_generator.next(),
+                                self.local_id_generator.fresh_id(),
                                 Instruction::Store {
                                     target: field_id,
                                     source: value_id,
@@ -1008,7 +1008,7 @@ impl Compiler {
                     lhs_stream,
                     rhs_stream,
                     Stream::from_element(StreamElement::Instruction(
-                        self.local_id_generator.next(),
+                        self.local_id_generator.fresh_id(),
                         Instruction::Store {
                             target: lhs_id,
                             source: rhs_id,
@@ -1036,7 +1036,7 @@ impl Compiler {
                     let (rhs_id, _, rhs_stream) =
                         self.compile_rhs_expression(expression, &locals, None)?;
                     stream.0.extend(rhs_stream.0);
-                    let store_id = self.local_id_generator.next();
+                    let store_id = self.local_id_generator.fresh_id();
                     stream.0.push(StreamElement::Instruction(
                         store_id,
                         Instruction::Store {
@@ -1095,7 +1095,7 @@ impl Compiler {
 
                 let stream = Stream::from_streams(vec![
                     Stream::from_element(StreamElement::Terminator(
-                        self.local_id_generator.next(),
+                        self.local_id_generator.fresh_id(),
                         Terminator::UnconditionalBranch {
                             target: first_condition_label,
                         },
@@ -1124,7 +1124,7 @@ impl Compiler {
                                         Stream::from_element(StreamElement::Label(condition_label)),
                                         condition_stream,
                                         Stream::from_element(StreamElement::Terminator(
-                                            self.local_id_generator.next(),
+                                            self.local_id_generator.fresh_id(),
                                             Terminator::ConditionalBranch {
                                                 condition: condition_id,
                                                 true_target: body_label.clone(),
@@ -1168,7 +1168,7 @@ impl Compiler {
                         closure_stream,
                         name_stream,
                         Stream::from_element(StreamElement::Instruction(
-                            self.local_id_generator.next(),
+                            self.local_id_generator.fresh_id(),
                             Instruction::Store {
                                 target: name_id,
                                 source: closure_id,
@@ -1188,11 +1188,11 @@ impl Compiler {
                 let (end_id, _, end_stream) =
                     self.compile_rhs_expression(for_statement.end(), &locals, None)?;
 
-                let val_id = self.local_id_generator.next();
-                let var_id = self.local_id_generator.next();
-                let step_id = self.local_id_generator.next();
-                let next_val_id = self.local_id_generator.next();
-                let continue_id = self.local_id_generator.next();
+                let val_id = self.local_id_generator.fresh_id();
+                let var_id = self.local_id_generator.fresh_id();
+                let step_id = self.local_id_generator.fresh_id();
+                let next_val_id = self.local_id_generator.fresh_id();
+                let continue_id = self.local_id_generator.fresh_id();
                 let init_end_label = self.label_generator.next("for_init_end");
                 let head_label = self.label_generator.next("for_head");
                 let body_start_label = self.label_generator.next("for_body_start");
@@ -1218,14 +1218,14 @@ impl Compiler {
                             },
                         ),
                         StreamElement::Terminator(
-                            self.local_id_generator.next(),
+                            self.local_id_generator.fresh_id(),
                             Terminator::UnconditionalBranch {
                                 target: init_end_label.clone(),
                             },
                         ),
                         StreamElement::Label(init_end_label.clone()),
                         StreamElement::Terminator(
-                            self.local_id_generator.next(),
+                            self.local_id_generator.fresh_id(),
                             Terminator::UnconditionalBranch {
                                 target: head_label.clone(),
                             },
@@ -1249,7 +1249,7 @@ impl Compiler {
                             },
                         ),
                         StreamElement::Terminator(
-                            self.local_id_generator.next(),
+                            self.local_id_generator.fresh_id(),
                             Terminator::ConditionalBranch {
                                 condition: continue_id,
                                 true_target: body_start_label.clone(),
@@ -1259,7 +1259,7 @@ impl Compiler {
                         StreamElement::Label(body_start_label),
                         StreamElement::Instruction(var_id, Instruction::Alloc),
                         StreamElement::Instruction(
-                            self.local_id_generator.next(),
+                            self.local_id_generator.fresh_id(),
                             Instruction::Store {
                                 target: var_id,
                                 source: val_id,
@@ -1277,14 +1277,14 @@ impl Compiler {
                             },
                         ),
                         StreamElement::Terminator(
-                            self.local_id_generator.next(),
+                            self.local_id_generator.fresh_id(),
                             Terminator::UnconditionalBranch {
                                 target: body_end_label.clone(),
                             },
                         ),
                         StreamElement::Label(body_end_label),
                         StreamElement::Terminator(
-                            self.local_id_generator.next(),
+                            self.local_id_generator.fresh_id(),
                             Terminator::UnconditionalBranch { target: head_label },
                         ),
                         StreamElement::Label(join_label),
@@ -1317,7 +1317,7 @@ impl Compiler {
                         Ok(Stream::from_streams(vec![
                             expr_stream,
                             Stream::from_element(StreamElement::Terminator(
-                                self.local_id_generator.next(),
+                                self.local_id_generator.fresh_id(),
                                 Terminator::Return {
                                     value: Some(expr_id),
                                 },
@@ -1325,13 +1325,13 @@ impl Compiler {
                         ]))
                     }
                     None => Ok(Stream::from_element(StreamElement::Terminator(
-                        self.local_id_generator.next(),
+                        self.local_id_generator.fresh_id(),
                         Terminator::Return { value: None },
                     ))),
                 }
             }
             ast::LastStmt::Break(_) => Ok(Stream::from_element(StreamElement::Terminator(
-                self.local_id_generator.next(),
+                self.local_id_generator.fresh_id(),
                 Terminator::UnconditionalBranch {
                     target: break_label.unwrap().clone(),
                 },
