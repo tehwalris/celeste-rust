@@ -446,6 +446,90 @@ pub struct OptimizationCfgs {
     pub after_deopt_builtins: Option<Cfg>,
 }
 
+impl OptimizationCfgs {
+    /// Returns the latest CFG from the pipeline, checking passes in reverse order.
+    ///
+    /// The passes are checked in the order they run in the pipeline (latest first):
+    /// heap_elim → deopt_builtins → block_coalesce → dce → inlining → call_resolution
+    /// → builtin_resolution → mem2reg
+    ///
+    /// Returns `None` if no passes have produced a CFG yet.
+    pub fn latest_cfg(&self) -> Option<&Cfg> {
+        self.after_heap_elim
+            .as_ref()
+            .or(self.after_deopt_builtins.as_ref())
+            .or(self.after_block_coalesce.as_ref())
+            .or(self.after_dce.as_ref())
+            .or(self.after_inlining.as_ref())
+            .or(self.after_call_resolution.as_ref())
+            .or(self.after_builtin_resolution.as_ref())
+            .or(self.after_mem2reg.as_ref())
+    }
+
+    /// Returns the latest CFG up to and including the specified pass.
+    ///
+    /// This is useful when a pass needs to use the result of earlier passes but
+    /// not later passes (e.g., when the later passes haven't run yet).
+    pub fn latest_cfg_through(&self, pass: PipelinePass) -> Option<&Cfg> {
+        match pass {
+            PipelinePass::HeapElim => self.latest_cfg(),
+            PipelinePass::DeoptBuiltins => self
+                .after_deopt_builtins
+                .as_ref()
+                .or(self.after_block_coalesce.as_ref())
+                .or(self.after_dce.as_ref())
+                .or(self.after_inlining.as_ref())
+                .or(self.after_call_resolution.as_ref())
+                .or(self.after_builtin_resolution.as_ref())
+                .or(self.after_mem2reg.as_ref()),
+            PipelinePass::BlockCoalesce => self
+                .after_block_coalesce
+                .as_ref()
+                .or(self.after_dce.as_ref())
+                .or(self.after_inlining.as_ref())
+                .or(self.after_call_resolution.as_ref())
+                .or(self.after_builtin_resolution.as_ref())
+                .or(self.after_mem2reg.as_ref()),
+            PipelinePass::Dce => self
+                .after_dce
+                .as_ref()
+                .or(self.after_inlining.as_ref())
+                .or(self.after_call_resolution.as_ref())
+                .or(self.after_builtin_resolution.as_ref())
+                .or(self.after_mem2reg.as_ref()),
+            PipelinePass::Inlining => self
+                .after_inlining
+                .as_ref()
+                .or(self.after_call_resolution.as_ref())
+                .or(self.after_builtin_resolution.as_ref())
+                .or(self.after_mem2reg.as_ref()),
+            PipelinePass::CallResolution => self
+                .after_call_resolution
+                .as_ref()
+                .or(self.after_builtin_resolution.as_ref())
+                .or(self.after_mem2reg.as_ref()),
+            PipelinePass::BuiltinResolution => self
+                .after_builtin_resolution
+                .as_ref()
+                .or(self.after_mem2reg.as_ref()),
+            PipelinePass::Mem2Reg => self.after_mem2reg.as_ref(),
+        }
+    }
+}
+
+/// Pipeline passes in the order they are executed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PipelinePass {
+    Mem2Reg,
+    BuiltinResolution,
+    CallResolution,
+    Inlining,
+    Dce,
+    BlockCoalesce,
+    DeoptBuiltins,
+    HeapElim,
+}
+
 /// Optimized function definition with its CFG.
 #[derive(Clone, Debug)]
 pub struct OptimizedFunDef {
@@ -914,9 +998,8 @@ fn run_optimization_pipeline_with_interprocedural_inner(
     cfgs.after_builtin_resolution = after_builtin_resolution.clone();
 
     // Get the CFG for the iteration loop
-    let cfg_for_loop = after_builtin_resolution
-        .as_ref()
-        .or(after_mem2reg.as_ref())
+    let cfg_for_loop = cfgs
+        .latest_cfg_through(PipelinePass::BuiltinResolution)
         .unwrap_or(cfg);
 
     // Stage 2: Iterative heap elimination (Stop mode) + inlining
@@ -1018,10 +1101,8 @@ fn run_optimization_pipeline_with_interprocedural_inner(
     // Stage 3: Dead code elimination
     // After inlining, there may be unused GetGlobal/Load instructions that were only used
     // to set up the original Call (which has been replaced by inlined code)
-    let cfg_for_dce = after_inlining
-        .as_ref()
-        .or(after_builtin_resolution.as_ref())
-        .or(after_mem2reg.as_ref())
+    let cfg_for_dce = cfgs
+        .latest_cfg_through(PipelinePass::Inlining)
         .unwrap_or(cfg);
 
     let after_dce = match eliminate_dead_code(cfg_for_dce) {
@@ -1043,11 +1124,8 @@ fn run_optimization_pipeline_with_interprocedural_inner(
     cfgs.after_dce = after_dce.clone();
 
     // Stage 4: block coalescing - merge straight-line blocks
-    let cfg_for_coalesce = after_dce
-        .as_ref()
-        .or(after_inlining.as_ref())
-        .or(after_builtin_resolution.as_ref())
-        .or(after_mem2reg.as_ref())
+    let cfg_for_coalesce = cfgs
+        .latest_cfg_through(PipelinePass::Dce)
         .unwrap_or(cfg);
 
     let after_block_coalesce = match coalesce_blocks(cfg_for_coalesce) {
@@ -1069,12 +1147,8 @@ fn run_optimization_pipeline_with_interprocedural_inner(
     cfgs.after_block_coalesce = after_block_coalesce.clone();
 
     // Stage 5: deopt unsafe builtins - replace unsafe builtin calls with deopt points
-    let cfg_for_deopt = after_block_coalesce
-        .as_ref()
-        .or(after_dce.as_ref())
-        .or(after_inlining.as_ref())
-        .or(after_builtin_resolution.as_ref())
-        .or(after_mem2reg.as_ref())
+    let cfg_for_deopt = cfgs
+        .latest_cfg_through(PipelinePass::BlockCoalesce)
         .unwrap_or(cfg);
 
     let after_deopt_builtins = match deopt_unsafe_builtins(cfg_for_deopt) {
@@ -1096,13 +1170,8 @@ fn run_optimization_pipeline_with_interprocedural_inner(
     cfgs.after_deopt_builtins = after_deopt_builtins.clone();
 
     // Stage 6: heap elimination - for globals (final pass with deopts)
-    let cfg_for_heap_elim = after_deopt_builtins
-        .as_ref()
-        .or(after_block_coalesce.as_ref())
-        .or(after_dce.as_ref())
-        .or(after_inlining.as_ref())
-        .or(after_builtin_resolution.as_ref())
-        .or(after_mem2reg.as_ref())
+    let cfg_for_heap_elim = cfgs
+        .latest_cfg_through(PipelinePass::DeoptBuiltins)
         .unwrap_or(cfg);
 
     // Re-analyze the CFG to get current accessed_globals (inlining may have added new ones)
