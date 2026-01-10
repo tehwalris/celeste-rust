@@ -976,9 +976,7 @@ mod tests {
                 (LocalId::from(2), Instruction::store(LocalId::from(0), LocalId::from(1))),  // Store initial value
                 (LocalId::from(3), Instruction::load(LocalId::from(0))),  // Load for first use
             ],
-            (LocalId::from(4), Terminator::UnconditionalBranch {
-                target: Label::from("block_a".to_string()),
-            }),
+            (LocalId::from(4), Terminator::branch("block_a")),
         );
 
         let block_a = Block::new_for_test(
@@ -1071,9 +1069,7 @@ mod tests {
                 (LocalId::from(1), Instruction::num_const(1)),
                 (LocalId::from(10), Instruction::store(LocalId::from(0), LocalId::from(1))),
             ],
-            (LocalId::from(11), Terminator::UnconditionalBranch {
-                target: Label::from("block_c".to_string()),
-            }),
+            (LocalId::from(11), Terminator::branch("block_c")),
         );
 
         let block_b = Block::new_for_test(
@@ -1081,9 +1077,7 @@ mod tests {
                 (LocalId::from(2), Instruction::num_const(2)),
                 (LocalId::from(20), Instruction::store(LocalId::from(0), LocalId::from(2))),
             ],
-            (LocalId::from(21), Terminator::UnconditionalBranch {
-                target: Label::from("block_c".to_string()),
-            }),
+            (LocalId::from(21), Terminator::branch("block_c")),
         );
 
         let block_c = Block::new_for_test(
