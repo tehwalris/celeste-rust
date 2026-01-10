@@ -8,7 +8,7 @@
 //! - Type mismatches (e.g., Load from a value instead of pointer)
 
 use crate::interpreter::common::{FxHashMap, FxHashSet};
-use crate::ir::{Block, Cfg, Instruction, Label, LocalId, Terminator};
+use crate::ir::{Block, BlockId, Cfg, Instruction, Label, LocalId, Terminator};
 
 /// The "type" of a value in SSA form - used for validation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,52 +197,27 @@ fn collect_definitions(
     }
 }
 
-/// Build a map from block name to its predecessors
+/// Build a map from block name to its predecessors.
+///
+/// Uses the centralized `Cfg::compute_predecessors()` and converts to string-based keys
+/// for compatibility with the validation logic.
 fn build_predecessor_map(cfg: &Cfg) -> FxHashMap<String, FxHashSet<String>> {
-    use crate::ir::ENTRY_BLOCK_LABEL;
+    let block_preds = cfg.compute_predecessors();
+    let mut result: FxHashMap<String, FxHashSet<String>> = FxHashMap::default();
 
-    let mut predecessors: FxHashMap<String, FxHashSet<String>> = FxHashMap::default();
-
-    // Initialize all blocks with empty predecessor sets
-    // The entry block is referenced by ENTRY_BLOCK_LABEL in phi nodes
-    predecessors.insert(ENTRY_BLOCK_LABEL.to_string(), FxHashSet::default());
-    for label in cfg.named.keys() {
-        predecessors.insert(label.as_str().to_string(), FxHashSet::default());
+    for (block_id, preds) in block_preds {
+        let block_name = match &block_id {
+            BlockId::Entry => continue, // Entry block has no predecessors; skip it
+            BlockId::Named(label) => label.as_str().to_string(),
+        };
+        let pred_names: FxHashSet<String> = preds
+            .into_iter()
+            .map(|p| p.label().as_str().to_string())
+            .collect();
+        result.insert(block_name, pred_names);
     }
 
-    // Add predecessors from entry block
-    add_predecessors_from_terminator(cfg.entry.terminator_kind(), ENTRY_BLOCK_LABEL, &mut predecessors);
-
-    // Add predecessors from named blocks
-    for (label, block) in &cfg.named {
-        add_predecessors_from_terminator(block.terminator_kind(), label.as_str(), &mut predecessors);
-    }
-
-    predecessors
-}
-
-/// Add predecessor edges from a terminator
-fn add_predecessors_from_terminator(
-    terminator: &Terminator,
-    from_block: &str,
-    predecessors: &mut FxHashMap<String, FxHashSet<String>>,
-) {
-    match terminator {
-        Terminator::Return { .. } | Terminator::Deopt { .. } => {}
-        Terminator::UnconditionalBranch { target } => {
-            if let Some(preds) = predecessors.get_mut(target.as_str()) {
-                preds.insert(from_block.to_string());
-            }
-        }
-        Terminator::ConditionalBranch { true_target, false_target, .. } => {
-            if let Some(preds) = predecessors.get_mut(true_target.as_str()) {
-                preds.insert(from_block.to_string());
-            }
-            if let Some(preds) = predecessors.get_mut(false_target.as_str()) {
-                preds.insert(from_block.to_string());
-            }
-        }
-    }
+    result
 }
 
 /// Validate that all used locals are defined

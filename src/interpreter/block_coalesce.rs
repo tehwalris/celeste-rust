@@ -6,7 +6,8 @@
 
 use std::collections::HashMap;
 
-use crate::ir::{Block, Cfg, Instruction, Label, LocalId, Terminator};
+use crate::interpreter::common::FxHashMap;
+use crate::ir::{Block, BlockId, Cfg, Instruction, Label, LocalId, Terminator};
 
 /// Result of the block coalescing pass
 #[derive(Debug)]
@@ -27,7 +28,7 @@ pub enum CoalesceResult {
 /// targets a block with only one predecessor.
 pub fn coalesce_blocks(cfg: &Cfg) -> CoalesceResult {
     // Compute predecessors
-    let preds = compute_predecessors(cfg);
+    let preds = predecessors_for_coalesce(cfg);
 
     // Find which blocks can be coalesced (have exactly one predecessor via unconditional branch)
     let mut coalesce_targets: HashMap<Label, BlockSource> = HashMap::new();
@@ -58,7 +59,7 @@ pub fn coalesce_blocks(cfg: &Cfg) -> CoalesceResult {
 
     // Keep merging until no more merges are possible
     loop {
-        let preds = compute_predecessors(&new_cfg);
+        let preds = predecessors_for_coalesce(&new_cfg);
         let mut merged = false;
 
         // Try to merge entry block with its target
@@ -239,50 +240,26 @@ fn merge_blocks(source: &mut Block, target: &Block, _target_label: &Label, sourc
     phi_replacements
 }
 
-/// Compute predecessors for each block
-fn compute_predecessors(cfg: &Cfg) -> HashMap<Label, Vec<Option<Label>>> {
-    let mut preds: HashMap<Label, Vec<Option<Label>>> = HashMap::new();
+/// Convert centralized predecessor map to the format used by block coalescing.
+///
+/// Returns a map from named block labels to their predecessor count.
+/// Entry block is not included (it has no predecessors).
+fn predecessors_for_coalesce(cfg: &Cfg) -> FxHashMap<Label, usize> {
+    let block_preds = cfg.compute_predecessors();
+    let mut result: FxHashMap<Label, usize> = FxHashMap::default();
 
-    // Initialize all blocks with empty predecessor lists
-    for label in cfg.named.keys() {
-        preds.insert(label.clone(), Vec::new());
-    }
-
-    // Entry block's successors (None represents entry block)
-    add_successors(cfg.entry.terminator_kind(), None, &mut preds);
-
-    // Named blocks' successors
-    for (label, block) in &cfg.named {
-        add_successors(block.terminator_kind(), Some(label.clone()), &mut preds);
-    }
-
-    preds
-}
-
-fn add_successors(
-    term: &Terminator,
-    from: Option<Label>,
-    preds: &mut HashMap<Label, Vec<Option<Label>>>,
-) {
-    match term {
-        Terminator::UnconditionalBranch { target } => {
-            preds.entry(target.clone()).or_default().push(from);
+    for (block_id, preds) in block_preds {
+        if let BlockId::Named(label) = block_id {
+            result.insert(label, preds.len());
         }
-        Terminator::ConditionalBranch {
-            true_target,
-            false_target,
-            ..
-        } => {
-            preds.entry(true_target.clone()).or_default().push(from.clone());
-            preds.entry(false_target.clone()).or_default().push(from);
-        }
-        Terminator::Return { .. } | Terminator::Deopt { .. } => {}
     }
+
+    result
 }
 
 /// Check if a block has exactly one predecessor
-fn has_single_predecessor(preds: &HashMap<Label, Vec<Option<Label>>>, label: &Label) -> bool {
-    preds.get(label).map(|p| p.len() == 1).unwrap_or(false)
+fn has_single_predecessor(preds: &FxHashMap<Label, usize>, label: &Label) -> bool {
+    preds.get(label).map(|&count| count == 1).unwrap_or(false)
 }
 
 #[cfg(test)]

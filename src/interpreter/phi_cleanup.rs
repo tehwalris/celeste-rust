@@ -10,9 +10,9 @@
 //! This is intentionally strict - it only handles Phi cleanup, nothing else.
 
 use crate::interpreter::common::{FxHashMap, FxHashSet};
-use crate::ir::{Block, Cfg, Instruction, Label, LocalId, Terminator};
+use crate::ir::{Block, BlockId, Cfg, Instruction, Label, LocalId};
 #[cfg(test)]
-use crate::ir::BinaryOp;
+use crate::ir::{BinaryOp, Terminator};
 
 /// Result of phi cleanup
 #[derive(Debug)]
@@ -29,51 +29,23 @@ pub struct PhiCleanupResult {
     pub collapsed_mappings: FxHashMap<LocalId, LocalId>,
 }
 
-/// Compute actual predecessors of each block based on terminators.
-/// Returns a map from block label to set of predecessor labels.
-/// Entry block has no predecessors in this map.
-fn compute_actual_predecessors(cfg: &Cfg) -> FxHashMap<Label, FxHashSet<Label>> {
-    let mut predecessors: FxHashMap<Label, FxHashSet<Label>> = FxHashMap::default();
+/// Convert the centralized predecessor map (BlockId -> Vec<BlockId>) to the format
+/// used by phi cleanup (Label -> FxHashSet<Label>).
+///
+/// Only includes named blocks in the output (entry block has no predecessors in CFG form).
+fn predecessors_for_phi_cleanup(cfg: &Cfg) -> FxHashMap<Label, FxHashSet<Label>> {
+    let block_preds = cfg.compute_predecessors();
+    let mut result: FxHashMap<Label, FxHashSet<Label>> = FxHashMap::default();
 
-    // Initialize empty sets for all named blocks
-    for label in cfg.named.keys() {
-        predecessors.insert(label.clone(), FxHashSet::default());
-    }
-
-    // Add predecessors from entry block
-    add_successors_as_predecessors(cfg.entry.terminator_kind(), &Label::from("entry".to_string()), &mut predecessors);
-
-    // Add predecessors from named blocks
-    for (label, block) in &cfg.named {
-        add_successors_as_predecessors(block.terminator_kind(), label, &mut predecessors);
-    }
-
-    predecessors
-}
-
-fn add_successors_as_predecessors(
-    terminator: &Terminator,
-    from_label: &Label,
-    predecessors: &mut FxHashMap<Label, FxHashSet<Label>>,
-) {
-    match terminator {
-        Terminator::Return { .. } | Terminator::Deopt { .. } => {
-            // No successors
-        }
-        Terminator::UnconditionalBranch { target } => {
-            if let Some(preds) = predecessors.get_mut(target) {
-                preds.insert(from_label.clone());
-            }
-        }
-        Terminator::ConditionalBranch { true_target, false_target, .. } => {
-            if let Some(preds) = predecessors.get_mut(true_target) {
-                preds.insert(from_label.clone());
-            }
-            if let Some(preds) = predecessors.get_mut(false_target) {
-                preds.insert(from_label.clone());
-            }
+    for (block_id, preds) in block_preds {
+        // Only include named blocks - entry block doesn't need predecessor info for phi cleanup
+        if let BlockId::Named(label) = block_id {
+            let pred_labels: FxHashSet<Label> = preds.into_iter().map(|p| p.label()).collect();
+            result.insert(label, pred_labels);
         }
     }
+
+    result
 }
 
 /// Clean up a single Phi instruction based on actual predecessors and defined locals.
@@ -81,18 +53,13 @@ fn add_successors_as_predecessors(
 fn cleanup_phi(
     phi_branches: &[(Label, LocalId)],
     actual_predecessors: &FxHashSet<Label>,
-    from_entry: bool,
     defined_locals: Option<&FxHashSet<LocalId>>,
 ) -> (Vec<(Label, LocalId)>, Option<LocalId>, bool) {
     let mut new_branches = Vec::new();
 
     for (label, local_id) in phi_branches {
-        // Special case: "entry" predecessor
-        let is_predecessor_valid = if label.as_str() == "entry" {
-            from_entry || actual_predecessors.contains(label)
-        } else {
-            actual_predecessors.contains(label)
-        };
+        // Check if this predecessor is valid (the predecessors set uses Label::entry() for entry block)
+        let is_predecessor_valid = actual_predecessors.contains(label);
 
         // Check if the local is defined (if we're filtering by defined locals)
         let is_local_valid = defined_locals
@@ -119,7 +86,6 @@ fn cleanup_phi(
 fn cleanup_block_phis(
     block: &Block,
     actual_predecessors: &FxHashSet<Label>,
-    from_entry: bool,
     defined_locals: Option<&FxHashSet<LocalId>>,
 ) -> (Block, usize, usize, usize, FxHashMap<LocalId, LocalId>) {
     let mut new_instructions = Vec::new();
@@ -132,7 +98,7 @@ fn cleanup_block_phis(
         match instruction {
             Instruction::Phi { branches } => {
                 let (new_branches, collapsed_to, was_emptied) =
-                    cleanup_phi(branches, actual_predecessors, from_entry, defined_locals);
+                    cleanup_phi(branches, actual_predecessors, defined_locals);
 
                 let removed = branches.len() - new_branches.len();
                 branches_removed += removed;
@@ -271,7 +237,7 @@ pub fn cleanup_phis_with_defined_locals(
     cfg: &Cfg,
     defined_locals: Option<&FxHashSet<LocalId>>,
 ) -> PhiCleanupResult {
-    let actual_predecessors = compute_actual_predecessors(cfg);
+    let actual_predecessors = predecessors_for_phi_cleanup(cfg);
 
     let mut total_branches_removed = 0;
     let mut total_phis_collapsed = 0;
@@ -282,7 +248,7 @@ pub fn cleanup_phis_with_defined_locals(
     // But process it anyway for completeness
     let entry_preds = FxHashSet::default();
     let (new_entry, branches_removed, phis_collapsed, phis_emptied, collapsed_mappings) =
-        cleanup_block_phis(&cfg.entry, &entry_preds, false, defined_locals);
+        cleanup_block_phis(&cfg.entry, &entry_preds, defined_locals);
     total_branches_removed += branches_removed;
     total_phis_collapsed += phis_collapsed;
     total_phis_emptied += phis_emptied;
@@ -292,17 +258,9 @@ pub fn cleanup_phis_with_defined_locals(
     let mut new_named: FxHashMap<Label, Block> = FxHashMap::default();
     for (label, block) in &cfg.named {
         let preds = actual_predecessors.get(label).cloned().unwrap_or_default();
-        // Check if entry block is a predecessor
-        let from_entry = match cfg.entry.terminator_kind() {
-            Terminator::UnconditionalBranch { target } => target == label,
-            Terminator::ConditionalBranch { true_target, false_target, .. } => {
-                true_target == label || false_target == label
-            }
-            _ => false,
-        };
 
         let (new_block, branches_removed, phis_collapsed, phis_emptied, collapsed_mappings) =
-            cleanup_block_phis(block, &preds, from_entry, defined_locals);
+            cleanup_block_phis(block, &preds, defined_locals);
         total_branches_removed += branches_removed;
         total_phis_collapsed += phis_collapsed;
         total_phis_emptied += phis_emptied;
@@ -651,7 +609,7 @@ mod tests {
                 (
                     LocalId::from(1),
                     Instruction::Phi {
-                        branches: vec![(Label::from("entry".to_string()), LocalId::from(0))],
+                        branches: vec![(Label::entry(), LocalId::from(0))],
                     },
                 ),
                 (
