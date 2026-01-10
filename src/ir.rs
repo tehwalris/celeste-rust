@@ -466,6 +466,100 @@ impl Instruction {
             Self::Phi { branches } => format!("Phi({} branches)", branches.len()),
         }
     }
+
+    /// Format this instruction for display in the CFG viewer.
+    ///
+    /// This provides a detailed string representation including all local IDs and parameters,
+    /// suitable for visualization and debugging purposes. Unlike `describe()`, this includes
+    /// full details of all operands.
+    pub fn format(&self) -> String {
+        match self {
+            Self::Alloc => "Alloc".to_string(),
+            Self::GetGlobal { name, create_if_missing } => {
+                if *create_if_missing {
+                    format!("GetGlobal({}, create)", name)
+                } else {
+                    format!("GetGlobal({})", name)
+                }
+            }
+            Self::Load { source } => format!("Load({})", usize::from(*source)),
+            Self::Store { target, source } => {
+                format!("Store({}, {})", usize::from(*target), usize::from(*source))
+            }
+            Self::StoreEmptyTable { target } => {
+                format!("StoreEmptyTable({})", usize::from(*target))
+            }
+            Self::StoreClosure { target, fun_def, captures } => {
+                let caps: Vec<_> = captures.iter().map(|id| usize::from(*id).to_string()).collect();
+                format!(
+                    "StoreClosure({}, {}, [{}])",
+                    usize::from(*target),
+                    fun_def.as_str(),
+                    caps.join(", ")
+                )
+            }
+            Self::GetField { receiver, field, create_if_missing } => {
+                if *create_if_missing {
+                    format!("GetField({}, {}, create)", usize::from(*receiver), field)
+                } else {
+                    format!("GetField({}, {})", usize::from(*receiver), field)
+                }
+            }
+            Self::GetIndex { receiver, index, create_if_missing } => {
+                if *create_if_missing {
+                    format!(
+                        "GetIndex({}, {}, create)",
+                        usize::from(*receiver),
+                        usize::from(*index)
+                    )
+                } else {
+                    format!("GetIndex({}, {})", usize::from(*receiver), usize::from(*index))
+                }
+            }
+            Self::NumberConstant { value } => format!("NumberConstant({:?})", value),
+            Self::BoolConstant { value } => format!("BoolConstant({})", value),
+            Self::StringConstant { value } => format!("StringConstant({:?})", value),
+            Self::NilConstant => "NilConstant".to_string(),
+            Self::Call { closure, args } => {
+                let arg_strs: Vec<_> = args.iter().map(|id| usize::from(*id).to_string()).collect();
+                format!("Call({}, [{}])", usize::from(*closure), arg_strs.join(", "))
+            }
+            Self::CallResolved {
+                fun_name,
+                captures,
+                args,
+            } => {
+                let cap_strs: Vec<_> = captures.iter().map(|id| usize::from(*id).to_string()).collect();
+                let arg_strs: Vec<_> = args.iter().map(|id| usize::from(*id).to_string()).collect();
+                format!(
+                    "CallResolved({}, caps=[{}], args=[{}])",
+                    fun_name.as_str(),
+                    cap_strs.join(", "),
+                    arg_strs.join(", ")
+                )
+            }
+            Self::CallBuiltin { name, args } => {
+                let arg_strs: Vec<_> = args.iter().map(|id| usize::from(*id).to_string()).collect();
+                format!("CallBuiltin({}, [{}])", name, arg_strs.join(", "))
+            }
+            Self::UnaryOp { op, arg } => format!("UnaryOp({:?}, {})", op, usize::from(*arg)),
+            Self::BinaryOp { left, op, right } => {
+                format!(
+                    "BinaryOp({}, {:?}, {})",
+                    usize::from(*left),
+                    op,
+                    usize::from(*right)
+                )
+            }
+            Self::Phi { branches } => {
+                let branch_strs: Vec<_> = branches
+                    .iter()
+                    .map(|(label, id)| format!("{}:{}", label.as_str(), usize::from(*id)))
+                    .collect();
+                format!("Phi([{}])", branch_strs.join(", "))
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

@@ -1383,7 +1383,7 @@ impl From<&Block> for SerializableBlock {
             .iter()
             .map(|(id, instr)| SerializableInstruction {
                 target_id: usize::from(*id),
-                instruction_text: format_instruction(instr),
+                instruction_text: instr.format(),
                 instruction_type: instr.type_name().to_string(),
             })
             .collect();
@@ -1398,95 +1398,6 @@ impl From<&Block> for SerializableBlock {
             instructions,
             terminator,
             hint_normalize: block.hint_normalize,
-        }
-    }
-}
-
-fn format_instruction(instr: &Instruction) -> String {
-    match instr {
-        Instruction::Alloc => "Alloc".to_string(),
-        Instruction::GetGlobal { name, create_if_missing } => {
-            if *create_if_missing {
-                format!("GetGlobal({}, create)", name)
-            } else {
-                format!("GetGlobal({})", name)
-            }
-        }
-        Instruction::Load { source } => format!("Load({})", usize::from(*source)),
-        Instruction::Store { target, source } => {
-            format!("Store({}, {})", usize::from(*target), usize::from(*source))
-        }
-        Instruction::StoreEmptyTable { target } => {
-            format!("StoreEmptyTable({})", usize::from(*target))
-        }
-        Instruction::StoreClosure { target, fun_def, captures } => {
-            let caps: Vec<_> = captures.iter().map(|id| usize::from(*id).to_string()).collect();
-            format!(
-                "StoreClosure({}, {}, [{}])",
-                usize::from(*target),
-                fun_def.as_str(),
-                caps.join(", ")
-            )
-        }
-        Instruction::GetField { receiver, field, create_if_missing } => {
-            if *create_if_missing {
-                format!("GetField({}, {}, create)", usize::from(*receiver), field)
-            } else {
-                format!("GetField({}, {})", usize::from(*receiver), field)
-            }
-        }
-        Instruction::GetIndex { receiver, index, create_if_missing } => {
-            if *create_if_missing {
-                format!(
-                    "GetIndex({}, {}, create)",
-                    usize::from(*receiver),
-                    usize::from(*index)
-                )
-            } else {
-                format!("GetIndex({}, {})", usize::from(*receiver), usize::from(*index))
-            }
-        }
-        Instruction::NumberConstant { value } => format!("NumberConstant({:?})", value),
-        Instruction::BoolConstant { value } => format!("BoolConstant({})", value),
-        Instruction::StringConstant { value } => format!("StringConstant({:?})", value),
-        Instruction::NilConstant => "NilConstant".to_string(),
-        Instruction::Call { closure, args } => {
-            let arg_strs: Vec<_> = args.iter().map(|id| usize::from(*id).to_string()).collect();
-            format!("Call({}, [{}])", usize::from(*closure), arg_strs.join(", "))
-        }
-        Instruction::CallResolved {
-            fun_name,
-            captures,
-            args,
-        } => {
-            let cap_strs: Vec<_> = captures.iter().map(|id| usize::from(*id).to_string()).collect();
-            let arg_strs: Vec<_> = args.iter().map(|id| usize::from(*id).to_string()).collect();
-            format!(
-                "CallResolved({}, caps=[{}], args=[{}])",
-                fun_name.as_str(),
-                cap_strs.join(", "),
-                arg_strs.join(", ")
-            )
-        }
-        Instruction::CallBuiltin { name, args } => {
-            let arg_strs: Vec<_> = args.iter().map(|id| usize::from(*id).to_string()).collect();
-            format!("CallBuiltin({}, [{}])", name, arg_strs.join(", "))
-        }
-        Instruction::UnaryOp { op, arg } => format!("UnaryOp({:?}, {})", op, usize::from(*arg)),
-        Instruction::BinaryOp { left, op, right } => {
-            format!(
-                "BinaryOp({}, {:?}, {})",
-                usize::from(*left),
-                op,
-                usize::from(*right)
-            )
-        }
-        Instruction::Phi { branches } => {
-            let branch_strs: Vec<_> = branches
-                .iter()
-                .map(|(label, id)| format!("{}:{}", label.as_str(), usize::from(*id)))
-                .collect();
-            format!("Phi([{}])", branch_strs.join(", "))
         }
     }
 }
