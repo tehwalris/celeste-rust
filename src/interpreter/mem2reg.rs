@@ -877,7 +877,6 @@ fn rewrite_block_for_cell(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::FxHashMap;
     use crate::ir::{Block, Cfg, Instruction, LocalId, Terminator, UnaryOp};
 
     #[test]
@@ -997,10 +996,7 @@ mod tests {
             (LocalId::from(10), Terminator::ret(Some(LocalId::from(9)))),
         );
 
-        let mut named: FxHashMap<Label, Block> = FxHashMap::default();
-        named.insert(Label::from("block_a".to_string()), block_a);
-
-        let cfg = Cfg { entry, named };
+        let cfg = Cfg::with_blocks(entry, [("block_a", block_a)]);
 
         let mut local_gen = LocalIdGenerator::new();
         let result = mem2reg(&cfg, &mut local_gen);
@@ -1097,12 +1093,10 @@ mod tests {
             (LocalId::from(30), Terminator::ret(Some(LocalId::from(3)))),
         );
 
-        let mut named: FxHashMap<Label, Block> = FxHashMap::default();
-        named.insert(Label::from("block_a".to_string()), block_a);
-        named.insert(Label::from("block_b".to_string()), block_b);
-        named.insert(Label::from("block_c".to_string()), block_c);
-
-        let cfg = Cfg { entry, named };
+        let cfg = Cfg::with_blocks(
+            entry,
+            [("block_a", block_a), ("block_b", block_b), ("block_c", block_c)],
+        );
 
         let mut local_gen = LocalIdGenerator::new();
         let result = mem2reg(&cfg, &mut local_gen);

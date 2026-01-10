@@ -251,7 +251,6 @@ fn has_single_predecessor(preds: &FxHashMap<Label, usize>, label: &Label) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::FxHashMap;
     use crate::ir::{Block, Cfg, Instruction, LocalId, Terminator};
 
     #[test]
@@ -274,10 +273,7 @@ mod tests {
             (LocalId::from(3), Terminator::ret(Some(LocalId::from(2)))),
         );
 
-        let mut named: FxHashMap<Label, Block> = FxHashMap::default();
-        named.insert(Label::from("block_a".to_string()), block_a);
-
-        let cfg = Cfg { entry, named };
+        let cfg = Cfg::with_blocks(entry, [("block_a", block_a)]);
 
         let result = coalesce_blocks(&cfg);
 
@@ -308,10 +304,7 @@ mod tests {
             (LocalId::from(2), Terminator::ret(None)),
         );
 
-        let mut named: FxHashMap<Label, Block> = FxHashMap::default();
-        named.insert(Label::from("block_a".to_string()), block_a);
-
-        let cfg = Cfg { entry, named };
+        let cfg = Cfg::with_blocks(entry, [("block_a", block_a)]);
 
         let result = coalesce_blocks(&cfg);
         assert!(matches!(result, CoalesceResult::NoChange));
@@ -343,11 +336,7 @@ mod tests {
             (LocalId::from(5), Terminator::ret(Some(LocalId::from(4)))),
         );
 
-        let mut named: FxHashMap<Label, Block> = FxHashMap::default();
-        named.insert(Label::from("block_a".to_string()), block_a);
-        named.insert(Label::from("block_b".to_string()), block_b);
-
-        let cfg = Cfg { entry, named };
+        let cfg = Cfg::with_blocks(entry, [("block_a", block_a), ("block_b", block_b)]);
 
         let result = coalesce_blocks(&cfg);
 
