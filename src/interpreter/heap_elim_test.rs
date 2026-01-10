@@ -403,36 +403,10 @@ mod tests {
     }
 
     /// Helper to run heap elimination on the simple field access CFG.
-    /// Returns the transformed CFG if successful, or panics with a descriptive message.
-    fn run_simple_field_heap_elim() -> crate::interpreter::heap_elimination::TransformedCfg {
-        use crate::ir::LocalIdGenerator;
-
-        let cfg = make_simple_field_access_cfg();
-        let shape = make_single_field_shape();
-
-        let local_gen = LocalIdGenerator::from_cfg(&cfg);
-        let label_gen = crate::ir::LabelGenerator::new();
-
-        let result = eliminate_heap(
-            &cfg,
-            &shape,
-            &[Some(LocalId::from(0))],
-            local_gen,
-            label_gen,
-            DeoptMode::Insert,
-        );
-
-        match result {
-            HeapEliminationResult::Success(transformed) => transformed,
-            HeapEliminationResult::ShapeNotPreserved(reason) => {
-                panic!("Heap elimination failed (shape not preserved): {}", reason)
-            }
-            other => panic!("Heap elimination failed: {:?}", other),
-        }
-    }
-
-    /// Helper to run heap elimination, returning both original and transformed CFGs.
-    fn run_simple_field_heap_elim_with_original() -> (Cfg, crate::interpreter::heap_elimination::TransformedCfg) {
+    /// Returns both the original CFG and the transformed result if successful,
+    /// or panics with a descriptive message.
+    fn run_simple_field_heap_elim_with_original(
+    ) -> (Cfg, crate::interpreter::heap_elimination::TransformedCfg) {
         use crate::ir::LocalIdGenerator;
 
         let cfg = make_simple_field_access_cfg();
@@ -457,6 +431,12 @@ mod tests {
             }
             other => panic!("Heap elimination failed: {:?}", other),
         }
+    }
+
+    /// Helper to run heap elimination on the simple field access CFG.
+    /// Returns the transformed CFG if successful.
+    fn run_simple_field_heap_elim() -> crate::interpreter::heap_elimination::TransformedCfg {
+        run_simple_field_heap_elim_with_original().1
     }
 
     /// Test execution of heap-eliminated CFG with SSA interpreter
