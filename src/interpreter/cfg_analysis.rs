@@ -1567,12 +1567,7 @@ mod tests {
                 LocalId::from(0),
                 Instruction::num_const(5),
             )],
-            (
-                LocalId::from(1),
-                Terminator::Return {
-                    value: Some(LocalId::from(0)),
-                },
-            ),
+            (LocalId::from(1), Terminator::ret(Some(LocalId::from(0)))),
         );
 
         Cfg::single_entry(entry)

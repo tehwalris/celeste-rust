@@ -160,12 +160,7 @@ mod tests {
                 (LocalId::from(3), Instruction::num_const(2)),
                 (LocalId::from(4), Instruction::call(LocalId::from(1), vec![LocalId::from(2), LocalId::from(3)])),
             ],
-            (
-                LocalId::from(5),
-                Terminator::Return {
-                    value: Some(LocalId::from(4)),
-                },
-            ),
+            (LocalId::from(5), Terminator::ret(Some(LocalId::from(4)))),
         ));
 
         // Build builtin set with "max"
@@ -212,12 +207,7 @@ mod tests {
                 (LocalId::from(1), Instruction::load(LocalId::from(0))),
                 (LocalId::from(2), Instruction::call(LocalId::from(1), vec![])),
             ],
-            (
-                LocalId::from(3),
-                Terminator::Return {
-                    value: Some(LocalId::from(2)),
-                },
-            ),
+            (LocalId::from(3), Terminator::ret(Some(LocalId::from(2)))),
         ));
 
         // Build builtin set with only "max" (not "unknown")
@@ -244,12 +234,7 @@ mod tests {
                 (LocalId::from(5), Instruction::load(LocalId::from(4))),
                 (LocalId::from(6), Instruction::call(LocalId::from(5), vec![LocalId::from(3)])),
             ],
-            (
-                LocalId::from(7),
-                Terminator::Return {
-                    value: Some(LocalId::from(6)),
-                },
-            ),
+            (LocalId::from(7), Terminator::ret(Some(LocalId::from(6)))),
         ));
 
         // Build builtin set with both max and min

@@ -174,12 +174,7 @@ mod tests {
                     Instruction::call_builtin("max", vec![LocalId::from(0), LocalId::from(0)]),
                 ),
             ],
-            (
-                LocalId::from(2),
-                Terminator::Return {
-                    value: Some(LocalId::from(1)),
-                },
-            ),
+            (LocalId::from(2), Terminator::ret(Some(LocalId::from(1)))),
         );
 
         let cfg = Cfg::single_entry(entry);

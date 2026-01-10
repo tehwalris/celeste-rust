@@ -432,12 +432,7 @@ mod tests {
                     ),
                 ),
             ],
-            (
-                LocalId::from(3),
-                Terminator::Return {
-                    value: Some(LocalId::from(2)),
-                },
-            ),
+            (LocalId::from(3), Terminator::ret(Some(LocalId::from(2)))),
         );
 
         FunDef {
@@ -459,12 +454,7 @@ mod tests {
                     Instruction::call_resolved("add_one_1", vec![], vec![LocalId::from(0)]),
                 ),
             ],
-            (
-                LocalId::from(2),
-                Terminator::Return {
-                    value: Some(LocalId::from(1)),
-                },
-            ),
+            (LocalId::from(2), Terminator::ret(Some(LocalId::from(1)))),
         );
 
         Cfg::single_entry(entry)

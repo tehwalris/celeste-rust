@@ -1369,12 +1369,7 @@ mod tests {
         // Should return NotApplicable since there's nothing to transform
         let entry = Block::new_for_test(
             vec![(LocalId::from(0), Instruction::num_const(5))],
-            (
-                LocalId::from(1),
-                Terminator::Return {
-                    value: Some(LocalId::from(0)),
-                },
-            ),
+            (LocalId::from(1), Terminator::ret(Some(LocalId::from(0)))),
         );
 
         let cfg = Cfg::single_entry(entry);
@@ -1649,12 +1644,7 @@ mod tests {
                     source: arg0_id,
                 },
             )],
-            (
-                LocalId::from(1),
-                Terminator::Return {
-                    value: Some(LocalId::from(0)),
-                },
-            ),
+            (LocalId::from(1), Terminator::ret(Some(LocalId::from(0)))),
         );
 
         let cfg = Cfg::single_entry(entry);
@@ -1749,12 +1739,7 @@ mod tests {
                     },
                 ),
             ],
-            (
-                LocalId::from(2),
-                Terminator::Return {
-                    value: Some(LocalId::from(1)),
-                },
-            ),
+            (LocalId::from(2), Terminator::ret(Some(LocalId::from(1)))),
         );
 
         let cfg = Cfg::single_entry(entry);
@@ -1831,12 +1816,7 @@ mod tests {
                     },
                 ),
             ],
-            (
-                LocalId::from(4),
-                Terminator::Return {
-                    value: Some(LocalId::from(3)),
-                },
-            ),
+            (LocalId::from(4), Terminator::ret(Some(LocalId::from(3)))),
         );
 
         let cfg = Cfg::single_entry(entry);

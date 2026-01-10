@@ -284,12 +284,7 @@ mod tests {
                     Instruction::call_resolved("foo_1", vec![], vec![LocalId::from(2)]),
                 ),
             ],
-            (
-                LocalId::from(4),
-                Terminator::Return {
-                    value: Some(LocalId::from(3)),
-                },
-            ),
+            (LocalId::from(4), Terminator::ret(Some(LocalId::from(3)))),
         );
 
         let cfg = Cfg::single_entry(entry);

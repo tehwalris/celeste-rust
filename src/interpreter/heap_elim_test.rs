@@ -257,9 +257,7 @@ mod tests {
                 (LocalId::from(11), Instruction::get_field(LocalId::from(0), "x", false)),
                 (LocalId::from(12), Instruction::load(LocalId::from(11))),
             ],
-            (LocalId::from(13), Terminator::Return {
-                value: Some(LocalId::from(12)),
-            }),
+            (LocalId::from(13), Terminator::ret(Some(LocalId::from(12)))),
         );
 
         named.insert(Label::from("if_true".to_string()), if_true);
