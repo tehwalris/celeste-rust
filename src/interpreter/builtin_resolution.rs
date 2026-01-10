@@ -161,12 +161,7 @@ mod tests {
                         create_if_missing: false,
                     },
                 ),
-                (
-                    LocalId::from(1),
-                    Instruction::Load {
-                        source: LocalId::from(0),
-                    },
-                ),
+                (LocalId::from(1), Instruction::load(LocalId::from(0))),
                 (LocalId::from(2), Instruction::num_const(1)),
                 (LocalId::from(3), Instruction::num_const(2)),
                 (
@@ -232,12 +227,7 @@ mod tests {
                         create_if_missing: false,
                     },
                 ),
-                (
-                    LocalId::from(1),
-                    Instruction::Load {
-                        source: LocalId::from(0),
-                    },
-                ),
+                (LocalId::from(1), Instruction::load(LocalId::from(0))),
                 (
                     LocalId::from(2),
                     Instruction::Call {
@@ -276,12 +266,7 @@ mod tests {
                         create_if_missing: false,
                     },
                 ),
-                (
-                    LocalId::from(1),
-                    Instruction::Load {
-                        source: LocalId::from(0),
-                    },
-                ),
+                (LocalId::from(1), Instruction::load(LocalId::from(0))),
                 (LocalId::from(2), Instruction::num_const(1)),
                 (
                     LocalId::from(3),
@@ -298,12 +283,7 @@ mod tests {
                         create_if_missing: false,
                     },
                 ),
-                (
-                    LocalId::from(5),
-                    Instruction::Load {
-                        source: LocalId::from(4),
-                    },
-                ),
+                (LocalId::from(5), Instruction::load(LocalId::from(4))),
                 (
                     LocalId::from(6),
                     Instruction::Call {

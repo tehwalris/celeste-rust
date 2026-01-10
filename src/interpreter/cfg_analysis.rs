@@ -1594,7 +1594,7 @@ mod tests {
                         create_if_missing: false,
                     },
                 ),
-                (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
+                (LocalId::from(1), Instruction::load(LocalId::from(0))),
             ],
             (
                 LocalId::from(2),
@@ -1621,10 +1621,7 @@ mod tests {
                 (LocalId::from(1), Instruction::num_const(5)),
                 (
                     LocalId::from(2),
-                    Instruction::Store {
-                        target: LocalId::from(0),
-                        source: LocalId::from(1),
-                    },
+                    Instruction::store(LocalId::from(0), LocalId::from(1)),
                 ),
             ],
             (LocalId::from(3), Terminator::Return { value: None }),
@@ -1768,7 +1765,7 @@ mod tests {
                 ),
                 (
                     LocalId::from(1),
-                    Instruction::Load { source: LocalId::from(0) },
+                    Instruction::load(LocalId::from(0)),
                 ),
                 (
                     LocalId::from(2),

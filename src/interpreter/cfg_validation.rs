@@ -538,7 +538,7 @@ mod tests {
                     ),
                     // This is the type error being tested: Load from Phi result.
                     // Phi produces a VALUE, not a pointer, so this should be flagged.
-                    (LocalId::from(4), Instruction::Load { source: LocalId::from(3) }),
+                    (LocalId::from(4), Instruction::load(LocalId::from(3))),
                 ],
                 (LocalId::from(5), Terminator::Return { value: Some(LocalId::from(4)) }),
             ),
@@ -580,7 +580,7 @@ mod tests {
         let cfg = Cfg::single_entry(Block::new_for_test(
             vec![
                 (LocalId::from(0), Instruction::Alloc),
-                (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
+                (LocalId::from(1), Instruction::load(LocalId::from(0))),
             ],
             (LocalId::from(2), Terminator::Return { value: Some(LocalId::from(1)) }),
         ));
@@ -600,7 +600,7 @@ mod tests {
                     field: "x".to_string(),
                     create_if_missing: false,
                 }),
-                (LocalId::from(2), Instruction::Load { source: LocalId::from(1) }),
+                (LocalId::from(2), Instruction::load(LocalId::from(1))),
             ],
             (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
         ));
@@ -615,7 +615,7 @@ mod tests {
         let cfg = Cfg::single_entry(Block::new_for_test(
             vec![
                 (LocalId::from(0), Instruction::num_const(42)),
-                (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
+                (LocalId::from(1), Instruction::load(LocalId::from(0))),
             ],
             (LocalId::from(2), Terminator::Return { value: Some(LocalId::from(1)) }),
         ));
@@ -634,7 +634,7 @@ mod tests {
                 (LocalId::from(1), Instruction::num_const(99)),
                 // This is the type error being tested: Store to a NumberConstant.
                 // NumberConstant produces a VALUE, not a pointer, so this should be flagged.
-                (LocalId::from(2), Instruction::Store { target: LocalId::from(0), source: LocalId::from(1) }),
+                (LocalId::from(2), Instruction::store(LocalId::from(0), LocalId::from(1))),
             ],
             (LocalId::from(3), Terminator::Return { value: None }),
         ));
@@ -657,7 +657,7 @@ mod tests {
             vec![
                 (LocalId::from(0), Instruction::Alloc),
                 (LocalId::from(1), Instruction::num_const(42)),
-                (LocalId::from(2), Instruction::Store { target: LocalId::from(0), source: LocalId::from(1) }),
+                (LocalId::from(2), Instruction::store(LocalId::from(0), LocalId::from(1))),
             ],
             (LocalId::from(3), Terminator::Return { value: None }),
         ));

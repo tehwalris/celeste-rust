@@ -346,7 +346,7 @@ mod tests {
         let entry = Block::new_for_test(
             vec![
                 (LocalId::from(0), Instruction::GetGlobal { name: "foo".to_string(), create_if_missing: false }),
-                (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
+                (LocalId::from(1), Instruction::load(LocalId::from(0))),
                 (LocalId::from(2), Instruction::Call { closure: LocalId::from(1), args: vec![] }),
             ],
             (LocalId::from(99), Terminator::Return { value: Some(LocalId::from(2)) }),
@@ -393,7 +393,7 @@ mod tests {
             vec![
                 (LocalId::from(0), Instruction::GetGlobal { name: "player".to_string(), create_if_missing: false }),
                 (LocalId::from(1), Instruction::GetField { receiver: LocalId::from(0), field: "update".to_string(), create_if_missing: false }),
-                (LocalId::from(2), Instruction::Load { source: LocalId::from(1) }),
+                (LocalId::from(2), Instruction::load(LocalId::from(1))),
                 (LocalId::from(3), Instruction::Call { closure: LocalId::from(2), args: vec![] }),
             ],
             (LocalId::from(99), Terminator::Return { value: Some(LocalId::from(3)) }),
@@ -506,7 +506,7 @@ mod tests {
         let entry = Block::new_for_test(
             vec![
                 (LocalId::from(0), Instruction::GetGlobal { name: "foo".to_string(), create_if_missing: false }),
-                (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
+                (LocalId::from(1), Instruction::load(LocalId::from(0))),
                 (LocalId::from(2), Instruction::Call { closure: LocalId::from(1), args: vec![] }),
             ],
             (LocalId::from(99), Terminator::Return { value: Some(LocalId::from(2)) }),

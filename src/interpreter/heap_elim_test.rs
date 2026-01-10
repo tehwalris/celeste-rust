@@ -216,9 +216,7 @@ mod tests {
                     field: "x".to_string(),
                     create_if_missing: false,
                 }),
-                (LocalId::from(2), Instruction::Load {
-                    source: LocalId::from(1)
-                }),
+                (LocalId::from(2), Instruction::load(LocalId::from(1))),
                 (LocalId::from(3), Instruction::num_const(0)),
                 (LocalId::from(4), Instruction::BinaryOp {
                     left: LocalId::from(2),
@@ -273,9 +271,7 @@ mod tests {
                     field: "x".to_string(),
                     create_if_missing: false,
                 }),
-                (LocalId::from(12), Instruction::Load {
-                    source: LocalId::from(11)
-                }),
+                (LocalId::from(12), Instruction::load(LocalId::from(11))),
             ],
             (LocalId::from(13), Terminator::Return {
                 value: Some(LocalId::from(12)),

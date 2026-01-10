@@ -888,11 +888,8 @@ mod tests {
         let entry = Block::new_for_test(
             vec![
                 (LocalId::from(0), Instruction::Alloc),
-                (LocalId::from(1), Instruction::Store {
-                    target: LocalId::from(0),
-                    source: LocalId::from(2)
-                }),
-                (LocalId::from(3), Instruction::Load { source: LocalId::from(0) }),
+                (LocalId::from(1), Instruction::store(LocalId::from(0), LocalId::from(2))),
+                (LocalId::from(3), Instruction::load(LocalId::from(0))),
                 (LocalId::from(4), Instruction::UnaryOp {
                     op: UnaryOp::Hash,
                     arg: LocalId::from(3)
@@ -977,11 +974,8 @@ mod tests {
             vec![
                 (LocalId::from(0), Instruction::Alloc),
                 (LocalId::from(1), Instruction::num_const(0)),
-                (LocalId::from(2), Instruction::Store {
-                    target: LocalId::from(0),
-                    source: LocalId::from(1),  // Store initial value
-                }),
-                (LocalId::from(3), Instruction::Load { source: LocalId::from(0) }),  // Load for first use
+                (LocalId::from(2), Instruction::store(LocalId::from(0), LocalId::from(1))),  // Store initial value
+                (LocalId::from(3), Instruction::load(LocalId::from(0))),  // Load for first use
             ],
             (LocalId::from(4), Terminator::UnconditionalBranch {
                 target: Label::from("block_a".to_string()),
@@ -990,18 +984,15 @@ mod tests {
 
         let block_a = Block::new_for_test(
             vec![
-                (LocalId::from(5), Instruction::Load { source: LocalId::from(0) }),  // Load i
+                (LocalId::from(5), Instruction::load(LocalId::from(0))),  // Load i
                 (LocalId::from(6), Instruction::num_const(1)),
                 (LocalId::from(7), Instruction::BinaryOp {
                     op: BinaryOp::Plus,
                     left: LocalId::from(5),
                     right: LocalId::from(6),
                 }),  // i + 1
-                (LocalId::from(8), Instruction::Store {
-                    target: LocalId::from(0),
-                    source: LocalId::from(7),  // i = i + 1 (SECOND STORE)
-                }),
-                (LocalId::from(9), Instruction::Load { source: LocalId::from(0) }),  // Load modified i
+                (LocalId::from(8), Instruction::store(LocalId::from(0), LocalId::from(7))),  // i = i + 1 (SECOND STORE)
+                (LocalId::from(9), Instruction::load(LocalId::from(0))),  // Load modified i
             ],
             (LocalId::from(10), Terminator::Return { value: Some(LocalId::from(9)) }),
         );
@@ -1086,10 +1077,7 @@ mod tests {
         let block_a = Block::new_for_test(
             vec![
                 (LocalId::from(1), Instruction::num_const(1)),
-                (LocalId::from(10), Instruction::Store {
-                    target: LocalId::from(0),
-                    source: LocalId::from(1),
-                }),
+                (LocalId::from(10), Instruction::store(LocalId::from(0), LocalId::from(1))),
             ],
             (LocalId::from(11), Terminator::UnconditionalBranch {
                 target: Label::from("block_c".to_string()),
@@ -1099,10 +1087,7 @@ mod tests {
         let block_b = Block::new_for_test(
             vec![
                 (LocalId::from(2), Instruction::num_const(2)),
-                (LocalId::from(20), Instruction::Store {
-                    target: LocalId::from(0),
-                    source: LocalId::from(2),
-                }),
+                (LocalId::from(20), Instruction::store(LocalId::from(0), LocalId::from(2))),
             ],
             (LocalId::from(21), Terminator::UnconditionalBranch {
                 target: Label::from("block_c".to_string()),
@@ -1111,7 +1096,7 @@ mod tests {
 
         let block_c = Block::new_for_test(
             vec![
-                (LocalId::from(3), Instruction::Load { source: LocalId::from(0) }),
+                (LocalId::from(3), Instruction::load(LocalId::from(0))),
             ],
             (LocalId::from(30), Terminator::Return { value: Some(LocalId::from(3)) }),
         );

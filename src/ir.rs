@@ -295,6 +295,24 @@ impl Instruction {
         Self::Phi { branches }
     }
 
+    /// Test helper to create a Load instruction.
+    ///
+    /// This is a convenience method for tests that need to create load
+    /// instructions. It's more concise than `Instruction::Load { source: LocalId::from(N) }`.
+    #[cfg(test)]
+    pub fn load(source: LocalId) -> Self {
+        Self::Load { source }
+    }
+
+    /// Test helper to create a Store instruction.
+    ///
+    /// This is a convenience method for tests that need to create store
+    /// instructions. It's more concise than the verbose struct literal.
+    #[cfg(test)]
+    pub fn store(target: LocalId, source: LocalId) -> Self {
+        Self::Store { target, source }
+    }
+
     /// Get all local IDs used by this instruction.
     ///
     /// This returns all LocalIds that this instruction reads from (its operands).

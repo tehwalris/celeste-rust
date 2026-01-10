@@ -1379,7 +1379,7 @@ mod tests {
                         create_if_missing: false,
                     },
                 ),
-                (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
+                (LocalId::from(1), Instruction::load(LocalId::from(0))),
             ],
             (
                 LocalId::from(2),
@@ -1419,7 +1419,7 @@ mod tests {
                         create_if_missing: true,
                     },
                 ),
-                (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
+                (LocalId::from(1), Instruction::load(LocalId::from(0))),
             ],
             (LocalId::from(2), Terminator::Return { value: Some(LocalId::from(1)) }),
         );
@@ -1457,7 +1457,7 @@ mod tests {
                         create_if_missing: false,
                     },
                 ),
-                (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
+                (LocalId::from(1), Instruction::load(LocalId::from(0))),
                 (
                     LocalId::from(2),
                     Instruction::CallBuiltin {
@@ -1499,7 +1499,7 @@ mod tests {
                         create_if_missing: false,
                     },
                 ),
-                (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
+                (LocalId::from(1), Instruction::load(LocalId::from(0))),
                 (
                     LocalId::from(2),
                     Instruction::CallBuiltin {
@@ -1576,7 +1576,7 @@ mod tests {
                         create_if_missing: false,
                     },
                 ),
-                (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
+                (LocalId::from(1), Instruction::load(LocalId::from(0))),
             ],
             (
                 LocalId::from(2),
@@ -1631,10 +1631,7 @@ mod tests {
                 (LocalId::from(1), Instruction::num_const(5)),
                 (
                     LocalId::from(2),
-                    Instruction::Store {
-                        target: LocalId::from(0),
-                        source: LocalId::from(1),
-                    },
+                    Instruction::store(LocalId::from(0), LocalId::from(1)),
                 ),
             ],
             (LocalId::from(3), Terminator::Return { value: None }),
@@ -1673,7 +1670,7 @@ mod tests {
                         create_if_missing: false,
                     },
                 ),
-                (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
+                (LocalId::from(1), Instruction::load(LocalId::from(0))),
                 (
                     LocalId::from(2),
                     Instruction::GetGlobal {
@@ -1681,7 +1678,7 @@ mod tests {
                         create_if_missing: false,
                     },
                 ),
-                (LocalId::from(3), Instruction::Load { source: LocalId::from(2) }),
+                (LocalId::from(3), Instruction::load(LocalId::from(2))),
                 (
                     LocalId::from(4),
                     Instruction::BinaryOp {
@@ -1796,10 +1793,7 @@ mod tests {
                 (LocalId::from(0), Instruction::num_const(99)),
                 (
                     LocalId::from(1),
-                    Instruction::Store {
-                        target: arg0_id,
-                        source: LocalId::from(0),
-                    },
+                    Instruction::store(arg0_id, LocalId::from(0)),
                 ),
             ],
             (LocalId::from(2), Terminator::Return { value: None }),
@@ -2009,13 +2003,10 @@ mod tests {
                         create_if_missing: true, // Even with create_if_missing=true, no deopt
                     },
                 ),
-                (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
+                (LocalId::from(1), Instruction::load(LocalId::from(0))),
                 (
                     LocalId::from(2),
-                    Instruction::Store {
-                        target: LocalId::from(0),
-                        source: LocalId::from(1),
-                    },
+                    Instruction::store(LocalId::from(0), LocalId::from(1)),
                 ),
             ],
             (LocalId::from(3), Terminator::Return { value: None }),
@@ -2064,7 +2055,7 @@ mod tests {
                         create_if_missing: false,
                     },
                 ),
-                (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
+                (LocalId::from(1), Instruction::load(LocalId::from(0))),
                 (
                     LocalId::from(2),
                     Instruction::GetGlobal {
@@ -2072,7 +2063,7 @@ mod tests {
                         create_if_missing: true,
                     },
                 ),
-                (LocalId::from(3), Instruction::Load { source: LocalId::from(2) }),
+                (LocalId::from(3), Instruction::load(LocalId::from(2))),
                 (
                     LocalId::from(4),
                     Instruction::BinaryOp {
@@ -2150,16 +2141,13 @@ mod tests {
                         create_if_missing: false,
                     },
                 ),
-                (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
+                (LocalId::from(1), Instruction::load(LocalId::from(0))),
                 (LocalId::from(2), Instruction::Alloc),
                 (
                     LocalId::from(3),
-                    Instruction::Store {
-                        target: LocalId::from(2),
-                        source: LocalId::from(1),
-                    },
+                    Instruction::store(LocalId::from(2), LocalId::from(1)),
                 ),
-                (LocalId::from(4), Instruction::Load { source: LocalId::from(2) }),
+                (LocalId::from(4), Instruction::load(LocalId::from(2))),
                 (
                     LocalId::from(5),
                     Instruction::GetField {
@@ -2168,7 +2156,7 @@ mod tests {
                         create_if_missing: false,
                     },
                 ),
-                (LocalId::from(6), Instruction::Load { source: LocalId::from(5) }),
+                (LocalId::from(6), Instruction::load(LocalId::from(5))),
             ],
             (
                 LocalId::from(7),
@@ -2236,12 +2224,9 @@ mod tests {
                 (cell_id, Instruction::Alloc),
                 (
                     LocalId::from(1),
-                    Instruction::Store {
-                        target: cell_id,
-                        source: value_id,
-                    },
+                    Instruction::store(cell_id, value_id),
                 ),
-                (LocalId::from(3), Instruction::Load { source: cell_id }),
+                (LocalId::from(3), Instruction::load(cell_id)),
                 (
                     LocalId::from(4),
                     Instruction::GetField {
@@ -2250,7 +2235,7 @@ mod tests {
                         create_if_missing: false,
                     },
                 ),
-                (LocalId::from(5), Instruction::Load { source: LocalId::from(4) }),
+                (LocalId::from(5), Instruction::load(LocalId::from(4))),
                 (
                     LocalId::from(6),
                     Instruction::Call {
@@ -2341,16 +2326,13 @@ mod tests {
                         create_if_missing: false,
                     },
                 ),
-                (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
+                (LocalId::from(1), Instruction::load(LocalId::from(0))),
                 (LocalId::from(2), Instruction::Alloc),
                 (
                     LocalId::from(3),
-                    Instruction::Store {
-                        target: LocalId::from(2),
-                        source: LocalId::from(1),
-                    },
+                    Instruction::store(LocalId::from(2), LocalId::from(1)),
                 ),
-                (LocalId::from(4), Instruction::Load { source: LocalId::from(2) }),
+                (LocalId::from(4), Instruction::load(LocalId::from(2))),
                 (
                     LocalId::from(5),
                     Instruction::GetField {
@@ -2359,8 +2341,8 @@ mod tests {
                         create_if_missing: false,
                     },
                 ),
-                (LocalId::from(6), Instruction::Load { source: LocalId::from(5) }),
-                (LocalId::from(7), Instruction::Load { source: LocalId::from(2) }),
+                (LocalId::from(6), Instruction::load(LocalId::from(5))),
+                (LocalId::from(7), Instruction::load(LocalId::from(2))),
                 (
                     LocalId::from(8),
                     Instruction::GetField {
@@ -2369,7 +2351,7 @@ mod tests {
                         create_if_missing: false,
                     },
                 ),
-                (LocalId::from(9), Instruction::Load { source: LocalId::from(8) }),
+                (LocalId::from(9), Instruction::load(LocalId::from(8))),
                 (
                     LocalId::from(10),
                     Instruction::BinaryOp {
@@ -2446,7 +2428,7 @@ mod tests {
                         create_if_missing: false,
                     },
                 ),
-                (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
+                (LocalId::from(1), Instruction::load(LocalId::from(0))),
                 (
                     LocalId::from(2),
                     Instruction::GetGlobal {
@@ -2454,23 +2436,17 @@ mod tests {
                         create_if_missing: false,
                     },
                 ),
-                (LocalId::from(3), Instruction::Load { source: LocalId::from(2) }),
+                (LocalId::from(3), Instruction::load(LocalId::from(2))),
                 (LocalId::from(4), Instruction::Alloc),
                 (
                     LocalId::from(5),
-                    Instruction::Store {
-                        target: LocalId::from(4),
-                        source: LocalId::from(1),
-                    },
+                    Instruction::store(LocalId::from(4), LocalId::from(1)),
                 ),
                 (
                     LocalId::from(6),
-                    Instruction::Store {
-                        target: LocalId::from(4),
-                        source: LocalId::from(3),
-                    },
+                    Instruction::store(LocalId::from(4), LocalId::from(3)),
                 ),
-                (LocalId::from(7), Instruction::Load { source: LocalId::from(4) }),
+                (LocalId::from(7), Instruction::load(LocalId::from(4))),
                 (
                     LocalId::from(8),
                     Instruction::GetField {
@@ -2479,7 +2455,7 @@ mod tests {
                         create_if_missing: false,
                     },
                 ),
-                (LocalId::from(9), Instruction::Load { source: LocalId::from(8) }),
+                (LocalId::from(9), Instruction::load(LocalId::from(8))),
             ],
             (
                 LocalId::from(10),
@@ -2543,25 +2519,19 @@ mod tests {
                         create_if_missing: false,
                     },
                 ),
-                (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
+                (LocalId::from(1), Instruction::load(LocalId::from(0))),
                 (LocalId::from(2), Instruction::Alloc),
                 (
                     LocalId::from(3),
-                    Instruction::Store {
-                        target: LocalId::from(2),
-                        source: LocalId::from(1),
-                    },
+                    Instruction::store(LocalId::from(2), LocalId::from(1)),
                 ),
-                (LocalId::from(4), Instruction::Load { source: LocalId::from(2) }),
+                (LocalId::from(4), Instruction::load(LocalId::from(2))),
                 (LocalId::from(5), Instruction::Alloc),
                 (
                     LocalId::from(6),
-                    Instruction::Store {
-                        target: LocalId::from(5),
-                        source: LocalId::from(4),
-                    },
+                    Instruction::store(LocalId::from(5), LocalId::from(4)),
                 ),
-                (LocalId::from(7), Instruction::Load { source: LocalId::from(5) }),
+                (LocalId::from(7), Instruction::load(LocalId::from(5))),
                 (
                     LocalId::from(8),
                     Instruction::GetField {
@@ -2570,7 +2540,7 @@ mod tests {
                         create_if_missing: false,
                     },
                 ),
-                (LocalId::from(9), Instruction::Load { source: LocalId::from(8) }),
+                (LocalId::from(9), Instruction::load(LocalId::from(8))),
             ],
             (
                 LocalId::from(10),
@@ -2616,7 +2586,7 @@ mod tests {
         let entry = Block::new_for_test(
             vec![
                 (LocalId::from(0), Instruction::Alloc),
-                (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
+                (LocalId::from(1), Instruction::load(LocalId::from(0))),
                 (
                     LocalId::from(2),
                     Instruction::GetField {
@@ -2625,7 +2595,7 @@ mod tests {
                         create_if_missing: false,
                     },
                 ),
-                (LocalId::from(3), Instruction::Load { source: LocalId::from(2) }),
+                (LocalId::from(3), Instruction::load(LocalId::from(2))),
             ],
             (
                 LocalId::from(4),
@@ -2674,7 +2644,7 @@ mod tests {
                         create_if_missing: false,
                     },
                 ),
-                (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
+                (LocalId::from(1), Instruction::load(LocalId::from(0))),
                 (LocalId::from(2), Instruction::num_const(1)),
                 (
                     LocalId::from(3),
