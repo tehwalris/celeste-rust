@@ -318,7 +318,7 @@ impl HeapShape {
     }
 
     /// Get the shape at a given path
-    fn get_shape_at_path(&self, path: &HeapPath) -> Option<&ValueShape> {
+    pub fn get_shape_at_path(&self, path: &HeapPath) -> Option<&ValueShape> {
         match path {
             HeapPath::Global(name) => self.globals.get(name),
             HeapPath::Arg(index) => self.args.get(*index).and_then(|o| o.as_ref()),

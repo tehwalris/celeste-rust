@@ -919,7 +919,7 @@ fn run_optimization_pipeline_with_interprocedural_inner(
             let mut shape = build_celeste_heap_shape(&loop_analysis.accessed_globals);
             shape.args = arg_shapes.to_vec();
 
-            let result = resolve_calls_via_slots(&current_cfg, &shape, arg_ids, arg_shapes, global_closure_map);
+            let result = resolve_calls_via_slots(&current_cfg, &shape, arg_ids, global_closure_map);
             if result.calls_resolved > 0 {
                 total_calls_resolved += result.calls_resolved;
                 current_cfg = result.cfg;

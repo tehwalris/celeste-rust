@@ -11,7 +11,7 @@
 
 use crate::interpreter::call_resolution::GlobalClosureMap;
 use crate::interpreter::common::FxHashMap;
-use crate::interpreter::heap_elimination::{HeapPath, HeapShape, HeapSlot, ValueShape};
+use crate::interpreter::heap_elimination::{HeapPath, HeapShape, HeapSlot};
 use crate::ir::{Block, BlockId, Cfg, GlobalId, Instruction, Label, LocalId};
 
 /// Tracks which LocalId points to which HeapSlot (or unknown)
@@ -68,45 +68,12 @@ pub struct CallResolutionResult {
 }
 
 
-/// Check if a slot exists in the shape
-fn is_slot_in_shape(slot: &HeapSlot, shape: &HeapShape, arg_shapes: &[Option<ValueShape>]) -> bool {
-    match slot.path() {
-        HeapPath::Global(name) => shape.globals.contains_key(name),
-        HeapPath::Field(base, _) => {
-            // Check if the path leads to a known shape
-            get_shape_at_path(slot.path(), shape, arg_shapes)
-                .map(|val_shape| val_shape.is_some())
-                .unwrap_or(false)
-        }
-        HeapPath::Arg(idx) => {
-            arg_shapes.get(*idx).map(|s| s.is_some()).unwrap_or(false)
-        }
-        HeapPath::Index(_, _) => {
-            // Index access could be supported but not needed for call resolution
-            false
-        }
-    }
-}
-
-/// Get the ValueShape at a given path
-fn get_shape_at_path<'a>(
-    path: &HeapPath,
-    shape: &'a HeapShape,
-    arg_shapes: &'a [Option<ValueShape>],
-) -> Option<Option<&'a ValueShape>> {
-    match path {
-        HeapPath::Global(name) => Some(shape.globals.get(name)),
-        HeapPath::Arg(idx) => Some(arg_shapes.get(*idx).and_then(|s| s.as_ref())),
-        HeapPath::Field(base, field) => {
-            if let Some(Some(ValueShape::Table(fields))) =
-                get_shape_at_path(base, shape, arg_shapes)
-            {
-                return Some(fields.get(field));
-            }
-            Some(None)
-        }
-        HeapPath::Index(_, _) => Some(None), // Not supported for now
-    }
+/// Check if a slot exists in the shape.
+/// Uses HeapShape::get_shape_at_path() for path resolution.
+fn is_slot_in_shape(slot: &HeapSlot, shape: &HeapShape) -> bool {
+    // HeapShape::get_shape_at_path handles Global, Arg, and Field paths.
+    // It returns None for Index paths, which is correct (not supported for call resolution).
+    shape.get_shape_at_path(slot.path()).is_some()
 }
 
 /// Get the closure definition from a slot, if it's a known closure.
@@ -115,8 +82,6 @@ fn get_shape_at_path<'a>(
 /// because shapes don't track capture information accurately).
 fn get_closure_from_slot(
     slot: &HeapSlot,
-    _shape: &HeapShape,
-    _arg_shapes: &[Option<ValueShape>],
     global_closure_map: &GlobalClosureMap,
 ) -> Option<(GlobalId, bool)> {  // Returns (fun_name, has_captures)
     // Convert slot path to the format used by GlobalClosureMap (e.g., "_G.foo" -> "foo")
@@ -140,7 +105,6 @@ fn analyze_and_resolve_block(
     block: &Block,
     incoming: &SlotMapping,
     shape: &HeapShape,
-    arg_shapes: &[Option<ValueShape>],
     global_closure_map: &GlobalClosureMap,
 ) -> (Block, usize, SlotMapping) {
     let mut mapping = incoming.clone();
@@ -153,7 +117,7 @@ fn analyze_and_resolve_block(
             Instruction::Call { closure, args } => {
                 // Try to resolve the closure
                 if let Some(slot) = mapping.get_slot(*closure) {
-                    if let Some((fun_name, has_captures)) = get_closure_from_slot(slot, shape, arg_shapes, global_closure_map) {
+                    if let Some((fun_name, has_captures)) = get_closure_from_slot(slot, global_closure_map) {
                         // Only resolve if the closure has no captures
                         // (closures with captures need capture values passed at call site)
                         if !has_captures {
@@ -185,7 +149,7 @@ fn analyze_and_resolve_block(
                 if let Some(parent_slot) = mapping.get_slot(*receiver).cloned() {
                     let child_path = parent_slot.path().clone().field(field);
                     let child_slot = HeapSlot::new(child_path);
-                    if is_slot_in_shape(&child_slot, shape, arg_shapes) {
+                    if is_slot_in_shape(&child_slot, shape) {
                         mapping.set_slot(*target_id, child_slot);
                     }
                 }
@@ -215,12 +179,15 @@ fn analyze_and_resolve_block(
     )
 }
 
-/// Run call resolution on a CFG using lightweight slot tracking
+/// Run call resolution on a CFG using lightweight slot tracking.
+///
+/// Note: The `shape.args` field should be set before calling this function.
+/// This is typically done by the caller (e.g., `cfg_analysis.rs` sets
+/// `shape.args = arg_shapes.to_vec()` before calling).
 pub fn resolve_calls_via_slots(
     cfg: &Cfg,
     shape: &HeapShape,
     arg_ids: &[Option<LocalId>],
-    arg_shapes: &[Option<ValueShape>],
     global_closure_map: &GlobalClosureMap,
 ) -> CallResolutionResult {
     let predecessors = cfg.compute_predecessors();
@@ -229,7 +196,8 @@ pub fn resolve_calls_via_slots(
     let mut initial_mapping = SlotMapping::new();
     for (idx, opt_id) in arg_ids.iter().enumerate() {
         if let Some(id) = opt_id {
-            if arg_shapes.get(idx).map(|s| s.is_some()).unwrap_or(false) {
+            // Use shape.args instead of a separate arg_shapes parameter
+            if shape.args.get(idx).map(|s| s.is_some()).unwrap_or(false) {
                 initial_mapping.set_slot(*id, HeapSlot::new(HeapPath::Arg(idx)));
             }
         }
@@ -277,7 +245,6 @@ pub fn resolve_calls_via_slots(
         &cfg.entry,
         &initial_mapping,
         shape,
-        arg_shapes,
         global_closure_map,
     );
     total_resolved += entry_resolved;
@@ -287,7 +254,7 @@ pub fn resolve_calls_via_slots(
     for (label, block) in &cfg.named {
         let block_id = BlockId::Named(label.clone());
         let incoming = compute_incoming_mapping(&block_id, &predecessors, &exit_mappings);
-        let (new_block, resolved, _) = analyze_and_resolve_block(block, &incoming, shape, arg_shapes, global_closure_map);
+        let (new_block, resolved, _) = analyze_and_resolve_block(block, &incoming, shape, global_closure_map);
         total_resolved += resolved;
         new_named.insert(label.clone(), new_block);
     }
@@ -369,6 +336,7 @@ fn compute_incoming_mapping(
 mod tests {
     use super::*;
     use crate::interpreter::call_resolution::GlobalClosure;
+    use crate::interpreter::heap_elimination::ValueShape;
     use crate::ir::{Block, Cfg, Instruction, Label, LocalId, Terminator};
     use crate::pico8_num::Pico8Num;
 
@@ -416,7 +384,7 @@ mod tests {
             has_captures: false,
         });
 
-        let result = resolve_calls_via_slots(&cfg, &shape, &[], &[], &global_closure_map);
+        let result = resolve_calls_via_slots(&cfg, &shape, &[], &global_closure_map);
 
         assert_eq!(result.calls_resolved, 1);
 
@@ -468,7 +436,7 @@ mod tests {
             has_captures: false,
         });
 
-        let result = resolve_calls_via_slots(&cfg, &shape, &[], &[], &global_closure_map);
+        let result = resolve_calls_via_slots(&cfg, &shape, &[], &global_closure_map);
 
         assert_eq!(result.calls_resolved, 1);
 
@@ -549,7 +517,7 @@ mod tests {
         shape.globals.insert("bar".to_string(), ValueShape::Leaf);
 
         let global_closure_map: GlobalClosureMap = FxHashMap::default();
-        let result = resolve_calls_via_slots(&cfg, &shape, &[], &[], &global_closure_map);
+        let result = resolve_calls_via_slots(&cfg, &shape, &[], &global_closure_map);
 
         // No calls to resolve in this CFG
         assert_eq!(result.calls_resolved, 0);
@@ -583,11 +551,11 @@ mod tests {
         });
 
         // First run
-        let result1 = resolve_calls_via_slots(&cfg, &shape, &[], &[], &global_closure_map);
+        let result1 = resolve_calls_via_slots(&cfg, &shape, &[], &global_closure_map);
         assert_eq!(result1.calls_resolved, 1);
 
         // Second run on the result
-        let result2 = resolve_calls_via_slots(&result1.cfg, &shape, &[], &[], &global_closure_map);
+        let result2 = resolve_calls_via_slots(&result1.cfg, &shape, &[], &global_closure_map);
 
         // Should resolve 0 calls (already resolved)
         assert_eq!(result2.calls_resolved, 0);
