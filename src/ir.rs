@@ -265,6 +265,70 @@ pub enum Instruction {
 }
 
 impl Instruction {
+    /// Get all local IDs used by this instruction.
+    ///
+    /// This returns all LocalIds that this instruction reads from (its operands).
+    /// The returned vector does NOT include the LocalId that the instruction
+    /// is assigned to (the "def" in def-use terminology).
+    pub fn get_used_locals(&self) -> Vec<LocalId> {
+        let mut result = Vec::new();
+        match self {
+            Self::Alloc => {}
+            Self::GetGlobal { .. } => {}
+            Self::Load { source } => {
+                result.push(*source);
+            }
+            Self::Store { target, source } => {
+                result.push(*target);
+                result.push(*source);
+            }
+            Self::StoreEmptyTable { target } => {
+                result.push(*target);
+            }
+            Self::StoreClosure {
+                target, captures, ..
+            } => {
+                result.push(*target);
+                result.extend(captures.iter().copied());
+            }
+            Self::GetField { receiver, .. } => {
+                result.push(*receiver);
+            }
+            Self::GetIndex { receiver, index, .. } => {
+                result.push(*receiver);
+                result.push(*index);
+            }
+            Self::NumberConstant { .. } => {}
+            Self::BoolConstant { .. } => {}
+            Self::StringConstant { .. } => {}
+            Self::NilConstant => {}
+            Self::BinaryOp { left, right, .. } => {
+                result.push(*left);
+                result.push(*right);
+            }
+            Self::UnaryOp { arg, .. } => {
+                result.push(*arg);
+            }
+            Self::Call { closure, args } => {
+                result.push(*closure);
+                result.extend(args.iter().copied());
+            }
+            Self::CallResolved { captures, args, .. } => {
+                result.extend(captures.iter().copied());
+                result.extend(args.iter().copied());
+            }
+            Self::CallBuiltin { args, .. } => {
+                result.extend(args.iter().copied());
+            }
+            Self::Phi { branches } => {
+                for (_, local) in branches {
+                    result.push(*local);
+                }
+            }
+        }
+        result
+    }
+
     pub fn map_local_ids(&self, mut f: impl FnMut(LocalId) -> LocalId) -> Self {
         match self {
             Self::Alloc => Self::Alloc,
@@ -375,6 +439,21 @@ pub enum Terminator {
 }
 
 impl Terminator {
+    /// Get all local IDs used by this terminator.
+    ///
+    /// This returns all LocalIds that this terminator reads from.
+    /// The returned vector does NOT include the LocalId that the terminator
+    /// is assigned to (the "def" in def-use terminology).
+    pub fn get_used_locals(&self) -> Vec<LocalId> {
+        match self {
+            Self::Return { value: Some(v) } => vec![*v],
+            Self::Return { value: None } => vec![],
+            Self::UnconditionalBranch { .. } => vec![],
+            Self::ConditionalBranch { condition, .. } => vec![*condition],
+            Self::Deopt { .. } => vec![],
+        }
+    }
+
     pub fn map_local_ids(&self, mut f: impl FnMut(LocalId) -> LocalId) -> Self {
         match self {
             Self::Return { value } => Self::Return {

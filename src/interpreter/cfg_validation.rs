@@ -256,8 +256,7 @@ fn validate_block_uses(
 ) {
     for (local_id, instruction) in &block.instructions {
         // Check instruction operands
-        let used_locals = get_used_locals(instruction);
-        for used in used_locals {
+        for used in instruction.get_used_locals() {
             if !defined_locals.contains_key(&used) {
                 errors.push(ValidationError::UndefinedLocal {
                     used_in_block: block_name.to_string(),
@@ -294,8 +293,7 @@ fn validate_block_uses(
     }
 
     // Check terminator operands
-    let term_used = get_terminator_used_locals(block.terminator_kind());
-    for used in term_used {
+    for used in block.terminator_kind().get_used_locals() {
         if !defined_locals.contains_key(&used) {
             errors.push(ValidationError::UndefinedLocal {
                 used_in_block: block_name.to_string(),
@@ -340,74 +338,6 @@ fn validate_branch_targets(
     }
 }
 
-/// Get all local IDs used by an instruction
-fn get_used_locals(instruction: &Instruction) -> Vec<LocalId> {
-    let mut result = Vec::new();
-    match instruction {
-        Instruction::Alloc => {}
-        Instruction::GetGlobal { .. } => {}
-        Instruction::Load { source } => {
-            result.push(*source);
-        }
-        Instruction::Store { target, source } => {
-            result.push(*target);
-            result.push(*source);
-        }
-        Instruction::StoreEmptyTable { target } => {
-            result.push(*target);
-        }
-        Instruction::StoreClosure { target, captures, .. } => {
-            result.push(*target);
-            result.extend(captures.iter().copied());
-        }
-        Instruction::GetField { receiver, .. } => {
-            result.push(*receiver);
-        }
-        Instruction::GetIndex { receiver, index, .. } => {
-            result.push(*receiver);
-            result.push(*index);
-        }
-        Instruction::NumberConstant { .. } => {}
-        Instruction::BoolConstant { .. } => {}
-        Instruction::StringConstant { .. } => {}
-        Instruction::NilConstant => {}
-        Instruction::BinaryOp { left, right, .. } => {
-            result.push(*left);
-            result.push(*right);
-        }
-        Instruction::UnaryOp { arg, .. } => {
-            result.push(*arg);
-        }
-        Instruction::Call { closure, args } => {
-            result.push(*closure);
-            result.extend(args.iter().copied());
-        }
-        Instruction::CallResolved { captures, args, .. } => {
-            result.extend(captures.iter().copied());
-            result.extend(args.iter().copied());
-        }
-        Instruction::CallBuiltin { args, .. } => {
-            result.extend(args.iter().copied());
-        }
-        Instruction::Phi { branches } => {
-            for (_, local) in branches {
-                result.push(*local);
-            }
-        }
-    }
-    result
-}
-
-/// Get all local IDs used by a terminator
-fn get_terminator_used_locals(terminator: &Terminator) -> Vec<LocalId> {
-    match terminator {
-        Terminator::Return { value: Some(v) } => vec![*v],
-        Terminator::Return { value: None } => vec![],
-        Terminator::UnconditionalBranch { .. } => vec![],
-        Terminator::ConditionalBranch { condition, .. } => vec![*condition],
-        Terminator::Deopt { .. } => vec![],
-    }
-}
 
 /// Classify an instruction by its SSA type (what kind of value it produces)
 fn classify_instruction(instruction: &Instruction) -> SsaType {

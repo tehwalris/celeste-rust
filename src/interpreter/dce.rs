@@ -47,74 +47,6 @@ fn has_side_effects(instruction: &Instruction) -> bool {
     }
 }
 
-/// Get all local IDs used by an instruction.
-fn get_used_locals(instruction: &Instruction) -> Vec<LocalId> {
-    let mut result = Vec::new();
-    match instruction {
-        Instruction::Alloc => {}
-        Instruction::GetGlobal { .. } => {}
-        Instruction::Load { source } => {
-            result.push(*source);
-        }
-        Instruction::Store { target, source } => {
-            result.push(*target);
-            result.push(*source);
-        }
-        Instruction::StoreEmptyTable { target } => {
-            result.push(*target);
-        }
-        Instruction::StoreClosure { target, captures, .. } => {
-            result.push(*target);
-            result.extend(captures.iter().copied());
-        }
-        Instruction::GetField { receiver, .. } => {
-            result.push(*receiver);
-        }
-        Instruction::GetIndex { receiver, index, .. } => {
-            result.push(*receiver);
-            result.push(*index);
-        }
-        Instruction::NumberConstant { .. } => {}
-        Instruction::BoolConstant { .. } => {}
-        Instruction::StringConstant { .. } => {}
-        Instruction::NilConstant => {}
-        Instruction::BinaryOp { left, right, .. } => {
-            result.push(*left);
-            result.push(*right);
-        }
-        Instruction::UnaryOp { arg, .. } => {
-            result.push(*arg);
-        }
-        Instruction::Call { closure, args } => {
-            result.push(*closure);
-            result.extend(args.iter().copied());
-        }
-        Instruction::CallResolved { captures, args, .. } => {
-            result.extend(captures.iter().copied());
-            result.extend(args.iter().copied());
-        }
-        Instruction::CallBuiltin { args, .. } => {
-            result.extend(args.iter().copied());
-        }
-        Instruction::Phi { branches } => {
-            for (_, local) in branches {
-                result.push(*local);
-            }
-        }
-    }
-    result
-}
-
-/// Get all local IDs used by a terminator.
-fn get_terminator_used_locals(terminator: &Terminator) -> Vec<LocalId> {
-    match terminator {
-        Terminator::Return { value: Some(v) } => vec![*v],
-        Terminator::Return { value: None } => vec![],
-        Terminator::UnconditionalBranch { .. } => vec![],
-        Terminator::ConditionalBranch { condition, .. } => vec![*condition],
-        Terminator::Deopt { .. } => vec![],
-    }
-}
 
 /// Compute reachable blocks from entry via control flow.
 /// Returns the set of reachable block labels (entry is always reachable).
@@ -185,14 +117,14 @@ pub fn eliminate_dead_code(cfg: &Cfg) -> DceResult {
         for (_, instruction) in &block.instructions {
             // Side-effectful instructions - mark all their operands as used
             if has_side_effects(instruction) {
-                for local in get_used_locals(instruction) {
+                for local in instruction.get_used_locals() {
                     used_locals.insert(local);
                 }
             }
         }
 
         // Terminator uses
-        for local in get_terminator_used_locals(block.terminator_kind()) {
+        for local in block.terminator_kind().get_used_locals() {
             used_locals.insert(local);
         }
     }
@@ -232,7 +164,7 @@ pub fn eliminate_dead_code(cfg: &Cfg) -> DceResult {
         changed = false;
         for (local_id, instruction) in &all_instructions {
             if used_locals.contains(local_id) {
-                for dep_local in get_used_locals(instruction) {
+                for dep_local in instruction.get_used_locals() {
                     if !used_locals.contains(&dep_local) {
                         used_locals.insert(dep_local);
                         changed = true;
