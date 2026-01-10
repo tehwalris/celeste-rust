@@ -17,6 +17,17 @@ use crate::ir::{
     Terminator,
 };
 
+/// Result from inlining a single block's body.
+/// Contains:
+/// - The remapped instructions
+/// - The terminator (LocalId, Terminator pair)
+/// - Optional return info: (label of this block, return value local) if this block returns
+type InlineBlockBodyResult = (
+    Vec<(LocalId, Instruction)>,
+    (LocalId, Terminator),
+    Option<(Label, LocalId)>,
+);
+
 /// Result of the inlining pass.
 #[derive(Debug)]
 pub enum InliningResult {
@@ -325,17 +336,12 @@ fn inline_calls_in_block(
 }
 
 /// Inline a block's body (instructions and terminator).
-///
-/// Returns:
-/// - The remapped instructions
-/// - The terminator
-/// - Optional return info: (label of this block, return value local) if this block returns
 fn inline_block_body(
     block: &Block,
     ctx: &mut InlineContext,
     block_label: &Label,
     continuation_label: &Label,
-) -> (Vec<(LocalId, Instruction)>, (LocalId, Terminator), Option<(Label, LocalId)>) {
+) -> InlineBlockBodyResult {
     // Remap instructions
     let mut new_instructions = Vec::new();
     for (callee_local, instruction) in &block.instructions {

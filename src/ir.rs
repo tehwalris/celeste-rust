@@ -406,6 +406,12 @@ pub struct Block {
     pub hint_normalize: bool,
 }
 
+/// Type alias for a slice of instructions (pairs of LocalId and Instruction).
+pub type InstructionSlice<'a> = &'a [(LocalId, Instruction)];
+
+/// Type alias for a split of phi and non-phi instructions in a block.
+pub type PhiSplit<'a> = (InstructionSlice<'a>, InstructionSlice<'a>);
+
 impl Block {
     /// Returns the LocalId assigned to the terminator instruction.
     #[inline]
@@ -421,9 +427,7 @@ impl Block {
 
     /// Splits block instructions into (phi_instructions, non_phi_instructions).
     /// Phi instructions must come first in the block, followed by non-phi instructions.
-    pub fn split_block_phi_instructions(
-        &self,
-    ) -> (&[(LocalId, Instruction)], &[(LocalId, Instruction)]) {
+    pub fn split_block_phi_instructions(&self) -> PhiSplit<'_> {
         let is_phi = |id_and_instr: &(LocalId, Instruction)| {
             matches!(id_and_instr, (_, Instruction::Phi { .. }))
         };
