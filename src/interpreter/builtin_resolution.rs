@@ -148,7 +148,6 @@ pub fn build_builtin_set<'a>(builtin_names: impl Iterator<Item = &'a String>) ->
 mod tests {
     use super::*;
     use crate::ir::{LocalId, Terminator};
-    use crate::pico8_num::Pico8Num;
 
     #[test]
     fn test_resolve_simple_builtin_call() {
@@ -168,18 +167,8 @@ mod tests {
                         source: LocalId::from(0),
                     },
                 ),
-                (
-                    LocalId::from(2),
-                    Instruction::NumberConstant {
-                        value: Pico8Num::from_i16(1),
-                    },
-                ),
-                (
-                    LocalId::from(3),
-                    Instruction::NumberConstant {
-                        value: Pico8Num::from_i16(2),
-                    },
-                ),
+                (LocalId::from(2), Instruction::num_const(1)),
+                (LocalId::from(3), Instruction::num_const(2)),
                 (
                     LocalId::from(4),
                     Instruction::Call {
@@ -293,12 +282,7 @@ mod tests {
                         source: LocalId::from(0),
                     },
                 ),
-                (
-                    LocalId::from(2),
-                    Instruction::NumberConstant {
-                        value: Pico8Num::from_i16(1),
-                    },
-                ),
+                (LocalId::from(2), Instruction::num_const(1)),
                 (
                     LocalId::from(3),
                     Instruction::Call {

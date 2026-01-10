@@ -109,7 +109,6 @@ pub fn deopt_unsafe_builtins(cfg: &Cfg) -> DeoptUnsafeBuiltinsResult {
 mod tests {
     use super::*;
     use crate::ir::LocalId;
-    use crate::pico8_num::Pico8Num;
 
     #[test]
     fn test_is_unsafe_builtin() {
@@ -133,12 +132,7 @@ mod tests {
         // CFG: %0 = NumberConstant(1); %1 = CallBuiltin(add, [%0]); return
         let entry = Block::new_for_test(
             vec![
-                (
-                    LocalId::from(0),
-                    Instruction::NumberConstant {
-                        value: Pico8Num::from_i16(1),
-                    },
-                ),
+                (LocalId::from(0), Instruction::num_const(1)),
                 (
                     LocalId::from(1),
                     Instruction::CallBuiltin {
@@ -177,12 +171,7 @@ mod tests {
         // CFG: %0 = NumberConstant(1); %1 = CallBuiltin(max, [%0, %0]); return %1
         let entry = Block::new_for_test(
             vec![
-                (
-                    LocalId::from(0),
-                    Instruction::NumberConstant {
-                        value: Pico8Num::from_i16(1),
-                    },
-                ),
+                (LocalId::from(0), Instruction::num_const(1)),
                 (
                     LocalId::from(1),
                     Instruction::CallBuiltin {

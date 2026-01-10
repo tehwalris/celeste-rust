@@ -211,7 +211,6 @@ pub fn build_global_closure_map_from_fun_defs<'a>(
 mod tests {
     use super::*;
     use crate::ir::{Block, Cfg, GlobalId, Instruction, LocalId, Terminator};
-    use crate::pico8_num::Pico8Num;
 
     fn make_test_cfg() -> Cfg {
         // Create a CFG that does:
@@ -236,12 +235,7 @@ mod tests {
                         source: LocalId::from(0),
                     },
                 ),
-                (
-                    LocalId::from(2),
-                    Instruction::NumberConstant {
-                        value: Pico8Num::from_i16(42),
-                    },
-                ),
+                (LocalId::from(2), Instruction::num_const(42)),
                 (
                     LocalId::from(3),
                     Instruction::Call {

@@ -209,7 +209,6 @@ pub fn eliminate_dead_code(cfg: &Cfg) -> DceResult {
 mod tests {
     use super::*;
     use crate::ir::{Block, Cfg, Instruction, LocalId, Terminator};
-    use crate::pico8_num::Pico8Num;
 
     #[test]
     fn test_removes_unused_get_global() {
@@ -227,12 +226,7 @@ mod tests {
                         create_if_missing: false,
                     },
                 ),
-                (
-                    LocalId::from(1),
-                    Instruction::NumberConstant {
-                        value: Pico8Num::from_i16(42),
-                    },
-                ),
+                (LocalId::from(1), Instruction::num_const(42)),
             ],
             (
                 LocalId::from(2),
@@ -322,12 +316,7 @@ mod tests {
                         source: LocalId::from(0),
                     },
                 ),
-                (
-                    LocalId::from(2),
-                    Instruction::NumberConstant {
-                        value: Pico8Num::from_i16(42),
-                    },
-                ),
+                (LocalId::from(2), Instruction::num_const(42)),
                 (
                     LocalId::from(3),
                     Instruction::CallResolved {

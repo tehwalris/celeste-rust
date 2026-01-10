@@ -1329,12 +1329,7 @@ mod tests {
         // CFG: %0 = NumberConstant(5); return %0
         // Should return NotApplicable since there's nothing to transform
         let entry = Block::new_for_test(
-            vec![(
-                LocalId::from(0),
-                Instruction::NumberConstant {
-                    value: Pico8Num::from_i16(5),
-                },
-            )],
+            vec![(LocalId::from(0), Instruction::num_const(5))],
             (
                 LocalId::from(1),
                 Terminator::Return {
@@ -1614,12 +1609,7 @@ mod tests {
                         create_if_missing: false,
                     },
                 ),
-                (
-                    LocalId::from(1),
-                    Instruction::NumberConstant {
-                        value: Pico8Num::from_i16(5),
-                    },
-                ),
+                (LocalId::from(1), Instruction::num_const(5)),
                 (
                     LocalId::from(2),
                     Instruction::Store {
@@ -1784,12 +1774,7 @@ mod tests {
 
         let entry = Block::new_for_test(
             vec![
-                (
-                    LocalId::from(0),
-                    Instruction::NumberConstant {
-                        value: Pico8Num::from_i16(99),
-                    },
-                ),
+                (LocalId::from(0), Instruction::num_const(99)),
                 (
                     LocalId::from(1),
                     Instruction::Store {
@@ -1923,12 +1908,7 @@ mod tests {
                     },
                 ),
                 // %2 = NumberConstant(42) - an argument
-                (
-                    LocalId::from(2),
-                    Instruction::NumberConstant {
-                        value: Pico8Num::from_i16(42),
-                    },
-                ),
+                (LocalId::from(2), Instruction::num_const(42)),
                 // %3 = Call(%1, [%2]) - call the closure
                 (
                     LocalId::from(3),
@@ -2672,12 +2652,7 @@ mod tests {
                     },
                 ),
                 (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
-                (
-                    LocalId::from(2),
-                    Instruction::NumberConstant {
-                        value: Pico8Num::from_i16(1),
-                    },
-                ),
+                (LocalId::from(2), Instruction::num_const(1)),
                 (
                     LocalId::from(3),
                     Instruction::Call {

@@ -413,7 +413,6 @@ fn inline_block_body(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pico8_num::Pico8Num;
 
     fn make_simple_callee() -> FunDef {
         // A simple function: fn(x) -> x + 1
@@ -423,12 +422,7 @@ mod tests {
         // return %2
         let entry = Block::new_for_test(
             vec![
-                (
-                    LocalId::from(1),
-                    Instruction::NumberConstant {
-                        value: Pico8Num::from_i16(1),
-                    },
-                ),
+                (LocalId::from(1), Instruction::num_const(1)),
                 (
                     LocalId::from(2),
                     Instruction::BinaryOp {
@@ -459,12 +453,7 @@ mod tests {
         // Caller: %0 = NumberConstant(5); %1 = CallResolved(add_one_1, [], [%0]); return %1
         let entry = Block::new_for_test(
             vec![
-                (
-                    LocalId::from(0),
-                    Instruction::NumberConstant {
-                        value: Pico8Num::from_i16(5),
-                    },
-                ),
+                (LocalId::from(0), Instruction::num_const(5)),
                 (
                     LocalId::from(1),
                     Instruction::CallResolved {

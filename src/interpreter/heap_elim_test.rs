@@ -219,9 +219,7 @@ mod tests {
                 (LocalId::from(2), Instruction::Load {
                     source: LocalId::from(1)
                 }),
-                (LocalId::from(3), Instruction::NumberConstant {
-                    value: Pico8Num::from_i16(0)
-                }),
+                (LocalId::from(3), Instruction::num_const(0)),
                 (LocalId::from(4), Instruction::BinaryOp {
                     left: LocalId::from(2),
                     op: BinaryOp::GreaterThan,
@@ -243,9 +241,7 @@ mod tests {
         //   jump -> if_join
         let if_true = Block::new_for_test(
             vec![
-                (LocalId::from(6), Instruction::NumberConstant {
-                    value: Pico8Num::from_i16(1)
-                }),
+                (LocalId::from(6), Instruction::num_const(1)),
                 (LocalId::from(7), Instruction::BinaryOp {
                     left: LocalId::from(2),
                     op: BinaryOp::Plus,
