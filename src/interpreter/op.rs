@@ -13,7 +13,7 @@ fn interpret_not(v: &Value) -> Result<Value> {
     match v {
         Value::Bool(v) => Ok(Value::Bool(v.map(|v| !v))),
         Value::UnknownBool => Ok(Value::UnknownBool),
-        v => panic!("Unsupported value for not: {:?}", v),
+        v => Err(anyhow!("Unsupported value for not: {:?}", v)),
     }
 }
 
@@ -213,9 +213,15 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Unsupported value for not")]
-    fn test_not_number_panics() {
-        let _ = interpret_not(&num(5));
+    fn test_not_number_returns_error() {
+        let result = interpret_not(&num(5));
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Unsupported value for not"),
+            "Expected error message to contain 'Unsupported value for not', got: {}",
+            err_msg
+        );
     }
 
     #[test]
