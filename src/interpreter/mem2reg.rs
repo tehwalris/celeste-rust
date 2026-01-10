@@ -1067,11 +1067,7 @@ mod tests {
                 (LocalId::from(0), Instruction::Alloc),
                 (LocalId::from(100), Instruction::bool_const(true)), // condition
             ],
-            (LocalId::from(101), Terminator::ConditionalBranch {
-                condition: LocalId::from(100),
-                true_target: Label::from("block_a".to_string()),
-                false_target: Label::from("block_b".to_string()),
-            }),
+            (LocalId::from(101), Terminator::cond_branch(LocalId::from(100), "block_a", "block_b")),
         );
 
         let block_a = Block::new_for_test(

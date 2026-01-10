@@ -444,11 +444,7 @@ mod tests {
 
         let entry = Block::new_for_test(
             vec![(LocalId::from(0), Instruction::bool_const(true))],
-            (LocalId::from(99), Terminator::ConditionalBranch {
-                condition: LocalId::from(0),
-                true_target: Label::from("true_branch".to_string()),
-                false_target: Label::from("false_branch".to_string()),
-            }),
+            (LocalId::from(99), Terminator::cond_branch(LocalId::from(0), "true_branch", "false_branch")),
         );
 
         let true_branch = Block::new_for_test(

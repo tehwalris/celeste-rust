@@ -224,11 +224,7 @@ mod tests {
                     LocalId::from(3),
                 )),
             ],
-            (LocalId::from(5), Terminator::ConditionalBranch {
-                condition: LocalId::from(4),
-                true_target: Label::from("if_true".to_string()),
-                false_target: Label::from("if_join".to_string()),
-            }),
+            (LocalId::from(5), Terminator::cond_branch(LocalId::from(4), "if_true", "if_join")),
         );
 
         // if_true block:
