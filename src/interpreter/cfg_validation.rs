@@ -424,13 +424,12 @@ pub fn assert_valid_cfg_with_args(cfg: &Cfg, arg_ids: &[LocalId], context: &str)
 mod tests {
     use super::*;
     use crate::ir::{Block, Cfg, Instruction, Label, LocalId, Terminator};
-    use crate::pico8_num::Pico8Num;
 
     #[test]
     fn test_valid_simple_cfg() {
         let cfg = Cfg::single_entry(Block::new_for_test(
             vec![
-                (LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(42) }),
+                (LocalId::from(0), Instruction::num_const(42)),
             ],
             (LocalId::from(1), Terminator::Return { value: Some(LocalId::from(0)) }),
         ));
@@ -458,7 +457,7 @@ mod tests {
             Label::from("block1".to_string()),
             Block::new_for_test(
                 vec![
-                    (LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(1) }), // Same ID as entry
+                    (LocalId::from(0), Instruction::num_const(1)), // Same ID as entry
                 ],
                 (LocalId::from(2), Terminator::Return { value: Some(LocalId::from(0)) }),
             ),
@@ -467,7 +466,7 @@ mod tests {
         let cfg = Cfg {
             entry: Block::new_for_test(
                 vec![
-                    (LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(42) }),
+                    (LocalId::from(0), Instruction::num_const(42)),
                 ],
                 (LocalId::from(1), Terminator::UnconditionalBranch { target: Label::from("block1".to_string()) }),
             ),
@@ -499,7 +498,7 @@ mod tests {
         let cfg = Cfg {
             entry: Block::new_for_test(
                 vec![
-                    (LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(42) }),
+                    (LocalId::from(0), Instruction::num_const(42)),
                 ],
                 (LocalId::from(1), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
             ),
@@ -550,7 +549,7 @@ mod tests {
             Label::from("other".to_string()),
             Block::new_for_test(
                 vec![
-                    (LocalId::from(2), Instruction::NumberConstant { value: Pico8Num::from_i16(99) }),
+                    (LocalId::from(2), Instruction::num_const(99)),
                 ],
                 (LocalId::from(6), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
             ),
@@ -559,7 +558,7 @@ mod tests {
         let cfg = Cfg {
             entry: Block::new_for_test(
                 vec![
-                    (LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(42) }),
+                    (LocalId::from(0), Instruction::num_const(42)),
                 ],
                 (LocalId::from(1), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
             ),
@@ -617,7 +616,7 @@ mod tests {
         // Load from NumberConstant is a type error
         let cfg = Cfg::single_entry(Block::new_for_test(
             vec![
-                (LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(42) }),
+                (LocalId::from(0), Instruction::num_const(42)),
                 (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
             ],
             (LocalId::from(2), Terminator::Return { value: Some(LocalId::from(1)) }),
@@ -633,8 +632,8 @@ mod tests {
         // Store to NumberConstant is a type error - you can only store to pointers
         let cfg = Cfg::single_entry(Block::new_for_test(
             vec![
-                (LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(42) }),
-                (LocalId::from(1), Instruction::NumberConstant { value: Pico8Num::from_i16(99) }),
+                (LocalId::from(0), Instruction::num_const(42)),
+                (LocalId::from(1), Instruction::num_const(99)),
                 // This is the type error being tested: Store to a NumberConstant.
                 // NumberConstant produces a VALUE, not a pointer, so this should be flagged.
                 (LocalId::from(2), Instruction::Store { target: LocalId::from(0), source: LocalId::from(1) }),
@@ -659,7 +658,7 @@ mod tests {
         let cfg = Cfg::single_entry(Block::new_for_test(
             vec![
                 (LocalId::from(0), Instruction::Alloc),
-                (LocalId::from(1), Instruction::NumberConstant { value: Pico8Num::from_i16(42) }),
+                (LocalId::from(1), Instruction::num_const(42)),
                 (LocalId::from(2), Instruction::Store { target: LocalId::from(0), source: LocalId::from(1) }),
             ],
             (LocalId::from(3), Terminator::Return { value: None }),
@@ -677,7 +676,7 @@ mod tests {
             Label::from("unreachable".to_string()),
             Block::new_for_test(
                 vec![
-                    (LocalId::from(2), Instruction::NumberConstant { value: Pico8Num::from_i16(99) }),
+                    (LocalId::from(2), Instruction::num_const(99)),
                 ],
                 (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
             ),
@@ -701,7 +700,7 @@ mod tests {
         let cfg = Cfg {
             entry: Block::new_for_test(
                 vec![
-                    (LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(42) }),
+                    (LocalId::from(0), Instruction::num_const(42)),
                 ],
                 // Entry jumps to join, not to unreachable
                 (LocalId::from(1), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),

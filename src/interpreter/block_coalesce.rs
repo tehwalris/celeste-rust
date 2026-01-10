@@ -253,7 +253,6 @@ mod tests {
     use super::*;
     use crate::common::FxHashMap;
     use crate::ir::{Block, Cfg, Instruction, LocalId, Terminator};
-    use crate::pico8_num::Pico8Num;
 
     #[test]
     fn test_simple_coalesce() {
@@ -263,7 +262,7 @@ mod tests {
 
         let entry = Block::new_for_test(
             vec![
-                (LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(5) }),
+                (LocalId::from(0), Instruction::num_const(5)),
             ],
             (
                 LocalId::from(1),
@@ -273,7 +272,7 @@ mod tests {
 
         let block_a = Block::new_for_test(
             vec![
-                (LocalId::from(2), Instruction::NumberConstant { value: Pico8Num::from_i16(10) }),
+                (LocalId::from(2), Instruction::num_const(10)),
             ],
             (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
         );
@@ -337,7 +336,7 @@ mod tests {
 
         let entry = Block::new_for_test(
             vec![
-                (LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(1) }),
+                (LocalId::from(0), Instruction::num_const(1)),
             ],
             (
                 LocalId::from(1),
@@ -347,7 +346,7 @@ mod tests {
 
         let block_a = Block::new_for_test(
             vec![
-                (LocalId::from(2), Instruction::NumberConstant { value: Pico8Num::from_i16(2) }),
+                (LocalId::from(2), Instruction::num_const(2)),
             ],
             (
                 LocalId::from(3),
@@ -357,7 +356,7 @@ mod tests {
 
         let block_b = Block::new_for_test(
             vec![
-                (LocalId::from(4), Instruction::NumberConstant { value: Pico8Num::from_i16(3) }),
+                (LocalId::from(4), Instruction::num_const(3)),
             ],
             (LocalId::from(5), Terminator::Return { value: Some(LocalId::from(4)) }),
         );

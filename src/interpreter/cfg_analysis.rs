@@ -1564,16 +1564,13 @@ impl CfgTestCases {
 mod tests {
     use super::*;
     use crate::ir::LocalId;
-    use crate::pico8_num::Pico8Num;
 
     fn make_simple_cfg() -> Cfg {
         // A simple CFG: %0 = NumberConstant(5); return %0
         let entry = Block::new_for_test(
             vec![(
                 LocalId::from(0),
-                Instruction::NumberConstant {
-                    value: Pico8Num::from_i16(5),
-                },
+                Instruction::num_const(5),
             )],
             (
                 LocalId::from(1),
@@ -1621,12 +1618,7 @@ mod tests {
                         create_if_missing: false,
                     },
                 ),
-                (
-                    LocalId::from(1),
-                    Instruction::NumberConstant {
-                        value: Pico8Num::from_i16(5),
-                    },
-                ),
+                (LocalId::from(1), Instruction::num_const(5)),
                 (
                     LocalId::from(2),
                     Instruction::Store {
@@ -1743,14 +1735,8 @@ mod tests {
         // Create inner function: %0 = 1, %1 = 1, %2 = %0 + %1, return %2
         let inner_cfg = Cfg::single_entry(Block::new_for_test(
             vec![
-                (
-                    LocalId::from(0),
-                    Instruction::NumberConstant { value: Pico8Num::from_i16(1) },
-                ),
-                (
-                    LocalId::from(1),
-                    Instruction::NumberConstant { value: Pico8Num::from_i16(1) },
-                ),
+                (LocalId::from(0), Instruction::num_const(1)),
+                (LocalId::from(1), Instruction::num_const(1)),
                 (
                     LocalId::from(2),
                     Instruction::BinaryOp {

@@ -334,7 +334,6 @@ mod tests {
     use crate::interpreter::call_resolution::GlobalClosure;
     use crate::interpreter::heap_elimination::ValueShape;
     use crate::ir::{Block, Cfg, Instruction, Label, LocalId, Terminator};
-    use crate::pico8_num::Pico8Num;
 
     #[test]
     fn test_resolve_simple_global_call() {
@@ -477,7 +476,7 @@ mod tests {
             vec![
                 // This call uses %1 which is only defined in true_branch
                 // At the join point, we don't know if %1 is valid
-                (LocalId::from(3), Instruction::NumberConstant { value: Pico8Num::from_i16(0) }),
+                (LocalId::from(3), Instruction::num_const(0)),
             ],
             (LocalId::from(96), Terminator::Return { value: Some(LocalId::from(3)) }),
         );

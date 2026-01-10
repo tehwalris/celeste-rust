@@ -265,6 +265,18 @@ pub enum Instruction {
 }
 
 impl Instruction {
+    /// Test helper to create a NumberConstant from an i16.
+    ///
+    /// This is a convenience method for tests that need to create number
+    /// constants without importing Pico8Num. It's more concise than the
+    /// full `Instruction::NumberConstant { value: Pico8Num::from_i16(N) }`.
+    #[cfg(test)]
+    pub fn num_const(value: i16) -> Self {
+        Self::NumberConstant {
+            value: Pico8Num::from_i16(value),
+        }
+    }
+
     /// Get all local IDs used by this instruction.
     ///
     /// This returns all LocalIds that this instruction reads from (its operands).

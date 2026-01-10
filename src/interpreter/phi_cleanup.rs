@@ -302,7 +302,6 @@ pub fn cleanup_phis_with_defined_locals(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pico8_num::Pico8Num;
 
     #[test]
     fn test_no_change_when_predecessors_match() {
@@ -315,7 +314,7 @@ mod tests {
         );
 
         let block_a = Block::new_for_test(
-            vec![(LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(1) })],
+            vec![(LocalId::from(0), Instruction::num_const(1))],
             (LocalId::from(1), Terminator::UnconditionalBranch { target: Label::from("block_b".to_string()) }),
         );
 
@@ -377,13 +376,13 @@ mod tests {
 
         // Block A now has Deopt terminator (doesn't branch to join anymore)
         let block_a = Block::new_for_test(
-            vec![(LocalId::from(1), Instruction::NumberConstant { value: Pico8Num::from_i16(1) })],
+            vec![(LocalId::from(1), Instruction::num_const(1))],
             (LocalId::from(10), Terminator::Deopt { reason: "test".to_string() }),
         );
 
         // Block B still branches to join
         let block_b = Block::new_for_test(
-            vec![(LocalId::from(2), Instruction::NumberConstant { value: Pico8Num::from_i16(2) })],
+            vec![(LocalId::from(2), Instruction::num_const(2))],
             (LocalId::from(11), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
         );
 
@@ -443,12 +442,12 @@ mod tests {
         );
 
         let block_a = Block::new_for_test(
-            vec![(LocalId::from(1), Instruction::NumberConstant { value: Pico8Num::from_i16(1) })],
+            vec![(LocalId::from(1), Instruction::num_const(1))],
             (LocalId::from(10), Terminator::Deopt { reason: "a".to_string() }),
         );
 
         let block_b = Block::new_for_test(
-            vec![(LocalId::from(2), Instruction::NumberConstant { value: Pico8Num::from_i16(2) })],
+            vec![(LocalId::from(2), Instruction::num_const(2))],
             (LocalId::from(11), Terminator::Deopt { reason: "b".to_string() }),
         );
 
@@ -518,12 +517,12 @@ mod tests {
         );
 
         let block_a = Block::new_for_test(
-            vec![(LocalId::from(1), Instruction::NumberConstant { value: Pico8Num::from_i16(1) })],
+            vec![(LocalId::from(1), Instruction::num_const(1))],
             (LocalId::from(10), Terminator::Deopt { reason: "a".to_string() }), // Deopt'd!
         );
 
         let block_b = Block::new_for_test(
-            vec![(LocalId::from(2), Instruction::NumberConstant { value: Pico8Num::from_i16(2) })],
+            vec![(LocalId::from(2), Instruction::num_const(2))],
             (
                 LocalId::from(11),
                 Terminator::ConditionalBranch {
@@ -535,7 +534,7 @@ mod tests {
         );
 
         let block_c = Block::new_for_test(
-            vec![(LocalId::from(3), Instruction::NumberConstant { value: Pico8Num::from_i16(3) })],
+            vec![(LocalId::from(3), Instruction::num_const(3))],
             (LocalId::from(12), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
         );
 
@@ -595,7 +594,7 @@ mod tests {
         // Phi should collapse and BinaryOp should reference %0 directly
 
         let entry = Block::new_for_test(
-            vec![(LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(1) })],
+            vec![(LocalId::from(0), Instruction::num_const(1))],
             (LocalId::from(99), Terminator::UnconditionalBranch { target: Label::from("block_b".to_string()) }),
         );
 
@@ -609,7 +608,7 @@ mod tests {
                 ),
                 (
                     LocalId::from(2),
-                    Instruction::NumberConstant { value: Pico8Num::from_i16(2) },
+                    Instruction::num_const(2),
                 ),
                 (
                     LocalId::from(3),
@@ -654,12 +653,12 @@ mod tests {
         // Final use should reference %1, not %2 (which doesn't exist after collapse)
 
         let entry = Block::new_for_test(
-            vec![(LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(0) })],
+            vec![(LocalId::from(0), Instruction::num_const(0))],
             (LocalId::from(99), Terminator::UnconditionalBranch { target: Label::from("block_a".to_string()) }),
         );
 
         let block_a = Block::new_for_test(
-            vec![(LocalId::from(1), Instruction::NumberConstant { value: Pico8Num::from_i16(1) })],
+            vec![(LocalId::from(1), Instruction::num_const(1))],
             (LocalId::from(98), Terminator::UnconditionalBranch { target: Label::from("block_b".to_string()) }),
         );
 
@@ -753,12 +752,12 @@ mod tests {
         // Block A still exists in this test CFG (predecessor is valid),
         // but we'll tell cleanup that %1 is not defined
         let block_a = Block::new_for_test(
-            vec![(LocalId::from(1), Instruction::NumberConstant { value: Pico8Num::from_i16(1) })],
+            vec![(LocalId::from(1), Instruction::num_const(1))],
             (LocalId::from(10), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
         );
 
         let block_b = Block::new_for_test(
-            vec![(LocalId::from(2), Instruction::NumberConstant { value: Pico8Num::from_i16(2) })],
+            vec![(LocalId::from(2), Instruction::num_const(2))],
             (LocalId::from(11), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
         );
 
@@ -833,12 +832,12 @@ mod tests {
         );
 
         let block_a = Block::new_for_test(
-            vec![(LocalId::from(1), Instruction::NumberConstant { value: Pico8Num::from_i16(1) })],
+            vec![(LocalId::from(1), Instruction::num_const(1))],
             (LocalId::from(10), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
         );
 
         let block_b = Block::new_for_test(
-            vec![(LocalId::from(2), Instruction::NumberConstant { value: Pico8Num::from_i16(2) })],
+            vec![(LocalId::from(2), Instruction::num_const(2))],
             (LocalId::from(11), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
         );
 

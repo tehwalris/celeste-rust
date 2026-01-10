@@ -879,7 +879,6 @@ mod tests {
     use super::*;
     use crate::common::FxHashMap;
     use crate::ir::{Block, Cfg, Instruction, LocalId, Terminator, UnaryOp};
-    use crate::pico8_num::Pico8Num;
 
     #[test]
     fn test_simple_cell_promotion() {
@@ -930,7 +929,7 @@ mod tests {
         // CFG with no Alloc
         let entry = Block::new_for_test(
             vec![
-                (LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(5) }),
+                (LocalId::from(0), Instruction::num_const(5)),
             ],
             (LocalId::from(1), Terminator::Return { value: Some(LocalId::from(0)) }),
         );
@@ -977,7 +976,7 @@ mod tests {
         let entry = Block::new_for_test(
             vec![
                 (LocalId::from(0), Instruction::Alloc),
-                (LocalId::from(1), Instruction::NumberConstant { value: Pico8Num::from_i16(0) }),
+                (LocalId::from(1), Instruction::num_const(0)),
                 (LocalId::from(2), Instruction::Store {
                     target: LocalId::from(0),
                     source: LocalId::from(1),  // Store initial value
@@ -992,7 +991,7 @@ mod tests {
         let block_a = Block::new_for_test(
             vec![
                 (LocalId::from(5), Instruction::Load { source: LocalId::from(0) }),  // Load i
-                (LocalId::from(6), Instruction::NumberConstant { value: Pico8Num::from_i16(1) }),
+                (LocalId::from(6), Instruction::num_const(1)),
                 (LocalId::from(7), Instruction::BinaryOp {
                     op: BinaryOp::Plus,
                     left: LocalId::from(5),
@@ -1086,7 +1085,7 @@ mod tests {
 
         let block_a = Block::new_for_test(
             vec![
-                (LocalId::from(1), Instruction::NumberConstant { value: Pico8Num::from_i16(1) }),
+                (LocalId::from(1), Instruction::num_const(1)),
                 (LocalId::from(10), Instruction::Store {
                     target: LocalId::from(0),
                     source: LocalId::from(1),
@@ -1099,7 +1098,7 @@ mod tests {
 
         let block_b = Block::new_for_test(
             vec![
-                (LocalId::from(2), Instruction::NumberConstant { value: Pico8Num::from_i16(2) }),
+                (LocalId::from(2), Instruction::num_const(2)),
                 (LocalId::from(20), Instruction::Store {
                     target: LocalId::from(0),
                     source: LocalId::from(2),
