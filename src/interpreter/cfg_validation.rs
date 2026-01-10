@@ -808,4 +808,102 @@ mod tests {
         assert!(!type_errors.is_empty(), "Expected type error for Load(NumberConstant)");
         assert!(type_errors.iter().any(|e| matches!(e, ValidationError::LoadFromNonPointer { .. })));
     }
+
+    #[test]
+    fn test_store_to_number_constant_is_type_error() {
+        // Store to NumberConstant is a type error - you can only store to pointers
+        let cfg = Cfg {
+            entry: Block {
+                instructions: vec![
+                    (LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(42) }),
+                    (LocalId::from(1), Instruction::NumberConstant { value: Pico8Num::from_i16(99) }),
+                    // BUG: Store to a NumberConstant - it's a VALUE, not a pointer!
+                    (LocalId::from(2), Instruction::Store { target: LocalId::from(0), source: LocalId::from(1) }),
+                ],
+                terminator: (LocalId::from(3), Terminator::Return { value: None }),
+                hint_normalize: false,
+            },
+            named: Default::default(),
+        };
+
+        // Structural validation should pass
+        let structural_result = validate_cfg(&cfg);
+        assert!(structural_result.is_valid(), "Structural validation should pass: {:?}", structural_result.errors);
+
+        // Type validation should catch Store(NumberConstant)
+        let type_errors = validate_types(&cfg, &[]);
+        assert!(!type_errors.is_empty(), "Expected type error for Store(NumberConstant)");
+        assert!(type_errors.iter().any(|e| matches!(e, ValidationError::StoreToNonPointer { target_type: SsaType::Value, .. })),
+            "Expected StoreToNonPointer error: {:?}", type_errors);
+    }
+
+    #[test]
+    fn test_store_to_alloc_is_valid() {
+        // Store to Alloc is valid - Alloc produces a pointer
+        let cfg = Cfg {
+            entry: Block {
+                instructions: vec![
+                    (LocalId::from(0), Instruction::Alloc),
+                    (LocalId::from(1), Instruction::NumberConstant { value: Pico8Num::from_i16(42) }),
+                    (LocalId::from(2), Instruction::Store { target: LocalId::from(0), source: LocalId::from(1) }),
+                ],
+                terminator: (LocalId::from(3), Terminator::Return { value: None }),
+                hint_normalize: false,
+            },
+            named: Default::default(),
+        };
+
+        let type_errors = validate_types(&cfg, &[]);
+        assert!(type_errors.is_empty(), "Store to Alloc should be valid: {:?}", type_errors);
+    }
+
+    #[test]
+    fn test_phi_references_non_predecessor() {
+        // A phi that references a block that exists but is not a predecessor
+        let mut named = FxHashMap::default();
+        named.insert(
+            Label::from("unreachable".to_string()),
+            Block {
+                instructions: vec![
+                    (LocalId::from(2), Instruction::NumberConstant { value: Pico8Num::from_i16(99) }),
+                ],
+                terminator: (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
+                hint_normalize: false,
+            },
+        );
+        named.insert(
+            Label::from("join".to_string()),
+            Block {
+                instructions: vec![
+                    // Phi references "unreachable" which exists but is NOT a predecessor of "join"
+                    (LocalId::from(4), Instruction::Phi {
+                        branches: vec![
+                            (Label::from("__entry".to_string()), LocalId::from(0)),
+                            (Label::from("unreachable".to_string()), LocalId::from(2)),
+                        ],
+                    }),
+                ],
+                terminator: (LocalId::from(5), Terminator::Return { value: Some(LocalId::from(4)) }),
+                hint_normalize: false,
+            },
+        );
+
+        let cfg = Cfg {
+            entry: Block {
+                instructions: vec![
+                    (LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(42) }),
+                ],
+                // Entry jumps to join, not to unreachable
+                terminator: (LocalId::from(1), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
+                hint_normalize: false,
+            },
+            named,
+        };
+
+        let result = validate_cfg(&cfg);
+        assert!(!result.is_valid(), "Expected validation errors");
+        assert!(result.errors.iter().any(|e| matches!(e, ValidationError::PhiReferencesNonPredecessor { referenced_block, .. }
+            if referenced_block.as_str() == "unreachable")),
+            "Expected PhiReferencesNonPredecessor error: {:?}", result.errors);
+    }
 }
