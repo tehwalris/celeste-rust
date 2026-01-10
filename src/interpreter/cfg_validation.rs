@@ -139,27 +139,18 @@ pub fn validate_cfg_with_args(cfg: &Cfg, arg_ids: &[LocalId]) -> ValidationResul
         defined_locals.insert(*arg_id, "<args>".to_string());
     }
 
-    // Check entry block
-    collect_definitions(&cfg.entry, "entry", &mut defined_locals, &mut errors);
-
-    // Check named blocks
-    for (label, block) in &cfg.named {
-        collect_definitions(block, label.as_str(), &mut defined_locals, &mut errors);
+    // Collect definitions from all blocks
+    for (label, block) in cfg.iter_blocks_with_label() {
+        collect_definitions(block, label, &mut defined_locals, &mut errors);
     }
 
     // Build predecessor map for phi validation
     let predecessors = build_predecessor_map(cfg);
 
-    // Now validate uses
-    validate_block_uses(&cfg.entry, "entry", &defined_locals, &block_names, &predecessors, &mut errors);
-    for (label, block) in &cfg.named {
-        validate_block_uses(block, label.as_str(), &defined_locals, &block_names, &predecessors, &mut errors);
-    }
-
-    // Validate branch targets
-    validate_branch_targets(&cfg.entry, "entry", &block_names, &mut errors);
-    for (label, block) in &cfg.named {
-        validate_branch_targets(block, label.as_str(), &block_names, &mut errors);
+    // Validate uses and branch targets for all blocks
+    for (label, block) in cfg.iter_blocks_with_label() {
+        validate_block_uses(block, label, &defined_locals, &block_names, &predecessors, &mut errors);
+        validate_branch_targets(block, label, &block_names, &mut errors);
     }
 
     ValidationResult { errors }
@@ -364,20 +355,14 @@ pub fn validate_types(cfg: &Cfg, arg_types: &[(LocalId, SsaType)]) -> Vec<Valida
         local_types.insert(*local_id, (*ssa_type, "<arg>".to_string()));
     }
 
-    // Collect types from entry block
-    collect_types(&cfg.entry, &mut local_types);
-
-    // Collect types from named blocks
-    for block in cfg.named.values() {
+    // Collect types from all blocks
+    for block in cfg.iter_blocks() {
         collect_types(block, &mut local_types);
     }
 
-    // Validate types in entry block
-    validate_block_types(&cfg.entry, "entry", &local_types, &mut errors);
-
-    // Validate types in named blocks
-    for (label, block) in &cfg.named {
-        validate_block_types(block, label.as_str(), &local_types, &mut errors);
+    // Validate types in all blocks
+    for (label, block) in cfg.iter_blocks_with_label() {
+        validate_block_types(block, label, &local_types, &mut errors);
     }
 
     errors

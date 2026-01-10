@@ -597,6 +597,20 @@ impl Cfg {
         )
     }
 
+    /// Iterate over all blocks with a string label.
+    ///
+    /// This is a convenience method for cases where you need block iteration
+    /// with string labels (e.g., for error messages, validation). The entry
+    /// block uses the label "entry" (not ENTRY_BLOCK_LABEL which is "__entry"
+    /// used for phi nodes).
+    pub fn iter_blocks_with_label(&self) -> impl Iterator<Item = (&str, &Block)> {
+        std::iter::once(("entry", &self.entry)).chain(
+            self.named
+                .iter()
+                .map(|(label, block)| (label.as_str(), block)),
+        )
+    }
+
     /// Compute predecessor map for all blocks.
     ///
     /// Returns a map from each block to the list of blocks that can branch to it.
