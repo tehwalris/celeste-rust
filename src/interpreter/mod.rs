@@ -7,9 +7,11 @@ mod core_interpreter;
 pub mod dce;
 pub mod deopt_unsafe_builtins;
 pub mod heap_elimination;
+pub mod slot_tracker;
 pub mod fixed_env;
 pub mod inlining;
 pub mod mem2reg;
+pub mod phi_cleanup;
 mod flow;
 pub mod glue;
 pub mod heap;
@@ -25,3 +27,6 @@ pub mod vectorize;
 
 #[cfg(test)]
 mod heap_elim_test;
+
+#[cfg(test)]
+mod celeste_integration_test;

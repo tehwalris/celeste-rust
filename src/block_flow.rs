@@ -37,6 +37,8 @@ fn targets_of_terminator(t: &Terminator, labels: &IndexSet<Label>) -> Result<Vec
             FlowNode::BeforeNamedBlock(get_label_index(true_target)?),
             FlowNode::BeforeNamedBlock(get_label_index(false_target)?),
         ]),
+        // Deopt has no successors in the optimized CFG (exits to interpreter)
+        Terminator::Deopt { .. } => Ok(vec![FlowNode::Return]),
     }
 }
 

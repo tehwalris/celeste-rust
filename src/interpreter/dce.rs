@@ -119,19 +119,72 @@ fn get_terminator_used_locals(terminator: &Terminator) -> Vec<LocalId> {
         Terminator::Return { value: None } => vec![],
         Terminator::UnconditionalBranch { .. } => vec![],
         Terminator::ConditionalBranch { condition, .. } => vec![*condition],
+        Terminator::Deopt { .. } => vec![],
+    }
+}
+
+/// Compute reachable blocks from entry via control flow.
+/// Returns the set of reachable block labels (entry is always reachable).
+fn compute_reachable_blocks(cfg: &Cfg) -> FxHashSet<Label> {
+    let mut reachable: FxHashSet<Label> = FxHashSet::default();
+    let mut worklist: Vec<&Label> = Vec::new();
+
+    // Process entry block's successors
+    add_terminator_successors(&cfg.entry.terminator.1, &mut worklist, &cfg.named);
+
+    while let Some(label) = worklist.pop() {
+        if reachable.contains(label) {
+            continue;
+        }
+        reachable.insert(label.clone());
+
+        if let Some(block) = cfg.named.get(label) {
+            add_terminator_successors(&block.terminator.1, &mut worklist, &cfg.named);
+        }
+    }
+
+    reachable
+}
+
+/// Add successor labels from a terminator to the worklist.
+fn add_terminator_successors<'a>(
+    terminator: &'a Terminator,
+    worklist: &mut Vec<&'a Label>,
+    named: &'a FxHashMap<Label, Block>,
+) {
+    match terminator {
+        Terminator::Return { .. } | Terminator::Deopt { .. } => {
+            // No successors
+        }
+        Terminator::UnconditionalBranch { target } => {
+            if named.contains_key(target) {
+                worklist.push(target);
+            }
+        }
+        Terminator::ConditionalBranch { true_target, false_target, .. } => {
+            if named.contains_key(true_target) {
+                worklist.push(true_target);
+            }
+            if named.contains_key(false_target) {
+                worklist.push(false_target);
+            }
+        }
     }
 }
 
 /// Run dead code elimination on a CFG.
 ///
-/// This removes instructions that:
-/// 1. Have no side effects
-/// 2. Their results are never used
+/// This removes:
+/// 1. Unreachable blocks (blocks not reachable from entry via control flow)
+/// 2. Instructions that have no side effects and whose results are never used
 pub fn eliminate_dead_code(cfg: &Cfg) -> DceResult {
-    // Step 1: Build use sets for each local
+    // Step 0: Compute reachable blocks
+    let reachable_blocks = compute_reachable_blocks(cfg);
+
+    // Step 1: Build use sets for each local (only from reachable blocks)
     let mut used_locals: FxHashSet<LocalId> = FxHashSet::default();
 
-    // Collect all used locals from all blocks
+    // Collect all used locals from reachable blocks
     fn collect_block_uses(
         block: &Block,
         used_locals: &mut FxHashSet<LocalId>,
@@ -151,20 +204,26 @@ pub fn eliminate_dead_code(cfg: &Cfg) -> DceResult {
         }
     }
 
+    // Entry block is always reachable
     collect_block_uses(&cfg.entry, &mut used_locals);
-    for block in cfg.named.values() {
-        collect_block_uses(block, &mut used_locals);
+    for (label, block) in &cfg.named {
+        if reachable_blocks.contains(label) {
+            collect_block_uses(block, &mut used_locals);
+        }
     }
 
     // Step 2: Propagate uses backwards through definitions
     // If a local is used, then all locals used in its definition are also used
+    // Only consider instructions from reachable blocks
     let mut all_instructions: Vec<(LocalId, &Instruction)> = Vec::new();
     for (local_id, instruction) in &cfg.entry.instructions {
         all_instructions.push((*local_id, instruction));
     }
-    for block in cfg.named.values() {
-        for (local_id, instruction) in &block.instructions {
-            all_instructions.push((*local_id, instruction));
+    for (label, block) in &cfg.named {
+        if reachable_blocks.contains(label) {
+            for (local_id, instruction) in &block.instructions {
+                all_instructions.push((*local_id, instruction));
+            }
         }
     }
 
@@ -218,13 +277,21 @@ pub fn eliminate_dead_code(cfg: &Cfg) -> DceResult {
 
     let new_entry = filter_block(&cfg.entry, &used_locals, &mut total_removed);
 
+    // Only include reachable blocks in output
     let mut new_named: FxHashMap<Label, Block> = FxHashMap::default();
+    let mut blocks_removed = 0;
     for (label, block) in &cfg.named {
-        let new_block = filter_block(block, &used_locals, &mut total_removed);
-        new_named.insert(label.clone(), new_block);
+        if reachable_blocks.contains(label) {
+            let new_block = filter_block(block, &used_locals, &mut total_removed);
+            new_named.insert(label.clone(), new_block);
+        } else {
+            // Count instructions in removed block
+            total_removed += block.instructions.len();
+            blocks_removed += 1;
+        }
     }
 
-    if total_removed == 0 {
+    if total_removed == 0 && blocks_removed == 0 {
         return DceResult::NoChange;
     }
 

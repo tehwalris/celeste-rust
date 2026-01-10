@@ -1,9 +1,11 @@
 //! Call Resolution Pass: Convert indirect calls to direct calls.
 //!
-//! This pass transforms `GetGlobal + Load + Call` patterns into `CallResolved`
-//! when we know statically which closure is stored in the global.
+//! This pass transforms indirect calls into `CallResolved` when we know
+//! statically which closure is being called.
 //!
-//! For example:
+//! ## Global Function Calls
+//!
+//! Pattern: `GetGlobal + Load + Call`
 //! ```text
 //! %1 = GetGlobal(tile_flag_at)
 //! %2 = Load(%1)
@@ -12,6 +14,20 @@
 //! Becomes:
 //! ```text
 //! %3 = CallResolved(tile_flag_at_72, captures=[], args=[args...])
+//! ```
+//!
+//! ## Method Calls on Known-Type Arguments
+//!
+//! Pattern: `Load(arg_cell) + GetField + Load + Call`
+//! ```text
+//! %1 = Load(%arg0)           // Load 'this' from arg cell
+//! %2 = GetField(%1, is_solid) // Get method
+//! %3 = Load(%2)              // Load closure
+//! %4 = Call(%3, [args...])   // Call method
+//! ```
+//! When we know arg0 is of type "player" and "player.is_solid" maps to "obj.is_solid_47":
+//! ```text
+//! %4 = CallResolved(obj.is_solid_47, captures=[%1], args=[args...])
 //! ```
 //!
 //! This enables subsequent inlining and eliminates heap lookups.

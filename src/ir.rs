@@ -40,6 +40,7 @@ impl From<usize> for LocalId {
     }
 }
 
+#[derive(Clone)]
 pub struct LocalIdGenerator {
     next_id: usize,
 }
@@ -70,6 +71,7 @@ impl LocalIdGenerator {
     }
 }
 
+#[derive(Clone)]
 pub struct UniqueStringGenerator<T: From<String>> {
     _item_type: std::marker::PhantomData<T>,
     next_id: usize,
@@ -133,6 +135,26 @@ impl From<String> for Label {
 }
 
 pub type LabelGenerator = UniqueStringGenerator<Label>;
+
+impl LabelGenerator {
+    /// Create a generator that starts from a value higher than any existing label ID in the CFG.
+    /// This prevents ID conflicts when generating new labels.
+    pub fn from_cfg(cfg: &Cfg) -> Self {
+        let mut max_id = 0;
+        for label in cfg.named.keys() {
+            // Try to parse the label suffix number (format: "prefix_N")
+            if let Some(suffix) = label.as_str().rsplit('_').next() {
+                if let Ok(n) = suffix.parse::<usize>() {
+                    max_id = max_id.max(n + 1);
+                }
+            }
+        }
+        Self {
+            _item_type: std::marker::PhantomData,
+            next_id: max_id,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnaryOp {
@@ -332,6 +354,15 @@ pub enum Terminator {
         true_target: Label,
         false_target: Label,
     },
+    /// Deoptimization point - abort optimized execution and fall back to interpreter.
+    /// This is inserted when we encounter operations that can't be optimized
+    /// (e.g., heap-modifying calls, impure builtins).
+    /// At runtime, hitting a Deopt means we must restart execution with the
+    /// original unoptimized CFG.
+    Deopt {
+        /// Human-readable reason for the deopt (for debugging/analysis)
+        reason: String,
+    },
 }
 
 impl Terminator {
@@ -351,6 +382,9 @@ impl Terminator {
                 condition: f(*condition),
                 true_target: true_target.clone(),
                 false_target: false_target.clone(),
+            },
+            Self::Deopt { reason } => Self::Deopt {
+                reason: reason.clone(),
             },
         }
     }

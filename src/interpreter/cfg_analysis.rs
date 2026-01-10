@@ -16,6 +16,146 @@ use serde::{Deserialize, Serialize};
 use crate::ir::{Block, Cfg, Instruction, LocalId, Terminator};
 
 type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
+type FxHashSet<T> = HashSet<T, BuildHasherDefault<FxHasher>>;
+
+/// Clean up phi nodes that reference undefined locals.
+///
+/// After DCE removes unreachable blocks, phi nodes in reachable blocks may still
+/// reference locals that were defined in the removed blocks. This function removes
+/// those invalid branches from phi nodes and collapses single-element phis.
+fn cleanup_phis_with_undefined_locals(cfg: &Cfg, predefined_locals: &[LocalId]) -> Cfg {
+    // First, collect all defined locals in the CFG
+    let mut defined_locals: FxHashSet<LocalId> = FxHashSet::default();
+
+    // Add predefined locals (args, unpack slots)
+    for local_id in predefined_locals {
+        defined_locals.insert(*local_id);
+    }
+
+    // Collect definitions from all blocks
+    for block in cfg.iter_blocks() {
+        for (local_id, _) in &block.instructions {
+            defined_locals.insert(*local_id);
+        }
+        defined_locals.insert(block.terminator.0);
+    }
+
+    // Now clean up phi nodes
+    fn cleanup_block_phis(block: &Block, defined_locals: &FxHashSet<LocalId>) -> (Block, FxHashMap<LocalId, LocalId>) {
+        let mut new_instructions = Vec::new();
+        let mut collapsed_mappings: FxHashMap<LocalId, LocalId> = FxHashMap::default();
+
+        for (local_id, instruction) in &block.instructions {
+            match instruction {
+                Instruction::Phi { branches } => {
+                    // Filter out branches that reference undefined locals
+                    let valid_branches: Vec<_> = branches
+                        .iter()
+                        .filter(|(_, branch_local)| defined_locals.contains(branch_local))
+                        .cloned()
+                        .collect();
+
+                    if valid_branches.is_empty() {
+                        // All branches reference undefined locals - this is problematic
+                        // but we'll create a nil constant to prevent validation errors
+                        new_instructions.push((*local_id, Instruction::NilConstant));
+                    } else if valid_branches.len() == 1 {
+                        // Single valid branch - collapse to direct reference
+                        collapsed_mappings.insert(*local_id, valid_branches[0].1);
+                        // Don't emit the phi - we'll remap references
+                    } else {
+                        // Multiple valid branches - keep as phi
+                        new_instructions.push((*local_id, Instruction::Phi { branches: valid_branches }));
+                    }
+                }
+                _ => {
+                    new_instructions.push((*local_id, instruction.clone()));
+                }
+            }
+        }
+
+        (
+            Block {
+                instructions: new_instructions,
+                terminator: block.terminator.clone(),
+                hint_normalize: block.hint_normalize,
+            },
+            collapsed_mappings,
+        )
+    }
+
+    // Process entry block
+    let (new_entry, entry_mappings) = cleanup_block_phis(&cfg.entry, &defined_locals);
+
+    // Process named blocks
+    let mut new_named: FxHashMap<crate::ir::Label, Block> = FxHashMap::default();
+    let mut all_mappings: FxHashMap<LocalId, LocalId> = entry_mappings;
+
+    for (label, block) in &cfg.named {
+        let (new_block, block_mappings) = cleanup_block_phis(block, &defined_locals);
+        new_named.insert(label.clone(), new_block);
+        all_mappings.extend(block_mappings);
+    }
+
+    // If there are any collapsed phi mappings, we need to remap references
+    if all_mappings.is_empty() {
+        return Cfg {
+            entry: new_entry,
+            named: new_named,
+        };
+    }
+
+    // Compute transitive closure of mappings
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let keys: Vec<_> = all_mappings.keys().cloned().collect();
+        for key in keys {
+            let value = all_mappings[&key];
+            if let Some(&next_value) = all_mappings.get(&value) {
+                if next_value != value {
+                    all_mappings.insert(key, next_value);
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    // Apply mappings to all instructions
+    let remap = |id: LocalId| -> LocalId {
+        *all_mappings.get(&id).unwrap_or(&id)
+    };
+
+    fn remap_block(block: &Block, remap: impl Fn(LocalId) -> LocalId) -> Block {
+        let new_instructions: Vec<_> = block
+            .instructions
+            .iter()
+            .map(|(id, instr)| (*id, instr.map_local_ids(&remap)))
+            .collect();
+
+        let new_terminator = (
+            block.terminator.0,
+            block.terminator.1.map_local_ids(&remap),
+        );
+
+        Block {
+            instructions: new_instructions,
+            terminator: new_terminator,
+            hint_normalize: block.hint_normalize,
+        }
+    }
+
+    let final_entry = remap_block(&new_entry, &remap);
+    let final_named: FxHashMap<_, _> = new_named
+        .into_iter()
+        .map(|(label, block)| (label, remap_block(&block, &remap)))
+        .collect();
+
+    Cfg {
+        entry: final_entry,
+        named: final_named,
+    }
+}
 
 /// Results of analyzing a CFG for heap-related operations.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -77,6 +217,45 @@ pub enum HeapEliminationStatus {
     NotApplicable,
 }
 
+/// Type of optimization step in the pipeline
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum PipelineStepType {
+    /// The original CFG before any optimization
+    Original,
+    /// mem2reg pass - promotes local cells to SSA
+    Mem2Reg { cells_promoted: usize },
+    /// Builtin resolution - resolves calls to known builtins
+    BuiltinResolution { calls_resolved: usize },
+    /// Heap elimination in Stop mode - resolves calls via shape tracking
+    HeapElimStop { calls_resolved: usize, iteration: usize },
+    /// Inlining pass - inlines resolved calls
+    Inlining { calls_inlined: usize, iteration: usize },
+    /// Dead code elimination
+    Dce { instructions_removed: usize },
+    /// Block coalescing - merges straight-line blocks
+    BlockCoalesce { blocks_removed: usize },
+    /// Deopt unsafe builtins - inserts deopt points for unsafe builtins
+    DeoptBuiltins { deopts_inserted: usize },
+    /// Final heap elimination with deopt insertion
+    HeapElimFinal {
+        unpack_count: usize,
+        modified_count: usize,
+        slot_mappings: Vec<SlotMapping>,
+    },
+}
+
+/// A single step in the optimization pipeline (internal representation)
+#[derive(Clone, Debug)]
+pub struct PipelineStep {
+    /// Human-readable name for this step
+    pub name: String,
+    /// Type of optimization that was applied
+    pub step_type: PipelineStepType,
+    /// The CFG after this step
+    pub cfg: Cfg,
+}
+
 /// Results of running the optimization pipeline
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct OptimizationResult {
@@ -94,6 +273,8 @@ pub struct OptimizationResult {
     pub inlining: InliningStatus,
     /// Result of dead code elimination pass
     pub dce: DceStatus,
+    /// Result of deopt unsafe builtins pass
+    pub deopt_builtins: DeoptBuiltinsStatus,
 }
 
 /// Status of the block coalescing pass
@@ -179,6 +360,19 @@ pub enum BuiltinResolutionStatus {
     NoChange,
     /// Skipped because no builtin set was provided
     Skipped,
+}
+
+/// Status of the deopt unsafe builtins pass
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub enum DeoptBuiltinsStatus {
+    #[default]
+    NotAttempted,
+    /// Successfully inserted deopt points for unsafe builtins
+    Success {
+        deopts_inserted: usize,
+    },
+    /// No unsafe builtins found
+    NoChange,
 }
 
 /// Counts of each instruction type in a CFG.
@@ -367,6 +561,10 @@ fn check_instruction_escapes(
 /// Intermediate CFG results from the optimization pipeline
 #[derive(Clone, Debug, Default)]
 pub struct OptimizationCfgs {
+    /// All pipeline steps in order, including iterations
+    pub steps: Vec<PipelineStep>,
+
+    // Legacy fields for backward compatibility with run_optimization_pipeline
     pub after_mem2reg: Option<Cfg>,
     pub after_heap_elim: Option<Cfg>,
     pub after_block_coalesce: Option<Cfg>,
@@ -374,6 +572,7 @@ pub struct OptimizationCfgs {
     pub after_call_resolution: Option<Cfg>,
     pub after_inlining: Option<Cfg>,
     pub after_dce: Option<Cfg>,
+    pub after_deopt_builtins: Option<Cfg>,
 }
 
 /// Run the full optimization pipeline on a CFG.
@@ -398,8 +597,9 @@ pub fn run_optimization_pipeline_full(
     analysis: &CfgAnalysisResult,
 ) -> (OptimizationResult, OptimizationCfgs) {
     use crate::interpreter::block_coalesce::{coalesce_blocks, CoalesceResult};
+    use crate::interpreter::cfg_validation::assert_valid_cfg_with_args;
     use crate::interpreter::heap_elimination::{
-        eliminate_heap, HeapEliminationResult, HeapShape, ValueShape,
+        eliminate_heap, DeoptMode, HeapEliminationResult, HeapShape, ValueShape,
     };
     use crate::interpreter::mem2reg::{mem2reg, Mem2RegResult};
     use crate::ir::{LabelGenerator, LocalIdGenerator};
@@ -412,12 +612,14 @@ pub fn run_optimization_pipeline_full(
     let (after_mem2reg, mem2reg_status) = if analysis.local_only_allocs > 0 {
         match mem2reg(cfg, &mut local_gen) {
             Mem2RegResult::Success { cfg: new_cfg, cells_promoted } => {
+                assert_valid_cfg_with_args(&new_cfg, &[], "after mem2reg");
                 (Some(new_cfg), Mem2RegStatus::Success { cells_promoted })
             }
             Mem2RegResult::NoCells => {
                 (None, Mem2RegStatus::NoCells)
             }
             Mem2RegResult::PartialSuccess { cfg: new_cfg, cells_promoted, cells_failed, .. } => {
+                assert_valid_cfg_with_args(&new_cfg, &[], "after mem2reg (partial)");
                 (Some(new_cfg), Mem2RegStatus::Partial { cells_promoted, cells_failed })
             }
         }
@@ -440,8 +642,12 @@ pub fn run_optimization_pipeline_full(
 
         let label_gen = LabelGenerator::new();
 
-        match eliminate_heap(cfg_for_heap_elim, &shape, &[], local_gen, label_gen) {
+        match eliminate_heap(cfg_for_heap_elim, &shape, &[], local_gen, label_gen, DeoptMode::Insert) {
             HeapEliminationResult::Success(transformed) => {
+                // Validation: include unpack_slots LocalIds as pre-defined
+                // These represent initial SSA values for heap slots
+                let unpack_ids: Vec<_> = transformed.unpack_slots.iter().map(|(_, id)| *id).collect();
+                assert_valid_cfg_with_args(&transformed.cfg, &unpack_ids, "after heap_elim");
                 let slot_mappings: Vec<SlotMapping> = transformed.unpack_slots
                     .iter()
                     .map(|(slot, local_id)| SlotMapping {
@@ -469,6 +675,10 @@ pub fn run_optimization_pipeline_full(
                 result.heap_elimination = HeapEliminationStatus::NotApplicable;
                 None
             }
+            HeapEliminationResult::ConstantViolation(reason) => {
+                result.heap_elimination = HeapEliminationStatus::Failed(format!("Constant violation: {}", reason));
+                None
+            }
         }
     } else {
         result.heap_elimination = HeapEliminationStatus::NotApplicable;
@@ -483,6 +693,7 @@ pub fn run_optimization_pipeline_full(
 
     match coalesce_blocks(cfg_for_coalesce) {
         CoalesceResult::Success { cfg: new_cfg, blocks_removed } => {
+            assert_valid_cfg_with_args(&new_cfg, &[], "after block_coalesce");
             result.block_coalesce = BlockCoalesceStatus::Success { blocks_removed };
             cfgs.after_block_coalesce = Some(new_cfg);
         }
@@ -578,7 +789,7 @@ pub fn optimize_all_functions(
         .map(|fd| (fd.name.clone(), *fd))
         .collect();
 
-    for name in sorted_names {
+    'function_loop: for name in sorted_names {
         let original_fun_def = fun_def_by_name.get(&name).unwrap();
         let mut local_gen = LocalIdGenerator::from_cfg(&original_fun_def.cfg);
         let mut label_gen = LabelGenerator::new();
@@ -590,23 +801,29 @@ pub fn optimize_all_functions(
             .chain(original_fun_def.capture_ids.iter().copied())
             .collect();
 
-        // Validate input CFG
-        crate::interpreter::cfg_validation::assert_valid_cfg_with_args(
+        // Validate input CFG - skip function if validation fails
+        let validation_result = crate::interpreter::cfg_validation::validate_cfg_with_args(
             &original_fun_def.cfg,
             &external_ids,
-            &format!("{} original", fn_name),
         );
+        if !validation_result.is_valid() {
+            eprintln!("Warning: Skipping {} - validation failed: {} errors", fn_name, validation_result.errors.len());
+            continue;
+        }
 
         // Stage 1: mem2reg
         let analysis = analyze_cfg(&original_fun_def.cfg);
         let mut current_cfg = if analysis.local_only_allocs > 0 {
             match mem2reg(&original_fun_def.cfg, &mut local_gen) {
                 Mem2RegResult::Success { cfg, .. } | Mem2RegResult::PartialSuccess { cfg, .. } => {
-                    crate::interpreter::cfg_validation::assert_valid_cfg_with_args(
+                    let validation = crate::interpreter::cfg_validation::validate_cfg_with_args(
                         &cfg,
                         &external_ids,
-                        &format!("{} after mem2reg", fn_name),
                     );
+                    if !validation.is_valid() {
+                        eprintln!("Warning: Skipping {} - mem2reg validation failed: {} errors", fn_name, validation.errors.len());
+                        continue;
+                    }
                     cfg
                 }
                 Mem2RegResult::NoCells => original_fun_def.cfg.clone(),
@@ -615,18 +832,28 @@ pub fn optimize_all_functions(
             original_fun_def.cfg.clone()
         };
 
+        // Helper to validate and continue if valid
+        macro_rules! validate_or_skip {
+            ($cfg:expr, $context:expr) => {{
+                let validation = crate::interpreter::cfg_validation::validate_cfg_with_args(
+                    $cfg,
+                    &external_ids,
+                );
+                if !validation.is_valid() {
+                    eprintln!("Warning: Skipping {} - {} validation failed: {} errors", fn_name, $context, validation.errors.len());
+                    continue 'function_loop;
+                }
+            }};
+        }
+
         // Iterate builtin resolution + call resolution + inlining until no more progress
         let max_rounds = 10; // Safety limit
-        for round in 0..max_rounds {
+        'inlining_loop: for round in 0..max_rounds {
             // Stage 2a: builtin resolution (if builtin set is provided)
             if let Some(builtins) = builtin_set {
                 current_cfg = match resolve_builtins(&current_cfg, builtins) {
                     BuiltinResolutionResult::Success { cfg, .. } => {
-                        crate::interpreter::cfg_validation::assert_valid_cfg_with_args(
-                            &cfg,
-                            &external_ids,
-                            &format!("{} after builtin_resolution round {}", fn_name, round),
-                        );
+                        validate_or_skip!(&cfg, &format!("builtin_resolution round {}", round));
                         cfg
                     }
                     BuiltinResolutionResult::NoChange => current_cfg,
@@ -636,11 +863,7 @@ pub fn optimize_all_functions(
             // Stage 2b: call resolution (for user-defined functions)
             current_cfg = match resolve_calls(&current_cfg, global_closure_map) {
                 CallResolutionResult::Success { cfg, .. } => {
-                    crate::interpreter::cfg_validation::assert_valid_cfg_with_args(
-                        &cfg,
-                        &external_ids,
-                        &format!("{} after call_resolution round {}", fn_name, round),
-                    );
+                    validate_or_skip!(&cfg, &format!("call_resolution round {}", round));
                     cfg
                 }
                 CallResolutionResult::NoChange => current_cfg,
@@ -649,16 +872,12 @@ pub fn optimize_all_functions(
             // Stage 3: inlining (using already-optimized callees!)
             match inline_calls(&current_cfg, &optimized, &mut local_gen, &mut label_gen) {
                 InliningResult::Success { cfg, .. } => {
-                    crate::interpreter::cfg_validation::assert_valid_cfg_with_args(
-                        &cfg,
-                        &external_ids,
-                        &format!("{} after inlining round {}", fn_name, round),
-                    );
+                    validate_or_skip!(&cfg, &format!("inlining round {}", round));
                     current_cfg = cfg;
                     // Continue to next round - might have more calls to resolve/inline
                 }
                 InliningResult::NoChange => {
-                    break; // No more inlining possible
+                    break 'inlining_loop; // No more inlining possible
                 }
             }
         }
@@ -668,11 +887,7 @@ pub fn optimize_all_functions(
         // that were only used to set up the original Call
         current_cfg = match eliminate_dead_code(&current_cfg) {
             DceResult::Success { cfg, .. } => {
-                crate::interpreter::cfg_validation::assert_valid_cfg_with_args(
-                    &cfg,
-                    &external_ids,
-                    &format!("{} after dce", fn_name),
-                );
+                validate_or_skip!(&cfg, "dce");
                 cfg
             }
             DceResult::NoChange => current_cfg,
@@ -681,22 +896,14 @@ pub fn optimize_all_functions(
         // Stage 5: block coalescing
         current_cfg = match coalesce_blocks(&current_cfg) {
             CoalesceResult::Success { cfg, .. } => {
-                crate::interpreter::cfg_validation::assert_valid_cfg_with_args(
-                    &cfg,
-                    &external_ids,
-                    &format!("{} after block_coalesce", fn_name),
-                );
+                validate_or_skip!(&cfg, "block_coalesce");
                 cfg
             }
             CoalesceResult::NoChange => current_cfg,
         };
 
         // Final validation
-        crate::interpreter::cfg_validation::assert_valid_cfg_with_args(
-            &current_cfg,
-            &external_ids,
-            &format!("{} final", fn_name),
-        );
+        validate_or_skip!(&current_cfg, "final");
 
         // Store the optimized version for use by later functions
         let optimized_fun_def = crate::ir::FunDef {
@@ -768,6 +975,7 @@ fn topological_sort(
 /// - Most other globals are simple leaf values
 fn build_celeste_heap_shape(accessed_globals: &[String]) -> crate::interpreter::heap_elimination::HeapShape {
     use crate::interpreter::heap_elimination::{HeapShape, ValueShape};
+    use crate::pico8_num::Pico8Num;
 
     let mut shape = HeapShape::new();
 
@@ -780,6 +988,14 @@ fn build_celeste_heap_shape(accessed_globals: &[String]) -> crate::interpreter::
                 fields.insert("y".to_string(), ValueShape::Leaf);
                 ValueShape::Table(fields)
             }
+            // Button key constants - these are immutable numbers
+            // k_left=0, k_right=1, k_up=2, k_down=3, k_jump=4, k_dash=5
+            "k_left" => ValueShape::Constant(Pico8Num::from_i16(0)),
+            "k_right" => ValueShape::Constant(Pico8Num::from_i16(1)),
+            "k_up" => ValueShape::Constant(Pico8Num::from_i16(2)),
+            "k_down" => ValueShape::Constant(Pico8Num::from_i16(3)),
+            "k_jump" => ValueShape::Constant(Pico8Num::from_i16(4)),
+            "k_dash" => ValueShape::Constant(Pico8Num::from_i16(5)),
             // Most other Celeste globals are simple values (numbers, booleans, etc.)
             // or complex structures we don't need to track
             _ => ValueShape::Leaf,
@@ -814,30 +1030,97 @@ pub fn run_optimization_pipeline_with_interprocedural(
     arg_ids: &[Option<crate::ir::LocalId>],
     arg_shapes: &[Option<crate::interpreter::heap_elimination::ValueShape>],
 ) -> (OptimizationResult, OptimizationCfgs) {
+    run_optimization_pipeline_with_interprocedural_inner(
+        cfg, analysis, global_closure_map, optimized_fun_defs, builtin_set, arg_ids, arg_shapes, true,
+    )
+}
+
+/// Version of run_optimization_pipeline_with_interprocedural that allows disabling strict validation.
+/// This is useful for the cfg_viewer where we want to continue even if validation fails.
+pub fn run_optimization_pipeline_with_interprocedural_lenient(
+    cfg: &Cfg,
+    analysis: &CfgAnalysisResult,
+    global_closure_map: &crate::interpreter::call_resolution::GlobalClosureMap,
+    optimized_fun_defs: &std::collections::HashMap<crate::ir::GlobalId, crate::ir::FunDef, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>,
+    builtin_set: Option<&crate::interpreter::builtin_resolution::BuiltinSet>,
+    arg_ids: &[Option<crate::ir::LocalId>],
+    arg_shapes: &[Option<crate::interpreter::heap_elimination::ValueShape>],
+) -> (OptimizationResult, OptimizationCfgs) {
+    run_optimization_pipeline_with_interprocedural_inner(
+        cfg, analysis, global_closure_map, optimized_fun_defs, builtin_set, arg_ids, arg_shapes, false,
+    )
+}
+
+fn run_optimization_pipeline_with_interprocedural_inner(
+    cfg: &Cfg,
+    analysis: &CfgAnalysisResult,
+    global_closure_map: &crate::interpreter::call_resolution::GlobalClosureMap,
+    optimized_fun_defs: &std::collections::HashMap<crate::ir::GlobalId, crate::ir::FunDef, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>,
+    builtin_set: Option<&crate::interpreter::builtin_resolution::BuiltinSet>,
+    arg_ids: &[Option<crate::ir::LocalId>],
+    arg_shapes: &[Option<crate::interpreter::heap_elimination::ValueShape>],
+    strict_validation: bool,
+) -> (OptimizationResult, OptimizationCfgs) {
     use crate::interpreter::block_coalesce::{coalesce_blocks, CoalesceResult};
     use crate::interpreter::builtin_resolution::{resolve_builtins, BuiltinResolutionResult};
-    use crate::interpreter::call_resolution::{resolve_calls, CallResolutionResult};
+    use crate::interpreter::cfg_validation::{assert_valid_cfg_with_args, validate_cfg_with_args};
     use crate::interpreter::dce::{eliminate_dead_code, DceResult};
-    use crate::interpreter::heap_elimination::{eliminate_heap, HeapEliminationResult};
+    use crate::interpreter::deopt_unsafe_builtins::{deopt_unsafe_builtins, DeoptUnsafeBuiltinsResult};
+    use crate::interpreter::heap_elimination::{eliminate_heap, DeoptMode, HeapEliminationResult};
     use crate::interpreter::inlining::{inline_calls, InliningResult};
     use crate::interpreter::mem2reg::{mem2reg, Mem2RegResult};
+    use crate::interpreter::slot_tracker::resolve_calls_via_slots;
     use crate::ir::{LabelGenerator, LocalIdGenerator};
+
+    // Helper to validate and optionally panic
+    let validate = |cfg: &Cfg, predefined: &[crate::ir::LocalId], context: &str| {
+        if strict_validation {
+            assert_valid_cfg_with_args(cfg, predefined, context);
+        } else {
+            let result = validate_cfg_with_args(cfg, predefined);
+            if !result.is_valid() {
+                eprintln!("Warning: Validation failed ({}): {} errors", context, result.errors.len());
+            }
+        }
+    };
+
+    // Extract defined arg_ids for validation (filter out None values)
+    let defined_arg_ids: Vec<_> = arg_ids.iter().filter_map(|id| *id).collect();
 
     let mut result = OptimizationResult::default();
     let mut cfgs = OptimizationCfgs::default();
     let mut local_gen = LocalIdGenerator::from_cfg(cfg);
     let mut label_gen = LabelGenerator::new();
 
+    // Record the original CFG as the first step
+    cfgs.steps.push(PipelineStep {
+        name: "Original".to_string(),
+        step_type: PipelineStepType::Original,
+        cfg: cfg.clone(),
+    });
+
     // Stage 1: mem2reg - eliminate local cells
     let (after_mem2reg, mem2reg_status) = if analysis.local_only_allocs > 0 {
         match mem2reg(cfg, &mut local_gen) {
             Mem2RegResult::Success { cfg: new_cfg, cells_promoted } => {
+                cfgs.steps.push(PipelineStep {
+                    name: format!("mem2reg ({} cells)", cells_promoted),
+                    step_type: PipelineStepType::Mem2Reg { cells_promoted },
+                    cfg: new_cfg.clone(),
+                });
+                validate(&new_cfg, &defined_arg_ids, "after mem2reg");
                 (Some(new_cfg), Mem2RegStatus::Success { cells_promoted })
             }
             Mem2RegResult::NoCells => {
                 (None, Mem2RegStatus::NoCells)
             }
             Mem2RegResult::PartialSuccess { cfg: new_cfg, cells_promoted, cells_failed, .. } => {
+                cfgs.steps.push(PipelineStep {
+                    name: format!("mem2reg ({} cells, {} failed)", cells_promoted, cells_failed),
+                    step_type: PipelineStepType::Mem2Reg { cells_promoted },
+                    cfg: new_cfg.clone(),
+                });
+                validate(&new_cfg, &defined_arg_ids, "after mem2reg (partial)");
                 (Some(new_cfg), Mem2RegStatus::Partial { cells_promoted, cells_failed })
             }
         }
@@ -854,6 +1137,12 @@ pub fn run_optimization_pipeline_with_interprocedural(
     let after_builtin_resolution = if let Some(builtins) = builtin_set {
         match resolve_builtins(cfg_for_builtin_res, builtins) {
             BuiltinResolutionResult::Success { cfg: new_cfg, calls_resolved } => {
+                cfgs.steps.push(PipelineStep {
+                    name: format!("builtin resolution ({} calls)", calls_resolved),
+                    step_type: PipelineStepType::BuiltinResolution { calls_resolved },
+                    cfg: new_cfg.clone(),
+                });
+                validate(&new_cfg, &defined_arg_ids, "after builtin resolution");
                 result.builtin_resolution = BuiltinResolutionStatus::Success { calls_resolved };
                 Some(new_cfg)
             }
@@ -868,39 +1157,59 @@ pub fn run_optimization_pipeline_with_interprocedural(
     };
     cfgs.after_builtin_resolution = after_builtin_resolution.clone();
 
-    // Get the CFG for call resolution
-    let cfg_for_call_res = after_builtin_resolution
+    // Get the CFG for the iteration loop
+    let cfg_for_loop = after_builtin_resolution
         .as_ref()
         .or(after_mem2reg.as_ref())
         .unwrap_or(cfg);
 
-    // Stage 2: call resolution - convert Call to CallResolved
-    let after_call_resolution = match resolve_calls(cfg_for_call_res, global_closure_map) {
-        CallResolutionResult::Success { cfg: new_cfg, calls_resolved } => {
-            result.call_resolution = CallResolutionStatus::Success { calls_resolved };
-            Some(new_cfg)
-        }
-        CallResolutionResult::NoChange => {
-            result.call_resolution = CallResolutionStatus::NoChange;
-            None
-        }
-    };
-    cfgs.after_call_resolution = after_call_resolution.clone();
-
-    // Get the CFG for inlining
-    let cfg_for_inlining = after_call_resolution
-        .as_ref()
-        .or(after_builtin_resolution.as_ref())
-        .or(after_mem2reg.as_ref())
-        .unwrap_or(cfg);
-
-    // Stage 3: inlining - inline CallResolved calls using optimized callees
-    // Iterate until no more progress (handles calls from inlined code)
-    let mut current_cfg = cfg_for_inlining.clone();
+    // Stage 2: Iterative heap elimination (Stop mode) + inlining
+    // In each iteration:
+    // 1. Run heap elimination with Stop mode - resolves calls via shape tracking
+    // 2. Run builtin resolution (for newly resolved calls)
+    // 3. Run inlining
+    // Repeat until no progress.
+    //
+    // This allows heap elimination to resolve calls (Call -> CallResolved) via
+    // shape tracking, which can then be inlined by subsequent inlining passes.
+    let mut current_cfg = cfg_for_loop.clone();
     let mut total_calls_inlined = 0;
+    let mut total_calls_resolved = 0;
     let max_rounds = 10;
 
-    for _ in 0..max_rounds {
+    // Determine if we need to run heap elimination in the iteration loop
+    let initial_analysis = analyze_cfg(&current_cfg);
+    let has_globals_for_loop = !initial_analysis.accessed_globals.is_empty();
+    let has_args_for_loop = arg_shapes.iter().any(|s| s.is_some());
+
+    for iteration in 0..max_rounds {
+        let mut made_progress = false;
+
+        // Use lightweight slot tracking to resolve calls (no SSA/Phi creation)
+        // This can safely run multiple times without creating duplicate definitions
+        if has_globals_for_loop || has_args_for_loop {
+            let loop_analysis = analyze_cfg(&current_cfg);
+            let mut shape = build_celeste_heap_shape(&loop_analysis.accessed_globals);
+            shape.args = arg_shapes.to_vec();
+
+            let result = resolve_calls_via_slots(&current_cfg, &shape, arg_ids, arg_shapes, global_closure_map);
+            if result.calls_resolved > 0 {
+                total_calls_resolved += result.calls_resolved;
+                current_cfg = result.cfg;
+                cfgs.steps.push(PipelineStep {
+                    name: format!("call_resolution iter {} ({} calls resolved)", iteration + 1, result.calls_resolved),
+                    step_type: PipelineStepType::HeapElimStop {
+                        calls_resolved: result.calls_resolved,
+                        iteration: iteration + 1,
+                    },
+                    cfg: current_cfg.clone(),
+                });
+                // Slot tracker doesn't create Phi nodes, so validation should pass
+                validate(&current_cfg, &defined_arg_ids, &format!("after call_resolution iter {}", iteration + 1));
+                made_progress = true;
+            }
+        }
+
         // Re-run builtin resolution to pick up any new calls from inlined code
         if let Some(builtins) = builtin_set {
             current_cfg = match resolve_builtins(&current_cfg, builtins) {
@@ -909,28 +1218,37 @@ pub fn run_optimization_pipeline_with_interprocedural(
             };
         }
 
-        // Re-run call resolution to pick up any new calls from inlined code
-        current_cfg = match resolve_calls(&current_cfg, global_closure_map) {
-            CallResolutionResult::Success { cfg, calls_resolved } => {
-                if total_calls_inlined == 0 {
-                    // First round - update the count
-                    result.call_resolution = CallResolutionStatus::Success { calls_resolved };
-                }
-                cfg
-            }
-            CallResolutionResult::NoChange => current_cfg,
-        };
-
+        // Try to inline resolved calls
         match inline_calls(&current_cfg, optimized_fun_defs, &mut local_gen, &mut label_gen) {
             InliningResult::Success { cfg: new_cfg, calls_inlined } => {
-                current_cfg = new_cfg;
+                current_cfg = new_cfg.clone();
                 total_calls_inlined += calls_inlined;
+                cfgs.steps.push(PipelineStep {
+                    name: format!("inlining iter {} ({} calls)", iteration + 1, calls_inlined),
+                    step_type: PipelineStepType::Inlining {
+                        calls_inlined,
+                        iteration: iteration + 1,
+                    },
+                    cfg: current_cfg.clone(),
+                });
+                validate(&current_cfg, &defined_arg_ids, &format!("after inlining iter {}", iteration + 1));
+                made_progress = true;
             }
-            InliningResult::NoChange => {
-                break;
-            }
+            InliningResult::NoChange => {}
+        }
+
+        if !made_progress {
+            break;
         }
     }
+
+    // Record call resolution results (from heap elimination's shape-tracked resolution)
+    if total_calls_resolved > 0 {
+        result.call_resolution = CallResolutionStatus::Success { calls_resolved: total_calls_resolved };
+    } else {
+        result.call_resolution = CallResolutionStatus::NoChange;
+    }
+    cfgs.after_call_resolution = None; // No longer a separate stage
 
     let after_inlining = if total_calls_inlined > 0 {
         result.inlining = InliningStatus::Success { calls_inlined: total_calls_inlined };
@@ -941,19 +1259,24 @@ pub fn run_optimization_pipeline_with_interprocedural(
     };
     cfgs.after_inlining = after_inlining.clone();
 
-    // Stage 4: Dead code elimination
+    // Stage 3: Dead code elimination
     // After inlining, there may be unused GetGlobal/Load instructions that were only used
     // to set up the original Call (which has been replaced by inlined code)
     let cfg_for_dce = after_inlining
         .as_ref()
-        .or(after_call_resolution.as_ref())
         .or(after_builtin_resolution.as_ref())
         .or(after_mem2reg.as_ref())
         .unwrap_or(cfg);
 
     let after_dce = match eliminate_dead_code(cfg_for_dce) {
         DceResult::Success { cfg: new_cfg, instructions_removed } => {
+            cfgs.steps.push(PipelineStep {
+                name: format!("DCE ({} removed)", instructions_removed),
+                step_type: PipelineStepType::Dce { instructions_removed },
+                cfg: new_cfg.clone(),
+            });
             result.dce = DceStatus::Success { instructions_removed };
+            validate(&new_cfg, &defined_arg_ids, "after DCE");
             Some(new_cfg)
         }
         DceResult::NoChange => {
@@ -963,18 +1286,23 @@ pub fn run_optimization_pipeline_with_interprocedural(
     };
     cfgs.after_dce = after_dce.clone();
 
-    // Stage 5: block coalescing - merge straight-line blocks
+    // Stage 4: block coalescing - merge straight-line blocks
     let cfg_for_coalesce = after_dce
         .as_ref()
         .or(after_inlining.as_ref())
-        .or(after_call_resolution.as_ref())
         .or(after_builtin_resolution.as_ref())
         .or(after_mem2reg.as_ref())
         .unwrap_or(cfg);
 
     let after_block_coalesce = match coalesce_blocks(cfg_for_coalesce) {
         CoalesceResult::Success { cfg: new_cfg, blocks_removed } => {
+            cfgs.steps.push(PipelineStep {
+                name: format!("block coalesce ({} removed)", blocks_removed),
+                step_type: PipelineStepType::BlockCoalesce { blocks_removed },
+                cfg: new_cfg.clone(),
+            });
             result.block_coalesce = BlockCoalesceStatus::Success { blocks_removed };
+            validate(&new_cfg, &defined_arg_ids, "after block_coalesce");
             Some(new_cfg)
         }
         CoalesceResult::NoChange => {
@@ -984,12 +1312,39 @@ pub fn run_optimization_pipeline_with_interprocedural(
     };
     cfgs.after_block_coalesce = after_block_coalesce.clone();
 
-    // Stage 6: heap elimination - for globals (after other transformations)
-    let cfg_for_heap_elim = after_block_coalesce
+    // Stage 5: deopt unsafe builtins - replace unsafe builtin calls with deopt points
+    let cfg_for_deopt = after_block_coalesce
         .as_ref()
         .or(after_dce.as_ref())
         .or(after_inlining.as_ref())
-        .or(after_call_resolution.as_ref())
+        .or(after_builtin_resolution.as_ref())
+        .or(after_mem2reg.as_ref())
+        .unwrap_or(cfg);
+
+    let after_deopt_builtins = match deopt_unsafe_builtins(cfg_for_deopt) {
+        DeoptUnsafeBuiltinsResult::Success { cfg: new_cfg, deopts_inserted } => {
+            cfgs.steps.push(PipelineStep {
+                name: format!("deopt builtins ({} inserted)", deopts_inserted),
+                step_type: PipelineStepType::DeoptBuiltins { deopts_inserted },
+                cfg: new_cfg.clone(),
+            });
+            result.deopt_builtins = DeoptBuiltinsStatus::Success { deopts_inserted };
+            validate(&new_cfg, &defined_arg_ids, "after deopt_builtins");
+            Some(new_cfg)
+        }
+        DeoptUnsafeBuiltinsResult::NoChange => {
+            result.deopt_builtins = DeoptBuiltinsStatus::NoChange;
+            None
+        }
+    };
+    cfgs.after_deopt_builtins = after_deopt_builtins.clone();
+
+    // Stage 6: heap elimination - for globals (final pass with deopts)
+    let cfg_for_heap_elim = after_deopt_builtins
+        .as_ref()
+        .or(after_block_coalesce.as_ref())
+        .or(after_dce.as_ref())
+        .or(after_inlining.as_ref())
         .or(after_builtin_resolution.as_ref())
         .or(after_mem2reg.as_ref())
         .unwrap_or(cfg);
@@ -1007,7 +1362,7 @@ pub fn run_optimization_pipeline_with_interprocedural(
         // Add arg shapes
         shape.args = arg_shapes.to_vec();
 
-        match eliminate_heap(cfg_for_heap_elim, &shape, arg_ids, local_gen, label_gen) {
+        match eliminate_heap(cfg_for_heap_elim, &shape, arg_ids, local_gen, label_gen, DeoptMode::Insert) {
             HeapEliminationResult::Success(transformed) => {
                 let slot_mappings: Vec<SlotMapping> = transformed.unpack_slots
                     .iter()
@@ -1019,21 +1374,60 @@ pub fn run_optimization_pipeline_with_interprocedural(
                 result.heap_elimination = HeapEliminationStatus::Success {
                     unpack_count: transformed.unpack_slots.len(),
                     modified_count: transformed.modified_slots.len(),
-                    slot_mappings,
+                    slot_mappings: slot_mappings.clone(),
                 };
+
+                // Record the step
+                cfgs.steps.push(PipelineStep {
+                    name: format!("heap_elim_final ({} slots)", transformed.unpack_slots.len()),
+                    step_type: PipelineStepType::HeapElimFinal {
+                        unpack_count: transformed.unpack_slots.len(),
+                        modified_count: transformed.modified_slots.len(),
+                        slot_mappings,
+                    },
+                    cfg: transformed.cfg.clone(),
+                });
+                // Note: We skip validation immediately after heap_elim because:
+                // 1. Deopt terminators may leave downstream blocks with undefined references
+                // 2. DCE_final will remove unreachable blocks, which may fix some issues
+                // 3. We validate after DCE_final instead
+                let unpack_ids: Vec<_> = transformed.unpack_slots.iter().map(|(_, id)| *id).collect();
+                let all_predefined: Vec<_> = defined_arg_ids.iter().copied()
+                    .chain(unpack_ids.iter().copied())
+                    .collect();
+
                 // Run DCE again after heap elimination to clean up dead GetGlobal/Load/GetField
+                // that were only used by Call instructions that got converted to Deopt
                 let final_cfg = match eliminate_dead_code(&transformed.cfg) {
-                    DceResult::Success { cfg: cleaned_cfg, instructions_removed } => {
-                        // Add to the DCE count
+                    DceResult::Success { cfg: dce_cfg, instructions_removed } => {
+                        // Record the final DCE step
+                        cfgs.steps.push(PipelineStep {
+                            name: format!("DCE final ({} removed)", instructions_removed),
+                            step_type: PipelineStepType::Dce { instructions_removed },
+                            cfg: dce_cfg.clone(),
+                        });
+                        // Add to the DCE count for stats
                         if let DceStatus::Success { instructions_removed: prev } = &result.dce {
                             result.dce = DceStatus::Success { instructions_removed: prev + instructions_removed };
                         } else {
                             result.dce = DceStatus::Success { instructions_removed };
                         }
+                        // DCE removes unreachable blocks, so we need to clean up Phi nodes
+                        // that reference those removed blocks
+                        let cleanup_result = crate::interpreter::phi_cleanup::cleanup_phis(&dce_cfg);
+
+                        // Also need to remove phi branches that reference locals from removed blocks
+                        // phi_cleanup only removes branches based on predecessor info, but doesn't
+                        // handle the case where the local itself was defined in a removed block
+                        let cleaned_cfg = cleanup_phis_with_undefined_locals(&cleanup_result.cfg, &all_predefined);
+
+                        validate(&cleaned_cfg, &all_predefined, "after DCE_final");
                         cleaned_cfg
                     }
-                    DceResult::NoChange => transformed.cfg,
+                    DceResult::NoChange => transformed.cfg.clone(),
                 };
+
+                // Store the final CFG (after DCE) for the viewer
                 cfgs.after_heap_elim = Some(final_cfg);
             }
             HeapEliminationResult::ShapeNotPreserved(reason) => {
@@ -1045,6 +1439,9 @@ pub fn run_optimization_pipeline_with_interprocedural(
             }
             HeapEliminationResult::NotApplicable => {
                 result.heap_elimination = HeapEliminationStatus::NotApplicable;
+            }
+            HeapEliminationResult::ConstantViolation(reason) => {
+                result.heap_elimination = HeapEliminationStatus::Failed(format!("Constant violation: {}", reason));
             }
         }
     } else {
@@ -1393,6 +1790,9 @@ fn format_terminator(term: &Terminator) -> String {
                 false_target.as_str()
             )
         }
+        Terminator::Deopt { reason } => {
+            format!("Deopt(\"{}\")", reason)
+        }
     }
 }
 
@@ -1419,28 +1819,53 @@ fn instruction_type_name(instr: &Instruction) -> &'static str {
     }
 }
 
+/// A serializable pipeline step for the CFG viewer
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SerializablePipelineStep {
+    /// Human-readable name for this step
+    pub name: String,
+    /// Type of optimization that was applied
+    pub step_type: PipelineStepType,
+    /// The CFG after this step
+    pub cfg: SerializableCfg,
+}
+
+/// Convert an internal PipelineStep to a serializable version
+pub fn serialize_pipeline_step(step: &PipelineStep) -> SerializablePipelineStep {
+    SerializablePipelineStep {
+        name: step.name.clone(),
+        step_type: step.step_type.clone(),
+        cfg: (&step.cfg).into(),
+    }
+}
+
 /// A test case for the CFG analyzer viewer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CfgTestCase {
     /// Name of the function
     pub name: String,
-    /// The original CFG (serializable form)
+    /// All pipeline steps in order (new format)
+    #[serde(default)]
+    pub pipeline_steps: Vec<SerializablePipelineStep>,
+    /// The original CFG (serializable form) - legacy, kept for backward compatibility
     pub original_cfg: SerializableCfg,
-    /// CFG after mem2reg pass (if any transformation occurred)
+    /// CFG after mem2reg pass (if any transformation occurred) - legacy
     pub after_mem2reg: Option<SerializableCfg>,
-    /// CFG after heap elimination pass (if any transformation occurred)
+    /// CFG after heap elimination pass (if any transformation occurred) - legacy
     pub after_heap_elim: Option<SerializableCfg>,
-    /// CFG after block coalescing pass (if any transformation occurred)
+    /// CFG after block coalescing pass (if any transformation occurred) - legacy
     pub after_block_coalesce: Option<SerializableCfg>,
-    /// CFG after builtin resolution pass (if any transformation occurred)
+    /// CFG after builtin resolution pass (if any transformation occurred) - legacy
     pub after_builtin_resolution: Option<SerializableCfg>,
-    /// CFG after call resolution pass (if any transformation occurred)
+    /// CFG after call resolution pass (if any transformation occurred) - legacy
     pub after_call_resolution: Option<SerializableCfg>,
-    /// CFG after inlining pass (if any transformation occurred)
+    /// CFG after inlining pass (if any transformation occurred) - legacy
     pub after_inlining: Option<SerializableCfg>,
-    /// CFG after dead code elimination pass (if any transformation occurred)
+    /// CFG after dead code elimination pass (if any transformation occurred) - legacy
     pub after_dce: Option<SerializableCfg>,
-    /// Final optimized CFG (whichever stage succeeded last)
+    /// CFG after deopt unsafe builtins pass (if any transformation occurred) - legacy
+    pub after_deopt_builtins: Option<SerializableCfg>,
+    /// Final optimized CFG (whichever stage succeeded last) - legacy
     pub optimized_cfg: SerializableCfg,
     /// Analysis results
     pub analysis: CfgAnalysisResult,
@@ -1845,14 +2270,14 @@ mod tests {
         // Create builtin set with "max"
         let builtin_set: BuiltinSet = ["max"].iter().map(|s| s.to_string()).collect();
 
-        // Run the pipeline
+        // Run the pipeline with arg_ids for a and b
         let (result, cfgs) = run_optimization_pipeline_with_interprocedural(
             &cfg,
             &analysis,
             &global_closure_map,
             &optimized_fun_defs,
             Some(&builtin_set),
-            &[],  // no arg_ids for this test
+            &[Some(a_id), Some(b_id)],  // arg_ids for a and b
             &[],  // no arg_shapes for this test
         );
 

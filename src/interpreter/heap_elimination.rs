@@ -609,11 +609,23 @@ fn is_pure_builtin(name: &str) -> bool {
 }
 
 /// Mapping from LocalId to the heap slot it represents (if any)
+///
+/// This struct tracks pointer information for constant propagation:
+/// - `id_to_slot`: Maps a LocalId to the heap path it points to (e.g., _G.player, Arg(0))
+/// - `id_to_value`: Maps a LocalId to another LocalId representing its SSA value
+/// - `cell_contents`: Maps a cell (Alloc result) to the slot of the value stored in it
+///
+/// The `cell_contents` tracking enables pointer propagation through local cells:
+/// when we Store a value with known slot into a cell, we remember that;
+/// when we Load from that cell, we recover the slot.
 struct LocalIdMapping {
     /// LocalId -> HeapSlot for pointer-typed locals
     id_to_slot: FxHashMap<LocalId, HeapSlot>,
     /// LocalId -> the value it holds (for tracking through loads/stores)
     id_to_value: FxHashMap<LocalId, LocalId>,
+    /// Cell LocalId -> HeapSlot of the value stored in the cell
+    /// This enables tracking pointers through Alloc/Store/Load sequences
+    cell_contents: FxHashMap<LocalId, HeapSlot>,
 }
 
 impl LocalIdMapping {
@@ -621,6 +633,7 @@ impl LocalIdMapping {
         LocalIdMapping {
             id_to_slot: FxHashMap::default(),
             id_to_value: FxHashMap::default(),
+            cell_contents: FxHashMap::default(),
         }
     }
 
@@ -638,6 +651,18 @@ impl LocalIdMapping {
 
     fn get_value(&self, id: LocalId) -> Option<LocalId> {
         self.id_to_value.get(&id).copied()
+    }
+
+    /// Record that a cell contains a value pointing to the given slot.
+    /// Called when we see Store(cell, source) where source has a known slot.
+    fn set_cell_contents(&mut self, cell: LocalId, slot: HeapSlot) {
+        self.cell_contents.insert(cell, slot);
+    }
+
+    /// Get the slot of the value stored in a cell.
+    /// Called when we see Load(cell) to recover pointer information.
+    fn get_cell_contents(&self, cell: LocalId) -> Option<&HeapSlot> {
+        self.cell_contents.get(&cell)
     }
 }
 
@@ -772,23 +797,29 @@ fn transform_block(
 
                     match deopt_mode {
                         DeoptMode::Insert => {
+                            // Generate a fresh ID for the Deopt terminator
+                            // (can't use *target_id - it might already be used by an instruction we included)
+                            let deopt_terminator_id = ssa_builder.local_gen.next();
                             return BlockTransformResult::NeedsDeopt {
                                 instructions: rewritten,
                                 reason: $reason,
-                                terminator_id: *target_id,
+                                terminator_id: deopt_terminator_id,
                                 calls_resolved,
                             }
                         }
                         DeoptMode::Stop => {
                             // In soft mode, return the block with instructions so far
-                            // plus remaining instructions unchanged
+                            // plus remaining instructions with uses rewritten
                             let mut final_instrs = rewritten;
-                            // Add current and remaining instructions unchanged
+                            // Add current and remaining instructions with LocalId references rewritten.
+                            // This is critical: earlier instructions may have been SSA-promoted
+                            // (e.g., Load of a leaf slot), so their results don't exist as
+                            // instructions anymore but are mapped to SSA variables.
                             let current_idx = block.instructions.iter()
                                 .position(|(id, _)| id == target_id)
                                 .unwrap();
                             for (id, instr) in &block.instructions[current_idx..] {
-                                final_instrs.push((*id, instr.clone()));
+                                final_instrs.push((*id, instr.clone().map_local_ids(rewrite)));
                             }
                             let rewritten_terminator = block.terminator.1.map_local_ids(rewrite);
                             return BlockTransformResult::Stopped {
@@ -821,6 +852,7 @@ fn transform_block(
             Instruction::Load { source } => {
                 // Load dereferences a pointer - get the value from the slot
                 if let Some(slot) = id_mapping.get_slot(*source).cloned() {
+                    // Source has a tracked slot (e.g., GetGlobal result or GetField result)
                     // Check if this is a constant slot first
                     if let Some(const_value) = shape.get_constant_at_path(slot.path()) {
                         // Constant slot - emit a NumberConstant instruction
@@ -847,8 +879,14 @@ fn transform_block(
                         // Keep the original instruction
                         new_instructions.push((*target_id, instruction.clone()));
                     }
+                } else if let Some(cell_slot) = id_mapping.get_cell_contents(*source).cloned() {
+                    // Source is a cell (Alloc result) that we've tracked a Store into.
+                    // We know what slot the cell contains - propagate that to the loaded value.
+                    // This is the key to pointer propagation through local cells!
+                    id_mapping.set_slot(*target_id, cell_slot);
+                    new_instructions.push((*target_id, instruction.clone()));
                 } else {
-                    // Loading from a non-tracked pointer - keep as is
+                    // Loading from a completely unknown pointer - keep as is
                     new_instructions.push((*target_id, instruction.clone()));
                 }
             }
@@ -856,6 +894,7 @@ fn transform_block(
             Instruction::Store { target, source } => {
                 // Store writes to a pointer location
                 if let Some(slot) = id_mapping.get_slot(*target).cloned() {
+                    // Target has a tracked slot (e.g., GetGlobal result or GetField result)
                     // Check if this is a constant slot - writes are forbidden
                     if shape.is_constant_path(slot.path()) {
                         return BlockTransformResult::ConstantViolation(
@@ -868,7 +907,13 @@ fn transform_block(
                     ssa_builder.define_in_block(block_id, slot.clone(), value);
                     // Don't emit the store - it's now an SSA definition
                 } else {
-                    // Storing to a non-tracked pointer - keep as is
+                    // Target is a non-tracked pointer (likely a local cell from Alloc)
+                    // Track what slot is being stored in the cell for pointer propagation
+                    if let Some(source_slot) = id_mapping.get_slot(*source).cloned() {
+                        // Source has a known slot - record that this cell now contains
+                        // a pointer to that slot. This enables pointer tracking through cells.
+                        id_mapping.set_cell_contents(*target, source_slot);
+                    }
                     new_instructions.push((*target_id, instruction.clone()));
                 }
             }
@@ -879,10 +924,14 @@ fn transform_block(
                     // Check if the field already exists in the known shape
                     if let Some(base_slot) = id_mapping.get_slot(*receiver) {
                         if !shape.field_exists_at_path(base_slot.path(), field) {
+                            // Include the instruction - its result might be used later
+                            new_instructions.push((*target_id, instruction.clone()));
                             needs_deopt!(format!("Shape-modifying GetField: {}", field));
                         }
                     } else {
                         // Unknown base - can't verify field exists
+                        // Include the instruction - its result might be used later
+                        new_instructions.push((*target_id, instruction.clone()));
                         needs_deopt!(format!("Shape-modifying GetField on unknown base: {}", field));
                     }
                 }
@@ -896,6 +945,8 @@ fn transform_block(
 
             Instruction::GetIndex { receiver, index, create_if_missing } => {
                 if *create_if_missing {
+                    // Include the instruction - its result might be used later
+                    new_instructions.push((*target_id, instruction.clone()));
                     needs_deopt!("Shape-modifying GetIndex".to_string());
                 }
                 // For now, don't track dynamic indices
@@ -909,24 +960,37 @@ fn transform_block(
                     new_instructions.push((*target_id, instruction.clone()));
                 } else {
                     // Escaping allocation - creates new heap shape, insert deopt
+                    // Include the instruction - its result might be used later
+                    new_instructions.push((*target_id, instruction.clone()));
                     needs_deopt!("Alloc instruction - may modify heap shape".to_string());
                 }
             }
 
             Instruction::StoreEmptyTable { target: _ } => {
+                // Include the instruction - this stores to a target that's already defined
+                new_instructions.push((*target_id, instruction.clone()));
                 needs_deopt!("StoreEmptyTable - modifies heap shape".to_string());
             }
 
             Instruction::StoreClosure { target: _, fun_def: _, captures: _ } => {
+                // Include the instruction - this stores to a target that's already defined
+                new_instructions.push((*target_id, instruction.clone()));
                 needs_deopt!("StoreClosure - modifies heap shape".to_string());
             }
 
             Instruction::Call { closure, args } => {
-                // Check if we know what closure is being called via shape tracking
+                // Check if we can resolve the call via shape tracking.
+                // Even if we resolve, we MUST stop/deopt because the called function
+                // could read or write to heap locations we're tracking in SSA form.
+                //
+                // In DeoptMode::Stop, resolving allows subsequent inlining passes to
+                // inline the resolved calls, which may allow heap elimination to proceed
+                // further on the next iteration.
                 if let Some(slot) = id_mapping.get_slot(*closure) {
                     if let Some((fun_name, has_captures)) = shape.get_closure_at_path(slot.path()) {
                         if !has_captures {
                             // We know the closure and it has no captures - resolve the call!
+                            // But we still must stop because the call could have side effects.
                             let resolved = Instruction::CallResolved {
                                 fun_name: fun_name.clone(),
                                 captures: vec![],
@@ -934,10 +998,14 @@ fn transform_block(
                             };
                             new_instructions.push((*target_id, resolved));
                             calls_resolved += 1;
-                            continue;
+                            needs_deopt!(format!(
+                                "Call to {} resolved - but call may have side effects",
+                                fun_name.as_str()
+                            ));
                         } else {
                             // Has captures - for now, can't resolve without capture values
-                            // TODO: Track captures through the shape
+                            // Still include the call instruction - interpreter will execute it
+                            new_instructions.push((*target_id, instruction.clone()));
                             needs_deopt!(format!(
                                 "Call to closure with captures: {}",
                                 fun_name.as_str()
@@ -946,11 +1014,15 @@ fn transform_block(
                     }
                 }
                 // Unknown closure - may have side effects
+                // Still include the call instruction - interpreter will execute it
+                new_instructions.push((*target_id, instruction.clone()));
                 needs_deopt!("Call instruction - unknown closure".to_string());
             }
 
             Instruction::CallResolved { fun_name, .. } => {
                 // CallResolved is still a call - may have side effects
+                // Still include the call instruction - interpreter will execute it
+                new_instructions.push((*target_id, instruction.clone()));
                 needs_deopt!(format!(
                     "CallResolved instruction ({}) - may have side effects",
                     fun_name.as_str()
@@ -965,6 +1037,8 @@ fn transform_block(
                     new_instructions.push((*target_id, instruction.clone()));
                 } else {
                     // Impure builtin - insert deopt
+                    // Still include the call instruction - interpreter will execute it
+                    new_instructions.push((*target_id, instruction.clone()));
                     needs_deopt!(format!(
                         "CallBuiltin instruction ({}) - not a pure builtin",
                         name
@@ -1205,6 +1279,18 @@ pub fn eliminate_heap(
     let transformed_cfg = Cfg {
         entry: final_entry,
         named: final_named,
+    };
+
+    // Clean up Phi nodes after Deopt insertions
+    // This removes Phi branches referencing blocks that no longer branch to the target
+    // (because they got Deopt terminators), and collapses single-element Phis
+    // Only run cleanup if we actually inserted Deopts that could have changed control flow
+    let transformed_cfg = if deopt_count > 0 {
+        use crate::interpreter::phi_cleanup::cleanup_phis;
+        let cleanup_result = cleanup_phis(&transformed_cfg);
+        cleanup_result.cfg
+    } else {
+        transformed_cfg
     };
 
     // In debug builds, validate the transformed CFG for type correctness
@@ -1956,6 +2042,678 @@ mod tests {
                 let has_load_from_2 = transformed.cfg.entry.instructions.iter()
                     .any(|(_, instr)| matches!(instr, Instruction::Load { source } if *source == LocalId::from(2)));
                 assert!(has_load_from_2, "Load from GetGlobal('unknown') should be preserved");
+            }
+            other => panic!("Expected Success, got {:?}", other),
+        }
+    }
+
+    // ==================== POINTER TRACKING THROUGH CELLS ====================
+    //
+    // These tests verify that heap elimination properly tracks pointers through
+    // local cells (Alloc + Store + Load). This is essentially constant propagation
+    // for pointers - if we know a value points to path P, and we store it in a
+    // cell and load it back, the loaded value still points to P.
+
+    /// Test 1: Basic pointer tracking through a cell.
+    /// Store a pointer with known slot into a cell, load it back.
+    /// The loaded value should have the same slot.
+    #[test]
+    fn test_pointer_tracking_basic_store_load() {
+        // CFG:
+        //   %0 = GetGlobal("player")     -- pointer to _G.player
+        //   %1 = Load(%0)                -- value at _G.player (a table)
+        //   %2 = Alloc                   -- create a cell
+        //   %3 = Store(%2, %1)           -- store the table pointer in the cell
+        //   %4 = Load(%2)                -- load it back from the cell
+        //   %5 = GetField(%4, "x")       -- get field from the loaded value
+        //   %6 = Load(%5)                -- load the field value
+        //   return %6
+        //
+        // Expected: %4 should track to _G.player, so %5 tracks to _G.player.x
+        // and the final Load can be SSA-promoted.
+
+        let entry = Block {
+            instructions: vec![
+                (
+                    LocalId::from(0),
+                    Instruction::GetGlobal {
+                        name: "player".to_string(),
+                        create_if_missing: false,
+                    },
+                ),
+                (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
+                (LocalId::from(2), Instruction::Alloc),
+                (
+                    LocalId::from(3),
+                    Instruction::Store {
+                        target: LocalId::from(2),
+                        source: LocalId::from(1),
+                    },
+                ),
+                (LocalId::from(4), Instruction::Load { source: LocalId::from(2) }),
+                (
+                    LocalId::from(5),
+                    Instruction::GetField {
+                        receiver: LocalId::from(4),
+                        field: "x".to_string(),
+                        create_if_missing: false,
+                    },
+                ),
+                (LocalId::from(6), Instruction::Load { source: LocalId::from(5) }),
+            ],
+            terminator: (
+                LocalId::from(7),
+                Terminator::Return { value: Some(LocalId::from(6)) },
+            ),
+            hint_normalize: false,
+        };
+
+        let cfg = Cfg {
+            entry,
+            named: FxHashMap::default(),
+        };
+
+        // Shape: _G.player is a table with x as a leaf
+        let mut player_fields = FxHashMap::default();
+        player_fields.insert("x".to_string(), ValueShape::Leaf);
+        let mut shape = HeapShape::new();
+        shape.globals.insert("player".to_string(), ValueShape::Table(player_fields));
+
+        let local_gen = make_local_gen();
+        let label_gen = make_label_gen();
+
+        let result = eliminate_heap(&cfg, &shape, &[], local_gen, label_gen, DeoptMode::Insert);
+
+        match result {
+            HeapEliminationResult::Success(transformed) => {
+                // Should have unpacked _G.player.x
+                assert_eq!(
+                    transformed.unpack_slots.len(), 1,
+                    "Should unpack player.x"
+                );
+
+                // The Load(%5) for player.x should be eliminated (SSA promoted)
+                // because we tracked the pointer through the cell
+                let load_count = transformed.cfg.entry.instructions.iter()
+                    .filter(|(_, instr)| matches!(instr, Instruction::Load { .. }))
+                    .count();
+
+                // We expect: Load(%0) for GetGlobal, Load(%2) for cell - but Load(%5) should be gone
+                // Actually after SSA promotion, Load(%5) becomes a reference to the SSA var
+                // Let's just check that we got a successful transformation with the slot
+                assert!(
+                    transformed.unpack_slots.iter().any(|(slot, _)| {
+                        slot.to_string().contains("player") && slot.to_string().contains("x")
+                    }),
+                    "Should have unpacked player.x slot"
+                );
+            }
+            other => panic!("Expected Success, got {:?}", other),
+        }
+    }
+
+    /// Test 2: Argument stored in cell, then method called.
+    /// This is the pattern the compiler generates for method parameters.
+    #[test]
+    fn test_pointer_tracking_arg_through_cell_method_call() {
+        // CFG (what compiler generates for `function obj:foo() return self.method() end`):
+        //   %0 = Alloc                   -- cell for self parameter
+        //   %1 = Store(%0, %2)           -- store self value (%2) into cell
+        //   %3 = Load(%0)                -- load self from cell
+        //   %4 = GetField(%3, "method")  -- get method
+        //   %5 = Load(%4)                -- load closure
+        //   %6 = Call(%5, [])            -- call it
+        //   return %6
+        //
+        // With shape tracking through the cell, we should resolve the call.
+
+        let cell_id = LocalId::from(0);
+        let value_id = LocalId::from(2);
+
+        let entry = Block {
+            instructions: vec![
+                (cell_id, Instruction::Alloc),
+                (
+                    LocalId::from(1),
+                    Instruction::Store {
+                        target: cell_id,
+                        source: value_id,
+                    },
+                ),
+                (LocalId::from(3), Instruction::Load { source: cell_id }),
+                (
+                    LocalId::from(4),
+                    Instruction::GetField {
+                        receiver: LocalId::from(3),
+                        field: "method".to_string(),
+                        create_if_missing: false,
+                    },
+                ),
+                (LocalId::from(5), Instruction::Load { source: LocalId::from(4) }),
+                (
+                    LocalId::from(6),
+                    Instruction::Call {
+                        closure: LocalId::from(5),
+                        args: vec![],
+                    },
+                ),
+            ],
+            terminator: (
+                LocalId::from(7),
+                Terminator::Return { value: Some(LocalId::from(6)) },
+            ),
+            hint_normalize: false,
+        };
+
+        let cfg = Cfg {
+            entry,
+            named: FxHashMap::default(),
+        };
+
+        // Shape: arg0 is a table with method closure and x leaf
+        let mut arg0_fields = FxHashMap::default();
+        arg0_fields.insert(
+            "method".to_string(),
+            ValueShape::Closure {
+                fun_name: GlobalId::from("my_method_1".to_string()),
+                capture_shapes: vec![],
+            },
+        );
+        arg0_fields.insert("x".to_string(), ValueShape::Leaf);
+        let mut shape = HeapShape::new();
+        shape.args = vec![Some(ValueShape::Table(arg0_fields))];
+
+        let local_gen = make_local_gen();
+        let label_gen = make_label_gen();
+
+        // arg_ids contains the VALUE id (what the compiler does)
+        let arg_ids = vec![Some(value_id)];
+
+        let result = eliminate_heap(&cfg, &shape, &arg_ids, local_gen, label_gen, DeoptMode::Stop);
+
+        match result {
+            HeapEliminationResult::Success(transformed) => {
+                let has_call_resolved = transformed.cfg.entry.instructions.iter().any(|(_, instr)| {
+                    match instr {
+                        Instruction::CallResolved { fun_name, .. } => {
+                            fun_name.as_str() == "my_method_1"
+                        }
+                        _ => false,
+                    }
+                });
+
+                // After fixing pointer tracking, this should resolve!
+                assert!(
+                    has_call_resolved,
+                    "Call should be resolved after pointer tracking fix. calls_resolved={}",
+                    transformed.calls_resolved
+                );
+            }
+            HeapEliminationResult::NotApplicable => {
+                panic!("Got NotApplicable - heap elimination didn't run");
+            }
+            other => panic!("Expected Success, got {:?}", other),
+        }
+    }
+
+    /// Test 3: Multiple loads from the same cell should all get the same slot.
+    #[test]
+    fn test_pointer_tracking_multiple_loads() {
+        // CFG:
+        //   %0 = GetGlobal("player")
+        //   %1 = Load(%0)                -- player table
+        //   %2 = Alloc                   -- cell
+        //   %3 = Store(%2, %1)           -- store player in cell
+        //   %4 = Load(%2)                -- first load from cell
+        //   %5 = GetField(%4, "x")       -- get x
+        //   %6 = Load(%5)
+        //   %7 = Load(%2)                -- second load from same cell
+        //   %8 = GetField(%7, "y")       -- get y
+        //   %9 = Load(%8)
+        //   %10 = BinaryOp(%6 + %9)
+        //   return %10
+        //
+        // Both %4 and %7 should track to _G.player
+
+        let entry = Block {
+            instructions: vec![
+                (
+                    LocalId::from(0),
+                    Instruction::GetGlobal {
+                        name: "player".to_string(),
+                        create_if_missing: false,
+                    },
+                ),
+                (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
+                (LocalId::from(2), Instruction::Alloc),
+                (
+                    LocalId::from(3),
+                    Instruction::Store {
+                        target: LocalId::from(2),
+                        source: LocalId::from(1),
+                    },
+                ),
+                (LocalId::from(4), Instruction::Load { source: LocalId::from(2) }),
+                (
+                    LocalId::from(5),
+                    Instruction::GetField {
+                        receiver: LocalId::from(4),
+                        field: "x".to_string(),
+                        create_if_missing: false,
+                    },
+                ),
+                (LocalId::from(6), Instruction::Load { source: LocalId::from(5) }),
+                (LocalId::from(7), Instruction::Load { source: LocalId::from(2) }),
+                (
+                    LocalId::from(8),
+                    Instruction::GetField {
+                        receiver: LocalId::from(7),
+                        field: "y".to_string(),
+                        create_if_missing: false,
+                    },
+                ),
+                (LocalId::from(9), Instruction::Load { source: LocalId::from(8) }),
+                (
+                    LocalId::from(10),
+                    Instruction::BinaryOp {
+                        left: LocalId::from(6),
+                        op: crate::ir::BinaryOp::Plus,
+                        right: LocalId::from(9),
+                    },
+                ),
+            ],
+            terminator: (
+                LocalId::from(11),
+                Terminator::Return { value: Some(LocalId::from(10)) },
+            ),
+            hint_normalize: false,
+        };
+
+        let cfg = Cfg {
+            entry,
+            named: FxHashMap::default(),
+        };
+
+        // Shape: player has x and y as leaves
+        let mut player_fields = FxHashMap::default();
+        player_fields.insert("x".to_string(), ValueShape::Leaf);
+        player_fields.insert("y".to_string(), ValueShape::Leaf);
+        let mut shape = HeapShape::new();
+        shape.globals.insert("player".to_string(), ValueShape::Table(player_fields));
+
+        let local_gen = make_local_gen();
+        let label_gen = make_label_gen();
+
+        let result = eliminate_heap(&cfg, &shape, &[], local_gen, label_gen, DeoptMode::Insert);
+
+        match result {
+            HeapEliminationResult::Success(transformed) => {
+                // Should have unpacked both player.x and player.y
+                assert_eq!(
+                    transformed.unpack_slots.len(), 2,
+                    "Should unpack both player.x and player.y"
+                );
+
+                let slot_names: Vec<_> = transformed.unpack_slots.iter()
+                    .map(|(slot, _)| slot.to_string())
+                    .collect();
+                assert!(
+                    slot_names.iter().any(|s| s.contains("player") && s.contains("x")),
+                    "Should have player.x"
+                );
+                assert!(
+                    slot_names.iter().any(|s| s.contains("player") && s.contains("y")),
+                    "Should have player.y"
+                );
+            }
+            other => panic!("Expected Success, got {:?}", other),
+        }
+    }
+
+    /// Test 4: Cell reassignment - after reassignment, should track new value.
+    /// This tests that we update our tracking when a cell is written again.
+    #[test]
+    fn test_pointer_tracking_cell_reassignment() {
+        // CFG:
+        //   %0 = GetGlobal("player1")
+        //   %1 = Load(%0)
+        //   %2 = GetGlobal("player2")
+        //   %3 = Load(%2)
+        //   %4 = Alloc                   -- cell
+        //   %5 = Store(%4, %1)           -- store player1
+        //   %6 = Store(%4, %3)           -- reassign to player2
+        //   %7 = Load(%4)                -- should get player2
+        //   %8 = GetField(%7, "x")
+        //   %9 = Load(%8)
+        //   return %9
+        //
+        // After reassignment, Load(%4) should track to player2, not player1
+
+        let entry = Block {
+            instructions: vec![
+                (
+                    LocalId::from(0),
+                    Instruction::GetGlobal {
+                        name: "player1".to_string(),
+                        create_if_missing: false,
+                    },
+                ),
+                (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
+                (
+                    LocalId::from(2),
+                    Instruction::GetGlobal {
+                        name: "player2".to_string(),
+                        create_if_missing: false,
+                    },
+                ),
+                (LocalId::from(3), Instruction::Load { source: LocalId::from(2) }),
+                (LocalId::from(4), Instruction::Alloc),
+                (
+                    LocalId::from(5),
+                    Instruction::Store {
+                        target: LocalId::from(4),
+                        source: LocalId::from(1),
+                    },
+                ),
+                (
+                    LocalId::from(6),
+                    Instruction::Store {
+                        target: LocalId::from(4),
+                        source: LocalId::from(3),
+                    },
+                ),
+                (LocalId::from(7), Instruction::Load { source: LocalId::from(4) }),
+                (
+                    LocalId::from(8),
+                    Instruction::GetField {
+                        receiver: LocalId::from(7),
+                        field: "x".to_string(),
+                        create_if_missing: false,
+                    },
+                ),
+                (LocalId::from(9), Instruction::Load { source: LocalId::from(8) }),
+            ],
+            terminator: (
+                LocalId::from(10),
+                Terminator::Return { value: Some(LocalId::from(9)) },
+            ),
+            hint_normalize: false,
+        };
+
+        let cfg = Cfg {
+            entry,
+            named: FxHashMap::default(),
+        };
+
+        // Shape: both players have x as leaf
+        let mut player_fields = FxHashMap::default();
+        player_fields.insert("x".to_string(), ValueShape::Leaf);
+        let mut shape = HeapShape::new();
+        shape.globals.insert("player1".to_string(), ValueShape::Table(player_fields.clone()));
+        shape.globals.insert("player2".to_string(), ValueShape::Table(player_fields));
+
+        let local_gen = make_local_gen();
+        let label_gen = make_label_gen();
+
+        let result = eliminate_heap(&cfg, &shape, &[], local_gen, label_gen, DeoptMode::Insert);
+
+        match result {
+            HeapEliminationResult::Success(transformed) => {
+                // Should track through to player2.x (the reassigned value)
+                let slot_names: Vec<_> = transformed.unpack_slots.iter()
+                    .map(|(slot, _)| slot.to_string())
+                    .collect();
+
+                // Should have player2.x since that's what the cell contains after reassignment
+                assert!(
+                    slot_names.iter().any(|s| s.contains("player2") && s.contains("x")),
+                    "Should track to player2.x after reassignment. Got: {:?}", slot_names
+                );
+            }
+            other => panic!("Expected Success, got {:?}", other),
+        }
+    }
+
+    /// Test 5: Nested cells - store a pointer, load it, store in another cell.
+    #[test]
+    fn test_pointer_tracking_nested_cells() {
+        // CFG:
+        //   %0 = GetGlobal("player")
+        //   %1 = Load(%0)
+        //   %2 = Alloc                   -- cell1
+        //   %3 = Store(%2, %1)           -- store player in cell1
+        //   %4 = Load(%2)                -- load from cell1
+        //   %5 = Alloc                   -- cell2
+        //   %6 = Store(%5, %4)           -- store in cell2
+        //   %7 = Load(%5)                -- load from cell2
+        //   %8 = GetField(%7, "x")
+        //   %9 = Load(%8)
+        //   return %9
+        //
+        // Pointer should flow: player -> cell1 -> cell2 -> GetField
+
+        let entry = Block {
+            instructions: vec![
+                (
+                    LocalId::from(0),
+                    Instruction::GetGlobal {
+                        name: "player".to_string(),
+                        create_if_missing: false,
+                    },
+                ),
+                (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
+                (LocalId::from(2), Instruction::Alloc),
+                (
+                    LocalId::from(3),
+                    Instruction::Store {
+                        target: LocalId::from(2),
+                        source: LocalId::from(1),
+                    },
+                ),
+                (LocalId::from(4), Instruction::Load { source: LocalId::from(2) }),
+                (LocalId::from(5), Instruction::Alloc),
+                (
+                    LocalId::from(6),
+                    Instruction::Store {
+                        target: LocalId::from(5),
+                        source: LocalId::from(4),
+                    },
+                ),
+                (LocalId::from(7), Instruction::Load { source: LocalId::from(5) }),
+                (
+                    LocalId::from(8),
+                    Instruction::GetField {
+                        receiver: LocalId::from(7),
+                        field: "x".to_string(),
+                        create_if_missing: false,
+                    },
+                ),
+                (LocalId::from(9), Instruction::Load { source: LocalId::from(8) }),
+            ],
+            terminator: (
+                LocalId::from(10),
+                Terminator::Return { value: Some(LocalId::from(9)) },
+            ),
+            hint_normalize: false,
+        };
+
+        let cfg = Cfg {
+            entry,
+            named: FxHashMap::default(),
+        };
+
+        let mut player_fields = FxHashMap::default();
+        player_fields.insert("x".to_string(), ValueShape::Leaf);
+        let mut shape = HeapShape::new();
+        shape.globals.insert("player".to_string(), ValueShape::Table(player_fields));
+
+        let local_gen = make_local_gen();
+        let label_gen = make_label_gen();
+
+        let result = eliminate_heap(&cfg, &shape, &[], local_gen, label_gen, DeoptMode::Insert);
+
+        match result {
+            HeapEliminationResult::Success(transformed) => {
+                // Should still track through both cells to player.x
+                assert!(
+                    transformed.unpack_slots.iter().any(|(slot, _)| {
+                        slot.to_string().contains("player") && slot.to_string().contains("x")
+                    }),
+                    "Should track through nested cells to player.x"
+                );
+            }
+            other => panic!("Expected Success, got {:?}", other),
+        }
+    }
+
+    /// Test 6: Load from cell before any store - should not crash, just not track.
+    #[test]
+    fn test_pointer_tracking_load_before_store() {
+        // CFG:
+        //   %0 = Alloc
+        //   %1 = Load(%0)                -- load before store (undefined behavior in real code)
+        //   %2 = GetField(%1, "x")
+        //   %3 = Load(%2)
+        //   return %3
+        //
+        // Should handle gracefully - no tracking, but no crash
+
+        let entry = Block {
+            instructions: vec![
+                (LocalId::from(0), Instruction::Alloc),
+                (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
+                (
+                    LocalId::from(2),
+                    Instruction::GetField {
+                        receiver: LocalId::from(1),
+                        field: "x".to_string(),
+                        create_if_missing: false,
+                    },
+                ),
+                (LocalId::from(3), Instruction::Load { source: LocalId::from(2) }),
+            ],
+            terminator: (
+                LocalId::from(4),
+                Terminator::Return { value: Some(LocalId::from(3)) },
+            ),
+            hint_normalize: false,
+        };
+
+        let cfg = Cfg {
+            entry,
+            named: FxHashMap::default(),
+        };
+
+        // Empty shape - nothing to track
+        let shape = HeapShape::new();
+
+        let local_gen = make_local_gen();
+        let label_gen = make_label_gen();
+
+        // Should not panic
+        let result = eliminate_heap(&cfg, &shape, &[], local_gen, label_gen, DeoptMode::Insert);
+
+        // NotApplicable is fine (no tracked slots), Success with no changes is also fine
+        match result {
+            HeapEliminationResult::Success(_) | HeapEliminationResult::NotApplicable => {}
+            other => panic!("Expected Success or NotApplicable, got {:?}", other),
+        }
+    }
+
+    /// Test that Stop mode correctly rewrites LocalId references in remaining instructions.
+    ///
+    /// This reproduces a bug where:
+    /// 1. GetGlobal(btn) -> %0, tracked with slot
+    /// 2. Load(%0) -> %1, SSA-promoted (no instruction emitted), %1 mapped to SSA var
+    /// 3. Call(%1, args) -> triggers stop (unknown closure)
+    ///
+    /// The bug was that remaining instructions (including Call) were added from the
+    /// original block without rewriting, so Call still referenced %1 which no longer
+    /// exists (since Load was SSA-promoted away).
+    #[test]
+    fn test_stop_mode_rewrites_remaining_instructions() {
+        // CFG: GetGlobal(btn) -> Load -> Call
+        // Shape: btn is a Leaf (incorrectly, but this is what triggers the bug)
+        let entry = Block {
+            instructions: vec![
+                (
+                    LocalId::from(0),
+                    Instruction::GetGlobal {
+                        name: "btn".to_string(),
+                        create_if_missing: false,
+                    },
+                ),
+                (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
+                (
+                    LocalId::from(2),
+                    Instruction::NumberConstant {
+                        value: Pico8Num::from_i16(1),
+                    },
+                ),
+                (
+                    LocalId::from(3),
+                    Instruction::Call {
+                        closure: LocalId::from(1),
+                        args: vec![LocalId::from(2)],
+                    },
+                ),
+            ],
+            terminator: (
+                LocalId::from(4),
+                Terminator::Return { value: Some(LocalId::from(3)) },
+            ),
+            hint_normalize: false,
+        };
+
+        let cfg = Cfg {
+            entry,
+            named: FxHashMap::default(),
+        };
+
+        // Shape: btn is a Leaf (this causes Load to be SSA-promoted)
+        let mut shape = HeapShape::new();
+        shape.globals.insert("btn".to_string(), ValueShape::Leaf);
+
+        let local_gen = make_local_gen();
+        let label_gen = make_label_gen();
+
+        // Run in Stop mode - this is where the bug manifests
+        let result = eliminate_heap(&cfg, &shape, &[], local_gen, label_gen, DeoptMode::Stop);
+
+        match result {
+            HeapEliminationResult::Success(transformed) => {
+                // Collect all defined LocalIds in the transformed CFG
+                let mut defined_ids: FxHashSet<LocalId> = FxHashSet::default();
+
+                // Entry block definitions
+                for (id, _) in &transformed.cfg.entry.instructions {
+                    defined_ids.insert(*id);
+                }
+
+                // Check that all uses reference defined IDs
+                for (_, instr) in &transformed.cfg.entry.instructions {
+                    instr.map_local_ids(|used_id| {
+                        assert!(
+                            defined_ids.contains(&used_id),
+                            "Instruction {:?} references undefined LocalId {:?}. Defined: {:?}",
+                            instr,
+                            used_id,
+                            defined_ids
+                        );
+                        used_id
+                    });
+                }
+
+                // Also check terminator
+                transformed.cfg.entry.terminator.1.map_local_ids(|used_id| {
+                    assert!(
+                        defined_ids.contains(&used_id),
+                        "Terminator references undefined LocalId {:?}. Defined: {:?}",
+                        used_id,
+                        defined_ids
+                    );
+                    used_id
+                });
             }
             other => panic!("Expected Success, got {:?}", other),
         }

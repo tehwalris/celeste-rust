@@ -18,12 +18,13 @@ use clap::Parser;
 use celeste_rust::frontend;
 use celeste_rust::interpreter::builtin_resolution::BuiltinSet;
 use celeste_rust::interpreter::cfg_analysis::{
-    analyze_cfg, optimize_all_functions, run_optimization_pipeline_with_interprocedural,
-    BlockCoalesceStatus, CfgTestCase, CfgTestCases, DceStatus, HeapEliminationStatus, Mem2RegStatus,
-    CallResolutionStatus, InliningStatus, SerializableCfg,
+    analyze_cfg, optimize_all_functions, run_optimization_pipeline_with_interprocedural_lenient,
+    serialize_pipeline_step, BlockCoalesceStatus, CfgTestCase, CfgTestCases, DceStatus,
+    HeapEliminationStatus, Mem2RegStatus, CallResolutionStatus, InliningStatus, SerializableCfg,
 };
 use celeste_rust::interpreter::call_resolution::build_global_closure_map_from_fun_defs;
 use celeste_rust::interpreter::heap_elimination::ValueShape;
+use celeste_rust::ir::GlobalId;
 
 #[derive(Parser, Debug)]
 #[command(name = "cfg_viewer")]
@@ -165,7 +166,8 @@ fn main() -> Result<()> {
 
         // Run optimization pipeline with inter-procedural passes
         // Uses pre-optimized callees so inlined code is already optimized
-        let (opt_result, cfgs) = run_optimization_pipeline_with_interprocedural(
+        // Using lenient version that warns on validation errors instead of panicking
+        let (opt_result, cfgs) = run_optimization_pipeline_with_interprocedural_lenient(
             &fun_def.cfg,
             &analysis,
             &global_closure_map,
@@ -255,11 +257,13 @@ fn main() -> Result<()> {
         let after_inlining_cfg = cfgs.after_inlining.as_ref().map(|c| c.into());
         let after_dce_cfg = cfgs.after_dce.as_ref().map(|c| c.into());
         let after_block_coalesce_cfg = cfgs.after_block_coalesce.as_ref().map(|c| c.into());
+        let after_deopt_builtins_cfg = cfgs.after_deopt_builtins.as_ref().map(|c| c.into());
         let after_heap_elim_cfg = cfgs.after_heap_elim.as_ref().map(|c| c.into());
 
         // Determine final optimized CFG (use the latest successful pass)
         let optimized_cfg = after_heap_elim_cfg
             .clone()
+            .or_else(|| after_deopt_builtins_cfg.clone())
             .or_else(|| after_block_coalesce_cfg.clone())
             .or_else(|| after_dce_cfg.clone())
             .or_else(|| after_inlining_cfg.clone())
@@ -271,8 +275,12 @@ fn main() -> Result<()> {
         // Get source span if available
         let source_span = fun_def.source_span.as_ref().map(|s| (s.start.line, s.end.line));
 
+        // Serialize pipeline steps
+        let pipeline_steps: Vec<_> = cfgs.steps.iter().map(serialize_pipeline_step).collect();
+
         let test_case = CfgTestCase {
             name: name.to_string(),
+            pipeline_steps,
             original_cfg,
             after_mem2reg: after_mem2reg_cfg,
             after_heap_elim: after_heap_elim_cfg,
@@ -281,6 +289,7 @@ fn main() -> Result<()> {
             after_call_resolution: after_call_resolution_cfg,
             after_inlining: after_inlining_cfg,
             after_dce: after_dce_cfg,
+            after_deopt_builtins: after_deopt_builtins_cfg,
             optimized_cfg,
             analysis,
             optimization_result: opt_result,
@@ -363,6 +372,40 @@ struct AnalysisStats {
     instructions_removed: usize,
 }
 
+/// Add common obj methods as Closure shapes to a fields map.
+/// These are methods inherited from obj by all object types.
+fn add_obj_method_closures(fields: &mut std::collections::HashMap<String, ValueShape, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>) {
+    // These methods are defined on obj and inherited by all object types
+    fields.insert("is_solid".to_string(), ValueShape::Closure {
+        fun_name: GlobalId::from("obj.is_solid_47".to_string()),
+        capture_shapes: vec![],
+    });
+    fields.insert("is_ice".to_string(), ValueShape::Closure {
+        fun_name: GlobalId::from("obj.is_ice_48".to_string()),
+        capture_shapes: vec![],
+    });
+    fields.insert("collide".to_string(), ValueShape::Closure {
+        fun_name: GlobalId::from("obj.collide_49".to_string()),
+        capture_shapes: vec![],
+    });
+    fields.insert("check".to_string(), ValueShape::Closure {
+        fun_name: GlobalId::from("obj.check_50".to_string()),
+        capture_shapes: vec![],
+    });
+    fields.insert("move".to_string(), ValueShape::Closure {
+        fun_name: GlobalId::from("obj.move_51".to_string()),
+        capture_shapes: vec![],
+    });
+    fields.insert("move_x".to_string(), ValueShape::Closure {
+        fun_name: GlobalId::from("obj.move_x_52".to_string()),
+        capture_shapes: vec![],
+    });
+    fields.insert("move_y".to_string(), ValueShape::Closure {
+        fun_name: GlobalId::from("obj.move_y_53".to_string()),
+        capture_shapes: vec![],
+    });
+}
+
 /// Build argument shapes for a function based on its name.
 ///
 /// Methods in Celeste follow a naming pattern like "player.update_21", "obj.move_x_52", etc.
@@ -430,6 +473,8 @@ fn build_arg_shapes_for_function(name: &str) -> Vec<Option<ValueShape>> {
             fields.insert("hitbox".to_string(), ValueShape::Table(hitbox_fields));
             // hair is a nested table - for now just mark as Leaf since we don't deeply track it
             fields.insert("hair".to_string(), ValueShape::Leaf);
+            // Add common obj methods (player inherits from obj)
+            add_obj_method_closures(&mut fields);
             ValueShape::Table(fields)
         }
         "obj" => {
@@ -458,6 +503,8 @@ fn build_arg_shapes_for_function(name: &str) -> Vec<Option<ValueShape>> {
             hitbox_fields.insert("w".to_string(), ValueShape::Leaf);
             hitbox_fields.insert("h".to_string(), ValueShape::Leaf);
             fields.insert("hitbox".to_string(), ValueShape::Table(hitbox_fields));
+            // Add common obj methods
+            add_obj_method_closures(&mut fields);
             ValueShape::Table(fields)
         }
         "spring" | "balloon" | "fall_floor" | "fruit" | "fly_fruit" | "fake_wall"
@@ -501,6 +548,8 @@ fn build_arg_shapes_for_function(name: &str) -> Vec<Option<ValueShape>> {
             hitbox_fields.insert("w".to_string(), ValueShape::Leaf);
             hitbox_fields.insert("h".to_string(), ValueShape::Leaf);
             fields.insert("hitbox".to_string(), ValueShape::Table(hitbox_fields));
+            // Add common obj methods (these types inherit from obj)
+            add_obj_method_closures(&mut fields);
             ValueShape::Table(fields)
         }
         _ => {

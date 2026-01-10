@@ -276,7 +276,7 @@ fn add_successors(
             preds.entry(true_target.clone()).or_default().push(from.clone());
             preds.entry(false_target.clone()).or_default().push(from);
         }
-        Terminator::Return { .. } => {}
+        Terminator::Return { .. } | Terminator::Deopt { .. } => {}
     }
 }
 

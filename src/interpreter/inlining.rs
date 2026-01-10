@@ -111,6 +111,7 @@ impl<'a> InlineContext<'a> {
                 true_target: self.map_label(&true_target),
                 false_target: self.map_label(&false_target),
             },
+            Terminator::Deopt { reason } => Terminator::Deopt { reason },
         }
     }
 }
@@ -400,6 +401,13 @@ fn inline_block_body(
                         false_target: mapped_false,
                     },
                 ),
+                None,
+            )
+        }
+        Terminator::Deopt { reason } => {
+            // Deopt is preserved as-is during inlining
+            (
+                (caller_term_local, Terminator::Deopt { reason: reason.clone() }),
                 None,
             )
         }

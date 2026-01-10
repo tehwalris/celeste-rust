@@ -532,6 +532,11 @@ fn interpret_prepared_cfg_inner(
                 let false_flow_data = bound_false.flow(flow_data)?;
                 process_branch(false, false_target, false_flow_data)?;
             }
+            Terminator::Deopt { reason } => {
+                // Deoptimization: fall back to unoptimized execution
+                // TODO: Implement proper deopt handling - for now this is a fatal error
+                return Err(anyhow::anyhow!("Deopt encountered: {}", reason));
+            }
         }
     }
 

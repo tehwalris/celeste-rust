@@ -63,6 +63,7 @@ impl BlockExport {
             Terminator::Return { .. } => "return".to_string(),
             Terminator::UnconditionalBranch { .. } => "unconditional".to_string(),
             Terminator::ConditionalBranch { .. } => "conditional".to_string(),
+            Terminator::Deopt { .. } => "deopt".to_string(),
         };
 
         // Create brief instruction summaries (just the type)
@@ -140,8 +141,8 @@ impl CfgExport {
 
     fn add_edges_for_block(edges: &mut Vec<CfgEdge>, source: Option<String>, block: &Block) {
         match &block.terminator.1 {
-            Terminator::Return { .. } => {
-                // No edges for return
+            Terminator::Return { .. } | Terminator::Deopt { .. } => {
+                // No edges for return or deopt
             }
             Terminator::UnconditionalBranch { target } => {
                 edges.push(CfgEdge {

@@ -373,7 +373,7 @@
         let data = null;
         let filteredCases = [];
         let currentIndex = 0;
-        let currentStage = 'original';
+        let currentStage = 0; // Index into pipeline_steps
         let currentCase = null;
 
         async function loadData() {
@@ -476,39 +476,51 @@
             if (!c) return;
 
             currentCase = c;
-            currentStage = 'original';
+            currentStage = 0; // Reset to first step (Original)
             updateCfgTabs();
             renderCurrentCfg();
             renderAnalysis(c);
         }
 
+        // currentStage is now an index into pipeline_steps
         function updateCfgTabs() {
             const c = currentCase;
             if (!c) return;
 
             const tabs = document.getElementById('cfg-tabs');
-            const hasMem2reg = c.after_mem2reg != null;
-            const hasCallResolution = c.after_call_resolution != null;
-            const hasInlining = c.after_inlining != null;
-            const hasDce = c.after_dce != null;
-            const hasBlockCoalesce = c.after_block_coalesce != null;
-            const hasHeapElim = c.after_heap_elim != null;
+            const steps = c.pipeline_steps || [];
 
-            tabs.innerHTML = `
-                <button class="cfg-tab ${currentStage === 'original' ? 'active' : ''}" data-stage="original">Original</button>
-                <button class="cfg-tab ${!hasMem2reg ? 'disabled' : ''} ${currentStage === 'mem2reg' ? 'active' : ''}" data-stage="mem2reg">mem2reg</button>
-                <button class="cfg-tab ${!hasCallResolution ? 'disabled' : ''} ${currentStage === 'call_resolution' ? 'active' : ''}" data-stage="call_resolution">call res</button>
-                <button class="cfg-tab ${!hasInlining ? 'disabled' : ''} ${currentStage === 'inlining' ? 'active' : ''}" data-stage="inlining">inlining</button>
-                <button class="cfg-tab ${!hasDce ? 'disabled' : ''} ${currentStage === 'dce' ? 'active' : ''}" data-stage="dce">DCE</button>
-                <button class="cfg-tab ${!hasBlockCoalesce ? 'disabled' : ''} ${currentStage === 'block_coalesce' ? 'active' : ''}" data-stage="block_coalesce">coalesce</button>
-                <button class="cfg-tab ${!hasHeapElim ? 'disabled' : ''} ${currentStage === 'heap_elim' ? 'active' : ''}" data-stage="heap_elim">heap elim</button>
-            `;
+            if (steps.length === 0) {
+                // Fallback to legacy format if no pipeline_steps
+                tabs.innerHTML = `<button class="cfg-tab active" data-stage="0">Original</button>`;
+                return;
+            }
+
+            // Generate buttons for each step
+            let html = '';
+            for (let i = 0; i < steps.length; i++) {
+                const step = steps[i];
+                const isActive = currentStage === i;
+                // Create a short label from the step name
+                let label = step.name;
+                // Shorten common prefixes
+                label = label.replace('heap_elim_stop iter ', 'HE-stop #');
+                label = label.replace('heap_elim_final', 'HE-final');
+                label = label.replace('inlining iter ', 'inline #');
+                label = label.replace('builtin resolution', 'builtins');
+                label = label.replace('block coalesce', 'coalesce');
+                // Truncate if still too long
+                if (label.length > 20) {
+                    label = label.substring(0, 18) + '...';
+                }
+                html += `<button class="cfg-tab ${isActive ? 'active' : ''}" data-stage="${i}" title="${step.name}">${label}</button>`;
+            }
+            tabs.innerHTML = html;
 
             // Add click handlers
             tabs.querySelectorAll('.cfg-tab').forEach(tab => {
                 tab.addEventListener('click', () => {
-                    const stage = tab.dataset.stage;
-                    if (tab.classList.contains('disabled')) return;
+                    const stage = parseInt(tab.dataset.stage);
                     currentStage = stage;
                     updateCfgTabs();
                     renderCurrentCfg();
@@ -521,22 +533,26 @@
             const c = currentCase;
             if (!c) return null;
 
-            switch (currentStage) {
-                case 'mem2reg':
-                    return c.after_mem2reg;
-                case 'call_resolution':
-                    return c.after_call_resolution;
-                case 'inlining':
-                    return c.after_inlining;
-                case 'dce':
-                    return c.after_dce;
-                case 'block_coalesce':
-                    return c.after_block_coalesce;
-                case 'heap_elim':
-                    return c.after_heap_elim;
-                default:
-                    return c.original_cfg;
+            const steps = c.pipeline_steps || [];
+
+            // If we have pipeline_steps, use them
+            if (steps.length > 0 && typeof currentStage === 'number' && currentStage < steps.length) {
+                return steps[currentStage].cfg;
             }
+
+            // Fallback to original_cfg
+            return c.original_cfg;
+        }
+
+        function getCurrentStepInfo() {
+            const c = currentCase;
+            if (!c) return null;
+
+            const steps = c.pipeline_steps || [];
+            if (steps.length > 0 && typeof currentStage === 'number' && currentStage < steps.length) {
+                return steps[currentStage];
+            }
+            return null;
         }
 
         function renderCurrentCfg() {
@@ -674,16 +690,9 @@
                 ? Math.round(100 * instrReduction / originalStats.instructions)
                 : 0;
 
-            // Stage label
-            const stageLabels = {
-                'original': 'Original',
-                'mem2reg': 'After mem2reg',
-                'call_resolution': 'After call resolution',
-                'inlining': 'After inlining',
-                'dce': 'After DCE',
-                'block_coalesce': 'After coalesce',
-                'heap_elim': 'After heap elim'
-            };
+            // Get current step info
+            const stepInfo = getCurrentStepInfo();
+            const stepLabel = stepInfo ? stepInfo.name : 'Original';
 
             let html = `<h3>Analysis: ${c.name}</h3>`;
 
@@ -691,8 +700,8 @@
                 html += `<div style="color: #888; margin-bottom: 5px; font-size: 12px;">Lines ${c.source_span[0]}-${c.source_span[1]}</div>`;
             }
 
-            // Show current viewing stage
-            html += `<div style="color: #00d9ff; margin-bottom: 10px; font-size: 12px; font-weight: bold;">Viewing: ${stageLabels[currentStage] || 'Original'}</div>`;
+            // Show current viewing step
+            html += `<div style="color: #00d9ff; margin-bottom: 10px; font-size: 12px; font-weight: bold;">Step ${currentStage + 1}/${c.pipeline_steps?.length || 1}: ${stepLabel}</div>`;
 
             html += `<div class="analysis-grid">
                 <div class="analysis-item">
@@ -721,7 +730,7 @@
                 </div>
                 <div class="analysis-item">
                     <div class="label">Blocks</div>
-                    <div class="value">${currentStats.blocks}${currentStage !== 'original' && currentStats.blocks !== originalStats.blocks ? ` <span style="color: #888; font-size: 12px;">(was ${originalStats.blocks})</span>` : ''}</div>
+                    <div class="value">${currentStats.blocks}${currentStage !== 0 && currentStats.blocks !== originalStats.blocks ? ` <span style="color: #888; font-size: 12px;">(was ${originalStats.blocks})</span>` : ''}</div>
                 </div>
                 <div class="analysis-item">
                     <div class="label">Instructions</div>
@@ -736,135 +745,74 @@
                 </div>`;
             }
 
-            // Show optimization pipeline results
-            const opt = c.optimization_result;
-            if (opt) {
+            // Show pipeline steps
+            const steps = c.pipeline_steps || [];
+            if (steps.length > 0) {
                 html += `<div style="margin-top: 15px; border-top: 1px solid #444; padding-top: 15px;">
-                    <div style="color: #00d9ff; font-size: 12px; font-weight: bold; margin-bottom: 10px;">Optimization Pipeline</div>`;
+                    <div style="color: #00d9ff; font-size: 12px; font-weight: bold; margin-bottom: 10px;">Pipeline Steps (${steps.length})</div>`;
 
-                // mem2reg status
-                let m2rHtml = '';
-                let m2rClass = '';
-                if (opt.mem2reg === 'NoCells') {
-                    m2rHtml = 'No cells to promote';
-                    m2rClass = '';
-                } else if (opt.mem2reg?.Success) {
-                    const cells = opt.mem2reg.Success.cells_promoted;
-                    m2rHtml = `✓ ${cells} cell${cells !== 1 ? 's' : ''} promoted`;
-                    m2rClass = 'true';
-                } else if (opt.mem2reg?.Partial) {
-                    const p = opt.mem2reg.Partial;
-                    m2rHtml = `⚠ ${p.cells_promoted} promoted, ${p.cells_failed} failed`;
-                    m2rClass = '';
-                }
-                const m2rActive = currentStage === 'mem2reg' ? 'border-left: 3px solid #00d9ff; padding-left: 8px;' : '';
-                html += `<div style="margin-bottom: 8px; ${m2rActive}">
-                    <div style="color: #888; font-size: 11px; text-transform: uppercase; margin-bottom: 3px;">mem2reg (local cells)${currentStage === 'mem2reg' ? ' ◀' : ''}</div>
-                    <div class="value ${m2rClass}" style="font-size: 12px;">${m2rHtml}</div>
-                </div>`;
+                for (let i = 0; i < steps.length; i++) {
+                    const step = steps[i];
+                    const isActive = currentStage === i;
+                    const activeStyle = isActive ? 'border-left: 3px solid #00d9ff; padding-left: 8px; background: rgba(0,217,255,0.1);' : '';
+                    const stepType = step.step_type?.type || 'Unknown';
 
-                // Call resolution status
-                let crHtml = '';
-                let crClass = '';
-                if (opt.call_resolution === 'NoChange') {
-                    crHtml = 'No calls to resolve';
-                    crClass = '';
-                } else if (opt.call_resolution?.Success) {
-                    const calls = opt.call_resolution.Success.calls_resolved;
-                    crHtml = `✓ ${calls} call${calls !== 1 ? 's' : ''} resolved`;
-                    crClass = 'true';
-                }
-                const crActive = currentStage === 'call_resolution' ? 'border-left: 3px solid #00d9ff; padding-left: 8px;' : '';
-                html += `<div style="margin-bottom: 8px; ${crActive}">
-                    <div style="color: #888; font-size: 11px; text-transform: uppercase; margin-bottom: 3px;">Call Resolution${currentStage === 'call_resolution' ? ' ◀' : ''}</div>
-                    <div class="value ${crClass}" style="font-size: 12px;">${crHtml}</div>
-                </div>`;
-
-                // Inlining status
-                let inlHtml = '';
-                let inlClass = '';
-                if (opt.inlining === 'NoChange') {
-                    inlHtml = 'No calls to inline';
-                    inlClass = '';
-                } else if (opt.inlining?.Success) {
-                    const calls = opt.inlining.Success.calls_inlined;
-                    inlHtml = `✓ ${calls} call${calls !== 1 ? 's' : ''} inlined`;
-                    inlClass = 'true';
-                }
-                const inlActive = currentStage === 'inlining' ? 'border-left: 3px solid #00d9ff; padding-left: 8px;' : '';
-                html += `<div style="margin-bottom: 8px; ${inlActive}">
-                    <div style="color: #888; font-size: 11px; text-transform: uppercase; margin-bottom: 3px;">Inlining${currentStage === 'inlining' ? ' ◀' : ''}</div>
-                    <div class="value ${inlClass}" style="font-size: 12px;">${inlHtml}</div>
-                </div>`;
-
-                // DCE status
-                let dceHtml = '';
-                let dceClass = '';
-                if (opt.dce === 'NoChange') {
-                    dceHtml = 'No dead code';
-                    dceClass = '';
-                } else if (opt.dce?.Success) {
-                    const removed = opt.dce.Success.instructions_removed;
-                    dceHtml = `✓ ${removed} instruction${removed !== 1 ? 's' : ''} removed`;
-                    dceClass = 'true';
-                }
-                const dceActive = currentStage === 'dce' ? 'border-left: 3px solid #00d9ff; padding-left: 8px;' : '';
-                html += `<div style="margin-bottom: 8px; ${dceActive}">
-                    <div style="color: #888; font-size: 11px; text-transform: uppercase; margin-bottom: 3px;">DCE (dead code elim)${currentStage === 'dce' ? ' ◀' : ''}</div>
-                    <div class="value ${dceClass}" style="font-size: 12px;">${dceHtml}</div>
-                </div>`;
-
-                // Block coalesce status
-                let bcHtml = '';
-                let bcClass = '';
-                if (opt.block_coalesce === 'NoChange') {
-                    bcHtml = 'No blocks to merge';
-                    bcClass = '';
-                } else if (opt.block_coalesce?.Success) {
-                    const removed = opt.block_coalesce.Success.blocks_removed;
-                    bcHtml = `✓ ${removed} block${removed !== 1 ? 's' : ''} removed`;
-                    bcClass = 'true';
-                }
-                const bcActive = currentStage === 'block_coalesce' ? 'border-left: 3px solid #00d9ff; padding-left: 8px;' : '';
-                html += `<div style="margin-bottom: 8px; ${bcActive}">
-                    <div style="color: #888; font-size: 11px; text-transform: uppercase; margin-bottom: 3px;">Block Coalesce${currentStage === 'block_coalesce' ? ' ◀' : ''}</div>
-                    <div class="value ${bcClass}" style="font-size: 12px;">${bcHtml}</div>
-                </div>`;
-
-                // Heap elimination status
-                let heapHtml = '';
-                let heapClass = '';
-                let slotMappingsHtml = '';
-                if (opt.heap_elimination === 'NotAttempted') {
-                    heapHtml = 'Not Attempted';
-                    heapClass = '';
-                } else if (opt.heap_elimination === 'NotApplicable') {
-                    heapHtml = 'Not Applicable';
-                    heapClass = '';
-                } else if (opt.heap_elimination?.Success) {
-                    const s = opt.heap_elimination.Success;
-                    heapHtml = `✓ ${s.unpack_count} slots, ${s.modified_count} modified`;
-                    heapClass = 'true';
-                    // Display slot mappings if available
-                    if (s.slot_mappings && s.slot_mappings.length > 0) {
-                        slotMappingsHtml = '<div style="margin-top: 6px; font-size: 11px; font-family: monospace;">';
-                        slotMappingsHtml += '<div style="color: #888; margin-bottom: 4px;">Slot → LocalId:</div>';
-                        for (const mapping of s.slot_mappings) {
-                            slotMappingsHtml += `<div style="color: #8af;">%${mapping.local_id}</div>`;
-                            slotMappingsHtml += `<div style="padding-left: 12px; color: #aaa; margin-bottom: 2px;">${escapeHtml(mapping.path)}</div>`;
-                        }
-                        slotMappingsHtml += '</div>';
+                    // Format step details based on type
+                    let details = '';
+                    let valueClass = 'true';
+                    switch (stepType) {
+                        case 'Original':
+                            details = 'Starting point';
+                            valueClass = '';
+                            break;
+                        case 'Mem2Reg':
+                            details = `${step.step_type.cells_promoted} cells promoted`;
+                            break;
+                        case 'BuiltinResolution':
+                            details = `${step.step_type.calls_resolved} builtins resolved`;
+                            break;
+                        case 'HeapElimStop':
+                            details = `${step.step_type.calls_resolved} calls resolved (iter ${step.step_type.iteration})`;
+                            break;
+                        case 'Inlining':
+                            details = `${step.step_type.calls_inlined} calls inlined (iter ${step.step_type.iteration})`;
+                            break;
+                        case 'Dce':
+                            details = `${step.step_type.instructions_removed} instructions removed`;
+                            break;
+                        case 'BlockCoalesce':
+                            details = `${step.step_type.blocks_removed} blocks removed`;
+                            break;
+                        case 'DeoptBuiltins':
+                            details = `${step.step_type.deopts_inserted} deopts inserted`;
+                            break;
+                        case 'HeapElimFinal':
+                            details = `${step.step_type.unpack_count} slots unpacked`;
+                            break;
+                        default:
+                            details = stepType;
                     }
-                } else if (opt.heap_elimination?.Failed) {
-                    heapHtml = `✗ ${opt.heap_elimination.Failed}`;
-                    heapClass = 'false';
+
+                    html += `<div style="margin-bottom: 6px; padding: 4px; border-radius: 4px; ${activeStyle}">
+                        <div style="display: flex; align-items: center; gap: 8px;">
+                            <span style="color: #666; font-size: 11px; min-width: 20px;">${i + 1}.</span>
+                            <span style="color: ${isActive ? '#00d9ff' : '#aaa'}; font-size: 12px; flex: 1;">${step.name}</span>
+                            ${isActive ? '<span style="color: #00d9ff;">◀</span>' : ''}
+                        </div>
+                        <div style="margin-left: 28px; color: #888; font-size: 11px;">${details}</div>
+                    </div>`;
                 }
-                const heapActive = currentStage === 'heap_elim' ? 'border-left: 3px solid #00d9ff; padding-left: 8px;' : '';
-                html += `<div style="${heapActive}">
-                    <div style="color: #888; font-size: 11px; text-transform: uppercase; margin-bottom: 3px;">Heap Elimination (globals)${currentStage === 'heap_elim' ? ' ◀' : ''}</div>
-                    <div class="value ${heapClass}" style="font-size: 12px;">${heapHtml}</div>
-                    ${slotMappingsHtml}
-                </div>`;
+
+                // Show slot mappings for HeapElimFinal if current step
+                if (stepInfo?.step_type?.type === 'HeapElimFinal' && stepInfo.step_type.slot_mappings?.length > 0) {
+                    html += '<div style="margin-top: 10px; font-size: 11px; font-family: monospace;">';
+                    html += '<div style="color: #888; margin-bottom: 4px;">Slot → LocalId:</div>';
+                    for (const mapping of stepInfo.step_type.slot_mappings) {
+                        html += `<div style="color: #8af;">%${mapping.local_id}</div>`;
+                        html += `<div style="padding-left: 12px; color: #aaa; margin-bottom: 2px;">${escapeHtml(mapping.path)}</div>`;
+                    }
+                    html += '</div>';
+                }
 
                 html += `</div>`;
             }

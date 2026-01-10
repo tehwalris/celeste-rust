@@ -5,3 +5,7 @@ perf.data*
 perf_*.data*
 checkpoints/
 server/
+
+# Python venv and server files
+.venv/
+serve.pid
