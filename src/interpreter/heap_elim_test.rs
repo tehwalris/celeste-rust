@@ -472,19 +472,22 @@ mod tests {
     }
 
     fn print_cfg(cfg: &Cfg) {
-        println!("Entry:");
-        print_block(&cfg.entry);
-        for (label, block) in &cfg.named {
-            println!("\n{}:", label.as_str());
-            print_block(block);
+        fn print_block(name: &str, block: &Block) {
+            println!("Block '{}':", name);
+            for (id, instr) in &block.instructions {
+                println!("  %{} = {}", usize::from(*id), instr.format());
+            }
+            println!(
+                "  terminator: %{} = {}",
+                usize::from(block.terminator_id()),
+                block.terminator_kind().format()
+            );
         }
-    }
 
-    fn print_block(block: &Block) {
-        for (id, instr) in &block.instructions {
-            println!("  %{} = {:?}", usize::from(*id), instr);
+        print_block("entry", &cfg.entry);
+        for (label, block) in &cfg.named {
+            print_block(label.as_str(), block);
         }
-        println!("  TERM: {:?}", block.terminator_kind());
     }
 
     /// Test execution of heap-eliminated CFG with SSA interpreter
