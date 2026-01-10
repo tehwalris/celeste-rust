@@ -123,7 +123,7 @@ fn compute_reachable_blocks(cfg: &Cfg) -> FxHashSet<Label> {
     let mut worklist: Vec<&Label> = Vec::new();
 
     // Process entry block's successors
-    add_terminator_successors(&cfg.entry.terminator.1, &mut worklist, &cfg.named);
+    add_terminator_successors(cfg.entry.terminator_kind(), &mut worklist, &cfg.named);
 
     while let Some(label) = worklist.pop() {
         if reachable.contains(label) {
@@ -132,7 +132,7 @@ fn compute_reachable_blocks(cfg: &Cfg) -> FxHashSet<Label> {
         reachable.insert(label.clone());
 
         if let Some(block) = cfg.named.get(label) {
-            add_terminator_successors(&block.terminator.1, &mut worklist, &cfg.named);
+            add_terminator_successors(block.terminator_kind(), &mut worklist, &cfg.named);
         }
     }
 
@@ -192,7 +192,7 @@ pub fn eliminate_dead_code(cfg: &Cfg) -> DceResult {
         }
 
         // Terminator uses
-        for local in get_terminator_used_locals(&block.terminator.1) {
+        for local in get_terminator_used_locals(block.terminator_kind()) {
             used_locals.insert(local);
         }
     }

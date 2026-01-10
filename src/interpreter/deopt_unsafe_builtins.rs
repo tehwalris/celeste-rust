@@ -168,7 +168,7 @@ mod tests {
             DeoptUnsafeBuiltinsResult::Success { cfg, deopts_inserted } => {
                 assert_eq!(deopts_inserted, 1);
                 // Entry block should end with Deopt
-                match &cfg.entry.terminator.1 {
+                match cfg.entry.terminator_kind() {
                     Terminator::Deopt { reason } => {
                         assert!(reason.contains("add"));
                     }

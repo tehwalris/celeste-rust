@@ -40,11 +40,11 @@ fn compute_actual_predecessors(cfg: &Cfg) -> FxHashMap<Label, FxHashSet<Label>> 
     }
 
     // Add predecessors from entry block
-    add_successors_as_predecessors(&cfg.entry.terminator.1, &Label::from("entry".to_string()), &mut predecessors);
+    add_successors_as_predecessors(cfg.entry.terminator_kind(), &Label::from("entry".to_string()), &mut predecessors);
 
     // Add predecessors from named blocks
     for (label, block) in &cfg.named {
-        add_successors_as_predecessors(&block.terminator.1, label, &mut predecessors);
+        add_successors_as_predecessors(block.terminator_kind(), label, &mut predecessors);
     }
 
     predecessors
@@ -203,8 +203,8 @@ fn remap_block_locals(block: &Block, mappings: &FxHashMap<LocalId, LocalId>) -> 
         .collect();
 
     let new_terminator = (
-        block.terminator.0,
-        match &block.terminator.1 {
+        block.terminator_id(),
+        match block.terminator_kind() {
             Terminator::Return { value: Some(v) } => Terminator::Return { value: Some(remap(*v)) },
             Terminator::Return { value: None } => Terminator::Return { value: None },
             Terminator::UnconditionalBranch { target } => {
@@ -258,7 +258,7 @@ pub fn cleanup_phis(cfg: &Cfg) -> PhiCleanupResult {
     for (label, block) in &cfg.named {
         let preds = actual_predecessors.get(label).cloned().unwrap_or_default();
         // Check if entry block is a predecessor
-        let from_entry = match &cfg.entry.terminator.1 {
+        let from_entry = match cfg.entry.terminator_kind() {
             Terminator::UnconditionalBranch { target } => target == label,
             Terminator::ConditionalBranch { true_target, false_target, .. } => {
                 true_target == label || false_target == label
@@ -360,7 +360,7 @@ mod tests {
         assert_eq!(result.collapsed_mappings.get(&LocalId::from(2)), Some(&LocalId::from(0)));
 
         // The return should now reference %0 directly
-        match &result.cfg.named.get(&Label::from("block_b".to_string())).unwrap().terminator.1 {
+        match result.cfg.named.get(&Label::from("block_b".to_string())).unwrap().terminator_kind() {
             Terminator::Return { value: Some(v) } => assert_eq!(*v, LocalId::from(0)),
             _ => panic!("Expected return terminator"),
         }

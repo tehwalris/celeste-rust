@@ -33,7 +33,7 @@ fn cleanup_phis_with_undefined_locals(cfg: &Cfg, predefined_locals: &[LocalId]) 
         for (local_id, _) in &block.instructions {
             defined_locals.insert(*local_id);
         }
-        defined_locals.insert(block.terminator.0);
+        defined_locals.insert(block.terminator_id());
     }
 
     // Now clean up phi nodes
@@ -130,8 +130,8 @@ fn cleanup_phis_with_undefined_locals(cfg: &Cfg, predefined_locals: &[LocalId]) 
             .collect();
 
         let new_terminator = (
-            block.terminator.0,
-            block.terminator.1.map_local_ids(&remap),
+            block.terminator_id(),
+            block.terminator_kind().map_local_ids(&remap),
         );
 
         Block {
@@ -481,7 +481,7 @@ fn analyze_escapes(cfg: &Cfg) -> EscapeInfo {
         }
 
         // Check terminator for returns
-        if let Terminator::Return { value: Some(ret_id) } = &block.terminator.1 {
+        if let Terminator::Return { value: Some(ret_id) } = block.terminator_kind() {
             if allocations.contains(ret_id) {
                 escaping.insert(*ret_id);
             }

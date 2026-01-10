@@ -125,7 +125,6 @@ impl<'a> UnboundSplitBlockFlow<FlowData, BoundInterpreterFlow<'a>> for Interpret
         liveness: &LivenessAnalysisResult,
         block: &Block,
     ) -> Result<BoundInterpreterFlow<'a>> {
-        let (terminator_local_id, _) = block.terminator;
         let first_non_phi_local_id = block
             .instructions
             .iter()
@@ -133,7 +132,7 @@ impl<'a> UnboundSplitBlockFlow<FlowData, BoundInterpreterFlow<'a>> for Interpret
                 Instruction::Phi { .. } => None,
                 _ => Some(*local_id),
             })
-            .unwrap_or(terminator_local_id);
+            .unwrap_or_else(|| block.terminator_id());
         let live_variables = liveness
             .get_live_variables(FlowSide::Before, first_non_phi_local_id)
             .cloned();

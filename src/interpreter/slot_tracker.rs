@@ -85,11 +85,11 @@ fn compute_predecessors(cfg: &Cfg) -> FxHashMap<BlockId, Vec<BlockId>> {
     }
 
     // Add predecessors from entry block
-    add_successors(&cfg.entry.terminator.1, BlockId::Entry, &mut preds);
+    add_successors(cfg.entry.terminator_kind(), BlockId::Entry, &mut preds);
 
     // Add predecessors from named blocks
     for (label, block) in &cfg.named {
-        add_successors(&block.terminator.1, BlockId::Named(label.clone()), &mut preds);
+        add_successors(block.terminator_kind(), BlockId::Named(label.clone()), &mut preds);
     }
 
     preds

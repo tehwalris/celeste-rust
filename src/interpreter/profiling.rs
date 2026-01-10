@@ -62,7 +62,7 @@ pub struct CfgEdge {
 
 impl BlockExport {
     pub fn from_block(block: &Block, label: Option<&Label>) -> Self {
-        let terminator_type = match &block.terminator.1 {
+        let terminator_type = match block.terminator_kind() {
             Terminator::Return { .. } => "return".to_string(),
             Terminator::UnconditionalBranch { .. } => "unconditional".to_string(),
             Terminator::ConditionalBranch { .. } => "conditional".to_string(),
@@ -143,7 +143,7 @@ impl CfgExport {
     }
 
     fn add_edges_for_block(edges: &mut Vec<CfgEdge>, source: Option<String>, block: &Block) {
-        match &block.terminator.1 {
+        match block.terminator_kind() {
             Terminator::Return { .. } | Terminator::Deopt { .. } => {
                 // No edges for return or deopt
             }

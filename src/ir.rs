@@ -61,7 +61,7 @@ impl LocalIdGenerator {
                 max_id = max_id.max(local_id.0 + 1);
             }
             // Also check terminator
-            max_id = max_id.max(block.terminator.0.0 + 1);
+            max_id = max_id.max(usize::from(block.terminator_id()) + 1);
         }
         Self { next_id: max_id }
     }
@@ -406,6 +406,18 @@ pub struct Block {
 }
 
 impl Block {
+    /// Returns the LocalId assigned to the terminator instruction.
+    #[inline]
+    pub fn terminator_id(&self) -> LocalId {
+        self.terminator.0
+    }
+
+    /// Returns a reference to the Terminator variant.
+    #[inline]
+    pub fn terminator_kind(&self) -> &Terminator {
+        &self.terminator.1
+    }
+
     /// Splits block instructions into (phi_instructions, non_phi_instructions).
     /// Phi instructions must come first in the block, followed by non-phi instructions.
     pub fn split_block_phi_instructions(

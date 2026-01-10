@@ -102,7 +102,7 @@ mod tests {
             }
 
             // Handle terminator
-            match &current_block.terminator.1 {
+            match current_block.terminator_kind() {
                 Terminator::Return { value } => {
                     let return_value = value.map(|id| state.locals.get(&id).cloned())
                         .flatten();
@@ -488,7 +488,7 @@ mod tests {
         for (id, instr) in &block.instructions {
             println!("  %{} = {:?}", usize::from(*id), instr);
         }
-        println!("  TERM: {:?}", block.terminator.1);
+        println!("  TERM: {:?}", block.terminator_kind());
     }
 
     /// Test execution of heap-eliminated CFG with SSA interpreter

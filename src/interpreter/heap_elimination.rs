@@ -537,7 +537,7 @@ fn compute_predecessors(cfg: &Cfg) -> FxHashMap<BlockId, Vec<(BlockId, Label)>> 
 
     // Process entry block
     // Note: Use Label::entry() which provides the canonical name for the entry block in phi nodes
-    match &cfg.entry.terminator.1 {
+    match cfg.entry.terminator_kind() {
         Terminator::Return { .. } | Terminator::Deopt { .. } => {}
         Terminator::UnconditionalBranch { target } => {
             add_pred(target, BlockId::Entry, Label::entry());
@@ -555,7 +555,7 @@ fn compute_predecessors(cfg: &Cfg) -> FxHashMap<BlockId, Vec<(BlockId, Label)>> 
     // Process named blocks
     for (label, block) in &cfg.named {
         let block_id = BlockId::Named(label.clone());
-        match &block.terminator.1 {
+        match block.terminator_kind() {
             Terminator::Return { .. } | Terminator::Deopt { .. } => {}
             Terminator::UnconditionalBranch { target } => {
                 add_pred(target, block_id, label.clone());
@@ -578,12 +578,12 @@ fn compute_predecessors(cfg: &Cfg) -> FxHashMap<BlockId, Vec<(BlockId, Label)>> 
 fn find_exit_blocks(cfg: &Cfg) -> Vec<BlockId> {
     let mut exits = Vec::new();
 
-    if matches!(cfg.entry.terminator.1, Terminator::Return { .. }) {
+    if matches!(cfg.entry.terminator_kind(), Terminator::Return { .. }) {
         exits.push(BlockId::Entry);
     }
 
     for (label, block) in &cfg.named {
-        if matches!(block.terminator.1, Terminator::Return { .. }) {
+        if matches!(block.terminator_kind(), Terminator::Return { .. }) {
             exits.push(BlockId::Named(label.clone()));
         }
     }
@@ -743,7 +743,7 @@ fn find_local_cells(cfg: &Cfg) -> FxHashSet<LocalId> {
         }
 
         // Check terminator for uses of cells
-        match &block.terminator.1 {
+        match block.terminator_kind() {
             Terminator::Return { value: Some(ret_id) } => {
                 if allocations.contains(ret_id) {
                     escaping.insert(*ret_id);
@@ -819,11 +819,11 @@ fn transform_block(
                             for (id, instr) in &block.instructions[current_idx..] {
                                 final_instrs.push((*id, instr.clone().map_local_ids(rewrite)));
                             }
-                            let rewritten_terminator = block.terminator.1.map_local_ids(rewrite);
+                            let rewritten_terminator = block.terminator_kind().map_local_ids(rewrite);
                             return BlockTransformResult::Stopped {
                                 block: Block {
                                     instructions: final_instrs,
-                                    terminator: (block.terminator.0, rewritten_terminator),
+                                    terminator: (block.terminator_id(), rewritten_terminator),
                                     hint_normalize: block.hint_normalize,
                                 },
                                 calls_resolved,
@@ -1072,8 +1072,8 @@ fn transform_block(
         .collect();
 
     let rewritten_terminator = (
-        block.terminator.0,
-        block.terminator.1.map_local_ids(rewrite_local_id),
+        block.terminator_id(),
+        block.terminator_kind().map_local_ids(rewrite_local_id),
     );
 
     BlockTransformResult::Success {
@@ -1590,7 +1590,7 @@ mod tests {
             HeapEliminationResult::Success(transformed) => {
                 assert!(transformed.deopt_count > 0, "Expected deopt to be inserted");
                 // The entry block should end with Deopt mentioning add
-                match &transformed.cfg.entry.terminator.1 {
+                match transformed.cfg.entry.terminator_kind() {
                     Terminator::Deopt { reason } => {
                         assert!(reason.contains("add"), "Deopt reason should mention add: {}", reason);
                     }
@@ -2701,7 +2701,7 @@ mod tests {
                 }
 
                 // Also check terminator
-                transformed.cfg.entry.terminator.1.map_local_ids(|used_id| {
+                transformed.cfg.entry.terminator_kind().map_local_ids(|used_id| {
                     assert!(
                         defined_ids.contains(&used_id),
                         "Terminator references undefined LocalId {:?}. Defined: {:?}",

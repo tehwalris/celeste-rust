@@ -195,7 +195,7 @@ fn find_local_cells(cfg: &Cfg) -> Vec<CellInfo> {
         }
 
         // Check terminator for uses of cells
-        match &block.terminator.1 {
+        match block.terminator_kind() {
             Terminator::Return { value: Some(ret_id) } => {
                 if allocations.contains_key(ret_id) {
                     escaping.insert(*ret_id);
@@ -417,7 +417,7 @@ fn promote_cell_multi_block(cfg: &mut Cfg, cell: &CellInfo, local_gen: &mut Loca
                 }
             };
 
-            match &block.terminator.1 {
+            match block.terminator_kind() {
                 Terminator::UnconditionalBranch { target } => {
                     worklist.push(BlockId::Named(target.clone()));
                 }
@@ -888,11 +888,11 @@ fn compute_predecessors(cfg: &Cfg) -> HashMap<BlockId, Vec<BlockId>> {
     let mut preds: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
 
     // Entry block's successors
-    add_successors(&cfg.entry.terminator.1, BlockId::Entry, &mut preds);
+    add_successors(cfg.entry.terminator_kind(), BlockId::Entry, &mut preds);
 
     // Named blocks' successors
     for (label, block) in &cfg.named {
-        add_successors(&block.terminator.1, BlockId::Named(label.clone()), &mut preds);
+        add_successors(block.terminator_kind(), BlockId::Named(label.clone()), &mut preds);
     }
 
     preds
@@ -1106,7 +1106,7 @@ mod tests {
                 }
 
                 // Return should use %7 (the BinaryOp result, not %9 which was a Load)
-                match &block_a.terminator.1 {
+                match block_a.terminator_kind() {
                     Terminator::Return { value: Some(ret_val) } => {
                         assert_eq!(*ret_val, LocalId::from(7), "Return should use %7 (the incremented value)");
                     }
@@ -1219,7 +1219,7 @@ mod tests {
                 }
 
                 // Return should use the phi result
-                match &block_c.terminator.1 {
+                match block_c.terminator_kind() {
                     Terminator::Return { value: Some(ret_val) } => {
                         assert_eq!(*ret_val, *phi_id, "Return should use phi result");
                     }

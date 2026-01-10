@@ -33,7 +33,7 @@ pub fn coalesce_blocks(cfg: &Cfg) -> CoalesceResult {
     let mut coalesce_targets: HashMap<Label, BlockSource> = HashMap::new();
 
     // Check entry block
-    if let Terminator::UnconditionalBranch { target } = &cfg.entry.terminator.1 {
+    if let Terminator::UnconditionalBranch { target } = cfg.entry.terminator_kind() {
         if has_single_predecessor(&preds, target) {
             coalesce_targets.insert(target.clone(), BlockSource::Entry);
         }
@@ -41,7 +41,7 @@ pub fn coalesce_blocks(cfg: &Cfg) -> CoalesceResult {
 
     // Check named blocks
     for (label, block) in &cfg.named {
-        if let Terminator::UnconditionalBranch { target } = &block.terminator.1 {
+        if let Terminator::UnconditionalBranch { target } = block.terminator_kind() {
             if has_single_predecessor(&preds, target) && !coalesce_targets.contains_key(target) {
                 coalesce_targets.insert(target.clone(), BlockSource::Named(label.clone()));
             }
@@ -62,7 +62,7 @@ pub fn coalesce_blocks(cfg: &Cfg) -> CoalesceResult {
         let mut merged = false;
 
         // Try to merge entry block with its target
-        if let Terminator::UnconditionalBranch { target } = &new_cfg.entry.terminator.1 {
+        if let Terminator::UnconditionalBranch { target } = new_cfg.entry.terminator_kind() {
             if has_single_predecessor(&preds, target) {
                 let target_label = target.clone();
                 if let Some(target_block) = new_cfg.named.remove(&target_label) {
@@ -84,7 +84,7 @@ pub fn coalesce_blocks(cfg: &Cfg) -> CoalesceResult {
             let labels: Vec<_> = new_cfg.named.keys().cloned().collect();
             for label in labels {
                 let block = new_cfg.named.get(&label).unwrap();
-                if let Terminator::UnconditionalBranch { target } = &block.terminator.1 {
+                if let Terminator::UnconditionalBranch { target } = block.terminator_kind() {
                     let target_label = target.clone();
                     if has_single_predecessor(&preds, &target_label) && target_label != label {
                         if let Some(target_block) = new_cfg.named.remove(&target_label) {
@@ -249,11 +249,11 @@ fn compute_predecessors(cfg: &Cfg) -> HashMap<Label, Vec<Option<Label>>> {
     }
 
     // Entry block's successors (None represents entry block)
-    add_successors(&cfg.entry.terminator.1, None, &mut preds);
+    add_successors(cfg.entry.terminator_kind(), None, &mut preds);
 
     // Named blocks' successors
     for (label, block) in &cfg.named {
-        add_successors(&block.terminator.1, Some(label.clone()), &mut preds);
+        add_successors(block.terminator_kind(), Some(label.clone()), &mut preds);
     }
 
     preds
@@ -333,7 +333,7 @@ mod tests {
                 assert_eq!(blocks_removed, 1);
                 assert!(new_cfg.named.is_empty());
                 assert_eq!(new_cfg.entry.instructions.len(), 2);
-                assert!(matches!(new_cfg.entry.terminator.1, Terminator::Return { .. }));
+                assert!(matches!(new_cfg.entry.terminator_kind(), Terminator::Return { .. }));
             }
             CoalesceResult::NoChange => panic!("Expected coalescing to occur"),
         }

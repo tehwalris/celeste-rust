@@ -211,11 +211,11 @@ fn build_predecessor_map(cfg: &Cfg) -> FxHashMap<String, FxHashSet<String>> {
     }
 
     // Add predecessors from entry block
-    add_predecessors_from_terminator(&cfg.entry.terminator.1, ENTRY_BLOCK_LABEL, &mut predecessors);
+    add_predecessors_from_terminator(cfg.entry.terminator_kind(), ENTRY_BLOCK_LABEL, &mut predecessors);
 
     // Add predecessors from named blocks
     for (label, block) in &cfg.named {
-        add_predecessors_from_terminator(&block.terminator.1, label.as_str(), &mut predecessors);
+        add_predecessors_from_terminator(block.terminator_kind(), label.as_str(), &mut predecessors);
     }
 
     predecessors
@@ -294,7 +294,7 @@ fn validate_block_uses(
     }
 
     // Check terminator operands
-    let term_used = get_terminator_used_locals(&block.terminator.1);
+    let term_used = get_terminator_used_locals(block.terminator_kind());
     for used in term_used {
         if !defined_locals.contains_key(&used) {
             errors.push(ValidationError::UndefinedLocal {
@@ -313,7 +313,7 @@ fn validate_branch_targets(
     block_names: &FxHashSet<String>,
     errors: &mut Vec<ValidationError>,
 ) {
-    match &block.terminator.1 {
+    match block.terminator_kind() {
         Terminator::Return { .. } | Terminator::Deopt { .. } => {}
         Terminator::UnconditionalBranch { target } => {
             if !block_names.contains(target.as_str()) {
