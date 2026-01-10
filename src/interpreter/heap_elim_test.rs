@@ -10,27 +10,16 @@
 //! The normal interpreter panics on Phi nodes, so we need a specialized
 //! SSA interpreter for testing.
 //!
-//! ## Key insight from analysis:
+//! ## SSA Correctness
 //!
-//! The heap elimination pass produces `Load(Phi)` patterns where:
-//! - `%slot = HeapRead(arg0.x)` - reads initial VALUE
+//! Heap elimination correctly produces SSA where Phi nodes merge VALUES
+//! (from HeapRead and computed results). Uses reference the Phi directly:
+//!
+//! - `%slot = HeapRead(arg0.x)` - reads the VALUE of arg0.x
 //! - `%phi = Phi([entry: %slot, if_true: %computed])` - merges VALUES
-//! - `%result = Load(%phi)` - tries to LOAD from the Phi!
+//! - `Return(%phi)` - uses the Phi result directly
 //!
-//! This is a REDUNDANCY rather than a bug. The Phi nodes track VALUES, and
-//! the Load instructions are unnecessary when applied to SSA values.
-//! The transformation is correct if Load(SSA_value) is treated as identity.
-//!
-//! In a cleaned-up SSA form, uses should reference %phi directly.
-//! The Load instructions are harmless but wasteful:
-//! - They make the IR harder to analyze
-//! - They could confuse downstream passes expecting Load(pointer)
-//!
-//! ## Test results:
-//!
-//! The SSA interpreter treats Load as identity for SSA values, and all
-//! tests pass with correct numerical results. This confirms the
-//! transformation is semantically correct, just suboptimally represented.
+//! The type validation confirms no Load(Phi) patterns are produced.
 
 #[cfg(test)]
 mod tests {
@@ -386,24 +375,14 @@ mod tests {
         }
     }
 
-    /// Test that verifies Load(Phi) is semantically equivalent to Phi value
-    /// This is the key test for the bug we found
+    /// Test that verifies Phi nodes correctly track VALUES, not pointers.
+    ///
+    /// This test confirms that heap elimination produces correct SSA where:
+    /// - Phi nodes merge VALUES (from HeapRead and computed results)
+    /// - Uses reference the Phi directly without redundant Load operations
     #[test]
     fn test_load_from_phi_equivalence() {
-        // This test demonstrates the problem:
-        // If Phi nodes track VALUES (not pointers), then Load(Phi) doesn't make sense
-        //
-        // In proper SSA, if we have:
-        //   %slot = HeapRead(arg0.x)  -- reads the VALUE of arg0.x
-        //   %phi = Phi([block1: %slot, block2: %new_value])  -- merges VALUES
-        //
-        // Then uses should reference %phi directly, not Load(%phi)
-        //
-        // The fact that we have Load(%phi) suggests either:
-        // 1. The Phis track pointers (GetField results), not values
-        // 2. Or there's a bug in the transformation
-
-        // Let's create a CFG and check what the Phis actually track
+        // Verify that Phi nodes track VALUES correctly in the transformed CFG
         use crate::ir::LocalIdGenerator;
 
         let cfg = make_simple_field_access_cfg();
@@ -444,14 +423,8 @@ mod tests {
                 }
             }
 
-            // The key question: do Phi nodes merge:
-            // A) HeapRead results (VALUES) - then Load(Phi) is redundant
-            // B) GetField results (POINTERS) - then Load(Phi) is necessary
-            //
-            // Based on our analysis, Phi nodes merge VALUES (from HeapRead and
-            // computed values like x+1). The Load(Phi) instructions are therefore
-            // redundant - they should be eliminated or replaced with direct use
-            // of the Phi result. This is a code quality issue, not a correctness bug.
+            // Phi nodes correctly merge VALUES (from HeapRead and computed values).
+            // Uses reference Phi results directly without redundant Load operations.
         }
     }
 

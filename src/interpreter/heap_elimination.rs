@@ -1199,8 +1199,8 @@ pub fn eliminate_heap(
         transformed_cfg
     };
 
-    // In debug builds, validate the transformed CFG for type correctness
-    // This catches issues like Load(Phi) where Phi produces a value, not a pointer
+    // In debug builds, validate the transformed CFG for type correctness.
+    // Type errors (e.g., Load from a non-pointer) indicate a regression in the transformation.
     #[cfg(debug_assertions)]
     {
         use crate::interpreter::cfg_validation::{validate_types, SsaType};
@@ -1213,8 +1213,7 @@ pub fn eliminate_heap(
 
         let type_errors = validate_types(&transformed_cfg, &arg_types);
         if !type_errors.is_empty() {
-            // Log the errors but don't panic - we're aware of the Load(Phi) issue
-            // TODO: Fix the transformation to not produce Load(Phi) patterns
+            // Log errors for debugging - these indicate a problem in the transformation
             #[cfg(test)]
             {
                 eprintln!("WARNING: heap_elimination produced {} type error(s):", type_errors.len());
