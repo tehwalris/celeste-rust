@@ -809,6 +809,21 @@ impl Cfg {
         std::iter::once(&mut self.entry).chain(self.named.values_mut())
     }
 
+    /// Find an instruction by its LocalId across all blocks.
+    ///
+    /// Searches the entry block first, then all named blocks.
+    /// Returns a reference to the instruction if found.
+    pub fn find_instruction(&self, target: LocalId) -> Option<&Instruction> {
+        for block in self.iter_blocks() {
+            for (id, instr) in &block.instructions {
+                if *id == target {
+                    return Some(instr);
+                }
+            }
+        }
+        None
+    }
+
     pub fn map_blocks(&self, f: impl Fn(&Block) -> Block) -> Self {
         Self {
             entry: f(&self.entry),

@@ -309,15 +309,13 @@ mod tests {
 
         // Now the key test: check for Load(Phi) pattern
         let mut load_from_phi_count = 0;
-        let phi_ids: std::collections::HashSet<LocalId> = transformed.cfg.entry.instructions.iter()
-            .chain(transformed.cfg.named.values().flat_map(|b| b.instructions.iter()))
+        let phi_ids: std::collections::HashSet<LocalId> = transformed.cfg.iter_blocks()
+            .flat_map(|b| b.instructions.iter())
             .filter(|(_, instr)| matches!(instr, Instruction::Phi { .. }))
             .map(|(id, _)| *id)
             .collect();
 
-        for block in std::iter::once(&transformed.cfg.entry)
-            .chain(transformed.cfg.named.values())
-        {
+        for block in transformed.cfg.iter_blocks() {
             for (target_id, instr) in &block.instructions {
                 if let Instruction::Load { source } = instr {
                     if phi_ids.contains(source) {
@@ -354,15 +352,13 @@ mod tests {
         // Find all Phi nodes and trace what they depend on
         println!("\n=== PHI ANALYSIS ===");
 
-        for (label, block) in std::iter::once((&Label::from("entry".to_string()), &transformed.cfg.entry))
-            .chain(transformed.cfg.named.iter())
-        {
+        for (label, block) in transformed.cfg.iter_blocks_with_label() {
             for (target_id, instr) in &block.instructions {
                 if let Instruction::Phi { branches } = instr {
-                    println!("\n%{} = Phi in {}:", usize::from(*target_id), label.as_str());
+                    println!("\n%{} = Phi in {}:", usize::from(*target_id), label);
                     for (src_label, src_id) in branches {
                         // Find what instruction defined src_id
-                        let def = find_definition(&transformed.cfg, *src_id);
+                        let def = transformed.cfg.find_instruction(*src_id);
                         println!("  from {}: %{} = {:?}", src_label.as_str(), usize::from(*src_id), def);
                     }
                 }
@@ -371,22 +367,6 @@ mod tests {
 
         // Phi nodes correctly merge VALUES (from HeapRead and computed values).
         // Uses reference Phi results directly without redundant Load operations.
-    }
-
-    fn find_definition(cfg: &Cfg, target: LocalId) -> Option<Instruction> {
-        for (id, instr) in &cfg.entry.instructions {
-            if *id == target {
-                return Some(instr.clone());
-            }
-        }
-        for block in cfg.named.values() {
-            for (id, instr) in &block.instructions {
-                if *id == target {
-                    return Some(instr.clone());
-                }
-            }
-        }
-        None
     }
 
     fn print_cfg(cfg: &Cfg) {
