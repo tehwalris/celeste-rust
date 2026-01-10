@@ -1372,21 +1372,10 @@ mod tests {
         // CFG: %0 = GetGlobal("x"); %1 = Load(%0); return %1
         let entry = Block::new_for_test(
             vec![
-                (
-                    LocalId::from(0),
-                    Instruction::GetGlobal {
-                        name: "x".to_string(),
-                        create_if_missing: false,
-                    },
-                ),
+                (LocalId::from(0), Instruction::get_global("x")),
                 (LocalId::from(1), Instruction::load(LocalId::from(0))),
             ],
-            (
-                LocalId::from(2),
-                Terminator::Return {
-                    value: Some(LocalId::from(1)),
-                },
-            ),
+            (LocalId::from(2), Terminator::ret(Some(LocalId::from(1)))),
         );
 
         let cfg = Cfg::single_entry(entry);
@@ -1412,16 +1401,10 @@ mod tests {
         // create_if_missing is allowed - we still track the global properly
         let entry = Block::new_for_test(
             vec![
-                (
-                    LocalId::from(0),
-                    Instruction::GetGlobal {
-                        name: "x".to_string(),
-                        create_if_missing: true,
-                    },
-                ),
+                (LocalId::from(0), Instruction::get_global_create("x")),
                 (LocalId::from(1), Instruction::load(LocalId::from(0))),
             ],
-            (LocalId::from(2), Terminator::Return { value: Some(LocalId::from(1)) }),
+            (LocalId::from(2), Terminator::ret(Some(LocalId::from(1)))),
         );
 
         let cfg = Cfg::single_entry(entry);
@@ -1450,13 +1433,7 @@ mod tests {
         // Pure builtins like max should be allowed
         let entry = Block::new_for_test(
             vec![
-                (
-                    LocalId::from(0),
-                    Instruction::GetGlobal {
-                        name: "x".to_string(),
-                        create_if_missing: false,
-                    },
-                ),
+                (LocalId::from(0), Instruction::get_global("x")),
                 (LocalId::from(1), Instruction::load(LocalId::from(0))),
                 (
                     LocalId::from(2),
@@ -1466,12 +1443,7 @@ mod tests {
                     },
                 ),
             ],
-            (
-                LocalId::from(3),
-                Terminator::Return {
-                    value: Some(LocalId::from(2)),
-                },
-            ),
+            (LocalId::from(3), Terminator::ret(Some(LocalId::from(2)))),
         );
 
         let cfg = Cfg::single_entry(entry);
@@ -1492,13 +1464,7 @@ mod tests {
         // Impure builtins like add (modifies tables) should be rejected
         let entry = Block::new_for_test(
             vec![
-                (
-                    LocalId::from(0),
-                    Instruction::GetGlobal {
-                        name: "x".to_string(),
-                        create_if_missing: false,
-                    },
-                ),
+                (LocalId::from(0), Instruction::get_global("x")),
                 (LocalId::from(1), Instruction::load(LocalId::from(0))),
                 (
                     LocalId::from(2),
@@ -1508,12 +1474,7 @@ mod tests {
                     },
                 ),
             ],
-            (
-                LocalId::from(3),
-                Terminator::Return {
-                    value: Some(LocalId::from(2)),
-                },
-            ),
+            (LocalId::from(3), Terminator::ret(Some(LocalId::from(2)))),
         );
 
         let cfg = Cfg::single_entry(entry);
@@ -1569,21 +1530,10 @@ mod tests {
         // k_left is a constant (0), so Load should become NumberConstant(0)
         let entry = Block::new_for_test(
             vec![
-                (
-                    LocalId::from(0),
-                    Instruction::GetGlobal {
-                        name: "k_left".to_string(),
-                        create_if_missing: false,
-                    },
-                ),
+                (LocalId::from(0), Instruction::get_global("k_left")),
                 (LocalId::from(1), Instruction::load(LocalId::from(0))),
             ],
-            (
-                LocalId::from(2),
-                Terminator::Return {
-                    value: Some(LocalId::from(1)),
-                },
-            ),
+            (LocalId::from(2), Terminator::ret(Some(LocalId::from(1)))),
         );
 
         let cfg = Cfg::single_entry(entry);
@@ -1621,20 +1571,11 @@ mod tests {
         // k_left is a constant, so Store should cause ConstantViolation
         let entry = Block::new_for_test(
             vec![
-                (
-                    LocalId::from(0),
-                    Instruction::GetGlobal {
-                        name: "k_left".to_string(),
-                        create_if_missing: false,
-                    },
-                ),
+                (LocalId::from(0), Instruction::get_global("k_left")),
                 (LocalId::from(1), Instruction::num_const(5)),
-                (
-                    LocalId::from(2),
-                    Instruction::store(LocalId::from(0), LocalId::from(1)),
-                ),
+                (LocalId::from(2), Instruction::store(LocalId::from(0), LocalId::from(1))),
             ],
-            (LocalId::from(3), Terminator::Return { value: None }),
+            (LocalId::from(3), Terminator::ret(None)),
         );
 
         let cfg = Cfg::single_entry(entry);
@@ -1663,37 +1604,13 @@ mod tests {
         // %4 = BinaryOp(%1, Plus, %3); return %4
         let entry = Block::new_for_test(
             vec![
-                (
-                    LocalId::from(0),
-                    Instruction::GetGlobal {
-                        name: "k_left".to_string(),
-                        create_if_missing: false,
-                    },
-                ),
+                (LocalId::from(0), Instruction::get_global("k_left")),
                 (LocalId::from(1), Instruction::load(LocalId::from(0))),
-                (
-                    LocalId::from(2),
-                    Instruction::GetGlobal {
-                        name: "x".to_string(),
-                        create_if_missing: false,
-                    },
-                ),
+                (LocalId::from(2), Instruction::get_global("x")),
                 (LocalId::from(3), Instruction::load(LocalId::from(2))),
-                (
-                    LocalId::from(4),
-                    Instruction::binary_op(
-                        crate::ir::BinaryOp::Plus,
-                        LocalId::from(1),
-                        LocalId::from(3),
-                    ),
-                ),
+                (LocalId::from(4), Instruction::binary_op(crate::ir::BinaryOp::Plus, LocalId::from(1), LocalId::from(3))),
             ],
-            (
-                LocalId::from(5),
-                Terminator::Return {
-                    value: Some(LocalId::from(4)),
-                },
-            ),
+            (LocalId::from(5), Terminator::ret(Some(LocalId::from(4)))),
         );
 
         let cfg = Cfg::single_entry(entry);
@@ -1996,20 +1913,12 @@ mod tests {
         // CFG: %0 = GetGlobal("unknown"); %1 = Load(%0); %2 = Store(%0, %1); return
         let entry = Block::new_for_test(
             vec![
-                (
-                    LocalId::from(0),
-                    Instruction::GetGlobal {
-                        name: "unknown".to_string(),
-                        create_if_missing: true, // Even with create_if_missing=true, no deopt
-                    },
-                ),
+                // Even with create_if_missing=true, no deopt
+                (LocalId::from(0), Instruction::get_global_create("unknown")),
                 (LocalId::from(1), Instruction::load(LocalId::from(0))),
-                (
-                    LocalId::from(2),
-                    Instruction::store(LocalId::from(0), LocalId::from(1)),
-                ),
+                (LocalId::from(2), Instruction::store(LocalId::from(0), LocalId::from(1))),
             ],
-            (LocalId::from(3), Terminator::Return { value: None }),
+            (LocalId::from(3), Terminator::ret(None)),
         );
 
         let cfg = Cfg::single_entry(entry);
@@ -2048,32 +1957,13 @@ mod tests {
         // %4 = BinaryOp(%1, Plus, %3); return %4
         let entry = Block::new_for_test(
             vec![
-                (
-                    LocalId::from(0),
-                    Instruction::GetGlobal {
-                        name: "x".to_string(),
-                        create_if_missing: false,
-                    },
-                ),
+                (LocalId::from(0), Instruction::get_global("x")),
                 (LocalId::from(1), Instruction::load(LocalId::from(0))),
-                (
-                    LocalId::from(2),
-                    Instruction::GetGlobal {
-                        name: "unknown".to_string(),
-                        create_if_missing: true,
-                    },
-                ),
+                (LocalId::from(2), Instruction::get_global_create("unknown")),
                 (LocalId::from(3), Instruction::load(LocalId::from(2))),
-                (
-                    LocalId::from(4),
-                    Instruction::binary_op(
-                        crate::ir::BinaryOp::Plus,
-                        LocalId::from(1),
-                        LocalId::from(3),
-                    ),
-                ),
+                (LocalId::from(4), Instruction::binary_op(crate::ir::BinaryOp::Plus, LocalId::from(1), LocalId::from(3))),
             ],
-            (LocalId::from(5), Terminator::Return { value: Some(LocalId::from(4)) }),
+            (LocalId::from(5), Terminator::ret(Some(LocalId::from(4)))),
         );
 
         let cfg = Cfg::single_entry(entry);
@@ -2134,34 +2024,15 @@ mod tests {
 
         let entry = Block::new_for_test(
             vec![
-                (
-                    LocalId::from(0),
-                    Instruction::GetGlobal {
-                        name: "player".to_string(),
-                        create_if_missing: false,
-                    },
-                ),
+                (LocalId::from(0), Instruction::get_global("player")),
                 (LocalId::from(1), Instruction::load(LocalId::from(0))),
-                (LocalId::from(2), Instruction::Alloc),
-                (
-                    LocalId::from(3),
-                    Instruction::store(LocalId::from(2), LocalId::from(1)),
-                ),
+                (LocalId::from(2), Instruction::alloc()),
+                (LocalId::from(3), Instruction::store(LocalId::from(2), LocalId::from(1))),
                 (LocalId::from(4), Instruction::load(LocalId::from(2))),
-                (
-                    LocalId::from(5),
-                    Instruction::GetField {
-                        receiver: LocalId::from(4),
-                        field: "x".to_string(),
-                        create_if_missing: false,
-                    },
-                ),
+                (LocalId::from(5), Instruction::get_field(LocalId::from(4), "x", false)),
                 (LocalId::from(6), Instruction::load(LocalId::from(5))),
             ],
-            (
-                LocalId::from(7),
-                Terminator::Return { value: Some(LocalId::from(6)) },
-            ),
+            (LocalId::from(7), Terminator::ret(Some(LocalId::from(6)))),
         );
 
         let cfg = Cfg::single_entry(entry);
@@ -2319,52 +2190,19 @@ mod tests {
 
         let entry = Block::new_for_test(
             vec![
-                (
-                    LocalId::from(0),
-                    Instruction::GetGlobal {
-                        name: "player".to_string(),
-                        create_if_missing: false,
-                    },
-                ),
+                (LocalId::from(0), Instruction::get_global("player")),
                 (LocalId::from(1), Instruction::load(LocalId::from(0))),
-                (LocalId::from(2), Instruction::Alloc),
-                (
-                    LocalId::from(3),
-                    Instruction::store(LocalId::from(2), LocalId::from(1)),
-                ),
+                (LocalId::from(2), Instruction::alloc()),
+                (LocalId::from(3), Instruction::store(LocalId::from(2), LocalId::from(1))),
                 (LocalId::from(4), Instruction::load(LocalId::from(2))),
-                (
-                    LocalId::from(5),
-                    Instruction::GetField {
-                        receiver: LocalId::from(4),
-                        field: "x".to_string(),
-                        create_if_missing: false,
-                    },
-                ),
+                (LocalId::from(5), Instruction::get_field(LocalId::from(4), "x", false)),
                 (LocalId::from(6), Instruction::load(LocalId::from(5))),
                 (LocalId::from(7), Instruction::load(LocalId::from(2))),
-                (
-                    LocalId::from(8),
-                    Instruction::GetField {
-                        receiver: LocalId::from(7),
-                        field: "y".to_string(),
-                        create_if_missing: false,
-                    },
-                ),
+                (LocalId::from(8), Instruction::get_field(LocalId::from(7), "y", false)),
                 (LocalId::from(9), Instruction::load(LocalId::from(8))),
-                (
-                    LocalId::from(10),
-                    Instruction::binary_op(
-                        crate::ir::BinaryOp::Plus,
-                        LocalId::from(6),
-                        LocalId::from(9),
-                    ),
-                ),
+                (LocalId::from(10), Instruction::binary_op(crate::ir::BinaryOp::Plus, LocalId::from(6), LocalId::from(9))),
             ],
-            (
-                LocalId::from(11),
-                Terminator::Return { value: Some(LocalId::from(10)) },
-            ),
+            (LocalId::from(11), Terminator::ret(Some(LocalId::from(10)))),
         );
 
         let cfg = Cfg::single_entry(entry);
@@ -2421,46 +2259,18 @@ mod tests {
 
         let entry = Block::new_for_test(
             vec![
-                (
-                    LocalId::from(0),
-                    Instruction::GetGlobal {
-                        name: "player1".to_string(),
-                        create_if_missing: false,
-                    },
-                ),
+                (LocalId::from(0), Instruction::get_global("player1")),
                 (LocalId::from(1), Instruction::load(LocalId::from(0))),
-                (
-                    LocalId::from(2),
-                    Instruction::GetGlobal {
-                        name: "player2".to_string(),
-                        create_if_missing: false,
-                    },
-                ),
+                (LocalId::from(2), Instruction::get_global("player2")),
                 (LocalId::from(3), Instruction::load(LocalId::from(2))),
-                (LocalId::from(4), Instruction::Alloc),
-                (
-                    LocalId::from(5),
-                    Instruction::store(LocalId::from(4), LocalId::from(1)),
-                ),
-                (
-                    LocalId::from(6),
-                    Instruction::store(LocalId::from(4), LocalId::from(3)),
-                ),
+                (LocalId::from(4), Instruction::alloc()),
+                (LocalId::from(5), Instruction::store(LocalId::from(4), LocalId::from(1))),
+                (LocalId::from(6), Instruction::store(LocalId::from(4), LocalId::from(3))),
                 (LocalId::from(7), Instruction::load(LocalId::from(4))),
-                (
-                    LocalId::from(8),
-                    Instruction::GetField {
-                        receiver: LocalId::from(7),
-                        field: "x".to_string(),
-                        create_if_missing: false,
-                    },
-                ),
+                (LocalId::from(8), Instruction::get_field(LocalId::from(7), "x", false)),
                 (LocalId::from(9), Instruction::load(LocalId::from(8))),
             ],
-            (
-                LocalId::from(10),
-                Terminator::Return { value: Some(LocalId::from(9)) },
-            ),
+            (LocalId::from(10), Terminator::ret(Some(LocalId::from(9)))),
         );
 
         let cfg = Cfg::single_entry(entry);
@@ -2512,40 +2322,18 @@ mod tests {
 
         let entry = Block::new_for_test(
             vec![
-                (
-                    LocalId::from(0),
-                    Instruction::GetGlobal {
-                        name: "player".to_string(),
-                        create_if_missing: false,
-                    },
-                ),
+                (LocalId::from(0), Instruction::get_global("player")),
                 (LocalId::from(1), Instruction::load(LocalId::from(0))),
-                (LocalId::from(2), Instruction::Alloc),
-                (
-                    LocalId::from(3),
-                    Instruction::store(LocalId::from(2), LocalId::from(1)),
-                ),
+                (LocalId::from(2), Instruction::alloc()),
+                (LocalId::from(3), Instruction::store(LocalId::from(2), LocalId::from(1))),
                 (LocalId::from(4), Instruction::load(LocalId::from(2))),
-                (LocalId::from(5), Instruction::Alloc),
-                (
-                    LocalId::from(6),
-                    Instruction::store(LocalId::from(5), LocalId::from(4)),
-                ),
+                (LocalId::from(5), Instruction::alloc()),
+                (LocalId::from(6), Instruction::store(LocalId::from(5), LocalId::from(4))),
                 (LocalId::from(7), Instruction::load(LocalId::from(5))),
-                (
-                    LocalId::from(8),
-                    Instruction::GetField {
-                        receiver: LocalId::from(7),
-                        field: "x".to_string(),
-                        create_if_missing: false,
-                    },
-                ),
+                (LocalId::from(8), Instruction::get_field(LocalId::from(7), "x", false)),
                 (LocalId::from(9), Instruction::load(LocalId::from(8))),
             ],
-            (
-                LocalId::from(10),
-                Terminator::Return { value: Some(LocalId::from(9)) },
-            ),
+            (LocalId::from(10), Terminator::ret(Some(LocalId::from(9)))),
         );
 
         let cfg = Cfg::single_entry(entry);
@@ -2637,27 +2425,12 @@ mod tests {
         // Shape: btn is a Leaf (incorrectly, but this is what triggers the bug)
         let entry = Block::new_for_test(
             vec![
-                (
-                    LocalId::from(0),
-                    Instruction::GetGlobal {
-                        name: "btn".to_string(),
-                        create_if_missing: false,
-                    },
-                ),
+                (LocalId::from(0), Instruction::get_global("btn")),
                 (LocalId::from(1), Instruction::load(LocalId::from(0))),
                 (LocalId::from(2), Instruction::num_const(1)),
-                (
-                    LocalId::from(3),
-                    Instruction::Call {
-                        closure: LocalId::from(1),
-                        args: vec![LocalId::from(2)],
-                    },
-                ),
+                (LocalId::from(3), Instruction::call(LocalId::from(1), vec![LocalId::from(2)])),
             ],
-            (
-                LocalId::from(4),
-                Terminator::Return { value: Some(LocalId::from(3)) },
-            ),
+            (LocalId::from(4), Terminator::ret(Some(LocalId::from(3)))),
         );
 
         let cfg = Cfg::single_entry(entry);

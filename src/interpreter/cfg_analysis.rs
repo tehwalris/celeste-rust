@@ -1587,21 +1587,10 @@ mod tests {
         // A CFG that reads from heap: %0 = GetGlobal("x"); %1 = Load(%0); return %1
         let entry = Block::new_for_test(
             vec![
-                (
-                    LocalId::from(0),
-                    Instruction::GetGlobal {
-                        name: "x".to_string(),
-                        create_if_missing: false,
-                    },
-                ),
+                (LocalId::from(0), Instruction::get_global("x")),
                 (LocalId::from(1), Instruction::load(LocalId::from(0))),
             ],
-            (
-                LocalId::from(2),
-                Terminator::Return {
-                    value: Some(LocalId::from(1)),
-                },
-            ),
+            (LocalId::from(2), Terminator::ret(Some(LocalId::from(1)))),
         );
 
         Cfg::single_entry(entry)
@@ -1611,20 +1600,11 @@ mod tests {
         // A CFG that writes to heap: %0 = GetGlobal("x"); %1 = NumberConstant(5); Store(%0, %1); return
         let entry = Block::new_for_test(
             vec![
-                (
-                    LocalId::from(0),
-                    Instruction::GetGlobal {
-                        name: "x".to_string(),
-                        create_if_missing: false,
-                    },
-                ),
+                (LocalId::from(0), Instruction::get_global("x")),
                 (LocalId::from(1), Instruction::num_const(5)),
-                (
-                    LocalId::from(2),
-                    Instruction::store(LocalId::from(0), LocalId::from(1)),
-                ),
+                (LocalId::from(2), Instruction::store(LocalId::from(0), LocalId::from(1))),
             ],
-            (LocalId::from(3), Terminator::Return { value: None }),
+            (LocalId::from(3), Terminator::ret(None)),
         );
 
         Cfg::single_entry(entry)
@@ -1759,20 +1739,11 @@ mod tests {
         // This pattern will be resolved to CallResolved by call_resolution
         let outer_cfg = Cfg::single_entry(Block::new_for_test(
             vec![
-                (
-                    LocalId::from(0),
-                    Instruction::GetGlobal { name: "inner".to_string(), create_if_missing: false },
-                ),
-                (
-                    LocalId::from(1),
-                    Instruction::load(LocalId::from(0)),
-                ),
-                (
-                    LocalId::from(2),
-                    Instruction::Call { closure: LocalId::from(1), args: vec![] },
-                ),
+                (LocalId::from(0), Instruction::get_global("inner")),
+                (LocalId::from(1), Instruction::load(LocalId::from(0))),
+                (LocalId::from(2), Instruction::call(LocalId::from(1), vec![])),
             ],
-            (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
+            (LocalId::from(3), Terminator::ret(Some(LocalId::from(2)))),
         ));
 
         let outer_def = FunDef {
@@ -1852,23 +1823,11 @@ mod tests {
         // Return(result)
         let entry = Block::new_for_test(
             vec![
-                (
-                    cell_id,
-                    Instruction::GetGlobal {
-                        name: "max".to_string(),
-                        create_if_missing: false,
-                    },
-                ),
-                (func_id, Instruction::Load { source: cell_id }),
-                (
-                    result_id,
-                    Instruction::Call {
-                        closure: func_id,
-                        args: vec![a_id, b_id],
-                    },
-                ),
+                (cell_id, Instruction::get_global("max")),
+                (func_id, Instruction::load(cell_id)),
+                (result_id, Instruction::call(func_id, vec![a_id, b_id])),
             ],
-            (terminator_id, Terminator::Return { value: Some(result_id) }),
+            (terminator_id, Terminator::ret(Some(result_id))),
         );
 
         let cfg = Cfg::single_entry(entry);

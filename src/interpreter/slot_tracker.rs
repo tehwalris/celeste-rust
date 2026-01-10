@@ -345,11 +345,11 @@ mod tests {
 
         let entry = Block::new_for_test(
             vec![
-                (LocalId::from(0), Instruction::GetGlobal { name: "foo".to_string(), create_if_missing: false }),
+                (LocalId::from(0), Instruction::get_global("foo")),
                 (LocalId::from(1), Instruction::load(LocalId::from(0))),
-                (LocalId::from(2), Instruction::Call { closure: LocalId::from(1), args: vec![] }),
+                (LocalId::from(2), Instruction::call(LocalId::from(1), vec![])),
             ],
-            (LocalId::from(99), Terminator::Return { value: Some(LocalId::from(2)) }),
+            (LocalId::from(99), Terminator::ret(Some(LocalId::from(2)))),
         );
 
         let cfg = Cfg::single_entry(entry);
@@ -391,12 +391,12 @@ mod tests {
 
         let entry = Block::new_for_test(
             vec![
-                (LocalId::from(0), Instruction::GetGlobal { name: "player".to_string(), create_if_missing: false }),
-                (LocalId::from(1), Instruction::GetField { receiver: LocalId::from(0), field: "update".to_string(), create_if_missing: false }),
+                (LocalId::from(0), Instruction::get_global("player")),
+                (LocalId::from(1), Instruction::get_field(LocalId::from(0), "update", false)),
                 (LocalId::from(2), Instruction::load(LocalId::from(1))),
-                (LocalId::from(3), Instruction::Call { closure: LocalId::from(2), args: vec![] }),
+                (LocalId::from(3), Instruction::call(LocalId::from(2), vec![])),
             ],
-            (LocalId::from(99), Terminator::Return { value: Some(LocalId::from(3)) }),
+            (LocalId::from(99), Terminator::ret(Some(LocalId::from(3)))),
         );
 
         let cfg = Cfg::single_entry(entry);
@@ -453,16 +453,16 @@ mod tests {
 
         let true_branch = Block::new_for_test(
             vec![
-                (LocalId::from(1), Instruction::GetGlobal { name: "foo".to_string(), create_if_missing: false }),
+                (LocalId::from(1), Instruction::get_global("foo")),
             ],
-            (LocalId::from(98), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
+            (LocalId::from(98), Terminator::branch("join")),
         );
 
         let false_branch = Block::new_for_test(
             vec![
-                (LocalId::from(2), Instruction::GetGlobal { name: "bar".to_string(), create_if_missing: false }),
+                (LocalId::from(2), Instruction::get_global("bar")),
             ],
-            (LocalId::from(97), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
+            (LocalId::from(97), Terminator::branch("join")),
         );
 
         // Join block tries to call %1 (from true branch) - but this won't work
@@ -505,11 +505,11 @@ mod tests {
 
         let entry = Block::new_for_test(
             vec![
-                (LocalId::from(0), Instruction::GetGlobal { name: "foo".to_string(), create_if_missing: false }),
+                (LocalId::from(0), Instruction::get_global("foo")),
                 (LocalId::from(1), Instruction::load(LocalId::from(0))),
-                (LocalId::from(2), Instruction::Call { closure: LocalId::from(1), args: vec![] }),
+                (LocalId::from(2), Instruction::call(LocalId::from(1), vec![])),
             ],
-            (LocalId::from(99), Terminator::Return { value: Some(LocalId::from(2)) }),
+            (LocalId::from(99), Terminator::ret(Some(LocalId::from(2)))),
         );
 
         let cfg = Cfg::single_entry(entry);

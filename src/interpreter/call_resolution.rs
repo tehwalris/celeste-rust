@@ -222,34 +222,12 @@ mod tests {
 
         let entry = Block::new_for_test(
             vec![
-                (
-                    LocalId::from(0),
-                    Instruction::GetGlobal {
-                        name: "foo".to_string(),
-                        create_if_missing: false,
-                    },
-                ),
-                (
-                    LocalId::from(1),
-                    Instruction::Load {
-                        source: LocalId::from(0),
-                    },
-                ),
+                (LocalId::from(0), Instruction::get_global("foo")),
+                (LocalId::from(1), Instruction::load(LocalId::from(0))),
                 (LocalId::from(2), Instruction::num_const(42)),
-                (
-                    LocalId::from(3),
-                    Instruction::Call {
-                        closure: LocalId::from(1),
-                        args: vec![LocalId::from(2)],
-                    },
-                ),
+                (LocalId::from(3), Instruction::call(LocalId::from(1), vec![LocalId::from(2)])),
             ],
-            (
-                LocalId::from(4),
-                Terminator::Return {
-                    value: Some(LocalId::from(3)),
-                },
-            ),
+            (LocalId::from(4), Terminator::ret(Some(LocalId::from(3)))),
         );
 
         Cfg::single_entry(entry)

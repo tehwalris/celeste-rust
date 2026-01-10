@@ -376,6 +376,31 @@ impl Instruction {
         Self::UnaryOp { op, arg }
     }
 
+    /// Test helper to create a GetGlobal instruction.
+    ///
+    /// This is a convenience method for tests that need to create get_global
+    /// instructions. It's more concise than the verbose struct literal with
+    /// `name.to_string()`.
+    #[cfg(test)]
+    pub fn get_global(name: &str) -> Self {
+        Self::GetGlobal {
+            name: name.to_string(),
+            create_if_missing: false,
+        }
+    }
+
+    /// Test helper to create a GetGlobal instruction with create_if_missing flag.
+    ///
+    /// This is a convenience method for tests that need to create get_global
+    /// instructions with the create_if_missing flag set to true.
+    #[cfg(test)]
+    pub fn get_global_create(name: &str) -> Self {
+        Self::GetGlobal {
+            name: name.to_string(),
+            create_if_missing: true,
+        }
+    }
+
     /// Get all local IDs used by this instruction.
     ///
     /// This returns all LocalIds that this instruction reads from (its operands).

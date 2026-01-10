@@ -154,23 +154,11 @@ mod tests {
         // Create a CFG with: GetGlobal("max") -> Load -> Call
         let cfg = Cfg::single_entry(Block::new_for_test(
             vec![
-                (
-                    LocalId::from(0),
-                    Instruction::GetGlobal {
-                        name: "max".to_string(),
-                        create_if_missing: false,
-                    },
-                ),
+                (LocalId::from(0), Instruction::get_global("max")),
                 (LocalId::from(1), Instruction::load(LocalId::from(0))),
                 (LocalId::from(2), Instruction::num_const(1)),
                 (LocalId::from(3), Instruction::num_const(2)),
-                (
-                    LocalId::from(4),
-                    Instruction::Call {
-                        closure: LocalId::from(1),
-                        args: vec![LocalId::from(2), LocalId::from(3)],
-                    },
-                ),
+                (LocalId::from(4), Instruction::call(LocalId::from(1), vec![LocalId::from(2), LocalId::from(3)])),
             ],
             (
                 LocalId::from(5),
@@ -220,21 +208,9 @@ mod tests {
         // Create a CFG with: GetGlobal("unknown") -> Load -> Call
         let cfg = Cfg::single_entry(Block::new_for_test(
             vec![
-                (
-                    LocalId::from(0),
-                    Instruction::GetGlobal {
-                        name: "unknown".to_string(),
-                        create_if_missing: false,
-                    },
-                ),
+                (LocalId::from(0), Instruction::get_global("unknown")),
                 (LocalId::from(1), Instruction::load(LocalId::from(0))),
-                (
-                    LocalId::from(2),
-                    Instruction::Call {
-                        closure: LocalId::from(1),
-                        args: vec![],
-                    },
-                ),
+                (LocalId::from(2), Instruction::call(LocalId::from(1), vec![])),
             ],
             (
                 LocalId::from(3),
@@ -259,38 +235,14 @@ mod tests {
         let cfg = Cfg::single_entry(Block::new_for_test(
             vec![
                 // max call
-                (
-                    LocalId::from(0),
-                    Instruction::GetGlobal {
-                        name: "max".to_string(),
-                        create_if_missing: false,
-                    },
-                ),
+                (LocalId::from(0), Instruction::get_global("max")),
                 (LocalId::from(1), Instruction::load(LocalId::from(0))),
                 (LocalId::from(2), Instruction::num_const(1)),
-                (
-                    LocalId::from(3),
-                    Instruction::Call {
-                        closure: LocalId::from(1),
-                        args: vec![LocalId::from(2)],
-                    },
-                ),
+                (LocalId::from(3), Instruction::call(LocalId::from(1), vec![LocalId::from(2)])),
                 // min call
-                (
-                    LocalId::from(4),
-                    Instruction::GetGlobal {
-                        name: "min".to_string(),
-                        create_if_missing: false,
-                    },
-                ),
+                (LocalId::from(4), Instruction::get_global("min")),
                 (LocalId::from(5), Instruction::load(LocalId::from(4))),
-                (
-                    LocalId::from(6),
-                    Instruction::Call {
-                        closure: LocalId::from(5),
-                        args: vec![LocalId::from(3)],
-                    },
-                ),
+                (LocalId::from(6), Instruction::call(LocalId::from(5), vec![LocalId::from(3)])),
             ],
             (
                 LocalId::from(7),
