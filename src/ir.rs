@@ -617,6 +617,41 @@ pub enum Terminator {
 }
 
 impl Terminator {
+    /// Test helper to create a Return terminator.
+    ///
+    /// This is a convenience method for tests that need to create return
+    /// terminators. It's more concise than `Terminator::Return { value }`.
+    #[cfg(test)]
+    pub fn ret(value: Option<LocalId>) -> Self {
+        Self::Return { value }
+    }
+
+    /// Test helper to create an UnconditionalBranch terminator.
+    ///
+    /// This is a convenience method for tests that need to create unconditional
+    /// branch terminators. It's more concise than the verbose struct literal
+    /// with `Label::from("name".to_string())`.
+    #[cfg(test)]
+    pub fn branch(target: &str) -> Self {
+        Self::UnconditionalBranch {
+            target: Label::from(target.to_string()),
+        }
+    }
+
+    /// Test helper to create a ConditionalBranch terminator.
+    ///
+    /// This is a convenience method for tests that need to create conditional
+    /// branch terminators. It's more concise than the verbose struct literal
+    /// with multiple `Label::from("name".to_string())` calls.
+    #[cfg(test)]
+    pub fn cond_branch(condition: LocalId, true_target: &str, false_target: &str) -> Self {
+        Self::ConditionalBranch {
+            condition,
+            true_target: Label::from(true_target.to_string()),
+            false_target: Label::from(false_target.to_string()),
+        }
+    }
+
     /// Get all local IDs used by this terminator.
     ///
     /// This returns all LocalIds that this terminator reads from.

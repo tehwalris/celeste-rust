@@ -310,12 +310,12 @@ mod tests {
 
         let entry = Block::new_for_test(
             vec![],
-            (LocalId::from(99), Terminator::UnconditionalBranch { target: Label::from("block_a".to_string()) }),
+            (LocalId::from(99), Terminator::branch("block_a")),
         );
 
         let block_a = Block::new_for_test(
             vec![(LocalId::from(0), Instruction::num_const(1))],
-            (LocalId::from(1), Terminator::UnconditionalBranch { target: Label::from("block_b".to_string()) }),
+            (LocalId::from(1), Terminator::branch("block_b")),
         );
 
         let block_b = Block::new_for_test(
@@ -323,7 +323,7 @@ mod tests {
                 LocalId::from(2),
                 Instruction::phi(vec![(Label::from("block_a".to_string()), LocalId::from(0))]),
             )],
-            (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
+            (LocalId::from(3), Terminator::ret(Some(LocalId::from(2)))),
         );
 
         let cfg = Cfg {
@@ -360,14 +360,7 @@ mod tests {
 
         let entry = Block::new_for_test(
             vec![(LocalId::from(0), Instruction::bool_const(true))],
-            (
-                LocalId::from(99),
-                Terminator::ConditionalBranch {
-                    condition: LocalId::from(0),
-                    true_target: Label::from("block_a".to_string()),
-                    false_target: Label::from("block_b".to_string()),
-                },
-            ),
+            (LocalId::from(99), Terminator::cond_branch(LocalId::from(0), "block_a", "block_b")),
         );
 
         // Block A now has Deopt terminator (doesn't branch to join anymore)
@@ -379,7 +372,7 @@ mod tests {
         // Block B still branches to join
         let block_b = Block::new_for_test(
             vec![(LocalId::from(2), Instruction::num_const(2))],
-            (LocalId::from(11), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
+            (LocalId::from(11), Terminator::branch("join")),
         );
 
         // Join has Phi referencing both A and B
@@ -391,7 +384,7 @@ mod tests {
                     (Label::from("block_b".to_string()), LocalId::from(2)),
                 ]),
             )],
-            (LocalId::from(12), Terminator::Return { value: Some(LocalId::from(3)) }),
+            (LocalId::from(12), Terminator::ret(Some(LocalId::from(3)))),
         );
 
         let cfg = Cfg {
@@ -425,14 +418,7 @@ mod tests {
 
         let entry = Block::new_for_test(
             vec![(LocalId::from(0), Instruction::bool_const(true))],
-            (
-                LocalId::from(99),
-                Terminator::ConditionalBranch {
-                    condition: LocalId::from(0),
-                    true_target: Label::from("block_a".to_string()),
-                    false_target: Label::from("block_b".to_string()),
-                },
-            ),
+            (LocalId::from(99), Terminator::cond_branch(LocalId::from(0), "block_a", "block_b")),
         );
 
         let block_a = Block::new_for_test(
@@ -453,7 +439,7 @@ mod tests {
                     (Label::from("block_b".to_string()), LocalId::from(2)),
                 ]),
             )],
-            (LocalId::from(12), Terminator::Return { value: Some(LocalId::from(3)) }),
+            (LocalId::from(12), Terminator::ret(Some(LocalId::from(3)))),
         );
 
         let cfg = Cfg {
@@ -493,19 +479,12 @@ mod tests {
 
         let entry = Block::new_for_test(
             vec![],
-            (LocalId::from(99), Terminator::UnconditionalBranch { target: Label::from("dispatch".to_string()) }),
+            (LocalId::from(99), Terminator::branch("dispatch")),
         );
 
         let dispatch = Block::new_for_test(
             vec![(LocalId::from(0), Instruction::bool_const(true))],
-            (
-                LocalId::from(98),
-                Terminator::ConditionalBranch {
-                    condition: LocalId::from(0),
-                    true_target: Label::from("block_a".to_string()),
-                    false_target: Label::from("block_b".to_string()),
-                },
-            ),
+            (LocalId::from(98), Terminator::cond_branch(LocalId::from(0), "block_a", "block_b")),
         );
 
         let block_a = Block::new_for_test(
@@ -515,19 +494,12 @@ mod tests {
 
         let block_b = Block::new_for_test(
             vec![(LocalId::from(2), Instruction::num_const(2))],
-            (
-                LocalId::from(11),
-                Terminator::ConditionalBranch {
-                    condition: LocalId::from(2),
-                    true_target: Label::from("block_c".to_string()),
-                    false_target: Label::from("join".to_string()),
-                },
-            ),
+            (LocalId::from(11), Terminator::cond_branch(LocalId::from(2), "block_c", "join")),
         );
 
         let block_c = Block::new_for_test(
             vec![(LocalId::from(3), Instruction::num_const(3))],
-            (LocalId::from(12), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
+            (LocalId::from(12), Terminator::branch("join")),
         );
 
         let join = Block::new_for_test(
@@ -539,7 +511,7 @@ mod tests {
                     (Label::from("block_c".to_string()), LocalId::from(3)),
                 ]),
             )],
-            (LocalId::from(13), Terminator::Return { value: Some(LocalId::from(4)) }),
+            (LocalId::from(13), Terminator::ret(Some(LocalId::from(4)))),
         );
 
         let cfg = Cfg {
@@ -585,7 +557,7 @@ mod tests {
 
         let entry = Block::new_for_test(
             vec![(LocalId::from(0), Instruction::num_const(1))],
-            (LocalId::from(99), Terminator::UnconditionalBranch { target: Label::from("block_b".to_string()) }),
+            (LocalId::from(99), Terminator::branch("block_b")),
         );
 
         let block_b = Block::new_for_test(
@@ -604,7 +576,7 @@ mod tests {
                     },
                 ),
             ],
-            (LocalId::from(10), Terminator::Return { value: Some(LocalId::from(3)) }),
+            (LocalId::from(10), Terminator::ret(Some(LocalId::from(3)))),
         );
 
         let cfg = Cfg {
@@ -639,12 +611,12 @@ mod tests {
 
         let entry = Block::new_for_test(
             vec![(LocalId::from(0), Instruction::num_const(0))],
-            (LocalId::from(99), Terminator::UnconditionalBranch { target: Label::from("block_a".to_string()) }),
+            (LocalId::from(99), Terminator::branch("block_a")),
         );
 
         let block_a = Block::new_for_test(
             vec![(LocalId::from(1), Instruction::num_const(1))],
-            (LocalId::from(98), Terminator::UnconditionalBranch { target: Label::from("block_b".to_string()) }),
+            (LocalId::from(98), Terminator::branch("block_b")),
         );
 
         // block_b has Phi from block_a only -> collapses to %1
@@ -653,7 +625,7 @@ mod tests {
                 LocalId::from(2),
                 Instruction::phi(vec![(Label::from("block_a".to_string()), LocalId::from(1))]),
             )],
-            (LocalId::from(97), Terminator::UnconditionalBranch { target: Label::from("block_c".to_string()) }),
+            (LocalId::from(97), Terminator::branch("block_c")),
         );
 
         // block_c has Phi from block_b only -> collapses to %2
@@ -674,7 +646,7 @@ mod tests {
                     },
                 ),
             ],
-            (LocalId::from(96), Terminator::Return { value: Some(LocalId::from(4)) }),
+            (LocalId::from(96), Terminator::ret(Some(LocalId::from(4)))),
         );
 
         let cfg = Cfg {
@@ -720,26 +692,19 @@ mod tests {
 
         let entry = Block::new_for_test(
             vec![(LocalId::from(0), Instruction::bool_const(true))],
-            (
-                LocalId::from(99),
-                Terminator::ConditionalBranch {
-                    condition: LocalId::from(0),
-                    true_target: Label::from("block_a".to_string()),
-                    false_target: Label::from("block_b".to_string()),
-                },
-            ),
+            (LocalId::from(99), Terminator::cond_branch(LocalId::from(0), "block_a", "block_b")),
         );
 
         // Block A still exists in this test CFG (predecessor is valid),
         // but we'll tell cleanup that %1 is not defined
         let block_a = Block::new_for_test(
             vec![(LocalId::from(1), Instruction::num_const(1))],
-            (LocalId::from(10), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
+            (LocalId::from(10), Terminator::branch("join")),
         );
 
         let block_b = Block::new_for_test(
             vec![(LocalId::from(2), Instruction::num_const(2))],
-            (LocalId::from(11), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
+            (LocalId::from(11), Terminator::branch("join")),
         );
 
         let join = Block::new_for_test(
@@ -750,7 +715,7 @@ mod tests {
                     (Label::from("block_b".to_string()), LocalId::from(2)),
                 ]),
             )],
-            (LocalId::from(12), Terminator::Return { value: Some(LocalId::from(3)) }),
+            (LocalId::from(12), Terminator::ret(Some(LocalId::from(3)))),
         );
 
         let cfg = Cfg {
@@ -800,24 +765,17 @@ mod tests {
 
         let entry = Block::new_for_test(
             vec![(LocalId::from(0), Instruction::bool_const(true))],
-            (
-                LocalId::from(99),
-                Terminator::ConditionalBranch {
-                    condition: LocalId::from(0),
-                    true_target: Label::from("block_a".to_string()),
-                    false_target: Label::from("block_b".to_string()),
-                },
-            ),
+            (LocalId::from(99), Terminator::cond_branch(LocalId::from(0), "block_a", "block_b")),
         );
 
         let block_a = Block::new_for_test(
             vec![(LocalId::from(1), Instruction::num_const(1))],
-            (LocalId::from(10), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
+            (LocalId::from(10), Terminator::branch("join")),
         );
 
         let block_b = Block::new_for_test(
             vec![(LocalId::from(2), Instruction::num_const(2))],
-            (LocalId::from(11), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
+            (LocalId::from(11), Terminator::branch("join")),
         );
 
         let join = Block::new_for_test(
@@ -828,7 +786,7 @@ mod tests {
                     (Label::from("block_b".to_string()), LocalId::from(2)),
                 ]),
             )],
-            (LocalId::from(12), Terminator::Return { value: Some(LocalId::from(3)) }),
+            (LocalId::from(12), Terminator::ret(Some(LocalId::from(3)))),
         );
 
         let cfg = Cfg {
