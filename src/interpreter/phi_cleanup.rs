@@ -829,6 +829,33 @@ mod tests {
 
     // ==================== Unit tests for transitive_closure ====================
 
+    /// Build mappings from (source, target) pairs for transitive closure tests.
+    fn build_mappings(pairs: &[(usize, usize)]) -> FxHashMap<LocalId, LocalId> {
+        pairs
+            .iter()
+            .map(|&(src, tgt)| (LocalId::from(src), LocalId::from(tgt)))
+            .collect()
+    }
+
+    /// Assert that all given source IDs map to the expected target ID.
+    fn assert_all_map_to(
+        result: &FxHashMap<LocalId, LocalId>,
+        sources: &[usize],
+        target: usize,
+    ) {
+        let target_id = LocalId::from(target);
+        for &src in sources {
+            assert_eq!(
+                result.get(&LocalId::from(src)),
+                Some(&target_id),
+                "Expected %{} -> %{}, but got {:?}",
+                src,
+                target,
+                result.get(&LocalId::from(src))
+            );
+        }
+    }
+
     #[test]
     fn test_transitive_closure_empty() {
         let mappings: FxHashMap<LocalId, LocalId> = FxHashMap::default();
@@ -838,72 +865,50 @@ mod tests {
 
     #[test]
     fn test_transitive_closure_single_mapping() {
-        let mut mappings: FxHashMap<LocalId, LocalId> = FxHashMap::default();
-        mappings.insert(LocalId::from(1), LocalId::from(0));
-
+        let mappings = build_mappings(&[(1, 0)]);
         let result = transitive_closure(&mappings);
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result.get(&LocalId::from(1)), Some(&LocalId::from(0)));
+        assert_all_map_to(&result, &[1], 0);
     }
 
     #[test]
     fn test_transitive_closure_chain_of_three() {
         // A -> B, B -> C should give A -> C, B -> C
-        let mut mappings: FxHashMap<LocalId, LocalId> = FxHashMap::default();
-        mappings.insert(LocalId::from(2), LocalId::from(1)); // %2 -> %1
-        mappings.insert(LocalId::from(1), LocalId::from(0)); // %1 -> %0
-
+        let mappings = build_mappings(&[(2, 1), (1, 0)]);
         let result = transitive_closure(&mappings);
 
         assert_eq!(result.len(), 2);
-        assert_eq!(result.get(&LocalId::from(2)), Some(&LocalId::from(0))); // %2 -> %0 (transitive)
-        assert_eq!(result.get(&LocalId::from(1)), Some(&LocalId::from(0))); // %1 -> %0
+        assert_all_map_to(&result, &[2, 1], 0);
     }
 
     #[test]
     fn test_transitive_closure_deep_chain() {
         // Test a chain of 6 mappings: %5 -> %4 -> %3 -> %2 -> %1 -> %0
-        let mut mappings: FxHashMap<LocalId, LocalId> = FxHashMap::default();
-        mappings.insert(LocalId::from(5), LocalId::from(4));
-        mappings.insert(LocalId::from(4), LocalId::from(3));
-        mappings.insert(LocalId::from(3), LocalId::from(2));
-        mappings.insert(LocalId::from(2), LocalId::from(1));
-        mappings.insert(LocalId::from(1), LocalId::from(0));
-
+        let mappings = build_mappings(&[(5, 4), (4, 3), (3, 2), (2, 1), (1, 0)]);
         let result = transitive_closure(&mappings);
 
         assert_eq!(result.len(), 5);
-        // All should resolve to %0
-        assert_eq!(result.get(&LocalId::from(5)), Some(&LocalId::from(0)));
-        assert_eq!(result.get(&LocalId::from(4)), Some(&LocalId::from(0)));
-        assert_eq!(result.get(&LocalId::from(3)), Some(&LocalId::from(0)));
-        assert_eq!(result.get(&LocalId::from(2)), Some(&LocalId::from(0)));
-        assert_eq!(result.get(&LocalId::from(1)), Some(&LocalId::from(0)));
+        assert_all_map_to(&result, &[5, 4, 3, 2, 1], 0);
     }
 
     #[test]
     fn test_transitive_closure_self_reference() {
         // Edge case: A -> A (self-reference)
         // This shouldn't happen in practice but the code should handle it without infinite loop
-        let mut mappings: FxHashMap<LocalId, LocalId> = FxHashMap::default();
-        mappings.insert(LocalId::from(0), LocalId::from(0)); // %0 -> %0
-
+        let mappings = build_mappings(&[(0, 0)]);
         let result = transitive_closure(&mappings);
 
         // Should remain unchanged - self-reference stays as is
         assert_eq!(result.len(), 1);
-        assert_eq!(result.get(&LocalId::from(0)), Some(&LocalId::from(0)));
+        assert_all_map_to(&result, &[0], 0);
     }
 
     #[test]
     fn test_transitive_closure_two_element_cycle() {
         // Edge case: A -> B, B -> A (two-element cycle)
         // This is pathological but the code should not infinite loop
-        let mut mappings: FxHashMap<LocalId, LocalId> = FxHashMap::default();
-        mappings.insert(LocalId::from(0), LocalId::from(1)); // %0 -> %1
-        mappings.insert(LocalId::from(1), LocalId::from(0)); // %1 -> %0
-
+        let mappings = build_mappings(&[(0, 1), (1, 0)]);
         let result = transitive_closure(&mappings);
 
         // The algorithm will follow %0 -> %1 -> %0 and stop at the self-reference check
@@ -916,42 +921,22 @@ mod tests {
     #[test]
     fn test_transitive_closure_independent_chains() {
         // Two independent chains: %3 -> %2 -> %1 and %6 -> %5 -> %4
-        let mut mappings: FxHashMap<LocalId, LocalId> = FxHashMap::default();
-        // Chain 1
-        mappings.insert(LocalId::from(3), LocalId::from(2));
-        mappings.insert(LocalId::from(2), LocalId::from(1));
-        // Chain 2
-        mappings.insert(LocalId::from(6), LocalId::from(5));
-        mappings.insert(LocalId::from(5), LocalId::from(4));
-
+        let mappings = build_mappings(&[(3, 2), (2, 1), (6, 5), (5, 4)]);
         let result = transitive_closure(&mappings);
 
         assert_eq!(result.len(), 4);
-        // Chain 1 resolves to %1
-        assert_eq!(result.get(&LocalId::from(3)), Some(&LocalId::from(1)));
-        assert_eq!(result.get(&LocalId::from(2)), Some(&LocalId::from(1)));
-        // Chain 2 resolves to %4
-        assert_eq!(result.get(&LocalId::from(6)), Some(&LocalId::from(4)));
-        assert_eq!(result.get(&LocalId::from(5)), Some(&LocalId::from(4)));
+        assert_all_map_to(&result, &[3, 2], 1); // Chain 1 resolves to %1
+        assert_all_map_to(&result, &[6, 5], 4); // Chain 2 resolves to %4
     }
 
     #[test]
     fn test_transitive_closure_diamond() {
         // Diamond pattern: %3 -> %1, %4 -> %2, both %1 and %2 -> %0
         // This tests that multiple paths to the same target work correctly
-        let mut mappings: FxHashMap<LocalId, LocalId> = FxHashMap::default();
-        mappings.insert(LocalId::from(3), LocalId::from(1));
-        mappings.insert(LocalId::from(4), LocalId::from(2));
-        mappings.insert(LocalId::from(1), LocalId::from(0));
-        mappings.insert(LocalId::from(2), LocalId::from(0));
-
+        let mappings = build_mappings(&[(3, 1), (4, 2), (1, 0), (2, 0)]);
         let result = transitive_closure(&mappings);
 
         assert_eq!(result.len(), 4);
-        // All should resolve to %0
-        assert_eq!(result.get(&LocalId::from(3)), Some(&LocalId::from(0)));
-        assert_eq!(result.get(&LocalId::from(4)), Some(&LocalId::from(0)));
-        assert_eq!(result.get(&LocalId::from(1)), Some(&LocalId::from(0)));
-        assert_eq!(result.get(&LocalId::from(2)), Some(&LocalId::from(0)));
+        assert_all_map_to(&result, &[3, 4, 1, 2], 0);
     }
 }
