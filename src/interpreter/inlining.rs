@@ -456,11 +456,7 @@ mod tests {
                 (LocalId::from(0), Instruction::num_const(5)),
                 (
                     LocalId::from(1),
-                    Instruction::CallResolved {
-                        fun_name: GlobalId::from("add_one_1".to_string()),
-                        captures: vec![],
-                        args: vec![LocalId::from(0)],
-                    },
+                    Instruction::call_resolved("add_one_1", vec![], vec![LocalId::from(0)]),
                 ),
             ],
             (

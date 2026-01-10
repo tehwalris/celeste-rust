@@ -401,6 +401,33 @@ impl Instruction {
         }
     }
 
+    /// Test helper to create a CallBuiltin instruction.
+    ///
+    /// This is a convenience method for tests that need to create call_builtin
+    /// instructions. It's more concise than the verbose struct literal with
+    /// `name.to_string()`.
+    #[cfg(test)]
+    pub fn call_builtin(name: &str, args: Vec<LocalId>) -> Self {
+        Self::CallBuiltin {
+            name: name.to_string(),
+            args,
+        }
+    }
+
+    /// Test helper to create a CallResolved instruction.
+    ///
+    /// This is a convenience method for tests that need to create call_resolved
+    /// instructions. It's more concise than the verbose struct literal with
+    /// `GlobalId::from()`.
+    #[cfg(test)]
+    pub fn call_resolved(fun_name: &str, captures: Vec<LocalId>, args: Vec<LocalId>) -> Self {
+        Self::CallResolved {
+            fun_name: GlobalId::from(fun_name.to_string()),
+            captures,
+            args,
+        }
+    }
+
     /// Get all local IDs used by this instruction.
     ///
     /// This returns all LocalIds that this instruction reads from (its operands).

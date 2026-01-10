@@ -1437,10 +1437,7 @@ mod tests {
                 (LocalId::from(1), Instruction::load(LocalId::from(0))),
                 (
                     LocalId::from(2),
-                    Instruction::CallBuiltin {
-                        name: "max".to_string(),
-                        args: vec![LocalId::from(1), LocalId::from(1)],
-                    },
+                    Instruction::call_builtin("max", vec![LocalId::from(1), LocalId::from(1)]),
                 ),
             ],
             (LocalId::from(3), Terminator::ret(Some(LocalId::from(2)))),
@@ -1468,10 +1465,7 @@ mod tests {
                 (LocalId::from(1), Instruction::load(LocalId::from(0))),
                 (
                     LocalId::from(2),
-                    Instruction::CallBuiltin {
-                        name: "add".to_string(),
-                        args: vec![LocalId::from(1), LocalId::from(1)],
-                    },
+                    Instruction::call_builtin("add", vec![LocalId::from(1), LocalId::from(1)]),
                 ),
             ],
             (LocalId::from(3), Terminator::ret(Some(LocalId::from(2)))),

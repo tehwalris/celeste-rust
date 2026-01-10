@@ -281,11 +281,7 @@ mod tests {
                 (LocalId::from(2), Instruction::num_const(42)),
                 (
                     LocalId::from(3),
-                    Instruction::CallResolved {
-                        fun_name: "foo_1".to_string().into(),
-                        captures: vec![],
-                        args: vec![LocalId::from(2)],
-                    },
+                    Instruction::call_resolved("foo_1", vec![], vec![LocalId::from(2)]),
                 ),
             ],
             (
