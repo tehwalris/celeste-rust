@@ -4,7 +4,9 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::{
     fmt,
+    num::ParseFloatError,
     ops::{Add, Div, Mul, Neg, Rem, Sub},
+    str::FromStr,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -55,10 +57,6 @@ impl Pico8Num {
         } else {
             Self::from_parts(n as i16, ((n - n.floor()) * 65536.) as u16)
         }
-    }
-
-    pub fn from_str(s: &str) -> Result<Self> {
-        Ok(Self::from_f32(s.parse()?))
     }
 
     pub const fn const_mul(&self, rhs: &Self) -> Self {
@@ -183,6 +181,14 @@ impl Neg for Pico8Num {
 
     fn neg(self) -> Self::Output {
         self.const_neg()
+    }
+}
+
+impl FromStr for Pico8Num {
+    type Err = ParseFloatError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self::from_f32(s.parse()?))
     }
 }
 
