@@ -751,6 +751,17 @@ impl Block {
         lines.join("\n")
     }
 
+    /// Create a new block with the given instructions, preserving terminator and hint_normalize.
+    ///
+    /// This is useful when transforming a block's instructions while keeping its control flow.
+    pub fn with_instructions(&self, instructions: Vec<(LocalId, Instruction)>) -> Self {
+        Block {
+            instructions,
+            terminator: self.terminator.clone(),
+            hint_normalize: self.hint_normalize,
+        }
+    }
+
     /// Test helper to create a block with given instructions and terminator.
     /// Sets `hint_normalize` to false by default.
     #[cfg(test)]

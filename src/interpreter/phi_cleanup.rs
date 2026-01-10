@@ -124,13 +124,13 @@ fn cleanup_block_phis(
         }
     }
 
-    let new_block = Block {
-        instructions: new_instructions,
-        terminator: block.terminator.clone(),
-        hint_normalize: block.hint_normalize,
-    };
-
-    (new_block, branches_removed, phis_collapsed, phis_emptied, collapsed_mappings)
+    (
+        block.with_instructions(new_instructions),
+        branches_removed,
+        phis_collapsed,
+        phis_emptied,
+        collapsed_mappings,
+    )
 }
 
 /// Compute the transitive closure of a mapping.

@@ -168,13 +168,7 @@ fn resolve_calls_in_block(block: &Block, global_closures: &GlobalClosureMap) -> 
         }
     }
 
-    let new_block = Block {
-        instructions: new_instructions,
-        terminator: block.terminator.clone(),
-        hint_normalize: block.hint_normalize,
-    };
-
-    (new_block, resolved_count)
+    (block.with_instructions(new_instructions), resolved_count)
 }
 
 /// Build a GlobalClosureMap from function definitions.

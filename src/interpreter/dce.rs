@@ -173,11 +173,7 @@ pub fn eliminate_dead_code(cfg: &Cfg) -> DceResult {
             }
         }
 
-        Block {
-            instructions: new_instructions,
-            terminator: block.terminator.clone(),
-            hint_normalize: block.hint_normalize,
-        }
+        block.with_instructions(new_instructions)
     }
 
     let new_entry = filter_block(&cfg.entry, &used_locals, &mut total_removed);
