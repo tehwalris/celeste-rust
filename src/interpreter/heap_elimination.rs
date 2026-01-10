@@ -214,6 +214,13 @@ impl HeapShape {
             );
         }
 
+        // Collect from args
+        for (index, maybe_shape) in self.args.iter().enumerate() {
+            if let Some(shape) = maybe_shape {
+                self.collect_constants_recursive(HeapPath::Arg(index), shape, &mut constants);
+            }
+        }
+
         constants
     }
 
@@ -1746,6 +1753,188 @@ mod tests {
                     .filter(|(_, instr)| matches!(instr, Instruction::Load { .. }))
                     .count();
                 assert_eq!(load_count, 0, "Expected no Loads (leaf slots map directly to SSA vars), got {}", load_count);
+            }
+            other => panic!("Expected Success, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_constant_arg_load() {
+        // CFG: Load(arg0) - arg0 is a constant
+        // arg0 is a constant (42), so Load should become NumberConstant(42)
+        let arg0_id = LocalId::from(10);
+
+        let entry = Block {
+            instructions: vec![(
+                LocalId::from(0),
+                Instruction::Load {
+                    source: arg0_id,
+                },
+            )],
+            terminator: (
+                LocalId::from(1),
+                Terminator::Return {
+                    value: Some(LocalId::from(0)),
+                },
+            ),
+            hint_normalize: false,
+        };
+
+        let cfg = Cfg {
+            entry,
+            named: FxHashMap::default(),
+        };
+
+        let mut shape = HeapShape::new();
+        // arg0 = 42 (constant)
+        shape.args = vec![Some(ValueShape::Constant(Pico8Num::from_i16(42)))];
+
+        let local_gen = make_local_gen();
+        let label_gen = make_label_gen();
+
+        let arg_ids = vec![Some(arg0_id)];
+
+        let result = eliminate_heap(&cfg, &shape, &arg_ids, local_gen, label_gen, DeoptMode::Insert);
+        match result {
+            HeapEliminationResult::Success(transformed) => {
+                // Check that the Load was replaced with NumberConstant
+                let instructions = &transformed.cfg.entry.instructions;
+                let has_number_constant = instructions.iter().any(|(_, instr)| {
+                    matches!(instr, Instruction::NumberConstant { value } if *value == Pico8Num::from_i16(42))
+                });
+                assert!(
+                    has_number_constant,
+                    "Expected NumberConstant(42) in transformed CFG"
+                );
+                // Should NOT have Load instruction
+                let has_load = instructions
+                    .iter()
+                    .any(|(_, instr)| matches!(instr, Instruction::Load { .. }));
+                assert!(!has_load, "Load should be replaced with NumberConstant");
+            }
+            other => panic!("Expected Success, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_constant_arg_write_aborts() {
+        // CFG: Store(arg0, value) - arg0 is a constant
+        // Writing to a constant argument should cause ConstantViolation
+        let arg0_id = LocalId::from(10);
+
+        let entry = Block {
+            instructions: vec![
+                (
+                    LocalId::from(0),
+                    Instruction::NumberConstant {
+                        value: Pico8Num::from_i16(99),
+                    },
+                ),
+                (
+                    LocalId::from(1),
+                    Instruction::Store {
+                        target: arg0_id,
+                        source: LocalId::from(0),
+                    },
+                ),
+            ],
+            terminator: (LocalId::from(2), Terminator::Return { value: None }),
+            hint_normalize: false,
+        };
+
+        let cfg = Cfg {
+            entry,
+            named: FxHashMap::default(),
+        };
+
+        let mut shape = HeapShape::new();
+        // arg0 = 42 (constant)
+        shape.args = vec![Some(ValueShape::Constant(Pico8Num::from_i16(42)))];
+
+        let local_gen = make_local_gen();
+        let label_gen = make_label_gen();
+
+        let arg_ids = vec![Some(arg0_id)];
+
+        let result = eliminate_heap(&cfg, &shape, &arg_ids, local_gen, label_gen, DeoptMode::Insert);
+        match result {
+            HeapEliminationResult::ConstantViolation(msg) => {
+                // The message should mention the arg (either "arg0" or "arg[0]")
+                assert!(
+                    msg.contains("arg"),
+                    "Error should mention arg: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected ConstantViolation, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_constant_arg_field_load() {
+        // CFG: GetField(arg0, "x") -> Load
+        // arg0.x is a constant (7), so Load should become NumberConstant(7)
+        let arg0_id = LocalId::from(10);
+
+        let entry = Block {
+            instructions: vec![
+                (
+                    LocalId::from(0),
+                    Instruction::GetField {
+                        receiver: arg0_id,
+                        field: "x".to_string(),
+                        create_if_missing: false,
+                    },
+                ),
+                (
+                    LocalId::from(1),
+                    Instruction::Load {
+                        source: LocalId::from(0),
+                    },
+                ),
+            ],
+            terminator: (
+                LocalId::from(2),
+                Terminator::Return {
+                    value: Some(LocalId::from(1)),
+                },
+            ),
+            hint_normalize: false,
+        };
+
+        let cfg = Cfg {
+            entry,
+            named: FxHashMap::default(),
+        };
+
+        let mut shape = HeapShape::new();
+        // arg0 = { x: Constant(7) }
+        let mut arg0_fields = FxHashMap::default();
+        arg0_fields.insert("x".to_string(), ValueShape::Constant(Pico8Num::from_i16(7)));
+        shape.args = vec![Some(ValueShape::Table(arg0_fields))];
+
+        let local_gen = make_local_gen();
+        let label_gen = make_label_gen();
+
+        let arg_ids = vec![Some(arg0_id)];
+
+        let result = eliminate_heap(&cfg, &shape, &arg_ids, local_gen, label_gen, DeoptMode::Insert);
+        match result {
+            HeapEliminationResult::Success(transformed) => {
+                // Check that the Load was replaced with NumberConstant
+                let instructions = &transformed.cfg.entry.instructions;
+                let has_number_constant = instructions.iter().any(|(_, instr)| {
+                    matches!(instr, Instruction::NumberConstant { value } if *value == Pico8Num::from_i16(7))
+                });
+                assert!(
+                    has_number_constant,
+                    "Expected NumberConstant(7) in transformed CFG"
+                );
+                // Should NOT have Load instruction
+                let has_load = instructions
+                    .iter()
+                    .any(|(_, instr)| matches!(instr, Instruction::Load { .. }));
+                assert!(!has_load, "Load should be replaced with NumberConstant");
             }
             other => panic!("Expected Success, got {:?}", other),
         }
