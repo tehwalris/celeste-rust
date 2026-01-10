@@ -204,21 +204,7 @@ fn remap_block_locals(block: &Block, mappings: &FxHashMap<LocalId, LocalId>) -> 
 
     let new_terminator = (
         block.terminator_id(),
-        match block.terminator_kind() {
-            Terminator::Return { value: Some(v) } => Terminator::Return { value: Some(remap(*v)) },
-            Terminator::Return { value: None } => Terminator::Return { value: None },
-            Terminator::UnconditionalBranch { target } => {
-                Terminator::UnconditionalBranch { target: target.clone() }
-            }
-            Terminator::ConditionalBranch { condition, true_target, false_target } => {
-                Terminator::ConditionalBranch {
-                    condition: remap(*condition),
-                    true_target: true_target.clone(),
-                    false_target: false_target.clone(),
-                }
-            }
-            Terminator::Deopt { reason } => Terminator::Deopt { reason: reason.clone() },
-        },
+        block.terminator_kind().map_local_ids(remap),
     );
 
     Block {
