@@ -1074,7 +1074,7 @@ mod tests {
         let entry = Block::new_for_test(
             vec![
                 (LocalId::from(0), Instruction::Alloc),
-                (LocalId::from(100), Instruction::BoolConstant { value: true }),  // condition
+                (LocalId::from(100), Instruction::bool_const(true)), // condition
             ],
             (LocalId::from(101), Terminator::ConditionalBranch {
                 condition: LocalId::from(100),

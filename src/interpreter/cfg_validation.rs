@@ -484,13 +484,10 @@ mod tests {
         named.insert(
             Label::from("join".to_string()),
             Block::new_for_test(
-                vec![
-                    (LocalId::from(2), Instruction::Phi {
-                        branches: vec![
-                            (Label::from("nonexistent".to_string()), LocalId::from(0)),
-                        ],
-                    }),
-                ],
+                vec![(
+                    LocalId::from(2),
+                    Instruction::phi(vec![(Label::from("nonexistent".to_string()), LocalId::from(0))]),
+                )],
                 (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
             ),
         );
@@ -532,12 +529,13 @@ mod tests {
             Block::new_for_test(
                 vec![
                     // Phi merges values from two branches
-                    (LocalId::from(3), Instruction::Phi {
-                        branches: vec![
+                    (
+                        LocalId::from(3),
+                        Instruction::phi(vec![
                             (Label::from("__entry".to_string()), LocalId::from(0)),
                             (Label::from("other".to_string()), LocalId::from(2)),
-                        ],
-                    }),
+                        ]),
+                    ),
                     // This is the type error being tested: Load from Phi result.
                     // Phi produces a VALUE, not a pointer, so this should be flagged.
                     (LocalId::from(4), Instruction::Load { source: LocalId::from(3) }),
@@ -686,12 +684,13 @@ mod tests {
             Block::new_for_test(
                 vec![
                     // Phi references "unreachable" which exists but is NOT a predecessor of "join"
-                    (LocalId::from(4), Instruction::Phi {
-                        branches: vec![
+                    (
+                        LocalId::from(4),
+                        Instruction::phi(vec![
                             (Label::from("__entry".to_string()), LocalId::from(0)),
                             (Label::from("unreachable".to_string()), LocalId::from(2)),
-                        ],
-                    }),
+                        ]),
+                    ),
                 ],
                 (LocalId::from(5), Terminator::Return { value: Some(LocalId::from(4)) }),
             ),

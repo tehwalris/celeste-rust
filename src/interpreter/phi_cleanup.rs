@@ -321,9 +321,7 @@ mod tests {
         let block_b = Block::new_for_test(
             vec![(
                 LocalId::from(2),
-                Instruction::Phi {
-                    branches: vec![(Label::from("block_a".to_string()), LocalId::from(0))],
-                },
+                Instruction::phi(vec![(Label::from("block_a".to_string()), LocalId::from(0))]),
             )],
             (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
         );
@@ -361,9 +359,7 @@ mod tests {
         // Join has Phi(A: %1, B: %2) - should remove A branch
 
         let entry = Block::new_for_test(
-            vec![
-                (LocalId::from(0), Instruction::BoolConstant { value: true }),
-            ],
+            vec![(LocalId::from(0), Instruction::bool_const(true))],
             (
                 LocalId::from(99),
                 Terminator::ConditionalBranch {
@@ -390,12 +386,10 @@ mod tests {
         let join = Block::new_for_test(
             vec![(
                 LocalId::from(3),
-                Instruction::Phi {
-                    branches: vec![
-                        (Label::from("block_a".to_string()), LocalId::from(1)),
-                        (Label::from("block_b".to_string()), LocalId::from(2)),
-                    ],
-                },
+                Instruction::phi(vec![
+                    (Label::from("block_a".to_string()), LocalId::from(1)),
+                    (Label::from("block_b".to_string()), LocalId::from(2)),
+                ]),
             )],
             (LocalId::from(12), Terminator::Return { value: Some(LocalId::from(3)) }),
         );
@@ -430,7 +424,7 @@ mod tests {
         // Join has Phi(A, B) - becomes empty!
 
         let entry = Block::new_for_test(
-            vec![(LocalId::from(0), Instruction::BoolConstant { value: true })],
+            vec![(LocalId::from(0), Instruction::bool_const(true))],
             (
                 LocalId::from(99),
                 Terminator::ConditionalBranch {
@@ -454,12 +448,10 @@ mod tests {
         let join = Block::new_for_test(
             vec![(
                 LocalId::from(3),
-                Instruction::Phi {
-                    branches: vec![
-                        (Label::from("block_a".to_string()), LocalId::from(1)),
-                        (Label::from("block_b".to_string()), LocalId::from(2)),
-                    ],
-                },
+                Instruction::phi(vec![
+                    (Label::from("block_a".to_string()), LocalId::from(1)),
+                    (Label::from("block_b".to_string()), LocalId::from(2)),
+                ]),
             )],
             (LocalId::from(12), Terminator::Return { value: Some(LocalId::from(3)) }),
         );
@@ -505,7 +497,7 @@ mod tests {
         );
 
         let dispatch = Block::new_for_test(
-            vec![(LocalId::from(0), Instruction::BoolConstant { value: true })],
+            vec![(LocalId::from(0), Instruction::bool_const(true))],
             (
                 LocalId::from(98),
                 Terminator::ConditionalBranch {
@@ -541,13 +533,11 @@ mod tests {
         let join = Block::new_for_test(
             vec![(
                 LocalId::from(4),
-                Instruction::Phi {
-                    branches: vec![
-                        (Label::from("block_a".to_string()), LocalId::from(1)),
-                        (Label::from("block_b".to_string()), LocalId::from(2)),
-                        (Label::from("block_c".to_string()), LocalId::from(3)),
-                    ],
-                },
+                Instruction::phi(vec![
+                    (Label::from("block_a".to_string()), LocalId::from(1)),
+                    (Label::from("block_b".to_string()), LocalId::from(2)),
+                    (Label::from("block_c".to_string()), LocalId::from(3)),
+                ]),
             )],
             (LocalId::from(13), Terminator::Return { value: Some(LocalId::from(4)) }),
         );
@@ -602,14 +592,9 @@ mod tests {
             vec![
                 (
                     LocalId::from(1),
-                    Instruction::Phi {
-                        branches: vec![(Label::entry(), LocalId::from(0))],
-                    },
+                    Instruction::phi(vec![(Label::entry(), LocalId::from(0))]),
                 ),
-                (
-                    LocalId::from(2),
-                    Instruction::num_const(2),
-                ),
+                (LocalId::from(2), Instruction::num_const(2)),
                 (
                     LocalId::from(3),
                     Instruction::BinaryOp {
@@ -666,9 +651,7 @@ mod tests {
         let block_b = Block::new_for_test(
             vec![(
                 LocalId::from(2),
-                Instruction::Phi {
-                    branches: vec![(Label::from("block_a".to_string()), LocalId::from(1))],
-                },
+                Instruction::phi(vec![(Label::from("block_a".to_string()), LocalId::from(1))]),
             )],
             (LocalId::from(97), Terminator::UnconditionalBranch { target: Label::from("block_c".to_string()) }),
         );
@@ -679,9 +662,7 @@ mod tests {
             vec![
                 (
                     LocalId::from(3),
-                    Instruction::Phi {
-                        branches: vec![(Label::from("block_b".to_string()), LocalId::from(2))],
-                    },
+                    Instruction::phi(vec![(Label::from("block_b".to_string()), LocalId::from(2))]),
                 ),
                 // This BinaryOp uses %3 (the Phi result), which should become %1 after transitive remapping
                 (
@@ -738,7 +719,7 @@ mod tests {
         // - The Phi should have the A branch removed, collapsing to just %2
 
         let entry = Block::new_for_test(
-            vec![(LocalId::from(0), Instruction::BoolConstant { value: true })],
+            vec![(LocalId::from(0), Instruction::bool_const(true))],
             (
                 LocalId::from(99),
                 Terminator::ConditionalBranch {
@@ -764,12 +745,10 @@ mod tests {
         let join = Block::new_for_test(
             vec![(
                 LocalId::from(3),
-                Instruction::Phi {
-                    branches: vec![
-                        (Label::from("block_a".to_string()), LocalId::from(1)),
-                        (Label::from("block_b".to_string()), LocalId::from(2)),
-                    ],
-                },
+                Instruction::phi(vec![
+                    (Label::from("block_a".to_string()), LocalId::from(1)),
+                    (Label::from("block_b".to_string()), LocalId::from(2)),
+                ]),
             )],
             (LocalId::from(12), Terminator::Return { value: Some(LocalId::from(3)) }),
         );
@@ -820,7 +799,7 @@ mod tests {
         // The Phi should become empty (phis_emptied = 1)
 
         let entry = Block::new_for_test(
-            vec![(LocalId::from(0), Instruction::BoolConstant { value: true })],
+            vec![(LocalId::from(0), Instruction::bool_const(true))],
             (
                 LocalId::from(99),
                 Terminator::ConditionalBranch {
@@ -844,12 +823,10 @@ mod tests {
         let join = Block::new_for_test(
             vec![(
                 LocalId::from(3),
-                Instruction::Phi {
-                    branches: vec![
-                        (Label::from("block_a".to_string()), LocalId::from(1)),
-                        (Label::from("block_b".to_string()), LocalId::from(2)),
-                    ],
-                },
+                Instruction::phi(vec![
+                    (Label::from("block_a".to_string()), LocalId::from(1)),
+                    (Label::from("block_b".to_string()), LocalId::from(2)),
+                ]),
             )],
             (LocalId::from(12), Terminator::Return { value: Some(LocalId::from(3)) }),
         );

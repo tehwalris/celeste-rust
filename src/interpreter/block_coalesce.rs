@@ -302,9 +302,7 @@ mod tests {
         // Should NOT coalesce (block_a has 2 predecessors)
 
         let entry = Block::new_for_test(
-            vec![
-                (LocalId::from(0), Instruction::BoolConstant { value: true }),
-            ],
+            vec![(LocalId::from(0), Instruction::bool_const(true))],
             (
                 LocalId::from(1),
                 Terminator::ConditionalBranch {

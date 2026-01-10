@@ -277,6 +277,24 @@ impl Instruction {
         }
     }
 
+    /// Test helper to create a BoolConstant.
+    ///
+    /// This is a convenience method for tests that need to create boolean
+    /// constants. It's more concise than `Instruction::BoolConstant { value: true }`.
+    #[cfg(test)]
+    pub fn bool_const(value: bool) -> Self {
+        Self::BoolConstant { value }
+    }
+
+    /// Test helper to create a Phi instruction.
+    ///
+    /// This is a convenience method for tests that need to create phi
+    /// instructions. It's more concise than the verbose struct literal.
+    #[cfg(test)]
+    pub fn phi(branches: Vec<(Label, LocalId)>) -> Self {
+        Self::Phi { branches }
+    }
+
     /// Get all local IDs used by this instruction.
     ///
     /// This returns all LocalIds that this instruction reads from (its operands).

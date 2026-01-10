@@ -443,9 +443,7 @@ mod tests {
         // Since we don't track through Phis, the call shouldn't resolve
 
         let entry = Block::new_for_test(
-            vec![
-                (LocalId::from(0), Instruction::BoolConstant { value: true }),
-            ],
+            vec![(LocalId::from(0), Instruction::bool_const(true))],
             (LocalId::from(99), Terminator::ConditionalBranch {
                 condition: LocalId::from(0),
                 true_target: Label::from("true_branch".to_string()),
