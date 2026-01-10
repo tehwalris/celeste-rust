@@ -555,7 +555,8 @@ mod tests {
                             (Label::from("other".to_string()), LocalId::from(2)),
                         ],
                     }),
-                    // BUG: Load from Phi result - Phi is a VALUE, not a pointer!
+                    // This is the type error being tested: Load from Phi result.
+                    // Phi produces a VALUE, not a pointer, so this should be flagged.
                     (LocalId::from(4), Instruction::Load { source: LocalId::from(3) }),
                 ],
                 terminator: (LocalId::from(5), Terminator::Return { value: Some(LocalId::from(4)) }),
@@ -666,7 +667,8 @@ mod tests {
                 instructions: vec![
                     (LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(42) }),
                     (LocalId::from(1), Instruction::NumberConstant { value: Pico8Num::from_i16(99) }),
-                    // BUG: Store to a NumberConstant - it's a VALUE, not a pointer!
+                    // This is the type error being tested: Store to a NumberConstant.
+                    // NumberConstant produces a VALUE, not a pointer, so this should be flagged.
                     (LocalId::from(2), Instruction::Store { target: LocalId::from(0), source: LocalId::from(1) }),
                 ],
                 terminator: (LocalId::from(3), Terminator::Return { value: None }),
