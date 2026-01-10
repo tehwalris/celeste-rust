@@ -733,6 +733,23 @@ impl Block {
 
         (phi_instructions, non_phi_instructions)
     }
+
+    /// Format this block as a multi-line string for debugging.
+    ///
+    /// The output includes each instruction with its LocalId prefix and the terminator.
+    /// Lines are indented with two spaces. This is suitable for test output and debugging.
+    pub fn format(&self, name: &str) -> String {
+        let mut lines = vec![format!("Block '{}':", name)];
+        for (id, instr) in &self.instructions {
+            lines.push(format!("  %{} = {}", usize::from(*id), instr.format()));
+        }
+        lines.push(format!(
+            "  terminator: %{} = {}",
+            usize::from(self.terminator_id()),
+            self.terminator_kind().format()
+        ));
+        lines.join("\n")
+    }
 }
 
 /// Identifies a block in a CFG, distinguishing between the entry block and named blocks.
@@ -816,6 +833,19 @@ impl Cfg {
         }
 
         preds
+    }
+
+    /// Format this CFG as a multi-line string for debugging.
+    ///
+    /// The output includes all blocks with their instructions and terminators.
+    /// Blocks are separated by blank lines. This is suitable for test output
+    /// and debugging.
+    pub fn format(&self) -> String {
+        let mut parts = vec![self.entry.format("entry")];
+        for (label, block) in &self.named {
+            parts.push(block.format(label.as_str()));
+        }
+        parts.join("\n\n")
     }
 }
 

@@ -407,19 +407,6 @@ mod tests {
 
     /// Helper to print a CFG for debugging
     fn print_cfg(cfg: &Cfg) {
-        fn print_block(name: &str, block: &crate::ir::Block) {
-            eprintln!("Block '{}':", name);
-            for (id, instr) in &block.instructions {
-                eprintln!("  %{} = {}", usize::from(*id), instr.format());
-            }
-            eprintln!("  terminator: %{} = {}",
-                usize::from(block.terminator_id()),
-                block.terminator_kind().format());
-        }
-
-        print_block("entry", &cfg.entry);
-        for (label, block) in &cfg.named {
-            print_block(label.as_str(), block);
-        }
+        eprintln!("{}", cfg.format());
     }
 }
