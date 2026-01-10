@@ -15,7 +15,7 @@ mod tests {
     use crate::interpreter::call_resolution::build_global_closure_map_from_fun_defs;
     use crate::interpreter::cfg_analysis::{
         analyze_cfg, run_optimization_pipeline_with_interprocedural,
-        run_optimization_pipeline_with_interprocedural_lenient,
+        run_optimization_pipeline_with_interprocedural_lenient, InterproceduralContext,
     };
     use crate::interpreter::cfg_validation::validate_cfg_with_args;
     use crate::ir::{Cfg, FunDef, GlobalId};
@@ -181,12 +181,15 @@ mod tests {
             let analysis = analyze_cfg(&fun_def.cfg);
             let arg_shapes = vec![]; // No special shapes for these simple tests
 
+            let ctx = InterproceduralContext {
+                global_closure_map: &global_closure_map,
+                optimized_fun_defs: &optimized_fun_def_map,
+                builtin_set: Some(&builtin_set),
+            };
             let (result, cfgs) = run_optimization_pipeline_with_interprocedural(
                 &fun_def.cfg,
                 &analysis,
-                &global_closure_map,
-                &optimized_fun_def_map,
-                Some(&builtin_set),
+                &ctx,
                 &fun_def.arg_ids,
                 &arg_shapes,
             );
@@ -276,12 +279,15 @@ mod tests {
             }
 
             // Use lenient version to avoid panics on validation issues in some complex functions
+            let ctx = InterproceduralContext {
+                global_closure_map: &global_closure_map,
+                optimized_fun_defs: &optimized_fun_def_map,
+                builtin_set: Some(&builtin_set),
+            };
             let (result, _) = run_optimization_pipeline_with_interprocedural_lenient(
                 &fun_def.cfg,
                 &analysis,
-                &global_closure_map,
-                &optimized_fun_def_map,
-                Some(&builtin_set),
+                &ctx,
                 &fun_def.arg_ids,
                 &[],
             );

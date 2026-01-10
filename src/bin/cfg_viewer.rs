@@ -20,7 +20,8 @@ use celeste_rust::interpreter::builtin_resolution::BuiltinSet;
 use celeste_rust::interpreter::cfg_analysis::{
     analyze_cfg, optimize_all_functions, run_optimization_pipeline_with_interprocedural_lenient,
     serialize_pipeline_step, BlockCoalesceStatus, CfgTestCase, CfgTestCases, DceStatus,
-    HeapEliminationStatus, Mem2RegStatus, CallResolutionStatus, InliningStatus, SerializableCfg,
+    HeapEliminationStatus, InterproceduralContext, Mem2RegStatus, CallResolutionStatus,
+    InliningStatus, SerializableCfg,
 };
 use celeste_rust::interpreter::call_resolution::build_global_closure_map_from_fun_defs;
 use celeste_rust::interpreter::heap_elimination::ValueShape;
@@ -167,12 +168,15 @@ fn main() -> Result<()> {
         // Run optimization pipeline with inter-procedural passes
         // Uses pre-optimized callees so inlined code is already optimized
         // Using lenient version that warns on validation errors instead of panicking
+        let ctx = InterproceduralContext {
+            global_closure_map: &global_closure_map,
+            optimized_fun_defs: &optimized_fun_def_map,
+            builtin_set: Some(&builtin_set),
+        };
         let (opt_result, cfgs) = run_optimization_pipeline_with_interprocedural_lenient(
             &fun_def.cfg,
             &analysis,
-            &global_closure_map,
-            &optimized_fun_def_map,
-            Some(&builtin_set),
+            &ctx,
             &fun_def.arg_ids,
             &arg_shapes,
         );

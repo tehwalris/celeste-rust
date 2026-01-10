@@ -232,6 +232,20 @@ pub enum DeoptBuiltinsStatus {
     NoChange,
 }
 
+/// Context for inter-procedural optimization passes.
+///
+/// This bundles the various maps and information needed for call resolution,
+/// inlining, and other interprocedural analyses into a single struct to reduce
+/// parameter counts and improve code readability.
+pub struct InterproceduralContext<'a> {
+    /// Mapping from global names to their closure definitions
+    pub global_closure_map: &'a crate::interpreter::call_resolution::GlobalClosureMap,
+    /// Pre-optimized function definitions available for inlining
+    pub optimized_fun_defs: &'a FxHashMap<GlobalId, FunDef>,
+    /// Optional set of builtin functions to resolve
+    pub builtin_set: Option<&'a crate::interpreter::builtin_resolution::BuiltinSet>,
+}
+
 /// Counts of each instruction type in a CFG.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct InstructionCounts {
@@ -746,20 +760,17 @@ fn build_celeste_heap_shape(accessed_globals: &[String]) -> crate::interpreter::
 /// 5. heap_elimination: Eliminate global heap operations with known shapes
 ///
 /// # Arguments
+/// * `ctx` - Inter-procedural context containing closure maps and function definitions
 /// * `arg_ids` - LocalIds for function arguments (Some if defined, None if unused/varargs)
 /// * `arg_shapes` - Optional shapes for function arguments (e.g., `self` in method calls)
 pub fn run_optimization_pipeline_with_interprocedural(
     cfg: &Cfg,
     analysis: &CfgAnalysisResult,
-    global_closure_map: &crate::interpreter::call_resolution::GlobalClosureMap,
-    optimized_fun_defs: &FxHashMap<GlobalId, FunDef>,
-    builtin_set: Option<&crate::interpreter::builtin_resolution::BuiltinSet>,
+    ctx: &InterproceduralContext<'_>,
     arg_ids: &[Option<LocalId>],
     arg_shapes: &[Option<crate::interpreter::heap_elimination::ValueShape>],
 ) -> (OptimizationResult, OptimizationCfgs) {
-    run_optimization_pipeline_with_interprocedural_inner(
-        cfg, analysis, global_closure_map, optimized_fun_defs, builtin_set, arg_ids, arg_shapes, true,
-    )
+    run_optimization_pipeline_with_interprocedural_inner(cfg, analysis, ctx, arg_ids, arg_shapes, true)
 }
 
 /// Version of run_optimization_pipeline_with_interprocedural that allows disabling strict validation.
@@ -767,23 +778,17 @@ pub fn run_optimization_pipeline_with_interprocedural(
 pub fn run_optimization_pipeline_with_interprocedural_lenient(
     cfg: &Cfg,
     analysis: &CfgAnalysisResult,
-    global_closure_map: &crate::interpreter::call_resolution::GlobalClosureMap,
-    optimized_fun_defs: &FxHashMap<GlobalId, FunDef>,
-    builtin_set: Option<&crate::interpreter::builtin_resolution::BuiltinSet>,
+    ctx: &InterproceduralContext<'_>,
     arg_ids: &[Option<LocalId>],
     arg_shapes: &[Option<crate::interpreter::heap_elimination::ValueShape>],
 ) -> (OptimizationResult, OptimizationCfgs) {
-    run_optimization_pipeline_with_interprocedural_inner(
-        cfg, analysis, global_closure_map, optimized_fun_defs, builtin_set, arg_ids, arg_shapes, false,
-    )
+    run_optimization_pipeline_with_interprocedural_inner(cfg, analysis, ctx, arg_ids, arg_shapes, false)
 }
 
 fn run_optimization_pipeline_with_interprocedural_inner(
     cfg: &Cfg,
     analysis: &CfgAnalysisResult,
-    global_closure_map: &crate::interpreter::call_resolution::GlobalClosureMap,
-    optimized_fun_defs: &FxHashMap<GlobalId, FunDef>,
-    builtin_set: Option<&crate::interpreter::builtin_resolution::BuiltinSet>,
+    ctx: &InterproceduralContext<'_>,
     arg_ids: &[Option<LocalId>],
     arg_shapes: &[Option<crate::interpreter::heap_elimination::ValueShape>],
     strict_validation: bool,
@@ -861,7 +866,7 @@ fn run_optimization_pipeline_with_interprocedural_inner(
     let cfg_for_builtin_res = after_mem2reg.as_ref().unwrap_or(cfg);
 
     // Stage 1b: builtin resolution - convert GetGlobal+Load+Call to CallBuiltin
-    let after_builtin_resolution = if let Some(builtins) = builtin_set {
+    let after_builtin_resolution = if let Some(builtins) = ctx.builtin_set {
         match resolve_builtins(cfg_for_builtin_res, builtins) {
             BuiltinResolutionResult::Success { cfg: new_cfg, calls_resolved } => {
                 cfgs.steps.push(PipelineStep {
@@ -919,7 +924,7 @@ fn run_optimization_pipeline_with_interprocedural_inner(
             let mut shape = build_celeste_heap_shape(&loop_analysis.accessed_globals);
             shape.args = arg_shapes.to_vec();
 
-            let result = resolve_calls_via_slots(&current_cfg, &shape, arg_ids, global_closure_map);
+            let result = resolve_calls_via_slots(&current_cfg, &shape, arg_ids, ctx.global_closure_map);
             if result.calls_resolved > 0 {
                 total_calls_resolved += result.calls_resolved;
                 current_cfg = result.cfg;
@@ -938,7 +943,7 @@ fn run_optimization_pipeline_with_interprocedural_inner(
         }
 
         // Re-run builtin resolution to pick up any new calls from inlined code
-        if let Some(builtins) = builtin_set {
+        if let Some(builtins) = ctx.builtin_set {
             current_cfg = match resolve_builtins(&current_cfg, builtins) {
                 BuiltinResolutionResult::Success { cfg, .. } => cfg,
                 BuiltinResolutionResult::NoChange => current_cfg,
@@ -946,7 +951,7 @@ fn run_optimization_pipeline_with_interprocedural_inner(
         }
 
         // Try to inline resolved calls
-        match inline_calls(&current_cfg, optimized_fun_defs, &mut local_gen, &mut label_gen) {
+        match inline_calls(&current_cfg, ctx.optimized_fun_defs, &mut local_gen, &mut label_gen) {
             InliningResult::Success { cfg: new_cfg, calls_inlined } => {
                 current_cfg = new_cfg.clone();
                 total_calls_inlined += calls_inlined;
@@ -1972,13 +1977,18 @@ mod tests {
         // Create builtin set with "max"
         let builtin_set: BuiltinSet = ["max"].iter().map(|s| s.to_string()).collect();
 
+        // Create interprocedural context
+        let ctx = InterproceduralContext {
+            global_closure_map: &global_closure_map,
+            optimized_fun_defs: &optimized_fun_defs,
+            builtin_set: Some(&builtin_set),
+        };
+
         // Run the pipeline with arg_ids for a and b
         let (result, cfgs) = run_optimization_pipeline_with_interprocedural(
             &cfg,
             &analysis,
-            &global_closure_map,
-            &optimized_fun_defs,
-            Some(&builtin_set),
+            &ctx,
             &[Some(a_id), Some(b_id)],  // arg_ids for a and b
             &[],  // no arg_shapes for this test
         );
