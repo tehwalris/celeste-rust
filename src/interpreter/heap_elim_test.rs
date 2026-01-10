@@ -439,6 +439,17 @@ mod tests {
         run_simple_field_heap_elim_with_original().1
     }
 
+    /// Converts unpack_slots from the transformed CFG into the format expected by ssa_execute.
+    fn make_slot_mappings(
+        transformed: &crate::interpreter::heap_elimination::TransformedCfg,
+    ) -> Vec<(String, LocalId)> {
+        transformed
+            .unpack_slots
+            .iter()
+            .map(|(slot, id)| (slot.to_string(), *id))
+            .collect()
+    }
+
     /// Test execution of heap-eliminated CFG with SSA interpreter
     #[test]
     fn test_ssa_execution_positive_x() {
@@ -448,9 +459,7 @@ mod tests {
         let mut initial_slots = FxHashMap::default();
         initial_slots.insert("arg0.x".to_string(), SsaValue::Num(Pico8Num::from_i16(5)));
 
-        let slot_mappings: Vec<_> = transformed.unpack_slots.iter()
-            .map(|(slot, id)| (slot.to_string(), *id))
-            .collect();
+        let slot_mappings = make_slot_mappings(&transformed);
 
         let exec_result = ssa_execute(&transformed.cfg, initial_slots, &slot_mappings);
 
@@ -475,9 +484,7 @@ mod tests {
         let mut initial_slots = FxHashMap::default();
         initial_slots.insert("arg0.x".to_string(), SsaValue::Num(Pico8Num::from_i16(-3)));
 
-        let slot_mappings: Vec<_> = transformed.unpack_slots.iter()
-            .map(|(slot, id)| (slot.to_string(), *id))
-            .collect();
+        let slot_mappings = make_slot_mappings(&transformed);
 
         let exec_result = ssa_execute(&transformed.cfg, initial_slots, &slot_mappings);
 
@@ -499,15 +506,12 @@ mod tests {
     #[test]
     fn test_ssa_execution_random() {
         let transformed = run_simple_field_heap_elim();
+        let slot_mappings = make_slot_mappings(&transformed);
 
         // Test with various values
         for x in [-100, -1, 0, 1, 100] {
             let mut initial_slots = FxHashMap::default();
             initial_slots.insert("arg0.x".to_string(), SsaValue::Num(Pico8Num::from_i16(x)));
-
-            let slot_mappings: Vec<_> = transformed.unpack_slots.iter()
-                .map(|(slot, id)| (slot.to_string(), *id))
-                .collect();
 
             let exec_result = ssa_execute(&transformed.cfg, initial_slots, &slot_mappings);
 
@@ -538,6 +542,7 @@ mod tests {
     #[test]
     fn test_equivalence_random_inputs() {
         let transformed = run_simple_field_heap_elim();
+        let slot_mappings = make_slot_mappings(&transformed);
 
         println!("\n=== EQUIVALENCE TEST ===");
 
@@ -558,10 +563,6 @@ mod tests {
             // Execute transformed CFG with SSA interpreter
             let mut initial_slots = FxHashMap::default();
             initial_slots.insert("arg0.x".to_string(), SsaValue::Num(x_num));
-
-            let slot_mappings: Vec<_> = transformed.unpack_slots.iter()
-                .map(|(slot, id)| (slot.to_string(), *id))
-                .collect();
 
             let ssa_result = ssa_execute(&transformed.cfg, initial_slots, &slot_mappings);
 
