@@ -603,6 +603,45 @@ enum BlockTransformResult {
     ConstantViolation(String),
 }
 
+impl BlockTransformResult {
+    /// Convert a transform result into a Block, updating counters as a side effect.
+    ///
+    /// Returns `Ok(Block)` for Success, NeedsDeopt, and Stopped variants.
+    /// Returns `Err(msg)` for ConstantViolation, which should abort the pass.
+    ///
+    /// # Arguments
+    /// * `hint_normalize` - The hint_normalize value from the original block
+    /// * `deopt_count` - Mutable counter for number of deopts
+    /// * `calls_resolved` - Mutable counter for total calls resolved
+    fn into_block(
+        self,
+        hint_normalize: bool,
+        deopt_count: &mut usize,
+        total_calls_resolved: &mut usize,
+    ) -> Result<Block, String> {
+        match self {
+            BlockTransformResult::Success { block, calls_resolved } => {
+                *total_calls_resolved += calls_resolved;
+                Ok(block)
+            }
+            BlockTransformResult::NeedsDeopt { instructions, reason, terminator_id, calls_resolved } => {
+                *total_calls_resolved += calls_resolved;
+                *deopt_count += 1;
+                Ok(Block {
+                    instructions,
+                    terminator: (terminator_id, Terminator::Deopt { reason }),
+                    hint_normalize,
+                })
+            }
+            BlockTransformResult::Stopped { block, calls_resolved, reason: _ } => {
+                *total_calls_resolved += calls_resolved;
+                Ok(block)
+            }
+            BlockTransformResult::ConstantViolation(msg) => Err(msg),
+        }
+    }
+}
+
 /// Find local cells (non-escaping allocations that are only used for Store/Load).
 /// These don't modify the visible heap shape and shouldn't cause deopts.
 /// Returns the set of alloc IDs that are local cells.
@@ -1068,27 +1107,13 @@ pub fn eliminate_heap(
         &local_cells,
         deopt_mode,
     );
-    let transformed_entry = match entry_result {
-        BlockTransformResult::Success { block, calls_resolved } => {
-            total_calls_resolved += calls_resolved;
-            block
-        }
-        BlockTransformResult::NeedsDeopt { instructions, reason, terminator_id, calls_resolved } => {
-            total_calls_resolved += calls_resolved;
-            deopt_count += 1;
-            Block {
-                instructions,
-                terminator: (terminator_id, Terminator::Deopt { reason }),
-                hint_normalize: cfg.entry.hint_normalize,
-            }
-        }
-        BlockTransformResult::Stopped { block, calls_resolved, reason: _ } => {
-            total_calls_resolved += calls_resolved;
-            block
-        }
-        BlockTransformResult::ConstantViolation(msg) => {
-            return HeapEliminationResult::ConstantViolation(msg);
-        }
+    let transformed_entry = match entry_result.into_block(
+        cfg.entry.hint_normalize,
+        &mut deopt_count,
+        &mut total_calls_resolved,
+    ) {
+        Ok(block) => block,
+        Err(msg) => return HeapEliminationResult::ConstantViolation(msg),
     };
 
     // Transform named blocks
@@ -1104,27 +1129,13 @@ pub fn eliminate_heap(
             &local_cells,
             deopt_mode,
         );
-        let transformed = match result {
-            BlockTransformResult::Success { block, calls_resolved } => {
-                total_calls_resolved += calls_resolved;
-                block
-            }
-            BlockTransformResult::NeedsDeopt { instructions, reason, terminator_id, calls_resolved } => {
-                total_calls_resolved += calls_resolved;
-                deopt_count += 1;
-                Block {
-                    instructions,
-                    terminator: (terminator_id, Terminator::Deopt { reason }),
-                    hint_normalize: block.hint_normalize,
-                }
-            }
-            BlockTransformResult::Stopped { block, calls_resolved, reason: _ } => {
-                total_calls_resolved += calls_resolved;
-                block
-            }
-            BlockTransformResult::ConstantViolation(msg) => {
-                return HeapEliminationResult::ConstantViolation(msg);
-            }
+        let transformed = match result.into_block(
+            block.hint_normalize,
+            &mut deopt_count,
+            &mut total_calls_resolved,
+        ) {
+            Ok(block) => block,
+            Err(msg) => return HeapEliminationResult::ConstantViolation(msg),
         };
         transformed_named.insert(label.clone(), transformed);
     }
