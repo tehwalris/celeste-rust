@@ -1,10 +1,11 @@
 //! Phi Cleanup Pass
 //!
-//! This pass cleans up Phi nodes after control flow changes (like Deopt insertion).
+//! This pass cleans up Phi nodes after control flow changes (like Deopt insertion or DCE).
 //! It handles:
 //! 1. Removing Phi branches that reference blocks no longer predecessors
-//! 2. Collapsing single-element Phis to direct references
-//! 3. Detecting empty Phis (0 elements after cleanup)
+//! 2. Removing Phi branches that reference undefined locals (from DCE-removed blocks)
+//! 3. Collapsing single-element Phis to direct references
+//! 4. Detecting empty Phis (0 elements after cleanup)
 //!
 //! This is intentionally strict - it only handles Phi cleanup, nothing else.
 
@@ -75,24 +76,30 @@ fn add_successors_as_predecessors(
     }
 }
 
-/// Clean up a single Phi instruction based on actual predecessors.
+/// Clean up a single Phi instruction based on actual predecessors and defined locals.
 /// Returns (new_instruction, was_collapsed, was_emptied)
 fn cleanup_phi(
     phi_branches: &[(Label, LocalId)],
     actual_predecessors: &FxHashSet<Label>,
     from_entry: bool,
+    defined_locals: Option<&FxHashSet<LocalId>>,
 ) -> (Vec<(Label, LocalId)>, Option<LocalId>, bool) {
     let mut new_branches = Vec::new();
 
     for (label, local_id) in phi_branches {
         // Special case: "entry" predecessor
-        let is_valid = if label.as_str() == "entry" {
+        let is_predecessor_valid = if label.as_str() == "entry" {
             from_entry || actual_predecessors.contains(label)
         } else {
             actual_predecessors.contains(label)
         };
 
-        if is_valid {
+        // Check if the local is defined (if we're filtering by defined locals)
+        let is_local_valid = defined_locals
+            .map(|defined| defined.contains(local_id))
+            .unwrap_or(true);
+
+        if is_predecessor_valid && is_local_valid {
             new_branches.push((label.clone(), *local_id));
         }
     }
@@ -113,6 +120,7 @@ fn cleanup_block_phis(
     block: &Block,
     actual_predecessors: &FxHashSet<Label>,
     from_entry: bool,
+    defined_locals: Option<&FxHashSet<LocalId>>,
 ) -> (Block, usize, usize, usize, FxHashMap<LocalId, LocalId>) {
     let mut new_instructions = Vec::new();
     let mut branches_removed = 0;
@@ -124,7 +132,7 @@ fn cleanup_block_phis(
         match instruction {
             Instruction::Phi { branches } => {
                 let (new_branches, collapsed_to, was_emptied) =
-                    cleanup_phi(branches, actual_predecessors, from_entry);
+                    cleanup_phi(branches, actual_predecessors, from_entry, defined_locals);
 
                 let removed = branches.len() - new_branches.len();
                 branches_removed += removed;
@@ -214,14 +222,55 @@ fn remap_block_locals(block: &Block, mappings: &FxHashMap<LocalId, LocalId>) -> 
     }
 }
 
+/// Collect all LocalIds defined in a CFG.
+///
+/// This includes:
+/// - All instruction outputs (left-hand side of assignments)
+/// - All terminator IDs
+/// - Optionally, predefined locals (function arguments, unpack slots)
+pub fn collect_defined_locals(cfg: &Cfg, predefined_locals: &[LocalId]) -> FxHashSet<LocalId> {
+    let mut defined_locals: FxHashSet<LocalId> = FxHashSet::default();
+
+    // Add predefined locals (args, unpack slots)
+    for local_id in predefined_locals {
+        defined_locals.insert(*local_id);
+    }
+
+    // Collect definitions from all blocks
+    for block in cfg.iter_blocks() {
+        for (local_id, _) in &block.instructions {
+            defined_locals.insert(*local_id);
+        }
+        defined_locals.insert(block.terminator_id());
+    }
+
+    defined_locals
+}
+
 /// Clean up Phi nodes in a CFG after control flow changes.
 ///
 /// This pass:
 /// 1. Computes actual predecessors based on terminators
 /// 2. Removes Phi branches referencing non-predecessor blocks
-/// 3. Collapses single-element Phis to direct references
-/// 4. Reports empty Phis (for caller to handle undefined local issues)
+/// 3. Optionally removes Phi branches referencing undefined locals (from DCE-removed blocks)
+/// 4. Collapses single-element Phis to direct references
+/// 5. Reports empty Phis (for caller to handle undefined local issues)
+///
+/// If `defined_locals` is provided, branches referencing locals not in the set will be removed.
+/// This is useful after DCE removes blocks that defined certain locals.
 pub fn cleanup_phis(cfg: &Cfg) -> PhiCleanupResult {
+    cleanup_phis_with_defined_locals(cfg, None)
+}
+
+/// Clean up Phi nodes, also filtering out branches referencing undefined locals.
+///
+/// This is the same as `cleanup_phis` but also removes Phi branches that reference
+/// locals not in the `defined_locals` set. Use this after DCE to clean up references
+/// to locals that were defined in removed blocks.
+pub fn cleanup_phis_with_defined_locals(
+    cfg: &Cfg,
+    defined_locals: Option<&FxHashSet<LocalId>>,
+) -> PhiCleanupResult {
     let actual_predecessors = compute_actual_predecessors(cfg);
 
     let mut total_branches_removed = 0;
@@ -233,7 +282,7 @@ pub fn cleanup_phis(cfg: &Cfg) -> PhiCleanupResult {
     // But process it anyway for completeness
     let entry_preds = FxHashSet::default();
     let (new_entry, branches_removed, phis_collapsed, phis_emptied, collapsed_mappings) =
-        cleanup_block_phis(&cfg.entry, &entry_preds, false);
+        cleanup_block_phis(&cfg.entry, &entry_preds, false, defined_locals);
     total_branches_removed += branches_removed;
     total_phis_collapsed += phis_collapsed;
     total_phis_emptied += phis_emptied;
@@ -253,7 +302,7 @@ pub fn cleanup_phis(cfg: &Cfg) -> PhiCleanupResult {
         };
 
         let (new_block, branches_removed, phis_collapsed, phis_emptied, collapsed_mappings) =
-            cleanup_block_phis(block, &preds, from_entry);
+            cleanup_block_phis(block, &preds, from_entry, defined_locals);
         total_branches_removed += branches_removed;
         total_phis_collapsed += phis_collapsed;
         total_phis_emptied += phis_emptied;
@@ -723,6 +772,171 @@ mod tests {
                 assert_eq!(*left, LocalId::from(1), "BinaryOp should reference %1 after transitive Phi collapse");
             }
             _ => panic!("Expected BinaryOp instruction"),
+        }
+    }
+
+    #[test]
+    fn test_remove_phi_branch_referencing_undefined_local() {
+        // Simulates what happens after DCE removes a block:
+        // - Entry conditionally branches to A and B
+        // - Both A and B branch to join
+        // - Join has Phi(A: %1, B: %2)
+        // - After DCE removes block A (and %1 with it), we call cleanup_phis_with_defined_locals
+        //   with defined_locals = {%0, %2} (not including %1)
+        // - The Phi should have the A branch removed, collapsing to just %2
+
+        let entry = make_block(
+            vec![(LocalId::from(0), Instruction::BoolConstant { value: true })],
+            (
+                LocalId::from(99),
+                Terminator::ConditionalBranch {
+                    condition: LocalId::from(0),
+                    true_target: Label::from("block_a".to_string()),
+                    false_target: Label::from("block_b".to_string()),
+                },
+            ),
+        );
+
+        // Block A still exists in this test CFG (predecessor is valid),
+        // but we'll tell cleanup that %1 is not defined
+        let block_a = make_block(
+            vec![(LocalId::from(1), Instruction::NumberConstant { value: Pico8Num::from_i16(1) })],
+            (LocalId::from(10), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
+        );
+
+        let block_b = make_block(
+            vec![(LocalId::from(2), Instruction::NumberConstant { value: Pico8Num::from_i16(2) })],
+            (LocalId::from(11), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
+        );
+
+        let join = make_block(
+            vec![(
+                LocalId::from(3),
+                Instruction::Phi {
+                    branches: vec![
+                        (Label::from("block_a".to_string()), LocalId::from(1)),
+                        (Label::from("block_b".to_string()), LocalId::from(2)),
+                    ],
+                },
+            )],
+            (LocalId::from(12), Terminator::Return { value: Some(LocalId::from(3)) }),
+        );
+
+        let cfg = Cfg {
+            entry,
+            named: [
+                (Label::from("block_a".to_string()), block_a),
+                (Label::from("block_b".to_string()), block_b),
+                (Label::from("join".to_string()), join),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        // Define locals except %1 (simulating that block_a was removed by DCE
+        // but the CFG still has it for this test - what matters is the defined_locals set)
+        let mut defined_locals: FxHashSet<LocalId> = FxHashSet::default();
+        defined_locals.insert(LocalId::from(0));  // from entry
+        defined_locals.insert(LocalId::from(2));  // from block_b
+        defined_locals.insert(LocalId::from(99)); // terminator id
+        defined_locals.insert(LocalId::from(10)); // terminator id
+        defined_locals.insert(LocalId::from(11)); // terminator id
+        defined_locals.insert(LocalId::from(12)); // terminator id
+        // Note: %1 is NOT included - simulating it was defined in a removed block
+
+        let result = cleanup_phis_with_defined_locals(&cfg, Some(&defined_locals));
+
+        // Branch referencing %1 should be removed (undefined local)
+        assert_eq!(result.branches_removed, 1);
+        // Phi now has one element, so should be collapsed
+        assert_eq!(result.phis_collapsed, 1);
+        assert_eq!(result.phis_emptied, 0);
+
+        // %3 should be remapped to %2
+        assert_eq!(result.collapsed_mappings.get(&LocalId::from(3)), Some(&LocalId::from(2)));
+
+        // The return should now reference %2 directly
+        match result.cfg.named.get(&Label::from("join".to_string())).unwrap().terminator_kind() {
+            Terminator::Return { value: Some(v) } => assert_eq!(*v, LocalId::from(2)),
+            _ => panic!("Expected return terminator"),
+        }
+    }
+
+    #[test]
+    fn test_all_phi_branches_reference_undefined_locals() {
+        // Test what happens when ALL Phi branches reference undefined locals
+        // The Phi should become empty (phis_emptied = 1)
+
+        let entry = make_block(
+            vec![(LocalId::from(0), Instruction::BoolConstant { value: true })],
+            (
+                LocalId::from(99),
+                Terminator::ConditionalBranch {
+                    condition: LocalId::from(0),
+                    true_target: Label::from("block_a".to_string()),
+                    false_target: Label::from("block_b".to_string()),
+                },
+            ),
+        );
+
+        let block_a = make_block(
+            vec![(LocalId::from(1), Instruction::NumberConstant { value: Pico8Num::from_i16(1) })],
+            (LocalId::from(10), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
+        );
+
+        let block_b = make_block(
+            vec![(LocalId::from(2), Instruction::NumberConstant { value: Pico8Num::from_i16(2) })],
+            (LocalId::from(11), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
+        );
+
+        let join = make_block(
+            vec![(
+                LocalId::from(3),
+                Instruction::Phi {
+                    branches: vec![
+                        (Label::from("block_a".to_string()), LocalId::from(1)),
+                        (Label::from("block_b".to_string()), LocalId::from(2)),
+                    ],
+                },
+            )],
+            (LocalId::from(12), Terminator::Return { value: Some(LocalId::from(3)) }),
+        );
+
+        let cfg = Cfg {
+            entry,
+            named: [
+                (Label::from("block_a".to_string()), block_a),
+                (Label::from("block_b".to_string()), block_b),
+                (Label::from("join".to_string()), join),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        // Define only entry locals - neither %1 nor %2 are defined
+        let mut defined_locals: FxHashSet<LocalId> = FxHashSet::default();
+        defined_locals.insert(LocalId::from(0));
+        defined_locals.insert(LocalId::from(99));
+        defined_locals.insert(LocalId::from(10));
+        defined_locals.insert(LocalId::from(11));
+        defined_locals.insert(LocalId::from(12));
+        // Note: neither %1 nor %2 is included
+
+        let result = cleanup_phis_with_defined_locals(&cfg, Some(&defined_locals));
+
+        // Both branches removed
+        assert_eq!(result.branches_removed, 2);
+        // Phi became empty
+        assert_eq!(result.phis_emptied, 1);
+        assert_eq!(result.phis_collapsed, 0);
+
+        // The Phi should still exist but with empty branches
+        let join_block = result.cfg.named.get(&Label::from("join".to_string())).unwrap();
+        match &join_block.instructions[0].1 {
+            Instruction::Phi { branches } => {
+                assert!(branches.is_empty());
+            }
+            _ => panic!("Expected Phi instruction"),
         }
     }
 }

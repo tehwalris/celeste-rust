@@ -11,147 +11,8 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::interpreter::common::{FxHashMap, FxHashSet};
+use crate::interpreter::common::FxHashMap;
 use crate::ir::{Block, Cfg, FunDef, GlobalId, Instruction, LocalId, Terminator};
-
-/// Clean up phi nodes that reference undefined locals.
-///
-/// After DCE removes unreachable blocks, phi nodes in reachable blocks may still
-/// reference locals that were defined in the removed blocks. This function removes
-/// those invalid branches from phi nodes and collapses single-element phis.
-fn cleanup_phis_with_undefined_locals(cfg: &Cfg, predefined_locals: &[LocalId]) -> Cfg {
-    // First, collect all defined locals in the CFG
-    let mut defined_locals: FxHashSet<LocalId> = FxHashSet::default();
-
-    // Add predefined locals (args, unpack slots)
-    for local_id in predefined_locals {
-        defined_locals.insert(*local_id);
-    }
-
-    // Collect definitions from all blocks
-    for block in cfg.iter_blocks() {
-        for (local_id, _) in &block.instructions {
-            defined_locals.insert(*local_id);
-        }
-        defined_locals.insert(block.terminator_id());
-    }
-
-    // Now clean up phi nodes
-    fn cleanup_block_phis(block: &Block, defined_locals: &FxHashSet<LocalId>) -> (Block, FxHashMap<LocalId, LocalId>) {
-        let mut new_instructions = Vec::new();
-        let mut collapsed_mappings: FxHashMap<LocalId, LocalId> = FxHashMap::default();
-
-        for (local_id, instruction) in &block.instructions {
-            match instruction {
-                Instruction::Phi { branches } => {
-                    // Filter out branches that reference undefined locals
-                    let valid_branches: Vec<_> = branches
-                        .iter()
-                        .filter(|(_, branch_local)| defined_locals.contains(branch_local))
-                        .cloned()
-                        .collect();
-
-                    if valid_branches.is_empty() {
-                        // All branches reference undefined locals - this is problematic
-                        // but we'll create a nil constant to prevent validation errors
-                        new_instructions.push((*local_id, Instruction::NilConstant));
-                    } else if valid_branches.len() == 1 {
-                        // Single valid branch - collapse to direct reference
-                        collapsed_mappings.insert(*local_id, valid_branches[0].1);
-                        // Don't emit the phi - we'll remap references
-                    } else {
-                        // Multiple valid branches - keep as phi
-                        new_instructions.push((*local_id, Instruction::Phi { branches: valid_branches }));
-                    }
-                }
-                _ => {
-                    new_instructions.push((*local_id, instruction.clone()));
-                }
-            }
-        }
-
-        (
-            Block {
-                instructions: new_instructions,
-                terminator: block.terminator.clone(),
-                hint_normalize: block.hint_normalize,
-            },
-            collapsed_mappings,
-        )
-    }
-
-    // Process entry block
-    let (new_entry, entry_mappings) = cleanup_block_phis(&cfg.entry, &defined_locals);
-
-    // Process named blocks
-    let mut new_named: FxHashMap<crate::ir::Label, Block> = FxHashMap::default();
-    let mut all_mappings: FxHashMap<LocalId, LocalId> = entry_mappings;
-
-    for (label, block) in &cfg.named {
-        let (new_block, block_mappings) = cleanup_block_phis(block, &defined_locals);
-        new_named.insert(label.clone(), new_block);
-        all_mappings.extend(block_mappings);
-    }
-
-    // If there are any collapsed phi mappings, we need to remap references
-    if all_mappings.is_empty() {
-        return Cfg {
-            entry: new_entry,
-            named: new_named,
-        };
-    }
-
-    // Compute transitive closure of mappings
-    let mut changed = true;
-    while changed {
-        changed = false;
-        let keys: Vec<_> = all_mappings.keys().cloned().collect();
-        for key in keys {
-            let value = all_mappings[&key];
-            if let Some(&next_value) = all_mappings.get(&value) {
-                if next_value != value {
-                    all_mappings.insert(key, next_value);
-                    changed = true;
-                }
-            }
-        }
-    }
-
-    // Apply mappings to all instructions
-    let remap = |id: LocalId| -> LocalId {
-        *all_mappings.get(&id).unwrap_or(&id)
-    };
-
-    fn remap_block(block: &Block, remap: impl Fn(LocalId) -> LocalId) -> Block {
-        let new_instructions: Vec<_> = block
-            .instructions
-            .iter()
-            .map(|(id, instr)| (*id, instr.map_local_ids(&remap)))
-            .collect();
-
-        let new_terminator = (
-            block.terminator_id(),
-            block.terminator_kind().map_local_ids(&remap),
-        );
-
-        Block {
-            instructions: new_instructions,
-            terminator: new_terminator,
-            hint_normalize: block.hint_normalize,
-        }
-    }
-
-    let final_entry = remap_block(&new_entry, remap);
-    let final_named: FxHashMap<_, _> = new_named
-        .into_iter()
-        .map(|(label, block)| (label, remap_block(&block, remap)))
-        .collect();
-
-    Cfg {
-        entry: final_entry,
-        named: final_named,
-    }
-}
 
 /// Results of analyzing a CFG for heap-related operations.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1279,13 +1140,11 @@ fn run_optimization_pipeline_with_interprocedural_inner(
                             result.dce = DceStatus::Success { instructions_removed };
                         }
                         // DCE removes unreachable blocks, so we need to clean up Phi nodes
-                        // that reference those removed blocks
-                        let cleanup_result = crate::interpreter::phi_cleanup::cleanup_phis(&dce_cfg);
-
-                        // Also need to remove phi branches that reference locals from removed blocks
-                        // phi_cleanup only removes branches based on predecessor info, but doesn't
-                        // handle the case where the local itself was defined in a removed block
-                        let cleaned_cfg = cleanup_phis_with_undefined_locals(&cleanup_result.cfg, &all_predefined);
+                        // that reference those removed blocks or locals defined in removed blocks.
+                        // We do both cleanups in a single pass by providing the defined_locals set.
+                        let defined_locals = crate::interpreter::phi_cleanup::collect_defined_locals(&dce_cfg, &all_predefined);
+                        let cleanup_result = crate::interpreter::phi_cleanup::cleanup_phis_with_defined_locals(&dce_cfg, Some(&defined_locals));
+                        let cleaned_cfg = cleanup_result.cfg;
 
                         validate(&cleaned_cfg, &all_predefined, "after DCE_final");
                         cleaned_cfg
