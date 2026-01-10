@@ -169,11 +169,7 @@ fn analyze_and_resolve_block(
     }
 
     (
-        Block {
-            instructions: new_instructions,
-            terminator: block.terminator.clone(),
-            hint_normalize: block.hint_normalize,
-        },
+        block.with_instructions(new_instructions),
         calls_resolved,
         mapping,
     )

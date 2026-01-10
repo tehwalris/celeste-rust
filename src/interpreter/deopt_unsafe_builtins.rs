@@ -66,14 +66,7 @@ fn process_block(block: &Block) -> (Block, bool) {
     }
 
     // No unsafe builtin found - return block unchanged
-    (
-        Block {
-            instructions: new_instructions,
-            terminator: block.terminator.clone(),
-            hint_normalize: block.hint_normalize,
-        },
-        false,
-    )
+    (block.with_instructions(new_instructions), false)
 }
 
 /// Replace unsafe builtin calls with deoptimization points.

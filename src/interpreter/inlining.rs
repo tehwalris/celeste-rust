@@ -326,13 +326,7 @@ fn inline_calls_in_block(
     }
 
     // No inlining happened - return the block unchanged
-    let result_block = Block {
-        instructions: new_instructions,
-        terminator: block.terminator.clone(),
-        hint_normalize: block.hint_normalize,
-    };
-
-    (result_block, inlined_count, new_blocks)
+    (block.with_instructions(new_instructions), inlined_count, new_blocks)
 }
 
 /// Inline a block's body (instructions and terminator).
