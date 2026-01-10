@@ -453,6 +453,34 @@ pub struct OptimizedFunDef {
     pub cfg: Cfg,
 }
 
+/// Log a validation skip warning with consistent formatting.
+///
+/// This helper centralizes the formatting of validation error messages to avoid
+/// duplication and ensure consistency across the optimization pipeline.
+fn log_validation_skip(
+    fn_name: &str,
+    context: &str,
+    errors: &[crate::interpreter::cfg_validation::ValidationError],
+) {
+    let context_suffix = if context.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", context)
+    };
+    eprintln!(
+        "Warning: Skipping {} -{} validation failed: {} errors",
+        fn_name,
+        context_suffix,
+        errors.len()
+    );
+    for (i, error) in errors.iter().take(3).enumerate() {
+        eprintln!("  [{}] {}", i + 1, error);
+    }
+    if errors.len() > 3 {
+        eprintln!("  ... and {} more", errors.len() - 3);
+    }
+}
+
 /// Optimize all function definitions with proper dependency ordering.
 ///
 /// This ensures that when we inline function A into function B, we use the
@@ -544,12 +572,7 @@ pub fn optimize_all_functions(
             &external_ids,
         );
         if !validation_result.is_valid() {
-            eprintln!(
-                "Warning: Skipping {} - validation failed: {} errors\n  First few: {:?}",
-                fn_name,
-                validation_result.errors.len(),
-                validation_result.errors.iter().take(3).collect::<Vec<_>>()
-            );
+            log_validation_skip(fn_name, "", &validation_result.errors);
             continue;
         }
 
@@ -563,12 +586,7 @@ pub fn optimize_all_functions(
                         &external_ids,
                     );
                     if !validation.is_valid() {
-                        eprintln!(
-                            "Warning: Skipping {} - mem2reg validation failed: {} errors\n  First few: {:?}",
-                            fn_name,
-                            validation.errors.len(),
-                            validation.errors.iter().take(3).collect::<Vec<_>>()
-                        );
+                        log_validation_skip(fn_name, "mem2reg", &validation.errors);
                         continue;
                     }
                     cfg
@@ -587,13 +605,7 @@ pub fn optimize_all_functions(
                     &external_ids,
                 );
                 if !validation.is_valid() {
-                    eprintln!(
-                        "Warning: Skipping {} - {} validation failed: {} errors\n  First few: {:?}",
-                        fn_name,
-                        $context,
-                        validation.errors.len(),
-                        validation.errors.iter().take(3).collect::<Vec<_>>()
-                    );
+                    log_validation_skip(fn_name, $context, &validation.errors);
                     continue 'function_loop;
                 }
             }};
