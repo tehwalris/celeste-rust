@@ -150,10 +150,7 @@ mod tests {
             (LocalId::from(2), Terminator::Return { value: None }),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: Default::default(),
-        };
+        let cfg = Cfg::single_entry(entry);
 
         let result = deopt_unsafe_builtins(&cfg);
         match result {
@@ -202,10 +199,7 @@ mod tests {
             ),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: Default::default(),
-        };
+        let cfg = Cfg::single_entry(entry);
 
         let result = deopt_unsafe_builtins(&cfg);
         assert!(matches!(result, DeoptUnsafeBuiltinsResult::NoChange));

@@ -242,10 +242,7 @@ mod tests {
             ),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: Default::default(),
-        };
+        let cfg = Cfg::single_entry(entry);
 
         let result = eliminate_dead_code(&cfg);
         match result {
@@ -295,10 +292,7 @@ mod tests {
             ),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: Default::default(),
-        };
+        let cfg = Cfg::single_entry(entry);
 
         let result = eliminate_dead_code(&cfg);
         assert!(matches!(result, DceResult::NoChange));
@@ -351,10 +345,7 @@ mod tests {
             ),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: Default::default(),
-        };
+        let cfg = Cfg::single_entry(entry);
 
         let result = eliminate_dead_code(&cfg);
         match result {
