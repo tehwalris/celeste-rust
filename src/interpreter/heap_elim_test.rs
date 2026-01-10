@@ -297,81 +297,51 @@ mod tests {
 
     #[test]
     fn test_heap_elim_simple_field_access() {
-        use crate::ir::LocalIdGenerator;
+        let (cfg, transformed) = run_simple_field_heap_elim_with_original();
 
-        let cfg = make_simple_field_access_cfg();
+        println!("=== ORIGINAL CFG ===");
+        print_cfg(&cfg);
 
-        // Create shape: arg0 is a table with field "x"
-        let mut shape = HeapShape::new();
-        let mut arg0_fields = FxHashMap::default();
-        arg0_fields.insert("x".to_string(), ValueShape::Leaf);
-        shape.args = vec![Some(ValueShape::Table(arg0_fields))];
+        println!("\n=== TRANSFORMED CFG ===");
+        print_cfg(&transformed.cfg);
 
-        let local_gen = LocalIdGenerator::from_cfg(&cfg);
-        let label_gen = crate::ir::LabelGenerator::new();
+        println!("\n=== SLOT MAPPINGS ===");
+        for (slot, local_id) in &transformed.unpack_slots {
+            println!("  {} -> %{}", slot, usize::from(*local_id));
+        }
 
-        let result = eliminate_heap(
-            &cfg,
-            &shape,
-            &[Some(LocalId::from(0))], // arg0 is at LocalId 0
-            local_gen,
-            label_gen,
-            DeoptMode::Insert
-        );
+        // Now the key test: check for Load(Phi) pattern
+        let mut load_from_phi_count = 0;
+        let phi_ids: std::collections::HashSet<LocalId> = transformed.cfg.entry.instructions.iter()
+            .chain(transformed.cfg.named.values().flat_map(|b| b.instructions.iter()))
+            .filter(|(_, instr)| matches!(instr, Instruction::Phi { .. }))
+            .map(|(id, _)| *id)
+            .collect();
 
-        match result {
-            HeapEliminationResult::Success(transformed) => {
-                println!("=== ORIGINAL CFG ===");
-                print_cfg(&cfg);
-
-                println!("\n=== TRANSFORMED CFG ===");
-                print_cfg(&transformed.cfg);
-
-                println!("\n=== SLOT MAPPINGS ===");
-                for (slot, local_id) in &transformed.unpack_slots {
-                    println!("  {} -> %{}", slot, usize::from(*local_id));
-                }
-
-                // Now the key test: check for Load(Phi) pattern
-                let mut load_from_phi_count = 0;
-                let phi_ids: std::collections::HashSet<LocalId> = transformed.cfg.entry.instructions.iter()
-                    .chain(transformed.cfg.named.values().flat_map(|b| b.instructions.iter()))
-                    .filter(|(_, instr)| matches!(instr, Instruction::Phi { .. }))
-                    .map(|(id, _)| *id)
-                    .collect();
-
-                for block in std::iter::once(&transformed.cfg.entry)
-                    .chain(transformed.cfg.named.values())
-                {
-                    for (target_id, instr) in &block.instructions {
-                        if let Instruction::Load { source } = instr {
-                            if phi_ids.contains(source) {
-                                load_from_phi_count += 1;
-                                println!("WARNING: Found Load from Phi: %{} = Load(%{})",
-                                         usize::from(*target_id), usize::from(*source));
-                            }
-                        }
+        for block in std::iter::once(&transformed.cfg.entry)
+            .chain(transformed.cfg.named.values())
+        {
+            for (target_id, instr) in &block.instructions {
+                if let Instruction::Load { source } = instr {
+                    if phi_ids.contains(source) {
+                        load_from_phi_count += 1;
+                        println!("WARNING: Found Load from Phi: %{} = Load(%{})",
+                                 usize::from(*target_id), usize::from(*source));
                     }
                 }
+            }
+        }
 
-                // This assertion documents the current behavior
-                // If heap_elim is fixed, this should be 0
-                println!("\nLoad from Phi count: {}", load_from_phi_count);
+        // This assertion documents the current behavior
+        // If heap_elim is fixed, this should be 0
+        println!("\nLoad from Phi count: {}", load_from_phi_count);
 
-                // Verify the transformation preserved the structure we expect
-                // The if_join block should have a Phi for the x value
-                if let Some(if_join) = transformed.cfg.named.get(&Label::from("if_join".to_string())) {
-                    let has_phi = if_join.instructions.iter()
-                        .any(|(_, instr)| matches!(instr, Instruction::Phi { .. }));
-                    println!("if_join has Phi: {}", has_phi);
-                }
-            }
-            HeapEliminationResult::ShapeNotPreserved(reason) => {
-                panic!("Heap elimination failed: {}", reason);
-            }
-            other => {
-                panic!("Unexpected result: {:?}", other);
-            }
+        // Verify the transformation preserved the structure we expect
+        // The if_join block should have a Phi for the x value
+        if let Some(if_join) = transformed.cfg.named.get(&Label::from("if_join".to_string())) {
+            let has_phi = if_join.instructions.iter()
+                .any(|(_, instr)| matches!(instr, Instruction::Phi { .. }));
+            println!("if_join has Phi: {}", has_phi);
         }
     }
 
@@ -382,50 +352,28 @@ mod tests {
     /// - Uses reference the Phi directly without redundant Load operations
     #[test]
     fn test_load_from_phi_equivalence() {
-        // Verify that Phi nodes track VALUES correctly in the transformed CFG
-        use crate::ir::LocalIdGenerator;
+        let transformed = run_simple_field_heap_elim();
 
-        let cfg = make_simple_field_access_cfg();
+        // Find all Phi nodes and trace what they depend on
+        println!("\n=== PHI ANALYSIS ===");
 
-        let mut shape = HeapShape::new();
-        let mut arg0_fields = FxHashMap::default();
-        arg0_fields.insert("x".to_string(), ValueShape::Leaf);
-        shape.args = vec![Some(ValueShape::Table(arg0_fields))];
-
-        let local_gen = LocalIdGenerator::from_cfg(&cfg);
-        let label_gen = crate::ir::LabelGenerator::new();
-
-        let result = eliminate_heap(
-            &cfg,
-            &shape,
-            &[Some(LocalId::from(0))],
-            local_gen,
-            label_gen,
-            DeoptMode::Insert
-        );
-
-        if let HeapEliminationResult::Success(transformed) = result {
-            // Find all Phi nodes and trace what they depend on
-            println!("\n=== PHI ANALYSIS ===");
-
-            for (label, block) in std::iter::once((&Label::from("entry".to_string()), &transformed.cfg.entry))
-                .chain(transformed.cfg.named.iter())
-            {
-                for (target_id, instr) in &block.instructions {
-                    if let Instruction::Phi { branches } = instr {
-                        println!("\n%{} = Phi in {}:", usize::from(*target_id), label.as_str());
-                        for (src_label, src_id) in branches {
-                            // Find what instruction defined src_id
-                            let def = find_definition(&transformed.cfg, *src_id);
-                            println!("  from {}: %{} = {:?}", src_label.as_str(), usize::from(*src_id), def);
-                        }
+        for (label, block) in std::iter::once((&Label::from("entry".to_string()), &transformed.cfg.entry))
+            .chain(transformed.cfg.named.iter())
+        {
+            for (target_id, instr) in &block.instructions {
+                if let Instruction::Phi { branches } = instr {
+                    println!("\n%{} = Phi in {}:", usize::from(*target_id), label.as_str());
+                    for (src_label, src_id) in branches {
+                        // Find what instruction defined src_id
+                        let def = find_definition(&transformed.cfg, *src_id);
+                        println!("  from {}: %{} = {:?}", src_label.as_str(), usize::from(*src_id), def);
                     }
                 }
             }
-
-            // Phi nodes correctly merge VALUES (from HeapRead and computed values).
-            // Uses reference Phi results directly without redundant Load operations.
         }
+
+        // Phi nodes correctly merge VALUES (from HeapRead and computed values).
+        // Uses reference Phi results directly without redundant Load operations.
     }
 
     fn find_definition(cfg: &Cfg, target: LocalId) -> Option<Instruction> {
@@ -448,17 +396,22 @@ mod tests {
         println!("{}", cfg.format());
     }
 
-    /// Test execution of heap-eliminated CFG with SSA interpreter
-    #[test]
-    fn test_ssa_execution_positive_x() {
-        use crate::ir::LocalIdGenerator;
-
-        let cfg = make_simple_field_access_cfg();
-
+    /// Creates a HeapShape for arg0 with a single "x" field.
+    fn make_single_field_shape() -> HeapShape {
         let mut shape = HeapShape::new();
         let mut arg0_fields = FxHashMap::default();
         arg0_fields.insert("x".to_string(), ValueShape::Leaf);
         shape.args = vec![Some(ValueShape::Table(arg0_fields))];
+        shape
+    }
+
+    /// Helper to run heap elimination on the simple field access CFG.
+    /// Returns the transformed CFG if successful, or panics with a descriptive message.
+    fn run_simple_field_heap_elim() -> crate::interpreter::heap_elimination::TransformedCfg {
+        use crate::ir::LocalIdGenerator;
+
+        let cfg = make_simple_field_access_cfg();
+        let shape = make_single_field_shape();
 
         let local_gen = LocalIdGenerator::from_cfg(&cfg);
         let label_gen = crate::ir::LabelGenerator::new();
@@ -469,83 +422,98 @@ mod tests {
             &[Some(LocalId::from(0))],
             local_gen,
             label_gen,
-            DeoptMode::Insert
+            DeoptMode::Insert,
         );
 
-        if let HeapEliminationResult::Success(transformed) = result {
-            // Test with positive x (takes the if_true branch)
-            let mut initial_slots = FxHashMap::default();
-            initial_slots.insert("arg0.x".to_string(), SsaValue::Num(Pico8Num::from_i16(5)));
-
-            let slot_mappings: Vec<_> = transformed.unpack_slots.iter()
-                .map(|(slot, id)| (slot.to_string(), *id))
-                .collect();
-
-            let exec_result = ssa_execute(&transformed.cfg, initial_slots, &slot_mappings);
-
-            match exec_result {
-                Ok((_, return_value)) => {
-                    println!("SSA execution result: {:?}", return_value);
-                    // If x=5 > 0, then we do x = x + 1, so result should be 6
-                    assert_eq!(return_value, Some(SsaValue::Num(Pico8Num::from_i16(6))));
-                }
-                Err(e) => {
-                    println!("SSA execution error: {}", e);
-                    panic!("SSA execution failed: {}", e);
-                }
+        match result {
+            HeapEliminationResult::Success(transformed) => transformed,
+            HeapEliminationResult::ShapeNotPreserved(reason) => {
+                panic!("Heap elimination failed (shape not preserved): {}", reason)
             }
-        } else {
-            panic!("Heap elimination failed");
+            other => panic!("Heap elimination failed: {:?}", other),
+        }
+    }
+
+    /// Helper to run heap elimination, returning both original and transformed CFGs.
+    fn run_simple_field_heap_elim_with_original() -> (Cfg, crate::interpreter::heap_elimination::TransformedCfg) {
+        use crate::ir::LocalIdGenerator;
+
+        let cfg = make_simple_field_access_cfg();
+        let shape = make_single_field_shape();
+
+        let local_gen = LocalIdGenerator::from_cfg(&cfg);
+        let label_gen = crate::ir::LabelGenerator::new();
+
+        let result = eliminate_heap(
+            &cfg,
+            &shape,
+            &[Some(LocalId::from(0))],
+            local_gen,
+            label_gen,
+            DeoptMode::Insert,
+        );
+
+        match result {
+            HeapEliminationResult::Success(transformed) => (cfg, transformed),
+            HeapEliminationResult::ShapeNotPreserved(reason) => {
+                panic!("Heap elimination failed (shape not preserved): {}", reason)
+            }
+            other => panic!("Heap elimination failed: {:?}", other),
+        }
+    }
+
+    /// Test execution of heap-eliminated CFG with SSA interpreter
+    #[test]
+    fn test_ssa_execution_positive_x() {
+        let transformed = run_simple_field_heap_elim();
+
+        // Test with positive x (takes the if_true branch)
+        let mut initial_slots = FxHashMap::default();
+        initial_slots.insert("arg0.x".to_string(), SsaValue::Num(Pico8Num::from_i16(5)));
+
+        let slot_mappings: Vec<_> = transformed.unpack_slots.iter()
+            .map(|(slot, id)| (slot.to_string(), *id))
+            .collect();
+
+        let exec_result = ssa_execute(&transformed.cfg, initial_slots, &slot_mappings);
+
+        match exec_result {
+            Ok((_, return_value)) => {
+                println!("SSA execution result: {:?}", return_value);
+                // If x=5 > 0, then we do x = x + 1, so result should be 6
+                assert_eq!(return_value, Some(SsaValue::Num(Pico8Num::from_i16(6))));
+            }
+            Err(e) => {
+                println!("SSA execution error: {}", e);
+                panic!("SSA execution failed: {}", e);
+            }
         }
     }
 
     #[test]
     fn test_ssa_execution_negative_x() {
-        use crate::ir::LocalIdGenerator;
+        let transformed = run_simple_field_heap_elim();
 
-        let cfg = make_simple_field_access_cfg();
+        // Test with negative x (skips the if_true branch)
+        let mut initial_slots = FxHashMap::default();
+        initial_slots.insert("arg0.x".to_string(), SsaValue::Num(Pico8Num::from_i16(-3)));
 
-        let mut shape = HeapShape::new();
-        let mut arg0_fields = FxHashMap::default();
-        arg0_fields.insert("x".to_string(), ValueShape::Leaf);
-        shape.args = vec![Some(ValueShape::Table(arg0_fields))];
+        let slot_mappings: Vec<_> = transformed.unpack_slots.iter()
+            .map(|(slot, id)| (slot.to_string(), *id))
+            .collect();
 
-        let local_gen = LocalIdGenerator::from_cfg(&cfg);
-        let label_gen = crate::ir::LabelGenerator::new();
+        let exec_result = ssa_execute(&transformed.cfg, initial_slots, &slot_mappings);
 
-        let result = eliminate_heap(
-            &cfg,
-            &shape,
-            &[Some(LocalId::from(0))],
-            local_gen,
-            label_gen,
-            DeoptMode::Insert
-        );
-
-        if let HeapEliminationResult::Success(transformed) = result {
-            // Test with negative x (skips the if_true branch)
-            let mut initial_slots = FxHashMap::default();
-            initial_slots.insert("arg0.x".to_string(), SsaValue::Num(Pico8Num::from_i16(-3)));
-
-            let slot_mappings: Vec<_> = transformed.unpack_slots.iter()
-                .map(|(slot, id)| (slot.to_string(), *id))
-                .collect();
-
-            let exec_result = ssa_execute(&transformed.cfg, initial_slots, &slot_mappings);
-
-            match exec_result {
-                Ok((_, return_value)) => {
-                    println!("SSA execution result: {:?}", return_value);
-                    // If x=-3 <= 0, we skip the increment, so result should be -3
-                    assert_eq!(return_value, Some(SsaValue::Num(Pico8Num::from_i16(-3))));
-                }
-                Err(e) => {
-                    println!("SSA execution error: {}", e);
-                    panic!("SSA execution failed: {}", e);
-                }
+        match exec_result {
+            Ok((_, return_value)) => {
+                println!("SSA execution result: {:?}", return_value);
+                // If x=-3 <= 0, we skip the increment, so result should be -3
+                assert_eq!(return_value, Some(SsaValue::Num(Pico8Num::from_i16(-3))));
             }
-        } else {
-            panic!("Heap elimination failed");
+            Err(e) => {
+                println!("SSA execution error: {}", e);
+                panic!("SSA execution failed: {}", e);
+            }
         }
     }
 
@@ -553,57 +521,34 @@ mod tests {
     /// should produce the same result as the expected semantics
     #[test]
     fn test_ssa_execution_random() {
-        use crate::ir::LocalIdGenerator;
+        let transformed = run_simple_field_heap_elim();
 
-        let cfg = make_simple_field_access_cfg();
+        // Test with various values
+        for x in [-100, -1, 0, 1, 100] {
+            let mut initial_slots = FxHashMap::default();
+            initial_slots.insert("arg0.x".to_string(), SsaValue::Num(Pico8Num::from_i16(x)));
 
-        let mut shape = HeapShape::new();
-        let mut arg0_fields = FxHashMap::default();
-        arg0_fields.insert("x".to_string(), ValueShape::Leaf);
-        shape.args = vec![Some(ValueShape::Table(arg0_fields))];
+            let slot_mappings: Vec<_> = transformed.unpack_slots.iter()
+                .map(|(slot, id)| (slot.to_string(), *id))
+                .collect();
 
-        let local_gen = LocalIdGenerator::from_cfg(&cfg);
-        let label_gen = crate::ir::LabelGenerator::new();
+            let exec_result = ssa_execute(&transformed.cfg, initial_slots, &slot_mappings);
 
-        let result = eliminate_heap(
-            &cfg,
-            &shape,
-            &[Some(LocalId::from(0))],
-            local_gen,
-            label_gen,
-            DeoptMode::Insert
-        );
-
-        if let HeapEliminationResult::Success(transformed) = result {
-            // Test with various values
-            for x in [-100, -1, 0, 1, 100] {
-                let mut initial_slots = FxHashMap::default();
-                initial_slots.insert("arg0.x".to_string(), SsaValue::Num(Pico8Num::from_i16(x)));
-
-                let slot_mappings: Vec<_> = transformed.unpack_slots.iter()
-                    .map(|(slot, id)| (slot.to_string(), *id))
-                    .collect();
-
-                let exec_result = ssa_execute(&transformed.cfg, initial_slots, &slot_mappings);
-
-                match exec_result {
-                    Ok((_, return_value)) => {
-                        // Expected: if x > 0 then x+1 else x
-                        let expected = if x > 0 { x + 1 } else { x };
-                        let actual = match return_value {
-                            Some(SsaValue::Num(n)) => n.whole_part_as_i16(),
-                            _ => panic!("Expected numeric return value"),
-                        };
-                        assert_eq!(actual, expected, "Failed for x={}", x);
-                        println!("x={}: expected={}, actual={} ✓", x, expected, actual);
-                    }
-                    Err(e) => {
-                        panic!("SSA execution failed for x={}: {}", x, e);
-                    }
+            match exec_result {
+                Ok((_, return_value)) => {
+                    // Expected: if x > 0 then x+1 else x
+                    let expected = if x > 0 { x + 1 } else { x };
+                    let actual = match return_value {
+                        Some(SsaValue::Num(n)) => n.whole_part_as_i16(),
+                        _ => panic!("Expected numeric return value"),
+                    };
+                    assert_eq!(actual, expected, "Failed for x={}", x);
+                    println!("x={}: expected={}, actual={} ✓", x, expected, actual);
+                }
+                Err(e) => {
+                    panic!("SSA execution failed for x={}: {}", x, e);
                 }
             }
-        } else {
-            panic!("Heap elimination failed");
         }
     }
 
@@ -615,138 +560,93 @@ mod tests {
     /// This is a basic property test that runs both versions with random inputs
     #[test]
     fn test_equivalence_random_inputs() {
-        use crate::ir::LocalIdGenerator;
+        let transformed = run_simple_field_heap_elim();
 
-        let cfg = make_simple_field_access_cfg();
+        println!("\n=== EQUIVALENCE TEST ===");
 
-        let mut shape = HeapShape::new();
-        let mut arg0_fields = FxHashMap::default();
-        arg0_fields.insert("x".to_string(), ValueShape::Leaf);
-        shape.args = vec![Some(ValueShape::Table(arg0_fields))];
+        // Test with various input values (simulating random inputs)
+        // Note: avoid boundary values like 32767 that would overflow on x+1
+        let test_values: Vec<i16> = vec![
+            -32768, -1000, -100, -10, -1, 0, 1, 10, 100, 1000, 30000,
+            42, -42, 127, -128, 255, -256
+        ];
 
-        let local_gen = LocalIdGenerator::from_cfg(&cfg);
-        let label_gen = crate::ir::LabelGenerator::new();
+        let mut all_passed = true;
+        let mut tested = 0;
+        let mut skipped = 0;
 
-        let result = eliminate_heap(
-            &cfg,
-            &shape,
-            &[Some(LocalId::from(0))],
-            local_gen,
-            label_gen,
-            DeoptMode::Insert
-        );
+        for x in test_values {
+            let x_num = Pico8Num::from_i16(x);
 
-        if let HeapEliminationResult::Success(transformed) = result {
-            println!("\n=== EQUIVALENCE TEST ===");
+            // Execute transformed CFG with SSA interpreter
+            let mut initial_slots = FxHashMap::default();
+            initial_slots.insert("arg0.x".to_string(), SsaValue::Num(x_num));
 
-            // Test with various input values (simulating random inputs)
-            // Note: avoid boundary values like 32767 that would overflow on x+1
-            let test_values: Vec<i16> = vec![
-                -32768, -1000, -100, -10, -1, 0, 1, 10, 100, 1000, 30000,
-                42, -42, 127, -128, 255, -256
-            ];
+            let slot_mappings: Vec<_> = transformed.unpack_slots.iter()
+                .map(|(slot, id)| (slot.to_string(), *id))
+                .collect();
 
-            let mut all_passed = true;
-            let mut tested = 0;
-            let mut skipped = 0;
+            let ssa_result = ssa_execute(&transformed.cfg, initial_slots, &slot_mappings);
 
-            for x in test_values {
-                let x_num = Pico8Num::from_i16(x);
-
-                // Execute transformed CFG with SSA interpreter
-                let mut initial_slots = FxHashMap::default();
-                initial_slots.insert("arg0.x".to_string(), SsaValue::Num(x_num));
-
-                let slot_mappings: Vec<_> = transformed.unpack_slots.iter()
-                    .map(|(slot, id)| (slot.to_string(), *id))
-                    .collect();
-
-                let ssa_result = ssa_execute(&transformed.cfg, initial_slots, &slot_mappings);
-
-                match ssa_result {
-                    Ok((_, ssa_return)) => {
-                        // Compare with expected semantics: if x > 0 then x+1 else x
-                        let expected = if x > 0 { x + 1 } else { x };
-                        let actual = match ssa_return {
-                            Some(SsaValue::Num(n)) => n.whole_part_as_i16(),
-                            _ => {
-                                println!("x={}: SSA returned non-numeric value", x);
-                                all_passed = false;
-                                continue;
-                            }
-                        };
-
-                        if actual != expected {
-                            println!("x={}: MISMATCH - expected={}, actual={}", x, expected, actual);
+            match ssa_result {
+                Ok((_, ssa_return)) => {
+                    // Compare with expected semantics: if x > 0 then x+1 else x
+                    let expected = if x > 0 { x + 1 } else { x };
+                    let actual = match ssa_return {
+                        Some(SsaValue::Num(n)) => n.whole_part_as_i16(),
+                        _ => {
+                            println!("x={}: SSA returned non-numeric value", x);
                             all_passed = false;
-                        } else {
-                            tested += 1;
+                            continue;
                         }
-                    }
-                    Err(e) => {
-                        println!("x={}: SSA execution error: {}", x, e);
-                        skipped += 1;
+                    };
+
+                    if actual != expected {
+                        println!("x={}: MISMATCH - expected={}, actual={}", x, expected, actual);
+                        all_passed = false;
+                    } else {
+                        tested += 1;
                     }
                 }
+                Err(e) => {
+                    println!("x={}: SSA execution error: {}", x, e);
+                    skipped += 1;
+                }
             }
-
-            println!("Tested {} values, skipped {}", tested, skipped);
-            assert!(all_passed, "Equivalence test failed - see output above for details");
-            assert!(tested > 0, "No values were successfully tested");
-
-            println!("✓ All {} test values produced equivalent results", tested);
-        } else {
-            panic!("Heap elimination failed");
         }
+
+        println!("Tested {} values, skipped {}", tested, skipped);
+        assert!(all_passed, "Equivalence test failed - see output above for details");
+        assert!(tested > 0, "No values were successfully tested");
+
+        println!("✓ All {} test values produced equivalent results", tested);
     }
 
     /// Test that the type validation catches Load(Phi) issues
     #[test]
     fn test_type_validation_catches_load_phi() {
         use crate::interpreter::cfg_validation::{validate_types, SsaType};
-        use crate::ir::LocalIdGenerator;
 
-        let cfg = make_simple_field_access_cfg();
+        let transformed = run_simple_field_heap_elim();
 
-        let mut shape = HeapShape::new();
-        let mut arg0_fields = FxHashMap::default();
-        arg0_fields.insert("x".to_string(), ValueShape::Leaf);
-        shape.args = vec![Some(ValueShape::Table(arg0_fields))];
+        // The arg is a pointer (table reference), so mark it as such
+        let arg_types = vec![(LocalId::from(0), SsaType::Pointer)];
 
-        let local_gen = LocalIdGenerator::from_cfg(&cfg);
-        let label_gen = crate::ir::LabelGenerator::new();
+        // Run type validation on the transformed CFG
+        let type_errors = validate_types(&transformed.cfg, &arg_types);
 
-        let result = eliminate_heap(
-            &cfg,
-            &shape,
-            &[Some(LocalId::from(0))],
-            local_gen,
-            label_gen,
-            DeoptMode::Insert
-        );
-
-        if let HeapEliminationResult::Success(transformed) = result {
-            // The arg is a pointer (table reference), so mark it as such
-            let arg_types = vec![(LocalId::from(0), SsaType::Pointer)];
-
-            // Run type validation on the transformed CFG
-            let type_errors = validate_types(&transformed.cfg, &arg_types);
-
-            println!("\n=== TYPE VALIDATION RESULTS ===");
-            println!("Total type errors: {}", type_errors.len());
-            for error in &type_errors {
-                println!("  - {}", error);
-            }
-
-            // After the Load(Phi) fix, heap elimination should produce valid SSA
-            // with no type errors
-            assert!(type_errors.is_empty(),
-                "Heap elimination should produce valid SSA with no type errors, but found: {:?}",
-                type_errors);
-
-            println!("\n✓ Heap elimination produces valid SSA - no type errors found");
-        } else {
-            panic!("Heap elimination failed");
+        println!("\n=== TYPE VALIDATION RESULTS ===");
+        println!("Total type errors: {}", type_errors.len());
+        for error in &type_errors {
+            println!("  - {}", error);
         }
+
+        // After the Load(Phi) fix, heap elimination should produce valid SSA
+        // with no type errors
+        assert!(type_errors.is_empty(),
+            "Heap elimination should produce valid SSA with no type errors, but found: {:?}",
+            type_errors);
+
+        println!("\n✓ Heap elimination produces valid SSA - no type errors found");
     }
 }
