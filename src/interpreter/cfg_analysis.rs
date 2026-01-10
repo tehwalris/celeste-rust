@@ -560,7 +560,7 @@ pub struct OptimizationCfgs {
     /// All pipeline steps in order, including iterations
     pub steps: Vec<PipelineStep>,
 
-    // Legacy fields for backward compatibility with run_optimization_pipeline
+    // Per-pass results for visualization (most are set by run_optimization_pipeline_with_interprocedural)
     pub after_mem2reg: Option<Cfg>,
     pub after_heap_elim: Option<Cfg>,
     pub after_block_coalesce: Option<Cfg>,
@@ -569,136 +569,6 @@ pub struct OptimizationCfgs {
     pub after_inlining: Option<Cfg>,
     pub after_dce: Option<Cfg>,
     pub after_deopt_builtins: Option<Cfg>,
-}
-
-/// Run the full optimization pipeline on a CFG.
-///
-/// Pipeline stages:
-/// 1. mem2reg: Promote local cells (non-escaping allocations) to SSA
-/// 2. heap_elimination: Eliminate global heap operations with known shapes
-/// 3. block_coalesce: Merge straight-line blocks
-///
-/// Returns the optimization result and intermediate CFGs for visualization.
-pub fn run_optimization_pipeline(
-    cfg: &Cfg,
-    analysis: &CfgAnalysisResult,
-) -> (OptimizationResult, Option<Cfg>, Option<Cfg>) {
-    let (result, cfgs) = run_optimization_pipeline_full(cfg, analysis);
-    (result, cfgs.after_mem2reg, cfgs.after_heap_elim)
-}
-
-/// Run the full optimization pipeline, returning all intermediate CFGs.
-pub fn run_optimization_pipeline_full(
-    cfg: &Cfg,
-    analysis: &CfgAnalysisResult,
-) -> (OptimizationResult, OptimizationCfgs) {
-    use crate::interpreter::block_coalesce::{coalesce_blocks, CoalesceResult};
-    use crate::interpreter::cfg_validation::assert_valid_cfg_with_args;
-    use crate::interpreter::heap_elimination::{
-        eliminate_heap, DeoptMode, HeapEliminationResult, HeapShape, ValueShape,
-    };
-    use crate::interpreter::mem2reg::{mem2reg, Mem2RegResult};
-    use crate::ir::{LabelGenerator, LocalIdGenerator};
-
-    let mut result = OptimizationResult::default();
-    let mut cfgs = OptimizationCfgs::default();
-
-    // Stage 1: mem2reg - eliminate local cells
-    let mut local_gen = LocalIdGenerator::from_cfg(cfg);
-    let (after_mem2reg, mem2reg_status) = if analysis.local_only_allocs > 0 {
-        match mem2reg(cfg, &mut local_gen) {
-            Mem2RegResult::Success { cfg: new_cfg, cells_promoted } => {
-                assert_valid_cfg_with_args(&new_cfg, &[], "after mem2reg");
-                (Some(new_cfg), Mem2RegStatus::Success { cells_promoted })
-            }
-            Mem2RegResult::NoCells => {
-                (None, Mem2RegStatus::NoCells)
-            }
-            Mem2RegResult::PartialSuccess { cfg: new_cfg, cells_promoted, cells_failed, .. } => {
-                assert_valid_cfg_with_args(&new_cfg, &[], "after mem2reg (partial)");
-                (Some(new_cfg), Mem2RegStatus::Partial { cells_promoted, cells_failed })
-            }
-        }
-    } else {
-        (None, Mem2RegStatus::NoCells)
-    };
-    result.mem2reg = mem2reg_status;
-    cfgs.after_mem2reg = after_mem2reg.clone();
-
-    // Get the CFG to use for heap elimination (after mem2reg or original)
-    let cfg_for_heap_elim = after_mem2reg.as_ref().unwrap_or(cfg);
-
-    // Stage 2: heap elimination - for globals
-    let after_heap_elim = if !analysis.accessed_globals.is_empty() {
-        // Create a simple shape where each global is a leaf value
-        let mut shape = HeapShape::new();
-        for global in &analysis.accessed_globals {
-            shape.globals.insert(global.clone(), ValueShape::Leaf);
-        }
-
-        let label_gen = LabelGenerator::new();
-
-        match eliminate_heap(cfg_for_heap_elim, &shape, &[], local_gen, label_gen, DeoptMode::Insert) {
-            HeapEliminationResult::Success(transformed) => {
-                // Validation: include unpack_slots LocalIds as pre-defined
-                // These represent initial SSA values for heap slots
-                let unpack_ids: Vec<_> = transformed.unpack_slots.iter().map(|(_, id)| *id).collect();
-                assert_valid_cfg_with_args(&transformed.cfg, &unpack_ids, "after heap_elim");
-                let slot_mappings: Vec<SlotMapping> = transformed.unpack_slots
-                    .iter()
-                    .map(|(slot, local_id)| SlotMapping {
-                        path: slot.to_string(),
-                        local_id: usize::from(*local_id) as u32,
-                    })
-                    .collect();
-                result.heap_elimination = HeapEliminationStatus::Success {
-                    unpack_count: transformed.unpack_slots.len(),
-                    modified_count: transformed.modified_slots.len(),
-                    slot_mappings,
-                };
-                Some(transformed.cfg)
-            }
-            HeapEliminationResult::ShapeNotPreserved(reason) => {
-                result.heap_elimination = HeapEliminationStatus::Failed(reason);
-                None
-            }
-            HeapEliminationResult::HasExternalCalls(funcs) => {
-                let reason = format!("External calls: {}", funcs.join(", "));
-                result.heap_elimination = HeapEliminationStatus::Failed(reason);
-                None
-            }
-            HeapEliminationResult::NotApplicable => {
-                result.heap_elimination = HeapEliminationStatus::NotApplicable;
-                None
-            }
-            HeapEliminationResult::ConstantViolation(reason) => {
-                result.heap_elimination = HeapEliminationStatus::Failed(format!("Constant violation: {}", reason));
-                None
-            }
-        }
-    } else {
-        result.heap_elimination = HeapEliminationStatus::NotApplicable;
-        None
-    };
-    cfgs.after_heap_elim = after_heap_elim.clone();
-
-    // Stage 3: block coalescing - merge straight-line blocks
-    let cfg_for_coalesce = after_heap_elim.as_ref()
-        .or(after_mem2reg.as_ref())
-        .unwrap_or(cfg);
-
-    match coalesce_blocks(cfg_for_coalesce) {
-        CoalesceResult::Success { cfg: new_cfg, blocks_removed } => {
-            assert_valid_cfg_with_args(&new_cfg, &[], "after block_coalesce");
-            result.block_coalesce = BlockCoalesceStatus::Success { blocks_removed };
-            cfgs.after_block_coalesce = Some(new_cfg);
-        }
-        CoalesceResult::NoChange => {
-            result.block_coalesce = BlockCoalesceStatus::NoChange;
-        }
-    }
-
-    (result, cfgs)
 }
 
 /// Optimized function definition with its CFG.
@@ -1445,35 +1315,6 @@ fn run_optimization_pipeline_with_interprocedural_inner(
     }
 
     (result, cfgs)
-}
-
-/// Try to apply heap elimination transformation to a CFG (legacy interface).
-/// This runs the full pipeline and returns the final result.
-pub fn try_heap_elimination(
-    cfg: &Cfg,
-    analysis: &CfgAnalysisResult,
-) -> (HeapEliminationStatus, Option<Cfg>) {
-    let (result, after_mem2reg, after_heap_elim) = run_optimization_pipeline(cfg, analysis);
-
-    // Determine final status and CFG
-    // Priority: heap_elimination success > mem2reg success > failure
-    if let HeapEliminationStatus::Success { .. } = &result.heap_elimination {
-        return (result.heap_elimination, after_heap_elim);
-    }
-
-    if let Mem2RegStatus::Success { cells_promoted } = &result.mem2reg {
-        return (
-            HeapEliminationStatus::Success {
-                unpack_count: *cells_promoted,
-                modified_count: 0,
-                slot_mappings: Vec::new(), // mem2reg doesn't track slot mappings
-            },
-            after_mem2reg,
-        );
-    }
-
-    // Return the heap elimination status (could be Failed or NotApplicable)
-    (result.heap_elimination, None)
 }
 
 fn analyze_block(
