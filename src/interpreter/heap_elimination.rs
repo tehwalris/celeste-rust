@@ -18,7 +18,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::interpreter::common::{FxHashMap, FxHashSet};
 use crate::ir::{
-    Block, Cfg, GlobalId, Instruction, Label, LabelGenerator, LocalId, LocalIdGenerator, Terminator,
+    Block, BlockId, Cfg, GlobalId, Instruction, Label, LabelGenerator, LocalId, LocalIdGenerator,
+    Terminator,
 };
 use crate::pico8_num::Pico8Num;
 
@@ -378,13 +379,6 @@ pub struct TransformedCfg {
     pub deopt_count: usize,
     /// Number of calls resolved (Call -> CallResolved)
     pub calls_resolved: usize,
-}
-
-/// Block identifier - either entry or named
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum BlockId {
-    Entry,
-    Named(Label),
 }
 
 /// Phi node entry for SSA construction: (target_id, slot, branches)

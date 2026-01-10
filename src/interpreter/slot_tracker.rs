@@ -12,7 +12,7 @@
 use crate::interpreter::call_resolution::GlobalClosureMap;
 use crate::interpreter::common::FxHashMap;
 use crate::interpreter::heap_elimination::{HeapPath, HeapShape, HeapSlot, ValueShape};
-use crate::ir::{Block, Cfg, GlobalId, Instruction, Label, LocalId, Terminator};
+use crate::ir::{Block, BlockId, Cfg, GlobalId, Instruction, Label, LocalId};
 
 /// Tracks which LocalId points to which HeapSlot (or unknown)
 #[derive(Debug, Clone)]
@@ -67,56 +67,6 @@ pub struct CallResolutionResult {
     pub calls_resolved: usize,
 }
 
-/// Block ordering for dataflow analysis
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum BlockId {
-    Entry,
-    Named(Label),
-}
-
-/// Compute predecessors for each block
-fn compute_predecessors(cfg: &Cfg) -> FxHashMap<BlockId, Vec<BlockId>> {
-    let mut preds: FxHashMap<BlockId, Vec<BlockId>> = FxHashMap::default();
-
-    // Initialize all blocks
-    preds.insert(BlockId::Entry, vec![]);
-    for label in cfg.named.keys() {
-        preds.insert(BlockId::Named(label.clone()), vec![]);
-    }
-
-    // Add predecessors from entry block
-    add_successors(cfg.entry.terminator_kind(), BlockId::Entry, &mut preds);
-
-    // Add predecessors from named blocks
-    for (label, block) in &cfg.named {
-        add_successors(block.terminator_kind(), BlockId::Named(label.clone()), &mut preds);
-    }
-
-    preds
-}
-
-fn add_successors(
-    terminator: &Terminator,
-    from: BlockId,
-    preds: &mut FxHashMap<BlockId, Vec<BlockId>>,
-) {
-    match terminator {
-        Terminator::Return { .. } | Terminator::Deopt { .. } => {}
-        Terminator::UnconditionalBranch { target } => {
-            if let Some(p) = preds.get_mut(&BlockId::Named(target.clone())) {
-                p.push(from);
-            }
-        }
-        Terminator::ConditionalBranch { true_target, false_target, .. } => {
-            if let Some(p) = preds.get_mut(&BlockId::Named(true_target.clone())) {
-                p.push(from.clone());
-            }
-            if let Some(p) = preds.get_mut(&BlockId::Named(false_target.clone())) {
-                p.push(from);
-            }
-        }
-    }
-}
 
 /// Check if a slot exists in the shape
 fn is_slot_in_shape(slot: &HeapSlot, shape: &HeapShape, arg_shapes: &[Option<ValueShape>]) -> bool {
@@ -273,7 +223,7 @@ pub fn resolve_calls_via_slots(
     arg_shapes: &[Option<ValueShape>],
     global_closure_map: &GlobalClosureMap,
 ) -> CallResolutionResult {
-    let predecessors = compute_predecessors(cfg);
+    let predecessors = cfg.compute_predecessors();
 
     // Initialize slot mappings for arguments
     let mut initial_mapping = SlotMapping::new();

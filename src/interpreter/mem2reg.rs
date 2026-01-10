@@ -10,9 +10,10 @@
 //!
 //! This is the classic "mem2reg" or "alloca promotion" optimization from LLVM.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
-use crate::ir::{Block, Cfg, Instruction, Label, LocalId, LocalIdGenerator, Terminator};
+use crate::common::FxHashMap;
+use crate::ir::{Block, BlockId, Cfg, Instruction, Label, LocalId, LocalIdGenerator, Terminator};
 
 /// Result of the mem2reg pass
 #[derive(Debug)]
@@ -43,13 +44,6 @@ struct CellInfo {
     stores: Vec<(BlockId, usize, LocalId)>,
     /// All Load instructions from this cell: (block_id, instruction_index, target_id)
     loads: Vec<(BlockId, usize, LocalId)>,
-}
-
-/// Block identifier
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum BlockId {
-    Entry,
-    Named(Label),
 }
 
 /// Run the mem2reg pass on a CFG.
@@ -140,11 +134,11 @@ pub fn mem2reg(cfg: &Cfg, local_gen: &mut LocalIdGenerator) -> Mem2RegResult {
 
 /// Find all local cells (non-escaping allocations)
 fn find_local_cells(cfg: &Cfg) -> Vec<CellInfo> {
-    let mut allocations: HashMap<LocalId, CellInfo> = HashMap::new();
+    let mut allocations: FxHashMap<LocalId, CellInfo> = FxHashMap::default();
     let mut escaping: HashSet<LocalId> = HashSet::new();
 
     // First pass: find all Allocs
-    for (_, block) in iter_blocks_with_id(cfg) {
+    for (_, block) in cfg.iter_blocks_with_id() {
         for (target_id, instruction) in &block.instructions {
             if matches!(instruction, Instruction::Alloc) {
                 allocations.insert(*target_id, CellInfo {
@@ -157,7 +151,7 @@ fn find_local_cells(cfg: &Cfg) -> Vec<CellInfo> {
     }
 
     // Second pass: find uses and mark escaping cells
-    for (block_id, block) in iter_blocks_with_id(cfg) {
+    for (block_id, block) in cfg.iter_blocks_with_id() {
         for (idx, (target_id, instruction)) in block.instructions.iter().enumerate() {
             match instruction {
                 Instruction::Alloc => {
@@ -233,7 +227,7 @@ fn promote_cell_single_block(cfg: &mut Cfg, cell: &CellInfo) -> bool {
     let block = &mut cfg.entry;
 
     // Map from Load target to the value it should use
-    let mut load_replacements: HashMap<LocalId, LocalId> = HashMap::new();
+    let mut load_replacements: FxHashMap<LocalId, LocalId> = FxHashMap::default();
 
     // Build load replacements by tracking the current value
     let mut current_value: Option<LocalId> = None;
@@ -325,7 +319,7 @@ enum ReachingValue {
 /// Promote a cell in a multi-block CFG using SSA construction
 fn promote_cell_multi_block(cfg: &mut Cfg, cell: &CellInfo, local_gen: &mut LocalIdGenerator) -> bool {
     // Compute predecessors
-    let predecessors = compute_predecessors(cfg);
+    let predecessors = cfg.compute_predecessors();
 
     // Check if this is the simple "store once, read many" pattern
     // This is the most common case and doesn't need phi nodes
@@ -341,7 +335,7 @@ fn promote_cell_multi_block(cfg: &mut Cfg, cell: &CellInfo, local_gen: &mut Loca
     if entry_stores.len() == 1 && other_stores.is_empty() {
         let (_, _, source_value) = entry_stores[0];
 
-        let mut load_replacements: HashMap<LocalId, LocalId> = HashMap::new();
+        let mut load_replacements: FxHashMap<LocalId, LocalId> = FxHashMap::default();
         for (_, _, load_target) in &cell.loads {
             load_replacements.insert(*load_target, *source_value);
         }
@@ -374,7 +368,7 @@ fn promote_cell_multi_block(cfg: &mut Cfg, cell: &CellInfo, local_gen: &mut Loca
         });
 
         if all_loads_in_same_block_after_store {
-            let mut load_replacements: HashMap<LocalId, LocalId> = HashMap::new();
+            let mut load_replacements: FxHashMap<LocalId, LocalId> = FxHashMap::default();
             for (_, _, load_target) in &cell.loads {
                 load_replacements.insert(*load_target, *source_value);
             }
@@ -441,7 +435,7 @@ fn promote_cell_multi_block(cfg: &mut Cfg, cell: &CellInfo, local_gen: &mut Loca
         });
 
         if all_loads_reachable {
-            let mut load_replacements: HashMap<LocalId, LocalId> = HashMap::new();
+            let mut load_replacements: FxHashMap<LocalId, LocalId> = FxHashMap::default();
             for (_, _, load_target) in &cell.loads {
                 load_replacements.insert(*load_target, *source_value);
             }
@@ -469,10 +463,10 @@ fn promote_cell_with_ssa(
     cfg: &mut Cfg,
     cell: &CellInfo,
     local_gen: &mut LocalIdGenerator,
-    predecessors: &HashMap<BlockId, Vec<BlockId>>,
+    predecessors: &FxHashMap<BlockId, Vec<BlockId>>,
 ) -> bool {
     // Step 1: Group stores and loads by block
-    let mut stores_by_block: HashMap<BlockId, Vec<(usize, LocalId)>> = HashMap::new();
+    let mut stores_by_block: FxHashMap<BlockId, Vec<(usize, LocalId)>> = FxHashMap::default();
     for (block_id, idx, source) in &cell.stores {
         stores_by_block.entry(block_id.clone()).or_default().push((*idx, *source));
     }
@@ -481,7 +475,7 @@ fn promote_cell_with_ssa(
         stores.sort_by_key(|(idx, _)| *idx);
     }
 
-    let mut loads_by_block: HashMap<BlockId, Vec<(usize, LocalId)>> = HashMap::new();
+    let mut loads_by_block: FxHashMap<BlockId, Vec<(usize, LocalId)>> = FxHashMap::default();
     for (block_id, idx, target) in &cell.loads {
         loads_by_block.entry(block_id.clone()).or_default().push((*idx, *target));
     }
@@ -492,7 +486,7 @@ fn promote_cell_with_ssa(
 
     // Step 2: Compute block exit values using forward dataflow
     // For each block, what value does the cell hold when leaving the block?
-    let mut block_exit_values: HashMap<BlockId, ReachingValue> = HashMap::new();
+    let mut block_exit_values: FxHashMap<BlockId, ReachingValue> = FxHashMap::default();
 
     // Collect all block IDs
     let mut all_block_ids: Vec<BlockId> = vec![BlockId::Entry];
@@ -560,7 +554,7 @@ fn promote_cell_with_ssa(
     }
 
     // Step 3: Compute entry values and load replacements
-    let mut block_entry_values: HashMap<BlockId, ReachingValue> = HashMap::new();
+    let mut block_entry_values: FxHashMap<BlockId, ReachingValue> = FxHashMap::default();
     block_entry_values.insert(BlockId::Entry, ReachingValue::Undefined);
 
     for block_id in &all_block_ids {
@@ -573,9 +567,9 @@ fn promote_cell_with_ssa(
     }
 
     // Step 4: For each load, determine what value it should use
-    let mut load_replacements: HashMap<LocalId, LocalId> = HashMap::new();
+    let mut load_replacements: FxHashMap<LocalId, LocalId> = FxHashMap::default();
     // Track phi nodes to insert: block_id -> (phi_result_id, branches)
-    let mut phi_nodes: HashMap<BlockId, (LocalId, Vec<(Label, LocalId)>)> = HashMap::new();
+    let mut phi_nodes: FxHashMap<BlockId, (LocalId, Vec<(Label, LocalId)>)> = FxHashMap::default();
 
     for (block_id, loads) in &loads_by_block {
         let entry_value = block_entry_values.get(block_id).cloned().unwrap_or(ReachingValue::Undefined);
@@ -668,7 +662,7 @@ fn promote_cell_with_ssa(
 /// Compute the entry value for a block by merging predecessor exit values
 fn compute_entry_value(
     predecessors: &[BlockId],
-    block_exit_values: &HashMap<BlockId, ReachingValue>,
+    block_exit_values: &FxHashMap<BlockId, ReachingValue>,
 ) -> ReachingValue {
     let mut result = ReachingValue::Undefined;
 
@@ -782,7 +776,7 @@ fn merge_with_pred(current: &ReachingValue, incoming: &ReachingValue, pred_label
 fn compute_block_exit_value(
     _block_id: &BlockId,
     entry_value: &ReachingValue,
-    stores_by_block: &HashMap<BlockId, Vec<(usize, LocalId)>>,
+    stores_by_block: &FxHashMap<BlockId, Vec<(usize, LocalId)>>,
     _block: &Block,
 ) -> ReachingValue {
     let stores = stores_by_block.get(_block_id).cloned().unwrap_or_default();
@@ -831,7 +825,7 @@ fn normalize_reaching_value(value: &ReachingValue) -> ReachingValue {
 fn rewrite_block_for_cell(
     block: &mut Block,
     cell: &CellInfo,
-    load_replacements: &HashMap<LocalId, LocalId>,
+    load_replacements: &FxHashMap<LocalId, LocalId>,
 ) {
     let new_instructions: Vec<_> = block.instructions.iter()
         .filter_map(|(target_id, instruction)| {
@@ -883,48 +877,6 @@ fn rewrite_block_for_cell(
     block.terminator = (*term_id, new_term);
 }
 
-/// Compute predecessor map for the CFG
-fn compute_predecessors(cfg: &Cfg) -> HashMap<BlockId, Vec<BlockId>> {
-    let mut preds: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
-
-    // Entry block's successors
-    add_successors(cfg.entry.terminator_kind(), BlockId::Entry, &mut preds);
-
-    // Named blocks' successors
-    for (label, block) in &cfg.named {
-        add_successors(block.terminator_kind(), BlockId::Named(label.clone()), &mut preds);
-    }
-
-    preds
-}
-
-fn add_successors(term: &Terminator, from: BlockId, preds: &mut HashMap<BlockId, Vec<BlockId>>) {
-    match term {
-        Terminator::UnconditionalBranch { target } => {
-            preds.entry(BlockId::Named(target.clone())).or_default().push(from);
-        }
-        Terminator::ConditionalBranch { true_target, false_target, .. } => {
-            preds.entry(BlockId::Named(true_target.clone())).or_default().push(from.clone());
-            preds.entry(BlockId::Named(false_target.clone())).or_default().push(from);
-        }
-        Terminator::Return { .. } | Terminator::Deopt { .. } => {}
-    }
-}
-
-/// Remove promoted cell operations from the CFG
-fn cleanup_promoted_cells(cfg: &mut Cfg, cells: &[CellInfo]) {
-    // This is now handled in the rewrite functions
-    // Kept for potential future cleanup needs
-}
-
-/// Iterate over all blocks with their IDs
-fn iter_blocks_with_id(cfg: &Cfg) -> Vec<(BlockId, &Block)> {
-    let mut result = vec![(BlockId::Entry, &cfg.entry)];
-    for (label, block) in &cfg.named {
-        result.push((BlockId::Named(label.clone()), block));
-    }
-    result
-}
 
 #[cfg(test)]
 mod tests {

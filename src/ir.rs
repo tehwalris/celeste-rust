@@ -455,6 +455,23 @@ impl Block {
     }
 }
 
+/// Identifies a block in a CFG, distinguishing between the entry block and named blocks.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum BlockId {
+    Entry,
+    Named(Label),
+}
+
+impl BlockId {
+    /// Get the label for this block (entry block uses the special entry label for phi nodes).
+    pub fn label(&self) -> Label {
+        match self {
+            BlockId::Entry => Label::entry(),
+            BlockId::Named(label) => label.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Cfg {
     pub entry: Block,
@@ -470,6 +487,64 @@ impl Cfg {
         Self {
             entry: f(&self.entry),
             named: self.named.iter().map(|(k, v)| (k.clone(), f(v))).collect(),
+        }
+    }
+
+    /// Iterate over all blocks with their BlockId.
+    pub fn iter_blocks_with_id(&self) -> impl Iterator<Item = (BlockId, &Block)> {
+        std::iter::once((BlockId::Entry, &self.entry)).chain(
+            self.named
+                .iter()
+                .map(|(label, block)| (BlockId::Named(label.clone()), block)),
+        )
+    }
+
+    /// Compute predecessor map for all blocks.
+    ///
+    /// Returns a map from each block to the list of blocks that can branch to it.
+    /// The entry block has no predecessors (empty Vec).
+    pub fn compute_predecessors(&self) -> FxHashMap<BlockId, Vec<BlockId>> {
+        let mut preds: FxHashMap<BlockId, Vec<BlockId>> = FxHashMap::default();
+
+        // Initialize all blocks with empty predecessor lists
+        preds.insert(BlockId::Entry, Vec::new());
+        for label in self.named.keys() {
+            preds.insert(BlockId::Named(label.clone()), Vec::new());
+        }
+
+        // Add predecessors from each block's terminator
+        for (block_id, block) in self.iter_blocks_with_id() {
+            Self::add_successors_as_predecessors(block.terminator_kind(), block_id, &mut preds);
+        }
+
+        preds
+    }
+
+    /// Helper to add predecessor edges from a terminator.
+    fn add_successors_as_predecessors(
+        terminator: &Terminator,
+        from: BlockId,
+        preds: &mut FxHashMap<BlockId, Vec<BlockId>>,
+    ) {
+        match terminator {
+            Terminator::Return { .. } | Terminator::Deopt { .. } => {}
+            Terminator::UnconditionalBranch { target } => {
+                if let Some(p) = preds.get_mut(&BlockId::Named(target.clone())) {
+                    p.push(from);
+                }
+            }
+            Terminator::ConditionalBranch {
+                true_target,
+                false_target,
+                ..
+            } => {
+                if let Some(p) = preds.get_mut(&BlockId::Named(true_target.clone())) {
+                    p.push(from.clone());
+                }
+                if let Some(p) = preds.get_mut(&BlockId::Named(false_target.clone())) {
+                    p.push(from);
+                }
+            }
         }
     }
 }
