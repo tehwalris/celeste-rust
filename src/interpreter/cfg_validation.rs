@@ -8,7 +8,7 @@
 //! - Type mismatches (e.g., Load from a value instead of pointer)
 
 use crate::interpreter::common::{FxHashMap, FxHashSet};
-use crate::ir::{Block, BlockId, Cfg, Instruction, Label, LocalId, Terminator};
+use crate::ir::{Block, BlockId, Cfg, Instruction, Label, LocalId};
 
 /// The "type" of a value in SSA form - used for validation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -286,29 +286,12 @@ fn validate_branch_targets(
     block_names: &FxHashSet<String>,
     errors: &mut Vec<ValidationError>,
 ) {
-    match block.terminator_kind() {
-        Terminator::Return { .. } | Terminator::Deopt { .. } => {}
-        Terminator::UnconditionalBranch { target } => {
-            if !block_names.contains(target.as_str()) {
-                errors.push(ValidationError::BranchTargetNotFound {
-                    from_block: block_name.to_string(),
-                    target: target.clone(),
-                });
-            }
-        }
-        Terminator::ConditionalBranch { true_target, false_target, .. } => {
-            if !block_names.contains(true_target.as_str()) {
-                errors.push(ValidationError::BranchTargetNotFound {
-                    from_block: block_name.to_string(),
-                    target: true_target.clone(),
-                });
-            }
-            if !block_names.contains(false_target.as_str()) {
-                errors.push(ValidationError::BranchTargetNotFound {
-                    from_block: block_name.to_string(),
-                    target: false_target.clone(),
-                });
-            }
+    for target in block.terminator_kind().get_successor_labels() {
+        if !block_names.contains(target.as_str()) {
+            errors.push(ValidationError::BranchTargetNotFound {
+                from_block: block_name.to_string(),
+                target: target.clone(),
+            });
         }
     }
 }
