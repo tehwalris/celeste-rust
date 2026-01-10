@@ -1285,21 +1285,20 @@ mod tests {
     fn test_simple_cfg_no_heap() {
         // CFG: %0 = NumberConstant(5); return %0
         // Should return NotApplicable since there's nothing to transform
-        let entry = Block {
-            instructions: vec![(
+        let entry = Block::new_for_test(
+            vec![(
                 LocalId::from(0),
                 Instruction::NumberConstant {
                     value: Pico8Num::from_i16(5),
                 },
             )],
-            terminator: (
+            (
                 LocalId::from(1),
                 Terminator::Return {
                     value: Some(LocalId::from(0)),
                 },
             ),
-            hint_normalize: false,
-        };
+        );
 
         let cfg = Cfg {
             entry,
@@ -1317,8 +1316,8 @@ mod tests {
     #[test]
     fn test_simple_global_read() {
         // CFG: %0 = GetGlobal("x"); %1 = Load(%0); return %1
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (
                     LocalId::from(0),
                     Instruction::GetGlobal {
@@ -1328,14 +1327,13 @@ mod tests {
                 ),
                 (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
             ],
-            terminator: (
+            (
                 LocalId::from(2),
                 Terminator::Return {
                     value: Some(LocalId::from(1)),
                 },
             ),
-            hint_normalize: false,
-        };
+        );
 
         let cfg = Cfg {
             entry,
@@ -1363,8 +1361,8 @@ mod tests {
     fn test_getglobal_create_if_missing_allowed() {
         // CFG: %0 = GetGlobal("x", create_if_missing=true); %1 = Load(%0); return %1
         // create_if_missing is allowed - we still track the global properly
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (
                     LocalId::from(0),
                     Instruction::GetGlobal {
@@ -1374,9 +1372,8 @@ mod tests {
                 ),
                 (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
             ],
-            terminator: (LocalId::from(2), Terminator::Return { value: Some(LocalId::from(1)) }),
-            hint_normalize: false,
-        };
+            (LocalId::from(2), Terminator::Return { value: Some(LocalId::from(1)) }),
+        );
 
         let cfg = Cfg {
             entry,
@@ -1406,8 +1403,8 @@ mod tests {
     fn test_pure_builtin_allowed() {
         // CFG: %0 = GetGlobal("x"); %1 = Load(%0); %2 = CallBuiltin("max", [%1, %1]); return %2
         // Pure builtins like max should be allowed
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (
                     LocalId::from(0),
                     Instruction::GetGlobal {
@@ -1424,14 +1421,13 @@ mod tests {
                     },
                 ),
             ],
-            terminator: (
+            (
                 LocalId::from(3),
                 Terminator::Return {
                     value: Some(LocalId::from(2)),
                 },
             ),
-            hint_normalize: false,
-        };
+        );
 
         let cfg = Cfg {
             entry,
@@ -1453,8 +1449,8 @@ mod tests {
     fn test_impure_builtin_rejected() {
         // CFG: %0 = GetGlobal("x"); %1 = Load(%0); %2 = CallBuiltin("add", [%1, %1]); return %2
         // Impure builtins like add (modifies tables) should be rejected
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (
                     LocalId::from(0),
                     Instruction::GetGlobal {
@@ -1471,14 +1467,13 @@ mod tests {
                     },
                 ),
             ],
-            terminator: (
+            (
                 LocalId::from(3),
                 Terminator::Return {
                     value: Some(LocalId::from(2)),
                 },
             ),
-            hint_normalize: false,
-        };
+        );
 
         let cfg = Cfg {
             entry,
@@ -1535,8 +1530,8 @@ mod tests {
     fn test_constant_global_load() {
         // CFG: %0 = GetGlobal("k_left"); %1 = Load(%0); return %1
         // k_left is a constant (0), so Load should become NumberConstant(0)
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (
                     LocalId::from(0),
                     Instruction::GetGlobal {
@@ -1546,14 +1541,13 @@ mod tests {
                 ),
                 (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
             ],
-            terminator: (
+            (
                 LocalId::from(2),
                 Terminator::Return {
                     value: Some(LocalId::from(1)),
                 },
             ),
-            hint_normalize: false,
-        };
+        );
 
         let cfg = Cfg {
             entry,
@@ -1591,8 +1585,8 @@ mod tests {
     fn test_constant_global_write_aborts() {
         // CFG: %0 = GetGlobal("k_left"); %1 = NumberConstant(5); Store(%0, %1); return
         // k_left is a constant, so Store should cause ConstantViolation
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (
                     LocalId::from(0),
                     Instruction::GetGlobal {
@@ -1614,9 +1608,8 @@ mod tests {
                     },
                 ),
             ],
-            terminator: (LocalId::from(3), Terminator::Return { value: None }),
-            hint_normalize: false,
-        };
+            (LocalId::from(3), Terminator::Return { value: None }),
+        );
 
         let cfg = Cfg {
             entry,
@@ -1645,8 +1638,8 @@ mod tests {
         // %0 = GetGlobal("k_left"); %1 = Load(%0);  // constant -> NumberConstant
         // %2 = GetGlobal("x"); %3 = Load(%2);       // leaf -> SSA Load
         // %4 = BinaryOp(%1, Plus, %3); return %4
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (
                     LocalId::from(0),
                     Instruction::GetGlobal {
@@ -1672,14 +1665,13 @@ mod tests {
                     },
                 ),
             ],
-            terminator: (
+            (
                 LocalId::from(5),
                 Terminator::Return {
                     value: Some(LocalId::from(4)),
                 },
             ),
-            hint_normalize: false,
-        };
+        );
 
         let cfg = Cfg {
             entry,
@@ -1722,21 +1714,20 @@ mod tests {
         // arg0 is a constant (42), so Load should become NumberConstant(42)
         let arg0_id = LocalId::from(10);
 
-        let entry = Block {
-            instructions: vec![(
+        let entry = Block::new_for_test(
+            vec![(
                 LocalId::from(0),
                 Instruction::Load {
                     source: arg0_id,
                 },
             )],
-            terminator: (
+            (
                 LocalId::from(1),
                 Terminator::Return {
                     value: Some(LocalId::from(0)),
                 },
             ),
-            hint_normalize: false,
-        };
+        );
 
         let cfg = Cfg {
             entry,
@@ -1780,8 +1771,8 @@ mod tests {
         // Writing to a constant argument should cause ConstantViolation
         let arg0_id = LocalId::from(10);
 
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (
                     LocalId::from(0),
                     Instruction::NumberConstant {
@@ -1796,9 +1787,8 @@ mod tests {
                     },
                 ),
             ],
-            terminator: (LocalId::from(2), Terminator::Return { value: None }),
-            hint_normalize: false,
-        };
+            (LocalId::from(2), Terminator::Return { value: None }),
+        );
 
         let cfg = Cfg {
             entry,
@@ -1834,8 +1824,8 @@ mod tests {
         // arg0.x is a constant (7), so Load should become NumberConstant(7)
         let arg0_id = LocalId::from(10);
 
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (
                     LocalId::from(0),
                     Instruction::GetField {
@@ -1851,14 +1841,13 @@ mod tests {
                     },
                 ),
             ],
-            terminator: (
+            (
                 LocalId::from(2),
                 Terminator::Return {
                     value: Some(LocalId::from(1)),
                 },
             ),
-            hint_normalize: false,
-        };
+        );
 
         let cfg = Cfg {
             entry,
@@ -1910,8 +1899,8 @@ mod tests {
         // arg0 is at LocalId 10
         let arg0_id = LocalId::from(10);
 
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 // %0 = GetField(arg0, "foo") - get the foo method from arg0
                 (
                     LocalId::from(0),
@@ -1944,14 +1933,13 @@ mod tests {
                     },
                 ),
             ],
-            terminator: (
+            (
                 LocalId::from(4),
                 Terminator::Return {
                     value: Some(LocalId::from(3)),
                 },
             ),
-            hint_normalize: false,
-        };
+        );
 
         let cfg = Cfg {
             entry,
@@ -2007,8 +1995,8 @@ mod tests {
         // Test that accessing a global NOT in the shape works without deopt
         // The original Load/Store instructions are kept but we still track the slot
         // CFG: %0 = GetGlobal("unknown"); %1 = Load(%0); %2 = Store(%0, %1); return
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (
                     LocalId::from(0),
                     Instruction::GetGlobal {
@@ -2025,9 +2013,8 @@ mod tests {
                     },
                 ),
             ],
-            terminator: (LocalId::from(3), Terminator::Return { value: None }),
-            hint_normalize: false,
-        };
+            (LocalId::from(3), Terminator::Return { value: None }),
+        );
 
         let cfg = Cfg {
             entry,
@@ -2066,8 +2053,8 @@ mod tests {
         // %0 = GetGlobal("x"); %1 = Load(%0);  // known - SSA promoted
         // %2 = GetGlobal("unknown"); %3 = Load(%2);  // unknown - kept as is
         // %4 = BinaryOp(%1, Plus, %3); return %4
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (
                     LocalId::from(0),
                     Instruction::GetGlobal {
@@ -2093,9 +2080,8 @@ mod tests {
                     },
                 ),
             ],
-            terminator: (LocalId::from(5), Terminator::Return { value: Some(LocalId::from(4)) }),
-            hint_normalize: false,
-        };
+            (LocalId::from(5), Terminator::Return { value: Some(LocalId::from(4)) }),
+        );
 
         let cfg = Cfg {
             entry,
@@ -2157,8 +2143,8 @@ mod tests {
         // Expected: %4 should track to _G.player, so %5 tracks to _G.player.x
         // and the final Load can be SSA-promoted.
 
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (
                     LocalId::from(0),
                     Instruction::GetGlobal {
@@ -2186,12 +2172,11 @@ mod tests {
                 ),
                 (LocalId::from(6), Instruction::Load { source: LocalId::from(5) }),
             ],
-            terminator: (
+            (
                 LocalId::from(7),
                 Terminator::Return { value: Some(LocalId::from(6)) },
             ),
-            hint_normalize: false,
-        };
+        );
 
         let cfg = Cfg {
             entry,
@@ -2255,8 +2240,8 @@ mod tests {
         let cell_id = LocalId::from(0);
         let value_id = LocalId::from(2);
 
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (cell_id, Instruction::Alloc),
                 (
                     LocalId::from(1),
@@ -2283,12 +2268,11 @@ mod tests {
                     },
                 ),
             ],
-            terminator: (
+            (
                 LocalId::from(7),
                 Terminator::Return { value: Some(LocalId::from(6)) },
             ),
-            hint_normalize: false,
-        };
+        );
 
         let cfg = Cfg {
             entry,
@@ -2360,8 +2344,8 @@ mod tests {
         //
         // Both %4 and %7 should track to _G.player
 
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (
                     LocalId::from(0),
                     Instruction::GetGlobal {
@@ -2407,12 +2391,11 @@ mod tests {
                     },
                 ),
             ],
-            terminator: (
+            (
                 LocalId::from(11),
                 Terminator::Return { value: Some(LocalId::from(10)) },
             ),
-            hint_normalize: false,
-        };
+        );
 
         let cfg = Cfg {
             entry,
@@ -2474,8 +2457,8 @@ mod tests {
         //
         // After reassignment, Load(%4) should track to player2, not player1
 
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (
                     LocalId::from(0),
                     Instruction::GetGlobal {
@@ -2518,12 +2501,11 @@ mod tests {
                 ),
                 (LocalId::from(9), Instruction::Load { source: LocalId::from(8) }),
             ],
-            terminator: (
+            (
                 LocalId::from(10),
                 Terminator::Return { value: Some(LocalId::from(9)) },
             ),
-            hint_normalize: false,
-        };
+        );
 
         let cfg = Cfg {
             entry,
@@ -2577,8 +2559,8 @@ mod tests {
         //
         // Pointer should flow: player -> cell1 -> cell2 -> GetField
 
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (
                     LocalId::from(0),
                     Instruction::GetGlobal {
@@ -2615,12 +2597,11 @@ mod tests {
                 ),
                 (LocalId::from(9), Instruction::Load { source: LocalId::from(8) }),
             ],
-            terminator: (
+            (
                 LocalId::from(10),
                 Terminator::Return { value: Some(LocalId::from(9)) },
             ),
-            hint_normalize: false,
-        };
+        );
 
         let cfg = Cfg {
             entry,
@@ -2663,8 +2644,8 @@ mod tests {
         //
         // Should handle gracefully - no tracking, but no crash
 
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (LocalId::from(0), Instruction::Alloc),
                 (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
                 (
@@ -2677,12 +2658,11 @@ mod tests {
                 ),
                 (LocalId::from(3), Instruction::Load { source: LocalId::from(2) }),
             ],
-            terminator: (
+            (
                 LocalId::from(4),
                 Terminator::Return { value: Some(LocalId::from(3)) },
             ),
-            hint_normalize: false,
-        };
+        );
 
         let cfg = Cfg {
             entry,
@@ -2719,8 +2699,8 @@ mod tests {
     fn test_stop_mode_rewrites_remaining_instructions() {
         // CFG: GetGlobal(btn) -> Load -> Call
         // Shape: btn is a Leaf (incorrectly, but this is what triggers the bug)
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (
                     LocalId::from(0),
                     Instruction::GetGlobal {
@@ -2743,12 +2723,11 @@ mod tests {
                     },
                 ),
             ],
-            terminator: (
+            (
                 LocalId::from(4),
                 Terminator::Return { value: Some(LocalId::from(3)) },
             ),
-            hint_normalize: false,
-        };
+        );
 
         let cfg = Cfg {
             entry,

@@ -890,8 +890,8 @@ mod tests {
         // CFG: %0 = Alloc; Store(0, 2); %3 = Load(0); %4 = UnaryOp(Hash, 3); Return(4)
         // Should become: %4 = UnaryOp(Hash, 2); Return(4)
 
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (LocalId::from(0), Instruction::Alloc),
                 (LocalId::from(1), Instruction::Store {
                     target: LocalId::from(0),
@@ -903,9 +903,8 @@ mod tests {
                     arg: LocalId::from(3)
                 }),
             ],
-            terminator: (LocalId::from(5), Terminator::Return { value: Some(LocalId::from(4)) }),
-            hint_normalize: false,
-        };
+            (LocalId::from(5), Terminator::Return { value: Some(LocalId::from(4)) }),
+        );
 
         let cfg = Cfg {
             entry,
@@ -936,13 +935,12 @@ mod tests {
     #[test]
     fn test_no_cells() {
         // CFG with no Alloc
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(5) }),
             ],
-            terminator: (LocalId::from(1), Terminator::Return { value: Some(LocalId::from(0)) }),
-            hint_normalize: false,
-        };
+            (LocalId::from(1), Terminator::Return { value: Some(LocalId::from(0)) }),
+        );
 
         let cfg = Cfg {
             entry,
@@ -986,8 +984,8 @@ mod tests {
 
         use crate::ir::BinaryOp;
 
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (LocalId::from(0), Instruction::Alloc),
                 (LocalId::from(1), Instruction::NumberConstant { value: Pico8Num::from_i16(0) }),
                 (LocalId::from(2), Instruction::Store {
@@ -996,14 +994,13 @@ mod tests {
                 }),
                 (LocalId::from(3), Instruction::Load { source: LocalId::from(0) }),  // Load for first use
             ],
-            terminator: (LocalId::from(4), Terminator::UnconditionalBranch {
+            (LocalId::from(4), Terminator::UnconditionalBranch {
                 target: Label::from("block_a".to_string()),
             }),
-            hint_normalize: false,
-        };
+        );
 
-        let block_a = Block {
-            instructions: vec![
+        let block_a = Block::new_for_test(
+            vec![
                 (LocalId::from(5), Instruction::Load { source: LocalId::from(0) }),  // Load i
                 (LocalId::from(6), Instruction::NumberConstant { value: Pico8Num::from_i16(1) }),
                 (LocalId::from(7), Instruction::BinaryOp {
@@ -1017,9 +1014,8 @@ mod tests {
                 }),
                 (LocalId::from(9), Instruction::Load { source: LocalId::from(0) }),  // Load modified i
             ],
-            terminator: (LocalId::from(10), Terminator::Return { value: Some(LocalId::from(9)) }),
-            hint_normalize: false,
-        };
+            (LocalId::from(10), Terminator::Return { value: Some(LocalId::from(9)) }),
+        );
 
         let mut named: FxHashMap<Label, Block> = FxHashMap::default();
         named.insert(Label::from("block_a".to_string()), block_a);
@@ -1086,54 +1082,50 @@ mod tests {
         //     %3 = Load(%0)  // x could be 1 or 2 - needs phi!
         //     return %3
 
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (LocalId::from(0), Instruction::Alloc),
                 (LocalId::from(100), Instruction::BoolConstant { value: true }),  // condition
             ],
-            terminator: (LocalId::from(101), Terminator::ConditionalBranch {
+            (LocalId::from(101), Terminator::ConditionalBranch {
                 condition: LocalId::from(100),
                 true_target: Label::from("block_a".to_string()),
                 false_target: Label::from("block_b".to_string()),
             }),
-            hint_normalize: false,
-        };
+        );
 
-        let block_a = Block {
-            instructions: vec![
+        let block_a = Block::new_for_test(
+            vec![
                 (LocalId::from(1), Instruction::NumberConstant { value: Pico8Num::from_i16(1) }),
                 (LocalId::from(10), Instruction::Store {
                     target: LocalId::from(0),
                     source: LocalId::from(1),
                 }),
             ],
-            terminator: (LocalId::from(11), Terminator::UnconditionalBranch {
+            (LocalId::from(11), Terminator::UnconditionalBranch {
                 target: Label::from("block_c".to_string()),
             }),
-            hint_normalize: false,
-        };
+        );
 
-        let block_b = Block {
-            instructions: vec![
+        let block_b = Block::new_for_test(
+            vec![
                 (LocalId::from(2), Instruction::NumberConstant { value: Pico8Num::from_i16(2) }),
                 (LocalId::from(20), Instruction::Store {
                     target: LocalId::from(0),
                     source: LocalId::from(2),
                 }),
             ],
-            terminator: (LocalId::from(21), Terminator::UnconditionalBranch {
+            (LocalId::from(21), Terminator::UnconditionalBranch {
                 target: Label::from("block_c".to_string()),
             }),
-            hint_normalize: false,
-        };
+        );
 
-        let block_c = Block {
-            instructions: vec![
+        let block_c = Block::new_for_test(
+            vec![
                 (LocalId::from(3), Instruction::Load { source: LocalId::from(0) }),
             ],
-            terminator: (LocalId::from(30), Terminator::Return { value: Some(LocalId::from(3)) }),
-            hint_normalize: false,
-        };
+            (LocalId::from(30), Terminator::Return { value: Some(LocalId::from(3)) }),
+        );
 
         let mut named: FxHashMap<Label, Block> = FxHashMap::default();
         named.insert(Label::from("block_a".to_string()), block_a);

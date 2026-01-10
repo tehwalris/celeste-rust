@@ -227,8 +227,8 @@ mod tests {
         // %3 = Call(%1, [%2])
         // return %3
 
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (
                     LocalId::from(0),
                     Instruction::GetGlobal {
@@ -256,14 +256,13 @@ mod tests {
                     },
                 ),
             ],
-            terminator: (
+            (
                 LocalId::from(4),
                 Terminator::Return {
                     value: Some(LocalId::from(3)),
                 },
             ),
-            hint_normalize: false,
-        };
+        );
 
         Cfg {
             entry,

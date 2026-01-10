@@ -273,24 +273,22 @@ mod tests {
         // block_a: const 10, return
         // Should become: Entry: const 5, const 10, return
 
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(5) }),
             ],
-            terminator: (
+            (
                 LocalId::from(1),
                 Terminator::UnconditionalBranch { target: Label::from("block_a".to_string()) },
             ),
-            hint_normalize: false,
-        };
+        );
 
-        let block_a = Block {
-            instructions: vec![
+        let block_a = Block::new_for_test(
+            vec![
                 (LocalId::from(2), Instruction::NumberConstant { value: Pico8Num::from_i16(10) }),
             ],
-            terminator: (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
-            hint_normalize: false,
-        };
+            (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
+        );
 
         let mut named: FxHashMap<Label, Block> = FxHashMap::default();
         named.insert(Label::from("block_a".to_string()), block_a);
@@ -316,11 +314,11 @@ mod tests {
         // block_a: return
         // Should NOT coalesce (block_a has 2 predecessors)
 
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (LocalId::from(0), Instruction::BoolConstant { value: true }),
             ],
-            terminator: (
+            (
                 LocalId::from(1),
                 Terminator::ConditionalBranch {
                     condition: LocalId::from(0),
@@ -328,14 +326,12 @@ mod tests {
                     false_target: Label::from("block_a".to_string()),
                 },
             ),
-            hint_normalize: false,
-        };
+        );
 
-        let block_a = Block {
-            instructions: vec![],
-            terminator: (LocalId::from(2), Terminator::Return { value: None }),
-            hint_normalize: false,
-        };
+        let block_a = Block::new_for_test(
+            vec![],
+            (LocalId::from(2), Terminator::Return { value: None }),
+        );
 
         let mut named: FxHashMap<Label, Block> = FxHashMap::default();
         named.insert(Label::from("block_a".to_string()), block_a);
@@ -351,35 +347,32 @@ mod tests {
         // Entry -> block_a -> block_b -> return
         // Should coalesce all into entry
 
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(1) }),
             ],
-            terminator: (
+            (
                 LocalId::from(1),
                 Terminator::UnconditionalBranch { target: Label::from("block_a".to_string()) },
             ),
-            hint_normalize: false,
-        };
+        );
 
-        let block_a = Block {
-            instructions: vec![
+        let block_a = Block::new_for_test(
+            vec![
                 (LocalId::from(2), Instruction::NumberConstant { value: Pico8Num::from_i16(2) }),
             ],
-            terminator: (
+            (
                 LocalId::from(3),
                 Terminator::UnconditionalBranch { target: Label::from("block_b".to_string()) },
             ),
-            hint_normalize: false,
-        };
+        );
 
-        let block_b = Block {
-            instructions: vec![
+        let block_b = Block::new_for_test(
+            vec![
                 (LocalId::from(4), Instruction::NumberConstant { value: Pico8Num::from_i16(3) }),
             ],
-            terminator: (LocalId::from(5), Terminator::Return { value: Some(LocalId::from(4)) }),
-            hint_normalize: false,
-        };
+            (LocalId::from(5), Terminator::Return { value: Some(LocalId::from(4)) }),
+        );
 
         let mut named: FxHashMap<Label, Block> = FxHashMap::default();
         named.insert(Label::from("block_a".to_string()), block_a);

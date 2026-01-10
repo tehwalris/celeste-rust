@@ -429,13 +429,12 @@ mod tests {
     #[test]
     fn test_valid_simple_cfg() {
         let cfg = Cfg {
-            entry: Block {
-                instructions: vec![
+            entry: Block::new_for_test(
+                vec![
                     (LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(42) }),
                 ],
-                terminator: (LocalId::from(1), Terminator::Return { value: Some(LocalId::from(0)) }),
-                hint_normalize: false,
-            },
+                (LocalId::from(1), Terminator::Return { value: Some(LocalId::from(0)) }),
+            ),
             named: Default::default(),
         };
 
@@ -446,11 +445,10 @@ mod tests {
     #[test]
     fn test_undefined_local() {
         let cfg = Cfg {
-            entry: Block {
-                instructions: vec![],
-                terminator: (LocalId::from(0), Terminator::Return { value: Some(LocalId::from(99)) }), // 99 is undefined
-                hint_normalize: false,
-            },
+            entry: Block::new_for_test(
+                vec![],
+                (LocalId::from(0), Terminator::Return { value: Some(LocalId::from(99)) }), // 99 is undefined
+            ),
             named: Default::default(),
         };
 
@@ -464,23 +462,21 @@ mod tests {
         let mut named = FxHashMap::default();
         named.insert(
             Label::from("block1".to_string()),
-            Block {
-                instructions: vec![
+            Block::new_for_test(
+                vec![
                     (LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(1) }), // Same ID as entry
                 ],
-                terminator: (LocalId::from(2), Terminator::Return { value: Some(LocalId::from(0)) }),
-                hint_normalize: false,
-            },
+                (LocalId::from(2), Terminator::Return { value: Some(LocalId::from(0)) }),
+            ),
         );
 
         let cfg = Cfg {
-            entry: Block {
-                instructions: vec![
+            entry: Block::new_for_test(
+                vec![
                     (LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(42) }),
                 ],
-                terminator: (LocalId::from(1), Terminator::UnconditionalBranch { target: Label::from("block1".to_string()) }),
-                hint_normalize: false,
-            },
+                (LocalId::from(1), Terminator::UnconditionalBranch { target: Label::from("block1".to_string()) }),
+            ),
             named,
         };
 
@@ -494,27 +490,25 @@ mod tests {
         let mut named = FxHashMap::default();
         named.insert(
             Label::from("join".to_string()),
-            Block {
-                instructions: vec![
+            Block::new_for_test(
+                vec![
                     (LocalId::from(2), Instruction::Phi {
                         branches: vec![
                             (Label::from("nonexistent".to_string()), LocalId::from(0)),
                         ],
                     }),
                 ],
-                terminator: (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
-                hint_normalize: false,
-            },
+                (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
+            ),
         );
 
         let cfg = Cfg {
-            entry: Block {
-                instructions: vec![
+            entry: Block::new_for_test(
+                vec![
                     (LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(42) }),
                 ],
-                terminator: (LocalId::from(1), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
-                hint_normalize: false,
-            },
+                (LocalId::from(1), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
+            ),
             named,
         };
 
@@ -526,11 +520,10 @@ mod tests {
     #[test]
     fn test_branch_target_not_found() {
         let cfg = Cfg {
-            entry: Block {
-                instructions: vec![],
-                terminator: (LocalId::from(0), Terminator::UnconditionalBranch { target: Label::from("nonexistent".to_string()) }),
-                hint_normalize: false,
-            },
+            entry: Block::new_for_test(
+                vec![],
+                (LocalId::from(0), Terminator::UnconditionalBranch { target: Label::from("nonexistent".to_string()) }),
+            ),
             named: Default::default(),
         };
 
@@ -546,8 +539,8 @@ mod tests {
         let mut named = FxHashMap::default();
         named.insert(
             Label::from("join".to_string()),
-            Block {
-                instructions: vec![
+            Block::new_for_test(
+                vec![
                     // Phi merges values from two branches
                     (LocalId::from(3), Instruction::Phi {
                         branches: vec![
@@ -559,29 +552,26 @@ mod tests {
                     // Phi produces a VALUE, not a pointer, so this should be flagged.
                     (LocalId::from(4), Instruction::Load { source: LocalId::from(3) }),
                 ],
-                terminator: (LocalId::from(5), Terminator::Return { value: Some(LocalId::from(4)) }),
-                hint_normalize: false,
-            },
+                (LocalId::from(5), Terminator::Return { value: Some(LocalId::from(4)) }),
+            ),
         );
         named.insert(
             Label::from("other".to_string()),
-            Block {
-                instructions: vec![
+            Block::new_for_test(
+                vec![
                     (LocalId::from(2), Instruction::NumberConstant { value: Pico8Num::from_i16(99) }),
                 ],
-                terminator: (LocalId::from(6), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
-                hint_normalize: false,
-            },
+                (LocalId::from(6), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
+            ),
         );
 
         let cfg = Cfg {
-            entry: Block {
-                instructions: vec![
+            entry: Block::new_for_test(
+                vec![
                     (LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(42) }),
                 ],
-                terminator: (LocalId::from(1), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
-                hint_normalize: false,
-            },
+                (LocalId::from(1), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
+            ),
             named,
         };
 
@@ -600,14 +590,13 @@ mod tests {
     fn test_load_from_alloc_is_valid() {
         // Load from Alloc is valid - Alloc produces a pointer
         let cfg = Cfg {
-            entry: Block {
-                instructions: vec![
+            entry: Block::new_for_test(
+                vec![
                     (LocalId::from(0), Instruction::Alloc),
                     (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
                 ],
-                terminator: (LocalId::from(2), Terminator::Return { value: Some(LocalId::from(1)) }),
-                hint_normalize: false,
-            },
+                (LocalId::from(2), Terminator::Return { value: Some(LocalId::from(1)) }),
+            ),
             named: Default::default(),
         };
 
@@ -619,8 +608,8 @@ mod tests {
     fn test_load_from_getfield_is_valid() {
         // Load from GetField is valid - GetField produces a pointer
         let cfg = Cfg {
-            entry: Block {
-                instructions: vec![
+            entry: Block::new_for_test(
+                vec![
                     (LocalId::from(0), Instruction::Alloc),
                     (LocalId::from(1), Instruction::GetField {
                         receiver: LocalId::from(0),
@@ -629,9 +618,8 @@ mod tests {
                     }),
                     (LocalId::from(2), Instruction::Load { source: LocalId::from(1) }),
                 ],
-                terminator: (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
-                hint_normalize: false,
-            },
+                (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
+            ),
             named: Default::default(),
         };
 
@@ -643,14 +631,13 @@ mod tests {
     fn test_load_from_number_constant_is_type_error() {
         // Load from NumberConstant is a type error
         let cfg = Cfg {
-            entry: Block {
-                instructions: vec![
+            entry: Block::new_for_test(
+                vec![
                     (LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(42) }),
                     (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
                 ],
-                terminator: (LocalId::from(2), Terminator::Return { value: Some(LocalId::from(1)) }),
-                hint_normalize: false,
-            },
+                (LocalId::from(2), Terminator::Return { value: Some(LocalId::from(1)) }),
+            ),
             named: Default::default(),
         };
 
@@ -663,17 +650,16 @@ mod tests {
     fn test_store_to_number_constant_is_type_error() {
         // Store to NumberConstant is a type error - you can only store to pointers
         let cfg = Cfg {
-            entry: Block {
-                instructions: vec![
+            entry: Block::new_for_test(
+                vec![
                     (LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(42) }),
                     (LocalId::from(1), Instruction::NumberConstant { value: Pico8Num::from_i16(99) }),
                     // This is the type error being tested: Store to a NumberConstant.
                     // NumberConstant produces a VALUE, not a pointer, so this should be flagged.
                     (LocalId::from(2), Instruction::Store { target: LocalId::from(0), source: LocalId::from(1) }),
                 ],
-                terminator: (LocalId::from(3), Terminator::Return { value: None }),
-                hint_normalize: false,
-            },
+                (LocalId::from(3), Terminator::Return { value: None }),
+            ),
             named: Default::default(),
         };
 
@@ -692,15 +678,14 @@ mod tests {
     fn test_store_to_alloc_is_valid() {
         // Store to Alloc is valid - Alloc produces a pointer
         let cfg = Cfg {
-            entry: Block {
-                instructions: vec![
+            entry: Block::new_for_test(
+                vec![
                     (LocalId::from(0), Instruction::Alloc),
                     (LocalId::from(1), Instruction::NumberConstant { value: Pico8Num::from_i16(42) }),
                     (LocalId::from(2), Instruction::Store { target: LocalId::from(0), source: LocalId::from(1) }),
                 ],
-                terminator: (LocalId::from(3), Terminator::Return { value: None }),
-                hint_normalize: false,
-            },
+                (LocalId::from(3), Terminator::Return { value: None }),
+            ),
             named: Default::default(),
         };
 
@@ -714,18 +699,17 @@ mod tests {
         let mut named = FxHashMap::default();
         named.insert(
             Label::from("unreachable".to_string()),
-            Block {
-                instructions: vec![
+            Block::new_for_test(
+                vec![
                     (LocalId::from(2), Instruction::NumberConstant { value: Pico8Num::from_i16(99) }),
                 ],
-                terminator: (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
-                hint_normalize: false,
-            },
+                (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
+            ),
         );
         named.insert(
             Label::from("join".to_string()),
-            Block {
-                instructions: vec![
+            Block::new_for_test(
+                vec![
                     // Phi references "unreachable" which exists but is NOT a predecessor of "join"
                     (LocalId::from(4), Instruction::Phi {
                         branches: vec![
@@ -734,20 +718,18 @@ mod tests {
                         ],
                     }),
                 ],
-                terminator: (LocalId::from(5), Terminator::Return { value: Some(LocalId::from(4)) }),
-                hint_normalize: false,
-            },
+                (LocalId::from(5), Terminator::Return { value: Some(LocalId::from(4)) }),
+            ),
         );
 
         let cfg = Cfg {
-            entry: Block {
-                instructions: vec![
+            entry: Block::new_for_test(
+                vec![
                     (LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(42) }),
                 ],
                 // Entry jumps to join, not to unreachable
-                terminator: (LocalId::from(1), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
-                hint_normalize: false,
-            },
+                (LocalId::from(1), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
+            ),
             named,
         };
 

@@ -209,8 +209,8 @@ mod tests {
         //   %3 = NumberConstant(0)
         //   %4 = BinaryOp(%2, >, %3)
         //   branch %4 -> if_true, if_false
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (LocalId::from(1), Instruction::GetField {
                     receiver: LocalId::from(0),
                     field: "x".to_string(),
@@ -228,13 +228,12 @@ mod tests {
                     right: LocalId::from(3),
                 }),
             ],
-            terminator: (LocalId::from(5), Terminator::ConditionalBranch {
+            (LocalId::from(5), Terminator::ConditionalBranch {
                 condition: LocalId::from(4),
                 true_target: Label::from("if_true".to_string()),
                 false_target: Label::from("if_join".to_string()),
             }),
-            hint_normalize: false,
-        };
+        );
 
         // if_true block:
         //   %6 = NumberConstant(1)
@@ -242,8 +241,8 @@ mod tests {
         //   %8 = GetField(%0, "x")
         //   Store(%8, %7)
         //   jump -> if_join
-        let if_true = Block {
-            instructions: vec![
+        let if_true = Block::new_for_test(
+            vec![
                 (LocalId::from(6), Instruction::NumberConstant {
                     value: Pico8Num::from_i16(1)
                 }),
@@ -262,18 +261,17 @@ mod tests {
                     source: LocalId::from(7),
                 }),
             ],
-            terminator: (LocalId::from(10), Terminator::UnconditionalBranch {
+            (LocalId::from(10), Terminator::UnconditionalBranch {
                 target: Label::from("if_join".to_string()),
             }),
-            hint_normalize: false,
-        };
+        );
 
         // if_join block:
         //   %11 = GetField(%0, "x")
         //   %12 = Load(%11)
         //   return %12
-        let if_join = Block {
-            instructions: vec![
+        let if_join = Block::new_for_test(
+            vec![
                 (LocalId::from(11), Instruction::GetField {
                     receiver: LocalId::from(0),
                     field: "x".to_string(),
@@ -283,11 +281,10 @@ mod tests {
                     source: LocalId::from(11)
                 }),
             ],
-            terminator: (LocalId::from(13), Terminator::Return {
+            (LocalId::from(13), Terminator::Return {
                 value: Some(LocalId::from(12)),
             }),
-            hint_normalize: false,
-        };
+        );
 
         named.insert(Label::from("if_true".to_string()), if_true);
         named.insert(Label::from("if_join".to_string()), if_join);
