@@ -161,8 +161,8 @@ mod tests {
     fn test_resolve_simple_builtin_call() {
         // Create a CFG with: GetGlobal("max") -> Load -> Call
         let cfg = Cfg {
-            entry: Block {
-                instructions: vec![
+            entry: Block::new_for_test(
+                vec![
                     (
                         LocalId::from(0),
                         Instruction::GetGlobal {
@@ -196,14 +196,13 @@ mod tests {
                         },
                     ),
                 ],
-                terminator: (
+                (
                     LocalId::from(5),
                     Terminator::Return {
                         value: Some(LocalId::from(4)),
                     },
                 ),
-                hint_normalize: false,
-            },
+            ),
             named: FxHashMap::default(),
         };
 
@@ -246,8 +245,8 @@ mod tests {
     fn test_no_resolve_unknown_global() {
         // Create a CFG with: GetGlobal("unknown") -> Load -> Call
         let cfg = Cfg {
-            entry: Block {
-                instructions: vec![
+            entry: Block::new_for_test(
+                vec![
                     (
                         LocalId::from(0),
                         Instruction::GetGlobal {
@@ -269,14 +268,13 @@ mod tests {
                         },
                     ),
                 ],
-                terminator: (
+                (
                     LocalId::from(3),
                     Terminator::Return {
                         value: Some(LocalId::from(2)),
                     },
                 ),
-                hint_normalize: false,
-            },
+            ),
             named: FxHashMap::default(),
         };
 
@@ -293,8 +291,8 @@ mod tests {
     fn test_resolve_multiple_builtin_calls() {
         // Create a CFG with calls to both max and min
         let cfg = Cfg {
-            entry: Block {
-                instructions: vec![
+            entry: Block::new_for_test(
+                vec![
                     // max call
                     (
                         LocalId::from(0),
@@ -344,14 +342,13 @@ mod tests {
                         },
                     ),
                 ],
-                terminator: (
+                (
                     LocalId::from(7),
                     Terminator::Return {
                         value: Some(LocalId::from(6)),
                     },
                 ),
-                hint_normalize: false,
-            },
+            ),
             named: FxHashMap::default(),
         };
 

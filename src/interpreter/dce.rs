@@ -222,8 +222,8 @@ mod tests {
         // %1 = NumberConstant(42)   <- used
         // return %1
 
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (
                     LocalId::from(0),
                     Instruction::GetGlobal {
@@ -238,14 +238,13 @@ mod tests {
                     },
                 ),
             ],
-            terminator: (
+            (
                 LocalId::from(2),
                 Terminator::Return {
                     value: Some(LocalId::from(1)),
                 },
             ),
-            hint_normalize: false,
-        };
+        );
 
         let cfg = Cfg {
             entry,
@@ -276,8 +275,8 @@ mod tests {
         //
         // All instructions should be kept because they form a chain to the return
 
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (
                     LocalId::from(0),
                     Instruction::GetGlobal {
@@ -292,14 +291,13 @@ mod tests {
                     },
                 ),
             ],
-            terminator: (
+            (
                 LocalId::from(2),
                 Terminator::Return {
                     value: Some(LocalId::from(1)),
                 },
             ),
-            hint_normalize: false,
-        };
+        );
 
         let cfg = Cfg {
             entry,
@@ -319,8 +317,8 @@ mod tests {
         // %3 = CallResolved(...)    <- uses %2 directly, not %1!
         // return %3
 
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (
                     LocalId::from(0),
                     Instruction::GetGlobal {
@@ -349,14 +347,13 @@ mod tests {
                     },
                 ),
             ],
-            terminator: (
+            (
                 LocalId::from(4),
                 Terminator::Return {
                     value: Some(LocalId::from(3)),
                 },
             ),
-            hint_normalize: false,
-        };
+        );
 
         let cfg = Cfg {
             entry,

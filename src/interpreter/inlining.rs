@@ -427,8 +427,8 @@ mod tests {
         // %1 = NumberConstant(1)
         // %2 = BinaryOp(%0, Plus, %1)
         // return %2
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (
                     LocalId::from(1),
                     Instruction::NumberConstant {
@@ -444,14 +444,13 @@ mod tests {
                     },
                 ),
             ],
-            terminator: (
+            (
                 LocalId::from(3),
                 Terminator::Return {
                     value: Some(LocalId::from(2)),
                 },
             ),
-            hint_normalize: false,
-        };
+        );
 
         FunDef {
             name: GlobalId::from("add_one_1".to_string()),
@@ -467,8 +466,8 @@ mod tests {
 
     fn make_caller_cfg() -> Cfg {
         // Caller: %0 = NumberConstant(5); %1 = CallResolved(add_one_1, [], [%0]); return %1
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (
                     LocalId::from(0),
                     Instruction::NumberConstant {
@@ -484,14 +483,13 @@ mod tests {
                     },
                 ),
             ],
-            terminator: (
+            (
                 LocalId::from(2),
                 Terminator::Return {
                     value: Some(LocalId::from(1)),
                 },
             ),
-            hint_normalize: false,
-        };
+        );
 
         Cfg {
             entry,

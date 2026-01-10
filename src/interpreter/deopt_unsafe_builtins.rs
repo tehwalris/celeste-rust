@@ -138,8 +138,8 @@ mod tests {
     #[test]
     fn test_deopt_on_add() {
         // CFG: %0 = NumberConstant(1); %1 = CallBuiltin(add, [%0]); return
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (
                     LocalId::from(0),
                     Instruction::NumberConstant {
@@ -154,9 +154,8 @@ mod tests {
                     },
                 ),
             ],
-            terminator: (LocalId::from(2), Terminator::Return { value: None }),
-            hint_normalize: false,
-        };
+            (LocalId::from(2), Terminator::Return { value: None }),
+        );
 
         let cfg = Cfg {
             entry,
@@ -186,8 +185,8 @@ mod tests {
     #[test]
     fn test_no_deopt_on_safe_builtin() {
         // CFG: %0 = NumberConstant(1); %1 = CallBuiltin(max, [%0, %0]); return %1
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (
                     LocalId::from(0),
                     Instruction::NumberConstant {
@@ -202,14 +201,13 @@ mod tests {
                     },
                 ),
             ],
-            terminator: (
+            (
                 LocalId::from(2),
                 Terminator::Return {
                     value: Some(LocalId::from(1)),
                 },
             ),
-            hint_normalize: false,
-        };
+        );
 
         let cfg = Cfg {
             entry,

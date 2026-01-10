@@ -1499,21 +1499,20 @@ mod tests {
 
     fn make_simple_cfg() -> Cfg {
         // A simple CFG: %0 = NumberConstant(5); return %0
-        let entry = Block {
-            instructions: vec![(
+        let entry = Block::new_for_test(
+            vec![(
                 LocalId::from(0),
                 Instruction::NumberConstant {
                     value: Pico8Num::from_i16(5),
                 },
             )],
-            terminator: (
+            (
                 LocalId::from(1),
                 Terminator::Return {
                     value: Some(LocalId::from(0)),
                 },
             ),
-            hint_normalize: false,
-        };
+        );
 
         Cfg {
             entry,
@@ -1523,8 +1522,8 @@ mod tests {
 
     fn make_heap_read_cfg() -> Cfg {
         // A CFG that reads from heap: %0 = GetGlobal("x"); %1 = Load(%0); return %1
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (
                     LocalId::from(0),
                     Instruction::GetGlobal {
@@ -1534,14 +1533,13 @@ mod tests {
                 ),
                 (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
             ],
-            terminator: (
+            (
                 LocalId::from(2),
                 Terminator::Return {
                     value: Some(LocalId::from(1)),
                 },
             ),
-            hint_normalize: false,
-        };
+        );
 
         Cfg {
             entry,
@@ -1551,8 +1549,8 @@ mod tests {
 
     fn make_heap_write_cfg() -> Cfg {
         // A CFG that writes to heap: %0 = GetGlobal("x"); %1 = NumberConstant(5); Store(%0, %1); return
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (
                     LocalId::from(0),
                     Instruction::GetGlobal {
@@ -1574,9 +1572,8 @@ mod tests {
                     },
                 ),
             ],
-            terminator: (LocalId::from(3), Terminator::Return { value: None }),
-            hint_normalize: false,
-        };
+            (LocalId::from(3), Terminator::Return { value: None }),
+        );
 
         Cfg {
             entry,
@@ -1685,8 +1682,8 @@ mod tests {
 
         // Create inner function: %0 = 1, %1 = 1, %2 = %0 + %1, return %2
         let inner_cfg = Cfg {
-            entry: Block {
-                instructions: vec![
+            entry: Block::new_for_test(
+                vec![
                     (
                         LocalId::from(0),
                         Instruction::NumberConstant { value: Pico8Num::from_i16(1) },
@@ -1704,9 +1701,8 @@ mod tests {
                         },
                     ),
                 ],
-                terminator: (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
-                hint_normalize: false,
-            },
+                (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
+            ),
             named: FxHashMap::default(),
         };
 
@@ -1722,8 +1718,8 @@ mod tests {
         // %0 = GetGlobal("inner"), %1 = Load(%0), %2 = Call(%1, [])
         // This pattern will be resolved to CallResolved by call_resolution
         let outer_cfg = Cfg {
-            entry: Block {
-                instructions: vec![
+            entry: Block::new_for_test(
+                vec![
                     (
                         LocalId::from(0),
                         Instruction::GetGlobal { name: "inner".to_string(), create_if_missing: false },
@@ -1737,9 +1733,8 @@ mod tests {
                         Instruction::Call { closure: LocalId::from(1), args: vec![] },
                     ),
                 ],
-                terminator: (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
-                hint_normalize: false,
-            },
+                (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
+            ),
             named: FxHashMap::default(),
         };
 
@@ -1818,8 +1813,8 @@ mod tests {
         // func = Load(cell)
         // result = Call(func, [a, b])
         // Return(result)
-        let entry = Block {
-            instructions: vec![
+        let entry = Block::new_for_test(
+            vec![
                 (
                     cell_id,
                     Instruction::GetGlobal {
@@ -1836,9 +1831,8 @@ mod tests {
                     },
                 ),
             ],
-            terminator: (terminator_id, Terminator::Return { value: Some(result_id) }),
-            hint_normalize: false,
-        };
+            (terminator_id, Terminator::Return { value: Some(result_id) }),
+        );
 
         let cfg = Cfg {
             entry,
