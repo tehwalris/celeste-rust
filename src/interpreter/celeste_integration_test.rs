@@ -159,6 +159,9 @@ mod tests {
 
     #[test]
     fn test_pipeline_on_simple_functions() {
+        use crate::interpreter::cfg_analysis::PipelineStepType;
+        use crate::ir::LocalId;
+
         // Test pipeline on functions that should optimize cleanly
         let fun_defs = load_celeste();
         let global_closure_map = build_global_closure_map_from_fun_defs(fun_defs.iter());
@@ -207,16 +210,29 @@ mod tests {
                 .filter_map(|id| *id)
                 .collect();
 
-            if let Some(final_cfg) = cfgs.steps.last().map(|s| &s.cfg) {
-                let validation = validate_cfg_with_args(final_cfg, &external_ids);
+            if let Some(final_step) = cfgs.steps.last() {
+                // Build the full list of predefined locals including heap slot locals
+                let mut predefined = external_ids.clone();
+                for step in &cfgs.steps {
+                    if let PipelineStepType::HeapElimFinal { slot_mappings, .. } = &step.step_type {
+                        for mapping in slot_mappings {
+                            predefined.push(LocalId::from(mapping.local_id as usize));
+                        }
+                    }
+                }
+
+                let validation = validate_cfg_with_args(&final_step.cfg, &predefined);
                 // Note: We allow some validation failures due to known issues with complex functions
                 // but we log them for visibility
                 if !validation.is_valid() {
                     eprintln!(
-                        "Warning: {} final CFG has {} validation errors (may be known issue)",
+                        "Warning: {} final CFG has {} validation error(s):",
                         fun_def.name.as_str(),
                         validation.errors.len()
                     );
+                    for error in &validation.errors {
+                        eprintln!("  - {}", error);
+                    }
                 }
             }
 
@@ -310,5 +326,100 @@ mod tests {
             "Integration test stats: {} calls resolved, {} inlined",
             total_calls_resolved, total_inlined
         );
+    }
+
+    #[test]
+    fn test_btn_validation_at_each_step() {
+        use crate::interpreter::cfg_analysis::PipelineStepType;
+        use crate::ir::LocalId;
+
+        // Debug test: find which optimization step introduces the validation error
+        let fun_defs = load_celeste();
+        let global_closure_map = build_global_closure_map_from_fun_defs(fun_defs.iter());
+        let builtin_set = builtin_set();
+        let optimized_fun_def_map: FxHashMap<GlobalId, FunDef> = FxHashMap::default();
+
+        let fun_def = fun_defs
+            .iter()
+            .find(|fd| fd.name.as_str().ends_with("btn_4"))
+            .expect("btn_4 not found");
+
+        let base_external_ids: Vec<_> = fun_def
+            .arg_ids
+            .iter()
+            .filter_map(|id| *id)
+            .collect();
+
+        let analysis = analyze_cfg(&fun_def.cfg);
+        let ctx = InterproceduralContext {
+            global_closure_map: &global_closure_map,
+            optimized_fun_defs: &optimized_fun_def_map,
+            builtin_set: Some(&builtin_set),
+        };
+
+        let (_result, cfgs) = run_optimization_pipeline_with_interprocedural(
+            &fun_def.cfg,
+            &analysis,
+            &ctx,
+            &fun_def.arg_ids,
+            &[],
+        );
+
+        // Track accumulated predefined locals through the pipeline
+        let mut accumulated_predefined: Vec<LocalId> = base_external_ids.clone();
+
+        // Check validation at each step
+        let mut first_invalid_step = None;
+        for (i, step) in cfgs.steps.iter().enumerate() {
+            // For HeapElimFinal steps, the slot mappings introduce new predefined locals
+            if let PipelineStepType::HeapElimFinal { slot_mappings, .. } = &step.step_type {
+                for mapping in slot_mappings {
+                    accumulated_predefined.push(LocalId::from(mapping.local_id as usize));
+                }
+            }
+
+            let validation = validate_cfg_with_args(&step.cfg, &accumulated_predefined);
+            if validation.is_valid() {
+                eprintln!("Step {}: {} - VALID", i, step.name);
+            } else {
+                eprintln!("Step {}: {} - {} error(s):", i, step.name, validation.errors.len());
+                for error in &validation.errors {
+                    eprintln!("  - {}", error);
+                }
+                if first_invalid_step.is_none() {
+                    first_invalid_step = Some(i);
+                }
+            }
+        }
+
+        // Dump the CFG before the first invalid step to help debug
+        if let Some(invalid_idx) = first_invalid_step {
+            if invalid_idx > 0 {
+                let prev_step = &cfgs.steps[invalid_idx - 1];
+                eprintln!("\n=== CFG BEFORE ERROR (step {}: {}) ===", invalid_idx - 1, prev_step.name);
+                print_cfg(&prev_step.cfg);
+            }
+            let invalid_step = &cfgs.steps[invalid_idx];
+            eprintln!("\n=== CFG WITH ERROR (step {}: {}) ===", invalid_idx, invalid_step.name);
+            print_cfg(&invalid_step.cfg);
+        }
+    }
+
+    /// Helper to print a CFG for debugging
+    fn print_cfg(cfg: &Cfg) {
+        fn print_block(name: &str, block: &crate::ir::Block) {
+            eprintln!("Block '{}':", name);
+            for (id, instr) in &block.instructions {
+                eprintln!("  %{} = {}", usize::from(*id), instr.format());
+            }
+            eprintln!("  terminator: %{} = {}",
+                usize::from(block.terminator_id()),
+                block.terminator_kind().format());
+        }
+
+        print_block("entry", &cfg.entry);
+        for (label, block) in &cfg.named {
+            print_block(label.as_str(), block);
+        }
     }
 }
