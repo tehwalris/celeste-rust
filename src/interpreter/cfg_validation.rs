@@ -431,7 +431,7 @@ mod tests {
             vec![
                 (LocalId::from(0), Instruction::num_const(42)),
             ],
-            (LocalId::from(1), Terminator::Return { value: Some(LocalId::from(0)) }),
+            (LocalId::from(1), Terminator::ret(Some(LocalId::from(0)))),
         ));
 
         let result = validate_cfg(&cfg);
@@ -442,7 +442,7 @@ mod tests {
     fn test_undefined_local() {
         let cfg = Cfg::single_entry(Block::new_for_test(
             vec![],
-            (LocalId::from(0), Terminator::Return { value: Some(LocalId::from(99)) }), // 99 is undefined
+            (LocalId::from(0), Terminator::ret(Some(LocalId::from(99)))), // 99 is undefined
         ));
 
         let result = validate_cfg(&cfg);
@@ -459,7 +459,7 @@ mod tests {
                 vec![
                     (LocalId::from(0), Instruction::num_const(1)), // Same ID as entry
                 ],
-                (LocalId::from(2), Terminator::Return { value: Some(LocalId::from(0)) }),
+                (LocalId::from(2), Terminator::ret(Some(LocalId::from(0)))),
             ),
         );
 
@@ -468,7 +468,7 @@ mod tests {
                 vec![
                     (LocalId::from(0), Instruction::num_const(42)),
                 ],
-                (LocalId::from(1), Terminator::UnconditionalBranch { target: Label::from("block1".to_string()) }),
+                (LocalId::from(1), Terminator::branch("block1")),
             ),
             named,
         };
@@ -488,7 +488,7 @@ mod tests {
                     LocalId::from(2),
                     Instruction::phi(vec![(Label::from("nonexistent".to_string()), LocalId::from(0))]),
                 )],
-                (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
+                (LocalId::from(3), Terminator::ret(Some(LocalId::from(2)))),
             ),
         );
 
@@ -497,7 +497,7 @@ mod tests {
                 vec![
                     (LocalId::from(0), Instruction::num_const(42)),
                 ],
-                (LocalId::from(1), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
+                (LocalId::from(1), Terminator::branch("join")),
             ),
             named,
         };
@@ -511,7 +511,7 @@ mod tests {
     fn test_branch_target_not_found() {
         let cfg = Cfg::single_entry(Block::new_for_test(
             vec![],
-            (LocalId::from(0), Terminator::UnconditionalBranch { target: Label::from("nonexistent".to_string()) }),
+            (LocalId::from(0), Terminator::branch("nonexistent")),
         ));
 
         let result = validate_cfg(&cfg);
@@ -540,7 +540,7 @@ mod tests {
                     // Phi produces a VALUE, not a pointer, so this should be flagged.
                     (LocalId::from(4), Instruction::load(LocalId::from(3))),
                 ],
-                (LocalId::from(5), Terminator::Return { value: Some(LocalId::from(4)) }),
+                (LocalId::from(5), Terminator::ret(Some(LocalId::from(4)))),
             ),
         );
         named.insert(
@@ -549,7 +549,7 @@ mod tests {
                 vec![
                     (LocalId::from(2), Instruction::num_const(99)),
                 ],
-                (LocalId::from(6), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
+                (LocalId::from(6), Terminator::branch("join")),
             ),
         );
 
@@ -558,7 +558,7 @@ mod tests {
                 vec![
                     (LocalId::from(0), Instruction::num_const(42)),
                 ],
-                (LocalId::from(1), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
+                (LocalId::from(1), Terminator::branch("join")),
             ),
             named,
         };
@@ -582,7 +582,7 @@ mod tests {
                 (LocalId::from(0), Instruction::Alloc),
                 (LocalId::from(1), Instruction::load(LocalId::from(0))),
             ],
-            (LocalId::from(2), Terminator::Return { value: Some(LocalId::from(1)) }),
+            (LocalId::from(2), Terminator::ret(Some(LocalId::from(1)))),
         ));
 
         let type_errors = validate_types(&cfg, &[]);
@@ -602,7 +602,7 @@ mod tests {
                 }),
                 (LocalId::from(2), Instruction::load(LocalId::from(1))),
             ],
-            (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
+            (LocalId::from(3), Terminator::ret(Some(LocalId::from(2)))),
         ));
 
         let type_errors = validate_types(&cfg, &[]);
@@ -617,7 +617,7 @@ mod tests {
                 (LocalId::from(0), Instruction::num_const(42)),
                 (LocalId::from(1), Instruction::load(LocalId::from(0))),
             ],
-            (LocalId::from(2), Terminator::Return { value: Some(LocalId::from(1)) }),
+            (LocalId::from(2), Terminator::ret(Some(LocalId::from(1)))),
         ));
 
         let type_errors = validate_types(&cfg, &[]);
@@ -636,7 +636,7 @@ mod tests {
                 // NumberConstant produces a VALUE, not a pointer, so this should be flagged.
                 (LocalId::from(2), Instruction::store(LocalId::from(0), LocalId::from(1))),
             ],
-            (LocalId::from(3), Terminator::Return { value: None }),
+            (LocalId::from(3), Terminator::ret(None)),
         ));
 
         // Structural validation should pass
@@ -659,7 +659,7 @@ mod tests {
                 (LocalId::from(1), Instruction::num_const(42)),
                 (LocalId::from(2), Instruction::store(LocalId::from(0), LocalId::from(1))),
             ],
-            (LocalId::from(3), Terminator::Return { value: None }),
+            (LocalId::from(3), Terminator::ret(None)),
         ));
 
         let type_errors = validate_types(&cfg, &[]);
@@ -676,7 +676,7 @@ mod tests {
                 vec![
                     (LocalId::from(2), Instruction::num_const(99)),
                 ],
-                (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
+                (LocalId::from(3), Terminator::ret(Some(LocalId::from(2)))),
             ),
         );
         named.insert(
@@ -692,7 +692,7 @@ mod tests {
                         ]),
                     ),
                 ],
-                (LocalId::from(5), Terminator::Return { value: Some(LocalId::from(4)) }),
+                (LocalId::from(5), Terminator::ret(Some(LocalId::from(4)))),
             ),
         );
 
@@ -702,7 +702,7 @@ mod tests {
                     (LocalId::from(0), Instruction::num_const(42)),
                 ],
                 // Entry jumps to join, not to unreachable
-                (LocalId::from(1), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
+                (LocalId::from(1), Terminator::branch("join")),
             ),
             named,
         };
