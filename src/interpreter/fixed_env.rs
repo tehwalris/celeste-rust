@@ -109,9 +109,7 @@ impl FixedEnv {
     pub fn add_fun_def(&mut self, mut fun_def: FunDef) {
         // Apply shape-independent optimizations if enabled
         if self.optimize_cfgs {
-            // Collect external IDs for validation (capture_ids + arg_ids are defined externally)
-            let mut external_ids: Vec<LocalId> = fun_def.capture_ids.clone();
-            external_ids.extend(fun_def.arg_ids.iter().filter_map(|opt| *opt));
+            let external_ids = fun_def.external_local_ids();
             fun_def.cfg = optimize_cfg(&fun_def.cfg, &external_ids);
         }
 

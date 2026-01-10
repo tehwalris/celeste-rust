@@ -1189,3 +1189,20 @@ pub struct FunDef {
     /// Source span of the function definition in the original Lua source
     pub source_span: Option<SourceSpan>,
 }
+
+impl FunDef {
+    /// Returns all external local IDs (arguments and captures) that are defined before the CFG executes.
+    ///
+    /// These are the "predefined" locals for CFG validation - they don't need to be defined
+    /// by instructions within the CFG because they're provided by the caller.
+    ///
+    /// Note: arg_ids contains Option<LocalId> because some arguments may be unused (None).
+    /// Only the defined (Some) arguments are included in the result.
+    pub fn external_local_ids(&self) -> Vec<LocalId> {
+        self.arg_ids
+            .iter()
+            .filter_map(|id| *id)
+            .chain(self.capture_ids.iter().copied())
+            .collect()
+    }
+}

@@ -643,12 +643,7 @@ pub fn optimize_all_functions(
         let mut local_gen = LocalIdGenerator::from_cfg(&original_fun_def.cfg);
         let mut label_gen = LabelGenerator::new();
         let fn_name = name.as_str();
-        // Combine arg_ids and capture_ids - both are available as "external" locals
-        // arg_ids are Option<LocalId> because some args may be unused (None)
-        let external_ids: Vec<_> = original_fun_def.arg_ids.iter()
-            .filter_map(|id| *id)
-            .chain(original_fun_def.capture_ids.iter().copied())
-            .collect();
+        let external_ids = original_fun_def.external_local_ids();
 
         // Validate input CFG - skip function if validation fails
         let validation_result = crate::interpreter::cfg_validation::validate_cfg_with_args(

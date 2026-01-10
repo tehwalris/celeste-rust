@@ -124,16 +124,9 @@ mod tests {
         let fun_defs = load_celeste();
 
         for fun_def in &fun_defs {
-            let external_ids: Vec<_> = fun_def
-                .arg_ids
-                .iter()
-                .filter_map(|id| *id)
-                .chain(fun_def.capture_ids.iter().copied())
-                .collect();
-
             assert_cfg_valid(
                 &fun_def.cfg,
-                &external_ids,
+                &fun_def.external_local_ids(),
                 &format!("{} original", fun_def.name.as_str()),
             );
         }
@@ -223,15 +216,9 @@ mod tests {
             );
 
             // Verify the final CFG is valid
-            let external_ids: Vec<_> = fun_def
-                .arg_ids
-                .iter()
-                .filter_map(|id| *id)
-                .collect();
-
             if let Some(final_step) = cfgs.steps.last() {
                 // Build the full list of predefined locals including heap slot locals
-                let mut predefined = external_ids.clone();
+                let mut predefined = fun_def.external_local_ids();
                 for step in &cfgs.steps {
                     if let PipelineStepType::HeapElimFinal { slot_mappings, .. } = &step.step_type {
                         for mapping in slot_mappings {
@@ -353,12 +340,6 @@ mod tests {
             .find(|fd| fd.name.as_str().ends_with("btn_4"))
             .expect("btn_4 not found");
 
-        let base_external_ids: Vec<_> = fun_def
-            .arg_ids
-            .iter()
-            .filter_map(|id| *id)
-            .collect();
-
         let analysis = analyze_cfg(&fun_def.cfg);
 
         let (_result, cfgs) = run_optimization_pipeline_with_interprocedural(
@@ -370,7 +351,7 @@ mod tests {
         );
 
         // Track accumulated predefined locals through the pipeline
-        let mut accumulated_predefined: Vec<LocalId> = base_external_ids.clone();
+        let mut accumulated_predefined = fun_def.external_local_ids();
 
         // Check validation at each step
         let mut first_invalid_step = None;
