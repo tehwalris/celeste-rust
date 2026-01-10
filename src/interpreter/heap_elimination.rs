@@ -1247,6 +1247,43 @@ mod tests {
         LabelGenerator::new()
     }
 
+    /// Create a HeapShape with a single global as a Leaf.
+    /// Example: `make_global_leaf_shape("x")` creates `{ globals: { x: Leaf } }`
+    fn make_global_leaf_shape(name: &str) -> HeapShape {
+        let mut shape = HeapShape::new();
+        shape.globals.insert(name.to_string(), ValueShape::Leaf);
+        shape
+    }
+
+    /// Create a HeapShape with a global table containing a single field as Leaf.
+    /// Example: `make_player_x_shape()` creates `{ globals: { player: { x: Leaf } } }`
+    fn make_player_x_shape() -> HeapShape {
+        let mut player_fields = FxHashMap::default();
+        player_fields.insert("x".to_string(), ValueShape::Leaf);
+        let mut shape = HeapShape::new();
+        shape.globals.insert("player".to_string(), ValueShape::Table(player_fields));
+        shape
+    }
+
+    /// Create a HeapShape with a global table containing x and y fields as Leaves.
+    /// Example: `make_player_xy_shape()` creates `{ globals: { player: { x: Leaf, y: Leaf } } }`
+    fn make_player_xy_shape() -> HeapShape {
+        let mut player_fields = FxHashMap::default();
+        player_fields.insert("x".to_string(), ValueShape::Leaf);
+        player_fields.insert("y".to_string(), ValueShape::Leaf);
+        let mut shape = HeapShape::new();
+        shape.globals.insert("player".to_string(), ValueShape::Table(player_fields));
+        shape
+    }
+
+    /// Create a table shape with a single field "x" as Leaf.
+    /// Useful for building custom HeapShapes that need a table with x field.
+    fn make_table_with_x() -> ValueShape {
+        let mut fields = FxHashMap::default();
+        fields.insert("x".to_string(), ValueShape::Leaf);
+        ValueShape::Table(fields)
+    }
+
     #[test]
     fn test_heap_path_construction() {
         let path = HeapPath::global("player").field("pos").field("x");
@@ -1269,13 +1306,8 @@ mod tests {
 
     #[test]
     fn test_heap_shape_collect_slots() {
-        let mut shape = HeapShape::new();
-
         // Create shape: { player: { x: Leaf, y: Leaf } }
-        let mut player_fields = FxHashMap::default();
-        player_fields.insert("x".to_string(), ValueShape::Leaf);
-        player_fields.insert("y".to_string(), ValueShape::Leaf);
-        shape.globals.insert("player".to_string(), ValueShape::Table(player_fields));
+        let shape = make_player_xy_shape();
 
         let slots = shape.collect_leaf_slots();
         assert_eq!(slots.len(), 2);
@@ -1340,9 +1372,7 @@ mod tests {
             named: FxHashMap::default(),
         };
 
-        // Shape: x is a leaf
-        let mut shape = HeapShape::new();
-        shape.globals.insert("x".to_string(), ValueShape::Leaf);
+        let shape = make_global_leaf_shape("x");
 
         let local_gen = make_local_gen();
         let label_gen = make_label_gen();
@@ -1380,8 +1410,7 @@ mod tests {
             named: FxHashMap::default(),
         };
 
-        let mut shape = HeapShape::new();
-        shape.globals.insert("x".to_string(), ValueShape::Leaf);
+        let shape = make_global_leaf_shape("x");
 
         let local_gen = make_local_gen();
         let label_gen = make_label_gen();
@@ -1434,8 +1463,7 @@ mod tests {
             named: FxHashMap::default(),
         };
 
-        let mut shape = HeapShape::new();
-        shape.globals.insert("x".to_string(), ValueShape::Leaf);
+        let shape = make_global_leaf_shape("x");
 
         let local_gen = make_local_gen();
         let label_gen = make_label_gen();
@@ -1480,8 +1508,7 @@ mod tests {
             named: FxHashMap::default(),
         };
 
-        let mut shape = HeapShape::new();
-        shape.globals.insert("x".to_string(), ValueShape::Leaf);
+        let shape = make_global_leaf_shape("x");
 
         let local_gen = make_local_gen();
         let label_gen = make_label_gen();
@@ -2088,9 +2115,8 @@ mod tests {
             named: FxHashMap::default(),
         };
 
-        let mut shape = HeapShape::new();
-        shape.globals.insert("x".to_string(), ValueShape::Leaf); // "x" is known
-        // "unknown" is NOT in the shape
+        // "x" is known, "unknown" is NOT in the shape
+        let shape = make_global_leaf_shape("x");
 
         let local_gen = make_local_gen();
         let label_gen = make_label_gen();
@@ -2183,11 +2209,7 @@ mod tests {
             named: FxHashMap::default(),
         };
 
-        // Shape: _G.player is a table with x as a leaf
-        let mut player_fields = FxHashMap::default();
-        player_fields.insert("x".to_string(), ValueShape::Leaf);
-        let mut shape = HeapShape::new();
-        shape.globals.insert("player".to_string(), ValueShape::Table(player_fields));
+        let shape = make_player_x_shape();
 
         let local_gen = make_local_gen();
         let label_gen = make_label_gen();
@@ -2402,12 +2424,7 @@ mod tests {
             named: FxHashMap::default(),
         };
 
-        // Shape: player has x and y as leaves
-        let mut player_fields = FxHashMap::default();
-        player_fields.insert("x".to_string(), ValueShape::Leaf);
-        player_fields.insert("y".to_string(), ValueShape::Leaf);
-        let mut shape = HeapShape::new();
-        shape.globals.insert("player".to_string(), ValueShape::Table(player_fields));
+        let shape = make_player_xy_shape();
 
         let local_gen = make_local_gen();
         let label_gen = make_label_gen();
@@ -2513,11 +2530,9 @@ mod tests {
         };
 
         // Shape: both players have x as leaf
-        let mut player_fields = FxHashMap::default();
-        player_fields.insert("x".to_string(), ValueShape::Leaf);
         let mut shape = HeapShape::new();
-        shape.globals.insert("player1".to_string(), ValueShape::Table(player_fields.clone()));
-        shape.globals.insert("player2".to_string(), ValueShape::Table(player_fields));
+        shape.globals.insert("player1".to_string(), make_table_with_x());
+        shape.globals.insert("player2".to_string(), make_table_with_x());
 
         let local_gen = make_local_gen();
         let label_gen = make_label_gen();
@@ -2608,10 +2623,7 @@ mod tests {
             named: FxHashMap::default(),
         };
 
-        let mut player_fields = FxHashMap::default();
-        player_fields.insert("x".to_string(), ValueShape::Leaf);
-        let mut shape = HeapShape::new();
-        shape.globals.insert("player".to_string(), ValueShape::Table(player_fields));
+        let shape = make_player_x_shape();
 
         let local_gen = make_local_gen();
         let label_gen = make_label_gen();
@@ -2735,8 +2747,7 @@ mod tests {
         };
 
         // Shape: btn is a Leaf (this causes Load to be SSA-promoted)
-        let mut shape = HeapShape::new();
-        shape.globals.insert("btn".to_string(), ValueShape::Leaf);
+        let shape = make_global_leaf_shape("btn");
 
         let local_gen = make_local_gen();
         let label_gen = make_label_gen();
