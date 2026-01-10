@@ -1716,13 +1716,7 @@ mod tests {
             (LocalId::from(3), Terminator::ret(Some(LocalId::from(2)))),
         ));
 
-        let inner_def = FunDef {
-            name: GlobalId::from("inner_1".to_string()),
-            capture_ids: vec![],
-            arg_ids: vec![],
-            cfg: inner_cfg,
-            source_span: None,
-        };
+        let inner_def = FunDef::for_test("inner_1", inner_cfg);
 
         // Create outer function that calls inner:
         // %0 = GetGlobal("inner"), %1 = Load(%0), %2 = Call(%1, [])
@@ -1736,13 +1730,7 @@ mod tests {
             (LocalId::from(3), Terminator::ret(Some(LocalId::from(2)))),
         ));
 
-        let outer_def = FunDef {
-            name: GlobalId::from("outer_2".to_string()),
-            capture_ids: vec![],
-            arg_ids: vec![],
-            cfg: outer_cfg,
-            source_span: None,
-        };
+        let outer_def = FunDef::for_test("outer_2", outer_cfg);
 
         // Build global closure map
         let mut global_closure_map: FxHashMap<String, GlobalClosure> = FxHashMap::default();

@@ -1205,4 +1205,28 @@ impl FunDef {
             .chain(self.capture_ids.iter().copied())
             .collect()
     }
+
+    /// Creates a simple FunDef for testing with no captures and no arguments.
+    #[cfg(test)]
+    pub fn for_test(name: &str, cfg: Cfg) -> Self {
+        Self {
+            name: GlobalId::from(name.to_string()),
+            capture_ids: vec![],
+            arg_ids: vec![],
+            cfg,
+            source_span: None,
+        }
+    }
+
+    /// Creates a FunDef for testing with arguments but no captures.
+    #[cfg(test)]
+    pub fn for_test_with_args(name: &str, arg_ids: Vec<Option<LocalId>>, cfg: Cfg) -> Self {
+        Self {
+            name: GlobalId::from(name.to_string()),
+            capture_ids: vec![],
+            arg_ids,
+            cfg,
+            source_span: None,
+        }
+    }
 }

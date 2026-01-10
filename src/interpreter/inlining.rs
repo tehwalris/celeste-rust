@@ -435,13 +435,7 @@ mod tests {
             (LocalId::from(3), Terminator::ret(Some(LocalId::from(2)))),
         );
 
-        FunDef {
-            name: GlobalId::from("add_one_1".to_string()),
-            capture_ids: vec![],
-            arg_ids: vec![Some(LocalId::from(0))],
-            cfg: Cfg::single_entry(entry),
-            source_span: None,
-        }
+        FunDef::for_test_with_args("add_one_1", vec![Some(LocalId::from(0))], Cfg::single_entry(entry))
     }
 
     fn make_caller_cfg() -> Cfg {
