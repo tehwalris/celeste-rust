@@ -21,6 +21,9 @@ use super::{
     vectorize::{vectorize_states, union_diff_states},
 };
 
+/// Accumulator for hint_normalize blocks: (accumulated_states, pending_states, dag_ids)
+type HintNormalizeAccumulator = (Vec<State>, Vec<State>, Vec<Option<u64>>);
+
 /// Helper to vectorize states within FlowData
 fn vectorize_flow_data(data: &FlowData) -> FlowData {
     match data {
@@ -265,7 +268,7 @@ fn interpret_prepared_cfg_inner(
     // Accumulator for hint_normalize blocks - we collect states here before processing
     // The "accumulated" field persists across iterations and contains all states seen so far
     // The "pending" field contains states that arrived since last processing
-    let mut hint_normalize_accumulators: FxHashMap<Label, (Vec<State>, Vec<State>, Vec<Option<u64>>)> = FxHashMap::default();
+    let mut hint_normalize_accumulators: FxHashMap<Label, HintNormalizeAccumulator> = FxHashMap::default();
     // ^-- (accumulated_states, pending_states, dag_ids)
     let mut results: Vec<(State, Option<Value>)> = vec![];
 
@@ -276,7 +279,7 @@ fn interpret_prepared_cfg_inner(
         flow_data: FlowData,
         dag_id: Option<u64>,
         pending: &mut Vec<(Option<Label>, FlowData, Option<u64>)>,
-        accumulators: &mut FxHashMap<Label, (Vec<State>, Vec<State>, Vec<Option<u64>>)>,
+        accumulators: &mut FxHashMap<Label, HintNormalizeAccumulator>,
         cfg: &Cfg,
     | {
         let target_block = cfg.named.get(target);

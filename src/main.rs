@@ -218,8 +218,7 @@ __reset_button_states()
     assert!(frame_fun_defs.is_empty(), "Frame code should not define new functions");
 
     // Try to resume from checkpoint if requested
-    let (mut states, start_frame) = if resume && checkpoint_dir.is_some() {
-        let dir = checkpoint_dir.unwrap();
+    let (mut states, start_frame) = if let (true, Some(dir)) = (resume, checkpoint_dir) {
         match find_latest_checkpoint(dir) {
             Some((checkpoint_path, frame)) => {
                 println!("Resuming from checkpoint: {} (frame {})", checkpoint_path, frame);

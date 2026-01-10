@@ -266,20 +266,16 @@ impl HeapShape {
             }
             HeapPath::Field(base, field) => {
                 // First find the base shape, then look up the field
-                if let Some(base_shape) = self.get_shape_at_path(base) {
-                    match base_shape {
-                        ValueShape::Table(fields) => {
-                            if let Some(field_shape) = fields.get(field) {
-                                matches!(field_shape, ValueShape::Leaf | ValueShape::Constant(_))
-                            } else {
-                                // Unknown field - don't track (might be dynamically added)
-                                false
-                            }
-                        }
-                        _ => false // Non-table base - don't track
+                if let Some(ValueShape::Table(fields)) = self.get_shape_at_path(base) {
+                    if let Some(field_shape) = fields.get(field) {
+                        matches!(field_shape, ValueShape::Leaf | ValueShape::Constant(_))
+                    } else {
+                        // Unknown field - don't track (might be dynamically added)
+                        false
                     }
                 } else {
-                    false // Unknown base - don't track
+                    // Unknown or non-table base - don't track
+                    false
                 }
             }
             HeapPath::Index { .. } => false, // Dynamic index - don't track
@@ -334,11 +330,8 @@ impl HeapShape {
 
     /// Check if a field exists at a given path (for create_if_missing checks)
     pub fn field_exists_at_path(&self, base_path: &HeapPath, field: &str) -> bool {
-        if let Some(base_shape) = self.get_shape_at_path(base_path) {
-            match base_shape {
-                ValueShape::Table(fields) => fields.contains_key(field),
-                _ => false
-            }
+        if let Some(ValueShape::Table(fields)) = self.get_shape_at_path(base_path) {
+            fields.contains_key(field)
         } else {
             false
         }
@@ -394,6 +387,10 @@ enum BlockId {
     Named(Label),
 }
 
+/// Phi node entry for SSA construction: (target_id, slot, branches)
+/// where branches maps (source_label -> source_local_id)
+type PhiNodeEntry = (LocalId, HeapSlot, Vec<(Label, LocalId)>);
+
 /// SSA construction state using the Braun algorithm
 struct SsaBuilder {
     /// Current local ID generator
@@ -409,8 +406,8 @@ struct SsaBuilder {
     block_definitions: FxHashMap<(BlockId, HeapSlot), LocalId>,
     /// Predecessors of each block
     predecessors: FxHashMap<BlockId, Vec<(BlockId, Label)>>,
-    /// Phi nodes to insert: block -> [(target_id, slot, branches)]
-    phi_nodes: FxHashMap<BlockId, Vec<(LocalId, HeapSlot, Vec<(Label, LocalId)>)>>,
+    /// Phi nodes to insert: block -> list of phi node entries
+    phi_nodes: FxHashMap<BlockId, Vec<PhiNodeEntry>>,
     /// Blocks that are currently being processed (for cycle detection)
     in_progress: FxHashSet<(BlockId, HeapSlot)>,
 }

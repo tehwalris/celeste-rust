@@ -12,6 +12,9 @@ use serde::Serialize;
 
 use crate::ir::{Block, Cfg, FunDef, Instruction, Label, SourceSpan, Terminator};
 
+/// Entry in the profiling span stack: (name, category, start_instant, dag_node_id, tree_node_id, start_step)
+type SpanStackEntry = (String, String, Instant, Option<u64>, Option<u64>, u64);
+
 // ============================================================================
 // CFG Structure Export
 // ============================================================================
@@ -314,7 +317,7 @@ pub struct Profiler {
     tree_stack: Vec<u64>,
     /// Stack of active span start times (for computing durations)
     /// Tuple: (name, category, start_instant, dag_node_id, tree_node_id, start_step)
-    span_stack: Vec<(String, String, Instant, Option<u64>, Option<u64>, u64)>,
+    span_stack: Vec<SpanStackEntry>,
     /// Current DAG node being processed (if any)
     current_dag_node: Option<u64>,
     /// Stack of CFG names (for tracking nested calls)
