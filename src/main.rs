@@ -89,25 +89,7 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    run_game_frames(
-        args.frames,
-        args.detail_from,
-        args.detail_to,
-        args.dump.as_deref(),
-        args.dump_states_at,
-        args.states_file.as_deref(),
-        args.profile.as_deref(),
-        args.trace.as_deref(),
-        args.checkpoint_dir.as_deref(),
-        args.checkpoint_interval,
-        args.resume,
-        args.capture_at,
-        &args.capture_function,
-        args.capture_slow_at,
-        &args.slow_call_function,
-        args.slow_call_threshold_ms,
-        args.slow_call_offset,
-    )
+    run_game_frames(&args)
 }
 
 /// Find the latest checkpoint in a directory
@@ -138,25 +120,7 @@ fn find_latest_checkpoint(dir: &str) -> Option<(String, u32)> {
     latest
 }
 
-fn run_game_frames(
-    num_frames: u32,
-    detail_from: u32,
-    detail_to: u32,
-    dump_path: Option<&str>,
-    dump_states_at: Option<u32>,
-    states_file: Option<&str>,
-    profile_dir: Option<&str>,
-    trace_file: Option<&str>,
-    checkpoint_dir: Option<&str>,
-    checkpoint_interval: u32,
-    resume: bool,
-    capture_at: Option<u32>,
-    capture_function: &str,
-    capture_slow_at: Option<u32>,
-    slow_call_function: &str,
-    slow_call_threshold_ms: u64,
-    slow_call_offset: u32,
-) -> Result<()> {
+fn run_game_frames(args: &Args) -> Result<()> {
     use crate::interpreter::glue::interpret_cfg;
     use crate::interpreter::input_capture::{enable_capture, disable_capture_and_get, enable_slow_call_capture, save_slow_call};
     use crate::interpreter::inspect::{make_state_abstract, create_frame_dump, write_frame_dump_jsonl, dump_states_to_file, save_checkpoint, load_checkpoint, checkpoint_filename, Checkpoint};
@@ -167,19 +131,19 @@ fn run_game_frames(
     use std::fs::File;
 
     // Enable profiling if requested
-    if profile_dir.is_some() {
+    if args.profile.is_some() {
         enable_profiling();
         println!("Profiling enabled");
     }
 
     // Enable lightweight tracing if requested
-    if trace_file.is_some() {
+    if args.trace.is_some() {
         enable_tracing();
         println!("Lightweight tracing enabled");
     }
 
     // Create checkpoint directory if needed
-    if let Some(dir) = checkpoint_dir {
+    if let Some(ref dir) = args.checkpoint_dir {
         std::fs::create_dir_all(dir)?;
     }
 
@@ -218,7 +182,7 @@ __reset_button_states()
     assert!(frame_fun_defs.is_empty(), "Frame code should not define new functions");
 
     // Try to resume from checkpoint if requested
-    let (mut states, start_frame) = if let (true, Some(dir)) = (resume, checkpoint_dir) {
+    let (mut states, start_frame) = if let (true, Some(ref dir)) = (args.resume, &args.checkpoint_dir) {
         match find_latest_checkpoint(dir) {
             Some((checkpoint_path, frame)) => {
                 println!("Resuming from checkpoint: {} (frame {})", checkpoint_path, frame);
@@ -262,7 +226,7 @@ __reset_button_states()
     println!("Injected tile_flag_at builtin into {} states", states.len());
 
     // Open dump file if requested
-    let mut dump_writer = dump_path.map(|path| {
+    let mut dump_writer = args.dump.as_ref().map(|path| {
         let file = File::create(path).expect("Failed to create dump file");
         BufWriter::new(file)
     });
@@ -275,21 +239,21 @@ __reset_button_states()
         }
     }
 
-    for frame_num in start_frame..=num_frames {
+    for frame_num in start_frame..=args.frames {
         let expanded_input: usize = states.iter().map(|s| s.vector_size).sum();
         print!("Frame {}: ", frame_num);
 
         // Enable capture if this is the target frame
-        if capture_at == Some(frame_num) {
-            println!("(capturing {} calls)", capture_function);
-            enable_capture(capture_function);
+        if args.capture_at == Some(frame_num) {
+            println!("(capturing {} calls)", args.capture_function);
+            enable_capture(&args.capture_function);
         }
 
         // Enable slow call capture if this is the target frame
-        if capture_slow_at == Some(frame_num) {
+        if args.capture_slow_at == Some(frame_num) {
             println!("(capturing slow {} calls, threshold={}ms, offset={})",
-                slow_call_function, slow_call_threshold_ms, slow_call_offset);
-            enable_slow_call_capture(slow_call_function, slow_call_threshold_ms, slow_call_offset);
+                args.slow_call_function, args.slow_call_threshold_ms, args.slow_call_offset);
+            enable_slow_call_capture(&args.slow_call_function, args.slow_call_threshold_ms, args.slow_call_offset);
         }
 
         let start = std::time::Instant::now();
@@ -303,9 +267,9 @@ __reset_button_states()
         }
 
         // Disable capture and save if this was the target frame
-        if capture_at == Some(frame_num) {
+        if args.capture_at == Some(frame_num) {
             let captured = disable_capture_and_get();
-            println!("  Captured {} calls to {}", captured.len(), capture_function);
+            println!("  Captured {} calls to {}", captured.len(), args.capture_function);
             let output_path = "/tmp/captured_calls.json";
             let json = serde_json::to_string_pretty(&captured).expect("Failed to serialize");
             std::fs::write(output_path, &json).expect("Failed to write");
@@ -313,7 +277,7 @@ __reset_button_states()
         }
 
         // Save slow call if this was the target frame
-        if capture_slow_at == Some(frame_num) {
+        if args.capture_slow_at == Some(frame_num) {
             let output_path = "/tmp/slow_call.json.zst";
             match save_slow_call(output_path) {
                 Ok(true) => println!("  Saved slow call to {}", output_path),
@@ -342,7 +306,7 @@ __reset_button_states()
             new_states.len(), expanded_output, start.elapsed());
 
         // Show detailed state info for specified frame range
-        if frame_num >= detail_from && frame_num <= detail_to {
+        if frame_num >= args.detail_from && frame_num <= args.detail_to {
             for (i, state) in new_states.iter().enumerate() {
                 println!("  State {}: vector_size={}, heap_len={}",
                     i, state.vector_size, state.heap.len());
@@ -356,8 +320,8 @@ __reset_button_states()
         }
 
         // Dump full states at specified frame
-        if dump_states_at == Some(frame_num) {
-            let output_path = states_file.unwrap_or("/tmp/states_dump.jsonl");
+        if args.dump_states_at == Some(frame_num) {
+            let output_path = args.states_file.as_deref().unwrap_or("/tmp/states_dump.jsonl");
             println!("Dumping {} full states to {}", new_states.len(), output_path);
             dump_states_to_file(&new_states, output_path).expect("Failed to dump states");
         }
@@ -365,8 +329,8 @@ __reset_button_states()
         states = new_states;
 
         // Save checkpoint if at interval
-        if let Some(dir) = checkpoint_dir {
-            if checkpoint_interval > 0 && frame_num % checkpoint_interval == 0 {
+        if let Some(ref dir) = args.checkpoint_dir {
+            if args.checkpoint_interval > 0 && frame_num % args.checkpoint_interval == 0 {
                 let checkpoint_path = format!("{}/{}", dir, checkpoint_filename(frame_num));
                 print!("  Saving checkpoint to {}... ", checkpoint_path);
                 std::io::Write::flush(&mut std::io::stdout()).ok();
@@ -394,10 +358,10 @@ __reset_button_states()
     println!("\nTotal: {} states ({} expanded) after {} frames",
         states.len(),
         states.iter().map(|s| s.vector_size).sum::<usize>(),
-        num_frames);
+        args.frames);
 
     // Save profiling data if enabled
-    if let Some(profile_dir) = profile_dir {
+    if let Some(ref profile_dir) = args.profile {
         use std::io::Write;
         std::fs::create_dir_all(profile_dir)?;
 
@@ -444,7 +408,7 @@ __reset_button_states()
     }
 
     // Save lightweight tracing data if enabled
-    if let Some(trace_file) = trace_file {
+    if let Some(ref trace_file) = args.trace {
         use std::io::Write;
 
         // Collect any remaining thread-local spans
