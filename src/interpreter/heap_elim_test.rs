@@ -422,86 +422,48 @@ mod tests {
             .collect()
     }
 
-    /// Test execution of heap-eliminated CFG with SSA interpreter
-    #[test]
-    fn test_ssa_execution_positive_x() {
+    /// Execute the simple field access CFG with the given x value and return the numeric result.
+    /// The CFG implements: if x > 0 then x+1 else x
+    fn execute_simple_field_cfg(x: i16) -> i16 {
         let transformed = run_simple_field_heap_elim();
-
-        // Test with positive x (takes the if_true branch)
-        let mut initial_slots = FxHashMap::default();
-        initial_slots.insert("arg0.x".to_string(), SsaValue::Num(Pico8Num::from_i16(5)));
-
         let slot_mappings = make_slot_mappings(&transformed);
+
+        let mut initial_slots = FxHashMap::default();
+        initial_slots.insert("arg0.x".to_string(), SsaValue::Num(Pico8Num::from_i16(x)));
 
         let exec_result = ssa_execute(&transformed.cfg, initial_slots, &slot_mappings);
 
         match exec_result {
-            Ok((_, return_value)) => {
-                println!("SSA execution result: {:?}", return_value);
-                // If x=5 > 0, then we do x = x + 1, so result should be 6
-                assert_eq!(return_value, Some(SsaValue::Num(Pico8Num::from_i16(6))));
-            }
-            Err(e) => {
-                println!("SSA execution error: {}", e);
-                panic!("SSA execution failed: {}", e);
-            }
+            Ok((_, return_value)) => match return_value {
+                Some(SsaValue::Num(n)) => n.whole_part_as_i16(),
+                _ => panic!("Expected numeric return value for x={}", x),
+            },
+            Err(e) => panic!("SSA execution failed for x={}: {}", x, e),
         }
+    }
+
+    /// Test execution of heap-eliminated CFG with SSA interpreter
+    #[test]
+    fn test_ssa_execution_positive_x() {
+        // If x=5 > 0, then we do x = x + 1, so result should be 6
+        assert_eq!(execute_simple_field_cfg(5), 6);
     }
 
     #[test]
     fn test_ssa_execution_negative_x() {
-        let transformed = run_simple_field_heap_elim();
-
-        // Test with negative x (skips the if_true branch)
-        let mut initial_slots = FxHashMap::default();
-        initial_slots.insert("arg0.x".to_string(), SsaValue::Num(Pico8Num::from_i16(-3)));
-
-        let slot_mappings = make_slot_mappings(&transformed);
-
-        let exec_result = ssa_execute(&transformed.cfg, initial_slots, &slot_mappings);
-
-        match exec_result {
-            Ok((_, return_value)) => {
-                println!("SSA execution result: {:?}", return_value);
-                // If x=-3 <= 0, we skip the increment, so result should be -3
-                assert_eq!(return_value, Some(SsaValue::Num(Pico8Num::from_i16(-3))));
-            }
-            Err(e) => {
-                println!("SSA execution error: {}", e);
-                panic!("SSA execution failed: {}", e);
-            }
-        }
+        // If x=-3 <= 0, we skip the increment, so result should be -3
+        assert_eq!(execute_simple_field_cfg(-3), -3);
     }
 
     /// Property-based test: for random inputs, the heap-eliminated CFG
     /// should produce the same result as the expected semantics
     #[test]
     fn test_ssa_execution_random() {
-        let transformed = run_simple_field_heap_elim();
-        let slot_mappings = make_slot_mappings(&transformed);
-
         // Test with various values
         for x in [-100, -1, 0, 1, 100] {
-            let mut initial_slots = FxHashMap::default();
-            initial_slots.insert("arg0.x".to_string(), SsaValue::Num(Pico8Num::from_i16(x)));
-
-            let exec_result = ssa_execute(&transformed.cfg, initial_slots, &slot_mappings);
-
-            match exec_result {
-                Ok((_, return_value)) => {
-                    // Expected: if x > 0 then x+1 else x
-                    let expected = if x > 0 { x + 1 } else { x };
-                    let actual = match return_value {
-                        Some(SsaValue::Num(n)) => n.whole_part_as_i16(),
-                        _ => panic!("Expected numeric return value"),
-                    };
-                    assert_eq!(actual, expected, "Failed for x={}", x);
-                    println!("x={}: expected={}, actual={} ✓", x, expected, actual);
-                }
-                Err(e) => {
-                    panic!("SSA execution failed for x={}: {}", x, e);
-                }
-            }
+            // Expected: if x > 0 then x+1 else x
+            let expected = if x > 0 { x + 1 } else { x };
+            assert_eq!(execute_simple_field_cfg(x), expected, "Failed for x={}", x);
         }
     }
 
@@ -513,11 +475,6 @@ mod tests {
     /// This is a basic property test that runs both versions with random inputs
     #[test]
     fn test_equivalence_random_inputs() {
-        let transformed = run_simple_field_heap_elim();
-        let slot_mappings = make_slot_mappings(&transformed);
-
-        println!("\n=== EQUIVALENCE TEST ===");
-
         // Test with various input values (simulating random inputs)
         // Note: avoid boundary values like 32767 that would overflow on x+1
         let test_values: Vec<i16> = vec![
@@ -525,51 +482,11 @@ mod tests {
             42, -42, 127, -128, 255, -256
         ];
 
-        let mut all_passed = true;
-        let mut tested = 0;
-        let mut skipped = 0;
-
-        for x in test_values {
-            let x_num = Pico8Num::from_i16(x);
-
-            // Execute transformed CFG with SSA interpreter
-            let mut initial_slots = FxHashMap::default();
-            initial_slots.insert("arg0.x".to_string(), SsaValue::Num(x_num));
-
-            let ssa_result = ssa_execute(&transformed.cfg, initial_slots, &slot_mappings);
-
-            match ssa_result {
-                Ok((_, ssa_return)) => {
-                    // Compare with expected semantics: if x > 0 then x+1 else x
-                    let expected = if x > 0 { x + 1 } else { x };
-                    let actual = match ssa_return {
-                        Some(SsaValue::Num(n)) => n.whole_part_as_i16(),
-                        _ => {
-                            println!("x={}: SSA returned non-numeric value", x);
-                            all_passed = false;
-                            continue;
-                        }
-                    };
-
-                    if actual != expected {
-                        println!("x={}: MISMATCH - expected={}, actual={}", x, expected, actual);
-                        all_passed = false;
-                    } else {
-                        tested += 1;
-                    }
-                }
-                Err(e) => {
-                    println!("x={}: SSA execution error: {}", x, e);
-                    skipped += 1;
-                }
-            }
+        for x in &test_values {
+            // Expected: if x > 0 then x+1 else x
+            let expected = if *x > 0 { *x + 1 } else { *x };
+            assert_eq!(execute_simple_field_cfg(*x), expected, "Failed for x={}", x);
         }
-
-        println!("Tested {} values, skipped {}", tested, skipped);
-        assert!(all_passed, "Equivalence test failed - see output above for details");
-        assert!(tested > 0, "No values were successfully tested");
-
-        println!("✓ All {} test values produced equivalent results", tested);
     }
 
     /// Test that the type validation catches Load(Phi) issues
