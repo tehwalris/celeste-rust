@@ -360,9 +360,10 @@ impl Profiler {
         self.enabled
     }
 
-    /// Reset all profiling data
+    /// Reset all profiling data and disable profiling
     pub fn reset(&mut self) {
-        self.start_time = Some(Instant::now());
+        self.enabled = false;
+        self.start_time = None;
         self.next_dag_id = 0;
         self.next_tree_id = 0;
         self.next_step = 0;
@@ -830,8 +831,13 @@ pub fn is_profiling_enabled() -> bool {
     PROFILING_ENABLED.load(Ordering::Acquire)
 }
 
-/// Reset profiling data
+/// Reset profiling data and disable profiling
+///
+/// After calling this, profiling will be disabled until `enable_profiling()` is called.
+/// This ensures clean test isolation when tests call reset_profiling() followed by
+/// enable_profiling().
 pub fn reset_profiling() {
+    PROFILING_ENABLED.store(false, Ordering::Release);
     PROFILER.lock().unwrap().reset();
 }
 
