@@ -122,11 +122,7 @@ pub fn coalesce_blocks(cfg: &Cfg) -> CoalesceResult {
 /// Replaces references to `old_label` with `new_label` in all phi instructions.
 /// If `new_label` is None, removes the phi branches entirely.
 fn update_phi_nodes_for_removed_block(cfg: &mut Cfg, old_label: &Label, new_label: Option<&Label>) {
-    // Update entry block
-    update_block_phi_nodes(&mut cfg.entry, old_label, new_label);
-
-    // Update named blocks
-    for (_, block) in cfg.named.iter_mut() {
+    for block in cfg.iter_blocks_mut() {
         update_block_phi_nodes(block, old_label, new_label);
     }
 }
@@ -168,15 +164,7 @@ fn apply_phi_replacements_globally(cfg: &mut Cfg, replacements: &FxHashMap<Local
 
     let apply = |id: LocalId| replacements.get(&id).copied().unwrap_or(id);
 
-    // Update entry block
-    for (_, instr) in &mut cfg.entry.instructions {
-        *instr = instr.map_local_ids(&apply);
-    }
-    let (term_id, term) = &cfg.entry.terminator;
-    cfg.entry.terminator = (*term_id, term.map_local_ids(&apply));
-
-    // Update named blocks
-    for (_, block) in cfg.named.iter_mut() {
+    for block in cfg.iter_blocks_mut() {
         for (_, instr) in &mut block.instructions {
             *instr = instr.map_local_ids(&apply);
         }

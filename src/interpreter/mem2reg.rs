@@ -345,8 +345,7 @@ fn promote_cell_multi_block(cfg: &mut Cfg, cell: &CellInfo, local_gen: &mut Loca
             return false;
         }
 
-        rewrite_block_for_cell(&mut cfg.entry, cell, &load_replacements);
-        for (_, block) in cfg.named.iter_mut() {
+        for block in cfg.iter_blocks_mut() {
             rewrite_block_for_cell(block, cell, &load_replacements);
         }
 
@@ -378,8 +377,7 @@ fn promote_cell_multi_block(cfg: &mut Cfg, cell: &CellInfo, local_gen: &mut Loca
                 return false;
             }
 
-            rewrite_block_for_cell(&mut cfg.entry, cell, &load_replacements);
-            for (_, block) in cfg.named.iter_mut() {
+            for block in cfg.iter_blocks_mut() {
                 rewrite_block_for_cell(block, cell, &load_replacements);
             }
 
@@ -445,8 +443,7 @@ fn promote_cell_multi_block(cfg: &mut Cfg, cell: &CellInfo, local_gen: &mut Loca
                 return false;
             }
 
-            rewrite_block_for_cell(&mut cfg.entry, cell, &load_replacements);
-            for (_, block) in cfg.named.iter_mut() {
+            for block in cfg.iter_blocks_mut() {
                 rewrite_block_for_cell(block, cell, &load_replacements);
             }
 
@@ -651,8 +648,7 @@ fn promote_cell_with_ssa(
     }
 
     // Then rewrite blocks to remove cell operations and use replacements
-    rewrite_block_for_cell(&mut cfg.entry, cell, &load_replacements);
-    for (_, block) in cfg.named.iter_mut() {
+    for block in cfg.iter_blocks_mut() {
         rewrite_block_for_cell(block, cell, &load_replacements);
     }
 

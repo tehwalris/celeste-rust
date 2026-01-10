@@ -805,6 +805,10 @@ impl Cfg {
         std::iter::once(&self.entry).chain(self.named.values())
     }
 
+    pub fn iter_blocks_mut(&mut self) -> impl Iterator<Item = &mut Block> {
+        std::iter::once(&mut self.entry).chain(self.named.values_mut())
+    }
+
     pub fn map_blocks(&self, f: impl Fn(&Block) -> Block) -> Self {
         Self {
             entry: f(&self.entry),
