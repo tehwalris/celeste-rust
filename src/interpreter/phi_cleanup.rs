@@ -303,6 +303,105 @@ pub fn cleanup_phis_with_defined_locals(
 mod tests {
     use super::*;
 
+    // ==================== Test Helper Functions ====================
+
+    /// A branch in a conditional diamond CFG pattern.
+    struct DiamondBranch {
+        /// Label for this branch block
+        label: &'static str,
+        /// LocalId assigned to the instruction in this branch
+        local_id: LocalId,
+        /// Terminator for this branch (branch to join, deopt, etc.)
+        terminator: Terminator,
+        /// Terminator LocalId for this branch
+        terminator_id: LocalId,
+    }
+
+    impl DiamondBranch {
+        /// Create a branch that jumps to the join block
+        fn branch_to_join(label: &'static str, local_id: usize, terminator_id: usize) -> Self {
+            Self {
+                label,
+                local_id: LocalId::from(local_id),
+                terminator: Terminator::branch("join"),
+                terminator_id: LocalId::from(terminator_id),
+            }
+        }
+
+        /// Create a branch that deopts (doesn't reach join)
+        fn deopt(label: &'static str, local_id: usize, terminator_id: usize, reason: &str) -> Self {
+            Self {
+                label,
+                local_id: LocalId::from(local_id),
+                terminator: Terminator::deopt(reason),
+                terminator_id: LocalId::from(terminator_id),
+            }
+        }
+    }
+
+    /// Create a diamond-shaped CFG with a conditional branch and join block with Phi.
+    ///
+    /// Structure:
+    /// ```text
+    ///       entry
+    ///      /     \
+    /// branch_a  branch_b
+    ///      \     /
+    ///       join (with Phi)
+    /// ```
+    ///
+    /// The join block contains a Phi referencing values from each branch,
+    /// followed by a return of the Phi result.
+    fn make_conditional_diamond_cfg(
+        branch_a: DiamondBranch,
+        branch_b: DiamondBranch,
+        phi_local_id: usize,
+        return_terminator_id: usize,
+    ) -> Cfg {
+        let entry = Block::new_for_test(
+            vec![(LocalId::from(0), Instruction::bool_const(true))],
+            (
+                LocalId::from(99),
+                Terminator::cond_branch(LocalId::from(0), branch_a.label, branch_b.label),
+            ),
+        );
+
+        let block_a = Block::new_for_test(
+            vec![(branch_a.local_id, Instruction::num_const(1))],
+            (branch_a.terminator_id, branch_a.terminator),
+        );
+
+        let block_b = Block::new_for_test(
+            vec![(branch_b.local_id, Instruction::num_const(2))],
+            (branch_b.terminator_id, branch_b.terminator),
+        );
+
+        let phi_id = LocalId::from(phi_local_id);
+        let join = Block::new_for_test(
+            vec![(
+                phi_id,
+                Instruction::phi(vec![
+                    (Label::from(branch_a.label.to_string()), branch_a.local_id),
+                    (Label::from(branch_b.label.to_string()), branch_b.local_id),
+                ]),
+            )],
+            (LocalId::from(return_terminator_id), Terminator::ret(Some(phi_id))),
+        );
+
+        Cfg {
+            entry,
+            named: [
+                (Label::from(branch_a.label.to_string()), block_a),
+                (Label::from(branch_b.label.to_string()), block_b),
+                (Label::from("join".to_string()), join),
+            ]
+            .into_iter()
+            .collect(),
+        }
+    }
+
+    // ==================== Tests ====================
+
     #[test]
     fn test_no_change_when_predecessors_match() {
         // Entry branches to Block A, Block A branches to Block B
@@ -358,45 +457,12 @@ mod tests {
         // B still branches to join
         // Join has Phi(A: %1, B: %2) - should remove A branch
 
-        let entry = Block::new_for_test(
-            vec![(LocalId::from(0), Instruction::bool_const(true))],
-            (LocalId::from(99), Terminator::cond_branch(LocalId::from(0), "block_a", "block_b")),
+        let cfg = make_conditional_diamond_cfg(
+            DiamondBranch::deopt("block_a", 1, 10, "test"),
+            DiamondBranch::branch_to_join("block_b", 2, 11),
+            3,  // phi_local_id
+            12, // return_terminator_id
         );
-
-        // Block A now has Deopt terminator (doesn't branch to join anymore)
-        let block_a = Block::new_for_test(
-            vec![(LocalId::from(1), Instruction::num_const(1))],
-            (LocalId::from(10), Terminator::deopt("test")),
-        );
-
-        // Block B still branches to join
-        let block_b = Block::new_for_test(
-            vec![(LocalId::from(2), Instruction::num_const(2))],
-            (LocalId::from(11), Terminator::branch("join")),
-        );
-
-        // Join has Phi referencing both A and B
-        let join = Block::new_for_test(
-            vec![(
-                LocalId::from(3),
-                Instruction::phi(vec![
-                    (Label::from("block_a".to_string()), LocalId::from(1)),
-                    (Label::from("block_b".to_string()), LocalId::from(2)),
-                ]),
-            )],
-            (LocalId::from(12), Terminator::ret(Some(LocalId::from(3)))),
-        );
-
-        let cfg = Cfg {
-            entry,
-            named: [
-                (Label::from("block_a".to_string()), block_a),
-                (Label::from("block_b".to_string()), block_b),
-                (Label::from("join".to_string()), join),
-            ]
-            .into_iter()
-            .collect(),
-        };
 
         let result = cleanup_phis(&cfg);
 
@@ -416,42 +482,12 @@ mod tests {
         // Both A and B get Deopt'd
         // Join has Phi(A, B) - becomes empty!
 
-        let entry = Block::new_for_test(
-            vec![(LocalId::from(0), Instruction::bool_const(true))],
-            (LocalId::from(99), Terminator::cond_branch(LocalId::from(0), "block_a", "block_b")),
+        let cfg = make_conditional_diamond_cfg(
+            DiamondBranch::deopt("block_a", 1, 10, "a"),
+            DiamondBranch::deopt("block_b", 2, 11, "b"),
+            3,  // phi_local_id
+            12, // return_terminator_id
         );
-
-        let block_a = Block::new_for_test(
-            vec![(LocalId::from(1), Instruction::num_const(1))],
-            (LocalId::from(10), Terminator::deopt("a")),
-        );
-
-        let block_b = Block::new_for_test(
-            vec![(LocalId::from(2), Instruction::num_const(2))],
-            (LocalId::from(11), Terminator::deopt("b")),
-        );
-
-        let join = Block::new_for_test(
-            vec![(
-                LocalId::from(3),
-                Instruction::phi(vec![
-                    (Label::from("block_a".to_string()), LocalId::from(1)),
-                    (Label::from("block_b".to_string()), LocalId::from(2)),
-                ]),
-            )],
-            (LocalId::from(12), Terminator::ret(Some(LocalId::from(3)))),
-        );
-
-        let cfg = Cfg {
-            entry,
-            named: [
-                (Label::from("block_a".to_string()), block_a),
-                (Label::from("block_b".to_string()), block_b),
-                (Label::from("join".to_string()), join),
-            ]
-            .into_iter()
-            .collect(),
-        };
 
         let result = cleanup_phis(&cfg);
 
@@ -690,44 +726,14 @@ mod tests {
         //   with defined_locals = {%0, %2} (not including %1)
         // - The Phi should have the A branch removed, collapsing to just %2
 
-        let entry = Block::new_for_test(
-            vec![(LocalId::from(0), Instruction::bool_const(true))],
-            (LocalId::from(99), Terminator::cond_branch(LocalId::from(0), "block_a", "block_b")),
-        );
-
         // Block A still exists in this test CFG (predecessor is valid),
         // but we'll tell cleanup that %1 is not defined
-        let block_a = Block::new_for_test(
-            vec![(LocalId::from(1), Instruction::num_const(1))],
-            (LocalId::from(10), Terminator::branch("join")),
+        let cfg = make_conditional_diamond_cfg(
+            DiamondBranch::branch_to_join("block_a", 1, 10),
+            DiamondBranch::branch_to_join("block_b", 2, 11),
+            3,  // phi_local_id
+            12, // return_terminator_id
         );
-
-        let block_b = Block::new_for_test(
-            vec![(LocalId::from(2), Instruction::num_const(2))],
-            (LocalId::from(11), Terminator::branch("join")),
-        );
-
-        let join = Block::new_for_test(
-            vec![(
-                LocalId::from(3),
-                Instruction::phi(vec![
-                    (Label::from("block_a".to_string()), LocalId::from(1)),
-                    (Label::from("block_b".to_string()), LocalId::from(2)),
-                ]),
-            )],
-            (LocalId::from(12), Terminator::ret(Some(LocalId::from(3)))),
-        );
-
-        let cfg = Cfg {
-            entry,
-            named: [
-                (Label::from("block_a".to_string()), block_a),
-                (Label::from("block_b".to_string()), block_b),
-                (Label::from("join".to_string()), join),
-            ]
-            .into_iter()
-            .collect(),
-        };
 
         // Define locals except %1 (simulating that block_a was removed by DCE
         // but the CFG still has it for this test - what matters is the defined_locals set)
@@ -763,42 +769,12 @@ mod tests {
         // Test what happens when ALL Phi branches reference undefined locals
         // The Phi should become empty (phis_emptied = 1)
 
-        let entry = Block::new_for_test(
-            vec![(LocalId::from(0), Instruction::bool_const(true))],
-            (LocalId::from(99), Terminator::cond_branch(LocalId::from(0), "block_a", "block_b")),
+        let cfg = make_conditional_diamond_cfg(
+            DiamondBranch::branch_to_join("block_a", 1, 10),
+            DiamondBranch::branch_to_join("block_b", 2, 11),
+            3,  // phi_local_id
+            12, // return_terminator_id
         );
-
-        let block_a = Block::new_for_test(
-            vec![(LocalId::from(1), Instruction::num_const(1))],
-            (LocalId::from(10), Terminator::branch("join")),
-        );
-
-        let block_b = Block::new_for_test(
-            vec![(LocalId::from(2), Instruction::num_const(2))],
-            (LocalId::from(11), Terminator::branch("join")),
-        );
-
-        let join = Block::new_for_test(
-            vec![(
-                LocalId::from(3),
-                Instruction::phi(vec![
-                    (Label::from("block_a".to_string()), LocalId::from(1)),
-                    (Label::from("block_b".to_string()), LocalId::from(2)),
-                ]),
-            )],
-            (LocalId::from(12), Terminator::ret(Some(LocalId::from(3)))),
-        );
-
-        let cfg = Cfg {
-            entry,
-            named: [
-                (Label::from("block_a".to_string()), block_a),
-                (Label::from("block_b".to_string()), block_b),
-                (Label::from("join".to_string()), join),
-            ]
-            .into_iter()
-            .collect(),
-        };
 
         // Define only entry locals - neither %1 nor %2 are defined
         let mut defined_locals: FxHashSet<LocalId> = FxHashSet::default();
