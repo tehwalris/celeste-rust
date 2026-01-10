@@ -4,8 +4,6 @@
 //! only one predecessor, and merges them together. This reduces control flow
 //! overhead and enables further optimizations.
 
-use std::collections::HashMap;
-
 use crate::interpreter::common::FxHashMap;
 use crate::ir::{Block, BlockId, Cfg, Instruction, Label, LocalId, Terminator};
 
@@ -31,7 +29,7 @@ pub fn coalesce_blocks(cfg: &Cfg) -> CoalesceResult {
     let preds = predecessors_for_coalesce(cfg);
 
     // Find which blocks can be coalesced (have exactly one predecessor via unconditional branch)
-    let mut coalesce_targets: HashMap<Label, BlockSource> = HashMap::new();
+    let mut coalesce_targets: FxHashMap<Label, BlockSource> = FxHashMap::default();
 
     // Check entry block
     if let Terminator::UnconditionalBranch { target } = cfg.entry.terminator_kind() {
@@ -163,7 +161,7 @@ enum BlockSource {
 /// Apply local ID replacements across the entire CFG.
 /// This is used when phis are resolved during block merging - the resolved
 /// phi's local ID needs to be replaced with its value throughout the CFG.
-fn apply_phi_replacements_globally(cfg: &mut Cfg, replacements: &HashMap<LocalId, LocalId>) {
+fn apply_phi_replacements_globally(cfg: &mut Cfg, replacements: &FxHashMap<LocalId, LocalId>) {
     if replacements.is_empty() {
         return;
     }
@@ -191,7 +189,7 @@ fn apply_phi_replacements_globally(cfg: &mut Cfg, replacements: &HashMap<LocalId
 /// Updates phi nodes to remove references to the target label.
 /// `source_label` is the label of the source block (None for entry block).
 /// Returns a map of phi replacements that should be applied globally.
-fn merge_blocks(source: &mut Block, target: &Block, _target_label: &Label, source_label: Option<&Label>) -> HashMap<LocalId, LocalId> {
+fn merge_blocks(source: &mut Block, target: &Block, _target_label: &Label, source_label: Option<&Label>) -> FxHashMap<LocalId, LocalId> {
     use crate::ir::ENTRY_BLOCK_LABEL;
 
     // Remove phi nodes from target - they reference the source which is now the same block
@@ -206,7 +204,7 @@ fn merge_blocks(source: &mut Block, target: &Block, _target_label: &Label, sourc
 
     // For each phi in target, we need to resolve it to the value from source
     // Since source is the only predecessor, we find the branch matching source's label
-    let mut phi_replacements: HashMap<LocalId, LocalId> = HashMap::new();
+    let mut phi_replacements: FxHashMap<LocalId, LocalId> = FxHashMap::default();
     for (target_id, instr) in target_phis {
         if let Instruction::Phi { branches } = instr {
             // Find the branch that matches the source block's label
