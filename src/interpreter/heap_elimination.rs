@@ -117,6 +117,27 @@ pub enum ValueShape {
     Pointer(HeapSlot),
 }
 
+impl ValueShape {
+    /// Create a Table shape from a list of (field_name, shape) pairs.
+    /// This is a convenience helper primarily for test code.
+    ///
+    /// Example:
+    /// ```ignore
+    /// let shape = ValueShape::table([
+    ///     ("x", ValueShape::Leaf),
+    ///     ("y", ValueShape::Constant(Pico8Num::from_i16(42))),
+    /// ]);
+    /// ```
+    #[cfg(test)]
+    pub fn table<const N: usize>(fields: [(&str, ValueShape); N]) -> ValueShape {
+        let mut map = FxHashMap::default();
+        for (name, shape) in fields {
+            map.insert(name.to_string(), shape);
+        }
+        ValueShape::Table(map)
+    }
+}
+
 /// The concrete shape of the heap at function entry
 #[derive(Clone, Debug)]
 pub struct HeapShape {
@@ -1269,30 +1290,28 @@ mod tests {
     /// Create a HeapShape with a global table containing a single field as Leaf.
     /// Example: `make_player_x_shape()` creates `{ globals: { player: { x: Leaf } } }`
     fn make_player_x_shape() -> HeapShape {
-        let mut player_fields = FxHashMap::default();
-        player_fields.insert("x".to_string(), ValueShape::Leaf);
         let mut shape = HeapShape::new();
-        shape.globals.insert("player".to_string(), ValueShape::Table(player_fields));
+        shape
+            .globals
+            .insert("player".to_string(), ValueShape::table([("x", ValueShape::Leaf)]));
         shape
     }
 
     /// Create a HeapShape with a global table containing x and y fields as Leaves.
     /// Example: `make_player_xy_shape()` creates `{ globals: { player: { x: Leaf, y: Leaf } } }`
     fn make_player_xy_shape() -> HeapShape {
-        let mut player_fields = FxHashMap::default();
-        player_fields.insert("x".to_string(), ValueShape::Leaf);
-        player_fields.insert("y".to_string(), ValueShape::Leaf);
         let mut shape = HeapShape::new();
-        shape.globals.insert("player".to_string(), ValueShape::Table(player_fields));
+        shape.globals.insert(
+            "player".to_string(),
+            ValueShape::table([("x", ValueShape::Leaf), ("y", ValueShape::Leaf)]),
+        );
         shape
     }
 
     /// Create a table shape with a single field "x" as Leaf.
     /// Useful for building custom HeapShapes that need a table with x field.
     fn make_table_with_x() -> ValueShape {
-        let mut fields = FxHashMap::default();
-        fields.insert("x".to_string(), ValueShape::Leaf);
-        ValueShape::Table(fields)
+        ValueShape::table([("x", ValueShape::Leaf)])
     }
 
     #[test]
@@ -1846,9 +1865,10 @@ mod tests {
 
         let mut shape = HeapShape::new();
         // arg0 = { x: Constant(7) }
-        let mut arg0_fields = FxHashMap::default();
-        arg0_fields.insert("x".to_string(), ValueShape::Constant(Pico8Num::from_i16(7)));
-        shape.args = vec![Some(ValueShape::Table(arg0_fields))];
+        shape.args = vec![Some(ValueShape::table([(
+            "x",
+            ValueShape::Constant(Pico8Num::from_i16(7)),
+        )]))];
 
         let local_gen = make_local_gen();
         let label_gen = make_label_gen();
@@ -1931,13 +1951,16 @@ mod tests {
         // Build shape: arg0 is a table with foo = Closure and x = Leaf
         // We need at least one Leaf for eliminate_heap to not return NotApplicable
         let mut shape = HeapShape::new();
-        let mut arg0_fields = FxHashMap::default();
-        arg0_fields.insert("foo".to_string(), ValueShape::Closure {
-            fun_name: GlobalId::from("my_func_1".to_string()),
-            capture_shapes: vec![], // No captures
-        });
-        arg0_fields.insert("x".to_string(), ValueShape::Leaf); // Need at least one leaf
-        shape.args = vec![Some(ValueShape::Table(arg0_fields))];
+        shape.args = vec![Some(ValueShape::table([
+            (
+                "foo",
+                ValueShape::Closure {
+                    fun_name: GlobalId::from("my_func_1".to_string()),
+                    capture_shapes: vec![], // No captures
+                },
+            ),
+            ("x", ValueShape::Leaf), // Need at least one leaf
+        ]))];
 
         let local_gen = make_local_gen();
         let label_gen = make_label_gen();
@@ -2245,17 +2268,17 @@ mod tests {
         let cfg = Cfg::single_entry(entry);
 
         // Shape: arg0 is a table with method closure and x leaf
-        let mut arg0_fields = FxHashMap::default();
-        arg0_fields.insert(
-            "method".to_string(),
-            ValueShape::Closure {
-                fun_name: GlobalId::from("my_method_1".to_string()),
-                capture_shapes: vec![],
-            },
-        );
-        arg0_fields.insert("x".to_string(), ValueShape::Leaf);
         let mut shape = HeapShape::new();
-        shape.args = vec![Some(ValueShape::Table(arg0_fields))];
+        shape.args = vec![Some(ValueShape::table([
+            (
+                "method",
+                ValueShape::Closure {
+                    fun_name: GlobalId::from("my_method_1".to_string()),
+                    capture_shapes: vec![],
+                },
+            ),
+            ("x", ValueShape::Leaf),
+        ]))];
 
         let local_gen = make_local_gen();
         let label_gen = make_label_gen();
