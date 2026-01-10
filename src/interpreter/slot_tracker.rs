@@ -340,17 +340,6 @@ mod tests {
     use crate::ir::{Block, Cfg, Instruction, Label, LocalId, Terminator};
     use crate::pico8_num::Pico8Num;
 
-    fn make_block(
-        instructions: Vec<(LocalId, Instruction)>,
-        terminator: (LocalId, Terminator),
-    ) -> Block {
-        Block {
-            instructions,
-            terminator,
-            hint_normalize: false,
-        }
-    }
-
     #[test]
     fn test_resolve_simple_global_call() {
         // CFG:
@@ -359,7 +348,7 @@ mod tests {
         // %2 = Call(%1, [])  // Uses Load result as closure
         // return %2
 
-        let entry = make_block(
+        let entry = Block::new_for_test(
             vec![
                 (LocalId::from(0), Instruction::GetGlobal { name: "foo".to_string(), create_if_missing: false }),
                 (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),
@@ -408,7 +397,7 @@ mod tests {
         // %3 = Call(%2, [])  // Uses Load result as closure
         // return %3
 
-        let entry = make_block(
+        let entry = Block::new_for_test(
             vec![
                 (LocalId::from(0), Instruction::GetGlobal { name: "player".to_string(), create_if_missing: false }),
                 (LocalId::from(1), Instruction::GetField { receiver: LocalId::from(0), field: "update".to_string(), create_if_missing: false }),
@@ -464,7 +453,7 @@ mod tests {
         // For this test, we simulate by having two paths merge
         // Since we don't track through Phis, the call shouldn't resolve
 
-        let entry = make_block(
+        let entry = Block::new_for_test(
             vec![
                 (LocalId::from(0), Instruction::BoolConstant { value: true }),
             ],
@@ -475,14 +464,14 @@ mod tests {
             }),
         );
 
-        let true_branch = make_block(
+        let true_branch = Block::new_for_test(
             vec![
                 (LocalId::from(1), Instruction::GetGlobal { name: "foo".to_string(), create_if_missing: false }),
             ],
             (LocalId::from(98), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
         );
 
-        let false_branch = make_block(
+        let false_branch = Block::new_for_test(
             vec![
                 (LocalId::from(2), Instruction::GetGlobal { name: "bar".to_string(), create_if_missing: false }),
             ],
@@ -494,7 +483,7 @@ mod tests {
         // In practice, the original code would use a Phi node here
         // For this test, we just verify that a call using a LocalId from one branch
         // doesn't get resolved at the join point
-        let join = make_block(
+        let join = Block::new_for_test(
             vec![
                 // This call uses %1 which is only defined in true_branch
                 // At the join point, we don't know if %1 is valid
@@ -527,7 +516,7 @@ mod tests {
     fn test_idempotent_multiple_runs() {
         // Running the pass multiple times should produce the same result
 
-        let entry = make_block(
+        let entry = Block::new_for_test(
             vec![
                 (LocalId::from(0), Instruction::GetGlobal { name: "foo".to_string(), create_if_missing: false }),
                 (LocalId::from(1), Instruction::Load { source: LocalId::from(0) }),

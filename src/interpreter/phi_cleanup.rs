@@ -304,34 +304,22 @@ mod tests {
     use super::*;
     use crate::pico8_num::Pico8Num;
 
-    /// Helper to create a simple block with given instructions and terminator
-    fn make_block(
-        instructions: Vec<(LocalId, Instruction)>,
-        terminator: (LocalId, Terminator),
-    ) -> Block {
-        Block {
-            instructions,
-            terminator,
-            hint_normalize: false,
-        }
-    }
-
     #[test]
     fn test_no_change_when_predecessors_match() {
         // Entry branches to Block A, Block A branches to Block B
         // Block B has Phi referencing A - should remain valid (but collapse to single element)
 
-        let entry = make_block(
+        let entry = Block::new_for_test(
             vec![],
             (LocalId::from(99), Terminator::UnconditionalBranch { target: Label::from("block_a".to_string()) }),
         );
 
-        let block_a = make_block(
+        let block_a = Block::new_for_test(
             vec![(LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(1) })],
             (LocalId::from(1), Terminator::UnconditionalBranch { target: Label::from("block_b".to_string()) }),
         );
 
-        let block_b = make_block(
+        let block_b = Block::new_for_test(
             vec![(
                 LocalId::from(2),
                 Instruction::Phi {
@@ -373,7 +361,7 @@ mod tests {
         // B still branches to join
         // Join has Phi(A: %1, B: %2) - should remove A branch
 
-        let entry = make_block(
+        let entry = Block::new_for_test(
             vec![
                 (LocalId::from(0), Instruction::BoolConstant { value: true }),
             ],
@@ -388,19 +376,19 @@ mod tests {
         );
 
         // Block A now has Deopt terminator (doesn't branch to join anymore)
-        let block_a = make_block(
+        let block_a = Block::new_for_test(
             vec![(LocalId::from(1), Instruction::NumberConstant { value: Pico8Num::from_i16(1) })],
             (LocalId::from(10), Terminator::Deopt { reason: "test".to_string() }),
         );
 
         // Block B still branches to join
-        let block_b = make_block(
+        let block_b = Block::new_for_test(
             vec![(LocalId::from(2), Instruction::NumberConstant { value: Pico8Num::from_i16(2) })],
             (LocalId::from(11), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
         );
 
         // Join has Phi referencing both A and B
-        let join = make_block(
+        let join = Block::new_for_test(
             vec![(
                 LocalId::from(3),
                 Instruction::Phi {
@@ -442,7 +430,7 @@ mod tests {
         // Both A and B get Deopt'd
         // Join has Phi(A, B) - becomes empty!
 
-        let entry = make_block(
+        let entry = Block::new_for_test(
             vec![(LocalId::from(0), Instruction::BoolConstant { value: true })],
             (
                 LocalId::from(99),
@@ -454,17 +442,17 @@ mod tests {
             ),
         );
 
-        let block_a = make_block(
+        let block_a = Block::new_for_test(
             vec![(LocalId::from(1), Instruction::NumberConstant { value: Pico8Num::from_i16(1) })],
             (LocalId::from(10), Terminator::Deopt { reason: "a".to_string() }),
         );
 
-        let block_b = make_block(
+        let block_b = Block::new_for_test(
             vec![(LocalId::from(2), Instruction::NumberConstant { value: Pico8Num::from_i16(2) })],
             (LocalId::from(11), Terminator::Deopt { reason: "b".to_string() }),
         );
 
-        let join = make_block(
+        let join = Block::new_for_test(
             vec![(
                 LocalId::from(3),
                 Instruction::Phi {
@@ -512,12 +500,12 @@ mod tests {
         // One gets Deopt'd, two remain
         // Phi(A, B, C) -> Phi(B, C)
 
-        let entry = make_block(
+        let entry = Block::new_for_test(
             vec![],
             (LocalId::from(99), Terminator::UnconditionalBranch { target: Label::from("dispatch".to_string()) }),
         );
 
-        let dispatch = make_block(
+        let dispatch = Block::new_for_test(
             vec![(LocalId::from(0), Instruction::BoolConstant { value: true })],
             (
                 LocalId::from(98),
@@ -529,12 +517,12 @@ mod tests {
             ),
         );
 
-        let block_a = make_block(
+        let block_a = Block::new_for_test(
             vec![(LocalId::from(1), Instruction::NumberConstant { value: Pico8Num::from_i16(1) })],
             (LocalId::from(10), Terminator::Deopt { reason: "a".to_string() }), // Deopt'd!
         );
 
-        let block_b = make_block(
+        let block_b = Block::new_for_test(
             vec![(LocalId::from(2), Instruction::NumberConstant { value: Pico8Num::from_i16(2) })],
             (
                 LocalId::from(11),
@@ -546,12 +534,12 @@ mod tests {
             ),
         );
 
-        let block_c = make_block(
+        let block_c = Block::new_for_test(
             vec![(LocalId::from(3), Instruction::NumberConstant { value: Pico8Num::from_i16(3) })],
             (LocalId::from(12), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
         );
 
-        let join = make_block(
+        let join = Block::new_for_test(
             vec![(
                 LocalId::from(4),
                 Instruction::Phi {
@@ -606,12 +594,12 @@ mod tests {
         // B has Phi(%0 from A), then uses Phi result in BinaryOp
         // Phi should collapse and BinaryOp should reference %0 directly
 
-        let entry = make_block(
+        let entry = Block::new_for_test(
             vec![(LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(1) })],
             (LocalId::from(99), Terminator::UnconditionalBranch { target: Label::from("block_b".to_string()) }),
         );
 
-        let block_b = make_block(
+        let block_b = Block::new_for_test(
             vec![
                 (
                     LocalId::from(1),
@@ -665,18 +653,18 @@ mod tests {
         // block_c has Phi (%3) referencing %2 from block_b (collapses to %2, which should become %1)
         // Final use should reference %1, not %2 (which doesn't exist after collapse)
 
-        let entry = make_block(
+        let entry = Block::new_for_test(
             vec![(LocalId::from(0), Instruction::NumberConstant { value: Pico8Num::from_i16(0) })],
             (LocalId::from(99), Terminator::UnconditionalBranch { target: Label::from("block_a".to_string()) }),
         );
 
-        let block_a = make_block(
+        let block_a = Block::new_for_test(
             vec![(LocalId::from(1), Instruction::NumberConstant { value: Pico8Num::from_i16(1) })],
             (LocalId::from(98), Terminator::UnconditionalBranch { target: Label::from("block_b".to_string()) }),
         );
 
         // block_b has Phi from block_a only -> collapses to %1
-        let block_b = make_block(
+        let block_b = Block::new_for_test(
             vec![(
                 LocalId::from(2),
                 Instruction::Phi {
@@ -688,7 +676,7 @@ mod tests {
 
         // block_c has Phi from block_b only -> collapses to %2
         // But %2 is also collapsed! So transitively, this should become %1
-        let block_c = make_block(
+        let block_c = Block::new_for_test(
             vec![
                 (
                     LocalId::from(3),
@@ -750,7 +738,7 @@ mod tests {
         //   with defined_locals = {%0, %2} (not including %1)
         // - The Phi should have the A branch removed, collapsing to just %2
 
-        let entry = make_block(
+        let entry = Block::new_for_test(
             vec![(LocalId::from(0), Instruction::BoolConstant { value: true })],
             (
                 LocalId::from(99),
@@ -764,17 +752,17 @@ mod tests {
 
         // Block A still exists in this test CFG (predecessor is valid),
         // but we'll tell cleanup that %1 is not defined
-        let block_a = make_block(
+        let block_a = Block::new_for_test(
             vec![(LocalId::from(1), Instruction::NumberConstant { value: Pico8Num::from_i16(1) })],
             (LocalId::from(10), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
         );
 
-        let block_b = make_block(
+        let block_b = Block::new_for_test(
             vec![(LocalId::from(2), Instruction::NumberConstant { value: Pico8Num::from_i16(2) })],
             (LocalId::from(11), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
         );
 
-        let join = make_block(
+        let join = Block::new_for_test(
             vec![(
                 LocalId::from(3),
                 Instruction::Phi {
@@ -832,7 +820,7 @@ mod tests {
         // Test what happens when ALL Phi branches reference undefined locals
         // The Phi should become empty (phis_emptied = 1)
 
-        let entry = make_block(
+        let entry = Block::new_for_test(
             vec![(LocalId::from(0), Instruction::BoolConstant { value: true })],
             (
                 LocalId::from(99),
@@ -844,17 +832,17 @@ mod tests {
             ),
         );
 
-        let block_a = make_block(
+        let block_a = Block::new_for_test(
             vec![(LocalId::from(1), Instruction::NumberConstant { value: Pico8Num::from_i16(1) })],
             (LocalId::from(10), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
         );
 
-        let block_b = make_block(
+        let block_b = Block::new_for_test(
             vec![(LocalId::from(2), Instruction::NumberConstant { value: Pico8Num::from_i16(2) })],
             (LocalId::from(11), Terminator::UnconditionalBranch { target: Label::from("join".to_string()) }),
         );
 
-        let join = make_block(
+        let join = Block::new_for_test(
             vec![(
                 LocalId::from(3),
                 Instruction::Phi {

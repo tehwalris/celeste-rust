@@ -750,6 +750,20 @@ impl Block {
         ));
         lines.join("\n")
     }
+
+    /// Test helper to create a block with given instructions and terminator.
+    /// Sets `hint_normalize` to false by default.
+    #[cfg(test)]
+    pub fn new_for_test(
+        instructions: Vec<(LocalId, Instruction)>,
+        terminator: (LocalId, Terminator),
+    ) -> Self {
+        Block {
+            instructions,
+            terminator,
+            hint_normalize: false,
+        }
+    }
 }
 
 /// Identifies a block in a CFG, distinguishing between the entry block and named blocks.
