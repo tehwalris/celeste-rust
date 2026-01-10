@@ -399,7 +399,7 @@ struct SsaBuilder {
     /// Definitions within each block: (block, slot) -> LocalId
     block_definitions: FxHashMap<(BlockId, HeapSlot), LocalId>,
     /// Predecessors of each block
-    predecessors: FxHashMap<BlockId, Vec<(BlockId, Label)>>,
+    predecessors: FxHashMap<BlockId, Vec<BlockId>>,
     /// Phi nodes to insert: block -> list of phi node entries
     phi_nodes: FxHashMap<BlockId, Vec<PhiNodeEntry>>,
     /// Blocks that are currently being processed (for cycle detection)
@@ -468,7 +468,7 @@ impl SsaBuilder {
 
         if preds.len() == 1 {
             // Single predecessor - recurse
-            let (pred_block, _) = &preds[0];
+            let pred_block = &preds[0];
             let id = self.get_at_end(pred_block, slot);
             self.slot_versions.insert(key, id);
             return id;
@@ -492,9 +492,10 @@ impl SsaBuilder {
 
         // Collect incoming values from predecessors
         let mut branches = Vec::new();
-        for (pred_block, pred_label) in &preds {
+        for pred_block in &preds {
             let pred_id = self.get_at_end(pred_block, slot);
-            branches.push((pred_label.clone(), pred_id));
+            // Use BlockId::label() to get the label for phi node branches
+            branches.push((pred_block.label(), pred_id));
         }
 
         // Remove from in progress
@@ -513,59 +514,6 @@ impl SsaBuilder {
     fn get_final_version(&mut self, exit_block: &BlockId, slot: &HeapSlot) -> LocalId {
         self.get_at_end(exit_block, slot)
     }
-}
-
-/// Analyze a CFG to compute predecessor information
-fn compute_predecessors(cfg: &Cfg) -> FxHashMap<BlockId, Vec<(BlockId, Label)>> {
-    let mut preds: FxHashMap<BlockId, Vec<(BlockId, Label)>> = FxHashMap::default();
-
-    // Entry block has no predecessors (it's the entry point)
-
-    // Helper to add predecessor
-    let mut add_pred = |target: &Label, from: BlockId, from_label: Label| {
-        preds
-            .entry(BlockId::Named(target.clone()))
-            .or_default()
-            .push((from, from_label));
-    };
-
-    // Process entry block
-    // Note: Use Label::entry() which provides the canonical name for the entry block in phi nodes
-    match cfg.entry.terminator_kind() {
-        Terminator::Return { .. } | Terminator::Deopt { .. } => {}
-        Terminator::UnconditionalBranch { target } => {
-            add_pred(target, BlockId::Entry, Label::entry());
-        }
-        Terminator::ConditionalBranch {
-            true_target,
-            false_target,
-            ..
-        } => {
-            add_pred(true_target, BlockId::Entry, Label::entry());
-            add_pred(false_target, BlockId::Entry, Label::entry());
-        }
-    }
-
-    // Process named blocks
-    for (label, block) in &cfg.named {
-        let block_id = BlockId::Named(label.clone());
-        match block.terminator_kind() {
-            Terminator::Return { .. } | Terminator::Deopt { .. } => {}
-            Terminator::UnconditionalBranch { target } => {
-                add_pred(target, block_id, label.clone());
-            }
-            Terminator::ConditionalBranch {
-                true_target,
-                false_target,
-                ..
-            } => {
-                add_pred(true_target, block_id.clone(), label.clone());
-                add_pred(false_target, block_id, label.clone());
-            }
-        }
-    }
-
-    preds
 }
 
 /// Find exit blocks (blocks that return)
@@ -1110,8 +1058,8 @@ pub fn eliminate_heap(
     // These don't modify heap shape and shouldn't cause deopts
     let local_cells = find_local_cells(cfg);
 
-    // Compute predecessors
-    let predecessors = compute_predecessors(cfg);
+    // Compute predecessors using the centralized Cfg method
+    let predecessors = cfg.compute_predecessors();
 
     // Find exit blocks
     let exit_blocks = find_exit_blocks(cfg);
