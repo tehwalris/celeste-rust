@@ -450,10 +450,7 @@ mod tests {
             name: GlobalId::from("add_one_1".to_string()),
             capture_ids: vec![],
             arg_ids: vec![Some(LocalId::from(0))],
-            cfg: Cfg {
-                entry,
-                named: FxHashMap::default(),
-            },
+            cfg: Cfg::single_entry(entry),
             source_span: None,
         }
     }
@@ -485,10 +482,7 @@ mod tests {
             ),
         );
 
-        Cfg {
-            entry,
-            named: FxHashMap::default(),
-        }
+        Cfg::single_entry(entry)
     }
 
     #[test]

@@ -1514,10 +1514,7 @@ mod tests {
             ),
         );
 
-        Cfg {
-            entry,
-            named: FxHashMap::default(),
-        }
+        Cfg::single_entry(entry)
     }
 
     fn make_heap_read_cfg() -> Cfg {
@@ -1541,10 +1538,7 @@ mod tests {
             ),
         );
 
-        Cfg {
-            entry,
-            named: FxHashMap::default(),
-        }
+        Cfg::single_entry(entry)
     }
 
     fn make_heap_write_cfg() -> Cfg {
@@ -1575,10 +1569,7 @@ mod tests {
             (LocalId::from(3), Terminator::Return { value: None }),
         );
 
-        Cfg {
-            entry,
-            named: FxHashMap::default(),
-        }
+        Cfg::single_entry(entry)
     }
 
     #[test]
@@ -1681,30 +1672,27 @@ mod tests {
         use crate::interpreter::call_resolution::GlobalClosure;
 
         // Create inner function: %0 = 1, %1 = 1, %2 = %0 + %1, return %2
-        let inner_cfg = Cfg {
-            entry: Block::new_for_test(
-                vec![
-                    (
-                        LocalId::from(0),
-                        Instruction::NumberConstant { value: Pico8Num::from_i16(1) },
-                    ),
-                    (
-                        LocalId::from(1),
-                        Instruction::NumberConstant { value: Pico8Num::from_i16(1) },
-                    ),
-                    (
-                        LocalId::from(2),
-                        Instruction::BinaryOp {
-                            left: LocalId::from(0),
-                            op: BinaryOp::Plus,
-                            right: LocalId::from(1),
-                        },
-                    ),
-                ],
-                (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
-            ),
-            named: FxHashMap::default(),
-        };
+        let inner_cfg = Cfg::single_entry(Block::new_for_test(
+            vec![
+                (
+                    LocalId::from(0),
+                    Instruction::NumberConstant { value: Pico8Num::from_i16(1) },
+                ),
+                (
+                    LocalId::from(1),
+                    Instruction::NumberConstant { value: Pico8Num::from_i16(1) },
+                ),
+                (
+                    LocalId::from(2),
+                    Instruction::BinaryOp {
+                        left: LocalId::from(0),
+                        op: BinaryOp::Plus,
+                        right: LocalId::from(1),
+                    },
+                ),
+            ],
+            (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
+        ));
 
         let inner_def = FunDef {
             name: GlobalId::from("inner_1".to_string()),
@@ -1717,26 +1705,23 @@ mod tests {
         // Create outer function that calls inner:
         // %0 = GetGlobal("inner"), %1 = Load(%0), %2 = Call(%1, [])
         // This pattern will be resolved to CallResolved by call_resolution
-        let outer_cfg = Cfg {
-            entry: Block::new_for_test(
-                vec![
-                    (
-                        LocalId::from(0),
-                        Instruction::GetGlobal { name: "inner".to_string(), create_if_missing: false },
-                    ),
-                    (
-                        LocalId::from(1),
-                        Instruction::Load { source: LocalId::from(0) },
-                    ),
-                    (
-                        LocalId::from(2),
-                        Instruction::Call { closure: LocalId::from(1), args: vec![] },
-                    ),
-                ],
-                (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
-            ),
-            named: FxHashMap::default(),
-        };
+        let outer_cfg = Cfg::single_entry(Block::new_for_test(
+            vec![
+                (
+                    LocalId::from(0),
+                    Instruction::GetGlobal { name: "inner".to_string(), create_if_missing: false },
+                ),
+                (
+                    LocalId::from(1),
+                    Instruction::Load { source: LocalId::from(0) },
+                ),
+                (
+                    LocalId::from(2),
+                    Instruction::Call { closure: LocalId::from(1), args: vec![] },
+                ),
+            ],
+            (LocalId::from(3), Terminator::Return { value: Some(LocalId::from(2)) }),
+        ));
 
         let outer_def = FunDef {
             name: GlobalId::from("outer_2".to_string()),
@@ -1834,10 +1819,7 @@ mod tests {
             (terminator_id, Terminator::Return { value: Some(result_id) }),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: FxHashMap::default(),
-        };
+        let cfg = Cfg::single_entry(entry);
 
         // Analyze and run the pipeline with builtin set
         let analysis = analyze_cfg(&cfg);

@@ -147,58 +147,54 @@ pub fn build_builtin_set<'a>(builtin_names: impl Iterator<Item = &'a String>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::FxHashMap;
     use crate::ir::{LocalId, Terminator};
     use crate::pico8_num::Pico8Num;
 
     #[test]
     fn test_resolve_simple_builtin_call() {
         // Create a CFG with: GetGlobal("max") -> Load -> Call
-        let cfg = Cfg {
-            entry: Block::new_for_test(
-                vec![
-                    (
-                        LocalId::from(0),
-                        Instruction::GetGlobal {
-                            name: "max".to_string(),
-                            create_if_missing: false,
-                        },
-                    ),
-                    (
-                        LocalId::from(1),
-                        Instruction::Load {
-                            source: LocalId::from(0),
-                        },
-                    ),
-                    (
-                        LocalId::from(2),
-                        Instruction::NumberConstant {
-                            value: Pico8Num::from_i16(1),
-                        },
-                    ),
-                    (
-                        LocalId::from(3),
-                        Instruction::NumberConstant {
-                            value: Pico8Num::from_i16(2),
-                        },
-                    ),
-                    (
-                        LocalId::from(4),
-                        Instruction::Call {
-                            closure: LocalId::from(1),
-                            args: vec![LocalId::from(2), LocalId::from(3)],
-                        },
-                    ),
-                ],
+        let cfg = Cfg::single_entry(Block::new_for_test(
+            vec![
                 (
-                    LocalId::from(5),
-                    Terminator::Return {
-                        value: Some(LocalId::from(4)),
+                    LocalId::from(0),
+                    Instruction::GetGlobal {
+                        name: "max".to_string(),
+                        create_if_missing: false,
                     },
                 ),
+                (
+                    LocalId::from(1),
+                    Instruction::Load {
+                        source: LocalId::from(0),
+                    },
+                ),
+                (
+                    LocalId::from(2),
+                    Instruction::NumberConstant {
+                        value: Pico8Num::from_i16(1),
+                    },
+                ),
+                (
+                    LocalId::from(3),
+                    Instruction::NumberConstant {
+                        value: Pico8Num::from_i16(2),
+                    },
+                ),
+                (
+                    LocalId::from(4),
+                    Instruction::Call {
+                        closure: LocalId::from(1),
+                        args: vec![LocalId::from(2), LocalId::from(3)],
+                    },
+                ),
+            ],
+            (
+                LocalId::from(5),
+                Terminator::Return {
+                    value: Some(LocalId::from(4)),
+                },
             ),
-            named: FxHashMap::default(),
-        };
+        ));
 
         // Build builtin set with "max"
         let mut builtins = BuiltinSet::default();
@@ -238,39 +234,36 @@ mod tests {
     #[test]
     fn test_no_resolve_unknown_global() {
         // Create a CFG with: GetGlobal("unknown") -> Load -> Call
-        let cfg = Cfg {
-            entry: Block::new_for_test(
-                vec![
-                    (
-                        LocalId::from(0),
-                        Instruction::GetGlobal {
-                            name: "unknown".to_string(),
-                            create_if_missing: false,
-                        },
-                    ),
-                    (
-                        LocalId::from(1),
-                        Instruction::Load {
-                            source: LocalId::from(0),
-                        },
-                    ),
-                    (
-                        LocalId::from(2),
-                        Instruction::Call {
-                            closure: LocalId::from(1),
-                            args: vec![],
-                        },
-                    ),
-                ],
+        let cfg = Cfg::single_entry(Block::new_for_test(
+            vec![
                 (
-                    LocalId::from(3),
-                    Terminator::Return {
-                        value: Some(LocalId::from(2)),
+                    LocalId::from(0),
+                    Instruction::GetGlobal {
+                        name: "unknown".to_string(),
+                        create_if_missing: false,
                     },
                 ),
+                (
+                    LocalId::from(1),
+                    Instruction::Load {
+                        source: LocalId::from(0),
+                    },
+                ),
+                (
+                    LocalId::from(2),
+                    Instruction::Call {
+                        closure: LocalId::from(1),
+                        args: vec![],
+                    },
+                ),
+            ],
+            (
+                LocalId::from(3),
+                Terminator::Return {
+                    value: Some(LocalId::from(2)),
+                },
             ),
-            named: FxHashMap::default(),
-        };
+        ));
 
         // Build builtin set with only "max" (not "unknown")
         let mut builtins = BuiltinSet::default();
@@ -284,67 +277,64 @@ mod tests {
     #[test]
     fn test_resolve_multiple_builtin_calls() {
         // Create a CFG with calls to both max and min
-        let cfg = Cfg {
-            entry: Block::new_for_test(
-                vec![
-                    // max call
-                    (
-                        LocalId::from(0),
-                        Instruction::GetGlobal {
-                            name: "max".to_string(),
-                            create_if_missing: false,
-                        },
-                    ),
-                    (
-                        LocalId::from(1),
-                        Instruction::Load {
-                            source: LocalId::from(0),
-                        },
-                    ),
-                    (
-                        LocalId::from(2),
-                        Instruction::NumberConstant {
-                            value: Pico8Num::from_i16(1),
-                        },
-                    ),
-                    (
-                        LocalId::from(3),
-                        Instruction::Call {
-                            closure: LocalId::from(1),
-                            args: vec![LocalId::from(2)],
-                        },
-                    ),
-                    // min call
-                    (
-                        LocalId::from(4),
-                        Instruction::GetGlobal {
-                            name: "min".to_string(),
-                            create_if_missing: false,
-                        },
-                    ),
-                    (
-                        LocalId::from(5),
-                        Instruction::Load {
-                            source: LocalId::from(4),
-                        },
-                    ),
-                    (
-                        LocalId::from(6),
-                        Instruction::Call {
-                            closure: LocalId::from(5),
-                            args: vec![LocalId::from(3)],
-                        },
-                    ),
-                ],
+        let cfg = Cfg::single_entry(Block::new_for_test(
+            vec![
+                // max call
                 (
-                    LocalId::from(7),
-                    Terminator::Return {
-                        value: Some(LocalId::from(6)),
+                    LocalId::from(0),
+                    Instruction::GetGlobal {
+                        name: "max".to_string(),
+                        create_if_missing: false,
                     },
                 ),
+                (
+                    LocalId::from(1),
+                    Instruction::Load {
+                        source: LocalId::from(0),
+                    },
+                ),
+                (
+                    LocalId::from(2),
+                    Instruction::NumberConstant {
+                        value: Pico8Num::from_i16(1),
+                    },
+                ),
+                (
+                    LocalId::from(3),
+                    Instruction::Call {
+                        closure: LocalId::from(1),
+                        args: vec![LocalId::from(2)],
+                    },
+                ),
+                // min call
+                (
+                    LocalId::from(4),
+                    Instruction::GetGlobal {
+                        name: "min".to_string(),
+                        create_if_missing: false,
+                    },
+                ),
+                (
+                    LocalId::from(5),
+                    Instruction::Load {
+                        source: LocalId::from(4),
+                    },
+                ),
+                (
+                    LocalId::from(6),
+                    Instruction::Call {
+                        closure: LocalId::from(5),
+                        args: vec![LocalId::from(3)],
+                    },
+                ),
+            ],
+            (
+                LocalId::from(7),
+                Terminator::Return {
+                    value: Some(LocalId::from(6)),
+                },
             ),
-            named: FxHashMap::default(),
-        };
+        ));
 
         // Build builtin set with both max and min
         let mut builtins = BuiltinSet::default();

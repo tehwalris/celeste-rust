@@ -353,10 +353,7 @@ mod tests {
             (LocalId::from(99), Terminator::Return { value: Some(LocalId::from(2)) }),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: FxHashMap::default(),
-        };
+        let cfg = Cfg::single_entry(entry);
 
         // Shape: foo is a Leaf (closure)
         let mut shape = HeapShape::new();
@@ -403,10 +400,7 @@ mod tests {
             (LocalId::from(99), Terminator::Return { value: Some(LocalId::from(3)) }),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: FxHashMap::default(),
-        };
+        let cfg = Cfg::single_entry(entry);
 
         // Shape: player.update is a Leaf (closure)
         let mut shape = HeapShape::new();
@@ -521,10 +515,7 @@ mod tests {
             (LocalId::from(99), Terminator::Return { value: Some(LocalId::from(2)) }),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: FxHashMap::default(),
-        };
+        let cfg = Cfg::single_entry(entry);
 
         let mut shape = HeapShape::new();
         shape.globals.insert("foo".to_string(), ValueShape::Leaf);

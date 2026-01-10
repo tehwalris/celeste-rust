@@ -902,10 +902,7 @@ mod tests {
             (LocalId::from(5), Terminator::Return { value: Some(LocalId::from(4)) }),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: FxHashMap::default(),
-        };
+        let cfg = Cfg::single_entry(entry);
 
         let mut local_gen = LocalIdGenerator::new();
         let result = mem2reg(&cfg, &mut local_gen);
@@ -938,10 +935,7 @@ mod tests {
             (LocalId::from(1), Terminator::Return { value: Some(LocalId::from(0)) }),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: FxHashMap::default(),
-        };
+        let cfg = Cfg::single_entry(entry);
 
         let mut local_gen = LocalIdGenerator::new();
         let result = mem2reg(&cfg, &mut local_gen);

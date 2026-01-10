@@ -258,10 +258,7 @@ mod tests {
             ),
         );
 
-        Cfg {
-            entry,
-            named: FxHashMap::default(),
-        }
+        Cfg::single_entry(entry)
     }
 
     #[test]

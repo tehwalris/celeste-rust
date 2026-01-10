@@ -876,6 +876,18 @@ impl Cfg {
         }
         parts.join("\n\n")
     }
+
+    /// Test helper to create a single-block CFG with only an entry block.
+    ///
+    /// This is the most common test pattern: a CFG with no control flow,
+    /// just an entry block that terminates.
+    #[cfg(test)]
+    pub fn single_entry(entry: Block) -> Self {
+        Self {
+            entry,
+            named: crate::interpreter::common::FxHashMap::default(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

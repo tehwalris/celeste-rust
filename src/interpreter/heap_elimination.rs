@@ -1343,10 +1343,7 @@ mod tests {
             ),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: FxHashMap::default(),
-        };
+        let cfg = Cfg::single_entry(entry);
 
         let shape = HeapShape::new(); // Empty shape
         let local_gen = make_local_gen();
@@ -1378,10 +1375,7 @@ mod tests {
             ),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: FxHashMap::default(),
-        };
+        let cfg = Cfg::single_entry(entry);
 
         let shape = make_global_leaf_shape("x");
 
@@ -1416,10 +1410,7 @@ mod tests {
             (LocalId::from(2), Terminator::Return { value: Some(LocalId::from(1)) }),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: FxHashMap::default(),
-        };
+        let cfg = Cfg::single_entry(entry);
 
         let shape = make_global_leaf_shape("x");
 
@@ -1469,10 +1460,7 @@ mod tests {
             ),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: FxHashMap::default(),
-        };
+        let cfg = Cfg::single_entry(entry);
 
         let shape = make_global_leaf_shape("x");
 
@@ -1514,10 +1502,7 @@ mod tests {
             ),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: FxHashMap::default(),
-        };
+        let cfg = Cfg::single_entry(entry);
 
         let shape = make_global_leaf_shape("x");
 
@@ -1587,10 +1572,7 @@ mod tests {
             ),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: FxHashMap::default(),
-        };
+        let cfg = Cfg::single_entry(entry);
 
         let mut shape = HeapShape::new();
         // k_left = 0 (constant)
@@ -1649,10 +1631,7 @@ mod tests {
             (LocalId::from(3), Terminator::Return { value: None }),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: FxHashMap::default(),
-        };
+        let cfg = Cfg::single_entry(entry);
 
         let mut shape = HeapShape::new();
         // k_left = 0 (constant)
@@ -1711,10 +1690,7 @@ mod tests {
             ),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: FxHashMap::default(),
-        };
+        let cfg = Cfg::single_entry(entry);
 
         let mut shape = HeapShape::new();
         // k_left = 0 (constant)
@@ -1767,10 +1743,7 @@ mod tests {
             ),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: FxHashMap::default(),
-        };
+        let cfg = Cfg::single_entry(entry);
 
         let mut shape = HeapShape::new();
         // arg0 = 42 (constant)
@@ -1828,10 +1801,7 @@ mod tests {
             (LocalId::from(2), Terminator::Return { value: None }),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: FxHashMap::default(),
-        };
+        let cfg = Cfg::single_entry(entry);
 
         let mut shape = HeapShape::new();
         // arg0 = 42 (constant)
@@ -1887,10 +1857,7 @@ mod tests {
             ),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: FxHashMap::default(),
-        };
+        let cfg = Cfg::single_entry(entry);
 
         let mut shape = HeapShape::new();
         // arg0 = { x: Constant(7) }
@@ -1979,10 +1946,7 @@ mod tests {
             ),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: FxHashMap::default(),
-        };
+        let cfg = Cfg::single_entry(entry);
 
         // Build shape: arg0 is a table with foo = Closure and x = Leaf
         // We need at least one Leaf for eliminate_heap to not return NotApplicable
@@ -2054,10 +2018,7 @@ mod tests {
             (LocalId::from(3), Terminator::Return { value: None }),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: FxHashMap::default(),
-        };
+        let cfg = Cfg::single_entry(entry);
 
         // Empty shape - "unknown" is not pre-declared
         let shape = HeapShape::new();
@@ -2121,10 +2082,7 @@ mod tests {
             (LocalId::from(5), Terminator::Return { value: Some(LocalId::from(4)) }),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: FxHashMap::default(),
-        };
+        let cfg = Cfg::single_entry(entry);
 
         // "x" is known, "unknown" is NOT in the shape
         let shape = make_global_leaf_shape("x");
@@ -2215,10 +2173,7 @@ mod tests {
             ),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: FxHashMap::default(),
-        };
+        let cfg = Cfg::single_entry(entry);
 
         let shape = make_player_x_shape();
 
@@ -2307,10 +2262,7 @@ mod tests {
             ),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: FxHashMap::default(),
-        };
+        let cfg = Cfg::single_entry(entry);
 
         // Shape: arg0 is a table with method closure and x leaf
         let mut arg0_fields = FxHashMap::default();
@@ -2430,10 +2382,7 @@ mod tests {
             ),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: FxHashMap::default(),
-        };
+        let cfg = Cfg::single_entry(entry);
 
         let shape = make_player_xy_shape();
 
@@ -2535,10 +2484,7 @@ mod tests {
             ),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: FxHashMap::default(),
-        };
+        let cfg = Cfg::single_entry(entry);
 
         // Shape: both players have x as leaf
         let mut shape = HeapShape::new();
@@ -2629,10 +2575,7 @@ mod tests {
             ),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: FxHashMap::default(),
-        };
+        let cfg = Cfg::single_entry(entry);
 
         let shape = make_player_x_shape();
 
@@ -2687,10 +2630,7 @@ mod tests {
             ),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: FxHashMap::default(),
-        };
+        let cfg = Cfg::single_entry(entry);
 
         // Empty shape - nothing to track
         let shape = HeapShape::new();
@@ -2752,10 +2692,7 @@ mod tests {
             ),
         );
 
-        let cfg = Cfg {
-            entry,
-            named: FxHashMap::default(),
-        };
+        let cfg = Cfg::single_entry(entry);
 
         // Shape: btn is a Leaf (this causes Load to be SSA-promoted)
         let shape = make_global_leaf_shape("btn");
