@@ -566,11 +566,7 @@ mod tests {
         let cfg = Cfg::single_entry(Block::new_for_test(
             vec![
                 (LocalId::from(0), Instruction::Alloc),
-                (LocalId::from(1), Instruction::GetField {
-                    receiver: LocalId::from(0),
-                    field: "x".to_string(),
-                    create_if_missing: false,
-                }),
+                (LocalId::from(1), Instruction::get_field(LocalId::from(0), "x", false)),
                 (LocalId::from(2), Instruction::load(LocalId::from(1))),
             ],
             (LocalId::from(3), Terminator::ret(Some(LocalId::from(2)))),

@@ -211,11 +211,7 @@ mod tests {
         //   branch %4 -> if_true, if_false
         let entry = Block::new_for_test(
             vec![
-                (LocalId::from(1), Instruction::GetField {
-                    receiver: LocalId::from(0),
-                    field: "x".to_string(),
-                    create_if_missing: false,
-                }),
+                (LocalId::from(1), Instruction::get_field(LocalId::from(0), "x", false)),
                 (LocalId::from(2), Instruction::load(LocalId::from(1))),
                 (LocalId::from(3), Instruction::num_const(0)),
                 (LocalId::from(4), Instruction::binary_op(
@@ -241,11 +237,7 @@ mod tests {
                     LocalId::from(2),
                     LocalId::from(6),
                 )),
-                (LocalId::from(8), Instruction::GetField {
-                    receiver: LocalId::from(0),
-                    field: "x".to_string(),
-                    create_if_missing: false,
-                }),
+                (LocalId::from(8), Instruction::get_field(LocalId::from(0), "x", false)),
                 (LocalId::from(9), Instruction::Store {
                     target: LocalId::from(8),
                     source: LocalId::from(7),
@@ -262,11 +254,7 @@ mod tests {
         //   return %12
         let if_join = Block::new_for_test(
             vec![
-                (LocalId::from(11), Instruction::GetField {
-                    receiver: LocalId::from(0),
-                    field: "x".to_string(),
-                    create_if_missing: false,
-                }),
+                (LocalId::from(11), Instruction::get_field(LocalId::from(0), "x", false)),
                 (LocalId::from(12), Instruction::load(LocalId::from(11))),
             ],
             (LocalId::from(13), Terminator::Return {
