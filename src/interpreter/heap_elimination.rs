@@ -140,113 +140,72 @@ impl HeapShape {
         }
     }
 
+    /// Traverse all value shapes in this heap shape, calling a visitor function for each.
+    /// The visitor receives the current path and shape, and should return shapes to
+    /// recursively traverse (for tables, this would be the field shapes).
+    fn traverse_shapes<F>(&self, mut visitor: F)
+    where
+        F: FnMut(&HeapPath, &ValueShape),
+    {
+        fn traverse_recursive<F>(path: HeapPath, shape: &ValueShape, visitor: &mut F)
+        where
+            F: FnMut(&HeapPath, &ValueShape),
+        {
+            visitor(&path, shape);
+            if let ValueShape::Table(fields) = shape {
+                for (field, field_shape) in fields {
+                    traverse_recursive(path.clone().field(field), field_shape, visitor);
+                }
+            }
+        }
+
+        // Traverse globals
+        for (name, shape) in &self.globals {
+            traverse_recursive(HeapPath::Global(name.clone()), shape, &mut visitor);
+        }
+
+        // Traverse args
+        for (index, maybe_shape) in self.args.iter().enumerate() {
+            if let Some(shape) = maybe_shape {
+                traverse_recursive(HeapPath::Arg(index), shape, &mut visitor);
+            }
+        }
+    }
+
     /// Collect all leaf slots that need to be unpacked
     pub fn collect_leaf_slots(&self) -> Vec<HeapSlot> {
         let mut slots = Vec::new();
 
-        // Collect from globals
-        for (name, shape) in &self.globals {
-            self.collect_slots_recursive(
-                HeapPath::Global(name.clone()),
-                shape,
-                &mut slots,
-            );
-        }
-
-        // Collect from args
-        for (index, maybe_shape) in self.args.iter().enumerate() {
-            if let Some(shape) = maybe_shape {
-                self.collect_slots_recursive(
-                    HeapPath::Arg(index),
-                    shape,
-                    &mut slots,
-                );
-            }
-        }
-
-        slots
-    }
-
-    fn collect_slots_recursive(
-        &self,
-        path: HeapPath,
-        shape: &ValueShape,
-        slots: &mut Vec<HeapSlot>,
-    ) {
-        match shape {
+        self.traverse_shapes(|path, shape| match shape {
             ValueShape::Leaf => {
-                slots.push(HeapSlot::new(path));
-            }
-            ValueShape::Constant(_) => {
-                // Constants don't need to be unpacked - we know their value statically
-                // They are handled separately via collect_constant_slots
-            }
-            ValueShape::Table(fields) => {
-                for (field, field_shape) in fields {
-                    self.collect_slots_recursive(
-                        path.clone().field(field),
-                        field_shape,
-                        slots,
-                    );
-                }
-            }
-            ValueShape::Closure { .. } => {
-                // Closures are not transformed - we know which function they refer to
-                // but we don't need to unpack their captures
+                slots.push(HeapSlot::new(path.clone()));
             }
             ValueShape::Pointer(target) => {
                 // Pointers create aliasing - use the target slot
                 slots.push(target.clone());
             }
-        }
+            _ => {
+                // Constants, Tables, Closures - not collected as leaf slots
+                // Constants are handled separately via collect_constant_slots
+                // Tables are traversed automatically
+                // Closures are not transformed
+            }
+        });
+
+        slots
     }
 
     /// Collect all constant slots with their values
     pub fn collect_constant_slots(&self) -> Vec<(HeapSlot, Pico8Num)> {
         let mut constants = Vec::new();
 
-        // Collect from globals
-        for (name, shape) in &self.globals {
-            self.collect_constants_recursive(
-                HeapPath::Global(name.clone()),
-                shape,
-                &mut constants,
-            );
-        }
-
-        // Collect from args
-        for (index, maybe_shape) in self.args.iter().enumerate() {
-            if let Some(shape) = maybe_shape {
-                self.collect_constants_recursive(HeapPath::Arg(index), shape, &mut constants);
+        self.traverse_shapes(|path, shape| {
+            if let ValueShape::Constant(value) = shape {
+                constants.push((HeapSlot::new(path.clone()), *value));
             }
-        }
+        });
 
         constants
-    }
-
-    fn collect_constants_recursive(
-        &self,
-        path: HeapPath,
-        shape: &ValueShape,
-        constants: &mut Vec<(HeapSlot, Pico8Num)>,
-    ) {
-        match shape {
-            ValueShape::Constant(value) => {
-                constants.push((HeapSlot::new(path), *value));
-            }
-            ValueShape::Table(fields) => {
-                for (field, field_shape) in fields {
-                    self.collect_constants_recursive(
-                        path.clone().field(field),
-                        field_shape,
-                        constants,
-                    );
-                }
-            }
-            _ => {
-                // Leaf, Closure, Pointer - not constants
-            }
-        }
     }
 
     /// Check if a heap path corresponds to a *known* leaf value in this shape.
