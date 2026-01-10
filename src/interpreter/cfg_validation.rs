@@ -550,7 +550,7 @@ mod tests {
         // Load from Alloc is valid - Alloc produces a pointer
         let cfg = Cfg::single_entry(Block::new_for_test(
             vec![
-                (LocalId::from(0), Instruction::Alloc),
+                (LocalId::from(0), Instruction::alloc()),
                 (LocalId::from(1), Instruction::load(LocalId::from(0))),
             ],
             (LocalId::from(2), Terminator::ret(Some(LocalId::from(1)))),
@@ -565,7 +565,7 @@ mod tests {
         // Load from GetField is valid - GetField produces a pointer
         let cfg = Cfg::single_entry(Block::new_for_test(
             vec![
-                (LocalId::from(0), Instruction::Alloc),
+                (LocalId::from(0), Instruction::alloc()),
                 (LocalId::from(1), Instruction::get_field(LocalId::from(0), "x", false)),
                 (LocalId::from(2), Instruction::load(LocalId::from(1))),
             ],
@@ -622,7 +622,7 @@ mod tests {
         // Store to Alloc is valid - Alloc produces a pointer
         let cfg = Cfg::single_entry(Block::new_for_test(
             vec![
-                (LocalId::from(0), Instruction::Alloc),
+                (LocalId::from(0), Instruction::alloc()),
                 (LocalId::from(1), Instruction::num_const(42)),
                 (LocalId::from(2), Instruction::store(LocalId::from(0), LocalId::from(1))),
             ],

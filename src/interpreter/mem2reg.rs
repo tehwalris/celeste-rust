@@ -886,7 +886,7 @@ mod tests {
 
         let entry = Block::new_for_test(
             vec![
-                (LocalId::from(0), Instruction::Alloc),
+                (LocalId::from(0), Instruction::alloc()),
                 (LocalId::from(1), Instruction::store(LocalId::from(0), LocalId::from(2))),
                 (LocalId::from(3), Instruction::load(LocalId::from(0))),
                 (LocalId::from(4), Instruction::unary_op(
@@ -971,7 +971,7 @@ mod tests {
 
         let entry = Block::new_for_test(
             vec![
-                (LocalId::from(0), Instruction::Alloc),
+                (LocalId::from(0), Instruction::alloc()),
                 (LocalId::from(1), Instruction::num_const(0)),
                 (LocalId::from(2), Instruction::store(LocalId::from(0), LocalId::from(1))),  // Store initial value
                 (LocalId::from(3), Instruction::load(LocalId::from(0))),  // Load for first use
@@ -1060,7 +1060,7 @@ mod tests {
 
         let entry = Block::new_for_test(
             vec![
-                (LocalId::from(0), Instruction::Alloc),
+                (LocalId::from(0), Instruction::alloc()),
                 (LocalId::from(100), Instruction::bool_const(true)), // condition
             ],
             (LocalId::from(101), Terminator::cond_branch(LocalId::from(100), "block_a", "block_b")),

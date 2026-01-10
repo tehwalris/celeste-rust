@@ -2042,7 +2042,7 @@ mod tests {
 
         let entry = Block::new_for_test(
             vec![
-                (cell_id, Instruction::Alloc),
+                (cell_id, Instruction::alloc()),
                 (
                     LocalId::from(1),
                     Instruction::store(cell_id, value_id),
@@ -2308,7 +2308,7 @@ mod tests {
 
         let entry = Block::new_for_test(
             vec![
-                (LocalId::from(0), Instruction::Alloc),
+                (LocalId::from(0), Instruction::alloc()),
                 (LocalId::from(1), Instruction::load(LocalId::from(0))),
                 (
                     LocalId::from(2),
