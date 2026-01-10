@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 
 use crate::interpreter::common::{FxHashMap, FxHashSet};
-use crate::ir::{Block, Cfg, Instruction, LocalId, Terminator};
+use crate::ir::{Block, Cfg, FunDef, GlobalId, Instruction, LocalId, Terminator};
 
 /// Clean up phi nodes that reference undefined locals.
 ///
@@ -589,10 +589,10 @@ pub struct OptimizedFunDef {
 ///
 /// Returns a map from function name to optimized CFG.
 pub fn optimize_all_functions(
-    fun_defs: &[&crate::ir::FunDef],
+    fun_defs: &[&FunDef],
     global_closure_map: &crate::interpreter::call_resolution::GlobalClosureMap,
     builtin_set: Option<&crate::interpreter::builtin_resolution::BuiltinSet>,
-) -> std::collections::HashMap<crate::ir::GlobalId, OptimizedFunDef, std::hash::BuildHasherDefault<rustc_hash::FxHasher>> {
+) -> FxHashMap<GlobalId, OptimizedFunDef> {
     use crate::interpreter::block_coalesce::{coalesce_blocks, CoalesceResult};
     use crate::interpreter::builtin_resolution::{resolve_builtins, BuiltinResolutionResult};
     use crate::interpreter::call_resolution::{resolve_calls, CallResolutionResult};
@@ -793,9 +793,9 @@ pub fn optimize_all_functions(
 /// Topological sort of function names based on call graph.
 /// Returns functions in order such that callees come before callers.
 fn topological_sort(
-    names: &[crate::ir::GlobalId],
-    call_graph: &std::collections::HashMap<crate::ir::GlobalId, Vec<crate::ir::GlobalId>, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>,
-) -> Vec<crate::ir::GlobalId> {
+    names: &[GlobalId],
+    call_graph: &FxHashMap<GlobalId, Vec<GlobalId>>,
+) -> Vec<GlobalId> {
     use std::collections::HashSet;
 
     let name_set: HashSet<_> = names.iter().cloned().collect();
@@ -803,11 +803,11 @@ fn topological_sort(
     let mut result = Vec::new();
 
     fn visit(
-        name: &crate::ir::GlobalId,
-        call_graph: &std::collections::HashMap<crate::ir::GlobalId, Vec<crate::ir::GlobalId>, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>,
-        name_set: &HashSet<crate::ir::GlobalId>,
-        visited: &mut HashSet<crate::ir::GlobalId>,
-        result: &mut Vec<crate::ir::GlobalId>,
+        name: &GlobalId,
+        call_graph: &FxHashMap<GlobalId, Vec<GlobalId>>,
+        name_set: &HashSet<GlobalId>,
+        visited: &mut HashSet<GlobalId>,
+        result: &mut Vec<GlobalId>,
     ) {
         if visited.contains(name) {
             return;
@@ -891,9 +891,9 @@ pub fn run_optimization_pipeline_with_interprocedural(
     cfg: &Cfg,
     analysis: &CfgAnalysisResult,
     global_closure_map: &crate::interpreter::call_resolution::GlobalClosureMap,
-    optimized_fun_defs: &std::collections::HashMap<crate::ir::GlobalId, crate::ir::FunDef, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>,
+    optimized_fun_defs: &FxHashMap<GlobalId, FunDef>,
     builtin_set: Option<&crate::interpreter::builtin_resolution::BuiltinSet>,
-    arg_ids: &[Option<crate::ir::LocalId>],
+    arg_ids: &[Option<LocalId>],
     arg_shapes: &[Option<crate::interpreter::heap_elimination::ValueShape>],
 ) -> (OptimizationResult, OptimizationCfgs) {
     run_optimization_pipeline_with_interprocedural_inner(
@@ -907,9 +907,9 @@ pub fn run_optimization_pipeline_with_interprocedural_lenient(
     cfg: &Cfg,
     analysis: &CfgAnalysisResult,
     global_closure_map: &crate::interpreter::call_resolution::GlobalClosureMap,
-    optimized_fun_defs: &std::collections::HashMap<crate::ir::GlobalId, crate::ir::FunDef, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>,
+    optimized_fun_defs: &FxHashMap<GlobalId, FunDef>,
     builtin_set: Option<&crate::interpreter::builtin_resolution::BuiltinSet>,
-    arg_ids: &[Option<crate::ir::LocalId>],
+    arg_ids: &[Option<LocalId>],
     arg_shapes: &[Option<crate::interpreter::heap_elimination::ValueShape>],
 ) -> (OptimizationResult, OptimizationCfgs) {
     run_optimization_pipeline_with_interprocedural_inner(
@@ -921,9 +921,9 @@ fn run_optimization_pipeline_with_interprocedural_inner(
     cfg: &Cfg,
     analysis: &CfgAnalysisResult,
     global_closure_map: &crate::interpreter::call_resolution::GlobalClosureMap,
-    optimized_fun_defs: &std::collections::HashMap<crate::ir::GlobalId, crate::ir::FunDef, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>,
+    optimized_fun_defs: &FxHashMap<GlobalId, FunDef>,
     builtin_set: Option<&crate::interpreter::builtin_resolution::BuiltinSet>,
-    arg_ids: &[Option<crate::ir::LocalId>],
+    arg_ids: &[Option<LocalId>],
     arg_shapes: &[Option<crate::interpreter::heap_elimination::ValueShape>],
     strict_validation: bool,
 ) -> (OptimizationResult, OptimizationCfgs) {
