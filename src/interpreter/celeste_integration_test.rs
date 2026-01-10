@@ -13,7 +13,7 @@ mod tests {
     use crate::common::FxHashMap;
     use crate::frontend;
     use crate::interpreter::builtin_resolution::BuiltinSet;
-    use crate::interpreter::call_resolution::build_global_closure_map_from_fun_defs;
+    use crate::interpreter::call_resolution::{build_global_closure_map_from_fun_defs, GlobalClosureMap};
     use crate::interpreter::cfg_analysis::{
         analyze_cfg, run_optimization_pipeline_with_interprocedural,
         run_optimization_pipeline_with_interprocedural_lenient, InterproceduralContext,
@@ -59,6 +59,34 @@ mod tests {
         .iter()
         .map(|s| s.to_string())
         .collect()
+    }
+
+    /// Holds the context pieces needed to run the optimization pipeline.
+    /// This avoids repeating the same setup code across multiple tests.
+    struct PipelineTestContext {
+        global_closure_map: GlobalClosureMap,
+        builtin_set: BuiltinSet,
+        optimized_fun_def_map: FxHashMap<GlobalId, FunDef>,
+    }
+
+    impl PipelineTestContext {
+        /// Build a pipeline context from the given function definitions
+        fn from_fun_defs(fun_defs: &[FunDef]) -> Self {
+            Self {
+                global_closure_map: build_global_closure_map_from_fun_defs(fun_defs.iter()),
+                builtin_set: builtin_set(),
+                optimized_fun_def_map: FxHashMap::default(),
+            }
+        }
+
+        /// Create an InterproceduralContext referencing this test context
+        fn as_interprocedural_context(&self) -> InterproceduralContext<'_> {
+            InterproceduralContext {
+                global_closure_map: &self.global_closure_map,
+                optimized_fun_defs: &self.optimized_fun_def_map,
+                builtin_set: Some(&self.builtin_set),
+            }
+        }
     }
 
     /// Validate that a CFG passes validation with the given external locals
@@ -164,11 +192,7 @@ mod tests {
 
         // Test pipeline on functions that should optimize cleanly
         let fun_defs = load_celeste();
-        let global_closure_map = build_global_closure_map_from_fun_defs(fun_defs.iter());
-        let builtin_set = builtin_set();
-
-        // Build optimized function map (empty for this test - we test functions individually)
-        let optimized_fun_def_map: FxHashMap<GlobalId, FunDef> = FxHashMap::default();
+        let test_ctx = PipelineTestContext::from_fun_defs(&fun_defs);
 
         // Functions expected to optimize successfully (at least mem2reg)
         let simple_functions = ["btn_4", "appr_68", "sign_69"];
@@ -182,15 +206,10 @@ mod tests {
             let analysis = analyze_cfg(&fun_def.cfg);
             let arg_shapes = vec![]; // No special shapes for these simple tests
 
-            let ctx = InterproceduralContext {
-                global_closure_map: &global_closure_map,
-                optimized_fun_defs: &optimized_fun_def_map,
-                builtin_set: Some(&builtin_set),
-            };
             let (result, cfgs) = run_optimization_pipeline_with_interprocedural(
                 &fun_def.cfg,
                 &analysis,
-                &ctx,
+                &test_ctx.as_interprocedural_context(),
                 &fun_def.arg_ids,
                 &arg_shapes,
             );
@@ -274,10 +293,7 @@ mod tests {
     fn test_call_resolution_makes_progress() {
         // Test that call resolution actually resolves some calls on real code
         let fun_defs = load_celeste();
-        let global_closure_map = build_global_closure_map_from_fun_defs(fun_defs.iter());
-        let builtin_set = builtin_set();
-
-        let optimized_fun_def_map: FxHashMap<GlobalId, FunDef> = FxHashMap::default();
+        let test_ctx = PipelineTestContext::from_fun_defs(&fun_defs);
 
         let mut total_calls_resolved = 0;
         let mut total_inlined = 0;
@@ -290,15 +306,10 @@ mod tests {
             }
 
             // Use lenient version to avoid panics on validation issues in some complex functions
-            let ctx = InterproceduralContext {
-                global_closure_map: &global_closure_map,
-                optimized_fun_defs: &optimized_fun_def_map,
-                builtin_set: Some(&builtin_set),
-            };
             let (result, _) = run_optimization_pipeline_with_interprocedural_lenient(
                 &fun_def.cfg,
                 &analysis,
-                &ctx,
+                &test_ctx.as_interprocedural_context(),
                 &fun_def.arg_ids,
                 &[],
             );
@@ -335,9 +346,7 @@ mod tests {
 
         // Debug test: find which optimization step introduces the validation error
         let fun_defs = load_celeste();
-        let global_closure_map = build_global_closure_map_from_fun_defs(fun_defs.iter());
-        let builtin_set = builtin_set();
-        let optimized_fun_def_map: FxHashMap<GlobalId, FunDef> = FxHashMap::default();
+        let test_ctx = PipelineTestContext::from_fun_defs(&fun_defs);
 
         let fun_def = fun_defs
             .iter()
@@ -351,16 +360,11 @@ mod tests {
             .collect();
 
         let analysis = analyze_cfg(&fun_def.cfg);
-        let ctx = InterproceduralContext {
-            global_closure_map: &global_closure_map,
-            optimized_fun_defs: &optimized_fun_def_map,
-            builtin_set: Some(&builtin_set),
-        };
 
         let (_result, cfgs) = run_optimization_pipeline_with_interprocedural(
             &fun_def.cfg,
             &analysis,
-            &ctx,
+            &test_ctx.as_interprocedural_context(),
             &fun_def.arg_ids,
             &[],
         );
