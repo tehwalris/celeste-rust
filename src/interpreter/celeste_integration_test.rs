@@ -394,4 +394,73 @@ mod tests {
     fn print_cfg(cfg: &Cfg) {
         eprintln!("{}", cfg.format());
     }
+
+    #[test]
+    fn test_all_functions_pipeline_valid() {
+        use crate::interpreter::cfg_analysis::PipelineStepType;
+        use crate::ir::LocalId;
+
+        // Run the full optimization pipeline on ALL Celeste functions and verify
+        // that the final CFG passes validation for each one.
+        let fun_defs = load_celeste();
+        let test_ctx = PipelineTestContext::from_fun_defs(&fun_defs);
+
+        let mut failures: Vec<(String, Vec<String>)> = Vec::new();
+        let mut successes = 0;
+
+        for fun_def in &fun_defs {
+            let analysis = analyze_cfg(&fun_def.cfg);
+
+            // Use the lenient version to collect all errors without panicking
+            let (_result, cfgs) = run_optimization_pipeline_with_interprocedural_lenient(
+                &fun_def.cfg,
+                &analysis,
+                &test_ctx.as_interprocedural_context(),
+                &fun_def.arg_ids,
+                &[], // No special arg shapes for this test
+            );
+
+            // Get the final CFG (should be the last step)
+            if let Some(final_step) = cfgs.steps.last() {
+                // Build the full list of predefined locals including heap slot locals
+                let mut predefined = fun_def.external_local_ids();
+                for step in &cfgs.steps {
+                    if let PipelineStepType::HeapElimFinal { slot_mappings, .. } = &step.step_type {
+                        for mapping in slot_mappings {
+                            predefined.push(LocalId::from(mapping.local_id as usize));
+                        }
+                    }
+                }
+
+                let validation = validate_cfg_with_args(&final_step.cfg, &predefined);
+                if validation.is_valid() {
+                    successes += 1;
+                } else {
+                    let errors: Vec<String> = validation.errors.iter().map(|e| e.to_string()).collect();
+                    failures.push((fun_def.name.as_str().to_string(), errors));
+                }
+            }
+        }
+
+        // Report all failures
+        if !failures.is_empty() {
+            eprintln!("\n=== VALIDATION FAILURES ({}/{} functions) ===", failures.len(), fun_defs.len());
+            for (name, errors) in &failures {
+                eprintln!("\n{}:", name);
+                for error in errors {
+                    eprintln!("  - {}", error);
+                }
+            }
+            panic!(
+                "Final CFG validation failed for {}/{} functions. See above for details.",
+                failures.len(),
+                fun_defs.len()
+            );
+        }
+
+        eprintln!(
+            "All {} Celeste functions pass final CFG validation",
+            successes
+        );
+    }
 }

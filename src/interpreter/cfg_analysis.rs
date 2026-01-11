@@ -100,6 +100,11 @@ pub enum PipelineStepType {
         modified_count: usize,
         slot_mappings: Vec<SlotMapping>,
     },
+    /// Phi cleanup - removes invalid phi branches after control flow changes
+    PhiCleanup {
+        branches_removed: usize,
+        phis_collapsed: usize,
+    },
 }
 
 /// A single step in the optimization pipeline (internal representation)
@@ -1218,7 +1223,7 @@ fn run_optimization_pipeline_with_interprocedural_inner(
 
                 // Run DCE again after heap elimination to clean up dead GetGlobal/Load/GetField
                 // that were only used by Call instructions that got converted to Deopt
-                let final_cfg = match eliminate_dead_code(&transformed.cfg) {
+                let after_dce_cfg = match eliminate_dead_code(&transformed.cfg) {
                     DceResult::Success { cfg: dce_cfg, instructions_removed } => {
                         // Record the final DCE step
                         cfgs.steps.push(PipelineStep {
@@ -1232,18 +1237,37 @@ fn run_optimization_pipeline_with_interprocedural_inner(
                         } else {
                             result.dce = DceStatus::Success { instructions_removed };
                         }
-                        // DCE removes unreachable blocks, so we need to clean up Phi nodes
-                        // that reference those removed blocks or locals defined in removed blocks.
-                        // We do both cleanups in a single pass by providing the defined_locals set.
-                        let defined_locals = crate::interpreter::phi_cleanup::collect_defined_locals(&dce_cfg, &all_predefined);
-                        let cleanup_result = crate::interpreter::phi_cleanup::cleanup_phis_with_defined_locals(&dce_cfg, Some(&defined_locals));
-                        let cleaned_cfg = cleanup_result.cfg;
-
-                        validate(&cleaned_cfg, &all_predefined, "after DCE_final");
-                        cleaned_cfg
+                        dce_cfg
                     }
                     DceResult::NoChange => transformed.cfg.clone(),
                 };
+
+                // Always run phi cleanup after heap_elim_final, even if DCE didn't remove blocks.
+                // heap_elim inserts Deopt terminators that change predecessor relationships,
+                // which can leave Phi nodes with branches from blocks that are no longer predecessors.
+                // DCE removes unreachable blocks, but doesn't fix Phi nodes referencing blocks
+                // that are still reachable but are no longer predecessors of the Phi's block.
+                let defined_locals = crate::interpreter::phi_cleanup::collect_defined_locals(&after_dce_cfg, &all_predefined);
+                let cleanup_result = crate::interpreter::phi_cleanup::cleanup_phis_with_defined_locals(&after_dce_cfg, Some(&defined_locals));
+                let final_cfg = cleanup_result.cfg.clone();
+
+                // Record phi cleanup step if any changes were made
+                if cleanup_result.branches_removed > 0 || cleanup_result.phis_collapsed > 0 {
+                    cfgs.steps.push(PipelineStep {
+                        name: format!(
+                            "phi_cleanup ({} branches removed, {} collapsed)",
+                            cleanup_result.branches_removed,
+                            cleanup_result.phis_collapsed
+                        ),
+                        step_type: PipelineStepType::PhiCleanup {
+                            branches_removed: cleanup_result.branches_removed,
+                            phis_collapsed: cleanup_result.phis_collapsed,
+                        },
+                        cfg: final_cfg.clone(),
+                    });
+                }
+
+                validate(&final_cfg, &all_predefined, "after phi_cleanup");
 
                 // Store the final CFG (after DCE) for the viewer
                 cfgs.after_heap_elim = Some(final_cfg);
