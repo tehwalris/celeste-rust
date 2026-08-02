@@ -33,6 +33,7 @@ not comparable.
 | + 4 `convert_ternary` (the `appr` pairs) | 2.62 s / 0.81 GB | 7.87 s / 2.83 GB |
 | + `decompose_truthy` x15, `if_convert` x2, `convert_ternary` x1 | 2.36 s / 0.74 GB | - |
 | + 2 diamonds absorbed (`absorb_stores`, `speculate` arms, `cse`) | 1.99 s / 0.64 GB | - |
+| + `is_solid` chains eager (`speculate_region` x9), consumers absorbed | 1.82 s / 0.62 GB | - |
 
 The store-triangle row is the first change that moved the fragment count: 558
 -> 335 mean fragments per frame at frame 34, split executions 19573 -> 11978.
@@ -43,6 +44,16 @@ or convertible diamond anywhere in the program splits any more**. Lane count
 identical throughout (92,713). See "Which branches actually split" below for
 why these sites paid when 81 earlier conversions did not.
 
+The `speculate_region` row is the first *loop-stage* result: the collide
+table loops behind `player.update_21`'s short-circuit gates run eagerly,
+their `if_join_413` gates stop splitting, and the freed per-lane `is_solid`
+values flowed to consumers that were absorbed in the same batch (the
+`on_ground` diamond, the gravity `appr`, the accel `elseif` chain, the
+wall-slide `maxfall` store, the `wall_dir` cascade via `decompose_truthy`).
+Fragments 140 -> 108 mean (955 -> 671 max), splits 5345 -> 4280. The
+instructive dynamic: converting only the chains moved splits (5345 -> 5345,
+relocated); each consumer conversion then killed its share for real.
+
 ### K, and why it is the number to watch
 
 `measure_k` reports the static size of a fully inlined, fully unrolled frame
@@ -51,15 +62,18 @@ here that tracks distance to a compilable kernel.
 
 |  | original | rewritten |
 |---|---|---|
-| dynamic instrs/frame, mean | 2122 | 1723 |
-| dynamic instrs/frame, max | 6422 | 5267 |
-| distinct blocks reached | 450 | 333 |
-| K, fully unrolled | 8321 | 7770 |
-| K, loops kept as loops | 2963 | 4066 |
+| dynamic instrs/frame, mean | 2122 | 1720 |
+| dynamic instrs/frame, max | 6422 | 4986 |
+| distinct blocks reached | 450 | 327 |
+| K, fully unrolled | 8321 | 7323 |
+| K, loops kept as loops | 2963 | 3899 |
 
-By instruction kind, rewritten: heap 43.9%, arith 26.3%, terminator 9.0%,
-const 6.6%, global 5.5%, phi 3.6%, guard 3.5%, call 1.6%. `arith`, `const` and
-`select` are the core a compiled kernel emits; the rest has to reach zero.
+By instruction kind, rewritten: heap 40.2%, arith 28.1%, terminator 9.4%,
+const 7.1%, global 5.7%, guard 3.9%, phi 3.7%, call 1.5%. `arith`, `const`
+and `select` are the core a compiled kernel emits; the rest has to reach
+zero. The region stage *lowered* K (7770 -> 7323 unrolled) despite running
+regions eagerly, because absorbing the consumers deleted whole arm blocks
+and their duplicated address arithmetic.
 
 K and the frame time move independently, and the store-triangle conversions
 are a clean example: K rose by 11 (guards added, arms now run on every lane)
@@ -250,6 +264,39 @@ The exposure this round: `if_body_135` (96 splits, previously quiet), the
 nested grace-check inside the jump arm - same `is_solid`-loop blocker as its
 parent `if_join_133`. Every remaining site is gated on a later stage (object
 loops, `btn` lane expansion); shape work is done until one lands.
+
+**Update, after the region stage** (`speculate_region` x9 making the
+`player.update_21` `is_solid` chains eager, plus the consumer conversions
+they exposed - the `on_ground` diamond via the multi-store `absorb_stores`,
+the gravity `appr` arm, the accel `elseif` chain, the wall-slide `maxfall`
+store, the `wall_dir` cascade via one more region + `decompose_truthy`):
+
+    branches: 4280 of 64692 executions split the state, across 22 distinct sites
+
+Frame 34: 1.99 s -> 1.82 s, 0.64 -> 0.62 GB, fragments 140 -> 108 mean
+(955 -> 671 max). The chain conversions alone moved splits without removing
+one (the `is_solid` result still fed a branch); each consumer conversion
+then deleted its share, and the multiplier paid again downstream:
+`if_join_95` 840 -> 648, `if_join_136` 326 -> 249, the `btn` pair 820 ->
+669 each, `in_j2_042` 300 -> 195. The remainder:
+
+| family | splits | what it is |
+|---|---|---|
+| `btn` x4 | 1923 | input fan-out |
+| `if_join_95` | 648 | the outer dash diamond, convertible last |
+| `if_join_133/136`, `if_body_135`, `and_or_join_153` | 873 | the jump/dash cluster (below) |
+| `anonymous_61` move loops (`413`, `for_head`s) | 599 | pixel loops, unroll stage |
+| `in_i1_068` x2 (`spikes_at` tile loops) | 114 | unroll stage |
+
+The jump cluster is one blocker deep: `if_body_159` (the wall-jump stores)
+needs `speculate` to move a re-load of `this.spd` above the `spd.y` store,
+and the cells are not provably distinct by the facts it has (the reload's
+base is a loaded table, not a shared local). The clean fix is a runtime
+distinctness guard (`assert_true` on pointer inequality), which needs `~=`
+on pointers in `op.rs` - deferred, not attempted this round. Exposures that
+did land: `if_condition_100` (the accel chain, 288 at its peak) was
+converted in-batch; `if_body_135` rose 96 -> 156 and `in_k1000_for_head_472`
+woke at 36, both gated on their stages.
 
 ### Input fan-out: lane expansion is worse than state duplication (2026-08)
 

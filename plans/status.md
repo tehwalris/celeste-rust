@@ -1,6 +1,6 @@
 # Status (2026-08)
 
-Branch `rewrite`. Build is warning-free, 271 tests pass, working tree clean.
+Branch `rewrite`. Build is warning-free, 286 tests pass, working tree clean.
 
 ## Measured, frame 34 (the standard iteration benchmark)
 
@@ -19,6 +19,7 @@ Branch `rewrite`. Build is warning-free, 271 tests pass, working tree clean.
 | + 4 `convert_ternary` (the `appr` pairs) | 2.62 s | 0.81 GB |
 | + `decompose_truthy` x15, 3 more conversions | 2.36 s | 0.74 GB |
 | + 2 diamonds absorbed (`absorb_stores`) | 1.99 s | 0.64 GB |
+| + `is_solid` chains eager (`speculate_region`), consumers absorbed | 1.82 s | 0.62 GB |
 
 Lane count is identical throughout (92,713), which is the first thing to check
 when a rewrite claims a win. Frame 37 confirms the same ratios (7.87 s, from
@@ -502,10 +503,62 @@ nested 2x2 tile loop with per-lane trip span (75 splits). Same
 unroll+mask family, but its early exit feeds `kill_player`, which
 mutates; take it after the move loops.
 
-The measured trade to expect from 1-3: K roughly flat (the loops already
-ran on most paths), frame time down from ~590 direct splits plus the
-multiplier. From 4: K up (all iterations always execute), another ~240
-direct.
+### Steps 1-3 landed (2026-08-03)
+
+`tile_flag_at` went straight into `PURE_BUILTINS` - the builtin never
+reads the abstract state, the room-(1, 0) collision cache is captured at
+construction, so it is honestly a function of its arguments (and its
+silent `as_i16` fallbacks became loud errors on the way). Seven call
+sites pinned. `speculate_region` was built with one addition to the
+sketch: termination is stated as a runtime guard (`bound < 32767` via the
+new general-purpose `assert_true` instruction) rather than an overflow
+argument, since `i <= bound < 32767` means a `+1` cannot wrap.
+
+The application taught more than the rule:
+
+* **Converting the chains alone removes nothing.** The `is_solid` result
+  still feeds a branch; the splits relocated 1:1 (5345 -> 5345) until
+  each *consumer* was converted, and then the downstream multiplier paid
+  again. Chains and consumers are one batch, not two stages.
+* **The `wall_dir` cascade was a live mixed-select mine.** `is_solid(-3,0)
+  and -1 or is_solid(3,0) and 1 or 0` survived the decompose stage only
+  because its operands arrived pre-sorted; making them per-lane blew up
+  loudly at the first differential. `decompose_truthy` could not see it
+  while an interior select fed the `or`-shortcircuit *terminator* - one
+  more `speculate_region` on that shortcircuit deleted the branch, and
+  the cascade became recognisable. Composition, not new machinery.
+* **`absorb_stores` now takes arms with several stores.** Pairing is by
+  target local (pair -> unguarded select-store, unpaired -> guarded
+  load-back). No aliasing analysis: every triangle emission is
+  load-adjacent, so it reproduces the cell's current value whatever
+  aliases whatever. The `on_ground` diamond (grace in both arms, djump in
+  one) was the driving site.
+* **Two new distinctness facts** in `speculate`: a global's cell is never
+  a field/index cell, and two differently-named globals differ. That
+  unblocked hoisting `max_djump`/`assert_value_cell` past the grace
+  store.
+
+Converted this batch: the three splitting `is_solid` chains and the
+`in_k034`/`wall_dir` shortcircuit (9 `speculate_region` entries), the
+`on_ground` diamond, the gravity `appr` arm, the accel `elseif` chain
+(bottom-up: inner triangle absorbed, residue re-speculated, outer diamond
+paired), the wall-slide `maxfall` store, the `wall_dir` cascade. Frame 34:
+1.99 s -> 1.82 s, fragments 140 -> 108, splits 5345 -> 4280, K 7770 ->
+7323 (down - absorbing consumers deleted more than eager regions added).
+
+Deferred, in order of value:
+
+* **The jump/dash cluster** (`if_join_133` 366, `if_body_135` 156,
+  `and_or_join_153` 102): blocked one level deep on `if_body_159`, whose
+  `spd` re-load must cross the `spd.y` store. The fix is a runtime
+  distinctness guard - `assert_true` on pointer inequality - which needs
+  `~=` on pointers in the interpreter and an opt-in `speculate` flag so
+  existing emissions stay stable. `if_join_136` (249) additionally wants
+  the `btn(k_up/k_down)` reads inside its arm.
+* **Step 4, the unroll** (`anonymous_61` 599 + `spikes_at` 114): as
+  planned above; the `a61` chain conversions (`p017`-`p020` analogues)
+  happen as part of it, since their splits only die with the loop.
+* `if_join_95` (648) last, once its else-arm is straight-line.
 
 Expect the exposure cascade whenever a stage removes splits: lanes that used
 to arrive pre-sorted arrive mixed, and quiet branches wake up. Re-run

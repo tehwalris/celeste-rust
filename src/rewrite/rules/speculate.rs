@@ -65,19 +65,37 @@ use super::{get_block, get_block_mut, require};
 
 /// Are the cells behind two pointer locals certainly different?
 ///
-/// One fact only, because it is the only one the blocked triangles need: two
-/// `get_field`s on the **same base local** with **different field names** yield
-/// different cells. Same local means same record pointer (pointers are
-/// per-state, not per-lane), a record maps each name to one cell, and field
-/// cells are only ever minted per-name by creating accessors - nothing can
-/// bind one cell to two names. Anything this cannot prove is treated as
-/// aliasing.
+/// Two facts, each an instance of the same principle: a name maps to one
+/// cell, cells are only ever minted fresh, and nothing can bind one cell to
+/// two names. Anything these cannot prove is treated as aliasing.
+///
+///   * Two `get_field`s on the **same base local** with **different field
+///     names** yield different cells. Same local means same record pointer
+///     (pointers are per-state, not per-lane), and a record maps each name
+///     to one cell.
+///   * A **global's cell and a field or index cell** are always different:
+///     global cells are minted by the global environment, field and index
+///     cells by their table's creating accessors - disjoint `alloc`s, and no
+///     instruction rebinds a name to an existing cell. Two globals with
+///     different names are distinct for the same reason.
 fn cells_provably_distinct(fun: &FunDef, a: LocalId, b: LocalId) -> bool {
     match (defining_instruction(fun, a), defining_instruction(fun, b)) {
         (
             Some(Instruction::GetField { receiver: ra, field: fa, .. }),
             Some(Instruction::GetField { receiver: rb, field: fb, .. }),
         ) => ra == rb && fa != fb,
+        (
+            Some(Instruction::GetGlobal { .. }),
+            Some(Instruction::GetField { .. } | Instruction::GetIndex { .. }),
+        )
+        | (
+            Some(Instruction::GetField { .. } | Instruction::GetIndex { .. }),
+            Some(Instruction::GetGlobal { .. }),
+        ) => true,
+        (
+            Some(Instruction::GetGlobal { name: na, .. }),
+            Some(Instruction::GetGlobal { name: nb, .. }),
+        ) => na != nb,
         _ => false,
     }
 }
@@ -119,6 +137,11 @@ fn commutes_with_store(fun: &FunDef, instr: &Instruction, store_target: LocalId)
         }
         // Reads the very thing a store writes.
         Instruction::Load { source } => cells_provably_distinct(fun, *source, store_target),
+        // Reads only the stored value's tag, but that is still the cell's
+        // contents - same requirement as a load.
+        Instruction::AssertValueCell { target } => {
+            cells_provably_distinct(fun, *target, store_target)
+        }
         // Dereferences the closure's cell, which a store could overwrite.
         Instruction::AssertClosure { .. } => false,
         // Nothing else is speculatable, so nothing else is ever hoisted; if it
@@ -522,6 +545,28 @@ mod tests {
         verify(&before, &after, "f", "join", None).unwrap();
         let arm = after.get("f").unwrap().cfg.named.get(&label("arm")).unwrap();
         assert_eq!(arm.instructions, vec![(id(13), store(10, 1))]);
+    }
+
+    /// A global's cell can never be a field's cell (disjoint mints), so a
+    /// load of a global crosses any field store; and two different globals
+    /// are likewise distinct.
+    #[test]
+    fn a_load_of_a_global_may_cross_a_field_store() {
+        for global_read in [
+            Instruction::GetGlobal { name: "max_djump".to_string(), create_if_missing: false },
+        ] {
+            let before = triangle_program(vec![
+                (id(10), field(2, "grace")),
+                (id(13), store(10, 1)),
+                (id(14), global_read),
+                (id(15), Instruction::Load { source: id(14) }),
+            ]);
+            let mut after = before.clone();
+            assert_eq!(apply(&mut after, "f", "join", None).unwrap(), 3);
+            verify(&before, &after, "f", "join", None).unwrap();
+            let arm = after.get("f").unwrap().cfg.named.get(&label("arm")).unwrap();
+            assert_eq!(arm.instructions, vec![(id(13), store(10, 1))]);
+        }
     }
 
     /// ...but not a store to the same field, nor to a field of a different

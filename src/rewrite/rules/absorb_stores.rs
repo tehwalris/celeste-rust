@@ -61,6 +61,22 @@
 //! In both shapes the `select` itself is the remaining bargain: on lanes
 //! where `%c`'s mask varies it refuses operands of different representations
 //! loudly rather than widening them, exactly as everywhere else.
+//!
+//! # Arms with several stores
+//!
+//! An arm may hold any number of stores (the `on_ground` diamond stores
+//! `grace` in both arms but `djump` only in one). Stores are paired across
+//! arms **by target local**: each pair becomes the unguarded select-store,
+//! each unpaired store the guarded load-back triangle. Emission order is the
+//! true arm's stores in their own order, then the false arm's remainder in
+//! theirs - and no aliasing question arises beyond the pair's same-local
+//! argument, because every triangle emission is *load-adjacent*: it loads
+//! the cell immediately before storing a select of that same value back.
+//! Whatever earlier emissions wrote to that cell - even through an aliasing
+//! pointer - is what the load sees, so the skipped side always reproduces
+//! the cell's current value and the taken side always wins. The only shape
+//! refused is one arm storing twice through one local, where pairing would
+//! be ambiguous.
 
 use anyhow::{anyhow, Result};
 
@@ -69,13 +85,11 @@ use crate::ir::{FunDef, Instruction, Label, LocalId, Terminator};
 use super::super::program::Program;
 use super::{get_block, predecessors, require, LocalIdAllocator};
 
-/// An arm: a block holding exactly one store and nothing else.
+/// An arm: a block holding only stores, in order.
 struct Arm {
     label: Label,
-    /// The store's target pointer local.
-    target: LocalId,
-    /// The store's value local.
-    source: LocalId,
+    /// The stores' (target pointer, value) locals, in block order.
+    stores: Vec<(LocalId, LocalId)>,
 }
 
 /// The shape this rule accepts, re-derived identically by `apply`, `verify`
@@ -99,21 +113,23 @@ fn classify(fun: &FunDef, head: &Label, target: &Label) -> Option<(Arm, Label)> 
         return None;
     }
     let block = fun.cfg.named.get(target)?;
-    let [(_, Instruction::Store { target: store_target, source })] =
-        block.instructions.as_slice()
-    else {
+    if block.instructions.is_empty() {
         return None;
-    };
+    }
+    let mut stores = Vec::new();
+    for (_, instr) in &block.instructions {
+        let Instruction::Store { target: store_target, source } = instr else {
+            return None;
+        };
+        stores.push((*store_target, *source));
+    }
     let Terminator::UnconditionalBranch { target: join } = block.terminator_kind() else {
         return None;
     };
     if block.hint_normalize {
         return None;
     }
-    Some((
-        Arm { label: target.clone(), target: *store_target, source: *source },
-        join.clone(),
-    ))
+    Some((Arm { label: target.clone(), stores }, join.clone()))
 }
 
 fn site(fun: &FunDef, function: &str, head: &Label) -> Result<Site> {
@@ -146,17 +162,6 @@ fn site(fun: &FunDef, function: &str, head: &Label) -> Result<Site> {
                     head.as_str(),
                     ja.as_str(),
                     jb.as_str()
-                ),
-            )?;
-            require(
-                a.target == b.target,
-                format!(
-                    "the arms of '{}' store to %{} and %{}; this rule only absorbs \
-                     stores to the same target local - run `cse` first if they \
-                     denote the same cell",
-                    head.as_str(),
-                    usize::from(a.target),
-                    usize::from(b.target)
                 ),
             )?;
             (ja, Some(a), Some(b))
@@ -199,6 +204,24 @@ fn site(fun: &FunDef, function: &str, head: &Label) -> Result<Site> {
         format!("'{}' is its own join; refusing a loop", head.as_str()),
     )?;
 
+    // Pairing is by target local, so one local twice in one arm would be
+    // ambiguous. Distinct locals need no such care: every emission except the
+    // same-local pair is load-adjacent (load the cell, select, store it
+    // back), which computes the right value whatever the cells turn out to
+    // alias, in whatever order the stores land.
+    for arm in true_arm.iter().chain(false_arm.iter()) {
+        for (i, (target, _)) in arm.stores.iter().enumerate() {
+            require(
+                arm.stores[..i].iter().all(|(other, _)| other != target),
+                format!(
+                    "the arm '{}' stores twice through %{}",
+                    arm.label.as_str(),
+                    usize::from(*target)
+                ),
+            )?;
+        }
+    }
+
     // The join is left untouched, so nothing in it may depend on which edge
     // control arrived by.
     let join_block = fun
@@ -221,40 +244,99 @@ fn site(fun: &FunDef, function: &str, head: &Label) -> Result<Site> {
     Ok(Site { condition: *condition, join, true_arm, false_arm })
 }
 
-/// The instructions the head gains, given the minted ids in order.
-fn expected_tail(s: &Site, minted: &[LocalId]) -> Vec<(LocalId, Instruction)> {
+/// One store the head will absorb.
+enum Emission {
+    /// Both arms stored through the same local: one select, no guard.
+    Pair { target: LocalId, if_true: LocalId, if_false: LocalId },
+    /// One arm stored, the other kept the old value: the guarded load-back.
+    Triangle { target: LocalId, source: LocalId, arm_is_true: bool },
+}
+
+/// The absorbed stores in emission order: the true arm's stores in their own
+/// order (each either paired with the false arm's same-local store or a
+/// triangle), then the false arm's remaining stores in theirs.
+fn emissions(s: &Site) -> Vec<Emission> {
     match (&s.true_arm, &s.false_arm) {
         (Some(a), Some(b)) => {
-            let [sel, st] = minted else { unreachable!() };
-            vec![
-                (
-                    *sel,
-                    Instruction::Select {
-                        condition: s.condition,
-                        if_true: a.source,
-                        if_false: b.source,
-                    },
-                ),
-                (*st, Instruction::Store { target: a.target, source: *sel }),
-            ]
+            let mut paired = vec![false; b.stores.len()];
+            let mut out = Vec::new();
+            for (target, if_true) in &a.stores {
+                match b.stores.iter().position(|(other, _)| other == target) {
+                    Some(i) => {
+                        paired[i] = true;
+                        out.push(Emission::Pair {
+                            target: *target,
+                            if_true: *if_true,
+                            if_false: b.stores[i].1,
+                        });
+                    }
+                    None => out.push(Emission::Triangle {
+                        target: *target,
+                        source: *if_true,
+                        arm_is_true: true,
+                    }),
+                }
+            }
+            for (i, (target, source)) in b.stores.iter().enumerate() {
+                if !paired[i] {
+                    out.push(Emission::Triangle {
+                        target: *target,
+                        source: *source,
+                        arm_is_true: false,
+                    });
+                }
+            }
+            out
         }
         (one_arm, other) => {
             let arm = one_arm.as_ref().or(other.as_ref()).unwrap();
             let arm_is_true = one_arm.is_some();
-            let [guard, old, sel, st] = minted else { unreachable!() };
-            let (if_true, if_false) = if arm_is_true {
-                (arm.source, *old)
-            } else {
-                (*old, arm.source)
-            };
-            vec![
-                (*guard, Instruction::AssertValueCell { target: arm.target }),
-                (*old, Instruction::Load { source: arm.target }),
-                (*sel, Instruction::Select { condition: s.condition, if_true, if_false }),
-                (*st, Instruction::Store { target: arm.target, source: *sel }),
-            ]
+            arm.stores
+                .iter()
+                .map(|(target, source)| Emission::Triangle {
+                    target: *target,
+                    source: *source,
+                    arm_is_true,
+                })
+                .collect()
         }
     }
+}
+
+/// The instructions the head gains, given the minted ids in order.
+fn expected_tail(s: &Site, minted: &[LocalId]) -> Vec<(LocalId, Instruction)> {
+    let mut out = Vec::new();
+    let mut next = minted.iter();
+    let mut fresh = || *next.next().unwrap();
+    for emission in emissions(s) {
+        match emission {
+            Emission::Pair { target, if_true, if_false } => {
+                let sel = fresh();
+                let st = fresh();
+                out.push((
+                    sel,
+                    Instruction::Select { condition: s.condition, if_true, if_false },
+                ));
+                out.push((st, Instruction::Store { target, source: sel }));
+            }
+            Emission::Triangle { target, source, arm_is_true } => {
+                let guard = fresh();
+                let old = fresh();
+                let sel = fresh();
+                let st = fresh();
+                let (if_true, if_false) =
+                    if arm_is_true { (source, old) } else { (old, source) };
+                out.push((guard, Instruction::AssertValueCell { target }));
+                out.push((old, Instruction::Load { source: target }));
+                out.push((
+                    sel,
+                    Instruction::Select { condition: s.condition, if_true, if_false },
+                ));
+                out.push((st, Instruction::Store { target, source: sel }));
+            }
+        }
+    }
+    out
 }
 
 fn arm_labels(s: &Site) -> Vec<Label> {
@@ -266,11 +348,13 @@ fn arm_labels(s: &Site) -> Vec<Label> {
 }
 
 fn minted_count(s: &Site) -> usize {
-    if s.true_arm.is_some() && s.false_arm.is_some() {
-        2
-    } else {
-        4
-    }
+    emissions(s)
+        .iter()
+        .map(|e| match e {
+            Emission::Pair { .. } => 2,
+            Emission::Triangle { .. } => 4,
+        })
+        .sum()
 }
 
 pub fn apply(program: &mut Program, function: &str, head: &str) -> Result<usize> {
@@ -619,7 +703,7 @@ mod tests {
     /// Two arms storing to different locals may or may not be the same cell;
     /// this rule refuses to guess.
     #[test]
-    fn refuses_a_diamond_with_distinct_targets() {
+    fn absorbs_a_diamond_with_distinct_targets_as_two_triangles() {
         let mut before = program(
             Some(arm_block(vec![(id(20), store(1, 4))], 21)),
             Some(arm_block(vec![(id(25), store(2, 5))], 26)),
@@ -635,8 +719,75 @@ mod tests {
             }),
         );
         let mut after = before.clone();
+        assert_eq!(apply(&mut after, "f", "head").unwrap(), 3);
+        verify(&before, &after, "f", "head").unwrap();
+        let tail = head_tail(&after);
+        assert_eq!(tail.len(), 8);
+        // True side first: guard, load, select (arm value on the true side),
+        // store; then the false side with the arm value on the false side.
+        assert_eq!(tail[0].1, Instruction::AssertValueCell { target: id(1) });
+        assert_eq!(
+            tail[2].1,
+            Instruction::Select { condition: id(3), if_true: id(4), if_false: tail[1].0 }
+        );
+        assert_eq!(tail[4].1, Instruction::AssertValueCell { target: id(2) });
+        assert_eq!(
+            tail[6].1,
+            Instruction::Select { condition: id(3), if_true: tail[5].0, if_false: id(5) }
+        );
+    }
+
+    /// The `on_ground` shape: one arm stores through two locals, the other
+    /// through one of them. The shared local pairs into an unguarded
+    /// select-store, the other gets the guarded load-back.
+    #[test]
+    fn absorbs_a_two_store_arm() {
+        let mut before = program(
+            Some(arm_block(vec![(id(20), store(1, 4)), (id(22), store(2, 5))], 21)),
+            Some(arm_block(vec![(id(25), store(1, 5))], 26)),
+            vec![],
+        );
+        let fun = before.functions.values_mut().next().unwrap();
+        fun.cfg.entry.instructions.insert(
+            1,
+            (id(2), Instruction::GetField {
+                receiver: id(0),
+                field: "y".to_string(),
+                create_if_missing: false,
+            }),
+        );
+        let mut after = before.clone();
+        assert_eq!(apply(&mut after, "f", "head").unwrap(), 3);
+        verify(&before, &after, "f", "head").unwrap();
+        let tail = head_tail(&after);
+        assert_eq!(tail.len(), 6);
+        // The pair for %1 first (true arm's first store), then the triangle
+        // for %2.
+        assert_eq!(
+            tail[0].1,
+            Instruction::Select { condition: id(3), if_true: id(4), if_false: id(5) }
+        );
+        assert_eq!(tail[1].1, Instruction::Store { target: id(1), source: tail[0].0 });
+        assert_eq!(tail[2].1, Instruction::AssertValueCell { target: id(2) });
+        assert_eq!(tail[3].1, Instruction::Load { source: id(2) });
+        assert_eq!(
+            tail[4].1,
+            Instruction::Select { condition: id(3), if_true: id(5), if_false: tail[3].0 }
+        );
+        assert_eq!(tail[5].1, Instruction::Store { target: id(2), source: tail[4].0 });
+    }
+
+    /// One local twice in one arm would make pairing ambiguous.
+    #[test]
+    fn refuses_an_arm_storing_twice_through_one_local() {
+        let before = program(
+            Some(arm_block(vec![(id(20), store(1, 4)), (id(22), store(1, 5))], 21)),
+            Some(arm_block(vec![(id(25), store(1, 5))], 26)),
+            vec![],
+        );
+        let mut after = before.clone();
         let error = apply(&mut after, "f", "head").unwrap_err().to_string();
-        assert!(error.contains("same target local"), "{}", error);
+        assert!(error.contains("stores twice through"), "{}", error);
     }
 
     /// An arm holding anything besides its store is `speculate`'s leftover
