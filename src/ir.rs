@@ -1,4 +1,5 @@
 use std::hash::BuildHasherDefault;
+use std::sync::Arc;
 
 use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
@@ -464,22 +465,113 @@ pub fn new_label_map() -> FxHashMap<Label, Block> {
     FxHashMap::default()
 }
 
+/// Maps the logical name of a value (`LocalId`, unique per definition, SSA) to
+/// the physical place it lives (a slot in a small dense array).
+///
+/// Keeping these separate is what lets slot allocation happen *without*
+/// destroying SSA. `LocalId` stays unique, so dominance checks, the
+/// single-definition invariant and rewrite-recipe addressing by `%N` all keep
+/// working; only the slot table changes. That in turn means allocation is not a
+/// terminal transformation and can be redone whenever the program changes.
+///
+/// It matters because `LocalEnv` used to be indexed by `LocalId` directly, so
+/// it cost `max LocalId + 1` slots, and every `filter_by_mask` clones it. After
+/// inlining, `player.update_21` reached 3206 ids - but never more than 18
+/// simultaneously live values. See `plans/inline-parked.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotMap {
+    /// Slot for each `LocalId`. Empty means the identity map, i.e. exactly the
+    /// old behaviour, which is what an un-allocated CFG gets.
+    of_local: Vec<u32>,
+    num_slots: usize,
+}
+
+impl SlotMap {
+    /// Every value gets its own slot, numbered by `LocalId`. Reproduces the
+    /// pre-slot behaviour exactly.
+    pub fn identity() -> Self {
+        Self { of_local: Vec::new(), num_slots: 0 }
+    }
+
+    pub fn from_vec(of_local: Vec<u32>) -> Self {
+        let num_slots = of_local
+            .iter()
+            .filter(|s| **s != u32::MAX)
+            .map(|s| *s as usize + 1)
+            .max()
+            .unwrap_or(0);
+        Self { of_local, num_slots }
+    }
+
+    pub fn is_identity(&self) -> bool {
+        self.of_local.is_empty()
+    }
+
+    /// The slot of a `LocalId`, or `None` if the map does not cover it. An
+    /// uncovered id means the map is stale with respect to the CFG.
+    pub fn try_slot_of(&self, id: LocalId) -> Option<usize> {
+        if self.of_local.is_empty() {
+            return Some(usize::from(id));
+        }
+        match self.of_local.get(usize::from(id)) {
+            Some(&s) if s != u32::MAX => Some(s as usize),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn slot_of(&self, id: LocalId) -> usize {
+        if self.of_local.is_empty() {
+            usize::from(id)
+        } else {
+            self.of_local
+                .get(usize::from(id))
+                .copied()
+                .unwrap_or(u32::MAX) as usize
+        }
+    }
+
+    pub fn num_slots(&self) -> usize {
+        self.num_slots
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Cfg {
     pub entry: Block,
     pub named: FxHashMap<Label, Block>,
+    /// Where each `LocalId` of this CFG physically lives at run time.
+    ///
+    /// Part of the CFG rather than the `FunDef` because the interpreter is
+    /// driven by CFGs - the `__init` and `__frame` chunks have no `FunDef`
+    /// behind them - and because it is exactly the ids occurring in these
+    /// blocks that it has to cover.
+    ///
+    /// Any rewrite that introduces or renumbers ids must reset this to the
+    /// identity; `validate` rejects a map that does not cover the CFG, and the
+    /// occupant array in `LocalEnv` is the run-time backstop.
+    pub slots: Arc<SlotMap>,
 }
 
 impl Cfg {
+    /// A CFG with no slot allocation yet, i.e. one local per `LocalId`.
+    pub fn new(entry: Block, named: FxHashMap<Label, Block>) -> Self {
+        Self { entry, named, slots: Arc::new(SlotMap::identity()) }
+    }
+
     pub fn iter_blocks(&self) -> impl Iterator<Item = &Block> {
         std::iter::once(&self.entry).chain(self.named.values())
     }
 
+    /// Rewrite every block, dropping the slot allocation.
+    ///
+    /// Callers change instructions, and a map built for the old instructions
+    /// says nothing about the new ones. Re-run `allocate_slots` afterwards.
     pub fn map_blocks(&self, f: impl Fn(&Block) -> Block) -> Self {
-        Self {
-            entry: f(&self.entry),
-            named: self.named.iter().map(|(k, v)| (k.clone(), f(v))).collect(),
-        }
+        Self::new(
+            f(&self.entry),
+            self.named.iter().map(|(k, v)| (k.clone(), f(v))).collect(),
+        )
     }
 }
 

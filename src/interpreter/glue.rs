@@ -59,11 +59,20 @@ pub fn interpret_prepared_cfg_with_name(
 
 fn interpret_prepared_cfg_inner(
     prepared: &PreparedCfg,
-    initial_state: State,
+    mut initial_state: State,
     fixed_env: &FixedEnv,
     name: Option<String>,
     source_span: Option<crate::ir::SourceSpan>,
 ) -> Result<Vec<(State, Option<Value>)>> {
+    // Locals live in slots, and which slot is which is a property of the CFG we
+    // are about to run. On a call the caller already built the environment
+    // under the callee's map (see `interpret_call_instruction`), so this is a
+    // no-op. On an entry chunk the state arrives from the previous chunk, whose
+    // `Return` emptied the environment, so all that is left is to swap the map.
+    initial_state
+        .local_env
+        .reslot(&prepared.cfg.slots);
+
     // Lightweight tracing span for CFG execution (low overhead)
     let _trace = TraceSpan::new(name.as_deref().unwrap_or("__main"), "cfg");
 

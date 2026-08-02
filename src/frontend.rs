@@ -166,10 +166,7 @@ impl Stream {
         let entry = block_builder.build_and_clear();
 
         (
-            Cfg {
-                entry,
-                named: named_blocks,
-            },
+            Cfg::new(entry, named_blocks),
             fun_defs,
         )
     }

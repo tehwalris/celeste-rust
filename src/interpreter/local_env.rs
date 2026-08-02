@@ -2,63 +2,9 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ir::LocalId;
+use crate::ir::{LocalId, SlotMap};
 
 use super::value::Value;
-
-/// Maps the logical name of a value (`LocalId`, unique per definition, SSA) to
-/// the physical place it lives (a slot in a small dense array).
-///
-/// Keeping these separate is what lets slot allocation happen *without*
-/// destroying SSA. `LocalId` stays unique, so dominance checks, the
-/// single-definition invariant and rewrite-recipe addressing by `%N` all keep
-/// working; only the slot table changes. That in turn means allocation is not a
-/// terminal transformation and can be redone whenever the program changes.
-///
-/// It matters because `LocalEnv` used to be indexed by `LocalId` directly, so
-/// it cost `max LocalId + 1` slots, and every `filter_by_mask` clones it. After
-/// inlining, `player.update_21` reached 3206 ids - but never more than 18
-/// simultaneously live values. See `plans/inline-parked.md`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SlotMap {
-    /// Slot for each `LocalId`. Empty means the identity map, i.e. exactly the
-    /// old behaviour, which is what an un-allocated function gets.
-    of_local: Vec<u32>,
-    num_slots: usize,
-}
-
-impl SlotMap {
-    /// Every value gets its own slot, numbered by `LocalId`. Reproduces the
-    /// pre-slot behaviour exactly.
-    pub fn identity() -> Self {
-        Self { of_local: Vec::new(), num_slots: 0 }
-    }
-
-    pub fn from_vec(of_local: Vec<u32>) -> Self {
-        let num_slots = of_local.iter().map(|s| *s as usize + 1).max().unwrap_or(0);
-        Self { of_local, num_slots }
-    }
-
-    pub fn is_identity(&self) -> bool {
-        self.of_local.is_empty()
-    }
-
-    #[inline]
-    pub fn slot_of(&self, id: LocalId) -> usize {
-        if self.of_local.is_empty() {
-            usize::from(id)
-        } else {
-            self.of_local
-                .get(usize::from(id))
-                .copied()
-                .unwrap_or(u32::MAX) as usize
-        }
-    }
-
-    pub fn num_slots(&self) -> usize {
-        self.num_slots
-    }
-}
 
 const NO_OCCUPANT: u32 = u32::MAX;
 
@@ -169,6 +115,27 @@ impl LocalEnv {
 
     pub fn slots(&self) -> &Arc<SlotMap> {
         &self.slots
+    }
+
+    /// True when no slot holds a value. Note that an environment stays empty
+    /// across a `Return` with no value, which is what lets the frame chunk hand
+    /// its state to the next frame.
+    pub fn is_empty(&self) -> bool {
+        self.data.values.iter().all(|v| v.is_none())
+    }
+
+    /// Move to a different slot map. Only legal while empty - there is no
+    /// meaningful way to reinterpret occupied slots under a different map, and
+    /// the only place this is needed is entering a CFG.
+    pub fn reslot(&mut self, slots: &Arc<SlotMap>) {
+        if Arc::ptr_eq(&self.slots, slots) {
+            return;
+        }
+        assert!(
+            self.is_empty(),
+            "cannot change the slot map of a non-empty local environment"
+        );
+        *self = Self::with_slots(Arc::clone(slots));
     }
 
     pub fn with_capacity(_max_locals: usize) -> Self {

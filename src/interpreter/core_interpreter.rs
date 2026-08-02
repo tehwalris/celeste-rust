@@ -407,8 +407,12 @@ impl<'a> CoreInterpreter<'a> {
                     fun_def.source_span.as_ref(),
                 );
 
-                // Create a new local_env for the function body
-                let mut new_local_env = super::local_env::LocalEnv::new();
+                // Create a new local_env for the function body, under the
+                // callee's slot map - arguments and captures are written
+                // through it, so it has to be in place before they are set.
+                let mut new_local_env = super::local_env::LocalEnv::with_slots(
+                    std::sync::Arc::clone(&prepared_cfg.cfg.slots),
+                );
 
                 // Set up captured values
                 for (capture_id, value) in fun_def.capture_ids.iter().zip(captured_values.iter()) {

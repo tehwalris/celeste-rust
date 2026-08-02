@@ -184,8 +184,7 @@ mod tests {
     /// ever live at once, even though three ids exist.
     #[test]
     fn counts_simultaneous_liveness_not_definitions() {
-        let cfg = Cfg {
-            entry: Block {
+        let cfg = Cfg::new(Block {
                 instructions: vec![
                     (id(0), num(1)),
                     (id(1), num(2)),
@@ -197,9 +196,7 @@ mod tests {
                 ],
                 terminator: (id(3), Terminator::Return { value: Some(id(2)) }),
                 hint_normalize: false,
-            },
-            named: crate::ir::new_label_map(),
-        };
+            }, crate::ir::new_label_map());
         let fun = FunDef {
             name: GlobalId::from("t".to_string()),
             capture_ids: vec![],

@@ -412,25 +412,19 @@ mod tests {
 
     #[test]
     fn accepts_a_straight_line_function() {
-        let cfg = Cfg {
-            entry: block(
+        let cfg = Cfg::new(block(
                 vec![(id(0), num(1)), (id(1), num(2))],
                 (id(2), Terminator::Return { value: Some(id(1)) }),
-            ),
-            named: Default::default(),
-        };
+            ), Default::default());
         assert!(validate_function(&fun_with(cfg)).is_empty());
     }
 
     #[test]
     fn rejects_duplicate_definition() {
-        let cfg = Cfg {
-            entry: block(
+        let cfg = Cfg::new(block(
                 vec![(id(0), num(1)), (id(0), num(2))],
                 (id(2), Terminator::Return { value: Some(id(0)) }),
-            ),
-            named: Default::default(),
-        };
+            ), Default::default());
         let errors = validate_function(&fun_with(cfg));
         assert!(errors.iter().any(|e| e.message.contains("defined more than once")), "{:?}", errors);
     }
@@ -453,8 +447,7 @@ mod tests {
             label("join"),
             block(vec![], (id(13), Terminator::Return { value: Some(id(10)) })),
         );
-        let cfg = Cfg {
-            entry: block(
+        let cfg = Cfg::new(block(
                 vec![(id(0), Instruction::BoolConstant { value: true })],
                 (
                     id(1),
@@ -464,9 +457,7 @@ mod tests {
                         false_target: label("f"),
                     },
                 ),
-            ),
-            named,
-        };
+            ), named);
         let errors = validate_function(&fun_with(cfg));
         assert!(
             errors.iter().any(|e| e.message.contains("does not dominate")),
@@ -490,8 +481,7 @@ mod tests {
             label("join"),
             block(vec![], (id(13), Terminator::Return { value: Some(id(0)) })),
         );
-        let cfg = Cfg {
-            entry: block(
+        let cfg = Cfg::new(block(
                 vec![(id(0), Instruction::BoolConstant { value: true })],
                 (
                     id(1),
@@ -501,9 +491,7 @@ mod tests {
                         false_target: label("f"),
                     },
                 ),
-            ),
-            named,
-        };
+            ), named);
         assert!(validate_function(&fun_with(cfg)).is_empty());
     }
 
@@ -525,8 +513,7 @@ mod tests {
                 (id(13), Terminator::Return { value: Some(id(30)) }),
             ),
         );
-        let cfg = Cfg {
-            entry: block(
+        let cfg = Cfg::new(block(
                 vec![(id(0), Instruction::BoolConstant { value: true })],
                 (
                     id(1),
@@ -536,9 +523,7 @@ mod tests {
                         false_target: label("f"),
                     },
                 ),
-            ),
-            named,
-        };
+            ), named);
         let errors = validate_function(&fun_with(cfg));
         assert!(
             errors.iter().any(|e| e.message.contains("no branch for predecessor")),
