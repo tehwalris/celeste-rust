@@ -106,6 +106,40 @@ pub struct Triangle {
 /// Recognises the shape. Shared by `apply` and `candidates`; `verify` re-derives
 /// it independently from the before program.
 pub fn triangle_at(cfg: &Cfg, join: &Label) -> Option<Triangle> {
+    find_triangle(cfg, join, true)
+}
+
+/// Triangles whose *shape* is right but whose arm cannot be speculated, with the
+/// instructions standing in the way.
+///
+/// This is the list that says what to work on next. `if_convert` is the last
+/// structural rule, so anything it cannot reach is a job for an earlier stage,
+/// and which stage depends entirely on what these instructions are: `store` and
+/// `get_field create` are heap traffic and belong to `promote_cell`, a `call` is
+/// a builtin that would need its own guard, an `alloc` changes `StateShape`.
+pub fn blockers(fun: &crate::ir::FunDef) -> Vec<(Label, Vec<String>)> {
+    let mut out = Vec::new();
+    for label in fun.cfg.named.keys() {
+        if find_triangle(&fun.cfg, label, true).is_some() {
+            continue;
+        }
+        let Some(triangle) = find_triangle(&fun.cfg, label, false) else { continue };
+        let Some(arm) = get_block(&fun.cfg, &Some(triangle.arm)) else { continue };
+        let reasons: Vec<String> = arm
+            .instructions
+            .iter()
+            .filter(|(_, i)| !is_speculatable(i))
+            .map(|(_, i)| super::super::print::format_instruction(i))
+            .collect();
+        if !reasons.is_empty() {
+            out.push((label.clone(), reasons));
+        }
+    }
+    out.sort_by_key(|(l, _)| l.as_str().to_string());
+    out
+}
+
+fn find_triangle(cfg: &Cfg, join: &Label, require_speculatable: bool) -> Option<Triangle> {
     let preds = predecessors(cfg);
     let join_key = Some(join.clone());
     let join_preds = preds.get(&join_key)?;
@@ -140,7 +174,7 @@ pub fn triangle_at(cfg: &Cfg, join: &Label) -> Option<Triangle> {
         {
             continue;
         }
-        if !arm.instructions.iter().all(|(_, i)| is_speculatable(i)) {
+        if require_speculatable && !arm.instructions.iter().all(|(_, i)| is_speculatable(i)) {
             continue;
         }
 

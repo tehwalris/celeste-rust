@@ -402,7 +402,36 @@ fn main() -> Result<()> {
                             n += 1;
                         }
                     }
+                    // What is blocking the rest matters as much as what is
+                    // convertible: it says which earlier stage to work on.
+                    let mut blocked = 0;
+                    let mut by_kind: std::collections::BTreeMap<String, usize> =
+                        Default::default();
+                    for (_, fun) in &program.functions {
+                        for (_, reasons) in
+                            celeste_rust::rewrite::rules::if_convert::blockers(fun)
+                        {
+                            blocked += 1;
+                            for reason in reasons {
+                                let kind = reason
+                                    .split_whitespace()
+                                    .next()
+                                    .unwrap_or("?")
+                                    .to_string();
+                                *by_kind.entry(kind).or_default() += 1;
+                            }
+                        }
+                    }
                     eprintln!("# {} if-convertible join(s)", n);
+                    eprintln!(
+                        "# {} more triangle(s) blocked by unspeculatable arms:",
+                        blocked
+                    );
+                    let mut kinds: Vec<_> = by_kind.into_iter().collect();
+                    kinds.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+                    for (kind, count) in kinds {
+                        eprintln!("#   {:>6}  {}", count, kind);
+                    }
                 }
                 "promote-capture" => {
                     let mut total_sites = 0;

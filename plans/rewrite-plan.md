@@ -902,6 +902,8 @@ Both stay within the existing soundness story: the guess about what a closure is
 and what it captured is asserted at run time, not proved.
 
 ### Then stage D, and only then stage E
+(superseded by section 11 - `if_convert` turned out to be blocked by heap
+traffic, not by calls)
 
 `if_convert` is built and correct but cannot touch a branch whose arm calls or
 stores, which is every branch that matters - the `and`/`or` triangles it *can*
@@ -923,3 +925,93 @@ is otherwise branch-free. At that point - and only at that point - fanning the
 inputs out across *lanes* instead of states leaves one state per frame and no
 merge at all. That is the payoff the whole sequence is aimed at, and it is worth
 being explicit that none of the intermediate stages collect it.
+
+## 11. Stage B is finished, and it moved the wall (2026-08)
+
+Section 10's two rules are built and applied.
+
+**`promote_capture { fn, index }`** turns a captured cell into a captured value.
+The precondition ended up narrower than section 10 proposed, in one specific way
+worth recording: "the cell is stored exactly once" is *not* sufficient. An
+`alloc` outside a loop with its single `store` inside it satisfies that while the
+cell changes value on every iteration, and a closure created early would observe
+a later write. So the rule requires the alloc, the store and the capture to be in
+one basic block, in that order. All 224 `obj.*` creation sites qualify. The 39
+that do not are `anonymous_59`'s, whose captures come from enclosing blocks.
+
+**`AssertClosure` grew `captures`**, `inline` binds `capture_ids` to locals named
+in the recipe entry, and `method_closure_map` resolves a field name to a function
+when every assignment in the program agrees. 84 method call sites over three
+rounds, all screened clean - the "receiver of the field access is the captured
+object" guess holds everywhere, and the guard says so at run time rather than the
+rewrite assuming it.
+
+Then `promote_cell` took the 32 `obj` boxes that nothing captured any more.
+
+### What the differential check had to give up
+
+The box was reachable only from the closure, so removing the capture makes `gc`
+drop it: the frame-boundary heap goes from 272 cells to 271. That is a real
+change to the cross-frame representation, which section 3 assumed was invariant
+and which the whole Tier 2 story rests on.
+
+The narrow fix: `observe_state` normalises **both** sides so that a closure
+capture is observed by the value it denotes rather than by the identity of the
+box holding it. That is exactly the claim the rule makes, it stays sensitive to
+*what* is captured, and unwrapping only one level fails in the safe direction (a
+missed normalisation is a spurious divergence, never a spurious pass).
+
+Worth being explicit that this premise will keep breaking. Stage C removes heap
+cells wholesale, and every one of those is a cross-frame representation change
+too. Each relaxation has to be narrow, applied to both sides, and written down.
+
+### The finding: stage D is blocked by heap traffic, not by calls
+
+Section 10 predicted that removing the calls would make the interesting arms
+speculatable, and that stage D would then have a large candidate set. It does
+not. `rewrite suggest if-convert` now reports:
+
+    # 19 if-convertible join(s)
+    # 155 more triangle(s) blocked by unspeculatable arms:
+    #       89  store
+    #       68  call
+    #       41  assert_closure
+    #       41  get_field
+    #       13  get_index
+    #        7  get_global
+    #        1  alloc
+
+Inlining converted a `call` into a body full of `store`s and
+`get_field ... create`s, which are just as unspeculatable and for a better
+reason: they mutate the heap, so running them on lanes that would have skipped
+the arm is wrong rather than merely risky. Removing the call did not remove the
+obstacle, it renamed it.
+
+So the ordering in section 4 was right for a reason section 4 did not give.
+**Stage C is not an optional memory win before stage D; it is what makes stage D
+possible at all.** 89 stores plus 41 creating field accesses is the bulk of the
+blocked set, and both are exactly what `promote_cell` eliminates.
+
+The remaining three blockers are smaller and each has an answer:
+
+- **68 `call`** are native builtins (`min`, `max`, `abs`, `flr`). Speculating one
+  needs the same guard structure `inline` uses - an `assert_builtin` - or a
+  whitelist of total ones. Cheap, and worth doing once the stores are gone.
+- **41 `assert_closure`** are guards this stage introduced. They are excluded
+  because they exist in order to fail. Whether they *should* be speculatable is
+  a real question: the arm's `load`s are already speculated on the same bargain.
+  Do not change it without measuring.
+- **1 `alloc`** changes `StateShape` and so changes which states can merge -
+  a silent cost rather than a loud failure, which is why it stays excluded.
+
+### Stage C, concretely
+
+`promote_cell` today requires the cell to be defined by an `Alloc`. Object fields
+are `GetField { create_if_missing: true }` cells, so it cannot touch them - which
+is the entire remaining blocker. Extending it needs the pointer-canonicality
+precondition section 4 already described: exactly one `GetField(recv, name)` per
+`(recv, name)` pair, exactly one `GetGlobal(name)` per name, all `GetIndex`
+indices constant. After 84 inlines there are many duplicate accessors, so
+`assume_eq` (or a CSE bulk rule) has to come first.
+
+That is the next piece of work, and unlike this stage it should measure.
