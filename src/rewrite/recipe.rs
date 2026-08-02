@@ -20,7 +20,7 @@ use super::rules::{
     allocate_slots, dce, fold, if_convert, inline, merge_blocks, promote_capture, promote_cell,
 };
 use crate::ir::LocalId;
-use super::validate::validate_program;
+use super::validate::{validate_function, validate_program};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RewriteEntry {
@@ -168,6 +168,31 @@ pub struct StepReport {
     pub instructions_after: usize,
     pub blocks_before: usize,
     pub blocks_after: usize,
+    /// Where the time went. Replaying the recipe is the prefix of every command,
+    /// so it is the number that decides how fast this project is to work on -
+    /// it is worth being able to see it broken down rather than guessed at.
+    pub timing: StepTiming,
+}
+
+#[derive(Default, Clone, Copy)]
+pub struct StepTiming {
+    pub clone: std::time::Duration,
+    pub apply: std::time::Duration,
+    pub validate: std::time::Duration,
+    pub verify: std::time::Duration,
+}
+
+impl StepTiming {
+    pub fn add(&mut self, other: &StepTiming) {
+        self.clone += other.clone;
+        self.apply += other.apply;
+        self.validate += other.validate;
+        self.verify += other.verify;
+    }
+
+    pub fn total(&self) -> std::time::Duration {
+        self.clone + self.apply + self.validate + self.verify
+    }
 }
 
 /// Applies one entry, then validates and verifies it.
@@ -177,9 +202,13 @@ pub struct StepReport {
 /// catches whole classes of mistake that no individual rule verifier would
 /// think to look for.
 pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepReport> {
+    let mut timing = StepTiming::default();
+    let clock = std::time::Instant::now();
     let before = program.clone();
+    timing.clone = clock.elapsed();
     let instructions_before = program.instruction_count();
     let blocks_before = program.block_count();
+    let clock = std::time::Instant::now();
 
     // Every rule but `allocate_slots` runs under the identity slot map.
     //
@@ -219,8 +248,27 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         ),
     }
     .with_context(|| format!("applying {} ({})", entry.id, entry.rule.name()))?;
+    timing.apply = clock.elapsed();
 
-    let errors = validate_program(program);
+    // Validate the functions this entry actually changed, found by comparing
+    // against the copy we already had to take.
+    //
+    // Whole-program validation after every entry was 97% of recipe replay once
+    // inlining had grown the program: dominance is superlinear in block count
+    // and `player.update_21` is now hundreds of blocks, so 554 entries x 77
+    // functions dominated everything. Validating a function that did not change
+    // cannot find anything - `validate_function` reads only that function - and
+    // the comparison is exact rather than a guess about what each rule touches,
+    // so nothing is taken on trust.
+    let clock = std::time::Instant::now();
+    let mut errors = Vec::new();
+    for (name, after_fun) in program.functions.iter() {
+        if before.functions.get(name) == Some(after_fun) {
+            continue;
+        }
+        errors.extend(validate_function(after_fun));
+    }
+    timing.validate = clock.elapsed();
     if !errors.is_empty() {
         let shown: Vec<String> = errors.iter().take(10).map(|e| e.to_string()).collect();
         return Err(anyhow!(
@@ -232,6 +280,7 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         ));
     }
 
+    let clock = std::time::Instant::now();
     match &entry.rule {
         Rule::Dce => dce::verify(&before, program),
         Rule::AllocateSlots => allocate_slots::verify(&before, program),
@@ -257,10 +306,12 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         ),
     }
     .with_context(|| format!("verifying {} ({})", entry.id, entry.rule.name()))?;
+    timing.verify = clock.elapsed();
 
     Ok(StepReport {
         id: entry.id.clone(),
         rule: entry.rule.name(),
+        timing,
         changes,
         instructions_before,
         instructions_after: program.instruction_count(),

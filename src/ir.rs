@@ -135,7 +135,7 @@ pub enum BinaryOp {
     TwoEqual,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Instruction {
     Alloc,
     GetGlobal {
@@ -393,7 +393,7 @@ impl Instruction {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Terminator {
     Return {
         value: Option<LocalId>,
@@ -449,7 +449,7 @@ impl Terminator {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Block {
     pub instructions: Vec<(LocalId, Instruction)>,
     pub terminator: (LocalId, Terminator),
@@ -576,7 +576,7 @@ impl SlotMap {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Cfg {
     pub entry: Block,
     pub named: FxHashMap<Label, Block>,
@@ -615,7 +615,7 @@ impl Cfg {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct FunDef {
     pub name: GlobalId,
     pub capture_ids: Vec<LocalId>,

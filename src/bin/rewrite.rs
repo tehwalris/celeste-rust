@@ -262,6 +262,22 @@ fn main() -> Result<()> {
                 program.block_count(),
                 program.instruction_count()
             );
+
+            // Replaying the recipe is the prefix of every command in this tool,
+            // so it decides how fast the project is to work on. Print the split
+            // so that it stays visible instead of quietly growing.
+            let mut total = celeste_rust::rewrite::recipe::StepTiming::default();
+            for r in &reports {
+                total.add(&r.timing);
+            }
+            println!(
+                "replay: {:.1}s total - clone {:.1}s, apply {:.1}s, validate {:.1}s, verify {:.1}s",
+                total.total().as_secs_f64(),
+                total.clone.as_secs_f64(),
+                total.apply.as_secs_f64(),
+                total.validate.as_secs_f64(),
+                total.verify.as_secs_f64(),
+            );
         }
 
         Command::Print { r#fn } => {
