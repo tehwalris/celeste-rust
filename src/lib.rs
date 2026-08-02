@@ -8,6 +8,7 @@ extern crate rustc_hash;
 extern crate work_queue;
 
 pub mod block_coverage;
+pub mod branch_sites;
 pub mod block_flow;
 pub mod cart_data;
 pub mod collision_cache;

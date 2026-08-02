@@ -49,38 +49,60 @@ But it means **if-conversion should be judged by the state count arriving at the
 frame boundary**, not by the `filter_branch` share, which slot allocation
 already cut from 33% to 13%.
 
-## Next: stage D, if-conversion
+## Stage D landed, and it barely helped
 
-Surveyed in `plans/rewrite-plan.md` section 9. The short version:
+`if_convert` works: 81 sites, `Select` in the IR and interpreter, an
+independent verifier, `suggest if-convert` and `screen` to choose sites. Two of
+84 candidates were dropped, for exactly the two predicted reasons - a select
+that could not combine a bool with a number, and an arm that computed `-2 % 8`
+on lanes that would have skipped it. Both were found by running, not by
+analysis, which is the bargain the design makes.
 
-* The program has **145 triangles** (`cond_br H → A, J`; `A → J`, which is what
-  Lua `and`/`or` compiles to) and only 12 diamonds. **84 triangles have fully
-  speculatable arms** - no call, store, `create_if_missing` or `assert_closure`.
-  33 of those are in `player.update_21`, the hottest function.
-* Arms are short: median 2 instructions, 315 in total.
-* So this is **one rule, `if_convert { join }`**, not the `hoist` +
-  `phi_to_select` pair section 4 proposed. There is nothing for `hoist` to empty
-  out.
-* `Select` is partial. One `HeapId` per pointer and one type tag per value means
-  it can only combine numbers, bools and intervals. Lua's `and`/`or` returns its
-  operands, so some of the 84 will be selecting between a bool and a number and
-  must fail loudly rather than widen.
-* Expect to apply all 84 one at a time and keep the ones that verify.
+    before   4.47 s   1.12 GB   576 mean fragments   28190 filter_branch
+    after    4.59 s   1.06 GB   558 mean fragments   26886 filter_branch
 
-Order of work is in section 9. After that, section 4's stage E (`peel`).
+81 conversions removed 4.6% of the splits.
 
-## Not a second lever after all
+## Why, and what to do instead
 
-`gc` is 21% of runtime, and the plan here used to say that
-`MaybeVector::Vector(Arc<Vec<T>>)` would make it nearly free, since gc only
-renumbers `HeapId`s but deep-copies per-lane data to do it.
+`rewrite bench --profile` now attributes each conditional branch to its source
+block and says whether it split:
 
-Measured, that is wrong. gc copies 284 MB of lane data over the whole frame-34
-run, about 28 ms against gc's 1.0 s - roughly 3%. Its cost is per *cell* (165 ns
-each, mostly allocation: the `HeapValue` clone, the `Box` the `FrozenVec`
-stores, and a rebuilt `FxHashMap` per object table), and cells scale with the
-number of states rather than with lanes per state.
+    branches: 21862 of 333379 executions split the state, across 33 distinct sites
 
-So gc is not an independent target. It is the same fragmentation problem seen
-from the other end, and if-conversion is what shrinks it. Numbers in
-BENCHMARK_DATA.md.
+**93% of branch executions are free.** All the fragmentation is in 33 places,
+and `if_convert` was aimed at the wrong ones - `and`/`or` conditions are almost
+always uniform across lanes. The full table is in BENCHMARK_DATA.md.
+
+The top two sites are the same code twice: the `if` inside `btn()` in
+`lua/builtin_level_4.lua`, inlined at two call sites. 2838 splits each, **zero**
+uniform executions, 26% of all splits between them - and, because they duplicate
+the state early in the frame, they multiply every split downstream.
+
+That branch is the search's own branching factor. `__button_states[i]` starts as
+an `UnknownBool`, and `flow.rs` sends a state branching on `UnknownBool` down
+*both* edges unfiltered, so `btn` doubles the state count. No program rewrite
+can remove it, because it is what enumerates the inputs.
+
+But it does not have to be modelled as **state duplication**. The same
+information fits in one state with twice as many lanes: `Bool(Vector([false; n]
+++ [true; n]))` for the button, every other value repeated. Total lanes are
+identical either way; the difference is the number of *states*, and every part
+of the 60% merge cost is per state.
+
+### Next: make input fan-out expand lanes instead of duplicating states
+
+1. Replace the Lua `btn` with a native builtin that, given an `UnknownBool`
+   button, returns **one** state of 2n lanes rather than two states of n. The
+   builtin signature already allows it - `Vec<(State, Value)>` can be a
+   singleton.
+2. Measure the fragment count, not the `filter_branch` share.
+3. If it works, look at whether `UnknownBool` branching in general should expand
+   rather than duplicate. `__split_by_flr` partitions lanes rather than
+   duplicating, which is why it costs 0.5% instead of 26%.
+
+Unknown until measured: whether halving states at the button read compounds
+through the downstream branches or is absorbed by them. The mechanism is cheap
+to test, which is the main argument for testing it first.
+
+After that, section 4's stage E (`peel`) for the loops.

@@ -78,6 +78,43 @@ share, which slot allocation already cut from 33% to 13%.
 Every frame still ends as **exactly one vectorized state**; all fragmentation is
 intra-frame and fully re-merged.
 
+### Which branches actually split (2026-08)
+
+`rewrite bench --profile` attributes every conditional-branch execution to its
+source block and records whether both edges got lanes. At frame 34:
+
+    branches: 21862 of 333379 executions split the state, across 33 distinct sites
+
+**93% of branch executions are free** - the condition is uniform across lanes,
+every lane goes the same way and nothing is cloned. All the fragmentation comes
+from 33 places, and the top 15 are 94% of it:
+
+| function | block | splits | uniform |
+|---|---|---|---|
+| `player.update_21` | `in_j2_050_if_join_10` | 2838 | 0 |
+| `player.update_21` | `in_j2_052_if_join_10` | 2838 | 0 |
+| `player.update_21` | `if_join_133` | 1856 | 2500 |
+| `obj.is_solid_47` | `if_join_413` | 1779 | 6247 |
+| `player.draw_22` | `__entry` | 1499 | 7211 |
+| `player.update_21` | `if_body_101` | 1356 | 504 |
+| `obj.move_y_53` | `for_body_start_488` | 1064 | 996 |
+
+This is why `if_convert` was nearly free but nearly useless: it was aimed at the
+145 `and`/`or` triangles, whose conditions are almost always uniform.
+
+The top two sites are **the same site twice** - the `if` inside `btn()` in
+`lua/builtin_level_4.lua`, inlined at two call sites. They split 2838 times each
+and *never* run uniformly, because that branch is the search's own branching
+factor: `__button_states[i]` starts as an `UnknownBool`, and `flow.rs` sends a
+state that branches on `UnknownBool` down **both** edges unfiltered. Together
+they are 26% of all splits, and because they duplicate the state early in the
+frame they multiply every split downstream.
+
+Note the mechanism: this is not lane filtering, it is state *duplication*.
+`filter_by_mask` is never called. It is also not something a program rewrite can
+remove, because the branch is semantically necessary - it is how the search
+enumerates inputs.
+
 ### What `gc` is actually doing (2026-08)
 
 `gc` is 21% of runtime at ~46 us per call, and the obvious guess is that it is

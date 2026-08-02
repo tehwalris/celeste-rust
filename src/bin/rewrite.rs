@@ -124,6 +124,7 @@ fn bench(label: &str, program: &Program, frames: u32, profile: bool) -> Result<(
     let mut run = celeste_rust::rewrite::verify::AbstractRun::start(program)?;
     if profile {
         celeste_rust::interpreter::tracing::reset_tracing();
+        celeste_rust::branch_sites::reset();
         celeste_rust::interpreter::tracing::enable_tracing();
     }
     let start = std::time::Instant::now();
@@ -180,6 +181,22 @@ fn bench(label: &str, program: &Program, frames: u32, profile: bool) -> Result<(
             "{:<28} {:>9.2} of {:.2}s wall clock (the rest is outside any span)",
             "measured", measured as f64 / 1e6, elapsed.as_secs_f64()
         );
+
+        let (splits, executions, distinct) = celeste_rust::branch_sites::totals();
+        println!();
+        println!(
+            "branches: {} of {} executions split the state, across {} distinct sites",
+            splits, executions, distinct
+        );
+        println!("{:<34} {:<32} {:>9} {:>9}", "function", "block", "splits", "uniform");
+        for (function, block, site) in
+            celeste_rust::branch_sites::report().into_iter().take(15)
+        {
+            println!(
+                "{:<34} {:<32} {:>9} {:>9}",
+                function, block, site.splits, site.uniform
+            );
+        }
 
         // Spans in the `merge_site` category exist only to bracket other work,
         // so they have no self time worth reporting - what matters is how much
