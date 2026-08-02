@@ -333,10 +333,19 @@ The non-`btn` remainder is ~4700 splits across a dozen sites in
 `player.update_21` and the object loop, none of them the triangle shape the
 current rules recognise. Price them with `bench --profile` and look at each
 shape before writing anything: some are diamonds (both sides do work), some
-are if/elseif chains, two are ternary variants that `convert_ternary`'s strict
-shape check refused (`and_or_join_199`, `in_i1_077_and_or_join_611` - look at
-why before widening the rule), and `for_head_487` is a loop header, which no
-select can absorb.
+are if/elseif chains, and `for_head_487` is a loop header, which no select can
+absorb.
+
+The two refused ternary variants (`and_or_join_199` 202 splits,
+`in_i1_077_and_or_join_611` 144) are understood: their `or`-half was already
+converted by one of the 81 early `if_convert`s, so the pair shape is gone and
+what remains is a single triangle whose mixed phi `%p` feeds an existing
+`select %p ? %p : %q`. The variant rule: require `%p`'s only uses to be
+selects of exactly that form, convert the triangle, and rewrite each to
+`select %c ? %b : %q` - the same truthiness argument as `convert_ternary`.
+`statically_truthy` needs one sound extension for `%694 = -(1)`: arithmetic
+results are Numbers or fail loudly, and no Number is falsy, so arithmetic ops
+qualify (comparisons do not - they return Bools).
 
 A diamond needs either a two-arm `if_convert` (both arms speculatable, selects
 at the join) or a store-sinking variant with two provenances. Same soundness
