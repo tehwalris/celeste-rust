@@ -68,6 +68,13 @@ enum Command {
         #[arg(long, default_value = "p")]
         prefix: String,
     },
+    /// Report how many LocalEnv slots each function needs now versus how many
+    /// it would need if values with disjoint live ranges shared a slot.
+    Slots {
+        /// Only show functions needing at least this many slots today.
+        #[arg(long, default_value_t = 40)]
+        min: usize,
+    },
     /// Run the rewritten program and report time, memory and lane counts.
     ///
     /// Note peak RSS is the process-wide high-water mark, so with `--baseline`
@@ -273,6 +280,42 @@ fn main() -> Result<()> {
                 }
                 other => return Err(anyhow!("unknown suggestion kind {:?}", other)),
             }
+        }
+
+        Command::Slots { min } => {
+            let (program, _) = build(&recipe)?;
+            let mut reports: Vec<_> = program
+                .functions
+                .values()
+                .map(celeste_rust::rewrite::liveness::slot_report)
+                .filter(|r| r.env_slots_now >= min)
+                .collect();
+            reports.sort_by_key(|r| std::cmp::Reverse(r.env_slots_now));
+            println!(
+                "{:<34} {:>10} {:>10} {:>8}  {}",
+                "function", "slots now", "if packed", "defs", "saving"
+            );
+            let mut total_now = 0;
+            let mut total_packed = 0;
+            for r in &reports {
+                total_now += r.env_slots_now;
+                total_packed += r.env_slots_packed;
+                println!(
+                    "{:<34} {:>10} {:>10} {:>8}  {:.1}x",
+                    r.name,
+                    r.env_slots_now,
+                    r.env_slots_packed,
+                    r.definitions,
+                    r.env_slots_now as f64 / r.env_slots_packed.max(1) as f64
+                );
+            }
+            println!();
+            println!(
+                "total over shown functions: {} -> {} ({:.1}x)",
+                total_now,
+                total_packed,
+                total_now as f64 / total_packed.max(1) as f64
+            );
         }
 
         Command::Bench { frames, baseline } => {

@@ -26,6 +26,7 @@
 //! Whatever decides *which* rewrites to make is unconstrained and untrusted,
 //! because the verifier checks the result.
 
+pub mod liveness;
 pub mod print;
 pub mod program;
 pub mod recipe;
