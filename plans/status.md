@@ -161,11 +161,11 @@ Two things this stage taught that were not in the plan:
   passed at 20 frames; three failed at 34, at frames 29 and 32. Screen at the
   depth the result will be used at.
 
-## Next: stage C, and it is now the blocker rather than a nicety
+## Stage C, in progress - and it is the blocker, not a nicety
 
-`suggest if-convert` reports what stands in the way:
+`suggest if-convert` reports what stands in the way of stage D:
 
-    # 19 if-convertible join(s)
+    # 3 if-convertible join(s)
     # 155 more triangle(s) blocked by unspeculatable arms:
     #       89  store
     #       68  call
@@ -175,21 +175,35 @@ Two things this stage taught that were not in the plan:
 Inlining converted each `call` into a body full of stores and creating field
 accesses. Those are unspeculatable for a better reason than the call was: they
 mutate the heap. So removing the calls renamed the obstacle rather than
-removing it, and **stage C is what makes stage D possible at all** - not a
-memory win to be taken whenever.
+removing it, and **stage C is what makes stage D possible at all**.
 
-`promote_cell` currently requires the cell to come from an `Alloc`. Object
-fields are `GetField { create_if_missing: true }` cells, so it cannot touch
-them. Extending it needs the pointer-canonicality precondition from section 4
-of the plan, and `assume_eq` (or a CSE bulk rule) first, because 84 inlines
-left many duplicate accessors.
+Three pieces:
 
-And the thing to keep in view: the two biggest splitting sites are the `btn`
-reads, 26% of splits, and no rewrite removes them. They stop mattering only when
-the frame is otherwise branch-free and the inputs can fan out across lanes
-instead of states - one state per frame, no merge. **None of the intermediate
-stages collect that payoff**, which is worth remembering when the next one also
-measures flat.
+1. **`cse`** - one instruction per value, so each cell has a single accessor.
+   Promotion's precondition is "no other instruction can produce a pointer to
+   this cell", and inlining left 1675 redundant accessors (`get_field
+   %2.hitbox` appeared 124 times in one function).
+   * **Block-local: done.** 3833 instructions removed, 23362 -> 19529.
+     Redundant accessors 1675 -> 597.
+   * **Cross-block: next.** The remaining 597 need an earlier definition in a
+     *dominating* block with no barrier on *any* path between - a real dataflow
+     question rather than an interval scan. Promotion needs function-wide
+     uniqueness, so this is not optional.
+2. **`assume_eq`** - for pointers that reach one cell by different paths, which
+   CSE cannot see. The `foreach` callback gets the object as argument `%2`
+   while the loop also reaches it as `objects[i]`; nothing syntactic connects
+   them. Inserts `assert %a == %b` and substitutes, converting an aliasing fact
+   into syntactic identity. Sound by construction.
+3. **Field promotion.** Unlike an `alloc` cell, a field cell *is* the game
+   state, so it cannot simply be deleted: load once where the pointer is first
+   available, work in SSA, store back before every `Return`. Inside the frame
+   no heap traffic; at the boundary an identical heap.
+
+   Measured, and it is less alarming than expected: of 146 field cells written
+   in `player.update_21`, **142 are written exactly once** and only 4 need
+   multi-store SSA construction with phi insertion. So most of this is the
+   existing `promote_cell` shape plus the load-at-entry / store-at-return
+   bracketing, not a general mem2reg.
 
 ## Keep replay fast
 
