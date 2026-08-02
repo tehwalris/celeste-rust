@@ -114,27 +114,51 @@ one. Reverted; details in BENCHMARK_DATA.md.
 
 ## Where that leaves things
 
-Three of the four ideas that looked promising from the profile have now been
-measured and rejected: `Arc<Vec>` for gc (3%, not 20%), `if_convert` on the
-`and`/`or` triangles (4.6% of splits), and lane expansion for input fan-out (a
-regression). What each one taught is in BENCHMARK_DATA.md, and the pattern is
-consistent: **fragmentation is not obviously wasteful.** Each fragment is a
-state in which more values are scalar, and scalars are what make the
-interpreter fast.
+Three ideas that looked good from the profile have been measured and rejected:
+`Arc<Vec>` for gc (3%, not 20%), `if_convert` on the `and`/`or` triangles (4.6%
+of splits), and lane expansion for input fan-out (a regression). The consistent
+lesson is that **fragmentation is not obviously wasteful** - each fragment is a
+state in which more values are scalar, and scalars are what make the interpreter
+fast. Details for each are in BENCHMARK_DATA.md.
 
-That reframes the target. The 60% spent merging is not the cost of a mistake
-to be undone cheaply; it is the price of scalar specialisation, and it comes
-down either by
+So the 60% spent merging is not a mistake to undo cheaply. It comes down either
+by making the merge itself cheaper (`merge_groups` 26%, `gc` 20%,
+`shape_grouping` 9%, `dedup_state` 9%, all per state on ~576 states per frame -
+bounded, unexamined, and independent of the program's shape), or by reaching a
+branch-free frame where there is one state and no merge. The second is the plan.
 
-  * making the merge itself cheaper - `merge_groups` 26%, `gc` 20%,
-    `shape_grouping` 9%, `dedup_state` 9%, all charged per state on ~576 states
-    per frame. Nothing here has been examined yet, and unlike the rewrites it
-    does not depend on the program's shape.
-  * or by getting all the way to a branch-free frame, at which point there is
-    one state and no merge. That is stages D and E finished, not started: 305
-    calls remain and no loop has been peeled. `if_convert` is built and works,
-    but it cannot touch a branch whose arm calls or stores.
+## Next: finish stage B, which is what unblocks stage D
 
-The second is the original plan and still the endgame. The first has never been
-measured and is the obvious next thing to look at, since it is a bounded
-question with a known cost.
+Surveyed in `plans/rewrite-plan.md` section 10. 305 calls remain:
+
+* **200 are native builtins** (`error` 54, `__print` 54, `mget` 17, `max` 16,
+  `min` 16, `flr` 10, ...). A builtin is already a leaf operation, so these cost
+  nothing at run time. They cost something at rewrite time only because
+  `if_convert` rejects any arm containing a `Call`.
+* **72 are method dispatch** (`.init` 32, `.collide` 13, `.check` 10,
+  `.is_solid` 7) and are blocked by **captures, not dispatch**. `inline::apply`
+  never cared how the closure was obtained; only `candidates` restricts itself
+  to globals. All seven `obj.*` methods capture exactly one cell, holding the
+  object itself, and that cell is `alloc`ed, stored once, and never rewritten.
+* **33 have a callee defined in another block** and need cross-block candidate
+  detection.
+
+Two rules, in this order:
+
+1. `promote_capture { fn, index }` - captured *cell* becomes captured *value*.
+   Whole-program rule keyed by the callee, since one `FunDef` is shared by all
+   32 closures made from it.
+2. `AssertClosure` grows `captures: Vec<LocalId>`, and `inline` binds the
+   callee's capture ids to them. After (1) the capture of `obj.collide_49` *is*
+   the object, which `o:collide(...)` already passes as argument 0. Before (1)
+   there is no local at the call site holding it, which is why the order
+   matters.
+
+Then stage D over the enlarged candidate set, then stage E for the loops.
+
+And the thing to keep in view: the two biggest splitting sites are the `btn`
+reads, 26% of splits, and no rewrite removes them. They stop mattering only when
+the frame is otherwise branch-free and the inputs can fan out across lanes
+instead of states - one state per frame, no merge. **None of the intermediate
+stages collect that payoff**, which is worth remembering when the next one also
+measures flat.

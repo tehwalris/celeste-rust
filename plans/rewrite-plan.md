@@ -813,3 +813,94 @@ bargain `assert_closure` makes for `inline`: the interpreter's own type checking
 is the guard, and a mis-speculated arm aborts the search instead of computing
 the wrong number. Differential verification covers 15,250 lanes over 30 frames,
 which is evidence but not proof.
+
+## 10. What actually blocks a call-free frame (2026-08)
+
+Stage B converged at 183 inlines with 305 calls left. Classifying them says the
+remaining work is not what section 4 assumed.
+
+| callee expression | count | what it is |
+|---|---|---|
+| `load (get_global "n")` | 200 | native builtins |
+| `load (get_field %o.n)` | 72 | method dispatch |
+| closure defined in another block | 33 | needs cross-block candidate detection |
+
+### The 200 "global" calls are mostly not a problem
+
+They are calls to **native builtins**, which is why `global_closure_map` does
+not resolve them - there is no Lua body to splice. `error` (54) and `__print`
+(54) are on death and debug paths. The rest are `mget` 17, `max` 16, `min` 16,
+`__array_table_drop_last` 13, `flr` 10, `tile_flag_at` 4.
+
+A builtin is already a leaf operation, so leaving it as a call costs nothing at
+run time. It costs something at *rewrite* time, because `if_convert` rejects any
+arm containing a `Call`, including `min`. Allowing a whitelist of pure builtins
+to be speculated would need the same guard structure `inline` uses - an
+`assert_builtin` - and would be worth doing only if such arms turn out to be on
+the branches that matter.
+
+### The 72 method calls are blocked by captures, not by dispatch
+
+This was the surprise. `inline::apply` never cared how the closure was obtained -
+it takes a call instruction and a callee name, inserts `assert_closure`, and
+splices - so `get_field` dispatch would work as-is. Only `candidates` restricts
+itself to globals. Pointing it at a method by hand gives:
+
+    inline: obj.collide_49 has 1 capture(s); only capture-free callees are supported
+
+All seven `obj.*` methods capture exactly one cell:
+
+    obj.is_solid_47  obj.is_ice_48  obj.collide_49  obj.check_50
+    obj.move_51      obj.move_x_52  obj.move_y_53
+
+The captured cell holds the object itself. `init_object` writes `local obj = {}`,
+and because Lua locals captured by a closure are mutable boxes, the frontend
+allocates a cell. Inspecting one: `%784 = alloc`, then a **single**
+`store %784 <- %785`, then only `load %784` and `store_closure ... [%784]`. The
+box is never rewritten.
+
+### So stage B needs two things, in order
+
+1. **`promote_capture { fn, index }`** - turn a captured *cell* into a captured
+   *value*. Precondition, checkable over the whole program: every
+   `store_closure ... <- F [%c]` has `%c` an `alloc` that is stored exactly once
+   and never stored again, and inside `F` the capture is only ever `load`ed.
+   Transformation: each creation site captures the stored value instead, and in
+   `F` every use of `%x = load %cap` is replaced by `%cap` (the IR has no copy
+   instruction, so this is a substitution, not an insertion).
+
+   Note this is a whole-program rule keyed by the callee, because one `FunDef`
+   is shared by all 32 closures made from it - they must all change together.
+
+2. **Captures in the guard.** `AssertClosure` grows a `captures: Vec<LocalId>`
+   asserting the closure's captured values equal those locals, and `inline`
+   binds `capture_ids[i]` to `captures[i]`. After (1) the capture of
+   `obj.collide_49` *is* the object, and `o:collide(...)` passes the object as
+   argument 0, so the call site already has a local holding it. Before (1) it
+   does not, which is why the order matters.
+
+Both stay within the existing soundness story: the guess about what a closure is
+and what it captured is asserted at run time, not proved.
+
+### Then stage D, and only then stage E
+
+`if_convert` is built and correct but cannot touch a branch whose arm calls or
+stores, which is every branch that matters - the `and`/`or` triangles it *can*
+take were 4.6% of splits. Removing the calls is what makes the interesting arms
+speculatable. Section 9's whitelist and verifier need no changes for that; the
+candidate set simply grows.
+
+The loops (`obj.move_y_53`'s `for_body_start` is 5% of splits on its own) are
+stage E and come last, because peeling multiplies code size and is much cheaper
+to verify against a program that is already call-free.
+
+### One thing that will not go away
+
+The two largest splitting sites are the `btn` reads, 26% of splits between them,
+and they are the search's own branching factor rather than anything a rewrite
+can remove. Section 9's measurement and the lane-expansion experiment
+(BENCHMARK_DATA.md) together say what to do about them: nothing, until the frame
+is otherwise branch-free. At that point - and only at that point - fanning the
+inputs out across *lanes* instead of states leaves one state per frame and no
+merge at all. That is the payoff the whole sequence is aimed at, and it is worth
+being explicit that none of the intermediate stages collect it.
