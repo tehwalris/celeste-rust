@@ -195,7 +195,7 @@ Two design consequences that fall out immediately:
   pointers is impossible — pointer-valued phis must be removed by
   specialization, not if-converted.
 
-### Step 0: the measurement that decides everything
+### Step 0: the measurement that decides everything (done - see section 8)
 
 Before building any machinery, **measure K**. Instrument the concrete
 interpreter to record, over a few hundred random input sequences, the set of
@@ -653,4 +653,88 @@ With a dynamic path of roughly 5k instructions, break-even is around
 **K ≈ 22,000 instructions**. Under that, we win on the existing interpreter and
 the memory win is free on top; well over it, the win only arrives after codegen.
 
-Measuring K is therefore still the decisive open question.
+## 8. K, measured (2026-08) — the answer is yes
+
+`cargo run --release --bin measure_k` (see `src/block_coverage.rs`).
+
+**K ≈ 10,700–11,900 instructions**, stable across seeds, 120–400 sequences and
+45–80 frame horizons. Break-even is ~22,000. **The transformation pays for
+itself on the existing interpreter, before any codegen.**
+
+Room-load frames are excluded from the measurement: `load_room` scans 16x16
+tiles and runs `foreach(types, ...)` per tile, ~2,800 block executions, which
+swamps everything else and gives a misleading K of 105,322. It is also a
+different heap shape, so it is a separate specialization by construction — a
+nice independent confirmation of the shape-keyed design in §2b.
+
+The breakdown by instruction kind matters more than the total:
+
+| kind | share of K | fate |
+|---|---|---|
+| `heap` (Alloc/Load/Store/GetField/GetIndex) | 46.6% | removed by `promote_cell` |
+| `terminator` | 19.4% | becomes a select, or vanishes |
+| `arith` | 9.3% | survives |
+| `const` | 7.5% | survives, mostly folded |
+| `global` (GetGlobal) | 7.0% | becomes a fixed slot |
+| `call` | 5.3% | removed by `inline` |
+| `phi` | 4.8% | becomes a select |
+
+**~78% of K is exactly what stages B–D are designed to eliminate.** The
+irreducible arithmetic core is roughly **2,500–3,000 ops per lane per frame**.
+
+### What that implies
+
+Today: ~66 µs per lane per frame at frame 34.
+
+| | ops/lane | ns per op-lane | µs/lane | speedup |
+|---|---|---|---|---|
+| today | 2,082 executed (fragmented) | ~32 effective | 66 | 1x |
+| branch-free, existing interpreter, before `promote_cell` | 11,900 | ~1.5 | ~18 | ~3.7x |
+| branch-free, after `promote_cell` | ~3,000 | ~1.5 | ~4.5 | ~15x |
+| compiled kernel, SIMD over i32 lanes | ~3,000 | ~0.2 | ~0.6 | ~100x |
+
+The staging is monotonic — every stage is a win on its own, so there is no
+valley to cross.
+
+### And the state is tiny
+
+Dumping frame 30 and counting per-lane (`MaybeVector::Vector`) slots: the
+entire per-lane state of room 1 is **17 values**.
+
+```
+freeze                     objects[1].dash_time        objects[1].p_dash
+has_dashed                 objects[1].djump            objects[1].p_jump
+objects[1].x               objects[1].grace            objects[1].spd.x
+objects[1].y               objects[1].flip.x           objects[1].spd.y
+objects[1].dash_accel.x    objects[1].dash_accel.y
+objects[1].dash_effect_time
+objects[1].dash_target.x   objects[1].dash_target.y
+```
+
+`rem.x`/`rem.y` are absent because `make_state_abstract` widens them to a
+scalar interval at each frame boundary. The other 263 heap cells are structure
+(107 pointers, 70 closures, 21 object tables, 13 builtins) or per-state scalars,
+all shared across lanes.
+
+So the frame function is a pure map on **17 i32s** (68 bytes/lane), against
+~14,000 bytes/lane of measured peak RSS — a ~200x transient blowup. Stored
+densely, frame 40's 948k lanes are 64 MB rather than 29 GB. Memory stops being
+the binding constraint somewhere around frame 60; time becomes it again.
+
+This is also, not coincidentally, almost exactly the state the old hardcoded
+Rust implementation used — except here it would be *derived from the Lua*
+rather than transcribed by hand.
+
+### Consequences for the plan
+
+- Go. Build the rewrite system.
+- `promote_cell` is the highest-value single rule: it is 46.6% of K, and
+  separately it wins back the ~1.9x memory regression from dropping mem2reg.
+  Doing it second (after the trivial rules prove the pipeline) still looks right.
+- The endgame should target **flat SoA i32 lane arrays plus a compiled kernel**,
+  processed in chunks. Not "run the branch-free CFG in the existing
+  interpreter" — that is only the intermediate checkpoint that keeps
+  differential verification cheap.
+- Known small over-count: the frame driver CFG and the button-reset CFG are both
+  named `__main`, so `__main::__entry` is counted twice (~8% of K). Harmless at
+  this precision.
