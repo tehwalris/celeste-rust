@@ -56,10 +56,31 @@ use super::{get_block, predecessors, require};
 
 /// Can this instruction be executed on lanes that would not have reached it?
 ///
-/// Excludes everything that writes: the heap must end up as if the arm had run
-/// only on its own lanes, and for a read-only instruction it does.
+/// This is the rule's whole soundness argument, so it is worth being precise
+/// about what it is protecting against. Speculating an instruction can go wrong
+/// in two quite different ways, and only one of them is a reason to refuse:
+///
+/// * **Silently.** The instruction changes something observable that the
+///   `select` at the join cannot take back. A `store` writes a cell on lanes
+///   that should not have written it; the join can still pick the right value
+///   for the phi, but the heap is already wrong and nothing says so. There is no
+///   rollback here - unlike a speculating CPU, which has one - so these must
+///   never be speculated. No amount of testing would reliably find the damage.
+///
+/// * **Loudly.** The instruction cannot corrupt anything; it can only stop the
+///   run. The asserts are the whole of this category: they exist in order to
+///   fail. Speculating one can produce a failure that the original program
+///   would not have had, but it cannot produce a *wrong answer*. That makes
+///   allowing it a screening question rather than a soundness question, which
+///   is the same bargain `inline` and `demote_create` already make.
+///
+/// So the answer is no for the first group and yes for the second. Note this
+/// only ever *offers* more triangles: each one still has to be added to the
+/// recipe and survive a differential run before it counts.
 pub fn is_speculatable(instr: &Instruction) -> bool {
     match instr {
+        // -- can go wrong silently: never speculate ------------------------
+        //
         // Writes, in one form or another.
         Instruction::Store { .. }
         | Instruction::StoreEmptyTable { .. }
@@ -69,25 +90,35 @@ pub fn is_speculatable(instr: &Instruction) -> bool {
         // the branch, which changes `StateShape` and so changes which states
         // can merge - a silent cost, not a loud failure.
         Instruction::Alloc => false,
-        // Exists in order to fail; speculating it would fail on lanes that
-        // never reached the call.
-        Instruction::AssertClosure { .. } => false,
-        // Speculatable, unlike `AssertClosure`, and for a specific reason.
-        // What it checks is whether a field exists, and that is a property of
-        // the state's heap rather than of a lane: within one state the answer
-        // is the same whichever arm ran. So running it on lanes that would
-        // have taken the other edge can only fail if the field is genuinely
-        // absent - which is exactly what the `demote_create` entry that
-        // inserted it already claims never happens here. One premise, checked
-        // once, by screening. Speculating it is not a second assumption.
-        Instruction::AssertPointer { .. } => true,
-        // These mutate the heap when the field is missing.
+        // These mutate the heap when the field is missing. `demote_create`
+        // exists to turn them into the plain read plus assert below.
         Instruction::GetGlobal { create_if_missing, .. }
         | Instruction::GetField { create_if_missing, .. }
         | Instruction::GetIndex { create_if_missing, .. } => !*create_if_missing,
         // A phi belongs to a control-flow join, so it cannot be moved. The arm
         // has a single predecessor and therefore has none anyway.
         Instruction::Phi { .. } => false,
+
+        // -- can only go wrong loudly: allow, and screen --------------------
+        //
+        // Whether a field exists is a property of the state's heap rather than
+        // of a lane, so within one state the answer is the same whichever arm
+        // ran. Speculating this can only fail where the field is genuinely
+        // absent, which is exactly what the `demote_create` entry that planted
+        // it already claims never happens. One premise, checked once.
+        Instruction::AssertPointer { .. } => true,
+        // Weaker than the above and worth stating plainly: this one really can
+        // fail where the unspeculated program would not. `if a.type == player
+        // then a:method() end` speculates into asserting that a non-player is a
+        // player. What saves it is that the failure is loud and immediate, and
+        // that an arm is only offered when *every* instruction in it is
+        // speculatable - so the body behind the assert is pure reads, and an
+        // assert that passes cannot let anything through. 35 triangles are
+        // blocked by nothing else; the ones whose claim does not hold fail
+        // screening and are simply not applied.
+        Instruction::AssertClosure { .. } => true,
+
+        // -- pure: the extra result is just ignored -------------------------
         Instruction::Load { .. }
         | Instruction::NumberConstant { .. }
         | Instruction::BoolConstant { .. }
@@ -116,6 +147,13 @@ pub struct Triangle {
 /// it independently from the before program.
 pub fn triangle_at(cfg: &Cfg, join: &Label) -> Option<Triangle> {
     find_triangle(cfg, join, true)
+}
+
+/// The triangle around a join whether or not its arm can be speculated. What
+/// `blockers` walks, exposed so that a diagnostic can ask how much a *blocked*
+/// triangle would be worth if the blocker were removed.
+pub fn triangle_shaped(cfg: &Cfg, join: &Label) -> Option<Triangle> {
+    find_triangle(cfg, join, false)
 }
 
 /// Triangles whose *shape* is right but whose arm cannot be speculated, with the
@@ -614,6 +652,32 @@ mod tests {
         let before = triangle_program(vec![(id(10), Instruction::Alloc)], true);
         let mut after = before.clone();
         assert!(apply(&mut after, "t", "join").is_err());
+    }
+
+    /// The other side of the same line. An assert in the arm *is* accepted,
+    /// because speculating it can only stop the run, never corrupt it - and an
+    /// arm is only offered when everything in it is speculatable, so the body
+    /// behind the assert is pure reads and an assert that passes cannot let
+    /// anything through.
+    #[test]
+    fn accepts_an_arm_that_only_asserts() {
+        for guard in [
+            Instruction::AssertPointer { value: id(1) },
+            Instruction::AssertClosure {
+                value: id(1),
+                fun_def: crate::ir::GlobalId::from("g".to_string()),
+                captures: vec![],
+            },
+        ] {
+            let before = triangle_program(vec![(id(11), guard), (id(10), num(7))], true);
+            let mut after = before.clone();
+            apply(&mut after, "t", "join").unwrap();
+            verify(&before, &after, "t", "join").unwrap();
+            assert!(
+                !after.get("t").unwrap().cfg.named.contains_key(&label("arm")),
+                "arm should be gone"
+            );
+        }
     }
 
     /// The verifier must reject a wrong conversion, not just confirm a right
