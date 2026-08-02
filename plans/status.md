@@ -149,9 +149,12 @@ Two rules, in this order:
    Whole-program rule keyed by the callee, since one `FunDef` is shared by all
    32 closures made from it.
 2. `AssertClosure` grows `captures: Vec<LocalId>`, and `inline` binds the
-   callee's capture ids to them. After (1) the capture of `obj.collide_49` *is*
-   the object, which `o:collide(...)` already passes as argument 0. Before (1)
-   there is no local at the call site holding it, which is why the order
+   callee's capture ids to them. After (1) the capture *is* the object, and the
+   call site already has it as the receiver of the field access - every such
+   call is `%f = get_field %o.name; call (load %f)`, and `%o` is the object the
+   closure captured. (Not as an argument: these methods have no `self`
+   parameter, they close over `obj` instead.) Before (1) the capture is a cell
+   pointer and no local at the call site holds it, which is why the order
    matters.
 
 Then stage D over the enlarged candidate set, then stage E for the loops.

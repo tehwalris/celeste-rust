@@ -874,10 +874,29 @@ box is never rewritten.
 
 2. **Captures in the guard.** `AssertClosure` grows a `captures: Vec<LocalId>`
    asserting the closure's captured values equal those locals, and `inline`
-   binds `capture_ids[i]` to `captures[i]`. After (1) the capture of
-   `obj.collide_49` *is* the object, and `o:collide(...)` passes the object as
-   argument 0, so the call site already has a local holding it. Before (1) it
-   does not, which is why the order matters.
+   binds `capture_ids[i]` to `captures[i]`.
+
+   Where does the call site get a local holding the capture? Not from the
+   arguments - these methods have no `self` parameter, because they close over
+   `obj` instead of taking it:
+
+       obj.check = function(type,ox,oy) return obj.collide(type,ox,oy) ~= nil end
+
+   compiles to `obj.check_50(%2, %5, %8) captures [%10]`. It comes from the
+   *receiver of the field access*. Every such call is `%f = get_field %o.name`
+   then `call (load %f)`, and `%o` is the object the closure captured - it has
+   to be, because `obj.collide = function ... end` assigned the closure onto
+   that same object. So the guard is
+
+       assert_closure %12 is obj.collide_49 with captures [%9]
+
+   where `%9` is already the receiver in `%11 = get_field %9.collide`. That
+   identity is an assumption, which is exactly why it is asserted rather than
+   proved.
+
+   Before (1) this does not work, because the capture is a *cell pointer* and no
+   local at the call site holds it - only its contents. That is why the order
+   matters.
 
 Both stay within the existing soundness story: the guess about what a closure is
 and what it captured is asserted at run time, not proved.
