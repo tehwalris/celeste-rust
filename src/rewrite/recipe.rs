@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use super::program::Program;
 use super::rules::{
-    allocate_slots, dce, fold, if_convert, inline, merge_blocks, promote_cell,
+    allocate_slots, dce, fold, if_convert, inline, merge_blocks, promote_capture, promote_cell,
 };
 use crate::ir::LocalId;
 use super::validate::validate_program;
@@ -67,6 +67,15 @@ pub enum Rule {
         /// The block the two paths join at.
         join: String,
     },
+    /// Make every closure of a function capture a value rather than the cell
+    /// holding it. Keyed by the callee, because one `FunDef` is shared by all
+    /// its creation sites and they must change together.
+    PromoteCapture {
+        #[serde(rename = "fn")]
+        function: String,
+        /// Which capture position, counting from 0.
+        index: usize,
+    },
     /// Replace one non-escaping, single-store heap cell with SSA values.
     PromoteCell {
         #[serde(rename = "fn")]
@@ -85,6 +94,7 @@ impl Rule {
             Rule::Fold => "fold",
             Rule::Inline { .. } => "inline",
             Rule::IfConvert { .. } => "if_convert",
+            Rule::PromoteCapture { .. } => "promote_capture",
             Rule::PromoteCell { .. } => "promote_cell",
         }
     }
@@ -168,6 +178,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::MergeBlocks => merge_blocks::apply(program),
         Rule::Fold => fold::apply(program),
         Rule::IfConvert { function, join } => if_convert::apply(program, function, join),
+        Rule::PromoteCapture { function, index } => {
+            promote_capture::apply(program, function, *index)
+        }
         Rule::PromoteCell { function, cell } => {
             promote_cell::apply(program, function, parse_cell(cell)?)
         }
@@ -196,6 +209,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::Fold => fold::verify(&before, program),
         Rule::IfConvert { function, join } => {
             if_convert::verify(&before, program, function, join)
+        }
+        Rule::PromoteCapture { function, index } => {
+            promote_capture::verify(&before, program, function, *index)
         }
         Rule::PromoteCell { function, cell } => {
             promote_cell::verify(&before, program, function, parse_cell(cell)?)

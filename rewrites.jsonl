@@ -409,6 +409,13 @@
 {"id":"c081","rule":"if_convert","fn":"player.update_21","join":"in_j2_039_and_or_join_49"}
 {"id":"c082","rule":"if_convert","fn":"player.update_21","join":"in_j2_040_and_or_join_49"}
 {"id":"c083","rule":"if_convert","fn":"del_6","join":"and_or_join_49"}
+{"fn":"obj.check_50","id":"pc000","index":0,"rule":"promote_capture"}
+{"fn":"obj.collide_49","id":"pc001","index":0,"rule":"promote_capture"}
+{"fn":"obj.is_ice_48","id":"pc002","index":0,"rule":"promote_capture"}
+{"fn":"obj.is_solid_47","id":"pc003","index":0,"rule":"promote_capture"}
+{"fn":"obj.move_51","id":"pc004","index":0,"rule":"promote_capture"}
+{"fn":"obj.move_x_52","id":"pc005","index":0,"rule":"promote_capture"}
+{"fn":"obj.move_y_53","id":"pc006","index":0,"rule":"promote_capture"}
 {"id":"c9a","rule":"fold"}
 {"id":"c9b","rule":"merge_blocks"}
 {"id":"c9c","rule":"dce"}

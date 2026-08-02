@@ -20,6 +20,15 @@
 //! tuples across all slots*, not per slot: sorting each slot independently
 //! would lose the correlation between fields and would call two genuinely
 //! different state sets equal.
+//!
+//! One exception to "the representation must not change", and it is worth being
+//! explicit about because more will follow: **a closure capture is observed by
+//! the value it denotes, not by the identity of the box holding it.** See
+//! `unbox_closure_captures`. `promote_capture` removes those boxes on purpose,
+//! and stage C will remove more heap cells still, so the premise that the
+//! cross-frame heap graph is literally invariant does not survive the rewrite
+//! sequence. Each place it is relaxed has to be narrow, stated, and applied to
+//! both sides.
 
 use anyhow::{Context, Result};
 use std::collections::BTreeSet;
@@ -114,10 +123,61 @@ impl StateObservation {
     }
 }
 
-/// Canonical observation of one state. GCs a copy first, so heap ids are
-/// deterministic.
+/// Observe a closure's capture by the value it *denotes*, not by the identity
+/// of the box holding it.
+///
+/// A Lua local that a closure captures is mutable, so the frontend gives it a
+/// heap cell and the closure captures a pointer to that cell. `promote_capture`
+/// removes the box where it is written once, which is a deliberate change to the
+/// cross-frame heap graph - the box was reachable only from the closure, so
+/// afterwards `gc` drops it and the heap is one cell smaller. Compared naively,
+/// every such rewrite reads as a divergence.
+///
+/// So both sides are normalised first: a capture that points at a cell holding a
+/// value is replaced by that value, and the now-unreferenced box disappears in
+/// the `gc` that follows. This is the one place the observation is deliberately
+/// blind to a representation difference, and it is exactly the difference the
+/// rule claims to make. It stays sensitive to *what* is captured - a capture
+/// pointed at the wrong thing still shows up, because the denoted values differ.
+///
+/// Deliberately single-level: a box holding a pointer to another box is not
+/// unwrapped. That direction is safe - failing to normalise can only produce a
+/// spurious divergence, never a spurious pass.
+fn unbox_closure_captures(state: &mut State) {
+    let mut updates: Vec<(crate::interpreter::heap::HeapId, HeapValue)> = Vec::new();
+    for i in 0..state.heap.len() {
+        let id = crate::interpreter::heap::HeapId::from_raw(i);
+        let Some(HeapValue::Closure(name, captures)) = state.heap.get_opt(id) else {
+            continue;
+        };
+        let mut changed = false;
+        let unboxed: Vec<Value> = captures
+            .iter()
+            .map(|capture| {
+                let Value::Pointer(target) = capture else { return capture.clone() };
+                match state.heap.get_opt(*target) {
+                    Some(HeapValue::Value(value)) => {
+                        changed = true;
+                        value.clone()
+                    }
+                    _ => capture.clone(),
+                }
+            })
+            .collect();
+        if changed {
+            updates.push((id, HeapValue::Closure(name.clone(), unboxed)));
+        }
+    }
+    for (id, value) in updates {
+        state.heap.set(id, value);
+    }
+}
+
+/// Canonical observation of one state. Normalises closure captures and GCs a
+/// copy first, so heap ids are deterministic.
 pub fn observe_state(state: &State) -> StateObservation {
     let mut state = state.clone();
+    unbox_closure_captures(&mut state);
     state.gc();
 
     let mut structure = Vec::with_capacity(state.heap.len());

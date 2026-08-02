@@ -61,7 +61,8 @@ enum Command {
     /// output is a suggestion, and only survives if the rule's verifier accepts
     /// it. Pipe it into the recipe and re-run `build`.
     Suggest {
-        /// What to look for: "promote-cell", "inline" or "if-convert".
+        /// What to look for: "promote-cell", "promote-capture", "inline" or
+        /// "if-convert".
         #[arg(default_value = "promote-cell")]
         what: String,
         /// Prefix for the generated ids.
@@ -397,6 +398,28 @@ fn main() -> Result<()> {
                         }
                     }
                     eprintln!("# {} if-convertible join(s)", n);
+                }
+                "promote-capture" => {
+                    let mut total_sites = 0;
+                    for (function, index, sites) in
+                        celeste_rust::rewrite::rules::promote_capture::candidates(&program)
+                    {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "id": format!("{}{:03}", prefix, n),
+                                "rule": "promote_capture",
+                                "fn": function,
+                                "index": index,
+                            })
+                        );
+                        n += 1;
+                        total_sites += sites;
+                    }
+                    eprintln!(
+                        "# {} promotable capture(s) over {} creation site(s)",
+                        n, total_sites
+                    );
                 }
                 other => return Err(anyhow!("unknown suggestion kind {:?}", other)),
             }
