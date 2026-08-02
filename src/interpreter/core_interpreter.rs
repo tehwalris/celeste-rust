@@ -123,6 +123,22 @@ impl<'a> CoreInterpreter<'a> {
                 }
                 Ok(None)
             }
+            Instruction::AssertPointer { value } => {
+                match self.state.local_env.get(*value) {
+                    Value::Pointer(_) => Ok(None),
+                    Value::NilPointer(hint) => Err(anyhow!(
+                        "AssertPointer({}) failed: it is nil ({}). A rewrite claimed this \
+                         always exists by the time it is read.",
+                        usize::from(*value),
+                        hint
+                    )),
+                    other => Err(anyhow!(
+                        "AssertPointer({}) failed: expected a pointer, got {:?}",
+                        usize::from(*value),
+                        other
+                    )),
+                }
+            }
             Instruction::GetGlobal {
                 name,
                 create_if_missing,

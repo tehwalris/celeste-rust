@@ -61,8 +61,8 @@ enum Command {
     /// output is a suggestion, and only survives if the rule's verifier accepts
     /// it. Pipe it into the recipe and re-run `build`.
     Suggest {
-        /// What to look for: "promote-cell", "promote-capture", "inline" or
-        /// "if-convert".
+        /// What to look for: "promote-cell", "promote-capture", "inline",
+        /// "if-convert" or "demote-create".
         #[arg(default_value = "promote-cell")]
         what: String,
         /// Prefix for the generated ids.
@@ -467,6 +467,44 @@ fn main() -> Result<()> {
                             }
                         }
                     }
+                    // Per-triangle blocker *sets*, not per-instruction counts.
+                    // A triangle is unblocked only when its last blocker goes,
+                    // so the counts above say what work exists while this says
+                    // what would actually pay: 46 `create` accessors were
+                    // demoted and not one triangle came free, because each
+                    // still had the `store` that followed it.
+                    let mut by_set: std::collections::BTreeMap<String, usize> =
+                        Default::default();
+                    for (_, fun) in &program.functions {
+                        for (_, reasons) in
+                            celeste_rust::rewrite::rules::if_convert::blockers(fun)
+                        {
+                            let mut kinds: Vec<String> = reasons
+                                .iter()
+                                .map(|r| {
+                                    let mut k = r
+                                        .split_whitespace()
+                                        .next()
+                                        .unwrap_or("?")
+                                        .to_string();
+                                    if r.ends_with(" create") {
+                                        k.push_str(" create");
+                                    }
+                                    k
+                                })
+                                .collect();
+                            kinds.sort();
+                            kinds.dedup();
+                            *by_set.entry(kinds.join(" + ")).or_default() += 1;
+                        }
+                    }
+                    eprintln!("#");
+                    eprintln!("# blocked triangles by the *set* of things in the way:");
+                    let mut sets: Vec<_> = by_set.into_iter().collect();
+                    sets.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+                    for (set, count) in sets {
+                        eprintln!("#   {:>6}  {}", count, set);
+                    }
                     eprintln!("# {} if-convertible join(s)", n);
                     eprintln!(
                         "# {} more triangle(s) blocked by unspeculatable arms:",
@@ -477,6 +515,30 @@ fn main() -> Result<()> {
                     for (kind, count) in kinds {
                         eprintln!("#   {:>6}  {}", count, kind);
                     }
+                }
+                "demote-create" => {
+                    let candidates =
+                        celeste_rust::rewrite::rules::demote_create::candidates(&program);
+                    for (i, (function, at)) in candidates.iter().enumerate() {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "id": format!("{}{:03}", prefix, i),
+                                "rule": "demote_create",
+                                "fn": function,
+                                "at": format!("%{}", usize::from(*at)),
+                            })
+                        );
+                    }
+                    eprintln!(
+                        "# {} creating accessor(s) blocking an if_convert triangle.",
+                        candidates.len()
+                    );
+                    eprintln!(
+                        "# Each is a claim about the run, not a theorem. Screen at the depth \
+                         the result will be used at:"
+                    );
+                    eprintln!("#   the field creations that do happen fall in 2 frames out of 34.");
                 }
                 "promote-capture" => {
                     let mut total_sites = 0;

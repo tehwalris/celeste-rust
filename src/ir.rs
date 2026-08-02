@@ -234,6 +234,25 @@ pub enum Instruction {
         fun_def: GlobalId,
         captures: Vec<LocalId>,
     },
+    /// Fails unless `value` is a real pointer rather than a `NilPointer`.
+    ///
+    /// The guard behind `rules::demote_create`. Turning `get_field %r.f create`
+    /// into a plain read is only valid where the field already exists; where it
+    /// does not, the read yields a `NilPointer` and the rewritten program would
+    /// differ from the original. This says so out loud at the point the claim is
+    /// made, rather than leaving it to whatever happens to dereference the
+    /// result later.
+    ///
+    /// A `NilPointer` carries a hint describing what was missing (`field x`,
+    /// `global y`), so the failure needs no extra data in the instruction to
+    /// explain itself.
+    ///
+    /// Cheap at runtime for the same reason `AssertClosure` is: whether a field
+    /// exists is a property of the state's heap, not of a lane, so this is one
+    /// tag check per state and it never splits the state set.
+    AssertPointer {
+        value: LocalId,
+    },
 }
 
 impl Instruction {
@@ -315,6 +334,7 @@ impl Instruction {
                 fun_def: fun_def.clone(),
                 captures: captures.iter().map(|id| f(*id)).collect(),
             },
+            Self::AssertPointer { value } => Self::AssertPointer { value: f(*value) },
         }
     }
 }
@@ -359,6 +379,7 @@ impl Instruction {
                 v.extend(captures.iter().copied());
                 v
             }
+            Self::AssertPointer { value } => vec![*value],
         }
     }
 
@@ -386,9 +407,9 @@ impl Instruction {
             | Self::BinaryOp { .. }
             | Self::Select { .. }
             | Self::Phi { .. } => false,
-            // Not a side effect on the heap, but it must never be optimised
-            // away: its whole purpose is to fail.
-            Self::AssertClosure { .. } => true,
+            // Not a side effect on the heap, but they must never be optimised
+            // away: their whole purpose is to fail.
+            Self::AssertClosure { .. } | Self::AssertPointer { .. } => true,
         }
     }
 }

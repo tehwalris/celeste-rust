@@ -90,6 +90,7 @@ fn instruction_type_name(instr: &Instruction) -> String {
         Instruction::AssertClosure { fun_def, .. } => {
             format!("AssertClosure({})", fun_def.as_str())
         }
+        Instruction::AssertPointer { .. } => "AssertPointer".to_string(),
         Instruction::GetGlobal { name, .. } => format!("GetGlobal({})", name),
         Instruction::Load { .. } => "Load".to_string(),
         Instruction::Store { .. } => "Store".to_string(),

@@ -28,6 +28,7 @@ pub mod if_convert;
 pub mod fold;
 pub mod cse;
 pub mod dce;
+pub mod demote_create;
 pub mod merge_blocks;
 pub mod inline;
 pub mod promote_capture;

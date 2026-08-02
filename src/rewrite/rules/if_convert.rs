@@ -72,6 +72,15 @@ pub fn is_speculatable(instr: &Instruction) -> bool {
         // Exists in order to fail; speculating it would fail on lanes that
         // never reached the call.
         Instruction::AssertClosure { .. } => false,
+        // Speculatable, unlike `AssertClosure`, and for a specific reason.
+        // What it checks is whether a field exists, and that is a property of
+        // the state's heap rather than of a lane: within one state the answer
+        // is the same whichever arm ran. So running it on lanes that would
+        // have taken the other edge can only fail if the field is genuinely
+        // absent - which is exactly what the `demote_create` entry that
+        // inserted it already claims never happens here. One premise, checked
+        // once, by screening. Speculating it is not a second assumption.
+        Instruction::AssertPointer { .. } => true,
         // These mutate the heap when the field is missing.
         Instruction::GetGlobal { create_if_missing, .. }
         | Instruction::GetField { create_if_missing, .. }
@@ -118,6 +127,26 @@ pub fn triangle_at(cfg: &Cfg, join: &Label) -> Option<Triangle> {
 /// `get_field create` are heap traffic and belong to `promote_cell`, a `call` is
 /// a builtin that would need its own guard, an `alloc` changes `StateShape`.
 pub fn blockers(fun: &crate::ir::FunDef) -> Vec<(Label, Vec<String>)> {
+    blocking_instructions(fun)
+        .into_iter()
+        .map(|(label, instructions)| {
+            (
+                label,
+                instructions
+                    .iter()
+                    .map(|(_, i)| super::super::print::format_instruction(i))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// The same thing with the ids kept, so a rule can be aimed at exactly the
+/// instructions that are in the way rather than at every instruction of its
+/// kind in the program. `demote_create` is the first caller: of the ~1400
+/// `create` accessors in the program only these are worth the risk of
+/// demoting, because only these unblock anything.
+pub fn blocking_instructions(fun: &crate::ir::FunDef) -> Vec<(Label, Vec<(LocalId, Instruction)>)> {
     let mut out = Vec::new();
     for label in fun.cfg.named.keys() {
         if find_triangle(&fun.cfg, label, true).is_some() {
@@ -125,14 +154,14 @@ pub fn blockers(fun: &crate::ir::FunDef) -> Vec<(Label, Vec<String>)> {
         }
         let Some(triangle) = find_triangle(&fun.cfg, label, false) else { continue };
         let Some(arm) = get_block(&fun.cfg, &Some(triangle.arm)) else { continue };
-        let reasons: Vec<String> = arm
+        let blocking: Vec<(LocalId, Instruction)> = arm
             .instructions
             .iter()
             .filter(|(_, i)| !is_speculatable(i))
-            .map(|(_, i)| super::super::print::format_instruction(i))
+            .cloned()
             .collect();
-        if !reasons.is_empty() {
-            out.push((label.clone(), reasons));
+        if !blocking.is_empty() {
+            out.push((label.clone(), blocking));
         }
     }
     out.sort_by_key(|(l, _)| l.as_str().to_string());

@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use super::program::Program;
 use super::rules::{
-    allocate_slots, cse, dce, fold, if_convert, inline, merge_blocks, promote_capture, promote_cell,
+    allocate_slots, cse, dce, demote_create, fold, if_convert, inline, merge_blocks,
+    promote_capture, promote_cell,
 };
 use crate::ir::LocalId;
 use super::validate::{validate_function, validate_program};
@@ -85,6 +86,16 @@ pub enum Rule {
         /// Which capture position, counting from 0.
         index: usize,
     },
+    /// Turn one creating accessor into a plain read, guarded by an
+    /// `assert_pointer`. Not semantics-preserving: it claims the field already
+    /// exists there, and the guard is what makes a wrong claim loud instead of
+    /// silent. Screen at full depth - see the rule's docs.
+    DemoteCreate {
+        #[serde(rename = "fn")]
+        function: String,
+        /// The accessor, as `%N`.
+        at: String,
+    },
     /// Replace one non-escaping, single-store heap cell with SSA values.
     PromoteCell {
         #[serde(rename = "fn")]
@@ -105,6 +116,7 @@ impl Rule {
             Rule::Inline { .. } => "inline",
             Rule::IfConvert { .. } => "if_convert",
             Rule::PromoteCapture { .. } => "promote_capture",
+            Rule::DemoteCreate { .. } => "demote_create",
             Rule::PromoteCell { .. } => "promote_cell",
         }
     }
@@ -241,6 +253,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::PromoteCapture { function, index } => {
             promote_capture::apply(program, function, *index)
         }
+        Rule::DemoteCreate { function, at } => {
+            demote_create::apply(program, function, parse_cell(at)?)
+        }
         Rule::PromoteCell { function, cell } => {
             promote_cell::apply(program, function, parse_cell(cell)?)
         }
@@ -298,6 +313,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         }
         Rule::PromoteCapture { function, index } => {
             promote_capture::verify(&before, program, function, *index)
+        }
+        Rule::DemoteCreate { function, at } => {
+            demote_create::verify(&before, program, function, parse_cell(at)?)
         }
         Rule::PromoteCell { function, cell } => {
             promote_cell::verify(&before, program, function, parse_cell(cell)?)

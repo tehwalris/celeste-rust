@@ -100,6 +100,9 @@ pub fn format_instruction(instr: &Instruction) -> String {
             n(*if_true),
             n(*if_false)
         ),
+        Instruction::AssertPointer { value } => {
+            format!("assert_pointer {}", n(*value))
+        }
         Instruction::AssertClosure { value, fun_def, captures } => format!(
             "assert_closure {} is {}{}",
             n(*value),
