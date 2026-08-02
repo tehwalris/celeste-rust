@@ -32,6 +32,7 @@ pub mod cse;
 pub mod dce;
 pub mod decompose_truthy;
 pub mod demote_create;
+pub mod mask_loop;
 pub mod merge_blocks;
 pub mod pin_builtin;
 pub mod inline;

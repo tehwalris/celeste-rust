@@ -78,6 +78,29 @@
 //! it refuses operands of different representations loudly rather than
 //! widening them.
 //!
+//! # Diamonds: serializing two regions
+//!
+//! With an explicit `join` in the recipe entry, the head may branch to *two*
+//! regions that meet at that join - the shape the `or`-shortcircuit's
+//! "skip to `true`" arm leaves behind once everything around it is eager:
+//!
+//! ```text
+//!   H:  br %c ? A : B          H:  br A
+//!   A:  ..region..        =>   A:  ..region, untouched..
+//!   Xa: br J                   Xa: br B                <- serialized
+//!   B:  ..region..             B:  ..region, untouched..
+//!   Xb: br J                   Xb: br J
+//!   J:  %p = phi [Xa: va,      J:  %p = select %c ? va : vb
+//!               Xb: vb]
+//! ```
+//!
+//! Both regions run, in sequence - the named arm first - and the join picks
+//! per lane. Every obligation applies to each region separately (purity,
+//! single entry, one exit, termination), the regions must be disjoint, and
+//! `B`'s entry block must have no phis: its predecessor changes from the
+//! head to `Xa`, which would dangle a phi edge. Pure regions commute, so
+//! the order is only a convention.
+//!
 //! # What this rule refuses, deliberately
 //!
 //! Anything with a store, call, alloc or creating accessor in the region;
@@ -101,18 +124,27 @@ use super::{predecessors, require, LocalIdAllocator};
 
 /// The bound every speculated loop is guarded against: a counter that stays
 /// `<= bound < 32767` can be incremented by 1 without wrapping.
-const BOUND_LIMIT: i16 = 32767;
+pub(super) const BOUND_LIMIT: i16 = 32767;
 
-/// One phi at the join, and the values it carries on the two edges.
+/// One phi at the join, and the values it carries on the two edges. For a
+/// triangle, `other_value` comes in on the head's edge; for a diamond, on
+/// the second region's exit edge. `exit_value` is always the named arm's.
 struct JoinPhi {
     id: LocalId,
-    head_value: LocalId,
+    other_value: LocalId,
     exit_value: LocalId,
+}
+
+/// Diamond mode: the second region's entry (the head's other branch target)
+/// and the named arm's exit, whose terminator is rewired into it.
+struct Serialize {
+    other: Label,
+    arm_exit: Label,
 }
 
 /// One cycle in the region, reduced to the fact the guard needs: the bound
 /// local and where it is defined.
-struct LoopBound {
+pub(super) struct LoopBound {
     bound: LocalId,
     /// `None` is the entry block.
     def_block: Option<Label>,
@@ -128,9 +160,11 @@ struct Site {
     join_phis: Vec<JoinPhi>,
     /// One entry per distinct bound local, ordered by (block, index).
     bounds: Vec<LoopBound>,
+    /// Present iff this is a diamond (an explicit `join` was given).
+    serialize: Option<Serialize>,
 }
 
-fn defining_site(fun: &FunDef, id: LocalId) -> Option<(Option<Label>, usize)> {
+pub(super) fn defining_site(fun: &FunDef, id: LocalId) -> Option<(Option<Label>, usize)> {
     for (index, (candidate, _)) in fun.cfg.entry.instructions.iter().enumerate() {
         if *candidate == id {
             return Some((None, index));
@@ -146,7 +180,7 @@ fn defining_site(fun: &FunDef, id: LocalId) -> Option<(Option<Label>, usize)> {
     None
 }
 
-fn defining_instruction<'a>(fun: &'a FunDef, id: LocalId) -> Option<&'a Instruction> {
+pub(super) fn defining_instruction<'a>(fun: &'a FunDef, id: LocalId) -> Option<&'a Instruction> {
     let (key, index) = defining_site(fun, id)?;
     let block = match &key {
         None => &fun.cfg.entry,
@@ -212,7 +246,7 @@ fn flood_fill(
 
 /// Back-edges of the region: DFS from `arm` (staying inside the region),
 /// reporting edges to a block currently on the DFS stack.
-fn back_edges(fun: &FunDef, region: &[Label], arm: &Label) -> Vec<(Label, Label)> {
+pub(super) fn back_edges(fun: &FunDef, region: &[Label], arm: &Label) -> Vec<(Label, Label)> {
     let in_region: FxHashSet<&Label> = region.iter().collect();
     let mut edges: Vec<(Label, Label)> = Vec::new();
     let mut finished: FxHashSet<Label> = FxHashSet::default();
@@ -276,7 +310,7 @@ fn natural_loop(
 }
 
 /// The termination shape of one back-edge, or why it does not have it.
-fn loop_bound(
+pub(super) fn loop_bound(
     fun: &FunDef,
     region: &[Label],
     latch: &Label,
@@ -401,7 +435,13 @@ fn loop_bound(
     Ok(*bound)
 }
 
-fn site(fun: &FunDef, function: &str, head: &Label, arm: &Label) -> Result<Site> {
+fn site(
+    fun: &FunDef,
+    function: &str,
+    head: &Label,
+    arm: &Label,
+    join_override: Option<&Label>,
+) -> Result<Site> {
     let head_block = fun.cfg.named.get(head).ok_or_else(|| {
         anyhow!("no block named '{}' in {}", head.as_str(), function)
     })?;
@@ -424,9 +464,23 @@ fn site(fun: &FunDef, function: &str, head: &Label, arm: &Label) -> Result<Site>
             ))
         }
     };
-    let join = if arm_is_true { false_target } else { true_target }.clone();
+    let other = if arm_is_true { false_target } else { true_target }.clone();
+    let join = match join_override {
+        None => other.clone(),
+        Some(j) => {
+            require(
+                j != &other,
+                format!(
+                    "'{}' is the head's other branch target already; drop the \
+                     join field for a triangle",
+                    j.as_str()
+                ),
+            )?;
+            j.clone()
+        }
+    };
     require(
-        &join != head && arm != head,
+        &join != head && arm != head && &other != head,
         format!("'{}' branches to itself", head.as_str()),
     )?;
 
@@ -446,65 +500,132 @@ fn site(fun: &FunDef, function: &str, head: &Label, arm: &Label) -> Result<Site>
         ),
     )?;
 
-    // Single entry: nothing outside the region reaches it, except the head's
-    // edge into the arm.
-    let preds = predecessors(&fun.cfg);
-    let in_region: FxHashSet<&Label> = region.iter().collect();
-    for label in &region {
-        for pred in preds.get(&Some(label.clone())).into_iter().flatten() {
-            let allowed = match pred {
-                Some(pred_label) => {
-                    in_region.contains(pred_label) || (label == arm && pred_label == head)
-                }
-                None => false,
+    // Diamond mode: the head's other target grows its own region, with the
+    // same obligations, plus two of its own: the regions are disjoint, and
+    // the second entry has no phis (its predecessor changes from the head to
+    // the first region's exit, which would dangle a phi edge).
+    let (serialize, other_exit) = match join_override {
+        None => (None, None),
+        Some(_) => {
+            let (region_b, exits_b) = flood_fill(fun, head, &other, &join)?;
+            let [exit_b] = exits_b.as_slice() else {
+                return Err(anyhow!(
+                    "the second region must leave through exactly one block, \
+                     found {:?}",
+                    exits_b.iter().map(|l| l.as_str()).collect::<Vec<_>>()
+                ));
             };
+            let exit_b_terminator = fun.cfg.named[exit_b].terminator_kind();
             require(
-                allowed,
+                matches!(exit_b_terminator, Terminator::UnconditionalBranch { target } if target == &join),
                 format!(
-                    "region block '{}' is reachable from outside the region",
-                    label.as_str()
+                    "the second exit '{}' must branch unconditionally to the join",
+                    exit_b.as_str()
                 ),
             )?;
-        }
-    }
-
-    // Purity: everything in the region must be safe to run on lanes that
-    // used to skip it. Phis are allowed on top of `is_speculatable`: they
-    // only merge region-internal paths (single entry), and no edge changes.
-    for label in &region {
-        for (id, instr) in &fun.cfg.named[label].instructions {
+            let in_a: FxHashSet<&Label> = region.iter().collect();
+            for label in &region_b {
+                require(
+                    !in_a.contains(label),
+                    format!(
+                        "the two regions overlap at '{}'",
+                        label.as_str()
+                    ),
+                )?;
+            }
             require(
-                matches!(instr, Instruction::Phi { .. }) || is_speculatable(instr),
+                !fun.cfg.named[&other]
+                    .instructions
+                    .iter()
+                    .any(|(_, i)| matches!(i, Instruction::Phi { .. })),
                 format!(
-                    "%{} in region block '{}' is not speculatable: {}",
-                    usize::from(*id),
-                    label.as_str(),
-                    format_instruction(instr)
+                    "the second region's entry '{}' has phis, whose head edge \
+                     would dangle after serialization",
+                    other.as_str()
                 ),
             )?;
+            (
+                Some(Serialize { other: other.clone(), arm_exit: exit.clone() }),
+                Some((region_b, exit_b.clone())),
+            )
         }
-    }
+    };
 
-    // Termination: every cycle must have the guarded counter shape.
+    // Single entry, purity and termination, per region. Phis are allowed on
+    // top of `is_speculatable`: they only merge region-internal paths
+    // (single entry), and no edge changes.
+    let preds = predecessors(&fun.cfg);
+    let regions: Vec<(&[Label], &Label)> = match &other_exit {
+        None => vec![(region.as_slice(), arm)],
+        Some((region_b, _)) => {
+            vec![(region.as_slice(), arm), (region_b.as_slice(), &other)]
+        }
+    };
     let mut bounds: Vec<LoopBound> = Vec::new();
-    for (latch, header) in back_edges(fun, &region, arm) {
-        let bound = loop_bound(fun, &region, &latch, &header)?;
-        if bounds.iter().any(|b| b.bound == bound) {
-            continue;
+    for (blocks, entry) in &regions {
+        let in_region: FxHashSet<&Label> = blocks.iter().collect();
+        for label in *blocks {
+            for pred in preds.get(&Some(label.clone())).into_iter().flatten() {
+                let allowed = match pred {
+                    Some(pred_label) => {
+                        in_region.contains(pred_label)
+                            || (&label == entry && pred_label == head)
+                    }
+                    None => false,
+                };
+                require(
+                    allowed,
+                    format!(
+                        "region block '{}' is reachable from outside the region",
+                        label.as_str()
+                    ),
+                )?;
+            }
         }
-        let (def_block, def_index) = defining_site(fun, bound).unwrap();
-        bounds.push(LoopBound { bound, def_block, def_index });
+        for label in *blocks {
+            for (id, instr) in &fun.cfg.named[label].instructions {
+                require(
+                    matches!(instr, Instruction::Phi { .. }) || is_speculatable(instr),
+                    format!(
+                        "%{} in region block '{}' is not speculatable: {}",
+                        usize::from(*id),
+                        label.as_str(),
+                        format_instruction(instr)
+                    ),
+                )?;
+            }
+        }
+        for (latch, header) in back_edges(fun, blocks, entry) {
+            let bound = loop_bound(fun, blocks, &latch, &header)?;
+            if bounds.iter().any(|b| b.bound == bound) {
+                continue;
+            }
+            let (def_block, def_index) = defining_site(fun, bound).unwrap();
+            // An earlier entry may have guarded this bound already - regions
+            // converted one gate at a time overlap in their loops. The guard
+            // is recognised by its exact three-instruction shape, so this
+            // never skips anything weaker than what it would emit.
+            if already_guarded(fun, bound, &def_block, def_index) {
+                continue;
+            }
+            bounds.push(LoopBound { bound, def_block, def_index });
+        }
     }
     bounds.sort_by_key(|b| (b.def_block.clone(), b.def_index));
 
-    // The join: exactly the head and the exit as predecessors, and every phi
-    // carries exactly those two edges.
+    // The join: exactly the two rewritten edges as predecessors, and every
+    // phi carries exactly those two. For a triangle that is the head and the
+    // exit; for a diamond, the two exits.
+    let other_edge: Label = match &other_exit {
+        None => head.clone(),
+        Some((_, exit_b)) => exit_b.clone(),
+    };
     let join_preds = preds.get(&Some(join.clone())).cloned().unwrap_or_default();
     let mut sorted_preds: Vec<&Option<Label>> = join_preds.iter().collect();
     sorted_preds.sort();
     sorted_preds.dedup();
     let expected: Vec<Option<Label>> = {
-        let mut v = vec![Some(head.clone()), Some(exit.clone())];
+        let mut v = vec![Some(other_edge.clone()), Some(exit.clone())];
         v.sort();
         v
     };
@@ -514,9 +635,11 @@ fn site(fun: &FunDef, function: &str, head: &Label, arm: &Label) -> Result<Site>
             && sorted_preds[1] == &expected[1]
             && join_preds.len() == 2,
         format!(
-            "the join '{}' must have exactly the head and the exit as \
+            "the join '{}' must have exactly '{}' and the exit '{}' as \
              predecessors",
-            join.as_str()
+            join.as_str(),
+            other_edge.as_str(),
+            exit.as_str()
         ),
     )?;
     let mut join_phis: Vec<JoinPhi> = Vec::new();
@@ -546,7 +669,7 @@ fn site(fun: &FunDef, function: &str, head: &Label, arm: &Label) -> Result<Site>
         )?;
         join_phis.push(JoinPhi {
             id: *id,
-            head_value: of(head)?,
+            other_value: of(&other_edge)?,
             exit_value: of(exit)?,
         });
     }
@@ -557,29 +680,60 @@ fn site(fun: &FunDef, function: &str, head: &Label, arm: &Label) -> Result<Site>
         join,
         join_phis,
         bounds,
+        serialize,
     })
 }
 
-/// The select a join phi becomes: the region-side value on the edge the arm
-/// owns, the head-side value on the other.
+/// The select a join phi becomes: the named arm's value on the edge the arm
+/// owns, the other value (head side, or second region) on the other.
 fn select_for(site: &Site, phi: &JoinPhi) -> Instruction {
     if site.arm_is_true {
         Instruction::Select {
             condition: site.condition,
             if_true: phi.exit_value,
-            if_false: phi.head_value,
+            if_false: phi.other_value,
         }
     } else {
         Instruction::Select {
             condition: site.condition,
-            if_true: phi.head_value,
+            if_true: phi.other_value,
             if_false: phi.exit_value,
         }
     }
 }
 
+/// Does the exact guard this rule would emit already follow the bound's
+/// definition? True iff the next three instructions are the limit constant,
+/// the compare against this bound, and the `assert_true` - the shape
+/// `guard_for` emits, on any ids.
+pub(super) fn already_guarded(
+    fun: &FunDef,
+    bound: LocalId,
+    def_block: &Option<Label>,
+    def_index: usize,
+) -> bool {
+    let block = match def_block {
+        None => &fun.cfg.entry,
+        Some(label) => &fun.cfg.named[label],
+    };
+    let Some(window) = block.instructions.get(def_index + 1..def_index + 4) else {
+        return false;
+    };
+    let [(limit_id, limit), (cmp_id, cmp), (_, assert)] = window else {
+        return false;
+    };
+    matches!(
+        limit,
+        Instruction::NumberConstant { value } if *value == Pico8Num::from_i16(BOUND_LIMIT)
+    ) && matches!(
+        cmp,
+        Instruction::BinaryOp { left, op: BinaryOp::LessThan, right }
+            if *left == bound && right == limit_id
+    ) && matches!(assert, Instruction::AssertTrue { value } if value == cmp_id)
+}
+
 /// The three-instruction guard for one bound, with the given minted ids.
-fn guard_for(bound: LocalId, minted: &[LocalId; 3]) -> Vec<(LocalId, Instruction)> {
+pub(super) fn guard_for(bound: LocalId, minted: &[LocalId; 3]) -> Vec<(LocalId, Instruction)> {
     vec![
         (
             minted[0],
@@ -597,11 +751,18 @@ fn guard_for(bound: LocalId, minted: &[LocalId; 3]) -> Vec<(LocalId, Instruction
     ]
 }
 
-pub fn apply(program: &mut Program, function: &str, head: &str, arm: &str) -> Result<usize> {
+pub fn apply(
+    program: &mut Program,
+    function: &str,
+    head: &str,
+    arm: &str,
+    join: Option<&str>,
+) -> Result<usize> {
     let head = &Label::from(head.to_string());
     let arm = &Label::from(arm.to_string());
+    let join = join.map(|j| Label::from(j.to_string()));
     let fun = program.get(function)?;
-    let s = site(fun, function, head, arm)?;
+    let s = site(fun, function, head, arm, join.as_ref())?;
     let mut alloc = LocalIdAllocator::for_function(fun);
     let minted: Vec<[LocalId; 3]> = s
         .bounds
@@ -614,6 +775,14 @@ pub fn apply(program: &mut Program, function: &str, head: &str, arm: &str) -> Re
     // The head's branch becomes an unconditional jump into the region.
     let head_block = fun.cfg.named.get_mut(head).unwrap();
     head_block.terminator.1 = Terminator::UnconditionalBranch { target: arm.clone() };
+
+    // A diamond serializes: the named arm's exit continues into the second
+    // region instead of the join.
+    if let Some(ser) = &s.serialize {
+        let exit_block = fun.cfg.named.get_mut(&ser.arm_exit).unwrap();
+        exit_block.terminator.1 =
+            Terminator::UnconditionalBranch { target: ser.other.clone() };
+    }
 
     // The join's phis become selects.
     let join_block = fun.cfg.named.get_mut(&s.join).unwrap();
@@ -645,7 +814,10 @@ pub fn apply(program: &mut Program, function: &str, head: &str, arm: &str) -> Re
     // `allocate_slots` afterwards.
     fun.cfg.slots = std::sync::Arc::new(SlotMap::identity());
 
-    Ok(1 + s.join_phis.len() + 3 * s.bounds.len())
+    Ok(1
+        + s.serialize.is_some() as usize
+        + s.join_phis.len()
+        + 3 * s.bounds.len())
 }
 
 /// Independent check: re-derives the site from the before program, then
@@ -658,11 +830,13 @@ pub fn verify(
     function: &str,
     head: &str,
     arm: &str,
+    join: Option<&str>,
 ) -> Result<()> {
     let head = &Label::from(head.to_string());
     let arm = &Label::from(arm.to_string());
+    let join = join.map(|j| Label::from(j.to_string()));
     let before_fun = before.get(function)?;
-    let s = site(before_fun, function, head, arm)?;
+    let s = site(before_fun, function, head, arm, join.as_ref())?;
     let after_fun = after.get(function)?;
 
     require(
@@ -835,6 +1009,10 @@ pub fn verify(
         )?;
         let want_terminator = if key.as_ref() == Some(head) {
             Terminator::UnconditionalBranch { target: arm.clone() }
+        } else if let Some(ser) =
+            s.serialize.as_ref().filter(|ser| key.as_ref() == Some(&ser.arm_exit))
+        {
+            Terminator::UnconditionalBranch { target: ser.other.clone() }
         } else {
             before_block.terminator_kind().clone()
         };
@@ -867,7 +1045,7 @@ pub fn candidates(program: &Program) -> Vec<(String, Label, Label)> {
                 continue;
             }
             for arm in [true_target, false_target] {
-                if site(fun, function.as_str(), label, arm).is_ok() {
+                if site(fun, function.as_str(), label, arm, None).is_ok() {
                     out.push((
                         function.as_str().to_string(),
                         label.clone(),
@@ -1012,9 +1190,9 @@ mod tests {
     fn speculates_a_pure_loop_region() {
         let mut p = region_program();
         let before = p.clone();
-        let changed = apply(&mut p, "f", "h", "setup").unwrap();
+        let changed = apply(&mut p, "f", "h", "setup", None).unwrap();
         assert_eq!(changed, 1 + 1 + 3);
-        verify(&before, &p, "f", "h", "setup").unwrap();
+        verify(&before, &p, "f", "h", "setup", None).unwrap();
         let text = format_function(p.get("f").unwrap());
         assert!(text.contains("br setup"), "{}", text);
         assert!(!text.contains("br %10"), "{}", text);
@@ -1043,8 +1221,8 @@ mod tests {
             h.terminator.1 = br_if(10, "join", "setup");
         }
         let before = p.clone();
-        apply(&mut p, "f", "h", "setup").unwrap();
-        verify(&before, &p, "f", "h", "setup").unwrap();
+        apply(&mut p, "f", "h", "setup", None).unwrap();
+        verify(&before, &p, "f", "h", "setup", None).unwrap();
         let text = format_function(p.get("f").unwrap());
         assert!(
             text.contains("select %10 ? %19 : %17"),
@@ -1064,7 +1242,7 @@ mod tests {
                 Instruction::Store { target: id(13), source: id(16) },
             ));
         }
-        let error = apply(&mut p, "f", "h", "setup")
+        let error = apply(&mut p, "f", "h", "setup", None)
             .unwrap_err()
             .to_string();
         assert!(error.contains("not speculatable"), "{}", error);
@@ -1081,7 +1259,7 @@ mod tests {
                 .named
                 .insert(label("side"), block(vec![], 907, br("cont")));
         }
-        let error = apply(&mut p, "f", "h", "setup")
+        let error = apply(&mut p, "f", "h", "setup", None)
             .unwrap_err()
             .to_string();
         assert!(
@@ -1101,7 +1279,7 @@ mod tests {
             body.instructions[0].1 =
                 Instruction::BinaryOp { left: id(13), op: BinaryOp::Minus, right: id(20) };
         }
-        let error = apply(&mut p, "f", "h", "setup")
+        let error = apply(&mut p, "f", "h", "setup", None)
             .unwrap_err()
             .to_string();
         assert!(error.contains("counter + step"), "{}", error);
@@ -1118,7 +1296,7 @@ mod tests {
             let body = fun.cfg.named.get_mut(&label("loop_body")).unwrap();
             body.instructions.insert(0, bound);
         }
-        let error = apply(&mut p, "f", "h", "setup")
+        let error = apply(&mut p, "f", "h", "setup", None)
             .unwrap_err()
             .to_string();
         assert!(error.contains("defined inside the loop"), "{}", error);
@@ -1134,7 +1312,7 @@ mod tests {
                 .push((id(32), Instruction::BoolConstant { value: true }));
             cont.terminator.1 = br_if(32, "join", "loop_head");
         }
-        let error = apply(&mut p, "f", "h", "setup")
+        let error = apply(&mut p, "f", "h", "setup", None)
             .unwrap_err()
             .to_string();
         assert!(
@@ -1155,11 +1333,11 @@ mod tests {
                 .named
                 .insert(label("stray"), block(vec![], 908, br("join")));
         }
-        let error = apply(&mut p, "f", "h", "setup")
+        let error = apply(&mut p, "f", "h", "setup", None)
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("exactly the head and the exit"),
+            error.contains("must have exactly 'h' and the exit 'cont'"),
             "{}",
             error
         );
@@ -1169,14 +1347,14 @@ mod tests {
     fn verify_rejects_a_kept_branch() {
         let mut p = region_program();
         let before = p.clone();
-        apply(&mut p, "f", "h", "setup").unwrap();
+        apply(&mut p, "f", "h", "setup", None).unwrap();
         // Tamper: restore the branch but keep the selects and guards.
         {
             let fun = p.get_mut("f").unwrap();
             let h = fun.cfg.named.get_mut(&label("h")).unwrap();
             h.terminator.1 = br_if(10, "setup", "join");
         }
-        let error = verify(&before, &p, "f", "h", "setup")
+        let error = verify(&before, &p, "f", "h", "setup", None)
             .unwrap_err()
             .to_string();
         assert!(error.contains("terminator of 'h'"), "{}", error);
@@ -1186,7 +1364,7 @@ mod tests {
     fn verify_rejects_a_swapped_select() {
         let mut p = region_program();
         let before = p.clone();
-        apply(&mut p, "f", "h", "setup").unwrap();
+        apply(&mut p, "f", "h", "setup", None).unwrap();
         {
             let fun = p.get_mut("f").unwrap();
             let join = fun.cfg.named.get_mut(&label("join")).unwrap();
@@ -1196,7 +1374,7 @@ mod tests {
                 if_false: id(17),
             };
         }
-        let error = verify(&before, &p, "f", "h", "setup")
+        let error = verify(&before, &p, "f", "h", "setup", None)
             .unwrap_err()
             .to_string();
         assert!(error.contains("changed %18"), "{}", error);
@@ -1206,7 +1384,7 @@ mod tests {
     fn verify_rejects_a_missing_guard() {
         let mut p = region_program();
         let before = p.clone();
-        apply(&mut p, "f", "h", "setup").unwrap();
+        apply(&mut p, "f", "h", "setup", None).unwrap();
         {
             let fun = p.get_mut("f").unwrap();
             let setup = fun.cfg.named.get_mut(&label("setup")).unwrap();
@@ -1218,7 +1396,7 @@ mod tests {
         // The guard-position scan now reads pre-existing instructions where
         // the minted triple should be, which fails the freshness check - a
         // loud rejection either way.
-        let error = verify(&before, &p, "f", "h", "setup")
+        let error = verify(&before, &p, "f", "h", "setup", None)
             .unwrap_err()
             .to_string();
         assert!(error.contains("'setup'"), "{}", error);
@@ -1232,5 +1410,146 @@ mod tests {
             found,
             vec![("f".to_string(), label("h"), label("setup"))]
         );
+    }
+
+    /// entry -> h; h: br %10 ? a : b.
+    /// a: %11 = 1 -> join.   b: %12 = 2 -> join.
+    /// join: %18 = phi(a: %11, b: %12); return %18.
+    ///
+    /// The smallest diamond: both regions are single blocks that double as
+    /// their own exits.
+    fn diamond_program() -> Program {
+        let entry = block(vec![], 900, br("h"));
+        let h = block(
+            vec![(id(10), Instruction::BoolConstant { value: true })],
+            901,
+            br_if(10, "a", "b"),
+        );
+        let a = block(vec![(id(11), num(1))], 902, br("join"));
+        let b = block(vec![(id(12), num(2))], 903, br("join"));
+        let join = block(
+            vec![(
+                id(18),
+                Instruction::Phi {
+                    branches: vec![(label("a"), id(11)), (label("b"), id(12))],
+                },
+            )],
+            904,
+            Terminator::Return { value: Some(id(18)) },
+        );
+        let mut named = crate::ir::new_label_map();
+        named.insert(label("h"), h);
+        named.insert(label("a"), a);
+        named.insert(label("b"), b);
+        named.insert(label("join"), join);
+        let fun = FunDef {
+            name: GlobalId::from("f".to_string()),
+            capture_ids: vec![],
+            arg_ids: vec![],
+            cfg: Cfg::new(entry, named),
+            source_span: None,
+        };
+        let mut functions = IndexMap::new();
+        functions.insert(fun.name.clone(), fun);
+        Program { functions }
+    }
+
+    /// With an explicit join, both regions run in sequence - named arm
+    /// first - and the join picks per lane.
+    #[test]
+    fn serializes_a_diamond() {
+        let mut p = diamond_program();
+        let before = p.clone();
+        let changed = apply(&mut p, "f", "h", "a", Some("join")).unwrap();
+        assert_eq!(changed, 3); // head branch + exit rewire + one phi
+        verify(&before, &p, "f", "h", "a", Some("join")).unwrap();
+
+        let fun = p.get("f").unwrap();
+        assert_eq!(
+            fun.cfg.named[&label("h")].terminator_kind(),
+            &br("a"),
+        );
+        assert_eq!(fun.cfg.named[&label("a")].terminator_kind(), &br("b"));
+        assert_eq!(fun.cfg.named[&label("b")].terminator_kind(), &br("join"));
+        assert_eq!(
+            fun.cfg.named[&label("join")].instructions,
+            vec![(
+                id(18),
+                Instruction::Select {
+                    condition: id(10),
+                    if_true: id(11),
+                    if_false: id(12),
+                },
+            )],
+        );
+    }
+
+    /// Naming the second arm mirrors the serialization order and the select.
+    #[test]
+    fn serializes_a_diamond_from_the_false_arm() {
+        let mut p = diamond_program();
+        let before = p.clone();
+        apply(&mut p, "f", "h", "b", Some("join")).unwrap();
+        verify(&before, &p, "f", "h", "b", Some("join")).unwrap();
+        let fun = p.get("f").unwrap();
+        assert_eq!(fun.cfg.named[&label("h")].terminator_kind(), &br("b"));
+        assert_eq!(fun.cfg.named[&label("b")].terminator_kind(), &br("a"));
+        assert_eq!(
+            fun.cfg.named[&label("join")].instructions[0].1,
+            Instruction::Select {
+                condition: id(10),
+                if_true: id(11),
+                if_false: id(12),
+            },
+        );
+    }
+
+    /// A join that is the head's other branch target is a triangle wearing a
+    /// costume; the explicit field is refused so each shape has one spelling.
+    #[test]
+    fn refuses_a_join_that_names_the_triangle() {
+        let mut p = region_program();
+        let error = apply(&mut p, "f", "h", "setup", Some("join"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("drop the join field"), "{}", error);
+    }
+
+    /// The second region's entry must be phi-free: its predecessor changes.
+    #[test]
+    fn refuses_a_second_entry_with_phis() {
+        let mut p = diamond_program();
+        {
+            let fun = p.get_mut("f").unwrap();
+            let b = fun.cfg.named.get_mut(&label("b")).unwrap();
+            b.instructions.insert(
+                0,
+                (
+                    id(13),
+                    Instruction::Phi { branches: vec![(label("h"), id(10))] },
+                ),
+            );
+        }
+        let error = apply(&mut p, "f", "h", "a", Some("join"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("has phis"), "{}", error);
+    }
+
+    /// The verifier must reject an applier that forgot to serialize.
+    #[test]
+    fn verify_rejects_a_missing_serialization() {
+        let mut p = diamond_program();
+        let before = p.clone();
+        apply(&mut p, "f", "h", "a", Some("join")).unwrap();
+        {
+            let fun = p.get_mut("f").unwrap();
+            let a = fun.cfg.named.get_mut(&label("a")).unwrap();
+            a.terminator.1 = br("join");
+        }
+        let error = verify(&before, &p, "f", "h", "a", Some("join"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("terminator"), "{}", error);
     }
 }

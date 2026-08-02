@@ -696,4 +696,20 @@
 {"id":"g024","rule":"speculate","fn":"player.update_21","join":"if_join_160","guards":[{"load":"%528","store":"%522"}],"why":"the reload of this.spd crosses the store through spd.y; distinct unless this.spd == this, which the emitted assert_true checks at runtime"}
 {"id":"g025","rule":"absorb_stores","fn":"player.update_21","head":"and_or_join_153"}
 {"id":"g026","rule":"merge_blocks"}
+{"id":"g027","rule":"speculate_region","fn":"anonymous_61","head":"in_k1001_for_body_start_488","arm":"in_k1001_in_k009_and_or_continue_416"}
+{"id":"g028","rule":"speculate_region","fn":"anonymous_61","head":"in_k1001_in_k009_if_join_413","arm":"in_k1001_in_k009_and_or_continue_424"}
+{"id":"g029","rule":"speculate_region","fn":"anonymous_61","head":"in_k1001_in_k009_and_or_join_425","arm":"in_k1001_in_k009_and_or_continue_428"}
+{"id":"g030","rule":"speculate_region","fn":"anonymous_61","head":"in_k1000_in_k008_if_join_413","arm":"in_k1000_in_k008_and_or_continue_424"}
+{"id":"g031","rule":"speculate_region","fn":"anonymous_61","head":"in_k1000_in_k008_and_or_join_425","arm":"in_k1000_in_k008_and_or_continue_428"}
+{"id":"g032","rule":"speculate_region","fn":"anonymous_61","head":"in_k1001_in_k009_and_or_join_417","arm":"in_k1001_in_k009_and_or_continue_420"}
+{"id":"g033","rule":"speculate_region","fn":"anonymous_61","head":"in_k1001_in_k009_and_or_join_421","arm":"in_k1001_in_k009_if_body_412","join":"in_k1001_in_k009_cont"}
+{"id":"g034","rule":"demote_create","fn":"anonymous_61","at":"%345"}
+{"id":"g035","rule":"demote_create","fn":"anonymous_61","at":"%360"}
+{"id":"g036","rule":"demote_create","fn":"anonymous_61","at":"%365"}
+{"id":"g037","rule":"mask_loop","fn":"anonymous_61","head":"in_k1001_for_head_487","limit":8,"why":"move_y pixel loop; abs(amount) is bounded by the guard, 8 covers dash speed with margin"}
+{"id":"g038","rule":"demote_create","fn":"anonymous_61","at":"%174"}
+{"id":"g039","rule":"demote_create","fn":"anonymous_61","at":"%189"}
+{"id":"g040","rule":"demote_create","fn":"anonymous_61","at":"%194"}
+{"id":"g041","rule":"mask_loop","fn":"anonymous_61","head":"in_k1000_for_head_472","limit":8,"why":"move_x pixel loop, same bound argument as g037"}
+{"id":"g042","rule":"merge_blocks"}
 {"id":"s1","rule":"allocate_slots"}

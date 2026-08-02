@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 use super::program::Program;
 use super::rules::{
     absorb_stores, allocate_slots, convert_ternary, cse, dce, decompose_truthy, demote_create,
-    fold, if_convert, inline, merge_blocks, pin_builtin, promote_capture, promote_cell,
-    sink_store, speculate, speculate_region,
+    fold, if_convert, inline, mask_loop, merge_blocks, pin_builtin, promote_capture,
+    promote_cell, sink_store, speculate, speculate_region,
 };
 use crate::ir::LocalId;
 use super::validate::{validate_function, validate_program};
@@ -173,6 +173,28 @@ pub enum Rule {
         head: String,
         /// The region's entry: the branch target that is not the join.
         arm: String,
+        /// Diamond mode: where both branch targets' regions meet. The two
+        /// regions are serialized, named arm first, and this join's phis
+        /// become selects. Absent for a triangle, whose join is the head's
+        /// other branch target.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        join: Option<String>,
+    },
+    /// Give a loop with a per-lane trip count a uniform constant trip count:
+    /// the head branches on a fresh counter against `limit` (per-state
+    /// uniform, so it stops splitting), per-lane progress becomes mask data,
+    /// every latch/break store is masked, and the break edge is deleted. A
+    /// loud `assert_true(bound <= limit)` guard covers the claim that
+    /// `limit` iterations are enough. Screen at full depth.
+    MaskLoop {
+        #[serde(rename = "fn")]
+        function: String,
+        /// The loop header: exactly a counter phi, `counter <= bound`, and
+        /// the conditional branch on it.
+        head: String,
+        /// The uniform trip count. Iterations run for counters 0..=limit;
+        /// a state whose per-lane bound exceeds it fails loudly.
+        limit: i16,
     },
     /// Move a triangle arm's trailing store past the join: a guarded load
     /// before the branch, a phi at the join, the store after it. The
@@ -210,6 +232,7 @@ impl Rule {
             Rule::DecomposeTruthy { .. } => "decompose_truthy",
             Rule::Speculate { .. } => "speculate",
             Rule::SpeculateRegion { .. } => "speculate_region",
+            Rule::MaskLoop { .. } => "mask_loop",
             Rule::SinkStore { .. } => "sink_store",
             Rule::AbsorbStores { .. } => "absorb_stores",
             Rule::PromoteCell { .. } => "promote_cell",
@@ -389,8 +412,11 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::Speculate { function, join, arm, guards } => {
             speculate::apply(program, function, join, arm.as_deref(), &parse_guards(guards)?)
         }
-        Rule::SpeculateRegion { function, head, arm } => {
-            speculate_region::apply(program, function, head, arm)
+        Rule::SpeculateRegion { function, head, arm, join } => {
+            speculate_region::apply(program, function, head, arm, join.as_deref())
+        }
+        Rule::MaskLoop { function, head, limit } => {
+            mask_loop::apply(program, function, head, *limit)
         }
         Rule::AbsorbStores { function, head } => absorb_stores::apply(program, function, head),
         Rule::SinkStore { function, at } => {
@@ -469,8 +495,11 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::Speculate { function, join, arm, guards } => {
             speculate::verify(&before, program, function, join, arm.as_deref(), &parse_guards(guards)?)
         }
-        Rule::SpeculateRegion { function, head, arm } => {
-            speculate_region::verify(&before, program, function, head, arm)
+        Rule::SpeculateRegion { function, head, arm, join } => {
+            speculate_region::verify(&before, program, function, head, arm, join.as_deref())
+        }
+        Rule::MaskLoop { function, head, limit } => {
+            mask_loop::verify(&before, program, function, head, *limit)
         }
         Rule::AbsorbStores { function, head } => {
             absorb_stores::verify(&before, program, function, head)

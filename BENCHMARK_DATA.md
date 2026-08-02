@@ -35,6 +35,7 @@ not comparable.
 | + 2 diamonds absorbed (`absorb_stores`, `speculate` arms, `cse`) | 1.99 s / 0.64 GB | - |
 | + `is_solid` chains eager (`speculate_region` x9), consumers absorbed | 1.82 s / 0.62 GB | - |
 | + wall-jump stores absorbed (`speculate` with a pointer guard) | 1.78 s / 0.61 GB | - |
+| + pixel loops masked (`mask_loop` x2, a61 chains eager) | 1.59 s / 0.63 GB | - |
 
 The store-triangle row is the first change that moved the fragment count: 558
 -> 335 mean fragments per frame at frame 34, split executions 19573 -> 11978.
@@ -63,18 +64,27 @@ here that tracks distance to a compilable kernel.
 
 |  | original | rewritten |
 |---|---|---|
-| dynamic instrs/frame, mean | 2122 | 1719 |
-| dynamic instrs/frame, max | 6422 | 5190 |
-| distinct blocks reached | 450 | 304 |
-| K, fully unrolled | 8321 | 7308 |
-| K, loops kept as loops | 2963 | 3884 |
+| dynamic instrs/frame, mean | 2122 | 3635 |
+| dynamic instrs/frame, max | 6422 | 9075 |
+| distinct blocks reached | 450 | 286 |
+| K, fully unrolled | 8321 | 9755 |
+| K, loops kept as loops | 2963 | 3943 |
 
-By instruction kind, rewritten: heap 40.3%, arith 28.2%, terminator 9.1%,
-const 7.1%, global 5.7%, guard 3.9%, phi 3.7%, call 1.5%. `arith`, `const`
-and `select` are the core a compiled kernel emits; the rest has to reach
-zero. The region stage *lowered* K (7770 -> 7323 unrolled) despite running
-regions eagerly, because absorbing the consumers deleted whole arm blocks
-and their duplicated address arithmetic.
+By instruction kind, rewritten: heap 39.2%, arith 30.7%, const 7.7%,
+terminator 7.2%, guard 5.3%, global 5.0%, phi 3.4%, call 1.1%. `arith`,
+`const` and `select` are the core a compiled kernel emits; the rest has to
+reach zero. The region stage *lowered* K (7770 -> 7323 unrolled) despite
+running regions eagerly, because absorbing the consumers deleted whole arm
+blocks and their duplicated address arithmetic.
+
+The `mask_loop` stage then *raised* dynamic work on purpose - mean per-lane
+instructions 1719 -> 3635, since the masked pixel loops now run a constant
+9 iterations with eager bodies - and the frame still got 11% faster,
+because fragments are what cost, not instructions. Note which K bound
+matters now: with per-lane control flow gone from these loops, they can
+stay *rolled* in a compiled kernel too, so the loops-kept bound (3943) is
+the realistic kernel size, and "fully unrolled" (9755) mostly counts
+uniform table-loop iterations that never needed flattening.
 
 K and the frame time move independently, and the store-triangle conversions
 are a clean example: K rose by 11 (guards added, arms now run on every lane)
@@ -331,6 +341,38 @@ stage, and `if_join_136`'s arm holds the `btn(k_up/k_down)` reads. The
 guard machinery itself is the reusable part: any future load-across-store
 whose distinctness is real but unprovable is now one recipe field, not a
 new rule.
+
+**Update, after the pixel loops were masked** (`mask_loop` x2 on
+`anonymous_61`'s inlined `move_x`/`move_y`, their `is_solid` chains made
+eager first with 7 `speculate_region` entries - one of them the first
+*diamond* serialization - plus 6 `demote_create` and one `merge_blocks`):
+
+    branches: 2245 of 36925 executions split the state, across 16 distinct sites
+
+Frame 34: 1.78 s -> 1.59 s, fragments 102 -> 67 mean (614 -> 371 max),
+splits 4058 -> 2245. The loops themselves accounted for 626; the
+downstream multiplier paid the other ~1200: the hot `btn` pair 618 -> 393
+each, the dash diamond 648 -> 372, `and_or_join_126` 366 -> 228,
+`if_join_136` 231 -> 144, `if_body_135` 156 -> 102. `anonymous_61` no
+longer splits at all except a 9-split `__entry` exposure. The remainder:
+
+| family | splits | what it is |
+|---|---|---|
+| `btn` x6 (two 17-split sites woke) | 1261 | input fan-out |
+| `in_i1_074_cont` (= old `if_join_95`) | 372 | the outer dash diamond, convertible last |
+| `and_or_join_126`, `if_join_136`, `if_body_135` | 474 | jump/dash cluster, gated on object loops / `btn` |
+| `in_i1_068` x2 (`spikes_at` tile loops) | 96 | mask family, but its break calls `kill_player` |
+| `__main` `in_i1_012` x2, `anonymous_61` `__entry`, 1 tail site | ~42 | small exposures |
+
+`mask_loop` keeps the loop *rolled* and gives it a uniform constant trip
+count (`k <= 8`, per-state, never splits); which lanes still iterate
+becomes mask data (`take = active && (i <= bound)`), every latch/break
+store is masked with the load-adjacent select-store, the break edge is
+deleted, and `assert_true(bound <= 8)` covers the claim that 9 iterations
+are enough. No unrolling: the model only forbids *per-lane* control
+state, and a uniform-trip rolled loop has none - the same reason the
+object-table loops were never a problem. The differential is identical
+through frame 34, guard included.
 
 ### Input fan-out: lane expansion is worse than state duplication (2026-08)
 

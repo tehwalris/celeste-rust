@@ -1,6 +1,6 @@
 # Status (2026-08)
 
-Branch `rewrite`. Build is warning-free, 293 tests pass, working tree clean.
+Branch `rewrite`. Build is warning-free, 306 tests pass, working tree clean.
 
 ## Measured, frame 34 (the standard iteration benchmark)
 
@@ -590,6 +590,58 @@ Two site renames from `merge_blocks`, for reading future profiles:
 inside a multi-block loop-bearing region - neither `absorb_stores` nor
 pure-region speculation applies), and `if_join_136`'s arm holds the
 `btn` reads. Both wait on their stages; next is the unroll.
+
+### Step 4 landed as `mask_loop` - no unroll needed (2026-08-03)
+
+The planned "unroll + mask" became **mask without unroll**, and that is
+the finding worth keeping: the interpreter's model forbids *per-lane*
+control state, not loops. A rolled loop whose trip count is per-state
+uniform executes without splitting (the object-table loops always did),
+so the pixel loops only needed their per-lane trip count turned into
+data. `mask_loop` gives the head a fresh uniform counter (`k <= limit`,
+a recipe constant), keeps the original `i <= bound` compare as a lane
+mask, folds the break edge into an `active` mask, rewrites every
+latch/break store to the load-adjacent masked select-store, deletes the
+break block, and plants `assert_true(bound <= limit)` after the bound.
+Termination becomes unconditional; inner cycles keep the
+`speculate_region` counter-shape obligation (with recognition of guards
+an earlier entry already planted, so overlapping regions do not get
+double guards). Obligations beyond that: nothing defined in the loop is
+used outside it, the exit has no phis, the latch sits on the branch's
+true side.
+
+Enablers built in the same batch:
+
+* **`speculate_region` diamonds** (an explicit `join` field): the head's
+  two targets each grow a region, both are checked as before, and they
+  are *serialized* - named arm first, its exit rewired into the second
+  entry, join phis to selects. Needed for the `or`-shortcircuit's
+  "skip to true" arm (`join_421`), whose sibling is the whole
+  `solid_at`-chain region. The second entry must be phi-free (its
+  predecessor changes).
+* The a61 chains went eager exactly like `update_21`'s (7
+  `speculate_region` entries), and as predicted the splits relocated 1:1
+  (4058 -> 4058) until `mask_loop` deleted the loop control they had
+  moved into.
+
+Measured at frame 34: 1.78 s -> 1.59 s, fragments 102 -> 67 mean
+(614 -> 371 max), splits 4058 -> 2245, `anonymous_61` clean but for a
+9-split `__entry` exposure. Per-lane dynamic work *doubled* (mean 1719 ->
+3635: nine eager iterations always) and the frame still got 11% faster -
+fragments are the cost, not instructions. K loops-kept 3884 -> 3943,
+which is now the bound that matters: uniform rolled loops can stay rolled
+in a compiled kernel too.
+
+Limit choice: 8 (nine iterations, i = 0..8). `abs(amount)` beyond 8 would
+need ~9 px/frame; the guard fails loudly if a later search depth reaches
+it, and the fix is editing one number in two recipe entries.
+
+Remaining splits (2245): `btn` x6 (1261, endgame lane expansion), the
+dash diamond `in_i1_074_cont` (372, convertible last), the jump/dash
+cluster (474, gated on the `update_21` wall-jump object-loop region and
+on `btn`-in-arm), `spikes_at` (96 - mask family, but its break side calls
+`kill_player`, which mutates; it needs the store-bearing-arm treatment or
+`kill_player`'s effects made maskable), small exposures (~42).
 
 Expect the exposure cascade whenever a stage removes splits: lanes that used
 to arrive pre-sorted arrive mixed, and quiet branches wake up. Re-run
