@@ -267,6 +267,68 @@ impl Instruction {
     }
 }
 
+impl Instruction {
+    /// Locals this instruction reads. Never includes the local it defines.
+    ///
+    /// `Store` reports both `target` and `source`: the target is a pointer
+    /// value that is read in order to be written through. Phi reports its
+    /// branch values but not its labels.
+    pub fn get_used_locals(&self) -> Vec<LocalId> {
+        match self {
+            Self::Alloc
+            | Self::GetGlobal { .. }
+            | Self::NumberConstant { .. }
+            | Self::BoolConstant { .. }
+            | Self::StringConstant { .. }
+            | Self::NilConstant => vec![],
+            Self::Load { source } => vec![*source],
+            Self::Store { target, source } => vec![*target, *source],
+            Self::StoreEmptyTable { target } => vec![*target],
+            Self::StoreClosure { target, captures, .. } => {
+                let mut v = vec![*target];
+                v.extend(captures.iter().copied());
+                v
+            }
+            Self::GetField { receiver, .. } => vec![*receiver],
+            Self::GetIndex { receiver, index, .. } => vec![*receiver, *index],
+            Self::Call { closure, args } => {
+                let mut v = vec![*closure];
+                v.extend(args.iter().copied());
+                v
+            }
+            Self::UnaryOp { arg, .. } => vec![*arg],
+            Self::BinaryOp { left, right, .. } => vec![*left, *right],
+            Self::Phi { branches } => branches.iter().map(|(_, id)| *id).collect(),
+        }
+    }
+
+    /// True if removing this instruction when its result is unused would change
+    /// program behaviour.
+    ///
+    /// Note `GetField`/`GetIndex` with `create_if_missing` are *not* pure: they
+    /// allocate a cell and mutate the receiver table, promoting `UnknownTable`
+    /// to `ObjectTable`. The previous optimizer's DCE classified them as pure
+    /// and would silently change the heap shape.
+    pub fn has_side_effects(&self) -> bool {
+        match self {
+            Self::Store { .. } | Self::StoreEmptyTable { .. } | Self::StoreClosure { .. } => true,
+            Self::Call { .. } => true,
+            Self::GetGlobal { create_if_missing, .. }
+            | Self::GetField { create_if_missing, .. }
+            | Self::GetIndex { create_if_missing, .. } => *create_if_missing,
+            Self::Alloc
+            | Self::Load { .. }
+            | Self::NumberConstant { .. }
+            | Self::BoolConstant { .. }
+            | Self::StringConstant { .. }
+            | Self::NilConstant
+            | Self::UnaryOp { .. }
+            | Self::BinaryOp { .. }
+            | Self::Phi { .. } => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Terminator {
     Return {
@@ -283,6 +345,25 @@ pub enum Terminator {
 }
 
 impl Terminator {
+    pub fn get_used_locals(&self) -> Vec<LocalId> {
+        match self {
+            Self::Return { value } => value.into_iter().copied().collect(),
+            Self::UnconditionalBranch { .. } => vec![],
+            Self::ConditionalBranch { condition, .. } => vec![*condition],
+        }
+    }
+
+    /// Successor labels, in order (true target then false target).
+    pub fn successor_labels(&self) -> Vec<&Label> {
+        match self {
+            Self::Return { .. } => vec![],
+            Self::UnconditionalBranch { target } => vec![target],
+            Self::ConditionalBranch { true_target, false_target, .. } => {
+                vec![true_target, false_target]
+            }
+        }
+    }
+
     pub fn map_local_ids(&self, mut f: impl FnMut(LocalId) -> LocalId) -> Self {
         match self {
             Self::Return { value } => Self::Return {
@@ -312,6 +393,16 @@ pub struct Block {
 }
 
 impl Block {
+    #[inline]
+    pub fn terminator_id(&self) -> LocalId {
+        self.terminator.0
+    }
+
+    #[inline]
+    pub fn terminator_kind(&self) -> &Terminator {
+        &self.terminator.1
+    }
+
     /// Splits block instructions into (phi_instructions, non_phi_instructions).
     /// Phi instructions must come first in the block, followed by non-phi instructions.
     pub fn split_block_phi_instructions(
@@ -343,6 +434,11 @@ impl Block {
 
         (phi_instructions, non_phi_instructions)
     }
+}
+
+/// A fresh, empty map of the kind `Cfg::named` uses.
+pub fn new_label_map() -> FxHashMap<Label, Block> {
+    FxHashMap::default()
 }
 
 #[derive(Clone, Debug)]

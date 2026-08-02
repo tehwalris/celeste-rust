@@ -1,0 +1,280 @@
+//! Driver for the program rewriting system. See plans/rewrite-plan.md.
+//!
+//!     rewrite build                 # replay the recipe, report progress
+//!     rewrite print [--fn NAME]     # dump textual IR
+//!     rewrite diff --id ID          # what one entry changed
+//!     rewrite check                 # structural validation only
+//!     rewrite verify [--frames N]   # differential run against the original
+//!     rewrite bisect [--frames N]   # find the first entry that breaks it
+
+use anyhow::{anyhow, Result};
+use clap::{Parser, Subcommand};
+
+use celeste_rust::rewrite::print::{format_function, format_program};
+use celeste_rust::rewrite::program::Program;
+use celeste_rust::rewrite::recipe::{apply_entry, build, Recipe};
+use celeste_rust::rewrite::validate::validate_program;
+use celeste_rust::rewrite::verify::differential_abstract;
+
+const DEFAULT_RECIPE: &str = "rewrites.jsonl";
+
+#[derive(Parser)]
+#[command(about = "Apply and verify program rewrites")]
+struct Cli {
+    #[arg(long, default_value = DEFAULT_RECIPE)]
+    recipe: String,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Replay the recipe and report what each entry did.
+    Build,
+    /// Print the textual IR of the rewritten program.
+    Print {
+        /// Only this function.
+        #[arg(long)]
+        r#fn: Option<String>,
+    },
+    /// Show what one recipe entry changed, as a textual diff.
+    Diff {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        r#fn: Option<String>,
+    },
+    /// Structural validation of the rewritten program.
+    Check,
+    /// Differentially run the rewritten program against the original.
+    Verify {
+        #[arg(long, default_value_t = 30)]
+        frames: u32,
+    },
+    /// Find the first recipe entry after which the differential run fails.
+    Bisect {
+        #[arg(long, default_value_t = 30)]
+        frames: u32,
+    },
+    /// Run the rewritten program and report time, memory and lane counts.
+    ///
+    /// Note peak RSS is the process-wide high-water mark, so with `--baseline`
+    /// the second figure includes the first run's peak. For an accurate memory
+    /// comparison, run the two separately.
+    Bench {
+        #[arg(long, default_value_t = 34)]
+        frames: u32,
+        /// Also run the unmodified program, for comparison.
+        #[arg(long)]
+        baseline: bool,
+    },
+}
+
+fn peak_rss_kb() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmHWM:"))
+                .and_then(|l| l.split_whitespace().nth(1)?.parse().ok())
+        })
+        .unwrap_or(0)
+}
+
+fn bench(label: &str, program: &Program, frames: u32) -> Result<()> {
+    let mut run = celeste_rust::rewrite::verify::AbstractRun::start(program)?;
+    let start = std::time::Instant::now();
+    for _ in 1..=frames {
+        run.step()?;
+    }
+    let elapsed = start.elapsed();
+    let lanes = run.lane_count();
+    println!(
+        "{:<10} {:>3} frames  {:>8.2}s  {:>10} lanes  {:>8.2} GB peak  {:>7.1} us/lane",
+        label,
+        frames,
+        elapsed.as_secs_f64(),
+        lanes,
+        peak_rss_kb() as f64 / 1048576.0,
+        elapsed.as_secs_f64() * 1e6 / lanes.max(1) as f64
+    );
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let recipe = Recipe::load(&cli.recipe)?;
+
+    match cli.command {
+        Command::Build => {
+            let (program, reports) = build(&recipe)?;
+            if reports.is_empty() {
+                println!("recipe is empty; program is as compiled");
+            }
+            for r in &reports {
+                println!(
+                    "{:<10} {:<14} {:>5} change(s)   {:>6} -> {:<6} instrs   {:>4} -> {:<4} blocks",
+                    r.id,
+                    r.rule,
+                    r.changes,
+                    r.instructions_before,
+                    r.instructions_after,
+                    r.blocks_before,
+                    r.blocks_after
+                );
+            }
+            println!();
+            println!(
+                "final: {} functions, {} blocks, {} instructions",
+                program.functions.len(),
+                program.block_count(),
+                program.instruction_count()
+            );
+        }
+
+        Command::Print { r#fn } => {
+            let (program, _) = build(&recipe)?;
+            match r#fn {
+                Some(name) => print!("{}", format_function(program.get(&name)?)),
+                None => print!("{}", format_program(&program)),
+            }
+        }
+
+        Command::Diff { id, r#fn } => {
+            let index = recipe
+                .entries
+                .iter()
+                .position(|e| e.id == id)
+                .ok_or_else(|| anyhow!("no recipe entry with id {:?}", id))?;
+
+            let mut program = Program::compile_from_disk()?;
+            for entry in &recipe.entries[..index] {
+                apply_entry(&mut program, entry)?;
+            }
+            let before = render(&program, &r#fn)?;
+            let report = apply_entry(&mut program, &recipe.entries[index])?;
+            let after = render(&program, &r#fn)?;
+
+            println!(
+                "# {} ({}) - {} change(s)",
+                report.id, report.rule, report.changes
+            );
+            print!("{}", unified_diff(&before, &after));
+        }
+
+        Command::Check => {
+            let (program, _) = build(&recipe)?;
+            let errors = validate_program(&program);
+            if errors.is_empty() {
+                println!(
+                    "ok: {} functions, {} blocks, {} instructions",
+                    program.functions.len(),
+                    program.block_count(),
+                    program.instruction_count()
+                );
+            } else {
+                for e in errors.iter().take(40) {
+                    println!("{}", e);
+                }
+                return Err(anyhow!("{} structural error(s)", errors.len()));
+            }
+        }
+
+        Command::Verify { frames } => {
+            let baseline = Program::compile_from_disk()?;
+            let (candidate, _) = build(&recipe)?;
+            println!("running {} frames of both programs...", frames);
+            let start = std::time::Instant::now();
+            match differential_abstract(&baseline, &candidate, frames)? {
+                None => println!(
+                    "ok: identical through frame {} ({:.1}s)",
+                    frames,
+                    start.elapsed().as_secs_f64()
+                ),
+                Some(d) => {
+                    println!("DIVERGED at frame {}:\n  {}", d.frame, d.detail);
+                    return Err(anyhow!("differential verification failed"));
+                }
+            }
+        }
+
+        Command::Bench { frames, baseline } => {
+            if baseline {
+                bench("original", &Program::compile_from_disk()?, frames)?;
+            }
+            let (program, _) = build(&recipe)?;
+            bench("rewritten", &program, frames)?;
+        }
+
+        Command::Bisect { frames } => {
+            let baseline = Program::compile_from_disk()?;
+            let mut program = Program::compile_from_disk()?;
+            for entry in &recipe.entries {
+                apply_entry(&mut program, entry)?;
+                print!("after {:<10} ... ", entry.id);
+                use std::io::Write;
+                std::io::stdout().flush().ok();
+                match differential_abstract(&baseline, &program, frames)? {
+                    None => println!("ok"),
+                    Some(d) => {
+                        println!("DIVERGED at frame {}", d.frame);
+                        println!("  {}", d.detail);
+                        return Err(anyhow!("first bad entry: {}", entry.id));
+                    }
+                }
+            }
+            println!("all {} entries verify", recipe.entries.len());
+        }
+    }
+
+    Ok(())
+}
+
+fn render(program: &Program, only: &Option<String>) -> Result<String> {
+    Ok(match only {
+        Some(name) => format_function(program.get(name)?),
+        None => format_program(program),
+    })
+}
+
+/// Minimal unified-ish diff. Good enough for eyeballing what a rewrite did;
+/// pipe through a real differ if you want more.
+fn unified_diff(before: &str, after: &str) -> String {
+    let a: Vec<&str> = before.lines().collect();
+    let b: Vec<&str> = after.lines().collect();
+
+    // Longest common subsequence over lines. CFG dumps are small.
+    let mut lcs = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for i in (0..a.len()).rev() {
+        for j in (0..b.len()).rev() {
+            lcs[i][j] = if a[i] == b[j] {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+
+    let mut out = String::new();
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i] == b[j] {
+            i += 1;
+            j += 1;
+        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+            out.push_str(&format!("-{}\n", a[i]));
+            i += 1;
+        } else {
+            out.push_str(&format!("+{}\n", b[j]));
+            j += 1;
+        }
+    }
+    for line in &a[i..] {
+        out.push_str(&format!("-{}\n", line));
+    }
+    for line in &b[j..] {
+        out.push_str(&format!("+{}\n", line));
+    }
+    out
+}

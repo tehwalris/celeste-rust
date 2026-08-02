@@ -1,0 +1,5 @@
+# Recipe: ordered rewrite instructions applied to the compiled program.
+# See plans/rewrite-plan.md. Each entry has a stable, unique id.
+{"id":"r001","rule":"fold"}
+{"id":"r002","rule":"merge_blocks"}
+{"id":"r003","rule":"dce"}
