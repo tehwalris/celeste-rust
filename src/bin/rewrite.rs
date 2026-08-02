@@ -429,11 +429,18 @@ fn main() -> Result<()> {
                         {
                             blocked += 1;
                             for reason in reasons {
-                                let kind = reason
+                                // `create` accessors are kept separate: they are
+                                // blocked because they *mutate*, which a
+                                // different rule has to discharge than a plain
+                                // read that might fault.
+                                let mut kind = reason
                                     .split_whitespace()
                                     .next()
                                     .unwrap_or("?")
                                     .to_string();
+                                if reason.ends_with(" create") {
+                                    kind.push_str(" create");
+                                }
                                 *by_kind.entry(kind).or_default() += 1;
                             }
                         }
