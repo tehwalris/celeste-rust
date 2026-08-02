@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use super::program::Program;
 use super::rules::{
-    allocate_slots, cse, dce, demote_create, fold, if_convert, inline, merge_blocks, pin_builtin,
-    promote_capture, promote_cell, sink_store, speculate,
+    allocate_slots, convert_ternary, cse, dce, demote_create, fold, if_convert, inline,
+    merge_blocks, pin_builtin, promote_capture, promote_cell, sink_store, speculate,
 };
 use crate::ir::LocalId;
 use super::validate::{validate_function, validate_program};
@@ -107,6 +107,17 @@ pub enum Rule {
         /// The accessor, as `%N`.
         at: String,
     },
+    /// Convert the two joins Lua's `a and b or c` compiles to into one select
+    /// on the original condition, in one step - one at a time is impossible,
+    /// because the intermediate phi mixes a bool with a number. Requires the
+    /// `and` arm's value to be statically truthy (`pin_builtin` supplies
+    /// that for the `appr` sites).
+    ConvertTernary {
+        #[serde(rename = "fn")]
+        function: String,
+        /// The outer (`or`) join block.
+        join: String,
+    },
     /// Hoist a triangle arm's speculatable instructions into the head, leaving
     /// only its stores behind - the state `sink_store` needs. Refused unless
     /// every hoist commutes with every store it crosses.
@@ -148,6 +159,7 @@ impl Rule {
             Rule::PromoteCapture { .. } => "promote_capture",
             Rule::PinBuiltin { .. } => "pin_builtin",
             Rule::DemoteCreate { .. } => "demote_create",
+            Rule::ConvertTernary { .. } => "convert_ternary",
             Rule::Speculate { .. } => "speculate",
             Rule::SinkStore { .. } => "sink_store",
             Rule::PromoteCell { .. } => "promote_cell",
@@ -302,6 +314,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::DemoteCreate { function, at } => {
             demote_create::apply(program, function, parse_cell(at)?)
         }
+        Rule::ConvertTernary { function, join } => {
+            convert_ternary::apply(program, function, join)
+        }
         Rule::Speculate { function, join } => speculate::apply(program, function, join),
         Rule::SinkStore { function, at } => {
             sink_store::apply(program, function, parse_cell(at)?)
@@ -369,6 +384,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         }
         Rule::DemoteCreate { function, at } => {
             demote_create::verify(&before, program, function, parse_cell(at)?)
+        }
+        Rule::ConvertTernary { function, join } => {
+            convert_ternary::verify(&before, program, function, join)
         }
         Rule::Speculate { function, join } => {
             speculate::verify(&before, program, function, join)

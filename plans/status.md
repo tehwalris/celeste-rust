@@ -16,10 +16,11 @@ Branch `rewrite`. Build is warning-free, 226 tests pass, working tree clean.
 | + `cse`, stage C piece 1 | 4.32 s | 1.06 GB |
 | + `demote_create` x46, `pin_builtin` x18 | 4.33 s | 1.06 GB |
 | + 4 store-blocked triangles converted | 3.36 s | 0.94 GB |
+| + 4 `convert_ternary` (the `appr` pairs) | 2.62 s | 0.81 GB |
 
 Lane count is identical throughout (92,713), which is the first thing to check
-when a rewrite claims a win. Frame 37 confirms the same ratios (9.22 s after
-the store triangles, from 13.0 s). Keep routine runs at frame 34 or below;
+when a rewrite claims a win. Frame 37 confirms the same ratios (7.87 s, from
+13.0 s before the store triangles). Keep routine runs at frame 34 or below;
 frame 40 takes over a minute.
 
 Full numbers and the time breakdown are in `BENCHMARK_DATA.md`.
@@ -238,18 +239,25 @@ converting a uniform branch is worse than leaving it - the arm stops being
 skipped and runs every time.
 
     triangles           count ever split     splits   % of all
-    convertible            54          6       2755      23.0%
+    convertible            46          2        346       4.1%
     blocked               100          0          0       0.0%
-    all branches            -          -      11978     100.0%
+    all branches            -          -       8472     100.0%
 
 The four store-blocked sites that used to head this table
 (`player.draw_22 if_join_222`, `player.update_21 if_join_98/116/119`; 3523
-splits, 18.0%) are converted - see "Done" below. No blocked triangle splits
-any more. What remains is the `and`/`or` ternary sites of inlined `appr`
-(convertible one by one, wrong one by one - see "Next") plus `btn`, which is
-the search's own input fan-out (1620 x 2, down from 2838 x 2 because fewer
+splits, 18.0%) and the four `appr` ternary pairs (2416 splits) are converted -
+see "Done" below. What still splits is no longer triangle-shaped:
+
+    site                                          splits   what it is
+    in_j2_042/046/050/052_if_join_10 (btn x4)       3362   input fan-out
+    if_join_95, if_join_133, if_join_136, ...       ~3700  diamonds and chains
+    anonymous_61 if_join_413, for_head_487           ~660  object loop
+    and_or_join_199, in_i1_077_and_or_join_611       346   ternary variants
+
+`btn` is the search's own input fan-out (down from 2838 x 2 because fewer
 states reach it; irreducible by rewriting, it becomes lane expansion once the
-frame is otherwise branch-free).
+frame is otherwise branch-free). The diamonds and chains are the next tier of
+shape work.
 
 ### Done
 
@@ -298,6 +306,18 @@ frame is otherwise branch-free).
   All four sites (13 recipe entries) screened clean in one 34-frame run.
   Frame 34: 4.33 s -> 3.36 s, fragments 558 -> 335, splits 19573 -> 11978.
   `player.draw_22` is now entirely branch-free.
+* **The `and`/`or` ternary.** `convert_ternary` takes the double triangle that
+  `a and b or c` compiles to in one step: both arms into the head, the
+  `and`-join emptied, the `or`-join's phis become selects on the original
+  condition. The intermediate phi - the value that mixes a bool with a number
+  and made one-at-a-time conversion impossible - is deleted, replacing it with
+  the `and`-arm's value on the edge where they provably agree. The one static
+  fact required is that the `and`-arm's value can never be falsy; `pin_builtin`
+  supplies it, since pure builtins return Numbers and no number is falsy. The
+  rule refuses if the phi has any other use. Applied to the four `appr` copies
+  in `player.update_21` that actually split (2416 splits); four more matching
+  pairs split zero states and were not applied. Frame 34: 3.36 s -> 2.62 s,
+  fragments 335 -> 232, splits 11978 -> 8472, K down 12.
 
 ### Not applied, and why
 
@@ -307,32 +327,20 @@ unconditionally and save nothing. This is the same misfire as the original 81
 conversions, which were chosen on convertibility alone and made the frame
 slower. Check `bench --profile` before applying an `if_convert`.
 
-### Next: the `and`/`or` ternary
+### Next: the splitters that are not triangles
 
-Now the whole remainder of the splitting-triangle table: 2755 splits, 23.0% of
-what is left. The four `and_or_join_603` sites are `appr` inlined:
+The non-`btn` remainder is ~4700 splits across a dozen sites in
+`player.update_21` and the object loop, none of them the triangle shape the
+current rules recognise. Price them with `bench --profile` and look at each
+shape before writing anything: some are diamonds (both sides do work), some
+are if/elseif chains, two are ternary variants that `convert_ternary`'s strict
+shape check refused (`and_or_join_199`, `in_i1_077_and_or_join_611` - look at
+why before widening the rule), and `for_head_487` is a loop header, which no
+select can absorb.
 
-    function appr(val,target,amount)
-      return val>target and max(val-amount,target) or min(val+amount,target)
-    end
-
-Converting one triangle at a time fails, because the `and` join combines a bool
-with a number and `Select` carries one type tag per value, not per lane:
-
-    at %1351 = select %1339 ? %1344 : %1339
-    select cannot combine Number(...) and Bool(...) per lane
-
-The mixed value never escapes, though: the `or` join takes it only when it is
-truthy, and truthy means it came from the arm, so it is the number. Converting
-the pair together gives `select %1339 ? %1344 : %1349`, both numbers. That
-needs one static fact - that `%1344` is always truthy - which `pin_builtin`
-supplies, since a numeric `CallBuiltin` returns a Number and every number is
-truthy in Lua.
-
-Lifting the truthiness test above the select is a valid identity
-(`truthy(select(c,a,b)) == select(c,truthy(a),truthy(b))`) but does not apply
-here: all six hot triangles store their phi value, so truthiness is not its only
-use. `interpret_not` also rejects numbers, so `Truthy` would be a new operation.
+A diamond needs either a two-arm `if_convert` (both arms speculatable, selects
+at the join) or a store-sinking variant with two provenances. Same soundness
+building blocks as the triangle rules; new shape recognisers.
 
 ### Later: `assume_eq`, whole-function field promotion
 

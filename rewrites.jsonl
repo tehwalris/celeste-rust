@@ -630,4 +630,8 @@
 {"id":"w010","rule":"speculate","fn":"player.update_21","join":"if_join_119"}
 {"id":"w011","rule":"sink_store","fn":"player.update_21","at":"%398"}
 {"id":"w012","rule":"if_convert","fn":"player.update_21","join":"if_join_119"}
+{"fn":"player.update_21","id":"t003","join":"in_i1_075_and_or_join_607","rule":"convert_ternary"}
+{"fn":"player.update_21","id":"t004","join":"in_i1_076_and_or_join_607","rule":"convert_ternary"}
+{"fn":"player.update_21","id":"t006","join":"in_i1_079_and_or_join_607","rule":"convert_ternary"}
+{"fn":"player.update_21","id":"t007","join":"in_i1_080_and_or_join_607","rule":"convert_ternary"}
 {"id":"s1","rule":"allocate_slots"}

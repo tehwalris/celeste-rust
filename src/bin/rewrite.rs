@@ -62,7 +62,7 @@ enum Command {
     /// it. Pipe it into the recipe and re-run `build`.
     Suggest {
         /// What to look for: "promote-cell", "promote-capture", "inline",
-        /// "if-convert", "demote-create", "pin-builtin", "speculate" or
+        /// "if-convert", "demote-create", "pin-builtin", "convert-ternary", "speculate" or
         /// "sink-store".
         #[arg(default_value = "promote-cell")]
         what: String,
@@ -656,6 +656,28 @@ fn main() -> Result<()> {
                          the result will be used at:"
                     );
                     eprintln!("#   the field creations that do happen fall in 2 frames out of 34.");
+                }
+                "convert-ternary" => {
+                    let candidates =
+                        celeste_rust::rewrite::rules::convert_ternary::candidates(&program);
+                    for (i, (function, join)) in candidates.iter().enumerate() {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "id": format!("{}{:03}", prefix, i),
+                                "rule": "convert_ternary",
+                                "fn": function,
+                                "join": join.as_str(),
+                            })
+                        );
+                    }
+                    eprintln!(
+                        "# {} and/or pair(s) whose and-arm value is statically truthy.",
+                        candidates.len()
+                    );
+                    eprintln!(
+                        "# Apply only where the pair actually splits - see bench --profile."
+                    );
                 }
                 "speculate" => {
                     let candidates =
