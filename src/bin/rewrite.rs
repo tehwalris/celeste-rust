@@ -603,65 +603,23 @@ fn main() -> Result<()> {
         }
 
         Command::Screen { candidates, frames } => {
-            let (mut program, _) = build(&recipe)?;
+            let (program, _) = build(&recipe)?;
             let baseline = Program::compile_from_disk()?;
             let trace = celeste_rust::rewrite::verify::observation_trace(&baseline, frames)?;
 
             let text = std::fs::read_to_string(&candidates)?;
             let candidates = Recipe::parse(&text)?;
             let total = candidates.entries.len();
-            let mut accepted = Vec::new();
-            for (i, entry) in candidates.entries.iter().enumerate() {
-                let mut trial = program.clone();
-                // A candidate may not merely diverge - it may panic. Speculating
-                // an arm runs it on lanes that would have skipped it, and the
-                // interpreter's arithmetic asserts on values it should never
-                // have seen (`Pico8Num::rem` on a negative number, say). That is
-                // the loud failure the design accepts, but it must not take the
-                // screener down with it: the trial program is discarded either
-                // way, so unwinding across it is safe.
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    apply_entry(&mut trial, entry).and_then(|_| {
-                        Ok(celeste_rust::rewrite::verify::differential_against_trace(
-                            &trace, &trial, frames,
-                        )?)
-                    })
-                }));
-                let outcome = match outcome {
-                    Ok(outcome) => outcome,
-                    Err(_) => Err(anyhow!("panicked - see the message above")),
-                };
-                match outcome {
-                    Ok(None) => {
-                        program = trial;
-                        accepted.push(entry.clone());
-                        eprintln!("[{}/{}] {:<8} keep", i + 1, total, entry.id);
-                    }
-                    Ok(Some(d)) => eprintln!(
-                        "[{}/{}] {:<8} drop (frame {}): {}",
-                        i + 1,
-                        total,
-                        entry.id,
-                        d.frame,
-                        first_line(&d.detail)
-                    ),
-                    Err(e) => eprintln!(
-                        "[{}/{}] {:<8} drop: {}",
-                        i + 1,
-                        total,
-                        entry.id,
-                        first_line(&format!("{}", e))
-                    ),
-                }
-            }
+            let (accepted, runs) = screen_group(&program, &candidates.entries, &trace, frames);
             for entry in &accepted {
                 println!("{}", serde_json::to_string(entry)?);
             }
             eprintln!(
-                "# kept {} of {} candidate(s), screened over {} frames",
+                "# kept {} of {} candidate(s), screened over {} frames in {} run(s)",
                 accepted.len(),
                 total,
-                frames
+                frames,
+                runs
             );
         }
 
@@ -712,6 +670,104 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// One screening trial: apply `entries` to a copy of `base` and check the
+/// result against the baseline observation trace.
+///
+/// A candidate may not merely diverge - it may panic. Speculating an arm runs it
+/// on lanes that would have skipped it, and the interpreter's arithmetic asserts
+/// on values it should never have seen (`Pico8Num::rem` on a negative number,
+/// say). That is the loud failure the design accepts, but it must not take the
+/// screener down with it: the trial program is discarded either way, so
+/// unwinding across it is safe.
+fn screen_trial(
+    base: &Program,
+    entries: &[celeste_rust::rewrite::recipe::RewriteEntry],
+    trace: &[std::collections::BTreeSet<celeste_rust::rewrite::verify::StateObservation>],
+    frames: u32,
+) -> std::result::Result<Program, String> {
+    let mut trial = base.clone();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        for entry in entries {
+            apply_entry(&mut trial, entry)?;
+        }
+        celeste_rust::rewrite::verify::differential_against_trace(trace, &trial, frames)
+    }));
+    match outcome {
+        Ok(Ok(None)) => Ok(trial),
+        Ok(Ok(Some(d))) => Err(format!("frame {}: {}", d.frame, first_line(&d.detail))),
+        Ok(Err(e)) => Err(first_line(&format!("{}", e))),
+        Err(_) => Err("panicked - see the message above".to_string()),
+    }
+}
+
+/// Screen candidates by group testing rather than one at a time.
+///
+/// A screening run costs a full differential execution - about 14 seconds at 34
+/// frames - and candidate sets are usually almost all good. Trying them one at a
+/// time therefore spends N runs to learn something that one run would usually
+/// settle: 38 `if_convert` candidates took 9 minutes to accept all 38, and 48
+/// `demote_create` candidates would have taken 11 minutes to reject 2.
+///
+/// So try the whole group at once. If it passes, every entry in it is accepted
+/// together. If it fails, split it in half and try each half on top of what has
+/// been accepted so far, recursively, until a failing group is a single entry -
+/// which is then the one to drop. That is `bisect` applied to a set rather than
+/// to a recipe, and it costs roughly `k * log(N/k)` runs for `k` bad entries out
+/// of `N`, against `N` for the sequential version. All good is one run.
+///
+/// Two properties are worth being explicit about, because this is a *trusted*
+/// check and a faster trusted check is only worth having if it is still trusted:
+///
+/// * **The accepted set is always one that has actually been run.** Every
+///   acceptance runs the differential on the cumulative program, not on the
+///   group in isolation, so the program returned here is exactly the one the
+///   last passing run verified. No separate confirmation pass is needed.
+/// * **Interaction between candidates is handled the same way as before.** Two
+///   entries that conflict - structurally, or by diverging only together - make
+///   their group fail, and the split then tries the second on top of the first,
+///   which is precisely what the sequential version did.
+fn screen_group(
+    base: &Program,
+    entries: &[celeste_rust::rewrite::recipe::RewriteEntry],
+    trace: &[std::collections::BTreeSet<celeste_rust::rewrite::verify::StateObservation>],
+    frames: u32,
+) -> (Vec<celeste_rust::rewrite::recipe::RewriteEntry>, usize) {
+    let mut program = base.clone();
+    let mut accepted = Vec::new();
+    let mut runs = 0;
+    // Groups still to try, in recipe order. `push_front` keeps a split group's
+    // halves ahead of everything queued behind it.
+    let mut queue: std::collections::VecDeque<Vec<_>> = std::collections::VecDeque::new();
+    if !entries.is_empty() {
+        queue.push_back(entries.to_vec());
+    }
+    while let Some(group) = queue.pop_front() {
+        runs += 1;
+        let ids = |g: &[celeste_rust::rewrite::recipe::RewriteEntry]| match g {
+            [one] => one.id.clone(),
+            _ => format!("{}..{} ({})", g[0].id, g[g.len() - 1].id, g.len()),
+        };
+        match screen_trial(&program, &group, trace, frames) {
+            Ok(next) => {
+                eprintln!("run {:>3}  keep {}", runs, ids(&group));
+                program = next;
+                accepted.extend(group);
+            }
+            Err(why) if group.len() == 1 => {
+                eprintln!("run {:>3}  DROP {} - {}", runs, group[0].id, why);
+            }
+            Err(why) => {
+                eprintln!("run {:>3}  split {} - {}", runs, ids(&group), why);
+                let second = group[group.len() / 2..].to_vec();
+                let first = group[..group.len() / 2].to_vec();
+                queue.push_front(second);
+                queue.push_front(first);
+            }
+        }
+    }
+    (accepted, runs)
 }
 
 fn first_line(s: &str) -> String {
