@@ -63,7 +63,7 @@ enum Command {
     Suggest {
         /// What to look for: "promote-cell", "promote-capture", "inline",
         /// "if-convert", "demote-create", "pin-builtin", "convert-ternary",
-        /// "decompose-truthy", "speculate" or "sink-store".
+        /// "decompose-truthy", "speculate", "sink-store" or "absorb-stores".
         #[arg(default_value = "promote-cell")]
         what: String,
         /// Prefix for the generated ids.
@@ -705,22 +705,46 @@ fn main() -> Result<()> {
                 "speculate" => {
                     let candidates =
                         celeste_rust::rewrite::rules::speculate::candidates(&program);
-                    for (i, (function, join)) in candidates.iter().enumerate() {
+                    for (i, (function, join, arm)) in candidates.iter().enumerate() {
+                        let mut entry = serde_json::json!({
+                            "id": format!("{}{:03}", prefix, i),
+                            "rule": "speculate",
+                            "fn": function,
+                            "join": join.as_str(),
+                        });
+                        if let Some(arm) = arm {
+                            entry["arm"] = serde_json::json!(arm.as_str());
+                        }
+                        println!("{}", entry);
+                    }
+                    eprintln!(
+                        "# {} arm(s) blocked by nothing but stores, hoists commuting; \
+                         entries with \"arm\" are diamond arms.",
+                        candidates.len()
+                    );
+                    eprintln!(
+                        "# Triangles: follow with sink_store per store, then if_convert. \
+                         Diamonds: absorb_stores once both arms are bare."
+                    );
+                }
+                "absorb-stores" => {
+                    let candidates =
+                        celeste_rust::rewrite::rules::absorb_stores::candidates(&program);
+                    for (i, (function, head)) in candidates.iter().enumerate() {
                         println!(
                             "{}",
                             serde_json::json!({
                                 "id": format!("{}{:03}", prefix, i),
-                                "rule": "speculate",
+                                "rule": "absorb_stores",
                                 "fn": function,
-                                "join": join.as_str(),
+                                "head": head.as_str(),
                             })
                         );
                     }
                     eprintln!(
-                        "# {} triangle(s) blocked by nothing but stores, hoists commuting.",
+                        "# {} head(s) whose arms are bare stores.",
                         candidates.len()
                     );
-                    eprintln!("# Follow each with sink_store per store, then if_convert.");
                 }
                 "sink-store" => {
                     let candidates =

@@ -17,8 +17,9 @@ use serde::{Deserialize, Serialize};
 
 use super::program::Program;
 use super::rules::{
-    allocate_slots, convert_ternary, cse, dce, decompose_truthy, demote_create, fold, if_convert,
-    inline, merge_blocks, pin_builtin, promote_capture, promote_cell, sink_store, speculate,
+    absorb_stores, allocate_slots, convert_ternary, cse, dce, decompose_truthy, demote_create,
+    fold, if_convert, inline, merge_blocks, pin_builtin, promote_capture, promote_cell,
+    sink_store, speculate,
 };
 use crate::ir::LocalId;
 use super::validate::{validate_function, validate_program};
@@ -128,14 +129,29 @@ pub enum Rule {
         /// The cascade's root select, as `%N`.
         root: String,
     },
-    /// Hoist a triangle arm's speculatable instructions into the head, leaving
-    /// only its stores behind - the state `sink_store` needs. Refused unless
-    /// every hoist commutes with every store it crosses.
+    /// Hoist an arm's speculatable instructions into the head, leaving only
+    /// its stores behind - the state `sink_store` / `absorb_stores` needs.
+    /// Refused unless every hoist commutes with every store it crosses.
     Speculate {
         #[serde(rename = "fn")]
         function: String,
         /// The block the two paths join at.
         join: String,
+        /// For a *diamond* at `join`: which of its two arms to hoist from.
+        /// Absent for a triangle, which has only one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        arm: Option<String>,
+    },
+    /// Replace a branch whose arms are bare stores with a select-store in the
+    /// head. Both arms storing to the same local needs no guard; a one-arm
+    /// triangle uses the `sink_store` load-back trick and its
+    /// `assert_value_cell` guard. The join is untouched, so it may have any
+    /// number of other predecessors - but no phis. Screen at full depth.
+    AbsorbStores {
+        #[serde(rename = "fn")]
+        function: String,
+        /// The block whose conditional branch is absorbed.
+        head: String,
     },
     /// Move a triangle arm's trailing store past the join: a guarded load
     /// before the branch, a phi at the join, the store after it. The
@@ -173,6 +189,7 @@ impl Rule {
             Rule::DecomposeTruthy { .. } => "decompose_truthy",
             Rule::Speculate { .. } => "speculate",
             Rule::SinkStore { .. } => "sink_store",
+            Rule::AbsorbStores { .. } => "absorb_stores",
             Rule::PromoteCell { .. } => "promote_cell",
         }
     }
@@ -331,7 +348,10 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::DecomposeTruthy { function, root } => {
             decompose_truthy::apply(program, function, parse_cell(root)?)
         }
-        Rule::Speculate { function, join } => speculate::apply(program, function, join),
+        Rule::Speculate { function, join, arm } => {
+            speculate::apply(program, function, join, arm.as_deref())
+        }
+        Rule::AbsorbStores { function, head } => absorb_stores::apply(program, function, head),
         Rule::SinkStore { function, at } => {
             sink_store::apply(program, function, parse_cell(at)?)
         }
@@ -405,8 +425,11 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::DecomposeTruthy { function, root } => {
             decompose_truthy::verify(&before, program, function, parse_cell(root)?)
         }
-        Rule::Speculate { function, join } => {
-            speculate::verify(&before, program, function, join)
+        Rule::Speculate { function, join, arm } => {
+            speculate::verify(&before, program, function, join, arm.as_deref())
+        }
+        Rule::AbsorbStores { function, head } => {
+            absorb_stores::verify(&before, program, function, head)
         }
         Rule::SinkStore { function, at } => {
             sink_store::verify(&before, program, function, parse_cell(at)?)

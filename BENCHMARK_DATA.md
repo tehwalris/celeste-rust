@@ -32,12 +32,14 @@ not comparable.
 | + 4 store-blocked triangles converted (`speculate`, `sink_store`, `if_convert`) | 3.36 s / 0.94 GB | 9.22 s / 3.11 GB |
 | + 4 `convert_ternary` (the `appr` pairs) | 2.62 s / 0.81 GB | 7.87 s / 2.83 GB |
 | + `decompose_truthy` x15, `if_convert` x2, `convert_ternary` x1 | 2.36 s / 0.74 GB | - |
+| + 2 diamonds absorbed (`absorb_stores`, `speculate` arms, `cse`) | 1.99 s / 0.64 GB | - |
 
 The store-triangle row is the first change that moved the fragment count: 558
 -> 335 mean fragments per frame at frame 34, split executions 19573 -> 11978.
-The ternary row continues it: 335 -> 232, splits -> 8472; the decompose row
-finishes the family: 232 -> 212, splits -> 7802, and **no triangle or
-`and`/`or` construct anywhere in the program splits any more**. Lane count
+The ternary row continues it: 335 -> 232, splits -> 8472; the decompose row:
+232 -> 212, splits -> 7802; the diamond row finishes every select-expressible
+shape: 212 -> 140, splits -> 5345, and **no triangle, `and`/`or` construct,
+or convertible diamond anywhere in the program splits any more**. Lane count
 identical throughout (92,713). See "Which branches actually split" below for
 why these sites paid when 81 earlier conversions did not.
 
@@ -49,14 +51,14 @@ here that tracks distance to a compilable kernel.
 
 |  | original | rewritten |
 |---|---|---|
-| dynamic instrs/frame, mean | 2122 | 1731 |
-| dynamic instrs/frame, max | 6422 | 5283 |
-| distinct blocks reached | 450 | 359 |
-| K, fully unrolled | 8321 | 7874 |
-| K, loops kept as loops | 2963 | 4164 |
+| dynamic instrs/frame, mean | 2122 | 1723 |
+| dynamic instrs/frame, max | 6422 | 5267 |
+| distinct blocks reached | 450 | 333 |
+| K, fully unrolled | 8321 | 7770 |
+| K, loops kept as loops | 2963 | 4066 |
 
-By instruction kind, rewritten: heap 44.0%, arith 25.9%, terminator 9.3%,
-const 6.8%, global 5.5%, phi 3.5%, guard 3.4%, call 1.6%. `arith`, `const` and
+By instruction kind, rewritten: heap 43.9%, arith 26.3%, terminator 9.0%,
+const 6.6%, global 5.5%, phi 3.6%, guard 3.5%, call 1.6%. `arith`, `const` and
 `select` are the core a compiled kernel emits; the rest has to reach zero.
 
 K and the frame time move independently, and the store-triangle conversions
@@ -106,25 +108,26 @@ costs about 8%.
 
 | span | self | share |
 |---|---|---|
-| `vectorize:merge_groups` | 1.27 s | 26.3% |
-| `gc:gc` | 0.99 s | 20.5% |
-| `filter:filter_branch` | 0.62 s | 12.9% |
-| `vectorize:shape_grouping` | 0.43 s | 8.9% |
-| `vectorize:dedup_state` | 0.41 s | 8.6% |
-| everything under `cfg:` (actual interpretation) | ~1.0 s | ~20% |
-| `filter:filter_split_flr` | 0.02 s | 0.5% |
+| `vectorize:merge_groups` | 0.41 s | 20.9% |
+| `vectorize:dedup_state` | 0.37 s | 18.7% |
+| `gc:gc` | 0.29 s | 14.5% |
+| `filter:filter_branch` | 0.27 s | 13.6% |
+| everything under `cfg:` (actual interpretation) | ~0.40 s | ~20% |
+| `vectorize:shape_grouping` | 0.12 s | 5.9% |
+| `filter:filter_split_flr` | 0.02 s | 1.2% |
 
 And the finding that matters most, from the `merge_site` bracketing spans:
 
 | | total | calls |
 |---|---|---|
-| `merge_frame_boundary` | **2.93 s (60%)** | 34 |
-| `merge_hint_normalize` | 0.26 s (5%) | 68 |
-| inside the frame CFG (`cfg:__main`) | 1.89 s (39%) | 34 |
+| `merge_frame_boundary` | **1.02 s (51%)** | 34 |
+| `merge_hint_normalize` | 0.25 s (13%) | 68 |
+| inside the frame CFG (`cfg:__main`) | 0.94 s (47%) | 34 |
 
-**Merging states back together at the frame boundary is 60% of runtime.** The
-frame itself is 39%, and the semantically necessary interval refinement
-(`filter_split_flr`) is 0.5%.
+**Merging states back together at the frame boundary is half of runtime**
+(down from 60% when this section was first written - the branch-removal
+rounds attack exactly this). The semantically necessary interval refinement
+(`filter_split_flr`) is ~1%.
 
 This is a change from the earlier reading of this file, which had intra-frame
 filtering at 33%. Slot allocation cut `filter_branch` from 33% to 13%, and what
@@ -132,9 +135,10 @@ was left standing was the merge.
 
 The cause is intra-frame branching. `rewrite bench` reports it directly:
 
-    fragments before merge: 19593 total, 576 mean, 5220 max per frame
+    fragments before merge: 4751 total, 140 mean, 955 max per frame
+    (was: 19593 total, 576 mean, 5220 max before the branch-removal rounds)
 
-A frame produces ~576 separate states which then have to be merged back into
+A frame produces ~140 separate states which then have to be merged back into
 one. Every part of the merge is per state, so **the fragment count is the
 number a branch-removing rewrite should be judged by** - not the `filter_branch`
 share, which slot allocation already cut from 33% to 13%.
@@ -224,6 +228,28 @@ the *downstream* `appr` pair at `in_i1_078` start splitting (144, previously
 0 - its condition used to arrive pre-sorted into per-state-uniform lanes).
 It was `ready` in the triangle table and one `convert_ternary` entry took it.
 Removing splits un-hides downstream splits; re-profile after every batch.
+
+**Update, after the diamond stage** (`absorb_stores` on `if_join_108` and
+`if_condition_92`, the two convertible sites of the five read this session):
+
+    branches: 5345 of 86751 executions split the state, across 24 distinct sites
+
+Removing 1056 direct splits took ~2457 total - the two sites sat *upstream*
+of most of `player.update_21`, so every splitter below them now sees fewer
+fragments: `if_join_95` 1056 -> 840, `if_join_133` 766 -> 444, `if_join_136`
+509 -> 326, the `btn` pair 1138 -> 820 each. Frame 34 fell 2.36 s -> 1.99 s
+and 0.74 -> 0.64 GB. The remainder:
+
+| family | splits | what it is |
+|---|---|---|
+| `btn` x4 (`in_j2_042/046/050/052`) | 2540 | input fan-out |
+| `if_join_95/133/136`, `if_body_135` | 1706 | diamonds blocked by loops / `btn` |
+| `if_join_413` x4, `for_head`s (object loop bodies) | ~1100 | loop + method shapes |
+
+The exposure this round: `if_body_135` (96 splits, previously quiet), the
+nested grace-check inside the jump arm - same `is_solid`-loop blocker as its
+parent `if_join_133`. Every remaining site is gated on a later stage (object
+loops, `btn` lane expansion); shape work is done until one lands.
 
 ### Input fan-out: lane expansion is worse than state duplication (2026-08)
 

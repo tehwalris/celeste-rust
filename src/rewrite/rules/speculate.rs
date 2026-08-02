@@ -127,19 +127,98 @@ fn commutes_with_store(fun: &FunDef, instr: &Instruction, store_target: LocalId)
 }
 
 /// The shape this rule accepts, re-derived identically by `apply`, `verify`
-/// and `candidates`: a triangle that `if_convert` rejects, whose arm's
-/// non-speculatable instructions are all plain stores, with every hoist
-/// commuting with every store it crosses.
-fn plan(fun: &FunDef, join: &Label) -> Result<Triangle> {
-    require(
-        triangle_at(&fun.cfg, join).is_none(),
-        format!(
-            "the triangle at '{}' is already fully speculatable; use if_convert",
-            join.as_str()
-        ),
-    )?;
-    let t = triangle_shaped(&fun.cfg, join)
-        .ok_or_else(|| anyhow!("no triangle joins at '{}'", join.as_str()))?;
+/// and `candidates`: an arm whose non-speculatable instructions are all plain
+/// stores, with every hoist commuting with every store it crosses.
+///
+/// Without `arm`, the arm is the one arm of the triangle at `join`, and a
+/// triangle `if_convert` could already take whole is refused. With `arm`, it
+/// is that named block: one side of any conditional branch, rejoining at
+/// `join` - a *diamond* arm, or the arm of a triangle whose join has other
+/// predecessors and is therefore invisible to `triangle_shaped`. A diamond
+/// has two arms, so each gets its own entry. The shape requirement is exactly
+/// what the soundness argument needs and nothing more: the arm's only
+/// predecessor is the head whose branch names it, so the arm runs iff that
+/// edge is taken. Hoisted instructions run on lanes that took the other edge
+/// (`is_speculatable`'s bargain), and within the arm they move only above
+/// that arm's own stores (`commutes_with_store`'s). No other arm's store is
+/// ever crossed - those stay behind their own branch.
+fn plan(fun: &FunDef, join: &Label, arm_label: Option<&Label>) -> Result<Triangle> {
+    let t = match arm_label {
+        None => {
+            require(
+                triangle_at(&fun.cfg, join).is_none(),
+                format!(
+                    "the triangle at '{}' is already fully speculatable; use if_convert",
+                    join.as_str()
+                ),
+            )?;
+            triangle_shaped(&fun.cfg, join)
+                .ok_or_else(|| anyhow!("no triangle joins at '{}'", join.as_str()))?
+        }
+        Some(arm_label) => {
+            let arm_key = Some(arm_label.clone());
+            let preds = super::predecessors(&fun.cfg);
+            let head_key = match preds.get(&arm_key).map(|p| p.as_slice()) {
+                Some([head]) => head.clone(),
+                _ => {
+                    return Err(anyhow!(
+                        "'{}' does not hang off a single predecessor, so it is \
+                         not an arm",
+                        arm_label.as_str()
+                    ))
+                }
+            };
+            let head = get_block(&fun.cfg, &head_key)
+                .ok_or_else(|| anyhow!("head block vanished"))?;
+            let crate::ir::Terminator::ConditionalBranch {
+                condition,
+                true_target,
+                false_target,
+            } = head.terminator_kind()
+            else {
+                return Err(anyhow!(
+                    "the predecessor of '{}' does not branch conditionally",
+                    arm_label.as_str()
+                ));
+            };
+            let arm_is_true = if true_target == arm_label && false_target != arm_label {
+                true
+            } else if false_target == arm_label && true_target != arm_label {
+                false
+            } else {
+                return Err(anyhow!(
+                    "'{}' is not exactly one target of its predecessor's branch",
+                    arm_label.as_str()
+                ));
+            };
+            let arm_block = get_block(&fun.cfg, &arm_key).unwrap();
+            require(
+                matches!(
+                    arm_block.terminator_kind(),
+                    crate::ir::Terminator::UnconditionalBranch { target } if target == join
+                ),
+                format!(
+                    "'{}' does not rejoin at '{}'",
+                    arm_label.as_str(),
+                    join.as_str()
+                ),
+            )?;
+            require(
+                !arm_block
+                    .instructions
+                    .iter()
+                    .any(|(_, i)| matches!(i, Instruction::Phi { .. })),
+                format!("'{}' contains phis, which cannot move", arm_label.as_str()),
+            )?;
+            Triangle {
+                head: head_key,
+                arm: arm_label.clone(),
+                join: join.clone(),
+                condition: *condition,
+                arm_is_true,
+            }
+        }
+    };
     let arm = get_block(&fun.cfg, &Some(t.arm.clone()))
         .ok_or_else(|| anyhow!("arm block '{}' vanished", t.arm.as_str()))?;
 
@@ -181,10 +260,16 @@ fn plan(fun: &FunDef, join: &Label) -> Result<Triangle> {
     Ok(t)
 }
 
-pub fn apply(program: &mut Program, function: &str, join: &str) -> Result<usize> {
+pub fn apply(
+    program: &mut Program,
+    function: &str,
+    join: &str,
+    arm: Option<&str>,
+) -> Result<usize> {
     let join = Label::from(join.to_string());
+    let arm = arm.map(|a| Label::from(a.to_string()));
     let fun = program.get(function)?;
-    let t = plan(fun, &join)?;
+    let t = plan(fun, &join, arm.as_ref())?;
 
     let fun = program.get_mut(function)?;
     let arm = get_block_mut(&mut fun.cfg, &Some(t.arm.clone())).unwrap();
@@ -205,11 +290,18 @@ pub fn apply(program: &mut Program, function: &str, join: &str) -> Result<usize>
 /// *before* program via `plan`, then insists the after program is exactly
 /// that: head extended by the hoisted instructions in order, arm reduced to
 /// its stores in order, and not one other thing different.
-pub fn verify(before: &Program, after: &Program, function: &str, join: &str) -> Result<()> {
+pub fn verify(
+    before: &Program,
+    after: &Program,
+    function: &str,
+    join: &str,
+    arm: Option<&str>,
+) -> Result<()> {
     let join = Label::from(join.to_string());
+    let arm = arm.map(|a| Label::from(a.to_string()));
     let before_fun = before.get(function)?;
     let after_fun = after.get(function)?;
-    let t = plan(before_fun, &join)?;
+    let t = plan(before_fun, &join, arm.as_ref())?;
 
     let before_arm = get_block(&before_fun.cfg, &Some(t.arm.clone())).unwrap();
     let before_head = get_block(&before_fun.cfg, &t.head).unwrap();
@@ -284,17 +376,33 @@ pub fn verify(before: &Program, after: &Program, function: &str, join: &str) -> 
     Ok(())
 }
 
-/// Triangles this rule accepts: blocked, store-only blockers, commutes clean.
-pub fn candidates(program: &Program) -> Vec<(String, Label)> {
+/// Arms this rule accepts: blocked, store-only blockers, commutes clean.
+/// Plain-triangle arms come back with `None`; every other arm - diamond arms,
+/// arms whose join has extra predecessors - names itself, one entry per arm.
+pub fn candidates(program: &Program) -> Vec<(String, Label, Option<Label>)> {
     let mut out = Vec::new();
     for (name, fun) in &program.functions {
         for label in fun.cfg.named.keys() {
-            if plan(fun, label).is_ok() {
-                out.push((name.as_str().to_string(), label.clone()));
+            if plan(fun, label, None).is_ok() {
+                out.push((name.as_str().to_string(), label.clone(), None));
+            }
+            let block = fun.cfg.named.get(label).unwrap();
+            let Some(join) = super::unconditional_target(block.terminator_kind()) else {
+                continue;
+            };
+            // A plain triangle's arm is already offered without a name.
+            if triangle_shaped(&fun.cfg, join).is_some_and(|t| &t.arm == label) {
+                continue;
+            }
+            if plan(fun, join, Some(label)).is_ok() {
+                out.push((name.as_str().to_string(), join.clone(), Some(label.clone())));
             }
         }
     }
-    out.sort_by(|a, b| (&a.0, a.1.as_str()).cmp(&(&b.0, b.1.as_str())));
+    out.sort_by(|a, b| {
+        (&a.0, a.1.as_str(), a.2.as_ref().map(|l| l.as_str()))
+            .cmp(&(&b.0, b.1.as_str(), b.2.as_ref().map(|l| l.as_str())))
+    });
     out
 }
 
@@ -387,8 +495,8 @@ mod tests {
             (id(13), store(10, 12)),
         ]);
         let mut after = before.clone();
-        assert_eq!(apply(&mut after, "f", "join").unwrap(), 3);
-        verify(&before, &after, "f", "join").unwrap();
+        assert_eq!(apply(&mut after, "f", "join", None).unwrap(), 3);
+        verify(&before, &after, "f", "join", None).unwrap();
 
         let fun = after.get("f").unwrap();
         let arm = fun.cfg.named.get(&label("arm")).unwrap();
@@ -409,8 +517,8 @@ mod tests {
             (id(15), Instruction::Load { source: id(14) }),
         ]);
         let mut after = before.clone();
-        assert_eq!(apply(&mut after, "f", "join").unwrap(), 3);
-        verify(&before, &after, "f", "join").unwrap();
+        assert_eq!(apply(&mut after, "f", "join", None).unwrap(), 3);
+        verify(&before, &after, "f", "join", None).unwrap();
         let arm = after.get("f").unwrap().cfg.named.get(&label("arm")).unwrap();
         assert_eq!(arm.instructions, vec![(id(13), store(10, 1))]);
     }
@@ -428,7 +536,7 @@ mod tests {
                 (id(15), Instruction::Load { source: id(14) }),
             ]);
             let mut after = before.clone();
-            let error = apply(&mut after, "f", "join").unwrap_err().to_string();
+            let error = apply(&mut after, "f", "join", None).unwrap_err().to_string();
             assert!(error.contains("same cell"), "{}", error);
         }
     }
@@ -442,7 +550,7 @@ mod tests {
             (id(13), Instruction::Call { closure: id(1), args: vec![] }),
         ]);
         let mut after = before.clone();
-        let error = apply(&mut after, "f", "join").unwrap_err().to_string();
+        let error = apply(&mut after, "f", "join", None).unwrap_err().to_string();
         assert!(error.contains("not a store"), "{}", error);
     }
 
@@ -451,7 +559,7 @@ mod tests {
     fn refuses_a_fully_speculatable_arm() {
         let before = triangle_program(vec![(id(10), num(7))]);
         let mut after = before.clone();
-        let error = apply(&mut after, "f", "join").unwrap_err().to_string();
+        let error = apply(&mut after, "f", "join", None).unwrap_err().to_string();
         assert!(error.contains("use if_convert"), "{}", error);
     }
 
@@ -464,12 +572,127 @@ mod tests {
             (id(13), store(10, 1)),
         ]);
         let mut after = before.clone();
-        apply(&mut after, "f", "join").unwrap();
+        apply(&mut after, "f", "join", None).unwrap();
         // Sabotage: move the store into the head as well.
         let fun = after.get_mut("f").unwrap();
         let s = fun.cfg.named.get_mut(&label("arm")).unwrap().instructions.remove(0);
         fun.cfg.entry.instructions.push(s);
-        assert!(verify(&before, &after, "f", "join").is_err());
+        assert!(verify(&before, &after, "f", "join", None).is_err());
+    }
+
+    /// `__entry` branches to `arm_a` or `arm_b`, which both join at `join`.
+    fn diamond_program(
+        a_body: Vec<(LocalId, Instruction)>,
+        b_body: Vec<(LocalId, Instruction)>,
+    ) -> Program {
+        let mut program = triangle_program(a_body);
+        let fun = program.functions.values_mut().next().unwrap();
+        let old = fun.cfg.named.remove(&label("arm")).unwrap();
+        fun.cfg.named.insert(label("arm_a"), old);
+        fun.cfg.named.insert(
+            label("arm_b"),
+            Block {
+                instructions: b_body,
+                terminator: (id(25), Terminator::UnconditionalBranch { target: label("join") }),
+                hint_normalize: false,
+            },
+        );
+        fun.cfg.entry.terminator = (
+            id(3),
+            Terminator::ConditionalBranch {
+                condition: id(0),
+                true_target: label("arm_a"),
+                false_target: label("arm_b"),
+            },
+        );
+        program
+    }
+
+    /// A diamond arm hoists exactly like a triangle arm, once the entry says
+    /// which arm it means. The sibling arm is untouched.
+    #[test]
+    fn hoists_a_named_diamond_arm() {
+        let before = diamond_program(
+            vec![(id(10), field(2, "x")), (id(12), num(7)), (id(13), store(10, 12))],
+            vec![(id(15), field(2, "x")), (id(16), num(9)), (id(17), store(15, 16))],
+        );
+        let mut after = before.clone();
+        assert_eq!(apply(&mut after, "f", "join", Some("arm_a")).unwrap(), 2);
+        verify(&before, &after, "f", "join", Some("arm_a")).unwrap();
+
+        let fun = after.get("f").unwrap();
+        let arm_a = fun.cfg.named.get(&label("arm_a")).unwrap();
+        assert_eq!(arm_a.instructions, vec![(id(13), store(10, 12))]);
+        let arm_b = fun.cfg.named.get(&label("arm_b")).unwrap();
+        assert_eq!(arm_b.instructions.len(), 3);
+        let head_ids: Vec<LocalId> =
+            fun.cfg.entry.instructions.iter().map(|(i, _)| *i).collect();
+        assert_eq!(head_ids, vec![id(0), id(1), id(10), id(12)]);
+
+        // And then the other arm, on top.
+        let middle = after.clone();
+        assert_eq!(apply(&mut after, "f", "join", Some("arm_b")).unwrap(), 2);
+        verify(&middle, &after, "f", "join", Some("arm_b")).unwrap();
+        let fun = after.get("f").unwrap();
+        let arm_b = fun.cfg.named.get(&label("arm_b")).unwrap();
+        assert_eq!(arm_b.instructions, vec![(id(17), store(15, 16))]);
+    }
+
+    /// An arm whose join has predecessors besides the triangle's - invisible
+    /// to `triangle_shaped`, reachable by naming the arm.
+    #[test]
+    fn hoists_an_arm_at_a_shared_join() {
+        let mut before = triangle_program(vec![
+            (id(10), field(2, "x")),
+            (id(12), num(7)),
+            (id(13), store(10, 12)),
+        ]);
+        let fun = before.functions.values_mut().next().unwrap();
+        fun.cfg.named.insert(
+            label("elsewhere"),
+            Block {
+                instructions: vec![],
+                terminator: (
+                    id(35),
+                    Terminator::UnconditionalBranch { target: label("join") },
+                ),
+                hint_normalize: false,
+            },
+        );
+        let mut after = before.clone();
+        // The triangle recognizer cannot see it...
+        let error = apply(&mut after, "f", "join", None).unwrap_err().to_string();
+        assert!(error.contains("no triangle joins"), "{}", error);
+        // ...naming the arm can.
+        assert_eq!(apply(&mut after, "f", "join", Some("arm")).unwrap(), 2);
+        verify(&before, &after, "f", "join", Some("arm")).unwrap();
+        let arm = after.get("f").unwrap().cfg.named.get(&label("arm")).unwrap();
+        assert_eq!(arm.instructions, vec![(id(13), store(10, 12))]);
+    }
+
+    /// A diamond entry must name one of the diamond's own arms.
+    #[test]
+    fn refuses_a_block_that_is_not_an_arm() {
+        let before = diamond_program(
+            vec![(id(10), field(2, "x")), (id(13), store(10, 1))],
+            vec![(id(15), num(9))],
+        );
+        let mut after = before.clone();
+        let error = apply(&mut after, "f", "join", Some("join")).unwrap_err().to_string();
+        assert!(error.contains("not an arm"), "{}", error);
+    }
+
+    /// Without an `arm` field a diamond is invisible: the triangle recognizer
+    /// must not quietly pick a side.
+    #[test]
+    fn refuses_a_diamond_without_an_arm_field() {
+        let before = diamond_program(
+            vec![(id(10), field(2, "x")), (id(13), store(10, 1))],
+            vec![(id(15), num(9))],
+        );
+        let mut after = before.clone();
+        let error = apply(&mut after, "f", "join", None).unwrap_err().to_string();
+        assert!(error.contains("no triangle joins"), "{}", error);
     }
 
     /// ...or one that dropped a hoisted instruction instead of moving it.
@@ -480,9 +703,9 @@ mod tests {
             (id(13), store(10, 1)),
         ]);
         let mut after = before.clone();
-        apply(&mut after, "f", "join").unwrap();
+        apply(&mut after, "f", "join", None).unwrap();
         after.get_mut("f").unwrap().cfg.entry.instructions.pop();
-        let error = verify(&before, &after, "f", "join").unwrap_err().to_string();
+        let error = verify(&before, &after, "f", "join", None).unwrap_err().to_string();
         assert!(error.contains("hoisted instructions"), "{}", error);
     }
 }

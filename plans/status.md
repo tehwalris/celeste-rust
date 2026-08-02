@@ -1,6 +1,6 @@
 # Status (2026-08)
 
-Branch `rewrite`. Build is warning-free, 257 tests pass, working tree clean.
+Branch `rewrite`. Build is warning-free, 271 tests pass, working tree clean.
 
 ## Measured, frame 34 (the standard iteration benchmark)
 
@@ -18,6 +18,7 @@ Branch `rewrite`. Build is warning-free, 257 tests pass, working tree clean.
 | + 4 store-blocked triangles converted | 3.36 s | 0.94 GB |
 | + 4 `convert_ternary` (the `appr` pairs) | 2.62 s | 0.81 GB |
 | + `decompose_truthy` x15, 3 more conversions | 2.36 s | 0.74 GB |
+| + 2 diamonds absorbed (`absorb_stores`) | 1.99 s | 0.64 GB |
 
 Lane count is identical throughout (92,713), which is the first thing to check
 when a rewrite claims a win. Frame 37 confirms the same ratios (7.87 s, from
@@ -241,24 +242,26 @@ skipped and runs every time.
 
     triangles           count ever split     splits   % of all
     convertible            42          0          0       0.0%
-    blocked               100          0          0       0.0%
-    all branches            -          -       7802     100.0%
+    blocked               101          0          0       0.0%
+    all branches            -          -       5345     100.0%
 
-**Every triangle and every `and`/`or` construct in the program is now
-silent.** The four store-blocked sites (3523 splits), the four `appr` ternary
-pairs (2416), and the two ternary variants plus everything they exposed (546)
-are all converted - see "Done" below. What still splits:
+**Every triangle, every `and`/`or` construct, and every convertible diamond
+in the program is now silent.** The four store-blocked sites (3523 splits),
+the four `appr` ternary pairs (2416), the ternary variants and everything
+they exposed (546), and the two diamond-stage sites (1056 direct, 2457 with
+the downstream effect) are all converted - see "Done" below. What still
+splits:
 
     site                                          splits   what it is
-    in_j2_042/046/050/052_if_join_10 (btn x4)       3176   input fan-out
-    if_join_95, if_join_133, if_join_136, ...       ~3400  diamonds and chains
-    anonymous_61/update_21 if_join_413, for_heads    ~920  object loop bodies
+    in_j2_042/046/050/052_if_join_10 (btn x4)       2540   input fan-out
+    if_join_95, if_join_133/136, if_body_135        1706   blocked diamonds (below)
+    anonymous_61/update_21 if_join_413, for_heads  ~1100   object loop bodies
     (in_k03x sites are the same loop body inlined)
 
-`btn` is the search's own input fan-out (down from 2838 x 2 because fewer
-states reach it; irreducible by rewriting, it becomes lane expansion once the
-frame is otherwise branch-free). The diamonds and chains are the next tier of
-shape work.
+`btn` is the search's own input fan-out (irreducible by rewriting, it becomes
+lane expansion once the frame is otherwise branch-free). The three blocked
+diamonds are priced in "Next" below; the object loops need unrolling or
+specialization, which no select can express.
 
 ### Done
 
@@ -339,6 +342,32 @@ shape work.
   7874. The unapplied tail shape of `convert_ternary` is subsumed and was
   removed (recoverable from git if a cascade without an always-truthy root
   ever appears).
+* **The first diamonds (`absorb_stores`).** Two sites, both in
+  `player.update_21`. `if_join_108` is `spd.x = abs(spd.x) > maxrun and
+  appr(..) or appr(..)` - a true diamond, both arms doing work and storing to
+  `spd.x`. `if_condition_92` is the grace-counter decrement, a one-store
+  triangle that was invisible to `find_triangle` because its join has a third
+  predecessor. One pipeline handles both, all but one rule pre-existing:
+  `merge_blocks` collapses each arm's block chain, `demote_create` demotes
+  the arms' creating accessors, `speculate` - extended to accept a *named*
+  arm, whose shape requirement is exactly the hoisting soundness argument
+  (only predecessor is the head whose branch names it) - empties each arm
+  down to its store, and `cse` unifies the two arms' address chains so both
+  stores name one local. The one new rule, `absorb_stores`, then replaces the
+  branch with a select-store *in the head*: both-arms-same-local needs no
+  guard (every path stored to that cell; same local means same cell, no
+  aliasing argument), one-arm reuses `sink_store`'s guarded load-back trick.
+  The join is never touched, which is what makes the shared-join shape and
+  any future N-predecessor join reachable - the price is a phi-free join,
+  checked. Crucially the *paired* store never went through `sink_store`:
+  sinking two same-cell stores independently is silently wrong (the second
+  load-back overwrites the first arm's value), so the pair had to be one
+  rule. Screened clean in one 34-frame run. Frame 34: 2.36 s -> 1.99 s,
+  mean fragments 140 (was 212), splits 7802 -> 5345 - 1056 direct and
+  another ~1400 downstream, the multiplier at work. K 7874 -> 7770.
+  Exposure check: `if_body_135` (the nested grace branch of the jump arm)
+  woke up at 96 splits; it is blocked by the same `is_solid` loops as its
+  parent.
 
 ### Not applied, and why
 
@@ -348,25 +377,37 @@ unconditionally and save nothing. This is the same misfire as the original 81
 conversions, which were chosen on convertibility alone and made the frame
 slower. Check `bench --profile` before applying an `if_convert`.
 
-### Next: the splitters that are not triangles
+### Next: the three blocked diamonds, all waiting on something bigger
 
-The non-`btn` remainder is ~4300 splits across a dozen sites in
-`player.update_21` and the object loop, none of them a shape the current
-rules recognise. Price them with `bench --profile` and look at each shape
-before writing anything: some are diamonds (both sides do work), some are
-if/elseif chains, and the `for_head` sites are loop headers, which no select
-can absorb.
+The five diamond/chain sites in `player.update_21` were read and tabulated
+this session; two were convertible (see `absorb_stores` above) and three are
+not, each blocked by a different later stage:
 
-A diamond needs either a two-arm `if_convert` (both arms speculatable, selects
-at the join) or a store-sinking variant with two provenances. Same soundness
-building blocks as the triangle rules; new shape recognisers.
+* **`if_join_95`** (840 splits, the largest non-`btn` site) branches on
+  `dash_time > 0`. Its true arm is the dashing update - convertible on its
+  own - but its false arm is the *entire walking/jumping/dash-start logic*,
+  containing everything below. Convertible only after the whole else-arm is
+  straight-line, i.e. last.
+* **`if_join_133`** (444) branches on the jump input. The grounded-jump path
+  is two stores, but the wall-jump path inlines `obj.is_solid`, which is an
+  object *loop* (the `in_k03x` sites). Blocked until the object-loop stage.
+* **`if_join_136`** (326) branches on the dash input. The dash-start arm
+  contains the `btn(k_up)` / `btn(k_down)` reads - input fan-out lives
+  *inside* the arm. Blocked until `btn` becomes lane expansion.
+* `if_body_135` (96, exposed by this round) is `if_join_133`'s nested
+  grace-check; same is_solid blocker.
 
-Expect the exposure cascade seen with `decompose_truthy`: removing a split
-un-hides work downstream, because lanes that used to arrive pre-sorted now
-arrive mixed, so branches that ran uniform start splitting for real. After
-each conversion, re-run `bench --profile` and check whether a previously
-quiet site has woken up - it may be a shape an existing rule already takes,
-as `in_i1_078` was.
+So shape work is done until a bigger stage lands. The remaining splits are
+`btn` x4 (2540 - lane expansion), the blocked diamonds above (~1700, gated on
+loops and `btn`), and the object loop bodies (~1100 - unrolling or
+specialization; `measure_k` prints the unroll price list, 6 iterations x ~62
+instructions each for the top sites).
+
+Expect the exposure cascade whenever a stage removes splits: lanes that used
+to arrive pre-sorted arrive mixed, and quiet branches wake up. Re-run
+`bench --profile` after each batch - the newcomer may be a shape an existing
+rule already takes, as `in_i1_078` was for `convert_ternary` and
+`if_body_135` was not.
 
 ### Later: `assume_eq`, whole-function field promotion
 

@@ -23,6 +23,7 @@ use crate::ir::{Block, Cfg, FunDef, Instruction, Label, LocalId, Terminator};
 
 use super::program::Program;
 
+pub mod absorb_stores;
 pub mod allocate_slots;
 pub mod convert_ternary;
 pub mod if_convert;
