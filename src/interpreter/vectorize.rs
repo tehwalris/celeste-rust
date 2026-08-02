@@ -459,14 +459,16 @@ where
     F: Fn(&State) -> &LocalEnv,
 {
     let first_env = get_env(&states[0]);
-    let mut merged = LocalEnv::new();
+    let mut merged = first_env.empty_like();
 
-    for (local_id, _) in first_env.iter() {
+    // Positional: all these states are at the same program point, so slot N
+    // holds the same logical value in each of them.
+    for (slot, _) in first_env.iter() {
         let value_and_sizes: Vec<_> = states.iter()
-            .map(|s| (get_env(s).get_by_raw_id(local_id).clone(), s.vector_size))
+            .map(|s| (get_env(s).get_by_raw_id(slot).clone(), s.vector_size))
             .collect();
         let merged_value = merge_values(&value_and_sizes);
-        merged.set_by_raw_id(local_id, merged_value);
+        merged.set_slot(slot, first_env.occupant_of_slot(slot), merged_value);
     }
 
     merged
@@ -747,9 +749,13 @@ fn clean_local_envs_for_merging(states: Vec<State>) -> Vec<State> {
         common_keys = common_keys.intersection(&state_keys).copied().collect();
     }
 
-    // Remove keys that aren't in the intersection
+    // Remove keys that aren't in the intersection. `common_keys` holds slots,
+    // so the retain predicate has to compare slots too.
     states.into_iter().map(|mut state| {
-        state.local_env.retain(|key: LocalId| common_keys.contains(&usize::from(key)));
+        let slots = std::sync::Arc::clone(state.local_env.slots());
+        state
+            .local_env
+            .retain(|id: LocalId| common_keys.contains(&slots.slot_of(id)));
         state
     }).collect()
 }

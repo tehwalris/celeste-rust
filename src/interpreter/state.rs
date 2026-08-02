@@ -9,7 +9,6 @@ use super::{
     tracing::TraceSpan,
     value::{HeapValue, Value},
 };
-use crate::ir::LocalId;
 
 // Use FxHash for faster hashing
 type FxBuildHasher = BuildHasherDefault<FxHasher>;
@@ -307,14 +306,18 @@ impl State {
 
         // Visit all roots from local_env (sorted for deterministic order)
         // Note: We must clone values since LocalEnv doesn't support draining
+        // `iter` yields *slots*, so the rebuild must be positional and must
+        // carry the occupant across. Using `set(LocalId::from(slot), ..)` would
+        // map the slot through the slot table a second time.
         let mut local_entries: Vec<_> = self.local_env.iter().collect();
         local_entries.sort_by_key(|(k, _)| *k);
-        let mut new_local_env = LocalEnv::new();
-        for (raw_id, value) in local_entries {
+        let mut new_local_env = self.local_env.empty_like();
+        for (slot, value) in local_entries {
             let new_value = map_value(value.clone(), &mut |id| {
                 visit(id, &self.heap, &mut old_to_new, &mut new_heap_values)
             });
-            new_local_env.set(LocalId::from(raw_id), new_value);
+            let occupant = self.local_env.occupant_of_slot(slot);
+            new_local_env.set_slot(slot, occupant, new_value);
         }
 
         // Visit all roots from outer_local_envs
@@ -322,12 +325,13 @@ impl State {
         for env in &self.outer_local_envs {
             let mut entries: Vec<_> = env.iter().collect();
             entries.sort_by_key(|(k, _)| *k);
-            let mut new_env = LocalEnv::new();
-            for (raw_id, value) in entries {
+            let mut new_env = env.empty_like();
+            for (slot, value) in entries {
                 let new_value = map_value(value.clone(), &mut |id| {
                     visit(id, &self.heap, &mut old_to_new, &mut new_heap_values)
                 });
-                new_env.set(LocalId::from(raw_id), new_value);
+                let occupant = env.occupant_of_slot(slot);
+                new_env.set_slot(slot, occupant, new_value);
             }
             new_outer_local_envs.push(new_env);
         }
