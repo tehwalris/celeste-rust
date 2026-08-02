@@ -1,19 +1,22 @@
 # Status (2026-08)
 
-Branch `rewrite`. Build is warning-free, 167 tests pass, working tree clean.
+Branch `rewrite`. Build is warning-free, 171 tests pass, working tree clean.
 
-## Measured, frame 34 (the standard iteration benchmark, ~6s)
+## Measured, frame 34 (the standard iteration benchmark)
 
 | program | time | memory |
 |---|---|---|
-| original | 6.64 s | 1.75 GB |
+| as compiled | 6.64 s | 1.75 GB |
 | + `promote_cell` (130 cells) | 5.47 s | 1.12 GB |
 | + slot plumbing (identity map, no-op) | 5.69 s | 1.12 GB |
+| + `allocate_slots` | 4.65 s | 1.05 GB |
+| + 183 `inline`s | 4.47 s | 1.12 GB |
 
-Frame 40, run once as a milestone check: 84.1 s / 25.8 GB -> 62.5 s / 14.45 GB.
-That was stage 1's target (beat the old unverified mem2reg's 15.2 GB).
+Lane count is identical throughout (92,713), which is the first thing to check
+when a rewrite claims a win. Frame 37 confirms the same ratios at ~13 s. Keep
+routine runs at frame 34 or below; frame 40 takes over a minute.
 
-Frame 40 takes over a minute; keep routine runs at frame 34 or below.
+Full numbers and the time breakdown are in `BENCHMARK_DATA.md`.
 
 ## Done
 
@@ -25,40 +28,53 @@ Frame 40 takes over a minute; keep routine runs at frame 34 or below.
   every rewrite is differentially verified against an enormous number of
   concrete behaviours.
 * **Stage 1** - `promote_cell`. 130 cells, converged in one round.
-* **Stage 2** - `inline`. Works and verifies (183 inlines), **parked** because
-  it was a 12% regression. See `plans/inline-parked.md`.
-* **Slot allocation step 1** - `LocalId` (logical, SSA) separated from slot
-  (physical, dense) in `LocalEnv`, with an occupant array so a bad allocation
-  fails loudly. Landed with the identity map, verified to be a no-op.
+* **Stage 2** - `inline`. 183 call sites. See `plans/inline.md` for why it was
+  parked for two months and what unparked it. 305 calls remain.
+* **Slot allocation** - `LocalId` (logical, SSA) is separated from slot
+  (physical, dense). `Cfg::slots` is part of the program; `slots::allocate`
+  colours the conflict graph; `validate` re-checks it after every rewrite; and
+  `LocalEnv`'s occupant array is the run-time backstop. 5207 slots over the
+  program became 357, against a liveness floor of 346.
+* **Profiling** - `rewrite bench --profile` gives a self-time breakdown.
 
-## Next: slot allocation step 2
+## The measurement that should drive what comes next
 
-The remaining work, in order:
+Merging states back together **at the frame boundary is 60% of runtime**. The
+frame itself is 39%, and `filter_split_flr` - the only semantically necessary
+filtering - is 0.5%.
 
-1. **Thread `SlotMap` through the program.** Currently `LocalEnv::new()` always
-   uses the identity map, so nothing can yet supply a real one. Needs:
-   - `SlotMap` moved to `ir.rs` (it is part of the program representation, and
-     `ir` should not depend on `interpreter`)
-   - a `slots` field on `FunDef`
-   - `PreparedCfg::with_slots`, populated by `FixedEnv::add_fun_def`
-   - `core_interpreter.rs:411`, where the callee's environment is built, to use
-     the callee's map
-   - the two entry chunks (`__init`, `__frame`), which are driven through
-     `interpret_cfg` rather than as functions
-2. **The `allocate_slots` rewrite.** Rebuilds only the slot table, never the IR,
-   so its diff is trivially reviewable. Linear scan over live ranges is ample -
-   max simultaneous liveness is 12-18, so packing quality hardly matters.
-   - verifier: independently recompute liveness (`src/rewrite/liveness.rs`) and
-     check no two simultaneously-live values share a slot. That is a static
-     proof; the occupant array is the backstop against the liveness analysis
-     itself being wrong.
-   - watch for the parallel-copy hazard: `flow_block_phi` assigns phis
-     sequentially, so an allocation that makes two phis in a block swap slots is
-     wrong. Simplest fix is to refuse to coalesce into a cycle.
-3. **Re-land the 183 inlines** (already written and verified) and re-measure.
-   The packed slot count barely moved under inlining, so this should now be a
-   clear win rather than a regression.
-4. **If-conversion** - `Select` in the IR, then `hoist` and `phi_to_select`.
+The cause is still intra-frame branching (`filter_branch` fires 830 times per
+frame, so a frame ends as ~630 states), so the lever is to produce fewer states.
+But it means **if-conversion should be judged by the state count arriving at the
+frame boundary**, not by the `filter_branch` share, which slot allocation
+already cut from 33% to 13%.
 
-Expected from (2): `player.update_21` from 848 slots to 12, `__frame` from 1508
-to 15. Filtering is 33% of runtime and clones the environment every time.
+## Next: stage D, if-conversion
+
+Surveyed in `plans/rewrite-plan.md` section 9. The short version:
+
+* The program has **145 triangles** (`cond_br H → A, J`; `A → J`, which is what
+  Lua `and`/`or` compiles to) and only 12 diamonds. **84 triangles have fully
+  speculatable arms** - no call, store, `create_if_missing` or `assert_closure`.
+  33 of those are in `player.update_21`, the hottest function.
+* Arms are short: median 2 instructions, 315 in total.
+* So this is **one rule, `if_convert { join }`**, not the `hoist` +
+  `phi_to_select` pair section 4 proposed. There is nothing for `hoist` to empty
+  out.
+* `Select` is partial. One `HeapId` per pointer and one type tag per value means
+  it can only combine numbers, bools and intervals. Lua's `and`/`or` returns its
+  operands, so some of the 84 will be selecting between a bool and a number and
+  must fail loudly rather than widen.
+* Expect to apply all 84 one at a time and keep the ones that verify.
+
+Order of work is in section 9. After that, section 4's stage E (`peel`).
+
+## Second lever, unscheduled
+
+`gc` is 21% of runtime at ~45 us per state. It copies every heap value, and a
+heap value holds a `MaybeVector::Vector(Vec<T>)` of per-lane data, so the cost
+is (cells x lanes) even though gc only renumbers `HeapId`s and never touches
+lane data. Making that `Arc<Vec<T>>` would make gc nearly free and would
+probably help `merge_groups` and `dedup_state` too. This is close to what the
+old `barrier` branch did. Worth roughly 20% on its own, and unlike if-conversion
+it does not depend on the program's shape.

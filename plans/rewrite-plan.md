@@ -738,3 +738,78 @@ rather than transcribed by hand.
 - Known small over-count: the frame driver CFG and the button-reset CFG are both
   named `__main`, so `__main::__entry` is counted twice (~8% of K). Harmless at
   this precision.
+
+## 9. Stage D, surveyed (2026-08)
+
+Stage D above proposed `hoist` + `phi_to_select` against a *diamond*. Counting
+what the program actually contains says the diamond is the rare case:
+
+| shape | count | arms fully speculatable |
+|---|---|---|
+| triangle (`cond_br H → A, J`; `A → J`) | 145 | **84** |
+| diamond (`cond_br H → T, F`; both `→ J`) | 12 | 0 |
+
+The triangle is what Lua `and`/`or` compiles to, which is why it dominates.
+Speculatable here means the arm contains no `call`, no `store`, no
+`create_if_missing` and no `assert_closure`. Arms are short: median 2
+instructions, max 24, 315 instructions over all 84.
+
+33 of the 84 are in `player.update_21`, which is the hottest function in the
+profile. The rest trail off: `spikes_at_74` 8, `obj.collide_49` 7,
+`fake_wall.update_37` 5.
+
+### What this changes about the design
+
+**One rule, not two.** With arms this short and single-entry, `hoist` buys
+nothing: `if_convert { join }` can move the whole arm into the head block and
+rewrite the phis in one step, and the precondition is still a local shape check.
+`hoist` was only needed to empty out arms so that `phi_to_select` could see a
+degenerate shape; there is nothing to empty.
+
+**Target the triangle.** `%p = phi [H: %x, A: %y]` where `A` is the arm becomes
+`%p = select %c, %y, %x` (operands ordered by which target `%c` selects). `J`
+then has one predecessor and `merge_blocks` absorbs it.
+
+**`Select` is partial, and that is the interesting part.** The value
+representation has one `HeapId` per pointer and one type tag per value, not per
+lane, so `select` can only produce a value when both sides are numbers, bools or
+intervals - or are literally the same value. Lua's `and`/`or` returns operands
+rather than booleans, so a fair number of these 84 will be selecting between a
+bool and a number and will fail.
+
+That is fine and is the intended workflow: suggest all 84, apply them one at a
+time, and let the differential run reject the ones that cannot be represented.
+The recipe then records exactly which sites are convertible, which is a fact
+about the program worth having written down. What it must not do is silently
+produce a wrong value - so `select` on mismatched representations is an error,
+not a widening.
+
+### Order of work
+
+1. `Select` in the IR, its interpretation, and its handling in `vectorize` /
+   `StateShape`.
+2. `if_convert { join }`, with an independent verifier: re-derive the shape from
+   the *before* program, check every moved instruction is on the speculatable
+   whitelist, check each `select` was built from the phi it replaced.
+3. `rewrite suggest if-convert`, replacing the throwaway script that produced
+   the table above.
+4. Measure. The thing to watch is the **state count arriving at the frame
+   boundary**, not the `filter_branch` share - see BENCHMARK_DATA.md, where
+   merging at the frame boundary is 60% of runtime and the frame itself is 39%.
+
+### The speculation hazard, stated honestly
+
+Executing an arm on lanes that would not have entered it is safe for the *value*
+- the select discards it - but not necessarily for *execution*. If the arm reads
+a field that is nil in a state that would have skipped the arm entirely, the
+interpreter raises a type error where the original program had none.
+
+The whitelist does not rule this out; only `Alloc`, constants and the pure
+operators are total, and restricting to those would exclude almost all 84 arms
+(389 of the moved instructions are `load` and 129 are `get_field`).
+
+So this is accepted as a loud failure rather than proved away, which is the same
+bargain `assert_closure` makes for `inline`: the interpreter's own type checking
+is the guard, and a mis-speculated arm aborts the search instead of computing
+the wrong number. Differential verification covers 15,250 lanes over 30 frames,
+which is evidence but not proof.
