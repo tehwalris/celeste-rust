@@ -107,6 +107,10 @@ pub fn is_speculatable(instr: &Instruction) -> bool {
         // absent, which is exactly what the `demote_create` entry that planted
         // it already claims never happens. One premise, checked once.
         Instruction::AssertPointer { .. } => true,
+        // Reads the heap, but only to fail: whether a cell holds a plain value
+        // is per-state, not per-lane, and a spurious failure on a state that
+        // would have skipped the arm is loud. Same bargain as the two above.
+        Instruction::AssertValueCell { .. } => true,
         // Weaker than the above and worth stating plainly: this one really can
         // fail where the unspeculated program would not. `if a.type == player
         // then a:method() end` speculates into asserting that a non-player is a

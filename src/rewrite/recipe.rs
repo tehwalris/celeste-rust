@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use super::program::Program;
 use super::rules::{
     allocate_slots, cse, dce, demote_create, fold, if_convert, inline, merge_blocks, pin_builtin,
-    promote_capture, promote_cell,
+    promote_capture, promote_cell, sink_store, speculate,
 };
 use crate::ir::LocalId;
 use super::validate::{validate_function, validate_program};
@@ -107,6 +107,25 @@ pub enum Rule {
         /// The accessor, as `%N`.
         at: String,
     },
+    /// Hoist a triangle arm's speculatable instructions into the head, leaving
+    /// only its stores behind - the state `sink_store` needs. Refused unless
+    /// every hoist commutes with every store it crosses.
+    Speculate {
+        #[serde(rename = "fn")]
+        function: String,
+        /// The block the two paths join at.
+        join: String,
+    },
+    /// Move a triangle arm's trailing store past the join: a guarded load
+    /// before the branch, a phi at the join, the store after it. The
+    /// `assert_value_cell` guard makes the one non-identity case - a closure
+    /// or table cell - fail loudly. Screen at full depth.
+    SinkStore {
+        #[serde(rename = "fn")]
+        function: String,
+        /// The store, as `%N`.
+        at: String,
+    },
     /// Replace one non-escaping, single-store heap cell with SSA values.
     PromoteCell {
         #[serde(rename = "fn")]
@@ -129,6 +148,8 @@ impl Rule {
             Rule::PromoteCapture { .. } => "promote_capture",
             Rule::PinBuiltin { .. } => "pin_builtin",
             Rule::DemoteCreate { .. } => "demote_create",
+            Rule::Speculate { .. } => "speculate",
+            Rule::SinkStore { .. } => "sink_store",
             Rule::PromoteCell { .. } => "promote_cell",
         }
     }
@@ -281,6 +302,10 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::DemoteCreate { function, at } => {
             demote_create::apply(program, function, parse_cell(at)?)
         }
+        Rule::Speculate { function, join } => speculate::apply(program, function, join),
+        Rule::SinkStore { function, at } => {
+            sink_store::apply(program, function, parse_cell(at)?)
+        }
         Rule::PromoteCell { function, cell } => {
             promote_cell::apply(program, function, parse_cell(cell)?)
         }
@@ -344,6 +369,12 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         }
         Rule::DemoteCreate { function, at } => {
             demote_create::verify(&before, program, function, parse_cell(at)?)
+        }
+        Rule::Speculate { function, join } => {
+            speculate::verify(&before, program, function, join)
+        }
+        Rule::SinkStore { function, at } => {
+            sink_store::verify(&before, program, function, parse_cell(at)?)
         }
         Rule::PromoteCell { function, cell } => {
             promote_cell::verify(&before, program, function, parse_cell(cell)?)

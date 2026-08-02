@@ -34,6 +34,8 @@ pub mod pin_builtin;
 pub mod inline;
 pub mod promote_capture;
 pub mod promote_cell;
+pub mod sink_store;
+pub mod speculate;
 
 /// Applies `f` to every function in the program, returning how many changes
 /// were made in total.

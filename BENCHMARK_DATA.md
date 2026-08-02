@@ -29,25 +29,40 @@ not comparable.
 | + stage B finished (`promote_capture`, 84 method inlines) | 4.36 s / 1.06 GB | - |
 | + `cse` (block-local, then cross-block for accessors) | 4.32 s / 1.06 GB | - |
 | + `demote_create` x46, `pin_builtin` x18 | 4.33 s / 1.06 GB | - |
+| + 4 store-blocked triangles converted (`speculate`, `sink_store`, `if_convert`) | 3.36 s / 0.94 GB | 9.22 s / 3.11 GB |
+
+The last row is the first change that moved the fragment count: 558 -> 335
+mean fragments per frame at frame 34, filter_branch 26886 -> 16568, split
+executions 19573 -> 11978. Lane count identical (92,713). See "Which branches
+actually split" below for why these four sites paid when 81 earlier
+conversions did not.
 
 ### K, and why it is the number to watch
 
 `measure_k` reports the static size of a fully inlined, fully unrolled frame
 body from sampled concrete runs. It takes 3 seconds and is the only measure
-here that tracks distance to a compilable kernel. Frame time and fragment count
-do not: fragments have been 558 through every rewrite so far, by design.
+here that tracks distance to a compilable kernel.
 
 |  | original | rewritten |
 |---|---|---|
-| dynamic instrs/frame, mean | 2122 | 1715 |
-| dynamic instrs/frame, max | 6422 | 5252 |
-| distinct blocks reached | 450 | 375 |
-| K, fully unrolled | 8321 | 7880 |
-| K, loops kept as loops | 2963 | 4170 |
+| dynamic instrs/frame, mean | 2122 | 1730 |
+| dynamic instrs/frame, max | 6422 | 5281 |
+| distinct blocks reached | 450 | 371 |
+| K, fully unrolled | 8321 | 7891 |
+| K, loops kept as loops | 2963 | 4181 |
 
-By instruction kind, rewritten: heap 43.9%, arith 25.8%, terminator 9.5%,
-const 6.7%, global 5.5%, phi 3.7%, guard 3.3%, call 1.6%. `arith`, `const` and
+By instruction kind, rewritten: heap 43.9%, arith 25.8%, terminator 9.4%,
+const 6.7%, global 5.4%, phi 3.7%, guard 3.4%, call 1.6%. `arith`, `const` and
 `select` are the core a compiled kernel emits; the rest has to reach zero.
+
+K and the frame time move independently, and the store-triangle conversions
+are a clean example: K rose by 11 (guards added, arms now run on every lane)
+while frame time fell 22%, because the change removes *states*, not per-lane
+work. Fragments had been 558 through every earlier rewrite - none of those
+removed a branch that ever split - and dropped to 335 the first time four
+splitting branches went away. So: K measures distance to the kernel, fragment
+count measures how much splitting remains, frame time follows fragments.
+Judge a rewrite by the one it claims to move.
 
 ### What `cse` cost and bought, in the three variants that were run
 
@@ -159,6 +174,23 @@ Note the mechanism: this is not lane filtering, it is state *duplication*.
 `filter_by_mask` is never called. It is also not something a program rewrite can
 remove, because the branch is semantically necessary - it is how the search
 enumerates inputs.
+
+**Update, after the four store-blocked triangles were converted** (`speculate`
++ `sink_store` + `if_convert` on `player.draw_22 if_join_222` and
+`player.update_21 if_join_98/116/119`):
+
+    branches: 11978 of 181247 executions split the state, across 31 distinct sites
+
+The four sites accounted for 3523 splits directly, but total splits fell by
+7595 and branch *executions* fell by 152k, because a split early in the frame
+multiplies every branch execution downstream - `draw_22`'s split alone cloned
+the state for the whole rest of the frame. Even the irreducible `btn` sites
+fell from 2838 to 1620 each, since fewer states now reach them. This
+downstream multiplier is also why the 81 earlier conversions bought nothing:
+they were aimed at branches that never split, so there was nothing to
+multiply. Every triangle that still splits is now *convertible* (blocked
+splits: 0); the remaining ones are the `and`/`or` ternary pairs of inlined
+`appr`, which need the paired conversion described in plans/status.md.
 
 ### Input fan-out: lane expansion is worse than state duplication (2026-08)
 

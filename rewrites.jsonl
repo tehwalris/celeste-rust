@@ -617,4 +617,17 @@
 {"id":"b015","rule":"pin_builtin","fn":"player.update_21","at":"%1426","name":"min"}
 {"id":"b016","rule":"pin_builtin","fn":"player.update_21","at":"%1439","name":"max"}
 {"id":"b017","rule":"pin_builtin","fn":"player.update_21","at":"%1444","name":"min"}
+{"id":"w000","rule":"speculate","fn":"player.draw_22","join":"if_join_222"}
+{"id":"w001","rule":"sink_store","fn":"player.draw_22","at":"%38"}
+{"id":"w002","rule":"sink_store","fn":"player.draw_22","at":"%32"}
+{"id":"w003","rule":"if_convert","fn":"player.draw_22","join":"if_join_222"}
+{"id":"w004","rule":"speculate","fn":"player.update_21","join":"if_join_98"}
+{"id":"w005","rule":"sink_store","fn":"player.update_21","at":"%187"}
+{"id":"w006","rule":"if_convert","fn":"player.update_21","join":"if_join_98"}
+{"id":"w007","rule":"speculate","fn":"player.update_21","join":"if_join_116"}
+{"id":"w008","rule":"sink_store","fn":"player.update_21","at":"%375"}
+{"id":"w009","rule":"if_convert","fn":"player.update_21","join":"if_join_116"}
+{"id":"w010","rule":"speculate","fn":"player.update_21","join":"if_join_119"}
+{"id":"w011","rule":"sink_store","fn":"player.update_21","at":"%398"}
+{"id":"w012","rule":"if_convert","fn":"player.update_21","join":"if_join_119"}
 {"id":"s1","rule":"allocate_slots"}

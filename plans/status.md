@@ -15,10 +15,12 @@ Branch `rewrite`. Build is warning-free, 226 tests pass, working tree clean.
 | + stage B finished (see below) | 4.36 s | 1.06 GB |
 | + `cse`, stage C piece 1 | 4.32 s | 1.06 GB |
 | + `demote_create` x46, `pin_builtin` x18 | 4.33 s | 1.06 GB |
+| + 4 store-blocked triangles converted | 3.36 s | 0.94 GB |
 
 Lane count is identical throughout (92,713), which is the first thing to check
-when a rewrite claims a win. Frame 37 confirms the same ratios at ~13 s. Keep
-routine runs at frame 34 or below; frame 40 takes over a minute.
+when a rewrite claims a win. Frame 37 confirms the same ratios (9.22 s after
+the store triangles, from 13.0 s). Keep routine runs at frame 34 or below;
+frame 40 takes over a minute.
 
 Full numbers and the time breakdown are in `BENCHMARK_DATA.md`.
 
@@ -202,13 +204,19 @@ reach zero.
 
 Two things this replaces:
 
-* **Fragments per frame cannot move until the end.** It has been 558 through
-  every change in this file. The plan predicts that: fragmentation only drops
-  when the frame is branch-free enough that input fan-out can move to lanes.
-  Judging intermediate work by it produces false discouragement.
+* **Fragments per frame only move when a *splitting* branch is removed.** It
+  was 558 through every change up to and including `cse`, because none of
+  those changes removed a branch that ever split - inlining relocates
+  branches, `cse` folds reads, and the original 81 `if_convert`s were aimed at
+  branches that ran uniformly. Converting the four store-blocked triangles,
+  which really did split, took it to 335. So the number does respond, but only
+  to that one kind of work; judging anything else by it produces false
+  discouragement.
 * **Instruction count of the rewritten program is not the metric either.**
   Cross-block `cse` removed 1454 instructions and made the frame 4% slower, by
-  keeping values live across the blocks in between.
+  keeping values live across the blocks in between. In the other direction,
+  the store conversions *raised* K by 11 (guards, arms running on every lane)
+  and cut frame time 22%.
 
 Both `measure_k` numbers were wrong until 2026-08. It compiled from source and
 never replayed the recipe, so K described a program nobody runs. Pointing it at
@@ -230,23 +238,18 @@ converting a uniform branch is worse than leaving it - the arm stops being
 skipped and runs every time.
 
     triangles           count ever split     splits   % of all
-    convertible            54          6       3072      15.7%
-    blocked               104          4       3523      18.0%
-    all branches            -          -      19573     100.0%
+    convertible            54          6       2755      23.0%
+    blocked               100          0          0       0.0%
+    all branches            -          -      11978     100.0%
 
-    state    function             join                        splits  in the way
-    blocked  player.draw_22       if_join_222                   1499  store
-    ready    player.update_21     in_i1_075_and_or_join_603     1356  -
-    blocked  player.update_21     if_join_116                   1052  store
-    ready    player.update_21     in_i1_076_and_or_join_603      768  -
-    blocked  player.update_21     if_join_119                    684  store
-    ready    player.update_21     in_i1_079_and_or_join_603      508  -
-    blocked  player.update_21     if_join_98                     288  store
-    ready    player.update_21     in_i1_080_and_or_join_603       72  -
-
-Nearly all splits are concentrated in these few sites plus `btn`, which is the
-search's own input fan-out (2838 x 2, irreducible by rewriting; it becomes lane
-expansion once the frame is otherwise branch-free).
+The four store-blocked sites that used to head this table
+(`player.draw_22 if_join_222`, `player.update_21 if_join_98/116/119`; 3523
+splits, 18.0%) are converted - see "Done" below. No blocked triangle splits
+any more. What remains is the `and`/`or` ternary sites of inlined `appr`
+(convertible one by one, wrong one by one - see "Next") plus `btn`, which is
+the search's own input fan-out (1620 x 2, down from 2838 x 2 because fewer
+states reach it; irreducible by rewriting, it becomes lane expansion once the
+frame is otherwise branch-free).
 
 ### Done
 
@@ -273,6 +276,28 @@ expansion once the frame is otherwise branch-free).
   rollback exists, so these stay refused) from ones that can only go wrong
   loudly (the asserts). All 35 triangles blocked by nothing but an
   `assert_closure` survive a 34-frame differential run.
+* **The store in the arm.** Two new rules turn a store-blocked triangle into
+  straight-line code, applied per site as `speculate`, then `sink_store` per
+  store (innermost-last first), then `if_convert`:
+    - `speculate` hoists the arm's speculatable instructions into the head so
+      the store's target pointer comes to dominate the branch. Its own
+      obligation is the crossing: a hoisted instruction that moves above a
+      store must commute with it. Non-heap instructions and non-create
+      accessors always do (a store writes cell contents, never the
+      name-to-cell map); a `load` only past a store to a **provably distinct
+      cell**, and the one distinctness fact implemented is two `get_field`s on
+      the same base with different names.
+    - `sink_store` moves the arm's trailing store past the join: `load %p` in
+      the head, `phi [arm: %v, head: %old]` at the join, one store after it.
+      On the skipped path this stores back what it loaded, which is only the
+      identity for a cell holding a plain value - `load` on a closure or
+      table cell returns a pointer to the cell itself, and storing that back
+      would corrupt it silently. A new `assert_value_cell` guard states that
+      premise and fails loudly in the one case the roundtrip is not the
+      identity.
+  All four sites (13 recipe entries) screened clean in one 34-frame run.
+  Frame 34: 4.33 s -> 3.36 s, fragments 558 -> 335, splits 19573 -> 11978.
+  `player.draw_22` is now entirely branch-free.
 
 ### Not applied, and why
 
@@ -282,15 +307,10 @@ unconditionally and save nothing. This is the same misfire as the original 81
 conversions, which were chosen on convertibility alone and made the frame
 slower. Check `bench --profile` before applying an `if_convert`.
 
-### Next: the store in the arm
+### Next: the `and`/`or` ternary
 
-Four sites, 3523 splits, 18.0%. Turn an arm's `%c = get_field %r.f create;
-store %c <- %v` into a load before the branch, a `select` at the join, and one
-store after it. `demote_create` already handles the `create` half.
-
-### Then: the `and`/`or` ternary
-
-The four `and_or_join_603` sites are `appr` inlined:
+Now the whole remainder of the splitting-triangle table: 2755 splits, 23.0% of
+what is left. The four `and_or_join_603` sites are `appr` inlined:
 
     function appr(val,target,amount)
       return val>target and max(val-amount,target) or min(val+amount,target)

@@ -62,7 +62,8 @@ enum Command {
     /// it. Pipe it into the recipe and re-run `build`.
     Suggest {
         /// What to look for: "promote-cell", "promote-capture", "inline",
-        /// "if-convert", "demote-create" or "pin-builtin".
+        /// "if-convert", "demote-create", "pin-builtin", "speculate" or
+        /// "sink-store".
         #[arg(default_value = "promote-cell")]
         what: String,
         /// Prefix for the generated ids.
@@ -655,6 +656,49 @@ fn main() -> Result<()> {
                          the result will be used at:"
                     );
                     eprintln!("#   the field creations that do happen fall in 2 frames out of 34.");
+                }
+                "speculate" => {
+                    let candidates =
+                        celeste_rust::rewrite::rules::speculate::candidates(&program);
+                    for (i, (function, join)) in candidates.iter().enumerate() {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "id": format!("{}{:03}", prefix, i),
+                                "rule": "speculate",
+                                "fn": function,
+                                "join": join.as_str(),
+                            })
+                        );
+                    }
+                    eprintln!(
+                        "# {} triangle(s) blocked by nothing but stores, hoists commuting.",
+                        candidates.len()
+                    );
+                    eprintln!("# Follow each with sink_store per store, then if_convert.");
+                }
+                "sink-store" => {
+                    let candidates =
+                        celeste_rust::rewrite::rules::sink_store::candidates(&program);
+                    for (i, (function, at)) in candidates.iter().enumerate() {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "id": format!("{}{:03}", prefix, i),
+                                "rule": "sink_store",
+                                "fn": function,
+                                "at": format!("%{}", usize::from(*at)),
+                            })
+                        );
+                    }
+                    eprintln!(
+                        "# {} trailing store(s) of a triangle arm, target defined outside it.",
+                        candidates.len()
+                    );
+                    eprintln!(
+                        "# Each plants an assert_value_cell: a cell that ever holds a \
+                         closure or table fails loudly. Screen at full depth."
+                    );
                 }
                 "promote-capture" => {
                     let mut total_sites = 0;

@@ -164,6 +164,24 @@ impl<'a> CoreInterpreter<'a> {
                     )),
                 }
             }
+            Instruction::AssertValueCell { target } => {
+                let heap_id = self.heap_id_from_pointer_local(*target)?;
+                match self.state.heap.get(heap_id) {
+                    HeapValue::Value(_) => Ok(None),
+                    other => Err(anyhow!(
+                        "AssertValueCell(%{}) failed: the cell holds {}, not a plain \
+                         value. A rewrite claimed loading and storing this cell back \
+                         is the identity, and for this cell it is not.",
+                        usize::from(*target),
+                        match other {
+                            HeapValue::Closure(fun_def, _) =>
+                                format!("a closure of {}", fun_def.as_str()),
+                            HeapValue::BuiltinFun(name) => format!("builtin {}", name),
+                            _ => "a table".to_string(),
+                        }
+                    )),
+                }
+            }
             Instruction::GetGlobal {
                 name,
                 create_if_missing,

@@ -253,6 +253,24 @@ pub enum Instruction {
     AssertPointer {
         value: LocalId,
     },
+    /// Fails execution unless the cell `target` points at holds a plain value
+    /// - not a closure and not a table.
+    ///
+    /// Planted by `rules::sink_store`, which turns a conditional `store` into
+    /// a load before the branch, a phi at the join and an unconditional store
+    /// after it. On the path that skipped the arm, that stores the loaded
+    /// value back - which is only the identity for a plain-value cell.
+    /// `load` on a closure or table cell yields a *pointer to the cell
+    /// itself*, and storing that back would overwrite the closure or table
+    /// with a self-pointer, silently. This says the premise out loud instead:
+    /// the one place the roundtrip is not the identity is the one place this
+    /// fails, before the load happens.
+    ///
+    /// Like `AssertPointer`, this is a property of the state's heap rather
+    /// than of a lane: one tag check per state, never a split.
+    AssertValueCell {
+        target: LocalId,
+    },
     /// A `Call` whose callee has been pinned to a named builtin.
     ///
     /// Exactly `Call`, after asserting that `callee` holds `BuiltinFun(name)`.
@@ -356,6 +374,7 @@ impl Instruction {
                 captures: captures.iter().map(|id| f(*id)).collect(),
             },
             Self::AssertPointer { value } => Self::AssertPointer { value: f(*value) },
+            Self::AssertValueCell { target } => Self::AssertValueCell { target: f(*target) },
             Self::CallBuiltin { callee, name, args } => Self::CallBuiltin {
                 callee: f(*callee),
                 name: name.clone(),
@@ -406,6 +425,7 @@ impl Instruction {
                 v
             }
             Self::AssertPointer { value } => vec![*value],
+            Self::AssertValueCell { target } => vec![*target],
             Self::CallBuiltin { callee, args, .. } => {
                 let mut v = vec![*callee];
                 v.extend(args.iter().copied());
@@ -440,7 +460,7 @@ impl Instruction {
             | Self::Phi { .. } => false,
             // Not a side effect on the heap, but they must never be optimised
             // away: their whole purpose is to fail.
-            Self::AssertClosure { .. } | Self::AssertPointer { .. } => true,
+            Self::AssertClosure { .. } | Self::AssertPointer { .. } | Self::AssertValueCell { .. } => true,
             // Pure in the heap, but it asserts, and the original `call` it
             // replaced would have run and could have failed. Same answer as
             // `Call` for the same reason.
