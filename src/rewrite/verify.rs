@@ -207,6 +207,14 @@ pub struct AbstractRun {
     /// recomputes its label set, which is free at 100 blocks and is not at the
     /// 1545 a fully inlined program has.
     frame_cfg: crate::interpreter::fixed_env::PreparedCfg,
+    /// How many separate states each frame produced, before they were merged
+    /// back into one.
+    ///
+    /// This is the number that decides how expensive a frame is. Re-merging is
+    /// 60% of runtime and its cost is per state, so a rewrite that removes
+    /// branches should be judged by this and not by its `filter_branch` share.
+    /// See BENCHMARK_DATA.md.
+    states_before_merge: Vec<usize>,
 }
 
 impl AbstractRun {
@@ -222,7 +230,7 @@ impl AbstractRun {
         let frame_cfg = crate::interpreter::fixed_env::PreparedCfg::new(
             program.frame_cfg().clone(),
         );
-        Ok(Self { states, fixed_env, frame_cfg })
+        Ok(Self { states, fixed_env, frame_cfg, states_before_merge: Vec::new() })
     }
 
     pub fn step(&mut self) -> Result<()> {
@@ -233,6 +241,7 @@ impl AbstractRun {
             new_states.extend(result.into_iter().map(|(s, _)| s));
         }
         let new_states: Vec<State> = new_states.into_iter().map(make_state_abstract).collect();
+        self.states_before_merge.push(new_states.len());
         self.states = {
             let _trace = crate::interpreter::tracing::TraceSpan::new(
                 "merge_frame_boundary",
@@ -249,6 +258,17 @@ impl AbstractRun {
 
     pub fn lane_count(&self) -> usize {
         self.states.iter().map(|s| s.vector_size).sum()
+    }
+
+    /// (total, mean, max) states produced per frame before merging.
+    pub fn states_before_merge(&self) -> (usize, f64, usize) {
+        let total: usize = self.states_before_merge.iter().sum();
+        let n = self.states_before_merge.len().max(1);
+        (
+            total,
+            total as f64 / n as f64,
+            self.states_before_merge.iter().copied().max().unwrap_or(0),
+        )
     }
 }
 

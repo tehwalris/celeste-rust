@@ -69,12 +69,18 @@ Surveyed in `plans/rewrite-plan.md` section 9. The short version:
 
 Order of work is in section 9. After that, section 4's stage E (`peel`).
 
-## Second lever, unscheduled
+## Not a second lever after all
 
-`gc` is 21% of runtime at ~45 us per state. It copies every heap value, and a
-heap value holds a `MaybeVector::Vector(Vec<T>)` of per-lane data, so the cost
-is (cells x lanes) even though gc only renumbers `HeapId`s and never touches
-lane data. Making that `Arc<Vec<T>>` would make gc nearly free and would
-probably help `merge_groups` and `dedup_state` too. This is close to what the
-old `barrier` branch did. Worth roughly 20% on its own, and unlike if-conversion
-it does not depend on the program's shape.
+`gc` is 21% of runtime, and the plan here used to say that
+`MaybeVector::Vector(Arc<Vec<T>>)` would make it nearly free, since gc only
+renumbers `HeapId`s but deep-copies per-lane data to do it.
+
+Measured, that is wrong. gc copies 284 MB of lane data over the whole frame-34
+run, about 28 ms against gc's 1.0 s - roughly 3%. Its cost is per *cell* (165 ns
+each, mostly allocation: the `HeapValue` clone, the `Box` the `FrozenVec`
+stores, and a rebuilt `FxHashMap` per object table), and cells scale with the
+number of states rather than with lanes per state.
+
+So gc is not an independent target. It is the same fragmentation problem seen
+from the other end, and if-conversion is what shrinks it. Numbers in
+BENCHMARK_DATA.md.

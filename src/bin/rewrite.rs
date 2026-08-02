@@ -135,6 +135,11 @@ fn bench(label: &str, program: &Program, frames: u32, profile: bool) -> Result<(
         "{:<10} end-of-frame state: heap {} cells, local_env {} entries",
         "", heap_len, env_len
     );
+    let (fragments, mean_fragments, max_fragments) = run.states_before_merge();
+    println!(
+        "{:<10} fragments before merge: {} total, {:.0} mean, {} max per frame",
+        "", fragments, mean_fragments, max_fragments
+    );
 
     if profile {
         let rows = celeste_rust::interpreter::tracing::span_self_time_summary();
