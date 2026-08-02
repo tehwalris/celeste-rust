@@ -62,7 +62,7 @@ enum Command {
     /// it. Pipe it into the recipe and re-run `build`.
     Suggest {
         /// What to look for: "promote-cell", "promote-capture", "inline",
-        /// "if-convert" or "demote-create".
+        /// "if-convert", "demote-create" or "pin-builtin".
         #[arg(default_value = "promote-cell")]
         what: String,
         /// Prefix for the generated ids.
@@ -612,6 +612,26 @@ fn main() -> Result<()> {
                         eprintln!("#   {:>6}  {}", count, kind);
                     }
                 }
+                "pin-builtin" => {
+                    let candidates =
+                        celeste_rust::rewrite::rules::pin_builtin::candidates(&program);
+                    for (i, (function, at, name)) in candidates.iter().enumerate() {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "id": format!("{}{:03}", prefix, i),
+                                "rule": "pin_builtin",
+                                "fn": function,
+                                "at": format!("%{}", usize::from(*at)),
+                                "name": name,
+                            })
+                        );
+                    }
+                    eprintln!(
+                        "# {} call(s) to a pure builtin blocking an if_convert triangle.",
+                        candidates.len()
+                    );
+                }
                 "demote-create" => {
                     let candidates =
                         celeste_rust::rewrite::rules::demote_create::candidates(&program);
@@ -793,7 +813,12 @@ fn screen_trial(
     match outcome {
         Ok(Ok(None)) => Ok(trial),
         Ok(Ok(Some(d))) => Err(format!("frame {}: {}", d.frame, first_line(&d.detail))),
-        Ok(Err(e)) => Err(first_line(&format!("{}", e))),
+        // `{}` on an anyhow error shows only the outermost context, which for a
+        // rule failure is just "verifying b000 (pin_builtin)" - true, and no
+        // help at all. The root cause is the interesting line.
+        Ok(Err(e)) => Err(first_line(
+            &e.chain().last().map_or_else(|| e.to_string(), |c| c.to_string()),
+        )),
         Err(_) => Err("panicked - see the message above".to_string()),
     }
 }

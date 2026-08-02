@@ -112,14 +112,14 @@ fn builtin_new_vector(mut state: State, args: Vec<Value>) -> Result<Vec<(State, 
     Ok(vec![(state, Value::Number(MaybeVector::Vector(numbers)))])
 }
 
-fn builtin_flr(state: State, args: Vec<Value>) -> Result<Vec<(State, Value)>> {
+fn builtin_flr(args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(anyhow!("flr requires 1 argument"));
     }
     match &args[0] {
         Value::Number(nums) => {
             let result = nums.map(|n| n.flr());
-            Ok(vec![(state, Value::Number(result))])
+            Ok(Value::Number(result))
         }
         Value::NumberInterval(MaybeVector::Scalar(interval)) => {
             // For an interval, flr only works if all values have the same floor
@@ -131,7 +131,7 @@ fn builtin_flr(state: State, args: Vec<Value>) -> Result<Vec<(State, Value)>> {
                     interval.low, interval.high, low_flr, high_flr
                 ));
             }
-            Ok(vec![(state, Value::Number(MaybeVector::Scalar(low_flr)))])
+            Ok(Value::Number(MaybeVector::Scalar(low_flr)))
         }
         Value::NumberInterval(MaybeVector::Vector(intervals)) => {
             // For a vector of intervals, each must have a single floor value
@@ -152,7 +152,7 @@ fn builtin_flr(state: State, args: Vec<Value>) -> Result<Vec<(State, Value)>> {
             } else {
                 Value::Number(MaybeVector::Vector(floors))
             };
-            Ok(vec![(state, result)])
+            Ok(result)
         }
         _ => Err(anyhow!("flr: argument must be a number")),
     }
@@ -281,34 +281,34 @@ fn builtin_error(_state: State, args: Vec<Value>) -> Result<Vec<(State, Value)>>
     }
 }
 
-fn builtin_min(state: State, args: Vec<Value>) -> Result<Vec<(State, Value)>> {
+fn builtin_min(args: &[Value]) -> Result<Value> {
     if args.len() != 2 { return Err(anyhow!("min requires 2 arguments")); }
     match (&args[0], &args[1]) {
         (Value::Number(a), Value::Number(b)) => {
             let result = MaybeVector::map2(a, b, |a, b| (*a).min(*b));
-            Ok(vec![(state, Value::Number(result))])
+            Ok(Value::Number(result))
         }
         _ => Err(anyhow!("min: arguments must be numbers")),
     }
 }
 
-fn builtin_max(state: State, args: Vec<Value>) -> Result<Vec<(State, Value)>> {
+fn builtin_max(args: &[Value]) -> Result<Value> {
     if args.len() != 2 { return Err(anyhow!("max requires 2 arguments")); }
     match (&args[0], &args[1]) {
         (Value::Number(a), Value::Number(b)) => {
             let result = MaybeVector::map2(a, b, |a, b| (*a).max(*b));
-            Ok(vec![(state, Value::Number(result))])
+            Ok(Value::Number(result))
         }
         _ => Err(anyhow!("max: arguments must be numbers")),
     }
 }
 
-fn builtin_abs(state: State, args: Vec<Value>) -> Result<Vec<(State, Value)>> {
+fn builtin_abs(args: &[Value]) -> Result<Value> {
     if args.len() != 1 { return Err(anyhow!("abs requires 1 argument")); }
     match &args[0] {
         Value::Number(nums) => {
             let result = nums.map(|n| n.abs());
-            Ok(vec![(state, Value::Number(result))])
+            Ok(Value::Number(result))
         }
         _ => Err(anyhow!("abs: argument must be a number")),
     }
@@ -515,10 +515,10 @@ pub fn create_fixed_env_with_builtins() -> FixedEnv {
     fixed_env.add_builtin("__new_vector", builtin_new_vector);
     fixed_env.add_builtin("__array_table_drop_last", builtin_array_table_drop_last);
     fixed_env.add_builtin("error", builtin_error);
-    fixed_env.add_builtin("min", builtin_min);
-    fixed_env.add_builtin("max", builtin_max);
-    fixed_env.add_builtin("abs", builtin_abs);
-    fixed_env.add_builtin("flr", builtin_flr);
+    fixed_env.add_pure_builtin("min", builtin_min);
+    fixed_env.add_pure_builtin("max", builtin_max);
+    fixed_env.add_pure_builtin("abs", builtin_abs);
+    fixed_env.add_pure_builtin("flr", builtin_flr);
     fixed_env.add_builtin("__split_by_flr", builtin_split_by_flr);
     fixed_env.add_builtin("add", builtin_add);
     fixed_env.add_builtin("print", builtin_print);

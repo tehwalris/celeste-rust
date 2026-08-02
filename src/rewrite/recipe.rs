@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use super::program::Program;
 use super::rules::{
-    allocate_slots, cse, dce, demote_create, fold, if_convert, inline, merge_blocks,
+    allocate_slots, cse, dce, demote_create, fold, if_convert, inline, merge_blocks, pin_builtin,
     promote_capture, promote_cell,
 };
 use crate::ir::LocalId;
@@ -86,6 +86,17 @@ pub enum Rule {
         /// Which capture position, counting from 0.
         index: usize,
     },
+    /// Name the callee of a call to a pure builtin, so that `if_convert` can
+    /// speculate it and `cse` can see through it. Guarded: the call fails if
+    /// the callee is not the builtin named.
+    PinBuiltin {
+        #[serde(rename = "fn")]
+        function: String,
+        /// The `call` instruction, as `%N`.
+        at: String,
+        /// Which builtin. Must be one of `fixed_env::PURE_BUILTINS`.
+        name: String,
+    },
     /// Turn one creating accessor into a plain read, guarded by an
     /// `assert_pointer`. Not semantics-preserving: it claims the field already
     /// exists there, and the guard is what makes a wrong claim loud instead of
@@ -116,6 +127,7 @@ impl Rule {
             Rule::Inline { .. } => "inline",
             Rule::IfConvert { .. } => "if_convert",
             Rule::PromoteCapture { .. } => "promote_capture",
+            Rule::PinBuiltin { .. } => "pin_builtin",
             Rule::DemoteCreate { .. } => "demote_create",
             Rule::PromoteCell { .. } => "promote_cell",
         }
@@ -220,12 +232,8 @@ impl StepTiming {
 /// think to look for.
 pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepReport> {
     let mut timing = StepTiming::default();
-    let clock = std::time::Instant::now();
-    let before = program.clone();
-    timing.clone = clock.elapsed();
     let instructions_before = program.instruction_count();
     let blocks_before = program.block_count();
-    let clock = std::time::Instant::now();
 
     // Every rule but `allocate_slots` runs under the identity slot map.
     //
@@ -237,11 +245,25 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
     // failing loudly on something avoidable is worse than not creating it.
     // Resetting here makes "the map matches the program" an invariant of the
     // recipe rather than an ordering rule an author has to remember.
+    //
+    // This happens *before* `before` is taken, so that `before` is the program
+    // the rule actually saw. Taking the snapshot first was a real bug: a rule
+    // whose verifier checks that it changed nothing else - `pin_builtin` and
+    // `demote_create` both do - then sees every untouched function differ,
+    // because `FunDef` carries the slot map and the reset had just changed all
+    // of them. It only showed up under `screen`, where the base program has been
+    // through `allocate_slots`; in a recipe these rules run before it, where the
+    // reset is a no-op.
     if !matches!(entry.rule, Rule::AllocateSlots) {
         for fun in program.functions.values_mut() {
             fun.cfg.slots = std::sync::Arc::new(crate::ir::SlotMap::identity());
         }
     }
+
+    let clock = std::time::Instant::now();
+    let before = program.clone();
+    timing.clone = clock.elapsed();
+    let clock = std::time::Instant::now();
 
     let changes = match &entry.rule {
         Rule::Dce => dce::apply(program),
@@ -252,6 +274,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::IfConvert { function, join } => if_convert::apply(program, function, join),
         Rule::PromoteCapture { function, index } => {
             promote_capture::apply(program, function, *index)
+        }
+        Rule::PinBuiltin { function, at, name } => {
+            pin_builtin::apply(program, function, parse_cell(at)?, name)
         }
         Rule::DemoteCreate { function, at } => {
             demote_create::apply(program, function, parse_cell(at)?)
@@ -313,6 +338,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         }
         Rule::PromoteCapture { function, index } => {
             promote_capture::verify(&before, program, function, *index)
+        }
+        Rule::PinBuiltin { function, at, name } => {
+            pin_builtin::verify(&before, program, function, parse_cell(at)?, name)
         }
         Rule::DemoteCreate { function, at } => {
             demote_create::verify(&before, program, function, parse_cell(at)?)

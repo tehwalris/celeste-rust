@@ -15,6 +15,24 @@ type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHash
 /// Multiple pairs are returned when the function can branch (e.g., on UnknownBool).
 pub type BuiltinFun = Arc<dyn Fn(State, Vec<Value>) -> anyhow::Result<Vec<(State, Value)>> + Send + Sync>;
 
+/// A builtin that is a function of its arguments alone: it cannot read or write
+/// the heap, and it always yields exactly one result rather than branching.
+pub type PureBuiltinFun = Arc<dyn Fn(&[Value]) -> anyhow::Result<Value> + Send + Sync>;
+
+/// The builtins that `Instruction::CallBuiltin` may name.
+///
+/// One list, used by two things that must not drift apart: `add_pure_builtin`
+/// refuses to register anything not named here, and
+/// `rules::if_convert::is_speculatable` decides from it whether a `CallBuiltin`
+/// can be hoisted out of a branch arm. Adding a name here is a claim that the
+/// implementation takes `State` and gives it back untouched, returns a single
+/// result, and reads nothing outside its arguments.
+pub const PURE_BUILTINS: &[&str] = &["min", "max", "abs", "flr"];
+
+pub fn is_pure_builtin(name: &str) -> bool {
+    PURE_BUILTINS.contains(&name)
+}
+
 /// PreparedCfg holds a CFG along with precomputed analysis data.
 /// This caches the label set to avoid recomputing it on every interpret_cfg call.
 #[derive(Clone)]
@@ -40,6 +58,10 @@ impl PreparedCfg {
 pub struct FixedEnv {
     pub fun_defs: FxHashMap<GlobalId, (FunDef, PreparedCfg)>,
     pub builtin_funs: FxHashMap<String, BuiltinFun>,
+    /// The subset of `builtin_funs` that `CallBuiltin` can invoke directly.
+    /// The same function is behind both entries, so a `call` and a pinned
+    /// `call_builtin` of the same name cannot compute different things.
+    pub pure_builtin_funs: FxHashMap<String, PureBuiltinFun>,
 }
 
 impl FixedEnv {
@@ -47,6 +69,7 @@ impl FixedEnv {
         Self {
             fun_defs: FxHashMap::default(),
             builtin_funs: FxHashMap::default(),
+            pure_builtin_funs: FxHashMap::default(),
         }
     }
 
@@ -61,5 +84,29 @@ impl FixedEnv {
         F: Fn(State, Vec<Value>) -> anyhow::Result<Vec<(State, Value)>> + Send + Sync + 'static,
     {
         self.builtin_funs.insert(name.to_string(), Arc::new(f));
+    }
+
+    /// Registers a builtin under both signatures, from one implementation.
+    ///
+    /// A normal `call` goes through the wrapper and behaves exactly as before;
+    /// a pinned `call_builtin` goes straight to `f`. Deriving one from the other
+    /// is the point - two hand-written copies of `max` that disagreed on an edge
+    /// case would be a rewrite that silently changes the program.
+    pub fn add_pure_builtin<F>(&mut self, name: &str, f: F)
+    where
+        F: Fn(&[Value]) -> anyhow::Result<Value> + Send + Sync + 'static,
+    {
+        assert!(
+            is_pure_builtin(name),
+            "{} is not in PURE_BUILTINS, so CallBuiltin must not be able to name it",
+            name
+        );
+        let f: PureBuiltinFun = Arc::new(f);
+        let wrapped = f.clone();
+        self.builtin_funs.insert(
+            name.to_string(),
+            Arc::new(move |state, args| Ok(vec![(state, wrapped(&args)?)])),
+        );
+        self.pure_builtin_funs.insert(name.to_string(), f);
     }
 }

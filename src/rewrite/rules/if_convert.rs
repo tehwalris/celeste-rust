@@ -117,6 +117,14 @@ pub fn is_speculatable(instr: &Instruction) -> bool {
         // blocked by nothing else; the ones whose claim does not hold fail
         // screening and are simply not applied.
         Instruction::AssertClosure { .. } => true,
+        // A `Call` has to be refused because it says nothing about what it
+        // calls. This one names its callee, and the name is always one of
+        // `fixed_env::PURE_BUILTINS` - a function of its arguments that cannot
+        // reach the heap and cannot branch. What is left is the assertion, and
+        // that fails loudly like the others.
+        Instruction::CallBuiltin { name, .. } => {
+            crate::interpreter::fixed_env::is_pure_builtin(name)
+        }
 
         // -- pure: the extra result is just ignored -------------------------
         Instruction::Load { .. }

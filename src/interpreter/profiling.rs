@@ -91,6 +91,7 @@ fn instruction_type_name(instr: &Instruction) -> String {
             format!("AssertClosure({})", fun_def.as_str())
         }
         Instruction::AssertPointer { .. } => "AssertPointer".to_string(),
+        Instruction::CallBuiltin { name, .. } => format!("CallBuiltin({})", name),
         Instruction::GetGlobal { name, .. } => format!("GetGlobal({})", name),
         Instruction::Load { .. } => "Load".to_string(),
         Instruction::Store { .. } => "Store".to_string(),

@@ -103,6 +103,12 @@ pub fn format_instruction(instr: &Instruction) -> String {
         Instruction::AssertPointer { value } => {
             format!("assert_pointer {}", n(*value))
         }
+        Instruction::CallBuiltin { callee, name, args } => format!(
+            "call_builtin {:?} via {}({})",
+            name,
+            n(*callee),
+            args.iter().map(|a| n(*a)).collect::<Vec<_>>().join(", ")
+        ),
         Instruction::AssertClosure { value, fun_def, captures } => format!(
             "assert_closure {} is {}{}",
             n(*value),

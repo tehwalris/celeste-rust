@@ -123,6 +123,31 @@ impl<'a> CoreInterpreter<'a> {
                 }
                 Ok(None)
             }
+            Instruction::CallBuiltin { callee, name, args } => {
+                let heap_id = self.heap_id_from_pointer_local(*callee)?;
+                match self.state.heap.get(heap_id) {
+                    HeapValue::BuiltinFun(actual) if actual == name => {}
+                    other => {
+                        return Err(anyhow!(
+                            "CallBuiltin({}) failed: %{} is {:?}, not the builtin a rewrite \
+                             pinned it to",
+                            name,
+                            usize::from(*callee),
+                            other
+                        ))
+                    }
+                }
+                let f = self
+                    .fixed_env
+                    .pure_builtin_funs
+                    .get(name)
+                    .ok_or_else(|| anyhow!("{} is not a pure builtin", name))?;
+                let arg_values: Vec<Value> = args
+                    .iter()
+                    .map(|id| self.state.local_env.get(*id).clone())
+                    .collect();
+                Ok(Some(f(&arg_values)?))
+            }
             Instruction::AssertPointer { value } => {
                 match self.state.local_env.get(*value) {
                     Value::Pointer(_) => Ok(None),

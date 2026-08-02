@@ -253,6 +253,27 @@ pub enum Instruction {
     AssertPointer {
         value: LocalId,
     },
+    /// A `Call` whose callee has been pinned to a named builtin.
+    ///
+    /// Exactly `Call`, after asserting that `callee` holds `BuiltinFun(name)`.
+    /// The point is not speed - it is that a `Call` says nothing about what it
+    /// calls, so `if_convert` has to assume the worst and refuse to speculate
+    /// it. Naming the callee lets the whitelist in `fixed_env::PURE_BUILTINS`
+    /// answer the question instead.
+    ///
+    /// That whitelist is the instruction's invariant, not a hint: `name` is
+    /// always a pure builtin, because `rules::pin_builtin` refuses to write
+    /// anything else and its verifier re-checks it. Several passes depend on
+    /// that - `cse` does not treat this as a barrier, which would be wrong for
+    /// a builtin that could touch the heap.
+    ///
+    /// The implementation behind the name is the same function a `call` would
+    /// have reached, so pinning cannot change what is computed.
+    CallBuiltin {
+        callee: LocalId,
+        name: String,
+        args: Vec<LocalId>,
+    },
 }
 
 impl Instruction {
@@ -335,6 +356,11 @@ impl Instruction {
                 captures: captures.iter().map(|id| f(*id)).collect(),
             },
             Self::AssertPointer { value } => Self::AssertPointer { value: f(*value) },
+            Self::CallBuiltin { callee, name, args } => Self::CallBuiltin {
+                callee: f(*callee),
+                name: name.clone(),
+                args: args.iter().map(|id| f(*id)).collect(),
+            },
         }
     }
 }
@@ -380,6 +406,11 @@ impl Instruction {
                 v
             }
             Self::AssertPointer { value } => vec![*value],
+            Self::CallBuiltin { callee, args, .. } => {
+                let mut v = vec![*callee];
+                v.extend(args.iter().copied());
+                v
+            }
         }
     }
 
@@ -410,6 +441,10 @@ impl Instruction {
             // Not a side effect on the heap, but they must never be optimised
             // away: their whole purpose is to fail.
             Self::AssertClosure { .. } | Self::AssertPointer { .. } => true,
+            // Pure in the heap, but it asserts, and the original `call` it
+            // replaced would have run and could have failed. Same answer as
+            // `Call` for the same reason.
+            Self::CallBuiltin { .. } => true,
         }
     }
 }

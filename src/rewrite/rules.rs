@@ -30,6 +30,7 @@ pub mod cse;
 pub mod dce;
 pub mod demote_create;
 pub mod merge_blocks;
+pub mod pin_builtin;
 pub mod inline;
 pub mod promote_capture;
 pub mod promote_cell;
