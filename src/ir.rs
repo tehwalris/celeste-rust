@@ -212,12 +212,19 @@ pub enum Instruction {
         if_false: LocalId,
     },
     /// Fails execution unless `value` is a pointer to a closure of `fun_def`
-    /// with no captures.
+    /// whose captured values are exactly `captures`.
     ///
     /// This is what makes `inline` sound without any analysis: rather than
     /// proving that a dynamic call always reaches a particular function, the
     /// rewrite asserts it and splices the body in. If the assertion ever fails
     /// we find out loudly instead of silently running the wrong code.
+    ///
+    /// The same trick extends to captures. Inlining a closure body needs a
+    /// local bound to each of the callee's `capture_ids`, and nothing at a call
+    /// site holds a captured value - `%f = get_field %o.collide; call (load %f)`
+    /// mentions the receiver, not the capture. That the receiver *is* the
+    /// capture is true of Celeste's objects but is not something the rewrite
+    /// proves; it asserts it here instead.
     ///
     /// Cheap at runtime: a closure pointer is a scalar, not a per-lane value,
     /// so this is one check per state rather than per lane, and it never splits
@@ -225,6 +232,7 @@ pub enum Instruction {
     AssertClosure {
         value: LocalId,
         fun_def: GlobalId,
+        captures: Vec<LocalId>,
     },
 }
 
@@ -302,9 +310,10 @@ impl Instruction {
                 if_true: f(*if_true),
                 if_false: f(*if_false),
             },
-            Self::AssertClosure { value, fun_def } => Self::AssertClosure {
+            Self::AssertClosure { value, fun_def, captures } => Self::AssertClosure {
                 value: f(*value),
                 fun_def: fun_def.clone(),
+                captures: captures.iter().map(|id| f(*id)).collect(),
             },
         }
     }
@@ -345,7 +354,11 @@ impl Instruction {
             Self::Select { condition, if_true, if_false } => {
                 vec![*condition, *if_true, *if_false]
             }
-            Self::AssertClosure { value, .. } => vec![*value],
+            Self::AssertClosure { value, captures, .. } => {
+                let mut v = vec![*value];
+                v.extend(captures.iter().copied());
+                v
+            }
         }
     }
 

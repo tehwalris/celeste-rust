@@ -49,7 +49,7 @@ pub enum Rule {
     MergeBlocks,
     /// Local simplifications: constant conditions, degenerate phis.
     Fold,
-    /// Splice a capture-free callee's body into one call site, guarded by an
+    /// Splice a callee's body into one call site, guarded by an
     /// `assert_closure`.
     Inline {
         #[serde(rename = "fn")]
@@ -58,6 +58,11 @@ pub enum Rule {
         at: String,
         /// The function to splice in.
         callee: String,
+        /// Locals holding the callee's captured values, one per capture, as
+        /// `%N`. The guard asserts the closure really did capture these, so a
+        /// wrong guess fails loudly rather than reading the wrong object.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        captures: Vec<String>,
     },
     /// Collapse a branch whose arm is safe to run unconditionally into a
     /// `select` at the named join block.
@@ -103,6 +108,10 @@ impl Rule {
 fn parse_cell(text: &str) -> Result<LocalId> {
     super::print::parse_local_name(text)
         .ok_or_else(|| anyhow!("cell must look like %17, got {:?}", text))
+}
+
+fn parse_cells(texts: &[String]) -> Result<Vec<LocalId>> {
+    texts.iter().map(|t| parse_cell(t)).collect()
 }
 
 #[derive(Debug, Default)]
@@ -172,6 +181,22 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
     let instructions_before = program.instruction_count();
     let blocks_before = program.block_count();
 
+    // Every rule but `allocate_slots` runs under the identity slot map.
+    //
+    // A slot map is built for a particular set of instructions and says nothing
+    // about instructions minted later, so any rule that adds a `LocalId` after
+    // `allocate_slots` leaves the map stale. `validate` catches that - which is
+    // how it was found, when `screen` appended candidates to a recipe whose last
+    // entry was `allocate_slots` and 36 of 36 died with structural errors - but
+    // failing loudly on something avoidable is worse than not creating it.
+    // Resetting here makes "the map matches the program" an invariant of the
+    // recipe rather than an ordering rule an author has to remember.
+    if !matches!(entry.rule, Rule::AllocateSlots) {
+        for fun in program.functions.values_mut() {
+            fun.cfg.slots = std::sync::Arc::new(crate::ir::SlotMap::identity());
+        }
+    }
+
     let changes = match &entry.rule {
         Rule::Dce => dce::apply(program),
         Rule::AllocateSlots => allocate_slots::apply(program),
@@ -184,9 +209,14 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::PromoteCell { function, cell } => {
             promote_cell::apply(program, function, parse_cell(cell)?)
         }
-        Rule::Inline { function, at, callee } => {
-            inline::apply(program, &entry.id, function, parse_cell(at)?, callee)
-        }
+        Rule::Inline { function, at, callee, captures } => inline::apply(
+            program,
+            &entry.id,
+            function,
+            parse_cell(at)?,
+            callee,
+            &parse_cells(captures)?,
+        ),
     }
     .with_context(|| format!("applying {} ({})", entry.id, entry.rule.name()))?;
 
@@ -216,9 +246,15 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::PromoteCell { function, cell } => {
             promote_cell::verify(&before, program, function, parse_cell(cell)?)
         }
-        Rule::Inline { function, at, callee } => {
-            inline::verify(&before, program, &entry.id, function, parse_cell(at)?, callee)
-        }
+        Rule::Inline { function, at, callee, captures } => inline::verify(
+            &before,
+            program,
+            &entry.id,
+            function,
+            parse_cell(at)?,
+            callee,
+            &parse_cells(captures)?,
+        ),
     }
     .with_context(|| format!("verifying {} ({})", entry.id, entry.rule.name()))?;
 

@@ -63,7 +63,7 @@ impl<'a> CoreInterpreter<'a> {
                 let heap_id = self.state.heap.alloc();
                 Ok(Some(Value::Pointer(heap_id)))
             }
-            Instruction::AssertClosure { value, fun_def } => {
+            Instruction::AssertClosure { value, fun_def, captures } => {
                 let actual = self.state.local_env.get(*value);
                 let Value::Pointer(heap_id) = actual else {
                     return Err(anyhow!(
@@ -72,30 +72,56 @@ impl<'a> CoreInterpreter<'a> {
                         actual
                     ));
                 };
-                match self.state.heap.get(*heap_id) {
-                    HeapValue::Closure(name, captures) => {
-                        if name != fun_def {
-                            return Err(anyhow!(
-                                "AssertClosure({}) failed: closure is {}",
-                                fun_def.as_str(),
-                                name.as_str()
-                            ));
-                        }
-                        if !captures.is_empty() {
-                            return Err(anyhow!(
-                                "AssertClosure({}) failed: expected no captures, got {}",
-                                fun_def.as_str(),
-                                captures.len()
-                            ));
-                        }
-                        Ok(None)
+                let (name, actual_captures) = match self.state.heap.get(*heap_id) {
+                    HeapValue::Closure(name, actual_captures) => (name, actual_captures),
+                    other => {
+                        return Err(anyhow!(
+                            "AssertClosure({}) failed: target is {:?}",
+                            fun_def.as_str(),
+                            other
+                        ))
                     }
-                    other => Err(anyhow!(
-                        "AssertClosure({}) failed: target is {:?}",
+                };
+                if name != fun_def {
+                    return Err(anyhow!(
+                        "AssertClosure({}) failed: closure is {}",
                         fun_def.as_str(),
-                        other
-                    )),
+                        name.as_str()
+                    ));
                 }
+                if actual_captures.len() != captures.len() {
+                    return Err(anyhow!(
+                        "AssertClosure({}) failed: closure captured {} value(s), the assertion \
+                         names {}",
+                        fun_def.as_str(),
+                        actual_captures.len(),
+                        captures.len()
+                    ));
+                }
+                // Compared by exact `Value` equality rather than anything
+                // cleverer. This is the whole guarantee behind inlining a
+                // closure with captures, so it should refuse anything it is not
+                // certain about - a scalar and a vector of the same number are
+                // deliberately not accepted as equal.
+                let expected: Vec<Value> = captures
+                    .iter()
+                    .map(|id| self.state.local_env.get(*id).clone())
+                    .collect();
+                for (index, (want, got)) in expected.iter().zip(actual_captures.iter()).enumerate()
+                {
+                    if want != got {
+                        return Err(anyhow!(
+                            "AssertClosure({}) failed: capture {} is {:?}, the assertion names \
+                             %{} which holds {:?}",
+                            fun_def.as_str(),
+                            index,
+                            got,
+                            usize::from(captures[index]),
+                            want
+                        ));
+                    }
+                }
+                Ok(None)
             }
             Instruction::GetGlobal {
                 name,

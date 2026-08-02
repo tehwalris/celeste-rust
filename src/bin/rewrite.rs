@@ -362,19 +362,24 @@ fn main() -> Result<()> {
                 }
                 "inline" => {
                     for (name, fun) in &program.functions {
-                        for (at, callee) in
+                        for (at, callee, captures) in
                             celeste_rust::rewrite::rules::inline::candidates(&program, fun)
                         {
-                            println!(
-                                "{}",
-                                serde_json::json!({
-                                    "id": format!("{}{:03}", prefix, n),
-                                    "rule": "inline",
-                                    "fn": name.as_str(),
-                                    "at": format!("%{}", usize::from(at)),
-                                    "callee": callee,
-                                })
-                            );
+                            let captures: Vec<String> = captures
+                                .iter()
+                                .map(|c| format!("%{}", usize::from(*c)))
+                                .collect();
+                            let mut entry = serde_json::json!({
+                                "id": format!("{}{:03}", prefix, n),
+                                "rule": "inline",
+                                "fn": name.as_str(),
+                                "at": format!("%{}", usize::from(at)),
+                                "callee": callee,
+                            });
+                            if !captures.is_empty() {
+                                entry["captures"] = serde_json::json!(captures);
+                            }
+                            println!("{}", entry);
                             n += 1;
                         }
                     }

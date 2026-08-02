@@ -24,15 +24,29 @@
 //! The guard is cheap: a closure pointer is a scalar rather than a per-lane
 //! value, so it costs one check per state and never splits the state set.
 //!
-//! # Restriction: callees with no captures
+//! # Callees with captures
 //!
-//! `CallResolved`-style capture passing is not implemented, so this only
-//! handles callees whose `capture_ids` is empty. That is not as narrow as it
-//! sounds: the frontend captures enclosing *locals*, and anything defined at
-//! the top level - including `player.update` and friends, which live in table
-//! constructors at the top level - has none. What it excludes is the closures
-//! built inside `init_object` (`obj.move`, `obj.is_solid`, `obj.collide`),
-//! which capture `obj`. Those are the hot ones and need a follow-up rule.
+//! Splicing a closure's body needs a local bound to each of the callee's
+//! `capture_ids`, and a call site does not obviously have one. Every method call
+//! in Celeste looks like
+//!
+//! ```text
+//!   %11 = get_field %9.collide
+//!   %12 = load %11
+//!   %16 = call %12(%2, %5, %8)
+//! ```
+//!
+//! and these methods take no `self` parameter - they close over `obj` instead -
+//! so the object arrives as the *receiver of the field access*, `%9`. It has to
+//! be the captured object, because `obj.collide = function ... end` assigned the
+//! closure onto that same table. But "has to be" is an argument about the
+//! program, not a proof, so the recipe entry names the capture locals explicitly
+//! and `assert_closure` checks them at run time - the same bargain the rule
+//! already makes about which function it is calling.
+//!
+//! Callees with captures also require `promote_capture` to have run first.
+//! Before it, the captured thing is a pointer to a mutable box, and no local at
+//! the call site holds that box - only its contents.
 
 use anyhow::{anyhow, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -80,14 +94,16 @@ pub fn apply(
     function: &str,
     call_id: LocalId,
     callee_name: &str,
+    captures: &[LocalId],
 ) -> Result<usize> {
     let callee = program.get(callee_name)?.clone();
     require(
-        callee.capture_ids.is_empty(),
+        callee.capture_ids.len() == captures.len(),
         format!(
-            "inline: {} has {} capture(s); only capture-free callees are supported",
+            "inline: {} takes {} capture(s), the recipe names {}",
             callee_name,
-            callee.capture_ids.len()
+            callee.capture_ids.len(),
+            captures.len()
         ),
     )?;
     require(
@@ -111,6 +127,12 @@ pub fn apply(
     // none). Missing arguments become a fresh `nil` in the caller's block.
     let mut rename: FxHashMap<LocalId, LocalId> = FxHashMap::default();
     let mut prelude: Vec<(LocalId, Instruction)> = Vec::new();
+    // Captures bind exactly like parameters. What makes them sound is not the
+    // binding but the guard below, which checks the closure really did capture
+    // these values.
+    for (capture, actual) in callee.capture_ids.iter().zip(captures) {
+        rename.insert(*capture, *actual);
+    }
     for (position, arg_slot) in callee.arg_ids.iter().enumerate() {
         let Some(param) = arg_slot else { continue };
         match args.get(position) {
@@ -167,6 +189,7 @@ pub fn apply(
         Instruction::AssertClosure {
             value: closure_id,
             fun_def: GlobalId::from(callee_name.to_string()),
+            captures: captures.to_vec(),
         },
     ));
     let original_terminator = std::mem::replace(
@@ -288,14 +311,20 @@ pub fn verify(
     function: &str,
     call_id: LocalId,
     callee_name: &str,
+    captures: &[LocalId],
 ) -> Result<()> {
     let before_caller = before.get(function)?;
     let after_caller = after.get(function)?;
     let callee = before.get(callee_name)?;
 
     require(
-        callee.capture_ids.is_empty(),
-        format!("inline: {} has captures", callee_name),
+        callee.capture_ids.len() == captures.len(),
+        format!(
+            "inline: {} takes {} capture(s), the recipe names {}",
+            callee_name,
+            callee.capture_ids.len(),
+            captures.len()
+        ),
     )?;
 
     // The call must have existed, and must be gone.
@@ -319,17 +348,23 @@ pub fn verify(
     // The guard must be in the block the call was in, on the same closure value.
     let after_call_block = super::get_block(&after_caller.cfg, &call_block_key)
         .ok_or_else(|| anyhow!("inline: the call's block disappeared"))?;
+    // It must name every capture the recipe claimed, in order. A guard that
+    // asserted the function but not the captures would let the spliced body read
+    // whatever the caller happened to have in those locals.
     let has_guard = after_call_block.instructions.iter().any(|(_, instr)| {
-        matches!(instr, Instruction::AssertClosure { value, fun_def }
-                 if *value == closure_id && fun_def.as_str() == callee_name)
+        matches!(instr, Instruction::AssertClosure { value, fun_def, captures: asserted }
+                 if *value == closure_id
+                    && fun_def.as_str() == callee_name
+                    && asserted.as_slice() == captures)
     });
     require(
         has_guard,
         format!(
-            "inline: no `assert_closure {} is {}` in '{}' - without it the \
-             rewrite is an unproven assumption",
+            "inline: no `assert_closure {} is {} with captures {:?}` in '{}' - without \
+             it the rewrite is an unproven assumption",
             usize::from(closure_id),
             callee_name,
+            captures.iter().map(|c| usize::from(*c)).collect::<Vec<_>>(),
             block_label(&call_block_key)
         ),
     )?;
@@ -525,41 +560,130 @@ pub fn global_closure_map(program: &Program) -> FxHashMap<String, GlobalId> {
 /// without checking.
 const REPLACED_AT_RUNTIME: &[&str] = &["tile_flag_at"];
 
-/// Call sites in `fun` whose target can be guessed, and whose callee takes no
-/// captures.
-pub fn candidates(program: &Program, fun: &FunDef) -> Vec<(LocalId, String)> {
-    let map = global_closure_map(program);
+/// Which function a *method* field holds, derived structurally from anywhere in
+/// the program that assigns a closure onto a field:
+///
+/// ```text
+///   %861 = get_field %785.is_solid create
+///   %862 = alloc
+///          store_closure %862 <- obj.is_solid_47 [%785]
+///          store %861 <- %862
+/// ```
+///
+/// Same shape as `global_closure_map`, with a field access in place of the
+/// global. A field name maps to a function only if every such assignment in the
+/// whole program agrees, so `update` - which fifteen object types define
+/// differently - correctly does not resolve.
+///
+/// Like `global_closure_map` this only *suggests*. Every inline it proposes is
+/// guarded by an `assert_closure`, and the rule's verifier insists on the guard.
+fn method_closure_map(program: &Program) -> FxHashMap<String, GlobalId> {
+    let mut candidates: FxHashMap<String, Option<GlobalId>> = FxHashMap::default();
+    for (_, fun) in program.functions.iter() {
+        for (_, block) in all_blocks(&fun.cfg) {
+            let mut closures: FxHashMap<LocalId, GlobalId> = FxHashMap::default();
+            let mut fields: FxHashMap<LocalId, String> = FxHashMap::default();
+            for (id, instr) in &block.instructions {
+                match instr {
+                    Instruction::StoreClosure { target, fun_def, .. } => {
+                        closures.insert(*target, fun_def.clone());
+                    }
+                    Instruction::GetField { field, .. } => {
+                        fields.insert(*id, field.clone());
+                    }
+                    Instruction::Store { target, source } => {
+                        let (Some(field), Some(fun_def)) =
+                            (fields.get(target), closures.get(source))
+                        else {
+                            continue;
+                        };
+                        match candidates.entry(field.clone()) {
+                            std::collections::hash_map::Entry::Occupied(mut e) => {
+                                if e.get().as_ref() != Some(fun_def) {
+                                    e.insert(None);
+                                }
+                            }
+                            std::collections::hash_map::Entry::Vacant(e) => {
+                                e.insert(Some(fun_def.clone()));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .filter_map(|(field, fun)| Some((field, fun?)))
+        .collect()
+}
+
+/// Call sites in `fun` whose target can be guessed, with the locals that should
+/// hold the callee's captures.
+///
+/// Two shapes are recognised. A global call `%g = get_global "n"; %c = load %g;
+/// call %c(..)` resolves through `global_closure_map` and has no captures. A
+/// method call `%f = get_field %o.n; %c = load %f; call %c(..)` resolves through
+/// `method_closure_map`, and the receiver `%o` is offered as the callee's single
+/// capture - see the module docs for why that is a guess rather than a fact, and
+/// why the guard is what makes it safe.
+pub fn candidates(program: &Program, fun: &FunDef) -> Vec<(LocalId, String, Vec<LocalId>)> {
+    let globals_map = global_closure_map(program);
+    let methods_map = method_closure_map(program);
     let mut out = Vec::new();
     for (_, block) in all_blocks(&fun.cfg) {
-        // Within a block, track `%g = get_global "n"` and `%c = load %g`.
+        // Within a block, track `%g = get_global "n"` / `%f = get_field %o.n`
+        // and the `load` of each.
         let mut global_of: FxHashMap<LocalId, String> = FxHashMap::default();
+        let mut field_of: FxHashMap<LocalId, (LocalId, String)> = FxHashMap::default();
         let mut loaded_global: FxHashMap<LocalId, String> = FxHashMap::default();
+        let mut loaded_field: FxHashMap<LocalId, (LocalId, String)> = FxHashMap::default();
         for (id, instr) in &block.instructions {
             match instr {
                 Instruction::GetGlobal { name, .. } => {
                     global_of.insert(*id, name.clone());
                 }
+                Instruction::GetField { receiver, field, .. } => {
+                    field_of.insert(*id, (*receiver, field.clone()));
+                }
                 Instruction::Load { source } => {
                     if let Some(name) = global_of.get(source) {
                         loaded_global.insert(*id, name.clone());
                     }
+                    if let Some(entry) = field_of.get(source) {
+                        loaded_field.insert(*id, entry.clone());
+                    }
                 }
                 Instruction::Call { closure, .. } => {
-                    let Some(name) = loaded_global.get(closure) else { continue };
-                    if REPLACED_AT_RUNTIME.contains(&name.as_str()) {
+                    let resolved = if let Some(name) = loaded_global.get(closure) {
+                        if REPLACED_AT_RUNTIME.contains(&name.as_str()) {
+                            continue;
+                        }
+                        globals_map.get(name).map(|callee| (callee.clone(), Vec::new()))
+                    } else if let Some((receiver, field)) = loaded_field.get(closure) {
+                        methods_map
+                            .get(field)
+                            .map(|callee| (callee.clone(), vec![*receiver]))
+                    } else {
                         continue;
-                    }
-                    let Some(callee) = map.get(name) else { continue };
+                    };
+                    let Some((callee, receiver)) = resolved else { continue };
                     let Ok(callee_def) = program.get(callee.as_str()) else { continue };
-                    if !callee_def.capture_ids.is_empty() {
-                        continue;
-                    }
-                    out.push((*id, callee.as_str().to_string()));
+                    // The receiver stands in for a single captured object.
+                    // A callee that captures anything else is beyond what this
+                    // heuristic can address.
+                    let call_captures = match (callee_def.capture_ids.len(), receiver.as_slice()) {
+                        (0, _) => Vec::new(),
+                        (1, [receiver]) => vec![*receiver],
+                        _ => continue,
+                    };
+                    out.push((*id, callee.as_str().to_string(), call_captures));
                 }
                 _ => {}
             }
         }
     }
-    out.sort_by_key(|(id, _)| usize::from(*id));
+    out.sort_by_key(|(id, _, _)| usize::from(*id));
     out
 }

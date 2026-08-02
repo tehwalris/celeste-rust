@@ -100,9 +100,19 @@ pub fn format_instruction(instr: &Instruction) -> String {
             n(*if_true),
             n(*if_false)
         ),
-        Instruction::AssertClosure { value, fun_def } => {
-            format!("assert_closure {} is {}", n(*value), fun_def.as_str())
-        }
+        Instruction::AssertClosure { value, fun_def, captures } => format!(
+            "assert_closure {} is {}{}",
+            n(*value),
+            fun_def.as_str(),
+            if captures.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " with captures [{}]",
+                    captures.iter().map(|c| n(*c)).collect::<Vec<_>>().join(", ")
+                )
+            }
+        ),
         Instruction::Phi { branches } => format!(
             "phi [{}]",
             branches
