@@ -337,15 +337,32 @@ are if/elseif chains, and `for_head_487` is a loop header, which no select can
 absorb.
 
 The two refused ternary variants (`and_or_join_199` 202 splits,
-`in_i1_077_and_or_join_611` 144) are understood: their `or`-half was already
-converted by one of the 81 early `if_convert`s, so the pair shape is gone and
-what remains is a single triangle whose mixed phi `%p` feeds an existing
-`select %p ? %p : %q`. The variant rule: require `%p`'s only uses to be
-selects of exactly that form, convert the triangle, and rewrite each to
-`select %c ? %b : %q` - the same truthiness argument as `convert_ternary`.
-`statically_truthy` needs one sound extension for `%694 = -(1)`: arithmetic
-results are Numbers or fail loudly, and no Number is falsy, so arithmetic ops
-qualify (comparisons do not - they return Bools).
+`in_i1_077_and_or_join_611` 144) are half solved. Their `or`-half was already
+converted by one of the 81 early `if_convert`s, leaving a triangle whose
+mixed phi feeds an existing `select %p ? %p : %q`; `convert_ternary` now has
+a *tail* shape for exactly that (implemented, 10 tests), and
+`statically_truthy` accepts arithmetic results (Numbers or loud failure,
+never falsy). Both sites still fail screening, though, and the failure is
+instructive: each cascade contains *another* mixed select from the early
+conversions (`%1390 = select %1384 ? %1381 : %1384`, `%1549` likewise) that
+only executes cleanly because the branch being removed splits the state
+first, keeping its condition uniform per lane. Remove the split and the old
+mixed select must combine a Bool with a Number for real.
+
+So these cascades need folding at the *select level, chain-wide*, before or
+together with removing the split. The design that eliminates mixed values
+entirely: decompose each and/or intermediate into a (truthiness, value) pair
+of homogeneous selects -
+
+    c and y  (y truthy)  ->  t = c,                       n = y
+    x or z               ->  t = select t_x ? t_x : t_z,  n = select t_x ? n_x : n_z
+    plain value k        ->  t = true-const,              n = k
+
+with only the final consumer reading `n`. Every select is then Bool/Bool or
+Number/Number; the mixed forms (`select c ? y : c`, `select x ? x : z`)
+never exist. This subsumes the tail shape and is the next rule to build. It
+also retires a latent hazard: every early-converted `and` in the program is
+a mine that any future split-removal can step on.
 
 A diamond needs either a two-arm `if_convert` (both arms speculatable, selects
 at the join) or a store-sinking variant with two provenances. Same soundness
