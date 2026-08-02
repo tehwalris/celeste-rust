@@ -10,10 +10,8 @@
 
 use anyhow::Result;
 use celeste_rust::block_coverage;
-use celeste_rust::frontend;
 use celeste_rust::game_runner::{
-    create_fixed_env_with_game_builtins, create_initial_state_with_builtins,
-    inject_tile_flag_at_builtin,
+    create_initial_state_with_builtins, inject_tile_flag_at_builtin,
 };
 use celeste_rust::interpreter::glue::interpret_cfg;
 use celeste_rust::interpreter::state::State;
@@ -34,6 +32,18 @@ struct Cli {
     /// Seed for the input generator
     #[arg(long, default_value_t = 1)]
     seed: u64,
+
+    /// Recipe to replay before measuring. K is a property of the program we
+    /// are actually building, so this defaults to the real one; the point of
+    /// the rewrites is to drive it down and that is only visible if they are
+    /// applied.
+    #[arg(long, default_value = "rewrites.jsonl")]
+    recipe: String,
+
+    /// Measure the freshly compiled program instead, ignoring the recipe.
+    /// The baseline the recipe is trying to improve on.
+    #[arg(long)]
+    original: bool,
 }
 
 /// xorshift64* - we only need cheap reproducible noise, not statistical quality.
@@ -86,35 +96,50 @@ fn set_concrete_buttons(state: &mut State, input_byte: u8) {
     }
 }
 
+/// The room this state is in, if it can be read.
+///
 /// Frames in which the room is (re)loaded are a different heap shape and a
-/// different specialization; measuring them together is meaningless.
-const EXCLUDE: &str = "load_room_60";
+/// different specialization; measuring them together is meaningless. Which
+/// frames those are is read from the state rather than from which function ran,
+/// because inlining renames and eventually erases the function.
+fn current_room(state: &State) -> Option<(i16, i16)> {
+    let deref = |id| match state.heap.get(id) {
+        HeapValue::Value(Value::Pointer(inner)) => Some(*inner),
+        HeapValue::ObjectTable(_) => Some(id),
+        _ => None,
+    };
+    let room = deref(*state.global_env.get("room")?)?;
+    let HeapValue::ObjectTable(fields) = state.heap.get(room) else { return None };
+    let (x, y) = (*fields.get("x")?, *fields.get("y")?);
+    let number = |id| match state.heap.get(id) {
+        HeapValue::Value(Value::Number(MaybeVector::Scalar(n))) => n.as_i16(),
+        _ => None,
+    };
+    Some((number(x)?, number(y)?))
+}
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     block_coverage::enable();
 
-    let level_3 = std::fs::read_to_string("lua/builtin_level_3.lua")?;
-    let level_4 = std::fs::read_to_string("lua/builtin_level_4.lua")?;
-    let game = std::fs::read_to_string("lua/celeste-minimal.lua")?;
-    let full_code = format!(
-        "{}\n{}\n{}\n_init()\n__reset_button_states()\n",
-        level_3, level_4, game
-    );
-
-    let ast = full_moon::parse(&full_code).expect("parse game");
-    let (cfg, fun_defs) = frontend::compile(&ast).expect("compile game");
-    let mut fixed_env = create_fixed_env_with_game_builtins();
-    for fun_def in fun_defs {
-        fixed_env.add_fun_def(fun_def);
+    // The program is always derived: sources -> compile -> replay the recipe.
+    // Measuring the freshly compiled program instead - which this did until it
+    // was noticed - reports the K of a program nobody runs, and cannot show any
+    // rewrite doing its job. It is still worth having as `--original`, since
+    // that is the number the recipe is trying to beat.
+    let mut program = celeste_rust::rewrite::program::Program::compile_from_disk()?;
+    if !cli.original {
+        let recipe = celeste_rust::rewrite::recipe::Recipe::load(&cli.recipe)?;
+        for entry in &recipe.entries {
+            celeste_rust::rewrite::recipe::apply_entry(&mut program, entry)?;
+        }
     }
+    let fixed_env = program.fixed_env();
     let initial_state = create_initial_state_with_builtins(&fixed_env);
-
-    let frame_ast = full_moon::parse("_update()\n_draw()\n").expect("parse frame");
-    let (frame_cfg, extra) = frontend::compile(&frame_ast).expect("compile frame");
-    assert!(extra.is_empty());
-    let reset_ast = full_moon::parse("__reset_button_states()").expect("parse reset");
-    let (reset_cfg, _) = frontend::compile(&reset_ast).expect("compile reset");
+    // `Program`'s frame chunk already ends with `__reset_button_states()`, so
+    // unlike the hand-built version there is no separate reset run.
+    let frame_cfg = program.frame_cfg().clone();
+    let cfg = program.init_cfg().clone();
 
     // The init run is not part of a frame; flush it so it doesn't pollute
     // the per-frame maxima.
@@ -125,7 +150,12 @@ fn main() -> Result<()> {
     // one right after init. Without this we would measure ~1,900 instructions of
     // Lua that never actually run.
     inject_tile_flag_at_builtin(&mut base_state);
-    block_coverage::end_frame_excluding(Some(EXCLUDE));
+    block_coverage::end_frame_dropping(true);
+    assert!(
+        current_room(&base_state).is_some(),
+        "cannot read the room from the state, so room-load frames cannot be \
+         excluded and K would be measured over two different specializations"
+    );
 
     let mut rng = Rng(cli.seed.max(1));
     let mut completed = 0usize;
@@ -148,6 +178,7 @@ fn main() -> Result<()> {
             hold_left -= 1;
             let input_byte = held;
 
+            let room_before = current_room(&state);
             set_concrete_buttons(&mut state, input_byte);
             let result = match interpret_cfg(frame_cfg.clone(), state, &fixed_env) {
                 Ok(r) => r,
@@ -164,11 +195,7 @@ fn main() -> Result<()> {
             }
             state = result.into_iter().next().unwrap().0;
 
-            let reset = interpret_cfg(reset_cfg.clone(), state, &fixed_env).expect("reset");
-            assert_eq!(reset.len(), 1);
-            state = reset.into_iter().next().unwrap().0;
-
-            block_coverage::end_frame_excluding(Some(EXCLUDE));
+            block_coverage::end_frame_dropping(current_room(&state) != room_before);
         }
         if ok {
             completed += 1;

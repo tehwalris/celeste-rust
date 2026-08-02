@@ -119,7 +119,16 @@ pub fn record_block(function: &str, label: &str, block: &crate::ir::Block) {
 /// is ~2800 block executions and swamps everything else. It also only happens
 /// when the object set changes, i.e. at a different heap shape, so it would be
 /// a separate specialization anyway.
-pub fn end_frame_excluding(exclude_function: Option<&str>) {
+/// Ends a frame, dropping it from the measurement if `drop_frame`.
+///
+/// The caller decides, because the only robust way to recognise the frame we
+/// need to drop - the one that loads a room - is from the *state*, not from the
+/// code that ran. This used to be `end_frame_excluding("load_room_60")`, which
+/// silently stopped working the moment the recipe inlined that function: the
+/// name vanished from the coverage keys, nothing was excluded, and the room-load
+/// frame's 16x16 tile loop landed in the maxima. It made K look 7.8x worse under
+/// the rewrites than without them.
+pub fn end_frame_dropping(drop_frame: bool) {
     if !is_enabled() {
         return;
     }
@@ -127,11 +136,9 @@ pub fn end_frame_excluding(exclude_function: Option<&str>) {
     let Some(cov) = guard.as_mut() else { return };
     let this_frame = std::mem::take(&mut cov.this_frame);
 
-    if let Some(excluded) = exclude_function {
-        if this_frame.keys().any(|(func, _)| func == excluded) {
-            cov.excluded_frames += 1;
-            return;
-        }
+    if drop_frame {
+        cov.excluded_frames += 1;
+        return;
     }
 
     cov.frames += 1;
@@ -147,7 +154,7 @@ pub fn end_frame_excluding(exclude_function: Option<&str>) {
 }
 
 pub fn end_frame() {
-    end_frame_excluding(None);
+    end_frame_dropping(false);
 }
 
 pub struct Report {
