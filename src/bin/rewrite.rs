@@ -139,6 +139,7 @@ fn bench(label: &str, program: &Program, frames: u32, profile: bool) -> Result<(
     if profile {
         celeste_rust::interpreter::tracing::reset_tracing();
         celeste_rust::branch_sites::reset();
+        celeste_rust::create_sites::reset();
         celeste_rust::interpreter::tracing::enable_tracing();
     }
     let start = std::time::Instant::now();
@@ -209,6 +210,27 @@ fn bench(label: &str, program: &Program, frames: u32, profile: bool) -> Result<(
             println!(
                 "{:<34} {:<32} {:>9} {:>9}",
                 function, block, site.splits, site.uniform
+            );
+        }
+
+        // A `create` accessor that never creates is a read wearing a mutation's
+        // clothes, and it is the mutation that blocks if-conversion.
+        println!();
+        println!(
+            "{:<20} {:>12} {:>12} {:>10}",
+            "create accessor", "found", "created", "create rate"
+        );
+        for (site, found, created) in celeste_rust::create_sites::summary() {
+            let total = found + created;
+            if total == 0 {
+                continue;
+            }
+            println!(
+                "{:<20} {:>12} {:>12} {:>9.2}%",
+                site.name(),
+                found,
+                created,
+                100.0 * created as f64 / total as f64
             );
         }
 
