@@ -101,6 +101,13 @@ fn bench(label: &str, program: &Program, frames: u32) -> Result<()> {
     }
     let elapsed = start.elapsed();
     let lanes = run.lane_count();
+    let heap_len: usize = run.states().iter().map(|s| s.heap.len()).max().unwrap_or(0);
+    let env_len: usize = run
+        .states()
+        .iter()
+        .map(|s| s.local_env.iter().count())
+        .max()
+        .unwrap_or(0);
     println!(
         "{:<10} {:>3} frames  {:>8.2}s  {:>10} lanes  {:>8.2} GB peak  {:>7.1} us/lane",
         label,
@@ -109,6 +116,10 @@ fn bench(label: &str, program: &Program, frames: u32) -> Result<()> {
         lanes,
         peak_rss_kb() as f64 / 1048576.0,
         elapsed.as_secs_f64() * 1e6 / lanes.max(1) as f64
+    );
+    println!(
+        "{:<10} end-of-frame state: heap {} cells, local_env {} entries",
+        "", heap_len, env_len
     );
     Ok(())
 }
@@ -211,33 +222,57 @@ fn main() -> Result<()> {
         }
 
         Command::Suggest { what, prefix } => {
-            if what != "promote-cell" {
-                return Err(anyhow!("unknown suggestion kind {:?}", what));
-            }
             // Suggestions are made against the program as the recipe leaves it,
             // so running suggest / append / build repeatedly converges.
             let (program, _) = build(&recipe)?;
             let mut n = 0;
-            let mut total_loads = 0;
-            for (name, fun) in &program.functions {
-                for (cell, loads) in celeste_rust::rewrite::rules::promote_cell::candidates(fun) {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "id": format!("{}{:03}", prefix, n),
-                            "rule": "promote_cell",
-                            "fn": name.as_str(),
-                            "cell": format!("%{}", usize::from(cell)),
-                        })
+            match what.as_str() {
+                "promote-cell" => {
+                    let mut total_loads = 0;
+                    for (name, fun) in &program.functions {
+                        for (cell, loads) in
+                            celeste_rust::rewrite::rules::promote_cell::candidates(fun)
+                        {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "id": format!("{}{:03}", prefix, n),
+                                    "rule": "promote_cell",
+                                    "fn": name.as_str(),
+                                    "cell": format!("%{}", usize::from(cell)),
+                                })
+                            );
+                            n += 1;
+                            total_loads += loads;
+                        }
+                    }
+                    eprintln!(
+                        "# {} promotable cell(s), {} load(s) they would remove",
+                        n, total_loads
                     );
-                    n += 1;
-                    total_loads += loads;
                 }
+                "inline" => {
+                    for (name, fun) in &program.functions {
+                        for (at, callee) in
+                            celeste_rust::rewrite::rules::inline::candidates(&program, fun)
+                        {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "id": format!("{}{:03}", prefix, n),
+                                    "rule": "inline",
+                                    "fn": name.as_str(),
+                                    "at": format!("%{}", usize::from(at)),
+                                    "callee": callee,
+                                })
+                            );
+                            n += 1;
+                        }
+                    }
+                    eprintln!("# {} inlinable call site(s)", n);
+                }
+                other => return Err(anyhow!("unknown suggestion kind {:?}", other)),
             }
-            eprintln!(
-                "# {} promotable cell(s), {} load(s) they would remove",
-                n, total_loads
-            );
         }
 
         Command::Bench { frames, baseline } => {

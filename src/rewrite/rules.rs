@@ -26,6 +26,7 @@ use super::program::Program;
 pub mod fold;
 pub mod dce;
 pub mod merge_blocks;
+pub mod inline;
 pub mod promote_cell;
 
 /// Applies `f` to every function in the program, returning how many changes

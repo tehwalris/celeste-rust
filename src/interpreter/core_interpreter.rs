@@ -63,6 +63,40 @@ impl<'a> CoreInterpreter<'a> {
                 let heap_id = self.state.heap.alloc();
                 Ok(Some(Value::Pointer(heap_id)))
             }
+            Instruction::AssertClosure { value, fun_def } => {
+                let actual = self.state.local_env.get(*value);
+                let Value::Pointer(heap_id) = actual else {
+                    return Err(anyhow!(
+                        "AssertClosure({}) failed: expected a closure pointer, got {:?}",
+                        fun_def.as_str(),
+                        actual
+                    ));
+                };
+                match self.state.heap.get(*heap_id) {
+                    HeapValue::Closure(name, captures) => {
+                        if name != fun_def {
+                            return Err(anyhow!(
+                                "AssertClosure({}) failed: closure is {}",
+                                fun_def.as_str(),
+                                name.as_str()
+                            ));
+                        }
+                        if !captures.is_empty() {
+                            return Err(anyhow!(
+                                "AssertClosure({}) failed: expected no captures, got {}",
+                                fun_def.as_str(),
+                                captures.len()
+                            ));
+                        }
+                        Ok(None)
+                    }
+                    other => Err(anyhow!(
+                        "AssertClosure({}) failed: target is {:?}",
+                        fun_def.as_str(),
+                        other
+                    )),
+                }
+            }
             Instruction::GetGlobal {
                 name,
                 create_if_missing,

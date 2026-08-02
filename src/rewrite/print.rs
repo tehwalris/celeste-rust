@@ -94,6 +94,9 @@ pub fn format_instruction(instr: &Instruction) -> String {
         Instruction::BinaryOp { left, op, right } => {
             format!("{} {} {}", n(*left), binary_op_str(*op), n(*right))
         }
+        Instruction::AssertClosure { value, fun_def } => {
+            format!("assert_closure {} is {}", n(*value), fun_def.as_str())
+        }
         Instruction::Phi { branches } => format!(
             "phi [{}]",
             branches

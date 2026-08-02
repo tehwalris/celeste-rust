@@ -86,6 +86,9 @@ impl BlockExport {
 fn instruction_type_name(instr: &Instruction) -> String {
     match instr {
         Instruction::Alloc => "Alloc".to_string(),
+        Instruction::AssertClosure { fun_def, .. } => {
+            format!("AssertClosure({})", fun_def.as_str())
+        }
         Instruction::GetGlobal { name, .. } => format!("GetGlobal({})", name),
         Instruction::Load { .. } => "Load".to_string(),
         Instruction::Store { .. } => "Store".to_string(),

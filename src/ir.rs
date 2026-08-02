@@ -192,6 +192,21 @@ pub enum Instruction {
     Phi {
         branches: Vec<(Label, LocalId)>,
     },
+    /// Fails execution unless `value` is a pointer to a closure of `fun_def`
+    /// with no captures.
+    ///
+    /// This is what makes `inline` sound without any analysis: rather than
+    /// proving that a dynamic call always reaches a particular function, the
+    /// rewrite asserts it and splices the body in. If the assertion ever fails
+    /// we find out loudly instead of silently running the wrong code.
+    ///
+    /// Cheap at runtime: a closure pointer is a scalar, not a per-lane value,
+    /// so this is one check per state rather than per lane, and it never splits
+    /// the state set.
+    AssertClosure {
+        value: LocalId,
+        fun_def: GlobalId,
+    },
 }
 
 impl Instruction {
@@ -263,6 +278,10 @@ impl Instruction {
                     .map(|(label, id)| (label.clone(), f(*id)))
                     .collect(),
             },
+            Self::AssertClosure { value, fun_def } => Self::AssertClosure {
+                value: f(*value),
+                fun_def: fun_def.clone(),
+            },
         }
     }
 }
@@ -299,6 +318,7 @@ impl Instruction {
             Self::UnaryOp { arg, .. } => vec![*arg],
             Self::BinaryOp { left, right, .. } => vec![*left, *right],
             Self::Phi { branches } => branches.iter().map(|(_, id)| *id).collect(),
+            Self::AssertClosure { value, .. } => vec![*value],
         }
     }
 
@@ -325,6 +345,9 @@ impl Instruction {
             | Self::UnaryOp { .. }
             | Self::BinaryOp { .. }
             | Self::Phi { .. } => false,
+            // Not a side effect on the heap, but it must never be optimised
+            // away: its whole purpose is to fail.
+            Self::AssertClosure { .. } => true,
         }
     }
 }
