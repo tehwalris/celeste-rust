@@ -258,7 +258,7 @@ impl<'a> CoreInterpreter<'a> {
                 let right = self.state.local_env.get(*right);
                 interpret_binary_op(left, *op, right).map(Some)
             }
-            Instruction::Phi { branches } => {
+            Instruction::Phi { .. } => {
                 panic!("Phi nodes should not be handled at this level")
             }
         }

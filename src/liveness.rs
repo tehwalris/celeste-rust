@@ -2,32 +2,38 @@ use rustc_hash::FxHashSet;
 
 use crate::{instruction_flow::FlowSide, ir::LocalId};
 
-/// Liveness analysis result.
-/// For now, this is a stub that doesn't actually compute liveness.
-/// TODO: Implement proper liveness analysis.
-pub struct LivenessAnalysisResult {
-    /// If set, return this set for all queries (used for "all live" stub)
-    all_live: Option<FxHashSet<LocalId>>,
-}
+/// Liveness information used to prune dead locals out of `LocalEnv` at join
+/// points (see `BoundInterpreterFlow::BlockBeforeJoin` in `interpreter::flow`).
+///
+/// Pruning dead locals matters for more than memory: `local_env` is part of
+/// `StateShape`, so a dead temporary left behind on one path prevents that
+/// state from merging with an otherwise identical one. The OCaml
+/// implementation does this; we do not yet.
+///
+/// This is currently a **no-op stub**. `get_live_variables` always returns
+/// `None`, which the flow code interprets as "no information, keep every
+/// local". That is conservative: it never prunes something that is still
+/// needed, it just fails to prune anything at all.
+///
+/// TODO: implement a real backwards liveness analysis over the CFG.
+#[derive(Default)]
+pub struct LivenessAnalysisResult {}
 
 impl LivenessAnalysisResult {
-    /// Creates a stub result where all variables are considered live.
-    /// This is conservative - it won't prune any variables.
+    /// Creates the conservative stub: nothing is ever pruned.
     pub fn all_live() -> Self {
-        Self {
-            all_live: Some(FxHashSet::default()),
-        }
+        Self {}
     }
 
+    /// Returns the set of locals live at `instruction_id`, or `None` if no
+    /// liveness information is available (meaning "keep all locals").
+    ///
+    /// Always returns `None` today - see the type-level docs.
     pub fn get_live_variables(
         &self,
         _side: FlowSide,
         _instruction_id: LocalId,
     ) -> Option<&FxHashSet<LocalId>> {
-        // For the stub, return an empty set which means "keep all" since
-        // the flow code retains variables that are in the live set.
-        // Actually, an empty set would prune everything. We need the opposite.
-        // Let's return None to indicate "all live".
         None
     }
 }

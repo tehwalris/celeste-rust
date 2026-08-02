@@ -77,7 +77,6 @@ fn interpret_prepared_cfg_inner(
 
     let adapter = InterpreterFlowAdapter { fixed_env };
     let cfg = &prepared.cfg;
-    let labels = &prepared.labels;
 
     // Register CFG for visualization and push onto CFG stack
     let cfg_name_str = name.as_deref().unwrap_or("__main");

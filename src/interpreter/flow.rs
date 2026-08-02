@@ -20,6 +20,15 @@ pub struct InterpreterFlowAdapter<'a> {
     pub fixed_env: &'a FixedEnv,
 }
 
+/// The data that flows along a CFG edge: a set of states (each of which is
+/// itself `vector_size` lanes in SoA layout).
+///
+/// Note there is no join/merge operation here. Two edges arriving at the same
+/// block are *not* combined; `glue::interpret_prepared_cfg_inner` queues them
+/// as separate work items and the block runs once per fragment. States are only
+/// ever merged back together at `hint_normalize` blocks, via `vectorize_states`
+/// + `union_diff_states`. This is the main source of intra-frame work
+/// multiplication - see plans/rewrite-plan.md.
 #[derive(Clone)]
 pub enum FlowData {
     States(Vec<State>),
@@ -50,18 +59,6 @@ impl FlowData {
         }
     }
 
-    pub fn join_mut(&mut self, other: Self) {
-        // TODO there's probably meant to be deduplication and stuff here
-        match (self, other) {
-            (FlowData::States(a), FlowData::States(b)) => {
-                a.extend(b);
-            }
-            (FlowData::StatesAndReturns(a), FlowData::StatesAndReturns(b)) => {
-                a.extend(b);
-            }
-            _ => panic!("Cannot join States and StatesAndReturns"),
-        }
-    }
 }
 
 pub enum BoundInterpreterFlow<'a> {

@@ -67,6 +67,8 @@ struct PlayerSummary {
     spd_y: NumOrInterval,
 }
 
+/// Fields mirror the JSON schema written by `view_frames`; not all are read.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct PlayerSpawnSummary {
     x: NumOrInterval,
@@ -77,6 +79,8 @@ struct PlayerSpawnSummary {
     delay: NumOrInterval,
 }
 
+/// Fields mirror the JSON schema written by `view_frames`; not all are read.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct StateSummary {
     #[allow(dead_code)]
@@ -107,6 +111,8 @@ struct NewFrameDump {
 }
 
 // Types for reference format
+/// Fields mirror the reference JSON schema; not all are read.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct ReferencePosition {
     x: i32,

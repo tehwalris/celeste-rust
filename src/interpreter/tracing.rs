@@ -23,11 +23,8 @@ use serde::Serialize;
 /// Global flag for whether tracing is enabled
 static TRACING_ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// Global start time (epoch) for computing relative timestamps.
-/// Stored as nanos since some arbitrary point.
-static TRACE_EPOCH_NANOS: AtomicU64 = AtomicU64::new(0);
-
-/// Thread-local instant for the trace epoch
+// Thread-local instant for the trace epoch. Each thread stamps its own epoch
+// on first use; spans are recorded as offsets from it.
 thread_local! {
     static LOCAL_EPOCH: RefCell<Option<Instant>> = const { RefCell::new(None) };
 }

@@ -78,7 +78,7 @@ fn main() {
             Some(captured.function_name.clone()),
             fun_def.source_span,
         );
-        std::hint::black_box(result);
+        std::hint::black_box(result.is_ok());
     }
 
     // Benchmark
@@ -96,7 +96,7 @@ fn main() {
         );
         let iter_time = iter_start.elapsed();
         println!("  Iteration {}: {:.2}ms", i + 1, iter_time.as_secs_f64() * 1000.0);
-        std::hint::black_box(result);
+        std::hint::black_box(result.is_ok());
     }
     let total = start.elapsed();
     let avg = total / iterations;

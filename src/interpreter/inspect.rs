@@ -296,7 +296,7 @@ pub fn create_frame_dump(frame: u32, states: &[State]) -> FrameDump {
     // In the future, use proper shape extraction
     let mut groups_map: BTreeMap<(usize, usize), Vec<(usize, StateSummary)>> = BTreeMap::new();
 
-    for (idx, state) in states.iter().enumerate() {
+    for state in states.iter() {
         let key = (state.heap.len(), state.vector_size);
         let summary = extract_state_summary(state);
         groups_map.entry(key).or_default().push((state.vector_size, summary));

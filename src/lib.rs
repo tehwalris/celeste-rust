@@ -1,6 +1,3 @@
-// TODO don't allow later
-#![allow(dead_code)]
-#![allow(unused_variables)]
 
 #[macro_use(anyhow)]
 extern crate anyhow;

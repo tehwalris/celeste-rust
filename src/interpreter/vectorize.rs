@@ -209,137 +209,6 @@ pub fn shape_of_state(state: &State) -> StateShape {
     }
 }
 
-/// Expands a value to `size` elements, returning an iterator of scalar values.
-fn expand_value_to_scalars(value: &Value, size: usize) -> Vec<ScalarValue> {
-    match value {
-        Value::Number(MaybeVector::Scalar(n)) => vec![ScalarValue::Number(*n); size],
-        Value::Number(MaybeVector::Vector(nums)) => {
-            assert_eq!(nums.len(), size);
-            nums.iter().map(|n| ScalarValue::Number(*n)).collect()
-        }
-        Value::NumberInterval(MaybeVector::Scalar(n)) => vec![ScalarValue::NumberInterval(*n); size],
-        Value::NumberInterval(MaybeVector::Vector(nums)) => {
-            assert_eq!(nums.len(), size);
-            nums.iter().map(|n| ScalarValue::NumberInterval(*n)).collect()
-        }
-        Value::Bool(MaybeVector::Scalar(b)) => vec![ScalarValue::Bool(*b); size],
-        Value::Bool(MaybeVector::Vector(bools)) => {
-            assert_eq!(bools.len(), size);
-            bools.iter().map(|b| ScalarValue::Bool(*b)).collect()
-        }
-        Value::String(s) => vec![ScalarValue::String(s.clone()); size],
-        Value::Nil(hint) => vec![ScalarValue::Nil(hint.clone()); size],
-        Value::Pointer(id) => vec![ScalarValue::Pointer(*id); size],
-        Value::NilPointer(s) => vec![ScalarValue::NilPointer(s.clone()); size],
-        Value::UnknownBool => vec![ScalarValue::UnknownBool; size],
-    }
-}
-
-/// A scalar value (single element, not a vector)
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-enum ScalarValue {
-    Number(Pico8Num),
-    NumberInterval(Pico8NumInterval),
-    Bool(bool),
-    UnknownBool,
-    String(String),
-    Nil(Option<String>),
-    Pointer(HeapId),
-    NilPointer(String),
-}
-
-impl ScalarValue {
-    fn is_vectorizable(&self) -> bool {
-        matches!(self, ScalarValue::Number(_) | ScalarValue::NumberInterval(_) | ScalarValue::Bool(_))
-    }
-}
-
-fn scalar_value_from_value(value: &Value) -> ScalarValue {
-    match value {
-        Value::Number(MaybeVector::Scalar(n)) => ScalarValue::Number(*n),
-        Value::Number(MaybeVector::Vector(nums)) => {
-            assert_eq!(nums.len(), 1);
-            ScalarValue::Number(nums[0])
-        }
-        Value::NumberInterval(MaybeVector::Scalar(n)) => ScalarValue::NumberInterval(*n),
-        Value::NumberInterval(MaybeVector::Vector(nums)) => {
-            assert_eq!(nums.len(), 1);
-            ScalarValue::NumberInterval(nums[0])
-        }
-        Value::Bool(MaybeVector::Scalar(b)) => ScalarValue::Bool(*b),
-        Value::Bool(MaybeVector::Vector(bools)) => {
-            assert_eq!(bools.len(), 1);
-            ScalarValue::Bool(bools[0])
-        }
-        Value::String(s) => ScalarValue::String(s.clone()),
-        Value::Nil(hint) => ScalarValue::Nil(hint.clone()),
-        Value::Pointer(id) => ScalarValue::Pointer(*id),
-        Value::NilPointer(s) => ScalarValue::NilPointer(s.clone()),
-        Value::UnknownBool => ScalarValue::UnknownBool,
-    }
-}
-
-fn value_from_scalars(scalars: Vec<ScalarValue>) -> Value {
-    if scalars.is_empty() {
-        panic!("Cannot build value from empty scalar list");
-    }
-
-    let first = &scalars[0];
-
-    // Check if all values are identical
-    let all_identical = scalars.iter().all(|s| s == first);
-
-    if all_identical || scalars.len() == 1 {
-        // Return as scalar
-        match first {
-            ScalarValue::Number(n) => Value::Number(MaybeVector::Scalar(*n)),
-            ScalarValue::NumberInterval(n) => Value::NumberInterval(MaybeVector::Scalar(*n)),
-            ScalarValue::Bool(b) => Value::Bool(MaybeVector::Scalar(*b)),
-            ScalarValue::String(s) => Value::String(s.clone()),
-            ScalarValue::Nil(hint) => Value::Nil(hint.clone()),
-            ScalarValue::Pointer(id) => Value::Pointer(*id),
-            ScalarValue::NilPointer(s) => Value::NilPointer(s.clone()),
-            ScalarValue::UnknownBool => Value::UnknownBool,
-        }
-    } else {
-        // Build a vector
-        match first {
-            ScalarValue::Number(_) => {
-                let nums: Vec<Pico8Num> = scalars.into_iter()
-                    .map(|s| match s {
-                        ScalarValue::Number(n) => n,
-                        _ => panic!("Mixed types in vector"),
-                    })
-                    .collect();
-                Value::Number(MaybeVector::Vector(nums))
-            }
-            ScalarValue::NumberInterval(_) => {
-                let nums: Vec<Pico8NumInterval> = scalars.into_iter()
-                    .map(|s| match s {
-                        ScalarValue::NumberInterval(n) => n,
-                        _ => panic!("Mixed types in vector"),
-                    })
-                    .collect();
-                Value::NumberInterval(MaybeVector::Vector(nums))
-            }
-            ScalarValue::Bool(_) => {
-                let bools: Vec<bool> = scalars.into_iter()
-                    .map(|s| match s {
-                        ScalarValue::Bool(b) => b,
-                        _ => panic!("Mixed types in vector"),
-                    })
-                    .collect();
-                Value::Bool(MaybeVector::Vector(bools))
-            }
-            _ => {
-                // UnknownBool, String, etc. are not vectorizable
-                // States with different values should have different shapes and never reach here
-                panic!("Values are not equal and not vectorizable");
-            }
-        }
-    }
-}
-
 /// Merge multiple states with the same shape into one vectorized state.
 fn vectorize_same_shape_states(states: Vec<State>) -> State {
     if states.len() == 1 {
@@ -351,7 +220,7 @@ fn vectorize_same_shape_states(states: Vec<State>) -> State {
 
     // Build vectorized heap
     let mut new_heap = Heap::new();
-    for i in 0..first_state.heap.len() {
+    for _ in 0..first_state.heap.len() {
         new_heap.alloc();
     }
 
@@ -396,7 +265,7 @@ fn merge_heap_values(values: &[(HeapValue, usize)]) -> HeapValue {
     let (first_value, _) = &values[0];
 
     match first_value {
-        HeapValue::Value(v) => {
+        HeapValue::Value(_) => {
             let value_and_sizes: Vec<_> = values.iter()
                 .map(|(hv, size)| {
                     match hv {
@@ -592,7 +461,7 @@ where
     let first_env = get_env(&states[0]);
     let mut merged = LocalEnv::new();
 
-    for (local_id, first_value) in first_env.iter() {
+    for (local_id, _) in first_env.iter() {
         let value_and_sizes: Vec<_> = states.iter()
             .map(|s| (get_env(s).get_by_raw_id(local_id).clone(), s.vector_size))
             .collect();
@@ -763,14 +632,6 @@ enum VectorRef<'a> {
     Numbers(&'a [Pico8Num]),
     NumberIntervals(&'a [Pico8NumInterval]),
     Bools(&'a [bool]),
-}
-
-fn scalar_at_index(vec: &VectorRef, index: usize) -> ScalarValue {
-    match vec {
-        VectorRef::Numbers(nums) => ScalarValue::Number(nums[index]),
-        VectorRef::NumberIntervals(nums) => ScalarValue::NumberInterval(nums[index]),
-        VectorRef::Bools(bools) => ScalarValue::Bool(bools[index]),
-    }
 }
 
 /// Unvectorize a state if its vector_size is 1 (convert vectors to scalars)
