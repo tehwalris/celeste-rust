@@ -250,6 +250,11 @@ fn interpret_prepared_cfg_inner(
         // Execute the block's instructions (post-phi flow)
         // Note: For hint_normalize blocks, states were already vectorized when pulled from accumulators
         let instruction_count = block.instructions.len();
+        crate::block_coverage::record_block(
+            name.as_deref().unwrap_or("__main"),
+            block_label.as_ref().map_or("__entry", |l| l.as_str()),
+            block,
+        );
         let bound_post_phi = adapter.flow_block_post_phi(block)?;
         let flow_data = bound_post_phi.flow(flow_data)?;
 
