@@ -27,6 +27,29 @@ not comparable.
 | + 183 `inline`s | 4.47 s / 1.12 GB | 12.87 s / 3.75 GB |
 | + 81 `if_convert`s | 4.40 s / 1.06 GB | - |
 | + stage B finished (`promote_capture`, 84 method inlines) | 4.36 s / 1.06 GB | - |
+| + `cse` (block-local, then cross-block for accessors) | 4.32 s / 1.06 GB | - |
+
+### What `cse` cost and bought, in the three variants that were run
+
+Same recipe, same lanes (92,713), same memory (1.06 GB), same fragments (558).
+
+| cse | frame 34 | instructions | live slots in `player.update_21` |
+|---|---|---|---|
+| block-local only | 4.38 s | 19529 | 23 |
+| cross-block, every kind | 4.55 s | 18075 | 29 |
+| cross-block, accessors and loads only | 4.32 s | 19073 | 24 |
+
+The middle row is the one worth remembering: **1454 fewer instructions and a 4%
+slower frame.** Only ~11% of frame time is running `player.update_21`; merge,
+gc, dedup and shape grouping are ~65% and are charged per state for every live
+value. Reusing a definition from an earlier block trades instructions for live
+range, and for arithmetic that trade is a loss. Restricting cross-block reuse to
+heap accessors and loads is smaller *and* faster than either extreme.
+
+`cse` is also barrier-bound rather than scope-bound: `player.update_21` has 306
+accessor barriers and 528 load barriers across 3801 instructions, so most of the
+redundancy that survives is fenced by the 101 remaining calls and 185 `create`
+accessors, not by block boundaries.
 
 Frame 40, milestone checks only: 84.1 s / 25.8 GB as compiled, 62.5 s / 14.45 GB
 after `promote_cell`. That beat the old unverified `mem2reg`'s 15.2 GB, which

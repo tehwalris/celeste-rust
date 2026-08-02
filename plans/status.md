@@ -1,6 +1,6 @@
 # Status (2026-08)
 
-Branch `rewrite`. Build is warning-free, 194 tests pass, working tree clean.
+Branch `rewrite`. Build is warning-free, 212 tests pass, working tree clean.
 
 ## Measured, frame 34 (the standard iteration benchmark)
 
@@ -13,6 +13,7 @@ Branch `rewrite`. Build is warning-free, 194 tests pass, working tree clean.
 | + 183 `inline`s | 4.47 s | 1.12 GB |
 | + 81 `if_convert`s | 4.40 s | 1.06 GB |
 | + stage B finished (see below) | 4.36 s | 1.06 GB |
+| + `cse`, stage C piece 1 | 4.32 s | 1.06 GB |
 
 Lane count is identical throughout (92,713), which is the first thing to check
 when a rewrite claims a win. Frame 37 confirms the same ratios at ~13 s. Keep
@@ -144,6 +145,8 @@ Details in `plans/rewrite-plan.md` section 11.
 | + 32 `promote_cell`s | 4.42 s / 1.06 GB | 558 |
 | + 84 method `inline`s | 4.34 s / 1.06 GB | 558 |
 | + 16 more `if_convert`s | 4.36 s / 1.06 GB | 558 |
+| + block-local `cse` | 4.38 s / 1.06 GB | 558 |
+| + cross-block `cse` (accessors and loads) | 4.32 s / 1.06 GB | 558 |
 
 **The fragment count did not move once**, which was the predicted shape:
 inlining relocates branches, it does not remove them. Instructions went
@@ -170,40 +173,85 @@ Two things this stage taught that were not in the plan:
     #       89  store
     #       68  call
     #       41  assert_closure
-    #       41  get_field
+    #       41  get_field create
+    #       13  get_index create
+    #        7  get_global create
+    #        1  alloc
+    #        1  store_empty_table
 
 Inlining converted each `call` into a body full of stores and creating field
 accesses. Those are unspeculatable for a better reason than the call was: they
 mutate the heap. So removing the calls renamed the obstacle rather than
 removing it, and **stage C is what makes stage D possible at all**.
 
-Three pieces:
+### The blocker table, read properly
 
-1. **`cse`** - one instruction per value, so each cell has a single accessor.
-   Promotion's precondition is "no other instruction can produce a pointer to
-   this cell", and inlining left 1675 redundant accessors (`get_field
-   %2.hitbox` appeared 124 times in one function).
-   * **Block-local: done.** 3833 instructions removed, 23362 -> 19529.
-     Redundant accessors 1675 -> 597.
-   * **Cross-block: next.** The remaining 597 need an earlier definition in a
-     *dominating* block with no barrier on *any* path between - a real dataflow
-     question rather than an interval scan. Promotion needs function-wide
-     uniqueness, so this is not optional.
-2. **`assume_eq`** - for pointers that reach one cell by different paths, which
-   CSE cannot see. The `foreach` callback gets the object as argument `%2`
-   while the loop also reaches it as `objects[i]`; nothing syntactic connects
-   them. Inserts `assert %a == %b` and substitutes, converting an aliasing fact
-   into syntactic identity. Sound by construction.
-3. **Field promotion.** Unlike an `alloc` cell, a field cell *is* the game
-   state, so it cannot simply be deleted: load once where the pointer is first
-   available, work in SSA, store back before every `Return`. Inside the frame
-   no heap traffic; at the boundary an identical heap.
+The histogram used to key on the first word, so `get_field` and `get_field ...
+create` shared a row. Split apart, the answer is not close: **of the 61
+accessors blocking a triangle, all 61 are `create`. Not one is a plain read.**
 
-   Measured, and it is less alarming than expected: of 146 field cells written
-   in `player.update_21`, **142 are written exactly once** and only 4 need
-   multi-store SSA construction with phi insertion. So most of this is the
-   existing `promote_cell` shape plus the load-at-entry / store-at-return
-   bracketing, not a general mem2reg.
+That kills a plan. No amount of read CSE can unblock a triangle, because no
+triangle is blocked by a read - which was measured directly, not reasoned
+about: cross-block `cse` left the table above **byte-identical**.
+
+It also says the 89 stores and the 61 creates are largely *the same 89-ish
+instructions*. `r.f = v` compiles to `get_field %r.f create` followed by
+`store`, so a field assignment inside an arm shows up once in each row. One
+rule addresses both.
+
+### 1. `cse` - done, both halves
+
+Block-local first (3833 folds, 23362 -> 19529 instructions), then across blocks
+by available expressions (a further 456, -> 19073, and 1.5% off the frame).
+
+Two things came out of it that matter more than the rule does:
+
+* **Instruction count is not the metric; live state size is.** Reusing a
+  definition from an earlier block keeps it live across everything in between,
+  and merge/gc/dedup/shape-grouping are ~65% of the frame and charged per state
+  per live value. Reusing *everything* across blocks removed 1454 instructions
+  and made the frame 4% **slower** (23 -> 29 live slots in `player.update_21`).
+  Restricting cross-block reuse to heap accessors and loads - and letting
+  arithmetic rematerialise - is both smaller and faster.
+* **`cse` is barrier-bound, not scope-bound.** `player.update_21` has 306
+  accessor barriers and 528 load barriers across 3801 instructions, one every
+  ~12 and ~7 instructions. Going cross-block therefore bought much less than
+  the redundancy count suggested, and going further (better aliasing, finer
+  barriers) would buy little more. The remaining redundancy is fenced by the
+  101 surviving calls and the 185 `create` accessors, not by block boundaries.
+
+### 2. Field assignment in an arm -> `select` at the join
+
+This is now the main event, not `assume_eq`. It addresses 89 + 61 of the 155
+blocked triangles, which is the only thing that moves fragments.
+
+Turn an arm's `%c = get_field %r.f create; store %c <- %v` into a `load` before
+the branch, a `select` at the join, and one store after it. Needs the create to
+be discharged - the field must already exist, which is exactly the "is this
+create redundant" question `cse` already half-answers - and a load hoisted
+above the branch, which the rule inserts itself rather than relying on `cse`.
+
+### 3. `assume_eq`
+
+For pointers that reach one cell by different paths, which CSE cannot see. The
+`foreach` callback gets the object as argument `%2` while the loop also reaches
+it as `objects[i]`; nothing syntactic connects them. Inserts `assert %a == %b`
+and substitutes, converting an aliasing fact into syntactic identity. Sound by
+construction.
+
+### 4. Whole-function field promotion
+
+Unlike an `alloc` cell, a field cell *is* the game state, so it cannot simply be
+deleted: load once where the pointer is first available, work in SSA, store back
+before every `Return`. Inside the frame no heap traffic; at the boundary an
+identical heap.
+
+Measured, and less alarming than expected: of 146 field cells written in
+`player.update_21`, **142 are written exactly once** and only 4 need multi-store
+SSA construction with phi insertion. But note this is blocked by the 101
+surviving calls in that function, any of which could reach the cell - so the
+stage B leftovers have to go first, and piece 2 above is the cheaper route to
+the same triangles.
 
 ## Keep replay fast
 
