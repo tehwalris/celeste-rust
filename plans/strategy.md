@@ -62,7 +62,7 @@ Widening is always safe: worst case, you over-approximate so much that solving b
 - More principled: interpreting original code makes correctness arguments easier
 - Iterative refinement not fully implemented
 
-### 3. Rust Abstract Interpreter (current work, `interpreter` branch)
+### 3. Rust Abstract Interpreter (current work, `rewrite` branch)
 
 - Port of OCaml implementation
 - Goal: Match OCaml semantics but with better performance
@@ -70,9 +70,16 @@ Widening is always safe: worst case, you over-approximate so much that solving b
   - Only abstraction: `player.rem.x` and `player.rem.y` → interval `[-0.5, 0.5)` after each frame
   - Uses `__split_by_flr` to split states by floor value when needed
   - Vectorization merges same-shape states; deduplication removes identical vector elements
-- State counts at frame 30: ~2141 states (vs old Rust's ~254 positions with ~many states each)
-- Likely has more states than OCaml due to missing features (liveness-based variable removal, better GC)
-- No backward pass yet, no iterative refinement yet
+- Every frame ends as exactly **one** vectorized state; at frame 30 that state
+  has 15,250 lanes. All fragmentation is intra-frame and is fully re-merged at
+  the boundary. See `BENCHMARK_DATA.md` for current timings.
+- Still missing liveness-based variable removal, which the OCaml version has.
+  Dead locals are part of `StateShape`, so leaving them around blocks merges.
+- No backward pass yet, no iterative refinement yet.
+- The forward pass reaches roughly **frame 43** within a 100 GB budget. Room 1
+  needs about **80 frames**, so refinement (below) is required, not optional —
+  but it needs a fast forward pass to be usable. That is what
+  `plans/rewrite-plan.md` is about.
 
 ## Correctness Layers
 
@@ -119,12 +126,23 @@ The biggest blocker is lack of debugging/inspection infrastructure:
 
 ### State Count / Deduplication Quality
 
-New Rust interpreter has more states than expected at frame 30 (~2141 vs old Rust's ~254 unique positions). This is partly expected (abstract vs concrete), but likely also due to:
-- Missing liveness analysis (dead variables not removed from closures)
+Lane counts are higher than the old hardcoded Rust's position counts. Partly
+expected (abstract vs concrete), but likely also:
+- Missing liveness analysis (dead variables not removed from closures) — see
+  `src/liveness.rs`, which is still a no-op stub
 - Less aggressive GC (keeping more heap objects alive)
 - Different shape hashing (may not merge states that should merge)
 
-**TODO**: Compare state counts with OCaml interpreter to understand deduplication quality.
+**TODO**: Compare lane counts with the OCaml interpreter to understand
+deduplication quality.
+
+### Forward-pass throughput
+
+The forward pass reaches ~frame 43 in 100 GB; room 1 needs ~80 frames. Beyond
+raw speed, the bigger issue is that heap operations are interleaved throughout
+execution, which makes the search impossible to distribute across machines or
+run on a GPU. `plans/rewrite-plan.md` covers the plan to rewrite the compiled
+program into a branch-free, call-free, fixed-shape kernel.
 
 ### Concrete-Abstract Testing Infrastructure
 
@@ -143,13 +161,24 @@ The current abstract interpreter can execute concrete programs. Key insight: sha
 
 ## Near-Term Plan
 
-### Phase 1: Inspection/Debugging Infrastructure
-- State serialization (dump states at checkpoints)
-- Basic state viewer (heap structure, shapes, field values)
-- Concrete-abstract containment queries
+Partly done since this was written: state serialization to JSONL, checkpointing,
+`view_frames` / `compare_frames`, the profiler (`--profile`) and the lightweight
+Chrome tracer (`--trace`) all exist, and `concrete_run` is a working
+single-lane concrete execution path sharing the abstract interpreter's code.
+
+### Phase 1: Program rewriting (current)
+
+See `plans/rewrite-plan.md`. Rewrite the compiled program into a branch-free,
+call-free, fixed-shape kernel via a checked-in list of individually-verifiable
+rewrite instructions. Motivated by both throughput and by making the workload
+distributable (multi-machine / GPU), which tightly interleaved heap operations
+prevent.
+
+The differential-verification infrastructure this needs (canonical frame-boundary
+state digests, comparing abstract runs before/after a change) is also the
+Concrete-Abstract testing infrastructure described above — build it once.
 
 ### Phase 2: Correctness Testing
-- Minimal concrete interpreter (or mode of abstract interpreter)
 - Property-based fuzzing: Lua programs × abstractions → check containment
 - End-to-end tests with TAS inputs
 
@@ -160,10 +189,12 @@ The current abstract interpreter can execute concrete programs. Key insight: sha
 ### Phase 4: Implement Refinement (Layer B)
 - Port refinement logic from old hardcoded Rust
 - Test with room 1
+- **Required, not optional**: room 1 needs ~80 frames and the forward pass alone
+  reaches ~43 within 100 GB. Constant-factor wins cannot close a 10^6 gap.
 
 ### Phase 5: Scale
-- Performance optimization
 - Parallelization (with correctness testing)
+- Distribute across machines / GPU
 - Handle multi-room game
 
 ## Architecture Notes

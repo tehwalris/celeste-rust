@@ -3,10 +3,12 @@
 Status: design only, nothing implemented. Written after re-reading the whole
 codebase and re-measuring the interpreter.
 
-## 0. Fresh measurements (this build, `interpreter` @ 9ec9778, release)
+## 0. Measurements
 
-`BENCHMARK_DATA.md` is stale by ~30x. Actual numbers today, single machine, no
-rayon flags, `-n N` from scratch:
+Full numbers live in `BENCHMARK_DATA.md` (kept current). The previous contents
+of that file were stale by ~25x and would have led to bad decisions.
+
+Headline, on `interpreter` @ 9ec9778 (i.e. *with* mem2reg + block_coalesce):
 
 | frames | wall (cumulative) | lanes at end | peak RSS |
 |---|---|---|---|
@@ -118,24 +120,31 @@ Two sibling branches are relevant:
   `LocalEnv`/`Heap` replacing `im::HashMap`, `Arc` for `Label`/`GlobalId`),
   independent of its barrier feature. Worth harvesting later.
 
-### Recommended base
+### Base (done)
 
-**Branch from `612e726`** (2025-12-31, `Revert "Add LazyVector..."`) — the direct
-parent of the first optimizer commit. Clean core interpreter, no optimizer code,
-no `Deopt`/`CallResolved`/`CallBuiltin` IR variants, no 28 MB blob. The core
-execution path (`flow.rs`, `state.rs`, `core_interpreter.rs`, `vectorize.rs`,
-`glue.rs`, `main.rs`, `game_runner.rs`) has **zero** imports of any pass module,
-so nothing of value is lost.
+The `rewrite` branch was created from **`612e726`** (2025-12-31,
+`Revert "Add LazyVector..."`) — the direct parent of the first optimizer commit.
+Clean core interpreter, no optimizer code, no `Deopt`/`CallResolved`/
+`CallBuiltin` IR variants, no 28 MB blob. The core execution path (`flow.rs`,
+`state.rs`, `core_interpreter.rs`, `vectorize.rs`, `glue.rs`, `main.rs`,
+`game_runner.rs`) has zero imports of any pass module, so nothing of value was
+lost.
 
-Cherry-pick afterwards (all small and independent):
-`df3c68c` (op.rs unit tests — the one good artifact of the agent loop),
-`8521911` (`run_game_frames(&Args)`), `8c6e17e` (FxHashMap aliases),
-`fc0d420`/`fff1207` (clippy), `c20573e` (dead `InterpreterAnalysis`).
+Cherry-picked: `df3c68c` (op.rs unit tests — the one good artifact of the agent
+loop), `73f503c` (`interpret_not` panic → `Err`), `0a02d6d` (`FromStr` for
+`Pico8Num`). The rest of the candidate cherry-picks were entangled with the
+deleted pass files and were not worth untangling.
 
-Keep the `interpreter` branch around as **reading material**: `inlining.rs` is a
+The `interpreter` branch is kept as **reading material**: `inlining.rs` is a
 reasonable starting point for the `inline` rule, `mem2reg.rs` for `promote_cell`.
-Delete `AGENT_PROMPT.md`/`loop.sh` or rewrite them — as written they instruct any
-future loop to re-create the problem.
+`AGENT_PROMPT.md` and `loop.sh` are deleted — as written they instructed any
+future agent loop to preserve and harden the passes, i.e. to re-create the
+problem.
+
+**Cost of the branch-off, measured**: dropping `mem2reg` + `block_coalesce`
+costs ~1.3x time and ~1.9x memory at frame 40 (15.2 GB → 29.2 GB). See
+`BENCHMARK_DATA.md`. That is the first debt the rewrite work has to repay, and
+it gives Stage C a concrete target rather than an aesthetic one.
 
 ## 2. Target program shape, and an honest estimate of the payoff
 
@@ -195,6 +204,83 @@ instruction count. The union of blocks reached is a good estimate of the
 if-converted kernel size; the max observed `|amount|` in `move_x`/`move_y` gives
 the unroll bounds. This is maybe a day of work and it tells us whether K is 5k
 (clear win) or 100k (need a different plan). Do this first.
+
+## 2b. The shape problem, and why it does not conflict with rewrites
+
+The obvious objection to an offline list of rewrites: **the program depends on
+the heap.** `foreach(objects, f)` with `obj.type.update(obj)` can only be
+devirtualized, inlined or unrolled if you know how many objects there are and
+what type each one is. Creating or destroying an object (dying, picking up a
+strawberry) changes the heap shape, and after that it is a *different program*.
+That is why the old design put the optimizer inside the interpreter as an
+approximate JIT: reach a new shape, compile for that shape.
+
+These reconcile cleanly, and the key observation is that **the engine already
+computes exactly the right key.**
+
+`vectorize::StateShape` captures the entire heap graph structure: every cell,
+every table's key set, every `Pointer(HeapId)` identity, every `Nil`, and which
+slots are per-lane numeric placeholders. Numeric *values* are abstracted away;
+structure is not. And `vectorize_states` already groups states by it at every
+frame boundary. So:
+
+```
+for each vectorized state S at frame start:
+    prog = jit_cache.get_or_compile(S.shape)
+    S'   = run(prog, S)
+```
+
+Three consequences fall out:
+
+1. **Shape assumptions need no runtime guards.** If the dispatcher matched
+   `S.shape` exactly, then "there is one object", "its `type` field points to
+   the `player` table", "`objects[1].type.update` is closure `player.update_21`"
+   are all *facts about the key*, not assumptions. A `resolve_call` rewrite
+   authored under shape `S` discharges its side condition **against `S`**,
+   mechanically. This is precisely the "assumptions about the initial heap
+   shape" the JIT needed, except it is now an explicit, inspectable input to
+   the verifier rather than something baked into a pass.
+
+2. **The rewrite list is the JIT's output, not a competitor to it.** Recipes are
+   keyed: `recipes/<shape-hash>.jsonl`, alongside a human-readable dump of the
+   shape. The thing that *generates* a recipe is untrusted and can run at JIT
+   time; the applier and verifier are the small trusted core and are the same
+   code either way. Recipes get cached and checked in, so the slow Tier 2
+   differential verification runs offline against exactly what the JIT
+   produced, and a human can read and hand-edit a recipe.
+
+3. **How many shapes are there?** For room 1: very few. The interpreter reports
+   `vec: 30 -> 1 states` at frame 30, i.e. all 15,250 lanes share one shape.
+   Room 1 has a single object (`player_spawn`, then `player`) - the minimal cart
+   has no `smoke` and room (1,0) contains only a spawn tile. So the cache will
+   have a handful of entries, and hand-authoring the recipe for the one shape
+   that matters is realistic.
+
+### Shape changes *within* a frame
+
+The remaining hard case: the shape is fixed at frame entry, but a lane can
+destroy or create an object mid-frame, so lanes can end the frame with different
+shapes. Options, in increasing order of effort:
+
+- **(v1) Speculate and re-run.** The kernel additionally computes a per-lane
+  "structural event" predicate (died / picked something up / spawned). Lanes
+  with an event have their result discarded and that frame re-run for them on
+  the general interpreter. The kernel is pure, so discarding is free and
+  correctness is unconditional. Structural events are a small minority of lanes
+  per frame, so the cost is negligible. **This is the right starting point** -
+  it defers all the hard design and cannot be wrong.
+- **(v2) Predication over a shape envelope.** Specialize to a superset shape
+  with a fixed object capacity and per-lane `alive` flags; creation/destruction
+  becomes a flag write, and the actual regrouping into distinct output shapes is
+  deferred to the existing frame-boundary `vectorize_states`. This is standard
+  SIMT predication and is what you want eventually, especially for rooms with
+  strawberries and platforms.
+
+Note that death is not special here, per se - a lane that dies is just a lane
+whose subsequent behaviour we still have to model correctly, since an optimal
+route may well contain a death. What *is* special is only winning. The thing
+that makes death awkward is purely mechanical: `destroy_object` changes the
+object array length, hence the shape.
 
 ## 3. Architecture: untrusted search, trusted check
 
@@ -494,11 +580,15 @@ Needed before the first rewrite:
    structurally. Options: a category-C "dead lane" predicate that skips the
    structural change and filters at frame end, or keep death as real control
    flow outside the kernel. Needs a decision before Stage C.
-4. **How many frames do we actually need?** Current wall ≈ frame 45. The TAS is
-   77 inputs total across rooms; room 1 probably ends somewhere in the 45–60
-   range. Worth pinning down exactly — it determines whether a 15x memory win
-   is sufficient or whether the backward/refinement pass from `plans/strategy.md`
-   is also required. My guess is we need both.
+4. **How many frames do we actually need? ~80.** That is well past the current
+   wall of ~frame 43, and 1.45^37 is about 10^6 more lanes. So constant-factor
+   wins alone do not close the gap — the forward/backward refinement from
+   `plans/strategy.md` is required as well. But refinement needs a fast forward
+   pass to be usable at all, and more importantly the target here is not just
+   speed: heap operations tightly interleaved with execution are what make the
+   search impossible to distribute across machines or run on a GPU. Getting to a
+   pure, fixed-shape kernel is the precondition for that, independent of the
+   local speedup.
 5. **Cheap experiments worth running before committing to any of this:**
    (a) add more `_hint_normalize()` calls to the Lua and measure — one line,
    possibly large; (b) confirm the native `tile_flag_at` injection is actually

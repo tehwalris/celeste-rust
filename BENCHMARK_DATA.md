@@ -1,88 +1,103 @@
 # Benchmark Data
 
-Collected on 2024-12-29 with rayon parallelization (32 threads), 100GB memory limit.
+Always run these under `./safe-run.sh` (systemd scope with `MemoryMax=100G`).
+Frame 40 already peaks at ~29 GB, and it is easy to OOM the machine otherwise.
 
-## Frame Timing Data
+```bash
+./safe-run.sh -- ./target/release/celeste-rust -n 40
+```
 
-| Frame | Time (seconds) | Expanded States | Notes |
-|-------|----------------|-----------------|-------|
-| 25 | 0.025 | 24 | First frame with state explosion |
-| 26 | 0.15 | 204 | |
-| 27 | 0.84 | 878 | |
-| 28 | 3.2 | 2,864 | |
-| 29 | 8.3 | 7,260 | |
-| 30 | 18 | 15,250 | |
-| 31 | 30 | 27,024 | |
-| 32 | 48 | 44,558 | |
-| 36 | 193 | 149,664 | |
-| 37 | 331 | 226,473 | |
-| 38 | 549 | 340,521 | ~9 minutes |
-| 39 | 1030 | 533,960 | ~17 minutes |
-| 40 | OOM | - | Hit 100GB memory limit |
+## Current baseline (2026-08, `rewrite` branch)
 
-## Exponential Fit (frames 30-39)
+Release build, single machine, from scratch (no checkpoint resume).
 
-**Time model:** `t = 5.48e-05 * exp(0.4245 * frame)`
-- Growth factor: ~1.53x per frame
-- R² = 0.9564
+| frames | wall | lanes at end | peak RSS |
+|--------|------|--------------|----------|
+| 30 | 0.69 s | 15,250 | 0.21 GB |
+| 34 | 6.1 s | 92,713 | 1.99 GB |
+| 37 | 23.5 s | 269,059 | 7.04 GB |
+| 40 | 87.1 s | 948,319 | 29.2 GB |
 
-**State count model:** `s = 0.255 * exp(0.3716 * frame)`
-- Growth factor: ~1.45x per frame
+Growth is ~1.45x lanes/frame and ~1.5x time/frame.
 
-## Extrapolated Predictions
+### Derived quantities
 
-| Frame | Predicted Time | Predicted States |
-|-------|----------------|------------------|
-| 40 | 22 minutes | 0.8M |
-| 45 | 3 hours | - |
-| 50 | 1 day | 34M |
-| 60 | 73 days | 1.5B |
-| 70 | 14 years | 63B |
-| 80 | 976 years | 2.7T |
+- **Per-lane cost per frame is roughly flat**: ~45 us (f30) -> ~87 us (f37) ->
+  ~92 us (f40). Fragmentation is not getting relatively worse with frame
+  number; the lane count is just growing exponentially.
+- **Per-lane memory is roughly flat at ~30 KB.** The end-of-frame state has
+  `heap_len = 280` cells, of which maybe ~120 are per-lane numeric/bool. At 8 B
+  that is ~1 KB/lane of actual information, so we carry a large constant-factor
+  overhead from intra-frame state fragmentation.
+- Every frame ends as **exactly one vectorized state**. All the fragmentation
+  is intra-frame; it is fully re-merged at the frame boundary.
+- At ~30 KB/lane the 100 GB budget is exhausted somewhere around **frame 43**.
 
-## Checkpoint Sizes
+## Effect of the two shipped CFG passes
 
-| Frame | Compressed Size (zstd -19) |
-|-------|---------------------------|
-| 5-24 | ~2.2 KB each |
-| 25 | 2.6 KB |
-| 30 | 42 KB |
-| 35 | 257 KB |
-| 36 | 317 KB |
-| 37 | 438 KB |
-| 38 | 626 KB |
-| 39 | 901 KB |
+The `interpreter` branch runs `mem2reg` + `block_coalesce` on every `FunDef`
+(`FixedEnv::optimize_cfg`). Those passes are *not* on this branch - they were
+dropped along with the rest of the unverified optimizer. Measured cost of
+dropping them:
 
-Total checkpoint storage for frames 5-39: ~2.6 MB
+| frames | `interpreter` (with passes) | `rewrite` (without) | ratio |
+|--------|------------------------------|---------------------|-------|
+| 30 | 0.62 s / 0.15 GB | 0.69 s / 0.21 GB | 1.1x / 1.5x |
+| 37 | 17.9 s / 3.86 GB | 23.5 s / 7.04 GB | 1.3x / 1.8x |
+| 40 | 66.7 s / 15.2 GB | 87.1 s / 29.2 GB | 1.3x / 1.9x |
 
-## Profile Analysis (Frame 31, ~22 seconds)
+**This is a real, measured ~1.9x memory regression, and it is the first thing
+the rewrite work has to win back.** It makes sense: promoting `Alloc` cells to
+SSA removes heap cells, which shrinks both the per-lane footprint and
+`StateShape`, which in turn lets more states merge.
 
-Profiled with `perf record -g --call-graph dwarf -F 99`.
+So `promote_cell` (the verified, per-cell replacement for `mem2reg`) and
+`merge_blocks` are not just enablers for later stages - they have an immediate
+measurable target: **get frame 40 back under 15 GB.**
 
-### Breakdown by Category
+## Where the intra-frame time goes
 
-| Category | % of Time | Main Functions |
-|----------|-----------|----------------|
-| Rayon/Crossbeam overhead | ~15% | with_handle (9%), try_advance (4.3%), steal (1.6%) |
-| im data structure ops | ~11% | bitmap::Iter (5.4%), SparseChunk clone (3.5%), hash_key (2.8%) |
-| Heap operations | ~8% | Heap::get_opt (7.3%), map_in_place (0.7%) |
-| State clone/drop | ~7% | State::clone (3.5%), drop_in_place (2.2%) |
-| Hashing | ~3% | SipHasher::write (2.6%) |
-| Vectorization | ~3% | shape_of_state (2.9%) |
-| Memory allocation | ~3% | Vec::from_iter (3.4%), malloc/free (1.4%) |
-| Actual interpretation | ~2% | interpret_prepared_cfg_inner (1.1%) |
+From `trace_frame37.json` (one frame, 318k spans, generated with `--trace`):
 
-### Key Insights
+| category | self time | share |
+|---|---|---|
+| `cfg` (nested CFG interpretation) | 6.05 s | 46.4% |
+| `materialize` | 3.28 s | 25.2% |
+| `vectorize` | 2.43 s | 18.6% |
+| `gc` | 1.06 s | 8.1% |
+| `filter_by_mask` | 0.21 s | 1.6% |
 
-1. **~15% is parallelism overhead** - crossbeam epoch management is expensive
-2. **~11% is im data structure operations** - immutable HashMap/HAMT is costly to iterate/clone
-3. **Only ~2% is actual interpretation** - core interpreter logic is NOT the bottleneck
-4. **Most time is in state management** - cloning, hashing, dropping, vectorization
+Top spans by self time:
 
-### Potential Optimizations
+```
+ 3.277s 25.2%  n=61130    materialize        [materialize]
+ 1.706s 13.1%  n=11255    tile_flag_at_72    [cfg]
+ 1.444s 11.1%  n=26883    tile_at_73         [cfg]
+ 1.149s  8.8%  n=38       dedup_state        [vectorize]
+ 1.047s  8.0%  n=20011    gc                 [gc]
+ 0.957s  7.3%  n=12       merge_groups       [vectorize]
+ 0.951s  7.3%  n=4        player.update_21   [cfg]
+```
 
-1. Reduce state cloning (use Rc/Arc)
-2. Batch parallel work to reduce crossbeam overhead
-3. Use FxHash instead of SipHash for im HashMap keys
-4. Simplify shape_of_state computation
-5. Consider arena allocation
+**236,052 nested CFG interpretations in a single frame** (`obj.collide` 35,636x,
+`obj.check` 35,636x, `tile_at` 26,883x, `sign` 15,426x, `is_solid` 11,032x) -
+for a frame that logically calls each a handful of times.
+
+The lesson: `filter_by_mask` itself is only 1.6%. The *consequence* of having
+filtered - a fragmented state set, each fragment re-entering every callee with
+its own nested worklist, then a large normalization pass to un-fragment - is
+most of the cost. See `plans/rewrite-plan.md`.
+
+## Scalar reference point
+
+`concrete_run` executes 30 frames single-lane in 46 ms including parse and init,
+i.e. ~0.5 ms per single-lane frame. The vectorized interpreter is already ~10x
+more efficient per lane than the scalar path at frame 30, so vectorization is
+working - the problem is what happens between frame boundaries.
+
+## Historical note
+
+The numbers previously in this file (frame 30 = 18 s, frame 39 = 1030 s, OOM at
+frame 40) were collected 2024-12-29 and are obsolete by ~25x. They predate
+mimalloc, LTO, `Arc<Vec>` COW `LocalEnv`, `FxHashMap`, GC-before-vectorize and
+the rest of the perf work. Do not use them for extrapolation.
