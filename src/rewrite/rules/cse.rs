@@ -70,6 +70,13 @@
 //! Because kills are always "forget everything of this kind" - never a
 //! kill of one particular entry - a block's whole effect collapses to a
 //! `(mask, gen)` pair, and the fixpoint is bitset AND/OR per block.
+//!
+//! # What is deliberately *not* reused across blocks
+//!
+//! Pure values - arithmetic and constants - stay block-local, even though they
+//! are the safest thing there is to reuse. See `crosses_blocks`: keeping one
+//! live across the blocks in between costs more in the interpreter than
+//! recomputing it, and the measurement is not close.
 
 use anyhow::{anyhow, Result};
 use rustc_hash::FxHashMap;
@@ -149,6 +156,28 @@ fn key_of(instr: &Instruction, resolve: &impl Fn(LocalId) -> LocalId) -> Option<
         // have effects and produce nothing.
         _ => return None,
     })
+}
+
+/// Is a value of this kind worth remembering past a block boundary?
+///
+/// Not a soundness question. `Pure` is the *safest* kind to reuse - nothing can
+/// disturb a function of SSA operands - so this is purely about cost. Reusing a
+/// value defined in an earlier block keeps it live in the interpreter's
+/// `LocalEnv` across everything in between, and every per-state operation
+/// (merge, gc, dedup, shape grouping) is charged for it. Those dominate the
+/// frame; running an instruction does not.
+///
+/// For a heap accessor the trade is clearly worth it - the alternative is real
+/// work against the heap. For arithmetic and constants it is clearly not, and
+/// measurably so. Letting `Pure` cross blocks as well removes a further 998
+/// instructions, takes `player.update_21` from 24 live slots to 29, and costs
+/// 5% of frame time: 4.33s -> 4.55s at frame 34, with the lane count identical.
+/// Rematerialising a constant is cheaper than carrying it.
+fn crosses_blocks(kind: Kind) -> bool {
+    match kind {
+        Kind::Accessor | Kind::Load => true,
+        Kind::Pure => false,
+    }
 }
 
 /// Does this instruction invalidate remembered values of `kind`?
@@ -284,6 +313,9 @@ struct Universe {
     /// applies the barrier.
     keep_accessor: Bits,
     keep_load: Bits,
+    /// Zero at the bits of kinds that do not survive a block boundary, so
+    /// `state &= this` at a block entry applies `crosses_blocks`.
+    keep_across_edges: Bits,
 }
 
 impl Universe {
@@ -391,6 +423,7 @@ fn redundancies(
         by_key: FxHashMap::default(),
         keep_accessor: Bits::new(),
         keep_load: Bits::new(),
+        keep_across_edges: Bits::new(),
     };
     for &b in &layout.order {
         let Some(block) = layout.blocks[b] else { continue };
@@ -411,11 +444,16 @@ fn redundancies(
     }
     universe.keep_accessor = bits_full(bits);
     universe.keep_load = bits_full(bits);
+    universe.keep_across_edges = bits_full(bits);
     for (i, (key, _)) in universe.pairs.iter().enumerate() {
-        match kind_of(key) {
+        let kind = kind_of(key);
+        match kind {
             Kind::Accessor => bit_clear(&mut universe.keep_accessor, i),
             Kind::Load => bit_clear(&mut universe.keep_load, i),
             Kind::Pure => {}
+        }
+        if !crosses_blocks(kind) {
+            bit_clear(&mut universe.keep_across_edges, i);
         }
     }
 
@@ -473,6 +511,10 @@ fn redundancies(
             if !any {
                 scratch.fill(0);
             }
+            // Values that are not worth carrying between blocks are dropped
+            // here, at the edge, rather than never recorded - within a block
+            // they are still folded.
+            bits_and(&mut scratch, &universe.keep_across_edges);
             inn[b].copy_from_slice(&scratch);
             bits_and(&mut scratch, &mask[b]);
             bits_or(&mut scratch, &gen[b]);
@@ -987,6 +1029,34 @@ mod tests {
         let text = run(&mut p);
         assert!(!text.contains("%12 ="), "{}", text);
         assert!(text.contains("return %11"), "{}", text);
+    }
+
+    /// Pure values stay block-local on purpose - see `crosses_blocks`. The
+    /// accessor beside them proves this is a policy about kinds and not a
+    /// failure to see across the edge.
+    #[test]
+    fn pure_values_are_not_reused_across_blocks_but_accessors_are() {
+        let mut p = cfg_of(vec![
+            (
+                "__entry",
+                vec![
+                    (id(10), Instruction::NumberConstant { value: crate::pico8_num::Pico8Num::from_i16(7) }),
+                    (id(11), field(2, "x", false)),
+                ],
+                goto("b"),
+            ),
+            (
+                "b",
+                vec![
+                    (id(12), Instruction::NumberConstant { value: crate::pico8_num::Pico8Num::from_i16(7) }),
+                    (id(13), field(2, "x", false)),
+                ],
+                Terminator::Return { value: Some(id(12)) },
+            ),
+        ]);
+        let text = run(&mut p);
+        assert!(text.contains("%12 = "), "the constant should be recomputed:\n{}", text);
+        assert!(!text.contains("%13 = "), "the accessor should be reused:\n{}", text);
     }
 
     /// Chains still collapse when the links are in different blocks, which is
