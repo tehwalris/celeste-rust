@@ -93,6 +93,12 @@ impl<'de> Deserialize<'de> for State {
     }
 }
 
+impl Default for State {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl State {
     pub fn new() -> Self {
         Self {
@@ -104,9 +110,7 @@ impl State {
             vector_size: 1,
         }
     }
-}
 
-impl State {
     pub fn map_values_in_place(&mut self, f: impl Fn(Value) -> Value) {
         let f = &f;
         self.heap.map_in_place(|v| match v {
