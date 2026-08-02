@@ -368,13 +368,41 @@ fn make_builtin_fget(
     }
 }
 
+/// Every element of a numeric argument as an `i16`, loudly.
+///
+/// `tile_flag_at` used to fall back to 0 on a non-integer coordinate, which
+/// would have silently computed collision at the map origin. Positions in
+/// Celeste are always whole pixels, so this error should never fire - and if
+/// it ever does, that is worth a stopped run.
+fn as_i16_elements(v: &MaybeVector<Pico8Num>, what: &str) -> Result<MaybeVector<i16>> {
+    let one = |n: &Pico8Num| {
+        n.as_i16()
+            .ok_or_else(|| anyhow!("tile_flag_at: {} must be an integer, got {:?}", what, n))
+    };
+    match v {
+        MaybeVector::Scalar(n) => Ok(MaybeVector::Scalar(one(n)?)),
+        MaybeVector::Vector(ns) => Ok(MaybeVector::Vector(
+            ns.iter().map(one).collect::<Result<Vec<i16>>>()?,
+        )),
+    }
+}
+
 /// Builtin tile_flag_at using precomputed collision cache
 /// tile_flag_at(x, y, w, h, flag) -> bool
+///
+/// Registered through `add_pure_builtin`: a function of its arguments alone.
+/// The cart data and the collision cache are captured at construction and are
+/// immutable for the lifetime of the environment - and the cache is hardcoded
+/// to room (1, 0), which is where the whole search currently happens. The real
+/// Lua `tile_flag_at` reads the `room` global; this replacement bakes the room
+/// in, so if the search ever crosses a room boundary the builtin must grow a
+/// room argument (and lose this registration) rather than serve stale
+/// collision data. See `inject_tile_flag_at_builtin`.
 fn make_builtin_tile_flag_at(
     cart_data: std::sync::Arc<cart_data::CartData>,
     collision_cache: std::sync::Arc<CollisionCache>,
-) -> impl Fn(State, Vec<Value>) -> Result<Vec<(State, Value)>> {
-    move |state: State, args: Vec<Value>| {
+) -> impl Fn(&[Value]) -> Result<Value> {
+    move |args: &[Value]| {
         if args.len() != 5 {
             return Err(anyhow!("tile_flag_at requires 5 arguments (x, y, w, h, flag)"));
         }
@@ -387,7 +415,7 @@ fn make_builtin_tile_flag_at(
 
         if flag != 0 {
             // Fall back to computed version for non-solid flags
-            return tile_flag_at_computed(&cart_data, &collision_cache, state, &args);
+            return tile_flag_at_computed(&cart_data, &collision_cache, args);
         }
 
         // Extract scalar w, h (these are typically constant)
@@ -396,16 +424,15 @@ fn make_builtin_tile_flag_at(
                 (w.as_i16().ok_or_else(|| anyhow!("w must be integer"))?,
                  h.as_i16().ok_or_else(|| anyhow!("h must be integer"))?)
             }
-            _ => return tile_flag_at_computed(&cart_data, &collision_cache, state, &args),
+            _ => return tile_flag_at_computed(&cart_data, &collision_cache, args),
         };
 
         // Handle x, y which may be vectors
         match (&args[0], &args[1]) {
             (Value::Number(x), Value::Number(y)) => {
-                let result = MaybeVector::map2(x, y, |x, y| {
-                    let xi = x.as_i16().unwrap_or(0);
-                    let yi = y.as_i16().unwrap_or(0);
-
+                let x = as_i16_elements(x, "x")?;
+                let y = as_i16_elements(y, "y")?;
+                let result = MaybeVector::map2(&x, &y, |&xi, &yi| {
                     // Try cached lookup for common sizes
                     if w == 6 && h == 5 {
                         // Player hitbox - but we need to account for the offset
@@ -426,9 +453,9 @@ fn make_builtin_tile_flag_at(
                     // Fall back to computation
                     collision_cache.solid_at(&cart_data, xi, yi, w, h).unwrap_or(false)
                 });
-                Ok(vec![(state, Value::Bool(result))])
+                Ok(Value::Bool(result))
             }
-            _ => tile_flag_at_computed(&cart_data, &collision_cache, state, &args),
+            _ => tile_flag_at_computed(&cart_data, &collision_cache, args),
         }
     }
 }
@@ -437,9 +464,8 @@ fn make_builtin_tile_flag_at(
 fn tile_flag_at_computed(
     cart_data: &cart_data::CartData,
     collision_cache: &CollisionCache,
-    state: State,
     args: &[Value],
-) -> Result<Vec<(State, Value)>> {
+) -> Result<Value> {
     // This path handles non-standard cases
     match (&args[0], &args[1], &args[2], &args[3], &args[4]) {
         (
@@ -502,7 +528,7 @@ fn tile_flag_at_computed(
             } else {
                 Value::Bool(MaybeVector::Vector(results))
             };
-            Ok(vec![(state, result)])
+            Ok(result)
         }
         _ => Err(anyhow!("tile_flag_at: all arguments must be numbers")),
     }
@@ -539,7 +565,7 @@ pub fn create_fixed_env_with_game_builtins() -> FixedEnv {
 
     fixed_env.add_builtin("mget", make_builtin_mget(cart_data.clone()));
     fixed_env.add_builtin("fget", make_builtin_fget(cart_data.clone()));
-    fixed_env.add_builtin("tile_flag_at", make_builtin_tile_flag_at(cart_data, collision_cache));
+    fixed_env.add_pure_builtin("tile_flag_at", make_builtin_tile_flag_at(cart_data, collision_cache));
     fixed_env
 }
 

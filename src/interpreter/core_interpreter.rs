@@ -182,6 +182,39 @@ impl<'a> CoreInterpreter<'a> {
                     )),
                 }
             }
+            Instruction::AssertTrue { value } => match self.state.local_env.get(*value) {
+                Value::Bool(MaybeVector::Scalar(true)) => Ok(None),
+                Value::Bool(MaybeVector::Scalar(false)) => Err(anyhow!(
+                    "AssertTrue(%{}) failed: it is false. A rewrite stated this \
+                     premise and this state falsifies it.",
+                    usize::from(*value)
+                )),
+                Value::Bool(MaybeVector::Vector(lanes)) => {
+                    let false_lanes = lanes.iter().filter(|l| !**l).count();
+                    if false_lanes == 0 {
+                        Ok(None)
+                    } else {
+                        Err(anyhow!(
+                            "AssertTrue(%{}) failed: false in {} of {} lanes. A \
+                             rewrite stated this premise and these lanes falsify it.",
+                            usize::from(*value),
+                            false_lanes,
+                            lanes.len()
+                        ))
+                    }
+                }
+                // A guard whose premise cannot be confirmed must not pass.
+                Value::UnknownBool => Err(anyhow!(
+                    "AssertTrue(%{}) failed: the value is an unknown bool, so the \
+                     premise cannot be confirmed.",
+                    usize::from(*value)
+                )),
+                other => Err(anyhow!(
+                    "AssertTrue(%{}) failed: expected a bool, got {:?}",
+                    usize::from(*value),
+                    other
+                )),
+            },
             Instruction::GetGlobal {
                 name,
                 create_if_missing,

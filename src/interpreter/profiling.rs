@@ -92,6 +92,7 @@ fn instruction_type_name(instr: &Instruction) -> String {
         }
         Instruction::AssertPointer { .. } => "AssertPointer".to_string(),
         Instruction::AssertValueCell { .. } => "AssertValueCell".to_string(),
+        Instruction::AssertTrue { .. } => "AssertTrue".to_string(),
         Instruction::CallBuiltin { name, .. } => format!("CallBuiltin({})", name),
         Instruction::GetGlobal { name, .. } => format!("GetGlobal({})", name),
         Instruction::Load { .. } => "Load".to_string(),

@@ -26,8 +26,12 @@ pub type PureBuiltinFun = Arc<dyn Fn(&[Value]) -> anyhow::Result<Value> + Send +
 /// `rules::if_convert::is_speculatable` decides from it whether a `CallBuiltin`
 /// can be hoisted out of a branch arm. Adding a name here is a claim that the
 /// implementation takes `State` and gives it back untouched, returns a single
-/// result, and reads nothing outside its arguments.
-pub const PURE_BUILTINS: &[&str] = &["min", "max", "abs", "flr"];
+/// result, and reads nothing outside its arguments. Data captured at
+/// construction counts as part of the implementation, not as a read - which is
+/// how `tile_flag_at` qualifies: the cart and the room-(1, 0) collision cache
+/// it closes over are immutable for the lifetime of the environment (see
+/// `game_runner::make_builtin_tile_flag_at` for the room caveat).
+pub const PURE_BUILTINS: &[&str] = &["min", "max", "abs", "flr", "tile_flag_at"];
 
 pub fn is_pure_builtin(name: &str) -> bool {
     PURE_BUILTINS.contains(&name)

@@ -105,7 +105,8 @@ fn commutes_with_store(fun: &FunDef, instr: &Instruction, store_target: LocalId)
         | Instruction::UnaryOp { .. }
         | Instruction::BinaryOp { .. }
         | Instruction::Select { .. }
-        | Instruction::AssertPointer { .. } => true,
+        | Instruction::AssertPointer { .. }
+        | Instruction::AssertTrue { .. } => true,
         // Structure reads: a store writes cell contents, never the name-to-cell
         // mapping these read. The creating variants mutate and must not move,
         // but they are not speculatable in the first place.

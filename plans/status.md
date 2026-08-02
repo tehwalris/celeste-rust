@@ -399,9 +399,113 @@ not, each blocked by a different later stage:
 
 So shape work is done until a bigger stage lands. The remaining splits are
 `btn` x4 (2540 - lane expansion), the blocked diamonds above (~1700, gated on
-loops and `btn`), and the object loop bodies (~1100 - unrolling or
-specialization; `measure_k` prints the unroll price list, 6 iterations x ~62
-instructions each for the top sites).
+loops and `btn`), and the loops (~1100, next).
+
+### Next stage: mask-unroll the movement loops
+
+Light IR reconnaissance split "the object loops" into two families with
+opposite properties:
+
+* **The pixel-stepping loops in `obj.move_x`/`obj.move_y`** (`in_k1000`/
+  `in_k1001`, inlined into `anonymous_61`). Celeste moves one pixel at a
+  time: `for i=1,abs(amount) do if not is_solid(step) then pos += step else
+  stop end`. The trip count `abs(amount)` is **per-lane data** (speed differs
+  across lanes), so the loop-continue branch itself splits
+  (`in_k1001_for_head_487`, 238), and the `is_solid` check in the body splits
+  too (`if_join_413`, 275). These are the frame-time target.
+* **The object-table loops in `check`/`collide`** (`in_k2000`-`2007`). The
+  table length is heap data, and the heap is per-*state* - every lane agrees
+  on how many objects exist. Uniform trip count, **zero splits**. They are
+  most of `anonymous_61`'s 53% of K but cost no frame time; they wait for the
+  kernel endgame (unroll or specialize by object type).
+
+Also to pin: `player.update_21`'s `in_k03x_if_join_413` sites (~260, the
+same `is_solid` body inlined at the wall-jump checks) and
+`in_i1_068_for_head_638` (75).
+
+The mechanism is masking, and the key realisation is that **the recipe
+already does masked execution one instruction at a time**: `select` is a
+masked move, and `sink_store`/`absorb_stores`' `store p <- select c ? new :
+old` is a masked store spelled with unmasked primitives. What is new for
+loops is masking *iteration*: unroll to a static bound and fold the
+continue/break conditions into a per-lane active mask -
+
+    active_k = active_{k-1} && (k <= abs(amount)) && !solid_at_next_pixel
+    x        = select active_k ? x + step : x
+
+Dead iterations compute garbage and keep old values - the same speculation
+bargain, same guards. The unroll is not an alternative to masking but what
+makes it expressible: the interpreter's model is uniform control flow and
+uniform pointers per state, with only scalars varying per lane. A rolled
+loop with per-lane trip counts would make "which iteration am I on"
+per-lane control state, which has no representation; unrolled, every
+iteration's addresses are the same for all lanes and per-lane activity
+becomes data.
+
+Block-level reconnaissance of the inlined `move_y` then reordered the
+stage. Every one of its splitting branches is a short-circuit gate whose
+*operand* is one of the table loops:
+
+* `for_body_start_488` (50) branches on `step > 0` to skip the two
+  platform checks (`in_k2004`/`2005`).
+* `if_join_413` (275) branches on the `tile_flag_at` result to skip the
+  fall-floor and fake-wall checks (`in_k2006`/`2007`) - it is the `or`
+  short-circuit of `solid_at(..) or check(fall_floor) or check(fake_wall)`.
+* `for_head_487` (238) is the pixel loop itself, whose body is all of the
+  above.
+
+So the `or`-chain cannot be made eager per-instruction - a loop is not an
+instruction `speculate` can hoist - and the table loops gate everything,
+not just K. Three facts make the fix cheap:
+
+* **The collide loop body is already pure straight-line code.** Earlier
+  stages (`decompose_truthy`, `cse`) flattened its `and`-chain to selects;
+  what remains is loads, non-create accessors, arithmetic, selects, one
+  early-exit branch, and a counter phi with `+1` increment and a
+  loop-invariant `<= count` bound. No stores, no calls, no creates.
+* **`tile_flag_at` is already a Rust builtin** backed by the per-room
+  collision cache (`game_runner.rs`), and it never reads the abstract
+  state - the room dependence is baked into the cache. Pure function of
+  its args for a fixed room; errors are loud. The IR just still sees an
+  anonymous `call`.
+* The early-exit and head branches of the table loops **never split**
+  today: the trip count (`#objects`) is per-state, and the type-equality
+  select chain collapses the per-lane position bools to a uniform false
+  when no object of the type exists.
+
+The stage order that falls out, cheapest enabler first:
+
+1. **Pin `tile_flag_at`** as a readonly builtin - a second category next
+   to `PURE_BUILTINS` (speculatable, but conservatively does not commute
+   with stores; our sites cross none). Also makes the `solid_at` chain
+   hoistable in `player.update_21`'s `in_k03x` copies.
+2. **`speculate_region`** - the triangle generalised to an arm that is a
+   whole single-entry/single-exit *subgraph*. Head's branch becomes
+   unconditional into the region; region internals are untouched; the
+   join's phis become selects on the head condition. Obligations: every
+   region instruction speculatable, single entry (only external pred is
+   the head), single exit edge to the join, and termination - counter phi
+   with positive constant increment and invariant bound, plus a loud
+   runtime bound guard rather than an overflow argument.
+3. Existing rules flatten the emptied `and`/`or` chain: `if_join_413`
+   (275 + ~260 in the `in_k03x` copies), `body_start_488` (50), with the
+   usual downstream multiplier - `is_solid` feeds `on_ground` which feeds
+   the whole update.
+4. **Unroll + mask the pixel loops last** (`for_head_487`, 238) - by then
+   the body is straight-line except the uniform table loops, so the
+   unroll is the clean self-loop case. A loud static bound on
+   `abs(amount)` replaces a speed-cap argument. This is also what
+   unblocks `if_join_133`/`if_body_135` (540 splits) later.
+
+Parked: `in_i1_068` in `player.update_21` is inlined `spikes_at` - a
+nested 2x2 tile loop with per-lane trip span (75 splits). Same
+unroll+mask family, but its early exit feeds `kill_player`, which
+mutates; take it after the move loops.
+
+The measured trade to expect from 1-3: K roughly flat (the loops already
+ran on most paths), frame time down from ~590 direct splits plus the
+multiplier. From 4: K up (all iterations always execute), another ~240
+direct.
 
 Expect the exposure cascade whenever a stage removes splits: lanes that used
 to arrive pre-sorted arrive mixed, and quiet branches wake up. Re-run

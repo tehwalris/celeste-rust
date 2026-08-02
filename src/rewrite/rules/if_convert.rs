@@ -111,6 +111,10 @@ pub fn is_speculatable(instr: &Instruction) -> bool {
         // is per-state, not per-lane, and a spurious failure on a state that
         // would have skipped the arm is loud. Same bargain as the two above.
         Instruction::AssertValueCell { .. } => true,
+        // Inspects a local bool, only to fail, and the failure is loud. A
+        // speculated guard can fire on a state that would have skipped it,
+        // which is the usual screening question.
+        Instruction::AssertTrue { .. } => true,
         // Weaker than the above and worth stating plainly: this one really can
         // fail where the unspeculated program would not. `if a.type == player
         // then a:method() end` speculates into asserting that a non-player is a

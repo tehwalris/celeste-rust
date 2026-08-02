@@ -106,6 +106,9 @@ pub fn format_instruction(instr: &Instruction) -> String {
         Instruction::AssertValueCell { target } => {
             format!("assert_value_cell {}", n(*target))
         }
+        Instruction::AssertTrue { value } => {
+            format!("assert_true {}", n(*value))
+        }
         Instruction::CallBuiltin { callee, name, args } => format!(
             "call_builtin {:?} via {}({})",
             name,

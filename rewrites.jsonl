@@ -662,4 +662,10 @@
 {"id":"v007","rule":"absorb_stores","fn":"player.update_21","head":"if_join_108"}
 {"id":"v008","rule":"speculate","fn":"player.update_21","join":"if_join_95","arm":"if_body_94"}
 {"id":"v009","rule":"absorb_stores","fn":"player.update_21","head":"if_condition_92"}
+{"id":"b018","rule":"pin_builtin","fn":"anonymous_61","at":"%288","name":"tile_flag_at"}
+{"id":"b019","rule":"pin_builtin","fn":"anonymous_61","at":"%460","name":"tile_flag_at"}
+{"id":"b020","rule":"pin_builtin","fn":"player.update_21","at":"%3274","name":"tile_flag_at"}
+{"id":"b021","rule":"pin_builtin","fn":"player.update_21","at":"%3413","name":"tile_flag_at"}
+{"id":"b022","rule":"pin_builtin","fn":"player.update_21","at":"%3552","name":"tile_flag_at"}
+{"id":"b023","rule":"pin_builtin","fn":"player.update_21","at":"%3657","name":"tile_flag_at"}
 {"id":"s1","rule":"allocate_slots"}

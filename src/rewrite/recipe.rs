@@ -19,7 +19,7 @@ use super::program::Program;
 use super::rules::{
     absorb_stores, allocate_slots, convert_ternary, cse, dce, decompose_truthy, demote_create,
     fold, if_convert, inline, merge_blocks, pin_builtin, promote_capture, promote_cell,
-    sink_store, speculate,
+    sink_store, speculate, speculate_region,
 };
 use crate::ir::LocalId;
 use super::validate::{validate_function, validate_program};
@@ -153,6 +153,19 @@ pub enum Rule {
         /// The block whose conditional branch is absorbed.
         head: String,
     },
+    /// Run a pure single-entry single-exit subgraph (loops included)
+    /// unconditionally instead of behind a branch: the head's branch becomes
+    /// a jump into the region, the region is untouched, the join's phis
+    /// become selects. Loops must have the guarded counter shape; the bound
+    /// gets a loud `assert_true` range guard. Screen at full depth.
+    SpeculateRegion {
+        #[serde(rename = "fn")]
+        function: String,
+        /// The block whose conditional branch is removed.
+        head: String,
+        /// The region's entry: the branch target that is not the join.
+        arm: String,
+    },
     /// Move a triangle arm's trailing store past the join: a guarded load
     /// before the branch, a phi at the join, the store after it. The
     /// `assert_value_cell` guard makes the one non-identity case - a closure
@@ -188,6 +201,7 @@ impl Rule {
             Rule::ConvertTernary { .. } => "convert_ternary",
             Rule::DecomposeTruthy { .. } => "decompose_truthy",
             Rule::Speculate { .. } => "speculate",
+            Rule::SpeculateRegion { .. } => "speculate_region",
             Rule::SinkStore { .. } => "sink_store",
             Rule::AbsorbStores { .. } => "absorb_stores",
             Rule::PromoteCell { .. } => "promote_cell",
@@ -351,6 +365,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::Speculate { function, join, arm } => {
             speculate::apply(program, function, join, arm.as_deref())
         }
+        Rule::SpeculateRegion { function, head, arm } => {
+            speculate_region::apply(program, function, head, arm)
+        }
         Rule::AbsorbStores { function, head } => absorb_stores::apply(program, function, head),
         Rule::SinkStore { function, at } => {
             sink_store::apply(program, function, parse_cell(at)?)
@@ -427,6 +444,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         }
         Rule::Speculate { function, join, arm } => {
             speculate::verify(&before, program, function, join, arm.as_deref())
+        }
+        Rule::SpeculateRegion { function, head, arm } => {
+            speculate_region::verify(&before, program, function, head, arm)
         }
         Rule::AbsorbStores { function, head } => {
             absorb_stores::verify(&before, program, function, head)

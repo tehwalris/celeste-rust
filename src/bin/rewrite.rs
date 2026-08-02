@@ -63,7 +63,8 @@ enum Command {
     Suggest {
         /// What to look for: "promote-cell", "promote-capture", "inline",
         /// "if-convert", "demote-create", "pin-builtin", "convert-ternary",
-        /// "decompose-truthy", "speculate", "sink-store" or "absorb-stores".
+        /// "decompose-truthy", "speculate", "speculate-region", "sink-store"
+        /// or "absorb-stores".
         #[arg(default_value = "promote-cell")]
         what: String,
         /// Prefix for the generated ids.
@@ -725,6 +726,30 @@ fn main() -> Result<()> {
                     eprintln!(
                         "# Triangles: follow with sink_store per store, then if_convert. \
                          Diamonds: absorb_stores once both arms are bare."
+                    );
+                }
+                "speculate-region" => {
+                    let candidates =
+                        celeste_rust::rewrite::rules::speculate_region::candidates(&program);
+                    for (i, (function, head, arm)) in candidates.iter().enumerate() {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "id": format!("{}{:03}", prefix, i),
+                                "rule": "speculate_region",
+                                "fn": function,
+                                "head": head.as_str(),
+                                "arm": arm.as_str(),
+                            })
+                        );
+                    }
+                    eprintln!(
+                        "# {} branch(es) skipping a pure single-entry single-exit region.",
+                        candidates.len()
+                    );
+                    eprintln!(
+                        "# Convert splitting heads only - an eager region that never \
+                         split is pure cost."
                     );
                 }
                 "absorb-stores" => {

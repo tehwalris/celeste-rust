@@ -71,7 +71,8 @@ fn instruction_kind(instr: &crate::ir::Instruction) -> &'static str {
         }
         UnaryOp { .. } | BinaryOp { .. } | Select { .. } => "arith",
         Phi { .. } => "phi",
-        AssertClosure { .. } | AssertPointer { .. } | AssertValueCell { .. } => "guard",
+        AssertClosure { .. } | AssertPointer { .. } | AssertValueCell { .. }
+        | AssertTrue { .. } => "guard",
         CallBuiltin { .. } => "builtin",
     }
 }

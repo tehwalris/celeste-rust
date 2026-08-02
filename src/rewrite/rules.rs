@@ -39,6 +39,7 @@ pub mod promote_capture;
 pub mod promote_cell;
 pub mod sink_store;
 pub mod speculate;
+pub mod speculate_region;
 
 /// Applies `f` to every function in the program, returning how many changes
 /// were made in total.

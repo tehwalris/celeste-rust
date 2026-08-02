@@ -271,6 +271,22 @@ pub enum Instruction {
     AssertValueCell {
         target: LocalId,
     },
+    /// Fails execution unless `value` is a bool that is true on every lane.
+    ///
+    /// The general-purpose loud guard: any premise that can be phrased as a
+    /// boolean over existing instructions gets computed with ordinary
+    /// arithmetic and then stated here. First user is `rules::speculate_region`,
+    /// which asserts a speculated loop's bound is small enough that its
+    /// counter can never wrap before exceeding it - turning a non-termination
+    /// argument into a range check. The planned loop unroll will state its
+    /// trip-count bound the same way.
+    ///
+    /// Unlike the guards above, this one is per-lane, not per-state: a vector
+    /// bool must be true in every lane, and `UnknownBool` fails - a guard
+    /// whose premise cannot be confirmed must not pass silently.
+    AssertTrue {
+        value: LocalId,
+    },
     /// A `Call` whose callee has been pinned to a named builtin.
     ///
     /// Exactly `Call`, after asserting that `callee` holds `BuiltinFun(name)`.
@@ -375,6 +391,7 @@ impl Instruction {
             },
             Self::AssertPointer { value } => Self::AssertPointer { value: f(*value) },
             Self::AssertValueCell { target } => Self::AssertValueCell { target: f(*target) },
+            Self::AssertTrue { value } => Self::AssertTrue { value: f(*value) },
             Self::CallBuiltin { callee, name, args } => Self::CallBuiltin {
                 callee: f(*callee),
                 name: name.clone(),
@@ -426,6 +443,7 @@ impl Instruction {
             }
             Self::AssertPointer { value } => vec![*value],
             Self::AssertValueCell { target } => vec![*target],
+            Self::AssertTrue { value } => vec![*value],
             Self::CallBuiltin { callee, args, .. } => {
                 let mut v = vec![*callee];
                 v.extend(args.iter().copied());
@@ -460,7 +478,10 @@ impl Instruction {
             | Self::Phi { .. } => false,
             // Not a side effect on the heap, but they must never be optimised
             // away: their whole purpose is to fail.
-            Self::AssertClosure { .. } | Self::AssertPointer { .. } | Self::AssertValueCell { .. } => true,
+            Self::AssertClosure { .. }
+            | Self::AssertPointer { .. }
+            | Self::AssertValueCell { .. }
+            | Self::AssertTrue { .. } => true,
             // Pure in the heap, but it asserts, and the original `call` it
             // replaced would have run and could have failed. Same answer as
             // `Call` for the same reason.
