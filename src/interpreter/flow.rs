@@ -271,7 +271,8 @@ impl<'a> BoundInterpreterFlow<'a> {
                         Ok(FlowData::States(vec![state]))
                     } else {
                         // Mixed: filter the state immediately
-                        let new_state = state.filter_by_mask(&condition_mask);
+                        let new_state =
+                            state.filter_by_mask(&condition_mask, crate::interpreter::state::FILTER_BRANCH);
                         Ok(FlowData::States(vec![new_state]))
                     }
                 }

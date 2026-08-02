@@ -548,7 +548,7 @@ fn dedup_vectorized_state(mut state: State) -> State {
         return state;
     }
 
-    state.filter_by_mask(&mask)
+    state.filter_by_mask(&mask, crate::interpreter::state::FILTER_DEDUP)
 }
 
 /// Collect all vectorizable vector values from a state for dedup purposes.

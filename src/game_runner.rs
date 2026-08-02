@@ -201,7 +201,7 @@ fn builtin_split_by_flr(state: State, args: Vec<Value>) -> Result<Vec<(State, Va
                 let mask: Vec<bool> = (0..nums.len())
                     .map(|i| group.iter().any(|(gi, _)| *gi == i))
                     .collect();
-                let filtered_state = state.filter_by_mask_clone(&mask);
+                let filtered_state = state.filter_by_mask_clone(&mask, crate::interpreter::state::FILTER_SPLIT_FLR);
                 let result_nums: Vec<Pico8Num> = group.into_iter().map(|(_, n)| n).collect();
                 let result_value = if result_nums.len() == 1 {
                     Value::Number(MaybeVector::Scalar(result_nums[0]))
@@ -252,7 +252,7 @@ fn builtin_split_by_flr(state: State, args: Vec<Value>) -> Result<Vec<(State, Va
                     continue; // No elements in this floor range
                 }
 
-                let filtered_state = state.filter_by_mask_clone(&mask);
+                let filtered_state = state.filter_by_mask_clone(&mask, crate::interpreter::state::FILTER_SPLIT_FLR);
 
                 // Collect the intersected intervals (non-None values)
                 let result_intervals: Vec<Pico8NumInterval> = intersections

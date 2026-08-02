@@ -19,6 +19,22 @@ type FxHashMap<K, V> = std::collections::HashMap<K, V, FxBuildHasher>;
 // This eliminates the need to sort in shape_of_state.
 type ImOrdMap<K, V> = im::OrdMap<K, V>;
 
+/// Why a `filter_by_mask` happened. Used as the trace span name so the three
+/// very different causes can be told apart in a profile.
+pub type FilterReason = &'static str;
+
+/// A conditional branch whose condition differs across lanes: the state is
+/// split so each edge sees only its own lanes. Pure overhead - this is what
+/// making the program branch-free is meant to eliminate.
+pub const FILTER_BRANCH: FilterReason = "filter_branch";
+
+/// `__split_by_flr` refining an interval into integer-floor classes.
+/// Semantically necessary; this is the search fanning out, not overhead.
+pub const FILTER_SPLIT_FLR: FilterReason = "filter_split_flr";
+
+/// Dropping duplicate lanes during vectorization. Useful work.
+pub const FILTER_DEDUP: FilterReason = "filter_dedup";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct State {
     pub heap: Heap,
@@ -131,15 +147,22 @@ impl State {
 
     /// Filters all vector values in the state by a mask, consuming self.
     /// The resulting state's vector_size will be the number of true values in the mask.
-    pub fn filter_by_mask(mut self, mask: &[bool]) -> Self {
-        self.filter_by_mask_in_place(mask);
+    ///
+    /// `reason` names the call site and becomes the trace span name. Filtering is
+    /// a large share of runtime, and the three reasons have very different
+    /// meanings: `FILTER_BRANCH` is overhead we intend to eliminate by making
+    /// the program branch-free, whereas `FILTER_SPLIT_FLR` is semantically
+    /// necessary interval refinement. Keeping them apart in traces is the only
+    /// way to size that prize. See plans/rewrite-plan.md.
+    pub fn filter_by_mask(mut self, mask: &[bool], reason: FilterReason) -> Self {
+        self.filter_by_mask_in_place(mask, reason);
         self
     }
 
     /// Filters all vector values in the state by a mask in place.
     /// The resulting state's vector_size will be the number of true values in the mask.
-    fn filter_by_mask_in_place(&mut self, mask: &[bool]) {
-        let _trace = TraceSpan::new("filter_by_mask", "filter");
+    fn filter_by_mask_in_place(&mut self, mask: &[bool], reason: FilterReason) {
+        let _trace = TraceSpan::new(reason, "filter");
         use super::value::count_true;
         let new_vector_size = count_true(mask);
 
@@ -159,9 +182,9 @@ impl State {
 
     /// Filters all vector values in the state by a mask, cloning first.
     /// The resulting state's vector_size will be the number of true values in the mask.
-    pub fn filter_by_mask_clone(&self, mask: &[bool]) -> Self {
+    pub fn filter_by_mask_clone(&self, mask: &[bool], reason: FilterReason) -> Self {
         let mut new_state = self.clone();
-        new_state.filter_by_mask_in_place(mask);
+        new_state.filter_by_mask_in_place(mask, reason);
         new_state
     }
 
