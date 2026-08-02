@@ -134,34 +134,28 @@ pub fn analyze(fun: &FunDef) -> Liveness {
     Liveness { live_in, live_out }
 }
 
-/// How much a function would gain from slot allocation.
+/// How much a function gains from slot allocation.
 pub struct SlotReport {
     pub name: String,
-    /// What `LocalEnv` costs today: it is indexed by `LocalId`, so its length is
-    /// the highest id plus one.
+    /// What `LocalEnv` costs for this function: the length of its slot map, or,
+    /// while the map is still the identity, the highest `LocalId` plus one.
     pub env_slots_now: usize,
-    /// What it would cost if values with disjoint live ranges shared a slot.
+    /// The floor: no allocation can use fewer slots than the largest number of
+    /// values live at one time.
     pub env_slots_packed: usize,
     pub definitions: usize,
 }
 
 pub fn slot_report(fun: &FunDef) -> SlotReport {
     let liveness = analyze(fun);
-    let mut max_id = 0;
-    let mut definitions = 0;
-    for id in fun.arg_ids.iter().flatten().chain(fun.capture_ids.iter()) {
-        max_id = max_id.max(usize::from(*id) + 1);
-    }
-    for block in fun.cfg.iter_blocks() {
-        for (id, _) in &block.instructions {
-            max_id = max_id.max(usize::from(*id) + 1);
-            definitions += 1;
-        }
-        max_id = max_id.max(usize::from(block.terminator_id()) + 1);
-    }
+    let definitions = fun
+        .cfg
+        .iter_blocks()
+        .map(|b| b.instructions.len())
+        .sum::<usize>();
     SlotReport {
         name: fun.name.as_str().to_string(),
-        env_slots_now: max_id,
+        env_slots_now: super::slots::slot_count(fun),
         env_slots_packed: liveness.max_simultaneously_live(&fun.cfg),
         definitions,
     }

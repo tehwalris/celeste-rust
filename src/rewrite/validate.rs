@@ -260,6 +260,20 @@ pub fn validate_function(fun: &FunDef) -> Vec<ValidationError> {
         }
     }
 
+    // --- the slot map matches the CFG ---
+    //
+    // Run here, after every rewrite, rather than only after `allocate_slots`.
+    // The dangerous case is not a bad allocation but a stale one: a rule that
+    // introduces or renumbers ids while an older map is still attached. Every
+    // rule that rebuilds blocks goes through `Cfg::map_blocks`, which resets the
+    // map to the identity, and this is what makes that obligation enforced
+    // rather than merely documented.
+    if errors.is_empty() {
+        for message in super::slots::check(fun) {
+            err!("{}", message);
+        }
+    }
+
     errors
 }
 
@@ -297,8 +311,10 @@ pub fn compute_reachable(blocks: &[(BlockKey, &Block)]) -> FxHashSet<BlockKey> {
 
 /// Dominator sets by the textbook fixpoint:
 ///
-///     Dom(entry) = {entry}
-///     Dom(n)     = {n} union (intersection over predecessors p of Dom(p))
+/// ```text
+/// Dom(entry) = {entry}
+/// Dom(n)     = {n} union (intersection over predecessors p of Dom(p))
+/// ```
 ///
 /// The sets include the block itself. Chosen over the Lengauer-Tarjan or
 /// Cooper-Harvey-Kennedy formulations purely because it is obviously correct

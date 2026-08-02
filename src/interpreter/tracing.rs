@@ -281,26 +281,40 @@ pub fn trace_call_owned(name: String) -> TraceSpan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
     use std::thread;
     use std::time::Duration;
 
+    /// Tracing state is process-global, so these tests cannot run concurrently
+    /// with each other. Each one takes this lock and resets the state under it.
+    /// Without it, `test_tracing_disabled_by_default` and `test_enable_tracing`
+    /// race and fail perhaps one run in five.
+    static TRACING_TESTS: Mutex<()> = Mutex::new(());
+
+    /// Recovers from poisoning: a failing test would otherwise turn one failure
+    /// into five.
+    fn exclusive() -> MutexGuard<'static, ()> {
+        let guard = TRACING_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        reset_tracing();
+        guard
+    }
+
     #[test]
     fn test_tracing_disabled_by_default() {
-        // Reset to ensure test isolation (other tests may have enabled tracing)
-        reset_tracing();
+        let _guard = exclusive();
         assert!(!is_tracing_enabled());
     }
 
     #[test]
     fn test_enable_tracing() {
-        reset_tracing();
+        let _guard = exclusive();
         enable_tracing();
         assert!(is_tracing_enabled());
     }
 
     #[test]
     fn test_span_collection() {
-        reset_tracing();
+        let _guard = exclusive();
         enable_tracing();
 
         {
@@ -317,7 +331,7 @@ mod tests {
 
     #[test]
     fn test_nested_spans() {
-        reset_tracing();
+        let _guard = exclusive();
         enable_tracing();
 
         {
@@ -338,8 +352,7 @@ mod tests {
 
     #[test]
     fn test_disabled_no_overhead() {
-        // Ensure tracing is disabled
-        TRACING_ENABLED.store(false, Ordering::Release);
+        let _guard = exclusive();
 
         // These should be no-ops
         {

@@ -735,6 +735,20 @@ pub fn assert_state_vector_lengths(state: &State) {
 
 /// Clean states by removing local_env entries that don't appear in all states.
 /// This allows states with different dead temporaries to merge.
+///
+/// A slot only survives if every state has it filled *and* they all agree on
+/// which `LocalId` is in it. The occupant part matters once slots are actually
+/// allocated: two states at this program point can hold different dead
+/// temporaries in one shared slot, and merging those would produce a state
+/// whose slot means one thing in some lanes and another in the rest.
+///
+/// Dropping such a slot is safe. All these states sit at the same program
+/// point, so the set of *live* ids is the same for all of them, and a live id
+/// occupies the same slot in each. Disagreement therefore only ever happens on
+/// values nothing will read.
+///
+/// Under the identity map occupant and slot are the same number, so the extra
+/// condition changes nothing.
 fn clean_local_envs_for_merging(states: Vec<State>) -> Vec<State> {
     use crate::ir::LocalId;
 
@@ -742,20 +756,25 @@ fn clean_local_envs_for_merging(states: Vec<State>) -> Vec<State> {
         return states;
     }
 
-    // Find the intersection of all local_env keys
-    let mut common_keys: FxHashSet<usize> = states[0].local_env.iter().map(|(k, _)| k).collect();
-    for state in &states[1..] {
-        let state_keys: FxHashSet<usize> = state.local_env.iter().map(|(k, _)| k).collect();
-        common_keys = common_keys.intersection(&state_keys).copied().collect();
-    }
+    let occupancy = |state: &State| -> FxHashSet<(usize, Option<LocalId>)> {
+        state
+            .local_env
+            .iter()
+            .map(|(slot, _)| (slot, state.local_env.occupant_of_slot(slot)))
+            .collect()
+    };
 
-    // Remove keys that aren't in the intersection. `common_keys` holds slots,
-    // so the retain predicate has to compare slots too.
+    let mut common: FxHashSet<(usize, Option<LocalId>)> = occupancy(&states[0]);
+    for state in &states[1..] {
+        common = common.intersection(&occupancy(state)).copied().collect();
+    }
+    let common_slots: FxHashSet<usize> = common.iter().map(|(slot, _)| *slot).collect();
+
     states.into_iter().map(|mut state| {
         let slots = std::sync::Arc::clone(state.local_env.slots());
         state
             .local_env
-            .retain(|id: LocalId| common_keys.contains(&slots.slot_of(id)));
+            .retain(|id: LocalId| common_slots.contains(&slots.slot_of(id)));
         state
     }).collect()
 }

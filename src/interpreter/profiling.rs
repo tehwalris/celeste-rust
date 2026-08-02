@@ -1024,7 +1024,7 @@ mod tests {
         profiler.enable();
 
         let parent_id = profiler.create_dag_node(1, 10, DagOperation::Entry, None);
-        let child_id = profiler.create_dag_node(
+        let _child_id = profiler.create_dag_node(
             2,
             20,
             DagOperation::BlockExecution { block_name: Some("test".to_string()) },
@@ -1042,7 +1042,7 @@ mod tests {
 
         let id1 = profiler.create_dag_node(1, 10, DagOperation::Entry, None);
         let id2 = profiler.create_dag_node(2, 20, DagOperation::Entry, None);
-        let merged_id = profiler.create_merged_dag_node(
+        let _merged_id = profiler.create_merged_dag_node(
             1,
             30,
             DagOperation::Vectorization,

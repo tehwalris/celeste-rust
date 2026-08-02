@@ -136,3 +136,4 @@
 {"id":"c2a","rule":"fold"}
 {"id":"c2b","rule":"merge_blocks"}
 {"id":"c2c","rule":"dce"}
+{"id":"s1","rule":"allocate_slots"}

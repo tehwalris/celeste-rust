@@ -16,7 +16,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use super::program::Program;
-use super::rules::{dce, fold, inline, merge_blocks, promote_cell};
+use super::rules::{allocate_slots, dce, fold, inline, merge_blocks, promote_cell};
 use crate::ir::LocalId;
 use super::validate::validate_program;
 
@@ -40,6 +40,9 @@ pub struct RewriteEntry {
 pub enum Rule {
     /// Remove dead instructions and unreachable blocks.
     Dce,
+    /// Repack locals so that values with disjoint live ranges share a slot.
+    /// Changes no instructions - only where they are stored.
+    AllocateSlots,
     /// Merge blocks into single-successor predecessors.
     MergeBlocks,
     /// Local simplifications: constant conditions, degenerate phis.
@@ -67,6 +70,7 @@ impl Rule {
     pub fn name(&self) -> &'static str {
         match self {
             Rule::Dce => "dce",
+            Rule::AllocateSlots => "allocate_slots",
             Rule::MergeBlocks => "merge_blocks",
             Rule::Fold => "fold",
             Rule::Inline { .. } => "inline",
@@ -149,6 +153,7 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
 
     let changes = match &entry.rule {
         Rule::Dce => dce::apply(program),
+        Rule::AllocateSlots => allocate_slots::apply(program),
         Rule::MergeBlocks => merge_blocks::apply(program),
         Rule::Fold => fold::apply(program),
         Rule::PromoteCell { function, cell } => {
@@ -174,6 +179,7 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
 
     match &entry.rule {
         Rule::Dce => dce::verify(&before, program),
+        Rule::AllocateSlots => allocate_slots::verify(&before, program),
         Rule::MergeBlocks => merge_blocks::verify(&before, program),
         Rule::Fold => fold::verify(&before, program),
         Rule::PromoteCell { function, cell } => {

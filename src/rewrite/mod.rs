@@ -31,5 +31,6 @@ pub mod print;
 pub mod program;
 pub mod recipe;
 pub mod rules;
+pub mod slots;
 pub mod validate;
 pub mod verify;
