@@ -92,6 +92,19 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         frames: u32,
     },
+    /// Print a digest of the canonical observation after each frame.
+    ///
+    /// `verify` compares two programs built from the same sources, so it cannot
+    /// check a change to the *harness* - a new builtin, a different lane
+    /// layout. This prints something stable that can be compared across such a
+    /// change by hand: run it, make the change, run it again, diff.
+    ///
+    /// The digest is over lane content, and lane rows are a set, so it is
+    /// deliberately blind to how lanes are distributed across states.
+    Observe {
+        #[arg(long, default_value_t = 30)]
+        frames: u32,
+    },
     /// Run the rewritten program and report time, memory and lane counts.
     ///
     /// Note peak RSS is the process-wide high-water mark, so with `--baseline`
@@ -486,6 +499,23 @@ fn main() -> Result<()> {
                 total,
                 frames
             );
+        }
+
+        Command::Observe { frames } => {
+            let (program, _) = build(&recipe)?;
+            let trace = celeste_rust::rewrite::verify::observation_trace(&program, frames)?;
+            println!("{:>6} {:>8} {:>20}", "frame", "states", "digest");
+            for (frame, observation) in trace.iter().enumerate() {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = rustc_hash::FxHasher::default();
+                format!("{:?}", observation).hash(&mut hasher);
+                println!(
+                    "{:>6} {:>8} {:>20x}",
+                    frame,
+                    observation.len(),
+                    hasher.finish()
+                );
+            }
         }
 
         Command::Bench { frames, baseline, profile } => {

@@ -115,6 +115,44 @@ Note the mechanism: this is not lane filtering, it is state *duplication*.
 remove, because the branch is semantically necessary - it is how the search
 enumerates inputs.
 
+### Input fan-out: lane expansion is worse than state duplication (2026-08)
+
+Following the branch-site table, `btn` was rewritten to be branch-free: a
+`__concretize` builtin that turns the `UnknownBool` button into a per-lane
+`Bool` by doubling the lane space, instead of an `if` that sends the state down
+both edges. Total lanes are identical either way, and `rewrite observe` confirmed
+the lane content was byte-identical over 25 frames.
+
+It is a clear regression:
+
+| | time | memory | mean fragments |
+|---|---|---|---|
+| `btn` as an `if` (state duplication) | 4.47 s | 1.12 GB | 576 |
+| `btn` via `__concretize` (lane expansion) | 5.46 s | 1.72 GB | 576 |
+
+**The fragment count did not move at all.** The split moved from inside `btn` to
+its caller: `if btn(k_jump) and ...` now branches on a lane-varying bool and
+splits into the same two states, one branch later.
+
+And it is *worse* than that, because the old formulation was doing something
+useful. Duplicating the state gives two states in which the button is
+`Bool(Scalar(true))` and `Bool(Scalar(false))` - **scalars**, which cost no
+per-lane storage and make every downstream condition derived from the button
+uniform, hence free. Lane expansion makes the button a vector, so those
+conditions become lane-varying, they split with real `filter_by_mask` work, and
+every value derived from the button is now per-lane storage. Hence the 54% more
+memory.
+
+So `UnknownBool` sending a state down both edges unfiltered is **load-bearing,
+not a wart**. Fragments are not gratuitous: each one is a scalar-specialised
+copy of the state, which is exactly why 93% of branches are free.
+
+The corollary for the plan: input fan-out as lane expansion only pays once the
+frame is *already* branch-free, because only then is there no downstream branch
+left to absorb the split. It is a late-stage change, not an early one. Reverted;
+`rewrite observe` was kept, since checking a harness change against lane content
+is what made this cheap to evaluate.
+
 ### What `gc` is actually doing (2026-08)
 
 `gc` is 21% of runtime at ~46 us per call, and the obvious guess is that it is

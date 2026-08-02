@@ -90,19 +90,51 @@ information fits in one state with twice as many lanes: `Bool(Vector([false; n]
 identical either way; the difference is the number of *states*, and every part
 of the 60% merge cost is per state.
 
-### Next: make input fan-out expand lanes instead of duplicating states
+### Tried: make input fan-out expand lanes. It is worse.
 
-1. Replace the Lua `btn` with a native builtin that, given an `UnknownBool`
-   button, returns **one** state of 2n lanes rather than two states of n. The
-   builtin signature already allows it - `Vec<(State, Value)>` can be a
-   singleton.
-2. Measure the fragment count, not the `filter_branch` share.
-3. If it works, look at whether `UnknownBool` branching in general should expand
-   rather than duplicate. `__split_by_flr` partitions lanes rather than
-   duplicating, which is why it costs 0.5% instead of 26%.
+`btn` was rewritten branch-free, with a `__concretize` builtin doubling the lane
+space instead of an `if` splitting the state. Lane content came out
+byte-identical over 25 frames (`rewrite observe`), and it was a clear
+regression: 4.47 s / 1.12 GB became 5.46 s / 1.72 GB, with **the fragment count
+unchanged at 576**.
 
-Unknown until measured: whether halving states at the button read compounds
-through the downstream branches or is absorbed by them. The mechanism is cheap
-to test, which is the main argument for testing it first.
+The split simply moved into the caller. `if btn(k_jump) and ...` now branches on
+a lane-varying bool and produces the same two states one branch later - except
+that the old version had something going for it that this analysis missed:
+duplicating the state leaves the button a **scalar** in each copy, so every
+downstream condition derived from it is uniform and therefore free. Expanding
+lanes makes it a vector, those conditions start splitting for real, and every
+derived value becomes per-lane storage.
 
-After that, section 4's stage E (`peel`) for the loops.
+So `UnknownBool` branching to both edges is load-bearing. A fragment is a
+scalar-specialised copy of the state, which is why 93% of branches are free.
+Lane expansion only pays once the frame is already branch-free and there is no
+downstream branch left to absorb the split - a late-stage change, not an early
+one. Reverted; details in BENCHMARK_DATA.md.
+
+## Where that leaves things
+
+Three of the four ideas that looked promising from the profile have now been
+measured and rejected: `Arc<Vec>` for gc (3%, not 20%), `if_convert` on the
+`and`/`or` triangles (4.6% of splits), and lane expansion for input fan-out (a
+regression). What each one taught is in BENCHMARK_DATA.md, and the pattern is
+consistent: **fragmentation is not obviously wasteful.** Each fragment is a
+state in which more values are scalar, and scalars are what make the
+interpreter fast.
+
+That reframes the target. The 60% spent merging is not the cost of a mistake
+to be undone cheaply; it is the price of scalar specialisation, and it comes
+down either by
+
+  * making the merge itself cheaper - `merge_groups` 26%, `gc` 20%,
+    `shape_grouping` 9%, `dedup_state` 9%, all charged per state on ~576 states
+    per frame. Nothing here has been examined yet, and unlike the rewrites it
+    does not depend on the program's shape.
+  * or by getting all the way to a branch-free frame, at which point there is
+    one state and no merge. That is stages D and E finished, not started: 305
+    calls remain and no loop has been peeled. `if_convert` is built and works,
+    but it cannot touch a branch whose arm calls or stores.
+
+The second is the original plan and still the endgame. The first has never been
+measured and is the obvious next thing to look at, since it is a bounded
+question with a known cost.
