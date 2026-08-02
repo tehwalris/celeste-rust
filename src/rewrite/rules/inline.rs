@@ -687,3 +687,106 @@ pub fn candidates(program: &Program, fun: &FunDef) -> Vec<(LocalId, String, Vec<
     out.sort_by_key(|(id, _, _)| usize::from(*id));
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rewrite::print::format_function;
+    use indexmap::IndexMap;
+
+    fn id(n: usize) -> LocalId {
+        LocalId::from(n)
+    }
+
+    fn block(instructions: Vec<(LocalId, Instruction)>, terminator: Terminator) -> Block {
+        Block { instructions, terminator: (id(900), terminator), hint_normalize: false }
+    }
+
+    fn program(funs: Vec<FunDef>) -> Program {
+        let mut functions = IndexMap::new();
+        for f in funs {
+            functions.insert(f.name.clone(), f);
+        }
+        Program { functions }
+    }
+
+    /// caller: `%1 = alloc; %2 = load %1; %3 = call %2()`
+    /// callee: `captures [%10]`, `%11 = load %10; return %11`
+    ///
+    /// `%1` stands in for the receiver the recipe offers as the capture.
+    fn caller_and_callee() -> Program {
+        let caller = FunDef {
+            name: GlobalId::from("caller".to_string()),
+            capture_ids: vec![],
+            arg_ids: vec![],
+            cfg: Cfg::new(
+                block(
+                    vec![
+                        (id(1), Instruction::Alloc),
+                        (id(2), Instruction::Load { source: id(1) }),
+                        (id(3), Instruction::Call { closure: id(2), args: vec![] }),
+                    ],
+                    Terminator::Return { value: Some(id(3)) },
+                ),
+                FxHashMap::default(),
+            ),
+            source_span: None,
+        };
+        let callee = FunDef {
+            name: GlobalId::from("callee".to_string()),
+            capture_ids: vec![id(10)],
+            arg_ids: vec![],
+            cfg: Cfg::new(
+                block(
+                    vec![(id(11), Instruction::Load { source: id(10) })],
+                    Terminator::Return { value: Some(id(11)) },
+                ),
+                FxHashMap::default(),
+            ),
+            source_span: None,
+        };
+        program(vec![caller, callee])
+    }
+
+    #[test]
+    fn a_capture_is_bound_and_asserted() {
+        let mut p = caller_and_callee();
+        let before = p.clone();
+        apply(&mut p, "t", "caller", id(3), "callee", &[id(1)]).unwrap();
+        verify(&before, &p, "t", "caller", id(3), "callee", &[id(1)]).unwrap();
+
+        let text = format_function(p.get("caller").unwrap());
+        assert!(
+            text.contains("assert_closure %2 is callee with captures [%1]"),
+            "{}",
+            text
+        );
+        // The callee's `load %10` became a load of the caller's `%1`, so the
+        // capture really is bound rather than left dangling.
+        assert!(text.contains("load %1"), "{}", text);
+    }
+
+    /// The guard is the whole soundness argument, so a rewrite that binds the
+    /// captures but does not assert them must be rejected.
+    #[test]
+    fn verify_rejects_a_guard_that_omits_the_captures() {
+        let mut p = caller_and_callee();
+        let before = p.clone();
+        apply(&mut p, "t", "caller", id(3), "callee", &[id(1)]).unwrap();
+        let caller = p.get_mut("caller").unwrap();
+        for (_, instr) in caller.cfg.entry.instructions.iter_mut() {
+            if let Instruction::AssertClosure { captures, .. } = instr {
+                captures.clear();
+            }
+        }
+        assert!(verify(&before, &p, "t", "caller", id(3), "callee", &[id(1)]).is_err());
+    }
+
+    /// A recipe that names the wrong number of captures cannot produce a
+    /// well-formed splice, so both halves refuse it.
+    #[test]
+    fn refuses_a_mismatched_capture_count() {
+        let mut p = caller_and_callee();
+        assert!(apply(&mut p, "t", "caller", id(3), "callee", &[]).is_err());
+    }
+}

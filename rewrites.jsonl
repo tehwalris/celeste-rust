@@ -524,6 +524,14 @@
 {"at":"%3672","callee":"obj.collide_49","captures":["%2"],"fn":"player.update_21","id":"k1037","rule":"inline"}
 {"at":"%3680","callee":"obj.collide_49","captures":["%2"],"fn":"player.update_21","id":"k1038","rule":"inline"}
 {"at":"%3688","callee":"obj.collide_49","captures":["%2"],"fn":"player.update_21","id":"k1039","rule":"inline"}
+{"at":"%295","callee":"obj.collide_49","captures":["%2"],"fn":"anonymous_61","id":"k2000","rule":"inline"}
+{"at":"%303","callee":"obj.collide_49","captures":["%2"],"fn":"anonymous_61","id":"k2001","rule":"inline"}
+{"at":"%311","callee":"obj.collide_49","captures":["%2"],"fn":"anonymous_61","id":"k2002","rule":"inline"}
+{"at":"%319","callee":"obj.collide_49","captures":["%2"],"fn":"anonymous_61","id":"k2003","rule":"inline"}
+{"at":"%467","callee":"obj.collide_49","captures":["%2"],"fn":"anonymous_61","id":"k2004","rule":"inline"}
+{"at":"%475","callee":"obj.collide_49","captures":["%2"],"fn":"anonymous_61","id":"k2005","rule":"inline"}
+{"at":"%483","callee":"obj.collide_49","captures":["%2"],"fn":"anonymous_61","id":"k2006","rule":"inline"}
+{"at":"%491","callee":"obj.collide_49","captures":["%2"],"fn":"anonymous_61","id":"k2007","rule":"inline"}
 {"id":"c9a","rule":"fold"}
 {"id":"c9b","rule":"merge_blocks"}
 {"id":"c9c","rule":"dce"}
