@@ -13,6 +13,7 @@ use celeste_rust::block_coverage;
 use celeste_rust::frontend;
 use celeste_rust::game_runner::{
     create_fixed_env_with_game_builtins, create_initial_state_with_builtins,
+    inject_tile_flag_at_builtin,
 };
 use celeste_rust::interpreter::glue::interpret_cfg;
 use celeste_rust::interpreter::state::State;
@@ -119,7 +120,11 @@ fn main() -> Result<()> {
     // the per-frame maxima.
     let init_result = interpret_cfg(cfg, initial_state, &fixed_env).expect("init");
     assert_eq!(init_result.len(), 1);
-    let base_state = init_result.into_iter().next().unwrap().0;
+    let mut base_state = init_result.into_iter().next().unwrap().0;
+    // The real runner swaps the Lua tile_flag_at for the native collision-cache
+    // one right after init. Without this we would measure ~1,900 instructions of
+    // Lua that never actually run.
+    inject_tile_flag_at_builtin(&mut base_state);
     block_coverage::end_frame_excluding(Some(EXCLUDE));
 
     let mut rng = Rng(cli.seed.max(1));
@@ -187,9 +192,21 @@ fn main() -> Result<()> {
         report.mean_dynamic, report.max_dynamic
     );
     println!("distinct (function, block) pairs reached: {}", report.distinct_blocks);
+    println!();
+    println!("K, two bounds:");
     println!(
-        "estimated K (branch-free frame body): {} instructions",
+        "  inlined, loops kept as loops:      {:>7} instructions",
+        report.k_static
+    );
+    println!(
+        "  inlined AND fully unrolled:        {:>7} instructions",
         report.k_instructions
+    );
+    println!(
+        "  (only lane-varying control flow actually has to be flattened,",
+    );
+    println!(
+        "   so the real number sits between these)",
     );
     if report.mean_dynamic > 0.0 {
         println!(

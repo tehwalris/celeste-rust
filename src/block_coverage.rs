@@ -149,7 +149,11 @@ pub fn end_frame() {
 }
 
 pub struct Report {
-    /// Estimated size of the fully inlined, unrolled, branch-free frame body.
+    /// Size with every reachable block counted once: fully inlined, but loops
+    /// left as loops and repeated calls left shared. Lower bound.
+    pub k_static: usize,
+    /// Size with every block replicated to its worst-case executions in a single
+    /// frame: fully inlined *and* fully unrolled. Upper bound.
     pub k_instructions: usize,
     /// Distinct (function, block) pairs reached at all.
     pub distinct_blocks: usize,
@@ -172,6 +176,7 @@ pub fn report() -> Option<Report> {
     let cov = guard.as_ref()?;
 
     let mut k = 0usize;
+    let mut k_static = 0usize;
     let mut per_function: FxHashMap<String, usize> = FxHashMap::default();
     let mut per_kind: FxHashMap<&'static str, usize> = FxHashMap::default();
     let mut hot = Vec::new();
@@ -181,6 +186,7 @@ pub fn report() -> Option<Report> {
         // +1 for the terminator, which is also work in the flattened form
         let contribution = (instrs + 1) * max_exec;
         k += contribution;
+        k_static += instrs + 1;
         *per_function.entry(key.0.clone()).or_insert(0) += contribution;
         if let Some(kinds) = cov.kinds.get(key) {
             for (kind, count) in kinds {
@@ -199,6 +205,7 @@ pub fn report() -> Option<Report> {
     by_kind.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
 
     Some(Report {
+        k_static,
         k_instructions: k,
         distinct_blocks: cov.max_per_frame.len(),
         hot_unrolled: hot,
