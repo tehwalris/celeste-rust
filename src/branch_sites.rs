@@ -51,6 +51,16 @@ pub fn reset() {
 }
 
 /// Sites that split at least once, worst first.
+/// Counts for one branch site, or zero if it never executed.
+pub fn lookup(function: &str, block: &str) -> BranchSite {
+    SITES
+        .lock()
+        .unwrap()
+        .get(&(function.to_string(), block.to_string()))
+        .copied()
+        .unwrap_or_default()
+}
+
 pub fn report() -> Vec<(String, String, BranchSite)> {
     let sites = SITES.lock().unwrap();
     let mut out: Vec<(String, String, BranchSite)> = sites

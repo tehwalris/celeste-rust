@@ -213,6 +213,102 @@ fn bench(label: &str, program: &Program, frames: u32, profile: bool) -> Result<(
             );
         }
 
+        // Which convertible triangles are actually worth converting.
+        //
+        // The blocker analysis says which triangles *can* be converted. That is
+        // a different question from whether they *cost* anything, and the two
+        // have already been confused once: the first 81 conversions were chosen
+        // on convertibility alone, removed 4.6% of splits, and made the frame
+        // slower. A branch is free when its condition is uniform across lanes,
+        // and converting a free branch is worse than leaving it - the arm stops
+        // being skipped and runs on every execution instead.
+        {
+            let mut rows: Vec<(bool, String, String, celeste_rust::branch_sites::BranchSite)> =
+                Vec::new();
+            for (name, fun) in &program.functions {
+                for join in fun.cfg.named.keys() {
+                    use celeste_rust::rewrite::rules::if_convert;
+                    let convertible = if_convert::triangle_at(&fun.cfg, join).is_some();
+                    let Some(t) = if_convert::triangle_shaped(&fun.cfg, join) else { continue };
+                    let head = t
+                        .head
+                        .as_ref()
+                        .map_or("__entry".to_string(), |l| l.as_str().to_string());
+                    let site = celeste_rust::branch_sites::lookup(name.as_str(), &head);
+                    rows.push((
+                        convertible,
+                        name.as_str().to_string(),
+                        join.as_str().to_string(),
+                        site,
+                    ));
+                }
+            }
+            rows.sort_by_key(|(_, f, j, s)| (std::cmp::Reverse(s.splits), f.clone(), j.clone()));
+            let (all_splits, _, _) = celeste_rust::branch_sites::totals();
+            println!();
+            println!(
+                "{:<14} {:>10} {:>10} {:>10} {:>10}",
+                "triangles", "count", "ever split", "splits", "% of all"
+            );
+            for (label, want) in [("convertible", true), ("blocked", false)] {
+                let group: Vec<_> = rows.iter().filter(|(c, ..)| *c == want).collect();
+                let splits: u64 = group.iter().map(|(_, _, _, s)| s.splits).sum();
+                println!(
+                    "{:<14} {:>10} {:>10} {:>10} {:>9.1}%",
+                    label,
+                    group.len(),
+                    group.iter().filter(|(_, _, _, s)| s.splits > 0).count(),
+                    splits,
+                    100.0 * splits as f64 / all_splits.max(1) as f64
+                );
+            }
+            println!(
+                "{:<14} {:>10} {:>10} {:>10} {:>9.1}%",
+                "all branches", "-", "-", all_splits, 100.0
+            );
+            println!();
+            // What is in the way, for the ones that are worth clearing. The
+            // blocked triangles that never split do not matter however easy
+            // they look; these are the whole of the prize.
+            let mut why: std::collections::BTreeMap<(String, String), String> = Default::default();
+            for (name, fun) in &program.functions {
+                for (join, reasons) in celeste_rust::rewrite::rules::if_convert::blockers(fun) {
+                    let mut kinds: Vec<String> = reasons
+                        .iter()
+                        .map(|r| {
+                            let mut k = r.split_whitespace().next().unwrap_or("?").to_string();
+                            if r.ends_with(" create") {
+                                k.push_str(" create");
+                            }
+                            k
+                        })
+                        .collect();
+                    kinds.sort();
+                    kinds.dedup();
+                    why.insert(
+                        (name.as_str().to_string(), join.as_str().to_string()),
+                        kinds.join(" + "),
+                    );
+                }
+            }
+            println!(
+                "{:<8} {:<20} {:<30} {:>7} {:>7}  {}",
+                "state", "function", "join", "splits", "uniform", "in the way"
+            );
+            for (convertible, function, join, site) in rows.iter().take(12) {
+                println!(
+                    "{:<8} {:<20} {:<30} {:>7} {:>7}  {}",
+                    if *convertible { "ready" } else { "blocked" },
+                    function,
+                    join,
+                    site.splits,
+                    site.uniform,
+                    why.get(&(function.clone(), join.clone()))
+                        .map_or("-", |s| s.as_str())
+                );
+            }
+        }
+
         // A `create` accessor that never creates is a read wearing a mutation's
         // clothes, and it is the mutation that blocks if-conversion.
         println!();
