@@ -141,6 +141,14 @@ pub enum Rule {
         /// Absent for a triangle, which has only one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         arm: Option<String>,
+        /// Runtime-distinctness guards: each permits one hoisted load (or
+        /// `assert_value_cell`) to cross one store whose cell the rule cannot
+        /// prove distinct, paid for with an emitted pointer compare plus
+        /// `assert_true` in the head. If the cells ever alias, the run dies
+        /// loudly instead of reading the wrong value silently. Opt-in, so
+        /// entries without guards emit byte-identically to before.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        guards: Vec<SpeculateGuard>,
     },
     /// Replace a branch whose arms are bare stores with a select-store in the
     /// head. Both arms storing to the same local needs no guard; a one-arm
@@ -209,9 +217,25 @@ impl Rule {
     }
 }
 
+/// One declared crossing for `Rule::Speculate`'s `guards` field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeculateGuard {
+    /// The hoisted cell-reading instruction, as `%N`.
+    pub load: String,
+    /// The crossed store's target local, as `%N`.
+    pub store: String,
+}
+
 fn parse_cell(text: &str) -> Result<LocalId> {
     super::print::parse_local_name(text)
         .ok_or_else(|| anyhow!("cell must look like %17, got {:?}", text))
+}
+
+fn parse_guards(guards: &[SpeculateGuard]) -> Result<Vec<(LocalId, LocalId)>> {
+    guards
+        .iter()
+        .map(|g| Ok((parse_cell(&g.load)?, parse_cell(&g.store)?)))
+        .collect()
 }
 
 fn parse_cells(texts: &[String]) -> Result<Vec<LocalId>> {
@@ -362,8 +386,8 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::DecomposeTruthy { function, root } => {
             decompose_truthy::apply(program, function, parse_cell(root)?)
         }
-        Rule::Speculate { function, join, arm } => {
-            speculate::apply(program, function, join, arm.as_deref())
+        Rule::Speculate { function, join, arm, guards } => {
+            speculate::apply(program, function, join, arm.as_deref(), &parse_guards(guards)?)
         }
         Rule::SpeculateRegion { function, head, arm } => {
             speculate_region::apply(program, function, head, arm)
@@ -442,8 +466,8 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::DecomposeTruthy { function, root } => {
             decompose_truthy::verify(&before, program, function, parse_cell(root)?)
         }
-        Rule::Speculate { function, join, arm } => {
-            speculate::verify(&before, program, function, join, arm.as_deref())
+        Rule::Speculate { function, join, arm, guards } => {
+            speculate::verify(&before, program, function, join, arm.as_deref(), &parse_guards(guards)?)
         }
         Rule::SpeculateRegion { function, head, arm } => {
             speculate_region::verify(&before, program, function, head, arm)

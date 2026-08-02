@@ -1,6 +1,6 @@
 # Status (2026-08)
 
-Branch `rewrite`. Build is warning-free, 286 tests pass, working tree clean.
+Branch `rewrite`. Build is warning-free, 293 tests pass, working tree clean.
 
 ## Measured, frame 34 (the standard iteration benchmark)
 
@@ -559,6 +559,37 @@ Deferred, in order of value:
   planned above; the `a61` chain conversions (`p017`-`p020` analogues)
   happen as part of it, since their splits only die with the loop.
 * `if_join_95` (648) last, once its else-arm is straight-line.
+
+### The pointer guard landed (2026-08-03)
+
+Smaller than planned: `~=` on pointers already existed in `op.rs`
+(`TwoEqual` compares `HeapId`s, `TildeEqual` negates it), so the entire
+interpreter half was free. What was built is the `speculate` half: an
+opt-in `guards` field on the recipe entry
+(`"guards":[{"load":"%528","store":"%522"}]`) that permits one declared
+load-across-store crossing in exchange for an emitted
+`%c = <cell> ~= <target>; assert_true %c` immediately before the hoisted
+read. Refusal messages now print the exact guard to declare. A guard that
+matches no blocked crossing is refused (typos must not silently weaken
+nothing), only `load`/`assert_value_cell` can cash one in (they read
+exactly one cell), and entries without guards emit byte-identically.
+
+Applied: `g024` (guarded speculate on `if_join_160`), `g025`
+(`absorb_stores` on `and_or_join_153`, killing its branch), `g026`
+(`merge_blocks`, -22 blocks; `fold` and `dce` were no-ops and were not
+kept). Frame 34: 1.82 s -> 1.78 s, fragments 108 -> 102 mean, splits
+4280 -> 4058 (102 direct at `and_or_join_153`, the rest downstream: the
+hot `btn` pair 669 -> 618 each). K 7323 -> 7308. Differential identical
+through 34 - the guard runs on every state through the jump path and
+holds.
+
+Two site renames from `merge_blocks`, for reading future profiles:
+`if_join_95` -> `in_i1_074_cont` (648), `if_join_133` -> `and_or_join_126`
+(366). The rest of the cluster is confirmed gated as predicted:
+`if_body_135`'s false arm *is* the `is_solid` object-loop region (stores
+inside a multi-block loop-bearing region - neither `absorb_stores` nor
+pure-region speculation applies), and `if_join_136`'s arm holds the
+`btn` reads. Both wait on their stages; next is the unroll.
 
 Expect the exposure cascade whenever a stage removes splits: lanes that used
 to arrive pre-sorted arrive mixed, and quiet branches wake up. Re-run

@@ -693,4 +693,7 @@
 {"id":"g021","rule":"speculate","fn":"player.update_21","join":"if_join_108","arm":"if_condition_105"}
 {"id":"g022","rule":"speculate","fn":"player.update_21","join":"if_join_108","arm":"if_body_106"}
 {"id":"g023","rule":"absorb_stores","fn":"player.update_21","head":"if_condition_100"}
+{"id":"g024","rule":"speculate","fn":"player.update_21","join":"if_join_160","guards":[{"load":"%528","store":"%522"}],"why":"the reload of this.spd crosses the store through spd.y; distinct unless this.spd == this, which the emitted assert_true checks at runtime"}
+{"id":"g025","rule":"absorb_stores","fn":"player.update_21","head":"and_or_join_153"}
+{"id":"g026","rule":"merge_blocks"}
 {"id":"s1","rule":"allocate_slots"}

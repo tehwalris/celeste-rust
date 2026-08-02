@@ -34,6 +34,7 @@ not comparable.
 | + `decompose_truthy` x15, `if_convert` x2, `convert_ternary` x1 | 2.36 s / 0.74 GB | - |
 | + 2 diamonds absorbed (`absorb_stores`, `speculate` arms, `cse`) | 1.99 s / 0.64 GB | - |
 | + `is_solid` chains eager (`speculate_region` x9), consumers absorbed | 1.82 s / 0.62 GB | - |
+| + wall-jump stores absorbed (`speculate` with a pointer guard) | 1.78 s / 0.61 GB | - |
 
 The store-triangle row is the first change that moved the fragment count: 558
 -> 335 mean fragments per frame at frame 34, split executions 19573 -> 11978.
@@ -62,13 +63,13 @@ here that tracks distance to a compilable kernel.
 
 |  | original | rewritten |
 |---|---|---|
-| dynamic instrs/frame, mean | 2122 | 1720 |
-| dynamic instrs/frame, max | 6422 | 4986 |
-| distinct blocks reached | 450 | 327 |
-| K, fully unrolled | 8321 | 7323 |
-| K, loops kept as loops | 2963 | 3899 |
+| dynamic instrs/frame, mean | 2122 | 1719 |
+| dynamic instrs/frame, max | 6422 | 5190 |
+| distinct blocks reached | 450 | 304 |
+| K, fully unrolled | 8321 | 7308 |
+| K, loops kept as loops | 2963 | 3884 |
 
-By instruction kind, rewritten: heap 40.2%, arith 28.1%, terminator 9.4%,
+By instruction kind, rewritten: heap 40.3%, arith 28.2%, terminator 9.1%,
 const 7.1%, global 5.7%, guard 3.9%, phi 3.7%, call 1.5%. `arith`, `const`
 and `select` are the core a compiled kernel emits; the rest has to reach
 zero. The region stage *lowered* K (7770 -> 7323 unrolled) despite running
@@ -297,6 +298,39 @@ on pointers in `op.rs` - deferred, not attempted this round. Exposures that
 did land: `if_condition_100` (the accel chain, 288 at its peak) was
 converted in-batch; `if_body_135` rose 96 -> 156 and `in_k1000_for_head_472`
 woke at 36, both gated on their stages.
+
+**Update, after the wall-jump pointer guard** (`speculate` with the new
+opt-in `guards` field on `if_join_160`, `absorb_stores` on
+`and_or_join_153`, one `merge_blocks`):
+
+    branches: 4058 of 62418 executions split the state, across 21 distinct sites
+
+Frame 34: 1.82 s -> 1.78 s, fragments 108 -> 102 mean (671 -> 614 max).
+`~=` on pointers turned out to already exist in `op.rs` (pointers compare
+by `HeapId`), so the whole interpreter half of the planned work was free;
+the stage was one `speculate` extension. Direct kill: `and_or_join_153`
+(102). Downstream: the hot `btn` pair 669 -> 618 each, `if_join_136`
+249 -> 231. K 7323 -> 7308 unrolled; dynamic max per lane rose 4986 ->
+5190 because the wall-jump loads now run on the longest path too. The
+remainder:
+
+| family | splits | what it is |
+|---|---|---|
+| `btn` x4 | 1821 | input fan-out |
+| `in_i1_074_cont` (= old `if_join_95`) | 648 | the outer dash diamond, convertible last |
+| `and_or_join_126` (= old `if_join_133`), `if_join_136`, `if_body_135` | 753 | jump/dash cluster, gated on object loops / `btn` |
+| `anonymous_61` move loops (`413` x2, `for_head`s) | 626 | pixel loops, unroll stage |
+| `in_i1_068` x2 (`spikes_at` tile loops) | 114 | unroll stage |
+| 6 sites below the profiler's top-15 cutoff | 96 | tails of the above |
+
+(`merge_blocks` renamed two sites: `if_join_95` and `if_join_133` merged
+into their predecessors - same branches, same splits.) The cluster is now
+exactly where the plan said it would be: `if_body_135`'s false arm *is*
+the `is_solid` object-loop region and cannot flatten before the loop
+stage, and `if_join_136`'s arm holds the `btn(k_up/k_down)` reads. The
+guard machinery itself is the reusable part: any future load-across-store
+whose distinctness is real but unprovable is now one recipe field, not a
+new rule.
 
 ### Input fan-out: lane expansion is worse than state duplication (2026-08)
 

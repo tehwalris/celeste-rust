@@ -54,14 +54,44 @@
 //!   * `assert_closure` dereferences the heap (the closure lives in a cell a
 //!     store could overwrite), so it never crosses a store. In practice the
 //!     asserts sit before the stores they guard, so nothing is lost.
+//!
+//! # Declared guards: runtime distinctness where proof runs out
+//!
+//! `cells_provably_distinct` is syntactic, and some true facts are out of its
+//! reach. The wall-jump arm reloads `this.spd` after storing through `spd.y`:
+//! the store's target hangs off a *loaded* table, so no fact about accessors
+//! on shared locals applies - the cells alias only if `this.spd == this`,
+//! which never happens, but "never happens" is not a proof.
+//!
+//! Per the project's standing rule, an unprovable premise becomes a runtime
+//! guard instead of an assumption. A recipe entry may *declare* such a
+//! crossing (`guards`), naming the hoisted read and the crossed store's
+//! target. The rule then emits, immediately before the hoisted read:
+//!
+//! ```text
+//!   %c = <read's cell> ~= <store's target>   ; pointers compare by HeapId
+//!   assert_true %c
+//! ```
+//!
+//! and permits that one crossing. Pointers are per-state (never per-lane), so
+//! `~=` on two cell pointers is a scalar bool, and `assert_true` kills the
+//! run loudly if the cells ever coincide - the reordered load would have read
+//! the wrong value *silently*, which is the one thing this file must make
+//! impossible. The guard runs on every lane reaching the head, including
+//! lanes that skip the arm; a spurious failure there is loud, and loud
+//! failures are a screening question (`if_convert`'s bargain again).
+//!
+//! Guards are strictly opt-in: an entry without `guards` emits byte-for-byte
+//! what it always did, and a declared guard that matches no blocked crossing
+//! is refused rather than silently ignored.
 
 use anyhow::{anyhow, Result};
 
-use crate::ir::{FunDef, Instruction, Label, LocalId};
+use crate::ir::{BinaryOp, FunDef, Instruction, Label, LocalId};
 
 use super::super::program::Program;
 use super::if_convert::{is_speculatable, triangle_at, triangle_shaped, Triangle};
-use super::{get_block, get_block_mut, require};
+use super::{get_block, get_block_mut, require, LocalIdAllocator};
 
 /// Are the cells behind two pointer locals certainly different?
 ///
@@ -150,9 +180,38 @@ fn commutes_with_store(fun: &FunDef, instr: &Instruction, store_target: LocalId)
     }
 }
 
+/// One emission owed to a declared guard: before the hoisted instruction
+/// `read`, assert at runtime that the cell it reads (`cell`) is not the cell
+/// the crossed store writes (`store_target`).
+#[derive(Debug, PartialEq, Eq)]
+struct PlannedGuard {
+    read: LocalId,
+    cell: LocalId,
+    store_target: LocalId,
+}
+
+/// The two instructions a planned guard emits, with the given minted ids.
+fn guard_instructions(g: &PlannedGuard, minted: &[LocalId; 2]) -> Vec<(LocalId, Instruction)> {
+    vec![
+        (
+            minted[0],
+            Instruction::BinaryOp {
+                left: g.cell,
+                op: BinaryOp::TildeEqual,
+                right: g.store_target,
+            },
+        ),
+        (minted[1], Instruction::AssertTrue { value: minted[0] }),
+    ]
+}
+
 /// The shape this rule accepts, re-derived identically by `apply`, `verify`
 /// and `candidates`: an arm whose non-speculatable instructions are all plain
-/// stores, with every hoist commuting with every store it crosses.
+/// stores, with every hoist commuting with every store it crosses - or, for a
+/// crossing declared in `guards`, paying for the missing proof with a runtime
+/// `assert_true` (see the module doc). Planned guards come back in a
+/// deterministic order: hoisted instructions in arm order, and for each, its
+/// crossed stores in arm order.
 ///
 /// Without `arm`, the arm is the one arm of the triangle at `join`, and a
 /// triangle `if_convert` could already take whole is refused. With `arm`, it
@@ -166,7 +225,12 @@ fn commutes_with_store(fun: &FunDef, instr: &Instruction, store_target: LocalId)
 /// (`is_speculatable`'s bargain), and within the arm they move only above
 /// that arm's own stores (`commutes_with_store`'s). No other arm's store is
 /// ever crossed - those stay behind their own branch.
-fn plan(fun: &FunDef, join: &Label, arm_label: Option<&Label>) -> Result<Triangle> {
+fn plan(
+    fun: &FunDef,
+    join: &Label,
+    arm_label: Option<&Label>,
+    guards: &[(LocalId, LocalId)],
+) -> Result<(Triangle, Vec<PlannedGuard>)> {
     let t = match arm_label {
         None => {
             require(
@@ -247,22 +311,56 @@ fn plan(fun: &FunDef, join: &Label, arm_label: Option<&Label>) -> Result<Triangl
         .ok_or_else(|| anyhow!("arm block '{}' vanished", t.arm.as_str()))?;
 
     let mut hoists = 0;
+    let mut planned: Vec<PlannedGuard> = Vec::new();
+    let mut guard_used = vec![false; guards.len()];
     for (index, (id, instr)) in arm.instructions.iter().enumerate() {
         if is_speculatable(instr) {
             hoists += 1;
             // This instruction will move above every store before it.
             for (_, earlier) in &arm.instructions[..index] {
                 let Instruction::Store { target, .. } = earlier else { continue };
-                require(
-                    commutes_with_store(fun, instr, *target),
-                    format!(
+                if commutes_with_store(fun, instr, *target) {
+                    continue;
+                }
+                let Some(declared) =
+                    guards.iter().position(|(read, store)| read == id && store == target)
+                else {
+                    return Err(anyhow!(
                         "hoisting {} = `{}` would move it above `store %{} <- ..`, \
-                         and they may touch the same cell",
+                         and they may touch the same cell. If they are distinct at \
+                         runtime, declare it: \
+                         \"guards\":[{{\"load\":\"{}\",\"store\":\"%{}\"}}]",
                         super::super::print::local_name(*id),
                         super::super::print::format_instruction(instr),
                         usize::from(*target),
-                    ),
-                )?;
+                        super::super::print::local_name(*id),
+                        usize::from(*target),
+                    ));
+                };
+                // A guard's `assert_true` proves exactly one fact - "this
+                // cell is not that cell" - so only an instruction that reads
+                // exactly one cell can cash it in.
+                let cell = match instr {
+                    Instruction::Load { source } => *source,
+                    Instruction::AssertValueCell { target } => *target,
+                    _ => {
+                        return Err(anyhow!(
+                            "a guard is declared for {} = `{}`, but only a load or \
+                             assert_value_cell reads exactly one cell a pointer \
+                             guard could cover",
+                            super::super::print::local_name(*id),
+                            super::super::print::format_instruction(instr),
+                        ))
+                    }
+                };
+                guard_used[declared] = true;
+                // The same (read, store target) pair can be crossed twice if
+                // the arm stores twice through one target local; the cells
+                // are the same, so one guard covers both.
+                let g = PlannedGuard { read: *id, cell, store_target: *target };
+                if !planned.contains(&g) {
+                    planned.push(g);
+                }
             }
         } else {
             require(
@@ -281,7 +379,41 @@ fn plan(fun: &FunDef, join: &Label, arm_label: Option<&Label>) -> Result<Triangl
         hoists > 0,
         format!("the arm of '{}' has nothing to hoist", join.as_str()),
     )?;
-    Ok(t)
+    // A declared guard that guards nothing is a typo or a stale claim; either
+    // way, silently ignoring it would let the recipe drift from what actually
+    // happens.
+    for ((read, store), used) in guards.iter().zip(&guard_used) {
+        require(
+            *used,
+            format!(
+                "the declared guard (load %{} across store %{}) matches no blocked \
+                 crossing - the ids are wrong, or the crossing is already provable",
+                usize::from(*read),
+                usize::from(*store),
+            ),
+        )?;
+    }
+    Ok((t, planned))
+}
+
+/// The head's tail after this rule: the hoisted instructions in arm order,
+/// each preceded by the guards it owes. `minted` supplies two fresh ids per
+/// planned guard, in `planned` order.
+fn hoisted_with_guards(
+    hoisted: &[(LocalId, Instruction)],
+    planned: &[PlannedGuard],
+    minted: &[[LocalId; 2]],
+) -> Vec<(LocalId, Instruction)> {
+    let mut out = Vec::new();
+    for (id, instr) in hoisted {
+        for (g, ids) in planned.iter().zip(minted) {
+            if g.read == *id {
+                out.extend(guard_instructions(g, ids));
+            }
+        }
+        out.push((*id, instr.clone()));
+    }
+    out
 }
 
 pub fn apply(
@@ -289,11 +421,15 @@ pub fn apply(
     function: &str,
     join: &str,
     arm: Option<&str>,
+    guards: &[(LocalId, LocalId)],
 ) -> Result<usize> {
     let join = Label::from(join.to_string());
     let arm = arm.map(|a| Label::from(a.to_string()));
     let fun = program.get(function)?;
-    let t = plan(fun, &join, arm.as_ref())?;
+    let (t, planned) = plan(fun, &join, arm.as_ref(), guards)?;
+    let mut ids = LocalIdAllocator::for_function(fun);
+    let minted: Vec<[LocalId; 2]> =
+        planned.iter().map(|_| [ids.fresh(), ids.fresh()]).collect();
 
     let fun = program.get_mut(function)?;
     let arm = get_block_mut(&mut fun.cfg, &Some(t.arm.clone())).unwrap();
@@ -302,30 +438,33 @@ pub fn apply(
         .drain(..)
         .partition(|(_, instr)| is_speculatable(instr));
     arm.instructions = kept;
-    let moved = hoisted.len();
+    let tail = hoisted_with_guards(&hoisted, &planned, &minted);
+    let moved = tail.len();
     let head = get_block_mut(&mut fun.cfg, &t.head).unwrap();
-    head.instructions.extend(hoisted);
+    head.instructions.extend(tail);
     Ok(moved)
 }
 
 /// Independent check.
 ///
-/// Re-derives the shape, the hoisted set and the commute obligations from the
-/// *before* program via `plan`, then insists the after program is exactly
-/// that: head extended by the hoisted instructions in order, arm reduced to
-/// its stores in order, and not one other thing different.
+/// Re-derives the shape, the hoisted set, the commute obligations and the
+/// owed guards from the *before* program via `plan`, then insists the after
+/// program is exactly that: head extended by the hoisted instructions in
+/// order - each preceded by its guard's compare-and-assert on fresh ids -
+/// arm reduced to its stores in order, and not one other thing different.
 pub fn verify(
     before: &Program,
     after: &Program,
     function: &str,
     join: &str,
     arm: Option<&str>,
+    guards: &[(LocalId, LocalId)],
 ) -> Result<()> {
     let join = Label::from(join.to_string());
     let arm = arm.map(|a| Label::from(a.to_string()));
     let before_fun = before.get(function)?;
     let after_fun = after.get(function)?;
-    let t = plan(before_fun, &join, arm.as_ref())?;
+    let (t, planned) = plan(before_fun, &join, arm.as_ref(), guards)?;
 
     let before_arm = get_block(&before_fun.cfg, &Some(t.arm.clone())).unwrap();
     let before_head = get_block(&before_fun.cfg, &t.head).unwrap();
@@ -337,15 +476,64 @@ pub fn verify(
 
     let after_head = get_block(&after_fun.cfg, &t.head)
         .ok_or_else(|| anyhow!("speculate removed the head block"))?;
+
+    // Learn the minted guard ids from the after head: each guard's two
+    // instructions sit at positions this pass computes independently, so the
+    // only thing taken from the applier is the ids themselves - checked fresh
+    // against every id this function had before (ids are function-local),
+    // and pairwise distinct.
+    let mut before_ids: rustc_hash::FxHashSet<LocalId> = rustc_hash::FxHashSet::default();
+    before_ids.extend(before_fun.arg_ids.iter().flatten().copied());
+    before_ids.extend(before_fun.capture_ids.iter().copied());
+    for block in before_fun.cfg.iter_blocks() {
+        before_ids.extend(block.instructions.iter().map(|(id, _)| *id));
+        before_ids.insert(block.terminator_id());
+    }
+    let mut minted_seen: rustc_hash::FxHashSet<LocalId> = rustc_hash::FxHashSet::default();
+    let mut minted: Vec<[LocalId; 2]> = Vec::new();
+    {
+        // Walk the same interleave `apply` produces to find each guard's
+        // splice position.
+        let mut pos = before_head.instructions.len();
+        for (id, _) in &hoisted {
+            for g in &planned {
+                if g.read != *id {
+                    continue;
+                }
+                let mut pair = [LocalId::from(0); 2];
+                for (offset, slot) in pair.iter_mut().enumerate() {
+                    let (after_id, _) = after_head.instructions.get(pos + offset).ok_or_else(
+                        || anyhow!("the guard for %{} is missing from the head", usize::from(*id)),
+                    )?;
+                    require(
+                        !before_ids.contains(after_id),
+                        format!(
+                            "minted guard id %{} already existed before",
+                            usize::from(*after_id)
+                        ),
+                    )?;
+                    require(
+                        minted_seen.insert(*after_id),
+                        format!("minted guard id %{} is used twice", usize::from(*after_id)),
+                    )?;
+                    *slot = *after_id;
+                }
+                minted.push(pair);
+                pos += 2;
+            }
+            pos += 1;
+        }
+    }
     let expected_head: Vec<(LocalId, Instruction)> = before_head
         .instructions
         .iter()
         .cloned()
-        .chain(hoisted)
+        .chain(hoisted_with_guards(&hoisted, &planned, &minted))
         .collect();
     require(
         after_head.instructions == expected_head,
-        "speculate did not append exactly the hoisted instructions to the head",
+        "speculate did not append exactly the hoisted instructions and their \
+         guards to the head",
     )?;
     require(
         after_head.terminator == before_head.terminator,
@@ -407,7 +595,7 @@ pub fn candidates(program: &Program) -> Vec<(String, Label, Option<Label>)> {
     let mut out = Vec::new();
     for (name, fun) in &program.functions {
         for label in fun.cfg.named.keys() {
-            if plan(fun, label, None).is_ok() {
+            if plan(fun, label, None, &[]).is_ok() {
                 out.push((name.as_str().to_string(), label.clone(), None));
             }
             let block = fun.cfg.named.get(label).unwrap();
@@ -418,7 +606,7 @@ pub fn candidates(program: &Program) -> Vec<(String, Label, Option<Label>)> {
             if triangle_shaped(&fun.cfg, join).is_some_and(|t| &t.arm == label) {
                 continue;
             }
-            if plan(fun, join, Some(label)).is_ok() {
+            if plan(fun, join, Some(label), &[]).is_ok() {
                 out.push((name.as_str().to_string(), join.clone(), Some(label.clone())));
             }
         }
@@ -519,8 +707,8 @@ mod tests {
             (id(13), store(10, 12)),
         ]);
         let mut after = before.clone();
-        assert_eq!(apply(&mut after, "f", "join", None).unwrap(), 3);
-        verify(&before, &after, "f", "join", None).unwrap();
+        assert_eq!(apply(&mut after, "f", "join", None, &[]).unwrap(), 3);
+        verify(&before, &after, "f", "join", None, &[]).unwrap();
 
         let fun = after.get("f").unwrap();
         let arm = fun.cfg.named.get(&label("arm")).unwrap();
@@ -541,8 +729,8 @@ mod tests {
             (id(15), Instruction::Load { source: id(14) }),
         ]);
         let mut after = before.clone();
-        assert_eq!(apply(&mut after, "f", "join", None).unwrap(), 3);
-        verify(&before, &after, "f", "join", None).unwrap();
+        assert_eq!(apply(&mut after, "f", "join", None, &[]).unwrap(), 3);
+        verify(&before, &after, "f", "join", None, &[]).unwrap();
         let arm = after.get("f").unwrap().cfg.named.get(&label("arm")).unwrap();
         assert_eq!(arm.instructions, vec![(id(13), store(10, 1))]);
     }
@@ -562,8 +750,8 @@ mod tests {
                 (id(15), Instruction::Load { source: id(14) }),
             ]);
             let mut after = before.clone();
-            assert_eq!(apply(&mut after, "f", "join", None).unwrap(), 3);
-            verify(&before, &after, "f", "join", None).unwrap();
+            assert_eq!(apply(&mut after, "f", "join", None, &[]).unwrap(), 3);
+            verify(&before, &after, "f", "join", None, &[]).unwrap();
             let arm = after.get("f").unwrap().cfg.named.get(&label("arm")).unwrap();
             assert_eq!(arm.instructions, vec![(id(13), store(10, 1))]);
         }
@@ -582,7 +770,7 @@ mod tests {
                 (id(15), Instruction::Load { source: id(14) }),
             ]);
             let mut after = before.clone();
-            let error = apply(&mut after, "f", "join", None).unwrap_err().to_string();
+            let error = apply(&mut after, "f", "join", None, &[]).unwrap_err().to_string();
             assert!(error.contains("same cell"), "{}", error);
         }
     }
@@ -596,7 +784,7 @@ mod tests {
             (id(13), Instruction::Call { closure: id(1), args: vec![] }),
         ]);
         let mut after = before.clone();
-        let error = apply(&mut after, "f", "join", None).unwrap_err().to_string();
+        let error = apply(&mut after, "f", "join", None, &[]).unwrap_err().to_string();
         assert!(error.contains("not a store"), "{}", error);
     }
 
@@ -605,7 +793,7 @@ mod tests {
     fn refuses_a_fully_speculatable_arm() {
         let before = triangle_program(vec![(id(10), num(7))]);
         let mut after = before.clone();
-        let error = apply(&mut after, "f", "join", None).unwrap_err().to_string();
+        let error = apply(&mut after, "f", "join", None, &[]).unwrap_err().to_string();
         assert!(error.contains("use if_convert"), "{}", error);
     }
 
@@ -618,12 +806,12 @@ mod tests {
             (id(13), store(10, 1)),
         ]);
         let mut after = before.clone();
-        apply(&mut after, "f", "join", None).unwrap();
+        apply(&mut after, "f", "join", None, &[]).unwrap();
         // Sabotage: move the store into the head as well.
         let fun = after.get_mut("f").unwrap();
         let s = fun.cfg.named.get_mut(&label("arm")).unwrap().instructions.remove(0);
         fun.cfg.entry.instructions.push(s);
-        assert!(verify(&before, &after, "f", "join", None).is_err());
+        assert!(verify(&before, &after, "f", "join", None, &[]).is_err());
     }
 
     /// `__entry` branches to `arm_a` or `arm_b`, which both join at `join`.
@@ -663,8 +851,8 @@ mod tests {
             vec![(id(15), field(2, "x")), (id(16), num(9)), (id(17), store(15, 16))],
         );
         let mut after = before.clone();
-        assert_eq!(apply(&mut after, "f", "join", Some("arm_a")).unwrap(), 2);
-        verify(&before, &after, "f", "join", Some("arm_a")).unwrap();
+        assert_eq!(apply(&mut after, "f", "join", Some("arm_a"), &[]).unwrap(), 2);
+        verify(&before, &after, "f", "join", Some("arm_a"), &[]).unwrap();
 
         let fun = after.get("f").unwrap();
         let arm_a = fun.cfg.named.get(&label("arm_a")).unwrap();
@@ -677,8 +865,8 @@ mod tests {
 
         // And then the other arm, on top.
         let middle = after.clone();
-        assert_eq!(apply(&mut after, "f", "join", Some("arm_b")).unwrap(), 2);
-        verify(&middle, &after, "f", "join", Some("arm_b")).unwrap();
+        assert_eq!(apply(&mut after, "f", "join", Some("arm_b"), &[]).unwrap(), 2);
+        verify(&middle, &after, "f", "join", Some("arm_b"), &[]).unwrap();
         let fun = after.get("f").unwrap();
         let arm_b = fun.cfg.named.get(&label("arm_b")).unwrap();
         assert_eq!(arm_b.instructions, vec![(id(17), store(15, 16))]);
@@ -707,11 +895,11 @@ mod tests {
         );
         let mut after = before.clone();
         // The triangle recognizer cannot see it...
-        let error = apply(&mut after, "f", "join", None).unwrap_err().to_string();
+        let error = apply(&mut after, "f", "join", None, &[]).unwrap_err().to_string();
         assert!(error.contains("no triangle joins"), "{}", error);
         // ...naming the arm can.
-        assert_eq!(apply(&mut after, "f", "join", Some("arm")).unwrap(), 2);
-        verify(&before, &after, "f", "join", Some("arm")).unwrap();
+        assert_eq!(apply(&mut after, "f", "join", Some("arm"), &[]).unwrap(), 2);
+        verify(&before, &after, "f", "join", Some("arm"), &[]).unwrap();
         let arm = after.get("f").unwrap().cfg.named.get(&label("arm")).unwrap();
         assert_eq!(arm.instructions, vec![(id(13), store(10, 12))]);
     }
@@ -724,7 +912,7 @@ mod tests {
             vec![(id(15), num(9))],
         );
         let mut after = before.clone();
-        let error = apply(&mut after, "f", "join", Some("join")).unwrap_err().to_string();
+        let error = apply(&mut after, "f", "join", Some("join"), &[]).unwrap_err().to_string();
         assert!(error.contains("not an arm"), "{}", error);
     }
 
@@ -737,8 +925,180 @@ mod tests {
             vec![(id(15), num(9))],
         );
         let mut after = before.clone();
-        let error = apply(&mut after, "f", "join", None).unwrap_err().to_string();
+        let error = apply(&mut after, "f", "join", None, &[]).unwrap_err().to_string();
         assert!(error.contains("no triangle joins"), "{}", error);
+    }
+
+    /// A declared guard buys the one crossing the facts cannot: the load's
+    /// cell hangs off a *different* base, so distinctness is unprovable, and
+    /// the rule charges a pointer compare plus `assert_true`, spliced
+    /// immediately before the hoisted load on fresh ids.
+    #[test]
+    fn a_declared_guard_buys_an_unprovable_crossing() {
+        let before = triangle_program(vec![
+            (id(10), field(2, "x")),
+            (id(13), store(10, 1)),
+            (id(14), field(1, "y")),
+            (id(15), Instruction::Load { source: id(14) }),
+        ]);
+        let guards = [(id(15), id(10))];
+        // Without the guard this exact shape is refused (see
+        // `refuses_a_load_crossing_a_possibly_aliasing_store`); with it:
+        let mut after = before.clone();
+        assert_eq!(apply(&mut after, "f", "join", None, &guards).unwrap(), 5);
+        verify(&before, &after, "f", "join", None, &guards).unwrap();
+
+        let fun = after.get("f").unwrap();
+        let arm = fun.cfg.named.get(&label("arm")).unwrap();
+        assert_eq!(arm.instructions, vec![(id(13), store(10, 1))]);
+        assert_eq!(
+            fun.cfg.entry.instructions[2..],
+            vec![
+                (id(10), field(2, "x")),
+                (id(14), field(1, "y")),
+                (
+                    id(32),
+                    Instruction::BinaryOp {
+                        left: id(14),
+                        op: BinaryOp::TildeEqual,
+                        right: id(10),
+                    },
+                ),
+                (id(33), Instruction::AssertTrue { value: id(32) }),
+                (id(15), Instruction::Load { source: id(14) }),
+            ],
+        );
+    }
+
+    /// Two stores through the same target local are one cell, so one guard
+    /// covers both crossings.
+    #[test]
+    fn one_guard_covers_a_twice_crossed_target() {
+        let before = triangle_program(vec![
+            (id(10), field(2, "x")),
+            (id(13), store(10, 1)),
+            (id(16), store(10, 1)),
+            (id(14), field(1, "y")),
+            (id(15), Instruction::Load { source: id(14) }),
+        ]);
+        let guards = [(id(15), id(10))];
+        let mut after = before.clone();
+        assert_eq!(apply(&mut after, "f", "join", None, &guards).unwrap(), 5);
+        verify(&before, &after, "f", "join", None, &guards).unwrap();
+        let fun = after.get("f").unwrap();
+        let asserts = fun
+            .cfg
+            .entry
+            .instructions
+            .iter()
+            .filter(|(_, i)| matches!(i, Instruction::AssertTrue { .. }))
+            .count();
+        assert_eq!(asserts, 1);
+    }
+
+    /// A guard that guards nothing is refused - here because the crossing it
+    /// names is already provable (sibling fields of one record).
+    #[test]
+    fn refuses_an_unused_guard() {
+        let before = triangle_program(vec![
+            (id(10), field(2, "x")),
+            (id(13), store(10, 1)),
+            (id(14), field(2, "y")),
+            (id(15), Instruction::Load { source: id(14) }),
+        ]);
+        let guards = [(id(15), id(10))];
+        let mut after = before.clone();
+        let error =
+            apply(&mut after, "f", "join", None, &guards).unwrap_err().to_string();
+        assert!(error.contains("matches no blocked crossing"), "{}", error);
+    }
+
+    /// A pointer guard proves one cell distinct from one cell; an instruction
+    /// that reads more than that (`assert_closure` dereferences the heap)
+    /// cannot cash it in.
+    #[test]
+    fn refuses_a_guard_on_an_instruction_without_a_single_cell() {
+        let before = triangle_program(vec![
+            (id(10), field(2, "x")),
+            (id(13), store(10, 1)),
+            (
+                id(15),
+                Instruction::AssertClosure {
+                    value: id(1),
+                    fun_def: crate::ir::GlobalId::from("g".to_string()),
+                    captures: vec![],
+                },
+            ),
+        ]);
+        let guards = [(id(15), id(10))];
+        let mut after = before.clone();
+        let error =
+            apply(&mut after, "f", "join", None, &guards).unwrap_err().to_string();
+        assert!(error.contains("only a load or assert_value_cell"), "{}", error);
+    }
+
+    /// The refusal for an undeclared crossing tells the author exactly what
+    /// to declare.
+    #[test]
+    fn the_refusal_names_the_guard_to_declare() {
+        let before = triangle_program(vec![
+            (id(10), field(2, "x")),
+            (id(13), store(10, 1)),
+            (id(14), field(1, "y")),
+            (id(15), Instruction::Load { source: id(14) }),
+        ]);
+        let mut after = before.clone();
+        let error = apply(&mut after, "f", "join", None, &[]).unwrap_err().to_string();
+        assert!(
+            error.contains(r#""guards":[{"load":"%15","store":"%10"}]"#),
+            "{}",
+            error
+        );
+    }
+
+    /// The verifier must reject an applier that dropped the guard it owed...
+    #[test]
+    fn verify_rejects_a_missing_guard() {
+        let before = triangle_program(vec![
+            (id(10), field(2, "x")),
+            (id(13), store(10, 1)),
+            (id(14), field(1, "y")),
+            (id(15), Instruction::Load { source: id(14) }),
+        ]);
+        let guards = [(id(15), id(10))];
+        let mut after = before.clone();
+        apply(&mut after, "f", "join", None, &guards).unwrap();
+        // Sabotage: strip the assert, keeping the compare.
+        let fun = after.get_mut("f").unwrap();
+        fun.cfg
+            .entry
+            .instructions
+            .retain(|(_, i)| !matches!(i, Instruction::AssertTrue { .. }));
+        assert!(verify(&before, &after, "f", "join", None, &guards).is_err());
+    }
+
+    /// ...or one that compared the wrong cells.
+    #[test]
+    fn verify_rejects_a_guard_on_the_wrong_cells() {
+        let before = triangle_program(vec![
+            (id(10), field(2, "x")),
+            (id(13), store(10, 1)),
+            (id(14), field(1, "y")),
+            (id(15), Instruction::Load { source: id(14) }),
+        ]);
+        let guards = [(id(15), id(10))];
+        let mut after = before.clone();
+        apply(&mut after, "f", "join", None, &guards).unwrap();
+        let fun = after.get_mut("f").unwrap();
+        for (_, instr) in fun.cfg.entry.instructions.iter_mut() {
+            if let Instruction::BinaryOp { left, op: BinaryOp::TildeEqual, .. } = instr {
+                *left = id(10); // now compares the store's cell with itself
+            }
+        }
+        let error = verify(&before, &after, "f", "join", None, &guards)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("guards"), "{}", error);
     }
 
     /// ...or one that dropped a hoisted instruction instead of moving it.
@@ -749,9 +1109,9 @@ mod tests {
             (id(13), store(10, 1)),
         ]);
         let mut after = before.clone();
-        apply(&mut after, "f", "join", None).unwrap();
+        apply(&mut after, "f", "join", None, &[]).unwrap();
         after.get_mut("f").unwrap().cfg.entry.instructions.pop();
-        let error = verify(&before, &after, "f", "join", None).unwrap_err().to_string();
+        let error = verify(&before, &after, "f", "join", None, &[]).unwrap_err().to_string();
         assert!(error.contains("hoisted instructions"), "{}", error);
     }
 }
