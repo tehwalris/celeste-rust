@@ -34,16 +34,16 @@ impl std::fmt::Display for ValidationError {
 }
 
 /// Identifies a block. `None` is the entry block.
-type BlockKey = Option<Label>;
+pub type BlockKey = Option<Label>;
 
-fn block_label(key: &BlockKey) -> String {
+pub fn block_label(key: &BlockKey) -> String {
     match key {
         None => "__entry".to_string(),
         Some(l) => l.as_str().to_string(),
     }
 }
 
-fn all_blocks(cfg: &Cfg) -> Vec<(BlockKey, &Block)> {
+pub fn all_blocks(cfg: &Cfg) -> Vec<(BlockKey, &Block)> {
     let mut out: Vec<(BlockKey, &Block)> = vec![(None, &cfg.entry)];
     let mut named: Vec<(&Label, &Block)> = cfg.named.iter().collect();
     named.sort_by_key(|(l, _)| l.as_str().to_string());
@@ -51,7 +51,7 @@ fn all_blocks(cfg: &Cfg) -> Vec<(BlockKey, &Block)> {
     out
 }
 
-fn successors(block: &Block) -> Vec<BlockKey> {
+pub fn successors(block: &Block) -> Vec<BlockKey> {
     match block.terminator_kind() {
         Terminator::Return { .. } => vec![],
         Terminator::UnconditionalBranch { target } => vec![Some(target.clone())],
@@ -278,7 +278,7 @@ fn definitions_by_block(
         .collect()
 }
 
-fn compute_reachable(blocks: &[(BlockKey, &Block)]) -> FxHashSet<BlockKey> {
+pub fn compute_reachable(blocks: &[(BlockKey, &Block)]) -> FxHashSet<BlockKey> {
     let by_key: FxHashMap<&BlockKey, &Block> = blocks.iter().map(|(k, b)| (k, *b)).collect();
     let mut seen: FxHashSet<BlockKey> = FxHashSet::default();
     let mut stack = vec![None];
@@ -305,7 +305,7 @@ fn compute_reachable(blocks: &[(BlockKey, &Block)]) -> FxHashSet<BlockKey> {
 /// and these CFGs have tens of blocks, not thousands. An earlier attempt here
 /// used the index-based `intersect` from Cooper-Harvey-Kennedy and got it
 /// subtly wrong on loops, which is exactly the case that matters.
-fn dominators(
+pub fn dominators(
     blocks: &[(BlockKey, &Block)],
     preds: &FxHashMap<BlockKey, Vec<BlockKey>>,
     reachable: &FxHashSet<BlockKey>,
@@ -352,6 +352,23 @@ fn dominators(
         }
     }
     dom
+}
+
+/// Dominator sets for a function, keyed by block. Each set includes the block
+/// itself. Unreachable blocks are absent.
+pub fn dominator_sets(cfg: &Cfg) -> FxHashMap<BlockKey, FxHashSet<BlockKey>> {
+    let blocks = all_blocks(cfg);
+    let mut preds: FxHashMap<BlockKey, Vec<BlockKey>> = FxHashMap::default();
+    for (key, _) in &blocks {
+        preds.entry(key.clone()).or_default();
+    }
+    for (key, block) in &blocks {
+        for succ in successors(block) {
+            preds.entry(succ).or_default().push(key.clone());
+        }
+    }
+    let reachable = compute_reachable(&blocks);
+    dominators(&blocks, &preds, &reachable)
 }
 
 pub fn validate_program(program: &Program) -> Vec<ValidationError> {

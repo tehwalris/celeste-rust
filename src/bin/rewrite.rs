@@ -57,6 +57,17 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         frames: u32,
     },
+    /// Propose recipe entries. This is the untrusted half of the system: the
+    /// output is a suggestion, and only survives if the rule's verifier accepts
+    /// it. Pipe it into the recipe and re-run `build`.
+    Suggest {
+        /// What to look for. Currently only "promote-cell".
+        #[arg(default_value = "promote-cell")]
+        what: String,
+        /// Prefix for the generated ids.
+        #[arg(long, default_value = "p")]
+        prefix: String,
+    },
     /// Run the rewritten program and report time, memory and lane counts.
     ///
     /// Note peak RSS is the process-wide high-water mark, so with `--baseline`
@@ -197,6 +208,36 @@ fn main() -> Result<()> {
                     return Err(anyhow!("differential verification failed"));
                 }
             }
+        }
+
+        Command::Suggest { what, prefix } => {
+            if what != "promote-cell" {
+                return Err(anyhow!("unknown suggestion kind {:?}", what));
+            }
+            // Suggestions are made against the program as the recipe leaves it,
+            // so running suggest / append / build repeatedly converges.
+            let (program, _) = build(&recipe)?;
+            let mut n = 0;
+            let mut total_loads = 0;
+            for (name, fun) in &program.functions {
+                for (cell, loads) in celeste_rust::rewrite::rules::promote_cell::candidates(fun) {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "id": format!("{}{:03}", prefix, n),
+                            "rule": "promote_cell",
+                            "fn": name.as_str(),
+                            "cell": format!("%{}", usize::from(cell)),
+                        })
+                    );
+                    n += 1;
+                    total_loads += loads;
+                }
+            }
+            eprintln!(
+                "# {} promotable cell(s), {} load(s) they would remove",
+                n, total_loads
+            );
         }
 
         Command::Bench { frames, baseline } => {

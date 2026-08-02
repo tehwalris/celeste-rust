@@ -16,7 +16,8 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use super::program::Program;
-use super::rules::{dce, fold, merge_blocks};
+use super::rules::{dce, fold, merge_blocks, promote_cell};
+use crate::ir::LocalId;
 use super::validate::validate_program;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +44,13 @@ pub enum Rule {
     MergeBlocks,
     /// Local simplifications: constant conditions, degenerate phis.
     Fold,
+    /// Replace one non-escaping, single-store heap cell with SSA values.
+    PromoteCell {
+        #[serde(rename = "fn")]
+        function: String,
+        /// The `alloc` that defines the cell, as `%N`.
+        cell: String,
+    },
 }
 
 impl Rule {
@@ -51,8 +59,14 @@ impl Rule {
             Rule::Dce => "dce",
             Rule::MergeBlocks => "merge_blocks",
             Rule::Fold => "fold",
+            Rule::PromoteCell { .. } => "promote_cell",
         }
     }
+}
+
+fn parse_cell(text: &str) -> Result<LocalId> {
+    super::print::parse_local_name(text)
+        .ok_or_else(|| anyhow!("cell must look like %17, got {:?}", text))
 }
 
 #[derive(Debug, Default)]
@@ -126,6 +140,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::Dce => dce::apply(program),
         Rule::MergeBlocks => merge_blocks::apply(program),
         Rule::Fold => fold::apply(program),
+        Rule::PromoteCell { function, cell } => {
+            promote_cell::apply(program, function, parse_cell(cell)?)
+        }
     }
     .with_context(|| format!("applying {} ({})", entry.id, entry.rule.name()))?;
 
@@ -145,6 +162,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::Dce => dce::verify(&before, program),
         Rule::MergeBlocks => merge_blocks::verify(&before, program),
         Rule::Fold => fold::verify(&before, program),
+        Rule::PromoteCell { function, cell } => {
+            promote_cell::verify(&before, program, function, parse_cell(cell)?)
+        }
     }
     .with_context(|| format!("verifying {} ({})", entry.id, entry.rule.name()))?;
 
