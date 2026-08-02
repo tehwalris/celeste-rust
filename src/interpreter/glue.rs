@@ -190,13 +190,18 @@ fn interpret_prepared_cfg_inner(
                     let dag_ids_copy: Vec<_> = std::mem::take(dag_ids);
 
                     // Vectorize pending states first (to merge compatible shapes)
-                    let vectorized_pending = vectorize_states(pending);
-
-                    // Compute union and diff with accumulated states
-                    let (new_union, actually_new) = union_diff_states(
-                        std::mem::take(accumulated_states),
-                        vectorized_pending,
-                    );
+                    let (new_union, actually_new) = {
+                        // Named so the profile can tell merging at a
+                        // hint_normalize block apart from merging at the frame
+                        // boundary; they are the same code but different
+                        // problems.
+                        let _trace = TraceSpan::new("merge_hint_normalize", "merge_site");
+                        let vectorized_pending = vectorize_states(pending);
+                        union_diff_states(
+                            std::mem::take(accumulated_states),
+                            vectorized_pending,
+                        )
+                    };
 
                     // Update the accumulator with the union (persists for next iteration)
                     *accumulated_states = new_union;

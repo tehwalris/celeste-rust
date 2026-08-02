@@ -233,7 +233,13 @@ impl AbstractRun {
             new_states.extend(result.into_iter().map(|(s, _)| s));
         }
         let new_states: Vec<State> = new_states.into_iter().map(make_state_abstract).collect();
-        self.states = vectorize_states(new_states);
+        self.states = {
+            let _trace = crate::interpreter::tracing::TraceSpan::new(
+                "merge_frame_boundary",
+                "merge_site",
+            );
+            vectorize_states(new_states)
+        };
         Ok(())
     }
 

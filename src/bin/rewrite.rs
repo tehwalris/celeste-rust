@@ -86,6 +86,9 @@ enum Command {
         /// Also run the unmodified program, for comparison.
         #[arg(long)]
         baseline: bool,
+        /// Print a self-time breakdown by span. Costs a few percent.
+        #[arg(long)]
+        profile: bool,
     },
 }
 
@@ -100,8 +103,12 @@ fn peak_rss_kb() -> u64 {
         .unwrap_or(0)
 }
 
-fn bench(label: &str, program: &Program, frames: u32) -> Result<()> {
+fn bench(label: &str, program: &Program, frames: u32, profile: bool) -> Result<()> {
     let mut run = celeste_rust::rewrite::verify::AbstractRun::start(program)?;
+    if profile {
+        celeste_rust::interpreter::tracing::reset_tracing();
+        celeste_rust::interpreter::tracing::enable_tracing();
+    }
     let start = std::time::Instant::now();
     for _ in 1..=frames {
         run.step()?;
@@ -128,6 +135,48 @@ fn bench(label: &str, program: &Program, frames: u32) -> Result<()> {
         "{:<10} end-of-frame state: heap {} cells, local_env {} entries",
         "", heap_len, env_len
     );
+
+    if profile {
+        let rows = celeste_rust::interpreter::tracing::span_self_time_summary();
+        let measured: u64 = rows.iter().map(|r| r.self_us).sum();
+        println!();
+        println!(
+            "{:<28} {:>9} {:>7} {:>9} {:>12}",
+            "span", "self (s)", "%", "total (s)", "count"
+        );
+        for row in rows.iter().take(20) {
+            println!(
+                "{:<28} {:>9.2} {:>6.1}% {:>9.2} {:>12}",
+                format!("{}:{}", row.category, row.name),
+                row.self_us as f64 / 1e6,
+                100.0 * row.self_us as f64 / measured.max(1) as f64,
+                row.total_us as f64 / 1e6,
+                row.count
+            );
+        }
+        println!(
+            "{:<28} {:>9.2} of {:.2}s wall clock (the rest is outside any span)",
+            "measured", measured as f64 / 1e6, elapsed.as_secs_f64()
+        );
+
+        // Spans in the `merge_site` category exist only to bracket other work,
+        // so they have no self time worth reporting - what matters is how much
+        // is under them.
+        let sites: Vec<_> = rows.iter().filter(|r| r.category == "merge_site").collect();
+        if !sites.is_empty() {
+            println!();
+            for row in sites {
+                println!(
+                    "{:<28} {:>9} {:>7} {:>9.2} {:>12}",
+                    format!("{}:{}", row.category, row.name),
+                    "-",
+                    "-",
+                    row.total_us as f64 / 1e6,
+                    row.count
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -318,12 +367,12 @@ fn main() -> Result<()> {
             );
         }
 
-        Command::Bench { frames, baseline } => {
+        Command::Bench { frames, baseline, profile } => {
             if baseline {
-                bench("original", &Program::compile_from_disk()?, frames)?;
+                bench("original", &Program::compile_from_disk()?, frames, profile)?;
             }
             let (program, _) = build(&recipe)?;
-            bench("rewritten", &program, frames)?;
+            bench("rewritten", &program, frames, profile)?;
         }
 
         Command::Bisect { frames } => {

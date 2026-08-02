@@ -191,6 +191,80 @@ pub fn get_tracing_json() -> String {
     serde_json::to_string(&events).unwrap_or_else(|_| "[]".to_string())
 }
 
+/// One row of the self-time breakdown.
+pub struct SpanSummary {
+    pub category: &'static str,
+    pub name: String,
+    /// Time inside this span but not inside any span nested within it.
+    pub self_us: u64,
+    /// Time inside this span, including nested spans.
+    pub total_us: u64,
+    pub count: u64,
+}
+
+/// Self time per span name, which is what "where does the frame go?" actually
+/// asks.
+///
+/// Summing span durations by name double counts, because a `filter` inside a
+/// `cfg` is inside both. Spans nest properly (they come from RAII guards on one
+/// thread's stack), so the parent of a span is the innermost other span whose
+/// interval contains it, and subtracting direct children from each parent
+/// leaves a partition of wall-clock time.
+pub fn span_self_time_summary() -> Vec<SpanSummary> {
+    collect_thread_spans();
+    let spans = COLLECTED_SPANS.lock().unwrap();
+
+    let mut order: Vec<usize> = (0..spans.len()).collect();
+    order.sort_by_key(|&i| {
+        let s = &spans[i];
+        // Outermost first when two spans start together.
+        (s.tid, s.start_us, std::cmp::Reverse(s.duration_us))
+    });
+
+    let mut child_us: Vec<u64> = vec![0; spans.len()];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut current_tid = None;
+    for &i in &order {
+        let span = &spans[i];
+        if current_tid != Some(span.tid) {
+            stack.clear();
+            current_tid = Some(span.tid);
+        }
+        while let Some(&top) = stack.last() {
+            if spans[top].start_us + spans[top].duration_us <= span.start_us {
+                stack.pop();
+            } else {
+                break;
+            }
+        }
+        if let Some(&parent) = stack.last() {
+            child_us[parent] += span.duration_us;
+        }
+        stack.push(i);
+    }
+
+    let mut by_name: std::collections::HashMap<(&'static str, String), SpanSummary> =
+        std::collections::HashMap::new();
+    for (i, span) in spans.iter().enumerate() {
+        let entry = by_name
+            .entry((span.category, span.name.clone()))
+            .or_insert_with(|| SpanSummary {
+                category: span.category,
+                name: span.name.clone(),
+                self_us: 0,
+                total_us: 0,
+                count: 0,
+            });
+        entry.self_us += span.duration_us.saturating_sub(child_us[i]);
+        entry.total_us += span.duration_us;
+        entry.count += 1;
+    }
+
+    let mut out: Vec<SpanSummary> = by_name.into_values().collect();
+    out.sort_by_key(|s| std::cmp::Reverse(s.self_us));
+    out
+}
+
 // ============================================================================
 // Span Guards
 // ============================================================================
