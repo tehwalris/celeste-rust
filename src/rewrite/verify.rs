@@ -26,7 +26,7 @@ use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
 
 use crate::game_runner::{create_initial_state_with_builtins, inject_tile_flag_at_builtin};
-use crate::interpreter::glue::interpret_cfg;
+use crate::interpreter::glue::{interpret_cfg, interpret_prepared_cfg};
 use crate::interpreter::inspect::make_state_abstract;
 use crate::interpreter::state::State;
 use crate::interpreter::value::{HeapValue, MaybeVector, Value};
@@ -203,7 +203,10 @@ pub fn observe_frame(states: &[State]) -> BTreeSet<StateObservation> {
 pub struct AbstractRun {
     states: Vec<State>,
     fixed_env: crate::interpreter::fixed_env::FixedEnv,
-    frame_cfg: crate::ir::Cfg,
+    /// Prepared once, not per frame. `interpret_cfg` clones the CFG and
+    /// recomputes its label set, which is free at 100 blocks and is not at the
+    /// 1545 a fully inlined program has.
+    frame_cfg: crate::interpreter::fixed_env::PreparedCfg,
 }
 
 impl AbstractRun {
@@ -216,13 +219,16 @@ impl AbstractRun {
         for state in &mut states {
             inject_tile_flag_at_builtin(state);
         }
-        Ok(Self { states, fixed_env, frame_cfg: program.frame_cfg().clone() })
+        let frame_cfg = crate::interpreter::fixed_env::PreparedCfg::new(
+            program.frame_cfg().clone(),
+        );
+        Ok(Self { states, fixed_env, frame_cfg })
     }
 
     pub fn step(&mut self) -> Result<()> {
         let mut new_states = Vec::new();
         for state in std::mem::take(&mut self.states) {
-            let result = interpret_cfg(self.frame_cfg.clone(), state, &self.fixed_env)
+            let result = interpret_prepared_cfg(&self.frame_cfg, state, &self.fixed_env)
                 .map_err(|e| anyhow!("frame failed: {}", e))?;
             new_states.extend(result.into_iter().map(|(s, _)| s));
         }

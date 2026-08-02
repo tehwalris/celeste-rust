@@ -477,7 +477,7 @@ pub fn new_label_map() -> FxHashMap<Label, Block> {
 /// It matters because `LocalEnv` used to be indexed by `LocalId` directly, so
 /// it cost `max LocalId + 1` slots, and every `filter_by_mask` clones it. After
 /// inlining, `player.update_21` reached 3206 ids - but never more than 18
-/// simultaneously live values. See `plans/inline-parked.md`.
+/// simultaneously live values. See `plans/inline.md`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotMap {
     /// Slot for each `LocalId`. Empty means the identity map, i.e. exactly the

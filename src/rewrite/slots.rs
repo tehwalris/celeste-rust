@@ -14,7 +14,7 @@
 //! runtime. Under the identity map the array is `max LocalId + 1` long:
 //! `player.update_21` costs 848 entries and `__frame` costs 1508, of which at
 //! most 12-18 are ever live. Inlining makes this dramatically worse (3206 ids),
-//! which is why `inline` is currently parked.
+//! which is why `inline` was parked until this existed.
 //!
 //! # What "valid" means
 //!

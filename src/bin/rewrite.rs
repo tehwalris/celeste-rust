@@ -61,7 +61,7 @@ enum Command {
     /// output is a suggestion, and only survives if the rule's verifier accepts
     /// it. Pipe it into the recipe and re-run `build`.
     Suggest {
-        /// What to look for. Currently only "promote-cell".
+        /// What to look for: "promote-cell" or "inline".
         #[arg(default_value = "promote-cell")]
         what: String,
         /// Prefix for the generated ids.

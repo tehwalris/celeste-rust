@@ -3,12 +3,11 @@
 //! Two uses, neither of which requires the interpreter to know anything about
 //! liveness:
 //!
-//!   * reporting - how many locals are simultaneously live tells us how small
-//!     `LocalEnv` could be made, which decides whether slot allocation is worth
-//!     doing (see `plans/inline-parked.md`)
-//!   * eventually, slot allocation itself: values whose live ranges do not
-//!     overlap can share a `LocalId`, which keeps the id range dense no matter
-//!     how much inlining happens
+//!   * slot allocation (`super::slots`) - values whose live ranges do not
+//!     overlap share a slot, which keeps `LocalEnv` small no matter how much
+//!     inlining happens
+//!   * reporting - `rewrite slots` compares what each function's map costs
+//!     against the floor set by simultaneous liveness (see `plans/inline.md`)
 //!
 //! Note the contrast with `src/liveness.rs`, which is a runtime hook the
 //! interpreter consults on every block entry and which has never been
@@ -38,8 +37,8 @@ pub struct Liveness {
 impl Liveness {
     /// The largest number of locals live at any single point in the function.
     ///
-    /// This is the number of slots a `LocalEnv` would actually need, as opposed
-    /// to `max LocalId + 1`, which is what it currently costs.
+    /// The floor for slot allocation: no assignment can do better, and
+    /// `slots::allocate` currently hits it on every function in the program.
     pub fn max_simultaneously_live(&self, cfg: &Cfg) -> usize {
         let mut max = 0;
         for (key, block) in all_blocks(cfg) {
