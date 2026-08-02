@@ -25,6 +25,8 @@ not comparable.
 | + slot plumbing (identity, no-op) | 5.69 s / 1.12 GB | - |
 | + `allocate_slots` | 4.65 s / 1.05 GB | 13.20 s / 3.63 GB |
 | + 183 `inline`s | 4.47 s / 1.12 GB | 12.87 s / 3.75 GB |
+| + 81 `if_convert`s | 4.40 s / 1.06 GB | - |
+| + stage B finished (`promote_capture`, 84 method inlines) | 4.36 s / 1.06 GB | - |
 
 Frame 40, milestone checks only: 84.1 s / 25.8 GB as compiled, 62.5 s / 14.45 GB
 after `promote_cell`. That beat the old unverified `mem2reg`'s 15.2 GB, which
@@ -180,6 +182,22 @@ two or three allocations - cloning the `HeapValue`, the `Box<HeapValue>` the
 That cost scales with the number of states, not with lanes per state. So it is
 not a separate lever at all: it is the same fragmentation problem, and
 if-conversion is what shrinks it.
+
+### Recipe replay is part of the benchmark (2026-08)
+
+`rewrite build` prints where replay time went:
+
+    replay: 2.0s total - clone 0.1s, apply 0.3s, validate 0.9s, verify 0.7s
+
+Every command in the tool replays the recipe before doing anything, so this is
+a constant added to `verify`, `screen`, `suggest`, `bench` and `print` alike.
+It had silently reached **67s** - 97% of it whole-program dominance validation
+after each of 554 entries, on functions that inlining had grown to hundreds of
+blocks. See the commit for the three fixes.
+
+The lesson for benchmarking: quote replay separately from the thing being
+measured. A `bench --frames 34` that reports 4.36s was, for most of this
+session, a 70-second command.
 
 ## Scalar reference point
 

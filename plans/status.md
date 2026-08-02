@@ -1,6 +1,6 @@
 # Status (2026-08)
 
-Branch `rewrite`. Build is warning-free, 171 tests pass, working tree clean.
+Branch `rewrite`. Build is warning-free, 194 tests pass, working tree clean.
 
 ## Measured, frame 34 (the standard iteration benchmark)
 
@@ -11,6 +11,8 @@ Branch `rewrite`. Build is warning-free, 171 tests pass, working tree clean.
 | + slot plumbing (identity map, no-op) | 5.69 s | 1.12 GB |
 | + `allocate_slots` | 4.65 s | 1.05 GB |
 | + 183 `inline`s | 4.47 s | 1.12 GB |
+| + 81 `if_convert`s | 4.40 s | 1.06 GB |
+| + stage B finished (see below) | 4.36 s | 1.06 GB |
 
 Lane count is identical throughout (92,713), which is the first thing to check
 when a rewrite claims a win. Frame 37 confirms the same ratios at ~13 s. Keep
@@ -127,37 +129,60 @@ by making the merge itself cheaper (`merge_groups` 26%, `gc` 20%,
 bounded, unexamined, and independent of the program's shape), or by reaching a
 branch-free frame where there is one state and no merge. The second is the plan.
 
-## Next: finish stage B, which is what unblocks stage D
+## Stage B is finished
 
-Surveyed in `plans/rewrite-plan.md` section 10. 305 calls remain:
+`promote_capture` turns a captured cell into a captured value;
+`AssertClosure` gained a `captures` list so `inline` can bind a callee's
+`capture_ids`; 84 method call sites inlined over three rounds, all screening
+clean; then `promote_cell` took the 32 `obj` boxes nothing captured any more.
+Details in `plans/rewrite-plan.md` section 11.
 
-* **200 are native builtins** (`error` 54, `__print` 54, `mget` 17, `max` 16,
-  `min` 16, `flr` 10, ...). A builtin is already a leaf operation, so these cost
-  nothing at run time. They cost something at rewrite time only because
-  `if_convert` rejects any arm containing a `Call`.
-* **72 are method dispatch** (`.init` 32, `.collide` 13, `.check` 10,
-  `.is_solid` 7) and are blocked by **captures, not dispatch**. `inline::apply`
-  never cared how the closure was obtained; only `candidates` restricts itself
-  to globals. All seven `obj.*` methods capture exactly one cell, holding the
-  object itself, and that cell is `alloc`ed, stored once, and never rewritten.
-* **33 have a callee defined in another block** and need cross-block candidate
-  detection.
+| step | frame 34 | fragments |
+|---|---|---|
+| + 81 `if_convert`s (previous) | 4.40 s / 1.06 GB | 558 |
+| + `promote_capture` x7 | 4.46 s / 1.06 GB | 558 |
+| + 32 `promote_cell`s | 4.42 s / 1.06 GB | 558 |
+| + 84 method `inline`s | 4.34 s / 1.06 GB | 558 |
+| + 16 more `if_convert`s | 4.36 s / 1.06 GB | 558 |
 
-Two rules, in this order:
+**The fragment count did not move once**, which was the predicted shape:
+inlining relocates branches, it does not remove them. Instructions went
+13109 -> 23362.
 
-1. `promote_capture { fn, index }` - captured *cell* becomes captured *value*.
-   Whole-program rule keyed by the callee, since one `FunDef` is shared by all
-   32 closures made from it.
-2. `AssertClosure` grows `captures: Vec<LocalId>`, and `inline` binds the
-   callee's capture ids to them. After (1) the capture *is* the object, and the
-   call site already has it as the receiver of the field access - every such
-   call is `%f = get_field %o.name; call (load %f)`, and `%o` is the object the
-   closure captured. (Not as an argument: these methods have no `self`
-   parameter, they close over `obj` instead.) Before (1) the capture is a cell
-   pointer and no local at the call site holds it, which is why the order
-   matters.
+Two things this stage taught that were not in the plan:
 
-Then stage D over the enlarged candidate set, then stage E for the loops.
+* **The differential check had to give ground.** Removing the box changes the
+  frame-boundary heap (272 cells -> 271), and the whole Tier 2 story assumed
+  that was invariant. `observe_state` now normalises both sides so a closure
+  capture is observed by the value it denotes rather than the box holding it.
+  Narrow, stated, applied to both sides - and this premise will keep breaking,
+  because stage C removes heap cells wholesale.
+* **20-frame screening is not deep enough.** All 19 `if_convert` candidates
+  passed at 20 frames; three failed at 34, at frames 29 and 32. Screen at the
+  depth the result will be used at.
+
+## Next: stage C, and it is now the blocker rather than a nicety
+
+`suggest if-convert` reports what stands in the way:
+
+    # 19 if-convertible join(s)
+    # 155 more triangle(s) blocked by unspeculatable arms:
+    #       89  store
+    #       68  call
+    #       41  assert_closure
+    #       41  get_field
+
+Inlining converted each `call` into a body full of stores and creating field
+accesses. Those are unspeculatable for a better reason than the call was: they
+mutate the heap. So removing the calls renamed the obstacle rather than
+removing it, and **stage C is what makes stage D possible at all** - not a
+memory win to be taken whenever.
+
+`promote_cell` currently requires the cell to come from an `Alloc`. Object
+fields are `GetField { create_if_missing: true }` cells, so it cannot touch
+them. Extending it needs the pointer-canonicality precondition from section 4
+of the plan, and `assume_eq` (or a CSE bulk rule) first, because 84 inlines
+left many duplicate accessors.
 
 And the thing to keep in view: the two biggest splitting sites are the `btn`
 reads, 26% of splits, and no rewrite removes them. They stop mattering only when
@@ -165,3 +190,21 @@ the frame is otherwise branch-free and the inputs can fan out across lanes
 instead of states - one state per frame, no merge. **None of the intermediate
 stages collect that payoff**, which is worth remembering when the next one also
 measures flat.
+
+## Keep replay fast
+
+`rewrite build` prints where recipe replay went:
+
+    replay: 2.0s total - clone 0.1s, apply 0.3s, validate 0.9s, verify 0.7s
+
+It reached **67s** during this session before anyone measured it, and since
+every command replays the recipe first, that was added to everything. 97% was
+whole-program dominance validation after every entry, on a program that
+inlining had grown to hundreds of blocks per function. Fixed by validating only
+changed functions, bitset dominators, and a dominator-tree walk.
+
+Watch this line. Replay is O(entries x program size) and both keep growing, so
+it will drift again. If it ever needs another order of magnitude, the fallback
+is a fast mode that validates once at the end and a conservative mode that
+validates per entry - at the cost of losing which entry broke things, which is
+what makes `bisect` necessary rather than optional.
