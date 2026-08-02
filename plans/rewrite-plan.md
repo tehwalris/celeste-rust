@@ -589,7 +589,68 @@ Needed before the first rewrite:
    search impossible to distribute across machines or run on a GPU. Getting to a
    pure, fixed-shape kernel is the precondition for that, independent of the
    local speedup.
-5. **Cheap experiments worth running before committing to any of this:**
-   (a) add more `_hint_normalize()` calls to the Lua and measure — one line,
-   possibly large; (b) confirm the native `tile_flag_at` injection is actually
-   taking effect; (c) harvest `barrier`'s Vec-based COW `LocalEnv`/`Heap`.
+5. **Cheap experiments — done, see below.** All three came back negative, which
+   is itself the useful result: there is no cheap lever left, so the program
+   shape is the only remaining one. `barrier`'s Vec-based COW `LocalEnv`/`Heap`
+   is still unharvested and is the one remaining non-structural idea.
+
+## 7. Results of the cheap experiments (2026-08)
+
+**(a) Is the native `tile_flag_at` injection taking effect?** Yes. In the
+January trace `tile_flag_at_72` and `tile_at_73` were the #2 and #3 hot spans
+(1.71 s and 1.44 s self). In a fresh trace they are absent entirely. No action.
+This also means the January trace's cost split was misleading and should not be
+used.
+
+**(b) Does adding `_hint_normalize()` calls help?** Marginally, and it costs
+time. Best placement found (immediately after the six `btn()` reads in
+`player.update`, i.e. right after the input fan-out and before the movement
+logic), at frame 37: **7.03 GB → 5.58 GB (-21%) but 23.4 s → 25.1 s (+7%)**.
+Lane counts identical. Two other placements (inside `obj.move`, end of
+`player.update`) were neutral or much worse (32.6 s). A ~20% memory saving buys
+about half a frame. Not pursued.
+
+This experiment was previously impossible to run: `_hint_normalize()`, which is
+supposed to be a pure merge hint with no semantics, crashed the interpreter
+anywhere except its two existing sites. `State::gc` called `Heap::get` on every
+reachable id and panicked on cells that `Alloc` had created but no `Store` had
+filled yet. Fixed in `d622121`.
+
+**(c) Is `union_diff_states`'s missing caching a problem?** Not yet — 4.3% self
+time at frame 34. Recorded so we don't re-litigate it.
+
+### Updated cost split (frame 34, fresh trace, 6.15 s total self time)
+
+| span | self | share | n |
+|---|---|---|---|
+| `filter_branch` | 2.034 s | **33.1%** | 25,220 |
+| `merge_groups` | 0.860 s | 14.0% | 102 |
+| `gc` | 0.820 s | 13.3% | 20,381 |
+| `dedup_state` | 0.582 s | 9.5% | 267 |
+| `player.update_21` | 0.406 s | 6.6% | 27 |
+| `shape_grouping` | 0.300 s | 4.9% | 102 |
+| `union_diff_states` | 0.264 s | 4.3% | 68 |
+| `filter_dedup` | 0.073 s | 1.2% | 172 |
+| `filter_split_flr` | 0.050 s | **0.8%** | 819 |
+
+By category: filter 35.1%, vectorize 28.3%, gc 13.7%, **cfg 22.9%**.
+
+Two things to read off this:
+
+- **Branch-induced filtering is ~40x the semantically necessary filtering.**
+  `filter_branch` is 33% and removable in principle; `filter_split_flr` — the
+  interval refinement that is the search actually fanning out — is 0.8%.
+- **~75% of runtime is attributable to intra-frame fragmentation**
+  (filter_branch + vectorize + gc), versus 23% actual interpretation. `gc` runs
+  20,381 times in 34 frames; in a branch-free world it would run ~34 times.
+
+### This sharpens the break-even for K
+
+Actual interpretation is 1.40 s for 92,713 lanes at frame 34 = ~15 µs/lane,
+against ~66 µs/lane total. A branch-free kernel removes essentially all of the
+other 51 µs but grows the interpretation term by `K / (dynamic path length)`.
+With a dynamic path of roughly 5k instructions, break-even is around
+**K ≈ 22,000 instructions**. Under that, we win on the existing interpreter and
+the memory win is free on top; well over it, the win only arrives after codegen.
+
+Measuring K is therefore still the decisive open question.
