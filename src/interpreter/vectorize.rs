@@ -1005,6 +1005,7 @@ pub fn union_diff_states(
     accumulated: Vec<State>,
     potentially_new: Vec<State>,
 ) -> (Vec<State>, Vec<State>) {
+    let _trace = TraceSpan::new("union_diff_states", "vectorize");
     if accumulated.is_empty() {
         // First, deduplicate within potentially_new
         let mut seen: FxHashSet<NormalizedState> = FxHashSet::default();
