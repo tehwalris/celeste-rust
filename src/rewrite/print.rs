@@ -94,6 +94,12 @@ pub fn format_instruction(instr: &Instruction) -> String {
         Instruction::BinaryOp { left, op, right } => {
             format!("{} {} {}", n(*left), binary_op_str(*op), n(*right))
         }
+        Instruction::Select { condition, if_true, if_false } => format!(
+            "select {} ? {} : {}",
+            n(*condition),
+            n(*if_true),
+            n(*if_false)
+        ),
         Instruction::AssertClosure { value, fun_def } => {
             format!("assert_closure {} is {}", n(*value), fun_def.as_str())
         }
@@ -120,6 +126,22 @@ pub fn format_terminator(term: &Terminator) -> String {
             false_target.as_str()
         ),
     }
+}
+
+/// One block's instructions and terminator, without its label. Used by rule
+/// verifiers to compare blocks structurally.
+pub fn format_block(block: &Block) -> String {
+    let mut out = String::new();
+    for (id, instr) in &block.instructions {
+        let _ = writeln!(out, "{} = {}", local_name(*id), format_instruction(instr));
+    }
+    let _ = writeln!(
+        out,
+        "{} = {}",
+        local_name(block.terminator_id()),
+        format_terminator(block.terminator_kind())
+    );
+    out
 }
 
 fn write_block(out: &mut String, label: &str, block: &Block) {

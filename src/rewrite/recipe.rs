@@ -16,7 +16,9 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use super::program::Program;
-use super::rules::{allocate_slots, dce, fold, inline, merge_blocks, promote_cell};
+use super::rules::{
+    allocate_slots, dce, fold, if_convert, inline, merge_blocks, promote_cell,
+};
 use crate::ir::LocalId;
 use super::validate::validate_program;
 
@@ -57,6 +59,14 @@ pub enum Rule {
         /// The function to splice in.
         callee: String,
     },
+    /// Collapse a branch whose arm is safe to run unconditionally into a
+    /// `select` at the named join block.
+    IfConvert {
+        #[serde(rename = "fn")]
+        function: String,
+        /// The block the two paths join at.
+        join: String,
+    },
     /// Replace one non-escaping, single-store heap cell with SSA values.
     PromoteCell {
         #[serde(rename = "fn")]
@@ -74,6 +84,7 @@ impl Rule {
             Rule::MergeBlocks => "merge_blocks",
             Rule::Fold => "fold",
             Rule::Inline { .. } => "inline",
+            Rule::IfConvert { .. } => "if_convert",
             Rule::PromoteCell { .. } => "promote_cell",
         }
     }
@@ -156,6 +167,7 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::AllocateSlots => allocate_slots::apply(program),
         Rule::MergeBlocks => merge_blocks::apply(program),
         Rule::Fold => fold::apply(program),
+        Rule::IfConvert { function, join } => if_convert::apply(program, function, join),
         Rule::PromoteCell { function, cell } => {
             promote_cell::apply(program, function, parse_cell(cell)?)
         }
@@ -182,6 +194,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::AllocateSlots => allocate_slots::verify(&before, program),
         Rule::MergeBlocks => merge_blocks::verify(&before, program),
         Rule::Fold => fold::verify(&before, program),
+        Rule::IfConvert { function, join } => {
+            if_convert::verify(&before, program, function, join)
+        }
         Rule::PromoteCell { function, cell } => {
             promote_cell::verify(&before, program, function, parse_cell(cell)?)
         }

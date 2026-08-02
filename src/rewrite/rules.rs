@@ -24,6 +24,7 @@ use crate::ir::{Block, Cfg, FunDef, Instruction, Label, LocalId, Terminator};
 use super::program::Program;
 
 pub mod allocate_slots;
+pub mod if_convert;
 pub mod fold;
 pub mod dce;
 pub mod merge_blocks;

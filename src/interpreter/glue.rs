@@ -1,7 +1,7 @@
 use std::hash::BuildHasherDefault;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rustc_hash::FxHasher;
 
 type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
@@ -270,7 +270,13 @@ fn interpret_prepared_cfg_inner(
             block,
         );
         let bound_post_phi = adapter.flow_block_post_phi(block)?;
-        let flow_data = bound_post_phi.flow(flow_data)?;
+        let flow_data = bound_post_phi.flow(flow_data).with_context(|| {
+            format!(
+                "in {} block '{}'",
+                name.as_deref().unwrap_or("__main"),
+                block_label.as_ref().map_or("__entry", |l| l.as_str())
+            )
+        })?;
 
         // Update DAG node with processing stats
         with_profiler(|p| {

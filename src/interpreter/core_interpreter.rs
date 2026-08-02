@@ -6,13 +6,13 @@ use super::{
     fixed_env::FixedEnv,
     heap::HeapId,
     input_capture,
-    op::{interpret_binary_op, interpret_unary_op},
+    op::{interpret_binary_op, interpret_select, interpret_unary_op},
     profiling::{DagOperation, SpanGuard, with_profiler},
     state::State,
     value::{HeapValue, MaybeVector, Value},
 };
 use crate::ir::{Instruction, LocalId};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 
 type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
@@ -292,6 +292,12 @@ impl<'a> CoreInterpreter<'a> {
                 let right = self.state.local_env.get(*right);
                 interpret_binary_op(left, *op, right).map(Some)
             }
+            Instruction::Select { condition, if_true, if_false } => {
+                let condition = self.state.local_env.get(*condition);
+                let if_true = self.state.local_env.get(*if_true);
+                let if_false = self.state.local_env.get(*if_false);
+                interpret_select(condition, if_true, if_false).map(Some)
+            }
             Instruction::Phi { .. } => {
                 panic!("Phi nodes should not be handled at this level")
             }
@@ -303,7 +309,20 @@ impl<'a> CoreInterpreter<'a> {
         local_id: LocalId,
         instruction: &Instruction,
     ) -> Result<()> {
-        if let Some(value) = self.interpret_non_call_instruction_no_assign(instruction)? {
+        // Naming the instruction costs nothing unless it fails, and a rewrite
+        // that speculates an arm onto lanes that cannot take it fails *here* -
+        // so this is what turns "something in the program went wrong" into a
+        // location a recipe entry can be traced back to.
+        let value = self
+            .interpret_non_call_instruction_no_assign(instruction)
+            .with_context(|| {
+                format!(
+                    "at %{} = {}",
+                    usize::from(local_id),
+                    crate::rewrite::print::format_instruction(instruction)
+                )
+            })?;
+        if let Some(value) = value {
             self.state.local_env.set(local_id, value);
         }
         Ok(())

@@ -61,7 +61,7 @@ enum Command {
     /// output is a suggestion, and only survives if the rule's verifier accepts
     /// it. Pipe it into the recipe and re-run `build`.
     Suggest {
-        /// What to look for: "promote-cell" or "inline".
+        /// What to look for: "promote-cell", "inline" or "if-convert".
         #[arg(default_value = "promote-cell")]
         what: String,
         /// Prefix for the generated ids.
@@ -74,6 +74,23 @@ enum Command {
         /// Only show functions needing at least this many slots today.
         #[arg(long, default_value_t = 40)]
         min: usize,
+    },
+    /// Try each candidate entry on top of the recipe, keep the ones that
+    /// verify, and print them.
+    ///
+    /// For rules that are *expected* to fail at some sites. `if_convert` is the
+    /// motivating case: its transformation is always structurally valid, but
+    /// the resulting `select` may be asked to combine values the representation
+    /// cannot hold per lane, and the only way to find out is to run it.
+    Screen {
+        /// File of candidate entries, one JSON object per line, as `suggest`
+        /// emits.
+        #[arg(long)]
+        candidates: String,
+        /// Frames to run when screening. Lower is faster and less thorough;
+        /// re-verify the accepted set at full length afterwards.
+        #[arg(long, default_value_t = 20)]
+        frames: u32,
     },
     /// Run the rewritten program and report time, memory and lane counts.
     ///
@@ -332,6 +349,25 @@ fn main() -> Result<()> {
                     }
                     eprintln!("# {} inlinable call site(s)", n);
                 }
+                "if-convert" => {
+                    for (name, fun) in &program.functions {
+                        for join in
+                            celeste_rust::rewrite::rules::if_convert::candidates(fun)
+                        {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "id": format!("{}{:03}", prefix, n),
+                                    "rule": "if_convert",
+                                    "fn": name.as_str(),
+                                    "join": join.as_str(),
+                                })
+                            );
+                            n += 1;
+                        }
+                    }
+                    eprintln!("# {} if-convertible join(s)", n);
+                }
                 other => return Err(anyhow!("unknown suggestion kind {:?}", other)),
             }
         }
@@ -372,6 +408,69 @@ fn main() -> Result<()> {
             );
         }
 
+        Command::Screen { candidates, frames } => {
+            let (mut program, _) = build(&recipe)?;
+            let baseline = Program::compile_from_disk()?;
+            let trace = celeste_rust::rewrite::verify::observation_trace(&baseline, frames)?;
+
+            let text = std::fs::read_to_string(&candidates)?;
+            let candidates = Recipe::parse(&text)?;
+            let total = candidates.entries.len();
+            let mut accepted = Vec::new();
+            for (i, entry) in candidates.entries.iter().enumerate() {
+                let mut trial = program.clone();
+                // A candidate may not merely diverge - it may panic. Speculating
+                // an arm runs it on lanes that would have skipped it, and the
+                // interpreter's arithmetic asserts on values it should never
+                // have seen (`Pico8Num::rem` on a negative number, say). That is
+                // the loud failure the design accepts, but it must not take the
+                // screener down with it: the trial program is discarded either
+                // way, so unwinding across it is safe.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    apply_entry(&mut trial, entry).and_then(|_| {
+                        Ok(celeste_rust::rewrite::verify::differential_against_trace(
+                            &trace, &trial, frames,
+                        )?)
+                    })
+                }));
+                let outcome = match outcome {
+                    Ok(outcome) => outcome,
+                    Err(_) => Err(anyhow!("panicked - see the message above")),
+                };
+                match outcome {
+                    Ok(None) => {
+                        program = trial;
+                        accepted.push(entry.clone());
+                        eprintln!("[{}/{}] {:<8} keep", i + 1, total, entry.id);
+                    }
+                    Ok(Some(d)) => eprintln!(
+                        "[{}/{}] {:<8} drop (frame {}): {}",
+                        i + 1,
+                        total,
+                        entry.id,
+                        d.frame,
+                        first_line(&d.detail)
+                    ),
+                    Err(e) => eprintln!(
+                        "[{}/{}] {:<8} drop: {}",
+                        i + 1,
+                        total,
+                        entry.id,
+                        first_line(&format!("{}", e))
+                    ),
+                }
+            }
+            for entry in &accepted {
+                println!("{}", serde_json::to_string(entry)?);
+            }
+            eprintln!(
+                "# kept {} of {} candidate(s), screened over {} frames",
+                accepted.len(),
+                total,
+                frames
+            );
+        }
+
         Command::Bench { frames, baseline, profile } => {
             if baseline {
                 bench("original", &Program::compile_from_disk()?, frames, profile)?;
@@ -402,6 +501,10 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn first_line(s: &str) -> String {
+    s.lines().next().unwrap_or("").chars().take(140).collect()
 }
 
 fn render(program: &Program, only: &Option<String>) -> Result<String> {

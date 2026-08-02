@@ -69,7 +69,7 @@ fn instruction_kind(instr: &crate::ir::Instruction) -> &'static str {
         NumberConstant { .. } | BoolConstant { .. } | StringConstant { .. } | NilConstant => {
             "const"
         }
-        UnaryOp { .. } | BinaryOp { .. } => "arith",
+        UnaryOp { .. } | BinaryOp { .. } | Select { .. } => "arith",
         Phi { .. } => "phi",
         AssertClosure { .. } => "guard",
     }

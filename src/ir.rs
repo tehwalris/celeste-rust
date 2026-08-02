@@ -193,6 +193,24 @@ pub enum Instruction {
     Phi {
         branches: Vec<(Label, LocalId)>,
     },
+    /// Per-lane choice between two values. What a `Phi` becomes once the
+    /// branch that produced it is gone (see `rules::if_convert`).
+    ///
+    /// The point of the whole rewrite effort: a `Phi` requires the state to
+    /// have been split so that each arm saw only its own lanes, and splitting
+    /// is what makes a frame end as ~576 fragments. A `Select` needs no split.
+    ///
+    /// It is deliberately **partial**. The value representation carries one
+    /// type tag and one `HeapId` per value rather than per lane, so two
+    /// different pointers, or a bool and a number, cannot be combined into one
+    /// value. Those cases are an error rather than a widening - a rewrite that
+    /// produces one is rejected by differential verification instead of
+    /// quietly losing information.
+    Select {
+        condition: LocalId,
+        if_true: LocalId,
+        if_false: LocalId,
+    },
     /// Fails execution unless `value` is a pointer to a closure of `fun_def`
     /// with no captures.
     ///
@@ -279,6 +297,11 @@ impl Instruction {
                     .map(|(label, id)| (label.clone(), f(*id)))
                     .collect(),
             },
+            Self::Select { condition, if_true, if_false } => Self::Select {
+                condition: f(*condition),
+                if_true: f(*if_true),
+                if_false: f(*if_false),
+            },
             Self::AssertClosure { value, fun_def } => Self::AssertClosure {
                 value: f(*value),
                 fun_def: fun_def.clone(),
@@ -319,6 +342,9 @@ impl Instruction {
             Self::UnaryOp { arg, .. } => vec![*arg],
             Self::BinaryOp { left, right, .. } => vec![*left, *right],
             Self::Phi { branches } => branches.iter().map(|(_, id)| *id).collect(),
+            Self::Select { condition, if_true, if_false } => {
+                vec![*condition, *if_true, *if_false]
+            }
             Self::AssertClosure { value, .. } => vec![*value],
         }
     }
@@ -345,6 +371,7 @@ impl Instruction {
             | Self::NilConstant
             | Self::UnaryOp { .. }
             | Self::BinaryOp { .. }
+            | Self::Select { .. }
             | Self::Phi { .. } => false,
             // Not a side effect on the heap, but it must never be optimised
             // away: its whole purpose is to fail.

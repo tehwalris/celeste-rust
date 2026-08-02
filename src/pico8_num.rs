@@ -163,16 +163,31 @@ impl Div for Pico8Num {
     }
 }
 
+impl Pico8Num {
+    /// `%`, or `None` where this implementation does not model PICO-8's
+    /// semantics: negative or fractional operands, and a non-positive divisor.
+    ///
+    /// Callers interpreting a program must use this rather than `%`. Whether
+    /// the operands are in range depends on the values flowing through the
+    /// program, and `if_convert` deliberately runs arithmetic on lanes that
+    /// would not have reached it, so this is a case the interpreter has to
+    /// report rather than abort on.
+    pub fn checked_rem(self, rhs: Self) -> Option<Self> {
+        let lhs = self.as_i16()?;
+        let rhs = rhs.as_i16()?;
+        if lhs < 0 || rhs <= 0 {
+            return None;
+        }
+        Some(Self::from_i16(lhs % rhs))
+    }
+}
+
 impl Rem for Pico8Num {
     type Output = Self;
 
     fn rem(self, rhs: Self) -> Self::Output {
-        let lhs = self.as_i16().unwrap();
-        let rhs = rhs.as_i16().unwrap();
-        if lhs < 0 || rhs <= 0 {
-            panic!("Pico8Num::Rem not implemented for negative/non-positive numbers");
-        }
-        Self::from_i16(lhs % rhs)
+        self.checked_rem(rhs)
+            .expect("Pico8Num::Rem not implemented for negative/non-positive numbers")
     }
 }
 

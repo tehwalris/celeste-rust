@@ -21,7 +21,7 @@
 //! would lose the correlation between fields and would call two genuinely
 //! different state sets equal.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Context, Result};
 use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
 
@@ -222,7 +222,7 @@ impl AbstractRun {
         let fixed_env = program.fixed_env();
         let initial = create_initial_state_with_builtins(&fixed_env);
         let init_states = interpret_cfg(program.init_cfg().clone(), initial, &fixed_env)
-            .map_err(|e| anyhow!("init failed: {}", e))?;
+            .context("init failed")?;
         let mut states: Vec<State> = init_states.into_iter().map(|(s, _)| s).collect();
         for state in &mut states {
             inject_tile_flag_at_builtin(state);
@@ -237,7 +237,7 @@ impl AbstractRun {
         let mut new_states = Vec::new();
         for state in std::mem::take(&mut self.states) {
             let result = interpret_prepared_cfg(&self.frame_cfg, state, &self.fixed_env)
-                .map_err(|e| anyhow!("frame failed: {}", e))?;
+                .context("frame failed")?;
             new_states.extend(result.into_iter().map(|(s, _)| s));
         }
         let new_states: Vec<State> = new_states.into_iter().map(make_state_abstract).collect();
@@ -275,6 +275,63 @@ impl AbstractRun {
 pub struct Divergence {
     pub frame: u32,
     pub detail: String,
+}
+
+/// The canonical observation after each of `frames` frames, plus the initial
+/// one. Precomputed once so that screening many candidates against the same
+/// baseline does not re-run the baseline every time.
+pub fn observation_trace(
+    program: &Program,
+    frames: u32,
+) -> Result<Vec<BTreeSet<StateObservation>>> {
+    let mut run = AbstractRun::start(program)?;
+    let mut out = vec![observe_frame(run.states())];
+    for _ in 1..=frames {
+        run.step()?;
+        out.push(observe_frame(run.states()));
+    }
+    Ok(out)
+}
+
+/// Runs `candidate` against a precomputed baseline trace.
+///
+/// Same check as `differential_abstract`, but for screening a batch of
+/// candidates against one baseline. Note that a candidate can also *fail* -
+/// `select` refuses values it cannot represent per lane - which is the expected
+/// outcome for a good fraction of `if_convert` sites and is reported as a
+/// divergence rather than propagated.
+pub fn differential_against_trace(
+    baseline: &[BTreeSet<StateObservation>],
+    candidate: &Program,
+    frames: u32,
+) -> Result<Option<Divergence>> {
+    let mut run = match AbstractRun::start(candidate) {
+        Ok(run) => run,
+        Err(e) => {
+            return Ok(Some(Divergence { frame: 0, detail: format!("init failed: {:#}", e) }))
+        }
+    };
+    for frame in 0..=frames {
+        if frame > 0 {
+            if let Err(e) = run.step() {
+                return Ok(Some(Divergence { frame, detail: format!("{:#}", e) }));
+            }
+        }
+        let observed = observe_frame(run.states());
+        let Some(expected) = baseline.get(frame as usize) else { break };
+        if &observed != expected {
+            return Ok(Some(Divergence {
+                frame,
+                detail: describe(
+                    expected,
+                    &observed,
+                    expected.len(),
+                    run.lane_count(),
+                ),
+            }));
+        }
+    }
+    Ok(None)
 }
 
 /// Runs both programs for `frames` frames, comparing the canonical observation

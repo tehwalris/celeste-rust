@@ -52,6 +52,103 @@ pub fn interpret_unary_op(state: &State, op: UnaryOp, v: &Value) -> Result<Value
 fn lift_to_interval(v: &MaybeVector<Pico8Num>) -> MaybeVector<Pico8NumInterval> {
     v.map_to(|n| Pico8NumInterval::from_number(*n))
 }
+
+/// Per-lane truthiness, following the same rules as a conditional branch
+/// (`flow.rs`): only `false` and `nil` are false, everything else is true.
+///
+/// `None` means the condition cannot be resolved per lane. That is
+/// `UnknownBool`, which a branch handles by sending the state down *both* edges
+/// unfiltered - there is no lane-wise answer to give, so a `select` on it has
+/// to fail.
+fn lane_condition(v: &Value) -> Option<MaybeVector<bool>> {
+    match v {
+        Value::Bool(b) => Some(b.clone()),
+        Value::Nil(_) => Some(MaybeVector::Scalar(false)),
+        Value::Number(_)
+        | Value::NumberInterval(_)
+        | Value::String(_)
+        | Value::Pointer(_) => Some(MaybeVector::Scalar(true)),
+        Value::UnknownBool | Value::NilPointer(_) => None,
+    }
+}
+
+/// Pick `if_true` or `if_false` per lane.
+///
+/// Deliberately partial - see `Instruction::Select`. A value carries one type
+/// tag and one `HeapId` for all its lanes, so this can only combine two values
+/// of the same numeric-ish representation, or two values that are already
+/// equal. Anything else is an error rather than a widening, because the whole
+/// reason to run a `select` is to avoid splitting the state, and silently
+/// losing per-lane information would defeat the purpose in the worst possible
+/// way: quietly.
+pub fn interpret_select(condition: &Value, if_true: &Value, if_false: &Value) -> Result<Value> {
+    let Some(mask) = lane_condition(condition) else {
+        return Err(anyhow!(
+            "select on a condition with no per-lane value: {:?}",
+            condition
+        ));
+    };
+
+    // A uniform condition needs no combining, and this is the case that lets a
+    // select survive on values it could not otherwise merge - a pointer, say.
+    match &mask {
+        MaybeVector::Scalar(true) => return Ok(if_true.clone()),
+        MaybeVector::Scalar(false) => return Ok(if_false.clone()),
+        MaybeVector::Vector(m) if m.iter().all(|b| *b) => return Ok(if_true.clone()),
+        MaybeVector::Vector(m) if m.iter().all(|b| !*b) => return Ok(if_false.clone()),
+        MaybeVector::Vector(_) => {}
+    }
+
+    if if_true == if_false {
+        return Ok(if_true.clone());
+    }
+
+    fn pick<T: std::fmt::Debug + Clone + PartialEq + Eq>(
+        mask: &MaybeVector<bool>,
+        a: &MaybeVector<T>,
+        b: &MaybeVector<T>,
+    ) -> MaybeVector<T> {
+        let MaybeVector::Vector(mask) = mask else {
+            unreachable!("uniform conditions are handled above")
+        };
+        let at = |v: &MaybeVector<T>, i: usize| match v {
+            MaybeVector::Scalar(s) => s.clone(),
+            MaybeVector::Vector(v) => v[i].clone(),
+        };
+        MaybeVector::Vector(
+            mask.iter()
+                .enumerate()
+                .map(|(i, take_true)| if *take_true { at(a, i) } else { at(b, i) })
+                .collect(),
+        )
+    }
+
+    match (if_true, if_false) {
+        (Value::Number(a), Value::Number(b)) => Ok(Value::Number(pick(&mask, a, b))),
+        (Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(pick(&mask, a, b))),
+        (Value::NumberInterval(a), Value::NumberInterval(b)) => {
+            Ok(Value::NumberInterval(pick(&mask, a, b)))
+        }
+        // Mixing a number with an interval is fine; that is the same widening
+        // the binary operators already do.
+        (Value::Number(a), Value::NumberInterval(b)) => Ok(Value::NumberInterval(pick(
+            &mask,
+            &lift_to_interval(a),
+            b,
+        ))),
+        (Value::NumberInterval(a), Value::Number(b)) => Ok(Value::NumberInterval(pick(
+            &mask,
+            a,
+            &lift_to_interval(b),
+        ))),
+        _ => Err(anyhow!(
+            "select cannot combine {:?} and {:?} per lane - a value carries one \
+             type tag and one HeapId for all its lanes",
+            if_true,
+            if_false
+        )),
+    }
+}
 pub fn interpret_binary_op(l: &Value, op: BinaryOp, r: &Value) -> Result<Value> {
     let sb = |b| Ok(Value::Bool(MaybeVector::Scalar(b)));
 
@@ -140,7 +237,26 @@ pub fn interpret_binary_op(l: &Value, op: BinaryOp, r: &Value) -> Result<Value> 
             Ok(Value::Number(MaybeVector::map2(l, r, |l, r| *l / *r)))
         }
         (Value::Number(l), BinaryOp::Percent, Value::Number(r)) => {
-            Ok(Value::Number(MaybeVector::map2(l, r, |l, r| *l % *r)))
+            // Reported rather than panicked: whether the operands are in range
+            // depends on the values flowing through the program.
+            let bad = std::cell::Cell::new(None);
+            let result = MaybeVector::map2(l, r, |l, r| {
+                l.checked_rem(*r).unwrap_or_else(|| {
+                    if bad.get().is_none() {
+                        bad.set(Some((*l, *r)));
+                    }
+                    Pico8Num::from_i16(0)
+                })
+            });
+            match bad.get() {
+                None => Ok(Value::Number(result)),
+                Some((l, r)) => Err(anyhow!(
+                    "unsupported operands for %: {:?} % {:?} (this implementation \
+                     only models non-negative integers with a positive divisor)",
+                    l,
+                    r
+                )),
+            }
         }
 
         // Arithmetic operations on intervals
@@ -691,5 +807,90 @@ mod tests {
             &Value::String("b".to_string()),
         );
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod select_tests {
+    use super::*;
+
+    fn num(n: i16) -> Value {
+        Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(n)))
+    }
+
+    fn nums(ns: &[i16]) -> Value {
+        Value::Number(MaybeVector::Vector(
+            ns.iter().map(|n| Pico8Num::from_i16(*n)).collect(),
+        ))
+    }
+
+    fn bools(bs: &[bool]) -> Value {
+        Value::Bool(MaybeVector::Vector(bs.to_vec()))
+    }
+
+    #[test]
+    fn picks_per_lane_and_broadcasts_scalars() {
+        let got = interpret_select(&bools(&[true, false, true]), &nums(&[1, 2, 3]), &num(9))
+            .unwrap();
+        assert_eq!(got, nums(&[1, 9, 3]));
+    }
+
+    /// A uniform condition needs no per-lane combining, which is what lets a
+    /// select survive on values it could not otherwise represent.
+    #[test]
+    fn a_uniform_condition_passes_a_value_through_untouched() {
+        let pointer = Value::Pointer(crate::interpreter::heap::HeapId::from_raw(7));
+        let got = interpret_select(
+            &Value::Bool(MaybeVector::Scalar(true)),
+            &pointer,
+            &Value::String("other".to_string()),
+        )
+        .unwrap();
+        assert_eq!(got, pointer);
+
+        // Same when the condition is a vector that happens to be uniform.
+        let got = interpret_select(&bools(&[false, false]), &num(1), &pointer).unwrap();
+        assert_eq!(got, pointer);
+    }
+
+    /// The case `if_convert` runs into in the real program: Lua's `and`/`or`
+    /// returns its operands, so a join can carry a bool on one side and a
+    /// number on the other. There is no per-lane representation for that, and
+    /// widening it would silently lose information.
+    #[test]
+    fn refuses_to_combine_a_bool_and_a_number() {
+        let err = interpret_select(&bools(&[true, false]), &num(1), &bools(&[false, false]))
+            .unwrap_err();
+        assert!(
+            format!("{}", err).contains("cannot combine"),
+            "{}",
+            err
+        );
+    }
+
+    /// `UnknownBool` sends a *branch* down both edges unfiltered, so there is
+    /// no lane-wise answer for a select to give.
+    #[test]
+    fn refuses_an_unknown_condition() {
+        let err = interpret_select(&Value::UnknownBool, &num(1), &num(2)).unwrap_err();
+        assert!(format!("{}", err).contains("no per-lane value"), "{}", err);
+    }
+
+    #[test]
+    fn equal_values_need_no_combining() {
+        let s = Value::String("x".to_string());
+        assert_eq!(
+            interpret_select(&bools(&[true, false]), &s, &s).unwrap(),
+            s
+        );
+    }
+
+    /// `%` is only modelled for non-negative integers with a positive divisor,
+    /// and `if_convert` deliberately runs arithmetic on lanes that would not
+    /// have reached it - so this has to be an error, not a panic.
+    #[test]
+    fn modulo_out_of_range_is_an_error_not_a_panic() {
+        let err = interpret_binary_op(&num(-2), BinaryOp::Percent, &num(8)).unwrap_err();
+        assert!(format!("{}", err).contains("unsupported operands"), "{}", err);
     }
 }
