@@ -551,4 +551,6 @@
 {"fn":"player.update_21","id":"z016","join":"in_i1_077_and_or_join_619","rule":"if_convert"}
 {"fn":"player.update_21","id":"z017","join":"in_i1_083_and_or_join_619","rule":"if_convert"}
 {"fn":"player.update_21","id":"z018","join":"in_i1_084_and_or_join_619","rule":"if_convert"}
+{"id":"e1","rule":"cse"}
+{"id":"e2","rule":"dce"}
 {"id":"s1","rule":"allocate_slots"}

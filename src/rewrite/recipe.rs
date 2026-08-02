@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use super::program::Program;
 use super::rules::{
-    allocate_slots, dce, fold, if_convert, inline, merge_blocks, promote_capture, promote_cell,
+    allocate_slots, cse, dce, fold, if_convert, inline, merge_blocks, promote_capture, promote_cell,
 };
 use crate::ir::LocalId;
 use super::validate::{validate_function, validate_program};
@@ -42,6 +42,10 @@ pub struct RewriteEntry {
 pub enum Rule {
     /// Remove dead instructions and unreachable blocks.
     Dce,
+    /// One instruction per value within a basic block. A prerequisite for
+    /// promoting object fields, which needs each cell to have a single
+    /// accessor.
+    Cse,
     /// Repack locals so that values with disjoint live ranges share a slot.
     /// Changes no instructions - only where they are stored.
     AllocateSlots,
@@ -94,6 +98,7 @@ impl Rule {
     pub fn name(&self) -> &'static str {
         match self {
             Rule::Dce => "dce",
+            Rule::Cse => "cse",
             Rule::AllocateSlots => "allocate_slots",
             Rule::MergeBlocks => "merge_blocks",
             Rule::Fold => "fold",
@@ -228,6 +233,7 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
 
     let changes = match &entry.rule {
         Rule::Dce => dce::apply(program),
+        Rule::Cse => cse::apply(program),
         Rule::AllocateSlots => allocate_slots::apply(program),
         Rule::MergeBlocks => merge_blocks::apply(program),
         Rule::Fold => fold::apply(program),
@@ -283,6 +289,7 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
     let clock = std::time::Instant::now();
     match &entry.rule {
         Rule::Dce => dce::verify(&before, program),
+        Rule::Cse => cse::verify(&before, program),
         Rule::AllocateSlots => allocate_slots::verify(&before, program),
         Rule::MergeBlocks => merge_blocks::verify(&before, program),
         Rule::Fold => fold::verify(&before, program),

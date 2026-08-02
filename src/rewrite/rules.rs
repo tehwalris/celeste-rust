@@ -26,6 +26,7 @@ use super::program::Program;
 pub mod allocate_slots;
 pub mod if_convert;
 pub mod fold;
+pub mod cse;
 pub mod dce;
 pub mod merge_blocks;
 pub mod inline;
