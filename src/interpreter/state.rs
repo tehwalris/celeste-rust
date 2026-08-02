@@ -196,11 +196,20 @@ impl State {
     /// 1. Visit all reachable heap values from global_env, local_env, outer_local_envs
     /// 2. Assign new HeapIds in the order values are visited
     /// 3. Create a compacted heap with only reachable values
+    ///
+    /// Uninitialized cells are preserved as uninitialized. `Instruction::Alloc`
+    /// creates a slot with no `HeapValue` in it, and nothing stores to it until
+    /// the corresponding `Store` runs - so at most program points there are live
+    /// pointers to cells that have no value yet (`local x` with no initializer
+    /// never gets one at all). Such a cell has no observable content, but its
+    /// identity matters: a later `Store` through that pointer must still work.
     pub fn gc(&mut self) {
         let _trace = TraceSpan::new("gc", "gc");
 
         let mut old_to_new: FxHashMap<HeapId, HeapId> = FxHashMap::default();
-        let mut new_heap_values: Vec<HeapValue> = Vec::new();
+        // `None` means the slot is allocated but holds no value. Also used as
+        // the placeholder while recursing, so cycles terminate.
+        let mut new_heap_values: Vec<Option<HeapValue>> = Vec::new();
 
         // Visit a heap ID, assigning a new ID if not yet visited
         // Returns the new ID
@@ -208,7 +217,7 @@ impl State {
             old_id: HeapId,
             old_heap: &Heap,
             old_to_new: &mut FxHashMap<HeapId, HeapId>,
-            new_heap_values: &mut Vec<HeapValue>,
+            new_heap_values: &mut Vec<Option<HeapValue>>,
         ) -> HeapId {
             if let Some(&new_id) = old_to_new.get(&old_id) {
                 return new_id;
@@ -219,16 +228,21 @@ impl State {
             old_to_new.insert(old_id, new_id);
 
             // Placeholder - will be replaced after recursing
-            new_heap_values.push(HeapValue::UnknownTable);
+            new_heap_values.push(None);
+
+            // An allocated-but-unset cell stays unset in the compacted heap.
+            let Some(old_value) = old_heap.get_opt(old_id) else {
+                return new_id;
+            };
 
             // Get the old value and recurse on references
             // Note: We must clone from heap (FrozenVec doesn't support taking ownership)
-            let new_value = map_heap_value(old_heap.get(old_id).clone(), |ref_id| {
+            let new_value = map_heap_value(old_value.clone(), |ref_id| {
                 visit(ref_id, old_heap, old_to_new, new_heap_values)
             });
 
             // Replace placeholder with actual value
-            new_heap_values[new_id.raw()] = new_value;
+            new_heap_values[new_id.raw()] = Some(new_value);
 
             new_id
         }
@@ -322,7 +336,9 @@ impl State {
         let mut new_heap = Heap::new();
         for value in new_heap_values {
             let id = new_heap.alloc();
-            new_heap.set(id, value);
+            if let Some(value) = value {
+                new_heap.set(id, value);
+            }
         }
 
         // Update state
