@@ -28,6 +28,26 @@ not comparable.
 | + 81 `if_convert`s | 4.40 s / 1.06 GB | - |
 | + stage B finished (`promote_capture`, 84 method inlines) | 4.36 s / 1.06 GB | - |
 | + `cse` (block-local, then cross-block for accessors) | 4.32 s / 1.06 GB | - |
+| + `demote_create` x46, `pin_builtin` x18 | 4.33 s / 1.06 GB | - |
+
+### K, and why it is the number to watch
+
+`measure_k` reports the static size of a fully inlined, fully unrolled frame
+body from sampled concrete runs. It takes 3 seconds and is the only measure
+here that tracks distance to a compilable kernel. Frame time and fragment count
+do not: fragments have been 558 through every rewrite so far, by design.
+
+|  | original | rewritten |
+|---|---|---|
+| dynamic instrs/frame, mean | 2122 | 1715 |
+| dynamic instrs/frame, max | 6422 | 5252 |
+| distinct blocks reached | 450 | 375 |
+| K, fully unrolled | 8321 | 7880 |
+| K, loops kept as loops | 2963 | 4170 |
+
+By instruction kind, rewritten: heap 43.9%, arith 25.8%, terminator 9.5%,
+const 6.7%, global 5.5%, phi 3.7%, guard 3.3%, call 1.6%. `arith`, `const` and
+`select` are the core a compiled kernel emits; the rest has to reach zero.
 
 ### What `cse` cost and bought, in the three variants that were run
 

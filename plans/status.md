@@ -1,6 +1,6 @@
 # Status (2026-08)
 
-Branch `rewrite`. Build is warning-free, 212 tests pass, working tree clean.
+Branch `rewrite`. Build is warning-free, 226 tests pass, working tree clean.
 
 ## Measured, frame 34 (the standard iteration benchmark)
 
@@ -14,6 +14,7 @@ Branch `rewrite`. Build is warning-free, 212 tests pass, working tree clean.
 | + 81 `if_convert`s | 4.40 s | 1.06 GB |
 | + stage B finished (see below) | 4.36 s | 1.06 GB |
 | + `cse`, stage C piece 1 | 4.32 s | 1.06 GB |
+| + `demote_create` x46, `pin_builtin` x18 | 4.33 s | 1.06 GB |
 
 Lane count is identical throughout (92,713), which is the first thing to check
 when a rewrite claims a win. Frame 37 confirms the same ratios at ~13 s. Keep
@@ -52,7 +53,7 @@ But it means **if-conversion should be judged by the state count arriving at the
 frame boundary**, not by the `filter_branch` share, which slot allocation
 already cut from 33% to 13%.
 
-## Stage D landed, and it barely helped
+## Stage D, first round: 81 conversions, 4.6% of splits
 
 `if_convert` works: 81 sites, `Select` in the IR and interpreter, an
 independent verifier, `suggest if-convert` and `screen` to choose sites. Two of
@@ -93,7 +94,7 @@ information fits in one state with twice as many lanes: `Bool(Vector([false; n]
 identical either way; the difference is the number of *states*, and every part
 of the 60% merge cost is per state.
 
-### Tried: make input fan-out expand lanes. It is worse.
+### Tried and reverted: input fan-out as lane expansion
 
 `btn` was rewritten branch-free, with a `__concretize` builtin doubling the lane
 space instead of an `if` splitting the state. Lane content came out
@@ -164,94 +165,179 @@ Two things this stage taught that were not in the plan:
   passed at 20 frames; three failed at 34, at frames 29 and 32. Screen at the
   depth the result will be used at.
 
-## Stage C, in progress - and it is the blocker, not a nicety
+## How progress is measured
 
-`suggest if-convert` reports what stands in the way of stage D:
+Use `measure_k`, not the fragment count.
 
-    # 3 if-convertible join(s)
-    # 155 more triangle(s) blocked by unspeculatable arms:
-    #       89  store
-    #       68  call
-    #       41  assert_closure
-    #       41  get_field create
-    #       13  get_index create
-    #        7  get_global create
-    #        1  alloc
-    #        1  store_empty_table
+`measure_k --sequences 120 --frames 45` runs the concrete interpreter over
+sampled input sequences and reports K, the static size of a fully inlined,
+fully unrolled frame body, broken down by instruction kind. It takes 3 seconds.
 
-Inlining converted each `call` into a body full of stores and creating field
-accesses. Those are unspeculatable for a better reason than the call was: they
-mutate the heap. So removing the calls renamed the obstacle rather than
-removing it, and **stage C is what makes stage D possible at all**.
+    ./target/release/measure_k --sequences 120 --frames 45              # the recipe program
+    ./target/release/measure_k --sequences 120 --frames 45 --original   # the baseline
 
-### The blocker table, read properly
+                              original   rewritten
+    dynamic instrs/frame mean     2122        1715
+    dynamic instrs/frame max      6422        5252
+    distinct blocks reached        450         375
+    K, fully unrolled             8321        7880
+    K, loops kept as loops        2963        4170
 
-The histogram used to key on the first word, so `get_field` and `get_field ...
-create` shared a row. Split apart, the answer is not close: **of the 61
-accessors blocking a triangle, all 61 are `create`. Not one is a plain read.**
+The last row rises because inlining duplicates code statically. The row above
+it is the one that matters for a branch-free kernel.
 
-That kills a plan. No amount of read CSE can unblock a triangle, because no
-triangle is blocked by a read - which was measured directly, not reasoned
-about: cross-block `cse` left the table above **byte-identical**.
+The breakdown by kind is the work list. `arith`, `const` and `select` are the
+irreducible core a compiled kernel would emit; every other category has to
+reach zero.
 
-It also says the 89 stores and the 61 creates are largely *the same 89-ish
-instructions*. `r.f = v` compiles to `get_field %r.f create` followed by
-`store`, so a field assignment inside an arm shows up once in each row. One
-rule addresses both.
+                original    rewritten
+    heap          48.8%       43.9%     stage C
+    terminator    22.3%        9.5%     if_convert
+    call           3.9%        1.6%     stage B
+    global         5.1%        5.5%
+    phi            5.7%        3.7%
+    guard             -        3.3%     cost of the runtime-checked rules
+    arith          7.6%       25.8%     core
+    const          6.5%        6.7%     core
 
-### 1. `cse` - done, both halves
+Two things this replaces:
 
-Block-local first (3833 folds, 23362 -> 19529 instructions), then across blocks
-by available expressions (a further 456, -> 19073, and 1.5% off the frame).
+* **Fragments per frame cannot move until the end.** It has been 558 through
+  every change in this file. The plan predicts that: fragmentation only drops
+  when the frame is branch-free enough that input fan-out can move to lanes.
+  Judging intermediate work by it produces false discouragement.
+* **Instruction count of the rewritten program is not the metric either.**
+  Cross-block `cse` removed 1454 instructions and made the frame 4% slower, by
+  keeping values live across the blocks in between.
 
-Two things came out of it that matter more than the rule does:
+Both `measure_k` numbers were wrong until 2026-08. It compiled from source and
+never replayed the recipe, so K described a program nobody runs. Pointing it at
+the real program then reported K as 64685, because room-load frames were
+excluded by matching the function name `load_room_60` and the recipe inlines
+that function away. The room is now read from the state instead. Filters keyed
+on names the rewrites are designed to erase will keep breaking this way.
 
-* **Instruction count is not the metric; live state size is.** Reusing a
-  definition from an earlier block keeps it live across everything in between,
-  and merge/gc/dedup/shape-grouping are ~65% of the frame and charged per state
-  per live value. Reusing *everything* across blocks removed 1454 instructions
-  and made the frame 4% **slower** (23 -> 29 live slots in `player.update_21`).
-  Restricting cross-block reuse to heap accessors and loads - and letting
-  arithmetic rematerialise - is both smaller and faster.
-* **`cse` is barrier-bound, not scope-bound.** `player.update_21` has 306
-  accessor barriers and 528 load barriers across 3801 instructions, one every
-  ~12 and ~7 instructions. Going cross-block therefore bought much less than
-  the redundancy count suggested, and going further (better aliasing, finer
-  barriers) would buy little more. The remaining redundancy is fenced by the
-  101 surviving calls and the 185 `create` accessors, not by block boundaries.
+## Stage C, in progress
 
-### 2. Field assignment in an arm -> `select` at the join
+Heap traffic is 43.9% of K and is the largest remaining category. It is also
+what blocks stage D: an `if_convert` arm cannot be speculated if it might
+mutate the heap.
 
-This is now the main event, not `assume_eq`. It addresses 89 + 61 of the 155
-blocked triangles, which is the only thing that moves fragments.
+`suggest if-convert` and `bench --profile` together price the work. The profile
+joins each candidate triangle to whether its branch actually splits the state,
+which matters because 93% of branch executions are uniform across lanes and
+converting a uniform branch is worse than leaving it - the arm stops being
+skipped and runs every time.
 
-Turn an arm's `%c = get_field %r.f create; store %c <- %v` into a `load` before
-the branch, a `select` at the join, and one store after it. Needs the create to
-be discharged - the field must already exist, which is exactly the "is this
-create redundant" question `cse` already half-answers - and a load hoisted
-above the branch, which the rule inserts itself rather than relying on `cse`.
+    triangles           count ever split     splits   % of all
+    convertible            54          6       3072      15.7%
+    blocked               104          4       3523      18.0%
+    all branches            -          -      19573     100.0%
 
-### 3. `assume_eq`
+    state    function             join                        splits  in the way
+    blocked  player.draw_22       if_join_222                   1499  store
+    ready    player.update_21     in_i1_075_and_or_join_603     1356  -
+    blocked  player.update_21     if_join_116                   1052  store
+    ready    player.update_21     in_i1_076_and_or_join_603      768  -
+    blocked  player.update_21     if_join_119                    684  store
+    ready    player.update_21     in_i1_079_and_or_join_603      508  -
+    blocked  player.update_21     if_join_98                     288  store
+    ready    player.update_21     in_i1_080_and_or_join_603       72  -
 
-For pointers that reach one cell by different paths, which CSE cannot see. The
-`foreach` callback gets the object as argument `%2` while the loop also reaches
-it as `objects[i]`; nothing syntactic connects them. Inserts `assert %a == %b`
-and substitutes, converting an aliasing fact into syntactic identity. Sound by
-construction.
+Nearly all splits are concentrated in these few sites plus `btn`, which is the
+search's own input fan-out (2838 x 2, irreducible by rewriting; it becomes lane
+expansion once the frame is otherwise branch-free).
 
-### 4. Whole-function field promotion
+### Done
 
-Unlike an `alloc` cell, a field cell *is* the game state, so it cannot simply be
-deleted: load once where the pointer is first available, work in SSA, store back
-before every `Return`. Inside the frame no heap traffic; at the boundary an
-identical heap.
+* **`cse`, both halves.** Block-local (3833 folds), then across blocks by
+  available expressions. Cross-block reuse is restricted to heap accessors and
+  loads; pure arithmetic stays block-local because keeping it live costs more
+  than recomputing it. `cse` is barrier-bound rather than scope-bound:
+  `player.update_21` has an accessor barrier every ~12 instructions and a load
+  barrier every ~7, so better scope buys little. It unblocked no triangles,
+  because every accessor blocking one is a `create`, and `cse` only folds reads.
+* **`demote_create`.** Turns `get_field %r.f create` into a plain read plus an
+  `assert_pointer`. `create_sites` (under `bench --profile`) measures 45
+  creations in 107554 executions of `get_field ... create` and 0 in 30599 of
+  `get_global ... create`; the creations are object construction. 46 of 48
+  candidate sites hold; the 2 that do not are in `player_spawn.update_24`.
+* **`pin_builtin`.** Turns `call %f(..)` into `call_builtin "max" via %f(..)`,
+  which is the same call after asserting the callee is that builtin.
+  `fixed_env::PURE_BUILTINS` (min, max, abs, flr) is one list used both by
+  registration and by `is_speculatable`, so they cannot drift.
+  `add_pure_builtin` registers one implementation under both signatures. 18
+  sites. This moved blocked triangles from 31.8% of splits to 18.0%.
+* **Asserts are speculatable.** `is_speculatable` now separates instructions
+  that can go wrong silently (stores, allocs, calls, creating accessors - no
+  rollback exists, so these stay refused) from ones that can only go wrong
+  loudly (the asserts). All 35 triangles blocked by nothing but an
+  `assert_closure` survive a 34-frame differential run.
 
-Measured, and less alarming than expected: of 146 field cells written in
-`player.update_21`, **142 are written exactly once** and only 4 need multi-store
-SSA construction with phi insertion. But note this is blocked by the 101
-surviving calls in that function, any of which could reach the cell - so the
-stage B leftovers have to go first, and piece 2 above is the cheaper route to
-the same triangles.
+### Not applied, and why
+
+82 `if_convert` candidates passed screening and were not added to the recipe:
+all of them split zero states. Applying them would run their arms
+unconditionally and save nothing. This is the same misfire as the original 81
+conversions, which were chosen on convertibility alone and made the frame
+slower. Check `bench --profile` before applying an `if_convert`.
+
+### Next: the store in the arm
+
+Four sites, 3523 splits, 18.0%. Turn an arm's `%c = get_field %r.f create;
+store %c <- %v` into a load before the branch, a `select` at the join, and one
+store after it. `demote_create` already handles the `create` half.
+
+### Then: the `and`/`or` ternary
+
+The four `and_or_join_603` sites are `appr` inlined:
+
+    function appr(val,target,amount)
+      return val>target and max(val-amount,target) or min(val+amount,target)
+    end
+
+Converting one triangle at a time fails, because the `and` join combines a bool
+with a number and `Select` carries one type tag per value, not per lane:
+
+    at %1351 = select %1339 ? %1344 : %1339
+    select cannot combine Number(...) and Bool(...) per lane
+
+The mixed value never escapes, though: the `or` join takes it only when it is
+truthy, and truthy means it came from the arm, so it is the number. Converting
+the pair together gives `select %1339 ? %1344 : %1349`, both numbers. That
+needs one static fact - that `%1344` is always truthy - which `pin_builtin`
+supplies, since a numeric `CallBuiltin` returns a Number and every number is
+truthy in Lua.
+
+Lifting the truthiness test above the select is a valid identity
+(`truthy(select(c,a,b)) == select(c,truthy(a),truthy(b))`) but does not apply
+here: all six hot triangles store their phi value, so truthiness is not its only
+use. `interpret_not` also rejects numbers, so `Truthy` would be a new operation.
+
+### Later: `assume_eq`, whole-function field promotion
+
+`assume_eq` handles pointers that reach one cell by different paths, which CSE
+cannot see - the `foreach` callback gets the object as `%2` while the loop also
+reaches it as `objects[i]`. Inserts `assert %a == %b` and substitutes.
+
+Whole-function field promotion loads a field cell once, works in SSA, and
+stores back before every `Return`. 142 of 146 field cells written in
+`player.update_21` are written exactly once. It is blocked by the calls that
+remain in that function, any of which could reach the cell.
+
+## Screening
+
+`rewrite screen --candidates FILE --frames 34` tries candidates by group
+testing: the whole set at once, and on failure split in half and retry each
+half on top of what has been accepted. Roughly `k*log(N/k)` runs for `k` bad out
+of `N`, against `N` before. 38 candidates with 3 bad took 15 runs; 18 candidates
+with 0 bad took 1.
+
+Every acceptance runs the differential on the cumulative program, so the
+accepted set is always one that has actually been run end to end.
+
+Screen at the depth the result will be used at. Failures cluster at frames
+26-32, so a 20-frame screen passes candidates that a 34-frame screen rejects.
 
 ## Keep replay fast
 
