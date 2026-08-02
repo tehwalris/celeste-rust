@@ -1,6 +1,6 @@
 # Status (2026-08)
 
-Branch `rewrite`. Build is warning-free, 226 tests pass, working tree clean.
+Branch `rewrite`. Build is warning-free, 257 tests pass, working tree clean.
 
 ## Measured, frame 34 (the standard iteration benchmark)
 
@@ -17,6 +17,7 @@ Branch `rewrite`. Build is warning-free, 226 tests pass, working tree clean.
 | + `demote_create` x46, `pin_builtin` x18 | 4.33 s | 1.06 GB |
 | + 4 store-blocked triangles converted | 3.36 s | 0.94 GB |
 | + 4 `convert_ternary` (the `appr` pairs) | 2.62 s | 0.81 GB |
+| + `decompose_truthy` x15, 3 more conversions | 2.36 s | 0.74 GB |
 
 Lane count is identical throughout (92,713), which is the first thing to check
 when a rewrite claims a win. Frame 37 confirms the same ratios (7.87 s, from
@@ -180,11 +181,11 @@ fully unrolled frame body, broken down by instruction kind. It takes 3 seconds.
     ./target/release/measure_k --sequences 120 --frames 45 --original   # the baseline
 
                               original   rewritten
-    dynamic instrs/frame mean     2122        1715
-    dynamic instrs/frame max      6422        5252
-    distinct blocks reached        450         375
-    K, fully unrolled             8321        7880
-    K, loops kept as loops        2963        4170
+    dynamic instrs/frame mean     2122        1731
+    dynamic instrs/frame max      6422        5283
+    distinct blocks reached        450         359
+    K, fully unrolled             8321        7874
+    K, loops kept as loops        2963        4164
 
 The last row rises because inlining duplicates code statically. The row above
 it is the one that matters for a branch-free kernel.
@@ -239,20 +240,20 @@ converting a uniform branch is worse than leaving it - the arm stops being
 skipped and runs every time.
 
     triangles           count ever split     splits   % of all
-    convertible            46          2        346       4.1%
+    convertible            42          0          0       0.0%
     blocked               100          0          0       0.0%
-    all branches            -          -       8472     100.0%
+    all branches            -          -       7802     100.0%
 
-The four store-blocked sites that used to head this table
-(`player.draw_22 if_join_222`, `player.update_21 if_join_98/116/119`; 3523
-splits, 18.0%) and the four `appr` ternary pairs (2416 splits) are converted -
-see "Done" below. What still splits is no longer triangle-shaped:
+**Every triangle and every `and`/`or` construct in the program is now
+silent.** The four store-blocked sites (3523 splits), the four `appr` ternary
+pairs (2416), and the two ternary variants plus everything they exposed (546)
+are all converted - see "Done" below. What still splits:
 
     site                                          splits   what it is
-    in_j2_042/046/050/052_if_join_10 (btn x4)       3362   input fan-out
-    if_join_95, if_join_133, if_join_136, ...       ~3700  diamonds and chains
-    anonymous_61 if_join_413, for_head_487           ~660  object loop
-    and_or_join_199, in_i1_077_and_or_join_611       346   ternary variants
+    in_j2_042/046/050/052_if_join_10 (btn x4)       3176   input fan-out
+    if_join_95, if_join_133, if_join_136, ...       ~3400  diamonds and chains
+    anonymous_61/update_21 if_join_413, for_heads    ~920  object loop bodies
+    (in_k03x sites are the same loop body inlined)
 
 `btn` is the search's own input fan-out (down from 2838 x 2 because fewer
 states reach it; irreducible by rewriting, it becomes lane expansion once the
@@ -318,6 +319,26 @@ shape work.
   in `player.update_21` that actually split (2416 splits); four more matching
   pairs split zero states and were not applied. Frame 34: 3.36 s -> 2.62 s,
   fragments 335 -> 232, splits 11978 -> 8472, K down 12.
+* **`decompose_truthy`.** The design sketched below, built. Every value in a
+  mixed `and`/`or` cascade splits into a (truthiness, value) pair of
+  homogeneous selects - `c and y` becomes t = c, n = y (the select is
+  *deleted*); `x or z` becomes two selects over the children's pairs; a phi
+  splits into a t-phi and an n-phi, with a bool edge accepted only when the
+  predecessor provably branches to the phi on that bool's false side (then a
+  minted dead zero keeps the n-phi well-typed). The root must be `x or k`
+  with `k` statically truthy: the cascade can then never be falsy, so the
+  root keeps its id and consumers are untouched. All 15 cascades in the
+  program (every inlined `sign()`, `flip.x and -1 or 1`, and friends)
+  screened clean in one 34-frame run, defusing every mixed-select mine at
+  once. That let plain `if_convert` take the two triangles the tail variant
+  had failed on - and when removing the `sign` split at `in_i1_077` exposed
+  the downstream `appr` pair (its 144 splits moved one block down, to a
+  branch that used to run uniform), `convert_ternary` took that too. The
+  exposure cascade then went quiet: zero triangle splits remain. Frame 34:
+  2.62 s -> 2.36 s, fragments 232 -> 212, splits 8472 -> 7802, K 7879 ->
+  7874. The unapplied tail shape of `convert_ternary` is subsumed and was
+  removed (recoverable from git if a cascade without an always-truthy root
+  ever appears).
 
 ### Not applied, and why
 
@@ -329,44 +350,23 @@ slower. Check `bench --profile` before applying an `if_convert`.
 
 ### Next: the splitters that are not triangles
 
-The non-`btn` remainder is ~4700 splits across a dozen sites in
-`player.update_21` and the object loop, none of them the triangle shape the
-current rules recognise. Price them with `bench --profile` and look at each
-shape before writing anything: some are diamonds (both sides do work), some
-are if/elseif chains, and `for_head_487` is a loop header, which no select can
-absorb.
-
-The two refused ternary variants (`and_or_join_199` 202 splits,
-`in_i1_077_and_or_join_611` 144) are half solved. Their `or`-half was already
-converted by one of the 81 early `if_convert`s, leaving a triangle whose
-mixed phi feeds an existing `select %p ? %p : %q`; `convert_ternary` now has
-a *tail* shape for exactly that (implemented, 10 tests), and
-`statically_truthy` accepts arithmetic results (Numbers or loud failure,
-never falsy). Both sites still fail screening, though, and the failure is
-instructive: each cascade contains *another* mixed select from the early
-conversions (`%1390 = select %1384 ? %1381 : %1384`, `%1549` likewise) that
-only executes cleanly because the branch being removed splits the state
-first, keeping its condition uniform per lane. Remove the split and the old
-mixed select must combine a Bool with a Number for real.
-
-So these cascades need folding at the *select level, chain-wide*, before or
-together with removing the split. The design that eliminates mixed values
-entirely: decompose each and/or intermediate into a (truthiness, value) pair
-of homogeneous selects -
-
-    c and y  (y truthy)  ->  t = c,                       n = y
-    x or z               ->  t = select t_x ? t_x : t_z,  n = select t_x ? n_x : n_z
-    plain value k        ->  t = true-const,              n = k
-
-with only the final consumer reading `n`. Every select is then Bool/Bool or
-Number/Number; the mixed forms (`select c ? y : c`, `select x ? x : z`)
-never exist. This subsumes the tail shape and is the next rule to build. It
-also retires a latent hazard: every early-converted `and` in the program is
-a mine that any future split-removal can step on.
+The non-`btn` remainder is ~4300 splits across a dozen sites in
+`player.update_21` and the object loop, none of them a shape the current
+rules recognise. Price them with `bench --profile` and look at each shape
+before writing anything: some are diamonds (both sides do work), some are
+if/elseif chains, and the `for_head` sites are loop headers, which no select
+can absorb.
 
 A diamond needs either a two-arm `if_convert` (both arms speculatable, selects
 at the join) or a store-sinking variant with two provenances. Same soundness
 building blocks as the triangle rules; new shape recognisers.
+
+Expect the exposure cascade seen with `decompose_truthy`: removing a split
+un-hides work downstream, because lanes that used to arrive pre-sorted now
+arrive mixed, so branches that ran uniform start splitting for real. After
+each conversion, re-run `bench --profile` and check whether a previously
+quiet site has woken up - it may be a shape an existing rule already takes,
+as `in_i1_078` was.
 
 ### Later: `assume_eq`, whole-function field promotion
 

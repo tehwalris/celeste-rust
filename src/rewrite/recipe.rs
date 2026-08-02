@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use super::program::Program;
 use super::rules::{
-    allocate_slots, convert_ternary, cse, dce, demote_create, fold, if_convert, inline,
-    merge_blocks, pin_builtin, promote_capture, promote_cell, sink_store, speculate,
+    allocate_slots, convert_ternary, cse, dce, decompose_truthy, demote_create, fold, if_convert,
+    inline, merge_blocks, pin_builtin, promote_capture, promote_cell, sink_store, speculate,
 };
 use crate::ir::LocalId;
 use super::validate::{validate_function, validate_program};
@@ -118,6 +118,16 @@ pub enum Rule {
         /// The outer (`or`) join block.
         join: String,
     },
+    /// Split a mixed `and`/`or` select cascade into (truthiness, value) pairs
+    /// of homogeneous selects, so no select ever combines a Bool with a
+    /// Number. Requires the cascade's root to be `x or k` with `k` statically
+    /// truthy; the root keeps its id, every interior id dies.
+    DecomposeTruthy {
+        #[serde(rename = "fn")]
+        function: String,
+        /// The cascade's root select, as `%N`.
+        root: String,
+    },
     /// Hoist a triangle arm's speculatable instructions into the head, leaving
     /// only its stores behind - the state `sink_store` needs. Refused unless
     /// every hoist commutes with every store it crosses.
@@ -160,6 +170,7 @@ impl Rule {
             Rule::PinBuiltin { .. } => "pin_builtin",
             Rule::DemoteCreate { .. } => "demote_create",
             Rule::ConvertTernary { .. } => "convert_ternary",
+            Rule::DecomposeTruthy { .. } => "decompose_truthy",
             Rule::Speculate { .. } => "speculate",
             Rule::SinkStore { .. } => "sink_store",
             Rule::PromoteCell { .. } => "promote_cell",
@@ -317,6 +328,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::ConvertTernary { function, join } => {
             convert_ternary::apply(program, function, join)
         }
+        Rule::DecomposeTruthy { function, root } => {
+            decompose_truthy::apply(program, function, parse_cell(root)?)
+        }
         Rule::Speculate { function, join } => speculate::apply(program, function, join),
         Rule::SinkStore { function, at } => {
             sink_store::apply(program, function, parse_cell(at)?)
@@ -387,6 +401,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         }
         Rule::ConvertTernary { function, join } => {
             convert_ternary::verify(&before, program, function, join)
+        }
+        Rule::DecomposeTruthy { function, root } => {
+            decompose_truthy::verify(&before, program, function, parse_cell(root)?)
         }
         Rule::Speculate { function, join } => {
             speculate::verify(&before, program, function, join)

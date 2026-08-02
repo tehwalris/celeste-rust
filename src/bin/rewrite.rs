@@ -62,8 +62,8 @@ enum Command {
     /// it. Pipe it into the recipe and re-run `build`.
     Suggest {
         /// What to look for: "promote-cell", "promote-capture", "inline",
-        /// "if-convert", "demote-create", "pin-builtin", "convert-ternary", "speculate" or
-        /// "sink-store".
+        /// "if-convert", "demote-create", "pin-builtin", "convert-ternary",
+        /// "decompose-truthy", "speculate" or "sink-store".
         #[arg(default_value = "promote-cell")]
         what: String,
         /// Prefix for the generated ids.
@@ -677,6 +677,29 @@ fn main() -> Result<()> {
                     );
                     eprintln!(
                         "# Apply only where the pair actually splits - see bench --profile."
+                    );
+                }
+                "decompose-truthy" => {
+                    let candidates =
+                        celeste_rust::rewrite::rules::decompose_truthy::candidates(&program);
+                    for (i, (function, root)) in candidates.iter().enumerate() {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "id": format!("{}{:03}", prefix, i),
+                                "rule": "decompose_truthy",
+                                "fn": function,
+                                "root": format!("%{}", usize::from(*root)),
+                            })
+                        );
+                    }
+                    eprintln!(
+                        "# {} always-truthy and/or cascade(s), mixed selects and all.",
+                        candidates.len()
+                    );
+                    eprintln!(
+                        "# Free on select-only chains; phi chains pay off once the \
+                         triangle is if-converted."
                     );
                 }
                 "speculate" => {

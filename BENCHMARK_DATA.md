@@ -31,12 +31,15 @@ not comparable.
 | + `demote_create` x46, `pin_builtin` x18 | 4.33 s / 1.06 GB | - |
 | + 4 store-blocked triangles converted (`speculate`, `sink_store`, `if_convert`) | 3.36 s / 0.94 GB | 9.22 s / 3.11 GB |
 | + 4 `convert_ternary` (the `appr` pairs) | 2.62 s / 0.81 GB | 7.87 s / 2.83 GB |
+| + `decompose_truthy` x15, `if_convert` x2, `convert_ternary` x1 | 2.36 s / 0.74 GB | - |
 
 The store-triangle row is the first change that moved the fragment count: 558
 -> 335 mean fragments per frame at frame 34, split executions 19573 -> 11978.
-The ternary row continues it: 335 -> 232, splits -> 8472. Lane count identical
-throughout (92,713). See "Which branches actually split" below for why these
-eight sites paid when 81 earlier conversions did not.
+The ternary row continues it: 335 -> 232, splits -> 8472; the decompose row
+finishes the family: 232 -> 212, splits -> 7802, and **no triangle or
+`and`/`or` construct anywhere in the program splits any more**. Lane count
+identical throughout (92,713). See "Which branches actually split" below for
+why these sites paid when 81 earlier conversions did not.
 
 ### K, and why it is the number to watch
 
@@ -47,13 +50,13 @@ here that tracks distance to a compilable kernel.
 |  | original | rewritten |
 |---|---|---|
 | dynamic instrs/frame, mean | 2122 | 1731 |
-| dynamic instrs/frame, max | 6422 | 5285 |
-| distinct blocks reached | 450 | 363 |
-| K, fully unrolled | 8321 | 7879 |
-| K, loops kept as loops | 2963 | 4169 |
+| dynamic instrs/frame, max | 6422 | 5283 |
+| distinct blocks reached | 450 | 359 |
+| K, fully unrolled | 8321 | 7874 |
+| K, loops kept as loops | 2963 | 4164 |
 
-By instruction kind, rewritten: heap 43.9%, arith 25.9%, terminator 9.3%,
-const 6.7%, global 5.5%, phi 3.6%, guard 3.4%, call 1.6%. `arith`, `const` and
+By instruction kind, rewritten: heap 44.0%, arith 25.9%, terminator 9.3%,
+const 6.8%, global 5.5%, phi 3.5%, guard 3.4%, call 1.6%. `arith`, `const` and
 `select` are the core a compiled kernel emits; the rest has to reach zero.
 
 K and the frame time move independently, and the store-triangle conversions
@@ -200,6 +203,27 @@ input fan-out), diamonds and chains in `player.update_21` (`if_join_95` 1056,
 `if_join_133` 838, `if_join_136` 581, `if_condition_92` 576, `if_join_108`
 480), the object loop in `anonymous_61` (~660), and two ternary variants
 `convert_ternary`'s strict shape check refused (346).
+
+**Update, after `decompose_truthy` x15 defused every mixed-select cascade and
+`if_convert`/`convert_ternary` took the two refused variants plus the `appr`
+pair that removing them exposed:**
+
+    branches: 7802 of 121074 executions split the state, across 26 distinct sites
+
+Zero splits remain from triangles or `and`/`or` constructs - the profiler's
+triangle table reads 0 across the board for the first time. The remainder:
+
+| family | splits | what it is |
+|---|---|---|
+| `btn` x4 (`in_j2_042/046/050/052`) | 3176 | input fan-out |
+| `if_join_95/133/136`, `if_condition_92`, `if_join_108` | ~3400 | diamonds and chains |
+| `if_join_413` x3, `for_head`s (object loop bodies) | ~920 | loop + method shapes |
+
+One dynamic worth recording: removing the `sign()` split at `in_i1_077` made
+the *downstream* `appr` pair at `in_i1_078` start splitting (144, previously
+0 - its condition used to arrive pre-sorted into per-state-uniform lanes).
+It was `ready` in the triangle table and one `convert_ternary` entry took it.
+Removing splits un-hides downstream splits; re-profile after every batch.
 
 ### Input fan-out: lane expansion is worse than state duplication (2026-08)
 

@@ -29,6 +29,7 @@ pub mod if_convert;
 pub mod fold;
 pub mod cse;
 pub mod dce;
+pub mod decompose_truthy;
 pub mod demote_create;
 pub mod merge_blocks;
 pub mod pin_builtin;
