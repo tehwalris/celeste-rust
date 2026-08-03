@@ -55,6 +55,7 @@ pub mod split_call;
 pub mod speculate_region;
 pub mod unroll_loop;
 pub mod widen_buttons;
+pub mod widen_rem;
 
 /// Applies `f` to every function in the program, returning how many changes
 /// were made in total.

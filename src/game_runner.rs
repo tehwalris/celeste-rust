@@ -85,6 +85,52 @@ fn builtin_new_unknown_boolean(state: State, args: Vec<Value>) -> Result<Vec<(St
     Ok(vec![(state, Value::UnknownBool)])
 }
 
+/// `__widen_rem(v)`: assert `v` lies in the player-rem interval `[-0.5, 0.5)`
+/// and return that whole interval, as a scalar (equal across lanes - that is
+/// the point: a widened rem column stops distinguishing rows). This is
+/// `make_state_abstract`'s rem widening exposed to the program, so a rewrite
+/// can schedule the abstraction before the frame boundary. The containment
+/// check is the runtime guard for a misplaced insertion.
+fn builtin_widen_rem(state: State, args: Vec<Value>) -> Result<Vec<(State, Value)>> {
+    if args.len() != 1 {
+        return Err(anyhow!("__widen_rem requires 1 argument"));
+    }
+    let half = Pico8Num::from_parts(0, 0x8000);
+    let wide = Pico8NumInterval::new(-half, half.next_smallest());
+    let check_number = |n: &Pico8Num| -> Result<()> {
+        if wide.contains_number(*n) {
+            Ok(())
+        } else {
+            Err(anyhow!("__widen_rem: value {:?} is not in [-0.5, 0.5)", n))
+        }
+    };
+    let check_interval = |i: &Pico8NumInterval| -> Result<()> {
+        if wide.contains_interval(i) {
+            Ok(())
+        } else {
+            Err(anyhow!("__widen_rem: interval {:?} is not in [-0.5, 0.5)", i))
+        }
+    };
+    match &args[0] {
+        Value::Number(MaybeVector::Scalar(n)) => check_number(n)?,
+        Value::Number(MaybeVector::Vector(nums)) => {
+            for n in nums.iter() {
+                check_number(n)?;
+            }
+        }
+        Value::NumberInterval(MaybeVector::Scalar(i)) => check_interval(i)?,
+        Value::NumberInterval(MaybeVector::Vector(intervals)) => {
+            for i in intervals.iter() {
+                check_interval(i)?;
+            }
+        }
+        other => {
+            return Err(anyhow!("__widen_rem: expected a number, got {:?}", other));
+        }
+    }
+    Ok(vec![(state, Value::NumberInterval(MaybeVector::Scalar(wide)))])
+}
+
 fn builtin_new_vector(mut state: State, args: Vec<Value>) -> Result<Vec<(State, Value)>> {
     if args.len() != 1 {
         return Err(anyhow!("__new_vector requires 1 argument"));
@@ -541,6 +587,7 @@ pub fn create_fixed_env_with_builtins() -> FixedEnv {
     let mut fixed_env = FixedEnv::new();
     fixed_env.add_builtin("__print", builtin_print);
     fixed_env.add_builtin("__new_unknown_boolean", builtin_new_unknown_boolean);
+    fixed_env.add_builtin("__widen_rem", builtin_widen_rem);
     fixed_env.add_builtin("__new_vector", builtin_new_vector);
     fixed_env.add_builtin("__array_table_drop_last", builtin_array_table_drop_last);
     fixed_env.add_builtin("error", builtin_error);

@@ -25,7 +25,7 @@ use super::rules::{
     mask_loop, merge_blocks,
     pin_builtin,
     promote_capture,
-    promote_cell, sink_store, speculate, speculate_region, split_call, unroll_loop, widen_buttons,
+    promote_cell, sink_store, speculate, speculate_region, split_call, unroll_loop, widen_buttons, widen_rem,
 };
 use crate::ir::LocalId;
 use super::validate::{validate_function, validate_program};
@@ -413,6 +413,20 @@ pub enum Rule {
         /// The block whose head widens the cells.
         block: String,
     },
+    /// Insert `make_state_abstract`'s rem widening at the head of a block:
+    /// `player.rem.x/.y` each pass through the `__widen_rem` builtin (assert
+    /// containment in [-0.5, 0.5), return the whole interval) and store
+    /// back. Sound only where rem is dead (inside the update body - `move`
+    /// runs before `type.update` and is rem's only reader). Claimed, not
+    /// proven; screened.
+    WidenRem {
+        #[serde(rename = "fn")]
+        function: String,
+        /// The block whose head widens rem.
+        block: String,
+        /// The player instance (the update body's `this`), as `%N`.
+        object: String,
+    },
 }
 
 impl Rule {
@@ -448,6 +462,7 @@ impl Rule {
             Rule::DedupGuards => "dedup_guards",
             Rule::AddHint { .. } => "add_hint",
             Rule::WidenButtons { .. } => "widen_buttons",
+            Rule::WidenRem { .. } => "widen_rem",
             Rule::AssumeEq { .. } => "assume_eq",
             Rule::SplitCall { .. } => "split_call",
         }
@@ -660,6 +675,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::DedupGuards => dedup_guards::apply(program),
         Rule::AddHint { function, block } => add_hint::apply(program, function, block),
         Rule::WidenButtons { function, block } => widen_buttons::apply(program, function, block),
+        Rule::WidenRem { function, block, object } => {
+            widen_rem::apply(program, function, block, parse_cell(object)?)
+        }
         Rule::AssumeEq { function, a, b } => {
             assume_eq::apply(program, function, parse_cell(a)?, parse_cell(b)?)
         }
@@ -789,6 +807,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::AddHint { function, block } => add_hint::verify(&before, program, function, block),
         Rule::WidenButtons { function, block } => {
             widen_buttons::verify(&before, program, function, block)
+        }
+        Rule::WidenRem { function, block, object } => {
+            widen_rem::verify(&before, program, function, block, parse_cell(object)?)
         }
         Rule::AssumeEq { function, a, b } => {
             assume_eq::verify(&before, program, function, parse_cell(a)?, parse_cell(b)?)

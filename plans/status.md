@@ -1224,14 +1224,42 @@ after the widen would re-split on a fresh unknown and diverge).
 **The lesson**: the frame-boundary merge is cheap *because it
 coincides with all the widenings* - buttons and rem dead/abstracted at
 the same point is what makes 89% of rows collapse. An early merge only
-pays if *every* widening moves with it. The missing piece is a
-`widen_rem` (apply `make_state_abstract`'s rem interval at
-`if_join_103`, where rem is dead until next frame's `move`) - that
-would make the mid-frame merge the boundary merge, scheduled before
-the update tail and draw run, and the boundary a no-op. Needs an
-interval-producing builtin (`__widen_rem(v)`: assert containment,
-return the [-0.5, 0.5) interval) and care that `make_state_abstract`
-tolerates an already-widened rem. Sketched, not built.
+pays if *every* widening moves with it.
+
+3. **Widen buttons + rem + hint** (`widen_rem` built: the
+   `__widen_rem` builtin applies `make_state_abstract`'s rem interval
+   with the same containment assert - `make_state_abstract` already
+   tolerates an interval input - and the rule inserts it for
+   `%obj.rem.x/.y` at a block head; note the `player` *global* is the
+   type table, the instance must be named as `%N`): fragments **61
+   total / 4 max**, `merge_frame_boundary` collapses 0.38 -> 0.05 s,
+   removal back to 85% - the mid-frame merge fully replaces the
+   boundary one, exactly as designed - and time is **+33%**
+   (1.15-1.18 s vs 0.88). Down from +110%, but still a loss.
+
+The residual +0.28 s is entirely accounted for by row-key width: the
+mid-frame key has **24.5 columns vs the boundary's 17**, because the
+update body's live vector locals (`input`, `v_input`, `on_ground`,
+...) join the key - dedup hashes +47% more elements (144M vs 97M),
+state clones cost 683 vs 410 ns/cell, `union_diff_states` widens too.
+Placing the hint at the update's end (`in_h061_cont`) does not help:
+dead locals are not dropped from `local_env` eagerly, so the key stays
+wide. Two interpreter-level fixes would close the gap, and both help
+the *base* configuration too:
+
+* **liveness-pruned merges**: have the hint accumulator drop locals
+  dead at the block (the compile-time `liveness` module knows) before
+  vectorizing - the mid-frame key shrinks to ~the boundary's 17.
+* **skip no-op dedups**: `dedup_vectorized_state` re-hashes every
+  state at every merge point even when it is the untouched output of
+  a previous dedup. In the base recipe the two pre-update hints re-hash
+  ~2 full populations per frame for nothing - roughly *half* of base's
+  0.29 s dedup span. This is the largest known pure-implementation win
+  (~0.14 s at 34) and it stands on its own, hints or no hints.
+
+All three experiment variants differentially identical through 34;
+recipe unchanged (regressions do not land). The rules (`add_hint`,
+`widen_buttons`, `widen_rem`) and the `__widen_rem` builtin are kept.
 
 ### Later: `assume_eq`, whole-function field promotion
 
