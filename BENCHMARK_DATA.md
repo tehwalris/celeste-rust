@@ -511,6 +511,41 @@ the two K bounds nearly converged (3047 loops-kept vs 3110) - **the hot
 path is now essentially loop-free**; what remains rolled is cold or in
 `__main`'s per-frame input handling.
 
+### The dash package re-measured; its expansion-free remainder landed (2026-08-03)
+
+The dash package (`plans/dash-package.jsonl`) re-derived cleanly against
+the fused frame - the suggester found all eight concretization diamonds,
+and the stage-C nest survived the inline byte-for-byte modulo
+renumbering. The bet was that the 2026-06 revert's stated blocker
+(expanded lanes feeding rolled loops and real branches) was gone now
+that downstream is straight-line selects. **The bet lost, at the same
+relative magnitude as before**: interleaved A/B at 34, 5 pairs,
+
+* time 0.88-0.90 -> 1.04-1.08 s (**+19%**), memory 0.47 -> 0.65 GB
+  (**+38%**), lanes identical, fragments/frame 527 -> 383
+
+`bench --profile` now says precisely why. `expand:expand_lanes` is 9.6%
+of wall on its own (144 executions - **expanding duplicates every heap
+cell of the state**, all ~279 of them, not just the button-dependent
+few), `cfg:anonymous_61` self time rises 0.20 -> 0.26 s from
+doubled-width vectors downstream, and the state machinery gives back
+only ~0.02 s of `filter_branch` - because it still runs, fragments or
+no. Partial lane expansion pays the full lane tax while the ~50% merge
+machinery keeps its state count. This bounds the endgame: there is no
+monotone path of individually-landable expansion stages; btn expansion
+has to be judged as one jump (all sites plus all consumers, machinery
+actually collapsing), and `expand` itself likely needs to get cheaper
+(copy-on-write lanes, or expanding only reachable-from-button cells).
+
+The expansion-free remainder of the package **did** land: the
+dash-direction nest (two inner diamonds, the outer diamond, three tail
+triangles, nine dash-gate `create` demotes) flattens with plain
+speculate/absorb into select-stores, no `expand` involved. Time and
+memory neutral at 34 and 37 (interleaved, lanes identical), and K drops
+3110 -> **3060** with reached (function, block) pairs 129 -> 115 - the
+`dedup_guards` pattern: a free K win, landed for the compiled kernel's
+sake. Differentially identical through 37.
+
 ## Where the time goes
 
 `rewrite bench --frames 34 --profile`, on the current recipe. Self time, so the

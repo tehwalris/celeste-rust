@@ -1109,6 +1109,39 @@ endgame is what collapses state count.
   precondition the 2026-06 revert identified. The prize is the ~65%
   the state machinery costs at ~530 fragments/frame.
 
+## Stage R: the dash package re-measured; the expansion economics are now understood (2026-08-03)
+
+Task #45 executed. The package re-derived cleanly on the fused frame
+(the suggester found every diamond; stage C's labels and shapes survived
+the inline byte-for-byte), was differentially identical through 37 - and
+**re-measured +19% time / +38% memory at 34**, the same relative
+regression as the 2026-06 attempt. The straight-line-selects
+precondition was real but not sufficient. The profiler explains it:
+
+* `expand:expand_lanes` alone is 9.6% of wall - expanding duplicates
+  *every* heap cell of the state (~279), not just the few that will
+  ever depend on the button;
+* downstream `anonymous_61` vector ops widen 2x (+0.06 s);
+* the state machinery refunds ~0.02 s of `filter_branch`, because
+  fragments dropped (527 -> 383/frame) but states did not collapse -
+  `dedup_state`/`merge_groups` still run at full state count.
+
+**Consequence for the endgame**: partial lane expansion is strictly
+worse than splitting - it pays the lane tax while the machinery keeps
+running. There is no monotone path of individually-landed expansion
+stages to "one straight-line kernel per frame". Task #47 must be judged
+as a single jump (every btn site expanded, every consumer converted,
+machinery share actually collapsing), and probably wants `expand` made
+cheap first: copy-on-write lane duplication, or expansion limited to
+cells reachable from the button. Updated `plans/dash-package.jsonl`
+records the fused-frame derivation and both measurements.
+
+What did land from the package: its expansion-free remainder. The
+dash-direction nest (inner diamonds A/B, outer diamond, three tail
+triangles, nine dash-gate `create` demotes, entries m010-m050) flattens
+into select-stores with no `expand`. Time/memory neutral at 34 and 37,
+K 3110 -> **3060**, reached blocks 129 -> 115.
+
 ### Later: `assume_eq`, whole-function field promotion
 
 `assume_eq` handles pointers that reach one cell by different paths, which CSE
