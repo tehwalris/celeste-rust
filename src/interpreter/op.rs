@@ -103,7 +103,7 @@ pub fn interpret_select(condition: &Value, if_true: &Value, if_false: &Value) ->
         return Ok(if_true.clone());
     }
 
-    fn pick<T: std::fmt::Debug + Clone + PartialEq + Eq>(
+    fn pick<T: std::fmt::Debug + Clone + PartialEq + Eq + Send + Sync>(
         mask: &MaybeVector<bool>,
         a: &MaybeVector<T>,
         b: &MaybeVector<T>,
@@ -115,12 +115,22 @@ pub fn interpret_select(condition: &Value, if_true: &Value, if_false: &Value) ->
             MaybeVector::Scalar(s) => s.clone(),
             MaybeVector::Vector(v) => v[i].clone(),
         };
-        MaybeVector::vector(
-            mask.iter()
-                .enumerate()
-                .map(|(i, take_true)| if *take_true { at(a, i) } else { at(b, i) })
-                .collect(),
-        )
+        if mask.len() < crate::interpreter::value::PAR_LANES_THRESHOLD {
+            MaybeVector::vector(
+                mask.iter()
+                    .enumerate()
+                    .map(|(i, take_true)| if *take_true { at(a, i) } else { at(b, i) })
+                    .collect(),
+            )
+        } else {
+            MaybeVector::vector(crate::interpreter::value::par_concat(mask.len(), |r| {
+                mask[r.clone()]
+                    .iter()
+                    .zip(r)
+                    .map(|(take_true, i)| if *take_true { at(a, i) } else { at(b, i) })
+                    .collect()
+            }))
+        }
     }
 
     match (if_true, if_false) {
@@ -239,16 +249,19 @@ pub fn interpret_binary_op(l: &Value, op: BinaryOp, r: &Value) -> Result<Value> 
         (Value::Number(l), BinaryOp::Percent, Value::Number(r)) => {
             // Reported rather than panicked: whether the operands are in range
             // depends on the values flowing through the program.
-            let bad = std::cell::Cell::new(None);
+            let bad = std::sync::Mutex::new(None);
             let result = MaybeVector::map2(l, r, |l, r| {
                 l.checked_rem(*r).unwrap_or_else(|| {
-                    if bad.get().is_none() {
-                        bad.set(Some((*l, *r)));
+                    // Failure path only - the success path never locks.
+                    let mut bad = bad.lock().unwrap();
+                    if bad.is_none() {
+                        *bad = Some((*l, *r));
                     }
                     Pico8Num::from_i16(0)
                 })
             });
-            match bad.get() {
+            let bad = *bad.lock().unwrap();
+            match bad {
                 None => Ok(Value::Number(result)),
                 Some((l, r)) => Err(anyhow!(
                     "unsupported operands for %: {:?} % {:?} (this implementation \

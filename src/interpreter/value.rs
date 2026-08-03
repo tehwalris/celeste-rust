@@ -37,49 +37,116 @@ impl<T: std::fmt::Debug + Clone + PartialEq + Eq> PartialEq for MaybeVector<T> {
 
 impl<T: std::fmt::Debug + Clone + PartialEq + Eq> Eq for MaybeVector<T> {}
 
-impl<T: std::fmt::Debug + Clone + PartialEq + Eq> MaybeVector<T> {
+/// Lane counts below this run per-lane loops sequentially; above it, the
+/// loop splits across threads. Deep frames run millions of lanes, where a
+/// single vector op costs milliseconds single-threaded.
+pub(crate) const PAR_LANES_THRESHOLD: usize = 1 << 17;
+
+/// Build an `n`-element vector from per-chunk builders, in parallel above
+/// the lane threshold - via the persistent lane pool, because this runs per
+/// vector *instruction* and cannot afford thread spawns. Chunks are
+/// concatenated in order, so the result is identical to the sequential
+/// build.
+pub(crate) fn par_concat<T: Send>(
+    n: usize,
+    f: impl Fn(std::ops::Range<usize>) -> Vec<T> + Sync,
+) -> Vec<T> {
+    let threads = super::par_pool::pool_threads();
+    if n < PAR_LANES_THRESHOLD || threads == 1 {
+        return f(0..n);
+    }
+    let chunk = n.div_ceil(threads);
+    let parts: Vec<std::sync::Mutex<Option<Vec<T>>>> =
+        (0..threads).map(|_| std::sync::Mutex::new(None)).collect();
+    super::par_pool::run(threads, &|t| {
+        let start = t * chunk;
+        let end = ((t + 1) * chunk).min(n);
+        *parts[t].lock().unwrap() = Some(f(start..end));
+    });
+    let mut out = Vec::with_capacity(n);
+    for part in parts {
+        out.extend(part.into_inner().unwrap().expect("chunk ran"));
+    }
+    out
+}
+
+impl<T: std::fmt::Debug + Clone + PartialEq + Eq + Send + Sync> MaybeVector<T> {
     /// A vector value from freshly-built lanes.
     pub fn vector(lanes: Vec<T>) -> Self {
         MaybeVector::Vector(std::sync::Arc::new(lanes))
     }
-    pub fn map(&self, f: impl Fn(&T) -> T) -> Self {
+    pub fn map(&self, f: impl Fn(&T) -> T + Sync) -> Self {
         match self {
             MaybeVector::Scalar(v) => MaybeVector::Scalar(f(v)),
-            MaybeVector::Vector(v) => MaybeVector::vector(v.iter().map(f).collect()),
+            MaybeVector::Vector(v) if v.len() < PAR_LANES_THRESHOLD => {
+                MaybeVector::vector(v.iter().map(f).collect())
+            }
+            MaybeVector::Vector(v) => MaybeVector::vector(par_concat(v.len(), |r| {
+                v[r].iter().map(&f).collect()
+            })),
         }
     }
 
     /// Maps over values, potentially changing the type
-    pub fn map_to<O: std::fmt::Debug + Clone + PartialEq + Eq>(
+    pub fn map_to<O: std::fmt::Debug + Clone + PartialEq + Eq + Send + Sync>(
         &self,
-        f: impl Fn(&T) -> O,
+        f: impl Fn(&T) -> O + Sync,
     ) -> MaybeVector<O> {
         match self {
             MaybeVector::Scalar(v) => MaybeVector::Scalar(f(v)),
-            MaybeVector::Vector(v) => MaybeVector::vector(v.iter().map(f).collect()),
+            MaybeVector::Vector(v) if v.len() < PAR_LANES_THRESHOLD => {
+                MaybeVector::vector(v.iter().map(f).collect())
+            }
+            MaybeVector::Vector(v) => MaybeVector::vector(par_concat(v.len(), |r| {
+                v[r].iter().map(&f).collect()
+            })),
         }
     }
 
-    pub fn map2<O: std::fmt::Debug + Clone + PartialEq + Eq>(
+    pub fn map2<O: std::fmt::Debug + Clone + PartialEq + Eq + Send + Sync>(
         a: &Self,
         b: &Self,
-        f: impl Fn(&T, &T) -> O,
+        f: impl Fn(&T, &T) -> O + Sync,
     ) -> MaybeVector<O> {
         match (a, b) {
             (MaybeVector::Scalar(a), MaybeVector::Scalar(b)) => MaybeVector::Scalar(f(a, b)),
             (MaybeVector::Vector(a), MaybeVector::Vector(b)) => {
                 // One length check up front instead of `zip_eq`'s check per
                 // element - this is the arithmetic inner loop, and the
-                // per-element branch blocks auto-vectorization.
+                // per-element branch blocks auto-vectorization. The direct
+                // loop is kept as the small-vector path: routing it through
+                // the chunk builder costs inlining of `f`.
                 assert_eq!(a.len(), b.len(), "map2 on vectors of different sizes");
-                MaybeVector::vector(a.iter().zip(b.iter()).map(|(a, b)| f(a, b)).collect())
+                if a.len() < PAR_LANES_THRESHOLD {
+                    MaybeVector::vector(a.iter().zip(b.iter()).map(|(a, b)| f(a, b)).collect())
+                } else {
+                    MaybeVector::vector(par_concat(a.len(), |r| {
+                        a[r.clone()]
+                            .iter()
+                            .zip(&b[r])
+                            .map(|(a, b)| f(a, b))
+                            .collect()
+                    }))
+                }
             }
             // Broadcast scalar to match vector size
             (MaybeVector::Scalar(a), MaybeVector::Vector(b)) => {
-                MaybeVector::vector(b.iter().map(|bi| f(a, bi)).collect())
+                if b.len() < PAR_LANES_THRESHOLD {
+                    MaybeVector::vector(b.iter().map(|bi| f(a, bi)).collect())
+                } else {
+                    MaybeVector::vector(par_concat(b.len(), |r| {
+                        b[r].iter().map(|bi| f(a, bi)).collect()
+                    }))
+                }
             }
             (MaybeVector::Vector(a), MaybeVector::Scalar(b)) => {
-                MaybeVector::vector(a.iter().map(|ai| f(ai, b)).collect())
+                if a.len() < PAR_LANES_THRESHOLD {
+                    MaybeVector::vector(a.iter().map(|ai| f(ai, b)).collect())
+                } else {
+                    MaybeVector::vector(par_concat(a.len(), |r| {
+                        a[r].iter().map(|ai| f(ai, b)).collect()
+                    }))
+                }
             }
         }
     }
@@ -113,7 +180,7 @@ pub fn count_true(mask: &[bool]) -> usize {
 #[inline]
 fn filter_vec_gather_ref<T: Clone + PartialEq>(vec: &[T], kept: &[u32]) -> MaybeVector<T>
 where
-    T: std::fmt::Debug + Clone + PartialEq + Eq,
+    T: std::fmt::Debug + Clone + PartialEq + Eq + Send + Sync,
 {
     if let [only] = kept {
         return MaybeVector::Scalar(vec[*only as usize].clone());
