@@ -1,0 +1,68 @@
+# The assembled dash package (2026-08-03): expand btn(k_up)/btn(k_down) into
+# lane fan-out and flatten every consumer, so the dash arm stops splitting
+# states. NOT part of the recipe: differentially identical through 34 and 37,
+# 144 target splits removed (505 -> 361), but measured +16-18% time and +30%
+# memory (see BENCHMARK_DATA.md). Kept for reference: splice these entries
+# before the trailing allocate_slots to reproduce. The gate-masking variant
+# (speculate_region in_k1039_cont/if_body_162 mask+expand, entry g162) was
+# worse still: 2.41s at 34 - every skipping state paid the 4x lane doubling.
+# Dash package stage A: expand k_up/k_down concretization diamonds (lane
+# expansion instead of state splits) + decompose the and-select branch.
+{"fn":"player.update_21","head":"in_j2_050_if_join_10","id":"g117","rule":"expand_bool"}
+{"fn":"player.update_21","head":"in_j2_052_if_join_10","id":"g118","rule":"expand_bool"}
+{"at":"%592","fn":"player.update_21","id":"g119","rule":"decompose_branch"}
+{"id":"g120","rule":"merge_blocks"}
+# Dash package stage B: the btn arg cells become SSA (block-local multi-store
+# promotion), the concretization accessors demote, and the k_down shortcircuit
+# arm runs eagerly - expand opt-in, concretization store unmasked.
+{"cell":"%1452","fn":"player.update_21","id":"g121","rule":"promote_cell"}
+{"cell":"%1494","fn":"player.update_21","id":"g122","rule":"promote_cell"}
+{"at":"%1479","fn":"player.update_21","id":"g123","rule":"demote_create"}
+{"at":"%1521","fn":"player.update_21","id":"g124","rule":"demote_create"}
+{"arm":"and_or_continue_182","expand":true,"fn":"player.update_21","head":"if_body_162","id":"g125","rule":"speculate_region"}
+# Dash package stage C: the dash-direction nest flattens. Inner diamond A
+# (input~=0 side, branch on v_input~=0) becomes select-stores.
+{"at":"%629","fn":"player.update_21","id":"g126","rule":"demote_create"}
+{"at":"%637","fn":"player.update_21","id":"g127","rule":"demote_create"}
+{"at":"%648","fn":"player.update_21","id":"g128","rule":"demote_create"}
+{"at":"%656","fn":"player.update_21","id":"g129","rule":"demote_create"}
+{"arm":"if_body_193","fn":"player.update_21","id":"g130","join":"if_join_195","rule":"speculate"}
+{"arm":"if_condition_192","fn":"player.update_21","id":"g131","join":"if_join_195","rule":"speculate"}
+{"id":"g132","rule":"cse"}
+{"fn":"player.update_21","head":"if_body_187","id":"g133","rule":"absorb_stores"}
+# Inner diamond B (input==0 side: vertical dash vs backdash).
+{"at":"%668","fn":"player.update_21","id":"g134","rule":"demote_create"}
+{"at":"%674","fn":"player.update_21","id":"g135","rule":"demote_create"}
+{"at":"%685","fn":"player.update_21","id":"g136","rule":"demote_create"}
+{"at":"%708","fn":"player.update_21","id":"g137","rule":"demote_create"}
+{"arm":"if_body_188","fn":"player.update_21","id":"g138","join":"if_join_190","rule":"speculate"}
+{"arm":"if_condition_186","fn":"player.update_21","id":"g139","join":"if_join_190","rule":"speculate"}
+{"id":"g140","rule":"cse"}
+{"fn":"player.update_21","head":"if_condition_185","id":"g141","rule":"absorb_stores"}
+# Outer diamond (input~=0): both sides are select-store chains now.
+{"id":"g141b","rule":"merge_blocks"}
+{"arm":"if_body_187","fn":"player.update_21","id":"g142","join":"if_join_190","rule":"speculate"}
+{"arm":"if_condition_185","fn":"player.update_21","id":"g143","join":"if_join_190","rule":"speculate"}
+{"id":"g144","rule":"cse"}
+{"fn":"player.update_21","head":"if_body_162","id":"g145","rule":"absorb_stores"}
+# Dash tail triangles: dash_target.y (spd.y<0), dash_accel.x (spd.y~=0),
+# dash_accel.y (spd.x~=0).
+{"arm":"if_body_205","fn":"player.update_21","id":"g146","join":"if_join_206","rule":"speculate"}
+{"fn":"player.update_21","head":"if_join_190","id":"g147","rule":"absorb_stores"}
+{"arm":"if_body_208","fn":"player.update_21","id":"g148","join":"if_join_209","rule":"speculate"}
+{"fn":"player.update_21","head":"if_join_206","id":"g149","rule":"absorb_stores"}
+{"arm":"if_body_211","fn":"player.update_21","id":"g150","join":"if_join_212","rule":"speculate"}
+{"fn":"player.update_21","head":"if_join_209","id":"g151","rule":"absorb_stores"}
+{"id":"g152","rule":"merge_blocks"}
+# The dash gate: demote the arm's creating accessors, then run the whole
+# arm unconditionally - stores masked on the gate condition, the two
+# expands and their concretization stores unmasked (per-lane refinement).
+{"at":"%562","fn":"player.update_21","id":"g153","rule":"demote_create"}
+{"at":"%570","fn":"player.update_21","id":"g154","rule":"demote_create"}
+{"at":"%573","fn":"player.update_21","id":"g155","rule":"demote_create"}
+{"at":"%577","fn":"player.update_21","id":"g156","rule":"demote_create"}
+{"at":"%712","fn":"player.update_21","id":"g157","rule":"demote_create"}
+{"at":"%718","fn":"player.update_21","id":"g158","rule":"demote_create"}
+{"at":"%733","fn":"player.update_21","id":"g159","rule":"demote_create"}
+{"at":"%748","fn":"player.update_21","id":"g160","rule":"demote_create"}
+{"at":"%754","fn":"player.update_21","id":"g161","rule":"demote_create"}

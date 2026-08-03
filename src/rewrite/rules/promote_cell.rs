@@ -35,11 +35,20 @@
 //!    position is a write through the pointer (fine); `%c` in *source* position
 //!    is the pointer itself being stored somewhere (an escape).
 //!
-//! 2. **Exactly one store, and it dominates every load.** With a single
-//!    definition there are no phis to place, so the transformation is a
-//!    substitution and nothing else. Multi-store cells need real SSA
-//!    construction with phi insertion; that is a separate, harder rule and is
-//!    deliberately not attempted here.
+//! 2. **Exactly one store, and it dominates every load** - or, failing
+//!    that, **every load has a store textually above it in its own block**.
+//!    Either way there are no phis to place, so the transformation is a
+//!    substitution and nothing else. In the single-store shape every load
+//!    forwards to the one stored value; in the block-local shape each load
+//!    forwards to the nearest store above it, which is exact because a
+//!    block runs straight-line and precondition 1 already proved no other
+//!    pointer can write the cell in between (this is what the compiled
+//!    `btn` argument cell looks like once its blocks are merged: store the
+//!    argument, read it, store `i+1`, read that). Stores no load sees are
+//!    deleted with the cell - never read and never escaping, they are
+//!    unobservable wherever they sit. Multi-store cells that fit neither
+//!    shape need real SSA construction with phi insertion; that is a
+//!    separate, harder rule and is deliberately not attempted here.
 //!
 //!    "Dominates" is per-block plus, within the storing block, the store must
 //!    precede the load textually.
@@ -122,9 +131,17 @@ fn find_alloc(cfg: &Cfg, cell: LocalId) -> Option<(BlockKey, usize)> {
 pub enum Verdict {
     /// Promotable: single store, dominating all loads.
     Ready { loads: usize },
+    /// Promotable without phis despite multiple stores: every load has a
+    /// store textually above it in its own block, so each load forwards to
+    /// the nearest one - a block runs straight-line and the escape check
+    /// already proved no other pointer can write the cell in between.
+    /// Stores no load sees are simply deleted: the cell never escapes and
+    /// is never read again, so they are unobservable wherever they sit.
+    ReadyLocal { loads: usize },
     /// The pointer leaks somewhere promotion cannot see.
     Escapes(String),
-    /// More than one store: needs phi insertion, which this rule does not do.
+    /// More than one store and not locally forwardable: needs phi
+    /// insertion, which this rule does not do.
     MultipleStores(usize),
     /// Never written, or written after being read on some path.
     StoreDoesNotDominate,
@@ -143,6 +160,18 @@ pub fn classify(fun: &FunDef, cell: LocalId) -> Verdict {
         return Verdict::Escapes(reason.clone());
     }
     if uses.stores.len() != 1 {
+        // Not the single-store shape - but per-load forwarding may still
+        // work. Every load needs a store above it in its own block.
+        let locally_fed = uses.loads.iter().all(|(load_block, load_index, _)| {
+            uses.stores
+                .iter()
+                .any(|(store_block, store_index, _)| {
+                    store_block == load_block && store_index < load_index
+                })
+        });
+        if locally_fed {
+            return Verdict::ReadyLocal { loads: uses.loads.len() };
+        }
         return Verdict::MultipleStores(uses.stores.len());
     }
     let (store_block, store_index, _) = &uses.stores[0];
@@ -161,6 +190,47 @@ pub fn classify(fun: &FunDef, cell: LocalId) -> Verdict {
     Verdict::Ready { loads: uses.loads.len() }
 }
 
+/// The substitution a promotion performs: each load's id mapped to the
+/// value it forwards to. `Ready` forwards every load to the single store's
+/// value; `ReadyLocal` forwards each load to the nearest store above it in
+/// its block. Chains - a store whose value is itself a deleted load of this
+/// cell - resolve to the surviving id (finite by SSA: a value dominates its
+/// use, so no load can transitively feed itself).
+fn substitution_for(uses: &CellUses, verdict: &Verdict) -> FxHashMap<LocalId, LocalId> {
+    let mut map: FxHashMap<LocalId, LocalId> = match verdict {
+        Verdict::Ready { .. } => {
+            let stored = uses.stores[0].2;
+            uses.loads.iter().map(|(_, _, id)| (*id, stored)).collect()
+        }
+        Verdict::ReadyLocal { .. } => uses
+            .loads
+            .iter()
+            .map(|(load_block, load_index, id)| {
+                let value = uses
+                    .stores
+                    .iter()
+                    .filter(|(store_block, store_index, _)| {
+                        store_block == load_block && store_index < load_index
+                    })
+                    .max_by_key(|(_, store_index, _)| *store_index)
+                    .map(|(_, _, value)| *value)
+                    .expect("classify checked every load has a store above it");
+                (*id, value)
+            })
+            .collect(),
+        other => unreachable!("substitution_for on {:?}", other),
+    };
+    let keys: Vec<LocalId> = map.keys().copied().collect();
+    for key in keys {
+        let mut value = map[&key];
+        while let Some(next) = map.get(&value) {
+            value = *next;
+        }
+        map.insert(key, value);
+    }
+    map
+}
+
 /// Every cell in a function that `classify` says is ready.
 pub fn candidates(fun: &FunDef) -> Vec<(LocalId, usize)> {
     let mut out = Vec::new();
@@ -169,7 +239,9 @@ pub fn candidates(fun: &FunDef) -> Vec<(LocalId, usize)> {
             if !matches!(instr, Instruction::Alloc) {
                 continue;
             }
-            if let Verdict::Ready { loads } = classify(fun, *id) {
+            if let Verdict::Ready { loads } | Verdict::ReadyLocal { loads } =
+                classify(fun, *id)
+            {
                 out.push((*id, loads));
             }
         }
@@ -180,8 +252,9 @@ pub fn candidates(fun: &FunDef) -> Vec<(LocalId, usize)> {
 
 pub fn apply(program: &mut Program, function: &str, cell: LocalId) -> Result<usize> {
     let fun = program.get_mut(function)?;
-    match classify(fun, cell) {
-        Verdict::Ready { .. } => {}
+    let verdict = classify(fun, cell);
+    match verdict {
+        Verdict::Ready { .. } | Verdict::ReadyLocal { .. } => {}
         other => {
             return Err(anyhow!(
                 "cannot promote %{} in {}: {:?}",
@@ -193,12 +266,10 @@ pub fn apply(program: &mut Program, function: &str, cell: LocalId) -> Result<usi
     }
 
     let uses = collect_uses(&fun.cfg, cell);
-    let stored_value = uses.stores[0].2;
     let load_ids: FxHashSet<LocalId> = uses.loads.iter().map(|(_, _, id)| *id).collect();
 
-    // Every load of this cell becomes the stored value.
-    let substitution: FxHashMap<LocalId, LocalId> =
-        load_ids.iter().map(|id| (*id, stored_value)).collect();
+    // Every load of this cell becomes the value the store it sees put there.
+    let substitution = substitution_for(&uses, &verdict);
 
     let mut removed = 0;
     for block in blocks_mut(&mut fun.cfg) {
@@ -242,8 +313,9 @@ pub fn verify(
     let before_fun = before.get(function)?;
     let after_fun = after.get(function)?;
 
-    match classify(before_fun, cell) {
-        Verdict::Ready { .. } => {}
+    let verdict = classify(before_fun, cell);
+    match verdict {
+        Verdict::Ready { .. } | Verdict::ReadyLocal { .. } => {}
         other => {
             return Err(anyhow!(
                 "promote_cell ran on %{} in {}, which is not promotable: {:?}",
@@ -255,7 +327,7 @@ pub fn verify(
     }
 
     let uses = collect_uses(&before_fun.cfg, cell);
-    let stored_value = uses.stores[0].2;
+    let substitution = substitution_for(&uses, &verdict);
     let load_ids: FxHashSet<LocalId> = uses.loads.iter().map(|(_, _, id)| *id).collect();
 
     // The cell and everything touching it must be gone.
@@ -284,15 +356,9 @@ pub fn verify(
         }
     }
 
-    // Everything else must be untouched except that references to a load of the
-    // cell now refer to the stored value.
-    let expected = |id: LocalId| {
-        if load_ids.contains(&id) {
-            stored_value
-        } else {
-            id
-        }
-    };
+    // Everything else must be untouched except that references to a load of
+    // the cell now refer to the value its store put there.
+    let expected = |id: LocalId| *substitution.get(&id).unwrap_or(&id);
     for (key, before_block) in all_blocks(&before_fun.cfg) {
         let after_block = super::get_block(&after_fun.cfg, &key).ok_or_else(|| {
             anyhow!("promote_cell removed block '{}'", block_label(&key))
@@ -346,4 +412,151 @@ pub fn verify(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{GlobalId, Terminator};
+    use crate::pico8_num::Pico8Num;
+    use indexmap::IndexMap;
+
+    fn id(n: usize) -> LocalId {
+        LocalId::from(n)
+    }
+
+    fn num(value: i16) -> Instruction {
+        Instruction::NumberConstant { value: Pico8Num::from_i16(value) }
+    }
+
+    /// The compiled `btn` argument cell after block merging: store the
+    /// argument, read it, store the incremented value, read that.
+    ///
+    ///   %1 = alloc; %2 = 7; store %1 <- %2; %4 = load %1;
+    ///   %5 = 1; %6 = %4 + %5; store %1 <- %6; %8 = load %1; return %8
+    fn local_program() -> Program {
+        let entry = Block {
+            instructions: vec![
+                (id(1), Instruction::Alloc),
+                (id(2), num(7)),
+                (id(3), Instruction::Store { target: id(1), source: id(2) }),
+                (id(4), Instruction::Load { source: id(1) }),
+                (id(5), num(1)),
+                (
+                    id(6),
+                    Instruction::BinaryOp {
+                        left: id(4),
+                        op: crate::ir::BinaryOp::Plus,
+                        right: id(5),
+                    },
+                ),
+                (id(7), Instruction::Store { target: id(1), source: id(6) }),
+                (id(8), Instruction::Load { source: id(1) }),
+            ],
+            terminator: (id(9), Terminator::Return { value: Some(id(8)) }),
+            hint_normalize: false,
+        };
+        let fun = FunDef {
+            name: GlobalId::from("f".to_string()),
+            capture_ids: vec![],
+            arg_ids: vec![],
+            cfg: Cfg::new(entry, crate::ir::new_label_map()),
+            source_span: None,
+        };
+        let mut functions = IndexMap::new();
+        functions.insert(fun.name.clone(), fun);
+        Program { functions }
+    }
+
+    #[test]
+    fn promotes_a_block_local_multi_store_cell() {
+        let before = local_program();
+        assert_eq!(
+            classify(before.get("f").unwrap(), id(1)),
+            Verdict::ReadyLocal { loads: 2 }
+        );
+        let mut after = before.clone();
+        let removed = apply(&mut after, "f", id(1)).unwrap();
+        assert_eq!(removed, 5); // alloc, two stores, two loads
+        verify(&before, &after, "f", id(1)).unwrap();
+        let entry = &after.get("f").unwrap().cfg.entry;
+        // Each load forwarded to the store above it: %6 = %2 + %5, return %6.
+        assert_eq!(
+            entry.instructions,
+            vec![
+                (id(2), num(7)),
+                (id(5), num(1)),
+                (
+                    id(6),
+                    Instruction::BinaryOp {
+                        left: id(2),
+                        op: crate::ir::BinaryOp::Plus,
+                        right: id(5),
+                    },
+                ),
+            ],
+        );
+        assert_eq!(
+            entry.terminator.1,
+            Terminator::Return { value: Some(id(6)) }
+        );
+    }
+
+    /// A store whose value is itself a deleted load of the cell resolves
+    /// through the chain to the surviving id.
+    #[test]
+    fn resolves_a_forwarding_chain() {
+        let mut before = local_program();
+        {
+            let fun = before.get_mut("f").unwrap();
+            // store %1 <- %4: the second store's value is the first load.
+            fun.cfg.entry.instructions[6].1 =
+                Instruction::Store { target: id(1), source: id(4) };
+        }
+        let mut after = before.clone();
+        apply(&mut after, "f", id(1)).unwrap();
+        verify(&before, &after, "f", id(1)).unwrap();
+        // %8 -> %4 -> %2.
+        assert_eq!(
+            after.get("f").unwrap().cfg.entry.terminator.1,
+            Terminator::Return { value: Some(id(2)) }
+        );
+    }
+
+    /// A load with no store above it in its block would need a phi.
+    #[test]
+    fn refuses_a_load_before_the_first_store() {
+        let mut before = local_program();
+        {
+            let fun = before.get_mut("f").unwrap();
+            // Move the first load above the first store.
+            let load = fun.cfg.entry.instructions.remove(3);
+            fun.cfg.entry.instructions.insert(2, load);
+        }
+        assert_eq!(
+            classify(before.get("f").unwrap(), id(1)),
+            Verdict::MultipleStores(2)
+        );
+        let error = apply(&mut before, "f", id(1)).unwrap_err().to_string();
+        assert!(error.contains("MultipleStores"), "{}", error);
+    }
+
+    /// The verifier re-derives the per-load forwarding itself.
+    #[test]
+    fn verify_rejects_wrong_forwarding() {
+        let before = local_program();
+        let mut after = before.clone();
+        apply(&mut after, "f", id(1)).unwrap();
+        {
+            let fun = after.get_mut("f").unwrap();
+            // Tamper: the add reads the wrong constant.
+            fun.cfg.entry.instructions[2].1 = Instruction::BinaryOp {
+                left: id(5),
+                op: crate::ir::BinaryOp::Plus,
+                right: id(5),
+            };
+        }
+        let error = verify(&before, &after, "f", id(1)).unwrap_err().to_string();
+        assert!(error.contains("changed %6"), "{}", error);
+    }
 }

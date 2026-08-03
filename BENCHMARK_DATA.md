@@ -189,6 +189,60 @@ longer sit as branches between every `btn` call and its concretization, so
 region speculation can cross them (`assert_true` is speculatable). This is
 step 1 of the dash package in plans/status.md.
 
+### The full dash package: assembled, correct, and a measured regression (2026-08-03)
+
+The complete package from plans/status.md was built and measured (entries
+preserved in plans/dash-package.jsonl; not in the recipe). It expands
+`btn(k_up)`/`btn(k_down)` into lane fan-out and flattens every consumer:
+the concretization diamonds become `expand` + store, the arg cells promote
+to SSA (block-local multi-store promotion), the k_down short-circuit arm
+runs eagerly under the new `speculate_region` expand opt-in, the 2x2
+dash-direction nest (`input~=0` x `v_input~=0`) and the three tail
+triangles (dash_target.y, dash_accel.x/y) all become select/masked-store
+form. The dash arm `if_body_162` ends up one straight-line block.
+Differentially **identical through 34 and 37**, and the 144 target splits
+are gone (505 -> 361 splits; fragments 527 -> 383 at 34, 695 -> 515 at 37).
+
+Measured A/B on the same binary, repeated:
+
+| | 34 frames | 37 frames |
+|---|---|---|
+| baseline (committed recipe) | 1.36-1.37 s, 0.50 GB | 5.74 s, 1.69 GB |
+| dash package | 1.61 s, 0.65 GB | 6.64 s, 2.20 GB |
+
+**+17% time, +30% memory, at both depths.** The profile attributes the
+entire +0.24 s at 34: `expand_lanes` 0.12 s/144 calls (an *eager physical
+copy* of every vector in the state, where the `UnknownBool` split it
+replaces shares the state lazily between fragments), `cfg:player.update_21`
+self +0.06 s (the serialized short-circuit evaluates both buttons for
+every dash-state where the branch evaluated one), gc +0.03 s (the doubled
+vectors are real allocations). `filter_branch` is unchanged (0.17 -> 0.18
+s) - the flattening did succeed in not paying vector-branch filters, which
+was the failure mode of the bare-expand experiment above.
+
+Masking the dash gate itself (`speculate_region` at `in_k1039_cont` with
+mask+expand, so every state runs the arm) was measured too: **2.41 s at
+34** - skipping states pay the 4x lane doubling for the rest of the frame
+with nothing reclaimed until the boundary dedup.
+
+The conclusion refutes the working hypothesis that expansion "pays as a
+package with masking every consumer". It does not, at these depths,
+because the baseline's split is not where the money is: an `UnknownBool`
+branch duplicates the state by reference, the four sub-states run the
+frame tail with mostly-scalar uniform values, and the frame-boundary merge
+machinery folds them back into vectors anyway. The package converts that
+lazy fork/merge into an eager mid-frame vector copy and buys back only
+per-state fixed overhead that is not yet the bottleneck. Lane expansion
+remains the right endgame shape - one state per frame with input fan-out
+as lanes - but it becomes profitable only when enough of the frame is
+branch-free that the merge machinery itself disappears, not
+cluster-by-cluster against a healthy merge path. The remaining big
+splitters (`in_i1_074_cont` 108 vector filter-splits on per-lane
+`dash_time>0`, the jump/dash button diamonds at 102/51) are identical in
+both programs and out of this package's scope: the `dash_time` diamond's
+else-side is the whole normal-movement body, which contains splitting
+branches and so cannot be a region today.
+
 ## Where the time goes
 
 `rewrite bench --frames 34 --profile`, on the current recipe. Self time, so the

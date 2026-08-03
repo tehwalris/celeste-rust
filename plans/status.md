@@ -1,6 +1,6 @@
 # Status (2026-08)
 
-Branch `rewrite`. Build is warning-free, 382 tests pass, working tree clean.
+Branch `rewrite`. Build is warning-free, 386 tests pass, working tree clean.
 
 ## Measured, frame 34 (the standard iteration benchmark)
 
@@ -926,13 +926,41 @@ What the package needs, in order, for the dash arm alone:
    up/down pair), which is why it stays opt-in and unmeasured until the
    package assembles. No recipe entry uses it yet; existing entries
    replay identically (screened at 34).
-3. Then the existing rules: decompose the unconditional `v_input` chain,
-   absorb the `if_body_187`/`if_condition_185` stores, mask the dash-gate
-   arm (`in_k1039_cont`) and the `dash_time` diamond (`in_i1_074_cont`).
+3. **DONE and MEASURED (2026-08-03) - the package does not land.** The
+   whole package was assembled on the recipe (entries preserved in
+   plans/dash-package.jsonl): expand_bool at both sites + decompose_branch,
+   merge_blocks, promote_cell on the btn arg cells (new block-local
+   multi-store shape - every load forwards to the nearest store above it
+   in its block, no phis, escape check kills the aliasing question),
+   demote_create on the concretization accessors, the k_down short-circuit
+   arm eager via `speculate_region` `expand:true` (first real use - worked
+   first try), then the 2x2 dash-direction nest and the three tail
+   triangles via the demote -> speculate -> cse -> absorb_stores pipeline.
+   The dash arm `if_body_162` becomes one straight-line block; only the
+   scalar gate branch remains. Differentially identical through 34 and 37,
+   all 144 target splits gone (505 -> 361), fragments 527 -> 383 / 695 ->
+   515 - and **+17% time, +30% memory at both depths** (1.37 -> 1.61 s at
+   34, 5.74 -> 6.64 s at 37). Masking the gate too (`in_k1039_cont`,
+   mask+expand) is worse still: 2.41 s at 34. Full attribution in
+   BENCHMARK_DATA.md: `expand_lanes` is an eager physical copy of every
+   vector where the `UnknownBool` split shares state lazily, and the
+   frame-boundary merge machinery was already folding the four sub-states
+   back into vectors cheaply. The `dash_time` diamond (`in_i1_074_cont`,
+   108 vector filter-splits, unchanged either way) is unreachable for
+   masking: its else-side is the entire normal-movement body, which still
+   contains splitting branches.
 
-Only after that package is whole does the frame stop splitting on dash
-inputs at all; every intermediate stage measures as a regression, so it
-lands whole or not at all.
+**What this means for the strategy:** expansion does not pay
+cluster-by-cluster against a healthy split/merge path. The hypothesis
+"pays as a package with masking every consumer" is refuted at current
+depths - the consumers were masked, the filters never fired, and it still
+lost, because the split it replaces was never the expensive part. Lane
+expansion stays the endgame *shape* (one state per frame, inputs as
+lanes), but the profitable route there has to remove the per-state
+machinery globally (or make `expand` lazy - share the doubled lanes the
+way a split shares the state) rather than convert one button cluster at a
+time. The machinery is all kept, tested, and known-correct at depth; the
+recipe keeps the committed baseline.
 
 ### Later: `assume_eq`, whole-function field promotion
 
