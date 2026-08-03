@@ -73,3 +73,43 @@ commit messages); every step verified through 34, the stack through 37.
 
 Net at 39 frames: **10.5 -> ~6.9-7.1 s (-33%)**. Threads capped at 16
 (merges) / 8 (ops) - the work is memory-bound.
+
+* **9433cec parallel local_env filter**: the env holds up to ~30
+  vector locals, comparable to the heap's columns; same pattern.
+  6.75-6.98 -> 6.48-6.54 s at 39. Also serialized the profiling tests
+  (global registry, raced under the parallel runner, flaked once).
+* **Parked: parallel normalize in union_diff_states** - consistent
+  small LOSS (~+0.15 s at 39) in two shapes (per-state threads and
+  chunked); allocation contention in clone+gc+sort beats the
+  parallelism. union_diff (0.52 s at 39) stays sequential; the real
+  fix is caching normalized forms across fixpoint rounds (the
+  accumulated set is re-normalized every call) - task #52 territory.
+
+## Working notes (for post-compaction continuation)
+
+* Metric runs: `./safe-run.sh -- ./target/release/celeste-rust -n 41
+  --detail-from 99 --detail-to 99`, read the `... in Xs` per-frame
+  lines. Full-run times vary +-15% run to run - the FINAL headline
+  number must be interleaved full runs, base commit 06b6248 binary vs
+  final binary, 3+ pairs. Bench comparisons stay interleaved
+  two-binary at 39 (`/tmp/rewrite-<name> bench --frames 39`).
+* Latest full run (9433cec): f39 13.4-13.5, f40 19.0, f41 27.2
+  (earlier run at 1eac28e: 12.0/18.1/28.8 - within cross-run noise).
+  Baseline (06b6248): f39 15.06, f40 23.85, f41 not run (~37 est).
+* Profile at 39 after all parallel commits (6.7s wall): cfg:a61 2.09,
+  filter_branch 1.62, merge_groups 1.01, dedup_state 1.01, union_diff
+  0.52, everything else <0.15.
+* Remaining ideas, rough order: (a) filter_branch residual - the
+  O(n) mask->kept scan is sequential per call, and each branch filters
+  BOTH sides = two gathers over the same state, could share; (b)
+  cfg:a61 - what remains after pooled ops: sub-threshold ops on
+  fragment states, per-instruction overhead, local_env clones -
+  instr_time profile (bench --profile) resolves it; (c) merge concat
+  ns/cell still ~2000 at 39 - the columns concat could go through the
+  lane pool instead of per-cell chunks; (d) task #52 caching for
+  union_diff; (e) GC arena/pooling if memory becomes the binder at
+  f42+ (~2x per frame growth; f42 ~8GB?, cap far).
+* Binaries preserved in /tmp: rewrite-base2 (06b6248), rewrite-par1/2/3
+  (dedup/concat/heap-filter), rewrite-par6 (pool ops), rewrite-parA
+  (env filter). Baseline full-run log /tmp/baseline-40.log; metric
+  /tmp/metric-41.log.
