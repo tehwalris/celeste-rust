@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use super::program::Program;
 use super::rules::{
-    absorb_stores, allocate_slots, convert_assert, convert_ternary, cse, dce, decompose_branch,
+    absorb_stores, allocate_slots, collapse_loop, convert_assert, convert_ternary, cse, dce,
+    decompose_branch,
     decompose_truthy, demote_create,
     expand_bool, fold, fold_reflexive, fuse_breaks, if_convert, inline, mask_loop, merge_blocks,
     pin_builtin,
@@ -303,6 +304,20 @@ pub enum Rule {
         /// The block whose conditional branch into the diamond is removed.
         head: String,
     },
+    /// Collapse a counted loop to one guarded execution of its body: a loud
+    /// `assert_true(bound == init)` in the preheader states that the trip
+    /// count is exactly one, the counter is replaced by its initial value,
+    /// and the head disappears - the preheader falls into the body, the
+    /// latch falls out to the exit. For the loops bounded by `#objects`,
+    /// which room (1, 0) keeps at exactly one object for the whole search.
+    /// Screen at full depth.
+    CollapseLoop {
+        #[serde(rename = "fn")]
+        function: String,
+        /// The loop header: exactly a counter phi, `counter <= bound`, and
+        /// the conditional branch on it.
+        head: String,
+    },
 }
 
 impl Rule {
@@ -331,6 +346,7 @@ impl Rule {
             Rule::DecomposeBranch { .. } => "decompose_branch",
             Rule::ExpandBool { .. } => "expand_bool",
             Rule::ConvertAssert { .. } => "convert_assert",
+            Rule::CollapseLoop { .. } => "collapse_loop",
         }
     }
 }
@@ -532,6 +548,7 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         }
         Rule::ExpandBool { function, head } => expand_bool::apply(program, function, head),
         Rule::ConvertAssert { function, head } => convert_assert::apply(program, function, head),
+        Rule::CollapseLoop { function, head } => collapse_loop::apply(program, function, head),
         Rule::Inline { function, at, callee, captures } => inline::apply(
             program,
             &entry.id,
@@ -638,6 +655,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         }
         Rule::ConvertAssert { function, head } => {
             convert_assert::verify(&before, program, function, head)
+        }
+        Rule::CollapseLoop { function, head } => {
+            collapse_loop::verify(&before, program, function, head)
         }
         Rule::Inline { function, at, callee, captures } => inline::verify(
             &before,

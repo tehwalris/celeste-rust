@@ -64,7 +64,8 @@ enum Command {
         /// What to look for: "promote-cell", "promote-capture", "inline",
         /// "if-convert", "demote-create", "pin-builtin", "convert-ternary",
         /// "decompose-truthy", "speculate", "speculate-region", "sink-store",
-        /// "absorb-stores", "expand-bool" or "convert-assert".
+        /// "absorb-stores", "expand-bool", "convert-assert" or
+        /// "collapse-loop".
         #[arg(default_value = "promote-cell")]
         what: String,
         /// Prefix for the generated ids.
@@ -841,6 +842,31 @@ fn main() -> Result<()> {
                     eprintln!(
                         "# Each becomes a straight-line `assert_true`. Safe to apply \
                          everywhere; screen at full depth anyway."
+                    );
+                }
+                "collapse-loop" => {
+                    let candidates =
+                        celeste_rust::rewrite::rules::collapse_loop::candidates(&program);
+                    for (i, (function, head)) in candidates.iter().enumerate() {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "id": format!("{}{:03}", prefix, i),
+                                "rule": "collapse_loop",
+                                "fn": function,
+                                "head": head.as_str(),
+                            })
+                        );
+                    }
+                    eprintln!(
+                        "# {} counted loop(s) whose shape allows the singleton \
+                         collapse.",
+                        candidates.len()
+                    );
+                    eprintln!(
+                        "# Each claims `bound == init` at runtime - only sound for \
+                         loops over `objects` while the room holds one object. Check \
+                         the bound's provenance before applying; screen at full depth."
                     );
                 }
                 "promote-capture" => {

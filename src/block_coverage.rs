@@ -171,6 +171,11 @@ pub struct Report {
     /// Blocks that ever run more than once in a single frame, worst first:
     /// (function, block, instructions, max_executions).
     pub hot_unrolled: Vec<(String, String, usize, usize)>,
+    /// Every (function, block, max_executions) reached at all, sorted by
+    /// name. The ground truth for "does this site actually run" - rewrites
+    /// aimed at hot code should be checked against it, because a guard on a
+    /// never-executed site passes every screen without testing anything.
+    pub reached: Vec<(String, String, usize)>,
     /// Per-function contribution to K, worst first.
     pub by_function: Vec<(String, usize)>,
     /// Contribution to K by instruction kind, worst first.
@@ -215,11 +220,19 @@ pub fn report() -> Option<Report> {
     let mut by_kind: Vec<(&'static str, usize)> = per_kind.into_iter().collect();
     by_kind.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
 
+    let mut reached: Vec<(String, String, usize)> = cov
+        .max_per_frame
+        .iter()
+        .map(|(key, &max_exec)| (key.0.clone(), key.1.clone(), max_exec))
+        .collect();
+    reached.sort();
+
     Some(Report {
         k_static,
         k_instructions: k,
         distinct_blocks: cov.max_per_frame.len(),
         hot_unrolled: hot,
+        reached,
         by_function,
         by_kind,
         frames: cov.frames,

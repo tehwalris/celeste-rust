@@ -44,6 +44,13 @@ struct Cli {
     /// The baseline the recipe is trying to improve on.
     #[arg(long)]
     original: bool,
+
+    /// Print every (function, block) pair reached, with its worst-case
+    /// executions in one frame. The ground truth for "does this site run":
+    /// a rewrite whose guard sits on a never-executed site passes every
+    /// screen without testing anything.
+    #[arg(long)]
+    blocks: bool,
 }
 
 /// xorshift64* - we only need cheap reproducible noise, not statistical quality.
@@ -272,6 +279,14 @@ fn main() -> Result<()> {
             100.0 * *contribution as f64 / report.k_instructions as f64,
             func
         );
+    }
+
+    if cli.blocks {
+        println!();
+        println!("blocks reached (max executions in one frame):");
+        for (func, block, max_exec) in &report.reached {
+            println!("  {:>4}  {}::{}", max_exec, func, block);
+        }
     }
 
     Ok(())

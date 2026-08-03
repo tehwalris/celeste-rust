@@ -39,6 +39,8 @@ not comparable.
 | + wall-jump arm eager (`fold_reflexive` dead gates, masked `speculate_region`) | 1.46 s / 0.53 GB | - |
 | + `spikes_at` nest masked (`fuse_breaks`, `mask_loop` `span`/`break_to`) | 1.40 s / 0.46 GB | 5.52 s / 1.51 GB |
 | + 9 `pin_builtin`s, `cse` forward mode (block-local store forwarding) | 1.35 s / 0.50 GB | 5.56 s / 1.47 GB |
+| + interpreter micro-opts round 1 + `Arc`'d lane payloads (see below) | 1.03-1.04 s / 0.47 GB | 4.11-4.16 s / 1.65 GB |
+| + 16 `collapse_loop` (the `#objects` check/collide loops) | 1.02-1.03 s / 0.47 GB | 4.04 s / 1.66 GB |
 
 The store-triangle row is the first change that moved the fragment count: 558
 -> 335 mean fragments per frame at frame 34, split executions 19573 -> 11978.
@@ -303,6 +305,43 @@ fresh arena per gc is what keeps garbage bounded. Reverted. The next
 candidates by profile are the arithmetic inner loop (`interpret_binary_op`
 + `map2`, ~11% of the run) and `Value::clone` on loads (~14% cumulative,
 would want `Arc`'d vectors - invasive, unexplored).
+
+### `collapse_loop`: the singleton object-table loops (2026-08-03)
+
+Room (1, 0) holds exactly one entity (read off the cart's map data), so
+`objects` is a singleton for the whole search - confirmed by a probe over
+the real abstract run: `#objects == 1` in every lane of every state
+through frame 40 (948,319 lanes; no death reaches the horizon). The new
+`collapse_loop` rule states that premise as a loud
+`assert_true(bound == init)` in the loop's preheader and collapses the
+loop: counter replaced by its initial value (`get_index objects[i]`
+becomes `get_index objects[1]`), head deleted, preheader falls into the
+body, latch falls out to the exit. The body is untouched, so early exits
+keep working.
+
+16 sites - every `for i=1,count(objects)` check/collide loop that
+actually executes (6 in `anonymous_61`, 10 in `player.update_21`),
+selected by intersecting `suggest collapse-loop` with the new
+`measure_k --blocks` coverage listing. A guard on a never-executed site
+would pass every screen without testing anything, so cold sites
+(`load_room` scans, other object types) were left alone deliberately.
+
+Two shapes refused themselves, exactly as designed: the inlined `foreach`
+and `del` loops compile as `for i=1,32767` with an in-body
+`#tbl < i` break - their guard compares `32767 == 1` and fired on frame
+1 of the differential run. They need a different collapse (first
+iteration always breaks), not this one.
+
+    before   34f: 1.03-1.04 s / 0.47 GB    37f: 4.11-4.16 s / 1.65 GB
+    after    34f: 1.02-1.03 s / 0.47 GB    37f: 4.04 s / 1.66 GB
+    K unrolled 9546 -> 9226, dynamic instrs/frame mean 3765 -> 3651
+
+Small on its own, as expected - the point is what it unlocks: each
+collapsed body now reads `objects[1]` at a constant index, which is the
+prerequisite for asserting `objects[1] == <the object being updated>`
+(`assume_eq`) and folding the `o ~= obj` term that makes every such
+check return nil in this room. Differentially identical through 34 and
+37; lanes identical.
 
 ## Where the time goes
 

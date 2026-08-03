@@ -1,6 +1,7 @@
 # Status (2026-08)
 
-Branch `rewrite`. Build is warning-free, 386 tests pass, working tree clean.
+Branch `rewrite`. Build is warning-free, 344 lib tests pass, working tree
+clean.
 
 ## Measured, frame 34 (the standard iteration benchmark)
 
@@ -25,6 +26,7 @@ Branch `rewrite`. Build is warning-free, 386 tests pass, working tree clean.
 | + 9 `pin_builtin`s, `cse` forward mode (block-local) | 1.35 s | 0.50 GB |
 | + interpreter micro-opts (lazy spans, columnar dedup hash, gather filter, map2) | 1.13 s | 0.47 GB |
 | + `Arc`'d lane payloads (clone = refcount bump) | 1.03 s | 0.47 GB |
+| + 16 `collapse_loop` (the `#objects` singleton check/collide loops) | 1.02 s | 0.47 GB |
 
 Lane count is identical throughout (92,713), which is the first thing to check
 when a rewrite claims a win. Frame 37 confirms the same ratios (7.87 s, from
@@ -963,6 +965,37 @@ machinery globally (or make `expand` lazy - share the doubled lanes the
 way a split shares the state) rather than convert one button cluster at a
 time. The machinery is all kept, tested, and known-correct at depth; the
 recipe keeps the committed baseline.
+
+## Stage O: the object table is a singleton (2026-08-03)
+
+A fresh look at where things stand after the micro-opt round reframed the
+object loops. Room (1, 0) contains exactly **one** entity - computed from
+`cart/map-data.txt`: one `player_spawn` tile, nothing else - so `objects`
+is `[spawn]` then `[player]` for the whole search. A probe over the real
+abstract run confirmed `#objects == 1` in every lane through frame 40;
+no death reaches the horizon (the nearest spikes are ~56px from spawn
+with ~16 control frames). Everything "the object-loop stage" was waiting
+for reduces to a singleton premise that one runtime guard can state.
+
+* **`collapse_loop`** (built, 16 sites landed): guard
+  `assert_true(bound == init)` in the preheader, counter := init, head
+  deleted. All `for i=1,count(objects)` check/collide loops collapsed;
+  bodies untouched. Measured: 4.11-4.16 -> 4.04 s at 37, K unrolled
+  9546 -> 9226. Coverage (`measure_k --blocks`, new) chose the sites: a
+  guard on a never-executed site passes every screen without testing
+  anything, so cold sites were deliberately skipped.
+* **Refused themselves**: the inlined `foreach`/`del` loops are
+  `for i=1,32767` with an in-body `#tbl < i` break - the guard compared
+  `32767 == 1` and fired on frame 1. They need a "first iteration
+  always breaks" collapse, not this one.
+* **Next, in order**: `assume_eq` (below) to state
+  `objects[1] == <the updated object>` and fold the `o ~= obj` term -
+  in this room every object-table `check`/`collide` then returns nil
+  constantly, and the `in_k1039_cont` wall-jump residue plus most of the
+  16 collapsed bodies fold away. Then the `foreach`/`del` collapse, then
+  devirtualizing `obj.type.update` (a 2-way uniform dispatch,
+  player_spawn vs player), which is what stands between `anonymous_61`
+  (64% of K) and straight-line code.
 
 ### Later: `assume_eq`, whole-function field promotion
 
