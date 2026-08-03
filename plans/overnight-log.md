@@ -111,5 +111,13 @@ Net at 39 frames: **10.5 -> ~6.9-7.1 s (-33%)**. Threads capped at 16
   f42+ (~2x per frame growth; f42 ~8GB?, cap far).
 * Binaries preserved in /tmp: rewrite-base2 (06b6248), rewrite-par1/2/3
   (dedup/concat/heap-filter), rewrite-par6 (pool ops), rewrite-parA
-  (env filter). Baseline full-run log /tmp/baseline-40.log; metric
-  /tmp/metric-41.log.
+  (env filter), rewrite-parB (single-pass kept). Baseline full-run log
+  /tmp/baseline-40.log; metric /tmp/metric-41.log.
+* Further threshold probes: op-pool at 64k measured worse than 128k
+  (6.75-6.97 vs 6.45-6.71), same as 32k earlier - 128k stands.
+* Single-pass kept (committed): neutral at 39, strictly less work.
+* Full stack differentially verified through 37 (31.9 s).
+* **Headline A/B in flight**: /tmp/metric-ab.sh, 3 interleaved pairs of
+  full `-n 41` runs, /tmp/celeste-base (06b6248) vs /tmp/celeste-new
+  (HEAD), logging per-frame times + peak RSS to /tmp/metric-ab.log.
+  Do not run anything heavy while it measures.
