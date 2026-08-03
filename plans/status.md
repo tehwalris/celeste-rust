@@ -1,6 +1,6 @@
 # Status (2026-08)
 
-Branch `rewrite`. Build is warning-free, 376 lib tests pass, working tree
+Branch `rewrite`. Build is warning-free, 383 lib tests pass, working tree
 clean.
 
 ## Measured, frame 34 (the standard iteration benchmark)
@@ -1056,13 +1056,28 @@ they unroll *statically*.
   3.65-3.75 s at 37, lanes identical. **K unrolled 5784 -> 3808
   (-34%)**; mean executed instructions per lane-frame 2416 -> 1695;
   reached blocks 240 -> 135. Identical through 34 and 37.
-* **Next**: `dedup_guards` - guard is now 18.1% of K (690 weighted) and
-  visibly duplicated in the merged blocks (`assert_closure` pairs on
-  the same SSA value). An assert dominated by an identical assert on
-  the same operands is redundant unconditionally (asserts read only
-  immutable SSA values - except `assert_value_cell`, which reads a
-  cell and is excluded). Then constant-arithmetic `fold` backed by
-  `op.rs` differential tests, for the unrolled counter chains.
+* **`dedup_guards`** (built, landed): an assert dominated by an
+  identical assert on the same SSA operands is redundant
+  unconditionally (`assert_true`/`assert_pointer`/`assert_closure`
+  read only immutable values; `assert_value_cell` reads a cell and is
+  excluded). 501 deleted; the verifier re-checks every deletion
+  against a surviving covering twin. Time-neutral (the guards were
+  mostly per-state scalar checks), but K unrolled 3808 -> **3368**
+  (-12%), guard weight 690 -> 250 (-64%) - work the compiled kernel
+  no longer contains.
+* **Next**, in rough order:
+  * constant-arithmetic `fold` backed by `op.rs` differential tests
+    (the unrolled counter chains `0+1`, `1+1`, ... and the address
+    arithmetic they feed);
+  * inline the last statically-known foreach/draw callbacks into
+    `__frame`; then the function-dce hygiene stage (delete-function
+    where references are gone, poison-function with a trapping body
+    for the coverage-cold rest);
+  * unroll the remaining hot loops the same way (`spikes_at` nest,
+    `__main`'s button loop) once their trip counts are uniform;
+  * heap is 38.9% of K again now that everything else shrank - the
+    residual loads are cross-join, so revisit promotion *after* the
+    above, when the straight-line regions are as large as they get.
 
 ### Later: `assume_eq`, whole-function field promotion
 

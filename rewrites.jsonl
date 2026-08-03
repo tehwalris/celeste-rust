@@ -843,4 +843,5 @@
 {"forward":true,"id":"h071","rule":"cse"}
 {"id":"h072","rule":"fold_select"}
 {"id":"h073","rule":"dce"}
+{"id":"h074","rule":"dedup_guards"}
 {"id":"s1","rule":"allocate_slots"}

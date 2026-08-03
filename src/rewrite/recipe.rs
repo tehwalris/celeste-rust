@@ -19,7 +19,7 @@ use super::program::Program;
 use super::rules::{
     absorb_stores, allocate_slots, assume_eq, collapse_break_loop, collapse_loop,
     convert_assert, convert_ternary,
-    cse, dce, decompose_branch,
+    cse, dce, decompose_branch, dedup_guards,
     decompose_truthy, demote_create,
     expand_bool, fold, fold_reflexive, fold_select, fuse_breaks, if_convert, inline,
     mask_loop, merge_blocks,
@@ -386,6 +386,12 @@ pub enum Rule {
         /// The loop header.
         head: String,
     },
+    /// Delete any `assert_true`/`assert_pointer`/`assert_closure` that is
+    /// dominated by an identical assert on the same SSA operands. Those
+    /// asserts are deterministic functions of immutable values, so the
+    /// dominated copy can never be the first to fire. `assert_value_cell`
+    /// reads a heap cell and is excluded.
+    DedupGuards,
 }
 
 impl Rule {
@@ -418,6 +424,7 @@ impl Rule {
             Rule::CollapseLoop { .. } => "collapse_loop",
             Rule::CollapseBreakLoop { .. } => "collapse_break_loop",
             Rule::UnrollLoop { .. } => "unroll_loop",
+            Rule::DedupGuards => "dedup_guards",
             Rule::AssumeEq { .. } => "assume_eq",
             Rule::SplitCall { .. } => "split_call",
         }
@@ -627,6 +634,7 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
             collapse_break_loop::apply(program, function, head)
         }
         Rule::UnrollLoop { function, head } => unroll_loop::apply(program, function, head),
+        Rule::DedupGuards => dedup_guards::apply(program),
         Rule::AssumeEq { function, a, b } => {
             assume_eq::apply(program, function, parse_cell(a)?, parse_cell(b)?)
         }
@@ -752,6 +760,7 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::UnrollLoop { function, head } => {
             unroll_loop::verify(&before, program, function, head)
         }
+        Rule::DedupGuards => dedup_guards::verify(&before, program),
         Rule::AssumeEq { function, a, b } => {
             assume_eq::verify(&before, program, function, parse_cell(a)?, parse_cell(b)?)
         }

@@ -45,6 +45,7 @@ not comparable.
 | + 4 `collapse_break_loop` (the `foreach`/`del` sentinel loops) | 0.93 s / 0.46 GB | 3.77-3.91 s / 1.62 GB |
 | + `split_call` + both update arms inlined (no dispatch left) | 0.94-0.96 s / 0.47 GB | 3.88-3.90 s / 1.65 GB |
 | + 2 `unroll_loop` (pixel-move loops flat) + `merge_blocks` + `cse` forward | 0.88-0.89 s / 0.46 GB | 3.65-3.75 s / 1.65 GB |
+| + `dedup_guards` (501 dominated asserts deleted) | time-neutral | time-neutral |
 
 The store-triangle row is the first change that moved the fragment count: 558
 -> 335 mean fragments per frame at frame 34, split executions 19573 -> 11978.
@@ -464,6 +465,27 @@ sweep) while the hot path shrank by a third. `fold` found nothing to do
 afterwards because constant arithmetic folding is still deliberately
 unimplemented (needs `op.rs`-differential testing); the unrolled counter
 chains (`0+1`, `1+1`, ...) are what it would eat.
+
+### `dedup_guards`: the assert tax (2026-08-03)
+
+The unrolled straight lines made the guard duplication visible:
+`inline` plants an `assert_closure` per spliced call site, `cse` unified
+the values they check but has no key for asserts (they produce nothing),
+and `dce` sees an effect it must keep. The new bulk rule deletes any
+`assert_true`/`assert_pointer`/`assert_closure` dominated by an
+identical assert on the same SSA operands - those asserts are
+deterministic functions of immutable values, so the dominated copy can
+never be the first to fire. `assert_value_cell` reads a heap cell and is
+excluded. The verifier re-checks every deletion against a *surviving*
+covering twin.
+
+501 asserts deleted (program 18,883 -> 18,382). Time-neutral by
+interleaved A/B at 34 and 37 - most of the deleted guards were per-state
+scalar checks, which the interpreter barely feels. The point is K:
+unrolled K 3808 -> **3368** (-12%), guard weight 690 -> 250 (-64%).
+That is paid work the eventual compiled kernel no longer contains.
+`dce` found nothing afterwards (the surviving first asserts keep their
+operands alive), so no `dce` entry follows it in the recipe.
 
 ## Where the time goes
 

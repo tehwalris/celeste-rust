@@ -37,6 +37,7 @@ pub mod fold_select;
 pub mod fuse_breaks;
 pub mod cse;
 pub mod dce;
+pub mod dedup_guards;
 pub mod decompose_branch;
 pub mod decompose_truthy;
 pub mod demote_create;
