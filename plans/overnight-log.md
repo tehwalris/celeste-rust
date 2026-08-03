@@ -45,3 +45,31 @@ remembering if the 100 GB cap ever becomes the constraint. Corrected
 understanding: the merge span is concat, not clones; masked
 materialization only pays if the dedup mask can be computed at
 contiguous-hash speed, which the virtual layouts cannot.
+
+## Attempt 2: parallelism (candidate #3) - LANDED, three commits
+
+The interpreter was entirely single-threaded on a 32-core machine.
+All parallel results are bit-identical to sequential (arguments in the
+commit messages); every step verified through 34, the stack through 37.
+
+* **99c806e parallel dedup**: hash pass over row chunks; bucket phase
+  partitioned by hash high bits (equal rows share a hash, so every
+  duplicate-candidate set lands intact in one partition; first
+  occurrence preserved). At 39: **10.45-10.60 -> 7.70-7.73 s (-26%)**.
+  dedup_state span 4.04 -> 0.99 s.
+* **(follow-up commit) parallel concat**: per-cell merges split across
+  threads. ~-3% median, never slower; merge_groups 1.73 -> 0.98 s.
+* **(follow-up commit) parallel heap filter**: the gathering
+  allocations of filter_vectors_if_needed computed across threads.
+  7.36-7.71 -> 6.98-7.15 s.
+* **1eac28e lane pool + parallel vector ops**: two measured dead ends
+  on the way - (a) per-op scoped-thread spawns: **+75%** (12.5-12.7 s
+  at 39) from spawn cost x hundreds of thousands of ops; (b) routing
+  the sequential path through the generic chunk builder: ~2x slower at
+  34 (inlining of the op closure lost). Final form: persistent
+  condvar-dispatch pool, direct loops verbatim below 128k lanes,
+  pooled chunks above. Neutral-to-slightly-positive at 39; expected to
+  pay at 40-41 (1-1.5M lanes). 32k threshold measured worse.
+
+Net at 39 frames: **10.5 -> ~6.9-7.1 s (-33%)**. Threads capped at 16
+(merges) / 8 (ops) - the work is memory-bound.

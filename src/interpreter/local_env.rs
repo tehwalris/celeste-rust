@@ -210,17 +210,55 @@ impl LocalEnv {
     }
 
     /// Filter vectors down to the `kept` lanes, only transforming values
-    /// that are vectors.
+    /// that are vectors. The per-slot gathers are independent, so large
+    /// filters split the slots across threads - same pattern and threshold
+    /// as the heap's filter.
     #[inline]
     pub fn filter_vectors_in_place(&mut self, kept: &[u32]) {
+        const PARALLEL_KEPT_THRESHOLD: usize = 1 << 14;
         let data = Arc::make_mut(&mut self.data);
-        for v in data.values.iter_mut() {
-            if let Some(val) = v.as_ref() {
-                if let Some(new_val) = val.filter_vectors_if_vector(kept) {
-                    *v = Some(new_val);
+        let threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1)
+            .min(16);
+        let vector_slots = data
+            .values
+            .iter()
+            .filter(|v| {
+                matches!(
+                    v,
+                    Some(Value::Number(crate::interpreter::value::MaybeVector::Vector(_)))
+                        | Some(Value::NumberInterval(
+                            crate::interpreter::value::MaybeVector::Vector(_)
+                        ))
+                        | Some(Value::Bool(crate::interpreter::value::MaybeVector::Vector(_)))
+                )
+            })
+            .count();
+        if kept.len() < PARALLEL_KEPT_THRESHOLD || threads == 1 || vector_slots < 2 {
+            for v in data.values.iter_mut() {
+                if let Some(val) = v.as_ref() {
+                    if let Some(new_val) = val.filter_vectors_if_vector(kept) {
+                        *v = Some(new_val);
+                    }
                 }
             }
+            return;
         }
+        let chunk = data.values.len().div_ceil(threads.min(vector_slots));
+        std::thread::scope(|scope| {
+            for slot_chunk in data.values.chunks_mut(chunk) {
+                scope.spawn(move || {
+                    for v in slot_chunk.iter_mut() {
+                        if let Some(val) = v.as_ref() {
+                            if let Some(new_val) = val.filter_vectors_if_vector(kept) {
+                                *v = Some(new_val);
+                            }
+                        }
+                    }
+                });
+            }
+        });
     }
 
     /// Iterate over occupied `(slot, value)` pairs.

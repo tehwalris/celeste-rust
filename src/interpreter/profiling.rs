@@ -1032,6 +1032,11 @@ impl Drop for FixedPointGuard {
 mod tests {
     use super::*;
 
+    /// The profiling registry is global; tests that reset/enable it race
+    /// under the parallel test runner. Every test touching global state
+    /// takes this lock.
+    static GLOBAL_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_profiler_disabled_by_default() {
         let profiler = Profiler::new();
@@ -1197,6 +1202,7 @@ mod tests {
 
     #[test]
     fn test_span_guard() {
+        let _global = GLOBAL_STATE_LOCK.lock().unwrap();
         reset_profiling();
         enable_profiling();
 
@@ -1211,6 +1217,7 @@ mod tests {
 
     #[test]
     fn test_fixed_point_guard() {
+        let _global = GLOBAL_STATE_LOCK.lock().unwrap();
         reset_profiling();
         enable_profiling();
 
