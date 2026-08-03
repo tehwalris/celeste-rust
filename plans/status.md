@@ -1252,10 +1252,16 @@ the *base* configuration too:
   vectorizing - the mid-frame key shrinks to ~the boundary's 17.
 * **skip no-op dedups**: `dedup_vectorized_state` re-hashes every
   state at every merge point even when it is the untouched output of
-  a previous dedup. In the base recipe the two pre-update hints re-hash
-  ~2 full populations per frame for nothing - roughly *half* of base's
-  0.29 s dedup span. This is the largest known pure-implementation win
-  (~0.14 s at 34) and it stands on its own, hints or no hints.
+  a previous dedup (`make_state_abstract` runs *before* the boundary
+  merge, so the pre-update hints see an already-widened, already-
+  crushed state). CORRECTION of an earlier overestimate ("half of
+  base's dedup, ~0.14 s"): the removal arithmetic refutes that - 89%
+  of all processed rows get removed, which is impossible if half the
+  volume were no-op passes removing nothing. The boundary passes carry
+  the fragment fan-out (~16 fragments x L rows -> L); the hints carry
+  ~2L per frame of ~18L total, so the no-op share is ~10-15% of rows,
+  worth ~0.03-0.05 s at 34. Real but modest; per-merge-site removal
+  counters would pin it exactly.
 
 All three experiment variants differentially identical through 34;
 recipe unchanged (regressions do not land). The rules (`add_hint`,
