@@ -16,6 +16,7 @@ pub mod collision_cache;
 pub mod frontend;
 pub mod game_runner;
 pub mod input;
+pub mod instr_time;
 pub mod instruction_flow;
 pub mod interpreter;
 pub mod ir;

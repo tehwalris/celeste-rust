@@ -144,6 +144,8 @@ fn bench(label: &str, program: &Program, frames: u32, profile: bool) -> Result<(
         celeste_rust::branch_sites::reset();
         celeste_rust::create_sites::reset();
         celeste_rust::interpreter::tracing::enable_tracing();
+        celeste_rust::instr_time::reset();
+        celeste_rust::instr_time::enable();
     }
     let start = std::time::Instant::now();
     for _ in 1..=frames {
@@ -214,6 +216,123 @@ fn bench(label: &str, program: &Program, frames: u32, profile: bool) -> Result<(
                 "{:<34} {:<32} {:>9} {:>9}",
                 function, block, site.splits, site.uniform
             );
+        }
+
+        // Where the program-under-test's own time goes, resolved to blocks
+        // and individual instructions. Timer overhead inflates everything
+        // roughly uniformly; read the shares, not the absolute seconds. A
+        // `call`'s time includes its whole callee.
+        {
+            // (function, local id) -> (block label, instruction text). The
+            // frame driver executes as "__main" and is not one of the
+            // program's functions, so it is indexed separately.
+            let mut locate: std::collections::HashMap<(String, usize), (String, String)> =
+                std::collections::HashMap::new();
+            {
+                let mut index = |name: &str, cfg: &celeste_rust::ir::Cfg| {
+                    let mut visit = |label: &str, block: &celeste_rust::ir::Block| {
+                        for (id, instr) in &block.instructions {
+                            locate.insert(
+                                (name.to_string(), usize::from(*id)),
+                                (
+                                    label.to_string(),
+                                    celeste_rust::rewrite::print::format_instruction(instr),
+                                ),
+                            );
+                        }
+                    };
+                    visit("__entry", &cfg.entry);
+                    for (label, block) in &cfg.named {
+                        visit(label.as_str(), block);
+                    }
+                };
+                for (name, fun) in &program.functions {
+                    index(name.as_str(), &fun.cfg);
+                }
+                index("__main", program.frame_cfg());
+            }
+
+            let rows = celeste_rust::instr_time::report();
+            let total_us: u128 = rows.iter().map(|(_, _, d, _)| d.as_micros()).sum();
+
+            let mut by_block: std::collections::HashMap<(String, String), (u128, u64)> =
+                std::collections::HashMap::new();
+            let mut by_kind: std::collections::HashMap<String, u128> =
+                std::collections::HashMap::new();
+            for (function, id, duration, samples) in &rows {
+                let (block, text) = locate
+                    .get(&(function.clone(), *id))
+                    .cloned()
+                    .unwrap_or_else(|| ("?".to_string(), "?".to_string()));
+                let entry = by_block.entry((function.clone(), block)).or_default();
+                entry.0 += duration.as_micros();
+                entry.1 += samples;
+                let kind = text
+                    .split([' ', '('])
+                    .find(|w| !w.starts_with('%') && !w.is_empty() && *w != "=")
+                    .unwrap_or("?")
+                    .to_string();
+                *by_kind.entry(kind).or_default() += duration.as_micros();
+            }
+
+            println!();
+            println!(
+                "program time under test: {:.2}s measured across {} distinct instructions",
+                total_us as f64 / 1e6,
+                rows.len()
+            );
+
+            let mut kind_rows: Vec<(String, u128)> = by_kind.into_iter().collect();
+            kind_rows.sort_by_key(|(k, us)| (std::cmp::Reverse(*us), k.clone()));
+            println!("{:<24} {:>9} {:>7}", "by instruction kind", "time (s)", "%");
+            for (kind, us) in kind_rows.iter().take(12) {
+                println!(
+                    "{:<24} {:>9.3} {:>6.1}%",
+                    kind,
+                    *us as f64 / 1e6,
+                    100.0 * *us as f64 / total_us.max(1) as f64
+                );
+            }
+
+            let mut block_rows: Vec<((String, String), (u128, u64))> =
+                by_block.into_iter().collect();
+            block_rows.sort_by_key(|(k, (us, _))| (std::cmp::Reverse(*us), k.clone()));
+            println!();
+            println!(
+                "{:<58} {:>9} {:>7} {:>10}",
+                "hottest blocks (function::block)", "time (s)", "%", "samples"
+            );
+            for ((function, block), (us, samples)) in block_rows.iter().take(15) {
+                println!(
+                    "{:<58} {:>9.3} {:>6.1}% {:>10}",
+                    format!("{}::{}", function, block),
+                    *us as f64 / 1e6,
+                    100.0 * *us as f64 / total_us.max(1) as f64,
+                    samples
+                );
+            }
+
+            println!();
+            println!(
+                "{:<7} {:>9} {:>7} {:>9}  {}",
+                "id", "time (s)", "%", "samples", "hottest instructions"
+            );
+            for (function, id, duration, samples) in rows.iter().take(30) {
+                let (block, text) = locate
+                    .get(&(function.clone(), *id))
+                    .cloned()
+                    .unwrap_or_else(|| ("?".to_string(), "?".to_string()));
+                println!(
+                    "%{:<6} {:>9.3} {:>6.1}% {:>9}  {}::{}: {}",
+                    id,
+                    duration.as_secs_f64(),
+                    100.0 * duration.as_micros() as f64 / total_us.max(1) as f64,
+                    samples,
+                    function,
+                    block,
+                    text
+                );
+            }
         }
 
         // Which convertible triangles are actually worth converting.

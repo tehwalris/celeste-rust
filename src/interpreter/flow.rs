@@ -200,7 +200,9 @@ impl<'a> BoundInterpreterFlow<'a> {
                 let mut states_b = Vec::new();
                 let mut current_is_a = true;
 
+                let timing = crate::instr_time::enabled();
                 for (local_id, instruction) in non_phi_instructions {
+                    let started = if timing { Some(std::time::Instant::now()) } else { None };
                     let (src, dst) = if current_is_a {
                         (&mut states_a, &mut states_b)
                     } else {
@@ -224,6 +226,9 @@ impl<'a> BoundInterpreterFlow<'a> {
                         }
                     }
 
+                    if let Some(started) = started {
+                        crate::instr_time::record(usize::from(*local_id), started.elapsed());
+                    }
                     current_is_a = !current_is_a;
                 }
 

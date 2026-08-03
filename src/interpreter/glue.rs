@@ -75,6 +75,9 @@ fn interpret_prepared_cfg_inner(
 
     // Lightweight tracing span for CFG execution (low overhead)
     let _trace = TraceSpan::new(name.as_deref().unwrap_or("__main"), "cfg");
+    // Attribute per-instruction time (see `instr_time`) to this function while
+    // it runs; a stack, because calls nest cfg executions.
+    let _instr_fn = crate::instr_time::enter_function(name.as_deref().unwrap_or("__main"));
 
     // Create profiling guard for this fixed-point invocation (full profiler)
     let fp_guard = FixedPointGuard::new(name.clone());
