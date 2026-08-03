@@ -37,6 +37,7 @@ not comparable.
 | + wall-jump stores absorbed (`speculate` with a pointer guard) | 1.78 s / 0.61 GB | - |
 | + pixel loops masked (`mask_loop` x2, a61 chains eager) | 1.59 s / 0.63 GB | - |
 | + wall-jump arm eager (`fold_reflexive` dead gates, masked `speculate_region`) | 1.46 s / 0.53 GB | - |
+| + `spikes_at` nest masked (`fuse_breaks`, `mask_loop` `span`/`break_to`) | 1.40 s / 0.46 GB | - |
 
 The store-triangle row is the first change that moved the fragment count: 558
 -> 335 mean fragments per frame at frame 34, split executions 19573 -> 11978.
@@ -65,11 +66,11 @@ here that tracks distance to a compilable kernel.
 
 |  | original | rewritten |
 |---|---|---|
-| dynamic instrs/frame, mean | 2122 | 3728 |
-| dynamic instrs/frame, max | 6422 | 9021 |
-| distinct blocks reached | 450 | 261 |
-| K, fully unrolled | 8321 | 9682 |
-| K, loops kept as loops | 2963 | 3934 |
+| dynamic instrs/frame, mean | 2122 | 3861 |
+| dynamic instrs/frame, max | 6422 | 9146 |
+| distinct blocks reached | 450 | 255 |
+| K, fully unrolled | 8321 | 9807 |
+| K, loops kept as loops | 2963 | 3980 |
 
 By instruction kind, rewritten: heap 39.6%, arith 30.9%, const 7.8%,
 terminator 6.7%, guard 5.4%, global 5.0%, phi 3.1%, call 1.1%. `arith`,
@@ -409,6 +410,45 @@ Every remaining split is now `btn`-tainted, `spikes_at`, or a small
 exposure - there is no convertible triangle, diamond or maskable region
 left that splits (the profile's triangle table shows 0 splits across all
 139 tracked shapes).
+
+**Update, after the `spikes_at` nest went eager** (`mget` promoted to a
+pure builtin, 7 `pin_builtin`, 1 `speculate_region` triangle, 3
+`fuse_breaks` collapsing the four-tile early-exit cascade to one break,
+then `mask_loop` twice with the new `span` and `break_to` fields -
+inside-out, the inner pass leaving exactly the merged shape the outer pass
+consumes):
+
+    branches: 505 of 12166 executions split the state, across 11 distinct sites
+
+Frame 34: 1.46 s -> 1.40 s, memory 0.53 -> 0.46 GB, fragments 46 -> 16
+mean (248 -> 86 max), splits 1531 -> 505. The 96 `spikes_at` splits are
+gone, and everything downstream shrank with the fragment count it
+multiplies - the same dynamic as every stage since the store triangles,
+but larger, because the tile loops split *early* in the frame and every
+later site paid per fragment. The remainder:
+
+| family | splits | what it is |
+|---|---|---|
+| `btn` x6 (the `in_j2_0xx_if_join_10` sites) | 331 | input fan-out |
+| `in_i1_074_cont` (the outer dash diamond) | 108 | arms contain `btn` calls, waits for the endgame |
+| `in_k1039_cont` (the dash gate) | 30 | condition reads `btn`, arm allocs |
+| `__main` `in_i1_012` x2, `anonymous_61` `__entry` | 36 | small exposures |
+
+The kill branch (`br found ? kill : continue`) that the conversion was
+expected to expose does not appear as a split site at 34 frames: the
+`in_j2_*` sites above are the `btn` inlines, not `kill_player`. K paid a
+small price for the eager 2x2 tile window running every frame: loops-kept
+3934 -> 3980, mean dynamic 3728 -> 3861.
+
+Two guards carry the stage's premises: `assert_true(init >= 0)` and
+`assert_true(bound - init < span + 1)` per loop (strict, because
+`min(15,(x+w-1)/8)` has no `flr` and the first guard draft with `<= span`
+failed loudly on fractional bounds two lanes wide). One interpreter
+extension was needed: eager execution feeds `%` negative and fractional
+dividends (`y % 8` for lanes above the screen), so `Pico8Num::checked_rem`
+now implements PICO-8's floored modulo (`-2 % 8 == 6`) for positive
+integer divisors - a strict generalisation of what the OCaml reference
+computes on its non-negative domain, checked by the differential run.
 
 Following the branch-site table, `btn` was rewritten to be branch-free: a
 `__concretize` builtin that turns the `UnknownBool` button into a per-lane

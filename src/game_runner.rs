@@ -334,17 +334,20 @@ fn builtin_array_table_drop_last(mut state: State, args: Vec<Value>) -> Result<V
     Ok(vec![(state, Value::Nil(None))])
 }
 
+/// Registered through `add_pure_builtin`: a function of its arguments alone.
+/// The cart data is captured at construction and the game never calls `mset`,
+/// so the map it reads is immutable for the lifetime of the environment.
 fn make_builtin_mget(
     cart_data: std::sync::Arc<cart_data::CartData>,
-) -> impl Fn(State, Vec<Value>) -> Result<Vec<(State, Value)>> {
-    move |state: State, args: Vec<Value>| {
+) -> impl Fn(&[Value]) -> Result<Value> {
+    move |args: &[Value]| {
         if args.len() != 2 { return Err(anyhow!("mget requires 2 arguments")); }
         match (&args[0], &args[1]) {
             (Value::Number(x), Value::Number(y)) => {
                 let result = MaybeVector::map2(x, y, |x, y| {
                     Pico8Num::from_i16(cart_data.mget(*x, *y).expect("mget failed") as i16)
                 });
-                Ok(vec![(state, Value::Number(result))])
+                Ok(Value::Number(result))
             }
             _ => Err(anyhow!("mget: arguments must be numbers")),
         }
@@ -563,7 +566,7 @@ pub fn create_fixed_env_with_game_builtins() -> FixedEnv {
     );
     eprintln!("[game_runner] Created collision cache for room (1, 0)");
 
-    fixed_env.add_builtin("mget", make_builtin_mget(cart_data.clone()));
+    fixed_env.add_pure_builtin("mget", make_builtin_mget(cart_data.clone()));
     fixed_env.add_builtin("fget", make_builtin_fget(cart_data.clone()));
     fixed_env.add_pure_builtin("tile_flag_at", make_builtin_tile_flag_at(cart_data, collision_cache));
     fixed_env

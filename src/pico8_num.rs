@@ -172,13 +172,20 @@ impl Pico8Num {
     /// program, and `if_convert` deliberately runs arithmetic on lanes that
     /// would not have reached it, so this is a case the interpreter has to
     /// report rather than abort on.
+    ///
+    /// PICO-8's `%` is floored modulo on the fixed-point representation: the
+    /// result takes the divisor's sign, so `-2 % 8 == 6` and `-2.5 % 8 ==
+    /// 5.5`. For a positive integer divisor that is exactly
+    /// `((raw % raw_rhs) + raw_rhs) % raw_rhs`, which also reproduces what
+    /// the OCaml reference computes on its narrower non-negative domain
+    /// (whole part mod, fraction kept). A non-positive or fractional divisor
+    /// stays unmodelled.
     pub fn checked_rem(self, rhs: Self) -> Option<Self> {
-        let lhs = self.as_i16()?;
-        let rhs = rhs.as_i16()?;
-        if lhs < 0 || rhs <= 0 {
+        let rhs_int = rhs.as_i16()?;
+        if rhs_int <= 0 {
             return None;
         }
-        Some(Self::from_i16(lhs % rhs))
+        Some(Self(self.0.rem_euclid(rhs.0)))
     }
 }
 
@@ -291,6 +298,28 @@ impl fmt::Debug for Pico8NumInterval {
 #[cfg(test)]
 mod tests {
     use crate::pico8_num::{constants, int, Pico8Num};
+
+    /// PICO-8's `%` is floored: the result takes the divisor's sign, and the
+    /// fixed-point fraction participates.
+    #[test]
+    fn test_checked_rem_is_floored_modulo() {
+        let n = Pico8Num::from_i16;
+        let eight = n(8);
+        assert_eq!(n(10).checked_rem(eight), Some(n(2)));
+        assert_eq!(n(-2).checked_rem(eight), Some(n(6)));
+        assert_eq!(n(-16).checked_rem(eight), Some(n(0)));
+        let half = Pico8Num::from_parts(2, 0x8000); // 2.5
+        assert_eq!(half.checked_rem(eight), Some(half));
+        let neg_half = half.const_neg(); // -2.5
+        assert_eq!(
+            neg_half.checked_rem(eight),
+            Some(Pico8Num::from_parts(5, 0x8000)) // 5.5
+        );
+        // Non-positive or fractional divisors stay unmodelled.
+        assert_eq!(n(1).checked_rem(n(0)), None);
+        assert_eq!(n(1).checked_rem(n(-8)), None);
+        assert_eq!(n(1).checked_rem(half), None);
+    }
 
     #[test]
     fn test_from_i16() {

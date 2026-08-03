@@ -291,7 +291,7 @@ mod tests {
     #[test]
     fn refuses_a_builtin_that_is_not_pure() {
         let mut p = program_of(call_site());
-        for name in ["add", "__split_by_flr", "mget", "not_a_builtin"] {
+        for name in ["add", "__split_by_flr", "fget", "not_a_builtin"] {
             let error = apply(&mut p, "f", id(12), name).unwrap_err().to_string();
             assert!(error.contains("not one of the pure builtins"), "{}: {}", name, error);
         }

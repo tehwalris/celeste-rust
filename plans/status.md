@@ -1,6 +1,6 @@
 # Status (2026-08)
 
-Branch `rewrite`. Build is warning-free, 319 tests pass, working tree clean.
+Branch `rewrite`. Build is warning-free, 332 tests pass, working tree clean.
 
 ## Measured, frame 34 (the standard iteration benchmark)
 
@@ -20,6 +20,8 @@ Branch `rewrite`. Build is warning-free, 319 tests pass, working tree clean.
 | + `decompose_truthy` x15, 3 more conversions | 2.36 s | 0.74 GB |
 | + 2 diamonds absorbed (`absorb_stores`) | 1.99 s | 0.64 GB |
 | + `is_solid` chains eager (`speculate_region`), consumers absorbed | 1.82 s | 0.62 GB |
+| + pixel loops masked, wall-jump arm eager | 1.46 s | 0.53 GB |
+| + `spikes_at` nest masked (`fuse_breaks` + `span`/`break_to` `mask_loop`) | 1.40 s | 0.46 GB |
 
 Lane count is identical throughout (92,713), which is the first thing to check
 when a rewrite claims a win. Frame 37 confirms the same ratios (7.87 s, from
@@ -708,6 +710,62 @@ inlined), and ~36 of small exposures. The next structural work is
 therefore the endgame itself: make `btn` lane expansion pay by doing it
 after, not before, the remaining branches stop splitting - plus K
 reduction (heap is 39.6% of the kernel) once the frame is one state.
+
+### The `spikes_at` nest went eager - two-level breaks landed (2026-08-03)
+
+The last mask-family split site. The inlined `spikes_at` is a 2-level
+tile-loop nest whose four tile checks each `return true` - four break
+edges jumping over *both* loops into a phi at the continuation, per-lane
+bounds on both counters, and per-lane *inits* too
+(`for i = max(0, flr(x/8)), min(15, (x+w-1)/8)`). `kill_player` turned
+out to be a non-issue: it sits cleanly downstream behind the hit flag.
+
+Four pieces, applied inside-out (entries g060-g077):
+
+* **`mget` is now a pure builtin** (the cart never calls `mset`; same
+  captured-immutable argument as `tile_flag_at`), so `pin_builtin` covers
+  the nest's calls and the body becomes speculatable.
+* **`fuse_breaks`** (new rule, ~200 lines): merges two consecutive
+  early-exit branches - the second test block goes eager into the first,
+  the conditions `or` together, the first break block goes unreachable
+  for `dce`. Sound because both break blocks must feed the join's phis
+  the same bool constant. Three applications collapse the cascade to one
+  break branch.
+* **`mask_loop` grew `span` and `break_to`** (both opt-in; the pixel-loop
+  entries replay byte-identically). `span` handles per-lane init: run
+  `span + 1` uniform iterations under `assert_true(init >= 0)` and
+  `assert_true(bound - init < span + 1)` - strict, because Lua `for`
+  bounds are fractional here (no `flr`), which the first guard draft
+  learned loudly. `break_to` handles the multi-level break: the break
+  edge is deleted and the exit carries the break out - the inner pass
+  leaves `br active ? outer_latch : cont` (still splitting), which is
+  *exactly the merged shape* the outer pass then consumes, leaving no
+  branch at all: the join's phi entry becomes
+  `select active ? false : true`, feeding the kill branch directly.
+* **`Pico8Num::checked_rem` is now PICO-8's floored modulo** for positive
+  integer divisors (`-2 % 8 == 6`, fractions participate). Eager
+  execution feeds `y % 8` negative and fractional dividends for lanes the
+  original loop skipped; the old non-negative-integer-only model was a
+  strict subset, so nothing previously reachable changed.
+
+Also in this stage: `loop_bound` accepts a bound defined *inside* the
+loop when it is a small constant (the masked inner loop's `k <= 1` is
+exactly that), checked statically instead of by the `< 32767` runtime
+guard - constants defined outside now skip that guard too, which the
+recipe replay confirmed changes no existing emission.
+
+Measured at frame 34: 1.46 s -> 1.40 s, memory 0.53 -> 0.46 GB, fragments
+46 -> 16 mean (248 -> 86 max), splits 1531 -> 505 across 11 sites. The 96
+`spikes_at` splits are gone and every downstream site shrank with the
+fragment count: `btn` 943 -> 331, the dash diamond 372 -> 108, the dash
+gate 84 -> 30. The kill branch does not split at 34 frames. K: loops-kept
+3934 -> 3980 (the eager 2x2 tile window runs every frame). Differential
+identical through 34.
+
+What remains is exactly the `btn`-tainted family (469 = `btn` x6 331 +
+dash diamond 108 + dash gate 30) plus ~36 small exposures. The next
+structural work is unchanged: the `btn` lane-expansion endgame, then K
+reduction (heap is 39.1% of the kernel).
 
 ### Later: `assume_eq`, whole-function field promotion
 

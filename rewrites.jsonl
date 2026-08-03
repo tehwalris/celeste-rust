@@ -729,4 +729,22 @@
 {"id":"g057","rule":"speculate_region","fn":"player.update_21","head":"if_body_135","arm":"if_body_139","join":"if_join_141","mask":true,"why":"the grace diamond: the wall-jump stores in both arms land per lane through masked selects on grace>0"}
 {"id":"g058","rule":"speculate_region","fn":"player.update_21","head":"and_or_join_126","arm":"if_body_135","mask":true,"why":"the jump branch: the whole wall-jump arm goes eager, its four masked stores re-masked by the jump condition"}
 {"id":"g059","rule":"merge_blocks"}
+{"id":"g060","rule":"pin_builtin","fn":"player.update_21","at":"%939","name":"flr"}
+{"id":"g061","rule":"pin_builtin","fn":"player.update_21","at":"%940","name":"max"}
+{"id":"g062","rule":"pin_builtin","fn":"player.update_21","at":"%949","name":"min"}
+{"id":"g063","rule":"pin_builtin","fn":"player.update_21","at":"%1031","name":"flr"}
+{"id":"g064","rule":"pin_builtin","fn":"player.update_21","at":"%1032","name":"max"}
+{"id":"g065","rule":"pin_builtin","fn":"player.update_21","at":"%1041","name":"min"}
+{"id":"g066","rule":"pin_builtin","fn":"player.update_21","at":"%1097","name":"mget","why":"the spikes_at tile read; the map is immutable (no mset in the cart), see PURE_BUILTINS"}
+{"id":"g067","rule":"speculate_region","fn":"player.update_21","head":"in_i1_068_if_condition_649","arm":"in_i1_068_and_or_continue_678","why":"the tile==43 and-or triangle inside the spikes_at inner body; flattening it makes the body a pure early-exit cascade"}
+{"id":"g068","rule":"merge_blocks"}
+{"id":"g069","rule":"fuse_breaks","fn":"player.update_21","head":"in_i1_068_for_body_start_644","why":"spikes_at cascade: fold the tile==17 and tile==27 breaks together"}
+{"id":"g070","rule":"fuse_breaks","fn":"player.update_21","head":"in_i1_068_for_body_start_644","why":"fold in the tile==43 break"}
+{"id":"g071","rule":"fuse_breaks","fn":"player.update_21","head":"in_i1_068_for_body_start_644","why":"fold in the tile==59 break; the inner body now has a single break branch"}
+{"id":"g072","rule":"dce"}
+{"id":"g073","rule":"mask_loop","fn":"player.update_21","head":"in_i1_068_for_head_643","span":1,"break_to":"in_i1_068_cont","why":"the spikes_at inner tile loop; the player hitbox spans at most 2 tiles in y, and the hit breaks out past both loops"}
+{"id":"g074","rule":"mask_loop","fn":"player.update_21","head":"in_i1_068_for_head_638","span":1,"break_to":"in_i1_068_cont","why":"the outer tile loop, in the merged shape the inner conversion leaves; the whole nest is now branch-free"}
+{"id":"g075","rule":"fold"}
+{"id":"g076","rule":"dce"}
+{"id":"g077","rule":"merge_blocks"}
 {"id":"s1","rule":"allocate_slots"}

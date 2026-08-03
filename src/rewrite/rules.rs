@@ -29,6 +29,7 @@ pub mod convert_ternary;
 pub mod if_convert;
 pub mod fold;
 pub mod fold_reflexive;
+pub mod fuse_breaks;
 pub mod cse;
 pub mod dce;
 pub mod decompose_truthy;

@@ -252,7 +252,7 @@ pub fn interpret_binary_op(l: &Value, op: BinaryOp, r: &Value) -> Result<Value> 
                 None => Ok(Value::Number(result)),
                 Some((l, r)) => Err(anyhow!(
                     "unsupported operands for %: {:?} % {:?} (this implementation \
-                     only models non-negative integers with a positive divisor)",
+                     only models a positive integer divisor)",
                     l,
                     r
                 )),
@@ -885,12 +885,15 @@ mod select_tests {
         );
     }
 
-    /// `%` is only modelled for non-negative integers with a positive divisor,
-    /// and `if_convert` deliberately runs arithmetic on lanes that would not
-    /// have reached it - so this has to be an error, not a panic.
+    /// `%` is only modelled for a positive integer divisor, and `if_convert`
+    /// deliberately runs arithmetic on lanes that would not have reached it -
+    /// so out of range has to be an error, not a panic. In range it is
+    /// PICO-8's floored modulo: a negative dividend takes the divisor's sign.
     #[test]
     fn modulo_out_of_range_is_an_error_not_a_panic() {
-        let err = interpret_binary_op(&num(-2), BinaryOp::Percent, &num(8)).unwrap_err();
+        let err = interpret_binary_op(&num(-2), BinaryOp::Percent, &num(0)).unwrap_err();
         assert!(format!("{}", err).contains("unsupported operands"), "{}", err);
+        let ok = interpret_binary_op(&num(-2), BinaryOp::Percent, &num(8)).unwrap();
+        assert_eq!(format!("{:?}", ok), format!("{:?}", num(6)));
     }
 }

@@ -473,15 +473,31 @@ pub(super) fn loop_bound(
         None => false,
         Some(label) => body.contains(label),
     };
+    // A bound defined inside the loop is only invariant if nothing about it
+    // can vary: a small constant qualifies (a masked inner loop's uniform
+    // trip count is exactly this shape), and its termination claim is
+    // checked right here instead of by a runtime guard.
     require(
-        !bound_in_body,
+        !bound_in_body || is_small_constant(fun, *bound),
         format!(
-            "the bound %{} of loop header '{}' is defined inside the loop",
+            "the bound %{} of loop header '{}' is defined inside the loop \
+             and is not a small constant",
             usize::from(*bound),
             header.as_str()
         ),
     )?;
     Ok(*bound)
+}
+
+/// Is this a `NumberConstant` provably below the `< 32767` termination
+/// guard's threshold? Such a bound needs no runtime guard: the check the
+/// guard would make is decided at rewrite time.
+pub(super) fn is_small_constant(fun: &FunDef, bound: LocalId) -> bool {
+    matches!(
+        defining_instruction(fun, bound),
+        Some(Instruction::NumberConstant { value })
+            if value.as_i16().is_some_and(|v| v < 32767)
+    )
 }
 
 fn site(
@@ -666,6 +682,9 @@ fn site(
         }
         for (latch, header) in back_edges(fun, blocks, entry) {
             let bound = loop_bound(fun, blocks, &latch, &header)?;
+            if is_small_constant(fun, bound) {
+                continue;
+            }
             if bounds.iter().any(|b| b.bound == bound) {
                 continue;
             }
@@ -1272,7 +1291,16 @@ mod tests {
             br_if(10, "setup", "join"),
         );
         let setup = block(
-            vec![(id(11), num(1)), (id(12), num(3)), (id(20), num(1))],
+            vec![
+                (id(11), num(1)),
+                // The bound is computed, not constant, so the termination guard
+                // is planted (a constant bound is checked statically instead).
+                (
+                    id(12),
+                    Instruction::BinaryOp { left: id(11), op: BinaryOp::Plus, right: id(11) },
+                ),
+                (id(20), num(1)),
+            ],
             902,
             br("loop_head"),
         );
@@ -1355,8 +1383,8 @@ mod tests {
         );
         assert!(text.contains("assert_true"), "{}", text);
         // The guard sits right after the bound's definition: between the
-        // bound constant and the step constant that follows it in `setup`.
-        let bound_at = text.find("num Pico8Num(\"0x30000\")").unwrap();
+        // bound and the step constant that follows it in `setup`.
+        let bound_at = text.find("%12 = %11 + %11").unwrap();
         let guard_at = text.find("assert_true").unwrap();
         let step_at = text.find("%20 = num").unwrap();
         assert!(bound_at < guard_at && guard_at < step_at, "{}", text);

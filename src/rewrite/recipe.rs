@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use super::program::Program;
 use super::rules::{
     absorb_stores, allocate_slots, convert_ternary, cse, dce, decompose_truthy, demote_create,
-    fold, fold_reflexive, if_convert, inline, mask_loop, merge_blocks, pin_builtin,
+    fold, fold_reflexive, fuse_breaks, if_convert, inline, mask_loop, merge_blocks, pin_builtin,
     promote_capture,
     promote_cell, sink_store, speculate, speculate_region,
 };
@@ -204,8 +204,35 @@ pub enum Rule {
         /// the conditional branch on it.
         head: String,
         /// The uniform trip count. Iterations run for counters 0..=limit;
-        /// a state whose per-lane bound exceeds it fails loudly.
-        limit: i16,
+        /// a state whose per-lane bound exceeds it fails loudly. Exactly one
+        /// of `limit` and `span` must be given.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<i16>,
+        /// Like `limit`, but for a loop whose *init* is per-lane too: the
+        /// loop runs `span + 1` uniform iterations, guarded by
+        /// `assert_true(init >= 0)` and `assert_true(bound - init < span + 1)`
+        /// (strict - a Lua `for` bound may be fractional).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        span: Option<i16>,
+        /// Opt-in: the loop's break edge leads to this external join instead
+        /// of the exit (a multi-level `break`, as in the inlined
+        /// `spikes_at`). The break value - a bool constant in the join's
+        /// phis - is re-routed through the exit: as a conditional branch on
+        /// the loop's `active` flag, or merged by select when the exit
+        /// already falls through to the join.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        break_to: Option<String>,
+    },
+    /// Merge two consecutive early-exit branches into one: the second test
+    /// block's instructions go eager into the head, the conditions combine
+    /// through an `or` select, and the first break block goes unreachable
+    /// for a later `dce` to sweep. Both break blocks must feed the join's
+    /// phis the same bool constant, so the switch of edges is invisible.
+    FuseBreaks {
+        #[serde(rename = "fn")]
+        function: String,
+        /// The block holding the earlier of the two early-exit branches.
+        head: String,
     },
     /// Move a triangle arm's trailing store past the join: a guarded load
     /// before the branch, a phi at the join, the store after it. The
@@ -245,6 +272,7 @@ impl Rule {
             Rule::Speculate { .. } => "speculate",
             Rule::SpeculateRegion { .. } => "speculate_region",
             Rule::MaskLoop { .. } => "mask_loop",
+            Rule::FuseBreaks { .. } => "fuse_breaks",
             Rule::SinkStore { .. } => "sink_store",
             Rule::AbsorbStores { .. } => "absorb_stores",
             Rule::PromoteCell { .. } => "promote_cell",
@@ -433,9 +461,10 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::SpeculateRegion { function, head, arm, join, mask } => {
             speculate_region::apply(program, function, head, arm, join.as_deref(), *mask)
         }
-        Rule::MaskLoop { function, head, limit } => {
-            mask_loop::apply(program, function, head, *limit)
+        Rule::MaskLoop { function, head, limit, span, break_to } => {
+            mask_loop::apply(program, function, head, *limit, *span, break_to.as_deref())
         }
+        Rule::FuseBreaks { function, head } => fuse_breaks::apply(program, function, head),
         Rule::AbsorbStores { function, head } => absorb_stores::apply(program, function, head),
         Rule::SinkStore { function, at } => {
             sink_store::apply(program, function, parse_cell(at)?)
@@ -517,8 +546,11 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::SpeculateRegion { function, head, arm, join, mask } => {
             speculate_region::verify(&before, program, function, head, arm, join.as_deref(), *mask)
         }
-        Rule::MaskLoop { function, head, limit } => {
-            mask_loop::verify(&before, program, function, head, *limit)
+        Rule::MaskLoop { function, head, limit, span, break_to } => {
+            mask_loop::verify(&before, program, function, head, *limit, *span, break_to.as_deref())
+        }
+        Rule::FuseBreaks { function, head } => {
+            fuse_breaks::verify(&before, program, function, head)
         }
         Rule::AbsorbStores { function, head } => {
             absorb_stores::verify(&before, program, function, head)
