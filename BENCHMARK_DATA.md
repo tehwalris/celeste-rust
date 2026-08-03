@@ -592,6 +592,55 @@ share, which slot allocation already cut from 33% to 13%.
 Every frame still ends as **exactly one vectorized state**; all fragmentation is
 intra-frame and fully re-merged.
 
+### The merge machinery measured against its task (2026-08-03)
+
+Is the ~50% merge share an implementation problem or the task's real
+cost? `bench --profile` now prints the merge data volume (new
+`merge_stats` counters, always on, per-call granularity, no measurable
+overhead), and a synthetic calibration replicated the dedup algorithm
+on workload-shaped data. Answer: **the implementation is within ~20% of
+optimal for this algorithm; the surprise is the task size.**
+
+The volume, at 34 frames (0.88 s wall):
+
+    merge data volume: 102 vectorize calls, 1012 states in -> 109 out (109 groups)
+      concatenate: 929 states x ~279 heap cells = 0.3M cell clones (0.11s, 410 ns/cell)
+      dedup: 109 calls, 5.68M rows x 17.1 row-weighted vector columns = 96.9M
+             elements, 5.04M rows removed (89%)
+      dedup throughput: 0.29s dedup_state self = 3.0 ns/element (50.4 ns/row)
+
+At 37 frames (3.7 s wall): 23.61M rows, 90% removed, 58.5 ns/row, and
+`merge_groups` cloning slows to 1268 ns/cell under 1.7 GB RSS.
+
+Reading:
+
+* **Throughput is near-optimal.** A stripped reimplementation of the
+  same algorithm (dense i32 columns, same FxHash fold, same bucket
+  structure, 170k rows x 17 columns, 89% dups) runs at 42.8 ns/row vs
+  50.4 measured - and the elementwise hash pass is the *minor* term
+  (0.4-3 ns/element; the ~40 ns/row hashmap probe/insert dominates
+  both). A sort-based formulation ("sort the states, dedup
+  consecutive") measures *slower*: 49.4 ns/row for the sort+scan alone,
+  on top of the same hashing. Micro-optimization (open addressing, no
+  per-bucket `Vec`) might buy 15-20% of the dedup span, i.e. ~0.05 s
+  at 34. There is no large constant factor hiding here.
+* **The task is ~60-90x the surviving lanes.** 5.68M rows are hashed
+  to keep 0.64M distinct (92.7k lanes at the final boundary); at 37 it
+  is 23.6M rows for 269k lanes. Every lane fans across the frame's
+  unknown branches (6 btn splits send whole states down both edges,
+  unfiltered) and gets re-crushed at ~3 merge points per frame
+  (boundary + 2 `hint_normalize`). The 89-90% duplicate rate *is the
+  search doing its job* - most button choices don't change the
+  outcome, and dedup is where that convergence is detected.
+* **Consequence**: the merge machinery is the search's pruning
+  operator running at ~50 ns per candidate; the lever is not its speed
+  but its input volume - fewer rows manufactured per frame (the lane
+  expansion endgame) or a representation where duplicate detection is
+  cheaper than per-row hashing (hierarchically ordered lanes, where
+  most columns are runs). Caching row hashes across a frame's 3 merge
+  points is the one modest implementation win available (~a third of
+  row cost at the repeat sites).
+
 ### Which branches actually split (2026-08)
 
 `rewrite bench --profile` attributes every conditional-branch execution to its

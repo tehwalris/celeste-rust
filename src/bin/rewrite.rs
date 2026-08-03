@@ -146,6 +146,7 @@ fn bench(label: &str, program: &Program, frames: u32, profile: bool) -> Result<(
         celeste_rust::interpreter::tracing::enable_tracing();
         celeste_rust::instr_time::reset();
         celeste_rust::instr_time::enable();
+        celeste_rust::merge_stats::reset();
     }
     let start = std::time::Instant::now();
     for _ in 1..=frames {
@@ -201,6 +202,50 @@ fn bench(label: &str, program: &Program, frames: u32, profile: bool) -> Result<(
             "{:<28} {:>9.2} of {:.2}s wall clock (the rest is outside any span)",
             "measured", measured as f64 / 1e6, elapsed.as_secs_f64()
         );
+
+        // The merge machinery's actual data volume, so its span times can be
+        // read as throughput. `dedup elements` is rows x vector columns - the
+        // row-key material actually hashed; `heap cells` counts every cell of
+        // every merged state that the concatenation cloned.
+        {
+            let m = celeste_rust::merge_stats::snapshot();
+            let span_s = |name: &str| -> f64 {
+                rows.iter()
+                    .find(|r| r.name == name)
+                    .map(|r| r.self_us as f64 / 1e6)
+                    .unwrap_or(0.0)
+            };
+            let dedup_s = span_s("dedup_state");
+            let merge_self_s = span_s("merge_groups");
+            println!();
+            println!(
+                "merge data volume: {} vectorize calls, {} states in -> {} out ({} groups)",
+                m.vectorize_calls, m.states_in, m.states_out, m.groups
+            );
+            println!(
+                "  concatenate: {} states x ~{} heap cells = {:.1}M cell clones ({:.2}s merge_groups self, {:.0} ns/cell)",
+                m.concat_states,
+                m.concat_cells.checked_div(m.concat_states).unwrap_or(0),
+                m.concat_cells as f64 / 1e6,
+                merge_self_s,
+                merge_self_s * 1e9 / m.concat_cells.max(1) as f64
+            );
+            println!(
+                "  dedup: {} calls, {:.2}M rows x {:.1} row-weighted vector columns = {:.1}M elements, {:.2}M rows removed ({:.0}%)",
+                m.dedup_calls,
+                m.dedup_rows as f64 / 1e6,
+                m.dedup_elems as f64 / m.dedup_rows.max(1) as f64,
+                m.dedup_elems as f64 / 1e6,
+                m.dedup_rows_removed as f64 / 1e6,
+                100.0 * m.dedup_rows_removed as f64 / m.dedup_rows.max(1) as f64
+            );
+            println!(
+                "  dedup throughput: {:.2}s dedup_state self = {:.1} ns/element ({:.1} ns/row)",
+                dedup_s,
+                dedup_s * 1e9 / m.dedup_elems.max(1) as f64,
+                dedup_s * 1e9 / m.dedup_rows.max(1) as f64
+            );
+        }
 
         let (splits, executions, distinct) = celeste_rust::branch_sites::totals();
         println!();

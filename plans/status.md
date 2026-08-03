@@ -1142,6 +1142,28 @@ triangles, nine dash-gate `create` demotes, entries m010-m050) flattens
 into select-stores with no `expand`. Time/memory neutral at 34 and 37,
 K 3110 -> **3060**, reached blocks 129 -> 115.
 
+## Stage S: the merge machinery measured against its task (2026-08-03)
+
+Asked directly: is the ~50% merge share slow code, or is the picture of
+the operation count wrong? New `merge_stats` counters (always on,
+per-call, printed by `bench --profile`) plus a synthetic calibration of
+the same algorithm answered it - see BENCHMARK_DATA.md "The merge
+machinery measured against its task" for the numbers. Summary:
+
+* the implementation is within ~20% of a tuned same-algorithm rewrite
+  (50.4 vs 42.8 ns/row), and the sort-then-dedup-consecutive
+  formulation is *slower* than the hash formulation, not faster;
+* the operation count was the wrong picture: dedup processes **~60-90x
+  the surviving lane count** (5.68M rows for 92.7k lanes at 34; 23.6M
+  for 269k at 37), because every lane fans across the frame's unknown
+  branches and is re-crushed at ~3 merge points per frame. 89-90% of
+  rows are duplicates - that removal *is* the search's pruning;
+* so the lever is input volume, not merge speed. Micro-opt ceiling is
+  ~0.05 s at 34; the endgame (fewer manufactured rows) and the
+  hierarchical-lane idea (plans/hierarchical-lanes.md - duplicate
+  detection cheaper than per-row hashing, `expand` as an O(1) top-level
+  variable) are what actually move it.
+
 ### Later: `assume_eq`, whole-function field promotion
 
 `assume_eq` handles pointers that reach one cell by different paths, which CSE

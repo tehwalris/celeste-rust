@@ -21,6 +21,7 @@ pub mod instruction_flow;
 pub mod interpreter;
 pub mod ir;
 pub mod liveness;
+pub mod merge_stats;
 pub mod pico8_num;
 pub mod rewrite;
 pub mod tas;
