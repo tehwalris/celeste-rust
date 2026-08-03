@@ -209,13 +209,14 @@ impl LocalEnv {
         }
     }
 
-    /// Filter vectors by mask, only transforming values that are vectors.
+    /// Filter vectors down to the `kept` lanes, only transforming values
+    /// that are vectors.
     #[inline]
-    pub fn filter_vectors_in_place(&mut self, mask: &[bool], true_count: usize) {
+    pub fn filter_vectors_in_place(&mut self, kept: &[u32]) {
         let data = Arc::make_mut(&mut self.data);
         for v in data.values.iter_mut() {
             if let Some(val) = v.as_ref() {
-                if let Some(new_val) = val.filter_vectors_if_vector(mask, true_count) {
+                if let Some(new_val) = val.filter_vectors_if_vector(kept) {
                     *v = Some(new_val);
                 }
             }

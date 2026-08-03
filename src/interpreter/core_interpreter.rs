@@ -511,7 +511,7 @@ impl<'a> CoreInterpreter<'a> {
 
         match heap_value {
             HeapValue::BuiltinFun(name) => {
-                let _span = SpanGuard::new(&format!("builtin:{}", name), "call");
+                let _span = SpanGuard::new_lazy(|| format!("builtin:{}", name), "call");
 
                 // Look up the builtin function
                 let builtin_fn = self
@@ -571,8 +571,8 @@ impl<'a> CoreInterpreter<'a> {
                     .get(&fun_def_name)
                     .ok_or_else(|| anyhow!("Unknown function: {:?}", fun_def_name))?;
 
-                let _span = SpanGuard::new_with_source(
-                    &format!("closure:{}", fun_def_name.as_str()),
+                let _span = SpanGuard::new_with_source_lazy(
+                    || format!("closure:{}", fun_def_name.as_str()),
                     "call",
                     fun_def.source_span.as_ref(),
                 );

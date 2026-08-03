@@ -474,19 +474,47 @@ where
     merged
 }
 
-/// Hash a row by combining the values at a given index across all vectors.
-/// Optimized to hash directly without creating intermediate ScalarValue objects.
-fn hash_row(vector_values: &[VectorRef], index: usize) -> u64 {
+/// Hash every row at once, one *vector* at a time. The row-major version
+/// walked all vectors per row - a strided access per lane over hundreds of
+/// separately-allocated vectors, which is where `dedup_state`'s time went.
+/// Column-major visits each vector once, sequentially, folding each
+/// element's hash into its row's running hash. Same collision story as
+/// before: candidates are confirmed by `rows_equal`, so the hash only has
+/// to be good, not perfect.
+fn hash_rows(vector_values: &[VectorRef], n: usize) -> Vec<u64> {
     use std::hash::{Hash, Hasher};
-    let mut hasher = rustc_hash::FxHasher::default();
+    #[inline(always)]
+    fn elem_hash<T: Hash>(value: &T) -> u64 {
+        let mut hasher = rustc_hash::FxHasher::default();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+    // Fibonacci-style fold; order-sensitive so permuted columns disagree.
+    #[inline(always)]
+    fn fold(row: &mut u64, value: u64) {
+        *row = (row.rotate_left(26) ^ value).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+    let mut hashes = vec![0x51_7c_c1_b7_27_22_0a_95u64; n];
     for vec in vector_values {
         match vec {
-            VectorRef::Numbers(nums) => nums[index].hash(&mut hasher),
-            VectorRef::NumberIntervals(nums) => nums[index].hash(&mut hasher),
-            VectorRef::Bools(bools) => bools[index].hash(&mut hasher),
+            VectorRef::Numbers(nums) => {
+                for (row, value) in hashes.iter_mut().zip(*nums) {
+                    fold(row, elem_hash(value));
+                }
+            }
+            VectorRef::NumberIntervals(nums) => {
+                for (row, value) in hashes.iter_mut().zip(*nums) {
+                    fold(row, elem_hash(value));
+                }
+            }
+            VectorRef::Bools(bools) => {
+                for (row, value) in hashes.iter_mut().zip(*bools) {
+                    fold(row, elem_hash(value));
+                }
+            }
         }
     }
-    hasher.finish()
+    hashes
 }
 
 /// Compare two rows by their values at the given indices.
@@ -523,16 +551,15 @@ fn dedup_vectorized_state(mut state: State) -> State {
         return state;
     }
 
-    // Use hash-based deduplication to avoid allocating Vec<ScalarValue> for each row.
-    // Map from hash -> list of unique row indices with that hash
-    // Pre-allocate with estimated capacity to reduce rehashing
+    // Hash every row up front (column-major, see `hash_rows`), then bucket.
+    // Map from hash -> list of unique row indices with that hash.
+    let row_hashes = hash_rows(&vector_values, state.vector_size);
     let mut hash_to_indices: FxHashMap<u64, Vec<usize>> =
         FxHashMap::with_capacity_and_hasher(state.vector_size / 2, Default::default());
     let mut mask = vec![false; state.vector_size];
     let mut unique_count = 0;
 
-    for i in 0..state.vector_size {
-        let row_hash = hash_row(&vector_values, i);
+    for (i, &row_hash) in row_hashes.iter().enumerate() {
         let indices = hash_to_indices.entry(row_hash).or_insert_with(Vec::new);
 
         // Check if this row matches any existing row with the same hash

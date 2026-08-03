@@ -243,6 +243,44 @@ both programs and out of this package's scope: the `dash_time` diamond's
 else-side is the whole normal-movement body, which contains splitting
 branches and so cannot be a region today.
 
+### Interpreter micro-optimization round 1 (2026-08-03)
+
+perf (`-g --call-graph dwarf` on `rewrite bench`, replay samples excluded)
+found three things the span profile could not see inside `dedup_state` and
+`filter_branch`. Three changes, each measured on 2-3 runs, differentially
+identical through 34 and 37:
+
+1. **Lazy span names.** Every builtin and closure call `format!`ed its
+   trace span name eagerly, profiling on or off. `SpanGuard::new_lazy`
+   builds the name only when profiling is enabled. ~1.5%.
+2. **Column-major dedup hashing.** `dedup_state` hashed row-by-row - a
+   strided walk over hundreds of separately-allocated vectors per lane.
+   `hash_rows` folds each vector into per-row running hashes in one
+   sequential pass per vector. ~5%. (`rows_equal`, the exactness confirm
+   on true duplicates, remains dedup's floor - it must touch every vector
+   at two indices and cannot be skipped without trusting the hash.)
+3. **Gather-based filtering.** `filter_by_mask` re-scanned the full
+   N-entry mask for every vector value in the state. The kept-lane index
+   list is now computed once and every vector gathers O(kept). ~5%. The
+   dead owned-path (`Value::filter_vectors`) went with it.
+
+| | 34 frames | 37 frames |
+|---|---|---|
+| before | 1.36-1.37 s, 0.50 GB | 5.74 s, 1.69 GB |
+| after | 1.17-1.21 s, 0.44 GB | 4.97-4.99 s, 1.63 GB |
+
+**-12% at 34, -13% at 37**, memory slightly down, lanes identical.
+
+**Tried and rejected: gc arena reuse.** gc clones every reachable heap
+value into a fresh arena per call; a rewrite re-indexed pointer-free
+values in the shared append-only arena (no clone) with a dense renumber
+table and a compact-when-bloated backstop. Measured: 4.94 s vs 4.97-4.99 s
+at 37 (noise) and +0.1 GB - the gc span was already only 0.07 s, and the
+fresh arena per gc is what keeps garbage bounded. Reverted. The next
+candidates by profile are the arithmetic inner loop (`interpret_binary_op`
++ `map2`, ~11% of the run) and `Value::clone` on loads (~14% cumulative,
+would want `Arc`'d vectors - invasive, unexplored).
+
 ## Where the time goes
 
 `rewrite bench --frames 34 --profile`, on the current recipe. Self time, so the

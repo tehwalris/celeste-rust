@@ -162,21 +162,27 @@ impl State {
     /// The resulting state's vector_size will be the number of true values in the mask.
     fn filter_by_mask_in_place(&mut self, mask: &[bool], reason: FilterReason) {
         let _trace = TraceSpan::new(reason, "filter");
-        use super::value::count_true;
-        let new_vector_size = count_true(mask);
+
+        // The mask is scanned once here; every vector below gathers the
+        // kept lanes directly, O(kept) per vector instead of O(mask).
+        let kept: Vec<u32> = mask
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &m)| m.then_some(i as u32))
+            .collect();
 
         // Filter values in heap - use optimized method that only clones vectors
-        self.heap.filter_vectors_in_place(mask, new_vector_size);
+        self.heap.filter_vectors_in_place(&kept);
 
         // Filter values in local env - use optimized method
-        self.local_env.filter_vectors_in_place(mask, new_vector_size);
+        self.local_env.filter_vectors_in_place(&kept);
 
         // Filter values in outer local envs
         for env in &mut self.outer_local_envs {
-            env.filter_vectors_in_place(mask, new_vector_size);
+            env.filter_vectors_in_place(&kept);
         }
 
-        self.vector_size = new_vector_size;
+        self.vector_size = kept.len();
     }
 
     /// Duplicates every lane of the state: lanes `[l1..lN]` become

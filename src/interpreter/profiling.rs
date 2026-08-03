@@ -900,12 +900,47 @@ impl SpanGuard {
         }
     }
 
+    /// Like `new`, but the name is only built when profiling is enabled.
+    /// Span names on hot call paths (every builtin and closure call) are
+    /// `format!`ed per execution, which is pure allocator and fmt traffic
+    /// in unprofiled runs - measured at a few percent of the interpreter.
+    pub fn new_lazy(name: impl FnOnce() -> String, category: &str) -> Self {
+        let active = is_profiling_enabled();
+        if active {
+            with_profiler(|p| p.start_span(&name(), category));
+        }
+        Self {
+            active,
+            args: std::collections::HashMap::new(),
+        }
+    }
+
     /// Create a span with source location info
     pub fn new_with_source(name: &str, category: &str, source_span: Option<&crate::ir::SourceSpan>) -> Self {
         let active = is_profiling_enabled();
         if active {
             with_profiler(|p| p.start_span(name, category));
         }
+        let mut args = std::collections::HashMap::new();
+        if let Some(span) = source_span {
+            args.insert("line".to_string(), span.start.line.to_string());
+            args.insert("end_line".to_string(), span.end.line.to_string());
+        }
+        Self { active, args }
+    }
+
+    /// `new_with_source` with a lazily-built name; also skips the source
+    /// args entirely when profiling is off.
+    pub fn new_with_source_lazy(
+        name: impl FnOnce() -> String,
+        category: &str,
+        source_span: Option<&crate::ir::SourceSpan>,
+    ) -> Self {
+        let active = is_profiling_enabled();
+        if !active {
+            return Self { active, args: std::collections::HashMap::new() };
+        }
+        with_profiler(|p| p.start_span(&name(), category));
         let mut args = std::collections::HashMap::new();
         if let Some(span) = source_span {
             args.insert("line".to_string(), span.start.line.to_string());

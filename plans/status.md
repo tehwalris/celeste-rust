@@ -23,6 +23,7 @@ Branch `rewrite`. Build is warning-free, 386 tests pass, working tree clean.
 | + pixel loops masked, wall-jump arm eager | 1.46 s | 0.53 GB |
 | + `spikes_at` nest masked (`fuse_breaks` + `span`/`break_to` `mask_loop`) | 1.40 s | 0.46 GB |
 | + 9 `pin_builtin`s, `cse` forward mode (block-local) | 1.35 s | 0.50 GB |
+| + interpreter micro-opts (lazy spans, columnar dedup hash, gather filter) | 1.19 s | 0.45 GB |
 
 Lane count is identical throughout (92,713), which is the first thing to check
 when a rewrite claims a win. Frame 37 confirms the same ratios (7.87 s, from
