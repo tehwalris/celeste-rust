@@ -767,6 +767,36 @@ dash diamond 108 + dash gate 30) plus ~36 small exposures. The next
 structural work is unchanged: the `btn` lane-expansion endgame, then K
 reduction (heap is 39.1% of the kernel).
 
+### The 36 small exposures are dash echoes, not rule targets (2026-08-03)
+
+The three remaining non-`btn` sites were swept and none falls to any
+existing or plausible rule. All three branch on per-lane game state and
+guard regions full of calls, stores and allocs:
+
+* `__frame in_i1_012_if_join_526` (9 splits): `if freeze>0 then
+  freeze-=1 return end` - early exit over the *entire update*.
+* `__frame in_i1_012_cont` (18): `if freeze>0 then return end` - early
+  exit over the *entire draw*.
+* `anonymous_61 __entry` (9): the cart's `spd.x~=0 or spd.y~=0` guard
+  around the whole inlined `obj.move` (stores to `rem`/`x`/`y`,
+  `__split_by_flr` calls, collision loops).
+
+They are echoes of the dash decision across frame boundaries: dashing
+lanes set `freeze=2`, the frame-boundary merge recombines lanes, and the
+next frame's `freeze>0` check re-splits them. Same fundamental category
+as `btn` - they end with lane expansion or lane filtering, not masking.
+(One cart-level out for `anonymous_61`: the `spd~=0` guard is an
+optimization added to the cart, and original Celeste calls `move`
+unconditionally - removing it would trade the split for eager
+`__split_by_flr` calls and collision loops on every object every frame.
+Its correctness rests on the `rem in [-0.5, 0.5)` invariant, so it is a
+cart change to weigh separately, not a recipe rule.)
+
+Deep screen after the `spikes_at` stage: differential identical through
+frame 37 (28.9 s) and frame 40 (104.5 s). Frame 40 bench: 23.63 s /
+5.28 GB / 948,319 lanes, the same 11 split sites as frame 34, and the
+kill branch still does not split - spikes stay unreachable through 40.
+
 ### Later: `assume_eq`, whole-function field promotion
 
 `assume_eq` handles pointers that reach one cell by different paths, which CSE

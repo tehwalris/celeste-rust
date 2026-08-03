@@ -37,7 +37,7 @@ not comparable.
 | + wall-jump stores absorbed (`speculate` with a pointer guard) | 1.78 s / 0.61 GB | - |
 | + pixel loops masked (`mask_loop` x2, a61 chains eager) | 1.59 s / 0.63 GB | - |
 | + wall-jump arm eager (`fold_reflexive` dead gates, masked `speculate_region`) | 1.46 s / 0.53 GB | - |
-| + `spikes_at` nest masked (`fuse_breaks`, `mask_loop` `span`/`break_to`) | 1.40 s / 0.46 GB | - |
+| + `spikes_at` nest masked (`fuse_breaks`, `mask_loop` `span`/`break_to`) | 1.40 s / 0.46 GB | 5.52 s / 1.51 GB |
 
 The store-triangle row is the first change that moved the fragment count: 558
 -> 335 mean fragments per frame at frame 34, split executions 19573 -> 11978.
@@ -121,7 +121,10 @@ accessors, not by block boundaries.
 
 Frame 40, milestone checks only: 84.1 s / 25.8 GB as compiled, 62.5 s / 14.45 GB
 after `promote_cell`. That beat the old unverified `mem2reg`'s 15.2 GB, which
-was stage 1's target.
+was stage 1's target. After the `spikes_at` stage: **23.63 s / 5.28 GB**
+(948,319 lanes), same 11 split sites as frame 34, differential identical
+through 40 (104.5 s) - the `mask_loop` span guards and the floored modulo hold
+in the deep regime, and the kill branch still does not split.
 
 Lane counts are identical across all of these (92,713 at frame 34; 269,059 at
 frame 37), which is the first thing to check when a rewrite claims a win -
