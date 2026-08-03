@@ -1,6 +1,6 @@
 # Status (2026-08)
 
-Branch `rewrite`. Build is warning-free, 375 tests pass, working tree clean.
+Branch `rewrite`. Build is warning-free, 382 tests pass, working tree clean.
 
 ## Measured, frame 34 (the standard iteration benchmark)
 
@@ -909,12 +909,23 @@ What the package needs, in order, for the dash arm alone:
    the `btn` evaluations). The 26th diamond is `btn_4`'s first assert,
    which lives in the unnamed entry block a pointed rule cannot name;
    `btn_4` is the cold non-inlined copy, so it stays.
-2. An opt-in for `expand` + the concretization store inside a masked
-   region (`is_speculatable` refuses `expand` by design: on lanes that
-   would have skipped the arm it doubles lanes nobody asked for - the cell
-   is reset to `UnknownBool` at the frame boundary, so next-frame dedup
-   reclaims the copies, but within the frame it is real cost that must be
-   measured, ~4N vs 3N lanes for the up/down pair).
+2. **DONE (2026-08-03):** `"expand": true` on a `speculate_region` entry
+   accepts `expand` plus its concretization store in the region. Neither
+   is masked - no mask is possible (a select mixing the expanded vector
+   with a skipped lane's `UnknownBool` is the representation `select`
+   refuses) and none is needed: the store writes the exhaustive lane-split
+   of exactly what the cell holds back into the very cell it was loaded
+   from, a per-lane refinement whichever way the lane would have branched.
+   The premise is pinned syntactically (load, expand, store-back in one
+   block, no other store between, same accessor with the same operands;
+   a missing cell loads `Nil`, which `expand` refuses loudly, so the
+   store-side accessor never creates), and `expand_lanes` doubles every
+   vector in the state - the head condition included - so masks computed
+   before the expand stay lane-consistent. The cost is the doubling
+   itself on states that skipped the region (~4N vs 3N lanes for the
+   up/down pair), which is why it stays opt-in and unmeasured until the
+   package assembles. No recipe entry uses it yet; existing entries
+   replay identically (screened at 34).
 3. Then the existing rules: decompose the unconditional `v_input` chain,
    absorb the `if_body_187`/`if_condition_185` stores, mask the dash-gate
    arm (`in_k1039_cont`) and the `dash_time` diamond (`in_i1_074_cont`).

@@ -199,6 +199,14 @@ pub enum Rule {
         /// loudly, as before.
         #[serde(default, skip_serializing_if = "is_false")]
         mask: bool,
+        /// Allow `expand` plus its concretization store - the load-adjacent
+        /// store of the expanded vector back into the very cell the value
+        /// was loaded from. Both run unmasked: the store writes the
+        /// exhaustive lane-split of exactly what the cell holds, a per-lane
+        /// refinement whether or not the lane took the region. Opt-in
+        /// because lanes that skipped the region still double.
+        #[serde(default, skip_serializing_if = "is_false")]
+        expand: bool,
     },
     /// Give a loop with a per-lane trip count a uniform constant trip count:
     /// the head branches on a fresh counter against `limit` (per-state
@@ -505,8 +513,8 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::Speculate { function, join, arm, guards } => {
             speculate::apply(program, function, join, arm.as_deref(), &parse_guards(guards)?)
         }
-        Rule::SpeculateRegion { function, head, arm, join, mask } => {
-            speculate_region::apply(program, function, head, arm, join.as_deref(), *mask)
+        Rule::SpeculateRegion { function, head, arm, join, mask, expand } => {
+            speculate_region::apply(program, function, head, arm, join.as_deref(), *mask, *expand)
         }
         Rule::MaskLoop { function, head, limit, span, break_to } => {
             mask_loop::apply(program, function, head, *limit, *span, break_to.as_deref())
@@ -595,8 +603,17 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::Speculate { function, join, arm, guards } => {
             speculate::verify(&before, program, function, join, arm.as_deref(), &parse_guards(guards)?)
         }
-        Rule::SpeculateRegion { function, head, arm, join, mask } => {
-            speculate_region::verify(&before, program, function, head, arm, join.as_deref(), *mask)
+        Rule::SpeculateRegion { function, head, arm, join, mask, expand } => {
+            speculate_region::verify(
+                &before,
+                program,
+                function,
+                head,
+                arm,
+                join.as_deref(),
+                *mask,
+                *expand,
+            )
         }
         Rule::MaskLoop { function, head, limit, span, break_to } => {
             mask_loop::verify(&before, program, function, head, *limit, *span, break_to.as_deref())
