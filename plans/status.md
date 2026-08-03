@@ -1,6 +1,6 @@
 # Status (2026-08)
 
-Branch `rewrite`. Build is warning-free, 306 tests pass, working tree clean.
+Branch `rewrite`. Build is warning-free, 319 tests pass, working tree clean.
 
 ## Measured, frame 34 (the standard iteration benchmark)
 
@@ -648,6 +648,66 @@ to arrive pre-sorted arrive mixed, and quiet branches wake up. Re-run
 `bench --profile` after each batch - the newcomer may be a shape an existing
 rule already takes, as `in_i1_078` was for `convert_ternary` and
 `if_body_135` was not.
+
+### The wall-jump arm went eager - masked regions landed (2026-08-03)
+
+The last planned piece of conversion machinery: `speculate_region` with
+`"mask": true` accepts regions that *write*. Every store becomes the
+load-adjacent masked select-store (`assert_value_cell; load old;
+select cond ? new : old; store`, original id kept) on the head's
+condition - the named arm's stores land on its side, a diamond's second
+region on the other, by swapping select operands rather than minting a
+`not`. Serializing two store-carrying regions is sound for the same
+reason the masking is: the masks are the two sides of one condition, so
+on any lane exactly one region's stores land and the other region writes
+back what was already there, which is exactly the state the live region
+would have seen. No aliasing analysis anywhere; `mask` without a store
+to justify it is refused, store-free entries emit byte-identically.
+
+The stage that used it, in order:
+
+* **`fold_reflexive`** (new small rule): the inliner leaves `is_solid(x, 0)`
+  chains opening on `0 > 0` - a reflexive comparison of a
+  `NumberConstant`, foldable to `false` with no arithmetic and no
+  semantics dependence (16.16 fixed point has no NaN; the constant
+  operand requirement keeps `t > t`-errors loud). 7 sites in 5
+  functions; two fold/dce cascade rounds then deleted 14 never-taken
+  collide loops - 1328 instructions, 105 blocks - including dead code
+  *inside regions earlier entries had made eager*.
+* One validator refinement fell out: between the `fold` that removes the
+  last reachable edge into a loop and the `dce` that sweeps it, a phi in
+  a live block can name an unreachable predecessor. Availability along
+  such an edge is now not required (the edge can never be taken) -
+  consistent with unreachable blocks' own instructions already being
+  outside the dominance walk.
+* Two `speculate_region` gates + 2 `demote_create` flattened what the
+  cascade left of the wall-jump arm.
+* **The grace diamond** (`if_body_135`): the first masked entry. True arm
+  stores `grace = 0`, `spd.y = -2`; false arm is the whole `is_solid`
+  scan ending in the pointer-guarded wall-jump stores. Both serialized,
+  all four stores masked on `grace > 0`.
+* **The jump branch** (`and_or_join_126`): the second masked entry, a
+  triangle whose region is the entire linearized arm; its four stores
+  (already masked once) re-mask on the jump condition. Masks compose as
+  selects compose.
+
+Measured at frame 34: 1.59 s -> 1.46 s, memory 0.63 -> 0.53 GB, fragments
+67 -> 46 mean (371 -> 248 max), splits 2245 -> 1531 across 13 sites. The
+jump/dash cluster's 474 splits are gone, and `btn` fell 1261 -> 943 with
+the fragment count it multiplies. K barely moved (loops-kept 3943 ->
+3934, mean dynamic 3635 -> 3728): this stage removed states, not work.
+Differential identical through 34 after every batch.
+
+**Nothing convertible splits any more.** The profile's triangle table is
+0 splits across all 139 tracked shapes. What remains: `btn` x6 + the
+dash gate + the dash diamond (1399 total, all `btn`-tainted - the
+endgame lane-expansion family), `spikes_at` (96 - its break feeds
+`kill_player`; either separate the hit flag from the kill or make the
+kill's effects maskable, likely with this same rule once the call is
+inlined), and ~36 of small exposures. The next structural work is
+therefore the endgame itself: make `btn` lane expansion pay by doing it
+after, not before, the remaining branches stop splitting - plus K
+reduction (heap is 39.6% of the kernel) once the frame is one state.
 
 ### Later: `assume_eq`, whole-function field promotion
 

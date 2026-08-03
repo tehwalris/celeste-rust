@@ -18,7 +18,8 @@ use serde::{Deserialize, Serialize};
 use super::program::Program;
 use super::rules::{
     absorb_stores, allocate_slots, convert_ternary, cse, dce, decompose_truthy, demote_create,
-    fold, if_convert, inline, mask_loop, merge_blocks, pin_builtin, promote_capture,
+    fold, fold_reflexive, if_convert, inline, mask_loop, merge_blocks, pin_builtin,
+    promote_capture,
     promote_cell, sink_store, speculate, speculate_region,
 };
 use crate::ir::LocalId;
@@ -55,6 +56,10 @@ pub enum Rule {
     MergeBlocks,
     /// Local simplifications: constant conditions, degenerate phis.
     Fold,
+    /// A comparison of a number constant with itself becomes the constant
+    /// reflexivity dictates. Kept apart from `fold` so older `fold` entries
+    /// replay byte-identically.
+    FoldReflexive,
     /// Splice a callee's body into one call site, guarded by an
     /// `assert_closure`.
     Inline {
@@ -179,6 +184,12 @@ pub enum Rule {
         /// other branch target.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         join: Option<String>,
+        /// Allow stores in the region: each becomes an assert-load-select-
+        /// store masked by the head's condition, landing only on the lanes
+        /// that took its region. Opt-in so store-free entries refuse stores
+        /// loudly, as before.
+        #[serde(default, skip_serializing_if = "is_false")]
+        mask: bool,
     },
     /// Give a loop with a per-lane trip count a uniform constant trip count:
     /// the head branches on a fresh counter against `limit` (per-state
@@ -223,6 +234,7 @@ impl Rule {
             Rule::AllocateSlots => "allocate_slots",
             Rule::MergeBlocks => "merge_blocks",
             Rule::Fold => "fold",
+            Rule::FoldReflexive => "fold_reflexive",
             Rule::Inline { .. } => "inline",
             Rule::IfConvert { .. } => "if_convert",
             Rule::PromoteCapture { .. } => "promote_capture",
@@ -247,6 +259,11 @@ pub struct SpeculateGuard {
     pub load: String,
     /// The crossed store's target local, as `%N`.
     pub store: String,
+}
+
+/// serde helper: keep serialized entries free of `"mask":false` noise.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn parse_cell(text: &str) -> Result<LocalId> {
@@ -393,6 +410,7 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::AllocateSlots => allocate_slots::apply(program),
         Rule::MergeBlocks => merge_blocks::apply(program),
         Rule::Fold => fold::apply(program),
+        Rule::FoldReflexive => fold_reflexive::apply(program),
         Rule::IfConvert { function, join } => if_convert::apply(program, function, join),
         Rule::PromoteCapture { function, index } => {
             promote_capture::apply(program, function, *index)
@@ -412,8 +430,8 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::Speculate { function, join, arm, guards } => {
             speculate::apply(program, function, join, arm.as_deref(), &parse_guards(guards)?)
         }
-        Rule::SpeculateRegion { function, head, arm, join } => {
-            speculate_region::apply(program, function, head, arm, join.as_deref())
+        Rule::SpeculateRegion { function, head, arm, join, mask } => {
+            speculate_region::apply(program, function, head, arm, join.as_deref(), *mask)
         }
         Rule::MaskLoop { function, head, limit } => {
             mask_loop::apply(program, function, head, *limit)
@@ -474,6 +492,7 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::AllocateSlots => allocate_slots::verify(&before, program),
         Rule::MergeBlocks => merge_blocks::verify(&before, program),
         Rule::Fold => fold::verify(&before, program),
+        Rule::FoldReflexive => fold_reflexive::verify(&before, program),
         Rule::IfConvert { function, join } => {
             if_convert::verify(&before, program, function, join)
         }
@@ -495,8 +514,8 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::Speculate { function, join, arm, guards } => {
             speculate::verify(&before, program, function, join, arm.as_deref(), &parse_guards(guards)?)
         }
-        Rule::SpeculateRegion { function, head, arm, join } => {
-            speculate_region::verify(&before, program, function, head, arm, join.as_deref())
+        Rule::SpeculateRegion { function, head, arm, join, mask } => {
+            speculate_region::verify(&before, program, function, head, arm, join.as_deref(), *mask)
         }
         Rule::MaskLoop { function, head, limit } => {
             mask_loop::verify(&before, program, function, head, *limit)

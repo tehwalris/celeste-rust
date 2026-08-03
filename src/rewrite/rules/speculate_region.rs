@@ -101,12 +101,46 @@
 //! head to `Xa`, which would dangle a phi edge. Pure regions commute, so
 //! the order is only a convention.
 //!
+//! # Masked stores: regions that write
+//!
+//! With `"mask": true` in the recipe entry, the region may contain plain
+//! `store` instructions. Each becomes the load-adjacent masked form that
+//! `absorb_stores` and `mask_loop` already use, on the head's condition:
+//!
+//! ```text
+//!   %s = store %t <- %v          %g = assert_value_cell %t
+//!                          =>    %o = load %t
+//!                                %m = select %c ? %v : %o
+//!                                %s = store %t <- %m
+//! ```
+//!
+//! (with the operands swapped when the store's region sits on the false
+//! side). The store's id and position stay; three ids are minted per store.
+//!
+//! Why this needs no aliasing analysis: the load is adjacent to the store,
+//! so whatever the cell aliases, `%o` is its current value, and lanes whose
+//! condition picks the old value write back exactly what was there. Lanes
+//! that took the region see the store land unchanged.
+//!
+//! Why serialization order stays sound for a diamond with stores: the two
+//! regions' masks are the two sides of one condition, so each store lands
+//! only on its own region's lanes. On those lanes the *other* region's
+//! stores all write back the old value, so every load in the live region
+//! reads exactly the state the un-serialized program would have shown it -
+//! the regions no longer commute, but they no longer need to.
+//!
+//! The remaining bargain is the select's, as with the join phis: mixed
+//! representations refuse loudly. A masked region whose stores create cells
+//! is still refused - `demote_create` first, so the cell provably exists or
+//! fails loudly.
+//!
 //! # What this rule refuses, deliberately
 //!
-//! Anything with a store, call, alloc or creating accessor in the region;
-//! a region reachable from anywhere but the head; more than one edge out;
+//! Anything with a call, alloc or creating accessor in the region; a store
+//! without the opt-in `mask` (and `mask` without a store to justify it); a
+//! region reachable from anywhere but the head; more than one edge out;
 //! a conditional exit; `hint_normalize` blocks; `return` inside the region;
-//! loops without the counter shape. Each refusal is a shape the five
+//! loops without the counter shape. Each refusal is a shape the converted
 //! `is_solid` chains do not have, and a rewrite we could not check.
 
 use anyhow::{anyhow, Result};
@@ -151,6 +185,18 @@ pub(super) struct LoopBound {
     def_index: usize,
 }
 
+/// One store in a masked region: where it is, what it writes, and on which
+/// side of the head's condition it lands.
+struct StoreSite {
+    block: Label,
+    index: usize,
+    target: LocalId,
+    value: LocalId,
+    /// True when the store's region runs on the condition's true side, so
+    /// the masked select picks the new value there.
+    new_on_true: bool,
+}
+
 /// The shape this rule accepts, re-derived identically by `apply`, `verify`
 /// and `candidates`.
 struct Site {
@@ -162,6 +208,9 @@ struct Site {
     bounds: Vec<LoopBound>,
     /// Present iff this is a diamond (an explicit `join` was given).
     serialize: Option<Serialize>,
+    /// The region's stores, in region discovery order; non-empty iff the
+    /// entry opted in with `mask`.
+    stores: Vec<StoreSite>,
 }
 
 pub(super) fn defining_site(fun: &FunDef, id: LocalId) -> Option<(Option<Label>, usize)> {
@@ -441,6 +490,7 @@ fn site(
     head: &Label,
     arm: &Label,
     join_override: Option<&Label>,
+    mask: bool,
 ) -> Result<Site> {
     let head_block = fun.cfg.named.get(head).ok_or_else(|| {
         anyhow!("no block named '{}' in {}", head.as_str(), function)
@@ -555,14 +605,15 @@ fn site(
     // top of `is_speculatable`: they only merge region-internal paths
     // (single entry), and no edge changes.
     let preds = predecessors(&fun.cfg);
-    let regions: Vec<(&[Label], &Label)> = match &other_exit {
-        None => vec![(region.as_slice(), arm)],
+    let regions: Vec<(&[Label], &Label, bool)> = match &other_exit {
+        None => vec![(region.as_slice(), arm, true)],
         Some((region_b, _)) => {
-            vec![(region.as_slice(), arm), (region_b.as_slice(), &other)]
+            vec![(region.as_slice(), arm, true), (region_b.as_slice(), &other, false)]
         }
     };
     let mut bounds: Vec<LoopBound> = Vec::new();
-    for (blocks, entry) in &regions {
+    let mut stores: Vec<StoreSite> = Vec::new();
+    for (blocks, entry, is_arm) in &regions {
         let in_region: FxHashSet<&Label> = blocks.iter().collect();
         for label in *blocks {
             for pred in preds.get(&Some(label.clone())).into_iter().flatten() {
@@ -583,7 +634,25 @@ fn site(
             }
         }
         for label in *blocks {
-            for (id, instr) in &fun.cfg.named[label].instructions {
+            for (index, (id, instr)) in fun.cfg.named[label].instructions.iter().enumerate() {
+                if let Instruction::Store { target, source } = instr {
+                    if mask {
+                        stores.push(StoreSite {
+                            block: label.clone(),
+                            index,
+                            target: *target,
+                            value: *source,
+                            new_on_true: *is_arm == arm_is_true,
+                        });
+                        continue;
+                    }
+                    return Err(anyhow!(
+                        "%{} in region block '{}' is a store; add \"mask\":true \
+                         to mask it on the head's condition",
+                        usize::from(*id),
+                        label.as_str()
+                    ));
+                }
                 require(
                     matches!(instr, Instruction::Phi { .. }) || is_speculatable(instr),
                     format!(
@@ -674,6 +743,11 @@ fn site(
         });
     }
 
+    require(
+        !mask || !stores.is_empty(),
+        "the region has no stores; drop the mask field",
+    )?;
+
     Ok(Site {
         condition: *condition,
         arm_is_true,
@@ -681,7 +755,27 @@ fn site(
         join_phis,
         bounds,
         serialize,
+        stores,
     })
+}
+
+/// The masked select one store's value goes through: the new value on the
+/// side of the condition its region owns, the freshly loaded old value on
+/// the other.
+fn masked_select_for(site: &Site, store: &StoreSite, old: LocalId) -> Instruction {
+    if store.new_on_true {
+        Instruction::Select {
+            condition: site.condition,
+            if_true: store.value,
+            if_false: old,
+        }
+    } else {
+        Instruction::Select {
+            condition: site.condition,
+            if_true: old,
+            if_false: store.value,
+        }
+    }
 }
 
 /// The select a join phi becomes: the named arm's value on the edge the arm
@@ -757,15 +851,21 @@ pub fn apply(
     head: &str,
     arm: &str,
     join: Option<&str>,
+    mask: bool,
 ) -> Result<usize> {
     let head = &Label::from(head.to_string());
     let arm = &Label::from(arm.to_string());
     let join = join.map(|j| Label::from(j.to_string()));
     let fun = program.get(function)?;
-    let s = site(fun, function, head, arm, join.as_ref())?;
+    let s = site(fun, function, head, arm, join.as_ref(), mask)?;
     let mut alloc = LocalIdAllocator::for_function(fun);
     let minted: Vec<[LocalId; 3]> = s
         .bounds
+        .iter()
+        .map(|_| [alloc.fresh(), alloc.fresh(), alloc.fresh()])
+        .collect();
+    let store_minted: Vec<[LocalId; 3]> = s
+        .stores
         .iter()
         .map(|_| [alloc.fresh(), alloc.fresh(), alloc.fresh()])
         .collect();
@@ -795,19 +895,48 @@ pub fn apply(
         slot.1 = select_for(&s, phi);
     }
 
-    // The termination guards, each right after its bound's definition.
-    // Descending index order so earlier insertions do not shift later ones.
-    let mut ordered: Vec<(usize, &LoopBound)> = s.bounds.iter().enumerate().collect();
-    ordered.sort_by_key(|(_, b)| (b.def_block.clone(), std::cmp::Reverse(b.def_index)));
-    for (minted_index, bound) in ordered {
-        let block = match &bound.def_block {
+    // The termination guards and the masked stores, spliced per block in
+    // descending position order so earlier insertions do not shift later
+    // ones. A guard inserts after its bound's definition; a store's triple
+    // inserts before the store, whose value is rewritten to the masked
+    // select. At the same position - a guard belonging to the instruction
+    // right before a store - the triple goes in first, which leaves the
+    // guard before the triple in the final layout.
+    let mut events: Vec<(Option<Label>, usize, u8, usize)> = Vec::new();
+    for (i, bound) in s.bounds.iter().enumerate() {
+        events.push((bound.def_block.clone(), bound.def_index + 1, 0, i));
+    }
+    for (i, store) in s.stores.iter().enumerate() {
+        events.push((Some(store.block.clone()), store.index, 1, i));
+    }
+    events.sort_by(|a, b| {
+        (a.0.as_ref().map(|l| l.as_str()), a.1, a.2)
+            .cmp(&(b.0.as_ref().map(|l| l.as_str()), b.1, b.2))
+            .reverse()
+    });
+    for (block_key, position, kind, index) in events {
+        let block = match &block_key {
             None => &mut fun.cfg.entry,
             Some(label) => fun.cfg.named.get_mut(label).unwrap(),
         };
-        let guard = guard_for(bound.bound, &minted[minted_index]);
-        block
-            .instructions
-            .splice(bound.def_index + 1..bound.def_index + 1, guard);
+        if kind == 1 {
+            let store = &s.stores[index];
+            let [guard, old, sel] = store_minted[index];
+            block.instructions[position].1 =
+                Instruction::Store { target: store.target, source: sel };
+            block.instructions.splice(
+                position..position,
+                [
+                    (guard, Instruction::AssertValueCell { target: store.target }),
+                    (old, Instruction::Load { source: store.target }),
+                    (sel, masked_select_for(&s, store, old)),
+                ],
+            );
+        } else {
+            let bound = &s.bounds[index];
+            let guard = guard_for(bound.bound, &minted[index]);
+            block.instructions.splice(position..position, guard);
+        }
     }
 
     // New instruction ids exist, so the slot allocation is stale. Re-run
@@ -817,7 +946,8 @@ pub fn apply(
     Ok(1
         + s.serialize.is_some() as usize
         + s.join_phis.len()
-        + 3 * s.bounds.len())
+        + 3 * s.bounds.len()
+        + 4 * s.stores.len())
 }
 
 /// Independent check: re-derives the site from the before program, then
@@ -831,12 +961,13 @@ pub fn verify(
     head: &str,
     arm: &str,
     join: Option<&str>,
+    mask: bool,
 ) -> Result<()> {
     let head = &Label::from(head.to_string());
     let arm = &Label::from(arm.to_string());
     let join = join.map(|j| Label::from(j.to_string()));
     let before_fun = before.get(function)?;
-    let s = site(before_fun, function, head, arm, join.as_ref())?;
+    let s = site(before_fun, function, head, arm, join.as_ref(), mask)?;
     let after_fun = after.get(function)?;
 
     require(
@@ -888,6 +1019,17 @@ pub fn verify(
     for list in guards_of.values_mut() {
         list.sort_by_key(|b| b.def_index);
     }
+    // Stores by block, ascending index, for the same reconstruction.
+    let mut stores_of: std::collections::BTreeMap<String, Vec<&StoreSite>> = Default::default();
+    for store in &s.stores {
+        stores_of
+            .entry(store.block.as_str().to_string())
+            .or_default()
+            .push(store);
+    }
+    for list in stores_of.values_mut() {
+        list.sort_by_key(|st| st.index);
+    }
 
     let keys: Vec<Option<Label>> = std::iter::once(None)
         .chain(before_fun.cfg.named.keys().cloned().map(Some))
@@ -912,25 +1054,29 @@ pub fn verify(
         })?;
         let name = label_str.as_deref().unwrap_or("__entry");
 
-        // First learn the minted ids: each guard occupies three known
-        // positions in the after block (its bound's index, shifted by the
-        // guards spliced in before it). Freshness and distinctness are
-        // checked here; the shapes are checked by the exact comparison
-        // below, built from the learned ids.
+        // Expected instructions: walk the before block, splicing in each
+        // guard after its bound's definition and each store's masked triple
+        // before the store, in the order `apply` leaves them. The minted ids
+        // are learned from the after block at the position each insertion
+        // must occupy; freshness and distinctness are checked here, the
+        // shapes by the exact comparison below, built from the learned ids.
         let empty: Vec<&LoopBound> = Vec::new();
         let guards = guards_of
             .get(&label_str.clone().filter(|_| key.is_some()))
             .unwrap_or(&empty);
-        let mut minted_of: Vec<[LocalId; 3]> = Vec::new();
-        for (guard_number, bound) in guards.iter().enumerate() {
-            let position = bound.def_index + 1 + 3 * guard_number;
+        let empty_stores: Vec<&StoreSite> = Vec::new();
+        let stores = label_str
+            .as_ref()
+            .and_then(|l| stores_of.get(l))
+            .unwrap_or(&empty_stores);
+        let learn = |at: usize,
+                         minted_seen: &mut FxHashSet<LocalId>|
+         -> Result<[LocalId; 3]> {
             let mut minted = [LocalId::from(0); 3];
-            for offset in 0..3 {
-                let (after_id, _) = after_block
-                    .instructions
-                    .get(position + offset)
-                    .ok_or_else(|| {
-                        anyhow!("'{}' is too short to hold its guard", name)
+            for (offset, slot) in minted.iter_mut().enumerate() {
+                let (after_id, _) =
+                    after_block.instructions.get(at + offset).ok_or_else(|| {
+                        anyhow!("'{}' is too short to hold its insertions", name)
                     })?;
                 require(
                     !before_ids.contains(after_id),
@@ -948,33 +1094,39 @@ pub fn verify(
                         name
                     ),
                 )?;
-                minted[offset] = *after_id;
+                *slot = *after_id;
             }
-            minted_of.push(minted);
-        }
-
-        // Expected instructions: the before block, with join phis replaced
-        // and the guards (now with their learned ids) spliced in.
-        let mut want: Vec<(LocalId, Instruction)> = before_block
-            .instructions
-            .iter()
-            .map(|(id, instr)| {
-                let instr = if key.as_ref() == Some(&s.join) {
-                    match s.join_phis.iter().find(|p| &p.id == id) {
-                        Some(phi) => select_for(&s, phi),
-                        None => instr.clone(),
-                    }
-                } else {
-                    instr.clone()
-                };
-                (*id, instr)
-            })
-            .collect();
-        for (bound, minted) in guards.iter().zip(minted_of.iter()).rev() {
-            want.splice(
-                bound.def_index + 1..bound.def_index + 1,
-                guard_for(bound.bound, minted),
-            );
+            Ok(minted)
+        };
+        let mut want: Vec<(LocalId, Instruction)> = Vec::new();
+        for position in 0..=before_block.instructions.len() {
+            for bound in guards.iter().filter(|b| b.def_index + 1 == position) {
+                let minted = learn(want.len(), &mut minted_seen)?;
+                want.extend(guard_for(bound.bound, &minted));
+            }
+            let Some((id, instr)) = before_block.instructions.get(position) else {
+                break;
+            };
+            if let Some(store) = stores.iter().find(|st| st.index == position) {
+                let [guard, old, sel] = learn(want.len(), &mut minted_seen)?;
+                want.push((guard, Instruction::AssertValueCell { target: store.target }));
+                want.push((old, Instruction::Load { source: store.target }));
+                want.push((sel, masked_select_for(&s, store, old)));
+                want.push((
+                    *id,
+                    Instruction::Store { target: store.target, source: sel },
+                ));
+                continue;
+            }
+            let instr = if key.as_ref() == Some(&s.join) {
+                match s.join_phis.iter().find(|p| &p.id == id) {
+                    Some(phi) => select_for(&s, phi),
+                    None => instr.clone(),
+                }
+            } else {
+                instr.clone()
+            };
+            want.push((*id, instr));
         }
 
         require(
@@ -1045,7 +1197,7 @@ pub fn candidates(program: &Program) -> Vec<(String, Label, Label)> {
                 continue;
             }
             for arm in [true_target, false_target] {
-                if site(fun, function.as_str(), label, arm, None).is_ok() {
+                if site(fun, function.as_str(), label, arm, None, false).is_ok() {
                     out.push((
                         function.as_str().to_string(),
                         label.clone(),
@@ -1190,9 +1342,9 @@ mod tests {
     fn speculates_a_pure_loop_region() {
         let mut p = region_program();
         let before = p.clone();
-        let changed = apply(&mut p, "f", "h", "setup", None).unwrap();
+        let changed = apply(&mut p, "f", "h", "setup", None, false).unwrap();
         assert_eq!(changed, 1 + 1 + 3);
-        verify(&before, &p, "f", "h", "setup", None).unwrap();
+        verify(&before, &p, "f", "h", "setup", None, false).unwrap();
         let text = format_function(p.get("f").unwrap());
         assert!(text.contains("br setup"), "{}", text);
         assert!(!text.contains("br %10"), "{}", text);
@@ -1221,8 +1373,8 @@ mod tests {
             h.terminator.1 = br_if(10, "join", "setup");
         }
         let before = p.clone();
-        apply(&mut p, "f", "h", "setup", None).unwrap();
-        verify(&before, &p, "f", "h", "setup", None).unwrap();
+        apply(&mut p, "f", "h", "setup", None, false).unwrap();
+        verify(&before, &p, "f", "h", "setup", None, false).unwrap();
         let text = format_function(p.get("f").unwrap());
         assert!(
             text.contains("select %10 ? %19 : %17"),
@@ -1242,10 +1394,10 @@ mod tests {
                 Instruction::Store { target: id(13), source: id(16) },
             ));
         }
-        let error = apply(&mut p, "f", "h", "setup", None)
+        let error = apply(&mut p, "f", "h", "setup", None, false)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("not speculatable"), "{}", error);
+        assert!(error.contains("is a store; add \"mask\":true"), "{}", error);
     }
 
     #[test]
@@ -1259,7 +1411,7 @@ mod tests {
                 .named
                 .insert(label("side"), block(vec![], 907, br("cont")));
         }
-        let error = apply(&mut p, "f", "h", "setup", None)
+        let error = apply(&mut p, "f", "h", "setup", None, false)
             .unwrap_err()
             .to_string();
         assert!(
@@ -1279,7 +1431,7 @@ mod tests {
             body.instructions[0].1 =
                 Instruction::BinaryOp { left: id(13), op: BinaryOp::Minus, right: id(20) };
         }
-        let error = apply(&mut p, "f", "h", "setup", None)
+        let error = apply(&mut p, "f", "h", "setup", None, false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("counter + step"), "{}", error);
@@ -1296,7 +1448,7 @@ mod tests {
             let body = fun.cfg.named.get_mut(&label("loop_body")).unwrap();
             body.instructions.insert(0, bound);
         }
-        let error = apply(&mut p, "f", "h", "setup", None)
+        let error = apply(&mut p, "f", "h", "setup", None, false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("defined inside the loop"), "{}", error);
@@ -1312,7 +1464,7 @@ mod tests {
                 .push((id(32), Instruction::BoolConstant { value: true }));
             cont.terminator.1 = br_if(32, "join", "loop_head");
         }
-        let error = apply(&mut p, "f", "h", "setup", None)
+        let error = apply(&mut p, "f", "h", "setup", None, false)
             .unwrap_err()
             .to_string();
         assert!(
@@ -1333,7 +1485,7 @@ mod tests {
                 .named
                 .insert(label("stray"), block(vec![], 908, br("join")));
         }
-        let error = apply(&mut p, "f", "h", "setup", None)
+        let error = apply(&mut p, "f", "h", "setup", None, false)
             .unwrap_err()
             .to_string();
         assert!(
@@ -1347,14 +1499,14 @@ mod tests {
     fn verify_rejects_a_kept_branch() {
         let mut p = region_program();
         let before = p.clone();
-        apply(&mut p, "f", "h", "setup", None).unwrap();
+        apply(&mut p, "f", "h", "setup", None, false).unwrap();
         // Tamper: restore the branch but keep the selects and guards.
         {
             let fun = p.get_mut("f").unwrap();
             let h = fun.cfg.named.get_mut(&label("h")).unwrap();
             h.terminator.1 = br_if(10, "setup", "join");
         }
-        let error = verify(&before, &p, "f", "h", "setup", None)
+        let error = verify(&before, &p, "f", "h", "setup", None, false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("terminator of 'h'"), "{}", error);
@@ -1364,7 +1516,7 @@ mod tests {
     fn verify_rejects_a_swapped_select() {
         let mut p = region_program();
         let before = p.clone();
-        apply(&mut p, "f", "h", "setup", None).unwrap();
+        apply(&mut p, "f", "h", "setup", None, false).unwrap();
         {
             let fun = p.get_mut("f").unwrap();
             let join = fun.cfg.named.get_mut(&label("join")).unwrap();
@@ -1374,7 +1526,7 @@ mod tests {
                 if_false: id(17),
             };
         }
-        let error = verify(&before, &p, "f", "h", "setup", None)
+        let error = verify(&before, &p, "f", "h", "setup", None, false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("changed %18"), "{}", error);
@@ -1384,7 +1536,7 @@ mod tests {
     fn verify_rejects_a_missing_guard() {
         let mut p = region_program();
         let before = p.clone();
-        apply(&mut p, "f", "h", "setup", None).unwrap();
+        apply(&mut p, "f", "h", "setup", None, false).unwrap();
         {
             let fun = p.get_mut("f").unwrap();
             let setup = fun.cfg.named.get_mut(&label("setup")).unwrap();
@@ -1396,7 +1548,7 @@ mod tests {
         // The guard-position scan now reads pre-existing instructions where
         // the minted triple should be, which fails the freshness check - a
         // loud rejection either way.
-        let error = verify(&before, &p, "f", "h", "setup", None)
+        let error = verify(&before, &p, "f", "h", "setup", None, false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("'setup'"), "{}", error);
@@ -1460,9 +1612,9 @@ mod tests {
     fn serializes_a_diamond() {
         let mut p = diamond_program();
         let before = p.clone();
-        let changed = apply(&mut p, "f", "h", "a", Some("join")).unwrap();
+        let changed = apply(&mut p, "f", "h", "a", Some("join"), false).unwrap();
         assert_eq!(changed, 3); // head branch + exit rewire + one phi
-        verify(&before, &p, "f", "h", "a", Some("join")).unwrap();
+        verify(&before, &p, "f", "h", "a", Some("join"), false).unwrap();
 
         let fun = p.get("f").unwrap();
         assert_eq!(
@@ -1489,8 +1641,8 @@ mod tests {
     fn serializes_a_diamond_from_the_false_arm() {
         let mut p = diamond_program();
         let before = p.clone();
-        apply(&mut p, "f", "h", "b", Some("join")).unwrap();
-        verify(&before, &p, "f", "h", "b", Some("join")).unwrap();
+        apply(&mut p, "f", "h", "b", Some("join"), false).unwrap();
+        verify(&before, &p, "f", "h", "b", Some("join"), false).unwrap();
         let fun = p.get("f").unwrap();
         assert_eq!(fun.cfg.named[&label("h")].terminator_kind(), &br("b"));
         assert_eq!(fun.cfg.named[&label("b")].terminator_kind(), &br("a"));
@@ -1509,7 +1661,7 @@ mod tests {
     #[test]
     fn refuses_a_join_that_names_the_triangle() {
         let mut p = region_program();
-        let error = apply(&mut p, "f", "h", "setup", Some("join"))
+        let error = apply(&mut p, "f", "h", "setup", Some("join"), false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("drop the join field"), "{}", error);
@@ -1530,7 +1682,7 @@ mod tests {
                 ),
             );
         }
-        let error = apply(&mut p, "f", "h", "a", Some("join"))
+        let error = apply(&mut p, "f", "h", "a", Some("join"), false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("has phis"), "{}", error);
@@ -1541,15 +1693,192 @@ mod tests {
     fn verify_rejects_a_missing_serialization() {
         let mut p = diamond_program();
         let before = p.clone();
-        apply(&mut p, "f", "h", "a", Some("join")).unwrap();
+        apply(&mut p, "f", "h", "a", Some("join"), false).unwrap();
         {
             let fun = p.get_mut("f").unwrap();
             let a = fun.cfg.named.get_mut(&label("a")).unwrap();
             a.terminator.1 = br("join");
         }
-        let error = verify(&before, &p, "f", "h", "a", Some("join"))
+        let error = verify(&before, &p, "f", "h", "a", Some("join"), false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("terminator"), "{}", error);
+    }
+
+    /// A store in a masked triangle region becomes the assert-load-select-
+    /// store, keeping its id, with the new value on the arm's side of the
+    /// condition.
+    #[test]
+    fn masks_a_store_in_a_triangle_region() {
+        let mut p = region_program();
+        {
+            let fun = p.get_mut("f").unwrap();
+            let body = fun.cfg.named.get_mut(&label("loop_body")).unwrap();
+            body.instructions.push((
+                id(30),
+                Instruction::Store { target: id(13), source: id(16) },
+            ));
+        }
+        let before = p.clone();
+        let changed = apply(&mut p, "f", "h", "setup", None, true).unwrap();
+        assert_eq!(changed, 1 + 1 + 3 + 4);
+        verify(&before, &p, "f", "h", "setup", None, true).unwrap();
+        let body = &p.get("f").unwrap().cfg.named[&label("loop_body")];
+        let n = body.instructions.len();
+        let (_, cell_guard) = &body.instructions[n - 4];
+        let (old, load) = &body.instructions[n - 3];
+        let (sel, select) = &body.instructions[n - 2];
+        let (store_id, store) = &body.instructions[n - 1];
+        assert_eq!(cell_guard, &Instruction::AssertValueCell { target: id(13) });
+        assert_eq!(load, &Instruction::Load { source: id(13) });
+        assert_eq!(
+            select,
+            &Instruction::Select { condition: id(10), if_true: id(16), if_false: *old },
+        );
+        assert_eq!(store, &Instruction::Store { target: id(13), source: *sel });
+        assert_eq!(*store_id, id(30));
+    }
+
+    /// With the arm on the false side, the masked select keeps the old
+    /// value on the true side instead - no `not` is minted.
+    #[test]
+    fn masks_a_store_on_the_false_arm() {
+        let mut p = region_program();
+        {
+            let fun = p.get_mut("f").unwrap();
+            fun.cfg.named.get_mut(&label("h")).unwrap().terminator.1 =
+                br_if(10, "join", "setup");
+            let body = fun.cfg.named.get_mut(&label("loop_body")).unwrap();
+            body.instructions.push((
+                id(30),
+                Instruction::Store { target: id(13), source: id(16) },
+            ));
+        }
+        let before = p.clone();
+        apply(&mut p, "f", "h", "setup", None, true).unwrap();
+        verify(&before, &p, "f", "h", "setup", None, true).unwrap();
+        let body = &p.get("f").unwrap().cfg.named[&label("loop_body")];
+        let n = body.instructions.len();
+        let (old, _) = &body.instructions[n - 3];
+        let (_, select) = &body.instructions[n - 2];
+        assert_eq!(
+            select,
+            &Instruction::Select { condition: id(10), if_true: *old, if_false: id(16) },
+        );
+    }
+
+    /// In a masked diamond each region's stores land on its own side of the
+    /// condition.
+    #[test]
+    fn masks_stores_in_both_diamond_regions() {
+        let mut p = diamond_program();
+        {
+            let fun = p.get_mut("f").unwrap();
+            fun.cfg.named.get_mut(&label("a")).unwrap().instructions.push((
+                id(30),
+                Instruction::Store { target: id(11), source: id(11) },
+            ));
+            fun.cfg.named.get_mut(&label("b")).unwrap().instructions.push((
+                id(31),
+                Instruction::Store { target: id(12), source: id(12) },
+            ));
+        }
+        let before = p.clone();
+        apply(&mut p, "f", "h", "a", Some("join"), true).unwrap();
+        verify(&before, &p, "f", "h", "a", Some("join"), true).unwrap();
+        let fun = p.get("f").unwrap();
+        let a_block = &fun.cfg.named[&label("a")];
+        let (old_a, _) = &a_block.instructions[a_block.instructions.len() - 3];
+        let (_, select_a) = &a_block.instructions[a_block.instructions.len() - 2];
+        assert_eq!(
+            select_a,
+            &Instruction::Select { condition: id(10), if_true: id(11), if_false: *old_a },
+        );
+        let b_block = &fun.cfg.named[&label("b")];
+        let (old_b, _) = &b_block.instructions[b_block.instructions.len() - 3];
+        let (_, select_b) = &b_block.instructions[b_block.instructions.len() - 2];
+        assert_eq!(
+            select_b,
+            &Instruction::Select { condition: id(10), if_true: *old_b, if_false: id(12) },
+        );
+        // Still serialized: a's exit continues into b.
+        assert_eq!(a_block.terminator_kind(), &br("b"));
+    }
+
+    /// `mask` on a store-free region is an unjustified premise: refuse.
+    #[test]
+    fn refuses_mask_without_stores() {
+        let mut p = region_program();
+        let error = apply(&mut p, "f", "h", "setup", None, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no stores; drop the mask field"), "{}", error);
+    }
+
+    /// A guard and a store triple landing at the same position keep the
+    /// guard first, and verify reproduces that layout.
+    #[test]
+    fn guard_and_store_at_the_same_position() {
+        let mut p = region_program();
+        {
+            let fun = p.get_mut("f").unwrap();
+            let setup = fun.cfg.named.get_mut(&label("setup")).unwrap();
+            // Right after the bound's definition, where its guard also goes.
+            setup.instructions.insert(
+                2,
+                (id(30), Instruction::Store { target: id(11), source: id(11) }),
+            );
+        }
+        let before = p.clone();
+        apply(&mut p, "f", "h", "setup", None, true).unwrap();
+        verify(&before, &p, "f", "h", "setup", None, true).unwrap();
+        let setup = &p.get("f").unwrap().cfg.named[&label("setup")];
+        // [%11, %12, guard x3, triple x3, %30 store, %20]
+        assert_eq!(setup.instructions.len(), 10);
+        assert!(matches!(
+            setup.instructions[2].1,
+            Instruction::NumberConstant { value } if value == Pico8Num::from_i16(BOUND_LIMIT)
+        ));
+        assert!(matches!(
+            setup.instructions[5].1,
+            Instruction::AssertValueCell { target } if target == id(11)
+        ));
+        assert!(matches!(
+            setup.instructions[8].1,
+            Instruction::Store { target, .. } if target == id(11)
+        ));
+        assert_eq!(setup.instructions[8].0, id(30));
+    }
+
+    /// The verifier rebuilds the masked select itself, so a swapped
+    /// polarity in the after program is caught.
+    #[test]
+    fn verify_rejects_a_swapped_mask_polarity() {
+        let mut p = region_program();
+        {
+            let fun = p.get_mut("f").unwrap();
+            let body = fun.cfg.named.get_mut(&label("loop_body")).unwrap();
+            body.instructions.push((
+                id(30),
+                Instruction::Store { target: id(13), source: id(16) },
+            ));
+        }
+        let before = p.clone();
+        apply(&mut p, "f", "h", "setup", None, true).unwrap();
+        {
+            let fun = p.get_mut("f").unwrap();
+            let body = fun.cfg.named.get_mut(&label("loop_body")).unwrap();
+            let n = body.instructions.len();
+            let old = body.instructions[n - 3].0;
+            body.instructions[n - 2].1 = Instruction::Select {
+                condition: id(10),
+                if_true: old,
+                if_false: id(16),
+            };
+        }
+        let error = verify(&before, &p, "f", "h", "setup", None, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("changed %"), "{}", error);
     }
 }

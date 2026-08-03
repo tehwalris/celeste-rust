@@ -36,6 +36,7 @@ not comparable.
 | + `is_solid` chains eager (`speculate_region` x9), consumers absorbed | 1.82 s / 0.62 GB | - |
 | + wall-jump stores absorbed (`speculate` with a pointer guard) | 1.78 s / 0.61 GB | - |
 | + pixel loops masked (`mask_loop` x2, a61 chains eager) | 1.59 s / 0.63 GB | - |
+| + wall-jump arm eager (`fold_reflexive` dead gates, masked `speculate_region`) | 1.46 s / 0.53 GB | - |
 
 The store-triangle row is the first change that moved the fragment count: 558
 -> 335 mean fragments per frame at frame 34, split executions 19573 -> 11978.
@@ -64,14 +65,14 @@ here that tracks distance to a compilable kernel.
 
 |  | original | rewritten |
 |---|---|---|
-| dynamic instrs/frame, mean | 2122 | 3635 |
-| dynamic instrs/frame, max | 6422 | 9075 |
-| distinct blocks reached | 450 | 286 |
-| K, fully unrolled | 8321 | 9755 |
-| K, loops kept as loops | 2963 | 3943 |
+| dynamic instrs/frame, mean | 2122 | 3728 |
+| dynamic instrs/frame, max | 6422 | 9021 |
+| distinct blocks reached | 450 | 261 |
+| K, fully unrolled | 8321 | 9682 |
+| K, loops kept as loops | 2963 | 3934 |
 
-By instruction kind, rewritten: heap 39.2%, arith 30.7%, const 7.7%,
-terminator 7.2%, guard 5.3%, global 5.0%, phi 3.4%, call 1.1%. `arith`,
+By instruction kind, rewritten: heap 39.6%, arith 30.9%, const 7.8%,
+terminator 6.7%, guard 5.4%, global 5.0%, phi 3.1%, call 1.1%. `arith`,
 `const` and `select` are the core a compiled kernel emits; the rest has to
 reach zero. The region stage *lowered* K (7770 -> 7323 unrolled) despite
 running regions eagerly, because absorbing the consumers deleted whole arm
@@ -374,7 +375,40 @@ state, and a uniform-trip rolled loop has none - the same reason the
 object-table loops were never a problem. The differential is identical
 through frame 34, guard included.
 
-### Input fan-out: lane expansion is worse than state duplication (2026-08)
+**Update, after the wall-jump arm went eager** (`fold_reflexive` + 4
+`fold`/`dce` rounds, 2 `speculate_region` gates, 2 `demote_create`, then
+the grace diamond and the jump branch as the first two *masked*
+`speculate_region` entries):
+
+    branches: 1531 of 30868 executions split the state, across 13 distinct sites
+
+Frame 34: 1.59 s -> 1.46 s, memory 0.63 -> 0.53 GB, fragments 67 -> 46
+mean (371 -> 248 max), splits 2245 -> 1531. Two findings paid for the
+stage. First, the `is_solid(x, 0)` chains all open with a gate on `0 > 0`:
+`fold_reflexive` folds the reflexive comparison without evaluating
+anything, and two fold/dce cascades deleted 14 never-taken collide loops
+across 7 sites in 5 functions - 1328 instructions of dead code, including
+inside regions earlier entries had made eager. Second, with the arm
+flattened, `speculate_region` with `"mask": true` ran the whole wall-jump
+arm - grace stores, `is_solid` scan, spd writes - unconditionally, every
+store going through a load-adjacent masked select; the grace diamond's two
+store-carrying arms serialize soundly because their masks are the two
+sides of one condition. The jump/dash cluster (474 splits) is gone
+entirely, and the `btn` family shrank with the fragment count it
+multiplies (1261 -> 943). The remainder:
+
+| family | splits | what it is |
+|---|---|---|
+| `btn` x6 | 943 | input fan-out |
+| `in_i1_074_cont` (the outer dash diamond) | 372 | arms contain `btn` calls, waits for the endgame |
+| `in_k1039_cont` (= old `if_join_136`, the dash gate) | 84 | condition reads `btn`, arm allocs |
+| `in_i1_068` x2 (`spikes_at` tile loops) | 96 | mask family, but its break calls `kill_player` |
+| `__main` `in_i1_012` x2, `anonymous_61` `__entry` | 36 | small exposures |
+
+Every remaining split is now `btn`-tainted, `spikes_at`, or a small
+exposure - there is no convertible triangle, diamond or maskable region
+left that splits (the profile's triangle table shows 0 splits across all
+139 tracked shapes).
 
 Following the branch-site table, `btn` was rewritten to be branch-free: a
 `__concretize` builtin that turns the `UnknownBool` button into a per-lane

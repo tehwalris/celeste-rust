@@ -712,4 +712,21 @@
 {"id":"g040","rule":"demote_create","fn":"anonymous_61","at":"%194"}
 {"id":"g041","rule":"mask_loop","fn":"anonymous_61","head":"in_k1000_for_head_472","limit":8,"why":"move_x pixel loop, same bound argument as g037"}
 {"id":"g042","rule":"merge_blocks"}
+{"id":"g043","rule":"fold_reflexive","why":"the wall-jump is_solid chains gate on 0 > 0; fold the reflexive comparisons so their dead loops can go"}
+{"id":"g044","rule":"fold"}
+{"id":"g045","rule":"dce"}
+{"id":"g046","rule":"fold"}
+{"id":"g047","rule":"fold"}
+{"id":"g048","rule":"dce"}
+{"id":"g049","rule":"fold"}
+{"id":"g050","rule":"fold"}
+{"id":"g051","rule":"dce"}
+{"id":"g052","rule":"fold"}
+{"id":"g053","rule":"speculate_region","fn":"player.update_21","head":"in_k034_if_join_413","arm":"in_k034_and_or_continue_424"}
+{"id":"g054","rule":"speculate_region","fn":"player.update_21","head":"in_k034_and_or_join_425","arm":"in_k034_and_or_continue_428"}
+{"id":"g055","rule":"demote_create","fn":"player.update_21","at":"%462","why":"player.grace is set in init and every update; the cell always exists by the time the wall-jump arm runs"}
+{"id":"g056","rule":"demote_create","fn":"player.update_21","at":"%468","why":"player.spd.y exists from object construction; the wall-jump arm only overwrites it"}
+{"id":"g057","rule":"speculate_region","fn":"player.update_21","head":"if_body_135","arm":"if_body_139","join":"if_join_141","mask":true,"why":"the grace diamond: the wall-jump stores in both arms land per lane through masked selects on grace>0"}
+{"id":"g058","rule":"speculate_region","fn":"player.update_21","head":"and_or_join_126","arm":"if_body_135","mask":true,"why":"the jump branch: the whole wall-jump arm goes eager, its four masked stores re-masked by the jump condition"}
+{"id":"g059","rule":"merge_blocks"}
 {"id":"s1","rule":"allocate_slots"}

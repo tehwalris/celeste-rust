@@ -28,6 +28,7 @@ pub mod allocate_slots;
 pub mod convert_ternary;
 pub mod if_convert;
 pub mod fold;
+pub mod fold_reflexive;
 pub mod cse;
 pub mod dce;
 pub mod decompose_truthy;

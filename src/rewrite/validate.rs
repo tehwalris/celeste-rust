@@ -227,6 +227,16 @@ pub fn validate_function(fun: &FunDef) -> Vec<ValidationError> {
                         } else {
                             Some(label.clone())
                         };
+                        // An edge from an unreachable predecessor can never
+                        // be taken, so nothing needs to be available along
+                        // it. This state exists between a `fold` that
+                        // removes the last reachable edge into a loop and
+                        // the `dce` that sweeps the loop - the walk here
+                        // already skips the unreachable blocks' own
+                        // instructions for the same reason.
+                        if !dominance.is_reachable(&pred_key) {
+                            continue;
+                        }
                         let ok = match (
                             defined.get(value).and_then(|k| dominance.index_of(k)),
                             dominance.index_of(&pred_key),
