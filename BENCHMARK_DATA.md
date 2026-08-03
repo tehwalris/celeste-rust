@@ -46,6 +46,7 @@ not comparable.
 | + `split_call` + both update arms inlined (no dispatch left) | 0.94-0.96 s / 0.47 GB | 3.88-3.90 s / 1.65 GB |
 | + 2 `unroll_loop` (pixel-move loops flat) + `merge_blocks` + `cse` forward | 0.88-0.89 s / 0.46 GB | 3.65-3.75 s / 1.65 GB |
 | + `dedup_guards` (501 dominated asserts deleted) | time-neutral | time-neutral |
+| + 2 `unroll_loop` on the `spikes_at` nest (inner then outer) | 0.88 s / 0.47 GB | 3.69-3.70 s / 1.65 GB |
 
 The store-triangle row is the first change that moved the fragment count: 558
 -> 335 mean fragments per frame at frame 34, split executions 19573 -> 11978.
@@ -486,6 +487,29 @@ unrolled K 3808 -> **3368** (-12%), guard weight 690 -> 250 (-64%).
 That is paid work the eventual compiled kernel no longer contains.
 `dce` found nothing afterwards (the surviving first asserts keep their
 operands alive), so no `dce` entry follows it in the recipe.
+
+### The `spikes_at` nest unrolled (2026-08-03)
+
+The instruction profiler picked the target: 7.2% of program-under-test
+time in the inner spikes body (`mget` + four fixed-point `%` + selects,
+re-derived per iteration). Stage L had already masked both nest loops to
+constant-bound counters (`k <= 1.0`, 2 iterations, `span < 2` asserted
+at runtime), so they were `unroll_loop` shapes except for one refusal:
+head-defined values (the in-bounds flags) are read *directly* by the
+exit blocks, not through phis. That is sound to unroll - a head-defined
+value used outside the loop always observes the final head execution,
+since every path out passes through it - so the rule now renames such
+uses through the last copy instead of refusing (chain-defined outside
+uses stay refused; they cannot dominate the exit). Replay of the earlier
+unroll entries is byte-identical, so no opt-in flag was needed.
+
+Inner loop first (its unroll linearizes the outer body), then the
+outer, then the usual sweep. Interleaved A/B: 0.89-0.90 -> 0.88 s at
+34, 3.75 -> 3.69-3.70 s at 37 (~-1.5%, matching the ceiling: the block
+was 7.2% of the ~26% program share). K unrolled 3368 -> **3110**, and
+the two K bounds nearly converged (3047 loops-kept vs 3110) - **the hot
+path is now essentially loop-free**; what remains rolled is cold or in
+`__main`'s per-frame input handling.
 
 ## Where the time goes
 

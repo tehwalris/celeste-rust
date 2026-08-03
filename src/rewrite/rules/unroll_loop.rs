@@ -32,8 +32,12 @@
 //! copy of the head's non-phi instructions, phi uses substituted with that
 //! iteration's values) falls through to `B1_itj .. Bm_itj`, which falls into
 //! `H_itj+1`; the final `H_itN` falls out to `X`. The head and chain blocks
-//! are deleted, and any phi elsewhere taking an edge from `H` takes it from
-//! `H_itN` instead, its value renamed through the last copy.
+//! are deleted; any phi elsewhere taking an edge from `H` takes it from
+//! `H_itN` instead; and every use of a head-defined value outside the loop
+//! is renamed through the last copy - such a use always observes the final
+//! head execution, because every path out of the loop passes through it.
+//! (A *chain*-defined value cannot dominate anything outside the loop, so
+//! outside uses of those are refused.)
 //!
 //! # Soundness
 //!
@@ -302,23 +306,18 @@ fn site(fun: &FunDef, function: &str, head: &Label) -> Result<Site> {
     }
     require(trip_count >= 1, format!("'{}' never runs", head.as_str()))?;
 
-    // No id defined in the head or the chain may be used outside them, except
-    // by a phi edge labelled with the head (remapped to the last copy). Such
-    // an edge value must be defined in the head or be loop-invariant - a
-    // chain-defined value cannot dominate the head's exit edge.
-    let mut inside: FxHashSet<LocalId> = FxHashSet::default();
-    for (id, _) in &head_block.instructions {
-        inside.insert(*id);
-    }
-    inside.insert(*head_terminator_id(head_block));
+    // A *head*-defined value used outside the loop always observes the final
+    // head execution - every path out passes through the last head visit - so
+    // such uses are fine: `apply` substitutes them through the last copy's
+    // rename map. A *chain*-defined value cannot dominate anything outside
+    // the loop (the preheader->head->exit path skips the chain), so an
+    // outside use of one is refused.
     let mut chain_defined: FxHashSet<LocalId> = FxHashSet::default();
     for label in &chain {
         let block = &fun.cfg.named[label];
         for (id, _) in &block.instructions {
-            inside.insert(*id);
             chain_defined.insert(*id);
         }
-        inside.insert(*head_terminator_id(block));
     }
     let loop_keys: FxHashSet<Option<Label>> = std::iter::once(Some(head.clone()))
         .chain(chain.iter().map(|l| Some(l.clone())))
@@ -329,45 +328,22 @@ fn site(fun: &FunDef, function: &str, head: &Label) -> Result<Site> {
         }
         let block = get_block(&fun.cfg, &key).expect("listed block exists");
         for (_, instr) in &block.instructions {
-            if let Instruction::Phi { branches } = instr {
-                for (label, value) in branches {
-                    if label == head {
-                        require(
-                            !chain_defined.contains(value),
-                            format!(
-                                "a phi on the head edge of '{}' carries a chain-defined value",
-                                head.as_str()
-                            ),
-                        )?;
-                        continue;
-                    }
-                    require(
-                        !inside.contains(value),
-                        format!("a loop-defined value of '{}' is used outside it", head.as_str()),
-                    )?;
-                }
-                continue;
-            }
             for used in instr.get_used_locals() {
                 require(
-                    !inside.contains(&used),
-                    format!("a loop-defined value of '{}' is used outside it", head.as_str()),
+                    !chain_defined.contains(&used),
+                    format!("a chain-defined value of '{}' is used outside it", head.as_str()),
                 )?;
             }
         }
         for used in block.terminator_kind().get_used_locals() {
             require(
-                !inside.contains(&used),
-                format!("a loop-defined value of '{}' is used outside it", head.as_str()),
+                !chain_defined.contains(&used),
+                format!("a chain-defined value of '{}' is used outside it", head.as_str()),
             )?;
         }
     }
 
     Ok(Site { preheader_key, exit, chain, phis, rest, trip_count })
-}
-
-fn head_terminator_id(block: &Block) -> &LocalId {
-    &block.terminator.0
 }
 
 fn copy_label(base: &Label, iteration: usize) -> Label {
@@ -477,33 +453,40 @@ pub fn apply(program: &mut Program, function: &str, head: &str) -> Result<usize>
     };
     retarget(&mut preheader.terminator.1, &head, &copy_label(&head, 0));
 
-    // Delete the loop, insert the copies.
+    // Delete the loop.
     fun.cfg.named.remove(&head);
     for label in &s.chain {
         fun.cfg.named.remove(label);
     }
-    for (label, block) in new_blocks {
-        fun.cfg.named.insert(label, block);
-    }
 
-    // Phis elsewhere that took the head edge now take it from the last copy,
-    // their values renamed through it.
+    // Every use of a head-defined value outside the loop observes the final
+    // head execution, so it renames through the last copy; phis that took the
+    // head edge take it from the last copy. Done before the copies are
+    // inserted, so only pre-existing blocks are touched.
     let last_head = copy_label(&head, s.trip_count);
+    let subst = |id: LocalId| *last_map.get(&id).unwrap_or(&id);
     let fix = |block: &mut Block| {
         for (_, instr) in block.instructions.iter_mut() {
             if let Instruction::Phi { branches } = instr {
                 for (label, value) in branches.iter_mut() {
                     if *label == head {
                         *label = last_head.clone();
-                        *value = *last_map.get(value).unwrap_or(value);
                     }
+                    *value = subst(*value);
                 }
+            } else {
+                *instr = instr.map_local_ids(subst);
             }
         }
+        block.terminator.1 = block.terminator.1.map_local_ids(subst);
     };
     fix(&mut fun.cfg.entry);
     for block in fun.cfg.named.values_mut() {
         fix(block);
+    }
+
+    for (label, block) in new_blocks {
+        fun.cfg.named.insert(label, block);
     }
 
     // Live ranges changed; any slot allocation is stale.
@@ -655,16 +638,20 @@ pub fn verify(before: &Program, after: &Program, function: &str, head: &str) -> 
         if key == s.preheader_key {
             retarget(&mut expected.terminator.1, &head, &copy_label(&head, 0));
         }
+        let subst = |id: LocalId| *last_map.get(&id).unwrap_or(&id);
         for (_, instr) in expected.instructions.iter_mut() {
             if let Instruction::Phi { branches } = instr {
                 for (label, value) in branches.iter_mut() {
                     if *label == head {
                         *label = last_head.clone();
-                        *value = *last_map.get(value).unwrap_or(value);
                     }
+                    *value = subst(*value);
                 }
+            } else {
+                *instr = instr.map_local_ids(subst);
             }
         }
+        expected.terminator.1 = expected.terminator.1.map_local_ids(subst);
         require(
             *after_block == expected,
             format!(
@@ -896,6 +883,31 @@ mod tests {
         }
         let err = apply(&mut program, "f", "head").unwrap_err();
         assert!(err.to_string().contains("chain-defined"), "{}", err);
+    }
+
+    #[test]
+    fn renames_a_head_value_used_directly_outside() {
+        // The masked-loop shape: the exit reads the accumulator phi directly,
+        // not through an exit phi. It must observe the last iteration's value.
+        let mut program = loop_program();
+        {
+            let fun = program.functions.values_mut().next().unwrap();
+            let exit = fun.cfg.named.get_mut(&label("exit")).unwrap();
+            exit.instructions[0] = (
+                id(15),
+                Instruction::BinaryOp { left: id(7), op: BinaryOp::Plus, right: id(7) },
+            );
+        }
+        let before = program.clone();
+        let mut after = program;
+        apply(&mut after, "f", "head").unwrap();
+        verify(&before, &after, "f", "head").unwrap();
+        let fun = after.get("f").unwrap();
+        let exit = &fun.cfg.named[&label("exit")];
+        let Instruction::BinaryOp { left, right, .. } = &exit.instructions[0].1 else { panic!() };
+        // No longer the phi id; both operands renamed consistently.
+        assert_ne!(*left, id(7));
+        assert_eq!(left, right);
     }
 
     #[test]

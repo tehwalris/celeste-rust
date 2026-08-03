@@ -844,4 +844,11 @@
 {"id":"h072","rule":"fold_select"}
 {"id":"h073","rule":"dce"}
 {"id":"h074","rule":"dedup_guards"}
+{"fn":"anonymous_61","head":"in_h061_in_i1_068_for_head_643","id":"h076","rule":"unroll_loop"}
+{"fn":"anonymous_61","head":"in_h061_in_i1_068_for_head_638","id":"h077","rule":"unroll_loop"}
+{"id":"h078","rule":"merge_blocks"}
+{"forward":true,"id":"h079","rule":"cse"}
+{"id":"h080","rule":"dedup_guards"}
+{"id":"h081","rule":"fold_select"}
+{"id":"h082","rule":"dce"}
 {"id":"s1","rule":"allocate_slots"}

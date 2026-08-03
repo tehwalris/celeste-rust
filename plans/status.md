@@ -1,6 +1,6 @@
 # Status (2026-08)
 
-Branch `rewrite`. Build is warning-free, 383 lib tests pass, working tree
+Branch `rewrite`. Build is warning-free, 384 lib tests pass, working tree
 clean.
 
 ## Measured, frame 34 (the standard iteration benchmark)
@@ -1078,6 +1078,36 @@ they unroll *statically*.
   * heap is 38.9% of K again now that everything else shrank - the
     residual loads are cross-join, so revisit promotion *after* the
     above, when the straight-line regions are as large as they get.
+
+## Stage Q: the spikes nest unrolled; next is the endgame (2026-08-03)
+
+Per-instruction profiling (`bench --profile`, new) settled the plan:
+wall clock is ~65% state machinery and ~26% program, heap ops are ~1%
+of wall time despite being 39% of K (nearly all cells are per-state
+scalars - K and wall time now measurably diverge), and the top flat
+program cost was the still-rolled `spikes_at` nest. Decision with the
+measurement in hand: skip constant-arith fold and the hygiene stage for
+now (neither is a win today), do the spikes unroll, then go straight at
+the split sites - merge cost is proportional to state count, and the
+endgame is what collapses state count.
+
+* `unroll_loop` extended: head-defined values used outside the loop
+  rename through the last copy (they always observe the final head
+  execution); chain-defined outside uses stay refused. Replay of the
+  pixel-loop entries byte-identical, so no opt-in flag.
+* Inner then outer spikes loop unrolled (2 iterations each, the
+  `span < 2` asserts from stage L still standing), swept. 0.89-0.90 ->
+  0.88 s at 34, 3.75 -> 3.69-3.70 at 37. K unrolled 3368 -> 3110, and
+  the K bounds nearly converged (3047 rolled vs 3110) - the hot path
+  is essentially loop-free.
+* **Next: the endgame sequence.** (1) re-land the dash package
+  (`plans/dash-package.jsonl`) - its blocker (btn-in-arm, cluster
+  allocs) predates the unrolled/fused frame; (2) convert the remaining
+  non-btn split sites (dash gate 108, tile splits 30, `__main` 27,
+  entry 9) with existing machinery; (3) btn as lane expansion -
+  downstream of btn is now selects, not branches, which is the
+  precondition the 2026-06 revert identified. The prize is the ~65%
+  the state machinery costs at ~530 fragments/frame.
 
 ### Later: `assume_eq`, whole-function field promotion
 
