@@ -824,4 +824,9 @@
 {"id":"h043","rule":"fold_select"}
 {"id":"h044","rule":"dce"}
 {"id":"h045","rule":"fold"}
+{"fn":"__frame","head":"in_j2_006_for_head_1","id":"h050","rule":"collapse_break_loop"}
+{"fn":"__frame","head":"in_j2_008_for_head_1","id":"h051","rule":"collapse_break_loop"}
+{"fn":"__frame","head":"in_j2_009_for_head_1","id":"h052","rule":"collapse_break_loop"}
+{"fn":"player_spawn.update_24","head":"in_i1_063_in_i1_037_for_head_30","id":"h053","rule":"collapse_break_loop"}
+{"id":"h054","rule":"dce"}
 {"id":"s1","rule":"allocate_slots"}

@@ -64,8 +64,8 @@ enum Command {
         /// What to look for: "promote-cell", "promote-capture", "inline",
         /// "if-convert", "demote-create", "pin-builtin", "convert-ternary",
         /// "decompose-truthy", "speculate", "speculate-region", "sink-store",
-        /// "absorb-stores", "expand-bool", "convert-assert" or
-        /// "collapse-loop".
+        /// "absorb-stores", "expand-bool", "convert-assert",
+        /// "collapse-loop" or "collapse-break-loop".
         #[arg(default_value = "promote-cell")]
         what: String,
         /// Prefix for the generated ids.
@@ -867,6 +867,31 @@ fn main() -> Result<()> {
                         "# Each claims `bound == init` at runtime - only sound for \
                          loops over `objects` while the room holds one object. Check \
                          the bound's provenance before applying; screen at full depth."
+                    );
+                }
+                "collapse-break-loop" => {
+                    let candidates =
+                        celeste_rust::rewrite::rules::collapse_break_loop::candidates(&program);
+                    for (i, (function, head)) in candidates.iter().enumerate() {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "id": format!("{}{:03}", prefix, i),
+                                "rule": "collapse_break_loop",
+                                "fn": function,
+                                "head": head.as_str(),
+                            })
+                        );
+                    }
+                    eprintln!(
+                        "# {} sentinel loop(s) with an in-body `#tbl < i` break - \
+                         the inlined foreach/del shape.",
+                        candidates.len()
+                    );
+                    eprintln!(
+                        "# Each claims the break fires on iteration 2 - the singleton \
+                         table premise again. Apply only where the loop executes \
+                         (measure_k --blocks); screen at full depth."
                     );
                 }
                 "promote-capture" => {

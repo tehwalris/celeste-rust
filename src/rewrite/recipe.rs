@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use super::program::Program;
 use super::rules::{
-    absorb_stores, allocate_slots, assume_eq, collapse_loop, convert_assert, convert_ternary,
+    absorb_stores, allocate_slots, assume_eq, collapse_break_loop, collapse_loop,
+    convert_assert, convert_ternary,
     cse, dce, decompose_branch,
     decompose_truthy, demote_create,
     expand_bool, fold, fold_reflexive, fold_select, fuse_breaks, if_convert, inline,
@@ -345,6 +346,18 @@ pub enum Rule {
         /// the conditional branch on it.
         head: String,
     },
+    /// Collapse a sentinel-bounded loop whose real exit is an in-body
+    /// `#tbl < i` break - the inlined `foreach`/`del` shape - guarded by
+    /// runtime asserts that iteration 1 does not break and iteration 2
+    /// does (the break check is re-materialized after the payload, reading
+    /// `# t` again so mid-payload table mutations count). The head and the
+    /// break block disappear. Screen at full depth.
+    CollapseBreakLoop {
+        #[serde(rename = "fn")]
+        function: String,
+        /// The sentinel loop header.
+        head: String,
+    },
 }
 
 impl Rule {
@@ -375,6 +388,7 @@ impl Rule {
             Rule::ExpandBool { .. } => "expand_bool",
             Rule::ConvertAssert { .. } => "convert_assert",
             Rule::CollapseLoop { .. } => "collapse_loop",
+            Rule::CollapseBreakLoop { .. } => "collapse_break_loop",
             Rule::AssumeEq { .. } => "assume_eq",
         }
     }
@@ -579,6 +593,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::ExpandBool { function, head } => expand_bool::apply(program, function, head),
         Rule::ConvertAssert { function, head } => convert_assert::apply(program, function, head),
         Rule::CollapseLoop { function, head } => collapse_loop::apply(program, function, head),
+        Rule::CollapseBreakLoop { function, head } => {
+            collapse_break_loop::apply(program, function, head)
+        }
         Rule::AssumeEq { function, a, b } => {
             assume_eq::apply(program, function, parse_cell(a)?, parse_cell(b)?)
         }
@@ -694,6 +711,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         }
         Rule::CollapseLoop { function, head } => {
             collapse_loop::verify(&before, program, function, head)
+        }
+        Rule::CollapseBreakLoop { function, head } => {
+            collapse_break_loop::verify(&before, program, function, head)
         }
         Rule::AssumeEq { function, a, b } => {
             assume_eq::verify(&before, program, function, parse_cell(a)?, parse_cell(b)?)

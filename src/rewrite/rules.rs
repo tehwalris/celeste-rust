@@ -26,6 +26,7 @@ use super::program::Program;
 pub mod absorb_stores;
 pub mod allocate_slots;
 pub mod assume_eq;
+pub mod collapse_break_loop;
 pub mod collapse_loop;
 pub mod convert_assert;
 pub mod convert_ternary;
