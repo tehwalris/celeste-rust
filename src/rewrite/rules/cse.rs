@@ -77,6 +77,68 @@
 //! are the safest thing there is to reuse. See `crosses_blocks`: keeping one
 //! live across the blocks in between costs more in the interpreter than
 //! recomputing it, and the measurement is not close.
+//!
+//! # The `forward` mode (opt-in per recipe entry)
+//!
+//! The paragraph above - "nothing is assumed about aliasing" - makes every
+//! store a fence for every load, and `player.update_21` has ~150 stores. The
+//! `forward` mode replaces the blanket kills with ones the heap model actually
+//! justifies, and adds store-to-load forwarding. It is opt-in because old
+//! `cse` entries must replay byte-identically; new entries say
+//! `"forward": true`.
+//!
+//! Three facts about the interpreter's heap carry the refinement, all checked
+//! against `core_interpreter.rs`:
+//!
+//! 1. **A field cell belongs to exactly one `(table, name)` pair.** The only
+//!    way a cell id enters an `ObjectTable`'s map is `get_field create`, which
+//!    always inserts a *freshly allocated* cell. So a cell obtained via
+//!    `get_field _.x` can never be the cell behind `get_field _.y`, a
+//!    `get_global`, a `get_index` (those live in `ArrayTable`s, which a table
+//!    cannot simultaneously be), or an IR-level `alloc`. Builtins hold the
+//!    invariant too: `add` allocates a fresh cell for the pushed value,
+//!    `del`/`__array_table_drop_last` only remove. A store through a
+//!    `get_field`-derived pointer therefore kills only loads of same-name
+//!    field cells - plus loads through pointers of *unknown* provenance
+//!    (phi/arg/load-derived), which could be anything.
+//!
+//! 2. **A `create` accessor never changes an existing cell.** It allocates a
+//!    missing cell holding nil; contents of every existing cell are untouched,
+//!    and a remembered load's source local is immutable SSA. So creates kill
+//!    no `Load` keys at all - only same-name accessor keys, whose re-execution
+//!    could now find a cell where they previously got a `NilPointer`. The one
+//!    cross-kill: a field-create can flip an `UnknownTable` into an
+//!    `ObjectTable`, after which a remembered `get_index` on it would *error*
+//!    rather than repeat its `NilPointer` - reusing the memory would suppress
+//!    that error, so field-creates kill index accessors and vice versa.
+//!
+//! 3. **`store %c <- %v` makes `load %c` return exactly the value of `%v`.**
+//!    (`StoreClosure` does not - loading a closure cell returns the cell's own
+//!    pointer - so it kills but never forwards.) Forwarding a later load to
+//!    `%v` is then just load-load CSE with the store as the first "load", and
+//!    the same must-analysis pair machinery makes it sound.
+//!
+//! Calls stay kill-everything with one exception: a callee that provably is a
+//! *heap-oblivious* builtin - `error` (aborts the run), `__print` (reads its
+//! argument values, appends to the print log), `__split_by_flr` (a function of
+//! its argument that splits the state) - touches no heap cell and creates no
+//! global, so it invalidates nothing. "Provably" has two halves: the callee's
+//! def chain is `load (get_global NAME)`, and a whole-program scan shows every
+//! `get_global NAME` result is used only by `Load` - so the global can never
+//! have been shadowed, structurally rather than by assumption.
+//!
+//! `StoreEmptyTable` remains a kill-everything barrier: it replaces a table
+//! wholesale, and it is rare (fresh-table construction in the smoke arm).
+//!
+//! **Everything forward mode finds is block-local.** The unrestricted version
+//! was built and measured: 631 folds against 270, K (loops kept) 3602 against
+//! 3815 - and `player.update_21` went from 33 to 47 live slots, because a
+//! load that used to be re-executed near its use became one value kept alive
+//! across the whole stretch. The interpreter charges merge, dedup and filter
+//! for the entire env per state, so at frame 37 that was ~2% *slower* despite
+//! 361 fewer instructions, exactly the `crosses_blocks` trade. Until folding
+//! is live-range-aware, the extra reach is a loss in the harness that
+//! actually runs.
 
 use anyhow::{anyhow, Result};
 use rustc_hash::FxHashMap;
@@ -117,6 +179,227 @@ fn kind_of(key: &Key) -> Kind {
         Key::Load { .. } => Kind::Load,
         Key::Pure(_) => Kind::Pure,
     }
+}
+
+/// Which cell a pointer-valued local denotes, as far as its defining
+/// instruction reveals. The heap model (see the module doc) makes the four
+/// known provenances permanently disjoint cell populations; `Unknown` (a
+/// phi, an argument, a loaded pointer) may alias anything.
+#[derive(PartialEq, Eq, Hash, Clone, Debug)]
+enum CellProv {
+    Field(String),
+    Global(String),
+    Index,
+    Alloc(LocalId),
+    Unknown,
+}
+
+/// Could a store through a `store`-provenance pointer change what a load
+/// through a `load`-provenance pointer reads?
+fn cells_may_alias(store: &CellProv, load: &CellProv) -> bool {
+    use CellProv::*;
+    match (store, load) {
+        (Unknown, _) | (_, Unknown) => true,
+        (Field(a), Field(b)) => a == b,
+        (Global(a), Global(b)) => a == b,
+        (Index, Index) => true,
+        (Alloc(a), Alloc(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// What one pair in the universe is vulnerable to, precomputed at build time.
+#[derive(Debug)]
+enum PairMeta {
+    AccField(String),
+    AccIndex,
+    AccGlobal(String),
+    Load(CellProv),
+    Pure,
+}
+
+/// The invalidation one instruction performs, under `forward` mode. Memoizing
+/// a bitmask per distinct barrier keeps applying one O(words), as before.
+#[derive(PartialEq, Eq, Hash, Clone, Debug)]
+enum Barrier {
+    None,
+    All,
+    Store(CellProv),
+    CreateField(String),
+    CreateIndex,
+    CreateGlobal(String),
+}
+
+fn kills(barrier: &Barrier, meta: &PairMeta) -> bool {
+    match (barrier, meta) {
+        (Barrier::None, _) | (_, PairMeta::Pure) => false,
+        (Barrier::All, _) => true,
+        (Barrier::Store(p), PairMeta::Load(lp)) => cells_may_alias(p, lp),
+        (Barrier::Store(_), _) => false,
+        (Barrier::CreateField(n), PairMeta::AccField(m)) => n == m,
+        // An UnknownTable this create turns into an ObjectTable would make a
+        // remembered get_index on it error instead of repeating a NilPointer.
+        (Barrier::CreateField(_), PairMeta::AccIndex) => true,
+        (Barrier::CreateField(_), _) => false,
+        (Barrier::CreateIndex, PairMeta::AccIndex) => true,
+        // The same flip in the other direction.
+        (Barrier::CreateIndex, PairMeta::AccField(_)) => true,
+        (Barrier::CreateIndex, _) => false,
+        (Barrier::CreateGlobal(n), PairMeta::AccGlobal(m)) => n == m,
+        (Barrier::CreateGlobal(_), _) => false,
+    }
+}
+
+/// Builtins that read and write no heap cell and create no global. `error`
+/// aborts the run, `__print` formats its arguments and appends to the print
+/// log, `__split_by_flr` is a function of its argument that splits the state.
+/// A call provably reaching one of these invalidates nothing. Keep this list
+/// in sync with the implementations in `game_runner.rs`.
+const HEAP_OBLIVIOUS: &[&str] = &["error", "__print", "__split_by_flr"];
+
+/// The subset of `HEAP_OBLIVIOUS` whose global can never have been shadowed:
+/// every `get_global NAME` result in the whole program is used only by `Load`.
+/// A name that fails the scan simply stays opaque.
+fn oblivious_globals(program: &Program) -> rustc_hash::FxHashSet<String> {
+    let mut bad: rustc_hash::FxHashSet<&str> = Default::default();
+    for fun in program.functions.values() {
+        let mut cells: FxHashMap<LocalId, &str> = FxHashMap::default();
+        for (_, block) in all_blocks(&fun.cfg) {
+            for (id, instr) in &block.instructions {
+                if let Instruction::GetGlobal { name, .. } = instr {
+                    if let Some(&n) = HEAP_OBLIVIOUS.iter().find(|&&n| n == name) {
+                        cells.insert(*id, n);
+                    }
+                }
+            }
+        }
+        if cells.is_empty() {
+            continue;
+        }
+        for (_, block) in all_blocks(&fun.cfg) {
+            for (_, instr) in &block.instructions {
+                if let Instruction::Load { source } = instr {
+                    if cells.contains_key(source) {
+                        continue;
+                    }
+                }
+                for used in instr.get_used_locals() {
+                    if let Some(&n) = cells.get(&used) {
+                        bad.insert(n);
+                    }
+                }
+            }
+            for used in block.terminator_kind().get_used_locals() {
+                if let Some(&n) = cells.get(&used) {
+                    bad.insert(n);
+                }
+            }
+        }
+    }
+    HEAP_OBLIVIOUS
+        .iter()
+        .filter(|n| !bad.contains(*n))
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Everything `forward` mode needs beyond the classic analysis: the defining
+/// instruction of each id (for provenance) and the proven-unshadowed
+/// heap-oblivious globals.
+struct Fwd<'a> {
+    defs: FxHashMap<LocalId, &'a Instruction>,
+    oblivious: &'a rustc_hash::FxHashSet<String>,
+}
+
+impl<'a> Fwd<'a> {
+    fn of(cfg: &'a Cfg, oblivious: &'a rustc_hash::FxHashSet<String>) -> Self {
+        let mut defs = FxHashMap::default();
+        for (_, block) in all_blocks(cfg) {
+            for (id, instr) in &block.instructions {
+                defs.insert(*id, instr);
+            }
+        }
+        Self { defs, oblivious }
+    }
+
+    /// `id` must already be resolved through the substitution.
+    fn cell_prov(&self, id: LocalId) -> CellProv {
+        match self.defs.get(&id) {
+            Some(Instruction::GetField { field, .. }) => CellProv::Field(field.clone()),
+            Some(Instruction::GetGlobal { name, .. }) => CellProv::Global(name.clone()),
+            Some(Instruction::GetIndex { .. }) => CellProv::Index,
+            Some(Instruction::Alloc) => CellProv::Alloc(id),
+            _ => CellProv::Unknown,
+        }
+    }
+
+    /// Does `callee` provably hold a heap-oblivious builtin? True only when
+    /// its def chain is `load (get_global NAME)` for a proven-unshadowed NAME.
+    fn is_oblivious_callee(&self, callee: LocalId, resolve: &impl Fn(LocalId) -> LocalId) -> bool {
+        let Some(Instruction::Load { source }) = self.defs.get(&callee) else {
+            return false;
+        };
+        let Some(Instruction::GetGlobal { name, .. }) = self.defs.get(&resolve(*source)) else {
+            return false;
+        };
+        self.oblivious.contains(name)
+    }
+
+    fn barrier_of(&self, instr: &Instruction, resolve: &impl Fn(LocalId) -> LocalId) -> Barrier {
+        match instr {
+            Instruction::Store { target, .. } | Instruction::StoreClosure { target, .. } => {
+                Barrier::Store(self.cell_prov(resolve(*target)))
+            }
+            Instruction::StoreEmptyTable { .. } => Barrier::All,
+            Instruction::Call { closure, .. } => {
+                if self.is_oblivious_callee(resolve(*closure), resolve) {
+                    Barrier::None
+                } else {
+                    Barrier::All
+                }
+            }
+            Instruction::GetField { create_if_missing: true, field, .. } => {
+                Barrier::CreateField(field.clone())
+            }
+            Instruction::GetIndex { create_if_missing: true, .. } => Barrier::CreateIndex,
+            Instruction::GetGlobal { create_if_missing: true, name, .. } => {
+                Barrier::CreateGlobal(name.clone())
+            }
+            _ => Barrier::None,
+        }
+    }
+
+    fn meta_of(&self, key: &Key) -> PairMeta {
+        match key {
+            Key::Field { field, .. } => PairMeta::AccField(field.clone()),
+            Key::Index { .. } => PairMeta::AccIndex,
+            Key::Global { name, .. } => PairMeta::AccGlobal(name.clone()),
+            Key::Load { source } => PairMeta::Load(self.cell_prov(*source)),
+            Key::Pure(_) => PairMeta::Pure,
+        }
+    }
+}
+
+/// Applies `barrier` to `state`, memoizing one mask per distinct barrier.
+fn forward_barrier(
+    state: &mut Bits,
+    metas: &[PairMeta],
+    cache: &mut FxHashMap<Barrier, Bits>,
+    barrier: &Barrier,
+) {
+    if matches!(barrier, Barrier::None) {
+        return;
+    }
+    if !cache.contains_key(barrier) {
+        let mut mask = bits_full(metas.len());
+        for (i, meta) in metas.iter().enumerate() {
+            if kills(barrier, meta) {
+                bit_clear(&mut mask, i);
+            }
+        }
+        cache.insert(barrier.clone(), mask);
+    }
+    bits_and(state, &cache[barrier]);
 }
 
 /// The key an instruction is remembered by, if it is a candidate at all.
@@ -370,11 +653,15 @@ fn apply_barriers(state: &mut Bits, universe: &Universe, instr: &Instruction) {
 /// a duplicate. Each round re-keys the instructions through the substitution
 /// found so far and treats the ones already removed as gone, so a round can only
 /// add. That terminates because the number of instructions is finite.
-fn substitution(cfg: &Cfg) -> FxHashMap<LocalId, LocalId> {
+fn substitution(
+    cfg: &Cfg,
+    oblivious: Option<&rustc_hash::FxHashSet<String>>,
+) -> FxHashMap<LocalId, LocalId> {
     let layout = Layout::of(cfg);
+    let fwd = oblivious.map(|o| Fwd::of(cfg, o));
     let mut subst: FxHashMap<LocalId, LocalId> = FxHashMap::default();
     loop {
-        let found = redundancies(&layout, &subst);
+        let found = redundancies(&layout, &subst, fwd.as_ref());
         let before = subst.len();
         for (from, to) in found {
             subst.entry(from).or_insert(to);
@@ -414,6 +701,7 @@ fn compress(subst: &mut FxHashMap<LocalId, LocalId>) {
 fn redundancies(
     layout: &Layout,
     subst: &FxHashMap<LocalId, LocalId>,
+    fwd: Option<&Fwd>,
 ) -> FxHashMap<LocalId, LocalId> {
     let resolve = |id: LocalId| *subst.get(&id).unwrap_or(&id);
 
@@ -428,16 +716,35 @@ fn redundancies(
     for &b in &layout.order {
         let Some(block) = layout.blocks[b] else { continue };
         for (id, instr) in live_instructions(block, subst) {
-            let Some(key) = key_of(instr, &resolve) else { continue };
+            // In forward mode a store is itself a source of the cell's value:
+            // it enters the universe under the key a load of that cell would
+            // have, paired with the *stored* id. It is never folded away
+            // itself - the replay skips stores when looking for duplicates.
+            let (key, value) = if let (Some(_), Instruction::Store { target, source }) =
+                (fwd, instr)
+            {
+                (Key::Load { source: resolve(*target) }, resolve(*source))
+            } else {
+                match key_of(instr, &resolve) {
+                    Some(key) => (key, *id),
+                    None => continue,
+                }
+            };
             universe.bit_of.insert(*id, universe.pairs.len());
             universe
                 .by_key
                 .entry(key.clone())
                 .or_default()
                 .push(universe.pairs.len());
-            universe.pairs.push((key, *id));
+            universe.pairs.push((key, value));
         }
     }
+    // Metadata for the refined kills, aligned with `pairs`. Only in forward
+    // mode; empty otherwise.
+    let metas: Vec<PairMeta> = match fwd {
+        Some(f) => universe.pairs.iter().map(|(key, _)| f.meta_of(key)).collect(),
+        None => Vec::new(),
+    };
     let bits = universe.len();
     if bits == 0 {
         return FxHashMap::default();
@@ -456,9 +763,39 @@ fn redundancies(
             bit_clear(&mut universe.keep_across_edges, i);
         }
     }
+    // In forward mode nothing crosses a block boundary at all. The earlier
+    // classic `cse` entry already reuses accessors and loads across blocks
+    // under the strong kills; what forward mode adds on top - store
+    // forwarding, loads surviving stores/creates/oblivious calls - would
+    // otherwise keep values live across long stretches, and every per-state
+    // operation (merge, dedup, filter) is charged for the whole env. Measured
+    // directly: letting the new folds cross raised `player.update_21` from 33
+    // to 47 live slots and was ~2% slower at frame 37 with the same fragment
+    // count, eating the win the removed instructions bought.
+    if fwd.is_some() {
+        universe.keep_across_edges = bits_empty(bits);
+    }
 
     // Summarise each block as `out = (in & mask) | gen`. Valid because every
     // kill is a constant mask, so a sequence of them composes into one.
+    let mut mask_cache: FxHashMap<Barrier, Bits> = FxHashMap::default();
+    let mut barriers = |state: &mut Bits, other: Option<&mut Bits>, instr: &Instruction| {
+        match fwd {
+            None => {
+                apply_barriers(state, &universe, instr);
+                if let Some(other) = other {
+                    apply_barriers(other, &universe, instr);
+                }
+            }
+            Some(f) => {
+                let barrier = f.barrier_of(instr, &resolve);
+                forward_barrier(state, &metas, &mut mask_cache, &barrier);
+                if let Some(other) = other {
+                    forward_barrier(other, &metas, &mut mask_cache, &barrier);
+                }
+            }
+        }
+    };
     let count = layout.blocks.len();
     let mut mask: Vec<Bits> = vec![Bits::new(); count];
     let mut gen: Vec<Bits> = vec![Bits::new(); count];
@@ -468,9 +805,9 @@ fn redundancies(
         let mut g = bits_empty(bits);
         for (id, instr) in live_instructions(block, subst) {
             // Barriers first, so an instruction never matches something its own
-            // effects invalidated - a `create` accessor forgets itself.
-            apply_barriers(&mut m, &universe, instr);
-            apply_barriers(&mut g, &universe, instr);
+            // effects invalidated - a `create` accessor forgets itself, and a
+            // store forgets the pairs of earlier writes to the same cell.
+            barriers(&mut m, Some(&mut g), instr);
             if let Some(&bit) = universe.bit_of.get(id) {
                 bit_set(&mut g, bit);
             }
@@ -531,14 +868,17 @@ fn redundancies(
         let Some(block) = layout.blocks[b] else { continue };
         let mut state = inn[b].clone();
         for (id, instr) in live_instructions(block, subst) {
-            apply_barriers(&mut state, &universe, instr);
+            barriers(&mut state, None, instr);
             let Some(&bit) = universe.bit_of.get(id) else { continue };
-            let candidates = &universe.by_key[&universe.pairs[bit].0];
-            if let Some(&other) = candidates
-                .iter()
-                .find(|&&c| c != bit && bit_get(&state, c))
-            {
-                found.insert(*id, universe.pairs[other].1);
+            // A store contributes its pair but is never itself a duplicate.
+            if !matches!(instr, Instruction::Store { .. }) {
+                let candidates = &universe.by_key[&universe.pairs[bit].0];
+                if let Some(&other) = candidates
+                    .iter()
+                    .find(|&&c| c != bit && bit_get(&state, c))
+                {
+                    found.insert(*id, universe.pairs[other].1);
+                }
             }
             bit_set(&mut state, bit);
         }
@@ -546,10 +886,11 @@ fn redundancies(
     found
 }
 
-pub fn apply(program: &mut Program) -> Result<usize> {
+pub fn apply(program: &mut Program, forward: bool) -> Result<usize> {
+    let oblivious = if forward { Some(oblivious_globals(program)) } else { None };
     let mut changes = 0;
     for fun in program.functions.values_mut() {
-        let subst = substitution(&fun.cfg);
+        let subst = substitution(&fun.cfg, oblivious.as_ref());
         if subst.is_empty() {
             continue;
         }
@@ -584,15 +925,16 @@ fn blocks_mut(cfg: &mut Cfg) -> impl Iterator<Item = &mut Block> {
 /// separately here is everything the applier could get wrong on top of it:
 /// removing an instruction that was not in the substitution, keeping one that
 /// was, failing to substitute a use, reordering, or touching a terminator.
-pub fn verify(before: &Program, after: &Program) -> Result<()> {
+pub fn verify(before: &Program, after: &Program, forward: bool) -> Result<()> {
     require(
         before.functions.len() == after.functions.len(),
         "cse changed the set of functions",
     )?;
+    let oblivious = if forward { Some(oblivious_globals(before)) } else { None };
 
     for (name, before_fun) in &before.functions {
         let after_fun = after.get(name.as_str())?;
-        let subst = substitution(&before_fun.cfg);
+        let subst = substitution(&before_fun.cfg, oblivious.as_ref());
         let resolve = |id: LocalId| *subst.get(&id).unwrap_or(&id);
 
         // A removed instruction must be replaced by one that survives, so the
@@ -720,8 +1062,15 @@ mod tests {
 
     fn run(p: &mut Program) -> String {
         let before = p.clone();
-        apply(p).unwrap();
-        verify(&before, p).unwrap();
+        apply(p, false).unwrap();
+        verify(&before, p, false).unwrap();
+        format_function(p.get("f").unwrap())
+    }
+
+    fn run_forward(p: &mut Program) -> String {
+        let before = p.clone();
+        apply(p, true).unwrap();
+        verify(&before, p, true).unwrap();
         format_function(p.get("f").unwrap())
     }
 
@@ -863,7 +1212,7 @@ mod tests {
         );
         run(&mut p);
         let once = format_function(p.get("f").unwrap());
-        assert_eq!(apply(&mut p).unwrap(), 0);
+        assert_eq!(apply(&mut p, false).unwrap(), 0);
         assert_eq!(once, format_function(p.get("f").unwrap()));
     }
 
@@ -1101,6 +1450,265 @@ mod tests {
         let fun = p.get_mut("f").unwrap();
         fun.cfg.entry.instructions.retain(|(i, _)| *i != id(12));
         fun.cfg.entry.terminator.1 = Terminator::Return { value: Some(id(10)) };
-        assert!(verify(&before, &p).is_err());
+        assert!(verify(&before, &p, false).is_err());
+    }
+
+    // --- forward mode ---
+
+    /// The heart of the mode: a load after a store of the same cell is the
+    /// stored value.
+    #[test]
+    fn forwards_a_store_to_a_load() {
+        let mut p = program_of(
+            vec![
+                (id(10), field(2, "x", false)),
+                (id(11), Instruction::Store { target: id(10), source: id(2) }),
+                (id(12), Instruction::Load { source: id(10) }),
+            ],
+            id(12),
+        );
+        let text = run_forward(&mut p);
+        assert!(!text.contains("%12"), "the load should fold to %2:\n{}", text);
+        assert!(text.contains("return %2"), "{}", text);
+    }
+
+    /// Classic mode must not forward - old recipe entries replay unchanged.
+    #[test]
+    fn classic_mode_does_not_forward() {
+        let mut p = program_of(
+            vec![
+                (id(10), field(2, "x", false)),
+                (id(11), Instruction::Store { target: id(10), source: id(2) }),
+                (id(12), Instruction::Load { source: id(10) }),
+            ],
+            id(12),
+        );
+        let text = run(&mut p);
+        assert!(text.contains("%12 = load %10"), "{}", text);
+    }
+
+    /// A store to a differently-named field cannot touch this cell, so the
+    /// load is still available.
+    #[test]
+    fn a_store_of_one_field_spares_loads_of_another() {
+        let mut p = program_of(
+            vec![
+                (id(10), field(2, "x", false)),
+                (id(11), field(2, "y", false)),
+                (id(12), Instruction::Load { source: id(11) }),
+                (id(13), Instruction::Store { target: id(10), source: id(2) }),
+                (id(14), Instruction::Load { source: id(11) }),
+            ],
+            id(14),
+        );
+        let text = run_forward(&mut p);
+        assert!(!text.contains("%14"), "the y load should be reused:\n{}", text);
+    }
+
+    /// ...but a store to the *same* field name through another receiver may
+    /// alias, and must still kill.
+    #[test]
+    fn a_same_name_store_still_kills() {
+        let mut p = program_of(
+            vec![
+                (id(10), field(2, "o", false)),
+                (id(11), Instruction::Load { source: id(10) }),
+                (id(12), field(11, "x", false)),
+                (id(13), field(2, "x", false)),
+                (id(14), Instruction::Load { source: id(13) }),
+                (id(15), Instruction::Store { target: id(12), source: id(2) }),
+                (id(16), Instruction::Load { source: id(13) }),
+            ],
+            id(16),
+        );
+        let text = run_forward(&mut p);
+        assert!(text.contains("%16 = load %13"), "{}", text);
+    }
+
+    /// A store through a pointer of unknown provenance (here: the argument
+    /// itself) could write any cell at all.
+    #[test]
+    fn a_store_through_an_unknown_pointer_kills_everything() {
+        let mut p = program_of(
+            vec![
+                (id(10), field(2, "x", false)),
+                (id(11), Instruction::Load { source: id(10) }),
+                (id(12), Instruction::Store { target: id(2), source: id(10) }),
+                (id(13), Instruction::Load { source: id(10) }),
+            ],
+            id(13),
+        );
+        let text = run_forward(&mut p);
+        assert!(text.contains("%13 = load %10"), "{}", text);
+    }
+
+    /// A `create` accessor only allocates a *missing* cell; the contents of
+    /// every existing cell - and every immutable SSA source local - are
+    /// untouched, so loads survive it in forward mode.
+    #[test]
+    fn a_create_no_longer_kills_loads() {
+        let mut p = program_of(
+            vec![
+                (id(10), field(2, "x", false)),
+                (id(11), Instruction::Load { source: id(10) }),
+                (id(12), field(2, "y", true)),
+                (id(13), Instruction::Load { source: id(10) }),
+            ],
+            id(13),
+        );
+        let text = run_forward(&mut p);
+        assert!(!text.contains("%13"), "the load should be reused:\n{}", text);
+    }
+
+    /// A create still kills *accessors* of the same name - an earlier
+    /// non-creating read may have returned a nil pointer.
+    #[test]
+    fn a_create_still_kills_same_name_accessors() {
+        let mut p = program_of(
+            vec![
+                (id(10), field(2, "y", false)),
+                (id(11), field(2, "y", true)),
+                (id(12), field(2, "y", false)),
+            ],
+            id(12),
+        );
+        let text = run_forward(&mut p);
+        assert!(text.contains("%12 = get_field %2.y"), "{}", text);
+    }
+
+    /// ...but no longer kills accessors of *other* names, which denote
+    /// provably different map entries.
+    #[test]
+    fn a_create_spares_other_names() {
+        let mut p = program_of(
+            vec![
+                (id(10), field(2, "y", false)),
+                (id(11), field(2, "z", true)),
+                (id(12), field(2, "y", false)),
+            ],
+            id(12),
+        );
+        let text = run_forward(&mut p);
+        assert!(!text.contains("%12"), "the accessor should be reused:\n{}", text);
+    }
+
+    /// A field-create can flip an UnknownTable into an ObjectTable, after
+    /// which a remembered get_index on it would error rather than repeat its
+    /// NilPointer - so the cross-kill stays.
+    #[test]
+    fn a_field_create_kills_index_accessors() {
+        let mut p = program_of(
+            vec![
+                (id(9), Instruction::NumberConstant { value: crate::pico8_num::Pico8Num::from_i16(1) }),
+                (id(10), Instruction::GetIndex { receiver: id(2), index: id(9), create_if_missing: false }),
+                (id(11), field(2, "z", true)),
+                (id(12), Instruction::GetIndex { receiver: id(2), index: id(9), create_if_missing: false }),
+            ],
+            id(12),
+        );
+        let text = run_forward(&mut p);
+        assert!(text.contains("%12 = get_index"), "{}", text);
+    }
+
+    /// A call whose callee provably is a heap-oblivious builtin invalidates
+    /// nothing.
+    #[test]
+    fn an_oblivious_call_is_transparent() {
+        let mut p = program_of(
+            vec![
+                (id(9), Instruction::GetGlobal { name: "error".to_string(), create_if_missing: false }),
+                (id(10), Instruction::Load { source: id(9) }),
+                (id(11), field(2, "x", false)),
+                (id(12), Instruction::Load { source: id(11) }),
+                (id(13), Instruction::Call { closure: id(10), args: vec![] }),
+                (id(14), Instruction::Load { source: id(11) }),
+            ],
+            id(14),
+        );
+        let text = run_forward(&mut p);
+        assert!(!text.contains("%14"), "the load should survive the error call:\n{}", text);
+    }
+
+    /// If anything anywhere in the program uses the oblivious global's cell
+    /// other than loading it, the name could be shadowed and the exemption is
+    /// off.
+    #[test]
+    fn a_shadowed_oblivious_global_is_opaque() {
+        let mut p = program_of(
+            vec![
+                (id(9), Instruction::GetGlobal { name: "error".to_string(), create_if_missing: false }),
+                (id(10), Instruction::Load { source: id(9) }),
+                (id(11), field(2, "x", false)),
+                (id(12), Instruction::Load { source: id(11) }),
+                (id(13), Instruction::Call { closure: id(10), args: vec![] }),
+                (id(14), Instruction::Load { source: id(11) }),
+                // The shadowing store, after everything else so it changes
+                // no availability itself: its provenance is Global("error"),
+                // which does not alias the field cell.
+                (id(15), Instruction::Store { target: id(9), source: id(2) }),
+            ],
+            id(14),
+        );
+        let text = run_forward(&mut p);
+        assert!(text.contains("%14 = load %11"), "{}", text);
+    }
+
+    /// A call to anything else still kills.
+    #[test]
+    fn an_ordinary_call_still_kills_in_forward_mode() {
+        let mut p = program_of(
+            vec![
+                (id(11), field(2, "x", false)),
+                (id(12), Instruction::Load { source: id(11) }),
+                (id(13), Instruction::Call { closure: id(2), args: vec![] }),
+                (id(14), Instruction::Load { source: id(11) }),
+            ],
+            id(14),
+        );
+        let text = run_forward(&mut p);
+        assert!(text.contains("%14 = load %11"), "{}", text);
+    }
+
+    /// Nothing forward mode finds crosses a block boundary - the live-range
+    /// cost was measured to eat the win (see the note in `redundancies`).
+    #[test]
+    fn forward_mode_folds_stay_block_local() {
+        let mut p = cfg_of(vec![
+            (
+                "__entry",
+                vec![
+                    (id(10), field(2, "x", false)),
+                    (id(11), Instruction::Store { target: id(10), source: id(2) }),
+                ],
+                goto("b"),
+            ),
+            (
+                "b",
+                vec![(id(12), Instruction::Load { source: id(10) })],
+                Terminator::Return { value: Some(id(12)) },
+            ),
+        ]);
+        let text = run_forward(&mut p);
+        assert!(text.contains("%12 = load %10"), "{}", text);
+    }
+
+    /// Two stores to the same cell: a load between them forwards from the
+    /// first, a load after them from the second.
+    #[test]
+    fn a_second_store_replaces_the_first() {
+        let mut p = program_of(
+            vec![
+                (id(9), Instruction::NumberConstant { value: crate::pico8_num::Pico8Num::from_i16(7) }),
+                (id(10), field(2, "x", false)),
+                (id(11), Instruction::Store { target: id(10), source: id(2) }),
+                (id(12), Instruction::Load { source: id(10) }),
+                (id(13), Instruction::Store { target: id(10), source: id(9) }),
+                (id(14), Instruction::Load { source: id(10) }),
+            ],
+            id(14),
+        );
+        let text = run_forward(&mut p);
+        assert!(!text.contains("%12") && !text.contains("%14"), "{}", text);
+        assert!(text.contains("return %9"), "{}", text);
     }
 }

@@ -1,6 +1,6 @@
 # Status (2026-08)
 
-Branch `rewrite`. Build is warning-free, 332 tests pass, working tree clean.
+Branch `rewrite`. Build is warning-free, 346 tests pass, working tree clean.
 
 ## Measured, frame 34 (the standard iteration benchmark)
 
@@ -22,6 +22,7 @@ Branch `rewrite`. Build is warning-free, 332 tests pass, working tree clean.
 | + `is_solid` chains eager (`speculate_region`), consumers absorbed | 1.82 s | 0.62 GB |
 | + pixel loops masked, wall-jump arm eager | 1.46 s | 0.53 GB |
 | + `spikes_at` nest masked (`fuse_breaks` + `span`/`break_to` `mask_loop`) | 1.40 s | 0.46 GB |
+| + 9 `pin_builtin`s, `cse` forward mode (block-local) | 1.35 s | 0.50 GB |
 
 Lane count is identical throughout (92,713), which is the first thing to check
 when a rewrite claims a win. Frame 37 confirms the same ratios (7.87 s, from
@@ -796,6 +797,41 @@ Deep screen after the `spikes_at` stage: differential identical through
 frame 37 (28.9 s) and frame 40 (104.5 s). Frame 40 bench: 23.63 s /
 5.28 GB / 948,319 lanes, the same 11 split sites as frame 34, and the
 kill branch still does not split - spikes stay unreachable through 40.
+
+### K reduction landed as `cse` forward mode, not field promotion (2026-08-03)
+
+The planned whole-function field promotion (load once, SSA, store back at
+returns) needs phi insertion, spill/reload around opaque calls, and an
+alias story for every base pointer. Before building that, the same goal -
+removing heap traffic - turned out to have a much smaller-machinery form:
+an opt-in `cse` mode (`"forward": true`, entry g087) with three changes,
+each resting on a checked heap-model fact (see the rule's docs):
+
+* **Store-to-load forwarding**: `store c <- v; ... load c` folds to `v`.
+* **Field-name alias refinement**: a store through a `get_field _.x`
+  pointer no longer kills loads of `.y` cells, globals, index cells or
+  IR-alloc cells - only same-name and unknown-provenance loads. A field
+  cell can only ever be reached under its own name, because field maps
+  only ever receive freshly allocated cells.
+* **`create` accessors kill no loads** (they never touch an existing
+  cell), and only same-name accessors. This un-fenced the 185 `create`
+  barriers.
+* **Heap-oblivious calls**: `error`/`__print`/`__split_by_flr` invalidate
+  nothing, guarded structurally - a whole-program scan proves those
+  globals are only ever loaded, so they cannot have been shadowed. Nine
+  new `pin_builtin` entries (g078-g086: `abs` x4, `flr` x2, `mget` x2,
+  `tile_flag_at`) remove the last pure-builtin call fences on hot paths.
+
+The live-range lesson bit immediately and is now measured precisely:
+unrestricted, the mode finds 631 folds and K (loops kept) falls 3980 ->
+3602, but `player.update_21` grows 33 -> 47 live slots and frame 37 gets
+~2.5% slower - merge/dedup/filter pay per env slot per state, and at
+269k lanes that eats the win. **Forward-mode folds are therefore
+block-local**: 270 folds, K 3980 -> 3815, slots unchanged, frame 34
+1.40 -> 1.35 s, frame 37 neutral. Differential identical through 34 and
+37; lanes and fragments unchanged throughout (the stage removes
+instructions, not states). The unrestricted variant is one deleted
+restriction away when splitting is gone and env cost stops mattering.
 
 ### Later: `assume_eq`, whole-function field promotion
 

@@ -747,4 +747,14 @@
 {"id":"g075","rule":"fold"}
 {"id":"g076","rule":"dce"}
 {"id":"g077","rule":"merge_blocks"}
+{"id":"g078","rule":"pin_builtin","fn":"player.update_21","at":"%306","name":"abs"}
+{"id":"g079","rule":"pin_builtin","fn":"player.update_21","at":"%391","name":"abs"}
+{"id":"g080","rule":"pin_builtin","fn":"player.update_21","at":"%1674","name":"mget"}
+{"id":"g081","rule":"pin_builtin","fn":"player.update_21","at":"%2141","name":"mget"}
+{"id":"g082","rule":"pin_builtin","fn":"player.update_21","at":"%3341","name":"tile_flag_at"}
+{"id":"g083","rule":"pin_builtin","fn":"anonymous_61","at":"%86","name":"flr"}
+{"id":"g084","rule":"pin_builtin","fn":"anonymous_61","at":"%133","name":"flr"}
+{"id":"g085","rule":"pin_builtin","fn":"anonymous_61","at":"%214","name":"abs"}
+{"id":"g086","rule":"pin_builtin","fn":"anonymous_61","at":"%386","name":"abs"}
+{"id":"g087","rule":"cse","forward":true,"why":"store-to-load forwarding with field-name alias refinement; the pins above remove the last pure-builtin call fences on the hot paths"}
 {"id":"s1","rule":"allocate_slots"}

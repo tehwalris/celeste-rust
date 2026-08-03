@@ -38,6 +38,7 @@ not comparable.
 | + pixel loops masked (`mask_loop` x2, a61 chains eager) | 1.59 s / 0.63 GB | - |
 | + wall-jump arm eager (`fold_reflexive` dead gates, masked `speculate_region`) | 1.46 s / 0.53 GB | - |
 | + `spikes_at` nest masked (`fuse_breaks`, `mask_loop` `span`/`break_to`) | 1.40 s / 0.46 GB | 5.52 s / 1.51 GB |
+| + 9 `pin_builtin`s, `cse` forward mode (block-local store forwarding) | 1.35 s / 0.50 GB | 5.56 s / 1.47 GB |
 
 The store-triangle row is the first change that moved the fragment count: 558
 -> 335 mean fragments per frame at frame 34, split executions 19573 -> 11978.
@@ -66,14 +67,14 @@ here that tracks distance to a compilable kernel.
 
 |  | original | rewritten |
 |---|---|---|
-| dynamic instrs/frame, mean | 2122 | 3861 |
-| dynamic instrs/frame, max | 6422 | 9146 |
+| dynamic instrs/frame, mean | 2122 | 3776 |
+| dynamic instrs/frame, max | 6422 | 8927 |
 | distinct blocks reached | 450 | 255 |
-| K, fully unrolled | 8321 | 9807 |
-| K, loops kept as loops | 2963 | 3980 |
+| K, fully unrolled | 8321 | 9562 |
+| K, loops kept as loops | 2963 | 3815 |
 
-By instruction kind, rewritten: heap 39.6%, arith 30.9%, const 7.8%,
-terminator 6.7%, guard 5.4%, global 5.0%, phi 3.1%, call 1.1%. `arith`,
+By instruction kind, rewritten: heap 38.5%, arith 32.2%, const ~8%,
+terminator ~7%, guard ~6%, global ~4%, phi ~3%, call 0.9%. `arith`,
 `const` and `select` are the core a compiled kernel emits; the rest has to
 reach zero. The region stage *lowered* K (7770 -> 7323 unrolled) despite
 running regions eagerly, because absorbing the consumers deleted whole arm
@@ -118,6 +119,17 @@ heap accessors and loads is smaller *and* faster than either extreme.
 accessor barriers and 528 load barriers across 3801 instructions, so most of the
 redundancy that survives is fenced by the 101 remaining calls and 185 `create`
 accessors, not by block boundaries.
+
+The forward-mode stage replayed the same lesson with sharper numbers. Refined
+alias kills plus store-to-load forwarding finds 631 folds unrestricted; K
+(loops kept) drops 3980 -> 3602, frame 34 improves 1.40 -> 1.33 s - and frame
+37 *regresses* ~2.5%, because `player.update_21` goes from 33 to 47 live
+slots and `anonymous_61` from 31 to 41, and merge/dedup/filter are charged
+for the whole env per state. Restricting every new fold to one block keeps
+270 of the folds, all of the frame-34 win that survives contact with depth
+(1.35 s), K 3815, and the slot counts exactly at baseline. Fold reach is a
+live-range decision, not a correctness one - the wider version only becomes
+free once splitting is gone or folding is made slot-aware.
 
 Frame 40, milestone checks only: 84.1 s / 25.8 GB as compiled, 62.5 s / 14.45 GB
 after `promote_cell`. That beat the old unverified `mem2reg`'s 15.2 GB, which

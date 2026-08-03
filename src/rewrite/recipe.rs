@@ -48,7 +48,14 @@ pub enum Rule {
     /// One instruction per value within a basic block. A prerequisite for
     /// promoting object fields, which needs each cell to have a single
     /// accessor.
-    Cse,
+    Cse {
+        /// Opt-in store-to-load forwarding with field-name alias refinement
+        /// and heap-oblivious call exemption - see the `forward` section of
+        /// the rule's docs. Off by default so old entries replay
+        /// byte-identically.
+        #[serde(default, skip_serializing_if = "is_false")]
+        forward: bool,
+    },
     /// Repack locals so that values with disjoint live ranges share a slot.
     /// Changes no instructions - only where they are stored.
     AllocateSlots,
@@ -257,7 +264,7 @@ impl Rule {
     pub fn name(&self) -> &'static str {
         match self {
             Rule::Dce => "dce",
-            Rule::Cse => "cse",
+            Rule::Cse { .. } => "cse",
             Rule::AllocateSlots => "allocate_slots",
             Rule::MergeBlocks => "merge_blocks",
             Rule::Fold => "fold",
@@ -434,7 +441,7 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
 
     let changes = match &entry.rule {
         Rule::Dce => dce::apply(program),
-        Rule::Cse => cse::apply(program),
+        Rule::Cse { forward } => cse::apply(program, *forward),
         Rule::AllocateSlots => allocate_slots::apply(program),
         Rule::MergeBlocks => merge_blocks::apply(program),
         Rule::Fold => fold::apply(program),
@@ -517,7 +524,7 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
     let clock = std::time::Instant::now();
     match &entry.rule {
         Rule::Dce => dce::verify(&before, program),
-        Rule::Cse => cse::verify(&before, program),
+        Rule::Cse { forward } => cse::verify(&before, program, *forward),
         Rule::AllocateSlots => allocate_slots::verify(&before, program),
         Rule::MergeBlocks => merge_blocks::verify(&before, program),
         Rule::Fold => fold::verify(&before, program),
