@@ -350,7 +350,7 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
                     }
                     Value::Number(MaybeVector::Vector(nums)) => {
                         if all_same {
-                            for n in nums {
+                            for n in nums.iter() {
                                 if *n != ref_val {
                                     all_same = false;
                                     break;
@@ -365,7 +365,7 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
             if result.len() == 1 || (all_same && result.len() > 1) {
                 Value::Number(MaybeVector::Scalar(result[0]))
             } else {
-                Value::Number(MaybeVector::Vector(result))
+                Value::Number(MaybeVector::vector(result))
             }
         }
         Value::NumberInterval(_) => {
@@ -391,7 +391,7 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
                     }
                     Value::NumberInterval(MaybeVector::Vector(nums)) => {
                         if all_same {
-                            for n in nums {
+                            for n in nums.iter() {
                                 if *n != ref_val {
                                     all_same = false;
                                     break;
@@ -406,7 +406,7 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
             if result.len() == 1 || (all_same && result.len() > 1) {
                 Value::NumberInterval(MaybeVector::Scalar(result[0]))
             } else {
-                Value::NumberInterval(MaybeVector::Vector(result))
+                Value::NumberInterval(MaybeVector::vector(result))
             }
         }
         Value::Bool(_) => {
@@ -432,7 +432,7 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
                     }
                     Value::Bool(MaybeVector::Vector(bools)) => {
                         if all_same {
-                            for b in bools {
+                            for b in bools.iter() {
                                 if *b != ref_val {
                                     all_same = false;
                                     break;
@@ -447,7 +447,7 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
             if result.len() == 1 || (all_same && result.len() > 1) {
                 Value::Bool(MaybeVector::Scalar(result[0]))
             } else {
-                Value::Bool(MaybeVector::Vector(result))
+                Value::Bool(MaybeVector::vector(result))
             }
         }
         _ => panic!("Unexpected value type for merge"),
@@ -953,7 +953,7 @@ fn extract_vectorizable_value(value: &Value) -> Option<VectorizableValue> {
     match value {
         Value::Number(MaybeVector::Scalar(n)) => Some(VectorizableValue::Number(*n)),
         Value::Number(MaybeVector::Vector(nums)) => {
-            let mut raw: Vec<Pico8Num> = nums.clone();
+            let mut raw: Vec<Pico8Num> = nums.as_ref().clone();
             raw.sort();
             raw.dedup();
             Some(VectorizableValue::NumberVector(raw))
@@ -971,7 +971,7 @@ fn extract_vectorizable_value(value: &Value) -> Option<VectorizableValue> {
         }
         Value::Bool(MaybeVector::Scalar(b)) => Some(VectorizableValue::Bool(*b)),
         Value::Bool(MaybeVector::Vector(bools)) => {
-            let mut raw: Vec<bool> = bools.clone();
+            let mut raw: Vec<bool> = bools.as_ref().clone();
             raw.sort();
             raw.dedup();
             Some(VectorizableValue::BoolVector(raw))
@@ -1324,7 +1324,7 @@ mod tests {
         let mut state1 = State::new();
         state1.vector_size = 2;
         let x1 = state1.heap.alloc();
-        state1.heap.set(x1, HeapValue::Value(Value::Number(MaybeVector::Vector(vec![
+        state1.heap.set(x1, HeapValue::Value(Value::Number(MaybeVector::vector(vec![
             Pico8Num::from_i16(1),
             Pico8Num::from_i16(2),
         ]))));
@@ -1362,7 +1362,7 @@ mod tests {
         let mut state1 = State::new();
         state1.vector_size = 2;
         let x1 = state1.heap.alloc();
-        state1.heap.set(x1, HeapValue::Value(Value::Number(MaybeVector::Vector(vec![
+        state1.heap.set(x1, HeapValue::Value(Value::Number(MaybeVector::vector(vec![
             Pico8Num::from_i16(1),
             Pico8Num::from_i16(2),
         ]))));

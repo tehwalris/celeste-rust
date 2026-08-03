@@ -115,7 +115,7 @@ pub fn interpret_select(condition: &Value, if_true: &Value, if_false: &Value) ->
             MaybeVector::Scalar(s) => s.clone(),
             MaybeVector::Vector(v) => v[i].clone(),
         };
-        MaybeVector::Vector(
+        MaybeVector::vector(
             mask.iter()
                 .enumerate()
                 .map(|(i, take_true)| if *take_true { at(a, i) } else { at(b, i) })
@@ -342,11 +342,11 @@ mod tests {
 
     #[test]
     fn test_not_vector() {
-        let v = Value::Bool(MaybeVector::Vector(vec![true, false, true]));
+        let v = Value::Bool(MaybeVector::vector(vec![true, false, true]));
         let result = interpret_not(&v).unwrap();
         assert_eq!(
             result,
-            Value::Bool(MaybeVector::Vector(vec![false, true, false]))
+            Value::Bool(MaybeVector::vector(vec![false, true, false]))
         );
     }
 
@@ -735,12 +735,12 @@ mod tests {
 
     #[test]
     fn test_add_vectors() {
-        let a = Value::Number(MaybeVector::Vector(vec![
+        let a = Value::Number(MaybeVector::vector(vec![
             Pico8Num::from_i16(1),
             Pico8Num::from_i16(2),
             Pico8Num::from_i16(3),
         ]));
-        let b = Value::Number(MaybeVector::Vector(vec![
+        let b = Value::Number(MaybeVector::vector(vec![
             Pico8Num::from_i16(10),
             Pico8Num::from_i16(20),
             Pico8Num::from_i16(30),
@@ -748,7 +748,7 @@ mod tests {
         let result = interpret_binary_op(&a, BinaryOp::Plus, &b).unwrap();
         assert_eq!(
             result,
-            Value::Number(MaybeVector::Vector(vec![
+            Value::Number(MaybeVector::vector(vec![
                 Pico8Num::from_i16(11),
                 Pico8Num::from_i16(22),
                 Pico8Num::from_i16(33),
@@ -760,7 +760,7 @@ mod tests {
     fn test_scalar_vector_broadcast() {
         // Scalar + Vector = Vector (broadcasting)
         let scalar = num(10);
-        let vector = Value::Number(MaybeVector::Vector(vec![
+        let vector = Value::Number(MaybeVector::vector(vec![
             Pico8Num::from_i16(1),
             Pico8Num::from_i16(2),
             Pico8Num::from_i16(3),
@@ -768,7 +768,7 @@ mod tests {
         let result = interpret_binary_op(&scalar, BinaryOp::Plus, &vector).unwrap();
         assert_eq!(
             result,
-            Value::Number(MaybeVector::Vector(vec![
+            Value::Number(MaybeVector::vector(vec![
                 Pico8Num::from_i16(11),
                 Pico8Num::from_i16(12),
                 Pico8Num::from_i16(13),
@@ -778,12 +778,12 @@ mod tests {
 
     #[test]
     fn test_compare_vectors() {
-        let a = Value::Number(MaybeVector::Vector(vec![
+        let a = Value::Number(MaybeVector::vector(vec![
             Pico8Num::from_i16(1),
             Pico8Num::from_i16(5),
             Pico8Num::from_i16(3),
         ]));
-        let b = Value::Number(MaybeVector::Vector(vec![
+        let b = Value::Number(MaybeVector::vector(vec![
             Pico8Num::from_i16(2),
             Pico8Num::from_i16(4),
             Pico8Num::from_i16(3),
@@ -792,7 +792,7 @@ mod tests {
         // 1<2=true, 5<4=false, 3<3=false
         assert_eq!(
             result,
-            Value::Bool(MaybeVector::Vector(vec![true, false, false]))
+            Value::Bool(MaybeVector::vector(vec![true, false, false]))
         );
     }
 
@@ -819,13 +819,13 @@ mod select_tests {
     }
 
     fn nums(ns: &[i16]) -> Value {
-        Value::Number(MaybeVector::Vector(
+        Value::Number(MaybeVector::vector(
             ns.iter().map(|n| Pico8Num::from_i16(*n)).collect(),
         ))
     }
 
     fn bools(bs: &[bool]) -> Value {
-        Value::Bool(MaybeVector::Vector(bs.to_vec()))
+        Value::Bool(MaybeVector::vector(bs.to_vec()))
     }
 
     #[test]

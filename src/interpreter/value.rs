@@ -9,18 +9,43 @@ use crate::{ir::GlobalId, pico8_num::{Pico8Num, Pico8NumInterval}};
 // Use FxHashMap for faster hashing in ObjectTable
 type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MaybeVector<T: std::fmt::Debug + Clone + PartialEq + Eq> {
     Scalar(T),
+    /// The lane payload is behind an `Arc`, so cloning a vector value - a
+    /// `load`, a `store`, a select on a uniform mask, an argument gather -
+    /// is a refcount bump instead of a per-lane copy. Writers that mutate
+    /// in place (`expand_lanes`) go through `Arc::make_mut`, paying the
+    /// copy only when the payload is actually shared.
     // TODO do we want a link to some kind of size provider?
-    Vector(Vec<T>),
+    Vector(std::sync::Arc<Vec<T>>),
 }
 
+impl<T: std::fmt::Debug + Clone + PartialEq + Eq> PartialEq for MaybeVector<T> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (MaybeVector::Scalar(a), MaybeVector::Scalar(b)) => a == b,
+            (MaybeVector::Vector(a), MaybeVector::Vector(b)) => {
+                // Shared payloads are common (that is the point of the Arc),
+                // so the pointer check short-circuits most comparisons.
+                std::sync::Arc::ptr_eq(a, b) || a == b
+            }
+            _ => false,
+        }
+    }
+}
+
+impl<T: std::fmt::Debug + Clone + PartialEq + Eq> Eq for MaybeVector<T> {}
+
 impl<T: std::fmt::Debug + Clone + PartialEq + Eq> MaybeVector<T> {
+    /// A vector value from freshly-built lanes.
+    pub fn vector(lanes: Vec<T>) -> Self {
+        MaybeVector::Vector(std::sync::Arc::new(lanes))
+    }
     pub fn map(&self, f: impl Fn(&T) -> T) -> Self {
         match self {
             MaybeVector::Scalar(v) => MaybeVector::Scalar(f(v)),
-            MaybeVector::Vector(v) => MaybeVector::Vector(v.iter().map(f).collect()),
+            MaybeVector::Vector(v) => MaybeVector::vector(v.iter().map(f).collect()),
         }
     }
 
@@ -31,7 +56,7 @@ impl<T: std::fmt::Debug + Clone + PartialEq + Eq> MaybeVector<T> {
     ) -> MaybeVector<O> {
         match self {
             MaybeVector::Scalar(v) => MaybeVector::Scalar(f(v)),
-            MaybeVector::Vector(v) => MaybeVector::Vector(v.iter().map(f).collect()),
+            MaybeVector::Vector(v) => MaybeVector::vector(v.iter().map(f).collect()),
         }
     }
 
@@ -47,14 +72,14 @@ impl<T: std::fmt::Debug + Clone + PartialEq + Eq> MaybeVector<T> {
                 // element - this is the arithmetic inner loop, and the
                 // per-element branch blocks auto-vectorization.
                 assert_eq!(a.len(), b.len(), "map2 on vectors of different sizes");
-                MaybeVector::Vector(a.iter().zip(b.iter()).map(|(a, b)| f(a, b)).collect())
+                MaybeVector::vector(a.iter().zip(b.iter()).map(|(a, b)| f(a, b)).collect())
             }
             // Broadcast scalar to match vector size
             (MaybeVector::Scalar(a), MaybeVector::Vector(b)) => {
-                MaybeVector::Vector(b.iter().map(|bi| f(a, bi)).collect())
+                MaybeVector::vector(b.iter().map(|bi| f(a, bi)).collect())
             }
             (MaybeVector::Vector(a), MaybeVector::Scalar(b)) => {
-                MaybeVector::Vector(a.iter().map(|ai| f(ai, b)).collect())
+                MaybeVector::vector(a.iter().map(|ai| f(ai, b)).collect())
             }
         }
     }
@@ -97,7 +122,7 @@ where
     for &i in kept {
         filtered.push(vec[i as usize].clone());
     }
-    MaybeVector::Vector(filtered)
+    MaybeVector::vector(filtered)
 }
 
 impl Value {

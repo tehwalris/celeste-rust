@@ -200,9 +200,10 @@ impl State {
         ) -> MaybeVector<T> {
             match v {
                 MaybeVector::Scalar(s) => MaybeVector::Scalar(s),
-                MaybeVector::Vector(mut vec) => {
-                    vec.extend_from_within(..);
-                    MaybeVector::Vector(vec)
+                MaybeVector::Vector(mut arc) => {
+                    // Copies only if another state still shares the lanes.
+                    std::sync::Arc::make_mut(&mut arc).extend_from_within(..);
+                    MaybeVector::Vector(arc)
                 }
             }
         }

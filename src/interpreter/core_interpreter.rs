@@ -443,7 +443,7 @@ impl<'a> CoreInterpreter<'a> {
                         let mut lanes = Vec::with_capacity(2 * n);
                         lanes.resize(n, true);
                         lanes.resize(2 * n, false);
-                        Ok(Some(Value::Bool(MaybeVector::Vector(lanes))))
+                        Ok(Some(Value::Bool(MaybeVector::vector(lanes))))
                     }
                     other => Err(anyhow!(
                         "Expand(%{}) expected a bool or unknown bool, got {:?}",
@@ -709,7 +709,7 @@ mod expand_tests {
     }
 
     fn num_vec(values: &[i16]) -> Value {
-        Value::Number(MaybeVector::Vector(
+        Value::Number(MaybeVector::vector(
             values.iter().map(|v| Pico8Num::from_i16(*v)).collect(),
         ))
     }
@@ -747,7 +747,7 @@ mod expand_tests {
         assert_eq!(state.vector_size, 6);
         assert_eq!(
             state.local_env.get(id(10)),
-            &Value::Bool(MaybeVector::Vector(vec![true, true, true, false, false, false]))
+            &Value::Bool(MaybeVector::vector(vec![true, true, true, false, false, false]))
         );
         // Env vector doubled, first copy then second.
         assert_eq!(state.local_env.get(id(1)), &num_vec(&[1, 2, 3, 1, 2, 3]));
@@ -770,13 +770,13 @@ mod expand_tests {
         let (mut state, cell) = three_lane_state();
         state
             .local_env
-            .set(id(0), Value::Bool(MaybeVector::Vector(vec![true, false, true])));
+            .set(id(0), Value::Bool(MaybeVector::vector(vec![true, false, true])));
         let state = run_expand(state, id(0)).unwrap();
 
         assert_eq!(state.vector_size, 3);
         assert_eq!(
             state.local_env.get(id(10)),
-            &Value::Bool(MaybeVector::Vector(vec![true, false, true]))
+            &Value::Bool(MaybeVector::vector(vec![true, false, true]))
         );
         assert_eq!(state.local_env.get(id(1)), &num_vec(&[1, 2, 3]));
         assert_eq!(state.heap.get(cell), &HeapValue::Value(num_vec(&[4, 5, 6])));

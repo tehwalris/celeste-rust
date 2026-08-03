@@ -347,10 +347,10 @@ mod tests {
         let condition_local_id = LocalId::from(0);
         let data_local_id = LocalId::from(1);
 
-        state.local_env.set(condition_local_id, Value::Bool(MaybeVector::Vector(vec![
+        state.local_env.set(condition_local_id, Value::Bool(MaybeVector::vector(vec![
             true, false, true, false
         ])));
-        state.local_env.set(data_local_id, Value::Number(MaybeVector::Vector(vec![
+        state.local_env.set(data_local_id, Value::Number(MaybeVector::vector(vec![
             Pico8Num::from_i16(1),
             Pico8Num::from_i16(2),
             Pico8Num::from_i16(3),
@@ -427,7 +427,7 @@ mod tests {
 
         let cond_id = LocalId::from(0);
         // All true
-        state.local_env.set(cond_id, Value::Bool(MaybeVector::Vector(vec![true, true, true])));
+        state.local_env.set(cond_id, Value::Bool(MaybeVector::vector(vec![true, true, true])));
 
         let branch = BoundInterpreterFlow::BranchConditional {
             condition_local_id: cond_id,
@@ -452,7 +452,7 @@ mod tests {
 
         let cond_id = LocalId::from(0);
         // All true, but we're taking false branch
-        state.local_env.set(cond_id, Value::Bool(MaybeVector::Vector(vec![true, true, true])));
+        state.local_env.set(cond_id, Value::Bool(MaybeVector::vector(vec![true, true, true])));
 
         let branch = BoundInterpreterFlow::BranchConditional {
             condition_local_id: cond_id,

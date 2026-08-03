@@ -247,7 +247,7 @@ branches and so cannot be a region today.
 
 perf (`-g --call-graph dwarf` on `rewrite bench`, replay samples excluded)
 found what the span profile could not see inside `dedup_state` and
-`filter_branch`. Four changes, each measured on 2-3 runs, differentially
+`filter_branch`. Five changes, each measured on 2-3 runs, differentially
 identical through 34 and 37:
 
 1. **Lazy span names.** Every builtin and closure call `format!`ed its
@@ -269,13 +269,30 @@ identical through 34 and 37:
    branch per lane for an invariant the interpreter already guarantees;
    asserting it once re-enables auto-vectorization. ~5%.
 
+5. **`Arc`'d lane payloads.** `MaybeVector::Vector` now holds
+   `Arc<Vec<T>>`, so cloning a vector value - every `load` and `store` of
+   a vectorized cell, every select on a uniform mask, every argument
+   gather - is a refcount bump instead of a per-lane copy. Writers
+   (`expand_lanes`) go through `Arc::make_mut` and pay the copy only when
+   the payload is shared; `PartialEq` gets an `Arc::ptr_eq` fast path,
+   which also short-circuits state-equality checks over shared vectors.
+   ~8% at both depths, +0.15 GB at 37 from retained sharing. This was
+   analysed and rejected in 2026-08 *as a gc optimization* ("lane copying
+   is ~3% of gc") - correctly, but gc was never where vector clones
+   lived: the interpreter's load/store/select paths were, and after
+   rounds 1-4 they were the largest remaining cost.
+
 | | 34 frames | 37 frames |
 |---|---|---|
 | before | 1.36-1.37 s, 0.50 GB | 5.74 s, 1.69 GB |
 | after 1-3 | 1.17-1.21 s, 0.44 GB | 4.97-4.99 s, 1.63 GB |
 | after 1-4 | 1.11-1.14 s, ~0.48 GB | 4.47 s, 1.50 GB |
+| after 1-5 | 1.03-1.04 s, 0.47 GB | 4.11-4.16 s, 1.65 GB |
 
-**-17% at 34, -22% at 37**, memory down, lanes identical throughout.
+**-24% at 34, -28% at 37**, lanes identical throughout. Frame 40
+milestone check: **18.82 s / 5.47 GB** (948,319 lanes) - the last
+recorded milestone was 23.63 s / 5.28 GB on an older recipe, so the
+memory cost of sharing stays within ~4% at depth.
 
 **Tried and rejected: gc arena reuse.** gc clones every reachable heap
 value into a fresh arena per call; a rewrite re-indexed pointer-free

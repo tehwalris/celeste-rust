@@ -509,14 +509,14 @@ pub fn make_state_abstract(mut state: State) -> State {
                         Value::NumberInterval(MaybeVector::Scalar(wide_interval))
                     }
                     Value::Number(MaybeVector::Vector(nums)) => {
-                        for n in nums {
+                        for n in nums.iter() {
                             assert!(
                                 wide_interval.contains_number(*n),
                                 "player_rem value {:?} not in expected interval",
                                 n
                             );
                         }
-                        Value::NumberInterval(MaybeVector::Vector(vec![wide_interval; nums.len()]))
+                        Value::NumberInterval(MaybeVector::vector(vec![wide_interval; nums.len()]))
                     }
                     Value::NumberInterval(MaybeVector::Scalar(interval)) => {
                         assert!(
@@ -527,14 +527,14 @@ pub fn make_state_abstract(mut state: State) -> State {
                         Value::NumberInterval(MaybeVector::Scalar(wide_interval))
                     }
                     Value::NumberInterval(MaybeVector::Vector(intervals)) => {
-                        for interval in intervals {
+                        for interval in intervals.iter() {
                             assert!(
                                 wide_interval.contains_interval(interval),
                                 "player_rem interval {:?} not in expected interval",
                                 interval
                             );
                         }
-                        Value::NumberInterval(MaybeVector::Vector(vec![wide_interval; intervals.len()]))
+                        Value::NumberInterval(MaybeVector::vector(vec![wide_interval; intervals.len()]))
                     }
                     other => {
                         panic!("Unexpected value type for player_rem: {:?}", other);
