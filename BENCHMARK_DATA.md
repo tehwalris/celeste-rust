@@ -142,6 +142,34 @@ Lane counts are identical across all of these (92,713 at frame 34; 269,059 at
 frame 37), which is the first thing to check when a rewrite claims a win -
 identical lanes means the same work was done, differently.
 
+### Lane expansion without consumer masking is a regression (2026-08)
+
+The `expand` instruction concretizes an unknown bool by doubling the state's
+lanes instead of duplicating the state (`rules::expand_bool` replaces `btn`'s
+concretization diamond with it; `rules::decompose_branch` keeps the `and`
+chain's short-circuit representable once the bool is a vector). Applied to the
+two dash-arm buttons alone - k_up (`in_j2_050_if_join_10`) and k_down
+(`in_j2_052_if_join_10`), entries `g088`-`g090` in git history - it is
+differentially identical through frame 37 and a clean regression:
+
+| recipe | frame 34 | frame 37 |
+|---|---|---|
+| without (committed) | 1.37-1.38 s / 0.50 GB | 5.65-5.75 s / 1.6-1.7 GB |
+| expand k_up/k_down | 1.55-1.57 s / 0.63 GB | 6.30-6.53 s / 2.1-2.2 GB |
+
+Same lanes, same 505 splits, same 527 fragments at frame 34 - the splits
+*relocated* rather than disappearing (k_up's 72 to the short-circuit branch
+`in_i1_081_cont`, k_down's 72 to the `v_input` consumers `if_body_187` /
+`if_condition_185`). The profile attributes the entire +0.20 s: an
+`UnknownBool` branch duplicates the state for free (both edges get it
+unfiltered), while the same branch on the expanded vector pays a per-lane
+mask filter per edge - `filter_branch` 0.18 s / 328 calls -> 0.33 s / 616
+calls - plus 0.08 s of `expand_lanes` itself. Expansion converts free state
+duplication into paid lane filtering; it can only pay off where the
+downstream branches disappear entirely, i.e. as a package with masking every
+consumer of the expanded value. The entries were reverted; the machinery
+(instruction, both rules, differential result) is kept and tested.
+
 ## Where the time goes
 
 `rewrite bench --frames 34 --profile`, on the current recipe. Self time, so the

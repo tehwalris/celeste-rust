@@ -63,8 +63,8 @@ enum Command {
     Suggest {
         /// What to look for: "promote-cell", "promote-capture", "inline",
         /// "if-convert", "demote-create", "pin-builtin", "convert-ternary",
-        /// "decompose-truthy", "speculate", "speculate-region", "sink-store"
-        /// or "absorb-stores".
+        /// "decompose-truthy", "speculate", "speculate-region", "sink-store",
+        /// "absorb-stores" or "expand-bool".
         #[arg(default_value = "promote-cell")]
         what: String,
         /// Prefix for the generated ids.
@@ -792,6 +792,31 @@ fn main() -> Result<()> {
                     eprintln!(
                         "# Each plants an assert_value_cell: a cell that ever holds a \
                          closure or table fails loudly. Screen at full depth."
+                    );
+                }
+                "expand-bool" => {
+                    let candidates =
+                        celeste_rust::rewrite::rules::expand_bool::candidates(&program);
+                    for (i, (function, head)) in candidates.iter().enumerate() {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "id": format!("{}{:03}", prefix, i),
+                                "rule": "expand_bool",
+                                "fn": function,
+                                "head": head.as_str(),
+                            })
+                        );
+                    }
+                    eprintln!(
+                        "# {} bool-concretization diamond(s) - branch on an unknown \
+                         bool, arms storing constants back.",
+                        candidates.len()
+                    );
+                    eprintln!(
+                        "# Each becomes lane expansion. Convert together with masking \
+                         its consumers; expansion alone just moves the split. Screen \
+                         at full depth."
                     );
                 }
                 "promote-capture" => {

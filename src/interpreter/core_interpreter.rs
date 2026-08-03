@@ -431,6 +431,27 @@ impl<'a> CoreInterpreter<'a> {
             Instruction::Phi { .. } => {
                 panic!("Phi nodes should not be handled at this level")
             }
+            Instruction::Expand { value } => {
+                let current = self.state.local_env.get(*value).clone();
+                match current {
+                    // Already concrete - a fixed-input run, or a cell some
+                    // earlier expand in this frame concretized. Identity.
+                    concrete @ Value::Bool(_) => Ok(Some(concrete)),
+                    Value::UnknownBool => {
+                        let n = self.state.vector_size;
+                        self.state.expand_lanes();
+                        let mut lanes = Vec::with_capacity(2 * n);
+                        lanes.resize(n, true);
+                        lanes.resize(2 * n, false);
+                        Ok(Some(Value::Bool(MaybeVector::Vector(lanes))))
+                    }
+                    other => Err(anyhow!(
+                        "Expand(%{}) expected a bool or unknown bool, got {:?}",
+                        usize::from(*value),
+                        other
+                    )),
+                }
+            }
         }
     }
 
@@ -675,5 +696,110 @@ impl<'a> CoreInterpreter<'a> {
                 heap_value
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod expand_tests {
+    use super::*;
+    use crate::pico8_num::Pico8Num;
+
+    fn id(n: usize) -> LocalId {
+        LocalId::from(n)
+    }
+
+    fn num_vec(values: &[i16]) -> Value {
+        Value::Number(MaybeVector::Vector(
+            values.iter().map(|v| Pico8Num::from_i16(*v)).collect(),
+        ))
+    }
+
+    /// A 3-lane state: an `UnknownBool` in %0, a number vector in %1, a
+    /// scalar in %2, and a heap cell holding another number vector.
+    fn three_lane_state() -> (State, HeapId) {
+        let mut state = State::new();
+        state.vector_size = 3;
+        state.local_env.set(id(0), Value::UnknownBool);
+        state.local_env.set(id(1), num_vec(&[1, 2, 3]));
+        state
+            .local_env
+            .set(id(2), Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(9))));
+        let cell = state.heap.alloc();
+        state.heap.set(cell, HeapValue::Value(num_vec(&[4, 5, 6])));
+        (state, cell)
+    }
+
+    fn run_expand(state: State, value: LocalId) -> Result<State> {
+        let fixed_env = FixedEnv::new();
+        let mut interpreter = CoreInterpreter::new(state, &fixed_env);
+        interpreter.interpret_non_call_instruction(id(10), &Instruction::Expand { value })?;
+        Ok(interpreter.into_state())
+    }
+
+    /// The point of the instruction: an unknown bool becomes a per-lane
+    /// vector - true on the first copy of every lane, false on the second -
+    /// and every vector in the state doubles along with it.
+    #[test]
+    fn unknown_bool_doubles_the_state() {
+        let (state, cell) = three_lane_state();
+        let state = run_expand(state, id(0)).unwrap();
+
+        assert_eq!(state.vector_size, 6);
+        assert_eq!(
+            state.local_env.get(id(10)),
+            &Value::Bool(MaybeVector::Vector(vec![true, true, true, false, false, false]))
+        );
+        // Env vector doubled, first copy then second.
+        assert_eq!(state.local_env.get(id(1)), &num_vec(&[1, 2, 3, 1, 2, 3]));
+        // Scalars broadcast; untouched.
+        assert_eq!(
+            state.local_env.get(id(2)),
+            &Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(9)))
+        );
+        // Heap vectors double too.
+        assert_eq!(state.heap.get(cell), &HeapValue::Value(num_vec(&[4, 5, 6, 4, 5, 6])));
+        // The operand itself stays an unknown bool - expand reads it, it does
+        // not redefine it.
+        assert_eq!(state.local_env.get(id(0)), &Value::UnknownBool);
+    }
+
+    /// On a concrete bool - what a fixed-input run sees, or a cell an earlier
+    /// expand already concretized - this is the identity.
+    #[test]
+    fn concrete_bool_is_identity() {
+        let (mut state, cell) = three_lane_state();
+        state
+            .local_env
+            .set(id(0), Value::Bool(MaybeVector::Vector(vec![true, false, true])));
+        let state = run_expand(state, id(0)).unwrap();
+
+        assert_eq!(state.vector_size, 3);
+        assert_eq!(
+            state.local_env.get(id(10)),
+            &Value::Bool(MaybeVector::Vector(vec![true, false, true]))
+        );
+        assert_eq!(state.local_env.get(id(1)), &num_vec(&[1, 2, 3]));
+        assert_eq!(state.heap.get(cell), &HeapValue::Value(num_vec(&[4, 5, 6])));
+    }
+
+    #[test]
+    fn scalar_bool_is_identity() {
+        let (mut state, _) = three_lane_state();
+        state.local_env.set(id(0), Value::Bool(MaybeVector::Scalar(false)));
+        let state = run_expand(state, id(0)).unwrap();
+        assert_eq!(state.vector_size, 3);
+        assert_eq!(
+            state.local_env.get(id(10)),
+            &Value::Bool(MaybeVector::Scalar(false))
+        );
+    }
+
+    /// Anything that is not a bool fails loudly rather than being coerced -
+    /// Lua truthiness has no business here, the operand is a button state.
+    #[test]
+    fn non_bool_fails() {
+        let (state, _) = three_lane_state();
+        let error = format!("{:#}", run_expand(state, id(1)).unwrap_err());
+        assert!(error.contains("expected a bool"), "{}", error);
     }
 }

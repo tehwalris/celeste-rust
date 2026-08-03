@@ -7,7 +7,7 @@ use super::{
     heap::{Heap, HeapId},
     local_env::LocalEnv,
     tracing::TraceSpan,
-    value::{HeapValue, Value},
+    value::{HeapValue, MaybeVector, Value},
 };
 
 // Use FxHash for faster hashing
@@ -177,6 +177,40 @@ impl State {
         }
 
         self.vector_size = new_vector_size;
+    }
+
+    /// Duplicates every lane of the state: lanes `[l1..lN]` become
+    /// `[l1..lN, l1..lN]` and `vector_size` doubles. Scalars broadcast over
+    /// any lane count and stay scalar, so only vectors are touched.
+    ///
+    /// The engine behind `Instruction::Expand`, which follows this with a
+    /// per-lane bool that is `true` on the first copy and `false` on the
+    /// second - together they enumerate both values of an unknown bool
+    /// without splitting the state.
+    pub fn expand_lanes(&mut self) {
+        let _trace = TraceSpan::new("expand_lanes", "expand");
+        fn double<T: std::fmt::Debug + Clone + PartialEq + Eq>(
+            v: MaybeVector<T>,
+        ) -> MaybeVector<T> {
+            match v {
+                MaybeVector::Scalar(s) => MaybeVector::Scalar(s),
+                MaybeVector::Vector(mut vec) => {
+                    vec.extend_from_within(..);
+                    MaybeVector::Vector(vec)
+                }
+            }
+        }
+        self.map_values_in_place(|value| match value {
+            Value::Number(v) => Value::Number(double(v)),
+            Value::NumberInterval(v) => Value::NumberInterval(double(v)),
+            Value::Bool(v) => Value::Bool(double(v)),
+            other @ (Value::UnknownBool
+            | Value::String(_)
+            | Value::Nil(_)
+            | Value::Pointer(_)
+            | Value::NilPointer(_)) => other,
+        });
+        self.vector_size *= 2;
     }
 
     /// Filters all vector values in the state by a mask, cloning first.

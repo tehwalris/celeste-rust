@@ -1,6 +1,6 @@
 # Status (2026-08)
 
-Branch `rewrite`. Build is warning-free, 346 tests pass, working tree clean.
+Branch `rewrite`. Build is warning-free, 365 tests pass, working tree clean.
 
 ## Measured, frame 34 (the standard iteration benchmark)
 
@@ -859,6 +859,57 @@ block-local**: 270 folds, K 3980 -> 3815, slots unchanged, frame 34
 37; lanes and fragments unchanged throughout (the stage removes
 instructions, not states). The unrestricted variant is one deleted
 restriction away when splitting is gone and env cost stops mattering.
+
+### Lane expansion is built, measured, and waiting on consumer masking (2026-08-03)
+
+The `btn` endgame's first machinery landed: `Instruction::Expand`
+concretizes an unknown bool by doubling the state's lanes (first copy
+`true`, second `false`) instead of duplicating the state - identity on a
+concrete bool, so fixed-input runs are untouched. Two rules place it:
+
+* `expand_bool` (pointed at the diamond's head) replaces a `btn`
+  concretization diamond - branch on the loaded cell, arms storing
+  `true`/`false` back through the same accessor - with
+  `%phi = expand %c; <accessor>; store <- %phi`, no branch, no minted ids.
+  `suggest expand-bool` finds all 12 btn diamonds and nothing else.
+* `decompose_branch` (pointed at the select) is the branch-side counterpart
+  of `decompose_truthy`, needed the moment the bool is a vector:
+  `%p = select %c ? %k : %c; br %p` becomes `br %c` with the join phi
+  taking `%k` on that edge (`%k` statically truthy demanded). Without it
+  the `and`-select mixes a Number and a vector Bool per lane, which the
+  representation refuses - loudly, which is how the screen found it.
+
+Applied to the two dash-arm buttons (k_up, k_down; entries g088-g090 in git
+history): **differentially identical through 34 and 37, and a ~11-13%
+regression** - 1.37 -> 1.56 s at 34, 5.7 -> 6.4 s at 37, +0.13/+0.5 GB.
+Same lanes, same 505 splits, same 527 fragments; the splits relocated to
+the short-circuit branch and the `v_input` consumers. The profile is
+unambiguous (see BENCHMARK_DATA.md): branching on an `UnknownBool`
+duplicates the state *for free*, branching on the expanded vector pays a
+per-lane mask filter per edge (`filter_branch` 0.18 s/328 calls -> 0.33
+s/616), plus `expand_lanes` itself. **Expansion trades free state
+duplication for paid lane filtering, so it only pays as a package with
+masking every consumer of the expanded value** - the entries were
+reverted, the machinery kept.
+
+What the package needs, in order, for the dash arm alone:
+
+1. An `__assert`-diamond-to-`assert_true` rule: the inlined range asserts
+   are uniform branches full of `error`/`__print` calls, and they are what
+   blocks region speculation across the k_down evaluation.
+2. An opt-in for `expand` + the concretization store inside a masked
+   region (`is_speculatable` refuses `expand` by design: on lanes that
+   would have skipped the arm it doubles lanes nobody asked for - the cell
+   is reset to `UnknownBool` at the frame boundary, so next-frame dedup
+   reclaims the copies, but within the frame it is real cost that must be
+   measured, ~4N vs 3N lanes for the up/down pair).
+3. Then the existing rules: decompose the unconditional `v_input` chain,
+   absorb the `if_body_187`/`if_condition_185` stores, mask the dash-gate
+   arm (`in_k1039_cont`) and the `dash_time` diamond (`in_i1_074_cont`).
+
+Only after that package is whole does the frame stop splitting on dash
+inputs at all; every intermediate stage measures as a regression, so it
+lands whole or not at all.
 
 ### Later: `assume_eq`, whole-function field promotion
 

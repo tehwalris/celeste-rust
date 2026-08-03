@@ -100,6 +100,7 @@ pub fn format_instruction(instr: &Instruction) -> String {
             n(*if_true),
             n(*if_false)
         ),
+        Instruction::Expand { value } => format!("expand {}", n(*value)),
         Instruction::AssertPointer { value } => {
             format!("assert_pointer {}", n(*value))
         }

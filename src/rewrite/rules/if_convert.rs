@@ -90,6 +90,11 @@ pub fn is_speculatable(instr: &Instruction) -> bool {
         // the branch, which changes `StateShape` and so changes which states
         // can merge - a silent cost, not a loud failure.
         Instruction::Alloc => false,
+        // Doubles every lane of the state. Running that on a path that did
+        // not take the branch multiplies lanes that were never asked for -
+        // silent cost, and the phantom lanes' expanded bool would be wrong to
+        // observe. Never moves.
+        Instruction::Expand { .. } => false,
         // These mutate the heap when the field is missing. `demote_create`
         // exists to turn them into the plain read plus assert below.
         Instruction::GetGlobal { create_if_missing, .. }

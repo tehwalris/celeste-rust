@@ -308,6 +308,29 @@ pub enum Instruction {
         name: String,
         args: Vec<LocalId>,
     },
+    /// Concretize an unknown bool by *lane expansion* instead of by branching.
+    ///
+    /// On an `UnknownBool`: every lane of the state is duplicated - the first
+    /// copy of the lane takes `true`, the second `false` - and the result is
+    /// the per-lane vector bool over the doubled state. On a value that is
+    /// already a concrete bool, scalar or vector, this is the identity, which
+    /// is what a concrete run with fixed inputs sees. Anything else fails
+    /// loudly.
+    ///
+    /// This is the branch-free counterpart of what a conditional branch on an
+    /// `UnknownBool` does today: the branch sends the whole state down *both*
+    /// edges, and each fragment stores one constant back into the cell it was
+    /// loaded from (`btn`'s concretization diamond). Expansion produces the
+    /// same set of lanes - each old lane once with `true` and once with
+    /// `false` - in one state instead of two fragments, which is exactly the
+    /// input fan-out the search intends. See `rules::expand_bool`.
+    ///
+    /// Unlike every other instruction, it rewrites the whole state (every
+    /// vector doubles), so it has "side effects" for every rule's purposes:
+    /// never dead, never speculated, never deduplicated.
+    Expand {
+        value: LocalId,
+    },
 }
 
 impl Instruction {
@@ -397,6 +420,7 @@ impl Instruction {
                 name: name.clone(),
                 args: args.iter().map(|id| f(*id)).collect(),
             },
+            Self::Expand { value } => Self::Expand { value: f(*value) },
         }
     }
 }
@@ -449,6 +473,7 @@ impl Instruction {
                 v.extend(args.iter().copied());
                 v
             }
+            Self::Expand { value } => vec![*value],
         }
     }
 
@@ -486,6 +511,9 @@ impl Instruction {
             // replaced would have run and could have failed. Same answer as
             // `Call` for the same reason.
             Self::CallBuiltin { .. } => true,
+            // Rewrites the whole state: every lane doubles. Removing it when
+            // the result is unused would remove the input fan-out itself.
+            Self::Expand { .. } => true,
         }
     }
 }

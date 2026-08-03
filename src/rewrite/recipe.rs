@@ -17,8 +17,10 @@ use serde::{Deserialize, Serialize};
 
 use super::program::Program;
 use super::rules::{
-    absorb_stores, allocate_slots, convert_ternary, cse, dce, decompose_truthy, demote_create,
-    fold, fold_reflexive, fuse_breaks, if_convert, inline, mask_loop, merge_blocks, pin_builtin,
+    absorb_stores, allocate_slots, convert_ternary, cse, dce, decompose_branch, decompose_truthy,
+    demote_create,
+    expand_bool, fold, fold_reflexive, fuse_breaks, if_convert, inline, mask_loop, merge_blocks,
+    pin_builtin,
     promote_capture,
     promote_cell, sink_store, speculate, speculate_region,
 };
@@ -258,6 +260,30 @@ pub enum Rule {
         /// The `alloc` that defines the cell, as `%N`.
         cell: String,
     },
+    /// Branch on an `and`'s condition instead of its mixed value:
+    /// `%p = select %c ? %k : %c; br %p` becomes `br %c`, with the true
+    /// target's phis taking `%k` on that edge and the select deleted.
+    /// Requires `%k` statically truthy. The branch-side counterpart of
+    /// `decompose_truthy`, for short-circuits whose skipped path has side
+    /// effects and so must remain a branch.
+    DecomposeBranch {
+        #[serde(rename = "fn")]
+        function: String,
+        /// The mixed select, as `%N`.
+        at: String,
+    },
+    /// Replace a bool-concretization diamond (`btn`'s tail: branch on an
+    /// unknown bool, each arm storing its constant back into the cell) with
+    /// an `expand` instruction: lanes duplicate instead of the state
+    /// splitting, and the per-lane bool is stored back through the arms'
+    /// accessor. The expand fails loudly if the branched-on value is ever
+    /// not a bool. Screen at full depth.
+    ExpandBool {
+        #[serde(rename = "fn")]
+        function: String,
+        /// The block whose conditional branch is removed.
+        head: String,
+    },
 }
 
 impl Rule {
@@ -283,6 +309,8 @@ impl Rule {
             Rule::SinkStore { .. } => "sink_store",
             Rule::AbsorbStores { .. } => "absorb_stores",
             Rule::PromoteCell { .. } => "promote_cell",
+            Rule::DecomposeBranch { .. } => "decompose_branch",
+            Rule::ExpandBool { .. } => "expand_bool",
         }
     }
 }
@@ -479,6 +507,10 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::PromoteCell { function, cell } => {
             promote_cell::apply(program, function, parse_cell(cell)?)
         }
+        Rule::DecomposeBranch { function, at } => {
+            decompose_branch::apply(program, function, parse_cell(at)?)
+        }
+        Rule::ExpandBool { function, head } => expand_bool::apply(program, function, head),
         Rule::Inline { function, at, callee, captures } => inline::apply(
             program,
             &entry.id,
@@ -567,6 +599,12 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         }
         Rule::PromoteCell { function, cell } => {
             promote_cell::verify(&before, program, function, parse_cell(cell)?)
+        }
+        Rule::DecomposeBranch { function, at } => {
+            decompose_branch::verify(&before, program, function, parse_cell(at)?)
+        }
+        Rule::ExpandBool { function, head } => {
+            expand_bool::verify(&before, program, function, head)
         }
         Rule::Inline { function, at, callee, captures } => inline::verify(
             &before,
