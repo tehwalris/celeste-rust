@@ -798,6 +798,33 @@ frame 37 (28.9 s) and frame 40 (104.5 s). Frame 40 bench: 23.63 s /
 5.28 GB / 948,319 lanes, the same 11 split sites as frame 34, and the
 kill branch still does not split - spikes stay unreachable through 40.
 
+### The dash cluster is pure `btn` taint; the allocs live elsewhere (2026-08-03)
+
+Investigated where the dash cluster's blockers actually are, in this cart's
+IR rather than from memory:
+
+* `in_k1039_cont` (30 splits) is the dash *initiation* gate
+  (`djump>0 and dash`). Its arm is plain stores, converted selects and
+  inlined `sign` - **no allocation anywhere** (the minimal cart has no
+  smoke objects at all). What blocks masking it is `v_input`:
+  `btn(k_up) and -1 or (btn(k_down) and 1 or 0)` *inside* the arm.
+* `in_i1_074_cont` (108 splits) is the `dash_time>0` diamond. Its true
+  arm (`appr` on `spd` toward `dash_target`) is maskable on its own; the
+  else arm is the whole normal-physics block and *contains* the dash
+  gate above, so it is `btn`-tainted transitively.
+* The allocations in `player.update_21` that memory attributed to the
+  dash arm are actually the platform `init_object`s inside the two
+  inlined `load_room` copies (via `next_room`, taken at `y<-4`) plus the
+  kill/`destroy_object` machinery - all behind uniformly-false branches
+  through frame 40. They become relevant when the search first crosses a
+  room boundary or dies, not before.
+
+So the whole 469-split remainder outside the freeze/spd echoes reduces
+to one question: how `btn` is modelled. The earlier "lane expansion is a
+regression" measurement (4.47 -> 5.46 s) predates every masking stage -
+fragments were 108 mean then and are 16 now, so the trade may have
+flipped and wants re-measuring before the endgame is designed.
+
 ### K reduction landed as `cse` forward mode, not field promotion (2026-08-03)
 
 The planned whole-function field promotion (load once, SSA, store back at
