@@ -1,6 +1,6 @@
 # Status (2026-08)
 
-Branch `rewrite`. Build is warning-free, 359 lib tests pass, working tree
+Branch `rewrite`. Build is warning-free, 368 lib tests pass, working tree
 clean.
 
 ## Measured, frame 34 (the standard iteration benchmark)
@@ -28,6 +28,7 @@ clean.
 | + `Arc`'d lane payloads (clone = refcount bump) | 1.03 s | 0.47 GB |
 | + 16 `collapse_loop` (the `#objects` singleton check/collide loops) | 1.02 s | 0.47 GB |
 | + 16 `assume_eq` + pointer folds (every object-table check folds to nil) | 0.93 s | 0.47 GB |
+| + 4 `collapse_break_loop` (`foreach`/`del`), `split_call` + both arms inlined | ~0.95 s (machine drift; interleaved A/B neutral) | 0.47 GB |
 
 Lane count is identical throughout (92,713), which is the first thing to check
 when a rewrite claims a win. Frame 37 confirms the same ratios (7.87 s, from
@@ -1002,13 +1003,27 @@ for reduces to a singleton premise that one runtime guard can state.
   history lesson re-learned: extending `fold_reflexive` in place changed
   what g043 folded and broke replay downstream - new fold behavior goes
   behind an entry-level opt-in, always.
-* **Next**: the `foreach`/`del` sentinel-loop collapse (their bound is
-  `32767` with an in-body `#tbl < i` break, so they need a
-  "first-iteration-breaks" argument, not `bound == init`), then
-  devirtualizing `obj.type.update` (a 2-way uniform dispatch,
-  player_spawn vs player), which is what stands between `anonymous_61`
-  and straight-line code. The dead `in_k1039_cont` split (30) survives
-  because its branch is on tile data, not the collide result.
+* **`collapse_break_loop`** (built, 4 sites landed): the `foreach`/`del`
+  sentinel shape, collapsed with three runtime asserts and no static
+  arithmetic - `init <= sentinel`, `not break_check` for iteration 1,
+  and a re-materialized break check after the payload (re-reading `# t`
+  so mid-payload mutations count) that must pass for iteration 2.
+* **`split_call` + inline** (built, landed): the object-update dispatch
+  split under `type == load(get_global "player")` - the rule itself is
+  neutral (both arms make the original call; the branch is a uniform
+  pointer compare), the premises live in the per-arm `assert_closure`s
+  that `inline` plants. `player.update_21` and `player_spawn.update_24`
+  now live inside `anonymous_61`; **no dynamic dispatch remains on the
+  hot path** (calls are 1.5% of K, all statically-known foreach/draw
+  closures). Time-neutral by interleaved A/B - the point is what it
+  unblocks: whole-function field promotion has no call barrier left in
+  the fused update body.
+* **Next**: whole-function field promotion over the fused
+  `anonymous_61` (heap is 37.7% of K; 142/146 field cells in the old
+  update body were written once), then inlining the last foreach/draw
+  callbacks into `__frame`. The dead `in_k1039_cont` split (30)
+  survives because its branch is on tile data, not the collide result;
+  it falls with the dash-gate endgame.
 
 ### Later: `assume_eq`, whole-function field promotion
 

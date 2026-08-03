@@ -42,6 +42,8 @@ not comparable.
 | + interpreter micro-opts round 1 + `Arc`'d lane payloads (see below) | 1.03-1.04 s / 0.47 GB | 4.11-4.16 s / 1.65 GB |
 | + 16 `collapse_loop` (the `#objects` check/collide loops) | 1.02-1.03 s / 0.47 GB | 4.04 s / 1.66 GB |
 | + 16 `assume_eq` + pointer folds: every object-table check returns nil | 0.92-0.94 s / 0.47 GB | 3.85 s / 1.71 GB |
+| + 4 `collapse_break_loop` (the `foreach`/`del` sentinel loops) | 0.93 s / 0.46 GB | 3.77-3.91 s / 1.62 GB |
+| + `split_call` + both update arms inlined (no dispatch left) | 0.94-0.96 s / 0.47 GB | 3.88-3.90 s / 1.65 GB |
 
 The store-triangle row is the first change that moved the fragment count: 558
 -> 335 mean fragments per frame at frame 34, split executions 19573 -> 11978.
@@ -383,6 +385,41 @@ K unrolled is down 39% on the day (9546 this morning). Splits are
 unchanged (505 across the same 11 sites) - this stage removed
 computation, not branches; branch *executions* fell 10892 -> 6518.
 Differentially identical through 34 and 37; lanes identical throughout.
+
+### `collapse_break_loop` and the devirtualized dispatch (2026-08-03)
+
+Two more stages of the singleton line, both neutral-to-positive on time
+and structural on purpose:
+
+* **`collapse_break_loop`** (4 sites): the `foreach`/`del` shape -
+  `for i=1,32767` with an in-body `#tbl < i` break - collapsed with
+  three runtime asserts and no static arithmetic: `init <= sentinel` in
+  the preheader, `not break_check` where the break branch was, and a
+  re-materialized break check after the payload that must pass
+  (re-reading `# t`, so `player_spawn.update`'s mid-payload
+  destroy-and-re-add counts). The three `foreach(objects, ...)` loops in
+  `__frame` and the `del` inside the spawn's `destroy_object`; cold
+  copies left alone. 37f 3.85 -> ~3.8 s, memory 1.71 -> 1.62 GB.
+* **`split_call` + inline x2**: the object-update dispatch
+  `obj.type.update(obj)` - per-state uniform but two-valued over the
+  search - split under `type == load(get_global "player")` (a pure,
+  uniform pointer compare; the rule is semantically neutral, both arms
+  make the original call), then each arm pinned by its own
+  `assert_closure` and inlined: `player.update_21` (2390 instructions)
+  and `player_spawn.update_24` (318) now live inside `anonymous_61`.
+  **No dynamic dispatch remains on the hot path**; remaining calls are
+  1.5% of K, all statically-known foreach/draw closures.
+
+A measurement lesson from the second stage: the machine drifted ~2%
+between the morning's runs and these, and against a stale baseline the
+inlines first read as a +3% regression. An interleaved A/B on the same
+binary (3.88-3.91 vs 3.88-3.90 at 37) showed both neutral. Compare
+variants interleaved, never against numbers from hours ago.
+
+Frame 40 milestone: **17.53 s / 5.30 GB** (948,319 lanes; previous
+milestone 18.82 / 5.47). K unrolled 5801 -> 5784; `anonymous_61` is now
+84.5% of K and `player.update_21` is no longer a function the frame
+calls. Differentially identical through 34 and 37 at every step.
 
 ## Where the time goes
 

@@ -829,4 +829,12 @@
 {"fn":"__frame","head":"in_j2_009_for_head_1","id":"h052","rule":"collapse_break_loop"}
 {"fn":"player_spawn.update_24","head":"in_i1_063_in_i1_037_for_head_30","id":"h053","rule":"collapse_break_loop"}
 {"id":"h054","rule":"dce"}
+{"at":"%54","fn":"anonymous_61","global":"player","id":"h060","on":"%42","rule":"split_call"}
+{"at":"%1653","callee":"player.update_21","fn":"anonymous_61","id":"h061","rule":"inline"}
+{"at":"%1655","callee":"player_spawn.update_24","fn":"anonymous_61","id":"h062","rule":"inline"}
+{"forward":true,"id":"h063","rule":"cse"}
+{"id":"h064","rule":"fold_reflexive","pointers":true}
+{"id":"h065","rule":"fold_select"}
+{"id":"h066","rule":"fold"}
+{"id":"h067","rule":"dce"}
 {"id":"s1","rule":"allocate_slots"}

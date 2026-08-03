@@ -25,7 +25,7 @@ use super::rules::{
     mask_loop, merge_blocks,
     pin_builtin,
     promote_capture,
-    promote_cell, sink_store, speculate, speculate_region,
+    promote_cell, sink_store, speculate, speculate_region, split_call,
 };
 use crate::ir::LocalId;
 use super::validate::{validate_function, validate_program};
@@ -346,6 +346,23 @@ pub enum Rule {
         /// the conditional branch on it.
         head: String,
     },
+    /// Duplicate a dynamic call under a two-way case split on
+    /// `on == load(get_global(global))`, so each copy can be pinned by its
+    /// own `assert_closure` and inlined. Semantically neutral by itself:
+    /// both arms perform the original call, and the discriminating branch
+    /// is a pure per-state-uniform pointer compare. The premises live in
+    /// the `inline` entries that follow, one per arm.
+    SplitCall {
+        #[serde(rename = "fn")]
+        function: String,
+        /// The `call` instruction, as `%N`.
+        at: String,
+        /// The discriminant local, as `%N` - e.g. the object's type
+        /// pointer.
+        on: String,
+        /// The global whose value the discriminant is compared against.
+        global: String,
+    },
     /// Collapse a sentinel-bounded loop whose real exit is an in-body
     /// `#tbl < i` break - the inlined `foreach`/`del` shape - guarded by
     /// runtime asserts that iteration 1 does not break and iteration 2
@@ -390,6 +407,7 @@ impl Rule {
             Rule::CollapseLoop { .. } => "collapse_loop",
             Rule::CollapseBreakLoop { .. } => "collapse_break_loop",
             Rule::AssumeEq { .. } => "assume_eq",
+            Rule::SplitCall { .. } => "split_call",
         }
     }
 }
@@ -599,6 +617,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::AssumeEq { function, a, b } => {
             assume_eq::apply(program, function, parse_cell(a)?, parse_cell(b)?)
         }
+        Rule::SplitCall { function, at, on, global } => {
+            split_call::apply(program, function, parse_cell(at)?, parse_cell(on)?, global)
+        }
         Rule::Inline { function, at, callee, captures } => inline::apply(
             program,
             &entry.id,
@@ -717,6 +738,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         }
         Rule::AssumeEq { function, a, b } => {
             assume_eq::verify(&before, program, function, parse_cell(a)?, parse_cell(b)?)
+        }
+        Rule::SplitCall { function, at, on, global } => {
+            split_call::verify(&before, program, function, parse_cell(at)?, parse_cell(on)?, global)
         }
         Rule::Inline { function, at, callee, captures } => inline::verify(
             &before,
