@@ -1164,6 +1164,29 @@ machinery measured against its task" for the numbers. Summary:
   detection cheaper than per-row hashing, `expand` as an O(1) top-level
   variable) are what actually move it.
 
+### The remaining split sites, each read to its condition (2026-08-03)
+
+Task #46's premise ("convert the non-btn sites with existing
+machinery") did not survive inspection. The 11 sites, 368 split
+executions per 34-frame run:
+
+| site | branches on | splits | verdict |
+|---|---|---|---|
+| btn diamonds x6 (incl. `in_k030_cont`, previously misread as "tile data" - its terminator is the btn(k_jump) concretization) | `__button_states[k]` unknown | 284 | expansion or nothing |
+| `in_i1_074_cont` | `dash_time > 0` | 84 | gates the *whole movement section*; the else side contains the dash gate and btn diamonds - no SESE region, masking pays both long paths for all lanes |
+| `and_or_join_126` | dash gate (`dash and djump>0`) | 18 | btn-in-arm; the masked variant is the old g162, measured 2.41 s |
+| `__main` freeze x2 | `freeze > 0` | 27 | arm skips the *entire frame update*; masking means running the frame for frozen lanes |
+| `a61 __entry` | `spd.x~=0 or spd.y~=0` | 9 | gates the whole `move()` region (the unrolled pixel loops); small count |
+
+Every remaining split is either a btn concretization or a *productive*
+gate - it separates lanes that genuinely execute very different amounts
+of work, and if-converting it means paying both sides for every lane,
+the exact trade g162 already measured at ~3x. Under the flat-lane
+representation there is nothing left to convert profitably; these sites
+too only become free under lane expansion with a representation where
+skipped work is cheap (masked-out lanes that cost nothing, or
+hierarchical sharing). Task #46 closed as investigated-empty.
+
 ### Later: `assume_eq`, whole-function field promotion
 
 `assume_eq` handles pointers that reach one cell by different paths, which CSE
