@@ -837,4 +837,10 @@
 {"id":"h065","rule":"fold_select"}
 {"id":"h066","rule":"fold"}
 {"id":"h067","rule":"dce"}
+{"fn":"anonymous_61","head":"in_k1000_for_head_472","id":"h068","rule":"unroll_loop"}
+{"fn":"anonymous_61","head":"in_k1001_for_head_487","id":"h069","rule":"unroll_loop"}
+{"id":"h070","rule":"merge_blocks"}
+{"forward":true,"id":"h071","rule":"cse"}
+{"id":"h072","rule":"fold_select"}
+{"id":"h073","rule":"dce"}
 {"id":"s1","rule":"allocate_slots"}

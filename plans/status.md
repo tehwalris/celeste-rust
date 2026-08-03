@@ -1,6 +1,6 @@
 # Status (2026-08)
 
-Branch `rewrite`. Build is warning-free, 368 lib tests pass, working tree
+Branch `rewrite`. Build is warning-free, 376 lib tests pass, working tree
 clean.
 
 ## Measured, frame 34 (the standard iteration benchmark)
@@ -1024,6 +1024,45 @@ for reduces to a singleton premise that one runtime guard can state.
   callbacks into `__frame`. The dead `in_k1039_cont` split (30)
   survives because its branch is on tile data, not the collide result;
   it falls with the dash-gate endgame.
+
+## Stage P: unroll the pixel loops instead of promoting fields (2026-08-03)
+
+The field-promotion recon inverted the plan. A weighted census of the
+hot path showed the residual heap cost concentrated in the pixel-move
+loops: `self.check`/`.collide`/`.hitbox.*`/`objects`/`count` re-loaded
+once per iteration (61-65 weighted loads each), killed not by any real
+invalidation but by the back edge - `cse` forward is deliberately
+block-local (the 33->47-slots lesson), and the classic cross-block mode
+fences every load at every store. Rather than build a cross-block alias
+analysis or a phi-inserting promoter, remove the back edges: the loops
+were already masked to uniform trip counts (`mask_loop`, stage K), so
+they unroll *statically*.
+
+* **`unroll_loop`** (built, 2 sites landed): counted loop with constant
+  init/step/bound -> N renamed copies of head + linear body chain, phi
+  values threaded copy to copy, exit phis retargeted to the last head
+  copy. No runtime guard: the trip count is simulated in the
+  interpreter's fixed-point arithmetic, and `verify` re-simulates it
+  independently, then re-derives every copy through an incrementally
+  built id bijection. Refuses non-linear bodies, phis in the chain,
+  loop-defined values used outside, trip counts over 64.
+* Applied to `in_k1000`/`in_k1001` (9 iterations each); the four cold
+  candidates (`__frame`/`__init`/`__reset_button_states`/
+  `title_screen`) stay rolled. Then `merge_blocks` (402 fusions) turned
+  each region into one straight-line block and the existing block-local
+  `cse forward` swept 1,682 instructions; `fold_select` + `dce` mopped
+  up.
+* Measured (interleaved A/B): 0.93 -> 0.88-0.89 s at 34, 3.73-3.84 ->
+  3.65-3.75 s at 37, lanes identical. **K unrolled 5784 -> 3808
+  (-34%)**; mean executed instructions per lane-frame 2416 -> 1695;
+  reached blocks 240 -> 135. Identical through 34 and 37.
+* **Next**: `dedup_guards` - guard is now 18.1% of K (690 weighted) and
+  visibly duplicated in the merged blocks (`assert_closure` pairs on
+  the same SSA value). An assert dominated by an identical assert on
+  the same operands is redundant unconditionally (asserts read only
+  immutable SSA values - except `assert_value_cell`, which reads a
+  cell and is excluded). Then constant-arithmetic `fold` backed by
+  `op.rs` differential tests, for the unrolled counter chains.
 
 ### Later: `assume_eq`, whole-function field promotion
 

@@ -44,6 +44,7 @@ not comparable.
 | + 16 `assume_eq` + pointer folds: every object-table check returns nil | 0.92-0.94 s / 0.47 GB | 3.85 s / 1.71 GB |
 | + 4 `collapse_break_loop` (the `foreach`/`del` sentinel loops) | 0.93 s / 0.46 GB | 3.77-3.91 s / 1.62 GB |
 | + `split_call` + both update arms inlined (no dispatch left) | 0.94-0.96 s / 0.47 GB | 3.88-3.90 s / 1.65 GB |
+| + 2 `unroll_loop` (pixel-move loops flat) + `merge_blocks` + `cse` forward | 0.88-0.89 s / 0.46 GB | 3.65-3.75 s / 1.65 GB |
 
 The store-triangle row is the first change that moved the fragment count: 558
 -> 335 mean fragments per frame at frame 34, split executions 19573 -> 11978.
@@ -420,6 +421,49 @@ Frame 40 milestone: **17.53 s / 5.30 GB** (948,319 lanes; previous
 milestone 18.82 / 5.47). K unrolled 5801 -> 5784; `anonymous_61` is now
 84.5% of K and `player.update_21` is no longer a function the frame
 calls. Differentially identical through 34 and 37 at every step.
+
+### `unroll_loop`: the pixel-move loops laid flat (2026-08-03)
+
+Census work first: of the 869 weighted loads per worst-case frame, the
+heaviest cells (`self.check`/`.collide`/`.hitbox.*`, `objects`, `count`)
+were re-loaded once per pixel-loop iteration - not because anything
+invalidated them, but because `cse`'s forward mode is deliberately
+block-local (the 33->47-slots lesson) and the classic cross-block mode
+treats every store as a fence for every load. The fix was not a smarter
+alias analysis; it was removing the back edges.
+
+`mask_loop` had already made the trip counts uniform (`i <= 8` on
+constants; the lane-varying `i <= amount` only feeds masked selects), so
+the new `unroll_loop` rule lays each loop out straight: N renamed copies
+of head + body chain, phi values threaded copy to copy. Nothing is
+guarded because nothing is assumed - the trip count is *simulated* from
+the constant init/step/bound in the interpreter's own fixed-point
+arithmetic, and `verify` re-simulates it independently, then walks the
+copies rebuilding the id bijection instruction by instruction. Applied
+to the two hot loops only (the cold candidates - `title_screen`'s 30
+iterations among them - stay rolled, per the cold-site discipline).
+
+After `merge_blocks`, each unrolled region is one straight-line block,
+and the *existing* block-local `cse` forward entry swept 1,682
+instructions of re-derived stanzas - exactly the reach the live-slot
+lesson said not to buy with cross-block liveness.
+
+Numbers (interleaved A/B, same binary, 3 pairs each):
+
+* frame 34: 0.93 -> 0.88-0.89 s (-4.5%), lanes identical (92,713)
+* frame 37: 3.73-3.84 -> 3.65-3.75 s (-2%), lanes identical (269,059)
+* K fully unrolled: 5784 -> **3808** (-34%); per-lane per-frame
+  executed instructions mean 2416 -> 1695, max 5152 -> 3201
+* reached (function, block) pairs: 240 -> 135
+* K by kind: heap 37.7% -> 34.4% (2182 -> 1311 absolute), guard now
+  18.1% (690 absolute, unchanged - duplicated asserts are the next
+  target), arith 23.9%, const+global 14.3%
+
+Program grew 18,620 -> 18,883 instructions (the 18 copies minus the
+sweep) while the hot path shrank by a third. `fold` found nothing to do
+afterwards because constant arithmetic folding is still deliberately
+unimplemented (needs `op.rs`-differential testing); the unrolled counter
+chains (`0+1`, `1+1`, ...) are what it would eat.
 
 ## Where the time goes
 

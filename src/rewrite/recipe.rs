@@ -25,7 +25,7 @@ use super::rules::{
     mask_loop, merge_blocks,
     pin_builtin,
     promote_capture,
-    promote_cell, sink_store, speculate, speculate_region, split_call,
+    promote_cell, sink_store, speculate, speculate_region, split_call, unroll_loop,
 };
 use crate::ir::LocalId;
 use super::validate::{validate_function, validate_program};
@@ -375,6 +375,17 @@ pub enum Rule {
         /// The sentinel loop header.
         head: String,
     },
+    /// Replace a counted loop whose trip count is statically known (constant
+    /// init, step and bound on the branch-deciding counter - the shape
+    /// `mask_loop` leaves behind) with that many renamed copies of its body,
+    /// laid out in a straight line. Purely a renaming plus an independently
+    /// re-simulated trip count; no runtime guard is needed.
+    UnrollLoop {
+        #[serde(rename = "fn")]
+        function: String,
+        /// The loop header.
+        head: String,
+    },
 }
 
 impl Rule {
@@ -406,6 +417,7 @@ impl Rule {
             Rule::ConvertAssert { .. } => "convert_assert",
             Rule::CollapseLoop { .. } => "collapse_loop",
             Rule::CollapseBreakLoop { .. } => "collapse_break_loop",
+            Rule::UnrollLoop { .. } => "unroll_loop",
             Rule::AssumeEq { .. } => "assume_eq",
             Rule::SplitCall { .. } => "split_call",
         }
@@ -614,6 +626,7 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::CollapseBreakLoop { function, head } => {
             collapse_break_loop::apply(program, function, head)
         }
+        Rule::UnrollLoop { function, head } => unroll_loop::apply(program, function, head),
         Rule::AssumeEq { function, a, b } => {
             assume_eq::apply(program, function, parse_cell(a)?, parse_cell(b)?)
         }
@@ -735,6 +748,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         }
         Rule::CollapseBreakLoop { function, head } => {
             collapse_break_loop::verify(&before, program, function, head)
+        }
+        Rule::UnrollLoop { function, head } => {
+            unroll_loop::verify(&before, program, function, head)
         }
         Rule::AssumeEq { function, a, b } => {
             assume_eq::verify(&before, program, function, parse_cell(a)?, parse_cell(b)?)

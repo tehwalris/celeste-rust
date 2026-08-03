@@ -65,7 +65,7 @@ enum Command {
         /// "if-convert", "demote-create", "pin-builtin", "convert-ternary",
         /// "decompose-truthy", "speculate", "speculate-region", "sink-store",
         /// "absorb-stores", "expand-bool", "convert-assert",
-        /// "collapse-loop" or "collapse-break-loop".
+        /// "collapse-loop", "collapse-break-loop" or "unroll-loop".
         #[arg(default_value = "promote-cell")]
         what: String,
         /// Prefix for the generated ids.
@@ -892,6 +892,32 @@ fn main() -> Result<()> {
                         "# Each claims the break fires on iteration 2 - the singleton \
                          table premise again. Apply only where the loop executes \
                          (measure_k --blocks); screen at full depth."
+                    );
+                }
+                "unroll-loop" => {
+                    let candidates =
+                        celeste_rust::rewrite::rules::unroll_loop::candidates(&program);
+                    for (i, (function, head, trip_count)) in candidates.iter().enumerate() {
+                        eprintln!("# {} runs {} time(s)", head.as_str(), trip_count);
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "id": format!("{}{:03}", prefix, i),
+                                "rule": "unroll_loop",
+                                "fn": function,
+                                "head": head.as_str(),
+                            })
+                        );
+                    }
+                    eprintln!(
+                        "# {} counted loop(s) with a statically known trip count.",
+                        candidates.len()
+                    );
+                    eprintln!(
+                        "# Semantically neutral (the trip count is simulated, not \
+                         assumed), but each multiplies its body's instruction count; \
+                         apply only where the loop is hot and follow with \
+                         merge_blocks + cse forward + dce."
                     );
                 }
                 "promote-capture" => {
