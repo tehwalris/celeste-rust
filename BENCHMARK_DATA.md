@@ -170,6 +170,25 @@ downstream branches disappear entirely, i.e. as a package with masking every
 consumer of the expanded value. The entries were reverted; the machinery
 (instruction, both rules, differential result) is kept and tested.
 
+### The `__assert` diamonds are gone - structural, time-neutral (2026-08-03)
+
+`convert_assert` (entries `g091`-`g115` + a `dce` at `g116`) replaced all 25
+inlined `__assert` failure diamonds - `%n = not %cond; br %n ? <print+error
+subgraph> : join` - with a straight-line `assert_true %cond`. Every path
+through such a subgraph calls `error`, which aborts the run exactly like a
+failing `assert_true`, and `not` hard-errors on non-bools, so there is no
+truthiness gap; the differential run is identical through 34 and 37.
+
+Measured A/B on the same binary, 34 and 37 frames, 2-3 runs each: **neutral
+within noise** (1.36-1.39 s / ~0.50 GB at 34 both ways; 5.71-5.79 s /
+1.66-1.72 GB at 37 both ways; lanes and fragments identical). Expected: the
+branches were uniform and never taken, so the interpreter never spent time
+in them. What the change buys is structural: 1722 -> 1622 blocks and
+17287 -> 16787 instructions, and - the point - the assert diamonds no
+longer sit as branches between every `btn` call and its concretization, so
+region speculation can cross them (`assert_true` is speculatable). This is
+step 1 of the dash package in plans/status.md.
+
 ## Where the time goes
 
 `rewrite bench --frames 34 --profile`, on the current recipe. Self time, so the

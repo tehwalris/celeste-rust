@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use super::program::Program;
 use super::rules::{
-    absorb_stores, allocate_slots, convert_ternary, cse, dce, decompose_branch, decompose_truthy,
-    demote_create,
+    absorb_stores, allocate_slots, convert_assert, convert_ternary, cse, dce, decompose_branch,
+    decompose_truthy, demote_create,
     expand_bool, fold, fold_reflexive, fuse_breaks, if_convert, inline, mask_loop, merge_blocks,
     pin_builtin,
     promote_capture,
@@ -284,6 +284,17 @@ pub enum Rule {
         /// The block whose conditional branch is removed.
         head: String,
     },
+    /// Replace an inlined `__assert` failure diamond (`if not cond then
+    /// __print(...) ... error(...) end`) with a single `assert_true` on the
+    /// condition. Every path through the diamond aborts the run, exactly
+    /// like a failing assert, so only the branch disappears - a uniform,
+    /// never-taken branch that still blocked speculation.
+    ConvertAssert {
+        #[serde(rename = "fn")]
+        function: String,
+        /// The block whose conditional branch into the diamond is removed.
+        head: String,
+    },
 }
 
 impl Rule {
@@ -311,6 +322,7 @@ impl Rule {
             Rule::PromoteCell { .. } => "promote_cell",
             Rule::DecomposeBranch { .. } => "decompose_branch",
             Rule::ExpandBool { .. } => "expand_bool",
+            Rule::ConvertAssert { .. } => "convert_assert",
         }
     }
 }
@@ -511,6 +523,7 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
             decompose_branch::apply(program, function, parse_cell(at)?)
         }
         Rule::ExpandBool { function, head } => expand_bool::apply(program, function, head),
+        Rule::ConvertAssert { function, head } => convert_assert::apply(program, function, head),
         Rule::Inline { function, at, callee, captures } => inline::apply(
             program,
             &entry.id,
@@ -605,6 +618,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         }
         Rule::ExpandBool { function, head } => {
             expand_bool::verify(&before, program, function, head)
+        }
+        Rule::ConvertAssert { function, head } => {
+            convert_assert::verify(&before, program, function, head)
         }
         Rule::Inline { function, at, callee, captures } => inline::verify(
             &before,

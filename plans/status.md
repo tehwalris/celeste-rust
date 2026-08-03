@@ -1,6 +1,6 @@
 # Status (2026-08)
 
-Branch `rewrite`. Build is warning-free, 365 tests pass, working tree clean.
+Branch `rewrite`. Build is warning-free, 375 tests pass, working tree clean.
 
 ## Measured, frame 34 (the standard iteration benchmark)
 
@@ -894,9 +894,21 @@ reverted, the machinery kept.
 
 What the package needs, in order, for the dash arm alone:
 
-1. An `__assert`-diamond-to-`assert_true` rule: the inlined range asserts
-   are uniform branches full of `error`/`__print` calls, and they are what
-   blocks region speculation across the k_down evaluation.
+1. **DONE (2026-08-03):** `convert_assert` replaces an inlined `__assert`
+   failure diamond with a straight-line `assert_true` on the condition.
+   Sound with no gap: every path through the diamond calls `error` (a hard
+   abort, like a failing assert), empty branch edges are dropped, and `not`
+   itself hard-errors on non-bools, so original and rewrite agree on every
+   input class - the one syntactic premise (the `error` global is never
+   rebound) can only turn silent survival into loud failure. Applied at all
+   25 sites (entries g091-g115; g116 `dce` sweeps the 25 now-dead message
+   nils): 1722 -> 1622 blocks, 17287 -> 16787 instructions, differentially
+   identical through 34 and 37, time-neutral at both depths (the branches
+   were uniform and never taken - the win is that `assert_true` is
+   speculatable, so the asserts no longer block region speculation across
+   the `btn` evaluations). The 26th diamond is `btn_4`'s first assert,
+   which lives in the unnamed entry block a pointed rule cannot name;
+   `btn_4` is the cold non-inlined copy, so it stays.
 2. An opt-in for `expand` + the concretization store inside a masked
    region (`is_speculatable` refuses `expand` by design: on lanes that
    would have skipped the arm it doubles lanes nobody asked for - the cell

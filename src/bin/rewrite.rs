@@ -64,7 +64,7 @@ enum Command {
         /// What to look for: "promote-cell", "promote-capture", "inline",
         /// "if-convert", "demote-create", "pin-builtin", "convert-ternary",
         /// "decompose-truthy", "speculate", "speculate-region", "sink-store",
-        /// "absorb-stores" or "expand-bool".
+        /// "absorb-stores", "expand-bool" or "convert-assert".
         #[arg(default_value = "promote-cell")]
         what: String,
         /// Prefix for the generated ids.
@@ -817,6 +817,30 @@ fn main() -> Result<()> {
                         "# Each becomes lane expansion. Convert together with masking \
                          its consumers; expansion alone just moves the split. Screen \
                          at full depth."
+                    );
+                }
+                "convert-assert" => {
+                    let candidates =
+                        celeste_rust::rewrite::rules::convert_assert::candidates(&program);
+                    for (i, (function, head)) in candidates.iter().enumerate() {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "id": format!("{}{:03}", prefix, i),
+                                "rule": "convert_assert",
+                                "fn": function,
+                                "head": head.as_str(),
+                            })
+                        );
+                    }
+                    eprintln!(
+                        "# {} inlined `__assert` failure diamond(s) - uniform \
+                         never-taken branches into print + error.",
+                        candidates.len()
+                    );
+                    eprintln!(
+                        "# Each becomes a straight-line `assert_true`. Safe to apply \
+                         everywhere; screen at full depth anyway."
                     );
                 }
                 "promote-capture" => {

@@ -25,6 +25,7 @@ use super::program::Program;
 
 pub mod absorb_stores;
 pub mod allocate_slots;
+pub mod convert_assert;
 pub mod convert_ternary;
 pub mod if_convert;
 pub mod fold;
