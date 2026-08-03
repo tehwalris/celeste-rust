@@ -25,12 +25,14 @@ use super::program::Program;
 
 pub mod absorb_stores;
 pub mod allocate_slots;
+pub mod assume_eq;
 pub mod collapse_loop;
 pub mod convert_assert;
 pub mod convert_ternary;
 pub mod if_convert;
 pub mod fold;
 pub mod fold_reflexive;
+pub mod fold_select;
 pub mod fuse_breaks;
 pub mod cse;
 pub mod dce;

@@ -41,6 +41,7 @@ not comparable.
 | + 9 `pin_builtin`s, `cse` forward mode (block-local store forwarding) | 1.35 s / 0.50 GB | 5.56 s / 1.47 GB |
 | + interpreter micro-opts round 1 + `Arc`'d lane payloads (see below) | 1.03-1.04 s / 0.47 GB | 4.11-4.16 s / 1.65 GB |
 | + 16 `collapse_loop` (the `#objects` check/collide loops) | 1.02-1.03 s / 0.47 GB | 4.04 s / 1.66 GB |
+| + 16 `assume_eq` + pointer folds: every object-table check returns nil | 0.92-0.94 s / 0.47 GB | 3.85 s / 1.71 GB |
 
 The store-triangle row is the first change that moved the fragment count: 558
 -> 335 mean fragments per frame at frame 34, split executions 19573 -> 11978.
@@ -342,6 +343,46 @@ prerequisite for asserting `objects[1] == <the object being updated>`
 (`assume_eq`) and folding the `o ~= obj` term that makes every such
 check return nil in this room. Differentially identical through 34 and
 37; lanes identical.
+
+### `assume_eq` + pointer folds: the checks fold to nil (2026-08-03)
+
+The cash-in. Three pieces, each independently verified:
+
+* **`assume_eq`** (new pointed rule): `%g = b == a; assert_true %g`
+  right after `b`'s definition, then every other use of `b` becomes `a`.
+  16 sites - in each collapsed body, the loaded `objects[1]` is asserted
+  equal to the object being updated (`%2`). The premise is the singleton
+  table again, stated per site, checked per lane.
+* **`fold_reflexive`, pointer families** (opt-in `"pointers": true`):
+  `x ==/~= x` with a dominating pointer witness (a `get_field` receiver,
+  an `assert_pointer`...), `nil` against `nil`, witnessed pointer against
+  `nil`. The witness is load-bearing: `==` is *not* reflexive in the
+  abstract semantics (`UnknownBool == UnknownBool` is `UnknownBool`,
+  `NumberInterval == anything` is `false`, even itself). The opt-in is
+  load-bearing too - extending the rule in place changed what the g043
+  entry folded and broke replay of everything after it, which is exactly
+  why the doc said to keep such rules apart.
+* **`fold_select`** (new bulk rule): static truthiness by def-chain
+  fixpoint. `a and b` compiles to `select a ? b : a`, so once
+  `assume_eq` makes one link a constant `false`, the whole chain is
+  falsy - but never constant. The rule classifies falsy/truthy through
+  the `and`/`or` select shapes, resolves selects on classified
+  conditions to the arm they must produce, and folds branches on
+  classified conditions to the edge they must take.
+
+The chain in every collapsed check body: `o ~= obj` folds false, the
+select cascade goes falsy, the early-exit branch folds, the found-object
+phi collapses to nil, `nil ~= nil` folds, and dce sweeps the lot - 829
+instructions in the first round, 891 with the second (16755 -> 15896).
+
+    before   34f: 1.02-1.03 s / 0.47 GB    37f: 4.04 s / 1.66 GB
+    after    34f: 0.92-0.94 s / 0.47 GB    37f: 3.85 s / 1.71 GB
+    K unrolled 9226 -> 5801, K static 3767 -> 2934
+
+K unrolled is down 39% on the day (9546 this morning). Splits are
+unchanged (505 across the same 11 sites) - this stage removed
+computation, not branches; branch *executions* fell 10892 -> 6518.
+Differentially identical through 34 and 37; lanes identical throughout.
 
 ## Where the time goes
 

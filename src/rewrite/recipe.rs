@@ -17,10 +17,11 @@ use serde::{Deserialize, Serialize};
 
 use super::program::Program;
 use super::rules::{
-    absorb_stores, allocate_slots, collapse_loop, convert_assert, convert_ternary, cse, dce,
-    decompose_branch,
+    absorb_stores, allocate_slots, assume_eq, collapse_loop, convert_assert, convert_ternary,
+    cse, dce, decompose_branch,
     decompose_truthy, demote_create,
-    expand_bool, fold, fold_reflexive, fuse_breaks, if_convert, inline, mask_loop, merge_blocks,
+    expand_bool, fold, fold_reflexive, fold_select, fuse_breaks, if_convert, inline,
+    mask_loop, merge_blocks,
     pin_builtin,
     promote_capture,
     promote_cell, sink_store, speculate, speculate_region,
@@ -69,7 +70,19 @@ pub enum Rule {
     /// A comparison of a number constant with itself becomes the constant
     /// reflexivity dictates. Kept apart from `fold` so older `fold` entries
     /// replay byte-identically.
-    FoldReflexive,
+    FoldReflexive {
+        /// Opt-in for the pointer families: witnessed-pointer reflexive
+        /// equality, nil against nil, witnessed pointer against nil.
+        /// Off by default so entries written before these existed keep
+        /// replaying byte-identically.
+        #[serde(default, skip_serializing_if = "is_false")]
+        pointers: bool,
+    },
+    /// Resolve selects and branches whose condition's truthiness is static:
+    /// an `and` chain poisoned by a constant `false` is falsy all the way
+    /// down, whatever the opaque links hold. Kept apart from `fold` for the
+    /// same replay reason.
+    FoldSelect,
     /// Splice a callee's body into one call site, guarded by an
     /// `assert_closure`.
     Inline {
@@ -304,6 +317,20 @@ pub enum Rule {
         /// The block whose conditional branch into the diamond is removed.
         head: String,
     },
+    /// State that two locals hold the same value - `%g = b == a;
+    /// assert_true %g` right after `b`'s definition - and replace every
+    /// other use of `b` with `a`. For equalities no local analysis can see:
+    /// the object read back out of the singleton table is the object being
+    /// updated. The premise is checked on every lane of every execution and
+    /// fails loudly. Screen at full depth.
+    AssumeEq {
+        #[serde(rename = "fn")]
+        function: String,
+        /// The local that survives, as `%N`. Must dominate `b`.
+        a: String,
+        /// The local that is replaced, as `%N`.
+        b: String,
+    },
     /// Collapse a counted loop to one guarded execution of its body: a loud
     /// `assert_true(bound == init)` in the preheader states that the trip
     /// count is exactly one, the counter is replaced by its initial value,
@@ -328,7 +355,8 @@ impl Rule {
             Rule::AllocateSlots => "allocate_slots",
             Rule::MergeBlocks => "merge_blocks",
             Rule::Fold => "fold",
-            Rule::FoldReflexive => "fold_reflexive",
+            Rule::FoldReflexive { .. } => "fold_reflexive",
+            Rule::FoldSelect => "fold_select",
             Rule::Inline { .. } => "inline",
             Rule::IfConvert { .. } => "if_convert",
             Rule::PromoteCapture { .. } => "promote_capture",
@@ -347,6 +375,7 @@ impl Rule {
             Rule::ExpandBool { .. } => "expand_bool",
             Rule::ConvertAssert { .. } => "convert_assert",
             Rule::CollapseLoop { .. } => "collapse_loop",
+            Rule::AssumeEq { .. } => "assume_eq",
         }
     }
 }
@@ -509,7 +538,8 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::AllocateSlots => allocate_slots::apply(program),
         Rule::MergeBlocks => merge_blocks::apply(program),
         Rule::Fold => fold::apply(program),
-        Rule::FoldReflexive => fold_reflexive::apply(program),
+        Rule::FoldReflexive { pointers } => fold_reflexive::apply(program, *pointers),
+        Rule::FoldSelect => fold_select::apply(program),
         Rule::IfConvert { function, join } => if_convert::apply(program, function, join),
         Rule::PromoteCapture { function, index } => {
             promote_capture::apply(program, function, *index)
@@ -549,6 +579,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::ExpandBool { function, head } => expand_bool::apply(program, function, head),
         Rule::ConvertAssert { function, head } => convert_assert::apply(program, function, head),
         Rule::CollapseLoop { function, head } => collapse_loop::apply(program, function, head),
+        Rule::AssumeEq { function, a, b } => {
+            assume_eq::apply(program, function, parse_cell(a)?, parse_cell(b)?)
+        }
         Rule::Inline { function, at, callee, captures } => inline::apply(
             program,
             &entry.id,
@@ -598,7 +631,10 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::AllocateSlots => allocate_slots::verify(&before, program),
         Rule::MergeBlocks => merge_blocks::verify(&before, program),
         Rule::Fold => fold::verify(&before, program),
-        Rule::FoldReflexive => fold_reflexive::verify(&before, program),
+        Rule::FoldReflexive { pointers } => {
+            fold_reflexive::verify(&before, program, *pointers)
+        }
+        Rule::FoldSelect => fold_select::verify(&before, program),
         Rule::IfConvert { function, join } => {
             if_convert::verify(&before, program, function, join)
         }
@@ -658,6 +694,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         }
         Rule::CollapseLoop { function, head } => {
             collapse_loop::verify(&before, program, function, head)
+        }
+        Rule::AssumeEq { function, a, b } => {
+            assume_eq::verify(&before, program, function, parse_cell(a)?, parse_cell(b)?)
         }
         Rule::Inline { function, at, callee, captures } => inline::verify(
             &before,

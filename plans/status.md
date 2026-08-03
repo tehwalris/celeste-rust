@@ -1,6 +1,6 @@
 # Status (2026-08)
 
-Branch `rewrite`. Build is warning-free, 344 lib tests pass, working tree
+Branch `rewrite`. Build is warning-free, 359 lib tests pass, working tree
 clean.
 
 ## Measured, frame 34 (the standard iteration benchmark)
@@ -27,6 +27,7 @@ clean.
 | + interpreter micro-opts (lazy spans, columnar dedup hash, gather filter, map2) | 1.13 s | 0.47 GB |
 | + `Arc`'d lane payloads (clone = refcount bump) | 1.03 s | 0.47 GB |
 | + 16 `collapse_loop` (the `#objects` singleton check/collide loops) | 1.02 s | 0.47 GB |
+| + 16 `assume_eq` + pointer folds (every object-table check folds to nil) | 0.93 s | 0.47 GB |
 
 Lane count is identical throughout (92,713), which is the first thing to check
 when a rewrite claims a win. Frame 37 confirms the same ratios (7.87 s, from
@@ -988,14 +989,26 @@ for reduces to a singleton premise that one runtime guard can state.
   `for i=1,32767` with an in-body `#tbl < i` break - the guard compared
   `32767 == 1` and fired on frame 1. They need a "first iteration
   always breaks" collapse, not this one.
-* **Next, in order**: `assume_eq` (below) to state
-  `objects[1] == <the updated object>` and fold the `o ~= obj` term -
-  in this room every object-table `check`/`collide` then returns nil
-  constantly, and the `in_k1039_cont` wall-jump residue plus most of the
-  16 collapsed bodies fold away. Then the `foreach`/`del` collapse, then
+* **`assume_eq` + pointer folds** (built, landed): `assume_eq` states
+  `objects[1] == <the updated object>` per collapsed body (16 sites);
+  `fold_reflexive` gained opt-in pointer families (witnessed-pointer
+  reflexivity, nil-nil, pointer-nil - the witness matters because `==`
+  is not reflexive abstractly: `UnknownBool == UnknownBool` is
+  `UnknownBool`, `NumberInterval == anything` is `false`); the new
+  `fold_select` propagates static truthiness through the `and`/`or`
+  select shapes and folds the branches. Every object-table check in the
+  room folds to nil; dce swept 891 instructions. 4.04 -> 3.85 s at 37,
+  0.92-0.94 s at 34, K unrolled 9226 -> 5801 (-39% on the day). One
+  history lesson re-learned: extending `fold_reflexive` in place changed
+  what g043 folded and broke replay downstream - new fold behavior goes
+  behind an entry-level opt-in, always.
+* **Next**: the `foreach`/`del` sentinel-loop collapse (their bound is
+  `32767` with an in-body `#tbl < i` break, so they need a
+  "first-iteration-breaks" argument, not `bound == init`), then
   devirtualizing `obj.type.update` (a 2-way uniform dispatch,
   player_spawn vs player), which is what stands between `anonymous_61`
-  (64% of K) and straight-line code.
+  and straight-line code. The dead `in_k1039_cont` split (30) survives
+  because its branch is on tile data, not the collide result.
 
 ### Later: `assume_eq`, whole-function field promotion
 
