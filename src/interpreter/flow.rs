@@ -261,23 +261,23 @@ impl<'a> BoundInterpreterFlow<'a> {
                 Value::Bool(MaybeVector::Vector(bool_vector)) => {
                     let condition_target = *condition_from_flow_edge;
 
-                    // Build a mask for lanes matching this condition
-                    let condition_mask: Vec<bool> = bool_vector
+                    // One pass: the kept lane indices directly, no
+                    // intermediate mask to build, count and re-scan.
+                    let kept: Vec<u32> = bool_vector
                         .iter()
-                        .map(|v| *v == condition_target)
+                        .enumerate()
+                        .filter_map(|(i, v)| (*v == condition_target).then_some(i as u32))
                         .collect();
 
-                    let matching_count = condition_mask.iter().filter(|&&b| b).count();
-
-                    if matching_count == 0 {
+                    if kept.is_empty() {
                         Ok(FlowData::States(vec![]))
-                    } else if matching_count == state.vector_size {
+                    } else if kept.len() == state.vector_size {
                         // ALL lanes go this direction - no filtering needed
                         Ok(FlowData::States(vec![state]))
                     } else {
                         // Mixed: filter the state immediately
-                        let new_state =
-                            state.filter_by_mask(&condition_mask, crate::interpreter::state::FILTER_BRANCH);
+                        let new_state = state
+                            .filter_by_kept(&kept, crate::interpreter::state::FILTER_BRANCH);
                         Ok(FlowData::States(vec![new_state]))
                     }
                 }

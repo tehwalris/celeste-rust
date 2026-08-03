@@ -158,6 +158,15 @@ impl State {
         self
     }
 
+    /// Filter to the lanes whose indices are listed (sorted ascending) in
+    /// `kept` - for callers that already know the kept set, so the mask is
+    /// never materialized or re-scanned.
+    pub fn filter_by_kept(mut self, kept: &[u32], reason: FilterReason) -> Self {
+        let _trace = TraceSpan::new(reason, "filter");
+        self.filter_by_kept_inner(kept);
+        self
+    }
+
     /// Filters all vector values in the state by a mask in place.
     /// The resulting state's vector_size will be the number of true values in the mask.
     fn filter_by_mask_in_place(&mut self, mask: &[bool], reason: FilterReason) {
@@ -170,16 +179,19 @@ impl State {
             .enumerate()
             .filter_map(|(i, &m)| m.then_some(i as u32))
             .collect();
+        self.filter_by_kept_inner(&kept);
+    }
 
+    fn filter_by_kept_inner(&mut self, kept: &[u32]) {
         // Filter values in heap - use optimized method that only clones vectors
-        self.heap.filter_vectors_in_place(&kept);
+        self.heap.filter_vectors_in_place(kept);
 
         // Filter values in local env - use optimized method
-        self.local_env.filter_vectors_in_place(&kept);
+        self.local_env.filter_vectors_in_place(kept);
 
         // Filter values in outer local envs
         for env in &mut self.outer_local_envs {
-            env.filter_vectors_in_place(&kept);
+            env.filter_vectors_in_place(kept);
         }
 
         self.vector_size = kept.len();
