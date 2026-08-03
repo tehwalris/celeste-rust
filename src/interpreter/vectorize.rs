@@ -219,20 +219,45 @@ fn vectorize_same_shape_states(states: Vec<State>) -> State {
     let first_state = &states[0];
     crate::merge_stats::record_concat(states.len(), first_state.heap.len());
 
-    // Build vectorized heap
+    // Build vectorized heap. Per-cell merges are independent, so large
+    // merges split the cells across threads; results are written back by id,
+    // so the outcome is order-independent and identical to sequential.
     let mut new_heap = Heap::new();
     for _ in 0..first_state.heap.len() {
         new_heap.alloc();
     }
 
-    for i in 0..first_state.heap.len() {
-        let id = HeapId::from_raw(i);
-        // Skip empty slots (allocated but never set)
-        if first_state.heap.get_opt(id).is_none() {
-            continue;
+    let ids: Vec<HeapId> = (0..first_state.heap.len())
+        .map(HeapId::from_raw)
+        .filter(|&id| first_state.heap.get_opt(id).is_some())
+        .collect();
+    let threads = merge_threads();
+    if total_vector_size < PARALLEL_ROW_THRESHOLD || threads == 1 {
+        for &id in &ids {
+            new_heap.set(id, merge_heap_values_from_states(&states, id));
         }
-        let merged_value = merge_heap_values_from_states(&states, id);
-        new_heap.set(id, merged_value);
+    } else {
+        let chunk = ids.len().div_ceil(threads);
+        let states_ref = &states;
+        let merged: Vec<Vec<(HeapId, HeapValue)>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = ids
+                .chunks(chunk)
+                .map(|id_chunk| {
+                    scope.spawn(move || {
+                        id_chunk
+                            .iter()
+                            .map(|&id| (id, merge_heap_values_from_states(states_ref, id)))
+                            .collect()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for chunk in merged {
+            for (id, value) in chunk {
+                new_heap.set(id, value);
+            }
+        }
     }
 
     // Build vectorized local_env
