@@ -1187,6 +1187,52 @@ too only become free under lane expansion with a representation where
 skipped work is cheap (masked-out lanes that cost nothing, or
 hierarchical sharing). Task #46 closed as investigated-empty.
 
+### Early-merge experiments: `add_hint` and `widen_buttons` (2026-08-03)
+
+Two new pointed rules (implemented, tested, and kept; their recipe
+entries are NOT landed - both placements measured as regressions).
+`add_hint` sets a block's `hint_normalize` flag - the interpreter
+already merges (vectorize + row-dedup) states arriving at flagged
+blocks, and the program's two existing hints both sit *before* the
+update body. `widen_buttons` inserts the in-place equivalent of
+`__reset_button_states()` at a block head (six fresh unknowns via plain
+`Call`s - deliberately not `CallBuiltin`, so `cse` can never collapse
+two independent unknowns). Interleaved A/B at 34, on top of the landed
+recipe (0.88-0.90 s, fragments 527 total / 86 max per frame):
+
+1. **Hint alone** at `in_h061_if_join_163` (after the dash arm
+   rejoins): fragments 281/38, time **+52%** (1.33-1.37 s).
+   Mid-frame, the concretized button cells still distinguish rows, so
+   the merge cannot drop lanes - it is a fourth full-population merge
+   pass plus wider vectors downstream, pure cost.
+2. **Widen + hint** (`widen_buttons` at `in_h061_if_join_103`, which
+   post-dominates all eight `btn` reads; hint at
+   `in_h061_and_or_join_219`): fragments **70 total / 6 max** - the
+   crush works, `player.draw` runs 26x instead of 279x - but time
+   **+110%** (1.88 s), memory +44%. The profile says why: the
+   mid-frame dedup removes only 67% of rows across 24 columns where
+   the boundary removes 89% across 17, because **`player.rem` is
+   still concrete per lane mid-frame** (`make_state_abstract` widens
+   it only at the boundary) - and the boundary dedup still runs
+   afterward. Two full-population dedups per frame, the second buying
+   nothing.
+
+Differentially identical through 34 in both variants (which also
+machine-checks `widen_buttons`' deadness claim: a live `btn` read
+after the widen would re-split on a fresh unknown and diverge).
+
+**The lesson**: the frame-boundary merge is cheap *because it
+coincides with all the widenings* - buttons and rem dead/abstracted at
+the same point is what makes 89% of rows collapse. An early merge only
+pays if *every* widening moves with it. The missing piece is a
+`widen_rem` (apply `make_state_abstract`'s rem interval at
+`if_join_103`, where rem is dead until next frame's `move`) - that
+would make the mid-frame merge the boundary merge, scheduled before
+the update tail and draw run, and the boundary a no-op. Needs an
+interval-producing builtin (`__widen_rem(v)`: assert containment,
+return the [-0.5, 0.5) interval) and care that `make_state_abstract`
+tolerates an already-widened rem. Sketched, not built.
+
 ### Later: `assume_eq`, whole-function field promotion
 
 `assume_eq` handles pointers that reach one cell by different paths, which CSE

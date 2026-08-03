@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use super::program::Program;
 use super::rules::{
-    absorb_stores, allocate_slots, assume_eq, collapse_break_loop, collapse_loop,
+    absorb_stores, add_hint, allocate_slots, assume_eq, collapse_break_loop, collapse_loop,
     convert_assert, convert_ternary,
     cse, dce, decompose_branch, dedup_guards,
     decompose_truthy, demote_create,
@@ -25,7 +25,7 @@ use super::rules::{
     mask_loop, merge_blocks,
     pin_builtin,
     promote_capture,
-    promote_cell, sink_store, speculate, speculate_region, split_call, unroll_loop,
+    promote_cell, sink_store, speculate, speculate_region, split_call, unroll_loop, widen_buttons,
 };
 use crate::ir::LocalId;
 use super::validate::{validate_function, validate_program};
@@ -392,6 +392,27 @@ pub enum Rule {
     /// dominated copy can never be the first to fire. `assert_value_cell`
     /// reads a heap cell and is excluded.
     DedupGuards,
+    /// Mark a block as an early normalize point: states arriving there are
+    /// accumulated, vectorized by shape, and row-deduped before execution
+    /// continues - the same merge the frame boundary performs, scheduled
+    /// earlier. Reduces fragments, not lanes; see the rule's docs.
+    AddHint {
+        #[serde(rename = "fn")]
+        function: String,
+        /// The block to flag.
+        block: String,
+    },
+    /// Insert the in-place equivalent of `__reset_button_states()` at the
+    /// head of a block: store a fresh unknown boolean into each of the six
+    /// `__button_states` cells. Sound only if every `btn` read of the frame
+    /// precedes the block - claimed, not proven; a violated claim diverges
+    /// from the original program and the differential screen catches it.
+    WidenButtons {
+        #[serde(rename = "fn")]
+        function: String,
+        /// The block whose head widens the cells.
+        block: String,
+    },
 }
 
 impl Rule {
@@ -425,6 +446,8 @@ impl Rule {
             Rule::CollapseBreakLoop { .. } => "collapse_break_loop",
             Rule::UnrollLoop { .. } => "unroll_loop",
             Rule::DedupGuards => "dedup_guards",
+            Rule::AddHint { .. } => "add_hint",
+            Rule::WidenButtons { .. } => "widen_buttons",
             Rule::AssumeEq { .. } => "assume_eq",
             Rule::SplitCall { .. } => "split_call",
         }
@@ -635,6 +658,8 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         }
         Rule::UnrollLoop { function, head } => unroll_loop::apply(program, function, head),
         Rule::DedupGuards => dedup_guards::apply(program),
+        Rule::AddHint { function, block } => add_hint::apply(program, function, block),
+        Rule::WidenButtons { function, block } => widen_buttons::apply(program, function, block),
         Rule::AssumeEq { function, a, b } => {
             assume_eq::apply(program, function, parse_cell(a)?, parse_cell(b)?)
         }
@@ -761,6 +786,10 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
             unroll_loop::verify(&before, program, function, head)
         }
         Rule::DedupGuards => dedup_guards::verify(&before, program),
+        Rule::AddHint { function, block } => add_hint::verify(&before, program, function, block),
+        Rule::WidenButtons { function, block } => {
+            widen_buttons::verify(&before, program, function, block)
+        }
         Rule::AssumeEq { function, a, b } => {
             assume_eq::verify(&before, program, function, parse_cell(a)?, parse_cell(b)?)
         }

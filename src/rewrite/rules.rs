@@ -24,6 +24,7 @@ use crate::ir::{Block, Cfg, FunDef, Instruction, Label, LocalId, Terminator};
 use super::program::Program;
 
 pub mod absorb_stores;
+pub mod add_hint;
 pub mod allocate_slots;
 pub mod assume_eq;
 pub mod collapse_break_loop;
@@ -53,6 +54,7 @@ pub mod speculate;
 pub mod split_call;
 pub mod speculate_region;
 pub mod unroll_loop;
+pub mod widen_buttons;
 
 /// Applies `f` to every function in the program, returning how many changes
 /// were made in total.
