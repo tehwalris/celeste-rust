@@ -246,8 +246,8 @@ branches and so cannot be a region today.
 ### Interpreter micro-optimization round 1 (2026-08-03)
 
 perf (`-g --call-graph dwarf` on `rewrite bench`, replay samples excluded)
-found three things the span profile could not see inside `dedup_state` and
-`filter_branch`. Three changes, each measured on 2-3 runs, differentially
+found what the span profile could not see inside `dedup_state` and
+`filter_branch`. Four changes, each measured on 2-3 runs, differentially
 identical through 34 and 37:
 
 1. **Lazy span names.** Every builtin and closure call `format!`ed its
@@ -264,12 +264,18 @@ identical through 34 and 37:
    list is now computed once and every vector gathers O(kept). ~5%. The
    dead owned-path (`Value::filter_vectors`) went with it.
 
+4. **One length check in `map2` instead of `zip_eq`'s check per
+   element.** The arithmetic inner loop (`interpret_binary_op`) pays a
+   branch per lane for an invariant the interpreter already guarantees;
+   asserting it once re-enables auto-vectorization. ~5%.
+
 | | 34 frames | 37 frames |
 |---|---|---|
 | before | 1.36-1.37 s, 0.50 GB | 5.74 s, 1.69 GB |
-| after | 1.17-1.21 s, 0.44 GB | 4.97-4.99 s, 1.63 GB |
+| after 1-3 | 1.17-1.21 s, 0.44 GB | 4.97-4.99 s, 1.63 GB |
+| after 1-4 | 1.11-1.14 s, ~0.48 GB | 4.47 s, 1.50 GB |
 
-**-12% at 34, -13% at 37**, memory slightly down, lanes identical.
+**-17% at 34, -22% at 37**, memory down, lanes identical throughout.
 
 **Tried and rejected: gc arena reuse.** gc clones every reachable heap
 value into a fresh arena per call; a rewrite re-indexed pointer-free

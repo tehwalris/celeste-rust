@@ -1,6 +1,5 @@
 use std::hash::BuildHasherDefault;
 
-use itertools::Itertools;
 use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
 
@@ -44,7 +43,11 @@ impl<T: std::fmt::Debug + Clone + PartialEq + Eq> MaybeVector<T> {
         match (a, b) {
             (MaybeVector::Scalar(a), MaybeVector::Scalar(b)) => MaybeVector::Scalar(f(a, b)),
             (MaybeVector::Vector(a), MaybeVector::Vector(b)) => {
-                MaybeVector::Vector(a.iter().zip_eq(b.iter()).map(|(a, b)| f(a, b)).collect())
+                // One length check up front instead of `zip_eq`'s check per
+                // element - this is the arithmetic inner loop, and the
+                // per-element branch blocks auto-vectorization.
+                assert_eq!(a.len(), b.len(), "map2 on vectors of different sizes");
+                MaybeVector::Vector(a.iter().zip(b.iter()).map(|(a, b)| f(a, b)).collect())
             }
             // Broadcast scalar to match vector size
             (MaybeVector::Scalar(a), MaybeVector::Vector(b)) => {
