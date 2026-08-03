@@ -266,32 +266,71 @@ impl Heap {
             self.compact();
         }
 
-        // Now build new base index, only updating entries that need transformation
+        // The gathering allocations (`filter_vectors_if_needed`) dominate, and
+        // they are independent per cell - large filters compute them across
+        // threads, then the storage pushes and index rebuild stay sequential.
+        // Identical outcome to the sequential loop.
+        const PARALLEL_KEPT_THRESHOLD: usize = 1 << 14;
+        let threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1)
+            .min(16);
+        let filtered: Vec<Option<HeapValue>> = if kept.len() < PARALLEL_KEPT_THRESHOLD
+            || threads == 1
+        {
+            (0..self.next_id)
+                .map(|id| {
+                    let idx = self.base_index.get(id).copied().unwrap_or(usize::MAX);
+                    if idx == usize::MAX {
+                        return None;
+                    }
+                    self.storage
+                        .get(idx)
+                        .expect("valid storage index")
+                        .filter_vectors_if_needed(kept)
+                })
+                .collect()
+        } else {
+            let chunk = self.next_id.div_ceil(threads);
+            let storage = &self.storage;
+            let base_index = &self.base_index;
+            let next_id = self.next_id;
+            let chunks: Vec<Vec<Option<HeapValue>>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..threads)
+                    .map(|t| {
+                        scope.spawn(move || {
+                            let start = t * chunk;
+                            let end = ((t + 1) * chunk).min(next_id);
+                            (start..end)
+                                .map(|id| {
+                                    let idx =
+                                        base_index.get(id).copied().unwrap_or(usize::MAX);
+                                    if idx == usize::MAX {
+                                        return None;
+                                    }
+                                    storage
+                                        .get(idx)
+                                        .expect("valid storage index")
+                                        .filter_vectors_if_needed(kept)
+                                })
+                                .collect()
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            chunks.into_iter().flatten().collect()
+        };
+
         let mut new_base = Vec::with_capacity(self.next_id);
-
-        for id in 0..self.next_id {
-            let old_storage_idx = if id < self.base_index.len() {
-                self.base_index[id]
-            } else {
-                usize::MAX
-            };
-
-            if old_storage_idx == usize::MAX {
-                new_base.push(usize::MAX);
-                continue;
-            }
-
-            let value = self.storage.get(old_storage_idx).expect("valid storage index");
-
-            // Check if this value needs transformation
-            if let Some(new_value) = value.filter_vectors_if_needed(kept) {
-                // Value was transformed - store the new value
-                // Use push_get_index for atomic index assignment
-                let new_storage_idx = self.storage.push_get_index(Box::new(new_value));
-                new_base.push(new_storage_idx);
-            } else {
-                // Value unchanged - keep the old storage index
-                new_base.push(old_storage_idx);
+        for (id, new_value) in filtered.into_iter().enumerate() {
+            let old_storage_idx = self.base_index.get(id).copied().unwrap_or(usize::MAX);
+            match new_value {
+                Some(new_value) => {
+                    // Use push_get_index for atomic index assignment
+                    new_base.push(self.storage.push_get_index(Box::new(new_value)));
+                }
+                None => new_base.push(old_storage_idx),
             }
         }
 
