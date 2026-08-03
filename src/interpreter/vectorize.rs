@@ -482,39 +482,72 @@ where
 /// element's hash into its row's running hash. Same collision story as
 /// before: candidates are confirmed by `rows_equal`, so the hash only has
 /// to be good, not perfect.
-fn hash_rows(vector_values: &[VectorRef], n: usize) -> Vec<u64> {
-    use std::hash::{Hash, Hasher};
-    #[inline(always)]
-    fn elem_hash<T: Hash>(value: &T) -> u64 {
-        let mut hasher = rustc_hash::FxHasher::default();
-        value.hash(&mut hasher);
-        hasher.finish()
-    }
-    // Fibonacci-style fold; order-sensitive so permuted columns disagree.
-    #[inline(always)]
-    fn fold(row: &mut u64, value: u64) {
-        *row = (row.rotate_left(26) ^ value).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    }
-    let mut hashes = vec![0x51_7c_c1_b7_27_22_0a_95u64; n];
+#[inline(always)]
+fn elem_hash<T: std::hash::Hash>(value: &T) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = rustc_hash::FxHasher::default();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Fibonacci-style fold; order-sensitive so permuted columns disagree.
+#[inline(always)]
+fn fold(row: &mut u64, value: u64) {
+    *row = (row.rotate_left(26) ^ value).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+}
+
+const ROW_HASH_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+/// Rows below this count are hashed and deduped sequentially - thread setup
+/// costs more than it saves on small merges.
+const PARALLEL_ROW_THRESHOLD: usize = 1 << 14;
+
+/// How many threads the merge machinery uses. The work is memory-bound, so
+/// this saturates well below the core count.
+fn merge_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .min(16)
+}
+
+/// Fold one row range of every column into its hash slots.
+fn hash_row_range(vector_values: &[VectorRef], hashes: &mut [u64], start: usize) {
+    let end = start + hashes.len();
     for vec in vector_values {
         match vec {
             VectorRef::Numbers(nums) => {
-                for (row, value) in hashes.iter_mut().zip(*nums) {
+                for (row, value) in hashes.iter_mut().zip(&nums[start..end]) {
                     fold(row, elem_hash(value));
                 }
             }
             VectorRef::NumberIntervals(nums) => {
-                for (row, value) in hashes.iter_mut().zip(*nums) {
+                for (row, value) in hashes.iter_mut().zip(&nums[start..end]) {
                     fold(row, elem_hash(value));
                 }
             }
             VectorRef::Bools(bools) => {
-                for (row, value) in hashes.iter_mut().zip(*bools) {
+                for (row, value) in hashes.iter_mut().zip(&bools[start..end]) {
                     fold(row, elem_hash(value));
                 }
             }
         }
     }
+}
+
+fn hash_rows(vector_values: &[VectorRef], n: usize) -> Vec<u64> {
+    let mut hashes = vec![ROW_HASH_SEED; n];
+    let threads = merge_threads();
+    if n < PARALLEL_ROW_THRESHOLD || threads == 1 {
+        hash_row_range(vector_values, &mut hashes, 0);
+        return hashes;
+    }
+    let chunk = n.div_ceil(threads);
+    std::thread::scope(|scope| {
+        for (i, hash_chunk) in hashes.chunks_mut(chunk).enumerate() {
+            scope.spawn(move || hash_row_range(vector_values, hash_chunk, i * chunk));
+        }
+    });
     hashes
 }
 
@@ -559,26 +592,10 @@ fn dedup_vectorized_state(mut state: State) -> State {
         return state;
     }
 
-    // Hash every row up front (column-major, see `hash_rows`), then bucket.
-    // Map from hash -> list of unique row indices with that hash.
+    // Hash every row up front (column-major, see `hash_rows`), then dedup -
+    // partitioned across threads for large states, sequential otherwise.
     let row_hashes = hash_rows(&vector_values, state.vector_size);
-    let mut hash_to_indices: FxHashMap<u64, Vec<usize>> =
-        FxHashMap::with_capacity_and_hasher(state.vector_size / 2, Default::default());
-    let mut mask = vec![false; state.vector_size];
-    let mut unique_count = 0;
-
-    for (i, &row_hash) in row_hashes.iter().enumerate() {
-        let indices = hash_to_indices.entry(row_hash).or_insert_with(Vec::new);
-
-        // Check if this row matches any existing row with the same hash
-        let is_duplicate = indices.iter().any(|&prev_idx| rows_equal(&vector_values, prev_idx, i));
-
-        if !is_duplicate {
-            indices.push(i);
-            mask[i] = true;
-            unique_count += 1;
-        }
-    }
+    let (mask, unique_count) = dedup_mask(&vector_values, &row_hashes, state.vector_size);
 
     crate::merge_stats::record_dedup(
         state.vector_size,
@@ -593,6 +610,103 @@ fn dedup_vectorized_state(mut state: State) -> State {
     }
 
     state.filter_by_mask(&mask, crate::interpreter::state::FILTER_DEDUP)
+}
+
+/// Dedup rows given their hashes: keep the first occurrence of every
+/// distinct row, in row order. Equal rows have equal hashes, so partitioning
+/// rows by hash bits distributes every duplicate-candidate set intact to one
+/// partition - the partitions dedup independently, in parallel, and the kept
+/// set is *identical* to the sequential result.
+fn dedup_mask(vector_values: &[VectorRef], row_hashes: &[u64], n: usize) -> (Vec<bool>, usize) {
+    fn dedup_rows<I: Iterator<Item = u32>>(
+        vector_values: &[VectorRef],
+        row_hashes: &[u64],
+        rows: I,
+        expected: usize,
+    ) -> Vec<u32> {
+        let mut map: FxHashMap<u64, Vec<u32>> =
+            FxHashMap::with_capacity_and_hasher(expected / 2, Default::default());
+        let mut kept = Vec::new();
+        for i in rows {
+            let indices = map.entry(row_hashes[i as usize]).or_default();
+            let is_duplicate = indices
+                .iter()
+                .any(|&prev| rows_equal(vector_values, prev as usize, i as usize));
+            if !is_duplicate {
+                indices.push(i);
+                kept.push(i);
+            }
+        }
+        kept
+    }
+
+    let threads = merge_threads();
+    let mut mask = vec![false; n];
+    if n < PARALLEL_ROW_THRESHOLD || threads == 1 {
+        let kept = dedup_rows(vector_values, row_hashes, 0..n as u32, n);
+        let unique = kept.len();
+        for i in kept {
+            mask[i as usize] = true;
+        }
+        return (mask, unique);
+    }
+
+    // Scatter rows into partitions by hash high bits, in parallel; each
+    // thread scans a contiguous row range, so concatenating the per-thread
+    // partition lists in thread order keeps every partition in ascending row
+    // order - which is what preserves first-occurrence-wins.
+    const PARTS: usize = 64;
+    let shift = 64 - PARTS.trailing_zeros();
+    let chunk = n.div_ceil(threads);
+    let locals: Vec<Vec<Vec<u32>>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                scope.spawn(move || {
+                    let start = t * chunk;
+                    let end = ((t + 1) * chunk).min(n);
+                    let mut parts: Vec<Vec<u32>> = vec![Vec::new(); PARTS];
+                    for i in start..end {
+                        parts[(row_hashes[i] >> shift) as usize].push(i as u32);
+                    }
+                    parts
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    // Dedup the partitions in parallel; each yields its kept rows.
+    let kept_lists: Vec<Vec<u32>> = std::thread::scope(|scope| {
+        let locals = &locals;
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                scope.spawn(move || {
+                    let mut out = Vec::new();
+                    let mut p = t;
+                    while p < PARTS {
+                        let total: usize = locals.iter().map(|l| l[p].len()).sum();
+                        let rows = locals.iter().flat_map(|l| l[p].iter().copied());
+                        out.push(dedup_rows(vector_values, row_hashes, rows, total));
+                        p += threads;
+                    }
+                    out
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect()
+    });
+
+    let mut unique = 0;
+    for kept in kept_lists {
+        unique += kept.len();
+        for i in kept {
+            mask[i as usize] = true;
+        }
+    }
+    (mask, unique)
 }
 
 /// Collect all vectorizable vector values from a state for dedup purposes.
