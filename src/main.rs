@@ -396,6 +396,7 @@ __reset_button_states()
         states.len(),
         states.iter().map(|s| s.vector_size).sum::<usize>(),
         num_frames);
+    celeste_rust::op_census::report();
 
     // Save profiling data if enabled
     if let Some(profile_dir) = profile_dir {

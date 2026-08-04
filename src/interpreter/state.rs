@@ -195,6 +195,7 @@ impl State {
     /// without splitting the state.
     pub fn expand_lanes(&mut self) {
         let _trace = TraceSpan::new("expand_lanes", "expand");
+        let t = crate::op_census::start();
         fn double<T: std::fmt::Debug + Clone + PartialEq + Eq>(
             v: MaybeVector<T>,
         ) -> MaybeVector<T> {
@@ -218,6 +219,7 @@ impl State {
             | Value::NilPointer(_)) => other,
         });
         self.vector_size *= 2;
+        crate::op_census::record(crate::op_census::Cat::Expand, self.vector_size, 0, t);
     }
 
     /// Filters all vector values in the state by a mask, cloning first.
@@ -244,6 +246,14 @@ impl State {
     /// never gets one at all). Such a cell has no observable content, but its
     /// identity matters: a later `Store` through that pointer must still work.
     pub fn gc(&mut self) {
+        let t_census = crate::op_census::start();
+        self.gc_inner(t_census);
+    }
+
+    // (census guard defined at module scope below)
+
+    fn gc_inner(&mut self, t_census: Option<std::time::Instant>) {
+        let _defer = CensusGcGuard(t_census);
         let _trace = TraceSpan::new("gc", "gc");
 
         let mut old_to_new: FxHashMap<HeapId, HeapId> = FxHashMap::default();
@@ -404,5 +414,14 @@ mod send_tests {
     fn test_state_is_send() {
         assert_send::<State>();
         assert_sync::<State>();
+    }
+}
+
+
+/// Records GC time to the op census even on early returns.
+struct CensusGcGuard(Option<std::time::Instant>);
+impl Drop for CensusGcGuard {
+    fn drop(&mut self) {
+        crate::op_census::record(crate::op_census::Cat::Gc, 0, 0, self.0.take());
     }
 }

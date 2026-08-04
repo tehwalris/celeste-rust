@@ -336,6 +336,7 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
                 _ => None,
             };
 
+            let t_concat = crate::op_census::start();
             let mut result = Vec::with_capacity(total_size);
             let mut all_same = ref_val.is_some();
             let ref_val = ref_val.unwrap_or(Pico8Num::from_i16(0));
@@ -363,6 +364,12 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
                     _ => panic!("Type mismatch in merge"),
                 }
             }
+            crate::op_census::record(
+                crate::op_census::Cat::Concat,
+                result.len(),
+                result.len() * 2 * 4,
+                t_concat,
+            );
             if result.len() == 1 || (all_same && result.len() > 1) {
                 Value::Number(MaybeVector::Scalar(result[0]))
             } else {
@@ -377,6 +384,7 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
                 _ => None,
             };
 
+            let t_concat = crate::op_census::start();
             let mut result = Vec::with_capacity(total_size);
             let mut all_same = ref_val.is_some();
             let ref_val = ref_val.unwrap_or(Pico8NumInterval::new(Pico8Num::from_i16(0), Pico8Num::from_i16(0)));
@@ -404,6 +412,12 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
                     _ => panic!("Type mismatch in merge"),
                 }
             }
+            crate::op_census::record(
+                crate::op_census::Cat::Concat,
+                result.len(),
+                result.len() * 2 * 8,
+                t_concat,
+            );
             if result.len() == 1 || (all_same && result.len() > 1) {
                 Value::NumberInterval(MaybeVector::Scalar(result[0]))
             } else {
@@ -418,6 +432,7 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
                 _ => None,
             };
 
+            let t_concat = crate::op_census::start();
             let mut result = Vec::with_capacity(total_size);
             let mut all_same = ref_val.is_some();
             let ref_val = ref_val.unwrap_or(false);
@@ -445,6 +460,12 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
                     _ => panic!("Type mismatch in merge"),
                 }
             }
+            crate::op_census::record(
+                crate::op_census::Cat::Concat,
+                result.len(),
+                result.len() * 2 * 1,
+                t_concat,
+            );
             if result.len() == 1 || (all_same && result.len() > 1) {
                 Value::Bool(MaybeVector::Scalar(result[0]))
             } else {
@@ -495,6 +516,15 @@ fn hash_rows(vector_values: &[VectorRef], n: usize) -> Vec<u64> {
     fn fold(row: &mut u64, value: u64) {
         *row = (row.rotate_left(26) ^ value).wrapping_mul(0x9e37_79b9_7f4a_7c15);
     }
+    let t = crate::op_census::start();
+    let col_bytes: usize = vector_values
+        .iter()
+        .map(|v| match v {
+            VectorRef::Numbers(x) => x.len() * 4,
+            VectorRef::NumberIntervals(x) => x.len() * 8,
+            VectorRef::Bools(x) => x.len(),
+        })
+        .sum();
     let mut hashes = vec![0x51_7c_c1_b7_27_22_0a_95u64; n];
     for vec in vector_values {
         match vec {
@@ -515,6 +545,12 @@ fn hash_rows(vector_values: &[VectorRef], n: usize) -> Vec<u64> {
             }
         }
     }
+    crate::op_census::record(
+        crate::op_census::Cat::HashRows,
+        n * vector_values.len(),
+        col_bytes + 16 * n * vector_values.len(),
+        t,
+    );
     hashes
 }
 
@@ -562,6 +598,7 @@ fn dedup_vectorized_state(mut state: State) -> State {
     // Hash every row up front (column-major, see `hash_rows`), then bucket.
     // Map from hash -> list of unique row indices with that hash.
     let row_hashes = hash_rows(&vector_values, state.vector_size);
+    let t_bucket = crate::op_census::start();
     let mut hash_to_indices: FxHashMap<u64, Vec<usize>> =
         FxHashMap::with_capacity_and_hasher(state.vector_size / 2, Default::default());
     let mut mask = vec![false; state.vector_size];
@@ -580,6 +617,12 @@ fn dedup_vectorized_state(mut state: State) -> State {
         }
     }
 
+    crate::op_census::record(
+        crate::op_census::Cat::DedupBucket,
+        state.vector_size,
+        0,
+        t_bucket,
+    );
     crate::merge_stats::record_dedup(
         state.vector_size,
         vector_values.len(),
@@ -1048,6 +1091,7 @@ fn extract_vectorizable_values_from_state(state: &State) -> Vec<VectorizableValu
 /// Normalize a state for comparison purposes.
 /// Two states that are "the same" will have equal NormalizedState representations.
 pub fn normalize_state_for_comparison(state: &State) -> NormalizedState {
+    let t = crate::op_census::start();
     // First, GC and renumber the state to get deterministic heap IDs
     let mut state = state.clone();
     state.gc();
@@ -1055,6 +1099,12 @@ pub fn normalize_state_for_comparison(state: &State) -> NormalizedState {
     let shape = shape_of_state(&state);
     let vectorizable_values = extract_vectorizable_values_from_state(&state);
 
+    crate::op_census::record(
+        crate::op_census::Cat::Normalize,
+        state.vector_size,
+        0,
+        t,
+    );
     NormalizedState {
         shape,
         vectorizable_values,

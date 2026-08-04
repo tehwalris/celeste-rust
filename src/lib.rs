@@ -22,6 +22,7 @@ pub mod interpreter;
 pub mod ir;
 pub mod liveness;
 pub mod merge_stats;
+pub mod op_census;
 pub mod pico8_num;
 pub mod rewrite;
 pub mod tas;

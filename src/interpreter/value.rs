@@ -45,7 +45,17 @@ impl<T: std::fmt::Debug + Clone + PartialEq + Eq> MaybeVector<T> {
     pub fn map(&self, f: impl Fn(&T) -> T) -> Self {
         match self {
             MaybeVector::Scalar(v) => MaybeVector::Scalar(f(v)),
-            MaybeVector::Vector(v) => MaybeVector::vector(v.iter().map(f).collect()),
+            MaybeVector::Vector(v) => {
+                let t = crate::op_census::start();
+                let out: Vec<T> = v.iter().map(f).collect();
+                crate::op_census::record(
+                    crate::op_census::Cat::Map,
+                    v.len(),
+                    2 * v.len() * std::mem::size_of::<T>(),
+                    t,
+                );
+                MaybeVector::vector(out)
+            }
         }
     }
 
@@ -56,7 +66,17 @@ impl<T: std::fmt::Debug + Clone + PartialEq + Eq> MaybeVector<T> {
     ) -> MaybeVector<O> {
         match self {
             MaybeVector::Scalar(v) => MaybeVector::Scalar(f(v)),
-            MaybeVector::Vector(v) => MaybeVector::vector(v.iter().map(f).collect()),
+            MaybeVector::Vector(v) => {
+                let t = crate::op_census::start();
+                let out: Vec<O> = v.iter().map(f).collect();
+                crate::op_census::record(
+                    crate::op_census::Cat::Map,
+                    v.len(),
+                    v.len() * (std::mem::size_of::<T>() + std::mem::size_of::<O>()),
+                    t,
+                );
+                MaybeVector::vector(out)
+            }
         }
     }
 
@@ -72,14 +92,38 @@ impl<T: std::fmt::Debug + Clone + PartialEq + Eq> MaybeVector<T> {
                 // element - this is the arithmetic inner loop, and the
                 // per-element branch blocks auto-vectorization.
                 assert_eq!(a.len(), b.len(), "map2 on vectors of different sizes");
-                MaybeVector::vector(a.iter().zip(b.iter()).map(|(a, b)| f(a, b)).collect())
+                let t = crate::op_census::start();
+                let out: Vec<O> = a.iter().zip(b.iter()).map(|(a, b)| f(a, b)).collect();
+                crate::op_census::record(
+                    crate::op_census::Cat::Binop,
+                    a.len(),
+                    a.len() * (2 * std::mem::size_of::<T>() + std::mem::size_of::<O>()),
+                    t,
+                );
+                MaybeVector::vector(out)
             }
             // Broadcast scalar to match vector size
             (MaybeVector::Scalar(a), MaybeVector::Vector(b)) => {
-                MaybeVector::vector(b.iter().map(|bi| f(a, bi)).collect())
+                let t = crate::op_census::start();
+                let out: Vec<O> = b.iter().map(|bi| f(a, bi)).collect();
+                crate::op_census::record(
+                    crate::op_census::Cat::Binop,
+                    b.len(),
+                    b.len() * (std::mem::size_of::<T>() + std::mem::size_of::<O>()),
+                    t,
+                );
+                MaybeVector::vector(out)
             }
             (MaybeVector::Vector(a), MaybeVector::Scalar(b)) => {
-                MaybeVector::vector(a.iter().map(|ai| f(ai, b)).collect())
+                let t = crate::op_census::start();
+                let out: Vec<O> = a.iter().map(|ai| f(ai, b)).collect();
+                crate::op_census::record(
+                    crate::op_census::Cat::Binop,
+                    a.len(),
+                    a.len() * (std::mem::size_of::<T>() + std::mem::size_of::<O>()),
+                    t,
+                );
+                MaybeVector::vector(out)
             }
         }
     }
@@ -118,10 +162,17 @@ where
     if let [only] = kept {
         return MaybeVector::Scalar(vec[*only as usize].clone());
     }
+    let t = crate::op_census::start();
     let mut filtered = Vec::with_capacity(kept.len());
     for &i in kept {
         filtered.push(vec[i as usize].clone());
     }
+    crate::op_census::record(
+        crate::op_census::Cat::Filter,
+        kept.len(),
+        kept.len() * (2 * std::mem::size_of::<T>() + 4),
+        t,
+    );
     MaybeVector::vector(filtered)
 }
 

@@ -115,12 +115,19 @@ pub fn interpret_select(condition: &Value, if_true: &Value, if_false: &Value) ->
             MaybeVector::Scalar(s) => s.clone(),
             MaybeVector::Vector(v) => v[i].clone(),
         };
-        MaybeVector::vector(
-            mask.iter()
-                .enumerate()
-                .map(|(i, take_true)| if *take_true { at(a, i) } else { at(b, i) })
-                .collect(),
-        )
+        let t = crate::op_census::start();
+        let out: Vec<T> = mask
+            .iter()
+            .enumerate()
+            .map(|(i, take_true)| if *take_true { at(a, i) } else { at(b, i) })
+            .collect();
+        crate::op_census::record(
+            crate::op_census::Cat::Select,
+            mask.len(),
+            mask.len() * (1 + 3 * std::mem::size_of::<T>()),
+            t,
+        );
+        MaybeVector::vector(out)
     }
 
     match (if_true, if_false) {
