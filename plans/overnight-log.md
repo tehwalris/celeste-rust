@@ -1,5 +1,49 @@
 # Overnight log (2026-08-04)
 
+## Morning summary (read this first)
+
+**Headline: cumulative time to frame 41 dropped 107 s -> 87 s.** Both
+configurations reach frame 41 inside the 120 s budget; the new stack
+has 33 s headroom vs 13 s. Frame 42 (~45 s) still does not fit - it
+needs another ~25-30% off the deep frames, and the remaining levers
+are structural (task volume / representation), not implementation.
+Peak RSS at 41: 44.3 -> 42.8 GB (cap 100 GB; frame 42 would fit
+memory-wise, frame 43 would not).
+
+What landed (all differentially identical through 37, final stack
+confirmed **identical through frame 40**, 401 tests, warning-free):
+
+* 99c806e - parallel row hashing + hash-partitioned dedup (-26% at 39)
+* ea70758 - parallel per-cell merge concat (~-3%)
+* dda4424 - parallel heap-filter gathers (scoped threads)
+* 1eac28e - persistent lane pool; vector ops >=128k lanes run pooled
+* 3a0364f - single-pass kept computation for branch filters (neutral,
+  strictly less work)
+* 517c191 - normalized-form cache in the hint accumulator (neutral,
+  strictly less work, removes a latent quadratic) [task #52 item]
+* 0405fba - REVERT of parallel local_env filter: bench said -4%, the
+  actual search runner said +35% at f37. Bisected on the runner.
+
+Worth-the-complexity questions for review:
+
+1. The lane pool (par_pool.rs) contains contained unsafe (lifetime
+   erasure behind a completion barrier) and a submit mutex. It is the
+   enabler for pooled vector ops, which are only slightly positive
+   today but scale with depth. Keep?
+2. The bench-vs-runner divergence (filter parallelism flipped sign) -
+   accept "runner is the metric" as standing rule? bench remains fine
+   for recipe-side A/Bs.
+3. Parked with numbers: virtual-concat merge (three variants; -18%
+   memory possible if the cap ever binds), parallel normalize
+   (allocation contention), 64k/32k op thresholds (worse), env-filter
+   parallelism (runner regression), MALLOC_MMAP_THRESHOLD_ and THP
+   (already optimal).
+4. Frame 42 route: task volume - the endgame (#47) or hierarchical
+   lanes (plans/hierarchical-lanes.md) - or memory bandwidth (NUMA
+   pinning was not tried; 2-socket topology unknown).
+
+Chronological detail below.
+
 Goal and rules: `plans/overnight-north-star.md`. One entry per attempt;
 numbers for both directions; kept/parked verdicts. Baseline binary and
 recipe as of commit 06b6248.
@@ -181,3 +225,10 @@ parallel and memory-bound. Frame 42 in 120 s likely needs either more
 memory bandwidth (NUMA placement? huge pages?) or a task-volume
 change (the endgame/hierarchical directions from plans/), not more
 thread fan-out.
+
+## Final checks
+
+* `rewrite verify --frames 40`: **identical** (65.4 s) - the full
+  parallel stack confirmed at the deepest screened depth.
+* THP already `always`; MALLOC_MMAP_THRESHOLD_=1G measured neutral at
+  39 (two pairs) - no env-level allocator wins available.
