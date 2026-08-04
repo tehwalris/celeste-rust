@@ -38,12 +38,19 @@ Rust equivalents.
 
 ### A note on history
 
-There was a previous attempt (Jan 2026, `interpreter` branch) at a generic CFG
-optimizer - mem2reg, inlining, heap elimination, call resolution, DCE, etc.
+There was a previous attempt (Jan 2026, now the
+`interpreter-abandoned-2026-01-11` branch) at a generic CFG optimizer - mem2reg, inlining, heap elimination, call resolution, DCE, etc.
 Roughly 11k lines. Most of it was never wired into the game runner, some of it
 produced CFGs the interpreter cannot execute, and its validation did not check
 dominance. That branch is kept as reading material only. Do not reintroduce
 untested passes; see `plans/rewrite-plan.md` for the approach that replaces it.
+
+## Branches
+
+`interpreter` is the live line (the rewrite campaign plus the current
+interpreter work). `parallel-experiments` holds the overnight parallelism,
+which is deliberately not merged - see BENCHMARK_DATA.md.
+`interpreter-abandoned-2026-01-11` is the January CFG optimizer above.
 
 ## Running safely
 
