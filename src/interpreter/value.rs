@@ -173,6 +173,9 @@ where
         kept.len() * (2 * std::mem::size_of::<T>() + 4),
         t,
     );
+    if crate::op_census::enabled() {
+        crate::op_census::record_filter_size(kept.len());
+    }
     MaybeVector::vector(filtered)
 }
 

@@ -44,6 +44,16 @@ static ELEMS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 static BYTES: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 static NANOS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 
+/// log2-bucketed histogram of Filter gather sizes (kept elements per call).
+static FILTER_HIST_CALLS: [AtomicU64; 24] = [const { AtomicU64::new(0) }; 24];
+static FILTER_HIST_ELEMS: [AtomicU64; 24] = [const { AtomicU64::new(0) }; 24];
+
+pub fn record_filter_size(kept: usize) {
+    let b = (usize::BITS - kept.max(1).leading_zeros() - 1).min(23) as usize;
+    FILTER_HIST_CALLS[b].fetch_add(1, Ordering::Relaxed);
+    FILTER_HIST_ELEMS[b].fetch_add(kept as u64, Ordering::Relaxed);
+}
+
 pub fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("CELESTE_CENSUS").is_some())
@@ -115,4 +125,18 @@ pub fn report() {
         "{:<14} {:>41.2} s inside censused ops",
         "total", total_ns as f64 / 1e9
     );
+    eprintln!("filter gather size histogram (kept elems/call):");
+    for b in 0..24 {
+        let c = FILTER_HIST_CALLS[b].load(Ordering::Relaxed);
+        if c == 0 {
+            continue;
+        }
+        let e = FILTER_HIST_ELEMS[b].load(Ordering::Relaxed);
+        eprintln!(
+            "  2^{:<2} {:>10} calls {:>10.1} Melems",
+            b,
+            c,
+            e as f64 / 1e6
+        );
+    }
 }

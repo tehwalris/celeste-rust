@@ -79,3 +79,45 @@ bookkeeping, shape grouping, input expansion.)
 4. THEN re-apply parallelism to whatever is left; it composes with all of
    the above, and its biggest current contribution (parallelizing page
    faults) becomes unnecessary.
+
+## Synthetic filter benchmark (/tmp/filter_bench.rs)
+
+30 i32 columns, sorted kept-indices, traffic model = source + indices +
+output bytes; sources cold-rotated for n >= 262k. GB/s per variant:
+
+| n x keep | current | reuse | inplace | tiled | simdmask | both |
+|---|---|---|---|---|---|---|
+| 128 x 50% | 29.0 | 41.6 | 32.5 | 41.5 | 27.7 | 12.7 |
+| 2k x 50% | 33.7 | 43.1 | 32.3 | 42.7 | 26.9 | 12.5 |
+| 32k x 50% | 35.2 | 39.3 | 30.2 | 36.6 | 26.5 | 12.7 |
+| 262k x 50% (cold) | 32.1 | 22.2 | 19.6 | 19.1 | 24.6 | 12.8 |
+| 1M x 50% (cold) | 32.7 | 21.5 | 14.6 | 17.7 | 23.6 | 12.9 |
+| **32k x 10%** | **91.3** | **99.5** | 46.3 | 88.4 | 16.0 | 11.7 |
+| 262k x 10% (cold) | 33.4 | 32.7 | 17.7 | 19.8 | 15.0 | 12.4 |
+| 1M x 10% (cold) | 32.4 | 31.2 | 12.1 | 18.8 | 15.2 | 11.7 |
+
+Readings:
+
+1. **Cache residency is worth 3-10x, dwarfing every other trick.** The
+   32k x 10% row (working set ~4 MB, L2+V-cache resident) runs at 91-99
+   GB/s - near the L2 roofline - while the same code on cold DRAM-sized
+   data does 19-33. This is the quantified case for *lane-blocking the
+   whole frame*: process a tile of lanes through many operations while it
+   is hot, instead of full-width sweeps that evict everything between ops.
+2. **Reuse beats fresh allocation by 25-30% warm** (43 vs 34) but the
+   steady-state allocator recycles big blocks well enough that fresh
+   allocation is not the disaster the 1 GiB calibration suggested - at
+   cold-large sizes `current` even wins (recycled dest pages are warm).
+   The interpreter's real 8.8 GB/s (census metric; ~12 GB/s in this
+   traffic model) vs 21-43 here says the remaining 2-3x is real-workload
+   coldness, size diversity, and per-call overhead on the 4.2M tiny
+   gathers - not the gather loop itself.
+3. **AVX2 mask-compaction underperforms scalar sorted-index gather**
+   (26 vs 40 warm) as implemented (scalar mask repack per 8 lanes); not
+   the priority. **Fused both-sides partition loses badly** (12-13,
+   branch-miss bound at 50%) - two masked gathers beat one branchy
+   partition.
+4. Implied plan, in order of leverage: (a) lane-tiling the frame
+   execution (structural; the 3-10x row), (b) buffer reuse + batching the
+   per-event column loop (the 25-30% + small-call overhead), (c) skip
+   SIMD compaction and fused partition - measured not worth it.
