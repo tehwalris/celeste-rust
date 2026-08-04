@@ -592,6 +592,60 @@ share, which slot allocation already cut from 33% to 13%.
 Every frame still ends as **exactly one vectorized state**; all fragmentation is
 intra-frame and fully re-merged.
 
+### If-converting the two hot fork sites: not available, and the nearby one is a 2.2x regression (2026-08-05)
+
+The per-site filter census put 99% of `filter_branch` on two branches -
+`in_i1_074_cont` (0.68 s at frame 39, on per-lane `dash_time > 0`) and
+`and_or_join_126` (0.35 s). Both were tried.
+
+**Neither branch is convertible by any current rule.** `suggest` proposes
+nothing for either: both arms contain `btn` branches on `UnknownBool`,
+which no select can express. This re-confirms the stage-R note - the
+`dash_time` diamond's else-side is the whole normal-movement body, and it
+contains splitting branches, so it cannot be a region. Removing that
+blocker needs `expand`, which has been measured as a regression twice
+(+17%, +19%) with a diagnosed cause (`expand_lanes` physically doubles all
+~279 heap cells when only the button-dependent few can differ).
+
+What *is* available nearby: 34 candidates from `suggest` over
+`anonymous_61` (if-convert, speculate-region, speculate, absorb-stores,
+convert-ternary, decompose-truthy, sink-store), of which 25 verify at 32
+frames. As a bundle they cost **3.02 s -> 6.6 s at 37 frames**, and
+bisection puts the entire regression on one entry: `if_convert` at join
+`in_h061_and_or_join_126`, the and/or triangle feeding the second hot
+branch. Alone it is 3.02 -> 6.58 s (**+118%**), 1.39 -> 1.84 GB. The other
+24 are neutral. Nothing landed.
+
+The mechanism is worth keeping, because it generalises. Split counts are
+**completely unchanged** - 503 splits across the same 11 sites with the
+same per-site counts - and lanes through the two hot sites barely move
+(9.8 -> 10.8 M and 4.1 -> 4.4 M at frame 37). What changes is the *width*
+of every filter:
+
+| frame 37 | baseline | +cif-014 |
+|---|---|---|
+| state filter calls | 3,972 | 32,912 (8.3x) |
+| filter elements | 355 M | 2,029 M (5.7x) |
+| filter time | 0.39 s | 1.76 s |
+| in_i1_074_cont | 24 events, 0.23 s | 48 events, 0.89 s |
+| and_or_join_126 | 12 events, 0.12 s | 24 events, 0.76 s |
+
+A filter call is one vector column, so calls/events is the number of live
+vector columns in the state. If-conversion roughly **quadrupled live
+columns** at the split points, because eager evaluation keeps both sides'
+intermediates live across the branch. So a conversion that does not
+actually remove a split is doubly bad: it pays for both arms *and* makes
+every downstream filter wider. The converted branch here was one of the
+always-uniform ones (`and_or_continue_125`/`if_condition_100` never appear
+in the split table), which is the same lesson as "if_convert removed 81
+branches and only 4.6% of the splits" - now with a cost mechanism
+attached.
+
+Corollary for the ranked plan: **filter cost is driven by live vector
+columns, not only by lane counts.** Narrowing what is live at a split is
+an independent lever on the same 1.03 s, and unlike if-conversion it does
+not require the btn blocker to fall first.
+
 ### The merge machinery measured against its task (2026-08-03)
 
 Is the ~50% merge share an implementation problem or the task's real
