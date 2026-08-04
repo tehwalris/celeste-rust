@@ -117,7 +117,49 @@ Net at 39 frames: **10.5 -> ~6.9-7.1 s (-33%)**. Threads capped at 16
   (6.75-6.97 vs 6.45-6.71), same as 32k earlier - 128k stands.
 * Single-pass kept (committed): neutral at 39, strictly less work.
 * Full stack differentially verified through 37 (31.9 s).
-* **Headline A/B in flight**: /tmp/metric-ab.sh, 3 interleaved pairs of
-  full `-n 41` runs, /tmp/celeste-base (06b6248) vs /tmp/celeste-new
-  (HEAD), logging per-frame times + peak RSS to /tmp/metric-ab.log.
-  Do not run anything heavy while it measures.
+* First headline A/B (3 pairs, /tmp/metric-ab.log): deep frames won
+  big (f41 37.5-37.7 -> 27.3-27.7 s, **-27%**; f40 -20%, f39 -11%) but
+  frames 34-37 REGRESSED (+72% at f34), which bench had not shown.
+* **Bisect on the runner at -n 37**: base 6.66, 1eac28e (pool) 5.66,
+  9433cec (env filter) 7.66, pool-routed filters 7.18. The parallel
+  local_env filter was the regression - bench at 39 said -4%, the
+  runner said +35%. **bench and the search runner disagree on
+  filter-level parallelism; the runner is the metric.** Reverted
+  heap.rs/local_env.rs to their 1eac28e form (heap keeps scoped
+  gathers, env sequential), kept single-pass kept + test lock.
+  Runner at 37 after revert: 5.76-5.80 vs base 6.71-6.74.
+* Memory at f41: ~44 GB both sides (cap 100 GB - not binding at 41;
+  frame 42 at ~1.55x growth -> ~68 GB, still fits; frame 43 would not).
+## Headline result (interleaved full runs, base 06b6248 vs HEAD 0405fba)
+
+Two pairs, /tmp/metric-ab2.log, per-frame seconds (base -> final):
+
+| frame | base | final | delta |
+|---|---|---|---|
+| 34 | 2.12 | 2.13 | 0% |
+| 36 | 4.61 | 4.09 | -11% |
+| 37 | 6.77 | 5.78 | -15% |
+| 38 | 10.05 | 8.23 | -18% |
+| 39 | 15.35 | 12.20 | -20% |
+| 40 | 24.00 | 18.66 | -22% |
+| 41 | 37.57 | 29.35 | **-22%** |
+
+Peak RSS at 41: 44.3 -> 42.8 GB. No shallow-frame regression (the
+first A/B's +72% at f34 was the env-filter commit, since reverted).
+
+**Metric**: cumulative to frame 41 ~= 107 s (base) -> **87 s (final)**.
+Both reach frame 41 inside the 120 s budget; final has 33 s of
+headroom vs base's 13 s. Frame 42 (~45 s at the 1.55x growth rate)
+does not yet fit - it needs roughly another 25-30% off the deep
+frames. Memory would fit (f42 ~ 65 GB < 100 GB cap; f43 would not).
+
+The speedup is entirely the parallelization chain (dedup partitioning,
+per-cell merge concat, scoped heap-filter gathers, pooled vector ops);
+the win grows with depth because that is where the machinery is
+memory-bound and wide.
+
+Next-best known items toward frame 42, in order: (a) cache normalized
+forms across fixpoint rounds in union_diff (the accumulated set is
+re-normalized every call - task #52); (b) whatever a fresh deep
+profile of the *runner* (not bench) says; (c) the parked virtual-merge
+memory variant if the cap ever binds.
