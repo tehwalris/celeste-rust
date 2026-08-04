@@ -192,6 +192,25 @@ impl LocalEnv {
         }
     }
 
+    /// Drops one local, if it is still the occupant of its slot.
+    ///
+    /// A slot whose occupant has moved on already lost this value - slots are
+    /// shared between locals with disjoint live ranges - so that case is a
+    /// no-op. What must not happen is dropping a *different* local's value,
+    /// which the occupant check prevents.
+    pub fn kill(&mut self, id: LocalId) {
+        let slot = self.slots.slot_of(id);
+        let Some(&occupant) = self.data.occupant.get(slot) else {
+            return;
+        };
+        if occupant != usize::from(id) as u32 {
+            return;
+        }
+        let data = Arc::make_mut(&mut self.data);
+        data.values[slot] = None;
+        data.occupant[slot] = NO_OCCUPANT;
+    }
+
     pub fn clear(&mut self) {
         self.data = Arc::new(EnvData {
             values: vec![None; self.slots.num_slots()],

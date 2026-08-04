@@ -900,4 +900,5 @@
 # Post-package sweep.
 {"forward":true,"id":"m047","rule":"cse"}
 {"id":"m050","rule":"dedup_guards"}
+{"id":"k1","rule":"kill_dead"}
 {"id":"s1","rule":"allocate_slots"}

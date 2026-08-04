@@ -211,6 +211,26 @@ pub enum Instruction {
         if_true: LocalId,
         if_false: LocalId,
     },
+    /// Drops locals from the environment: deadness, written into the IR.
+    ///
+    /// The interpreter carries a `LocalEnv` full of per-lane vectors, and
+    /// every branch filter gathers *all* of them, every mid-frame merge keys
+    /// on *all* of them. A value the program will never read again therefore
+    /// keeps costing lane copies, and - because `local_env` is part of
+    /// `StateShape` - a dead temporary left behind on one path stops that
+    /// state merging with an otherwise identical one. The interpreter cannot
+    /// know a value is dead; `src/liveness.rs` is a no-op stub and the
+    /// runtime hook it feeds has never done anything.
+    ///
+    /// So deadness is computed once, at rewrite time, and named explicitly
+    /// here. `rules::kill_dead` places these; `validate` proves independently
+    /// that nothing reads a killed local afterwards. `get_used_locals`
+    /// deliberately returns nothing for this instruction - a kill is not a
+    /// use, and reporting one would keep the value alive in every liveness
+    /// analysis, including the one that places kills.
+    Kill {
+        values: Vec<LocalId>,
+    },
     /// Fails execution unless `value` is a pointer to a closure of `fun_def`
     /// whose captured values are exactly `captures`.
     ///
@@ -421,6 +441,9 @@ impl Instruction {
                 args: args.iter().map(|id| f(*id)).collect(),
             },
             Self::Expand { value } => Self::Expand { value: f(*value) },
+            Self::Kill { values } => Self::Kill {
+                values: values.iter().map(|v| f(*v)).collect(),
+            },
         }
     }
 }
@@ -474,6 +497,8 @@ impl Instruction {
                 v
             }
             Self::Expand { value } => vec![*value],
+            // Not a use - see the variant's docs.
+            Self::Kill { .. } => vec![],
         }
     }
 
@@ -501,6 +526,9 @@ impl Instruction {
             | Self::BinaryOp { .. }
             | Self::Select { .. }
             | Self::Phi { .. } => false,
+            // A kill changes the environment, so it must never be reordered
+            // away or dropped as pure.
+            Self::Kill { .. } => true,
             // Not a side effect on the heap, but they must never be optimised
             // away: their whole purpose is to fail.
             Self::AssertClosure { .. }

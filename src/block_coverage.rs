@@ -65,6 +65,7 @@ fn instruction_kind(instr: &crate::ir::Instruction) -> &'static str {
         Alloc | Load { .. } | Store { .. } | StoreEmptyTable { .. } | GetField { .. }
         | GetIndex { .. } => "heap",
         GetGlobal { .. } => "global",
+        Kill { .. } => "kill",
         StoreClosure { .. } | Call { .. } => "call",
         NumberConstant { .. } | BoolConstant { .. } | StringConstant { .. } | NilConstant => {
             "const"

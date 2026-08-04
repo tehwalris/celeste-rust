@@ -55,6 +55,10 @@ pub fn format_instruction(instr: &Instruction) -> String {
     let n = local_name;
     match instr {
         Instruction::Alloc => "alloc".to_string(),
+        Instruction::Kill { values } => format!(
+            "kill {}",
+            values.iter().map(|v| n(*v)).collect::<Vec<_>>().join(", ")
+        ),
         Instruction::GetGlobal { name, create_if_missing } => format!(
             "get_global {:?}{}",
             name,

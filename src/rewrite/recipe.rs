@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use super::program::Program;
 use super::rules::{
     absorb_stores, add_hint, allocate_slots, assume_eq, collapse_break_loop, collapse_loop,
+    kill_dead,
     convert_assert, convert_ternary,
     cse, dce, decompose_branch, dedup_guards,
     decompose_truthy, demote_create,
@@ -64,6 +65,7 @@ pub enum Rule {
     /// Repack locals so that values with disjoint live ranges share a slot.
     /// Changes no instructions - only where they are stored.
     AllocateSlots,
+    KillDead,
     /// Merge blocks into single-successor predecessors.
     MergeBlocks,
     /// Local simplifications: constant conditions, degenerate phis.
@@ -435,6 +437,7 @@ impl Rule {
             Rule::Dce => "dce",
             Rule::Cse { .. } => "cse",
             Rule::AllocateSlots => "allocate_slots",
+            Rule::KillDead => "kill_dead",
             Rule::MergeBlocks => "merge_blocks",
             Rule::Fold => "fold",
             Rule::FoldReflexive { .. } => "fold_reflexive",
@@ -625,6 +628,7 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::Dce => dce::apply(program),
         Rule::Cse { forward } => cse::apply(program, *forward),
         Rule::AllocateSlots => allocate_slots::apply(program),
+        Rule::KillDead => kill_dead::apply(program),
         Rule::MergeBlocks => merge_blocks::apply(program),
         Rule::Fold => fold::apply(program),
         Rule::FoldReflexive { pointers } => fold_reflexive::apply(program, *pointers),
@@ -731,6 +735,7 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::Dce => dce::verify(&before, program),
         Rule::Cse { forward } => cse::verify(&before, program, *forward),
         Rule::AllocateSlots => allocate_slots::verify(&before, program),
+        Rule::KillDead => kill_dead::verify(&before, program),
         Rule::MergeBlocks => merge_blocks::verify(&before, program),
         Rule::Fold => fold::verify(&before, program),
         Rule::FoldReflexive { pointers } => {

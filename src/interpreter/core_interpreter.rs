@@ -431,6 +431,19 @@ impl<'a> CoreInterpreter<'a> {
             Instruction::Phi { .. } => {
                 panic!("Phi nodes should not be handled at this level")
             }
+            Instruction::Kill { values } => {
+                // Dropping a local is the whole point: it stops being copied
+                // by every branch filter and stops being part of
+                // `StateShape`, so two states that differ only in dead
+                // temporaries can merge. Killing a slot that some later
+                // definition already took over is a no-op rather than an
+                // error - the value is gone either way, and `LocalEnv::get`
+                // is what catches a genuine use-after-kill.
+                for value in values {
+                    self.state.local_env.kill(*value);
+                }
+                Ok(None)
+            }
             Instruction::Expand { value } => {
                 let current = self.state.local_env.get(*value).clone();
                 match current {

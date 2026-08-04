@@ -592,6 +592,52 @@ share, which slot allocation already cut from 33% to 13%.
 Every frame still ends as **exactly one vectorized state**; all fragmentation is
 intra-frame and fully re-merged.
 
+### `kill_dead`: deadness in the IR, -9% at depth (2026-08-05)
+
+The filter-column census said 41.9% of the vector columns a filter has to
+gather live in `local_env`, and the interpreter never drops any of them:
+`src/liveness.rs` is a no-op stub and `glue.rs` passes `all_live()`, so
+the `BlockBeforeJoin` pruning in `flow.rs` has never pruned anything.
+
+New IR instruction `Kill { values }` and bulk rule `kill_dead` place one
+kill at the end of each block naming everything dead there. Deadness is
+computed once at rewrite time and stated in the program text, where a
+verifier can refute it - the verifier walks *forward* from each kill and
+fails if any path reads the value before redefining it, deliberately not
+sharing the backwards liveness analysis that placed it.
+
+Measured, interleaved, lanes identical (269,059 at 37; 613,865 at 39):
+
+| | base | +kill_dead |
+|---|---|---|
+| `rewrite bench` 37 frames | 3.07 s | 2.77 s (**-10%**) |
+| runner `--rewritten` frame 39 | 3.91 s | 3.56 s (**-9%**) |
+
+Census at frame 39 shows exactly the predicted mechanism, and nothing else:
+
+| | base | +kill_dead |
+|---|---|---|
+| state filter calls | 4,000 | 2,532 (-37%) |
+| filter elements | 901 M | 432 M (-52%) |
+| filter time | 1.12 s | 0.59 s (-47%) |
+| in_i1_074_cont | 0.68 s | 0.34 s |
+| and_or_join_126 | 0.35 s | 0.17 s |
+
+Filter *calls* fall by a third and *elements* by half - the dead locals
+were both numerous and wide. Split counts and lane counts are unchanged;
+this buys nothing by removing branches, only by making each one carry
+less. 197 kills in `anonymous_61`, naming 3,090 locals, 15.7 per kill.
+Differentially identical through 37.
+
+Two things worth keeping. The first version of the verifier treated a phi
+operand as a use on *every* incoming edge, which rejected every loop head
+in the program (`__init: kill of %746 ... is followed by a read of it`) -
+a phi consumes its operand on one edge only. And the applier's kill set
+needs a third term beyond the obvious two: locals live at the end of a
+predecessor but dead on entry here, which die *on the edge*. Without it
+one path drops a value while a sibling path carries it, and two states
+that should merge differ by something neither can read.
+
 ### If-converting the two hot fork sites: not available, and the nearby one is a 2.2x regression (2026-08-05)
 
 The per-site filter census put 99% of `filter_branch` on two branches -

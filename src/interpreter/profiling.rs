@@ -87,6 +87,7 @@ fn instruction_type_name(instr: &Instruction) -> String {
     match instr {
         Instruction::Alloc => "Alloc".to_string(),
         Instruction::Select { .. } => "Select".to_string(),
+        Instruction::Kill { .. } => "Kill".to_string(),
         Instruction::Expand { .. } => "Expand".to_string(),
         Instruction::AssertClosure { fun_def, .. } => {
             format!("AssertClosure({})", fun_def.as_str())

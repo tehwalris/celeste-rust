@@ -32,6 +32,7 @@ pub mod collapse_loop;
 pub mod convert_assert;
 pub mod convert_ternary;
 pub mod if_convert;
+pub mod kill_dead;
 pub mod fold;
 pub mod fold_reflexive;
 pub mod fold_select;

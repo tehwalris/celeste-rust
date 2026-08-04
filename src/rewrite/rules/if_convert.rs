@@ -86,6 +86,9 @@ pub fn is_speculatable(instr: &Instruction) -> bool {
         | Instruction::StoreEmptyTable { .. }
         | Instruction::StoreClosure { .. }
         | Instruction::Call { .. } => false,
+        // A kill is a claim about a whole path, not a value: hoisting one
+        // into a head would drop a local the other arm still reads.
+        Instruction::Kill { .. } => false,
         // Allocating would add a cell to the heap on a path that did not take
         // the branch, which changes `StateShape` and so changes which states
         // can merge - a silent cost, not a loud failure.
