@@ -188,6 +188,23 @@ impl State {
         if reason == FILTER_BRANCH {
             crate::op_census::record_branch_filter(mask.len(), kept.len(), t_census);
         }
+        if crate::op_census::enabled() {
+            let count_env = |env: &LocalEnv| {
+                env.iter().filter(|(_, v)| is_vector_value(v)).count()
+            };
+            crate::op_census::record_filter_columns(
+                (0..self.heap.len())
+                    .filter_map(|i| self.heap.get_opt(HeapId::from_raw(i)))
+                    .filter(|hv| match hv {
+                        HeapValue::Value(v) => is_vector_value(v),
+                        HeapValue::Closure(_, caps) => caps.iter().any(is_vector_value),
+                        _ => false,
+                    })
+                    .count(),
+                count_env(&self.local_env),
+                self.outer_local_envs.iter().map(count_env).sum(),
+            );
+        }
         let reason_index = crate::op_census::REASON_NAMES
             .iter()
             .position(|name| *name == reason)
@@ -434,4 +451,14 @@ impl Drop for CensusGcGuard {
     fn drop(&mut self) {
         crate::op_census::record(crate::op_census::Cat::Gc, 0, 0, self.0.take());
     }
+}
+
+/// A value the filter has to gather, as opposed to one it can leave alone.
+fn is_vector_value(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Number(MaybeVector::Vector(_))
+            | Value::NumberInterval(MaybeVector::Vector(_))
+            | Value::Bool(MaybeVector::Vector(_))
+    )
 }

@@ -57,6 +57,20 @@ static DEDUP_EQ_CALLS: AtomicU64 = AtomicU64::new(0);
 static DEDUP_COL_CMPS: AtomicU64 = AtomicU64::new(0);
 static DEDUP_COLS: AtomicU64 = AtomicU64::new(0);
 
+/// Where the vector columns a filter has to gather actually live. Filter
+/// cost is proportional to live columns, and the two containers have
+/// completely different levers: `local_env` columns are killed by liveness
+/// pruning (which the interpreter currently disables - it runs
+/// `all_live()`), heap columns are not.
+static FILTER_COLS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+pub const COL_ORIGINS: [&str; 3] = ["heap", "local_env", "outer_local_envs"];
+
+pub fn record_filter_columns(heap: usize, local: usize, outer: usize) {
+    FILTER_COLS[0].fetch_add(heap as u64, Ordering::Relaxed);
+    FILTER_COLS[1].fetch_add(local as u64, Ordering::Relaxed);
+    FILTER_COLS[2].fetch_add(outer as u64, Ordering::Relaxed);
+}
+
 /// Source length of filter gathers, against which `Cat::Filter`'s element
 /// count is the *kept* length. The ratio decides what the gather actually
 /// costs: below about one kept element per cache line, a gather touches
@@ -222,6 +236,9 @@ pub fn reset() {
         FILTER_REASON_KEPT[i].store(0, Ordering::Relaxed);
         FILTER_REASON_NANOS[i].store(0, Ordering::Relaxed);
     }
+    for i in 0..3 {
+        FILTER_COLS[i].store(0, Ordering::Relaxed);
+    }
     FILTER_SRC_ELEMS.store(0, Ordering::Relaxed);
     FILTER_SRC_BYTES.store(0, Ordering::Relaxed);
     DEDUP_EQ_CALLS.store(0, Ordering::Relaxed);
@@ -317,6 +334,22 @@ pub fn report() {
             calls,
             FILTER_REASON_KEPT[i].load(Ordering::Relaxed) as f64 / 1e6,
             FILTER_REASON_NANOS[i].load(Ordering::Relaxed) as f64 / 1e9,
+        );
+    }
+    let cols: Vec<u64> = (0..3).map(|i| FILTER_COLS[i].load(Ordering::Relaxed)).collect();
+    if cols.iter().sum::<u64>() > 0 {
+        let total = cols.iter().sum::<u64>() as f64;
+        eprintln!(
+            "filter columns by origin: {}",
+            (0..3)
+                .map(|i| format!(
+                    "{} {} ({:.1}%)",
+                    COL_ORIGINS[i],
+                    cols[i],
+                    100.0 * cols[i] as f64 / total
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     let src_elems = FILTER_SRC_ELEMS.load(Ordering::Relaxed);
