@@ -48,6 +48,21 @@ static NANOS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 static FILTER_HIST_CALLS: [AtomicU64; 24] = [const { AtomicU64::new(0) }; 24];
 static FILTER_HIST_ELEMS: [AtomicU64; 24] = [const { AtomicU64::new(0) }; 24];
 
+/// Extra detail for the dedup bucket phase, which the plain
+/// calls/elems/bytes shape cannot express: how many candidate rows the
+/// probe actually verified, and how many column cells that verification
+/// read. The two have completely different fixes (probe locality vs
+/// row-major random gathers), so the split decides what to build.
+static DEDUP_EQ_CALLS: AtomicU64 = AtomicU64::new(0);
+static DEDUP_COL_CMPS: AtomicU64 = AtomicU64::new(0);
+static DEDUP_COLS: AtomicU64 = AtomicU64::new(0);
+
+pub fn record_dedup_detail(eq_calls: u64, col_cmps: u64, cols: u64) {
+    DEDUP_EQ_CALLS.fetch_add(eq_calls, Ordering::Relaxed);
+    DEDUP_COL_CMPS.fetch_add(col_cmps, Ordering::Relaxed);
+    DEDUP_COLS.fetch_add(cols, Ordering::Relaxed);
+}
+
 pub fn record_filter_size(kept: usize) {
     let b = (usize::BITS - kept.max(1).leading_zeros() - 1).min(23) as usize;
     FILTER_HIST_CALLS[b].fetch_add(1, Ordering::Relaxed);
@@ -76,6 +91,25 @@ pub fn record(cat: Cat, elems: usize, bytes: usize, started: Option<std::time::I
     ELEMS[i].fetch_add(elems as u64, Ordering::Relaxed);
     BYTES[i].fetch_add(bytes as u64, Ordering::Relaxed);
     NANOS[i].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// Zero every counter. Used to census one frame at a time - the per-lane
+/// cost of an op as the lane count grows is the whole question behind
+/// tiling, and cumulative totals hide it.
+pub fn reset() {
+    for i in 0..N {
+        CALLS[i].store(0, Ordering::Relaxed);
+        ELEMS[i].store(0, Ordering::Relaxed);
+        BYTES[i].store(0, Ordering::Relaxed);
+        NANOS[i].store(0, Ordering::Relaxed);
+    }
+    for b in 0..24 {
+        FILTER_HIST_CALLS[b].store(0, Ordering::Relaxed);
+        FILTER_HIST_ELEMS[b].store(0, Ordering::Relaxed);
+    }
+    DEDUP_EQ_CALLS.store(0, Ordering::Relaxed);
+    DEDUP_COL_CMPS.store(0, Ordering::Relaxed);
+    DEDUP_COLS.store(0, Ordering::Relaxed);
 }
 
 pub fn report() {
@@ -125,6 +159,19 @@ pub fn report() {
         "{:<14} {:>41.2} s inside censused ops",
         "total", total_ns as f64 / 1e9
     );
+    let eq_calls = DEDUP_EQ_CALLS.load(Ordering::Relaxed);
+    if eq_calls > 0 {
+        let col_cmps = DEDUP_COL_CMPS.load(Ordering::Relaxed);
+        let cols = DEDUP_COLS.load(Ordering::Relaxed);
+        eprintln!(
+            "dedup detail: {:.1} M rows_equal calls, {:.1} M column cells read \
+             ({:.1} of {:.1} columns per call before a mismatch)",
+            eq_calls as f64 / 1e6,
+            col_cmps as f64 / 1e6,
+            col_cmps as f64 / eq_calls as f64,
+            cols as f64 / eq_calls as f64,
+        );
+    }
     eprintln!("filter gather size histogram (kept elems/call):");
     for b in 0..24 {
         let c = FILTER_HIST_CALLS[b].load(Ordering::Relaxed);

@@ -110,6 +110,11 @@ fn main() -> Result<()> {
                 run.lane_count(),
                 t.elapsed()
             );
+            if celeste_rust::op_census::enabled() {
+                eprintln!("--- census for frame {} alone ---", frame);
+                celeste_rust::op_census::report();
+                celeste_rust::op_census::reset();
+            }
         }
         println!(
             "\nTotal: {} states ({} expanded) after {} frames",

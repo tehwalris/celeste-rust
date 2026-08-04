@@ -17,6 +17,14 @@ impl Pico8Num {
         Self((v as i32) << 16)
     }
 
+    /// The raw fixed-point bits. The representation is a plain `i32` with no
+    /// padding and no two encodings of one value, so comparing bits is
+    /// exactly comparing numbers - which is what lets dedup pack rows of
+    /// mixed value types into one word array and compare them wholesale.
+    pub const fn to_bits(&self) -> u32 {
+        self.0 as u32
+    }
+
     pub const fn as_i16(&self) -> Option<i16> {
         if self.0 & 0xffff == 0 {
             Some((self.0 >> 16) as i16)

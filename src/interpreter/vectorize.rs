@@ -570,6 +570,179 @@ fn rows_equal(vector_values: &[VectorRef], idx1: usize, idx2: usize) -> bool {
     true
 }
 
+/// Which lanes to keep: `true` for the first occurrence of each distinct
+/// row, `false` for every later copy of it. Also returns how many were kept.
+///
+/// The obvious algorithm - one pass, per-hash lists of surviving rows,
+/// `rows_equal` against each candidate - is what this replaces, because its
+/// verification is where the time went. Measured at frame 39 of the
+/// rewritten program: 1.32 s in this phase, of which 0.43 s was the hash
+/// probe and 0.89 s was verification, doing 303 M column-cell reads
+/// scattered across ~17 separately-allocated column vectors (a ~340 MB
+/// footprint at 2.9 ns per cell - cache-miss bound, not compute bound).
+/// 97% of rows are duplicates and essentially every comparison reads all
+/// columns and reports equal, so there is no early exit to win with; the
+/// only lever is making the reads cheaper.
+///
+/// So verification is restructured to touch one small table instead of
+/// every column:
+///
+/// 1. A probe pass assigns each row the *first* row of its hash class.
+///    Nothing is compared yet, so this is one sequential sweep.
+/// 2. The candidate-unique rows - only those, typically a few percent of
+///    the input - are packed row-major into a dense word array, built in
+///    L2-sized tiles of rows so each tile stays resident while all columns
+///    write into it.
+/// 3. Verification streams the columns in row order and compares each
+///    duplicate against its representative's packed row: one random access
+///    into a table small enough to live in cache, instead of one per
+///    column into the full-width columns.
+/// 4. Any row that disagrees with its representative means two *different*
+///    rows share a 64-bit hash. Then, and only then, every hash class
+///    containing such a row is redone by the original row-major algorithm.
+///    Classes are independent, so this reproduces the old result exactly -
+///    it is a fallback for a case that is astronomically unlikely (~1e-5
+///    expected collisions at these row counts), not an approximation.
+fn bucket_unique_mask(vector_values: &[VectorRef], row_hashes: &[u64]) -> (Vec<bool>, usize) {
+    let n = row_hashes.len();
+
+    // 1. Probe: representative = first row seen with this hash.
+    let mut first_of_hash: FxHashMap<u64, u32> =
+        FxHashMap::with_capacity_and_hasher(n / 2, Default::default());
+    let mut mask = vec![false; n];
+    // For each row, the dense slot of its representative. A representative
+    // points at itself, so verification needs no special case for it.
+    let mut dense_of_row: Vec<u32> = vec![0; n];
+    let mut uniq: Vec<u32> = Vec::new();
+
+    for (i, &row_hash) in row_hashes.iter().enumerate() {
+        match first_of_hash.entry(row_hash) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                let dense = uniq.len() as u32;
+                slot.insert(dense);
+                uniq.push(i as u32);
+                dense_of_row[i] = dense;
+                mask[i] = true;
+            }
+            std::collections::hash_map::Entry::Occupied(slot) => {
+                dense_of_row[i] = *slot.get();
+            }
+        }
+    }
+    let mut unique_count = uniq.len();
+    if unique_count == n {
+        // Every row has its own hash, so no two rows can be equal and there
+        // is nothing to verify.
+        return (mask, unique_count);
+    }
+
+    // 2. Pack the representatives, one row per `words_per_row` words.
+    let words_per_row: usize = vector_values
+        .iter()
+        .map(|v| match v {
+            VectorRef::NumberIntervals(_) => 2,
+            VectorRef::Numbers(_) | VectorRef::Bools(_) => 1,
+        })
+        .sum();
+    let mut dense = vec![0u32; uniq.len() * words_per_row];
+    // Tile so the destination stays in L2 (1 MiB/core) across all the
+    // column passes that fill it.
+    const DENSE_TILE_BYTES: usize = 192 * 1024;
+    let tile_rows = (DENSE_TILE_BYTES / (words_per_row * 4)).max(1);
+    for tile_start in (0..uniq.len()).step_by(tile_rows) {
+        let tile_end = (tile_start + tile_rows).min(uniq.len());
+        let mut w = 0;
+        for vec in vector_values {
+            match vec {
+                VectorRef::Numbers(nums) => {
+                    for d in tile_start..tile_end {
+                        dense[d * words_per_row + w] = nums[uniq[d] as usize].to_bits();
+                    }
+                    w += 1;
+                }
+                VectorRef::Bools(bools) => {
+                    for d in tile_start..tile_end {
+                        dense[d * words_per_row + w] = bools[uniq[d] as usize] as u32;
+                    }
+                    w += 1;
+                }
+                VectorRef::NumberIntervals(ivs) => {
+                    for d in tile_start..tile_end {
+                        let iv = &ivs[uniq[d] as usize];
+                        dense[d * words_per_row + w] = iv.low.to_bits();
+                        dense[d * words_per_row + w + 1] = iv.high.to_bits();
+                    }
+                    w += 2;
+                }
+            }
+        }
+    }
+
+    // 3. Verify each duplicate against its representative's packed row.
+    // Branchless: 97% of these agree, so an early exit would only cost a
+    // mispredict.
+    let mut contaminated: Vec<usize> = Vec::new();
+    for i in 0..n {
+        if mask[i] {
+            continue;
+        }
+        let base = dense_of_row[i] as usize * words_per_row;
+        let rep = &dense[base..base + words_per_row];
+        let mut equal = true;
+        let mut w = 0;
+        for vec in vector_values {
+            match vec {
+                VectorRef::Numbers(nums) => {
+                    equal &= rep[w] == nums[i].to_bits();
+                    w += 1;
+                }
+                VectorRef::Bools(bools) => {
+                    equal &= rep[w] == bools[i] as u32;
+                    w += 1;
+                }
+                VectorRef::NumberIntervals(ivs) => {
+                    equal &= rep[w] == ivs[i].low.to_bits();
+                    equal &= rep[w + 1] == ivs[i].high.to_bits();
+                    w += 2;
+                }
+            }
+        }
+        if !equal {
+            contaminated.push(i);
+        }
+    }
+
+    // 4. Hash collision between distinct rows: redo those classes exactly.
+    if !contaminated.is_empty() {
+        let bad: FxHashSet<u64> = contaminated.iter().map(|&i| row_hashes[i]).collect();
+        let mut per_hash: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
+        for i in 0..n {
+            let row_hash = row_hashes[i];
+            if !bad.contains(&row_hash) {
+                continue;
+            }
+            let indices = per_hash.entry(row_hash).or_default();
+            let is_duplicate = indices
+                .iter()
+                .any(|&prev_idx| rows_equal(vector_values, prev_idx, i));
+            if is_duplicate {
+                if mask[i] {
+                    mask[i] = false;
+                    unique_count -= 1;
+                }
+            } else {
+                indices.push(i);
+                if !mask[i] {
+                    mask[i] = true;
+                    unique_count += 1;
+                }
+            }
+        }
+    }
+
+    (mask, unique_count)
+}
+
 /// Deduplicate a vectorized state by removing duplicate vector elements.
 /// Returns a new state with unique vector elements.
 fn dedup_vectorized_state(mut state: State) -> State {
@@ -596,26 +769,9 @@ fn dedup_vectorized_state(mut state: State) -> State {
     }
 
     // Hash every row up front (column-major, see `hash_rows`), then bucket.
-    // Map from hash -> list of unique row indices with that hash.
     let row_hashes = hash_rows(&vector_values, state.vector_size);
     let t_bucket = crate::op_census::start();
-    let mut hash_to_indices: FxHashMap<u64, Vec<usize>> =
-        FxHashMap::with_capacity_and_hasher(state.vector_size / 2, Default::default());
-    let mut mask = vec![false; state.vector_size];
-    let mut unique_count = 0;
-
-    for (i, &row_hash) in row_hashes.iter().enumerate() {
-        let indices = hash_to_indices.entry(row_hash).or_insert_with(Vec::new);
-
-        // Check if this row matches any existing row with the same hash
-        let is_duplicate = indices.iter().any(|&prev_idx| rows_equal(&vector_values, prev_idx, i));
-
-        if !is_duplicate {
-            indices.push(i);
-            mask[i] = true;
-            unique_count += 1;
-        }
-    }
+    let (mask, unique_count) = bucket_unique_mask(&vector_values, &row_hashes);
 
     crate::op_census::record(
         crate::op_census::Cat::DedupBucket,
@@ -623,6 +779,14 @@ fn dedup_vectorized_state(mut state: State) -> State {
         0,
         t_bucket,
     );
+    if crate::op_census::enabled() {
+        let verified = (state.vector_size - unique_count) as u64;
+        crate::op_census::record_dedup_detail(
+            verified,
+            verified * vector_values.len() as u64,
+            verified * vector_values.len() as u64,
+        );
+    }
     crate::merge_stats::record_dedup(
         state.vector_size,
         vector_values.len(),
@@ -1282,6 +1446,56 @@ mod tests {
             HeapValue::Value(Value::Number(MaybeVector::Scalar(_))) => {}
             _ => panic!("Expected scalar after dedup"),
         }
+    }
+
+    /// The fast path: distinct hashes mean distinct rows, equal hashes are
+    /// confirmed against the packed representative.
+    #[test]
+    fn bucket_keeps_the_first_of_each_distinct_row() {
+        let nums: Vec<Pico8Num> = [1, 2, 1, 3, 2, 1].iter().map(|v| Pico8Num::from_i16(*v)).collect();
+        let bools = [true, false, true, true, false, true];
+        let values = vec![
+            VectorRef::Numbers(&nums),
+            VectorRef::Bools(&bools),
+        ];
+        let hashes = hash_rows(&values, nums.len());
+        let (mask, unique) = bucket_unique_mask(&values, &hashes);
+        assert_eq!(mask, vec![true, true, false, true, false, false]);
+        assert_eq!(unique, 3);
+    }
+
+    /// The fallback. Every row is handed the same hash, so the packed-row
+    /// check rejects most representatives and the original row-major
+    /// algorithm has to redo the whole class - which it must do with the
+    /// same answer as the collision-free path. This is the only way that
+    /// branch gets exercised: a real 64-bit collision has never been seen.
+    #[test]
+    fn bucket_falls_back_exactly_when_hashes_collide() {
+        let nums: Vec<Pico8Num> = [1, 2, 1, 3, 2, 1].iter().map(|v| Pico8Num::from_i16(*v)).collect();
+        let bools = [true, false, true, true, false, true];
+        let values = vec![
+            VectorRef::Numbers(&nums),
+            VectorRef::Bools(&bools),
+        ];
+        let all_same = vec![0x5eed_5eed_5eed_5eedu64; nums.len()];
+        let (mask, unique) = bucket_unique_mask(&values, &all_same);
+        assert_eq!(mask, vec![true, true, false, true, false, false]);
+        assert_eq!(unique, 3);
+    }
+
+    /// A partial collision: two distinct rows share a hash while a third
+    /// row's hash is its own. The colliding class is redone, the other is
+    /// left alone.
+    #[test]
+    fn bucket_fallback_touches_only_the_colliding_class() {
+        let nums: Vec<Pico8Num> = [1, 2, 3, 3, 4].iter().map(|v| Pico8Num::from_i16(*v)).collect();
+        let values = vec![VectorRef::Numbers(&nums)];
+        // Rows 0,1 collide (distinct values); rows 2,3 share a hash and are
+        // genuinely equal; row 4 is alone.
+        let hashes = vec![7, 7, 9, 9, 11];
+        let (mask, unique) = bucket_unique_mask(&values, &hashes);
+        assert_eq!(mask, vec![true, true, true, false, true]);
+        assert_eq!(unique, 4);
     }
 
     #[test]
