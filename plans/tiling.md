@@ -143,13 +143,51 @@ lanes, which is what inflates the dedup input to 19.8 M rows and the
 fragment count to ~695/frame. Their bill arrives as merge volume, not
 filter time, and the fix is `expand` (task #47), not selects.
 
-Both filter sites keep exactly 50.0% of lanes, every time. That is the
-signature of a condition that tracks an expanded button's lane bit -
-`expand` lays lanes out as [all-true half, all-false half], and
-`dash_time > 0` follows the dash button exactly. Worth confirming: if
-the split is contiguous in lane order, it is a slice rather than a
-gather, which changes both what if-conversion is worth and what the
-filter itself could cost.
+**Correction: the 50.0% keep rate is an artifact of this metric, not a
+signal.** A split records two filter events, one per edge, each with
+`lanes_in` = the whole pre-split state and `kept` = its own share. The
+two shares sum to the state, so kept/lanes_in over both events is
+exactly 50% by construction whatever the real split was. An earlier
+draft read it as a condition tracking an expanded button's lane bit;
+that was wrong, and so was the premise under it - there is **no `expand`
+in the current program at all** (zero occurrences in `rewrite print`).
+The expand-based dash package was parked as a measured regression, so
+nothing duplicates lanes. Every split site forks states.
+
+### How long a fork stays forked
+
+Post-dominance over anonymous_61 (203 blocks, 3216 instructions):
+
+| site | condition | exclusive A | exclusive B | shared afterwards |
+|---|---|---|---|---|
+| in_i1_074_cont | `dash_time > 0` | 1 block / 48 instrs | 13 blocks / 471 instrs | 81 blocks / ~850 instrs |
+| and_or_join_126 | computed select | 9 blocks / 182 instrs | 0 | 82 blocks / ~845 instrs |
+
+The arms genuinely diverge for 48 vs 471 instructions (and 182 vs 0).
+After that both halves execute *the same* ~81 blocks to the end of the
+frame, as two separate states, never rejoined before the frame-boundary
+merge. (Formal post-dominance reports the function exit, because the
+shared blocks have several paths into them - not because they diverge.)
+
+So the fork is not what costs; how long it persists after it stops
+mattering is. ~850 instructions of identical code run twice over states
+that differ in a handful of columns, and the redundancy surfaces at the
+merge, where dedup collapses 19.8 M rows to 613 k. Note the fork's cost
+is therefore *not* lane-work - the halves sum to the whole - but
+per-fragment fixed cost plus merge volume, which is why the 1.03 s of
+measured filter time understates it.
+
+Two plays, both with existing machinery:
+
+* **If-convert the two sites.** At most ~500 and ~182 instructions of
+  extra per-lane work (~15% more instruction-work on all lanes) to
+  remove a state copy, ~850 duplicated instructions and the merge
+  volume. Whether it is available depends on what is in arm B's 13
+  exclusive blocks - stores and calls are what `speculate_region` and
+  `absorb_stores` exist for, and that is the next thing to check.
+* **Rejoin early** - a merge at the reconvergence point (`add_hint`).
+  Measured as a regression when placed after the btn fan-out; never
+  tried here, where the reconvergence is 13 blocks after the split.
 
 Ranked next steps, by measured prize:
 
