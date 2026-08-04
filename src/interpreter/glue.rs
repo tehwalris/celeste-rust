@@ -19,7 +19,7 @@ use super::{
     state::State,
     tracing::TraceSpan,
     value::Value,
-    vectorize::{union_diff_states, vectorize_states},
+    vectorize::{vectorize_states, StateSetAccumulator},
 };
 
 /// Interprets a CFG with the given initial state and fixed environment.
@@ -125,8 +125,8 @@ fn interpret_prepared_cfg_inner(
     // Accumulator for hint_normalize blocks - we collect states here before processing
     // The "accumulated" field persists across iterations and contains all states seen so far
     // The "pending" field contains states that arrived since last processing
-    let mut hint_normalize_accumulators: FxHashMap<Label, (Vec<State>, Vec<State>, Vec<Option<u64>>)> = FxHashMap::default();
-    // ^-- (accumulated_states, pending_states, dag_ids)
+    let mut hint_normalize_accumulators: FxHashMap<Label, (StateSetAccumulator, Vec<State>, Vec<Option<u64>>)> = FxHashMap::default();
+    // ^-- (accumulated states + cached normalized forms, pending_states, dag_ids)
     let mut results: Vec<(State, Option<Value>)> = vec![];
 
     // Helper to queue states for a target block
@@ -136,7 +136,7 @@ fn interpret_prepared_cfg_inner(
         flow_data: FlowData,
         dag_id: Option<u64>,
         pending: &mut Vec<(Option<Label>, FlowData, Option<u64>)>,
-        accumulators: &mut FxHashMap<Label, (Vec<State>, Vec<State>, Vec<Option<u64>>)>,
+        accumulators: &mut FxHashMap<Label, (StateSetAccumulator, Vec<State>, Vec<Option<u64>>)>,
         cfg: &Cfg,
     | {
         let target_block = cfg.named.get(target);
@@ -160,7 +160,7 @@ fn interpret_prepared_cfg_inner(
                 }
                 std::collections::hash_map::Entry::Vacant(e) => {
                     // First time seeing this block: accumulated is empty, pending has the new states
-                    e.insert((vec![], new_states, vec![dag_id]));
+                    e.insert((StateSetAccumulator::default(), new_states, vec![dag_id]));
                 }
             }
         } else {
@@ -193,21 +193,17 @@ fn interpret_prepared_cfg_inner(
                     let dag_ids_copy: Vec<_> = std::mem::take(dag_ids);
 
                     // Vectorize pending states first (to merge compatible shapes)
-                    let (new_union, actually_new) = {
+                    let actually_new = {
                         // Named so the profile can tell merging at a
                         // hint_normalize block apart from merging at the frame
                         // boundary; they are the same code but different
                         // problems.
                         let _trace = TraceSpan::new("merge_hint_normalize", "merge_site");
                         let vectorized_pending = vectorize_states(pending);
-                        union_diff_states(
-                            std::mem::take(accumulated_states),
-                            vectorized_pending,
-                        )
+                        // The accumulator keeps its normalized forms across
+                        // fixpoint rounds; only the new arrivals normalize.
+                        accumulated_states.union_diff(vectorized_pending)
                     };
-
-                    // Update the accumulator with the union (persists for next iteration)
-                    *accumulated_states = new_union;
 
                     // Only process actually_new states
                     if actually_new.is_empty() {

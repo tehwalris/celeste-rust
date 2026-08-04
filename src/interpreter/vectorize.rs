@@ -1208,6 +1208,37 @@ pub fn normalize_state_for_comparison(state: &State) -> NormalizedState {
 /// - `actually_new`: Only the states that weren't already in accumulated
 ///
 /// This is the key operation for fixed-point iteration at hint_normalize blocks.
+/// An accumulated state set with its normalized forms cached. States are
+/// immutable once inside, so their normalized forms never go stale - the
+/// fixpoint loop at a hint block calls `union_diff` every round, and
+/// re-normalizing the whole accumulated set each time (clone + GC + a sort
+/// per vector column, per state) was measured as the entire
+/// `union_diff_states` span.
+#[derive(Default)]
+pub struct StateSetAccumulator {
+    pub states: Vec<State>,
+    normalized: FxHashSet<NormalizedState>,
+}
+
+impl StateSetAccumulator {
+    /// Add `potentially_new` states, returning the ones not already present.
+    /// Identical membership semantics to `union_diff_states`: same
+    /// normalization, same first-wins dedup within the batch.
+    pub fn union_diff(&mut self, potentially_new: Vec<State>) -> Vec<State> {
+        let _trace = TraceSpan::new("union_diff_states", "vectorize");
+        let mut actually_new = Vec::new();
+        for state in potentially_new {
+            let normalized = normalize_state_for_comparison(&state);
+            if !self.normalized.contains(&normalized) {
+                self.normalized.insert(normalized);
+                self.states.push(state.clone());
+                actually_new.push(state);
+            }
+        }
+        actually_new
+    }
+}
+
 pub fn union_diff_states(
     accumulated: Vec<State>,
     potentially_new: Vec<State>,
