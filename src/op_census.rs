@@ -71,6 +71,26 @@ pub fn record_filter_columns(heap: usize, local: usize, outer: usize) {
     FILTER_COLS[2].fetch_add(outer as u64, Ordering::Relaxed);
 }
 
+/// What garbage collection actually reclaims, and how much of the heap a
+/// filter has to look at. `gc` only reclaims cells nothing can *reach*;
+/// a cell that is still reachable but will never be read again is invisible
+/// to it, and gets copied by every filter until the frame ends.
+static GC_CELLS_BEFORE: AtomicU64 = AtomicU64::new(0);
+static GC_CELLS_AFTER: AtomicU64 = AtomicU64::new(0);
+static FILTER_HEAP_CELLS: AtomicU64 = AtomicU64::new(0);
+
+pub fn record_gc_cells(before: usize, after: usize) {
+    if !enabled() {
+        return;
+    }
+    GC_CELLS_BEFORE.fetch_add(before as u64, Ordering::Relaxed);
+    GC_CELLS_AFTER.fetch_add(after as u64, Ordering::Relaxed);
+}
+
+pub fn record_filter_heap_cells(cells: usize) {
+    FILTER_HEAP_CELLS.fetch_add(cells as u64, Ordering::Relaxed);
+}
+
 /// Source length of filter gathers, against which `Cat::Filter`'s element
 /// count is the *kept* length. The ratio decides what the gather actually
 /// costs: below about one kept element per cache line, a gather touches
@@ -230,6 +250,9 @@ pub fn reset() {
         FILTER_HIST_CALLS[b].store(0, Ordering::Relaxed);
         FILTER_HIST_ELEMS[b].store(0, Ordering::Relaxed);
     }
+    GC_CELLS_BEFORE.store(0, Ordering::Relaxed);
+    GC_CELLS_AFTER.store(0, Ordering::Relaxed);
+    FILTER_HEAP_CELLS.store(0, Ordering::Relaxed);
     branch_site_stats().lock().unwrap().clear();
     for i in 0..3 {
         FILTER_REASON_CALLS[i].store(0, Ordering::Relaxed);
@@ -334,6 +357,25 @@ pub fn report() {
             calls,
             FILTER_REASON_KEPT[i].load(Ordering::Relaxed) as f64 / 1e6,
             FILTER_REASON_NANOS[i].load(Ordering::Relaxed) as f64 / 1e9,
+        );
+    }
+    let gc_before = GC_CELLS_BEFORE.load(Ordering::Relaxed);
+    if gc_before > 0 {
+        let gc_after = GC_CELLS_AFTER.load(Ordering::Relaxed);
+        eprintln!(
+            "gc: {} cells in -> {} out ({:.1}% unreachable and reclaimed)",
+            gc_before,
+            gc_after,
+            100.0 * (gc_before - gc_after) as f64 / gc_before as f64,
+        );
+    }
+    let heap_cells = FILTER_HEAP_CELLS.load(Ordering::Relaxed);
+    if heap_cells > 0 {
+        eprintln!(
+            "filter heap reach: {} cells present, {} of them hold vectors ({:.1}%)",
+            heap_cells,
+            FILTER_COLS[0].load(Ordering::Relaxed),
+            100.0 * FILTER_COLS[0].load(Ordering::Relaxed) as f64 / heap_cells as f64,
         );
     }
     let cols: Vec<u64> = (0..3).map(|i| FILTER_COLS[i].load(Ordering::Relaxed)).collect();

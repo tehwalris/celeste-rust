@@ -192,6 +192,7 @@ impl State {
             let count_env = |env: &LocalEnv| {
                 env.iter().filter(|(_, v)| is_vector_value(v)).count()
             };
+            crate::op_census::record_filter_heap_cells(self.heap.len());
             crate::op_census::record_filter_columns(
                 (0..self.heap.len())
                     .filter_map(|i| self.heap.get_opt(HeapId::from_raw(i)))
@@ -274,7 +275,9 @@ impl State {
     /// identity matters: a later `Store` through that pointer must still work.
     pub fn gc(&mut self) {
         let t_census = crate::op_census::start();
+        let before = self.heap.len();
         self.gc_inner(t_census);
+        crate::op_census::record_gc_cells(before, self.heap.len());
     }
 
     // (census guard defined at module scope below)
