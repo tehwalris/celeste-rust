@@ -546,6 +546,37 @@ memory neutral at 34 and 37 (interleaved, lanes identical), and K drops
 `dedup_guards` pattern: a free K win, landed for the compiled kernel's
 sake. Differentially identical through 37.
 
+## The parallel interpreter (2026-08-04, overnight session)
+
+The interpreter was single-threaded on a 16-core (32-thread) machine.
+An overnight session parallelized the merge machinery and the large
+vector operations - full story, parked ideas and per-commit numbers in
+`plans/overnight-log.md`. Everything above this section that quotes
+wall-clock times predates the change; K figures are unaffected.
+
+Headline (interleaved full `-n 41` runs, 2 pairs, per-frame seconds):
+
+| frame | before | after | delta |
+|---|---|---|---|
+| 34 | 2.12 | 2.13 | 0% |
+| 37 | 6.77 | 5.78 | -15% |
+| 39 | 15.35 | 12.20 | -20% |
+| 40 | 24.00 | 18.66 | -22% |
+| 41 | 37.57 | 29.35 | -22% |
+
+Cumulative to frame 41: ~107 s -> **~87 s**. Peak RSS at 41: 44.3 ->
+42.8 GB. Differentially identical through frame 40. The win grows with
+depth because the deep frames are memory-bound merge/filter work,
+which is what parallelized (dedup -26% alone). The machine is
+single-socket / single-NUMA-node (7950X3D), so NUMA placement is not
+an available lever; THP is already `always`.
+
+Two standing lessons: (1) per-operation thread spawns are catastrophic
+(+75%) - the persistent lane pool exists because of this; (2) `rewrite
+bench` and the search runner disagree on filter-level parallelism
+(bench -4%, runner +35% - reverted); **runner A/B is the metric for
+interpreter changes**, bench remains fine for recipe-side A/Bs.
+
 ## Where the time goes
 
 `rewrite bench --frames 34 --profile`, on the current recipe. Self time, so the
