@@ -210,6 +210,24 @@ pub fn shape_of_state(state: &State) -> StateShape {
 }
 
 /// Merge multiple states with the same shape into one vectorized state.
+/// Measurement only: what the dedup key would cost over a virtual
+/// concatenation, and how many columns the uniform check removes from it.
+/// Prices the two mechanisms that sank the three parked attempts, without
+/// changing what the merge does.
+fn price_virtual_concat(states: &[State]) {
+    use super::virtual_merge;
+    let Some(columns) = virtual_merge::collect_columns(states) else {
+        return;
+    };
+    let total_rows: usize = states.iter().map(|s| s.vector_size).sum();
+    let key: Vec<&virtual_merge::Column> = columns.iter().filter(|c| !c.is_uniform()).collect();
+    let started = std::time::Instant::now();
+    let hashes = virtual_merge::hash_rows(&key, total_rows);
+    let nanos = started.elapsed().as_nanos() as u64;
+    std::hint::black_box(&hashes);
+    crate::op_census::record_virtual_hash(columns.len(), columns.len() - key.len(), total_rows, nanos);
+}
+
 fn vectorize_same_shape_states(states: Vec<State>) -> State {
     if states.len() == 1 {
         return states.into_iter().next().unwrap();
@@ -1092,6 +1110,9 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
         return states;
     }
 
+    // Diagnostic: how compressible is the whole merge, post-gc?
+    let dump_before = super::merge_dump::measure(&states, true);
+
     // Validate input states (only in debug mode)
     let t0 = std::time::Instant::now();
     #[cfg(debug_assertions)]
@@ -1127,6 +1148,9 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
         states_by_shape
             .into_iter()
             .map(|(_, group)| {
+                if crate::op_census::enabled() && group.len() > 1 {
+                    price_virtual_concat(&group);
+                }
                 let vectorized = vectorize_same_shape_states(group);
                 let deduped = dedup_vectorized_state(vectorized);
                 unvectorize_if_possible(deduped)
@@ -1134,6 +1158,7 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
             .collect()
     };
     stats.vectorize_groups_ns = t3.elapsed().as_nanos() as u64;
+    super::merge_dump::report(dump_before, &result);
 
     // Validate output states (only in debug mode)
     let t4 = std::time::Instant::now();

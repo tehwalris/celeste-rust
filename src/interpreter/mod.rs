@@ -11,4 +11,6 @@ pub mod profiling;
 pub mod state;
 pub mod tracing;
 pub mod value;
+pub mod merge_dump;
+pub mod virtual_merge;
 pub mod vectorize;
