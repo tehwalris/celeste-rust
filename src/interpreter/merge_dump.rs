@@ -155,6 +155,79 @@ fn distinct_per_column(per_state: &[Vec<RawColumn>]) -> Vec<(usize, usize)> {
     out
 }
 
+/// Tests whether the surviving rows are *hierarchical*: many rows sharing a
+/// prefix of field values and differing only in a suffix, nested.
+///
+/// Columns are visited cheapest-first (fewest distinct values), and after
+/// each one we count how many distinct prefixes exist. A set of rows drawn
+/// independently from the per-field domains would multiply out by each
+/// column's full cardinality; a hierarchy branches by far less, and the
+/// profile shows exactly where the branching happens.
+fn prefix_profile(state: &State) {
+    let Some((columns, _)) = collect_columns_labeled(std::slice::from_ref(state)) else {
+        return;
+    };
+    let raw: Vec<RawColumn> = columns
+        .iter()
+        .map(|c| to_raw(c, state.vector_size))
+        .collect();
+    let labels = column_labels(state);
+    let rows = state.vector_size;
+    if rows == 0 {
+        return;
+    }
+
+    let key_at = |c: &RawColumn, row: usize| -> u64 {
+        let at = row * c.width;
+        let mut key = 0u64;
+        for (i, b) in c.bytes[at..at + c.width].iter().enumerate() {
+            key |= (*b as u64) << (8 * i);
+        }
+        key
+    };
+
+    // Cheapest columns first: a compact hierarchy, if there is one, shows up
+    // as long stretches with a branching factor near 1.
+    let mut order: Vec<usize> = (0..raw.len()).collect();
+    let cardinality: Vec<usize> = raw
+        .iter()
+        .map(|c| {
+            let mut seen: rustc_hash::FxHashSet<u64> = Default::default();
+            for row in 0..rows {
+                seen.insert(key_at(c, row));
+            }
+            seen.len()
+        })
+        .collect();
+    order.sort_by_key(|i| (cardinality[*i], *i));
+
+    eprintln!(
+        "               prefix profile of the merged rows ({} rows, cheapest field first):",
+        rows
+    );
+    let mut hashes = vec![0xcbf2_9ce4_8422_2325u64; rows];
+    let mut previous = 1usize;
+    for index in order {
+        let column = &raw[index];
+        for (row, h) in hashes.iter_mut().enumerate() {
+            *h = (h.rotate_left(26) ^ key_at(column, row)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        }
+        let distinct: rustc_hash::FxHashSet<u64> = hashes.iter().copied().collect();
+        let distinct = distinct.len();
+        // Only print where the structure actually changes.
+        if distinct != previous {
+            eprintln!(
+                "                 +{:<26} card {:>4}  ->{:>9} distinct prefixes  (x{:.2})",
+                labels.get(index).cloned().unwrap_or_default(),
+                cardinality[index],
+                distinct,
+                distinct as f64 / previous as f64,
+            );
+            previous = distinct;
+        }
+    }
+}
+
 /// What one side of the merge costs, stored and stored-compressed.
 pub struct Sizes {
     pub states: usize,
@@ -172,18 +245,21 @@ pub struct Sizes {
 /// many lanes (default 1,000,000 - small merges are noise). `detail` also
 /// prints the per-column breakdown.
 pub fn measure(states: &[State], detail: bool) -> Option<Sizes> {
-    // Cached: `vectorize_states` runs ~100 times a frame and this is off in
-    // every normal run.
+    measure_with_threshold(states, detail, enabled_threshold()?)
+}
+
+/// Cached: `vectorize_states` runs ~100 times a frame and this is off in
+/// every normal run.
+fn enabled_threshold() -> Option<usize> {
     static THRESHOLD: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    let threshold = (*THRESHOLD.get_or_init(|| {
+    *THRESHOLD.get_or_init(|| {
         std::env::var_os("CELESTE_DUMP_MERGE").map(|setting| {
             setting
                 .to_str()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1_000_000)
         })
-    }))?;
-    measure_with_threshold(states, detail, threshold)
+    })
 }
 
 /// The merged side is much smaller than the threshold that selected the
@@ -353,6 +429,7 @@ pub fn report(before: Option<Sizes>, after: &[State]) {
         })
         .collect();
     rows.sort_by_key(|(_, b, _)| std::cmp::Reverse(b.1));
+    let _ = &rows;
     for (label, (lanes_b, uniq_b), (lanes_a, uniq_a)) in rows.iter().take(24) {
         eprintln!(
             "               {:<26} {:>9} /{:>9} ({:>5.2}%) {:>8} /{:>7} ({:>5.2}%)",
@@ -364,5 +441,17 @@ pub fn report(before: Option<Sizes>, after: &[State]) {
             lanes_a,
             100.0 * *uniq_a as f64 / (*lanes_a).max(1) as f64,
         );
+    }
+}
+
+/// Runs the hierarchy test on the merged state.
+pub fn report_structure(after: &[State]) {
+    if enabled_threshold().is_none() {
+        return;
+    }
+    if let Some(state) = after.iter().max_by_key(|s| s.vector_size) {
+        if state.vector_size >= 100_000 {
+            prefix_profile(state);
+        }
     }
 }

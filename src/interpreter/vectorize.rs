@@ -1159,6 +1159,7 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
     };
     stats.vectorize_groups_ns = t3.elapsed().as_nanos() as u64;
     super::merge_dump::report(dump_before, &result);
+    super::merge_dump::report_structure(&result);
 
     // Validate output states (only in debug mode)
     let t4 = std::time::Instant::now();
