@@ -91,6 +91,16 @@ pub fn record_filter_heap_cells(cells: usize) {
     FILTER_HEAP_CELLS.fetch_add(cells as u64, Ordering::Relaxed);
 }
 
+/// Locals *occupied* at filter time, against which `FILTER_COLS[1]` counts
+/// only the ones holding per-lane vectors. A local holding a scalar, a
+/// pointer or a nil costs a filter nothing, so the two numbers answer
+/// different questions: how much is live, versus how much is lane data.
+static FILTER_LOCAL_SLOTS: AtomicU64 = AtomicU64::new(0);
+
+pub fn record_filter_local_slots(slots: usize) {
+    FILTER_LOCAL_SLOTS.fetch_add(slots as u64, Ordering::Relaxed);
+}
+
 /// Source length of filter gathers, against which `Cat::Filter`'s element
 /// count is the *kept* length. The ratio decides what the gather actually
 /// costs: below about one kept element per cache line, a gather touches
@@ -253,6 +263,7 @@ pub fn reset() {
     GC_CELLS_BEFORE.store(0, Ordering::Relaxed);
     GC_CELLS_AFTER.store(0, Ordering::Relaxed);
     FILTER_HEAP_CELLS.store(0, Ordering::Relaxed);
+    FILTER_LOCAL_SLOTS.store(0, Ordering::Relaxed);
     branch_site_stats().lock().unwrap().clear();
     for i in 0..3 {
         FILTER_REASON_CALLS[i].store(0, Ordering::Relaxed);
@@ -376,6 +387,15 @@ pub fn report() {
             heap_cells,
             FILTER_COLS[0].load(Ordering::Relaxed),
             100.0 * FILTER_COLS[0].load(Ordering::Relaxed) as f64 / heap_cells as f64,
+        );
+    }
+    let local_slots = FILTER_LOCAL_SLOTS.load(Ordering::Relaxed);
+    if local_slots > 0 {
+        eprintln!(
+            "filter local reach: {} occupied slots, {} of them hold vectors ({:.1}%)",
+            local_slots,
+            FILTER_COLS[1].load(Ordering::Relaxed),
+            100.0 * FILTER_COLS[1].load(Ordering::Relaxed) as f64 / local_slots as f64,
         );
     }
     let cols: Vec<u64> = (0..3).map(|i| FILTER_COLS[i].load(Ordering::Relaxed)).collect();

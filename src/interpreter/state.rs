@@ -193,6 +193,10 @@ impl State {
                 env.iter().filter(|(_, v)| is_vector_value(v)).count()
             };
             crate::op_census::record_filter_heap_cells(self.heap.len());
+            crate::op_census::record_filter_local_slots(
+                self.local_env.iter().count()
+                    + self.outer_local_envs.iter().map(|e| e.iter().count()).sum::<usize>(),
+            );
             crate::op_census::record_filter_columns(
                 (0..self.heap.len())
                     .filter_map(|i| self.heap.get_opt(HeapId::from_raw(i)))
