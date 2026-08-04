@@ -55,6 +55,26 @@ fn cell_names(state: &State) -> std::collections::HashMap<usize, String> {
     names
 }
 
+/// Field-path names for a state's columns, in collection order.
+fn column_labels(state: &State) -> Vec<String> {
+    let names = cell_names(state);
+    let Some((_, origins)) = collect_columns_labeled(std::slice::from_ref(state)) else {
+        return Vec::new();
+    };
+    origins
+        .iter()
+        .map(|origin| match origin {
+            Origin::Heap(cell) => names
+                .get(cell)
+                .cloned()
+                .unwrap_or_else(|| format!("cell{}", cell)),
+            Origin::HeapCapture(cell, k) => format!("cell{}.capture{}", cell, k),
+            Origin::Local(slot) => format!("local{}", slot),
+            Origin::Outer(d, slot) => format!("outer{}.local{}", d, slot),
+        })
+        .collect()
+}
+
 /// One column of one state, as raw little-endian bytes.
 struct RawColumn {
     width: usize,
@@ -103,6 +123,38 @@ fn zstd_len(data: &[u8], level: i32) -> usize {
     encoder.finish().expect("zstd finish").len()
 }
 
+/// Distinct values per column, which is what a dictionary encoding would
+/// have to store. Keys are the element's raw bytes widened to u64, so
+/// equality here is exactly value equality (see `Pico8Num::to_bits`).
+fn distinct_per_column(per_state: &[Vec<RawColumn>]) -> Vec<(usize, usize)> {
+    let Some(first) = per_state.first() else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(first.len());
+    for (index, col) in first.iter().enumerate() {
+        let mut seen: rustc_hash::FxHashSet<u64> = Default::default();
+        let mut lanes = 0usize;
+        for state_cols in per_state {
+            // Fragments of a different shape have a different column list;
+            // counting them positionally would mix unrelated fields.
+            let Some(c) = state_cols.get(index) else { continue };
+            if c.width != col.width {
+                continue;
+            }
+            lanes += c.bytes.len() / c.width;
+            for chunk in c.bytes.chunks_exact(c.width) {
+                let mut key = 0u64;
+                for (i, b) in chunk.iter().enumerate() {
+                    key |= (*b as u64) << (8 * i);
+                }
+                seen.insert(key);
+            }
+        }
+        out.push((lanes, seen.len()));
+    }
+    out
+}
+
 /// What one side of the merge costs, stored and stored-compressed.
 pub struct Sizes {
     pub states: usize,
@@ -111,6 +163,9 @@ pub struct Sizes {
     pub raw: usize,
     pub col_major: usize,
     pub row_major: usize,
+    /// (lanes, distinct values) per column.
+    pub distinct: Vec<(usize, usize)>,
+    pub labels: Vec<String>,
 }
 
 /// Measures, if `CELESTE_DUMP_MERGE` is set and this merge is at least that
@@ -186,6 +241,8 @@ fn measure_with_threshold(states: &[State], detail: bool, threshold: usize) -> O
         raw: raw_bytes,
         col_major: zstd_len(&col_major, 3),
         row_major: zstd_len(&row_major, 3),
+        distinct: distinct_per_column(&per_state),
+        labels: column_labels(&states[0]),
     };
 
     // Per-column, on the largest state, so the ratios are not diluted by
@@ -278,4 +335,34 @@ pub fn report(before: Option<Sizes>, after: &[State]) {
         before.raw as f64 / before.col_major as f64,
         after.raw as f64 / after.col_major as f64,
     );
+
+    eprintln!(
+        "               {:<26} {:>22} {:>22}",
+        "distinct values per field", "unmerged", "merged"
+    );
+    let mut rows: Vec<(String, (usize, usize), (usize, usize))> = before
+        .distinct
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            (
+                before.labels.get(i).cloned().unwrap_or_default(),
+                *b,
+                after.distinct.get(i).copied().unwrap_or((0, 0)),
+            )
+        })
+        .collect();
+    rows.sort_by_key(|(_, b, _)| std::cmp::Reverse(b.1));
+    for (label, (lanes_b, uniq_b), (lanes_a, uniq_a)) in rows.iter().take(24) {
+        eprintln!(
+            "               {:<26} {:>9} /{:>9} ({:>5.2}%) {:>8} /{:>7} ({:>5.2}%)",
+            label,
+            uniq_b,
+            lanes_b,
+            100.0 * *uniq_b as f64 / (*lanes_b).max(1) as f64,
+            uniq_a,
+            lanes_a,
+            100.0 * *uniq_a as f64 / (*lanes_a).max(1) as f64,
+        );
+    }
 }
