@@ -21,6 +21,12 @@ struct Args {
     #[arg(short = 'n', long, default_value_t = 30)]
     frames: u32,
 
+    /// Run the RECIPE-REWRITTEN program through the same search loop
+    /// (states verified identical; see rewrite verify). Prototype for
+    /// making the rewritten program the search's program.
+    #[arg(long)]
+    rewritten: bool,
+
     /// Show detailed state info for frames starting at this number
     #[arg(long, default_value_t = 25)]
     detail_from: u32,
@@ -89,6 +95,31 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    if args.rewritten {
+        let recipe = celeste_rust::rewrite::recipe::Recipe::load("rewrites.jsonl")?;
+        let (program, _) = celeste_rust::rewrite::recipe::build(&recipe)?;
+        let mut run = celeste_rust::rewrite::verify::AbstractRun::start(&program)?;
+        for frame in 1..=args.frames {
+            let t = std::time::Instant::now();
+            run.step()?;
+            println!(
+                "Frame {}: {} states ({} expanded) in {:?}",
+                frame,
+                run.states().len(),
+                run.lane_count(),
+                t.elapsed()
+            );
+        }
+        println!(
+            "\nTotal: {} states ({} expanded) after {} frames",
+            run.states().len(),
+            run.lane_count(),
+            args.frames
+        );
+        celeste_rust::op_census::report();
+        return Ok(());
+    }
     run_game_frames(
         args.frames,
         args.detail_from,
