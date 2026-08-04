@@ -395,6 +395,15 @@ fn interpret_prepared_cfg_inner(
                     Ok(())
                 };
 
+                // Name the conditional for the census, so a filter inside
+                // `filter_by_mask` can be charged to the branch that caused it.
+                if crate::op_census::enabled() {
+                    crate::op_census::set_branch_site(
+                        name.as_deref().unwrap_or("__main"),
+                        block_label.as_ref().map_or("__entry", |l| l.as_str()),
+                    );
+                }
+
                 // True branch: clone the flow_data
                 let bound_true = adapter.flow_branch(terminator, true_target)?;
                 let true_flow_data = bound_true.flow(flow_data.clone())?;

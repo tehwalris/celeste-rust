@@ -247,7 +247,14 @@ impl<'a> BoundInterpreterFlow<'a> {
                         vec![state]
                     }))
                 }
-                Value::UnknownBool => Ok(FlowData::States(vec![state])),
+                Value::UnknownBool => {
+                    // Both edges get the whole state - no filtering, so this
+                    // costs a duplication and everything downstream of it
+                    // rather than filter time. Counted separately for that
+                    // reason.
+                    crate::op_census::record_unknown_branch_dup(state.vector_size);
+                    Ok(FlowData::States(vec![state]))
+                }
                 Value::Number(_)
                 | Value::NumberInterval(_)
                 | Value::Bool(MaybeVector::Scalar(true))

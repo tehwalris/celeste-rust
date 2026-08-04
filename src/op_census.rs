@@ -66,6 +66,83 @@ static DEDUP_COLS: AtomicU64 = AtomicU64::new(0);
 static FILTER_SRC_ELEMS: AtomicU64 = AtomicU64::new(0);
 static FILTER_SRC_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// Per-branch-site accounting for the two different things a conditional
+/// branch can cost.
+///
+/// A vector-bool condition with mixed lanes filters the state in two, and
+/// that shows up as `filter_branch` time. An `UnknownBool` condition does
+/// not filter at all - `flow.rs` sends the whole state down both edges -
+/// so it costs a state duplication and everything downstream of it
+/// instead, and pays nothing here. The two need completely different
+/// rewrites (if-conversion to selects vs `expand` into lanes), so
+/// attributing the cost per site is what says which sites are worth which
+/// treatment.
+#[derive(Default, Clone, Copy)]
+pub struct BranchSiteCost {
+    pub filter_events: u64,
+    pub lanes_in: u64,
+    pub lanes_kept: u64,
+    pub nanos: u64,
+    pub unknown_dups: u64,
+    pub unknown_dup_lanes: u64,
+}
+
+type SiteKey = (String, String);
+
+fn branch_site_stats() -> &'static std::sync::Mutex<std::collections::HashMap<SiteKey, BranchSiteCost>>
+{
+    static STATS: OnceLock<std::sync::Mutex<std::collections::HashMap<SiteKey, BranchSiteCost>>> =
+        OnceLock::new();
+    STATS.get_or_init(Default::default)
+}
+
+thread_local! {
+    /// The branch currently being flowed, so a filter deep inside
+    /// `filter_by_mask` can name the conditional that caused it.
+    static BRANCH_SITE: std::cell::RefCell<SiteKey> =
+        std::cell::RefCell::new((String::new(), String::new()));
+}
+
+/// Names the branch about to be flowed. Only called under the census.
+pub fn set_branch_site(function: &str, block: &str) {
+    BRANCH_SITE.with(|site| {
+        let mut site = site.borrow_mut();
+        site.0.clear();
+        site.0.push_str(function);
+        site.1.clear();
+        site.1.push_str(block);
+    });
+}
+
+fn with_current_site(f: impl FnOnce(&mut BranchSiteCost)) {
+    BRANCH_SITE.with(|site| {
+        let site = site.borrow();
+        let mut stats = branch_site_stats().lock().unwrap();
+        f(stats.entry(site.clone()).or_default());
+    });
+}
+
+pub fn record_branch_filter(lanes_in: usize, kept: usize, started: Option<std::time::Instant>) {
+    let Some(started) = started else { return };
+    let nanos = started.elapsed().as_nanos() as u64;
+    with_current_site(|entry| {
+        entry.filter_events += 1;
+        entry.lanes_in += lanes_in as u64;
+        entry.lanes_kept += kept as u64;
+        entry.nanos += nanos;
+    });
+}
+
+pub fn record_unknown_branch_dup(lanes: usize) {
+    if !enabled() {
+        return;
+    }
+    with_current_site(|entry| {
+        entry.unknown_dups += 1;
+        entry.unknown_dup_lanes += lanes as u64;
+    });
+}
+
 /// Whole-state filter events split by why they happened. `filter_branch` is
 /// overhead the branch-removal campaign exists to delete; `filter_dedup` is
 /// the merge doing useful work; `filter_split_flr` is the search genuinely
@@ -139,6 +216,7 @@ pub fn reset() {
         FILTER_HIST_CALLS[b].store(0, Ordering::Relaxed);
         FILTER_HIST_ELEMS[b].store(0, Ordering::Relaxed);
     }
+    branch_site_stats().lock().unwrap().clear();
     for i in 0..3 {
         FILTER_REASON_CALLS[i].store(0, Ordering::Relaxed);
         FILTER_REASON_KEPT[i].store(0, Ordering::Relaxed);
@@ -198,6 +276,36 @@ pub fn report() {
         "{:<14} {:>41.2} s inside censused ops",
         "total", total_ns as f64 / 1e9
     );
+    {
+        let stats = branch_site_stats().lock().unwrap();
+        let mut rows: Vec<_> = stats.iter().collect();
+        rows.sort_by_key(|(_, c)| std::cmp::Reverse(c.nanos));
+        if !rows.is_empty() {
+            eprintln!(
+                "branch sites by filter cost ({:<28} {:>7} {:>10} {:>8} {:>7} {:>10})",
+                "function::block", "filters", "lanes in", "kept %", "sec", "unknown"
+            );
+            for ((function, block), cost) in rows.iter().take(12) {
+                if cost.nanos == 0 && cost.unknown_dups == 0 {
+                    continue;
+                }
+                eprintln!(
+                    "  {:<44} {:>7} {:>10.1}M {:>7.1}% {:>7.2} {:>5} dups/{:.1}M lanes",
+                    format!("{}::{}", function, block),
+                    cost.filter_events,
+                    cost.lanes_in as f64 / 1e6,
+                    if cost.lanes_in > 0 {
+                        100.0 * cost.lanes_kept as f64 / cost.lanes_in as f64
+                    } else {
+                        0.0
+                    },
+                    cost.nanos as f64 / 1e9,
+                    cost.unknown_dups,
+                    cost.unknown_dup_lanes as f64 / 1e6,
+                );
+            }
+        }
+    }
     for i in 0..3 {
         let calls = FILTER_REASON_CALLS[i].load(Ordering::Relaxed);
         if calls == 0 {

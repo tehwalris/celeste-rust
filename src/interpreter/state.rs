@@ -185,6 +185,9 @@ impl State {
 
         self.vector_size = kept.len();
 
+        if reason == FILTER_BRANCH {
+            crate::op_census::record_branch_filter(mask.len(), kept.len(), t_census);
+        }
         let reason_index = crate::op_census::REASON_NAMES
             .iter()
             .position(|name| *name == reason)

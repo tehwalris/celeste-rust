@@ -111,24 +111,57 @@ Splitting filter time by reason (new census counters) at frame 39:
 
 So a quarter of the frame is still the interpreter cloning a state
 because a branch condition varies across lanes - the exact cost the
-rewrite recipe exists to remove, not an interpreter inefficiency. And
-`rewrite bench --profile` already names the offenders: at 37 frames, 503
-splits across **11 distinct sites**, concentrated in six:
+rewrite recipe exists to remove, not an interpreter inefficiency.
 
-| site | splits | uniform |
-|---|---|---|
-| anonymous_61 in_h061_in_i1_074_cont | 120 | 36 |
-| anonymous_61 in_h061_and_or_continue_182 | 78 | 0 |
-| anonymous_61 in_h061_if_body_162 | 78 | 0 |
-| anonymous_61 in_h061_in_i1_072_cont | 78 | 0 |
-| anonymous_61 in_h061_in_k030_cont | 39 | 0 |
-| anonymous_61 in_h061_and_or_join_126 | 36 | 120 |
+Charging each filter to the conditional that caused it (census names the
+branch site in `glue.rs`, `filter_by_mask` charges it) splits the 11
+split sites into two families that cost *completely different things*:
+
+| site | filters | lanes in | kept | sec | unknown dups |
+|---|---|---|---|---|---|
+| in_h061_in_i1_074_cont | 24 | 24.3 M | 50.0% | **0.68** | - |
+| in_h061_and_or_join_126 | 12 | 11.1 M | 50.0% | **0.35** | - |
+| __main in_i1_012_if_join_526 | 2 | 0.8 M | 50.0% | 0.01 | - |
+| anonymous_61 __entry | 2 | 0.7 M | 50.0% | 0.01 | - |
+| __main in_i1_012_cont | 2 | 0.1 M | 50.0% | 0.00 | - |
+| in_h061_in_i1_072_cont (k_dash) | 0 | - | - | 0.00 | 24 / 12.2 M |
+| in_h061_in_k030_cont (k_jump) | 0 | - | - | 0.00 | 12 / 6.1 M |
+| in_h061_if_body_162 (k_up) | 0 | - | - | 0.00 | 12 / 6.1 M |
+| in_h061_and_or_continue_182 (k_down) | 0 | - | - | 0.00 | 12 / 6.1 M |
+| in_h061_and_or_continue_75 | 0 | - | - | 0.00 | 4 / 2.0 M |
+| in_h061_if_join_60 | 0 | - | - | 0.00 | 4 / 2.0 M |
+
+**Two sites are 99% of the branch-filter cost**, and both are genuine
+vector conditions - `in_i1_074_cont` branches on `dash_time > 0`,
+`and_or_join_126` on a computed select. Those are if-conversion targets:
+selects, `speculate_region`, `absorb_stores`.
+
+**The four btn sites pay no filter time at all.** Their condition is an
+`UnknownBool`, and `flow.rs` sends the whole state down both edges
+without filtering - so they cost 68 state duplications over 34.5 M
+lanes, which is what inflates the dedup input to 19.8 M rows and the
+fragment count to ~695/frame. Their bill arrives as merge volume, not
+filter time, and the fix is `expand` (task #47), not selects.
+
+Both filter sites keep exactly 50.0% of lanes, every time. That is the
+signature of a condition that tracks an expanded button's lane bit -
+`expand` lays lanes out as [all-true half, all-false half], and
+`dash_time > 0` follows the dash button exactly. Worth confirming: if
+the split is contiguous in lane order, it is a slice rather than a
+gather, which changes both what if-conversion is worth and what the
+filter itself could cost.
 
 Ranked next steps, by measured prize:
 
-1. **Convert the six remaining hot split sites** (task #47 and kin). Worth
-   up to 1.03 s of a 4.10 s frame - the single largest item, and it is
-   recipe-side work, where `rewrite bench` is the right A/B metric.
+1. **If-convert `in_i1_074_cont` and `and_or_join_126`** - 1.03 s of a
+   4.10 s frame, and it is two sites, not six. Both are vector
+   conditions, so this is the existing select/speculate_region
+   machinery. Recipe-side work, where `rewrite bench` is the right A/B.
+1b. **`expand` the four btn sites** (task #47) - no filter time, but 68
+   state duplications over 34.5 M lanes feeding the merge. Its cost is
+   the merge volume, so measure it there, not in filter time. The trade
+   is more favourable than when k_up/k_down were done, since dedup just
+   got ~40% cheaper.
 2. **Radix-partitioned dedup** - partition rows by hash bits so each
    partition's probe table and representative rows fit L2. Est. 0.80 ->
    ~0.3 s, but it requires physically partitioning the columns.
