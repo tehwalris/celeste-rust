@@ -57,6 +57,38 @@ static DEDUP_EQ_CALLS: AtomicU64 = AtomicU64::new(0);
 static DEDUP_COL_CMPS: AtomicU64 = AtomicU64::new(0);
 static DEDUP_COLS: AtomicU64 = AtomicU64::new(0);
 
+/// Source length of filter gathers, against which `Cat::Filter`'s element
+/// count is the *kept* length. The ratio decides what the gather actually
+/// costs: below about one kept element per cache line, a gather touches
+/// every line of the source, so the honest traffic is the whole source -
+/// and the `Cat::Filter` GB/s figure, which counts only kept elements,
+/// understates it by exactly that factor.
+static FILTER_SRC_ELEMS: AtomicU64 = AtomicU64::new(0);
+static FILTER_SRC_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Whole-state filter events split by why they happened. `filter_branch` is
+/// overhead the branch-removal campaign exists to delete; `filter_dedup` is
+/// the merge doing useful work; `filter_split_flr` is the search genuinely
+/// fanning out. Knowing which one owns the time decides whether to make
+/// filtering faster or to stop doing it.
+static FILTER_REASON_CALLS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static FILTER_REASON_KEPT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static FILTER_REASON_NANOS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+pub const REASON_NAMES: [&str; 3] = ["filter_branch", "filter_dedup", "filter_split_flr"];
+
+pub fn record_filter_reason(reason_index: usize, kept: usize, started: Option<std::time::Instant>) {
+    let Some(started) = started else { return };
+    FILTER_REASON_CALLS[reason_index].fetch_add(1, Ordering::Relaxed);
+    FILTER_REASON_KEPT[reason_index].fetch_add(kept as u64, Ordering::Relaxed);
+    FILTER_REASON_NANOS[reason_index].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
+pub fn record_filter_source(src_elems: usize, elem_size: usize) {
+    FILTER_SRC_ELEMS.fetch_add(src_elems as u64, Ordering::Relaxed);
+    FILTER_SRC_BYTES.fetch_add((src_elems * elem_size) as u64, Ordering::Relaxed);
+}
+
 pub fn record_dedup_detail(eq_calls: u64, col_cmps: u64, cols: u64) {
     DEDUP_EQ_CALLS.fetch_add(eq_calls, Ordering::Relaxed);
     DEDUP_COL_CMPS.fetch_add(col_cmps, Ordering::Relaxed);
@@ -107,6 +139,13 @@ pub fn reset() {
         FILTER_HIST_CALLS[b].store(0, Ordering::Relaxed);
         FILTER_HIST_ELEMS[b].store(0, Ordering::Relaxed);
     }
+    for i in 0..3 {
+        FILTER_REASON_CALLS[i].store(0, Ordering::Relaxed);
+        FILTER_REASON_KEPT[i].store(0, Ordering::Relaxed);
+        FILTER_REASON_NANOS[i].store(0, Ordering::Relaxed);
+    }
+    FILTER_SRC_ELEMS.store(0, Ordering::Relaxed);
+    FILTER_SRC_BYTES.store(0, Ordering::Relaxed);
     DEDUP_EQ_CALLS.store(0, Ordering::Relaxed);
     DEDUP_COL_CMPS.store(0, Ordering::Relaxed);
     DEDUP_COLS.store(0, Ordering::Relaxed);
@@ -159,6 +198,38 @@ pub fn report() {
         "{:<14} {:>41.2} s inside censused ops",
         "total", total_ns as f64 / 1e9
     );
+    for i in 0..3 {
+        let calls = FILTER_REASON_CALLS[i].load(Ordering::Relaxed);
+        if calls == 0 {
+            continue;
+        }
+        eprintln!(
+            "  {:<18} {:>7} state filters, {:>9.1} M lanes kept, {:>6.2} s",
+            REASON_NAMES[i],
+            calls,
+            FILTER_REASON_KEPT[i].load(Ordering::Relaxed) as f64 / 1e6,
+            FILTER_REASON_NANOS[i].load(Ordering::Relaxed) as f64 / 1e9,
+        );
+    }
+    let src_elems = FILTER_SRC_ELEMS.load(Ordering::Relaxed);
+    if src_elems > 0 {
+        let kept = ELEMS[Cat::Filter as usize].load(Ordering::Relaxed);
+        let src_bytes = FILTER_SRC_BYTES.load(Ordering::Relaxed);
+        let ns = NANOS[Cat::Filter as usize].load(Ordering::Relaxed);
+        // Honest traffic: every source cache line a gather touches, plus the
+        // index list and the output.
+        let kept_bytes = BYTES[Cat::Filter as usize].load(Ordering::Relaxed);
+        let traffic = src_bytes + kept_bytes;
+        eprintln!(
+            "filter detail: {:.1} M source elems -> {:.1} M kept ({:.1}% keep rate); \
+             whole-source traffic {:.2} GB = {:.1} GB/s",
+            src_elems as f64 / 1e6,
+            kept as f64 / 1e6,
+            100.0 * kept as f64 / src_elems as f64,
+            traffic as f64 / 1e9,
+            if ns > 0 { traffic as f64 / ns as f64 } else { 0.0 },
+        );
+    }
     let eq_calls = DEDUP_EQ_CALLS.load(Ordering::Relaxed);
     if eq_calls > 0 {
         let col_cmps = DEDUP_COL_CMPS.load(Ordering::Relaxed);

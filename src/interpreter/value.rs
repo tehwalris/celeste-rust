@@ -175,6 +175,7 @@ where
     );
     if crate::op_census::enabled() {
         crate::op_census::record_filter_size(kept.len());
+        crate::op_census::record_filter_source(vec.len(), std::mem::size_of::<T>());
     }
     MaybeVector::vector(filtered)
 }

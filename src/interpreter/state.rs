@@ -162,6 +162,7 @@ impl State {
     /// The resulting state's vector_size will be the number of true values in the mask.
     fn filter_by_mask_in_place(&mut self, mask: &[bool], reason: FilterReason) {
         let _trace = TraceSpan::new(reason, "filter");
+        let t_census = crate::op_census::start();
 
         // The mask is scanned once here; every vector below gathers the
         // kept lanes directly, O(kept) per vector instead of O(mask).
@@ -183,6 +184,12 @@ impl State {
         }
 
         self.vector_size = kept.len();
+
+        let reason_index = crate::op_census::REASON_NAMES
+            .iter()
+            .position(|name| *name == reason)
+            .expect("every filter reason must be in the census table");
+        crate::op_census::record_filter_reason(reason_index, kept.len(), t_census);
     }
 
     /// Duplicates every lane of the state: lanes `[l1..lN]` become

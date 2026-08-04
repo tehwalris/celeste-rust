@@ -90,7 +90,7 @@ penalty it removes does.
 
 | item | sec | reading |
 |---|---|---|
-| state filter | 1.11 | 1.23 ns/kept vs 0.50 in the standalone gather benchmark; 1.5x of it is working-set growth. **Biggest single item, cause not yet isolated.** |
+| state filter | 1.09 | **1.03 s of it is `filter_branch`** - 42 state splits per frame, 18.5 M lanes kept. Not an interpreter problem at all: this is the branch-removal campaign's remaining exposure. See below. |
 | dedup bucket | 0.80 | now mostly the hash probe. Radix-partitioning by hash bits would make probe *and* verify L2-local, but needs the row data physically partitioned too. |
 | merge concat | 0.46 | 16 GB/s, degrades 1.6x with depth |
 | select | 0.40 | 12.9 GB/s, flat in lane count - a codegen/SIMD target, not a cache one |
@@ -99,10 +99,36 @@ penalty it removes does.
 | hash_rows | 0.16 | degrades 2.7x with depth |
 | uncensused | 0.47 | dispatch, phi moves, env/heap bookkeeping |
 
+### The filter is branch splits, and they have names
+
+Splitting filter time by reason (new census counters) at frame 39:
+
+| reason | state filters | lanes kept | sec |
+|---|---|---|---|
+| filter_branch | 42 | 18.5 M | **1.03** |
+| filter_split_flr | 80 | 1.8 M | 0.07 |
+| filter_dedup | 2 | 1.6 M | 0.06 |
+
+So a quarter of the frame is still the interpreter cloning a state
+because a branch condition varies across lanes - the exact cost the
+rewrite recipe exists to remove, not an interpreter inefficiency. And
+`rewrite bench --profile` already names the offenders: at 37 frames, 503
+splits across **11 distinct sites**, concentrated in six:
+
+| site | splits | uniform |
+|---|---|---|
+| anonymous_61 in_h061_in_i1_074_cont | 120 | 36 |
+| anonymous_61 in_h061_and_or_continue_182 | 78 | 0 |
+| anonymous_61 in_h061_if_body_162 | 78 | 0 |
+| anonymous_61 in_h061_in_i1_072_cont | 78 | 0 |
+| anonymous_61 in_h061_in_k030_cont | 39 | 0 |
+| anonymous_61 in_h061_and_or_join_126 | 36 | 120 |
+
 Ranked next steps, by measured prize:
 
-1. **Isolate the state filter's 2.5x gap** against the standalone gather
-   benchmark. It is the largest item and the gap is not explained yet.
+1. **Convert the six remaining hot split sites** (task #47 and kin). Worth
+   up to 1.03 s of a 4.10 s frame - the single largest item, and it is
+   recipe-side work, where `rewrite bench` is the right A/B metric.
 2. **Radix-partitioned dedup** - partition rows by hash bits so each
    partition's probe table and representative rows fit L2. Est. 0.80 ->
    ~0.3 s, but it requires physically partitioning the columns.
