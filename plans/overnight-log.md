@@ -163,3 +163,21 @@ forms across fixpoint rounds in union_diff (the accumulated set is
 re-normalized every call - task #52); (b) whatever a fresh deep
 profile of the *runner* (not bench) says; (c) the parked virtual-merge
 memory variant if the cap ever binds.
+
+## Post-headline: union_diff cache (517c191)
+
+Item (a) built: StateSetAccumulator carries the normalized set across
+fixpoint rounds (states immutable once inside -> cache never stale;
+membership semantics identical). **Neutral on the runner at 39 over
+four pairs** - the span is dominated by normalizing the *pending*
+arrivals, not the accumulated set (which holds only 1-3 states per
+round). Landed as strictly-less-work + removes a latent quadratic in
+fixpoint rounds. Verify 34 clean.
+
+Conclusion for item (b): union_diff was not the frame-42 lever. What
+remains at depth per the last profiles: cfg vector ops (pooled above
+128k lanes only), merge concat bandwidth, dedup bandwidth - all now
+parallel and memory-bound. Frame 42 in 120 s likely needs either more
+memory bandwidth (NUMA placement? huge pages?) or a task-volume
+change (the endgame/hierarchical directions from plans/), not more
+thread fan-out.
