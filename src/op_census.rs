@@ -446,6 +446,7 @@ pub fn report() {
             MEMO_ELEMS.load(Ordering::Relaxed) as f64 / 1e6,
         );
     }
+    crate::interpreter::would_dedup::report();
     let gc_before = GC_CELLS_BEFORE.load(Ordering::Relaxed);
     if gc_before > 0 {
         let gc_after = GC_CELLS_AFTER.load(Ordering::Relaxed);

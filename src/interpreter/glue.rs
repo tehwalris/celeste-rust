@@ -280,6 +280,13 @@ fn interpret_prepared_cfg_inner(
                 block_label.as_ref().map_or("__entry", |l| l.as_str())
             )
         })?;
+        if let FlowData::States(states) = &flow_data {
+            super::would_dedup::record(
+                name.as_deref().unwrap_or("__main"),
+                block_label.as_ref().map_or("__entry", |l| l.as_str()),
+                states,
+            );
+        }
 
         // Update DAG node with processing stats
         with_profiler(|p| {
