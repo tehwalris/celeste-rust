@@ -515,11 +515,20 @@ objects.1.rem.x etc. Findings:
   mid-update; the collapsed loops' #objects == 1 premise assert fires
   (loudly, as designed) - recipe-only unsoundness, plain program fine.
   Boundary death pruning (built, env-gated) cannot catch it (mid-frame).
-  Fix: __prune_state builtin at kill_player's head via recipe entry =
-  death pruning at the kill site. BLOCKED on Philippe's approval of
-  death pruning as default search semantics; until then every run
-  > f58 stops at the guard. Probe confirms zero boundary death states
-  through f58 (frontier there: 18.95M lanes, 476s/34.5GB non-frontier).
+  Fix: death pruning was built, then REJECTED by Philippe (2026-08-06)
+  and removed (commit 72f7526) - do not resurrect it. His direction:
+  death states are just another state class the recipe is not
+  specialized for; the fix is the DEOPT ARCHITECTURE (task #78):
+  canonical state = plain representation (the cross-frame heap
+  contract), per-program from/to-canonical mappings derived from the
+  recipe (today only the promote_capture unbox/rebox pairs), optimistic
+  specialized execution, deopt-to-plain re-run of the frame on premise
+  failure. Deaths then cost ~15 rows total (post-kill states have no
+  player, so same-countdown lanes collapse to one row; respawns dedup
+  against the original spawn in the visited set). Until #78 lands,
+  every run > f58 stops at the guard. Probe confirms zero boundary
+  death states through f58 (frontier there: 18.95M lanes,
+  476s/34.5GB non-frontier).
 * 2022 comparison, properly aligned: at their control 29 (our f53):
   24s/405MB theirs vs ~200s/18GB ours (frontier-only) - ~8-9x time,
   ~45x memory. Full-room estimate: theirs ~5-15 min, ours ~3-5 h
