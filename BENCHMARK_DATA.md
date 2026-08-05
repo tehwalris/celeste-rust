@@ -82,10 +82,14 @@ dash_time,djump,has_dashed,p_dash,p_jump - time-flat, peak -44%):
 | | time | peak |
 |---|---|---|
 | bench `--frames 45` | 47.6 s | 8.5 GB |
-| bench `--frames 46` | **70.0 s** | 12.1 GB |
+| bench `--frames 46` | 70.0 s | 12.1 GB |
+| bench `--frames 47` | **104.1 s** | 16.3 GB |
 
-Frame 46 is the deepest frame ever computed, and the per-frame growth
-softened to ~1.47x (memory pressure feeds back into merge cost).
+Frame 47 (12.0M lanes) is the deepest frame ever computed, inside a
+120 s budget, and the per-frame growth softened to ~1.47-1.49x (memory
+pressure feeds back into merge cost). For scale: 24 hours before this
+measurement, the frontier was frame 41 at 107 s - six frames deeper at
+the same cost, one working day later.
 
 The store-triangle row is the first change that moved the fragment count: 558
 -> 335 mean fragments per frame at frame 34, split executions 19573 -> 11978.
