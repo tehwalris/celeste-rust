@@ -312,6 +312,27 @@ c and d implied-false of the guard (the continue-flag chain's shape:
 flag_i = select stop_i ? false : flag_{i-1}). Entries then target the
 whole [first-bound-check .. last-store] range per axis.
 
+## Region skipping: closed at the pixel-move sites (2026-08-06)
+
+The axis-level super-region (one guard, 8 iterations, calls included)
+applies, rule-verifies, and is differentially identical through 37 -
+the machinery is complete and proven. But the skip census settles it:
+22% of skip evaluations fire carrying ~0.0M lanes, against 1.8M lanes
+entering. Per-select routing uniformity is a property of the many tiny
+fragments; the lane-heavy states are never uniformly idle, so region
+skipping cannot reach the cost at these sites at any granularity
+(per-iteration +3.4%, axis-level flat). No recipe entries remain; the
+terminator + rule + verifier + census stay for sites with genuinely
+state-uniform masks.
+
+The day's deep lesson, three measurements in a row (specialization,
+per-iteration guards, axis guards): the remaining frame-body cost is
+carried by lane-heavy states that are *mixed* in every discrete
+dimension the machinery can see - the redundancy that remains is
+per-lane inside heavy states, already minimised at the op level, and
+the levers that remain are the ones already banked (partitioning,
+merge machinery) plus whatever reduces lane count itself.
+
 ## Ranked next steps
 
 1. ~~Fragment-parallel frame execution~~ DONE as state-parallel flow
