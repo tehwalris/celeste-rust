@@ -25,6 +25,7 @@ use super::program::Program;
 
 pub mod absorb_stores;
 pub mod add_hint;
+pub mod guard_region;
 pub mod partition_merge;
 pub mod remove_hint;
 pub mod allocate_slots;
