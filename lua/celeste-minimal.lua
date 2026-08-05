@@ -99,6 +99,13 @@ player =
 		local on_ground=this.is_solid(0,1)
 		local on_ice=this.is_ice(0,1)
 
+		-- TODO: classic Celeste buffers a jump press for 4 frames (jbuffer);
+		-- this minimal version dropped it, so a press during dash frames or
+		-- before a wall comes in range is LOST instead of buffered. This is
+		-- NOT a no-op simplification: TAS inputs for classic must be re-timed
+		-- to the execution frame (see tas/room_1_0_exit_frame_100.txt).
+		-- Reachability and optimal frame counts are unaffected, since a
+		-- buffered jump executes identically to an exactly-timed press.
 		local jump = btn(k_jump) and not this.p_jump
 		this.p_jump = btn(k_jump)
 
