@@ -91,12 +91,46 @@ pub fn interpret_select(condition: &Value, if_true: &Value, if_false: &Value) ->
 
     // A uniform condition needs no combining, and this is the case that lets a
     // select survive on values it could not otherwise merge - a pointer, say.
+    // The census counts what the *discarded* arm cost upstream: a vector arm
+    // was per-lane compute this point throws away (class-dead speculation).
+    let discarded_lanes = |v: &Value| -> usize {
+        match v {
+            Value::Number(MaybeVector::Vector(x)) => x.len(),
+            Value::NumberInterval(MaybeVector::Vector(x)) => x.len(),
+            Value::Bool(MaybeVector::Vector(x)) => x.len(),
+            _ => 0,
+        }
+    };
     match &mask {
-        MaybeVector::Scalar(true) => return Ok(if_true.clone()),
-        MaybeVector::Scalar(false) => return Ok(if_false.clone()),
-        MaybeVector::Vector(m) if m.iter().all(|b| *b) => return Ok(if_true.clone()),
-        MaybeVector::Vector(m) if m.iter().all(|b| !*b) => return Ok(if_false.clone()),
-        MaybeVector::Vector(_) => {}
+        MaybeVector::Scalar(true) => {
+            if crate::op_census::enabled() {
+                crate::op_census::record_select_uniform(discarded_lanes(if_false));
+            }
+            return Ok(if_true.clone());
+        }
+        MaybeVector::Scalar(false) => {
+            if crate::op_census::enabled() {
+                crate::op_census::record_select_uniform(discarded_lanes(if_true));
+            }
+            return Ok(if_false.clone());
+        }
+        MaybeVector::Vector(m) if m.iter().all(|b| *b) => {
+            if crate::op_census::enabled() {
+                crate::op_census::record_select_uniform(discarded_lanes(if_false));
+            }
+            return Ok(if_true.clone());
+        }
+        MaybeVector::Vector(m) if m.iter().all(|b| !*b) => {
+            if crate::op_census::enabled() {
+                crate::op_census::record_select_uniform(discarded_lanes(if_true));
+            }
+            return Ok(if_false.clone());
+        }
+        MaybeVector::Vector(_) => {
+            if crate::op_census::enabled() {
+                crate::op_census::record_select_mixed();
+            }
+        }
     }
 
     if if_true == if_false {

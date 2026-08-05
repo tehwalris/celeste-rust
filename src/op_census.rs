@@ -248,6 +248,25 @@ pub fn memo_probe(
     record_memo_probe(hit, elems);
 }
 
+/// Class-dead speculation: a select whose mask is uniform (scalar, or a
+/// vector that collapsed to one truth value) returns one arm and discards
+/// the other. A discarded *vector* arm is upstream per-lane compute that
+/// this consumption point threw away - with partitioned merges making
+/// masks uniform per class, this counts the vector work that per-class
+/// constant folding + DCE of the speculated regions could skip entirely.
+static SELECT_UNIFORM_CALLS: AtomicU64 = AtomicU64::new(0);
+static SELECT_UNIFORM_DISCARD_LANES: AtomicU64 = AtomicU64::new(0);
+static SELECT_MIXED_CALLS: AtomicU64 = AtomicU64::new(0);
+
+pub fn record_select_uniform(discarded_vector_lanes: usize) {
+    SELECT_UNIFORM_CALLS.fetch_add(1, Ordering::Relaxed);
+    SELECT_UNIFORM_DISCARD_LANES.fetch_add(discarded_vector_lanes as u64, Ordering::Relaxed);
+}
+
+pub fn record_select_mixed() {
+    SELECT_MIXED_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn record_memo_probe(hit: bool, elems: usize) {
     MEMO_CALLS.fetch_add(1, Ordering::Relaxed);
     MEMO_ELEMS.fetch_add(elems as u64, Ordering::Relaxed);
@@ -302,6 +321,9 @@ pub fn record(cat: Cat, elems: usize, bytes: usize, started: Option<std::time::I
 /// cost of an op as the lane count grows is the whole question behind
 /// tiling, and cumulative totals hide it.
 pub fn reset() {
+    SELECT_UNIFORM_CALLS.store(0, Ordering::Relaxed);
+    SELECT_UNIFORM_DISCARD_LANES.store(0, Ordering::Relaxed);
+    SELECT_MIXED_CALLS.store(0, Ordering::Relaxed);
     {
         let mut seen = MEMO_SEEN.lock().unwrap();
         seen.0.clear();
@@ -444,6 +466,15 @@ pub fn report() {
             100.0 * hits as f64 / memo_calls as f64,
             MEMO_HIT_ELEMS.load(Ordering::Relaxed) as f64 / 1e6,
             MEMO_ELEMS.load(Ordering::Relaxed) as f64 / 1e6,
+        );
+    }
+    let uniform_selects = SELECT_UNIFORM_CALLS.load(Ordering::Relaxed);
+    if uniform_selects > 0 {
+        eprintln!(
+            "selects: {} uniform-mask (routing) vs {} mixed; {:.1} M vector-arm lanes discarded by uniform masks (class-dead speculation, foldable per class)",
+            uniform_selects,
+            SELECT_MIXED_CALLS.load(Ordering::Relaxed),
+            SELECT_UNIFORM_DISCARD_LANES.load(Ordering::Relaxed) as f64 / 1e6,
         );
     }
     crate::interpreter::would_dedup::report();
