@@ -168,6 +168,14 @@ fork sites (filter_branch superlinear at depth), (2) whatever a fresh
 profile of the frame body's ~55% shows beyond instruction time, (3)
 memory-side work if the search pushes past frame 45.
 
+Post-fix perf top symbols (bench f42, CPU shares; wall shares are lower
+for the parallel merge pieces): virtual_unique_mask machinery 10.3%
+(was 17.7% before the chunk-buffered verify), select::pick 4.5%,
+interpret_binary_op 4.0%, the tile_flag_at builtin family ~3.2% (worth
+a look: expensive per lane over positions with cardinality <=59 - the
+one op family where the dict_pricing verdict does not apply), recipe
+replay ~2.4% (a constant bench includes), allocator ~2%.
+
 ## Ranked next steps
 
 1. ~~Fragment-parallel frame execution~~ DONE as state-parallel flow
