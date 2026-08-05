@@ -1289,6 +1289,73 @@ pub fn normalize_state_for_comparison(state: &State) -> NormalizedState {
     }
 }
 
+/// Diagnostic for a suspected soundness hole (`CELESTE_CHECK_UNION=1`).
+///
+/// `NormalizedState` compares vector columns by their *sorted unique value
+/// sets*, independently per column. That is an over-approximation of state
+/// equality in the dangerous direction: two states whose columns hold the
+/// same value sets but paired into different rows compare EQUAL, and
+/// `union_diff_states` then drops one of them as already-seen - silently
+/// losing part of the search space. The differential verifier cannot see
+/// it, because both programs share the mechanism.
+///
+/// This tracker recomputes an order-insensitive digest of the *actual lane
+/// rows* (a commutative fold of per-row hashes, plus the shape hash and
+/// vector size) and reports every state the coarse equality would drop
+/// whose row digest was never seen for that coarse class.
+struct UnionExactCheck {
+    /// coarse-normalized form -> the exact row digests seen under it.
+    by_coarse: FxHashMap<NormalizedState, FxHashSet<u64>>,
+}
+
+impl UnionExactCheck {
+    fn new() -> Option<Self> {
+        std::env::var_os("CELESTE_CHECK_UNION").map(|_| Self {
+            by_coarse: FxHashMap::default(),
+        })
+    }
+
+    fn row_digest(state: &State) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let vector_values = collect_vector_values(state);
+        let row_hashes = hash_rows(&vector_values, state.vector_size);
+        // Commutative combine: lane order must not matter, row content must.
+        let rows: u64 = row_hashes
+            .iter()
+            .fold(0u64, |acc, h| acc.wrapping_add(h.wrapping_mul(0x2545_F491_4F6C_DD1D)));
+        let mut hasher = rustc_hash::FxHasher::default();
+        shape_of_state(state).hash(&mut hasher);
+        state.vector_size.hash(&mut hasher);
+        rows.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Record a state that survived (was considered new).
+    fn record_new(&mut self, normalized: &NormalizedState, state: &State) {
+        self.by_coarse
+            .entry(normalized.clone())
+            .or_default()
+            .insert(Self::row_digest(state));
+    }
+
+    /// A state the coarse equality is about to drop: complain if its rows
+    /// were never actually seen.
+    fn check_dropped(&mut self, normalized: &NormalizedState, state: &State) {
+        let digest = Self::row_digest(state);
+        let seen = self
+            .by_coarse
+            .entry(normalized.clone())
+            .or_default();
+        if seen.insert(digest) {
+            eprintln!(
+                "UNION-DROP MISMATCH: coarse-equal state with UNSEEN row digest dropped \
+                 ({} lanes) - per-column value-set equality is losing real states",
+                state.vector_size
+            );
+        }
+    }
+}
+
 /// Compute union and diff of two state sets.
 ///
 /// Given `accumulated` (states already seen) and `potentially_new` (states just arrived),
@@ -1302,15 +1369,40 @@ pub fn union_diff_states(
     potentially_new: Vec<State>,
 ) -> (Vec<State>, Vec<State>) {
     let _trace = TraceSpan::new("union_diff_states", "vectorize");
+    let mut exact_check = UnionExactCheck::new();
     if accumulated.is_empty() {
+        // The states just arrived from one `vectorize_states` call, which
+        // emits exactly one state per shape group - so they are pairwise
+        // distinct by construction and there is nothing to deduplicate.
+        // That claim is checked, not assumed: the direct shapes (the
+        // arrivals are post-gc, so no re-canonicalisation is needed) must
+        // be pairwise distinct. If the guard ever fails - a different
+        // caller, a second fixed-point round, a shape-hash collision -
+        // fall through to the full canonical comparison, which is what
+        // this path always did. Skipping it matters: the canonical
+        // comparison clones and gc's every state, 0.81 s at frame 40 for
+        // a dedup that never removed anything.
+        let mut shape_hashes: FxHashSet<u64> = FxHashSet::default();
+        let all_distinct = potentially_new
+            .iter()
+            .all(|state| shape_hashes.insert(shape_of_state(state).cached_hash));
+        if all_distinct && exact_check.is_none() {
+            return (potentially_new.clone(), potentially_new);
+        }
+
         // First, deduplicate within potentially_new
         let mut seen: FxHashSet<NormalizedState> = FxHashSet::default();
         let mut unique = Vec::new();
         for state in potentially_new {
             let normalized = normalize_state_for_comparison(&state);
             if !seen.contains(&normalized) {
+                if let Some(check) = exact_check.as_mut() {
+                    check.record_new(&normalized, &state);
+                }
                 seen.insert(normalized);
                 unique.push(state);
+            } else if let Some(check) = exact_check.as_mut() {
+                check.check_dropped(&normalized, &state);
             }
         }
         return (unique.clone(), unique);
@@ -1326,6 +1418,12 @@ pub fn union_diff_states(
         .iter()
         .map(normalize_state_for_comparison)
         .collect();
+    if let Some(check) = exact_check.as_mut() {
+        for state in accumulated.iter() {
+            let normalized = normalize_state_for_comparison(state);
+            check.record_new(&normalized, state);
+        }
+    }
 
     // Partition potentially_new into truly new vs already seen
     // Also deduplicate within potentially_new
@@ -1334,8 +1432,13 @@ pub fn union_diff_states(
     for state in potentially_new {
         let normalized = normalize_state_for_comparison(&state);
         if !seen.contains(&normalized) {
+            if let Some(check) = exact_check.as_mut() {
+                check.record_new(&normalized, &state);
+            }
             seen.insert(normalized);
             actually_new.push(state);
+        } else if let Some(check) = exact_check.as_mut() {
+            check.check_dropped(&normalized, &state);
         }
     }
 
