@@ -109,6 +109,14 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         frames: u32,
     },
+    /// Estimate the per-class specialization prize: instructions whose
+    /// value the merge-partition cells determine, and the speculated
+    /// select arms they discard per class, weighted by a measured
+    /// per-instruction time profile.
+    Classdead {
+        #[arg(long, default_value_t = 40)]
+        frames: u32,
+    },
     /// Run the rewritten program and report time, memory and lane counts.
     ///
     /// Note peak RSS is the process-wide high-water mark, so with `--baseline`
@@ -1263,6 +1271,53 @@ fn main() -> Result<()> {
             }
         }
 
+        Command::Classdead { frames } => {
+            let (program, _) = build(&recipe)?;
+            // Measure per-instruction time on the partitioned program.
+            celeste_rust::instr_time::reset();
+            celeste_rust::instr_time::enable();
+            let mut run = celeste_rust::rewrite::verify::AbstractRun::start(&program)?;
+            for _ in 1..=frames {
+                run.step()?;
+            }
+            let rows = celeste_rust::instr_time::report();
+            let total_us: f64 = rows.iter().map(|(_, _, d, _)| d.as_micros() as f64).sum();
+
+            let analysis = celeste_rust::rewrite::class_dead::analyze(&program);
+            let mut determined_us = 0.0f64;
+            let mut at_risk_us = 0.0f64;
+            let mut at_risk_count = 0usize;
+            let mut determined_count = 0usize;
+            for (function, id, duration, _) in &rows {
+                let Some(fun) = analysis.get(function) else { continue };
+                let local = celeste_rust::ir::LocalId::from(*id);
+                if fun.determined.contains(&local) {
+                    determined_us += duration.as_micros() as f64;
+                    determined_count += 1;
+                } else if fun.at_risk.contains(&local) {
+                    at_risk_us += duration.as_micros() as f64;
+                    at_risk_count += 1;
+                }
+            }
+            println!(
+                "class-dead analysis over {} frames ({:.2}s measured instruction time), partition cells {:?}:",
+                frames,
+                total_us / 1e6,
+                program.merge_partition_cells,
+            );
+            println!(
+                "  class-determined: {} instructions, {:.2}s ({:.1}%) - scalar per state today;                  zero under per-class folding",
+                determined_count,
+                determined_us / 1e6,
+                100.0 * determined_us / total_us.max(1.0),
+            );
+            println!(
+                "  at-risk (exclusive select-arm chains): {} instructions, {:.2}s ({:.1}%) -                  one arm's share dies per class under specialization",
+                at_risk_count,
+                at_risk_us / 1e6,
+                100.0 * at_risk_us / total_us.max(1.0),
+            );
+        }
         Command::Bench { frames, baseline, profile } => {
             if baseline {
                 bench("original", &Program::compile_from_disk()?, frames, profile)?;
