@@ -814,32 +814,70 @@ fn virtual_unique_mask(key: &[&Column], row_hashes: &[u64]) -> (Vec<bool>, usize
         return (mask, unique_count);
     }
 
-    // 2. Pack the representatives.
-    let _t_pack_verify = TraceSpan::new("vm_pack_verify", "vectorize");
+    // 2. Pack the representatives - tiles are disjoint dense ranges, so
+    // they pack in parallel, each still an L2-sized destination filled by
+    // sorted piece walks.
+    let _t_pack = TraceSpan::new("vm_pack", "vectorize");
     let words_per_row: usize = key.iter().map(|c| c.words()).sum();
     let mut dense = vec![0u32; uniq.len() * words_per_row];
     const DENSE_TILE_BYTES: usize = 192 * 1024;
     let tile_rows = (DENSE_TILE_BYTES / (words_per_row.max(1) * 4)).max(1);
-    for tile_start in (0..uniq.len()).step_by(tile_rows) {
-        let tile_end = (tile_start + tile_rows).min(uniq.len());
-        let tile = &uniq[tile_start..tile_end];
-        let mut w = 0;
-        for column in key {
-            let words = column.words();
-            column.visit_rows_words(tile, |k, (w0, w1)| {
-                let base = (tile_start + k) * words_per_row + w;
-                dense[base] = w0;
-                if words == 2 {
-                    dense[base + 1] = w1;
+    {
+        let pack_tile = |tile_index: usize, dense_tile: &mut [u32]| {
+            let tile_start = tile_index * tile_rows;
+            let tile_end = (tile_start + tile_rows).min(uniq.len());
+            let tile = &uniq[tile_start..tile_end];
+            let mut w = 0;
+            for column in key.iter() {
+                let words = column.words();
+                column.visit_rows_words(tile, |k, (w0, w1)| {
+                    let base = k * words_per_row + w;
+                    dense_tile[base] = w0;
+                    if words == 2 {
+                        dense_tile[base + 1] = w1;
+                    }
+                });
+                w += words;
+            }
+        };
+        let threads = merge_threads();
+        if uniq.len() < PARALLEL_ROW_THRESHOLD || threads == 1 {
+            for (tile_index, dense_tile) in
+                dense.chunks_mut(tile_rows * words_per_row).enumerate()
+            {
+                pack_tile(tile_index, dense_tile);
+            }
+        } else {
+            let tiles: Vec<(usize, &mut [u32])> = dense
+                .chunks_mut(tile_rows * words_per_row)
+                .enumerate()
+                .collect();
+            let per_thread = tiles.len().div_ceil(threads);
+            let mut groups: Vec<Vec<(usize, &mut [u32])>> = Vec::new();
+            for (i, entry) in tiles.into_iter().enumerate() {
+                if i % per_thread == 0 {
+                    groups.push(Vec::with_capacity(per_thread));
+                }
+                groups.last_mut().unwrap().push(entry);
+            }
+            std::thread::scope(|scope| {
+                for group in groups {
+                    let pack_tile = &pack_tile;
+                    scope.spawn(move || {
+                        for (tile_index, dense_tile) in group {
+                            pack_tile(tile_index, dense_tile);
+                        }
+                    });
                 }
             });
-            w += words;
         }
     }
 
+    drop(_t_pack);
     // 3. Verify, column-major over contiguous row ranges - one range per
     // thread, each a sorted piece walk, all random access confined to the
     // cache-resident dense table.
+    let _t_verify = TraceSpan::new("vm_verify", "vectorize");
     let mut ok = vec![true; n];
     {
         let verify_range = |ok_chunk: &mut [bool], start: usize| {
