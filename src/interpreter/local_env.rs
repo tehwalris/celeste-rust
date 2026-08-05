@@ -245,7 +245,7 @@ impl LocalEnv {
     /// Filter vectors down to the `kept` lanes, only transforming values
     /// that are vectors.
     #[inline]
-    pub fn filter_vectors_in_place(&mut self, kept: &[u32]) {
+    pub fn filter_vectors_in_place(&mut self, kept: &super::value::KeptLanes) {
         let data = Arc::make_mut(&mut self.data);
         for v in data.values.iter_mut() {
             if let Some(val) = v.as_ref() {

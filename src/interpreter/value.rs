@@ -171,32 +171,85 @@ pub fn count_true(mask: &[bool]) -> usize {
     mask.iter().map(|&b| b as usize).sum()
 }
 
-/// Filter a vector down to the lanes in `kept` (sorted indices of the
-/// mask's true entries, computed once per state filter). O(kept) per
-/// vector instead of O(mask): a filter touches every vector value in the
-/// state, so re-scanning the full mask per vector was the dominant cost of
-/// `filter_branch`.
+/// The lanes a filter keeps, as sorted half-open `[start, end)` ranges.
+///
+/// Kept lanes come in contiguous stretches - measured 30.6 lanes per run at
+/// `filter_branch`, 19.5 at `filter_split_flr` - because adjacent lanes
+/// share history (concat + first-occurrence dedup preserve arrival order),
+/// so they usually agree on a branch condition. Ranges turn the per-lane
+/// gather every filtered vector pays into a few `extend_from_slice` calls
+/// (memcpy for the `Copy` payloads all lanes are), and they are computed
+/// once per state filter, not per vector.
+pub struct KeptLanes {
+    ranges: Vec<(u32, u32)>,
+    total: usize,
+}
+
+impl KeptLanes {
+    pub fn from_mask(mask: &[bool]) -> Self {
+        let mut ranges = Vec::new();
+        let mut total = 0usize;
+        let mut i = 0usize;
+        while i < mask.len() {
+            if mask[i] {
+                let start = i;
+                while i < mask.len() && mask[i] {
+                    i += 1;
+                }
+                ranges.push((start as u32, i as u32));
+                total += i - start;
+            } else {
+                i += 1;
+            }
+        }
+        Self { ranges, total }
+    }
+
+    pub fn len(&self) -> usize {
+        self.total
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+
+    /// Number of contiguous runs.
+    pub fn runs(&self) -> usize {
+        self.ranges.len()
+    }
+
+    pub fn first(&self) -> Option<u32> {
+        self.ranges.first().map(|&(s, _)| s)
+    }
+}
+
+/// Filter a vector down to the kept lanes. O(kept) per vector instead of
+/// O(mask): a filter touches every vector value in the state, so
+/// re-scanning the full mask per vector was the dominant cost of
+/// `filter_branch`. Range-at-a-time on top of that: `extend_from_slice`
+/// per run instead of an indexed copy per lane.
 #[inline]
-fn filter_vec_gather_ref<T: Clone + PartialEq>(vec: &[T], kept: &[u32]) -> MaybeVector<T>
+fn filter_vec_gather_ref<T: Clone + PartialEq>(vec: &[T], kept: &KeptLanes) -> MaybeVector<T>
 where
     T: std::fmt::Debug + Clone + PartialEq + Eq,
 {
-    if let [only] = kept {
-        return MaybeVector::Scalar(vec[*only as usize].clone());
+    if kept.total == 1 {
+        let only = kept.first().expect("total 1 implies a range");
+        return MaybeVector::Scalar(vec[only as usize].clone());
     }
     let t = crate::op_census::start();
-    let mut filtered = Vec::with_capacity(kept.len());
-    for &i in kept {
-        filtered.push(vec[i as usize].clone());
+    let mut filtered = Vec::with_capacity(kept.total);
+    for &(start, end) in &kept.ranges {
+        filtered.extend_from_slice(&vec[start as usize..end as usize]);
     }
     crate::op_census::record(
         crate::op_census::Cat::Filter,
-        kept.len(),
-        kept.len() * (2 * std::mem::size_of::<T>() + 4),
+        kept.total,
+        kept.total * (2 * std::mem::size_of::<T>() + 4),
         t,
     );
     if crate::op_census::enabled() {
-        crate::op_census::record_filter_size(kept.len());
+        crate::op_census::record_filter_size(kept.total);
         crate::op_census::record_filter_source(vec.len(), std::mem::size_of::<T>());
     }
     MaybeVector::vector(filtered)
@@ -207,7 +260,7 @@ impl Value {
     /// Returns None for scalars (no transformation needed).
     /// This avoids cloning scalar values that don't need transformation.
     #[inline]
-    pub fn filter_vectors_if_vector(&self, kept: &[u32]) -> Option<Self> {
+    pub fn filter_vectors_if_vector(&self, kept: &KeptLanes) -> Option<Self> {
         match self {
             Value::Bool(MaybeVector::Vector(vec)) => Some(Value::Bool(filter_vec_gather_ref(vec, kept))),
             Value::Number(MaybeVector::Vector(vec)) => Some(Value::Number(filter_vec_gather_ref(vec, kept))),
@@ -234,7 +287,7 @@ impl HeapValue {
     /// Returns None for values that don't contain vectors (no transformation needed).
     /// This avoids cloning non-vector values during filter operations.
     #[inline]
-    pub fn filter_vectors_if_needed(&self, kept: &[u32]) -> Option<Self> {
+    pub fn filter_vectors_if_needed(&self, kept: &KeptLanes) -> Option<Self> {
         match self {
             HeapValue::Value(v) => v.filter_vectors_if_vector(kept).map(HeapValue::Value),
             HeapValue::Closure(id, captures) => {

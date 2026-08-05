@@ -195,6 +195,11 @@ pub fn record_unknown_branch_dup(lanes: usize) {
 static FILTER_REASON_CALLS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static FILTER_REASON_KEPT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static FILTER_REASON_NANOS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Contiguous runs in the kept-index list, per reason. kept/runs is the mean
+/// run length: how much of a filter gather could be chunked memcpy instead of
+/// per-lane gather, and - if it is low - how much a sorted lane order at the
+/// merge could raise it.
+static FILTER_REASON_RUNS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 pub const REASON_NAMES: [&str; 3] = ["filter_branch", "filter_dedup", "filter_split_flr"];
 
@@ -203,6 +208,10 @@ pub fn record_filter_reason(reason_index: usize, kept: usize, started: Option<st
     FILTER_REASON_CALLS[reason_index].fetch_add(1, Ordering::Relaxed);
     FILTER_REASON_KEPT[reason_index].fetch_add(kept as u64, Ordering::Relaxed);
     FILTER_REASON_NANOS[reason_index].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
+pub fn record_filter_runs(reason_index: usize, runs: usize) {
+    FILTER_REASON_RUNS[reason_index].fetch_add(runs as u64, Ordering::Relaxed);
 }
 
 pub fn record_filter_source(src_elems: usize, elem_size: usize) {
@@ -269,6 +278,7 @@ pub fn reset() {
         FILTER_REASON_CALLS[i].store(0, Ordering::Relaxed);
         FILTER_REASON_KEPT[i].store(0, Ordering::Relaxed);
         FILTER_REASON_NANOS[i].store(0, Ordering::Relaxed);
+        FILTER_REASON_RUNS[i].store(0, Ordering::Relaxed);
     }
     for i in 0..3 {
         FILTER_COLS[i].store(0, Ordering::Relaxed);
@@ -362,12 +372,15 @@ pub fn report() {
         if calls == 0 {
             continue;
         }
+        let kept = FILTER_REASON_KEPT[i].load(Ordering::Relaxed);
+        let runs = FILTER_REASON_RUNS[i].load(Ordering::Relaxed);
         eprintln!(
-            "  {:<18} {:>7} state filters, {:>9.1} M lanes kept, {:>6.2} s",
+            "  {:<18} {:>7} state filters, {:>9.1} M lanes kept, {:>6.2} s, {:>6.1} lanes/run",
             REASON_NAMES[i],
             calls,
-            FILTER_REASON_KEPT[i].load(Ordering::Relaxed) as f64 / 1e6,
+            kept as f64 / 1e6,
             FILTER_REASON_NANOS[i].load(Ordering::Relaxed) as f64 / 1e9,
+            kept as f64 / runs.max(1) as f64,
         );
     }
     let gc_before = GC_CELLS_BEFORE.load(Ordering::Relaxed);

@@ -257,7 +257,7 @@ impl Heap {
     /// need transformation. This is more efficient than map_in_place for
     /// filter_vectors operations because it avoids cloning values that
     /// don't contain vectors.
-    pub fn filter_vectors_in_place(&mut self, kept: &[u32]) {
+    pub fn filter_vectors_in_place(&mut self, kept: &super::value::KeptLanes) {
         // For filter operations, we only need to update values that contain vectors.
         // Non-vector values can keep their existing storage indices.
 

@@ -165,12 +165,9 @@ impl State {
         let t_census = crate::op_census::start();
 
         // The mask is scanned once here; every vector below gathers the
-        // kept lanes directly, O(kept) per vector instead of O(mask).
-        let kept: Vec<u32> = mask
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &m)| m.then_some(i as u32))
-            .collect();
+        // kept lanes directly, O(kept) per vector instead of O(mask), and
+        // range-at-a-time (see `KeptLanes`).
+        let kept = super::value::KeptLanes::from_mask(mask);
 
         // Filter values in heap - use optimized method that only clones vectors
         self.heap.filter_vectors_in_place(&kept);
@@ -215,6 +212,10 @@ impl State {
             .position(|name| *name == reason)
             .expect("every filter reason must be in the census table");
         crate::op_census::record_filter_reason(reason_index, kept.len(), t_census);
+        if crate::op_census::enabled() && !kept.is_empty() {
+            // How chunky the gather is: contiguous stretches of kept indices.
+            crate::op_census::record_filter_runs(reason_index, kept.runs());
+        }
     }
 
     /// Duplicates every lane of the state: lanes `[l1..lN]` become
