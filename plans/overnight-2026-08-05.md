@@ -350,46 +350,67 @@ finished 200m) re-run today on room (1,0):
   include ~11 pre-spawn frames): theirs 1.28 us/state-run vs ours
   ~4.7 us/lane at f43 - **~4x slower per lane for a general compiled-
   Lua interpreter vs hand-written physics**, which is closer than
-  expected. The bigger gap is state count: they dedupe rem-EQUIVALENT
-  states ('Don't run_player_update multiple times for equivalent rems'),
-  not just rem-equal ones - and our distinct-modulo census measured
-  exactly that slack at 1.8-1.9x on heavy states.
-* **The lever this uncovers**: rem-equivalence dedup is result-
-  preserving (their run matched the public TAS) - it merges states with
-  provably identical futures, which is NOT the precision change that
-  was ruled out. Porting their equivalence into our merge is likely a
-  ~2x state cut. Their game.rs holds the definition.
+  expected. The bigger gap is state count - but the first attribution
+  of that gap to rem was WRONG; see "The rem question, corrected" below.
+  (RETRACTED: "our distinct-modulo census measured that slack at
+  1.8-1.9x" - the excluded columns in that census cannot have been the
+  player's rem, which is widened-uniform at the frontier. The 4 excluded
+  non-uniform columns were cell158/cell163 x/y pairs whose identity was
+  never verified - plausibly spd and/or position, which would make the
+  1.8-1.9x number meaningless. Census must be redone with verified cell
+  identities before any state-count conclusion.)
 * Open: the room's exact optimal frame count - the baseline TAS
   (tas/baseline/TAS2.tas) needs the 2022 input encoding (their tas.rs)
   to demarcate the first room; a naive decode through concrete_run gave
   a suspicious trajectory, so the bit mapping differs.
 
-## The rem question, resolved to a decision point (2026-08-06)
+## The rem question, CORRECTED (2026-08-06 morning)
 
-Read the 2022 definition: ALL_DIFFERENT_REMS_FOR_MOVE is the four rem
-corners (+-0.5 per axis). The 2022 searcher does not track rem: every
-frame it runs the move with both extreme rems per axis and merges by
-post-move outcome. Mathematically grounded (flr(rem+spd+0.5) over the
-unit rem interval takes at most two values, realized at the extremes) -
-but methodologically it is an **over-approximation**: rem is
-existentially quantified per frame, independent of history. Optimality
-still holds by the two-sided argument (over-approx bounds the horizon,
-the concrete TAS witnesses achievability - and 2022's matched the
-public TAS), but the normalized result set is a superset of exact
-tracking.
+Philippe asked the right question ("what does our current code widen and
+when?") and the answer overturns the previous section's framing.
 
-Consequences:
-* An exact in-model rem equivalence beyond bit-equality is essentially
-  empty (distinct rems differ under some future spd sequence), so the
-  1.8-1.9x modulo-rem census slack is only reachable via the 2022-style
-  over-approx + concrete-witness methodology.
-* If adopted, the natural implementation is a rewrite: replace the rem
-  accumulate at frame start with a four-corner expand (the expand
-  machinery exists), plus concrete replay validation of any final TAS -
-  and verify would compare against a rem-projected observation.
-* **Blocked on Philippe**: this is a normalized-result-set change, which
-  he ruled out earlier in general; but it is also exactly the
-  methodology his own 2022 solve used. His call, explicitly.
+**What the current code actually does** (verified in source, not
+reconstructed):
+* `make_state_abstract` (inspect.rs:487) widens exactly two heap cells -
+  `player.rem.x` and `player.rem.y`, found by walking `objects[]` for
+  `type == "player"` - to the full interval [-0.5, 0.5-eps], with a
+  containment assert. Nothing else is ever widened. `player_spawn`'s
+  rem is NOT widened (tracked exactly during spawn frames).
+* It runs at EVERY frame boundary, after the frame's flow and BEFORE
+  the boundary merge - main.rs:363 and verify.rs:306 (bench/verify use
+  the same order). So the merge sees uniform rem columns, and lanes
+  differing only in rem already dedup at frame end.
+* Mid-frame, rem lives as an interval the whole time: obj.move shifts
+  it by spd+0.5, `__split_by_flr` fans lanes into floor classes (<=2
+  per axis), flr extracts a concrete amount, rem becomes the refined
+  subinterval; collision writes concrete 0. The fan-out persists to
+  frame end, where widening + merge collapse reconverged lanes.
+* No widening exists in the recipe: zero `widen_rem`/`widen_buttons`
+  entries; the `__widen_rem` builtin is unused machinery from the
+  parked task #51 experiments.
+
+**Consequences (correcting the previous section):**
+* Our system ALREADY existentially quantifies player rem per frame -
+  the same abstraction as 2022's four-corner treatment, in a different
+  mechanization (full interval + floor-split vs corner enumeration).
+  Both discard all rem information at every frame boundary. There is
+  NO normalized-result-set decision on the table; nothing is blocked
+  on Philippe. The previous section's "over-approximation vs exact
+  tracking" contrast was a false dichotomy - we never tracked rem
+  across frames.
+* The real remaining differences vs 2022 are (a) collapse TIMING: they
+  group by post-move outcome immediately after move, we carry the flr
+  fan-out through the rest of the frame to the boundary merge; and
+  (b) per-lane interpreter speed (~4x).
+* Lever (a) is result-preserving under current semantics: player.rem is
+  dead from the end of the player's move() until the boundary widening,
+  so widening it early (the existing `widen_rem` rule) plus an early
+  hint merge collapses the fan-out where 2022 does, without changing
+  frame-boundary results. This is exactly parked task #51 (+110% ->
+  +33% when merges were expensive) - worth re-testing now that merges
+  are partitioned and much cheaper.
+* The 1.8-1.9x distinct-modulo number is retracted pending a redone
+  census with verified cell identities (see above).
 
 ## Ranked next steps
 
