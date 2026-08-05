@@ -1074,6 +1074,134 @@ impl Clone for VectorizeTimingStats {
 /// 2. Groups states by shape (structure with values normalized)
 /// 3. Merges each group into a single vectorized state
 /// 4. Deduplicates rows within each merged state
+/// The merge-partition cells (`CELESTE_PARTITION_CELLS`, comma-separated
+/// field names, e.g. "dash_time"): merges group by the *values* of these
+/// cells in addition to shape, so states in different classes never merge.
+///
+/// Why: a branch on a partition cell is uniform within every merged state,
+/// so it routes instead of splitting - the point is to kill the hot
+/// mid-frame forks (dash_time at in_i1_074_cont). Uniform-collapse then
+/// keeps the cell `Scalar` in each state, and its column leaves every
+/// dedup key. Lanes that converge across classes still dedup, one merge
+/// later, when their current values agree - the lane *set* is unchanged
+/// (splitting and merging are both semantics-preserving), which
+/// `rewrite verify` checks end to end.
+fn partition_cell_patterns() -> &'static [String] {
+    static PATTERNS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        std::env::var("CELESTE_PARTITION_CELLS")
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// Resolve the configured patterns against a state's cell names. A pattern
+/// matches a cell whose field path equals it or ends with ".<pattern>"
+/// (so "dash_time" matches both a global and a field, but not
+/// "dash_effect_time").
+fn resolve_partition_cells(state: &State) -> Vec<usize> {
+    let patterns = partition_cell_patterns();
+    if patterns.is_empty() {
+        return Vec::new();
+    }
+    let names = super::merge_dump::cell_names(state);
+    let mut cells: Vec<usize> = names
+        .iter()
+        .filter(|(_, name)| {
+            patterns
+                .iter()
+                .any(|p| *name == p || name.ends_with(&format!(".{}", p)))
+        })
+        .map(|(&cell, _)| cell)
+        .collect();
+    cells.sort_unstable();
+    cells
+}
+
+/// The state's class under the partition cells: a hash of their values.
+/// `None` if any partition cell still varies per lane - the caller splits
+/// the state first. A hash collision between two classes merely merges
+/// them (what an unpartitioned merge does to every class), never breaks
+/// anything.
+fn partition_class(state: &State, cells: &[usize]) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+    for &cell in cells {
+        match state.heap.get_opt(HeapId::from_raw(cell)) {
+            Some(HeapValue::Value(v)) => match v {
+                Value::Number(MaybeVector::Vector(_))
+                | Value::NumberInterval(MaybeVector::Vector(_))
+                | Value::Bool(MaybeVector::Vector(_)) => return None,
+                Value::Number(MaybeVector::Scalar(n)) => (cell, 1u8, n).hash(&mut hasher),
+                Value::NumberInterval(MaybeVector::Scalar(iv)) => {
+                    (cell, 2u8, iv.low, iv.high).hash(&mut hasher)
+                }
+                Value::Bool(MaybeVector::Scalar(b)) => (cell, 3u8, b).hash(&mut hasher),
+                // Non-vectorizable values are already part of the shape.
+                _ => cell.hash(&mut hasher),
+            },
+            _ => cell.hash(&mut hasher),
+        }
+    }
+    Some(hasher.finish())
+}
+
+/// Split any state whose partition cells vary per lane into per-class
+/// sub-states, using the one-pass branch split on a value-equality mask.
+/// Bounded by the cells' cardinality (<= a handful of values each).
+fn split_states_by_partition(states: Vec<State>, cells: &[usize]) -> Vec<State> {
+    let mut out = Vec::with_capacity(states.len());
+    let mut work = states;
+    while let Some(state) = work.pop() {
+        let Some(varying) = cells.iter().copied().find(|&cell| {
+            matches!(
+                state.heap.get_opt(HeapId::from_raw(cell)),
+                Some(HeapValue::Value(
+                    Value::Number(MaybeVector::Vector(_))
+                        | Value::NumberInterval(MaybeVector::Vector(_))
+                        | Value::Bool(MaybeVector::Vector(_))
+                ))
+            )
+        }) else {
+            out.push(state);
+            continue;
+        };
+        // Mask: lanes equal to the first lane's value peel off as one
+        // uniform class; the remainder loops back for the next value.
+        let mask: Vec<bool> = match state.heap.get_opt(HeapId::from_raw(varying)) {
+            Some(HeapValue::Value(Value::Number(MaybeVector::Vector(v)))) => {
+                let first = v[0];
+                v.iter().map(|&x| x == first).collect()
+            }
+            Some(HeapValue::Value(Value::NumberInterval(MaybeVector::Vector(v)))) => {
+                let first = v[0];
+                v.iter().map(|&x| x == first).collect()
+            }
+            Some(HeapValue::Value(Value::Bool(MaybeVector::Vector(v)))) => {
+                let first = v[0];
+                v.iter().map(|&x| x == first).collect()
+            }
+            _ => unreachable!("checked varying above"),
+        };
+        let (uniform, rest) = state.split_by_condition(&mask, true);
+        // The uniform side collapses the cell to Scalar via the split's
+        // canonicalizing gathers; the rest still varies (or is now uniform
+        // in a different value) and loops.
+        if let Some(uniform) = uniform {
+            work.push(uniform);
+        }
+        if let Some(rest) = rest {
+            work.push(rest);
+        }
+    }
+    out
+}
+
 pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
     let _trace = TraceSpan::new("vectorize_states", "vectorize");
     let mut stats = VectorizeTimingStats::default();
@@ -1108,14 +1236,32 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
     let states = clean_local_envs_for_merging(states);
     stats.clean_local_envs_ns = t1.elapsed().as_nanos() as u64;
 
-    // Group states by shape
+    // Partition on the configured cells, if any: split lane-varying states
+    // per class first, then group by (shape, class) so classes never merge.
     let t2 = std::time::Instant::now();
-    let mut states_by_shape: FxHashMap<StateShape, Vec<State>> = FxHashMap::default();
+    let partition_cells = states
+        .first()
+        .map(resolve_partition_cells)
+        .unwrap_or_default();
+    let states = if partition_cells.is_empty() {
+        states
+    } else {
+        let _trace_split = TraceSpan::new("partition_split", "vectorize");
+        split_states_by_partition(states, &partition_cells)
+    };
+
+    // Group states by shape (and partition class).
+    let mut states_by_shape: FxHashMap<(StateShape, u64), Vec<State>> = FxHashMap::default();
     {
         let _trace_shape = TraceSpan::new("shape_grouping", "vectorize");
         for state in states {
+            let class = partition_class(&state, &partition_cells)
+                .expect("partition-varying states were split above");
             let shape = shape_of_state(&state);
-            states_by_shape.entry(shape).or_insert_with(Vec::new).push(state);
+            states_by_shape
+                .entry((shape, class))
+                .or_insert_with(Vec::new)
+                .push(state);
         }
     }
     stats.shape_grouping_ns = t2.elapsed().as_nanos() as u64;
