@@ -364,6 +364,33 @@ finished 200m) re-run today on room (1,0):
   to demarcate the first room; a naive decode through concrete_run gave
   a suspicious trajectory, so the bit mapping differs.
 
+## The rem question, resolved to a decision point (2026-08-06)
+
+Read the 2022 definition: ALL_DIFFERENT_REMS_FOR_MOVE is the four rem
+corners (+-0.5 per axis). The 2022 searcher does not track rem: every
+frame it runs the move with both extreme rems per axis and merges by
+post-move outcome. Mathematically grounded (flr(rem+spd+0.5) over the
+unit rem interval takes at most two values, realized at the extremes) -
+but methodologically it is an **over-approximation**: rem is
+existentially quantified per frame, independent of history. Optimality
+still holds by the two-sided argument (over-approx bounds the horizon,
+the concrete TAS witnesses achievability - and 2022's matched the
+public TAS), but the normalized result set is a superset of exact
+tracking.
+
+Consequences:
+* An exact in-model rem equivalence beyond bit-equality is essentially
+  empty (distinct rems differ under some future spd sequence), so the
+  1.8-1.9x modulo-rem census slack is only reachable via the 2022-style
+  over-approx + concrete-witness methodology.
+* If adopted, the natural implementation is a rewrite: replace the rem
+  accumulate at frame start with a four-corner expand (the expand
+  machinery exists), plus concrete replay validation of any final TAS -
+  and verify would compare against a rem-projected observation.
+* **Blocked on Philippe**: this is a normalized-result-set change, which
+  he ruled out earlier in general; but it is also exactly the
+  methodology his own 2022 solve used. His call, explicitly.
+
 ## Ranked next steps
 
 1. ~~Fragment-parallel frame execution~~ DONE as state-parallel flow
