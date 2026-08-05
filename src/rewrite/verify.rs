@@ -325,9 +325,14 @@ impl AbstractRun {
             vectorize_states(new_states)
         };
         if let Some(visited) = self.visited_rows.as_mut() {
-            let (kept, _before, _after) = crate::interpreter::vectorize::subtract_visited(
+            let (kept, before, after) = crate::interpreter::vectorize::subtract_visited(
                 std::mem::take(&mut self.states),
                 visited,
+            );
+            let visited_total: usize = visited.values().map(|s| s.len()).sum();
+            println!(
+                "  frontier-only: {} -> {} new lanes, visited total {}",
+                before, after, visited_total
             );
             self.states = kept;
         }
