@@ -18,7 +18,7 @@ commit. All commits pushed to `census` (and `interpreter` follows it).
 | union_diff guarded pass-through | **29.06 s (-8.8%)** | f40 **7.68 s (-12.1%)** | afd0653 |
 | partitioned probe (hash high bits, >=512k rows) | 29.01 s (-0.4%) | f40 7.44 s (-2.4%) | (probe) |
 
-| state-parallel flow (opt-in: plain program only) | **22.33 s (-22.4%)**, +14% mem | flat (gate off) | (parallel flow) |
+| ~~state-parallel flow~~ REVERTED by morning review: only helped the plain program, which the search does not run | (-22.4% plain, gone) | flat | (reverted) |
 | select pick loop specialized per arm repr | flat | f42 -2.6% | (select) |
 | one-pass branch split (both edges at once) | 21.55 s (-3.4%) | f42 within noise | (branch) |
 | parallel dense pack (tiles on scoped threads) | 20.97 s (-2.8% median) | f43 -1.2% | (pack) |
@@ -27,7 +27,10 @@ commit. All commits pushed to `census` (and `interpreter` follows it).
 **Milestone gate: `rewrite verify --frames 40` identical on the full
 stack; `CELESTE_CHECK_UNION=1` at `-n 40`: zero mismatches.**
 
-**Cumulative: runner -n 39 44.4 -> 21.0 s (-52.7%). bench f42 26.5 ->
+**Cumulative (before the morning revert of state-parallel flow, which
+only affected the plain runner): runner -n 39 44.4 -> 21.0 s (-52.7%);
+post-revert the plain runner is ~27 s (-39%) and the rewritten path -
+the one that matters - keeps everything. bench f42 26.5 ->
 ~19.4 s, f43 32.2 -> ~30.8 s since the mid-night frontier.
 Final headline re-run: runner -n 41 = 50.1 s / 40.2 GiB (was 107 s
 yesterday, 87 s on the parallel branch) - 2.1x yesterday's baseline.**
