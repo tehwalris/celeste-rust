@@ -293,6 +293,25 @@ guard_region rule remains. Its concrete design:
   not just literal mask equality. Start with one pixel-move super-region
   as the pilot entry.
 
+## Region skipping: first measurement (2026-08-06 afternoon)
+
+The whole pipeline works end to end: 7 per-iteration guards on the
+pixel-move continue-flags applied, rule-verified, and differentially
+identical through 37 - the machinery is proven. But the measurement
+parks this granularity: **+3.4%** at f42 (14.55 -> 15.06 s, all pairs).
+Each guard adds per-fragment block-crossing overhead (phi flows,
+dispatch, queueing x 254 fragments x 7 guards) that outweighs skipping
+~15-instruction regions.
+
+The fix is granularity, per the original super-region design: ONE guard
+per axis on the axis root mask over all 8 iterations (~180
+instructions + 8 tile_flag_at calls) - skips fire for every fragment
+not moving on that axis (very common: grounded fragments for y, idle
+for x). Needs one more implied_false form: `select c ? _ : d` with both
+c and d implied-false of the guard (the continue-flag chain's shape:
+flag_i = select stop_i ? false : flag_{i-1}). Entries then target the
+whole [first-bound-check .. last-store] range per axis.
+
 ## Ranked next steps
 
 1. ~~Fragment-parallel frame execution~~ DONE as state-parallel flow
