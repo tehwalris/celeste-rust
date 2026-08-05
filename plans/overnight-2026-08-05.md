@@ -20,11 +20,13 @@ commit. All commits pushed to `census` (and `interpreter` follows it).
 
 | state-parallel flow (opt-in: plain program only) | **22.33 s (-22.4%)**, +14% mem | flat (gate off) | (parallel flow) |
 | select pick loop specialized per arm repr | flat | f42 -2.6% | (select) |
+| one-pass branch split (both edges at once) | 21.55 s (-3.4%) | f42 within noise | (branch) |
 
 **Milestone gate: `rewrite verify --frames 40` identical on the full
 stack; `CELESTE_CHECK_UNION=1` at `-n 40`: zero mismatches.**
 
-**Cumulative: runner -n 39 44.4 -> 22.3 s (-49.7%). bench f40 9.76 -> ~7.2 s.**
+**Cumulative: runner -n 39 44.4 -> 21.6 s (-51.4%). bench f40 9.76 -> ~7.2 s,
+f42 26.5 -> ~19.4 s since the mid-night frontier.**
 
 Morning headlines (final binary):
 
