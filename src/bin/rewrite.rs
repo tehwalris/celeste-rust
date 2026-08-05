@@ -132,6 +132,17 @@ enum Command {
         #[arg(long, default_value_t = 34)]
         frames: u32,
     },
+    /// Certify the canonical-state mapping and the deopt path: run the
+    /// rewritten program with deopt *forced* on every state of every frame -
+    /// so each frame goes specialized-input -> to_canonical -> plain program
+    /// -> from_canonical - and compare observations frame by frame against a
+    /// plain-program run. Equal through N frames means both mapping
+    /// directions and the plain re-run are exercised on every reachable state
+    /// without changing meaning.
+    Deoptcheck {
+        #[arg(long, default_value_t = 34)]
+        frames: u32,
+    },
     Bench {
         #[arg(long, default_value_t = 34)]
         frames: u32,
@@ -141,6 +152,12 @@ enum Command {
         /// Print a self-time breakdown by span. Costs a few percent.
         #[arg(long)]
         profile: bool,
+        /// On a frame failure (a specialization premise such as the collapsed
+        /// loops' "#objects == 1" firing), re-run that state's frame under the
+        /// plain program via the canonical-state mapping instead of aborting.
+        /// Required to search past frame 58, where states start dying.
+        #[arg(long)]
+        deopt: bool,
     },
 }
 
@@ -155,8 +172,19 @@ fn peak_rss_kb() -> u64 {
         .unwrap_or(0)
 }
 
-fn bench(label: &str, program: &Program, frames: u32, profile: bool) -> Result<()> {
-    let mut run = celeste_rust::rewrite::verify::AbstractRun::start(program)?;
+fn bench(
+    label: &str,
+    program: &Program,
+    frames: u32,
+    profile: bool,
+    deopt: Option<(&Program, celeste_rust::rewrite::state_mapping::StateMapping)>,
+) -> Result<()> {
+    let mut run = match deopt {
+        Some((plain, mapping)) => celeste_rust::rewrite::verify::AbstractRun::start_with_deopt(
+            program, plain, mapping, false,
+        )?,
+        None => celeste_rust::rewrite::verify::AbstractRun::start(program)?,
+    };
     if profile {
         celeste_rust::interpreter::tracing::reset_tracing();
         celeste_rust::branch_sites::reset();
@@ -195,6 +223,13 @@ fn bench(label: &str, program: &Program, frames: u32, profile: bool) -> Result<(
         "{:<10} end-of-frame state: heap {} cells, local_env {} entries",
         "", heap_len, env_len
     );
+    let (deopt_states, deopt_lanes) = run.deopt_events();
+    if deopt_states > 0 {
+        println!(
+            "{:<10} deopt: {} state(s) / {} lanes re-ran under the plain program",
+            "", deopt_states, deopt_lanes
+        );
+    }
     // How many rows are distinct if the rem cells are ignored: the gap
     // between this and the lane count is interval-refinement multiplicity
     // (the rem/flr cycle), i.e. abstraction cost rather than game states.
@@ -1476,12 +1511,75 @@ fn main() -> Result<()> {
                 frames
             );
         }
-        Command::Bench { frames, baseline, profile } => {
+        Command::Deoptcheck { frames } => {
+            use celeste_rust::rewrite::state_mapping::StateMapping;
+            use celeste_rust::rewrite::verify::{observe_frame, AbstractRun};
+            let plain = Program::compile_from_disk()?;
+            let (program, _) = build(&recipe)?;
+            let mapping = StateMapping::from_recipe(&recipe);
+            println!(
+                "canonical-state mapping: {} (function, capture) pair(s)",
+                mapping.pair_count()
+            );
+            // Order matters: `set_merge_partition_patterns` is process-global,
+            // so start the plain run first and the specialized run second -
+            // then both merge under the specialized partition key, exactly as
+            // `differential_abstract` does.
+            let mut plain_run = AbstractRun::start(&plain)?;
+            let mut forced =
+                AbstractRun::start_with_deopt(&program, &plain, mapping, true)?;
+            for frame in 1..=frames {
+                plain_run.step()?;
+                forced.step()?;
+                let a = observe_frame(plain_run.states());
+                let b = observe_frame(forced.states());
+                if a != b {
+                    println!(
+                        "DIVERGED at frame {}: plain run != forced-deopt run ({} vs {} \
+                         state observations). The canonical-state mapping or the deopt \
+                         path changed meaning.",
+                        frame,
+                        a.len(),
+                        b.len()
+                    );
+                    std::process::exit(1);
+                }
+                if frame % 5 == 0 || frame == frames {
+                    println!(
+                        "frame {}: identical ({} lanes, {} deopted states so far)",
+                        frame,
+                        forced.lane_count(),
+                        forced.deopt_events().0
+                    );
+                }
+            }
+            println!(
+                "ok: deopt path certified through frame {} - every state of every frame \
+                 went specialized -> canonical -> plain program -> specialized without \
+                 changing the reachable set",
+                frames
+            );
+        }
+        Command::Bench { frames, baseline, profile, deopt } => {
             if baseline {
-                bench("original", &Program::compile_from_disk()?, frames, profile)?;
+                bench("original", &Program::compile_from_disk()?, frames, profile, None)?;
             }
             let (program, _) = build(&recipe)?;
-            bench("rewritten", &program, frames, profile)?;
+            let deopt_setup = if deopt {
+                Some((
+                    Program::compile_from_disk()?,
+                    celeste_rust::rewrite::state_mapping::StateMapping::from_recipe(&recipe),
+                ))
+            } else {
+                None
+            };
+            bench(
+                "rewritten",
+                &program,
+                frames,
+                profile,
+                deopt_setup.as_ref().map(|(p, m)| (p, m.clone())),
+            )?;
         }
 
         Command::Bisect { frames } => {

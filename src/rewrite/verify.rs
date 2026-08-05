@@ -284,6 +284,28 @@ pub struct AbstractRun {
     /// Use only the historic rem widening at boundaries (for the widen-check,
     /// which applies the conservative widenings post hoc instead).
     rem_only_abstraction: bool,
+    /// Deopt-to-plain support; `None` means a failing frame is a hard error.
+    deopt: Option<DeoptTarget>,
+}
+
+/// Everything needed to re-run a frame under the plain program when the
+/// specialized one hits a premise it baked in (see `state_mapping`).
+///
+/// The plain program has its own `FixedEnv` - its function definitions differ
+/// from the specialized ones - and the mapping translates the frame-input
+/// state to canonical before the re-run and the outputs back after it.
+struct DeoptTarget {
+    plain_cfg: crate::interpreter::fixed_env::PreparedCfg,
+    plain_env: crate::interpreter::fixed_env::FixedEnv,
+    mapping: super::state_mapping::StateMapping,
+    /// Deopt *every* state instead of only failing ones. This is the
+    /// certification mode of `rewrite deoptcheck`: it pushes every frame of
+    /// every state through to_canonical -> plain -> from_canonical, so a
+    /// mapping bug shows up as an observation divergence rather than waiting
+    /// for the first real deopt at frame 59.
+    force: bool,
+    /// (states, lanes) deopted over the whole run.
+    total_events: (usize, usize),
 }
 
 impl AbstractRun {
@@ -315,6 +337,7 @@ impl AbstractRun {
             states_before_merge: Vec::new(),
             visited_rows,
             rem_only_abstraction: false,
+            deopt: None,
         })
     }
 
@@ -325,12 +348,87 @@ impl AbstractRun {
         Ok(run)
     }
 
+    /// Like `start`, but a frame that fails under `program` deopts: the
+    /// frame-input state is mapped to canonical, the frame re-runs under
+    /// `plain`, and the outputs are mapped back. With `force`, *every* state
+    /// takes that path (certification mode; see `DeoptTarget::force`).
+    ///
+    /// `mapping` must be the one derived from the recipe that produced
+    /// `program`, and `plain` must be the unrewritten program.
+    pub fn start_with_deopt(
+        program: &Program,
+        plain: &Program,
+        mapping: super::state_mapping::StateMapping,
+        force: bool,
+    ) -> Result<Self> {
+        let mut run = Self::start(program)?;
+        run.deopt = Some(DeoptTarget {
+            plain_cfg: crate::interpreter::fixed_env::PreparedCfg::new(
+                plain.frame_cfg().clone(),
+            ),
+            plain_env: plain.fixed_env(),
+            mapping,
+            force,
+            total_events: (0, 0),
+        });
+        Ok(run)
+    }
+
+    /// (states, lanes) that deopted to the plain program so far.
+    pub fn deopt_events(&self) -> (usize, usize) {
+        self.deopt.as_ref().map_or((0, 0), |d| d.total_events)
+    }
+
     pub fn step(&mut self) -> Result<()> {
         let mut new_states = Vec::new();
+        let mut frame_events = (0usize, 0usize);
         for state in std::mem::take(&mut self.states) {
-            let result = interpret_prepared_cfg(&self.frame_cfg, state, &self.fixed_env)
-                .context("frame failed")?;
-            new_states.extend(result.into_iter().map(|(s, _)| s));
+            match &mut self.deopt {
+                None => {
+                    let result =
+                        interpret_prepared_cfg(&self.frame_cfg, state, &self.fixed_env)
+                            .context("frame failed")?;
+                    new_states.extend(result.into_iter().map(|(s, _)| s));
+                }
+                Some(deopt) if deopt.force => {
+                    frame_events.0 += 1;
+                    frame_events.1 += state.vector_size;
+                    new_states.extend(run_deopt_frame(deopt, state)?);
+                }
+                Some(deopt) => {
+                    // Optimistic: run the specialized frame; deopt on failure.
+                    // Panics are caught too - a speculated instruction may
+                    // assert on values the verify horizon never showed it
+                    // (same failure class `screen_trial` unwinds across).
+                    let snapshot = state.clone();
+                    let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                        || interpret_prepared_cfg(&self.frame_cfg, state, &self.fixed_env),
+                    ));
+                    match attempt {
+                        Ok(Ok(result)) => {
+                            new_states.extend(result.into_iter().map(|(s, _)| s))
+                        }
+                        Ok(Err(err)) => {
+                            log_deopt(&mut frame_events, &snapshot, &format!("{:#}", err));
+                            new_states.extend(run_deopt_frame(deopt, snapshot)?);
+                        }
+                        Err(panic) => {
+                            log_deopt(&mut frame_events, &snapshot, &panic_text(&panic));
+                            new_states.extend(run_deopt_frame(deopt, snapshot)?);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(deopt) = self.deopt.as_mut() {
+            deopt.total_events.0 += frame_events.0;
+            deopt.total_events.1 += frame_events.1;
+            if frame_events.0 > 0 && !deopt.force {
+                println!(
+                    "  deopt: {} state(s) / {} lanes re-ran under the plain program",
+                    frame_events.0, frame_events.1
+                );
+            }
         }
         let new_states: Vec<State> = if self.rem_only_abstraction {
             new_states
@@ -380,6 +478,52 @@ impl AbstractRun {
             total as f64 / n as f64,
             self.states_before_merge.iter().copied().max().unwrap_or(0),
         )
+    }
+}
+
+/// One frame of one state under the plain program: map the input to canonical,
+/// run, map the outputs back to the specialized representation.
+///
+/// An error here is terminal on purpose: the plain program is ground truth, so
+/// a state that fails under it too is a real bug, not a missed specialization.
+fn run_deopt_frame(deopt: &DeoptTarget, mut state: State) -> Result<Vec<State>> {
+    deopt
+        .mapping
+        .to_canonical(&mut state)
+        .context("deopt: mapping the frame input to canonical")?;
+    let result = interpret_prepared_cfg(&deopt.plain_cfg, state, &deopt.plain_env)
+        .context("deopt: the frame failed under the plain program too")?;
+    let mut out = Vec::with_capacity(result.len());
+    for (mut s, _) in result {
+        deopt
+            .mapping
+            .from_canonical(&mut s)
+            .context("deopt: mapping a frame output back from canonical")?;
+        out.push(s);
+    }
+    Ok(out)
+}
+
+/// Count a deopt event; print the trigger for the first one each frame (the
+/// rest are usually the same premise firing across states, and the per-frame
+/// summary line carries the count).
+fn log_deopt(frame_events: &mut (usize, usize), state: &State, reason: &str) {
+    frame_events.0 += 1;
+    frame_events.1 += state.vector_size;
+    if frame_events.0 == 1 {
+        let one_line = reason.replace('\n', " | ");
+        let short: String = one_line.chars().take(240).collect();
+        println!("  deopt trigger ({} lanes): {}", state.vector_size, short);
+    }
+}
+
+fn panic_text(panic: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = panic.downcast_ref::<String>() {
+        format!("panic: {}", s)
+    } else if let Some(s) = panic.downcast_ref::<&str>() {
+        format!("panic: {}", s)
+    } else {
+        "panic with a non-string payload".to_string()
     }
 }
 

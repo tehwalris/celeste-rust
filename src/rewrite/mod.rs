@@ -33,5 +33,6 @@ pub mod program;
 pub mod recipe;
 pub mod rules;
 pub mod slots;
+pub mod state_mapping;
 pub mod validate;
 pub mod verify;
