@@ -29,7 +29,7 @@ use super::virtual_merge::{collect_columns_labeled, Column, Origin, Piece};
 
 /// Resolves heap cells to the field path that reaches them, so a column can
 /// be named `player.spd.x` rather than `cell 49`.
-pub(crate) fn cell_names(state: &State) -> std::collections::HashMap<usize, String> {
+pub fn cell_names(state: &State) -> std::collections::HashMap<usize, String> {
     let mut names: std::collections::HashMap<usize, String> = Default::default();
     for (global, id) in state.global_env.iter() {
         names.insert(id.raw(), global.clone());

@@ -185,6 +185,61 @@ fn bench(label: &str, program: &Program, frames: u32, profile: bool) -> Result<(
         "{:<10} end-of-frame state: heap {} cells, local_env {} entries",
         "", heap_len, env_len
     );
+    // How many rows are distinct if the rem cells are ignored: the gap
+    // between this and the lane count is interval-refinement multiplicity
+    // (the rem/flr cycle), i.e. abstraction cost rather than game states.
+    if std::env::var_os("CELESTE_DISTINCT_MODULO").is_some() {
+        let patterns: Vec<String> = std::env::var("CELESTE_DISTINCT_MODULO")
+            .unwrap()
+            .split(',')
+            .map(|x| x.trim().to_string())
+            .collect();
+        for state in run.states() {
+            let names = celeste_rust::interpreter::merge_dump::cell_names(state);
+            let Some((columns, origins)) =
+                celeste_rust::interpreter::virtual_merge::collect_columns_labeled(
+                    std::slice::from_ref(state),
+                )
+            else {
+                continue;
+            };
+            let full: Vec<_> = columns.iter().filter(|c| !c.is_uniform()).collect();
+            let modulo: Vec<_> = columns
+                .iter()
+                .zip(&origins)
+                .filter(|(c, origin)| {
+                    if c.is_uniform() {
+                        return false;
+                    }
+                    let name = match origin {
+                        celeste_rust::interpreter::virtual_merge::Origin::Heap(cell) => {
+                            names.get(cell).cloned().unwrap_or_default()
+                        }
+                        _ => String::new(),
+                    };
+                    !patterns
+                        .iter()
+                        .any(|p| name == *p || name.ends_with(&format!(".{}", p)))
+                })
+                .map(|(c, _)| c)
+                .collect();
+            let distinct = |cols: &[&celeste_rust::interpreter::virtual_merge::Column]| {
+                let hashes =
+                    celeste_rust::interpreter::virtual_merge::hash_rows(cols, state.vector_size);
+                hashes.iter().collect::<std::collections::HashSet<_>>().len()
+            };
+            println!(
+                "distinct-modulo [{}]: {} lanes, {} full cols -> {} kept, {} distinct full, {} distinct modulo ({:.1}x multiplicity)",
+                patterns.join(","),
+                state.vector_size,
+                full.len(),
+                modulo.len(),
+                distinct(&full),
+                distinct(&modulo),
+                state.vector_size as f64 / distinct(&modulo).max(1) as f64,
+            );
+        }
+    }
     let (fragments, mean_fragments, max_fragments) = run.states_before_merge();
     println!(
         "{:<10} fragments before merge: {} total, {:.0} mean, {} max per frame",
