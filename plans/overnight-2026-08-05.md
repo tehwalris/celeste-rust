@@ -78,6 +78,19 @@ cfg:anonymous_61 self ~4.0 s (45%) - the frame body: instruction loop +
 per-state overhead. virtual_merge ~2.1 -> ~1.3 s est. filter_branch ~1.3 s.
 gc 0.07 s. Everything else small.
 
+## The f44 profile (what to attack next, measured)
+
+bench --frames 44 --profile: cfg:anonymous_61 self 34.7 s (56%),
+filter_branch **9.8 s** (16%; it was 1.3 s at f40 - superlinear in
+lanes, the two hot fork sites again), vm_pack_verify 5.6 s (pack still
+sequential), vm_hash 3.7 s, vm_probe 3.2 s, everything else <1.5 s.
+The two depth levers: (a) the frame body is memory-bound streaming over
+4-byte lanes with <=59 distinct values - dictionary codes (u8) cut its
+bandwidth 4x and this path does NOT benefit from concurrency (measured);
+(b) filter_branch = the dash_time forks; if-conversion is measured
+impossible (2.2x), so the fix is run-structured masks or splitting the
+state permanently at those sites.
+
 ## Ranked next steps
 
 1. ~~Fragment-parallel frame execution~~ DONE as state-parallel flow
