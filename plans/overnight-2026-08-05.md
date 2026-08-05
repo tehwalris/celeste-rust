@@ -135,6 +135,16 @@ values) is worth ~10x on top for the ops it can cover. The two fork
 sites again: in_i1_074_cont 0.81 s + and_or_join_126 0.57 s of filter at
 frame 42 alone.
 
+## The cross-fragment memo: priced, not built
+
+A pricing census (CELESTE_CENSUS=1, `op memo pricing` line) asked whether
+ops recur with Arc-identical inputs across fragments: 17.8% of calls,
+**12.7% of output elements** - under 2% of total time at depth, not worth
+a Mutex/retention-bearing cache. What it rules out matters more: the
+'100% duplicate-lane computation' is within-vector redundancy, so the
+only lever that reaches it is per-context/dictionary evaluation. That is
+now unambiguously the top item.
+
 ## Ranked next steps
 
 1. ~~Fragment-parallel frame execution~~ DONE as state-parallel flow
