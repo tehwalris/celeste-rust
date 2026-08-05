@@ -28,16 +28,19 @@ Morning headlines (final binary):
 |---|---|---|
 | runner `-n 40` | 36.2 s | 24.8 GiB |
 | runner `-n 41` | **54.0 s** | 41.3 GiB |
+| runner `-n 42` | **81.9 s** | 62.5 GiB |
 | bench `--frames 43` | **32.2 s** | 13.7 GB |
+| bench `--frames 44` | **61.0 s** | 18.7 GB |
 
 Yesterday's baseline reached frame 41 in 107 s; the overnight parallel
-branch did 87 s. Tonight's stack does **54 s** - 2x yesterday, on a
-mostly-sequential interpreter plus targeted parallel pieces. On the
-rewritten path, extrapolating ~1.65x/frame from f43=32.2 s: f44 = ~53 s,
-f45 = ~88 s - a 60 s budget now reaches ~frame 44 and 120 s ~frame 45,
-roughly two frames deeper than the morning estimates at the same budgets.
-Memory: runner f41 peaks at 41 GiB (cap 100G); rewritten path is far
-leaner (f43 = 13.7 GB).
+branch did 87 s. Tonight's stack does **54 s** - 2x yesterday. Frame 42
+on the plain path - which yesterday's log said "needs bandwidth or task
+volume" - now completes in 81.9 s / 62.5 GiB. On the rewritten path the
+budget map is measured through f44: **frame 44 in 61 s / 18.7 GB**, so a
+60 s budget reaches frame 44 and 120 s reaches ~frame 45 (~110 s
+extrapolated, ~31 GB) - two frames deeper than the morning estimates.
+Note the us/lane creep at depth (10.0 at f43 -> 13.3 at f44): the merge
+grows superlinearly; the dedup input volume lever is not done.
 
 Probe threshold lesson: at 16k rows partitioning was +0.3% runner (extra
 O(n) passes beat mid-size savings); at 512k - where the map actually
