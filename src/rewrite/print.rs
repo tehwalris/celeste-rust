@@ -155,12 +155,6 @@ pub fn format_terminator(term: &Terminator) -> String {
             true_target.as_str(),
             false_target.as_str()
         ),
-        Terminator::ConditionalSkip { condition, skip_target, enter_target } => format!(
-            "skip_if_none {} ? {} : {}",
-            local_name(*condition),
-            skip_target.as_str(),
-            enter_target.as_str()
-        ),
     }
 }
 

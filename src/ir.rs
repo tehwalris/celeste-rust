@@ -559,21 +559,6 @@ pub enum Terminator {
         true_target: Label,
         false_target: Label,
     },
-    /// Skip a guarded region when its mask is *uniformly false* in the
-    /// executing state; enter it otherwise. Unlike `ConditionalBranch`
-    /// this never filters or splits: the whole state takes one edge, and
-    /// a mixed mask simply enters (the region's masked stores make the
-    /// false lanes no-ops, exactly as when no skip exists). The payoff is
-    /// per-fragment: a fragment whose mask is a scalar false - which the
-    /// uniform collapse makes common - jumps over the region's vector
-    /// work instead of computing it and discarding per select.
-    ConditionalSkip {
-        condition: LocalId,
-        /// Taken when the condition is uniformly false.
-        skip_target: Label,
-        /// Taken otherwise (any true lane, mixed, or unknown).
-        enter_target: Label,
-    },
 }
 
 impl Terminator {
@@ -582,7 +567,6 @@ impl Terminator {
             Self::Return { value } => value.into_iter().copied().collect(),
             Self::UnconditionalBranch { .. } => vec![],
             Self::ConditionalBranch { condition, .. } => vec![*condition],
-            Self::ConditionalSkip { condition, .. } => vec![*condition],
         }
     }
 
@@ -593,9 +577,6 @@ impl Terminator {
             Self::UnconditionalBranch { target } => vec![target],
             Self::ConditionalBranch { true_target, false_target, .. } => {
                 vec![true_target, false_target]
-            }
-            Self::ConditionalSkip { skip_target, enter_target, .. } => {
-                vec![enter_target, skip_target]
             }
         }
     }
@@ -616,15 +597,6 @@ impl Terminator {
                 condition: f(*condition),
                 true_target: true_target.clone(),
                 false_target: false_target.clone(),
-            },
-            Self::ConditionalSkip {
-                condition,
-                skip_target,
-                enter_target,
-            } => Self::ConditionalSkip {
-                condition: f(*condition),
-                skip_target: skip_target.clone(),
-                enter_target: enter_target.clone(),
             },
         }
     }

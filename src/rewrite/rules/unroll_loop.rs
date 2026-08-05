@@ -510,14 +510,6 @@ fn retarget(terminator: &mut Terminator, from: &Label, to: &Label) {
                 *false_target = to.clone();
             }
         }
-        Terminator::ConditionalSkip { skip_target, enter_target, .. } => {
-            if skip_target == from {
-                *skip_target = to.clone();
-            }
-            if enter_target == from {
-                *enter_target = to.clone();
-            }
-        }
     }
 }
 

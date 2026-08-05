@@ -245,13 +245,6 @@ pub fn apply(
                     false_target: map_label(false_target),
                 }
             }
-            Terminator::ConditionalSkip { condition, skip_target, enter_target } => {
-                Terminator::ConditionalSkip {
-                    condition: resolve(*condition),
-                    skip_target: map_label(skip_target),
-                    enter_target: map_label(enter_target),
-                }
-            }
         };
 
         new_blocks.push((

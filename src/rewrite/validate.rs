@@ -58,9 +58,6 @@ pub fn successors(block: &Block) -> Vec<BlockKey> {
         Terminator::ConditionalBranch { true_target, false_target, .. } => {
             vec![Some(true_target.clone()), Some(false_target.clone())]
         }
-        Terminator::ConditionalSkip { skip_target, enter_target, .. } => {
-            vec![Some(enter_target.clone()), Some(skip_target.clone())]
-        }
     }
 }
 

@@ -258,22 +258,6 @@ static SELECT_UNIFORM_CALLS: AtomicU64 = AtomicU64::new(0);
 static SELECT_UNIFORM_DISCARD_LANES: AtomicU64 = AtomicU64::new(0);
 static SELECT_MIXED_CALLS: AtomicU64 = AtomicU64::new(0);
 
-/// ConditionalSkip routing outcomes.
-static SKIP_TAKEN: AtomicU64 = AtomicU64::new(0);
-static SKIP_TAKEN_LANES: AtomicU64 = AtomicU64::new(0);
-static SKIP_ENTERED: AtomicU64 = AtomicU64::new(0);
-static SKIP_ENTERED_LANES: AtomicU64 = AtomicU64::new(0);
-
-pub fn record_skip(taken: bool, lanes: usize) {
-    if taken {
-        SKIP_TAKEN.fetch_add(1, Ordering::Relaxed);
-        SKIP_TAKEN_LANES.fetch_add(lanes as u64, Ordering::Relaxed);
-    } else {
-        SKIP_ENTERED.fetch_add(1, Ordering::Relaxed);
-        SKIP_ENTERED_LANES.fetch_add(lanes as u64, Ordering::Relaxed);
-    }
-}
-
 pub fn record_select_uniform(discarded_vector_lanes: usize) {
     SELECT_UNIFORM_CALLS.fetch_add(1, Ordering::Relaxed);
     SELECT_UNIFORM_DISCARD_LANES.fetch_add(discarded_vector_lanes as u64, Ordering::Relaxed);
@@ -337,10 +321,6 @@ pub fn record(cat: Cat, elems: usize, bytes: usize, started: Option<std::time::I
 /// cost of an op as the lane count grows is the whole question behind
 /// tiling, and cumulative totals hide it.
 pub fn reset() {
-    SKIP_TAKEN.store(0, Ordering::Relaxed);
-    SKIP_TAKEN_LANES.store(0, Ordering::Relaxed);
-    SKIP_ENTERED.store(0, Ordering::Relaxed);
-    SKIP_ENTERED_LANES.store(0, Ordering::Relaxed);
     SELECT_UNIFORM_CALLS.store(0, Ordering::Relaxed);
     SELECT_UNIFORM_DISCARD_LANES.store(0, Ordering::Relaxed);
     SELECT_MIXED_CALLS.store(0, Ordering::Relaxed);
@@ -486,16 +466,6 @@ pub fn report() {
             100.0 * hits as f64 / memo_calls as f64,
             MEMO_HIT_ELEMS.load(Ordering::Relaxed) as f64 / 1e6,
             MEMO_ELEMS.load(Ordering::Relaxed) as f64 / 1e6,
-        );
-    }
-    let skips = SKIP_TAKEN.load(Ordering::Relaxed) + SKIP_ENTERED.load(Ordering::Relaxed);
-    if skips > 0 {
-        eprintln!(
-            "region skips: {} taken ({:.1} M lanes) vs {} entered ({:.1} M lanes)",
-            SKIP_TAKEN.load(Ordering::Relaxed),
-            SKIP_TAKEN_LANES.load(Ordering::Relaxed) as f64 / 1e6,
-            SKIP_ENTERED.load(Ordering::Relaxed),
-            SKIP_ENTERED_LANES.load(Ordering::Relaxed) as f64 / 1e6,
         );
     }
     let uniform_selects = SELECT_UNIFORM_CALLS.load(Ordering::Relaxed);

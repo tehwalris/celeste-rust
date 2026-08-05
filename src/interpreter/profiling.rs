@@ -63,7 +63,6 @@ impl BlockExport {
             Terminator::Return { .. } => "return".to_string(),
             Terminator::UnconditionalBranch { .. } => "unconditional".to_string(),
             Terminator::ConditionalBranch { .. } => "conditional".to_string(),
-            Terminator::ConditionalSkip { .. } => "conditional_skip".to_string(),
         };
 
         // Create brief instruction summaries (just the type)
@@ -173,18 +172,6 @@ impl CfgExport {
                     source,
                     target: false_target.as_str().to_string(),
                     edge_type: "false".to_string(),
-                });
-            }
-            Terminator::ConditionalSkip { skip_target, enter_target, .. } => {
-                edges.push(CfgEdge {
-                    source: source.clone(),
-                    target: enter_target.as_str().to_string(),
-                    edge_type: "skip_enter".to_string(),
-                });
-                edges.push(CfgEdge {
-                    source,
-                    target: skip_target.as_str().to_string(),
-                    edge_type: "skip_taken".to_string(),
                 });
             }
         }
