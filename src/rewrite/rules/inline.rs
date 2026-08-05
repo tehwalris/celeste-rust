@@ -707,7 +707,7 @@ mod tests {
         for f in funs {
             functions.insert(f.name.clone(), f);
         }
-        Program { functions }
+        Program { functions, merge_partition_cells: Vec::new() }
     }
 
     /// caller: `%1 = alloc; %2 = load %1; %3 = call %2()`

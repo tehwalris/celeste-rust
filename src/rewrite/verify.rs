@@ -279,6 +279,9 @@ pub struct AbstractRun {
 
 impl AbstractRun {
     pub fn start(program: &Program) -> Result<Self> {
+        crate::interpreter::vectorize::set_merge_partition_patterns(
+            &program.merge_partition_cells,
+        );
         let fixed_env = program.fixed_env();
         let initial = create_initial_state_with_builtins(&fixed_env);
         let init_states = interpret_cfg(program.init_cfg().clone(), initial, &fixed_env)

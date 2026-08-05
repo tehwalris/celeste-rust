@@ -26,7 +26,7 @@ use super::rules::{
     mask_loop, merge_blocks,
     pin_builtin,
     promote_capture,
-    promote_cell, sink_store, speculate, speculate_region, split_call, unroll_loop, remove_hint, widen_buttons, widen_rem,
+    promote_cell, sink_store, speculate, speculate_region, split_call, unroll_loop, partition_merge, remove_hint, widen_buttons, widen_rem,
 };
 use crate::ir::LocalId;
 use super::validate::{validate_function, validate_program};
@@ -404,6 +404,9 @@ pub enum Rule {
         /// The block to flag.
         block: String,
     },
+    /// Designate the merge-partition cells (field-path patterns).
+    #[serde(rename = "partition_merge")]
+    PartitionMerge { cells: Vec<String> },
     /// Unmark a block as an early normalize point (inverse of `add_hint`).
     #[serde(rename = "remove_hint")]
     RemoveHint {
@@ -473,6 +476,7 @@ impl Rule {
             Rule::DedupGuards => "dedup_guards",
             Rule::AddHint { .. } => "add_hint",
             Rule::RemoveHint { .. } => "remove_hint",
+            Rule::PartitionMerge { .. } => "partition_merge",
             Rule::WidenButtons { .. } => "widen_buttons",
             Rule::WidenRem { .. } => "widen_rem",
             Rule::AssumeEq { .. } => "assume_eq",
@@ -688,6 +692,7 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::DedupGuards => dedup_guards::apply(program),
         Rule::AddHint { function, block } => add_hint::apply(program, function, block),
         Rule::RemoveHint { function, block } => remove_hint::apply(program, function, block),
+        Rule::PartitionMerge { cells } => partition_merge::apply(program, cells),
         Rule::WidenButtons { function, block } => widen_buttons::apply(program, function, block),
         Rule::WidenRem { function, block, object } => {
             widen_rem::apply(program, function, block, parse_cell(object)?)
@@ -823,6 +828,7 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::RemoveHint { function, block } => {
             remove_hint::verify(&before, program, function, block)
         }
+        Rule::PartitionMerge { cells } => partition_merge::verify(&before, program, cells),
         Rule::WidenButtons { function, block } => {
             widen_buttons::verify(&before, program, function, block)
         }

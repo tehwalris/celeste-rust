@@ -1541,7 +1541,7 @@ mod tests {
         };
         let mut functions = IndexMap::new();
         functions.insert(fun.name.clone(), fun);
-        Program { functions }
+        Program { functions, merge_partition_cells: Vec::new() }
     }
 
     #[test]
@@ -1809,7 +1809,7 @@ mod tests {
         };
         let mut functions = IndexMap::new();
         functions.insert(fun.name.clone(), fun);
-        Program { functions }
+        Program { functions, merge_partition_cells: Vec::new() }
     }
 
     /// With an explicit join, both regions run in sequence - named arm
@@ -2177,7 +2177,7 @@ mod tests {
         };
         let mut functions = IndexMap::new();
         functions.insert(fun.name.clone(), fun);
-        Program { functions }
+        Program { functions, merge_partition_cells: Vec::new() }
     }
 
     /// The concretization pair runs untouched and unmasked; the ordinary

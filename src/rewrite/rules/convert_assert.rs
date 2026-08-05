@@ -565,7 +565,7 @@ mod tests {
                 source_span: None,
             },
         );
-        Program { functions }
+        Program { functions, merge_partition_cells: Vec::new() }
     }
 
     #[test]

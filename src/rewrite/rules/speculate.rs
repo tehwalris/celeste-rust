@@ -693,7 +693,7 @@ mod tests {
                 source_span: None,
             },
         );
-        Program { functions }
+        Program { functions, merge_partition_cells: Vec::new() }
     }
 
     /// The main shape: the pointer, its guard and the stored value hoist; the

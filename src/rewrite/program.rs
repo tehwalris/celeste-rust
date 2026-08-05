@@ -25,6 +25,11 @@ pub const FRAME_FN: &str = "__frame";
 pub struct Program {
     /// Insertion-ordered so that printing and hashing are deterministic.
     pub functions: IndexMap<GlobalId, FunDef>,
+    /// Field-path patterns of the merge-partition cells (see the
+    /// `partition_merge` rule): the interpreter's merges group by the
+    /// values of these cells in addition to shape, so branches on them
+    /// route instead of splitting. Empty = unpartitioned.
+    pub merge_partition_cells: Vec<String>,
 }
 
 /// The Lua that gets compiled into a `Program`. Kept here rather than in the
@@ -74,7 +79,7 @@ impl Program {
         for fun_def in fun_defs {
             functions.insert(fun_def.name.clone(), fun_def);
         }
-        Ok(Self { functions })
+        Ok(Self { functions, merge_partition_cells: Vec::new() })
     }
 
     pub fn compile_from_disk() -> Result<Self> {

@@ -445,7 +445,7 @@ mod tests {
                 source_span: None,
             },
         );
-        Program { functions }
+        Program { functions, merge_partition_cells: Vec::new() }
     }
 
     fn store(target: usize, source: usize) -> Instruction {

@@ -833,7 +833,7 @@ mod tests {
                 source_span: None,
             },
         );
-        Program { functions }
+        Program { functions, merge_partition_cells: Vec::new() }
     }
 
     /// The inlined `sign()` cascade: `v>0 and 1 or (v<0 and -1 or 0)`, as the
@@ -1051,7 +1051,7 @@ mod tests {
                 source_span: None,
             },
         );
-        Program { functions }
+        Program { functions, merge_partition_cells: Vec::new() }
     }
 
     #[test]

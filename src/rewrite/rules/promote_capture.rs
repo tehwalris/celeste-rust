@@ -602,7 +602,7 @@ mod tests {
         for f in funs {
             functions.insert(f.name.clone(), f);
         }
-        Program { functions }
+        Program { functions, merge_partition_cells: Vec::new() }
     }
 
     /// maker: `%1 = alloc; %2 = ...; store %1 <- %2; store_closure %3 <- callee [%1]`

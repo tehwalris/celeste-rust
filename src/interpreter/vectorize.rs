@@ -1066,38 +1066,39 @@ impl Clone for VectorizeTimingStats {
     }
 }
 
-/// Vectorize states: GC + merge by shape.
-///
-/// This is the main entry point for combining multiple states into fewer
-/// vectorized states. It:
-/// 1. GCs all states (removes heap garbage)
-/// 2. Groups states by shape (structure with values normalized)
-/// 3. Merges each group into a single vectorized state
-/// 4. Deduplicates rows within each merged state
-/// The merge-partition cells (`CELESTE_PARTITION_CELLS`, comma-separated
-/// field names, e.g. "dash_time"): merges group by the *values* of these
-/// cells in addition to shape, so states in different classes never merge.
-///
-/// Why: a branch on a partition cell is uniform within every merged state,
-/// so it routes instead of splitting - the point is to kill the hot
-/// mid-frame forks (dash_time at in_i1_074_cont). Uniform-collapse then
-/// keeps the cell `Scalar` in each state, and its column leaves every
-/// dedup key. Lanes that converge across classes still dedup, one merge
-/// later, when their current values agree - the lane *set* is unchanged
-/// (splitting and merging are both semantics-preserving), which
-/// `rewrite verify` checks end to end.
-fn partition_cell_patterns() -> &'static [String] {
-    static PATTERNS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    PATTERNS.get_or_init(|| {
-        std::env::var("CELESTE_PARTITION_CELLS")
-            .map(|v| {
-                v.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default()
-    })
+lazy_static::lazy_static! {
+    /// Program-carried patterns (the `partition_merge` annotation). Set by
+    /// the harness when a run starts; never cleared, because partitioning
+    /// either program of a differential pair is semantics-preserving and a
+    /// process may interleave both.
+    static ref PROGRAM_PATTERNS: std::sync::RwLock<Vec<String>> =
+        std::sync::RwLock::new(Vec::new());
+}
+
+/// Install the program's merge-partition annotation. Empty lists are
+/// ignored (no opinion); the `CELESTE_PARTITION_CELLS` env var, when set,
+/// overrides for experiments.
+pub fn set_merge_partition_patterns(patterns: &[String]) {
+    if patterns.is_empty() {
+        return;
+    }
+    *PROGRAM_PATTERNS.write().unwrap() = patterns.to_vec();
+}
+
+fn partition_cell_patterns() -> Vec<String> {
+    static ENV: std::sync::OnceLock<Option<Vec<String>>> = std::sync::OnceLock::new();
+    let env = ENV.get_or_init(|| {
+        std::env::var("CELESTE_PARTITION_CELLS").ok().map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+    });
+    match env {
+        Some(patterns) => patterns.clone(),
+        None => PROGRAM_PATTERNS.read().unwrap().clone(),
+    }
 }
 
 /// Resolve the configured patterns against a state's cell names. A pattern
@@ -1202,6 +1203,26 @@ fn split_states_by_partition(states: Vec<State>, cells: &[usize]) -> Vec<State> 
     out
 }
 
+/// Vectorize states: GC + merge by shape.
+///
+/// This is the main entry point for combining multiple states into fewer
+/// vectorized states. It:
+/// 1. GCs all states (removes heap garbage)
+/// 2. Groups states by shape (structure with values normalized)
+/// 3. Merges each group into a single vectorized state
+/// 4. Deduplicates rows within each merged state
+/// The merge-partition cells (`CELESTE_PARTITION_CELLS`, comma-separated
+/// field names, e.g. "dash_time"): merges group by the *values* of these
+/// cells in addition to shape, so states in different classes never merge.
+///
+/// Why: a branch on a partition cell is uniform within every merged state,
+/// so it routes instead of splitting - the point is to kill the hot
+/// mid-frame forks (dash_time at in_i1_074_cont). Uniform-collapse then
+/// keeps the cell `Scalar` in each state, and its column leaves every
+/// dedup key. Lanes that converge across classes still dedup, one merge
+/// later, when their current values agree - the lane *set* is unchanged
+/// (splitting and merging are both semantics-preserving), which
+/// `rewrite verify` checks end to end.
 pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
     let _trace = TraceSpan::new("vectorize_states", "vectorize");
     let mut stats = VectorizeTimingStats::default();

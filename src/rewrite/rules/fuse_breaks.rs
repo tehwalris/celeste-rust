@@ -461,7 +461,7 @@ mod tests {
         };
         let mut functions = IndexMap::new();
         functions.insert(fun.name.clone(), fun);
-        Program { functions }
+        Program { functions, merge_partition_cells: Vec::new() }
     }
 
     #[test]
