@@ -995,3 +995,91 @@ mod select_tests {
         assert_eq!(format!("{:?}", ok), format!("{:?}", num(6)));
     }
 }
+
+#[cfg(test)]
+mod dict_pricing {
+    use crate::pico8_num::Pico8Num;
+    use rustc_hash::FxHashMap;
+
+    /// Prices per-context evaluation against direct per-lane evaluation, at
+    /// the state set's real cardinalities (state-structure.md: <=59 distinct
+    /// values per column, ~1500 joint contexts). Three strategies:
+    ///
+    ///   direct:   out[i] = f(a[i], b[i])                (what the interpreter does)
+    ///   dict:     build pair codes on the fly, eval each distinct pair once,
+    ///             gather                                (per-op dictionary)
+    ///   coded:    inputs already carry u8 codes + value tables; combine
+    ///             codes, eval the tiny table, gather    (persistent representation)
+    ///
+    /// Run with: cargo test --release dict_pricing -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_dict_vs_direct() {
+        const N: usize = 1 << 21;
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        for &(ka, kb) in &[(5usize, 7usize), (13, 20), (51, 59)] {
+            let pool_a: Vec<Pico8Num> = (0..ka).map(|i| Pico8Num::from_i16(i as i16 + 1)).collect();
+            let pool_b: Vec<Pico8Num> = (0..kb).map(|i| Pico8Num::from_i16(i as i16 + 1)).collect();
+            let codes_a: Vec<u8> = (0..N).map(|_| (next() as usize % ka) as u8).collect();
+            let codes_b: Vec<u8> = (0..N).map(|_| (next() as usize % kb) as u8).collect();
+            let a: Vec<Pico8Num> = codes_a.iter().map(|&c| pool_a[c as usize]).collect();
+            let b: Vec<Pico8Num> = codes_b.iter().map(|&c| pool_b[c as usize]).collect();
+
+            for (op_name, f) in [
+                ("add", (|x: Pico8Num, y: Pico8Num| x + y) as fn(Pico8Num, Pico8Num) -> Pico8Num),
+                ("div", |x: Pico8Num, y: Pico8Num| x / y),
+            ] {
+                let t = std::time::Instant::now();
+                let direct: Vec<Pico8Num> = a.iter().zip(&b).map(|(&x, &y)| f(x, y)).collect();
+                let t_direct = t.elapsed();
+
+                let t = std::time::Instant::now();
+                let mut dict: FxHashMap<(Pico8Num, Pico8Num), u16> = FxHashMap::default();
+                let mut values: Vec<Pico8Num> = Vec::new();
+                let mut codes: Vec<u16> = Vec::with_capacity(N);
+                for (&x, &y) in a.iter().zip(&b) {
+                    let next_code = values.len() as u16;
+                    let code = *dict.entry((x, y)).or_insert_with(|| {
+                        values.push(f(x, y));
+                        next_code
+                    });
+                    codes.push(code);
+                }
+                let dict_out: Vec<Pico8Num> = codes.iter().map(|&c| values[c as usize]).collect();
+                let t_dict = t.elapsed();
+
+                let t = std::time::Instant::now();
+                let mut table: Vec<Pico8Num> = Vec::with_capacity(ka * kb);
+                for &x in &pool_a {
+                    for &y in &pool_b {
+                        table.push(f(x, y));
+                    }
+                }
+                let coded_out: Vec<Pico8Num> = codes_a
+                    .iter()
+                    .zip(&codes_b)
+                    .map(|(&ca, &cb)| table[ca as usize * kb + cb as usize])
+                    .collect();
+                let t_coded = t.elapsed();
+
+                assert_eq!(direct, dict_out);
+                assert_eq!(direct, coded_out);
+                println!(
+                    "{op_name:>4} ka={ka:>2} kb={kb:>2}: direct {:>7.2?}  dict {:>7.2?} ({:.2}x)  coded {:>7.2?} ({:.2}x)",
+                    t_direct,
+                    t_dict,
+                    t_dict.as_secs_f64() / t_direct.as_secs_f64(),
+                    t_coded,
+                    t_coded.as_secs_f64() / t_direct.as_secs_f64(),
+                );
+            }
+        }
+    }
+}
