@@ -204,6 +204,8 @@ fn bench(label: &str, program: &Program, frames: u32, profile: bool) -> Result<(
                 continue;
             };
             let full: Vec<_> = columns.iter().filter(|c| !c.is_uniform()).collect();
+            let mut kept_names: Vec<String> = Vec::new();
+            let mut excluded_names: Vec<String> = Vec::new();
             let modulo: Vec<_> = columns
                 .iter()
                 .zip(&origins)
@@ -213,13 +215,22 @@ fn bench(label: &str, program: &Program, frames: u32, profile: bool) -> Result<(
                     }
                     let name = match origin {
                         celeste_rust::interpreter::virtual_merge::Origin::Heap(cell) => {
-                            names.get(cell).cloned().unwrap_or_default()
+                            names
+                                .get(cell)
+                                .cloned()
+                                .unwrap_or_else(|| format!("cell{}", cell))
                         }
-                        _ => String::new(),
+                        other => format!("{:?}", other),
                     };
-                    !patterns
+                    let matched = patterns
                         .iter()
-                        .any(|p| name == *p || name.ends_with(&format!(".{}", p)))
+                        .any(|p| name == *p || name.ends_with(&format!(".{}", p)));
+                    if matched {
+                        excluded_names.push(name);
+                    } else {
+                        kept_names.push(name);
+                    }
+                    !matched
                 })
                 .map(|(c, _)| c)
                 .collect();
@@ -237,6 +248,11 @@ fn bench(label: &str, program: &Program, frames: u32, profile: bool) -> Result<(
                 distinct(&full),
                 distinct(&modulo),
                 state.vector_size as f64 / distinct(&modulo).max(1) as f64,
+            );
+            println!(
+                "  excluded: [{}]  kept: [{}]",
+                excluded_names.join(", "),
+                kept_names.join(", ")
             );
         }
     }

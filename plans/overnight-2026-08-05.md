@@ -412,6 +412,28 @@ reconstructed):
 * The 1.8-1.9x distinct-modulo number is retracted pending a redone
   census with verified cell identities (see above).
 
+**Census redone with named cells (2026-08-06, f42):** cell_names now
+follows pointers and array elements, so player fields resolve as
+objects.1.rem.x etc. Findings:
+* objects.1.rem.{x,y} NEVER appear among non-uniform frontier columns -
+  player rem is widened-uniform at every frontier state. Zero rem slack;
+  the boundary widening + merge already collapse it. Confirmed
+  empirically, not just from source.
+* Yesterday's excluded cell158/cell163 were spd plus another x/y table
+  (dash_target or dash_accel). Excluding only spd.{x,y} today gives
+  1.1-1.6x on most states but 10-13x on dash-cluster states and 109x on
+  one 122k-lane state - which is CARDINALITY STRUCTURE, not slack:
+  distinct spd values have distinct futures and cannot be deduped.
+  The distinct-modulo census only finds exploitable slack for cells that
+  are provably future-irrelevant (as rem is, via widening); no such cell
+  remains at the frontier.
+* Every frontier state shows distinct-full == lanes: no exact duplicate
+  rows survive the merge. The merge is airtight.
+* Consequence: the frontier state-count gap vs 2022 (if it survives a
+  fair frame-aligned comparison at all) is NOT recoverable by smarter
+  boundary dedup on the current abstraction. Remaining levers: per-lane
+  speed, and intra-frame collapse timing (task #74).
+
 ## Ranked next steps
 
 1. ~~Fragment-parallel frame execution~~ DONE as state-parallel flow

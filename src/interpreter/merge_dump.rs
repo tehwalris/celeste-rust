@@ -34,21 +34,39 @@ pub fn cell_names(state: &State) -> std::collections::HashMap<usize, String> {
     for (global, id) in state.global_env.iter() {
         names.insert(id.raw(), global.clone());
     }
-    // Two passes so one level of nesting (player.spd.x) resolves even when
-    // the table is visited before its parent is named.
-    for _ in 0..3 {
+    // Several passes so nesting resolves even when a table is visited before
+    // its parent is named. Names propagate through pointer cells and array
+    // elements, so objects reached only via `objects[i]` still get full paths
+    // (objects.1.rem.x) rather than falling back to cellN.x.
+    for _ in 0..5 {
         for i in 0..state.heap.len() {
-            let Some(HeapValue::ObjectTable(fields)) = state.heap.get_opt(HeapId::from_raw(i))
-            else {
-                continue;
-            };
-            let parent = names.get(&i).cloned();
-            for (field, child) in fields.iter() {
-                let label = match &parent {
-                    Some(p) => format!("{}.{}", p, field),
-                    None => format!("cell{}.{}", i, field),
-                };
-                names.entry(child.raw()).or_insert(label);
+            match state.heap.get_opt(HeapId::from_raw(i)) {
+                Some(HeapValue::ObjectTable(fields)) => {
+                    let parent = names.get(&i).cloned();
+                    for (field, child) in fields.iter() {
+                        let label = match &parent {
+                            Some(p) => format!("{}.{}", p, field),
+                            None => format!("cell{}.{}", i, field),
+                        };
+                        names.entry(child.raw()).or_insert(label);
+                    }
+                }
+                Some(HeapValue::ArrayTable(items)) => {
+                    let parent = names.get(&i).cloned();
+                    for (k, child) in items.iter().enumerate() {
+                        let label = match &parent {
+                            Some(p) => format!("{}.{}", p, k + 1),
+                            None => format!("cell{}.{}", i, k + 1),
+                        };
+                        names.entry(child.raw()).or_insert(label);
+                    }
+                }
+                Some(HeapValue::Value(super::value::Value::Pointer(target))) => {
+                    if let Some(name) = names.get(&i).cloned() {
+                        names.entry(target.raw()).or_insert(name);
+                    }
+                }
+                _ => {}
             }
         }
     }
