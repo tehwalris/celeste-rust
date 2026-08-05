@@ -41,26 +41,64 @@ use crate::ir::{Block, Instruction, Label, LocalId, Terminator};
 use super::super::program::Program;
 use super::{require, LocalIdAllocator};
 
+/// The builtins `pin_builtin` ever names: pure reads of arguments and
+/// cart data. A `call_builtin` to one of these is skip-safe - it computes
+/// a value and touches nothing.
+const PURE_BUILTINS: [&str; 6] = ["abs", "flr", "max", "min", "mget", "tile_flag_at"];
+
 /// Instructions allowed in a guarded region besides mask-form stores.
 fn effect_free(instr: &Instruction) -> bool {
-    matches!(
-        instr,
+    match instr {
         Instruction::NumberConstant { .. }
-            | Instruction::BoolConstant { .. }
-            | Instruction::StringConstant { .. }
-            | Instruction::NilConstant
-            | Instruction::BinaryOp { .. }
-            | Instruction::UnaryOp { .. }
-            | Instruction::Select { .. }
-            | Instruction::Load { .. }
-            | Instruction::GetGlobal { .. }
-            | Instruction::GetField { .. }
-            | Instruction::GetIndex { .. }
-            | Instruction::AssertClosure { .. }
-            | Instruction::AssertPointer { .. }
-            | Instruction::AssertValueCell { .. }
-            | Instruction::AssertTrue { .. }
-    )
+        | Instruction::BoolConstant { .. }
+        | Instruction::StringConstant { .. }
+        | Instruction::NilConstant
+        | Instruction::BinaryOp { .. }
+        | Instruction::UnaryOp { .. }
+        | Instruction::Select { .. }
+        | Instruction::Load { .. }
+        | Instruction::GetGlobal { .. }
+        | Instruction::GetField { .. }
+        | Instruction::GetIndex { .. }
+        | Instruction::AssertClosure { .. }
+        | Instruction::AssertPointer { .. }
+        | Instruction::AssertValueCell { .. }
+        | Instruction::AssertTrue { .. } => true,
+        Instruction::CallBuiltin { name, .. } => {
+            PURE_BUILTINS.contains(&name.as_str())
+        }
+        _ => false,
+    }
+}
+
+/// Whether `cond` is provably false whenever `mask` is false, following
+/// the and-forms the frontend and `decompose_truthy` emit:
+/// `select d ? x : d` (yields the falsy `d` when `d` is false) and
+/// `select d ? x : false`, recursively on `d`. `defs` covers the whole
+/// block, so chains may thread through head and region alike.
+fn implied_false(
+    cond: LocalId,
+    mask: LocalId,
+    defs: &FxHashMap<LocalId, &Instruction>,
+) -> bool {
+    if cond == mask {
+        return true;
+    }
+    match defs.get(&cond) {
+        Some(Instruction::Select {
+            condition,
+            if_true: _,
+            if_false,
+        }) => {
+            let false_arm_falsy = *if_false == *condition
+                || matches!(
+                    defs.get(if_false),
+                    Some(Instruction::BoolConstant { value: false })
+                );
+            false_arm_falsy && implied_false(*condition, mask, defs)
+        }
+        _ => false,
+    }
 }
 
 struct RegionPlan {
@@ -94,6 +132,11 @@ fn plan(
 
     let region = &block.instructions[from_idx..=to_idx];
     let region_defs: FxHashSet<LocalId> = region.iter().map(|(id, _)| *id).collect();
+    let block_defs: FxHashMap<LocalId, &Instruction> = block
+        .instructions
+        .iter()
+        .map(|(id, instr)| (*id, instr))
+        .collect();
     require(
         !region_defs.contains(&mask),
         "the mask must be defined outside the region".to_string(),
@@ -129,20 +172,36 @@ fn plan(
                     } => (*condition, *if_false),
                     _ => return Err(anyhow!("store source is not a select")),
                 };
-                require(cond == mask, "store select is not on the mask".to_string())?;
-                let old_def = region
+                require(
+                    implied_false(cond, mask, &block_defs),
+                    "store select's mask is not implied-false by the guard".to_string(),
+                )?;
+                // The old arm must be the cell's current value: a load of
+                // the same cell, anywhere earlier in the block (head or
+                // region), with no store to that cell in between - then a
+                // skipped store leaves exactly the value the masked store
+                // writes under a uniformly-false mask.
+                let old_idx = block
+                    .instructions
                     .iter()
-                    .take(idx)
-                    .find(|(rid, _)| rid == &old)
-                    .map(|(_, i)| i)
-                    .ok_or_else(|| anyhow!("store old arm defined outside region"))?;
-                let load_src = match old_def {
+                    .position(|(bid, _)| bid == &old)
+                    .ok_or_else(|| anyhow!("store old arm defined outside block"))?;
+                let store_block_idx = from_idx + idx;
+                require(old_idx < store_block_idx, "old arm after the store".to_string())?;
+                let load_src = match &block.instructions[old_idx].1 {
                     Instruction::Load { source } => *source,
                     _ => return Err(anyhow!("store old arm is not a load")),
                 };
                 require(
                     load_src == *target,
                     "store old arm does not load the stored cell".to_string(),
+                )?;
+                let intervening_store = block.instructions[old_idx + 1..store_block_idx]
+                    .iter()
+                    .any(|(_, i)| matches!(i, Instruction::Store { target: t, .. } if t == target));
+                require(
+                    !intervening_store,
+                    "cell stored between its load and the masked store".to_string(),
                 )?;
                 require(
                     !store_targets.contains(target),
@@ -173,8 +232,11 @@ fn plan(
                 }
             };
             require(
-                cond == mask,
-                format!("escaping select %{} is not on the mask", usize::from(*id)),
+                implied_false(cond, mask, &block_defs),
+                format!(
+                    "escaping select %{}'s mask is not implied-false by the guard",
+                    usize::from(*id)
+                ),
             )?;
             require(
                 !region_defs.contains(&old),
