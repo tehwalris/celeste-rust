@@ -199,7 +199,8 @@ static FILTER_REASON_NANOS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// merge could raise it.
 static FILTER_REASON_RUNS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
-pub const REASON_NAMES: [&str; 3] = ["filter_branch", "filter_dedup", "filter_split_flr"];
+pub const REASON_NAMES: [&str; 4] =
+    ["filter_branch", "filter_dedup", "filter_split_flr", "filter_visited"];
 
 pub fn record_filter_reason(reason_index: usize, kept: usize, started: Option<std::time::Instant>) {
     let Some(started) = started else { return };

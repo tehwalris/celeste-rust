@@ -312,6 +312,19 @@ __reset_button_states()
         }
     }
 
+    // Frontier-only search: persistent cross-frame visited set of canonical
+    // row hashes, keyed by shape hash. Experimental; hash-only (not
+    // proof-grade). Sound only from a fresh start - on --resume the visited
+    // set is empty, which loses dedup but never completeness.
+    let mut visited_rows: Option<
+        rustc_hash::FxHashMap<u64, rustc_hash::FxHashSet<u64>>,
+    > = if std::env::var_os("CELESTE_FRONTIER_ONLY").is_some() {
+        println!("frontier-only search ENABLED (experimental, hash-only visited set)");
+        Some(Default::default())
+    } else {
+        None
+    };
+
     for frame_num in start_frame..=num_frames {
         let expanded_input: usize = states.iter().map(|s| s.vector_size).sum();
         print!("Frame {}: ", frame_num);
@@ -373,6 +386,22 @@ __reset_button_states()
             println!("  (vec: {} -> {} states, merged {}, avg_vs={:.1})",
                 before_vec, after_vec, before_vec - after_vec, avg_vs);
         }
+
+        // Frontier-only search (CELESTE_FRONTIER_ONLY=1): drop lanes already
+        // reached at an earlier frame; expand only the new ones next frame.
+        // Experimental sizing version - see subtract_visited's soundness note.
+        let new_states = if let Some(visited) = visited_rows.as_mut() {
+            let (kept, lanes_before, lanes_after) =
+                crate::interpreter::vectorize::subtract_visited(new_states, visited);
+            let visited_total: usize = visited.values().map(|s| s.len()).sum();
+            println!(
+                "  (frontier-only: {} -> {} new lanes, visited total {})",
+                lanes_before, lanes_after, visited_total
+            );
+            kept
+        } else {
+            new_states
+        };
 
         let expanded_output: usize = new_states.iter().map(|s| s.vector_size).sum();
         println!("{} states ({} expanded) in {:?}",

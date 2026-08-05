@@ -34,6 +34,11 @@ pub const FILTER_SPLIT_FLR: FilterReason = "filter_split_flr";
 /// Dropping duplicate lanes during vectorization. Useful work.
 pub const FILTER_DEDUP: FilterReason = "filter_dedup";
 
+/// Frontier-only search: dropping lanes whose canonical row was already
+/// reached at an earlier frame (their successors are reachable earlier via
+/// the same input suffix, so re-expanding them finds nothing new).
+pub const FILTER_VISITED: FilterReason = "filter_visited";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct State {
     pub heap: Heap,

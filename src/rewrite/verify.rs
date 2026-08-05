@@ -275,6 +275,12 @@ pub struct AbstractRun {
     /// branches should be judged by this and not by its `filter_branch` share.
     /// See BENCHMARK_DATA.md.
     states_before_merge: Vec<usize>,
+    /// Frontier-only search (CELESTE_FRONTIER_ONLY=1): persistent cross-frame
+    /// visited set of canonical row hashes, keyed by shape hash. Experimental,
+    /// hash-only; see `vectorize::subtract_visited` for the soundness note.
+    visited_rows: Option<
+        rustc_hash::FxHashMap<u64, rustc_hash::FxHashSet<u64>>,
+    >,
 }
 
 impl AbstractRun {
@@ -293,7 +299,13 @@ impl AbstractRun {
         let frame_cfg = crate::interpreter::fixed_env::PreparedCfg::new(
             program.frame_cfg().clone(),
         );
-        Ok(Self { states, fixed_env, frame_cfg, states_before_merge: Vec::new() })
+        let visited_rows = if std::env::var_os("CELESTE_FRONTIER_ONLY").is_some() {
+            println!("frontier-only search ENABLED (experimental, hash-only visited set)");
+            Some(Default::default())
+        } else {
+            None
+        };
+        Ok(Self { states, fixed_env, frame_cfg, states_before_merge: Vec::new(), visited_rows })
     }
 
     pub fn step(&mut self) -> Result<()> {
@@ -312,6 +324,13 @@ impl AbstractRun {
             );
             vectorize_states(new_states)
         };
+        if let Some(visited) = self.visited_rows.as_mut() {
+            let (kept, _before, _after) = crate::interpreter::vectorize::subtract_visited(
+                std::mem::take(&mut self.states),
+                visited,
+            );
+            self.states = kept;
+        }
         Ok(())
     }
 

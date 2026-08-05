@@ -1223,6 +1223,58 @@ fn split_states_by_partition(states: Vec<State>, cells: &[usize]) -> Vec<State> 
 /// later, when their current values agree - the lane *set* is unchanged
 /// (splitting and merging are both semantics-preserving), which
 /// `rewrite verify` checks end to end.
+/// Frontier-only search: drop lanes whose canonical row was already reached
+/// at an earlier frame. A state reachable at frame m < n only expands to
+/// states reachable at m+1 <= n via the same input suffix, so re-expanding it
+/// can never discover a new earliest arrival - the search stays complete and
+/// win frames stay earliest-arrival (= optimal TAS length). Requires the
+/// state representation to be world-still (see the timer-global pinning in
+/// make_state_abstract) or cross-frame rows never match and this is a no-op.
+///
+/// EXPERIMENTAL SIZING VERSION: the visited set stores 64-bit row hashes with
+/// no exact verification, so a hash collision would silently drop a genuinely
+/// new state. Fine for measuring the win; NOT proof-grade. The hardened
+/// version must chunk-verify rows like the boundary merge does.
+///
+/// Returns (kept_states, lanes_before, lanes_after).
+pub fn subtract_visited(
+    states: Vec<State>,
+    visited: &mut FxHashMap<u64, FxHashSet<u64>>,
+) -> (Vec<State>, usize, usize) {
+    use crate::interpreter::virtual_merge::{collect_columns_labeled, hash_rows, Column};
+    let _trace = TraceSpan::new("subtract_visited", "vectorize");
+    let mut out = Vec::with_capacity(states.len());
+    let mut before = 0usize;
+    let mut after = 0usize;
+    for state in states {
+        before += state.vector_size;
+        let shape_hash = shape_of_state(&state).cached_hash();
+        let Some((columns, _origins)) = collect_columns_labeled(std::slice::from_ref(&state))
+        else {
+            // Cannot canonicalize this state - keep it whole. Sound: skipping
+            // dedup only costs work, never correctness.
+            after += state.vector_size;
+            out.push(state);
+            continue;
+        };
+        let refs: Vec<&Column> = columns.iter().collect();
+        // hash_rows folds scalar/uniform pieces into every row, so the row
+        // hash covers the full lane-varying AND lane-uniform value content;
+        // structure is covered by the shape hash keying the set.
+        let hashes = hash_rows(&refs, state.vector_size);
+        let set = visited.entry(shape_hash).or_default();
+        let mask: Vec<bool> = hashes.iter().map(|h| set.insert(*h)).collect();
+        let kept = mask.iter().filter(|b| **b).count();
+        after += kept;
+        if kept == state.vector_size {
+            out.push(state);
+        } else if kept > 0 {
+            out.push(state.filter_by_mask_clone(&mask, crate::interpreter::state::FILTER_VISITED));
+        }
+    }
+    (out, before, after)
+}
+
 pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
     let _trace = TraceSpan::new("vectorize_states", "vectorize");
     let mut stats = VectorizeTimingStats::default();
