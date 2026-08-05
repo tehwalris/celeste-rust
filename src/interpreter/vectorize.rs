@@ -1350,16 +1350,27 @@ pub fn union_diff_states(
          and never fired). Implement an exact dedup on the vectorize_states \
          row machinery before relying on multi-round fixed points."
     );
-    let mut shape_hashes: FxHashSet<u64> = FxHashSet::default();
-    let all_distinct = potentially_new
-        .iter()
-        .all(|state| shape_hashes.insert(shape_of_state(state).cached_hash));
+    // With merge partitioning active, vectorize_states legitimately emits
+    // one state per (shape, class) - the distinctness guard must use the
+    // same key, or same-shape different-class arrivals trip it (this
+    // happened, loudly, the first time a partition key varied at a hint
+    // site).
+    let partition_cells = potentially_new
+        .first()
+        .map(resolve_partition_cells)
+        .unwrap_or_default();
+    let mut shape_classes: FxHashSet<(u64, u64)> = FxHashSet::default();
+    let all_distinct = potentially_new.iter().all(|state| {
+        let class = partition_class(state, &partition_cells).unwrap_or(u64::MAX);
+        shape_classes.insert((shape_of_state(state).cached_hash, class))
+    });
     assert!(
         all_distinct,
-        "hint_normalize arrivals are not pairwise shape-distinct (or two \
-         shapes collided in a 64-bit hash): vectorize_states should emit one \
-         state per shape. union_diff_states no longer contains a state dedup; \
-         implement an exact one on the vectorize_states row machinery."
+        "hint_normalize arrivals are not pairwise (shape, class)-distinct \
+         (or a 64-bit hash collided): vectorize_states should emit one state \
+         per shape and partition class. union_diff_states no longer contains \
+         a state dedup; implement an exact one on the vectorize_states row \
+         machinery."
     );
     (potentially_new.clone(), potentially_new)
 }
