@@ -101,22 +101,6 @@ pub fn record_filter_local_slots(slots: usize) {
     FILTER_LOCAL_SLOTS.fetch_add(slots as u64, Ordering::Relaxed);
 }
 
-/// The virtual-concat experiment: how many columns a merge group has, how
-/// many of them are uniform (so materialising would collapse them out of
-/// the dedup key), and what hashing them costs without concatenating. The
-/// three parked attempts lost on exactly these two numbers.
-static VC_COLUMNS: AtomicU64 = AtomicU64::new(0);
-static VC_UNIFORM: AtomicU64 = AtomicU64::new(0);
-static VC_ROWS: AtomicU64 = AtomicU64::new(0);
-static VC_NANOS: AtomicU64 = AtomicU64::new(0);
-
-pub fn record_virtual_hash(columns: usize, uniform: usize, rows: usize, nanos: u64) {
-    VC_COLUMNS.fetch_add(columns as u64, Ordering::Relaxed);
-    VC_UNIFORM.fetch_add(uniform as u64, Ordering::Relaxed);
-    VC_ROWS.fetch_add(rows as u64, Ordering::Relaxed);
-    VC_NANOS.fetch_add(nanos, Ordering::Relaxed);
-}
-
 /// Source length of filter gathers, against which `Cat::Filter`'s element
 /// count is the *kept* length. The ratio decides what the gather actually
 /// costs: below about one kept element per cache line, a gather touches
@@ -276,10 +260,6 @@ pub fn reset() {
         FILTER_HIST_CALLS[b].store(0, Ordering::Relaxed);
         FILTER_HIST_ELEMS[b].store(0, Ordering::Relaxed);
     }
-    VC_COLUMNS.store(0, Ordering::Relaxed);
-    VC_UNIFORM.store(0, Ordering::Relaxed);
-    VC_ROWS.store(0, Ordering::Relaxed);
-    VC_NANOS.store(0, Ordering::Relaxed);
     GC_CELLS_BEFORE.store(0, Ordering::Relaxed);
     GC_CELLS_AFTER.store(0, Ordering::Relaxed);
     FILTER_HEAP_CELLS.store(0, Ordering::Relaxed);
@@ -388,23 +368,6 @@ pub fn report() {
             calls,
             FILTER_REASON_KEPT[i].load(Ordering::Relaxed) as f64 / 1e6,
             FILTER_REASON_NANOS[i].load(Ordering::Relaxed) as f64 / 1e9,
-        );
-    }
-    let vc_columns = VC_COLUMNS.load(Ordering::Relaxed);
-    if vc_columns > 0 {
-        let uniform = VC_UNIFORM.load(Ordering::Relaxed);
-        let rows = VC_ROWS.load(Ordering::Relaxed);
-        let ns = VC_NANOS.load(Ordering::Relaxed);
-        eprintln!(
-            "virtual concat: {} columns, {} uniform ({:.1}%) -> {} key columns; \
-             hashing {:.1} M rows virtually took {:.2} s ({:.2} ns/cell)",
-            vc_columns,
-            uniform,
-            100.0 * uniform as f64 / vc_columns as f64,
-            vc_columns - uniform,
-            rows as f64 / 1e6,
-            ns as f64 / 1e9,
-            ns as f64 / ((rows * (vc_columns - uniform)) as f64 / vc_columns as f64).max(1.0),
         );
     }
     let gc_before = GC_CELLS_BEFORE.load(Ordering::Relaxed);

@@ -209,25 +209,6 @@ pub fn shape_of_state(state: &State) -> StateShape {
     }
 }
 
-/// Merge multiple states with the same shape into one vectorized state.
-/// Measurement only: what the dedup key would cost over a virtual
-/// concatenation, and how many columns the uniform check removes from it.
-/// Prices the two mechanisms that sank the three parked attempts, without
-/// changing what the merge does.
-fn price_virtual_concat(states: &[State]) {
-    use super::virtual_merge;
-    let Some(columns) = virtual_merge::collect_columns(states) else {
-        return;
-    };
-    let total_rows: usize = states.iter().map(|s| s.vector_size).sum();
-    let key: Vec<&virtual_merge::Column> = columns.iter().filter(|c| !c.is_uniform()).collect();
-    let started = std::time::Instant::now();
-    let hashes = virtual_merge::hash_rows(&key, total_rows);
-    let nanos = started.elapsed().as_nanos() as u64;
-    std::hint::black_box(&hashes);
-    crate::op_census::record_virtual_hash(columns.len(), columns.len() - key.len(), total_rows, nanos);
-}
-
 fn vectorize_same_shape_states(states: Vec<State>) -> State {
     if states.len() == 1 {
         return states.into_iter().next().unwrap();
@@ -1148,8 +1129,15 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
         states_by_shape
             .into_iter()
             .map(|(_, group)| {
-                if crate::op_census::enabled() && group.len() > 1 {
-                    price_virtual_concat(&group);
+                if group.len() > 1 {
+                    // Merge + dedup over the virtual concatenation - never
+                    // materialises the pre-dedup table. Produces the same
+                    // state as the materialised pipeline below (a test
+                    // holds them equal); the fallback covers group shapes
+                    // the column collection cannot represent.
+                    if let Some(state) = super::virtual_merge::merge_dedup_group(&group) {
+                        return state;
+                    }
                 }
                 let vectorized = vectorize_same_shape_states(group);
                 let deduped = dedup_vectorized_state(vectorized);
@@ -1684,6 +1672,108 @@ mod tests {
         assert_eq!(result.len(), 1);
         let state = &result[0];
         assert_eq!(state.vector_size, 2, "Duplicate should be removed");
+    }
+
+    /// The virtual merge must produce *exactly* the state the materialised
+    /// pipeline produces - same lanes, same order, same Scalar/Vector
+    /// representation per leaf. `State` equality is representation-
+    /// sensitive (`Scalar(x) != Vector([x, x])`), so this holds the two
+    /// paths equal at that level, over a group with mixed scalar/vector
+    /// pieces, duplicate rows within and across fragments, a uniform
+    /// column, a non-vectorizable leaf, and locals.
+    #[test]
+    fn test_virtual_merge_matches_materialized_pipeline() {
+        use crate::ir::LocalId;
+
+        // Deterministic pseudo-random lane values (no RNG in tests).
+        let mut seed: u64 = 0x9e3779b97f4a7c15;
+        let mut next = move |modulus: i16| -> i16 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) % modulus as u64) as i16
+        };
+
+        let mut group: Vec<State> = Vec::new();
+        for fragment in 0..7 {
+            let lanes = 1 + (fragment % 3);
+            let mut state = State::new();
+            state.vector_size = lanes;
+
+            // Cell 0: low-cardinality number column (drawn from 4 values, so
+            // plenty of duplicate rows). Scalar representation when a
+            // fragment happens to be uniform, like real fragments.
+            let numbers: Vec<Pico8Num> =
+                (0..lanes).map(|_| Pico8Num::from_i16(next(4))).collect();
+            let c0 = state.heap.alloc();
+            state
+                .heap
+                .set(c0, HeapValue::Value(Value::Number(MaybeVector::vector(numbers))));
+
+            // Cell 1: bool column.
+            let bools: Vec<bool> = (0..lanes).map(|_| next(2) == 0).collect();
+            let c1 = state
+                .heap
+                .alloc();
+            state
+                .heap
+                .set(c1, HeapValue::Value(Value::Bool(MaybeVector::vector(bools))));
+
+            // Cell 2: interval column, two distinct intervals.
+            let intervals: Vec<crate::pico8_num::Pico8NumInterval> = (0..lanes)
+                .map(|_| {
+                    let w = next(2);
+                    crate::pico8_num::Pico8NumInterval {
+                        low: Pico8Num::from_i16(w),
+                        high: Pico8Num::from_i16(w + 3),
+                    }
+                })
+                .collect();
+            let c2 = state.heap.alloc();
+            state.heap.set(
+                c2,
+                HeapValue::Value(Value::NumberInterval(MaybeVector::vector(intervals))),
+            );
+
+            // Cell 3: uniform across the whole group - must collapse to
+            // Scalar and leave the dedup key.
+            let c3 = state.heap.alloc();
+            state.heap.set(
+                c3,
+                HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(42)))),
+            );
+
+            // Cell 4: non-vectorizable leaf, identical everywhere.
+            let c4 = state.heap.alloc();
+            state
+                .heap
+                .set(c4, HeapValue::Value(Value::String("same".to_string())));
+
+            state.global_env.insert("a".to_string(), c0);
+            state.global_env.insert("b".to_string(), c1);
+            state.global_env.insert("c".to_string(), c2);
+            state.global_env.insert("d".to_string(), c3);
+            state.global_env.insert("e".to_string(), c4);
+
+            // A local, mixing scalar and vector representations.
+            let local: Vec<Pico8Num> =
+                (0..lanes).map(|_| Pico8Num::from_i16(next(3))).collect();
+            state
+                .local_env
+                .set(LocalId::from(0), Value::Number(MaybeVector::vector(local)));
+
+            group.push(state);
+        }
+
+        let virtual_merged = super::super::virtual_merge::merge_dedup_group(&group)
+            .expect("group should be collectable");
+
+        let materialized = {
+            let vectorized = vectorize_same_shape_states(group);
+            let deduped = dedup_vectorized_state(vectorized);
+            unvectorize_if_possible(deduped)
+        };
+
+        assert!(virtual_merged.vector_size < 14, "dedup must remove rows");
+        assert_eq!(virtual_merged, materialized);
     }
 }
 
