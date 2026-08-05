@@ -317,6 +317,42 @@ impl<'a> BoundInterpreterFlow<'a> {
     }
 }
 
+/// Whether multi-state flow steps may run their states on the worker pool.
+/// Default off; the plain-program search runner turns it on (see the module
+/// comment in `flow` for the measured asymmetry).
+static PARALLEL_FLOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_parallel_flow(enabled: bool) {
+    PARALLEL_FLOW.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Concatenate per-state flow outputs in input order - shared tail of the
+/// sequential and parallel paths.
+fn finish_flow(per_state: Vec<FlowData>) -> Result<FlowData> {
+    let mut result_states: Vec<State> = Vec::with_capacity(per_state.len());
+    let mut result_returns: Vec<(State, Value)> = Vec::new();
+    let mut has_returns = false;
+    for data in per_state {
+        match data {
+            FlowData::States(new_states) => {
+                result_states.extend(new_states);
+            }
+            FlowData::StatesAndReturns(new_returns) => {
+                has_returns = true;
+                result_returns.extend(new_returns);
+            }
+        }
+    }
+    if has_returns {
+        if !result_states.is_empty() {
+            panic!("Mix of States and StatesAndReturns");
+        }
+        Ok(FlowData::StatesAndReturns(result_returns))
+    } else {
+        Ok(FlowData::States(result_states))
+    }
+}
+
 impl<'a> BoundSplitBlockFlow<FlowData> for BoundInterpreterFlow<'a> {
     fn flow(&self, v: FlowData) -> Result<FlowData> {
         let states = match v {
@@ -326,32 +362,84 @@ impl<'a> BoundSplitBlockFlow<FlowData> for BoundInterpreterFlow<'a> {
             }
         };
 
-        // Pre-compute total capacity to avoid reallocations
-        // Most flow operations return a single state, so estimate 1 per input
-        let mut result_states: Vec<State> = Vec::with_capacity(states.len());
-        let mut result_returns: Vec<(State, Value)> = Vec::new();
-        let mut has_returns = false;
-
-        for state in states {
-            match self.flow_single_state(state)? {
-                FlowData::States(new_states) => {
-                    result_states.extend(new_states);
-                }
-                FlowData::StatesAndReturns(new_returns) => {
-                    has_returns = true;
-                    result_returns.extend(new_returns);
-                }
-            }
+        // States are independent of each other through a flow step - no
+        // instruction reads another state, and a call's descendants replace
+        // their parent in place - so a multi-state step can run its states
+        // on separate threads and concatenate the per-state outputs in
+        // input order, which reproduces the sequential result exactly
+        // (including state order). Three gates keep the spawns worth their
+        // cost, learned the hard way (an ungated version made verify 16x
+        // slower on spawn overhead alone):
+        //   * enough total lanes that per-state work dwarfs a thread spawn;
+        //   * never nested - a worker running a callee's CFG stays
+        //     sequential (thread-local flag);
+        //   * sequential when per-instruction timing is on: `instr_time`
+        //     attributes through a thread-local function stack that worker
+        //     threads do not inherit.
+        thread_local! {
+            static IN_PARALLEL_FLOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         }
-
-        if has_returns {
-            if !result_states.is_empty() {
-                panic!("Mix of States and StatesAndReturns");
+        const MIN_PARALLEL_LANES: usize = 1 << 15;
+        // Off unless the driver opts in (see `set_parallel_flow`): state-
+        // parallel flow is -21.7% on the unrewritten search path, whose
+        // per-state work is CPU-bound overhead, but +4-6% on the rewritten
+        // path, whose giant fused block already saturates memory bandwidth
+        // with a single state - concurrency there only buys cache thrash
+        // (+8-18% peak RSS). Measured at 8 and 16 threads, same split.
+        if !PARALLEL_FLOW.load(std::sync::atomic::Ordering::Relaxed) {
+            let mut flat = Vec::with_capacity(states.len());
+            for state in states {
+                flat.push(self.flow_single_state(state)?);
             }
-            Ok(FlowData::StatesAndReturns(result_returns))
+            return finish_flow(flat);
+        }
+        let total_lanes: usize = states.iter().map(|s| s.vector_size).sum();
+        let threads = super::virtual_merge::worker_threads().min(states.len());
+        let parallel = threads > 1
+            && total_lanes >= MIN_PARALLEL_LANES
+            && !IN_PARALLEL_FLOW.with(|f| f.get())
+            && !crate::instr_time::enabled();
+        let per_state: Vec<FlowData> = if parallel {
+            // A persistent pool, not per-call spawns: flow steps run
+            // thousands of times per frame, and an earlier scoped-thread
+            // version spent minutes of *system* time on thread churn. A
+            // dedicated pool sized like the merge's (memory-bound work
+            // saturates well below the 32 hardware threads) rather than
+            // rayon's core-count global pool.
+            use rayon::prelude::*;
+            static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+            let pool = POOL.get_or_init(|| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(super::virtual_merge::worker_threads().min(8))
+                    .build()
+                    .expect("flow thread pool")
+            });
+            let results: Vec<Result<FlowData>> = pool.install(|| {
+                states
+                    .into_par_iter()
+                    .map(|state| {
+                        IN_PARALLEL_FLOW.with(|f| f.set(true));
+                        let result = self.flow_single_state(state);
+                        IN_PARALLEL_FLOW.with(|f| f.set(false));
+                        result
+                    })
+                    .collect()
+            });
+            // First error in input order wins, matching the sequential loop.
+            let mut flat = Vec::with_capacity(results.len());
+            for result in results {
+                flat.push(result?);
+            }
+            flat
         } else {
-            Ok(FlowData::States(result_states))
-        }
+            let mut flat = Vec::with_capacity(states.len());
+            for state in states {
+                flat.push(self.flow_single_state(state)?);
+            }
+            flat
+        };
+
+        finish_flow(per_state)
     }
 }
 

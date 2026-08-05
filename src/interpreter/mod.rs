@@ -1,6 +1,6 @@
 mod core_interpreter;
 pub mod fixed_env;
-mod flow;
+pub mod flow;
 pub mod glue;
 pub mod heap;
 pub mod input_capture;

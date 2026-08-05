@@ -96,6 +96,11 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    // State-parallel flow pays only on the unrewritten program, whose
+    // per-state work is CPU-bound overhead; the rewritten program's fused
+    // block is memory-bound per state and regresses under it. See flow.rs.
+    celeste_rust::interpreter::flow::set_parallel_flow(!args.rewritten);
+
     if args.rewritten {
         let recipe = celeste_rust::rewrite::recipe::Recipe::load("rewrites.jsonl")?;
         let (program, _) = celeste_rust::rewrite::recipe::build(&recipe)?;

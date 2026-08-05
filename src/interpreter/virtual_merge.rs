@@ -153,13 +153,25 @@ fn visit_range_impl<T: Copy + PartialEq, O: Copy>(
 /// parallel experiments settled on.
 const PARALLEL_ROW_THRESHOLD: usize = 1 << 14;
 
-/// How many threads the merge machinery uses. The work is memory-bound, so
-/// this saturates well below the core count.
+/// How many threads the interpreter's parallel pieces use. The work is
+/// memory-bound, so this saturates well below the core count.
+///
+/// Cached: `available_parallelism` is NOT a getter - on Linux it opens and
+/// reads half a dozen procfs/cgroup files per call. Calling it per flow
+/// step put 7.7M syscalls into a 30-frame run and turned minutes of wall
+/// clock into kernel time.
+pub fn worker_threads() -> usize {
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THREADS.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1)
+            .min(16)
+    })
+}
+
 fn merge_threads() -> usize {
-    std::thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(1)
-        .min(16)
+    worker_threads()
 }
 
 /// A column value widened to at most two u32 words, the same packing
