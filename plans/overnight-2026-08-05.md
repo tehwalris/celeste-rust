@@ -18,8 +18,26 @@ commit. All commits pushed to `census` (and `interpreter` follows it).
 | union_diff guarded pass-through | **29.06 s (-8.8%)** | f40 **7.68 s (-12.1%)** | afd0653 |
 | partitioned probe (hash high bits, >=512k rows) | 29.01 s (-0.4%) | f40 7.44 s (-2.4%) | (probe) |
 
-**Cumulative: runner -n 39 44.4 -> 29.0 s (-34.6%). bench f40 9.76 -> 7.44 s
-since the mid-night frontier measurement; f37 2.89 -> ~2.0 s est (-30%).**
+| state-parallel flow (opt-in: plain program only) | **22.33 s (-22.4%)**, +14% mem | flat (gate off) | (parallel flow) |
+
+**Cumulative: runner -n 39 44.4 -> 22.3 s (-49.7%). bench f40 9.76 -> ~7.2 s.**
+
+Morning headlines (final binary):
+
+| | time | peak |
+|---|---|---|
+| runner `-n 40` | 36.2 s | 24.8 GiB |
+| runner `-n 41` | **54.0 s** | 41.3 GiB |
+| bench `--frames 43` | **32.2 s** | 13.7 GB |
+
+Yesterday's baseline reached frame 41 in 107 s; the overnight parallel
+branch did 87 s. Tonight's stack does **54 s** - 2x yesterday, on a
+mostly-sequential interpreter plus targeted parallel pieces. On the
+rewritten path, extrapolating ~1.65x/frame from f43=32.2 s: f44 = ~53 s,
+f45 = ~88 s - a 60 s budget now reaches ~frame 44 and 120 s ~frame 45,
+roughly two frames deeper than the morning estimates at the same budgets.
+Memory: runner f41 peaks at 41 GiB (cap 100G); rewritten path is far
+leaner (f43 = 13.7 GB).
 
 Probe threshold lesson: at 16k rows partitioning was +0.3% runner (extra
 O(n) passes beat mid-size savings); at 512k - where the map actually
@@ -59,11 +77,14 @@ gc 0.07 s. Everything else small.
 
 ## Ranked next steps
 
-1. **Fragment-parallel frame execution.** cfg:anonymous_61 is 45% and
-   embarrassingly parallel across fragments (states in the worklist are
-   independent). Blockers: profiler/DAG/census thread-safety, worklist
-   order. The parallel-experiments branch never did this - it parallelized
-   within ops instead (and its big-vector-op piece regressed).
+1. ~~Fragment-parallel frame execution~~ DONE as state-parallel flow
+   steps, opt-in for the plain program (-22.4% runner). The rewritten
+   path regresses under it (+4-6%: its fused block is memory-bound per
+   state), so its win must come from somewhere else - likely making
+   per-state work narrower (dictionary/RLE), not more concurrent.
+   Two lessons the hard way: std::thread::available_parallelism reads
+   procfs per call (7.7M syscalls before caching); per-call scoped
+   spawns at flow frequency cost minutes of system time (rayon pool).
 2. ~~Virtual merge probe pass~~ DONE (partitioned, 512k threshold).
    Remaining inside virtual_merge at f40: vm_pack_verify 0.61 s (pack is
    still sequential), vm_probe 0.43 s, vm_hash 0.40 s.
