@@ -145,6 +145,18 @@ a Mutex/retention-bearing cache. What it rules out matters more: the
 only lever that reaches it is per-context/dictionary evaluation. That is
 now unambiguously the top item.
 
+## Per-context evaluation priced (dict_pricing microbenchmark)
+
+At real cardinalities over 2M lanes: on-the-fly per-op dictionaries are
+**1.8-10.9x slower** than direct evaluation (hash-coding per lane costs
+more than the arithmetic) - that idea is dead. Pre-coded inputs win only
+~1.6x at the op level, because arithmetic was never the cost; lane
+traffic is. So the representation project's honest value proposition is
+**end-to-end u8 narrowness** (~4x less traffic through ops, row hashing
+- which IS bandwidth-bound at 42 GB/s - filters and dedup), and it only
+pays as a whole-pipeline change: codes in, codes out, decode at the
+boundaries. Scope accordingly.
+
 ## Ranked next steps
 
 1. ~~Fragment-parallel frame execution~~ DONE as state-parallel flow
