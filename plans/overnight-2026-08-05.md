@@ -186,7 +186,9 @@ replay ~2.4% (a constant bench includes), allocator ~2%.
   class first. Key dash_time,djump - the two hot forks' condition cells,
   read from the IR. Both forks now route instead of splitting.
   f42: 18.37 -> 13.08 s (**-29%**), 9.5 -> 4.84 GB (**-49%**).
-  f44: 61 -> ~40.6 s (dash_time alone; extended key deeper probe TBD).
+  f44: 61 -> 40.6 s (dash_time) -> **33.9 s / 10.8 GB** (dash_time,djump;
+  -44%/-42% vs this morning). **f45: 54.6 s / 15.3 GB - the first frame
+  45 ever, inside a 60 s budget**; f46 extrapolates to ~88 s.
   Boundary-only variant (hints removed) measures far worse - the hint
   merges and the partition are complementary. Graduation to a recipe
   annotation (program-carried, per-site keys) is next.

@@ -64,6 +64,18 @@ Growth is ~1.65x/frame on the rewritten path, so a 60 s budget reaches
 **frame 43** and 120 s reaches **frame 44** - two frames deeper than the
 morning's estimate at the same budgets, still single-threaded.
 
+Updated 2026-08-06 with the context-partitioned merge
+(CELESTE_PARTITION_CELLS=dash_time,djump - see the partition section and
+plans/overnight-2026-08-05.md):
+
+| | time | peak |
+|---|---|---|
+| bench `--frames 42` | 13.1 s | 4.84 GB |
+| bench `--frames 44` | 33.9 s | 10.8 GB |
+| bench `--frames 45` | **54.6 s** | 15.3 GB |
+
+A 60 s budget now reaches **frame 45**; 120 s reaches ~frame 46.
+
 The store-triangle row is the first change that moved the fragment count: 558
 -> 335 mean fragments per frame at frame 34, split executions 19573 -> 11978.
 The ternary row continues it: 335 -> 232, splits -> 8472; the decompose row:
