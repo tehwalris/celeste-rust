@@ -107,30 +107,59 @@ fn visit_rows_impl<T: Copy + PartialEq, O: Copy>(
     }
 }
 
-/// Visit every row of the virtual column in order, yielding (row, value).
-fn visit_all_impl<T: Copy + PartialEq, O: Copy>(
+/// Walk the rows in `[start, start + out_len)` of `pieces`, calling
+/// `f(global_row, value)`. Sorted-walk over the pieces, entered at `start`
+/// by skipping whole pieces - this is what lets a *range* of the virtual
+/// concatenation be processed independently of the rest, which is the unit
+/// of parallelism here.
+fn visit_range_impl<T: Copy + PartialEq, O: Copy>(
     pieces: &[Piece<T>],
+    start: usize,
+    end: usize,
     to_out: impl Fn(T) -> O,
     mut f: impl FnMut(usize, O),
 ) {
-    let mut i = 0usize;
+    let mut at = 0usize;
     for piece in pieces {
+        let n = piece.len();
+        let (p0, p1) = (at, at + n);
+        at = p1;
+        if p1 <= start {
+            continue;
+        }
+        if p0 >= end {
+            break;
+        }
+        let lo = start.max(p0);
+        let hi = end.min(p1);
         match piece {
             Piece::Slice(s) => {
-                for v in s.iter() {
+                for (i, v) in (lo..hi).zip(&s[lo - p0..hi - p0]) {
                     f(i, to_out(*v));
-                    i += 1;
                 }
             }
-            Piece::Scalar(v, n) => {
+            Piece::Scalar(v, _) => {
                 let out = to_out(*v);
-                for _ in 0..*n {
+                for i in lo..hi {
                     f(i, out);
-                    i += 1;
                 }
             }
         }
     }
+}
+
+/// Rows below this count are processed sequentially - thread setup costs
+/// more than it saves on small merges. Same figure the materialised
+/// parallel experiments settled on.
+const PARALLEL_ROW_THRESHOLD: usize = 1 << 14;
+
+/// How many threads the merge machinery uses. The work is memory-bound, so
+/// this saturates well below the core count.
+fn merge_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .min(16)
 }
 
 /// A column value widened to at most two u32 words, the same packing
@@ -198,13 +227,13 @@ impl<'a> Column<'a> {
         }
     }
 
-    /// Visit every row in order, yielding (row, packed words).
-    fn visit_all_words(&self, f: impl FnMut(usize, Words)) {
+    /// Visit rows `[start, end)` in order, yielding (row, packed words).
+    fn visit_range_words(&self, start: usize, end: usize, f: impl FnMut(usize, Words)) {
         match self {
-            Column::Numbers(p) => visit_all_impl(p, |v| (v.to_bits(), 0), f),
-            Column::Bools(p) => visit_all_impl(p, |v| (v as u32, 0), f),
+            Column::Numbers(p) => visit_range_impl(p, start, end, |v| (v.to_bits(), 0), f),
+            Column::Bools(p) => visit_range_impl(p, start, end, |v| (v as u32, 0), f),
             Column::Intervals(p) => {
-                visit_all_impl(p, |v| (v.low.to_bits(), v.high.to_bits()), f)
+                visit_range_impl(p, start, end, |v| (v.low.to_bits(), v.high.to_bits()), f)
             }
         }
     }
@@ -464,14 +493,45 @@ pub fn hash_rows(columns: &[&Column], total_rows: usize) -> Vec<u64> {
         }
     }
 
+    fn hash_range(columns: &[&Column], hashes: &mut [u64], start: usize) {
+        let end = start + hashes.len();
+        for column in columns {
+            match column {
+                Column::Numbers(p) => visit_range_impl(p, start, end, |v| elem_hash(&v), |i, h| {
+                    fold(&mut hashes[i - start], h)
+                }),
+                Column::Bools(p) => visit_range_impl(p, start, end, |v| elem_hash(&v), |i, h| {
+                    fold(&mut hashes[i - start], h)
+                }),
+                Column::Intervals(p) => visit_range_impl(p, start, end, |v| elem_hash(&v), |i, h| {
+                    fold(&mut hashes[i - start], h)
+                }),
+            }
+        }
+    }
+
     let t = crate::op_census::start();
     let mut hashes = vec![0x51_7c_c1_b7_27_22_0a_95u64; total_rows];
-    for column in columns {
-        match column {
-            Column::Numbers(p) => run(p, &mut hashes),
-            Column::Bools(p) => run(p, &mut hashes),
-            Column::Intervals(p) => run(p, &mut hashes),
+    let threads = merge_threads();
+    if total_rows < PARALLEL_ROW_THRESHOLD || threads == 1 {
+        for column in columns {
+            match column {
+                Column::Numbers(p) => run(p, &mut hashes),
+                Column::Bools(p) => run(p, &mut hashes),
+                Column::Intervals(p) => run(p, &mut hashes),
+            }
         }
+    } else {
+        // Row-range chunks: each thread folds every column over its own
+        // contiguous stretch, entering the piece walk by skipping whole
+        // pieces. Identical arithmetic per row, so the result matches the
+        // sequential pass exactly.
+        let chunk = total_rows.div_ceil(threads);
+        std::thread::scope(|scope| {
+            for (i, hash_chunk) in hashes.chunks_mut(chunk).enumerate() {
+                scope.spawn(move || hash_range(columns, hash_chunk, i * chunk));
+            }
+        });
     }
     let col_bytes: usize = columns.iter().map(|c| c.total_bytes()).sum();
     crate::op_census::record(
@@ -550,23 +610,40 @@ fn virtual_unique_mask(key: &[&Column], row_hashes: &[u64]) -> (Vec<bool>, usize
         }
     }
 
-    // 3. Verify, column-major.
+    // 3. Verify, column-major over contiguous row ranges - one range per
+    // thread, each a sorted piece walk, all random access confined to the
+    // cache-resident dense table.
     let mut ok = vec![true; n];
     {
-        let mut w = 0;
-        for column in key {
-            let words = column.words();
-            column.visit_all_words(|i, (w0, w1)| {
-                if !mask[i] {
-                    let base = dense_of_row[i] as usize * words_per_row + w;
-                    let mut equal = dense[base] == w0;
-                    if words == 2 {
-                        equal &= dense[base + 1] == w1;
+        let verify_range = |ok_chunk: &mut [bool], start: usize| {
+            let end = start + ok_chunk.len();
+            let mut w = 0;
+            for column in key.iter() {
+                let words = column.words();
+                column.visit_range_words(start, end, |i, (w0, w1)| {
+                    if !mask[i] {
+                        let base = dense_of_row[i] as usize * words_per_row + w;
+                        let mut equal = dense[base] == w0;
+                        if words == 2 {
+                            equal &= dense[base + 1] == w1;
+                        }
+                        ok_chunk[i - start] &= equal;
                     }
-                    ok[i] &= equal;
+                });
+                w += words;
+            }
+        };
+        let threads = merge_threads();
+        if n < PARALLEL_ROW_THRESHOLD || threads == 1 {
+            verify_range(&mut ok, 0);
+        } else {
+            let chunk = n.div_ceil(threads);
+            std::thread::scope(|scope| {
+                for (i, ok_chunk) in ok.chunks_mut(chunk).enumerate() {
+                    let verify_range = &verify_range;
+                    scope.spawn(move || verify_range(ok_chunk, i * chunk));
                 }
             });
-            w += words;
         }
     }
     let contaminated: Vec<usize> = (0..n).filter(|&i| !mask[i] && !ok[i]).collect();
@@ -653,6 +730,40 @@ pub fn merge_dedup_group(states: &[State]) -> Option<State> {
     };
     crate::merge_stats::record_dedup(total_rows, key.len(), first.heap.len(), removed);
 
+    // Gather every non-uniform column's survivors up front, columns in
+    // parallel - they are independent, and each gather is a sorted piece
+    // walk into a fresh allocation.
+    let mut gathered: Vec<Option<Value>> = {
+        let threads = merge_threads().min(columns.len().max(1));
+        let mut gathered: Vec<Option<Value>> = (0..columns.len()).map(|_| None).collect();
+        if kept.len() < PARALLEL_ROW_THRESHOLD || threads <= 1 {
+            for (slot, (column, uniform)) in gathered.iter_mut().zip(columns.iter().zip(&uniform))
+            {
+                if uniform.is_none() {
+                    *slot = Some(column.gather(&kept));
+                }
+            }
+        } else {
+            let chunk = columns.len().div_ceil(threads);
+            let kept = &kept;
+            let columns = &columns;
+            let uniform = &uniform;
+            std::thread::scope(|scope| {
+                for (i, out_chunk) in gathered.chunks_mut(chunk).enumerate() {
+                    scope.spawn(move || {
+                        for (k, slot) in out_chunk.iter_mut().enumerate() {
+                            let col_index = i * chunk + k;
+                            if uniform[col_index].is_none() {
+                                *slot = Some(columns[col_index].gather(kept));
+                            }
+                        }
+                    });
+                }
+            });
+        }
+        gathered
+    };
+
     // Build the merged state, walking the same structure the collection
     // walked and consuming its columns in order. The `Origin` check makes a
     // traversal mismatch a loud panic instead of a silently misplaced
@@ -665,7 +776,9 @@ pub fn merge_dedup_group(states: &[State]) -> Option<State> {
         );
         let value = match &uniform[next_col] {
             Some(scalar) => scalar.clone(),
-            None => columns[next_col].gather(&kept),
+            None => gathered[next_col]
+                .take()
+                .expect("non-uniform column must have been gathered"),
         };
         next_col += 1;
         value
