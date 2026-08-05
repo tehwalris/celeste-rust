@@ -564,9 +564,25 @@ sake. Differentially identical through 37.
 
 ## Where the time goes
 
-`rewrite bench --frames 34 --profile`, on the current recipe. Self time, so the
-rows partition wall clock rather than double counting nested spans. Profiling
-costs about 8%.
+Refreshed 2026-08-06 after the overnight stack (see
+plans/overnight-2026-08-05.md). `rewrite bench --frames 43 --profile`:
+
+| span | self | share |
+|---|---|---|
+| `cfg:anonymous_61` (the frame body) | ~17 s | ~55% |
+| `filter:filter_branch` | ~4-10 s (grows superlinearly with depth) | 15%+ |
+| `vectorize:vm_hash` / `vm_verify` / `vm_probe` / `vm_pack` (the virtual merge, all parallel) | 2.2 / 2.2 / 1.9 / 0.9 s | ~23% |
+| `vectorize:merge_groups`, `dedup_state`, `union_diff_states`, `gc` | ~0 | ~1% |
+
+The old materialised-merge costs (`merge_groups` 21%, `dedup_state` 19%
+in the previous version of this table, measured at frame 34) are gone:
+the virtual merge replaced them and the union pass-through removed
+`union_diff`. What remains at depth is the frame body itself - whose
+instruction time the cardinality census showed to be 100% duplicate-lane
+computation - and the two dash_time fork sites behind `filter_branch`.
+
+The previous version of this section, kept for the fragment-count
+narrative it documents (frame 34 numbers, pre-virtual-merge):
 
 | span | self | share |
 |---|---|---|
