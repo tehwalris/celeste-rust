@@ -95,10 +95,17 @@ values already present in the same vector, <=59 distinct) - the win is
 computing each distinct result once per context, not narrower streams.
 (b) filter_branch = the dash_time forks; if-conversion is measured
 impossible (2.2x), so the fix is run-structured masks or splitting the
-state permanently at those sites. Also check why us/lane grows with
-depth at all: per-lane compute is linear in lanes, so the growth is
-per-fragment overhead or merge superlinearity - instr_time at f44 would
-say which.
+state permanently at those sites.
+
+instr_time at f44 (same binary): **select alone is 13.4 s** of ~35 s
+flat instruction time (call spans nest callees, 51.5 s by-site;
+call_builtin 10.6 s). Fragments only grew 695 -> 1087 f37 -> f44, so the
+depth growth is in per-lane op volume, and select - whose outputs the
+census showed carry <=51 distinct values - is the single best target for
+per-context/dictionary evaluation. Start there next session: select's
+cost anatomy (gather vs allocation vs arms), then a prototype that
+evaluates hot selects per distinct (mask, arm-value) context instead of
+per lane.
 
 ## Ranked next steps
 
