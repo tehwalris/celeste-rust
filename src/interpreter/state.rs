@@ -218,6 +218,62 @@ impl State {
         }
     }
 
+    /// Split the state at a conditional branch: one pass over the condition
+    /// and one pass over every vector, producing both edges' states.
+    /// Semantically identical to filtering twice (once per edge with
+    /// negated masks), but the condition is scanned once, the state is
+    /// cloned once (COW), and each vector's cache lines are touched once
+    /// instead of nearly twice - `filter_branch` was 9.8 s at frame 44.
+    ///
+    /// `None` on a side means no lanes took that edge.
+    pub fn split_by_condition(self, condition: &[bool], target: bool) -> (Option<Self>, Option<Self>) {
+        let runs = super::value::SplitRuns::from_condition(condition, target);
+        if runs.total_false() == 0 {
+            return (Some(self), None);
+        }
+        if runs.total_true() == 0 {
+            return (None, Some(self));
+        }
+        let _trace = TraceSpan::new(FILTER_BRANCH, "filter");
+        let t_census = crate::op_census::start();
+
+        let mut state_true = self;
+        let mut state_false = state_true.clone();
+        state_true
+            .heap
+            .split_vectors_in_place(&mut state_false.heap, &runs);
+        state_true
+            .local_env
+            .split_vectors_in_place(&mut state_false.local_env, &runs);
+        for (env_true, env_false) in state_true
+            .outer_local_envs
+            .iter_mut()
+            .zip(state_false.outer_local_envs.iter_mut())
+        {
+            env_true.split_vectors_in_place(env_false, &runs);
+        }
+        state_true.vector_size = runs.total_true();
+        state_false.vector_size = runs.total_false();
+
+        // Census parity with the two filters this replaces: one branch-
+        // filter event and one reason event per side.
+        crate::op_census::record_branch_filter(condition.len(), runs.total_true(), t_census);
+        crate::op_census::record_branch_filter(condition.len(), runs.total_false(), crate::op_census::start());
+        let reason_index = crate::op_census::REASON_NAMES
+            .iter()
+            .position(|name| *name == FILTER_BRANCH)
+            .expect("filter_branch is in the census table");
+        crate::op_census::record_filter_reason(reason_index, runs.total_true(), t_census);
+        crate::op_census::record_filter_reason(reason_index, runs.total_false(), crate::op_census::start());
+        if crate::op_census::enabled() {
+            let (runs_true, runs_false) = runs.runs_per_side();
+            crate::op_census::record_filter_runs(reason_index, runs_true);
+            crate::op_census::record_filter_runs(reason_index, runs_false);
+        }
+
+        (Some(state_true), Some(state_false))
+    }
+
     /// Duplicates every lane of the state: lanes `[l1..lN]` become
     /// `[l1..lN, l1..lN]` and `vector_size` doubles. Scalars broadcast over
     /// any lane count and stay scalar, so only vectors are touched.

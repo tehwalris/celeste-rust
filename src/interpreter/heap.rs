@@ -298,6 +298,49 @@ impl Heap {
         self.base_index = Arc::new(new_base);
     }
 
+    /// Split vectors into two heaps in one walk: `self` keeps the matching
+    /// lanes, `other` (a clone of the pre-split heap) gets the rest.
+    /// Cells without vectors keep their shared storage index in both -
+    /// the same COW behaviour as `filter_vectors_in_place`, paid once
+    /// instead of once per side.
+    pub fn split_vectors_in_place(&mut self, other: &mut Self, runs: &super::value::SplitRuns) {
+        if !self.overlay.is_empty() {
+            self.compact();
+        }
+        if !other.overlay.is_empty() {
+            other.compact();
+        }
+        debug_assert_eq!(self.next_id, other.next_id, "split of diverged heaps");
+
+        let mut base_a = Vec::with_capacity(self.next_id);
+        let mut base_b = Vec::with_capacity(self.next_id);
+        for id in 0..self.next_id {
+            let old_storage_idx = if id < self.base_index.len() {
+                self.base_index[id]
+            } else {
+                usize::MAX
+            };
+            if old_storage_idx == usize::MAX {
+                base_a.push(usize::MAX);
+                base_b.push(usize::MAX);
+                continue;
+            }
+            let value = self.storage.get(old_storage_idx).expect("valid storage index");
+            match value.split_vectors_if_needed(runs) {
+                Some((value_a, value_b)) => {
+                    base_a.push(self.storage.push_get_index(Box::new(value_a)));
+                    base_b.push(other.storage.push_get_index(Box::new(value_b)));
+                }
+                None => {
+                    base_a.push(old_storage_idx);
+                    base_b.push(old_storage_idx);
+                }
+            }
+        }
+        self.base_index = Arc::new(base_a);
+        other.base_index = Arc::new(base_b);
+    }
+
     /// Freeze is a no-op for this implementation since storage is already shared.
     pub fn freeze(&mut self) {
         // Compact to reduce overlay size for future clones

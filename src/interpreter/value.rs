@@ -223,6 +223,159 @@ impl KeptLanes {
     }
 }
 
+/// A branch condition's lanes as alternating runs: `(start, end, matches)`.
+///
+/// Built with one scan of the condition vector; both sides of a split read
+/// it, so a conditional branch scans its condition once instead of once
+/// per edge, and each vector is *split* in a single pass - every run is an
+/// `extend_from_slice` into one of the two outputs, touching each source
+/// cache line once where filtering each side separately touched nearly all
+/// of them twice.
+pub struct SplitRuns {
+    runs: Vec<(u32, u32, bool)>,
+    total_true: usize,
+    total_false: usize,
+}
+
+impl SplitRuns {
+    /// Runs of `lane == target` over the condition vector.
+    pub fn from_condition(condition: &[bool], target: bool) -> Self {
+        let mut runs = Vec::new();
+        let mut total_true = 0usize;
+        let mut total_false = 0usize;
+        let mut i = 0usize;
+        while i < condition.len() {
+            let matches = condition[i] == target;
+            let start = i;
+            while i < condition.len() && (condition[i] == target) == matches {
+                i += 1;
+            }
+            runs.push((start as u32, i as u32, matches));
+            if matches {
+                total_true += i - start;
+            } else {
+                total_false += i - start;
+            }
+        }
+        Self {
+            runs,
+            total_true,
+            total_false,
+        }
+    }
+
+    /// Lanes on the matching side.
+    pub fn total_true(&self) -> usize {
+        self.total_true
+    }
+
+    /// Lanes on the non-matching side.
+    pub fn total_false(&self) -> usize {
+        self.total_false
+    }
+
+    /// Contiguous runs per side, for the filter census.
+    pub fn runs_per_side(&self) -> (usize, usize) {
+        let t = self.runs.iter().filter(|&&(_, _, m)| m).count();
+        (t, self.runs.len() - t)
+    }
+}
+
+/// Split a vector into its matching and non-matching lanes in one pass.
+#[inline]
+fn split_vec<T>(vec: &[T], runs: &SplitRuns) -> (MaybeVector<T>, MaybeVector<T>)
+where
+    T: std::fmt::Debug + Clone + PartialEq + Eq,
+{
+    let t = crate::op_census::start();
+    let mut out_true: Vec<T> = Vec::with_capacity(runs.total_true);
+    let mut out_false: Vec<T> = Vec::with_capacity(runs.total_false);
+    for &(start, end, matches) in &runs.runs {
+        let side = if matches { &mut out_true } else { &mut out_false };
+        side.extend_from_slice(&vec[start as usize..end as usize]);
+    }
+    crate::op_census::record(
+        crate::op_census::Cat::Filter,
+        vec.len(),
+        vec.len() * (2 * std::mem::size_of::<T>() + 4),
+        t,
+    );
+    // `vector` collapses uniform or single-lane sides to `Scalar`, matching
+    // what two separate filters would have produced.
+    (MaybeVector::vector(out_true), MaybeVector::vector(out_false))
+}
+
+impl Value {
+    /// Split vectors into both sides at once; `None` for scalars, which
+    /// broadcast over any lane count and stay shared.
+    #[inline]
+    pub fn split_vectors_if_vector(&self, runs: &SplitRuns) -> Option<(Self, Self)> {
+        match self {
+            Value::Bool(MaybeVector::Vector(vec)) => {
+                let (a, b) = split_vec(vec, runs);
+                Some((Value::Bool(a), Value::Bool(b)))
+            }
+            Value::Number(MaybeVector::Vector(vec)) => {
+                let (a, b) = split_vec(vec, runs);
+                Some((Value::Number(a), Value::Number(b)))
+            }
+            Value::NumberInterval(MaybeVector::Vector(vec)) => {
+                let (a, b) = split_vec(vec, runs);
+                Some((Value::NumberInterval(a), Value::NumberInterval(b)))
+            }
+            _ => None,
+        }
+    }
+}
+
+impl HeapValue {
+    /// Split vectors in this heap value into both sides at once; `None` if
+    /// it holds no vectors (both sides share it unchanged).
+    #[inline]
+    pub fn split_vectors_if_needed(&self, runs: &SplitRuns) -> Option<(Self, Self)> {
+        match self {
+            HeapValue::Value(v) => v
+                .split_vectors_if_vector(runs)
+                .map(|(a, b)| (HeapValue::Value(a), HeapValue::Value(b))),
+            HeapValue::Closure(id, captures) => {
+                let any_vector = captures.iter().any(|cap| {
+                    matches!(
+                        cap,
+                        Value::Bool(MaybeVector::Vector(_))
+                            | Value::Number(MaybeVector::Vector(_))
+                            | Value::NumberInterval(MaybeVector::Vector(_))
+                    )
+                });
+                if !any_vector {
+                    return None;
+                }
+                let mut caps_a = Vec::with_capacity(captures.len());
+                let mut caps_b = Vec::with_capacity(captures.len());
+                for cap in captures {
+                    match cap.split_vectors_if_vector(runs) {
+                        Some((a, b)) => {
+                            caps_a.push(a);
+                            caps_b.push(b);
+                        }
+                        None => {
+                            caps_a.push(cap.clone());
+                            caps_b.push(cap.clone());
+                        }
+                    }
+                }
+                Some((
+                    HeapValue::Closure(id.clone(), caps_a),
+                    HeapValue::Closure(id.clone(), caps_b),
+                ))
+            }
+            HeapValue::ObjectTable(_)
+            | HeapValue::ArrayTable(_)
+            | HeapValue::UnknownTable
+            | HeapValue::BuiltinFun(_) => None,
+        }
+    }
+}
+
 /// Filter a vector down to the kept lanes. O(kept) per vector instead of
 /// O(mask): a filter touches every vector value in the state, so
 /// re-scanning the full mask per vector was the dominant cost of

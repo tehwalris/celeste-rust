@@ -404,15 +404,13 @@ fn interpret_prepared_cfg_inner(
                     );
                 }
 
-                // True branch: clone the flow_data
-                let bound_true = adapter.flow_branch(terminator, true_target)?;
-                let true_flow_data = bound_true.flow(flow_data.clone())?;
+                // Both edges at once: the condition is inspected once per
+                // state and a lane-mixed condition splits the state in a
+                // single pass instead of filtering a clone per edge.
+                let bound_split = adapter.flow_branch_split(terminator)?;
+                let (true_flow_data, false_flow_data) = bound_split.flow_split(flow_data)?;
                 let took_true = !true_flow_data.is_empty();
                 process_branch(true, true_target, true_flow_data)?;
-
-                // False branch: consume the original flow_data
-                let bound_false = adapter.flow_branch(terminator, false_target)?;
-                let false_flow_data = bound_false.flow(flow_data)?;
                 let took_false = !false_flow_data.is_empty();
                 process_branch(false, false_target, false_flow_data)?;
 

@@ -256,6 +256,23 @@ impl LocalEnv {
         }
     }
 
+    /// Split vector values into two environments in one walk: `self` keeps
+    /// the matching lanes, `other` (a clone of the pre-split env) gets the
+    /// rest. Scalars stay shared. Occupancy is untouched on both sides.
+    pub fn split_vectors_in_place(&mut self, other: &mut Self, runs: &super::value::SplitRuns) {
+        let data_a = Arc::make_mut(&mut self.data);
+        let data_b = Arc::make_mut(&mut other.data);
+        debug_assert_eq!(data_a.values.len(), data_b.values.len(), "split of diverged envs");
+        for (slot_a, slot_b) in data_a.values.iter_mut().zip(data_b.values.iter_mut()) {
+            if let Some(value) = slot_a.as_ref() {
+                if let Some((a, b)) = value.split_vectors_if_vector(runs) {
+                    *slot_a = Some(a);
+                    *slot_b = Some(b);
+                }
+            }
+        }
+    }
+
     /// Iterate over occupied `(slot, value)` pairs.
     ///
     /// Yields slots, not `LocalId`s. Callers that rebuild an environment

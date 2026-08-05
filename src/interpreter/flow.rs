@@ -74,10 +74,6 @@ pub enum BoundInterpreterFlow<'a> {
         non_phi_instructions: Vec<(LocalId, Instruction)>,
     },
     BranchUnconditional,
-    BranchConditional {
-        condition_local_id: LocalId,
-        condition_from_flow_edge: bool,
-    },
     Return {
         return_local_id: Option<LocalId>,
     },
@@ -147,16 +143,6 @@ impl<'a> UnboundSplitBlockFlow<FlowData, BoundInterpreterFlow<'a>> for Interpret
         match terminator {
             Terminator::UnconditionalBranch { target } if target == flow_target => {
                 Ok(BoundInterpreterFlow::BranchUnconditional)
-            }
-            Terminator::ConditionalBranch {
-                condition,
-                true_target,
-                false_target,
-            } if flow_target == true_target || flow_target == false_target => {
-                Ok(BoundInterpreterFlow::BranchConditional {
-                    condition_local_id: *condition,
-                    condition_from_flow_edge: flow_target == true_target,
-                })
             }
             _ => panic!("Unexpected flow"),
         }
@@ -249,59 +235,6 @@ impl<'a> BoundInterpreterFlow<'a> {
                 Ok(FlowData::States(final_states))
             }
             Self::BranchUnconditional => Ok(FlowData::States(vec![state])),
-            Self::BranchConditional {
-                condition_local_id,
-                condition_from_flow_edge,
-            } => match &state.local_env.get(*condition_local_id) {
-                Value::Bool(MaybeVector::Scalar(false)) | Value::Nil(_) => {
-                    Ok(FlowData::States(if *condition_from_flow_edge {
-                        vec![]
-                    } else {
-                        vec![state]
-                    }))
-                }
-                Value::UnknownBool => {
-                    // Both edges get the whole state - no filtering, so this
-                    // costs a duplication and everything downstream of it
-                    // rather than filter time. Counted separately for that
-                    // reason.
-                    crate::op_census::record_unknown_branch_dup(state.vector_size);
-                    Ok(FlowData::States(vec![state]))
-                }
-                Value::Number(_)
-                | Value::NumberInterval(_)
-                | Value::Bool(MaybeVector::Scalar(true))
-                | Value::String(_)
-                | Value::Pointer(_) => Ok(FlowData::States(if *condition_from_flow_edge {
-                    vec![state]
-                } else {
-                    vec![]
-                })),
-                Value::NilPointer(_) => Err(anyhow!("Nil pointer in condition")),
-                Value::Bool(MaybeVector::Vector(bool_vector)) => {
-                    let condition_target = *condition_from_flow_edge;
-
-                    // Build a mask for lanes matching this condition
-                    let condition_mask: Vec<bool> = bool_vector
-                        .iter()
-                        .map(|v| *v == condition_target)
-                        .collect();
-
-                    let matching_count = condition_mask.iter().filter(|&&b| b).count();
-
-                    if matching_count == 0 {
-                        Ok(FlowData::States(vec![]))
-                    } else if matching_count == state.vector_size {
-                        // ALL lanes go this direction - no filtering needed
-                        Ok(FlowData::States(vec![state]))
-                    } else {
-                        // Mixed: filter the state immediately
-                        let new_state =
-                            state.filter_by_mask(&condition_mask, crate::interpreter::state::FILTER_BRANCH);
-                        Ok(FlowData::States(vec![new_state]))
-                    }
-                }
-            },
             Self::Return { return_local_id } => match *return_local_id {
                 Some(return_local_id) => {
                     state.local_env.retain(|id| id == return_local_id);
@@ -324,6 +257,149 @@ static PARALLEL_FLOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 
 pub fn set_parallel_flow(enabled: bool) {
     PARALLEL_FLOW.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Run `f` over every state, in input order, on the worker pool when it
+/// pays. States are independent of each other through a flow step - no
+/// instruction reads another state, and a call's descendants replace their
+/// parent in place - so per-state outputs concatenated in input order
+/// reproduce the sequential result exactly. Three gates keep the pool
+/// worth its cost, learned the hard way (an ungated scoped-thread version
+/// made verify 16x slower on spawn churn):
+///   * enough total lanes that per-state work dwarfs the dispatch;
+///   * never nested - a worker running a callee's CFG stays sequential
+///     (thread-local flag);
+///   * sequential when per-instruction timing is on: `instr_time`
+///     attributes through a thread-local function stack that worker
+///     threads do not inherit.
+/// And off entirely unless the driver opts in (`set_parallel_flow`):
+/// measured -21.7% on the unrewritten search path (CPU-bound per-state
+/// overhead) but +4-6% on the rewritten path (memory-bound fused block,
+/// concurrency only buys cache thrash and +8-18% peak RSS).
+fn map_states_maybe_parallel<R: Send>(
+    states: Vec<State>,
+    f: impl Fn(State) -> Result<R> + Sync,
+) -> Result<Vec<R>> {
+    thread_local! {
+        static IN_PARALLEL_FLOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    const MIN_PARALLEL_LANES: usize = 1 << 15;
+
+    let sequential = |states: Vec<State>| -> Result<Vec<R>> {
+        let mut flat = Vec::with_capacity(states.len());
+        for state in states {
+            flat.push(f(state)?);
+        }
+        Ok(flat)
+    };
+
+    if !PARALLEL_FLOW.load(std::sync::atomic::Ordering::Relaxed) {
+        return sequential(states);
+    }
+    let total_lanes: usize = states.iter().map(|s| s.vector_size).sum();
+    let threads = super::virtual_merge::worker_threads().min(states.len());
+    let parallel = threads > 1
+        && total_lanes >= MIN_PARALLEL_LANES
+        && !IN_PARALLEL_FLOW.with(|c| c.get())
+        && !crate::instr_time::enabled();
+    if !parallel {
+        return sequential(states);
+    }
+
+    // A persistent pool, not per-call spawns: flow steps run thousands of
+    // times per frame, and an earlier scoped-thread version spent minutes
+    // of *system* time on thread churn.
+    use rayon::prelude::*;
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    let pool = POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(super::virtual_merge::worker_threads().min(8))
+            .build()
+            .expect("flow thread pool")
+    });
+    let results: Vec<Result<R>> = pool.install(|| {
+        states
+            .into_par_iter()
+            .map(|state| {
+                IN_PARALLEL_FLOW.with(|c| c.set(true));
+                let result = f(state);
+                IN_PARALLEL_FLOW.with(|c| c.set(false));
+                result
+            })
+            .collect()
+    });
+    // First error in input order wins, matching the sequential loop.
+    let mut flat = Vec::with_capacity(results.len());
+    for result in results {
+        flat.push(result?);
+    }
+    Ok(flat)
+}
+
+/// A conditional branch bound for both edges at once. Replaces the two
+/// per-edge `BranchConditional` flows: the condition is inspected once per
+/// state, and a lane-mixed condition splits the state in a single pass
+/// (`State::split_by_condition`) instead of filtering a clone per edge.
+pub struct BoundBranchSplit {
+    condition_local_id: LocalId,
+}
+
+impl<'a> InterpreterFlowAdapter<'a> {
+    pub fn flow_branch_split(&self, terminator: &Terminator) -> Result<BoundBranchSplit> {
+        match terminator {
+            Terminator::ConditionalBranch { condition, .. } => Ok(BoundBranchSplit {
+                condition_local_id: *condition,
+            }),
+            _ => panic!("Unexpected flow"),
+        }
+    }
+}
+
+impl BoundBranchSplit {
+    /// Both edges' states, in input order per edge.
+    pub fn flow_split(&self, v: FlowData) -> Result<(FlowData, FlowData)> {
+        let states = match v {
+            FlowData::States(states) => states,
+            FlowData::StatesAndReturns(_) => {
+                return Err(anyhow!("Return value in unexpected part of CFG"))
+            }
+        };
+        let pairs = map_states_maybe_parallel(states, |state| self.split_single_state(state))?;
+        let mut true_states = Vec::new();
+        let mut false_states = Vec::new();
+        for (t, f) in pairs {
+            true_states.extend(t);
+            false_states.extend(f);
+        }
+        Ok((FlowData::States(true_states), FlowData::States(false_states)))
+    }
+
+    fn split_single_state(&self, state: State) -> Result<(Option<State>, Option<State>)> {
+        // Clone the condition value (an Arc bump for vectors) so the state
+        // can be moved below.
+        let condition_value = state.local_env.get(self.condition_local_id).clone();
+        match condition_value {
+            Value::Bool(MaybeVector::Scalar(false)) | Value::Nil(_) => Ok((None, Some(state))),
+            Value::UnknownBool => {
+                // Both edges get the whole state - no filtering, so this
+                // costs a duplication and everything downstream of it
+                // rather than filter time. Counted separately for that
+                // reason. (Once per branch now; the per-edge formulation
+                // counted each duplication twice.)
+                crate::op_census::record_unknown_branch_dup(state.vector_size);
+                Ok((Some(state.clone()), Some(state)))
+            }
+            Value::Number(_)
+            | Value::NumberInterval(_)
+            | Value::Bool(MaybeVector::Scalar(true))
+            | Value::String(_)
+            | Value::Pointer(_) => Ok((Some(state), None)),
+            Value::NilPointer(_) => Err(anyhow!("Nil pointer in condition")),
+            Value::Bool(MaybeVector::Vector(bool_vector)) => {
+                Ok(state.split_by_condition(&bool_vector, true))
+            }
+        }
+    }
 }
 
 /// Concatenate per-state flow outputs in input order - shared tail of the
@@ -361,84 +437,7 @@ impl<'a> BoundSplitBlockFlow<FlowData> for BoundInterpreterFlow<'a> {
                 return Err(anyhow!("Return value in unexpected part of CFG"))
             }
         };
-
-        // States are independent of each other through a flow step - no
-        // instruction reads another state, and a call's descendants replace
-        // their parent in place - so a multi-state step can run its states
-        // on separate threads and concatenate the per-state outputs in
-        // input order, which reproduces the sequential result exactly
-        // (including state order). Three gates keep the spawns worth their
-        // cost, learned the hard way (an ungated version made verify 16x
-        // slower on spawn overhead alone):
-        //   * enough total lanes that per-state work dwarfs a thread spawn;
-        //   * never nested - a worker running a callee's CFG stays
-        //     sequential (thread-local flag);
-        //   * sequential when per-instruction timing is on: `instr_time`
-        //     attributes through a thread-local function stack that worker
-        //     threads do not inherit.
-        thread_local! {
-            static IN_PARALLEL_FLOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-        }
-        const MIN_PARALLEL_LANES: usize = 1 << 15;
-        // Off unless the driver opts in (see `set_parallel_flow`): state-
-        // parallel flow is -21.7% on the unrewritten search path, whose
-        // per-state work is CPU-bound overhead, but +4-6% on the rewritten
-        // path, whose giant fused block already saturates memory bandwidth
-        // with a single state - concurrency there only buys cache thrash
-        // (+8-18% peak RSS). Measured at 8 and 16 threads, same split.
-        if !PARALLEL_FLOW.load(std::sync::atomic::Ordering::Relaxed) {
-            let mut flat = Vec::with_capacity(states.len());
-            for state in states {
-                flat.push(self.flow_single_state(state)?);
-            }
-            return finish_flow(flat);
-        }
-        let total_lanes: usize = states.iter().map(|s| s.vector_size).sum();
-        let threads = super::virtual_merge::worker_threads().min(states.len());
-        let parallel = threads > 1
-            && total_lanes >= MIN_PARALLEL_LANES
-            && !IN_PARALLEL_FLOW.with(|f| f.get())
-            && !crate::instr_time::enabled();
-        let per_state: Vec<FlowData> = if parallel {
-            // A persistent pool, not per-call spawns: flow steps run
-            // thousands of times per frame, and an earlier scoped-thread
-            // version spent minutes of *system* time on thread churn. A
-            // dedicated pool sized like the merge's (memory-bound work
-            // saturates well below the 32 hardware threads) rather than
-            // rayon's core-count global pool.
-            use rayon::prelude::*;
-            static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
-            let pool = POOL.get_or_init(|| {
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(super::virtual_merge::worker_threads().min(8))
-                    .build()
-                    .expect("flow thread pool")
-            });
-            let results: Vec<Result<FlowData>> = pool.install(|| {
-                states
-                    .into_par_iter()
-                    .map(|state| {
-                        IN_PARALLEL_FLOW.with(|f| f.set(true));
-                        let result = self.flow_single_state(state);
-                        IN_PARALLEL_FLOW.with(|f| f.set(false));
-                        result
-                    })
-                    .collect()
-            });
-            // First error in input order wins, matching the sequential loop.
-            let mut flat = Vec::with_capacity(results.len());
-            for result in results {
-                flat.push(result?);
-            }
-            flat
-        } else {
-            let mut flat = Vec::with_capacity(states.len());
-            for state in states {
-                flat.push(self.flow_single_state(state)?);
-            }
-            flat
-        };
-
+        let per_state = map_states_maybe_parallel(states, |state| self.flow_single_state(state))?;
         finish_flow(per_state)
     }
 }
@@ -448,136 +447,101 @@ mod tests {
     use super::*;
     use crate::pico8_num::Pico8Num;
 
-    /// Test immediate filtering with a vectorized bool condition
+    /// A lane-mixed vector condition splits the state in one pass: both
+    /// edges' states come back from a single flow_split, filtered exactly
+    /// as the two per-edge filters used to produce.
     #[test]
-    fn test_branch_conditional_immediate_filter() {
-        // Create a state with vector_size = 4
-        // local_env[0] = Bool([true, false, true, false])  <- condition
-        // local_env[1] = Number([1, 2, 3, 4])              <- data
+    fn test_branch_split_immediate_filter() {
+        // vector_size = 4; condition [t, f, t, f]; data [1, 2, 3, 4].
         let mut state = State::new();
         state.vector_size = 4;
 
         let condition_local_id = LocalId::from(0);
         let data_local_id = LocalId::from(1);
 
-        state.local_env.set(condition_local_id, Value::Bool(MaybeVector::vector(vec![
-            true, false, true, false
-        ])));
-        state.local_env.set(data_local_id, Value::Number(MaybeVector::vector(vec![
-            Pico8Num::from_i16(1),
-            Pico8Num::from_i16(2),
-            Pico8Num::from_i16(3),
-            Pico8Num::from_i16(4),
-        ])));
-
-        // Create true branch flow
-        let true_branch = BoundInterpreterFlow::BranchConditional {
+        state.local_env.set(
             condition_local_id,
-            condition_from_flow_edge: true,
-        };
+            Value::Bool(MaybeVector::vector(vec![true, false, true, false])),
+        );
+        state.local_env.set(
+            data_local_id,
+            Value::Number(MaybeVector::vector(vec![
+                Pico8Num::from_i16(1),
+                Pico8Num::from_i16(2),
+                Pico8Num::from_i16(3),
+                Pico8Num::from_i16(4),
+            ])),
+        );
 
-        // Create false branch flow
-        let false_branch = BoundInterpreterFlow::BranchConditional {
+        let split = BoundBranchSplit {
             condition_local_id,
-            condition_from_flow_edge: false,
         };
+        let (true_data, false_data) = split.flow_split(FlowData::States(vec![state])).unwrap();
 
-        // Clone state for false branch
-        let state_for_false = state.clone();
-
-        // Execute true branch
-        let true_result = true_branch.flow_single_state(state).unwrap();
-        let true_states = match true_result {
+        let true_states = match true_data {
             FlowData::States(s) => s,
             _ => panic!("Expected States"),
         };
-
-        assert_eq!(true_states.len(), 1, "True branch should return 1 state");
+        assert_eq!(true_states.len(), 1, "True edge should get 1 state");
         let true_state = &true_states[0];
-        assert_eq!(true_state.vector_size, 2, "True branch should have 2 lanes");
-
-        // Vectors should be immediately filtered
+        assert_eq!(true_state.vector_size, 2, "True edge should have 2 lanes");
         match true_state.local_env.get(data_local_id) {
             Value::Number(MaybeVector::Vector(nums)) => {
-                assert_eq!(nums.len(), 2, "Vector should be filtered to 2 elements");
-                assert_eq!(nums[0], Pico8Num::from_i16(1), "First element");
-                assert_eq!(nums[1], Pico8Num::from_i16(3), "Second element");
+                assert_eq!(&nums[..], &[Pico8Num::from_i16(1), Pico8Num::from_i16(3)]);
             }
             _ => panic!("Expected Number vector"),
         }
 
-        // Execute false branch
-        let false_result = false_branch.flow_single_state(state_for_false).unwrap();
-        let false_states = match false_result {
+        let false_states = match false_data {
             FlowData::States(s) => s,
             _ => panic!("Expected States"),
         };
-
-        assert_eq!(false_states.len(), 1, "False branch should return 1 state");
+        assert_eq!(false_states.len(), 1, "False edge should get 1 state");
         let false_state = &false_states[0];
-        assert_eq!(false_state.vector_size, 2, "False branch should have 2 lanes");
-
-        // Vectors should be immediately filtered
+        assert_eq!(false_state.vector_size, 2, "False edge should have 2 lanes");
         match false_state.local_env.get(data_local_id) {
             Value::Number(MaybeVector::Vector(nums)) => {
-                assert_eq!(nums.len(), 2, "Vector should be filtered to 2 elements");
-                assert_eq!(nums[0], Pico8Num::from_i16(2), "First element");
-                assert_eq!(nums[1], Pico8Num::from_i16(4), "Second element");
+                assert_eq!(&nums[..], &[Pico8Num::from_i16(2), Pico8Num::from_i16(4)]);
             }
             _ => panic!("Expected Number vector"),
         }
 
-        // Total count should equal original
-        let total = true_state.vector_size + false_state.vector_size;
-        assert_eq!(total, 4, "Total lanes should equal original (2 + 2 = 4)");
+        assert_eq!(
+            true_state.vector_size + false_state.vector_size,
+            4,
+            "Total lanes should equal original"
+        );
     }
 
-    /// Test that all lanes going true direction returns unchanged state
+    /// A uniform vector condition routes the whole state down one edge
+    /// unchanged, with nothing on the other edge. (With the uniform
+    /// collapse in MaybeVector::vector such a condition is normally a
+    /// Scalar already; the vector form is built directly here to pin the
+    /// split's own handling of it.)
     #[test]
-    fn test_branch_all_true() {
+    fn test_branch_split_all_one_side() {
         let mut state = State::new();
         state.vector_size = 3;
 
         let cond_id = LocalId::from(0);
-        // All true
-        state.local_env.set(cond_id, Value::Bool(MaybeVector::vector(vec![true, true, true])));
+        state.local_env.set(
+            cond_id,
+            Value::Bool(MaybeVector::Vector(std::sync::Arc::new(vec![
+                true, true, true,
+            ]))),
+        );
 
-        let branch = BoundInterpreterFlow::BranchConditional {
+        let split = BoundBranchSplit {
             condition_local_id: cond_id,
-            condition_from_flow_edge: true,
         };
+        let (true_data, false_data) = split.flow_split(FlowData::States(vec![state])).unwrap();
 
-        let result = branch.flow_single_state(state).unwrap();
-        let result_state = match result {
-            FlowData::States(mut s) => s.pop().unwrap(),
-            _ => panic!("Expected States"),
-        };
-
-        // Should return unchanged (no filtering needed)
-        assert_eq!(result_state.vector_size, 3);
-    }
-
-    /// Test that no lanes going our direction returns empty
-    #[test]
-    fn test_branch_all_opposite() {
-        let mut state = State::new();
-        state.vector_size = 3;
-
-        let cond_id = LocalId::from(0);
-        // All true, but we're taking false branch
-        state.local_env.set(cond_id, Value::Bool(MaybeVector::vector(vec![true, true, true])));
-
-        let branch = BoundInterpreterFlow::BranchConditional {
-            condition_local_id: cond_id,
-            condition_from_flow_edge: false, // Taking false branch
-        };
-
-        let result = branch.flow_single_state(state).unwrap();
-        let states = match result {
+        let true_states = match true_data {
             FlowData::States(s) => s,
             _ => panic!("Expected States"),
         };
-
-        assert!(states.is_empty(), "No lanes go to false branch, should be empty");
+        assert_eq!(true_states.len(), 1);
+        assert_eq!(true_states[0].vector_size, 3, "unchanged on the taken edge");
+        assert!(false_data.is_empty(), "nothing on the untaken edge");
     }
 }
