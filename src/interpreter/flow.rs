@@ -250,88 +250,25 @@ impl<'a> BoundInterpreterFlow<'a> {
     }
 }
 
-/// Whether multi-state flow steps may run their states on the worker pool.
-/// Default off; the plain-program search runner turns it on (see the module
-/// comment in `flow` for the measured asymmetry).
-static PARALLEL_FLOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-pub fn set_parallel_flow(enabled: bool) {
-    PARALLEL_FLOW.store(enabled, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Run `f` over every state, in input order, on the worker pool when it
-/// pays. States are independent of each other through a flow step - no
-/// instruction reads another state, and a call's descendants replace their
-/// parent in place - so per-state outputs concatenated in input order
-/// reproduce the sequential result exactly. Three gates keep the pool
-/// worth its cost, learned the hard way (an ungated scoped-thread version
-/// made verify 16x slower on spawn churn):
-///   * enough total lanes that per-state work dwarfs the dispatch;
-///   * never nested - a worker running a callee's CFG stays sequential
-///     (thread-local flag);
-///   * sequential when per-instruction timing is on: `instr_time`
-///     attributes through a thread-local function stack that worker
-///     threads do not inherit.
-/// And off entirely unless the driver opts in (`set_parallel_flow`):
-/// measured -21.7% on the unrewritten search path (CPU-bound per-state
-/// overhead) but +4-6% on the rewritten path (memory-bound fused block,
-/// concurrency only buys cache thrash and +8-18% peak RSS).
+/// Run `f` over every state, in input order. States are independent of
+/// each other through a flow step - no instruction reads another state,
+/// and a call's descendants replace their parent in place - so this is the
+/// shared per-state driver for plain flow steps and the fused branch
+/// split.
+///
+/// A state-parallel version of this (rayon pool, opt-in per program) was
+/// measured at -22% on the unrewritten search path but +4-6% and +8-18%
+/// peak RSS on the rewritten one - the fused block's per-state streaming
+/// working sets evict each other. Since the rewritten path is the one the
+/// search runs, the parallel arm was reverted by review; it lives in git
+/// history ("state-parallel flow steps") if the tradeoff ever flips.
 fn map_states_maybe_parallel<R: Send>(
     states: Vec<State>,
     f: impl Fn(State) -> Result<R> + Sync,
 ) -> Result<Vec<R>> {
-    thread_local! {
-        static IN_PARALLEL_FLOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    const MIN_PARALLEL_LANES: usize = 1 << 15;
-
-    let sequential = |states: Vec<State>| -> Result<Vec<R>> {
-        let mut flat = Vec::with_capacity(states.len());
-        for state in states {
-            flat.push(f(state)?);
-        }
-        Ok(flat)
-    };
-
-    if !PARALLEL_FLOW.load(std::sync::atomic::Ordering::Relaxed) {
-        return sequential(states);
-    }
-    let total_lanes: usize = states.iter().map(|s| s.vector_size).sum();
-    let threads = super::virtual_merge::worker_threads().min(states.len());
-    let parallel = threads > 1
-        && total_lanes >= MIN_PARALLEL_LANES
-        && !IN_PARALLEL_FLOW.with(|c| c.get())
-        && !crate::instr_time::enabled();
-    if !parallel {
-        return sequential(states);
-    }
-
-    // A persistent pool, not per-call spawns: flow steps run thousands of
-    // times per frame, and an earlier scoped-thread version spent minutes
-    // of *system* time on thread churn.
-    use rayon::prelude::*;
-    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
-    let pool = POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(super::virtual_merge::worker_threads().min(8))
-            .build()
-            .expect("flow thread pool")
-    });
-    let results: Vec<Result<R>> = pool.install(|| {
-        states
-            .into_par_iter()
-            .map(|state| {
-                IN_PARALLEL_FLOW.with(|c| c.set(true));
-                let result = f(state);
-                IN_PARALLEL_FLOW.with(|c| c.set(false));
-                result
-            })
-            .collect()
-    });
-    // First error in input order wins, matching the sequential loop.
-    let mut flat = Vec::with_capacity(results.len());
-    for result in results {
-        flat.push(result?);
+    let mut flat = Vec::with_capacity(states.len());
+    for state in states {
+        flat.push(f(state)?);
     }
     Ok(flat)
 }
