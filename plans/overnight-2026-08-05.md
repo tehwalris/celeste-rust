@@ -282,6 +282,16 @@ guard_region rule remains. Its concrete design:
   every region-def escaping the region is mask-form as above.
 * suggest side: scan fused blocks for maximal ranges whose escaping defs
   share a common mask. Apply to the dash-package regions first.
+* Scoping scan (select count per mask in anonymous_61): no mask guards
+  more than 4 selects - per-mask regions are small. But the 3-select
+  family %5972..%6852 is the unrolled pixel-move iterations, and masks
+  chain from root predicates (iteration mask = root && cond), so the
+  high-value form is a guard on the ROOT mask over a super-region: root
+  uniformly false implies every derived mask false, skipping the whole
+  family. The verifier then needs implied-falseness along the mask
+  def-chain (and/select-of-root forms, the decompose_truthy shapes),
+  not just literal mask equality. Start with one pixel-move super-region
+  as the pilot entry.
 
 ## Ranked next steps
 
