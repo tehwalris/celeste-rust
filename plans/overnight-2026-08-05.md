@@ -346,8 +346,9 @@ finished 200m) re-run today on room (1,0):
 * Its growth curve is the saturation story measured exactly: 7.0x ->
   1.105x by f29, monotone decline - the same shape our lane counts show
   (1.53x -> 1.35x at our f41-f47). The room genuinely saturates.
-* Rough per-state comparison (frame alignment imperfect - our counts
-  include ~11 pre-spawn frames): theirs 1.28 us/state-run vs ours
+* Rough per-state comparison (frame alignment now pinned - our frames
+  1-24 are the spawn prologue, first player update at frame 25, so
+  their control frame k = our frame 24+k): theirs 1.28 us/state-run vs ours
   ~4.7 us/lane at f43 - **~4x slower per lane for a general compiled-
   Lua interpreter vs hand-written physics**, which is closer than
   expected. The bigger gap is state count - but the first attribution
@@ -359,10 +360,8 @@ finished 200m) re-run today on room (1,0):
   never verified - plausibly spd and/or position, which would make the
   1.8-1.9x number meaningless. Census must be redone with verified cell
   identities before any state-count conclusion.)
-* Open: the room's exact optimal frame count - the baseline TAS
-  (tas/baseline/TAS2.tas) needs the 2022 input encoding (their tas.rs)
-  to demarcate the first room; a naive decode through concrete_run gave
-  a suspicious trajectory, so the bit mapping differs.
+* ~~Open: the room's exact optimal frame count~~ RESOLVED (2026-08-06),
+  see "Room (1,0) optimal pinned" below.
 
 ## The rem question, CORRECTED (2026-08-06 morning)
 
@@ -409,6 +408,42 @@ reconstructed):
   frame-boundary results. This is exactly parked task #51 (+110% ->
   +33% when merges were expensive) - worth re-testing now that merges
   are partitioned and much cheaper.
+
+## Room (1,0) optimal pinned: exit during frame 100 (2026-08-06)
+
+TAS2.tas decoded and replayed. Facts, all verified on our engine:
+
+* The input bit encoding is IDENTICAL between the repos (bit0..5 =
+  left,right,up,down,jump,dash) - the earlier "suspicious trajectory"
+  was pure frame misalignment, not bit mapping.
+* TAS2.tas is 77 control-frame inputs for the first room only. The 2022
+  model has NO spawn phase: its control frame k = our frame 24+k (our
+  frames 1-24 are the spawn prologue; the player object is created at
+  the end of frame 24; the first player update is frame 25 - the
+  abstract search uses the same numbering, main.rs test comment
+  confirms "player spawn at frame 25").
+* **Semantic difference found: celeste-minimal has NO jump buffer.**
+  Classic (and the 2022 hand model, game.rs jbuffer) buffers a jump
+  press for 4 frames; celeste-minimal consumes `btn(k_jump) press` the
+  same frame or loses it (presses during dash_time>0 frames, or
+  airborne before a wall comes in range, do nothing). This does not
+  change reachability: a buffered jump executes identically to a press
+  at the execution frame, so the two games have the same optimal frame
+  counts; only input sequences need re-timing.
+* Adapting TAS2 by moving four J presses to their execution frames
+  (control indices 5->7, 47->49, 53->54, 62->63) reproduces the 2022
+  trajectory FRAME-FOR-FRAME in integer position, and the room
+  transition to (2,0) fires during our frame 100 - the 76th player
+  update, exactly the 2022 win frame (their 0-based control frame 75).
+  Witness checked in: tas/room_1_0_exit_frame_100.txt.
+* **Consequence for the search**: the optimal exit is during frame 100
+  in our numbering (2022's search proved 76 control frames optimal in
+  a model whose trajectories are a superset of ours; the witness shows
+  ours achieves it). The abstract forward search certifies this by
+  reaching frame 100 and finding the exit reachable, with frame <= 99
+  showing none. Current frontier f47 = control frame 22 of 76.
+* Incidental: concrete_run cannot run past the room transition - room
+  (2,0)'s fruit.update calls `sin`, which the fixed env lacks.
 
 **Retested (2026-08-06, task #74): parked at +40%.** The exact old
 stack (widen_buttons + widen_rem at in_h061_if_join_103, add_hint at

@@ -1,0 +1,22 @@
+# Room (1,0) exit witness for celeste-minimal, verified 2026-08-06.
+#
+# Input bytes for concrete_run (-i), one per frame starting at frame 1.
+# bit0=left bit1=right bit2=up bit3=down bit4=jump bit5=dash.
+# Frames 1-24 are the spawn prologue (inputs ignored; player object is
+# created at the end of frame 24, first player update is frame 25).
+# The player crosses y < -4 and the room transition to (2,0) fires
+# DURING FRAME 100 - i.e. on the 76th player-update frame, matching the
+# 2022 searcher's proven optimum (win at its 0-based control frame 75).
+#
+# Derived from celeste-rust-old tas/baseline/TAS2.tas by moving four
+# jump presses from their (jbuffer-buffered) press frames to their
+# execution frames - celeste-minimal has no jump buffer: TAS indices
+# 5->7, 47->49, 53->54, 62->63 (0-based control frames). With those
+# moves the trajectory matches the 2022 model FRAME-FOR-FRAME in
+# integer position through the exit.
+#
+# Replay (expect room transition at frame 100, then a crash in room
+# (2,0)'s fruit.update on the missing `sin` builtin - harmless):
+#   ./target/release/concrete_run -i "$(grep -v '^#' tas/room_1_0_exit_frame_100.txt | tr -d '\n')" -f 100
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+42,0,0,0,0,0,2,18,2,2,18,2,2,2,2,18,1,1,1,0,16,0,0,0,36,2,2,2,2,2,2,0,2,2,2,2,2,2,2,10,10,10,42,42,0,0,0,2,2,18,2,2,2,2,18,2,2,2,2,2,2,2,2,18,2,0,0,0,16,0,0,0,0,16,0,0
