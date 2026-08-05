@@ -203,6 +203,19 @@ replay ~2.4% (a constant bench includes), allocator ~2%.
   which needs a resolution-bug check before trusting it.
 * Hint removal itself: parked earlier at +3.8% (hints are load-bearing);
   the unsound NormalizedState comparison is deleted outright.
+* **The 59% explained** (and the census caveats with it): would-dedup
+  counts *intra-fragment* duplicates - each fragment is a single worklist
+  item, and buttons are scalar within one, so the widened variant is
+  trivially identical (no resolution bug). The duplicates themselves are
+  the **rem/flr cycle**: lanes differing only in stale `rem` become
+  widened-equal at frame start - after the boundary merge already ran on
+  fresh rem - and the mid-frame flr splits then re-concretize rem,
+  recreating exactly the lanes an early dedup removes. Hence the early
+  hint's +30%: kill 59%, pay a merge, flr resurrects them. The
+  redundancy is structural to the interval abstraction. The genuinely
+  open variant: dedup after widening AND keep rem widened longer (defer
+  the flr split), which changes the abstraction's precision/cost
+  trade - a strategy.md-level question, not an interpreter tweak.
 
 ## Ranked next steps
 
