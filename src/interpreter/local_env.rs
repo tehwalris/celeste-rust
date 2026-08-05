@@ -166,6 +166,20 @@ impl LocalEnv {
         }
     }
 
+    /// Non-panicking lookup: `Some` only if `id` is still the occupant of its
+    /// slot. For diagnostics that probe whether an instruction bound a value,
+    /// where "not set" is an answer rather than a bug.
+    #[inline]
+    pub fn try_get(&self, id: LocalId) -> Option<&Value> {
+        let slot = self.slots.slot_of(id);
+        match self.data.occupant.get(slot) {
+            Some(&occupant) if occupant == usize::from(id) as u32 => {
+                self.data.values.get(slot).and_then(|v| v.as_ref())
+            }
+            _ => None,
+        }
+    }
+
     #[inline]
     pub fn set(&mut self, id: LocalId, value: Value) {
         let slot = self.slots.slot_of(id);

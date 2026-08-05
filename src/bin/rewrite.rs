@@ -146,6 +146,9 @@ fn bench(label: &str, program: &Program, frames: u32, profile: bool) -> Result<(
         celeste_rust::interpreter::tracing::enable_tracing();
         celeste_rust::instr_time::reset();
         celeste_rust::instr_time::enable();
+        if std::env::var("CELESTE_INSTR_CARD").is_ok() {
+            celeste_rust::instr_time::enable_cardinality();
+        }
         celeste_rust::merge_stats::reset();
     }
     let start = std::time::Instant::now();
@@ -377,6 +380,82 @@ fn bench(label: &str, program: &Program, frames: u32, profile: bool) -> Result<(
                     block,
                     text
                 );
+            }
+
+            // Output-cardinality census (CELESTE_INSTR_CARD=1): how much of
+            // each instruction's time went into lanes whose value already
+            // existed elsewhere in the same output vector. `ideal` is
+            // time x distinct/lanes - what the instruction would cost if it
+            // computed each distinct result once; `waste` is the rest.
+            let card_rows = celeste_rust::instr_time::cardinality_report();
+            if !card_rows.is_empty() {
+                let time_of: std::collections::HashMap<(String, usize), std::time::Duration> = rows
+                    .iter()
+                    .map(|(f, id, d, _)| ((f.clone(), *id), *d))
+                    .collect();
+                struct WasteRow {
+                    function: String,
+                    id: usize,
+                    time: std::time::Duration,
+                    waste_us: f64,
+                    stat: celeste_rust::instr_time::CardStat,
+                    is_call: bool,
+                    text: String,
+                    block: String,
+                }
+                let mut waste_rows: Vec<WasteRow> = Vec::new();
+                for (function, id, stat) in &card_rows {
+                    let Some(&time) = time_of.get(&(function.clone(), *id)) else {
+                        continue;
+                    };
+                    let (block, text) = locate
+                        .get(&(function.clone(), *id))
+                        .cloned()
+                        .unwrap_or_else(|| ("?".to_string(), "?".to_string()));
+                    let density = stat.distinct as f64 / stat.lanes.max(1) as f64;
+                    waste_rows.push(WasteRow {
+                        function: function.clone(),
+                        id: *id,
+                        time,
+                        waste_us: time.as_micros() as f64 * (1.0 - density),
+                        stat: *stat,
+                        is_call: text.starts_with("call") || text.contains("= call"),
+                        text,
+                        block,
+                    });
+                }
+                // Calls nest their callee's instructions, which are counted
+                // themselves - excluding calls keeps the totals flat.
+                let flat: Vec<&WasteRow> = waste_rows.iter().filter(|r| !r.is_call).collect();
+                let flat_time_us: f64 = flat.iter().map(|r| r.time.as_micros() as f64).sum();
+                let flat_waste_us: f64 = flat.iter().map(|r| r.waste_us).sum();
+                println!();
+                println!(
+                    "output-cardinality census (non-call): {:.2}s measured, {:.2}s ({:.0}%) spent on lanes duplicating a value already in the same vector",
+                    flat_time_us / 1e6,
+                    flat_waste_us / 1e6,
+                    100.0 * flat_waste_us / flat_time_us.max(1.0)
+                );
+                let mut ranked: Vec<&WasteRow> = flat.clone();
+                ranked.sort_by(|a, b| b.waste_us.total_cmp(&a.waste_us));
+                println!(
+                    "{:<7} {:>9} {:>9} {:>10} {:>9} {:>8}  {}",
+                    "id", "waste(s)", "time (s)", "lanes/ex", "dist/ex", "maxdist", "instruction"
+                );
+                for r in ranked.iter().take(30) {
+                    println!(
+                        "%{:<6} {:>9.3} {:>9.3} {:>10.0} {:>9.1} {:>8}  {}::{}: {}",
+                        r.id,
+                        r.waste_us / 1e6,
+                        r.time.as_secs_f64(),
+                        r.stat.lanes as f64 / r.stat.execs.max(1) as f64,
+                        r.stat.distinct as f64 / r.stat.execs.max(1) as f64,
+                        r.stat.max_distinct,
+                        r.function,
+                        r.block,
+                        r.text
+                    );
+                }
             }
         }
 

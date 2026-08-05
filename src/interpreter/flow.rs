@@ -229,6 +229,19 @@ impl<'a> BoundInterpreterFlow<'a> {
                     if let Some(started) = started {
                         crate::instr_time::record(usize::from(*local_id), started.elapsed());
                     }
+                    if crate::instr_time::cardinality_enabled() {
+                        // After the timed window on purpose - counting distinct
+                        // values costs more than many instructions do.
+                        for result_state in dst.iter() {
+                            if let Some(value) = result_state.local_env.try_get(*local_id) {
+                                crate::instr_time::record_cardinality(
+                                    usize::from(*local_id),
+                                    value,
+                                    result_state.vector_size,
+                                );
+                            }
+                        }
+                    }
                     current_is_a = !current_is_a;
                 }
 
