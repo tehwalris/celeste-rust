@@ -1032,10 +1032,15 @@ mod dict_pricing {
             let a: Vec<Pico8Num> = codes_a.iter().map(|&c| pool_a[c as usize]).collect();
             let b: Vec<Pico8Num> = codes_b.iter().map(|&c| pool_b[c as usize]).collect();
 
-            for (op_name, f) in [
-                ("add", (|x: Pico8Num, y: Pico8Num| x + y) as fn(Pico8Num, Pico8Num) -> Pico8Num),
-                ("div", |x: Pico8Num, y: Pico8Num| x / y),
-            ] {
+            // Macro rather than a fn pointer: an indirect call per lane
+            // blocks inlining and vectorization, and pessimized the direct
+            // baseline 4.5x in the first version of this benchmark (the
+            // interpreter's map2 inlines its closure, so the honest
+            // baseline must too).
+            macro_rules! bench_op {
+                ($op_name:literal, $f:expr) => {{
+                let op_name = $op_name;
+                let f = $f;
                 let t = std::time::Instant::now();
                 let direct: Vec<Pico8Num> = a.iter().zip(&b).map(|(&x, &y)| f(x, y)).collect();
                 let t_direct = t.elapsed();
@@ -1079,7 +1084,10 @@ mod dict_pricing {
                     t_coded,
                     t_coded.as_secs_f64() / t_direct.as_secs_f64(),
                 );
+                }};
             }
+            bench_op!("add", |x: Pico8Num, y: Pico8Num| x + y);
+            bench_op!("div", |x: Pico8Num, y: Pico8Num| x / y);
         }
     }
 }
