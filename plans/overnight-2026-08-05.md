@@ -237,6 +237,33 @@ replay ~2.4% (a constant bench includes), allocator ~2%.
   two-variant (dashing vs not) implementation when it climbs the
   priority list.
 
+## The specialization thread's conclusion -> region skipping (2026-08-06)
+
+Sizing chain: dynamic census says 73% of selects route / 770M vector-arm
+lanes discarded; static classdead v2 (cell-forwarding + buttons) says
+only ~1-3% is *statically* class- or button-determined, because the
+partition cells are legitimately overwritten mid-frame under
+position-derived conditions. Verdict: the prize is dynamic per-fragment
+uniformity, and the mechanism is **region skipping**:
+
+* New terminator (ConditionalSkip): if the mask is uniformly false in
+  this state, jump past the region; otherwise fall through. Never
+  splits, never predicts - the uniformity is observed per state, the
+  fallback is today's exact behavior.
+* guard_region recipe rule wraps the masked speculated regions (dash
+  package first); its verifier must prove the region is effect-free
+  under uniformly-false mask (every store mask-guarded, no other
+  effects, region-defined values consumed only through mask-selects).
+* Expected: converts the discarded-arm compute into skipped compute for
+  uniform states; mixed states unchanged. Sized >=13% of vector work
+  plus chains and dispatch.
+* Philippe's per-button-combo program variants: statically small on its
+  own (buttons fold little beyond routing), still interesting later for
+  deleting the fan-out machinery itself.
+
+Status when this note was written: task #71, IR/interpreter half in
+progress.
+
 ## Ranked next steps
 
 1. ~~Fragment-parallel frame execution~~ DONE as state-parallel flow
