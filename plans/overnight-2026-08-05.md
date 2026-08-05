@@ -84,12 +84,21 @@ bench --frames 44 --profile: cfg:anonymous_61 self 34.7 s (56%),
 filter_branch **9.8 s** (16%; it was 1.3 s at f40 - superlinear in
 lanes, the two hot fork sites again), vm_pack_verify 5.6 s (pack still
 sequential), vm_hash 3.7 s, vm_probe 3.2 s, everything else <1.5 s.
-The two depth levers: (a) the frame body is memory-bound streaming over
-4-byte lanes with <=59 distinct values - dictionary codes (u8) cut its
-bandwidth 4x and this path does NOT benefit from concurrency (measured);
+The two depth levers: (a) the frame body - but NOT via bandwidth:
+perf stat at f40 measured IPC 1.95 and ~2.8 GB/s of DRAM traffic (539M
+cache misses over 12.4 s), nowhere near saturation. The body is compute-
+side with L3-resident per-state working sets, which also reframes the
+parallel-flow regression on this path (likely mutual L3 eviction between
+concurrent states, not bandwidth). The dictionary/per-context case
+therefore rests on the census fact (100% of instruction time recomputes
+values already present in the same vector, <=59 distinct) - the win is
+computing each distinct result once per context, not narrower streams.
 (b) filter_branch = the dash_time forks; if-conversion is measured
 impossible (2.2x), so the fix is run-structured masks or splitting the
-state permanently at those sites.
+state permanently at those sites. Also check why us/lane grows with
+depth at all: per-lane compute is linear in lanes, so the growth is
+per-fragment overhead or merge superlinearity - instr_time at f44 would
+say which.
 
 ## Ranked next steps
 
