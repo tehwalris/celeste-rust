@@ -94,7 +94,11 @@ fn implied_false(
                 || matches!(
                     defs.get(if_false),
                     Some(Instruction::BoolConstant { value: false })
-                );
+                )
+                // The continue-flag chain form: flag_i = select stop_i ?
+                // false-ish : flag_{i-1} - the false arm is itself
+                // implied-false, recursively.
+                || implied_false(*if_false, mask, defs);
             false_arm_falsy && implied_false(*condition, mask, defs)
         }
         _ => false,
@@ -151,7 +155,6 @@ fn plan(
     tail_uses.extend(block.terminator.1.get_used_locals());
 
     let mut escapes = Vec::new();
-    let mut store_targets: FxHashSet<LocalId> = FxHashSet::default();
     for (idx, (id, instr)) in region.iter().enumerate() {
         match instr {
             Instruction::Store { target, source } => {
@@ -203,11 +206,11 @@ fn plan(
                     !intervening_store,
                     "cell stored between its load and the masked store".to_string(),
                 )?;
-                require(
-                    !store_targets.contains(target),
-                    "cell stored twice in region".to_string(),
-                )?;
-                store_targets.insert(*target);
+                // Repeated stores to one cell are fine: each store's own
+                // old-arm freshness check (load of the cell with no
+                // intervening store) guarantees that under a false mask
+                // the chain rewrites the cell's running value at every
+                // step.
             }
             other => {
                 require(

@@ -379,6 +379,9 @@ fn interpret_prepared_cfg_inner(
                             crate::interpreter::value::MaybeVector::Scalar(false)
                         ) | crate::interpreter::value::Value::Nil(_)
                     );
+                    if crate::op_census::enabled() {
+                        crate::op_census::record_skip(uniformly_false, state.vector_size);
+                    }
                     if uniformly_false {
                         skip_states.push(state);
                     } else {
