@@ -145,17 +145,27 @@ a Mutex/retention-bearing cache. What it rules out matters more: the
 only lever that reaches it is per-context/dictionary evaluation. That is
 now unambiguously the top item.
 
-## Per-context evaluation priced (dict_pricing microbenchmark)
+## Per-context evaluation priced and CLOSED (dict_pricing microbenchmark)
 
-At real cardinalities over 2M lanes: on-the-fly per-op dictionaries are
-**1.8-10.9x slower** than direct evaluation (hash-coding per lane costs
-more than the arithmetic) - that idea is dead. Pre-coded inputs win only
-~1.6x at the op level, because arithmetic was never the cost; lane
-traffic is. So the representation project's honest value proposition is
-**end-to-end u8 narrowness** (~4x less traffic through ops, row hashing
-- which IS bandwidth-bound at 42 GB/s - filters and dedup), and it only
-pays as a whole-pipeline change: codes in, codes out, decode at the
-boundaries. Scope accordingly.
+Two rounds - the first accidentally pessimized the direct baseline 4.5x
+with a fn-pointer call per lane. With honest inlined baselines, at real
+cardinalities over 2M lanes:
+
+  on-the-fly dict:  1.9-20.8x slower (hash-coding per lane >> arithmetic)
+  pre-coded inputs: add 1.03-1.35x (slower or equal!), div 0.61-0.83x
+
+**Per-context evaluation loses on cheap arithmetic even when the codes
+are free.** The dictionary/context branch of state-structure.md is
+measured out. What remains of the representation idea: u8 columns for
+the bandwidth-bound phases only (row hashing runs at 42 GB/s - actual
+DRAM saturation) and the ~4x memory footprint at depth. Neither
+justifies whole-pipeline code plumbing on its own; revisit only if
+memory becomes the binding constraint again.
+
+Next session's honest top items are therefore: (1) the two dash_time
+fork sites (filter_branch superlinear at depth), (2) whatever a fresh
+profile of the frame body's ~55% shows beyond instruction time, (3)
+memory-side work if the search pushes past frame 45.
 
 ## Ranked next steps
 
