@@ -57,3 +57,34 @@ full test suite + deep run results recorded below as they complete.
 ## Results (filled in as runs complete)
 
 * deoptcheck 34: GREEN (235 forced deopts, identical every frame).
+* verify 34: GREEN (12.1s). Full cargo test suite: GREEN.
+* **Deep run PAST THE f58 WALL** (frontier-only + deopt, --frames 62):
+  completed in 179.9s / 16.36 GB peak - note this beats the old
+  f58-and-stop run (476s / 34.5GB, non-frontier) while going 4 frames
+  further. Deopt events: f59 4 states/719k lanes, f60 9/1.77M,
+  f61 16/1.93M, f62 21/2.18M (total 50 states / 6.6M lanes re-ran under
+  plain). The trigger is exactly the diagnosed premise
+  (assert_true %3695, #objects==1, kill frames empty the objects array).
+  Frontier new-lanes growth bends from x1.3-1.4 (f36-42) to x1.05-1.10
+  (f50-58); f62 frontier = 2.46M new lanes, visited total 27.4M rows.
+* Deopt cost observation: a whole boundary state deopts if ANY of its
+  lanes dies mid-frame, so by f62 over half the pre-subtract lanes ran
+  under plain. The dead-countdown lineages (0 objects for 15 frames)
+  also deopt every frame by construction. Two future levers, both in
+  the specialization-framework spirit (NO death special-casing):
+  (a) finer deopt granularity (catch the premise failure at the split
+  state mid-frame, not the boundary state), (b) a second specialized
+  program for the dead-room class, once program families exist.
+
+## 2. Win probe + frame-100 attempt
+
+`count_room_x_lanes` (inspect.rs): lanes with global room.x == 2 at a
+boundary have exited room (1,0) - next_room() writes the index. bench
+now prints per-frame elapsed/lanes/RSS and the first win frame. For the
+earliest-arrival frontier search, first win frame = optimal TAS length
+under the stated abstractions. Expected: frame 100 exactly (2022-proven
+optimum, witness in tas/room_1_0_exit_frame_100.txt) - anything else is
+a bug, so the deep run is an end-to-end differential against 2022.
+
+* Frame-100 run (--frames 102, frontier + deopt): launched, results
+  below when complete.
