@@ -111,16 +111,34 @@ pub fn interpret_select(condition: &Value, if_true: &Value, if_false: &Value) ->
         let MaybeVector::Vector(mask) = mask else {
             unreachable!("uniform conditions are handled above")
         };
-        let at = |v: &MaybeVector<T>, i: usize| match v {
-            MaybeVector::Scalar(s) => s.clone(),
-            MaybeVector::Vector(v) => v[i].clone(),
-        };
         let t = crate::op_census::start();
-        let out: Vec<T> = mask
-            .iter()
-            .enumerate()
-            .map(|(i, take_true)| if *take_true { at(a, i) } else { at(b, i) })
-            .collect();
+        // Specialized per arm representation: select is the largest flat
+        // instruction cost at depth (13.4 s at frame 44), and the generic
+        // loop paid a per-lane match on each arm. Each specialization is a
+        // branchless-friendly loop the compiler can vectorize; the
+        // scalar/scalar case in particular is a mask-to-value map with no
+        // per-lane indexing at all.
+        let out: Vec<T> = match (a, b) {
+            (MaybeVector::Scalar(a), MaybeVector::Scalar(b)) => mask
+                .iter()
+                .map(|&take_true| if take_true { a.clone() } else { b.clone() })
+                .collect(),
+            (MaybeVector::Scalar(a), MaybeVector::Vector(b)) => mask
+                .iter()
+                .zip(b.iter())
+                .map(|(&take_true, b)| if take_true { a.clone() } else { b.clone() })
+                .collect(),
+            (MaybeVector::Vector(a), MaybeVector::Scalar(b)) => mask
+                .iter()
+                .zip(a.iter())
+                .map(|(&take_true, a)| if take_true { a.clone() } else { b.clone() })
+                .collect(),
+            (MaybeVector::Vector(a), MaybeVector::Vector(b)) => mask
+                .iter()
+                .zip(a.iter().zip(b.iter()))
+                .map(|(&take_true, (a, b))| if take_true { a.clone() } else { b.clone() })
+                .collect(),
+        };
         crate::op_census::record(
             crate::op_census::Cat::Select,
             mask.len(),
