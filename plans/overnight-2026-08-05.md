@@ -482,6 +482,50 @@ objects.1.rem.x etc. Findings:
   boundary dedup on the current abstraction. Remaining levers: per-lane
   speed, and intra-frame collapse timing (task #74).
 
+## Evening 2026-08-06: frontier-only search, the speed set, and the f59 gate
+
+* **Frontier-only expansion landed** (Philippe's insight; env-gated,
+  CELESTE_FRONTIER_ONLY): expand only never-before-seen rows. Enabled by
+  pinning the gameplay-dead timer globals (frames/seconds/minutes/
+  deaths) - the frames counter had made all cross-frame rows distinct.
+  f42: 14.65s/2.74GB/2.18M lanes -> 9.99s/1.41GB/944k new (with the
+  freeze partition key). Hash-only visited set; proof-grade needs exact
+  rows (or the dense encoding below).
+* **dash_effect_time clamp**: decrements forever, only read is `> 0` -
+  clamped at 0 (no-op in every room). Dedup fraction at f38 jumped from
+  ~15% to ~45% of pre-subtract lanes.
+* **widencheck landed** (Philippe's certification): search with rem-only
+  widening + post-hoc conservative widenings == widen-every-boundary
+  run, frame by frame. PASSES through f38; the pins/clamp are certified
+  pure quotients. p_jump/p_dash widening REJECTED (asymmetric
+  over-approximation; see the make_state_abstract note).
+* **Speed set (Opus investigation)**: reachable spd.x = 65 values,
+  spd.y = 106, joint 3684 pairs (12 bits); flags 3696 (12 bits);
+  full state key ~39 bits in a u64 with position as the sparse outer
+  index. Ice (0.05 accel) and springs (x0.2) destroy the lattice -
+  absent in room (1,0). Dense-encoding design is the open lever on the
+  ~9x per-state cost gap vs 2022.
+* **State-count gap vs 2022 explained** (control-frame-1 comparison, 24
+  vs 7 rows): freeze-intermediate copies (~x3 on dash states; 2022
+  schedules dash successors 2 frames ahead), dominated input variants
+  (~x2; 2022 prunes jump+dash-type combos), death lineages (2022 prunes
+  deaths), compounding until reconvergence. Same fields, same physics -
+  the gap is counting semantics, priced in by our genericness choices.
+* **f59 landmine**: first kill frame. kill_player empties objects
+  mid-update; the collapsed loops' #objects == 1 premise assert fires
+  (loudly, as designed) - recipe-only unsoundness, plain program fine.
+  Boundary death pruning (built, env-gated) cannot catch it (mid-frame).
+  Fix: __prune_state builtin at kill_player's head via recipe entry =
+  death pruning at the kill site. BLOCKED on Philippe's approval of
+  death pruning as default search semantics; until then every run
+  > f58 stops at the guard. Probe confirms zero boundary death states
+  through f58 (frontier there: 18.95M lanes, 476s/34.5GB non-frontier).
+* 2022 comparison, properly aligned: at their control 29 (our f53):
+  24s/405MB theirs vs ~200s/18GB ours (frontier-only) - ~8-9x time,
+  ~45x memory. Full-room estimate: theirs ~5-15 min, ours ~3-5 h
+  projected IF the new-lane curve bends like theirs (their accumulated
+  set reaches ~9.45M by the win frame; ours ~75x that ratio).
+
 ## Ranked next steps
 
 1. ~~Fragment-parallel frame execution~~ DONE as state-parallel flow
