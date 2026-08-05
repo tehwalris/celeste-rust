@@ -340,19 +340,6 @@ impl AbstractRun {
         } else {
             new_states.into_iter().map(make_state_abstract).collect()
         };
-        let new_states: Vec<State> = if std::env::var_os("CELESTE_PRUNE_DEATHS").is_some() {
-            let before = new_states.len();
-            let kept: Vec<State> = new_states
-                .into_iter()
-                .filter(|s| !crate::interpreter::inspect::is_death_state(s))
-                .collect();
-            if kept.len() != before {
-                println!("  (death pruning: dropped {} states)", before - kept.len());
-            }
-            kept
-        } else {
-            new_states
-        };
         self.states_before_merge.push(new_states.len());
         self.states = {
             let _trace = crate::interpreter::tracing::TraceSpan::new(

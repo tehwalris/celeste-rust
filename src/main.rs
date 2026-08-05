@@ -375,17 +375,6 @@ __reset_button_states()
         // Make states abstract (widen player.rem to interval)
         new_states = new_states.into_iter().map(make_state_abstract).collect();
 
-        // Death pruning (CELESTE_PRUNE_DEATHS=1): drop the delay_restart
-        // window states after kill_player. Sound for earliest-win search;
-        // see inspect::is_death_state.
-        if std::env::var_os("CELESTE_PRUNE_DEATHS").is_some() {
-            let before = new_states.len();
-            new_states.retain(|s| !crate::interpreter::inspect::is_death_state(s));
-            if new_states.len() != before {
-                println!("  (death pruning: dropped {} states)", before - new_states.len());
-            }
-        }
-
         let before_vec = new_states.len();
 
         // Vectorize states (GC + materialize + merge by shape)

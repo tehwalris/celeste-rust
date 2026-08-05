@@ -529,33 +529,6 @@ pub fn describe_objects(state: &State) -> String {
     format!("objects: {} [{}]", items.len(), parts.join(", "))
 }
 
-/// True if this state is a death lineage: no live `player` and no
-/// `player_spawn` in the objects array. This is the 15-frame
-/// `delay_restart` window after `kill_player` destroyed the player (the
-/// initial spawn phase has a `player_spawn`, so it is not matched).
-///
-/// Used by the env-gated death pruning (CELESTE_PRUNE_DEATHS=1): dropping
-/// these states is sound for single-room earliest-win search - any
-/// post-restart trajectory is a time-shifted from-scratch run, so it can
-/// never improve the optimal frame count - and it keeps reloaded-room states
-/// (which falsify the collapsed-loop `#objects == 1` premises, first
-/// reachable at frame 59) out of the search. Without the gate the premise
-/// assert fails loudly instead - deliberately, so the pruning stays a
-/// conscious choice rather than a silent default.
-pub fn is_death_state(state: &State) -> bool {
-    let helper = StateHelper::new(state);
-    let Some(objects_array_id) = helper.get_objects_array_id() else {
-        return false;
-    };
-    for type_name in ["player", "player_spawn"] {
-        match helper.find_objects_by_type(objects_array_id, type_name) {
-            Ok(found) if !found.is_empty() => return false,
-            _ => {}
-        }
-    }
-    true
-}
-
 /// Make marked heap values abstract by replacing concrete numbers with intervals.
 /// This is the key function for abstract interpretation - it widens concrete values
 /// to represent uncertainty (e.g., player's sub-pixel position can be anywhere in [-0.5, 0.5)).
