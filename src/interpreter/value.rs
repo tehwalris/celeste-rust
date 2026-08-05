@@ -39,7 +39,29 @@ impl<T: std::fmt::Debug + Clone + PartialEq + Eq> Eq for MaybeVector<T> {}
 
 impl<T: std::fmt::Debug + Clone + PartialEq + Eq> MaybeVector<T> {
     /// A vector value from freshly-built lanes.
-    pub fn vector(lanes: Vec<T>) -> Self {
+    ///
+    /// Collapses a uniform payload to `Scalar` on the spot. The cardinality
+    /// census found instruction outputs that are constant across ~50k lanes
+    /// (a select whose arms agree wherever its mask varies, a comparison that
+    /// resolves the same way in every lane of a scalar-specialised fragment) -
+    /// and a uniform vector is pure downstream cost: every op over it is
+    /// per-lane work a `Scalar` gets for free, and it re-enters the merge's
+    /// dedup key where a `Scalar` drops out. The check early-exits at the
+    /// first differing lane, so genuinely varying vectors pay a few
+    /// comparisons; the full-scan cost lands only on vectors that were about
+    /// to make everything downstream more expensive.
+    ///
+    /// A single-lane payload also collapses, matching what `filter` already
+    /// did. An empty payload stays a vector - `Scalar` cannot represent
+    /// "no lanes", and zero-lane states are the caller's bug to surface.
+    pub fn vector(mut lanes: Vec<T>) -> Self {
+        let uniform = match lanes.split_first() {
+            Some((first, rest)) => rest.iter().all(|v| v == first),
+            None => false,
+        };
+        if uniform {
+            return MaybeVector::Scalar(lanes.swap_remove(0));
+        }
         MaybeVector::Vector(std::sync::Arc::new(lanes))
     }
     pub fn map(&self, f: impl Fn(&T) -> T) -> Self {

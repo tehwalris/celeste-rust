@@ -1967,17 +1967,19 @@ __print(flr(high))
         let result_states =
             interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
 
-        // Expected output:
+        // Expected output. Uniform vector results collapse to scalars at
+        // construction (`MaybeVector::vector`), so an all-equal comparison
+        // result is a plain "true"/"false"/"1" rather than "V[...]".
         // true        - 0 < 1.5
         // true        - 1 < 1.8
-        // true        - V[0, 1] < 1.5 -> V[true, true] which prints as "true" (both true)
-        // true        - 1 < V[1.5, 1.8] -> V[true, true]
-        // true        - V[0, 1] < V[1.5, 1.8] -> V[true, true]
+        // true        - V[0, 1] < 1.5 -> uniform, collapses to scalar true
+        // true        - 1 < V[1.5, 1.8] -> uniform true
+        // true        - V[0, 1] < V[1.5, 1.8] -> uniform true
         // true        - (0 + 1) < 1.5
         // false       - (1 + 1) < 1.8 (2 < 1.8 is false)
         // V[true, false] - (V[0, 1] + 1) < V[1.5, 1.8] -> V[1, 2] < V[1.5, 1.8] -> V[true, false]
         // V[0, 1]     - low unchanged
-        // 1           - flr(V[1.5, 1.8]) -> V[1, 1] but if all same, shows as scalar
+        // 1           - flr(V[1.5, 1.8]) -> uniform 1
 
         assert_eq!(result_states.len(), 1);
         assert_eq!(
@@ -1985,14 +1987,14 @@ __print(flr(high))
             vec![
                 "true",
                 "true",
-                "V[true, true]",
-                "V[true, true]",
-                "V[true, true]",
+                "true",
+                "true",
+                "true",
                 "true",
                 "false",
                 "V[true, false]",
                 "V[0, 1]",
-                "V[1, 1]",
+                "1",
             ]
         );
     }
