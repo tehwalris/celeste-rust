@@ -1163,292 +1163,60 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
     result
 }
 
-/// A normalized state representation for efficient comparison.
-/// This is the state after GC and with deterministic heap IDs.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct NormalizedState {
-    /// The shape (structure with vectorizable values normalized)
-    shape: StateShape,
-    /// The actual vectorizable values, in a deterministic order
-    /// This allows us to compare states for equality
-    vectorizable_values: Vec<VectorizableValue>,
-}
-
-/// A vectorizable value extracted from a state
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum VectorizableValue {
-    Number(Pico8Num),
-    NumberInterval(Pico8Num, Pico8Num),  // low, high
-    Bool(bool),
-    // For vectors, we store sorted unique values to normalize
-    NumberVector(Vec<Pico8Num>),
-    NumberIntervalVector(Vec<(Pico8Num, Pico8Num)>),
-    BoolVector(Vec<bool>),
-}
-
-fn extract_vectorizable_value(value: &Value) -> Option<VectorizableValue> {
-    match value {
-        Value::Number(MaybeVector::Scalar(n)) => Some(VectorizableValue::Number(*n)),
-        Value::Number(MaybeVector::Vector(nums)) => {
-            let mut raw: Vec<Pico8Num> = nums.as_ref().clone();
-            raw.sort();
-            raw.dedup();
-            Some(VectorizableValue::NumberVector(raw))
-        }
-        Value::NumberInterval(MaybeVector::Scalar(interval)) => {
-            Some(VectorizableValue::NumberInterval(interval.low, interval.high))
-        }
-        Value::NumberInterval(MaybeVector::Vector(intervals)) => {
-            let mut raw: Vec<(Pico8Num, Pico8Num)> = intervals.iter()
-                .map(|i| (i.low, i.high))
-                .collect();
-            raw.sort();
-            raw.dedup();
-            Some(VectorizableValue::NumberIntervalVector(raw))
-        }
-        Value::Bool(MaybeVector::Scalar(b)) => Some(VectorizableValue::Bool(*b)),
-        Value::Bool(MaybeVector::Vector(bools)) => {
-            let mut raw: Vec<bool> = bools.as_ref().clone();
-            raw.sort();
-            raw.dedup();
-            Some(VectorizableValue::BoolVector(raw))
-        }
-        _ => None,
-    }
-}
-
-fn extract_vectorizable_values_from_state(state: &State) -> Vec<VectorizableValue> {
-    let mut values = Vec::new();
-
-    // Extract from heap (in order, skip empty slots)
-    for i in 0..state.heap.len() {
-        let id = HeapId::from_raw(i);
-        let Some(heap_value) = state.heap.get_opt(id) else {
-            continue;
-        };
-        match heap_value {
-            HeapValue::Value(v) => {
-                if let Some(vv) = extract_vectorizable_value(v) {
-                    values.push(vv);
-                }
-            }
-            HeapValue::Closure(_, captures) => {
-                for v in captures {
-                    if let Some(vv) = extract_vectorizable_value(v) {
-                        values.push(vv);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // Extract from local_env (sorted by key for determinism)
-    let mut local_entries: Vec<_> = state.local_env.iter().collect();
-    local_entries.sort_by_key(|(k, _)| *k);
-    for (_, v) in local_entries {
-        if let Some(vv) = extract_vectorizable_value(v) {
-            values.push(vv);
-        }
-    }
-
-    // Extract from outer_local_envs
-    for env in &state.outer_local_envs {
-        let mut entries: Vec<_> = env.iter().collect();
-        entries.sort_by_key(|(k, _)| *k);
-        for (_, v) in entries {
-            if let Some(vv) = extract_vectorizable_value(v) {
-                values.push(vv);
-            }
-        }
-    }
-
-    values
-}
-
-/// Normalize a state for comparison purposes.
-/// Two states that are "the same" will have equal NormalizedState representations.
-pub fn normalize_state_for_comparison(state: &State) -> NormalizedState {
-    let t = crate::op_census::start();
-    // First, GC and renumber the state to get deterministic heap IDs
-    let mut state = state.clone();
-    state.gc();
-
-    let shape = shape_of_state(&state);
-    let vectorizable_values = extract_vectorizable_values_from_state(&state);
-
-    crate::op_census::record(
-        crate::op_census::Cat::Normalize,
-        state.vector_size,
-        0,
-        t,
-    );
-    NormalizedState {
-        shape,
-        vectorizable_values,
-    }
-}
-
-/// Diagnostic for a suspected soundness hole (`CELESTE_CHECK_UNION=1`).
+/// Compute union and diff of two state sets at a `hint_normalize` block.
 ///
-/// `NormalizedState` compares vector columns by their *sorted unique value
-/// sets*, independently per column. That is an over-approximation of state
-/// equality in the dangerous direction: two states whose columns hold the
-/// same value sets but paired into different rows compare EQUAL, and
-/// `union_diff_states` then drops one of them as already-seen - silently
-/// losing part of the search space. The differential verifier cannot see
-/// it, because both programs share the mechanism.
+/// Given `accumulated` (states from previous fixed-point rounds) and
+/// `potentially_new` (states just arrived), returns the union and the
+/// states that were not already accumulated - the ones that still need to
+/// be executed onward.
 ///
-/// This tracker recomputes an order-insensitive digest of the *actual lane
-/// rows* (a commutative fold of per-row hashes, plus the shape hash and
-/// vector size) and reports every state the coarse equality would drop
-/// whose row digest was never seen for that coarse class.
-struct UnionExactCheck {
-    /// coarse-normalized form -> the exact row digests seen under it.
-    by_coarse: FxHashMap<NormalizedState, FxHashSet<u64>>,
-}
-
-impl UnionExactCheck {
-    fn new() -> Option<Self> {
-        std::env::var_os("CELESTE_CHECK_UNION").map(|_| Self {
-            by_coarse: FxHashMap::default(),
-        })
-    }
-
-    fn row_digest(state: &State) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let vector_values = collect_vector_values(state);
-        let row_hashes = hash_rows(&vector_values, state.vector_size);
-        // Commutative combine: lane order must not matter, row content must.
-        let rows: u64 = row_hashes
-            .iter()
-            .fold(0u64, |acc, h| acc.wrapping_add(h.wrapping_mul(0x2545_F491_4F6C_DD1D)));
-        let mut hasher = rustc_hash::FxHasher::default();
-        shape_of_state(state).hash(&mut hasher);
-        state.vector_size.hash(&mut hasher);
-        rows.hash(&mut hasher);
-        hasher.finish()
-    }
-
-    /// Record a state that survived (was considered new).
-    fn record_new(&mut self, normalized: &NormalizedState, state: &State) {
-        self.by_coarse
-            .entry(normalized.clone())
-            .or_default()
-            .insert(Self::row_digest(state));
-    }
-
-    /// A state the coarse equality is about to drop: complain if its rows
-    /// were never actually seen.
-    fn check_dropped(&mut self, normalized: &NormalizedState, state: &State) {
-        let digest = Self::row_digest(state);
-        let seen = self
-            .by_coarse
-            .entry(normalized.clone())
-            .or_default();
-        if seen.insert(digest) {
-            eprintln!(
-                "UNION-DROP MISMATCH: coarse-equal state with UNSEEN row digest dropped \
-                 ({} lanes) - per-column value-set equality is losing real states",
-                state.vector_size
-            );
-        }
-    }
-}
-
-/// Compute union and diff of two state sets.
+/// In the current programs this is a checked pass-through, not a real
+/// dedup, because both structural facts below hold and are guarded:
 ///
-/// Given `accumulated` (states already seen) and `potentially_new` (states just arrived),
-/// returns:
-/// - `union`: All states (accumulated + truly new ones)
-/// - `actually_new`: Only the states that weren't already in accumulated
+///   * The arrivals come from one `vectorize_states` call, which emits
+///     exactly one state per shape group - so they are pairwise distinct
+///     by construction (checked: pairwise-distinct direct shape hashes;
+///     the arrivals are post-gc, so their shapes compare canonically).
+///   * Every hint fixed point converges in one round, so `accumulated` is
+///     empty (measured: merge_hint_normalize span count == frames x hint
+///     blocks, exactly).
 ///
-/// This is the key operation for fixed-point iteration at hint_normalize blocks.
+/// There used to be a real dedup here, comparing states by their
+/// per-column sorted unique value sets. That is an over-approximation of
+/// state equality in the unsound direction - two states with equal value
+/// sets but different row pairings compared EQUAL and one would be
+/// silently dropped from the search, invisibly to the differential
+/// verifier (both programs shared the mechanism). It never fired (the
+/// facts above), so it was removed rather than fixed. If either guard
+/// ever fails, this panics with instructions instead of guessing:
+/// a correct dedup must compare actual lane-row sets, which is the same
+/// computation `vectorize_states`' dedup already performs - build it on
+/// that machinery, not on per-column summaries.
 pub fn union_diff_states(
     accumulated: Vec<State>,
     potentially_new: Vec<State>,
 ) -> (Vec<State>, Vec<State>) {
     let _trace = TraceSpan::new("union_diff_states", "vectorize");
-    let mut exact_check = UnionExactCheck::new();
-    if accumulated.is_empty() {
-        // The states just arrived from one `vectorize_states` call, which
-        // emits exactly one state per shape group - so they are pairwise
-        // distinct by construction and there is nothing to deduplicate.
-        // That claim is checked, not assumed: the direct shapes (the
-        // arrivals are post-gc, so no re-canonicalisation is needed) must
-        // be pairwise distinct. If the guard ever fails - a different
-        // caller, a second fixed-point round, a shape-hash collision -
-        // fall through to the full canonical comparison, which is what
-        // this path always did. Skipping it matters: the canonical
-        // comparison clones and gc's every state, 0.81 s at frame 40 for
-        // a dedup that never removed anything.
-        let mut shape_hashes: FxHashSet<u64> = FxHashSet::default();
-        let all_distinct = potentially_new
-            .iter()
-            .all(|state| shape_hashes.insert(shape_of_state(state).cached_hash));
-        if all_distinct && exact_check.is_none() {
-            return (potentially_new.clone(), potentially_new);
-        }
-
-        // First, deduplicate within potentially_new
-        let mut seen: FxHashSet<NormalizedState> = FxHashSet::default();
-        let mut unique = Vec::new();
-        for state in potentially_new {
-            let normalized = normalize_state_for_comparison(&state);
-            if !seen.contains(&normalized) {
-                if let Some(check) = exact_check.as_mut() {
-                    check.record_new(&normalized, &state);
-                }
-                seen.insert(normalized);
-                unique.push(state);
-            } else if let Some(check) = exact_check.as_mut() {
-                check.check_dropped(&normalized, &state);
-            }
-        }
-        return (unique.clone(), unique);
-    }
-
-    if potentially_new.is_empty() {
-        // Nothing new
-        return (accumulated, vec![]);
-    }
-
-    // Build a set of normalized accumulated states for fast lookup
-    let accumulated_normalized: FxHashSet<NormalizedState> = accumulated
+    assert!(
+        accumulated.is_empty(),
+        "a hint_normalize fixed point took a second round: union_diff_states \
+         no longer contains a state dedup (the old per-column one was unsound \
+         and never fired). Implement an exact dedup on the vectorize_states \
+         row machinery before relying on multi-round fixed points."
+    );
+    let mut shape_hashes: FxHashSet<u64> = FxHashSet::default();
+    let all_distinct = potentially_new
         .iter()
-        .map(normalize_state_for_comparison)
-        .collect();
-    if let Some(check) = exact_check.as_mut() {
-        for state in accumulated.iter() {
-            let normalized = normalize_state_for_comparison(state);
-            check.record_new(&normalized, state);
-        }
-    }
-
-    // Partition potentially_new into truly new vs already seen
-    // Also deduplicate within potentially_new
-    let mut seen: FxHashSet<NormalizedState> = accumulated_normalized;
-    let mut actually_new = Vec::new();
-    for state in potentially_new {
-        let normalized = normalize_state_for_comparison(&state);
-        if !seen.contains(&normalized) {
-            if let Some(check) = exact_check.as_mut() {
-                check.record_new(&normalized, &state);
-            }
-            seen.insert(normalized);
-            actually_new.push(state);
-        } else if let Some(check) = exact_check.as_mut() {
-            check.check_dropped(&normalized, &state);
-        }
-    }
-
-    // Union = accumulated + actually_new
-    let mut union = accumulated;
-    union.extend(actually_new.clone());
-
-    (union, actually_new)
+        .all(|state| shape_hashes.insert(shape_of_state(state).cached_hash));
+    assert!(
+        all_distinct,
+        "hint_normalize arrivals are not pairwise shape-distinct (or two \
+         shapes collided in a 64-bit hash): vectorize_states should emit one \
+         state per shape. union_diff_states no longer contains a state dedup; \
+         implement an exact one on the vectorize_states row machinery."
+    );
+    (potentially_new.clone(), potentially_new)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -30,8 +30,6 @@ pub enum Cat {
     Filter,
     /// `expand_lanes`: every vector doubles in place.
     Expand,
-    /// `normalize_state_for_comparison`: clone + GC + per-column sorts.
-    Normalize,
     /// Heap GC walks.
     Gc,
     _Count,
@@ -357,7 +355,6 @@ pub fn report() {
         (Cat::DedupBucket, "dedup bucket"),
         (Cat::Filter, "state filter"),
         (Cat::Expand, "expand_lanes"),
-        (Cat::Normalize, "normalize"),
         (Cat::Gc, "gc"),
     ];
     eprintln!();
