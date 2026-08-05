@@ -214,6 +214,51 @@ pub fn record_filter_runs(reason_index: usize, runs: usize) {
     FILTER_REASON_RUNS[reason_index].fetch_add(runs as u64, Ordering::Relaxed);
 }
 
+/// Cross-fragment op-memo pricing: how many vector-input binary ops and
+/// selects recur with *identical input Arcs* within one frame. Fragments
+/// born from an UnknownBool duplication share unchanged column Arcs, so an
+/// op over shared inputs recomputes the same output in every fragment - a
+/// per-frame memo keyed on (op, input pointers) would return a clone
+/// instead. These counters price that memo before it is built.
+static MEMO_CALLS: AtomicU64 = AtomicU64::new(0);
+static MEMO_HITS: AtomicU64 = AtomicU64::new(0);
+static MEMO_HIT_ELEMS: AtomicU64 = AtomicU64::new(0);
+static MEMO_ELEMS: AtomicU64 = AtomicU64::new(0);
+
+lazy_static::lazy_static! {
+    /// Seen memo keys plus strong refs to every probed Arc, so a freed
+    /// vector's address cannot be reused and fake a hit. Diagnostic only,
+    /// cleared with the rest of the census.
+    static ref MEMO_SEEN: std::sync::Mutex<(
+        rustc_hash::FxHashSet<u64>,
+        Vec<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    )> = std::sync::Mutex::new((rustc_hash::FxHashSet::default(), Vec::new()));
+}
+
+/// Probe the pricing memo with a pre-hashed (op, input pointers) key.
+pub fn memo_probe(
+    key: u64,
+    elems: usize,
+    holders: Vec<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+) {
+    let mut seen = MEMO_SEEN.lock().unwrap();
+    let hit = !seen.0.insert(key);
+    if !hit {
+        seen.1.extend(holders);
+    }
+    drop(seen);
+    record_memo_probe(hit, elems);
+}
+
+pub fn record_memo_probe(hit: bool, elems: usize) {
+    MEMO_CALLS.fetch_add(1, Ordering::Relaxed);
+    MEMO_ELEMS.fetch_add(elems as u64, Ordering::Relaxed);
+    if hit {
+        MEMO_HITS.fetch_add(1, Ordering::Relaxed);
+        MEMO_HIT_ELEMS.fetch_add(elems as u64, Ordering::Relaxed);
+    }
+}
+
 pub fn record_filter_source(src_elems: usize, elem_size: usize) {
     FILTER_SRC_ELEMS.fetch_add(src_elems as u64, Ordering::Relaxed);
     FILTER_SRC_BYTES.fetch_add((src_elems * elem_size) as u64, Ordering::Relaxed);
@@ -259,6 +304,15 @@ pub fn record(cat: Cat, elems: usize, bytes: usize, started: Option<std::time::I
 /// cost of an op as the lane count grows is the whole question behind
 /// tiling, and cumulative totals hide it.
 pub fn reset() {
+    {
+        let mut seen = MEMO_SEEN.lock().unwrap();
+        seen.0.clear();
+        seen.1.clear();
+    }
+    MEMO_CALLS.store(0, Ordering::Relaxed);
+    MEMO_HITS.store(0, Ordering::Relaxed);
+    MEMO_HIT_ELEMS.store(0, Ordering::Relaxed);
+    MEMO_ELEMS.store(0, Ordering::Relaxed);
     for i in 0..N {
         CALLS[i].store(0, Ordering::Relaxed);
         ELEMS[i].store(0, Ordering::Relaxed);
@@ -381,6 +435,18 @@ pub fn report() {
             kept as f64 / 1e6,
             FILTER_REASON_NANOS[i].load(Ordering::Relaxed) as f64 / 1e9,
             kept as f64 / runs.max(1) as f64,
+        );
+    }
+    let memo_calls = MEMO_CALLS.load(Ordering::Relaxed);
+    if memo_calls > 0 {
+        let hits = MEMO_HITS.load(Ordering::Relaxed);
+        eprintln!(
+            "op memo pricing: {} vector-op calls, {} ({:.1}%) with previously seen input Arcs; {:.1} of {:.1} M output elems would be memo clones",
+            memo_calls,
+            hits,
+            100.0 * hits as f64 / memo_calls as f64,
+            MEMO_HIT_ELEMS.load(Ordering::Relaxed) as f64 / 1e6,
+            MEMO_ELEMS.load(Ordering::Relaxed) as f64 / 1e6,
         );
     }
     let gc_before = GC_CELLS_BEFORE.load(Ordering::Relaxed);

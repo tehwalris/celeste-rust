@@ -102,6 +102,8 @@ pub fn interpret_select(condition: &Value, if_true: &Value, if_false: &Value) ->
     if if_true == if_false {
         return Ok(if_true.clone());
     }
+    // A mixed-mask select that actually combines lanes: price the memo.
+    memo_price(0x5e1e_c7_5e1e_c7u64, &[condition, if_true, if_false]);
 
     fn pick<T: std::fmt::Debug + Clone + PartialEq + Eq>(
         mask: &MaybeVector<bool>,
@@ -174,7 +176,78 @@ pub fn interpret_select(condition: &Value, if_true: &Value, if_false: &Value) ->
         )),
     }
 }
+/// The vector Arc inside a value, as (address, type-erased strong ref).
+fn vec_arc_of(v: &Value) -> Option<(usize, std::sync::Arc<dyn std::any::Any + Send + Sync>)> {
+    match v {
+        Value::Number(MaybeVector::Vector(a)) => {
+            Some((std::sync::Arc::as_ptr(a) as usize, a.clone()))
+        }
+        Value::NumberInterval(MaybeVector::Vector(a)) => {
+            Some((std::sync::Arc::as_ptr(a) as usize, a.clone()))
+        }
+        Value::Bool(MaybeVector::Vector(a)) => {
+            Some((std::sync::Arc::as_ptr(a) as usize, a.clone()))
+        }
+        _ => None,
+    }
+}
+
+fn value_lanes(v: &Value) -> usize {
+    match v {
+        Value::Number(MaybeVector::Vector(a)) => a.len(),
+        Value::NumberInterval(MaybeVector::Vector(a)) => a.len(),
+        Value::Bool(MaybeVector::Vector(a)) => a.len(),
+        _ => 1,
+    }
+}
+
+/// Price the cross-fragment op memo (census only): would this vector op's
+/// inputs have been seen before, Arc-identically, this frame?
+fn memo_price(tag: u64, inputs: &[&Value]) {
+    if !crate::op_census::enabled() {
+        return;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+    tag.hash(&mut hasher);
+    let mut holders = Vec::new();
+    let mut elems = 1usize;
+    let mut any_vector = false;
+    for value in inputs {
+        match vec_arc_of(value) {
+            Some((ptr, holder)) => {
+                any_vector = true;
+                ptr.hash(&mut hasher);
+                elems = elems.max(value_lanes(value));
+                holders.push(holder);
+            }
+            None => {
+                // A scalar operand's identity is its value: hash the whole
+                // value so ops differing only in a scalar operand do not
+                // fake a memo hit.
+                match value {
+                    Value::Number(MaybeVector::Scalar(n)) => (1u8, n).hash(&mut hasher),
+                    Value::NumberInterval(MaybeVector::Scalar(iv)) => {
+                        (2u8, iv.low, iv.high).hash(&mut hasher)
+                    }
+                    Value::Bool(MaybeVector::Scalar(b)) => (3u8, b).hash(&mut hasher),
+                    other => (4u8, format!("{other:?}")).hash(&mut hasher),
+                }
+            }
+        }
+    }
+    if any_vector {
+        crate::op_census::memo_probe(hasher.finish(), elems, holders);
+    }
+}
+
 pub fn interpret_binary_op(l: &Value, op: BinaryOp, r: &Value) -> Result<Value> {
+    if crate::op_census::enabled() {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = rustc_hash::FxHasher::default();
+        std::mem::discriminant(&op).hash(&mut hasher);
+        memo_price(hasher.finish(), &[l, r]);
+    }
     let sb = |b| Ok(Value::Bool(MaybeVector::Scalar(b)));
 
     // Handle mixed Number/NumberInterval by lifting Number to NumberInterval
