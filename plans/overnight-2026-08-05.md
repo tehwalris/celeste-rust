@@ -333,6 +333,37 @@ per-lane inside heavy states, already minimised at the op level, and
 the levers that remain are the ones already banked (partitioning,
 merge machinery) plus whatever reduces lane count itself.
 
+## The 2022 reference (develop branch) benchmarked (2026-08-06)
+
+Philippe's 2022 hand-written searcher (celeste-rust-old, branch develop:
+hardcoded physics, exact states, guided brute force + fast forward pass
++ backward pass; historically finished 100m matching the public TAS and
+finished 200m) re-run today on room (1,0):
+
+* **24.0 s wall / 405 MB for 29 forward frames**, frontier ~964k TRUE
+  states, 1.28 us per actual state-run, 79 ns per potential-run (their
+  pruning skips 94% of potential runs).
+* Its growth curve is the saturation story measured exactly: 7.0x ->
+  1.105x by f29, monotone decline - the same shape our lane counts show
+  (1.53x -> 1.35x at our f41-f47). The room genuinely saturates.
+* Rough per-state comparison (frame alignment imperfect - our counts
+  include ~11 pre-spawn frames): theirs 1.28 us/state-run vs ours
+  ~4.7 us/lane at f43 - **~4x slower per lane for a general compiled-
+  Lua interpreter vs hand-written physics**, which is closer than
+  expected. The bigger gap is state count: they dedupe rem-EQUIVALENT
+  states ('Don't run_player_update multiple times for equivalent rems'),
+  not just rem-equal ones - and our distinct-modulo census measured
+  exactly that slack at 1.8-1.9x on heavy states.
+* **The lever this uncovers**: rem-equivalence dedup is result-
+  preserving (their run matched the public TAS) - it merges states with
+  provably identical futures, which is NOT the precision change that
+  was ruled out. Porting their equivalence into our merge is likely a
+  ~2x state cut. Their game.rs holds the definition.
+* Open: the room's exact optimal frame count - the baseline TAS
+  (tas/baseline/TAS2.tas) needs the 2022 input encoding (their tas.rs)
+  to demarcate the first room; a naive decode through concrete_run gave
+  a suspicious trajectory, so the bit mapping differs.
+
 ## Ranked next steps
 
 1. ~~Fragment-parallel frame execution~~ DONE as state-parallel flow
