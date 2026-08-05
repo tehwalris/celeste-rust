@@ -186,8 +186,9 @@ impl<'a> CoreInterpreter<'a> {
                 Value::Bool(MaybeVector::Scalar(true)) => Ok(None),
                 Value::Bool(MaybeVector::Scalar(false)) => Err(anyhow!(
                     "AssertTrue(%{}) failed: it is false. A rewrite stated this \
-                     premise and this state falsifies it.",
-                    usize::from(*value)
+                     premise and this state falsifies it. ({})",
+                    usize::from(*value),
+                    crate::interpreter::inspect::describe_objects(&self.state)
                 )),
                 Value::Bool(MaybeVector::Vector(lanes)) => {
                     let false_lanes = lanes.iter().filter(|l| !**l).count();

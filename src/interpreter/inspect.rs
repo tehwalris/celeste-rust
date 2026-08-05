@@ -489,6 +489,46 @@ pub fn mark_heap(state: &State) -> HeapMarks {
     marks
 }
 
+/// One-line description of the objects array (count + resolved type names),
+/// for premise-failure diagnostics.
+pub fn describe_objects(state: &State) -> String {
+    let helper = StateHelper::new(state);
+    let Some(arr_id) = helper.get_objects_array_id() else {
+        return "objects: <no array>".to_string();
+    };
+    let HeapValue::ArrayTable(items) = helper.load(arr_id) else {
+        return "objects: <not an array>".to_string();
+    };
+    let items = items.clone();
+    let mut parts: Vec<String> = Vec::new();
+    for item_ptr in &items {
+        let type_target = match helper.load(*item_ptr) {
+            HeapValue::Value(Value::Pointer(obj_id)) => match helper.load(*obj_id) {
+                HeapValue::ObjectTable(obj) => obj.get("type").and_then(|type_ptr| {
+                    match helper.load(*type_ptr) {
+                        HeapValue::Value(Value::Pointer(t)) => Some(*t),
+                        _ => None,
+                    }
+                }),
+                _ => None,
+            },
+            _ => None,
+        };
+        let name = type_target
+            .and_then(|t| {
+                state.global_env.iter().find_map(|(name, gid)| {
+                    match helper.load(*gid) {
+                        HeapValue::Value(Value::Pointer(p)) if *p == t => Some(name.clone()),
+                        _ => None,
+                    }
+                })
+            })
+            .unwrap_or_else(|| "?".to_string());
+        parts.push(name);
+    }
+    format!("objects: {} [{}]", items.len(), parts.join(", "))
+}
+
 /// True if this state is a death lineage: no live `player` and no
 /// `player_spawn` in the objects array. This is the 15-frame
 /// `delay_restart` window after `kill_player` destroyed the player (the
@@ -519,7 +559,17 @@ pub fn is_death_state(state: &State) -> bool {
 /// Make marked heap values abstract by replacing concrete numbers with intervals.
 /// This is the key function for abstract interpretation - it widens concrete values
 /// to represent uncertainty (e.g., player's sub-pixel position can be anywhere in [-0.5, 0.5)).
-pub fn make_state_abstract(mut state: State) -> State {
+pub fn make_state_abstract(state: State) -> State {
+    apply_conservative_widenings(make_state_abstract_rem_only(state))
+}
+
+/// Only the historic rem widening - the baseline abstraction the search has
+/// always used. The widen-check (rewrite widencheck) runs the search with
+/// this alone and applies `apply_conservative_widenings` post hoc, to certify
+/// that the newer widenings are conservative: widening at every boundary
+/// must yield exactly the post-hoc-widened exact sets, or the widened field
+/// influenced gameplay and the widening changed the reachable set.
+pub fn make_state_abstract_rem_only(mut state: State) -> State {
     let marks = mark_heap(&state);
 
     // The player_rem_xy interval: [-0.5, 0.5)
@@ -579,6 +629,16 @@ pub fn make_state_abstract(mut state: State) -> State {
             }
         }
     }
+
+    state
+}
+
+/// The newer boundary widenings, all justified as behavior-preserving by read
+/// censuses (and certifiable dynamically via `rewrite widencheck`): the
+/// dash_effect_time clamp, and the gameplay-dead timer-global pins. Applied
+/// as part of `make_state_abstract`, and applied post hoc by the widen-check.
+pub fn apply_conservative_widenings(mut state: State) -> State {
+    let marks = mark_heap(&state);
 
     // Clamp player.dash_effect_time at 0 from below. The field decrements
     // unconditionally every frame (celeste-minimal.lua:124) and its ONLY read

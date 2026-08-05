@@ -122,6 +122,16 @@ enum Command {
     /// Note peak RSS is the process-wide high-water mark, so with `--baseline`
     /// the second figure includes the first run's peak. For an accurate memory
     /// comparison, run the two separately.
+    /// Certify that the conservative boundary widenings (timer pins,
+    /// dash_effect_time clamp) do not change the reachable set: run the
+    /// search with only the historic rem widening, apply the conservative
+    /// widenings post hoc each frame, and compare against the widen-every-
+    /// boundary run. Equal through N frames means the widened fields did not
+    /// influence gameplay within that horizon.
+    Widencheck {
+        #[arg(long, default_value_t = 34)]
+        frames: u32,
+    },
     Bench {
         #[arg(long, default_value_t = 34)]
         frames: u32,
@@ -1421,6 +1431,50 @@ fn main() -> Result<()> {
                     fwd.determined_cells.len(),
                 );
             }
+        }
+        Command::Widencheck { frames } => {
+            use celeste_rust::interpreter::inspect::apply_conservative_widenings;
+            use celeste_rust::interpreter::vectorize::vectorize_states;
+            use celeste_rust::rewrite::verify::{observe_frame, AbstractRun};
+            let (program, _) = build(&recipe)?;
+            let mut widened = AbstractRun::start(&program)?;
+            let mut exact = AbstractRun::start_rem_only(&program)?;
+            for frame in 1..=frames {
+                widened.step()?;
+                exact.step()?;
+                let a = observe_frame(widened.states());
+                let post_hoc: Vec<_> = exact
+                    .states()
+                    .iter()
+                    .cloned()
+                    .map(apply_conservative_widenings)
+                    .collect();
+                let b = observe_frame(&vectorize_states(post_hoc));
+                if a != b {
+                    println!(
+                        "DIVERGED at frame {}: widen-every-boundary != post-hoc-widened exact \
+                         ({} vs {} state observations). A conservative widening influenced \
+                         gameplay.",
+                        frame,
+                        a.len(),
+                        b.len()
+                    );
+                    std::process::exit(1);
+                }
+                if frame % 5 == 0 || frame == frames {
+                    println!(
+                        "frame {}: identical ({} lanes widened / {} lanes exact side)",
+                        frame,
+                        widened.lane_count(),
+                        exact.lane_count()
+                    );
+                }
+            }
+            println!(
+                "ok: conservative widenings certified through frame {} - widening at every \
+                 boundary equals post-hoc widening of the exact sets",
+                frames
+            );
         }
         Command::Bench { frames, baseline, profile } => {
             if baseline {

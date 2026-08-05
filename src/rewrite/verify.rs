@@ -281,6 +281,9 @@ pub struct AbstractRun {
     visited_rows: Option<
         rustc_hash::FxHashMap<u64, rustc_hash::FxHashSet<u64>>,
     >,
+    /// Use only the historic rem widening at boundaries (for the widen-check,
+    /// which applies the conservative widenings post hoc instead).
+    rem_only_abstraction: bool,
 }
 
 impl AbstractRun {
@@ -305,7 +308,21 @@ impl AbstractRun {
         } else {
             None
         };
-        Ok(Self { states, fixed_env, frame_cfg, states_before_merge: Vec::new(), visited_rows })
+        Ok(Self {
+            states,
+            fixed_env,
+            frame_cfg,
+            states_before_merge: Vec::new(),
+            visited_rows,
+            rem_only_abstraction: false,
+        })
+    }
+
+    /// Widen only rem at boundaries; used by `rewrite widencheck`.
+    pub fn start_rem_only(program: &Program) -> Result<Self> {
+        let mut run = Self::start(program)?;
+        run.rem_only_abstraction = true;
+        Ok(run)
     }
 
     pub fn step(&mut self) -> Result<()> {
@@ -315,12 +332,24 @@ impl AbstractRun {
                 .context("frame failed")?;
             new_states.extend(result.into_iter().map(|(s, _)| s));
         }
-        let new_states: Vec<State> = new_states.into_iter().map(make_state_abstract).collect();
-        let new_states: Vec<State> = if std::env::var_os("CELESTE_PRUNE_DEATHS").is_some() {
+        let new_states: Vec<State> = if self.rem_only_abstraction {
             new_states
                 .into_iter()
-                .filter(|s| !crate::interpreter::inspect::is_death_state(s))
+                .map(crate::interpreter::inspect::make_state_abstract_rem_only)
                 .collect()
+        } else {
+            new_states.into_iter().map(make_state_abstract).collect()
+        };
+        let new_states: Vec<State> = if std::env::var_os("CELESTE_PRUNE_DEATHS").is_some() {
+            let before = new_states.len();
+            let kept: Vec<State> = new_states
+                .into_iter()
+                .filter(|s| !crate::interpreter::inspect::is_death_state(s))
+                .collect();
+            if kept.len() != before {
+                println!("  (death pruning: dropped {} states)", before - kept.len());
+            }
+            kept
         } else {
             new_states
         };
