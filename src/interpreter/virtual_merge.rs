@@ -876,26 +876,51 @@ fn virtual_unique_mask(key: &[&Column], row_hashes: &[u64]) -> (Vec<bool>, usize
     drop(_t_pack);
     // 3. Verify, column-major over contiguous row ranges - one range per
     // thread, each a sorted piece walk, all random access confined to the
-    // cache-resident dense table.
+    // cache-resident dense table. Within a range, work goes through
+    // L1-sized chunks: each column decodes its chunk into a stack buffer
+    // with a sequential store loop, then a tight zip loop compares the
+    // buffer against the representatives - equal-length slices, so the
+    // compiler drops the bounds checks the per-element closure paid
+    // (measured: the closure was the profile's top symbol at ~18% CPU).
     let _t_verify = TraceSpan::new("vm_verify", "vectorize");
     let mut ok = vec![true; n];
     {
+        const VERIFY_CHUNK: usize = 4096;
         let verify_range = |ok_chunk: &mut [bool], start: usize| {
-            let end = start + ok_chunk.len();
-            let mut w = 0;
-            for column in key.iter() {
-                let words = column.words();
-                column.visit_range_words(start, end, |i, (w0, w1)| {
-                    if !mask[i] {
-                        let base = dense_of_row[i] as usize * words_per_row + w;
-                        let mut equal = dense[base] == w0;
-                        if words == 2 {
-                            equal &= dense[base + 1] == w1;
+            let mut buf = vec![(0u32, 0u32); VERIFY_CHUNK];
+            let len = ok_chunk.len();
+            let mut chunk_start = 0usize;
+            while chunk_start < len {
+                let chunk_len = VERIFY_CHUNK.min(len - chunk_start);
+                let global = start + chunk_start;
+                let mask_c = &mask[global..global + chunk_len];
+                let dense_of_row_c = &dense_of_row[global..global + chunk_len];
+                let ok_c = &mut ok_chunk[chunk_start..chunk_start + chunk_len];
+                let buf_c = &mut buf[..chunk_len];
+                let mut w = 0;
+                for column in key.iter() {
+                    let words = column.words();
+                    column.visit_range_words(global, global + chunk_len, |i, wv| {
+                        buf_c[i - global] = wv;
+                    });
+                    for (((&(w0, w1), &masked), &dense_row), ok_slot) in buf_c
+                        .iter()
+                        .zip(mask_c)
+                        .zip(dense_of_row_c)
+                        .zip(ok_c.iter_mut())
+                    {
+                        if !masked {
+                            let base = dense_row as usize * words_per_row + w;
+                            let mut equal = dense[base] == w0;
+                            if words == 2 {
+                                equal &= dense[base + 1] == w1;
+                            }
+                            *ok_slot &= equal;
                         }
-                        ok_chunk[i - start] &= equal;
                     }
-                });
-                w += words;
+                    w += words;
+                }
+                chunk_start += chunk_len;
             }
         };
         let threads = merge_threads();
