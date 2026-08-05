@@ -88,3 +88,52 @@ a bug, so the deep run is an end-to-end differential against 2022.
 
 * Frame-100 run (--frames 102, frontier + deopt): launched, results
   below when complete.
+
+## 3. Lane-granular deopt (deopt v2)
+
+Measured need: with v1, a whole boundary state re-runs under plain if
+ANY of its lanes dies mid-frame - f58 6.0s -> f59 13.9s -> f60 29.1s,
+and by f72 the deopt drag put frames at ~100s. Millions of alive lanes
+were paying the plain price for a few dying ones.
+
+The generic fix (no death special-casing - works for ANY premise):
+
+* On a failing boundary state, retry the specialized frame with a
+  synthetic `__lane_origin` global: a per-lane Number column (raw-bits
+  lane index) the program never reads. Every existing filter / expand /
+  merge carries it automatically; its only semantic effect is
+  preventing cross-origin dedup during the retry.
+* Collect mode (`interpreter/deopt_collect.rs`, process-global sink):
+  `assert_true` captures the origins of falsifying lanes instead of
+  aborting - scalar-false and UnknownBool capture the whole fragment
+  and drop it, a mixed vector captures the false lanes and continues
+  the true ones (FILTER_DEOPT). Non-bool stays a hard error.
+* The driver filters the retry's outputs to drop rows whose origin was
+  captured, strips the origin column, and re-runs ONLY the captured
+  lanes under plain via the canonical mapping. Lane-coverage
+  accounting (every origin in outputs-or-captured, in range) guards
+  against silently lost lanes; any surprise - non-premise retry error,
+  panic, accounting mismatch - falls back to the sound v1 whole-state
+  path with a printed reason.
+* Also fixed in passing: the census FILTER_REASON arrays were [3] while
+  REASON_NAMES had 4 entries - filter_visited would have indexed out of
+  bounds under CELESTE_CENSUS=1. Now sized by REASON_COUNT (5, with
+  filter_deopt).
+
+Verification:
+* New integration test `granular_deopt_reproduces_the_baseline`:
+  corrupts the fused frame body with 3 synthetic premises (assert_true
+  on comparison outputs - lane-mixed once the input fan-out starts) and
+  runs 28 frames with deopt; observations must equal the unmodified
+  rewritten program's trace every frame. PASSES (deopts fire from the
+  prologue on, partial and capture-all paths both taken).
+* A/B at the real kill frames: v2 reproduces v1's per-frame
+  post-subtract lane counts and visited totals EXACTLY (f59
+  1838536/20791318, f60 1997387/22788705 - bit-identical reachable
+  sets), while the plain re-runs collapse from 719k lanes -> 40 (f59)
+  and 1.77M -> 525 (f60). Frame times 13.9s -> 9.1s and 29.1s -> 13.6s.
+  The dying-lane count really is 4 orders of magnitude below the
+  whole-state count; the remaining overhead is the retry itself (the
+  failing states run specialized twice). A later refinement could
+  predict-and-skip the first attempt for states in classes that
+  deopted last frame - optimization only, correctness is done.

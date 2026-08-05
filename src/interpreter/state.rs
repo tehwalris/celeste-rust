@@ -39,6 +39,11 @@ pub const FILTER_DEDUP: FilterReason = "filter_dedup";
 /// the same input suffix, so re-expanding them finds nothing new).
 pub const FILTER_VISITED: FilterReason = "filter_visited";
 
+/// Lane-granular deopt: dropping lanes that violated a specialization
+/// premise (they re-run under the plain program), or - on the retry's
+/// outputs - lanes whose origin was captured.
+pub const FILTER_DEOPT: FilterReason = "filter_deopt";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct State {
     pub heap: Heap,

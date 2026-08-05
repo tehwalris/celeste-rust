@@ -204,6 +204,17 @@ impl<'a> BoundInterpreterFlow<'a> {
                                     interpreter.interpret_call_instruction(*local_id, instruction)?,
                                 );
                             }
+                            // Lane-granular deopt: a falsified premise captures
+                            // the violating lanes' origins and continues (or
+                            // drops) the rest, instead of aborting the frame.
+                            // See `deopt_collect`.
+                            Instruction::AssertTrue { value }
+                                if crate::interpreter::deopt_collect::is_collecting() =>
+                            {
+                                if let Some(state) = interpreter.collect_assert_true(*value)? {
+                                    dst.push(state);
+                                }
+                            }
                             _ => {
                                 let mut interpreter = interpreter;
                                 interpreter.interpret_non_call_instruction(*local_id, instruction)?;

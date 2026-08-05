@@ -46,6 +46,47 @@ impl<'a> CoreInterpreter<'a> {
         self.state
     }
 
+    /// `assert_true` under lane-granular deopt collection (see
+    /// `deopt_collect`): lanes that falsify the premise have their origins
+    /// captured and are dropped; the surviving lanes continue. Returns `None`
+    /// when no lane survives - the caller drops the fragment.
+    ///
+    /// `UnknownBool` captures every lane: the premise cannot be confirmed for
+    /// any of them, which is exactly the situation the plain re-run is for. A
+    /// non-bool value is still a hard error - that is a broken program, not a
+    /// falsified premise.
+    pub fn collect_assert_true(self, value: LocalId) -> Result<Option<State>> {
+        // Clone is an Arc bump for the vector case; it ends the borrow of
+        // `state` so the captures below can take it.
+        let condition = self.state.local_env.get(value).clone();
+        match condition {
+            Value::Bool(MaybeVector::Scalar(true)) => Ok(Some(self.state)),
+            Value::Bool(MaybeVector::Scalar(false)) | Value::UnknownBool => {
+                crate::interpreter::deopt_collect::capture_all(&self.state);
+                Ok(None)
+            }
+            Value::Bool(MaybeVector::Vector(lanes)) => {
+                if lanes.iter().all(|l| *l) {
+                    return Ok(Some(self.state));
+                }
+                let keep: Vec<bool> = lanes.iter().copied().collect();
+                crate::interpreter::deopt_collect::capture_dropped(&self.state, &keep);
+                if keep.iter().all(|k| !k) {
+                    return Ok(None);
+                }
+                Ok(Some(self.state.filter_by_mask_clone(
+                    &keep,
+                    crate::interpreter::state::FILTER_DEOPT,
+                )))
+            }
+            other => Err(anyhow!(
+                "AssertTrue(%{}) failed: expected a bool, got {:?}",
+                usize::from(value),
+                other
+            )),
+        }
+    }
+
     fn heap_id_from_pointer_local(&self, local_id: LocalId) -> Result<HeapId> {
         match self.state.local_env.get(local_id) {
             Value::Pointer(heap_id) => Ok(*heap_id),

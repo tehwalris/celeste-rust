@@ -190,17 +190,18 @@ pub fn record_unknown_branch_dup(lanes: usize) {
 /// the merge doing useful work; `filter_split_flr` is the search genuinely
 /// fanning out. Knowing which one owns the time decides whether to make
 /// filtering faster or to stop doing it.
-static FILTER_REASON_CALLS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
-static FILTER_REASON_KEPT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
-static FILTER_REASON_NANOS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static FILTER_REASON_CALLS: [AtomicU64; REASON_COUNT] = [const { AtomicU64::new(0) }; REASON_COUNT];
+static FILTER_REASON_KEPT: [AtomicU64; REASON_COUNT] = [const { AtomicU64::new(0) }; REASON_COUNT];
+static FILTER_REASON_NANOS: [AtomicU64; REASON_COUNT] = [const { AtomicU64::new(0) }; REASON_COUNT];
 /// Contiguous runs in the kept-index list, per reason. kept/runs is the mean
 /// run length: how much of a filter gather could be chunked memcpy instead of
 /// per-lane gather, and - if it is low - how much a sorted lane order at the
 /// merge could raise it.
-static FILTER_REASON_RUNS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static FILTER_REASON_RUNS: [AtomicU64; REASON_COUNT] = [const { AtomicU64::new(0) }; REASON_COUNT];
 
-pub const REASON_NAMES: [&str; 4] =
-    ["filter_branch", "filter_dedup", "filter_split_flr", "filter_visited"];
+pub const REASON_COUNT: usize = 5;
+pub const REASON_NAMES: [&str; REASON_COUNT] =
+    ["filter_branch", "filter_dedup", "filter_split_flr", "filter_visited", "filter_deopt"];
 
 pub fn record_filter_reason(reason_index: usize, kept: usize, started: Option<std::time::Instant>) {
     let Some(started) = started else { return };
@@ -349,7 +350,7 @@ pub fn reset() {
     FILTER_HEAP_CELLS.store(0, Ordering::Relaxed);
     FILTER_LOCAL_SLOTS.store(0, Ordering::Relaxed);
     branch_site_stats().lock().unwrap().clear();
-    for i in 0..3 {
+    for i in 0..REASON_COUNT {
         FILTER_REASON_CALLS[i].store(0, Ordering::Relaxed);
         FILTER_REASON_KEPT[i].store(0, Ordering::Relaxed);
         FILTER_REASON_NANOS[i].store(0, Ordering::Relaxed);
@@ -441,7 +442,7 @@ pub fn report() {
             }
         }
     }
-    for i in 0..3 {
+    for i in 0..REASON_COUNT {
         let calls = FILTER_REASON_CALLS[i].load(Ordering::Relaxed);
         if calls == 0 {
             continue;

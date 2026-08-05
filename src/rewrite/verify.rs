@@ -410,11 +410,25 @@ impl AbstractRun {
                         }
                         Ok(Err(err)) => {
                             log_deopt(&mut frame_events, &snapshot, &format!("{:#}", err));
-                            new_states.extend(run_deopt_frame(deopt, snapshot)?);
+                            let (states, plain_lanes) = run_deopt_frame_granular(
+                                deopt,
+                                &self.frame_cfg,
+                                &self.fixed_env,
+                                snapshot,
+                            )?;
+                            frame_events.1 += plain_lanes;
+                            new_states.extend(states);
                         }
                         Err(panic) => {
                             log_deopt(&mut frame_events, &snapshot, &panic_text(&panic));
-                            new_states.extend(run_deopt_frame(deopt, snapshot)?);
+                            let (states, plain_lanes) = run_deopt_frame_granular(
+                                deopt,
+                                &self.frame_cfg,
+                                &self.fixed_env,
+                                snapshot,
+                            )?;
+                            frame_events.1 += plain_lanes;
+                            new_states.extend(states);
                         }
                     }
                 }
@@ -481,6 +495,124 @@ impl AbstractRun {
     }
 }
 
+/// Lane-granular deopt: retry the failing frame under the specialized program
+/// with a per-lane origin column and the interpreter in collect mode (see
+/// `deopt_collect`), so premise-violating lanes are captured instead of
+/// aborting the frame; then re-run only the captured lanes under the plain
+/// program. Falls back to the whole-state path (`run_deopt_frame`) on
+/// anything unexpected - a retry that fails for a non-premise reason, a
+/// panic, or a lane-coverage accounting mismatch.
+///
+/// Returns the frame outputs plus how many lanes actually re-ran under plain.
+fn run_deopt_frame_granular(
+    deopt: &DeoptTarget,
+    frame_cfg: &crate::interpreter::fixed_env::PreparedCfg,
+    fixed_env: &crate::interpreter::fixed_env::FixedEnv,
+    snapshot: State,
+) -> Result<(Vec<State>, usize)> {
+    use crate::interpreter::deopt_collect;
+    use crate::interpreter::state::FILTER_DEOPT;
+
+    let n = snapshot.vector_size;
+    let mut tagged = snapshot.clone();
+    inject_origin(&mut tagged);
+    deopt_collect::begin();
+    let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        interpret_prepared_cfg(frame_cfg, tagged, fixed_env)
+    }));
+    let captured = deopt_collect::take();
+    let result = match attempt {
+        Ok(Ok(result)) if !captured.is_empty() => result,
+        Ok(Ok(_)) => {
+            // The first attempt failed but the retry captured nothing and
+            // succeeded - nondeterminism somewhere. Ground truth is plain.
+            println!("  deopt: retry captured nothing; whole-state fallback");
+            return Ok((run_deopt_frame(deopt, snapshot)?, n));
+        }
+        Ok(Err(err)) => {
+            let one_line = format!("{:#}", err).replace('\n', " | ");
+            println!(
+                "  deopt: retry failed for a non-premise reason ({}); whole-state fallback",
+                one_line.chars().take(160).collect::<String>()
+            );
+            return Ok((run_deopt_frame(deopt, snapshot)?, n));
+        }
+        Err(panic) => {
+            println!(
+                "  deopt: retry panicked ({}); whole-state fallback",
+                panic_text(&panic).chars().take(160).collect::<String>()
+            );
+            return Ok((run_deopt_frame(deopt, snapshot)?, n));
+        }
+    };
+
+    let failed: rustc_hash::FxHashSet<u32> = captured.iter().copied().collect();
+
+    // Accounting: every input lane must end up either in the specialized
+    // outputs or in the captured set. A lane in neither vanished silently -
+    // that is a machinery bug, and the whole-state path is the sound answer.
+    let mut covered = vec![false; n];
+    let mut in_range = true;
+    for &o in &captured {
+        match covered.get_mut(o as usize) {
+            Some(c) => *c = true,
+            None => in_range = false,
+        }
+    }
+
+    let mut out = Vec::new();
+    for (state, _) in result {
+        let origins = deopt_collect::read_origins(&state);
+        for &o in &origins {
+            match covered.get_mut(o as usize) {
+                Some(c) => *c = true,
+                None => in_range = false,
+            }
+        }
+        let mask: Vec<bool> = origins.iter().map(|o| !failed.contains(o)).collect();
+        let mut state = if mask.iter().all(|k| *k) {
+            state
+        } else if mask.iter().any(|k| *k) {
+            state.filter_by_mask_clone(&mask, FILTER_DEOPT)
+        } else {
+            continue;
+        };
+        state.global_env.remove(deopt_collect::ORIGIN_GLOBAL);
+        out.push(state);
+    }
+
+    if !in_range || !covered.iter().all(|c| *c) {
+        println!(
+            "  deopt: lane accounting mismatch on the retry; whole-state fallback"
+        );
+        return Ok((run_deopt_frame(deopt, snapshot)?, n));
+    }
+
+    let plain_mask: Vec<bool> = (0..n).map(|i| failed.contains(&(i as u32))).collect();
+    let plain_input = snapshot.filter_by_mask_clone(&plain_mask, FILTER_DEOPT);
+    let plain_lanes = plain_input.vector_size;
+    out.extend(run_deopt_frame(deopt, plain_input)?);
+    Ok((out, plain_lanes))
+}
+
+/// Give every lane of `state` a distinct origin index (a synthetic global the
+/// program never reads; see `deopt_collect::ORIGIN_GLOBAL`). The index is the
+/// lane position, bijectively encoded in the raw Pico8Num bits.
+fn inject_origin(state: &mut State) {
+    use crate::interpreter::deopt_collect::ORIGIN_GLOBAL;
+    let lanes: Vec<Pico8Num> = (0..state.vector_size as u32)
+        .map(|i| Pico8Num::from_parts((i >> 16) as i16, i as u16))
+        .collect();
+    let value = if lanes.len() == 1 {
+        MaybeVector::Scalar(lanes[0])
+    } else {
+        MaybeVector::Vector(std::sync::Arc::new(lanes))
+    };
+    let cell = state.heap.alloc();
+    state.heap.set(cell, HeapValue::Value(Value::Number(value)));
+    state.global_env.insert(ORIGIN_GLOBAL.to_string(), cell);
+}
+
 /// One frame of one state under the plain program: map the input to canonical,
 /// run, map the outputs back to the specialized representation.
 ///
@@ -506,14 +638,14 @@ fn run_deopt_frame(deopt: &DeoptTarget, mut state: State) -> Result<Vec<State>> 
 
 /// Count a deopt event; print the trigger for the first one each frame (the
 /// rest are usually the same premise firing across states, and the per-frame
-/// summary line carries the count).
+/// summary line carries the count). The *lane* count is added by the caller -
+/// with the granular path, only the lanes that actually re-ran under plain.
 fn log_deopt(frame_events: &mut (usize, usize), state: &State, reason: &str) {
     frame_events.0 += 1;
-    frame_events.1 += state.vector_size;
     if frame_events.0 == 1 {
         let one_line = reason.replace('\n', " | ");
         let short: String = one_line.chars().take(240).collect();
-        println!("  deopt trigger ({} lanes): {}", state.vector_size, short);
+        println!("  deopt trigger (state of {} lanes): {}", state.vector_size, short);
     }
 }
 
@@ -720,6 +852,99 @@ mod tests {
             result.is_some(),
             "differential verification passed a program with a changed constant"
         );
+    }
+
+    /// End-to-end check of the lane-granular deopt machinery: corrupt the
+    /// rewritten program with a synthetic premise that only *some* lanes
+    /// satisfy - an `assert_true` on an `expand`-produced button bool, so
+    /// half the expanded lanes falsify it every frame - and run with deopt.
+    /// The captured lanes re-run under the plain program through the
+    /// canonical-state mapping; the result must match the unmodified
+    /// rewritten program's observations exactly, every frame.
+    ///
+    /// This exercises: origin injection and stripping, collect-mode capture
+    /// and mid-fragment filtering, the lane-coverage accounting, the plain
+    /// re-run of only the failed lanes, and the merge of both output sets.
+    #[test]
+    fn granular_deopt_reproduces_the_baseline() {
+        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
+            || !std::path::Path::new("rewrites.jsonl").exists()
+        {
+            return;
+        }
+        let recipe = crate::rewrite::recipe::Recipe::load("rewrites.jsonl").expect("load recipe");
+        let (program, _) = crate::rewrite::recipe::build(&recipe).expect("build rewritten");
+        let plain = Program::compile_from_disk().expect("compile plain");
+        let mapping = crate::rewrite::state_mapping::StateMapping::from_recipe(&recipe);
+        assert!(!mapping.is_identity());
+
+        // Corrupt: assert the outputs of the first few comparisons in the
+        // fused frame body. Comparisons on player state are lane-mixed once
+        // the input fan-out starts, so some lanes falsify these synthetic
+        // premises every frame - the partial-capture path - while scalar
+        // frames and uniform fragments exercise the capture-all path.
+        let mut corrupted = program.clone();
+        let fun = corrupted
+            .get_mut("anonymous_61")
+            .expect("the fused frame body exists");
+        let mut next_id: usize = std::iter::once(&fun.cfg.entry)
+            .chain(fun.cfg.named.values())
+            .flat_map(|b| {
+                b.instructions
+                    .iter()
+                    .map(|(id, _)| usize::from(*id))
+                    .chain(std::iter::once(usize::from(b.terminator.0)))
+            })
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let mut inserted = 0;
+        for block in std::iter::once(&mut fun.cfg.entry).chain(fun.cfg.named.values_mut()) {
+            let mut index = 0;
+            while index < block.instructions.len() && inserted < 3 {
+                if matches!(
+                    block.instructions[index].1,
+                    Instruction::BinaryOp {
+                        op: crate::ir::BinaryOp::LessThan | crate::ir::BinaryOp::GreaterThan,
+                        ..
+                    }
+                ) {
+                    let target = block.instructions[index].0;
+                    block.instructions.insert(
+                        index + 1,
+                        (
+                            crate::ir::LocalId::from(next_id),
+                            Instruction::AssertTrue { value: target },
+                        ),
+                    );
+                    next_id += 1;
+                    inserted += 1;
+                    index += 1;
+                }
+                index += 1;
+            }
+            if inserted >= 3 {
+                break;
+            }
+        }
+        assert!(inserted > 0, "no comparison found to corrupt");
+
+        let frames = 28;
+        let baseline = observation_trace(&program, frames).expect("baseline trace");
+        let mut run = AbstractRun::start_with_deopt(&corrupted, &plain, mapping, false)
+            .expect("start deopt run");
+        for frame in 1..=frames {
+            run.step().expect("step");
+            assert_eq!(
+                observe_frame(run.states()),
+                baseline[frame as usize],
+                "granular deopt diverged from the baseline at frame {}",
+                frame
+            );
+        }
+        let (states, lanes) = run.deopt_events();
+        assert!(states > 0, "the synthetic premise never fired");
+        assert!(lanes > 0, "no lanes re-ran under the plain program");
     }
 
     /// And it must not cry wolf: the program compared against itself is equal.
