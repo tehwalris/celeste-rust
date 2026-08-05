@@ -179,6 +179,31 @@ a look: expensive per lane over positions with cardinality <=59 - the
 one op family where the dict_pricing verdict does not apply), recipe
 replay ~2.4% (a constant bench includes), allocator ~2%.
 
+## Morning session 2 (2026-08-06, with Philippe): the partition line
+
+* **Context-partitioned merge landed (env-gated pilot)**: merges group by
+  (shape, values of designated cells); lane-varying states split per
+  class first. Key dash_time,djump - the two hot forks' condition cells,
+  read from the IR. Both forks now route instead of splitting.
+  f42: 18.37 -> 13.08 s (**-29%**), 9.5 -> 4.84 GB (**-49%**).
+  f44: 61 -> ~40.6 s (dash_time alone; extended key deeper probe TBD).
+  Boundary-only variant (hints removed) measures far worse - the hint
+  merges and the partition are complementary. Graduation to a recipe
+  annotation (program-carried, per-site keys) is next.
+* The union_diff pass-through guard aborted - correctly - when djump
+  varied at a hint site: with partitioning, arrivals are one per
+  (shape, class), and the guard now uses that key.
+* **would-dedup census built** (CELESTE_WOULD_DEDUP=1): ~59% of lanes are
+  already duplicates at nearly every block from frame start, uniformly.
+  But the obvious exploitation - add_hint at the earliest once-per-frame
+  59% site - is **+30% time / -17% memory**: removing them costs more
+  than carrying them, at least at that site. Parked; the census remains
+  the map, and the memory drop makes it a dial if depth becomes
+  memory-bound. The buttons-widened variant showed zero delta everywhere,
+  which needs a resolution-bug check before trusting it.
+* Hint removal itself: parked earlier at +3.8% (hints are load-bearing);
+  the unsound NormalizedState comparison is deleted outright.
+
 ## Ranked next steps
 
 1. ~~Fragment-parallel frame execution~~ DONE as state-parallel flow
