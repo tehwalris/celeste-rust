@@ -474,11 +474,46 @@ pub fn mark_heap(state: &State) -> HeapMarks {
                         }
                     }
                 }
+                // Mark dash_effect_time for the boundary clamp (see
+                // make_state_abstract): it decrements unconditionally every
+                // frame, so without a clamp it drifts negative forever and
+                // makes otherwise-identical states at different frames
+                // distinct, defeating cross-frame visited dedup.
+                if let Some(ptr) = player.get("dash_effect_time") {
+                    marks.add_mark("player_dash_effect_time", *ptr);
+                }
             }
         }
     }
 
     marks
+}
+
+/// True if this state is a death lineage: no live `player` and no
+/// `player_spawn` in the objects array. This is the 15-frame
+/// `delay_restart` window after `kill_player` destroyed the player (the
+/// initial spawn phase has a `player_spawn`, so it is not matched).
+///
+/// Used by the env-gated death pruning (CELESTE_PRUNE_DEATHS=1): dropping
+/// these states is sound for single-room earliest-win search - any
+/// post-restart trajectory is a time-shifted from-scratch run, so it can
+/// never improve the optimal frame count - and it keeps reloaded-room states
+/// (which falsify the collapsed-loop `#objects == 1` premises, first
+/// reachable at frame 59) out of the search. Without the gate the premise
+/// assert fails loudly instead - deliberately, so the pruning stays a
+/// conscious choice rather than a silent default.
+pub fn is_death_state(state: &State) -> bool {
+    let helper = StateHelper::new(state);
+    let Some(objects_array_id) = helper.get_objects_array_id() else {
+        return false;
+    };
+    for type_name in ["player", "player_spawn"] {
+        match helper.find_objects_by_type(objects_array_id, type_name) {
+            Ok(found) if !found.is_empty() => return false,
+            _ => {}
+        }
+    }
+    true
 }
 
 /// Make marked heap values abstract by replacing concrete numbers with intervals.
@@ -541,6 +576,33 @@ pub fn make_state_abstract(mut state: State) -> State {
                     }
                 };
                 state.heap.set(heap_id, HeapValue::Value(new_value));
+            }
+        }
+    }
+
+    // Clamp player.dash_effect_time at 0 from below. The field decrements
+    // unconditionally every frame (celeste-minimal.lua:124) and its ONLY read
+    // anywhere is `hit.dash_effect_time > 0` (line 471), so every value <= 0
+    // is behaviorally identical - the clamp is a no-op in every room, not
+    // just this one. Without it the field drifts negative forever and two
+    // otherwise-identical states at different frames never compare equal,
+    // defeating cross-frame visited dedup.
+    if let Some(heap_ids) = marks.marks.get("player_dash_effect_time") {
+        let zero = Pico8Num::from_i16(0);
+        for &heap_id in heap_ids {
+            match state.heap.get(heap_id) {
+                HeapValue::Value(Value::Number(mv)) => {
+                    let clamped = match mv {
+                        MaybeVector::Scalar(n) => {
+                            MaybeVector::Scalar(if *n < zero { zero } else { *n })
+                        }
+                        MaybeVector::Vector(ns) => MaybeVector::vector(
+                            ns.iter().map(|n| if *n < zero { zero } else { *n }).collect(),
+                        ),
+                    };
+                    state.heap.set(heap_id, HeapValue::Value(Value::Number(clamped)));
+                }
+                other => panic!("player dash_effect_time is not a number: {:?}", other),
             }
         }
     }

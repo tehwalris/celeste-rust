@@ -250,6 +250,10 @@ fn get_player_rem(state: &State) -> Option<(Pico8Num, Pico8Num)> {
     Some((rem_x, rem_y))
 }
 
+/// CAREFUL when parsing this output: the format is floor.frac_hex, NOT
+/// sign-magnitude. For negative numbers the whole part is the FLOOR and the
+/// fraction is the positive offset above it: `-4.76ec` means
+/// (-4 << 16) | 0x76ec = -0x3.8914 (-3.5355), not -(4 + 0x76ec/65536).
 fn format_num(n: Pico8Num) -> String {
     let whole = n.whole_part_as_i16();
     let frac = n.fraction_part_as_u16();
