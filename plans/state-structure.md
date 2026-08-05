@@ -95,3 +95,38 @@ Ordered by how much the measurements support them, not by ease:
    vector instruction's output cardinality keyed by `LocalId` alongside the
    existing `instr_time`, then rank by `time x distinct/lanes`. Measures the
    waste directly without needing field attribution to be exact.
+
+## Outcomes (2026-08-05, the night after)
+
+What the list above turned into, in the order it was executed. All numbers
+in BENCHMARK_DATA.md; every change differentially verified through 37.
+
+* **(4) ran first** as the `CELESTE_INSTR_CARD` census. Verdict: 0.54 s of
+  non-call instruction time at frame 37, **100% of it** duplicate-lane
+  computation, no hot instruction (top 13 ms). The redundancy is uniform,
+  so per-op fixes are pointless; representation-level changes are not.
+* The census surfaced a cheaper fact than (1): instruction outputs with
+  dist/exec = 1.0 - *constant* vectors nothing demotes. **Uniform collapse
+  in `MaybeVector::vector`** landed: -8.4% runner, -8.6% memory.
+* **(3) landed** on the fourth attempt (uniform columns + sorted piece
+  walks): -3.4% runner, -28% peak on the rewritten path.
+* A new filter census asked how chunky filter gathers are: **30.6
+  lanes/run** already. **Ranged gathers (`KeptLanes`)** landed: -13.5%
+  runner, the night's largest single win.
+* Cumulative: runner `-n 39` 44.4 -> 33.5 s (-24%), `bench --frames 37`
+  2.89 -> 2.38 s (-18%).
+
+* **Context-sorting merged lanes was tried and parked.** Dictionary-code
+  the <=32-cardinality columns, sort lanes by the packed key at every
+  merge. Split verdict: rewritten bench 2.38 -> 2.30 s (-3.4%), but the
+  runner 33.6 -> 34.7 s (+3.3%) - the coding + permute over the plain
+  path's 600k-lane frame-boundary merges costs more than its filters
+  save. Also instructive: mean lanes/run barely moved (30.6 -> 27.5,
+  run-count-weighted), yet census filter time fell 24%, so the natural
+  lane order is already context-clustered and the sort mostly upgrades
+  the lane-weighted tail. Revisit if the frame-boundary merge shrinks,
+  with a mid-frame-only gate, or when a per-context execution scheme
+  needs contiguous contexts anyway.
+
+Still open from the list: (1) dictionary codes as the *stored*
+representation, and (2) context/position factoring.
