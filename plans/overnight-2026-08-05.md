@@ -261,8 +261,27 @@ uniformity, and the mechanism is **region skipping**:
   own (buttons fold little beyond routing), still interesting later for
   deleting the fan-out machinery itself.
 
-Status when this note was written: task #71, IR/interpreter half in
-progress.
+Status: ConditionalSkip terminator LANDED (routing semantics + 3 glue
+tests + all plumbing; commit "ir: ConditionalSkip terminator"). The
+guard_region rule remains. Its concrete design:
+
+* Entry: {rule: guard_region, fn, block, from, to, mask, prefix} -
+  split the block's instructions at [from..=to] into head / region /
+  join blocks; head ends with ConditionalSkip mask ? join : region;
+  region ends br join; join holds the tail + original terminator.
+* For each region-defined local used in the tail: it must be
+  `select mask ? new : old` with `old` defined before the region; the
+  join gets phi [head: old, region: select] and tail uses are rewritten
+  to the phi. That is exactly the value the select yields when the mask
+  is uniformly false, so skipping is semantics-preserving.
+* Verifier: mask defined in the head; every region store's value is a
+  mask-form select whose false arm is the pre-store cell value (load of
+  the target inside the region before any store to it); no calls except
+  pinned-readonly; the assert family inserted by the speculation rules
+  is allowed (they cannot fire on lanes whose values are the old ones);
+  every region-def escaping the region is mask-form as above.
+* suggest side: scan fused blocks for maximal ranges whose escaping defs
+  share a common mask. Apply to the dash-package regions first.
 
 ## Ranked next steps
 
