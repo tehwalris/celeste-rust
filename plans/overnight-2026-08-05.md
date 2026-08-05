@@ -15,10 +15,15 @@ commit. All commits pushed to `census` (and `interpreter` follows it).
 | virtual-concat merge (4th attempt, landed) | 39.03 s (-3.4%) | f37 2.57 s, peak -28% | ec5018f |
 | ranged filter gathers (`KeptLanes`) | 33.54 s (**-13.5%**) | f37 2.38 s | bde95ef |
 | parallel virtual merge (scoped threads, <=16) | 31.89 s (-4.8%) | f40 8.80 s (-10.6%) | (merge: parallelize) |
-| union_diff guarded pass-through | **29.06 s (-8.8%)** | f40 **7.68 s (-12.1%)** | (union_diff) |
+| union_diff guarded pass-through | **29.06 s (-8.8%)** | f40 **7.68 s (-12.1%)** | afd0653 |
+| partitioned probe (hash high bits, >=512k rows) | 29.01 s (-0.4%) | f40 7.44 s (-2.4%) | (probe) |
 
-**Cumulative: runner -n 39 44.4 -> 29.1 s (-34%). bench f40 9.76 -> 7.68 s
-since the mid-night frontier measurement; f37 2.89 -> ~2.1 s est (-27%+).**
+**Cumulative: runner -n 39 44.4 -> 29.0 s (-34.6%). bench f40 9.76 -> 7.44 s
+since the mid-night frontier measurement; f37 2.89 -> ~2.0 s est (-30%).**
+
+Probe threshold lesson: at 16k rows partitioning was +0.3% runner (extra
+O(n) passes beat mid-size savings); at 512k - where the map actually
+outgrows the cache - both paths win. vm_probe 0.86 -> 0.43 s at f40.
 
 Frontier measured mid-night (before the last two wins): bench f40 9.76 s /
 3.70 GB, f41 16.07 s / 6.05 GB, f42 26.47 s / 9.36 GB (~1.65x/frame);
@@ -59,9 +64,9 @@ gc 0.07 s. Everything else small.
    independent). Blockers: profiler/DAG/census thread-safety, worklist
    order. The parallel-experiments branch never did this - it parallelized
    within ops instead (and its big-vector-op piece regressed).
-2. **Virtual merge probe pass** is now its sequential floor (hash-map build
-   over all rows). The parallel branch partitioned it by hash high bits;
-   port that (disjoint writes per partition, per-partition dense slots).
+2. ~~Virtual merge probe pass~~ DONE (partitioned, 512k threshold).
+   Remaining inside virtual_merge at f40: vm_pack_verify 0.61 s (pack is
+   still sequential), vm_probe 0.43 s, vm_hash 0.40 s.
 3. **filter_branch 1.3 s**: the remaining cost is mask production and
    per-vector dispatch, not the gather. The structural fix is fewer forks
    (rewrite side) or RLE masks.
