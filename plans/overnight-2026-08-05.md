@@ -409,6 +409,19 @@ reconstructed):
   frame-boundary results. This is exactly parked task #51 (+110% ->
   +33% when merges were expensive) - worth re-testing now that merges
   are partitioned and much cheaper.
+
+**Retested (2026-08-06, task #74): parked at +40%.** The exact old
+stack (widen_buttons + widen_rem at in_h061_if_join_103, add_hint at
+in_h061_and_or_join_219) on top of the current recipe: differentially
+identical through 34; interleaved A/B at f42 gives 14.75 -> 20.57 s
+(**+40%**), 2.74 -> 2.36 GB (**-15%**), identical frontier (2181716
+lanes, confirming result-preservation). Fragments crush 10674 -> 3934
+total (max 892 -> 332), but even partition-routed virtual merges cost
+more mid-frame than the duplicate lanes they remove. Third consistent
+verdict for this shape (+30%, +33%, +40%): a full-population mid-frame
+merge does not pay on this program at these depths. The -15% memory is
+a real dial if depth becomes memory-bound - the recipe stack is three
+lines, kept in this note, not in the recipe.
 * The 1.8-1.9x distinct-modulo number is retracted pending a redone
   census with verified cell identities (see above).
 
