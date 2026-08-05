@@ -76,6 +76,17 @@ plans/overnight-2026-08-05.md):
 
 A 60 s budget now reaches **frame 45**; 120 s reaches ~frame 46.
 
+Updated again after the booleans joined the key (pm1 =
+dash_time,djump,has_dashed,p_dash,p_jump - time-flat, peak -44%):
+
+| | time | peak |
+|---|---|---|
+| bench `--frames 45` | 47.6 s | 8.5 GB |
+| bench `--frames 46` | **70.0 s** | 12.1 GB |
+
+Frame 46 is the deepest frame ever computed, and the per-frame growth
+softened to ~1.47x (memory pressure feeds back into merge cost).
+
 The store-triangle row is the first change that moved the fragment count: 558
 -> 335 mean fragments per frame at frame 34, split executions 19573 -> 11978.
 The ternary row continues it: 335 -> 232, splits -> 8472; the decompose row:

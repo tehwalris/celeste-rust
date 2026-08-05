@@ -902,4 +902,4 @@
 {"id":"m050","rule":"dedup_guards"}
 {"id":"k1","rule":"kill_dead"}
 {"id":"s1","rule":"allocate_slots"}
-{"id": "pm1", "rule": "partition_merge", "cells": ["dash_time", "djump"], "note": "the two hot forks condition cells: dash_time (in_i1_074_cont) and djump (and_or_join_126). Measured -29% time / -49% peak at f42; frame 45 in 54.6s"}
+{"id": "pm1", "rule": "partition_merge", "cells": ["dash_time", "djump", "has_dashed", "p_dash", "p_jump"], "note": "fork-condition cells (dash_time, djump: both hot forks route instead of splitting; -29% time -49% mem at f42) plus the cheap booleans (time-flat, another -44% peak: 4.86 -> 2.72 GB at f42)"}
