@@ -47,6 +47,22 @@ not comparable.
 | + 2 `unroll_loop` (pixel-move loops flat) + `merge_blocks` + `cse` forward | 0.88-0.89 s / 0.46 GB | 3.65-3.75 s / 1.65 GB |
 | + `dedup_guards` (501 dominated asserts deleted) | time-neutral | time-neutral |
 | + 2 `unroll_loop` on the `spikes_at` nest (inner then outer) | 0.88 s / 0.47 GB | 3.69-3.70 s / 1.65 GB |
+| + `kill_dead` + cache-blocked dedup (2026-08-05 morning) | - | ~2.89 s |
+| + uniform collapse + virtual merge + ranged filters (2026-08-05 night) | - | 2.38 s / **1.01 GB** |
+
+The frontier with the 2026-08-05 night stack (sequential interpreter):
+
+| | time | peak | lanes |
+|---|---|---|---|
+| bench `--frames 40` | 9.76 s | 3.70 GB | 948,319 |
+| bench `--frames 41` | 16.07 s | 6.05 GB | 1,447,750 |
+| bench `--frames 42` | 26.47 s | 9.36 GB | 2,181,716 |
+| runner `-n 39` | 33.5 s | 14.6 GiB | 613,865 |
+| runner `-n 40` | 50.4 s | 23.8 GiB | 948,319 |
+
+Growth is ~1.65x/frame on the rewritten path, so a 60 s budget reaches
+**frame 43** and 120 s reaches **frame 44** - two frames deeper than the
+morning's estimate at the same budgets, still single-threaded.
 
 The store-triangle row is the first change that moved the fragment count: 558
 -> 335 mean fragments per frame at frame 34, split executions 19573 -> 11978.
