@@ -22,6 +22,7 @@ commit. All commits pushed to `census` (and `interpreter` follows it).
 | select pick loop specialized per arm repr | flat | f42 -2.6% | (select) |
 | one-pass branch split (both edges at once) | 21.55 s (-3.4%) | f42 within noise | (branch) |
 | parallel dense pack (tiles on scoped threads) | 20.97 s (-2.8% median) | f43 -1.2% | (pack) |
+| chunk-buffered dedup verify (perf-guided) | flat | f43 -3.4% | (verify) |
 
 **Milestone gate: `rewrite verify --frames 40` identical on the full
 stack; `CELESTE_CHECK_UNION=1` at `-n 40`: zero mismatches.**
