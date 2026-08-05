@@ -543,6 +543,222 @@ pub fn hash_rows(columns: &[&Column], total_rows: usize) -> Vec<u64> {
     hashes
 }
 
+/// The probe phase's outputs: which rows are representatives (first row
+/// seen with their hash), each row's representative's slot in the dense
+/// table, and the representatives themselves in ascending row order (slot
+/// d belongs to row `uniq[d]`).
+struct Probe {
+    mask: Vec<bool>,
+    dense_of_row: Vec<u32>,
+    uniq: Vec<u32>,
+}
+
+fn sequential_probe(row_hashes: &[u64]) -> Probe {
+    let n = row_hashes.len();
+    let mut first_of_hash: FxHashMap<u64, u32> =
+        FxHashMap::with_capacity_and_hasher(n / 2, Default::default());
+    let mut mask = vec![false; n];
+    let mut dense_of_row: Vec<u32> = vec![0; n];
+    let mut uniq: Vec<u32> = Vec::new();
+    for (i, &row_hash) in row_hashes.iter().enumerate() {
+        match first_of_hash.entry(row_hash) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                let dense = uniq.len() as u32;
+                slot.insert(dense);
+                uniq.push(i as u32);
+                dense_of_row[i] = dense;
+                mask[i] = true;
+            }
+            std::collections::hash_map::Entry::Occupied(slot) => {
+                dense_of_row[i] = *slot.get();
+            }
+        }
+    }
+    Probe {
+        mask,
+        dense_of_row,
+        uniq,
+    }
+}
+
+/// The probe, partitioned by hash high bits and bit-identical to
+/// `sequential_probe`.
+///
+/// Equal rows share a hash, so a hash class lands intact in one partition;
+/// partition row lists are built from contiguous per-thread ranges
+/// concatenated in thread order, so they are ascending, and the first
+/// occurrence within a partition is the global first occurrence. Dense
+/// slots are assigned per partition and then renumbered by representative
+/// row order - which is exactly the discovery order the sequential probe
+/// assigns. Two wins: the partitions probe in parallel, and each
+/// partition's hash map is ~PARTS times smaller, small enough to stay in
+/// cache where the single big map thrashed.
+///
+/// Every write is either to a thread-owned contiguous chunk or single-
+/// threaded; no atomics, no unsafe.
+fn partitioned_probe(row_hashes: &[u64], threads: usize) -> Probe {
+    const PARTS: usize = 64;
+    let shift = 64 - PARTS.trailing_zeros();
+    let part_of = |hash: u64| (hash >> shift) as usize;
+    let n = row_hashes.len();
+    let chunk = n.div_ceil(threads);
+
+    // Phase A: scatter rows into partition lists, per-thread; record each
+    // row's position within its thread-local partition list.
+    let mut local_pos: Vec<u32> = vec![0; n];
+    let per_thread_parts: Vec<Vec<Vec<u32>>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = row_hashes
+            .chunks(chunk)
+            .zip(local_pos.chunks_mut(chunk))
+            .enumerate()
+            .map(|(t, (hash_chunk, pos_chunk))| {
+                scope.spawn(move || {
+                    let start = t * chunk;
+                    let mut parts: Vec<Vec<u32>> = vec![Vec::new(); PARTS];
+                    for (k, (&h, pos)) in hash_chunk.iter().zip(pos_chunk).enumerate() {
+                        let p = part_of(h);
+                        *pos = parts[p].len() as u32;
+                        parts[p].push((start + k) as u32);
+                    }
+                    parts
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    // Offsets of each thread's contribution within the concatenated
+    // partition lists, and the concatenation itself.
+    let thread_count = per_thread_parts.len();
+    let mut offset_of_thread: Vec<[u32; PARTS]> = vec![[0; PARTS]; thread_count];
+    let mut part_lens = [0u32; PARTS];
+    for (t, parts) in per_thread_parts.iter().enumerate() {
+        for p in 0..PARTS {
+            offset_of_thread[t][p] = part_lens[p];
+            part_lens[p] += parts[p].len() as u32;
+        }
+    }
+    let parts: Vec<Vec<u32>> = (0..PARTS)
+        .map(|p| {
+            let mut list = Vec::with_capacity(part_lens[p] as usize);
+            for thread_parts in &per_thread_parts {
+                list.extend_from_slice(&thread_parts[p]);
+            }
+            list
+        })
+        .collect();
+
+    // Phase B: probe each partition independently, partitions striped
+    // across threads. Outputs are per-partition: the representative rows
+    // (ascending) and, for each list position, its representative's
+    // partition-local slot.
+    struct PartProbe {
+        firsts: Vec<u32>,
+        rep_of_pos: Vec<u32>,
+    }
+    let probes: Vec<PartProbe> = std::thread::scope(|scope| {
+        let parts = &parts;
+        let handles: Vec<_> = (0..threads.min(PARTS))
+            .map(|t| {
+                scope.spawn(move || {
+                    let mut out: Vec<(usize, PartProbe)> = Vec::new();
+                    let mut p = t;
+                    while p < PARTS {
+                        let list = &parts[p];
+                        let mut map: FxHashMap<u64, u32> = FxHashMap::with_capacity_and_hasher(
+                            list.len() / 2,
+                            Default::default(),
+                        );
+                        let mut firsts: Vec<u32> = Vec::new();
+                        let mut rep_of_pos: Vec<u32> = Vec::with_capacity(list.len());
+                        for &row in list {
+                            match map.entry(row_hashes[row as usize]) {
+                                std::collections::hash_map::Entry::Vacant(slot) => {
+                                    let local = firsts.len() as u32;
+                                    slot.insert(local);
+                                    firsts.push(row);
+                                    rep_of_pos.push(local);
+                                }
+                                std::collections::hash_map::Entry::Occupied(slot) => {
+                                    rep_of_pos.push(*slot.get());
+                                }
+                            }
+                        }
+                        out.push((p, PartProbe { firsts, rep_of_pos }));
+                        p += threads;
+                    }
+                    out
+                })
+            })
+            .collect();
+        let mut probes: Vec<Option<PartProbe>> = (0..PARTS).map(|_| None).collect();
+        for handle in handles {
+            for (p, probe) in handle.join().unwrap() {
+                probes[p] = Some(probe);
+            }
+        }
+        probes.into_iter().map(|p| p.unwrap()).collect()
+    });
+
+    // Phase C: provisional global slots (partition-major), then renumber so
+    // slot order equals representative row order - the sequential probe's
+    // discovery order.
+    let mut base = [0u32; PARTS];
+    let mut total_uniq = 0u32;
+    for p in 0..PARTS {
+        base[p] = total_uniq;
+        total_uniq += probes[p].firsts.len() as u32;
+    }
+    let mut pairs: Vec<(u32, u32)> = Vec::with_capacity(total_uniq as usize);
+    for p in 0..PARTS {
+        for (j, &row) in probes[p].firsts.iter().enumerate() {
+            pairs.push((row, base[p] + j as u32));
+        }
+    }
+    pairs.sort_unstable_by_key(|&(row, _)| row);
+    let uniq: Vec<u32> = pairs.iter().map(|&(row, _)| row).collect();
+    let mut remap: Vec<u32> = vec![0; total_uniq as usize];
+    for (sorted_idx, &(_, provisional)) in pairs.iter().enumerate() {
+        remap[provisional as usize] = sorted_idx as u32;
+    }
+
+    // Phase D: fill dense_of_row and mask, threads on contiguous row
+    // ranges again.
+    let mut mask = vec![false; n];
+    let mut dense_of_row: Vec<u32> = vec![0; n];
+    std::thread::scope(|scope| {
+        let probes = &probes;
+        let offset_of_thread = &offset_of_thread;
+        let remap = &remap;
+        for ((t, hash_chunk), (pos_chunk, (mask_chunk, dense_chunk))) in row_hashes
+            .chunks(chunk)
+            .enumerate()
+            .zip(local_pos.chunks(chunk).zip(
+                mask.chunks_mut(chunk).zip(dense_of_row.chunks_mut(chunk)),
+            ))
+        {
+            scope.spawn(move || {
+                for k in 0..hash_chunk.len() {
+                    let p = part_of(hash_chunk[k]);
+                    let pos = (offset_of_thread[t][p] + pos_chunk[k]) as usize;
+                    let local_rep = probes[p].rep_of_pos[pos];
+                    let provisional = base[p] + local_rep;
+                    dense_chunk[k] = remap[provisional as usize];
+                    // A row is kept iff it is its own representative.
+                    mask_chunk[k] =
+                        probes[p].firsts[local_rep as usize] == (t * chunk + k) as u32;
+                }
+            });
+        }
+    });
+
+    Probe {
+        mask,
+        dense_of_row,
+        uniq,
+    }
+}
+
 /// Which rows to keep: `true` for the first occurrence of each distinct
 /// row, `false` for every later copy. The virtual twin of
 /// `vectorize::bucket_unique_mask`, with the same four phases:
@@ -563,32 +779,31 @@ pub fn hash_rows(columns: &[&Column], total_rows: usize) -> Vec<u64> {
 fn virtual_unique_mask(key: &[&Column], row_hashes: &[u64]) -> (Vec<bool>, usize) {
     let n = row_hashes.len();
 
-    let mut first_of_hash: FxHashMap<u64, u32> =
-        FxHashMap::with_capacity_and_hasher(n / 2, Default::default());
-    let mut mask = vec![false; n];
-    let mut dense_of_row: Vec<u32> = vec![0; n];
-    let mut uniq: Vec<u32> = Vec::new();
-
-    for (i, &row_hash) in row_hashes.iter().enumerate() {
-        match first_of_hash.entry(row_hash) {
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                let dense = uniq.len() as u32;
-                slot.insert(dense);
-                uniq.push(i as u32);
-                dense_of_row[i] = dense;
-                mask[i] = true;
-            }
-            std::collections::hash_map::Entry::Occupied(slot) => {
-                dense_of_row[i] = *slot.get();
-            }
-        }
-    }
+    let _t_probe = TraceSpan::new("vm_probe", "vectorize");
+    // The probe is worth partitioning only once its hash map outgrows the
+    // cache: below ~512k rows the single map is L3-resident and the
+    // partitioned version's extra O(n) passes (scatter, fill, remap) cost
+    // more than they save - measured +0.3% on the runner with the plain
+    // 16k threshold, against a halved probe on the deep merges.
+    const PARTITIONED_PROBE_THRESHOLD: usize = 1 << 19;
+    let Probe {
+        mask,
+        dense_of_row,
+        uniq,
+    } = if n < PARTITIONED_PROBE_THRESHOLD || merge_threads() == 1 {
+        sequential_probe(row_hashes)
+    } else {
+        partitioned_probe(row_hashes, merge_threads())
+    };
+    let mut mask = mask;
+    drop(_t_probe);
     let mut unique_count = uniq.len();
     if unique_count == n {
         return (mask, unique_count);
     }
 
     // 2. Pack the representatives.
+    let _t_pack_verify = TraceSpan::new("vm_pack_verify", "vectorize");
     let words_per_row: usize = key.iter().map(|c| c.words()).sum();
     let mut dense = vec![0u32; uniq.len() * words_per_row];
     const DENSE_TILE_BYTES: usize = 192 * 1024;
@@ -699,13 +914,19 @@ pub fn merge_dedup_group(states: &[State]) -> Option<State> {
     debug_assert!(states.len() > 1);
     let _trace = TraceSpan::new("virtual_merge", "vectorize");
 
-    let (columns, origins) = collect_columns_labeled(states)?;
+    let (columns, origins) = {
+        let _t = TraceSpan::new("vm_collect", "vectorize");
+        collect_columns_labeled(states)?
+    };
     let total_rows: usize = states.iter().map(|s| s.vector_size).sum();
     let first = &states[0];
     crate::merge_stats::record_concat(states.len(), first.heap.len());
 
     // Uniform columns leave the key and become scalars in the output.
-    let uniform: Vec<Option<Value>> = columns.iter().map(|c| c.uniform_scalar()).collect();
+    let uniform: Vec<Option<Value>> = {
+        let _t = TraceSpan::new("vm_uniform", "vectorize");
+        columns.iter().map(|c| c.uniform_scalar()).collect()
+    };
     let key: Vec<&Column> = columns
         .iter()
         .zip(&uniform)
@@ -716,9 +937,14 @@ pub fn merge_dedup_group(states: &[State]) -> Option<State> {
         // No column tells any two rows apart: every row is the same row.
         (vec![0u32], total_rows - 1)
     } else {
-        let hashes = hash_rows(&key, total_rows);
+        let hashes = {
+            let _t = TraceSpan::new("vm_hash", "vectorize");
+            hash_rows(&key, total_rows)
+        };
         let t_bucket = crate::op_census::start();
+        let _t_mask = TraceSpan::new("vm_mask", "vectorize");
         let (mask, unique_count) = virtual_unique_mask(&key, &hashes);
+        drop(_t_mask);
         crate::op_census::record(crate::op_census::Cat::DedupBucket, total_rows, 0, t_bucket);
         let kept: Vec<u32> = mask
             .iter()
@@ -733,6 +959,7 @@ pub fn merge_dedup_group(states: &[State]) -> Option<State> {
     // Gather every non-uniform column's survivors up front, columns in
     // parallel - they are independent, and each gather is a sorted piece
     // walk into a fresh allocation.
+    let _t_gather = TraceSpan::new("vm_gather", "vectorize");
     let mut gathered: Vec<Option<Value>> = {
         let threads = merge_threads().min(columns.len().max(1));
         let mut gathered: Vec<Option<Value>> = (0..columns.len()).map(|_| None).collect();
@@ -764,6 +991,8 @@ pub fn merge_dedup_group(states: &[State]) -> Option<State> {
         gathered
     };
 
+    drop(_t_gather);
+    let _t_build = TraceSpan::new("vm_build", "vectorize");
     // Build the merged state, walking the same structure the collection
     // walked and consuming its columns in order. The `Origin` check makes a
     // traversal mismatch a loud panic instead of a silently misplaced
@@ -884,4 +1113,41 @@ pub fn merge_dedup_group(states: &[State]) -> Option<State> {
         prints: first.prints.clone(),
         vector_size: kept.len(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The partitioned probe must be bit-identical to the sequential one -
+    /// same mask, same dense slots, same uniq order - across sizes, thread
+    /// counts and duplicate densities.
+    #[test]
+    fn partitioned_probe_matches_sequential() {
+        // Deterministic pseudo-random hashes with plenty of duplicates.
+        let mut seed: u64 = 0x1234_5678_9abc_def0;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for &n in &[1usize, 5, 100, 1 << 14, (1 << 14) + 1, 100_000] {
+            for &distinct in &[1usize, 2, 37, 5000] {
+                let pool: Vec<u64> = (0..distinct).map(|_| next()).collect();
+                let hashes: Vec<u64> =
+                    (0..n).map(|_| pool[(next() as usize) % distinct]).collect();
+                let sequential = sequential_probe(&hashes);
+                for &threads in &[2usize, 3, 16] {
+                    let partitioned = partitioned_probe(&hashes, threads);
+                    assert_eq!(partitioned.mask, sequential.mask, "n={n} threads={threads}");
+                    assert_eq!(
+                        partitioned.dense_of_row, sequential.dense_of_row,
+                        "n={n} threads={threads}"
+                    );
+                    assert_eq!(partitioned.uniq, sequential.uniq, "n={n} threads={threads}");
+                }
+            }
+        }
+    }
 }
