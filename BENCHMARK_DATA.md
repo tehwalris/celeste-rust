@@ -723,6 +723,26 @@ The memory figure is the point: on the rewritten path the transient
 concat *was* a third of peak RSS. That gap should widen with depth, since
 the pre-dedup table grows ~1.6x per frame.
 
+### The hint_normalize points: measured load-bearing, kept (2026-08-06)
+
+The two shipped mid-frame normalize points (plus the leftover in
+_update_62) predate the branch-free rewrite, so removing them from the
+rewritten program was tried via a new `remove_hint` recipe rule (the
+rule is landed and stays; the entries are parked). Differential verify
+is identical across the difference - merging is semantics-preserving -
+and fragments grow 23 -> 505 mean per frame. Seven interleaved rounds
+at frames 42: **18.39 s with hints vs 19.09 s without (+3.8%), peak
+9.6 -> 10.0 GB**. So mid-frame fragment control still pays ~4% even
+with the virtual merge making merges cheap. The context-partitioned
+merge idea would *replace* these merge points with something stronger
+(partition on the fork-condition cells) rather than delete them.
+
+Separately and independently, the unsound per-column state comparison
+that used to live behind these hint merges (union_diff's
+NormalizedState) is deleted outright - union_diff is now a guarded
+pass-through that panics with instructions if a real dedup is ever
+needed again.
+
 ### Ranged filter gathers: -13.5% (2026-08-05)
 
 A new census column asked how *chunky* filter gathers are: contiguous

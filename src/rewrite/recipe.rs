@@ -26,7 +26,7 @@ use super::rules::{
     mask_loop, merge_blocks,
     pin_builtin,
     promote_capture,
-    promote_cell, sink_store, speculate, speculate_region, split_call, unroll_loop, widen_buttons, widen_rem,
+    promote_cell, sink_store, speculate, speculate_region, split_call, unroll_loop, remove_hint, widen_buttons, widen_rem,
 };
 use crate::ir::LocalId;
 use super::validate::{validate_function, validate_program};
@@ -404,6 +404,14 @@ pub enum Rule {
         /// The block to flag.
         block: String,
     },
+    /// Unmark a block as an early normalize point (inverse of `add_hint`).
+    #[serde(rename = "remove_hint")]
+    RemoveHint {
+        #[serde(rename = "fn")]
+        function: String,
+        /// The block to unflag.
+        block: String,
+    },
     /// Insert the in-place equivalent of `__reset_button_states()` at the
     /// head of a block: store a fresh unknown boolean into each of the six
     /// `__button_states` cells. Sound only if every `btn` read of the frame
@@ -464,6 +472,7 @@ impl Rule {
             Rule::UnrollLoop { .. } => "unroll_loop",
             Rule::DedupGuards => "dedup_guards",
             Rule::AddHint { .. } => "add_hint",
+            Rule::RemoveHint { .. } => "remove_hint",
             Rule::WidenButtons { .. } => "widen_buttons",
             Rule::WidenRem { .. } => "widen_rem",
             Rule::AssumeEq { .. } => "assume_eq",
@@ -678,6 +687,7 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::UnrollLoop { function, head } => unroll_loop::apply(program, function, head),
         Rule::DedupGuards => dedup_guards::apply(program),
         Rule::AddHint { function, block } => add_hint::apply(program, function, block),
+        Rule::RemoveHint { function, block } => remove_hint::apply(program, function, block),
         Rule::WidenButtons { function, block } => widen_buttons::apply(program, function, block),
         Rule::WidenRem { function, block, object } => {
             widen_rem::apply(program, function, block, parse_cell(object)?)
@@ -810,6 +820,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         }
         Rule::DedupGuards => dedup_guards::verify(&before, program),
         Rule::AddHint { function, block } => add_hint::verify(&before, program, function, block),
+        Rule::RemoveHint { function, block } => {
+            remove_hint::verify(&before, program, function, block)
+        }
         Rule::WidenButtons { function, block } => {
             widen_buttons::verify(&before, program, function, block)
         }
