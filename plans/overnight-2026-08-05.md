@@ -214,10 +214,28 @@ replay ~2.4% (a constant bench includes), allocator ~2%.
   fresh rem - and the mid-frame flr splits then re-concretize rem,
   recreating exactly the lanes an early dedup removes. Hence the early
   hint's +30%: kill 59%, pay a merge, flr resurrects them. The
-  redundancy is structural to the interval abstraction. The genuinely
-  open variant: dedup after widening AND keep rem widened longer (defer
-  the flr split), which changes the abstraction's precision/cost
-  trade - a strategy.md-level question, not an interpreter tweak.
+  redundancy is structural to the interval abstraction. A variant that
+  deferred the flr re-split (keeping rem widened longer) was considered
+  and **ruled out by Philippe (2026-08-06): it changes the normalized
+  result set, and the abstraction's precision is not up for trade. Do
+  not revisit.**
+
+## Afternoon: key sweep + class-dead speculation sizing (2026-08-06)
+
+* Key sweep at f42 found the knee: +freeze adds zero classes (constant
+  mid-game); +grace,dash_effect_time is +45% time (758 mean fragments);
+  +spd-signs is +500% (5,398). **The 5-cell key is the optimum.**
+* Frontier with it: f45 47.6 s / 8.5 GB, **f46 70.0 s**, **f47 104.1 s /
+  16.3 GB** (12M lanes) - six frames past yesterday at equal cost.
+* Philippe's constant-folding question, sized: 73% of select executions
+  route on uniform masks; they discard **770M vector-arm lanes** (vs
+  ~5.8B total select+binop lanes at f42) - >=13% of vector work is
+  class-dead speculation, more counting the discarded arms' upstream
+  chains. Estimated prize for per-class constant folding + DCE of
+  speculated regions: ~3-10% of frame time. Real but second-order at
+  current costs; the assume_eq/fold machinery is most of a static
+  two-variant (dashing vs not) implementation when it climbs the
+  priority list.
 
 ## Ranked next steps
 
