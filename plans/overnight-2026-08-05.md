@@ -19,6 +19,10 @@ commit. All commits pushed to `census` (and `interpreter` follows it).
 | partitioned probe (hash high bits, >=512k rows) | 29.01 s (-0.4%) | f40 7.44 s (-2.4%) | (probe) |
 
 | state-parallel flow (opt-in: plain program only) | **22.33 s (-22.4%)**, +14% mem | flat (gate off) | (parallel flow) |
+| select pick loop specialized per arm repr | flat | f42 -2.6% | (select) |
+
+**Milestone gate: `rewrite verify --frames 40` identical on the full
+stack; `CELESTE_CHECK_UNION=1` at `-n 40`: zero mismatches.**
 
 **Cumulative: runner -n 39 44.4 -> 22.3 s (-49.7%). bench f40 9.76 -> ~7.2 s.**
 
