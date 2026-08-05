@@ -545,6 +545,35 @@ pub fn make_state_abstract(mut state: State) -> State {
         }
     }
 
+    // Pin the gameplay-dead timer globals to 0.
+    //
+    // `frames`, `seconds`, `minutes` and `deaths` form a closed subsystem in
+    // celeste-minimal: they only ever feed each other (the timer cascade and
+    // the death counter), never gameplay. The single gameplay read is the
+    // fruit sprite wobble `sin(frames/30)` - and `sin` is deliberately absent
+    // from the fixed env, so a room where that read executes crashes loudly
+    // instead of silently depending on a pinned value. Erasing them at the
+    // frame boundary makes the state representation world-still, which is
+    // what allows cross-frame visited-set dedup (a state reached at frame n
+    // never needs re-expansion later). It also merges died-and-respawned
+    // lanes with never-died ones (`deaths` is lane-varying after a death).
+    for name in ["frames", "seconds", "minutes", "deaths"] {
+        let cell = state
+            .global_env
+            .get(name)
+            .copied()
+            .unwrap_or_else(|| panic!("timer global {} missing - pinning would silently not apply", name));
+        match state.heap.get(cell) {
+            HeapValue::Value(Value::Number(_)) => {
+                state.heap.set(
+                    cell,
+                    HeapValue::Value(Value::Number(MaybeVector::Scalar(Pico8Num::from_i16(0)))),
+                );
+            }
+            other => panic!("timer global {} is not a number: {:?}", name, other),
+        }
+    }
+
     state
 }
 
