@@ -1284,6 +1284,8 @@ fn main() -> Result<()> {
             let total_us: f64 = rows.iter().map(|(_, _, d, _)| d.as_micros() as f64).sum();
 
             let analysis = celeste_rust::rewrite::class_dead::analyze(&program);
+            let fwd_class = celeste_rust::rewrite::class_dead::analyze_forwarding(&program, false);
+            let fwd_buttons = celeste_rust::rewrite::class_dead::analyze_forwarding(&program, true);
             let mut determined_us = 0.0f64;
             let mut at_risk_us = 0.0f64;
             let mut at_risk_count = 0usize;
@@ -1317,6 +1319,37 @@ fn main() -> Result<()> {
                 at_risk_us / 1e6,
                 100.0 * at_risk_us / total_us.max(1.0),
             );
+            for (label, fwd) in [
+                ("cell-forwarding, class only", &fwd_class),
+                ("cell-forwarding + buttons (per input-combo variants)", &fwd_buttons),
+            ] {
+                let mut det_us = 0.0f64;
+                let mut det_n = 0usize;
+                let mut risk_us = 0.0f64;
+                let mut risk_n = 0usize;
+                for (function, id, duration, _) in &rows {
+                    let Some(fun) = fwd.per_function.get(function) else { continue };
+                    let local = celeste_rust::ir::LocalId::from(*id);
+                    if fun.determined.contains(&local) {
+                        det_us += duration.as_micros() as f64;
+                        det_n += 1;
+                    } else if fun.at_risk.contains(&local) {
+                        risk_us += duration.as_micros() as f64;
+                        risk_n += 1;
+                    }
+                }
+                println!(
+                    "  [{}] determined: {} instrs, {:.2}s ({:.1}%); at-risk: {} instrs, {:.2}s ({:.1}%); determined cells: {}",
+                    label,
+                    det_n,
+                    det_us / 1e6,
+                    100.0 * det_us / total_us.max(1.0),
+                    risk_n,
+                    risk_us / 1e6,
+                    100.0 * risk_us / total_us.max(1.0),
+                    fwd.determined_cells.len(),
+                );
+            }
         }
         Command::Bench { frames, baseline, profile } => {
             if baseline {

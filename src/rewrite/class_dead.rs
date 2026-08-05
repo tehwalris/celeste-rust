@@ -35,6 +35,180 @@ pub struct FunctionClassDead {
     pub at_risk: FxHashSet<LocalId>,
 }
 
+/// Whole-program determinedness with cell forwarding: a global cell is
+/// *determined* when every store into it stores a determined value; loads
+/// of determined cells are determined. Buttons can join the seed set
+/// ("buttons known": per-variant specialization on the 2^k input combos),
+/// in which case loads through the `__button_states` array are determined
+/// too. Value- and cell-determinedness are mutually recursive, so the
+/// whole program iterates to a fixed point.
+pub struct ProgramClassDead {
+    pub per_function: FxHashMap<String, FunctionClassDead>,
+    pub determined_cells: FxHashSet<String>,
+}
+
+fn function_cfgs(program: &Program) -> Vec<(String, &Cfg)> {
+    let mut out: Vec<(String, &Cfg)> = program
+        .functions
+        .iter()
+        .map(|(name, fun)| (name.as_str().to_string(), &fun.cfg))
+        .collect();
+    out.push(("__main".to_string(), program.frame_cfg()));
+    out
+}
+
+/// One pass of value-determinedness over a CFG, given the currently
+/// determined cell set. Returns (determined locals, the cells this CFG
+/// stores non-determined values into).
+fn function_pass(
+    cfg: &Cfg,
+    patterns: &[String],
+    buttons_known: bool,
+    determined_cells: &FxHashSet<String>,
+) -> (FxHashSet<LocalId>, FxHashSet<String>) {
+    let mut instrs: FxHashMap<LocalId, &Instruction> = FxHashMap::default();
+    let mut order: Vec<LocalId> = Vec::new();
+    for block in std::iter::once(&cfg.entry).chain(cfg.named.values()) {
+        for (id, instr) in &block.instructions {
+            instrs.insert(*id, instr);
+            order.push(*id);
+        }
+    }
+
+    // Which locals are pointers to which named global cell (or to the
+    // button array / its elements).
+    let mut global_ptr: FxHashMap<LocalId, String> = FxHashMap::default();
+    let mut button_ish: FxHashSet<LocalId> = FxHashSet::default();
+    for &id in &order {
+        match instrs[&id] {
+            Instruction::GetGlobal { name, .. } => {
+                if name == "__button_states" {
+                    button_ish.insert(id);
+                } else {
+                    global_ptr.insert(id, name.clone());
+                }
+            }
+            // The promoted player cells are object *fields* (get_field
+            // %player.djump), not globals - track those pointers by field
+            // name. Field names double as cell identities here, which is
+            // exact enough for a sizing analysis.
+            Instruction::GetField { field, .. } => {
+                global_ptr.insert(id, field.clone());
+            }
+            Instruction::Load { source } => {
+                if button_ish.contains(source) {
+                    button_ish.insert(id);
+                }
+            }
+            Instruction::GetIndex { receiver, .. } => {
+                if button_ish.contains(receiver) {
+                    button_ish.insert(id);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut determined: FxHashSet<LocalId> = FxHashSet::default();
+    loop {
+        let mut changed = false;
+        for &id in &order {
+            if determined.contains(&id) {
+                continue;
+            }
+            let instr = instrs[&id];
+            let ok = match instr {
+                Instruction::NumberConstant { .. } | Instruction::BoolConstant { .. } => true,
+                Instruction::Load { source } => {
+                    (buttons_known && button_ish.contains(source))
+                        || global_ptr.get(source).is_some_and(|g| {
+                            is_partition_global(g, patterns) || determined_cells.contains(g)
+                        })
+                }
+                _ if pure_value(instr) => {
+                    let used = instr.get_used_locals();
+                    !used.is_empty() && used.iter().all(|u| determined.contains(u))
+                }
+                _ => false,
+            };
+            if ok {
+                determined.insert(id);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Cells this CFG stores non-determined values into.
+    let mut dirty_cells: FxHashSet<String> = FxHashSet::default();
+    for &id in &order {
+        if let Instruction::Store { target, source } = instrs[&id] {
+            if let Some(global) = global_ptr.get(target) {
+                if !determined.contains(source) {
+                    dirty_cells.insert(global.clone());
+                }
+            }
+        }
+    }
+    (determined, dirty_cells)
+}
+
+/// Whole-program fixed point. Starts optimistic (every stored-to global
+/// cell determined) and removes cells that receive non-determined stores,
+/// until stable; then classifies at-risk chains per function.
+pub fn analyze_forwarding(program: &Program, buttons_known: bool) -> ProgramClassDead {
+    let patterns = &program.merge_partition_cells;
+    let cfgs = function_cfgs(program);
+
+    // Optimistic start: every global name stored to anywhere.
+    let mut determined_cells: FxHashSet<String> = FxHashSet::default();
+    for (_, cfg) in &cfgs {
+        for block in std::iter::once(&cfg.entry).chain(cfg.named.values()) {
+            for (_, instr) in &block.instructions {
+                if let Instruction::GetGlobal { name, .. } = instr {
+                    if name != "__button_states" {
+                        determined_cells.insert(name.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    loop {
+        let mut all_dirty: FxHashSet<String> = FxHashSet::default();
+        for (_, cfg) in &cfgs {
+            let (_, dirty) = function_pass(cfg, patterns, buttons_known, &determined_cells);
+            all_dirty.extend(dirty);
+        }
+        let before = determined_cells.len();
+        for cell in &all_dirty {
+            determined_cells.remove(cell);
+        }
+        if determined_cells.len() == before {
+            break;
+        }
+    }
+
+    let mut per_function = FxHashMap::default();
+    for (name, cfg) in &cfgs {
+        let (determined, _) = function_pass(cfg, patterns, buttons_known, &determined_cells);
+        let at_risk = at_risk_for(cfg, &determined);
+        per_function.insert(
+            name.clone(),
+            FunctionClassDead {
+                determined,
+                at_risk,
+            },
+        );
+    }
+    ProgramClassDead {
+        per_function,
+        determined_cells,
+    }
+}
+
 /// Whether an instruction is pure enough to be class-determined when its
 /// inputs are: no heap effects, no state splits, value fully a function of
 /// operands.
@@ -58,6 +232,71 @@ fn is_partition_global(name: &str, patterns: &[String]) -> bool {
     patterns
         .iter()
         .any(|p| name == p || p.ends_with(&format!(".{}", name)))
+}
+
+/// Pure instructions whose every consumer path ends in the discarded-able
+/// arm of a determined-mask select.
+fn at_risk_for(cfg: &Cfg, determined: &FxHashSet<LocalId>) -> FxHashSet<LocalId> {
+    let mut instrs: FxHashMap<LocalId, &Instruction> = FxHashMap::default();
+    let mut order: Vec<LocalId> = Vec::new();
+    let mut consumers: FxHashMap<LocalId, Vec<LocalId>> = FxHashMap::default();
+    let mut terminator_used: FxHashSet<LocalId> = FxHashSet::default();
+    for block in std::iter::once(&cfg.entry).chain(cfg.named.values()) {
+        for (id, instr) in &block.instructions {
+            instrs.insert(*id, instr);
+            order.push(*id);
+            for used in instr.get_used_locals() {
+                consumers.entry(used).or_default().push(*id);
+            }
+        }
+        let (_, terminator) = &block.terminator;
+        for used in terminator.get_used_locals() {
+            terminator_used.insert(used);
+        }
+    }
+    let mut at_risk: FxHashSet<LocalId> = order
+        .iter()
+        .copied()
+        .filter(|id| {
+            let instr = instrs[id];
+            pure_value(instr) && !determined.contains(id) && !terminator_used.contains(id)
+        })
+        .collect();
+    loop {
+        let drop: Vec<LocalId> = at_risk
+            .iter()
+            .copied()
+            .filter(|&id| {
+                !consumers.get(&id).map_or(false, |cs| {
+                    !cs.is_empty()
+                        && cs.iter().all(|c| {
+                            if at_risk.contains(c) {
+                                return true;
+                            }
+                            match instrs.get(c) {
+                                Some(Instruction::Select {
+                                    condition,
+                                    if_true,
+                                    if_false,
+                                }) => {
+                                    determined.contains(condition)
+                                        && (*if_true == id || *if_false == id)
+                                        && *condition != id
+                                }
+                                _ => false,
+                            }
+                        })
+                })
+            })
+            .collect();
+        if drop.is_empty() {
+            break;
+        }
+        for id in drop {
+            at_risk.remove(&id);
+        }
+    }
+    at_risk
 }
 
 pub fn analyze_function(cfg: &Cfg, patterns: &[String]) -> FunctionClassDead {
