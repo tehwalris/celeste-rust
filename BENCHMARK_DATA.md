@@ -691,6 +691,52 @@ The memory figure is the point: on the rewritten path the transient
 concat *was* a third of peak RSS. That gap should widen with depth, since
 the pre-dedup table grows ~1.6x per frame.
 
+### Ranged filter gathers: -13.5% (2026-08-05)
+
+A new census column asked how *chunky* filter gathers are: contiguous
+runs in the kept-index list. Answer at frame 37: **30.6 lanes per run**
+at `filter_branch`, 19.5 at `filter_split_flr` - nothing like the ~2 a
+random mask would give. Adjacent lanes share history (concat and
+first-occurrence dedup preserve arrival order), so they usually agree on
+a branch condition. The same census also showed `filter_dedup` at zero
+calls - the virtual merge has eliminated dedup-side filtering entirely.
+
+So `filter_by_mask` now scans the mask once into `[start, end)` ranges
+(`KeptLanes`) and each vector gathers by `extend_from_slice` per run -
+memcpy, since the payloads are `Copy` - instead of one indexed copy per
+lane.
+
+Interleaved A/B, 3 rounds, identical lane counts:
+
+|                    | before | after | delta |
+|--------------------|--------|-------|-------|
+| runner `-n 39`     | 38.77 s | 33.54 s | **-13.5%** |
+| `bench --frames 37`| 2.54 s | 2.38 s | -6.4% |
+
+The largest single win of 2026-08-05, and it stacks with the uniform
+collapse (which raises run lengths by removing lane-varying columns).
+If lanes were ever sorted by context at the merge, run lengths - and this
+win - would grow further; that is the cheap consumer the sorted-lane idea
+was missing.
+
+### Hint-block union kept as states, not as a persistent normalized set (2026-08-05)
+
+Tried: replacing the accumulated `Vec<State>` union at hint_normalize
+blocks with a persistent `FxHashSet<NormalizedState>`, so fixed-point
+rounds stop re-normalizing (clone + gc) the whole union. Parked on the
+numbers: runner `-n 39` 38.77 s -> 39.13 s (+0.9%, slower in all three
+interleaved pairs), bench 2.56 s -> 2.52 s with peak 1.01 -> 0.93 GB.
+
+The reason there was nothing to win: `merge_hint_normalize` runs exactly
+once per hint block per frame (74 spans = 37 frames x 2 blocks), so every
+fixed point converges in a single round and the cross-round membership
+check never rejects anything. The old code's `accumulated.is_empty()`
+fast path was already optimal; the new version only added deep normalized
+copies (the union states are Arc-shared, a `NormalizedState` is not) held
+until the CFG ends. If fixed points ever start taking multiple rounds -
+loops through hint blocks - revisit with a digest-indexed set that stores
+Arc-shared states and re-normalizes only on digest hits.
+
 ### If-converting the two hot fork sites: not available, and the nearby one is a 2.2x regression (2026-08-05)
 
 The per-site filter census put 99% of `filter_branch` on two branches -
