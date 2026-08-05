@@ -638,6 +638,59 @@ predecessor but dead on entry here, which die *on the edge*. Without it
 one path drops a value while a sibling path carries it, and two states
 that should merge differ by something neither can read.
 
+### Uniform vectors collapse to `Scalar` at construction: -8.4% / -8.6% memory (2026-08-05)
+
+The output-cardinality census (`CELESTE_INSTR_CARD=1` with
+`rewrite bench --profile`) measured, for every instruction, how many
+distinct values its output vector contains. Result at frame 37 of the
+rewritten program: 0.54 s of non-call instruction time, and 100% of it -
+to three decimals - is lanes duplicating a value that already exists
+elsewhere in the same output vector. No hot instruction: the top one is
+13 ms; mean output is ~50k lanes with 1-28 distinct values, max distinct
+anywhere 51. Several selects produce *constant* vectors (dist/exec = 1.0),
+and nothing mid-frame demoted a constant vector to `Scalar` - only the
+merge's `unvectorize_if_possible` did, once per frame.
+
+So `MaybeVector::vector` now early-exit-scans fresh lanes and returns
+`Scalar` when they are uniform. Every producer funnels through it (map,
+map2, select gather, filter gather, concat), so uniform vectors stop
+existing at all, downstream ops go per-state instead of per-lane, and the
+column drops out of the merge's dedup key. Safe against merge-group
+fragmentation because shape normalization is representation-blind.
+Non-uniform vectors pay a few comparisons (exit at the first differing
+lane).
+
+Interleaved A/B, 3 rounds each, identical lane counts:
+
+|                    | base           | collapsed      | delta |
+|--------------------|----------------|----------------|-------|
+| runner `-n 39`     | 44.36 s / 16.2 GiB | 40.64 s / 14.9 GiB | -8.4% time, -8.6% mem |
+| `bench --frames 37`| 2.89 s         | 2.71 s         | -6.4% |
+
+Differentially identical through 37.
+
+### The virtual-concat merge, fourth attempt: landed (2026-08-05)
+
+Multi-state merge groups now dedup over a *virtual* concatenation
+(`src/interpreter/virtual_merge.rs`): hash, dedup and gather run straight
+off the per-fragment columns, and the 23.6M-row pre-dedup table (frame 37)
+is never built. The two killers of the three parked attempts are handled -
+uniform columns leave the dedup key explicitly, and every access is a
+sorted piece walk. Output is identical to the materialised pipeline
+(same hash seed, so the same survivor mask; a test holds the two states
+equal, representation included), which stays as the fallback.
+
+Interleaved A/B, 3 rounds each, identical lane counts:
+
+|                    | materialised   | virtual        | delta |
+|--------------------|----------------|----------------|-------|
+| runner `-n 39`     | 40.42 s / 14.9 GiB | 39.03 s / 14.6 GiB | -3.4% time |
+| `bench --frames 37`| 2.68 s / 1.41 GB peak | 2.57 s / **1.01 GB** peak | -4.1% time, **-28% mem** |
+
+The memory figure is the point: on the rewritten path the transient
+concat *was* a third of peak RSS. That gap should widen with depth, since
+the pre-dedup table grows ~1.6x per frame.
+
 ### If-converting the two hot fork sites: not available, and the nearby one is a 2.2x regression (2026-08-05)
 
 The per-site filter census put 99% of `filter_branch` on two branches -
