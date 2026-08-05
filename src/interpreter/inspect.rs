@@ -545,6 +545,14 @@ pub fn make_state_abstract(mut state: State) -> State {
         }
     }
 
+    // NOTE on p_jump/p_dash (2026-08-06): widening the held-button trails to
+    // unknown at the boundary was considered (it would merge the dominated
+    // held variants with their released twins) and REJECTED by Philippe: it
+    // is an over-approximation - it admits e.g. ground-jump at n followed by
+    // wall-jump at n+1, which the concrete game forbids (the press at n
+    // forces p_jump=true at n+1). Unlike the rem widening this changes the
+    // reachable set asymmetrically, so it stays out.
+
     // Pin the gameplay-dead timer globals to 0.
     //
     // `frames`, `seconds`, `minutes` and `deaths` form a closed subsystem in
