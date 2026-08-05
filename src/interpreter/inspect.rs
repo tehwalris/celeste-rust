@@ -680,6 +680,48 @@ pub fn apply_conservative_widenings(mut state: State) -> State {
     state
 }
 
+/// Lanes whose global `room.x` equals `x`.
+///
+/// `next_room()` writes the new room index when the player crosses the top of
+/// the screen, so for a search confined to room (1,0) the lanes with
+/// `room.x == 2` at a frame boundary are exactly the ones that exited - the
+/// win condition. The earliest frame where any appear is the optimal TAS
+/// length (under the search's stated abstractions).
+///
+/// Loud on structural surprises: `room` missing or non-numeric means the
+/// probe would silently never fire, which is worse than a crash.
+pub fn count_room_x_lanes(state: &State, x: i16) -> usize {
+    let helper = StateHelper::new(state);
+    // The global cell holds a pointer to the table (globals are boxed like
+    // locals); follow the one indirection.
+    let cell = helper
+        .find_global("room")
+        .unwrap_or_else(|| panic!("count_room_x_lanes: no `room` global"));
+    let table_id = helper
+        .unwrap_pointer(helper.load(cell))
+        .unwrap_or_else(|| panic!("count_room_x_lanes: `room` global is not a table pointer"));
+    let HeapValue::ObjectTable(room) = helper.load(table_id) else {
+        panic!("count_room_x_lanes: `room` does not point at a table");
+    };
+    let x_id = *room
+        .get("x")
+        .unwrap_or_else(|| panic!("count_room_x_lanes: room table has no x field"));
+    let HeapValue::Value(Value::Number(n)) = helper.load(x_id) else {
+        panic!("count_room_x_lanes: room.x is not a number");
+    };
+    let want = Pico8Num::from_i16(x);
+    match n {
+        MaybeVector::Scalar(s) => {
+            if *s == want {
+                state.vector_size
+            } else {
+                0
+            }
+        }
+        MaybeVector::Vector(v) => v.iter().filter(|s| **s == want).count(),
+    }
+}
+
 // ============================================================================
 // Full State Serialization (for debugging)
 // ============================================================================

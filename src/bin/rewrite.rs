@@ -198,8 +198,36 @@ fn bench(
         celeste_rust::merge_stats::reset();
     }
     let start = std::time::Instant::now();
-    for _ in 1..=frames {
+    let mut first_win: Option<u32> = None;
+    for frame in 1..=frames {
+        let frame_start = std::time::Instant::now();
         run.step()?;
+        // Room-exit probe: lanes that reached room (2,0) have won room (1,0).
+        // The earliest such frame is the optimal TAS length under the search's
+        // abstractions.
+        let win_lanes: usize = run
+            .states()
+            .iter()
+            .map(|s| celeste_rust::interpreter::inspect::count_room_x_lanes(s, 2))
+            .sum();
+        if win_lanes > 0 && first_win.is_none() {
+            first_win = Some(frame);
+        }
+        println!(
+            "frame {:>3}: {:>7.2}s  {:>10} lanes  rss {:>5.1} GB{}",
+            frame,
+            frame_start.elapsed().as_secs_f64(),
+            run.lane_count(),
+            peak_rss_kb() as f64 / 1048576.0,
+            if win_lanes > 0 {
+                format!("  WIN: {} lanes in room (2,0)", win_lanes)
+            } else {
+                String::new()
+            }
+        );
+    }
+    if let Some(frame) = first_win {
+        println!("first room-exit lanes appeared at frame {}", frame);
     }
     let elapsed = start.elapsed();
     let lanes = run.lane_count();
