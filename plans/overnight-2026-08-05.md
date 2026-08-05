@@ -116,6 +116,25 @@ cost anatomy (gather vs allocation vs arms), then a prototype that
 evaluates hot selects per distinct (mask, arm-value) context instead of
 per lane.
 
+## Op-level anatomy at frame 42 (CELESTE_CENSUS, frame 42 alone)
+
+| op | time | ns/elem | GB/s |
+|---|---|---|---|
+| binop | 2.02 s | 0.51 | 14.7 |
+| state filter | 1.57 s | 1.00 | 11.4 |
+| dedup bucket (probe+pack+verify wall) | 1.55 s | 20.7/row | - |
+| select | 1.42 s | 0.63 | 15.0 |
+| hash_rows | 0.59 s | 0.46 | **42** |
+| map | 0.17 s | 0.32 | - |
+
+hash_rows runs at ~3x the GB/s of select/binop/filter: the latter are not
+bandwidth-limited, they are allocation- and mixed-stream-bound. So the
+per-lane ops have ~2-3x headroom even before any representation change,
+and the representation change (per-context evaluation over <=59 distinct
+values) is worth ~10x on top for the ops it can cover. The two fork
+sites again: in_i1_074_cont 0.81 s + and_or_join_126 0.57 s of filter at
+frame 42 alone.
+
 ## Ranked next steps
 
 1. ~~Fragment-parallel frame execution~~ DONE as state-parallel flow
