@@ -533,6 +533,17 @@ pub fn describe_objects(state: &State) -> String {
 /// This is the key function for abstract interpretation - it widens concrete values
 /// to represent uncertainty (e.g., player's sub-pixel position can be anywhere in [-0.5, 0.5)).
 pub fn make_state_abstract(state: State) -> State {
+    // CELESTE_EXACT_REM: skip the historic rem widening and track rem
+    // exactly, keeping only the certified quotient widenings (timer pins,
+    // dash_effect_time clamp). A strict refinement of the widened
+    // abstraction - the reachable set becomes the CONCRETE one (of the
+    // jbuffer-stripped minimal cart), so the earliest win frame is the
+    // concrete optimum rather than the rem-widened lower bound. Costs more
+    // rows per (pos, spd, flags); measured before use, see the ledger.
+    static EXACT_REM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *EXACT_REM.get_or_init(|| std::env::var_os("CELESTE_EXACT_REM").is_some()) {
+        return apply_conservative_widenings(state);
+    }
     apply_conservative_widenings(make_state_abstract_rem_only(state))
 }
 
