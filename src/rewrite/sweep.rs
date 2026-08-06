@@ -98,21 +98,48 @@ pub fn backward_sweep(
     // Edge chunks spill to disk per frame: at full-room scale the edge set
     // is tens of GB, and a growing Vec's doubling reallocs would spike past
     // the memory cap. They are re-read once, into an exactly-sized Vec.
+    // Chunks persist across sweeps: a frame's edges depend only on its saved
+    // batch (deterministic replay), so extending the horizon later only
+    // replays the NEW frames. Win seeds are persisted alongside for the same
+    // reason.
     let edge_dir = dir.join("sweep-edges");
-    if edge_dir.exists() {
-        std::fs::remove_dir_all(&edge_dir)?;
-    }
     std::fs::create_dir_all(&edge_dir)?;
     let mut edge_total: u64 = 0;
     let mut edge_chunks: Vec<std::path::PathBuf> = Vec::new();
 
     for f in 1..=frames {
         let t = std::time::Instant::now();
+        let chunk_path = edge_dir.join(format!("f{:03}.bin", f));
+        let wins_path = edge_dir.join(format!("wins-f{:03}.bin", f));
+        // Reuse a previous sweep's work for this frame if present.
+        if wins_path.exists() && (chunk_path.exists() || f == frames) {
+            let mut wins: Vec<(u32, u32)> = Vec::new();
+            checkpoint::read_u32_pairs_into(&wins_path, &mut wins)?;
+            for (id, _) in wins {
+                *g.get_mut(id as usize)
+                    .ok_or_else(|| anyhow!("wins-f{:03}: id out of range", f))? = 0;
+            }
+            if f < frames {
+                let mut pairs: Vec<(u32, u32)> = Vec::new();
+                // Only the count is needed here; the pairs are re-read for
+                // the BFS load below. Read the header count cheaply.
+                checkpoint::read_u32_pairs_into(&chunk_path, &mut pairs)?;
+                edge_total += pairs.len() as u64;
+                edge_chunks.push(chunk_path);
+            }
+            continue;
+        }
         let states = checkpoint::load_frame_states(dir, f)
             .with_context(|| format!("loading frame batch f{:03}", f))?;
         if states.is_empty() {
+            checkpoint::write_u32_pairs(&wins_path, &[])?;
+            if f < frames {
+                checkpoint::write_u32_pairs(&chunk_path, &[])?;
+                edge_chunks.push(chunk_path);
+            }
             continue;
         }
+        let mut frame_wins: Vec<(u32, u32)> = Vec::new();
         let mut batch = Vec::with_capacity(states.len());
         let mut batch_lanes = 0usize;
         for mut state in states {
@@ -129,6 +156,7 @@ pub fn backward_sweep(
             for (id, win) in ids.iter().zip(room_x_lane_mask(&state, 2)) {
                 if win {
                     g[*id as usize] = 0;
+                    frame_wins.push((*id, 0));
                 }
             }
             batch_lanes += state.vector_size;
@@ -137,6 +165,7 @@ pub fn backward_sweep(
                 batch.push(state);
             }
         }
+        checkpoint::write_u32_pairs(&wins_path, &frame_wins)?;
         if f == frames {
             break;
         }
@@ -194,7 +223,6 @@ pub fn backward_sweep(
         // input combinations); dedup, then spill the chunk to disk.
         frame_edges.sort_unstable();
         frame_edges.dedup();
-        let chunk_path = edge_dir.join(format!("f{:03}.bin", f));
         checkpoint::write_u32_pairs(&chunk_path, &frame_edges)?;
         edge_total += frame_edges.len() as u64;
         edge_chunks.push(chunk_path);
@@ -227,7 +255,7 @@ pub fn backward_sweep(
     for chunk in &edge_chunks {
         checkpoint::read_u32_pairs_into(chunk, &mut edges)?;
     }
-    std::fs::remove_dir_all(&edge_dir)?;
+    // Chunks stay on disk for incremental horizon extension.
 
     let t = std::time::Instant::now();
     edges.sort_unstable_by_key(|&(src, dst)| (dst, src));
