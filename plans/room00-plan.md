@@ -96,7 +96,7 @@ specialization ("JIT variants"), per Philippe 2026-08-06.
   exhaustively and any fruit/sin bug is a loud error, not a silent
   wrong answer.
 
-## Fidelity deviations (proposed, need sign-off)
+## Fidelity deviations (SIGNED OFF by Philippe 2026-08-06)
 
 The original spawns extra display-only objects that minimal omits:
 4 `smoke` per wall break (init calls rnd() - cannot be modeled
@@ -108,6 +108,13 @@ writes the player, acts as a solid, or influences any state that
 interacting code reads, so the player trajectory and frame counts
 are identical; and once smoke is omitted (forced by rnd), lifeup's
 omission costs nothing further since array indices already differ.
+
+Sign-off notes: this is the approach for now; eventually we want a
+cleaner, mechanically-checked version of the non-interaction
+argument - treat it as a known issue, not a settled proof. On sin:
+Philippe will test bit-exactness against a real PICO-8 himself at
+some point; the f32+truncation implementation is believed correct
+and the stakes at this level are low, so it is not a blocker.
 
 ## Room (0,0) layout (from cart map, for route planning)
 

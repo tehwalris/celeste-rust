@@ -118,3 +118,13 @@ Ladder wall clock is ~3h; the two known inefficiencies, in order:
    table in memory across the whole ladder (checkpointing to disk
    only as crash insurance, not as the hand-off mechanism) removes
    the round-trips entirely.
+
+3. Back-compat complexity debt (Philippe, 2026-08-06). Several spots
+   now carry logic purely to avoid shifting hashes/fingerprints under
+   existing checkpoint universes: the fingerprint hashing precision /
+   start-room / flags only-when-non-default, and the sin builtin
+   registered only for non-(1,0) rooms. At some point do ONE cleanup
+   pass that removes all of this conditionality (hash everything
+   unconditionally, register builtins unconditionally), lets every
+   hash change once, and regenerates the checkpoint universes. Not
+   now.
