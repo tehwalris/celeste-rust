@@ -370,3 +370,30 @@ Findings (full room, 90 frames):
 
 The XY-dump run also reproduced the frame-90 win and the exact final
 frontier (4668057) with dump overhead of ~0% (738.6s).
+
+## 7. Refinement pipeline build (daytime, with Philippe)
+
+Direction set in the morning discussion: the strategy.md iterative
+precision refinement, not brute force. Everything below is committed:
+
+* Row table (dense ids + watermarks): R~(f) is a prefix of id space.
+* Checkpoints: JSON meta + columnar binary + zstd + strict fingerprint
+  (bench --checkpoint-dir/--resume; resume series bit-identical).
+* Backward sweep (rewrite sweep): static row graph via origin-tagged
+  replay of saved frame batches, g(row) by reverse BFS; B(f)/band from
+  the (e, g) scalars; edge chunks + win seeds persist for incremental
+  horizon extension. f45 smoke: zero replay divergence.
+* Rem precision ladder (CELESTE_REM_BITS): Bits(0) = historic, k in
+  1..15 = nested floor-aligned 2^-k buckets, 16 = exact. k=1 at f40:
+  455,637 lanes, between level 0 (174,938) and exact (1,937,074).
+* Band-restricted forward (bench --band-dir/--band-horizon/
+  --band-prev-bits): coarsen each lane to the previous level,
+  drop lanes with e > f or g > horizon - f (FILTER_BAND).
+
+In flight: the full level-0 sweep over the f90 run (expect
+min(e+g) = 90, cross-checking the forward win frame). Then: k=1 with
+band at horizon 90 - expected to REFUTE horizon 90 immediately (no
+win row by f90 at k=1), driving the first horizon bump toward the
+concrete optimum 100. Witness extraction at the final level: walk
+rows with decreasing g, recovering the input per step by trying the
+32 inputs concretely - the reference TAS should fall out.
