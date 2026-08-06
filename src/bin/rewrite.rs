@@ -297,11 +297,23 @@ enum Command {
 }
 
 fn peak_rss_kb() -> u64 {
+    read_status_kb("VmHWM:")
+}
+
+/// Current resident set, as opposed to the `VmHWM` peak: at a frame
+/// boundary the difference between the two is the mid-frame transient
+/// (fragments + append-only heap-storage growth), which is invisible in
+/// the peak-only number and turned out to dominate room (0,0)'s OOM.
+fn current_rss_kb() -> u64 {
+    read_status_kb("VmRSS:")
+}
+
+fn read_status_kb(field: &str) -> u64 {
     std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|s| {
             s.lines()
-                .find(|l| l.starts_with("VmHWM:"))
+                .find(|l| l.starts_with(field))
                 .and_then(|l| l.split_whitespace().nth(1)?.parse().ok())
         })
         .unwrap_or(0)
@@ -513,10 +525,11 @@ fn bench(
             run.absorb_won_lanes();
         }
         println!(
-            "frame {:>3}: {:>7.2}s  {:>10} lanes  rss {:>5.1} GB{}",
+            "frame {:>3}: {:>7.2}s  {:>10} lanes  rss {:>5.1} GB (peak {:>5.1}){}",
             frame,
             frame_start.elapsed().as_secs_f64(),
             run.lane_count(),
+            current_rss_kb() as f64 / 1048576.0,
             peak_rss_kb() as f64 / 1048576.0,
             if win_lanes > 0 {
                 format!("  WIN: {} lanes in room ({},_)", win_lanes, win_x)

@@ -91,8 +91,14 @@ impl Pico8Num {
 
     /// PICO-8 `sin`: the argument is in TURNS and the result is INVERTED
     /// (sin(0.25) == -1). Modeled on the console's C implementation: the
-    /// whole chain in f32 (`sinf`), converted to 16.16 by C-style
-    /// truncation toward zero (Rust `as i32`).
+    /// argument is first reduced to [0, 1) IN FIXED POINT (the 16
+    /// fractional bits - exact, and periodicity mod one turn holds by
+    /// construction, which the fruit-off boundary widening in
+    /// `inspect::apply_conservative_widenings` depends on); then the chain
+    /// runs in f32 (`sinf`), converted to 16.16 by C-style truncation
+    /// toward zero (Rust `as i32`). Without the reduction, f32 loses
+    /// fractional mantissa bits for arguments past 1.0 and sin(102/40) !=
+    /// sin(22/40) by an ulp - caught by test_pico8_sin_period_40_bit_exact.
     ///
     /// The quarter-turn values are exact by construction (see tests). Full
     /// bit-exactness against a real console has NOT been verified yet; the
@@ -101,7 +107,9 @@ impl Pico8Num {
     /// plans/room00-plan.md before trusting a proof that depends on fruit
     /// collection timing.
     pub fn pico8_sin(self) -> Self {
-        let turns = self.0 as f32 / 65536.0;
+        // Two's-complement masking IS floored mod 1.0: -0.25 -> 0.75.
+        let reduced = self.0 & 0xffff;
+        let turns = reduced as f32 / 65536.0;
         let v = -(turns * (2.0 * std::f32::consts::PI)).sin();
         Self((v * 65536.0) as i32)
     }
@@ -405,6 +413,30 @@ mod tests {
             (int(-4) - constants::PICO8_NUM_0_15).abs(),
             int(4) + constants::PICO8_NUM_0_15
         );
+    }
+
+    /// Pins the invariance the fruit-off boundary widening relies on
+    /// (`inspect::apply_conservative_widenings`): for every nonnegative
+    /// integer `off`, `sin(off/40) == sin((off mod 40)/40)` BIT-EXACTLY in
+    /// this implementation. The fixed-point division makes the arguments
+    /// differ by exactly 1.0 per period ((off+40)/40 == off/40 + 1 for
+    /// nonnegative integer division), but sin runs through an f32 chain
+    /// where +1.0 turn is NOT trivially bit-invariant - so the equality is
+    /// checked exhaustively over the whole integer range instead of argued.
+    #[test]
+    fn test_pico8_sin_period_40_bit_exact() {
+        let forty = Pico8Num::from_i16(40);
+        for off in 0..=i16::MAX {
+            let full = Pico8Num::from_i16(off) / forty;
+            let reduced = Pico8Num::from_i16(off % 40) / forty;
+            assert_eq!(
+                full.pico8_sin(),
+                reduced.pico8_sin(),
+                "sin({}/40) != sin({}/40)",
+                off,
+                off % 40
+            );
+        }
     }
 
     #[test]

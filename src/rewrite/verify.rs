@@ -830,6 +830,25 @@ impl AbstractRun {
             );
             self.states = kept;
         }
+        // Boundary compaction (env-gated: CELESTE_BOUNDARY_GC). The heap's
+        // storage is append-only and shared by Arc: without a gc, boundary
+        // states pin the whole mid-frame append log - every superseded
+        // HeapValue of every store - and the search's residency runs ~100x
+        // the frontier's materialized size (room (0,0) f79: ~70 GB resident
+        // vs 549 MB for the same states freshly loaded from disk). gc
+        // rebuilds each state's heap from its reachable cells, dropping the
+        // log. Row hashing is layout-independent (the probe paths gc before
+        // row_keys and match the search's tables), so hashes and standing
+        // checkpoints are unaffected.
+        if std::env::var_os("CELESTE_BOUNDARY_GC").is_some() {
+            let _trace = crate::interpreter::tracing::TraceSpan::new(
+                "boundary_gc",
+                "gc",
+            );
+            for state in &mut self.states {
+                state.gc();
+            }
+        }
         Ok(())
     }
 

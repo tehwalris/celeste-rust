@@ -879,6 +879,63 @@ pub fn apply_conservative_widenings(mut state: State) -> State {
     // forces p_jump=true at n+1). Unlike the rem widening this changes the
     // reachable set asymmetrically, so it stays out.
 
+    // Reduce each live fruit's bob counter modulo its period 40.
+    //
+    // Read census: `off` is written at fruit.init (this.off=0) and
+    // fruit.update (this.off += 1), and READ exactly once - fruit.update's
+    // `sin(this.off/40)` (celeste-minimal.lua ~line 425). For nonnegative
+    // integers, fixed-point division splits exactly ((off+40)/40 ==
+    // off/40 + 1), and `pico8_sin` reduces its argument mod one turn in
+    // fixed point, so sin(off/40) == sin((off mod 40)/40) bit-for-bit -
+    // pinned exhaustively by test_pico8_sin_period_40_bit_exact. Without
+    // this pin, `off` is an embedded frame counter: every fruit-alive row
+    // differs across frames and break cohorts, defeating cross-frame
+    // visited dedup (measured at 33.5% of the room-(0,0) frontier at f79).
+    // No fruit ever exists in room (1,0), so this is a no-op there and the
+    // standing (1,0) row hashes are untouched.
+    {
+        let helper = StateHelper::new(&state);
+        let mut off_updates: Vec<(HeapId, Value)> = Vec::new();
+        if let Some(arr_id) = helper
+            .find_global("objects")
+            .and_then(|id| helper.unwrap_pointer(helper.load(id)))
+        {
+            let fruits = helper
+                .find_objects_by_type(arr_id, "fruit")
+                .unwrap_or_else(|e| panic!("fruit-off pin: {}", e));
+            for obj_id in fruits {
+                let HeapValue::ObjectTable(obj) = helper.load(obj_id) else {
+                    panic!("fruit-off pin: fruit is not an ObjectTable");
+                };
+                let off_cell = *obj
+                    .get("off")
+                    .unwrap_or_else(|| panic!("fruit-off pin: fruit has no `off` field"));
+                let reduce = |n: &Pico8Num| -> Pico8Num {
+                    let i = n
+                        .as_i16()
+                        .unwrap_or_else(|| panic!("fruit-off pin: off {:?} is not an integer", n));
+                    assert!(i >= 0, "fruit-off pin: off {} is negative", i);
+                    Pico8Num::from_i16(i % 40)
+                };
+                match helper.load(off_cell) {
+                    HeapValue::Value(Value::Number(mv)) => {
+                        let reduced = match mv {
+                            MaybeVector::Scalar(n) => MaybeVector::Scalar(reduce(n)),
+                            MaybeVector::Vector(ns) => {
+                                MaybeVector::vector(ns.iter().map(reduce).collect())
+                            }
+                        };
+                        off_updates.push((off_cell, Value::Number(reduced)));
+                    }
+                    other => panic!("fruit-off pin: off is not a number: {:?}", other),
+                }
+            }
+        }
+        for (cell, value) in off_updates {
+            state.heap.set(cell, HeapValue::Value(value));
+        }
+    }
+
     // Pin the gameplay-dead timer globals to 0.
     //
     // `frames`, `seconds`, `minutes` and `deaths` form a closed subsystem in
