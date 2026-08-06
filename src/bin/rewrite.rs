@@ -158,6 +158,18 @@ enum Command {
         /// Required to search past frame 58, where states start dying.
         #[arg(long)]
         deopt: bool,
+        /// Write checkpoints (boundary states + row table) under this
+        /// directory. See plans/refinement-plan.md for the format.
+        #[arg(long)]
+        checkpoint_dir: Option<String>,
+        /// Checkpoint every N frames (and always at the final frame).
+        #[arg(long, default_value_t = 5)]
+        checkpoint_every: u32,
+        /// Resume from the latest checkpoint in --checkpoint-dir. Fails
+        /// loudly if the recipe, lua sources or search flags differ from
+        /// the run that wrote it.
+        #[arg(long)]
+        resume: bool,
     },
 }
 
@@ -172,19 +184,58 @@ fn peak_rss_kb() -> u64 {
         .unwrap_or(0)
 }
 
+/// Checkpoint configuration for a bench run.
+struct CheckpointCfg {
+    dir: std::path::PathBuf,
+    every: u32,
+    resume: bool,
+    /// See `checkpoint::config_fingerprint`.
+    fingerprint: String,
+}
+
 fn bench(
     label: &str,
     program: &Program,
     frames: u32,
     profile: bool,
     deopt: Option<(&Program, celeste_rust::rewrite::state_mapping::StateMapping)>,
+    checkpoint: Option<CheckpointCfg>,
 ) -> Result<()> {
+    use celeste_rust::rewrite::checkpoint;
     let mut run = match deopt {
         Some((plain, mapping)) => celeste_rust::rewrite::verify::AbstractRun::start_with_deopt(
             program, plain, mapping, false,
         )?,
         None => celeste_rust::rewrite::verify::AbstractRun::start(program)?,
     };
+    let mut start_frame = 1u32;
+    if let Some(cfg) = checkpoint.as_ref().filter(|c| c.resume) {
+        match checkpoint::latest(&cfg.dir)? {
+            Some(frame) if frame < frames => {
+                let loaded = checkpoint::load(&cfg.dir, frame, &cfg.fingerprint)?;
+                let visited = loaded.visited;
+                let visited = if run.visited_table().is_some() { Some(visited) } else { None };
+                run.restore(
+                    loaded.states,
+                    visited,
+                    (loaded.meta.deopt_states as usize, loaded.meta.deopt_lanes as usize),
+                )?;
+                start_frame = frame + 1;
+                println!(
+                    "resumed from checkpoint f{:03}: {} rows, {} states",
+                    frame, loaded.meta.row_count, loaded.meta.state_count
+                );
+            }
+            Some(frame) => {
+                return Err(anyhow!(
+                    "latest checkpoint f{:03} is not before --frames {}",
+                    frame,
+                    frames
+                ))
+            }
+            None => println!("--resume: no checkpoint found, starting fresh"),
+        }
+    }
     if profile {
         celeste_rust::interpreter::tracing::reset_tracing();
         celeste_rust::branch_sites::reset();
@@ -213,9 +264,28 @@ fn bench(
         };
     let start = std::time::Instant::now();
     let mut first_win: Option<u32> = None;
-    for frame in 1..=frames {
+    for frame in start_frame..=frames {
         let frame_start = std::time::Instant::now();
         run.step()?;
+        if let Some(cfg) = checkpoint.as_ref() {
+            if frame % cfg.every == 0 || frame == frames {
+                let t = std::time::Instant::now();
+                let empty = celeste_rust::interpreter::row_table::RowTable::default();
+                let path = checkpoint::save(
+                    &cfg.dir,
+                    frame,
+                    &cfg.fingerprint,
+                    run.states(),
+                    run.visited_table().unwrap_or(&empty),
+                    run.deopt_events(),
+                )?;
+                println!(
+                    "  checkpoint {} written in {:.1}s",
+                    path.display(),
+                    t.elapsed().as_secs_f64()
+                );
+            }
+        }
         if let Some(w) = xy_dump.as_mut() {
             use std::io::Write;
             let mut hist: std::collections::BTreeMap<(i16, i16), u64> = Default::default();
@@ -1618,9 +1688,17 @@ fn main() -> Result<()> {
                 frames
             );
         }
-        Command::Bench { frames, baseline, profile, deopt } => {
+        Command::Bench {
+            frames,
+            baseline,
+            profile,
+            deopt,
+            checkpoint_dir,
+            checkpoint_every,
+            resume,
+        } => {
             if baseline {
-                bench("original", &Program::compile_from_disk()?, frames, profile, None)?;
+                bench("original", &Program::compile_from_disk()?, frames, profile, None, None)?;
             }
             let (program, _) = build(&recipe)?;
             let deopt_setup = if deopt {
@@ -1631,12 +1709,30 @@ fn main() -> Result<()> {
             } else {
                 None
             };
+            let checkpoint_cfg = match checkpoint_dir {
+                Some(dir) => {
+                    let recipe_text = std::fs::read_to_string(&cli.recipe).unwrap_or_default();
+                    Some(CheckpointCfg {
+                        dir: std::path::PathBuf::from(dir),
+                        every: checkpoint_every,
+                        resume,
+                        fingerprint: celeste_rust::rewrite::checkpoint::config_fingerprint(
+                            &recipe_text,
+                        ),
+                    })
+                }
+                None if resume => {
+                    return Err(anyhow!("--resume requires --checkpoint-dir"))
+                }
+                None => None,
+            };
             bench(
                 "rewritten",
                 &program,
                 frames,
                 profile,
                 deopt_setup.as_ref().map(|(p, m)| (p, m.clone())),
+                checkpoint_cfg,
             )?;
         }
 

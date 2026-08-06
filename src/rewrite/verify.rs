@@ -381,6 +381,37 @@ impl AbstractRun {
         self.deopt.as_ref().map_or((0, 0), |d| d.total_events)
     }
 
+    /// The frontier row table, when frontier-only search is enabled.
+    pub fn visited_table(&self) -> Option<&crate::interpreter::row_table::RowTable> {
+        self.visited_rows.as_ref()
+    }
+
+    /// Restore from a checkpoint: boundary states, row table and deopt
+    /// counters as of some completed frame. The caller continues stepping
+    /// from the following frame. Refuses to attach a row table when
+    /// frontier-only search is off (the fingerprint should have caught the
+    /// flag mismatch already; this is the belt to that suspender).
+    pub fn restore(
+        &mut self,
+        states: Vec<State>,
+        visited: Option<crate::interpreter::row_table::RowTable>,
+        deopt_events: (usize, usize),
+    ) -> Result<()> {
+        if visited.is_some() != self.visited_rows.is_some() {
+            return Err(anyhow::anyhow!(
+                "checkpoint frontier state ({}) does not match this run ({})",
+                if visited.is_some() { "present" } else { "absent" },
+                if self.visited_rows.is_some() { "enabled" } else { "disabled" },
+            ));
+        }
+        self.states = states;
+        self.visited_rows = visited;
+        if let Some(deopt) = self.deopt.as_mut() {
+            deopt.total_events = deopt_events;
+        }
+        Ok(())
+    }
+
     pub fn step(&mut self) -> Result<()> {
         let mut new_states = Vec::new();
         let mut frame_events = (0usize, 0usize);
