@@ -105,6 +105,7 @@ pub fn backward_sweep(
     // reason.
     let edge_dir = dir.join("sweep-edges");
     std::fs::create_dir_all(&edge_dir)?;
+    let win_x = crate::game_runner::win_room_x();
     let mut edge_total: u64 = 0;
     let mut edge_chunks: Vec<std::path::PathBuf> = Vec::new();
 
@@ -121,7 +122,7 @@ pub fn backward_sweep(
             let mut frame_wins: Vec<(u32, u32)> = Vec::new();
             for state in &states {
                 let keys = row_keys(state)?;
-                for (key, win) in keys.iter().zip(room_x_lane_mask(state, 2)) {
+                for (key, win) in keys.iter().zip(room_x_lane_mask(state, win_x)) {
                     if win {
                         let id = table.id_of(*key).ok_or_else(|| {
                             anyhow!("frame f{:03}: saved lane's row missing from table", f)
@@ -174,7 +175,7 @@ pub fn backward_sweep(
                 })
                 .collect::<Result<_>>()?;
             // Rows already in the next room have won: g = 0 seeds.
-            for (id, win) in ids.iter().zip(room_x_lane_mask(&state, 2)) {
+            for (id, win) in ids.iter().zip(room_x_lane_mask(&state, win_x)) {
                 if win {
                     g[*id as usize] = 0;
                     frame_wins.push((*id, 0));
@@ -183,9 +184,9 @@ pub fn backward_sweep(
             batch_lanes += state.vector_size;
             if f < frames {
                 // Won lanes are absorbing (their g = 0 seed is recorded
-                // above); expanding them would simulate room (2,0).
+                // above); expanding them would simulate the next room.
                 let keep: Vec<bool> =
-                    room_x_lane_mask(&state, 2).into_iter().map(|w| !w).collect();
+                    room_x_lane_mask(&state, win_x).into_iter().map(|w| !w).collect();
                 let kept = keep.iter().filter(|b| **b).count();
                 let (mut state, ids) = if kept == state.vector_size {
                     (state, ids)

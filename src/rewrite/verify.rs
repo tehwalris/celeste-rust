@@ -414,12 +414,14 @@ impl AbstractRun {
         self.band = Some(band);
     }
 
-    /// Drop lanes that have exited the room (global room.x == 2) from the
-    /// frontier: win states are absorbing for a room-scoped search.
+    /// Drop lanes that have exited the room (global room.x reached the
+    /// configured win value) from the frontier: win states are absorbing
+    /// for a room-scoped search.
     pub fn absorb_won_lanes(&mut self) {
+        let win_x = crate::game_runner::win_room_x();
         let mut kept = Vec::new();
         for state in std::mem::take(&mut self.states) {
-            let mask: Vec<bool> = crate::interpreter::inspect::room_x_lane_mask(&state, 2)
+            let mask: Vec<bool> = crate::interpreter::inspect::room_x_lane_mask(&state, win_x)
                 .into_iter()
                 .map(|w| !w)
                 .collect();

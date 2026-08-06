@@ -842,10 +842,11 @@ pub fn apply_conservative_widenings(mut state: State) -> State {
 /// Lanes whose global `room.x` equals `x`.
 ///
 /// `next_room()` writes the new room index when the player crosses the top of
-/// the screen, so for a search confined to room (1,0) the lanes with
-/// `room.x == 2` at a frame boundary are exactly the ones that exited - the
-/// win condition. The earliest frame where any appear is the optimal TAS
-/// length (under the search's stated abstractions).
+/// the screen, so for a search confined to one room the lanes whose `room.x`
+/// equals the next room's x (`game_runner::win_room_x()`) at a frame boundary
+/// are exactly the ones that exited - the win condition. The earliest frame
+/// where any appear is the optimal TAS length (under the search's stated
+/// abstractions).
 ///
 /// Loud on structural surprises: `room` missing or non-numeric means the
 /// probe would silently never fire, which is worse than a crash.

@@ -6,7 +6,12 @@
 # rebuilt per (k,H).
 set -euo pipefail
 cd "$(dirname "$0")"
-L0=~/celeste-checkpoints/room1
+# ROOM=x,y selects the start room (default 1,0). Must match
+# game_runner::room_dir_stem: "room1" for the default, "room<x><y>" else.
+ROOM=${ROOM:-1,0}
+export CELESTE_START_ROOM="$ROOM"
+if [ "$ROOM" = "1,0" ]; then STEM=room1; else STEM=room$(echo "$ROOM" | tr -d ' ,'); fi
+L0=~/celeste-checkpoints/$STEM
 export CELESTE_FRONTIER_ONLY=1 CELESTE_DEOPT_COLLECT_FIRST=1
 FROM=${1:-94}
 TO=${2:-104}
@@ -22,8 +27,8 @@ for H in $(seq "$FROM" "$TO"); do
   refuted=0
   for K in $(seq 1 "$MAXK"); do
     PREV_BITS=$((K - 1))
-    if [ "$K" -eq 1 ]; then PREV=$L0; else PREV=~/celeste-checkpoints/room1-k$PREV_BITS; fi
-    KDIR=~/celeste-checkpoints/room1-k$K
+    if [ "$K" -eq 1 ]; then PREV=$L0; else PREV=~/celeste-checkpoints/$STEM-k$PREV_BITS; fi
+    KDIR=~/celeste-checkpoints/$STEM-k$K
     echo "=== horizon $H: k=$K banded (band from bits $PREV_BITS) ==="
     rm -rf "$KDIR"
     CELESTE_REM_BITS=$K ./safe-run.sh -- ./target/release/rewrite bench \

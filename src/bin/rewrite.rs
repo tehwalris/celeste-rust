@@ -158,7 +158,9 @@ enum Command {
         /// Comma-separated precision levels to probe, e.g. "0,1,2,3".
         #[arg(long)]
         levels: String,
-        /// Checkpoint base: level 0 at <base>/room1, level k at <base>/room1-k<k>.
+        /// Checkpoint base: level 0 at <base>/<room-stem>, level k at
+        /// <base>/<room-stem>-k<k> (stem "room1" for the default room,
+        /// "room<x><y>" otherwise; see game_runner::room_dir_stem).
         #[arg(long)]
         base_dir: String,
     },
@@ -176,7 +178,9 @@ enum Command {
         /// Precision level whose band to walk (16 = exact rem).
         #[arg(long, default_value_t = 16)]
         level: u8,
-        /// Checkpoint base: level 0 at <base>/room1, level k at <base>/room1-k<k>.
+        /// Checkpoint base: level 0 at <base>/<room-stem>, level k at
+        /// <base>/<room-stem>-k<k> (stem "room1" for the default room,
+        /// "room<x><y>" otherwise; see game_runner::room_dir_stem).
         #[arg(long)]
         base_dir: String,
         /// Optional reference TAS to compare against.
@@ -195,7 +199,9 @@ enum Command {
         /// Precision level whose band to walk (16 = exact rem).
         #[arg(long, default_value_t = 16)]
         level: u8,
-        /// Checkpoint base: level 0 at <base>/room1, level k at <base>/room1-k<k>.
+        /// Checkpoint base: level 0 at <base>/<room-stem>, level k at
+        /// <base>/<room-stem>-k<k> (stem "room1" for the default room,
+        /// "room<x><y>" otherwise; see game_runner::room_dir_stem).
         #[arg(long)]
         base_dir: String,
     },
@@ -405,21 +411,22 @@ fn bench(
                 writeln!(w, "{},{},{},{}", frame, x, y, lanes)?;
             }
         }
-        // Room-exit probe: lanes that reached room (2,0) have won room (1,0).
-        // The earliest such frame is the optimal TAS length under the search's
-        // abstractions.
+        // Room-exit probe: lanes whose room.x reached the win value have won
+        // the start room. The earliest such frame is the optimal TAS length
+        // under the search's abstractions.
+        let win_x = celeste_rust::game_runner::win_room_x();
         let win_lanes: usize = run
             .states()
             .iter()
-            .map(|s| celeste_rust::interpreter::inspect::count_room_x_lanes(s, 2))
+            .map(|s| celeste_rust::interpreter::inspect::count_room_x_lanes(s, win_x))
             .sum();
         if win_lanes > 0 && first_win.is_none() {
             first_win = Some(frame);
         }
         // Won lanes are absorbing for a room-scoped search: they stay in the
         // row table (their arrival frame IS the result) but must not be
-        // expanded - room (2,0) simulation is out of scope (and would hit
-        // the deliberate `sin` guard). Drop them from the frontier here,
+        // expanded - next-room simulation is out of scope (and, for the
+        // default room, would hit the deliberate `sin` guard). Drop them here,
         // after the probe counted them and after checkpoint/frame saving
         // recorded them.
         if win_lanes > 0 {
@@ -432,7 +439,7 @@ fn bench(
             run.lane_count(),
             peak_rss_kb() as f64 / 1048576.0,
             if win_lanes > 0 {
-                format!("  WIN: {} lanes in room (2,0)", win_lanes)
+                format!("  WIN: {} lanes in room ({},_)", win_lanes, win_x)
             } else {
                 String::new()
             }
@@ -959,6 +966,19 @@ fn bench(
         }
     }
     Ok(())
+}
+
+/// Checkpoint dir for a refinement level under the base dir, for the
+/// configured start room: level 0 at `<base>/<stem>`, level k at
+/// `<base>/<stem>-k<k>`, where the stem is `game_runner::room_dir_stem()`
+/// ("room1" for the default room, "room<x><y>" otherwise).
+fn level_checkpoint_dir(base_dir: &str, level: u8) -> std::path::PathBuf {
+    let stem = celeste_rust::game_runner::room_dir_stem();
+    if level == 0 {
+        std::path::PathBuf::from(base_dir).join(stem)
+    } else {
+        std::path::PathBuf::from(base_dir).join(format!("{}-k{}", stem, level))
+    }
 }
 
 /// Parse a TAS file: comment lines start with '#', the rest is
@@ -2001,11 +2021,7 @@ fn main() -> Result<()> {
                 let k: u8 = part.trim().parse().map_err(|e| anyhow!("bad level: {}", e))?;
                 let precision =
                     if k >= 16 { RemPrecision::Exact } else { RemPrecision::Bits(k) };
-                let dir = if k == 0 {
-                    std::path::PathBuf::from(&base_dir).join("room1")
-                } else {
-                    std::path::PathBuf::from(&base_dir).join(format!("room1-k{}", k))
-                };
+                let dir = level_checkpoint_dir(&base_dir, k);
                 let fp = checkpoint::config_fingerprint_with_precision(&recipe_text, precision);
                 let frame = checkpoint::latest(&dir)?
                     .ok_or_else(|| anyhow!("level {}: no checkpoint in {}", k, dir.display()))?;
@@ -2118,11 +2134,7 @@ fn main() -> Result<()> {
             };
             let precision =
                 if level >= 16 { RemPrecision::Exact } else { RemPrecision::Bits(level) };
-            let dir = if level == 0 {
-                std::path::PathBuf::from(&base_dir).join("room1")
-            } else {
-                std::path::PathBuf::from(&base_dir).join(format!("room1-k{}", level))
-            };
+            let dir = level_checkpoint_dir(&base_dir, level);
             let recipe_text = std::fs::read_to_string(&cli.recipe).unwrap_or_default();
             let fp = checkpoint::config_fingerprint_with_precision(&recipe_text, precision);
             let frame = checkpoint::latest(&dir)?
@@ -2221,14 +2233,15 @@ fn main() -> Result<()> {
             }
 
             // The walk must have ended on a winning row: g = 0 and the
-            // player concretely in room (2, 0).
+            // player concretely in the next room.
+            let win_x = celeste_rust::game_runner::win_room_x();
             let final_probe = probe(&state)?;
             let mut canon = state.clone();
             mapping.from_canonical(&mut canon)?;
-            let concrete_win = count_room_x_lanes(&canon, 2) == 1;
+            let concrete_win = count_room_x_lanes(&canon, win_x) == 1;
             println!(
-                "final row: {:?} (want g=0), concrete room.x==2: {}",
-                final_probe, concrete_win
+                "final row: {:?} (want g=0), concrete room.x=={}: {}",
+                final_probe, win_x, concrete_win
             );
             if final_probe.map(|(_, g)| g) != Some(0) || !concrete_win {
                 return Err(anyhow!("walk did not end on a winning state"));
@@ -2275,11 +2288,7 @@ fn main() -> Result<()> {
 
             let precision =
                 if level >= 16 { RemPrecision::Exact } else { RemPrecision::Bits(level) };
-            let dir = if level == 0 {
-                std::path::PathBuf::from(&base_dir).join("room1")
-            } else {
-                std::path::PathBuf::from(&base_dir).join(format!("room1-k{}", level))
-            };
+            let dir = level_checkpoint_dir(&base_dir, level);
             let recipe_text = std::fs::read_to_string(&cli.recipe).unwrap_or_default();
             let fp = checkpoint::config_fingerprint_with_precision(&recipe_text, precision);
             let frame = checkpoint::latest(&dir)?
@@ -2437,10 +2446,11 @@ fn main() -> Result<()> {
             }
 
             // Every final node must be a concrete win.
+            let win_x = celeste_rust::game_runner::win_room_x();
             for node in layer.values() {
                 let mut canon = node.state.clone();
                 mapping.from_canonical(&mut canon)?;
-                if count_room_x_lanes(&canon, 2) != 1 {
+                if count_room_x_lanes(&canon, win_x) != 1 {
                     return Err(anyhow!("final node is not a concrete win"));
                 }
             }
