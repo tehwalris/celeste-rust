@@ -397,3 +397,31 @@ win row by f90 at k=1), driving the first horizon bump toward the
 concrete optimum 100. Witness extraction at the final level: walk
 rows with decreasing g, recovering the input per step by trying the
 32 inputs concretely - the reference TAS should fall out.
+
+### Refinement: first results (afternoon)
+
+* Level-0 sweep completed after the union_diff fix: the room-1
+  transition graph at level 0 is 151.6M nodes / 7.196B edges (~47.5
+  successors/row - vs <= 32 for a deterministic game; the excess is
+  rem-interval flr splitting, ~1.5 abstract successors per (state,
+  input), a per-level health metric that should shrink as k rises).
+  Zero replay divergences across all edges. BFS from the single win
+  seed: 316s. **min(e+g) = 90, exactly matching the forward first-win
+  frame** - the backward pass independently cross-checks the forward
+  result.
+* 143.3M of 151.6M rows can eventually reach the exit, but the
+  horizon-90 deadline collapses the band to HUNDREDS of rows per
+  frame (f25: 4, f40: 280, f60: 16, f89: 160, f90: 1). The optimal
+  tube is razor thin; the deadline does all the pruning.
+* **k=1 refutes horizon 90**: the banded 1-bit pass runs the tube
+  (1-40 lanes/frame, every coarse row found) and empties at frame 50 -
+  at half-pixel rem precision no state can stay on a 90-frame winning
+  path past f49. First refutation; total cost of the k=1 pass: 0.7s.
+* Win-lane absorption added (bench + sweep): room-exit lanes are
+  terminal; expanding them would simulate room (2,0) into the sin
+  guard.
+* refine.sh now climbs horizons (extend level-0 one frame via resume,
+  chunk-incremental sweep, k=1 probe) until k=1 first wins at some
+  H1 (90 < H1 <= 100); then k=2..16 repeat the pattern toward the
+  concrete optimum, expected to land at exactly 100 with the
+  reference TAS as a surviving path.
