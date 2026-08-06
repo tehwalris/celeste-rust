@@ -428,6 +428,78 @@ impl<'a> StateHelper<'a> {
     }
 }
 
+/// The object-array shape of a state: the sequence of type-table global
+/// names of the objects currently alive, in array order - e.g.
+/// `["fake_wall", "player"]` for room (0,0) after the spawn finishes.
+///
+/// Pointers are per-state structure, never lane-varying, so the shape is a
+/// property of the whole state: every lane in a state shares it. This is
+/// what makes shape dispatch (`verify::Variant`) a per-state decision.
+///
+/// Loud on structural surprises: an object whose `type` does not resolve
+/// unambiguously to a global would make shape dispatch silently misroute,
+/// which is worse than a crash.
+pub fn object_shape(state: &State) -> anyhow::Result<Vec<String>> {
+    use anyhow::anyhow;
+    let helper = StateHelper::new(state);
+    let arr_id = helper
+        .get_objects_array_id()
+        .ok_or_else(|| anyhow!("object_shape: no `objects` array global"))?;
+    let items: Vec<HeapId> = match helper.load(arr_id) {
+        HeapValue::ArrayTable(items) => items.clone(),
+        other => {
+            return Err(anyhow!("object_shape: `objects` is not an ArrayTable: {:?}", other))
+        }
+    };
+    // Reverse map: heap id of a pointed-to table -> global names pointing at
+    // it. Built per call; the global env is small and boundary states are
+    // few. Ambiguity (two globals aliasing one type table) is an error at
+    // the point of use, not a silent pick - global_env iteration order is
+    // not deterministic.
+    let mut names: FxHashMap<HeapId, Vec<&str>> = FxHashMap::default();
+    for (name, cell) in &state.global_env {
+        if let HeapValue::Value(Value::Pointer(target)) = helper.load(*cell) {
+            names.entry(*target).or_default().push(name.as_str());
+        }
+    }
+    let mut shape = Vec::with_capacity(items.len());
+    for item in items {
+        let obj_id = helper
+            .unwrap_pointer(helper.load(item))
+            .ok_or_else(|| anyhow!("object_shape: objects element is not a pointer"))?;
+        let obj = match helper.load(obj_id) {
+            HeapValue::ObjectTable(t) => t,
+            other => {
+                return Err(anyhow!("object_shape: object is not an ObjectTable: {:?}", other))
+            }
+        };
+        let type_ptr = obj
+            .get("type")
+            .ok_or_else(|| anyhow!("object_shape: object has no `type` field"))?;
+        let type_id = helper
+            .unwrap_pointer(helper.load(*type_ptr))
+            .ok_or_else(|| anyhow!("object_shape: object `type` is not a pointer"))?;
+        match names.get(&type_id).map(Vec::as_slice) {
+            Some([name]) => shape.push(name.to_string()),
+            Some(many) => {
+                let mut many: Vec<&str> = many.to_vec();
+                many.sort_unstable();
+                return Err(anyhow!(
+                    "object_shape: object type table is aliased by several globals: {:?}",
+                    many
+                ));
+            }
+            None => {
+                return Err(anyhow!(
+                    "object_shape: object type at heap {:?} matches no global",
+                    type_id
+                ))
+            }
+        }
+    }
+    Ok(shape)
+}
+
 /// Marks to apply when making state abstract
 pub struct HeapMarks {
     /// Map from mark name to set of heap IDs that should get that mark

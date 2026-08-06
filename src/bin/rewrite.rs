@@ -7,7 +7,7 @@
 //!     rewrite verify [--frames N]   # differential run against the original
 //!     rewrite bisect [--frames N]   # find the first entry that breaks it
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 
 use celeste_rust::rewrite::print::{format_function, format_program};
@@ -205,6 +205,18 @@ enum Command {
         #[arg(long)]
         base_dir: String,
     },
+    /// Census of a saved frame batch: lanes grouped by object-array shape
+    /// (inspect::object_shape), with the fruit `off`-counter spread when a
+    /// fruit is alive. For diagnosing frontier bloat - e.g. room (0,0)'s
+    /// post-break lanes, whose ever-incrementing `off` defeats cross-frame
+    /// dedup (plans/room00-plan.md).
+    ShapeCensus {
+        /// Checkpoint dir with saved frames (bench --save-frames).
+        #[arg(long)]
+        checkpoint_dir: String,
+        #[arg(long)]
+        frame: u32,
+    },
     Bench {
         #[arg(long, default_value_t = 34)]
         frames: u32,
@@ -248,6 +260,19 @@ enum Command {
         /// 16 = exact). Validated against the previous dir's fingerprint.
         #[arg(long)]
         band_prev_bits: Option<u8>,
+        /// Register a shape-dispatched variant: SHAPES=RECIPE_PATH, where
+        /// SHAPES is a |-separated list of object-array shapes and each
+        /// shape is a comma-separated object type-name list. Example:
+        /// --variant 'player|player_spawn=rewrites.jsonl'. A state whose
+        /// object-array shape matches runs its frames under that recipe's
+        /// program, through the canonical mapping both ways; every other
+        /// state uses the base recipe. Dispatch is semantically invisible
+        /// (boundary states are identical with or without variants), so it
+        /// is deliberately NOT part of the checkpoint fingerprint - the
+        /// gate for registering a variant is a lane-count/observation
+        /// comparison against a variant-free run.
+        #[arg(long = "variant")]
+        variants: Vec<String>,
     },
     /// The backward pass (see plans/refinement-plan.md): replay the saved
     /// frame batches one frame each with an origin column, build the row
@@ -282,6 +307,54 @@ fn peak_rss_kb() -> u64 {
         .unwrap_or(0)
 }
 
+/// Build the shape-dispatched variant registry from `--variant` specs
+/// (SHAPES=RECIPE_PATH; see the flag's doc comment). `base_program` is the
+/// bench's base program - its merge-partition cells must agree with every
+/// variant's, because the partition patterns are process-global and mid-frame
+/// hint merges inside a variant frame use them too.
+fn build_variants(
+    specs: &[String],
+    base_program: &Program,
+) -> Result<Vec<celeste_rust::rewrite::verify::Variant>> {
+    use celeste_rust::rewrite::state_mapping::StateMapping;
+    let mut out = Vec::new();
+    for spec in specs {
+        let (shapes_part, path) = spec
+            .split_once('=')
+            .ok_or_else(|| anyhow!("--variant must be SHAPES=RECIPE_PATH, got {:?}", spec))?;
+        let shapes: Vec<Vec<String>> = shapes_part
+            .split('|')
+            .map(|shape| shape.split(',').map(|t| t.trim().to_string()).collect())
+            .collect();
+        if shapes.iter().any(|s: &Vec<String>| s.is_empty() || s.iter().any(|t| t.is_empty())) {
+            return Err(anyhow!("--variant {:?}: empty shape or type name", spec));
+        }
+        let recipe = Recipe::load(path)
+            .with_context(|| format!("--variant {:?}: loading recipe", spec))?;
+        let (program, _) = build(&recipe)
+            .with_context(|| format!("--variant {:?}: building program", spec))?;
+        if program.merge_partition_cells != base_program.merge_partition_cells {
+            return Err(anyhow!(
+                "--variant {:?}: merge-partition cells {:?} differ from the base \
+                 program's {:?}; the partition patterns are process-global",
+                spec,
+                program.merge_partition_cells,
+                base_program.merge_partition_cells
+            ));
+        }
+        out.push(celeste_rust::rewrite::verify::Variant {
+            label: format!("{}[{}]", path, shapes_part),
+            shapes,
+            frame_cfg: celeste_rust::interpreter::fixed_env::PreparedCfg::new(
+                program.frame_cfg().clone(),
+            ),
+            fixed_env: program.fixed_env(),
+            mapping: StateMapping::from_recipe(&recipe),
+        });
+    }
+    Ok(out)
+}
+
 /// Checkpoint configuration for a bench run.
 struct CheckpointCfg {
     dir: std::path::PathBuf,
@@ -300,6 +373,8 @@ fn bench(
     deopt: Option<(&Program, celeste_rust::rewrite::state_mapping::StateMapping)>,
     checkpoint: Option<CheckpointCfg>,
     band: Option<celeste_rust::rewrite::verify::BandFilter>,
+    variants: Vec<celeste_rust::rewrite::verify::Variant>,
+    variant_base_mapping: Option<celeste_rust::rewrite::state_mapping::StateMapping>,
 ) -> Result<()> {
     use celeste_rust::rewrite::checkpoint;
     let mut run = match deopt {
@@ -308,6 +383,11 @@ fn bench(
         )?,
         None => celeste_rust::rewrite::verify::AbstractRun::start(program)?,
     };
+    if !variants.is_empty() {
+        let base_mapping = variant_base_mapping
+            .ok_or_else(|| anyhow!("variants need the base recipe's mapping"))?;
+        run.set_variants(base_mapping, variants);
+    }
     if let Some(band) = band {
         run.set_band(band);
     }
@@ -475,6 +555,24 @@ fn bench(
         println!(
             "{:<10} deopt: {} state(s) / {} lanes re-ran under the plain program",
             "", deopt_states, deopt_lanes
+        );
+    }
+    let (variant_states, variant_lanes, variant_fallbacks) = run.variant_events();
+    if variant_states > 0 || variant_fallbacks > 0 {
+        println!(
+            "{:<10} variants: {} state(s) / {} lanes ran under shape variants{}",
+            "",
+            variant_states,
+            variant_lanes,
+            if variant_fallbacks > 0 {
+                format!(
+                    " - {} FALLBACKS to the base program (a registered variant's \
+                     premises failed; fix the registry)",
+                    variant_fallbacks
+                )
+            } else {
+                String::new()
+            }
         );
     }
     // How many rows are distinct if the rem cells are ignored: the gap
@@ -1887,6 +1985,80 @@ fn main() -> Result<()> {
                 frames
             );
         }
+        Command::ShapeCensus { checkpoint_dir, frame } => {
+            use celeste_rust::interpreter::inspect::{object_shape, StateHelper};
+            use celeste_rust::interpreter::value::{HeapValue, MaybeVector, Value};
+            use celeste_rust::rewrite::checkpoint;
+            let dir = std::path::PathBuf::from(&checkpoint_dir);
+            let states = checkpoint::load_frame_states(&dir, frame)?;
+            // shape -> (states, lanes)
+            let mut by_shape: std::collections::BTreeMap<String, (usize, usize)> =
+                Default::default();
+            // Distinct fruit `off` values across all fruit-alive lanes.
+            let mut off_values: std::collections::BTreeSet<i32> = Default::default();
+            let mut fruit_lanes = 0usize;
+            for state in &states {
+                let shape = match object_shape(state) {
+                    Ok(v) => v.join(","),
+                    Err(e) => format!("<unreadable: {:#}>", e),
+                };
+                let entry = by_shape.entry(shape.clone()).or_insert((0, 0));
+                entry.0 += 1;
+                entry.1 += state.vector_size;
+                if shape.split(',').any(|t| t == "fruit") {
+                    fruit_lanes += state.vector_size;
+                    let helper = StateHelper::new(state);
+                    let arr = helper
+                        .find_global("objects")
+                        .and_then(|id| helper.unwrap_pointer(helper.load(id)));
+                    if let Some(arr_id) = arr {
+                        for obj_id in helper
+                            .find_objects_by_type(arr_id, "fruit")
+                            .map_err(|e| anyhow!("{}", e))?
+                        {
+                            let HeapValue::ObjectTable(obj) = helper.load(obj_id) else {
+                                continue;
+                            };
+                            let Some(off_cell) = obj.get("off") else { continue };
+                            match helper.load(*off_cell) {
+                                HeapValue::Value(Value::Number(MaybeVector::Scalar(n))) => {
+                                    off_values.insert(n.as_raw_u32() as i32);
+                                }
+                                HeapValue::Value(Value::Number(MaybeVector::Vector(ns))) => {
+                                    for n in ns.iter() {
+                                        off_values.insert(n.as_raw_u32() as i32);
+                                    }
+                                }
+                                other => println!("  fruit off is not a number: {:?}", other),
+                            }
+                        }
+                    }
+                }
+            }
+            let total_lanes: usize = by_shape.values().map(|(_, l)| l).sum();
+            println!("frame f{:03}: {} states, {} lanes", frame, states.len(), total_lanes);
+            for (shape, (st, lanes)) in &by_shape {
+                println!(
+                    "  [{}] {} states, {} lanes ({:.1}%)",
+                    shape,
+                    st,
+                    lanes,
+                    100.0 * *lanes as f64 / total_lanes.max(1) as f64
+                );
+            }
+            if fruit_lanes > 0 {
+                let min = off_values.iter().next().copied().unwrap_or(0);
+                let max = off_values.iter().next_back().copied().unwrap_or(0);
+                println!(
+                    "  fruit off: {} distinct raw values across {} fruit lanes, raw range [{}, {}]",
+                    off_values.len(),
+                    fruit_lanes,
+                    min,
+                    max
+                );
+            }
+        }
+
         Command::Bench {
             frames,
             baseline,
@@ -1899,9 +2071,10 @@ fn main() -> Result<()> {
             band_dir,
             band_horizon,
             band_prev_bits,
+            variants,
         } => {
             if baseline {
-                bench("original", &Program::compile_from_disk()?, frames, profile, None, None, None)?;
+                bench("original", &Program::compile_from_disk()?, frames, profile, None, None, None, vec![], None)?;
             }
             let (program, _) = build(&recipe)?;
             let deopt_setup = if deopt {
@@ -1911,6 +2084,12 @@ fn main() -> Result<()> {
                 ))
             } else {
                 None
+            };
+            let built_variants = build_variants(&variants, &program)?;
+            let variant_base_mapping = if built_variants.is_empty() {
+                None
+            } else {
+                Some(celeste_rust::rewrite::state_mapping::StateMapping::from_recipe(&recipe))
             };
             let checkpoint_cfg = match checkpoint_dir {
                 Some(dir) => {
@@ -1992,6 +2171,8 @@ fn main() -> Result<()> {
                 deopt_setup.as_ref().map(|(p, m)| (p, m.clone())),
                 checkpoint_cfg,
                 band,
+                built_variants,
+                variant_base_mapping,
             )?;
         }
 

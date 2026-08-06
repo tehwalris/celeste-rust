@@ -284,6 +284,9 @@ pub struct AbstractRun {
     rem_only_abstraction: bool,
     /// Deopt-to-plain support; `None` means a failing frame is a hard error.
     deopt: Option<DeoptTarget>,
+    /// Shape-dispatched variants; `None` means every state runs the base
+    /// program (see `Variant`).
+    variants: Option<VariantDispatch>,
     /// Precision-refinement band restriction (plans/refinement-plan.md):
     /// lanes whose coarsened row is outside the previous level's band are
     /// dropped at each boundary.
@@ -324,6 +327,134 @@ struct DeoptTarget {
     total_events: (usize, usize),
 }
 
+/// A per-shape specialized program (plans/room00-plan.md, "shape-dispatched
+/// variants"): a state whose object-array shape (`inspect::object_shape`)
+/// matches one of `shapes` runs its frames under this program instead of
+/// the base one.
+///
+/// Boundary states always stay in the BASE program's layout: a variant
+/// frame round-trips base -> canonical -> variant on the way in and
+/// variant -> canonical -> base on the way out. Dispatch is therefore
+/// invisible to checkpoints, row hashing, band coarsening and the sweep -
+/// a run with variants must produce exactly the same boundary states as a
+/// run without, and that equivalence (lane counts per frame, observations)
+/// is the gate for registering one.
+pub struct Variant {
+    pub label: String,
+    /// The object-array shapes (type-name sequences) this program is
+    /// specialized for, e.g. [["player"], ["player_spawn"]].
+    pub shapes: Vec<Vec<String>>,
+    pub frame_cfg: crate::interpreter::fixed_env::PreparedCfg,
+    pub fixed_env: crate::interpreter::fixed_env::FixedEnv,
+    /// This variant's layout <-> canonical.
+    pub mapping: super::state_mapping::StateMapping,
+}
+
+struct VariantDispatch {
+    /// The base program's layout <-> canonical.
+    base_mapping: super::state_mapping::StateMapping,
+    variants: Vec<Variant>,
+    /// (states, lanes) that ran under some variant, whole run.
+    total_events: (usize, usize),
+    /// States that matched a shape but whose variant frame failed and fell
+    /// back to the base path. A registered variant's premises must hold for
+    /// every state of its shape, so anything nonzero is a registry bug -
+    /// loud per event, and reported at the end of the run.
+    total_fallbacks: usize,
+}
+
+/// Outcome of offering a state to the variant registry for one frame.
+enum VariantOutcome {
+    /// The variant ran the frame; outputs are back in base layout.
+    Ran(Vec<State>),
+    /// No variant matched (or the variant failed - already logged): the
+    /// caller runs the state under the base path.
+    Base(State),
+}
+
+/// Run one state's frame under `variant`, through the canonical form both
+/// ways. Any error or panic falls back to the base path with a loud print;
+/// the snapshot clone is what makes that fallback possible.
+fn dispatch_variant_frame(vd: &mut VariantDispatch, state: State) -> VariantOutcome {
+    let shape = match crate::interpreter::inspect::object_shape(&state) {
+        Ok(shape) => shape,
+        Err(err) => {
+            // A state whose shape cannot be read is not dispatchable; the
+            // base program is the sound answer. Loud anyway - this means
+            // the heap looks structurally unlike the game.
+            println!("  variant: shape probe failed ({:#}); base path", err);
+            return VariantOutcome::Base(state);
+        }
+    };
+    let Some(idx) = vd
+        .variants
+        .iter()
+        .position(|v| v.shapes.iter().any(|s| *s == shape))
+    else {
+        return VariantOutcome::Base(state);
+    };
+    let snapshot = state.clone();
+    let lanes = state.vector_size;
+    let variant = &vd.variants[idx];
+    let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_variant_frame(&vd.base_mapping, variant, state)
+    }));
+    match attempt {
+        Ok(Ok(outputs)) => {
+            vd.total_events.0 += 1;
+            vd.total_events.1 += lanes;
+            VariantOutcome::Ran(outputs)
+        }
+        Ok(Err(err)) => {
+            let one_line = format!("{:#}", err).replace('\n', " | ");
+            println!(
+                "  variant {}: frame FAILED ({}); falling back to the base program - \
+                 a registered variant's premises must hold for its shape, fix the registry",
+                vd.variants[idx].label,
+                one_line.chars().take(200).collect::<String>()
+            );
+            vd.total_fallbacks += 1;
+            VariantOutcome::Base(snapshot)
+        }
+        Err(panic) => {
+            println!(
+                "  variant {}: frame PANICKED ({}); falling back to the base program",
+                vd.variants[idx].label,
+                panic_text(&panic).chars().take(200).collect::<String>()
+            );
+            vd.total_fallbacks += 1;
+            VariantOutcome::Base(snapshot)
+        }
+    }
+}
+
+fn run_variant_frame(
+    base_mapping: &super::state_mapping::StateMapping,
+    variant: &Variant,
+    mut state: State,
+) -> Result<Vec<State>> {
+    base_mapping
+        .to_canonical(&mut state)
+        .context("variant: mapping base layout to canonical")?;
+    variant
+        .mapping
+        .from_canonical(&mut state)
+        .context("variant: mapping canonical to the variant layout")?;
+    let result = interpret_prepared_cfg(&variant.frame_cfg, state, &variant.fixed_env)?;
+    let mut out = Vec::with_capacity(result.len());
+    for (mut s, _) in result {
+        variant
+            .mapping
+            .to_canonical(&mut s)
+            .context("variant: mapping a frame output back to canonical")?;
+        base_mapping
+            .from_canonical(&mut s)
+            .context("variant: mapping a frame output back to base layout")?;
+        out.push(s);
+    }
+    Ok(out)
+}
+
 impl AbstractRun {
     pub fn start(program: &Program) -> Result<Self> {
         crate::interpreter::vectorize::set_merge_partition_patterns(
@@ -354,6 +485,7 @@ impl AbstractRun {
             visited_rows,
             rem_only_abstraction: false,
             deopt: None,
+            variants: None,
             band: None,
         })
     }
@@ -395,6 +527,36 @@ impl AbstractRun {
     /// (states, lanes) that deopted to the plain program so far.
     pub fn deopt_events(&self) -> (usize, usize) {
         self.deopt.as_ref().map_or((0, 0), |d| d.total_events)
+    }
+
+    /// Register shape-dispatched variants. `base_mapping` is the mapping of
+    /// the recipe that built THIS run's base program (needed to reach the
+    /// canonical form from base-layout states).
+    pub fn set_variants(
+        &mut self,
+        base_mapping: super::state_mapping::StateMapping,
+        variants: Vec<Variant>,
+    ) {
+        for v in &variants {
+            println!(
+                "variant {} registered for shapes {:?}",
+                v.label, v.shapes
+            );
+        }
+        self.variants = Some(VariantDispatch {
+            base_mapping,
+            variants,
+            total_events: (0, 0),
+            total_fallbacks: 0,
+        });
+    }
+
+    /// (states, lanes, fallbacks) run under shape variants so far.
+    /// Fallbacks should be zero; see `VariantDispatch::total_fallbacks`.
+    pub fn variant_events(&self) -> (usize, usize, usize) {
+        self.variants
+            .as_ref()
+            .map_or((0, 0, 0), |v| (v.total_events.0, v.total_events.1, v.total_fallbacks))
     }
 
     /// The frontier row table, when frontier-only search is enabled.
@@ -467,7 +629,27 @@ impl AbstractRun {
     pub fn step(&mut self) -> Result<()> {
         let mut new_states = Vec::new();
         let mut frame_events = (0usize, 0usize);
+        let mut variant_frame_events = (0usize, 0usize);
         for state in std::mem::take(&mut self.states) {
+            // Shape dispatch first: a state whose object-array shape has a
+            // registered variant runs under it (through canonical, both
+            // ways) and skips the base path entirely. States the registry
+            // does not cover - and the loud fallback of a failing variant
+            // frame - continue into the base path below.
+            let state = if let Some(vd) = self.variants.as_mut() {
+                let before = vd.total_events;
+                match dispatch_variant_frame(vd, state) {
+                    VariantOutcome::Ran(outputs) => {
+                        variant_frame_events.0 += vd.total_events.0 - before.0;
+                        variant_frame_events.1 += vd.total_events.1 - before.1;
+                        new_states.extend(outputs);
+                        continue;
+                    }
+                    VariantOutcome::Base(state) => state,
+                }
+            } else {
+                state
+            };
             match &mut self.deopt {
                 None => {
                     let result =
@@ -549,6 +731,12 @@ impl AbstractRun {
                     frame_events.0, frame_events.1
                 );
             }
+        }
+        if variant_frame_events.0 > 0 {
+            println!(
+                "  variant: {} state(s) / {} lanes ran under shape variants",
+                variant_frame_events.0, variant_frame_events.1
+            );
         }
         let new_states: Vec<State> = if self.rem_only_abstraction {
             new_states
@@ -1120,6 +1308,66 @@ mod tests {
         let (states, lanes) = run.deopt_events();
         assert!(states > 0, "the synthetic premise never fired");
         assert!(lanes > 0, "no lanes re-ran under the plain program");
+    }
+
+    /// End-to-end check of the shape-dispatch machinery (`Variant`): run the
+    /// plain-compiled program as the base with the full recipe registered as
+    /// a variant for the singleton shapes. Every state in room (1,0) is a
+    /// singleton, so every frame of every state dispatches to the variant -
+    /// base -> canonical -> variant on the way in, back on the way out - and
+    /// the observations must match a plain-only run exactly, every frame.
+    ///
+    /// This exercises: the object-shape probe, shape matching, both mapping
+    /// directions around a variant frame, and the zero-fallback invariant.
+    #[test]
+    fn shape_variant_dispatch_reproduces_the_baseline() {
+        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
+            || !std::path::Path::new("rewrites.jsonl").exists()
+        {
+            return;
+        }
+        let plain = Program::compile_from_disk().expect("compile plain");
+        let recipe = crate::rewrite::recipe::Recipe::load("rewrites.jsonl").expect("load recipe");
+        let (rewritten, _) = crate::rewrite::recipe::build(&recipe).expect("build rewritten");
+        let mapping = crate::rewrite::state_mapping::StateMapping::from_recipe(&recipe);
+        assert!(!mapping.is_identity());
+
+        let frames = 28;
+        let baseline = observation_trace(&plain, frames).expect("baseline trace");
+        let mut run = AbstractRun::start(&plain).expect("start base run");
+        // Shape probe sanity: room (1,0) starts as a lone player_spawn.
+        assert_eq!(
+            crate::interpreter::inspect::object_shape(&run.states()[0]).expect("shape probe"),
+            vec!["player_spawn".to_string()]
+        );
+        run.set_variants(
+            // The base program is the plain one: its layout IS canonical.
+            crate::rewrite::state_mapping::StateMapping::default(),
+            vec![Variant {
+                label: "rewrites.jsonl[test]".to_string(),
+                shapes: vec![
+                    vec!["player".to_string()],
+                    vec!["player_spawn".to_string()],
+                ],
+                frame_cfg: crate::interpreter::fixed_env::PreparedCfg::new(
+                    rewritten.frame_cfg().clone(),
+                ),
+                fixed_env: rewritten.fixed_env(),
+                mapping,
+            }],
+        );
+        for frame in 1..=frames {
+            run.step().expect("step");
+            assert_eq!(
+                observe_frame(run.states()),
+                baseline[frame as usize],
+                "variant dispatch diverged from the baseline at frame {}",
+                frame
+            );
+        }
+        let (states, lanes, fallbacks) = run.variant_events();
+        assert!(states > 0 && lanes > 0, "no frames ran under the variant");
+        assert_eq!(fallbacks, 0, "variant frames fell back to the base program");
     }
 
     /// And it must not cry wolf: the program compared against itself is equal.
