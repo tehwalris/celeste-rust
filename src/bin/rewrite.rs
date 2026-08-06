@@ -170,6 +170,25 @@ enum Command {
         /// the run that wrote it.
         #[arg(long)]
         resume: bool,
+        /// Also save every frame's post-subtract boundary states under
+        /// <checkpoint-dir>/frames/ - the input of the backward sweep.
+        #[arg(long)]
+        save_frames: bool,
+    },
+    /// The backward pass (see plans/refinement-plan.md): replay the saved
+    /// frame batches one frame each with an origin column, build the row
+    /// successor graph, and compute g(row) = min frames to the room exit by
+    /// reverse BFS. Prints min(e+g) (must equal the forward first-win frame)
+    /// and per-frame band sizes for the horizon; writes g.bin.
+    Sweep {
+        #[arg(long)]
+        checkpoint_dir: String,
+        /// The forward pass's last frame (its checkpoint must exist).
+        #[arg(long)]
+        frames: u32,
+        /// Horizon N for the band statistics (defaults to --frames).
+        #[arg(long)]
+        horizon: Option<u32>,
     },
 }
 
@@ -189,6 +208,7 @@ struct CheckpointCfg {
     dir: std::path::PathBuf,
     every: u32,
     resume: bool,
+    save_frames: bool,
     /// See `checkpoint::config_fingerprint`.
     fingerprint: String,
 }
@@ -268,6 +288,9 @@ fn bench(
         let frame_start = std::time::Instant::now();
         run.step()?;
         if let Some(cfg) = checkpoint.as_ref() {
+            if cfg.save_frames {
+                checkpoint::save_frame_states(&cfg.dir, frame, run.states())?;
+            }
             if frame % cfg.every == 0 || frame == frames {
                 let t = std::time::Instant::now();
                 let empty = celeste_rust::interpreter::row_table::RowTable::default();
@@ -1696,6 +1719,7 @@ fn main() -> Result<()> {
             checkpoint_dir,
             checkpoint_every,
             resume,
+            save_frames,
         } => {
             if baseline {
                 bench("original", &Program::compile_from_disk()?, frames, profile, None, None)?;
@@ -1716,6 +1740,7 @@ fn main() -> Result<()> {
                         dir: std::path::PathBuf::from(dir),
                         every: checkpoint_every,
                         resume,
+                        save_frames,
                         fingerprint: celeste_rust::rewrite::checkpoint::config_fingerprint(
                             &recipe_text,
                         ),
@@ -1736,6 +1761,43 @@ fn main() -> Result<()> {
             )?;
         }
 
+        Command::Sweep { checkpoint_dir, frames, horizon } => {
+            use celeste_rust::rewrite::state_mapping::StateMapping;
+            use celeste_rust::rewrite::sweep;
+            let horizon = horizon.unwrap_or(frames);
+            let dir = std::path::PathBuf::from(checkpoint_dir);
+            let recipe_text = std::fs::read_to_string(&cli.recipe).unwrap_or_default();
+            let fingerprint =
+                celeste_rust::rewrite::checkpoint::config_fingerprint(&recipe_text);
+            let plain = Program::compile_from_disk()?;
+            let (program, _) = build(&recipe)?;
+            let mapping = StateMapping::from_recipe(&recipe);
+            let result =
+                sweep::backward_sweep(&dir, frames, &fingerprint, &program, &plain, mapping)?;
+            sweep::save_g(&dir, &result.g)?;
+            let reachable = result.g.iter().filter(|&&v| v != sweep::G_UNREACHABLE).count();
+            println!(
+                "sweep: {} of {} rows can reach the exit; {} edges",
+                reachable,
+                result.g.len(),
+                result.edge_count
+            );
+            match result.optimal_frame {
+                Some(win) => println!(
+                    "abstract optimal win frame from e+g: {} (forward first-win must match)",
+                    win
+                ),
+                None => println!("no row reaches the exit - the horizon is too short"),
+            }
+            // Band sizes for the horizon: the k=1 forward pass's budget.
+            let ck = celeste_rust::rewrite::checkpoint::load(&dir, frames, &fingerprint)?;
+            println!("band sizes for horizon {} (frame, rows):", horizon);
+            for (f, size) in sweep::band_sizes(&ck.visited, &result.g, horizon) {
+                if size > 0 || f % 10 == 0 {
+                    println!("  f{:03}: {}", f, size);
+                }
+            }
+        }
         Command::Bisect { frames } => {
             let baseline = Program::compile_from_disk()?;
             let mut program = Program::compile_from_disk()?;

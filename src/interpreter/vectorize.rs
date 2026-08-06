@@ -1268,7 +1268,11 @@ pub fn subtract_visited(
         // ~10^8 rows the 64-bit birthday risk was ~10^-4 per run; 128 bits
         // make it negligible.
         let hashes = hash_rows(&refs, state.vector_size);
-        let hashes2 = hash_rows_seeded(&refs, state.vector_size, 0xa076_1d64_78bd_642f);
+        let hashes2 = hash_rows_seeded(
+            &refs,
+            state.vector_size,
+            crate::interpreter::row_table::ROW_HASH_SEED2,
+        );
         let mask: Vec<bool> = hashes
             .iter()
             .zip(&hashes2)

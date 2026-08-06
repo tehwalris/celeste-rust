@@ -103,6 +103,50 @@ impl<W: Write> Write for CountingWriter<W> {
     }
 }
 
+/// Save one frame's post-subtract boundary states (`<dir>/frames/fNNN.bin`).
+/// Self-contained: header + zstd content checksum; no meta entry.
+pub fn save_frame_states(dir: &Path, frame: u32, states: &[State]) -> Result<()> {
+    let fdir = dir.join("frames");
+    std::fs::create_dir_all(&fdir)?;
+    let tmp = fdir.join(format!("tmp-f{:03}.bin", frame));
+    write_bin(&tmp, |w| bincode::serialize_into(w, states).context("serializing frame states"))?;
+    std::fs::rename(&tmp, fdir.join(format!("f{:03}.bin", frame)))?;
+    Ok(())
+}
+
+/// Load one frame's saved boundary states.
+pub fn load_frame_states(dir: &Path, frame: u32) -> Result<Vec<State>> {
+    let path = dir.join("frames").join(format!("f{:03}.bin", frame));
+    let r = read_bin_header_len(&path)?;
+    bincode::deserialize_from(r).with_context(|| format!("deserializing {}", path.display()))
+}
+
+/// `read_bin` trusting the header's own payload length (for self-contained
+/// files that have no meta.json entry); integrity comes from the zstd
+/// content checksum.
+fn read_bin_header_len(path: &Path) -> Result<impl Read> {
+    let mut file = std::io::BufReader::new(std::fs::File::open(path)?);
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic)?;
+    if &magic != MAGIC {
+        return Err(anyhow!("{}: bad magic", path.display()));
+    }
+    let mut buf4 = [0u8; 4];
+    file.read_exact(&mut buf4)?;
+    let version = u32::from_le_bytes(buf4);
+    if version != FORMAT_VERSION {
+        return Err(anyhow!(
+            "{}: format version {} != expected {}",
+            path.display(),
+            version,
+            FORMAT_VERSION
+        ));
+    }
+    let mut buf8 = [0u8; 8];
+    file.read_exact(&mut buf8)?;
+    Ok(zstd::Decoder::new(file)?)
+}
+
 fn read_bin(path: &Path, expected_payload_len: u64) -> Result<impl Read> {
     let mut file = std::io::BufReader::new(std::fs::File::open(path)?);
     let mut magic = [0u8; 4];
@@ -133,6 +177,61 @@ fn read_bin(path: &Path, expected_payload_len: u64) -> Result<impl Read> {
         ));
     }
     Ok(zstd::Decoder::new(file)?)
+}
+
+/// Write a flat array of (u32, u32) pairs (edge chunks). Same header + zstd
+/// envelope as every other .bin.
+pub fn write_u32_pairs(path: &Path, pairs: &[(u32, u32)]) -> Result<()> {
+    write_bin(path, |w| {
+        w.write_all(&(pairs.len() as u64).to_le_bytes())?;
+        for (a, b) in pairs {
+            w.write_all(&a.to_le_bytes())?;
+            w.write_all(&b.to_le_bytes())?;
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// Append the pairs from `path` into `out` (which should be pre-reserved).
+pub fn read_u32_pairs_into(path: &Path, out: &mut Vec<(u32, u32)>) -> Result<()> {
+    let mut r = read_bin_header_len(path)?;
+    let mut buf8 = [0u8; 8];
+    r.read_exact(&mut buf8)?;
+    let count = u64::from_le_bytes(buf8) as usize;
+    let mut buf = vec![0u8; 1 << 20];
+    let mut remaining = count * 8;
+    let mut carry: Vec<u8> = Vec::new();
+    while remaining > 0 {
+        let take = remaining.min(buf.len());
+        r.read_exact(&mut buf[..take])?;
+        remaining -= take;
+        let mut data = &buf[..take];
+        if !carry.is_empty() {
+            let need = 8 - carry.len();
+            carry.extend_from_slice(&data[..need.min(data.len())]);
+            if carry.len() == 8 {
+                let a = u32::from_le_bytes(carry[0..4].try_into().unwrap());
+                let b = u32::from_le_bytes(carry[4..8].try_into().unwrap());
+                out.push((a, b));
+                data = &data[need..];
+                carry.clear();
+            } else {
+                continue;
+            }
+        }
+        let whole = data.len() / 8 * 8;
+        for chunk in data[..whole].chunks_exact(8) {
+            let a = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
+            let b = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
+            out.push((a, b));
+        }
+        carry.extend_from_slice(&data[whole..]);
+    }
+    if !carry.is_empty() {
+        return Err(anyhow!("{}: trailing bytes", path.display()));
+    }
+    Ok(())
 }
 
 pub struct Checkpoint {

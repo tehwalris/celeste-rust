@@ -28,6 +28,10 @@
 
 use rustc_hash::FxHashMap;
 
+/// Seed of the second row hash (the first uses seed 0). Shared by the
+/// forward pass and the backward sweep so both compute identical row keys.
+pub const ROW_HASH_SEED2: u64 = 0xa076_1d64_78bd_642f;
+
 /// See module docs.
 #[derive(Default)]
 pub struct RowTable {

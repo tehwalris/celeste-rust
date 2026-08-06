@@ -1,0 +1,330 @@
+//! The backward pass: min-frames-to-goal over the reachable row graph.
+//!
+//! Because a row is the COMPLETE canonical boundary state and the interpreter
+//! is deterministic, the successor relation is a static graph over rows - it
+//! does not depend on the frame at which a row occurs. So the backward pass
+//! is not a per-frame simulation: it is one origin-tagged forward replay of
+//! every saved frontier batch (each row is expanded exactly once, at its
+//! discovery frame), which records the edges `src row -> dst row`, followed
+//! by a reverse BFS assigning
+//!
+//!   g(row) = minimum frames from `row` to the room exit,
+//!
+//! seeded by the rows already in the next room (g = 0). Together with the
+//! earliest-arrival frame e(row) (free from the row-table watermarks), the
+//! per-frame backward-viability set for a horizon N is
+//!
+//!   B(f) = { row : g(row) <= N - f },     band(f) = { e <= f } ∩ B(f),
+//!
+//! materialized on demand - per-frame in meaning, two scalars per row in
+//! storage. `min(e + g)` over all rows is the abstract optimal win frame and
+//! must equal the forward pass's first-win frame.
+//!
+//! Soundness: everything here over-approximates concrete reachability the
+//! same way the forward pass does (widened rem, certified quotients), so an
+//! empty band proves impossibility at the horizon; achievability is only
+//! ever claimed from a fully concrete witness replay.
+
+use anyhow::{anyhow, Context, Result};
+use std::path::Path;
+
+use crate::interpreter::deopt_collect;
+use crate::interpreter::inspect::room_x_lane_mask;
+use crate::interpreter::row_table::{RowTable, ROW_HASH_SEED2};
+use crate::interpreter::state::State;
+use crate::interpreter::vectorize::shape_of_state;
+use crate::interpreter::virtual_merge::{collect_columns_labeled, hash_rows, hash_rows_seeded, Column};
+
+use super::checkpoint;
+use super::program::Program;
+use super::state_mapping::StateMapping;
+use super::verify::AbstractRun;
+
+/// The sweep's own origin column. Distinct from the deopt machinery's
+/// `__lane_origin`, which comes and goes inside the same frame execution.
+pub const SWEEP_ORIGIN: &str = "__sweep_origin";
+
+/// `g` value meaning "cannot reach the goal (within the explored graph)".
+pub const G_UNREACHABLE: u16 = u16::MAX;
+
+/// Row keys of every lane of a canonical boundary state - the same
+/// computation `subtract_visited` performs on the forward pass.
+pub fn row_keys(state: &State) -> Result<Vec<(u64, u64)>> {
+    let shape_hash = shape_of_state(state).cached_hash();
+    let Some((columns, _)) = collect_columns_labeled(std::slice::from_ref(state)) else {
+        return Err(anyhow!(
+            "state cannot be canonicalized for row keys (collect_columns failed)"
+        ));
+    };
+    let refs: Vec<&Column> = columns.iter().collect();
+    let h1 = hash_rows(&refs, state.vector_size);
+    let h2 = hash_rows_seeded(&refs, state.vector_size, ROW_HASH_SEED2);
+    Ok(h1
+        .iter()
+        .zip(&h2)
+        .map(|(a, b)| RowTable::key(shape_hash, *a, *b))
+        .collect())
+}
+
+pub struct SweepResult {
+    /// Min frames to the room exit per row id; `G_UNREACHABLE` if none.
+    pub g: Vec<u16>,
+    /// Distinct edges recorded (after in-batch dedup).
+    pub edge_count: usize,
+    /// `min(e + g)` over all rows - the abstract optimal win frame.
+    pub optimal_frame: Option<u32>,
+}
+
+/// Run the backward sweep over the frame batches saved by
+/// `bench --checkpoint-dir D --save-frames` up to `frames`, using the row
+/// table from the checkpoint at `frames`.
+pub fn backward_sweep(
+    dir: &Path,
+    frames: u32,
+    fingerprint: &str,
+    program: &Program,
+    plain: &Program,
+    mapping: StateMapping,
+) -> Result<SweepResult> {
+    let ck = checkpoint::load(dir, frames, fingerprint).context("loading final checkpoint")?;
+    let table = ck.visited;
+    let n_rows = table.len();
+    println!("sweep: {} rows, replaying frames 1..{}", n_rows, frames);
+
+    let mut engine = AbstractRun::start_with_deopt(program, plain, mapping, false)?;
+    engine.disable_frontier();
+
+    let mut g: Vec<u16> = vec![G_UNREACHABLE; n_rows];
+    // Edge chunks spill to disk per frame: at full-room scale the edge set
+    // is tens of GB, and a growing Vec's doubling reallocs would spike past
+    // the memory cap. They are re-read once, into an exactly-sized Vec.
+    let edge_dir = dir.join("sweep-edges");
+    if edge_dir.exists() {
+        std::fs::remove_dir_all(&edge_dir)?;
+    }
+    std::fs::create_dir_all(&edge_dir)?;
+    let mut edge_total: u64 = 0;
+    let mut edge_chunks: Vec<std::path::PathBuf> = Vec::new();
+
+    for f in 1..=frames {
+        let t = std::time::Instant::now();
+        let states = checkpoint::load_frame_states(dir, f)
+            .with_context(|| format!("loading frame batch f{:03}", f))?;
+        if states.is_empty() {
+            continue;
+        }
+        let mut batch = Vec::with_capacity(states.len());
+        let mut batch_lanes = 0usize;
+        for mut state in states {
+            let keys = row_keys(&state)?;
+            let ids: Vec<u32> = keys
+                .iter()
+                .map(|k| {
+                    table.id_of(*k).ok_or_else(|| {
+                        anyhow!("frame f{:03}: a saved lane's row is not in the row table", f)
+                    })
+                })
+                .collect::<Result<_>>()?;
+            // Rows already in the next room have won: g = 0 seeds.
+            for (id, win) in ids.iter().zip(room_x_lane_mask(&state, 2)) {
+                if win {
+                    g[*id as usize] = 0;
+                }
+            }
+            batch_lanes += state.vector_size;
+            if f < frames {
+                deopt_collect::inject_named(&mut state, SWEEP_ORIGIN, &ids);
+                batch.push(state);
+            }
+        }
+        if f == frames {
+            break;
+        }
+
+        // Expand in chunks of bounded input-lane count: the origin column
+        // prevents boundary dedup, so the successor fan-out is the FULL
+        // pre-dedup lane count (~30x the frontier at depth); a whole deep
+        // batch at once would spike tens of GB of transient state.
+        const CHUNK_LANES: usize = 1_000_000;
+        let mut accounted = 0usize;
+        let mut frame_edges: Vec<(u32, u32)> = Vec::new();
+        let mut chunk: Vec<State> = Vec::new();
+        let mut chunk_lanes = 0usize;
+        let mut queue: std::collections::VecDeque<State> = batch.into();
+        while let Some(state) = queue.pop_front() {
+            chunk_lanes += state.vector_size;
+            chunk.push(state);
+            if chunk_lanes < CHUNK_LANES && !queue.is_empty() {
+                continue;
+            }
+            // One frame forward; the origin column carries each lane's
+            // source row id through every split, merge and deopt.
+            let deopt_events = engine.deopt_events();
+            engine.restore(std::mem::take(&mut chunk), None, deopt_events)?;
+            chunk_lanes = 0;
+            engine
+                .step()
+                .with_context(|| format!("expanding frame batch f{:03}", f))?;
+            for out in engine.states() {
+                let origins = deopt_collect::read_origins_named(out, SWEEP_ORIGIN);
+                let mut stripped = out.clone();
+                stripped.global_env.remove(SWEEP_ORIGIN);
+                stripped.gc();
+                let keys = row_keys(&stripped)?;
+                if keys.len() != origins.len() {
+                    return Err(anyhow!("sweep: origin/key length mismatch at f{:03}", f));
+                }
+                for (src, key) in origins.iter().zip(&keys) {
+                    let dst = table.id_of(*key).ok_or_else(|| {
+                        anyhow!(
+                            "frame f{:03}: a successor row is not in the row table - \
+                             the replay diverged from the forward pass",
+                            f
+                        )
+                    })?;
+                    frame_edges.push((*src, dst));
+                }
+                accounted += origins.len();
+            }
+            // Drop the chunk's outputs before the next chunk runs.
+            let deopt_events = engine.deopt_events();
+            engine.restore(Vec::new(), None, deopt_events)?;
+        }
+        // Most redundancy is within a frame (the same (src, dst) via many
+        // input combinations); dedup, then spill the chunk to disk.
+        frame_edges.sort_unstable();
+        frame_edges.dedup();
+        let chunk_path = edge_dir.join(format!("f{:03}.bin", f));
+        checkpoint::write_u32_pairs(&chunk_path, &frame_edges)?;
+        edge_total += frame_edges.len() as u64;
+        edge_chunks.push(chunk_path);
+        if f % 10 == 0 || f + 1 == frames {
+            println!(
+                "  sweep f{:03}: {} lanes in, {} successor lanes -> {} distinct edges, {:.1}s ({} edges total)",
+                f,
+                batch_lanes,
+                accounted,
+                frame_edges.len(),
+                t.elapsed().as_secs_f64(),
+                edge_total
+            );
+        }
+    }
+    drop(engine);
+
+    // Reload every chunk into one exactly-sized Vec (no doubling spikes),
+    // sort by dst for predecessor ranges, then reverse BFS from g=0 seeds.
+    let edge_bytes_gb = edge_total as f64 * 8.0 / 1e9;
+    println!("sweep: loading {} edges ({:.1} GB) for BFS", edge_total, edge_bytes_gb);
+    if edge_bytes_gb > 60.0 {
+        return Err(anyhow!(
+            "edge set is {:.1} GB - too large for the in-RAM BFS; a streaming \
+             BFS over the disk chunks is needed at this scale",
+            edge_bytes_gb
+        ));
+    }
+    let mut edges: Vec<(u32, u32)> = Vec::with_capacity(edge_total as usize);
+    for chunk in &edge_chunks {
+        checkpoint::read_u32_pairs_into(chunk, &mut edges)?;
+    }
+    std::fs::remove_dir_all(&edge_dir)?;
+
+    let t = std::time::Instant::now();
+    edges.sort_unstable_by_key(|&(src, dst)| (dst, src));
+    edges.dedup();
+    let edge_count = edges.len();
+    // dst -> range of edges, via the sorted order.
+    let range_of = |dst: u32| {
+        let lo = edges.partition_point(|&(_, d)| d < dst);
+        let hi = edges.partition_point(|&(_, d)| d <= dst);
+        lo..hi
+    };
+    let mut queue: std::collections::VecDeque<u32> = (0..n_rows as u32)
+        .filter(|&id| g[id as usize] == 0)
+        .collect();
+    let seeds = queue.len();
+    while let Some(v) = queue.pop_front() {
+        let next = g[v as usize]
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("g overflow"))?;
+        for &(src, _) in &edges[range_of(v)] {
+            if g[src as usize] == G_UNREACHABLE {
+                g[src as usize] = next;
+                queue.push_back(src);
+            }
+        }
+    }
+    println!(
+        "sweep: {} edges, {} win seeds, BFS in {:.1}s",
+        edge_count,
+        seeds,
+        t.elapsed().as_secs_f64()
+    );
+
+    // min(e + g): the abstract optimal win frame.
+    let mut optimal_frame: Option<u32> = None;
+    for id in 0..n_rows as u32 {
+        let gv = g[id as usize];
+        if gv == G_UNREACHABLE {
+            continue;
+        }
+        if let Some(e) = table.earliest_frame(id) {
+            let win = e + gv as u32;
+            optimal_frame = Some(optimal_frame.map_or(win, |b| b.min(win)));
+        }
+    }
+
+    Ok(SweepResult { g, edge_count, optimal_frame })
+}
+
+/// Write the g array next to the checkpoints (`<dir>/g.bin`, u16-LE columnar).
+pub fn save_g(dir: &Path, g: &[u16]) -> Result<()> {
+    use std::io::Write;
+    let tmp = dir.join("tmp-g.bin");
+    {
+        let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+        w.write_all(b"C8TB")?;
+        w.write_all(&checkpoint::FORMAT_VERSION.to_le_bytes())?;
+        w.write_all(&(g.len() as u64).to_le_bytes())?;
+        let mut zw = zstd::Encoder::new(&mut w, 1)?;
+        zw.include_checksum(true)?;
+        for v in g {
+            zw.write_all(&v.to_le_bytes())?;
+        }
+        zw.finish()?;
+        w.flush()?;
+    }
+    std::fs::rename(&tmp, dir.join("g.bin"))?;
+    Ok(())
+}
+
+/// Per-frame band sizes for a horizon: |{row : e <= f and g <= horizon - f}|.
+pub fn band_sizes(table: &RowTable, g: &[u16], horizon: u32) -> Vec<(u32, u64)> {
+    let frames = table.watermarks().len() as u32;
+    // Difference array over frames: each row is in the band for
+    // f in [e, horizon - g] (clamped to the forward range).
+    let mut diff = vec![0i64; frames as usize + 2];
+    for id in 0..g.len() as u32 {
+        let gv = g[id as usize];
+        if gv == G_UNREACHABLE {
+            continue;
+        }
+        let Some(e) = table.earliest_frame(id) else { continue };
+        if gv as u32 > horizon {
+            continue;
+        }
+        let last = (horizon - gv as u32).min(frames);
+        if e > last {
+            continue;
+        }
+        diff[e as usize] += 1;
+        diff[last as usize + 1] -= 1;
+    }
+    let mut out = Vec::with_capacity(frames as usize);
+    let mut acc = 0i64;
+    for f in 1..=frames {
+        acc += diff[f as usize];
+        out.push((f, acc as u64));
+    }
+    out
+}

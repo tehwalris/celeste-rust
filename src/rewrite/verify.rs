@@ -386,6 +386,13 @@ impl AbstractRun {
         self.visited_rows.as_ref()
     }
 
+    /// Turn frontier subtraction off (regardless of the env flag). The
+    /// backward sweep expands saved frontier batches one frame at a time and
+    /// must see every successor lane, not just never-seen ones.
+    pub fn disable_frontier(&mut self) {
+        self.visited_rows = None;
+    }
+
     /// Restore from a checkpoint: boundary states, row table and deopt
     /// counters as of some completed frame. The caller continues stepping
     /// from the following frame. Refuses to attach a row table when
@@ -664,18 +671,12 @@ fn run_deopt_frame_granular(
 /// program never reads; see `deopt_collect::ORIGIN_GLOBAL`). The index is the
 /// lane position, bijectively encoded in the raw Pico8Num bits.
 fn inject_origin(state: &mut State) {
-    use crate::interpreter::deopt_collect::ORIGIN_GLOBAL;
-    let lanes: Vec<Pico8Num> = (0..state.vector_size as u32)
-        .map(|i| Pico8Num::from_parts((i >> 16) as i16, i as u16))
-        .collect();
-    let value = if lanes.len() == 1 {
-        MaybeVector::Scalar(lanes[0])
-    } else {
-        MaybeVector::Vector(std::sync::Arc::new(lanes))
-    };
-    let cell = state.heap.alloc();
-    state.heap.set(cell, HeapValue::Value(Value::Number(value)));
-    state.global_env.insert(ORIGIN_GLOBAL.to_string(), cell);
+    let ids: Vec<u32> = (0..state.vector_size.max(1) as u32).collect();
+    crate::interpreter::deopt_collect::inject_named(
+        state,
+        crate::interpreter::deopt_collect::ORIGIN_GLOBAL,
+        &ids,
+    );
 }
 
 /// One frame of one state under the plain program: map the input to canonical,

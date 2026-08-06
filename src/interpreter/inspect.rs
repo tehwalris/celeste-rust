@@ -733,6 +733,31 @@ pub fn count_room_x_lanes(state: &State, x: i16) -> usize {
     }
 }
 
+/// Per-lane version of `count_room_x_lanes`: which lanes have `room.x == x`.
+pub fn room_x_lane_mask(state: &State, x: i16) -> Vec<bool> {
+    let helper = StateHelper::new(state);
+    let cell = helper
+        .find_global("room")
+        .unwrap_or_else(|| panic!("room_x_lane_mask: no `room` global"));
+    let table_id = helper
+        .unwrap_pointer(helper.load(cell))
+        .unwrap_or_else(|| panic!("room_x_lane_mask: `room` global is not a table pointer"));
+    let HeapValue::ObjectTable(room) = helper.load(table_id) else {
+        panic!("room_x_lane_mask: `room` does not point at a table");
+    };
+    let x_id = *room
+        .get("x")
+        .unwrap_or_else(|| panic!("room_x_lane_mask: room table has no x field"));
+    let HeapValue::Value(Value::Number(n)) = helper.load(x_id) else {
+        panic!("room_x_lane_mask: room.x is not a number");
+    };
+    let want = Pico8Num::from_i16(x);
+    match n {
+        MaybeVector::Scalar(s) => vec![*s == want; state.vector_size.max(1)],
+        MaybeVector::Vector(v) => v.iter().map(|s| *s == want).collect(),
+    }
+}
+
 /// Per-lane (x, y) whole-pixel positions of the first object (the player or
 /// the spawn animation), or `None` when the objects array is empty (dead
 /// countdown states) or missing. Used by the per-coordinate saturation dump
