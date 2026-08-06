@@ -313,13 +313,14 @@ __reset_button_states()
     }
 
     // Frontier-only search: persistent cross-frame visited set of canonical
-    // row hashes, keyed by shape hash. Experimental; hash-only (not
-    // proof-grade). Sound only from a fresh start - on --resume the visited
-    // set is empty, which loses dedup but never completeness.
+    // 128-bit row hashes, keyed by shape hash. Not exact-key, but the
+    // birthday collision risk at 10^8 rows is negligible. Sound only from a
+    // fresh start - on --resume the visited set is empty, which loses dedup
+    // but never completeness.
     let mut visited_rows: Option<
-        rustc_hash::FxHashMap<u64, rustc_hash::FxHashSet<u64>>,
+        rustc_hash::FxHashMap<u64, rustc_hash::FxHashSet<(u64, u64)>>,
     > = if std::env::var_os("CELESTE_FRONTIER_ONLY").is_some() {
-        println!("frontier-only search ENABLED (experimental, hash-only visited set)");
+        println!("frontier-only search ENABLED (128-bit hashed visited set)");
         Some(Default::default())
     } else {
         None

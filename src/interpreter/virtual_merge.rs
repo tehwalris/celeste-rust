@@ -471,10 +471,20 @@ pub fn collect_columns_labeled<'a>(
 /// and visited once in order, so the per-piece dispatch amortises over
 /// thousands of lanes rather than costing anything per element.
 pub fn hash_rows(columns: &[&Column], total_rows: usize) -> Vec<u64> {
+    hash_rows_seeded(columns, total_rows, 0)
+}
+
+/// `hash_rows` with the seed mixed into every element hash, giving an
+/// independent hash function per seed. The frontier visited set keys rows by
+/// two independently-seeded 64-bit hashes (128 bits total), which takes the
+/// birthday collision risk at 10^8 rows from ~10^-4 to negligible - the
+/// difference between "modulo hashing" and a claim one can argue about.
+pub fn hash_rows_seeded(columns: &[&Column], total_rows: usize, seed: u64) -> Vec<u64> {
     use std::hash::{Hash, Hasher};
     #[inline(always)]
-    fn elem_hash<T: Hash>(value: &T) -> u64 {
+    fn elem_hash_seeded<T: Hash>(value: &T, seed: u64) -> u64 {
         let mut hasher = rustc_hash::FxHasher::default();
+        seed.hash(&mut hasher);
         value.hash(&mut hasher);
         hasher.finish()
     }
@@ -482,20 +492,20 @@ pub fn hash_rows(columns: &[&Column], total_rows: usize) -> Vec<u64> {
     fn fold(row: &mut u64, value: u64) {
         *row = (row.rotate_left(26) ^ value).wrapping_mul(0x9e37_79b9_7f4a_7c15);
     }
-    fn run<T: Hash + Copy + PartialEq>(pieces: &[Piece<T>], hashes: &mut [u64]) {
+    fn run<T: Hash + Copy + PartialEq>(pieces: &[Piece<T>], hashes: &mut [u64], seed: u64) {
         let mut at = 0;
         for piece in pieces {
             let n = piece.len();
             match piece {
                 Piece::Slice(s) => {
                     for (row, value) in hashes[at..at + n].iter_mut().zip(s.iter()) {
-                        fold(row, elem_hash(value));
+                        fold(row, elem_hash_seeded(value, seed));
                     }
                 }
                 Piece::Scalar(v, _) => {
                     // One hash for the whole run - the value is the same in
                     // every lane of this fragment.
-                    let h = elem_hash(v);
+                    let h = elem_hash_seeded(v, seed);
                     for row in hashes[at..at + n].iter_mut() {
                         fold(row, h);
                     }
@@ -505,17 +515,17 @@ pub fn hash_rows(columns: &[&Column], total_rows: usize) -> Vec<u64> {
         }
     }
 
-    fn hash_range(columns: &[&Column], hashes: &mut [u64], start: usize) {
+    fn hash_range(columns: &[&Column], hashes: &mut [u64], start: usize, seed: u64) {
         let end = start + hashes.len();
         for column in columns {
             match column {
-                Column::Numbers(p) => visit_range_impl(p, start, end, |v| elem_hash(&v), |i, h| {
+                Column::Numbers(p) => visit_range_impl(p, start, end, |v| elem_hash_seeded(&v, seed), |i, h| {
                     fold(&mut hashes[i - start], h)
                 }),
-                Column::Bools(p) => visit_range_impl(p, start, end, |v| elem_hash(&v), |i, h| {
+                Column::Bools(p) => visit_range_impl(p, start, end, |v| elem_hash_seeded(&v, seed), |i, h| {
                     fold(&mut hashes[i - start], h)
                 }),
-                Column::Intervals(p) => visit_range_impl(p, start, end, |v| elem_hash(&v), |i, h| {
+                Column::Intervals(p) => visit_range_impl(p, start, end, |v| elem_hash_seeded(&v, seed), |i, h| {
                     fold(&mut hashes[i - start], h)
                 }),
             }
@@ -528,9 +538,9 @@ pub fn hash_rows(columns: &[&Column], total_rows: usize) -> Vec<u64> {
     if total_rows < PARALLEL_ROW_THRESHOLD || threads == 1 {
         for column in columns {
             match column {
-                Column::Numbers(p) => run(p, &mut hashes),
-                Column::Bools(p) => run(p, &mut hashes),
-                Column::Intervals(p) => run(p, &mut hashes),
+                Column::Numbers(p) => run(p, &mut hashes, seed),
+                Column::Bools(p) => run(p, &mut hashes, seed),
+                Column::Intervals(p) => run(p, &mut hashes, seed),
             }
         }
     } else {
@@ -541,7 +551,7 @@ pub fn hash_rows(columns: &[&Column], total_rows: usize) -> Vec<u64> {
         let chunk = total_rows.div_ceil(threads);
         std::thread::scope(|scope| {
             for (i, hash_chunk) in hashes.chunks_mut(chunk).enumerate() {
-                scope.spawn(move || hash_range(columns, hash_chunk, i * chunk));
+                scope.spawn(move || hash_range(columns, hash_chunk, i * chunk, seed));
             }
         });
     }

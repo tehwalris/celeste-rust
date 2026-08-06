@@ -253,3 +253,27 @@ Verification:
   the result survives; only the end-of-run summary is lost.
 * deoptcheck/verify/test-suite all green at every commit tonight;
   every change is one commit on `census`, pushed.
+
+## 4. Visited-set hardening: 128-bit row keys
+
+Two independently-seeded 64-bit row hashes (seed mixed into every
+element hash) keyed as a pair. At 151.6M rows the single-64-bit
+birthday risk was ~6e-4 per run; now negligible (~1e-23). f45 frontier
+counts bit-identical to the 64-bit version (so no shallow collision
+had occurred); cost ~2% of a deep run. The full-room run was repeated
+under 128-bit keys to re-certify the frame-90 bound - result recorded
+below. Exact-key encoding (dictionary-packed rows) remains the
+morning-review item if "negligible hash risk" is not acceptable for
+the eventual proof.
+
+## 5. Dash package (#47): re-parked
+
+Tried appending plans/dash-package.jsonl to the recipe under the new
+stack (partitioned merges + frontier + collect-first): the entries no
+longer apply - the recipe evolved past the 2026-08-03 derivation
+('in_h061_in_i1_081_if_body_23' is not exactly accessor + bool +
+store). Re-deriving is task-#45-scale work for what measured +17%
+time / +30% memory before; the expand-copies-every-vector fundamental
+is unchanged. Re-parked; revisit only if fragment-count overhead rises
+in future profiles (f72 profile: 55% straight-line execution, 19%
+merge, 6.5% deopt filtering, 12% tile_flag_at builtins, 3% gc).

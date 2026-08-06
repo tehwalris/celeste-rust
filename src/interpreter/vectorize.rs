@@ -1239,9 +1239,11 @@ fn split_states_by_partition(states: Vec<State>, cells: &[usize]) -> Vec<State> 
 /// Returns (kept_states, lanes_before, lanes_after).
 pub fn subtract_visited(
     states: Vec<State>,
-    visited: &mut FxHashMap<u64, FxHashSet<u64>>,
+    visited: &mut FxHashMap<u64, FxHashSet<(u64, u64)>>,
 ) -> (Vec<State>, usize, usize) {
-    use crate::interpreter::virtual_merge::{collect_columns_labeled, hash_rows, Column};
+    use crate::interpreter::virtual_merge::{
+        collect_columns_labeled, hash_rows, hash_rows_seeded, Column,
+    };
     let _trace = TraceSpan::new("subtract_visited", "vectorize");
     let mut out = Vec::with_capacity(states.len());
     let mut before = 0usize;
@@ -1261,9 +1263,17 @@ pub fn subtract_visited(
         // hash_rows folds scalar/uniform pieces into every row, so the row
         // hash covers the full lane-varying AND lane-uniform value content;
         // structure is covered by the shape hash keying the set.
+        // Two independently-seeded 64-bit hashes = a 128-bit row key. At
+        // ~10^8 rows the 64-bit birthday risk was ~10^-4 per run; 128 bits
+        // make it negligible.
         let hashes = hash_rows(&refs, state.vector_size);
+        let hashes2 = hash_rows_seeded(&refs, state.vector_size, 0xa076_1d64_78bd_642f);
         let set = visited.entry(shape_hash).or_default();
-        let mask: Vec<bool> = hashes.iter().map(|h| set.insert(*h)).collect();
+        let mask: Vec<bool> = hashes
+            .iter()
+            .zip(&hashes2)
+            .map(|(a, b)| set.insert((*a, *b)))
+            .collect();
         let kept = mask.iter().filter(|b| **b).count();
         after += kept;
         if kept == state.vector_size {

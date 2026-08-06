@@ -276,10 +276,10 @@ pub struct AbstractRun {
     /// See BENCHMARK_DATA.md.
     states_before_merge: Vec<usize>,
     /// Frontier-only search (CELESTE_FRONTIER_ONLY=1): persistent cross-frame
-    /// visited set of canonical row hashes, keyed by shape hash. Experimental,
-    /// hash-only; see `vectorize::subtract_visited` for the soundness note.
+    /// visited set of canonical 128-bit row hashes, keyed by shape hash. See
+    /// `vectorize::subtract_visited` for the collision-risk note.
     visited_rows: Option<
-        rustc_hash::FxHashMap<u64, rustc_hash::FxHashSet<u64>>,
+        rustc_hash::FxHashMap<u64, rustc_hash::FxHashSet<(u64, u64)>>,
     >,
     /// Use only the historic rem widening at boundaries (for the widen-check,
     /// which applies the conservative widenings post hoc instead).
@@ -328,7 +328,7 @@ impl AbstractRun {
             program.frame_cfg().clone(),
         );
         let visited_rows = if std::env::var_os("CELESTE_FRONTIER_ONLY").is_some() {
-            println!("frontier-only search ENABLED (experimental, hash-only visited set)");
+            println!("frontier-only search ENABLED (128-bit hashed visited set)");
             Some(Default::default())
         } else {
             None
