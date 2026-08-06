@@ -398,6 +398,107 @@ pub fn interpret_binary_op(l: &Value, op: BinaryOp, r: &Value) -> Result<Value> 
         (Value::NumberInterval(l), BinaryOp::Minus, Value::NumberInterval(r)) => {
             Ok(Value::NumberInterval(MaybeVector::map2(l, r, |l, r| *l - *r)))
         }
+        // Interval scaled by a POSITIVE scalar (the widened fruit-off path:
+        // `off/40`, `sin(..)*2.5`). Fixed-point mul/div by a positive
+        // constant is monotone, so the endpoint images bound the image of
+        // every representable value in between - the result interval is
+        // sound without any rounding analysis. Negative or lane-varying
+        // scalars stay unsupported (loud), not silently approximated.
+        (Value::NumberInterval(l), BinaryOp::Star, Value::Number(MaybeVector::Scalar(r)))
+            if *r > Pico8Num::from_i16(0) =>
+        {
+            Ok(Value::NumberInterval(l.map(|iv| iv.scale_positive(*r))))
+        }
+        (Value::NumberInterval(l), BinaryOp::Slash, Value::Number(MaybeVector::Scalar(r)))
+            if *r > Pico8Num::from_i16(0) =>
+        {
+            Ok(Value::NumberInterval(l.map(|iv| iv.div_positive(*r))))
+        }
+
+        // Interval comparisons: per-lane definite answers where the interval
+        // is entirely on one side, whole-value UnknownBool as soon as any
+        // lane straddles (the branch machinery then explores both arms for
+        // the state - a sound over-approximation; the definite lanes are
+        // re-filtered by their arms' outcomes downstream).
+        (Value::NumberInterval(_), op, _) | (_, op, Value::NumberInterval(_))
+            if matches!(
+                op,
+                BinaryOp::LessThan
+                    | BinaryOp::GreaterThan
+                    | BinaryOp::LessThanEqual
+                    | BinaryOp::GreaterThanEqual
+            ) =>
+        {
+            let lift = |v: &Value| -> Result<MaybeVector<crate::pico8_num::Pico8NumInterval>> {
+                match v {
+                    Value::NumberInterval(iv) => Ok(iv.clone()),
+                    Value::Number(n) => Ok(lift_to_interval(n)),
+                    other => Err(anyhow!("interval comparison with {:?}", other)),
+                }
+            };
+            let l = lift(l)?;
+            let r = lift(r)?;
+            // tri-state per lane: Some(bool) definite, None straddling.
+            let judge = |l: &crate::pico8_num::Pico8NumInterval,
+                         r: &crate::pico8_num::Pico8NumInterval|
+             -> Option<bool> {
+                match op {
+                    BinaryOp::LessThan => {
+                        if l.high < r.low {
+                            Some(true)
+                        } else if l.low >= r.high {
+                            Some(false)
+                        } else {
+                            None
+                        }
+                    }
+                    BinaryOp::LessThanEqual => {
+                        if l.high <= r.low {
+                            Some(true)
+                        } else if l.low > r.high {
+                            Some(false)
+                        } else {
+                            None
+                        }
+                    }
+                    BinaryOp::GreaterThan => {
+                        if l.low > r.high {
+                            Some(true)
+                        } else if l.high <= r.low {
+                            Some(false)
+                        } else {
+                            None
+                        }
+                    }
+                    BinaryOp::GreaterThanEqual => {
+                        if l.low >= r.high {
+                            Some(true)
+                        } else if l.high < r.low {
+                            Some(false)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            };
+            let tri = MaybeVector::map2(&l, &r, |l, r| judge(l, r));
+            let any_unknown = match &tri {
+                MaybeVector::Scalar(t) => t.is_none(),
+                MaybeVector::Vector(ts) => ts.iter().any(|t| t.is_none()),
+            };
+            if any_unknown {
+                Ok(Value::UnknownBool)
+            } else {
+                let bools = match &tri {
+                    MaybeVector::Scalar(t) => MaybeVector::Scalar(t.unwrap()),
+                    MaybeVector::Vector(ts) => {
+                        MaybeVector::vector(ts.iter().map(|t| t.unwrap()).collect())
+                    }
+                };
+                Ok(Value::Bool(bools))
+            }
+        }
 
         // Comparison operations on numbers
         (Value::Number(l), BinaryOp::LessThan, Value::Number(r)) => {

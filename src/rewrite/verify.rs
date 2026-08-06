@@ -921,14 +921,14 @@ fn run_deopt_frame_granular(
             let one_line = format!("{:#}", err).replace('\n', " | ");
             println!(
                 "  deopt: retry failed for a non-premise reason ({}); whole-state fallback",
-                one_line.chars().take(160).collect::<String>()
+                one_line.chars().take(400).collect::<String>()
             );
             return Ok((run_deopt_frame(deopt, snapshot)?, n));
         }
         Err(panic) => {
             println!(
                 "  deopt: retry panicked ({}); whole-state fallback",
-                panic_text(&panic).chars().take(160).collect::<String>()
+                panic_text(&panic).chars().take(400).collect::<String>()
             );
             return Ok((run_deopt_frame(deopt, snapshot)?, n));
         }

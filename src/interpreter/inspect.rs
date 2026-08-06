@@ -834,6 +834,52 @@ pub fn make_state_abstract_rem(mut state: State, precision: RemPrecision) -> Sta
         }
     }
 
+    // Widen each live fruit's bob counter to unknown-within-period: off :=
+    // the FULL interval [0, 39] at every non-exact level (this function
+    // returns early for Exact, where `off` stays concrete mod 40 - the
+    // conservative pin). This joins the refinement ladder exactly like rem:
+    // coarse levels over-approximate the bob (sin over the interval covers
+    // [-1, 1], so the fruit's y is the whole band and collisions split on
+    // UnknownBool), refutations stay sound, and the exact level resolves
+    // the phase through the k15 band. Rationale (Philippe, 2026-08-07): the
+    // berry is extremely unlikely to be on the optimal path; if it IS, the
+    // exact level still decides correctly - a wrong result cannot slip
+    // through, only a loose band. The win: all break cohorts collapse into
+    // one row family (33.5% of the room-(0,0) frontier at f79 was
+    // per-cohort fruit rows).
+    {
+        let helper = StateHelper::new(&state);
+        let mut off_cells: Vec<HeapId> = Vec::new();
+        if let Some(arr_id) = helper
+            .find_global("objects")
+            .and_then(|id| helper.unwrap_pointer(helper.load(id)))
+        {
+            let fruits = helper
+                .find_objects_by_type(arr_id, "fruit")
+                .unwrap_or_else(|e| panic!("fruit-off widening: {}", e));
+            for obj_id in fruits {
+                let HeapValue::ObjectTable(obj) = helper.load(obj_id) else {
+                    panic!("fruit-off widening: fruit is not an ObjectTable");
+                };
+                off_cells.push(*obj.get("off").unwrap_or_else(|| {
+                    panic!("fruit-off widening: fruit has no `off` field")
+                }));
+            }
+        }
+        let full_period = Pico8NumInterval::new(Pico8Num::from_i16(0), Pico8Num::from_i16(39));
+        for cell in off_cells {
+            match state.heap.get(cell) {
+                HeapValue::Value(Value::Number(_) | Value::NumberInterval(_)) => {
+                    state.heap.set(
+                        cell,
+                        HeapValue::Value(Value::NumberInterval(MaybeVector::Scalar(full_period))),
+                    );
+                }
+                other => panic!("fruit-off widening: off is not numeric: {:?}", other),
+            }
+        }
+    }
+
     state
 }
 
@@ -926,6 +972,21 @@ pub fn apply_conservative_widenings(mut state: State) -> State {
                             }
                         };
                         off_updates.push((off_cell, Value::Number(reduced)));
+                    }
+                    // Already widened to unknown-within-period by
+                    // make_state_abstract_rem (which runs before this at
+                    // non-exact levels; mid-frame the interval drifts to at
+                    // most [1, 40]). Validate the bound and leave it - the
+                    // next boundary's widening resets it to [0, 39].
+                    HeapValue::Value(Value::NumberInterval(mv)) => {
+                        let ok = |iv: &Pico8NumInterval| {
+                            iv.low >= Pico8Num::from_i16(0) && iv.high <= Pico8Num::from_i16(40)
+                        };
+                        let all_ok = match mv {
+                            MaybeVector::Scalar(iv) => ok(iv),
+                            MaybeVector::Vector(ivs) => ivs.iter().all(ok),
+                        };
+                        assert!(all_ok, "fruit-off pin: widened off outside [0, 40]: {:?}", mv);
                     }
                     other => panic!("fruit-off pin: off is not a number: {:?}", other),
                 }

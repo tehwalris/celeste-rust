@@ -300,14 +300,37 @@ impl Pico8NumInterval {
     }
 }
 
+impl Pico8NumInterval {
+    /// Endpoint arithmetic is only sound when no value in the interval
+    /// wraps: if exactly one endpoint wraps, the true result set is two
+    /// disjoint segments and a single [low, high] pair cannot represent it
+    /// (a struct-literal construction would silently produce low > high).
+    /// The extremes computed in i64 bound every intermediate sum, so
+    /// checking them is a complete wrap detector. Loud on wrap: no current
+    /// widening produces values anywhere near the numeric range, so a trip
+    /// here is a modeling surprise to investigate, not a case to paper
+    /// over. (If a full-range interval ever becomes legitimate, its closure
+    /// under wrapping arithmetic is the full interval - add that as an
+    /// explicit, deliberate case then.)
+    fn from_i64_endpoints(low: i64, high: i64) -> Self {
+        assert!(
+            low >= i32::MIN as i64 && high <= i32::MAX as i64,
+            "interval arithmetic wrapped: endpoints [{}, {}] leave the 16.16 range",
+            low,
+            high
+        );
+        Self::new(Pico8Num(low as i32), Pico8Num(high as i32))
+    }
+}
+
 impl Add for Pico8NumInterval {
     type Output = Self;
 
     fn add(self, rhs: Self) -> Self::Output {
-        Self {
-            low: self.low + rhs.low,
-            high: self.high + rhs.high,
-        }
+        Self::from_i64_endpoints(
+            self.low.0 as i64 + rhs.low.0 as i64,
+            self.high.0 as i64 + rhs.high.0 as i64,
+        )
     }
 }
 
@@ -315,10 +338,28 @@ impl Sub for Pico8NumInterval {
     type Output = Self;
 
     fn sub(self, rhs: Self) -> Self::Output {
-        Self {
-            low: self.low - rhs.high,
-            high: self.high - rhs.low,
-        }
+        Self::from_i64_endpoints(
+            self.low.0 as i64 - rhs.high.0 as i64,
+            self.high.0 as i64 - rhs.low.0 as i64,
+        )
+    }
+}
+
+impl Pico8NumInterval {
+    /// Scale by a POSITIVE scalar (monotone, so endpoint images bound the
+    /// set), with the same loud wrap detection as `Add`/`Sub`.
+    pub fn scale_positive(&self, rhs: Pico8Num) -> Self {
+        assert!(rhs.0 > 0, "scale_positive needs a positive scalar");
+        let mul = |a: i32| -> i64 { ((a as i64) * (rhs.0 as i64)) >> 16 };
+        Self::from_i64_endpoints(mul(self.low.0), mul(self.high.0))
+    }
+
+    /// Divide by a POSITIVE scalar (monotone), loud on wrap. Mirrors the
+    /// concrete `Div` (i64 shifted dividend, truncating division).
+    pub fn div_positive(&self, rhs: Pico8Num) -> Self {
+        assert!(rhs.0 > 0, "div_positive needs a positive scalar");
+        let div = |a: i32| -> i64 { ((a as i64) << 16).wrapping_div(rhs.0 as i64) };
+        Self::from_i64_endpoints(div(self.low.0), div(self.high.0))
     }
 }
 

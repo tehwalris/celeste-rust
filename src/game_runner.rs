@@ -650,17 +650,27 @@ pub fn apply_start_room(game_lua: &str) -> Result<String> {
     Ok(game_lua.replacen(PAT, &format!("load_room({}, {})", x, y), 1))
 }
 
-/// PICO-8 `sin`, concrete arguments only (see `Pico8Num::pico8_sin`).
-/// Widened values reaching sin is a modeling error, not a case to
-/// over-approximate - so intervals are a loud failure.
+/// PICO-8 `sin` (see `Pico8Num::pico8_sin`). Interval arguments come from
+/// the fruit-off widening (plans/room00-plan.md): at non-exact refinement
+/// levels the fruit's bob counter is an unknown-within-period interval, so
+/// sin over it soundly returns the FULL range [-1, 1] - the coarse levels
+/// over-approximate the bob and the exact level (concrete off) resolves it,
+/// same contract as the rem ladder.
 fn builtin_sin(args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(anyhow!("sin requires 1 argument"));
     }
     match &args[0] {
         Value::Number(nums) => Ok(Value::Number(nums.map(|n| n.pico8_sin()))),
+        Value::NumberInterval(ivs) => {
+            let full = crate::pico8_num::Pico8NumInterval::new(
+                Pico8Num::from_i16(-1),
+                Pico8Num::from_i16(1),
+            );
+            Ok(Value::NumberInterval(ivs.map(|_| full)))
+        }
         other => Err(anyhow!(
-            "sin: only concrete numbers are supported (a widened value reached sin): {:?}",
+            "sin: unsupported argument (neither number nor interval): {:?}",
             other
         )),
     }

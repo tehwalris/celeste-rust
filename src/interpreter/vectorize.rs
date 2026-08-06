@@ -1459,14 +1459,20 @@ pub fn union_diff_states(
         let class = partition_class(state, &cells).unwrap_or(u64::MAX);
         shape_classes.insert((shape_of_state(state).cached_hash, class))
     });
-    assert!(
-        all_distinct,
-        "hint_normalize arrivals are not pairwise (shape, class)-distinct \
-         (or a 64-bit hash collided): vectorize_states should emit one state \
-         per shape and partition class. union_diff_states no longer contains \
-         a state dedup; implement an exact one on the vectorize_states row \
-         machinery."
-    );
+    if !all_distinct {
+        // Same-(shape, class) arrivals DO occur since the fruit-off interval
+        // widening: a branch on a whole-value UnknownBool (an interval
+        // comparison with a straddling lane) copies ALL lanes down both
+        // arms, and when neither arm writes anything class-distinguishing
+        // before the join, both arrivals carry the same shape and class with
+        // overlapping lane sets. The exact answer is the row-level union -
+        // vectorize_states' own merge/dedup machinery - which is precisely
+        // the "exact dedup" the old panic here demanded. This never fires
+        // on interval-free rooms (the guard was a hard panic through the
+        // whole room-(1,0) campaign).
+        let merged = vectorize_states(potentially_new);
+        return (merged.clone(), merged);
+    }
     (potentially_new.clone(), potentially_new)
 }
 #[cfg(test)]
