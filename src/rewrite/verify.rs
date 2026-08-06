@@ -275,12 +275,10 @@ pub struct AbstractRun {
     /// branches should be judged by this and not by its `filter_branch` share.
     /// See BENCHMARK_DATA.md.
     states_before_merge: Vec<usize>,
-    /// Frontier-only search (CELESTE_FRONTIER_ONLY=1): persistent cross-frame
-    /// visited set of canonical 128-bit row hashes, keyed by shape hash. See
-    /// `vectorize::subtract_visited` for the collision-risk note.
-    visited_rows: Option<
-        rustc_hash::FxHashMap<u64, rustc_hash::FxHashSet<(u64, u64)>>,
-    >,
+    /// Frontier-only search (CELESTE_FRONTIER_ONLY=1): the persistent
+    /// cross-frame row table (dense ids + per-frame watermarks; 128-bit
+    /// keys - see `vectorize::subtract_visited` for the collision note).
+    visited_rows: Option<crate::interpreter::row_table::RowTable>,
     /// Use only the historic rem widening at boundaries (for the widen-check,
     /// which applies the conservative widenings post hoc instead).
     rem_only_abstraction: bool,
@@ -490,10 +488,10 @@ impl AbstractRun {
                 std::mem::take(&mut self.states),
                 visited,
             );
-            let visited_total: usize = visited.values().map(|s| s.len()).sum();
+            visited.end_frame();
             println!(
                 "  frontier-only: {} -> {} new lanes, visited total {}",
-                before, after, visited_total
+                before, after, visited.len()
             );
             self.states = kept;
         }

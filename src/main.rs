@@ -317,9 +317,7 @@ __reset_button_states()
     // birthday collision risk at 10^8 rows is negligible. Sound only from a
     // fresh start - on --resume the visited set is empty, which loses dedup
     // but never completeness.
-    let mut visited_rows: Option<
-        rustc_hash::FxHashMap<u64, rustc_hash::FxHashSet<(u64, u64)>>,
-    > = if std::env::var_os("CELESTE_FRONTIER_ONLY").is_some() {
+    let mut visited_rows: Option<crate::interpreter::row_table::RowTable> = if std::env::var_os("CELESTE_FRONTIER_ONLY").is_some() {
         println!("frontier-only search ENABLED (128-bit hashed visited set)");
         Some(Default::default())
     } else {
@@ -394,10 +392,10 @@ __reset_button_states()
         let new_states = if let Some(visited) = visited_rows.as_mut() {
             let (kept, lanes_before, lanes_after) =
                 crate::interpreter::vectorize::subtract_visited(new_states, visited);
-            let visited_total: usize = visited.values().map(|s| s.len()).sum();
+            visited.end_frame();
             println!(
                 "  (frontier-only: {} -> {} new lanes, visited total {})",
-                lanes_before, lanes_after, visited_total
+                lanes_before, lanes_after, visited.len()
             );
             kept
         } else {

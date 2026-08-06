@@ -1239,8 +1239,9 @@ fn split_states_by_partition(states: Vec<State>, cells: &[usize]) -> Vec<State> 
 /// Returns (kept_states, lanes_before, lanes_after).
 pub fn subtract_visited(
     states: Vec<State>,
-    visited: &mut FxHashMap<u64, FxHashSet<(u64, u64)>>,
+    visited: &mut crate::interpreter::row_table::RowTable,
 ) -> (Vec<State>, usize, usize) {
+    use crate::interpreter::row_table::RowTable;
     use crate::interpreter::virtual_merge::{
         collect_columns_labeled, hash_rows, hash_rows_seeded, Column,
     };
@@ -1268,11 +1269,14 @@ pub fn subtract_visited(
         // make it negligible.
         let hashes = hash_rows(&refs, state.vector_size);
         let hashes2 = hash_rows_seeded(&refs, state.vector_size, 0xa076_1d64_78bd_642f);
-        let set = visited.entry(shape_hash).or_default();
         let mask: Vec<bool> = hashes
             .iter()
             .zip(&hashes2)
-            .map(|(a, b)| set.insert((*a, *b)))
+            .map(|(a, b)| {
+                visited
+                    .insert_new(RowTable::key(shape_hash, *a, *b))
+                    .is_some()
+            })
             .collect();
         let kept = mask.iter().filter(|b| **b).count();
         after += kept;
