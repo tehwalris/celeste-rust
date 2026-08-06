@@ -162,6 +162,27 @@ enum Command {
         #[arg(long)]
         base_dir: String,
     },
+    /// Extract an optimal TAS from a refined level's band by forward greedy
+    /// walk: from the initial state, try every input byte each frame,
+    /// keep the ones whose concrete successor lands in the level's row table
+    /// with e <= f and g <= horizon - f, and follow one of them. With every
+    /// per-frame candidate set nonempty through the horizon, the walk is
+    /// guaranteed to end on a g=0 (winning) row - the band is exactly the
+    /// set of states on some optimal-horizon path. Optionally compares
+    /// against a reference TAS, preferring its byte whenever it qualifies.
+    ExtractTas {
+        #[arg(long)]
+        horizon: u32,
+        /// Precision level whose band to walk (16 = exact rem).
+        #[arg(long, default_value_t = 16)]
+        level: u8,
+        /// Checkpoint base: level 0 at <base>/room1, level k at <base>/room1-k<k>.
+        #[arg(long)]
+        base_dir: String,
+        /// Optional reference TAS to compare against.
+        #[arg(long)]
+        tas: Option<String>,
+    },
     Bench {
         #[arg(long, default_value_t = 34)]
         frames: u32,
@@ -922,6 +943,73 @@ fn bench(
         }
     }
     Ok(())
+}
+
+/// Parse a TAS file: comment lines start with '#', the rest is
+/// comma-separated input bytes (bit i of a byte = PICO-8 button i).
+fn parse_tas(path: &str) -> Result<Vec<u8>> {
+    let text = std::fs::read_to_string(path)?;
+    text.lines()
+        .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+        .flat_map(|l| l.split(','))
+        .filter(|t| !t.trim().is_empty())
+        .map(|t| t.trim().parse::<u8>().map_err(|e| anyhow!("bad input byte: {}", e)))
+        .collect()
+}
+
+/// Overwrite the six concrete button cells of a plain-program state from an
+/// input byte.
+fn set_concrete_buttons(
+    state: &mut celeste_rust::interpreter::state::State,
+    byte: u8,
+) -> Result<()> {
+    use celeste_rust::interpreter::value::{HeapValue, MaybeVector, Value};
+    let cell = *state
+        .global_env
+        .get("__button_states")
+        .ok_or_else(|| anyhow!("no __button_states"))?;
+    let arr = match state.heap.get_opt(cell) {
+        Some(HeapValue::Value(Value::Pointer(id))) => *id,
+        Some(HeapValue::ArrayTable(_)) => cell,
+        other => return Err(anyhow!("__button_states shape: {:?}", other)),
+    };
+    let items = match state.heap.get_opt(arr) {
+        Some(HeapValue::ArrayTable(items)) => items.clone(),
+        other => return Err(anyhow!("button array shape: {:?}", other)),
+    };
+    for (i, item) in items.iter().enumerate() {
+        let pressed = byte >> i & 1 == 1;
+        let target = match state.heap.get_opt(*item) {
+            Some(HeapValue::Value(Value::Pointer(id))) => *id,
+            _ => *item,
+        };
+        state
+            .heap
+            .set(target, HeapValue::Value(Value::Bool(MaybeVector::Scalar(pressed))));
+    }
+    Ok(())
+}
+
+/// Run the plain program's init chunk to the single pre-frame-1 concrete
+/// state (the canonical spawn state).
+fn concrete_initial_state(
+    plain: &Program,
+    fixed_env: &celeste_rust::interpreter::fixed_env::FixedEnv,
+) -> Result<celeste_rust::interpreter::state::State> {
+    use celeste_rust::game_runner::{
+        create_initial_state_with_builtins, inject_tile_flag_at_builtin,
+    };
+    use celeste_rust::interpreter::glue::interpret_cfg;
+    let initial = create_initial_state_with_builtins(fixed_env);
+    let init_states = interpret_cfg(plain.init_cfg().clone(), initial, fixed_env)?;
+    let mut states: Vec<_> = init_states.into_iter().map(|(s, _)| s).collect();
+    for s in &mut states {
+        inject_tile_flag_at_builtin(s);
+    }
+    if states.len() != 1 {
+        return Err(anyhow!("init produced {} states", states.len()));
+    }
+    Ok(states.pop().unwrap())
 }
 
 fn main() -> Result<()> {
@@ -1872,29 +1960,16 @@ fn main() -> Result<()> {
         }
 
         Command::TraceWitness { tas, horizon, levels, base_dir } => {
-            use celeste_rust::game_runner::{
-                create_initial_state_with_builtins, inject_tile_flag_at_builtin,
-            };
             use celeste_rust::interpreter::glue::interpret_cfg;
             use celeste_rust::interpreter::inspect::{
                 apply_conservative_widenings, make_state_abstract_rem, RemPrecision,
             };
             use celeste_rust::interpreter::row_table::RowTable;
-            use celeste_rust::interpreter::state::State;
-            use celeste_rust::interpreter::value::{HeapValue, MaybeVector, Value};
             use celeste_rust::rewrite::checkpoint;
             use celeste_rust::rewrite::state_mapping::StateMapping;
             use celeste_rust::rewrite::sweep;
 
-            // Parse the TAS: skip comments, join, split by comma.
-            let text = std::fs::read_to_string(&tas)?;
-            let inputs: Vec<u8> = text
-                .lines()
-                .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
-                .flat_map(|l| l.split(','))
-                .filter(|t| !t.trim().is_empty())
-                .map(|t| t.trim().parse::<u8>().map_err(|e| anyhow!("bad input byte: {}", e)))
-                .collect::<Result<_>>()?;
+            let inputs = parse_tas(&tas)?;
             println!("witness: {} input bytes, horizon {}", inputs.len(), horizon);
 
             // Load every requested level's table and g array.
@@ -1941,51 +2016,13 @@ fn main() -> Result<()> {
             let plain = Program::compile_from_disk()?;
             let mapping = StateMapping::from_recipe(&recipe);
             let fixed_env = plain.fixed_env();
-            let initial = create_initial_state_with_builtins(&fixed_env);
-            let init_states =
-                interpret_cfg(plain.init_cfg().clone(), initial, &fixed_env)?;
-            let mut states: Vec<State> = init_states.into_iter().map(|(s, _)| s).collect();
-            for s in &mut states {
-                inject_tile_flag_at_builtin(s);
-            }
-            if states.len() != 1 {
-                return Err(anyhow!("init produced {} states", states.len()));
-            }
-            let mut state = states.pop().unwrap();
-
-            let set_buttons = |state: &mut State, byte: u8| -> Result<()> {
-                let cell = *state
-                    .global_env
-                    .get("__button_states")
-                    .ok_or_else(|| anyhow!("no __button_states"))?;
-                let arr = match state.heap.get_opt(cell) {
-                    Some(HeapValue::Value(Value::Pointer(id))) => *id,
-                    Some(HeapValue::ArrayTable(_)) => cell,
-                    other => return Err(anyhow!("__button_states shape: {:?}", other)),
-                };
-                let items = match state.heap.get_opt(arr) {
-                    Some(HeapValue::ArrayTable(items)) => items.clone(),
-                    other => return Err(anyhow!("button array shape: {:?}", other)),
-                };
-                for (i, item) in items.iter().enumerate() {
-                    let pressed = byte >> i & 1 == 1;
-                    let target = match state.heap.get_opt(*item) {
-                        Some(HeapValue::Value(Value::Pointer(id))) => *id,
-                        _ => *item,
-                    };
-                    state.heap.set(
-                        target,
-                        HeapValue::Value(Value::Bool(MaybeVector::Scalar(pressed))),
-                    );
-                }
-                Ok(())
-            };
+            let mut state = concrete_initial_state(&plain, &fixed_env)?;
 
             let frame_cfg = plain.frame_cfg().clone();
             let mut first_fail: Option<(u32, u8, String)> = None;
             for frame in 1..=horizon {
                 let byte = inputs.get(frame as usize - 1).copied().unwrap_or(0);
-                set_buttons(&mut state, byte)?;
+                set_concrete_buttons(&mut state, byte)?;
                 let result = interpret_cfg(frame_cfg.clone(), state, &fixed_env)?;
                 if result.len() != 1 {
                     return Err(anyhow!("frame {}: {} states (branching!)", frame, result.len()));
@@ -2045,6 +2082,166 @@ fn main() -> Result<()> {
                 None => println!(
                     "witness trace PASSES every probed level's band at every frame"
                 ),
+            }
+        }
+        Command::ExtractTas { horizon, level, base_dir, tas } => {
+            use celeste_rust::interpreter::fixed_env::PreparedCfg;
+            use celeste_rust::interpreter::glue::interpret_prepared_cfg;
+            use celeste_rust::interpreter::inspect::{
+                apply_conservative_widenings, count_room_x_lanes, make_state_abstract_rem,
+                RemPrecision,
+            };
+            use celeste_rust::interpreter::state::State;
+            use celeste_rust::rewrite::checkpoint;
+            use celeste_rust::rewrite::state_mapping::StateMapping;
+            use celeste_rust::rewrite::sweep;
+
+            let reference: Option<Vec<u8>> = match &tas {
+                Some(path) => Some(parse_tas(path)?),
+                None => None,
+            };
+            let precision =
+                if level >= 16 { RemPrecision::Exact } else { RemPrecision::Bits(level) };
+            let dir = if level == 0 {
+                std::path::PathBuf::from(&base_dir).join("room1")
+            } else {
+                std::path::PathBuf::from(&base_dir).join(format!("room1-k{}", level))
+            };
+            let recipe_text = std::fs::read_to_string(&cli.recipe).unwrap_or_default();
+            let fp = checkpoint::config_fingerprint_with_precision(&recipe_text, precision);
+            let frame = checkpoint::latest(&dir)?
+                .ok_or_else(|| anyhow!("no checkpoint in {}", dir.display()))?;
+            let ck = checkpoint::load(&dir, frame, &fp)?;
+            let g = sweep::load_g(&dir)?;
+            if g.len() != ck.visited.len() {
+                return Err(anyhow!("g/table size mismatch"));
+            }
+            let table = ck.visited;
+            println!(
+                "level {}: {} rows (through f{:03}), walking horizon {}",
+                level,
+                table.len(),
+                frame,
+                horizon
+            );
+
+            let plain = Program::compile_from_disk()?;
+            let mapping = StateMapping::from_recipe(&recipe);
+            let fixed_env = plain.fixed_env();
+            let mut state = concrete_initial_state(&plain, &fixed_env)?;
+            let frame_cfg = PreparedCfg::new(plain.frame_cfg().clone());
+
+            // Probe one concrete state's row in the level's band. A concrete
+            // rem is a point value, so widening lands in exactly one bucket -
+            // no straddle split needed here.
+            let probe = |s: &State| -> Result<Option<(u32, u16)>> {
+                let mut canon = s.clone();
+                mapping.from_canonical(&mut canon)?;
+                let mut a = make_state_abstract_rem(canon, precision);
+                a = apply_conservative_widenings(a);
+                a.gc();
+                let key = sweep::row_keys(&a)?[0];
+                Ok(table.id_of(key).map(|id| {
+                    (table.earliest_frame(id).unwrap_or(u32::MAX), g[id as usize])
+                }))
+            };
+
+            let mut extracted: Vec<u8> = Vec::new();
+            let mut ref_missing_frames: Vec<u32> = Vec::new();
+            for frame in 1..=horizon {
+                let budget = horizon - frame;
+                // Try every input byte (bits 0-5 = the six PICO-8 buttons);
+                // keep those whose successor stays in the band.
+                let mut candidates: Vec<(u8, State)> = Vec::new();
+                for byte in 0u8..64 {
+                    let mut s = state.clone();
+                    set_concrete_buttons(&mut s, byte)?;
+                    let result = interpret_prepared_cfg(&frame_cfg, s, &fixed_env)?;
+                    if result.len() != 1 {
+                        return Err(anyhow!(
+                            "frame {}: {} states (branching!)",
+                            frame,
+                            result.len()
+                        ));
+                    }
+                    let s = result.into_iter().next().unwrap().0;
+                    if let Some((e, gv)) = probe(&s)? {
+                        if e <= frame
+                            && gv != sweep::G_UNREACHABLE
+                            && (gv as u32) <= budget
+                        {
+                            candidates.push((byte, s));
+                        }
+                    }
+                }
+                if candidates.is_empty() {
+                    return Err(anyhow!(
+                        "frame {}: no input keeps the walk inside the band",
+                        frame
+                    ));
+                }
+                let ref_byte =
+                    reference.as_ref().and_then(|r| r.get(frame as usize - 1).copied());
+                let ref_ok =
+                    ref_byte.is_some_and(|b| candidates.iter().any(|(c, _)| *c == b));
+                if ref_byte.is_some() && !ref_ok {
+                    ref_missing_frames.push(frame);
+                }
+                let chosen = if ref_ok { ref_byte.unwrap() } else { candidates[0].0 };
+                let n = candidates.len();
+                state = candidates
+                    .into_iter()
+                    .find(|(b, _)| *b == chosen)
+                    .unwrap()
+                    .1;
+                extracted.push(chosen);
+                println!(
+                    "f{:03}: byte {:2}  ({:2} optimal input bytes{})",
+                    frame,
+                    chosen,
+                    n,
+                    if ref_byte.is_some() && !ref_ok { ", reference byte NOT optimal" } else { "" }
+                );
+            }
+
+            // The walk must have ended on a winning row: g = 0 and the
+            // player concretely in room (2, 0).
+            let final_probe = probe(&state)?;
+            let mut canon = state.clone();
+            mapping.from_canonical(&mut canon)?;
+            let concrete_win = count_room_x_lanes(&canon, 2) == 1;
+            println!(
+                "final row: {:?} (want g=0), concrete room.x==2: {}",
+                final_probe, concrete_win
+            );
+            if final_probe.map(|(_, g)| g) != Some(0) || !concrete_win {
+                return Err(anyhow!("walk did not end on a winning state"));
+            }
+            println!(
+                "extracted TAS ({} frames): {}",
+                extracted.len(),
+                extracted
+                    .iter()
+                    .map(|b| b.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            if let Some(r) = &reference {
+                let identical = r.len() == extracted.len()
+                    && r.iter().zip(&extracted).all(|(a, b)| a == b);
+                if identical {
+                    println!("extracted TAS is byte-identical to the reference");
+                } else if ref_missing_frames.is_empty() {
+                    println!(
+                        "reference byte was in the optimal set at every frame \
+                         (differences only past the reference's length)"
+                    );
+                } else {
+                    println!(
+                        "reference byte fell out of the optimal set at frames {:?}",
+                        ref_missing_frames
+                    );
+                }
             }
         }
         Command::Sweep { checkpoint_dir, frames, horizon, banded } => {
