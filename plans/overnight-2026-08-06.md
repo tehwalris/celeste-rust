@@ -425,3 +425,39 @@ rows with decreasing g, recovering the input per step by trying the
   H1 (90 < H1 <= 100); then k=2..16 repeat the pattern toward the
   concrete optimum, expected to land at exactly 100 with the
   reference TAS as a surviving path.
+
+### The ladder's first full climb, a wrong answer, and the fix
+
+First climb (before the fix): L(1)=94, L(2)=97, L(3)=100 - and k=3's
+sweep independently gave min(e+g)=100. Then k=4 REFUTED horizons
+100-104, which is impossible (the reference TAS wins concretely at
+100): a soundness leak somewhere.
+
+The instrument that found it: `rewrite trace-witness` replays the
+reference TAS concretely and probes every level's row table and (e,g)
+band per frame. k=0 passed every frame (its g counts 19..1,0 straight
+into the win - the level-0 tables track reality exactly). First
+anomaly: f28, k=1, e=30 - the k=1 pass reached the true row two
+frames late; higher levels then missed the true path wholesale.
+
+Root cause: at k>=1, a boundary rem interval can straddle a bucket
+boundary (first dash: [-0.463, 0.037) at 1 bit). The widening stored
+the SPAN of both buckets as one row; the same state reached another
+way (or probed from a concrete state) canonicalizes to a single
+bucket. Row identity fragmented - the abstraction stayed sound (no
+reachability lost), but band coarsenings and probes missed legitimate
+rows, and refutations built on those bands were wrong.
+
+Fix: split straddling lanes into one lane per bucket (clipped) before
+the widening. Boundary intervals inherit single-bucket width, so a
+straddle spans at most two adjacent buckets (asserted). Level 0 and
+Exact are no-ops; verify 34 bit-identical. FORMAT_VERSION bumped to 2
+so every stale table/chunk refuses loudly; the ladder is rebuilding
+from horizon 90. Final gates: witness trace passes every level at
+every frame, and the ladder converges with all levels winning at the
+same horizon (expected: exactly 100).
+
+Lesson recorded: three consecutive "wins" (L1/L2/L3 all plausible)
+masked the identity bug; only the impossible refutation exposed it,
+and only the concrete-witness probe localized it. The witness tracer
+is now a standing gate for the refinement machinery.
