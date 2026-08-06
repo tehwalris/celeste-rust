@@ -72,3 +72,49 @@ specialization ("JIT variants"), per Philippe 2026-08-06.
   bobbing) - more rows while a fruit is alive, handled by the band
   machinery, no code needed.
 - Optimality = fastest exit; the berry itself is score, not time.
+
+## Groundwork landed (2026-08-06, pre-integration)
+
+- `CELESTE_START_ROOM=x,y` (default 1,0): single source of truth in
+  game_runner::start_room(), driving (a) a STRICT exactly-once
+  substitution of _init's load_room call, (b) the collision-cache
+  room, (c) `sin` builtin registration, (d) the config fingerprint
+  (hashed only when non-default, so all room-(1,0) checkpoints stay
+  valid). sin is registered ONLY for non-(1,0) rooms because a new
+  builtin global changes heap layout and therefore every row hash -
+  registering it unconditionally would have silently poisoned the
+  (1,0) universe under an unchanged fingerprint.
+- `Pico8Num::pico8_sin`: PICO-8 semantics (turns, inverted), f32
+  chain + C-style truncation, quarter-turn values exact (tested).
+  OPEN: bit-exactness against a real console is unverified; the
+  fruit bob only evaluates sin on the 40 residues of off/40, so a
+  one-time table dump from real PICO-8 pins all of them. Needed
+  before trusting a proof where fruit-collection timing matters.
+- Gate so far: room (0,0) loads, spawns at (8,112), runs stably
+  under concrete_run. The wall-break exercise is deferred to
+  integration - the forward search will hit the break lanes
+  exhaustively and any fruit/sin bug is a loud error, not a silent
+  wrong answer.
+
+## Fidelity deviations (proposed, need sign-off)
+
+The original spawns extra display-only objects that minimal omits:
+4 `smoke` per wall break (init calls rnd() - cannot be modeled
+exactly AND deterministically) and 1 `lifeup` per fruit collect
+(deterministic but display-only). Proposal: omit BOTH, with the
+documented-deviation pattern already used for the dropped jump
+buffer (celeste-minimal.lua ~line 103): neither object reads or
+writes the player, acts as a solid, or influences any state that
+interacting code reads, so the player trajectory and frame counts
+are identical; and once smoke is omitted (forced by rnd), lifeup's
+omission costs nothing further since array indices already differ.
+
+## Room (0,0) layout (from cart map, for route planning)
+
+Spawn (8,112) bottom-left; fake wall x 8-23, y 32-47, resting on a
+ledge (tiles x 0-39 at y 48). Left wall column exists only for
+y<=79; the spawn column is open to the screen edge (edge clamps, no
+wall-jump). Small blocks at (24-39, 96) and (56-71, 88) stair up.
+Natural break approach: reach the ledge right of the wall (stand
+y=40, x>=24) and dash LEFT into it; the break bounce is spd.y=-1.5
+with dash_time=-1.

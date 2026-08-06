@@ -226,6 +226,8 @@ fn run_game_frames(
         .expect("Failed to read builtin_level_4.lua");
     let game = std::fs::read_to_string("lua/celeste-minimal.lua")
         .expect("Failed to read celeste-minimal.lua");
+    let game = game_runner::apply_start_room(&game)
+        .expect("Failed to apply configured start room");
 
     // Suffix code to call _init
     let init_suffix = r#"

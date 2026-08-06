@@ -33,7 +33,8 @@ pub type PureBuiltinFun = Arc<dyn Fn(&[Value]) -> anyhow::Result<Value> + Send +
 /// `game_runner::make_builtin_tile_flag_at` for the room caveat). `mget`
 /// qualifies the same way: it reads only the cart's map data, and the game
 /// never calls `mset` (grep the Lua), so the map is immutable too.
-pub const PURE_BUILTINS: &[&str] = &["min", "max", "abs", "flr", "tile_flag_at", "mget"];
+pub const PURE_BUILTINS: &[&str] =
+    &["min", "max", "abs", "flr", "sin", "tile_flag_at", "mget"];
 
 pub fn is_pure_builtin(name: &str) -> bool {
     PURE_BUILTINS.contains(&name)

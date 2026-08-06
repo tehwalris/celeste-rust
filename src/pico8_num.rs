@@ -88,6 +88,23 @@ impl Pico8Num {
     pub const fn next_smallest(self) -> Self {
         Self(self.0 - 1)
     }
+
+    /// PICO-8 `sin`: the argument is in TURNS and the result is INVERTED
+    /// (sin(0.25) == -1). Modeled on the console's C implementation: the
+    /// whole chain in f32 (`sinf`), converted to 16.16 by C-style
+    /// truncation toward zero (Rust `as i32`).
+    ///
+    /// The quarter-turn values are exact by construction (see tests). Full
+    /// bit-exactness against a real console has NOT been verified yet; the
+    /// fruit's bob only ever evaluates sin on the 40 residues of off/40, so
+    /// a dumped table from real PICO-8 can pin all of them - see
+    /// plans/room00-plan.md before trusting a proof that depends on fruit
+    /// collection timing.
+    pub fn pico8_sin(self) -> Self {
+        let turns = self.0 as f32 / 65536.0;
+        let v = -(turns * (2.0 * std::f32::consts::PI)).sin();
+        Self((v * 65536.0) as i32)
+    }
 }
 
 pub const fn int(v: i16) -> Pico8Num {
@@ -388,5 +405,22 @@ mod tests {
             (int(-4) - constants::PICO8_NUM_0_15).abs(),
             int(4) + constants::PICO8_NUM_0_15
         );
+    }
+
+    #[test]
+    fn test_pico8_sin_quarter_turns() {
+        // PICO-8 sin is in turns and inverted; the quarter values are the
+        // ones the console documents exactly.
+        assert_eq!(int(0).pico8_sin(), int(0));
+        assert_eq!(Pico8Num::from_parts(0, 0x4000).pico8_sin(), int(-1)); // sin(0.25)
+        assert_eq!(Pico8Num::from_parts(0, 0x8000).pico8_sin(), int(0)); // sin(0.5)
+        assert_eq!(Pico8Num::from_parts(0, 0xc000).pico8_sin(), int(1)); // sin(0.75)
+        assert_eq!(int(1).pico8_sin(), int(0)); // full turn
+        // Periodicity across whole turns for a fruit-style argument.
+        let x = Pico8Num::from_parts(0, 1638); // off=1 -> 1/40 of a turn
+        let y = Pico8Num::from_parts(3, 1638); // three turns later
+        assert_eq!(x.pico8_sin(), y.pico8_sin());
+        // Sign: just past 0 the inverted sine goes negative.
+        assert!((x.pico8_sin().as_raw_u32() as i32) < 0);
     }
 }

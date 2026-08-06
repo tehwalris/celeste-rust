@@ -45,7 +45,9 @@ impl Sources {
         Ok(Self {
             builtin_level_3: std::fs::read_to_string("lua/builtin_level_3.lua")?,
             builtin_level_4: std::fs::read_to_string("lua/builtin_level_4.lua")?,
-            game: std::fs::read_to_string("lua/celeste-minimal.lua")?,
+            game: crate::game_runner::apply_start_room(&std::fs::read_to_string(
+                "lua/celeste-minimal.lua",
+            )?)?,
         })
     }
 }

@@ -76,6 +76,13 @@ pub fn config_fingerprint_with_precision(
     for flag in ["CELESTE_FRONTIER_ONLY", "CELESTE_DEOPT_COLLECT_FIRST", "CELESTE_EXACT_REM"] {
         std::env::var_os(flag).is_some().hash(&mut h);
     }
+    // The start room defines the whole search universe (lua substitution,
+    // collision cache, builtin set). Hashed only when non-default so the
+    // room-(1,0) checkpoints written before this existed remain valid.
+    let room = crate::game_runner::start_room();
+    if room != (1, 0) {
+        format!("start_room={},{}", room.0, room.1).hash(&mut h);
+    }
     // The rem precision level changes the reachable set; the VALUE matters.
     // Hashed only when non-default so checkpoints written before the ladder
     // existed (implicitly Bits(0)) remain valid.

@@ -441,12 +441,12 @@ fn as_i16_elements(v: &MaybeVector<Pico8Num>, what: &str) -> Result<MaybeVector<
 ///
 /// Registered through `add_pure_builtin`: a function of its arguments alone.
 /// The cart data and the collision cache are captured at construction and are
-/// immutable for the lifetime of the environment - and the cache is hardcoded
-/// to room (1, 0), which is where the whole search currently happens. The real
-/// Lua `tile_flag_at` reads the `room` global; this replacement bakes the room
-/// in, so if the search ever crosses a room boundary the builtin must grow a
-/// room argument (and lose this registration) rather than serve stale
-/// collision data. See `inject_tile_flag_at_builtin`.
+/// immutable for the lifetime of the environment - and the cache is built for
+/// the configured `start_room()`, which is where the whole search happens.
+/// The real Lua `tile_flag_at` reads the `room` global; this replacement
+/// bakes the room in, so if the search ever crosses a room boundary the
+/// builtin must grow a room argument (and lose this registration) rather
+/// than serve stale collision data. See `inject_tile_flag_at_builtin`.
 fn make_builtin_tile_flag_at(
     cart_data: std::sync::Arc<cart_data::CartData>,
     collision_cache: std::sync::Arc<CollisionCache>,
@@ -583,6 +583,60 @@ fn tile_flag_at_computed(
     }
 }
 
+/// The room the search starts in, from `CELESTE_START_ROOM` ("x,y"),
+/// default (1, 0). Drives the `_init` load_room substitution
+/// (`apply_start_room`), the collision cache room, the `sin` builtin
+/// registration, and the checkpoint config fingerprint - all four must
+/// agree, which is why this is the single source of truth.
+pub fn start_room() -> (i16, i16) {
+    static ROOM: std::sync::OnceLock<(i16, i16)> = std::sync::OnceLock::new();
+    *ROOM.get_or_init(|| match std::env::var("CELESTE_START_ROOM") {
+        Ok(s) => {
+            let (x, y) = s
+                .split_once(',')
+                .unwrap_or_else(|| panic!("CELESTE_START_ROOM must be \"x,y\", got {:?}", s));
+            (
+                x.trim().parse().expect("CELESTE_START_ROOM x must be an integer"),
+                y.trim().parse().expect("CELESTE_START_ROOM y must be an integer"),
+            )
+        }
+        Err(_) => (1, 0),
+    })
+}
+
+/// Point the game's `_init` at the configured start room. Strict: the
+/// checked-in lua must contain the default call exactly once, so a source
+/// edit can never silently disable the substitution.
+pub fn apply_start_room(game_lua: &str) -> Result<String> {
+    const PAT: &str = "load_room(1, 0)";
+    let count = game_lua.matches(PAT).count();
+    if count != 1 {
+        return Err(anyhow!(
+            "expected exactly one {:?} in the game lua, found {}",
+            PAT,
+            count
+        ));
+    }
+    let (x, y) = start_room();
+    Ok(game_lua.replacen(PAT, &format!("load_room({}, {})", x, y), 1))
+}
+
+/// PICO-8 `sin`, concrete arguments only (see `Pico8Num::pico8_sin`).
+/// Widened values reaching sin is a modeling error, not a case to
+/// over-approximate - so intervals are a loud failure.
+fn builtin_sin(args: &[Value]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(anyhow!("sin requires 1 argument"));
+    }
+    match &args[0] {
+        Value::Number(nums) => Ok(Value::Number(nums.map(|n| n.pico8_sin()))),
+        other => Err(anyhow!(
+            "sin: only concrete numbers are supported (a widened value reached sin): {:?}",
+            other
+        )),
+    }
+}
+
 pub fn create_fixed_env_with_builtins() -> FixedEnv {
     let mut fixed_env = FixedEnv::new();
     fixed_env.add_builtin("__print", builtin_print);
@@ -603,15 +657,26 @@ pub fn create_fixed_env_with_builtins() -> FixedEnv {
 
 pub fn create_fixed_env_with_game_builtins() -> FixedEnv {
     let mut fixed_env = create_fixed_env_with_builtins();
+    let (room_x, room_y) = start_room();
+    // `sin` is registered only for rooms that need it (room (0,0)'s fruit
+    // bobbing). Registering it unconditionally would add a builtin global
+    // to every state - changing heap layout and therefore EVERY row hash -
+    // without changing the config fingerprint, silently invalidating the
+    // whole room-(1,0) checkpoint universe. The fingerprint covers the
+    // start room, so this conditional keeps builtin set and fingerprint in
+    // lockstep.
+    if (room_x, room_y) != (1, 0) {
+        fixed_env.add_pure_builtin("sin", builtin_sin);
+    }
     let cart_data = std::sync::Arc::new(
         cart_data::CartData::load("cart").expect("Failed to load cart data")
     );
 
-    // Create collision cache for room (1, 0) - hardcoded for now
     let collision_cache = std::sync::Arc::new(
-        CollisionCache::new(&cart_data, 1, 0).expect("Failed to create collision cache")
+        CollisionCache::new(&cart_data, room_x, room_y)
+            .expect("Failed to create collision cache")
     );
-    eprintln!("[game_runner] Created collision cache for room (1, 0)");
+    eprintln!("[game_runner] Created collision cache for room ({}, {})", room_x, room_y);
 
     fixed_env.add_pure_builtin("mget", make_builtin_mget(cart_data.clone()));
     fixed_env.add_builtin("fget", make_builtin_fget(cart_data.clone()));
@@ -636,4 +701,23 @@ pub fn inject_tile_flag_at_builtin(state: &mut State) {
     let heap_id = state.heap.alloc();
     state.heap.set(heap_id, HeapValue::BuiltinFun(builtin_name.clone()));
     state.global_env.insert(builtin_name, heap_id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_start_room;
+
+    // These run with the default start room (1,0), where the substitution
+    // must be an exact identity - and the strictness must still hold.
+    #[test]
+    fn apply_start_room_is_identity_for_default_room() {
+        let src = "function _init()\n\tload_room(1, 0)\nend\n";
+        assert_eq!(apply_start_room(src).unwrap(), src);
+    }
+
+    #[test]
+    fn apply_start_room_rejects_missing_or_duplicated_call() {
+        assert!(apply_start_room("load_room(7,3)").is_err());
+        assert!(apply_start_room("load_room(1, 0) load_room(1, 0)").is_err());
+    }
 }
