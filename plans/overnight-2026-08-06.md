@@ -286,3 +286,38 @@ and visited total) is identical to the 64-bit run - no 64-bit
 collision ever fired in the room-1 search. 749.9s / 34.1 GB
 (vs 737.5s / 32.7 GB at 64-bit: +1.7% time, +4% memory). The frame-90
 bound now rests on a ~1e-23 hash risk rather than ~6e-4.
+
+## 6. Per-coordinate saturation (task #77)
+
+Data: CELESTE_XY_DUMP=path on bench dumps one CSV row per occupied
+player pixel per frame, counting frontier lanes there (under
+frontier-only these are NEW rows per (frame,x,y) - the arrival/taper
+series). Regenerate with:
+  CELESTE_FRONTIER_ONLY=1 CELESTE_DEOPT_COLLECT_FIRST=1 \
+  CELESTE_XY_DUMP=/tmp/xy90.csv ./safe-run.sh -- \
+  ./target/release/rewrite bench --frames 90 --deopt
+(170k rows; not committed. Fit script pattern in the ledger history.)
+
+Findings (full room, 90 frames):
+* 7,843 pixels ever occupied (~48% of the 128x128 room).
+* Per-coordinate shape is regular: rise to peak in ~10-20 frames
+  (early arrivals) shrinking to ~4 (late), taper HALF-LIFE only 2-10
+  frames after peak - the bulk of a coordinate's new rows lands in a
+  ~15-25 frame window after arrival - but with a long thin tail:
+  coordinates arriving before ~f50 are still trickling new rows when
+  the run ends (median active span = run end for all arrivals >= f50).
+* correlation(arrival frame, active span) = -0.92, dominated by
+  end-of-run truncation - i.e. almost nothing fully saturates before
+  the room is solved. "Saturation" at the room level comes from the
+  per-coordinate RATES tapering, not from coordinates dying.
+* Late second wave: arrivals at f71-79 (~120-320 new pixels/frame,
+  rise ~15) - the hard-to-reach top-of-room pixels, not respawns
+  (respawns dedup instantly).
+* Forecasting use (Philippe's original ask): a new coordinate's future
+  contribution is predictable from arrival frame + first few counts
+  via a shared taper kernel; room-total work ~ sum of per-coordinate
+  kernels. For deeper rooms this gives an early-run projection of
+  total cost long before saturation is visible in aggregate.
+
+The XY-dump run also reproduced the frame-90 win and the exact final
+frontier (4668057) with dump overhead of ~0% (738.6s).
