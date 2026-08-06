@@ -722,6 +722,36 @@ pub fn count_room_x_lanes(state: &State, x: i16) -> usize {
     }
 }
 
+/// Per-lane (x, y) whole-pixel positions of the first object (the player or
+/// the spawn animation), or `None` when the objects array is empty (dead
+/// countdown states) or missing. Used by the per-coordinate saturation dump
+/// (`CELESTE_XY_DUMP`); analysis-only, so unexpected shapes return `None`
+/// rather than panicking - a missing histogram row is visible in the plot,
+/// and this must not take a search down.
+pub fn player_xy_per_lane(state: &State) -> Option<Vec<(i16, i16)>> {
+    let helper = StateHelper::new(state);
+    let arr_id = helper.get_objects_array_id()?;
+    let HeapValue::ArrayTable(items) = helper.load(arr_id) else { return None };
+    let first = *items.first()?;
+    // One indirection per element: the array slot holds a pointer cell.
+    let HeapValue::Value(Value::Pointer(obj_id)) = helper.load(first) else { return None };
+    let HeapValue::ObjectTable(obj) = helper.load(*obj_id) else { return None };
+    let axis = |name: &str| -> Option<Vec<i16>> {
+        let cell = *obj.get(name)?;
+        let HeapValue::Value(Value::Number(n)) = helper.load(cell) else { return None };
+        Some(match n {
+            MaybeVector::Scalar(v) => vec![v.whole_part_as_i16(); state.vector_size.max(1)],
+            MaybeVector::Vector(vs) => vs.iter().map(|v| v.whole_part_as_i16()).collect(),
+        })
+    };
+    let xs = axis("x")?;
+    let ys = axis("y")?;
+    if xs.len() != ys.len() {
+        return None;
+    }
+    Some(xs.into_iter().zip(ys).collect())
+}
+
 // ============================================================================
 // Full State Serialization (for debugging)
 // ============================================================================

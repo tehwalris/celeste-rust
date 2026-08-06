@@ -197,11 +197,41 @@ fn bench(
         }
         celeste_rust::merge_stats::reset();
     }
+    // Per-coordinate saturation dump (analysis): one CSV line per occupied
+    // player pixel per frame, counting the frontier lanes there. With
+    // frontier-only search the counts are NEW rows per (frame, x, y), which
+    // is exactly the per-coordinate arrival/taper data.
+    let mut xy_dump: Option<std::io::BufWriter<std::fs::File>> =
+        match std::env::var("CELESTE_XY_DUMP") {
+            Ok(path) => {
+                let mut w = std::io::BufWriter::new(std::fs::File::create(&path)?);
+                use std::io::Write;
+                writeln!(w, "frame,x,y,lanes")?;
+                Some(w)
+            }
+            Err(_) => None,
+        };
     let start = std::time::Instant::now();
     let mut first_win: Option<u32> = None;
     for frame in 1..=frames {
         let frame_start = std::time::Instant::now();
         run.step()?;
+        if let Some(w) = xy_dump.as_mut() {
+            use std::io::Write;
+            let mut hist: std::collections::BTreeMap<(i16, i16), u64> = Default::default();
+            for state in run.states() {
+                if let Some(points) =
+                    celeste_rust::interpreter::inspect::player_xy_per_lane(state)
+                {
+                    for p in points {
+                        *hist.entry(p).or_default() += 1;
+                    }
+                }
+            }
+            for ((x, y), lanes) in hist {
+                writeln!(w, "{},{},{},{}", frame, x, y, lanes)?;
+            }
+        }
         // Room-exit probe: lanes that reached room (2,0) have won room (1,0).
         // The earliest such frame is the optimal TAS length under the search's
         // abstractions.
