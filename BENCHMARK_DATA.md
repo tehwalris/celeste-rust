@@ -104,13 +104,14 @@ means - it is the rem-widened lower bound, not the concrete optimum
 | | time | peak | note |
 |---|---|---|---|
 | bench `--frames 62 --deopt` (v1 deopt) | 179.9 s | 16.4 GB | first run past f58 |
-| bench `--frames 90 --deopt` (v2, clean) | **898 s** | 32.5 GB | full room; WIN at f90; 151.6M visited rows |
+| bench `--frames 90 --deopt` (v2, clean) | 898 s | 32.5 GB | full room; WIN at f90; 151.6M visited rows |
+| + CELESTE_DEOPT_COLLECT_FIRST | **737 s** | 32.7 GB | same win, same frontier, -18% |
 
 Per-frame at depth (v2, clean run): f60 13.6 s, f76 (peak, 5.24M new
 lanes) ~35-45 s, f90 29.6 s. Total plain re-runs across all 90 frames:
 1.55M lanes (v1 re-ran ~5M lanes per frame by f74 - the lane-granular
 deopt is what makes the deep half affordable). A 120 s budget reaches
-**frame 62**.
+**frame 63** (collect-first).
 
 For scale: the 2022 hand-written solver completed this room in roughly
 5-15 min. The general system is now at wall-clock parity on the
