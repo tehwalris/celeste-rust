@@ -88,6 +88,67 @@ a bug, so the deep run is an end-to-end differential against 2022.
 
 * Frame-100 run (--frames 102, frontier + deopt): launched, results
   below when complete.
+* Soundness note on the win probe: `tile_flag_at` is baked to room
+  (1,0) (game_runner.rs:439-448), so frames AFTER a room exit simulate
+  room (2,0) with stale collision data - those frames are untrusted
+  and only exist because the run continues past the win. The win frame
+  itself is sound: everything up to the exit uses room-1 data
+  correctly, and the room-2 boundary state is produced by load_room's
+  generic mget/fget reads, not the baked cache. Crossing rooms for
+  real needs a room-parametric tile_flag_at.
+
+## HEADLINE: the deep run reached the end of room (1,0)
+
+The v1-deopt frontier run (--frames 102) ran 90 frames and found the
+first room-exit lanes at **frame 90** - then crashed at f91, correctly
+and by design (see below). Numbers: cumulative ~28 min wall clock
+(heavily contended by concurrent builds/tests), 47.5 GB peak RSS,
+visited set ~111M rows at f80, new-lanes peaking ~5.2M/frame around
+f72-74 then declining (saturation + respawn dedup).
+
+**Interpretation - read this before anything else.** The win probe
+commit (661b0ec) claimed "anything other than frame 100 is a bug".
+That framing was WRONG, and the run showed why: frame 90 is the
+correct *abstract* answer, not a falsification of the 2022 proof.
+
+* Our abstraction re-widens player.rem.x/y to [-0.5,0.5) at EVERY
+  frame boundary - the abstract adversary gets free subpixels every
+  frame, strictly more freedom than the concrete rem dynamics (which
+  evolve deterministically from spawn). Upward progress can gain up to
+  ~1px/frame from that freedom; ~10 frames over a ~66-control-frame
+  climb is plausible slack.
+* The 2022 solver's forward pass used 4 rem corner VALUES plus a
+  domination/monotonicity argument (strategy.md section 1) - much
+  tighter in the rem dimension - and proved the concrete optimum, 76
+  control frames = our frame 100.
+* So: abstract lower bound 90 <= concrete optimum 100. Consistent.
+  The 10-frame gap is exactly the slack the strategy's backward
+  refinement pass (plans/strategy.md) exists to close - e.g. re-run
+  forward with rem tracked exactly (or 2022-style corners) only along
+  the surviving tube of the widened search.
+* Confidence in "no bug": timer pins + d_e_t clamp are certified
+  quotients (widencheck); the jbuffer strip only REMOVES options;
+  frontier hash collisions can only LOSE states (delay wins, not
+  create them); and from f74 on, ~99% of each frame's lanes ran under
+  the PLAIN ground-truth interpreter via v1 whole-state deopt, so the
+  winning trajectory largely executed unrewritten. The remaining
+  unverified surface is rewrite behavior beyond the f40 differential
+  horizon on the ~1% of lanes that stayed specialized.
+
+The f91 crash is the designed guard firing, not a failure: room (2,0)
+has a fruit, fruit.update reads sin(frames/30), and `sin` was
+deliberately left out of the fixed env when the timer globals were
+pinned - a room where gameplay reads the timer crashes loudly instead
+of silently using a pinned value. Room-2 frames are untrusted anyway
+(tile_flag_at is baked to room (1,0)).
+
+New facts for the room-1 certificate (all modulo the experimental
+64-bit-hash visited set):
+* No input sequence exits room (1,0) before frame 90 even with free
+  subpixels every frame (abstract bound).
+* Deaths/respawns are fully handled: the search ran through 31 kill
+  frames and respawn cohorts (first deaths f59, first respawns ~f74;
+  new-lanes declining after f74 shows respawn dedup absorbing them).
 
 ## 3. Lane-granular deopt (deopt v2)
 
