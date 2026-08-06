@@ -37,7 +37,7 @@ for H in $(seq "$FROM" "$TO"); do
       break
     fi
     echo "=== horizon $H: k=$K wins; sweeping level $K ==="
-    CELESTE_REM_BITS=$K ./safe-run.sh -- ./target/release/rewrite sweep \
+    CELESTE_REM_BITS=$K ./safe-run.sh -- ./target/release/rewrite sweep --banded \
         --checkpoint-dir "$KDIR" --frames "$H" --horizon "$H" \
         > "/tmp/k${K}sweep-h$H.log" 2>&1
     grep -E "abstract optimal|win seeds" "/tmp/k${K}sweep-h$H.log"

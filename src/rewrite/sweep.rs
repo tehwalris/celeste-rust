@@ -85,6 +85,7 @@ pub fn backward_sweep(
     program: &Program,
     plain: &Program,
     mapping: StateMapping,
+    banded: bool,
 ) -> Result<SweepResult> {
     let ck = checkpoint::load(dir, frames, fingerprint).context("loading final checkpoint")?;
     let table = ck.visited;
@@ -220,6 +221,7 @@ pub fn backward_sweep(
         // batch at once would spike tens of GB of transient state.
         const CHUNK_LANES: usize = 1_000_000;
         let mut accounted = 0usize;
+        let mut missing_successors = 0usize;
         let mut frame_edges: Vec<(u32, u32)> = Vec::new();
         let mut chunk: Vec<State> = Vec::new();
         let mut chunk_lanes = 0usize;
@@ -248,14 +250,23 @@ pub fn backward_sweep(
                     return Err(anyhow!("sweep: origin/key length mismatch at f{:03}", f));
                 }
                 for (src, key) in origins.iter().zip(&keys) {
-                    let dst = table.id_of(*key).ok_or_else(|| {
-                        anyhow!(
-                            "frame f{:03}: a successor row is not in the row table - \
-                             the replay diverged from the forward pass",
-                            f
-                        )
-                    })?;
-                    frame_edges.push((*src, dst));
+                    match table.id_of(*key) {
+                        Some(dst) => frame_edges.push((*src, dst)),
+                        // A banded forward pass pruned out-of-band successors
+                        // from its table; dropping their edges is sound (any
+                        // finer level's winning path coarsens to in-table
+                        // edges), and the count keeps it visible. For an
+                        // UNbanded level a missing successor means the replay
+                        // diverged - loud.
+                        None if banded => missing_successors += 1,
+                        None => {
+                            return Err(anyhow!(
+                                "frame f{:03}: a successor row is not in the row \
+                                 table - the replay diverged from the forward pass",
+                                f
+                            ))
+                        }
+                    }
                 }
                 accounted += origins.len();
             }
@@ -270,13 +281,18 @@ pub fn backward_sweep(
         checkpoint::write_u32_pairs(&chunk_path, &frame_edges)?;
         edge_total += frame_edges.len() as u64;
         edge_chunks.push(chunk_path);
-        if f % 10 == 0 || f + 1 == frames {
+        if f % 10 == 0 || f + 1 == frames || missing_successors > 0 {
             println!(
-                "  sweep f{:03}: {} lanes in, {} successor lanes -> {} distinct edges, {:.1}s ({} edges total)",
+                "  sweep f{:03}: {} lanes in, {} successor lanes -> {} distinct edges{}, {:.1}s ({} edges total)",
                 f,
                 batch_lanes,
                 accounted,
                 frame_edges.len(),
+                if missing_successors > 0 {
+                    format!(" ({} out-of-band successors dropped)", missing_successors)
+                } else {
+                    String::new()
+                },
                 t.elapsed().as_secs_f64(),
                 edge_total
             );

@@ -201,6 +201,11 @@ enum Command {
         /// Horizon N for the band statistics (defaults to --frames).
         #[arg(long)]
         horizon: Option<u32>,
+        /// The forward pass being swept was band-restricted: successors
+        /// outside its row table were pruned by the band, and their edges
+        /// are dropped (sound) instead of being a replay-divergence error.
+        #[arg(long)]
+        banded: bool,
     },
 }
 
@@ -1847,7 +1852,7 @@ fn main() -> Result<()> {
             )?;
         }
 
-        Command::Sweep { checkpoint_dir, frames, horizon } => {
+        Command::Sweep { checkpoint_dir, frames, horizon, banded } => {
             use celeste_rust::rewrite::state_mapping::StateMapping;
             use celeste_rust::rewrite::sweep;
             let horizon = horizon.unwrap_or(frames);
@@ -1859,7 +1864,7 @@ fn main() -> Result<()> {
             let (program, _) = build(&recipe)?;
             let mapping = StateMapping::from_recipe(&recipe);
             let result =
-                sweep::backward_sweep(&dir, frames, &fingerprint, &program, &plain, mapping)?;
+                sweep::backward_sweep(&dir, frames, &fingerprint, &program, &plain, mapping, banded)?;
             sweep::save_g(&dir, &result.g)?;
             let reachable = result.g.iter().filter(|&&v| v != sweep::G_UNREACHABLE).count();
             println!(
