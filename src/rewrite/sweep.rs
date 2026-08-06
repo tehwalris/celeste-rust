@@ -284,33 +284,50 @@ pub fn backward_sweep(
     }
     drop(engine);
 
-    // Reload every chunk into one exactly-sized Vec (no doubling spikes),
-    // sort by dst for predecessor ranges, then reverse BFS from g=0 seeds.
-    let edge_bytes_gb = edge_total as f64 * 8.0 / 1e9;
-    println!("sweep: loading {} edges ({:.1} GB) for BFS", edge_total, edge_bytes_gb);
-    if edge_bytes_gb > 60.0 {
-        return Err(anyhow!(
-            "edge set is {:.1} GB - too large for the in-RAM BFS; a streaming \
-             BFS over the disk chunks is needed at this scale",
-            edge_bytes_gb
-        ));
-    }
-    let mut edges: Vec<(u32, u32)> = Vec::with_capacity(edge_total as usize);
+    // Build a CSR predecessor structure by streaming the chunks twice:
+    // pass 1 counts per-dst degrees, pass 2 scatter-fills the srcs array.
+    // No global sort or dedup is needed - each row is expanded exactly once
+    // (in its discovery frame's chunk), so (src, dst) pairs are cross-chunk
+    // unique by construction, and within-chunk dedup already happened at
+    // write time. 4 bytes per edge instead of 8, no sort.
+    let edge_bytes_gb = edge_total as f64 * 4.0 / 1e9;
+    println!(
+        "sweep: building CSR over {} edges ({:.1} GB) for BFS",
+        edge_total, edge_bytes_gb
+    );
+    let t = std::time::Instant::now();
+    let mut counts: Vec<u32> = vec![0; n_rows];
     for chunk in &edge_chunks {
-        checkpoint::read_u32_pairs_into(chunk, &mut edges)?;
+        checkpoint::stream_u32_pairs(chunk, |_, dst| {
+            counts[dst as usize] += 1;
+        })?;
     }
+    let mut offsets: Vec<u64> = Vec::with_capacity(n_rows + 1);
+    let mut acc: u64 = 0;
+    offsets.push(0);
+    for &c in &counts {
+        acc += c as u64;
+        offsets.push(acc);
+    }
+    if acc != edge_total {
+        return Err(anyhow!("CSR count mismatch: {} != {}", acc, edge_total));
+    }
+    let mut srcs: Vec<u32> = vec![0; edge_total as usize];
+    let mut cursor: Vec<u64> = offsets[..n_rows].to_vec();
+    for chunk in &edge_chunks {
+        checkpoint::stream_u32_pairs(chunk, |src, dst| {
+            let at = cursor[dst as usize];
+            srcs[at as usize] = src;
+            cursor[dst as usize] = at + 1;
+        })?;
+    }
+    drop(counts);
+    drop(cursor);
+    let edge_count = edge_total as usize;
+    println!("sweep: CSR built in {:.1}s", t.elapsed().as_secs_f64());
     // Chunks stay on disk for incremental horizon extension.
 
     let t = std::time::Instant::now();
-    edges.sort_unstable_by_key(|&(src, dst)| (dst, src));
-    edges.dedup();
-    let edge_count = edges.len();
-    // dst -> range of edges, via the sorted order.
-    let range_of = |dst: u32| {
-        let lo = edges.partition_point(|&(_, d)| d < dst);
-        let hi = edges.partition_point(|&(_, d)| d <= dst);
-        lo..hi
-    };
     let mut queue: std::collections::VecDeque<u32> = (0..n_rows as u32)
         .filter(|&id| g[id as usize] == 0)
         .collect();
@@ -319,7 +336,8 @@ pub fn backward_sweep(
         let next = g[v as usize]
             .checked_add(1)
             .ok_or_else(|| anyhow!("g overflow"))?;
-        for &(src, _) in &edges[range_of(v)] {
+        let range = offsets[v as usize] as usize..offsets[v as usize + 1] as usize;
+        for &src in &srcs[range] {
             if g[src as usize] == G_UNREACHABLE {
                 g[src as usize] = next;
                 queue.push_back(src);
