@@ -573,6 +573,105 @@ pub fn make_state_abstract(state: State) -> State {
     apply_conservative_widenings(make_state_abstract_rem(state, rem_precision_from_env()))
 }
 
+/// Split lanes whose boundary rem interval straddles a bucket boundary of
+/// the session precision into one lane per bucket, clipping the interval.
+///
+/// Why: the boundary widening maps each lane's rem to the bucket(s) covering
+/// it. A straddling interval (e.g. [-0.463, 0.037) at 1 bit, after a dash's
+/// rounding) would widen to the SPAN of two buckets - sound, but the row is
+/// then a different value than the single bucket the same underlying state
+/// gets when reached along another path, so row identity fragments and
+/// band/witness probes miss legitimate rows. Splitting first makes every
+/// boundary row's rem exactly one bucket - canonical identity per level.
+///
+/// Boundary intervals inherit single-bucket width (they enter the frame as
+/// one bucket and the move only shifts and renormalizes them), so a
+/// straddle spans at most two adjacent buckets; this is asserted.
+pub fn split_rem_straddles(state: State) -> Vec<State> {
+    let RemPrecision::Bits(bits) = rem_precision_from_env() else { return vec![state] };
+    if bits == 0 {
+        return vec![state];
+    }
+    let width: i32 = 0x1_0000 >> bits;
+    let bucket_low = |n: Pico8Num| (n.as_raw_u32() as i32).div_euclid(width) * width;
+
+    let marks = mark_heap(&state);
+    let Some(cells) = marks.marks.get("player_rem_xy").cloned() else { return vec![state] };
+
+    let mut work = vec![state];
+    for cell in cells {
+        let mut next = Vec::with_capacity(work.len());
+        for state in work {
+            let Some(HeapValue::Value(Value::NumberInterval(mv))) = state.heap.get_opt(cell)
+            else {
+                // Numbers (and anything else) lie in a single bucket.
+                next.push(state);
+                continue;
+            };
+            let intervals: Vec<Pico8NumInterval> = match mv {
+                MaybeVector::Scalar(iv) => vec![*iv; state.vector_size.max(1)],
+                MaybeVector::Vector(ivs) => ivs.iter().copied().collect(),
+            };
+            let straddle: Vec<bool> = intervals
+                .iter()
+                .map(|iv| {
+                    let lo = bucket_low(iv.low);
+                    let hi = bucket_low(iv.high);
+                    assert!(
+                        hi - lo <= width,
+                        "rem interval {:?} spans more than two buckets at {} bits",
+                        iv,
+                        bits
+                    );
+                    hi != lo
+                })
+                .collect();
+            if straddle.iter().all(|s| !s) {
+                next.push(state);
+                continue;
+            }
+            let from_raw = |r: i32| Pico8Num::from_parts((r >> 16) as i16, r as u16);
+            // A: every lane, straddlers clipped to their LOW bucket.
+            let clipped_low: Vec<Pico8NumInterval> = intervals
+                .iter()
+                .zip(&straddle)
+                .map(|(iv, s)| {
+                    if *s {
+                        Pico8NumInterval::new(iv.low, from_raw(bucket_low(iv.low) + width - 1))
+                    } else {
+                        *iv
+                    }
+                })
+                .collect();
+            let mut low_state = state.clone();
+            low_state.heap.set(
+                cell,
+                HeapValue::Value(Value::NumberInterval(MaybeVector::vector(clipped_low))),
+            );
+            next.push(low_state);
+            // B: only the straddler lanes, clipped to their HIGH bucket.
+            let high_state = state.filter_by_mask_clone(
+                &straddle,
+                crate::interpreter::state::FILTER_SPLIT_FLR,
+            );
+            let clipped_high: Vec<Pico8NumInterval> = intervals
+                .iter()
+                .zip(&straddle)
+                .filter(|(_, s)| **s)
+                .map(|(iv, _)| Pico8NumInterval::new(from_raw(bucket_low(iv.high)), iv.high))
+                .collect();
+            let mut high_state = high_state;
+            high_state.heap.set(
+                cell,
+                HeapValue::Value(Value::NumberInterval(MaybeVector::vector(clipped_high))),
+            );
+            next.push(high_state);
+        }
+        work = next;
+    }
+    work
+}
+
 /// Only the historic rem widening - the baseline abstraction the search has
 /// always used. The widen-check (rewrite widencheck) runs the search with
 /// this alone and applies `apply_conservative_widenings` post hoc, to certify

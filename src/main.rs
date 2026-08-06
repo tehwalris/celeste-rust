@@ -372,7 +372,11 @@ __reset_button_states()
         }
 
         // Make states abstract (widen player.rem to interval)
-        new_states = new_states.into_iter().map(make_state_abstract).collect();
+        new_states = new_states
+            .into_iter()
+            .flat_map(crate::interpreter::inspect::split_rem_straddles)
+            .map(make_state_abstract)
+            .collect();
 
         let before_vec = new_states.len();
 

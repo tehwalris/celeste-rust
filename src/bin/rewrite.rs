@@ -143,6 +143,25 @@ enum Command {
         #[arg(long, default_value_t = 34)]
         frames: u32,
     },
+    /// Replay a concrete input sequence (the reference TAS) and probe every
+    /// refinement level's row table and (e, g) band per frame. The first
+    /// frame where the true winning path is missing from a level's table or
+    /// fails its band test is the exact address of a soundness leak; a fully
+    /// passing trace is the strongest possible certificate that the bands
+    /// contain the real optimum.
+    TraceWitness {
+        /// TAS file: comment lines, then comma-separated input bytes.
+        #[arg(long)]
+        tas: String,
+        #[arg(long)]
+        horizon: u32,
+        /// Comma-separated precision levels to probe, e.g. "0,1,2,3".
+        #[arg(long)]
+        levels: String,
+        /// Checkpoint base: level 0 at <base>/room1, level k at <base>/room1-k<k>.
+        #[arg(long)]
+        base_dir: String,
+    },
     Bench {
         #[arg(long, default_value_t = 34)]
         frames: u32,
@@ -1852,6 +1871,182 @@ fn main() -> Result<()> {
             )?;
         }
 
+        Command::TraceWitness { tas, horizon, levels, base_dir } => {
+            use celeste_rust::game_runner::{
+                create_initial_state_with_builtins, inject_tile_flag_at_builtin,
+            };
+            use celeste_rust::interpreter::glue::interpret_cfg;
+            use celeste_rust::interpreter::inspect::{
+                apply_conservative_widenings, make_state_abstract_rem, RemPrecision,
+            };
+            use celeste_rust::interpreter::row_table::RowTable;
+            use celeste_rust::interpreter::state::State;
+            use celeste_rust::interpreter::value::{HeapValue, MaybeVector, Value};
+            use celeste_rust::rewrite::checkpoint;
+            use celeste_rust::rewrite::state_mapping::StateMapping;
+            use celeste_rust::rewrite::sweep;
+
+            // Parse the TAS: skip comments, join, split by comma.
+            let text = std::fs::read_to_string(&tas)?;
+            let inputs: Vec<u8> = text
+                .lines()
+                .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+                .flat_map(|l| l.split(','))
+                .filter(|t| !t.trim().is_empty())
+                .map(|t| t.trim().parse::<u8>().map_err(|e| anyhow!("bad input byte: {}", e)))
+                .collect::<Result<_>>()?;
+            println!("witness: {} input bytes, horizon {}", inputs.len(), horizon);
+
+            // Load every requested level's table and g array.
+            let recipe_text = std::fs::read_to_string(&cli.recipe).unwrap_or_default();
+            struct Level {
+                k: u8,
+                precision: RemPrecision,
+                table: RowTable,
+                g: Vec<u16>,
+            }
+            let mut level_data: Vec<Level> = Vec::new();
+            for part in levels.split(',') {
+                let k: u8 = part.trim().parse().map_err(|e| anyhow!("bad level: {}", e))?;
+                let precision =
+                    if k >= 16 { RemPrecision::Exact } else { RemPrecision::Bits(k) };
+                let dir = if k == 0 {
+                    std::path::PathBuf::from(&base_dir).join("room1")
+                } else {
+                    std::path::PathBuf::from(&base_dir).join(format!("room1-k{}", k))
+                };
+                let fp = checkpoint::config_fingerprint_with_precision(&recipe_text, precision);
+                let frame = checkpoint::latest(&dir)?
+                    .ok_or_else(|| anyhow!("level {}: no checkpoint in {}", k, dir.display()))?;
+                let ck = checkpoint::load(&dir, frame, &fp)?;
+                // g.bin is optional: without it the probe checks table
+                // membership and e only.
+                let g = match sweep::load_g(&dir) {
+                    Ok(g) => {
+                        if g.len() != ck.visited.len() {
+                            return Err(anyhow!("level {}: g/table size mismatch", k));
+                        }
+                        g
+                    }
+                    Err(_) => Vec::new(),
+                };
+                println!(
+                    "level {}: {} rows (through f{:03})",
+                    k,
+                    ck.visited.len(),
+                    frame
+                );
+                level_data.push(Level { k, precision, table: ck.visited, g });
+            }
+            let plain = Program::compile_from_disk()?;
+            let mapping = StateMapping::from_recipe(&recipe);
+            let fixed_env = plain.fixed_env();
+            let initial = create_initial_state_with_builtins(&fixed_env);
+            let init_states =
+                interpret_cfg(plain.init_cfg().clone(), initial, &fixed_env)?;
+            let mut states: Vec<State> = init_states.into_iter().map(|(s, _)| s).collect();
+            for s in &mut states {
+                inject_tile_flag_at_builtin(s);
+            }
+            if states.len() != 1 {
+                return Err(anyhow!("init produced {} states", states.len()));
+            }
+            let mut state = states.pop().unwrap();
+
+            let set_buttons = |state: &mut State, byte: u8| -> Result<()> {
+                let cell = *state
+                    .global_env
+                    .get("__button_states")
+                    .ok_or_else(|| anyhow!("no __button_states"))?;
+                let arr = match state.heap.get_opt(cell) {
+                    Some(HeapValue::Value(Value::Pointer(id))) => *id,
+                    Some(HeapValue::ArrayTable(_)) => cell,
+                    other => return Err(anyhow!("__button_states shape: {:?}", other)),
+                };
+                let items = match state.heap.get_opt(arr) {
+                    Some(HeapValue::ArrayTable(items)) => items.clone(),
+                    other => return Err(anyhow!("button array shape: {:?}", other)),
+                };
+                for (i, item) in items.iter().enumerate() {
+                    let pressed = byte >> i & 1 == 1;
+                    let target = match state.heap.get_opt(*item) {
+                        Some(HeapValue::Value(Value::Pointer(id))) => *id,
+                        _ => *item,
+                    };
+                    state.heap.set(
+                        target,
+                        HeapValue::Value(Value::Bool(MaybeVector::Scalar(pressed))),
+                    );
+                }
+                Ok(())
+            };
+
+            let frame_cfg = plain.frame_cfg().clone();
+            let mut first_fail: Option<(u32, u8, String)> = None;
+            for frame in 1..=horizon {
+                let byte = inputs.get(frame as usize - 1).copied().unwrap_or(0);
+                set_buttons(&mut state, byte)?;
+                let result = interpret_cfg(frame_cfg.clone(), state, &fixed_env)?;
+                if result.len() != 1 {
+                    return Err(anyhow!("frame {}: {} states (branching!)", frame, result.len()));
+                }
+                state = result.into_iter().next().unwrap().0;
+
+                // Canonicalize per level and probe.
+                let mut canon = state.clone();
+                mapping.from_canonical(&mut canon)?;
+                let mut line = format!("f{:03}:", frame);
+                for level in &level_data {
+                    let mut s = make_state_abstract_rem(canon.clone(), level.precision);
+                    s = apply_conservative_widenings(s);
+                    s.gc();
+                    let key = sweep::row_keys(&s)?[0];
+                    let status = match level.table.id_of(key) {
+                        None => "MISS".to_string(),
+                        Some(id) => {
+                            let e = level.table.earliest_frame(id).unwrap_or(u32::MAX);
+                            let e_ok = e <= frame;
+                            if level.g.is_empty() {
+                                if e_ok {
+                                    format!("ok(e={})", e)
+                                } else {
+                                    format!("BAD(e={})", e)
+                                }
+                            } else {
+                                let g = level.g[id as usize];
+                                let g_ok = g != sweep::G_UNREACHABLE
+                                    && (g as u32) <= horizon - frame;
+                                if e_ok && g_ok {
+                                    format!("ok(e={},g={})", e, g)
+                                } else {
+                                    format!("BAD(e={},g={})", e, g)
+                                }
+                            }
+                        }
+                    };
+                    if status.contains("MISS") || status.contains("BAD") {
+                        if first_fail.is_none() {
+                            first_fail = Some((frame, level.k, status.clone()));
+                        }
+                    }
+                    line.push_str(&format!("  k{}:{}", level.k, status));
+                }
+                let interesting = line.contains("MISS") || line.contains("BAD");
+                if interesting || frame % 10 == 0 || frame >= horizon - 2 {
+                    println!("{}", line);
+                }
+            }
+            match first_fail {
+                Some((frame, k, status)) => println!(
+                    "FIRST FAILURE: frame {}, level {}: {} - the true path leaves \
+                     this level's band there",
+                    frame, k, status
+                ),
+                None => println!(
+                    "witness trace PASSES every probed level's band at every frame"
+                ),
+            }
+        }
         Command::Sweep { checkpoint_dir, frames, horizon, banded } => {
             use celeste_rust::rewrite::state_mapping::StateMapping;
             use celeste_rust::rewrite::sweep;

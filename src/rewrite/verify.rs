@@ -554,7 +554,11 @@ impl AbstractRun {
                 .map(crate::interpreter::inspect::make_state_abstract_rem_only)
                 .collect()
         } else {
-            new_states.into_iter().map(make_state_abstract).collect()
+            new_states
+                .into_iter()
+                .flat_map(crate::interpreter::inspect::split_rem_straddles)
+                .map(make_state_abstract)
+                .collect()
         };
         self.states_before_merge.push(new_states.len());
         self.states = {
