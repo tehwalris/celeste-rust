@@ -70,7 +70,12 @@ specialization ("JIT variants"), per Philippe 2026-08-06.
   screen (if_not_fruit reads it at spawn).
 - An uncollected fruit adds off-counter phase to state (period-40
   bobbing) - more rows while a fruit is alive, handled by the band
-  machinery, no code needed.
+  machinery, no code needed. BUT: `off` increments forever, so
+  fruit-alive rows never dedup across frames (an embedded frame
+  counter). If post-break rows blow up, a conservative widening
+  `off := off mod 40` is justifiable - `off`'s only read is
+  `sin(off/40)`, which has period 40 in `off` (verify with a read
+  census + widencheck before trusting). Not implemented.
 - Optimality = fastest exit; the berry itself is score, not time.
 
 ## Groundwork landed (2026-08-06, pre-integration)
@@ -125,3 +130,11 @@ wall-jump). Small blocks at (24-39, 96) and (56-71, 88) stair up.
 Natural break approach: reach the ledge right of the wall (stand
 y=40, x>=24) and dash LEFT into it; the break bounce is spd.y=-1.5
 with dash_time=-1.
+
+CORRECTION (2026-08-06, full tile decode): the room has THREE spike
+patches (tile 17, up-spikes), all on the low route right of spawn:
+px x 40-55 at y 112 (floor level), x 72-87 at y 104, x 88-111 at
+y 96. Deaths ARE possible in (0,0) - expect kill/respawn lane churn
+like room (1,0), not the death-free search hoped for earlier. The
+only object tiles remain player_spawn (1,12) and fake_wall (1,4);
+everything else is terrain/decoration.

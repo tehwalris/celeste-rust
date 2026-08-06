@@ -812,9 +812,14 @@ pub fn apply_conservative_widenings(mut state: State) -> State {
     // `frames`, `seconds`, `minutes` and `deaths` form a closed subsystem in
     // celeste-minimal: they only ever feed each other (the timer cascade and
     // the death counter), never gameplay. The single gameplay read is the
-    // fruit sprite wobble `sin(frames/30)` - and `sin` is deliberately absent
-    // from the fixed env, so a room where that read executes crashes loudly
-    // instead of silently depending on a pinned value. Erasing them at the
+    // key sprite wobble `sin(frames/30)` (celeste-minimal.lua, key.update).
+    // For the default room `sin` is absent from the fixed env, so a room
+    // where that read executes crashes loudly instead of silently depending
+    // on a pinned value. For non-default start rooms `sin` IS registered
+    // (game_runner), so the belt there is different: the pin is sound in a
+    // room iff no key object exists in it - room (0,0) has none (fruit bobs
+    // on its per-object `off` counter, not `frames`). Revisit before any
+    // key room. Erasing them at the
     // frame boundary makes the state representation world-still, which is
     // what allows cross-frame visited-set dedup (a state reached at frame n
     // never needs re-expansion later). It also merges died-and-respawned
