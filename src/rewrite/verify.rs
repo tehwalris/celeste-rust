@@ -414,6 +414,28 @@ impl AbstractRun {
         self.band = Some(band);
     }
 
+    /// Drop lanes that have exited the room (global room.x == 2) from the
+    /// frontier: win states are absorbing for a room-scoped search.
+    pub fn absorb_won_lanes(&mut self) {
+        let mut kept = Vec::new();
+        for state in std::mem::take(&mut self.states) {
+            let mask: Vec<bool> = crate::interpreter::inspect::room_x_lane_mask(&state, 2)
+                .into_iter()
+                .map(|w| !w)
+                .collect();
+            let keep = mask.iter().filter(|b| **b).count();
+            if keep == state.vector_size {
+                kept.push(state);
+            } else if keep > 0 {
+                kept.push(state.filter_by_mask_clone(
+                    &mask,
+                    crate::interpreter::state::FILTER_BAND,
+                ));
+            }
+        }
+        self.states = kept;
+    }
+
     /// Restore from a checkpoint: boundary states, row table and deopt
     /// counters as of some completed frame. The caller continues stepping
     /// from the following frame. Refuses to attach a row table when

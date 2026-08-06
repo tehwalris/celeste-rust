@@ -162,7 +162,7 @@ pub fn backward_sweep(
         let mut frame_wins: Vec<(u32, u32)> = Vec::new();
         let mut batch = Vec::with_capacity(states.len());
         let mut batch_lanes = 0usize;
-        for mut state in states {
+        for state in states {
             let keys = row_keys(&state)?;
             let ids: Vec<u32> = keys
                 .iter()
@@ -181,6 +181,30 @@ pub fn backward_sweep(
             }
             batch_lanes += state.vector_size;
             if f < frames {
+                // Won lanes are absorbing (their g = 0 seed is recorded
+                // above); expanding them would simulate room (2,0).
+                let keep: Vec<bool> =
+                    room_x_lane_mask(&state, 2).into_iter().map(|w| !w).collect();
+                let kept = keep.iter().filter(|b| **b).count();
+                let (mut state, ids) = if kept == state.vector_size {
+                    (state, ids)
+                } else if kept > 0 {
+                    let filtered_ids: Vec<u32> = ids
+                        .iter()
+                        .zip(&keep)
+                        .filter(|(_, k)| **k)
+                        .map(|(id, _)| *id)
+                        .collect();
+                    (
+                        state.filter_by_mask_clone(
+                            &keep,
+                            crate::interpreter::state::FILTER_BAND,
+                        ),
+                        filtered_ids,
+                    )
+                } else {
+                    continue;
+                };
                 deopt_collect::inject_named(&mut state, SWEEP_ORIGIN, &ids);
                 batch.push(state);
             }

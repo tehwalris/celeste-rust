@@ -261,6 +261,9 @@ fn bench(
                     "resumed from checkpoint f{:03}: {} rows, {} states",
                     frame, loaded.meta.row_count, loaded.meta.state_count
                 );
+                // The restored frontier may contain won lanes (room exited);
+                // they are absorbing and must not be expanded.
+                run.absorb_won_lanes();
             }
             Some(frame) => {
                 return Err(anyhow!(
@@ -351,6 +354,15 @@ fn bench(
             .sum();
         if win_lanes > 0 && first_win.is_none() {
             first_win = Some(frame);
+        }
+        // Won lanes are absorbing for a room-scoped search: they stay in the
+        // row table (their arrival frame IS the result) but must not be
+        // expanded - room (2,0) simulation is out of scope (and would hit
+        // the deliberate `sin` guard). Drop them from the frontier here,
+        // after the probe counted them and after checkpoint/frame saving
+        // recorded them.
+        if win_lanes > 0 {
+            run.absorb_won_lanes();
         }
         println!(
             "frame {:>3}: {:>7.2}s  {:>10} lanes  rss {:>5.1} GB{}",
