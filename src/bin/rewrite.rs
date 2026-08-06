@@ -183,6 +183,22 @@ enum Command {
         #[arg(long)]
         tas: Option<String>,
     },
+    /// Enumerate ALL optimal-horizon trajectories in a refined level's band:
+    /// layered BFS from the spawn state trying every input byte, deduping
+    /// concrete successors by row key. Counts distinct row trajectories,
+    /// distinct whole-pixel (x, y) position sequences (identical position
+    /// histories collapsed via subset construction), and raw input-byte
+    /// sequences (in log10 - don't-care buttons inflate these enormously).
+    CountOptimal {
+        #[arg(long)]
+        horizon: u32,
+        /// Precision level whose band to walk (16 = exact rem).
+        #[arg(long, default_value_t = 16)]
+        level: u8,
+        /// Checkpoint base: level 0 at <base>/room1, level k at <base>/room1-k<k>.
+        #[arg(long)]
+        base_dir: String,
+    },
     Bench {
         #[arg(long, default_value_t = 34)]
         frames: u32,
@@ -2243,6 +2259,201 @@ fn main() -> Result<()> {
                     );
                 }
             }
+        }
+        Command::CountOptimal { horizon, level, base_dir } => {
+            use celeste_rust::interpreter::fixed_env::PreparedCfg;
+            use celeste_rust::interpreter::glue::interpret_prepared_cfg;
+            use celeste_rust::interpreter::inspect::{
+                apply_conservative_widenings, count_room_x_lanes, make_state_abstract_rem,
+                player_xy_per_lane, RemPrecision,
+            };
+            use celeste_rust::interpreter::state::State;
+            use celeste_rust::rewrite::checkpoint;
+            use celeste_rust::rewrite::state_mapping::StateMapping;
+            use celeste_rust::rewrite::sweep;
+            use std::collections::HashMap;
+
+            let precision =
+                if level >= 16 { RemPrecision::Exact } else { RemPrecision::Bits(level) };
+            let dir = if level == 0 {
+                std::path::PathBuf::from(&base_dir).join("room1")
+            } else {
+                std::path::PathBuf::from(&base_dir).join(format!("room1-k{}", level))
+            };
+            let recipe_text = std::fs::read_to_string(&cli.recipe).unwrap_or_default();
+            let fp = checkpoint::config_fingerprint_with_precision(&recipe_text, precision);
+            let frame = checkpoint::latest(&dir)?
+                .ok_or_else(|| anyhow!("no checkpoint in {}", dir.display()))?;
+            let ck = checkpoint::load(&dir, frame, &fp)?;
+            let g = sweep::load_g(&dir)?;
+            if g.len() != ck.visited.len() {
+                return Err(anyhow!("g/table size mismatch"));
+            }
+            let table = ck.visited;
+            println!("level {}: {} rows, enumerating horizon {}", level, table.len(), horizon);
+
+            let plain = Program::compile_from_disk()?;
+            let mapping = StateMapping::from_recipe(&recipe);
+            let fixed_env = plain.fixed_env();
+            let spawn = concrete_initial_state(&plain, &fixed_env)?;
+            let frame_cfg = PreparedCfg::new(plain.frame_cfg().clone());
+
+            type Key = (u64, u64);
+            let probe = |s: &State| -> Result<Option<(Key, u32, u16)>> {
+                let mut canon = s.clone();
+                mapping.from_canonical(&mut canon)?;
+                let mut a = make_state_abstract_rem(canon, precision);
+                a = apply_conservative_widenings(a);
+                a.gc();
+                let key = sweep::row_keys(&a)?[0];
+                Ok(table.id_of(key).map(|id| {
+                    (key, table.earliest_frame(id).unwrap_or(u32::MAX), g[id as usize])
+                }))
+            };
+            let position = |s: &State| -> (i16, i16) {
+                player_xy_per_lane(s)
+                    .and_then(|v| v.first().copied())
+                    .unwrap_or((i16::MIN, i16::MIN))
+            };
+
+            // Layer 0: the spawn state. Per node: concrete state, count of
+            // distinct row trajectories reaching it (exact), and count of
+            // distinct input-byte sequences reaching it (f64 - the totals
+            // overflow u128 long before precision matters).
+            struct Node {
+                state: State,
+                traj: u128,
+                byte_seqs: f64,
+            }
+            let mut layer: HashMap<Key, Node> = HashMap::new();
+            let spawn_key = {
+                let p = probe(&spawn)?;
+                p.map(|(k, _, _)| k).unwrap_or((0, 0))
+            };
+            layer.insert(spawn_key, Node { state: spawn, traj: 1, byte_seqs: 1.0 });
+            // Position-sequence classes: distinct position histories collapse
+            // when they lead to the same set of current rows, so track
+            // (sorted row-key set) -> number of distinct position sequences.
+            let mut pos_classes: HashMap<Vec<Key>, u128> = HashMap::new();
+            pos_classes.insert(vec![spawn_key], 1);
+
+            let mut total_edges = 0usize;
+            for frame in 1..=horizon {
+                let budget = (horizon - frame) as u16;
+                // Expand every node with every byte; dedup successors by row.
+                let mut next: HashMap<Key, Node> = HashMap::new();
+                // src key -> distinct successors as (dst key, position).
+                let mut succs: HashMap<Key, Vec<(Key, (i16, i16))>> = HashMap::new();
+                // (src, dst) -> byte multiplicity.
+                let mut edge_bytes: HashMap<(Key, Key), u32> = HashMap::new();
+                for (src_key, node) in &layer {
+                    for byte in 0u8..64 {
+                        let mut s = node.state.clone();
+                        set_concrete_buttons(&mut s, byte)?;
+                        let result = interpret_prepared_cfg(&frame_cfg, s, &fixed_env)?;
+                        if result.len() != 1 {
+                            return Err(anyhow!("frame {}: branching", frame));
+                        }
+                        let s = result.into_iter().next().unwrap().0;
+                        let Some((key, e, gv)) = probe(&s)? else { continue };
+                        // Tight band: winning exactly at the horizon needs
+                        // g == budget (g < budget would beat the optimum).
+                        if e > frame || gv != budget {
+                            continue;
+                        }
+                        let entry = edge_bytes.entry((*src_key, key)).or_insert(0);
+                        if *entry == 0 {
+                            succs
+                                .entry(*src_key)
+                                .or_default()
+                                .push((key, position(&s)));
+                            next.entry(key).or_insert_with(|| Node {
+                                state: s,
+                                traj: 0,
+                                byte_seqs: 0.0,
+                            });
+                        }
+                        *entry += 1;
+                    }
+                }
+                if next.is_empty() {
+                    return Err(anyhow!("frame {}: band walk died", frame));
+                }
+                total_edges += edge_bytes.len();
+                for ((src, dst), mult) in &edge_bytes {
+                    let (traj, byte_seqs) = {
+                        let s = &layer[src];
+                        (s.traj, s.byte_seqs)
+                    };
+                    let d = next.get_mut(dst).unwrap();
+                    d.traj += traj;
+                    d.byte_seqs += byte_seqs * *mult as f64;
+                }
+                // Advance the position-sequence classes.
+                let mut next_classes: HashMap<Vec<Key>, u128> = HashMap::new();
+                for (rows, mult) in &pos_classes {
+                    let mut by_pos: HashMap<(i16, i16), Vec<Key>> = HashMap::new();
+                    for row in rows {
+                        for (dst, pos) in succs.get(row).map(|v| v.as_slice()).unwrap_or(&[])
+                        {
+                            let set = by_pos.entry(*pos).or_default();
+                            if !set.contains(dst) {
+                                set.push(*dst);
+                            }
+                        }
+                    }
+                    for (_, mut set) in by_pos {
+                        set.sort_unstable();
+                        *next_classes.entry(set).or_insert(0) += mult;
+                    }
+                }
+                let positions: std::collections::BTreeSet<(i16, i16)> = next
+                    .values()
+                    .map(|n| position(&n.state))
+                    .collect();
+                let pos_str = if positions.len() <= 4 {
+                    format!(
+                        "  at {}",
+                        positions
+                            .iter()
+                            .map(|(x, y)| format!("({},{})", x, y))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    )
+                } else {
+                    String::new()
+                };
+                println!(
+                    "f{:03}: {:2} rows, {:2} positions, {} pos-seqs, {} trajs{}",
+                    frame,
+                    next.len(),
+                    positions.len(),
+                    next_classes.values().sum::<u128>(),
+                    next.values().map(|n| n.traj).sum::<u128>(),
+                    pos_str
+                );
+                layer = next;
+                pos_classes = next_classes;
+            }
+
+            // Every final node must be a concrete win.
+            for node in layer.values() {
+                let mut canon = node.state.clone();
+                mapping.from_canonical(&mut canon)?;
+                if count_room_x_lanes(&canon, 2) != 1 {
+                    return Err(anyhow!("final node is not a concrete win"));
+                }
+            }
+            let trajs: u128 = layer.values().map(|n| n.traj).sum();
+            let pos_seqs: u128 = pos_classes.values().sum();
+            let byte_seqs: f64 = layer.values().map(|n| n.byte_seqs).sum();
+            println!("band edges walked: {}", total_edges);
+            println!("distinct optimal row trajectories:      {}", trajs);
+            println!("distinct optimal (x,y) pixel sequences: {}", pos_seqs);
+            println!(
+                "distinct optimal input-byte sequences:  ~10^{:.1}",
+                byte_seqs.log10()
+            );
         }
         Command::Sweep { checkpoint_dir, frames, horizon, banded } => {
             use celeste_rust::rewrite::state_mapping::StateMapping;

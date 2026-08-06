@@ -502,3 +502,24 @@ This is the full strategy.md pipeline closed end to end on room
 (1,0): forward abstract search -> backward sweep -> band-restricted
 precision ladder -> concrete optimum -> witness extraction, with the
 2022 result reproduced independently.
+
+## Census of the optimum (rewrite count-optimal)
+
+Enumerating the entire exact-rem band (327 rows, 1048 walked edges -
+the +1 over the sweep's 1047 is the spawn->frame-1 transition, which
+the sweep never stores):
+
+- Distinct (x,y) whole-pixel position sequences: 3. The optimal
+  route is pixel-unique except frames 57-60 (the wall approach
+  before the second dash, x 44-49 / y 40-46), where two pixel
+  variants exist; all reconverge at (49,40) by f061.
+- Distinct row trajectories (sequences of exact canonical states):
+  877,390,002,843,513,269,834,754,293,760 (~8.8e29). Layers hold
+  2-4 rows at one pixel position: the states differ in button-edge
+  memory (p_jump/p_dash) and similar don't-care-now bits that still
+  live in state, so "free will" multiplies by 2-4 most frames.
+- Distinct input-byte sequences: ~10^162.5 of 64^100 ~ 10^180
+  possible (bits that never even enter state).
+
+So physically there is essentially ONE optimal route with a
+two-pixel wobble in the wall-jump setup window.
