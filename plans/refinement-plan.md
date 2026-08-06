@@ -95,3 +95,26 @@ Full story: plans/overnight-2026-08-06.md.
 4. DONE: precision-k rem widening + straddle split + band-filtered
    forward.
 5. DONE: ladder driver + witness trace + extract-tas.
+
+## Future work (noted 2026-08-06, deliberately not done)
+
+Ladder wall clock is ~3h; the two known inefficiencies, in order:
+
+1. Non-incremental backward pass (~1h of the 3h). Edge DISCOVERY is
+   already incremental (per-frame chunks persist and are reused),
+   but every horizon rebuilds the CSR adjacency from scratch (two
+   streaming passes over all ~7.2B edges, ~29 GB x2 read) and
+   reruns the reverse BFS from zero. Extending horizon H -> H+1
+   only adds new rows/edges at the deep end and new win seeds;
+   existing g values can only decrease, and only via paths through
+   the new material. An incremental BFS seeded from the new wins +
+   an appendable on-disk CSR would make each horizon's backward
+   step near-free.
+
+2. Checkpoint round-trips on the 1-frame extends (~25 min). Each
+   horizon's level-0 extend resumes from disk, runs one frame, and
+   saves again - full load/save of multi-GB state for one frame of
+   work. A resident driver that keeps the level-0 frontier + row
+   table in memory across the whole ladder (checkpointing to disk
+   only as crash insurance, not as the hand-off mechanism) removes
+   the round-trips entirely.
