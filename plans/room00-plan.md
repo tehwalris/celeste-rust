@@ -121,6 +121,40 @@ Philippe will test bit-exactness against a real PICO-8 himself at
 some point; the f32+truncation implementation is believed correct
 and the stakes at this level are low, so it is not a blocker.
 
+## Level-0 memory wall (measured 2026-08-07)
+
+The shape-agnostic recipe fixed SPEED (44s/frame at f60 vs 130s on
+the plain fallback, identical 5.69M lanes) but the level-0 forward
+OOMed at the 100G cap during frame 80: f79 = 12.1M frontier lanes,
+71.6 GB boundary rss (+3.3 GB/frame), 200.4M visited rows - already
+1.3x ALL of room (1,0)'s campaign (151.6M) with the win still ~30-45
+frames away. Per-lane cost is the same ~6 KB as (1,0); the frontier
+is simply ~2.3x bigger at equivalent depth. Shape census at f79:
+63.3% [fake_wall,player], 33.5% [player,fruit] (16 break cohorts,
+off 1..17), 3.3% [player]. Projections at the win (~f105-125):
+frontier ~40M lanes / ~240 GB, visited 500M-1B rows, sweep CSR far
+past 100G. Program specialization CANNOT fix this - lanes are
+abstraction-level. Options considered:
+
+1. Coarser rung BELOW level 0: widen the p_jump/p_dash held-button
+   trails to unknown at boundaries, as a refutable over-approximating
+   ladder level (-1). Merges the held/released trail variants that
+   the count-optimal census showed carry ~10^29-fold multiplicity.
+   Level 0 then runs banded by level -1 like every other rung, and
+   everything downstream (visited, sweep, bands) shrinks. NOTE: this
+   widening was explicitly rejected by Philippe as the BASE
+   abstraction (it admits input sequences the game forbids - see the
+   NOTE in inspect.rs); as a ladder rung, over-approximation is the
+   design and the exact levels refute it. NEEDS PHILIPPE'S SIGN-OFF
+   (never-resurrect list).
+2. External-memory frontier + sweep (disk-spilled boundary states,
+   streamed expansion, sharded merge, external CSR). Sound, no
+   abstraction change, removes the wall for any room; 1-2 days of
+   infra and it must cover the sweep too, not just the forward pass.
+3. off := off mod 40 (see the note above): sound and cheap but only
+   bites once off >= 40; at f79 all cohorts are still below 17.
+   Worth doing regardless; not sufficient alone.
+
 ## Room (0,0) layout (from cart map, for route planning)
 
 Spawn (8,112) bottom-left; fake wall x 8-23, y 32-47, resting on a
