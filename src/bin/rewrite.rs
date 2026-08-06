@@ -247,7 +247,7 @@ fn bench(
     let mut start_frame = 1u32;
     if let Some(cfg) = checkpoint.as_ref().filter(|c| c.resume) {
         match checkpoint::latest(&cfg.dir)? {
-            Some(frame) if frame < frames => {
+            Some(frame) if frame <= frames => {
                 let loaded = checkpoint::load(&cfg.dir, frame, &cfg.fingerprint)?;
                 let visited = loaded.visited;
                 let visited = if run.visited_table().is_some() { Some(visited) } else { None };
@@ -267,7 +267,7 @@ fn bench(
             }
             Some(frame) => {
                 return Err(anyhow!(
-                    "latest checkpoint f{:03} is not before --frames {}",
+                    "latest checkpoint f{:03} is beyond --frames {}",
                     frame,
                     frames
                 ))
