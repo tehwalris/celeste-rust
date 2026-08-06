@@ -298,6 +298,34 @@ pub fn save_g(dir: &Path, g: &[u16]) -> Result<()> {
     Ok(())
 }
 
+/// Load the g array written by `save_g`.
+pub fn load_g(dir: &Path) -> Result<Vec<u16>> {
+    use std::io::Read;
+    let path = dir.join("g.bin");
+    let mut file = std::io::BufReader::new(std::fs::File::open(&path)?);
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic)?;
+    if &magic != b"C8TB" {
+        return Err(anyhow!("{}: bad magic", path.display()));
+    }
+    let mut buf4 = [0u8; 4];
+    file.read_exact(&mut buf4)?;
+    if u32::from_le_bytes(buf4) != checkpoint::FORMAT_VERSION {
+        return Err(anyhow!("{}: format version mismatch", path.display()));
+    }
+    let mut buf8 = [0u8; 8];
+    file.read_exact(&mut buf8)?;
+    let count = u64::from_le_bytes(buf8) as usize;
+    let mut zr = zstd::Decoder::new(file)?;
+    let mut out = vec![0u16; count];
+    let mut buf = vec![0u8; count * 2];
+    zr.read_exact(&mut buf)?;
+    for (i, chunk) in buf.chunks_exact(2).enumerate() {
+        out[i] = u16::from_le_bytes(chunk.try_into().unwrap());
+    }
+    Ok(out)
+}
+
 /// Per-frame band sizes for a horizon: |{row : e <= f and g <= horizon - f}|.
 pub fn band_sizes(table: &RowTable, g: &[u16], horizon: u32) -> Vec<(u32, u64)> {
     let frames = table.watermarks().len() as u32;

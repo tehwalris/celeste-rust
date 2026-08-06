@@ -44,6 +44,10 @@ pub const FILTER_VISITED: FilterReason = "filter_visited";
 /// outputs - lanes whose origin was captured.
 pub const FILTER_DEOPT: FilterReason = "filter_deopt";
 
+/// Precision refinement: dropping lanes whose coarsened row is outside the
+/// previous level's band (cannot be on a winning path within the horizon).
+pub const FILTER_BAND: FilterReason = "filter_band";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct State {
     pub heap: Heap,

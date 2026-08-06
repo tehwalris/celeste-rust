@@ -174,6 +174,18 @@ enum Command {
         /// <checkpoint-dir>/frames/ - the input of the backward sweep.
         #[arg(long)]
         save_frames: bool,
+        /// Previous precision level's checkpoint dir: confine this run to
+        /// its band (rows with e <= f and g <= horizon - f, after
+        /// coarsening each lane to that level's rem precision).
+        #[arg(long)]
+        band_dir: Option<String>,
+        /// Horizon N for the band restriction.
+        #[arg(long)]
+        band_horizon: Option<u32>,
+        /// The previous level's rem bits (0 = the historic full widening,
+        /// 16 = exact). Validated against the previous dir's fingerprint.
+        #[arg(long)]
+        band_prev_bits: Option<u8>,
     },
     /// The backward pass (see plans/refinement-plan.md): replay the saved
     /// frame batches one frame each with an origin column, build the row
@@ -220,6 +232,7 @@ fn bench(
     profile: bool,
     deopt: Option<(&Program, celeste_rust::rewrite::state_mapping::StateMapping)>,
     checkpoint: Option<CheckpointCfg>,
+    band: Option<celeste_rust::rewrite::verify::BandFilter>,
 ) -> Result<()> {
     use celeste_rust::rewrite::checkpoint;
     let mut run = match deopt {
@@ -228,6 +241,9 @@ fn bench(
         )?,
         None => celeste_rust::rewrite::verify::AbstractRun::start(program)?,
     };
+    if let Some(band) = band {
+        run.set_band(band);
+    }
     let mut start_frame = 1u32;
     if let Some(cfg) = checkpoint.as_ref().filter(|c| c.resume) {
         match checkpoint::latest(&cfg.dir)? {
@@ -1720,9 +1736,12 @@ fn main() -> Result<()> {
             checkpoint_every,
             resume,
             save_frames,
+            band_dir,
+            band_horizon,
+            band_prev_bits,
         } => {
             if baseline {
-                bench("original", &Program::compile_from_disk()?, frames, profile, None, None)?;
+                bench("original", &Program::compile_from_disk()?, frames, profile, None, None, None)?;
             }
             let (program, _) = build(&recipe)?;
             let deopt_setup = if deopt {
@@ -1751,6 +1770,60 @@ fn main() -> Result<()> {
                 }
                 None => None,
             };
+            let band = match (band_dir, band_horizon, band_prev_bits) {
+                (Some(dir), Some(horizon), Some(prev_bits)) => {
+                    use celeste_rust::interpreter::inspect::RemPrecision;
+                    use celeste_rust::rewrite::checkpoint;
+                    use celeste_rust::rewrite::sweep;
+                    let prev_precision = if prev_bits >= 16 {
+                        RemPrecision::Exact
+                    } else {
+                        RemPrecision::Bits(prev_bits)
+                    };
+                    let dir = std::path::PathBuf::from(dir);
+                    let recipe_text = std::fs::read_to_string(&cli.recipe).unwrap_or_default();
+                    let prev_fp = checkpoint::config_fingerprint_with_precision(
+                        &recipe_text,
+                        prev_precision,
+                    );
+                    let prev_frame = checkpoint::latest(&dir)?
+                        .ok_or_else(|| anyhow!("--band-dir has no checkpoint"))?;
+                    if prev_frame < horizon {
+                        return Err(anyhow!(
+                            "--band-dir's latest checkpoint f{:03} is before the horizon {}",
+                            prev_frame,
+                            horizon
+                        ));
+                    }
+                    let ck = checkpoint::load(&dir, prev_frame, &prev_fp)?;
+                    let g_prev = sweep::load_g(&dir)?;
+                    if g_prev.len() != ck.visited.len() {
+                        return Err(anyhow!(
+                            "g.bin has {} rows but the row table has {}",
+                            g_prev.len(),
+                            ck.visited.len()
+                        ));
+                    }
+                    println!(
+                        "band: previous level {:?}, {} rows, horizon {}",
+                        prev_precision,
+                        ck.visited.len(),
+                        horizon
+                    );
+                    Some(celeste_rust::rewrite::verify::BandFilter {
+                        prev_table: ck.visited,
+                        g_prev,
+                        horizon,
+                        prev_precision,
+                    })
+                }
+                (None, None, None) => None,
+                _ => {
+                    return Err(anyhow!(
+                        "--band-dir, --band-horizon and --band-prev-bits go together"
+                    ))
+                }
+            };
             bench(
                 "rewritten",
                 &program,
@@ -1758,6 +1831,7 @@ fn main() -> Result<()> {
                 profile,
                 deopt_setup.as_ref().map(|(p, m)| (p, m.clone())),
                 checkpoint_cfg,
+                band,
             )?;
         }
 

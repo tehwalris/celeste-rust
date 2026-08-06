@@ -532,19 +532,45 @@ pub fn describe_objects(state: &State) -> String {
 /// Make marked heap values abstract by replacing concrete numbers with intervals.
 /// This is the key function for abstract interpretation - it widens concrete values
 /// to represent uncertainty (e.g., player's sub-pixel position can be anywhere in [-0.5, 0.5)).
+/// The rem precision ladder (plans/refinement-plan.md).
+///
+/// * `Bits(0)` - the historic widening: rem -> the full interval [-0.5, 0.5).
+/// * `Bits(k)`, k in 1..=15 - quantize rem to floor-aligned buckets of width
+///   2^-k: the interval `[floor(rem * 2^k) / 2^k, +2^-k)`. Each level nests
+///   inside the previous one, so level k-1 over-approximates level k.
+/// * `Exact` - no rem widening at all (the concrete rem dynamics).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RemPrecision {
+    Bits(u8),
+    Exact,
+}
+
+/// The session's rem precision: CELESTE_REM_BITS=k (16 or CELESTE_EXACT_REM
+/// mean exact; unset means the historic Bits(0)). Read once.
+pub fn rem_precision_from_env() -> RemPrecision {
+    static PRECISION: std::sync::OnceLock<RemPrecision> = std::sync::OnceLock::new();
+    *PRECISION.get_or_init(|| {
+        if std::env::var_os("CELESTE_EXACT_REM").is_some() {
+            return RemPrecision::Exact;
+        }
+        match std::env::var("CELESTE_REM_BITS") {
+            Ok(v) => {
+                let bits: u8 = v
+                    .parse()
+                    .unwrap_or_else(|_| panic!("CELESTE_REM_BITS={:?} is not a number", v));
+                if bits >= 16 {
+                    RemPrecision::Exact
+                } else {
+                    RemPrecision::Bits(bits)
+                }
+            }
+            Err(_) => RemPrecision::Bits(0),
+        }
+    })
+}
+
 pub fn make_state_abstract(state: State) -> State {
-    // CELESTE_EXACT_REM: skip the historic rem widening and track rem
-    // exactly, keeping only the certified quotient widenings (timer pins,
-    // dash_effect_time clamp). A strict refinement of the widened
-    // abstraction - the reachable set becomes the CONCRETE one (of the
-    // jbuffer-stripped minimal cart), so the earliest win frame is the
-    // concrete optimum rather than the rem-widened lower bound. Costs more
-    // rows per (pos, spd, flags); measured before use, see the ledger.
-    static EXACT_REM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *EXACT_REM.get_or_init(|| std::env::var_os("CELESTE_EXACT_REM").is_some()) {
-        return apply_conservative_widenings(state);
-    }
-    apply_conservative_widenings(make_state_abstract_rem_only(state))
+    apply_conservative_widenings(make_state_abstract_rem(state, rem_precision_from_env()))
 }
 
 /// Only the historic rem widening - the baseline abstraction the search has
@@ -553,57 +579,80 @@ pub fn make_state_abstract(state: State) -> State {
 /// that the newer widenings are conservative: widening at every boundary
 /// must yield exactly the post-hoc-widened exact sets, or the widened field
 /// influenced gameplay and the widening changed the reachable set.
-pub fn make_state_abstract_rem_only(mut state: State) -> State {
+pub fn make_state_abstract_rem_only(state: State) -> State {
+    make_state_abstract_rem(state, RemPrecision::Bits(0))
+}
+
+/// The floor-aligned width-2^-bits bucket containing `n` (bits in 1..=15).
+fn rem_bucket(n: Pico8Num, bits: u8) -> Pico8NumInterval {
+    let width: i32 = 0x1_0000 >> bits;
+    let raw = n.as_raw_u32() as i32;
+    let low = raw.div_euclid(width) * width;
+    let from_raw = |r: i32| Pico8Num::from_parts((r >> 16) as i16, r as u16);
+    Pico8NumInterval::new(from_raw(low), from_raw(low + width - 1))
+}
+
+/// Widen player.rem.x/y at `precision` (see `RemPrecision`). Bits(0) is the
+/// historic full-interval widening, bit for bit; Exact leaves rem untouched.
+pub fn make_state_abstract_rem(mut state: State, precision: RemPrecision) -> State {
+    if precision == RemPrecision::Exact {
+        return state;
+    }
     let marks = mark_heap(&state);
 
-    // The player_rem_xy interval: [-0.5, 0.5)
-    // In Pico-8, 0.5 is 0x8000 in the fractional part
+    // The player_rem_xy range: [-0.5, 0.5). 0.5 is 0x8000 fractional.
     let half = Pico8Num::from_parts(0, 0x8000);
     let neg_half = -half;
     let half_below = half.next_smallest(); // 0.5 - epsilon
     let wide_interval = Pico8NumInterval::new(neg_half, half_below);
 
-    // Apply abstractions based on marks
+    // Bucket of a single value at this precision.
+    let widen_number = |n: Pico8Num| -> Pico8NumInterval {
+        assert!(
+            wide_interval.contains_number(n),
+            "player_rem value {:?} not in expected interval",
+            n
+        );
+        match precision {
+            RemPrecision::Bits(0) => wide_interval,
+            RemPrecision::Bits(bits) => rem_bucket(n, bits),
+            RemPrecision::Exact => unreachable!(),
+        }
+    };
+    // An interval (mid-frame refinement residue) spans its endpoint buckets.
+    let widen_interval = |iv: &Pico8NumInterval| -> Pico8NumInterval {
+        assert!(
+            wide_interval.contains_interval(iv),
+            "player_rem interval {:?} not in expected interval",
+            iv
+        );
+        match precision {
+            RemPrecision::Bits(0) => wide_interval,
+            RemPrecision::Bits(bits) => {
+                Pico8NumInterval::new(rem_bucket(iv.low, bits).low, rem_bucket(iv.high, bits).high)
+            }
+            RemPrecision::Exact => unreachable!(),
+        }
+    };
+
     if let Some(heap_ids) = marks.marks.get("player_rem_xy") {
         for &heap_id in heap_ids {
             let heap_value = state.heap.get(heap_id);
             if let HeapValue::Value(value) = heap_value {
                 let new_value = match value {
                     Value::Number(MaybeVector::Scalar(n)) => {
-                        assert!(
-                            wide_interval.contains_number(*n),
-                            "player_rem value {:?} not in expected interval",
-                            n
-                        );
-                        Value::NumberInterval(MaybeVector::Scalar(wide_interval))
+                        Value::NumberInterval(MaybeVector::Scalar(widen_number(*n)))
                     }
-                    Value::Number(MaybeVector::Vector(nums)) => {
-                        for n in nums.iter() {
-                            assert!(
-                                wide_interval.contains_number(*n),
-                                "player_rem value {:?} not in expected interval",
-                                n
-                            );
-                        }
-                        Value::NumberInterval(MaybeVector::vector(vec![wide_interval; nums.len()]))
-                    }
+                    Value::Number(MaybeVector::Vector(nums)) => Value::NumberInterval(
+                        MaybeVector::vector(nums.iter().map(|n| widen_number(*n)).collect()),
+                    ),
                     Value::NumberInterval(MaybeVector::Scalar(interval)) => {
-                        assert!(
-                            wide_interval.contains_interval(interval),
-                            "player_rem interval {:?} not in expected interval",
-                            interval
-                        );
-                        Value::NumberInterval(MaybeVector::Scalar(wide_interval))
+                        Value::NumberInterval(MaybeVector::Scalar(widen_interval(interval)))
                     }
                     Value::NumberInterval(MaybeVector::Vector(intervals)) => {
-                        for interval in intervals.iter() {
-                            assert!(
-                                wide_interval.contains_interval(interval),
-                                "player_rem interval {:?} not in expected interval",
-                                interval
-                            );
-                        }
-                        Value::NumberInterval(MaybeVector::vector(vec![wide_interval; intervals.len()]))
+                        Value::NumberInterval(MaybeVector::vector(
+                            intervals.iter().map(|iv| widen_interval(iv)).collect(),
+                        ))
                     }
                     other => {
                         panic!("Unexpected value type for player_rem: {:?}", other);

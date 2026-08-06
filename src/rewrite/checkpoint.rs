@@ -53,6 +53,19 @@ pub struct Meta {
 
 /// What determines the search trajectory; hashed into the fingerprint.
 pub fn config_fingerprint(recipe_text: &str) -> String {
+    config_fingerprint_with_precision(
+        recipe_text,
+        crate::interpreter::inspect::rem_precision_from_env(),
+    )
+}
+
+/// `config_fingerprint` for an explicit precision level - the band loader
+/// validates the PREVIOUS level's checkpoints, whose fingerprint differs
+/// from the current run's only in the precision component.
+pub fn config_fingerprint_with_precision(
+    recipe_text: &str,
+    precision: crate::interpreter::inspect::RemPrecision,
+) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = rustc_hash::FxHasher::default();
     FORMAT_VERSION.hash(&mut h);
@@ -62,6 +75,12 @@ pub fn config_fingerprint(recipe_text: &str) -> String {
     }
     for flag in ["CELESTE_FRONTIER_ONLY", "CELESTE_DEOPT_COLLECT_FIRST", "CELESTE_EXACT_REM"] {
         std::env::var_os(flag).is_some().hash(&mut h);
+    }
+    // The rem precision level changes the reachable set; the VALUE matters.
+    // Hashed only when non-default so checkpoints written before the ladder
+    // existed (implicitly Bits(0)) remain valid.
+    if precision != crate::interpreter::inspect::RemPrecision::Bits(0) {
+        format!("{:?}", precision).hash(&mut h);
     }
     format!("{:016x}", h.finish())
 }

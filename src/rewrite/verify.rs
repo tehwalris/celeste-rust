@@ -284,6 +284,21 @@ pub struct AbstractRun {
     rem_only_abstraction: bool,
     /// Deopt-to-plain support; `None` means a failing frame is a hard error.
     deopt: Option<DeoptTarget>,
+    /// Precision-refinement band restriction (plans/refinement-plan.md):
+    /// lanes whose coarsened row is outside the previous level's band are
+    /// dropped at each boundary.
+    band: Option<BandFilter>,
+}
+
+/// The previous precision level's result, used to confine this level's
+/// forward pass to states that can still be on a winning path.
+pub struct BandFilter {
+    pub prev_table: crate::interpreter::row_table::RowTable,
+    /// Min frames to the exit per previous-level row id (`sweep::save_g`).
+    pub g_prev: Vec<u16>,
+    pub horizon: u32,
+    /// The previous level's rem precision (what to coarsen to).
+    pub prev_precision: crate::interpreter::inspect::RemPrecision,
 }
 
 /// Everything needed to re-run a frame under the plain program when the
@@ -339,6 +354,7 @@ impl AbstractRun {
             visited_rows,
             rem_only_abstraction: false,
             deopt: None,
+            band: None,
         })
     }
 
@@ -391,6 +407,11 @@ impl AbstractRun {
     /// must see every successor lane, not just never-seen ones.
     pub fn disable_frontier(&mut self) {
         self.visited_rows = None;
+    }
+
+    /// Confine the forward pass to the previous level's band.
+    pub fn set_band(&mut self, band: BandFilter) {
+        self.band = Some(band);
     }
 
     /// Restore from a checkpoint: boundary states, row table and deopt
@@ -521,6 +542,66 @@ impl AbstractRun {
             );
             vectorize_states(new_states)
         };
+        if let Some(band) = &self.band {
+            let frame = self.states_before_merge.len() as u32;
+            let budget = band.horizon.saturating_sub(frame);
+            let mut kept_states = Vec::new();
+            let (mut before, mut after, mut missing) = (0usize, 0usize, 0usize);
+            for state in std::mem::take(&mut self.states) {
+                before += state.vector_size;
+                let mut coarse = crate::interpreter::inspect::make_state_abstract_rem(
+                    state.clone(),
+                    band.prev_precision,
+                );
+                coarse.gc();
+                let keys = super::sweep::row_keys(&coarse)?;
+                let mask: Vec<bool> = keys
+                    .iter()
+                    .map(|k| match band.prev_table.id_of(*k) {
+                        Some(id) => {
+                            let e = band
+                                .prev_table
+                                .earliest_frame(id)
+                                .unwrap_or(u32::MAX);
+                            let g = band.g_prev[id as usize];
+                            e <= frame
+                                && g != super::sweep::G_UNREACHABLE
+                                && (g as u32) <= budget
+                        }
+                        None => {
+                            // Sound to drop: the coarse row was never even
+                            // reachable at the previous level, so nothing
+                            // that maps to it can be on a winning path. A
+                            // nonzero count at the FIRST refinement level is
+                            // a canonicalization bug though - watch it.
+                            missing += 1;
+                            false
+                        }
+                    })
+                    .collect();
+                let kept = mask.iter().filter(|b| **b).count();
+                after += kept;
+                if kept == state.vector_size {
+                    kept_states.push(state);
+                } else if kept > 0 {
+                    kept_states.push(state.filter_by_mask_clone(
+                        &mask,
+                        crate::interpreter::state::FILTER_BAND,
+                    ));
+                }
+            }
+            self.states = kept_states;
+            println!(
+                "  band: {} -> {} lanes in band{}",
+                before,
+                after,
+                if missing > 0 {
+                    format!(" ({} lanes with unknown coarse rows dropped)", missing)
+                } else {
+                    String::new()
+                }
+            );
+        }
         if let Some(visited) = self.visited_rows.as_mut() {
             let (kept, before, after) = crate::interpreter::vectorize::subtract_visited(
                 std::mem::take(&mut self.states),
