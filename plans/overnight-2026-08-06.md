@@ -188,6 +188,17 @@ The generic fix (no death special-casing - works for ANY premise):
   bounds under CELESTE_CENSUS=1. Now sized by REASON_COUNT (5, with
   filter_deopt).
 
+### Collect-first refinement (env: CELESTE_DEOPT_COLLECT_FIRST)
+
+Attempt-then-retry pays twice for failing states. Collect-first runs
+EVERY frame in collect mode with the origin column injected up front:
+a failing state pays one specialized run, a clean state pays only the
+origin-column overhead. Measured (uncontended): +2.9% on clean frames
+(f45: 10.37 -> 10.67s), -19 to -21% on kill frames (f60: 11.7 -> 9.2s,
+f61: 11.35 -> 9.08s), identical outputs everywhere. Env-gated, default
+off. The feared cross-origin mid-frame dedup loss did not materialize
+(+2.9% total includes it).
+
 Verification:
 * New integration test `granular_deopt_reproduces_the_baseline`:
   corrupts the fused frame body with 3 synthetic premises (assert_true
@@ -205,3 +216,40 @@ Verification:
   failing states run specialized twice). A later refinement could
   predict-and-skip the first attempt for states in classes that
   deopted last frame - optimization only, correctness is done.
+
+## Ranked next steps (for morning review)
+
+1. **Close the 10-frame gap (task #81)** - the search now computes the
+   abstract bound (90); the prize is the concrete optimum (100) proved
+   by OUR system. Options in the task; the strategy-doc answer is
+   backward refinement over the widened tube with rem tracked tightly.
+   Needs Philippe's direction.
+2. **Proof-grade visited set** - the whole room-1 result is modulo
+   64-bit row hashes. Exact keys (dictionary-encoded packed rows or
+   128-bit hashes as a stopgap) turn the frontier search into
+   something one can argue about. The Opus speed-set analysis (spd
+   12 bits, flags 12 bits, pos sparse) is the design input.
+3. **Deep-frame profile** - after the collect-first full-room run,
+   profile f70+ to see what is left: specialized interpret vs merge vs
+   visited-subtract. Decides whether the next lever is representation
+   (dictionary/RLE) or merge mechanics.
+4. **#47 dash package / btn expand** - fragments are 326 mean per
+   frame at f45; expanding the button fan-out into lanes is the
+   structural fix and plans/dash-package.jsonl already exists. Was
+   parked pre-partitioning; the landscape changed.
+5. **Room 2 readiness** (later): room-parametric tile_flag_at, a `sin`
+   builtin decision for fruit rooms (the timer pins are unsound where
+   gameplay reads frames - the guard works, now it needs a policy),
+   program family for the multi-object room.
+
+## Operational notes
+
+* Runs tonight: /tmp/bench62_deopt.log (v1 first crossing),
+  /tmp/bench102_deopt.log (v1 full, win at f90, crash f91 by design),
+  /tmp/bench90_v2.log (v2 clean headline, 898s/32.5GB),
+  /tmp/bench90_cf.log (collect-first full room).
+* The win-probe crash ordering caveat: if a run past the win crashes
+  (room-2 sin guard), the per-frame WIN lines are already printed -
+  the result survives; only the end-of-run summary is lost.
+* deoptcheck/verify/test-suite all green at every commit tonight;
+  every change is one commit on `census`, pushed.
