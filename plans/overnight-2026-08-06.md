@@ -523,3 +523,15 @@ the sweep never stores):
 
 So physically there is essentially ONE optimal route with a
 two-pixel wobble in the wall-jump setup window.
+
+## Historical comparison (from Philippe, 2026-08-06)
+
+The 2022 system - more optimized per-frame execution, but brute
+force over rem (zero to full precision in one jump, band-restricted
+concrete search inside the abstract band) - took ~48 hours on a
+slightly weaker but similar-frequency machine. The refinement ladder
+does the same proof in ~3h01m. The win is structural, not
+per-frame: each precision level only pays for the band the previous
+level could not refute, so the exponential blowup the old brute
+force ate in one bite is amortized into a staircase where k=1 costs
+6.5 min and k=16 costs 14 seconds.
