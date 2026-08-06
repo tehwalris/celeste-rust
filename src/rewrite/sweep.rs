@@ -111,7 +111,27 @@ pub fn backward_sweep(
         let t = std::time::Instant::now();
         let chunk_path = edge_dir.join(format!("f{:03}.bin", f));
         let wins_path = edge_dir.join(format!("wins-f{:03}.bin", f));
-        // Reuse a previous sweep's work for this frame if present.
+        // Reuse a previous sweep's work for this frame if present. A chunk
+        // without a wins file (older sweep) triggers a cheap batch rescan
+        // for win seeds below, without re-expanding.
+        if chunk_path.exists() && !wins_path.exists() && f < frames {
+            let states = checkpoint::load_frame_states(dir, f)
+                .with_context(|| format!("loading frame batch f{:03}", f))?;
+            let mut frame_wins: Vec<(u32, u32)> = Vec::new();
+            for state in &states {
+                let keys = row_keys(state)?;
+                for (key, win) in keys.iter().zip(room_x_lane_mask(state, 2)) {
+                    if win {
+                        let id = table.id_of(*key).ok_or_else(|| {
+                            anyhow!("frame f{:03}: saved lane's row missing from table", f)
+                        })?;
+                        g[id as usize] = 0;
+                        frame_wins.push((id, 0));
+                    }
+                }
+            }
+            checkpoint::write_u32_pairs(&wins_path, &frame_wins)?;
+        }
         if wins_path.exists() && (chunk_path.exists() || f == frames) {
             let mut wins: Vec<(u32, u32)> = Vec::new();
             checkpoint::read_u32_pairs_into(&wins_path, &mut wins)?;

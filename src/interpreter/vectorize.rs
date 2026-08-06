@@ -1445,14 +1445,18 @@ pub fn union_diff_states(
     // one state per (shape, class) - the distinctness guard must use the
     // same key, or same-shape different-class arrivals trip it (this
     // happened, loudly, the first time a partition key varied at a hint
-    // site).
-    let partition_cells = potentially_new
-        .first()
-        .map(resolve_partition_cells)
-        .unwrap_or_default();
+    // site). The cells are resolved PER STATE, exactly as vectorize's own
+    // grouping does: resolving from the first arrival and applying those
+    // cell ids across different shapes misclassifies - concretely, when a
+    // dead state (no player, so no partition cells resolve) arrives first,
+    // every alive state's class collapses to one constant and same-shape
+    // different-freeze arrivals trip the guard. The backward sweep's
+    // restored batch ordering exposed this; the forward pass had dodged it
+    // by arrival order alone.
     let mut shape_classes: FxHashSet<(u64, u64)> = FxHashSet::default();
     let all_distinct = potentially_new.iter().all(|state| {
-        let class = partition_class(state, &partition_cells).unwrap_or(u64::MAX);
+        let cells = resolve_partition_cells(state);
+        let class = partition_class(state, &cells).unwrap_or(u64::MAX);
         shape_classes.insert((shape_of_state(state).cached_hash, class))
     });
     assert!(
