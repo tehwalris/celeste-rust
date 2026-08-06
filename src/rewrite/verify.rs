@@ -304,6 +304,9 @@ struct DeoptTarget {
     /// mapping bug shows up as an observation divergence rather than waiting
     /// for the first real deopt at frame 59.
     force: bool,
+    /// Run every frame in collect mode (origin column injected up front)
+    /// instead of attempt-then-retry. Env-gated: CELESTE_DEOPT_COLLECT_FIRST.
+    collect_first: bool,
     /// (states, lanes) deopted over the whole run.
     total_events: (usize, usize),
 }
@@ -369,6 +372,7 @@ impl AbstractRun {
             plain_env: plain.fixed_env(),
             mapping,
             force,
+            collect_first: std::env::var_os("CELESTE_DEOPT_COLLECT_FIRST").is_some(),
             total_events: (0, 0),
         });
         Ok(run)
@@ -395,6 +399,25 @@ impl AbstractRun {
                     frame_events.1 += state.vector_size;
                     new_states.extend(run_deopt_frame(deopt, state)?);
                 }
+                Some(deopt) if deopt.collect_first => {
+                    // Collect-first: every frame runs in collect mode with the
+                    // origin column, so a failing state pays one specialized
+                    // run instead of two (attempt + retry). The cost is the
+                    // origin column's overhead on clean frames - measured
+                    // before this became reachable (CELESTE_DEOPT_COLLECT_FIRST).
+                    let (states, plain_lanes) = run_deopt_frame_granular(
+                        deopt,
+                        &self.frame_cfg,
+                        &self.fixed_env,
+                        state,
+                        false,
+                    )?;
+                    if plain_lanes > 0 {
+                        frame_events.0 += 1;
+                        frame_events.1 += plain_lanes;
+                    }
+                    new_states.extend(states);
+                }
                 Some(deopt) => {
                     // Optimistic: run the specialized frame; deopt on failure.
                     // Panics are caught too - a speculated instruction may
@@ -415,6 +438,7 @@ impl AbstractRun {
                                 &self.frame_cfg,
                                 &self.fixed_env,
                                 snapshot,
+                                true,
                             )?;
                             frame_events.1 += plain_lanes;
                             new_states.extend(states);
@@ -426,6 +450,7 @@ impl AbstractRun {
                                 &self.frame_cfg,
                                 &self.fixed_env,
                                 snapshot,
+                                true,
                             )?;
                             frame_events.1 += plain_lanes;
                             new_states.extend(states);
@@ -509,6 +534,7 @@ fn run_deopt_frame_granular(
     frame_cfg: &crate::interpreter::fixed_env::PreparedCfg,
     fixed_env: &crate::interpreter::fixed_env::FixedEnv,
     snapshot: State,
+    expect_failure: bool,
 ) -> Result<(Vec<State>, usize)> {
     use crate::interpreter::deopt_collect;
     use crate::interpreter::state::FILTER_DEOPT;
@@ -522,6 +548,16 @@ fn run_deopt_frame_granular(
     }));
     let captured = deopt_collect::take();
     let result = match attempt {
+        // Collect-first mode: no premise fired - the common case. Strip the
+        // origin column and hand the outputs straight back.
+        Ok(Ok(result)) if captured.is_empty() && !expect_failure => {
+            let mut out = Vec::with_capacity(result.len());
+            for (mut state, _) in result {
+                state.global_env.remove(deopt_collect::ORIGIN_GLOBAL);
+                out.push(state);
+            }
+            return Ok((out, 0));
+        }
         Ok(Ok(result)) if !captured.is_empty() => result,
         Ok(Ok(_)) => {
             // The first attempt failed but the retry captured nothing and
