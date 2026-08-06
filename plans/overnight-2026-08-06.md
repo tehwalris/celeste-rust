@@ -10,6 +10,55 @@ Continues plans/overnight-2026-08-05.md (frontier-only search, widencheck,
 the f59 premise-guard diagnosis, and the REJECTED death pruning - see the
 correction there; the fix is the deopt architecture below).
 
+## MORNING SUMMARY (read this first)
+
+The night in one line: **the search now runs the entire room (1,0) -
+through every death and respawn - to its abstract optimum in ~12
+minutes / 33 GB, and that optimum is frame 90**, the rem-widened lower
+bound on the concrete 100.
+
+Landed (each its own commit, every gate green, all pushed):
+1. **Deopt architecture (#78)** - canonical-state mapping from the
+   recipe (promote_capture pairs), optimistic specialized execution,
+   re-run under plain on premise failure. Certified by the new
+   `rewrite deoptcheck` (forced round-trip of every state, green at
+   34 and 37).
+2. **Lane-granular deopt (#80)** - origin column + collect-mode
+   asserts; only the lanes that actually violate a premise pay the
+   plain price (f60: 1.77M plain lanes -> 525). Full-depth A/B:
+   bit-identical reachable sets.
+3. **Collect-first mode** - failing states pay one specialized run,
+   not two: full room 898s -> 737s.
+4. **128-bit visited keys** - the full-room frontier series is
+   IDENTICAL to the 64-bit run (no collision ever fired); bound now
+   rests on ~1e-23 instead of ~6e-4.
+5. **Win probe** + the frame-90 result and its interpretation
+   (NOT a bug - see the HEADLINE section; my earlier "anything != 100
+   is a bug" claim was wrong and is corrected there).
+6. **Per-coordinate saturation (#77)** - CELESTE_XY_DUMP + analysis:
+   per-pixel arrival/taper is regular enough to forecast room cost
+   from early frames.
+7. **Exact-rem mode** (CELESTE_EXACT_REM) + feasibility measurement:
+   13x lanes at f42 and still compounding - full-width exact forward
+   is out; the tube refinement (#81) is the path to closing 90 -> 100.
+   A run-until-the-cap exact run is charting the multiplier curve
+   (/tmp/bench60_exact.log).
+
+Objective scoreboard: 2-minute frontier f60 -> **f63**;
+time-to-room-solved: unreachable yesterday (f58 wall) -> **737 s**.
+2022-solver comparison: rough wall-clock parity on the forward pass,
+computing the abstract bound while interpreting the original Lua.
+
+Decisions needed from Philippe (task #81 and ledger sections):
+* Direction for closing the 10-frame gap (backward/tube refinement vs
+  propagated-rem middle ground; full exact forward is measured out).
+* Whether 128-bit hashing suffices for the eventual proof or exact
+  keys (dictionary-packed rows) are required.
+* Whether collect-first + frontier-only should stop being opt-in.
+* Room-2 policy eventually: room-parametric tile_flag_at, and what to
+  do about `sin(frames/30)` in fruit rooms (the pin guard works; a
+  policy is needed).
+
 ## 1. Deopt architecture (task #78) - LANDED
 
 Philippe's design: canonical state = the plain program's cross-frame
