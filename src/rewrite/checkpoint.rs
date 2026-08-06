@@ -212,6 +212,28 @@ pub fn write_u32_pairs(path: &Path, pairs: &[(u32, u32)]) -> Result<()> {
     Ok(())
 }
 
+/// Stream the pairs from `path` through `f` without materializing them.
+pub fn stream_u32_pairs(path: &Path, mut f: impl FnMut(u32, u32)) -> Result<u64> {
+    let mut r = read_bin_header_len(path)?;
+    let mut buf8 = [0u8; 8];
+    r.read_exact(&mut buf8)?;
+    let count = u64::from_le_bytes(buf8);
+    let mut buf = vec![0u8; 1 << 20];
+    let mut remaining = (count as usize) * 8;
+    while remaining > 0 {
+        let take = remaining.min(buf.len());
+        // The buffer is a multiple of 8, so reads never split a pair.
+        r.read_exact(&mut buf[..take])?;
+        remaining -= take;
+        for chunk in buf[..take].chunks_exact(8) {
+            let a = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
+            let b = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
+            f(a, b);
+        }
+    }
+    Ok(count)
+}
+
 /// Append the pairs from `path` into `out` (which should be pre-reserved).
 pub fn read_u32_pairs_into(path: &Path, out: &mut Vec<(u32, u32)>) -> Result<()> {
     let mut r = read_bin_header_len(path)?;
