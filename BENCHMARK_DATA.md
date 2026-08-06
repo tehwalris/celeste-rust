@@ -91,6 +91,35 @@ pressure feeds back into merge cost). For scale: 24 hours before this
 measurement, the frontier was frame 41 at 107 s - six frames deeper at
 the same cost, one working day later.
 
+## 2026-08-06 overnight: the whole room
+
+With frontier-only search (CELESTE_FRONTIER_ONLY=1), the deopt
+architecture (`bench --deopt`, tasks #78/#80) and the conservative
+widenings (timer pins + dash_effect_time clamp), the search now runs
+the ENTIRE room (1,0), through 31 kill/respawn frames, to the abstract
+win at frame 90 (see plans/overnight-2026-08-06.md for what frame 90
+means - it is the rem-widened lower bound, not the concrete optimum
+100):
+
+| | time | peak | note |
+|---|---|---|---|
+| bench `--frames 62 --deopt` (v1 deopt) | 179.9 s | 16.4 GB | first run past f58 |
+| bench `--frames 90 --deopt` (v2, clean) | **898 s** | 32.5 GB | full room; WIN at f90; 151.6M visited rows |
+
+Per-frame at depth (v2, clean run): f60 13.6 s, f76 (peak, 5.24M new
+lanes) ~35-45 s, f90 29.6 s. Total plain re-runs across all 90 frames:
+1.55M lanes (v1 re-ran ~5M lanes per frame by f74 - the lane-granular
+deopt is what makes the deep half affordable). A 120 s budget reaches
+**frame 62**.
+
+For scale: the 2022 hand-written solver completed this room in roughly
+5-15 min. The general system is now at wall-clock parity on the
+forward pass, while interpreting the original Lua.
+
+Frontier-only + deopt are still opt-in (env var + flag); the standard
+f34/f37 iteration benchmarks above are unchanged and remain the
+regression gate.
+
 The store-triangle row is the first change that moved the fragment count: 558
 -> 335 mean fragments per frame at frame 34, split executions 19573 -> 11978.
 The ternary row continues it: 335 -> 232, splits -> 8472; the decompose row:

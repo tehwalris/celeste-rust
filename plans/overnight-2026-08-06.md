@@ -142,6 +142,13 @@ pinned - a room where gameplay reads the timer crashes loudly instead
 of silently using a pinned value. Room-2 frames are untrusted anyway
 (tile_flag_at is baked to room (1,0)).
 
+Saturation curve (full room, from the run's frontier lines): new
+rows/frame peak at ~5.24M around f76, then decline to ~3.8M (f85) with
+a small second wave to 4.7M at f90. Accumulated distinct rows by f90:
+151.6M - about 16x the 2022 solver's ~9.45M by its win frame, which is
+the priced-in genericness gap (freeze copies, p-bit trails, death
+lineages, interval-rem multiplicity) now measured end-to-end.
+
 New facts for the room-1 certificate (all modulo the experimental
 64-bit-hash visited set):
 * No input sequence exits room (1,0) before frame 90 even with free
