@@ -277,3 +277,12 @@ time / +30% memory before; the expand-copies-every-vector fundamental
 is unchanged. Re-parked; revisit only if fragment-count overhead rises
 in future profiles (f72 profile: 55% straight-line execution, 19%
 merge, 6.5% deopt filtering, 12% tile_flag_at builtins, 3% gc).
+
+### 128-bit re-certification result
+
+Full-room run repeated under 128-bit keys: win at frame 90 again, and
+the ENTIRE 90-frame frontier series (every per-frame new-lane count
+and visited total) is identical to the 64-bit run - no 64-bit
+collision ever fired in the room-1 search. 749.9s / 34.1 GB
+(vs 737.5s / 32.7 GB at 64-bit: +1.7% time, +4% memory). The frame-90
+bound now rests on a ~1e-23 hash risk rather than ~6e-4.
