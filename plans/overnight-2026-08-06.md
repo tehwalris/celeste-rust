@@ -461,3 +461,44 @@ Lesson recorded: three consecutive "wins" (L1/L2/L3 all plausible)
 masked the identity bug; only the impossible refutation exposed it,
 and only the concrete-witness probe localized it. The witness tracer
 is now a standing gate for the refinement machinery.
+
+## CONVERGENCE (evening 2026-08-06): concrete optimum proven, TAS extracted
+
+The post-fix ladder (rebuilt from scratch under FORMAT_VERSION 2) ran
+3h and converged:
+
+- horizons 90-93 refuted at k=1; 94-96 at k=2; 97 at k=3; 98 at k=5;
+  99 at k=6.
+- horizon 100: every level k=1..16 wins, and every level's backward
+  sweep reports min(e+g) equal to its forward first-win. k=16 is
+  EXACT rem - no abstraction left on that axis.
+- Ladder verdict: CONCRETE OPTIMUM = 100. Matches the 2022 solver's
+  76 control frames (our frame 100 = spawn prologue 24 + control 76).
+
+The trustworthy L-curve: L(1)=94, L(2)=97, L(3)=L(4)=98, L(5)=99,
+L(6..16)=100 - a clean monotone staircase (the pre-fix curve had
+skipped 95/96 and then collapsed into the impossible k=4 refutation).
+
+Band collapse with precision at horizon 100: 8.9M rows (k=1) -> 297k
+(k=7) -> 86k (k=10) -> 29.6k (k=14) -> 327 rows (k=15, k=16); sweep
+edges 21.1M (k=4) -> 1047 (k=16). By exact precision the band is a
+single trajectory tube.
+
+Gate 1 - witness trace: the reference TAS probes ok in ALL 17 levels'
+tables at EVERY frame, with e+g == 100 exactly at k>=6 and g counting
+10..2,1,0 into the win. No MISS, no BAD anywhere.
+
+Gate 2 - TAS extraction (new `rewrite extract-tas`): greedy forward
+walk over the k=16 band from the spawn state, trying all 64 input
+bytes per frame concretely and keeping those whose successor row
+stays in the band with g <= 100-f. The reference byte was in the
+optimal set at every frame; the extracted TAS is BYTE-IDENTICAL to
+tas/room_1_0_exit_frame_100.txt, ends on a (e=100, g=0) row with the
+player concretely in room (2,0). The walk also measures per-frame
+input freedom: mostly 32/64 don't-care bytes, tightest moment f067
+with exactly 2 optimal bytes (the second dash).
+
+This is the full strategy.md pipeline closed end to end on room
+(1,0): forward abstract search -> backward sweep -> band-restricted
+precision ladder -> concrete optimum -> witness extraction, with the
+2022 result reproduced independently.

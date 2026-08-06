@@ -77,11 +77,21 @@ tightness is the whole cost model.
 
 ## Build order and status
 
+ALL DONE (2026-08-06). The pipeline converged on room (1,0):
+CONCRETE OPTIMUM = frame 100, all levels k=1..16 (16 = exact rem)
+winning at horizon 100 with sweep min(e+g) == forward first-win at
+every level. L-curve: L(1)=94, L(2)=97, L(3)=L(4)=98, L(5)=99,
+L(6+)=100. Gates: `rewrite trace-witness` passes all 17 levels at
+every frame; `rewrite extract-tas` walks the 327-row exact band and
+reproduces the reference TAS byte-identically. Driver: `ladder.sh`.
+Full story: plans/overnight-2026-08-06.md.
+
 1. DONE: row table with dense ids + watermarks; subtract_visited
    rewired; f45 frontier series bit-identical to the set-based code.
-2. Checkpoint save/load + bench --checkpoint-dir/--resume. Gate:
-   resume at f45 reproduces the f90 run's exact frontier series.
-3. Backward sweep at k=0, horizon 90 (origin-tagged replay +
-   successor membership). Sanity: near-spawn rows leave B by f~85.
-4. Precision-k rem widening + band-filtered forward at k=1.
-5. Loop driver + concrete witness extraction at the final level.
+2. DONE: checkpoint save/load + bench --checkpoint-dir/--resume
+   (FORMAT_VERSION 2 after the rem-straddle canonicalization fix).
+3. DONE: backward sweep (origin-tagged replay, CSR edges, reverse
+   BFS); k=0 horizon-90 sweep matched the forward first-win exactly.
+4. DONE: precision-k rem widening + straddle split + band-filtered
+   forward.
+5. DONE: ladder driver + witness trace + extract-tas.
