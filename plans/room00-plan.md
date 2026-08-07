@@ -164,7 +164,13 @@ plain fallback (currently ~10x-chunked as mitigation):
    lanes lose definiteness. The v1 collapses the whole value to
    UnknownBool when ANY lane straddles, which in a million-lane state
    is always - it destroyed the sliver (h89: 5.9M lanes deopted for
-   what per-lane analysis would have made a few thousand).
+   what per-lane analysis would have made a few thousand). The
+   acceptance criterion (Philippe 2026-08-07): LANE INDEPENDENCE - no
+   lane's imprecision may affect any other lane's execution. That
+   invariant is what makes vectorization, chunking, merging and dedup
+   correct; the v1 comparison violates it. Likely shape: a tri-state
+   bool value (MaybeVector of Option<bool>), definite lanes routed
+   per-lane at branches, only the unknown sliver double-executed.
 2. select on an unknown condition resolves by EXPAND-STYLE LANE
    DUPLICATION (the btn fan-out machinery): each unresolved lane
    splits into its A- and B-resolution, exact and externally
