@@ -218,9 +218,16 @@ pub fn backward_sweep(
 
         // Expand in chunks of bounded input-lane count: the origin column
         // prevents boundary dedup, so the successor fan-out is the FULL
-        // pre-dedup lane count (~30x the frontier at depth); a whole deep
-        // batch at once would spike tens of GB of transient state.
-        const CHUNK_LANES: usize = 1_000_000;
+        // pre-dedup lane count (~30-50x the frontier at depth); a whole deep
+        // batch at once would spike tens of GB of transient state. The
+        // default was 1M through the room-(1,0) campaign; at room-(0,0)'s
+        // h88 (36M-lane batches, deeper fan-out) that OOMed the 100G cap,
+        // hence the smaller default and the env override
+        // (CELESTE_SWEEP_CHUNK_LANES).
+        let chunk_lanes_cap: usize = std::env::var("CELESTE_SWEEP_CHUNK_LANES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(250_000);
         let mut accounted = 0usize;
         let mut missing_successors = 0usize;
         let mut frame_edges: Vec<(u32, u32)> = Vec::new();
@@ -230,7 +237,7 @@ pub fn backward_sweep(
         while let Some(state) = queue.pop_front() {
             chunk_lanes += state.vector_size;
             chunk.push(state);
-            if chunk_lanes < CHUNK_LANES && !queue.is_empty() {
+            if chunk_lanes < chunk_lanes_cap && !queue.is_empty() {
                 continue;
             }
             // One frame forward; the origin column carries each lane's
