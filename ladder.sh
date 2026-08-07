@@ -24,7 +24,10 @@ for H in $(seq "$FROM" "$TO"); do
   ./safe-run.sh -- ./target/release/rewrite --recipe "$RECIPE" bench --frames "$H" --deopt \
       --checkpoint-dir "$L0" --save-frames --resume > /tmp/l0-h$H.log 2>&1
   tail -2 /tmp/l0-h$H.log
-  ./safe-run.sh -- ./target/release/rewrite --recipe "$RECIPE" sweep \
+  # The sweep's origin-tagged plain replays of fruit states blow up on
+  # UnknownBool branch doubling; a much tighter per-state lane cap than the
+  # forward pass needs (see the h88 OOM postmortem in room00-plan.md).
+  CELESTE_MAX_STATE_LANES=100000 ./safe-run.sh -- ./target/release/rewrite --recipe "$RECIPE" sweep \
       --checkpoint-dir "$L0" --frames "$H" --horizon "$H" > /tmp/l0sweep-h$H.log 2>&1
   grep -E "abstract optimal|win seeds" /tmp/l0sweep-h$H.log
   refuted=0
@@ -45,7 +48,7 @@ for H in $(seq "$FROM" "$TO"); do
       break
     fi
     echo "=== horizon $H: k=$K wins; sweeping level $K ==="
-    CELESTE_REM_BITS=$K ./safe-run.sh -- ./target/release/rewrite --recipe "$RECIPE" sweep --banded \
+    CELESTE_REM_BITS=$K CELESTE_MAX_STATE_LANES=100000 ./safe-run.sh -- ./target/release/rewrite --recipe "$RECIPE" sweep --banded \
         --checkpoint-dir "$KDIR" --frames "$H" --horizon "$H" \
         > "/tmp/k${K}sweep-h$H.log" 2>&1
     grep -E "abstract optimal|win seeds" "/tmp/k${K}sweep-h$H.log"
