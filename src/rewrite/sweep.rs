@@ -66,6 +66,170 @@ pub fn row_keys(state: &State) -> Result<Vec<(u64, u64)>> {
         .collect())
 }
 
+/// One CSR shard: the predecessor lists contributed by a contiguous range
+/// of frame chunks (see the shard commentary in `backward_sweep`). Two
+/// mmap-backed files: `shard-<lo>-<hi>.offsets` (24-byte header, then
+/// (n_rows+1) u64 LE) and `shard-<lo>-<hi>.srcs` (raw u32 LE). `n_rows` is
+/// the row-table size AT BUILD TIME; rows added later have no entries here.
+struct Shard {
+    first_frame: u32,
+    last_frame: u32,
+    n_rows: usize,
+    edges: u64,
+    offsets: memmap2::Mmap,
+    srcs: memmap2::Mmap,
+}
+
+const SHARD_MAGIC: u32 = 0x43385348; // "C8SH"
+const SHARD_HEADER: usize = 24;
+
+impl Shard {
+    fn paths(dir: &Path, lo: u32, hi: u32) -> (std::path::PathBuf, std::path::PathBuf) {
+        (
+            dir.join(format!("shard-{:03}-{:03}.offsets", lo, hi)),
+            dir.join(format!("shard-{:03}-{:03}.srcs", lo, hi)),
+        )
+    }
+
+    fn load_all(dir: &Path) -> Result<Vec<Shard>> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+            let Some(range) = name
+                .strip_prefix("shard-")
+                .and_then(|r| r.strip_suffix(".offsets"))
+            else {
+                continue;
+            };
+            let (lo, hi) = range
+                .split_once('-')
+                .ok_or_else(|| anyhow!("bad shard name {}", name))?;
+            out.push(Shard::open(dir, lo.parse()?, hi.parse()?)?);
+        }
+        out.sort_by_key(|s| s.first_frame);
+        for pair in out.windows(2) {
+            if pair[1].first_frame != pair[0].last_frame + 1 {
+                return Err(anyhow!(
+                    "shard ranges not contiguous: f{:03}-f{:03} then f{:03}-f{:03}",
+                    pair[0].first_frame,
+                    pair[0].last_frame,
+                    pair[1].first_frame,
+                    pair[1].last_frame
+                ));
+            }
+        }
+        if let Some(first) = out.first() {
+            if first.first_frame != 1 {
+                return Err(anyhow!("first shard starts at f{:03}, not f001", first.first_frame));
+            }
+        }
+        Ok(out)
+    }
+
+    fn open(dir: &Path, lo: u32, hi: u32) -> Result<Shard> {
+        let (off_path, srcs_path) = Self::paths(dir, lo, hi);
+        let off_file = std::fs::File::open(&off_path)?;
+        let offsets = unsafe { memmap2::Mmap::map(&off_file)? };
+        if offsets.len() < SHARD_HEADER
+            || u32::from_le_bytes(offsets[0..4].try_into().unwrap()) != SHARD_MAGIC
+        {
+            return Err(anyhow!("bad shard header in {}", off_path.display()));
+        }
+        let n_rows = u64::from_le_bytes(offsets[8..16].try_into().unwrap()) as usize;
+        let edges = u64::from_le_bytes(offsets[16..24].try_into().unwrap());
+        if offsets.len() != SHARD_HEADER + (n_rows + 1) * 8 {
+            return Err(anyhow!("offsets length mismatch in {}", off_path.display()));
+        }
+        let srcs_file = std::fs::File::open(&srcs_path)?;
+        let srcs = unsafe { memmap2::Mmap::map(&srcs_file)? };
+        if srcs.len() as u64 != edges * 4 {
+            return Err(anyhow!("srcs length mismatch in {}", srcs_path.display()));
+        }
+        Ok(Shard { first_frame: lo, last_frame: hi, n_rows, edges, offsets, srcs })
+    }
+
+    /// Stream the chunks for frames lo..=hi twice (count, then scatter) into
+    /// a fresh shard. `n_rows` is the current row-table size.
+    fn build(dir: &Path, edge_dir: &Path, lo: u32, hi: u32, n_rows: usize) -> Result<Shard> {
+        let chunk_paths: Vec<std::path::PathBuf> =
+            (lo..=hi).map(|f| edge_dir.join(format!("f{:03}.bin", f))).collect();
+        let mut counts: Vec<u32> = vec![0; n_rows];
+        let mut edges: u64 = 0;
+        for chunk in &chunk_paths {
+            edges += checkpoint::stream_u32_pairs(chunk, |_, dst| {
+                counts[dst as usize] += 1;
+            })?;
+        }
+        let (off_path, srcs_path) = Self::paths(dir, lo, hi);
+        let tmp_off = off_path.with_extension("offsets.tmp");
+        let tmp_srcs = srcs_path.with_extension("srcs.tmp");
+        {
+            let off_file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_off)?;
+            off_file.set_len((SHARD_HEADER + (n_rows + 1) * 8) as u64)?;
+            let mut off_map = unsafe { memmap2::MmapMut::map_mut(&off_file)? };
+            off_map[0..4].copy_from_slice(&SHARD_MAGIC.to_le_bytes());
+            off_map[4..8].copy_from_slice(&0u32.to_le_bytes());
+            off_map[8..16].copy_from_slice(&(n_rows as u64).to_le_bytes());
+            off_map[16..24].copy_from_slice(&edges.to_le_bytes());
+            let mut acc: u64 = 0;
+            for (i, &c) in std::iter::once(&0u32).chain(counts.iter()).enumerate() {
+                acc += c as u64;
+                let at = SHARD_HEADER + i * 8;
+                off_map[at..at + 8].copy_from_slice(&acc.to_le_bytes());
+            }
+            if acc != edges {
+                return Err(anyhow!("shard count mismatch: {} != {}", acc, edges));
+            }
+            let srcs_file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_srcs)?;
+            srcs_file.set_len(edges * 4)?;
+            let mut srcs_map = unsafe { memmap2::MmapMut::map_mut(&srcs_file)? };
+            // Reuse counts as fill cursors relative to each row's offset.
+            for c in counts.iter_mut() {
+                *c = 0;
+            }
+            for chunk in &chunk_paths {
+                checkpoint::stream_u32_pairs(chunk, |src, dst| {
+                    let base_at = SHARD_HEADER + dst as usize * 8;
+                    let base =
+                        u64::from_le_bytes(off_map[base_at..base_at + 8].try_into().unwrap());
+                    let at = (base + counts[dst as usize] as u64) as usize * 4;
+                    srcs_map[at..at + 4].copy_from_slice(&src.to_le_bytes());
+                    counts[dst as usize] += 1;
+                })?;
+            }
+        }
+        std::fs::rename(&tmp_off, &off_path)?;
+        std::fs::rename(&tmp_srcs, &srcs_path)?;
+        Shard::open(dir, lo, hi)
+    }
+
+    #[inline]
+    fn for_each_pred(&self, v: u32, mut f: impl FnMut(u32)) {
+        let v = v as usize;
+        if v >= self.n_rows {
+            return;
+        }
+        let at = SHARD_HEADER + v * 8;
+        let lo = u64::from_le_bytes(self.offsets[at..at + 8].try_into().unwrap()) as usize;
+        let hi = u64::from_le_bytes(self.offsets[at + 8..at + 16].try_into().unwrap()) as usize;
+        for i in lo..hi {
+            let s = i * 4;
+            f(u32::from_le_bytes(self.srcs[s..s + 4].try_into().unwrap()));
+        }
+    }
+}
+
 pub struct SweepResult {
     /// Min frames to the room exit per row id; `G_UNREACHABLE` if none.
     pub g: Vec<u16>,
@@ -142,11 +306,7 @@ pub fn backward_sweep(
                     .ok_or_else(|| anyhow!("wins-f{:03}: id out of range", f))? = 0;
             }
             if f < frames {
-                let mut pairs: Vec<(u32, u32)> = Vec::new();
-                // Only the count is needed here; the pairs are re-read for
-                // the BFS load below. Read the header count cheaply.
-                checkpoint::read_u32_pairs_into(&chunk_path, &mut pairs)?;
-                edge_total += pairs.len() as u64;
+                edge_total += checkpoint::u32_pairs_count(&chunk_path)?;
                 edge_chunks.push(chunk_path);
             }
             continue;
@@ -308,68 +468,61 @@ pub fn backward_sweep(
     }
     drop(engine);
 
-    // Build a CSR predecessor structure by streaming the chunks twice:
-    // pass 1 counts per-dst degrees, pass 2 scatter-fills the srcs array.
-    // No global sort or dedup is needed - each row is expanded exactly once
-    // (in its discovery frame's chunk), so (src, dst) pairs are cross-chunk
-    // unique by construction, and within-chunk dedup already happened at
-    // write time. 4 bytes per edge instead of 8, no sort.
-    let edge_bytes_gb = edge_total as f64 * 4.0 / 1e9;
-    println!(
-        "sweep: building CSR over {} edges ({:.1} GB) for BFS",
-        edge_total, edge_bytes_gb
-    );
+    // CSR shards, incremental across horizons. A shard is a predecessor CSR
+    // (offsets + srcs, both file-backed mmaps - reclaimable page cache, not
+    // OOM-able anon memory) over a contiguous RANGE of frame chunks. Row
+    // ids are append-only across horizon extensions (the row table only
+    // grows), so old shards stay valid forever: a row newer than a shard
+    // simply has no entries in it, and a row's true predecessor list is the
+    // union across shards. Per horizon only the chunks no shard covers -
+    // the new frames - are streamed (twice, small); the old ~50 GB of edges
+    // is never re-decoded or re-scattered. No global sort or dedup is
+    // needed - each row is expanded exactly once (in its discovery frame's
+    // chunk), so (src, dst) pairs are cross-chunk unique by construction.
     let t = std::time::Instant::now();
-    let mut counts: Vec<u32> = vec![0; n_rows];
-    for chunk in &edge_chunks {
-        checkpoint::stream_u32_pairs(chunk, |_, dst| {
-            counts[dst as usize] += 1;
-        })?;
+    let shard_dir = edge_dir.join("shards");
+    std::fs::create_dir_all(&shard_dir)?;
+    // Legacy single-file CSR from the pre-shard code: rebuildable, drop it.
+    let _ = std::fs::remove_file(edge_dir.join("csr-srcs.bin"));
+    let mut shards = Shard::load_all(&shard_dir)?;
+    let covered = shards.iter().map(|s| s.last_frame).max().unwrap_or(0);
+    let last_chunk_frame = frames.saturating_sub(1);
+    for s in &shards {
+        if s.first_frame == 0 || s.first_frame > s.last_frame || s.last_frame > last_chunk_frame {
+            return Err(anyhow!(
+                "shard f{:03}-f{:03} is inconsistent with horizon {}",
+                s.first_frame,
+                s.last_frame,
+                frames
+            ));
+        }
     }
-    let mut offsets: Vec<u64> = Vec::with_capacity(n_rows + 1);
-    let mut acc: u64 = 0;
-    offsets.push(0);
-    for &c in &counts {
-        acc += c as u64;
-        offsets.push(acc);
+    if covered < last_chunk_frame {
+        let lo = covered + 1;
+        let hi = last_chunk_frame;
+        println!(
+            "sweep: building CSR shard f{:03}-f{:03} over the new chunks ({} shards reused)",
+            lo,
+            hi,
+            shards.len()
+        );
+        let shard = Shard::build(&shard_dir, &edge_dir, lo, hi, n_rows)?;
+        shards.push(shard);
+    } else {
+        println!("sweep: all {} CSR shards reused", shards.len());
     }
-    if acc != edge_total {
-        return Err(anyhow!("CSR count mismatch: {} != {}", acc, edge_total));
+    let shard_edge_total: u64 = shards.iter().map(|s| s.edges).sum();
+    if shard_edge_total != edge_total {
+        return Err(anyhow!(
+            "shard edge total {} != chunk edge total {} - stale shards? \
+             delete {} to rebuild",
+            shard_edge_total,
+            edge_total,
+            shard_dir.display()
+        ));
     }
-    // The srcs array is file-backed (mmap in the edge dir) rather than anon
-    // memory: at room-(0,0) scale it alone is ~47 GB, and as anon memory it
-    // OOMed the h82 sweep against the 100G cap. As page cache it is
-    // reclaimable - the kernel evicts and rereads instead of killing - and
-    // with the machine's free RAM it stays fully cached in practice, so the
-    // scatter-fill and the BFS's random reads run at memory speed. The
-    // file is deleted after the BFS (rebuildable from the chunks).
-    let csr_path = edge_dir.join("csr-srcs.bin");
-    let csr_file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&csr_path)?;
-    csr_file.set_len(edge_total * 4)?;
-    let mut srcs_mmap = unsafe { memmap2::MmapMut::map_mut(&csr_file)? };
-    let srcs: &mut [u8] = &mut srcs_mmap;
-    let mut cursor: Vec<u64> = offsets[..n_rows].to_vec();
-    for chunk in &edge_chunks {
-        checkpoint::stream_u32_pairs(chunk, |src, dst| {
-            let at = cursor[dst as usize] as usize * 4;
-            srcs[at..at + 4].copy_from_slice(&src.to_le_bytes());
-            cursor[dst as usize] += 1;
-        })?;
-    }
-    drop(counts);
-    drop(cursor);
-    let srcs = &*srcs_mmap;
-    let read_src = |edge_idx: usize| -> u32 {
-        let at = edge_idx * 4;
-        u32::from_le_bytes(srcs[at..at + 4].try_into().unwrap())
-    };
     let edge_count = edge_total as usize;
-    println!("sweep: CSR built in {:.1}s", t.elapsed().as_secs_f64());
+    println!("sweep: CSR ready in {:.1}s", t.elapsed().as_secs_f64());
     // Chunks stay on disk for incremental horizon extension.
 
     let t = std::time::Instant::now();
@@ -381,18 +534,15 @@ pub fn backward_sweep(
         let next = g[v as usize]
             .checked_add(1)
             .ok_or_else(|| anyhow!("g overflow"))?;
-        let range = offsets[v as usize] as usize..offsets[v as usize + 1] as usize;
-        for edge_idx in range {
-            let src = read_src(edge_idx);
-            if g[src as usize] == G_UNREACHABLE {
-                g[src as usize] = next;
-                queue.push_back(src);
-            }
+        for shard in &shards {
+            shard.for_each_pred(v, |src| {
+                if g[src as usize] == G_UNREACHABLE {
+                    g[src as usize] = next;
+                    queue.push_back(src);
+                }
+            });
         }
     }
-    drop(srcs_mmap);
-    // Rebuildable from the chunks; do not leave ~50 GB behind per horizon.
-    let _ = std::fs::remove_file(&csr_path);
     println!(
         "sweep: {} edges, {} win seeds, BFS in {:.1}s",
         edge_count,

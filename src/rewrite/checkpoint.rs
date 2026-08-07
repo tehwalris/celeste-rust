@@ -219,6 +219,18 @@ pub fn write_u32_pairs(path: &Path, pairs: &[(u32, u32)]) -> Result<()> {
     Ok(())
 }
 
+/// Just the pair count of a u32-pairs file - decodes only the first zstd
+/// block (the count is the first 8 payload bytes), not the payload. The
+/// sweep's chunk-reuse path used to fully decode every chunk (37 GB at
+/// room-(0,0) h88) per horizon just to read these counts.
+pub fn u32_pairs_count(path: &Path) -> Result<u64> {
+    use std::io::Read;
+    let mut r = read_bin_header_len(path)?;
+    let mut buf8 = [0u8; 8];
+    r.read_exact(&mut buf8)?;
+    Ok(u64::from_le_bytes(buf8))
+}
+
 /// Stream the pairs from `path` through `f` without materializing them.
 pub fn stream_u32_pairs(path: &Path, mut f: impl FnMut(u32, u32)) -> Result<u64> {
     let mut r = read_bin_header_len(path)?;
