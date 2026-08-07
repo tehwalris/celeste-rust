@@ -171,6 +171,18 @@ plain fallback (currently ~10x-chunked as mitigation):
    correct; the v1 comparison violates it. Likely shape: a tri-state
    bool value (MaybeVector of Option<bool>), definite lanes routed
    per-lane at branches, only the unknown sliver double-executed.
+   General form (Philippe): BATCHING INVARIANCE - for any partition
+   of a state set, running the parts separately and running the
+   concatenation must produce the same canonical outputs, modulo only
+   the declared widenings; SIMD-ness is a pure optimization, never a
+   behavior change. Certify mechanically with a `simdcheck` in the
+   deoptcheck/widencheck family (singleton-split vs batched runs,
+   observations compared per frame) - it becomes the tri-state work's
+   acceptance gate. Note: the v1 violation only INFLATES coarse
+   levels (a definite lane batched with a straddler gets dragged down
+   the wrong arm - sound over-approx, visible as extra rows); the
+   exact level k16 never sees interval comparisons (off concrete), so
+   the campaign's proof is insulated.
 2. select on an unknown condition resolves by EXPAND-STYLE LANE
    DUPLICATION (the btn fan-out machinery): each unresolved lane
    splits into its A- and B-resolution, exact and externally
