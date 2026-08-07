@@ -199,7 +199,7 @@ static FILTER_REASON_NANOS: [AtomicU64; REASON_COUNT] = [const { AtomicU64::new(
 /// merge could raise it.
 static FILTER_REASON_RUNS: [AtomicU64; REASON_COUNT] = [const { AtomicU64::new(0) }; REASON_COUNT];
 
-pub const REASON_COUNT: usize = 6;
+pub const REASON_COUNT: usize = 7;
 pub const REASON_NAMES: [&str; REASON_COUNT] = [
     "filter_branch",
     "filter_dedup",
@@ -207,6 +207,7 @@ pub const REASON_NAMES: [&str; REASON_COUNT] = [
     "filter_visited",
     "filter_deopt",
     "filter_band",
+    "filter_chunk",
 ];
 
 pub fn record_filter_reason(reason_index: usize, kept: usize, started: Option<std::time::Instant>) {

@@ -630,7 +630,46 @@ impl AbstractRun {
         let mut new_states = Vec::new();
         let mut frame_events = (0usize, 0usize);
         let mut variant_frame_events = (0usize, 0usize);
-        for state in std::mem::take(&mut self.states) {
+        // Lane-chunking (env-gated: CELESTE_MAX_STATE_LANES=N): split states
+        // above N lanes into <=N-lane chunks before the frame. Lanes are
+        // independent, so running chunks separately and re-merging at the
+        // boundary is semantics-preserving; what it changes is the PEAK -
+        // the mid-frame transient (fragments plus the heap's append-only
+        // storage) is proportional to the widest state in flight, and at
+        // room-(0,0) scale a single 12.5M-lane frame peaked at 98 GB. The
+        // cost is re-running per-chunk the work that is uniform across
+        // lanes.
+        let input_states: Vec<State> = {
+            let taken = std::mem::take(&mut self.states);
+            match std::env::var("CELESTE_MAX_STATE_LANES")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+            {
+                None => taken,
+                Some(cap) => {
+                    assert!(cap > 0, "CELESTE_MAX_STATE_LANES must be positive");
+                    let mut out = Vec::with_capacity(taken.len());
+                    for state in taken {
+                        if state.vector_size <= cap {
+                            out.push(state);
+                            continue;
+                        }
+                        let n = state.vector_size;
+                        for start in (0..n).step_by(cap) {
+                            let end = (start + cap).min(n);
+                            let mask: Vec<bool> =
+                                (0..n).map(|i| i >= start && i < end).collect();
+                            out.push(state.filter_by_mask_clone(
+                                &mask,
+                                crate::interpreter::state::FILTER_CHUNK,
+                            ));
+                        }
+                    }
+                    out
+                }
+            }
+        };
+        for state in input_states {
             // Shape dispatch first: a state whose object-array shape has a
             // registered variant runs under it (through canonical, both
             // ways) and skips the base path entirely. States the registry

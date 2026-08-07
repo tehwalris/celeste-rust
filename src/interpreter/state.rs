@@ -48,6 +48,11 @@ pub const FILTER_DEOPT: FilterReason = "filter_deopt";
 /// previous level's band (cannot be on a winning path within the horizon).
 pub const FILTER_BAND: FilterReason = "filter_band";
 
+/// Lane-chunking of oversized states before a frame (see
+/// `AbstractRun::step`, CELESTE_MAX_STATE_LANES): pure mechanics, no
+/// semantic filtering - the chunks re-merge at the boundary.
+pub const FILTER_CHUNK: FilterReason = "filter_chunk";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct State {
     pub heap: Heap,

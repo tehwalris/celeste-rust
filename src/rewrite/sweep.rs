@@ -329,17 +329,38 @@ pub fn backward_sweep(
     if acc != edge_total {
         return Err(anyhow!("CSR count mismatch: {} != {}", acc, edge_total));
     }
-    let mut srcs: Vec<u32> = vec![0; edge_total as usize];
+    // The srcs array is file-backed (mmap in the edge dir) rather than anon
+    // memory: at room-(0,0) scale it alone is ~47 GB, and as anon memory it
+    // OOMed the h82 sweep against the 100G cap. As page cache it is
+    // reclaimable - the kernel evicts and rereads instead of killing - and
+    // with the machine's free RAM it stays fully cached in practice, so the
+    // scatter-fill and the BFS's random reads run at memory speed. The
+    // file is deleted after the BFS (rebuildable from the chunks).
+    let csr_path = edge_dir.join("csr-srcs.bin");
+    let csr_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&csr_path)?;
+    csr_file.set_len(edge_total * 4)?;
+    let mut srcs_mmap = unsafe { memmap2::MmapMut::map_mut(&csr_file)? };
+    let srcs: &mut [u8] = &mut srcs_mmap;
     let mut cursor: Vec<u64> = offsets[..n_rows].to_vec();
     for chunk in &edge_chunks {
         checkpoint::stream_u32_pairs(chunk, |src, dst| {
-            let at = cursor[dst as usize];
-            srcs[at as usize] = src;
-            cursor[dst as usize] = at + 1;
+            let at = cursor[dst as usize] as usize * 4;
+            srcs[at..at + 4].copy_from_slice(&src.to_le_bytes());
+            cursor[dst as usize] += 1;
         })?;
     }
     drop(counts);
     drop(cursor);
+    let srcs = &*srcs_mmap;
+    let read_src = |edge_idx: usize| -> u32 {
+        let at = edge_idx * 4;
+        u32::from_le_bytes(srcs[at..at + 4].try_into().unwrap())
+    };
     let edge_count = edge_total as usize;
     println!("sweep: CSR built in {:.1}s", t.elapsed().as_secs_f64());
     // Chunks stay on disk for incremental horizon extension.
@@ -354,13 +375,17 @@ pub fn backward_sweep(
             .checked_add(1)
             .ok_or_else(|| anyhow!("g overflow"))?;
         let range = offsets[v as usize] as usize..offsets[v as usize + 1] as usize;
-        for &src in &srcs[range] {
+        for edge_idx in range {
+            let src = read_src(edge_idx);
             if g[src as usize] == G_UNREACHABLE {
                 g[src as usize] = next;
                 queue.push_back(src);
             }
         }
     }
+    drop(srcs_mmap);
+    // Rebuildable from the chunks; do not leave ~50 GB behind per horizon.
+    let _ = std::fs::remove_file(&csr_path);
     println!(
         "sweep: {} edges, {} win seeds, BFS in {:.1}s",
         edge_count,
