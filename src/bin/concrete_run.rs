@@ -283,10 +283,15 @@ fn main() -> Result<()> {
     // Load and compile the game
     let level_3 = std::fs::read_to_string("lua/builtin_level_3.lua")?;
     let level_4 = std::fs::read_to_string("lua/builtin_level_4.lua")?;
-    let game = std::fs::read_to_string("lua/celeste-minimal.lua")?;
+    // apply_start_room, or CELESTE_START_ROOM runs a franken-room: the
+    // collision cache follows the configured room (via the fixed env) while
+    // the raw lua still loads (1, 0) - which is exactly what happened when
+    // the proven room-(0,0) TAS "failed" to replay here while both
+    // canonical replays won.
+    let game = celeste_rust::game_runner::apply_start_room(
+        &std::fs::read_to_string("lua/celeste-minimal.lua")?,
+    )?;
 
-    // For concrete execution, we don't call __reset_button_states after init
-    // We'll set buttons manually before each frame
     let init_suffix = r#"
 _init()
 __reset_button_states()
@@ -322,9 +327,14 @@ __reset_button_states()
     }
 
     // Compile frame code (without button reset - we'll do it manually)
+    // Must match program::FRAME_CODE exactly: without the button-state
+    // reset, the p_jump/p_dash press-edge trails corrupt across frames and
+    // precisely-timed dashes fizzle (this desynced the proven room-(0,0)
+    // 94-frame TAS while the canonical replays won with it).
     let frame_code = r#"
 _update()
 _draw()
+__reset_button_states()
 "#;
     let frame_ast = full_moon::parse(frame_code).expect("Failed to parse frame code");
     let (frame_cfg, frame_fun_defs) = frontend::compile(&frame_ast).expect("Failed to compile frame");

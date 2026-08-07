@@ -1,5 +1,41 @@
 # Room (0,0) "100 m": multi-variant specialization + the fake wall
 
+## RESULT (2026-08-07): CONCRETE OPTIMUM = 94 FRAMES - PROVEN
+
+The optimal TAS for room (0,0), with the breakable strawberry wall
+fully modeled, is 94 frames (28-frame spawn + 66 input frames) - exact
+parity with the community TAS database's 66-input record, which is
+hereby proven optimal. The optimal route runs RIGHT, up the stair
+blocks, exiting at the top-right corner (x=103, y<-4 at f94); it never
+touches the fake wall - the berry-bounce speed tech is proven
+non-optimal, not just assumed.
+
+Certificates, all three in agreement:
+- Ladder: horizons 80-87 refuted at k=1, 88-90 at k=3, 91 at k=4,
+  92 at k=5, 93 at k=7; horizon 94 converged through ALL levels
+  k=1..16 with min(e+g)=94 at every level (level-0 abstract bound 80).
+- extract-tas walked the k=16 exact band greedily to a concrete
+  94-frame input sequence (tas/room_0_0_exit_frame_94.txt), final row
+  g=0, player concretely in room (1,0). Ran under the RECIPE program.
+- trace-witness replayed that TAS under the PLAIN program: in every
+  probed level's band at every frame, e+g=94 throughout, g=0 at f94.
+- concrete_run (standalone tool) reproduces the win at f94 after
+  fixing its two bugs (below).
+
+Known-deviation note: the community TAS's byte stream does NOT replay
+under celeste-minimal - expected, since minimal drops the jump buffer
+(the documented deviation) that console TASes lean on. The equal
+frame counts cross-validate both results; the byte streams are not
+interchangeable.
+
+Tool bugs found by the closure gates (both fixed):
+- concrete_run never applied apply_start_room: under
+  CELESTE_START_ROOM it simulated a franken-room ((1,0) objects with
+  the configured room's collision cache). This also explains the
+  early hand-TAS confusion in the recon phase.
+- player_xy_per_lane read objects[1] (the fake wall in this room)
+  instead of finding the player by type.
+
 Goal: prove the optimal TAS for the FIRST room, including the
 breakable hidden-strawberry wall. This is a NEW result - both the
 2022 solver and the current campaign skipped 100 m precisely because

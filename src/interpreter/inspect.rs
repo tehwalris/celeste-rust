@@ -1111,11 +1111,22 @@ pub fn room_x_lane_mask(state: &State, x: i16) -> Vec<bool> {
 pub fn player_xy_per_lane(state: &State) -> Option<Vec<(i16, i16)>> {
     let helper = StateHelper::new(state);
     let arr_id = helper.get_objects_array_id()?;
-    let HeapValue::ArrayTable(items) = helper.load(arr_id) else { return None };
-    let first = *items.first()?;
-    // One indirection per element: the array slot holds a pointer cell.
-    let HeapValue::Value(Value::Pointer(obj_id)) = helper.load(first) else { return None };
-    let HeapValue::ObjectTable(obj) = helper.load(*obj_id) else { return None };
+    // Find the object BY TYPE, not by slot: in multi-object rooms the first
+    // slot can be the fake_wall (this silently reported the wall's (8, 32)
+    // as "the player" throughout room (0,0) until the witness-position
+    // instrumentation exposed it). Fall back to player_spawn so the spawn
+    // phase still reports a position.
+    let obj_id = helper
+        .find_objects_by_type(arr_id, "player")
+        .ok()
+        .and_then(|v| v.first().copied())
+        .or_else(|| {
+            helper
+                .find_objects_by_type(arr_id, "player_spawn")
+                .ok()
+                .and_then(|v| v.first().copied())
+        })?;
+    let HeapValue::ObjectTable(obj) = helper.load(obj_id) else { return None };
     let axis = |name: &str| -> Option<Vec<i16>> {
         let cell = *obj.get(name)?;
         let HeapValue::Value(Value::Number(n)) = helper.load(cell) else { return None };

@@ -1,0 +1,6 @@
+# Room (0,0) '100 m' optimal TAS: room exit (next_room to (1,0)) at frame 94.
+# Proven optimal by the full precision ladder (horizons 80-93 refuted,
+# h94 converged k=1..16 with min(e+g)=94 at every level), with the
+# breakable strawberry wall fully modeled - the optimal route never
+# breaks it. Extracted 2026-08-07 by extract-tas from the k=16 band.
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,18,2,2,42,0,0,0,0,0,0,16,0,0,34,0,0,0,0,0,0,34,0,0,0,0,0,0,16,0,0,0,0,0,16,0,0,0,0,0,0,0,38,0,0,0,0,0,0,0,0,0,2,2,18,0,2,2,2,2,36,0,0,0,0,0

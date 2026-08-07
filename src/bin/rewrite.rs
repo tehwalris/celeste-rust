@@ -2269,7 +2269,12 @@ fn main() -> Result<()> {
                 // Canonicalize per level and probe.
                 let mut canon = state.clone();
                 mapping.from_canonical(&mut canon)?;
-                let mut line = format!("f{:03}:", frame);
+                let pos = celeste_rust::interpreter::inspect::player_xy_per_lane(&state)
+                    .and_then(|v| v.first().copied());
+                let mut line = match pos {
+                    Some((x, y)) => format!("f{:03} ({:>3},{:>3}):", frame, x, y),
+                    None => format!("f{:03} (no player):", frame),
+                };
                 for level in &level_data {
                     let mut s = make_state_abstract_rem(canon.clone(), level.precision);
                     s = apply_conservative_widenings(s);
