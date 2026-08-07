@@ -753,7 +753,17 @@ impl AbstractRun {
                         // uniform cap).
                         let cap = match crate::interpreter::inspect::object_shape(&state) {
                             Ok(shape) if shape.iter().any(|t| t == "fruit") => {
-                                (cap / 10).max(1)
+                                // Divisor tunable per context: the sweep's
+                                // origin-tagged replays block all dedup, so
+                                // the fruit UnknownBool doubling multiplies
+                                // on the full 64-input fan-out and needs far
+                                // smaller chunks than the forward pass.
+                                let div: usize =
+                                    std::env::var("CELESTE_FRUIT_CHUNK_DIVISOR")
+                                        .ok()
+                                        .and_then(|v| v.parse().ok())
+                                        .unwrap_or(10);
+                                (cap / div.max(1)).max(1)
                             }
                             _ => cap,
                         };
