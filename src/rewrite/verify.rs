@@ -650,6 +650,20 @@ impl AbstractRun {
                     assert!(cap > 0, "CELESTE_MAX_STATE_LANES must be positive");
                     let mut out = Vec::with_capacity(taken.len());
                     for state in taken {
+                        // Fruit-bearing states get a 10x tighter cap: their
+                        // frames run under the plain program (the recipe path
+                        // hits select-on-UnknownBool) where the widened
+                        // fruit's UnknownBool collide branches copy ALL lanes
+                        // down both arms repeatedly - the transient per input
+                        // lane is an order of magnitude above a normal
+                        // state's (h89 OOMed on exactly this with the
+                        // uniform cap).
+                        let cap = match crate::interpreter::inspect::object_shape(&state) {
+                            Ok(shape) if shape.iter().any(|t| t == "fruit") => {
+                                (cap / 10).max(1)
+                            }
+                            _ => cap,
+                        };
                         if state.vector_size <= cap {
                             out.push(state);
                             continue;
