@@ -155,6 +155,25 @@ abstraction-level. Options considered:
    bites once off >= 40; at f79 all cohorts are still below 17.
    Worth doing regardless; not sufficient alone.
 
+## Queued after convergence: the fruit fast path (spec'd 2026-08-07)
+
+Two-part fix so fruit states run the recipe instead of whole-state
+plain fallback (currently ~10x-chunked as mitigation):
+
+1. Per-lane tri-state interval comparisons: only genuinely straddling
+   lanes lose definiteness. The v1 collapses the whole value to
+   UnknownBool when ANY lane straddles, which in a million-lane state
+   is always - it destroyed the sliver (h89: 5.9M lanes deopted for
+   what per-lane analysis would have made a few thousand).
+2. select on an unknown condition resolves by EXPAND-STYLE LANE
+   DUPLICATION (the btn fan-out machinery): each unresolved lane
+   splits into its A- and B-resolution, exact and externally
+   invisible. Explicitly REJECTED (Philippe 2026-08-07): the numeric
+   interval-hull shortcut - select(unknown, 3, 7) -> [3, 7] admits
+   values no execution produces and decouples the value from its
+   condition; a semantic widening hidden in an instruction rather
+   than a declared per-level abstraction. Duplication only.
+
 ## Room (0,0) layout (from cart map, for route planning)
 
 Spawn (8,112) bottom-left; fake wall x 8-23, y 32-47, resting on a
