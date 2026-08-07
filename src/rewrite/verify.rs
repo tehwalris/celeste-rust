@@ -363,6 +363,90 @@ struct VariantDispatch {
     total_fallbacks: usize,
 }
 
+/// Aggregated counters for the streaming boundary pipeline.
+#[derive(Default)]
+struct StreamCounters {
+    band_before: usize,
+    band_after: usize,
+    band_missing: usize,
+    sub_before: usize,
+    sub_after: usize,
+}
+
+/// Streaming boundary pipeline (env CELESTE_STREAM_BOUNDARY, frontier-only
+/// runs): abstract, band-filter and visited-subtract one frame-output state
+/// as soon as it is produced, so only SURVIVING lanes are ever held for the
+/// end-of-frame merge. Without this, every chunk's raw outputs accumulate
+/// until the frame ends - ~30M pre-dedup lanes at room-(0,0) f89, which is
+/// what kept OOMing the level-0 extends no matter how inputs were chunked.
+/// Semantics are unchanged: the per-state pipeline is exactly the phased
+/// one (abstraction and band tests are per-lane; the visited set is "rows
+/// ever seen", so subtracting incrementally as it grows kills cross-chunk
+/// duplicates the same way the final dedup did).
+fn stream_boundary_one(
+    state: State,
+    band: Option<&BandFilter>,
+    frame: u32,
+    visited: &mut crate::interpreter::row_table::RowTable,
+    counters: &mut StreamCounters,
+) -> Result<Vec<State>> {
+    let mut kept_out = Vec::new();
+    for state in crate::interpreter::inspect::split_rem_straddles(state) {
+        let state = make_state_abstract(state);
+        let state = if let Some(band) = band {
+            counters.band_before += state.vector_size;
+            let budget = band.horizon.saturating_sub(frame);
+            let mut coarse = crate::interpreter::inspect::make_state_abstract_rem(
+                state.clone(),
+                band.prev_precision,
+            );
+            coarse.gc();
+            let keys = super::sweep::row_keys(&coarse)?;
+            let mask: Vec<bool> = keys
+                .iter()
+                .map(|k| match band.prev_table.id_of(*k) {
+                    Some(id) => {
+                        let e = band.prev_table.earliest_frame(id).unwrap_or(u32::MAX);
+                        let g = band.g_prev[id as usize];
+                        e <= frame
+                            && g != super::sweep::G_UNREACHABLE
+                            && (g as u32) <= budget
+                    }
+                    None => {
+                        counters.band_missing += 1;
+                        false
+                    }
+                })
+                .collect();
+            let kept = mask.iter().filter(|b| **b).count();
+            counters.band_after += kept;
+            if kept == state.vector_size {
+                state
+            } else if kept > 0 {
+                state.filter_by_mask_clone(&mask, crate::interpreter::state::FILTER_BAND)
+            } else {
+                continue;
+            }
+        } else {
+            state
+        };
+        // Row hashing is heap-layout-sensitive on raw interpreter fragments;
+        // the phased path subtracts vectorize-canonicalized states, and the
+        // witness/extract probes gc before hashing and match those tables -
+        // gc IS the canonicalizer. Without this, the same logical row
+        // arrives under different hashes on different paths and the visited
+        // set double-counts (measured: 2x visited, +10% spurious frontier).
+        let mut state = state;
+        state.gc();
+        let (kept, before, after) =
+            crate::interpreter::vectorize::subtract_visited(vec![state], visited);
+        counters.sub_before += before;
+        counters.sub_after += after;
+        kept_out.extend(kept);
+    }
+    Ok(kept_out)
+}
+
 /// Outcome of offering a state to the variant registry for one frame.
 enum VariantOutcome {
     /// The variant ran the frame; outputs are back in base layout.
@@ -630,6 +714,15 @@ impl AbstractRun {
         let mut new_states = Vec::new();
         let mut frame_events = (0usize, 0usize);
         let mut variant_frame_events = (0usize, 0usize);
+        // Streaming boundary mode: see `stream_boundary_one`. Only
+        // meaningful with the frontier subtract on, and mutually exclusive
+        // with the widencheck's rem-only abstraction.
+        let stream = std::env::var_os("CELESTE_STREAM_BOUNDARY").is_some()
+            && self.visited_rows.is_some()
+            && !self.rem_only_abstraction;
+        let frame_no = self.states_before_merge.len() as u32 + 1;
+        let mut stream_counters = StreamCounters::default();
+        let mut stream_survivors: Vec<State> = Vec::new();
         // Lane-chunking (env-gated: CELESTE_MAX_STATE_LANES=N): split states
         // above N lanes into <=N-lane chunks before the frame. Lanes are
         // independent, so running chunks separately and re-merging at the
@@ -774,6 +867,25 @@ impl AbstractRun {
                     }
                 }
             }
+            // Streaming mode: drain this input state's outputs through the
+            // boundary pipeline immediately, so raw outputs never
+            // accumulate across chunks.
+            if stream {
+                let band = self.band.as_ref();
+                let visited = self
+                    .visited_rows
+                    .as_mut()
+                    .expect("stream implies a visited table");
+                for out in new_states.drain(..) {
+                    stream_survivors.extend(stream_boundary_one(
+                        out,
+                        band,
+                        frame_no,
+                        visited,
+                        &mut stream_counters,
+                    )?);
+                }
+            }
         }
         if let Some(deopt) = self.deopt.as_mut() {
             deopt.total_events.0 += frame_events.0;
@@ -790,6 +902,50 @@ impl AbstractRun {
                 "  variant: {} state(s) / {} lanes ran under shape variants",
                 variant_frame_events.0, variant_frame_events.1
             );
+        }
+        if stream {
+            // Everything already went through abstraction, band and
+            // subtract per state; merge the survivors and report the
+            // aggregate counters in the usual formats.
+            self.states_before_merge.push(stream_survivors.len());
+            self.states = {
+                let _trace = crate::interpreter::tracing::TraceSpan::new(
+                    "merge_frame_boundary",
+                    "merge_site",
+                );
+                vectorize_states(stream_survivors)
+            };
+            if self.band.is_some() {
+                println!(
+                    "  band: {} -> {} lanes in band{}",
+                    stream_counters.band_before,
+                    stream_counters.band_after,
+                    if stream_counters.band_missing > 0 {
+                        format!(
+                            " ({} lanes with unknown coarse rows dropped)",
+                            stream_counters.band_missing
+                        )
+                    } else {
+                        String::new()
+                    }
+                );
+            }
+            let visited = self.visited_rows.as_mut().expect("stream implies visited");
+            visited.end_frame();
+            println!(
+                "  frontier-only: {} -> {} new lanes, visited total {}",
+                stream_counters.sub_before,
+                stream_counters.sub_after,
+                visited.len()
+            );
+            if std::env::var_os("CELESTE_BOUNDARY_GC").is_some() {
+                let _trace =
+                    crate::interpreter::tracing::TraceSpan::new("boundary_gc", "gc");
+                for state in &mut self.states {
+                    state.gc();
+                }
+            }
+            return Ok(());
         }
         let new_states: Vec<State> = if self.rem_only_abstraction {
             new_states
