@@ -311,8 +311,10 @@ pub fn backward_sweep(
             }
             continue;
         }
-        let states = checkpoint::load_frame_states(dir, f)
-            .with_context(|| format!("loading frame batch f{:03}", f))?;
+        let states = crate::metrics::time("bwd.load_batch", || {
+            checkpoint::load_frame_states(dir, f)
+                .with_context(|| format!("loading frame batch f{:03}", f))
+        })?;
         if states.is_empty() {
             checkpoint::write_u32_pairs(&wins_path, &[])?;
             if f < frames {
@@ -405,9 +407,11 @@ pub fn backward_sweep(
             let deopt_events = engine.deopt_events();
             engine.restore(std::mem::take(&mut chunk), None, deopt_events)?;
             chunk_lanes = 0;
-            engine
-                .step()
-                .with_context(|| format!("expanding frame batch f{:03}", f))?;
+            crate::metrics::time("bwd.replay", || {
+                engine
+                    .step()
+                    .with_context(|| format!("expanding frame batch f{:03}", f))
+            })?;
             for out in engine.states() {
                 let origins = deopt_collect::read_origins_named(out, SWEEP_ORIGIN);
                 let mut stripped = out.clone();
@@ -506,7 +510,8 @@ pub fn backward_sweep(
             hi,
             shards.len()
         );
-        let shard = Shard::build(&shard_dir, &edge_dir, lo, hi, n_rows)?;
+        let shard =
+            crate::metrics::time("bwd.shard_build", || Shard::build(&shard_dir, &edge_dir, lo, hi, n_rows))?;
         shards.push(shard);
     } else {
         println!("sweep: all {} CSR shards reused", shards.len());
@@ -526,6 +531,8 @@ pub fn backward_sweep(
     // Chunks stay on disk for incremental horizon extension.
 
     let t = std::time::Instant::now();
+    let _t_bfs = crate::metrics::time("bwd.bfs", || ());
+    let t_bfs = std::time::Instant::now();
     let mut queue: std::collections::VecDeque<u32> = (0..n_rows as u32)
         .filter(|&id| g[id as usize] == 0)
         .collect();
@@ -543,6 +550,7 @@ pub fn backward_sweep(
             });
         }
     }
+    crate::metrics::record("bwd.bfs", t_bfs.elapsed());
     println!(
         "sweep: {} edges, {} win seeds, BFS in {:.1}s",
         edge_count,

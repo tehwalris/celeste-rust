@@ -467,7 +467,9 @@ fn bench(
         run.step()?;
         if let Some(cfg) = checkpoint.as_ref() {
             if cfg.save_frames {
-                checkpoint::save_frame_states(&cfg.dir, frame, run.states())?;
+                celeste_rust::metrics::time("fwd.save_frames", || {
+                    checkpoint::save_frame_states(&cfg.dir, frame, run.states())
+                })?;
             }
             if frame % cfg.every == 0 || frame == frames {
                 let t = std::time::Instant::now();
@@ -542,6 +544,15 @@ fn bench(
         println!("first room-exit lanes appeared at frame {}", frame);
     }
     let elapsed = start.elapsed();
+    celeste_rust::metrics::dump(
+        "bench",
+        checkpoint.as_ref().map(|c| c.dir.as_path()),
+        &[
+            ("frames", frames.to_string()),
+            ("lanes", run.lane_count().to_string()),
+            ("peak_rss_kb", peak_rss_kb().to_string()),
+        ],
+    );
     let lanes = run.lane_count();
     let heap_len: usize = run.states().iter().map(|s| s.heap.len()).max().unwrap_or(0);
     let env_len: usize = run
@@ -2695,6 +2706,16 @@ fn main() -> Result<()> {
                     println!("  f{:03}: {}", f, size);
                 }
             }
+            celeste_rust::metrics::dump(
+                "sweep",
+                Some(dir.as_path()),
+                &[
+                    ("frames", frames.to_string()),
+                    ("horizon", horizon.to_string()),
+                    ("edges", result.edge_count.to_string()),
+                    ("rows", result.g.len().to_string()),
+                ],
+            );
         }
         Command::Bisect { frames } => {
             let baseline = Program::compile_from_disk()?;

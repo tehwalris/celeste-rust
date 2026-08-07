@@ -363,6 +363,19 @@ struct VariantDispatch {
     total_fallbacks: usize,
 }
 
+/// Records a coarse phase duration on drop (see `crate::metrics`).
+struct ScopedPhase(&'static str, std::time::Instant);
+impl ScopedPhase {
+    fn new(name: &'static str) -> Self {
+        Self(name, std::time::Instant::now())
+    }
+}
+impl Drop for ScopedPhase {
+    fn drop(&mut self) {
+        crate::metrics::record(self.0, self.1.elapsed());
+    }
+}
+
 /// Aggregated counters for the streaming boundary pipeline.
 #[derive(Default)]
 struct StreamCounters {
@@ -792,6 +805,7 @@ impl AbstractRun {
             // ways) and skips the base path entirely. States the registry
             // does not cover - and the loud fallback of a failing variant
             // frame - continue into the base path below.
+            let t_interpret = std::time::Instant::now();
             let state = if let Some(vd) = self.variants.as_mut() {
                 let before = vd.total_events;
                 match dispatch_variant_frame(vd, state) {
@@ -799,6 +813,7 @@ impl AbstractRun {
                         variant_frame_events.0 += vd.total_events.0 - before.0;
                         variant_frame_events.1 += vd.total_events.1 - before.1;
                         new_states.extend(outputs);
+                        crate::metrics::record("fwd.interpret", t_interpret.elapsed());
                         continue;
                     }
                     VariantOutcome::Base(state) => state,
@@ -877,10 +892,12 @@ impl AbstractRun {
                     }
                 }
             }
+            crate::metrics::record("fwd.interpret", t_interpret.elapsed());
             // Streaming mode: drain this input state's outputs through the
             // boundary pipeline immediately, so raw outputs never
             // accumulate across chunks.
             if stream {
+                let _t = ScopedPhase::new("fwd.boundary_stream");
                 let band = self.band.as_ref();
                 let visited = self
                     .visited_rows
@@ -919,6 +936,7 @@ impl AbstractRun {
             // aggregate counters in the usual formats.
             self.states_before_merge.push(stream_survivors.len());
             self.states = {
+                let _t = ScopedPhase::new("fwd.merge");
                 let _trace = crate::interpreter::tracing::TraceSpan::new(
                     "merge_frame_boundary",
                     "merge_site",
@@ -957,20 +975,24 @@ impl AbstractRun {
             }
             return Ok(());
         }
-        let new_states: Vec<State> = if self.rem_only_abstraction {
-            new_states
-                .into_iter()
-                .map(crate::interpreter::inspect::make_state_abstract_rem_only)
-                .collect()
-        } else {
-            new_states
-                .into_iter()
-                .flat_map(crate::interpreter::inspect::split_rem_straddles)
-                .map(make_state_abstract)
-                .collect()
+        let new_states: Vec<State> = {
+            let _t = ScopedPhase::new("fwd.abstract");
+            if self.rem_only_abstraction {
+                new_states
+                    .into_iter()
+                    .map(crate::interpreter::inspect::make_state_abstract_rem_only)
+                    .collect()
+            } else {
+                new_states
+                    .into_iter()
+                    .flat_map(crate::interpreter::inspect::split_rem_straddles)
+                    .map(make_state_abstract)
+                    .collect()
+            }
         };
         self.states_before_merge.push(new_states.len());
         self.states = {
+            let _t = ScopedPhase::new("fwd.merge");
             let _trace = crate::interpreter::tracing::TraceSpan::new(
                 "merge_frame_boundary",
                 "merge_site",
