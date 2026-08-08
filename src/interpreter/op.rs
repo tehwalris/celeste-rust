@@ -71,9 +71,29 @@ pub fn interpret_unary_op(state: &State, op: UnaryOp, v: &Value) -> Result<Value
 /// Keep the flag: the lane-independence property it restores is worth
 /// having, and the diagnosis needs the code. But the default must be the
 /// path we know completes.
+/// 0 = not yet read, 1 = off, 2 = on. An atomic rather than a OnceLock so
+/// tests can drive both paths; the env var is the default, read once.
+static TRI_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 fn tri_state_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CELESTE_TRI_STATE").is_some())
+    use std::sync::atomic::Ordering;
+    match TRI_STATE.load(Ordering::Relaxed) {
+        0 => {
+            let on = std::env::var_os("CELESTE_TRI_STATE").is_some();
+            TRI_STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+        1 => false,
+        _ => true,
+    }
+}
+
+/// Force the tri-state path on or off, overriding the environment.
+/// For tests, which must be able to exercise both paths regardless of how
+/// the suite was invoked.
+#[cfg(test)]
+pub fn set_tri_state(on: bool) {
+    TRI_STATE.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Helper to lift a number to an interval

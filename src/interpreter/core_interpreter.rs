@@ -958,9 +958,10 @@ mod expand_tests {
     /// select succeeds.
     #[test]
     fn a_straddling_lane_no_longer_poisons_the_select() {
-        use crate::interpreter::op::{interpret_binary_op, interpret_select};
+        use crate::interpreter::op::{interpret_binary_op, interpret_select, set_tri_state};
         use crate::ir::BinaryOp;
         use crate::pico8_num::Pico8NumInterval;
+        set_tri_state(true);
 
         let n = |v: i16| Pico8Num::from_i16(v);
         // Lane 0: [0,1] < 10   -> definitely true
@@ -1005,9 +1006,10 @@ mod expand_tests {
     /// pre-existing paths are bit-for-bit unchanged.
     #[test]
     fn an_all_straddling_comparison_is_still_unknown_bool() {
-        use crate::interpreter::op::interpret_binary_op;
+        use crate::interpreter::op::{interpret_binary_op, set_tri_state};
         use crate::ir::BinaryOp;
         use crate::pico8_num::Pico8NumInterval;
+        set_tri_state(true);
 
         let n = |v: i16| Pico8Num::from_i16(v);
         let straddling = Value::NumberInterval(MaybeVector::vector(vec![
