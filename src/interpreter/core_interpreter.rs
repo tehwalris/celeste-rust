@@ -528,6 +528,14 @@ impl<'a> CoreInterpreter<'a> {
                 )
             })?;
         if let Some(value) = value {
+            // The one place a transient tri-state becomes a stored value.
+            // Resolving here - rather than at each consumer - is what lets
+            // `select` and the branch machinery stay untouched: by the time
+            // they read a cell, its condition is definite.
+            let value = match value {
+                Value::MaybeBool(tri) => resolve_maybe_bool(&mut self.state, tri),
+                definite => definite,
+            };
             self.state.local_env.set(local_id, value);
         }
         Ok(())
@@ -726,6 +734,45 @@ impl<'a> CoreInterpreter<'a> {
     }
 }
 
+/// Turn a transient `MaybeBool` into a definite `Bool`, widening the state
+/// so that every ambiguous lane exists twice: the original resolved TRUE
+/// and an appended copy resolved FALSE.
+///
+/// This is the whole tri-state mechanism. It is exact rather than an
+/// approximation: the lane's interval genuinely admits both outcomes, so
+/// both successors are reachable and listing both is what the abstraction
+/// already means. Nothing is invented - which is why hulling the two arms
+/// into one interval was rejected: that admits values no execution produces.
+///
+/// Definite lanes are untouched, so no lane's imprecision can reach a
+/// neighbour (the LANE INDEPENDENCE criterion in plans/tristate-plan.md).
+pub fn resolve_maybe_bool(state: &mut State, tri: MaybeVector<Option<bool>>) -> Value {
+    let n = state.vector_size;
+    let per_lane: Vec<Option<bool>> = match &tri {
+        MaybeVector::Scalar(t) => vec![*t; n],
+        MaybeVector::Vector(v) => {
+            assert_eq!(v.len(), n, "tri-state width must match the state's lanes");
+            v.as_ref().clone()
+        }
+    };
+    let ambiguous: Vec<bool> = per_lane.iter().map(|t| t.is_none()).collect();
+    let extra = crate::interpreter::value::count_true(&ambiguous);
+    if extra == 0 {
+        // All definite: identical to what the comparison used to return.
+        return Value::Bool(MaybeVector::vector(
+            per_lane.into_iter().map(|t| t.unwrap()).collect(),
+        ));
+    }
+    state.duplicate_lanes(&ambiguous);
+    // Originals: definite lanes keep their answer, ambiguous ones take the
+    // TRUE resolution. Appended copies (in ambiguous-lane order, matching
+    // `duplicate_lanes`) take the FALSE one.
+    let mut lanes: Vec<bool> = per_lane.iter().map(|t| t.unwrap_or(true)).collect();
+    lanes.resize(n + extra, false);
+    Value::Bool(MaybeVector::vector(lanes))
+}
+
+
 #[cfg(test)]
 mod expand_tests {
     use super::*;
@@ -828,5 +875,82 @@ mod expand_tests {
         let (state, _) = three_lane_state();
         let error = format!("{:#}", run_expand(state, id(1)).unwrap_err());
         assert!(error.contains("expected a bool"), "{}", error);
+    }
+
+    /// Only the ambiguous lanes duplicate - the point of the whole design.
+    /// Three lanes, one ambiguous: four lanes out, not six.
+    #[test]
+    fn resolve_duplicates_only_the_ambiguous_lanes() {
+        let (mut state, cell) = three_lane_state();
+        let tri = MaybeVector::vector(vec![Some(true), None, Some(false)]);
+        let resolved = resolve_maybe_bool(&mut state, tri);
+
+        assert_eq!(state.vector_size, 4, "one ambiguous lane adds exactly one");
+        // Originals keep their answers; the ambiguous one resolves true and
+        // its appended copy resolves false.
+        assert_eq!(
+            resolved,
+            Value::Bool(MaybeVector::vector(vec![true, true, false, false]))
+        );
+        // The duplicated lane carries the ambiguous lane's DATA, so the
+        // appended lane must equal lane 1 in every other column.
+        match state.heap.get(cell) {
+            HeapValue::Value(Value::Number(MaybeVector::Vector(nums))) => {
+                assert_eq!(nums.len(), 4);
+                assert_eq!(nums[3], nums[1], "copy must carry the source lane's data");
+            }
+            other => panic!("unexpected cell {:?}", other),
+        }
+    }
+
+    /// An all-definite tri-state must behave exactly as the old code did:
+    /// a plain Bool and no widening at all.
+    #[test]
+    fn resolve_is_a_no_op_when_every_lane_is_definite() {
+        let (mut state, _) = three_lane_state();
+        let tri = MaybeVector::vector(vec![Some(true), Some(false), Some(true)]);
+        let resolved = resolve_maybe_bool(&mut state, tri);
+        assert_eq!(state.vector_size, 3);
+        assert_eq!(
+            resolved,
+            Value::Bool(MaybeVector::vector(vec![true, false, true]))
+        );
+    }
+
+    /// LANE INDEPENDENCE in miniature: a definite lane's answer must not
+    /// depend on whether an ambiguous lane shares its state. Resolving
+    /// lane 0 alone and resolving it batched must agree.
+    #[test]
+    fn a_definite_lane_is_unaffected_by_an_ambiguous_neighbour() {
+        let (mut batched, _) = three_lane_state();
+        let with_neighbour =
+            resolve_maybe_bool(&mut batched, MaybeVector::vector(vec![Some(true), None, Some(false)]));
+        let batched_lane0 = match &with_neighbour {
+            Value::Bool(MaybeVector::Vector(v)) => v[0],
+            Value::Bool(MaybeVector::Scalar(b)) => *b,
+            other => panic!("expected bools, got {:?}", other),
+        };
+
+        let (mut alone, _) = three_lane_state();
+        let solo = resolve_maybe_bool(
+            &mut alone,
+            MaybeVector::vector(vec![Some(true), Some(true), Some(false)]),
+        );
+        let solo_lane0 = match &solo {
+            Value::Bool(MaybeVector::Vector(v)) => v[0],
+            Value::Bool(MaybeVector::Scalar(b)) => *b,
+            other => panic!("expected bools, got {:?}", other),
+        };
+        assert_eq!(batched_lane0, solo_lane0);
+    }
+
+    /// duplicate_lanes with an empty mask must not touch the state.
+    #[test]
+    fn duplicate_lanes_with_no_selection_is_inert() {
+        let (mut state, cell) = three_lane_state();
+        let before = state.heap.get(cell).clone();
+        state.duplicate_lanes(&[false, false, false]);
+        assert_eq!(state.vector_size, 3);
+        assert_eq!(state.heap.get(cell), &before);
     }
 }

@@ -334,6 +334,70 @@ impl State {
         crate::op_census::record(crate::op_census::Cat::Expand, self.vector_size, 0, t);
     }
 
+    /// Append a copy of every lane the mask selects, leaving the originals
+    /// in place: lane order becomes `[0..n) ++ [selected lanes, in order]`.
+    ///
+    /// The selective sibling of `expand_lanes`, which doubles everything.
+    /// That difference is the entire point of the tri-state work: an
+    /// ambiguous comparison in three lanes of a million should cost three
+    /// extra lanes, not another million (and not, as before, a whole-state
+    /// fallback onto the plain program).
+    ///
+    /// Scalars are left alone - they broadcast over any lane count, so they
+    /// are already correct for the wider state.
+    pub fn duplicate_lanes(&mut self, mask: &[bool]) {
+        let _trace = TraceSpan::new("duplicate_lanes", "expand");
+        let t = crate::op_census::start();
+        assert_eq!(
+            mask.len(),
+            self.vector_size,
+            "duplicate_lanes mask must cover exactly the current lanes"
+        );
+        let indices: Vec<usize> = mask
+            .iter()
+            .enumerate()
+            .filter(|(_, keep)| **keep)
+            .map(|(i, _)| i)
+            .collect();
+        if indices.is_empty() {
+            return;
+        }
+        fn dup<T: std::fmt::Debug + Clone + PartialEq + Eq>(
+            v: MaybeVector<T>,
+            indices: &[usize],
+        ) -> MaybeVector<T> {
+            match v {
+                MaybeVector::Scalar(s) => MaybeVector::Scalar(s),
+                MaybeVector::Vector(mut arc) => {
+                    // Copies only if another state still shares the lanes.
+                    let lanes = std::sync::Arc::make_mut(&mut arc);
+                    lanes.reserve(indices.len());
+                    for &i in indices {
+                        // Every index is < the original length and we only
+                        // ever push, so the source lane stays valid.
+                        let copied = lanes[i].clone();
+                        lanes.push(copied);
+                    }
+                    MaybeVector::Vector(arc)
+                }
+            }
+        }
+        let indices = &indices;
+        self.map_values_in_place(|value| match value {
+            Value::Number(v) => Value::Number(dup(v, indices)),
+            Value::NumberInterval(v) => Value::NumberInterval(dup(v, indices)),
+            Value::Bool(v) => Value::Bool(dup(v, indices)),
+            Value::MaybeBool(_) => panic!("{}", super::value::MAYBE_BOOL_ESCAPED),
+            other @ (Value::UnknownBool
+            | Value::String(_)
+            | Value::Nil(_)
+            | Value::Pointer(_)
+            | Value::NilPointer(_)) => other,
+        });
+        self.vector_size += indices.len();
+        crate::op_census::record(crate::op_census::Cat::Expand, self.vector_size, 0, t);
+    }
+
     /// Filters all vector values in the state by a mask, cloning first.
     /// The resulting state's vector_size will be the number of true values in the mask.
     pub fn filter_by_mask_clone(&self, mask: &[bool], reason: FilterReason) -> Self {
