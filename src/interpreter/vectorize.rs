@@ -148,6 +148,70 @@ pub fn debug_shape_of_state(state: &State) -> StateShape {
 }
 
 /// Get the shape of a state for vectorization grouping
+/// `shape_of_state(state).cached_hash()` without building the shape.
+///
+/// The frontier subtract needs only the hash, and it asks for it once per
+/// boundary state - ~1000 per frame at depth. Building the `StateShape` to
+/// throw it away costs several Vec allocations and a clone of every
+/// global-env key (about fifty `String`s) per call.
+///
+/// Identical by construction rather than by re-derivation: it calls the
+/// same `normalize_*_for_shape` functions on the same values in the same
+/// order, and only the CONTAINER hashing is written out by hand - a `Vec`
+/// hashes as a length prefix followed by its elements, a tuple as its
+/// fields in order, and a `String` exactly as its `str`. A test holds it
+/// equal to `shape_of_state(..).cached_hash()`.
+pub fn shape_hash_of_state(state: &State) -> u64 {
+    use std::hash::{Hash, Hasher};
+    /// What `<[T] as Hash>::hash` writes before the elements. The
+    /// `write_length_prefix` method that spells this is unstable; its
+    /// default body is exactly this, and `FxHasher` does not override it.
+    #[inline]
+    fn write_len(hasher: &mut rustc_hash::FxHasher, len: usize) {
+        hasher.write_usize(len);
+    }
+    let mut hasher = rustc_hash::FxHasher::default();
+
+    // heap_structure: Vec<(HeapId, HeapValueShape)>
+    let heap_len = state.heap.len();
+    write_len(&mut hasher, heap_len);
+    for i in 0..heap_len {
+        let id = HeapId::from_raw(i);
+        id.hash(&mut hasher);
+        match state.heap.get_opt(id) {
+            Some(value) => normalize_heap_value_for_shape(value).hash(&mut hasher),
+            None => HeapValueShape::Empty.hash(&mut hasher),
+        }
+    }
+
+    // local_env_structure: Vec<(usize, ValueShape)>
+    write_len(&mut hasher, state.local_env.iter().count());
+    for (k, v) in state.local_env.iter() {
+        k.hash(&mut hasher);
+        normalize_value_for_shape(v).hash(&mut hasher);
+    }
+
+    // outer_local_envs_structure: Vec<Vec<(usize, ValueShape)>>
+    write_len(&mut hasher, state.outer_local_envs.len());
+    for env in &state.outer_local_envs {
+        write_len(&mut hasher, env.iter().count());
+        for (k, v) in env.iter() {
+            k.hash(&mut hasher);
+            normalize_value_for_shape(v).hash(&mut hasher);
+        }
+    }
+
+    // global_env: Vec<(String, HeapId)>
+    write_len(&mut hasher, state.global_env.len());
+    for (k, v) in state.global_env.iter() {
+        k.hash(&mut hasher);
+        v.hash(&mut hasher);
+    }
+
+    state.prints.hash(&mut hasher);
+    hasher.finish()
+}
+
 pub fn shape_of_state(state: &State) -> StateShape {
     // Get heap structure (handle empty slots that are allocated but not set)
     let heap_len = state.heap.len();
@@ -1284,7 +1348,7 @@ pub fn visited_row_keys(
 ) -> Option<VisitedKeys> {
     use crate::interpreter::virtual_merge::{collect_columns_labeled, row_key_hashes, Column};
     let _trace = TraceSpan::new("visited_row_keys", "vectorize");
-    let shape_hash = shape_of_state(state).cached_hash();
+    let shape_hash = shape_hash_of_state(state);
     let (columns, _origins) = collect_columns_labeled(std::slice::from_ref(state))?;
     let refs: Vec<&Column> = columns.iter().collect();
     // The row hash folds scalar/uniform pieces into every row, so it covers
@@ -1486,14 +1550,52 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
     let mut states_by_shape: FxHashMap<(StateShape, u64), Vec<State>> = FxHashMap::default();
     {
         let _trace_shape = TraceSpan::new("shape_grouping", "vectorize");
-        for state in states {
-            let class = partition_class(&state, &partition_cells)
-                .expect("partition-varying states were split above");
-            let shape = shape_of_state(&state);
-            states_by_shape
-                .entry((shape, class))
-                .or_insert_with(Vec::new)
-                .push(state);
+        // Deriving a state's (shape, class) walks its whole heap and is a
+        // pure function of that state, so at the frame boundary - where
+        // there are ~1000 survivor fragments - the derivation is spread
+        // across threads and only the grouping itself stays sequential
+        // (it has to be: the insertion order into each group's Vec is what
+        // fixes the merged lane order).
+        let threads = super::virtual_merge::merge_threads();
+        let keys: Vec<(StateShape, u64)> = if states.len() < 8 || threads == 1 {
+            states
+                .iter()
+                .map(|state| {
+                    (
+                        shape_of_state(state),
+                        partition_class(state, &partition_cells)
+                            .expect("partition-varying states were split above"),
+                    )
+                })
+                .collect()
+        } else {
+            let chunk = states.len().div_ceil(threads);
+            let partition_cells = &partition_cells;
+            std::thread::scope(|scope| {
+                states
+                    .chunks(chunk)
+                    .map(|part| {
+                        scope.spawn(move || {
+                            part.iter()
+                                .map(|state| {
+                                    (
+                                        shape_of_state(state),
+                                        partition_class(state, partition_cells).expect(
+                                            "partition-varying states were split above",
+                                        ),
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .flat_map(|h| h.join().expect("shape grouping worker"))
+                    .collect()
+            })
+        };
+        for (state, key) in states.into_iter().zip(keys) {
+            states_by_shape.entry(key).or_default().push(state);
         }
     }
     stats.shape_grouping_ns = t2.elapsed().as_nanos() as u64;
@@ -1619,6 +1721,67 @@ pub fn union_diff_states(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hash-only shape path must agree with the shape it skips
+    /// building - it feeds the frontier row key, so a divergence would
+    /// silently split the visited set in two.
+    #[test]
+    fn shape_hash_matches_the_built_shape() {
+        use crate::interpreter::local_env::LocalEnv;
+        let mut shapes = Vec::new();
+
+        // Empty.
+        shapes.push(State::new());
+
+        // Globals, a vector and a scalar, an unset cell, prints.
+        let mut s = State::new();
+        s.vector_size = 3;
+        let a = s.heap.alloc();
+        s.heap.set(a, HeapValue::Value(Value::Number(MaybeVector::vector(
+            [1, 2, 3].iter().map(|n| Pico8Num::from_i16(*n)).collect(),
+        ))));
+        let b = s.heap.alloc();
+        s.heap.set(b, HeapValue::Value(Value::Bool(MaybeVector::Scalar(true))));
+        let unset = s.heap.alloc();
+        let table = s.heap.alloc();
+        let mut fields: std::collections::HashMap<String, HeapId, _> = Default::default();
+        fields.insert("x".to_string(), a);
+        fields.insert("y".to_string(), b);
+        s.heap.set(table, HeapValue::ObjectTable(fields));
+        let arr = s.heap.alloc();
+        s.heap.set(arr, HeapValue::ArrayTable(vec![a, b, unset]));
+        let builtin = s.heap.alloc();
+        s.heap.set(builtin, HeapValue::BuiltinFun("sin".to_string()));
+        s.global_env.insert("zebra".to_string(), table);
+        s.global_env.insert("alpha".to_string(), arr);
+        s.global_env.insert("sin".to_string(), builtin);
+        s.prints.push("hello".to_string());
+        shapes.push(s);
+
+        // Locals and outer locals, including a nil and a pointer.
+        let mut s = State::new();
+        s.vector_size = 2;
+        let p = s.heap.alloc();
+        s.heap.set(p, HeapValue::Value(Value::Nil(Some("gone".to_string()))));
+        let mut env = LocalEnv::new();
+        env.set_by_raw_id(0, Value::Pointer(p));
+        env.set_by_raw_id(4, Value::UnknownBool);
+        s.local_env = env;
+        let mut outer = LocalEnv::new();
+        outer.set_by_raw_id(2, Value::NumberInterval(MaybeVector::Scalar(
+            crate::pico8_num::Pico8NumInterval::from_number(Pico8Num::from_i16(7)),
+        )));
+        s.outer_local_envs = vec![outer, LocalEnv::new()];
+        shapes.push(s);
+
+        for state in &shapes {
+            assert_eq!(
+                shape_hash_of_state(state),
+                shape_of_state(state).cached_hash(),
+                "hash-only shape diverged"
+            );
+        }
+    }
 
     #[test]
     fn test_vectorize_two_scalar_states() {
