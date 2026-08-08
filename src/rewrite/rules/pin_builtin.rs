@@ -194,6 +194,85 @@ pub fn verify(
 /// The callee is recognised syntactically - `%f = get_global "max"` then
 /// `%g = load %f` then `call %g(..)` - which is a guess about what the recipe
 /// author means, not a proof. The assertion is what makes a wrong guess loud.
+/// Pin every call whose callee is a load of one of `names`, program-wide.
+///
+/// Used at compile time (`Program::compile`) for the builtins that are
+/// native from state zero - min/max/abs/flr/sin/mget - so the plain
+/// program gets the pinned form everywhere without carrying a recipe
+/// entry per site. The safety story is unchanged from the per-site rule:
+/// every pinned call still asserts at runtime that the callee really is
+/// the named builtin, and the names must be pure builtins.
+///
+/// `tile_flag_at` must NOT be in `names`: its global holds a Lua closure
+/// until `inject_tile_flag_at_builtin` swaps it after init, so a pinned
+/// call reached during init would fail its callee assertion.
+pub fn pin_all(program: &mut Program, names: &[&str]) -> Result<usize> {
+    for name in names {
+        require(
+            is_pure_builtin(name),
+            format!("{:?} is not one of the pure builtins {:?}", name, PURE_BUILTINS),
+        )?;
+        require(
+            *name != "tile_flag_at",
+            "tile_flag_at is only native after init; pinning it program-wide \
+             would break init-time calls"
+                .to_string(),
+        )?;
+    }
+    let mut pinned_count = 0;
+    for (_, fun) in program.functions.iter_mut() {
+        // Same scoping as `candidates`: a get_global's cell is trusted
+        // within its block, the loaded value anywhere in the function.
+        let mut builtin_of: rustc_hash::FxHashMap<LocalId, String> = Default::default();
+        for (_, block) in all_blocks(&fun.cfg) {
+            let mut cell_of: rustc_hash::FxHashMap<LocalId, String> = Default::default();
+            for (id, instr) in &block.instructions {
+                match instr {
+                    Instruction::GetGlobal { name, create_if_missing: false }
+                        if names.contains(&name.as_str()) =>
+                    {
+                        cell_of.insert(*id, name.clone());
+                    }
+                    Instruction::Load { source } => {
+                        if let Some(name) = cell_of.get(source) {
+                            builtin_of.insert(*id, name.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if builtin_of.is_empty() {
+            continue;
+        }
+        let keys: Vec<BlockKey> = all_blocks(&fun.cfg).into_iter().map(|(k, _)| k).collect();
+        for key in keys {
+            let block = get_block(&fun.cfg, &key).unwrap();
+            let to_pin: Vec<(usize, String)> = block
+                .instructions
+                .iter()
+                .enumerate()
+                .filter_map(|(index, (_, instr))| match instr {
+                    Instruction::Call { closure, .. } => {
+                        builtin_of.get(closure).map(|name| (index, name.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            if to_pin.is_empty() {
+                continue;
+            }
+            let block = get_block_mut(&mut fun.cfg, &key).unwrap();
+            for (index, name) in to_pin {
+                let replacement = pinned(&block.instructions[index].1, &name)?;
+                block.instructions[index].1 = replacement;
+                pinned_count += 1;
+            }
+        }
+    }
+    Ok(pinned_count)
+}
+
 pub fn candidates(program: &Program) -> Vec<(String, LocalId, String)> {
     let mut out = Vec::new();
     for (function, fun) in &program.functions {

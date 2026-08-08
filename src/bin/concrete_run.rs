@@ -172,7 +172,7 @@ fn main() -> Result<()> {
     );
     println!();
 
-    let program = Program::compile_from_disk()?;
+    let program = Program::compile_executable_from_disk()?;
     let fixed_env = program.fixed_env();
     let frame_cfg = PreparedCfg::new(program.frame_cfg().clone());
 

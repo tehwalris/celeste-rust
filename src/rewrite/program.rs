@@ -93,8 +93,36 @@ impl Program {
         Ok(Self { functions, merge_partition_cells: Vec::new() })
     }
 
+    /// Pin every call to a state-zero-native builtin (Call -> CallBuiltin
+    /// with a runtime callee assertion; see `pin_builtin::pin_all`).
+    ///
+    /// For EXECUTED plain programs only - the deopt target, sweep replays,
+    /// the concrete walks, the runner, verify's baseline side. The recipe
+    /// must NOT build on a pinned base: its whole-program passes (cse
+    /// forward, dce) would eliminate different instructions than they did
+    /// when the recipe was derived and every later id reference would
+    /// drift, so the recipe carries its own pin entries at the positions
+    /// its derivation needs them. `tile_flag_at` is deliberately absent
+    /// from the list (native only after init); its pins stay in the
+    /// recipe.
+    pub fn pin_native_builtins(&mut self) -> Result<usize> {
+        super::rules::pin_builtin::pin_all(
+            self,
+            &["min", "max", "abs", "flr", "sin", "mget"],
+        )
+    }
+
     pub fn compile_from_disk() -> Result<Self> {
         Self::compile(&Sources::load_from_disk()?)
+    }
+
+    /// `compile_from_disk` + `pin_native_builtins`: the plain program as
+    /// every EXECUTION path runs it. Recipe replays must keep using
+    /// `compile_from_disk` (see `pin_native_builtins` for why).
+    pub fn compile_executable_from_disk() -> Result<Self> {
+        let mut program = Self::compile_from_disk()?;
+        program.pin_native_builtins()?;
+        Ok(program)
     }
 
     pub fn get(&self, name: &str) -> Result<&FunDef> {

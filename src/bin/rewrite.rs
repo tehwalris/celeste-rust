@@ -1276,7 +1276,7 @@ fn main() -> Result<()> {
         }
 
         Command::Verify { frames } => {
-            let baseline = Program::compile_from_disk()?;
+            let baseline = Program::compile_executable_from_disk()?;
             let (candidate, _) = build(&recipe)?;
             println!("running {} frames of both programs...", frames);
             let start = std::time::Instant::now();
@@ -1810,7 +1810,7 @@ fn main() -> Result<()> {
 
         Command::Screen { candidates, frames } => {
             let (program, _) = build(&recipe)?;
-            let baseline = Program::compile_from_disk()?;
+            let baseline = Program::compile_executable_from_disk()?;
             let trace = celeste_rust::rewrite::verify::observation_trace(&baseline, frames)?;
 
             let text = std::fs::read_to_string(&candidates)?;
@@ -1973,7 +1973,7 @@ fn main() -> Result<()> {
         Command::Deoptcheck { frames } => {
             use celeste_rust::rewrite::state_mapping::StateMapping;
             use celeste_rust::rewrite::verify::{observe_frame, AbstractRun};
-            let plain = Program::compile_from_disk()?;
+            let plain = Program::compile_executable_from_disk()?;
             let (program, _) = build(&recipe)?;
             let mapping = StateMapping::from_recipe(&recipe);
             println!(
@@ -2109,12 +2109,12 @@ fn main() -> Result<()> {
             variants,
         } => {
             if baseline {
-                bench("original", &Program::compile_from_disk()?, frames, profile, None, None, None, vec![], None)?;
+                bench("original", &Program::compile_executable_from_disk()?, frames, profile, None, None, None, vec![], None)?;
             }
             let (program, _) = build(&recipe)?;
             let deopt_setup = if deopt {
                 Some((
-                    Program::compile_from_disk()?,
+                    Program::compile_executable_from_disk()?,
                     celeste_rust::rewrite::state_mapping::StateMapping::from_recipe(&recipe),
                 ))
             } else {
@@ -2233,7 +2233,7 @@ fn main() -> Result<()> {
                 );
                 level_data.push(level);
             }
-            let plain = Program::compile_from_disk()?;
+            let plain = Program::compile_executable_from_disk()?;
             let mapping = StateMapping::from_recipe(&recipe);
             let fixed_env = plain.fixed_env();
             let mut state = celeste_rust::concrete::initial_state(&plain, &fixed_env)?;
@@ -2325,7 +2325,7 @@ fn main() -> Result<()> {
                 horizon
             );
 
-            let plain = Program::compile_from_disk()?;
+            let plain = Program::compile_executable_from_disk()?;
             let mapping = StateMapping::from_recipe(&recipe);
             let fixed_env = plain.fixed_env();
             let mut state = celeste_rust::concrete::initial_state(&plain, &fixed_env)?;
@@ -2456,7 +2456,7 @@ fn main() -> Result<()> {
             let (precision, table, g) = (loaded.precision, loaded.table, loaded.g);
             println!("level {}: {} rows, enumerating horizon {}", level, table.len(), horizon);
 
-            let plain = Program::compile_from_disk()?;
+            let plain = Program::compile_executable_from_disk()?;
             let mapping = StateMapping::from_recipe(&recipe);
             let fixed_env = plain.fixed_env();
             let spawn = celeste_rust::concrete::initial_state(&plain, &fixed_env)?;
@@ -2625,7 +2625,7 @@ fn main() -> Result<()> {
             let recipe_text = std::fs::read_to_string(&cli.recipe).unwrap_or_default();
             let fingerprint =
                 celeste_rust::rewrite::checkpoint::config_fingerprint(&recipe_text);
-            let plain = Program::compile_from_disk()?;
+            let plain = Program::compile_executable_from_disk()?;
             let (program, _) = build(&recipe)?;
             let mapping = StateMapping::from_recipe(&recipe);
             let result =
@@ -2665,7 +2665,7 @@ fn main() -> Result<()> {
             );
         }
         Command::Bisect { frames } => {
-            let baseline = Program::compile_from_disk()?;
+            let baseline = Program::compile_executable_from_disk()?;
             let mut program = Program::compile_from_disk()?;
             for entry in &recipe.entries {
                 apply_entry(&mut program, entry)?;

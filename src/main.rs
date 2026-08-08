@@ -184,8 +184,11 @@ fn run_game_frames(
     // chunks); see rewrite::program.
     let sources = celeste_rust::rewrite::program::Sources::load_from_disk()
         .expect("Failed to load game sources");
-    let program = celeste_rust::rewrite::program::Program::compile(&sources)
+    let mut program = celeste_rust::rewrite::program::Program::compile(&sources)
         .expect("Failed to compile game program");
+    program
+        .pin_native_builtins()
+        .expect("Failed to pin native builtins");
     let fixed_env = program.fixed_env();
     let cfg = program.init_cfg().clone();
     let frame_cfg = program.frame_cfg().clone();

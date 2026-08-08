@@ -30,7 +30,12 @@ use crate::interpreter::state::State;
 const MAGIC: &[u8; 4] = b"C8TB";
 /// Bump whenever the meaning or layout of ANY checkpoint content changes,
 /// including the serde shape of `State`.
-pub const FORMAT_VERSION: u32 = 2;
+///
+/// Version 3: the 2026-08 hash-breaking batch - `sin` registered
+/// unconditionally (every state gains a builtin global, changing every
+/// row hash), compile-time builtin pinning, and the fingerprint computed
+/// from `CampaignConfig` with every field hashed unconditionally.
+pub const FORMAT_VERSION: u32 = 3;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Meta {
@@ -51,12 +56,42 @@ pub struct Meta {
     pub states_bin_len: u64,
 }
 
+/// Everything that determines the search trajectory, read from the
+/// environment once per call. The fingerprint is computed FROM this
+/// struct, every field hashed unconditionally by value - if something can
+/// change the reachable set, it belongs in here; if it is in here, two
+/// runs that disagree on it can never share checkpoints. (The old
+/// fingerprint hashed env-var *presence* and skipped default values for
+/// back-compat, which is how probe commands run without the campaign env
+/// produced valid-looking but mismatching hashes - twice.)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CampaignConfig {
+    /// The start room defines the whole search universe (lua
+    /// substitution, collision cache, win predicate).
+    pub start_room: (i16, i16),
+    /// The rem abstraction level (the refinement ladder's k).
+    pub precision: crate::interpreter::abstraction::RemPrecision,
+    /// Frontier-only search (subtract-visited); CELESTE_FRONTIER_ONLY.
+    pub frontier_only: bool,
+    /// Deopt frames run collect-first; CELESTE_DEOPT_COLLECT_FIRST.
+    pub deopt_collect_first: bool,
+}
+
+impl CampaignConfig {
+    pub fn from_env() -> Self {
+        Self {
+            start_room: crate::game_runner::start_room(),
+            precision: crate::interpreter::abstraction::rem_precision_from_env(),
+            frontier_only: std::env::var_os("CELESTE_FRONTIER_ONLY").is_some(),
+            deopt_collect_first: std::env::var_os("CELESTE_DEOPT_COLLECT_FIRST")
+                .is_some(),
+        }
+    }
+}
+
 /// What determines the search trajectory; hashed into the fingerprint.
 pub fn config_fingerprint(recipe_text: &str) -> String {
-    config_fingerprint_with_precision(
-        recipe_text,
-        crate::interpreter::abstraction::rem_precision_from_env(),
-    )
+    config_fingerprint_for(recipe_text, &CampaignConfig::from_env())
 }
 
 /// `config_fingerprint` for an explicit precision level - the band loader
@@ -66,6 +101,12 @@ pub fn config_fingerprint_with_precision(
     recipe_text: &str,
     precision: crate::interpreter::abstraction::RemPrecision,
 ) -> String {
+    let mut config = CampaignConfig::from_env();
+    config.precision = precision;
+    config_fingerprint_for(recipe_text, &config)
+}
+
+pub fn config_fingerprint_for(recipe_text: &str, config: &CampaignConfig) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = rustc_hash::FxHasher::default();
     FORMAT_VERSION.hash(&mut h);
@@ -73,22 +114,10 @@ pub fn config_fingerprint_with_precision(
     for path in ["lua/builtin_level_3.lua", "lua/builtin_level_4.lua", "lua/celeste-minimal.lua"] {
         std::fs::read_to_string(path).unwrap_or_default().hash(&mut h);
     }
-    for flag in ["CELESTE_FRONTIER_ONLY", "CELESTE_DEOPT_COLLECT_FIRST", "CELESTE_EXACT_REM"] {
-        std::env::var_os(flag).is_some().hash(&mut h);
-    }
-    // The start room defines the whole search universe (lua substitution,
-    // collision cache, builtin set). Hashed only when non-default so the
-    // room-(1,0) checkpoints written before this existed remain valid.
-    let room = crate::game_runner::start_room();
-    if room != (1, 0) {
-        format!("start_room={},{}", room.0, room.1).hash(&mut h);
-    }
-    // The rem precision level changes the reachable set; the VALUE matters.
-    // Hashed only when non-default so checkpoints written before the ladder
-    // existed (implicitly Bits(0)) remain valid.
-    if precision != crate::interpreter::abstraction::RemPrecision::Bits(0) {
-        format!("{:?}", precision).hash(&mut h);
-    }
+    config.start_room.hash(&mut h);
+    format!("{:?}", config.precision).hash(&mut h);
+    config.frontier_only.hash(&mut h);
+    config.deopt_collect_first.hash(&mut h);
     format!("{:016x}", h.finish())
 }
 

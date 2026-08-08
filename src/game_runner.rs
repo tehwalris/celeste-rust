@@ -697,16 +697,13 @@ pub fn create_fixed_env_with_builtins() -> FixedEnv {
 pub fn create_fixed_env_with_game_builtins() -> FixedEnv {
     let mut fixed_env = create_fixed_env_with_builtins();
     let (room_x, room_y) = start_room();
-    // `sin` is registered only for rooms that need it (room (0,0)'s fruit
-    // bobbing). Registering it unconditionally would add a builtin global
-    // to every state - changing heap layout and therefore EVERY row hash -
-    // without changing the config fingerprint, silently invalidating the
-    // whole room-(1,0) checkpoint universe. The fingerprint covers the
-    // start room, so this conditional keeps builtin set and fingerprint in
-    // lockstep.
-    if (room_x, room_y) != (1, 0) {
-        fixed_env.add_pure_builtin("sin", builtin_sin);
-    }
+    // `sin` is native for every room. (It used to be conditional on the
+    // start room to keep the pre-existing room-(1,0) row hashes valid;
+    // the 2026-08 hash-breaking batch bumped the checkpoint FORMAT_VERSION
+    // and re-derived both rooms' universes, so the conditional is gone -
+    // it also meant the default room's program crashed the moment a replay
+    // crossed into a fruit room.)
+    fixed_env.add_pure_builtin("sin", builtin_sin);
     let cart_data = std::sync::Arc::new(
         cart_data::CartData::load("cart").expect("Failed to load cart data")
     );

@@ -97,7 +97,11 @@ fn main() -> Result<()> {
     // rewrite doing its job. It is still worth having as `--original`, since
     // that is the number the recipe is trying to beat.
     let mut program = celeste_rust::rewrite::program::Program::compile_from_disk()?;
-    if !cli.original {
+    if cli.original {
+        // Measure the plain program as it is actually executed (with the
+        // native builtins pinned).
+        program.pin_native_builtins()?;
+    } else {
         let recipe = celeste_rust::rewrite::recipe::Recipe::load(&cli.recipe)?;
         for entry in &recipe.entries {
             celeste_rust::rewrite::recipe::apply_entry(&mut program, entry)?;
