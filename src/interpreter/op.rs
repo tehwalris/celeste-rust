@@ -488,12 +488,25 @@ pub fn interpret_binary_op(l: &Value, op: BinaryOp, r: &Value) -> Result<Value> 
                 }
             };
             let tri = MaybeVector::map2(&l, &r, |l, r| judge(l, r));
-            let any_unknown = match &tri {
-                MaybeVector::Scalar(t) => t.is_none(),
-                MaybeVector::Vector(ts) => ts.iter().any(|t| t.is_none()),
+            let (any_unknown, all_unknown) = match &tri {
+                MaybeVector::Scalar(t) => (t.is_none(), t.is_none()),
+                MaybeVector::Vector(ts) => (
+                    ts.iter().any(|t| t.is_none()),
+                    ts.iter().all(|t| t.is_none()),
+                ),
             };
-            if any_unknown {
+            if all_unknown {
+                // No lane has an answer: exactly the old whole-value case,
+                // and the branch machinery already handles it.
                 Ok(Value::UnknownBool)
+            } else if any_unknown {
+                // MIXED - the case this whole change exists for. Previously
+                // one straddling lane collapsed every definite answer beside
+                // it, dragging the entire state onto the plain program. Now
+                // the definite lanes keep their answers and only the
+                // ambiguous ones are duplicated, when this transient is
+                // resolved at assignment (see resolve_maybe_bool).
+                Ok(Value::MaybeBool(tri))
             } else {
                 let bools = match &tri {
                     MaybeVector::Scalar(t) => MaybeVector::Scalar(t.unwrap()),

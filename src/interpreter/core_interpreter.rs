@@ -944,6 +944,82 @@ mod expand_tests {
         assert_eq!(batched_lane0, solo_lane0);
     }
 
+    /// End-to-end reproduction of the room-(0,0) strawberry failure, which
+    /// is the reason this machinery exists. The archived sweep log shows:
+    ///
+    ///   at %157 = select %125 ? %154 : %125: select on a condition with
+    ///   no per-lane value: UnknownBool ... whole-state fallback
+    ///   (in fruit.update_34 -> obj.collide_49)
+    ///
+    /// A three-lane comparison where ONE lane straddles a widened interval:
+    /// before, that collapsed the whole value and the select below failed,
+    /// dropping the entire state onto the plain program. Now the definite
+    /// lanes keep their answers, only the straddler duplicates, and the
+    /// select succeeds.
+    #[test]
+    fn a_straddling_lane_no_longer_poisons_the_select() {
+        use crate::interpreter::op::{interpret_binary_op, interpret_select};
+        use crate::ir::BinaryOp;
+        use crate::pico8_num::Pico8NumInterval;
+
+        let n = |v: i16| Pico8Num::from_i16(v);
+        // Lane 0: [0,1] < 10   -> definitely true
+        // Lane 1: [5,15] < 10  -> STRADDLES
+        // Lane 2: [20,30] < 10 -> definitely false
+        let fruit_y = Value::NumberInterval(MaybeVector::vector(vec![
+            Pico8NumInterval::new(n(0), n(1)),
+            Pico8NumInterval::new(n(5), n(15)),
+            Pico8NumInterval::new(n(20), n(30)),
+        ]));
+        let threshold = Value::Number(MaybeVector::Scalar(n(10)));
+
+        let compared =
+            interpret_binary_op(&fruit_y, BinaryOp::LessThan, &threshold).unwrap();
+        let tri = match compared {
+            Value::MaybeBool(tri) => tri,
+            other => panic!("expected a mixed tri-state, got {:?}", other),
+        };
+
+        let (mut state, _) = three_lane_state();
+        let condition = resolve_maybe_bool(&mut state, tri);
+        assert_eq!(state.vector_size, 4, "only the straddling lane duplicates");
+
+        // The definite lanes kept the answers they would have had alone.
+        assert_eq!(
+            condition,
+            Value::Bool(MaybeVector::vector(vec![true, true, false, false]))
+        );
+
+        // And the select that used to fail now resolves per lane.
+        let a = Value::Number(MaybeVector::Scalar(n(7)));
+        let b = Value::Number(MaybeVector::Scalar(n(9)));
+        let picked = interpret_select(&condition, &a, &b).unwrap();
+        assert_eq!(
+            picked,
+            Value::Number(MaybeVector::vector(vec![n(7), n(7), n(9), n(9)])),
+            "straddling lane appears once per resolution, definite lanes untouched"
+        );
+    }
+
+    /// An ALL-straddling comparison keeps the old whole-value behaviour, so
+    /// pre-existing paths are bit-for-bit unchanged.
+    #[test]
+    fn an_all_straddling_comparison_is_still_unknown_bool() {
+        use crate::interpreter::op::interpret_binary_op;
+        use crate::ir::BinaryOp;
+        use crate::pico8_num::Pico8NumInterval;
+
+        let n = |v: i16| Pico8Num::from_i16(v);
+        let straddling = Value::NumberInterval(MaybeVector::vector(vec![
+            Pico8NumInterval::new(n(5), n(15)),
+            Pico8NumInterval::new(n(0), n(20)),
+        ]));
+        let threshold = Value::Number(MaybeVector::Scalar(n(10)));
+        let compared =
+            interpret_binary_op(&straddling, BinaryOp::LessThan, &threshold).unwrap();
+        assert_eq!(compared, Value::UnknownBool);
+    }
+
     /// duplicate_lanes with an empty mask must not touch the state.
     #[test]
     fn duplicate_lanes_with_no_selection_is_inert() {
