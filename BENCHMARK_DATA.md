@@ -1,3 +1,81 @@
+# Chunk-parallel frames: 4.5x and less memory (2026-08-08)
+
+Room (1,0), 60 frames, frontier-only + deopt, same lane counts throughout
+(1,997,387 at f60 - the check that nothing semantic moved):
+
+| | time | peak | note |
+|---|---|---|---|
+| serial, no chunking (the baseline all day) | 89.2 s | 4.31 GB | |
+| 16 threads, no chunking | 57.0 s | 11.83 GB | 1.6x, and 2.7x the memory |
+| 1 thread, chunk cap 8k | ~110 s | 1.2 GB | the tiling tax, ~23% |
+| **16 threads, chunk cap 8k** | **19.8 s** | **2.48 GB** | **4.5x, and 42% less memory** |
+
+The two knobs are one setting. Threads alone undo streaming - 16 chunks'
+raw outputs in flight is exactly the accumulation the streaming boundary
+was built to avoid. Chunking alone is a 23% loss, because each chunk
+re-runs the work that is uniform across lanes. Together the chunks give the
+threads work and the threads pay for the chunking, so the cap now derives
+from the thread count instead of being a knob to remember.
+
+Phase split at f60 (16 threads): interpret 12.1 s (parallel), boundary
+4.5 s (serial), merge 2.8 s. Serial remainder is 37%, so Amdahl caps
+further thread scaling at ~1.6x more; SMT is worthless (t=24 and t=32 are
+both slightly slower than t=16 - this is memory-bound).
+
+Chunk size is a real optimum, not a monotone knob: at 16 threads, f55 goes
+27.1 s at cap 1000, 14.5 s at 4000, **13.2 s at 8000**, 15.2 s at 16000,
+18.3 s at 32000. Too small and the per-chunk uniform work dominates; too
+large and the batch barrier and the cache do.
+
+## What made it scale
+
+1. **The visited-set probe split in two.** Phase 1 (hash each lane to its
+   128-bit row key and probe the table READ-ONLY) needs only `&RowTable`,
+   so it runs in the worker. Phase 2 (insert, assigning ids) stays serial.
+   At depth ~98% of offered lanes are rows already seen - f60 offers 100.5M
+   and keeps 2.0M - so nearly all of the one-cache-miss-per-lane traffic
+   parallelises. Boundary went 25.0 s -> 5.9 s on its own.
+2. **The two parallelism levels had to stop multiplying.** A frame worker
+   calling `hash_rows` would `thread::scope` another 16 OS threads per
+   boundary state - thousands of spawns per frame. `set_nested_parallel`
+   makes the inner level yield to the outer.
+3. **Uniform columns leave the per-lane row hash.** Census: a boundary
+   state has 50.8 columns that hold one value in every lane and 7.2 that
+   vary, and the old sequential fold folded all 58 into every row. See the
+   commit - the fix required making the combine order-independent, which is
+   also a latent correctness point (uniformity is a property of a state,
+   not of a column).
+
+## Determinism, and what "identical" means here
+
+Two separate axes, and only one of them moves anything:
+
+* **Threads: byte-neutral.** At a fixed chunk cap, 16 threads produce
+  byte-identical `states.bin` and `visited.bin` to 1 thread. Work goes out
+  in batches of `threads` consecutive chunks and comes back in INPUT order,
+  so the sequence of rows offered to the visited set is the serial one and
+  row ids are unchanged. `parcheck.sh` is the gate.
+* **Chunk cap: reorders ids, not rows.** A different cap changes which
+  fragments merge mid-frame, so rows reach the boundary in a different
+  order and get different ids. The row SET is unchanged - per-frame "new
+  lanes" and "visited total" are equal at every frame, and only the
+  pre-dedup `sub_before` count moves (23,873,562 vs 23,873,058 at one
+  frame of a 45-frame run).
+
+## Correction to the roofline accounting above
+
+The 31x figure below rests on 1.95e11 lane-instructions for a 100-frame
+room-(1,0) run, derived from 212.5M lane-frames. That count is the number
+of lanes that SURVIVED to the visited set. It is not the work done: at f60
+a frame turns 2.0M input lanes into 100.5M boundary lanes (the ~50x button
+fan-out), and the frame body computes on those. So the real
+lane-instruction count is far higher, the achieved rate far better, and the
+"42 cycles per lane-instruction" figure is wrong by whatever the mid-frame
+lane multiplier is. Bound [B] should be recomputed from measured bytes (the
+`CELESTE_CENSUS` totals) rather than from an instruction count, and until
+that is done the honest statement is the measured one: 4.5x today, with 37%
+of the run now serial.
+
 # Roofline: how far off are we? (measured 2026-08-08)
 
 Philippe's yardstick: "the time to load all the compressed states for a
