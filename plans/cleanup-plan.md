@@ -75,6 +75,46 @@ All in ONE change, then re-derive both rooms' checkpoint universes
    missing env bit twice on 2026-08-07); the fingerprint is computed
    FROM the config.
 
+## Execution ledger (overnight 2026-08-08)
+
+Phase A - DONE, each pass gated green (tests + both verifies + both
+witness traces byte-identical to the frozen baseline logs):
+
+1. Dead weight (2 commits): compare_frames, view_frames,
+   slow_call_benchmark, vectorize_benchmark, the input_capture module
+   and its interpreter hooks, the silent-skip vectorize test, stale
+   main.rs allows, dead tas.rs/input.rs, six unused deps (bv, regex,
+   work-queue, crossbeam, image, petgraph). Audited and KEPT as live:
+   liveness, branch_sites, create_sites, would_dedup, instr_time,
+   merge_stats, block_coverage. ~2,100 lines gone.
+2. A1: `concrete` lib module (buttons, initial state, frame stepping) +
+   every binary through Sources/Program. concrete_run output
+   byte-identical on both witness TASes; extract-tas still reproduces
+   the room-(1,0) reference TAS byte-identically.
+3. A3: proof-critical abstraction layer split into
+   interpreter::abstraction with the over-approximation contract in its
+   module doc; inspect.rs is now read-only debug tooling.
+4. A2: step() decomposed into chunk_states / interpret_state /
+   report_frame_events / finish_{streaming,phased}_boundary (+
+   apply_band_filter, subtract_frontier, boundary_gc_if_enabled);
+   bench artifacts byte-identical in both boundary modes. Level-loading
+   and row-probe boilerplate factored (load_level / widened_row_key).
+5. A5: CELESTE_STREAM_BOUNDARY deleted - every frontier run streams
+   (set-equivalence re-verified: byte-identical artifacts);
+   CELESTE_MAX_STATE_LANES defaults to the campaign's 1M (0 disables).
+
+Phase B - code LANDED (commit "hash-breaking batch"), FORMAT_VERSION 3:
+sin registered for every room (fixes the cross-room replay crash);
+plain programs pinned at execution (Program::pin_native_builtins -
+NOTE: the recipe must keep building on the unpinned base and keep its
+own pin entries, because whole-program passes like cse-forward drift
+every later id reference on a pinned base; this was tried and the
+replay failed at m010); CampaignConfig + fingerprint-from-config with
+every field hashed by value. Old universes archived at
+~/celeste-checkpoints/pre-phaseB/. Re-derivation: single-horizon
+ladders (the optima are known - 100 and 94), room (1,0) then room
+(0,0), logs at ~/celeste-checkpoints/rederive-room*.log.
+
 ## Phase C: on the new baseline
 
 1. Recipe minimization tool: drop entries whose removal changes
