@@ -1004,6 +1004,47 @@ mod expand_tests {
 
     /// An ALL-straddling comparison keeps the old whole-value behaviour, so
     /// pre-existing paths are bit-for-bit unchanged.
+    /// The gate has two states and only one of them was ever exercised.
+    ///
+    /// With tri-state OFF, a MIXED comparison - some lanes definite, some
+    /// straddling - must collapse to `UnknownBool`, which is what this arm
+    /// did before tri-state existed. It instead fell into the all-definite
+    /// arm and unwrapped a `None`, which aborted the room (0,0) campaign at
+    /// frame 66 (the widened strawberry produces straddling comparisons
+    /// constantly; room (1,0) produces none, so every gate ran green).
+    #[test]
+    fn a_mixed_comparison_with_tri_state_off_collapses_instead_of_panicking() {
+        use crate::interpreter::op::{interpret_binary_op, set_tri_state};
+        use crate::pico8_num::{Pico8Num, Pico8NumInterval};
+
+        let n = |v: i16| Pico8Num::from_i16(v);
+        // Lane 0 is definitely less; lane 1 straddles.
+        let left = Value::NumberInterval(MaybeVector::vector(vec![
+            Pico8NumInterval::new(n(0), n(1)),
+            Pico8NumInterval::new(n(0), n(10)),
+        ]));
+        let right = Value::Number(MaybeVector::Scalar(n(5)));
+
+        set_tri_state(false);
+        let off = interpret_binary_op(&left, crate::ir::BinaryOp::LessThan, &right)
+            .expect("a mixed comparison must not error");
+        assert_eq!(
+            off,
+            Value::UnknownBool,
+            "with the gate off, a straddling lane must collapse the whole value"
+        );
+
+        set_tri_state(true);
+        let on = interpret_binary_op(&left, crate::ir::BinaryOp::LessThan, &right)
+            .expect("a mixed comparison must not error");
+        assert!(
+            matches!(on, Value::MaybeBool(_)),
+            "with the gate on, the definite lanes keep their answers, got {:?}",
+            on
+        );
+        set_tri_state(false);
+    }
+
     #[test]
     fn an_all_straddling_comparison_is_still_unknown_bool() {
         use crate::interpreter::op::{interpret_binary_op, set_tri_state};

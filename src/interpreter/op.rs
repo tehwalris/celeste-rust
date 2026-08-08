@@ -543,11 +543,21 @@ pub fn interpret_binary_op(l: &Value, op: BinaryOp, r: &Value) -> Result<Value> 
                     ts.iter().all(|t| t.is_none()),
                 ),
             };
-            if all_unknown {
-                // No lane has an answer: exactly the old whole-value case,
-                // and the branch machinery already handles it.
+            if all_unknown || (any_unknown && !tri_state_enabled()) {
+                // No lane has an answer, or some lane does not and tri-state
+                // is off: collapse to the whole-value case, which is what
+                // this arm did before tri-state existed and what the branch
+                // machinery already handles.
+                //
+                // The `!tri_state_enabled()` term is load-bearing and was
+                // missing: gating tri-state off sent MIXED comparisons into
+                // the `unwrap` arm below, which panics on the first lane
+                // that straddles. Room (1,0) never showed it because
+                // nothing there produces a straddling comparison; room
+                // (0,0)'s widened strawberry produces them constantly, and
+                // it aborted the campaign at f66.
                 Ok(Value::UnknownBool)
-            } else if any_unknown && tri_state_enabled() {
+            } else if any_unknown {
                 // MIXED - the case this whole change exists for. Previously
                 // one straddling lane collapsed every definite answer beside
                 // it, dragging the entire state onto the plain program. Now
@@ -556,11 +566,20 @@ pub fn interpret_binary_op(l: &Value, op: BinaryOp, r: &Value) -> Result<Value> 
                 // resolved at assignment (see resolve_maybe_bool).
                 Ok(Value::MaybeBool(tri))
             } else {
+                // Every lane is definite - guaranteed by the arms above, and
+                // the unwraps below depend on it.
+                debug_assert!(!any_unknown);
                 let bools = match &tri {
-                    MaybeVector::Scalar(t) => MaybeVector::Scalar(t.unwrap()),
-                    MaybeVector::Vector(ts) => {
-                        MaybeVector::vector(ts.iter().map(|t| t.unwrap()).collect())
-                    }
+                    MaybeVector::Scalar(t) => MaybeVector::Scalar(
+                        t.expect("an all-definite comparison has no straddling lane"),
+                    ),
+                    MaybeVector::Vector(ts) => MaybeVector::vector(
+                        ts.iter()
+                            .map(|t| {
+                                t.expect("an all-definite comparison has no straddling lane")
+                            })
+                            .collect(),
+                    ),
                 };
                 Ok(Value::Bool(bools))
             }
