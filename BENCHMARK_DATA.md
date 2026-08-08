@@ -1,3 +1,36 @@
+# Room (1,0) re-certified on the parallel build (2026-08-08)
+
+The end-to-end gate for everything below, and the one that matters: a
+FULLY FRESH ladder at horizon 100 - level-0 forward, a from-scratch
+backward sweep, then k=1..16 banded - reproducing the certified answer.
+
+**CONCRETE OPTIMUM = 100 frames.** All 17 per-level answers identical to
+the previously certified run (90, 94, 97, 98, 98, 99, then 100 from k=6
+on), and the level-0 sweep matched to the edge: **10,072,724,145 edges, 2
+win seeds** on both.
+
+That is a strong check on the whole day's work at once - chunk-parallel
+frames, the order-independent row key, the parallel visited probe, the
+parallel sweep replay. A single mis-ordered row id or a hash collision
+anywhere in 10 billion edges would move one of those seventeen numbers.
+
+| stage | wall |
+|---|---|
+| level-0 forward, f1-f100 (16 GB peak) | ~22 min |
+| backward sweep, 100 frames from scratch, 10.07e9 edges | ~45 min |
+| k=1..16 banded levels + their sweeps | ~9 min |
+| **total, nothing reused** | **~76 min** |
+
+For comparison the previous certification took 1h45 - but that one reused
+banked CSR shards for the sweep, which the cost analysis below estimates
+would otherwise have added hours. The sweep here was built from nothing.
+
+Caveat, so the table is not read as more than it is: the sweep's SPEEDUP
+is unmeasured. It is parallel now and gated byte-identical
+(`sweepcheck.sh`), but there is no controlled serial counterpart at this
+depth - the f40 gate universe finishes in 5 s either way. See the pending
+task before quoting a number for it.
+
 # The parallel campaign, end state: 5.2x at 60 frames (2026-08-08)
 
 Room (1,0), 60 frames, frontier-only + deopt. Lane counts identical to the
