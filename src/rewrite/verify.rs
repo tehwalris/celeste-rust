@@ -734,15 +734,31 @@ fn chunk_states(states: Vec<State>) -> Vec<State> {
         // state's (h89 OOMed on exactly this with the uniform cap).
         let cap = match crate::interpreter::abstraction::object_shape(&state) {
             Ok(shape) if shape.iter().any(|t| t == "fruit") => {
-                // Divisor tunable per context: the sweep's origin-tagged
-                // replays block all dedup, so the fruit UnknownBool
-                // doubling multiplies on the full 64-input fan-out and
-                // needs far smaller chunks than the forward pass.
-                let div: usize = std::env::var("CELESTE_FRUIT_CHUNK_DIVISOR")
+                // Fruit chunks are capped in ABSOLUTE lanes, not as a
+                // fraction of the ordinary cap.
+                //
+                // It used to be `cap / 10`, calibrated when the ordinary
+                // cap was 1,000,000 - so a fruit chunk was 100,000 lanes.
+                // When the parallel default brought the base to 8,000 that
+                // silently became 800, and since a fruit state runs the
+                // PLAIN program (its widened collide check is UnknownBool,
+                // which the specialized select cannot take), the result was
+                // one plain-program invocation per 800 lanes: room (0,0)
+                // f77 spent most of a 165-second frame in 1,355 separate
+                // plain runs of 1.08M deopted lanes.
+                //
+                // 8,000 keeps the in-flight fruit transient at 16 threads x
+                // 8,000 = 128k lanes, next to the 1 x 100,000 the serial
+                // build carried, while cutting the invocation count 10x.
+                // The sweep still wants far less (its origin column blocks
+                // all dedup, so the UnknownBool doubling multiplies on the
+                // full 64-input fan-out) and sets the env var.
+                std::env::var("CELESTE_FRUIT_CHUNK_LANES")
                     .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(10);
-                (cap / div.max(1)).max(1)
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(8_000)
+                    .max(1)
+                    .min(cap)
             }
             _ => cap,
         };

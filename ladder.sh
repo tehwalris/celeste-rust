@@ -34,7 +34,7 @@ for H in $(seq "$FROM" "$TO"); do
   # and small chunks are what give the threads work at all (a 250k-lane
   # sweep batch was only 3 chunks at the old cap). The fruit divisor comes
   # down with it so the fruit chunk stays ~1000 lanes rather than 80.
-  CELESTE_MAX_STATE_LANES=8000 CELESTE_FRUIT_CHUNK_DIVISOR=8 ./safe-run.sh -- ./target/release/rewrite --recipe "$RECIPE" sweep \
+  CELESTE_MAX_STATE_LANES=8000 CELESTE_FRUIT_CHUNK_LANES=1000 ./safe-run.sh -- ./target/release/rewrite --recipe "$RECIPE" sweep \
       --checkpoint-dir "$L0" --frames "$H" --horizon "$H" > /tmp/l0sweep-h$H.log 2>&1
   grep -E "abstract optimal|win seeds" /tmp/l0sweep-h$H.log
   refuted=0
@@ -55,7 +55,7 @@ for H in $(seq "$FROM" "$TO"); do
       break
     fi
     echo "=== horizon $H: k=$K wins; sweeping level $K ==="
-    CELESTE_REM_BITS=$K CELESTE_MAX_STATE_LANES=8000 CELESTE_FRUIT_CHUNK_DIVISOR=8 ./safe-run.sh -- ./target/release/rewrite --recipe "$RECIPE" sweep --banded \
+    CELESTE_REM_BITS=$K CELESTE_MAX_STATE_LANES=8000 CELESTE_FRUIT_CHUNK_LANES=1000 ./safe-run.sh -- ./target/release/rewrite --recipe "$RECIPE" sweep --banded \
         --checkpoint-dir "$KDIR" --frames "$H" --horizon "$H" \
         > "/tmp/k${K}sweep-h$H.log" 2>&1
     grep -E "abstract optimal|win seeds" "/tmp/k${K}sweep-h$H.log"
