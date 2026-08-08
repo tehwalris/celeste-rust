@@ -82,6 +82,55 @@ allocations, two uniformity scans, two extra round-trips through memory
 before map2 started. Fused into one pass: -2.8% (96.9 -> 94.2 s at 60
 frames), byte-identical artifacts.
 
+## State-parallel flow, retested at depth: still not it (2026-08-08)
+
+The 2026-08-05 revert of state-parallel flow noted "+4-6% on the
+rewritten path" and left the door open "if the tradeoff ever flips".
+Hypothesis worth testing: that was measured at frame 42, where states
+are small (~2900 lanes), so thread overhead would dominate; at frame 60+
+states are ~115k lanes and it should win.
+
+Retested by reverting the revert (it was already deterministic -
+per-state outputs concatenate in input order) and measuring at 60
+frames: 95.9 s off vs 94.7 s on. 1.3%. The tradeoff did not flip.
+
+The useful conclusion is WHY. Parallelising across the states in a flow
+step only helps when a step has many states. After each boundary merge a
+frame starts as ~1 state and splits progressively, so most of the work
+happens in WIDE SINGLE STATES that this parallelism never touches.
+
+=> The right parallel axis is ACROSS LANES WITHIN A STATE, not across
+states. That is also exactly the axis tiling wants: chunk the lane vector
+into cache-sized blocks, run a block through the whole program, then the
+next. Parallelism and tiling become the same refactor rather than two
+that fight each other (which is what the 2026-08-05 "working sets evict
+each other" note was really reporting).
+
+Scratch branch discarded; nothing landed from this experiment except the
+knowledge.
+
+## Queued: spatial locality (Philippe, 2026-08-08)
+
+"There's a ton of locality in the game state's spatial coordinates - if
+you're around the bottom left corner and you run one frame, you're still
+going to end up around the bottom left corner."
+
+Two distinct uses, and the second is the one that matters:
+
+1. tile_flag_at reads tiles near (x,y), so position-sorted lanes would
+   make its lookups sequential rather than a random gather. But Philippe
+   notes this one may not need locality at all: a room is 16x16 tiles, so
+   solidity is 256 bits = 32 bytes, and a custom per-room lookup could be
+   compressed small enough to sit in L1 permanently. Compression beats
+   locality here.
+
+2. DEDUP is where locality matters. subtract_visited is 13% of the
+   profile and probes a hash table of 128-bit keys - random access into a
+   large table, one cache miss per lane. Spatially adjacent states are
+   also the ones most likely to be duplicates, so ordering or bucketing
+   the visited set by position (rather than by hash) would turn those
+   misses into local probes AND cluster the duplicates it is looking for.
+
 ## Queued: integer-typed values end to end (Philippe, 2026-08-08)
 
 "Some numbers are pretty much exclusively ints so we could store them
