@@ -37,3 +37,6 @@ path = "src/bin/rewrite.rs"
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+# Frame pointers + line tables so `perf` can attribute cycles to source.
+# Costs nothing measurable and makes the profile readable.
+debug = 1

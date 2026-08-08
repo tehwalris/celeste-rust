@@ -417,25 +417,6 @@ fn make_builtin_fget(
     }
 }
 
-/// Every element of a numeric argument as an `i16`, loudly.
-///
-/// `tile_flag_at` used to fall back to 0 on a non-integer coordinate, which
-/// would have silently computed collision at the map origin. Positions in
-/// Celeste are always whole pixels, so this error should never fire - and if
-/// it ever does, that is worth a stopped run.
-fn as_i16_elements(v: &MaybeVector<Pico8Num>, what: &str) -> Result<MaybeVector<i16>> {
-    let one = |n: &Pico8Num| {
-        n.as_i16()
-            .ok_or_else(|| anyhow!("tile_flag_at: {} must be an integer, got {:?}", what, n))
-    };
-    match v {
-        MaybeVector::Scalar(n) => Ok(MaybeVector::Scalar(one(n)?)),
-        MaybeVector::Vector(ns) => Ok(MaybeVector::vector(
-            ns.iter().map(one).collect::<Result<Vec<i16>>>()?,
-        )),
-    }
-}
-
 /// Builtin tile_flag_at using precomputed collision cache
 /// tile_flag_at(x, y, w, h, flag) -> bool
 ///
@@ -476,32 +457,77 @@ fn make_builtin_tile_flag_at(
             _ => return tile_flag_at_computed(&cart_data, &collision_cache, args),
         };
 
-        // Handle x, y which may be vectors
+        // Handle x, y which may be vectors.
+        //
+        // Fused deliberately: converting x and y to i16 through
+        // `as_i16_elements` first cost two intermediate Vec allocations,
+        // two uniformity scans inside `MaybeVector::vector`, and two extra
+        // round-trips through memory before `map2` even started - and this
+        // builtin is the single largest cluster in the profile (13.9% of
+        // the search: the closure, as_i16_elements, tile_flag_at_computed
+        // and mget together). One pass, one allocation, conversion folded
+        // into the lookup.
         match (&args[0], &args[1]) {
             (Value::Number(x), Value::Number(y)) => {
-                let x = as_i16_elements(x, "x")?;
-                let y = as_i16_elements(y, "y")?;
-                let result = MaybeVector::map2(&x, &y, |&xi, &yi| {
+                let lookup = |xn: &Pico8Num, yn: &Pico8Num| -> Result<bool> {
+                    let xi = xn.as_i16().ok_or_else(|| {
+                        anyhow!("tile_flag_at: x must be an integer, got {:?}", xn)
+                    })?;
+                    let yi = yn.as_i16().ok_or_else(|| {
+                        anyhow!("tile_flag_at: y must be an integer, got {:?}", yn)
+                    })?;
                     // Try cached lookup for common sizes
                     if w == 6 && h == 5 {
                         // Player hitbox - but we need to account for the offset
                         // solid_player expects position without hitbox offset
                         if let Some(v) = collision_cache.solid_player(xi - 1, yi - 3) {
-                            return v;
+                            return Ok(v);
                         }
                     } else if w == 1 && h == 1 {
                         if let Some(v) = collision_cache.solid_1x1(xi, yi) {
-                            return v;
+                            return Ok(v);
                         }
                     } else if w == 8 && h == 8 {
                         if let Some(v) = collision_cache.solid_8x8(xi, yi) {
-                            return v;
+                            return Ok(v);
                         }
                     }
-
                     // Fall back to computation
-                    collision_cache.solid_at(&cart_data, xi, yi, w, h).unwrap_or(false)
-                });
+                    Ok(collision_cache.solid_at(&cart_data, xi, yi, w, h).unwrap_or(false))
+                };
+                let result = match (x, y) {
+                    (MaybeVector::Scalar(xn), MaybeVector::Scalar(yn)) => {
+                        MaybeVector::Scalar(lookup(xn, yn)?)
+                    }
+                    (MaybeVector::Vector(xs), MaybeVector::Vector(ys)) => {
+                        if xs.len() != ys.len() {
+                            return Err(anyhow!(
+                                "tile_flag_at: x and y have different lane counts ({} vs {})",
+                                xs.len(),
+                                ys.len()
+                            ));
+                        }
+                        let mut out = Vec::with_capacity(xs.len());
+                        for (xn, yn) in xs.iter().zip(ys.iter()) {
+                            out.push(lookup(xn, yn)?);
+                        }
+                        MaybeVector::vector(out)
+                    }
+                    (MaybeVector::Scalar(xn), MaybeVector::Vector(ys)) => {
+                        let mut out = Vec::with_capacity(ys.len());
+                        for yn in ys.iter() {
+                            out.push(lookup(xn, yn)?);
+                        }
+                        MaybeVector::vector(out)
+                    }
+                    (MaybeVector::Vector(xs), MaybeVector::Scalar(yn)) => {
+                        let mut out = Vec::with_capacity(xs.len());
+                        for xn in xs.iter() {
+                            out.push(lookup(xn, yn)?);
+                        }
+                        MaybeVector::vector(out)
+                    }
+                };
                 Ok(Value::Bool(result))
             }
             _ => tile_flag_at_computed(&cart_data, &collision_cache, args),

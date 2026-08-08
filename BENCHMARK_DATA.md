@@ -54,6 +54,51 @@ Three gaps, in order of ratio-per-effort:
    rather than the whole lane set through one instruction at a time, is
    exactly the difference between bound [B] and bound [A].
 
+## Where the cycles go (perf, room (1,0) 60 frames, search-dominated)
+
+Profile a 40-frame run and half of it is recipe build (liveness::analyze,
+validate_function, slots::constraints - all startup). At 60 frames the
+search dominates and the picture is:
+
+| subsystem | % |
+|---|---|
+| tile_flag_at / collision lookup | 13.9 |
+| subtract_visited (frontier) | 13.0 |
+| MaybeVector map/map2 (arithmetic) | 11.4 |
+| instruction dispatch | 9.9 |
+| interpret_select::pick | 9.1 |
+| abstraction (rem widening) | 5.5 |
+| allocator | 3.5 |
+| merge / hashing | 2.8 |
+
+No single dominant hotspot - the top five are ~57% spread over five
+subsystems. That is itself the finding: there is no one fix worth 10x,
+so the primary lever has to be parallelism (which multiplies everything)
+with tiling to make it work, and the per-subsystem items are secondary.
+
+Landed from this profile: tile_flag_at converted x and y to i16 through
+`as_i16_elements` before looking anything up - two intermediate Vec
+allocations, two uniformity scans, two extra round-trips through memory
+before map2 started. Fused into one pass: -2.8% (96.9 -> 94.2 s at 60
+frames), byte-identical artifacts.
+
+## Queued: integer-typed values end to end (Philippe, 2026-08-08)
+
+"Some numbers are pretty much exclusively ints so we could store them
+that way end to end."
+
+Pico8Num is 16.16 fixed point in an i32, but x, y, tile coordinates,
+timers, sprite ids and flags only ever hold integers. A separate integer
+representation would halve their memory traffic (the thing bound [B] is
+made of), delete conversions like the one fused above, and make their
+comparisons and arithmetic cheaper. It also composes with tiling: narrow
+columns mean more lanes per cache line.
+
+Not free: a second numeric variant touches every arithmetic path, and the
+lane-structural handlers must resize it (exactly the desync hazard that
+shaped the MaybeBool design - see plans/tristate-plan.md). Worth scoping
+against the parallelism work rather than doing on impulse.
+
 Caveat on the 36,000x: bound [A] assumes compute is free, so it is a
 yardstick rather than a target. Bound [B] (31x) is the honest measure of
 how much is being left on the table by the current execution strategy,
