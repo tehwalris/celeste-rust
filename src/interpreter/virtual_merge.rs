@@ -188,7 +188,10 @@ pub fn set_nested_parallel(nested: bool) {
     NESTED.with(|n| n.set(nested));
 }
 
-fn merge_threads() -> usize {
+/// Threads for a parallel step INSIDE the interpreter. Always this, never
+/// `worker_threads` directly: the mid-frame merges run on frame-worker
+/// threads, and fanning out again there re-creates the nested explosion.
+pub fn merge_threads() -> usize {
     if NESTED.with(|n| n.get()) {
         1
     } else {

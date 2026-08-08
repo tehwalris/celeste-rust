@@ -218,6 +218,34 @@ pub struct KeptLanes {
 }
 
 impl KeptLanes {
+    /// Runs from an ASCENDING list of kept lane indices.
+    ///
+    /// The frontier subtract knows its survivors as a short index list (at
+    /// depth ~2% of the lanes offered), so materialising a full bool mask
+    /// just to scan it back into runs is two passes over a vector that is
+    /// 50x larger than the answer. Debug-asserts ascendingness, since a
+    /// caller that got the order wrong would silently build overlapping
+    /// runs and gather the same lane twice.
+    pub fn from_sorted_indices(indices: &[u32]) -> Self {
+        let mut ranges: Vec<(u32, u32)> = Vec::new();
+        for &i in indices {
+            match ranges.last_mut() {
+                Some(last) if last.1 == i => last.1 = i + 1,
+                _ => {
+                    debug_assert!(
+                        ranges.last().is_none_or(|last| last.1 < i),
+                        "kept indices must be strictly ascending"
+                    );
+                    ranges.push((i, i + 1));
+                }
+            }
+        }
+        Self {
+            ranges,
+            total: indices.len(),
+        }
+    }
+
     pub fn from_mask(mask: &[bool]) -> Self {
         let mut ranges = Vec::new();
         let mut total = 0usize;

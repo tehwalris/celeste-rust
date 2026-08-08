@@ -1299,11 +1299,26 @@ pub fn visited_row_keys(
         state.vector_size,
         crate::interpreter::row_table::ROW_HASH_SEED2,
     );
-    let candidates: Vec<(u32, (u64, u64))> = keys
-        .into_iter()
-        .enumerate()
-        .filter_map(|(i, key)| visited.id_of(key).is_none().then_some((i as u32, key)))
-        .collect();
+    // Two filters, both here in the worker, and the second one matters more
+    // than it looks. `visited` is the table as it stood when this BATCH
+    // started, so a row that a sibling chunk is about to discover is still
+    // absent from it - every lane carrying that row would reach the serial
+    // phase as a candidate. Worse, a chunk's own lanes repeat rows
+    // constantly: at f50 a frame offers 57M lanes and keeps 1.1M.
+    //
+    // So dedup locally as well. Keeping only the FIRST lane of each key is
+    // exactly what the serial `insert_new` would have decided for the rest
+    // (it returns `None` for every later lane with the same key), so this
+    // changes nothing but the amount of work handed across the thread
+    // boundary. The local set holds one chunk's distinct rows, which is
+    // small enough to stay in cache - unlike the global table.
+    let mut seen: rustc_hash::FxHashSet<(u64, u64)> = rustc_hash::FxHashSet::default();
+    let mut candidates: Vec<(u32, (u64, u64))> = Vec::new();
+    for (i, key) in keys.into_iter().enumerate() {
+        if visited.id_of(key).is_none() && seen.insert(key) {
+            candidates.push((i as u32, key));
+        }
+    }
     Some(VisitedKeys {
         candidates,
         lanes: state.vector_size,
@@ -1333,19 +1348,24 @@ pub fn subtract_precomputed(
         return (vec![state], before, before);
     };
     debug_assert_eq!(lanes, state.vector_size);
-    let mut mask = vec![false; lanes];
-    let mut kept = 0usize;
+    // O(candidates), not O(lanes): the survivors come out as an ascending
+    // index list and go straight to runs. Building a lane-sized bool mask
+    // here was two extra passes over a vector ~50x longer than its answer,
+    // on the one phase of the frame that cannot be parallelised.
+    let mut survivors: Vec<u32> = Vec::new();
     for (lane, key) in candidates {
         if visited.insert_new(key).is_some() {
-            mask[lane as usize] = true;
-            kept += 1;
+            survivors.push(lane);
         }
     }
+    let kept = survivors.len();
     if kept == state.vector_size {
         (vec![state], before, kept)
     } else if kept > 0 {
+        let kept_lanes = crate::interpreter::value::KeptLanes::from_sorted_indices(&survivors);
         (
-            vec![state.filter_by_mask_clone(&mask, crate::interpreter::state::FILTER_VISITED)],
+            vec![state
+                .filter_by_kept_clone(&kept_lanes, crate::interpreter::state::FILTER_VISITED)],
             before,
             kept,
         )
@@ -1363,7 +1383,27 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
     // This removes garbage from heaps, allowing states to match shapes better.
     let states: Vec<State> = {
         let _gc_trace = TraceSpan::new("gc_before_vectorize", "gc");
-        states.into_iter().map(|mut s| { s.gc(); s }).collect()
+        // One state's gc cannot see another's, so this is a plain map over
+        // independent work - and at the frame boundary there are hundreds
+        // of survivor fragments. Chunked rather than one task per state so
+        // the thread count does not track the fragment count.
+        let threads = crate::interpreter::virtual_merge::merge_threads();
+        if states.len() < 8 || threads == 1 {
+            states.into_iter().map(|mut s| { s.gc(); s }).collect()
+        } else {
+            let mut states = states;
+            let chunk = states.len().div_ceil(threads);
+            std::thread::scope(|scope| {
+                for part in states.chunks_mut(chunk) {
+                    scope.spawn(move || {
+                        for s in part {
+                            s.gc();
+                        }
+                    });
+                }
+            });
+            states
+        }
     };
 
     if states.is_empty() {

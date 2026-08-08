@@ -406,6 +406,24 @@ impl State {
         new_state
     }
 
+    /// `filter_by_mask_clone` for a caller that already knows its survivors
+    /// as runs, skipping the bool mask entirely.
+    pub fn filter_by_kept_clone(
+        &self,
+        kept: &super::value::KeptLanes,
+        reason: FilterReason,
+    ) -> Self {
+        let _trace = TraceSpan::new(reason, "filter");
+        let mut new_state = self.clone();
+        new_state.heap.filter_vectors_in_place(kept);
+        new_state.local_env.filter_vectors_in_place(kept);
+        for env in &mut new_state.outer_local_envs {
+            env.filter_vectors_in_place(kept);
+        }
+        new_state.vector_size = kept.len();
+        new_state
+    }
+
     /// Garbage collect the heap and renumber HeapIds deterministically.
     /// This ensures that states with the same logical structure will have
     /// the same heap IDs, which is critical for vectorization to work correctly.
