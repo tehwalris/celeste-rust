@@ -514,15 +514,39 @@ fn stream_boundary_subtract(
     visited: &mut crate::interpreter::row_table::RowTable,
     counters: &mut StreamCounters,
 ) -> Vec<State> {
-    let mut kept_out = Vec::new();
+    decided_survivors(prepared, visited, counters)
+        .into_iter()
+        .filter_map(|(state, survivors)| {
+            crate::interpreter::vectorize::subtract_apply(state, survivors)
+        })
+        .collect()
+}
+
+/// The serial half of the subtract: assign ids to the new rows and say
+/// which lanes survive, WITHOUT gathering them.
+///
+/// The gather is `subtract_apply`, which is pure and goes back on a worker
+/// thread (`step_parallel`). It touches every column of the state, so
+/// leaving it in the serial phase put ~2% of a frame's lanes x ~58 columns
+/// of copying on the one thread that cannot be parallelised.
+fn decided_survivors(
+    prepared: Vec<PreparedRows>,
+    visited: &mut crate::interpreter::row_table::RowTable,
+    counters: &mut StreamCounters,
+) -> Vec<(State, crate::interpreter::vectorize::Survivors)> {
+    use crate::interpreter::vectorize::Survivors;
+    let mut out = Vec::with_capacity(prepared.len());
     for PreparedRows { state, keys } in prepared {
-        let (kept, before, after) =
-            crate::interpreter::vectorize::subtract_precomputed(state, keys, visited);
+        let (survivors, before) =
+            crate::interpreter::vectorize::subtract_decide(&state, keys, visited);
         counters.sub_before += before;
-        counters.sub_after += after;
-        kept_out.extend(kept);
+        counters.sub_after += match &survivors {
+            Survivors::All => state.vector_size,
+            Survivors::Some(kept) => kept.len(),
+        };
+        out.push((state, survivors));
     }
-    kept_out
+    out
 }
 
 /// Outcome of offering a state to the variant registry for one frame.
@@ -1077,15 +1101,47 @@ impl AbstractRun {
                 .visited_rows
                 .as_mut()
                 .expect("stream implies a visited table");
+            let mut decided = Vec::new();
             for result in results {
                 let (prepared, ev, sc) = result?;
                 counters.absorb(&ev);
                 stream_counters.absorb(&sc);
-                stream_survivors.extend(stream_boundary_subtract(
-                    prepared,
-                    visited,
-                    &mut stream_counters,
-                ));
+                decided.extend(decided_survivors(prepared, visited, &mut stream_counters));
+            }
+            drop(_t);
+            // Phase 3: gather the survivors. Pure given the decision above,
+            // so it goes back on the workers - it copies every column of
+            // every state that lost lanes.
+            let _t = ScopedPhase::new("fwd.boundary_gather");
+            let gathered: Vec<Vec<State>> = std::thread::scope(|scope| {
+                let chunk = decided.len().div_ceil(threads).max(1);
+                decided
+                    .chunks_mut(chunk)
+                    .map(|part| {
+                        scope.spawn(move || {
+                            let mut out = Vec::new();
+                            for (state, survivors) in part {
+                                let survivors = std::mem::replace(
+                                    survivors,
+                                    crate::interpreter::vectorize::Survivors::All,
+                                );
+                                if let Some(s) = crate::interpreter::vectorize::subtract_apply(
+                                    std::mem::replace(state, State::new()),
+                                    survivors,
+                                ) {
+                                    out.push(s);
+                                }
+                            }
+                            out
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|h| h.join().expect("boundary gather worker"))
+                    .collect()
+            });
+            for part in gathered {
+                stream_survivors.extend(part);
             }
         }
         self.report_frame_events(&counters);

@@ -1332,11 +1332,14 @@ pub fn visited_row_keys(
     })
 }
 
-/// PHASE 2: assign ids to the genuinely new rows and drop the rest.
+/// PHASE 2: decide which lanes survive, assigning ids to the genuinely new
+/// rows. Returns `None` when every lane survives (nothing to gather).
 ///
 /// Runs serially in input order - row ids are assigned in insertion order
 /// and everything downstream (checkpoints, bands, the backward sweep) is
-/// written in terms of them, so this ordering is load-bearing.
+/// written in terms of them, so this ordering is load-bearing. It is
+/// therefore kept as small as possible: the gather that ACTS on this
+/// decision is phase 3 and runs back on the worker threads.
 ///
 /// Phase 1's verdict is only a filter, never a decision: every candidate
 /// lane still goes through `insert_new`, which is what resolves duplicates
@@ -1344,15 +1347,22 @@ pub fn visited_row_keys(
 /// "absent" in phase 1; the second one's `insert_new` returns `None`).
 /// Handing over every lane as a candidate would give the same answer, just
 /// slower.
-pub fn subtract_precomputed(
-    state: State,
+pub enum Survivors {
+    /// Every lane is new; the state passes through untouched.
+    All,
+    /// The lanes to gather. Empty means the whole state is dropped.
+    Some(crate::interpreter::value::KeptLanes),
+}
+
+pub fn subtract_decide(
+    state: &State,
     keys: Option<VisitedKeys>,
     visited: &mut crate::interpreter::row_table::RowTable,
-) -> (Vec<State>, usize, usize) {
+) -> (Survivors, usize) {
     let _trace = TraceSpan::new("subtract_visited", "vectorize");
     let before = state.vector_size;
     let Some(VisitedKeys { candidates, lanes }) = keys else {
-        return (vec![state], before, before);
+        return (Survivors::All, before);
     };
     debug_assert_eq!(lanes, state.vector_size);
     // O(candidates), not O(lanes): the survivors come out as an ascending
@@ -1365,20 +1375,43 @@ pub fn subtract_precomputed(
             survivors.push(lane);
         }
     }
-    let kept = survivors.len();
-    if kept == state.vector_size {
-        (vec![state], before, kept)
-    } else if kept > 0 {
-        let kept_lanes = crate::interpreter::value::KeptLanes::from_sorted_indices(&survivors);
-        (
-            vec![state
-                .filter_by_kept_clone(&kept_lanes, crate::interpreter::state::FILTER_VISITED)],
-            before,
-            kept,
-        )
-    } else {
-        (Vec::new(), before, 0)
+    if survivors.len() == state.vector_size {
+        return (Survivors::All, before);
     }
+    (
+        Survivors::Some(crate::interpreter::value::KeptLanes::from_sorted_indices(
+            &survivors,
+        )),
+        before,
+    )
+}
+
+/// PHASE 3: gather the surviving lanes. Pure, so it goes back on a worker.
+pub fn subtract_apply(state: State, survivors: Survivors) -> Option<State> {
+    match survivors {
+        Survivors::All => Some(state),
+        Survivors::Some(kept) if kept.is_empty() => None,
+        Survivors::Some(kept) => Some(
+            state.filter_by_kept_clone(&kept, crate::interpreter::state::FILTER_VISITED),
+        ),
+    }
+}
+
+pub fn subtract_precomputed(
+    state: State,
+    keys: Option<VisitedKeys>,
+    visited: &mut crate::interpreter::row_table::RowTable,
+) -> (Vec<State>, usize, usize) {
+    let (survivors, before) = subtract_decide(&state, keys, visited);
+    let after = match &survivors {
+        Survivors::All => state.vector_size,
+        Survivors::Some(kept) => kept.len(),
+    };
+    (
+        subtract_apply(state, survivors).into_iter().collect(),
+        before,
+        after,
+    )
 }
 
 pub fn vectorize_states(states: Vec<State>) -> Vec<State> {

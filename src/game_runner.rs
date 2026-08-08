@@ -469,6 +469,10 @@ fn make_builtin_tile_flag_at(
         // into the lookup.
         match (&args[0], &args[1]) {
             (Value::Number(x), Value::Number(y)) => {
+                // (w, h) is the same for every lane of a call, so the map
+                // and its offset are chosen once here rather than re-tested
+                // per lane inside the loop below.
+                let map = collision_cache.solid_map(w, h);
                 let lookup = |xn: &Pico8Num, yn: &Pico8Num| -> Result<bool> {
                     let xi = xn.as_i16().ok_or_else(|| {
                         anyhow!("tile_flag_at: x must be an integer, got {:?}", xn)
@@ -476,23 +480,13 @@ fn make_builtin_tile_flag_at(
                     let yi = yn.as_i16().ok_or_else(|| {
                         anyhow!("tile_flag_at: y must be an integer, got {:?}", yn)
                     })?;
-                    // Try cached lookup for common sizes
-                    if w == 6 && h == 5 {
-                        // Player hitbox - but we need to account for the offset
-                        // solid_player expects position without hitbox offset
-                        if let Some(v) = collision_cache.solid_player(xi - 1, yi - 3) {
-                            return Ok(v);
-                        }
-                    } else if w == 1 && h == 1 {
-                        if let Some(v) = collision_cache.solid_1x1(xi, yi) {
-                            return Ok(v);
-                        }
-                    } else if w == 8 && h == 8 {
-                        if let Some(v) = collision_cache.solid_8x8(xi, yi) {
+                    if let Some((map, dx, dy)) = map {
+                        if let Some(v) = map.get(xi + dx, yi + dy) {
                             return Ok(v);
                         }
                     }
-                    // Fall back to computation
+                    // Outside the precomputed range, or a hitbox size with
+                    // no map: compute it.
                     Ok(collision_cache.solid_at(&cart_data, xi, yi, w, h).unwrap_or(false))
                 };
                 let result = match (x, y) {
