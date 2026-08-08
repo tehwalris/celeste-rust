@@ -489,6 +489,13 @@ fn bench(
         };
     let start = std::time::Instant::now();
     let mut first_win: Option<u32> = None;
+    // A campaign is hours long and its tail frames are the expensive ones;
+    // never go longer than this without a restart point.
+    let checkpoint_seconds: u64 = std::env::var("CELESTE_CHECKPOINT_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(600);
+    let mut last_checkpoint = std::time::Instant::now();
     for frame in start_frame..=frames {
         let frame_start = std::time::Instant::now();
         run.step()?;
@@ -498,7 +505,13 @@ fn bench(
                     checkpoint::save_frame_states(&cfg.dir, frame, run.states())
                 })?;
             }
-            if frame % cfg.every == 0 || frame == frames {
+            // Frame count is the wrong unit for this. A frame costs 2 s at
+            // f55 and 100 s at f75 on room (0,0), so "every 5 frames" is a
+            // 10-second interval early and a half-hour one exactly where
+            // the run is most expensive to lose. Whichever comes first,
+            // frames or CELESTE_CHECKPOINT_SECONDS (default 10 min).
+            let overdue = last_checkpoint.elapsed().as_secs() >= checkpoint_seconds;
+            if frame % cfg.every == 0 || frame == frames || overdue {
                 let t = std::time::Instant::now();
                 let empty = celeste_rust::interpreter::row_table::RowTable::default();
                 let path = checkpoint::save(
@@ -510,10 +523,12 @@ fn bench(
                     run.deopt_events(),
                 )?;
                 println!(
-                    "  checkpoint {} written in {:.1}s",
+                    "  checkpoint {} written in {:.1}s{}",
                     path.display(),
-                    t.elapsed().as_secs_f64()
+                    t.elapsed().as_secs_f64(),
+                    if overdue { " (time-triggered)" } else { "" }
                 );
+                last_checkpoint = std::time::Instant::now();
             }
         }
         if let Some(w) = xy_dump.as_mut() {
