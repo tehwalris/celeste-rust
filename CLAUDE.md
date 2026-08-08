@@ -63,8 +63,16 @@ accidental blowup kills the process rather than the machine.
 ./safe-run.sh -- ./target/release/celeste-rust -n 40
 ```
 
-Exit code 137 means OOM. Frame 40 already peaks at ~29 GB; do not run higher
-frame counts unsandboxed.
+Exit code 137 means OOM. Peak memory is much lower than it used to be (the
+chunk-parallel work took frame 60 of the rewritten path from 4.3 GB to
+2.4 GB), but the unrewritten `celeste-rust -n 40` runner is still the old
+~29 GB - do not run higher frame counts unsandboxed.
+
+The search runs on 16 threads with an 8,000-lane chunk cap by default.
+Those two are ONE setting: threads without chunking undoes the streaming
+boundary's memory bound, and chunking without threads is a ~23% loss. See
+`plans/roofline-plan.md` before changing either, and `./parcheck.sh` to
+re-check that the parallel path stays byte-identical to the serial one.
 
 ## Useful entry points
 
