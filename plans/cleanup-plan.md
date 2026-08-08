@@ -12,6 +12,24 @@ tas/room_0_0_exit_frame_94.txt via trace-witness), not just the (1,0)
 suite. Rationale: the fake_wall incident - a verified-looking recipe
 entry was unsound in code that room (1,0) never executes.
 
+## Baseline (established 2026-08-08, logs in
+## ~/celeste-checkpoints/cleanup-baseline-2026-08-08/)
+
+- nextest: 469 passed, 1 skipped.
+- `verify --frames 40`: ok both rooms (room1 63.2s, room00 42.1s).
+- trace-witness room00 (h94, k0..16): PASSES every level every frame.
+- trace-witness room1 (h100, k0..16): in-band at every level through
+  f099; at f100 (the post-exit frame, player at (8,124) in room (2,0))
+  only k16 matches, k0-k15 MISS. This is NOT a cleanup regression and
+  NOT a soundness hole: the historical certificate (full pass incl.
+  f100) was issued before the fruit-`off` interval widening changed how
+  fruit-bearing states abstract at Bits(k) levels, and room (2,0) has a
+  fruit on screen. The room1 tables are internally consistent with the
+  code that built and certified them; current-code probes of those
+  tables mismatch only on the one fruit-bearing (post-exit) frame, and
+  only at widened levels. Phase B's re-derivation restores code/table
+  consistency. Until then, gate = outputs identical to these logs.
+
 ## Phase A: hash-neutral passes (each independently gated)
 
 1. Single source of truth for program assembly. concrete_run
