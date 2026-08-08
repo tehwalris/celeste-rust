@@ -206,7 +206,7 @@ enum Command {
         base_dir: String,
     },
     /// Census of a saved frame batch: lanes grouped by object-array shape
-    /// (inspect::object_shape), with the fruit `off`-counter spread when a
+    /// (abstraction::object_shape), with the fruit `off`-counter spread when a
     /// fruit is alive. For diagnosing frontier bloat - e.g. room (0,0)'s
     /// post-break lanes, whose ever-incrementing `off` defeats cross-frame
     /// dedup (plans/room00-plan.md).
@@ -494,7 +494,7 @@ fn bench(
             let mut hist: std::collections::BTreeMap<(i16, i16), u64> = Default::default();
             for state in run.states() {
                 if let Some(points) =
-                    celeste_rust::interpreter::inspect::player_xy_per_lane(state)
+                    celeste_rust::interpreter::abstraction::player_xy_per_lane(state)
                 {
                     for p in points {
                         *hist.entry(p).or_default() += 1;
@@ -512,7 +512,7 @@ fn bench(
         let win_lanes: usize = run
             .states()
             .iter()
-            .map(|s| celeste_rust::interpreter::inspect::count_room_x_lanes(s, win_x))
+            .map(|s| celeste_rust::interpreter::abstraction::count_room_x_lanes(s, win_x))
             .sum();
         if win_lanes > 0 && first_win.is_none() {
             first_win = Some(frame);
@@ -1862,7 +1862,7 @@ fn main() -> Result<()> {
             }
         }
         Command::Widencheck { frames } => {
-            use celeste_rust::interpreter::inspect::apply_conservative_widenings;
+            use celeste_rust::interpreter::abstraction::apply_conservative_widenings;
             use celeste_rust::interpreter::vectorize::vectorize_states;
             use celeste_rust::rewrite::verify::{observe_frame, AbstractRun};
             let (program, _) = build(&recipe)?;
@@ -1955,7 +1955,8 @@ fn main() -> Result<()> {
             );
         }
         Command::ShapeCensus { checkpoint_dir, frame } => {
-            use celeste_rust::interpreter::inspect::{object_shape, StateHelper};
+            use celeste_rust::interpreter::abstraction::object_shape;
+            use celeste_rust::interpreter::inspect::StateHelper;
             use celeste_rust::interpreter::value::{HeapValue, MaybeVector, Value};
             use celeste_rust::rewrite::checkpoint;
             let dir = std::path::PathBuf::from(&checkpoint_dir);
@@ -2080,7 +2081,7 @@ fn main() -> Result<()> {
             };
             let band = match (band_dir, band_horizon, band_prev_bits) {
                 (Some(dir), Some(horizon), Some(prev_bits)) => {
-                    use celeste_rust::interpreter::inspect::RemPrecision;
+                    use celeste_rust::interpreter::abstraction::RemPrecision;
                     use celeste_rust::rewrite::checkpoint;
                     use celeste_rust::rewrite::sweep;
                     let prev_precision = if prev_bits >= 16 {
@@ -2146,7 +2147,7 @@ fn main() -> Result<()> {
         }
 
         Command::TraceWitness { tas, horizon, levels, base_dir } => {
-            use celeste_rust::interpreter::inspect::{
+            use celeste_rust::interpreter::abstraction::{
                 apply_conservative_widenings, make_state_abstract_rem, RemPrecision,
             };
             use celeste_rust::interpreter::row_table::RowTable;
@@ -2210,7 +2211,7 @@ fn main() -> Result<()> {
                 // Canonicalize per level and probe.
                 let mut canon = state.clone();
                 mapping.from_canonical(&mut canon)?;
-                let pos = celeste_rust::interpreter::inspect::player_xy_per_lane(&state)
+                let pos = celeste_rust::interpreter::abstraction::player_xy_per_lane(&state)
                     .and_then(|v| v.first().copied());
                 let mut line = match pos {
                     Some((x, y)) => format!("f{:03} ({:>3},{:>3}):", frame, x, y),
@@ -2270,7 +2271,7 @@ fn main() -> Result<()> {
         Command::ExtractTas { horizon, level, base_dir, tas } => {
             use celeste_rust::interpreter::fixed_env::PreparedCfg;
             use celeste_rust::interpreter::glue::interpret_prepared_cfg;
-            use celeste_rust::interpreter::inspect::{
+            use celeste_rust::interpreter::abstraction::{
                 apply_conservative_widenings, count_room_x_lanes, make_state_abstract_rem,
                 RemPrecision,
             };
@@ -2427,7 +2428,7 @@ fn main() -> Result<()> {
         Command::CountOptimal { horizon, level, base_dir } => {
             use celeste_rust::interpreter::fixed_env::PreparedCfg;
             use celeste_rust::interpreter::glue::interpret_prepared_cfg;
-            use celeste_rust::interpreter::inspect::{
+            use celeste_rust::interpreter::abstraction::{
                 apply_conservative_widenings, count_room_x_lanes, make_state_abstract_rem,
                 player_xy_per_lane, RemPrecision,
             };

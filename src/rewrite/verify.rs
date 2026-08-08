@@ -36,7 +36,7 @@ use std::hash::{Hash, Hasher};
 
 use crate::game_runner::{create_initial_state_with_builtins, inject_tile_flag_at_builtin};
 use crate::interpreter::glue::{interpret_cfg, interpret_prepared_cfg};
-use crate::interpreter::inspect::make_state_abstract;
+use crate::interpreter::abstraction::make_state_abstract;
 use crate::interpreter::state::State;
 use crate::interpreter::value::{HeapValue, MaybeVector, Value};
 use crate::interpreter::vectorize::vectorize_states;
@@ -301,7 +301,7 @@ pub struct BandFilter {
     pub g_prev: Vec<u16>,
     pub horizon: u32,
     /// The previous level's rem precision (what to coarsen to).
-    pub prev_precision: crate::interpreter::inspect::RemPrecision,
+    pub prev_precision: crate::interpreter::abstraction::RemPrecision,
 }
 
 /// Everything needed to re-run a frame under the plain program when the
@@ -328,7 +328,7 @@ struct DeoptTarget {
 }
 
 /// A per-shape specialized program (plans/room00-plan.md, "shape-dispatched
-/// variants"): a state whose object-array shape (`inspect::object_shape`)
+/// variants"): a state whose object-array shape (`abstraction::object_shape`)
 /// matches one of `shapes` runs its frames under this program instead of
 /// the base one.
 ///
@@ -404,12 +404,12 @@ fn stream_boundary_one(
     counters: &mut StreamCounters,
 ) -> Result<Vec<State>> {
     let mut kept_out = Vec::new();
-    for state in crate::interpreter::inspect::split_rem_straddles(state) {
+    for state in crate::interpreter::abstraction::split_rem_straddles(state) {
         let state = make_state_abstract(state);
         let state = if let Some(band) = band {
             counters.band_before += state.vector_size;
             let budget = band.horizon.saturating_sub(frame);
-            let mut coarse = crate::interpreter::inspect::make_state_abstract_rem(
+            let mut coarse = crate::interpreter::abstraction::make_state_abstract_rem(
                 state.clone(),
                 band.prev_precision,
             );
@@ -473,7 +473,7 @@ enum VariantOutcome {
 /// ways. Any error or panic falls back to the base path with a loud print;
 /// the snapshot clone is what makes that fallback possible.
 fn dispatch_variant_frame(vd: &mut VariantDispatch, state: State) -> VariantOutcome {
-    let shape = match crate::interpreter::inspect::object_shape(&state) {
+    let shape = match crate::interpreter::abstraction::object_shape(&state) {
         Ok(shape) => shape,
         Err(err) => {
             // A state whose shape cannot be read is not dispatchable; the
@@ -680,7 +680,7 @@ impl AbstractRun {
         let win_x = crate::game_runner::win_room_x();
         let mut kept = Vec::new();
         for state in std::mem::take(&mut self.states) {
-            let mask: Vec<bool> = crate::interpreter::inspect::room_x_lane_mask(&state, win_x)
+            let mask: Vec<bool> = crate::interpreter::abstraction::room_x_lane_mask(&state, win_x)
                 .into_iter()
                 .map(|w| !w)
                 .collect();
@@ -764,7 +764,7 @@ impl AbstractRun {
                         // lane is an order of magnitude above a normal
                         // state's (h89 OOMed on exactly this with the
                         // uniform cap).
-                        let cap = match crate::interpreter::inspect::object_shape(&state) {
+                        let cap = match crate::interpreter::abstraction::object_shape(&state) {
                             Ok(shape) if shape.iter().any(|t| t == "fruit") => {
                                 // Divisor tunable per context: the sweep's
                                 // origin-tagged replays block all dedup, so
@@ -980,12 +980,12 @@ impl AbstractRun {
             if self.rem_only_abstraction {
                 new_states
                     .into_iter()
-                    .map(crate::interpreter::inspect::make_state_abstract_rem_only)
+                    .map(crate::interpreter::abstraction::make_state_abstract_rem_only)
                     .collect()
             } else {
                 new_states
                     .into_iter()
-                    .flat_map(crate::interpreter::inspect::split_rem_straddles)
+                    .flat_map(crate::interpreter::abstraction::split_rem_straddles)
                     .map(make_state_abstract)
                     .collect()
             }
@@ -1006,7 +1006,7 @@ impl AbstractRun {
             let (mut before, mut after, mut missing) = (0usize, 0usize, 0usize);
             for state in std::mem::take(&mut self.states) {
                 before += state.vector_size;
-                let mut coarse = crate::interpreter::inspect::make_state_abstract_rem(
+                let mut coarse = crate::interpreter::abstraction::make_state_abstract_rem(
                     state.clone(),
                     band.prev_precision,
                 );
@@ -1597,7 +1597,7 @@ mod tests {
         let mut run = AbstractRun::start(&plain).expect("start base run");
         // Shape probe sanity: room (1,0) starts as a lone player_spawn.
         assert_eq!(
-            crate::interpreter::inspect::object_shape(&run.states()[0]).expect("shape probe"),
+            crate::interpreter::abstraction::object_shape(&run.states()[0]).expect("shape probe"),
             vec!["player_spawn".to_string()]
         );
         run.set_variants(

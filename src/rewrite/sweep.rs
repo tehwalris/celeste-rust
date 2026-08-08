@@ -29,7 +29,7 @@ use anyhow::{anyhow, Context, Result};
 use std::path::Path;
 
 use crate::interpreter::deopt_collect;
-use crate::interpreter::inspect::room_x_lane_mask;
+use crate::interpreter::abstraction::room_x_lane_mask;
 use crate::interpreter::row_table::{RowTable, ROW_HASH_SEED2};
 use crate::interpreter::state::State;
 use crate::interpreter::vectorize::shape_of_state;

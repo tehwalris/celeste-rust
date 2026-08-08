@@ -55,7 +55,7 @@ pub struct Meta {
 pub fn config_fingerprint(recipe_text: &str) -> String {
     config_fingerprint_with_precision(
         recipe_text,
-        crate::interpreter::inspect::rem_precision_from_env(),
+        crate::interpreter::abstraction::rem_precision_from_env(),
     )
 }
 
@@ -64,7 +64,7 @@ pub fn config_fingerprint(recipe_text: &str) -> String {
 /// from the current run's only in the precision component.
 pub fn config_fingerprint_with_precision(
     recipe_text: &str,
-    precision: crate::interpreter::inspect::RemPrecision,
+    precision: crate::interpreter::abstraction::RemPrecision,
 ) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = rustc_hash::FxHasher::default();
@@ -86,7 +86,7 @@ pub fn config_fingerprint_with_precision(
     // The rem precision level changes the reachable set; the VALUE matters.
     // Hashed only when non-default so checkpoints written before the ladder
     // existed (implicitly Bits(0)) remain valid.
-    if precision != crate::interpreter::inspect::RemPrecision::Bits(0) {
+    if precision != crate::interpreter::abstraction::RemPrecision::Bits(0) {
         format!("{:?}", precision).hash(&mut h);
     }
     format!("{:016x}", h.finish())

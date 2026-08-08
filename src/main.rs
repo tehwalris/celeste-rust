@@ -154,7 +154,8 @@ fn run_game_frames(
     resume: bool,
 ) -> Result<()> {
     use crate::interpreter::glue::interpret_cfg;
-    use crate::interpreter::inspect::{make_state_abstract, create_frame_dump, write_frame_dump_jsonl, dump_states_to_file, save_checkpoint, load_checkpoint, checkpoint_filename, Checkpoint};
+    use crate::interpreter::abstraction::make_state_abstract;
+    use crate::interpreter::inspect::{create_frame_dump, write_frame_dump_jsonl, dump_states_to_file, save_checkpoint, load_checkpoint, checkpoint_filename, Checkpoint};
     use crate::interpreter::profiling::{enable_profiling, get_chrome_tracing_json, get_dag_json, get_tree_json, get_cfgs_json, get_profile_summary};
     use crate::interpreter::tracing::{enable_tracing, get_tracing_json, collect_thread_spans};
     use crate::game_runner::{create_initial_state_with_builtins, inject_tile_flag_at_builtin};
@@ -276,7 +277,7 @@ fn run_game_frames(
         // Make states abstract (widen player.rem to interval)
         new_states = new_states
             .into_iter()
-            .flat_map(crate::interpreter::inspect::split_rem_straddles)
+            .flat_map(crate::interpreter::abstraction::split_rem_straddles)
             .map(make_state_abstract)
             .collect();
 

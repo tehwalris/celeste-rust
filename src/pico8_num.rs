@@ -94,7 +94,7 @@ impl Pico8Num {
     /// argument is first reduced to [0, 1) IN FIXED POINT (the 16
     /// fractional bits - exact, and periodicity mod one turn holds by
     /// construction, which the fruit-off boundary widening in
-    /// `inspect::apply_conservative_widenings` depends on); then the chain
+    /// `abstraction::apply_conservative_widenings` depends on); then the chain
     /// runs in f32 (`sinf`), converted to 16.16 by C-style truncation
     /// toward zero (Rust `as i32`). Without the reduction, f32 loses
     /// fractional mantissa bits for arguments past 1.0 and sin(102/40) !=
@@ -457,7 +457,7 @@ mod tests {
     }
 
     /// Pins the invariance the fruit-off boundary widening relies on
-    /// (`inspect::apply_conservative_widenings`): for every nonnegative
+    /// (`abstraction::apply_conservative_widenings`): for every nonnegative
     /// integer `off`, `sin(off/40) == sin((off mod 40)/40)` BIT-EXACTLY in
     /// this implementation. The fixed-point division makes the arguments
     /// differ by exactly 1.0 per period ((off+40)/40 == off/40 + 1 for

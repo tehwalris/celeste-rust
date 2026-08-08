@@ -1,4 +1,5 @@
 mod core_interpreter;
+pub mod abstraction;
 pub mod deopt_collect;
 pub mod fixed_env;
 mod flow;
