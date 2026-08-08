@@ -1,7 +1,3 @@
-// TODO don't allow later
-#![allow(dead_code)]
-#![allow(unused_variables)]
-
 // Use mimalloc as the global allocator for better performance
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -265,7 +261,6 @@ fn run_game_frames(
     };
 
     for frame_num in start_frame..=num_frames {
-        let expanded_input: usize = states.iter().map(|s| s.vector_size).sum();
         print!("Frame {}: ", frame_num);
 
         let start = std::time::Instant::now();
