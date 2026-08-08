@@ -1312,6 +1312,13 @@ pub fn visited_row_keys(
     // changes nothing but the amount of work handed across the thread
     // boundary. The local set holds one chunk's distinct rows, which is
     // small enough to stay in cache - unlike the global table.
+    //
+    // Order matters, and not the way it first looks. Probing the small
+    // cache-resident set FIRST to save global misses was measured and is
+    // 4% WORSE: it makes `seen` hold every distinct row in the chunk
+    // instead of only the candidates, and the candidates are ~2% of them.
+    // The global probe is the cheap filter here precisely because it
+    // rejects so much.
     let mut seen: rustc_hash::FxHashSet<(u64, u64)> = rustc_hash::FxHashSet::default();
     let mut candidates: Vec<(u32, (u64, u64))> = Vec::new();
     for (i, key) in keys.into_iter().enumerate() {
