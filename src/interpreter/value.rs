@@ -161,7 +161,39 @@ pub enum Value {
     Nil(Option<String>),
     Pointer(HeapId),
     NilPointer(String),
+    /// A per-lane tri-state bool: `Some(b)` where the comparison was
+    /// definite for that lane, `None` where it genuinely straddles.
+    ///
+    /// TRANSIENT - see plans/tristate-plan.md. This value exists only
+    /// between the instruction that computes it and that instruction's
+    /// result being assigned, where `resolve_maybe_bool` turns it into a
+    /// definite `Bool` by duplicating the ambiguous lanes. It must never
+    /// reach local_env, the heap, a checkpoint or a row hash.
+    ///
+    /// The invariant is enforced rather than accommodated: the lane
+    /// filters, splitters and expanders reject it loudly. A per-lane
+    /// variant they merely *ignored* would not be resized with its
+    /// neighbours, silently desyncing every downstream lane index -
+    /// which is precisely the bug class this design avoids.
+    ///
+    /// Only ever constructed MIXED (at least one `Some` and one `None`):
+    /// all-definite is a `Bool`, all-unknown is an `UnknownBool`, so
+    /// every pre-existing path keeps its exact previous behaviour.
+    ///
+    /// Kept LAST in the enum on purpose: the variants above keep their
+    /// bincode discriminants, so checkpoints written before this existed
+    /// stay byte-compatible. Adding it mid-enum shifted every later
+    /// variant and changed `states.bin` for a purely inert change - which
+    /// would have silently invalidated a certified checkpoint universe.
+    MaybeBool(MaybeVector<Option<bool>>),
 }
+
+/// Panic message for the lane-structural handlers. Centralised so the
+/// invariant reads the same everywhere it is enforced.
+pub const MAYBE_BOOL_ESCAPED: &str =
+    "Value::MaybeBool escaped into a stored state - it is transient and must be \
+     resolved by resolve_maybe_bool at the instruction that produced it \
+     (see plans/tristate-plan.md)";
 
 /// Count true values in a mask using SIMD-friendly byte sum
 #[inline(always)]
@@ -323,6 +355,8 @@ impl Value {
                 let (a, b) = split_vec(vec, runs);
                 Some((Value::NumberInterval(a), Value::NumberInterval(b)))
             }
+            // As above: an unsplit vector desyncs both sides of the branch.
+            Value::MaybeBool(_) => panic!("{}", MAYBE_BOOL_ESCAPED),
             _ => None,
         }
     }
@@ -344,6 +378,10 @@ impl HeapValue {
                         Value::Bool(MaybeVector::Vector(_))
                             | Value::Number(MaybeVector::Vector(_))
                             | Value::NumberInterval(MaybeVector::Vector(_))
+                            // Listed so a stray MaybeBool routes into the
+                            // per-value path and trips its guard, instead of
+                            // being skipped as "this closure has no vectors".
+                            | Value::MaybeBool(_)
                     )
                 });
                 if !any_vector {
@@ -420,6 +458,10 @@ impl Value {
             Value::NumberInterval(MaybeVector::Vector(vec)) => {
                 Some(Value::NumberInterval(filter_vec_gather_ref(vec, kept)))
             }
+            // A vector NOT gathered here keeps its old lane count while its
+            // neighbours shrink - silent desync. MaybeBool is transient and
+            // cannot arrive, so say so rather than falling through to None.
+            Value::MaybeBool(_) => panic!("{}", MAYBE_BOOL_ESCAPED),
             _ => None,
         }
     }
@@ -450,7 +492,9 @@ impl HeapValue {
                     if matches!(cap,
                         Value::Bool(MaybeVector::Vector(_)) |
                         Value::Number(MaybeVector::Vector(_)) |
-                        Value::NumberInterval(MaybeVector::Vector(_))
+                        Value::NumberInterval(MaybeVector::Vector(_)) |
+                        // As above: route to the guard rather than skip.
+                        Value::MaybeBool(_)
                     ) {
                         any_vector = true;
                         break;

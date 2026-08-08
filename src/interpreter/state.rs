@@ -320,6 +320,10 @@ impl State {
             Value::Number(v) => Value::Number(double(v)),
             Value::NumberInterval(v) => Value::NumberInterval(double(v)),
             Value::Bool(v) => Value::Bool(double(v)),
+            // A per-lane variant that is NOT doubled here would desync every
+            // downstream lane index, silently. It is transient by design so
+            // it cannot arrive; say so loudly if it ever does.
+            Value::MaybeBool(_) => panic!("{}", super::value::MAYBE_BOOL_ESCAPED),
             other @ (Value::UnknownBool
             | Value::String(_)
             | Value::Nil(_)
@@ -417,6 +421,7 @@ impl State {
                 | Value::NumberInterval(_)
                 | Value::Bool(_)
                 | Value::UnknownBool
+                | Value::MaybeBool(_)
                 | Value::String(_)
                 | Value::Nil(_)
                 | Value::NilPointer(_)) => v,

@@ -81,6 +81,8 @@ fn value_cell(value: &Value, lane: usize) -> Cell {
         }
         Value::Bool(b) => Cell::Bool(pick(b, lane)),
         Value::UnknownBool => Cell::UnknownBool,
+        // Transient (value.rs): never present in an observed state.
+        Value::MaybeBool(_) => panic!("{}", crate::interpreter::value::MAYBE_BOOL_ESCAPED),
         Value::String(s) => Cell::Str(s.clone()),
         Value::Nil(hint) => Cell::Nil(hint.clone()),
         Value::Pointer(id) => Cell::Pointer(id.raw()),

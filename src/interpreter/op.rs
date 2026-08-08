@@ -69,6 +69,11 @@ fn lane_condition(v: &Value) -> Option<MaybeVector<bool>> {
         | Value::String(_)
         | Value::Pointer(_) => Some(MaybeVector::Scalar(true)),
         Value::UnknownBool | Value::NilPointer(_) => None,
+        // Transient (see value.rs): it is resolved into a definite `Bool`
+        // before assignment, so a select should never receive one. Reported
+        // as "no per-lane value" rather than panicking, so the deopt path
+        // can still absorb it if some route ever does reach here.
+        Value::MaybeBool(_) => None,
     }
 }
 

@@ -327,6 +327,10 @@ impl BoundBranchSplit {
         // can be moved below.
         let condition_value = state.local_env.get(self.condition_local_id).clone();
         match condition_value {
+            // Transient: comparisons resolve MaybeBool into a definite Bool
+            // at the instruction that produced it, so a branch can never see
+            // one. Loud rather than accommodated - see value.rs.
+            Value::MaybeBool(_) => panic!("{}", crate::interpreter::value::MAYBE_BOOL_ESCAPED),
             Value::Bool(MaybeVector::Scalar(false)) | Value::Nil(_) => Ok((None, Some(state))),
             Value::UnknownBool => {
                 // Both edges get the whole state - no filtering, so this
