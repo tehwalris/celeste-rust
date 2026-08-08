@@ -48,6 +48,34 @@ pub fn interpret_unary_op(state: &State, op: UnaryOp, v: &Value) -> Result<Value
     }
 }
 
+/// Per-lane tri-state resolution for MIXED interval comparisons
+/// (CELESTE_TRI_STATE=1). OFF by default, because the first deep
+/// measurement showed it is not yet deployable:
+///
+///   room (0,0), frames 1-78, identical inputs
+///     baseline:  2394 s, peak 27.9 GB, 9.48 M lanes deopted
+///     tri-state: identical lanes every frame through f65, identical
+///                cumulative time (586.6 s vs 589.3 s), then OOM at
+///                102 GB inside frame 66
+///
+/// So the mechanism is right - it reproduces the baseline's results
+/// exactly, and costs nothing when it does not fire - but the cost model
+/// was wrong. Resolution duplicates the ambiguous lanes eagerly at every
+/// mixed comparison, and `obj.collide` has several in a row, so once the
+/// ambiguous set stops being a sliver the intra-frame transient
+/// multiplies with no merge in between to collapse the (largely
+/// identical) copies. The design premise - that per-lane analysis would
+/// leave "a few thousand" of 5.9 M lanes ambiguous - is untested and
+/// looks false near the strawberry.
+///
+/// Keep the flag: the lane-independence property it restores is worth
+/// having, and the diagnosis needs the code. But the default must be the
+/// path we know completes.
+fn tri_state_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CELESTE_TRI_STATE").is_some())
+}
+
 /// Helper to lift a number to an interval
 fn lift_to_interval(v: &MaybeVector<Pico8Num>) -> MaybeVector<Pico8NumInterval> {
     v.map_to(|n| Pico8NumInterval::from_number(*n))
@@ -499,7 +527,7 @@ pub fn interpret_binary_op(l: &Value, op: BinaryOp, r: &Value) -> Result<Value> 
                 // No lane has an answer: exactly the old whole-value case,
                 // and the branch machinery already handles it.
                 Ok(Value::UnknownBool)
-            } else if any_unknown {
+            } else if any_unknown && tri_state_enabled() {
                 // MIXED - the case this whole change exists for. Previously
                 // one straddling lane collapsed every definite answer beside
                 // it, dragging the entire state onto the plain program. Now

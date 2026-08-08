@@ -132,6 +132,33 @@ enum Command {
         #[arg(long, default_value_t = 34)]
         frames: u32,
     },
+    /// Certify BATCHING INVARIANCE: a lane's result must not depend on
+    /// which other lanes share its state.
+    ///
+    /// Philippe's formulation, which is the property this checks: "if you
+    /// take one state and run it, versus all the states concatenated and
+    /// run through, you should be getting the same output - SIMD-ness
+    /// should be a pure optimization, not a behavior change."
+    ///
+    /// Method: walk the real search forward, and at each frame take the
+    /// live states, sample up to `--max-lanes` of their lanes, and run
+    /// that sub-state two ways - once as a batch, and once as one
+    /// single-lane state per lane. The canonical row keys (the same
+    /// per-lane fingerprints the search's tables and the proofs use) must
+    /// come out as the same set. Any difference is a lane-independence
+    /// violation, reported with the frame and the offending keys.
+    ///
+    /// This is the acceptance gate for the tri-state work: the v1
+    /// whole-value UnknownBool violates it by construction, because one
+    /// straddling lane changes what its neighbours compute.
+    Simdcheck {
+        #[arg(long, default_value_t = 30)]
+        frames: u32,
+        /// Lanes sampled per state per frame. Cost is one extra frame run
+        /// per lane, so this trades coverage for time.
+        #[arg(long, default_value_t = 24)]
+        max_lanes: usize,
+    },
     /// Certify the canonical-state mapping and the deopt path: run the
     /// rewritten program with deopt *forced* on every state of every frame -
     /// so each frame goes specialized-input -> to_canonical -> plain program
@@ -1969,6 +1996,131 @@ fn main() -> Result<()> {
                  boundary equals post-hoc widening of the exact sets",
                 frames
             );
+        }
+        Command::Simdcheck { frames, max_lanes } => {
+            use celeste_rust::interpreter::state::State;
+            use celeste_rust::rewrite::state_mapping::StateMapping;
+            use celeste_rust::rewrite::sweep;
+            use celeste_rust::rewrite::verify::AbstractRun;
+            use std::collections::BTreeSet;
+
+            if std::env::var_os("CELESTE_FRONTIER_ONLY").is_some() {
+                return Err(anyhow!(
+                    "simdcheck must run with the frontier subtract OFF: it \
+                     removes rows seen in earlier frames, which a batched run \
+                     and a single-lane run would each do against their own \
+                     history, making the two incomparable for reasons that \
+                     have nothing to do with lane independence"
+                ));
+            }
+
+            let (program, _) = build(&recipe)?;
+            let plain = Program::compile_executable_from_disk()?;
+            let mapping = StateMapping::from_recipe(&recipe);
+
+            // Canonical per-lane fingerprints of a set of states - the same
+            // row keys the search's tables and the optimality proofs use, so
+            // "same output" here means the same thing it means there.
+            let rows_of = |states: &[State]| -> Result<BTreeSet<(u64, u64)>> {
+                let mut out = BTreeSet::new();
+                for state in states {
+                    let mut s = state.clone();
+                    s.gc();
+                    for key in sweep::row_keys(&s)? {
+                        out.insert(key);
+                    }
+                }
+                Ok(out)
+            };
+
+            // Run exactly one frame over `states` and return their rows.
+            let run_once = |states: Vec<State>| -> Result<BTreeSet<(u64, u64)>> {
+                let mut run =
+                    AbstractRun::start_with_deopt(&program, &plain, mapping.clone(), false)?;
+                run.restore(states, None, (0, 0))?;
+                run.step()?;
+                rows_of(run.states())
+            };
+
+            let mut run =
+                AbstractRun::start_with_deopt(&program, &plain, mapping.clone(), false)?;
+            let mut checked_lanes = 0usize;
+            let mut violations = 0usize;
+            for frame in 1..=frames {
+                // Sample from the live states BEFORE stepping, so the inputs
+                // are states the real search actually reaches.
+                let inputs: Vec<State> = run.states().to_vec();
+                for (si, state) in inputs.iter().enumerate() {
+                    let n = state.vector_size;
+                    if n == 0 {
+                        continue;
+                    }
+                    // Stride so the sample spans the state rather than
+                    // clustering at lane 0, where lanes are most alike.
+                    let take = max_lanes.min(n);
+                    let stride = (n + take - 1) / take;
+                    let picked: Vec<usize> = (0..n).step_by(stride.max(1)).take(take).collect();
+                    let mut mask = vec![false; n];
+                    for &i in &picked {
+                        mask[i] = true;
+                    }
+                    let group = state.filter_by_mask_clone(
+                        &mask,
+                        celeste_rust::interpreter::state::FILTER_BAND,
+                    );
+
+                    let batched = run_once(vec![group.clone()])?;
+
+                    let mut singles = BTreeSet::new();
+                    for lane in 0..group.vector_size {
+                        let mut one = vec![false; group.vector_size];
+                        one[lane] = true;
+                        let single = group.filter_by_mask_clone(
+                            &one,
+                            celeste_rust::interpreter::state::FILTER_BAND,
+                        );
+                        for key in run_once(vec![single])? {
+                            singles.insert(key);
+                        }
+                    }
+                    checked_lanes += group.vector_size;
+
+                    if batched != singles {
+                        violations += 1;
+                        let only_batched: Vec<_> = batched.difference(&singles).take(3).collect();
+                        let only_singles: Vec<_> = singles.difference(&batched).take(3).collect();
+                        println!(
+                            "VIOLATION frame {} state {}: batched {} rows vs singletons {} rows",
+                            frame,
+                            si,
+                            batched.len(),
+                            singles.len()
+                        );
+                        println!("  only when batched:   {:?}", only_batched);
+                        println!("  only when separate:  {:?}", only_singles);
+                    }
+                }
+                run.step()?;
+                if frame % 5 == 0 || frame == frames {
+                    println!(
+                        "f{:03}: {} lanes checked so far, {} violation(s)",
+                        frame, checked_lanes, violations
+                    );
+                }
+            }
+            if violations == 0 {
+                println!(
+                    "simdcheck PASSES: {} lanes over {} frames produce identical \
+                     canonical rows batched and alone",
+                    checked_lanes, frames
+                );
+            } else {
+                return Err(anyhow!(
+                    "simdcheck FAILED: {} state(s) whose batched result differs \
+                     from running their lanes separately",
+                    violations
+                ));
+            }
         }
         Command::Deoptcheck { frames } => {
             use celeste_rust::rewrite::state_mapping::StateMapping;
