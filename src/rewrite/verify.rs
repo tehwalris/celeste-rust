@@ -386,8 +386,8 @@ struct StreamCounters {
     sub_after: usize,
 }
 
-/// Streaming boundary pipeline (env CELESTE_STREAM_BOUNDARY, frontier-only
-/// runs): abstract, band-filter and visited-subtract one frame-output state
+/// Streaming boundary pipeline (the standard path for frontier-only runs):
+/// abstract, band-filter and visited-subtract one frame-output state
 /// as soon as it is produced, so only SURVIVING lanes are ever held for the
 /// end-of-frame merge. Without this, every chunk's raw outputs accumulate
 /// until the frame ends - ~30M pre-dedup lanes at room-(0,0) f89, which is
@@ -809,11 +809,12 @@ impl AbstractRun {
     /// 673,503 visited at f40); they differ in peak memory and in the
     /// on-disk order of visited rows.
     pub fn step(&mut self) -> Result<()> {
-        // Streaming needs the frontier subtract and is meaningless under
-        // the widencheck's rem-only abstraction.
-        let stream = std::env::var_os("CELESTE_STREAM_BOUNDARY").is_some()
-            && self.visited_rows.is_some()
-            && !self.rem_only_abstraction;
+        // Every frontier run streams (the CELESTE_STREAM_BOUNDARY opt-in
+        // graduated after the modes were shown set-equivalent; see the
+        // equivalence note above). Streaming needs the frontier subtract
+        // and is meaningless under the widencheck's rem-only abstraction -
+        // that corner still takes the phased path.
+        let stream = self.visited_rows.is_some() && !self.rem_only_abstraction;
         let frame_no = self.states_before_merge.len() as u32 + 1;
         let input_states = chunk_states(std::mem::take(&mut self.states));
         let mut counters = FrameEventCounters::default();
