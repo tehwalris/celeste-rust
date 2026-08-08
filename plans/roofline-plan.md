@@ -62,6 +62,38 @@ re-measure both. At 16 threads, f55 goes 27.1 s at cap 1000, 14.5 at 4000,
 13.2 at 8000, 15.2 at 16000, 18.3 at 32000. The optimum is real and not
 flat.
 
+## Correction: chunking is NOT lane-count-neutral where UnknownBool deopts
+
+Earlier notes (and the first version of this file) say the chunk cap
+"reorders ids, not rows". That was verified on room (1,0), and on room
+(1,0) it is true. It is NOT true in general, and room (0,0) shows why.
+
+A fruit state's widened collide check is `UnknownBool`, and an
+`UnknownBool` branch sends the WHOLE state down both edges. So the
+coarseness of the over-approximation depends on how lanes are grouped: a
+chunk in which the condition happens to be definite avoids the doubling,
+and a coarser chunk containing that lane alongside an ambiguous one does
+not. Measured directly, same f075 checkpoint, same code, only the fruit
+chunk cap different (800 vs 8,000 lanes):
+
+    f76 new lanes    9,873,531   (cap 800)
+    f76 new lanes    9,891,670   (cap 8,000)
+
+The direction is guaranteed, which is what keeps this sound: finer chunks
+can only ever remove doubling, never add it, so a coarser cap yields a
+SUPERSET. The abstract search is an over-approximation and a bigger one is
+still an over-approximation; the concrete optimum comes from the k=16
+exact level plus a witness replay, neither of which this touches.
+
+What it does mean:
+
+* Two runs at different chunk caps are not comparable frame-by-frame on a
+  room with fruit. Compare them only at the level of the certified answer.
+* `parcheck.sh` is unaffected and its claim is unchanged - it holds the
+  cap FIXED and varies only the thread count, and that is byte-identical.
+* A cap change is a semantic choice on such rooms, not just a performance
+  knob. Note it when changing one.
+
 ## Closed off (do not re-open without new information)
 
 * Parallelising across the states *inside* a flow step. Measured twice,
