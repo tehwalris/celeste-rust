@@ -55,13 +55,22 @@ impl Sources {
 const INIT_SUFFIX: &str = "\n_init()\n__reset_button_states()\n";
 const FRAME_CODE: &str = "\n_update()\n_draw()\n__reset_button_states()\n";
 
+impl Sources {
+    /// The exact toplevel chunk text `compile` parses. Exposed for tools
+    /// that save the compiled source next to their output (the profiler's
+    /// source mapping).
+    pub fn init_chunk_text(&self) -> String {
+        format!(
+            "{}\n{}\n{}\n{}",
+            self.builtin_level_3, self.builtin_level_4, self.game, INIT_SUFFIX
+        )
+    }
+}
+
 impl Program {
     /// Compile the Lua sources into the starting program (before any rewrites).
     pub fn compile(sources: &Sources) -> Result<Self> {
-        let full = format!(
-            "{}\n{}\n{}\n{}",
-            sources.builtin_level_3, sources.builtin_level_4, sources.game, INIT_SUFFIX
-        );
+        let full = sources.init_chunk_text();
         let ast = full_moon::parse(&full).map_err(|e| anyhow!("parse game: {:?}", e))?;
         let (init_cfg, fun_defs) = crate::frontend::compile(&ast)?;
 

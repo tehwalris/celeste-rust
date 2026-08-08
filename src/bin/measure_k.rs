@@ -10,10 +10,6 @@
 
 use anyhow::Result;
 use celeste_rust::block_coverage;
-use celeste_rust::game_runner::{
-    create_initial_state_with_builtins, inject_tile_flag_at_builtin,
-};
-use celeste_rust::interpreter::glue::interpret_cfg;
 use celeste_rust::interpreter::state::State;
 use celeste_rust::interpreter::value::{HeapValue, MaybeVector, Value};
 use clap::Parser;
@@ -69,40 +65,6 @@ impl Rng {
     }
 }
 
-fn set_concrete_buttons(state: &mut State, input_byte: u8) {
-    let buttons = [
-        (input_byte & 1) != 0,
-        (input_byte & 2) != 0,
-        (input_byte & 4) != 0,
-        (input_byte & 8) != 0,
-        (input_byte & 16) != 0,
-        (input_byte & 32) != 0,
-    ];
-    let button_states_global_id = state
-        .global_env
-        .get("__button_states")
-        .expect("__button_states not found");
-    let button_states_id = match state.heap.get(*button_states_global_id) {
-        HeapValue::Value(Value::Pointer(id)) => *id,
-        HeapValue::ArrayTable(_) => *button_states_global_id,
-        other => panic!("__button_states unexpected: {:?}", other),
-    };
-    let array_items = match state.heap.get(button_states_id) {
-        HeapValue::ArrayTable(items) => items.clone(),
-        other => panic!("__button_states not an array: {:?}", other),
-    };
-    for (i, &pressed) in buttons.iter().enumerate() {
-        let item_ptr_id = array_items[i];
-        let value_id = match state.heap.get(item_ptr_id) {
-            HeapValue::Value(Value::Pointer(id)) => *id,
-            _ => item_ptr_id,
-        };
-        state
-            .heap
-            .set(value_id, HeapValue::Value(Value::Bool(MaybeVector::Scalar(pressed))));
-    }
-}
-
 /// The room this state is in, if it can be read.
 ///
 /// Frames in which the room is (re)loaded are a different heap shape and a
@@ -142,21 +104,19 @@ fn main() -> Result<()> {
         }
     }
     let fixed_env = program.fixed_env();
-    let initial_state = create_initial_state_with_builtins(&fixed_env);
     // `Program`'s frame chunk already ends with `__reset_button_states()`, so
-    // unlike the hand-built version there is no separate reset run.
-    let frame_cfg = program.frame_cfg().clone();
-    let cfg = program.init_cfg().clone();
+    // unlike the old hand-built version there is no separate reset run.
+    let frame_cfg = celeste_rust::interpreter::fixed_env::PreparedCfg::new(
+        program.frame_cfg().clone(),
+    );
 
     // The init run is not part of a frame; flush it so it doesn't pollute
-    // the per-frame maxima.
-    let init_result = interpret_cfg(cfg, initial_state, &fixed_env).expect("init");
-    assert_eq!(init_result.len(), 1);
-    let mut base_state = init_result.into_iter().next().unwrap().0;
-    // The real runner swaps the Lua tile_flag_at for the native collision-cache
-    // one right after init. Without this we would measure ~1,900 instructions of
-    // Lua that never actually run.
-    inject_tile_flag_at_builtin(&mut base_state);
+    // the per-frame maxima. `concrete::initial_state` also swaps the Lua
+    // tile_flag_at for the native collision-cache one, exactly like the real
+    // runner - without that we would measure ~1,900 instructions of Lua that
+    // never actually run.
+    let base_state = celeste_rust::concrete::initial_state(&program, &fixed_env)
+        .expect("init");
     block_coverage::end_frame_dropping(true);
     assert!(
         current_room(&base_state).is_some(),
@@ -186,21 +146,16 @@ fn main() -> Result<()> {
             let input_byte = held;
 
             let room_before = current_room(&state);
-            set_concrete_buttons(&mut state, input_byte);
-            let result = match interpret_cfg(frame_cfg.clone(), state, &fixed_env) {
-                Ok(r) => r,
+            state = match celeste_rust::concrete::step_frame(
+                &frame_cfg, state, &fixed_env, input_byte,
+            ) {
+                Ok(s) => s,
                 Err(e) => {
                     eprintln!("sequence {} aborted: {}", seq, e);
                     ok = false;
                     break;
                 }
             };
-            if result.len() != 1 {
-                eprintln!("sequence {} branched into {} states", seq, result.len());
-                ok = false;
-                break;
-            }
-            state = result.into_iter().next().unwrap().0;
 
             block_coverage::end_frame_dropping(current_room(&state) != room_before);
         }

@@ -13,6 +13,7 @@ pub mod create_sites;
 pub mod block_flow;
 pub mod cart_data;
 pub mod collision_cache;
+pub mod concrete;
 pub mod frontend;
 pub mod game_runner;
 pub mod input;

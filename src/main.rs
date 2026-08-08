@@ -9,7 +9,6 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use anyhow::Result;
 use clap::Parser;
 
-use celeste_rust::frontend;
 use celeste_rust::game_runner;
 use celeste_rust::interpreter;
 
@@ -162,7 +161,7 @@ fn run_game_frames(
     use crate::interpreter::inspect::{make_state_abstract, create_frame_dump, write_frame_dump_jsonl, dump_states_to_file, save_checkpoint, load_checkpoint, checkpoint_filename, Checkpoint};
     use crate::interpreter::profiling::{enable_profiling, get_chrome_tracing_json, get_dag_json, get_tree_json, get_cfgs_json, get_profile_summary};
     use crate::interpreter::tracing::{enable_tracing, get_tracing_json, collect_thread_spans};
-    use crate::game_runner::{create_fixed_env_with_game_builtins, create_initial_state_with_builtins, inject_tile_flag_at_builtin};
+    use crate::game_runner::{create_initial_state_with_builtins, inject_tile_flag_at_builtin};
     use std::io::BufWriter;
     use std::fs::File;
 
@@ -183,41 +182,16 @@ fn run_game_frames(
         std::fs::create_dir_all(dir)?;
     }
 
-    // Load and compile the game
-    let level_3 = std::fs::read_to_string("lua/builtin_level_3.lua")
-        .expect("Failed to read builtin_level_3.lua");
-    let level_4 = std::fs::read_to_string("lua/builtin_level_4.lua")
-        .expect("Failed to read builtin_level_4.lua");
-    let game = std::fs::read_to_string("lua/celeste-minimal.lua")
-        .expect("Failed to read celeste-minimal.lua");
-    let game = game_runner::apply_start_room(&game)
-        .expect("Failed to apply configured start room");
-
-    // Suffix code to call _init
-    let init_suffix = r#"
-_init()
-__reset_button_states()
-"#;
-
-    let full_code = format!("{}\n{}\n{}\n{}\n", level_3, level_4, game, init_suffix);
-
-    let ast = full_moon::parse(&full_code).expect("Failed to parse game code");
-    let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile game");
-
-    let mut fixed_env = create_fixed_env_with_game_builtins();
-    for fun_def in fun_defs {
-        fixed_env.add_fun_def(fun_def);
-    }
-
-    // Compile frame code (update + draw + reset buttons)
-    let frame_code = r#"
-_update()
-_draw()
-__reset_button_states()
-"#;
-    let frame_ast = full_moon::parse(frame_code).expect("Failed to parse frame code");
-    let (frame_cfg, frame_fun_defs) = frontend::compile(&frame_ast).expect("Failed to compile frame");
-    assert!(frame_fun_defs.is_empty(), "Frame code should not define new functions");
+    // The program is the shared, derived one - the same assembly every
+    // other tool runs (sources + start-room substitution + init/frame
+    // chunks); see rewrite::program.
+    let sources = celeste_rust::rewrite::program::Sources::load_from_disk()
+        .expect("Failed to load game sources");
+    let program = celeste_rust::rewrite::program::Program::compile(&sources)
+        .expect("Failed to compile game program");
+    let fixed_env = program.fixed_env();
+    let cfg = program.init_cfg().clone();
+    let frame_cfg = program.frame_cfg().clone();
 
     // Try to resume from checkpoint if requested
     let (mut states, start_frame) = if resume && checkpoint_dir.is_some() {
@@ -431,7 +405,7 @@ __reset_button_states()
         // Save the source code that was compiled (for source mapping)
         let source_path = format!("{}/source.lua", profile_dir);
         let mut file = File::create(&source_path)?;
-        file.write_all(full_code.as_bytes())?;
+        file.write_all(sources.init_chunk_text().as_bytes())?;
         println!("Saved source to {}", source_path);
 
         // Print summary
@@ -478,6 +452,7 @@ __reset_button_states()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use celeste_rust::frontend;
     use crate::game_runner::{
         create_fixed_env_with_builtins,
         create_fixed_env_with_game_builtins,

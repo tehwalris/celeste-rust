@@ -1115,61 +1115,6 @@ fn parse_tas(path: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
-/// Overwrite the six concrete button cells of a plain-program state from an
-/// input byte.
-fn set_concrete_buttons(
-    state: &mut celeste_rust::interpreter::state::State,
-    byte: u8,
-) -> Result<()> {
-    use celeste_rust::interpreter::value::{HeapValue, MaybeVector, Value};
-    let cell = *state
-        .global_env
-        .get("__button_states")
-        .ok_or_else(|| anyhow!("no __button_states"))?;
-    let arr = match state.heap.get_opt(cell) {
-        Some(HeapValue::Value(Value::Pointer(id))) => *id,
-        Some(HeapValue::ArrayTable(_)) => cell,
-        other => return Err(anyhow!("__button_states shape: {:?}", other)),
-    };
-    let items = match state.heap.get_opt(arr) {
-        Some(HeapValue::ArrayTable(items)) => items.clone(),
-        other => return Err(anyhow!("button array shape: {:?}", other)),
-    };
-    for (i, item) in items.iter().enumerate() {
-        let pressed = byte >> i & 1 == 1;
-        let target = match state.heap.get_opt(*item) {
-            Some(HeapValue::Value(Value::Pointer(id))) => *id,
-            _ => *item,
-        };
-        state
-            .heap
-            .set(target, HeapValue::Value(Value::Bool(MaybeVector::Scalar(pressed))));
-    }
-    Ok(())
-}
-
-/// Run the plain program's init chunk to the single pre-frame-1 concrete
-/// state (the canonical spawn state).
-fn concrete_initial_state(
-    plain: &Program,
-    fixed_env: &celeste_rust::interpreter::fixed_env::FixedEnv,
-) -> Result<celeste_rust::interpreter::state::State> {
-    use celeste_rust::game_runner::{
-        create_initial_state_with_builtins, inject_tile_flag_at_builtin,
-    };
-    use celeste_rust::interpreter::glue::interpret_cfg;
-    let initial = create_initial_state_with_builtins(fixed_env);
-    let init_states = interpret_cfg(plain.init_cfg().clone(), initial, fixed_env)?;
-    let mut states: Vec<_> = init_states.into_iter().map(|(s, _)| s).collect();
-    for s in &mut states {
-        inject_tile_flag_at_builtin(s);
-    }
-    if states.len() != 1 {
-        return Err(anyhow!("init produced {} states", states.len()));
-    }
-    Ok(states.pop().unwrap())
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let recipe = Recipe::load(&cli.recipe)?;
@@ -2201,7 +2146,6 @@ fn main() -> Result<()> {
         }
 
         Command::TraceWitness { tas, horizon, levels, base_dir } => {
-            use celeste_rust::interpreter::glue::interpret_cfg;
             use celeste_rust::interpreter::inspect::{
                 apply_conservative_widenings, make_state_abstract_rem, RemPrecision,
             };
@@ -2253,18 +2197,15 @@ fn main() -> Result<()> {
             let plain = Program::compile_from_disk()?;
             let mapping = StateMapping::from_recipe(&recipe);
             let fixed_env = plain.fixed_env();
-            let mut state = concrete_initial_state(&plain, &fixed_env)?;
+            let mut state = celeste_rust::concrete::initial_state(&plain, &fixed_env)?;
 
-            let frame_cfg = plain.frame_cfg().clone();
+            let frame_cfg = celeste_rust::interpreter::fixed_env::PreparedCfg::new(
+                plain.frame_cfg().clone(),
+            );
             let mut first_fail: Option<(u32, u8, String)> = None;
             for frame in 1..=horizon {
                 let byte = inputs.get(frame as usize - 1).copied().unwrap_or(0);
-                set_concrete_buttons(&mut state, byte)?;
-                let result = interpret_cfg(frame_cfg.clone(), state, &fixed_env)?;
-                if result.len() != 1 {
-                    return Err(anyhow!("frame {}: {} states (branching!)", frame, result.len()));
-                }
-                state = result.into_iter().next().unwrap().0;
+                state = celeste_rust::concrete::step_frame(&frame_cfg, state, &fixed_env, byte)?;
 
                 // Canonicalize per level and probe.
                 let mut canon = state.clone();
@@ -2366,7 +2307,7 @@ fn main() -> Result<()> {
             let plain = Program::compile_from_disk()?;
             let mapping = StateMapping::from_recipe(&recipe);
             let fixed_env = plain.fixed_env();
-            let mut state = concrete_initial_state(&plain, &fixed_env)?;
+            let mut state = celeste_rust::concrete::initial_state(&plain, &fixed_env)?;
             let frame_cfg = PreparedCfg::new(plain.frame_cfg().clone());
 
             // Probe one concrete state's row in the level's band. A concrete
@@ -2393,7 +2334,7 @@ fn main() -> Result<()> {
                 let mut candidates: Vec<(u8, State)> = Vec::new();
                 for byte in 0u8..64 {
                     let mut s = state.clone();
-                    set_concrete_buttons(&mut s, byte)?;
+                    celeste_rust::concrete::set_concrete_buttons(&mut s, byte)?;
                     let result = interpret_prepared_cfg(&frame_cfg, s, &fixed_env)?;
                     if result.len() != 1 {
                         return Err(anyhow!(
@@ -2514,7 +2455,7 @@ fn main() -> Result<()> {
             let plain = Program::compile_from_disk()?;
             let mapping = StateMapping::from_recipe(&recipe);
             let fixed_env = plain.fixed_env();
-            let spawn = concrete_initial_state(&plain, &fixed_env)?;
+            let spawn = celeste_rust::concrete::initial_state(&plain, &fixed_env)?;
             let frame_cfg = PreparedCfg::new(plain.frame_cfg().clone());
 
             type Key = (u64, u64);
@@ -2568,7 +2509,7 @@ fn main() -> Result<()> {
                 for (src_key, node) in &layer {
                     for byte in 0u8..64 {
                         let mut s = node.state.clone();
-                        set_concrete_buttons(&mut s, byte)?;
+                        celeste_rust::concrete::set_concrete_buttons(&mut s, byte)?;
                         let result = interpret_prepared_cfg(&frame_cfg, s, &fixed_env)?;
                         if result.len() != 1 {
                             return Err(anyhow!("frame {}: branching", frame));
