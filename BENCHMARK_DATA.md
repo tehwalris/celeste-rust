@@ -1,5 +1,25 @@
 # Benchmark Data
 
+## Fresh-run cost: room (0,0) vs room (1,0) (2026-08-08)
+
+A clean fresh 100 m campaign with today's code costs ~13 +/- 2 h vs the
+measured 3h01m for 200 m (~4.5x): level-0 forward to first win ~1 h
+(vs 14 min), first full backward sweep ~3 h (vs ~31 min), horizons
+81-94 ~8-10 h (vs ~2 h), final ladder ~30 min. The 4.5x factors:
+(a) ~3-4x slower program per lane (shape-agnostic prefix recipe, fruit
+states on the plain path) applied to BOTH passes; (b) ~2.5x more state
+(387M vs 151.6M visited rows; 21M vs 5.2M peak frontier); amplified by
+the origin-tagged sweep replay being ~4x the forward cost on the same
+frame (the origin column forbids mid-frame merging - f90: 2747 s replay
+vs 740 s forward, 1.3B successors materialized). Banked offsets:
+incremental CSR shards (would otherwise add ~4-6 h), streaming
+boundary (without it the run OOMs), header-only chunk counts.
+Recovery plan (deliberately deferred): S2/S3 variant recipes (both
+passes ~3x), tri-state comparisons (kills the fruit plain-fallback and
+coarse-level inflation, allows larger replay chunks), parallel replay
+(single-threaded today). Target: fresh 100 m in ~2-4 h.
+
+
 Always run these under `./safe-run.sh` (systemd scope with `MemoryMax=100G`).
 It is easy to OOM the machine otherwise.
 
