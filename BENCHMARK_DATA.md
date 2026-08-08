@@ -1,3 +1,59 @@
+# The parallel campaign, end state: 5.2x at 60 frames (2026-08-08)
+
+Room (1,0), 60 frames, frontier-only + deopt. Lane counts identical to the
+serial baseline at every step (1,997,387 at f60).
+
+| | time | peak |
+|---|---|---|
+| serial, no chunking (the morning's baseline) | 89.2 s | 4.31 GB |
+| chunk-parallel frames (16 threads, cap 8k) | 21.9 s | 2.55 GB |
+| + parallel visited probe, local candidate dedup, parallel pre-merge gc | 18.6 s | 2.43 GB |
+| + survivor gather moved off the serial path | **17.2 s** | **2.43 GB** |
+
+**5.2x, on 40% less memory.** Phase split at the end: interpret 12.4 s
+(parallel), boundary decide 1.9 s (serial), merge 2.1 s, gather 0.5 s
+(parallel). The serial remainder is 24%.
+
+## The shape of what is left
+
+The parallel region is 12.4 s x 16 threads = ~200 CPU-seconds, and it is
+spread thin - the flat profile's top entries are 12% (row keys), 7%
+(select), 10% (tile_flag_at across four symbols), 5% (map2). Same finding
+as the first profile: there is no single fix worth a multiple, so the
+remaining levers are (a) less work per lane, which is what the queued
+integer-representation idea is, and (b) the 24% serial tail.
+
+Two structural facts that bound everything:
+
+* **98.1% of the lanes a frame computes are duplicates.** f55 offers
+  82,078,938 lanes to the boundary and keeps 1,563,989. That ratio is
+  independent of chunk size (82,078,458 at cap 1M vs 82,078,938 at cap 8k,
+  0.0006% apart), so it is not lost mid-frame merging - it is the button
+  fan-out reaching states the search has already seen. Nothing short of
+  knowing the answer in advance avoids computing them.
+* **Parallel efficiency is ~8x on 16 threads** for the frame body
+  (`fwd.interpret` at cap 8k, f55: 32.9 s at t=2, 19.0 at t=4, 11.1 at
+  t=8, 7.5 at t=16 - still gaining 1.48x on the last doubling, so not
+  saturated, but tailing).
+
+## Measured and not landed
+
+Recorded because each one closes a plausible-looking direction:
+
+| idea | result |
+|---|---|
+| mimalloc in the `rewrite` driver (main.rs has it, bin/rewrite.rs never did) | **+22% on the parallel path.** glibc's per-thread arenas suit a short-lived lane vector per instruction on 16 threads better than mimalloc's segments |
+| sharded row table, parallel batch insert (ids still serial and bit-identical) | cuts the serial fold 1.91 -> 1.27 s, **1.8% worse overall.** A frame does ~100M probes to ~1.6M inserts; the shard indirection taxes the 100M to parallelise the 1.6M |
+| probe the cache-resident local dedup set before the global table | **4% worse.** It makes the local set hold every distinct row in the chunk instead of only the candidates (~2% of them) |
+| batches larger than the thread count (barrier / load balance) | 24 is 1% better and 15% more memory; 32 and 48 are worse. Imbalance is not where the efficiency goes |
+| bitmap the collision tables (112 KB -> 14 KB), hoist the (w,h) choice | exactly neutral (11.26 vs 11.27 s at f55) - they were already cache-resident. Kept anyway: smaller, and it replaced a placeholder test |
+| hash-only `shape_hash_of_state`, parallel shape derivation | 17.27 -> 17.22 s. Kept for the same reason |
+| dropping the global probe entirely (to price it) | saves 0.6 s of the 12.3 s parallel region, adds 5.7 s to the serial one |
+| `CELESTE_DEOPT_COLLECT_FIRST` off (does the origin column block mid-frame dedup?) | 1.3%. The "origin forbids mid-frame merging" note was about the sweep's replays, not the forward pass |
+
+Transparent huge pages are already `always` on this machine, so the
+visited table's TLB behaviour is not on the table either.
+
 # Chunk-parallel frames: 4.5x and less memory (2026-08-08)
 
 Room (1,0), 60 frames, frontier-only + deopt, same lane counts throughout
