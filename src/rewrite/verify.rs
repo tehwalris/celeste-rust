@@ -753,9 +753,13 @@ fn chunk_states(states: Vec<State>) -> Vec<State> {
         let n = state.vector_size;
         for start in (0..n).step_by(cap) {
             let end = (start + cap).min(n);
-            let mask: Vec<bool> = (0..n).map(|i| i >= start && i < end).collect();
-            out.push(state.filter_by_mask_clone(
-                &mask,
+            // A chunk is one contiguous run, so hand the filter that run
+            // directly. Materialising an n-length bool mask per chunk made
+            // chunking quadratic in the state width - at depth a 5M-lane
+            // state is 625 chunks, i.e. 3e9 mask writes for one state, all
+            // of it on the serial path.
+            out.push(state.filter_by_kept_clone(
+                &crate::interpreter::value::KeptLanes::from_range(start, end),
                 crate::interpreter::state::FILTER_CHUNK,
             ));
         }

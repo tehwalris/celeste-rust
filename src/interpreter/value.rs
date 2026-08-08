@@ -218,6 +218,23 @@ pub struct KeptLanes {
 }
 
 impl KeptLanes {
+    /// The single run `[start, end)`.
+    ///
+    /// For lane-chunking, where the "mask" is a contiguous window. Building
+    /// it as a bool vector cost O(all lanes) PER CHUNK - quadratic in the
+    /// state width, and at depth a 5M-lane state is 625 chunks.
+    pub fn from_range(start: usize, end: usize) -> Self {
+        debug_assert!(start <= end);
+        Self {
+            ranges: if start == end {
+                Vec::new()
+            } else {
+                vec![(start as u32, end as u32)]
+            },
+            total: end - start,
+        }
+    }
+
     /// Runs from an ASCENDING list of kept lane indices.
     ///
     /// The frontier subtract knows its survivors as a short index list (at
