@@ -1103,6 +1103,71 @@ fn level_checkpoint_dir(base_dir: &str, level: u8) -> std::path::PathBuf {
     }
 }
 
+/// A refinement level's persisted result, loaded with the level's own
+/// fingerprint (each level's precision is part of its fingerprint).
+struct LoadedLevel {
+    k: u8,
+    precision: celeste_rust::interpreter::abstraction::RemPrecision,
+    /// Latest checkpointed frame the table runs through.
+    frame: u32,
+    table: celeste_rust::interpreter::row_table::RowTable,
+    /// Min frames to the exit per row id (`sweep::save_g`); empty when
+    /// g.bin is absent and `g_required` was false - probes then check
+    /// table membership and e only.
+    g: Vec<u16>,
+}
+
+/// The rem precision of ladder level `k`: 16 means exact.
+fn precision_for_level(k: u8) -> celeste_rust::interpreter::abstraction::RemPrecision {
+    use celeste_rust::interpreter::abstraction::RemPrecision;
+    if k >= 16 { RemPrecision::Exact } else { RemPrecision::Bits(k) }
+}
+
+/// Load level `k`'s row table (and g array) from under `base_dir`.
+fn load_level(
+    recipe_path: &str,
+    base_dir: &str,
+    k: u8,
+    g_required: bool,
+) -> Result<LoadedLevel> {
+    use celeste_rust::rewrite::{checkpoint, sweep};
+    let precision = precision_for_level(k);
+    let dir = level_checkpoint_dir(base_dir, k);
+    let recipe_text = std::fs::read_to_string(recipe_path).unwrap_or_default();
+    let fp = checkpoint::config_fingerprint_with_precision(&recipe_text, precision);
+    let frame = checkpoint::latest(&dir)?
+        .ok_or_else(|| anyhow!("level {}: no checkpoint in {}", k, dir.display()))?;
+    let ck = checkpoint::load(&dir, frame, &fp)?;
+    let g = match sweep::load_g(&dir) {
+        Ok(g) => {
+            if g.len() != ck.visited.len() {
+                return Err(anyhow!("level {}: g/table size mismatch", k));
+            }
+            g
+        }
+        Err(e) if g_required => return Err(e),
+        Err(_) => Vec::new(),
+    };
+    Ok(LoadedLevel { k, precision, frame, table: ck.visited, g })
+}
+
+/// The row key of an already-canonical concrete state at `precision`:
+/// widen, apply the conservative boundary widenings, gc (the row-hash
+/// canonicalizer) and hash. A concrete rem is a point value, so widening
+/// lands in exactly one bucket - no straddle split needed.
+fn widened_row_key(
+    canon: celeste_rust::interpreter::state::State,
+    precision: celeste_rust::interpreter::abstraction::RemPrecision,
+) -> Result<(u64, u64)> {
+    use celeste_rust::interpreter::abstraction::{
+        apply_conservative_widenings, make_state_abstract_rem,
+    };
+    let mut a = make_state_abstract_rem(canon, precision);
+    a = apply_conservative_widenings(a);
+    a.gc();
+    Ok(celeste_rust::rewrite::sweep::row_keys(&a)?[0])
+}
+
 /// Parse a TAS file: comment lines start with '#', the rest is
 /// comma-separated input bytes (bit i of a byte = PICO-8 button i).
 fn parse_tas(path: &str) -> Result<Vec<u8>> {
@@ -2147,53 +2212,26 @@ fn main() -> Result<()> {
         }
 
         Command::TraceWitness { tas, horizon, levels, base_dir } => {
-            use celeste_rust::interpreter::abstraction::{
-                apply_conservative_widenings, make_state_abstract_rem, RemPrecision,
-            };
-            use celeste_rust::interpreter::row_table::RowTable;
-            use celeste_rust::rewrite::checkpoint;
             use celeste_rust::rewrite::state_mapping::StateMapping;
             use celeste_rust::rewrite::sweep;
 
             let inputs = parse_tas(&tas)?;
             println!("witness: {} input bytes, horizon {}", inputs.len(), horizon);
 
-            // Load every requested level's table and g array.
-            let recipe_text = std::fs::read_to_string(&cli.recipe).unwrap_or_default();
-            struct Level {
-                k: u8,
-                precision: RemPrecision,
-                table: RowTable,
-                g: Vec<u16>,
-            }
-            let mut level_data: Vec<Level> = Vec::new();
+            // Load every requested level's table and g array (g.bin is
+            // optional: without it the probe checks table membership and e
+            // only).
+            let mut level_data: Vec<LoadedLevel> = Vec::new();
             for part in levels.split(',') {
                 let k: u8 = part.trim().parse().map_err(|e| anyhow!("bad level: {}", e))?;
-                let precision =
-                    if k >= 16 { RemPrecision::Exact } else { RemPrecision::Bits(k) };
-                let dir = level_checkpoint_dir(&base_dir, k);
-                let fp = checkpoint::config_fingerprint_with_precision(&recipe_text, precision);
-                let frame = checkpoint::latest(&dir)?
-                    .ok_or_else(|| anyhow!("level {}: no checkpoint in {}", k, dir.display()))?;
-                let ck = checkpoint::load(&dir, frame, &fp)?;
-                // g.bin is optional: without it the probe checks table
-                // membership and e only.
-                let g = match sweep::load_g(&dir) {
-                    Ok(g) => {
-                        if g.len() != ck.visited.len() {
-                            return Err(anyhow!("level {}: g/table size mismatch", k));
-                        }
-                        g
-                    }
-                    Err(_) => Vec::new(),
-                };
+                let level = load_level(&cli.recipe, &base_dir, k, false)?;
                 println!(
                     "level {}: {} rows (through f{:03})",
                     k,
-                    ck.visited.len(),
-                    frame
+                    level.table.len(),
+                    level.frame
                 );
-                level_data.push(Level { k, precision, table: ck.visited, g });
+                level_data.push(level);
             }
             let plain = Program::compile_from_disk()?;
             let mapping = StateMapping::from_recipe(&recipe);
@@ -2218,10 +2256,7 @@ fn main() -> Result<()> {
                     None => format!("f{:03} (no player):", frame),
                 };
                 for level in &level_data {
-                    let mut s = make_state_abstract_rem(canon.clone(), level.precision);
-                    s = apply_conservative_widenings(s);
-                    s.gc();
-                    let key = sweep::row_keys(&s)?[0];
+                    let key = widened_row_key(canon.clone(), level.precision)?;
                     let status = match level.table.id_of(key) {
                         None => "MISS".to_string(),
                         Some(id) => {
@@ -2271,12 +2306,8 @@ fn main() -> Result<()> {
         Command::ExtractTas { horizon, level, base_dir, tas } => {
             use celeste_rust::interpreter::fixed_env::PreparedCfg;
             use celeste_rust::interpreter::glue::interpret_prepared_cfg;
-            use celeste_rust::interpreter::abstraction::{
-                apply_conservative_widenings, count_room_x_lanes, make_state_abstract_rem,
-                RemPrecision,
-            };
+            use celeste_rust::interpreter::abstraction::count_room_x_lanes;
             use celeste_rust::interpreter::state::State;
-            use celeste_rust::rewrite::checkpoint;
             use celeste_rust::rewrite::state_mapping::StateMapping;
             use celeste_rust::rewrite::sweep;
 
@@ -2284,24 +2315,13 @@ fn main() -> Result<()> {
                 Some(path) => Some(parse_tas(path)?),
                 None => None,
             };
-            let precision =
-                if level >= 16 { RemPrecision::Exact } else { RemPrecision::Bits(level) };
-            let dir = level_checkpoint_dir(&base_dir, level);
-            let recipe_text = std::fs::read_to_string(&cli.recipe).unwrap_or_default();
-            let fp = checkpoint::config_fingerprint_with_precision(&recipe_text, precision);
-            let frame = checkpoint::latest(&dir)?
-                .ok_or_else(|| anyhow!("no checkpoint in {}", dir.display()))?;
-            let ck = checkpoint::load(&dir, frame, &fp)?;
-            let g = sweep::load_g(&dir)?;
-            if g.len() != ck.visited.len() {
-                return Err(anyhow!("g/table size mismatch"));
-            }
-            let table = ck.visited;
+            let loaded = load_level(&cli.recipe, &base_dir, level, true)?;
+            let (precision, table, g) = (loaded.precision, loaded.table, loaded.g);
             println!(
                 "level {}: {} rows (through f{:03}), walking horizon {}",
                 level,
                 table.len(),
-                frame,
+                loaded.frame,
                 horizon
             );
 
@@ -2317,10 +2337,7 @@ fn main() -> Result<()> {
             let probe = |s: &State| -> Result<Option<(u32, u16)>> {
                 let mut canon = s.clone();
                 mapping.from_canonical(&mut canon)?;
-                let mut a = make_state_abstract_rem(canon, precision);
-                a = apply_conservative_widenings(a);
-                a.gc();
-                let key = sweep::row_keys(&a)?[0];
+                let key = widened_row_key(canon, precision)?;
                 Ok(table.id_of(key).map(|id| {
                     (table.earliest_frame(id).unwrap_or(u32::MAX), g[id as usize])
                 }))
@@ -2429,28 +2446,14 @@ fn main() -> Result<()> {
             use celeste_rust::interpreter::fixed_env::PreparedCfg;
             use celeste_rust::interpreter::glue::interpret_prepared_cfg;
             use celeste_rust::interpreter::abstraction::{
-                apply_conservative_widenings, count_room_x_lanes, make_state_abstract_rem,
-                player_xy_per_lane, RemPrecision,
+                count_room_x_lanes, player_xy_per_lane,
             };
             use celeste_rust::interpreter::state::State;
-            use celeste_rust::rewrite::checkpoint;
             use celeste_rust::rewrite::state_mapping::StateMapping;
-            use celeste_rust::rewrite::sweep;
             use std::collections::HashMap;
 
-            let precision =
-                if level >= 16 { RemPrecision::Exact } else { RemPrecision::Bits(level) };
-            let dir = level_checkpoint_dir(&base_dir, level);
-            let recipe_text = std::fs::read_to_string(&cli.recipe).unwrap_or_default();
-            let fp = checkpoint::config_fingerprint_with_precision(&recipe_text, precision);
-            let frame = checkpoint::latest(&dir)?
-                .ok_or_else(|| anyhow!("no checkpoint in {}", dir.display()))?;
-            let ck = checkpoint::load(&dir, frame, &fp)?;
-            let g = sweep::load_g(&dir)?;
-            if g.len() != ck.visited.len() {
-                return Err(anyhow!("g/table size mismatch"));
-            }
-            let table = ck.visited;
+            let loaded = load_level(&cli.recipe, &base_dir, level, true)?;
+            let (precision, table, g) = (loaded.precision, loaded.table, loaded.g);
             println!("level {}: {} rows, enumerating horizon {}", level, table.len(), horizon);
 
             let plain = Program::compile_from_disk()?;
@@ -2463,10 +2466,7 @@ fn main() -> Result<()> {
             let probe = |s: &State| -> Result<Option<(Key, u32, u16)>> {
                 let mut canon = s.clone();
                 mapping.from_canonical(&mut canon)?;
-                let mut a = make_state_abstract_rem(canon, precision);
-                a = apply_conservative_widenings(a);
-                a.gc();
-                let key = sweep::row_keys(&a)?[0];
+                let key = widened_row_key(canon, precision)?;
                 Ok(table.id_of(key).map(|id| {
                     (key, table.earliest_frame(id).unwrap_or(u32::MAX), g[id as usize])
                 }))
