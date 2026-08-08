@@ -302,6 +302,43 @@ pub fn record_filter_size(kept: usize) {
     FILTER_HIST_ELEMS[b].fetch_add(kept as u64, Ordering::Relaxed);
 }
 
+/// How lossy the UnknownBool collapse is: lanes that HAD a definite answer
+/// at a comparison that nonetheless produced a whole-value UnknownBool,
+/// against the lanes involved. If the definite share is ~0 the collapse
+/// costs nothing and partitioning the state would buy nothing.
+static COLLAPSE_DEFINITE: AtomicU64 = AtomicU64::new(0);
+static COLLAPSE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static COLLAPSE_CALLS: AtomicU64 = AtomicU64::new(0);
+static COLLAPSE_MIXED: AtomicU64 = AtomicU64::new(0);
+
+pub fn record_unknown_collapse(definite: usize, total: usize) {
+    COLLAPSE_DEFINITE.fetch_add(definite as u64, Ordering::Relaxed);
+    COLLAPSE_TOTAL.fetch_add(total as u64, Ordering::Relaxed);
+    COLLAPSE_CALLS.fetch_add(1, Ordering::Relaxed);
+    if definite > 0 {
+        COLLAPSE_MIXED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn report_unknown_collapse() {
+    let calls = COLLAPSE_CALLS.load(Ordering::Relaxed);
+    if calls == 0 {
+        return;
+    }
+    let total = COLLAPSE_TOTAL.load(Ordering::Relaxed).max(1);
+    let definite = COLLAPSE_DEFINITE.load(Ordering::Relaxed);
+    println!(
+        "UNKNOWNBOOL COLLAPSE: {} constructions, {} mixed ({:.1}%); \
+         {} of {} lanes had a definite answer ({:.2}%)",
+        calls,
+        COLLAPSE_MIXED.load(Ordering::Relaxed),
+        100.0 * COLLAPSE_MIXED.load(Ordering::Relaxed) as f64 / calls as f64,
+        definite,
+        total,
+        100.0 * definite as f64 / total as f64,
+    );
+}
+
 pub fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("CELESTE_CENSUS").is_some())
@@ -374,6 +411,7 @@ pub fn reset() {
 }
 
 pub fn report() {
+    report_unknown_collapse();
     if !enabled() {
         return;
     }

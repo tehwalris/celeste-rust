@@ -84,3 +84,65 @@ deopt, more duplication), so it never dropped a reachable state: the
 94-frame proof stands, and k16 (exact rem) never sees interval
 comparisons at all. This is a latent hazard and a large performance
 tax, not a wrong answer.
+
+
+# Postscript: the collapse is a cross-lane JOIN, and the fix is a PARTITION
+
+(2026-08-09, from Philippe.)
+
+`Value::UnknownBool` is a whole-VALUE variant with no lane structure, and
+it gets constructed in two situations that are not the same operation:
+
+* every lane straddles - then it is a lossless COMPRESSION of "a vector of
+  unknowns", and lanes have still not interacted;
+* some lanes straddle - then it is a JOIN ACROSS LANES, and lane 3's
+  ambiguity destroys lane 5's perfectly good answer.
+
+Only the first preserves the per-lane independence the whole vectorised
+abstraction rests on. Stating the invariant that way - *UnknownBool may
+only be built when every lane is unknown* - names the bug precisely, and
+it says what the fix has to be.
+
+MEASURED, room (0,0) to f68, counting at every construction:
+
+    14603 constructions, 10233 mixed (70.1%)
+    2,396,690 of 3,470,283 lanes had a definite answer (69.06%)
+
+So the lossy case is the common case, and roughly two thirds of the
+precision at each site is thrown away.
+
+## Why this is not tri-state again
+
+Tri-state (this file, above) attacked the same problem and lost on memory:
+102 GB at frame 66. The reason is now clear, and it is not "the estimate
+was wrong" - it is that `resolve_maybe_bool` DUPLICATED every ambiguous
+lane into two (a true copy and a false copy), so the growth compounds
+multiplicatively across the several comparisons inside `obj.collide`.
+
+Partitioning does not duplicate anything. The state splits into
+
+* the lanes with definite answers, carrying a real `Bool` vector, and
+* the lanes that straddle, carrying `UnknownBool` - where the all-unknown
+  invariant now genuinely holds.
+
+TOTAL LANE COUNT IS PRESERVED EXACTLY. It restores the invariant instead
+of working around its absence, and it is strictly better than both current
+options: no contamination (unlike the collapse) and no growth (unlike
+tri-state).
+
+It also lands on room (0,0)'s actual bottleneck. The whole-state deopt to
+the plain program fires because `select` meets an `UnknownBool` condition;
+under partitioning only the straddling side deopts and ~69% of the lanes
+stay on the specialized program.
+
+## The obstacle, which is architectural rather than semantic
+
+`interpret_binary_op` returns a `Value`, not states - which is exactly why
+`MaybeBool` was designed as a transient resolved at the assignment choke
+point. Partitioning needs an INSTRUCTION to yield two states into the
+flow. Branches can already do that; instructions cannot. That is the work,
+and it should be scoped before anything else here is touched.
+
+Note the pleasant consequence: `MaybeBool` and its guards already exist
+and are already tested. The transient is the right carrier; only its
+RESOLUTION changes, from duplicate-the-lane to split-the-state.

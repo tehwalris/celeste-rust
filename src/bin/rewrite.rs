@@ -616,6 +616,11 @@ fn bench(
         "{:<10} end-of-frame state: heap {} cells, local_env {} entries",
         "", heap_len, env_len
     );
+    // The census report is wired into main.rs only, so the `rewrite`
+    // driver - which is where every search actually runs - never emitted
+    // it. This one is unconditional (two atomic adds per construction) and
+    // prints only when something was counted.
+    celeste_rust::op_census::report_unknown_collapse();
     let (deopt_states, deopt_lanes) = run.deopt_events();
     if deopt_states > 0 {
         println!(

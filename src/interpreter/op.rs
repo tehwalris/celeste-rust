@@ -543,6 +543,18 @@ pub fn interpret_binary_op(l: &Value, op: BinaryOp, r: &Value) -> Result<Value> 
                     ts.iter().all(|t| t.is_none()),
                 ),
             };
+            if any_unknown {
+                // How much precision does collapsing to UnknownBool
+                // actually cost? Partitioning the state instead only helps
+                // where some lane HAS an answer, so count that directly.
+                let (definite, total) = match &tri {
+                    MaybeVector::Scalar(t) => (t.is_some() as usize, 1),
+                    MaybeVector::Vector(ts) => {
+                        (ts.iter().filter(|t| t.is_some()).count(), ts.len())
+                    }
+                };
+                crate::op_census::record_unknown_collapse(definite, total);
+            }
             if all_unknown || (any_unknown && !tri_state_enabled()) {
                 // No lane has an answer, or some lane does not and tri-state
                 // is off: collapse to the whole-value case, which is what
