@@ -1261,10 +1261,12 @@ pub fn subtract_visited(
 /// caller keeps it whole. Sound: skipping dedup only costs work, never
 /// correctness.
 pub struct VisitedKeys {
-    keys: Vec<(u64, u64)>,
-    /// Phase-1 result: the key was NOT in the table at the time this was
-    /// computed. Only these lanes need the (serial) insert.
-    absent: Vec<bool>,
+    /// Only the lanes whose key was NOT in the table at probe time, each
+    /// with its key. Everything else is already known to be a duplicate
+    /// and never reaches the serial phase - which is the point, since at
+    /// depth that is ~98% of the lanes offered.
+    candidates: Vec<(u32, (u64, u64))>,
+    lanes: usize,
 }
 
 /// PHASE 1 of the frontier subtract: canonicalize the state into columns,
@@ -1280,8 +1282,7 @@ pub fn visited_row_keys(
     state: &State,
     visited: &crate::interpreter::row_table::RowTable,
 ) -> Option<VisitedKeys> {
-    use crate::interpreter::row_table::RowTable;
-    use crate::interpreter::virtual_merge::{collect_columns_labeled, hash_rows_two_seeds, Column};
+    use crate::interpreter::virtual_merge::{collect_columns_labeled, row_key_hashes, Column};
     let _trace = TraceSpan::new("visited_row_keys", "vectorize");
     let shape_hash = shape_of_state(state).cached_hash();
     let (columns, _origins) = collect_columns_labeled(std::slice::from_ref(state))?;
@@ -1292,18 +1293,21 @@ pub fn visited_row_keys(
     // 64-bit hashes = a 128-bit row key: at ~10^8 rows the 64-bit birthday
     // risk was ~10^-4 per run, which 128 bits make negligible. Both seeds
     // are folded in ONE pass over the columns.
-    let (hashes, hashes2) = hash_rows_two_seeds(
+    let keys = row_key_hashes(
+        shape_hash,
         &refs,
         state.vector_size,
         crate::interpreter::row_table::ROW_HASH_SEED2,
     );
-    let keys: Vec<(u64, u64)> = hashes
-        .iter()
-        .zip(&hashes2)
-        .map(|(a, b)| RowTable::key(shape_hash, *a, *b))
+    let candidates: Vec<(u32, (u64, u64))> = keys
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, key)| visited.id_of(key).is_none().then_some((i as u32, key)))
         .collect();
-    let absent: Vec<bool> = keys.iter().map(|k| visited.id_of(*k).is_none()).collect();
-    Some(VisitedKeys { keys, absent })
+    Some(VisitedKeys {
+        candidates,
+        lanes: state.vector_size,
+    })
 }
 
 /// PHASE 2: assign ids to the genuinely new rows and drop the rest.
@@ -1312,12 +1316,12 @@ pub fn visited_row_keys(
 /// and everything downstream (checkpoints, bands, the backward sweep) is
 /// written in terms of them, so this ordering is load-bearing.
 ///
-/// The `absent` verdict from phase 1 is only a filter, never a decision:
-/// every surviving lane still goes through `insert_new`, which is what
-/// resolves duplicates *within* this batch (two lanes with the same new
-/// row both read "absent" in phase 1; the second one's `insert_new`
-/// returns `None`). Passing `absent` all-true would give the same answer,
-/// just slower.
+/// Phase 1's verdict is only a filter, never a decision: every candidate
+/// lane still goes through `insert_new`, which is what resolves duplicates
+/// *within* this batch (two lanes carrying the same new row both read
+/// "absent" in phase 1; the second one's `insert_new` returns `None`).
+/// Handing over every lane as a candidate would give the same answer, just
+/// slower.
 pub fn subtract_precomputed(
     state: State,
     keys: Option<VisitedKeys>,
@@ -1325,16 +1329,18 @@ pub fn subtract_precomputed(
 ) -> (Vec<State>, usize, usize) {
     let _trace = TraceSpan::new("subtract_visited", "vectorize");
     let before = state.vector_size;
-    let Some(VisitedKeys { keys, absent }) = keys else {
+    let Some(VisitedKeys { candidates, lanes }) = keys else {
         return (vec![state], before, before);
     };
-    debug_assert_eq!(keys.len(), state.vector_size);
-    let mask: Vec<bool> = keys
-        .iter()
-        .zip(&absent)
-        .map(|(key, absent)| *absent && visited.insert_new(*key).is_some())
-        .collect();
-    let kept = mask.iter().filter(|b| **b).count();
+    debug_assert_eq!(lanes, state.vector_size);
+    let mut mask = vec![false; lanes];
+    let mut kept = 0usize;
+    for (lane, key) in candidates {
+        if visited.insert_new(key).is_some() {
+            mask[lane as usize] = true;
+            kept += 1;
+        }
+    }
     if kept == state.vector_size {
         (vec![state], before, kept)
     } else if kept > 0 {

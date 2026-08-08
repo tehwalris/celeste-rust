@@ -33,7 +33,7 @@ use crate::interpreter::abstraction::room_x_lane_mask;
 use crate::interpreter::row_table::{RowTable, ROW_HASH_SEED2};
 use crate::interpreter::state::State;
 use crate::interpreter::vectorize::shape_of_state;
-use crate::interpreter::virtual_merge::{collect_columns_labeled, hash_rows, hash_rows_seeded, Column};
+use crate::interpreter::virtual_merge::{collect_columns_labeled, row_key_hashes, Column};
 
 use super::checkpoint;
 use super::program::Program;
@@ -57,13 +57,12 @@ pub fn row_keys(state: &State) -> Result<Vec<(u64, u64)>> {
         ));
     };
     let refs: Vec<&Column> = columns.iter().collect();
-    let h1 = hash_rows(&refs, state.vector_size);
-    let h2 = hash_rows_seeded(&refs, state.vector_size, ROW_HASH_SEED2);
-    Ok(h1
-        .iter()
-        .zip(&h2)
-        .map(|(a, b)| RowTable::key(shape_hash, *a, *b))
-        .collect())
+    Ok(row_key_hashes(
+        shape_hash,
+        &refs,
+        state.vector_size,
+        ROW_HASH_SEED2,
+    ))
 }
 
 /// One CSR shard: the predecessor lists contributed by a contiguous range

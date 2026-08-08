@@ -207,7 +207,33 @@ pub enum Column<'a> {
     Intervals(Vec<Piece<'a, Pico8NumInterval>>),
 }
 
+/// A column's single value, when it has one. The untyped `uniform_scalar`
+/// wraps it in a `Value` (an allocation-bearing enum); the row-key hash
+/// wants the raw payload to hash, once, per column.
+pub enum UniformValue {
+    Number(Pico8Num),
+    Bool(bool),
+    Interval(Pico8NumInterval),
+}
+
 impl<'a> Column<'a> {
+    /// The single value every row of this column holds, if there is one.
+    /// `None` also covers the empty column, which has nothing to fold.
+    pub fn uniform_value(&self) -> Option<UniformValue> {
+        fn check<T: Copy + PartialEq>(pieces: &[Piece<T>]) -> Option<T> {
+            let first = pieces.iter().find_map(|p| p.first())?;
+            pieces
+                .iter()
+                .all(|p| p.all_equal_to(&first))
+                .then_some(first)
+        }
+        match self {
+            Column::Numbers(p) => check(p).map(UniformValue::Number),
+            Column::Bools(p) => check(p).map(UniformValue::Bool),
+            Column::Intervals(p) => check(p).map(UniformValue::Interval),
+        }
+    }
+
     /// The single scalar this column collapses to, if no two rows can be
     /// told apart by it. Such a column leaves the dedup key and the merged
     /// state stores it as a `Scalar` - the collapse that materialising
@@ -496,131 +522,6 @@ pub fn hash_rows(columns: &[&Column], total_rows: usize) -> Vec<u64> {
     hash_rows_seeded(columns, total_rows, 0)
 }
 
-/// Both halves of the frontier's 128-bit row key in ONE pass over the
-/// columns.
-///
-/// `subtract_visited` needs `hash_rows(cols, n)` and
-/// `hash_rows_seeded(cols, n, SEED2)`, and ran them as two independent
-/// passes - reading every column's bytes twice and walking the piece list
-/// twice for a per-element cost that is a handful of multiplies. Folding
-/// both seeds in the same visit halves the column traffic, which is the
-/// part that misses cache.
-///
-/// Returns exactly `(hash_rows(..), hash_rows_seeded(.., seed2))`; the
-/// element hash and the fold are the same arithmetic in the same order, so
-/// this is a pure scheduling change and row keys are unchanged. A test
-/// holds it equal to the two separate calls.
-pub fn hash_rows_two_seeds(
-    columns: &[&Column],
-    total_rows: usize,
-    seed2: u64,
-) -> (Vec<u64>, Vec<u64>) {
-    use std::hash::{Hash, Hasher};
-    #[inline(always)]
-    fn elem_hash_seeded<T: Hash>(value: &T, seed: u64) -> u64 {
-        let mut hasher = rustc_hash::FxHasher::default();
-        seed.hash(&mut hasher);
-        value.hash(&mut hasher);
-        hasher.finish()
-    }
-    #[inline(always)]
-    fn fold(row: &mut u64, value: u64) {
-        *row = (row.rotate_left(26) ^ value).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    }
-    fn run<T: Hash + Copy + PartialEq>(
-        pieces: &[Piece<T>],
-        a: &mut [u64],
-        b: &mut [u64],
-        seed2: u64,
-    ) {
-        let mut at = 0;
-        for piece in pieces {
-            let n = piece.len();
-            match piece {
-                Piece::Slice(s) => {
-                    for ((ra, rb), value) in a[at..at + n]
-                        .iter_mut()
-                        .zip(b[at..at + n].iter_mut())
-                        .zip(s.iter())
-                    {
-                        fold(ra, elem_hash_seeded(value, 0));
-                        fold(rb, elem_hash_seeded(value, seed2));
-                    }
-                }
-                Piece::Scalar(v, _) => {
-                    let ha = elem_hash_seeded(v, 0);
-                    let hb = elem_hash_seeded(v, seed2);
-                    for (ra, rb) in a[at..at + n].iter_mut().zip(b[at..at + n].iter_mut()) {
-                        fold(ra, ha);
-                        fold(rb, hb);
-                    }
-                }
-            }
-            at += n;
-        }
-    }
-    fn run_range(
-        columns: &[&Column],
-        a: &mut [u64],
-        b: &mut [u64],
-        start: usize,
-        seed2: u64,
-    ) {
-        let end = start + a.len();
-        for column in columns {
-            macro_rules! go {
-                ($p:expr) => {
-                    visit_range_impl(
-                        $p,
-                        start,
-                        end,
-                        |v| (elem_hash_seeded(&v, 0), elem_hash_seeded(&v, seed2)),
-                        |i, (ha, hb)| {
-                            fold(&mut a[i - start], ha);
-                            fold(&mut b[i - start], hb);
-                        },
-                    )
-                };
-            }
-            match column {
-                Column::Numbers(p) => go!(p),
-                Column::Bools(p) => go!(p),
-                Column::Intervals(p) => go!(p),
-            }
-        }
-    }
-
-    let t = crate::op_census::start();
-    const INIT: u64 = 0x51_7c_c1_b7_27_22_0a_95;
-    let mut a = vec![INIT; total_rows];
-    let mut b = vec![INIT; total_rows];
-    let threads = merge_threads();
-    if total_rows < PARALLEL_ROW_THRESHOLD || threads == 1 {
-        for column in columns {
-            match column {
-                Column::Numbers(p) => run(p, &mut a, &mut b, seed2),
-                Column::Bools(p) => run(p, &mut a, &mut b, seed2),
-                Column::Intervals(p) => run(p, &mut a, &mut b, seed2),
-            }
-        }
-    } else {
-        let chunk = total_rows.div_ceil(threads);
-        std::thread::scope(|scope| {
-            for (i, (ca, cb)) in a.chunks_mut(chunk).zip(b.chunks_mut(chunk)).enumerate() {
-                scope.spawn(move || run_range(columns, ca, cb, i * chunk, seed2));
-            }
-        });
-    }
-    let col_bytes: usize = columns.iter().map(|c| c.total_bytes()).sum();
-    crate::op_census::record(
-        crate::op_census::Cat::HashRows,
-        2 * total_rows * columns.len(),
-        col_bytes + 32 * total_rows * columns.len(),
-        t,
-    );
-    (a, b)
-}
-
 /// `hash_rows` with the seed mixed into every element hash, giving an
 /// independent hash function per seed. The frontier visited set keys rows by
 /// two independently-seeded 64-bit hashes (128 bits total), which takes the
@@ -710,6 +611,145 @@ pub fn hash_rows_seeded(columns: &[&Column], total_rows: usize, seed: u64) -> Ve
         t,
     );
     hashes
+}
+
+/// The frontier's 128-bit row key: both halves, in one pass, with the
+/// state's UNIFORM columns folded once instead of once per row.
+///
+/// Measured on room (1,0) at depth: a boundary state has ~50.8 columns that
+/// hold the same value in every lane and ~7.2 that vary. `hash_rows` folds
+/// all 58 into every row, so ~87% of the arithmetic re-derives a per-state
+/// constant per lane - and 64-bit multiply is one port, so those folds were
+/// 23% of all cycles in the profile.
+///
+/// The combine is therefore ORDER-INDEPENDENT (wrapping addition of
+/// well-diffused per-column contributions) rather than a sequential fold.
+/// That is not only an optimisation - it is required for the hoist to be
+/// CORRECT. Uniformity is a property of a state, not of a column: the same
+/// logical row can arrive in a state where column 5 is uniform and column 9
+/// varies, and in another where it is the other way round. A sequential
+/// fold would have to visit both in canonical position to agree; an
+/// order-independent one does not care which side of the hoist each column
+/// fell on.
+///
+/// What order-independence costs is that the column's IDENTITY has to enter
+/// its contribution explicitly, or two columns swapping values would
+/// produce the same sum. The ordinal is hashed in with the value, and each
+/// contribution goes through a splitmix finalizer before being added, so
+/// low-entropy values (booleans, small integers - most of this state) still
+/// spread across all 64 bits.
+///
+/// Two independently-seeded halves give the 128-bit key. Comparability
+/// across states rests on the same premise the sequential version rested
+/// on: equal-shape states produce columns in the same canonical order, and
+/// the shape hash keys the table.
+pub fn row_key_hashes(
+    shape_hash: u64,
+    columns: &[&Column],
+    total_rows: usize,
+    seed2: u64,
+) -> Vec<(u64, u64)> {
+    use std::hash::{Hash, Hasher};
+
+    /// Per-(column, seed) salt: the column's identity, hashed once. It is
+    /// what stops two columns swapping values from producing the same sum.
+    #[inline(always)]
+    fn salt(ord: usize, seed: u64) -> u64 {
+        let mut hasher = rustc_hash::FxHasher::default();
+        seed.hash(&mut hasher);
+        (ord as u64).hash(&mut hasher);
+        hasher.finish()
+    }
+    /// splitmix64's finalizer. Load-bearing, not decoration: contributions
+    /// are ADDED, so each one has to be spread over all 64 bits first or
+    /// the low bits of a column of small integers would carry the sum.
+    #[inline(always)]
+    fn finalize(h: u64) -> u64 {
+        let h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        let h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        h ^ (h >> 31)
+    }
+    #[inline(always)]
+    fn contrib<T: Hash>(value: &T, salt: u64) -> u64 {
+        let mut hasher = rustc_hash::FxHasher::default();
+        value.hash(&mut hasher);
+        finalize(hasher.finish() ^ salt)
+    }
+
+    /// Add one column's contributions into both halves.
+    fn add_column<T: Hash + Copy + PartialEq>(
+        pieces: &[Piece<T>],
+        ord: usize,
+        seed2: u64,
+        keys: &mut [(u64, u64)],
+    ) {
+        let (pa, pb) = (salt(ord, 0), salt(ord, seed2));
+        let mut at = 0;
+        for piece in pieces {
+            let n = piece.len();
+            match piece {
+                Piece::Slice(s) => {
+                    for (key, v) in keys[at..at + n].iter_mut().zip(s.iter()) {
+                        key.0 = key.0.wrapping_add(contrib(v, pa));
+                        key.1 = key.1.wrapping_add(contrib(v, pb));
+                    }
+                }
+                Piece::Scalar(v, _) => {
+                    let (ca, cb) = (contrib(v, pa), contrib(v, pb));
+                    for key in keys[at..at + n].iter_mut() {
+                        key.0 = key.0.wrapping_add(ca);
+                        key.1 = key.1.wrapping_add(cb);
+                    }
+                }
+            }
+            at += n;
+        }
+    }
+
+    let t = crate::op_census::start();
+    const INIT: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+    // Pass 1: the shape and every column that holds one value across the
+    // whole virtual concatenation contribute constants, computed once. The
+    // shape used to be mixed in per lane by `RowTable::key`, which is four
+    // multiplies per lane for something that cannot vary within a state.
+    let (mut base_a, mut base_b) = (
+        finalize(INIT ^ shape_hash),
+        finalize(INIT ^ shape_hash.wrapping_add(0x9e37_79b9_7f4a_7c15)),
+    );
+    let mut varying: Vec<(usize, &Column)> = Vec::new();
+    for (ord, column) in columns.iter().enumerate() {
+        macro_rules! uniform_add {
+            ($v:expr) => {{
+                base_a = base_a.wrapping_add(contrib(&$v, salt(ord, 0)));
+                base_b = base_b.wrapping_add(contrib(&$v, salt(ord, seed2)));
+            }};
+        }
+        match column.uniform_value() {
+            Some(UniformValue::Number(v)) => uniform_add!(v),
+            Some(UniformValue::Bool(v)) => uniform_add!(v),
+            Some(UniformValue::Interval(v)) => uniform_add!(v),
+            // An empty column has no value to fold and no rows to
+            // distinguish; it contributes nothing either way.
+            None => varying.push((ord, column)),
+        }
+    }
+    let mut keys = vec![(base_a, base_b); total_rows];
+    // Pass 2: only the columns that actually tell rows apart.
+    for (ord, column) in &varying {
+        match column {
+            Column::Numbers(p) => add_column(p, *ord, seed2, &mut keys),
+            Column::Bools(p) => add_column(p, *ord, seed2, &mut keys),
+            Column::Intervals(p) => add_column(p, *ord, seed2, &mut keys),
+        }
+    }
+    let col_bytes: usize = varying.iter().map(|(_, c)| c.total_bytes()).sum();
+    crate::op_census::record(
+        crate::op_census::Cat::HashRows,
+        2 * total_rows * varying.len().max(1),
+        col_bytes + 32 * total_rows * varying.len(),
+        t,
+    );
+    keys
 }
 
 /// The probe phase's outputs: which rows are representatives (first row

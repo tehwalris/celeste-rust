@@ -35,7 +35,13 @@ const MAGIC: &[u8; 4] = b"C8TB";
 /// unconditionally (every state gains a builtin global, changing every
 /// row hash), compile-time builtin pinning, and the fingerprint computed
 /// from `CampaignConfig` with every field hashed unconditionally.
-pub const FORMAT_VERSION: u32 = 3;
+///
+/// Version 4: the row key became order-independent
+/// (`virtual_merge::row_key_hashes`) so a state's uniform columns are
+/// folded once instead of once per lane. Every key in every visited set
+/// changes, so a v3 checkpoint must be refused rather than resumed - its
+/// row ids would refer to keys this build can no longer compute.
+pub const FORMAT_VERSION: u32 = 4;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Meta {
