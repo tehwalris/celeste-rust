@@ -1,3 +1,64 @@
+# Roofline: how far off are we? (measured 2026-08-08)
+
+Philippe's yardstick: "the time to load all the compressed states for a
+frame at peak theoretical memory bandwidth, plus the time to write the
+compressed states at peak bandwidth - that's sort of the benchmark. Not
+necessarily achievable, but you should be able to get close."
+
+Machine: Ryzen 9 7950X3D, 16C/32T, 128 MiB L3. MEASURED bandwidth (not
+spec sheet): 51.5 GB/s pure read, 36.0 GB/s STREAM triad, 29.0 GB/s
+memcpy counting read+write.
+
+Subject: room (1,0) level-0 forward pass, 100 frames, the FAST room -
+212,559,007 lane-frames, 670 MB of compressed states (3.15 bytes/lane;
+the compression is excellent), 1658 s wall.
+
+| bound | time | we are |
+|---|---|---|
+| [A] compressed-state I/O only (Philippe's roofline) | 0.046 s | 36,000x off |
+| [B] every intermediate materialised to RAM, bandwidth-bound | 53.8 s | 31x off |
+| [C] compute: 1.95e11 lane-instructions, AVX2, 16 cores | 0.15 s | 11,000x off |
+| actual | 1658 s | |
+
+Per lane-instruction we spend 8.5 ns - about 42 cycles at 5 GHz - where
+a vectorised op over a long lane vector should amortise to well under
+one. Achieved rate is 1.18e8 lane-instructions/s.
+
+Bound [B] is the one to internalise: even a *perfectly memory-bound*
+implementation of the dataflow we already have would finish in 54 s
+instead of 1658 s. The 31x is not "a few times slower than necessary".
+
+Where the time goes (fwd metrics, same run):
+  fwd.interpret        1190 s   72%
+  fwd.boundary_stream   353 s   21%
+  fwd.save_frames        45 s    3%
+  fwd.merge              10 s    0.6%
+
+Three gaps, in order of ratio-per-effort:
+
+1. NO THREAD PARALLELISM IN INTERPRET. 72% of the time runs on one core
+   of sixteen; only virtual_merge is threaded (std::thread::scope).
+   Frames decompose into ~61 independent fragments, which is
+   embarrassingly parallel. A state-parallel flow was tried and reverted
+   (task #63, "only helped the plain path") - worth re-measuring now
+   that the recipe path dominates and the fragment count is known.
+
+2. ~42 CYCLES PER LANE-INSTRUCTION. Enum dispatch per instruction, the
+   MaybeVector Scalar/Vector branch per operand, heap indirection, Arc
+   refcount traffic, and an allocation per output vector.
+
+3. NO TILING. Each instruction materialises its whole output vector
+   (~111k lanes at f100 = ~444 KB, far past L2) before the next
+   instruction reads it back: 1.56 TB of intermediate traffic for this
+   run. Tiling a cache-sized block of lanes through the whole program,
+   rather than the whole lane set through one instruction at a time, is
+   exactly the difference between bound [B] and bound [A].
+
+Caveat on the 36,000x: bound [A] assumes compute is free, so it is a
+yardstick rather than a target. Bound [B] (31x) is the honest measure of
+how much is being left on the table by the current execution strategy,
+and gaps 1+3 are the levers on it.
+
 # Benchmark Data
 
 ## Fresh-run cost: room (0,0) vs room (1,0) (2026-08-08)
