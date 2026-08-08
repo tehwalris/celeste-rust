@@ -562,22 +562,27 @@ struct FrameEventCounters {
     variant: (usize, usize),
 }
 
-/// Lane-chunking (env-gated: CELESTE_MAX_STATE_LANES=N): split states
-/// above N lanes into <=N-lane chunks before the frame. Lanes are
-/// independent, so running chunks separately and re-merging at the
-/// boundary is semantics-preserving; what it changes is the PEAK -
-/// the mid-frame transient (fragments plus the heap's append-only
-/// storage) is proportional to the widest state in flight, and at
-/// room-(0,0) scale a single 12.5M-lane frame peaked at 98 GB. The
-/// cost is re-running per-chunk the work that is uniform across lanes.
+/// Lane-chunking: split states above N lanes into <=N-lane chunks before
+/// the frame. Lanes are independent, so running chunks separately and
+/// re-merging at the boundary is semantics-preserving; what it changes is
+/// the PEAK - the mid-frame transient (fragments plus the heap's
+/// append-only storage) is proportional to the widest state in flight,
+/// and at room-(0,0) scale a single 12.5M-lane frame peaked at 98 GB.
+/// The cost is re-running per-chunk the work that is uniform across
+/// lanes.
+///
+/// The cap defaults to 1M lanes (the room-(0,0) campaign value; it never
+/// fires on runs below that scale). CELESTE_MAX_STATE_LANES overrides;
+/// 0 disables chunking entirely.
 fn chunk_states(states: Vec<State>) -> Vec<State> {
-    let Some(cap) = std::env::var("CELESTE_MAX_STATE_LANES")
+    const DEFAULT_CAP: usize = 1_000_000;
+    let cap = std::env::var("CELESTE_MAX_STATE_LANES")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-    else {
+        .unwrap_or(DEFAULT_CAP);
+    if cap == 0 {
         return states;
-    };
-    assert!(cap > 0, "CELESTE_MAX_STATE_LANES must be positive");
+    }
     let mut out = Vec::with_capacity(states.len());
     for state in states {
         // Fruit-bearing states get a 10x tighter cap: their frames run
