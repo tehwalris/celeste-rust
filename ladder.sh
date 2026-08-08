@@ -16,6 +16,19 @@ if [ "$ROOM" = "1,0" ]; then STEM=room1; else STEM=room$(echo "$ROOM" | tr -d ' 
 RECIPE=${RECIPE:-rewrites.jsonl}
 L0=~/celeste-checkpoints/$STEM
 export CELESTE_FRONTIER_ONLY=1 CELESTE_DEOPT_COLLECT_FIRST=1
+# CHUNKING IS SEMANTIC ON ROOMS WITH FRUIT, so every stage of a campaign
+# must use the SAME values. An UnknownBool branch sends the whole state
+# down both edges, so how lanes are grouped decides how coarse the
+# over-approximation is - and the sweep replays the forward pass frame by
+# frame, so a different grouping produces a different successor set.
+#
+# Getting it wrong fails in one of two ways, and only one of them is
+# visible: a sweep chunked FINER than the forward pass silently produces
+# a SUBSET of its edges (g then overestimates and the bands prune viable
+# rows); chunked COARSER it produces a superset and dies with "a successor
+# row is not in the row table". These used to differ - forward at
+# cap/10 and sweep at cap/100 - which is the quiet direction.
+export CELESTE_MAX_STATE_LANES=8000 CELESTE_FRUIT_CHUNK_LANES=8000
 FROM=${1:-94}
 TO=${2:-104}
 MAXK=${3:-16}
@@ -34,7 +47,7 @@ for H in $(seq "$FROM" "$TO"); do
   # and small chunks are what give the threads work at all (a 250k-lane
   # sweep batch was only 3 chunks at the old cap). The fruit divisor comes
   # down with it so the fruit chunk stays ~1000 lanes rather than 80.
-  CELESTE_MAX_STATE_LANES=8000 CELESTE_FRUIT_CHUNK_LANES=1000 ./safe-run.sh -- ./target/release/rewrite --recipe "$RECIPE" sweep \
+  ./safe-run.sh -- ./target/release/rewrite --recipe "$RECIPE" sweep \
       --checkpoint-dir "$L0" --frames "$H" --horizon "$H" > /tmp/l0sweep-h$H.log 2>&1
   grep -E "abstract optimal|win seeds" /tmp/l0sweep-h$H.log
   refuted=0
@@ -55,7 +68,7 @@ for H in $(seq "$FROM" "$TO"); do
       break
     fi
     echo "=== horizon $H: k=$K wins; sweeping level $K ==="
-    CELESTE_REM_BITS=$K CELESTE_MAX_STATE_LANES=8000 CELESTE_FRUIT_CHUNK_LANES=1000 ./safe-run.sh -- ./target/release/rewrite --recipe "$RECIPE" sweep --banded \
+    CELESTE_REM_BITS=$K ./safe-run.sh -- ./target/release/rewrite --recipe "$RECIPE" sweep --banded \
         --checkpoint-dir "$KDIR" --frames "$H" --horizon "$H" \
         > "/tmp/k${K}sweep-h$H.log" 2>&1
     grep -E "abstract optimal|win seeds" "/tmp/k${K}sweep-h$H.log"
