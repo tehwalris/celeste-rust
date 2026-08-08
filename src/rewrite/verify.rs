@@ -388,6 +388,18 @@ struct StreamCounters {
     sub_after: usize,
 }
 
+impl StreamCounters {
+    /// Fold a worker's per-chunk counters in. Called in input order so the
+    /// totals do not depend on which thread finished first.
+    fn absorb(&mut self, other: &StreamCounters) {
+        self.band_before += other.band_before;
+        self.band_after += other.band_after;
+        self.band_missing += other.band_missing;
+        self.sub_before += other.sub_before;
+        self.sub_after += other.sub_after;
+    }
+}
+
 /// Streaming boundary pipeline (the standard path for frontier-only runs):
 /// abstract, band-filter and visited-subtract one frame-output state
 /// as soon as it is produced, so only SURVIVING lanes are ever held for the
@@ -405,6 +417,25 @@ fn stream_boundary_one(
     visited: &mut crate::interpreter::row_table::RowTable,
     counters: &mut StreamCounters,
 ) -> Result<Vec<State>> {
+    let prepared = stream_boundary_prepare(state, band, frame, counters, visited)?;
+    Ok(stream_boundary_subtract(prepared, visited, counters))
+}
+
+/// The THREAD-SAFE prefix of `stream_boundary_one`: straddle-split,
+/// abstract, band-filter and gc. Every step here is a pure function of its
+/// input state, so a worker thread can run it for its own chunk (see
+/// `step_parallel`); only the visited-set subtraction that follows touches
+/// shared mutable state.
+///
+/// The counters it fills are per-call and merged by the caller in input
+/// order, so the aggregate is identical whichever thread did the work.
+fn stream_boundary_prepare(
+    state: State,
+    band: Option<&BandFilter>,
+    frame: u32,
+    counters: &mut StreamCounters,
+    visited: &crate::interpreter::row_table::RowTable,
+) -> Result<Vec<PreparedRows>> {
     let mut kept_out = Vec::new();
     for state in crate::interpreter::abstraction::split_rem_straddles(state) {
         let state = make_state_abstract(state);
@@ -453,13 +484,45 @@ fn stream_boundary_one(
         // set double-counts (measured: 2x visited, +10% spurious frontier).
         let mut state = state;
         state.gc();
+        // Phase 1 of the frontier subtract - hashing every lane into its
+        // 128-bit row key and looking it up read-only. This is where the
+        // per-lane cache miss lives, and it needs only `&RowTable`, so it
+        // belongs on this side of the parallel/serial line.
+        let keys = crate::interpreter::vectorize::visited_row_keys(&state, visited);
+        kept_out.push(PreparedRows { state, keys });
+    }
+    Ok(kept_out)
+}
+
+/// A boundary state with its visited-set keys already computed and probed
+/// (`visited_row_keys`). Only the id-assigning insert is left, and that has
+/// to happen in input order.
+struct PreparedRows {
+    state: State,
+    keys: Option<crate::interpreter::vectorize::VisitedKeys>,
+}
+
+/// The SERIAL suffix: subtract the rows this run has already reached.
+///
+/// Kept out of `stream_boundary_prepare` because the row table is the one
+/// piece of shared mutable state in the frame pipeline, and because row ids
+/// are assigned in insertion order - running this in input order is what
+/// makes a parallel frame produce byte-identical checkpoints to a serial
+/// one.
+fn stream_boundary_subtract(
+    prepared: Vec<PreparedRows>,
+    visited: &mut crate::interpreter::row_table::RowTable,
+    counters: &mut StreamCounters,
+) -> Vec<State> {
+    let mut kept_out = Vec::new();
+    for PreparedRows { state, keys } in prepared {
         let (kept, before, after) =
-            crate::interpreter::vectorize::subtract_visited(vec![state], visited);
+            crate::interpreter::vectorize::subtract_precomputed(state, keys, visited);
         counters.sub_before += before;
         counters.sub_after += after;
         kept_out.extend(kept);
     }
-    Ok(kept_out)
+    kept_out
 }
 
 /// Outcome of offering a state to the variant registry for one frame.
@@ -564,6 +627,37 @@ struct FrameEventCounters {
     variant: (usize, usize),
 }
 
+impl FrameEventCounters {
+    fn absorb(&mut self, other: &FrameEventCounters) {
+        self.deopt.0 += other.deopt.0;
+        self.deopt.1 += other.deopt.1;
+        self.variant.0 += other.variant.0;
+        self.variant.1 += other.variant.1;
+    }
+}
+
+/// Worker threads for chunk-parallel frame execution
+/// (`CELESTE_FRAME_THREADS`; 1 = off, the default).
+///
+/// This is the lane axis, not the state axis: `chunk_states` cuts a wide
+/// boundary state into independent lane chunks and each worker runs one
+/// chunk through the whole frame body. Parallelising across the states
+/// *inside* a flow step was measured twice and rejected (see
+/// BENCHMARK_DATA.md) - after a boundary merge a frame is a handful of very
+/// wide states, so there is nothing to spread there. Chunking creates the
+/// work items that parallelism then consumes, which is why the two only
+/// pay off together.
+fn frame_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("CELESTE_FRAME_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or_else(crate::interpreter::virtual_merge::worker_threads)
+            .max(1)
+    })
+}
+
 /// Lane-chunking: split states above N lanes into <=N-lane chunks before
 /// the frame. Lanes are independent, so running chunks separately and
 /// re-merging at the boundary is semantics-preserving; what it changes is
@@ -577,11 +671,32 @@ struct FrameEventCounters {
 /// fires on runs below that scale). CELESTE_MAX_STATE_LANES overrides;
 /// 0 disables chunking entirely.
 fn chunk_states(states: Vec<State>) -> Vec<State> {
-    const DEFAULT_CAP: usize = 1_000_000;
+    // The cap and the thread count are ONE setting, not two. Measured on
+    // room (1,0), 60 frames (2026-08-08):
+    //
+    //   1 thread,  no chunking        89.2 s   4.31 GB
+    //   1 thread,  cap 8k             ~110 s   (the tiling tax: ~23%, from
+    //                                          re-running per chunk the work
+    //                                          that is uniform across lanes)
+    //   16 threads, no chunking       57.0 s  11.83 GB  (1.6x, and 2.7x the
+    //                                          memory - 16 chunks' raw
+    //                                          outputs in flight is exactly
+    //                                          what streaming existed to
+    //                                          avoid)
+    //   16 threads, cap 8k            21.9 s   2.55 GB  (4.1x AND less
+    //                                          memory than serial)
+    //
+    // Each alone is a bad trade; together they are the whole win, because
+    // the chunks are what give the threads work and the threads are what
+    // pay for the chunking. So the parallel default cap is derived here
+    // rather than left to the caller to remember.
+    const SERIAL_CAP: usize = 1_000_000;
+    const PARALLEL_CAP: usize = 8_000;
+    let default_cap = if frame_threads() > 1 { PARALLEL_CAP } else { SERIAL_CAP };
     let cap = std::env::var("CELESTE_MAX_STATE_LANES")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_CAP);
+        .unwrap_or(default_cap);
     if cap == 0 {
         return states;
     }
@@ -824,6 +939,13 @@ impl AbstractRun {
         let stream = self.visited_rows.is_some() && !self.rem_only_abstraction;
         let frame_no = self.states_before_merge.len() as u32 + 1;
         let input_states = chunk_states(std::mem::take(&mut self.states));
+        // Chunk-parallel path: only for streaming frontier runs, and only
+        // when no shape variants are registered (variant dispatch owns
+        // `&mut self`). Everything else keeps the serial loop below - one
+        // code path per arrangement, and the parallel one is opt-in.
+        if stream && frame_threads() > 1 && self.variants.is_none() {
+            return self.step_parallel(input_states, frame_no);
+        }
         let mut counters = FrameEventCounters::default();
         let mut stream_counters = StreamCounters::default();
         let mut stream_survivors: Vec<State> = Vec::new();
@@ -865,6 +987,112 @@ impl AbstractRun {
         }
     }
 
+    /// `step` with the frame body and the pure boundary prefix spread over
+    /// `frame_threads()` worker threads.
+    ///
+    /// DETERMINISM is the whole design constraint, because the row table
+    /// assigns ids in insertion order and those ids are what checkpoints,
+    /// bands and the backward sweep are written in terms of. So:
+    ///
+    /// * work is handed out in BATCHES of `threads` consecutive chunks;
+    /// * inside a batch each worker runs `interpret_state_base` plus
+    ///   `stream_boundary_prepare` on its own chunk, touching nothing
+    ///   shared;
+    /// * the batch's results are then folded in INPUT ORDER on this
+    ///   thread - `stream_boundary_subtract` and the counters both.
+    ///
+    /// So the sequence of rows offered to the visited set is exactly the
+    /// serial path's, and the run is byte-identical to a single-threaded
+    /// one. The batch (rather than a queue) is also what bounds memory:
+    /// at most `threads` chunks' raw outputs are alive at once, which is
+    /// why the chunk cap has to come down as the thread count goes up.
+    fn step_parallel(&mut self, input_states: Vec<State>, frame_no: u32) -> Result<()> {
+        let threads = frame_threads();
+        let mut counters = FrameEventCounters::default();
+        let mut stream_counters = StreamCounters::default();
+        let mut stream_survivors: Vec<State> = Vec::new();
+        let deopt = self.deopt.as_ref();
+        let frame_cfg = &self.frame_cfg;
+        let fixed_env = &self.fixed_env;
+        let band = self.band.as_ref();
+
+        let mut batch: Vec<State> = Vec::with_capacity(threads);
+        let mut queue = input_states.into_iter();
+        loop {
+            batch.clear();
+            for state in queue.by_ref().take(threads) {
+                batch.push(state);
+            }
+            if batch.is_empty() {
+                break;
+            }
+            type Prepared = Result<(Vec<PreparedRows>, FrameEventCounters, StreamCounters)>;
+            let results: Vec<Prepared> = {
+                let _t = ScopedPhase::new("fwd.interpret");
+                let visited_ro: &crate::interpreter::row_table::RowTable = self
+                    .visited_rows
+                    .as_ref()
+                    .expect("stream implies a visited table");
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = batch
+                        .drain(..)
+                        .map(|state| {
+                            scope.spawn(move || -> Prepared {
+                                // This thread IS the parallelism; the row
+                                // hashing inside must not fan out again.
+                                crate::interpreter::virtual_merge::set_nested_parallel(true);
+                                let mut ev = FrameEventCounters::default();
+                                let mut sc = StreamCounters::default();
+                                let outputs = interpret_state_base(
+                                    deopt, frame_cfg, fixed_env, state, &mut ev,
+                                )?;
+                                let mut prepared = Vec::new();
+                                for out in outputs {
+                                    prepared.extend(stream_boundary_prepare(
+                                        out, band, frame_no, &mut sc, visited_ro,
+                                    )?);
+                                }
+                                Ok((prepared, ev, sc))
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| match h.join() {
+                            Ok(r) => r,
+                            // A worker panicked. The serial path lets the
+                            // panic unwind into the deopt handler; here the
+                            // frame is already past that point, so surface
+                            // it as an error rather than losing the chunk.
+                            Err(panic) => Err(anyhow::anyhow!(
+                                "chunk-parallel frame worker: {}",
+                                panic_text(&panic)
+                            )),
+                        })
+                        .collect()
+                })
+            };
+            let _t = ScopedPhase::new("fwd.boundary_stream");
+            let visited = self
+                .visited_rows
+                .as_mut()
+                .expect("stream implies a visited table");
+            for result in results {
+                let (prepared, ev, sc) = result?;
+                counters.absorb(&ev);
+                stream_counters.absorb(&sc);
+                stream_survivors.extend(stream_boundary_subtract(
+                    prepared,
+                    visited,
+                    &mut stream_counters,
+                ));
+            }
+        }
+        self.report_frame_events(&counters);
+        self.finish_streaming_boundary(stream_survivors, &stream_counters);
+        Ok(())
+    }
+
     /// Run one input state through the frame program: shape dispatch first
     /// (a state whose object-array shape has a registered variant runs
     /// under it, through canonical both ways, and skips the base path
@@ -888,80 +1116,91 @@ impl AbstractRun {
         } else {
             state
         };
-        let mut new_states = Vec::new();
-        match &mut self.deopt {
-            None => {
-                let result = interpret_prepared_cfg(&self.frame_cfg, state, &self.fixed_env)
-                    .context("frame failed")?;
-                new_states.extend(result.into_iter().map(|(s, _)| s));
-            }
-            Some(deopt) if deopt.force => {
+        interpret_state_base(
+            self.deopt.as_ref(),
+            &self.frame_cfg,
+            &self.fixed_env,
+            state,
+            counters,
+        )
+    }
+}
+
+/// The frame body proper: everything `interpret_state` does once shape
+/// dispatch has declined the state.
+///
+/// A free function taking only shared borrows, so a worker thread can run
+/// it - that is the whole point of the split. `run_deopt_frame` and
+/// `run_deopt_frame_granular` already take `&DeoptTarget`; the only
+/// mutation left was the event counters, which are per-call and aggregated
+/// by the caller in deterministic order.
+fn interpret_state_base(
+    deopt: Option<&DeoptTarget>,
+    frame_cfg: &crate::interpreter::fixed_env::PreparedCfg,
+    fixed_env: &crate::interpreter::fixed_env::FixedEnv,
+    state: State,
+    counters: &mut FrameEventCounters,
+) -> Result<Vec<State>> {
+    let mut new_states = Vec::new();
+    match deopt {
+        None => {
+            let result = interpret_prepared_cfg(frame_cfg, state, fixed_env)
+                .context("frame failed")?;
+            new_states.extend(result.into_iter().map(|(s, _)| s));
+        }
+        Some(deopt) if deopt.force => {
+            counters.deopt.0 += 1;
+            counters.deopt.1 += state.vector_size;
+            new_states.extend(run_deopt_frame(deopt, state)?);
+        }
+        Some(deopt) if deopt.collect_first => {
+            // Collect-first: every frame runs in collect mode with the
+            // origin column, so a failing state pays one specialized
+            // run instead of two (attempt + retry). The cost is the
+            // origin column's overhead on clean frames - measured
+            // before this became reachable (CELESTE_DEOPT_COLLECT_FIRST).
+            let (states, plain_lanes) =
+                run_deopt_frame_granular(deopt, frame_cfg, fixed_env, state, false)?;
+            if plain_lanes > 0 {
                 counters.deopt.0 += 1;
-                counters.deopt.1 += state.vector_size;
-                new_states.extend(run_deopt_frame(deopt, state)?);
+                counters.deopt.1 += plain_lanes;
             }
-            Some(deopt) if deopt.collect_first => {
-                // Collect-first: every frame runs in collect mode with the
-                // origin column, so a failing state pays one specialized
-                // run instead of two (attempt + retry). The cost is the
-                // origin column's overhead on clean frames - measured
-                // before this became reachable (CELESTE_DEOPT_COLLECT_FIRST).
-                let (states, plain_lanes) = run_deopt_frame_granular(
-                    deopt,
-                    &self.frame_cfg,
-                    &self.fixed_env,
-                    state,
-                    false,
-                )?;
-                if plain_lanes > 0 {
-                    counters.deopt.0 += 1;
-                    counters.deopt.1 += plain_lanes;
+            new_states.extend(states);
+        }
+        Some(deopt) => {
+            // Optimistic: run the specialized frame; deopt on failure.
+            // Panics are caught too - a speculated instruction may
+            // assert on values the verify horizon never showed it
+            // (same failure class `screen_trial` unwinds across).
+            let snapshot = state.clone();
+            let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || interpret_prepared_cfg(frame_cfg, state, fixed_env),
+            ));
+            match attempt {
+                Ok(Ok(result)) => {
+                    new_states.extend(result.into_iter().map(|(s, _)| s))
                 }
-                new_states.extend(states);
-            }
-            Some(deopt) => {
-                // Optimistic: run the specialized frame; deopt on failure.
-                // Panics are caught too - a speculated instruction may
-                // assert on values the verify horizon never showed it
-                // (same failure class `screen_trial` unwinds across).
-                let snapshot = state.clone();
-                let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                    || interpret_prepared_cfg(&self.frame_cfg, state, &self.fixed_env),
-                ));
-                match attempt {
-                    Ok(Ok(result)) => {
-                        new_states.extend(result.into_iter().map(|(s, _)| s))
-                    }
-                    Ok(Err(err)) => {
-                        log_deopt(&mut counters.deopt, &snapshot, &format!("{:#}", err));
-                        let (states, plain_lanes) = run_deopt_frame_granular(
-                            deopt,
-                            &self.frame_cfg,
-                            &self.fixed_env,
-                            snapshot,
-                            true,
-                        )?;
-                        counters.deopt.1 += plain_lanes;
-                        new_states.extend(states);
-                    }
-                    Err(panic) => {
-                        log_deopt(&mut counters.deopt, &snapshot, &panic_text(&panic));
-                        let (states, plain_lanes) = run_deopt_frame_granular(
-                            deopt,
-                            &self.frame_cfg,
-                            &self.fixed_env,
-                            snapshot,
-                            true,
-                        )?;
-                        counters.deopt.1 += plain_lanes;
-                        new_states.extend(states);
-                    }
+                Ok(Err(err)) => {
+                    log_deopt(&mut counters.deopt, &snapshot, &format!("{:#}", err));
+                    let (states, plain_lanes) =
+                        run_deopt_frame_granular(deopt, frame_cfg, fixed_env, snapshot, true)?;
+                    counters.deopt.1 += plain_lanes;
+                    new_states.extend(states);
+                }
+                Err(panic) => {
+                    log_deopt(&mut counters.deopt, &snapshot, &panic_text(&panic));
+                    let (states, plain_lanes) =
+                        run_deopt_frame_granular(deopt, frame_cfg, fixed_env, snapshot, true)?;
+                    counters.deopt.1 += plain_lanes;
+                    new_states.extend(states);
                 }
             }
         }
-        Ok(new_states)
     }
+    Ok(new_states)
+}
 
+impl AbstractRun {
     /// Aggregate the frame's deopt/variant events and print the per-frame
     /// lines the campaign logs grep for.
     fn report_frame_events(&mut self, counters: &FrameEventCounters) {

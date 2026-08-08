@@ -12,13 +12,20 @@
 //! lanes, instead of aborting the frame. The deopt driver then re-runs only
 //! the captured origins under the plain program.
 //!
-//! The sink is process-global because `flow` may fan states out across
-//! threads; captures are rare (only failing premises), so a mutex is fine.
-//! Exactly one `AbstractRun` steps at a time, matching the other process-
-//! global interpreter state (e.g. merge partition patterns).
+//! The sink is THREAD-LOCAL. It used to be a process-global mutex, on the
+//! reasoning that exactly one `AbstractRun` steps at a time; chunk-parallel
+//! frame execution (`CELESTE_FRAME_THREADS`) breaks that premise - several
+//! worker threads each run a whole frame in collect mode at once, and a
+//! shared sink would attribute one chunk's failing origins to another
+//! chunk's lane numbering. A thread-local sink is both correct under
+//! parallelism and cheaper (no lock on the capture path).
+//!
+//! The contract this imposes on callers: `begin`, the interpretation it
+//! guards, and `take` must all run on the SAME thread. Both call sites
+//! (`run_deopt_frame_granular` and the sweep's replay) satisfy that - the
+//! frame runs inline between them.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::cell::{Cell, RefCell};
 
 use crate::interpreter::state::State;
 use crate::interpreter::value::{HeapValue, MaybeVector, Value};
@@ -28,25 +35,26 @@ use crate::interpreter::value::{HeapValue, MaybeVector, Value};
 /// stripped from every output before the frame boundary.
 pub const ORIGIN_GLOBAL: &str = "__lane_origin";
 
-static COLLECTING: AtomicBool = AtomicBool::new(false);
-static SINK: Mutex<Vec<u32>> = Mutex::new(Vec::new());
-
-/// Enter collect mode. The sink starts empty.
-pub fn begin() {
-    let mut sink = SINK.lock().unwrap();
-    sink.clear();
-    COLLECTING.store(true, Ordering::SeqCst);
+thread_local! {
+    static COLLECTING: Cell<bool> = const { Cell::new(false) };
+    static SINK: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Leave collect mode and return every captured origin.
+/// Enter collect mode on this thread. The sink starts empty.
+pub fn begin() {
+    SINK.with(|s| s.borrow_mut().clear());
+    COLLECTING.with(|c| c.set(true));
+}
+
+/// Leave collect mode and return every origin captured on this thread.
 pub fn take() -> Vec<u32> {
-    COLLECTING.store(false, Ordering::SeqCst);
-    std::mem::take(&mut *SINK.lock().unwrap())
+    COLLECTING.with(|c| c.set(false));
+    SINK.with(|s| std::mem::take(&mut *s.borrow_mut()))
 }
 
 #[inline]
 pub fn is_collecting() -> bool {
-    COLLECTING.load(Ordering::Relaxed)
+    COLLECTING.with(|c| c.get())
 }
 
 /// The per-lane origin indices of `state`, decoded from the origin global.
@@ -106,7 +114,8 @@ pub fn inject_named(state: &mut State, name: &str, values: &[u32]) {
 
 /// Capture the origins of every lane of `state`.
 pub fn capture_all(state: &State) {
-    SINK.lock().unwrap().extend(read_origins(state));
+    let origins = read_origins(state);
+    SINK.with(|s| s.borrow_mut().extend(origins));
 }
 
 /// Capture the origins of the lanes where `keep` is false (the lanes that
@@ -114,12 +123,13 @@ pub fn capture_all(state: &State) {
 pub fn capture_dropped(state: &State, keep: &[bool]) {
     let origins = read_origins(state);
     assert_eq!(origins.len(), keep.len(), "deopt_collect: mask length mismatch");
-    let mut sink = SINK.lock().unwrap();
-    sink.extend(
-        origins
-            .iter()
-            .zip(keep)
-            .filter(|(_, keep)| !**keep)
-            .map(|(o, _)| *o),
-    );
+    SINK.with(|s| {
+        s.borrow_mut().extend(
+            origins
+                .iter()
+                .zip(keep)
+                .filter(|(_, keep)| !**keep)
+                .map(|(o, _)| *o),
+        )
+    });
 }

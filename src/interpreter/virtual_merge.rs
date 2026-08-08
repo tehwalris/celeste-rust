@@ -170,8 +170,30 @@ pub fn worker_threads() -> usize {
     })
 }
 
+thread_local! {
+    /// Set on a thread that is ITSELF one of many running a frame chunk
+    /// (`CELESTE_FRAME_THREADS`). The inner row-hashing then stays
+    /// sequential.
+    static NESTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Mark this thread as already-parallel for the duration of the caller.
+///
+/// Without it the two levels multiply: a frame worker calls `hash_rows`
+/// once per boundary state, and each call would `thread::scope` another 16
+/// OS threads - thousands of spawns per frame, oversubscribing 16 cores
+/// many times over. The outer parallelism is the coarser and better
+/// balanced of the two, so the inner one yields.
+pub fn set_nested_parallel(nested: bool) {
+    NESTED.with(|n| n.set(nested));
+}
+
 fn merge_threads() -> usize {
-    worker_threads()
+    if NESTED.with(|n| n.get()) {
+        1
+    } else {
+        worker_threads()
+    }
 }
 
 /// A column value widened to at most two u32 words, the same packing
@@ -472,6 +494,131 @@ pub fn collect_columns_labeled<'a>(
 /// thousands of lanes rather than costing anything per element.
 pub fn hash_rows(columns: &[&Column], total_rows: usize) -> Vec<u64> {
     hash_rows_seeded(columns, total_rows, 0)
+}
+
+/// Both halves of the frontier's 128-bit row key in ONE pass over the
+/// columns.
+///
+/// `subtract_visited` needs `hash_rows(cols, n)` and
+/// `hash_rows_seeded(cols, n, SEED2)`, and ran them as two independent
+/// passes - reading every column's bytes twice and walking the piece list
+/// twice for a per-element cost that is a handful of multiplies. Folding
+/// both seeds in the same visit halves the column traffic, which is the
+/// part that misses cache.
+///
+/// Returns exactly `(hash_rows(..), hash_rows_seeded(.., seed2))`; the
+/// element hash and the fold are the same arithmetic in the same order, so
+/// this is a pure scheduling change and row keys are unchanged. A test
+/// holds it equal to the two separate calls.
+pub fn hash_rows_two_seeds(
+    columns: &[&Column],
+    total_rows: usize,
+    seed2: u64,
+) -> (Vec<u64>, Vec<u64>) {
+    use std::hash::{Hash, Hasher};
+    #[inline(always)]
+    fn elem_hash_seeded<T: Hash>(value: &T, seed: u64) -> u64 {
+        let mut hasher = rustc_hash::FxHasher::default();
+        seed.hash(&mut hasher);
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+    #[inline(always)]
+    fn fold(row: &mut u64, value: u64) {
+        *row = (row.rotate_left(26) ^ value).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+    fn run<T: Hash + Copy + PartialEq>(
+        pieces: &[Piece<T>],
+        a: &mut [u64],
+        b: &mut [u64],
+        seed2: u64,
+    ) {
+        let mut at = 0;
+        for piece in pieces {
+            let n = piece.len();
+            match piece {
+                Piece::Slice(s) => {
+                    for ((ra, rb), value) in a[at..at + n]
+                        .iter_mut()
+                        .zip(b[at..at + n].iter_mut())
+                        .zip(s.iter())
+                    {
+                        fold(ra, elem_hash_seeded(value, 0));
+                        fold(rb, elem_hash_seeded(value, seed2));
+                    }
+                }
+                Piece::Scalar(v, _) => {
+                    let ha = elem_hash_seeded(v, 0);
+                    let hb = elem_hash_seeded(v, seed2);
+                    for (ra, rb) in a[at..at + n].iter_mut().zip(b[at..at + n].iter_mut()) {
+                        fold(ra, ha);
+                        fold(rb, hb);
+                    }
+                }
+            }
+            at += n;
+        }
+    }
+    fn run_range(
+        columns: &[&Column],
+        a: &mut [u64],
+        b: &mut [u64],
+        start: usize,
+        seed2: u64,
+    ) {
+        let end = start + a.len();
+        for column in columns {
+            macro_rules! go {
+                ($p:expr) => {
+                    visit_range_impl(
+                        $p,
+                        start,
+                        end,
+                        |v| (elem_hash_seeded(&v, 0), elem_hash_seeded(&v, seed2)),
+                        |i, (ha, hb)| {
+                            fold(&mut a[i - start], ha);
+                            fold(&mut b[i - start], hb);
+                        },
+                    )
+                };
+            }
+            match column {
+                Column::Numbers(p) => go!(p),
+                Column::Bools(p) => go!(p),
+                Column::Intervals(p) => go!(p),
+            }
+        }
+    }
+
+    let t = crate::op_census::start();
+    const INIT: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+    let mut a = vec![INIT; total_rows];
+    let mut b = vec![INIT; total_rows];
+    let threads = merge_threads();
+    if total_rows < PARALLEL_ROW_THRESHOLD || threads == 1 {
+        for column in columns {
+            match column {
+                Column::Numbers(p) => run(p, &mut a, &mut b, seed2),
+                Column::Bools(p) => run(p, &mut a, &mut b, seed2),
+                Column::Intervals(p) => run(p, &mut a, &mut b, seed2),
+            }
+        }
+    } else {
+        let chunk = total_rows.div_ceil(threads);
+        std::thread::scope(|scope| {
+            for (i, (ca, cb)) in a.chunks_mut(chunk).zip(b.chunks_mut(chunk)).enumerate() {
+                scope.spawn(move || run_range(columns, ca, cb, i * chunk, seed2));
+            }
+        });
+    }
+    let col_bytes: usize = columns.iter().map(|c| c.total_bytes()).sum();
+    crate::op_census::record(
+        crate::op_census::Cat::HashRows,
+        2 * total_rows * columns.len(),
+        col_bytes + 32 * total_rows * columns.len(),
+        t,
+    );
+    (a, b)
 }
 
 /// `hash_rows` with the seed mixed into every element hash, giving an

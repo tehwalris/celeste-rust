@@ -1241,56 +1241,111 @@ pub fn subtract_visited(
     states: Vec<State>,
     visited: &mut crate::interpreter::row_table::RowTable,
 ) -> (Vec<State>, usize, usize) {
-    use crate::interpreter::row_table::RowTable;
-    use crate::interpreter::virtual_merge::{
-        collect_columns_labeled, hash_rows, hash_rows_seeded, Column,
-    };
-    let _trace = TraceSpan::new("subtract_visited", "vectorize");
     let mut out = Vec::with_capacity(states.len());
     let mut before = 0usize;
     let mut after = 0usize;
     for state in states {
-        before += state.vector_size;
-        let shape_hash = shape_of_state(&state).cached_hash();
-        let Some((columns, _origins)) = collect_columns_labeled(std::slice::from_ref(&state))
-        else {
-            // Cannot canonicalize this state - keep it whole. Sound: skipping
-            // dedup only costs work, never correctness.
-            after += state.vector_size;
-            out.push(state);
-            continue;
-        };
-        let refs: Vec<&Column> = columns.iter().collect();
-        // hash_rows folds scalar/uniform pieces into every row, so the row
-        // hash covers the full lane-varying AND lane-uniform value content;
-        // structure is covered by the shape hash keying the set.
-        // Two independently-seeded 64-bit hashes = a 128-bit row key. At
-        // ~10^8 rows the 64-bit birthday risk was ~10^-4 per run; 128 bits
-        // make it negligible.
-        let hashes = hash_rows(&refs, state.vector_size);
-        let hashes2 = hash_rows_seeded(
-            &refs,
-            state.vector_size,
-            crate::interpreter::row_table::ROW_HASH_SEED2,
-        );
-        let mask: Vec<bool> = hashes
-            .iter()
-            .zip(&hashes2)
-            .map(|(a, b)| {
-                visited
-                    .insert_new(RowTable::key(shape_hash, *a, *b))
-                    .is_some()
-            })
-            .collect();
-        let kept = mask.iter().filter(|b| **b).count();
-        after += kept;
-        if kept == state.vector_size {
-            out.push(state);
-        } else if kept > 0 {
-            out.push(state.filter_by_mask_clone(&mask, crate::interpreter::state::FILTER_VISITED));
-        }
+        let keys = visited_row_keys(&state, visited);
+        let (kept, b, a) = subtract_precomputed(state, keys, visited);
+        before += b;
+        after += a;
+        out.extend(kept);
     }
     (out, before, after)
+}
+
+/// A state's per-lane visited-set keys, plus a read-only verdict on which
+/// of them the table already holds.
+///
+/// `None` means the state could not be canonicalized into columns; the
+/// caller keeps it whole. Sound: skipping dedup only costs work, never
+/// correctness.
+pub struct VisitedKeys {
+    keys: Vec<(u64, u64)>,
+    /// Phase-1 result: the key was NOT in the table at the time this was
+    /// computed. Only these lanes need the (serial) insert.
+    absent: Vec<bool>,
+}
+
+/// PHASE 1 of the frontier subtract: canonicalize the state into columns,
+/// hash each lane into its 128-bit row key, and look each key up read-only.
+///
+/// This is the expensive half and it only needs `&RowTable`, so a worker
+/// thread can run it for its own chunk while the table sits still. At depth
+/// ~98% of offered lanes are already-visited rows (f60: 100.5M offered,
+/// 2.0M new), so almost all of the probe traffic - one cache miss per lane
+/// into a table of tens of millions of keys - parallelises, and the serial
+/// phase is left with only the misses.
+pub fn visited_row_keys(
+    state: &State,
+    visited: &crate::interpreter::row_table::RowTable,
+) -> Option<VisitedKeys> {
+    use crate::interpreter::row_table::RowTable;
+    use crate::interpreter::virtual_merge::{collect_columns_labeled, hash_rows_two_seeds, Column};
+    let _trace = TraceSpan::new("visited_row_keys", "vectorize");
+    let shape_hash = shape_of_state(state).cached_hash();
+    let (columns, _origins) = collect_columns_labeled(std::slice::from_ref(state))?;
+    let refs: Vec<&Column> = columns.iter().collect();
+    // The row hash folds scalar/uniform pieces into every row, so it covers
+    // the full lane-varying AND lane-uniform value content; structure is
+    // covered by the shape hash keying the set. Two independently-seeded
+    // 64-bit hashes = a 128-bit row key: at ~10^8 rows the 64-bit birthday
+    // risk was ~10^-4 per run, which 128 bits make negligible. Both seeds
+    // are folded in ONE pass over the columns.
+    let (hashes, hashes2) = hash_rows_two_seeds(
+        &refs,
+        state.vector_size,
+        crate::interpreter::row_table::ROW_HASH_SEED2,
+    );
+    let keys: Vec<(u64, u64)> = hashes
+        .iter()
+        .zip(&hashes2)
+        .map(|(a, b)| RowTable::key(shape_hash, *a, *b))
+        .collect();
+    let absent: Vec<bool> = keys.iter().map(|k| visited.id_of(*k).is_none()).collect();
+    Some(VisitedKeys { keys, absent })
+}
+
+/// PHASE 2: assign ids to the genuinely new rows and drop the rest.
+///
+/// Runs serially in input order - row ids are assigned in insertion order
+/// and everything downstream (checkpoints, bands, the backward sweep) is
+/// written in terms of them, so this ordering is load-bearing.
+///
+/// The `absent` verdict from phase 1 is only a filter, never a decision:
+/// every surviving lane still goes through `insert_new`, which is what
+/// resolves duplicates *within* this batch (two lanes with the same new
+/// row both read "absent" in phase 1; the second one's `insert_new`
+/// returns `None`). Passing `absent` all-true would give the same answer,
+/// just slower.
+pub fn subtract_precomputed(
+    state: State,
+    keys: Option<VisitedKeys>,
+    visited: &mut crate::interpreter::row_table::RowTable,
+) -> (Vec<State>, usize, usize) {
+    let _trace = TraceSpan::new("subtract_visited", "vectorize");
+    let before = state.vector_size;
+    let Some(VisitedKeys { keys, absent }) = keys else {
+        return (vec![state], before, before);
+    };
+    debug_assert_eq!(keys.len(), state.vector_size);
+    let mask: Vec<bool> = keys
+        .iter()
+        .zip(&absent)
+        .map(|(key, absent)| *absent && visited.insert_new(*key).is_some())
+        .collect();
+    let kept = mask.iter().filter(|b| **b).count();
+    if kept == state.vector_size {
+        (vec![state], before, kept)
+    } else if kept > 0 {
+        (
+            vec![state.filter_by_mask_clone(&mask, crate::interpreter::state::FILTER_VISITED)],
+            before,
+            kept,
+        )
+    } else {
+        (Vec::new(), before, 0)
+    }
 }
 
 pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
