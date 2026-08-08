@@ -180,29 +180,42 @@ impl State {
     /// Filters all vector values in the state by a mask in place.
     /// The resulting state's vector_size will be the number of true values in the mask.
     fn filter_by_mask_in_place(&mut self, mask: &[bool], reason: FilterReason) {
-        let _trace = TraceSpan::new(reason, "filter");
-        let t_census = crate::op_census::start();
-
         // The mask is scanned once here; every vector below gathers the
         // kept lanes directly, O(kept) per vector instead of O(mask), and
         // range-at-a-time (see `KeptLanes`).
         let kept = super::value::KeptLanes::from_mask(mask);
+        self.filter_by_kept_in_place(&kept, Some(mask.len()), reason);
+    }
+
+    /// The one filter body. `lanes_before` is only needed by the branch
+    /// census, which is charged per *input* lane; callers that came from a
+    /// run list (the frontier subtract, lane chunking) pass `None` because
+    /// they are never `FILTER_BRANCH`.
+    fn filter_by_kept_in_place(
+        &mut self,
+        kept: &super::value::KeptLanes,
+        lanes_before: Option<usize>,
+        reason: FilterReason,
+    ) {
+        let _trace = TraceSpan::new(reason, "filter");
+        let t_census = crate::op_census::start();
 
         // Filter values in heap - use optimized method that only clones vectors
-        self.heap.filter_vectors_in_place(&kept);
+        self.heap.filter_vectors_in_place(kept);
 
         // Filter values in local env - use optimized method
-        self.local_env.filter_vectors_in_place(&kept);
+        self.local_env.filter_vectors_in_place(kept);
 
         // Filter values in outer local envs
         for env in &mut self.outer_local_envs {
-            env.filter_vectors_in_place(&kept);
+            env.filter_vectors_in_place(kept);
         }
 
         self.vector_size = kept.len();
 
         if reason == FILTER_BRANCH {
-            crate::op_census::record_branch_filter(mask.len(), kept.len(), t_census);
+            let before = lanes_before.expect("a branch filter always comes from a mask");
+            crate::op_census::record_branch_filter(before, kept.len(), t_census);
         }
         if crate::op_census::enabled() {
             let count_env = |env: &LocalEnv| {
@@ -413,14 +426,8 @@ impl State {
         kept: &super::value::KeptLanes,
         reason: FilterReason,
     ) -> Self {
-        let _trace = TraceSpan::new(reason, "filter");
         let mut new_state = self.clone();
-        new_state.heap.filter_vectors_in_place(kept);
-        new_state.local_env.filter_vectors_in_place(kept);
-        for env in &mut new_state.outer_local_envs {
-            env.filter_vectors_in_place(kept);
-        }
-        new_state.vector_size = kept.len();
+        new_state.filter_by_kept_in_place(kept, None, reason);
         new_state
     }
 
