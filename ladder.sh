@@ -27,7 +27,14 @@ for H in $(seq "$FROM" "$TO"); do
   # The sweep's origin-tagged plain replays of fruit states blow up on
   # UnknownBool branch doubling; a much tighter per-state lane cap than the
   # forward pass needs (see the h88 OOM postmortem in room00-plan.md).
-  CELESTE_MAX_STATE_LANES=100000 CELESTE_FRUIT_CHUNK_DIVISOR=100 ./safe-run.sh -- ./target/release/rewrite --recipe "$RECIPE" sweep \
+  #
+  # The base cap came down 100000 -> 8000 when the replay went parallel:
+  # the thing the old figure bounded was the transient of ONE chunk in
+  # flight, and there are now 16. 16 x 8000 is below the old 1 x 100000,
+  # and small chunks are what give the threads work at all (a 250k-lane
+  # sweep batch was only 3 chunks at the old cap). The fruit divisor comes
+  # down with it so the fruit chunk stays ~1000 lanes rather than 80.
+  CELESTE_MAX_STATE_LANES=8000 CELESTE_FRUIT_CHUNK_DIVISOR=8 ./safe-run.sh -- ./target/release/rewrite --recipe "$RECIPE" sweep \
       --checkpoint-dir "$L0" --frames "$H" --horizon "$H" > /tmp/l0sweep-h$H.log 2>&1
   grep -E "abstract optimal|win seeds" /tmp/l0sweep-h$H.log
   refuted=0
@@ -48,7 +55,7 @@ for H in $(seq "$FROM" "$TO"); do
       break
     fi
     echo "=== horizon $H: k=$K wins; sweeping level $K ==="
-    CELESTE_REM_BITS=$K CELESTE_MAX_STATE_LANES=100000 CELESTE_FRUIT_CHUNK_DIVISOR=100 ./safe-run.sh -- ./target/release/rewrite --recipe "$RECIPE" sweep --banded \
+    CELESTE_REM_BITS=$K CELESTE_MAX_STATE_LANES=8000 CELESTE_FRUIT_CHUNK_DIVISOR=8 ./safe-run.sh -- ./target/release/rewrite --recipe "$RECIPE" sweep --banded \
         --checkpoint-dir "$KDIR" --frames "$H" --horizon "$H" \
         > "/tmp/k${K}sweep-h$H.log" 2>&1
     grep -E "abstract optimal|win seeds" "/tmp/k${K}sweep-h$H.log"

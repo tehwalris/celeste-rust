@@ -971,8 +971,12 @@ impl AbstractRun {
         // when no shape variants are registered (variant dispatch owns
         // `&mut self`). Everything else keeps the serial loop below - one
         // code path per arrangement, and the parallel one is opt-in.
-        if stream && frame_threads() > 1 && self.variants.is_none() {
-            return self.step_parallel(input_states, frame_no);
+        if frame_threads() > 1 && self.variants.is_none() {
+            return if stream {
+                self.step_parallel(input_states, frame_no)
+            } else {
+                self.step_parallel_phased(input_states, frame_no)
+            };
         }
         let mut counters = FrameEventCounters::default();
         let mut stream_counters = StreamCounters::default();
@@ -1151,6 +1155,82 @@ impl AbstractRun {
         self.report_frame_events(&counters);
         self.finish_streaming_boundary(stream_survivors, &stream_counters);
         Ok(())
+    }
+
+    /// `step_parallel` for the PHASED arrangement - the backward sweep's
+    /// replay, and any run without a visited table.
+    ///
+    /// Much simpler than the streaming one, because there is nothing
+    /// shared: the phase accumulates raw outputs and merges them at the
+    /// end, so a worker's only job is `interpret_state_base` and the
+    /// results just have to be concatenated in input order. That ordering
+    /// is what makes it identical to the serial path, since the merge that
+    /// follows is order-sensitive in its lane layout.
+    ///
+    /// This is the sweep's whole cost. The replay was already ~4x the
+    /// forward pass on the same frame (f90: 2747 s vs 740 s) because the
+    /// origin column forbids boundary dedup, and it had been left entirely
+    /// serial while the forward pass got 5x faster.
+    ///
+    /// Batched by thread count for the same reason as the streaming path:
+    /// the sweep's transient per chunk is what OOMed room (0,0) at h88, so
+    /// the chunk cap has to come down as the thread count goes up
+    /// (CELESTE_MAX_STATE_LANES, which the sweep sets explicitly).
+    fn step_parallel_phased(&mut self, input_states: Vec<State>, frame_no: u32) -> Result<()> {
+        let threads = frame_threads();
+        let mut counters = FrameEventCounters::default();
+        let mut new_states: Vec<State> = Vec::new();
+        let deopt = self.deopt.as_ref();
+        let frame_cfg = &self.frame_cfg;
+        let fixed_env = &self.fixed_env;
+
+        let mut batch: Vec<State> = Vec::with_capacity(threads);
+        let mut queue = input_states.into_iter();
+        loop {
+            batch.clear();
+            for state in queue.by_ref().take(threads) {
+                batch.push(state);
+            }
+            if batch.is_empty() {
+                break;
+            }
+            type Ran = Result<(Vec<State>, FrameEventCounters)>;
+            let results: Vec<Ran> = {
+                let _t = ScopedPhase::new("fwd.interpret");
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = batch
+                        .drain(..)
+                        .map(|state| {
+                            scope.spawn(move || -> Ran {
+                                crate::interpreter::virtual_merge::set_nested_parallel(true);
+                                let mut ev = FrameEventCounters::default();
+                                let outputs = interpret_state_base(
+                                    deopt, frame_cfg, fixed_env, state, &mut ev,
+                                )?;
+                                Ok((outputs, ev))
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| match h.join() {
+                            Ok(r) => r,
+                            Err(panic) => Err(anyhow::anyhow!(
+                                "chunk-parallel frame worker: {}",
+                                panic_text(&panic)
+                            )),
+                        })
+                        .collect()
+                })
+            };
+            for result in results {
+                let (outputs, ev) = result?;
+                counters.absorb(&ev);
+                new_states.extend(outputs);
+            }
+        }
+        self.report_frame_events(&counters);
+        self.finish_phased_boundary(new_states, frame_no)
     }
 
     /// Run one input state through the frame program: shape dispatch first
