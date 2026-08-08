@@ -552,6 +552,71 @@ fn run_variant_frame(
     Ok(out)
 }
 
+/// Per-frame deopt and variant event tallies, reported by
+/// `report_frame_events`.
+#[derive(Default)]
+struct FrameEventCounters {
+    /// (states, lanes) that re-ran under the plain program.
+    deopt: (usize, usize),
+    /// (states, lanes) that ran under shape variants.
+    variant: (usize, usize),
+}
+
+/// Lane-chunking (env-gated: CELESTE_MAX_STATE_LANES=N): split states
+/// above N lanes into <=N-lane chunks before the frame. Lanes are
+/// independent, so running chunks separately and re-merging at the
+/// boundary is semantics-preserving; what it changes is the PEAK -
+/// the mid-frame transient (fragments plus the heap's append-only
+/// storage) is proportional to the widest state in flight, and at
+/// room-(0,0) scale a single 12.5M-lane frame peaked at 98 GB. The
+/// cost is re-running per-chunk the work that is uniform across lanes.
+fn chunk_states(states: Vec<State>) -> Vec<State> {
+    let Some(cap) = std::env::var("CELESTE_MAX_STATE_LANES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    else {
+        return states;
+    };
+    assert!(cap > 0, "CELESTE_MAX_STATE_LANES must be positive");
+    let mut out = Vec::with_capacity(states.len());
+    for state in states {
+        // Fruit-bearing states get a 10x tighter cap: their frames run
+        // under the plain program (the recipe path hits
+        // select-on-UnknownBool) where the widened fruit's UnknownBool
+        // collide branches copy ALL lanes down both arms repeatedly - the
+        // transient per input lane is an order of magnitude above a normal
+        // state's (h89 OOMed on exactly this with the uniform cap).
+        let cap = match crate::interpreter::abstraction::object_shape(&state) {
+            Ok(shape) if shape.iter().any(|t| t == "fruit") => {
+                // Divisor tunable per context: the sweep's origin-tagged
+                // replays block all dedup, so the fruit UnknownBool
+                // doubling multiplies on the full 64-input fan-out and
+                // needs far smaller chunks than the forward pass.
+                let div: usize = std::env::var("CELESTE_FRUIT_CHUNK_DIVISOR")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(10);
+                (cap / div.max(1)).max(1)
+            }
+            _ => cap,
+        };
+        if state.vector_size <= cap {
+            out.push(state);
+            continue;
+        }
+        let n = state.vector_size;
+        for start in (0..n).step_by(cap) {
+            let end = (start + cap).min(n);
+            let mask: Vec<bool> = (0..n).map(|i| i >= start && i < end).collect();
+            out.push(state.filter_by_mask_clone(
+                &mask,
+                crate::interpreter::state::FILTER_CHUNK,
+            ));
+        }
+    }
+    out
+}
+
 impl AbstractRun {
     pub fn start(program: &Program) -> Result<Self> {
         crate::interpreter::vectorize::set_merge_partition_patterns(
@@ -723,187 +788,54 @@ impl AbstractRun {
         Ok(())
     }
 
+    /// One abstract frame: run every state through the frame program
+    /// (shape-variant dispatch, then the configured deopt mode), then push
+    /// the outputs through the boundary pipeline - abstract, band filter,
+    /// frontier subtract, merge.
+    ///
+    /// Two boundary arrangements exist:
+    ///
+    /// * STREAMING (frontier runs): each input state's raw outputs go
+    ///   through the whole pipeline immediately (`stream_boundary_one`) and
+    ///   only band-surviving, never-visited lanes are held - raw outputs
+    ///   never accumulate across the frame. This is what broke the
+    ///   room-(0,0) memory wall: unmerged raw outputs accumulating until
+    ///   frame end were the real 100 GB peak.
+    /// * PHASED (everything else): outputs accumulate, then each stage runs
+    ///   over the whole frame's outputs at once.
+    ///
+    /// Both produce the same lane sets (equivalence-gated on room (1,0):
+    /// identical per-frame new-lane and visited counts, 174,938 lanes /
+    /// 673,503 visited at f40); they differ in peak memory and in the
+    /// on-disk order of visited rows.
     pub fn step(&mut self) -> Result<()> {
-        let mut new_states = Vec::new();
-        let mut frame_events = (0usize, 0usize);
-        let mut variant_frame_events = (0usize, 0usize);
-        // Streaming boundary mode: see `stream_boundary_one`. Only
-        // meaningful with the frontier subtract on, and mutually exclusive
-        // with the widencheck's rem-only abstraction.
+        // Streaming needs the frontier subtract and is meaningless under
+        // the widencheck's rem-only abstraction.
         let stream = std::env::var_os("CELESTE_STREAM_BOUNDARY").is_some()
             && self.visited_rows.is_some()
             && !self.rem_only_abstraction;
         let frame_no = self.states_before_merge.len() as u32 + 1;
+        let input_states = chunk_states(std::mem::take(&mut self.states));
+        let mut counters = FrameEventCounters::default();
         let mut stream_counters = StreamCounters::default();
         let mut stream_survivors: Vec<State> = Vec::new();
-        // Lane-chunking (env-gated: CELESTE_MAX_STATE_LANES=N): split states
-        // above N lanes into <=N-lane chunks before the frame. Lanes are
-        // independent, so running chunks separately and re-merging at the
-        // boundary is semantics-preserving; what it changes is the PEAK -
-        // the mid-frame transient (fragments plus the heap's append-only
-        // storage) is proportional to the widest state in flight, and at
-        // room-(0,0) scale a single 12.5M-lane frame peaked at 98 GB. The
-        // cost is re-running per-chunk the work that is uniform across
-        // lanes.
-        let input_states: Vec<State> = {
-            let taken = std::mem::take(&mut self.states);
-            match std::env::var("CELESTE_MAX_STATE_LANES")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-            {
-                None => taken,
-                Some(cap) => {
-                    assert!(cap > 0, "CELESTE_MAX_STATE_LANES must be positive");
-                    let mut out = Vec::with_capacity(taken.len());
-                    for state in taken {
-                        // Fruit-bearing states get a 10x tighter cap: their
-                        // frames run under the plain program (the recipe path
-                        // hits select-on-UnknownBool) where the widened
-                        // fruit's UnknownBool collide branches copy ALL lanes
-                        // down both arms repeatedly - the transient per input
-                        // lane is an order of magnitude above a normal
-                        // state's (h89 OOMed on exactly this with the
-                        // uniform cap).
-                        let cap = match crate::interpreter::abstraction::object_shape(&state) {
-                            Ok(shape) if shape.iter().any(|t| t == "fruit") => {
-                                // Divisor tunable per context: the sweep's
-                                // origin-tagged replays block all dedup, so
-                                // the fruit UnknownBool doubling multiplies
-                                // on the full 64-input fan-out and needs far
-                                // smaller chunks than the forward pass.
-                                let div: usize =
-                                    std::env::var("CELESTE_FRUIT_CHUNK_DIVISOR")
-                                        .ok()
-                                        .and_then(|v| v.parse().ok())
-                                        .unwrap_or(10);
-                                (cap / div.max(1)).max(1)
-                            }
-                            _ => cap,
-                        };
-                        if state.vector_size <= cap {
-                            out.push(state);
-                            continue;
-                        }
-                        let n = state.vector_size;
-                        for start in (0..n).step_by(cap) {
-                            let end = (start + cap).min(n);
-                            let mask: Vec<bool> =
-                                (0..n).map(|i| i >= start && i < end).collect();
-                            out.push(state.filter_by_mask_clone(
-                                &mask,
-                                crate::interpreter::state::FILTER_CHUNK,
-                            ));
-                        }
-                    }
-                    out
-                }
-            }
-        };
+        let mut new_states: Vec<State> = Vec::new();
         for state in input_states {
-            // Shape dispatch first: a state whose object-array shape has a
-            // registered variant runs under it (through canonical, both
-            // ways) and skips the base path entirely. States the registry
-            // does not cover - and the loud fallback of a failing variant
-            // frame - continue into the base path below.
-            let t_interpret = std::time::Instant::now();
-            let state = if let Some(vd) = self.variants.as_mut() {
-                let before = vd.total_events;
-                match dispatch_variant_frame(vd, state) {
-                    VariantOutcome::Ran(outputs) => {
-                        variant_frame_events.0 += vd.total_events.0 - before.0;
-                        variant_frame_events.1 += vd.total_events.1 - before.1;
-                        new_states.extend(outputs);
-                        crate::metrics::record("fwd.interpret", t_interpret.elapsed());
-                        continue;
-                    }
-                    VariantOutcome::Base(state) => state,
-                }
-            } else {
-                state
+            let outputs = {
+                let _t = ScopedPhase::new("fwd.interpret");
+                self.interpret_state(state, &mut counters)?
             };
-            match &mut self.deopt {
-                None => {
-                    let result =
-                        interpret_prepared_cfg(&self.frame_cfg, state, &self.fixed_env)
-                            .context("frame failed")?;
-                    new_states.extend(result.into_iter().map(|(s, _)| s));
-                }
-                Some(deopt) if deopt.force => {
-                    frame_events.0 += 1;
-                    frame_events.1 += state.vector_size;
-                    new_states.extend(run_deopt_frame(deopt, state)?);
-                }
-                Some(deopt) if deopt.collect_first => {
-                    // Collect-first: every frame runs in collect mode with the
-                    // origin column, so a failing state pays one specialized
-                    // run instead of two (attempt + retry). The cost is the
-                    // origin column's overhead on clean frames - measured
-                    // before this became reachable (CELESTE_DEOPT_COLLECT_FIRST).
-                    let (states, plain_lanes) = run_deopt_frame_granular(
-                        deopt,
-                        &self.frame_cfg,
-                        &self.fixed_env,
-                        state,
-                        false,
-                    )?;
-                    if plain_lanes > 0 {
-                        frame_events.0 += 1;
-                        frame_events.1 += plain_lanes;
-                    }
-                    new_states.extend(states);
-                }
-                Some(deopt) => {
-                    // Optimistic: run the specialized frame; deopt on failure.
-                    // Panics are caught too - a speculated instruction may
-                    // assert on values the verify horizon never showed it
-                    // (same failure class `screen_trial` unwinds across).
-                    let snapshot = state.clone();
-                    let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                        || interpret_prepared_cfg(&self.frame_cfg, state, &self.fixed_env),
-                    ));
-                    match attempt {
-                        Ok(Ok(result)) => {
-                            new_states.extend(result.into_iter().map(|(s, _)| s))
-                        }
-                        Ok(Err(err)) => {
-                            log_deopt(&mut frame_events, &snapshot, &format!("{:#}", err));
-                            let (states, plain_lanes) = run_deopt_frame_granular(
-                                deopt,
-                                &self.frame_cfg,
-                                &self.fixed_env,
-                                snapshot,
-                                true,
-                            )?;
-                            frame_events.1 += plain_lanes;
-                            new_states.extend(states);
-                        }
-                        Err(panic) => {
-                            log_deopt(&mut frame_events, &snapshot, &panic_text(&panic));
-                            let (states, plain_lanes) = run_deopt_frame_granular(
-                                deopt,
-                                &self.frame_cfg,
-                                &self.fixed_env,
-                                snapshot,
-                                true,
-                            )?;
-                            frame_events.1 += plain_lanes;
-                            new_states.extend(states);
-                        }
-                    }
-                }
-            }
-            crate::metrics::record("fwd.interpret", t_interpret.elapsed());
-            // Streaming mode: drain this input state's outputs through the
-            // boundary pipeline immediately, so raw outputs never
-            // accumulate across chunks.
             if stream {
+                // Drain this input state's outputs through the boundary
+                // pipeline immediately, so raw outputs never accumulate
+                // across chunks.
                 let _t = ScopedPhase::new("fwd.boundary_stream");
                 let band = self.band.as_ref();
                 let visited = self
                     .visited_rows
                     .as_mut()
                     .expect("stream implies a visited table");
-                for out in new_states.drain(..) {
+                for out in outputs {
                     stream_survivors.extend(stream_boundary_one(
                         out,
                         band,
@@ -912,69 +844,183 @@ impl AbstractRun {
                         &mut stream_counters,
                     )?);
                 }
+            } else {
+                new_states.extend(outputs);
             }
         }
-        if let Some(deopt) = self.deopt.as_mut() {
-            deopt.total_events.0 += frame_events.0;
-            deopt.total_events.1 += frame_events.1;
-            if frame_events.0 > 0 && !deopt.force {
-                println!(
-                    "  deopt: {} state(s) / {} lanes re-ran under the plain program",
-                    frame_events.0, frame_events.1
-                );
-            }
-        }
-        if variant_frame_events.0 > 0 {
-            println!(
-                "  variant: {} state(s) / {} lanes ran under shape variants",
-                variant_frame_events.0, variant_frame_events.1
-            );
-        }
+        self.report_frame_events(&counters);
         if stream {
-            // Everything already went through abstraction, band and
-            // subtract per state; merge the survivors and report the
-            // aggregate counters in the usual formats.
-            self.states_before_merge.push(stream_survivors.len());
-            self.states = {
-                let _t = ScopedPhase::new("fwd.merge");
-                let _trace = crate::interpreter::tracing::TraceSpan::new(
-                    "merge_frame_boundary",
-                    "merge_site",
-                );
-                vectorize_states(stream_survivors)
-            };
-            if self.band.is_some() {
-                println!(
-                    "  band: {} -> {} lanes in band{}",
-                    stream_counters.band_before,
-                    stream_counters.band_after,
-                    if stream_counters.band_missing > 0 {
-                        format!(
-                            " ({} lanes with unknown coarse rows dropped)",
-                            stream_counters.band_missing
-                        )
-                    } else {
-                        String::new()
-                    }
-                );
+            self.finish_streaming_boundary(stream_survivors, &stream_counters);
+            Ok(())
+        } else {
+            self.finish_phased_boundary(new_states, frame_no)
+        }
+    }
+
+    /// Run one input state through the frame program: shape dispatch first
+    /// (a state whose object-array shape has a registered variant runs
+    /// under it, through canonical both ways, and skips the base path
+    /// entirely; the loud fallback of a failing variant frame continues
+    /// into the base path), then the configured deopt mode.
+    fn interpret_state(
+        &mut self,
+        state: State,
+        counters: &mut FrameEventCounters,
+    ) -> Result<Vec<State>> {
+        let state = if let Some(vd) = self.variants.as_mut() {
+            let before = vd.total_events;
+            match dispatch_variant_frame(vd, state) {
+                VariantOutcome::Ran(outputs) => {
+                    counters.variant.0 += vd.total_events.0 - before.0;
+                    counters.variant.1 += vd.total_events.1 - before.1;
+                    return Ok(outputs);
+                }
+                VariantOutcome::Base(state) => state,
             }
-            let visited = self.visited_rows.as_mut().expect("stream implies visited");
-            visited.end_frame();
-            println!(
-                "  frontier-only: {} -> {} new lanes, visited total {}",
-                stream_counters.sub_before,
-                stream_counters.sub_after,
-                visited.len()
-            );
-            if std::env::var_os("CELESTE_BOUNDARY_GC").is_some() {
-                let _trace =
-                    crate::interpreter::tracing::TraceSpan::new("boundary_gc", "gc");
-                for state in &mut self.states {
-                    state.gc();
+        } else {
+            state
+        };
+        let mut new_states = Vec::new();
+        match &mut self.deopt {
+            None => {
+                let result = interpret_prepared_cfg(&self.frame_cfg, state, &self.fixed_env)
+                    .context("frame failed")?;
+                new_states.extend(result.into_iter().map(|(s, _)| s));
+            }
+            Some(deopt) if deopt.force => {
+                counters.deopt.0 += 1;
+                counters.deopt.1 += state.vector_size;
+                new_states.extend(run_deopt_frame(deopt, state)?);
+            }
+            Some(deopt) if deopt.collect_first => {
+                // Collect-first: every frame runs in collect mode with the
+                // origin column, so a failing state pays one specialized
+                // run instead of two (attempt + retry). The cost is the
+                // origin column's overhead on clean frames - measured
+                // before this became reachable (CELESTE_DEOPT_COLLECT_FIRST).
+                let (states, plain_lanes) = run_deopt_frame_granular(
+                    deopt,
+                    &self.frame_cfg,
+                    &self.fixed_env,
+                    state,
+                    false,
+                )?;
+                if plain_lanes > 0 {
+                    counters.deopt.0 += 1;
+                    counters.deopt.1 += plain_lanes;
+                }
+                new_states.extend(states);
+            }
+            Some(deopt) => {
+                // Optimistic: run the specialized frame; deopt on failure.
+                // Panics are caught too - a speculated instruction may
+                // assert on values the verify horizon never showed it
+                // (same failure class `screen_trial` unwinds across).
+                let snapshot = state.clone();
+                let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || interpret_prepared_cfg(&self.frame_cfg, state, &self.fixed_env),
+                ));
+                match attempt {
+                    Ok(Ok(result)) => {
+                        new_states.extend(result.into_iter().map(|(s, _)| s))
+                    }
+                    Ok(Err(err)) => {
+                        log_deopt(&mut counters.deopt, &snapshot, &format!("{:#}", err));
+                        let (states, plain_lanes) = run_deopt_frame_granular(
+                            deopt,
+                            &self.frame_cfg,
+                            &self.fixed_env,
+                            snapshot,
+                            true,
+                        )?;
+                        counters.deopt.1 += plain_lanes;
+                        new_states.extend(states);
+                    }
+                    Err(panic) => {
+                        log_deopt(&mut counters.deopt, &snapshot, &panic_text(&panic));
+                        let (states, plain_lanes) = run_deopt_frame_granular(
+                            deopt,
+                            &self.frame_cfg,
+                            &self.fixed_env,
+                            snapshot,
+                            true,
+                        )?;
+                        counters.deopt.1 += plain_lanes;
+                        new_states.extend(states);
+                    }
                 }
             }
-            return Ok(());
         }
+        Ok(new_states)
+    }
+
+    /// Aggregate the frame's deopt/variant events and print the per-frame
+    /// lines the campaign logs grep for.
+    fn report_frame_events(&mut self, counters: &FrameEventCounters) {
+        if let Some(deopt) = self.deopt.as_mut() {
+            deopt.total_events.0 += counters.deopt.0;
+            deopt.total_events.1 += counters.deopt.1;
+            if counters.deopt.0 > 0 && !deopt.force {
+                println!(
+                    "  deopt: {} state(s) / {} lanes re-ran under the plain program",
+                    counters.deopt.0, counters.deopt.1
+                );
+            }
+        }
+        if counters.variant.0 > 0 {
+            println!(
+                "  variant: {} state(s) / {} lanes ran under shape variants",
+                counters.variant.0, counters.variant.1
+            );
+        }
+    }
+
+    /// Streaming epilogue: everything already went through abstraction,
+    /// band and subtract per state; merge the survivors and report the
+    /// aggregate counters in the usual formats.
+    fn finish_streaming_boundary(
+        &mut self,
+        stream_survivors: Vec<State>,
+        stream_counters: &StreamCounters,
+    ) {
+        self.states_before_merge.push(stream_survivors.len());
+        self.states = {
+            let _t = ScopedPhase::new("fwd.merge");
+            let _trace = crate::interpreter::tracing::TraceSpan::new(
+                "merge_frame_boundary",
+                "merge_site",
+            );
+            vectorize_states(stream_survivors)
+        };
+        if self.band.is_some() {
+            println!(
+                "  band: {} -> {} lanes in band{}",
+                stream_counters.band_before,
+                stream_counters.band_after,
+                if stream_counters.band_missing > 0 {
+                    format!(
+                        " ({} lanes with unknown coarse rows dropped)",
+                        stream_counters.band_missing
+                    )
+                } else {
+                    String::new()
+                }
+            );
+        }
+        let visited = self.visited_rows.as_mut().expect("stream implies visited");
+        visited.end_frame();
+        println!(
+            "  frontier-only: {} -> {} new lanes, visited total {}",
+            stream_counters.sub_before,
+            stream_counters.sub_after,
+            visited.len()
+        );
+        self.boundary_gc_if_enabled();
+    }
+
+    /// Phased epilogue: abstract the whole frame's outputs, merge, then
+    /// band-filter and frontier-subtract the merged states.
+    fn finish_phased_boundary(&mut self, new_states: Vec<State>, frame_no: u32) -> Result<()> {
         let new_states: Vec<State> = {
             let _t = ScopedPhase::new("fwd.abstract");
             if self.rem_only_abstraction {
@@ -999,88 +1045,104 @@ impl AbstractRun {
             );
             vectorize_states(new_states)
         };
-        if let Some(band) = &self.band {
-            let frame = self.states_before_merge.len() as u32;
-            let budget = band.horizon.saturating_sub(frame);
-            let mut kept_states = Vec::new();
-            let (mut before, mut after, mut missing) = (0usize, 0usize, 0usize);
-            for state in std::mem::take(&mut self.states) {
-                before += state.vector_size;
-                let mut coarse = crate::interpreter::abstraction::make_state_abstract_rem(
-                    state.clone(),
-                    band.prev_precision,
-                );
-                coarse.gc();
-                let keys = super::sweep::row_keys(&coarse)?;
-                let mask: Vec<bool> = keys
-                    .iter()
-                    .map(|k| match band.prev_table.id_of(*k) {
-                        Some(id) => {
-                            let e = band
-                                .prev_table
-                                .earliest_frame(id)
-                                .unwrap_or(u32::MAX);
-                            let g = band.g_prev[id as usize];
-                            e <= frame
-                                && g != super::sweep::G_UNREACHABLE
-                                && (g as u32) <= budget
-                        }
-                        None => {
-                            // Sound to drop: the coarse row was never even
-                            // reachable at the previous level, so nothing
-                            // that maps to it can be on a winning path. A
-                            // nonzero count at the FIRST refinement level is
-                            // a canonicalization bug though - watch it.
-                            missing += 1;
-                            false
-                        }
-                    })
-                    .collect();
-                let kept = mask.iter().filter(|b| **b).count();
-                after += kept;
-                if kept == state.vector_size {
-                    kept_states.push(state);
-                } else if kept > 0 {
-                    kept_states.push(state.filter_by_mask_clone(
-                        &mask,
-                        crate::interpreter::state::FILTER_BAND,
-                    ));
-                }
+        self.apply_band_filter(frame_no)?;
+        self.subtract_frontier();
+        self.boundary_gc_if_enabled();
+        Ok(())
+    }
+
+    /// Drop lanes whose coarsened row is outside the previous precision
+    /// level's band (phased path; the streaming path does this per state in
+    /// `stream_boundary_one`).
+    fn apply_band_filter(&mut self, frame: u32) -> Result<()> {
+        let Some(band) = &self.band else { return Ok(()) };
+        let budget = band.horizon.saturating_sub(frame);
+        let mut kept_states = Vec::new();
+        let (mut before, mut after, mut missing) = (0usize, 0usize, 0usize);
+        for state in std::mem::take(&mut self.states) {
+            before += state.vector_size;
+            let mut coarse = crate::interpreter::abstraction::make_state_abstract_rem(
+                state.clone(),
+                band.prev_precision,
+            );
+            coarse.gc();
+            let keys = super::sweep::row_keys(&coarse)?;
+            let mask: Vec<bool> = keys
+                .iter()
+                .map(|k| match band.prev_table.id_of(*k) {
+                    Some(id) => {
+                        let e = band
+                            .prev_table
+                            .earliest_frame(id)
+                            .unwrap_or(u32::MAX);
+                        let g = band.g_prev[id as usize];
+                        e <= frame
+                            && g != super::sweep::G_UNREACHABLE
+                            && (g as u32) <= budget
+                    }
+                    None => {
+                        // Sound to drop: the coarse row was never even
+                        // reachable at the previous level, so nothing
+                        // that maps to it can be on a winning path. A
+                        // nonzero count at the FIRST refinement level is
+                        // a canonicalization bug though - watch it.
+                        missing += 1;
+                        false
+                    }
+                })
+                .collect();
+            let kept = mask.iter().filter(|b| **b).count();
+            after += kept;
+            if kept == state.vector_size {
+                kept_states.push(state);
+            } else if kept > 0 {
+                kept_states.push(state.filter_by_mask_clone(
+                    &mask,
+                    crate::interpreter::state::FILTER_BAND,
+                ));
             }
-            self.states = kept_states;
-            println!(
-                "  band: {} -> {} lanes in band{}",
-                before,
-                after,
-                if missing > 0 {
-                    format!(" ({} lanes with unknown coarse rows dropped)", missing)
-                } else {
-                    String::new()
-                }
-            );
         }
-        if let Some(visited) = self.visited_rows.as_mut() {
-            let (kept, before, after) = crate::interpreter::vectorize::subtract_visited(
-                std::mem::take(&mut self.states),
-                visited,
-            );
-            visited.end_frame();
-            println!(
-                "  frontier-only: {} -> {} new lanes, visited total {}",
-                before, after, visited.len()
-            );
-            self.states = kept;
-        }
-        // Boundary compaction (env-gated: CELESTE_BOUNDARY_GC). The heap's
-        // storage is append-only and shared by Arc: without a gc, boundary
-        // states pin the whole mid-frame append log - every superseded
-        // HeapValue of every store - and the search's residency runs ~100x
-        // the frontier's materialized size (room (0,0) f79: ~70 GB resident
-        // vs 549 MB for the same states freshly loaded from disk). gc
-        // rebuilds each state's heap from its reachable cells, dropping the
-        // log. Row hashing is layout-independent (the probe paths gc before
-        // row_keys and match the search's tables), so hashes and standing
-        // checkpoints are unaffected.
+        self.states = kept_states;
+        println!(
+            "  band: {} -> {} lanes in band{}",
+            before,
+            after,
+            if missing > 0 {
+                format!(" ({} lanes with unknown coarse rows dropped)", missing)
+            } else {
+                String::new()
+            }
+        );
+        Ok(())
+    }
+
+    /// Frontier-only subtract (phased path): drop lanes whose row was seen
+    /// in any earlier frame, and record this frame's rows.
+    fn subtract_frontier(&mut self) {
+        let Some(visited) = self.visited_rows.as_mut() else { return };
+        let (kept, before, after) = crate::interpreter::vectorize::subtract_visited(
+            std::mem::take(&mut self.states),
+            visited,
+        );
+        visited.end_frame();
+        println!(
+            "  frontier-only: {} -> {} new lanes, visited total {}",
+            before, after, visited.len()
+        );
+        self.states = kept;
+    }
+
+    /// Boundary compaction (env-gated: CELESTE_BOUNDARY_GC). The heap's
+    /// storage is append-only and shared by Arc: without a gc, boundary
+    /// states pin the whole mid-frame append log - every superseded
+    /// HeapValue of every store - and the search's residency runs ~100x
+    /// the frontier's materialized size (room (0,0) f79: ~70 GB resident
+    /// vs 549 MB for the same states freshly loaded from disk). gc
+    /// rebuilds each state's heap from its reachable cells, dropping the
+    /// log. Row hashing is layout-independent (the probe paths gc before
+    /// row_keys and match the search's tables), so hashes and standing
+    /// checkpoints are unaffected.
+    fn boundary_gc_if_enabled(&mut self) {
         if std::env::var_os("CELESTE_BOUNDARY_GC").is_some() {
             let _trace = crate::interpreter::tracing::TraceSpan::new(
                 "boundary_gc",
@@ -1090,7 +1152,6 @@ impl AbstractRun {
                 state.gc();
             }
         }
-        Ok(())
     }
 
     pub fn states(&self) -> &[State] {
