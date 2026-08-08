@@ -162,9 +162,10 @@ The current abstract interpreter can execute concrete programs. Key insight: sha
 ## Near-Term Plan
 
 Partly done since this was written: state serialization to JSONL, checkpointing,
-`view_frames` / `compare_frames`, the profiler (`--profile`) and the lightweight
-Chrome tracer (`--trace`) all exist, and `concrete_run` is a working
-single-lane concrete execution path sharing the abstract interpreter's code.
+the profiler (`--profile`) and the lightweight Chrome tracer (`--trace`) all
+exist, and `concrete_run` is a working single-lane concrete execution path
+sharing the abstract interpreter's code. (The one-off dump viewers and capture
+benchmarks from that era were deleted in the 2026-08 cleanup.)
 
 ### Phase 1: Program rewriting (current)
 

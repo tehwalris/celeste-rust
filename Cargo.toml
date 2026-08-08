@@ -28,14 +28,6 @@ memmap2 = "0.9"
 elsa = "1.10"
 
 [[bin]]
-name = "view_frames"
-path = "src/bin/view_frames.rs"
-
-[[bin]]
-name = "compare_frames"
-path = "src/bin/compare_frames.rs"
-
-[[bin]]
 name = "concrete_run"
 path = "src/bin/concrete_run.rs"
 

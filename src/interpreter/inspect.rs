@@ -1171,22 +1171,6 @@ pub fn states_to_jsonl(states: &[State], writer: &mut impl std::io::Write) -> st
     Ok(())
 }
 
-/// Load multiple states from JSONL
-pub fn states_from_jsonl(reader: impl std::io::BufRead) -> std::io::Result<Vec<State>> {
-    let mut states = Vec::new();
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let state: State = serde_json::from_str(&line).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-        })?;
-        states.push(state);
-    }
-    Ok(states)
-}
-
 /// Dump states to a JSONL file
 pub fn dump_states_to_file(states: &[State], path: &str) -> std::io::Result<()> {
     use std::fs::File;
@@ -1196,15 +1180,6 @@ pub fn dump_states_to_file(states: &[State], path: &str) -> std::io::Result<()> 
     states_to_jsonl(states, &mut writer)?;
     writer.flush()?;
     Ok(())
-}
-
-/// Load states from a JSONL file
-pub fn load_states_from_file(path: &str) -> std::io::Result<Vec<State>> {
-    use std::fs::File;
-    use std::io::BufReader;
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    states_from_jsonl(reader)
 }
 
 // ============================================================================

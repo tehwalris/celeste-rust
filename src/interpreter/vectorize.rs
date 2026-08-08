@@ -1478,63 +1478,6 @@ pub fn union_diff_states(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interpreter::inspect::load_states_from_file;
-
-    #[test]
-    fn test_vectorize_real_states() {
-        // Load states that Python analysis says should merge
-        let states = match load_states_from_file("/tmp/test_merge_states.jsonl") {
-            Ok(s) => s,
-            Err(_) => {
-                println!("Skipping test - no test file");
-                return;
-            }
-        };
-
-        println!("Loaded {} states", states.len());
-        for (i, s) in states.iter().enumerate() {
-            println!("  State {}: vector_size={}, heap_len={}", i, s.vector_size, s.heap.len());
-        }
-
-        // Get shapes
-        let shape1 = shape_of_state(&states[0]);
-        let shape2 = shape_of_state(&states[1]);
-
-        println!("\nShapes equal: {}", shape1 == shape2);
-
-        if shape1 != shape2 {
-            // Find where they differ
-            println!("Heap structure lengths: {} vs {}",
-                shape1.heap_structure.len(), shape2.heap_structure.len());
-
-            for (i, (a, b)) in shape1.heap_structure.iter()
-                .zip(shape2.heap_structure.iter()).enumerate() {
-                if a != b {
-                    println!("  Differ at heap[{}]:", i);
-                    println!("    s1: {:?}", a);
-                    println!("    s2: {:?}", b);
-                    if i > 3 { break; }  // Just show first few
-                }
-            }
-
-            println!("\nLocal env: {:?} vs {:?}",
-                shape1.local_env_structure.len(), shape2.local_env_structure.len());
-            println!("Outer envs: {:?} vs {:?}",
-                shape1.outer_local_envs_structure.len(), shape2.outer_local_envs_structure.len());
-            println!("Global env: {} vs {}",
-                shape1.global_env.len(), shape2.global_env.len());
-            println!("Prints: {:?} vs {:?}", shape1.prints, shape2.prints);
-        }
-
-        // Try vectorizing
-        let vectorized = vectorize_states(states.clone());
-        println!("\nAfter vectorization: {} states", vectorized.len());
-
-        // If they didn't merge, that's a bug
-        if states.len() == 2 && vectorized.len() == 2 && shape1 != shape2 {
-            panic!("States have different shapes but Python says they should merge!");
-        }
-    }
 
     #[test]
     fn test_vectorize_two_scalar_states() {

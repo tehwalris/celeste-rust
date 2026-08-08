@@ -5,7 +5,6 @@ use rustc_hash::FxHasher;
 use super::{
     fixed_env::FixedEnv,
     heap::HeapId,
-    input_capture,
     op::{interpret_binary_op, interpret_select, interpret_unary_op},
     profiling::{DagOperation, SpanGuard, with_profiler},
     state::State,
@@ -603,22 +602,6 @@ impl<'a> CoreInterpreter<'a> {
                 Ok(states)
             }
             HeapValue::Closure(fun_def_name, captured_values) => {
-                // Capture inputs for benchmarking if enabled
-                input_capture::maybe_capture(fun_def_name.as_str(), arg_values.clone());
-
-                // For slow call capture: clone state before we modify it
-                let capture_slow = input_capture::should_capture_slow_call(fun_def_name.as_str());
-                let state_before = if capture_slow {
-                    Some((self.state.clone(), arg_values.clone()))
-                } else {
-                    None
-                };
-                let call_start = if capture_slow {
-                    Some(std::time::Instant::now())
-                } else {
-                    None
-                };
-
                 // Look up the function definition with prepared CFG
                 let (fun_def, prepared_cfg) = self
                     .fixed_env
@@ -682,17 +665,6 @@ impl<'a> CoreInterpreter<'a> {
                     Some(fun_def_name.as_str().to_string()),
                     fun_def.source_span,
                 )?;
-
-                // Record slow call if it exceeded threshold
-                if let (Some((state, args)), Some(start)) = (state_before, call_start) {
-                    let duration_us = start.elapsed().as_micros() as u64;
-                    input_capture::maybe_record_slow_call(
-                        fun_def_name.as_str(),
-                        args,
-                        state,
-                        duration_us,
-                    );
-                }
 
                 // Track if this closure call caused a state split
                 if result_states.len() > 1 {
