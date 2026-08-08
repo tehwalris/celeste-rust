@@ -36,7 +36,14 @@ path = "src/bin/rewrite.rs"
 [profile.release]
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+# unwind, not abort. The deopt path is BUILT on catching panics - a
+# speculated instruction can assert on values the verify horizon never
+# showed it, and run_deopt_frame_granular catches that and re-runs the
+# state under the plain program. Under `abort` that catch_unwind is a
+# no-op and such a panic kills the process instead, which is how a
+# multi-hour room (0,0) campaign died at frame 66 on a one-line bug.
+# Measured cost of unwinding: 2.2% (10.26 -> 10.48 s at 55 frames).
+panic = "unwind"
 # Frame pointers + line tables so `perf` can attribute cycles to source.
 # Costs nothing measurable and makes the profile readable.
 debug = 1
