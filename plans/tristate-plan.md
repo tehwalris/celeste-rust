@@ -546,3 +546,38 @@ semantics and no longer matches what the binary produces. They are fine
 to develop against but must not be used to certify a g/band result. The
 room (0,0) end-to-end run rebuilds them anyway, and should be markedly
 cheaper: deopt is gone and f80 peaked at 17.0 GB against 40.6 GB.
+
+## simdcheck PASSES on room (0,0)
+
+    simdcheck: forward walk WITH the frontier subtract; probes always without it
+    f070: 23063 lanes checked so far, 0 violation(s)
+    simdcheck PASSES: 23063 lanes over 70 frames produce identical canonical
+    rows batched and alone
+
+70 frames, so the sample covers f066-f070 where the partition and the two
+splits actually fire - the region that could violate the property. Room
+(1,0) passes this trivially and proves nothing, which is why the check had
+to be made runnable on room (0,0) at all (see the per-probe subtract fix).
+
+This is Philippe's requirement, in his words: "I don't want the results to
+change depending on what is in which other lane."
+
+Why it should hold, so the result is not just an observation: after these
+fixes every surviving `UnknownBool` is honestly all-lanes-unknown. The
+partition removes the mixed-comparison source; the remaining sources are
+`__new_unknown_boolean` (button input) and a select with both arms
+unknown, both genuinely unknown per lane. A condition unknown for every
+lane splits into two copies that each keep every lane, and a lane run
+alone splits into two copies of that lane - so the union matches.
+
+### The result means nothing without the control
+
+A check that cannot fail is not evidence. With the partition and split
+disabled the old whole-value collapse violates batching invariance BY
+CONSTRUCTION (simdcheck's own docs say so), so that run MUST report
+violations. It is queued. If it also passes, this gate is blind and the
+pass above should be discarded rather than believed.
+
+This is the lesson from the retracted "batch invariance violated" finding
+earlier in the campaign, which came from trusting an unvalidated parser
+that happened to be blind exactly where it was tested.
