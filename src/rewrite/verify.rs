@@ -939,8 +939,12 @@ impl AbstractRun {
     }
 
     /// The finished table; `None` when recording was never enabled.
-    pub fn take_pos_graph(&mut self) -> Option<super::pos_graph::PosGraph> {
-        self.pos_obs.take().map(|o| o.build())
+    pub fn take_pos_graph(
+        &mut self,
+        frames: u32,
+        fingerprint: &str,
+    ) -> Option<super::pos_graph::PosGraph> {
+        self.pos_obs.take().map(|o| o.build(frames, fingerprint))
     }
 
     /// Drop lanes that have exited the room (global room.x reached the

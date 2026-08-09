@@ -100,6 +100,149 @@ not recorded. The time ratios are therefore soft and most likely
 understate the gain. Lane counts, peak RSS, deopt counts and win counts
 are contention-independent.
 
+# Room (0,0) SWEEPS. The thing that could not run, runs (2026-08-09)
+
+**Read the universe caveat first.** Every room (0,0) number below is
+against the forward pass as it stood at `census` 1d24aba, i.e. BEFORE the
+interpreter fixes that partition mixed interval comparisons and split
+`select` on an `UnknownBool` (861c4c7, b8187b6 and follow-ups). Those make
+the abstraction strictly more precise, so room (0,0) now produces fewer
+lanes - the gap is zero through f65, -1.25% at f70, -13% at f79 - and
+`~/celeste-checkpoints/room00` no longer matches what the current binary
+produces. What is demonstrated here is that the sweep RUNS at this scale
+and what it costs; the `g` it produced is not a certification of anything
+and should not be reused. The abstract first-win frame is 80 either way.
+
+The sweep OOMed on room (0,0) with the edge graph - one frame there
+produces 644,653,017 successor lanes, each an edge - while the forward
+pass completed fine. That was the whole point of the rewrite, and it is
+done:
+
+| room (0,0), H=94, 460,658,200 rows | |
+|---|---|
+| rows that reach the exit within the horizon | 24,514,668 |
+| row-expansions | 451,884,260 |
+| successors outside the row table | **0** |
+| `min(e + g)` | **80**, = the forward pass's first room-exit frame |
+| position graph | 405,332 pairs / 7,923 cells / 2.7 MB, 6,171.5 s |
+| re-index | 181.2 s (310.5 s on a second, contended run) |
+| backward loop | ~2,600 s |
+
+`min(e+g) = 80` against the forward pass's "first room-exit lanes appeared
+at frame 80" is the ladder's own consistency check, and it is the only
+check available here: room (0,0) has no certified `g`, because the sweep
+that would have produced one is the one that OOMs.
+
+**Zero out-of-table successors is the surprise.** Room (0,0) is 89.0%
+mixed UnknownBool collapses (64,272,681 of 72,192,126 constructions), so
+regrouping its candidate lanes was expected to reach rows the forward pass
+never did. Over 451.9M expansions it reached none. That does not make the
+room batch-invariant - the collapse can still turn a definite lane into
+two - but whatever it does produce stayed inside the row table.
+
+Two costs are genuinely worse here than on room (1,0), and both come from
+the fruit: the position graph took 6,171.5 s to record (against 1,121.9 s)
+because f090 alone is 401.8 s of `UnknownBool` whole-state fallbacks, and
+the expansions are 0.98x the row count rather than 0.46x.
+
+## The allocator, which cost an OOM
+
+The first attempt died anyway, in the backward loop, at the 100 GB cap -
+and not because the sweep needs 100 GB:
+
+| after the re-index, room (0,0) | RSS |
+|---|---|
+| position graph built in the same process | **94 GB** (OOM-killed later) |
+| identical graph loaded from `posgraph.bin` | **41.6 GB** (finished) |
+
+Same index, same data, 52 GB apart. The replay's transient peaks around
+76 GB, and freeing it does not return it: glibc keeps it in its arenas,
+invisible to us and fully counted by the cgroup.
+
+The remedy that is measured is the second row: build the table with
+`rewrite pos-graph`, in its own process, and let the sweep load it - which
+banks the 1.7 h on disk anyway. `sweep_time` also calls `malloc_trim`
+between its two phases, but how much that recovers is NOT measured, and
+should not be quoted: room (1,0)'s transient is too small to show it (its
+post-index RSS is 22.9 GB without the call and 24.7 GB with it, the
+difference being contention, not the call) and reproducing room (0,0)'s
+costs 1.7 h.
+
+# The time-expanded sweep is BUILT, and it gates to the edge (2026-08-09)
+
+`rewrite sweep --time-expanded` reproduces the certified `g` for room
+(1,0) at H=100 element-wise over all 212,559,009 rows, with no edge graph
+at all. The census's projection held to 0.001%: it predicted 98,279,103
+row-expansions, the sweep performed **98,280,066** (0.46x the edge
+sweep's 212,559,009).
+
+| room (1,0), H=100, from nothing | edge sweep | time-expanded |
+|---|---|---|
+| row-expansions | 212,559,009 | 98,280,066 (0.46x) |
+| stored predecessor data | 10.07e9 edges, 58 GB on disk | 383,943 cell pairs, 1.0 MB |
+| wall, total | ~45 min | **30:53** |
+| peak RSS | (plus the 58 GB of shards) | 33.7 GB |
+
+Where the 30:53 goes:
+
+| stage | wall | how often |
+|---|---|---|
+| position graph replay | 1121.9 s | once per PRECISION LEVEL, extended over new frames |
+| re-index | 71.9 s | once per sweep |
+| backward loop (expansions + scan + keys) | ~660 s | once per sweep |
+
+So a second horizon at the same level costs ~730 s, not 30 min. Against
+the edge sweep that is a straight win on memory (58 GB of shards gone)
+and roughly a wash on time at H=100; five frames of horizon slack makes
+it a wash on expansions too and ten makes it 2.3x worse (see the census
+table below). It is a MEMORY result first.
+
+## The re-index was the missing piece
+
+Candidates at frame `i` were discovered at any earlier frame, but the
+saved batches are grouped BY discovery frame, so the obvious loop re-reads
+batches 1..i every frame - O(H²/2) decompressions, ~1900 s on room (1,0),
+more than the expansions cost. One pass over the 2,592 saved states
+instead, recording `(state, lane, cell, win)` per row id: **71.9 s**, and
+every later fetch is an array index. The states stay resident, which is
+most of the 33.7 GB peak - 8.5 GB of decompressed bincode for room (1,0),
+20.6 GB for room (0,0).
+
+## What the gate had to be, and what it must not be
+
+A horizon-H sweep never looks past H, so it produces `g` only where
+`e + g <= H` - 8,823,156 of 212,559,009 rows at H=100, against the
+certified array's 203,369,203. The comparison is therefore against the
+certified array THRESHOLDED at H (`tools/gdiff.py --threshold H --meta
+meta.json`), element-wise, every row.
+
+Not against the reported optimum. A wrong sweep earlier the same day
+printed `abstract optimal win frame from e+g: 90`, matching the certified
+run exactly, while `g` was wrong for 95% of rows - the win chain happens
+to be stamp-monotone. That is the number the ladder greps.
+
+Three cheaper gates come first and are worth keeping: the certified
+banded levels have real wins and real expansions at 1/100th the size.
+room1-k16 (327 rows), room1-k8 (92,869) and room1-k1 (8,888,141 rows,
+29.5M expansions, 285 s) each reproduce their level's certified `g`
+exactly.
+
+## The regrouping, and why room (1,0) is the easy case
+
+Candidates come from every earlier frame, so they are expanded in
+different lane groups than the forward pass used - and grouping is
+semantic: a comparison against a widened interval that straddles in ANY
+lane of a chunk collapses to a whole-value `UnknownBool` and sends the
+entire chunk down both edges. Room (1,0) has ZERO mixed collapses and
+satisfies batch invariance, which is why its `g` here is identical rather
+than merely sound; the sweep reported **0** successor lanes outside the
+row table, exactly as that predicts. Room (0,0) is 70.1% mixed.
+
+What holds regardless is the only property the band needs: every grouping
+over-approximates the CONCRETE transition relation (a finer group merely
+lets a lane take the branch it would concretely have taken), so no row on
+a concrete winning path is ever pruned.
+
 # The position table has to be per LANE, not per chunk (2026-08-09)
 
 The table below says a positional predecessor filter is worth building.
@@ -265,7 +408,7 @@ would otherwise have added hours. The sweep here was built from nothing.
 
 Caveat, so the table is not read as more than it is: the sweep's SPEEDUP
 is unmeasured. It is parallel now and gated byte-identical
-(`sweepcheck.sh`), but there is no controlled serial counterpart at this
+(the since-deleted `sweepcheck.sh`), but there is no controlled serial counterpart at this
 depth - the f40 gate universe finishes in 5 s either way. See the pending
 task before quoting a number for it.
 
