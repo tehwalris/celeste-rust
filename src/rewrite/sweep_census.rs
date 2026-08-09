@@ -21,6 +21,11 @@
 //! predecessor relation, made sound by the fact that the candidates are then
 //! actually expanded, so only cost depends on its tightness.
 //!
+//! Positions are measured relative to the START room, not room-local:
+//! object coordinates reset at a room transition, so the one frame that
+//! crosses into the next room looks like a 128-pixel jump and poisons every
+//! learned radius that touches the exit.
+//!
 //! This module measures whether that filter has any power at all, from a
 //! finished forward pass plus its certified `g`: per frame it reports
 //! `|R(i)|`, `|B(i)|`, the number of distinct position cells `B(i)` occupies,
@@ -31,29 +36,32 @@
 use anyhow::{anyhow, Context, Result};
 use std::path::Path;
 
-use crate::interpreter::abstraction::player_xy_per_lane;
+use crate::interpreter::abstraction::{player_xy_per_lane, room_xy_per_lane};
 use crate::interpreter::row_table::RowTable;
 
 use super::checkpoint;
 use super::sweep::{row_keys, G_UNREACHABLE};
 
 /// Side of the position grid, in pixels. A room is 128x128; the grid is
-/// bigger so that the overshoot a transition frame produces (the player is
-/// already past the room edge when `room.x` flips) still lands in it.
+/// bigger because positions are measured relative to the START room, so a
+/// row that has already crossed into the next room sits past 128.
 pub const GRID: i32 = 256;
 /// Pixel coordinate mapped to grid index 0.
 const ORIGIN: i32 = -64;
+/// Side of a room in pixels - the stride between rooms in the grid.
+const ROOM_PX: i32 = 128;
 /// `positions[id]` for a row with no player object - the countdown states
 /// after a death, and any state whose objects array has neither `player`
 /// nor `player_spawn`. Such rows are never candidates under a positional
 /// filter, which is exactly what we want to measure.
 pub const NO_CELL: u16 = u16::MAX;
 
-/// Grid cell of a whole-pixel position. Loud rather than clamping: a
-/// position outside the grid would silently distort every distance.
-fn cell_of(x: i16, y: i16) -> Result<u16> {
-    let gx = x as i32 - ORIGIN;
-    let gy = y as i32 - ORIGIN;
+/// Grid cell of a whole-pixel position, given in START-ROOM-relative
+/// coordinates. Loud rather than clamping: a position outside the grid
+/// would silently distort every distance.
+fn cell_of(x: i32, y: i32) -> Result<u16> {
+    let gx = x - ORIGIN;
+    let gy = y - ORIGIN;
     if !(0..GRID).contains(&gx) || !(0..GRID).contains(&gy) {
         return Err(anyhow!("player position ({}, {}) is outside the census grid", x, y));
     }
@@ -72,6 +80,7 @@ fn cell_of(x: i16, y: i16) -> Result<u16> {
 /// batches and the row table disagree and every number below would be
 /// meaningless.
 pub fn build_positions(dir: &Path, frames: u32, table: &RowTable) -> Result<Vec<u16>> {
+    let start = crate::game_runner::start_room();
     let n_rows = table.len();
     let mut positions = vec![NO_CELL; n_rows];
     let mut seen = vec![0u64; n_rows.div_ceil(64)];
@@ -82,7 +91,12 @@ pub fn build_positions(dir: &Path, frames: u32, table: &RowTable) -> Result<Vec<
             .with_context(|| format!("loading frame batch f{:03}", f))?;
         for state in &states {
             let keys = row_keys(state)?;
+            let rooms = room_xy_per_lane(state)
+                .ok_or_else(|| anyhow!("f{:03}: a saved state has no readable `room`", f))?;
             let xy = player_xy_per_lane(state);
+            if rooms.len() != keys.len() {
+                return Err(anyhow!("f{:03}: {} rooms for {} lanes", f, rooms.len(), keys.len()));
+            }
             if let Some(xy) = &xy {
                 if xy.len() != keys.len() {
                     return Err(anyhow!(
@@ -112,7 +126,11 @@ pub fn build_positions(dir: &Path, frames: u32, table: &RowTable) -> Result<Vec<
                 seen[w] |= b;
                 match &xy {
                     Some(xy) => {
-                        positions[id as usize] = cell_of(xy[lane].0, xy[lane].1)?;
+                        let (rx, ry) = rooms[lane];
+                        positions[id as usize] = cell_of(
+                            xy[lane].0 as i32 + (rx - start.0) as i32 * ROOM_PX,
+                            xy[lane].1 as i32 + (ry - start.1) as i32 * ROOM_PX,
+                        )?;
                         placed += 1;
                     }
                     None => without_player += 1,
@@ -144,7 +162,7 @@ pub fn save_positions(dir: &Path, positions: &[u16]) -> Result<()> {
     let tmp = dir.join("tmp-pos.bin");
     {
         let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
-        w.write_all(b"C8PS")?;
+        w.write_all(b"C8PG")?;
         w.write_all(&checkpoint::FORMAT_VERSION.to_le_bytes())?;
         w.write_all(&(positions.len() as u64).to_le_bytes())?;
         let mut zw = zstd::Encoder::new(&mut w, 1)?;
@@ -169,7 +187,7 @@ pub fn load_positions(dir: &Path, n_rows: usize) -> Result<Option<Vec<u16>>> {
     let mut file = std::io::BufReader::new(std::fs::File::open(&path)?);
     let mut magic = [0u8; 4];
     file.read_exact(&mut magic)?;
-    if &magic != b"C8PS" {
+    if &magic != b"C8PG" {
         return Err(anyhow!("{}: bad magic", path.display()));
     }
     let mut buf4 = [0u8; 4];

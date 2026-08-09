@@ -670,6 +670,26 @@ pub fn room_x_lane_mask(state: &State, x: i16) -> Vec<bool> {
     }
 }
 
+/// Per-lane `(room.x, room.y)`. Object coordinates are ROOM-LOCAL, so a
+/// room transition wraps the player's x from ~128 back to ~0; anything that
+/// measures distance between two frames has to add `room * 128` first or
+/// that one frame looks like a 128-pixel teleport.
+pub fn room_xy_per_lane(state: &State) -> Option<Vec<(i16, i16)>> {
+    let helper = StateHelper::new(state);
+    let table_id = helper.unwrap_pointer(helper.load(helper.find_global("room")?))?;
+    let HeapValue::ObjectTable(room) = helper.load(table_id) else { return None };
+    let axis = |name: &str| -> Option<Vec<i16>> {
+        let HeapValue::Value(Value::Number(n)) = helper.load(*room.get(name)?) else {
+            return None;
+        };
+        Some(match n {
+            MaybeVector::Scalar(v) => vec![v.whole_part_as_i16(); state.vector_size.max(1)],
+            MaybeVector::Vector(vs) => vs.iter().map(|v| v.whole_part_as_i16()).collect(),
+        })
+    };
+    Some(axis("x")?.into_iter().zip(axis("y")?).collect())
+}
+
 /// Per-lane (x, y) whole-pixel positions of the first object (the player or
 /// the spawn animation), or `None` when the objects array is empty (dead
 /// countdown states) or missing. Used by the per-coordinate saturation dump
