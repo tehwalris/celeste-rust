@@ -620,3 +620,15 @@ the gate discriminates and the pass is not vacuous.
 This is the discipline the retracted "batch invariance violated" finding
 earlier in the campaign should have had: a checker that has not been shown
 capable of failing is not evidence.
+
+### Control, final tally
+
+    fixes OFF: f070: 23079 lanes checked, 3 violation(s)
+      VIOLATION frame 67 state 9: batched 376 rows vs singletons 360
+      VIOLATION frame 69 state 9: batched 492 rows vs singletons 488
+      VIOLATION frame 70 state 9: batched 648 rows vs singletons 624
+      Error: simdcheck FAILED
+
+Three violations, all in the straddling region, all with batched > single.
+The two runs sample almost identically (23,079 vs 23,063 lanes), so the
+fixes are the only difference between PASS and FAIL.

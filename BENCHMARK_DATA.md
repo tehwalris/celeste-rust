@@ -72,12 +72,19 @@ it is the only frame of 15 that moves.
 That claim is only worth something because the POSITIVE CONTROL fails.
 With the fixes disabled:
 
+    f070: 23079 lanes checked so far, 3 violation(s)
     VIOLATION frame 67 state 9: batched 376 rows vs singletons 360 rows
+    VIOLATION frame 69 state 9: batched 492 rows vs singletons 488 rows
+    VIOLATION frame 70 state 9: batched 648 rows vs singletons 624 rows
+    Error: simdcheck FAILED: 3 state(s) whose batched result differs from
+           running their lanes separately
 
-Frame 67 is in the straddling region, and the batched run produces MORE
-rows - the whole-value collapse adding spurious rows to lanes that had
-answers, which is the predicted mechanism. So the gate discriminates, and
-the pass is not vacuous.
+All three sit in the straddling region (f66+), and every one has the
+batched run producing MORE rows than the singletons - the whole-value
+collapse adding spurious rows to lanes that had answers, which is the
+mechanism predicted before the run. The two runs sample almost identically
+(23,079 lanes against 23,063), so the only difference between PASS and
+FAIL is the fixes. The gate discriminates and the pass is not vacuous.
 
 Getting the gate to run at all required a fix: it had refused any run with
 the frontier subtract on, but without the subtract room (0,0) exhausts
