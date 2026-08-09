@@ -526,3 +526,23 @@ rests on:
   f81/4268, f82/3472, f83/5030).
 
 Quote those. If a clean wall-clock number is wanted, re-run f94 alone.
+
+## Room (1,0) is untouched; room (0,0)'s checkpoints are stale
+
+Room (1,0), f42 widencheck, all three fixes ON versus all OFF:
+
+    frame 40: identical (673479 lanes widened / 948319 lanes exact side)
+    frame 42: identical (1208554 lanes widened / 2181716 lanes exact side)
+
+Byte-identical both ways, as required: room (1,0) produces no straddling
+comparison, so none of the three rules can fire there. Its certified
+campaign (concrete optimum 100, 17 precision levels) therefore stands and
+does not need re-deriving.
+
+Room (0,0) is the opposite, and this is the operational consequence to
+remember: its forward pass now produces FEWER lanes, so every checkpoint
+under ~/celeste-checkpoints/room00 and room00-tsweep predates the current
+semantics and no longer matches what the binary produces. They are fine
+to develop against but must not be used to certify a g/band result. The
+room (0,0) end-to-end run rebuilds them anyway, and should be markedly
+cheaper: deopt is gone and f80 peaked at 17.0 GB against 40.6 GB.
