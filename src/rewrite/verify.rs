@@ -858,6 +858,22 @@ impl AbstractRun {
         Ok(run)
     }
 
+    /// Turn the frontier subtract off for this run regardless of the
+    /// environment.
+    ///
+    /// For `simdcheck`'s probe runs. The subtract removes rows this run has
+    /// already seen, and a batched probe seeds its history from the whole
+    /// sampled group while each single-lane probe seeds from one lane - so
+    /// with it on, the two differ for a reason that has nothing to do with
+    /// lane independence. Turning it off HERE, rather than forbidding it
+    /// for the whole command, lets the forward walk stay frontier-only and
+    /// therefore actually reach the frames where straddling happens
+    /// (without it, room (0,0) exhausts 100 GB before frame 70).
+    pub fn without_frontier_subtract(mut self) -> Self {
+        self.visited_rows = None;
+        self
+    }
+
     /// (states, lanes) that deopted to the plain program so far.
     pub fn deopt_events(&self) -> (usize, usize) {
         self.deopt.as_ref().map_or((0, 0), |d| d.total_events)

@@ -2099,14 +2099,29 @@ fn main() -> Result<()> {
             use celeste_rust::rewrite::verify::AbstractRun;
             use std::collections::BTreeSet;
 
-            if std::env::var_os("CELESTE_FRONTIER_ONLY").is_some() {
-                return Err(anyhow!(
-                    "simdcheck must run with the frontier subtract OFF: it \
-                     removes rows seen in earlier frames, which a batched run \
-                     and a single-lane run would each do against their own \
-                     history, making the two incomparable for reasons that \
-                     have nothing to do with lane independence"
-                ));
+            // The frontier subtract must be off for the PROBE runs - a
+            // batched probe seeds its history from the whole sampled group
+            // and each single-lane probe from one lane, so with it on the
+            // two differ for reasons unrelated to lane independence.
+            // `without_frontier_subtract` guarantees that per probe, which
+            // is why this is no longer a hard error on the whole command.
+            //
+            // The forward WALK may keep it, and on any deep room it must:
+            // it decides which states get sampled, not how they are
+            // compared, and without it room (0,0) exhausts 100 GB before
+            // reaching frame 66, where the first straddling comparison
+            // appears - so the un-subtracted form certifies nothing about
+            // the frames that matter.
+            let frontier_walk = std::env::var_os("CELESTE_FRONTIER_ONLY").is_some();
+            println!(
+                "simdcheck: forward walk {} the frontier subtract; probes always without it",
+                if frontier_walk { "WITH" } else { "without" }
+            );
+            if frontier_walk {
+                println!(
+                    "  (so the certified population is the states the frontier search \
+                     actually steps, which is what the campaign runs)"
+                );
             }
 
             let (program, _) = build(&recipe)?;
@@ -2131,7 +2146,8 @@ fn main() -> Result<()> {
             // Run exactly one frame over `states` and return their rows.
             let run_once = |states: Vec<State>| -> Result<BTreeSet<(u64, u64)>> {
                 let mut run =
-                    AbstractRun::start_with_deopt(&program, &plain, mapping.clone(), false)?;
+                    AbstractRun::start_with_deopt(&program, &plain, mapping.clone(), false)?
+                        .without_frontier_subtract();
                 run.restore(states, None, (0, 0))?;
                 run.step()?;
                 rows_of(run.states())
