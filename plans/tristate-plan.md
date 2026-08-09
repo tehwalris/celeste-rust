@@ -487,3 +487,23 @@ means the abstract bound gets sharper at depth, not just cheaper.
 The f70 A/B (baseline 8,164,454 lanes) matches l0-h94's own f70 line
 exactly, so the two runs are comparable and the deltas above are not a
 configuration difference.
+
+## The answer is unchanged, which is the point
+
+The abstract first win is the LOWER BOUND the whole proof rests on, so the
+one thing this work must not do is move it. It does not:
+
+    BEFORE  frame 80:  138.20s  11,609,448 lanes  peak 40.6 GB  WIN: 1040 lanes
+    AFTER   frame 80:   50.05s   9,888,690 lanes  peak 17.0 GB  WIN: 1040 lanes
+
+Same first-win frame, and the SAME 1040 winning lanes, while the rest of
+the frame's set shrank 15%. The precision landed entirely on states that
+were never going to win, and left the answer alone.
+
+Note the direction that would have been alarming. More precision can only
+shrink the abstract set, so the abstract win can only move LATER (a
+tighter bound). A win appearing EARLIER than the baseline's would mean
+the set had grown somewhere, i.e. a bug. Equality is the best available
+outcome and is what happened.
+
+That frame also ran 2.8x faster on 2.4x less memory.
