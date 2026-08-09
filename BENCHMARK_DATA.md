@@ -1,3 +1,78 @@
+# The time-expanded sweep is BUILT, and it gates to the edge (2026-08-09)
+
+`rewrite sweep --time-expanded` reproduces the certified `g` for room
+(1,0) at H=100 element-wise over all 212,559,009 rows, with no edge graph
+at all. The census's projection held to 0.001%: it predicted 98,279,103
+row-expansions, the sweep performed **98,280,066** (0.46x the edge
+sweep's 212,559,009).
+
+| room (1,0), H=100, from nothing | edge sweep | time-expanded |
+|---|---|---|
+| row-expansions | 212,559,009 | 98,280,066 (0.46x) |
+| stored predecessor data | 10.07e9 edges, 58 GB on disk | 383,943 cell pairs, 1.0 MB |
+| wall, total | ~45 min | **30:53** |
+| peak RSS | (plus the 58 GB of shards) | 33.7 GB |
+
+Where the 30:53 goes:
+
+| stage | wall | how often |
+|---|---|---|
+| position graph replay | 1121.9 s | once per PRECISION LEVEL, extended over new frames |
+| re-index | 71.9 s | once per sweep |
+| backward loop (expansions + scan + keys) | ~660 s | once per sweep |
+
+So a second horizon at the same level costs ~730 s, not 30 min. Against
+the edge sweep that is a straight win on memory (58 GB of shards gone)
+and roughly a wash on time at H=100; five frames of horizon slack makes
+it a wash on expansions too and ten makes it 2.3x worse (see the census
+table below). It is a MEMORY result first.
+
+## The re-index was the missing piece
+
+Candidates at frame `i` were discovered at any earlier frame, but the
+saved batches are grouped BY discovery frame, so the obvious loop re-reads
+batches 1..i every frame - O(H²/2) decompressions, ~1900 s on room (1,0),
+more than the expansions cost. One pass over the 2,592 saved states
+instead, recording `(state, lane, cell, win)` per row id: **71.9 s**, and
+every later fetch is an array index. The states stay resident, which is
+most of the 33.7 GB peak - 8.5 GB of decompressed bincode for room (1,0),
+20.6 GB for room (0,0).
+
+## What the gate had to be, and what it must not be
+
+A horizon-H sweep never looks past H, so it produces `g` only where
+`e + g <= H` - 8,823,156 of 212,559,009 rows at H=100, against the
+certified array's 203,369,203. The comparison is therefore against the
+certified array THRESHOLDED at H (`tools/gdiff.py --threshold H --meta
+meta.json`), element-wise, every row.
+
+Not against the reported optimum. A wrong sweep earlier the same day
+printed `abstract optimal win frame from e+g: 90`, matching the certified
+run exactly, while `g` was wrong for 95% of rows - the win chain happens
+to be stamp-monotone. That is the number the ladder greps.
+
+Three cheaper gates come first and are worth keeping: the certified
+banded levels have real wins and real expansions at 1/100th the size.
+room1-k16 (327 rows), room1-k8 (92,869) and room1-k1 (8,888,141 rows,
+29.5M expansions, 285 s) each reproduce their level's certified `g`
+exactly.
+
+## The regrouping, and why room (1,0) is the easy case
+
+Candidates come from every earlier frame, so they are expanded in
+different lane groups than the forward pass used - and grouping is
+semantic: a comparison against a widened interval that straddles in ANY
+lane of a chunk collapses to a whole-value `UnknownBool` and sends the
+entire chunk down both edges. Room (1,0) has ZERO mixed collapses and
+satisfies batch invariance, which is why its `g` here is identical rather
+than merely sound; the sweep reported **0** successor lanes outside the
+row table, exactly as that predicts. Room (0,0) is 70.1% mixed.
+
+What holds regardless is the only property the band needs: every grouping
+over-approximates the CONCRETE transition relation (a finer group merely
+lets a lane take the branch it would concretely have taken), so no row on
+a concrete winning path is ever pruned.
+
 # The position table has to be per LANE, not per chunk (2026-08-09)
 
 The table below says a positional predecessor filter is worth building.
