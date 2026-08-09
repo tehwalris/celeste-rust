@@ -227,6 +227,10 @@ pub fn learn_radii(dir: &Path, frames: u32, positions: &[u16]) -> Result<Vec<u32
     let mut radii2 = vec![u32::MAX; (GRID * GRID) as usize];
     let mut edges = 0u64;
     let mut no_cell = 0u64;
+    // Edges by whole-pixel displacement. A flat radius is only sound if it
+    // covers this whole histogram, so its tail is what decides whether one
+    // exists at all.
+    let mut hist = vec![0u64; 2 * GRID as usize];
     for f in 1..frames {
         let path = edge_dir.join(format!("f{:03}.bin", f));
         if !path.exists() {
@@ -246,6 +250,7 @@ pub fn learn_radii(dir: &Path, frames: u32, positions: &[u16]) -> Result<Vec<u32
             if *slot == u32::MAX || d2 > *slot {
                 *slot = d2;
             }
+            hist[(d2 as f64).sqrt().ceil() as usize] += 1;
         })?;
         edges += n;
         if f % 10 == 0 || f + 1 == frames {
@@ -268,6 +273,39 @@ pub fn learn_radii(dir: &Path, frames: u32, positions: &[u16]) -> Result<Vec<u32
         (max as f64).sqrt(),
         no_cell
     );
+    // The displacement tail: for each candidate flat radius, how many edges
+    // it would MISS. A radius that misses any edge is unsound on its own.
+    let total: u64 = hist.iter().sum();
+    let mut over = total;
+    println!("  displacement tail (edges a flat radius would miss):");
+    for r in 0..hist.len() {
+        over -= hist[r];
+        if over == 0 {
+            println!("    <= {:>3}px: none", r);
+            break;
+        }
+        if r <= 16 || hist[r] > 0 {
+            println!("    <= {:>3}px: {} edges beyond ({:.3e} of all)", r, over, over as f64 / total as f64);
+        }
+    }
+    // The cells that force a big radius, so the cause is nameable rather
+    // than a number: these are the ones that make the learned mask useless.
+    let mut worst: Vec<(u32, usize)> = radii2
+        .iter()
+        .enumerate()
+        .filter(|(_, &r)| r != u32::MAX)
+        .map(|(c, &r)| (r, c))
+        .collect();
+    worst.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    println!("  cells forcing the largest radii (start-room-relative px):");
+    for (r2, c) in worst.iter().take(8) {
+        println!(
+            "    ({:>4}, {:>4}) needs {:.1}px",
+            (c % GRID as usize) as i32 + ORIGIN,
+            (c / GRID as usize) as i32 + ORIGIN,
+            (*r2 as f64).sqrt()
+        );
+    }
     Ok(radii2)
 }
 
@@ -355,6 +393,9 @@ pub struct FrameCensus {
     pub candidates: Vec<u64>,
     /// Same, under the per-cell learned radii; `None` when not supplied.
     pub learned: Option<u64>,
+    /// The largest learned radius (px) any B(i+1) cell carries - one cell
+    /// with a teleport-sized radius is enough to make the mask the room.
+    pub learned_max_px: Option<u32>,
 }
 
 /// Squared-distance field from the set cells, capped at `rmax`. Only the
@@ -422,9 +463,15 @@ pub fn census(
             }
         }
         distance_field(&b_next_cells, rmax, &mut field);
-        if let Some(r2) = learned_radii {
+        let learned_max_px = learned_radii.map(|r2| {
             learned_mask(&b_next_cells, r2, &mut learned_in);
-        }
+            b_next_cells
+                .iter()
+                .map(|&c| r2[c as usize])
+                .filter(|&r| r != u32::MAX)
+                .max()
+                .map_or(0, |r| (r as f64).sqrt().ceil() as u32)
+        });
 
         // R(i) and B(i), and the candidates.
         occupied.fill(false);
@@ -481,6 +528,7 @@ pub fn census(
             new_rows,
             candidates,
             learned: learned_radii.map(|_| learned),
+            learned_max_px,
         });
     }
     Ok(out)

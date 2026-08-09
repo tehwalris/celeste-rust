@@ -2938,7 +2938,11 @@ fn main() -> Result<()> {
                 let head: String = radii
                     .iter()
                     .map(|r| format!("{:>14}", format!("cand r={}", r)))
-                    .chain(learned.iter().map(|_| format!("{:>14}", "cand learned")))
+                    .chain(
+                        learned
+                            .iter()
+                            .flat_map(|_| [format!("{:>14}", "cand learned"), format!("{:>8}", "max r")]),
+                    )
                     .collect();
                 println!(
                     "{:>5}{:>14}{:>14}{:>9}{:>9}{:>14}{}",
@@ -2961,6 +2965,7 @@ fn main() -> Result<()> {
                             .iter()
                             .chain(row.learned.iter())
                             .map(|c| format!("{:>14}", c))
+                            .chain(row.learned_max_px.iter().map(|r| format!("{:>8}", r)))
                             .collect();
                         println!(
                             "{:>5}{:>14}{:>14}{:>9}{:>9}{:>14}{}",
