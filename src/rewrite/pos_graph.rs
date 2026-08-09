@@ -32,6 +32,13 @@
 //! like a 128-pixel teleport, and since the cell it lands in is the seed of
 //! the backward sweep, every candidate mask that touched it covered the
 //! whole room. See BENCHMARK_DATA.md.
+//!
+//! The next room is placed one ROOM_PX to the right, because rooms advance
+//! along `room.x`. That is a labelling, not a geometry: room (0,0) is left
+//! by going UP, so its exit lanes keep their local x (~110) and land at
+//! start-relative x ~238. The grid has to hold the start room AND a whole
+//! room's width past it in both axes, which is why it is 512 wide and why
+//! cells no longer fit in a u16.
 
 use anyhow::{anyhow, Result};
 use std::path::Path;
@@ -39,10 +46,12 @@ use std::path::Path;
 use crate::interpreter::abstraction::{player_xy_per_lane, room_xy_per_lane};
 use crate::interpreter::state::State;
 
-/// Side of the position grid, in pixels. A room is 128x128; the grid is
-/// bigger because positions are start-room-relative, so a row that has
-/// already crossed into the next room sits past 128.
-pub const GRID: i32 = 256;
+/// Side of the position grid, in pixels. A room is 128x128; the grid holds
+/// the start room plus a whole room's width past it in each axis, because a
+/// row that has crossed into the next room is labelled one ROOM_PX to the
+/// right whichever edge it actually left by. 256 was not enough: room (0,0)
+/// exits upward and its crossing lanes land at start-relative x ~238.
+pub const GRID: i32 = 512;
 /// Pixel coordinate mapped to grid index 0.
 pub const ORIGIN: i32 = -64;
 /// Side of a room in pixels - the stride between rooms in the grid.
@@ -54,39 +63,38 @@ const ROOM_PX: i32 = 128;
 /// predecessors and successors, they just cannot be located - so it must
 /// participate, not be dropped.
 ///
-/// It doubles as the grid's out-of-range marker, so `cell_of` refuses to
-/// produce it: the single grid position it would collide with is rejected
-/// loudly rather than silently merging with "nowhere".
-pub const NO_CELL: u16 = u16::MAX;
+/// A node of its own past the end of the grid, so no position can alias it.
+pub const NO_CELL: u32 = (GRID * GRID) as u32;
 
 /// Number of nodes, including `NO_CELL`.
-pub const CELL_COUNT: usize = 1 << 16;
+pub const CELL_COUNT: usize = (GRID * GRID) as usize + 1;
 /// `u64` words in a bitmap over all nodes.
-pub const CELL_WORDS: usize = CELL_COUNT / 64;
+pub const CELL_WORDS: usize = CELL_COUNT.div_ceil(64);
 
 /// Grid cell of a whole-pixel START-ROOM-RELATIVE position. Loud rather
 /// than clamping: a position outside the grid would silently distort the
 /// whole table.
-pub fn cell_of(x: i32, y: i32) -> Result<u16> {
+pub fn cell_of(x: i32, y: i32) -> Result<u32> {
     let (gx, gy) = (x - ORIGIN, y - ORIGIN);
     if !(0..GRID).contains(&gx) || !(0..GRID).contains(&gy) {
-        return Err(anyhow!("position ({}, {}) is outside the position grid", x, y));
+        return Err(anyhow!(
+            "position ({}, {}) is outside the position grid ({}..{} in both axes)",
+            x,
+            y,
+            ORIGIN,
+            ORIGIN + GRID - 1
+        ));
     }
-    let cell = (gy * GRID + gx) as u16;
-    if cell == NO_CELL {
-        return Err(anyhow!("position ({}, {}) collides with the no-position node", x, y));
-    }
-    Ok(cell)
+    Ok((gy * GRID + gx) as u32)
 }
 
 /// Human-readable start-room-relative pixels of a cell.
-pub fn cell_xy(cell: u16) -> Option<(i32, i32)> {
-    (cell != NO_CELL)
-        .then(|| (cell as i32 % GRID + ORIGIN, cell as i32 / GRID + ORIGIN))
+pub fn cell_xy(cell: u32) -> Option<(i32, i32)> {
+    (cell != NO_CELL).then(|| (cell as i32 % GRID + ORIGIN, cell as i32 / GRID + ORIGIN))
 }
 
 /// Per-lane cell of a boundary state.
-pub fn state_cells(state: &State) -> Result<Vec<u16>> {
+pub fn state_cells(state: &State) -> Result<Vec<u32>> {
     let start = crate::game_runner::start_room();
     let rooms = room_xy_per_lane(state)
         .ok_or_else(|| anyhow!("state_cells: no readable `room` global"))?;
@@ -118,7 +126,7 @@ pub fn state_cells(state: &State) -> Result<Vec<u16>> {
 pub struct PosGraph {
     /// `srcs[offsets[d] .. offsets[d + 1]]` for destination cell `d`.
     offsets: Vec<u32>,
-    srcs: Vec<u16>,
+    srcs: Vec<u32>,
     /// The `frames` the table was recorded for: it has seen every
     /// transition taken out of frames `1..frames`. Horizon-independent but
     /// NOT frame-independent - extending the forward pass adds frames whose
@@ -140,11 +148,11 @@ impl PosGraph {
 
     /// Back to a builder, so a table can be extended over new frames.
     pub fn into_builder(self) -> PosGraphBuilder {
-        let mut by_dst: rustc_hash::FxHashMap<u16, Vec<u16>> = Default::default();
+        let mut by_dst: rustc_hash::FxHashMap<u32, Vec<u32>> = Default::default();
         for d in 0..self.offsets.len().saturating_sub(1) {
             let (lo, hi) = (self.offsets[d] as usize, self.offsets[d + 1] as usize);
             if lo != hi {
-                by_dst.insert(d as u16, self.srcs[lo..hi].to_vec());
+                by_dst.insert(d as u32, self.srcs[lo..hi].to_vec());
             }
         }
         PosGraphBuilder { by_dst }
@@ -155,7 +163,7 @@ impl PosGraph {
         self.offsets.windows(2).filter(|w| w[1] > w[0]).count()
     }
 
-    pub fn srcs_of(&self, dst: u16) -> &[u16] {
+    pub fn srcs_of(&self, dst: u32) -> &[u32] {
         if self.offsets.is_empty() {
             return &[];
         }
@@ -170,7 +178,7 @@ impl PosGraph {
     /// cell nothing was ever seen to step into is only reachable by being
     /// there already (the start row), and dropping it entirely would lose
     /// that row.
-    pub fn union_into(&self, dsts: &[u16], out: &mut [u64]) {
+    pub fn union_into(&self, dsts: &[u32], out: &mut [u64]) {
         out.fill(0);
         for &d in dsts {
             let srcs = self.srcs_of(d);
@@ -186,16 +194,19 @@ impl PosGraph {
 
     /// `<dir>/posgraph.bin`.
     ///
-    /// The magic is `C8PX`; the `C8PW` files the frame-count-less first
-    /// version wrote are refused by `load` rather than read as covering an
-    /// unknown range, because a table short of the horizon silently
-    /// under-generates candidates.
+    /// The header carries the frame coverage AND the grid the cells are
+    /// numbered in, and `load` refuses anything it does not recognise:
+    /// a table short of the horizon silently under-generates candidates,
+    /// and one numbered in a different grid is a permutation of the room.
+    /// `C8PW` (no frame count) and `C8PX` (no grid) are both refused.
     pub fn save(&self, dir: &Path) -> Result<()> {
         use std::io::Write;
         let tmp = dir.join("tmp-posgraph.bin");
         {
             let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
-            w.write_all(b"C8PX")?;
+            w.write_all(b"C8PY")?;
+            w.write_all(&GRID.to_le_bytes())?;
+            w.write_all(&ORIGIN.to_le_bytes())?;
             w.write_all(&self.frames.to_le_bytes())?;
             w.write_all(&(self.srcs.len() as u64).to_le_bytes())?;
             for v in &self.offsets {
@@ -220,17 +231,34 @@ impl PosGraph {
         let mut file = std::io::BufReader::new(std::fs::File::open(&path)?);
         let mut magic = [0u8; 4];
         file.read_exact(&mut magic)?;
-        if &magic == b"C8PW" {
+        if &magic == b"C8PW" || &magic == b"C8PX" {
             return Err(anyhow!(
-                "{}: written by the version that did not record its frame \
-                 coverage - delete it and let the sweep rebuild it",
-                path.display()
+                "{}: written by an older version, whose header does not pin \
+                 the {} - delete it and let the sweep rebuild it",
+                path.display(),
+                if &magic == b"C8PW" { "frame coverage" } else { "position grid" }
             ));
         }
-        if &magic != b"C8PX" {
+        if &magic != b"C8PY" {
             return Err(anyhow!("{}: bad magic", path.display()));
         }
         let mut buf4 = [0u8; 4];
+        file.read_exact(&mut buf4)?;
+        let grid = i32::from_le_bytes(buf4);
+        file.read_exact(&mut buf4)?;
+        let origin = i32::from_le_bytes(buf4);
+        if (grid, origin) != (GRID, ORIGIN) {
+            return Err(anyhow!(
+                "{}: cells are numbered in a {}px grid at origin {}, this \
+                 build uses {}px at {} - the numbering is a permutation of \
+                 the room, so delete it and let the sweep rebuild it",
+                path.display(),
+                grid,
+                origin,
+                GRID,
+                ORIGIN
+            ));
+        }
         file.read_exact(&mut buf4)?;
         let frames = u32::from_le_bytes(buf4);
         let mut buf8 = [0u8; 8];
@@ -240,10 +268,10 @@ impl PosGraph {
         file.read_exact(&mut buf)?;
         let offsets: Vec<u32> =
             buf.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
-        let mut buf = vec![0u8; pairs * 2];
+        let mut buf = vec![0u8; pairs * 4];
         file.read_exact(&mut buf)?;
-        let srcs: Vec<u16> =
-            buf.chunks_exact(2).map(|c| u16::from_le_bytes(c.try_into().unwrap())).collect();
+        let srcs: Vec<u32> =
+            buf.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
         if offsets[CELL_COUNT] as usize != pairs {
             return Err(anyhow!("{}: offsets end at {}, not {}", path.display(), offsets[CELL_COUNT], pairs));
         }
@@ -261,11 +289,11 @@ impl PosGraph {
 #[derive(Default)]
 pub struct PosGraphBuilder {
     /// Destination cell -> its (small) sorted set of source cells.
-    by_dst: rustc_hash::FxHashMap<u16, Vec<u16>>,
+    by_dst: rustc_hash::FxHashMap<u32, Vec<u32>>,
 }
 
 impl PosGraphBuilder {
-    pub fn record(&mut self, src: u16, dst: u16) {
+    pub fn record(&mut self, src: u32, dst: u32) {
         let set = self.by_dst.entry(dst).or_default();
         if let Err(at) = set.binary_search(&src) {
             set.insert(at, src);
@@ -292,7 +320,7 @@ impl PosGraphBuilder {
         let mut by_dst = self.by_dst;
         for d in 0..CELL_COUNT {
             offsets.push(srcs.len() as u32);
-            if let Some(set) = by_dst.remove(&(d as u16)) {
+            if let Some(set) = by_dst.remove(&(d as u32)) {
                 srcs.extend_from_slice(&set);
             }
         }
@@ -426,7 +454,7 @@ pub struct PosObserver {
     /// Per-lane `(src cell, dst cell)` pairs, pushed under a lock by
     /// whichever worker ran the chunk. Folded into the table in `flush`, off
     /// the workers' critical section.
-    pending: std::sync::Mutex<Vec<(u16, u16)>>,
+    pending: std::sync::Mutex<Vec<(u32, u32)>>,
     graph: std::sync::Mutex<PosGraphBuilder>,
 }
 
@@ -440,7 +468,7 @@ impl PosObserver {
     /// Tag every input lane with its own cell, so the outputs can be
     /// attributed back to it.
     pub fn tag(&self, state: &mut State) -> Result<()> {
-        let cells: Vec<u32> = state_cells(state)?.into_iter().map(u32::from).collect();
+        let cells = state_cells(state)?;
         crate::interpreter::deopt_collect::inject_named(state, POS_ORIGIN, &cells);
         Ok(())
     }
@@ -459,7 +487,7 @@ impl PosObserver {
                     dsts.len()
                 ));
             }
-            pairs.extend(srcs.iter().zip(&dsts).map(|(&s, &d)| (s as u16, d)));
+            pairs.extend(srcs.iter().zip(&dsts).map(|(&s, &d)| (s, d)));
         }
         pairs.sort_unstable();
         pairs.dedup();
@@ -493,13 +521,15 @@ mod tests {
 
     #[test]
     fn cells_round_trip_and_reject_out_of_grid() {
-        assert_eq!(cell_of(0, 0).unwrap(), (64 * GRID + 64) as u16);
+        assert_eq!(cell_of(0, 0).unwrap(), (64 * GRID + 64) as u32);
         assert_eq!(cell_xy(cell_of(3, -7).unwrap()).unwrap(), (3, -7));
         assert!(cell_of(-64, 0).is_ok());
         assert!(cell_of(-65, 0).is_err());
-        assert!(cell_of(0, 192).is_err());
-        // The one grid position that would alias the no-position node.
-        assert!(cell_of(191, 191).is_err());
+        // Room (0,0)'s exit lanes land here, and a 256px grid refused them.
+        assert!(cell_of(238, -5).is_ok());
+        assert!(cell_of(0, ORIGIN + GRID).is_err());
+        // No position can alias the no-position node.
+        assert!(cell_of(ORIGIN + GRID - 1, ORIGIN + GRID - 1).unwrap() < NO_CELL);
         assert_eq!(cell_xy(NO_CELL), None);
     }
 
@@ -515,7 +545,7 @@ mod tests {
         assert_eq!(g.frames(), 42);
         assert_eq!(g.srcs_of(3), &[5, 7], "sorted and deduped");
         assert_eq!(g.srcs_of(NO_CELL), &[9], "the no-position node participates");
-        assert_eq!(g.srcs_of(4), &[] as &[u16]);
+        assert_eq!(g.srcs_of(4), &[] as &[u32]);
         assert_eq!(g.pairs(), 3);
         assert_eq!(g.live_cells(), 2);
     }

@@ -2945,7 +2945,12 @@ fn main() -> Result<()> {
                     .unwrap_or_else(|| sweep_census::build_positions(&dir, frames, &table))?;
                 let exact = sweep_census::learn_src_cells(&dir, frames, &positions)?;
                 let (mut checked, mut missing) = (0u64, Vec::new());
+                // The edge-derived pairs are in the CENSUS's cell space.
                 for (dst, src) in exact.pairs() {
+                    let (dst, src) = (
+                        sweep_census::to_pos_graph_cell(dst),
+                        sweep_census::to_pos_graph_cell(src),
+                    );
                     checked += 1;
                     if !graph.srcs_of(dst).contains(&src) {
                         if missing.len() < 10 {

@@ -72,6 +72,23 @@ fn cell_of(x: i32, y: i32) -> Result<u16> {
     Ok(cell)
 }
 
+/// A census cell in `pos_graph`'s numbering.
+///
+/// The census keeps its own 256px cell space - it only ever runs on room
+/// (1,0), whose positions all fit - while `pos_graph` numbers a 512px one,
+/// because room (0,0) exits upward and its crossing lanes land 238px from
+/// its origin. The two coincided once and must now be crossed explicitly.
+pub fn to_pos_graph_cell(cell: u16) -> u32 {
+    if cell == NO_CELL {
+        return crate::rewrite::pos_graph::NO_CELL;
+    }
+    crate::rewrite::pos_graph::cell_of(
+        (cell as i32 % GRID) + ORIGIN,
+        (cell as i32 / GRID) + ORIGIN,
+    )
+    .expect("the census grid must fit inside the position graph's")
+}
+
 /// Player position cell per row id, from the saved frontier batches.
 ///
 /// The forward pass is frontier-only, so every row appears in exactly one
@@ -558,7 +575,8 @@ pub fn census(
     let mut learned_in = vec![false; cells];
     let mut exact_in = vec![0u64; GRID_WORDS];
     let mut recorded_in = vec![0u64; crate::rewrite::pos_graph::CELL_WORDS];
-    let mut b_next_u16: Vec<u16> = Vec::new();
+    let mut b_next_pg: Vec<u32> = Vec::new();
+    let pg_cell: Vec<u32> = (0..cells).map(|c| to_pos_graph_cell(c as u16)).collect();
     let mut occupied = vec![false; cells];
     let mut out = Vec::new();
     // Frame `horizon` needs no expansion at all: B(horizon) is the win
@@ -598,12 +616,12 @@ pub fn census(
             // The recorded table has a node for "no player object", which
             // the census's cell space represents as NO_CELL; B(i+1) rows
             // without a position are part of the query.
-            b_next_u16.clear();
-            b_next_u16.extend(b_next_cells.iter().map(|&c| c as u16));
+            b_next_pg.clear();
+            b_next_pg.extend(b_next_cells.iter().map(|&c| pg_cell[c as usize]));
             if (0..next_end).any(|id| positions[id] == NO_CELL && g[id] <= g_next) {
-                b_next_u16.push(crate::rewrite::pos_graph::NO_CELL);
+                b_next_pg.push(crate::rewrite::pos_graph::NO_CELL);
             }
-            pg.union_into(&b_next_u16, &mut recorded_in);
+            pg.union_into(&b_next_pg, &mut recorded_in);
         }
 
         // R(i) and B(i), and the candidates.
@@ -644,7 +662,8 @@ pub fn census(
             // The recorded table has a node for a row with no player
             // object, so those rows are candidates like any other; the
             // disc-based columns cannot place them at all.
-            if recorded.is_some() && recorded_in[c as usize / 64] & (1 << (c % 64)) != 0 {
+            let pc = pg_cell[c as usize] as usize;
+            if recorded.is_some() && recorded_in[pc / 64] & (1 << (pc % 64)) != 0 {
                 recorded_candidates += 1;
             }
             if c == NO_CELL {

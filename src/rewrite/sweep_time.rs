@@ -88,7 +88,7 @@ pub struct RowIndex {
     lane: Vec<u32>,
     /// Row id -> player position cell (`NO_CELL` when the row has no player
     /// object; that is a normal node of the position graph, not a hole).
-    cell: Vec<u16>,
+    cell: Vec<u32>,
     /// Row ids already in the next room. Absorbing: the forward pass drops
     /// them after saving, so they are never expanded here either - they are
     /// the seeds of `B(H)`.
@@ -219,7 +219,7 @@ pub fn build_index(dir: &Path, frames: u32, table: &RowTable) -> Result<RowIndex
 /// Add `cell` to the live destination set, folding its recorded predecessor
 /// cells into the candidate mask. Idempotent - both sets only grow, because
 /// `B` only grows as the sweep runs backward.
-fn mark_dst_cell(graph: &PosGraph, cell: u16, dst_seen: &mut [u64], cand_cells: &mut [u64]) {
+fn mark_dst_cell(graph: &PosGraph, cell: u32, dst_seen: &mut [u64], cand_cells: &mut [u64]) {
     if !set_bit(dst_seen, cell as usize) {
         return;
     }
@@ -552,8 +552,11 @@ mod tests {
     use super::*;
     use crate::rewrite::pos_graph::PosGraphBuilder;
 
-    fn cells(bits: &[u64]) -> Vec<u16> {
-        (0..bits.len() * 64).filter(|&c| get_bit(bits, c)).map(|c| c as u16).collect()
+    fn cells(bits: &[u64]) -> Vec<u32> {
+        (0..crate::rewrite::pos_graph::CELL_COUNT)
+            .filter(|&c| get_bit(bits, c))
+            .map(|c| c as u32)
+            .collect()
     }
 
     /// The candidate mask is the union of the recorded predecessor cells of
