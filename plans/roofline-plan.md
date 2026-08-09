@@ -119,132 +119,73 @@ from an instruction count. Until that is done, quote the measured
 speedups, not the ratio.
 
 
-# BATCH INVARIANCE IS VIOLATED - measured 2026-08-09, unresolved
+# Batch invariance: HOLDS on room (1,0). (And a retracted claim.)
 
-Philippe's guiding principle, which the whole vectorised design is
-supposed to rest on:
+Philippe's guiding principle, which the whole vectorised design rests on:
 
 > Running a set of lanes as one batch must give the same result as
 > partitioning it into subsets, running each, and unioning the outputs.
 > Threading, batch sizes and chunk caps are scheduling decisions and must
 > not be visible in the answer.
 
-`simdcheck.sh` mechanises it: run N frames under configurations that
-differ ONLY in how lanes were grouped, and compare the SET of canonical
-row keys reached. Ids are assignment-order and may differ; the set may
-not. (`parcheck.sh` covers the stronger byte-identity claim for threads
-alone at a FIXED grouping, and still passes.)
+`simdcheck.sh` mechanises it: run N frames under configurations differing
+only in how lanes were grouped, and compare the SET of canonical row keys
+reached. Row IDS are assignment order and legitimately differ; the set may
+not.
 
-**Room (1,0), 42 frames - the room with no fruit, which I expected to
-pass:**
+**Result, room (1,0) - the invariant HOLDS:**
 
-    t16 cap 8000 fruit 8000    1208578 rows   digest 2194b24e5f749316
-    t1  cap 8000 fruit 8000    1208578 rows   digest 2194b24e5f749316
-    t16 cap 1000 fruit 1000    1208578 rows   digest 4a36e961159a1b3d
-    t4  cap   97 fruit   97    1208578 rows   digest b354b05391aa9e85
+    f29:  t=1 cap 8000 | t=1 cap 200 | t=16 cap 8000 | t=16 cap 200
+          all 7284 rows, digest 4609008652eeb72b
 
-Threads alone are invariant. CHUNK SIZE IS NOT. And the shape of the
-difference is the informative part:
+    f42:  caps 8000 / 1000 / 97 across threads 1 / 4 / 16
+          all 1208578 rows, digest 2ceb5fae06cf9f31
 
-    |A| = |B| = 1,208,578    shared 343,514    only-A 865,064    only-B 865,064
+## RETRACTION, and the lesson
 
-**Identical cardinality, 28% overlap.** Two searches that genuinely
-explored different state sets would almost certainly differ in size. Equal
-counts with partial overlap is the signature of a KEYING difference - the
-same logical rows receiving different keys - not of a different search.
+An earlier version of this file reported the opposite - "batch invariance
+is violated by chunk size, even on room (1,0)" - with digests, overlap
+counts, a frame-29 bisection and six ruled-out causes. **All of it was an
+artifact of the checking tool.** `visited.bin` is COLUMNAR (a count, then
+every key's low half, then every key's high half); my reader parsed it as
+interleaved pairs, so it was pairing `lo[2i]` with `lo[2i+1]` and
+digesting a function of the ROW-ID ORDER. Id order depends on discovery
+order, which depends on chunking - so the tool reported a difference
+exactly when chunking changed, which is indistinguishable from the real
+thing.
 
-## Why this matters more than the fruit story
+The bisection was not wasted: it is what made the data small enough to
+cross-check. The error was found by validating the reader against a
+known-good source - an independent in-interpreter dump of the same keys -
+which showed ZERO overlap where there should have been total overlap.
 
-I attributed the room (0,0) sweep divergence at f067 to the fruit chunk
-cap changing mid-campaign, and pinned the knobs (c8dfb2f). That pin is
-right regardless, but this measurement says the diagnosis was probably
-INCOMPLETE: room (1,0) has no fruit and no `UnknownBool` collapse to
-speak of, and its keys still move with chunk size. So there is a second,
-more basic source of chunk dependence in the row key itself.
+Two things to take from it:
 
-If the row key is not chunk-invariant then:
+* **A checker that can only say "differs" needs its own validation before
+  its output is believed.** Compare it against a source of truth, or a
+  deliberately perturbed run, BEFORE trusting an alarming result. I
+  validated mine only after it had alarmed me, and after I had committed
+  the conclusion.
+* **The broken check passed exactly where it was blind.** Threads at a
+  fixed cap produce identical id order, so even the broken reader agreed -
+  which is what gave me confidence in it. A check that agrees on the easy
+  case and disagrees on the interesting one looks precisely like a
+  discovery.
 
-* the frontier dedup misses rows it should have matched. Sound - extra
-  work, not wrong answers - but it inflates every search.
-* the SWEEP cannot reproduce the forward pass's keys unless it chunks
-  identically, which is exactly the f067 error, and explains why it
-  appeared on a configuration mismatch rather than on fruit specifically.
+`tools/rowset.py` now documents the layout. The validation against the
+in-interpreter dump is the thing to repeat if it is ever touched.
 
-## Localised: room (1,0), first divergence at FRAME 29
+## Still open: room (0,0)
 
-Bisecting the frame count (chunk cap 8000 vs 200, otherwise identical):
+Room (1,0) has NO mixed UnknownBool collapses (the counter reads zero) and
+satisfies the invariant. Room (0,0) is 70.1% mixed. If the collapse is the
+only cross-lane operation left, room (0,0) should violate the invariant
+and room (1,0) should not - which would make Philippe's UnknownBool
+diagnosis the SOLE known source of batch dependence, and #105 the fix that
+restores it. Settle it with:
 
-    f21..f28   identical, every frame          f28: 2888 rows, 0 differing
-    f29        DIFFERS                         7284 rows, 6466 shared, 818 each side
+    ./simdcheck.sh 55 0,0 rewrites-room00.jsonl
 
-Frames 1-28 agree to the byte. Frame 29 discovers 4,396 new rows in BOTH
-configurations - the same number - and 818 of them (18.6%) key differently.
-
-## What it is NOT (all measured, do not re-check)
-
-* **Not the row key.** A unit test (`sweep::batch_invariance_tests`) builds
-  a state whose halves are each uniform in a column where the whole is not
-  - exactly what a chunk boundary creates - and the per-lane keys are
-  unchanged. It passes.
-* **Not the shape hash.** Dumping every shape hash seen at the boundary:
-  2 distinct shapes under both caps, and the SETS are equal. So the
-  per-state term of the key is stable; the difference is in the per-row
-  contributions, i.e. in the column VALUES.
-* **Not the rem abstraction.** `make_state_abstract_rem` widens strictly
-  per lane, and at level 0 (`Bits(0)`) it maps every rem to one constant
-  interval. `split_rem_straddles` returns early at 0 bits.
-* **Not deopt.** Frame 29 reports no deopt events under either cap, and
-  both produce 4,396 new lanes.
-* **Not the mixed-UnknownBool collapse.** The collapse counter fires ZERO
-  times on room (1,0) through f29. (It fires constantly on room (0,0) -
-  70.1% mixed - but that is a different room and a different mechanism.)
-* **NOT THE RECIPE.** `bench --baseline`, the unrewritten program, shows
-  the same violation at f29 (digests 3cfbe238 vs 5027393f). So this is in
-  the core abstract interpreter, not in any rewrite's per-state premise.
-
-That last one is the important one: it rules out the hypothesis that some
-rewrite with a state-wide guard (`assume_eq`, `guard_region`, `mask_loop`
-span asserts) is responsible, and puts the cross-lane dependence in the
-interpreter or the merge.
-
-## Where to look next
-
-Equal lane counts, equal shapes, differing column values means some lane's
-VALUE depends on which lanes shared its state. Remaining suspects, in the
-core interpreter: a branch on a whole-value `UnknownBool` (which sends
-every lane down both edges regardless of whether that lane's condition was
-ambiguous); `__split_by_flr`'s interval refinement; and the boundary
-merge's choice of representative.
-
-The next step is a tool, not a guess: dump frame 29's boundary rows as
-VALUES rather than hashes under both caps and diff them. 818 rows is small
-enough to read. Everything above was obtained by elimination; this would
-be obtained by observation.
-
-## Where to look first
-
-The key is `row_key_hashes(shape_hash, columns, ..)`. Its per-row part was
-made order-independent and is representation-blind by construction. The
-per-STATE part is the shape hash, and a shape difference moves every row
-in that state at once - which fits "same count, different keys" exactly.
-`normalize_value_for_shape` is blind to Scalar-vs-Vector (both map to
-`VectorizableNumber` etc.), so that is not it; the candidates left are
-
-* `Value::Number` vs `Value::NumberInterval` being DIFFERENT shapes, with
-  the rem widening producing one or the other depending on the lanes
-  present;
-* the column ORDINALS shifting, since `row_key_hashes` mixes a column's
-  position into its contribution and the column list comes from the heap;
-* heap ids in `ValueShape::Pointer` after a gc whose reachable set depends
-  on values.
-
-The decisive experiment is one state, run whole versus split in two, with
-the output row keys compared directly - a unit test, not a campaign. Do
-that before changing anything.
-
-## Consequence for the plan
-
-This outranks everything in "Ranked next steps" above. It is also more
-evidence for #105: partitioning on straddling lanes makes a lane's fate
-depend only on its own comparison, which is one of the two things the
-invariant needs. The other is a chunk-invariant key.
+The sweep divergence at room (0,0) f067 was a real error raised by the
+program, not by this tooling, and the chunking pin in `ladder.sh` stands
+regardless.

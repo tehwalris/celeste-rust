@@ -1383,10 +1383,41 @@ pub fn visited_row_keys(
     // instead of only the candidates, and the candidates are ~2% of them.
     // The global probe is the cheap filter here precisely because it
     // rejects so much.
+    let dump_rows = std::env::var_os("CELESTE_DUMP_ROWS").is_some();
     let mut seen: rustc_hash::FxHashSet<(u64, u64)> = rustc_hash::FxHashSet::default();
     let mut candidates: Vec<(u32, (u64, u64))> = Vec::new();
     for (i, key) in keys.into_iter().enumerate() {
         if visited.id_of(key).is_none() && seen.insert(key) {
+            if dump_rows {
+                use std::fmt::Write as _;
+                let mut line = format!("{:016x}{:016x}", key.0, key.1);
+                for c in &refs {
+                    match c {
+                        Column::Numbers(p) => {
+                            let v = match &p[0] {
+                                crate::interpreter::virtual_merge::Piece::Slice(sl) => sl[i],
+                                crate::interpreter::virtual_merge::Piece::Scalar(v, _) => *v,
+                            };
+                            let _ = write!(line, " n{}", v.as_raw_u32());
+                        }
+                        Column::Bools(p) => {
+                            let v = match &p[0] {
+                                crate::interpreter::virtual_merge::Piece::Slice(sl) => sl[i],
+                                crate::interpreter::virtual_merge::Piece::Scalar(v, _) => *v,
+                            };
+                            let _ = write!(line, " b{}", v as u8);
+                        }
+                        Column::Intervals(p) => {
+                            let v = match &p[0] {
+                                crate::interpreter::virtual_merge::Piece::Slice(sl) => sl[i],
+                                crate::interpreter::virtual_merge::Piece::Scalar(v, _) => *v,
+                            };
+                            let _ = write!(line, " i{},{}", v.low.as_raw_u32(), v.high.as_raw_u32());
+                        }
+                    }
+                }
+                eprintln!("ROW {}", line);
+            }
             candidates.push((i as u32, key));
         }
     }
