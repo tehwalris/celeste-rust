@@ -119,11 +119,35 @@ pub struct PosGraph {
     /// `srcs[offsets[d] .. offsets[d + 1]]` for destination cell `d`.
     offsets: Vec<u32>,
     srcs: Vec<u16>,
+    /// The `frames` the table was recorded for: it has seen every
+    /// transition taken out of frames `1..frames`. Horizon-independent but
+    /// NOT frame-independent - extending the forward pass adds frames whose
+    /// transitions this has never seen, and a missing pair means the sweep's
+    /// filter never generates that candidate and nothing notices. Stored so
+    /// the sweep can check it rather than assume.
+    frames: u32,
 }
 
 impl PosGraph {
     pub fn pairs(&self) -> usize {
         self.srcs.len()
+    }
+
+    /// The frame count this table covers (transitions out of `1..frames`).
+    pub fn frames(&self) -> u32 {
+        self.frames
+    }
+
+    /// Back to a builder, so a table can be extended over new frames.
+    pub fn into_builder(self) -> PosGraphBuilder {
+        let mut by_dst: rustc_hash::FxHashMap<u16, Vec<u16>> = Default::default();
+        for d in 0..self.offsets.len().saturating_sub(1) {
+            let (lo, hi) = (self.offsets[d] as usize, self.offsets[d + 1] as usize);
+            if lo != hi {
+                by_dst.insert(d as u16, self.srcs[lo..hi].to_vec());
+            }
+        }
+        PosGraphBuilder { by_dst }
     }
 
     /// Destination cells with at least one recorded predecessor.
@@ -161,12 +185,18 @@ impl PosGraph {
     }
 
     /// `<dir>/posgraph.bin`.
+    ///
+    /// The magic is `C8PX`; the `C8PW` files the frame-count-less first
+    /// version wrote are refused by `load` rather than read as covering an
+    /// unknown range, because a table short of the horizon silently
+    /// under-generates candidates.
     pub fn save(&self, dir: &Path) -> Result<()> {
         use std::io::Write;
         let tmp = dir.join("tmp-posgraph.bin");
         {
             let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
-            w.write_all(b"C8PW")?;
+            w.write_all(b"C8PX")?;
+            w.write_all(&self.frames.to_le_bytes())?;
             w.write_all(&(self.srcs.len() as u64).to_le_bytes())?;
             for v in &self.offsets {
                 w.write_all(&v.to_le_bytes())?;
@@ -190,9 +220,19 @@ impl PosGraph {
         let mut file = std::io::BufReader::new(std::fs::File::open(&path)?);
         let mut magic = [0u8; 4];
         file.read_exact(&mut magic)?;
-        if &magic != b"C8PW" {
+        if &magic == b"C8PW" {
+            return Err(anyhow!(
+                "{}: written by the version that did not record its frame \
+                 coverage - delete it and let the sweep rebuild it",
+                path.display()
+            ));
+        }
+        if &magic != b"C8PX" {
             return Err(anyhow!("{}: bad magic", path.display()));
         }
+        let mut buf4 = [0u8; 4];
+        file.read_exact(&mut buf4)?;
+        let frames = u32::from_le_bytes(buf4);
         let mut buf8 = [0u8; 8];
         file.read_exact(&mut buf8)?;
         let pairs = u64::from_le_bytes(buf8) as usize;
@@ -207,7 +247,7 @@ impl PosGraph {
         if offsets[CELL_COUNT] as usize != pairs {
             return Err(anyhow!("{}: offsets end at {}, not {}", path.display(), offsets[CELL_COUNT], pairs));
         }
-        Ok(Some(PosGraph { offsets, srcs }))
+        Ok(Some(PosGraph { offsets, srcs, frames }))
     }
 }
 
@@ -244,7 +284,9 @@ impl PosGraphBuilder {
         self.by_dst.values().map(|v| v.len()).sum()
     }
 
-    pub fn build(self) -> PosGraph {
+    /// `frames` records what range the table has seen (see
+    /// `PosGraph::frames`); it is the caller's claim, not a measurement.
+    pub fn build(self, frames: u32) -> PosGraph {
         let mut offsets = Vec::with_capacity(CELL_COUNT + 1);
         let mut srcs = Vec::with_capacity(self.pairs());
         let mut by_dst = self.by_dst;
@@ -255,7 +297,7 @@ impl PosGraphBuilder {
             }
         }
         offsets.push(srcs.len() as u32);
-        PosGraph { offsets, srcs }
+        PosGraph { offsets, srcs, frames }
     }
 }
 
@@ -268,8 +310,12 @@ impl PosGraphBuilder {
 /// has already run (and, for room (0,0), whose edge-based sweep cannot
 /// run at all). A forward pass that enables `record_pos_graph` gets the
 /// same table for free; nothing here needs the edges.
+///
+/// `from` is the first frame to replay, so a table that already covers
+/// `1..from` can be extended without redoing it.
 pub fn build_from_replay(
     dir: &Path,
+    from: u32,
     frames: u32,
     engine: &mut crate::rewrite::verify::AbstractRun,
 ) -> Result<PosGraph> {
@@ -280,7 +326,7 @@ pub fn build_from_replay(
     engine.disable_frontier();
     engine.record_pos_graph();
     let win_x = crate::game_runner::win_room_x();
-    for f in 1..frames {
+    for f in from.max(1)..frames {
         let t = std::time::Instant::now();
         let states = checkpoint::load_frame_states(dir, f)
             .map_err(|e| anyhow!("loading frame batch f{:03}: {:#}", f, e))?;
@@ -346,7 +392,7 @@ pub fn build_from_replay(
         }
     }
     engine
-        .take_pos_graph()
+        .take_pos_graph(frames)
         .ok_or_else(|| anyhow!("recording was enabled but produced no table"))
 }
 
@@ -435,9 +481,9 @@ impl PosObserver {
         self.graph.lock().expect("pos observer").pairs()
     }
 
-    pub fn build(self) -> PosGraph {
+    pub fn build(self, frames: u32) -> PosGraph {
         self.flush();
-        self.graph.into_inner().expect("pos observer").build()
+        self.graph.into_inner().expect("pos observer").build(frames)
     }
 }
 
@@ -465,7 +511,8 @@ mod tests {
         b.record(7, 3); // duplicate
         b.record(9, NO_CELL);
         assert_eq!(b.pairs(), 3);
-        let g = b.build();
+        let g = b.build(42);
+        assert_eq!(g.frames(), 42);
         assert_eq!(g.srcs_of(3), &[5, 7], "sorted and deduped");
         assert_eq!(g.srcs_of(NO_CELL), &[9], "the no-position node participates");
         assert_eq!(g.srcs_of(4), &[] as &[u16]);
@@ -477,7 +524,7 @@ mod tests {
     fn union_keeps_an_unrecorded_destination_as_itself() {
         let mut b = PosGraphBuilder::default();
         b.record(7, 3);
-        let g = b.build();
+        let g = b.build(1);
         let mut out = vec![0u64; CELL_WORDS];
         let is_set = |out: &[u64], c: u16| out[c as usize / 64] & (1 << (c % 64)) != 0;
 
@@ -501,8 +548,44 @@ mod tests {
         b.record(2, 10);
         b.record(3, 11);
         a.merge(b);
-        let g = a.build();
+        let g = a.build(7);
         assert_eq!(g.srcs_of(10), &[1, 2]);
         assert_eq!(g.srcs_of(11), &[3]);
+    }
+
+    /// A table that covers fewer frames than the sweep needs would silently
+    /// under-generate candidates, so the coverage travels with the file -
+    /// and the format that had no room for it is refused, not guessed at.
+    #[test]
+    fn a_saved_table_carries_its_frame_coverage_and_extends() {
+        let dir = std::env::temp_dir().join(format!("posgraph-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut b = PosGraphBuilder::default();
+        b.record(1, 10);
+        b.build(50).save(&dir).unwrap();
+        let loaded = PosGraph::load(&dir).unwrap().expect("just saved");
+        assert_eq!(loaded.frames(), 50);
+        assert_eq!(loaded.srcs_of(10), &[1]);
+
+        // Extension: the old table back to a builder, plus the new frames.
+        let mut extended = loaded.into_builder();
+        extended.record(2, 10);
+        let extended = extended.build(60);
+        assert_eq!(extended.srcs_of(10), &[1, 2]);
+        assert_eq!(extended.frames(), 60);
+
+        // The first format wrote no frame count; reading it as one would
+        // invent coverage the table does not have.
+        let mut raw = std::fs::read(dir.join("posgraph.bin")).unwrap();
+        raw[..4].copy_from_slice(b"C8PW");
+        std::fs::write(dir.join("posgraph.bin"), &raw).unwrap();
+        let err = match PosGraph::load(&dir) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("the frame-count-less format must be refused"),
+        };
+        assert!(err.contains("frame coverage"), "{}", err);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

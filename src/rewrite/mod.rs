@@ -38,5 +38,6 @@ pub mod slots;
 pub mod state_mapping;
 pub mod sweep;
 pub mod sweep_census;
+pub mod sweep_time;
 pub mod validate;
 pub mod verify;

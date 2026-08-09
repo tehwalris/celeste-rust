@@ -320,6 +320,12 @@ enum Command {
         /// are dropped (sound) instead of being a replay-divergence error.
         #[arg(long)]
         banded: bool,
+        /// Use the TIME-EXPANDED sweep (`rewrite::sweep_time`): no edge
+        /// graph at all, candidates filtered by the position graph. The
+        /// edge sweep OOMs on room (0,0), where one frame produces 645M
+        /// edges; this is what replaces it.
+        #[arg(long)]
+        time_expanded: bool,
     },
     /// Build the position-transition table (`rewrite::pos_graph`) by
     /// replaying the saved frontier batches. Writes `posgraph.bin`; touches
@@ -2848,9 +2854,9 @@ fn main() -> Result<()> {
                 byte_seqs.log10()
             );
         }
-        Command::Sweep { checkpoint_dir, frames, horizon, banded } => {
+        Command::Sweep { checkpoint_dir, frames, horizon, banded, time_expanded } => {
             use celeste_rust::rewrite::state_mapping::StateMapping;
-            use celeste_rust::rewrite::sweep;
+            use celeste_rust::rewrite::{sweep, sweep_time};
             let horizon = horizon.unwrap_or(frames);
             let dir = std::path::PathBuf::from(checkpoint_dir);
             let recipe_text = std::fs::read_to_string(&cli.recipe).unwrap_or_default();
@@ -2859,17 +2865,32 @@ fn main() -> Result<()> {
             let plain = Program::compile_executable_from_disk()?;
             let (program, _) = build(&recipe)?;
             let mapping = StateMapping::from_recipe(&recipe);
-            let result =
-                sweep::backward_sweep(&dir, frames, &fingerprint, &program, &plain, mapping, banded)?;
-            sweep::save_g(&dir, &result.g)?;
-            let reachable = result.g.iter().filter(|&&v| v != sweep::G_UNREACHABLE).count();
+            // Both sweeps produce the same `g`, the time-expanded one only
+            // where `e + g <= horizon` (it never looks past the horizon).
+            let (g, optimal_frame, work) = if time_expanded {
+                let r = sweep_time::backward_sweep_time(
+                    &dir, frames, horizon, &fingerprint, &program, &plain, mapping, banded,
+                )?;
+                let work = vec![
+                    ("expansions", r.expansions.to_string()),
+                    ("out_of_table", r.out_of_table.to_string()),
+                ];
+                (r.g, r.optimal_frame, work)
+            } else {
+                let r = sweep::backward_sweep(
+                    &dir, frames, &fingerprint, &program, &plain, mapping, banded,
+                )?;
+                (r.g, r.optimal_frame, vec![("edges", r.edge_count.to_string())])
+            };
+            sweep::save_g(&dir, &g)?;
+            let reachable = g.iter().filter(|&&v| v != sweep::G_UNREACHABLE).count();
             println!(
-                "sweep: {} of {} rows can reach the exit; {} edges",
+                "sweep: {} of {} rows can reach the exit; {}",
                 reachable,
-                result.g.len(),
-                result.edge_count
+                g.len(),
+                work.iter().map(|(k, v)| format!("{} {}", v, k)).collect::<Vec<_>>().join(", ")
             );
-            match result.optimal_frame {
+            match optimal_frame {
                 Some(win) => println!(
                     "abstract optimal win frame from e+g: {} (forward first-win must match)",
                     win
@@ -2879,21 +2900,18 @@ fn main() -> Result<()> {
             // Band sizes for the horizon: the k=1 forward pass's budget.
             let ck = celeste_rust::rewrite::checkpoint::load(&dir, frames, &fingerprint)?;
             println!("band sizes for horizon {} (frame, rows):", horizon);
-            for (f, size) in sweep::band_sizes(&ck.visited, &result.g, horizon) {
+            for (f, size) in sweep::band_sizes(&ck.visited, &g, horizon) {
                 if size > 0 || f % 10 == 0 {
                     println!("  f{:03}: {}", f, size);
                 }
             }
-            celeste_rust::metrics::dump(
-                "sweep",
-                Some(dir.as_path()),
-                &[
-                    ("frames", frames.to_string()),
-                    ("horizon", horizon.to_string()),
-                    ("edges", result.edge_count.to_string()),
-                    ("rows", result.g.len().to_string()),
-                ],
-            );
+            let mut fields = vec![
+                ("frames", frames.to_string()),
+                ("horizon", horizon.to_string()),
+                ("rows", g.len().to_string()),
+            ];
+            fields.extend(work);
+            celeste_rust::metrics::dump("sweep", Some(dir.as_path()), &fields);
         }
         Command::PosGraph { checkpoint_dir, frames, check_against_edges } => {
             use celeste_rust::rewrite::pos_graph;
@@ -2906,7 +2924,7 @@ fn main() -> Result<()> {
                 &program, &plain, mapping, false,
             )?;
             let t = std::time::Instant::now();
-            let graph = pos_graph::build_from_replay(&dir, frames, &mut engine)?;
+            let graph = pos_graph::build_from_replay(&dir, 1, frames, &mut engine)?;
             println!(
                 "posgraph: {} pairs over {} destination cells, built in {:.1}s",
                 graph.pairs(),
