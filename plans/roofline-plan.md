@@ -117,3 +117,83 @@ lane-instruction" is inflated by the mid-frame lane multiplier, and bound
 [B] wants recomputing from measured bytes (`CELESTE_CENSUS`) rather than
 from an instruction count. Until that is done, quote the measured
 speedups, not the ratio.
+
+
+# BATCH INVARIANCE IS VIOLATED - measured 2026-08-09, unresolved
+
+Philippe's guiding principle, which the whole vectorised design is
+supposed to rest on:
+
+> Running a set of lanes as one batch must give the same result as
+> partitioning it into subsets, running each, and unioning the outputs.
+> Threading, batch sizes and chunk caps are scheduling decisions and must
+> not be visible in the answer.
+
+`simdcheck.sh` mechanises it: run N frames under configurations that
+differ ONLY in how lanes were grouped, and compare the SET of canonical
+row keys reached. Ids are assignment-order and may differ; the set may
+not. (`parcheck.sh` covers the stronger byte-identity claim for threads
+alone at a FIXED grouping, and still passes.)
+
+**Room (1,0), 42 frames - the room with no fruit, which I expected to
+pass:**
+
+    t16 cap 8000 fruit 8000    1208578 rows   digest 2194b24e5f749316
+    t1  cap 8000 fruit 8000    1208578 rows   digest 2194b24e5f749316
+    t16 cap 1000 fruit 1000    1208578 rows   digest 4a36e961159a1b3d
+    t4  cap   97 fruit   97    1208578 rows   digest b354b05391aa9e85
+
+Threads alone are invariant. CHUNK SIZE IS NOT. And the shape of the
+difference is the informative part:
+
+    |A| = |B| = 1,208,578    shared 343,514    only-A 865,064    only-B 865,064
+
+**Identical cardinality, 28% overlap.** Two searches that genuinely
+explored different state sets would almost certainly differ in size. Equal
+counts with partial overlap is the signature of a KEYING difference - the
+same logical rows receiving different keys - not of a different search.
+
+## Why this matters more than the fruit story
+
+I attributed the room (0,0) sweep divergence at f067 to the fruit chunk
+cap changing mid-campaign, and pinned the knobs (c8dfb2f). That pin is
+right regardless, but this measurement says the diagnosis was probably
+INCOMPLETE: room (1,0) has no fruit and no `UnknownBool` collapse to
+speak of, and its keys still move with chunk size. So there is a second,
+more basic source of chunk dependence in the row key itself.
+
+If the row key is not chunk-invariant then:
+
+* the frontier dedup misses rows it should have matched. Sound - extra
+  work, not wrong answers - but it inflates every search.
+* the SWEEP cannot reproduce the forward pass's keys unless it chunks
+  identically, which is exactly the f067 error, and explains why it
+  appeared on a configuration mismatch rather than on fruit specifically.
+
+## Where to look first
+
+The key is `row_key_hashes(shape_hash, columns, ..)`. Its per-row part was
+made order-independent and is representation-blind by construction. The
+per-STATE part is the shape hash, and a shape difference moves every row
+in that state at once - which fits "same count, different keys" exactly.
+`normalize_value_for_shape` is blind to Scalar-vs-Vector (both map to
+`VectorizableNumber` etc.), so that is not it; the candidates left are
+
+* `Value::Number` vs `Value::NumberInterval` being DIFFERENT shapes, with
+  the rem widening producing one or the other depending on the lanes
+  present;
+* the column ORDINALS shifting, since `row_key_hashes` mixes a column's
+  position into its contribution and the column list comes from the heap;
+* heap ids in `ValueShape::Pointer` after a gc whose reachable set depends
+  on values.
+
+The decisive experiment is one state, run whole versus split in two, with
+the output row keys compared directly - a unit test, not a campaign. Do
+that before changing anything.
+
+## Consequence for the plan
+
+This outranks everything in "Ranked next steps" above. It is also more
+evidence for #105: partitioning on straddling lanes makes a lane's fate
+depend only on its own comparison, which is one of the two things the
+invariant needs. The other is a chunk-invariant key.
