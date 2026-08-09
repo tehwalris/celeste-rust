@@ -277,3 +277,31 @@ known fix for room (0,0)'s batch-dependence (whether a collapse fires
 depends on whether ANY lane in the state straddles, so it changes with the
 chunk size; room (1,0) never collapses, which is why it certifies as
 chunk-invariant and room (0,0) does not).
+
+### One cheaper alternative, already disproved
+
+Before building the split, the obvious cheaper move is to propagate the
+tri-state THROUGH `select` rather than collapsing: in
+
+    %125 = select %93 ? %122 : %93
+
+the lanes where `%93` is false give `%125 = false` definitely, whatever
+`%122` is, so this could yield a `MaybeBool` that the partition then
+handles - no state split at all.
+
+It does not apply here. If `%93` had any false lane, `select` would have
+failed at `%125` with "cannot combine UnknownBool and Bool per lane", and
+the observed deopt is at `%157`. So `%93` is uniformly TRUE in exactly
+these states, `select` returns the `if_true` arm verbatim, and `%125`
+inherits `%122`'s `UnknownBool` unchanged. There are no definite lanes to
+salvage; the information is genuinely absent.
+
+That leaves the state split as the only lever, and it is worth being
+clear-eyed about its cost: `obj.collide` is a four-sided box test, so a
+chain of all-unknown conditions can split 2^4. The reason it is still
+expected to win is that the PLAIN PROGRAM ALREADY PAYS EXACTLY THAT - a
+branch on `UnknownBool` sends the whole state down both edges - and pays
+`to_canonical`/`from_canonical` and an unoptimized run of the WHOLE frame
+on top. The split's win is confined to keeping the rest of the frame on
+the fast path, which is why its size depends entirely on what share of
+frame time the deopt is, and why that measurement gates the work.
