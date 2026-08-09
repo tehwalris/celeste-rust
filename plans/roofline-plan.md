@@ -184,7 +184,13 @@ and room (1,0) should not - which would make Philippe's UnknownBool
 diagnosis the SOLE known source of batch dependence, and #105 the fix that
 restores it. Settle it with:
 
-    ./simdcheck.sh 55 0,0 rewrites-room00.jsonl
+    ./simdcheck.sh 66 0,0 rewrites-room00.jsonl
+
+Use 66, not less: the collapse counter reads ZERO on room (0,0) at f40,
+f48, f52, f56, f60 and f64, and 14,603 constructions by f68. The fruit
+only becomes reachable around f65, so anything cheaper does not exercise
+the mechanism at all. That makes the test ~8 minutes and ~15 GB per
+configuration - schedule it when no campaign is running.
 
 The sweep divergence at room (0,0) f067 was a real error raised by the
 program, not by this tooling, and the chunking pin in `ladder.sh` stands
