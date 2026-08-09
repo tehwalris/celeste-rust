@@ -507,3 +507,22 @@ the set had grown somewhere, i.e. a bug. Equality is the best available
 outcome and is what happened.
 
 That frame also ran 2.8x faster on 2.4x less memory.
+
+### Measurement hygiene for the f94 comparison
+
+The f94 run shared the machine with the background agent's time-expanded
+sweep (~3.5 cores, 19 GB) and with simdcheck (~1.7 cores). It asked for
+16 threads and got about 9.4 cores' worth. Whether the l0-h94 baseline
+ran alone is not recorded, so the TIME ratios from this pair are soft and
+most likely understate the gain.
+
+What is NOT affected by contention, and is therefore what the argument
+rests on:
+
+* lane counts per frame (the -13% at f79 and its monotone growth),
+* peak RSS,
+* deopt state/lane counts (zero),
+* the first-win frame and the winning lane counts (identical: f80/1040,
+  f81/4268, f82/3472, f83/5030).
+
+Quote those. If a clean wall-clock number is wanted, re-run f94 alone.
