@@ -312,13 +312,19 @@ pub fn prepare_pos_graph(
     drop(engine);
     // The replay's transient is the biggest allocation this process ever
     // makes - room (0,0)'s peaked around 76 GB - and dropping it does not
-    // return it to the OS: glibc keeps it in its per-thread arenas, where it
-    // is invisible to us and fully counted by the cgroup. Measured on room
+    // return it to the OS: glibc keeps it in its arenas, where it is
+    // invisible to us and fully counted by the cgroup. MEASURED on room
     // (0,0): with the graph built in this process the RSS after the re-index
     // was 94 GB and the backward loop was OOM-killed at the 100 GB cap; with
-    // the same graph loaded from disk instead it was 41.6 GB and the sweep
-    // finished. So hand the arenas back before the re-index claims its own
-    // tens of gigabytes.
+    // the same graph loaded from `posgraph.bin` instead it was 41.6 GB and
+    // the sweep finished.
+    //
+    // So ask for the arenas back. How much this actually recovers is NOT
+    // measured: room (1,0)'s transient is small enough that its post-index
+    // RSS is the same either way (22.9 GB before this call existed, 24.7 GB
+    // with it), and reproducing room (0,0)'s is 1.7 h of replay. The remedy
+    // that IS measured is the one above - build the table with `rewrite
+    // pos-graph`, in its own process, and let the sweep load it.
     trim_allocator();
     let graph = match existing {
         Some(old) => {

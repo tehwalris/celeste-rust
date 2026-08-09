@@ -43,11 +43,17 @@ and not because the sweep needs 100 GB:
 | identical graph loaded from `posgraph.bin` | **41.6 GB** (finished) |
 
 Same index, same data, 52 GB apart. The replay's transient peaks around
-76 GB, and freeing it does not return it: glibc keeps it in its per-thread
-arenas, invisible to us and fully counted by the cgroup. `sweep_time` now
-calls `malloc_trim` between the two phases, and `rewrite pos-graph` exists
-so the 1.7 h can be banked on disk and kept out of the sweep's process
-entirely.
+76 GB, and freeing it does not return it: glibc keeps it in its arenas,
+invisible to us and fully counted by the cgroup.
+
+The remedy that is measured is the second row: build the table with
+`rewrite pos-graph`, in its own process, and let the sweep load it - which
+banks the 1.7 h on disk anyway. `sweep_time` also calls `malloc_trim`
+between its two phases, but how much that recovers is NOT measured, and
+should not be quoted: room (1,0)'s transient is too small to show it (its
+post-index RSS is 22.9 GB without the call and 24.7 GB with it, the
+difference being contention, not the call) and reproducing room (0,0)'s
+costs 1.7 h.
 
 # The time-expanded sweep is BUILT, and it gates to the edge (2026-08-09)
 
