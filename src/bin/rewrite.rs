@@ -321,6 +321,34 @@ enum Command {
         #[arg(long)]
         banded: bool,
     },
+    /// Measure whether a POSITIONAL predecessor filter could replace the
+    /// sweep's edge graph (see `rewrite::sweep_census`). Read-only: needs a
+    /// finished forward pass with `frames/`, and its `g.bin`; writes only
+    /// `pos.bin` (the per-row player position, cached).
+    SweepCensus {
+        #[arg(long)]
+        checkpoint_dir: String,
+        /// The forward pass's last frame (its checkpoint must exist).
+        #[arg(long)]
+        frames: u32,
+        /// Horizons H for the band (defaults to --frames). A horizon above
+        /// the certified optimum is the interesting case: at the optimum
+        /// itself every banded row lies on an optimal path, so the band is
+        /// as thin as it can ever be.
+        #[arg(long = "horizon", value_delimiter = ',')]
+        horizons: Vec<u32>,
+        /// Candidate radii in pixels.
+        #[arg(long, value_delimiter = ',', default_value = "4,8,16")]
+        radii: Vec<i32>,
+        /// Also measure the old solver's per-cell learned radius, derived
+        /// from the sweep's edge chunks. Slow the first time (it streams
+        /// every edge); cached in `radii.bin`.
+        #[arg(long)]
+        learn_radii: bool,
+        /// Print every Nth frame's row (the totals always cover all frames).
+        #[arg(long, default_value_t = 10)]
+        every: u32,
+    },
 }
 
 fn peak_rss_kb() -> u64 {
@@ -2850,6 +2878,122 @@ fn main() -> Result<()> {
                     ("rows", result.g.len().to_string()),
                 ],
             );
+        }
+        Command::SweepCensus { checkpoint_dir, frames, horizons, radii, learn_radii, every } => {
+            use celeste_rust::rewrite::sweep_census;
+            let horizons = if horizons.is_empty() { vec![frames] } else { horizons };
+            let dir = std::path::PathBuf::from(checkpoint_dir);
+            let recipe_text = std::fs::read_to_string(&cli.recipe).unwrap_or_default();
+            let fingerprint =
+                celeste_rust::rewrite::checkpoint::config_fingerprint(&recipe_text);
+            let ck = celeste_rust::rewrite::checkpoint::load(&dir, frames, &fingerprint)?;
+            let table = ck.visited;
+            drop(ck.states);
+            let g = celeste_rust::rewrite::sweep::load_g(&dir)?;
+            if g.len() != table.len() {
+                return Err(anyhow::anyhow!(
+                    "g.bin has {} rows, the row table {}",
+                    g.len(),
+                    table.len()
+                ));
+            }
+            let positions = match sweep_census::load_positions(&dir, table.len())? {
+                Some(p) => {
+                    println!("census: reusing {}/pos.bin", dir.display());
+                    p
+                }
+                None => {
+                    let t = std::time::Instant::now();
+                    let p = sweep_census::build_positions(&dir, frames, &table)?;
+                    println!("census: positions built in {:.1}s", t.elapsed().as_secs_f64());
+                    sweep_census::save_positions(&dir, &p)?;
+                    p
+                }
+            };
+            let learned = if learn_radii {
+                match sweep_census::load_radii(&dir)? {
+                    Some(r) => {
+                        println!("census: reusing {}/radii.bin", dir.display());
+                        Some(r)
+                    }
+                    None => {
+                        let t = std::time::Instant::now();
+                        let r = sweep_census::learn_radii(&dir, frames, &positions)?;
+                        println!("census: radii learned in {:.1}s", t.elapsed().as_secs_f64());
+                        sweep_census::save_radii(&dir, &r)?;
+                        Some(r)
+                    }
+                }
+            } else {
+                None
+            };
+            let edge_sweep = table.len() as u64;
+            for horizon in &horizons {
+                let horizon = *horizon;
+                let t = std::time::Instant::now();
+                let rows =
+                    sweep_census::census(&table, &g, &positions, horizon, &radii, learned.as_deref())?;
+                println!();
+                println!("=== horizon {} ({:.1}s) ===", horizon, t.elapsed().as_secs_f64());
+                let head: String = radii
+                    .iter()
+                    .map(|r| format!("{:>14}", format!("cand r={}", r)))
+                    .chain(learned.iter().map(|_| format!("{:>14}", "cand learned")))
+                    .collect();
+                println!(
+                    "{:>5}{:>14}{:>14}{:>9}{:>9}{:>14}{}",
+                    "f", "|R(i)|", "|B(i)|", "R cells", "B cells", "new rows", head
+                );
+                let mut naive = 0u64;
+                let mut ideal = 0u64;
+                let mut totals = vec![0u64; radii.len()];
+                let mut learned_total = 0u64;
+                for row in &rows {
+                    naive += row.r_rows;
+                    ideal += row.new_rows;
+                    for (k, c) in row.candidates.iter().enumerate() {
+                        totals[k] += c;
+                    }
+                    learned_total += row.learned.unwrap_or(0);
+                    if row.frame % every == 0 {
+                        let cand: String = row
+                            .candidates
+                            .iter()
+                            .chain(row.learned.iter())
+                            .map(|c| format!("{:>14}", c))
+                            .collect();
+                        println!(
+                            "{:>5}{:>14}{:>14}{:>9}{:>9}{:>14}{}",
+                            row.frame,
+                            row.r_rows,
+                            row.b_rows,
+                            row.r_cells,
+                            row.b_cells,
+                            row.new_rows,
+                            cand
+                        );
+                    }
+                }
+                println!("row-expansions over frames 1..{} (the sweep's unit of work):", horizon);
+                let line = |label: String, n: u64| {
+                    println!(
+                        "  {:<34}{:>16}  ({:.2}x today, {:.4} of naive)",
+                        label,
+                        n,
+                        n as f64 / edge_sweep as f64,
+                        n as f64 / naive as f64
+                    )
+                };
+                println!("  {:<34}{:>16}", "edge sweep today (each row once):", edge_sweep);
+                line("time-expanded, no filter:".to_string(), naive);
+                line("time-expanded, perfect oracle:".to_string(), ideal);
+                for (k, r) in radii.iter().enumerate() {
+                    line(format!("time-expanded, radius {}px:", r), totals[k]);
+                }
+                if learned.is_some() {
+                    line("time-expanded, learned radii:".to_string(), learned_total);
+                }
+            }
         }
         Command::Bisect { frames } => {
             let baseline = Program::compile_executable_from_disk()?;
