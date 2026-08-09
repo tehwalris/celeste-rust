@@ -378,3 +378,50 @@ real numbers, which the run summaries give as **66,872 -> 65,960**. The
 error was mine in transcription, not in the runs. The ratio is unaffected
 (-1.4% either way) and no conclusion changes, but the absolute figures
 were wrong and are corrected here.
+
+## Result: the deopt is gone at f70
+
+The condition split and the UnknownBool-arm rule together, room (0,0) to
+f70, 8 threads, campaign chunk settings (8000/8000), 486->488 tests:
+
+                 baseline    +split     +arm rule
+  time           243.86 s   239.44 s     218.68 s
+  peak RSS        21.28 GB   16.99 GB     13.63 GB
+  deopt      12st/65,960  7st/47,000            0
+  fragments       100,220    100,768      102,694
+  lanes         8,121,405  8,115,505    8,062,451
+
+Time -10%, peak memory -36%, and no whole-state fallback survives.
+Fragments rise 2.5%, so the splits do not multiply - the failure mode
+that took the original duplicate-the-lane design to 102 GB at f66.
+
+Split firings per frame: 96 / 240 / 432 / 828 / 1848.
+
+THE TWO RULES ONLY PAY OFF TOGETHER. Frame 68 recorded zero splits in the
+split-only run, because `select cannot combine UnknownBool and Bool`
+fired first and dropped the whole state before any split could happen.
+Fixing only the condition moves the failure one instruction down the
+chain; fixing only the arm leaves the condition failing above it.
+
+### Not yet certified
+
+Lanes fell 0.7%. Fewer lanes is EITHER more precision (the split keeps
+the rewritten program's precision, where the deopt round-trips through
+`to_canonical`, which widens) OR dropped reachable states, which would be
+unsound. A lane count cannot tell those apart, and the pleasant reading
+must not be assumed.
+
+`trace-witness` is the gate: it replays the concrete reference TAS
+(tas/room_0_0_exit_frame_94.txt) under the PLAIN program and probes each
+frame's abstract row table, so a MISS is the exact address of a leak.
+`g.bin` is optional there - without it the probe checks table membership
+and `e`, which is exactly the question - so no sweep is needed and the
+gate is cheap.
+
+Until it passes, none of the numbers above should be quoted.
+
+### Next, if it passes
+
+Re-measure at f94, where the deopt was 81.7M lanes of a 4502 s run. That
+is where the payoff should be largest, and it is the figure the room (0,0)
+end-to-end estimate (13 +/- 2 h) is built on.
