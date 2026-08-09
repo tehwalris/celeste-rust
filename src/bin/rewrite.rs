@@ -2927,12 +2927,30 @@ fn main() -> Result<()> {
             } else {
                 None
             };
+            // The exact per-cell source sets are the tightest a positional
+            // filter can be, and unlike a disc they can express "the far
+            // edge of the previous room". Same edge stream as the radii.
+            let src_cells = if learn_radii {
+                let t = std::time::Instant::now();
+                let s = sweep_census::learn_src_cells(&dir, frames, &positions)?;
+                println!("census: source sets learned in {:.1}s", t.elapsed().as_secs_f64());
+                Some(s)
+            } else {
+                None
+            };
             let edge_sweep = table.len() as u64;
             for horizon in &horizons {
                 let horizon = *horizon;
                 let t = std::time::Instant::now();
-                let rows =
-                    sweep_census::census(&table, &g, &positions, horizon, &radii, learned.as_deref())?;
+                let rows = sweep_census::census(
+                    &table,
+                    &g,
+                    &positions,
+                    horizon,
+                    &radii,
+                    learned.as_deref(),
+                    src_cells.as_ref(),
+                )?;
                 println!();
                 println!("=== horizon {} ({:.1}s) ===", horizon, t.elapsed().as_secs_f64());
                 let head: String = radii
@@ -2943,6 +2961,7 @@ fn main() -> Result<()> {
                             .iter()
                             .flat_map(|_| [format!("{:>14}", "cand learned"), format!("{:>8}", "max r")]),
                     )
+                    .chain(src_cells.iter().map(|_| format!("{:>14}", "cand exact")))
                     .collect();
                 println!(
                     "{:>5}{:>14}{:>14}{:>9}{:>9}{:>14}{}",
@@ -2952,7 +2971,9 @@ fn main() -> Result<()> {
                 let mut ideal = 0u64;
                 let mut totals = vec![0u64; radii.len()];
                 let mut learned_total = 0u64;
+                let mut exact_total = 0u64;
                 for row in &rows {
+                    exact_total += row.exact.unwrap_or(0);
                     naive += row.r_rows;
                     ideal += row.new_rows;
                     for (k, c) in row.candidates.iter().enumerate() {
@@ -2966,6 +2987,7 @@ fn main() -> Result<()> {
                             .chain(row.learned.iter())
                             .map(|c| format!("{:>14}", c))
                             .chain(row.learned_max_px.iter().map(|r| format!("{:>8}", r)))
+                            .chain(row.exact.iter().map(|c| format!("{:>14}", c)))
                             .collect();
                         println!(
                             "{:>5}{:>14}{:>14}{:>9}{:>9}{:>14}{}",
@@ -2997,6 +3019,9 @@ fn main() -> Result<()> {
                 }
                 if learned.is_some() {
                     line("time-expanded, learned radii:".to_string(), learned_total);
+                }
+                if src_cells.is_some() {
+                    line("time-expanded, exact source sets:".to_string(), exact_total);
                 }
             }
         }

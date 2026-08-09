@@ -309,6 +309,43 @@ pub fn learn_radii(dir: &Path, frames: u32, positions: &[u16]) -> Result<Vec<u32
     Ok(radii2)
 }
 
+/// Learn `SrcCells` from the sweep's edge chunks, alongside `learn_radii`'s
+/// pass so the 58 GB is streamed once rather than twice.
+pub fn learn_src_cells(dir: &Path, frames: u32, positions: &[u16]) -> Result<SrcCells> {
+    let edge_dir = dir.join("sweep-edges");
+    let mut out =
+        SrcCells { index: vec![u32::MAX; (GRID * GRID) as usize], bits: Vec::new() };
+    for f in 1..frames {
+        let path = edge_dir.join(format!("f{:03}.bin", f));
+        let t = std::time::Instant::now();
+        let n = checkpoint::stream_u32_pairs(&path, |src, dst| {
+            let (sc, dc) = (positions[src as usize], positions[dst as usize]);
+            if sc == NO_CELL || dc == NO_CELL {
+                return;
+            }
+            let base = out.slot(dc);
+            out.bits[base + sc as usize / 64] |= 1 << (sc % 64);
+        })?;
+        if f % 20 == 0 || f + 1 == frames {
+            println!(
+                "  src-cells f{:03}: {} edges ({:.1}s, {} destination cells)",
+                f,
+                n,
+                t.elapsed().as_secs_f64(),
+                out.occupied_cells()
+            );
+        }
+    }
+    let set: usize = out.bits.iter().map(|w| w.count_ones() as usize).sum();
+    println!(
+        "src-cells: {} destination cells, {:.1} source cells each on average, {} MB",
+        out.occupied_cells(),
+        set as f64 / out.occupied_cells().max(1) as f64,
+        out.bits.len() * 8 / 1_000_000
+    );
+    Ok(out)
+}
+
 /// `<dir>/radii.bin`: one u32 squared radius per grid cell.
 pub fn save_radii(dir: &Path, radii2: &[u32]) -> Result<()> {
     use std::io::Write;
@@ -348,6 +385,58 @@ pub fn load_radii(dir: &Path) -> Result<Option<Vec<u32>>> {
     let mut buf = vec![0u8; count * 4];
     file.read_exact(&mut buf)?;
     Ok(Some(buf.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect()))
+}
+
+/// Number of `u64` words in a bitmap over the whole position grid.
+const GRID_WORDS: usize = (GRID * GRID) as usize / 64;
+
+/// For each destination cell, the exact SET of cells a predecessor of it was
+/// ever in. This is the tightest a purely positional filter can be: it is
+/// the true predecessor relation, projected onto position and nothing else.
+///
+/// A disc cannot express "the right-hand edge of the previous room", which
+/// is what the predecessors of a room transition actually are - so the disc
+/// has to use the distance to the far corner and paints the room. The set
+/// costs 8 KB per occupied destination cell (66 MB on room (1,0)), which is
+/// nothing next to the 58 GB of edges it replaces.
+pub struct SrcCells {
+    /// Destination cell -> dense index, `u32::MAX` when never a destination.
+    index: Vec<u32>,
+    /// Dense index -> bitmap over source cells, `GRID_WORDS` words each.
+    bits: Vec<u64>,
+}
+
+impl SrcCells {
+    fn slot(&mut self, dst: u16) -> usize {
+        let at = &mut self.index[dst as usize];
+        if *at == u32::MAX {
+            *at = (self.bits.len() / GRID_WORDS) as u32;
+            self.bits.resize(self.bits.len() + GRID_WORDS, 0);
+        }
+        *at as usize * GRID_WORDS
+    }
+
+    /// Union of the source sets of `cells`, as a grid bitmap.
+    pub fn union_into(&self, cells: &[u32], out: &mut [u64]) {
+        out.fill(0);
+        for &c in cells {
+            let at = self.index[c as usize];
+            if at == u32::MAX {
+                // Never a destination, so nothing is known to reach it. It
+                // is occupied by a viable row all the same, so keep the row.
+                out[c as usize / 64] |= 1 << (c % 64);
+                continue;
+            }
+            let base = at as usize * GRID_WORDS;
+            for (w, o) in self.bits[base..base + GRID_WORDS].iter().zip(out.iter_mut()) {
+                *o |= *w;
+            }
+        }
+    }
+
+    pub fn occupied_cells(&self) -> usize {
+        self.bits.len() / GRID_WORDS
+    }
 }
 
 /// The old design's candidate mask: every cell within cell `c`'s OWN
@@ -396,6 +485,8 @@ pub struct FrameCensus {
     /// The largest learned radius (px) any B(i+1) cell carries - one cell
     /// with a teleport-sized radius is enough to make the mask the room.
     pub learned_max_px: Option<u32>,
+    /// Same as `candidates`, under the exact per-cell source sets.
+    pub exact: Option<u64>,
 }
 
 /// Squared-distance field from the set cells, capped at `rmax`. Only the
@@ -429,6 +520,7 @@ pub fn census(
     horizon: u32,
     radii: &[i32],
     learned_radii: Option<&[u32]>,
+    src_cells: Option<&SrcCells>,
 ) -> Result<Vec<FrameCensus>> {
     let n_rows = g.len();
     if positions.len() != n_rows {
@@ -440,6 +532,7 @@ pub fn census(
     let cells = (GRID * GRID) as usize;
     let mut field = vec![u32::MAX; cells];
     let mut learned_in = vec![false; cells];
+    let mut exact_in = vec![0u64; GRID_WORDS];
     let mut occupied = vec![false; cells];
     let mut out = Vec::new();
     // Frame `horizon` needs no expansion at all: B(horizon) is the win
@@ -472,6 +565,9 @@ pub fn census(
                 .max()
                 .map_or(0, |r| (r as f64).sqrt().ceil() as u32)
         });
+        if let Some(sc) = src_cells {
+            sc.union_into(&b_next_cells, &mut exact_in);
+        }
 
         // R(i) and B(i), and the candidates.
         occupied.fill(false);
@@ -482,6 +578,7 @@ pub fn census(
         let mut new_rows = 0u64;
         let mut candidates = vec![0u64; radii.len()];
         let mut learned = 0u64;
+        let mut exact = 0u64;
         for id in 0..r_end {
             let c = positions[id];
             if c != NO_CELL && !occupied[c as usize] {
@@ -518,6 +615,9 @@ pub fn census(
             if learned_radii.is_some() && learned_in[c as usize] {
                 learned += 1;
             }
+            if src_cells.is_some() && exact_in[c as usize / 64] & (1 << (c % 64)) != 0 {
+                exact += 1;
+            }
         }
         out.push(FrameCensus {
             frame: i,
@@ -529,6 +629,7 @@ pub fn census(
             candidates,
             learned: learned_radii.map(|_| learned),
             learned_max_px,
+            exact: src_cells.map(|_| exact),
         });
     }
     Ok(out)
@@ -575,7 +676,7 @@ mod tests {
         // g: row 0 reaches the exit in 2, row 1 in 1, row 2 never.
         let g = vec![2u16, 1, G_UNREACHABLE];
         let positions = vec![cell_of(0, 0).unwrap(); 3];
-        let rows = census(&t, &g, &positions, 3, &[GRID], None).unwrap();
+        let rows = census(&t, &g, &positions, 3, &[GRID], None, None).unwrap();
         // Horizon 3, so frames 1 and 2 are reported.
         assert_eq!(rows.len(), 2);
         // f1: R = {0,1}, B(1) = g <= 2 = {0,1}; B(2) = g <= 1 over R(2) =
@@ -604,5 +705,36 @@ mod tests {
         assert!(!mask[(10 * GRID + 13) as usize], "outside it");
         assert!(mask[far as usize], "an unlearned cell is still itself");
         assert!(!mask[(10 * GRID + 61) as usize], "but nothing around it");
+    }
+
+    /// The exact source sets are what a disc cannot express: a destination
+    /// whose predecessors are a distant, tight cluster.
+    #[test]
+    fn src_cells_keep_distant_predecessors_tight() {
+        let mut sc =
+            SrcCells { index: vec![u32::MAX; (GRID * GRID) as usize], bits: Vec::new() };
+        let dst = (200 * GRID + 200) as u16;
+        let src = (10 * GRID + 10) as u16;
+        let base = sc.slot(dst);
+        sc.bits[base + src as usize / 64] |= 1 << (src % 64);
+        assert_eq!(sc.occupied_cells(), 1);
+
+        let mut out = vec![0u64; GRID_WORDS];
+        fn is_set(out: &[u64], c: u16) -> bool {
+            out[c as usize / 64] & (1 << (c % 64)) != 0
+        }
+        sc.union_into(&[dst as u32], &mut out);
+        assert!(is_set(&out, src), "the one recorded predecessor");
+        assert!(!is_set(&out, dst), "the destination itself was never a predecessor");
+        assert!(!is_set(&out, (10 * GRID + 11) as u16), "nor its neighbour");
+        // A disc covering `src` from `dst` would have radius ~269 and so
+        // would cover the whole grid; the set covers one cell.
+        assert_eq!(out.iter().map(|w| w.count_ones()).sum::<u32>(), 1);
+
+        // A cell that was never a destination keeps only itself.
+        let unseen = (5 * GRID + 5) as u32;
+        sc.union_into(&[unseen], &mut out);
+        assert_eq!(out.iter().map(|w| w.count_ones()).sum::<u32>(), 1);
+        assert!(is_set(&out, unseen as u16));
     }
 }
