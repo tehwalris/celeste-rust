@@ -302,13 +302,34 @@ pub fn build_from_replay(
         if batch.is_empty() {
             continue;
         }
-        let deopt_events = engine.deopt_events();
-        engine.restore(batch, None, deopt_events)?;
-        engine.step().map_err(|e| anyhow!("replaying frame f{:03}: {:#}", f, e))?;
-        // The outputs are only needed for their positions, which the
-        // observer already read; drop them before the next frame.
-        let deopt_events = engine.deopt_events();
-        engine.restore(Vec::new(), None, deopt_events)?;
+        // Expand in bounded groups. The replay takes the PHASED path, which
+        // accumulates a frame's whole raw successor set before merging, and
+        // that transient is what OOMed the edge sweep on room (0,0): a
+        // 2M-lane batch of room (1,0) at f065 was already 28 GB in one go.
+        // Nothing here needs the outputs to meet, since the observer has
+        // read their positions by the time the group is dropped.
+        let group_lanes: usize = std::env::var("CELESTE_POSGRAPH_GROUP_LANES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(250_000);
+        let mut group: Vec<crate::interpreter::state::State> = Vec::new();
+        let mut group_size = 0usize;
+        let mut queue: std::collections::VecDeque<_> = batch.into();
+        while let Some(state) = queue.pop_front() {
+            group_size += state.vector_size;
+            group.push(state);
+            if group_size < group_lanes && !queue.is_empty() {
+                continue;
+            }
+            let deopt_events = engine.deopt_events();
+            engine.restore(std::mem::take(&mut group), None, deopt_events)?;
+            group_size = 0;
+            engine.step().map_err(|e| anyhow!("replaying frame f{:03}: {:#}", f, e))?;
+            // The outputs are only needed for their positions, which the
+            // observer already read; drop them before the next group.
+            let deopt_events = engine.deopt_events();
+            engine.restore(Vec::new(), None, deopt_events)?;
+        }
         if f % 10 == 0 || f + 1 == frames {
             println!(
                 "  posgraph f{:03}: {} lanes, {} pairs so far ({:.1}s)",
