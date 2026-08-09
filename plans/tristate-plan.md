@@ -135,6 +135,57 @@ the plain program fires because `select` meets an `UnknownBool` condition;
 under partitioning only the straddling side deopts and ~69% of the lanes
 stay on the specialized program.
 
+## The obstacle is SMALLER than it looked (checked 2026-08-09)
+
+I recorded below that partitioning "needs an INSTRUCTION to yield two
+states into the flow. Branches can already do that; instructions cannot."
+That is wrong - the machinery is already there.
+
+`flow.rs`, the site that runs a block's instructions, accumulates into
+`dst: Vec<State>`:
+
+    Instruction::Call { .. }        => dst.extend(...)     // MANY states
+    Instruction::AssertTrue { .. }  => ... dst.push(state) // ZERO or one
+    _                               => ... dst.push(state) // exactly one
+
+The `Call` arm already extends with many, and the lane-granular deopt's
+`collect_assert_true` already yields zero or one. Subsequent instructions
+then run over every state in `dst`. So a non-call instruction returning a
+partition needs no new plumbing - only a wider return type on the arm that
+currently pushes exactly one.
+
+### Suggested shape, avoiding a per-instruction allocation
+
+Do NOT return `Vec<State>` from `interpret_non_call_instruction`: it runs
+for every instruction of every state and would allocate on the hot path
+for a case that is rare. Return the spill instead:
+
+    fn interpret_non_call_instruction(..) -> Result<Option<State>>
+
+`None` in the overwhelmingly common case; `Some(ambiguous)` when a
+`MaybeBool` was partitioned off. The flow arm becomes
+
+    let extra = interpreter.interpret_non_call_instruction(*local_id, instruction)?;
+    dst.push(interpreter.into_state());
+    dst.extend(extra);
+
+and `resolve_maybe_bool` is replaced by a `partition_maybe_bool` that
+filters the state twice - definite lanes carrying a real `Bool` vector,
+straddling lanes carrying an `UnknownBool` whose all-unknown invariant now
+genuinely holds. Both filters already exist (`filter_by_kept_clone`,
+`split_by_condition`); neither duplicates a lane, so the total lane count
+is preserved exactly, which is the whole point.
+
+### What still needs care
+
+* The ambiguous state must inherit the local's `UnknownBool`, not the
+  `MaybeBool` - the transient must still never be stored.
+* An all-definite or all-ambiguous partition must produce NO spill, or
+  every comparison doubles the state count for nothing.
+* Lane order: the definite side keeps its order and the spill keeps its
+  own, so the boundary merge sees two states rather than one reordered
+  one. That is the same situation any branch split already creates.
+
 ## The obstacle, which is architectural rather than semantic
 
 `interpret_binary_op` returns a `Value`, not states - which is exactly why
