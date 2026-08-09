@@ -150,8 +150,8 @@ mod batch_invariance_tests {
     /// A lane's canonical key must not depend on which other lanes happen
     /// to share its state.
     ///
-    /// This is the narrowest form of Philippe's batch-invariance principle
-    /// - it does not even run a frame. If it fails, the chunk dependence
+    /// This is the narrowest form of Philippe's batch-invariance principle:
+    /// it does not even run a frame. If it fails, the chunk dependence
     /// `simdcheck.sh` measured lives in the KEY, and everything downstream
     /// (frontier dedup, and the sweep's ability to reproduce the forward
     /// pass) inherits it.

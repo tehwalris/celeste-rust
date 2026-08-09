@@ -2878,10 +2878,13 @@ fn main() -> Result<()> {
             use celeste_rust::rewrite::state_mapping::StateMapping;
             use celeste_rust::rewrite::sweep_time;
             let dir = std::path::PathBuf::from(checkpoint_dir);
+            let recipe_text = std::fs::read_to_string(&cli.recipe).unwrap_or_default();
+            let fingerprint =
+                celeste_rust::rewrite::checkpoint::config_fingerprint(&recipe_text);
             let plain = Program::compile_executable_from_disk()?;
             let (program, _) = build(&recipe)?;
             let mapping = StateMapping::from_recipe(&recipe);
-            sweep_time::prepare_pos_graph(&dir, frames, &program, &plain, mapping)?;
+            sweep_time::prepare_pos_graph(&dir, frames, &fingerprint, &program, &plain, mapping)?;
         }
         Command::Bisect { frames } => {
             let baseline = Program::compile_executable_from_disk()?;

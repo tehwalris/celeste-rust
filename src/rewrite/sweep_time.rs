@@ -286,17 +286,31 @@ pub struct TimeSweepResult {
 /// the filter never generates that candidate and nothing notices. So the
 /// covered frame count is stored in the file and checked here.
 ///
-/// It is built PER PRECISION LEVEL, in that level's own directory. Sharing a
-/// coarser level's table with a finer one is probably sound, but there is no
-/// cheap runtime guard for it, so it is not done.
+/// It is built PER PRECISION LEVEL, in that level's own directory, and the
+/// fingerprint in the file is what enforces that: sharing a coarser level's
+/// table with a finer one is probably sound, but there is no cheap runtime
+/// guard for the sharing itself, so it is refused rather than assumed.
 pub fn prepare_pos_graph(
     dir: &Path,
     frames: u32,
+    fingerprint: &str,
     program: &Program,
     plain: &Program,
     mapping: StateMapping,
 ) -> Result<PosGraph> {
     let existing = PosGraph::load(dir)?;
+    if let Some(old) = &existing {
+        if old.fingerprint() != fingerprint {
+            return Err(anyhow!(
+                "{}/posgraph.bin was recorded from the forward pass {}, but \
+                 this configuration is {} - it describes transitions that \
+                 search never took, and misses ones it does. Delete it.",
+                dir.display(),
+                old.fingerprint(),
+                fingerprint
+            ));
+        }
+    }
     let covered = existing.as_ref().map_or(1, |g| g.frames());
     if covered >= frames {
         let graph = existing.expect("a covered range implies a loaded table");
@@ -316,7 +330,7 @@ pub fn prepare_pos_graph(
     );
     let t = std::time::Instant::now();
     let mut engine = AbstractRun::start_with_deopt(program, plain, mapping, false)?;
-    let fresh = pos_graph::build_from_replay(dir, covered, frames, &mut engine)?;
+    let fresh = pos_graph::build_from_replay(dir, covered, frames, fingerprint, &mut engine)?;
     drop(engine);
     // The replay's transient is the biggest allocation this process ever
     // makes - room (0,0)'s peaked around 76 GB - and dropping it does not
@@ -338,7 +352,7 @@ pub fn prepare_pos_graph(
         Some(old) => {
             let mut b = old.into_builder();
             b.merge(fresh.into_builder());
-            b.build(frames)
+            b.build(frames, fingerprint)
         }
         None => fresh,
     };
@@ -372,7 +386,8 @@ pub fn backward_sweep_time(
             frames
         ));
     }
-    let graph = prepare_pos_graph(dir, frames, program, plain, mapping.clone())?;
+    let graph =
+        prepare_pos_graph(dir, frames, fingerprint, program, plain, mapping.clone())?;
 
     let ck = checkpoint::load(dir, frames, fingerprint).context("loading final checkpoint")?;
     let table = ck.visited;
@@ -610,7 +625,7 @@ mod tests {
         b.record(3, 10);
         b.record(4, 10);
         b.record(5, 11);
-        let graph = b.build(1);
+        let graph = b.build(1, "fp");
 
         let (mut dst_seen, mut cand) = (vec![0u64; CELL_WORDS], vec![0u64; CELL_WORDS]);
         mark_dst_cell(&graph, 10, &mut dst_seen, &mut cand);
@@ -627,7 +642,7 @@ mod tests {
     /// start row.
     #[test]
     fn an_unrecorded_destination_keeps_itself_as_a_candidate() {
-        let graph = PosGraphBuilder::default().build(1);
+        let graph = PosGraphBuilder::default().build(1, "fp");
         let (mut dst_seen, mut cand) = (vec![0u64; CELL_WORDS], vec![0u64; CELL_WORDS]);
         mark_dst_cell(&graph, 77, &mut dst_seen, &mut cand);
         assert_eq!(cells(&cand), vec![77]);
@@ -639,7 +654,7 @@ mod tests {
     fn the_no_position_node_participates() {
         let mut b = PosGraphBuilder::default();
         b.record(9, NO_CELL);
-        let graph = b.build(1);
+        let graph = b.build(1, "fp");
         let (mut dst_seen, mut cand) = (vec![0u64; CELL_WORDS], vec![0u64; CELL_WORDS]);
         mark_dst_cell(&graph, NO_CELL, &mut dst_seen, &mut cand);
         assert_eq!(cells(&cand), vec![9]);
