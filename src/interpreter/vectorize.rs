@@ -1383,6 +1383,14 @@ pub fn visited_row_keys(
     // instead of only the candidates, and the candidates are ~2% of them.
     // The global probe is the cheap filter here precisely because it
     // rejects so much.
+    // CELESTE_DUMP_ROWS prints each newly-reached row as "ROW <key>
+    // <values>" on stderr. It exists to be a SECOND, independent view of
+    // the same rows that `visited.bin` records, and that is not idle
+    // redundancy: `visited.bin` is columnar and an off-by-one reading of
+    // it produced a convincing false report of broken batch invariance
+    // (see plans/roofline-plan.md). Cross-checking a checkpoint reader
+    // against this dump is what caught it, and is what to repeat if the
+    // reader is ever touched. Gated, and only reached for candidate lanes.
     let dump_rows = std::env::var_os("CELESTE_DUMP_ROWS").is_some();
     let mut seen: rustc_hash::FxHashSet<(u64, u64)> = rustc_hash::FxHashSet::default();
     let mut candidates: Vec<(u32, (u64, u64))> = Vec::new();
