@@ -321,6 +321,21 @@ pub fn record_unknown_collapse(definite: usize, total: usize) {
     }
 }
 
+/// How many times a `select` on a whole-value `UnknownBool` split the
+/// state rather than dropping the frame onto the plain program. Each one
+/// is a deopt avoided, but also a state created, so this is the number to
+/// watch against the fragment count if the split ever starts to multiply.
+static SELECT_SPLITS: AtomicU64 = AtomicU64::new(0);
+
+pub fn record_select_split() {
+    SELECT_SPLITS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Per-frame select splits, resetting the counter.
+pub fn take_select_splits() -> u64 {
+    SELECT_SPLITS.swap(0, Ordering::Relaxed)
+}
+
 /// Wall-clock nanoseconds spent inside `run_deopt_frame`, i.e. re-running a
 /// state under the plain program after the rewritten one refused it. Summed
 /// across worker threads, so on an N-thread frame this can exceed the frame's

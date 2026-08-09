@@ -217,12 +217,22 @@ impl<'a> BoundInterpreterFlow<'a> {
                             }
                             _ => {
                                 let mut interpreter = interpreter;
-                                // A mixed interval comparison partitions:
-                                // the definite lanes stay in this state,
-                                // the straddling ones spill into a second.
-                                // `dst` already carries many states per
-                                // instruction (see the Call arm), so this
-                                // needs no new plumbing.
+                                // Two instructions can yield a second state
+                                // here, and both spill through this one
+                                // channel. `dst` already carries many states
+                                // per instruction (see the Call arm), so
+                                // neither needs new plumbing.
+                                //
+                                //  - a MIXED interval comparison PARTITIONS:
+                                //    definite lanes stay, straddling lanes
+                                //    spill. Lanes are moved, so the total is
+                                //    unchanged.
+                                //  - a `select` on a whole-value UnknownBool
+                                //    SPLITS: the spill is the false copy and
+                                //    this state becomes the true one. Both
+                                //    keep every lane, so lanes DO double -
+                                //    that is the price of not dropping the
+                                //    whole frame onto the plain program.
                                 let spill = interpreter
                                     .interpret_non_call_instruction(*local_id, instruction)?;
                                 dst.push(interpreter.into_state());

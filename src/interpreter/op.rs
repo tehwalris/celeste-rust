@@ -48,16 +48,20 @@ pub fn interpret_unary_op(state: &State, op: UnaryOp, v: &Value) -> Result<Value
     }
 }
 
-/// Per-lane handling of MIXED interval comparisons
-/// (CELESTE_PARTITION_STRADDLES=1), where some lanes have a definite
-/// answer and some straddle. OFF by default; see plans/tristate-plan.md.
+/// Per-lane handling of MIXED interval comparisons, where some lanes have
+/// a definite answer and some straddle. ON by default; set
+/// CELESTE_NO_PARTITION_STRADDLES to opt out (for A/B measurement only).
 ///
 /// Building a whole-value `UnknownBool` from such a comparison is a join
-/// ACROSS LANES - one lane's ambiguity destroying its neighbours' answers
-/// - and it is the only known source of batch-dependence in the
-/// interpreter, since whether it fires depends on whether ANY lane in the
-/// state straddles and therefore on the chunk size. With the flag on, the
-/// comparison yields a `MaybeBool` transient that
+/// ACROSS LANES - one lane's ambiguity destroying its neighbours' answers.
+/// That is a CORRECTNESS property, not an optimization: a lane's result
+/// must not depend on which other lanes happen to share its state, or
+/// batching stops being a pure implementation detail and starts changing
+/// what the search computes. It is also why the collapse is chunk-size
+/// dependent, since whether it fires depends on whether ANY lane in the
+/// state straddles. `simdcheck` is the acceptance gate for exactly this.
+///
+/// So the comparison yields a `MaybeBool` transient that
 /// `core_interpreter::partition_maybe_bool` resolves by SPLITTING THE
 /// STATE: definite lanes keep a real `Bool`, straddling lanes leave in a
 /// spill state whose `UnknownBool` is then honest.
@@ -68,13 +72,12 @@ pub fn interpret_unary_op(state: &State, op: UnaryOp, v: &Value) -> Result<Value
 /// the copies multiplied. A partition moves lanes and never creates one,
 /// which fixed that: measured at f70 the fragment count moves 0.05%.
 ///
-/// It is off by default because it does not currently pay. It is aimed at
-/// mixed comparisons, but at depth 83% of collapses are ALL-unknown -
-/// where the whole-value tag is honest and no split is possible - and
-/// those are what actually drive the plain-program deopt. So it costs
-/// 4.6% peak RSS and buys a 1.4% deopt reduction. It stays because it is
-/// the prerequisite for splitting `select` on `UnknownBool` (the actual
-/// fix) and because it is the only known cure for the batch-dependence.
+/// It is on by default because lane independence is wanted whether or not
+/// it pays, and it very nearly does not: at f70 it costs 4.6% peak RSS,
+/// is neutral on time, and cuts the deopt only 1.4%. That is because it
+/// targets mixed comparisons while 83% of collapses at depth are
+/// ALL-unknown - where the whole-value tag is honest and no split is
+/// possible. Those are handled by splitting `select` instead.
 /// 0 = not yet read, 1 = off, 2 = on. An atomic rather than a OnceLock so
 /// tests can drive both paths; the env var is the default, read once.
 static PARTITION_STRADDLES: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -83,7 +86,7 @@ fn partition_straddles_enabled() -> bool {
     use std::sync::atomic::Ordering;
     match PARTITION_STRADDLES.load(Ordering::Relaxed) {
         0 => {
-            let on = std::env::var_os("CELESTE_PARTITION_STRADDLES").is_some();
+            let on = std::env::var_os("CELESTE_NO_PARTITION_STRADDLES").is_none();
             PARTITION_STRADDLES.store(if on { 2 } else { 1 }, Ordering::Relaxed);
             on
         }
@@ -241,6 +244,14 @@ pub fn interpret_select(condition: &Value, if_true: &Value, if_false: &Value) ->
         MaybeVector::vector(out)
     }
 
+    /// A boolean arm as one entry per lane, broadcasting the scalar form.
+    fn bool_lanes(v: &MaybeVector<bool>, lanes: usize) -> Vec<bool> {
+        match v {
+            MaybeVector::Scalar(b) => vec![*b; lanes],
+            MaybeVector::Vector(v) => v.as_ref().clone(),
+        }
+    }
+
     match (if_true, if_false) {
         (Value::Number(a), Value::Number(b)) => Ok(Value::Number(pick(&mask, a, b))),
         (Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(pick(&mask, a, b))),
@@ -259,6 +270,43 @@ pub fn interpret_select(condition: &Value, if_true: &Value, if_false: &Value) ->
             a,
             &lift_to_interval(b),
         ))),
+        // Both arms unknown: so is every lane of the result, and the
+        // whole-value tag is honest. No gate needed - this loses nothing.
+        (Value::UnknownBool, Value::UnknownBool) => Ok(Value::UnknownBool),
+        // ONE boolean arm is a whole-value `UnknownBool`. The lanes the mask
+        // takes from the DEFINITE arm still have an answer, so collapsing
+        // the result to `UnknownBool` - or failing, which is what this used
+        // to do - is again a join across lanes.
+        //
+        // This is the second link of the strawberry's `and` chain. Splitting
+        // the CONDITION (see `split_select_on_unknown`) turns `%157` into a
+        // real per-lane `Bool`, and then `%189 = select %157 ? %186 : %157`
+        // fails here instead, with `%186` unknown and `%157` mixed. Mixed is
+        // the point: there are definite lanes to keep.
+        (Value::UnknownBool, Value::Bool(b)) if partition_straddles_enabled() => {
+            let MaybeVector::Vector(m) = &mask else {
+                unreachable!("uniform conditions are handled above")
+            };
+            let b = bool_lanes(b, m.len());
+            Ok(Value::MaybeBool(MaybeVector::vector(
+                m.iter()
+                    .zip(b)
+                    .map(|(&take_true, b)| if take_true { None } else { Some(b) })
+                    .collect(),
+            )))
+        }
+        (Value::Bool(a), Value::UnknownBool) if partition_straddles_enabled() => {
+            let MaybeVector::Vector(m) = &mask else {
+                unreachable!("uniform conditions are handled above")
+            };
+            let a = bool_lanes(a, m.len());
+            Ok(Value::MaybeBool(MaybeVector::vector(
+                m.iter()
+                    .zip(a)
+                    .map(|(&take_true, a)| if take_true { Some(a) } else { None })
+                    .collect(),
+            )))
+        }
         _ => Err(anyhow!(
             "select cannot combine {:?} and {:?} per lane - a value carries one \
              type tag and one HeapId for all its lanes",

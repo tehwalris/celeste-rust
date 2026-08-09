@@ -544,6 +544,10 @@ fn bench(
         let frame_start = std::time::Instant::now();
         run.step()?;
         {
+            let splits = celeste_rust::op_census::take_select_splits();
+            if splits > 0 {
+                println!("  select splits f{:03}: {}", frame, splits);
+            }
             let deopt_nanos = celeste_rust::op_census::take_deopt_nanos();
             if deopt_nanos > 0 {
                 let frame_nanos = frame_start.elapsed().as_nanos() as u64;

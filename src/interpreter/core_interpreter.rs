@@ -20,6 +20,26 @@ pub struct CoreInterpreter<'a> {
     fixed_env: &'a FixedEnv,
 }
 
+/// Splitting the state on `select`-over-`UnknownBool` instead of dropping
+/// the whole frame onto the plain program. ON by default; set
+/// CELESTE_NO_SPLIT_SELECT to opt out (for A/B measurement only).
+///
+/// 0 = not yet read, 1 = off, 2 = on.
+static SPLIT_SELECT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn split_select_enabled() -> bool {
+    use std::sync::atomic::Ordering;
+    match SPLIT_SELECT.load(Ordering::Relaxed) {
+        0 => {
+            let on = std::env::var_os("CELESTE_NO_SPLIT_SELECT").is_none();
+            SPLIT_SELECT.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+        1 => false,
+        _ => true,
+    }
+}
+
 fn make_non_pointer_error(value: &Value) -> anyhow::Error {
     match value {
         Value::Pointer(_) | Value::NilPointer(_) => {
@@ -518,6 +538,25 @@ impl<'a> CoreInterpreter<'a> {
         local_id: LocalId,
         instruction: &Instruction,
     ) -> Result<Option<State>> {
+        // `select` on a whole-value `UnknownBool` has no per-lane mask, so
+        // it cannot pick arms and used to drop the WHOLE FRAME onto the
+        // plain program. Split the state instead: one copy where the
+        // condition is true, one where it is false. Sound because the
+        // condition is unknown for every lane - the two copies cover every
+        // possibility between them - and it is exactly what `branch` on
+        // `UnknownBool` already does, which is also what the plain
+        // fallback was doing by a much more expensive route.
+        //
+        // Measured on room (0,0): the deopt this removes was 0.5% of lanes
+        // but >=12% of CPU by f70 and growing ~2.4x per frame, because a
+        // deopted lane costs >=25x a normal one.
+        if let Instruction::Select { condition, .. } = instruction {
+            if split_select_enabled()
+                && matches!(self.state.local_env.get(*condition), Value::UnknownBool)
+            {
+                return self.split_select_on_unknown(local_id, instruction, *condition);
+            }
+        }
         // Naming the instruction costs nothing unless it fails, and a rewrite
         // that speculates an arm onto lanes that cannot take it fails *here* -
         // so this is what turns "something in the program went wrong" into a
@@ -543,6 +582,54 @@ impl<'a> CoreInterpreter<'a> {
             self.state.local_env.set(local_id, value);
         }
         Ok(None)
+    }
+
+    /// Resolve a `select` whose condition is a whole-value `UnknownBool` by
+    /// splitting into a true copy (kept in `self`) and a false copy
+    /// (returned as the spill). Both copies then run the SAME instruction
+    /// with a now-definite condition, so this recurses exactly once.
+    ///
+    /// The condition local is overwritten in each copy rather than only the
+    /// arms being picked. That is deliberate: any later instruction reading
+    /// the same condition must see the branch this copy represents, or the
+    /// two copies would disagree about the same fact.
+    fn split_select_on_unknown(
+        &mut self,
+        local_id: LocalId,
+        instruction: &Instruction,
+        condition: LocalId,
+    ) -> Result<Option<State>> {
+        crate::op_census::record_select_split();
+
+        let mut false_state = self.state.clone();
+        false_state
+            .local_env
+            .set(condition, Value::Bool(MaybeVector::Scalar(false)));
+        self.state
+            .local_env
+            .set(condition, Value::Bool(MaybeVector::Scalar(true)));
+
+        let mut false_interp = CoreInterpreter::new(false_state, self.fixed_env);
+        let nested = false_interp.interpret_non_call_instruction(local_id, instruction)?;
+        // The condition is definite in both copies now, so neither may split
+        // again. If one did we would have two spills and one slot to return
+        // them in, and silently dropping a state is unsound - so refuse.
+        if nested.is_some() {
+            return Err(anyhow!(
+                "select split at %{} produced a second spill; a definite condition must not \
+                 split again",
+                usize::from(local_id)
+            ));
+        }
+        let again = self.interpret_non_call_instruction(local_id, instruction)?;
+        if again.is_some() {
+            return Err(anyhow!(
+                "select split at %{} re-split on the true side; a definite condition must not \
+                 split again",
+                usize::from(local_id)
+            ));
+        }
+        Ok(Some(false_interp.into_state()))
     }
 
     pub fn interpret_call_instruction(
@@ -864,6 +951,98 @@ mod expand_tests {
         let mut interpreter = CoreInterpreter::new(state, &fixed_env);
         interpreter.interpret_non_call_instruction(id(10), &Instruction::Expand { value })?;
         Ok(interpreter.into_state())
+    }
+
+    /// A `select` whose condition is a whole-value `UnknownBool` must SPLIT
+    /// rather than fail. This is the room (0,0) deopt in miniature: before,
+    /// `%157 = select %125 ? %154 : %125` with `%125` unknown dropped the
+    /// entire frame onto the plain program, which by f70 was >=12% of CPU
+    /// and growing 2.4x per frame.
+    #[test]
+    fn select_on_unknown_bool_splits_the_state_instead_of_failing() {
+        let n = |v: i16| Pico8Num::from_i16(v);
+        let mut state = State::new();
+        state.vector_size = 3;
+        // %0 is the unknown condition; %1 and %2 are the arms.
+        state.local_env.set(id(0), Value::UnknownBool);
+        state
+            .local_env
+            .set(id(1), Value::Number(MaybeVector::Scalar(n(7))));
+        state
+            .local_env
+            .set(id(2), Value::Number(MaybeVector::Scalar(n(9))));
+
+        let fixed_env = FixedEnv::new();
+        let mut interpreter = CoreInterpreter::new(state, &fixed_env);
+        let spill = interpreter
+            .interpret_non_call_instruction(
+                id(10),
+                &Instruction::Select { condition: id(0), if_true: id(1), if_false: id(2) },
+            )
+            .expect("an unknown condition must split, not error")
+            .expect("the split must yield a second state");
+        let true_side = interpreter.into_state();
+
+        // The two copies take opposite arms...
+        assert_eq!(
+            true_side.local_env.get(id(10)),
+            &Value::Number(MaybeVector::Scalar(n(7)))
+        );
+        assert_eq!(
+            spill.local_env.get(id(10)),
+            &Value::Number(MaybeVector::Scalar(n(9)))
+        );
+
+        // ...and each copy's CONDITION agrees with the arm it took, so a
+        // later instruction reading %0 cannot contradict this one.
+        assert_eq!(
+            true_side.local_env.get(id(0)),
+            &Value::Bool(MaybeVector::Scalar(true))
+        );
+        assert_eq!(
+            spill.local_env.get(id(0)),
+            &Value::Bool(MaybeVector::Scalar(false))
+        );
+
+        // Splitting copies lanes rather than dividing them: an unknown
+        // condition is unknown for EVERY lane, so both copies keep all
+        // three. This is the cost side, and it is why the counter exists.
+        assert_eq!(true_side.vector_size, 3);
+        assert_eq!(spill.vector_size, 3);
+    }
+
+    /// With the split gated off, the old behaviour must return exactly -
+    /// the error the whole-state deopt keys on. Both gate states get
+    /// exercised, because a gate only ever tested one way is a gate that
+    /// breaks the first time someone flips it (see the room (0,0) f66
+    /// abort).
+    #[test]
+    fn select_on_unknown_bool_still_fails_with_the_split_off() {
+        let n = |v: i16| Pico8Num::from_i16(v);
+        let mut state = State::new();
+        state.vector_size = 2;
+        state.local_env.set(id(0), Value::UnknownBool);
+        state
+            .local_env
+            .set(id(1), Value::Number(MaybeVector::Scalar(n(7))));
+        state
+            .local_env
+            .set(id(2), Value::Number(MaybeVector::Scalar(n(9))));
+
+        super::SPLIT_SELECT.store(1, std::sync::atomic::Ordering::Relaxed);
+        let fixed_env = FixedEnv::new();
+        let mut interpreter = CoreInterpreter::new(state, &fixed_env);
+        let error = format!(
+            "{:#}",
+            interpreter
+                .interpret_non_call_instruction(
+                    id(10),
+                    &Instruction::Select { condition: id(0), if_true: id(1), if_false: id(2) },
+                )
+                .unwrap_err()
+        );
+        super::SPLIT_SELECT.store(2, std::sync::atomic::Ordering::Relaxed);
+        assert!(error.contains("no per-lane value"), "{}", error);
     }
 
     /// The point of the instruction: an unknown bool becomes a per-lane

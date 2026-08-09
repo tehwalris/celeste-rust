@@ -214,7 +214,7 @@ Room (0,0), 70 frames, interleaved A/B, 8 threads:
 | time | 277.07 s | 272.77 s |
 | lanes | 8,164,454 | 8,121,405 |
 | fragments | 100,272 | 100,220 |
-| deopt lanes | 133,744 | 131,920 |
+| deopt lanes | 66,872 | 65,960 |
 | peak RSS | 19.42 GB | 20.32 GB |
 
 The **cost** side is the good news, and it settles the question this plan
@@ -305,3 +305,76 @@ branch on `UnknownBool` sends the whole state down both edges - and pays
 on top. The split's win is confined to keeping the rest of the frame on
 the fast path, which is why its size depends entirely on what share of
 frame time the deopt is, and why that measurement gates the work.
+
+## Decision (2026-08-09, Philippe): lane independence is not negotiable
+
+> "I want the unknown bool lanes being independent thing either way,
+> whether or not performance. I don't want lanes to be dependent on each
+> other. I don't want the results to change depending on what is in which
+> other lane."
+
+So the partition is now ON by default (opt out with
+CELESTE_NO_PARTITION_STRADDLES, for A/B measurement only), despite costing
+4.6% peak RSS for a 1.4% deopt reduction. The property being bought is
+that batching is a pure implementation detail: a lane's result must not
+depend on which other lanes share its state, or the chunk size becomes
+part of the abstraction and every result is contingent on it.
+`rewrite simdcheck` is the acceptance gate for that claim and should be
+run on room (0,0), which is the room that can violate it.
+
+## The select split
+
+Also landed, same session, on the same decision: `select` on a whole-value
+`UnknownBool` now SPLITS the state - a true copy and a false copy - rather
+than erroring into the whole-state plain-program fallback.
+
+Soundness: the condition is unknown for EVERY lane (an honest
+`UnknownBool` post-partition), so the two copies cover every possibility
+between them. It is precisely what `branch` on `UnknownBool` already does,
+and what the plain fallback was doing by a much more expensive route -
+which yields a testable prediction: the split should produce results
+IDENTICAL to the deopt, not merely sound. Diverging lane counts in the A/B
+would mean one of the two paths is wrong and must be understood before the
+split is trusted.
+
+The condition local is overwritten in each copy, not just the arms picked,
+so that a later instruction reading the same condition sees the branch its
+copy represents. Two copies that disagreed about the same fact would be
+unsound in a way no lane count would reveal.
+
+Cost: unlike the partition, the split COPIES lanes rather than moving
+them, so lanes double at each firing, and `obj.collide` is a four-sided
+test. The guard against runaway is that the plain program already paid
+exactly this doubling via branches; `record_select_split` counts firings
+per frame so it can be watched against the fragment count.
+
+Why it was worth building, measured on room (0,0) before the change:
+
+    frame   deopt CPU   % of frame wall   deopt lanes
+    f066      0.75 s          4.6%              652
+    f067      2.57 s         13.9%            2,278
+    f068      6.68 s         28.3%            5,729
+    f069     14.97 s         54.6%           17,343
+    f070     27.15 s         98.0%           40,870
+
+Deopted lanes were 0.5% of all lanes but >=12% of frame CPU, i.e. a
+deopted lane cost >=25x a normal one, and they grew ~2.4x per frame while
+total lanes grew ~2%. Frames 66-70 alone were 52 s of a 234 s run. The
+lane count alone said 1.6% and would have closed this as not worth doing;
+the timer is what showed otherwise, which is the general lesson.
+
+NOTE on the "% of frame wall" column: it is CPU summed over 8 worker
+threads against WALL time, so it overstates the recoverable share. The
+true wall saving is bounded below by ~12% (deopt perfectly spread across
+workers) and above by the printed figure (deopt entirely on the critical
+path). The A/B of the split against the deopt is the number that settles
+it, and is what should be quoted.
+
+### Correction to the deopt-lane figures above
+
+An earlier revision of this file, and the commit message for the partition,
+quoted the deopt as 133,744 -> 131,920 lanes. Those are exactly DOUBLE the
+real numbers, which the run summaries give as **66,872 -> 65,960**. The
+error was mine in transcription, not in the runs. The ratio is unaffected
+(-1.4% either way) and no conclusion changes, but the absolute figures
+were wrong and are corrected here.
