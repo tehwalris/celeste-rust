@@ -197,3 +197,83 @@ and it should be scoped before anything else here is touched.
 Note the pleasant consequence: `MaybeBool` and its guards already exist
 and are already tested. The transient is the right carrier; only its
 RESOLUTION changes, from duplicate-the-lane to split-the-state.
+
+## Result (2026-08-09): built, correct, and very nearly pointless
+
+`partition_maybe_bool` is implemented and wired through the spill return
+described above. It behaves exactly as designed. It does not pay.
+
+Room (1,0), 45 frames: **byte-identical** with the partition on and off.
+That is the predicted control - room (1,0) produces zero mixed
+comparisons, so the partition must be a no-op there, and it is.
+
+Room (0,0), 70 frames, interleaved A/B, 8 threads:
+
+| | partition OFF | partition ON |
+|---|---|---|
+| time | 277.07 s | 272.77 s |
+| lanes | 8,164,454 | 8,121,405 |
+| fragments | 100,272 | 100,220 |
+| deopt lanes | 133,744 | 131,920 |
+| peak RSS | 19.42 GB | 20.32 GB |
+
+The **cost** side is the good news, and it settles the question this plan
+was written to answer: fragments moved by 0.05%. The feared multiplicative
+re-splitting - each partition being cut again by the next comparison -
+does not happen. Lanes even fell 0.5%, which is what a strictly more
+precise abstraction should do.
+
+The **benefit** side did not materialise. The whole point was to stop
+dropping states onto the plain program, and the deopt fell only 1.4%.
+
+### Why, and it is not a bug
+
+The per-frame collapse census at f070 (partition on):
+
+    78,184 constructions where some lane is unknown
+    13,109 MIXED (16.8%)  <- all the partition can touch
+    65,075 ALL-unknown (83.2%)
+
+An all-unknown comparison collapses to `UnknownBool` no matter what,
+because the whole-value tag is *honest* there - no lane has an answer to
+preserve. Partitioning is defined to leave that case alone.
+
+And the surviving deopt is exactly that case. Every deopt at f070 is the
+same site, the strawberry's collide test:
+
+    %122 = %110 > %121                  <- comparison collapses
+    %125 = select %93 ? %122 : %93      <- and: Bool ? UnknownBool -> UnknownBool
+    %157 = select %125 ? %154 : %125    <- select on UnknownBool: whole-state fallback
+
+So the partition is aimed at 17% of collapses while the deopt is driven by
+the other 83%. The earlier "70.1% of constructions are mixed" figure that
+motivated this plan was measured over a different frame range and does not
+hold at the depth where the deopt actually costs anything.
+
+### What would actually remove the deopt
+
+Not this. The lever is the *consumer*: make `select` on a whole-value
+`UnknownBool` SPLIT THE STATE (one copy with the condition true, one
+false) instead of erroring. That is sound for an all-unknown condition -
+it is precisely what `branch` on `UnknownBool` already does - and it keeps
+the rest of the frame on the fast path instead of re-running the whole
+frame under the plain program. The spill plumbing this plan added is
+exactly the mechanism it needs, so the work here is not wasted; it is the
+first half.
+
+That is task #96, and it should not be started until the pending
+measurement says what the deopt actually costs in TIME. 131,920 deopted
+lanes out of 8.1M is 1.6% of lanes, but a deopted lane costs far more than
+a normal one, so the time share could be anywhere from 2% to 40%. A
+`record_deopt_nanos` counter now reports it per frame. Build nothing here
+until that number exists.
+
+### Disposition
+
+Kept, env-gated `CELESTE_PARTITION_STRADDLES`, default OFF - it is neutral
+on time and costs 4.6% peak RSS, and memory is the binding constraint. It
+stays because it is the prerequisite for #96 and because it is the only
+known fix for room (0,0)'s batch-dependence (whether a collapse fires
+depends on whether ANY lane in the state straddles, so it changes with the
+chunk size; room (1,0) never collapses, which is why it certifies as
+chunk-invariant and room (0,0) does not).

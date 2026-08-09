@@ -53,6 +53,13 @@ pub const FILTER_BAND: FilterReason = "filter_band";
 /// semantic filtering - the chunks re-merge at the boundary.
 pub const FILTER_CHUNK: FilterReason = "filter_chunk";
 
+/// Partitioning a MIXED interval comparison: the lanes with a definite
+/// answer keep it, the lanes that straddle are carried off into their own
+/// state where `UnknownBool` is honest. See `partition_maybe_bool`. Not
+/// overhead and not the search fanning out - it is precision being kept
+/// that the old whole-value collapse threw away.
+pub const FILTER_STRADDLE: FilterReason = "filter_straddle";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct State {
     pub heap: Heap,
@@ -179,6 +186,11 @@ impl State {
 
     /// Filters all vector values in the state by a mask in place.
     /// The resulting state's vector_size will be the number of true values in the mask.
+    /// `filter_by_mask_in_place` for callers outside this module.
+    pub fn filter_by_mask_in_place_pub(&mut self, mask: &[bool], reason: FilterReason) {
+        self.filter_by_mask_in_place(mask, reason)
+    }
+
     fn filter_by_mask_in_place(&mut self, mask: &[bool], reason: FilterReason) {
         // The mask is scanned once here; every vector below gathers the
         // kept lanes directly, O(kept) per vector instead of O(mask), and

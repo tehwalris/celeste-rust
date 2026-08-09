@@ -48,39 +48,43 @@ pub fn interpret_unary_op(state: &State, op: UnaryOp, v: &Value) -> Result<Value
     }
 }
 
-/// Per-lane tri-state resolution for MIXED interval comparisons
-/// (CELESTE_TRI_STATE=1). OFF by default, because the first deep
-/// measurement showed it is not yet deployable:
+/// Per-lane handling of MIXED interval comparisons
+/// (CELESTE_PARTITION_STRADDLES=1), where some lanes have a definite
+/// answer and some straddle. OFF by default; see plans/tristate-plan.md.
 ///
-///   room (0,0), frames 1-78, identical inputs
-///     baseline:  2394 s, peak 27.9 GB, 9.48 M lanes deopted
-///     tri-state: identical lanes every frame through f65, identical
-///                cumulative time (586.6 s vs 589.3 s), then OOM at
-///                102 GB inside frame 66
+/// Building a whole-value `UnknownBool` from such a comparison is a join
+/// ACROSS LANES - one lane's ambiguity destroying its neighbours' answers
+/// - and it is the only known source of batch-dependence in the
+/// interpreter, since whether it fires depends on whether ANY lane in the
+/// state straddles and therefore on the chunk size. With the flag on, the
+/// comparison yields a `MaybeBool` transient that
+/// `core_interpreter::partition_maybe_bool` resolves by SPLITTING THE
+/// STATE: definite lanes keep a real `Bool`, straddling lanes leave in a
+/// spill state whose `UnknownBool` is then honest.
 ///
-/// So the mechanism is right - it reproduces the baseline's results
-/// exactly, and costs nothing when it does not fire - but the cost model
-/// was wrong. Resolution duplicates the ambiguous lanes eagerly at every
-/// mixed comparison, and `obj.collide` has several in a row, so once the
-/// ambiguous set stops being a sliver the intra-frame transient
-/// multiplies with no merge in between to collapse the (largely
-/// identical) copies. The design premise - that per-lane analysis would
-/// leave "a few thousand" of 5.9 M lanes ambiguous - is untested and
-/// looks false near the strawberry.
+/// The first design duplicated the ambiguous lanes instead of moving
+/// them, and OOMed at 102 GB inside room (0,0) frame 66 - `obj.collide`
+/// has several mixed comparisons in a row with no merge between them, so
+/// the copies multiplied. A partition moves lanes and never creates one,
+/// which fixed that: measured at f70 the fragment count moves 0.05%.
 ///
-/// Keep the flag: the lane-independence property it restores is worth
-/// having, and the diagnosis needs the code. But the default must be the
-/// path we know completes.
+/// It is off by default because it does not currently pay. It is aimed at
+/// mixed comparisons, but at depth 83% of collapses are ALL-unknown -
+/// where the whole-value tag is honest and no split is possible - and
+/// those are what actually drive the plain-program deopt. So it costs
+/// 4.6% peak RSS and buys a 1.4% deopt reduction. It stays because it is
+/// the prerequisite for splitting `select` on `UnknownBool` (the actual
+/// fix) and because it is the only known cure for the batch-dependence.
 /// 0 = not yet read, 1 = off, 2 = on. An atomic rather than a OnceLock so
 /// tests can drive both paths; the env var is the default, read once.
-static TRI_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static PARTITION_STRADDLES: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-fn tri_state_enabled() -> bool {
+fn partition_straddles_enabled() -> bool {
     use std::sync::atomic::Ordering;
-    match TRI_STATE.load(Ordering::Relaxed) {
+    match PARTITION_STRADDLES.load(Ordering::Relaxed) {
         0 => {
-            let on = std::env::var_os("CELESTE_TRI_STATE").is_some();
-            TRI_STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            let on = std::env::var_os("CELESTE_PARTITION_STRADDLES").is_some();
+            PARTITION_STRADDLES.store(if on { 2 } else { 1 }, Ordering::Relaxed);
             on
         }
         1 => false,
@@ -88,12 +92,12 @@ fn tri_state_enabled() -> bool {
     }
 }
 
-/// Force the tri-state path on or off, overriding the environment.
+/// Force the partition path on or off, overriding the environment.
 /// For tests, which must be able to exercise both paths regardless of how
 /// the suite was invoked.
 #[cfg(test)]
-pub fn set_tri_state(on: bool) {
-    TRI_STATE.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+pub fn set_partition_straddles(on: bool) {
+    PARTITION_STRADDLES.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Helper to lift a number to an interval
@@ -555,13 +559,13 @@ pub fn interpret_binary_op(l: &Value, op: BinaryOp, r: &Value) -> Result<Value> 
                 };
                 crate::op_census::record_unknown_collapse(definite, total);
             }
-            if all_unknown || (any_unknown && !tri_state_enabled()) {
+            if all_unknown || (any_unknown && !partition_straddles_enabled()) {
                 // No lane has an answer, or some lane does not and tri-state
                 // is off: collapse to the whole-value case, which is what
                 // this arm did before tri-state existed and what the branch
                 // machinery already handles.
                 //
-                // The `!tri_state_enabled()` term is load-bearing and was
+                // The `!partition_straddles_enabled()` term is load-bearing and was
                 // missing: gating tri-state off sent MIXED comparisons into
                 // the `unwrap` arm below, which panics on the first lane
                 // that straddles. Room (1,0) never showed it because

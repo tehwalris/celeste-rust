@@ -1773,7 +1773,14 @@ fn inject_origin(state: &mut State) {
 ///
 /// An error here is terminal on purpose: the plain program is ground truth, so
 /// a state that fails under it too is a real bug, not a missed specialization.
-fn run_deopt_frame(deopt: &DeoptTarget, mut state: State) -> Result<Vec<State>> {
+fn run_deopt_frame(deopt: &DeoptTarget, state: State) -> Result<Vec<State>> {
+    let started = std::time::Instant::now();
+    let out = run_deopt_frame_inner(deopt, state);
+    crate::op_census::record_deopt_nanos(started.elapsed().as_nanos() as u64);
+    out
+}
+
+fn run_deopt_frame_inner(deopt: &DeoptTarget, mut state: State) -> Result<Vec<State>> {
     deopt
         .mapping
         .to_canonical(&mut state)

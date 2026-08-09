@@ -509,11 +509,15 @@ impl<'a> CoreInterpreter<'a> {
         }
     }
 
+    /// Returns the SPILL state when a mixed comparison partitioned (see
+    /// `partition_maybe_bool`); `None` otherwise, which is almost always.
+    /// `Option` rather than `Vec` deliberately: this runs for every
+    /// instruction of every state, so the common path must not allocate.
     pub fn interpret_non_call_instruction(
         &mut self,
         local_id: LocalId,
         instruction: &Instruction,
-    ) -> Result<()> {
+    ) -> Result<Option<State>> {
         // Naming the instruction costs nothing unless it fails, and a rewrite
         // that speculates an arm onto lanes that cannot take it fails *here* -
         // so this is what turns "something in the program went wrong" into a
@@ -531,14 +535,14 @@ impl<'a> CoreInterpreter<'a> {
             // The one place a transient tri-state becomes a stored value.
             // Resolving here - rather than at each consumer - is what lets
             // `select` and the branch machinery stay untouched: by the time
-            // they read a cell, its condition is definite.
-            let value = match value {
-                Value::MaybeBool(tri) => resolve_maybe_bool(&mut self.state, tri),
-                definite => definite,
-            };
+            // they read a cell, its condition is definite (or is an honest
+            // whole-value `UnknownBool` in the spilled state).
+            if let Value::MaybeBool(tri) = value {
+                return Ok(partition_maybe_bool(&mut self.state, local_id, tri));
+            }
             self.state.local_env.set(local_id, value);
         }
-        Ok(())
+        Ok(None)
     }
 
     pub fn interpret_call_instruction(
@@ -746,7 +750,38 @@ impl<'a> CoreInterpreter<'a> {
 ///
 /// Definite lanes are untouched, so no lane's imprecision can reach a
 /// neighbour (the LANE INDEPENDENCE criterion in plans/tristate-plan.md).
-pub fn resolve_maybe_bool(state: &mut State, tri: MaybeVector<Option<bool>>) -> Value {
+/// Split a mixed comparison into a definite state and an ambiguous one.
+///
+/// This is the PARTITION that replaces tri-state's duplication. Given a
+/// per-lane tri-state, the calling state keeps the lanes that HAVE an
+/// answer and stores a real `Bool` vector; the lanes that straddle are
+/// carried off into a returned state whose value is `UnknownBool` - which
+/// is now honest, because every lane of THAT state really is unknown.
+///
+/// Why partition rather than duplicate: `resolve_maybe_bool` (below, now
+/// unused by the interpreter) turned each ambiguous lane into two, a true
+/// copy and a false copy, so the growth compounded across the several
+/// comparisons in `obj.collide` and reached 102 GB at frame 66. A
+/// partition moves lanes; it never creates them. Total lane count across
+/// the two states is exactly the input's.
+///
+/// Why it matters beyond memory: building a whole-value `UnknownBool` from
+/// a comparison where only SOME lanes straddle is a join ACROSS LANES -
+/// one lane's ambiguity destroying its neighbours' answers. Measured on
+/// room (0,0), 70.1% of constructions are mixed and 69.1% of the lanes at
+/// them had a definite answer that was being discarded. It is also the
+/// sole known source of batch-dependence: whether the collapse fires
+/// depends on whether ANY lane in the state straddles, so it changes with
+/// the chunk size (room (1,0), which never collapses, is chunk-invariant;
+/// room (0,0) is not).
+///
+/// Returns `None` when no lane straddles - the overwhelmingly common case,
+/// which must not allocate or split.
+pub fn partition_maybe_bool(
+    state: &mut State,
+    local_id: LocalId,
+    tri: MaybeVector<Option<bool>>,
+) -> Option<State> {
     let n = state.vector_size;
     let per_lane: Vec<Option<bool>> = match &tri {
         MaybeVector::Scalar(t) => vec![*t; n],
@@ -755,21 +790,42 @@ pub fn resolve_maybe_bool(state: &mut State, tri: MaybeVector<Option<bool>>) -> 
             v.as_ref().clone()
         }
     };
-    let ambiguous: Vec<bool> = per_lane.iter().map(|t| t.is_none()).collect();
-    let extra = crate::interpreter::value::count_true(&ambiguous);
-    if extra == 0 {
-        // All definite: identical to what the comparison used to return.
-        return Value::Bool(MaybeVector::vector(
-            per_lane.into_iter().map(|t| t.unwrap()).collect(),
-        ));
+    let definite: Vec<bool> = per_lane.iter().map(|t| t.is_some()).collect();
+    let n_definite = crate::interpreter::value::count_true(&definite);
+
+    if n_definite == n {
+        // Nothing straddles: exactly what the comparison used to return.
+        state.local_env.set(
+            local_id,
+            Value::Bool(MaybeVector::vector(
+                per_lane.into_iter().map(|t| t.unwrap()).collect(),
+            )),
+        );
+        return None;
     }
-    state.duplicate_lanes(&ambiguous);
-    // Originals: definite lanes keep their answer, ambiguous ones take the
-    // TRUE resolution. Appended copies (in ambiguous-lane order, matching
-    // `duplicate_lanes`) take the FALSE one.
-    let mut lanes: Vec<bool> = per_lane.iter().map(|t| t.unwrap_or(true)).collect();
-    lanes.resize(n + extra, false);
-    Value::Bool(MaybeVector::vector(lanes))
+    if n_definite == 0 {
+        // Every lane straddles, so the whole-value tag is honest and no
+        // split is needed. `interpret_binary_op` only builds a MaybeBool
+        // when the lanes are MIXED, so this is defensive.
+        state.local_env.set(local_id, Value::UnknownBool);
+        return None;
+    }
+
+    let ambiguous: Vec<bool> = definite.iter().map(|d| !d).collect();
+    let mut spill = state.filter_by_mask_clone(
+        &ambiguous,
+        crate::interpreter::state::FILTER_STRADDLE,
+    );
+    spill.local_env.set(local_id, Value::UnknownBool);
+
+    state.filter_by_mask_in_place_pub(&definite, crate::interpreter::state::FILTER_STRADDLE);
+    state.local_env.set(
+        local_id,
+        Value::Bool(MaybeVector::vector(
+            per_lane.into_iter().flatten().collect(),
+        )),
+    );
+    Some(spill)
 }
 
 
@@ -877,66 +933,114 @@ mod expand_tests {
         assert!(error.contains("expected a bool"), "{}", error);
     }
 
-    /// Only the ambiguous lanes duplicate - the point of the whole design.
-    /// Three lanes, one ambiguous: four lanes out, not six.
+    /// The partition MOVES lanes; it must never create one. Three lanes,
+    /// one ambiguous: two definite lanes stay and one straddler leaves, so
+    /// the two states hold exactly three lanes between them.
     #[test]
-    fn resolve_duplicates_only_the_ambiguous_lanes() {
+    fn partition_moves_the_ambiguous_lanes_without_creating_any() {
         let (mut state, cell) = three_lane_state();
         let tri = MaybeVector::vector(vec![Some(true), None, Some(false)]);
-        let resolved = resolve_maybe_bool(&mut state, tri);
+        let spill = partition_maybe_bool(&mut state, id(10), tri).expect("a mixed tri-state splits");
 
-        assert_eq!(state.vector_size, 4, "one ambiguous lane adds exactly one");
-        // Originals keep their answers; the ambiguous one resolves true and
-        // its appended copy resolves false.
+        assert_eq!(state.vector_size, 2, "the two definite lanes stay");
+        assert_eq!(spill.vector_size, 1, "the straddler leaves");
+        // Total is conserved - the property that distinguishes a partition
+        // from the duplication this replaced.
+        assert_eq!(state.vector_size + spill.vector_size, 3);
+
+        // The definite side keeps real answers...
         assert_eq!(
-            resolved,
-            Value::Bool(MaybeVector::vector(vec![true, true, false, false]))
+            state.local_env.get(id(10)),
+            &Value::Bool(MaybeVector::vector(vec![true, false]))
         );
-        // The duplicated lane carries the ambiguous lane's DATA, so the
-        // appended lane must equal lane 1 in every other column.
+        // ...and the ambiguous side's whole-value tag is now honest, because
+        // every lane in THAT state really is unknown.
+        assert_eq!(spill.local_env.get(id(10)), &Value::UnknownBool);
+
+        // Each side carries its own lanes' data: lanes 0 and 2 stayed, lane
+        // 1 left.
         match state.heap.get(cell) {
             HeapValue::Value(Value::Number(MaybeVector::Vector(nums))) => {
-                assert_eq!(nums.len(), 4);
-                assert_eq!(nums[3], nums[1], "copy must carry the source lane's data");
+                assert_eq!(nums.len(), 2);
+                assert_eq!(
+                    (nums[0].as_i16(), nums[1].as_i16()),
+                    (Some(4), Some(6)),
+                    "definite side keeps lanes 0 and 2"
+                );
+            }
+            other => panic!("unexpected cell {:?}", other),
+        }
+        // A one-lane filter collapses a uniform column to a scalar, so
+        // accept either representation and check the value.
+        match spill.heap.get(cell) {
+            HeapValue::Value(Value::Number(nums)) => {
+                let lanes: Vec<_> = match nums {
+                    MaybeVector::Scalar(v) => vec![*v],
+                    MaybeVector::Vector(v) => v.as_ref().clone(),
+                };
+                assert_eq!(lanes.len(), 1);
+                assert_eq!(lanes[0].as_i16(), Some(5), "spill carries lane 1");
             }
             other => panic!("unexpected cell {:?}", other),
         }
     }
 
-    /// An all-definite tri-state must behave exactly as the old code did:
-    /// a plain Bool and no widening at all.
+    /// An all-definite tri-state must behave exactly as the old code did: a
+    /// plain Bool, no split, and no allocation. This is the overwhelmingly
+    /// common case and it must stay free.
     #[test]
-    fn resolve_is_a_no_op_when_every_lane_is_definite() {
+    fn partition_is_a_no_op_when_every_lane_is_definite() {
         let (mut state, _) = three_lane_state();
         let tri = MaybeVector::vector(vec![Some(true), Some(false), Some(true)]);
-        let resolved = resolve_maybe_bool(&mut state, tri);
+        let spill = partition_maybe_bool(&mut state, id(10), tri);
+        assert!(spill.is_none(), "nothing straddles, so nothing splits");
         assert_eq!(state.vector_size, 3);
         assert_eq!(
-            resolved,
-            Value::Bool(MaybeVector::vector(vec![true, false, true]))
+            state.local_env.get(id(10)),
+            &Value::Bool(MaybeVector::vector(vec![true, false, true]))
         );
     }
 
+    /// An ALL-straddling tri-state is the one case where the whole-value tag
+    /// was always honest, so it must not split either.
+    #[test]
+    fn partition_does_not_split_when_every_lane_straddles() {
+        let (mut state, _) = three_lane_state();
+        let tri = MaybeVector::vector(vec![None, None, None]);
+        let spill = partition_maybe_bool(&mut state, id(10), tri);
+        assert!(spill.is_none(), "no lane has an answer to preserve");
+        assert_eq!(state.vector_size, 3);
+        assert_eq!(state.local_env.get(id(10)), &Value::UnknownBool);
+    }
+
     /// LANE INDEPENDENCE in miniature: a definite lane's answer must not
-    /// depend on whether an ambiguous lane shares its state. Resolving
-    /// lane 0 alone and resolving it batched must agree.
+    /// depend on whether an ambiguous lane shares its state. This is the
+    /// property whose absence made room (0,0) batch-dependent - whether the
+    /// collapse fires used to depend on whether ANY lane in the state
+    /// straddled, so the answer changed with the chunk size.
     #[test]
     fn a_definite_lane_is_unaffected_by_an_ambiguous_neighbour() {
+        // Lane 0 is definite in both runs; in the first it shares a state
+        // with a straddler, in the second it does not.
         let (mut batched, _) = three_lane_state();
-        let with_neighbour =
-            resolve_maybe_bool(&mut batched, MaybeVector::vector(vec![Some(true), None, Some(false)]));
-        let batched_lane0 = match &with_neighbour {
+        partition_maybe_bool(
+            &mut batched,
+            id(10),
+            MaybeVector::vector(vec![Some(true), None, Some(false)]),
+        );
+        let batched_lane0 = match batched.local_env.get(id(10)) {
             Value::Bool(MaybeVector::Vector(v)) => v[0],
             Value::Bool(MaybeVector::Scalar(b)) => *b,
             other => panic!("expected bools, got {:?}", other),
         };
 
         let (mut alone, _) = three_lane_state();
-        let solo = resolve_maybe_bool(
+        partition_maybe_bool(
             &mut alone,
+            id(10),
             MaybeVector::vector(vec![Some(true), Some(true), Some(false)]),
         );
-        let solo_lane0 = match &solo {
+        let solo_lane0 = match alone.local_env.get(id(10)) {
             Value::Bool(MaybeVector::Vector(v)) => v[0],
             Value::Bool(MaybeVector::Scalar(b)) => *b,
             other => panic!("expected bools, got {:?}", other),
@@ -958,10 +1062,10 @@ mod expand_tests {
     /// select succeeds.
     #[test]
     fn a_straddling_lane_no_longer_poisons_the_select() {
-        use crate::interpreter::op::{interpret_binary_op, interpret_select, set_tri_state};
+        use crate::interpreter::op::{interpret_binary_op, interpret_select, set_partition_straddles};
         use crate::ir::BinaryOp;
         use crate::pico8_num::Pico8NumInterval;
-        set_tri_state(true);
+        set_partition_straddles(true);
 
         let n = |v: i16| Pico8Num::from_i16(v);
         // Lane 0: [0,1] < 10   -> definitely true
@@ -982,24 +1086,36 @@ mod expand_tests {
         };
 
         let (mut state, _) = three_lane_state();
-        let condition = resolve_maybe_bool(&mut state, tri);
-        assert_eq!(state.vector_size, 4, "only the straddling lane duplicates");
+        let spill = partition_maybe_bool(&mut state, id(10), tri).expect("the mixed lane splits");
+        assert_eq!(state.vector_size, 2, "the two definite lanes stay together");
+        assert_eq!(spill.vector_size, 1, "only the straddler leaves");
 
         // The definite lanes kept the answers they would have had alone.
+        let condition = state.local_env.get(id(10)).clone();
         assert_eq!(
             condition,
-            Value::Bool(MaybeVector::vector(vec![true, true, false, false]))
+            Value::Bool(MaybeVector::vector(vec![true, false]))
         );
 
-        // And the select that used to fail now resolves per lane.
+        // And the select that used to drop the whole state onto the plain
+        // program now resolves per lane on the definite side.
         let a = Value::Number(MaybeVector::Scalar(n(7)));
         let b = Value::Number(MaybeVector::Scalar(n(9)));
         let picked = interpret_select(&condition, &a, &b).unwrap();
         assert_eq!(
             picked,
-            Value::Number(MaybeVector::vector(vec![n(7), n(7), n(9), n(9)])),
-            "straddling lane appears once per resolution, definite lanes untouched"
+            Value::Number(MaybeVector::vector(vec![n(7), n(9)])),
+            "definite lanes pick per lane instead of collapsing"
         );
+
+        // The spill still cannot select - its condition is genuinely
+        // unknown - and that residue is what the whole-state fallback is
+        // for. Partitioning shrinks the fallback; it does not remove it.
+        let error = format!(
+            "{:#}",
+            interpret_select(spill.local_env.get(id(10)), &a, &b).unwrap_err()
+        );
+        assert!(error.contains("no per-lane value"), "{}", error);
     }
 
     /// An ALL-straddling comparison keeps the old whole-value behaviour, so
@@ -1014,7 +1130,7 @@ mod expand_tests {
     /// constantly; room (1,0) produces none, so every gate ran green).
     #[test]
     fn a_mixed_comparison_with_tri_state_off_collapses_instead_of_panicking() {
-        use crate::interpreter::op::{interpret_binary_op, set_tri_state};
+        use crate::interpreter::op::{interpret_binary_op, set_partition_straddles};
         use crate::pico8_num::{Pico8Num, Pico8NumInterval};
 
         let n = |v: i16| Pico8Num::from_i16(v);
@@ -1025,7 +1141,7 @@ mod expand_tests {
         ]));
         let right = Value::Number(MaybeVector::Scalar(n(5)));
 
-        set_tri_state(false);
+        set_partition_straddles(false);
         let off = interpret_binary_op(&left, crate::ir::BinaryOp::LessThan, &right)
             .expect("a mixed comparison must not error");
         assert_eq!(
@@ -1034,7 +1150,7 @@ mod expand_tests {
             "with the gate off, a straddling lane must collapse the whole value"
         );
 
-        set_tri_state(true);
+        set_partition_straddles(true);
         let on = interpret_binary_op(&left, crate::ir::BinaryOp::LessThan, &right)
             .expect("a mixed comparison must not error");
         assert!(
@@ -1042,15 +1158,15 @@ mod expand_tests {
             "with the gate on, the definite lanes keep their answers, got {:?}",
             on
         );
-        set_tri_state(false);
+        set_partition_straddles(false);
     }
 
     #[test]
     fn an_all_straddling_comparison_is_still_unknown_bool() {
-        use crate::interpreter::op::{interpret_binary_op, set_tri_state};
+        use crate::interpreter::op::{interpret_binary_op, set_partition_straddles};
         use crate::ir::BinaryOp;
         use crate::pico8_num::Pico8NumInterval;
-        set_tri_state(true);
+        set_partition_straddles(true);
 
         let n = |v: i16| Pico8Num::from_i16(v);
         let straddling = Value::NumberInterval(MaybeVector::vector(vec![

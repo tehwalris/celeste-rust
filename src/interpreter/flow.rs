@@ -217,8 +217,16 @@ impl<'a> BoundInterpreterFlow<'a> {
                             }
                             _ => {
                                 let mut interpreter = interpreter;
-                                interpreter.interpret_non_call_instruction(*local_id, instruction)?;
+                                // A mixed interval comparison partitions:
+                                // the definite lanes stay in this state,
+                                // the straddling ones spill into a second.
+                                // `dst` already carries many states per
+                                // instruction (see the Call arm), so this
+                                // needs no new plumbing.
+                                let spill = interpreter
+                                    .interpret_non_call_instruction(*local_id, instruction)?;
                                 dst.push(interpreter.into_state());
+                                dst.extend(spill);
                             }
                         }
                     }

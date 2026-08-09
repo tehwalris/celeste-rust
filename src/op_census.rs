@@ -199,7 +199,7 @@ static FILTER_REASON_NANOS: [AtomicU64; REASON_COUNT] = [const { AtomicU64::new(
 /// merge could raise it.
 static FILTER_REASON_RUNS: [AtomicU64; REASON_COUNT] = [const { AtomicU64::new(0) }; REASON_COUNT];
 
-pub const REASON_COUNT: usize = 7;
+pub const REASON_COUNT: usize = 8;
 pub const REASON_NAMES: [&str; REASON_COUNT] = [
     "filter_branch",
     "filter_dedup",
@@ -208,6 +208,7 @@ pub const REASON_NAMES: [&str; REASON_COUNT] = [
     "filter_deopt",
     "filter_band",
     "filter_chunk",
+    "filter_straddle",
 ];
 
 pub fn record_filter_reason(reason_index: usize, kept: usize, started: Option<std::time::Instant>) {
@@ -318,6 +319,25 @@ pub fn record_unknown_collapse(definite: usize, total: usize) {
     if definite > 0 {
         COLLAPSE_MIXED.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Wall-clock nanoseconds spent inside `run_deopt_frame`, i.e. re-running a
+/// state under the plain program after the rewritten one refused it. Summed
+/// across worker threads, so on an N-thread frame this can exceed the frame's
+/// elapsed time; it is a share-of-CPU figure, not a share-of-wall figure.
+///
+/// This exists to answer "is the deopt worth attacking?" with a number. The
+/// lane count alone cannot: a deopted lane costs far more than a normal one,
+/// so a 1%-of-lanes deopt is not a 1%-of-time deopt.
+static DEOPT_NANOS: AtomicU64 = AtomicU64::new(0);
+
+pub fn record_deopt_nanos(nanos: u64) {
+    DEOPT_NANOS.fetch_add(nanos, Ordering::Relaxed);
+}
+
+/// Per-frame deopt CPU time, resetting the counter.
+pub fn take_deopt_nanos() -> u64 {
+    DEOPT_NANOS.swap(0, Ordering::Relaxed)
 }
 
 /// Per-frame collapse figures, resetting the counters.

@@ -544,6 +544,18 @@ fn bench(
         let frame_start = std::time::Instant::now();
         run.step()?;
         {
+            let deopt_nanos = celeste_rust::op_census::take_deopt_nanos();
+            if deopt_nanos > 0 {
+                let frame_nanos = frame_start.elapsed().as_nanos() as u64;
+                println!(
+                    "  deopt f{:03}: {:.2}s of plain-program CPU ({:.1}% of the frame's \
+                     {:.2}s wall, summed over threads)",
+                    frame,
+                    deopt_nanos as f64 / 1e9,
+                    100.0 * deopt_nanos as f64 / frame_nanos.max(1) as f64,
+                    frame_nanos as f64 / 1e9,
+                );
+            }
             let (calls, mixed, definite, total) =
                 celeste_rust::op_census::take_unknown_collapse();
             if calls > 0 {
