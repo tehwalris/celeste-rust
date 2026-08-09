@@ -1,3 +1,139 @@
+# The position table has to be per LANE, not per chunk (2026-08-09)
+
+The table below says a positional predecessor filter is worth building.
+The first attempt at RECORDING one - which is the part an implementation
+must have, since deriving it from the edges is circular and impossible on
+room (0,0) anyway - is correct and useless, and the gap between those two
+words is the whole result.
+
+`AbstractRun::record_pos_graph` is a read-only probe: it reads the
+positions going into the frame body and coming out, and injects nothing,
+so a recorded run takes exactly the path an unrecorded one does. What it
+cannot do without tagging lanes is say WHICH input produced which output,
+so it records every source cell of a chunk against every destination cell
+of that chunk. On room (1,0), 100 frames, that is:
+
+| table | pairs | src cells per dst | candidates at H=100 |
+|---|---|---|---|
+| exact, from the 10.1e9 edges | 383,528 | 47.1 | 98.3M (0.46x the edge sweep) |
+| **recorded per 8,000-lane chunk** | **58,333,241** | **7,162** | **4.150e9 (19.53x)** |
+| no filter at all | - | - | 4.433e9 (20.86x) |
+
+The recorded table retains **93.6%** of the unfiltered candidate set. Per
+frame it is not a filter at all: 106,587,071 candidates at f080 against a
+flat 8px disc's 2,301,506, out of |R(080)| = 111,171,031.
+
+It is genuinely conservative - `pos-graph --check-against-edges` confirms
+all 383,360 (dst, src) pairs derivable from the edges are present - so
+this is a tightness failure, not a correctness one. An 8,000-lane chunk
+is just spatially wide: its lanes span thousands of cells, and the cross
+product is the square of that.
+
+Build cost, for the record: 2,056.8 s for 100 frames, ~6 GB peak after
+the replay was made to expand in 250k-lane groups (it was 28 GB at f065
+in one go, the same transient that OOMs the edge sweep).
+
+## What has to change
+
+Per-lane attribution, which means an origin column after all - but one
+carrying the source CELL (~8,000 distinct values on room (1,0)) rather
+than the source ROW (213M). That is the sweep's existing replay cost,
+paid ONCE per room to produce a table of ~1.5 MB, instead of 58 GB of
+edges rebuilt per horizon.
+
+It must be done in the replay, not in the forward pass: a per-lane column
+is per-lane distinct, so it forbids the boundary dedup that decides how
+coarse the over-approximation is, and a tagged forward pass would be a
+different search from the certified one. The replay already runs with
+`disable_frontier`, so it has no boundary dedup to lose - which is
+exactly why the cost lands there and not on the forward pass.
+
+`--check-against-edges` is the gate for it on room (1,0), and the census's
+`cand recorded` column is the number that says whether it is tight enough.
+The target to beat is the exact table's 98.3M; anything near 4.15e9 is
+the same failure again.
+
+# The time-expanded sweep: measured, and it is worth doing (2026-08-09)
+
+Can the backward sweep drop its edge graph - 10,072,724,145 edges and
+58 GB for room (1,0), and an outright OOM on room (0,0) - and instead
+re-derive the successors each frame, filtered by PLAYER POSITION?
+`rewrite sweep-census` answers that from the certified room (1,0)
+universe (212,559,009 rows, concrete optimum 100) without running a
+sweep. The unit throughout is ROW-EXPANSIONS: one row carried one frame
+forward, which is what both designs actually pay for.
+
+| over frames 1..H | H=100 | H=105 | H=110 |
+|---|---|---|---|
+| edge sweep today (each row once) | 212.6M | 212.6M | 212.6M |
+| time-expanded, no filter | 4.433e9 (20.9x) | 4.433e9 | 4.433e9 |
+| time-expanded, perfect predecessor oracle | 8.8M (0.04x) | 26.8M (0.13x) | 56.0M (0.26x) |
+| time-expanded, flat 8px disc | 120.9M (0.57x) | 304.8M (1.43x) | 554.8M (2.61x) |
+| time-expanded, per-cell learned radius | 1.652e9 (7.8x) | 1.787e9 (8.4x) | 1.945e9 (9.2x) |
+| **time-expanded, exact per-cell source sets** | **98.3M (0.46x)** | **259.0M (1.22x)** | **486.8M (2.29x)** |
+
+H=100 is the certified optimum, so its band is as thin as a band can
+ever be - every row in it lies on an optimal path. H=105 and H=110 use
+the same `g` with a slacker horizon to show the degradation; they are
+what a horizon the ladder has not yet refuted would look like.
+
+The naive time-expanded cost is 20.9x the edge sweep, not the 39x a
+back-of-envelope from `mean g` suggests: B is monotone
+(`B(i) ⊇ B(i+1) ∩ R(i)`), so a row that has already qualified is never
+re-tested, and only `R(i) \ B(i+1)` is.
+
+## The filter has to be a set, not a radius
+
+The old solver (`celeste-rust-old`, `DistanceTracker`) learned one max
+squared distance per destination cell and painted a disc. That is 7.8x
+WORSE than the edge sweep here, and the reason is a single cell.
+
+Of the 10.07e9 edges, 10,072,669,008 move at most 8 pixels. The other
+55,137 all land in ONE cell - (136, 124) measured from the start room's
+origin, which is the next room's spawn point, where a winning row
+appears. Its true predecessors are the far edge of the PREVIOUS room, so
+the disc that holds them has radius 134px and covers everything. And
+that cell is the seed of `B(H)`, so it is in `B(i+1)` at every late
+frame: the learned-radius candidate count is 119,070,337 at f090 where a
+flat 8px reads 1,247,069.
+
+Storing the exact SET of source cells per destination cell instead - a
+grid bitmap, 8 KB per occupied cell, 8,143 cells and 66 MB on room (1,0),
+47.1 source cells per destination on average - removes the problem
+entirely (1,052,051 at f090) and is tighter than any radius everywhere
+else too. 66 MB against 58 GB of edges.
+
+The 8px disc is listed above for comparison only: it is NOT sound, by
+exactly those 55,137 edges.
+
+## What this does and does not buy
+
+At the horizon the ladder actually lands on it is 0.46x the expansions,
+and the 58 GB edge store, the 303 s CSR shard build, the 537 s
+`fwd.merge` and the reverse BFS all disappear. Five frames of slack makes
+it a wash and ten makes it 2.3x worse - so this is a MEMORY result, not
+primarily a speed one. What it fixes is room (0,0), where the forward
+pass completes (94 frames, 85 min, 60 GB) and only the sweep dies.
+
+Two things the census does not measure, both of which have to be settled
+before the sweep is rewritten:
+
+* Where the source sets come from. Learning them from the edge chunks is
+  fine for a measurement but circular for an implementation - they have
+  to be recorded by the FORWARD pass, which sees every transition exactly
+  once (frontier-only, and the successor relation is a static graph over
+  rows) and can maintain the 66 MB table for free.
+* How a candidate row becomes a `State`. Candidates at frame `i` were
+  discovered at any earlier frame, but the saved batches are grouped BY
+  discovery frame, so the obvious loop re-loads batches 1..i every frame
+  - O(H²/2) decompressions, ~1900 s on room (1,0), which is more than the
+  expansions cost.
+
+Also note the gate has to change shape: a time-expanded sweep at horizon
+H produces `g` only where `e + g <= H`, so it cannot be compared
+element-wise against the full certified `g`. The equivalent full-array
+gate is against the certified array THRESHOLDED at H.
+
 # Room (1,0) re-certified on the parallel build (2026-08-08)
 
 The end-to-end gate for everything below, and the one that matters: a

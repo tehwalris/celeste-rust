@@ -321,6 +321,50 @@ enum Command {
         #[arg(long)]
         banded: bool,
     },
+    /// Build the position-transition table (`rewrite::pos_graph`) by
+    /// replaying the saved frontier batches. Writes `posgraph.bin`; touches
+    /// no checkpoint and needs no edges, so it also works on a room whose
+    /// edge-based sweep cannot run.
+    PosGraph {
+        #[arg(long)]
+        checkpoint_dir: String,
+        /// The forward pass's last frame (its checkpoint must exist).
+        #[arg(long)]
+        frames: u32,
+        /// Also check the table against the edges: every `(dst, src)` cell
+        /// pair the edge chunks contain must be present, or the table is
+        /// not an over-approximation. Only possible where a sweep has run.
+        #[arg(long)]
+        check_against_edges: bool,
+    },
+    /// Measure whether a POSITIONAL predecessor filter could replace the
+    /// sweep's edge graph (see `rewrite::sweep_census`). Read-only: needs a
+    /// finished forward pass with `frames/`, and its `g.bin`; writes only
+    /// `pos.bin` (the per-row player position, cached).
+    SweepCensus {
+        #[arg(long)]
+        checkpoint_dir: String,
+        /// The forward pass's last frame (its checkpoint must exist).
+        #[arg(long)]
+        frames: u32,
+        /// Horizons H for the band (defaults to --frames). A horizon above
+        /// the certified optimum is the interesting case: at the optimum
+        /// itself every banded row lies on an optimal path, so the band is
+        /// as thin as it can ever be.
+        #[arg(long = "horizon", value_delimiter = ',')]
+        horizons: Vec<u32>,
+        /// Candidate radii in pixels.
+        #[arg(long, value_delimiter = ',', default_value = "4,8,16")]
+        radii: Vec<i32>,
+        /// Also measure the old solver's per-cell learned radius, derived
+        /// from the sweep's edge chunks. Slow the first time (it streams
+        /// every edge); cached in `radii.bin`.
+        #[arg(long)]
+        learn_radii: bool,
+        /// Print every Nth frame's row (the totals always cover all frames).
+        #[arg(long, default_value_t = 10)]
+        every: u32,
+    },
 }
 
 fn peak_rss_kb() -> u64 {
@@ -2850,6 +2894,234 @@ fn main() -> Result<()> {
                     ("rows", result.g.len().to_string()),
                 ],
             );
+        }
+        Command::PosGraph { checkpoint_dir, frames, check_against_edges } => {
+            use celeste_rust::rewrite::pos_graph;
+            use celeste_rust::rewrite::state_mapping::StateMapping;
+            let dir = std::path::PathBuf::from(checkpoint_dir);
+            let plain = Program::compile_executable_from_disk()?;
+            let (program, _) = build(&recipe)?;
+            let mapping = StateMapping::from_recipe(&recipe);
+            let mut engine = celeste_rust::rewrite::verify::AbstractRun::start_with_deopt(
+                &program, &plain, mapping, false,
+            )?;
+            let t = std::time::Instant::now();
+            let graph = pos_graph::build_from_replay(&dir, frames, &mut engine)?;
+            println!(
+                "posgraph: {} pairs over {} destination cells, built in {:.1}s",
+                graph.pairs(),
+                graph.live_cells(),
+                t.elapsed().as_secs_f64()
+            );
+            graph.save(&dir)?;
+            if check_against_edges {
+                use celeste_rust::rewrite::sweep_census;
+                let recipe_text = std::fs::read_to_string(&cli.recipe).unwrap_or_default();
+                let fingerprint =
+                    celeste_rust::rewrite::checkpoint::config_fingerprint(&recipe_text);
+                let ck = celeste_rust::rewrite::checkpoint::load(&dir, frames, &fingerprint)?;
+                let table = ck.visited;
+                drop(ck.states);
+                let positions = sweep_census::load_positions(&dir, table.len())?
+                    .map(Ok)
+                    .unwrap_or_else(|| sweep_census::build_positions(&dir, frames, &table))?;
+                let exact = sweep_census::learn_src_cells(&dir, frames, &positions)?;
+                let (mut checked, mut missing) = (0u64, Vec::new());
+                for (dst, src) in exact.pairs() {
+                    checked += 1;
+                    if !graph.srcs_of(dst).contains(&src) {
+                        if missing.len() < 10 {
+                            missing.push((dst, src));
+                        }
+                    }
+                }
+                let n_missing = missing.len();
+                println!(
+                    "posgraph: checked {} edge-derived pairs against {} recorded",
+                    checked,
+                    graph.pairs()
+                );
+                for (dst, src) in &missing {
+                    println!(
+                        "  MISSING {:?} -> {:?}",
+                        pos_graph::cell_xy(*src),
+                        pos_graph::cell_xy(*dst)
+                    );
+                }
+                if n_missing > 0 {
+                    return Err(anyhow!(
+                        "the recorded table is NOT an over-approximation: {} \
+                         edge-derived pairs are absent (first {} shown)",
+                        n_missing,
+                        n_missing.min(10)
+                    ));
+                }
+                println!("posgraph: every edge-derived pair is present - conservative");
+            }
+        }
+        Command::SweepCensus { checkpoint_dir, frames, horizons, radii, learn_radii, every } => {
+            use celeste_rust::rewrite::sweep_census;
+            let horizons = if horizons.is_empty() { vec![frames] } else { horizons };
+            let dir = std::path::PathBuf::from(checkpoint_dir);
+            let recipe_text = std::fs::read_to_string(&cli.recipe).unwrap_or_default();
+            let fingerprint =
+                celeste_rust::rewrite::checkpoint::config_fingerprint(&recipe_text);
+            let ck = celeste_rust::rewrite::checkpoint::load(&dir, frames, &fingerprint)?;
+            let table = ck.visited;
+            drop(ck.states);
+            let g = celeste_rust::rewrite::sweep::load_g(&dir)?;
+            if g.len() != table.len() {
+                return Err(anyhow::anyhow!(
+                    "g.bin has {} rows, the row table {}",
+                    g.len(),
+                    table.len()
+                ));
+            }
+            let positions = match sweep_census::load_positions(&dir, table.len())? {
+                Some(p) => {
+                    println!("census: reusing {}/pos.bin", dir.display());
+                    p
+                }
+                None => {
+                    let t = std::time::Instant::now();
+                    let p = sweep_census::build_positions(&dir, frames, &table)?;
+                    println!("census: positions built in {:.1}s", t.elapsed().as_secs_f64());
+                    sweep_census::save_positions(&dir, &p)?;
+                    p
+                }
+            };
+            let learned = if learn_radii {
+                match sweep_census::load_radii(&dir)? {
+                    Some(r) => {
+                        println!("census: reusing {}/radii.bin", dir.display());
+                        Some(r)
+                    }
+                    None => {
+                        let t = std::time::Instant::now();
+                        let r = sweep_census::learn_radii(&dir, frames, &positions)?;
+                        println!("census: radii learned in {:.1}s", t.elapsed().as_secs_f64());
+                        sweep_census::save_radii(&dir, &r)?;
+                        Some(r)
+                    }
+                }
+            } else {
+                None
+            };
+            // The exact per-cell source sets are the tightest a positional
+            // filter can be, and unlike a disc they can express "the far
+            // edge of the previous room". Same edge stream as the radii.
+            let src_cells = if learn_radii {
+                let t = std::time::Instant::now();
+                let s = sweep_census::learn_src_cells(&dir, frames, &positions)?;
+                println!("census: source sets learned in {:.1}s", t.elapsed().as_secs_f64());
+                Some(s)
+            } else {
+                None
+            };
+            // The table an implementation can actually have: recorded by
+            // the probe, not derived from the edges.
+            let recorded = celeste_rust::rewrite::pos_graph::PosGraph::load(&dir)?;
+            if let Some(pg) = &recorded {
+                println!(
+                    "census: posgraph.bin has {} pairs over {} destination cells",
+                    pg.pairs(),
+                    pg.live_cells()
+                );
+            }
+            let edge_sweep = table.len() as u64;
+            for horizon in &horizons {
+                let horizon = *horizon;
+                let t = std::time::Instant::now();
+                let rows = sweep_census::census(
+                    &table,
+                    &g,
+                    &positions,
+                    horizon,
+                    &radii,
+                    learned.as_deref(),
+                    src_cells.as_ref(),
+                    recorded.as_ref(),
+                )?;
+                println!();
+                println!("=== horizon {} ({:.1}s) ===", horizon, t.elapsed().as_secs_f64());
+                let head: String = radii
+                    .iter()
+                    .map(|r| format!("{:>14}", format!("cand r={}", r)))
+                    .chain(
+                        learned
+                            .iter()
+                            .flat_map(|_| [format!("{:>14}", "cand learned"), format!("{:>8}", "max r")]),
+                    )
+                    .chain(src_cells.iter().map(|_| format!("{:>14}", "cand exact")))
+                    .chain(recorded.iter().map(|_| format!("{:>14}", "cand recorded")))
+                    .collect();
+                println!(
+                    "{:>5}{:>14}{:>14}{:>9}{:>9}{:>14}{}",
+                    "f", "|R(i)|", "|B(i)|", "R cells", "B cells", "new rows", head
+                );
+                let mut naive = 0u64;
+                let mut ideal = 0u64;
+                let mut totals = vec![0u64; radii.len()];
+                let mut learned_total = 0u64;
+                let mut exact_total = 0u64;
+                let mut recorded_total = 0u64;
+                for row in &rows {
+                    exact_total += row.exact.unwrap_or(0);
+                    recorded_total += row.recorded.unwrap_or(0);
+                    naive += row.r_rows;
+                    ideal += row.new_rows;
+                    for (k, c) in row.candidates.iter().enumerate() {
+                        totals[k] += c;
+                    }
+                    learned_total += row.learned.unwrap_or(0);
+                    if row.frame % every == 0 {
+                        let cand: String = row
+                            .candidates
+                            .iter()
+                            .chain(row.learned.iter())
+                            .map(|c| format!("{:>14}", c))
+                            .chain(row.learned_max_px.iter().map(|r| format!("{:>8}", r)))
+                            .chain(row.exact.iter().map(|c| format!("{:>14}", c)))
+                            .chain(row.recorded.iter().map(|c| format!("{:>14}", c)))
+                            .collect();
+                        println!(
+                            "{:>5}{:>14}{:>14}{:>9}{:>9}{:>14}{}",
+                            row.frame,
+                            row.r_rows,
+                            row.b_rows,
+                            row.r_cells,
+                            row.b_cells,
+                            row.new_rows,
+                            cand
+                        );
+                    }
+                }
+                println!("row-expansions over frames 1..{} (the sweep's unit of work):", horizon);
+                let line = |label: String, n: u64| {
+                    println!(
+                        "  {:<34}{:>16}  ({:.2}x today, {:.4} of naive)",
+                        label,
+                        n,
+                        n as f64 / edge_sweep as f64,
+                        n as f64 / naive as f64
+                    )
+                };
+                println!("  {:<34}{:>16}", "edge sweep today (each row once):", edge_sweep);
+                line("time-expanded, no filter:".to_string(), naive);
+                line("time-expanded, perfect oracle:".to_string(), ideal);
+                for (k, r) in radii.iter().enumerate() {
+                    line(format!("time-expanded, radius {}px:", r), totals[k]);
+                }
+                if learned.is_some() {
+                    line("time-expanded, learned radii:".to_string(), learned_total);
+                }
+                if src_cells.is_some() {
+                    line("time-expanded, exact source sets:".to_string(), exact_total);
+                }
+                if recorded.is_some() {
+                    line("time-expanded, RECORDED table:".to_string(), recorded_total);
+                }
+            }
         }
         Command::Bisect { frames } => {
             let baseline = Program::compile_executable_from_disk()?;

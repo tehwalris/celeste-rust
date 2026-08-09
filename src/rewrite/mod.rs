@@ -29,6 +29,7 @@
 pub mod checkpoint;
 pub mod class_dead;
 pub mod liveness;
+pub mod pos_graph;
 pub mod print;
 pub mod program;
 pub mod recipe;
@@ -36,5 +37,6 @@ pub mod rules;
 pub mod slots;
 pub mod state_mapping;
 pub mod sweep;
+pub mod sweep_census;
 pub mod validate;
 pub mod verify;
