@@ -1,5 +1,16 @@
 # Room (0,0) SWEEPS. The thing that could not run, runs (2026-08-09)
 
+**Read the universe caveat first.** Every room (0,0) number below is
+against the forward pass as it stood at `census` 1d24aba, i.e. BEFORE the
+interpreter fixes that partition mixed interval comparisons and split
+`select` on an `UnknownBool` (861c4c7, b8187b6 and follow-ups). Those make
+the abstraction strictly more precise, so room (0,0) now produces fewer
+lanes - the gap is zero through f65, -1.25% at f70, -13% at f79 - and
+`~/celeste-checkpoints/room00` no longer matches what the current binary
+produces. What is demonstrated here is that the sweep RUNS at this scale
+and what it costs; the `g` it produced is not a certification of anything
+and should not be reused. The abstract first-win frame is 80 either way.
+
 The sweep OOMed on room (0,0) with the edge graph - one frame there
 produces 644,653,017 successor lanes, each an edge - while the forward
 pass completed fine. That was the whole point of the rewrite, and it is

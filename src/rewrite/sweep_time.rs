@@ -48,6 +48,14 @@
 //! and its `g` is exactly the edge sweep's, which is the gate. In the event
 //! room (0,0) reported zero out-of-table successors too.
 //!
+//! That paragraph is about to get WEAKER, in the good direction: the
+//! interpreter fixes that partition a mixed comparison instead of collapsing
+//! it (861c4c7, b8187b6 and follow-ups) remove the mechanism it is about, so
+//! there is much less left for a regrouping to change. Re-read it after
+//! those land rather than trusting the percentages. Nothing below depends on
+//! them: the soundness argument is that EVERY grouping over-approximates the
+//! concrete relation, which does not care how coarse any of them are.
+//!
 //! What survives regardless is the only property the band needs: every
 //! grouping over-approximates the CONCRETE transition relation - a finer
 //! group merely lets a lane take the branch it would concretely have taken -
