@@ -1015,6 +1015,18 @@ impl AbstractRun {
         // and is meaningless under the widencheck's rem-only abstraction -
         // that corner still takes the phased path.
         let stream = self.visited_rows.is_some() && !self.rem_only_abstraction;
+        // The recorder's per-lane column would ride into the boundary's row
+        // keys and forbid the frontier dedup, which is what sets how coarse
+        // the whole abstraction is - a recorded streaming run would be a
+        // DIFFERENT SEARCH from the certified one. Refuse rather than trust
+        // the caller to have called `disable_frontier`.
+        if stream && self.pos_obs.is_some() {
+            return Err(anyhow!(
+                "pos-graph recording is only valid on a non-streaming run \
+                 (call disable_frontier first) - its per-lane column would \
+                 change the frontier dedup and so the reachable set"
+            ));
+        }
         let frame_no = self.states_before_merge.len() as u32 + 1;
         let input_states = chunk_states(std::mem::take(&mut self.states));
         // Chunk-parallel path: only for streaming frontier runs, and only
@@ -1300,17 +1312,16 @@ impl AbstractRun {
             // The shape-variant path returns without reaching the frame
             // body, so it has to record for itself or the table would be
             // missing every transition a variant took.
-            let srcs = self
-                .pos_obs
-                .as_ref()
-                .map(|_| super::pos_graph::state_cells(&state))
-                .transpose()?;
+            let mut state = state;
+            if let Some(obs) = self.pos_obs.as_ref() {
+                obs.tag(&mut state)?;
+            }
             match dispatch_variant_frame(vd, state) {
                 VariantOutcome::Ran(outputs) => {
                     counters.variant.0 += vd.total_events.0 - before.0;
                     counters.variant.1 += vd.total_events.1 - before.1;
-                    if let (Some(obs), Some(srcs)) = (self.pos_obs.as_ref(), srcs) {
-                        obs.record(&srcs, &outputs)?;
+                    if let Some(obs) = self.pos_obs.as_ref() {
+                        obs.record(&outputs)?;
                     }
                     return Ok(outputs);
                 }
@@ -1342,15 +1353,15 @@ fn interpret_state_base(
     deopt: Option<&DeoptTarget>,
     frame_cfg: &crate::interpreter::fixed_env::PreparedCfg,
     fixed_env: &crate::interpreter::fixed_env::FixedEnv,
-    state: State,
+    mut state: State,
     counters: &mut FrameEventCounters,
     pos_obs: Option<&super::pos_graph::PosObserver>,
 ) -> Result<Vec<State>> {
-    // Read the input's positions before the state is consumed. This is the
-    // only place that has both sides of a chunk's transition.
-    let srcs = pos_obs
-        .map(|_| super::pos_graph::state_cells(&state))
-        .transpose()?;
+    // Tag each input lane with its own cell before the state is consumed.
+    // This is the only place that has both sides of a chunk's transition.
+    if let Some(obs) = pos_obs {
+        obs.tag(&mut state)?;
+    }
     let mut new_states = Vec::new();
     match deopt {
         None => {
@@ -1407,8 +1418,8 @@ fn interpret_state_base(
             }
         }
     }
-    if let (Some(obs), Some(srcs)) = (pos_obs, srcs) {
-        obs.record(&srcs, &new_states)?;
+    if let Some(obs) = pos_obs {
+        obs.record(&new_states)?;
     }
     Ok(new_states)
 }

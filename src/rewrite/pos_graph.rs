@@ -15,11 +15,16 @@
 //! game's geometry, not of any particular search; and it is used only to
 //! shrink the candidate set that the sweep then actually expands. The
 //! expansion is what establishes an edge. If this table were too small the
-//! sweep would be wrong, so it is built by the FORWARD pass, which sees
-//! every transition exactly once (frontier-only, and the successor relation
-//! is a static graph over rows), and the sweep checks the shape it was given
-//! rather than trusting it. If it is too LARGE the sweep is merely slower,
-//! which is why an over-approximation is safe and a guess is not.
+//! sweep would be wrong, so it is RECORDED - by replaying the saved frontier
+//! batches, which is the same work the forward pass did and so sees every
+//! transition exactly once (frontier-only, and the successor relation is a
+//! static graph over rows) - never guessed. If it is too LARGE the sweep is
+//! merely slower, which is why an over-approximation is safe.
+//!
+//! It is HORIZON-INDEPENDENT by construction: nothing here reads a horizon,
+//! a band or a `g`. It answers "which positions can step into this
+//! position?", which is a property of the game's dynamics. Build once per
+//! room, reuse for every horizon of the ladder.
 //!
 //! Positions are measured relative to the START room. Object coordinates in
 //! the cart are room-local, so the one frame that crosses into the next room
@@ -345,25 +350,37 @@ pub fn build_from_replay(
         .ok_or_else(|| anyhow!("recording was enabled but produced no table"))
 }
 
+/// The per-lane origin column the recorder injects: each lane carries the
+/// CELL its frame-input lane was in. Distinct from the sweep's
+/// `SWEEP_ORIGIN`, which carries a row id.
+pub const POS_ORIGIN: &str = "__pos_origin";
+
 /// Collects the table while a run steps frames.
 ///
-/// It only READS positions - of the state going into the frame body and of
-/// the states coming out - and never injects a column. That matters: an
-/// origin column is per-lane distinct, so it forbids the intra-frame merges
-/// that decide how coarse the whole over-approximation is, which would make
-/// the recorded run a different search from the one being recorded (see the
-/// chunking note in `ladder.sh`). A read-only probe cannot.
+/// Attribution is PER LANE, via `POS_ORIGIN`: the recorder tags each input
+/// lane with its own cell and reads the tag back off each output lane, so a
+/// pair is a real transition rather than a chunk-wide cross product. The
+/// first version of this was read-only and recorded every source cell of a
+/// chunk against every destination cell of it; that is conservative and
+/// completely useless - it kept 93.6% of the unfiltered candidate set,
+/// because an 8,000-lane chunk spans thousands of cells and the cross
+/// product squares that. See BENCHMARK_DATA.md.
 ///
-/// The price of not tagging lanes is that a chunk's sources cannot be
-/// matched to its own destinations, so every source cell of the chunk is
-/// recorded against every destination cell of the chunk. That is an
-/// over-approximation in the safe direction, and it is per CHUNK - the
-/// forward pass's own 8,000-lane grouping - not per frame.
+/// The column is why recording belongs in the REPLAY and not in the forward
+/// pass. A per-lane column is per-lane distinct, so it forbids the boundary
+/// dedup that decides how coarse the whole over-approximation is: a tagged
+/// forward pass would be a DIFFERENT SEARCH from the certified one. The
+/// replay runs with `disable_frontier` and so has no boundary dedup to
+/// lose, which is exactly why the cost lands there. `AbstractRun::step`
+/// refuses to record on a streaming run rather than trusting that.
+///
+/// The tag is a cell, not a row id, on purpose: ~8,000 distinct values
+/// instead of 213M, so what lane dedup remains inside a frame still fires.
 pub struct PosObserver {
-    /// One `(sources, destinations)` observation per chunk, pushed under a
-    /// lock by whichever worker ran it. The cross product is expanded in
-    /// `flush`, off the workers' critical section.
-    pending: std::sync::Mutex<Vec<(Vec<u16>, Vec<u16>)>>,
+    /// Per-lane `(src cell, dst cell)` pairs, pushed under a lock by
+    /// whichever worker ran the chunk. Folded into the table in `flush`, off
+    /// the workers' critical section.
+    pending: std::sync::Mutex<Vec<(u16, u16)>>,
     graph: std::sync::Mutex<PosGraphBuilder>,
 }
 
@@ -373,26 +390,34 @@ impl Default for PosObserver {
     }
 }
 
-fn sorted_unique(cells: &[u16]) -> Vec<u16> {
-    let mut out = cells.to_vec();
-    out.sort_unstable();
-    out.dedup();
-    out
-}
-
 impl PosObserver {
-    /// One chunk's worth: the cells its input lanes were in, and the states
-    /// the frame body produced from them.
-    pub fn record(&self, srcs: &[u16], outputs: &[State]) -> Result<()> {
-        let mut dsts = Vec::new();
+    /// Tag every input lane with its own cell, so the outputs can be
+    /// attributed back to it.
+    pub fn tag(&self, state: &mut State) -> Result<()> {
+        let cells: Vec<u32> = state_cells(state)?.into_iter().map(u32::from).collect();
+        crate::interpreter::deopt_collect::inject_named(state, POS_ORIGIN, &cells);
+        Ok(())
+    }
+
+    /// Read the tags back off one chunk's outputs and pair each with the
+    /// cell that output lane is in.
+    pub fn record(&self, outputs: &[State]) -> Result<()> {
+        let mut pairs = Vec::new();
         for out in outputs {
-            dsts.extend(state_cells(out)?);
+            let srcs = crate::interpreter::deopt_collect::read_origins_named(out, POS_ORIGIN);
+            let dsts = state_cells(out)?;
+            if srcs.len() != dsts.len() {
+                return Err(anyhow!(
+                    "pos observer: {} origins for {} lanes",
+                    srcs.len(),
+                    dsts.len()
+                ));
+            }
+            pairs.extend(srcs.iter().zip(&dsts).map(|(&s, &d)| (s as u16, d)));
         }
-        let (srcs, dsts) = (sorted_unique(srcs), sorted_unique(&dsts));
-        if srcs.is_empty() || dsts.is_empty() {
-            return Ok(());
-        }
-        self.pending.lock().expect("pos observer").push((srcs, dsts));
+        pairs.sort_unstable();
+        pairs.dedup();
+        self.pending.lock().expect("pos observer").extend(pairs);
         Ok(())
     }
 
@@ -401,12 +426,8 @@ impl PosObserver {
     pub fn flush(&self) {
         let pending = std::mem::take(&mut *self.pending.lock().expect("pos observer"));
         let mut graph = self.graph.lock().expect("pos observer");
-        for (srcs, dsts) in pending {
-            for &d in &dsts {
-                for &s in &srcs {
-                    graph.record(s, d);
-                }
-            }
+        for (s, d) in pending {
+            graph.record(s, d);
         }
     }
 
