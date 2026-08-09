@@ -454,3 +454,36 @@ bug that spares the reference TAS would survive it. The complementary
 gate is `simdcheck`, which is about lane independence rather than
 containment, and the checkpoint run reproduced 8,062,451 lanes exactly,
 so the pipeline is at least deterministic.
+
+## The precision gain compounds with depth
+
+Frame-by-frame lanes, room (0,0), ladder level-0 baseline (l0-h94.log,
+neither partition nor split) against the fixed build:
+
+    frame        before         after     delta
+      65       7,210,948     7,210,948    +0.00%
+      66       7,568,640     7,567,998    -0.01%
+      68       7,961,203     7,943,858    -0.22%
+      70       8,164,454     8,062,451    -1.25%
+      72       8,506,417     8,265,617    -2.83%
+      75       9,105,527     8,412,780    -7.61%
+      77      10,370,959     9,206,850   -11.22%
+      79      11,067,899     9,623,143   -13.05%
+
+Three things make this the signature of PRECISION rather than of an
+artifact or a leak:
+
+* it is exactly zero at f65 and turns on at f66, which is where the first
+  straddling comparison appears - the split cannot act before that;
+* it is monotone and never once positive, i.e. the abstract set only ever
+  shrinks, which is what a refinement must do;
+* it compounds, because fewer states at frame N means fewer successors at
+  N+1.
+
+Together with the trace-witness pass this is the case that the fix
+TIGHTENS the abstraction rather than dropping reachable states. It also
+means the abstract bound gets sharper at depth, not just cheaper.
+
+The f70 A/B (baseline 8,164,454 lanes) matches l0-h94's own f70 line
+exactly, so the two runs are comparable and the deltas above are not a
+configuration difference.
