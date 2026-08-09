@@ -437,6 +437,26 @@ impl SrcCells {
     pub fn occupied_cells(&self) -> usize {
         self.bits.len() / GRID_WORDS
     }
+
+    /// Every `(dst cell, src cell)` the edges actually contain. The
+    /// conservativeness gate for a table built any other way: whatever
+    /// claims to over-approximate the predecessor relation has to contain
+    /// all of these.
+    pub fn pairs(&self) -> impl Iterator<Item = (u16, u16)> + '_ {
+        self.index.iter().enumerate().filter(|(_, &at)| at != u32::MAX).flat_map(
+            move |(dst, &at)| {
+                let base = at as usize * GRID_WORDS;
+                self.bits[base..base + GRID_WORDS]
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &w)| w != 0)
+                    .flat_map(move |(w, &word)| {
+                        (0..64).filter(move |b| word & (1 << b) != 0).map(move |b| (w * 64 + b) as u16)
+                    })
+                    .map(move |src| (dst as u16, src))
+            },
+        )
+    }
 }
 
 /// The old design's candidate mask: every cell within cell `c`'s OWN
@@ -487,6 +507,9 @@ pub struct FrameCensus {
     pub learned_max_px: Option<u32>,
     /// Same as `candidates`, under the exact per-cell source sets.
     pub exact: Option<u64>,
+    /// Same, under the table the forward-pass probe actually RECORDS
+    /// (`pos_graph`) - the only one an implementation can have.
+    pub recorded: Option<u64>,
 }
 
 /// Squared-distance field from the set cells, capped at `rmax`. Only the
@@ -521,6 +544,7 @@ pub fn census(
     radii: &[i32],
     learned_radii: Option<&[u32]>,
     src_cells: Option<&SrcCells>,
+    recorded: Option<&crate::rewrite::pos_graph::PosGraph>,
 ) -> Result<Vec<FrameCensus>> {
     let n_rows = g.len();
     if positions.len() != n_rows {
@@ -533,6 +557,8 @@ pub fn census(
     let mut field = vec![u32::MAX; cells];
     let mut learned_in = vec![false; cells];
     let mut exact_in = vec![0u64; GRID_WORDS];
+    let mut recorded_in = vec![0u64; crate::rewrite::pos_graph::CELL_WORDS];
+    let mut b_next_u16: Vec<u16> = Vec::new();
     let mut occupied = vec![false; cells];
     let mut out = Vec::new();
     // Frame `horizon` needs no expansion at all: B(horizon) is the win
@@ -568,6 +594,17 @@ pub fn census(
         if let Some(sc) = src_cells {
             sc.union_into(&b_next_cells, &mut exact_in);
         }
+        if let Some(pg) = recorded {
+            // The recorded table has a node for "no player object", which
+            // the census's cell space represents as NO_CELL; B(i+1) rows
+            // without a position are part of the query.
+            b_next_u16.clear();
+            b_next_u16.extend(b_next_cells.iter().map(|&c| c as u16));
+            if (0..next_end).any(|id| positions[id] == NO_CELL && g[id] <= g_next) {
+                b_next_u16.push(crate::rewrite::pos_graph::NO_CELL);
+            }
+            pg.union_into(&b_next_u16, &mut recorded_in);
+        }
 
         // R(i) and B(i), and the candidates.
         occupied.fill(false);
@@ -579,6 +616,7 @@ pub fn census(
         let mut candidates = vec![0u64; radii.len()];
         let mut learned = 0u64;
         let mut exact = 0u64;
+        let mut recorded_candidates = 0u64;
         for id in 0..r_end {
             let c = positions[id];
             if c != NO_CELL && !occupied[c as usize] {
@@ -602,6 +640,12 @@ pub fn census(
             // Already in B(i+1) - monotone, so no test is needed at i.
             if viable && gv <= g_next {
                 continue;
+            }
+            // The recorded table has a node for a row with no player
+            // object, so those rows are candidates like any other; the
+            // disc-based columns cannot place them at all.
+            if recorded.is_some() && recorded_in[c as usize / 64] & (1 << (c % 64)) != 0 {
+                recorded_candidates += 1;
             }
             if c == NO_CELL {
                 continue;
@@ -630,6 +674,7 @@ pub fn census(
             learned: learned_radii.map(|_| learned),
             learned_max_px,
             exact: src_cells.map(|_| exact),
+            recorded: recorded.map(|_| recorded_candidates),
         });
     }
     Ok(out)
@@ -676,7 +721,7 @@ mod tests {
         // g: row 0 reaches the exit in 2, row 1 in 1, row 2 never.
         let g = vec![2u16, 1, G_UNREACHABLE];
         let positions = vec![cell_of(0, 0).unwrap(); 3];
-        let rows = census(&t, &g, &positions, 3, &[GRID], None, None).unwrap();
+        let rows = census(&t, &g, &positions, 3, &[GRID], None, None, None).unwrap();
         // Horizon 3, so frames 1 and 2 are reported.
         assert_eq!(rows.len(), 2);
         // f1: R = {0,1}, B(1) = g <= 2 = {0,1}; B(2) = g <= 1 over R(2) =

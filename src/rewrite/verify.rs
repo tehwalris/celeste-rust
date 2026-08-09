@@ -293,6 +293,11 @@ pub struct AbstractRun {
     /// lanes whose coarsened row is outside the previous level's band are
     /// dropped at each boundary.
     band: Option<BandFilter>,
+    /// Position-transition recording (`rewrite::pos_graph`). `Some` only
+    /// when a caller asked for it; the probe reads the frame body's input
+    /// and output positions and injects nothing, so a recorded run takes
+    /// exactly the same path as an unrecorded one.
+    pos_obs: Option<super::pos_graph::PosObserver>,
 }
 
 /// The previous precision level's result, used to confine this level's
@@ -815,6 +820,7 @@ impl AbstractRun {
             deopt: None,
             variants: None,
             band: None,
+            pos_obs: None,
         })
     }
 
@@ -904,6 +910,23 @@ impl AbstractRun {
         self.band = Some(band);
     }
 
+    /// Record the position-transition table while stepping
+    /// (`rewrite::pos_graph`). Read-only: it does not change what any frame
+    /// computes, only what is observed about it.
+    pub fn record_pos_graph(&mut self) {
+        self.pos_obs = Some(super::pos_graph::PosObserver::default());
+    }
+
+    /// Pairs recorded so far, for progress reporting.
+    pub fn pos_graph_pairs(&self) -> Option<usize> {
+        self.pos_obs.as_ref().map(|o| o.pairs())
+    }
+
+    /// The finished table; `None` when recording was never enabled.
+    pub fn take_pos_graph(&mut self) -> Option<super::pos_graph::PosGraph> {
+        self.pos_obs.take().map(|o| o.build())
+    }
+
     /// Drop lanes that have exited the room (global room.x reached the
     /// configured win value) from the frontier: win states are absorbing
     /// for a room-scoped search.
@@ -975,6 +998,17 @@ impl AbstractRun {
     /// 673,503 visited at f40); they differ in peak memory and in the
     /// on-disk order of visited rows.
     pub fn step(&mut self) -> Result<()> {
+        let result = self.step_inner();
+        // Fold this frame's observations in, so the pending list stays a
+        // frame's worth rather than a run's. Done even on failure: what was
+        // observed before the error is still true.
+        if let Some(obs) = self.pos_obs.as_ref() {
+            obs.flush();
+        }
+        result
+    }
+
+    fn step_inner(&mut self) -> Result<()> {
         // Every frontier run streams (the CELESTE_STREAM_BOUNDARY opt-in
         // graduated after the modes were shown set-equivalent; see the
         // equivalence note above). Streaming needs the frontier subtract
@@ -1063,6 +1097,7 @@ impl AbstractRun {
         let frame_cfg = &self.frame_cfg;
         let fixed_env = &self.fixed_env;
         let band = self.band.as_ref();
+        let pos_obs = self.pos_obs.as_ref();
 
         let mut batch: Vec<State> = Vec::with_capacity(threads);
         let mut queue = input_states.into_iter();
@@ -1092,7 +1127,7 @@ impl AbstractRun {
                                 let mut ev = FrameEventCounters::default();
                                 let mut sc = StreamCounters::default();
                                 let outputs = interpret_state_base(
-                                    deopt, frame_cfg, fixed_env, state, &mut ev,
+                                    deopt, frame_cfg, fixed_env, state, &mut ev, pos_obs,
                                 )?;
                                 let mut prepared = Vec::new();
                                 for out in outputs {
@@ -1199,6 +1234,7 @@ impl AbstractRun {
         let deopt = self.deopt.as_ref();
         let frame_cfg = &self.frame_cfg;
         let fixed_env = &self.fixed_env;
+        let pos_obs = self.pos_obs.as_ref();
 
         let mut batch: Vec<State> = Vec::with_capacity(threads);
         let mut queue = input_states.into_iter();
@@ -1221,7 +1257,7 @@ impl AbstractRun {
                                 crate::interpreter::virtual_merge::set_nested_parallel(true);
                                 let mut ev = FrameEventCounters::default();
                                 let outputs = interpret_state_base(
-                                    deopt, frame_cfg, fixed_env, state, &mut ev,
+                                    deopt, frame_cfg, fixed_env, state, &mut ev, pos_obs,
                                 )?;
                                 Ok((outputs, ev))
                             })
@@ -1261,10 +1297,21 @@ impl AbstractRun {
     ) -> Result<Vec<State>> {
         let state = if let Some(vd) = self.variants.as_mut() {
             let before = vd.total_events;
+            // The shape-variant path returns without reaching the frame
+            // body, so it has to record for itself or the table would be
+            // missing every transition a variant took.
+            let srcs = self
+                .pos_obs
+                .as_ref()
+                .map(|_| super::pos_graph::state_cells(&state))
+                .transpose()?;
             match dispatch_variant_frame(vd, state) {
                 VariantOutcome::Ran(outputs) => {
                     counters.variant.0 += vd.total_events.0 - before.0;
                     counters.variant.1 += vd.total_events.1 - before.1;
+                    if let (Some(obs), Some(srcs)) = (self.pos_obs.as_ref(), srcs) {
+                        obs.record(&srcs, &outputs)?;
+                    }
                     return Ok(outputs);
                 }
                 VariantOutcome::Base(state) => state,
@@ -1278,6 +1325,7 @@ impl AbstractRun {
             &self.fixed_env,
             state,
             counters,
+            self.pos_obs.as_ref(),
         )
     }
 }
@@ -1296,7 +1344,13 @@ fn interpret_state_base(
     fixed_env: &crate::interpreter::fixed_env::FixedEnv,
     state: State,
     counters: &mut FrameEventCounters,
+    pos_obs: Option<&super::pos_graph::PosObserver>,
 ) -> Result<Vec<State>> {
+    // Read the input's positions before the state is consumed. This is the
+    // only place that has both sides of a chunk's transition.
+    let srcs = pos_obs
+        .map(|_| super::pos_graph::state_cells(&state))
+        .transpose()?;
     let mut new_states = Vec::new();
     match deopt {
         None => {
@@ -1352,6 +1406,9 @@ fn interpret_state_base(
                 }
             }
         }
+    }
+    if let (Some(obs), Some(srcs)) = (pos_obs, srcs) {
+        obs.record(&srcs, &new_states)?;
     }
     Ok(new_states)
 }

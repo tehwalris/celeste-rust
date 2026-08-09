@@ -321,6 +321,22 @@ enum Command {
         #[arg(long)]
         banded: bool,
     },
+    /// Build the position-transition table (`rewrite::pos_graph`) by
+    /// replaying the saved frontier batches. Writes `posgraph.bin`; touches
+    /// no checkpoint and needs no edges, so it also works on a room whose
+    /// edge-based sweep cannot run.
+    PosGraph {
+        #[arg(long)]
+        checkpoint_dir: String,
+        /// The forward pass's last frame (its checkpoint must exist).
+        #[arg(long)]
+        frames: u32,
+        /// Also check the table against the edges: every `(dst, src)` cell
+        /// pair the edge chunks contain must be present, or the table is
+        /// not an over-approximation. Only possible where a sweep has run.
+        #[arg(long)]
+        check_against_edges: bool,
+    },
     /// Measure whether a POSITIONAL predecessor filter could replace the
     /// sweep's edge graph (see `rewrite::sweep_census`). Read-only: needs a
     /// finished forward pass with `frames/`, and its `g.bin`; writes only
@@ -2879,6 +2895,70 @@ fn main() -> Result<()> {
                 ],
             );
         }
+        Command::PosGraph { checkpoint_dir, frames, check_against_edges } => {
+            use celeste_rust::rewrite::pos_graph;
+            use celeste_rust::rewrite::state_mapping::StateMapping;
+            let dir = std::path::PathBuf::from(checkpoint_dir);
+            let plain = Program::compile_executable_from_disk()?;
+            let (program, _) = build(&recipe)?;
+            let mapping = StateMapping::from_recipe(&recipe);
+            let mut engine = celeste_rust::rewrite::verify::AbstractRun::start_with_deopt(
+                &program, &plain, mapping, false,
+            )?;
+            let t = std::time::Instant::now();
+            let graph = pos_graph::build_from_replay(&dir, frames, &mut engine)?;
+            println!(
+                "posgraph: {} pairs over {} destination cells, built in {:.1}s",
+                graph.pairs(),
+                graph.live_cells(),
+                t.elapsed().as_secs_f64()
+            );
+            graph.save(&dir)?;
+            if check_against_edges {
+                use celeste_rust::rewrite::sweep_census;
+                let recipe_text = std::fs::read_to_string(&cli.recipe).unwrap_or_default();
+                let fingerprint =
+                    celeste_rust::rewrite::checkpoint::config_fingerprint(&recipe_text);
+                let ck = celeste_rust::rewrite::checkpoint::load(&dir, frames, &fingerprint)?;
+                let table = ck.visited;
+                drop(ck.states);
+                let positions = sweep_census::load_positions(&dir, table.len())?
+                    .map(Ok)
+                    .unwrap_or_else(|| sweep_census::build_positions(&dir, frames, &table))?;
+                let exact = sweep_census::learn_src_cells(&dir, frames, &positions)?;
+                let (mut checked, mut missing) = (0u64, Vec::new());
+                for (dst, src) in exact.pairs() {
+                    checked += 1;
+                    if !graph.srcs_of(dst).contains(&src) {
+                        if missing.len() < 10 {
+                            missing.push((dst, src));
+                        }
+                    }
+                }
+                let n_missing = missing.len();
+                println!(
+                    "posgraph: checked {} edge-derived pairs against {} recorded",
+                    checked,
+                    graph.pairs()
+                );
+                for (dst, src) in &missing {
+                    println!(
+                        "  MISSING {:?} -> {:?}",
+                        pos_graph::cell_xy(*src),
+                        pos_graph::cell_xy(*dst)
+                    );
+                }
+                if n_missing > 0 {
+                    return Err(anyhow!(
+                        "the recorded table is NOT an over-approximation: {} \
+                         edge-derived pairs are absent (first {} shown)",
+                        n_missing,
+                        n_missing.min(10)
+                    ));
+                }
+                println!("posgraph: every edge-derived pair is present - conservative");
+            }
+        }
         Command::SweepCensus { checkpoint_dir, frames, horizons, radii, learn_radii, every } => {
             use celeste_rust::rewrite::sweep_census;
             let horizons = if horizons.is_empty() { vec![frames] } else { horizons };
@@ -2938,6 +3018,16 @@ fn main() -> Result<()> {
             } else {
                 None
             };
+            // The table an implementation can actually have: recorded by
+            // the probe, not derived from the edges.
+            let recorded = celeste_rust::rewrite::pos_graph::PosGraph::load(&dir)?;
+            if let Some(pg) = &recorded {
+                println!(
+                    "census: posgraph.bin has {} pairs over {} destination cells",
+                    pg.pairs(),
+                    pg.live_cells()
+                );
+            }
             let edge_sweep = table.len() as u64;
             for horizon in &horizons {
                 let horizon = *horizon;
@@ -2950,6 +3040,7 @@ fn main() -> Result<()> {
                     &radii,
                     learned.as_deref(),
                     src_cells.as_ref(),
+                    recorded.as_ref(),
                 )?;
                 println!();
                 println!("=== horizon {} ({:.1}s) ===", horizon, t.elapsed().as_secs_f64());
@@ -2962,6 +3053,7 @@ fn main() -> Result<()> {
                             .flat_map(|_| [format!("{:>14}", "cand learned"), format!("{:>8}", "max r")]),
                     )
                     .chain(src_cells.iter().map(|_| format!("{:>14}", "cand exact")))
+                    .chain(recorded.iter().map(|_| format!("{:>14}", "cand recorded")))
                     .collect();
                 println!(
                     "{:>5}{:>14}{:>14}{:>9}{:>9}{:>14}{}",
@@ -2972,8 +3064,10 @@ fn main() -> Result<()> {
                 let mut totals = vec![0u64; radii.len()];
                 let mut learned_total = 0u64;
                 let mut exact_total = 0u64;
+                let mut recorded_total = 0u64;
                 for row in &rows {
                     exact_total += row.exact.unwrap_or(0);
+                    recorded_total += row.recorded.unwrap_or(0);
                     naive += row.r_rows;
                     ideal += row.new_rows;
                     for (k, c) in row.candidates.iter().enumerate() {
@@ -2988,6 +3082,7 @@ fn main() -> Result<()> {
                             .map(|c| format!("{:>14}", c))
                             .chain(row.learned_max_px.iter().map(|r| format!("{:>8}", r)))
                             .chain(row.exact.iter().map(|c| format!("{:>14}", c)))
+                            .chain(row.recorded.iter().map(|c| format!("{:>14}", c)))
                             .collect();
                         println!(
                             "{:>5}{:>14}{:>14}{:>9}{:>9}{:>14}{}",
@@ -3022,6 +3117,9 @@ fn main() -> Result<()> {
                 }
                 if src_cells.is_some() {
                     line("time-expanded, exact source sets:".to_string(), exact_total);
+                }
+                if recorded.is_some() {
+                    line("time-expanded, RECORDED table:".to_string(), recorded_total);
                 }
             }
         }
