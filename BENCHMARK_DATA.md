@@ -238,7 +238,7 @@ would otherwise have added hours. The sweep here was built from nothing.
 
 Caveat, so the table is not read as more than it is: the sweep's SPEEDUP
 is unmeasured. It is parallel now and gated byte-identical
-(`sweepcheck.sh`), but there is no controlled serial counterpart at this
+(the since-deleted `sweepcheck.sh`), but there is no controlled serial counterpart at this
 depth - the f40 gate universe finishes in 5 s either way. See the pending
 task before quoting a number for it.
 

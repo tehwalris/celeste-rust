@@ -1,14 +1,14 @@
-//! The backward sweep in TIME-EXPANDED space: the same `g` as `sweep.rs`,
-//! without the edge graph.
+//! The backward sweep, in TIME-EXPANDED space. `sweep.rs` holds what it
+//! produces; this is how.
 //!
-//! `sweep.rs` inverts the successor relation by materializing it: every
-//! `(src row, dst row)` pair the forward pass ever took, 10,072,724,145 of
-//! them and 58 GB of CSR shards for room (1,0), and an outright OOM on room
-//! (0,0), where ONE frame produces 644,653,017 of them. This module answers
-//! the same question - "who steps into the rows that just got marked?" - by
-//! re-deriving successors each frame from a small POSITIONAL
-//! over-approximation of the predecessor relation (`pos_graph`), and stores
-//! no edges at all.
+//! It replaced an edge graph, which inverted the successor relation by
+//! materializing it: every `(src row, dst row)` pair the forward pass ever
+//! took, 10,072,724,145 of them and 58 GB of CSR shards for room (1,0), and
+//! an outright OOM on room (0,0), where ONE frame produces 644,653,017 of
+//! them. This answers the same question - "who steps into the rows that just
+//! got marked?" - by re-deriving successors each frame from a small
+//! POSITIONAL over-approximation of the predecessor relation (`pos_graph`),
+//! and stores no edges at all.
 //!
 //! Nodes are `(row, frame)`, so every edge goes `i -> i+1` by construction.
 //! Writing `R(i)` for the rows with earliest arrival `<= i` (the row table's
@@ -20,8 +20,8 @@
 //! and `B(i) = { s in R(i) : g(s) <= H - i }`, so a row that FIRST enters at
 //! frame `i` has `g = H - i` exactly and the sweep's output converts to the
 //! same `g` array `save_g` has always written. Only rows with `e + g <= H`
-//! ever enter, so a horizon-H sweep produces `g` where the edge sweep's `g`
-//! is thresholded at H - see `tools/gdiff.py --threshold`.
+//! ever enter, so a horizon-H sweep produces `g` only where a full sweep's
+//! `g` is thresholded at H - see `tools/gdiff.py --threshold`.
 //!
 //! Two things make it affordable:
 //!
@@ -32,8 +32,9 @@
 //! * **The positional filter.** Of `R(i) \ B(i+1)`, only rows whose player
 //!   position is a recorded predecessor position of a position `B(i+1)`
 //!   occupies are expanded: 98.3M expansions at H=100 on room (1,0), 0.46x
-//!   the edge sweep. The filter is an over-approximation and the expansion
-//!   is what establishes an edge, so only COST depends on its tightness.
+//!   the edge sweep's. The filter is an over-approximation and it is the
+//!   EXPANSION that establishes an edge, so only cost depends on how tight
+//!   it is.
 //!
 //! Soundness of the regrouping. Candidates at frame `i` come from every
 //! earlier discovery frame, so they are expanded in different lane groups
@@ -42,9 +43,10 @@
 //! to a whole-value `UnknownBool` and sends the entire chunk down both edges.
 //! That is the only known cross-lane operation left, and it is measured -
 //! room (1,0) has ZERO mixed collapses and satisfies batch invariance, room
-//! (0,0) is 70.1% mixed (see "Batch invariance" in `plans/roofline-plan.md`).
+//! (0,0) is 89.0% mixed (see "Batch invariance" in `plans/roofline-plan.md`).
 //! So on room (1,0) this sweep's successors are exactly the forward pass's,
-//! and its `g` is exactly the edge sweep's; on room (0,0) they can differ.
+//! and its `g` is exactly the edge sweep's, which is the gate. In the event
+//! room (0,0) reported zero out-of-table successors too.
 //!
 //! What survives regardless is the only property the band needs: every
 //! grouping over-approximates the CONCRETE transition relation - a finer
@@ -121,9 +123,9 @@ fn set_bit(bits: &mut [u64], i: usize) -> bool {
 
 /// One pass over every saved batch, recording where each row's lane lives.
 ///
-/// Also checks, per row, what `sweep_census::build_positions` checks: the
-/// forward pass is frontier-only, so every row appears in exactly one batch,
-/// the one for its earliest-arrival frame. A row in the wrong batch, or in
+/// Also checks, per row, the property the whole index rests on: the forward
+/// pass is frontier-only, so every row appears in exactly one batch, the one
+/// for its earliest-arrival frame. A row in the wrong batch, or in
 /// two, means the batches and the row table disagree and every candidate set
 /// below would be drawn from the wrong states.
 pub fn build_index(dir: &Path, frames: u32, table: &RowTable) -> Result<RowIndex> {
@@ -216,6 +218,23 @@ pub fn build_index(dir: &Path, frames: u32, table: &RowTable) -> Result<RowIndex
     Ok(idx)
 }
 
+/// Return free heap to the OS, between the sweep's two big phases.
+///
+/// `Vec`'s `Drop` frees, it does not necessarily unmap: glibc holds the
+/// pages in its arenas for reuse, which is right for a steady-state
+/// allocator and wrong for a process with two disjoint multi-tens-of-GB
+/// phases under a hard cgroup cap. No-op on anything but glibc.
+fn trim_allocator() {
+    #[cfg(target_env = "gnu")]
+    {
+        extern "C" {
+            fn malloc_trim(pad: usize) -> std::os::raw::c_int;
+        }
+        // Safe: `malloc_trim` only walks the allocator's own free lists.
+        unsafe { malloc_trim(0) };
+    }
+}
+
 /// Add `cell` to the live destination set, folding its recorded predecessor
 /// cells into the candidate mask. Idempotent - both sets only grow, because
 /// `B` only grows as the sweep runs backward.
@@ -262,7 +281,7 @@ pub struct TimeSweepResult {
 /// It is built PER PRECISION LEVEL, in that level's own directory. Sharing a
 /// coarser level's table with a finer one is probably sound, but there is no
 /// cheap runtime guard for it, so it is not done.
-fn load_or_extend_pos_graph(
+pub fn prepare_pos_graph(
     dir: &Path,
     frames: u32,
     program: &Program,
@@ -291,6 +310,16 @@ fn load_or_extend_pos_graph(
     let mut engine = AbstractRun::start_with_deopt(program, plain, mapping, false)?;
     let fresh = pos_graph::build_from_replay(dir, covered, frames, &mut engine)?;
     drop(engine);
+    // The replay's transient is the biggest allocation this process ever
+    // makes - room (0,0)'s peaked around 76 GB - and dropping it does not
+    // return it to the OS: glibc keeps it in its per-thread arenas, where it
+    // is invisible to us and fully counted by the cgroup. Measured on room
+    // (0,0): with the graph built in this process the RSS after the re-index
+    // was 94 GB and the backward loop was OOM-killed at the 100 GB cap; with
+    // the same graph loaded from disk instead it was 41.6 GB and the sweep
+    // finished. So hand the arenas back before the re-index claims its own
+    // tens of gigabytes.
+    trim_allocator();
     let graph = match existing {
         Some(old) => {
             let mut b = old.into_builder();
@@ -329,7 +358,7 @@ pub fn backward_sweep_time(
             frames
         ));
     }
-    let graph = load_or_extend_pos_graph(dir, frames, program, plain, mapping.clone())?;
+    let graph = prepare_pos_graph(dir, frames, program, plain, mapping.clone())?;
 
     let ck = checkpoint::load(dir, frames, fingerprint).context("loading final checkpoint")?;
     let table = ck.visited;

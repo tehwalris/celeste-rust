@@ -1,5 +1,5 @@
 #!/bin/bash
-# Gate for the TIME-EXPANDED backward sweep (rewrite::sweep_time).
+# Gate for the backward sweep (rewrite::sweep_time).
 #
 # Two claims, both exact:
 #
@@ -12,9 +12,10 @@
 #
 # It runs on a certified BANDED level rather than a fresh small universe
 # because a small universe has no wins at all - room (1,0) first exits at
-# frame 90 - so its g is all-unreachable and gates nothing. The banded
-# levels are the cheapest artifacts that have real wins, real expansions
-# and a certified answer.
+# frame 90 - so its g is all-unreachable and gates nothing. That is the hole
+# the deleted sweepcheck.sh had, hidden because it also compared the edge
+# shards. The banded levels are the cheapest artifacts that have real wins,
+# real expansions and a certified answer.
 #
 # Never gate on the reported optimum: a wrong sweep printed the correct
 # "abstract optimal win frame 90" while g was wrong for 95% of rows,
@@ -39,7 +40,7 @@ run() { # $1 threads, $2 dir
   # The position graph is rebuilt per run, so its recording is gated too.
   rm -f "$2/posgraph.bin"
   CELESTE_FRAME_THREADS=$1 ./safe-run.sh -- ./target/release/rewrite sweep \
-      --time-expanded --banded --checkpoint-dir "$2" --frames "$H" --horizon "$H" 2>&1
+      --banded --checkpoint-dir "$2" --frames "$H" --horizon "$H" 2>&1
 }
 
 a=$(run 1 /tmp/tsweepcheck-a)
