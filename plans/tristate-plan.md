@@ -425,3 +425,32 @@ Until it passes, none of the numbers above should be quoted.
 Re-measure at f94, where the deopt was 81.7M lanes of a 4502 s run. That
 is where the payoff should be largest, and it is the figure the room (0,0)
 end-to-end estimate (13 +/- 2 h) is built on.
+
+### CERTIFIED: the lane reduction is precision, not loss
+
+`trace-witness` on room (0,0), horizon 70, level 0 (115,656,896 rows):
+
+    f010 (  8, 93):  k0:ok(e=10)
+    f020 (  8, 93):  k0:ok(e=20)
+    f030 ( 10, 96):  k0:ok(e=30)
+    f040 ( 33, 88):  k0:ok(e=40)
+    f050 ( 60, 80):  k0:ok(e=49)
+    f060 ( 88, 71):  k0:ok(e=59)
+    f068 ( 81, 52):  k0:ok(e=66)
+    f069 ( 79, 50):  k0:ok(e=67)
+    f070 ( 77, 48):  k0:ok(e=68)
+    witness trace PASSES every probed level's band at every frame
+
+The concrete winning path is present in the abstract row table at every
+frame, INCLUDING the straddling frames f066-f070 where the splits fire.
+So the 0.7% lane reduction is added precision - the split keeps the
+rewritten program's precision where the deopt round-tripped through
+`to_canonical`, which widens - and not dropped states. The f70 numbers
+above can be quoted.
+
+Scope of the claim, stated honestly: this is ONE trajectory, so it is the
+strongest certificate this project has rather than a proof. A soundness
+bug that spares the reference TAS would survive it. The complementary
+gate is `simdcheck`, which is about lane independence rather than
+containment, and the checkpoint run reproduced 8,062,451 lanes exactly,
+so the pipeline is at least deterministic.
