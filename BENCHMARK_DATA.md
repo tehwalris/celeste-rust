@@ -1,3 +1,98 @@
+# The deopt is gone on room (0,0): 2.55x, -47% memory (2026-08-09)
+
+Three interpreter fixes, all default-on, remove every plain-program
+fallback from room (0,0). Full horizon, level 0, campaign chunk settings
+(8000/8000), against the ladder's own `l0-h94.log` baseline:
+
+| | before | after | |
+|---|---|---|---|
+| time | 5,079.41 s | **1,992.93 s** | 2.55x |
+| lanes | 26,696,437 | 21,663,480 | -18.9% |
+| peak RSS | 59.83 GB | **31.76 GB** | -47% |
+| deopt | 10,235 states / 81,766,256 lanes | **0** | gone |
+| fragments | 871,168 | 1,857,040 | **+113%** |
+
+Per-frame the gain grows with depth, because the deopt did: f86 2.44x,
+f88 2.58x, f90 2.85x, f92 2.96x, f93 2.95x. The baseline spent 42% of its
+whole run in the last five frames.
+
+## What the fixes are
+
+Every one removes a join ACROSS LANES, where one lane's ambiguity
+destroyed its neighbours' answers:
+
+1. a MIXED interval comparison PARTITIONS the state (definite lanes keep
+   a real `Bool`, straddling lanes spill into a state whose `UnknownBool`
+   is then honest) instead of collapsing the whole value;
+2. `select` on an `UnknownBool` CONDITION splits into a true copy and a
+   false copy instead of erroring into the whole-state fallback;
+3. `select` with one `UnknownBool` boolean ARM yields a per-lane
+   tri-state, which (1) then resolves.
+
+They only pay off together. Frame 68 recorded ZERO splits with only (2):
+`select cannot combine UnknownBool and Bool` fired first and dropped the
+state before any split could happen. Fixing one link moves the failure
+one instruction down the same `and` chain in `obj.collide`.
+
+## The cost, stated plainly
+
+Fragments MORE THAN DOUBLE (871k -> 1.86M, peak 72,617 -> 181,198 per
+frame). At f70 the increase was only 2.5%, so this is a depth effect: the
+splits do multiply where the strawberry's chain is hot. The boundary
+merge absorbs it - lanes and memory both fell - but anything that makes
+per-fragment cost matter more should expect this to bite.
+
+## Why it is precision and not a leak
+
+* `trace-witness` passes at every frame through f070, including every
+  frame where splits fire, against 115,656,896 rows.
+* The lane reduction is exactly 0.00% at f65 and turns on at f66, where
+  the first straddling comparison appears; it is monotone and never
+  negative-signed the wrong way.
+* The first-win frame is UNCHANGED at 80, and the winning lane counts are
+  identical at f80-f93 (1040, 4268, 3472, 5030, 8966, 8770, 10096, 12794,
+  14754, 14570, 9440, 8188, 4474, 8400).
+* Room (1,0) is byte-identical with all three fixes on or off, so its
+  certified campaign stands.
+
+ONE EXCEPTION, which should not be buried: at f94 the winning lane count
+is 18,780 against the baseline's 18,781. One fewer. That is the safe
+direction - a refinement can only shrink the abstract set, so a spurious
+winning state was dropped - and the reported optimum is set by the FIRST
+win at f80, which is unchanged. But it is a change to the winning set and
+it is the only frame of 15 that moves.
+
+## Lane independence, certified with a control
+
+`simdcheck` on room (0,0):
+
+    simdcheck PASSES: 23063 lanes over 70 frames produce identical
+    canonical rows batched and alone
+
+That claim is only worth something because the POSITIVE CONTROL fails.
+With the fixes disabled:
+
+    VIOLATION frame 67 state 9: batched 376 rows vs singletons 360 rows
+
+Frame 67 is in the straddling region, and the batched run produces MORE
+rows - the whole-value collapse adding spurious rows to lanes that had
+answers, which is the predicted mechanism. So the gate discriminates, and
+the pass is not vacuous.
+
+Getting the gate to run at all required a fix: it had refused any run with
+the frontier subtract on, but without the subtract room (0,0) exhausts
+100 GB before frame 66, so it could only ever certify frames incapable of
+violating the property. The subtract is now disabled per PROBE, which is
+what must be comparable, rather than per command.
+
+## Measurement caveat
+
+The f94 run shared the machine with a background sweep and with simdcheck,
+getting ~9.4 cores of the 16 it asked for; the baseline's conditions are
+not recorded. The time ratios are therefore soft and most likely
+understate the gain. Lane counts, peak RSS, deopt counts and win counts
+are contention-independent.
+
 # The position table has to be per LANE, not per chunk (2026-08-09)
 
 The table below says a positional predecessor filter is worth building.

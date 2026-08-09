@@ -581,3 +581,42 @@ pass above should be discarded rather than believed.
 This is the lesson from the retracted "batch invariance violated" finding
 earlier in the campaign, which came from trusting an unvalidated parser
 that happened to be blind exactly where it was tested.
+
+## FINAL: f94, and the control that makes the simdcheck pass mean something
+
+Room (0,0), full horizon, against the ladder's own l0-h94 baseline:
+
+                     before        after
+    time           5,079.41 s   1,992.93 s   (2.55x)
+    lanes          26,696,437   21,663,480   (-18.9%)
+    peak RSS         59.83 GB     31.76 GB   (-47%)
+    deopt      10,235 st/81.77M lanes    0
+    fragments         871,168    1,857,040   (+113%)
+
+The fragment count MORE THAN DOUBLES. At f70 it was +2.5%, so this is a
+depth effect and the honest cost of the design: the splits multiply where
+the strawberry's chain is hot. The boundary merge absorbs it (lanes and
+memory both fell), but it is the number to watch if per-fragment cost ever
+becomes significant.
+
+At f94 the winning lane count is 18,780 against 18,781 - one fewer, and
+the only one of the 15 winning frames that moves. Safe direction (a
+refinement can only shrink the set) and the optimum is set by the first
+win at f80, which is unchanged. Recorded because it is exactly the sort of
+one-lane delta that is easy to not mention.
+
+### The control
+
+    fixed build:  simdcheck PASSES: 23063 lanes over 70 frames produce
+                  identical canonical rows batched and alone
+    fixes OFF:    VIOLATION frame 67 state 9: batched 376 rows vs
+                  singletons 360 rows
+
+Frame 67 is inside the straddling region, and the batched run produces
+MORE rows - the whole-value collapse adding spurious rows to lanes that
+had answers, which is exactly the mechanism predicted before the run. So
+the gate discriminates and the pass is not vacuous.
+
+This is the discipline the retracted "batch invariance violated" finding
+earlier in the campaign should have had: a checker that has not been shown
+capable of failing is not evidence.
