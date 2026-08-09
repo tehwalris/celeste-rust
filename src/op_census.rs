@@ -320,6 +320,24 @@ pub fn record_unknown_collapse(definite: usize, total: usize) {
     }
 }
 
+/// Per-frame collapse figures, resetting the counters.
+///
+/// Returns (constructions, mixed, definite_lanes, total_lanes). The
+/// per-frame breakdown is what says whether partitioning a mixed
+/// comparison would split a state ONCE or repeatedly: compare `mixed`
+/// against the frame's fragment count. Many mixed constructions per
+/// fragment would mean each partition gets re-split by the next
+/// comparison, and the state count grows multiplicatively rather than by
+/// one.
+pub fn take_unknown_collapse() -> (u64, u64, u64, u64) {
+    (
+        COLLAPSE_CALLS.swap(0, Ordering::Relaxed),
+        COLLAPSE_MIXED.swap(0, Ordering::Relaxed),
+        COLLAPSE_DEFINITE.swap(0, Ordering::Relaxed),
+        COLLAPSE_TOTAL.swap(0, Ordering::Relaxed),
+    )
+}
+
 pub fn report_unknown_collapse() {
     let calls = COLLAPSE_CALLS.load(Ordering::Relaxed);
     if calls == 0 {

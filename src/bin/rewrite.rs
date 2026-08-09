@@ -499,6 +499,21 @@ fn bench(
     for frame in start_frame..=frames {
         let frame_start = std::time::Instant::now();
         run.step()?;
+        {
+            let (calls, mixed, definite, total) =
+                celeste_rust::op_census::take_unknown_collapse();
+            if calls > 0 {
+                println!(
+                    "  collapse f{:03}: {} constructions, {} mixed, {}/{} lanes definite ({:.1}%)",
+                    frame,
+                    calls,
+                    mixed,
+                    definite,
+                    total,
+                    100.0 * definite as f64 / total.max(1) as f64
+                );
+            }
+        }
         if let Some(cfg) = checkpoint.as_ref() {
             if cfg.save_frames {
                 celeste_rust::metrics::time("fwd.save_frames", || {
