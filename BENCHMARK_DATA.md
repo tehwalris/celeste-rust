@@ -1,3 +1,58 @@
+# The position table has to be per LANE, not per chunk (2026-08-09)
+
+The table below says a positional predecessor filter is worth building.
+The first attempt at RECORDING one - which is the part an implementation
+must have, since deriving it from the edges is circular and impossible on
+room (0,0) anyway - is correct and useless, and the gap between those two
+words is the whole result.
+
+`AbstractRun::record_pos_graph` is a read-only probe: it reads the
+positions going into the frame body and coming out, and injects nothing,
+so a recorded run takes exactly the path an unrecorded one does. What it
+cannot do without tagging lanes is say WHICH input produced which output,
+so it records every source cell of a chunk against every destination cell
+of that chunk. On room (1,0), 100 frames, that is:
+
+| table | pairs | src cells per dst | candidates at H=100 |
+|---|---|---|---|
+| exact, from the 10.1e9 edges | 383,528 | 47.1 | 98.3M (0.46x the edge sweep) |
+| **recorded per 8,000-lane chunk** | **58,333,241** | **7,162** | **4.150e9 (19.53x)** |
+| no filter at all | - | - | 4.433e9 (20.86x) |
+
+The recorded table retains **93.6%** of the unfiltered candidate set. Per
+frame it is not a filter at all: 106,587,071 candidates at f080 against a
+flat 8px disc's 2,301,506, out of |R(080)| = 111,171,031.
+
+It is genuinely conservative - `pos-graph --check-against-edges` confirms
+all 383,360 (dst, src) pairs derivable from the edges are present - so
+this is a tightness failure, not a correctness one. An 8,000-lane chunk
+is just spatially wide: its lanes span thousands of cells, and the cross
+product is the square of that.
+
+Build cost, for the record: 2,056.8 s for 100 frames, ~6 GB peak after
+the replay was made to expand in 250k-lane groups (it was 28 GB at f065
+in one go, the same transient that OOMs the edge sweep).
+
+## What has to change
+
+Per-lane attribution, which means an origin column after all - but one
+carrying the source CELL (~8,000 distinct values on room (1,0)) rather
+than the source ROW (213M). That is the sweep's existing replay cost,
+paid ONCE per room to produce a table of ~1.5 MB, instead of 58 GB of
+edges rebuilt per horizon.
+
+It must be done in the replay, not in the forward pass: a per-lane column
+is per-lane distinct, so it forbids the boundary dedup that decides how
+coarse the over-approximation is, and a tagged forward pass would be a
+different search from the certified one. The replay already runs with
+`disable_frontier`, so it has no boundary dedup to lose - which is
+exactly why the cost lands there and not on the forward pass.
+
+`--check-against-edges` is the gate for it on room (1,0), and the census's
+`cand recorded` column is the number that says whether it is tight enough.
+The target to beat is the exact table's 98.3M; anything near 4.15e9 is
+the same failure again.
+
 # The time-expanded sweep: measured, and it is worth doing (2026-08-09)
 
 Can the backward sweep drop its edge graph - 10,072,724,145 edges and
