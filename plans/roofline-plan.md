@@ -170,6 +170,57 @@ If the row key is not chunk-invariant then:
   identically, which is exactly the f067 error, and explains why it
   appeared on a configuration mismatch rather than on fruit specifically.
 
+## Localised: room (1,0), first divergence at FRAME 29
+
+Bisecting the frame count (chunk cap 8000 vs 200, otherwise identical):
+
+    f21..f28   identical, every frame          f28: 2888 rows, 0 differing
+    f29        DIFFERS                         7284 rows, 6466 shared, 818 each side
+
+Frames 1-28 agree to the byte. Frame 29 discovers 4,396 new rows in BOTH
+configurations - the same number - and 818 of them (18.6%) key differently.
+
+## What it is NOT (all measured, do not re-check)
+
+* **Not the row key.** A unit test (`sweep::batch_invariance_tests`) builds
+  a state whose halves are each uniform in a column where the whole is not
+  - exactly what a chunk boundary creates - and the per-lane keys are
+  unchanged. It passes.
+* **Not the shape hash.** Dumping every shape hash seen at the boundary:
+  2 distinct shapes under both caps, and the SETS are equal. So the
+  per-state term of the key is stable; the difference is in the per-row
+  contributions, i.e. in the column VALUES.
+* **Not the rem abstraction.** `make_state_abstract_rem` widens strictly
+  per lane, and at level 0 (`Bits(0)`) it maps every rem to one constant
+  interval. `split_rem_straddles` returns early at 0 bits.
+* **Not deopt.** Frame 29 reports no deopt events under either cap, and
+  both produce 4,396 new lanes.
+* **Not the mixed-UnknownBool collapse.** The collapse counter fires ZERO
+  times on room (1,0) through f29. (It fires constantly on room (0,0) -
+  70.1% mixed - but that is a different room and a different mechanism.)
+* **NOT THE RECIPE.** `bench --baseline`, the unrewritten program, shows
+  the same violation at f29 (digests 3cfbe238 vs 5027393f). So this is in
+  the core abstract interpreter, not in any rewrite's per-state premise.
+
+That last one is the important one: it rules out the hypothesis that some
+rewrite with a state-wide guard (`assume_eq`, `guard_region`, `mask_loop`
+span asserts) is responsible, and puts the cross-lane dependence in the
+interpreter or the merge.
+
+## Where to look next
+
+Equal lane counts, equal shapes, differing column values means some lane's
+VALUE depends on which lanes shared its state. Remaining suspects, in the
+core interpreter: a branch on a whole-value `UnknownBool` (which sends
+every lane down both edges regardless of whether that lane's condition was
+ambiguous); `__split_by_flr`'s interval refinement; and the boundary
+merge's choice of representative.
+
+The next step is a tool, not a guess: dump frame 29's boundary rows as
+VALUES rather than hashes under both caps and diff them. 818 rows is small
+enough to read. Everything above was obtained by elimination; this would
+be obtained by observation.
+
 ## Where to look first
 
 The key is `row_key_hashes(shape_hash, columns, ..)`. Its per-row part was

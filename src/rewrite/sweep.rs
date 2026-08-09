@@ -652,3 +652,66 @@ pub fn band_sizes(table: &RowTable, g: &[u16], horizon: u32) -> Vec<(u32, u64)> 
     }
     out
 }
+
+#[cfg(test)]
+mod batch_invariance_tests {
+    use super::*;
+    use crate::interpreter::heap::HeapId;
+    use crate::interpreter::state::State;
+    use crate::interpreter::value::{HeapValue, MaybeVector, Value};
+    use crate::pico8_num::Pico8Num;
+
+    /// A lane's canonical key must not depend on which other lanes happen
+    /// to share its state.
+    ///
+    /// This is the narrowest form of Philippe's batch-invariance principle
+    /// - it does not even run a frame. If it fails, the chunk dependence
+    /// `simdcheck.sh` measured lives in the KEY, and everything downstream
+    /// (frontier dedup, and the sweep's ability to reproduce the forward
+    /// pass) inherits it.
+    #[test]
+    fn a_lanes_key_does_not_depend_on_its_neighbours() {
+        // Two columns. `a` varies across all four lanes; `b` is chosen so
+        // that some SPLITS of the state make it uniform while the whole
+        // state leaves it varying - that is the situation a chunk boundary
+        // creates.
+        let build = |a: &[i16], b: &[i16]| -> State {
+            let mut s = State::new();
+            s.vector_size = a.len();
+            let ca = s.heap.alloc();
+            s.heap.set(
+                ca,
+                HeapValue::Value(Value::Number(MaybeVector::vector(
+                    a.iter().map(|v| Pico8Num::from_i16(*v)).collect(),
+                ))),
+            );
+            let cb = s.heap.alloc();
+            s.heap.set(
+                cb,
+                HeapValue::Value(Value::Number(MaybeVector::vector(
+                    b.iter().map(|v| Pico8Num::from_i16(*v)).collect(),
+                ))),
+            );
+            s.global_env.insert("a".to_string(), ca);
+            s.global_env.insert("b".to_string(), cb);
+            let _ = HeapId::from_raw(0);
+            s
+        };
+
+        let a = [10i16, 11, 12, 13];
+        // Lanes 0-1 share b=7; lanes 2-3 share b=9. So the halves are each
+        // uniform in `b` while the whole is not.
+        let b = [7i16, 7, 9, 9];
+
+        let whole = row_keys(&build(&a, &b)).expect("keys for the whole state");
+        let first = row_keys(&build(&a[..2], &b[..2])).expect("keys for lanes 0-1");
+        let second = row_keys(&build(&a[2..], &b[2..])).expect("keys for lanes 2-3");
+
+        let split: Vec<(u64, u64)> = first.iter().chain(second.iter()).copied().collect();
+        assert_eq!(
+            whole, split,
+            "a lane's key changed when its neighbours did - batch invariance is \
+             broken in the KEY itself, not in the interpretation"
+        );
+    }
+}
