@@ -1,3 +1,54 @@
+# Room (0,0) SWEEPS. The thing that could not run, runs (2026-08-09)
+
+The sweep OOMed on room (0,0) with the edge graph - one frame there
+produces 644,653,017 successor lanes, each an edge - while the forward
+pass completed fine. That was the whole point of the rewrite, and it is
+done:
+
+| room (0,0), H=94, 460,658,200 rows | |
+|---|---|
+| rows that reach the exit within the horizon | 24,514,668 |
+| row-expansions | 451,884,260 |
+| successors outside the row table | **0** |
+| `min(e + g)` | **80**, = the forward pass's first room-exit frame |
+| position graph | 405,332 pairs / 7,923 cells / 2.7 MB, 6,171.5 s |
+| re-index | 181.2 s (310.5 s on a second, contended run) |
+| backward loop | ~2,600 s |
+
+`min(e+g) = 80` against the forward pass's "first room-exit lanes appeared
+at frame 80" is the ladder's own consistency check, and it is the only
+check available here: room (0,0) has no certified `g`, because the sweep
+that would have produced one is the one that OOMs.
+
+**Zero out-of-table successors is the surprise.** Room (0,0) is 89.0%
+mixed UnknownBool collapses (64,272,681 of 72,192,126 constructions), so
+regrouping its candidate lanes was expected to reach rows the forward pass
+never did. Over 451.9M expansions it reached none. That does not make the
+room batch-invariant - the collapse can still turn a definite lane into
+two - but whatever it does produce stayed inside the row table.
+
+Two costs are genuinely worse here than on room (1,0), and both come from
+the fruit: the position graph took 6,171.5 s to record (against 1,121.9 s)
+because f090 alone is 401.8 s of `UnknownBool` whole-state fallbacks, and
+the expansions are 0.98x the row count rather than 0.46x.
+
+## The allocator, which cost an OOM
+
+The first attempt died anyway, in the backward loop, at the 100 GB cap -
+and not because the sweep needs 100 GB:
+
+| after the re-index, room (0,0) | RSS |
+|---|---|
+| position graph built in the same process | **94 GB** (OOM-killed later) |
+| identical graph loaded from `posgraph.bin` | **41.6 GB** (finished) |
+
+Same index, same data, 52 GB apart. The replay's transient peaks around
+76 GB, and freeing it does not return it: glibc keeps it in its per-thread
+arenas, invisible to us and fully counted by the cgroup. `sweep_time` now
+calls `malloc_trim` between the two phases, and `rewrite pos-graph` exists
+so the 1.7 h can be banked on disk and kept out of the sweep's process
+entirely.
+
 # The time-expanded sweep is BUILT, and it gates to the edge (2026-08-09)
 
 `rewrite sweep --time-expanded` reproduces the certified `g` for room
