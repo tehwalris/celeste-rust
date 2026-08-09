@@ -195,3 +195,73 @@ configuration - schedule it when no campaign is running.
 The sweep divergence at room (0,0) f067 was a real error raised by the
 program, not by this tooling, and the chunking pin in `ladder.sh` stands
 regardless.
+
+
+# The backward sweep needs PREDECESSORS, and why (2026-08-09)
+
+The sweep OOMed on room (0,0) at f08x. The forward pass for that room
+completes fine (94 frames, 85 min, 60 GB), so this is a sweep-only
+problem: a single frame there produces 644,653,017 successor lanes, each
+becoming a distinct (src, dst) edge.
+
+## Attempt that failed: stamp-ordered relaxation (do not retry)
+
+Idea: skip the edge graph. Replay frames in DESCENDING order and relax
+`g[src] = min(g[src], g[dst] + 1)` where the old code pushed an edge. No
+`frame_edges`, no CSR shards, no BFS - the per-frame cost becomes a
+min-reduction into a 2-byte-per-row array.
+
+It is WRONG, and by a mile. Rows carry their EARLIEST discovery frame as
+their stamp, and the search is frontier-only, so a row is recorded once.
+At f60 the forward pass produces 100,574,399 successors of which only
+1,997,387 are new: **~98% of all successor edges point at rows discovered
+EARLIER**. Descending-stamp order cannot relax through those, so the pass
+follows 2% of the graph.
+
+    certified   203,369,203 rows reachable to the exit
+    stamp-order   4,830,304   (2.4% - which is just the new-row rate)
+
+**And it printed the right answer anyway.** `abstract optimal win frame
+from e+g: 90`, matching the certified run exactly, because the win chain
+happens to be stamp-monotone. That is the number the ladder compares, so
+the normal gate would have PASSED while g was wrong for 95% of rows,
+silently over-pruning every band at levels k>=1. Gate on the full g array,
+never on the reported optimum.
+
+## Why the edge graph exists
+
+Forward BFS needs SUCCESSORS; the frame function is a successor oracle, so
+each state is expanded exactly once (213M expansions). Backward BFS needs
+PREDECESSORS - "who steps into the states that just got marked?" - which
+the frame function cannot answer. The edge graph is the transposition, and
+that is its whole purpose: not to memoise successors (cheap to recompute)
+but to invert them.
+
+Without it you can only simulate "who points at X?" by re-asking every
+candidate "do you point at X?", once per frame, until it says yes. Priced
+from the certified array (212,559,009 rows, 95.7% reachable, mean g 39.4,
+max 127): a row costs g+1 expansions, so **8.2e9 against 213e6 - 39x**.
+
+## The way through: approximate predecessors
+
+Philippe's earlier solver (`~/src/github.com/tehwalris/celeste-rust-old`,
+`src/main.rs` ~845-900 and `src/state_table.rs::add_to_possible_src_mask`
+/ `DistanceTracker`) used a cheap CONSERVATIVE predecessor instead of an
+exact one: the forward pass records, per destination position, the max
+squared distance any source was from it; backward, each marked destination
+paints every position within that learned radius into a candidate mask,
+and only forward states on those positions get expanded - the forward step
+then recovers the true edges. Approximation only has to never MISS a real
+predecessor; correctness comes from the forward verification and only cost
+comes from its tightness.
+
+Work in TIME-EXPANDED space while doing this - nodes are (state, frame),
+not state. Then every edge goes frame i -> i+1 by construction and the
+"back-edge" problem above disappears entirely; it was an artifact of
+indexing by discovery stamp, which collapses (s, 30) and (s, 60) into one
+node.
+
+The number that decides it: how few POSITION CELLS are live per frame. A
+room is ~16k cells and R(i) is ~1e8 rows at depth, so ~1e4 rows share a
+cell - position does not discriminate within a cell, and the entire win
+comes from few cells being live. Measure before building.
