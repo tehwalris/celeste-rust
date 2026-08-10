@@ -20,11 +20,25 @@
 # Never gate on the reported optimum: a wrong sweep printed the correct
 # "abstract optimal win frame 90" while g was wrong for 95% of rows,
 # because the win chain happens to be stamp-monotone.
+#
+# ROOM/RECIPE select the room, exactly as ladder.sh does. The default room
+# (1,0) is the one with a CERTIFIED g, so it is the only place claim 1 can be
+# made against an independent answer. Room (0,0) has no certified g - the edge
+# sweep that would have produced one is the one that OOMs - so pointing this
+# at a room-(0,0) level checks claims 1' and 2 instead: that a re-run
+# reproduces the level's own g element-wise, and that the thread count is not
+# visible in it. That is reproducibility and thread-invariance, not
+# certification, and it is the room that CAN violate batch invariance, so it
+# is the one worth checking.
 set -euo pipefail
 cd "$(dirname "$0")"
 K=${1:-8}
 H=${2:-100}
-SRC=${3:-~/celeste-checkpoints/room1-k$K}
+ROOM=${ROOM:-1,0}
+export CELESTE_START_ROOM="$ROOM"
+if [ "$ROOM" = "1,0" ]; then STEM=room1; else STEM=room$(echo "$ROOM" | tr -d ' ,'); fi
+RECIPE=${RECIPE:-rewrites.jsonl}
+SRC=${3:-~/celeste-checkpoints/$STEM-k$K}
 SRC=$(eval echo "$SRC")
 if [ ! -d "$SRC/frames" ]; then
   echo "no certified level at $SRC - pass one as \$3" >&2
@@ -39,7 +53,8 @@ run() { # $1 threads, $2 dir
   cp -a "$SRC" "$2"
   # The position graph is rebuilt per run, so its recording is gated too.
   rm -f "$2/posgraph.bin"
-  CELESTE_FRAME_THREADS=$1 ./safe-run.sh -- ./target/release/rewrite sweep \
+  CELESTE_FRAME_THREADS=$1 ./safe-run.sh -- ./target/release/rewrite \
+      --recipe "$RECIPE" sweep \
       --banded --checkpoint-dir "$2" --frames "$H" --horizon "$H" 2>&1
 }
 

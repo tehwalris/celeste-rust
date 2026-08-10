@@ -621,6 +621,25 @@ This is the discipline the retracted "batch invariance violated" finding
 earlier in the campaign should have had: a checker that has not been shown
 capable of failing is not evidence.
 
+## Where the fragment doubling actually cost something (2026-08-10)
+
+The f94 table above flagged fragments more than doubling as the number
+to watch "if per-fragment cost ever becomes significant". The room (0,0)
+end-to-end run found the place: the SWEEP's position-graph replay, which
+runs with `disable_frontier` and therefore has no boundary merge to
+absorb them. It OOMed at the 100 GB cap after 9,040 s, having completed
+the same work in 6,171.5 s before the fixes.
+
+It is a memory cost only - the replay is 42% FASTER once it fits
+(3,567 s staged) because the deopt is gone there too. But it needed a
+108 GB cap for the final frame (peak 101.08 GB) and one process per few
+frames, and neither the expansion group size nor the thread count moved
+it at that depth. Details and the failed levers are in BENCHMARK_DATA.md.
+
+The honest summary of the trade at horizon 94: **-64% wall clock,
++~30 GB of peak on the one stage where fragments are not merged away.**
+The optimum, the L-curve and every level's agreement are unchanged.
+
 ### Control, final tally
 
     fixes OFF: f070: 23079 lanes checked, 3 violation(s)

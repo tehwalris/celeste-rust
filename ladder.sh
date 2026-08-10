@@ -14,7 +14,12 @@ ROOM=${ROOM:-1,0}
 export CELESTE_START_ROOM="$ROOM"
 if [ "$ROOM" = "1,0" ]; then STEM=room1; else STEM=room$(echo "$ROOM" | tr -d ' ,'); fi
 RECIPE=${RECIPE:-rewrites.jsonl}
-L0=~/celeste-checkpoints/$STEM
+# L0/KROOT are overridable so a smoke run can be pointed at a scratch dir
+# without touching a certified campaign's checkpoints.
+L0=${L0:-~/celeste-checkpoints/$STEM}
+L0=$(eval echo "$L0")
+KROOT=${KROOT:-~/celeste-checkpoints/$STEM}
+KROOT=$(eval echo "$KROOT")
 export CELESTE_FRONTIER_ONLY=1 CELESTE_DEOPT_COLLECT_FIRST=1
 # CHUNKING IS SEMANTIC ON ROOMS WITH FRUIT, so every stage of a campaign
 # must use the SAME values. An UnknownBool branch sends the whole state
@@ -32,10 +37,42 @@ export CELESTE_MAX_STATE_LANES=8000 CELESTE_FRUIT_CHUNK_LANES=8000
 FROM=${1:-94}
 TO=${2:-104}
 MAXK=${3:-16}
+# Per-stage wall clock and peak RSS. The bench prints its own peak, the sweep
+# does not, and neither knows how long the OTHER stages took - so a campaign
+# could only ever be costed by log archaeology. One line per stage here, and
+# `/usr/bin/time` wraps the binary INSIDE the cgroup scope so the RSS is the
+# search process's, not systemd-run's.
+STAGES=${STAGES:-/tmp/ladder-stages.tsv}
+[ -f "$STAGES" ] || printf 'stage\twall_s\tpeak_gb\trc\n' > "$STAGES"
+# Cgroup cap for every stage. 100G is the house default and is what room
+# (1,0) needs. Room (0,0)'s position-graph replay of its LAST frame peaks at
+# 101.08 GB - measured, not estimated - so that campaign has to be run with
+# MEM=108G. Do not raise it past what `free` leaves after /tmp (a tmpfs):
+# above that the kernel kills the machine instead of the cgroup killing the
+# job, which is the whole point of the cap.
+MEM=${MEM:-100G}
+stage() { # $1 name, $2 logfile, rest: the command
+  local name=$1 log=$2 rc=0 t=/tmp/ladder-time.$$
+  shift 2
+  local t0=$SECONDS
+  set +e
+  ./safe-run.sh --memory "$MEM" -- /usr/bin/time -v -o "$t" "$@" > "$log" 2>&1
+  rc=$?
+  set -e
+  local wall=$((SECONDS - t0))
+  local kb
+  kb=$(awk '/Maximum resident set size/ {print $NF+0; exit}' "$t" 2>/dev/null)
+  awk -v n="$name" -v w="$wall" -v k="${kb:-0}" -v r="$rc" \
+      'BEGIN{printf "%s\t%s\t%.2f\t%s\n", n, w, k/1048576, r}' | tee -a "$STAGES"
+  # A failed stage must still abort the campaign (the caller runs under
+  # `set -e`), but only after its cost has been recorded.
+  return $rc
+}
 for H in $(seq "$FROM" "$TO"); do
   echo "=== horizon $H: level 0 extend + sweep ==="
-  ./safe-run.sh -- ./target/release/rewrite --recipe "$RECIPE" bench --frames "$H" --deopt \
-      --checkpoint-dir "$L0" --save-frames --resume > /tmp/l0-h$H.log 2>&1
+  stage "l0-bench-h$H" /tmp/l0-h$H.log \
+      ./target/release/rewrite --recipe "$RECIPE" bench --frames "$H" --deopt \
+      --checkpoint-dir "$L0" --save-frames --resume
   tail -2 /tmp/l0-h$H.log
   # The sweep's origin-tagged plain replays of fruit states blow up on
   # UnknownBool branch doubling; a much tighter per-state lane cap than the
@@ -47,20 +84,40 @@ for H in $(seq "$FROM" "$TO"); do
   # and small chunks are what give the threads work at all (a 250k-lane
   # sweep batch was only 3 chunks at the old cap). The fruit divisor comes
   # down with it so the fruit chunk stays ~1000 lanes rather than 80.
-  ./safe-run.sh -- ./target/release/rewrite --recipe "$RECIPE" sweep \
-      --checkpoint-dir "$L0" --frames "$H" --horizon "$H" > /tmp/l0sweep-h$H.log 2>&1
+  #
+  # The position graph is built in its OWN process, even though the sweep
+  # would build it itself through the same function. The replay's transient
+  # is the biggest allocation either process makes (~76 GB on room (0,0)) and
+  # glibc does not hand it back: with the table built in-process the post-index
+  # RSS was 94 GB and the backward loop was OOM-killed, against 41.6 GB when the
+  # same table was loaded from posgraph.bin. It also banks the replay on disk.
+  #
+  # On room (0,0) this stage is the memory high-water mark of the whole
+  # campaign (101.08 GB at f093, hence MEM=108G) and it does NOT come down
+  # with CELESTE_POSGRAPH_GROUP_LANES or with fewer threads at that depth -
+  # both were measured and both still OOMed. What works below f090 is the
+  # group knob (250k -> 100k took f001..f080 from 40-76 GB to 6-10 GB with a
+  # BYTE-IDENTICAL table), and what works above it is one process per few
+  # frames, since glibc keeps the arenas between frames. `rewrite pos-graph
+  # --frames N` extends an existing table, so staging it is just a loop.
+  stage "l0-posgraph-h$H" /tmp/l0posgraph-h$H.log \
+      ./target/release/rewrite --recipe "$RECIPE" pos-graph \
+      --checkpoint-dir "$L0" --frames "$H"
+  stage "l0-sweep-h$H" /tmp/l0sweep-h$H.log \
+      ./target/release/rewrite --recipe "$RECIPE" sweep \
+      --checkpoint-dir "$L0" --frames "$H" --horizon "$H"
   grep -E "abstract optimal|win seeds" /tmp/l0sweep-h$H.log
   refuted=0
   for K in $(seq 1 "$MAXK"); do
     PREV_BITS=$((K - 1))
-    if [ "$K" -eq 1 ]; then PREV=$L0; else PREV=~/celeste-checkpoints/$STEM-k$PREV_BITS; fi
-    KDIR=~/celeste-checkpoints/$STEM-k$K
+    if [ "$K" -eq 1 ]; then PREV=$L0; else PREV=$KROOT-k$PREV_BITS; fi
+    KDIR=$KROOT-k$K
     echo "=== horizon $H: k=$K banded (band from bits $PREV_BITS) ==="
     rm -rf "$KDIR"
-    CELESTE_REM_BITS=$K ./safe-run.sh -- ./target/release/rewrite --recipe "$RECIPE" bench \
+    stage "k$K-bench-h$H" "/tmp/k$K-h$H.log" \
+        env CELESTE_REM_BITS=$K ./target/release/rewrite --recipe "$RECIPE" bench \
         --frames "$H" --deopt --checkpoint-dir "$KDIR" --save-frames \
-        --band-dir "$PREV" --band-horizon "$H" --band-prev-bits "$PREV_BITS" \
-        > "/tmp/k$K-h$H.log" 2>&1
+        --band-dir "$PREV" --band-horizon "$H" --band-prev-bits "$PREV_BITS"
     tail -3 "/tmp/k$K-h$H.log" | head -1
     if ! grep -q "first room-exit" "/tmp/k$K-h$H.log"; then
       echo "=== horizon $H REFUTED at k=$K ==="
@@ -68,9 +125,12 @@ for H in $(seq "$FROM" "$TO"); do
       break
     fi
     echo "=== horizon $H: k=$K wins; sweeping level $K ==="
-    CELESTE_REM_BITS=$K ./safe-run.sh -- ./target/release/rewrite --recipe "$RECIPE" sweep --banded \
-        --checkpoint-dir "$KDIR" --frames "$H" --horizon "$H" \
-        > "/tmp/k${K}sweep-h$H.log" 2>&1
+    stage "k$K-posgraph-h$H" "/tmp/k${K}posgraph-h$H.log" \
+        env CELESTE_REM_BITS=$K ./target/release/rewrite --recipe "$RECIPE" pos-graph \
+        --checkpoint-dir "$KDIR" --frames "$H"
+    stage "k$K-sweep-h$H" "/tmp/k${K}sweep-h$H.log" \
+        env CELESTE_REM_BITS=$K ./target/release/rewrite --recipe "$RECIPE" sweep --banded \
+        --checkpoint-dir "$KDIR" --frames "$H" --horizon "$H"
     grep -E "abstract optimal|win seeds" "/tmp/k${K}sweep-h$H.log"
   done
   if [ "$refuted" -eq 0 ]; then

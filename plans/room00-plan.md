@@ -1,5 +1,48 @@
 # Room (0,0) "100 m": multi-variant specialization + the fake wall
 
+## RE-DERIVED (2026-08-10) on the fixed interpreter: STILL 94
+
+The whole ladder was rebuilt from nothing after the three interpreter
+fixes (partitioned mixed comparisons, `select` splitting on an
+`UnknownBool` condition, `select` with an `UnknownBool` arm), because
+those make the abstraction strictly more precise and so invalidate
+every pre-fix checkpoint. Result unchanged: **CONCRETE OPTIMUM = 94**,
+all 17 levels winning at horizon 94, and every level's backward
+`min(e+g)` equal to its own forward first-win.
+
+The L-curve, which is the thing that could have moved and did not:
+
+    L(0)=80  L(1)=88  L(2)=88  L(3)=91  L(4)=92  L(5)=93  L(6)=93
+    L(7..16)=94
+
+CORRECTION to the sentence below: it says "horizon 94 converged
+through ALL levels k=1..16 with min(e+g)=94 at every level". The
+second half is WRONG - the coarse levels bound at 88-93, as the L-curve
+above shows and as the refutation list in the same paragraph always
+implied (k=1 refuted at h87 means L(1)=88, k=3 at h90 means L(3)=91,
+and so on). Every one of those seven values is reproduced exactly by
+the 2026-08-10 run, which is the strongest evidence available that the
+fixes did not move the abstraction in the unsafe direction: more
+precision can only raise a level's bound, so a value BELOW the recorded
+one would have meant the set had grown.
+
+Cost: 2.62 h of useful work. The old estimate was 13 +/- 2 h and was
+mostly a deopt that no longer exists. Full breakdown, and the
+position-graph OOM that the doubled fragment count caused, are at the
+top of BENCHMARK_DATA.md.
+
+Two operational facts from that run, both binding:
+
+* the level-0 position-graph replay peaks at **101.08 GB** on its last
+  frame and needs `MEM=108G`; per-frame peaks are near-linear in lane
+  count (74.19 / 83.00 / 91.31 / 101.08 GB at f090 / f091 / f092 /
+  f093), so **horizon 95 does not fit on this machine** without work on
+  that transient. It must also be built one process per few frames -
+  glibc does not return the arenas between frames.
+* `~/celeste-checkpoints/room00-prefix-stale` is the pre-fix tree, kept
+  aside deliberately. It is not comparable to anything the current
+  binary produces and must never be resumed from.
+
 ## RESULT (2026-08-07): CONCRETE OPTIMUM = 94 FRAMES - PROVEN
 
 The optimal TAS for room (0,0), with the breakable strawberry wall

@@ -1,3 +1,130 @@
+# Room (0,0) end to end on the fixed interpreter: 2.6 h (2026-08-10)
+
+The full ladder re-derived from nothing on the post-fix interpreter.
+**CONCRETE OPTIMUM = 94 frames**, unchanged, and all 17 levels agree: every
+level's backward `min(e + g)` equals its own forward first-win frame.
+
+    L(0)=80  L(1)=88  L(2)=88  L(3)=91  L(4)=92  L(5)=93  L(6)=93
+    L(7..16)=94
+
+That L-curve reproduces the 2026-08-07 campaign's refutation record exactly
+(horizons 80-87 refuted at k=1, 88-90 at k=3, 91 at k=4, 92 at k=5, 93 at
+k=7). Note that room00-plan.md's summary sentence "min(e+g)=94 at every
+level" was wrong and is corrected there; the refutation list in the same
+paragraph was right.
+
+## Where the 2.6 h goes
+
+Clean-path wall clock, 16 threads, campaign chunk settings (8000/8000):
+
+| stage | wall | peak RSS | share |
+|---|---|---|---|
+| level-0 forward, f1..f94 | 1,810 s | 37.88 GB | 19% |
+| level-0 position graph | 3,567 s | 101.08 GB | 38% |
+| level-0 re-index | 156 s | (in the sweep) | 2% |
+| level-0 backward loop | 2,088 s | 73.70 GB | 22% |
+| levels k=1..16, all 48 stages | 1,766 s | 21.58 GB (k1) | 19% |
+| **total** | **9,436 s = 2.62 h** | **101.08 GB** | |
+
+k=1 is 65% of the whole k-ladder (1,147 s of 1,766 s) and k=7..16 are 14 s
+each - the band collapses from 27.5M rows at k=1 to 962 at k=16.
+
+Within the level-0 forward pass, frames 80-94 are 1,396 s of 1,804 s
+(**77%**); the first 79 frames are 408 s. Phase totals: `fwd.interpret`
+1,256.5 s, `fwd.merge` 219.1 s, `fwd.save_frames` 88.8 s,
+`fwd.boundary_gather` 75.9 s, `fwd.boundary_stream` 53.8 s.
+
+Within the sweep: `bwdt.replay` 1,397.7 s (of which `fwd.merge` 961.7 s and
+`fwd.interpret` 340.1 s), `bwdt.keys` 569.8 s, `bwdt.index` 156.0 s.
+
+**The old estimate was 13 +/- 2 h and is now 2.6 h.** That estimate was
+built on the f94 forward pass costing 5,079 s, 81.8M deopted lanes, and a
+6,171 s position graph whose f090 alone was 401.8 s of whole-state plain
+fallbacks. The deopt is gone, so the forward pass is 1,810 s and the graph
+is 3,567 s. Nothing else about the ladder changed.
+
+## The sweep, against the pre-fix universe
+
+Same room, same horizon, the only difference being the interpreter fixes:
+
+| level 0, H=94 | pre-fix | rebuilt |
+|---|---|---|
+| rows | 460,658,200 | **405,616,308** (-11.9%) |
+| rows reaching the exit | 24,514,668 | 24,512,603 (-2,065) |
+| row-expansions | 451,884,260 | 449,013,771 (-0.6%) |
+| successors outside the row table | 0 | **0** |
+| `min(e+g)` | 80 | 80 |
+| position graph | 405,332 pairs / 7,923 cells | 405,325 / 7,922 |
+| position graph wall | 6,171.5 s | 3,567 s |
+| re-index | 181.2 s | 156.0 s |
+| backward loop | ~2,600 s | 2,088 s |
+
+Zero out-of-table successors again, over 449M expansions. The row table is
+12% smaller and the exit-reaching set moved by 2,065 rows out of 24.5M -
+the safe direction, and the abstract bound is unchanged at 80.
+
+The forward pass reproduced every recorded figure from the f94 A/B exactly:
+21,663,480 lanes, 1,857,040 fragments, first room-exit at frame 80, and all
+15 winning lane counts including the f94 **18,780** (one below the pre-fix
+18,781). It ran in 1,804.41 s against that A/B's contended 1,992.93 s, and
+peaked at **37.88 GB against its 31.76 GB** - the A/B got ~9.4 of the 16
+cores it asked for, and fewer concurrent chunk transients is a lower peak.
+Quote 37.88 GB as the uncontended figure.
+
+## The fragment doubling BIT, and it cost 2.6 h
+
+The f94 note below flagged fragments more than doubling (871k -> 1.86M) as
+"the number to watch if per-fragment cost ever becomes significant". The
+position-graph replay is exactly that place, and it OOMed:
+
+    one process, whole range, 250k group: 96.60 GB, killed at 9,040 s
+
+Two things that were tried and did NOT fix it, both worth recording because
+they are the obvious levers:
+
+* `CELESTE_POSGRAPH_GROUP_LANES` 250,000 -> 40,000 -> 10,000. The last frame
+  OOMed at 96.58 and 96.61 GB respectively. Below f090 the knob helps a lot
+  (RSS fell from 40-76 GB to 6-10 GB over f1..f80); at f091+ it does nothing.
+* `CELESTE_FRAME_THREADS` 16 -> 4. Climbed monotonically to 99.8 GB and died
+  anyway, 2.3x slower on the way.
+
+What worked: one process per few frames (glibc does not hand the arenas back
+between frames, and a fresh process does), plus a **108 GB** cap for the last
+frame, which peaked at **101.08 GB**. Per-frame peaks are almost linear in
+the frame's lane count - 74.19 GB through f090, 83.00 at f091, 91.31 at f092,
+101.08 at f093 - so f094 would want ~108 GB and f095 ~115 GB. **Room (0,0)
+at horizon 95 does not fit on this machine without work on the replay's
+transient.** That is the concrete next constraint, not a projection.
+
+The staged rebuild is `ladder.sh`'s new `MEM=` knob plus a pos-graph stage in
+its own process; the failed attempts cost 9,439 s on top of the 9,436 s of
+useful work, so the wall clock of the session was 5.2 h for a 2.6 h campaign.
+
+### The group size does not change the answer, measured
+
+`chunk_states` only ever SPLITS a state and never merges across states, so
+the group knobs cannot change how lanes are grouped - only how many
+already-chunked states are in flight. The runs confirm it on room (0,0)
+itself: at group 250,000 and at group 100,000 the recorded table had the
+same pair count at every printed frame - 98,742 at f050, 196,278 at f060,
+324,347 at f070, 399,844 at f080. Same table, 10x less memory.
+
+## Gates
+
+* `trace-witness` on `tas/room_0_0_exit_frame_94.txt`, **all 17 levels**,
+  every frame: PASSES, with `e+g = 94` and `g = 0` at f094.
+* `tsweepcheck.sh` on room (1,0) k8: `g` still matches the certified edge
+  sweep element-wise (the control - the script grew ROOM/RECIPE and this
+  proves the change is inert).
+* `tsweepcheck.sh` on room (0,0) k8 (169,601 rows) and k2 (6,201,650 rows):
+  `g.bin` byte-identical at 1 and 16 threads, and a full re-run reproduces
+  the ladder's own `g` element-wise, 0 differing entries. Room (0,0) has no
+  certified `g` to compare against, so this is reproducibility and
+  thread-invariance, not certification - stated plainly because the script
+  still prints the word "certified".
+* `cargo nextest run --release`: 488 passed. Build warning-free.
+* `~/celeste-checkpoints/room1/g.bin` sha256 unchanged (`a97ca05c...`).
+
 # The deopt is gone on room (0,0): 2.55x, -47% memory (2026-08-09)
 
 Three interpreter fixes, all default-on, remove every plain-program
@@ -101,6 +228,10 @@ understate the gain. Lane counts, peak RSS, deopt counts and win counts
 are contention-independent.
 
 # Room (0,0) SWEEPS. The thing that could not run, runs (2026-08-09)
+
+**SUPERSEDED by the end-to-end section at the top of this file (2026-08-10),
+which re-derived all of it on the fixed interpreter.** Kept for the
+allocator finding and for the before/after comparison.
 
 **Read the universe caveat first.** Every room (0,0) number below is
 against the forward pass as it stood at `census` 1d24aba, i.e. BEFORE the

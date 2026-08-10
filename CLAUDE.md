@@ -63,7 +63,13 @@ accidental blowup kills the process rather than the machine.
 ./safe-run.sh -- ./target/release/celeste-rust -n 40
 ```
 
-Exit code 137 means OOM. Peak memory is much lower than it used to be (the
+Exit code 137 means OOM. One job needs MORE than the 100 GB default:
+room (0,0)'s level-0 position-graph replay peaks at 101.08 GB on its last
+frame, so that campaign runs `ladder.sh` with `MEM=108G` and builds the
+graph a few frames per process. See BENCHMARK_DATA.md; do not raise the cap
+past what `free` leaves after /tmp, which is a tmpfs.
+
+Peak memory is much lower than it used to be (the
 chunk-parallel work took frame 60 of the rewritten path from 4.3 GB to
 2.4 GB), but the unrewritten `celeste-rust -n 40` runner is still the old
 ~29 GB - do not run higher frame counts unsandboxed.
