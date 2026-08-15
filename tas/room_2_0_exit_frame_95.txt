@@ -2,8 +2,12 @@
 #
 # Input bytes for concrete_run (-i), one per frame starting at frame 1.
 # bit0=left bit1=right bit2=up bit3=down bit4=jump bit5=dash.
-# Frames 1-25 are the spawn prologue (inputs ignored; the player object is
-# created at the end of frame 25, so the first player update is frame 26).
+# Frames 1-25 are the spawn prologue (inputs ignored). The player object is
+# created DURING frame 26 and updates in the same frame - the first input
+# byte that matters is frame 26's. (Unlike rooms (0,0) and (1,0), where the
+# player misses its creation frame: this room's player_spawn is at index 2
+# of four, so `foreach`'s index walk still reaches the new player after the
+# array shifts. See plans/room20-plan.md.)
 # next_room() (room.x 2 -> 3) fires DURING FRAME 95, i.e. on the 70th
 # player-update frame - exactly the 70 input bytes of the community TAS.
 #

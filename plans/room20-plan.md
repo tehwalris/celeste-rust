@@ -18,10 +18,10 @@ Collecting the fruit gives `[spring, spring, player]`; nothing else changes
 the shape. Springs are never destroyed - they hide (`hide_in`/`hide_for`,
 `spr` 18/19, `delay`) and come back.
 
-* The spawn prologue is **25 frames**: the player object is created at the
-  end of frame 25, so the first player update is frame 26. (Room (0,0) is
-  28, room (1,0) is 24; the spawn falls from y=128 to the spawn tile, and
-  this one is at y=104.)
+* The spawn prologue is **25 frames**: the player object is created during
+  frame 26 and, in this room, updates on that same frame, so frame 26 is the
+  first input byte that matters. (Rooms (0,0) and (1,0) hand the player its
+  first update one frame after creation - see the `foreach` section.)
 * Spikes: tile 17 at tx 7..10 of ty 6 and ty 11. Deaths are possible.
 * The room is left through the gap at the TOP, tx 8..11 (x 64..95); every
   other top tile is solid. The win is `room.x == 3`, as everywhere else.
@@ -188,6 +188,13 @@ is 95. Straight-line extrapolation puts the 100 GB cap somewhere around
 f075 and the f095 frontier near 10^8 lanes with 2-3 x 10^9 visited rows -
 which is 4x this machine's RAM for the forward pass alone, before the sweep
 (room (0,0)'s sweep needed 2x its forward pass).
+
+Memory is the first wall but not the only one. At f068 a frame costs 305 s
+and the per-frame time is growing about as fast as the lane count; carrying
+that to f095 is ~11 h for the level-0 forward pass ALONE, before the first
+sweep. A campaign is that pass plus a sweep per horizon plus 16 banded
+levels per horizon, over the ~15 horizons between the abstract bound and the
+answer. Even with the memory, this is a machine-weeks job as it stands.
 
 The `CELESTE_XY_DUMP` census says exactly where it goes:
 
