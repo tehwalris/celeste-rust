@@ -135,17 +135,18 @@ NEXT object is skipped. Three consequences, all of them real in this cart:
 1. **The player misses its creation-frame update** in a room where
    `player_spawn` is the LAST object - rooms (0,0) and (1,0). PICO-8 runs
    `player.update` on the frame the player is created; we run it first on
-   the next frame. Room (2,0) is accidentally exempt: its spawn is at index
-   2 of four, so the walk still reaches the player. Both room witnesses
-   replay IDENTICALLY under a scratch build with PICO-8's `all` (room (0,0)
-   still exits during f094, room (1,0) during f100) - the creation frame's
-   input is 0 in both and the player is standing still, so the extra update
-   is a no-op there. It is not a no-op in general: a search that is allowed
-   to act on the creation frame has one more frame of input than ours does,
-   so rooms (0,0) and (1,0) may each be one frame optimistic. The community
-   TASes, which run on real PICO-8, use exactly the input-frame counts we
-   proved optimal (66 and 76), which is evidence that the extra frame does
-   not help - not a proof.
+   the next frame. Room (2,0) is exempt: its spawn is at index 2 of four, so
+   the walk still reaches the player after the shift, and its player updates
+   on its creation frame exactly as PICO-8's does.
+   The effect on those two rooms is a LABEL, not a lost frame: the Nth
+   player update still consumes the Nth input byte, so the reachable set
+   after N updates is identical - it just happens on frame N+24 for us and
+   N+23 in PICO-8. Their proven optima are therefore 94 and 100 room frames
+   in this model against 93 and 99 in PICO-8, with the INPUT-frame counts
+   (66 and 76, which is what the TAS database records) identical either way.
+   Both witnesses replay identically under a scratch build with PICO-8's
+   `all`, exiting on the same frames. Room (2,0)'s 95 needs no such
+   adjustment.
 2. **The object after a self-destroying one skips an update.** In room
    (2,0) that is spring (40,112), skipped on the spawn frame (harmless) and
    on any frame where the fruit is collected (NOT harmless: a bounce that
