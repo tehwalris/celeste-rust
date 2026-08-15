@@ -13,11 +13,13 @@ frame 75 and the horizon it has to reach is 95. Full write-up in
 | 55 | 11,783,364 | 68.7M | 10.5 GB | 39.0 |
 | 60 | 23,220,148 | 178M | 21.7 GB | 113.5 |
 | 65 | 36,562,604 | | 38.3 GB | 244.3 |
-| 67 | 45,409,165 | | 44.3 GB | 240.6 |
+| 68 | 50,674,575 | 450M | 47.7 GB | 305.3 |
+| 70 | 62,890,020 | 570M | 67.6 GB | 347.9 |
 
-Per-frame growth is still 1.09-1.11 at f065. Room (0,0), for comparison,
-peaked at 12.1M frontier lanes at f079 and finished its whole campaign in
-405M rows.
+f001..f070 cost 2,773 s and peaked at 76.08 GB, with the position graph
+recorded inside it. Per-frame growth is still 1.09-1.11 at f070 and 570M
+visited rows is already 1.4x room (0,0)'s ENTIRE campaign - which peaked at
+12.1M frontier lanes at f079 and finished in 405M rows.
 
 **Where it goes is measured, not guessed** (`CELESTE_XY_DUMP`): the room has
 about 4,500 reachable whole-pixel positions, the frontier has 96% of them by
