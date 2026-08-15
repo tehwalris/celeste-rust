@@ -435,23 +435,40 @@ impl<'a> CoreInterpreter<'a> {
                     self.state
                         .heap
                         .set(field_heap_id, HeapValue::Value(Value::Nil(None)));
+                    // Lua lets an assignment skip indices - `t[3] = v` on an
+                    // empty table is legal and leaves t[1] and t[2] absent.
+                    // Room (2,0) does exactly that: the fruit sets
+                    // got_fruit[1 + level_index()], and level_index() is 2
+                    // there (it is 0 in room (0,0), which is why only an
+                    // append was ever needed before). Arrays are modelled
+                    // densely, so the skipped indices are materialised as
+                    // explicit nils, which read back exactly as Lua's absent
+                    // keys do. What this does NOT model is PICO-8's `#`/`add`
+                    // on a table with holes, whose length is any border; no
+                    // table in the cart is both hole-punched and appended to.
+                    let old_len = match self.state.heap.get(table_heap_id) {
+                        HeapValue::ArrayTable(fields) => fields.len(),
+                        HeapValue::UnknownTable => 0,
+                        _ => unreachable!(),
+                    };
+                    let mut fields: Vec<HeapId> = Vec::with_capacity(index as usize);
+                    for _ in old_len..(index as usize - 1) {
+                        let gap_heap_id = self.state.heap.alloc();
+                        self.state
+                            .heap
+                            .set(gap_heap_id, HeapValue::Value(Value::Nil(None)));
+                        fields.push(gap_heap_id);
+                    }
+                    fields.push(field_heap_id);
                     match self.state.heap.get(table_heap_id) {
-                        HeapValue::ArrayTable(fields) => {
-                            if index as usize != fields.len() + 1 {
-                                return Err(anyhow!("Index is not the next index in the array"));
-                            }
+                        HeapValue::ArrayTable(_) => {
                             self.state.heap.modify(table_heap_id, |v| {
-                                if let HeapValue::ArrayTable(fields) = v {
-                                    fields.push(field_heap_id);
+                                if let HeapValue::ArrayTable(old) = v {
+                                    old.extend_from_slice(&fields);
                                 }
                             });
                         }
                         HeapValue::UnknownTable => {
-                            if index as usize != 1 {
-                                return Err(anyhow!("Index is not the next index in the array"));
-                            }
-                            let mut fields = Vec::new();
-                            fields.push(field_heap_id);
                             self.state
                                 .heap
                                 .set(table_heap_id, HeapValue::ArrayTable(fields));

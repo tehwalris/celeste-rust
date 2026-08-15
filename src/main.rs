@@ -1064,6 +1064,45 @@ __print(function_a ~= function_b)
         );
     }
 
+    /// `t[3] = v` on an empty table: legal Lua, and what room (2,0)'s fruit
+    /// does (`got_fruit[1 + level_index()]` with level_index() == 2). The
+    /// skipped indices must read back as nil, and a later append must land
+    /// after them.
+    #[test]
+    fn test_interpret_index_assignment_past_the_end() {
+        use crate::interpreter::glue::interpret_cfg;
+
+        let code = r#"
+local t = {}
+t[3] = true
+__print(t[1])
+__print(t[2])
+__print(t[3])
+__print(#t)
+t[4] = "after"
+__print(t[4])
+__print(#t)
+"#;
+        let ast = full_moon::parse(code).expect("Failed to parse");
+        let (cfg, fun_defs) = frontend::compile(&ast).expect("Failed to compile");
+
+        let mut fixed_env = create_fixed_env_with_builtins();
+        for fun_def in fun_defs {
+            fixed_env.add_fun_def(fun_def);
+        }
+
+        let initial_state = create_initial_state_with_builtins(&fixed_env);
+
+        let result_states =
+            interpret_cfg(cfg, initial_state, &fixed_env).expect("Interpretation failed");
+
+        assert_eq!(result_states.len(), 1);
+        assert_eq!(
+            result_states[0].0.prints,
+            vec!["nil", "nil", "true", "3", "after", "4"]
+        );
+    }
+
     #[test]
     fn test_interpret_for_range() {
         use crate::interpreter::glue::interpret_cfg;
