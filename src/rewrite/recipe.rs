@@ -483,6 +483,46 @@ impl Rule {
             Rule::SplitCall { .. } => "split_call",
         }
     }
+
+    /// Every field of this entry that names a LOCAL, with the function it is
+    /// resolved against - the exact set `resolve_cell` is called on.
+    ///
+    /// One place, so that migrating the recipe from `%N` to stable names is a
+    /// walk rather than thirty-five hand-written cases that can silently omit
+    /// one. `PartitionMerge`'s `cells` are field-path patterns, not locals,
+    /// and are deliberately absent.
+    ///
+    /// Returns the function name by value: the borrow checker will not let a
+    /// shared read of `function` coexist with the mutable field borrows, and
+    /// cloning one short string per entry is not worth a lifetime dance.
+    pub fn cell_fields_mut(&mut self) -> Option<(String, Vec<&mut String>)> {
+        let (function, fields): (&mut String, Vec<&mut String>) = match self {
+            Rule::Inline { function, at, captures, .. } => {
+                let mut fields = vec![at];
+                fields.extend(captures.iter_mut());
+                (function, fields)
+            }
+            Rule::PinBuiltin { function, at, .. }
+            | Rule::DemoteCreate { function, at }
+            | Rule::SinkStore { function, at }
+            | Rule::DecomposeBranch { function, at } => (function, vec![at]),
+            Rule::DecomposeTruthy { function, root } => (function, vec![root]),
+            Rule::PromoteCell { function, cell } => (function, vec![cell]),
+            Rule::WidenRem { function, object, .. } => (function, vec![object]),
+            Rule::AssumeEq { function, a, b } => (function, vec![a, b]),
+            Rule::SplitCall { function, at, on, .. } => (function, vec![at, on]),
+            Rule::Speculate { function, guards, .. } => {
+                let mut fields = Vec::new();
+                for guard in guards.iter_mut() {
+                    fields.push(&mut guard.load);
+                    fields.push(&mut guard.store);
+                }
+                (function, fields)
+            }
+            _ => return None,
+        };
+        Some((function.clone(), fields))
+    }
 }
 
 /// One declared crossing for `Rule::Speculate`'s `guards` field.
@@ -998,6 +1038,77 @@ fn name_new_locals(before: &Program, after: &mut Program, entry_id: &str) -> Res
         }
     }
     Ok(())
+}
+
+/// What one `migrate_to_names` run changed.
+pub struct MigrationReport {
+    /// Cell fields rewritten from `%N` to a stable name.
+    pub migrated: usize,
+    /// Cell fields left as `%N` because the local has no name - i.e. it is a
+    /// SOURCE local, which is already stable and deliberately unnamed.
+    pub source: usize,
+    /// Cell fields that were already names.
+    pub already: usize,
+}
+
+/// Re-address every recipe cell that points at a rewrite-created local, from
+/// `%N` to the stable name of whatever created it.
+///
+/// Done by replay rather than by editing text: an entry's `%N` only means
+/// anything against the program AS THAT ENTRY FINDS IT, so the only way to
+/// know which local `%325` is, is to build the program up to that entry. So
+/// this walks the recipe exactly as `build` does, and rewrites each entry
+/// just before applying it.
+///
+/// Every rewrite is checked to resolve back to the id it replaced, and the
+/// whole thing is gated by `rewrite isocheck`: if migration changed which
+/// instruction an entry addressed, the final program would differ.
+pub fn migrate_to_names(recipe: &mut Recipe) -> Result<MigrationReport> {
+    let mut program = Program::compile_from_disk()?;
+    let mut report = MigrationReport { migrated: 0, source: 0, already: 0 };
+
+    for entry in recipe.entries.iter_mut() {
+        let id = entry.id.clone();
+        if let Some((function, fields)) = entry.rule.cell_fields_mut() {
+            let names = &program
+                .get(&function)
+                .with_context(|| format!("entry {}", id))?
+                .cfg
+                .names;
+            for field in fields {
+                let Some(local) = super::print::parse_local_name(field) else {
+                    report.already += 1;
+                    continue;
+                };
+                match names.get(local) {
+                    Some(name) => {
+                        let replacement = format!("%{}", name);
+                        // The name must round-trip to the id it replaced.
+                        // Cheap, and it is the whole claim of this pass.
+                        if names.lookup(name) != Some(local) {
+                            return Err(anyhow!(
+                                "entry {}: name {:?} does not resolve back to {} in {}",
+                                id,
+                                name,
+                                usize::from(local),
+                                function
+                            ));
+                        }
+                        *field = replacement;
+                        report.migrated += 1;
+                    }
+                    // Unnamed means a source local: `LocalIdGenerator`
+                    // numbers those per function at compile time, so an edit
+                    // to one function cannot move another's. `%N` is already
+                    // the stable spelling for them.
+                    None => report.source += 1,
+                }
+            }
+        }
+        apply_entry(&mut program, entry)
+            .with_context(|| format!("replaying entry {} during name migration", id))?;
+    }
+    Ok(report)
 }
 
 /// Builds the program from source and replays the whole recipe.

@@ -249,6 +249,17 @@ enum Command {
     /// names a change to the base program actually disturbed - which is the
     /// measurement the whole recipe-stability plan turns on.
     Names {},
+    /// Re-address the recipe's cells from `%N` to the stable name of whatever
+    /// rewrite created the local. Replays the recipe to do it, because `%N`
+    /// only means anything against the program as that entry finds it. Cells
+    /// pointing at SOURCE locals stay `%N` - those are already stable.
+    /// Verify with `rewrite isocheck` afterwards: the program must not move.
+    MigrateNames {
+        /// Write the migrated recipe back over the input. Without this, the
+        /// counts are printed and nothing is touched.
+        #[arg(long)]
+        write: bool,
+    },
     /// Is the compiled program the SAME program, up to renaming its locals?
     /// The gate for plans/recipe-stability-plan.md: that refactor changes how
     /// LocalIds are assigned, not what program comes out, so it must leave
@@ -1375,6 +1386,57 @@ fn parse_tas(path: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
+/// Re-emit a recipe file with `entries`' current contents, keeping comments,
+/// blank lines and the untouched entries' exact original text.
+///
+/// The recipe is documentation as much as data - a third of the file is
+/// comments explaining why a group of entries exists - so a rewrite that
+/// dropped them, or that reflowed all 905 lines through serde, would make the
+/// migration's diff unreadable and unreviewable. Only lines whose entry
+/// actually changed are re-serialized.
+fn recipe_text_with_header(path: &str, recipe: &Recipe) -> Result<String> {
+    let original = std::fs::read_to_string(path)?;
+    let mut out = String::new();
+    let mut next = 0usize;
+    for line in original.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        let entry = recipe
+            .entries
+            .get(next)
+            .ok_or_else(|| anyhow!("recipe has more lines than parsed entries"))?;
+        let before: celeste_rust::rewrite::recipe::RewriteEntry = serde_json::from_str(trimmed)?;
+        if before.id != entry.id {
+            return Err(anyhow!(
+                "recipe line/entry mismatch: file has {:?} where entry {} is {:?}",
+                before.id,
+                next,
+                entry.id
+            ));
+        }
+        let re_emitted = serde_json::to_string(entry)?;
+        if re_emitted == serde_json::to_string(&before)? {
+            out.push_str(trimmed);
+        } else {
+            out.push_str(&re_emitted);
+        }
+        out.push('\n');
+        next += 1;
+    }
+    if next != recipe.entries.len() {
+        return Err(anyhow!(
+            "recipe has {} entries but the file only had {} entry lines",
+            recipe.entries.len(),
+            next
+        ));
+    }
+    Ok(out)
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let recipe = Recipe::load(&cli.recipe)?;
@@ -2452,6 +2514,22 @@ fn main() -> Result<()> {
             rows.sort();
             for row in rows {
                 println!("{}", row);
+            }
+        }
+
+        Command::MigrateNames { write } => {
+            let mut recipe = recipe;
+            let report = celeste_rust::rewrite::recipe::migrate_to_names(&mut recipe)?;
+            println!(
+                "{} cell(s) re-addressed to stable names, {} left as %N (source \
+                 locals, already stable), {} already named",
+                report.migrated, report.source, report.already
+            );
+            if write {
+                std::fs::write(&cli.recipe, recipe_text_with_header(&cli.recipe, &recipe)?)?;
+                println!("wrote {}", cli.recipe);
+            } else {
+                println!("(dry run - pass --write to apply)");
             }
         }
 
