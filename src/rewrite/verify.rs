@@ -699,6 +699,36 @@ fn frame_threads() -> usize {
 /// The cap defaults to 1M lanes (the room-(0,0) campaign value; it never
 /// fires on runs below that scale). CELESTE_MAX_STATE_LANES overrides;
 /// 0 disables chunking entirely.
+/// The lane cap `chunk_states` will actually use, as a value.
+///
+/// Exposed because it belongs in the campaign fingerprint and the
+/// fingerprint must hash what the run WILL DO, not which environment
+/// variables happen to be set. Note the default is a function of the
+/// thread count, so a run that sets neither variable still has a definite
+/// cap - and two runs at different thread counts have DIFFERENT caps
+/// without either one naming a chunk setting.
+pub fn effective_chunk_cap() -> usize {
+    const SERIAL_CAP: usize = 1_000_000;
+    const PARALLEL_CAP: usize = 8_000;
+    let default_cap = if frame_threads() > 1 { PARALLEL_CAP } else { SERIAL_CAP };
+    std::env::var("CELESTE_MAX_STATE_LANES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default_cap)
+}
+
+/// The fruit-shape lane cap `chunk_states` will actually use, as a value.
+/// Clamped by the general cap exactly as the chunking does.
+pub fn effective_fruit_chunk_cap() -> usize {
+    let cap = effective_chunk_cap();
+    std::env::var("CELESTE_FRUIT_CHUNK_LANES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8_000)
+        .max(1)
+        .min(cap.max(1))
+}
+
 fn chunk_states(states: Vec<State>) -> Vec<State> {
     // The cap and the thread count are ONE setting, not two. Measured on
     // room (1,0), 60 frames (2026-08-08):
@@ -719,13 +749,7 @@ fn chunk_states(states: Vec<State>) -> Vec<State> {
     // the chunks are what give the threads work and the threads are what
     // pay for the chunking. So the parallel default cap is derived here
     // rather than left to the caller to remember.
-    const SERIAL_CAP: usize = 1_000_000;
-    const PARALLEL_CAP: usize = 8_000;
-    let default_cap = if frame_threads() > 1 { PARALLEL_CAP } else { SERIAL_CAP };
-    let cap = std::env::var("CELESTE_MAX_STATE_LANES")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(default_cap);
+    let cap = effective_chunk_cap();
     if cap == 0 {
         return states;
     }
@@ -758,12 +782,7 @@ fn chunk_states(states: Vec<State>) -> Vec<State> {
                 // The sweep still wants far less (its origin column blocks
                 // all dedup, so the UnknownBool doubling multiplies on the
                 // full 64-input fan-out) and sets the env var.
-                std::env::var("CELESTE_FRUIT_CHUNK_LANES")
-                    .ok()
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .unwrap_or(8_000)
-                    .max(1)
-                    .min(cap)
+                effective_fruit_chunk_cap()
             }
             _ => cap,
         };

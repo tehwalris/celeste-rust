@@ -81,6 +81,26 @@ pub struct CampaignConfig {
     pub frontier_only: bool,
     /// Deopt frames run collect-first; CELESTE_DEOPT_COLLECT_FIRST.
     pub deopt_collect_first: bool,
+    /// The lane cap `chunk_states` will use, and the fruit-shape cap
+    /// (CELESTE_MAX_STATE_LANES, CELESTE_FRUIT_CHUNK_LANES).
+    ///
+    /// CHUNKING IS SEMANTIC on rooms with fruit: a comparison against a
+    /// widened interval that straddles in any lane of a chunk used to
+    /// collapse to a whole-value `UnknownBool` and send the entire chunk
+    /// down both edges, so how lanes are grouped decided how coarse the
+    /// over-approximation was. The partition fixes remove that mechanism,
+    /// but "much less left to change" is not "nothing", and the caps also
+    /// steer the deopt and the merge. Two runs that disagree on them must
+    /// never share checkpoints.
+    ///
+    /// Stored as the EFFECTIVE values, not env-var presence, because the
+    /// default is a function of the thread count: 1M serial, 8k parallel.
+    /// A run that sets neither variable still has a definite cap, and two
+    /// runs at different thread counts differ without either naming a
+    /// chunk setting - which presence-hashing would have missed, the same
+    /// way it missed things twice before.
+    pub max_state_lanes: usize,
+    pub fruit_chunk_lanes: usize,
 }
 
 impl CampaignConfig {
@@ -91,6 +111,8 @@ impl CampaignConfig {
             frontier_only: std::env::var_os("CELESTE_FRONTIER_ONLY").is_some(),
             deopt_collect_first: std::env::var_os("CELESTE_DEOPT_COLLECT_FIRST")
                 .is_some(),
+            max_state_lanes: crate::rewrite::verify::effective_chunk_cap(),
+            fruit_chunk_lanes: crate::rewrite::verify::effective_fruit_chunk_cap(),
         }
     }
 }
@@ -124,6 +146,8 @@ pub fn config_fingerprint_for(recipe_text: &str, config: &CampaignConfig) -> Str
     format!("{:?}", config.precision).hash(&mut h);
     config.frontier_only.hash(&mut h);
     config.deopt_collect_first.hash(&mut h);
+    config.max_state_lanes.hash(&mut h);
+    config.fruit_chunk_lanes.hash(&mut h);
     format!("{:016x}", h.finish())
 }
 
@@ -381,4 +405,59 @@ pub fn load(dir: &Path, frame: u32, fingerprint: &str) -> Result<Checkpoint> {
     }
 
     Ok(Checkpoint { meta, visited, states })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base() -> CampaignConfig {
+        CampaignConfig {
+            start_room: (0, 0),
+            precision: crate::interpreter::abstraction::RemPrecision::Bits(0),
+            frontier_only: true,
+            deopt_collect_first: true,
+            max_state_lanes: 8_000,
+            fruit_chunk_lanes: 8_000,
+        }
+    }
+
+    /// Chunking is SEMANTIC on rooms with fruit, so two runs that group
+    /// lanes differently can produce different over-approximations and must
+    /// never share checkpoints. Before this, they hashed the same and a
+    /// resume across a cap change was silently accepted - and the quiet
+    /// direction (a sweep chunked FINER than its forward pass) produces a
+    /// SUBSET of the edges, so `g` overestimates and the band prunes viable
+    /// rows with nothing reporting it.
+    #[test]
+    fn the_chunk_caps_change_the_fingerprint() {
+        let a = config_fingerprint_for("recipe", &base());
+
+        let mut finer = base();
+        finer.max_state_lanes = 4_000;
+        assert_ne!(a, config_fingerprint_for("recipe", &finer), "cap must count");
+
+        let mut fruit = base();
+        fruit.fruit_chunk_lanes = 1_000;
+        assert_ne!(a, config_fingerprint_for("recipe", &fruit), "fruit cap must count");
+
+        // And the same configuration still agrees with itself, or every
+        // resume in the campaign would break.
+        assert_eq!(a, config_fingerprint_for("recipe", &base()));
+    }
+
+    /// The default cap is a function of the THREAD COUNT (1M serial, 8k
+    /// parallel), so two runs can differ without either naming a chunk
+    /// setting. That is why the config stores effective values rather than
+    /// env-var presence.
+    #[test]
+    fn the_serial_and_parallel_defaults_are_distinguishable() {
+        let mut serial = base();
+        serial.max_state_lanes = 1_000_000;
+        assert_ne!(
+            config_fingerprint_for("recipe", &serial),
+            config_fingerprint_for("recipe", &base()),
+            "the serial default must not hash like the parallel one"
+        );
+    }
 }
