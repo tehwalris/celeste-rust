@@ -294,6 +294,27 @@ pub fn validate_function(fun: &FunDef) -> Vec<ValidationError> {
         }
     }
 
+    // --- names refer to live instructions ---
+    //
+    // A name outliving the instruction it named is the failure mode that
+    // would make the recipe address the wrong thing SILENTLY: the entry
+    // resolves, to a local that no longer exists or - worse, once ids are
+    // reused - to a different one. `Cfg::map_blocks` deliberately carries
+    // names through a rewrite, so a rule that deletes an instruction is
+    // responsible for pruning its name, and this is what makes forgetting
+    // loud. Names are addressing metadata and cannot affect the program,
+    // so this checks bookkeeping, not semantics.
+    for (id, name) in cfg.names.iter() {
+        if !defined.contains_key(&id) {
+            err!(
+                "name {:?} refers to {} which this function does not define \
+                 - a rewrite deleted it without pruning the name",
+                name,
+                local_name(id)
+            );
+        }
+    }
+
     // --- the slot map matches the CFG ---
     //
     // Run here, after every rewrite, rather than only after `allocate_slots`.

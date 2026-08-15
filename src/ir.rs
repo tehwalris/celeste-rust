@@ -744,12 +744,15 @@ pub struct Cfg {
     /// identity; `validate` rejects a map that does not cover the CFG, and the
     /// occupant array in `LocalEnv` is the run-time backstop.
     pub slots: Arc<SlotMap>,
+    /// Stable names for this CFG's locals; see `Names`. Empty until the
+    /// naming pass runs, and invisible to `PartialEq`.
+    pub names: Names,
 }
 
 impl Cfg {
     /// A CFG with no slot allocation yet, i.e. one local per `LocalId`.
     pub fn new(entry: Block, named: FxHashMap<Label, Block>) -> Self {
-        Self { entry, named, slots: Arc::new(SlotMap::identity()) }
+        Self { entry, named, slots: Arc::new(SlotMap::identity()), names: Names::default() }
     }
 
     pub fn iter_blocks(&self) -> impl Iterator<Item = &Block> {
@@ -761,10 +764,114 @@ impl Cfg {
     /// Callers change instructions, and a map built for the old instructions
     /// says nothing about the new ones. Re-run `allocate_slots` afterwards.
     pub fn map_blocks(&self, f: impl Fn(&Block) -> Block) -> Self {
-        Self::new(
+        let mut out = Self::new(
             f(&self.entry),
             self.named.iter().map(|(k, v)| (k.clone(), f(v))).collect(),
-        )
+        );
+        // Names are CARRIED, unlike slots which are deliberately dropped.
+        //
+        // Rewriting a block does not rename anything, so erasing the names
+        // here would silently destroy the recipe's addressing the moment
+        // the naming pass populates them - a rule would simply return a
+        // function whose locals had no names, and the next entry that
+        // referred to one would fail with "unknown name" far from the
+        // cause. A name left pointing at an instruction the rewrite
+        // DELETED is caught by validation instead, which is the loud
+        // direction.
+        out.names = self.names.clone();
+        out
+    }
+}
+
+/// Stable names for locals - the addressing the recipe wants, kept apart
+/// from the `LocalId`, which is free to move.
+///
+/// A recipe entry that says `%foreach_1.t3` must still mean the same
+/// instruction after an unrelated edit elsewhere. Ids cannot provide that:
+/// they have to stay DENSE, because `SlotMap::identity()` means slot ==
+/// LocalId and `LocalEnv` sizes its storage by slot, so a sparse id would
+/// make every intermediate state allocate to the id's magnitude. See
+/// plans/recipe-stability-plan.md - the per-entry stride scheme died on
+/// exactly that.
+///
+/// # Why `PartialEq` ignores it
+///
+/// Names are ADDRESSING METADATA, not program content: two functions that
+/// differ only in what their locals are called are the same function.
+/// Several rule verifiers assert "nothing outside the edited region
+/// changed" by comparing `FunDef`s, and they would all start failing the
+/// moment naming was introduced - the same trap `apply_entry` already
+/// works around for `slots` by resetting the map before every rule. The
+/// `isocheck` gate is what actually checks the program did not change, and
+/// it is name-blind by construction.
+#[derive(Clone, Debug, Default)]
+pub struct Names {
+    of_local: FxHashMap<LocalId, String>,
+    by_name: FxHashMap<String, LocalId>,
+}
+
+impl PartialEq for Names {
+    /// Always equal: see the type docs. Naming a local is not a change to
+    /// the program.
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Names {
+    pub fn is_empty(&self) -> bool {
+        self.of_local.is_empty()
+    }
+
+    pub fn get(&self, id: LocalId) -> Option<&str> {
+        self.of_local.get(&id).map(|s| s.as_str())
+    }
+
+    pub fn lookup(&self, name: &str) -> Option<LocalId> {
+        self.by_name.get(name).copied()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (LocalId, &str)> {
+        self.of_local.iter().map(|(id, n)| (*id, n.as_str()))
+    }
+
+    /// Bind a name to an id, refusing any collision.
+    ///
+    /// Two locals sharing a name would make a recipe entry silently address
+    /// the wrong instruction, which is the failure this whole mechanism
+    /// exists to prevent - so it is an error, never a last-writer-wins.
+    pub fn insert(&mut self, id: LocalId, name: impl Into<String>) -> Result<(), String> {
+        let name = name.into();
+        if let Some(existing) = self.by_name.get(&name) {
+            if *existing != id {
+                return Err(format!(
+                    "name {:?} is already bound to %{}, cannot bind it to %{}",
+                    name,
+                    usize::from(*existing),
+                    usize::from(id)
+                ));
+            }
+            return Ok(());
+        }
+        if let Some(old) = self.of_local.get(&id) {
+            return Err(format!(
+                "%{} is already named {:?}, cannot rename it to {:?}",
+                usize::from(id),
+                old,
+                name
+            ));
+        }
+        self.by_name.insert(name.clone(), id);
+        self.of_local.insert(id, name);
+        Ok(())
+    }
+
+    /// Drop names whose id no longer exists, given the ids still live.
+    pub fn retain_ids(&mut self, live: &dyn Fn(LocalId) -> bool) {
+        self.of_local.retain(|id, _| live(*id));
+        let kept: FxHashMap<String, LocalId> =
+            self.of_local.iter().map(|(id, n)| (n.clone(), *id)).collect();
+        self.by_name = kept;
     }
 }
 
@@ -776,4 +883,64 @@ pub struct FunDef {
     pub cfg: Cfg,
     /// Source span of the function definition in the original Lua source
     pub source_span: Option<SourceSpan>,
+}
+
+#[cfg(test)]
+mod names_tests {
+    use super::*;
+
+    #[test]
+    fn a_name_binds_both_ways() {
+        let mut n = Names::default();
+        n.insert(LocalId::from(7), "foreach_1.loop_i").unwrap();
+        assert_eq!(n.get(LocalId::from(7)), Some("foreach_1.loop_i"));
+        assert_eq!(n.lookup("foreach_1.loop_i"), Some(LocalId::from(7)));
+        assert_eq!(n.lookup("nope"), None);
+    }
+
+    /// The whole point: two locals must never share a name, or a recipe
+    /// entry silently addresses the wrong instruction. Last-writer-wins
+    /// would be the dangerous behaviour, so a collision is an error.
+    #[test]
+    fn a_colliding_name_is_refused() {
+        let mut n = Names::default();
+        n.insert(LocalId::from(1), "t").unwrap();
+        let err = n.insert(LocalId::from(2), "t").expect_err("must refuse");
+        assert!(err.contains("already bound"), "{}", err);
+        // and the original binding is intact
+        assert_eq!(n.lookup("t"), Some(LocalId::from(1)));
+    }
+
+    /// Renaming an already-named local is equally refused - a second name
+    /// for one id would let two recipe entries disagree about what they are
+    /// pointing at while both resolving.
+    #[test]
+    fn renaming_is_refused_but_rebinding_the_same_pair_is_fine() {
+        let mut n = Names::default();
+        n.insert(LocalId::from(1), "a").unwrap();
+        assert!(n.insert(LocalId::from(1), "b").is_err());
+        n.insert(LocalId::from(1), "a").expect("idempotent rebind is fine");
+    }
+
+    /// Names are metadata: two functions differing only in them are equal,
+    /// or every rule verifier that asserts "nothing else changed" would
+    /// start failing the moment naming was introduced.
+    #[test]
+    fn names_are_invisible_to_equality() {
+        let mut a = Names::default();
+        let b = Names::default();
+        a.insert(LocalId::from(3), "x").unwrap();
+        assert_eq!(a, b, "naming a local is not a change to the program");
+    }
+
+    #[test]
+    fn retain_drops_dead_ids_from_both_directions() {
+        let mut n = Names::default();
+        n.insert(LocalId::from(1), "keep").unwrap();
+        n.insert(LocalId::from(2), "drop").unwrap();
+        n.retain_ids(&|id| usize::from(id) == 1);
+        assert_eq!(n.lookup("keep"), Some(LocalId::from(1)));
+        assert_eq!(n.lookup("drop"), None, "the reverse map must be pruned too");
+        assert_eq!(n.get(LocalId::from(2)), None);
+    }
 }

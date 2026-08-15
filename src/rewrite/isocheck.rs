@@ -30,7 +30,6 @@ use std::fmt::Write as _;
 
 use anyhow::{anyhow, Result};
 
-use crate::ir::LocalId;
 use crate::rewrite::program::Program;
 
 /// The canonical form of a program: every local replaced by the order in
