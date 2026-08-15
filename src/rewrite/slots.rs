@@ -161,13 +161,38 @@ pub fn constraints(fun: &FunDef) -> Vec<Vec<LocalId>> {
     out
 }
 
+/// A local's identity for ordering purposes, independent of its `LocalId`.
+///
+/// Rewrite-created locals have a stable name (`{entry}.{block}.{position}`);
+/// source locals deliberately have none, because their ids are already
+/// per-function and stable, so their id IS the stable key. Zero-padded so
+/// the string order matches the numeric one.
+///
+/// Named and unnamed locals therefore sort into two groups. That is fine -
+/// all that is required is that the key does not move when the numbering
+/// does.
+fn stable_key(fun: &FunDef, id: LocalId) -> String {
+    match fun.cfg.names.get(id) {
+        Some(name) => format!("n:{}", name),
+        None => format!("i:{:08}", usize::from(id)),
+    }
+}
+
 /// Greedy colouring of the conflict graph.
 ///
 /// Deliberately unsophisticated. Max simultaneous liveness is 12-18, so the gap
 /// between this and an optimal allocation is at most a couple of slots against
 /// a baseline of hundreds, and a simple allocator is one fewer thing to be
-/// wrong. Ordering is by descending conflict count, ties broken by id, so the
-/// result is deterministic.
+/// wrong. Ordering is by descending conflict count, ties broken by
+/// `stable_key`, so the result is deterministic AND survives a renumbering.
+///
+/// The tiebreak used to be the raw `LocalId`, which made the whole slot
+/// assignment a function of the id numbering - and row keys are computed
+/// from slots, so every checkpoint and every certified `g` silently depended
+/// on it. Any change to how ids are handed out permuted the layout of states
+/// that mean exactly the same thing. Keying the tiebreak on the local's
+/// STABLE NAME instead makes the layout a function of the program, which is
+/// what it should have been: see plans/recipe-stability-plan.md.
 pub fn allocate(fun: &FunDef) -> SlotMap {
     let ids = defined_ids(fun);
     if ids.is_empty() {
@@ -188,13 +213,20 @@ pub fn allocate(fun: &FunDef) -> SlotMap {
         }
     }
 
-    let mut order: Vec<LocalId> = ids.clone();
-    order.sort_by_key(|id| {
-        (
-            std::cmp::Reverse(conflicts.get(id).map_or(0, |c| c.len())),
-            *id,
-        )
-    });
+    // Keys built once rather than inside the comparator: `sort_by_key` calls
+    // it O(n log n) times, and each call formats a string.
+    let mut order: Vec<(usize, String, LocalId)> = ids
+        .iter()
+        .map(|id| {
+            (
+                usize::MAX - conflicts.get(id).map_or(0, |c| c.len()),
+                stable_key(fun, *id),
+                *id,
+            )
+        })
+        .collect();
+    order.sort();
+    let order: Vec<LocalId> = order.into_iter().map(|(_, _, id)| id).collect();
 
     let mut slot_of: FxHashMap<LocalId, u32> = FxHashMap::default();
     for id in order {

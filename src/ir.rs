@@ -354,6 +354,16 @@ pub enum Instruction {
 }
 
 impl Instruction {
+    /// Rename the block labels this instruction mentions. Only `Phi` does.
+    pub fn map_labels(&self, f: &impl Fn(&Label) -> Label) -> Self {
+        match self {
+            Self::Phi { branches } => Self::Phi {
+                branches: branches.iter().map(|(label, id)| (f(label), *id)).collect(),
+            },
+            other => other.clone(),
+        }
+    }
+
     pub fn map_local_ids(&self, mut f: impl FnMut(LocalId) -> LocalId) -> Self {
         match self {
             Self::Alloc => Self::Alloc,
@@ -570,6 +580,23 @@ impl Terminator {
         }
     }
 
+    /// Rename this terminator's branch targets.
+    pub fn map_labels(&self, f: &impl Fn(&Label) -> Label) -> Self {
+        match self {
+            Self::Return { value } => Self::Return { value: *value },
+            Self::UnconditionalBranch { target } => {
+                Self::UnconditionalBranch { target: f(target) }
+            }
+            Self::ConditionalBranch { condition, true_target, false_target } => {
+                Self::ConditionalBranch {
+                    condition: *condition,
+                    true_target: f(true_target),
+                    false_target: f(false_target),
+                }
+            }
+        }
+    }
+
     /// Successor labels, in order (true target then false target).
     pub fn successor_labels(&self) -> Vec<&Label> {
         match self {
@@ -780,6 +807,32 @@ impl Cfg {
         // direction.
         out.names = self.names.clone();
         out
+    }
+
+    /// Rename every block label: the map's keys, every branch target and
+    /// every phi's incoming-edge label, all at once.
+    ///
+    /// Renaming only some of those would leave a CFG that still looks
+    /// well-formed to a casual reader but whose phis name edges that no
+    /// longer exist, so this is one operation rather than three the caller
+    /// has to remember. Slots and names are carried unchanged - a label is
+    /// not a local.
+    pub fn map_labels(&self, f: &impl Fn(&Label) -> Label) -> Self {
+        let map_block = |block: &Block| Block {
+            instructions: block
+                .instructions
+                .iter()
+                .map(|(id, instruction)| (*id, instruction.map_labels(f)))
+                .collect(),
+            terminator: (block.terminator.0, block.terminator.1.map_labels(f)),
+            hint_normalize: block.hint_normalize,
+        };
+        Self {
+            entry: map_block(&self.entry),
+            named: self.named.iter().map(|(k, v)| (f(k), map_block(v))).collect(),
+            slots: self.slots.clone(),
+            names: self.names.clone(),
+        }
     }
 }
 

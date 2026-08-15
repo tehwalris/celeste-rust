@@ -249,6 +249,16 @@ enum Command {
     /// names a change to the base program actually disturbed - which is the
     /// measurement the whole recipe-stability plan turns on.
     Names {},
+    /// Print every block as "function<TAB>canonical position<TAB>label".
+    /// The position is structural (reverse postorder from the entry), so
+    /// joining two builds' dumps on it recovers a label renaming.
+    Labels {
+        /// Dump the freshly compiled program instead of the rewritten one.
+        /// Needed when the recipe cannot replay - which is exactly the case
+        /// while a label renaming is being migrated.
+        #[arg(long)]
+        base: bool,
+    },
     /// Re-address the recipe's cells from `%N` to the stable name of whatever
     /// rewrite created the local. Replays the recipe to do it, because `%N`
     /// only means anything against the program as that entry finds it. Cells
@@ -2517,6 +2527,19 @@ fn main() -> Result<()> {
             }
         }
 
+        Command::Labels { base } => {
+            let program = if base {
+                celeste_rust::rewrite::program::Program::compile_from_disk()?
+            } else {
+                build(&recipe)?.0
+            };
+            for (function, position, label) in
+                celeste_rust::rewrite::isocheck::label_positions(&program)
+            {
+                println!("{}\t{}\t{}", function, position, label);
+            }
+        }
+
         Command::MigrateNames { write } => {
             let mut recipe = recipe;
             let report = celeste_rust::rewrite::recipe::migrate_to_names(&mut recipe)?;
@@ -2537,6 +2560,18 @@ fn main() -> Result<()> {
             use celeste_rust::rewrite::isocheck;
             let (program, _) = build(&recipe)?;
             let dir = std::path::PathBuf::from(dir);
+            // Blocks the canonical walk could not reach have no
+            // reverse-postorder position, so the gate's insensitivity to
+            // label NAMING does not cover them. Say so rather than let the
+            // check quietly mean less than it claims.
+            let orphans = isocheck::unreachable_blocks(&program);
+            if orphans > 0 {
+                println!(
+                    "WARNING: {} unreachable block(s); their canonical names fall \
+                     back to label order, so a renaming WOULD show up as a diff",
+                    orphans
+                );
+            }
             if save {
                 isocheck::save_baseline(&program, &dir)?;
                 println!(
@@ -2547,8 +2582,8 @@ fn main() -> Result<()> {
             } else {
                 let lines = isocheck::check_against_baseline(&program, &dir)?;
                 println!(
-                    "isocheck OK: {} lines identical up to a LocalId renaming, \
-                     and slot-identical (digest {})",
+                    "isocheck OK: {} lines identical up to a renaming of locals \
+                     AND block labels, and slot-identical (digest {})",
                     lines,
                     isocheck::canonical(&program).digest()
                 );

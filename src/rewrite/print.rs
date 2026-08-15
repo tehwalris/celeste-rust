@@ -225,7 +225,14 @@ pub fn format_function(fun: &FunDef) -> String {
             format!(" captures [{}]", captures.join(", "))
         }
     );
-    for (label, block) in blocks_in_order(&fun.cfg) {
+    out.push_str(&format_cfg(&fun.cfg));
+    out
+}
+
+/// A CFG's blocks, without any function header.
+pub fn format_cfg(cfg: &Cfg) -> String {
+    let mut out = String::new();
+    for (label, block) in blocks_in_order(cfg) {
         write_block(&mut out, &label, block);
     }
     out

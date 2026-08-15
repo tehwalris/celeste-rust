@@ -109,6 +109,67 @@ impl Stream {
         (stream, new_ids_by_old_ids)
     }
 
+    /// Renumber this function's block labels from zero, so a label is
+    /// unique within its function rather than within the whole program.
+    ///
+    /// The exact counterpart of `make_local_ids_dense`, and it exists for
+    /// the same reason. `Compiler` holds ONE `LabelGenerator` for every
+    /// function it compiles, so a label's number counts every block emitted
+    /// anywhere before it: adding eight blocks to `foreach` moved 525 of
+    /// the program's 695 labels, and with them 137 of the 235 labels the
+    /// rewrite recipe addresses. Locals were already immune to that, via
+    /// the densification below; labels simply never got the same treatment.
+    ///
+    /// Numbering follows the order labels are DECLARED in the stream, which
+    /// is source order - deterministic, and independent of anything outside
+    /// this function.
+    fn make_labels_dense(&self) -> Self {
+        let mut generator = LabelGenerator::new();
+        let mut map: HashMap<Label, Label> = HashMap::new();
+        for element in &self.0 {
+            if let StreamElement::Label(label) = element {
+                // The generator's format is `{prefix}_{n}`; keep the prefix
+                // so `if_join_12` still says what kind of block it is.
+                let text = label.as_str();
+                let prefix = match text.rfind('_') {
+                    Some(at) if text[at + 1..].chars().all(|c| c.is_ascii_digit()) => &text[..at],
+                    _ => text,
+                };
+                let fresh = generator.next(prefix);
+                if map.insert(label.clone(), fresh).is_some() {
+                    panic!("label {} declared twice in one function", text);
+                }
+            }
+        }
+        let lookup = |label: &Label| -> Label {
+            match map.get(label) {
+                Some(fresh) => fresh.clone(),
+                // A branch or phi naming a block this stream does not
+                // declare would leave one label in the old global numbering
+                // and silently reintroduce the drift. Loud, not tolerated.
+                None => panic!("label {} is referenced but never declared", label.as_str()),
+            }
+        };
+        Self(
+            self.0
+                .iter()
+                .map(|element| match element {
+                    StreamElement::Label(label) => StreamElement::Label(lookup(label)),
+                    StreamElement::Instruction(id, instruction) => {
+                        StreamElement::Instruction(*id, instruction.map_labels(&lookup))
+                    }
+                    StreamElement::Terminator(id, terminator) => {
+                        StreamElement::Terminator(*id, terminator.map_labels(&lookup))
+                    }
+                    // Not descended into for the same reason `map_local_ids`
+                    // does not: a nested function's labels belong to its own
+                    // CFG, and it has been through this already.
+                    other => other.clone(),
+                })
+                .collect(),
+        )
+    }
+
     fn build_inner(self) -> (Cfg, Vec<FunDef>) {
         struct BlockBuilder {
             instructions: Vec<(LocalId, Instruction)>,
@@ -173,6 +234,7 @@ impl Stream {
 
     fn build(self) -> StreamBuildResult {
         let (stream, new_ids_by_old_ids) = self.make_local_ids_dense();
+        let stream = stream.make_labels_dense();
         let (cfg, fun_defs) = stream.build_inner();
         StreamBuildResult {
             cfg,

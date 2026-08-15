@@ -21,6 +21,13 @@
 //! difference is reported as the first differing line, which names the
 //! function and instruction rather than just saying "not isomorphic".
 //!
+//! BLOCK LABELS are canonicalised the same way, by reverse postorder from
+//! the entry. They have to be: unlike `LocalId`s, which `Stream::build`
+//! re-densifies per function, labels come from a generator that is global to
+//! the whole program, so any edit renames most of them. Without this the
+//! gate would answer "the program changed" to a change that renamed things
+//! and nothing else - the one distinction it exists to draw.
+//!
 //! Beyond the refactor this is the general "did my change alter the compiled
 //! program at all" check - the thing that was missing when a fourteen-
 //! instruction edit to `foreach` turned out to move 371+ recipe entries.
@@ -82,6 +89,25 @@ fn canonicalize_ids(line: &str, map: &mut BTreeMap<usize, usize>) -> String {
     out
 }
 
+/// `kill` names a SET of locals, but prints a list, and `kill_dead` sorts
+/// that list by raw `LocalId` so the recipe replays byte-for-byte. A sort by
+/// raw id is not stable under a renaming - which is the one thing this whole
+/// module abstracts away - so the printed order leaks the numbering back in.
+///
+/// Re-sort it by canonical index instead. Only `kill` gets this: every other
+/// instruction's operand order is meaningful.
+fn normalize_kill_order(line: &str) -> String {
+    let Some(at) = line.find(" = kill ") else {
+        return line.to_string();
+    };
+    let (head, tail) = line.split_at(at + " = kill ".len());
+    let mut operands: Vec<&str> = tail.split(", ").map(str::trim).collect();
+    operands.sort_by_key(|token| {
+        token.trim_start_matches("%c").parse::<usize>().unwrap_or(usize::MAX)
+    });
+    format!("{}{}", head, operands.join(", "))
+}
+
 /// Canonical form of the whole program.
 ///
 /// Functions are emitted in NAME order and blocks in LABEL order, not in
@@ -90,7 +116,140 @@ fn canonicalize_ids(line: &str, map: &mut BTreeMap<usize, usize>) -> String {
 /// that merely reorders insertions would otherwise show up as a spurious
 /// difference. The local numbering is per function, so an id in one
 /// function cannot alias one in another.
+/// Rename every block to `b{n}`, numbered by the order a depth-first walk
+/// from the entry FINISHES with it - reverse postorder, the same order a
+/// dominance computation would use.
+///
+/// Needed because block labels carry a number from a generator that is
+/// GLOBAL to the whole program (frontend.rs: one `LabelGenerator` for every
+/// function, unlike `LocalId`s, which `Stream::build` re-densifies per
+/// function). So adding eight blocks to `foreach` renames 525 of 695
+/// labels, and without this the gate would report "the program changed" for
+/// a change that renamed things and nothing else - which is precisely the
+/// distinction it exists to make.
+///
+/// Structural, not textual: the walk depends only on the entry and on each
+/// terminator's successor order, so it is identical for two programs that
+/// differ only in what the blocks are called.
+///
+/// Unreachable blocks have no reverse-postorder position. They are numbered
+/// after the reachable ones, ordered by their original label, and COUNTED -
+/// see `unreachable_blocks`. A final program should have none (`dce`
+/// removes them), and if one appears, the gate's insensitivity to naming
+/// stops holding for it, so silence would be the wrong answer.
+fn canonical_labels(cfg: &crate::ir::Cfg) -> (crate::ir::Cfg, usize) {
+    use crate::ir::Label;
+
+    // Iterative DFS, postorder. `__entry` is unnamed and always first, so it
+    // is not in the map and needs no number.
+    let mut order: Vec<Label> = Vec::new();
+    let mut seen: std::collections::HashSet<Label> = Default::default();
+    // (label, whether its successors have been pushed yet)
+    let mut stack: Vec<(Option<Label>, bool)> = vec![(None, false)];
+    while let Some((label, expanded)) = stack.pop() {
+        let block = match &label {
+            None => &cfg.entry,
+            Some(l) => match cfg.named.get(l) {
+                Some(b) => b,
+                // A dangling branch target is `validate`'s business, not
+                // ours; skip it rather than panicking inside the gate.
+                None => continue,
+            },
+        };
+        if expanded {
+            if let Some(l) = label {
+                order.push(l);
+            }
+            continue;
+        }
+        if let Some(l) = &label {
+            if !seen.insert(l.clone()) {
+                continue;
+            }
+        }
+        stack.push((label, true));
+        // Pushed in reverse so the first successor is visited first.
+        for successor in block.terminator.1.successor_labels().into_iter().rev() {
+            if !seen.contains(successor) {
+                stack.push((Some(successor.clone()), false));
+            }
+        }
+    }
+    order.reverse();
+
+    let mut unreachable: Vec<&Label> = cfg.named.keys().filter(|l| !seen.contains(*l)).collect();
+    unreachable.sort();
+    let unreachable_count = unreachable.len();
+
+    let mut map: rustc_hash::FxHashMap<Label, Label> = Default::default();
+    for (index, label) in order.iter().chain(unreachable).enumerate() {
+        // Zero-padded: `canonical` orders blocks by label string, and
+        // unpadded `b10` would sort before `b2`. Harmless but unreadable.
+        map.insert(label.clone(), Label::from(format!("b{:05}", index)));
+    }
+    (cfg.map_labels(&|l: &Label| map.get(l).cloned().unwrap_or_else(|| l.clone())), unreachable_count)
+}
+
+/// How many blocks the canonical form could not place by reachability.
+/// Zero for any program that has been through `dce`.
+pub fn unreachable_blocks(program: &Program) -> usize {
+    program.functions.values().map(|f| canonical_labels(&f.cfg).1).sum()
+}
+
+/// Every block as `function`, `canonical position`, `label` - the label's
+/// STRUCTURAL address next to the name it currently has.
+///
+/// Two builds that differ only in how labels are named produce the same
+/// canonical positions, so joining two of these dumps on (function,
+/// position) recovers the old -> new renaming without any of the compiler
+/// having to remember it. That is how the recipe's block references were
+/// migrated when label numbering became per-function; see
+/// plans/recipe-stability-plan.md.
+pub fn label_positions(program: &Program) -> Vec<(String, usize, String)> {
+    let mut out = Vec::new();
+    let mut names: Vec<String> = program.functions.keys().map(|g| g.as_str().to_string()).collect();
+    names.sort();
+    for name in names {
+        let fun = program.get(&name).expect("name came from the map");
+        let (canon, _) = canonical_labels(&fun.cfg);
+        // `canonical_labels` renames to `b{position}`, so the canonical
+        // CFG's labels ARE the positions; pairing them back to the original
+        // needs the same walk over the original, which `map_labels`
+        // preserves the order of.
+        let original = crate::rewrite::print::blocks_in_order(&fun.cfg);
+        let renamed = crate::rewrite::print::blocks_in_order(&canon);
+        debug_assert_eq!(original.len(), renamed.len());
+        // Both are sorted by label, and the rename is a bijection, so the
+        // two sorted lists do NOT correspond position-by-position. Pair
+        // them through the block bodies instead: a block's terminator id is
+        // unique within a function.
+        let position_of: BTreeMap<usize, String> = renamed
+            .iter()
+            .map(|(label, block)| (usize::from(block.terminator_id()), label.clone()))
+            .collect();
+        for (label, block) in original {
+            if label == "__entry" {
+                continue;
+            }
+            let canonical_label = position_of
+                .get(&usize::from(block.terminator_id()))
+                .expect("the rename preserves terminator ids");
+            let position: usize = canonical_label
+                .trim_start_matches('b')
+                .parse()
+                .expect("canonical labels are b{n}");
+            out.push((name.clone(), position, label));
+        }
+    }
+    out
+}
+
 pub fn canonical(program: &Program) -> Canonical {
+    let mut relabelled = program.clone();
+    for fun in relabelled.functions.values_mut() {
+        fun.cfg = canonical_labels(&fun.cfg).0;
+    }
+    let program = &relabelled;
     let printed = crate::rewrite::print::format_program(program);
     let mut text = String::with_capacity(printed.len());
     let mut maps: BTreeMap<String, BTreeMap<usize, usize>> = BTreeMap::new();
@@ -127,17 +286,29 @@ pub fn canonical(program: &Program) -> Canonical {
         }
         blocks.sort_by(|a, b| a.0.cmp(&b.0));
 
-        // One numbering per function.
+        // One numbering per function, allocated in two passes: everything
+        // except `kill` first, then `kill`.
+        //
+        // A `kill` list's printed order comes from a raw-id sort, so letting
+        // it allocate canonical indices would make the numbering depend on
+        // the raw ids - the exact leak `normalize_kill_order` exists to
+        // close. Every killed local is defined somewhere in the function, so
+        // the second pass finds almost nothing; it is there so that an id
+        // reachable ONLY through a back edge still gets a number rather than
+        // rendering as unmapped.
+        let ordered: Vec<String> =
+            header.into_iter().chain(blocks.into_iter().flat_map(|(_, l)| l)).collect();
         let mut map: BTreeMap<usize, usize> = BTreeMap::new();
-        for line in header {
-            text.push_str(&canonicalize_ids(&line, &mut map));
-            text.push('\n');
+        let is_kill = |line: &str| line.contains(" = kill ");
+        for line in ordered.iter().filter(|l| !is_kill(l)) {
+            canonicalize_ids(line, &mut map);
         }
-        for (_, lines) in blocks {
-            for line in lines {
-                text.push_str(&canonicalize_ids(&line, &mut map));
-                text.push('\n');
-            }
+        for line in ordered.iter().filter(|l| is_kill(l)) {
+            canonicalize_ids(line, &mut map);
+        }
+        for line in &ordered {
+            text.push_str(&normalize_kill_order(&canonicalize_ids(line, &mut map)));
+            text.push('\n');
         }
         // "fn name(%a, %b)" -> "name"
         let name = fn_header
@@ -302,6 +473,109 @@ mod tests {
         let mut m = BTreeMap::new();
         let out = canonicalize_ids("%5 = phi [b: %9, c: %5]", &mut m);
         assert_eq!(out, "%c0 = phi [b: %c1, c: %c0]");
+    }
+
+    /// Build a tiny diamond whose blocks are called whatever the caller
+    /// says: entry branches to `a`/`b`, both jump to `j`, which returns
+    /// with a phi naming both incoming edges.
+    fn diamond(a: &str, b: &str, j: &str) -> crate::ir::Cfg {
+        use crate::ir::*;
+        let id = |n: usize| LocalId::from(n);
+        let block = |instructions: Vec<(LocalId, Instruction)>, terminator| Block {
+            instructions,
+            terminator,
+            hint_normalize: false,
+        };
+        let mut named = new_label_map();
+        named.insert(
+            Label::from(a.to_string()),
+            block(vec![], (id(10), Terminator::UnconditionalBranch { target: Label::from(j.to_string()) })),
+        );
+        named.insert(
+            Label::from(b.to_string()),
+            block(vec![], (id(11), Terminator::UnconditionalBranch { target: Label::from(j.to_string()) })),
+        );
+        named.insert(
+            Label::from(j.to_string()),
+            block(
+                vec![(
+                    id(12),
+                    Instruction::Phi {
+                        branches: vec![
+                            (Label::from(a.to_string()), id(1)),
+                            (Label::from(b.to_string()), id(1)),
+                        ],
+                    },
+                )],
+                (id(13), Terminator::Return { value: Some(id(12)) }),
+            ),
+        );
+        Cfg::new(
+            block(
+                vec![(id(1), Instruction::Alloc)],
+                (
+                    id(2),
+                    Terminator::ConditionalBranch {
+                        condition: id(1),
+                        true_target: Label::from(a.to_string()),
+                        false_target: Label::from(b.to_string()),
+                    },
+                ),
+            ),
+            named,
+        )
+    }
+
+    /// The property the label half of the gate rests on. Block labels carry
+    /// a number from a program-global generator, so an edit anywhere renames
+    /// them wholesale; the canonical form must not notice.
+    #[test]
+    fn renaming_every_block_canonicalizes_identically() {
+        let (x, _) = canonical_labels(&diamond("if_body_7", "if_else_8", "if_join_9"));
+        let (y, _) = canonical_labels(&diamond("if_body_512", "if_else_513", "if_join_514"));
+        assert_eq!(
+            crate::rewrite::print::format_cfg(&x),
+            crate::rewrite::print::format_cfg(&y),
+            "a wholesale label renaming must be invisible"
+        );
+    }
+
+    /// And the other direction, or it proves nothing: swapping which arm the
+    /// condition takes is a real difference, and no renaming can hide it.
+    #[test]
+    fn swapping_the_branch_arms_survives_label_canonicalization() {
+        let straight = diamond("a", "b", "j");
+        let mut swapped = diamond("a", "b", "j");
+        if let crate::ir::Terminator::ConditionalBranch { true_target, false_target, .. } =
+            &mut swapped.entry.terminator.1
+        {
+            std::mem::swap(true_target, false_target);
+        } else {
+            panic!("the fixture branches");
+        }
+        assert_ne!(
+            crate::rewrite::print::format_cfg(&canonical_labels(&straight).0),
+            crate::rewrite::print::format_cfg(&canonical_labels(&swapped).0),
+        );
+    }
+
+    /// A block nothing branches to has no reverse-postorder position. It
+    /// must be reported rather than silently placed, because the gate's
+    /// naming-insensitivity does not extend to it.
+    #[test]
+    fn unreachable_blocks_are_counted() {
+        use crate::ir::*;
+        let mut cfg = diamond("a", "b", "j");
+        cfg.named.insert(
+            Label::from("orphan".to_string()),
+            Block {
+                instructions: vec![],
+                terminator: (LocalId::from(20), Terminator::Return { value: None }),
+                hint_normalize: false,
+            },
+        );
+        assert_eq!(canonical_labels(&cfg).1, 1);
+        assert_eq!(canonical_labels(&diamond("a", "b", "j")).1, 0);
     }
 
     #[test]

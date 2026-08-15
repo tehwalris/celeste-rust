@@ -91,6 +91,54 @@ Order, because the migration is circular otherwise:
    `migrate-names`'s round-trip assertion.
 4. `isocheck` green again proves the program did not move.
 
+### DONE, and the acceptance test passes (2026-08-16)
+
+All four steps landed. Then the `foreach` change was applied for real, and
+the whole recipe replayed:
+
+    entries that stopped applying:  3   - p1_127, p1_127a, p1_127b
+
+and all three are `promote_cell` on `foreach_1` itself: the deletion-safe
+version has three promotable cells where the index walk had one, so the one
+entry became three. Nothing else in the recipe moved. Compare **371+ of
+905** under the old addressing.
+
+What each piece contributed, since only the combination works:
+
+* **stable names for rewrite-created locals** - 263 cells that pointed at
+  ids no compiler ever produced;
+* **`{entry}.{block}.{position}` rather than a running index** - without
+  this, growing an inlined callee shifted every later name in the function
+  and `i1_033.133` silently became a different instruction;
+* **per-function label numbering** - 256 of the recipe's label references,
+  and (because a local's name contains its block's label) 179 of the local
+  references too;
+* **`isocheck` canonicalising labels by reverse postorder** - the gate that
+  made it possible to tell "renamed" from "changed" at each step.
+
+Verification, at each step, that the program did not move:
+
+* the label map was derived by joining two builds on canonical position and
+  checked by applying it to the old dump: 696 blocks, all 77 functions
+  reproduced byte for byte;
+* `isocheck` reported the final program ISOMORPHIC across the label
+  densification (it failed only on slots, below);
+* 451 lib tests, the verifiers, and the concrete walk all pass.
+
+### The slot break, taken deliberately and once
+
+`slots::allocate` broke ties by raw `LocalId`, so the runtime layout was a
+function of the NUMBERING - and row keys are computed from slots, so every
+checkpoint and every certified `g` depended on it. The tiebreak is now the
+local's stable name (source locals keep their id, which is already stable).
+
+That moves slots once. Measured: **34,997 slots before and after, and no
+function needs more than it did** - a permutation, not a regression. Rooms
+(0, 0) and (1, 0) must be re-derived, which they already owed for the
+chunk-cap fingerprint, so the marginal cost is nothing. The campaign
+fingerprint hashes the recipe text, so stale checkpoints are rejected
+automatically rather than silently reused.
+
 ## Goal
 
 A change to the base program should cost effort PROPORTIONAL TO THE CHANGE.

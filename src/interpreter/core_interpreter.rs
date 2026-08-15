@@ -1256,11 +1256,25 @@ mod expand_tests {
     /// dropping the entire state onto the plain program. Now the definite
     /// lanes keep their answers, only the straddler duplicates, and the
     /// select succeeds.
+    /// `PARTITION_STRADDLES` is a process-global, so the tests that drive it
+    /// must not run at the same time. Without this, one test flipping the
+    /// flag between another's `set_partition_straddles` and its call makes
+    /// the other fail - which is exactly what a full-suite run produced
+    /// ("left: MaybeBool(...), right: UnknownBool") while every one of them
+    /// passed in isolation. A flaky gate is worse than no gate.
+    fn straddles_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // Not `unwrap`: one panicking test must not cascade into the others
+        // reporting a poisoned mutex instead of their real result.
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn a_straddling_lane_no_longer_poisons_the_select() {
         use crate::interpreter::op::{interpret_binary_op, interpret_select, set_partition_straddles};
         use crate::ir::BinaryOp;
         use crate::pico8_num::Pico8NumInterval;
+        let _serialised = straddles_lock();
         set_partition_straddles(true);
 
         let n = |v: i16| Pico8Num::from_i16(v);
@@ -1328,6 +1342,7 @@ mod expand_tests {
     fn a_mixed_comparison_with_tri_state_off_collapses_instead_of_panicking() {
         use crate::interpreter::op::{interpret_binary_op, set_partition_straddles};
         use crate::pico8_num::{Pico8Num, Pico8NumInterval};
+        let _serialised = straddles_lock();
 
         let n = |v: i16| Pico8Num::from_i16(v);
         // Lane 0 is definitely less; lane 1 straddles.
@@ -1354,7 +1369,10 @@ mod expand_tests {
             "with the gate on, the definite lanes keep their answers, got {:?}",
             on
         );
-        set_partition_straddles(false);
+        // Leave the global ON, which is the default. Leaving it off - as
+        // this did - silently disabled the partition path for every test
+        // that ran after it.
+        set_partition_straddles(true);
     }
 
     #[test]
@@ -1362,6 +1380,7 @@ mod expand_tests {
         use crate::interpreter::op::{interpret_binary_op, set_partition_straddles};
         use crate::ir::BinaryOp;
         use crate::pico8_num::Pico8NumInterval;
+        let _serialised = straddles_lock();
         set_partition_straddles(true);
 
         let n = |v: i16| Pico8Num::from_i16(v);
