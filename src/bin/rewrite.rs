@@ -244,6 +244,20 @@ enum Command {
         #[arg(long)]
         frame: u32,
     },
+    /// Is the compiled program the SAME program, up to renaming its locals?
+    /// The gate for plans/recipe-stability-plan.md: that refactor changes how
+    /// LocalIds are assigned, not what program comes out, so it must leave
+    /// the final program isomorphic AND slot-identical. Slot identity is not
+    /// cosmetic - row keys are computed from slots, so a permutation
+    /// invalidates every checkpoint and every certified g.
+    Isocheck {
+        /// Write the baseline instead of checking against it.
+        #[arg(long)]
+        save: bool,
+        /// Where the baseline lives.
+        #[arg(long, default_value = "baseline/isocheck")]
+        dir: String,
+    },
     Bench {
         #[arg(long, default_value_t = 34)]
         frames: u32,
@@ -2407,6 +2421,28 @@ fn main() -> Result<()> {
                     fruit_lanes,
                     min,
                     max
+                );
+            }
+        }
+
+        Command::Isocheck { save, dir } => {
+            use celeste_rust::rewrite::isocheck;
+            let (program, _) = build(&recipe)?;
+            let dir = std::path::PathBuf::from(dir);
+            if save {
+                isocheck::save_baseline(&program, &dir)?;
+                println!(
+                    "baseline written to {} (digest {})",
+                    dir.display(),
+                    isocheck::canonical(&program).digest()
+                );
+            } else {
+                let lines = isocheck::check_against_baseline(&program, &dir)?;
+                println!(
+                    "isocheck OK: {} lines identical up to a LocalId renaming, \
+                     and slot-identical (digest {})",
+                    lines,
+                    isocheck::canonical(&program).digest()
                 );
             }
         }

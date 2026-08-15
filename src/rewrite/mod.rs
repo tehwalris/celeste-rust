@@ -30,6 +30,7 @@ pub mod checkpoint;
 pub mod class_dead;
 pub mod liveness;
 pub mod pos_graph;
+pub mod isocheck;
 pub mod print;
 pub mod program;
 pub mod recipe;
