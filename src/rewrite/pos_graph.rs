@@ -378,13 +378,12 @@ pub fn build_from_replay(
     fingerprint: &str,
     engine: &mut crate::rewrite::verify::AbstractRun,
 ) -> Result<PosGraph> {
-    use crate::interpreter::abstraction::room_x_lane_mask;
+    use crate::interpreter::abstraction::win_lane_mask;
     use crate::interpreter::state::FILTER_BAND;
     use crate::rewrite::checkpoint;
 
     engine.disable_frontier();
     engine.record_pos_graph();
-    let win_x = crate::game_runner::win_room_x();
     for f in from.max(1)..frames {
         let t = std::time::Instant::now();
         let states = checkpoint::load_frame_states(dir, f)
@@ -397,7 +396,7 @@ pub fn build_from_replay(
         let mut lanes = 0usize;
         for state in states {
             let keep: Vec<bool> =
-                room_x_lane_mask(&state, win_x).into_iter().map(|w| !w).collect();
+                win_lane_mask(&state).into_iter().map(|w| !w).collect();
             let kept = keep.iter().filter(|b| **b).count();
             if kept == 0 {
                 continue;

@@ -101,6 +101,13 @@ pub struct CampaignConfig {
     /// way it missed things twice before.
     pub max_state_lanes: usize,
     pub fruit_chunk_lanes: usize,
+    /// A SYNTHETIC win target (CELESTE_WIN_AT_XY), for cheap pipeline tests.
+    /// A run that finishes at an arbitrary position is a DIFFERENT SEARCH -
+    /// different absorbing set, different B(H) seed, different g - so its
+    /// artifacts must never be resumable from, or comparable to, a real
+    /// campaign's. Hashing it is what makes that impossible rather than
+    /// merely discouraged.
+    pub synthetic_win: Option<(i16, i16)>,
 }
 
 impl CampaignConfig {
@@ -113,6 +120,7 @@ impl CampaignConfig {
                 .is_some(),
             max_state_lanes: crate::rewrite::verify::effective_chunk_cap(),
             fruit_chunk_lanes: crate::rewrite::verify::effective_fruit_chunk_cap(),
+            synthetic_win: crate::interpreter::abstraction::synthetic_win_xy(),
         }
     }
 }
@@ -148,6 +156,7 @@ pub fn config_fingerprint_for(recipe_text: &str, config: &CampaignConfig) -> Str
     config.deopt_collect_first.hash(&mut h);
     config.max_state_lanes.hash(&mut h);
     config.fruit_chunk_lanes.hash(&mut h);
+    config.synthetic_win.hash(&mut h);
     format!("{:016x}", h.finish())
 }
 
@@ -419,6 +428,7 @@ mod tests {
             deopt_collect_first: true,
             max_state_lanes: 8_000,
             fruit_chunk_lanes: 8_000,
+            synthetic_win: None,
         }
     }
 

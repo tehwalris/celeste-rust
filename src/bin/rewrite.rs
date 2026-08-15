@@ -275,6 +275,14 @@ enum Command {
         /// <checkpoint-dir>/frames/ - the input of the backward sweep.
         #[arg(long)]
         save_frames: bool,
+        /// Record the position-transition table DURING this pass and write
+        /// it to <checkpoint-dir>/posgraph.bin, instead of paying a whole
+        /// second pass over the room for it (`rewrite pos-graph`). The
+        /// per-lane cell tag is stripped at the end of every chunk, so it
+        /// never reaches a boundary row key; mid-frame grouping does change,
+        /// so the gate is that the row table comes out element-wise equal.
+        #[arg(long)]
+        record_pos_graph: bool,
         /// Previous precision level's checkpoint dir: confine this run to
         /// its band (rows with e <= f and g <= horizon - f, after
         /// coarsening each lane to that level's rem precision).
@@ -432,6 +440,7 @@ fn bench(
     band: Option<celeste_rust::rewrite::verify::BandFilter>,
     variants: Vec<celeste_rust::rewrite::verify::Variant>,
     variant_base_mapping: Option<celeste_rust::rewrite::state_mapping::StateMapping>,
+    record_pos_graph: bool,
 ) -> Result<()> {
     use celeste_rust::rewrite::checkpoint;
     let mut run = match deopt {
@@ -444,6 +453,9 @@ fn bench(
         let base_mapping = variant_base_mapping
             .ok_or_else(|| anyhow!("variants need the base recipe's mapping"))?;
         run.set_variants(base_mapping, variants);
+    }
+    if record_pos_graph {
+        run.record_pos_graph();
     }
     if let Some(band) = band {
         run.set_band(band);
@@ -599,11 +611,11 @@ fn bench(
         // Room-exit probe: lanes whose room.x reached the win value have won
         // the start room. The earliest such frame is the optimal TAS length
         // under the search's abstractions.
-        let win_x = celeste_rust::game_runner::win_room_x();
+
         let win_lanes: usize = run
             .states()
             .iter()
-            .map(|s| celeste_rust::interpreter::abstraction::count_room_x_lanes(s, win_x))
+            .map(celeste_rust::interpreter::abstraction::count_win_lanes)
             .sum();
         if win_lanes > 0 && first_win.is_none() {
             first_win = Some(frame);
@@ -625,7 +637,7 @@ fn bench(
             current_rss_kb() as f64 / 1048576.0,
             peak_rss_kb() as f64 / 1048576.0,
             if win_lanes > 0 {
-                format!("  WIN: {} lanes in room ({},_)", win_lanes, win_x)
+                format!("  WIN: {} lanes {}", win_lanes, celeste_rust::interpreter::abstraction::win_label())
             } else {
                 String::new()
             }
@@ -633,6 +645,24 @@ fn bench(
     }
     if let Some(frame) = first_win {
         println!("first room-exit lanes appeared at frame {}", frame);
+    }
+    // Write the fused table before the timing line, so the reported wall
+    // clock covers the whole stage this is meant to REPLACE.
+    if record_pos_graph {
+        let cfg = checkpoint.as_ref().ok_or_else(|| {
+            anyhow!("--record-pos-graph needs --checkpoint-dir to write posgraph.bin into")
+        })?;
+        let pairs = run.pos_graph_pairs().unwrap_or(0);
+        let graph = run
+            .take_pos_graph(frames, &cfg.fingerprint)
+            .ok_or_else(|| anyhow!("recording was enabled but produced no table"))?;
+        graph.save(&cfg.dir)?;
+        println!(
+            "  position graph recorded IN the forward pass: {} pairs over {} \
+             destination cells",
+            pairs,
+            graph.live_cells()
+        );
     }
     let elapsed = start.elapsed();
     celeste_rust::metrics::dump(
@@ -2340,13 +2370,14 @@ fn main() -> Result<()> {
             checkpoint_every,
             resume,
             save_frames,
+            record_pos_graph,
             band_dir,
             band_horizon,
             band_prev_bits,
             variants,
         } => {
             if baseline {
-                bench("original", &Program::compile_executable_from_disk()?, frames, profile, None, None, None, vec![], None)?;
+                bench("original", &Program::compile_executable_from_disk()?, frames, profile, None, None, None, vec![], None, false)?;
             }
             let (program, _) = build(&recipe)?;
             let deopt_setup = if deopt {
@@ -2445,6 +2476,7 @@ fn main() -> Result<()> {
                 band,
                 built_variants,
                 variant_base_mapping,
+                record_pos_graph,
             )?;
         }
 
@@ -2543,7 +2575,7 @@ fn main() -> Result<()> {
         Command::ExtractTas { horizon, level, base_dir, tas } => {
             use celeste_rust::interpreter::fixed_env::PreparedCfg;
             use celeste_rust::interpreter::glue::interpret_prepared_cfg;
-            use celeste_rust::interpreter::abstraction::count_room_x_lanes;
+            use celeste_rust::interpreter::abstraction::count_win_lanes;
             use celeste_rust::interpreter::state::State;
             use celeste_rust::rewrite::state_mapping::StateMapping;
             use celeste_rust::rewrite::sweep;
@@ -2640,14 +2672,16 @@ fn main() -> Result<()> {
 
             // The walk must have ended on a winning row: g = 0 and the
             // player concretely in the next room.
-            let win_x = celeste_rust::game_runner::win_room_x();
+
             let final_probe = probe(&state)?;
             let mut canon = state.clone();
             mapping.from_canonical(&mut canon)?;
-            let concrete_win = count_room_x_lanes(&canon, win_x) == 1;
+            let concrete_win = count_win_lanes(&canon) == 1;
             println!(
-                "final row: {:?} (want g=0), concrete room.x=={}: {}",
-                final_probe, win_x, concrete_win
+                "final row: {:?} (want g=0), concrete win {}: {}",
+                final_probe,
+                celeste_rust::interpreter::abstraction::win_label(),
+                concrete_win
             );
             if final_probe.map(|(_, g)| g) != Some(0) || !concrete_win {
                 return Err(anyhow!("walk did not end on a winning state"));
@@ -2683,7 +2717,7 @@ fn main() -> Result<()> {
             use celeste_rust::interpreter::fixed_env::PreparedCfg;
             use celeste_rust::interpreter::glue::interpret_prepared_cfg;
             use celeste_rust::interpreter::abstraction::{
-                count_room_x_lanes, player_xy_per_lane,
+                count_win_lanes, player_xy_per_lane,
             };
             use celeste_rust::interpreter::state::State;
             use celeste_rust::rewrite::state_mapping::StateMapping;
@@ -2835,11 +2869,11 @@ fn main() -> Result<()> {
             }
 
             // Every final node must be a concrete win.
-            let win_x = celeste_rust::game_runner::win_room_x();
+
             for node in layer.values() {
                 let mut canon = node.state.clone();
                 mapping.from_canonical(&mut canon)?;
-                if count_room_x_lanes(&canon, win_x) != 1 {
+                if count_win_lanes(&canon) != 1 {
                     return Err(anyhow!("final node is not a concrete win"));
                 }
             }

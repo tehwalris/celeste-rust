@@ -749,3 +749,71 @@ mod tests {
         assert!(!interval.contains_number(half)); // 0.5 is not included (we use < 0.5)
     }
 }
+
+/// A SYNTHETIC win target for cheap end-to-end tests: `CELESTE_WIN_AT_XY=x,y`
+/// makes "won" mean "the player is at whole-pixel (x, y)" instead of "the
+/// player left the room".
+///
+/// Why this exists. The real win is a room transition, so any test of the
+/// forward/sweep pipeline that produces NON-VACUOUS `g` has to run to the
+/// frame where the room is actually exited - 90+ on room (1,0), tens of
+/// minutes. Moving the finish line to a position the optimal run passes
+/// through EARLY gives the same pipeline, with real wins, at a fraction of
+/// the horizon; two such points then bracket a cost extrapolation.
+///
+/// It is in the campaign fingerprint (`CampaignConfig`). A checkpoint or a
+/// `g` produced under a synthetic win describes a different search, and
+/// must never be resumable from, or comparable to, a real campaign's.
+/// Read once.
+pub fn synthetic_win_xy() -> Option<(i16, i16)> {
+    static TARGET: std::sync::OnceLock<Option<(i16, i16)>> = std::sync::OnceLock::new();
+    *TARGET.get_or_init(|| {
+        let raw = std::env::var("CELESTE_WIN_AT_XY").ok()?;
+        let (x, y) = raw.split_once(',').unwrap_or_else(|| {
+            panic!("CELESTE_WIN_AT_XY must be \"x,y\", got {:?}", raw)
+        });
+        let parse = |s: &str, which: &str| -> i16 {
+            s.trim().parse().unwrap_or_else(|e| {
+                panic!("CELESTE_WIN_AT_XY {} coordinate {:?}: {}", which, s, e)
+            })
+        };
+        let target = (parse(x, "x"), parse(y, "y"));
+        println!(
+            "SYNTHETIC WIN: a lane counts as won at player ({}, {}), NOT at the \
+             room exit - this is a test configuration and is in the fingerprint",
+            target.0, target.1
+        );
+        Some(target)
+    })
+}
+
+/// Which lanes have won, under whichever win condition is configured.
+///
+/// The single definition every consumer uses - the forward pass's
+/// absorbing set, the sweep's B(H) seed, the position graph's exclusion,
+/// and the CLI probes - so a synthetic target cannot be honoured by some
+/// of them and not others, which would be a silently inconsistent search.
+pub fn win_lane_mask(state: &State) -> Vec<bool> {
+    match synthetic_win_xy() {
+        None => room_x_lane_mask(state, crate::game_runner::win_room_x()),
+        Some(target) => match player_xy_per_lane(state) {
+            // No player object: nothing here can be at the target.
+            None => vec![false; state.vector_size.max(1)],
+            Some(xy) => xy.into_iter().map(|p| p == target).collect(),
+        },
+    }
+}
+
+/// Count of `win_lane_mask`.
+pub fn count_win_lanes(state: &State) -> usize {
+    win_lane_mask(state).into_iter().filter(|w| *w).count()
+}
+
+/// How to describe the configured win in a log line, so a synthetic run is
+/// never mistaken for a real one when reading output later.
+pub fn win_label() -> String {
+    match synthetic_win_xy() {
+        None => format!("in room ({},_)", crate::game_runner::win_room_x()),
+        Some((x, y)) => format!("at SYNTHETIC target ({}, {})", x, y),
+    }
+}

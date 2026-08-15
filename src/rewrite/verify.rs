@@ -970,10 +970,9 @@ impl AbstractRun {
     /// configured win value) from the frontier: win states are absorbing
     /// for a room-scoped search.
     pub fn absorb_won_lanes(&mut self) {
-        let win_x = crate::game_runner::win_room_x();
         let mut kept = Vec::new();
         for state in std::mem::take(&mut self.states) {
-            let mask: Vec<bool> = crate::interpreter::abstraction::room_x_lane_mask(&state, win_x)
+            let mask: Vec<bool> = crate::interpreter::abstraction::win_lane_mask(&state)
                 .into_iter()
                 .map(|w| !w)
                 .collect();
@@ -1054,18 +1053,22 @@ impl AbstractRun {
         // and is meaningless under the widencheck's rem-only abstraction -
         // that corner still takes the phased path.
         let stream = self.visited_rows.is_some() && !self.rem_only_abstraction;
-        // The recorder's per-lane column would ride into the boundary's row
-        // keys and forbid the frontier dedup, which is what sets how coarse
-        // the whole abstraction is - a recorded streaming run would be a
-        // DIFFERENT SEARCH from the certified one. Refuse rather than trust
-        // the caller to have called `disable_frontier`.
-        if stream && self.pos_obs.is_some() {
-            return Err(anyhow!(
-                "pos-graph recording is only valid on a non-streaming run \
-                 (call disable_frontier first) - its per-lane column would \
-                 change the frontier dedup and so the reachable set"
-            ));
-        }
+        // Recording used to be refused on a streaming run: the per-lane
+        // column would ride into the boundary's row keys and forbid the
+        // frontier dedup, which is what sets how coarse the abstraction is,
+        // so a recorded streaming run was a DIFFERENT SEARCH.
+        //
+        // The tag is now stripped at the end of every chunk, before the
+        // states reach the boundary (see `interpret_state_base`), so it
+        // cannot reach a row key and the objection no longer applies. That
+        // is what lets the recording FUSE into the forward pass instead of
+        // costing a whole second pass over the room - 3,567 s and a 101 GB
+        // peak on room (0,0), the largest stage of the ladder and the
+        // reason horizon 95 did not fit.
+        //
+        // Mid-frame grouping still differs, so this is gated by measurement
+        // rather than argument: the fused run's row table must come out
+        // element-wise equal to the unfused one's.
         let frame_no = self.states_before_merge.len() as u32 + 1;
         let input_states = chunk_states(std::mem::take(&mut self.states));
         // Chunk-parallel path: only for streaming frontier runs, and only
@@ -1459,6 +1462,28 @@ fn interpret_state_base(
     }
     if let Some(obs) = pos_obs {
         obs.record(&new_states)?;
+        // STRIP THE TAG HERE, before the states go anywhere else.
+        //
+        // The tag exists only to attribute this frame's outputs to this
+        // frame's inputs; nothing downstream wants it. Removing it now is
+        // what lets recording run on a STREAMING frontier pass at all: the
+        // objection to a tagged forward pass was that a per-lane column
+        // rides into the boundary row keys and forbids the frontier dedup
+        // that sets how coarse the abstraction is. A tag that never reaches
+        // the boundary cannot do that.
+        //
+        // What this does NOT make identical is mid-frame grouping: the
+        // column is per-lane distinct, so lane merges inside the frame
+        // still see it and still decline. That is deliberate - a merge
+        // would fold two source cells into one lane and the table would
+        // MISS a pair, which is the unsound direction (g too large, band
+        // over-prunes, nothing reports it). So the fragments differ from an
+        // untagged run and the reachable set has to be CHECKED equal, not
+        // assumed - see the gate in BENCHMARK_DATA.md.
+        for state in &mut new_states {
+            state.global_env.remove(super::pos_graph::POS_ORIGIN);
+            state.gc();
+        }
     }
     Ok(new_states)
 }

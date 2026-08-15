@@ -68,7 +68,7 @@
 use anyhow::{anyhow, Context, Result};
 use std::path::Path;
 
-use crate::interpreter::abstraction::room_x_lane_mask;
+use crate::interpreter::abstraction::win_lane_mask;
 use crate::interpreter::deopt_collect;
 use crate::interpreter::row_table::RowTable;
 use crate::interpreter::state::{State, FILTER_BAND};
@@ -138,7 +138,6 @@ fn set_bit(bits: &mut [u64], i: usize) -> bool {
 /// below would be drawn from the wrong states.
 pub fn build_index(dir: &Path, frames: u32, table: &RowTable) -> Result<RowIndex> {
     let n_rows = table.len();
-    let win_x = crate::game_runner::win_room_x();
     let mut idx = RowIndex {
         states: Vec::new(),
         owner: vec![u32::MAX; n_rows],
@@ -158,7 +157,7 @@ pub fn build_index(dir: &Path, frames: u32, table: &RowTable) -> Result<RowIndex
             }
             let keys = row_keys(&state)?;
             let cells = pos_graph::state_cells(&state)?;
-            let won = room_x_lane_mask(&state, win_x);
+            let won = win_lane_mask(&state);
             if keys.len() != state.vector_size
                 || cells.len() != state.vector_size
                 || won.len() != state.vector_size
