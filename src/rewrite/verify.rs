@@ -463,6 +463,68 @@ fn stream_boundary_prepare(
                             && g != super::sweep::G_UNREACHABLE
                             && (g as u32) <= budget
                     }
+                    // TODO(soundness, band): A MISS AGAINST AN UNBANDED
+                    // PREVIOUS LEVEL (i.e. k = 1, whose previous level is 0)
+                    // MUST BE ZERO, AND SHOULD BE FATAL. Today every miss is
+                    // just a counter and a log line and the lane is silently
+                    // dropped - the quiet direction, because a lost reachable
+                    // state means we can report an optimum that is too slow,
+                    // or refute a horizon that is actually achievable.
+                    //
+                    // The distinction matters and is easy to get backwards.
+                    // Against an UNBANDED table a miss is impossible under a
+                    // correct abstraction: level k's row coarsens to a level
+                    // k-1 row that k-1 itself reached (simulation), so "not
+                    // in the table at all" means the coarsening is wrong.
+                    // Against a BANDED table - every k >= 2 - a miss is
+                    // NORMAL: k-1 dropped that row as out-of-band, so it
+                    // never entered k-1's visited set, and refusing its
+                    // refinements is exactly how pruning propagates. Room
+                    // (1,0)'s certified campaign has thousands of misses at
+                    // k2/k3/k6 and ZERO at k1, across every horizon, which is
+                    // precisely this pattern.
+                    //
+                    // This has already fired once for real. `make_state_abstract_rem`
+                    // widened a fruit's bob counter `off` but left its `y`
+                    // concrete, while the coarse level derives `y` FROM the
+                    // widened `off` by interval arithmetic. The coarsened row
+                    // was a soundly over-approximating state that k-1 never
+                    // produces - it lands BETWEEN rungs - so every fruit-alive
+                    // lane of the exact level was dropped. Room (0,0) hid it
+                    // (its fruit exists only after the wall break, which the
+                    // optimal path never does); room (2,0) has a fruit alive
+                    // from frame 1 and k16 came out empty at frame 2.
+                    //
+                    // The property being violated is NOT soundness of the
+                    // widening (the point y really was inside the band). It is
+                    // that widen must be CANONICAL: `widen(s)` has to be
+                    // exactly the representation the coarse level would itself
+                    // have produced, because the lookup that follows is exact
+                    // equality, not intersection. Idempotence does not imply
+                    // it - the buggy widen was idempotent.
+                    //
+                    // The k=1 gate would have caught the fruit bug the
+                    // first time a room with a LIVE fruit ran, because level 0
+                    // is unbanded. It did not fire earlier only because
+                    // room (1,0) has no objects at all and room (0,0)'s fruit
+                    // exists only after a wall break the optimal path never
+                    // performs.
+                    //
+                    // Two fixes, neither done:
+                    //   1. assert band_missing == 0 whenever the previous
+                    //      level is unbanded. Exact, free (the lookup already
+                    //      happens), and it turns this whole class from a
+                    //      wrong answer into a stopped campaign. For k >= 2 it
+                    //      cannot be used as-is; distinguishing a legitimate
+                    //      out-of-band miss from a bad coarsening there needs
+                    //      k-1's PRE-band table, which is not stored.
+                    //   2. replace the exact lookup with the INTERSECTION test
+                    //      it is an optimization of - "does this level-k state
+                    //      intersect any level-(k-1) state?" - which is what we
+                    //      actually mean and does not require widen to be
+                    //      canonical at all. More expensive, but only on the
+                    //      band path, and it removes the failure class at
+                    //      every k rather than just k=1.
                     None => {
                         counters.band_missing += 1;
                         false

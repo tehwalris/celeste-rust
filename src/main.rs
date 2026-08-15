@@ -1831,6 +1831,33 @@ f(__new_unknown_boolean())
     fn test_interpret_foreach() {
         use crate::interpreter::glue::interpret_cfg;
 
+        // TODO(fidelity, foreach): OUR `foreach` IS NOT PICO-8's, AND THE
+        // DIFFERENCE LOSES REAL TRANSITIONS. Ours advances the index
+        // unconditionally; PICO-8's `foreach(t,f)` is `for v in all(t) do
+        // f(v) end`, and `all` advances ONLY IF the element at the cursor is
+        // still the one it just returned. So when an object destroys itself
+        // during its own update, PICO-8 still visits the object that shifts
+        // into its slot and we skip it. Three consequences, all real in this
+        // cart: `load_room`'s foreach(objects,destroy_object) destroys only
+        // indices 1,3,5,... so a death leaves stale objects behind (observed
+        // in room (2,0)'s shape census); the player misses its creation-frame
+        // update where player_spawn is last, which makes our room (0,0)=94
+        // and (1,0)=100 PICO-8's 93 and 99 (a label - the input-frame counts
+        // 66 and 76 agree either way); and a spring that shifts into a
+        // collected fruit's slot loses an update, so a bounce PICO-8 would
+        // deliver is absent from our reachable set - which is the unsound
+        // direction, since it can refute an achievable horizon.
+        //
+        // Not fixed yet because it moves foreach_1's instruction numbering,
+        // which 13 recipe entries address by %n, changes every row hash, and
+        // can move rooms (0,0)/(1,0)'s absolute optima by one frame. The
+        // cheap moment to do it is while those rooms need re-deriving anyway.
+        //
+        // TODO(fidelity, general): this is one instance of a class - our
+        // builtins are reimplementations and have not been differentially
+        // tested against real PICO-8. Same treatment wanted for the numerics
+        // (fixed-point rounding, division, sin/cos tables, rnd).
+        //
         // From lua_tests/foreach.lua - testing the foreach function implementation
         // foreach is implemented in Lua (builtin_level_3.lua):
         //   function foreach(tbl, func)
