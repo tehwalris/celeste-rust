@@ -415,9 +415,24 @@ pub fn make_state_abstract_rem(mut state: State, precision: RemPrecision) -> Sta
     // through, only a loose band. The win: all break cohorts collapse into
     // one row family (33.5% of the room-(0,0) frontier at f79 was
     // per-cohort fruit rows).
+    //
+    // The bob POSITION goes with it. `off` is read in exactly one place -
+    // fruit.update's `this.y = this.start + sin(this.off/40)*2.5` (the read
+    // census in `apply_conservative_widenings`) - so `y` is the one field
+    // derived from it, and widening one without the other does not produce
+    // a state the coarse level can have. That asymmetry is not academic:
+    // the exact level's `y` is one of the 40 concrete bob positions, so its
+    // coarsened row (concrete y, widened off) matches no row of the coarse
+    // level (interval y, widened off), and the band filter drops the lane
+    // as an "unknown coarse row". Room (2,0) has a fruit alive from room
+    // load in EVERY lane, and before this the k16 level came out empty at
+    // frame 2 and refuted every horizon. `sin` is in [-1, 1] by definition,
+    // so the band is start +/- 2.5 - which is also, bit for bit, what the
+    // coarse levels' own interval arithmetic puts there.
     {
         let helper = StateHelper::new(&state);
         let mut off_cells: Vec<HeapId> = Vec::new();
+        let mut bob_cells: Vec<(HeapId, HeapId)> = Vec::new();
         if let Some(arr_id) = helper
             .find_global("objects")
             .and_then(|id| helper.unwrap_pointer(helper.load(id)))
@@ -432,6 +447,12 @@ pub fn make_state_abstract_rem(mut state: State, precision: RemPrecision) -> Sta
                 off_cells.push(*obj.get("off").unwrap_or_else(|| {
                     panic!("fruit-off widening: fruit has no `off` field")
                 }));
+                let field = |name: &str| {
+                    *obj.get(name).unwrap_or_else(|| {
+                        panic!("fruit-off widening: fruit has no `{}` field", name)
+                    })
+                };
+                bob_cells.push((field("y"), field("start")));
             }
         }
         let full_period = Pico8NumInterval::new(Pico8Num::from_i16(0), Pico8Num::from_i16(39));
@@ -445,6 +466,52 @@ pub fn make_state_abstract_rem(mut state: State, precision: RemPrecision) -> Sta
                 }
                 other => panic!("fruit-off widening: off is not numeric: {:?}", other),
             }
+        }
+        // sin(off/40) * 2.5, for an unknown phase: the whole bob band.
+        let amplitude = Pico8Num::from_parts(2, 0x8000);
+        let band_of = |start: &Pico8Num| Pico8NumInterval::new(*start - amplitude, *start + amplitude);
+        for (y_cell, start_cell) in bob_cells {
+            let bands: MaybeVector<Pico8NumInterval> = match state.heap.get(start_cell) {
+                HeapValue::Value(Value::Number(MaybeVector::Scalar(start))) => {
+                    MaybeVector::Scalar(band_of(start))
+                }
+                HeapValue::Value(Value::Number(MaybeVector::Vector(starts))) => {
+                    MaybeVector::vector(starts.iter().map(band_of).collect())
+                }
+                other => panic!("fruit-off widening: start is not a number: {:?}", other),
+            };
+            // The widening must only ever grow the value it replaces.
+            let old_y = match state.heap.get(y_cell) {
+                HeapValue::Value(value) => value.clone(),
+                other => panic!("fruit-off widening: y is not a value: {:?}", other),
+            };
+            let band_of_lane = |i: usize| match &bands {
+                MaybeVector::Scalar(band) => *band,
+                MaybeVector::Vector(bands) => bands[i],
+            };
+            for i in 0..state.vector_size {
+                let contained = match &old_y {
+                    Value::Number(MaybeVector::Scalar(n)) => band_of_lane(i).contains_number(*n),
+                    Value::Number(MaybeVector::Vector(ns)) => band_of_lane(i).contains_number(ns[i]),
+                    Value::NumberInterval(MaybeVector::Scalar(iv)) => {
+                        band_of_lane(i).contains_interval(iv)
+                    }
+                    Value::NumberInterval(MaybeVector::Vector(ivs)) => {
+                        band_of_lane(i).contains_interval(&ivs[i])
+                    }
+                    other => panic!("fruit-off widening: y is not numeric: {:?}", other),
+                };
+                assert!(
+                    contained,
+                    "fruit-off widening: lane {} of y {:?} is outside the bob band {:?}",
+                    i,
+                    old_y,
+                    band_of_lane(i)
+                );
+            }
+            state
+                .heap
+                .set(y_cell, HeapValue::Value(Value::NumberInterval(bands)));
         }
     }
 
@@ -598,6 +665,14 @@ pub fn apply_conservative_widenings(mut state: State) -> State {
             other => panic!("timer global {} is not a number: {:?}", name, other),
         }
     }
+
+    // NOTE on `has_dashed` (2026-08-15): it is gameplay-dead in any room
+    // without a `fly_fruit` (its only read is fly_fruit.update's
+    // `if has_dashed`), and pinning it looked like a free way to merge the
+    // dashed and never-dashed copies of every state. MEASURED on room
+    // (2,0): the pin changes the frame-50 frontier from 5,507,770 lanes to
+    // 5,507,769 - one lane. By the time the frontier is large, every state
+    // in it has dashed. Not worth a per-room soundness argument.
 
     state
 }

@@ -1,5 +1,22 @@
 # Room (0,0) "100 m": multi-variant specialization + the fake wall
 
+## LATER FINDING (2026-08-15, from room (2,0)): the k16 band dropped
+## every fruit-alive lane
+
+The fruit-`off` widening widened `off` and not the bob POSITION derived
+from it, so a level-16 row coarsened to k15 was a row k15 never had, and
+the band filter dropped it as an "unknown coarse row". In THIS room that
+was invisible and harmless - the fruit exists only after the wall break,
+the optimal path never breaks the wall, and every refutation here happened
+at k <= 7, where both levels widen the bob identically - but it means the
+k16 stage of the 94-frame convergence was searching a strictly smaller set
+than it should have been. The 94 stands (a concrete 94-frame witness exists
+and the refutations are unaffected); what would NOT have stood is a k16
+refutation of some horizon, had one occurred. Fixed in
+`make_state_abstract_rem`; see plans/room20-plan.md. Room (0,0)'s row
+hashes move slightly as a result (a fruit's `y` is the bob band from its
+creation frame rather than from the next one).
+
 ## RE-DERIVED (2026-08-10) on the fixed interpreter: STILL 94
 
 The whole ladder was rebuilt from nothing after the three interpreter
