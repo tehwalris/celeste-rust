@@ -26,9 +26,9 @@
 # twice off the right wall of the shaft and leave through the gap at the
 # top (x in [64, 95]). It collects NEITHER spring NOR the fruit.
 #
-# Replay (expect the exit during frame 95; the leftover player object then
-# re-triggers next_room on frames 96 and 97 - `del` does not remove it from
-# `objects` mid-foreach - and frame 97 loads room (5,0), whose balloon.init
+# Replay (expect the exit during frame 95; the player survives its own room
+# change - load_room's foreach deletes every other element - and re-enters
+# next_room on frames 96 and 97; frame 97 loads room (5,0), whose balloon.init
 # calls the unimplemented `rnd`. That crash is 2 frames PAST the exit and
 # is harmless; run -f 95 to avoid it):
 #   ./target/release/concrete_run -i "$(grep -v '^#' tas/room_2_0_exit_frame_95.txt | tr -d '\n')" -f 95

@@ -45,11 +45,11 @@ mechanical rather than guesswork:
 `next_room()` fires DURING FRAME 95 - established by a second scratch tree
 in which `next_room` only sets `freeze`, so the frame it runs on is visible
 in `concrete_run`'s output. Reading it off the raw replay is misleading:
-`del` does not remove the player from `objects` while `_update`'s `foreach`
-is iterating, so the OLD player keeps updating for two more frames and
-re-enters `next_room` at 96 and 97 - and frame 97 loads room (5,0), whose
-`balloon.init` calls the unimplemented `rnd`. That crash is two frames past
-the exit and is harmless.
+`load_room`'s own `foreach(objects, destroy_object)` deletes every OTHER
+element (see the `foreach` section), so the player survives its own room
+change, keeps updating, and re-enters `next_room` on frames 96 and 97 -
+and frame 97 loads room (5,0), whose `balloon.init` calls the unimplemented
+`rnd`. That crash is two frames past the exit and is harmless.
 
 The route collects neither the fruit nor a spring.
 
