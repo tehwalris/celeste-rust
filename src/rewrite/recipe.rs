@@ -725,6 +725,13 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
     // cannot find anything - `validate_function` reads only that function - and
     // the comparison is exact rather than a guess about what each rule touches,
     // so nothing is taken on trust.
+    // Before validating, not after: `validate` rejects a name whose local no
+    // longer exists, and a rule that deleted instructions has just created
+    // exactly that. Running here also means every later stage - the rule's
+    // own verifier, the report - sees the names the entry actually
+    // established.
+    name_new_locals(&before, program, &entry.id)?;
+
     let clock = std::time::Instant::now();
     let mut errors = Vec::new();
     for (name, after_fun) in program.functions.iter() {
@@ -864,6 +871,86 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         blocks_before,
         blocks_after: program.block_count(),
     })
+}
+
+
+/// Give every local this entry just created a name derived from the ENTRY
+/// that created it, so a later recipe entry can address it stably.
+///
+/// Done here, once, rather than in each of the seventeen rule files that
+/// mint ids: `apply_entry` is the only place that holds both the before and
+/// after programs, so "which locals are new" is a subtraction rather than
+/// seventeen rules each remembering to report. No rule signature changes,
+/// and a rule added later is covered without being told to be.
+///
+/// The order is CANONICAL - by block label, then by position within the
+/// block - not the order the ids happen to number. That is the whole point:
+/// if it were id order, the names would inherit exactly the instability the
+/// ids have, and an unrelated edit upstream would renumber them.
+///
+/// Source locals are deliberately left unnamed. They are already stable
+/// (`LocalIdGenerator` numbers per function at compile time, so editing one
+/// function cannot move another's), `%n` keeps addressing them, and naming
+/// 20,000 instructions that do not need it would be noise.
+fn name_new_locals(before: &Program, after: &mut Program, entry_id: &str) -> Result<()> {
+    for (global, fun) in after.functions.iter_mut() {
+        // PRUNE FIRST. `Cfg::map_blocks` carries names through a rewrite, so
+        // a rule that deleted an instruction leaves its name behind; that is
+        // deliberate (erasing them all would destroy the addressing) but it
+        // makes pruning this function's job. Doing it here rather than in
+        // each rule keeps it symmetric with the naming below - one place
+        // that knows what the entry did, instead of every rule remembering.
+        //
+        // Without this, `validate` rejects the program outright, which is
+        // how the need showed up rather than a name silently resolving to a
+        // deleted local.
+        let live: rustc_hash::FxHashSet<LocalId> =
+            crate::rewrite::slots::defined_ids(fun).into_iter().collect();
+        fun.cfg.names.retain_ids(&|id| live.contains(&id));
+
+        let old_ids: rustc_hash::FxHashSet<LocalId> = match before.functions.get(global) {
+            Some(old) => crate::rewrite::slots::defined_ids(old).into_iter().collect(),
+            // A function this entry created outright: everything in it is new.
+            None => Default::default(),
+        };
+
+        // Canonical walk: blocks by label (entry first), instructions in
+        // order. `Cfg.named` is an FxHashMap, so its iteration order must
+        // not leak into a name.
+        let mut fresh: Vec<LocalId> = Vec::new();
+        let mut seen = |id: LocalId, fresh: &mut Vec<LocalId>| {
+            if !old_ids.contains(&id) {
+                fresh.push(id);
+            }
+        };
+        let mut labels: Vec<&crate::ir::Label> = fun.cfg.named.keys().collect();
+        labels.sort();
+        let entry_block = &fun.cfg.entry;
+        for (id, _) in &entry_block.instructions {
+            seen(*id, &mut fresh);
+        }
+        seen(entry_block.terminator_id(), &mut fresh);
+        for label in labels {
+            let block = &fun.cfg.named[label];
+            for (id, _) in &block.instructions {
+                seen(*id, &mut fresh);
+            }
+            seen(block.terminator_id(), &mut fresh);
+        }
+
+        for (index, id) in fresh.into_iter().enumerate() {
+            // Already named means this id survived from an earlier entry
+            // under a different function key; leave the first name alone.
+            if fun.cfg.names.get(id).is_some() {
+                continue;
+            }
+            fun.cfg
+                .names
+                .insert(id, format!("{}.{}", entry_id, index))
+                .map_err(|e| anyhow!("naming locals created by {}: {}", entry_id, e))?;
+        }
+    }
+    Ok(())
 }
 
 /// Builds the program from source and replays the whole recipe.

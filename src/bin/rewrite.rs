@@ -1393,6 +1393,12 @@ fn main() -> Result<()> {
                 );
             }
             println!();
+            let named: usize = program
+                .functions
+                .values()
+                .map(|f| f.cfg.names.iter().count())
+                .sum();
+            println!("stable names bound to rewrite-created locals: {}", named);
             println!(
                 "final: {} functions, {} blocks, {} instructions",
                 program.functions.len(),
