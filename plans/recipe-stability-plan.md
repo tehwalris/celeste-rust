@@ -104,9 +104,30 @@ Give a minted id an identity derived from WHO minted it, not from how many
 ids existed when it was minted. Entry `i1_023`'s third temporary should be
 the same id no matter what any other entry did.
 
-Sketch: reserve a disjoint range per recipe entry - `SOURCE_MAX + k *
-STRIDE + i` for the `i`th mint of the `k`th entry - and assert on overflow
-of `STRIDE` rather than silently colliding.
+### The stride sketch is DEAD - measured, 2026-08-15
+
+The obvious version - reserve a disjoint id range per entry, `BASE + k *
+STRIDE + i` - was implemented and then abandoned, because stability cannot
+live in the id's VALUE:
+
+* `SlotMap::identity()` is an empty vec meaning "slot == LocalId", which is
+  what every CFG carries until `allocate_slots` runs last;
+* `LocalEnv` sizes its storage BY SLOT;
+* so a sparse id near 2^20 makes every intermediate state allocate a
+  million slots - and `bisect`, `screen` and the rule verifiers all
+  interpret the program before `allocate_slots` compacts anything.
+
+Keeping ids dense and making the RANGE stable are in direct conflict. The
+resolution is that they are answering different questions, and only one of
+them needs the id:
+
+    ids stay dense and are free to move;
+    STABILITY LIVES IN A NAME, in a side table.
+
+which is what Philippe proposed at the outset. A minted instruction gets a
+name derived from the entry that minted it (`i1_023.t3`); the recipe
+addresses names; the id remains whatever keeps the runtime compact. This
+also subsumes Phase 2 rather than preceding it.
 
 ### The feasibility problem, and its answer
 
