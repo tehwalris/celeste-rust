@@ -70,12 +70,26 @@ Philippe's framing, and it is the right one. Notes:
 * `Cfg.named` is an `FxHashMap<Label, Block>` and prints in hash order, so
   the walk must order blocks explicitly - by reachability from entry, with
   label as a tiebreak. Trusting iteration order would make it flaky.
-* **Slot identity is not optional.** `allocate_slots` assigns each local a
-  runtime slot, and row keys - hence every checkpoint and every certified
-  `g` - depend on it. A refactor can be perfectly isomorphic and still
-  permute slots, which would invalidate rooms (0,0) and (1,0) a second
-  time. If slots do move, canonicalise the allocation rather than accept
-  the churn.
+* **Slot identity is not optional, but it is not the end state either.**
+  `allocate_slots` assigns each local a runtime slot, and row keys - hence
+  every checkpoint and every certified `g` - depend on it. So the gate
+  compares slots, and today that comparison is "did they move".
+
+  Philippe's call (2026-08-15): slot NAMES should themselves be derived and
+  stable, not merely preserved by accident, and it is worth breaking them
+  ONCE to get that property. So the end state is:
+
+      a local's slot is a deterministic function of its STABLE NAME,
+      not of the order its id happened to be assigned in.
+
+  which makes checkpoints survive future refactors instead of surviving
+  this one by luck. The break is paid once, during Phase 2, and both rooms
+  are re-derived after it - they already need re-deriving for the chunk-cap
+  fingerprint anyway, so the marginal cost is one campaign, not three.
+
+  Until that point the gate's slot half stays "identical"; after it, the
+  gate becomes "slots are the function of the names that the allocator
+  claims", which is a stronger and more useful statement.
 * Capture today's final program as the golden baseline FIRST. Then every
   commit of the refactor is gated from the start, instead of the whole
   thing being validated retrospectively against a 905-entry recipe.
