@@ -43,6 +43,54 @@ More is coming: the numerics have never been differentially tested against
 real PICO-8 either. **The recipe's addressing has made the model
 effectively immutable, and that is the thing to fix.**
 
+### The bigger half: BLOCK LABELS are globally numbered
+
+Measured 2026-08-16, after the local-naming work was done and the `foreach`
+change was replayed against it. `Compiler` (frontend.rs:192) holds ONE
+`LabelGenerator` for the entire program, while `LocalId`s are re-densified
+PER FUNCTION by `Stream::make_local_ids_dense` in `Stream::build`. Labels
+have no such step. That asymmetry is the whole story:
+
+    source block labels, before the foreach change:   695
+    source block labels, after:                       703
+    labels whose STRING SURVIVED:                     170
+
+Adding eight blocks to `foreach` moves **525 of 695** block labels, because
+every label generated after it in compile order shifts by eight. And the
+recipe addresses blocks by label far more than it addresses locals:
+
+    entries naming a block:                     222 of 905
+    label-valued fields:                        263
+    distinct labels referenced:                 235
+    referenced labels whose label MOVED:        137  (58%)
+
+So the 263 local cells that were just made stable were the SMALLER half of
+the problem. This is also the real explanation for "371+ of 905 entries
+broke": not mostly minted-id drift, but label drift.
+
+The fix is exactly symmetric to the one the locals already have - renumber
+labels per function in `Stream::build`, so a label is `if_join_12` within
+its own function and an edit to another function cannot move it. Blocks
+created by inlining are already `in_{entry}_{callee label}`, so they
+inherit the property.
+
+Order, because the migration is circular otherwise:
+
+1. Make `isocheck` insensitive to label NAMING (canonicalize labels by
+   reverse-postorder, exactly as locals are canonicalized by first-seen
+   order) and re-save the baseline. This has to come FIRST or the gate
+   cannot tell "labels renamed" from "program changed" - which is the one
+   distinction the whole step needs.
+2. `Stream::make_labels_dense`, symmetric with `make_local_ids_dense`.
+3. Derive the old -> new label map and migrate the recipe's 263 label
+   fields. The map is recoverable without any production plumbing: the two
+   compiled programs are structurally identical, so walking each function
+   in reverse-postorder from the entry and zipping the two label sequences
+   IS the map. Verify it by applying it to the old dump and requiring the
+   result to equal the new dump exactly - a self-checking migration, like
+   `migrate-names`'s round-trip assertion.
+4. `isocheck` green again proves the program did not move.
+
 ## Goal
 
 A change to the base program should cost effort PROPORTIONAL TO THE CHANGE.
