@@ -1,0 +1,32 @@
+# Room (2,0) "300 m" exit witness for celeste-minimal, derived 2026-08-15.
+#
+# Input bytes for concrete_run (-i), one per frame starting at frame 1.
+# bit0=left bit1=right bit2=up bit3=down bit4=jump bit5=dash.
+# Frames 1-25 are the spawn prologue (inputs ignored; the player object is
+# created at the end of frame 25, so the first player update is frame 26).
+# next_room() (room.x 2 -> 3) fires DURING FRAME 95, i.e. on the 70th
+# player-update frame - exactly the 70 input bytes of the community TAS.
+#
+# Derived from ~/src/github.com/CelesteClassic/tasdatabase/classic/any/TAS3.tas
+# by moving two jump presses from their (jbuffer-buffered) press frames to
+# their execution frames - celeste-minimal has no jump buffer: frames
+# 68 -> 69 and 91 -> 92. Both were verified against a scratch build of
+# celeste-minimal WITH the jbuffer restored (the original's exact code),
+# which replays TAS3.tas byte-for-byte: the repaired sequence reproduces
+# that reference trajectory frame-for-frame in position, speed and rem
+# through the exit.
+#
+# Route: dash right off the spawn ledge, dash up-right onto the mid ledge,
+# run right, dash up-right, run right to the far wall, jump off it, run
+# left, dash straight up the left side of the top-middle shaft, wall-jump
+# twice off the right wall of the shaft and leave through the gap at the
+# top (x in [64, 95]). It collects NEITHER spring NOR the fruit.
+#
+# Replay (expect the exit during frame 95; the leftover player object then
+# re-triggers next_room on frames 96 and 97 - `del` does not remove it from
+# `objects` mid-foreach - and frame 97 loads room (5,0), whose balloon.init
+# calls the unimplemented `rnd`. That crash is 2 frames PAST the exit and
+# is harmless; run -f 95 to avoid it):
+#   ./target/release/concrete_run -i "$(grep -v '^#' tas/room_2_0_exit_frame_95.txt | tr -d '\n')" -f 95
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+1,42,0,0,0,0,0,0,0,38,0,0,0,0,0,2,2,2,2,18,2,2,2,2,2,2,38,38,38,0,0,0,2,2,2,2,2,2,2,2,2,2,1,17,1,1,1,1,1,4,4,36,4,36,0,0,0,2,2,1,2,2,2,18,0,0,16,0,0,0

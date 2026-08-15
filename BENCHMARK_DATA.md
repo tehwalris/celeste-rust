@@ -1,3 +1,62 @@
+# Room (2,0) does not fit: the ladder needs a rung below 0 (2026-08-15)
+
+Room (2,0) is the first room the campaign cannot afford. Everything else
+works - the pipeline was taken end to end on it, all 17 levels, with a
+non-vacuous `g` - but the level-0 forward pass runs out of RAM around
+frame 75 and the horizon it has to reach is 95. Full write-up in
+`plans/room20-plan.md`; the numbers:
+
+| frame | frontier lanes | visited rows | RSS | s/frame |
+|---|---|---|---|---|
+| 45 | 1,503,507 | 5.2M | 1.7 GB | 4.4 |
+| 50 | 5,507,770 | 24.1M | 4.7 GB | 16.9 |
+| 55 | 11,783,364 | 68.7M | 10.5 GB | 39.0 |
+| 60 | 23,220,148 | 178M | 21.7 GB | 113.5 |
+| 65 | 36,562,604 | | 38.3 GB | 244.3 |
+| 67 | 45,409,165 | | 44.3 GB | 240.6 |
+
+Per-frame growth is still 1.09-1.11 at f065. Room (0,0), for comparison,
+peaked at 12.1M frontier lanes at f079 and finished its whole campaign in
+405M rows.
+
+**Where it goes is measured, not guessed** (`CELESTE_XY_DUMP`): the room has
+about 4,500 reachable whole-pixel positions, the frontier has 96% of them by
+f050, and from there every doubling is state AT a position - 115 lanes per
+position at f040, 432 at f045, 1,278 at f050, 1,665 at f052. With `rem`
+already fully widened at level 0, that is the velocity and dash machinery.
+No amount of specialization, chunking or recipe work touches it: those
+change the cost per lane, and this is the number of lanes. The ladder
+refines exactly one field (`player.rem`) and its coarsest rung is exact in
+every other coordinate; a wide-open room wants a rung BELOW 0 that buckets
+`spd.x`/`spd.y` the same way, with level 0 banded by it.
+
+Standing result for the room: the optimum is **at most 95 frames**
+(`tas/room_2_0_exit_frame_95.txt`, derived from the community TAS and
+verified concretely), and at least whatever frame the level-0 pass reaches
+without a win.
+
+## What DID land, and what it cost
+
+* A soundness fix to the ladder: the fruit-`off` widening did not widen the
+  bob POSITION with it, so every fruit-alive lane of the EXACT level was
+  dropped from the band as an "unknown coarse row". Invisible on room (0,0)
+  (its winning path has no live fruit); fatal on room (2,0), where k16 came
+  out empty at frame 2 and refuted every horizon. Control: with the fix,
+  horizon 34 is refuted at k=2 and horizon 35 converges through all 17
+  levels at `CELESTE_WIN_AT_XY=26,108`, where `trace-witness` also passes
+  every level at every frame.
+* Sparse index creation in the interpreter: `got_fruit[1 + level_index()]`
+  is an append only in room (0,0).
+* The fused position-graph recording is now correct under `--resume` and
+  gated by `posgraphcheck.sh` (row sets equal, table a strict superset, `g`
+  identical as a function of the row). `ladder.sh FUSE=1` uses it, and the
+  ladder now skips its level-0 extend when the tree already covers the
+  horizon.
+* A fidelity finding that needs a decision, not a fix by me: `foreach` is
+  an index walk, PICO-8's `all()` is not, and the difference is visible in
+  this room's frontier (five-object shapes after a death). See
+  plans/room20-plan.md.
+
 # Room (0,0) end to end on the fixed interpreter: 2.6 h (2026-08-10)
 
 The full ladder re-derived from nothing on the post-fix interpreter.
