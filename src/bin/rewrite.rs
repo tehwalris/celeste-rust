@@ -2440,8 +2440,13 @@ fn main() -> Result<()> {
             let (program, _) = build(&recipe)?;
             let mut rows: Vec<String> = Vec::new();
             for (global, fun) in program.functions.iter() {
-                for (_, name) in fun.cfg.names.iter() {
-                    rows.push(format!("{}\t{}", global.as_str(), name));
+                for (id, name) in fun.cfg.names.iter() {
+                    rows.push(format!(
+                        "{}\t{}\t%{}",
+                        global.as_str(),
+                        name,
+                        usize::from(id)
+                    ));
                 }
             }
             rows.sort();

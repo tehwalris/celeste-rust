@@ -499,20 +499,65 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-fn parse_cell(text: &str) -> Result<LocalId> {
-    super::print::parse_local_name(text)
-        .ok_or_else(|| anyhow!("cell must look like %17, got {:?}", text))
-}
+/// Every function's name bindings, taken BEFORE the rule mutates anything.
+///
+/// A snapshot rather than a live borrow because the rule needs `&mut
+/// Program` and resolving against it at the call site would conflict. It
+/// also happens to be the right semantics: an entry addresses the program
+/// AS IT FOUND IT, so a name the entry itself creates cannot be referred to
+/// by that same entry.
+pub type NameSnapshot = rustc_hash::FxHashMap<String, rustc_hash::FxHashMap<String, LocalId>>;
 
-fn parse_guards(guards: &[SpeculateGuard]) -> Result<Vec<(LocalId, LocalId)>> {
-    guards
+fn take_name_snapshot(program: &Program) -> NameSnapshot {
+    program
+        .functions
         .iter()
-        .map(|g| Ok((parse_cell(&g.load)?, parse_cell(&g.store)?)))
+        .map(|(g, f)| {
+            (
+                g.as_str().to_string(),
+                f.cfg.names.iter().map(|(id, n)| (n.to_string(), id)).collect(),
+            )
+        })
         .collect()
 }
 
-fn parse_cells(texts: &[String]) -> Result<Vec<LocalId>> {
-    texts.iter().map(|t| parse_cell(t)).collect()
+/// Resolve a recipe's cell reference: either `%17` (a source local, whose
+/// numbering is already stable) or `%some.stable.name` (anything a rewrite
+/// created). Both spellings stay valid so the recipe can migrate one entry
+/// at a time - see plans/recipe-stability-plan.md.
+fn resolve_cell(names: &NameSnapshot, function: &str, text: &str) -> Result<LocalId> {
+    if let Some(id) = super::print::parse_local_name(text) {
+        return Ok(id);
+    }
+    let bare = text.strip_prefix('%').unwrap_or(text);
+    names
+        .get(function)
+        .and_then(|m| m.get(bare))
+        .copied()
+        .ok_or_else(|| {
+            anyhow!(
+                "cell {:?} is neither a %N local nor a name bound in {} - a \
+                 name that no longer resolves means the entry that created \
+                 it did not run, or ran differently",
+                text,
+                function
+            )
+        })
+}
+
+fn cells(names: &NameSnapshot, function: &str, texts: &[String]) -> Result<Vec<LocalId>> {
+    texts.iter().map(|t| resolve_cell(names, function, t)).collect()
+}
+
+fn guards_in(
+    names: &NameSnapshot,
+    function: &str,
+    guards: &[SpeculateGuard],
+) -> Result<Vec<(LocalId, LocalId)>> {
+    guards
+        .iter()
+        .map(|g| Ok((resolve_cell(names, function, &g.load)?, resolve_cell(names, function, &g.store)?)))
+        .collect()
 }
 
 #[derive(Debug, Default)]
@@ -632,6 +677,8 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         }
     }
 
+    let names = take_name_snapshot(program);
+
     let clock = std::time::Instant::now();
     let before = program.clone();
     timing.clone = clock.elapsed();
@@ -651,19 +698,19 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
             promote_capture::apply(program, function, *index)
         }
         Rule::PinBuiltin { function, at, name } => {
-            pin_builtin::apply(program, function, parse_cell(at)?, name)
+            pin_builtin::apply(program, function, resolve_cell(&names, function, at)?, name)
         }
         Rule::DemoteCreate { function, at } => {
-            demote_create::apply(program, function, parse_cell(at)?)
+            demote_create::apply(program, function, resolve_cell(&names, function, at)?)
         }
         Rule::ConvertTernary { function, join } => {
             convert_ternary::apply(program, function, join)
         }
         Rule::DecomposeTruthy { function, root } => {
-            decompose_truthy::apply(program, function, parse_cell(root)?)
+            decompose_truthy::apply(program, function, resolve_cell(&names, function, root)?)
         }
         Rule::Speculate { function, join, arm, guards } => {
-            speculate::apply(program, function, join, arm.as_deref(), &parse_guards(guards)?)
+            speculate::apply(program, function, join, arm.as_deref(), &guards_in(&names, function, guards)?)
         }
         Rule::SpeculateRegion { function, head, arm, join, mask, expand } => {
             speculate_region::apply(program, function, head, arm, join.as_deref(), *mask, *expand)
@@ -674,13 +721,13 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::FuseBreaks { function, head } => fuse_breaks::apply(program, function, head),
         Rule::AbsorbStores { function, head } => absorb_stores::apply(program, function, head),
         Rule::SinkStore { function, at } => {
-            sink_store::apply(program, function, parse_cell(at)?)
+            sink_store::apply(program, function, resolve_cell(&names, function, at)?)
         }
         Rule::PromoteCell { function, cell } => {
-            promote_cell::apply(program, function, parse_cell(cell)?)
+            promote_cell::apply(program, function, resolve_cell(&names, function, cell)?)
         }
         Rule::DecomposeBranch { function, at } => {
-            decompose_branch::apply(program, function, parse_cell(at)?)
+            decompose_branch::apply(program, function, resolve_cell(&names, function, at)?)
         }
         Rule::ExpandBool { function, head } => expand_bool::apply(program, function, head),
         Rule::ConvertAssert { function, head } => convert_assert::apply(program, function, head),
@@ -695,21 +742,21 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::PartitionMerge { cells } => partition_merge::apply(program, cells),
         Rule::WidenButtons { function, block } => widen_buttons::apply(program, function, block),
         Rule::WidenRem { function, block, object } => {
-            widen_rem::apply(program, function, block, parse_cell(object)?)
+            widen_rem::apply(program, function, block, resolve_cell(&names, function, object)?)
         }
         Rule::AssumeEq { function, a, b } => {
-            assume_eq::apply(program, function, parse_cell(a)?, parse_cell(b)?)
+            assume_eq::apply(program, function, resolve_cell(&names, function, a)?, resolve_cell(&names, function, b)?)
         }
         Rule::SplitCall { function, at, on, global } => {
-            split_call::apply(program, function, parse_cell(at)?, parse_cell(on)?, global)
+            split_call::apply(program, function, resolve_cell(&names, function, at)?, resolve_cell(&names, function, on)?, global)
         }
         Rule::Inline { function, at, callee, captures } => inline::apply(
             program,
             &entry.id,
             function,
-            parse_cell(at)?,
+            resolve_cell(&names, function, at)?,
             callee,
-            &parse_cells(captures)?,
+            &cells(&names, function, captures)?,
         ),
     }
     .with_context(|| format!("applying {} ({})", entry.id, entry.rule.name()))?;
@@ -771,19 +818,19 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
             promote_capture::verify(&before, program, function, *index)
         }
         Rule::PinBuiltin { function, at, name } => {
-            pin_builtin::verify(&before, program, function, parse_cell(at)?, name)
+            pin_builtin::verify(&before, program, function, resolve_cell(&names, function, at)?, name)
         }
         Rule::DemoteCreate { function, at } => {
-            demote_create::verify(&before, program, function, parse_cell(at)?)
+            demote_create::verify(&before, program, function, resolve_cell(&names, function, at)?)
         }
         Rule::ConvertTernary { function, join } => {
             convert_ternary::verify(&before, program, function, join)
         }
         Rule::DecomposeTruthy { function, root } => {
-            decompose_truthy::verify(&before, program, function, parse_cell(root)?)
+            decompose_truthy::verify(&before, program, function, resolve_cell(&names, function, root)?)
         }
         Rule::Speculate { function, join, arm, guards } => {
-            speculate::verify(&before, program, function, join, arm.as_deref(), &parse_guards(guards)?)
+            speculate::verify(&before, program, function, join, arm.as_deref(), &guards_in(&names, function, guards)?)
         }
         Rule::SpeculateRegion { function, head, arm, join, mask, expand } => {
             speculate_region::verify(
@@ -807,13 +854,13 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
             absorb_stores::verify(&before, program, function, head)
         }
         Rule::SinkStore { function, at } => {
-            sink_store::verify(&before, program, function, parse_cell(at)?)
+            sink_store::verify(&before, program, function, resolve_cell(&names, function, at)?)
         }
         Rule::PromoteCell { function, cell } => {
-            promote_cell::verify(&before, program, function, parse_cell(cell)?)
+            promote_cell::verify(&before, program, function, resolve_cell(&names, function, cell)?)
         }
         Rule::DecomposeBranch { function, at } => {
-            decompose_branch::verify(&before, program, function, parse_cell(at)?)
+            decompose_branch::verify(&before, program, function, resolve_cell(&names, function, at)?)
         }
         Rule::ExpandBool { function, head } => {
             expand_bool::verify(&before, program, function, head)
@@ -840,22 +887,22 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
             widen_buttons::verify(&before, program, function, block)
         }
         Rule::WidenRem { function, block, object } => {
-            widen_rem::verify(&before, program, function, block, parse_cell(object)?)
+            widen_rem::verify(&before, program, function, block, resolve_cell(&names, function, object)?)
         }
         Rule::AssumeEq { function, a, b } => {
-            assume_eq::verify(&before, program, function, parse_cell(a)?, parse_cell(b)?)
+            assume_eq::verify(&before, program, function, resolve_cell(&names, function, a)?, resolve_cell(&names, function, b)?)
         }
         Rule::SplitCall { function, at, on, global } => {
-            split_call::verify(&before, program, function, parse_cell(at)?, parse_cell(on)?, global)
+            split_call::verify(&before, program, function, resolve_cell(&names, function, at)?, resolve_cell(&names, function, on)?, global)
         }
         Rule::Inline { function, at, callee, captures } => inline::verify(
             &before,
             program,
             &entry.id,
             function,
-            parse_cell(at)?,
+            resolve_cell(&names, function, at)?,
             callee,
-            &parse_cells(captures)?,
+            &cells(&names, function, captures)?,
         ),
     }
     .with_context(|| format!("verifying {} ({})", entry.id, entry.rule.name()))?;
@@ -918,7 +965,7 @@ fn name_new_locals(before: &Program, after: &mut Program, entry_id: &str) -> Res
         // order. `Cfg.named` is an FxHashMap, so its iteration order must
         // not leak into a name.
         let mut fresh: Vec<LocalId> = Vec::new();
-        let mut seen = |id: LocalId, fresh: &mut Vec<LocalId>| {
+        let seen = |id: LocalId, fresh: &mut Vec<LocalId>| {
             if !old_ids.contains(&id) {
                 fresh.push(id);
             }
