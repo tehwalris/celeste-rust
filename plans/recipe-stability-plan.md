@@ -208,3 +208,32 @@ program is unchanged.
   instruction when the program changes, which is worse than failing loudly.
 * Do not accept the 705-entry recipe with the broken entries dropped
   without measuring what optimisation was lost.
+
+## Measured: names move only where the program actually changed
+
+With naming live (16,689 names over 19,906 instructions - most of the final
+program is rewrite-created, which is the measure of why `%n` was so
+fragile), the `foreach` change was replayed against the longest prefix that
+applies under BOTH versions (up to `j2_014`, with `p1_127`'s cell remapped
+`%15 -> %21` by hand).
+
+    entries in that prefix that create names:   108
+    entries whose names moved:                   19
+
+and every one of the 19 is genuinely downstream of `foreach`:
+
+* the direct foreach inlines - i1_017, i1_018, i1_023, i1_028, i1_031;
+* inlines of `load_room_60` and `next_room_58`, which are functions that
+  themselves have foreach inlined into them, so their bodies grew -
+  i1_086, i1_088, i1_090, i1_091, j2_000, j2_004, j2_005, j2_013.
+
+No entry unrelated to `foreach` was disturbed. Compare the `%n` scheme,
+where the same edit stopped **371+ of 905** entries from applying, most of
+them with no relationship to `foreach` at all - they broke because a
+counter moved.
+
+What this does NOT yet establish: that a recipe ADDRESSED by name would
+replay. That needs Phase 3. What it establishes is the property the
+addressing rests on - a name's binding depends only on the entry that
+created it and on that entry's own output, so an unrelated change upstream
+cannot move it.

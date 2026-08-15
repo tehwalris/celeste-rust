@@ -244,6 +244,11 @@ enum Command {
         #[arg(long)]
         frame: u32,
     },
+    /// Print every stable name bound to a rewrite-created local, as
+    /// "function<TAB>name". Sorted, so two runs can be diffed to see which
+    /// names a change to the base program actually disturbed - which is the
+    /// measurement the whole recipe-stability plan turns on.
+    Names {},
     /// Is the compiled program the SAME program, up to renaming its locals?
     /// The gate for plans/recipe-stability-plan.md: that refactor changes how
     /// LocalIds are assigned, not what program comes out, so it must leave
@@ -2428,6 +2433,20 @@ fn main() -> Result<()> {
                     min,
                     max
                 );
+            }
+        }
+
+        Command::Names {} => {
+            let (program, _) = build(&recipe)?;
+            let mut rows: Vec<String> = Vec::new();
+            for (global, fun) in program.functions.iter() {
+                for (_, name) in fun.cfg.names.iter() {
+                    rows.push(format!("{}\t{}", global.as_str(), name));
+                }
+            }
+            rows.sort();
+            for row in rows {
+                println!("{}", row);
             }
         }
 
