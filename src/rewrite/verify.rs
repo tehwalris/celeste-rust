@@ -952,6 +952,12 @@ impl AbstractRun {
         self.pos_obs = Some(super::pos_graph::PosObserver::default());
     }
 
+    /// Record while stepping, but keep everything an earlier run of the
+    /// same search already recorded - the resumed case.
+    pub fn record_pos_graph_from(&mut self, graph: super::pos_graph::PosGraph) {
+        self.pos_obs = Some(super::pos_graph::PosObserver::seeded(graph));
+    }
+
     /// Pairs recorded so far, for progress reporting.
     pub fn pos_graph_pairs(&self) -> Option<usize> {
         self.pos_obs.as_ref().map(|o| o.pairs())

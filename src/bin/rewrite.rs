@@ -454,9 +454,6 @@ fn bench(
             .ok_or_else(|| anyhow!("variants need the base recipe's mapping"))?;
         run.set_variants(base_mapping, variants);
     }
-    if record_pos_graph {
-        run.record_pos_graph();
-    }
     if let Some(band) = band {
         run.set_band(band);
     }
@@ -489,6 +486,59 @@ fn bench(
                 ))
             }
             None => println!("--resume: no checkpoint found, starting fresh"),
+        }
+    }
+    // After the resume, so a run that picks up at frame N keeps the
+    // transitions of frames 1..N-1 instead of writing a table that claims
+    // to cover them and does not.
+    if record_pos_graph {
+        let existing = match checkpoint.as_ref() {
+            Some(cfg) => celeste_rust::rewrite::pos_graph::PosGraph::load(&cfg.dir)?
+                .filter(|g| {
+                    if g.fingerprint() == cfg.fingerprint {
+                        true
+                    } else {
+                        panic!(
+                            "{}/posgraph.bin was recorded from the forward pass {}, \
+                             but this configuration is {}. Delete it.",
+                            cfg.dir.display(),
+                            g.fingerprint(),
+                            cfg.fingerprint
+                        )
+                    }
+                }),
+            None => None,
+        };
+        match existing {
+            Some(graph) => {
+                if graph.frames() + 1 < start_frame {
+                    return Err(anyhow!(
+                        "--record-pos-graph resuming at frame {}, but the table on \
+                         disk only covers frames 1..{} - the gap would never be \
+                         recorded. Delete posgraph.bin and rebuild it.",
+                        start_frame,
+                        graph.frames()
+                    ));
+                }
+                println!(
+                    "  position graph: extending the recorded table ({} pairs, \
+                     frames 1..{})",
+                    graph.pairs(),
+                    graph.frames()
+                );
+                run.record_pos_graph_from(graph);
+            }
+            None => {
+                if start_frame > 1 {
+                    return Err(anyhow!(
+                        "--record-pos-graph resuming at frame {} with no table on \
+                         disk: frames 1..{} would be missing from it",
+                        start_frame,
+                        start_frame - 1
+                    ));
+                }
+                run.record_pos_graph();
+            }
         }
     }
     if profile {

@@ -68,12 +68,35 @@ stage() { # $1 name, $2 logfile, rest: the command
   # `set -e`), but only after its cost has been recorded.
   return $rc
 }
+# FUSE=1 records the position graph DURING the level-0 forward pass instead
+# of replaying the whole room for it afterwards (`--record-pos-graph`). The
+# l0-posgraph stage below then finds a table that already covers the horizon
+# and reuses it. Gated on room (2,0) at h40: the visited row SETS are
+# identical with and against it, the recorded table is a strict superset (one
+# extra pair - the spawn's first move, which the replay cannot see because it
+# starts from the frame-1 batch), and the sweep's `g` is identical as a
+# function of the row. Off by default: on a room whose forward pass is not
+# already checked this way, the replay is the conservative path.
+FUSE_ARG=""
+[ -n "${FUSE:-}" ] && FUSE_ARG="--record-pos-graph"
 for H in $(seq "$FROM" "$TO"); do
   echo "=== horizon $H: level 0 extend + sweep ==="
+  # A level-0 tree built past this horizon in one process (which is how a
+  # campaign avoids paying a resume's reload and re-merge per horizon)
+  # already contains this horizon's row table: the search is frontier-only
+  # and each
+  # frame's rows depend only on earlier frames, so f$H here is what a run
+  # stopped at $H would have written. `bench --resume` would refuse it -
+  # "latest checkpoint is beyond --frames" - so skip the stage rather than
+  # rebuild the room.
+  if [ -d "$L0/f$(printf %03d "$H")" ]; then
+    echo "level 0 already covers f$H - skipping the extend"
+  else
   stage "l0-bench-h$H" /tmp/l0-h$H.log \
       ./target/release/rewrite --recipe "$RECIPE" bench --frames "$H" --deopt \
-      --checkpoint-dir "$L0" --save-frames --resume
+      --checkpoint-dir "$L0" --save-frames --resume $FUSE_ARG
   tail -2 /tmp/l0-h$H.log
+  fi
   # The sweep's origin-tagged plain replays of fruit states blow up on
   # UnknownBool branch doubling; a much tighter per-state lane cap than the
   # forward pass needs (see the h88 OOM postmortem in room00-plan.md).

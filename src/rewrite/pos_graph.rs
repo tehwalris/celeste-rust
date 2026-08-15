@@ -495,6 +495,19 @@ impl Default for PosObserver {
 }
 
 impl PosObserver {
+    /// Start from an already-built table, so a RESUMED forward pass keeps
+    /// the transitions of the frames it is not re-running. Without this the
+    /// fused recording writes a table stamped with the full horizon but
+    /// holding only the resumed tail, and a table that is too small makes
+    /// the sweep drop real predecessors - silently, and in the direction
+    /// that loses winning paths.
+    pub fn seeded(graph: PosGraph) -> Self {
+        Self {
+            pending: std::sync::Mutex::new(Vec::new()),
+            graph: std::sync::Mutex::new(graph.into_builder()),
+        }
+    }
+
     /// Tag every input lane with its own cell, so the outputs can be
     /// attributed back to it.
     pub fn tag(&self, state: &mut State) -> Result<()> {
