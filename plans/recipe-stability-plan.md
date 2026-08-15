@@ -150,6 +150,20 @@ Open questions to settle with measurement, not argument:
 * how large does the peak id actually get mid-rewrite, and does any
   structure allocate proportional to it before compaction?
 
+### The seam, located
+
+Every place a recipe string becomes a `LocalId` is `recipe::parse_cell`,
+and there are **23 call sites, all in `recipe.rs`, all with the target
+function already in scope**. So name resolution is one function plus its
+callers in a single file - not a change that ripples through the 17 rule
+files that mint ids.
+
+    fn parse_cell(text) -> LocalId            // today: only %17
+    fn parse_cell(fun, text) -> LocalId       // %17 OR %foreach_1.t3
+
+`%n` keeps working for source ids, so entries migrate one at a time and
+the gate proves each step changed nothing.
+
 ## Phase 2 - names on top
 
 Provenance makes ids STABLE; names make the recipe READABLE, and they are
