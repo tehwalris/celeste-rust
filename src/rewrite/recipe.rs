@@ -585,6 +585,18 @@ fn resolve_cell(names: &NameSnapshot, function: &str, text: &str) -> Result<Loca
         })
 }
 
+/// `resolve_cell` against one function's live name table rather than a
+/// whole-program snapshot. Used by the migration, which holds the program.
+fn resolve_cell_in(names: &crate::ir::Names, function: &str, text: &str) -> Result<LocalId> {
+    if let Some(id) = super::print::parse_local_name(text) {
+        return Ok(id);
+    }
+    let bare = text.strip_prefix('%').unwrap_or(text);
+    names.lookup(bare).ok_or_else(|| {
+        anyhow!("cell {:?} is neither a %N local nor a name bound in {}", text, function)
+    })
+}
+
 fn cells(names: &NameSnapshot, function: &str, texts: &[String]) -> Result<Vec<LocalId>> {
     texts.iter().map(|t| resolve_cell(names, function, t)).collect()
 }
@@ -1001,39 +1013,56 @@ fn name_new_locals(before: &Program, after: &mut Program, entry_id: &str) -> Res
             None => Default::default(),
         };
 
-        // Canonical walk: blocks by label (entry first), instructions in
-        // order. `Cfg.named` is an FxHashMap, so its iteration order must
-        // not leak into a name.
-        let mut fresh: Vec<LocalId> = Vec::new();
-        let seen = |id: LocalId, fresh: &mut Vec<LocalId>| {
-            if !old_ids.contains(&id) {
-                fresh.push(id);
+        // The name is `{entry}.{block}.{position}` - a coordinate in the
+        // program, not a counter over the entry's output.
+        //
+        // A running index over everything the entry created was the first
+        // version, and it is not local enough. `inline` splices a whole
+        // callee body, so growing the callee - which happens whenever a
+        // function inlined INTO it grows - shifts the index of every
+        // instruction after the growth, and names that had nothing to do
+        // with the change rebind to different instructions. That is exactly
+        // the failure mode `%N` had, one level down: `i1_033.133` stopped
+        // being a `call` and became a `br`.
+        //
+        // Keyed by block, a change is confined to the block it happens in,
+        // and blocks created by inlining carry the inlining entry's id in
+        // their label (`in_i1_033_...`), so the label is itself provenance.
+        // A name still moves if an instruction is inserted EARLIER IN ITS
+        // OWN BLOCK - there is no free lunch - but that is a change to the
+        // very code the name points into.
+        //
+        // `Cfg.named` is an FxHashMap, so its iteration order must never
+        // leak into a name; the labels are sorted.
+        let mut fresh: Vec<(LocalId, String)> = Vec::new();
+        let collect = |label: &str, block: &crate::ir::Block, fresh: &mut Vec<_>| {
+            for (position, (id, _)) in block.instructions.iter().enumerate() {
+                if !old_ids.contains(id) {
+                    fresh.push((*id, format!("{}.{}.{}", entry_id, label, position)));
+                }
+            }
+            let terminator = block.terminator_id();
+            if !old_ids.contains(&terminator) {
+                fresh.push((terminator, format!("{}.{}.t", entry_id, label)));
             }
         };
+        collect("__entry", &fun.cfg.entry, &mut fresh);
         let mut labels: Vec<&crate::ir::Label> = fun.cfg.named.keys().collect();
         labels.sort();
-        let entry_block = &fun.cfg.entry;
-        for (id, _) in &entry_block.instructions {
-            seen(*id, &mut fresh);
-        }
-        seen(entry_block.terminator_id(), &mut fresh);
         for label in labels {
-            let block = &fun.cfg.named[label];
-            for (id, _) in &block.instructions {
-                seen(*id, &mut fresh);
-            }
-            seen(block.terminator_id(), &mut fresh);
+            collect(label.as_str(), &fun.cfg.named[label], &mut fresh);
         }
 
-        for (index, id) in fresh.into_iter().enumerate() {
-            // Already named means this id survived from an earlier entry
-            // under a different function key; leave the first name alone.
+        for (id, name) in fresh {
+            // Already named means this id survived from an earlier entry;
+            // leave the first name alone, because a later entry moving an
+            // instruction between blocks must not silently re-address it.
             if fun.cfg.names.get(id).is_some() {
                 continue;
             }
             fun.cfg
                 .names
-                .insert(id, format!("{}.{}", entry_id, index))
+                .insert(id, name)
                 .map_err(|e| anyhow!("naming locals created by {}: {}", entry_id, e))?;
         }
     }
@@ -1076,10 +1105,13 @@ pub fn migrate_to_names(recipe: &mut Recipe) -> Result<MigrationReport> {
                 .cfg
                 .names;
             for field in fields {
-                let Some(local) = super::print::parse_local_name(field) else {
-                    report.already += 1;
-                    continue;
-                };
+                // Resolve first, exactly as `resolve_cell` would, then
+                // re-emit. Resolving an already-named cell rather than
+                // skipping it is what lets this pass REGENERATE the recipe
+                // when the naming scheme itself changes - otherwise the
+                // first scheme would be permanent.
+                let local = resolve_cell_in(names, &function, field)
+                    .with_context(|| format!("entry {}", id))?;
                 match names.get(local) {
                     Some(name) => {
                         let replacement = format!("%{}", name);
@@ -1094,8 +1126,12 @@ pub fn migrate_to_names(recipe: &mut Recipe) -> Result<MigrationReport> {
                                 function
                             ));
                         }
+                        if *field == replacement {
+                            report.already += 1;
+                        } else {
+                            report.migrated += 1;
+                        }
                         *field = replacement;
-                        report.migrated += 1;
                     }
                     // Unnamed means a source local: `LocalIdGenerator`
                     // numbers those per function at compile time, so an edit
