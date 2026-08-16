@@ -4693,7 +4693,7 @@ fn add_0(%c0, %c1)
     %c4 = %c2 + %c3
     %c5 = get_index %c0[%c4] create
     %c6 = store %c5 <- %c1
-    %c7 = return
+    %c7 = return %c1
 
 fn anonymous_59(%c0) captures [%c1, %c2, %c3]
   __entry:

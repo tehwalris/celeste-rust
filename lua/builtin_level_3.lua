@@ -1,5 +1,8 @@
 function add(t, v)
+  -- PICO-8's add RETURNS the value it appended. Nothing in this cart uses
+  -- the result, so this is latent - but latent is exactly what foreach was.
   t[#t + 1] = v
+  return v
 end
 
 function foreach(tbl, func)

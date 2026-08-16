@@ -59,7 +59,13 @@ re-deriving a room costs hours. Do them ALL, then re-derive ONCE.
         divisor's sign; `7 % -3` is 1, and the result is never negative).
         The rule is exactly `i32::rem_euclid` on raw bits, `a % 0 == 0`,
         confirmed on 20/20 console data points.
-- [ ] A6 Re-run the three witness TASes and the suite. Commit the lot.
+- [x] A6 DONE. Committed as 5d4a5d3, plus the Lua-level `add` fix.
+      `pico8_diff`: **16 passed, 0 failed, 0 xfail** - the interpreter now
+      agrees with a real console on every case in the harness.
+
+      The `add` fix is the clearest evidence the stability work paid for
+      itself: `add` is INLINED at many sites, and changing its body cost
+      **zero** recipe entries. Before tonight that class of edit cost 371.
 
 ### B. Recipe completeness
 
@@ -124,3 +130,9 @@ discussion. Expect the state to need an abstraction, not just more lanes.
 * 02:00 label densification + name-keyed slots committed (e57b837).
 * 02:15 PICO-8 installed; `foreach` = `all()` confirmed on five cases.
 * 02:40 `sin` table dumped, folded 65536 -> 16384, reconstruction exact.
+* 03:30 numerics batch committed (5d4a5d3). Also found and fixed: room00's
+  recipe had been silently broken since e57b837 because only the base
+  recipe was migrated to stable names, and NO test replayed the second
+  recipe. `every_checked_in_recipe_replays` now does.
+* 04:00 Lua-level `add` returns its value; 0 recipe entries broken;
+  harness fully green at 16/16.
