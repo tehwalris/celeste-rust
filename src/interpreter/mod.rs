@@ -9,6 +9,10 @@ pub mod heap;
 pub mod inspect;
 pub mod local_env;
 mod op;
+/// Test-only: the shared lock for everything whose result depends on the
+/// process-global `PARTITION_STRADDLES` toggle (see its doc in op.rs).
+#[cfg(test)]
+pub use op::partition_straddles_test_lock;
 pub mod profiling;
 pub mod row_table;
 pub mod visited;

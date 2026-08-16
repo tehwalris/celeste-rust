@@ -72,9 +72,17 @@ suite. It runs the command in a systemd scope with `MemoryMax=100G` so an
 accidental blowup kills the process rather than the machine.
 
 ```bash
-./safe-run.sh -- cargo test --release
+./safe-run.sh -- cargo nextest run --release
 ./safe-run.sh -- ./target/release/celeste-rust -n 40
 ```
+
+Run the suite with NEXTEST, never bare `cargo test --release`: the tests
+are fine (21 s wall for all 515 under nextest, 2026-08-16) but several
+of them mutate process-global state (tracing, instr_time, op_census,
+partition toggles), and under cargo test's shared-process harness the
+suite has twice been observed degrading to ~70-85 MINUTES at one core.
+nextest runs each test in its own process, which contains every such
+leak by construction.
 
 Exit code 137 means OOM. One job needs MORE than the 100 GB default:
 room (0,0)'s level-0 position-graph replay peaks at 101.08 GB on its last

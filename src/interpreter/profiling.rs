@@ -360,6 +360,10 @@ impl Profiler {
         self.start_time = Some(Instant::now());
     }
 
+    pub fn disable(&mut self) {
+        self.enabled = false;
+    }
+
     pub fn is_enabled(&self) -> bool {
         self.enabled
     }
@@ -828,6 +832,19 @@ pub fn enable_profiling() {
     PROFILER.lock().unwrap().enable();
 }
 
+/// Disable profiling. ANY caller of `enable_profiling` that does not own
+/// the process for its remaining lifetime must pair it with this: the
+/// flag is process-global, and leaving it on routes every span in every
+/// LATER piece of work through the `PROFILER` mutex. Two tests that
+/// leaked it made the whole test binary's interpreter runs serialize on
+/// that mutex - the "70-minute suite" of 2026-08-16 was exactly this,
+/// invisible under nextest's process-per-test isolation and
+/// catastrophic under `cargo test`'s shared process.
+pub fn disable_profiling() {
+    PROFILING_ENABLED.store(false, Ordering::Release);
+    PROFILER.lock().unwrap().disable();
+}
+
 /// Check if profiling is enabled (cheap check without mutex)
 #[inline]
 pub fn is_profiling_enabled() -> bool {
@@ -1196,10 +1213,30 @@ mod tests {
         assert_eq!(summary.vectorizations, 1);
     }
 
-    #[test]
-    fn test_span_guard() {
+    /// The GLOBAL profiler is process-wide state: tests that enable it
+    /// must (a) not run concurrently with each other and (b) DISABLE it
+    /// on the way out, panic or not - a leaked enable routes every span
+    /// of every later test in the process through the profiler mutex,
+    /// which is what turned the whole suite into 70+ minutes under
+    /// `cargo test` (see `disable_profiling`'s doc comment).
+    fn global_profiler_exclusive() -> impl Drop {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        struct Guard(Option<std::sync::MutexGuard<'static, ()>>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                disable_profiling();
+                self.0.take();
+            }
+        }
+        let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_profiling();
         enable_profiling();
+        Guard(Some(guard))
+    }
+
+    #[test]
+    fn test_span_guard() {
+        let _exclusive = global_profiler_exclusive();
 
         {
             let _guard = SpanGuard::new("test", "cat");
@@ -1212,8 +1249,7 @@ mod tests {
 
     #[test]
     fn test_fixed_point_guard() {
-        reset_profiling();
-        enable_profiling();
+        let _exclusive = global_profiler_exclusive();
 
         {
             let guard = FixedPointGuard::new(Some("test_fn".to_string()));

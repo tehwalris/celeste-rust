@@ -2254,6 +2254,11 @@ mod tests {
     /// re-run of only the failed lanes, and the merge of both output sets.
     #[test]
     fn granular_deopt_reproduces_the_baseline() {
+        // Serialise against the partition-toggle tests: this test compares
+        // a baseline run against a candidate run, and a toggle flip
+        // between the two makes them diverge spuriously.
+        let _partition =
+            crate::interpreter::partition_straddles_test_lock();
         if !std::path::Path::new("lua/celeste-minimal.lua").exists()
             || !std::path::Path::new("rewrites.jsonl").exists()
         {
@@ -2345,6 +2350,11 @@ mod tests {
     /// directions around a variant frame, and the zero-fallback invariant.
     #[test]
     fn shape_variant_dispatch_reproduces_the_baseline() {
+        // Serialise against the partition-toggle tests: this test compares
+        // a baseline run against a candidate run, and a toggle flip
+        // between the two makes them diverge spuriously.
+        let _partition =
+            crate::interpreter::partition_straddles_test_lock();
         if !std::path::Path::new("lua/celeste-minimal.lua").exists()
             || !std::path::Path::new("rewrites.jsonl").exists()
         {

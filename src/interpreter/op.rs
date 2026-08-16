@@ -103,6 +103,20 @@ pub fn set_partition_straddles(on: bool) {
     PARTITION_STRADDLES.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Lock for tests whose result depends on `PARTITION_STRADDLES` - the
+/// tests that DRIVE it and the differential tests that assume its
+/// default, both. Under `cargo test`'s shared process a toggle test
+/// flipping the flag mid-way through another test's baseline/candidate
+/// pair makes the pair diverge (observed: variant dispatch "diverged at
+/// frame 24" - the baseline ran with partitioning off, the candidate
+/// with it on). Under nextest this lock is uncontended, so it costs
+/// nothing where the suite actually runs.
+#[cfg(test)]
+pub fn partition_straddles_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Helper to lift a number to an interval
 fn lift_to_interval(v: &MaybeVector<Pico8Num>) -> MaybeVector<Pico8NumInterval> {
     v.map_to(|n| Pico8NumInterval::from_number(*n))

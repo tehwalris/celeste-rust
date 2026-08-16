@@ -1263,10 +1263,10 @@ mod expand_tests {
     /// ("left: MaybeBool(...), right: UnknownBool") while every one of them
     /// passed in isolation. A flaky gate is worse than no gate.
     fn straddles_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        // Not `unwrap`: one panicking test must not cascade into the others
-        // reporting a poisoned mutex instead of their real result.
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        // The SHARED lock in op.rs, not a private one: the differential
+        // tests in rewrite::verify depend on the flag's default and take
+        // the same lock, or a toggle here diverges their baselines.
+        crate::interpreter::op::partition_straddles_test_lock()
     }
 
     #[test]
