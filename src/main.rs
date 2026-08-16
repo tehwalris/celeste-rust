@@ -2859,13 +2859,17 @@ __reset_button_states()
             println!("State {}: vector_size={}, prints={:?}", i, state.vector_size, state.prints);
         }
 
-        // With proper deduplication, we should have:
-        // - 1 state (not 2)
-        // - vector_size=1 (not 2, since both states were identical)
-        // - prints=["42"]
-        assert_eq!(result_states.len(), 1, "Expected 1 state after deduplication");
-        assert_eq!(result_states[0].0.vector_size, 1,
-                   "Expected vector_size=1 since both paths produce identical state");
+        // One state after the merge - but TWO lanes, not one, since the
+        // branch-on-UnknownBool EDGE REFINEMENT (flow.rs; plans/
+        // spd-rung.md round 2): each arm learns its condition value
+        // (true/false), so the arm states differ in that live local
+        // until it dies. In the real pipeline the recipe's liveness
+        // kills retire the condition before any merge (verified
+        // byte-identical at room (1,0) f30); this toy has no kills, so
+        // the refined local is visible here by design.
+        assert_eq!(result_states.len(), 1, "Expected 1 merged state");
+        assert_eq!(result_states[0].0.vector_size, 2,
+                   "the refined condition local keeps the arm lanes distinct in this kill-less toy");
         assert_eq!(result_states[0].0.prints, vec!["42"]);
     }
 
@@ -2926,11 +2930,15 @@ __reset_button_states()
             println!("State {}: vector_size={}, prints={:?}", i, state.vector_size, state.prints);
         }
 
-        // After proper deduplication of y, we should have 1 state
-        // with x being vectorized and y being scalar (since y was deduplicated)
-        assert_eq!(result_states.len(), 1, "Expected 1 state after deduplication");
-        // The state should have vector_size=2 for x
-        assert_eq!(result_states[0].0.vector_size, 2,
-                   "Expected vector_size=2 for the x variable");
+        // One merged state; FOUR lanes, not two: both diamonds' branch
+        // conditions are edge-refined (flow.rs), so the second diamond's
+        // arms stay distinct per condition value in this kill-less toy
+        // (2 x-values x 2 refined y-conditions). See the comment in
+        // test_hint_normalize_deduplicates_identical_states; the real
+        // pipeline's liveness kills make this invisible (verified
+        // byte-identical at room (1,0) f30).
+        assert_eq!(result_states.len(), 1, "Expected 1 merged state");
+        assert_eq!(result_states[0].0.vector_size, 4,
+                   "2 x-values x 2 refined condition values in this kill-less toy");
     }
 }

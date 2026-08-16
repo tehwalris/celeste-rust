@@ -356,8 +356,30 @@ impl BoundBranchSplit {
                 // rather than filter time. Counted separately for that
                 // reason. (Once per branch now; the per-edge formulation
                 // counted each duplication twice.)
+                //
+                // EDGE REFINEMENT (plans/spd-rung.md round 2): each
+                // successor learns the condition's value. An UnknownBool
+                // is a bool by construction (comparisons, btn, not), so
+                // on the true edge it IS true and on the false edge it
+                // IS false - overwriting the local is exact, not an
+                // approximation. Without this, Lua's `a and b or c`
+                // VALUE idiom returns the still-unknown condition out of
+                // the false arm (observed: `appr` returning UnknownBool
+                // into spd.x on the plain program under the spd rung).
+                // Heap copies or aliases of the value stay unknown; only
+                // the branched-on local is refined.
                 crate::op_census::record_unknown_branch_dup(state.vector_size);
-                Ok((Some(state.clone()), Some(state)))
+                let mut true_state = state.clone();
+                true_state.local_env.set(
+                    self.condition_local_id,
+                    Value::Bool(MaybeVector::Scalar(true)),
+                );
+                let mut false_state = state;
+                false_state.local_env.set(
+                    self.condition_local_id,
+                    Value::Bool(MaybeVector::Scalar(false)),
+                );
+                Ok((Some(true_state), Some(false_state)))
             }
             Value::Number(_)
             | Value::NumberInterval(_)
