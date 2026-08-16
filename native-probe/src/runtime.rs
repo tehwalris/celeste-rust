@@ -103,6 +103,9 @@ pub struct Rt {
     /// Per-site receiver log for the gap census (empty = logging off).
     /// Lattice per site: 0 = unseen, cell+1 = single receiver, MAX = multi.
     pub site_log: Vec<u64>,
+    /// Per-branch-site outcome flags (empty = off): bit0 = took true,
+    /// bit1 = took false. 3 across a fan-out = divergent site.
+    pub branch_log: Vec<u8>,
 }
 
 #[inline]
@@ -138,6 +141,7 @@ impl Rt {
             cache,
             prints: Vec::new(),
             site_log: Vec::new(),
+            branch_log: Vec::new(),
         }
     }
 
@@ -433,6 +437,16 @@ impl Rt {
             V::NilPtr => panic!("branch on a nil pointer"),
             V::UBool => panic!("branch on UnknownBool on the concrete path"),
         }
+    }
+
+    /// `truthy` with branch-site logging (SIMD divergence census).
+    #[inline]
+    pub fn truthy_b(&mut self, v: V, site: u32) -> bool {
+        let t = self.truthy(v);
+        if !self.branch_log.is_empty() {
+            self.branch_log[site as usize] |= if t { 1 } else { 2 };
+        }
+        t
     }
 
     /// `Select` condition (op.rs:158 interpret_select): the condition must

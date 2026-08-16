@@ -395,6 +395,92 @@ fn run_census(dir: &str, frame: u32, census_frames: u32, max_lanes: usize) {
     }
 }
 
+/// SIMD-sizing measurement: one snapshot lane, one frame, all 64 input
+/// bytes - which branch sites diverge across the fan-out? (Sites that
+/// stay uniform run lockstep in a SIMD engine; divergent sites need
+/// both-arms + blend.)
+fn run_branch_census(dir: &str, frame: u32) {
+    use celeste_rust::rewrite::checkpoint;
+    let states = checkpoint::load_frame_states(std::path::Path::new(dir), frame)
+        .expect("load frame states");
+    // The biggest state: the lane axis needs real lane diversity.
+    let state = states
+        .iter()
+        .max_by_key(|s| s.vector_size)
+        .expect("no states");
+    let cart_base = if std::path::Path::new("cart").exists() { "cart" } else { "../cart" };
+    let (room_x, room_y) = celeste_rust::game_runner::start_room();
+    let cart =
+        std::sync::Arc::new(CartData::load(cart_base).expect("failed to load cart data"));
+    let cache = std::sync::Arc::new(
+        CollisionCache::new(&cart, room_x, room_y).expect("failed to create collision cache"),
+    );
+    let probe = Probe::new();
+    let mut agg: Vec<u8> = vec![0; gen::BRANCH_INFO.len()];
+    let mut panics = 0usize;
+    // Axis 1: input fan-out (one lane, 64 bytes). Axis 2: lane batch
+    // (byte 2 = hold right, up to 256 lanes spread across the state) -
+    // the union sizes the SIMD design.
+    let max_lane = state.vector_size.min(256);
+    eprintln!(
+        "[branch-census] state with {} lanes; {} input runs + {} lane runs",
+        state.vector_size, 64, max_lane
+    );
+    let runs: Vec<(u8, usize)> = (0u8..64)
+        .map(|b| (b, 0usize))
+        .chain((0..max_lane).map(|l| (2u8, l)))
+        .collect();
+    for (byte, lane) in runs {
+        let mut rt = Rt::new(
+            cart.clone(),
+            cache.clone(),
+            gen::GLOBAL_NAMES.len(),
+            gen::STRINGS,
+        );
+        rt.branch_log = vec![0; gen::BRANCH_INFO.len()];
+        import::import_lane(&mut rt, state, lane, true);
+        for (i, name) in BUILTIN_NAMES.iter().enumerate() {
+            if let Some(g) = gen::global_id(name) {
+                if rt.globals[g as usize] == runtime::NONE {
+                    let cell = rt.alloc(Cell::Bi(i as u32));
+                    rt.globals[g as usize] = cell;
+                }
+            }
+        }
+        set_buttons(&mut rt, &probe, byte);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gen::call_fn(&mut rt, gen::FN_FRAME, &[], &[]);
+        }));
+        if outcome.is_err() {
+            panics += 1;
+        }
+        for (a, &b) in agg.iter_mut().zip(rt.branch_log.iter()) {
+            *a |= b;
+        }
+    }
+    let executed = agg.iter().filter(|&&b| b != 0).count();
+    let divergent: Vec<usize> = agg
+        .iter()
+        .enumerate()
+        .filter(|(_, &b)| b == 3)
+        .map(|(i, _)| i)
+        .collect();
+    println!(
+        "branch census: {} sites total, {} executed, {} DIVERGENT across the 64-input fan-out, {} panicked inputs",
+        agg.len(),
+        executed,
+        divergent.len(),
+        panics
+    );
+    let mut by_fn: std::collections::BTreeMap<&str, usize> = Default::default();
+    for i in &divergent {
+        *by_fn.entry(gen::BRANCH_INFO[*i]).or_default() += 1;
+    }
+    for (f, n) in by_fn {
+        println!("  {} divergent in {}", n, f);
+    }
+}
+
 fn main() {
     let mut inputs: Vec<u8> = Vec::new();
     let mut frames: Option<u32> = None;
@@ -413,6 +499,12 @@ fn main() {
                     .parse()
                     .unwrap();
                 from_checkpoint = Some((dir, frame));
+            }
+            "--branch-census" => {
+                let dir = args.next().expect("--branch-census needs DIR FRAME");
+                let frame: u32 = args.next().expect("FRAME").parse().unwrap();
+                run_branch_census(&dir, frame);
+                return;
             }
             "--census-frames" => {
                 census_frames = args.next().expect("value").parse().unwrap()

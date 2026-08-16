@@ -70,6 +70,8 @@ struct Gen {
     /// (kind, fn name, interned field id or 0) per get_field/get_index
     /// site, in site-id order - the gap census's site table.
     site_info: Vec<(&'static str, String, u32, usize)>,
+    /// fn name per conditional-branch site (SIMD divergence census).
+    branch_info: Vec<String>,
     strings: Interner,
     globals: Interner,
     fields: Interner,
@@ -428,10 +430,13 @@ impl Gen {
                     writeln!(body, "{} continue;", edge(target.as_str())?)?;
                 }
                 Terminator::ConditionalBranch { condition, true_target, false_target } => {
+                    let bsite = self.branch_info.len() as u32;
+                    self.branch_info.push(fn_name.clone());
                     writeln!(
                         body,
-                        "if rt.truthy({}) {{ {} }} else {{ {} }} continue;",
+                        "if rt.truthy_b({}, {}) {{ {} }} else {{ {} }} continue;",
                         l(*condition),
+                        bsite,
                         edge(true_target.as_str())?,
                         edge(false_target.as_str())?
                     )?;
@@ -486,6 +491,7 @@ fn main() -> Result<()> {
     let mut gen = Gen {
         current_fn: String::new(),
         site_info: Vec::new(),
+        branch_info: Vec::new(),
         strings: Interner::default(),
         globals: Interner::default(),
         fields: Interner::default(),
@@ -534,6 +540,12 @@ fn main() -> Result<()> {
     out.push_str("pub static SITE_INFO: &[(&str, &str, u32, u32)] = &[\n");
     for (kind, fn_name, f, iid) in &gen.site_info {
         out.push_str(&format!("    ({:?}, {:?}, {}, {}),\n", kind, fn_name, f, iid));
+    }
+    out.push_str("];\n");
+    out.push_str("/// fn name per conditional-branch site.\n");
+    out.push_str("pub static BRANCH_INFO: &[&str] = &[\n");
+    for f in &gen.branch_info {
+        out.push_str(&format!("    {:?},\n", f));
     }
     out.push_str("];\n");
     out.push_str(&format!("pub const FN_INIT: u32 = {};\n", fn_init));

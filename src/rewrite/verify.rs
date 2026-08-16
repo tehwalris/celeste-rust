@@ -247,18 +247,47 @@ pub fn observe_state(state: &State) -> StateObservation {
     StateObservation { structure, globals, rows, prints: state.prints.clone() }
 }
 
+/// Every vectorizable value goes to the rows - INCLUDING uniform scalars.
+/// A uniform value is just a per-lane vector whose lanes agree; recording
+/// uniformity in `structure` would make the observation depend on how lanes
+/// are grouped into states (a partition class turns lane-varying cells
+/// uniform), which is exactly the implementation detail the observation
+/// must be blind to (partition-agnostic verification, 2026-08-17).
 fn is_per_lane(value: &Value) -> bool {
     matches!(
         value,
-        Value::Number(MaybeVector::Vector(_))
-            | Value::NumberInterval(MaybeVector::Vector(_))
-            | Value::Bool(MaybeVector::Vector(_))
+        Value::Number(_) | Value::NumberInterval(_) | Value::Bool(_)
     )
 }
 
 /// Canonical observation of a whole frame: the multiset of state observations.
+/// Grouping-canonical: states that differ only in how lanes are packaged
+/// into vectorized states (partitioned merges, chunk boundaries) observe
+/// identically - same-(structure, globals, prints) observations merge their
+/// row sets. Soundness anchor: batching invariance (#97 simdcheck) - no
+/// per-lane result ever depends on which lanes share a state. A lost or
+/// corrupted lane still fails (the row multiset differs).
 pub fn observe_frame(states: &[State]) -> BTreeSet<StateObservation> {
-    states.iter().map(observe_state).collect()
+    let mut merged: std::collections::BTreeMap<
+        (Vec<Cell>, Vec<(String, usize)>, Vec<String>),
+        BTreeSet<Vec<Cell>>,
+    > = std::collections::BTreeMap::new();
+    for state in states {
+        let o = observe_state(state);
+        merged
+            .entry((o.structure, o.globals, o.prints))
+            .or_default()
+            .extend(o.rows);
+    }
+    merged
+        .into_iter()
+        .map(|((structure, globals, prints), rows)| StateObservation {
+            structure,
+            globals,
+            rows,
+            prints,
+        })
+        .collect()
 }
 
 /// Runs the abstract search and yields the observation after each frame.
