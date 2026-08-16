@@ -2181,6 +2181,15 @@ fn describe(
                 .collect();
             if !differing.is_empty() {
                 detail.push_str(&format!("\n  structure differs at heap slots {:?}", differing));
+                // Name the differing slots: which cell kinds disagree is
+                // usually the whole diagnosis (2026-08-16, the room (2,0)
+                // v6 divergence hunt).
+                for &i in differing.iter().take(4) {
+                    detail.push_str(&format!(
+                        "\n    slot {}: baseline {:?} vs candidate {:?}",
+                        i, x.structure[i], y.structure[i]
+                    ));
+                }
             } else if x.rows != y.rows {
                 detail.push_str(&format!(
                     "\n  same structure, {} vs {} distinct lane rows",

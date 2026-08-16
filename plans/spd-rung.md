@@ -272,3 +272,32 @@ trials instead, one 40-frame differential each:
   non-player_spawn side). If B diverges: the 39 removals are implicated
   (StateMapping/canonical-structure interaction) - re-add in halves.
 Recipes: /tmp/rewrites-v6*.jsonl. Logs: /tmp/verify-*.log.
+
+## v6 divergence RESOLVED: partition_merge pm1 (2026-08-16 ~01:00)
+
+Trial ledger: A (no sp1) diverged; B' (no split_call chain, no sp1)
+diverged; C/C' (+c043/c045: c045 re-crashes the spring nil-deref, c043
+alone no change) diverged; CONTROL (base recipe) cannot even run room
+(2,0) under verify (fruit devirt assert at f1 - the removals were
+necessary, so the culprit had to be RETAINED); D (v8 minus pm1)
+**VERIFIES IDENTICAL through f40**.
+
+Diagnosis, enabled by the new slot-naming in the divergence reporter
+(verify.rs): candidate states held per-state-uniform values where the
+baseline had per-lane vectors (observation sentinel Num(i32::MIN)) - the
+candidate keeps partition classes the plain baseline merges. pm1's
+partitioning reconciled with the plain grouping on room (1,0) (its #69
+verify passed) but does not on a fruit room.
+
+Consequences:
+- /tmp/rewrites-v9.jsonl (copy: ~/celeste-checkpoints/room20-s16-v9-
+  recipe.jsonl) is the VERIFIED room (2,0) recipe: fruit-clean, verify-
+  clean, WITHOUT pm1 (which cost: pm1 was -29% time / -49% mem on (1,0)).
+- S16 f50 gate probe launched with v9 (room20-s16-v9 checkpoint dir).
+- DECISION for Philippe: reinstate pm1 by making verify's observation
+  partition-agnostic (merge same-shape states before comparing - aligned
+  with the #97 batching-invariance certification, grouping must never
+  change results), vs running fruit rooms without pm1. The verifier fix
+  is the principled route; not built at 1am.
+- Still open: split_at entry for the LocalId(200) UNKNOWN_STORE site
+  (3.2k events in the v2 probe - small; f50 probe will size it).
