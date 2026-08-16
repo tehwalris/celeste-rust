@@ -229,7 +229,48 @@ re-deriving a room costs hours. Do them ALL, then re-derive ONCE.
 - [ ] B4 NOTE: `rewrites-room00.jsonl` is a SECOND recipe file and needs the
       same `foreach` re-derivation as the base one. Check it replays.
 
-### C. Room 3 = (2,0)   <- REORDERED after B2's negative result
+### C. Room 3 = (2,0)   <- REORDERED TWICE. Read this first.
+
+**Room (2,0) does not fit, and that was already known and measured.**
+BENCHMARK_DATA.md "Room (2,0) does not fit: the ladder needs a rung below 0
+(2026-08-15)" and plans/room20-plan.md. The pipeline was taken end to end on
+this room, all 17 levels, non-vacuous `g`. The level-0 forward pass runs out
+of RAM around **f075** and the horizon it must reach is **95**:
+
+    f050   5.5M frontier lanes    24M visited    4.7 GB    16.9 s/frame
+    f070  62.9M frontier lanes   570M visited   67.6 GB   347.9 s/frame
+
+and per-frame growth is still 1.09-1.11 at f070.
+
+**Why, measured with CELESTE_XY_DUMP, not guessed.** The room has ~4,500
+reachable whole-pixel positions and the frontier holds 96% of them by f050.
+Everything after that is state AT a position: 115 lanes/position at f040,
+432 at f045, 1,278 at f050, 1,665 at f052. `rem` is already fully widened at
+level 0, so what is left is velocity and the dash/jump machinery.
+
+**This is the same lesson as B2, one level up.** Recipe work, variants and
+chunking change the COST PER LANE. This is the NUMBER of lanes. No amount of
+the work I was about to do would have touched it - which is exactly why C0
+below exists.
+
+The fix named in room20-plan.md is a ladder rung BELOW level 0 that buckets
+`spd.x`/`spd.y` the way `rem` is bucketed, with level 0 banded by it: the
+same refutable over-approximation, the same `--band-dir`/`--band-prev-bits`
+machinery, generalised from one abstracted field to two. `make_state_abstract_rem`
+is mark-driven (`player_rem_xy`), so a `player_spd_xy` rung is mechanically
+similar - the hard part is that `rem` has a known bounded range [-0.5, 0.5)
+and `spd` does not.
+
+Two things already measured that say what NOT to try:
+* pinning `has_dashed`: 5,507,770 -> 5,507,769 lanes at f050. One lane.
+* dropping the fruit-`off` widening: 40.4M lanes at f052 against 7.5M. 5.4x
+  WORSE. The widening stays.
+
+- [ ] C-CENSUS **Which field actually carries the multiplicity?**
+      room20-plan.md says "velocity and the dash/jump machinery" and lists
+      ten fields; it does not say which dominates. Bucketing `spd` is a
+      guess until that is measured. Do this BEFORE building the rung.
+
 
 - [ ] C0 **Get it running and find the bottleneck FIRST.** Bench room (2,0)
       at a few depths with the base recipe, with FUSE=1 (which ladder.sh
