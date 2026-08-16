@@ -253,3 +253,22 @@ shape (relates to #113's foreach re-derivations) and place split_at entries
 for the four sites. The earlier row counts seen for f055-f065 (5.2M/8.0M/
 12.3M) came from a run whose frames this rerun's fresh derivation deleted;
 treat them as unverified until reproduced.
+
+## v6 divergence isolation (2026-08-16 late, in progress)
+
+The agent's scratch recipe /tmp/rewrites-v6.jsonl (base minus 39
+1-object-specialization entries, plus split_call chain h060s + retargeted
+h062 inline + retargeted sp1_facing_x %2168) verifies clean to f38 on
+room (2,0), diverges at f39: candidate 67 states vs baseline 36, SAME
+lane totals (619,516), "structure differs at heap slots [299, 322]" -
+a merge-identity fragmentation, not a value bug. Linear per-entry bisect
+measured impractical (24/852 entries in 40 min) - killed; targeted
+trials instead, one 40-frame differential each:
+- Trial A: v6 minus sp1_facing_x -> STILL DIVERGES (sp1 exonerated).
+- Trial B: v6 minus h060s+h062 (split_call chain) -> RUNNING
+  (/tmp/verify-noChain.log).
+- If B clean: chain guilty, inspect split_call's state partitioning
+  (likely: the split leaves a structurally distinct residue on the
+  non-player_spawn side). If B diverges: the 39 removals are implicated
+  (StateMapping/canonical-structure interaction) - re-add in halves.
+Recipes: /tmp/rewrites-v6*.jsonl. Logs: /tmp/verify-*.log.
