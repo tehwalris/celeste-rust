@@ -304,45 +304,28 @@ impl Div for Pico8Num {
     }
 }
 
-impl Pico8Num {
-    /// `%`, or `None` where this implementation does not model PICO-8's
-    /// semantics: negative or fractional operands, and a non-positive divisor.
-    ///
-    /// Callers interpreting a program must use this rather than `%`. Whether
-    /// the operands are in range depends on the values flowing through the
-    /// program, and `if_convert` deliberately runs arithmetic on lanes that
-    /// would not have reached it, so this is a case the interpreter has to
-    /// report rather than abort on.
-    ///
-    /// PICO-8's `%` is exactly `i32::rem_euclid` on the raw fixed-point
-    /// bits, with `a % 0 == 0`. The result is NEVER negative.
-    ///
-    /// This doc used to say the result "takes the divisor's sign", which is
-    /// what Lua does and what PICO-8 does NOT: the console gives
-    /// `7 % -3 == 1`, where Lua gives -2. Measured across all four sign
-    /// combinations, fractional divisors and zero - 20 of 20 data points
-    /// agree with `rem_euclid`. The old `rhs <= 0` and non-integer guards
-    /// were therefore refusing cases the same line already computed
-    /// correctly.
-    ///
-    /// Still an `Option` because callers interpreting a program must be able
-    /// to handle a case this does not model rather than abort - `if_convert`
-    /// deliberately runs arithmetic on lanes that would not have reached it.
-    /// Nothing currently returns `None`.
-    pub fn checked_rem(self, rhs: Self) -> Option<Self> {
-        if rhs.0 == 0 {
-            return Some(Self(0));
-        }
-        Some(Self(self.0.rem_euclid(rhs.0)))
-    }
-}
 
 impl Rem for Pico8Num {
     type Output = Self;
 
+    /// PICO-8's `%` is exactly `i32::rem_euclid` on the raw fixed-point
+    /// bits, with `a % 0 == 0`. It is TOTAL, and the result is never
+    /// negative.
+    ///
+    /// This used to be a `checked_rem` returning `None` for a non-positive
+    /// or fractional divisor, with the interpreter carrying a lane-wise
+    /// failure path to report those. None of it was needed: the console
+    /// answers every combination, and the single `rem_euclid` line already
+    /// computed those answers while the guards above it threw them away.
+    ///
+    /// Note this is NOT Lua's rule. Lua's result takes the divisor's sign,
+    /// so Lua says `7 % -3 == -2`; the console says 1. Measured across all
+    /// four sign combinations, fractional divisors and zero.
     fn rem(self, rhs: Self) -> Self::Output {
-        self.checked_rem(rhs)
-            .expect("Pico8Num::Rem not implemented for negative/non-positive numbers")
+        if rhs.0 == 0 {
+            return Self(0);
+        }
+        Self(self.0.rem_euclid(rhs.0))
     }
 }
 
@@ -495,31 +478,24 @@ mod tests {
     fn test_checked_rem_is_floored_modulo() {
         let n = Pico8Num::from_i16;
         let eight = n(8);
-        assert_eq!(n(10).checked_rem(eight), Some(n(2)));
-        assert_eq!(n(-2).checked_rem(eight), Some(n(6)));
-        assert_eq!(n(-16).checked_rem(eight), Some(n(0)));
+        assert_eq!(n(10) % eight, n(2));
+        assert_eq!(n(-2) % eight, n(6));
+        assert_eq!(n(-16) % eight, n(0));
         let half = Pico8Num::from_parts(2, 0x8000); // 2.5
-        assert_eq!(half.checked_rem(eight), Some(half));
+        assert_eq!(half % eight, half);
         let neg_half = half.const_neg(); // -2.5
-        assert_eq!(
-            neg_half.checked_rem(eight),
-            Some(Pico8Num::from_parts(5, 0x8000)) // 5.5
-        );
+        assert_eq!(neg_half % eight, Pico8Num::from_parts(5, 0x8000)); // 5.5
         // These three used to assert `None` - "unmodelled". They are not
         // unmodelled; the console answers them, and the single `rem_euclid`
         // line already computed those answers correctly while the guards
         // above it threw them away. Measured on a real PICO-8 0.2.7a6:
-        assert_eq!(n(1).checked_rem(n(0)), Some(n(0)), "1 % 0");
-        assert_eq!(n(0).checked_rem(n(0)), Some(n(0)), "0 % 0");
-        assert_eq!(n(-1).checked_rem(n(0)), Some(n(0)), "-1 % 0");
-        assert_eq!(n(1).checked_rem(n(-8)), Some(n(1)), "1 % -8");
-        assert_eq!(n(1).checked_rem(half), Some(n(1)), "1 % 2.5");
-        assert_eq!(n(7).checked_rem(half), Some(n(2)), "7 % 2.5");
-        assert_eq!(
-            n(-7).checked_rem(half),
-            Some(Pico8Num::from_parts(0, 0x8000)),
-            "-7 % 2.5"
-        );
+        assert_eq!(n(1) % n(0), n(0), "1 % 0");
+        assert_eq!(n(0) % n(0), n(0), "0 % 0");
+        assert_eq!(n(-1) % n(0), n(0), "-1 % 0");
+        assert_eq!(n(1) % n(-8), n(1), "1 % -8");
+        assert_eq!(n(1) % half, n(1), "1 % 2.5");
+        assert_eq!(n(7) % half, n(2), "7 % 2.5");
+        assert_eq!(n(-7) % half, Pico8Num::from_parts(0, 0x8000), "-7 % 2.5");
     }
 
     #[test]

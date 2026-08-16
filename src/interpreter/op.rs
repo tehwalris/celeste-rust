@@ -474,26 +474,12 @@ pub fn interpret_binary_op(l: &Value, op: BinaryOp, r: &Value) -> Result<Value> 
             Ok(Value::Number(MaybeVector::map2(l, r, |l, r| *l / *r)))
         }
         (Value::Number(l), BinaryOp::Percent, Value::Number(r)) => {
-            // Reported rather than panicked: whether the operands are in range
-            // depends on the values flowing through the program.
-            let bad = std::cell::Cell::new(None);
-            let result = MaybeVector::map2(l, r, |l, r| {
-                l.checked_rem(*r).unwrap_or_else(|| {
-                    if bad.get().is_none() {
-                        bad.set(Some((*l, *r)));
-                    }
-                    Pico8Num::from_i16(0)
-                })
-            });
-            match bad.get() {
-                None => Ok(Value::Number(result)),
-                Some((l, r)) => Err(anyhow!(
-                    "unsupported operands for %: {:?} % {:?} (this implementation \
-                     only models a positive integer divisor)",
-                    l,
-                    r
-                )),
-            }
+            // No error path: PICO-8's `%` is total. It was measured to be
+            // `rem_euclid` on the raw 16.16 bits for every sign combination,
+            // fractional divisors included, with `a % 0 == 0`. The lane-wise
+            // failure plumbing that used to be here existed because this was
+            // believed to model only a positive integer divisor.
+            Ok(Value::Number(MaybeVector::map2(l, r, |l, r| *l % *r)))
         }
 
         // Arithmetic operations on intervals
@@ -1267,16 +1253,32 @@ mod select_tests {
         );
     }
 
-    /// `%` is only modelled for a positive integer divisor, and `if_convert`
-    /// deliberately runs arithmetic on lanes that would not have reached it -
-    /// so out of range has to be an error, not a panic. In range it is
-    /// PICO-8's floored modulo: a negative dividend takes the divisor's sign.
+    /// `%` never fails and never panics, for ANY operands.
+    ///
+    /// This test used to assert that a zero divisor is an error, because `%`
+    /// was believed to be modelled only for a positive integer divisor. A
+    /// real console says otherwise: `a % b` is `rem_euclid` on the raw 16.16
+    /// bits for every combination, and `a % 0` is 0. So the case that used
+    /// to be "out of range" is simply an answer.
+    ///
+    /// The property that mattered is stronger now rather than gone.
+    /// `if_convert` deliberately runs arithmetic on lanes that would not have
+    /// reached it, so `%` must not blow up on operands the real program would
+    /// never produce - and now there is no input at all that it rejects.
     #[test]
-    fn modulo_out_of_range_is_an_error_not_a_panic() {
-        let err = interpret_binary_op(&num(-2), BinaryOp::Percent, &num(0)).unwrap_err();
-        assert!(format!("{}", err).contains("unsupported operands"), "{}", err);
-        let ok = interpret_binary_op(&num(-2), BinaryOp::Percent, &num(8)).unwrap();
-        assert_eq!(format!("{:?}", ok), format!("{:?}", num(6)));
+    fn modulo_is_total_and_matches_the_console() {
+        let cases = [(-2, 0, 0), (7, 0, 0), (-2, 8, 6), (7, -3, 1), (-7, 3, 2), (10, 8, 2)];
+        for (a, b, want) in cases {
+            let got = interpret_binary_op(&num(a), BinaryOp::Percent, &num(b))
+                .unwrap_or_else(|e| panic!("{} % {} failed: {}", a, b, e));
+            assert_eq!(
+                format!("{:?}", got),
+                format!("{:?}", num(want)),
+                "{} % {}",
+                a,
+                b
+            );
+        }
     }
 }
 
