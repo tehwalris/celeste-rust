@@ -1,3 +1,113 @@
+# The room (0,0) S2 variant is speed-neutral, and the control says why
+# (2026-08-16)
+
+Task #86 / plan item B2: derive a recipe specialised for room (0,0)'s
+dominant object-array shape S2 = `[fake_wall, player]` and register it as a
+shape variant. The recipe exists, is verified, and **buys 0.0%.** The
+control experiment below says that is not a derivation failure - it is
+where the time in room (1,0)'s extra 232 entries actually sits.
+
+## The headline, room (0,0) f048, idle machine, 3 runs each
+
+`rewrite bench --frames 48`, host `rewrites-room00.jsonl`, variant
+`--variant 'fake_wall,player=rewrites-room00-s2.jsonl'`:
+
+| | wall | lanes | peak RSS | us/lane |
+|---|---|---|---|---|
+| without the variant | 22.09 / 22.00 / 21.92 s | 4,614,581 | 8.18 / 8.17 / 8.16 GB | 4.8 |
+| with the variant | 22.11 / 21.93 / 22.02 s | 4,614,581 | 8.20 / 8.20 / 8.21 GB | 4.8 |
+
+Not "within noise" in the hand-wavy sense - the phases agree too:
+`fwd.interpret` 7.56 s vs 7.59 s, `fwd.merge` 11.49 s vs 11.56 s. And the
+variant is not idle: 2,057 states / 12,741,383 lanes ran under it, which is
+EVERY lane from frame 28 (the spawn) to frame 48. Zero fallbacks.
+
+Worth reading off the same table: at this depth the frame body is 35% of
+wall time and the boundary merge is 53%. Program specialisation is bidding
+for a third of the clock before it starts.
+
+## The control: what the 232 missing entries are actually worth
+
+Room (1,0) can run both recipes, so the gap is directly measurable there.
+f037, 3 runs each, lanes identical (365,029) in all four:
+
+| recipe | entries | wall | peak RSS |
+|---|---|---|---|
+| base `rewrites.jsonl` | 889 | 1.82 / 1.81 / 1.81 s | 0.71 GB |
+| base minus `h068`,`h069` | 887 | 1.74 / 1.76 / 1.79 s | 0.65 GB |
+| base minus the 34 shape entries | 855 | 2.00 / 1.98 / 2.00 s | 0.65 GB |
+| `rewrites-room00.jsonl` | 657 | 2.04 / 2.04 / 2.04 s | 0.64 GB |
+
+So the whole 232-entry gap is **0.23 s, 11.3%** - not the 26% the entry
+count suggested - and **0.19 s of it (83%) is 34 entries**: the 16
+`collapse_loop`s, the 16 `assume_eq`s that follow them, and two
+`unroll_loop`s. The other 198 are worth 0.04 s, at the edge of the noise.
+The two `unroll_loop`s are worth nothing at all on their own (removing them
+is, if anything, faster).
+
+Those 34 are exactly the 34 the S2 screen dropped, and the reason is not
+mechanical. `collapse_loop` collapses a counted loop by asserting
+`bound == init`, a trip count of ONE; room (0,0) has TWO objects, so all 16
+guards fire at frame 29 - loudly, which is the rule working. But the prize
+in room (1,0) was never the collapse (its own commit measured it "small on
+its own"); it is the `assume_eq` that follows, folding `objects[1] == this`
+so that every `check`/`collide` in the room returns nil statically.
+
+**That fold does not exist in room (0,0), at any trip count.** The second
+object is a real `fake_wall` the player collides with - `obj.is_solid`
+checks `fake_wall` on every pixel step and the answer is a genuine bbox
+test, not `nil`. A two-trip collapse rule would remove the loop heads and
+constant-fold the `get_index`; it would not produce the fold, because
+`anonymous_61` is ONE function called for both objects and neither
+iteration's identity is static inside it.
+
+Getting the fold back needs the whole of room00-plan.md step 3: unroll the
+OUTER `foreach(objects, ...)` into two copies, inline `anonymous_61` per
+slot, and only then collapse and `assume_eq` the inner loops per slot. That
+is new rule work (rewrite-plan.md's unimplemented `peel`, plus a per-slot
+inline), not a recipe edit, and it is the only thing on this room's
+critical path that the measurement supports.
+
+## Registering a variant used to cost 3.6x
+
+Found while benchmarking, fixed before measuring anything else. `step_inner`
+refused the chunk-parallel path whenever variants were registered, because
+`dispatch_variant_frame` took `&mut self`. Room (0,0) f040, the host recipe
+registered as a NO-OP variant of itself:
+
+| | wall | us/lane |
+|---|---|---|
+| no variant | 2.13 s | 5.5 |
+| no-op variant, before | 7.59 s | 19.6 |
+| no-op variant, after | 2.13 s | 5.5 |
+| no variant, `CELESTE_FRAME_THREADS=1` | 7.22 s | 18.6 |
+
+The last row is the control: the 3.6x was threading, not dispatch. Dispatch
+itself - the shape probe plus the base -> canonical -> variant -> canonical
+-> base round trip - is 7.59/7.22 = 5%. Dispatch is a pure function of the
+state, so it now lives in `interpret_state_base` behind a shared borrow and
+rides the workers like everything else. `parcheck.sh 45 8000` still passes
+byte-identically.
+
+## A hazard the `--variant` doc comment did not state
+
+"Dispatch is semantically invisible" is true of the row SETS and false of
+the row IDS. Room (0,0) f040 under campaign settings, with and against the
+S2 variant:
+
+* identical: fingerprint, `row_count` 387,443, all 40 per-frame watermarks,
+  `state_count`, `lane_count`, and the per-frame `frontier-only: -> N new
+  lanes, visited total M` line;
+* different: `states.bin`, 319,986 vs 316,684 bytes.
+
+A variant frame emits its raw lanes in a different order and multiplicity
+(fewer duplicates - that is what `if_convert`/`speculate` do), and row ids
+are assigned in insertion order. So `--variant` is SEMANTIC in exactly the
+way the chunk cap is: every stage of a campaign has to carry the same set,
+and because it is deliberately outside the fingerprint, a mismatch is
+silent. Flagged in the flag's doc comment; do not wire it into `ladder.sh`
+stage by stage.
+
 # Room (2,0) does not fit: the ladder needs a rung below 0 (2026-08-15)
 
 Room (2,0) is the first room the campaign cannot afford. Everything else

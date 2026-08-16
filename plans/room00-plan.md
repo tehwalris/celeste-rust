@@ -156,6 +156,31 @@ specialization ("JIT variants"), per Philippe 2026-08-06.
    devirtualization, field promotion for both objects. Reuse the
    mature suggest/screen tooling. Then S1/S3 only if measurement
    says they matter (S3 lanes exist only post-break; possibly rare).
+
+   DONE 2026-08-16 as far as the existing rules reach, and the answer
+   is **0.0%** - `rewrites-room00-s2.jsonl`, 738 entries, 68 of the 102
+   shape candidates screened clean, every lane from f028 dispatched,
+   zero fallbacks, 22.0 s either way at f048. Numbers and the control
+   at the top of BENCHMARK_DATA.md.
+
+   What this step got wrong, and it is worth keeping: "2-slot loop
+   unroll, per-slot devirtualization" was written as if the two were
+   independent. They are not, and the ORDER is the opposite of the one
+   attempted. Devirtualising `type.update` inside `anonymous_61`
+   (`split_call` on the `player` global, `fake_wall.update_37` in the
+   other arm) works fine and is worth nothing, because `anonymous_61`
+   is still ONE function called for both objects - so inside it neither
+   the receiver nor any `objects[i]` has a static identity, and the
+   `assume_eq` fold that made room (1,0) fast (`objects[1] == this`,
+   hence every check nil) has nothing to stand on. The 2-slot unroll
+   has to happen FIRST, in the caller, and `anonymous_61` has to be
+   inlined per slot; only then is each slot's object identity static
+   and the inner collapse + `assume_eq` meaningful. That needs `peel`
+   (rewrite-plan.md section 4, unimplemented) plus a per-slot inline.
+
+   Note also that even done properly this room cannot get room (1,0)'s
+   fold in full: the fake wall is a real solid the player collides
+   with, so slot 2's check against it is a genuine bbox test, not nil.
 4. Re-run the ladder with variants; compare wall clock; witness
    extraction; and answer THE question: does the optimal path break
    the wall?

@@ -87,8 +87,10 @@ re-deriving a room costs hours. Do them ALL, then re-derive ONCE.
       more to bite on; that is the case this measurement does NOT cover.
       p1_127 is separate and not merely owed: `i`/`prev` are genuinely
       multi-store loop-carried cells, which mem2reg-lite cannot promote.
-- [ ] B2 Room (0,0) **per-shape recipes** - task #86, and the "actually JIT"
-      item. Sized, 2026-08-16:
+- [x] B2 Room (0,0) **per-shape recipes** - task #86, and the "actually JIT"
+      item. DONE and **speed-neutral**; the control experiment is the
+      result. Full numbers at the top of BENCHMARK_DATA.md. Sized,
+      2026-08-16:
 
           base recipe (room (1,0)):        889 entries
           rewrites-room00.jsonl:           658 entries  ("shape-agnostic subset")
@@ -109,6 +111,84 @@ re-deriving a room costs hours. Do them ALL, then re-derive ONCE.
       identical with and without variants, so a variant cannot change the
       answer, only the speed. ladder.sh has no `--variant` wiring yet; that
       is part of this task.
+
+      **S2 landed. `rewrites-room00-s2.jsonl`, 738 entries** = the 657 of
+      `rewrites-room00.jsonl`, plus 13 `fake_wall.update_37` entries that
+      room (1,0) never executes and so never screened, plus 68 of the 102
+      shape candidates. Registered with
+
+          --variant 'fake_wall,player=rewrites-room00-s2.jsonl'
+
+      Three things had to happen, in this order:
+
+      1. **Registering a variant used to switch the chunk-parallel path
+         off** (`step_inner` refused it because dispatch owned `&mut self`).
+         Measured on room (0,0) f40: 2.13 s without a variant, 7.59 s with a
+         no-op one - a 3.6x handicap no variant could ever win back. The
+         dispatch is a pure function of the state, so it moved into
+         `interpret_state_base` behind a shared borrow and now runs on the
+         workers like everything else. Same frame at 2.13 s again.
+      2. **A variant could not be screened at all**, because `screen` and
+         `verify` run the recipe as the WHOLE program from frame 1, and
+         room (0,0) spends its first 27 frames in S1 - where an S2 recipe's
+         devirtualisation premise is false. `--variant-of HOST
+         --variant-shapes SHAPES` hosts the trial instead, and compares
+         against the HOST's own trace, which is exactly the claim a variant
+         makes. Two extra rejections that no observation check would catch:
+         a nonzero fallback count, and a variant that never dispatched.
+      3. Only then the derivation. 102 shape candidates screened, 68 kept.
+
+      **The result: 0.0%.** Room (0,0) f048, 3 runs each on an idle
+      machine, 4,614,581 lanes both ways, zero fallbacks, every lane from
+      f028 on dispatched:
+
+          without:  22.09 / 22.00 / 21.92 s   8.18 GB   4.8 us/lane
+          with:     22.11 / 21.93 / 22.02 s   8.20 GB   4.8 us/lane
+
+      `fwd.interpret` 7.56 s vs 7.59 s - the specialised program is
+      exactly as fast as the shape-agnostic one.
+
+      What did NOT survive, and it is the whole story: **all 32
+      `collapse_loop`/`assume_eq` entries**, plus two `unroll_loop`s.
+      `collapse_loop` collapses by asserting `bound == init`, a trip count
+      of ONE; room (0,0) has TWO objects and every one of those guards
+      fires at frame 29.
+
+      The control makes the size of that exact: on room (1,0), which can
+      run both recipes, the whole 232-entry gap is **0.23 s / 11.3% at
+      f037, not 26%** - and **0.19 s of it (83%) is those 34 entries.** The
+      other 198, which include everything the S2 variant did land, are
+      worth 0.04 s between them.
+
+      And a two-trip collapse rule would NOT recover it. Room (1,0)'s prize
+      was never the collapse (its own commit measured it "small on its
+      own") but the `assume_eq` that folds every object-table check to nil,
+      and that fold is FALSE in room (0,0) - the second object is a real
+      `fake_wall` that `obj.is_solid` collides with on every pixel step.
+      Recovering it needs room00-plan.md step 3 in full: unroll the OUTER
+      `foreach(objects, ...)` to two copies, inline `anonymous_61` per
+      slot, and collapse + `assume_eq` per slot, where each iteration's
+      object identity IS static. That is `peel` plus a per-slot inline -
+      new rule work, days, and the measurement above is what should decide
+      whether 11% of a third of the clock is worth it.
+
+      NOT DONE, and worth knowing before wiring the ladder: **the backward
+      sweep cannot use variants.** `sweep_time` builds its own
+      `AbstractRun::start_with_deopt` and never calls `set_variants`, so the
+      replay - which is ~4x the forward cost on the same frame - still runs
+      the shape-agnostic program.
+
+      **Do not wire `--variant` into ladder.sh stage by stage**, and not
+      only because it buys nothing today. "Dispatch is invisible" holds for
+      the row SETS and not for the row IDS: f040 under campaign settings
+      gives an identical fingerprint, row_count, watermarks and lane count
+      with and against the variant, and a `states.bin` that differs
+      (319,986 vs 316,684 bytes), because a variant frame emits its raw
+      lanes in a different order and ids are assigned in insertion order.
+      `--variant` is semantic exactly the way the chunk cap is - same set
+      at every stage or the sweep's `g` misaligns from the forward pass's
+      rows - and it is deliberately outside the fingerprint, so a mismatch
+      would be silent. Now stated in the flag's doc comment.
 - [ ] B3 Room (1,0) recipe complete on the same footing.
 - [ ] B4 NOTE: `rewrites-room00.jsonl` is a SECOND recipe file and needs the
       same `foreach` re-derivation as the base one. Check it replays.
