@@ -291,17 +291,21 @@ Two things already measured that say what NOT to try:
   WORSE. The widening stays.
 
 - [x] C-CENSUS **Which field actually carries the multiplicity?**
-      DONE, and the answer changes the rung. `rewrite field-census` prices
-      every lane-varying field offline from the saved boundary states.
-      At f052: `spd` bucketed to 1 px/frame leaves 20.8% of the rows (4.8x,
-      13.6 frames of headroom against the 20 needed) and erasing `spd`
-      outright - which no executable abstraction can do - leaves 11.3%
-      (8.9x, 18.9 frames). **A `spd`-only rung does not reach.** The whole
-      dash state machine is worth 1.16x. What IS worth as much as `spd` is
-      `p_jump`+`p_dash`, two booleans holding the previous frame's button
-      state for edge detection: 27.2% on their own, and `spd:0` with them is
-      5.9% = 17x = 24.5 frames. Unpriced: the mid-frame `UnknownBool` split
-      a widened `p_jump` causes. Numbers in plans/room20-plan.md.
+      DONE. `rewrite field-census` prices every lane-varying field offline
+      from the saved boundary states, at any frame. **Measure at f070, not
+      f050** - the `spd` rung is 4x stronger at depth and f050 flips the
+      decision. At f070 (62,890,020 rows): `spd` bucketed to 1 px/frame
+      leaves 6.9% = 14.5x = 23.1 frames of headroom against the 20 needed,
+      so **the proposed rung IS the right one, at its coarsest setting
+      only** (1/2 px/frame is 12.9% = 7.8x = 17.7 frames, which does not
+      reach). The dash state machine is 1.14x - the ten-field list was
+      really a two-field list. `p_jump`+`p_dash`, two booleans holding the
+      previous frame's button state for edge detection, are a flat 3.8x on
+      their own and take the rung to 1.9% = 52x = 34 frames; 99.2% of the
+      frontier's rows have their `p_jump`-flipped twin present. Unpriced:
+      the mid-frame `UnknownBool` split a widened `p_jump` causes, and the
+      interval widening a bucketed `spd` causes. Numbers in
+      plans/room20-plan.md.
 
 
 - [ ] C0 **Get it running and find the bottleneck FIRST.** Bench room (2,0)

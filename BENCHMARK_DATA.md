@@ -140,10 +140,14 @@ recorded inside it. Per-frame growth is still 1.09-1.11 at f070 and 570M
 visited rows is already 1.4x room (0,0)'s ENTIRE campaign - which peaked at
 12.1M frontier lanes at f079 and finished in 405M rows.
 
-**Where it goes is measured, not guessed** (`CELESTE_XY_DUMP`): the room has
-about 4,500 reachable whole-pixel positions, the frontier has 96% of them by
-f050, and from there every doubling is state AT a position - 115 lanes per
-position at f040, 432 at f045, 1,278 at f050, 1,665 at f052. With `rem`
+**Where it goes is measured, not guessed** (`CELESTE_XY_DUMP`, extended to
+f070 by `rewrite field-census`, which reproduces its f050/f052 counts
+exactly): the frontier occupies 4,309 whole-pixel positions at f050 and
+7,590 at f070, at 1,278 and 8,286 lanes per position. So the position set is
+NOT saturated - the earlier "~4,500, 96% by f050" reading was an
+extrapolation from f040..f052 and is wrong - but the two terms grow at very
+different rates (positions 1.76x from f050 to f070, lanes per position
+6.5x), so the growth is still overwhelmingly state AT a position. With `rem`
 already fully widened at level 0, that is the velocity and dash machinery.
 No amount of specialization, chunking or recipe work touches it: those
 change the cost per lane, and this is the number of lanes. The ladder
@@ -152,28 +156,36 @@ every other coordinate; a wide-open room wants a rung BELOW 0 that buckets
 some other field the same way, with level 0 banded by it.
 
 **Which field, priced** (`rewrite field-census`, 2026-08-16 - offline from
-the saved boundary states, 12 s and 1.4 GB at f052, so it costs no search
-time). Rows surviving if a field is collapsed, over 5,507,770 rows at f050 /
-7,495,512 at f052:
+the saved boundary states, 12 s / 1.4 GB at f052 and ~25 min / 11 GB at
+f070, so it costs no search time and cannot contaminate a benchmark).
+Rows surviving if a field is collapsed, out of 5,507,770 at f050 and
+62,890,020 at f070 - both reproduced exactly by the tool:
 
-| collapsed | f050 | f052 |
+| collapsed | f050 | **f070** |
 |---|---|---|
-| `spd.x`+`spd.y` bucketed to 1 px/frame - the buildable rung | 27.2% | 20.8% |
-| `spd.x`+`spd.y` ERASED - the unbuildable upper bound | 16.9% | 11.3% |
-| `p_jump`+`p_dash` erased (two booleans) | 27.6% | 27.2% |
-| whole dash state machine (`dash_time`, `dash_target.*`, `dash_accel.*`, `dash_effect_time`) | 86.2% | 85.9% |
-| `spd:0` + `p_jump` + `p_dash` | 8.0% | 5.9% |
+| `spd.x`+`spd.y` bucketed to 1 px/frame - the buildable rung | 27.2% | **6.9%** |
+| `spd.x`+`spd.y` bucketed to 1/2 px/frame | 39.4% | 12.9% |
+| `spd.x`+`spd.y` ERASED - the unbuildable upper bound | 16.9% | 3.5% |
+| `p_jump`+`p_dash` erased (two booleans) | 27.6% | 26.3% |
+| whole dash state machine (`dash_time`, `dash_target.*`, `dash_accel.*`, `dash_effect_time`) | 86.2% | 88.0% |
+| `spd:0` + `p_jump` + `p_dash` | 8.0% | **1.9%** |
 
-The frontier grows 1.123x per frame at f066..f073, so a factor F is
-`ln F / ln 1.123` frames, and the wall is 20 frames short of the horizon.
-**A `spd` rung alone does not reach**: 4.8x = 13.6 frames buildable, 8.9x =
-18.9 frames even erased outright. `p_jump`/`p_dash` - the previous frame's
-button state, kept only for edge detection - are each worth as much as
-`spd.y`, and `spd:0` plus those two booleans is 17x = 24.5 frames. The dash
-state machine proper is worth 1.16x and is not where to look. Per-field
-counts conditioned on a position do NOT multiply out: their product is
-~85,000x the actual row count there, so nothing but the joint measurement
-predicts a rung. Full table and caveats in plans/room20-plan.md.
+**Read this at f070, not at f050.** The `spd` rung's value grows steeply
+with depth - `spd.x` goes from 187 distinct values to 3,460 - and a census
+taken at f050 understates it by 4x and flips the decision. The frontier
+grows 1.1228x per frame over f066..f073, so a factor F is
+`ln F / ln 1.1228` frames and the wall is 20 frames short of the horizon:
+the buildable `spd:0` rung is **14.5x = 23.1 frames**, which clears it;
+`spd:1` is 7.8x = 17.7 frames, which does not. So the rung is the right one
+but only at its coarsest setting, and the margin is thin enough to want
+`p_jump`/`p_dash` (the previous frame's button state, kept for edge
+detection) with it - 52x = 34 frames together, for two booleans that need no
+bucketing machinery at all. The dash state machine proper is 1.14x and is
+not where to look; nor is `djump`, `grace` or `flip.x`. Per-field counts
+conditioned on a position do NOT multiply out - at f070 their product is
+15,000x the actual row count at the median position - so nothing but the
+joint measurement predicts a rung. Full tables and caveats in
+plans/room20-plan.md.
 
 Standing result for the room: the optimum is **at most 95 frames**
 (`tas/room_2_0_exit_frame_95.txt`, derived from the community TAS and

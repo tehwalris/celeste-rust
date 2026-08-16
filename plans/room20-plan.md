@@ -210,13 +210,23 @@ The `CELESTE_XY_DUMP` census says exactly where it goes:
 | 45 | 3,483 | 1,503,502 | 432 |
 | 50 | 4,309 | 5,507,767 | 1,278 |
 | 52 | 4,503 | 7,495,508 | 1,665 |
+| 70 | 7,590 | 62,890,009 | 8,286 |
 
-**The geometry has saturated** - the room only has about 4,500 reachable
-whole-pixel positions and the frontier reached 96% of them by f050 - and
-every remaining doubling is state AT a position. At level 0 `rem` is already
-fully widened, so what is left is the velocity and the dash/jump machinery:
-`spd.x`, `spd.y` (full 16.16 fixed point), `dash_time`, `dash_target`,
-`dash_accel`, `dash_effect_time`, `djump`, `grace`, `p_jump`, `p_dash`.
+The f070 row is from `rewrite field-census` (below), which reproduces this
+dump's f050 and f052 position counts exactly, and it **corrects the
+"saturated at ~4,500 positions" reading**: the frontier had not saturated by
+f052, it kept spreading to 7,590 positions (7,389 of them inside the room's
+128x128, the rest a room-transition x of -4). What the four early rows made
+look like saturation was the first derivative flattening, not the set
+closing.
+
+The conclusion survives the correction, because the two terms move at very
+different rates: from f050 to f070 the positions grow 1.76x and the lanes
+per position grow 6.5x. **The multiplicity is state AT a position**, and it
+is what all the growth is. At level 0 `rem` is already fully widened, so
+what is left is the velocity and the dash/jump machinery: `spd.x`, `spd.y`
+(full 16.16 fixed point), `dash_time`, `dash_target`, `dash_accel`,
+`dash_effect_time`, `djump`, `grace`, `p_jump`, `p_dash`.
 
 That is a statement about the LADDER, not about this room's implementation:
 the refinement ladder refines exactly one thing, `player.rem`, and its
@@ -233,7 +243,7 @@ per lane, and the problem is the number of lanes.
 WHICH field is measured in the next section, and the ten-field list above
 turns out to be badly unbalanced.
 
-## Which field carries the multiplicity: measured, and `spd` is not enough
+## Which field carries the multiplicity: measured, and it IS `spd` - at depth
 
 `rewrite field-census` (`src/interpreter/field_census.rs`) reads one frame's
 saved boundary states and asks, per lane-varying field: how many rows survive
@@ -243,42 +253,64 @@ any rung abstracting it could merge. `field:n` instead buckets it to `2^-n`,
 the same `div_euclid(width) * width` the `rem` ladder applies (asserted in
 the module's tests), which is what a rung would really do. Offline from
 `~/celeste-checkpoints/room20/frames/`, 12 s and 1.4 GB at f052 - no search
-time, so it cannot contaminate a benchmark.
+time, so it cannot contaminate a benchmark. f070, at 62.9M rows, costs
+~25 min and 11 GB.
 
-The frontier at these frames has 17-20 lane-varying fields in total; `rem`
-is not one of them (already fully widened) and neither is anything on the
-fruit or the object array except the springs' `delay`/`spr`.
+The frontier has 15-19 lane-varying fields per object-array shape (20 across
+all shapes at f050, 23 at f070, where more shapes exist). `rem` is not one
+of them - already fully widened - and neither is anything on the fruit or
+the object array except the springs' `delay`/`spr`.
 
-Single fields erased, as a fraction of the rows before (f050, 5,507,770
-rows, all distinct - the census reproduces the lane count exactly):
+**Measure at DEPTH.** The frames are not interchangeable and the difference
+is not small: the same collapse of `spd` leaves 16.9% of the rows at f050
+and 3.5% at f070, because `spd.x` alone goes from 187 distinct values to
+3,460. A census taken only at f050 understates the `spd` rung by 4x and
+leads to the opposite decision. f070 (62,890,020 rows, the deepest saved
+frame before the wall) is the one to read.
 
-| field | distinct values | f045 | f050 | f052 |
-|---|---|---|---|---|
-| `player.x` | 82 | 18.6% | 17.2% | 17.3% |
-| `player.y` | 92 | 15.9% | 17.0% | 17.6% |
-| `player.spd.x` | 187 | 39.0% | 32.0% | 27.4% |
-| `player.spd.y` | 138 | 65.5% | 57.8% | 55.5% |
-| `player.p_jump` | 2 | 50.7% | 50.6% | 50.5% |
-| `player.p_dash` | 2 | 59.0% | 54.6% | 53.8% |
-| `player.flip.x` | 2 | 92.4% | 94.5% | 96.1% |
-| `player.grace` | 7 | 98.9% | 96.7% | 96.7% |
-| `player.dash_effect_time` | 11 | 99.1% | 99.3% | 99.4% |
-| `player.dash_target.x/.y` | 3 | 100.0% | 99.4% | 99.2% |
-| `player.dash_time` | 5 | 100.0% | 100.0% | 100.0% |
-| `player.dash_accel.x/.y` | 3 | 100.0% | 100.0% | 100.0% |
-| `player.djump` | 2 | 99.7% | 99.7% | 99.5% |
+Single fields erased, as a fraction of the rows before. Every frame's
+`rows_before` reproduces the published frontier lane count exactly:
 
-**Two booleans - the previous frame's jump and dash button, kept only for
-edge detection (`jump = btn(k_jump) and not this.p_jump`) - are each worth
-about as much as `spd.y`, and together as much as the whole velocity
-vector.** The dash state machine proper is worth essentially nothing.
+| field | values at f070 | f045 | f050 | f052 | **f070** |
+|---|---|---|---|---|---|
+| `player.spd.x` | 3,460 | 39.0% | 32.0% | 27.4% | **13.4%** |
+| `player.x` | 129 | 18.6% | 17.2% | 17.3% | **13.6%** |
+| `player.y` | 116 | 15.9% | 17.0% | 17.6% | **16.0%** |
+| `player.spd.y` | 165 | 65.5% | 57.8% | 55.5% | **45.2%** |
+| `player.p_jump` | 2 | 50.7% | 50.6% | 50.5% | **50.4%** |
+| `player.p_dash` | 2 | 59.0% | 54.6% | 53.8% | **52.1%** |
+| `player.grace` | 7 | 98.9% | 96.7% | 96.7% | **97.5%** |
+| `player.dash_target.y` | 3 | 100.0% | 99.5% | 99.4% | **98.0%** |
+| `player.flip.x` | 2 | 92.4% | 94.5% | 96.1% | **98.9%** |
+| `player.djump` | 2 | 99.7% | 99.7% | 99.5% | **99.8%** |
+| `player.dash_effect_time` | 11 | 99.1% | 99.3% | 99.4% | **99.9%** |
+| `player.dash_target.x` | 3 | 100.0% | 99.4% | 99.1% | **99.8%** |
+| `player.dash_time` | 5 | 100.0% | 100.0% | 100.0% | **100.0%** |
+| `player.dash_accel.x/.y` | 3 | 100.0% | 100.0% | 100.0% | **100.0%** |
+| springs' `delay`/`spr`, `freeze`, `has_dashed`, `delay_restart` | | ~100% | ~100% | ~100% | **~100%** |
 
-Read the boolean numbers as a pairing rate: erasing a boolean cannot leave
-less than 50% of the rows, and `p_jump` leaves 50.6% - so **98.8% of the
-frontier's rows at f050 have their `p_jump`-flipped twin in the frontier
-too**, and 90.8% have their `p_dash` twin. The frontier is carrying two (and
-mostly four) copies of nearly every game state that differ only in which
-buttons were held on the frame that produced them.
+Three things fall out of that table:
+
+* **`spd.x` overtakes position.** At f070 erasing it leaves fewer rows than
+  erasing the player's whole `x` coordinate, and its distinct-value count
+  passes `x`'s by 27x (3,460 against 129). Position spreads over a bounded
+  room; velocity does not.
+* **The dash state machine is worth nothing.** `dash_time`,
+  `dash_target.*`, `dash_accel.*` and `dash_effect_time` are 98-100%
+  individually and 88.0% together at f070 - 1.14x for six fields. Neither
+  are `djump`, `grace`, `flip.x` or anything on the springs. Of the ten
+  non-`spd` fields this plan used to list, EIGHT are worth 1.19x between
+  them.
+* **Two booleans are worth 3.8x.** `p_jump`/`p_dash` are the previous
+  frame's jump and dash button, kept only for edge detection
+  (`jump = btn(k_jump) and not this.p_jump`). Read them as a pairing rate:
+  erasing a boolean cannot leave less than 50% of the rows, and `p_jump`
+  leaves 50.4% at f070 - so **99.2% of the frontier's rows have their
+  `p_jump`-flipped twin in the frontier too**, and 95.8% have their `p_dash`
+  twin. The frontier carries two (mostly four) copies of nearly every game
+  state, differing only in which buttons were held on the frame that
+  produced it. Unlike `spd`, this one is FLAT with depth (30.0% at f045,
+  26.3% at f070), so it is a constant ~3.8x rather than a growing one.
 
 That `p_jump`/`p_dash` are where the input history survives is consistent
 with the rest of the model rather than a surprise: `__button_states` does
@@ -291,87 +323,109 @@ was pressed keeps distinguishing rows forever.
 
 Sets collapsed together, which is what a rung does:
 
-| collapsed | f045 | f050 | f052 |
-|---|---|---|---|
-| `spd.x`+`spd.y` erased | 25.3% | 16.9% | 11.3% |
-| `spd.x`+`spd.y` bucketed to 1 px/frame (`:0`) | 37.9% | 27.2% | 20.8% |
-| ... to 1/2 px/frame (`:1`) | 50.4% | 39.4% | 33.9% |
-| ... to 1/4 px/frame (`:2`) | 69.8% | 61.1% | 57.5% |
-| `p_jump`+`p_dash` erased | 30.0% | 27.6% | 27.2% |
-| `dash_time`+`dash_target.*`+`dash_accel.*`+`dash_effect_time` | 89.9% | 86.2% | 85.9% |
-| all ten non-`spd` fields of the list above | 26.6% | 22.4% | 21.8% |
-| `spd` erased + `p_jump` + `p_dash` | 8.6% | 5.1% | 3.3% |
-| `spd:0` + `p_jump` + `p_dash` | 12.3% | 8.0% | 5.9% |
-| `spd:0` + `p_jump` + `p_dash` + `grace` + `dash_effect_time` | 11.3% | 7.0% | 5.2% |
-| all twelve erased | 1.8% | 0.8% | 0.6% |
-
-The eight non-`spd`, non-button fields of the list are worth 1.23x between
-them (22.4% against `p_jump`+`p_dash`'s 27.6%). The plan's ten-field list
-is really a two-field list.
+| collapsed | f045 | f050 | f052 | **f070** |
+|---|---|---|---|---|
+| `spd.x`+`spd.y` erased | 25.3% | 16.9% | 11.3% | **3.5%** |
+| `spd.x`+`spd.y` bucketed to 1 px/frame (`:0`) | 37.9% | 27.2% | 20.8% | **6.9%** |
+| ... to 1/2 px/frame (`:1`) | 50.4% | 39.4% | 33.9% | **12.9%** |
+| ... to 1/4 px/frame (`:2`) | 69.8% | 61.1% | 57.5% | - |
+| `p_jump`+`p_dash` erased | 30.0% | 27.6% | 27.2% | **26.3%** |
+| `dash_time`+`dash_target.*`+`dash_accel.*`+`dash_effect_time` | 89.9% | 86.2% | 85.9% | **88.0%** |
+| all ten non-`spd` fields of the old list | 26.6% | 22.4% | 21.8% | - |
+| `spd:0` + `p_jump` + `p_dash` | 12.3% | 8.0% | 5.9% | **1.9%** |
+| `spd` erased + `p_jump` + `p_dash` | 8.6% | 5.1% | 3.3% | **1.0%** |
+| all twelve erased | 1.8% | 0.8% | 0.6% | **0.2%** |
 
 ### What that buys in frames
 
-The frontier grows by a factor of 1.123 per frame over f066..f073
+The frontier grows by a factor of 1.1228 per frame over f066..f073
 (watermark deltas of the f073 checkpoint), so a merge factor F is
-`ln F / ln 1.123` frames of headroom, and the wall (~f075) is 20 frames
-short of the horizon (95):
+`ln F / ln 1.1228` frames of headroom, and the wall (~f075) is 20 frames
+short of the horizon (95). At f070:
 
-| rung | factor at f052 | frames |
-|---|---|---|
-| `spd` bucketed at 1 px/frame | 4.8x | 13.6 |
-| `spd` erased (unbuildable upper bound) | 8.9x | 18.9 |
-| `p_jump`+`p_dash` erased | 3.7x | 11.3 |
-| `spd:0` + `p_jump` + `p_dash` | 17.0x | 24.5 |
-| `spd` erased + `p_jump` + `p_dash` | 30.4x | 29.5 |
+| rung | factor at f070 | frames | (same rung at f050) |
+|---|---|---|---|
+| `spd` bucketed at 1 px/frame - the buildable rung | **14.5x** | **23.1** | 3.7x, 11.2 |
+| `spd` bucketed at 1/2 px/frame | 7.8x | 17.7 | 2.5x, 8.0 |
+| `spd` erased (unbuildable upper bound) | 29.0x | 29.1 | 5.9x, 15.4 |
+| `p_jump`+`p_dash` erased | 3.8x | 11.5 | 3.6x, 11.1 |
+| `spd:0` + `p_jump` + `p_dash` | 52.1x | 34.2 | 12.6x, 21.9 |
+| all twelve erased | 606x | 55.3 | 119x, 41.3 |
 
-**A `spd.x`/`spd.y` rung on its own does not reach.** Even erasing both
-outright - which no executable abstraction can do, since `spd` drives the
-motion - is 19 frames, and the buildable version of it is 14. Add the two
-button-history booleans and there is real margin.
+**The `spd.x`/`spd.y` rung this plan proposed is the right rung, and the
+coarsest useful version of it - one whole pixel per frame, zero fraction
+bits, the same rung shape `CELESTE_REM_BITS=0` already is for `rem` - clears
+the 20-frame gap with 3 frames to spare.** Half-pixel buckets do not (17.7).
+So the rung must be built at its COARSEST setting to be worth building, and
+the margin at that setting is thin enough that `p_jump`/`p_dash` should be
+taken with it: together they are 52x, or 34 frames, which is margin rather
+than a coin flip.
 
-The one honest caveat: these are counts of surviving BOUNDARY ROWS. A
-widened `p_jump` makes `btn(k_jump) and not this.p_jump` an `UnknownBool`
-and splits the state mid-frame, and a bucketed `spd` becomes an interval
-that widens everything downstream of it; neither cost is priced here. That
-is the same shape of unknown the `rem` ladder already carries, and the same
-control applies - build the rung, measure the lanes, keep it only if the
-boundary win survives the mid-frame loss.
+Two honest caveats, in order of size:
+
+1. These are counts of surviving BOUNDARY ROWS. A bucketed `spd` becomes an
+   interval that widens everything downstream of it, and a widened `p_jump`
+   makes `btn(k_jump) and not this.p_jump` an `UnknownBool` that splits the
+   state mid-frame. Neither cost is priced here. It is the same shape of
+   unknown the `rem` ladder already carries, and the same control applies:
+   build the rung, measure the lanes, keep it only if the boundary win
+   survives the mid-frame loss. Room (2,0)'s own history says this is not a
+   formality - dropping the fruit-`off` widening looked like a pure win on
+   the same kind of reasoning and came out 5.4x WORSE, for exactly this
+   reason.
+2. The 20-frame gap is measured against a straight-line extrapolation of the
+   f075 wall. The growth ratio is itself decaying (1.29/frame at f045-f050,
+   1.12 at f070), so both the gap and the headroom are soft.
 
 ### The fields are massively correlated, so per-field counts do not multiply
 
-Conditioned on a whole-pixel position, at f050 (4,309 occupied positions,
-1,062 lanes at the median one, 7,475 at the worst):
+Distinct values the field takes among the lanes sharing one position -
+median and p90 OVER positions, and the value at the most crowded position.
+f050 has 4,309 positions (median 1,062 lanes, worst 7,475 at (50, 86)); f070
+has 7,590 (median 4,914, worst 77,691 at (48, 88)):
 
-| field | distinct values at the median position | p90 | worst position |
-|---|---|---|---|
-| `spd.x` | 43 | 87 | 139 |
-| `spd.y` | 28 | 43 | 42 |
-| `dash_effect_time` | 8 | 11 | 9 |
-| `dash_time` | 5 | 5 | 5 |
-| `grace` | 2 | 5 | 6 |
-| `dash_target.x/.y`, `dash_accel.x/.y` | 3 | 3 | 3 |
-| `djump`, `p_jump`, `p_dash`, `flip.x` | 2 | 2 | 2 |
-| `objects.2.delay` (a spring's hide timer) | 3 | 8 | 7 |
+| field | f050 median | f050 p90 | f050 worst | **f070 median** | **f070 p90** | **f070 max** |
+|---|---|---|---|---|---|---|
+| `spd.x` | 43 | 87 | 139 | **117** | **845** | **2,595** |
+| `spd.y` | 28 | 43 | 42 | **34** | **51** | **79** |
+| `dash_effect_time` | 8 | 11 | 9 | 7 | 10 | 11 |
+| `dash_time` | 5 | 5 | 5 | 3 | 5 | 5 |
+| `grace` | 2 | 5 | 6 | 1 | 4 | 6 |
+| `dash_target.x/.y`, `dash_accel.x/.y` | 3 | 3 | 3 | 3 | 3 | 3 |
+| `djump`, `p_jump`, `p_dash`, `flip.x` | 2 | 2 | 2 | 2 | 2 | 2 |
+| a spring's `delay` | 3 | 8 | 7 | 2 | 5 | 11 |
 
-The PRODUCT of those twelve counts is 9.0e7 at the median position against
-1,062 actual rows - a factor of 85,000. The reachable state at a position is
-a thin sliver of the product space, and `spd.x` x `spd.y` alone is 5.9x
-correlated (median product 1,196, median joint 195). Two consequences:
+Only `spd.x` moves. Everything else is a handful of values at a position at
+BOTH depths - which is the same story the erasure table tells, from the
+other side.
+
+The PRODUCT of the twelve candidate fields' counts is 1.8e7 at f070's median
+position against 4,824 actual rows - a factor of 15,000, and 205,000 at the
+worst position (1.6e10 against 77,691). The reachable state at a position is
+a thin sliver of the product space, and `spd.x` x `spd.y` alone is 5.8x
+correlated at both depths (f070 median product 4,454, median joint 854).
+Three consequences:
 
 * per-field distinct counts are useless for predicting a rung's value; only
-  the joint measurement above means anything;
+  the joint measurements above mean anything. This is the trap the whole
+  census exists to avoid;
 * the multiplicity is not concentrated in one field to be knocked out. After
-  fixing position AND the exact `(spd.x, spd.y)` pair there are still 5.3
-  distinct states at the median position, and 41.9 after fixing position and
-  the 1-px/frame `spd` bucket.
+  fixing position AND the exact `(spd.x, spd.y)` pair there are still 4.9
+  distinct states at f070's median position (5.3 at f050) - so `spd` and
+  position TOGETHER explain all but a factor of 5;
+* `spd.x`'s per-position spread is heavily skewed - median 117, p90 845, max
+  2,595 - so a `spd` rung's value is concentrated in a minority of
+  positions. That is an argument for a rung, not against one, but it means a
+  per-position bucket count would be a poor summary of it.
 
 Reproduce with:
 
-    ./target/release/rewrite --recipe rewrites-room00.jsonl field-census \
-        --checkpoint-dir ~/celeste-checkpoints/room20 --frame 50 \
+    ./safe-run.sh --memory 60G -- ./target/release/rewrite \
+        --recipe rewrites-room00.jsonl field-census \
+        --checkpoint-dir ~/celeste-checkpoints/room20 --frame 70 \
         --collapse player.spd.x,player.spd.y \
         --collapse player.spd.x:0,player.spd.y:0,player.p_jump,player.p_dash \
-        --out /tmp/fc050.csv
+        --out /tmp/fc070.csv
 
 Two self-checks the tool passes and which are worth repeating after any
 change to it: `rows_before` equals the frontier lane count exactly (a
