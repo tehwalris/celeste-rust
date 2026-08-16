@@ -99,6 +99,41 @@ applies the previous level's full composite widening).
    rung width and the go/no-go for the full campaign. Numbers go to
    Philippe with the bucket-scheme decision BEFORE the campaign.
 
+## Status 2026-08-16 evening
+
+Machinery LANDED (2d9bae2): composite precision, widening, N-way
+splitter (refactor gated byte-identical on room1 f001-f030), band
+plumbing, fingerprint, interval min/max/abs (the first builtins widened
+spd reaches that rem never did).
+
+**The crossover is REAL and measured** (room1, w=16 vs exact):
+
+| frame | exact rows | spd-16 rows | ratio |
+|---|---|---|---|
+| f30 | 27,047 | 75,237 | 2.78x WORSE |
+| f40 | 902,303 | 1,974,666 | 2.19x worse |
+| f50 | 8,033,952 | 4,940,489 | **1.63x BETTER** |
+
+Position-forking from interval flr costs immediately; the dedup
+collapse overtakes it between f40 and f50 and widens with depth -
+consistent with the census's 14.5x at room (2,0) f070 depth.
+
+**Blocker found at f56 (room1, w=16)**: `player.spd` carries a literal
+UnknownBool at a boundary - a select whose condition went unknown
+(tri-state comparisons against the widened spd intervals) stored an
+undecided value into spd on some lane; the widen panics (correctly -
+that value cannot be soundly bucketed), the deopt catches the panic,
+and the PLAIN program then also chokes (`UnknownBool < Number` in
+player.update if_body_56 - the plain path has no select machinery at
+all). NEXT STEP: find the producing select site(s) in the rewritten
+program and apply the existing select-split/expand recipe treatment
+(task #96's playbook - it eliminated exactly this class for the btn and
+dash sites). Start from the f55 checkpoint in /tmp/spd-depth (fingerprint
+needs CELESTE_SPD_WIDTH_LOG2=16 env) and instrument which select stores
+into player_spd cells with an UnknownBool result. The select-splits
+counter was firing (36k/frame at f55), so the machinery exists - the
+new sites are just not in the recipe yet.
+
 ## Open questions (carry to the probe, not decided by reasoning)
 
 * Bottom rung width: 1 px predicted 14.5x; 2 px if growth still wins.
