@@ -298,6 +298,11 @@ pub struct AbstractRun {
     /// and output positions and injects nothing, so a recorded run takes
     /// exactly the same path as an unrecorded one.
     pos_obs: Option<super::pos_graph::PosObserver>,
+    /// Suppress the per-frame deopt/variant reporting. For the screening
+    /// runs, whose stdout is a JSONL stream of accepted entries and has to
+    /// stay pipeable; a hundred trials' telemetry in the middle of it is
+    /// not telemetry, it is corruption. The counters are still tallied.
+    quiet: bool,
 }
 
 /// The previous precision level's result, used to confine this level's
@@ -628,7 +633,18 @@ enum VariantOutcome {
 /// Run one state's frame under `variant`, through the canonical form both
 /// ways. Any error or panic falls back to the base path with a loud print;
 /// the snapshot clone is what makes that fallback possible.
-fn dispatch_variant_frame(vd: &mut VariantDispatch, state: State) -> VariantOutcome {
+///
+/// Takes the registry by shared reference and tallies into the caller's
+/// per-call counters, so a worker thread can run it. Dispatch is a pure
+/// function of the state (its object-array shape picks the program), which
+/// is why nothing here has to be sequenced; registering a variant used to
+/// disable the chunk-parallel path outright, and that cost 3.6x on room
+/// (0,0) - far more than any variant could win back.
+fn dispatch_variant_frame(
+    vd: &VariantDispatch,
+    state: State,
+    counters: &mut FrameEventCounters,
+) -> VariantOutcome {
     let shape = match crate::interpreter::abstraction::object_shape(&state) {
         Ok(shape) => shape,
         Err(err) => {
@@ -654,8 +670,8 @@ fn dispatch_variant_frame(vd: &mut VariantDispatch, state: State) -> VariantOutc
     }));
     match attempt {
         Ok(Ok(outputs)) => {
-            vd.total_events.0 += 1;
-            vd.total_events.1 += lanes;
+            counters.variant.0 += 1;
+            counters.variant.1 += lanes;
             VariantOutcome::Ran(outputs)
         }
         Ok(Err(err)) => {
@@ -666,7 +682,7 @@ fn dispatch_variant_frame(vd: &mut VariantDispatch, state: State) -> VariantOutc
                 vd.variants[idx].label,
                 one_line.chars().take(200).collect::<String>()
             );
-            vd.total_fallbacks += 1;
+            counters.variant_fallbacks += 1;
             VariantOutcome::Base(snapshot)
         }
         Err(panic) => {
@@ -675,7 +691,7 @@ fn dispatch_variant_frame(vd: &mut VariantDispatch, state: State) -> VariantOutc
                 vd.variants[idx].label,
                 panic_text(&panic).chars().take(200).collect::<String>()
             );
-            vd.total_fallbacks += 1;
+            counters.variant_fallbacks += 1;
             VariantOutcome::Base(snapshot)
         }
     }
@@ -716,6 +732,9 @@ struct FrameEventCounters {
     deopt: (usize, usize),
     /// (states, lanes) that ran under shape variants.
     variant: (usize, usize),
+    /// States whose variant frame failed and took the base path instead.
+    /// See `VariantDispatch::total_fallbacks`: anything nonzero is a bug.
+    variant_fallbacks: usize,
 }
 
 impl FrameEventCounters {
@@ -724,6 +743,7 @@ impl FrameEventCounters {
         self.deopt.1 += other.deopt.1;
         self.variant.0 += other.variant.0;
         self.variant.1 += other.variant.1;
+        self.variant_fallbacks += other.variant_fallbacks;
     }
 }
 
@@ -902,6 +922,7 @@ impl AbstractRun {
             variants: None,
             band: None,
             pos_obs: None,
+            quiet: false,
         })
     }
 
@@ -968,12 +989,6 @@ impl AbstractRun {
         base_mapping: super::state_mapping::StateMapping,
         variants: Vec<Variant>,
     ) {
-        for v in &variants {
-            println!(
-                "variant {} registered for shapes {:?}",
-                v.label, v.shapes
-            );
-        }
         self.variants = Some(VariantDispatch {
             base_mapping,
             variants,
@@ -1139,11 +1154,9 @@ impl AbstractRun {
         // element-wise equal to the unfused one's.
         let frame_no = self.states_before_merge.len() as u32 + 1;
         let input_states = chunk_states(std::mem::take(&mut self.states));
-        // Chunk-parallel path: only for streaming frontier runs, and only
-        // when no shape variants are registered (variant dispatch owns
-        // `&mut self`). Everything else keeps the serial loop below - one
-        // code path per arrangement, and the parallel one is opt-in.
-        if frame_threads() > 1 && self.variants.is_none() {
+        // Chunk-parallel path. Everything else keeps the serial loop below -
+        // one code path per arrangement, and the parallel one is opt-in.
+        if frame_threads() > 1 {
             return if stream {
                 self.step_parallel(input_states, frame_no)
             } else {
@@ -1157,7 +1170,15 @@ impl AbstractRun {
         for state in input_states {
             let outputs = {
                 let _t = ScopedPhase::new("fwd.interpret");
-                self.interpret_state(state, &mut counters)?
+                interpret_state_base(
+                    self.variants.as_ref(),
+                    self.deopt.as_ref(),
+                    &self.frame_cfg,
+                    &self.fixed_env,
+                    state,
+                    &mut counters,
+                    self.pos_obs.as_ref(),
+                )?
             };
             if stream {
                 // Drain this input state's outputs through the boundary
@@ -1215,6 +1236,7 @@ impl AbstractRun {
         let mut counters = FrameEventCounters::default();
         let mut stream_counters = StreamCounters::default();
         let mut stream_survivors: Vec<State> = Vec::new();
+        let variants = self.variants.as_ref();
         let deopt = self.deopt.as_ref();
         let frame_cfg = &self.frame_cfg;
         let fixed_env = &self.fixed_env;
@@ -1249,7 +1271,8 @@ impl AbstractRun {
                                 let mut ev = FrameEventCounters::default();
                                 let mut sc = StreamCounters::default();
                                 let outputs = interpret_state_base(
-                                    deopt, frame_cfg, fixed_env, state, &mut ev, pos_obs,
+                                    variants, deopt, frame_cfg, fixed_env, state, &mut ev,
+                                    pos_obs,
                                 )?;
                                 let mut prepared = Vec::new();
                                 for out in outputs {
@@ -1353,6 +1376,7 @@ impl AbstractRun {
         let threads = frame_threads();
         let mut counters = FrameEventCounters::default();
         let mut new_states: Vec<State> = Vec::new();
+        let variants = self.variants.as_ref();
         let deopt = self.deopt.as_ref();
         let frame_cfg = &self.frame_cfg;
         let fixed_env = &self.fixed_env;
@@ -1379,7 +1403,8 @@ impl AbstractRun {
                                 crate::interpreter::virtual_merge::set_nested_parallel(true);
                                 let mut ev = FrameEventCounters::default();
                                 let outputs = interpret_state_base(
-                                    deopt, frame_cfg, fixed_env, state, &mut ev, pos_obs,
+                                    variants, deopt, frame_cfg, fixed_env, state, &mut ev,
+                                    pos_obs,
                                 )?;
                                 Ok((outputs, ev))
                             })
@@ -1407,52 +1432,13 @@ impl AbstractRun {
         self.finish_phased_boundary(new_states, frame_no)
     }
 
-    /// Run one input state through the frame program: shape dispatch first
-    /// (a state whose object-array shape has a registered variant runs
-    /// under it, through canonical both ways, and skips the base path
-    /// entirely; the loud fallback of a failing variant frame continues
-    /// into the base path), then the configured deopt mode.
-    fn interpret_state(
-        &mut self,
-        state: State,
-        counters: &mut FrameEventCounters,
-    ) -> Result<Vec<State>> {
-        let state = if let Some(vd) = self.variants.as_mut() {
-            let before = vd.total_events;
-            // The shape-variant path returns without reaching the frame
-            // body, so it has to record for itself or the table would be
-            // missing every transition a variant took.
-            let mut state = state;
-            if let Some(obs) = self.pos_obs.as_ref() {
-                obs.tag(&mut state)?;
-            }
-            match dispatch_variant_frame(vd, state) {
-                VariantOutcome::Ran(outputs) => {
-                    counters.variant.0 += vd.total_events.0 - before.0;
-                    counters.variant.1 += vd.total_events.1 - before.1;
-                    if let Some(obs) = self.pos_obs.as_ref() {
-                        obs.record(&outputs)?;
-                    }
-                    return Ok(outputs);
-                }
-                VariantOutcome::Base(state) => state,
-            }
-        } else {
-            state
-        };
-        interpret_state_base(
-            self.deopt.as_ref(),
-            &self.frame_cfg,
-            &self.fixed_env,
-            state,
-            counters,
-            self.pos_obs.as_ref(),
-        )
-    }
 }
 
-/// The frame body proper: everything `interpret_state` does once shape
-/// dispatch has declined the state.
+/// One input state's whole frame: shape dispatch first (a state whose
+/// object-array shape has a registered variant runs under it, through
+/// canonical both ways, and skips the base program entirely; the loud
+/// fallback of a failing variant frame continues into the base program),
+/// then the configured deopt mode.
 ///
 /// A free function taking only shared borrows, so a worker thread can run
 /// it - that is the whole point of the split. `run_deopt_frame` and
@@ -1460,6 +1446,7 @@ impl AbstractRun {
 /// mutation left was the event counters, which are per-call and aggregated
 /// by the caller in deterministic order.
 fn interpret_state_base(
+    variants: Option<&VariantDispatch>,
     deopt: Option<&DeoptTarget>,
     frame_cfg: &crate::interpreter::fixed_env::PreparedCfg,
     fixed_env: &crate::interpreter::fixed_env::FixedEnv,
@@ -1469,61 +1456,75 @@ fn interpret_state_base(
 ) -> Result<Vec<State>> {
     // Tag each input lane with its own cell before the state is consumed.
     // This is the only place that has both sides of a chunk's transition.
+    // The variant path sits below the tag and above the record, so a
+    // dispatched frame contributes its transitions like any other.
     if let Some(obs) = pos_obs {
         obs.tag(&mut state)?;
     }
     let mut new_states = Vec::new();
-    match deopt {
-        None => {
-            let result = interpret_prepared_cfg(frame_cfg, state, fixed_env)
-                .context("frame failed")?;
-            new_states.extend(result.into_iter().map(|(s, _)| s));
-        }
-        Some(deopt) if deopt.force => {
-            counters.deopt.0 += 1;
-            counters.deopt.1 += state.vector_size;
-            new_states.extend(run_deopt_frame(deopt, state)?);
-        }
-        Some(deopt) if deopt.collect_first => {
-            // Collect-first: every frame runs in collect mode with the
-            // origin column, so a failing state pays one specialized
-            // run instead of two (attempt + retry). The cost is the
-            // origin column's overhead on clean frames - measured
-            // before this became reachable (CELESTE_DEOPT_COLLECT_FIRST).
-            let (states, plain_lanes) =
-                run_deopt_frame_granular(deopt, frame_cfg, fixed_env, state, false)?;
-            if plain_lanes > 0 {
-                counters.deopt.0 += 1;
-                counters.deopt.1 += plain_lanes;
+    let declined = match variants {
+        Some(vd) => match dispatch_variant_frame(vd, state, counters) {
+            VariantOutcome::Ran(outputs) => {
+                new_states = outputs;
+                None
             }
-            new_states.extend(states);
-        }
-        Some(deopt) => {
-            // Optimistic: run the specialized frame; deopt on failure.
-            // Panics are caught too - a speculated instruction may
-            // assert on values the verify horizon never showed it
-            // (same failure class `screen_trial` unwinds across).
-            let snapshot = state.clone();
-            let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                || interpret_prepared_cfg(frame_cfg, state, fixed_env),
-            ));
-            match attempt {
-                Ok(Ok(result)) => {
-                    new_states.extend(result.into_iter().map(|(s, _)| s))
-                }
-                Ok(Err(err)) => {
-                    log_deopt(&mut counters.deopt, &snapshot, &format!("{:#}", err));
-                    let (states, plain_lanes) =
-                        run_deopt_frame_granular(deopt, frame_cfg, fixed_env, snapshot, true)?;
+            VariantOutcome::Base(state) => Some(state),
+        },
+        None => Some(state),
+    };
+    if let Some(state) = declined {
+        match deopt {
+            None => {
+                let result = interpret_prepared_cfg(frame_cfg, state, fixed_env)
+                    .context("frame failed")?;
+                new_states.extend(result.into_iter().map(|(s, _)| s));
+            }
+            Some(deopt) if deopt.force => {
+                counters.deopt.0 += 1;
+                counters.deopt.1 += state.vector_size;
+                new_states.extend(run_deopt_frame(deopt, state)?);
+            }
+            Some(deopt) if deopt.collect_first => {
+                // Collect-first: every frame runs in collect mode with the
+                // origin column, so a failing state pays one specialized
+                // run instead of two (attempt + retry). The cost is the
+                // origin column's overhead on clean frames - measured
+                // before this became reachable (CELESTE_DEOPT_COLLECT_FIRST).
+                let (states, plain_lanes) =
+                    run_deopt_frame_granular(deopt, frame_cfg, fixed_env, state, false)?;
+                if plain_lanes > 0 {
+                    counters.deopt.0 += 1;
                     counters.deopt.1 += plain_lanes;
-                    new_states.extend(states);
                 }
-                Err(panic) => {
-                    log_deopt(&mut counters.deopt, &snapshot, &panic_text(&panic));
-                    let (states, plain_lanes) =
-                        run_deopt_frame_granular(deopt, frame_cfg, fixed_env, snapshot, true)?;
-                    counters.deopt.1 += plain_lanes;
-                    new_states.extend(states);
+                new_states.extend(states);
+            }
+            Some(deopt) => {
+                // Optimistic: run the specialized frame; deopt on failure.
+                // Panics are caught too - a speculated instruction may
+                // assert on values the verify horizon never showed it
+                // (same failure class `screen_trial` unwinds across).
+                let snapshot = state.clone();
+                let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || interpret_prepared_cfg(frame_cfg, state, fixed_env),
+                ));
+                match attempt {
+                    Ok(Ok(result)) => {
+                        new_states.extend(result.into_iter().map(|(s, _)| s))
+                    }
+                    Ok(Err(err)) => {
+                        log_deopt(&mut counters.deopt, &snapshot, &format!("{:#}", err));
+                        let (states, plain_lanes) =
+                            run_deopt_frame_granular(deopt, frame_cfg, fixed_env, snapshot, true)?;
+                        counters.deopt.1 += plain_lanes;
+                        new_states.extend(states);
+                    }
+                    Err(panic) => {
+                        log_deopt(&mut counters.deopt, &snapshot, &panic_text(&panic));
+                        let (states, plain_lanes) =
+                            run_deopt_frame_granular(deopt, frame_cfg, fixed_env, snapshot, true)?;
+                        counters.deopt.1 += plain_lanes;
+                        new_states.extend(states);
+                    }
                 }
             }
         }
@@ -1560,17 +1561,23 @@ impl AbstractRun {
     /// Aggregate the frame's deopt/variant events and print the per-frame
     /// lines the campaign logs grep for.
     fn report_frame_events(&mut self, counters: &FrameEventCounters) {
+        let quiet = self.quiet;
         if let Some(deopt) = self.deopt.as_mut() {
             deopt.total_events.0 += counters.deopt.0;
             deopt.total_events.1 += counters.deopt.1;
-            if counters.deopt.0 > 0 && !deopt.force {
+            if counters.deopt.0 > 0 && !deopt.force && !quiet {
                 println!(
                     "  deopt: {} state(s) / {} lanes re-ran under the plain program",
                     counters.deopt.0, counters.deopt.1
                 );
             }
         }
-        if counters.variant.0 > 0 {
+        if let Some(vd) = self.variants.as_mut() {
+            vd.total_events.0 += counters.variant.0;
+            vd.total_events.1 += counters.variant.1;
+            vd.total_fallbacks += counters.variant_fallbacks;
+        }
+        if counters.variant.0 > 0 && !self.quiet {
             println!(
                 "  variant: {} state(s) / {} lanes ran under shape variants",
                 counters.variant.0, counters.variant.1
@@ -2011,6 +2018,77 @@ pub fn differential_against_trace(
                 ),
             }));
         }
+    }
+    Ok(None)
+}
+
+/// Runs a shape VARIANT against a precomputed baseline trace.
+///
+/// `host` runs every state whose object-array shape the variant does not
+/// claim; the variant runs the rest, through the canonical form both ways.
+/// The baseline to pass is the host's own trace: a variant's contract is
+/// that dispatch is INVISIBLE (see `Variant`), so "the host with this
+/// variant registered observes what the host alone observes" is exactly the
+/// claim, and it is checkable at a depth where the variant's shape actually
+/// occurs. The host's own equivalence to the plain program is a separate
+/// gate that `verify` already runs.
+///
+/// Two failure modes are specific to this mode and both are checked here,
+/// because neither shows up as a divergence:
+///
+///   * a variant frame that FAILS falls back to the host and produces the
+///     right answer, so a variant whose premises never hold would otherwise
+///     screen clean. Any fallback is a rejection.
+///   * a variant that never dispatched at all was never exercised, so the
+///     run says nothing about it. That is precisely how 129 entries on
+///     never-executed object functions got into a recipe unchecked
+///     (see the `rewrites-room00.jsonl` commit); refuse it instead.
+pub fn differential_variant_against_trace(
+    baseline: &[BTreeSet<StateObservation>],
+    host: &Program,
+    host_mapping: super::state_mapping::StateMapping,
+    variant: Variant,
+    frames: u32,
+) -> Result<Option<Divergence>> {
+    let mut run = match AbstractRun::start(host) {
+        Ok(run) => run,
+        Err(e) => {
+            return Ok(Some(Divergence { frame: 0, detail: format!("init failed: {:#}", e) }))
+        }
+    };
+    run.set_variants(host_mapping, vec![variant]);
+    run.quiet = true;
+    for frame in 0..=frames {
+        if frame > 0 {
+            if let Err(e) = run.step() {
+                return Ok(Some(Divergence { frame, detail: format!("{:#}", e) }));
+            }
+        }
+        let (_, _, fallbacks) = run.variant_events();
+        if fallbacks > 0 {
+            return Ok(Some(Divergence {
+                frame,
+                detail: format!("{} variant frame(s) fell back to the host program", fallbacks),
+            }));
+        }
+        let observed = observe_frame(run.states());
+        let Some(expected) = baseline.get(frame as usize) else { break };
+        if &observed != expected {
+            return Ok(Some(Divergence {
+                frame,
+                detail: describe(expected, &observed, expected.len(), run.lane_count()),
+            }));
+        }
+    }
+    let (states, _, _) = run.variant_events();
+    if states == 0 {
+        return Ok(Some(Divergence {
+            frame: frames,
+            detail: format!(
+                "the variant never dispatched in {} frames - nothing was exercised",
+                frames
+            ),
+        }));
     }
     Ok(None)
 }

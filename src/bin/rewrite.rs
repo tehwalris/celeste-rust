@@ -28,6 +28,30 @@ struct Cli {
     command: Command,
 }
 
+/// Treat `--recipe` as a shape VARIANT of another recipe instead of as the
+/// whole program (see `verify::Variant`). Without `--variant-of` both flags
+/// are absent and the command behaves as before.
+///
+/// Why a variant needs its own mode at all: an S2 = [fake_wall, player]
+/// recipe devirtualises `type.update` to `fake_wall.update` and
+/// `player.update`, and room (0,0) spends its first 27 frames in
+/// S1 = [fake_wall, player_spawn], where that premise is false. Run as the
+/// whole program it fails at frame 1 and there is nothing to screen. Hosted,
+/// it runs exactly on the frames whose shape it claims.
+#[derive(clap::Args, Clone)]
+struct VariantOf {
+    /// The HOST recipe. It runs every state whose object-array shape is not
+    /// one of `--variant-shapes`; the trial program runs the rest. The
+    /// baseline compared against is the host's own observation trace, since
+    /// what a variant promises is that dispatch is invisible.
+    #[arg(long = "variant-of")]
+    host: Option<String>,
+    /// |-separated object-array shapes, each a comma-separated type-name
+    /// list, e.g. 'fake_wall,player'. Same spelling as `bench --variant`.
+    #[arg(long = "variant-shapes")]
+    shapes: Option<String>,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Replay the recipe and report what each entry did.
@@ -51,6 +75,8 @@ enum Command {
     Verify {
         #[arg(long, default_value_t = 30)]
         frames: u32,
+        #[command(flatten)]
+        variant_of: VariantOf,
     },
     /// Find the first recipe entry after which the differential run fails.
     Bisect {
@@ -95,6 +121,8 @@ enum Command {
         /// re-verify the accepted set at full length afterwards.
         #[arg(long, default_value_t = 20)]
         frames: u32,
+        #[command(flatten)]
+        variant_of: VariantOf,
     },
     /// Print a digest of the canonical observation after each frame.
     ///
@@ -346,6 +374,18 @@ enum Command {
         /// is deliberately NOT part of the checkpoint fingerprint - the
         /// gate for registering a variant is a lane-count/observation
         /// comparison against a variant-free run.
+        ///
+        /// MEASURED CAVEAT (2026-08-16), and it is the same hazard as the
+        /// chunk cap: "invisible" means the row SETS are equal, not that
+        /// the row IDS are. Room (0,0) f040 with and against the S2
+        /// variant gives an identical fingerprint, row_count, per-frame
+        /// watermarks, state_count and lane_count - and `states.bin`
+        /// differs (319,986 vs 316,684 bytes), because a variant frame
+        /// emits its raw lanes in a different order and ids are assigned
+        /// in insertion order. So a campaign must use the SAME `--variant`
+        /// set at EVERY stage; mixing them silently misaligns the sweep's
+        /// `g` from the forward pass's rows, and the fingerprint will not
+        /// say so.
         #[arg(long = "variant")]
         variants: Vec<String>,
     },
@@ -412,11 +452,59 @@ fn read_status_kb(field: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// A |-separated list of object-array shapes, each a comma-separated list of
+/// object type names, as `--variant` and `--variant-shapes` both spell it.
+fn parse_shapes(text: &str) -> Result<Vec<Vec<String>>> {
+    let shapes: Vec<Vec<String>> = text
+        .split('|')
+        .map(|shape| shape.split(',').map(|t| t.trim().to_string()).collect())
+        .collect();
+    if shapes.iter().any(|s: &Vec<String>| s.is_empty() || s.iter().any(|t| t.is_empty())) {
+        return Err(anyhow!("empty shape or object type name in {:?}", text));
+    }
+    Ok(shapes)
+}
+
+/// Package a built program as a variant for `shapes`. `host_program` is the
+/// program that will dispatch to it: the partition patterns are
+/// process-global (`vectorize::set_merge_partition_patterns`, installed by
+/// whichever `AbstractRun::start` ran) and mid-frame hint merges inside a
+/// variant frame use them too, so a variant that states a DIFFERENT list
+/// would silently be ignored. An EMPTY list is allowed and means the same
+/// thing there as here - no opinion, inherit the host's. That is what a
+/// screening trial has, since `partition_merge` is the recipe's last entry
+/// and candidates are applied before it.
+fn make_variant(
+    program: &Program,
+    mapping: celeste_rust::rewrite::state_mapping::StateMapping,
+    shapes: Vec<Vec<String>>,
+    label: String,
+    host_program: &Program,
+) -> Result<celeste_rust::rewrite::verify::Variant> {
+    if !program.merge_partition_cells.is_empty()
+        && program.merge_partition_cells != host_program.merge_partition_cells
+    {
+        return Err(anyhow!(
+            "variant {}: merge-partition cells {:?} differ from the host program's {:?}; \
+             the partition patterns are process-global",
+            label,
+            program.merge_partition_cells,
+            host_program.merge_partition_cells
+        ));
+    }
+    Ok(celeste_rust::rewrite::verify::Variant {
+        label,
+        shapes,
+        frame_cfg: celeste_rust::interpreter::fixed_env::PreparedCfg::new(
+            program.frame_cfg().clone(),
+        ),
+        fixed_env: program.fixed_env(),
+        mapping,
+    })
+}
+
 /// Build the shape-dispatched variant registry from `--variant` specs
-/// (SHAPES=RECIPE_PATH; see the flag's doc comment). `base_program` is the
-/// bench's base program - its merge-partition cells must agree with every
-/// variant's, because the partition patterns are process-global and mid-frame
-/// hint merges inside a variant frame use them too.
+/// (SHAPES=RECIPE_PATH; see the flag's doc comment).
 fn build_variants(
     specs: &[String],
     base_program: &Program,
@@ -427,37 +515,50 @@ fn build_variants(
         let (shapes_part, path) = spec
             .split_once('=')
             .ok_or_else(|| anyhow!("--variant must be SHAPES=RECIPE_PATH, got {:?}", spec))?;
-        let shapes: Vec<Vec<String>> = shapes_part
-            .split('|')
-            .map(|shape| shape.split(',').map(|t| t.trim().to_string()).collect())
-            .collect();
-        if shapes.iter().any(|s: &Vec<String>| s.is_empty() || s.iter().any(|t| t.is_empty())) {
-            return Err(anyhow!("--variant {:?}: empty shape or type name", spec));
-        }
+        let shapes = parse_shapes(shapes_part)
+            .with_context(|| format!("--variant {:?}", spec))?;
         let recipe = Recipe::load(path)
             .with_context(|| format!("--variant {:?}: loading recipe", spec))?;
         let (program, _) = build(&recipe)
             .with_context(|| format!("--variant {:?}: building program", spec))?;
-        if program.merge_partition_cells != base_program.merge_partition_cells {
-            return Err(anyhow!(
-                "--variant {:?}: merge-partition cells {:?} differ from the base \
-                 program's {:?}; the partition patterns are process-global",
-                spec,
-                program.merge_partition_cells,
-                base_program.merge_partition_cells
-            ));
-        }
-        out.push(celeste_rust::rewrite::verify::Variant {
-            label: format!("{}[{}]", path, shapes_part),
+        out.push(make_variant(
+            &program,
+            StateMapping::from_recipe(&recipe),
             shapes,
-            frame_cfg: celeste_rust::interpreter::fixed_env::PreparedCfg::new(
-                program.frame_cfg().clone(),
-            ),
-            fixed_env: program.fixed_env(),
-            mapping: StateMapping::from_recipe(&recipe),
-        });
+            format!("{}[{}]", path, shapes_part),
+            base_program,
+        )?);
     }
     Ok(out)
+}
+
+/// `--variant-of` resolved: the host program that dispatches to the recipe
+/// under test, and the shapes that recipe claims.
+struct VariantHost {
+    program: Program,
+    mapping: celeste_rust::rewrite::state_mapping::StateMapping,
+    shapes: Vec<Vec<String>>,
+    label: String,
+}
+
+fn resolve_variant_host(args: &VariantOf) -> Result<Option<VariantHost>> {
+    use celeste_rust::rewrite::state_mapping::StateMapping;
+    match (&args.host, &args.shapes) {
+        (None, None) => Ok(None),
+        (Some(path), Some(shapes)) => {
+            let recipe = Recipe::load(path)
+                .with_context(|| format!("--variant-of {:?}: loading recipe", path))?;
+            let (program, _) = build(&recipe)
+                .with_context(|| format!("--variant-of {:?}: building program", path))?;
+            Ok(Some(VariantHost {
+                mapping: StateMapping::from_recipe(&recipe),
+                program,
+                shapes: parse_shapes(shapes).context("--variant-shapes")?,
+                label: format!("[{}]", shapes),
+            }))
+        }
+        _ => Err(anyhow!("--variant-of and --variant-shapes must be given together")),
+    }
 }
 
 /// Checkpoint configuration for a bench run.
@@ -492,6 +593,9 @@ fn bench(
     if !variants.is_empty() {
         let base_mapping = variant_base_mapping
             .ok_or_else(|| anyhow!("variants need the base recipe's mapping"))?;
+        for v in &variants {
+            println!("variant {} registered for shapes {:?}", v.label, v.shapes);
+        }
         run.set_variants(base_mapping, variants);
     }
     if let Some(band) = band {
@@ -1548,12 +1652,43 @@ fn main() -> Result<()> {
             }
         }
 
-        Command::Verify { frames } => {
-            let baseline = Program::compile_executable_from_disk()?;
+        Command::Verify { frames, variant_of } => {
             let (candidate, _) = build(&recipe)?;
-            println!("running {} frames of both programs...", frames);
+            let host = resolve_variant_host(&variant_of)?;
             let start = std::time::Instant::now();
-            match differential_abstract(&baseline, &candidate, frames)? {
+            let divergence = match host.as_ref() {
+                None => {
+                    let baseline = Program::compile_executable_from_disk()?;
+                    println!("running {} frames of both programs...", frames);
+                    differential_abstract(&baseline, &candidate, frames)?
+                }
+                Some(host) => {
+                    println!(
+                        "running {} frames of the host, then of the host dispatching \
+                         {} to {:?}...",
+                        frames, cli.recipe, host.shapes
+                    );
+                    let trace = celeste_rust::rewrite::verify::observation_trace(
+                        &host.program,
+                        frames,
+                    )?;
+                    let variant = make_variant(
+                        &candidate,
+                        celeste_rust::rewrite::state_mapping::StateMapping::from_recipe(&recipe),
+                        host.shapes.clone(),
+                        host.label.clone(),
+                        &host.program,
+                    )?;
+                    celeste_rust::rewrite::verify::differential_variant_against_trace(
+                        &trace,
+                        &host.program,
+                        host.mapping.clone(),
+                        variant,
+                        frames,
+                    )?
+                }
+            };
+            match divergence {
                 None => println!(
                     "ok: identical through frame {} ({:.1}s)",
                     frames,
@@ -2081,15 +2216,52 @@ fn main() -> Result<()> {
             );
         }
 
-        Command::Screen { candidates, frames } => {
+        Command::Screen { candidates, frames, variant_of } => {
             let (program, _) = build(&recipe)?;
-            let baseline = Program::compile_executable_from_disk()?;
-            let trace = celeste_rust::rewrite::verify::observation_trace(&baseline, frames)?;
+            let host = resolve_variant_host(&variant_of)?;
+            let trace = match host.as_ref() {
+                None => {
+                    let baseline = Program::compile_executable_from_disk()?;
+                    celeste_rust::rewrite::verify::observation_trace(&baseline, frames)?
+                }
+                // The host's own trace, not the plain program's: see
+                // `differential_variant_against_trace`.
+                Some(host) => {
+                    celeste_rust::rewrite::verify::observation_trace(&host.program, frames)?
+                }
+            };
 
             let text = std::fs::read_to_string(&candidates)?;
             let candidates = Recipe::parse(&text)?;
             let total = candidates.entries.len();
-            let (accepted, runs) = screen_group(&program, &candidates.entries, &trace, frames);
+            // The variant's canonical mapping comes from the recipe, and only
+            // `promote_capture` contributes to it. A candidate carrying one
+            // would make the mapping depend on which trial accepted it, so
+            // refuse rather than screen against a mapping that is wrong for
+            // half the runs.
+            if host.is_some() {
+                if let Some(bad) = candidates
+                    .entries
+                    .iter()
+                    .find(|e| matches!(e.rule, celeste_rust::rewrite::recipe::Rule::PromoteCapture { .. }))
+                {
+                    return Err(anyhow!(
+                        "{}: promote_capture changes the cross-frame representation, so it \
+                         cannot be screened as a variant candidate; put it in the host recipe",
+                        bad.id
+                    ));
+                }
+            }
+            let variant_mapping =
+                celeste_rust::rewrite::state_mapping::StateMapping::from_recipe(&recipe);
+            let (accepted, runs) = screen_group(
+                &program,
+                &candidates.entries,
+                &trace,
+                frames,
+                host.as_ref(),
+                &variant_mapping,
+            );
             for entry in &accepted {
                 println!("{}", serde_json::to_string(entry)?);
             }
@@ -3214,18 +3386,44 @@ fn main() -> Result<()> {
 /// say). That is the loud failure the design accepts, but it must not take the
 /// screener down with it: the trial program is discarded either way, so
 /// unwinding across it is safe.
+///
+/// In variant mode `variant_mapping` is the VARIANT recipe's canonical
+/// mapping, not `host.mapping` - a dispatched frame needs both, base ->
+/// canonical with the host's and canonical -> variant with this one.
 fn screen_trial(
     base: &Program,
     entries: &[celeste_rust::rewrite::recipe::RewriteEntry],
     trace: &[std::collections::BTreeSet<celeste_rust::rewrite::verify::StateObservation>],
     frames: u32,
+    host: Option<&VariantHost>,
+    variant_mapping: &celeste_rust::rewrite::state_mapping::StateMapping,
 ) -> std::result::Result<Program, String> {
     let mut trial = base.clone();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         for entry in entries {
             apply_entry(&mut trial, entry)?;
         }
-        celeste_rust::rewrite::verify::differential_against_trace(trace, &trial, frames)
+        match host {
+            None => {
+                celeste_rust::rewrite::verify::differential_against_trace(trace, &trial, frames)
+            }
+            Some(host) => {
+                let variant = make_variant(
+                    &trial,
+                    variant_mapping.clone(),
+                    host.shapes.clone(),
+                    host.label.clone(),
+                    &host.program,
+                )?;
+                celeste_rust::rewrite::verify::differential_variant_against_trace(
+                    trace,
+                    &host.program,
+                    host.mapping.clone(),
+                    variant,
+                    frames,
+                )
+            }
+        }
     }));
     match outcome {
         Ok(Ok(None)) => Ok(trial),
@@ -3271,6 +3469,8 @@ fn screen_group(
     entries: &[celeste_rust::rewrite::recipe::RewriteEntry],
     trace: &[std::collections::BTreeSet<celeste_rust::rewrite::verify::StateObservation>],
     frames: u32,
+    host: Option<&VariantHost>,
+    variant_mapping: &celeste_rust::rewrite::state_mapping::StateMapping,
 ) -> (Vec<celeste_rust::rewrite::recipe::RewriteEntry>, usize) {
     let mut program = base.clone();
     let mut accepted = Vec::new();
@@ -3287,7 +3487,7 @@ fn screen_group(
             [one] => one.id.clone(),
             _ => format!("{}..{} ({})", g[0].id, g[g.len() - 1].id, g.len()),
         };
-        match screen_trial(&program, &group, trace, frames) {
+        match screen_trial(&program, &group, trace, frames, host, variant_mapping) {
             Ok(next) => {
                 eprintln!("run {:>3}  keep {}", runs, ids(&group));
                 program = next;
