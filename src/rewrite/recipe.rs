@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use super::program::Program;
 use super::rules::{
     absorb_stores, add_hint, allocate_slots, assume_eq, collapse_break_loop, collapse_loop,
-    kill_dead,
+    collapse_all_loop, kill_dead,
     convert_assert, convert_ternary,
     cse, dce, decompose_branch, dedup_guards,
     decompose_truthy, demote_create, drop_dead_cell,
@@ -400,6 +400,18 @@ pub enum Rule {
         /// The sentinel loop header.
         head: String,
     },
+    /// Collapse the `all()` iterator's sentinel loop (the post-#112 foreach
+    /// shape: advance diamond + nil check through cells, no length read),
+    /// guarded by runtime asserts that iteration 1 does not break and
+    /// iteration 2 does. Iteration 2's check chain is re-materialized as a
+    /// fresh copy after the payload, re-reading the cells on the real heap.
+    /// The head and the break block disappear. Screen at full depth.
+    CollapseAllLoop {
+        #[serde(rename = "fn")]
+        function: String,
+        /// The sentinel loop header.
+        head: String,
+    },
     /// Replace a counted loop whose trip count is statically known (constant
     /// init, step and bound on the branch-deciding counter - the shape
     /// `mask_loop` leaves behind) with that many renamed copies of its body,
@@ -497,6 +509,7 @@ impl Rule {
             Rule::ConvertAssert { .. } => "convert_assert",
             Rule::CollapseLoop { .. } => "collapse_loop",
             Rule::CollapseBreakLoop { .. } => "collapse_break_loop",
+            Rule::CollapseAllLoop { .. } => "collapse_all_loop",
             Rule::UnrollLoop { .. } => "unroll_loop",
             Rule::DedupGuards => "dedup_guards",
             Rule::AddHint { .. } => "add_hint",
@@ -823,6 +836,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::CollapseBreakLoop { function, head } => {
             collapse_break_loop::apply(program, function, head)
         }
+        Rule::CollapseAllLoop { function, head } => {
+            collapse_all_loop::apply(program, &entry.id, function, head)
+        }
         Rule::UnrollLoop { function, head } => unroll_loop::apply(program, function, head),
         Rule::DedupGuards => dedup_guards::apply(program),
         Rule::AddHint { function, block } => add_hint::apply(program, function, block),
@@ -971,6 +987,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         }
         Rule::CollapseBreakLoop { function, head } => {
             collapse_break_loop::verify(&before, program, function, head)
+        }
+        Rule::CollapseAllLoop { function, head } => {
+            collapse_all_loop::verify(&before, program, &entry.id, function, head)
         }
         Rule::UnrollLoop { function, head } => {
             unroll_loop::verify(&before, program, function, head)

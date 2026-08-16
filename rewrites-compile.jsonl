@@ -1004,6 +1004,15 @@
 {"fn":"_init_15","id":"xc052","join":"in_i1_091_in_i1_030_and_or_join_4","rule":"if_convert"}
 {"id":"xc_cse","rule":"cse"}
 {"id":"xm001","rule":"merge_blocks"}
+# Zero-divergence round 3: collapse the three per-frame all() loops (the
+# post-#112 foreach shape; rule collapse_all_loop, task #113). Every premise
+# is a runtime assert; iteration 2 re-runs the check chain on the real heap.
+{"fn":"__frame","head":"in_j2_006_for_head_1","id":"zc000","rule":"collapse_all_loop"}
+{"fn":"__frame","head":"in_j2_008_for_head_1","id":"zc001","rule":"collapse_all_loop"}
+{"fn":"__frame","head":"in_j2_009_for_head_1","id":"zc002","rule":"collapse_all_loop"}
+{"id":"zc003","rule":"merge_blocks"}
+{"forward":true,"id":"zc004","rule":"cse"}
+{"id":"zc005","rule":"dce"}
 {"id":"xb_dce","rule":"dce"}
 {"id":"k1","rule":"kill_dead"}
 {"id":"s1","rule":"allocate_slots"}

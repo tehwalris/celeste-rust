@@ -29,6 +29,7 @@ pub mod partition_merge;
 pub mod remove_hint;
 pub mod allocate_slots;
 pub mod assume_eq;
+pub mod collapse_all_loop;
 pub mod collapse_break_loop;
 pub mod collapse_loop;
 pub mod convert_assert;

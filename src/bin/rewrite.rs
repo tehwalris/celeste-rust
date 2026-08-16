@@ -2199,6 +2199,27 @@ fn main() -> Result<()> {
                          the bound's provenance before applying; screen at full depth."
                     );
                 }
+                "collapse-all-loop" => {
+                    let candidates =
+                        celeste_rust::rewrite::rules::collapse_all_loop::candidates(&program);
+                    for (i, (function, head)) in candidates.iter().enumerate() {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "id": format!("{}{:03}", prefix, i),
+                                "rule": "collapse_all_loop",
+                                "fn": function,
+                                "head": head.as_str(),
+                            })
+                        );
+                    }
+                    eprintln!(
+                        "# {} all()-iterator sentinel loop(s) - advance diamond + nil check \
+                         through cells. Sound for singleton tables; every premise is a \
+                         runtime assert. Screen at full depth.",
+                        candidates.len()
+                    );
+                }
                 "collapse-break-loop" => {
                     let candidates =
                         celeste_rust::rewrite::rules::collapse_break_loop::candidates(&program);
