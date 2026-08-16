@@ -1,8 +1,24 @@
+-- The button table is allocated ONCE, here at toplevel, so its identity and
+-- shape are part of the initial heap and stable across frames. The reset
+-- overwrites all six slots in place; it must never allocate. (A per-frame
+-- `{}` rebuild made every btn read a multi-receiver site - the last 22
+-- heap sites standing between the compiled per-shape programs and zero
+-- heap. The toplevel values are dead: init ends with a reset.)
+__button_states = {}
+__button_states[1] = false
+__button_states[2] = false
+__button_states[3] = false
+__button_states[4] = false
+__button_states[5] = false
+__button_states[6] = false
+
 function __reset_button_states()
-  __button_states = {}
-  for i = 1,6 do
-    __button_states[i] = __new_unknown_boolean()
-  end
+  __button_states[1] = __new_unknown_boolean()
+  __button_states[2] = __new_unknown_boolean()
+  __button_states[3] = __new_unknown_boolean()
+  __button_states[4] = __new_unknown_boolean()
+  __button_states[5] = __new_unknown_boolean()
+  __button_states[6] = __new_unknown_boolean()
 end
 
 function btn(i)
