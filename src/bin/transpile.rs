@@ -70,7 +70,8 @@ struct Gen {
     /// (kind, fn name, interned field id or 0) per get_field/get_index
     /// site, in site-id order - the gap census's site table.
     site_info: Vec<(&'static str, String, u32, usize)>,
-    /// fn name per conditional-branch site (SIMD divergence census).
+    /// (fn name, block label) per conditional-branch site (SIMD
+    /// divergence census).
     branch_info: Vec<String>,
     strings: Interner,
     globals: Interner,
@@ -431,7 +432,7 @@ impl Gen {
                 }
                 Terminator::ConditionalBranch { condition, true_target, false_target } => {
                     let bsite = self.branch_info.len() as u32;
-                    self.branch_info.push(fn_name.clone());
+                    self.branch_info.push(format!("{} @{}", fn_name, label));
                     writeln!(
                         body,
                         "if rt.truthy_b({}, {}) {{ {} }} else {{ {} }} continue;",

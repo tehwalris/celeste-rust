@@ -103,9 +103,11 @@ pub struct Rt {
     /// Per-site receiver log for the gap census (empty = logging off).
     /// Lattice per site: 0 = unseen, cell+1 = single receiver, MAX = multi.
     pub site_log: Vec<u64>,
-    /// Per-branch-site outcome flags (empty = off): bit0 = took true,
-    /// bit1 = took false. 3 across a fan-out = divergent site.
-    pub branch_log: Vec<u8>,
+    /// Per-branch-site outcome-SEQUENCE hash (empty = off). A site is
+    /// SIMD-divergent iff different runs produce different sequences -
+    /// a loop head taking true 6x then false is fine as long as every
+    /// lane does the same.
+    pub branch_log: Vec<u64>,
 }
 
 #[inline]
@@ -444,7 +446,8 @@ impl Rt {
     pub fn truthy_b(&mut self, v: V, site: u32) -> bool {
         let t = self.truthy(v);
         if !self.branch_log.is_empty() {
-            self.branch_log[site as usize] |= if t { 1 } else { 2 };
+            let h = &mut self.branch_log[site as usize];
+            *h = h.wrapping_mul(31).wrapping_add(1 + t as u64);
         }
         t
     }

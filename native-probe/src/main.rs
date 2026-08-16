@@ -416,7 +416,9 @@ fn run_branch_census(dir: &str, frame: u32) {
         CollisionCache::new(&cart, room_x, room_y).expect("failed to create collision cache"),
     );
     let probe = Probe::new();
-    let mut agg: Vec<u8> = vec![0; gen::BRANCH_INFO.len()];
+    // Per site: first run's sequence hash + divergence flag.
+    let mut first: Vec<Option<u64>> = vec![None; gen::BRANCH_INFO.len()];
+    let mut div: Vec<bool> = vec![false; gen::BRANCH_INFO.len()];
     let mut panics = 0usize;
     // Axis 1: input fan-out (one lane, 64 bytes). Axis 2: lane batch
     // (byte 2 = hold right, up to 256 lanes spread across the state) -
@@ -453,31 +455,32 @@ fn run_branch_census(dir: &str, frame: u32) {
         }));
         if outcome.is_err() {
             panics += 1;
+            continue; // a panicked run's partial sequence is not comparable
         }
-        for (a, &b) in agg.iter_mut().zip(rt.branch_log.iter()) {
-            *a |= b;
+        for (i, &h) in rt.branch_log.iter().enumerate() {
+            match first[i] {
+                None => first[i] = Some(h),
+                Some(f) if f != h => div[i] = true,
+                _ => {}
+            }
         }
     }
-    let executed = agg.iter().filter(|&&b| b != 0).count();
-    let divergent: Vec<usize> = agg
+    let executed = first.iter().filter(|f| **f != Some(0) && f.is_some()).count();
+    let divergent: Vec<usize> = div
         .iter()
         .enumerate()
-        .filter(|(_, &b)| b == 3)
+        .filter(|(_, &d)| d)
         .map(|(i, _)| i)
         .collect();
     println!(
-        "branch census: {} sites total, {} executed, {} DIVERGENT across the 64-input fan-out, {} panicked inputs",
-        agg.len(),
+        "branch census: {} sites total, {} executed, {} DIVERGENT (sequence differs across runs), {} panicked runs",
+        first.len(),
         executed,
         divergent.len(),
         panics
     );
-    let mut by_fn: std::collections::BTreeMap<&str, usize> = Default::default();
     for i in &divergent {
-        *by_fn.entry(gen::BRANCH_INFO[*i]).or_default() += 1;
-    }
-    for (f, n) in by_fn {
-        println!("  {} divergent in {}", n, f);
+        println!("  site {}: {}", i, gen::BRANCH_INFO[*i]);
     }
 }
 
