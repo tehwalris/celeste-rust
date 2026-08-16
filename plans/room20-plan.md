@@ -301,6 +301,30 @@ Three things fall out of that table:
   are `djump`, `grace`, `flip.x` or anything on the springs. Of the ten
   non-`spd` fields this plan used to list, EIGHT are worth 1.19x between
   them.
+* **BUT `p_jump`/`p_dash` widening was ALREADY CONSIDERED AND REJECTED**,
+  2026-08-06, and the note is in `abstraction.rs` right where the widenings
+  are applied. Philippe's reason: it admits behaviour the concrete game
+  forbids - ground-jump at n followed by wall-jump at n+1, when the press at
+  n forces `p_jump = true` at n+1 - so unlike the rem widening it "changes
+  the reachable set asymmetrically".
+
+  Stating the objection precisely, because it decides the design. An
+  over-approximation is SOUND FOR REFUTATION: if the coarse pass finds no
+  win by horizon H, the concrete game certainly has none. The problem is the
+  other direction. The ladder concludes "concrete optimum = H" when ALL 17
+  levels win at H, and that conclusion rests on the top rung being EXACT.
+  `rem` gets away with being widened at level 0 precisely because k=16
+  narrows it back to exact, so a spurious coarse win is refuted by a finer
+  level. A `p_jump` widening applied at every level is never refuted by
+  anything: it would survive to k=16, and the ladder would report a
+  spurious win AS THE OPTIMUM.
+
+  So the 3.8x is not free and not merely "unpriced downstream". It is
+  available only if `p_jump`/`p_dash` come with their OWN refinement rung -
+  exact at the top - exactly as `rem` has one. That is strictly more work
+  than the `spd` rung, not less, and it should not be read as the cheap
+  option in the table above.
+
 * **Two booleans are worth 3.8x.** `p_jump`/`p_dash` are the previous
   frame's jump and dash button, kept only for edge detection
   (`jump = btn(k_jump) and not this.p_jump`). Read them as a pairing rate:

@@ -302,7 +302,19 @@ Two things already measured that say what NOT to try:
       really a two-field list. `p_jump`+`p_dash`, two booleans holding the
       previous frame's button state for edge detection, are a flat 3.8x on
       their own and take the rung to 1.9% = 52x = 34 frames; 99.2% of the
-      frontier's rows have their `p_jump`-flipped twin present. Unpriced:
+      frontier's rows have their `p_jump`-flipped twin present.
+
+      **NOT FREE, and not a new idea** - widening the held-button trails was
+      considered and REJECTED on 2026-08-06; the note is in
+      `abstraction.rs`. It admits what the game forbids (a press at n forces
+      `p_jump` at n+1). The sharp version: over-approximating is sound for
+      REFUTING a horizon, but the ladder calls H the concrete optimum when
+      all 17 levels win, and that rests on the top rung being exact. `rem`
+      is widened at level 0 and narrowed back to exact by k=16, so a
+      spurious coarse win gets refuted. A `p_jump` widening at every level
+      is refuted by nothing and would survive to k=16 as a FALSE optimum.
+      It needs its own refinement rung, which makes it more work than the
+      `spd` rung, not less. Also unpriced:
       the mid-frame `UnknownBool` split a widened `p_jump` causes, and the
       interval widening a bucketed `spd` causes. Numbers in
       plans/room20-plan.md.
