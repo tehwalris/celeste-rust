@@ -67,6 +67,9 @@ fn l(id: LocalId) -> String {
 struct Gen {
     /// Name of the function currently being emitted (assert diagnostics).
     current_fn: String,
+    /// (kind, fn name, interned field id or 0) per get_field/get_index
+    /// site, in site-id order - the gap census's site table.
+    site_info: Vec<(&'static str, String, u32)>,
     strings: Interner,
     globals: Interner,
     fields: Interner,
@@ -215,24 +218,30 @@ impl Gen {
             }
             Instruction::GetField { receiver, field, create_if_missing } => {
                 let f = self.fields.intern(field);
+                let site = self.site_info.len() as u32;
+                self.site_info.push(("field", self.current_fn.clone(), f));
                 writeln!(
                     out,
-                    "{} = rt.get_field({}, {}, {}); // .{}",
+                    "{} = rt.get_field({}, {}, {}, {}); // .{}",
                     d,
                     l(*receiver),
                     f,
                     create_if_missing,
+                    site,
                     field
                 )?;
             }
             Instruction::GetIndex { receiver, index, create_if_missing } => {
+                let site = self.site_info.len() as u32;
+                self.site_info.push(("index", self.current_fn.clone(), 0));
                 writeln!(
                     out,
-                    "{} = rt.get_index({}, {}, {});",
+                    "{} = rt.get_index({}, {}, {}, {});",
                     d,
                     l(*receiver),
                     l(*index),
-                    create_if_missing
+                    create_if_missing,
+                    site
                 )?;
             }
             Instruction::NumberConstant { value } => {
@@ -254,7 +263,14 @@ impl Gen {
             Instruction::NilConstant => writeln!(out, "{} = V::Nil;", d)?,
             Instruction::Call { closure, args } => {
                 let args: Vec<String> = args.iter().map(|a| l(*a)).collect();
-                writeln!(out, "{} = call_value(rt, {}, &[{}]);", d, l(*closure), args.join(", "))?;
+                writeln!(
+                    out,
+                    "{} = call_value(rt, {}, &[{}], {:?});",
+                    d,
+                    l(*closure),
+                    args.join(", "),
+                    format!("{} %{}", self.current_fn, usize::from(id))
+                )?;
             }
             Instruction::CallBuiltin { callee, name, args } => {
                 let bi = Self::builtin_id(name)?;
@@ -469,6 +485,7 @@ fn main() -> Result<()> {
 
     let mut gen = Gen {
         current_fn: String::new(),
+        site_info: Vec::new(),
         strings: Interner::default(),
         globals: Interner::default(),
         fields: Interner::default(),
@@ -513,6 +530,12 @@ fn main() -> Result<()> {
     out.push_str(&str_array("GLOBAL_NAMES", &gen.globals.names));
     out.push_str(&str_array("FIELD_NAMES", &gen.fields.names));
     out.push_str(&str_array("FN_NAMES", &gen.fn_names));
+    out.push_str("/// (kind, fn, interned field id) per get_field/get_index site.\n");
+    out.push_str("pub static SITE_INFO: &[(&str, &str, u32)] = &[\n");
+    for (kind, fn_name, f) in &gen.site_info {
+        out.push_str(&format!("    ({:?}, {:?}, {}),\n", kind, fn_name, f));
+    }
+    out.push_str("];\n");
     out.push_str(&format!("pub const FN_INIT: u32 = {};\n", fn_init));
     out.push_str(&format!("pub const FN_FRAME: u32 = {};\n\n", fn_frame));
     out.push_str(
@@ -524,8 +547,8 @@ fn main() -> Result<()> {
     out.push_str(
         "/// Call through a value: closure cells dispatch on their dense fn id,\n\
          /// builtin cells go to the runtime (core_interpreter.rs:697).\n\
-         pub fn call_value(rt: &mut Rt, c: V, args: &[V]) -> V {\n\
-         \x20   let V::Ptr(p) = c else { panic!(\"call on a non-pointer: {:?}\", c) };\n\
+         pub fn call_value(rt: &mut Rt, c: V, args: &[V], ctx: &str) -> V {\n\
+         \x20   let V::Ptr(p) = c else { panic!(\"call on a non-pointer at {}: {:?}\", ctx, c) };\n\
          \x20   match &rt.heap[p as usize] {\n\
          \x20       Cell::Clo(f, caps) => {\n\
          \x20           let f = *f;\n\

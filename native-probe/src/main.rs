@@ -11,6 +11,7 @@
 #![allow(unused_variables, unused_assignments, unused_mut, unreachable_code, dead_code)]
 
 mod gen;
+mod import;
 mod runtime;
 
 use celeste_rust::cart_data::CartData;
@@ -256,9 +257,10 @@ fn build_rt() -> Rt {
     let (room_x, room_y) = celeste_rust::game_runner::start_room();
     // Runnable both from the repo root and from native-probe/.
     let cart_base = if std::path::Path::new("cart").exists() { "cart" } else { "../cart" };
-    let cart = CartData::load(cart_base).expect("failed to load cart data");
-    let cache =
-        CollisionCache::new(&cart, room_x, room_y).expect("failed to create collision cache");
+    let cart = std::sync::Arc::new(CartData::load(cart_base).expect("failed to load cart data"));
+    let cache = std::sync::Arc::new(
+        CollisionCache::new(&cart, room_x, room_y).expect("failed to create collision cache"),
+    );
     eprintln!("[native-probe] collision cache for room ({}, {})", room_x, room_y);
 
     let mut rt = Rt::new(cart, cache, gen::GLOBAL_NAMES.len(), gen::STRINGS);
@@ -279,13 +281,143 @@ fn build_rt() -> Rt {
     rt
 }
 
+/// Gap census (plans/native-probe.md): run real snapshot lanes through the
+/// compiled frame with receiver logging, and report which get_field/
+/// get_index sites resolve to a single cell per shape (columnizable, with
+/// a runtime guard) vs many (the shape's overlay to-do list).
+fn run_census(dir: &str, frame: u32, census_frames: u32, max_lanes: usize) {
+    use celeste_rust::rewrite::checkpoint;
+    let states = checkpoint::load_frame_states(std::path::Path::new(dir), frame)
+        .expect("load frame states");
+    let cart_base = if std::path::Path::new("cart").exists() { "cart" } else { "../cart" };
+    let (room_x, room_y) = celeste_rust::game_runner::start_room();
+    let cart =
+        std::sync::Arc::new(CartData::load(cart_base).expect("failed to load cart data"));
+    let cache = std::sync::Arc::new(
+        CollisionCache::new(&cart, room_x, room_y).expect("failed to create collision cache"),
+    );
+    let probe = Probe::new();
+
+    // Global receiver lattice + failure counts.
+    let mut acc: Vec<u64> = vec![0; gen::SITE_INFO.len()];
+    let (mut lanes_run, mut lanes_panicked) = (0usize, 0usize);
+    let total_lanes: usize = states.iter().map(|s| s.vector_size).sum();
+    let stride = (total_lanes / max_lanes.max(1)).max(1);
+
+    let mut lane_cursor = 0usize;
+    'outer: for state in &states {
+        for lane in 0..state.vector_size {
+            lane_cursor += 1;
+            if lane_cursor % stride != 0 {
+                continue;
+            }
+            if lanes_run + lanes_panicked >= max_lanes {
+                break 'outer;
+            }
+            // A fresh world per lane; cart/cache shared.
+            let mut rt = Rt::new(
+                cart.clone(),
+                cache.clone(),
+                gen::GLOBAL_NAMES.len(),
+                gen::STRINGS,
+            );
+            rt.site_log = vec![0; gen::SITE_INFO.len()];
+            import::import_lane(&mut rt, state, lane, true);
+            // Builtin bindings are init-invariants, not state: snapshots
+            // saved before a builtin existed (bench-r1-fresh predates
+            // __split_at) lack its global; backfill exactly like
+            // create_initial_state_with_builtins (game_runner.rs:878).
+            for (i, name) in BUILTIN_NAMES.iter().enumerate() {
+                if let Some(g) = gen::global_id(name) {
+                    if rt.globals[g as usize] == runtime::NONE {
+                        let cell = rt.alloc(Cell::Bi(i as u32));
+                        rt.globals[g as usize] = cell;
+                    }
+                }
+            }
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                for step in 0..census_frames {
+                    // Vary inputs a little so both input arms are exercised.
+                    let byte = [2u8, 18, 34, 0][(lane + step as usize) % 4];
+                    set_buttons(&mut rt, &probe, byte);
+                    gen::call_fn(&mut rt, gen::FN_FRAME, &[], &[]);
+                }
+            }));
+            match outcome {
+                Ok(()) => lanes_run += 1,
+                Err(_) => lanes_panicked += 1,
+            }
+            // Join this lane's lattice into the accumulator (panicked lanes
+            // included: sites they DID reach before failing still count).
+            for (a, &s) in acc.iter_mut().zip(rt.site_log.iter()) {
+                if s == 0 {
+                    continue;
+                }
+                *a = match *a {
+                    0 => s,
+                    x if x == s => x,
+                    _ => u64::MAX,
+                };
+            }
+        }
+    }
+
+    let mut single = 0usize;
+    let mut multi: Vec<usize> = Vec::new();
+    let mut unseen = 0usize;
+    for (i, &s) in acc.iter().enumerate() {
+        match s {
+            0 => unseen += 1,
+            u64::MAX => multi.push(i),
+            _ => single += 1,
+        }
+    }
+    println!(
+        "census: {} lanes run, {} panicked (premise failures), {} sites: {} single-receiver, {} multi, {} unreached",
+        lanes_run, lanes_panicked, acc.len(), single, multi.len(), unseen
+    );
+    let mut by_fn: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
+    for i in multi {
+        let (kind, fn_name, f) = gen::SITE_INFO[i];
+        let label = if kind == "field" {
+            format!("site {} get_field .{}", i, gen::FIELD_NAMES[f as usize])
+        } else {
+            format!("site {} get_index", i)
+        };
+        by_fn.entry(fn_name).or_default().push(label);
+    }
+    println!("== gaps (multi-receiver sites) by function ==");
+    for (fn_name, sites) in &by_fn {
+        println!("{} ({}):", fn_name, sites.len());
+        for s in sites {
+            println!("    {}", s);
+        }
+    }
+}
+
 fn main() {
     let mut inputs: Vec<u8> = Vec::new();
     let mut frames: Option<u32> = None;
     let mut bench_reps: Option<u32> = None;
+    let mut from_checkpoint: Option<(String, u32)> = None;
+    let mut census_frames: u32 = 2;
+    let mut max_lanes: usize = 256;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
+            "--from-checkpoint" => {
+                let dir = args.next().expect("--from-checkpoint needs DIR");
+                let frame = args
+                    .next()
+                    .expect("--from-checkpoint needs DIR FRAME")
+                    .parse()
+                    .unwrap();
+                from_checkpoint = Some((dir, frame));
+            }
+            "--census-frames" => {
+                census_frames = args.next().expect("value").parse().unwrap()
+            }
+            "--max-lanes" => max_lanes = args.next().expect("value").parse().unwrap(),
             "-i" => {
                 inputs = args
                     .next()
@@ -302,6 +434,11 @@ fn main() {
         }
     }
     let num_frames = frames.unwrap_or(inputs.len() as u32);
+
+    if let Some((dir, frame)) = from_checkpoint {
+        run_census(&dir, frame, census_frames, max_lanes);
+        return;
+    }
 
     let probe = Probe::new();
     let mut rt = build_rt();

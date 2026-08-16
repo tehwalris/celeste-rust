@@ -6,6 +6,8 @@
 //! concrete path cannot reach (intervals, unknown bools in ops, lane
 //! machinery) panics loudly instead of approximating.
 
+use std::sync::Arc;
+
 use celeste_rust::cart_data::CartData;
 use celeste_rust::collision_cache::CollisionCache;
 use celeste_rust::pico8_num::Pico8Num;
@@ -95,9 +97,12 @@ pub struct Rt {
     pub globals: Vec<u32>,
     /// Static strings from the program + runtime concat results.
     pub strings: Vec<String>,
-    pub cart: CartData,
-    pub cache: CollisionCache,
+    pub cart: Arc<CartData>,
+    pub cache: Arc<CollisionCache>,
     pub prints: Vec<String>,
+    /// Per-site receiver log for the gap census (empty = logging off).
+    /// Lattice per site: 0 = unseen, cell+1 = single receiver, MAX = multi.
+    pub site_log: Vec<u64>,
 }
 
 #[inline]
@@ -120,8 +125,8 @@ fn ptr_of(v: V) -> u32 {
 
 impl Rt {
     pub fn new(
-        cart: CartData,
-        cache: CollisionCache,
+        cart: Arc<CartData>,
+        cache: Arc<CollisionCache>,
         globals_len: usize,
         static_strings: &[&str],
     ) -> Self {
@@ -132,7 +137,26 @@ impl Rt {
             cart,
             cache,
             prints: Vec::new(),
+            site_log: Vec::new(),
         }
+    }
+
+    /// Join `recv` into the site's receiver lattice (census mode only).
+    #[inline]
+    fn log_site(&mut self, site: u32, recv: V) {
+        if self.site_log.is_empty() {
+            return;
+        }
+        let slot = &mut self.site_log[site as usize];
+        let v = match recv {
+            V::Ptr(p) => p as u64 + 1,
+            _ => u64::MAX, // non-pointer receiver: never columnizable
+        };
+        *slot = match *slot {
+            0 => v,
+            x if x == v => x,
+            _ => u64::MAX,
+        };
     }
 
     #[inline]
@@ -202,7 +226,8 @@ impl Rt {
     }
 
     /// `Instruction::GetField` (core_interpreter.rs:362).
-    pub fn get_field(&mut self, recv: V, f: u32, create: bool) -> V {
+    pub fn get_field(&mut self, recv: V, f: u32, create: bool, site: u32) -> V {
+        self.log_site(site, recv);
         let table = ptr_of(recv);
         let existing = match &self.heap[table as usize] {
             Cell::Obj(fields) => fields.iter().find(|(k, _)| *k == f).map(|(_, c)| *c),
@@ -227,7 +252,8 @@ impl Rt {
     /// `Instruction::GetIndex` (core_interpreter.rs:412), including the
     /// gap-fill create path (dense arrays; skipped indices materialise as
     /// explicit nils).
-    pub fn get_index(&mut self, recv: V, idx: V, create: bool) -> V {
+    pub fn get_index(&mut self, recv: V, idx: V, create: bool, site: u32) -> V {
+        self.log_site(site, recv);
         let table = ptr_of(recv);
         let index = num(idx)
             .as_i16()
