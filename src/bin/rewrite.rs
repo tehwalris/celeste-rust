@@ -476,6 +476,17 @@ enum Command {
         #[arg(long)]
         checkpoint_dir: String,
     },
+    /// Leading-edge extraction: the rightmost (and leftmost) player x per
+    /// frame from saved frame batches. The slope gap between two levels'
+    /// curves is the realized fake-progress rate of the coarser one -
+    /// the number that decides the refinement schedule (plans/spd-rung.md)
+    /// - measurable from shallow frames instead of a run to the win.
+    LeadingEdge {
+        #[arg(long)]
+        checkpoint_dir: String,
+        #[arg(long)]
+        frames: u32,
+    },
 }
 
 fn peak_rss_kb() -> u64 {
@@ -3526,6 +3537,32 @@ fn main() -> Result<()> {
                 t.elapsed().as_secs_f64(),
                 meta.row_count
             );
+        }
+        Command::LeadingEdge { checkpoint_dir, frames } => {
+            use celeste_rust::rewrite::checkpoint;
+            let dir = std::path::PathBuf::from(checkpoint_dir);
+            println!("frame\tmin_x\tmax_x\tlanes");
+            for f in 1..=frames {
+                let states = match checkpoint::load_frame_states(&dir, f) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let (mut min_x, mut max_x, mut lanes) = (i32::MAX, i32::MIN, 0usize);
+                for state in &states {
+                    if let Some(points) =
+                        celeste_rust::interpreter::abstraction::player_xy_per_lane(state)
+                    {
+                        for (x, _) in points {
+                            min_x = min_x.min(x as i32);
+                            max_x = max_x.max(x as i32);
+                            lanes += 1;
+                        }
+                    }
+                }
+                if lanes > 0 {
+                    println!("{}\t{}\t{}\t{}", f, min_x, max_x, lanes);
+                }
+            }
         }
         Command::Bisect { frames } => {
             let baseline = Program::compile_executable_from_disk()?;

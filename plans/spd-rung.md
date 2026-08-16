@@ -193,6 +193,27 @@ Also consider the same refinement for MaybeBool spill states
 (partition_maybe_bool sets the spill's local to UnknownBool; its
 downstream branch could refine identically).
 
+## S(16) SOUND on room (1,0) + the schedule decision (2026-08-16 night)
+
+With sp1_facing_x and the branch edge refinement, spd-16 rem-0 runs
+room (1,0) clean to f81+ and finds its FIRST ROOM-EXIT AT f80 <= 89 -
+the rung over-approximates correctly on the known-answer room. Row
+collapse vs exact at depth: f50 1.63x, f60 3.14x, f65 4.2x, widening.
+
+**Schedule decision - LOCKSTEP/DIAGONAL, from measurement:**
+marginal realized fake progress on room (1,0):
+  rem full widening: 100 - 89 = 11 fake frames
+  spd 1px buckets:    89 - 80 =  9 fake frames
+Comparable rates at comparable coarseness -> errors ADD while cost
+MULTIPLIES, so the ladder walks the diagonal (refine both dimensions
+together, ~16 levels not 32). The leading-edge extraction
+(`rewrite leading-edge`) confirms the mechanism: gap 0 px in
+speed-capped stretches (caps bind), ~0.3 px/frame in free movement,
+peak +24 px at f71.
+
+Remaining for #110: ladder.sh diagonal schedule wiring, the room (1,0)
+extended-ladder agreement run, then the room (2,0) S(16) probe.
+
 ## Open questions (carry to the probe, not decided by reasoning)
 
 * Bottom rung width: 1 px predicted 14.5x; 2 px if growth still wins.
