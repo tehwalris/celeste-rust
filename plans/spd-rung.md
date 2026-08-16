@@ -154,6 +154,45 @@ into player_spd cells with an UnknownBool result. The select-splits
 counter was firing (36k/frame at f55), so the machinery exists - the
 new sites are just not in the recipe yet.
 
+## Round 2 diagnosis (2026-08-16 late; after sp1_facing_x)
+
+The facing split WORKS: f56 passes and f55's rows dropped 6.39M ->
+5.24M (clipped intervals canonicalize better). The next failure
+(f56-f60) is DEEPER and two-layered:
+
+1. Some speculation guard in the rewritten path genuinely fails under
+   widened spd -> those states legitimately deopt to the plain program
+   (which guard: not yet identified - run with the deopt-collect
+   reporting to name it; reducing deopt frequency is a later
+   performance question, not a correctness one).
+2. The PLAIN program then poisons spd itself, through Lua `and/or`
+   VALUE semantics: in `appr`'s `val>target and max(..) or min(..)`,
+   when the comparison partitions to unknown, the false arm of the
+   `and` returns THE CONDITION VALUE - and the interpreter leaves it
+   as UnknownBool instead of refining it to `false` on that edge. The
+   UnknownBool then travels: `t or min(..)` branches on t, the truthy
+   edge RETURNS t, and appr's result (stored to spd.x, plain-program
+   site `player.update_21` %353 = store %340 <- %352) is a literal
+   UnknownBool.
+
+THE FIX (next session, fresh context): in the branch machinery
+(flow.rs), when a state splits on a whole-value UnknownBool condition,
+overwrite the condition LOCAL with Bool(true) / Bool(false) in the
+respective successor states. Sound and exact: UnknownBool is a bool by
+construction, and each edge knows its value. This is a global precision
+improvement, fixes the plain fallback for interval spd generally
+(every and/or value idiom, not just appr), and needs its own gates:
+byte-identity on room1 f30 exact (no UnknownBool branches fire there
+under exact spd? VERIFY, don't assume - btn branches DO fire, so
+expect row changes... if rows change, this is fingerprint-relevant and
+needs the full nextest + verify + room1-f30-compare treatment and a
+careful review of whether hint/merge behavior depends on the
+UnknownBool staying opaque).
+
+Also consider the same refinement for MaybeBool spill states
+(partition_maybe_bool sets the spill's local to UnknownBool; its
+downstream branch could refine identically).
+
 ## Open questions (carry to the probe, not decided by reasoning)
 
 * Bottom rung width: 1 px predicted 14.5x; 2 px if growth still wins.
