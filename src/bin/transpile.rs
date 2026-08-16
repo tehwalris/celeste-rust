@@ -69,7 +69,7 @@ struct Gen {
     current_fn: String,
     /// (kind, fn name, interned field id or 0) per get_field/get_index
     /// site, in site-id order - the gap census's site table.
-    site_info: Vec<(&'static str, String, u32)>,
+    site_info: Vec<(&'static str, String, u32, usize)>,
     strings: Interner,
     globals: Interner,
     fields: Interner,
@@ -219,7 +219,7 @@ impl Gen {
             Instruction::GetField { receiver, field, create_if_missing } => {
                 let f = self.fields.intern(field);
                 let site = self.site_info.len() as u32;
-                self.site_info.push(("field", self.current_fn.clone(), f));
+                self.site_info.push(("field", self.current_fn.clone(), f, usize::from(id)));
                 writeln!(
                     out,
                     "{} = rt.get_field({}, {}, {}, {}); // .{}",
@@ -233,7 +233,7 @@ impl Gen {
             }
             Instruction::GetIndex { receiver, index, create_if_missing } => {
                 let site = self.site_info.len() as u32;
-                self.site_info.push(("index", self.current_fn.clone(), 0));
+                self.site_info.push(("index", self.current_fn.clone(), 0, usize::from(id)));
                 writeln!(
                     out,
                     "{} = rt.get_index({}, {}, {}, {});",
@@ -530,10 +530,10 @@ fn main() -> Result<()> {
     out.push_str(&str_array("GLOBAL_NAMES", &gen.globals.names));
     out.push_str(&str_array("FIELD_NAMES", &gen.fields.names));
     out.push_str(&str_array("FN_NAMES", &gen.fn_names));
-    out.push_str("/// (kind, fn, interned field id) per get_field/get_index site.\n");
-    out.push_str("pub static SITE_INFO: &[(&str, &str, u32)] = &[\n");
-    for (kind, fn_name, f) in &gen.site_info {
-        out.push_str(&format!("    ({:?}, {:?}, {}),\n", kind, fn_name, f));
+    out.push_str("/// (kind, fn, interned field id, instruction id) per site.\n");
+    out.push_str("pub static SITE_INFO: &[(&str, &str, u32, u32)] = &[\n");
+    for (kind, fn_name, f, iid) in &gen.site_info {
+        out.push_str(&format!("    ({:?}, {:?}, {}, {}),\n", kind, fn_name, f, iid));
     }
     out.push_str("];\n");
     out.push_str(&format!("pub const FN_INIT: u32 = {};\n", fn_init));

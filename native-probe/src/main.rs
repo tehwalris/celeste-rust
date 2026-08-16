@@ -378,11 +378,11 @@ fn run_census(dir: &str, frame: u32, census_frames: u32, max_lanes: usize) {
     );
     let mut by_fn: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
     for i in multi {
-        let (kind, fn_name, f) = gen::SITE_INFO[i];
+        let (kind, fn_name, f, iid) = gen::SITE_INFO[i];
         let label = if kind == "field" {
-            format!("site {} get_field .{}", i, gen::FIELD_NAMES[f as usize])
+            format!("site {} %{} get_field .{}", i, iid, gen::FIELD_NAMES[f as usize])
         } else {
-            format!("site {} get_index", i)
+            format!("site {} %{} get_index", i, iid)
         };
         by_fn.entry(fn_name).or_default().push(label);
     }
