@@ -375,17 +375,25 @@ enum Command {
         /// gate for registering a variant is a lane-count/observation
         /// comparison against a variant-free run.
         ///
-        /// MEASURED CAVEAT (2026-08-16), and it is the same hazard as the
-        /// chunk cap: "invisible" means the row SETS are equal, not that
-        /// the row IDS are. Room (0,0) f040 with and against the S2
-        /// variant gives an identical fingerprint, row_count, per-frame
-        /// watermarks, state_count and lane_count - and `states.bin`
-        /// differs (319,986 vs 316,684 bytes), because a variant frame
-        /// emits its raw lanes in a different order and ids are assigned
-        /// in insertion order. So a campaign must use the SAME `--variant`
-        /// set at EVERY stage; mixing them silently misaligns the sweep's
-        /// `g` from the forward pass's rows, and the fingerprint will not
-        /// say so.
+        /// MEASURED (2026-08-16), and narrower than it first looks:
+        /// "invisible" holds for the row SETS and not for the row IDS.
+        /// Room (0,0) f040 under campaign settings, with and against the
+        /// S2 variant, gives an identical fingerprint, row_count 387,443,
+        /// all 40 per-frame watermarks, state_count, lane_count and
+        /// per-frame frontier line - and `states.bin` (319,986 vs 316,684
+        /// bytes) and `visited.bin` both differ, because a variant frame
+        /// emits its raw lanes in a different order and multiplicity and
+        /// ids are assigned in insertion order.
+        ///
+        /// This does NOT make checkpoints non-interchangeable: everything
+        /// downstream reads ids out of the tree it was given, so resuming
+        /// a variant run from a variant-free checkpoint is fine (see the
+        /// VARIANTS note in ladder.sh). What it does mean is that
+        /// artifacts are not BYTE-comparable across the setting, so a
+        /// `parcheck.sh`-style byte gate has to hold the variant set
+        /// fixed, and a `g.bin` is only meaningful against the row table
+        /// it was computed from - which is one more reason to apply the
+        /// same set to every stage, as ladder.sh does.
         #[arg(long = "variant")]
         variants: Vec<String>,
     },

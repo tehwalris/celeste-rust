@@ -178,17 +178,23 @@ re-deriving a room costs hours. Do them ALL, then re-derive ONCE.
       replay - which is ~4x the forward cost on the same frame - still runs
       the shape-agnostic program.
 
-      **Do not wire `--variant` into ladder.sh stage by stage**, and not
-      only because it buys nothing today. "Dispatch is invisible" holds for
-      the row SETS and not for the row IDS: f040 under campaign settings
-      gives an identical fingerprint, row_count, watermarks and lane count
-      with and against the variant, and a `states.bin` that differs
-      (319,986 vs 316,684 bytes), because a variant frame emits its raw
-      lanes in a different order and ids are assigned in insertion order.
-      `--variant` is semantic exactly the way the chunk cap is - same set
-      at every stage or the sweep's `g` misaligns from the forward pass's
-      rows - and it is deliberately outside the fingerprint, so a mismatch
-      would be silent. Now stated in the flag's doc comment.
+      A refinement to the VARIANTS note now in ladder.sh: "dispatch is
+      invisible" holds for the row SETS and not for the row IDS. f040 under
+      campaign settings gives an identical fingerprint, row_count,
+      watermarks and lane count either way, and a `states.bin` (319,986 vs
+      316,684 bytes) and `visited.bin` that both differ, because a variant
+      frame emits its raw lanes in a different order and ids are assigned
+      in insertion order. Checkpoints stay interchangeable - everything
+      downstream reads ids out of the tree it was handed, so resuming a
+      variant run from a variant-free tree is fine, as the note says. What
+      does follow is narrower: artifacts are not BYTE-comparable across the
+      setting (a `parcheck.sh`-style gate has to hold it fixed), and a
+      `g.bin` only means anything against the row table it came from. Both
+      now in the flag's doc comment.
+
+      Given all of the above, **there is no reason to turn VARIANTS on for
+      room (0,0) yet**: 0.0% at f048, and `pos-graph`/`sweep` - the largest
+      stages - cannot dispatch at all.
 - [ ] B3 Room (1,0) recipe complete on the same footing.
 - [ ] B4 NOTE: `rewrites-room00.jsonl` is a SECOND recipe file and needs the
       same `foreach` re-derivation as the base one. Check it replays.

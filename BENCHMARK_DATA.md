@@ -89,24 +89,33 @@ state, so it now lives in `interpret_state_base` behind a shared borrow and
 rides the workers like everything else. `parcheck.sh 45 8000` still passes
 byte-identically.
 
-## A hazard the `--variant` doc comment did not state
+## "Dispatch is invisible" holds for the row sets, not the row ids
 
-"Dispatch is semantically invisible" is true of the row SETS and false of
-the row IDS. Room (0,0) f040 under campaign settings, with and against the
-S2 variant:
+Room (0,0) f040 under campaign settings (frontier-only, deopt, 8000-lane
+chunks), with and against the S2 variant:
 
 * identical: fingerprint, `row_count` 387,443, all 40 per-frame watermarks,
-  `state_count`, `lane_count`, and the per-frame `frontier-only: -> N new
+  `state_count`, `lane_count`, and every per-frame `frontier-only: -> N new
   lanes, visited total M` line;
-* different: `states.bin`, 319,986 vs 316,684 bytes.
+* different: `states.bin` (319,986 vs 316,684 bytes) and `visited.bin`.
 
-A variant frame emits its raw lanes in a different order and multiplicity
-(fewer duplicates - that is what `if_convert`/`speculate` do), and row ids
-are assigned in insertion order. So `--variant` is SEMANTIC in exactly the
-way the chunk cap is: every stage of a campaign has to carry the same set,
-and because it is deliberately outside the fingerprint, a mismatch is
-silent. Flagged in the flag's doc comment; do not wire it into `ladder.sh`
-stage by stage.
+A variant frame emits its raw lanes in a different order and multiplicity -
+fewer duplicates, which is what `if_convert`/`speculate` do - and row ids
+are assigned in insertion order.
+
+This is NOT the chunk cap's kind of semantic: the cap changes the reachable
+SET on rooms with fruit, and this changes nothing but the numbering. So
+`ladder.sh`'s VARIANTS note is right that checkpoints stay interchangeable
+and a variant run can resume from a variant-free tree - everything
+downstream reads ids out of the tree it was handed. Two narrower things do
+follow, and neither was written down before:
+
+* artifacts are not BYTE-comparable across the setting, so a
+  `parcheck.sh`-style byte gate has to hold the variant set fixed;
+* a `g.bin` is only meaningful against the row table it was computed from,
+  which is one more reason to apply the same set to every stage - exactly
+  what ladder.sh already does, and it does it for the "stages quietly
+  disagree" reason rather than this one.
 
 # Room (2,0) does not fit: the ladder needs a rung below 0 (2026-08-15)
 
