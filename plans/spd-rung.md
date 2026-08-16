@@ -318,3 +318,21 @@ Consequences:
   (CELESTE_SPD_WIDTH_LOG2=17) probing to f50 now (room20-s2px).
   If 2px also OOMs: next levers are rem-bits banding at the bottom rung
   or a streaming/frontier-only hump traversal.
+
+## 2px contingency result: ALSO OOMs (2026-08-16)
+
+- S(2px) f50 probe: rc=137, killed entering f36. Peak 57.6 GB at f35
+  (1.66M lanes, 78.6s). Expansion arrived EARLIER than 1px (f35 vs f38-39
+  at comparable lane counts): coarser spd bins pack more distinct
+  positions per lane, so the position fan-out per lane is larger and the
+  hump moves left instead of shrinking. Widening spd further is the wrong
+  axis for this room.
+- Conclusion: room (2,0)'s pre-crossover hump is position-driven, not
+  spd-driven. The pre-registered follow-up levers stand:
+  (a) rem-bits banding at the bottom rung (shrink the OTHER widened
+      coordinate; has a narrowing rung above it by construction), or
+  (b) streaming/frontier-only hump traversal (bound resident lanes,
+      not total lanes).
+- Decision deferred; written up here rather than rushed. The spd-rung
+  campaign pauses while the zero-heap/zero-branch rewrite work runs
+  (Philippe's directive 2026-08-16).
