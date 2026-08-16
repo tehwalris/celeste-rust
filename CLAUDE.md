@@ -30,6 +30,19 @@ Rust equivalents.
 - **Correctness beats cleverness.** A transformation we cannot check is worse
   than no transformation. If you cannot verify something, insert a runtime
   guard instead of assuming.
+- **Never widen a field without a rung that narrows it back.** Every
+  widening is an over-approximation. That is sound for REFUTING a horizon -
+  if the coarse pass finds no win by H, the concrete game has none - but the
+  ladder reports "concrete optimum = H" when all 17 levels win at H, and
+  that conclusion rests on the top rung being EXACT in every coordinate.
+  `player.rem` is fully widened at level 0 and gets away with it only
+  because k=16 narrows it back, so a spurious coarse win is refuted by a
+  finer level. A widening applied at EVERY level is refuted by nothing: it
+  survives to k=16 and the ladder reports a spurious win as the optimum.
+  This has come up twice (`p_jump`/`p_dash`, 2026-08-06 and again from the
+  field census 2026-08-16), so: the cost of a new abstraction is the
+  abstraction PLUS its refinement ladder, and anything advertised as a free
+  merge is mispriced.
 - **Measure before and after.** Any change that claims a performance effect
   needs numbers from an actual run, not reasoning.
 - Do not leave dead code behind. The build is warning-free; keep it that way.
