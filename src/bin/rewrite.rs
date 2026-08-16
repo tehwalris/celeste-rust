@@ -385,6 +385,11 @@ enum Command {
         /// 16 = exact). Validated against the previous dir's fingerprint.
         #[arg(long)]
         band_prev_bits: Option<u8>,
+        /// The previous level's spd bucket width (log2 raw units;
+        /// plans/spd-rung.md). Absent = the previous level had spd
+        /// Exact - correct for every rem-ladder level.
+        #[arg(long)]
+        band_prev_spd_width: Option<u8>,
         /// Register a shape-dispatched variant: SHAPES=RECIPE_PATH, where
         /// SHAPES is a |-separated list of object-array shapes and each
         /// shape is a comma-separated object type-name list. Example:
@@ -1514,7 +1519,16 @@ fn load_level(
     let precision = precision_for_level(k);
     let dir = level_checkpoint_dir(base_dir, k);
     let recipe_text = std::fs::read_to_string(recipe_path).unwrap_or_default();
-    let fp = checkpoint::config_fingerprint_with_precision(&recipe_text, precision);
+    // The k-ladder's levels all have spd Exact; the spd rungs below
+    // level 0 get their own loading path when witness tracing crosses
+    // them.
+    let fp = checkpoint::config_fingerprint_with_precision(
+        &recipe_text,
+        celeste_rust::interpreter::abstraction::LadderPrecision {
+            spd: celeste_rust::interpreter::abstraction::SpdPrecision::Exact,
+            rem: precision,
+        },
+    );
     let frame = checkpoint::latest(&dir)?
         .ok_or_else(|| anyhow!("level {}: no checkpoint in {}", k, dir.display()))?;
     let ck = checkpoint::load(&dir, frame, &fp)?;
@@ -2847,6 +2861,7 @@ fn main() -> Result<()> {
             band_dir,
             band_horizon,
             band_prev_bits,
+            band_prev_spd_width,
             variants,
         } => {
             if baseline {
@@ -2887,13 +2902,21 @@ fn main() -> Result<()> {
             };
             let band = match (band_dir, band_horizon, band_prev_bits) {
                 (Some(dir), Some(horizon), Some(prev_bits)) => {
-                    use celeste_rust::interpreter::abstraction::RemPrecision;
+                    use celeste_rust::interpreter::abstraction::{
+                        LadderPrecision, RemPrecision, SpdPrecision,
+                    };
                     use celeste_rust::rewrite::checkpoint;
                     use celeste_rust::rewrite::sweep;
-                    let prev_precision = if prev_bits >= 16 {
-                        RemPrecision::Exact
-                    } else {
-                        RemPrecision::Bits(prev_bits)
+                    let prev_precision = LadderPrecision {
+                        spd: match band_prev_spd_width {
+                            Some(w) => SpdPrecision::WidthLog2(w),
+                            None => SpdPrecision::Exact,
+                        },
+                        rem: if prev_bits >= 16 {
+                            RemPrecision::Exact
+                        } else {
+                            RemPrecision::Bits(prev_bits)
+                        },
                     };
                     let dir = std::path::PathBuf::from(dir);
                     let recipe_text = std::fs::read_to_string(&cli.recipe).unwrap_or_default();

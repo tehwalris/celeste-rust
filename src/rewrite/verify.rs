@@ -313,7 +313,7 @@ pub struct BandFilter {
     pub g_prev: Vec<u16>,
     pub horizon: u32,
     /// The previous level's rem precision (what to coarsen to).
-    pub prev_precision: crate::interpreter::abstraction::RemPrecision,
+    pub prev_precision: crate::interpreter::abstraction::LadderPrecision,
 }
 
 /// Everything needed to re-run a frame under the plain program when the
@@ -447,12 +447,12 @@ fn stream_boundary_prepare(
     visited: &crate::interpreter::visited::Visited,
 ) -> Result<Vec<PreparedRows>> {
     let mut kept_out = Vec::new();
-    for state in crate::interpreter::abstraction::split_rem_straddles(state) {
+    for state in crate::interpreter::abstraction::split_precision_straddles(state) {
         let state = make_state_abstract(state);
         let state = if let Some(band) = band {
             counters.band_before += state.vector_size;
             let budget = band.horizon.saturating_sub(frame);
-            let mut coarse = crate::interpreter::abstraction::make_state_abstract_rem(
+            let mut coarse = crate::interpreter::abstraction::coarsen_to(
                 state.clone(),
                 band.prev_precision,
             );
@@ -1655,7 +1655,7 @@ impl AbstractRun {
             } else {
                 new_states
                     .into_iter()
-                    .flat_map(crate::interpreter::abstraction::split_rem_straddles)
+                    .flat_map(crate::interpreter::abstraction::split_precision_straddles)
                     .map(make_state_abstract)
                     .collect()
             }
@@ -1685,7 +1685,7 @@ impl AbstractRun {
         let (mut before, mut after, mut missing) = (0usize, 0usize, 0usize);
         for state in std::mem::take(&mut self.states) {
             before += state.vector_size;
-            let mut coarse = crate::interpreter::abstraction::make_state_abstract_rem(
+            let mut coarse = crate::interpreter::abstraction::coarsen_to(
                 state.clone(),
                 band.prev_precision,
             );

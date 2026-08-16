@@ -281,7 +281,7 @@ fn run_game_frames(
         // Make states abstract (widen player.rem to interval)
         new_states = new_states
             .into_iter()
-            .flat_map(crate::interpreter::abstraction::split_rem_straddles)
+            .flat_map(crate::interpreter::abstraction::split_precision_straddles)
             .map(make_state_abstract)
             .collect();
 

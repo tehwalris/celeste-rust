@@ -88,6 +88,10 @@ pub struct CampaignConfig {
     pub start_room: (i16, i16),
     /// The rem abstraction level (the refinement ladder's k).
     pub precision: crate::interpreter::abstraction::RemPrecision,
+    /// The spd rung below level 0 (plans/spd-rung.md). Exact for every
+    /// campaign that predates the rung; hashed unconditionally like
+    /// everything else here.
+    pub spd_precision: crate::interpreter::abstraction::SpdPrecision,
     /// Frontier-only search (subtract-visited); CELESTE_FRONTIER_ONLY.
     pub frontier_only: bool,
     /// Deopt frames run collect-first; CELESTE_DEOPT_COLLECT_FIRST.
@@ -126,6 +130,7 @@ impl CampaignConfig {
         Self {
             start_room: crate::game_runner::start_room(),
             precision: crate::interpreter::abstraction::rem_precision_from_env(),
+            spd_precision: crate::interpreter::abstraction::spd_precision_from_env(),
             frontier_only: std::env::var_os("CELESTE_FRONTIER_ONLY").is_some(),
             deopt_collect_first: std::env::var_os("CELESTE_DEOPT_COLLECT_FIRST")
                 .is_some(),
@@ -143,13 +148,14 @@ pub fn config_fingerprint(recipe_text: &str) -> String {
 
 /// `config_fingerprint` for an explicit precision level - the band loader
 /// validates the PREVIOUS level's checkpoints, whose fingerprint differs
-/// from the current run's only in the precision component.
+/// from the current run's only in the precision components.
 pub fn config_fingerprint_with_precision(
     recipe_text: &str,
-    precision: crate::interpreter::abstraction::RemPrecision,
+    precision: crate::interpreter::abstraction::LadderPrecision,
 ) -> String {
     let mut config = CampaignConfig::from_env();
-    config.precision = precision;
+    config.precision = precision.rem;
+    config.spd_precision = precision.spd;
     config_fingerprint_for(recipe_text, &config)
 }
 
@@ -163,6 +169,7 @@ pub fn config_fingerprint_for(recipe_text: &str, config: &CampaignConfig) -> Str
     }
     config.start_room.hash(&mut h);
     format!("{:?}", config.precision).hash(&mut h);
+    format!("{:?}", config.spd_precision).hash(&mut h);
     config.frontier_only.hash(&mut h);
     config.deopt_collect_first.hash(&mut h);
     config.max_state_lanes.hash(&mut h);
@@ -561,6 +568,7 @@ mod tests {
         CampaignConfig {
             start_room: (0, 0),
             precision: crate::interpreter::abstraction::RemPrecision::Bits(0),
+            spd_precision: crate::interpreter::abstraction::SpdPrecision::Exact,
             frontier_only: true,
             deopt_collect_first: true,
             max_state_lanes: 8_000,

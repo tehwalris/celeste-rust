@@ -154,6 +154,20 @@ pub fn mark_heap(state: &State) -> HeapMarks {
                         }
                     }
                 }
+                // Get player.spd - the spd-rung widening's target
+                // (plans/spd-rung.md). Marked unconditionally; whether
+                // anything happens to it is SpdPrecision's decision.
+                if let Some(spd_ptr) = player.get("spd") {
+                    if let Some(spd_heap_id) = helper.unwrap_pointer(helper.load(*spd_ptr)) {
+                        if let HeapValue::ObjectTable(spd) = helper.load(spd_heap_id) {
+                            for key in ["x", "y"] {
+                                if let Some(coord_ptr) = spd.get(key) {
+                                    marks.add_mark("player_spd_xy", *coord_ptr);
+                                }
+                            }
+                        }
+                    }
+                }
                 // Mark dash_effect_time for the boundary clamp (see
                 // make_state_abstract): it decrements unconditionally every
                 // frame, so without a clamp it drifts negative forever and
@@ -209,8 +223,71 @@ pub fn rem_precision_from_env() -> RemPrecision {
     })
 }
 
+/// The spd precision ladder (plans/spd-rung.md) - the rung BELOW level 0
+/// that unblocks room (2,0).
+///
+/// * `WidthLog2(w)` - widen player.spd.x/y to floor-aligned buckets of
+///   width 2^w in raw 16.16 units. w=16 is 1 px/frame. Buckets are
+///   STATIC and data-independent (floor-alignment on the raw i32), so
+///   the scheme covers the entire speed range by construction - no
+///   assumption about which speeds occur. Power-of-two floor-aligned
+///   buckets NEST, so a coarser level over-approximates a finer one and
+///   band coarsening can never straddle.
+/// * `Exact` - no spd widening (today's semantics; the env default).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SpdPrecision {
+    WidthLog2(u8),
+    Exact,
+}
+
+/// The session's spd precision: CELESTE_SPD_WIDTH_LOG2=w (unset means
+/// Exact - nothing changes for existing campaigns). Read once.
+pub fn spd_precision_from_env() -> SpdPrecision {
+    static PRECISION: std::sync::OnceLock<SpdPrecision> = std::sync::OnceLock::new();
+    *PRECISION.get_or_init(|| match std::env::var("CELESTE_SPD_WIDTH_LOG2") {
+        Ok(v) => {
+            let w: u8 = v
+                .parse()
+                .unwrap_or_else(|_| panic!("CELESTE_SPD_WIDTH_LOG2={:?} is not a number", v));
+            assert!(
+                (8..=20).contains(&w),
+                "CELESTE_SPD_WIDTH_LOG2={} outside the sane range 8..=20 \
+                 (16 = 1 px/frame buckets)",
+                w
+            );
+            SpdPrecision::WidthLog2(w)
+        }
+        Err(_) => SpdPrecision::Exact,
+    })
+}
+
+/// The composite ladder precision: spd rungs below level 0, rem rungs
+/// above it (plans/spd-rung.md). The ladder refines spd to Exact FIRST,
+/// then rem - a level is always coarsened to another by applying BOTH
+/// components of the coarser level's precision.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LadderPrecision {
+    pub spd: SpdPrecision,
+    pub rem: RemPrecision,
+}
+
+pub fn ladder_precision_from_env() -> LadderPrecision {
+    LadderPrecision { spd: spd_precision_from_env(), rem: rem_precision_from_env() }
+}
+
+/// Coarsen a state to `precision` - the band mapping between ladder
+/// levels. No straddle splitting is needed here: a finer level's
+/// buckets nest inside the coarser level's (rem and spd both), so the
+/// widened value is always exactly one coarse bucket.
+pub fn coarsen_to(state: State, precision: LadderPrecision) -> State {
+    make_state_abstract_spd(make_state_abstract_rem(state, precision.rem), precision.spd)
+}
+
 pub fn make_state_abstract(state: State) -> State {
-    apply_conservative_widenings(make_state_abstract_rem(state, rem_precision_from_env()))
+    apply_conservative_widenings(make_state_abstract_spd(
+        make_state_abstract_rem(state, rem_precision_from_env()),
+        spd_precision_from_env(),
+    ))
 }
 
 /// Split lanes whose boundary rem interval straddles a bucket boundary of
@@ -232,11 +309,46 @@ pub fn split_rem_straddles(state: State) -> Vec<State> {
     if bits == 0 {
         return vec![state];
     }
-    let width: i32 = 0x1_0000 >> bits;
+    // rem boundary intervals are single-bucket-width by construction
+    // (they enter the frame as one bucket and the move only shifts and
+    // renormalizes them), so a straddle spans at most TWO buckets.
+    split_marked_straddles(state, "player_rem_xy", 0x1_0000 >> bits, 2)
+}
+
+/// `split_rem_straddles` for the spd rung: one lane per occupied spd
+/// bucket (plans/spd-rung.md). spd boundary intervals are one bucket
+/// wide plus at most a frame's worth of accel drift, so the span cap is
+/// generous rather than tight; hitting it means the physics moved spd
+/// intervals in a way the design did not price, and that should FAIL,
+/// not widen silently.
+pub fn split_spd_straddles(state: State) -> Vec<State> {
+    let SpdPrecision::WidthLog2(w) = spd_precision_from_env() else { return vec![state] };
+    split_marked_straddles(state, "player_spd_xy", 1i32 << w, 8)
+}
+
+/// Both boundary straddle splits, composed - the one the boundary
+/// pipeline calls.
+pub fn split_precision_straddles(state: State) -> Vec<State> {
+    split_rem_straddles(state)
+        .into_iter()
+        .flat_map(split_spd_straddles)
+        .collect()
+}
+
+/// Split lanes whose interval on any `mark`-ed cell straddles a
+/// floor-aligned bucket of `width` into one lane per covered bucket,
+/// clipping each to its bucket. Generalizes the historic two-bucket rem
+/// split: the first emitted state is EVERY lane clipped to its first
+/// bucket, then one state per further bucket depth holding only the
+/// lanes that reach it - for a two-bucket straddle this is bit for bit
+/// the old (low, high) pair, in the same order, which the room (1,0)
+/// f30 byte-identity gate checks.
+fn split_marked_straddles(state: State, mark: &str, width: i32, max_span: i32) -> Vec<State> {
     let bucket_low = |n: Pico8Num| (n.as_raw_u32() as i32).div_euclid(width) * width;
+    let from_raw = |r: i32| Pico8Num::from_parts((r >> 16) as i16, r as u16);
 
     let marks = mark_heap(&state);
-    let Some(cells) = marks.marks.get("player_rem_xy").cloned() else { return vec![state] };
+    let Some(cells) = marks.marks.get(mark).cloned() else { return vec![state] };
 
     let mut work = vec![state];
     for cell in cells {
@@ -252,64 +364,134 @@ pub fn split_rem_straddles(state: State) -> Vec<State> {
                 MaybeVector::Scalar(iv) => vec![*iv; state.vector_size.max(1)],
                 MaybeVector::Vector(ivs) => ivs.iter().copied().collect(),
             };
-            let straddle: Vec<bool> = intervals
+            // Buckets covered per lane, 1-based.
+            let spans: Vec<i32> = intervals
                 .iter()
                 .map(|iv| {
-                    let lo = bucket_low(iv.low);
-                    let hi = bucket_low(iv.high);
+                    let span = (bucket_low(iv.high) - bucket_low(iv.low)) / width + 1;
                     assert!(
-                        hi - lo <= width,
-                        "rem interval {:?} spans more than two buckets at {} bits",
+                        span <= max_span,
+                        "{} interval {:?} spans {} buckets of width {:#x} (cap {})",
+                        mark,
                         iv,
-                        bits
+                        span,
+                        width,
+                        max_span
                     );
-                    hi != lo
+                    span
                 })
                 .collect();
-            if straddle.iter().all(|s| !s) {
+            let deepest = spans.iter().copied().max().unwrap_or(1);
+            if deepest == 1 {
                 next.push(state);
                 continue;
             }
-            let from_raw = |r: i32| Pico8Num::from_parts((r >> 16) as i16, r as u16);
-            // A: every lane, straddlers clipped to their LOW bucket.
-            let clipped_low: Vec<Pico8NumInterval> = intervals
+            // Depth 1: every lane, clipped to its FIRST bucket.
+            let clipped_first: Vec<Pico8NumInterval> = intervals
                 .iter()
-                .zip(&straddle)
-                .map(|(iv, s)| {
-                    if *s {
+                .zip(&spans)
+                .map(|(iv, span)| {
+                    if *span > 1 {
                         Pico8NumInterval::new(iv.low, from_raw(bucket_low(iv.low) + width - 1))
                     } else {
                         *iv
                     }
                 })
                 .collect();
-            let mut low_state = state.clone();
-            low_state.heap.set(
+            let mut first_state = state.clone();
+            first_state.heap.set(
                 cell,
-                HeapValue::Value(Value::NumberInterval(MaybeVector::vector(clipped_low))),
+                HeapValue::Value(Value::NumberInterval(MaybeVector::vector(clipped_first))),
             );
-            next.push(low_state);
-            // B: only the straddler lanes, clipped to their HIGH bucket.
-            let high_state = state.filter_by_mask_clone(
-                &straddle,
-                crate::interpreter::state::FILTER_SPLIT_FLR,
-            );
-            let clipped_high: Vec<Pico8NumInterval> = intervals
-                .iter()
-                .zip(&straddle)
-                .filter(|(_, s)| **s)
-                .map(|(iv, _)| Pico8NumInterval::new(from_raw(bucket_low(iv.high)), iv.high))
-                .collect();
-            let mut high_state = high_state;
-            high_state.heap.set(
-                cell,
-                HeapValue::Value(Value::NumberInterval(MaybeVector::vector(clipped_high))),
-            );
-            next.push(high_state);
+            next.push(first_state);
+            // Depth k >= 2: only the lanes whose interval reaches bucket k,
+            // clipped to it.
+            for depth in 2..=deepest {
+                let reaches: Vec<bool> = spans.iter().map(|s| *s >= depth).collect();
+                let depth_state = state.filter_by_mask_clone(
+                    &reaches,
+                    crate::interpreter::state::FILTER_SPLIT_FLR,
+                );
+                let clipped: Vec<Pico8NumInterval> = intervals
+                    .iter()
+                    .zip(&spans)
+                    .filter(|(_, s)| **s >= depth)
+                    .map(|(iv, span)| {
+                        let start = bucket_low(iv.low) + (depth - 1) * width;
+                        let low = if depth == 1 { iv.low } else { from_raw(start) };
+                        let high = if depth == *span {
+                            iv.high
+                        } else {
+                            from_raw(start + width - 1)
+                        };
+                        Pico8NumInterval::new(low, high)
+                    })
+                    .collect();
+                let mut depth_state = depth_state;
+                depth_state.heap.set(
+                    cell,
+                    HeapValue::Value(Value::NumberInterval(MaybeVector::vector(clipped))),
+                );
+                next.push(depth_state);
+            }
         }
         work = next;
     }
     work
+}
+
+/// Widen player.spd.x/y to floor-aligned buckets of width 2^w raw
+/// (plans/spd-rung.md). Exact is a no-op. The sanity bound is NOT
+/// load-bearing - floor-aligned buckets cover every representable value
+/// - it exists to catch a heap-shape bug loudly rather than bucket
+/// garbage.
+pub fn make_state_abstract_spd(mut state: State, precision: SpdPrecision) -> State {
+    let SpdPrecision::WidthLog2(w) = precision else { return state };
+    let width: i32 = 1i32 << w;
+    let sane = Pico8NumInterval::new(
+        Pico8Num::from_parts(-16, 0),
+        Pico8Num::from_parts(16, 0),
+    );
+    let bucket = |raw_low: i32| -> Pico8NumInterval {
+        let from_raw = |r: i32| Pico8Num::from_parts((r >> 16) as i16, r as u16);
+        Pico8NumInterval::new(from_raw(raw_low), from_raw(raw_low + width - 1))
+    };
+    let floor_of = |n: Pico8Num| (n.as_raw_u32() as i32).div_euclid(width) * width;
+    let widen_number = |n: Pico8Num| -> Pico8NumInterval {
+        assert!(sane.contains_number(n), "player spd {:?} outside +/-16 px/frame", n);
+        bucket(floor_of(n))
+    };
+    let widen_interval = |iv: &Pico8NumInterval| -> Pico8NumInterval {
+        assert!(sane.contains_interval(iv), "player spd interval {:?} outside +/-16 px/frame", iv);
+        Pico8NumInterval::new(bucket(floor_of(iv.low)).low, bucket(floor_of(iv.high)).high)
+    };
+
+    let marks = mark_heap(&state);
+    if let Some(heap_ids) = marks.marks.get("player_spd_xy") {
+        for &heap_id in heap_ids {
+            if let HeapValue::Value(value) = state.heap.get(heap_id) {
+                let new_value = match value {
+                    Value::Number(MaybeVector::Scalar(n)) => {
+                        Value::NumberInterval(MaybeVector::Scalar(widen_number(*n)))
+                    }
+                    Value::Number(MaybeVector::Vector(nums)) => Value::NumberInterval(
+                        MaybeVector::vector(nums.iter().map(|n| widen_number(*n)).collect()),
+                    ),
+                    Value::NumberInterval(MaybeVector::Scalar(interval)) => {
+                        Value::NumberInterval(MaybeVector::Scalar(widen_interval(interval)))
+                    }
+                    Value::NumberInterval(MaybeVector::Vector(intervals)) => {
+                        Value::NumberInterval(MaybeVector::vector(
+                            intervals.iter().map(widen_interval).collect(),
+                        ))
+                    }
+                    other => panic!("Unexpected value type for player_spd: {:?}", other),
+                };
+                state.heap.set(heap_id, HeapValue::Value(new_value));
+            }
+        }
+    }
+    state
 }
 
 /// Only the historic rem widening - the baseline abstraction the search has
@@ -822,6 +1004,51 @@ mod tests {
         assert!(interval.contains_number(Pico8Num::from_parts(0, 0x4000))); // 0.25
         assert!(interval.contains_number(neg_half));
         assert!(!interval.contains_number(half)); // 0.5 is not included (we use < 0.5)
+    }
+
+    /// The spd buckets (plans/spd-rung.md): static floor-aligned coverage
+    /// including negatives, power-of-two NESTING (finer bucket inside
+    /// exactly one coarser bucket - what makes band coarsening
+    /// straddle-free and coarse levels over-approximations), and the
+    /// 1 px width at w=16.
+    #[test]
+    fn spd_buckets_are_static_nested_and_cover_negatives() {
+        let bucket = |raw: i32, w: u8| -> (i32, i32) {
+            let width = 1i32 << w;
+            let low = raw.div_euclid(width) * width;
+            (low, low + width - 1)
+        };
+        // 1 px buckets at w=16: -0.3 px/f lands in [-1 px, -epsilon].
+        let neg = -(0x0000_4CCC_i32); // ~ -0.3 in 16.16
+        let (lo, hi) = bucket(neg, 16);
+        assert_eq!(lo, -0x1_0000, "negative speeds floor-align DOWN");
+        assert_eq!(hi, -1);
+        // Zero sits at the bottom of [0, 1px).
+        assert_eq!(bucket(0, 16), (0, 0xFFFF));
+        // Nesting: every w=16 bucket lies inside exactly one w=17 bucket.
+        for raw in [-0x2_8000i32, -0x1_0000, -1, 0, 0x7FFF, 0x1_2345, 0x5_0000] {
+            let (lo16, hi16) = bucket(raw, 16);
+            let (lo17, hi17) = bucket(raw, 17);
+            assert!(lo17 <= lo16 && hi16 <= hi17, "w=16 bucket of {:#x} not nested", raw);
+            // And the coarse bucket of the fine bucket's endpoints agrees.
+            assert_eq!(bucket(lo16, 17), (lo17, hi17));
+            assert_eq!(bucket(hi16, 17), (lo17, hi17));
+        }
+    }
+
+    /// `SpdPrecision::Exact` must leave any state bit-identical (it is the
+    /// default; existing campaigns and gates depend on this being a no-op).
+    #[test]
+    fn spd_exact_is_a_no_op_and_split_passthrough() {
+        // Cheap structural check without building a game state: the
+        // widen function returns the input untouched for Exact...
+        let state = State::new();
+        let out = make_state_abstract_spd(state.clone(), SpdPrecision::Exact);
+        assert_eq!(out.vector_size, state.vector_size);
+        // ...and the env default (unset in tests) is Exact, so the
+        // boundary splitter passes through.
+        assert_eq!(spd_precision_from_env(), SpdPrecision::Exact);
+        assert_eq!(split_spd_straddles(State::new()).len(), 1);
     }
 }
 

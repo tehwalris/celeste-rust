@@ -331,6 +331,32 @@ fn builtin_error(_state: State, args: Vec<Value>) -> Result<Vec<(State, Value)>>
     }
 }
 
+/// Lift a numeric Value (Number or NumberInterval) to intervals, for the
+/// builtins whose interval extension is exact (min/max/abs are monotone,
+/// abs piecewise). Returns None for non-numeric values.
+fn value_as_intervals(v: &Value) -> Option<MaybeVector<Pico8NumInterval>> {
+    match v {
+        Value::Number(nv) => Some(nv.map_to(|n| Pico8NumInterval::from_number(*n))),
+        Value::NumberInterval(iv) => Some(iv.clone()),
+        _ => None,
+    }
+}
+
+/// abs over an interval: monotone on each side of 0; a zero-straddling
+/// interval maps to [0, max(|lo|, |hi|)]. Uses Pico8Num::abs (saturating)
+/// on the endpoints, so the 0x8000.0000 edge behaves exactly like the
+/// concrete op.
+fn interval_abs(iv: &Pico8NumInterval) -> Pico8NumInterval {
+    let zero = Pico8Num::from_i16(0);
+    if iv.low >= zero {
+        *iv
+    } else if iv.high <= zero {
+        Pico8NumInterval::new(iv.high.abs(), iv.low.abs())
+    } else {
+        Pico8NumInterval::new(zero, iv.low.abs().max(iv.high.abs()))
+    }
+}
+
 fn builtin_min(args: &[Value]) -> Result<Value> {
     if args.len() != 2 { return Err(anyhow!("min requires 2 arguments")); }
     match (&args[0], &args[1]) {
@@ -338,7 +364,16 @@ fn builtin_min(args: &[Value]) -> Result<Value> {
             let result = MaybeVector::map2(a, b, |a, b| (*a).min(*b));
             Ok(Value::Number(result))
         }
-        _ => Err(anyhow!("min: arguments must be numbers")),
+        // The interval extension of min is exact: min is monotone in
+        // both arguments, so min(A, B) = [min(lo), min(hi)] pointwise.
+        (a, b) => match (value_as_intervals(a), value_as_intervals(b)) {
+            (Some(a), Some(b)) => Ok(Value::NumberInterval(MaybeVector::map2(
+                &a,
+                &b,
+                |a, b| Pico8NumInterval::new(a.low.min(b.low), a.high.min(b.high)),
+            ))),
+            _ => Err(anyhow!("min: arguments must be numbers")),
+        },
     }
 }
 
@@ -349,7 +384,15 @@ fn builtin_max(args: &[Value]) -> Result<Value> {
             let result = MaybeVector::map2(a, b, |a, b| (*a).max(*b));
             Ok(Value::Number(result))
         }
-        _ => Err(anyhow!("max: arguments must be numbers")),
+        // Exact for the same reason as min.
+        (a, b) => match (value_as_intervals(a), value_as_intervals(b)) {
+            (Some(a), Some(b)) => Ok(Value::NumberInterval(MaybeVector::map2(
+                &a,
+                &b,
+                |a, b| Pico8NumInterval::new(a.low.max(b.low), a.high.max(b.high)),
+            ))),
+            _ => Err(anyhow!("max: arguments must be numbers")),
+        },
     }
 }
 
@@ -359,6 +402,9 @@ fn builtin_abs(args: &[Value]) -> Result<Value> {
         Value::Number(nums) => {
             let result = nums.map(|n| n.abs());
             Ok(Value::Number(result))
+        }
+        Value::NumberInterval(ivs) => {
+            Ok(Value::NumberInterval(ivs.map(interval_abs)))
         }
         _ => Err(anyhow!("abs: argument must be a number")),
     }
