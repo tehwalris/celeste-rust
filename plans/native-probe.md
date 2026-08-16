@@ -283,3 +283,30 @@ iter 1 payload runs, iter 2 hits the nil sentinel), re-apply the
 proven pipeline, then the dash-trigger stage-D (speculate +
 absorb_stores over the flattened dash body). Both are the last things
 between the compiled room (1,0) shape and 0 divergent branches.
+
+## Zero-divergence round 3 RESULT (2026-08-17): 22 -> 9, both real sites cornered
+
+Measured on the regenerated room (1,0) f35 states (hex-identical 400
+frames; differential verify identical through 40, spawn frames included):
+
+- branch census: 9 divergent = 2 REAL + 7 shadows of the freeze gate.
+  The type-lambda and loop-head shadows are GONE - the three per-frame
+  all() walks are collapsed by the new `collapse_all_loop` rule
+  (peel-2-assert-3; task #113 discharged), the draw lambdas and
+  player.draw are inlined at all four peeled sites, the six advance
+  diamonds are select-stores, and eight scratch cells are dropped.
+- gap census: 0 multi-receiver, 184 single-receiver, 0 panics.
+
+The two real sites, each one link from done:
+1. freeze gate (__frame @in_i1_012_cont): the masked-region conversion
+   is PROVEN to apply once the four idx/last iterator cells drop; their
+   loads sit behind stores to sibling scratch cells, which forward-cse
+   treats as fences. Missing link: an opt-in cell-precise forward mode
+   (a store through a non-escaping alloc cell cannot alias any other
+   cell) - opt-in so certified recipes stay byte-identical. Then:
+   forward -> drop_dead_cell x4 -> speculate_region {mask:true} (the
+   entry that applied cleanly in the reverted round) -> gate gone,
+   7 shadows with it.
+2. dash trigger (anonymous_61 @in_h061_if_condition_43): stage-D
+   speculate + absorb_stores over the already-flattened dash body
+   (m-package pattern), a mechanical per-store derivation.

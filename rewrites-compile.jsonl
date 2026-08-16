@@ -1013,6 +1013,50 @@
 {"id":"zc003","rule":"merge_blocks"}
 {"forward":true,"id":"zc004","rule":"cse"}
 {"id":"zc005","rule":"dce"}
+# Inline the draw lambdas at all four peeled call sites.
+{"at":"%1552","callee":"anonymous_63","fn":"__frame","id":"zn000","rule":"inline"}
+{"at":"%1595","callee":"anonymous_64","fn":"__frame","id":"zn001","rule":"inline"}
+{"at":"%1765","callee":"anonymous_63","fn":"__frame","id":"zn002","rule":"inline"}
+{"at":"%1813","callee":"anonymous_64","fn":"__frame","id":"zn003","rule":"inline"}
+{"id":"zn004","rule":"cse"}
+{"id":"zn005","rule":"dce"}
+# Devirt the o.type.draw calls to player.draw_22 (closure-guarded; the pass-1
+# copies sit in uniformly-dead arms under the singleton premise).
+{"at":"%1861","callee":"player.draw_22","fn":"__frame","id":"zn006","rule":"inline"}
+{"at":"%1886","callee":"player.draw_22","fn":"__frame","id":"zn007","rule":"inline"}
+{"at":"%1911","callee":"player.draw_22","fn":"__frame","id":"zn008","rule":"inline"}
+{"at":"%1936","callee":"player.draw_22","fn":"__frame","id":"zn009","rule":"inline"}
+{"id":"zn010","rule":"cse"}
+{"id":"zn011","rule":"dce"}
+# The six advance diamonds: arm add speculated, index store absorbed.
+{"arm":"in_j2_008_if_body_4","fn":"__frame","id":"zq000","join":"in_j2_008_if_join_5","rule":"speculate"}
+{"fn":"__frame","head":"in_i1_013_if_join_2","id":"zq001","rule":"absorb_stores"}
+{"arm":"in_j2_009_if_body_4","fn":"__frame","id":"zq002","join":"in_j2_009_if_join_5","rule":"speculate"}
+{"fn":"__frame","head":"in_j2_008_for_join_10","id":"zq003","rule":"absorb_stores"}
+{"arm":"it2_zc001_in_j2_008_if_body_4","fn":"__frame","id":"zq004","join":"it2_zc001_in_j2_008_if_join_5","rule":"speculate"}
+{"fn":"__frame","head":"in_zn000_cont","id":"zq005","rule":"absorb_stores"}
+{"arm":"it2_zc002_in_j2_009_if_body_4","fn":"__frame","id":"zq006","join":"it2_zc002_in_j2_009_if_join_5","rule":"speculate"}
+{"fn":"__frame","head":"in_zn001_cont","id":"zq007","rule":"absorb_stores"}
+{"arm":"it3_zc001_in_j2_008_if_body_4","fn":"__frame","id":"zq008","join":"it3_zc001_in_j2_008_if_join_5","rule":"speculate"}
+{"fn":"__frame","head":"in_zn002_cont","id":"zq009","rule":"absorb_stores"}
+{"arm":"it3_zc002_in_j2_009_if_body_4","fn":"__frame","id":"zq010","join":"it3_zc002_in_j2_009_if_join_5","rule":"speculate"}
+{"fn":"__frame","head":"in_zn003_cont","id":"zq011","rule":"absorb_stores"}
+# Dead cells: the lambda closures and the per-iteration v cells.
+{"cell":"%175","fn":"__frame","id":"zq012","rule":"drop_dead_cell"}
+{"cell":"%182","fn":"__frame","id":"zq013","rule":"drop_dead_cell"}
+{"cell":"%1525","fn":"__frame","id":"zq014","rule":"drop_dead_cell"}
+{"cell":"%1568","fn":"__frame","id":"zq015","rule":"drop_dead_cell"}
+{"cell":"%1746","fn":"__frame","id":"zq016","rule":"drop_dead_cell"}
+{"cell":"%1794","fn":"__frame","id":"zq017","rule":"drop_dead_cell"}
+{"cell":"%1770","fn":"__frame","id":"zq018","rule":"drop_dead_cell"}
+{"cell":"%1818","fn":"__frame","id":"zq019","rule":"drop_dead_cell"}
+{"id":"zq_mb","rule":"merge_blocks"}
+{"forward":true,"id":"zq_cse","rule":"cse"}
+{"id":"zq_dce","rule":"dce"}
+# The idx/last iterator cells stay alive for now: their loads sit behind
+# stores to sibling scratch cells, which forward-cse treats as fences.
+# Next unit: an opt-in cell-precise forward mode (non-escaping allocs
+# cannot alias), then these four drop and the freeze gate converts.
 {"id":"xb_dce","rule":"dce"}
 {"id":"k1","rule":"kill_dead"}
 {"id":"s1","rule":"allocate_slots"}
