@@ -485,7 +485,10 @@ pub fn make_state_abstract_spd(mut state: State, precision: SpdPrecision) -> Sta
                             intervals.iter().map(widen_interval).collect(),
                         ))
                     }
-                    other => panic!("Unexpected value type for player_spd: {:?}", other),
+                    other => panic!(
+                        "Unexpected value type for player_spd at {:?}: {:?}",
+                        heap_id, other
+                    ),
                 };
                 state.heap.set(heap_id, HeapValue::Value(new_value));
             }

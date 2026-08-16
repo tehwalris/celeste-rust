@@ -317,6 +317,21 @@ impl<'a> CoreInterpreter<'a> {
             Instruction::Store { target, source } => {
                 let heap_id = self.heap_id_from_pointer_local(*target)?;
                 let source_value = self.state.local_env.get(*source);
+                // Diagnostic (CELESTE_TRACE_UNKNOWN_STORE): name the site
+                // that stores a whole-value UnknownBool. An UnknownBool
+                // is only a legal STORED value where a later concretize
+                // consumes it; one that survives to a numeric field at
+                // the frame boundary is exactly the spd-rung f56 failure
+                // (plans/spd-rung.md), and the site named here is where
+                // the split-at-threshold rewrite belongs.
+                if matches!(source_value, Value::UnknownBool)
+                    && std::env::var_os("CELESTE_TRACE_UNKNOWN_STORE").is_some()
+                {
+                    eprintln!(
+                        "UNKNOWN_STORE target={:?} source={:?} heap={:?}",
+                        target, source, heap_id
+                    );
+                }
                 self.state
                     .heap
                     .set(heap_id, HeapValue::Value(source_value.clone()));

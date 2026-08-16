@@ -118,7 +118,27 @@ Position-forking from interval flr costs immediately; the dedup
 collapse overtakes it between f40 and f50 and widens with depth -
 consistent with the census's 14.5x at room (2,0) f070 depth.
 
-**Blocker found at f56 (room1, w=16)**: `player.spd` carries a literal
+**Blocker DIAGNOSED (f56, room1, w=16)** - full chain, one root site:
+`anonymous_61` %2184-%2195 (Celeste's `if spd.x ~= 0 then flip.x =
+spd.x < 0`): a mid-frame spd.x interval straddling 0 makes `flip.x` a
+genuinely-unknown boolean (348 UnknownBool stores traced into heap 171
+at f56); the dash's no-input arm `spd.x = flip.x and -1 or 1` then
+converts it to an unknown NUMBER and stores it into spd.x (heap 206),
+which the boundary widen refuses. Philippe's split-before-compare
+design (approved) fixes it at the root: insert `__split_at(value, 0)`
+before the flip comparison - a three-way interval split ({<c}, {==c},
+{>c}, making EVERY comparison operator against c decidable) modeled on
+`split_interval_by_floor`. NEXT: (1) `__split_at` state-splitting
+builtin in game_runner.rs next to `__split_by_flr`; (2) a `split_at`
+recipe rule (insert call_builtin + redirect later uses, the expand_bool
+insertion shape); (3) one recipe entry at this site; (4) rerun room1
+f60+, expect more sites to name themselves the same loud way (the
+CELESTE_TRACE_UNKNOWN_STORE env + the widen panic now print cells).
+Note bucket edges at every integer px coincide with the game's decision
+thresholds, so only mid-frame accel drift ever straddles - the splits
+should be rare.
+
+**Original blocker note**: `player.spd` carries a literal
 UnknownBool at a boundary - a select whose condition went unknown
 (tri-state comparisons against the widened spd intervals) stored an
 undecided value into spd on some lane; the widen panics (correctly -
