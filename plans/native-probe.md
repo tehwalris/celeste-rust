@@ -248,3 +248,38 @@ k_dash reads concretize for all lanes), 53x if_convert, merges + dce.
 Every entry rule-verified on apply; whole recipe differentially verified
 identical through 40 frames (81.5s); all 5 checked-in recipes replay
 (the test now GLOBS rewrites*.jsonl).
+
+## Zero-divergence grind, round 3 status (2026-08-17, late)
+
+Target: the 2 real divergent branches (freeze gate + dash trigger; the
+other 9 census sites are measured pure shadows of the freeze gate).
+
+Landed groundwork:
+- `drop_dead_cell` rule (pointed; unit-tested): deletes an alloc'd cell
+  nothing reads - the alloc, its stores, and its provably-true guards
+  (`assert_closure` matching a unique dominating `store_closure`;
+  `assert_value_cell` dominated by a plain store). Needed because
+  inlining a call-through-cell leaves an undeletable cluster behind.
+  Deliberately NOT a `dce` widening - that would silently change what
+  the certified recipes produce.
+
+Derivation attempt (reverted to keep the recipe green): the freeze-gate
+conversion pipeline is proven end-to-end EXCEPT one link. What worked,
+in order, on top of the committed overlay: inline the two _draw lambdas
++ player.draw at their call sites; drop the dead closure cells; convert
+the all()-iterator first-slot triangles (speculate + absorb_stores +
+merge + forward-cse + drop_dead_cell); then
+`speculate_region {mask:true}` over the whole draw body APPLIED (18
+changes - the gate became an unconditional masked region). The broken
+link: the draw foreach loops must be COLLAPSED first, and both existing
+collapse rules mismatch - `collapse_loop` plants `assert(32767==1)`
+(the differential screen caught it at frame 1, exactly as designed),
+and `collapse_break_loop` predates #112's all() shape (nil-keyed
+sentinel, no length read). This is precisely open task #113.
+
+Next unit (fresh session): implement the all()-shape collapse
+(`collapse_all_loop`: 2-iteration unroll under runtime asserts -
+iter 1 payload runs, iter 2 hits the nil sentinel), re-apply the
+proven pipeline, then the dash-trigger stage-D (speculate +
+absorb_stores over the flattened dash body). Both are the last things
+between the compiled room (1,0) shape and 0 divergent branches.

@@ -21,7 +21,7 @@ use super::rules::{
     kill_dead,
     convert_assert, convert_ternary,
     cse, dce, decompose_branch, dedup_guards,
-    decompose_truthy, demote_create,
+    decompose_truthy, demote_create, drop_dead_cell,
     expand_bool, fold, fold_reflexive, fold_select, fuse_breaks, if_convert, inline,
     mask_loop, merge_blocks,
     pin_builtin, split_at,
@@ -151,6 +151,16 @@ pub enum Rule {
         function: String,
         /// The accessor, as `%N`.
         at: String,
+    },
+    /// Delete an allocated cell nothing ever reads - its `alloc` plus every
+    /// store into it. The whole claim (no loads, no escapes, no other use)
+    /// is checked syntactically at apply time; see the rule's docs for why
+    /// this is a pointed rule and not a widening of `dce`.
+    DropDeadCell {
+        #[serde(rename = "fn")]
+        function: String,
+        /// The cell's alloc, as `%N`.
+        cell: String,
     },
     /// Convert the two joins Lua's `a and b or c` compiles to into one select
     /// on the original condition, in one step - one at a time is impossible,
@@ -472,6 +482,7 @@ impl Rule {
             Rule::PinBuiltin { .. } => "pin_builtin",
             Rule::SplitAt { .. } => "split_at",
             Rule::DemoteCreate { .. } => "demote_create",
+            Rule::DropDeadCell { .. } => "drop_dead_cell",
             Rule::ConvertTernary { .. } => "convert_ternary",
             Rule::DecomposeTruthy { .. } => "decompose_truthy",
             Rule::Speculate { .. } => "speculate",
@@ -523,6 +534,7 @@ impl Rule {
             | Rule::DecomposeBranch { function, at } => (function, vec![at]),
             Rule::DecomposeTruthy { function, root } => (function, vec![root]),
             Rule::PromoteCell { function, cell } => (function, vec![cell]),
+            Rule::DropDeadCell { function, cell } => (function, vec![cell]),
             Rule::WidenRem { function, object, .. } => (function, vec![object]),
             Rule::AssumeEq { function, a, b } => (function, vec![a, b]),
             Rule::SplitCall { function, at, on, .. } => (function, vec![at, on]),
@@ -776,6 +788,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::DemoteCreate { function, at } => {
             demote_create::apply(program, function, resolve_cell(&names, function, at)?)
         }
+        Rule::DropDeadCell { function, cell } => {
+            drop_dead_cell::apply(program, function, resolve_cell(&names, function, cell)?)
+        }
         Rule::ConvertTernary { function, join } => {
             convert_ternary::apply(program, function, join)
         }
@@ -902,6 +917,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         ),
         Rule::DemoteCreate { function, at } => {
             demote_create::verify(&before, program, function, resolve_cell(&names, function, at)?)
+        }
+        Rule::DropDeadCell { function, cell } => {
+            drop_dead_cell::verify(&before, program, function, resolve_cell(&names, function, cell)?)
         }
         Rule::ConvertTernary { function, join } => {
             convert_ternary::verify(&before, program, function, join)
