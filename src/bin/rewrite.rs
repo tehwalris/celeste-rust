@@ -487,6 +487,17 @@ enum Command {
         #[arg(long)]
         frames: u32,
     },
+    /// Inventory of boundary state SHAPES over saved frames (plans/
+    /// native-probe.md: the per-shape row/overlay architecture needs the
+    /// finite list of shapes the campaigns actually reach). One row per
+    /// distinct `StateShape` per dir: object-type label, frame range,
+    /// state and lane counts. (`shape-census` is the older single-frame
+    /// lane-grouping diagnostic; this walks whole dirs.)
+    ShapeInventory {
+        /// Checkpoint dirs (with frames/ subdirs), repeatable.
+        #[arg(long, required = true)]
+        checkpoint_dir: Vec<String>,
+    },
 }
 
 fn peak_rss_kb() -> u64 {
@@ -3561,6 +3572,113 @@ fn main() -> Result<()> {
                 }
                 if lanes > 0 {
                     println!("{}\t{}\t{}\t{}", f, min_x, max_x, lanes);
+                }
+            }
+        }
+        Command::ShapeInventory { checkpoint_dir } => {
+            use celeste_rust::interpreter::inspect::StateHelper;
+            use celeste_rust::interpreter::value::{HeapValue, Value};
+            use celeste_rust::rewrite::checkpoint;
+            for dir_str in &checkpoint_dir {
+                let dir = std::path::PathBuf::from(dir_str);
+                let frames_dir = dir.join("frames");
+                let mut frame_nums: Vec<u32> = match std::fs::read_dir(&frames_dir) {
+                    Ok(rd) => rd
+                        .filter_map(|e| {
+                            let name = e.ok()?.file_name().into_string().ok()?;
+                            let stem = name.strip_prefix('f')?.strip_suffix(".bin")?;
+                            stem.parse().ok()
+                        })
+                        .collect(),
+                    Err(e) => {
+                        println!("{}: no frames dir ({})", dir_str, e);
+                        continue;
+                    }
+                };
+                frame_nums.sort_unstable();
+                // shape hash -> (label, states, lanes, first frame, last frame)
+                let mut census: std::collections::BTreeMap<u64, (String, usize, usize, u32, u32)> =
+                    Default::default();
+                for &f in &frame_nums {
+                    let states = match checkpoint::load_frame_states(&dir, f) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            println!("{} f{:03}: load failed ({})", dir_str, f, e);
+                            continue;
+                        }
+                    };
+                    for state in &states {
+                        let shape =
+                            celeste_rust::interpreter::vectorize::debug_shape_of_state(state);
+                        let helper = StateHelper::new(state);
+                        // Label: the object-type global names of the objects
+                        // array, in array order. Type tables are found by
+                        // reverse lookup over the global env.
+                        let type_name = |type_target: celeste_rust::interpreter::heap::HeapId|
+                            -> String {
+                            for (name, gcell) in state.global_env.iter() {
+                                if let HeapValue::Value(Value::Pointer(t)) = helper.load(*gcell) {
+                                    if *t == type_target {
+                                        return name.clone();
+                                    }
+                                }
+                            }
+                            format!("?type@{:?}", type_target)
+                        };
+                        let label = (|| -> Option<String> {
+                            let objects = helper.find_global("objects")?;
+                            let HeapValue::Value(Value::Pointer(arr)) = helper.load(objects)
+                            else { return None };
+                            let HeapValue::ArrayTable(items) = helper.load(*arr) else {
+                                return None;
+                            };
+                            let mut parts = Vec::new();
+                            for item in items {
+                                let HeapValue::Value(Value::Pointer(obj)) = helper.load(*item)
+                                else { parts.push("?".into()); continue };
+                                let HeapValue::ObjectTable(fields) = helper.load(*obj) else {
+                                    parts.push("?".into());
+                                    continue;
+                                };
+                                match fields.get("type") {
+                                    Some(tcell) => match helper.load(*tcell) {
+                                        HeapValue::Value(Value::Pointer(t)) => {
+                                            parts.push(type_name(*t))
+                                        }
+                                        _ => parts.push("?".into()),
+                                    },
+                                    None => parts.push("<no-type>".into()),
+                                }
+                            }
+                            Some(parts.join("+"))
+                        })()
+                        .unwrap_or_else(|| "<no objects array>".to_string());
+                        let entry = census.entry(shape.cached_hash()).or_insert((
+                            label,
+                            0,
+                            0,
+                            f,
+                            f,
+                        ));
+                        entry.1 += 1;
+                        entry.2 += state.vector_size;
+                        entry.4 = f;
+                    }
+                }
+                println!(
+                    "== {} ({} frames: f{:03}..f{:03}, {} distinct shapes)",
+                    dir_str,
+                    frame_nums.len(),
+                    frame_nums.first().copied().unwrap_or(0),
+                    frame_nums.last().copied().unwrap_or(0),
+                    census.len()
+                );
+                println!("shape_hash\tlabel\tstates\tlanes\tfirst\tlast");
+                for (hash, (label, states, lanes, first, last)) in &census {
+                    println!(
+                        "{:016x}\t{}\t{}\t{}\tf{:03}\tf{:03}",
+                        hash, label, states, lanes, first, last
+                    );
                 }
             }
         }
