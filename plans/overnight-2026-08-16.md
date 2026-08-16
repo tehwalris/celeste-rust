@@ -195,15 +195,51 @@ re-deriving a room costs hours. Do them ALL, then re-derive ONCE.
       Given all of the above, **there is no reason to turn VARIANTS on for
       room (0,0) yet**: 0.0% at f048, and `pos-graph`/`sweep` - the largest
       stages - cannot dispatch at all.
+      **Two corrections to what I wrote above, both mine.**
+
+      The "232 entries = 26% of the optimisation" line is WRONG and stays
+      here as the error it was: I priced the prize by ENTRY COUNT. The
+      control prices the entries directly, because room (1,0) runs both
+      recipes - f037, identical lane counts, re-verified independently:
+      base 1.82s vs shape-agnostic 2.03/2.07s = **11.5%**. And 83% of even
+      that is the 34 entries S2 provably cannot have. Entry count is not
+      value; measure the gap before building the bridge.
+
+      Also "a variant cannot change the answer, only the speed" is right
+      about the row SETS and wrong about the row IDS - `states.bin` differs
+      byte-wise, because a variant frame emits lanes in a different order
+      and multiplicity and ids are assigned on insertion. Checkpoints stay
+      interchangeable (everything downstream reads ids out of the tree it
+      was handed), but artifacts are not byte-comparable across the setting.
+
+      **STRATEGIC CONSEQUENCE - this is why the plan changes.** Room (0,0)'s
+      forward pass is not where its time goes. The campaign is 2.62h and
+      `pos-graph` ALONE is 3567s. Tuning the forward pass was the wrong
+      target, and B2 is the measurement that proves it rather than an
+      opinion. The bottleneck work is #109 (fuse pos-graph into the forward
+      pass - already built, already measured 2.1x on the build phase, and
+      already gated on room (2,0)) and #114 (pos-graph/sweep cannot dispatch
+      variants at all today).
+
+      So: do NOT open per-shape work for room (2,0) speculatively. Get the
+      room running, measure where its time actually goes, and only then
+      decide. That order is the whole lesson of B2.
+
 - [ ] B3 Room (1,0) recipe complete on the same footing.
 - [ ] B4 NOTE: `rewrites-room00.jsonl` is a SECOND recipe file and needs the
       same `foreach` re-derivation as the base one. Check it replays.
 
-### C. Room 3 = (2,0)
+### C. Room 3 = (2,0)   <- REORDERED after B2's negative result
 
+- [ ] C0 **Get it running and find the bottleneck FIRST.** Bench room (2,0)
+      at a few depths with the base recipe, with FUSE=1 (which ladder.sh
+      already supports and which is already gated on THIS room), and see
+      the stage split. B2's lesson: measure before building.
 - [ ] C1 Shapes census for (2,0): fruit + 2 springs. What object-array
-      shapes actually occur, and for how many lanes each.
-- [ ] C2 Per-shape recipes.
+      shapes actually occur, and for how many lanes each. Diagnostic, not a
+      commitment to build variants.
+- [ ] C2 Per-shape recipes - ONLY if C0/C1 show the forward pass is where
+      the time is AND a control prices the missing entries as worth it.
 - [ ] C3 Widening: the band-filter soundness issue (verify.rs `None =>` arm,
       k=1 misses must be fatal), and whatever the fruit's `off` widening
       needs now that `sin` is exact.
