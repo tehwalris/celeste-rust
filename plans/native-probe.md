@@ -196,3 +196,24 @@ Probe grows `--from-checkpoint DIR --frame N --lane L` mode for this and
 for the abstract-oracle runs later. Priority order by inventory lane mass:
 room1 player shape, then room20 fruit+spring+spring+player pair, then
 room00 fake_wall+player.
+
+### Gap census implementation state (checkpoint for continuation)
+
+- native-probe/src/import.rs WRITTEN: State->Rt importer (per-lane, memoized
+  cycle-safe, drops program-unnamed fields/globals, interval cells get
+  low-endpoint placeholders under a flag; MaybeBool panics).
+- TODO next, in order:
+  1. Rt: cart/cache fields -> Arc (share across per-lane Rt rebuilds);
+     add `site_log: Vec<u64>` (0=unseen, cell+1, MAX=multi lattice).
+  2. transpile.rs: number get_field/get_index sites, pass SITE arg;
+     emit SITE_INFO: &[(kind, fn_name, name_id)] + N_SITES in gen.rs.
+  3. main.rs: `--from-checkpoint DIR --frame N [--census-frames K]
+     [--max-lanes M]` mode: per matching lane fresh heap/globals,
+     import_lane, run K frames over a few input bytes, join site_log into
+     a global accumulator; report gaps (MULTI sites) grouped by fn with
+     resolved names + columnizable percentage.
+  4. Cargo.toml probe profile: panic=abort -> unwind (census must survive
+     per-lane premise panics via catch_unwind); RE-BASELINE the 2.5us
+     bench after the switch.
+- Then: emit the row program for the room1 player shape (columnizable
+  sites -> fixed row slots with runtime guards), gap list -> overlay work.
