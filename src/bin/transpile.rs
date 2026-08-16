@@ -466,10 +466,18 @@ fn str_array(name: &str, items: &[String]) -> String {
 
 fn main() -> Result<()> {
     let mut rewritten = false;
+    let mut recipe_path = "rewrites.jsonl".to_string();
     let mut out_path = "native-probe/src/gen.rs".to_string();
-    for arg in std::env::args().skip(1) {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "--rewritten" => rewritten = true,
+            "--recipe" => {
+                recipe_path = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--recipe needs a path"))?;
+                rewritten = true;
+            }
             other => out_path = other.to_string(),
         }
     }
@@ -480,9 +488,12 @@ fn main() -> Result<()> {
         // program's (each entry is differentially verified), so the same
         // concrete_run oracle applies - transpiling it exercises the
         // recipe-planted instructions (Select/Expand/Kill/guards) natively.
-        let recipe = celeste_rust::rewrite::recipe::Recipe::load("rewrites.jsonl")?;
+        // `--recipe` selects a different recipe file - the compile-only
+        // overlay recipes (rewrites-compile.jsonl) live here, never in the
+        // runner.
+        let recipe = celeste_rust::rewrite::recipe::Recipe::load(&recipe_path)?;
         let (program, _) = celeste_rust::rewrite::recipe::build(&recipe)
-            .context("apply rewrites.jsonl (run from the repo root)")?;
+            .with_context(|| format!("apply {} (run from the repo root)", recipe_path))?;
         program
     } else {
         Program::compile_executable_from_disk()

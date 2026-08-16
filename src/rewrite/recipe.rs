@@ -1209,13 +1209,28 @@ mod checked_in_recipe_tests {
     /// Discovering that by hand, one room later, is the expensive way.
     #[test]
     fn every_checked_in_recipe_replays() {
-        for path in ["rewrites.jsonl", "rewrites-room00.jsonl", "rewrites-room00-s2.jsonl"] {
-            if !std::path::Path::new(path).exists() {
-                // Run from a different working directory; the other tests
-                // that need the tree skip the same way.
-                continue;
-            }
-            let recipe = super::Recipe::load(path).unwrap_or_else(|e| panic!("{}: {:#}", path, e));
+        // Glob, don't enumerate: a hardcoded list here silently skipped
+        // rewrites-room20.jsonl for a day. Any `rewrites*.jsonl` at the
+        // repo root is a checked-in recipe and must replay.
+        let mut paths: Vec<String> = std::fs::read_dir(".")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.starts_with("rewrites") && n.ends_with(".jsonl"))
+            .collect();
+        paths.sort();
+        if !std::path::Path::new("rewrites.jsonl").exists() {
+            // Run from a different working directory; the other tests
+            // that need the tree skip the same way.
+            return;
+        }
+        assert!(
+            !paths.is_empty(),
+            "rewrites.jsonl exists but the glob found nothing - broken test"
+        );
+        for path in paths {
+            let recipe = super::Recipe::load(&path).unwrap_or_else(|e| panic!("{}: {:#}", path, e));
             super::build(&recipe)
                 .unwrap_or_else(|e| panic!("{} does not replay: {:#}", path, e));
         }
