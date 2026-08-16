@@ -1,16 +1,43 @@
-// WARNING All the functions in this module are not really tested against pico8.
+// Verified against a REAL PICO-8 0.2.7a6 (see `pico8_diff/`): `sin` is now a
+// dumped table rather than a model, literal parsing follows the console's
+// truncate-and-wrap rule, and `+ - * /` and `%` were measured to agree.
+//
+// STILL NOT VERIFIED, and each is a place a proof could quietly be wrong:
+// `abs(-32768)` (the console saturates, we wrap negative), division by zero
+// and division overflow (the console saturates, we panic or wrap), and every
+// builtin this interpreter does not implement yet. See
+// `pico8_diff/known_fail.txt`.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::{
     fmt,
-    num::ParseFloatError,
     ops::{Add, Div, Mul, Neg, Rem, Sub},
     str::FromStr,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Pico8Num(i32);
+
+/// The console's `sin`, tabulated. Little-endian `i32` in 16.16, one entry
+/// per distinguishable input of the first half-turn; see `pico8_sin` and
+/// `pico8_diff/gen/README.md` for how it was dumped and why 16384 entries
+/// cover all 65536 inputs exactly.
+static SIN_TABLE: [i32; 16384] = {
+    let bytes = *include_bytes!("../cart/pico8_sin_table.bin");
+    let mut table = [0i32; 16384];
+    let mut i = 0;
+    while i < 16384 {
+        table[i] = i32::from_le_bytes([
+            bytes[i * 4],
+            bytes[i * 4 + 1],
+            bytes[i * 4 + 2],
+            bytes[i * 4 + 3],
+        ]);
+        i += 1;
+    }
+    table
+};
 
 impl Pico8Num {
     pub const fn from_i16(v: i16) -> Self {
@@ -58,13 +85,49 @@ impl Pico8Num {
         self.0 as u32
     }
 
-    pub fn from_f32(n: f32) -> Self {
-        // TODO this is probably not accurate
-        if n < 0. {
-            Self::from_f32(-n).const_neg()
-        } else {
-            Self::from_parts(n as i16, ((n - n.floor()) * 65536.) as u16)
+    /// Parse a decimal literal the way the console does: multiply by 65536,
+    /// TRUNCATE toward zero, and let an out-of-range integer part WRAP.
+    ///
+    /// Measured on a real PICO-8 rather than assumed - `0.0000076` (just
+    /// under half an ulp) is 0, `0.0000153` is 1, so it truncates and does
+    /// not round; `65535` is `0xffff.0000`, i.e. -1, so the integer part
+    /// wraps rather than saturating.
+    ///
+    /// This replaces a route through `f32`, which was wrong twice over: f32
+    /// has 24 mantissa bits for a format that needs 31, and `n as i16`
+    /// SATURATES in Rust, so the literal `32768` came out as 32767 and
+    /// `-32768` as -32767. Neither bug was reachable from this cart - all 55
+    /// of its distinct literals parse identically either way, which is why
+    /// this change moves nothing - but "not currently reachable" is a poor
+    /// thing to rest a proof on.
+    ///
+    /// Done in `i128` on the digits rather than in floating point so that
+    /// the arithmetic is exact by construction for any input length.
+    fn parse_decimal(s: &str) -> Option<Self> {
+        let (negative, digits) = match s.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, s),
+        };
+        let (int_text, frac_text) = match digits.split_once('.') {
+            Some((i, f)) => (i, f),
+            None => (digits, ""),
+        };
+        if int_text.is_empty() && frac_text.is_empty() {
+            return None;
         }
+        if !int_text.bytes().chain(frac_text.bytes()).all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let int_part: i128 = if int_text.is_empty() { 0 } else { int_text.parse().ok()? };
+        // floor(0.frac * 65536), exactly: the fraction is frac/10^len.
+        let mut frac_raw: i128 = 0;
+        if !frac_text.is_empty() {
+            let scaled: i128 = frac_text.parse().ok()?;
+            let denominator = 10i128.checked_pow(u32::try_from(frac_text.len()).ok()?)?;
+            frac_raw = scaled.checked_mul(65536)? / denominator;
+        }
+        let raw = (int_part << 16).wrapping_add(frac_raw) as i32;
+        Some(Self(if negative { raw.wrapping_neg() } else { raw }))
     }
 
     pub const fn const_mul(&self, rhs: &Self) -> Self {
@@ -73,12 +136,24 @@ impl Pico8Num {
         Self(low as i32)
     }
 
+    /// Negation WRAPS: the console gives `-(-32768) == -32768`.
+    ///
+    /// `-self.0` panics on `i32::MIN` in debug builds and wraps in release,
+    /// so this was already the release behaviour - but by accident, and with
+    /// a debug-only panic waiting in it.
     pub const fn const_neg(self) -> Self {
-        Self(-self.0)
+        Self(self.0.wrapping_neg())
     }
 
+    /// `abs` SATURATES, unlike negation: the console gives
+    /// `abs(-32768) == 0x7fff.ffff` while `-(-32768) == -32768`.
+    ///
+    /// The asymmetry is real and measured, not a guess. `self.0.abs()` gave
+    /// a NEGATIVE magnitude here (wrapping back to -32768 in release,
+    /// panicking in debug), which is the kind of thing that turns into a
+    /// wrong answer rather than a crash.
     pub const fn abs(self) -> Self {
-        Self(self.0.abs())
+        Self(self.0.saturating_abs())
     }
 
     pub const fn flr(self) -> Self {
@@ -90,28 +165,31 @@ impl Pico8Num {
     }
 
     /// PICO-8 `sin`: the argument is in TURNS and the result is INVERTED
-    /// (sin(0.25) == -1). Modeled on the console's C implementation: the
-    /// argument is first reduced to [0, 1) IN FIXED POINT (the 16
-    /// fractional bits - exact, and periodicity mod one turn holds by
-    /// construction, which the fruit-off boundary widening in
-    /// `abstraction::apply_conservative_widenings` depends on); then the chain
-    /// runs in f32 (`sinf`), converted to 16.16 by C-style truncation
-    /// toward zero (Rust `as i32`). Without the reduction, f32 loses
-    /// fractional mantissa bits for arguments past 1.0 and sin(102/40) !=
-    /// sin(22/40) by an ulp - caught by test_pico8_sin_period_40_bit_exact.
+    /// (sin(0.25) == -1). A TABLE DUMPED FROM A REAL CONSOLE, not a formula.
     ///
-    /// The quarter-turn values are exact by construction (see tests). Full
-    /// bit-exactness against a real console has NOT been verified yet; the
-    /// fruit's bob only ever evaluates sin on the 40 residues of off/40, so
-    /// a dumped table from real PICO-8 can pin all of them - see
-    /// plans/room00-plan.md before trusting a proof that depends on fruit
-    /// collection timing.
+    /// This used to be `-sinf(2πx)` in f32, and that model was WRONG - by up
+    /// to 13 ulps, on 41 of the 52 arguments the fruit's bob actually
+    /// evaluates. The old doc comment asked for exactly this dump before
+    /// trusting any proof that depends on fruit collection timing; here it
+    /// is. There is no approximation left to be wrong: `sin` reduces mod one
+    /// turn, so its domain is finite and it is simply tabulated.
+    ///
+    /// The table is 16384 entries rather than 65536 because two properties
+    /// were measured to hold over every input (see
+    /// `pico8_diff/gen/README.md`): the console's `sin` is constant over
+    /// blocks of two adjacent inputs, and `sin(x + 0.5) == -sin(x)` exactly.
+    /// `sin(0.5 - x) == sin(x)` does NOT hold even though real sine says it
+    /// must, which is the clearest possible sign that tabulating beats
+    /// modelling here.
+    ///
+    /// Periodicity mod one turn is exact by construction, which the
+    /// fruit-off boundary widening in
+    /// `abstraction::apply_conservative_widenings` depends on.
     pub fn pico8_sin(self) -> Self {
         // Two's-complement masking IS floored mod 1.0: -0.25 -> 0.75.
-        let reduced = self.0 & 0xffff;
-        let turns = reduced as f32 / 65536.0;
-        let v = -(turns * (2.0 * std::f32::consts::PI)).sin();
-        Self((v * 65536.0) as i32)
+        let frac = (self.0 & 0xffff) as u32;
+        let entry = SIN_TABLE[((frac & 0x7fff) >> 1) as usize];
+        Self(if frac < 0x8000 { entry } else { -entry })
     }
 }
 
@@ -190,9 +268,39 @@ impl Mul for Pico8Num {
 impl Div for Pico8Num {
     type Output = Self;
 
+    /// Truncate toward zero, and SATURATE to +/-0x7fff.ffff if the exact
+    /// quotient does not fit - including division by zero.
+    ///
+    /// Measured on a real console. Three facts pin the rule down and the
+    /// obvious implementations get at least one wrong:
+    ///
+    /// * `1/0 = 0x7fff.ffff`, `-1/0 = 0x8000.0001`, `0/0 = 0x7fff.ffff`.
+    ///   Division by zero is a saturating infinity with a sign, not a trap.
+    ///   We used to `wrapping_div` by zero, which PANICS - and a panic where
+    ///   the console keeps running is a soundness hole, not a safe failure:
+    ///   the search would lose states PICO-8 reaches.
+    /// * The negative bound is `0x8000.0001`, one ulp above the most
+    ///   negative value, so the clamp is SYMMETRIC at +/-0x7fff.ffff.
+    /// * But `min/1 = 0x8000.0000` - a quotient that FITS is returned
+    ///   unchanged even though it lies outside that symmetric range. So the
+    ///   clamp applies to overflow only, and a blanket clamp would be wrong.
     fn div(self, rhs: Self) -> Self::Output {
-        let self_high = (self.0 as i64) << 16;
-        Self((self_high.wrapping_div(rhs.0 as i64)) as i32)
+        const LIMIT: i64 = 0x7fff_ffff;
+        if rhs.0 == 0 {
+            // 0/0 saturates POSITIVE on the console, so `>= 0` not `> 0`.
+            return Self(if self.0 >= 0 { LIMIT as i32 } else { -(LIMIT as i32) });
+        }
+        let quotient = ((self.0 as i64) << 16) / (rhs.0 as i64);
+        Self(match i32::try_from(quotient) {
+            Ok(exact) => exact,
+            Err(_) => {
+                if quotient > 0 {
+                    LIMIT as i32
+                } else {
+                    -(LIMIT as i32)
+                }
+            }
+        })
     }
 }
 
@@ -206,17 +314,24 @@ impl Pico8Num {
     /// would not have reached it, so this is a case the interpreter has to
     /// report rather than abort on.
     ///
-    /// PICO-8's `%` is floored modulo on the fixed-point representation: the
-    /// result takes the divisor's sign, so `-2 % 8 == 6` and `-2.5 % 8 ==
-    /// 5.5`. For a positive integer divisor that is exactly
-    /// `((raw % raw_rhs) + raw_rhs) % raw_rhs`, which also reproduces what
-    /// the OCaml reference computes on its narrower non-negative domain
-    /// (whole part mod, fraction kept). A non-positive or fractional divisor
-    /// stays unmodelled.
+    /// PICO-8's `%` is exactly `i32::rem_euclid` on the raw fixed-point
+    /// bits, with `a % 0 == 0`. The result is NEVER negative.
+    ///
+    /// This doc used to say the result "takes the divisor's sign", which is
+    /// what Lua does and what PICO-8 does NOT: the console gives
+    /// `7 % -3 == 1`, where Lua gives -2. Measured across all four sign
+    /// combinations, fractional divisors and zero - 20 of 20 data points
+    /// agree with `rem_euclid`. The old `rhs <= 0` and non-integer guards
+    /// were therefore refusing cases the same line already computed
+    /// correctly.
+    ///
+    /// Still an `Option` because callers interpreting a program must be able
+    /// to handle a case this does not model rather than abort - `if_convert`
+    /// deliberately runs arithmetic on lanes that would not have reached it.
+    /// Nothing currently returns `None`.
     pub fn checked_rem(self, rhs: Self) -> Option<Self> {
-        let rhs_int = rhs.as_i16()?;
-        if rhs_int <= 0 {
-            return None;
+        if rhs.0 == 0 {
+            return Some(Self(0));
         }
         Some(Self(self.0.rem_euclid(rhs.0)))
     }
@@ -240,10 +355,11 @@ impl Neg for Pico8Num {
 }
 
 impl FromStr for Pico8Num {
-    type Err = ParseFloatError;
+    type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self::from_f32(s.parse()?))
+        Self::parse_decimal(s.trim())
+            .ok_or_else(|| anyhow::anyhow!("{:?} is not a PICO-8 number literal", s))
     }
 }
 
@@ -389,10 +505,21 @@ mod tests {
             neg_half.checked_rem(eight),
             Some(Pico8Num::from_parts(5, 0x8000)) // 5.5
         );
-        // Non-positive or fractional divisors stay unmodelled.
-        assert_eq!(n(1).checked_rem(n(0)), None);
-        assert_eq!(n(1).checked_rem(n(-8)), None);
-        assert_eq!(n(1).checked_rem(half), None);
+        // These three used to assert `None` - "unmodelled". They are not
+        // unmodelled; the console answers them, and the single `rem_euclid`
+        // line already computed those answers correctly while the guards
+        // above it threw them away. Measured on a real PICO-8 0.2.7a6:
+        assert_eq!(n(1).checked_rem(n(0)), Some(n(0)), "1 % 0");
+        assert_eq!(n(0).checked_rem(n(0)), Some(n(0)), "0 % 0");
+        assert_eq!(n(-1).checked_rem(n(0)), Some(n(0)), "-1 % 0");
+        assert_eq!(n(1).checked_rem(n(-8)), Some(n(1)), "1 % -8");
+        assert_eq!(n(1).checked_rem(half), Some(n(1)), "1 % 2.5");
+        assert_eq!(n(7).checked_rem(half), Some(n(2)), "7 % 2.5");
+        assert_eq!(
+            n(-7).checked_rem(half),
+            Some(Pico8Num::from_parts(0, 0x8000)),
+            "-7 % 2.5"
+        );
     }
 
     #[test]
@@ -495,5 +622,143 @@ mod tests {
         assert_eq!(x.pico8_sin(), y.pico8_sin());
         // Sign: just past 0 the inverted sine goes negative.
         assert!((x.pico8_sin().as_raw_u32() as i32) < 0);
+    }
+
+    /// Literal parsing, against a REAL PICO-8 0.2.7a6.
+    ///
+    /// The two rounding probes are the point: `0.0000076` is just UNDER half
+    /// an ulp and `0.0000153` just over one, so together they show the
+    /// console truncates rather than rounds. `65535` and `32768` show the
+    /// integer part wraps rather than saturating - which is what the old
+    /// `n as i16` got wrong, since Rust float-to-int casts saturate.
+    #[test]
+    fn literals_parse_the_way_the_console_parses_them() {
+        for (text, expected) in [
+            ("0.1", 0x0000_1999_u32),
+            ("0.3", 0x0000_4ccc),
+            ("0.7", 0x0000_b333),
+            ("32767.99998", 0x7fff_fffe),
+            ("1000.00002", 0x03e8_0001),
+            ("0.0000076", 0x0000_0000),
+            ("0.0000153", 0x0000_0001),
+            ("32768", 0x8000_0000),
+            ("65535", 0xffff_0000),
+            ("0.05", 0x0000_0ccc),
+            ("1.5", 0x0001_8000),
+        ] {
+            let got: Pico8Num = text.parse().expect("a valid literal");
+            assert_eq!(
+                got.to_bits(),
+                expected,
+                "literal {} parsed as {:#010x}, console says {:#010x}",
+                text,
+                got.to_bits(),
+                expected
+            );
+        }
+        assert!("".parse::<Pico8Num>().is_err());
+        assert!("1.2.3".parse::<Pico8Num>().is_err());
+        assert!("nope".parse::<Pico8Num>().is_err());
+    }
+
+    /// Division and the +/-32768 edges, against a REAL PICO-8 0.2.7a6.
+    ///
+    /// `min/1` next to `min/-1` is the case that rules out a blanket clamp:
+    /// the first FITS and is returned unchanged at `0x8000.0000`, outside
+    /// the symmetric range the second saturates into. And `-min` next to
+    /// `abs(min)` is the case that rules out treating the two as the same
+    /// operation: negation wraps, `abs` saturates.
+    #[test]
+    fn division_and_the_range_edges_match_the_console() {
+        let raw = |bits: u32| Pico8Num(bits as i32);
+        let min = int(-32768);
+        for (label, got, expected) in [
+            ("1/0", int(1) / int(0), 0x7fff_ffff_u32),
+            ("-1/0", int(-1) / int(0), 0x8000_0001),
+            ("0/0", int(0) / int(0), 0x7fff_ffff),
+            ("32767/0.5", int(32767) / raw(0x0000_8000), 0x7fff_ffff),
+            ("-32767/0.5", int(-32767) / raw(0x0000_8000), 0x8000_0001),
+            ("min/1", min / int(1), 0x8000_0000),
+            ("min/-1", min / int(-1), 0x7fff_ffff),
+            ("min*-1", min * int(-1), 0x8000_0000),
+            ("-min", -min, 0x8000_0000),
+            ("abs(min)", min.abs(), 0x7fff_ffff),
+            ("-7/2", int(-7) / int(2), 0xfffc_8000),
+            ("7/-2", int(7) / int(-2), 0xfffc_8000),
+            ("1/3", int(1) / int(3), 0x0000_5555),
+            ("-1/3", int(-1) / int(3), 0xffff_aaab),
+        ] {
+            assert_eq!(
+                got.to_bits(),
+                expected,
+                "{} gave {:#010x}, console says {:#010x}",
+                label,
+                got.to_bits(),
+                expected
+            );
+        }
+    }
+
+    /// `%` against a REAL PICO-8 0.2.7a6, all four sign combinations.
+    ///
+    /// `7 % -3 == 1` is the one that matters: Lua gives -2, so anything
+    /// that reuses host `%` semantics is wrong here.
+    #[test]
+    fn modulo_matches_the_console_in_every_sign_combination() {
+        for (a, b, expected) in [
+            (7, 3, 1),
+            (-7, 3, 2),
+            (7, -3, 1),
+            (-7, -3, 2),
+            (7, 0, 0),
+            (-7, 0, 0),
+        ] {
+            let got = (int(a) % int(b)).to_bits();
+            let want = int(expected).to_bits();
+            assert_eq!(got, want, "{} % {} gave {:#010x}, want {:#010x}", a, b, got, want);
+        }
+        // The result is never negative, whatever the divisor's sign.
+        for b in [-9i16, -1, 1, 9] {
+            for a in [-100i16, -1, 0, 1, 100] {
+                assert!(
+                    (int(a) % int(b)).to_bits() as i32 >= 0,
+                    "{} % {} came out negative",
+                    a,
+                    b
+                );
+            }
+        }
+    }
+
+    /// Values read off a REAL PICO-8 0.2.7a6 with `tostr(sin(x), true)`.
+    ///
+    /// The point of these is that the old `-sinf(2πx)` model passes the
+    /// quarter-turn test above and still gets every one of these wrong -
+    /// `sin(1/40)` by 13 ulps. Quarter turns are the values a model is most
+    /// likely to get right by construction, so on their own they certify
+    /// almost nothing; these are arbitrary interior points, which is exactly
+    /// what makes them worth pinning.
+    #[test]
+    fn pico8_sin_matches_the_console_at_interior_points() {
+        // sin(i/40) for i = 1..7 - the fruit bob's own arguments.
+        let want: [i32; 7] = [
+            0xffffd7ea_u32 as i32,
+            0xffffb0e9_u32 as i32,
+            0xffff8bc3_u32 as i32,
+            0xffff698f_u32 as i32,
+            0xffff4afb_u32 as i32,
+            0xffff30de_u32 as i32,
+            0xffff1be9_u32 as i32,
+        ];
+        for (index, expected) in want.iter().enumerate() {
+            let i = i16::try_from(index + 1).expect("small");
+            let turns = int(i) / int(40);
+            assert_eq!(
+                turns.pico8_sin().as_raw_u32() as i32,
+                *expected,
+                "sin({}/40) disagrees with the console",
+                i
+            );
+        }
     }
 }

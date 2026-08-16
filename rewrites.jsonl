@@ -130,7 +130,6 @@
 {"cell":"%3","fn":"__assert_2","id":"p1_124","rule":"promote_cell"}
 {"cell":"%0","fn":"foreach_1","id":"p1_125","rule":"promote_cell"}
 {"cell":"%3","fn":"foreach_1","id":"p1_126","rule":"promote_cell"}
-{"cell":"%15","fn":"foreach_1","id":"p1_127","rule":"promote_cell"}
 {"cell":"%0","fn":"add_0","id":"p1_128","rule":"promote_cell"}
 {"cell":"%3","fn":"add_0","id":"p1_129","rule":"promote_cell"}
 {"id":"c2a","rule":"fold"}
@@ -824,9 +823,6 @@
 {"id":"h043","rule":"fold_select"}
 {"id":"h044","rule":"dce"}
 {"id":"h045","rule":"fold"}
-{"fn":"__frame","head":"in_j2_006_for_head_1","id":"h050","rule":"collapse_break_loop"}
-{"fn":"__frame","head":"in_j2_008_for_head_1","id":"h051","rule":"collapse_break_loop"}
-{"fn":"__frame","head":"in_j2_009_for_head_1","id":"h052","rule":"collapse_break_loop"}
 {"fn":"player_spawn.update_24","head":"in_i1_063_in_i1_037_for_head_4","id":"h053","rule":"collapse_break_loop"}
 {"id":"h054","rule":"dce"}
 {"at":"%54","fn":"anonymous_61","global":"player","id":"h060","on":"%42","rule":"split_call"}

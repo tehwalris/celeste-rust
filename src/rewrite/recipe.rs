@@ -1167,3 +1167,29 @@ pub fn build(recipe: &Recipe) -> Result<(Program, Vec<StepReport>)> {
     }
     Ok((program, reports))
 }
+
+#[cfg(test)]
+mod checked_in_recipe_tests {
+    /// EVERY checked-in recipe must replay, not just the default one.
+    ///
+    /// `rewrites-room00.jsonl` sat broken through a commit and a full test
+    /// run because nothing exercised it: `isocheck` and the verify tests all
+    /// name `rewrites.jsonl` explicitly. The label densification invalidated
+    /// room (0,0)'s `%N` addressing exactly as it invalidated the base
+    /// recipe's, and only the base recipe had been migrated to stable names.
+    ///
+    /// Discovering that by hand, one room later, is the expensive way.
+    #[test]
+    fn every_checked_in_recipe_replays() {
+        for path in ["rewrites.jsonl", "rewrites-room00.jsonl"] {
+            if !std::path::Path::new(path).exists() {
+                // Run from a different working directory; the other tests
+                // that need the tree skip the same way.
+                continue;
+            }
+            let recipe = super::Recipe::load(path).unwrap_or_else(|e| panic!("{}: {:#}", path, e));
+            super::build(&recipe)
+                .unwrap_or_else(|e| panic!("{} does not replay: {:#}", path, e));
+        }
+    }
+}

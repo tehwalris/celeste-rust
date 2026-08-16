@@ -1,0 +1,22 @@
+# Cases that differ from a real PICO-8 today, one per line, with the reason.
+#
+# Format: <case name> <reason>
+#
+# These are reported as XFAIL and do not turn the suite red. A case listed
+# here that starts PASSING is reported as XPASS and DOES turn it red, so the
+# list cannot rot: fixing the bug forces removing the line.
+#
+# Everything below was measured on PICO-8 0.2.7a6 on 2026-08-16 - the exact
+# outputs are in the work directory run.sh keeps on failure. Nothing here has
+# been fixed: the whole point of this run was to find out what is wrong, and
+# every one of these changes numbers the game already depends on, so they
+# need to be fixed deliberately and with the checkpoint hashes re-derived.
+
+num_abs_min  abs(-32768) saturates to 0x7fff.ffff on PICO-8; ours is i32::MIN.abs(), which wraps back to -32768 in release and panics in debug (src/pico8_num.rs Pico8Num::abs)
+num_div_saturate  PICO-8 clamps an out-of-range quotient to [0x8000.0001, 0x7fff.ffff], including for a zero divisor; our Div wraps on overflow and PANICS on a zero divisor (i64::wrapping_div)
+num_literals  the literal 32768 is 0x8000.0000 on PICO-8 (wraps) but 0x7fff.0000 for us: Pico8Num::from_f32 does `n as i16`, and a Rust float-to-int cast SATURATES. So the literal -32768 evaluates to -32767 for us
+num_literals_precision  our literal path is text -> f32 -> Pico8Num, and an f32 has a 24-bit mantissa while 16.16 needs up to 31 significant bits, so a literal with a large whole part and a fine fraction (1000.00002, 32767.99998) loses low bits
+num_mod_signs  our checked_rem refuses a non-positive or fractional divisor. PICO-8 defines all of them: `a % b` is exactly i32::rem_euclid on the raw 16.16 bits (so the result is never negative and does not depend on the sign of b), and `a % 0` is 0
+num_sin  our pico8_sin models the console as -sinf(2*pi*turns) in f32; the console uses its own table, and the two differ by up to 13 ulps away from the quarter turns
+num_sin_fruit40  same cause as num_sin: 41 of the 52 fruit-bob arguments sin(off/40) differ, by up to 13 ulps (~2e-4). Periodicity in off -> off + 40 does hold on both sides
+seq_add_del_count  PICO-8's `add(t, v)` returns v; our Lua-level add (lua/builtin_level_4.lua) is `t[#t+1] = v` and returns nothing. Everything else in that case agrees

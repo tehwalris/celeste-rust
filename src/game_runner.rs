@@ -75,7 +75,11 @@ fn builtin_add(mut state: State, args: Vec<Value>) -> Result<Vec<(State, Value)>
         }
         other => return Err(anyhow!("add: first argument is not an array table: {:?}", other)),
     }
-    Ok(vec![(state, Value::Nil(None))])
+    // PICO-8's `add` RETURNS the value it appended; this returned nil.
+    // Nothing in the cart uses the result - checked - so the difference is
+    // latent, but "not reachable today" is the reasoning that left `foreach`
+    // wrong for months.
+    Ok(vec![(state, args[1].clone())])
 }
 
 fn builtin_new_unknown_boolean(state: State, args: Vec<Value>) -> Result<Vec<(State, Value)>> {

@@ -32,6 +32,10 @@ path = "src/bin/measure_k.rs"
 name = "rewrite"
 path = "src/bin/rewrite.rs"
 
+[[bin]]
+name = "lua_run"
+path = "src/bin/lua_run.rs"
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
