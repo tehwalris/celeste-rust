@@ -83,8 +83,12 @@ either at its roofline or carrying a precise measured gap-picture
   premise pattern that breaks a whole approach) get written up in plans/
   and that line stops, rather than pushing through.
 - Freeze-gate/dash and everything else here is fair game for this
-  session - nothing is reserved for Philippe except genuinely ambiguous
-  AND irreversible calls.
+  session - NOTHING is reserved for Philippe, including design
+  decisions he might not agree with. His explicit instruction: make the
+  call, keep moving; he may reverse a design in the morning and that is
+  fine and expected. Blocking on his judgment is the wrong move;
+  writing down WHY a call was made (so reversing it is cheap) is the
+  right one.
 
 ## Useful state from tonight (2026-08-17 early)
 
