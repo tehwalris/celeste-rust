@@ -164,6 +164,10 @@ impl Pico8Num {
         Self(self.0 - 1)
     }
 
+    pub const fn next_largest(self) -> Self {
+        Self(self.0 + 1)
+    }
+
     /// PICO-8 `sin`: the argument is in TURNS and the result is INVERTED
     /// (sin(0.25) == -1). A TABLE DUMPED FROM A REAL CONSOLE, not a formula.
     ///

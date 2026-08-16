@@ -323,6 +323,89 @@ fn builtin_split_by_flr(state: State, args: Vec<Value>) -> Result<Vec<(State, Va
     }
 }
 
+/// `__split_at(value, c)`: split lanes whose interval straddles the
+/// constant `c` into up to three states - {< c}, {== c}, {> c} - with
+/// the interval clipped to each side (plans/spd-rung.md, the
+/// split-before-compare design). Three-way rather than two so EVERY
+/// comparison operator against `c` is decidable downstream, whichever
+/// way the site is written. Concrete numbers pass through unsplit; they
+/// are already on a definite side.
+fn builtin_split_at(state: State, args: Vec<Value>) -> Result<Vec<(State, Value)>> {
+    if args.len() != 2 {
+        return Err(anyhow!("__split_at requires 2 arguments"));
+    }
+    let c = match &args[1] {
+        Value::Number(MaybeVector::Scalar(c)) => *c,
+        other => return Err(anyhow!("__split_at: threshold must be a scalar number, got {:?}", other)),
+    };
+    let full_low = Pico8Num::from_parts(i16::MIN, 0);
+    let full_high = Pico8Num::from_parts(i16::MAX, 0xffff);
+    // The three sides, as closed intervals. `c` at either representable
+    // extreme degenerates to two sides.
+    let mut sides: Vec<Pico8NumInterval> = Vec::with_capacity(3);
+    if c > full_low {
+        sides.push(Pico8NumInterval::new(full_low, c.next_smallest()));
+    }
+    sides.push(Pico8NumInterval::from_number(c));
+    if c < full_high {
+        sides.push(Pico8NumInterval::new(c.next_largest(), full_high));
+    }
+    match &args[0] {
+        v @ Value::Number(_) => Ok(vec![(state, v.clone())]),
+        Value::NumberInterval(MaybeVector::Scalar(interval)) => {
+            let mut results = Vec::new();
+            for side in &sides {
+                if let Some(clipped) = interval.intersect(side) {
+                    // The {== c} side degenerates to the CONCRETE number:
+                    // downstream equality then takes the exact Number
+                    // path. A point INTERVAL would hit the
+                    // `NumberInterval == _ => false` rule and evaluate
+                    // `~= c` as true - the wrong branch, silently.
+                    let value = if clipped.low == clipped.high {
+                        Value::Number(MaybeVector::Scalar(clipped.low))
+                    } else {
+                        Value::NumberInterval(MaybeVector::Scalar(clipped))
+                    };
+                    results.push((state.clone(), value));
+                }
+            }
+            Ok(results)
+        }
+        Value::NumberInterval(MaybeVector::Vector(intervals)) => {
+            let mut results = Vec::new();
+            for side in &sides {
+                let clipped: Vec<Option<Pico8NumInterval>> =
+                    intervals.iter().map(|iv| iv.intersect(side)).collect();
+                let mask: Vec<bool> = clipped.iter().map(|o| o.is_some()).collect();
+                if !mask.iter().any(|b| *b) {
+                    continue;
+                }
+                let filtered = state
+                    .filter_by_mask_clone(&mask, crate::interpreter::state::FILTER_SPLIT_FLR);
+                let kept: Vec<Pico8NumInterval> = clipped.into_iter().flatten().collect();
+                let value = if kept.iter().all(|iv| iv.low == iv.high) {
+                    // Degenerate (the {== c} side, or fully-collapsed
+                    // intervals): concrete numbers, see the scalar case.
+                    if kept.len() == 1 {
+                        Value::Number(MaybeVector::Scalar(kept[0].low))
+                    } else {
+                        Value::Number(MaybeVector::vector(
+                            kept.iter().map(|iv| iv.low).collect(),
+                        ))
+                    }
+                } else if kept.len() == 1 {
+                    Value::NumberInterval(MaybeVector::Scalar(kept[0]))
+                } else {
+                    Value::NumberInterval(MaybeVector::vector(kept))
+                };
+                results.push((filtered, value));
+            }
+            Ok(results)
+        }
+        other => Err(anyhow!("__split_at: argument must be a number, got {:?}", other)),
+    }
+}
+
 fn builtin_error(_state: State, args: Vec<Value>) -> Result<Vec<(State, Value)>> {
     match args.as_slice() {
         [] => Err(anyhow!("error called")),
@@ -759,6 +842,7 @@ pub fn create_fixed_env_with_builtins() -> FixedEnv {
     fixed_env.add_pure_builtin("abs", builtin_abs);
     fixed_env.add_pure_builtin("flr", builtin_flr);
     fixed_env.add_builtin("__split_by_flr", builtin_split_by_flr);
+    fixed_env.add_builtin("__split_at", builtin_split_at);
     fixed_env.add_builtin("add", builtin_add);
     fixed_env.add_builtin("print", builtin_print);
     fixed_env

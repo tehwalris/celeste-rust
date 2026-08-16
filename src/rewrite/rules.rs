@@ -54,6 +54,7 @@ pub mod promote_capture;
 pub mod promote_cell;
 pub mod sink_store;
 pub mod speculate;
+pub mod split_at;
 pub mod split_call;
 pub mod speculate_region;
 pub mod unroll_loop;

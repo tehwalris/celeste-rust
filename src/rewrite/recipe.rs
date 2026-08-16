@@ -24,7 +24,7 @@ use super::rules::{
     decompose_truthy, demote_create,
     expand_bool, fold, fold_reflexive, fold_select, fuse_breaks, if_convert, inline,
     mask_loop, merge_blocks,
-    pin_builtin,
+    pin_builtin, split_at,
     promote_capture,
     promote_cell, sink_store, speculate, speculate_region, split_call, unroll_loop, partition_merge, remove_hint, widen_buttons, widen_rem,
 };
@@ -128,6 +128,19 @@ pub enum Rule {
         at: String,
         /// Which builtin. Must be one of `fixed_env::PURE_BUILTINS`.
         name: String,
+    },
+    /// Insert a state-splitting `__split_at(value, c)` call after `at`'s
+    /// definition, redirecting later uses to the split result - the
+    /// split-before-compare fix for interval values straddling a game
+    /// decision threshold (plans/spd-rung.md). Semantically neutral on
+    /// concrete values; a refinement split on intervals.
+    SplitAt {
+        #[serde(rename = "fn")]
+        function: String,
+        /// The value's defining instruction, as `%N` or a stable name.
+        at: String,
+        /// The threshold, raw 16.16 hex ("0x0000" = 0, "0x1_0000" = 1).
+        threshold: String,
     },
     /// Turn one creating accessor into a plain read, guarded by an
     /// `assert_pointer`. Not semantics-preserving: it claims the field already
@@ -457,6 +470,7 @@ impl Rule {
             Rule::IfConvert { .. } => "if_convert",
             Rule::PromoteCapture { .. } => "promote_capture",
             Rule::PinBuiltin { .. } => "pin_builtin",
+            Rule::SplitAt { .. } => "split_at",
             Rule::DemoteCreate { .. } => "demote_create",
             Rule::ConvertTernary { .. } => "convert_ternary",
             Rule::DecomposeTruthy { .. } => "decompose_truthy",
@@ -502,7 +516,8 @@ impl Rule {
                 fields.extend(captures.iter_mut());
                 (function, fields)
             }
-            Rule::PinBuiltin { function, at, .. }
+            Rule::SplitAt { function, at, .. }
+            | Rule::PinBuiltin { function, at, .. }
             | Rule::DemoteCreate { function, at }
             | Rule::SinkStore { function, at }
             | Rule::DecomposeBranch { function, at } => (function, vec![at]),
@@ -752,6 +767,12 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::PinBuiltin { function, at, name } => {
             pin_builtin::apply(program, function, resolve_cell(&names, function, at)?, name)
         }
+        Rule::SplitAt { function, at, threshold } => split_at::apply(
+            program,
+            function,
+            resolve_cell(&names, function, at)?,
+            split_at::parse_threshold(threshold)?,
+        ),
         Rule::DemoteCreate { function, at } => {
             demote_create::apply(program, function, resolve_cell(&names, function, at)?)
         }
@@ -872,6 +893,13 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::PinBuiltin { function, at, name } => {
             pin_builtin::verify(&before, program, function, resolve_cell(&names, function, at)?, name)
         }
+        Rule::SplitAt { function, at, threshold } => split_at::verify(
+            &before,
+            program,
+            function,
+            resolve_cell(&names, function, at)?,
+            split_at::parse_threshold(threshold)?,
+        ),
         Rule::DemoteCreate { function, at } => {
             demote_create::verify(&before, program, function, resolve_cell(&names, function, at)?)
         }
