@@ -437,6 +437,10 @@ fn run_branch_census(dir: &str, frame: u32) {
     // Per site: first run's sequence hash + divergence flag.
     let mut first: Vec<Option<u64>> = vec![None; gen::BRANCH_INFO.len()];
     let mut div: Vec<bool> = vec![false; gen::BRANCH_INFO.len()];
+    // Distinct nonzero sequence hashes per site: a divergent site with ONE
+    // nonzero hash is a pure SHADOW of an upstream gate (it always does the
+    // same thing when it runs at all); real divergence needs >= 2.
+    let mut nonzero: Vec<Vec<u64>> = vec![Vec::new(); gen::BRANCH_INFO.len()];
     let mut panics = 0usize;
     // Axis 1: input fan-out (one lane, 64 bytes). Axis 2: lane batch
     // (byte 2 = hold right, up to 256 lanes spread across the state) -
@@ -481,6 +485,9 @@ fn run_branch_census(dir: &str, frame: u32) {
                 Some(f) if f != h => div[i] = true,
                 _ => {}
             }
+            if h != 0 && !nonzero[i].contains(&h) {
+                nonzero[i].push(h);
+            }
         }
     }
     let executed = first.iter().filter(|f| **f != Some(0) && f.is_some()).count();
@@ -498,7 +505,14 @@ fn run_branch_census(dir: &str, frame: u32) {
         panics
     );
     for i in &divergent {
-        println!("  site {}: {}", i, gen::BRANCH_INFO[*i]);
+        let n = nonzero[*i].len();
+        println!(
+            "  site {}: {} [{} distinct nonzero sequence(s){}]",
+            i,
+            gen::BRANCH_INFO[*i],
+            n,
+            if n <= 1 { " - SHADOW of an upstream gate" } else { "" }
+        );
     }
 }
 
