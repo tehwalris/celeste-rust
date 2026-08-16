@@ -225,3 +225,31 @@ extended-ladder agreement run, then the room (2,0) S(16) probe.
 * How much branch-doubling widened spd causes in move/collision physics
   (tri-state comparisons and straddle partitioning exist and are
   certified, but their cost here is an empirical question).
+
+## Room (2,0) S(16) probe, attempt 2 (2026-08-16 evening): OOM at f47
+
+`CELESTE_START_ROOM=2,0` + spd 1px + rem widened, `bench --frames 65
+--deopt --save-frames`, 100G cap. Killed by the cap (exit 137) at f47/48:
+lanes 2.6M (f42) -> 7.75M (f46), RSS peak 97.3 GB, frame times 180 -> 730 s.
+The expansion hump never bent. Two independent causes, both room-(2,0)
+artifacts, neither seen on room (1,0):
+
+1. **The fruit breaks the devirt entries.** Room (2,0) is a 3-object room
+   (player/spawn + fruit + ...); the `obj.type.update` devirtualization and
+   collapsed object loops assert `player_spawn.update_24 | player.update_21`
+   and fail on `fruit.update_34` - "retry failed for a non-premise reason";
+   **5,396 whole-state deopt fallbacks** over 47 frames. Every fallback runs
+   the plain program on the whole state: the frame cost multiplier plus
+   merge-hostile plain-path fragmentation.
+2. **Unsplit spd poison sites.** 3.86M UNKNOWN_STORE events:
+   LocalId(367) 2.59M, LocalId(18) 1.26M, LocalId(200) 3.2k, LocalId(602) 6.
+   These are the room-(2,0)-reachable analogues of the sp1_facing_x site -
+   each needs a `split_at` recipe entry (rule exists) at the right
+   threshold, or the stored unknowns fan out downstream.
+
+Consequence: the S(16) rung cannot be probed on 300 m until the recipe is
+made 3-object-clean - re-derive the devirt/collapse family for the fruit
+shape (relates to #113's foreach re-derivations) and place split_at entries
+for the four sites. The earlier row counts seen for f055-f065 (5.2M/8.0M/
+12.3M) came from a run whose frames this rerun's fresh derivation deleted;
+treat them as unverified until reproduced.
