@@ -6,3 +6,7 @@ perf_*.data*
 checkpoints/
 server/
 serve/
+
+# native-compile probe (task #124): generated code + build dir
+native-probe/src/gen.rs
+native-probe/target/

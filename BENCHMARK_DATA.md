@@ -2448,6 +2448,21 @@ i.e. ~0.5 ms per single-lane frame. The vectorized interpreter is already ~10x
 more efficient per lane than the scalar path at frame 30, so vectorization is
 working - the problem is what happens between frame boundaries.
 
+## Native speed of light (2026-08-16, plans/native-probe.md)
+
+The IR transpiled to plain Rust (`transpile` + `native-probe/`), single lane,
+hex-exact against `concrete_run` over a 400-frame randomized input tape, on
+an otherwise-idle core 15 with the campaign pinned off it:
+
+- **6.2-6.4 µs per frame-lane** (1000 reps x 400 frames). IPC 3.87,
+  cache-miss rate 0.91% - compute-bound, L1-resident.
+- Interpreted `concrete_run` same day, same core: ~1.14 ms/frame under
+  campaign load (~0.64 ms on a quiet machine) -> **~100-180x**.
+- The abstract interpreter's ~17 µs *per lane* means compiled scalar code
+  beats vectorized interpretation per lane by 2.7x - before any
+  specialization (v0 uses linear-scan field lookups and no allocation
+  reuse). This prices the compile-the-abstract-semantics direction.
+
 ## Historical note
 
 The numbers once in this file (frame 30 = 18 s, frame 39 = 1030 s, OOM at frame

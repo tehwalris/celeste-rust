@@ -52,3 +52,7 @@ panic = "unwind"
 # Frame pointers + line tables so `perf` can attribute cycles to source.
 # Costs nothing measurable and makes the profile readable.
 debug = 1
+
+[[bin]]
+name = "transpile"
+path = "src/bin/transpile.rs"
