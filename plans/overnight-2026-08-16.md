@@ -69,9 +69,24 @@ re-deriving a room costs hours. Do them ALL, then re-derive ONCE.
 
 ### B. Recipe completeness
 
-- [ ] B1 Re-derive the 4 entries the new `foreach` loop shape dropped
-      (h050/h051/h052 `collapse_break_loop` + p1_127). Optimisation only -
-      per-lane time went DOWN without them - but do not leave them lost.
+- [x] B1 PARKED, with a measurement rather than a guess. The 3 dropped
+      entries are `collapse_break_loop`; the new loop breaks on
+      `tbl[i] == nil` instead of `#tbl < i`, so the rule's shape check
+      refuses. Rather than extend the rule speculatively I priced it: the
+      ONE `collapse_break_loop` entry that still applies was removed and
+      re-benchmarked on an idle machine, 3 runs each.
+
+          with it:     0.90s / 0.90s / 0.90s   132153 lanes   6.8 us/lane
+          without it:  0.90s / 0.90s / 0.89s   132153 lanes   6.8 us/lane
+
+      Identical, to three digits and to the lane. It does change the program
+      (1754 -> 1764 blocks), so it applies - it just buys nothing at 34
+      frames on room (1,0). Extending the rule for the other three is
+      therefore not justified by anything measured yet. REVISIT for room
+      (2,0), which has more objects and where object-loop collapsing has
+      more to bite on; that is the case this measurement does NOT cover.
+      p1_127 is separate and not merely owed: `i`/`prev` are genuinely
+      multi-store loop-carried cells, which mem2reg-lite cannot promote.
 - [ ] B2 Room (0,0) **per-shape recipes** - task #86, and the "actually JIT"
       item. Sized, 2026-08-16:
 

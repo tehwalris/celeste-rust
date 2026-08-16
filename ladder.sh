@@ -14,6 +14,35 @@ ROOM=${ROOM:-1,0}
 export CELESTE_START_ROOM="$ROOM"
 if [ "$ROOM" = "1,0" ]; then STEM=room1; else STEM=room$(echo "$ROOM" | tr -d ' ,'); fi
 RECIPE=${RECIPE:-rewrites.jsonl}
+# VARIANTS is a whitespace-separated list of shape-dispatched variant specs,
+# each 'shape|shape=RECIPE_PATH' (see --variant in bin/rewrite.rs). A state
+# whose object-array shape matches runs its frames under that recipe instead
+# of $RECIPE.
+#
+# Safe to turn on or off mid-campaign, and that is by design rather than by
+# luck: a variant frame round-trips base -> canonical -> variant -> canonical
+# -> base, so the boundary states it produces are IDENTICAL to the base
+# program's. Checkpoints are therefore interchangeable, which is why the
+# campaign fingerprint deliberately does not hash the variant list - you can
+# resume a variant run from checkpoints written without one.
+#
+# Applied to every stage that supports it, uniformly. Not because
+# correctness needs it - see above - but so that a variant which turns out
+# to be WRONG shows up as a disagreement rather than as a campaign whose
+# stages quietly disagree with each other.
+#
+# NOTE: only `bench` accepts --variant today. `pos-graph` and `sweep` replay
+# the forward pass too and would benefit - on room (0,0) pos-graph was the
+# largest stage at 3567s - but do not take the flag yet.
+VARIANTS=${VARIANTS:-}
+read -ra VARIANT_SPECS <<< "$VARIANTS"
+VARIANT_ARGS=()
+for spec in ${VARIANT_SPECS[@]+"${VARIANT_SPECS[@]}"}; do
+  VARIANT_ARGS+=(--variant "$spec")
+done
+if [ ${#VARIANT_ARGS[@]} -gt 0 ]; then
+  echo "shape variants: ${VARIANTS}"
+fi
 # L0/KROOT are overridable so a smoke run can be pointed at a scratch dir
 # without touching a certified campaign's checkpoints.
 L0=${L0:-~/celeste-checkpoints/$STEM}
@@ -94,7 +123,8 @@ for H in $(seq "$FROM" "$TO"); do
   else
   stage "l0-bench-h$H" /tmp/l0-h$H.log \
       ./target/release/rewrite --recipe "$RECIPE" bench --frames "$H" --deopt \
-      --checkpoint-dir "$L0" --save-frames --resume $FUSE_ARG
+      --checkpoint-dir "$L0" --save-frames --resume $FUSE_ARG \
+      ${VARIANT_ARGS[@]+"${VARIANT_ARGS[@]}"}
   tail -2 /tmp/l0-h$H.log
   fi
   # The sweep's origin-tagged plain replays of fruit states blow up on
@@ -140,7 +170,8 @@ for H in $(seq "$FROM" "$TO"); do
     stage "k$K-bench-h$H" "/tmp/k$K-h$H.log" \
         env CELESTE_REM_BITS=$K ./target/release/rewrite --recipe "$RECIPE" bench \
         --frames "$H" --deopt --checkpoint-dir "$KDIR" --save-frames \
-        --band-dir "$PREV" --band-horizon "$H" --band-prev-bits "$PREV_BITS"
+        --band-dir "$PREV" --band-horizon "$H" --band-prev-bits "$PREV_BITS" \
+        ${VARIANT_ARGS[@]+"${VARIANT_ARGS[@]}"}
     tail -3 "/tmp/k$K-h$H.log" | head -1
     if ! grep -q "first room-exit" "/tmp/k$K-h$H.log"; then
       echo "=== horizon $H REFUTED at k=$K ==="
