@@ -301,3 +301,20 @@ Consequences:
   is the principled route; not built at 1am.
 - Still open: split_at entry for the LocalId(200) UNKNOWN_STORE site
   (3.2k events in the v2 probe - small; f50 probe will size it).
+
+## Room (2,0) S16 probes with the fixed recipe: 1px OOMs on the hump, 2px launched
+
+- v9 (no pm1): OOM (137) at ~f38. f34-f37 lanes 244k -> 1.41M
+  (~1.7x/frame), f37 148.2s, peak 61.9G at f37.
+- v8 (pm1 restored, after the partition-agnostic verifier landed): OOM at
+  ~f39. IDENTICAL lane counts (pm1 changes packaging, never rows), but
+  2.8x faster frames (f37 53.6s) and lower peaks; f38 2.38M lanes,
+  peak 87G. 0 whole-state deopts in both runs; spd poison sites at zero.
+- Diagnosis: the S16(1px) pre-crossover hump on room (2,0) is ~7x the
+  exact campaign's rows at f38 (exact f38 ~350k interpolated vs 2.38M)
+  and outruns the 100G cap before dedup collapse arrives. Room (1,0)'s
+  hump crested by f40-50; this room's 4-object state is heavier.
+- Per the pre-registered contingency: 2px bottom rung
+  (CELESTE_SPD_WIDTH_LOG2=17) probing to f50 now (room20-s2px).
+  If 2px also OOMs: next levers are rem-bits banding at the bottom rung
+  or a streaming/frontier-only hump traversal.
