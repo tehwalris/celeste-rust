@@ -435,6 +435,7 @@ name = "native-probe"
 version = "0.1.0"
 dependencies = [
  "celeste-rust",
+ "serde_json",
 ]
 
 [[package]]

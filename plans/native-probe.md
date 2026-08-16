@@ -217,3 +217,34 @@ room00 fake_wall+player.
      bench after the switch.
 - Then: emit the row program for the room1 player shape (columnizable
   sites -> fixed row slots with runtime guards), gap list -> overlay work.
+
+## Zero-heap / zero-branch status (2026-08-17, room (1,0) player shape)
+
+The compile-only recipe `rewrites-compile.jsonl` (base + overlay before
+kill_dead; consumed by `transpile --recipe`, NEVER by the runner - the
+expansion measured +19%/+38% on the interpreter and stays out of the base)
+now measures, against fresh post-Lua-edit f35 states (256 lanes, 64-input
+fan-out, 0 panics, hex-identical to concrete_run over 400 frames):
+
+- HEAP: **0 multi-receiver sites** (was 22). 182 single-receiver live
+  sites = guarded fixed row slots; 2892 unreached. Zero-heap for this
+  shape is measured, not projected. The enabler was the `__button_states`
+  toplevel-init Lua edit (commit ff4a853).
+- BRANCHES: 611 static (was 693), 29 executed, **11 divergent** (was 22):
+  - 1 `anonymous_61 @in_h061_and_or_join_65` - the dash-trigger branch;
+    its arm holds stores/calls, needs a stage-D speculate+absorb
+    derivation (m-package pattern). The last genuine blend site.
+  - 1 `__frame @in_i1_012_cont` - freeze early-out; pm1 already
+    partitions on freeze, so it is uniform per dispatch class.
+  - 9 smoke-birth lifecycle (j2_008/009 draw-loop iterators + the
+    anonymous_63/64 type lambdas): jump/dash spawns a smoke object, draw
+    loops iterate 1 vs 2. Per-shape unroll domain - the draw shims are
+    noops, so the masked smoke arm is nearly empty.
+
+Overlay contents: 20x expand_bool (every remaining btn concretization
+diamond), 4x decompose_branch (mixed and-selects), 6x speculate_region
+expand:true (the short-circuit btn arms run eagerly - the k_left/k_jump/
+k_dash reads concretize for all lanes), 53x if_convert, merges + dce.
+Every entry rule-verified on apply; whole recipe differentially verified
+identical through 40 frames (81.5s); all 5 checked-in recipes replay
+(the test now GLOBS rewrites*.jsonl).

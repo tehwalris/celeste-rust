@@ -281,14 +281,34 @@ fn build_rt() -> Rt {
     rt
 }
 
+/// Load boundary states from either checkpoint layout: `frames/fNNN.bin`
+/// (the campaign frame batches) or `fNNN/states.bin` (`rewrite bench
+/// --checkpoint-dir`). For the bench layout the fingerprint check is
+/// self-supplied from meta.json - the census wants states, not resume
+/// safety.
+fn load_states_any(dir: &str, frame: u32) -> Vec<celeste_rust::interpreter::state::State> {
+    use celeste_rust::rewrite::checkpoint;
+    let path = std::path::Path::new(dir);
+    if path.join("frames").join(format!("f{:03}.bin", frame)).exists() {
+        return checkpoint::load_frame_states(path, frame).expect("load frame states");
+    }
+    let meta_path = path.join(format!("f{:03}", frame)).join("meta.json");
+    let meta: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&meta_path)
+            .unwrap_or_else(|e| panic!("read {}: {}", meta_path.display(), e)),
+    )
+    .expect("parse meta.json");
+    let fp = meta["fingerprint"].as_str().expect("meta.json fingerprint");
+    let (_, states) = checkpoint::load_light(path, frame, fp).expect("load_light states");
+    states
+}
+
 /// Gap census (plans/native-probe.md): run real snapshot lanes through the
 /// compiled frame with receiver logging, and report which get_field/
 /// get_index sites resolve to a single cell per shape (columnizable, with
 /// a runtime guard) vs many (the shape's overlay to-do list).
 fn run_census(dir: &str, frame: u32, census_frames: u32, max_lanes: usize) {
-    use celeste_rust::rewrite::checkpoint;
-    let states = checkpoint::load_frame_states(std::path::Path::new(dir), frame)
-        .expect("load frame states");
+    let states = load_states_any(dir, frame);
     let cart_base = if std::path::Path::new("cart").exists() { "cart" } else { "../cart" };
     let (room_x, room_y) = celeste_rust::game_runner::start_room();
     let cart =
@@ -400,9 +420,7 @@ fn run_census(dir: &str, frame: u32, census_frames: u32, max_lanes: usize) {
 /// stay uniform run lockstep in a SIMD engine; divergent sites need
 /// both-arms + blend.)
 fn run_branch_census(dir: &str, frame: u32) {
-    use celeste_rust::rewrite::checkpoint;
-    let states = checkpoint::load_frame_states(std::path::Path::new(dir), frame)
-        .expect("load frame states");
+    let states = load_states_any(dir, frame);
     // The biggest state: the lane axis needs real lane diversity.
     let state = states
         .iter()
