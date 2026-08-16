@@ -149,7 +149,31 @@ No amount of specialization, chunking or recipe work touches it: those
 change the cost per lane, and this is the number of lanes. The ladder
 refines exactly one field (`player.rem`) and its coarsest rung is exact in
 every other coordinate; a wide-open room wants a rung BELOW 0 that buckets
-`spd.x`/`spd.y` the same way, with level 0 banded by it.
+some other field the same way, with level 0 banded by it.
+
+**Which field, priced** (`rewrite field-census`, 2026-08-16 - offline from
+the saved boundary states, 12 s and 1.4 GB at f052, so it costs no search
+time). Rows surviving if a field is collapsed, over 5,507,770 rows at f050 /
+7,495,512 at f052:
+
+| collapsed | f050 | f052 |
+|---|---|---|
+| `spd.x`+`spd.y` bucketed to 1 px/frame - the buildable rung | 27.2% | 20.8% |
+| `spd.x`+`spd.y` ERASED - the unbuildable upper bound | 16.9% | 11.3% |
+| `p_jump`+`p_dash` erased (two booleans) | 27.6% | 27.2% |
+| whole dash state machine (`dash_time`, `dash_target.*`, `dash_accel.*`, `dash_effect_time`) | 86.2% | 85.9% |
+| `spd:0` + `p_jump` + `p_dash` | 8.0% | 5.9% |
+
+The frontier grows 1.123x per frame at f066..f073, so a factor F is
+`ln F / ln 1.123` frames, and the wall is 20 frames short of the horizon.
+**A `spd` rung alone does not reach**: 4.8x = 13.6 frames buildable, 8.9x =
+18.9 frames even erased outright. `p_jump`/`p_dash` - the previous frame's
+button state, kept only for edge detection - are each worth as much as
+`spd.y`, and `spd:0` plus those two booleans is 17x = 24.5 frames. The dash
+state machine proper is worth 1.16x and is not where to look. Per-field
+counts conditioned on a position do NOT multiply out: their product is
+~85,000x the actual row count there, so nothing but the joint measurement
+predicts a rung. Full table and caveats in plans/room20-plan.md.
 
 Standing result for the room: the optimum is **at most 95 frames**
 (`tas/room_2_0_exit_frame_95.txt`, derived from the community TAS and

@@ -222,13 +222,162 @@ That is a statement about the LADDER, not about this room's implementation:
 the refinement ladder refines exactly one thing, `player.rem`, and its
 coarsest rung is still exact in every other coordinate. Rooms (0,0) and
 (1,0) are small and walled, so their reachable (position, velocity) product
-stays inside 100 GB; a wide-open room does not. The natural next rung is a
-level BELOW 0 that buckets `spd.x`/`spd.y` the way `rem` is bucketed, with
-level 0 banded by it - the same refutable over-approximation the rem ladder
+stays inside 100 GB; a wide-open room does not. The next rung is a level
+BELOW 0 that buckets some other field the way `rem` is bucketed, with level
+0 banded by it - the same refutable over-approximation the rem ladder
 already is, and the same machinery (`--band-dir`, `--band-prev-bits`)
-generalised from one abstracted field to two. Specialization (variants),
-chunking and the recipe cannot touch this: they change the cost per lane,
-and the problem is the number of lanes.
+generalised from one abstracted field to several. Specialization
+(variants), chunking and the recipe cannot touch this: they change the cost
+per lane, and the problem is the number of lanes.
+
+WHICH field is measured in the next section, and the ten-field list above
+turns out to be badly unbalanced.
+
+## Which field carries the multiplicity: measured, and `spd` is not enough
+
+`rewrite field-census` (`src/interpreter/field_census.rs`) reads one frame's
+saved boundary states and asks, per lane-varying field: how many rows survive
+if that field is collapsed? Erasing a field is the crudest possible
+abstraction of it, so `rows_after / rows_before` is an UPPER BOUND on what
+any rung abstracting it could merge. `field:n` instead buckets it to `2^-n`,
+the same `div_euclid(width) * width` the `rem` ladder applies (asserted in
+the module's tests), which is what a rung would really do. Offline from
+`~/celeste-checkpoints/room20/frames/`, 12 s and 1.4 GB at f052 - no search
+time, so it cannot contaminate a benchmark.
+
+The frontier at these frames has 17-20 lane-varying fields in total; `rem`
+is not one of them (already fully widened) and neither is anything on the
+fruit or the object array except the springs' `delay`/`spr`.
+
+Single fields erased, as a fraction of the rows before (f050, 5,507,770
+rows, all distinct - the census reproduces the lane count exactly):
+
+| field | distinct values | f045 | f050 | f052 |
+|---|---|---|---|---|
+| `player.x` | 82 | 18.6% | 17.2% | 17.3% |
+| `player.y` | 92 | 15.9% | 17.0% | 17.6% |
+| `player.spd.x` | 187 | 39.0% | 32.0% | 27.4% |
+| `player.spd.y` | 138 | 65.5% | 57.8% | 55.5% |
+| `player.p_jump` | 2 | 50.7% | 50.6% | 50.5% |
+| `player.p_dash` | 2 | 59.0% | 54.6% | 53.8% |
+| `player.flip.x` | 2 | 92.4% | 94.5% | 96.1% |
+| `player.grace` | 7 | 98.9% | 96.7% | 96.7% |
+| `player.dash_effect_time` | 11 | 99.1% | 99.3% | 99.4% |
+| `player.dash_target.x/.y` | 3 | 100.0% | 99.4% | 99.2% |
+| `player.dash_time` | 5 | 100.0% | 100.0% | 100.0% |
+| `player.dash_accel.x/.y` | 3 | 100.0% | 100.0% | 100.0% |
+| `player.djump` | 2 | 99.7% | 99.7% | 99.5% |
+
+**Two booleans - the previous frame's jump and dash button, kept only for
+edge detection (`jump = btn(k_jump) and not this.p_jump`) - are each worth
+about as much as `spd.y`, and together as much as the whole velocity
+vector.** The dash state machine proper is worth essentially nothing.
+
+Read the boolean numbers as a pairing rate: erasing a boolean cannot leave
+less than 50% of the rows, and `p_jump` leaves 50.6% - so **98.8% of the
+frontier's rows at f050 have their `p_jump`-flipped twin in the frontier
+too**, and 90.8% have their `p_dash` twin. The frontier is carrying two (and
+mostly four) copies of nearly every game state that differ only in which
+buttons were held on the frame that produced them.
+
+That `p_jump`/`p_dash` are where the input history survives is consistent
+with the rest of the model rather than a surprise: `__button_states` does
+not appear in this census at all, because `__reset_button_states()` makes it
+a fresh unknown at the end of every frame chunk - which is exactly what lets
+the boundary merge dedup lanes that took different inputs to the same state.
+`p_jump`/`p_dash` are the player's own copy of the same information, they
+are NOT reset, and so they are the one channel through which the input that
+was pressed keeps distinguishing rows forever.
+
+Sets collapsed together, which is what a rung does:
+
+| collapsed | f045 | f050 | f052 |
+|---|---|---|---|
+| `spd.x`+`spd.y` erased | 25.3% | 16.9% | 11.3% |
+| `spd.x`+`spd.y` bucketed to 1 px/frame (`:0`) | 37.9% | 27.2% | 20.8% |
+| ... to 1/2 px/frame (`:1`) | 50.4% | 39.4% | 33.9% |
+| ... to 1/4 px/frame (`:2`) | 69.8% | 61.1% | 57.5% |
+| `p_jump`+`p_dash` erased | 30.0% | 27.6% | 27.2% |
+| `dash_time`+`dash_target.*`+`dash_accel.*`+`dash_effect_time` | 89.9% | 86.2% | 85.9% |
+| all ten non-`spd` fields of the list above | 26.6% | 22.4% | 21.8% |
+| `spd` erased + `p_jump` + `p_dash` | 8.6% | 5.1% | 3.3% |
+| `spd:0` + `p_jump` + `p_dash` | 12.3% | 8.0% | 5.9% |
+| `spd:0` + `p_jump` + `p_dash` + `grace` + `dash_effect_time` | 11.3% | 7.0% | 5.2% |
+| all twelve erased | 1.8% | 0.8% | 0.6% |
+
+The eight non-`spd`, non-button fields of the list are worth 1.23x between
+them (22.4% against `p_jump`+`p_dash`'s 27.6%). The plan's ten-field list
+is really a two-field list.
+
+### What that buys in frames
+
+The frontier grows by a factor of 1.123 per frame over f066..f073
+(watermark deltas of the f073 checkpoint), so a merge factor F is
+`ln F / ln 1.123` frames of headroom, and the wall (~f075) is 20 frames
+short of the horizon (95):
+
+| rung | factor at f052 | frames |
+|---|---|---|
+| `spd` bucketed at 1 px/frame | 4.8x | 13.6 |
+| `spd` erased (unbuildable upper bound) | 8.9x | 18.9 |
+| `p_jump`+`p_dash` erased | 3.7x | 11.3 |
+| `spd:0` + `p_jump` + `p_dash` | 17.0x | 24.5 |
+| `spd` erased + `p_jump` + `p_dash` | 30.4x | 29.5 |
+
+**A `spd.x`/`spd.y` rung on its own does not reach.** Even erasing both
+outright - which no executable abstraction can do, since `spd` drives the
+motion - is 19 frames, and the buildable version of it is 14. Add the two
+button-history booleans and there is real margin.
+
+The one honest caveat: these are counts of surviving BOUNDARY ROWS. A
+widened `p_jump` makes `btn(k_jump) and not this.p_jump` an `UnknownBool`
+and splits the state mid-frame, and a bucketed `spd` becomes an interval
+that widens everything downstream of it; neither cost is priced here. That
+is the same shape of unknown the `rem` ladder already carries, and the same
+control applies - build the rung, measure the lanes, keep it only if the
+boundary win survives the mid-frame loss.
+
+### The fields are massively correlated, so per-field counts do not multiply
+
+Conditioned on a whole-pixel position, at f050 (4,309 occupied positions,
+1,062 lanes at the median one, 7,475 at the worst):
+
+| field | distinct values at the median position | p90 | worst position |
+|---|---|---|---|
+| `spd.x` | 43 | 87 | 139 |
+| `spd.y` | 28 | 43 | 42 |
+| `dash_effect_time` | 8 | 11 | 9 |
+| `dash_time` | 5 | 5 | 5 |
+| `grace` | 2 | 5 | 6 |
+| `dash_target.x/.y`, `dash_accel.x/.y` | 3 | 3 | 3 |
+| `djump`, `p_jump`, `p_dash`, `flip.x` | 2 | 2 | 2 |
+| `objects.2.delay` (a spring's hide timer) | 3 | 8 | 7 |
+
+The PRODUCT of those twelve counts is 9.0e7 at the median position against
+1,062 actual rows - a factor of 85,000. The reachable state at a position is
+a thin sliver of the product space, and `spd.x` x `spd.y` alone is 5.9x
+correlated (median product 1,196, median joint 195). Two consequences:
+
+* per-field distinct counts are useless for predicting a rung's value; only
+  the joint measurement above means anything;
+* the multiplicity is not concentrated in one field to be knocked out. After
+  fixing position AND the exact `(spd.x, spd.y)` pair there are still 5.3
+  distinct states at the median position, and 41.9 after fixing position and
+  the 1-px/frame `spd` bucket.
+
+Reproduce with:
+
+    ./target/release/rewrite --recipe rewrites-room00.jsonl field-census \
+        --checkpoint-dir ~/celeste-checkpoints/room20 --frame 50 \
+        --collapse player.spd.x,player.spd.y \
+        --collapse player.spd.x:0,player.spd.y:0,player.p_jump,player.p_dash \
+        --out /tmp/fc050.csv
+
+Two self-checks the tool passes and which are worth repeating after any
+change to it: `rows_before` equals the frontier lane count exactly (a
+frontier-only boundary has no duplicate rows), and collapsing EVERY
+lane-varying field leaves exactly one row per object-array shape (5 at
+f045).
 
 ## Measurements that say what NOT to do
 

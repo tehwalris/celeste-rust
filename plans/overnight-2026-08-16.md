@@ -225,7 +225,31 @@ re-deriving a room costs hours. Do them ALL, then re-derive ONCE.
       room running, measure where its time actually goes, and only then
       decide. That order is the whole lesson of B2.
 
-- [ ] B3 Room (1,0) recipe complete on the same footing.
+- [x] B3 Room (1,0) already IS the complete recipe - `rewrites.jsonl`, 889
+      entries, and B2's control shows it is 11.5% ahead of the
+      shape-agnostic one at f037. Nothing to add.
+
+### B5. OWED: both certified rooms need re-deriving
+
+Everything tonight invalidates them, and for two independent reasons:
+
+* slots moved (name-keyed allocation, e57b837) so row keys moved;
+* the model changed (foreach, sin, literals, division, abs, %, add) so the
+  reachable set itself can move.
+
+The campaign fingerprint hashes the recipe text and the lua sources, so
+stale checkpoints are REJECTED rather than silently reused - the failure
+mode here is wasted time, not a wrong answer. Both rooms have a known
+answer to reproduce, which makes them a strong end-to-end check on the
+whole night:
+
+    room (1,0)   optimum 100    tas/room_1_0_exit_frame_100.txt
+    room (0,0)   optimum  94    tas/room_0_0_exit_frame_94.txt, 2.62 h
+
+Room (1,0) is the cheaper one and should go first. If either comes out at a
+different optimum, one of tonight's fidelity fixes changed the game - which
+is possible and would be a REAL result, not a bug: `sin` is exact now and
+room (0,0)'s winning path has a strawberry. Do not assume it will match.
 - [ ] B4 NOTE: `rewrites-room00.jsonl` is a SECOND recipe file and needs the
       same `foreach` re-derivation as the base one. Check it replays.
 
@@ -266,10 +290,18 @@ Two things already measured that say what NOT to try:
 * dropping the fruit-`off` widening: 40.4M lanes at f052 against 7.5M. 5.4x
   WORSE. The widening stays.
 
-- [ ] C-CENSUS **Which field actually carries the multiplicity?**
-      room20-plan.md says "velocity and the dash/jump machinery" and lists
-      ten fields; it does not say which dominates. Bucketing `spd` is a
-      guess until that is measured. Do this BEFORE building the rung.
+- [x] C-CENSUS **Which field actually carries the multiplicity?**
+      DONE, and the answer changes the rung. `rewrite field-census` prices
+      every lane-varying field offline from the saved boundary states.
+      At f052: `spd` bucketed to 1 px/frame leaves 20.8% of the rows (4.8x,
+      13.6 frames of headroom against the 20 needed) and erasing `spd`
+      outright - which no executable abstraction can do - leaves 11.3%
+      (8.9x, 18.9 frames). **A `spd`-only rung does not reach.** The whole
+      dash state machine is worth 1.16x. What IS worth as much as `spd` is
+      `p_jump`+`p_dash`, two booleans holding the previous frame's button
+      state for edge detection: 27.2% on their own, and `spd:0` with them is
+      5.9% = 17x = 24.5 frames. Unpriced: the mid-frame `UnknownBool` split
+      a widened `p_jump` causes. Numbers in plans/room20-plan.md.
 
 
 - [ ] C0 **Get it running and find the bottleneck FIRST.** Bench room (2,0)

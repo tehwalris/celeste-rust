@@ -272,6 +272,28 @@ enum Command {
         #[arg(long)]
         frame: u32,
     },
+    /// Which FIELD carries the lane multiplicity at a frame boundary?
+    /// Per lane-varying field: distinct values, and how many rows survive
+    /// if that field is collapsed to one value (an upper bound on what a
+    /// ladder rung abstracting it could merge). See
+    /// `interpreter::field_census`.
+    FieldCensus {
+        /// Checkpoint dir with saved frames (bench --save-frames).
+        #[arg(long)]
+        checkpoint_dir: String,
+        #[arg(long)]
+        frame: u32,
+        /// Collapse these fields together as one rung would, e.g.
+        /// `--collapse player.spd.x,player.spd.y`. A bare field is ERASED
+        /// (the upper bound on abstracting it); `field:n` keeps n fraction
+        /// bits, exactly as `CELESTE_REM_BITS` means it for `rem`.
+        /// Repeatable; each set also gets a joint per-position CSV column.
+        #[arg(long = "collapse")]
+        collapse_sets: Vec<String>,
+        /// Write per-position distinct-value counts to this CSV.
+        #[arg(long)]
+        out: Option<String>,
+    },
     /// Print every stable name bound to a rewrite-created local, as
     /// "function<TAB>name". Sorted, so two runs can be diffed to see which
     /// names a change to the base program actually disturbed - which is the
@@ -2686,6 +2708,18 @@ fn main() -> Result<()> {
                     max
                 );
             }
+        }
+
+        Command::FieldCensus { checkpoint_dir, frame, collapse_sets, out } => {
+            use celeste_rust::interpreter::field_census::{self, CollapseSet};
+            use celeste_rust::rewrite::checkpoint;
+            let dir = std::path::PathBuf::from(&checkpoint_dir);
+            let states = checkpoint::load_frame_states(&dir, frame)?;
+            let sets: Vec<CollapseSet> = collapse_sets
+                .iter()
+                .map(|s| CollapseSet::parse(s))
+                .collect::<Result<Vec<_>>>()?;
+            field_census::run(states, frame, &sets, out.as_ref().map(std::path::Path::new))?;
         }
 
         Command::Names {} => {
