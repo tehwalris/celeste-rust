@@ -181,3 +181,18 @@ taskset -c 15 ./native-probe/target/release/native-probe -i "$seq" -f 400 --benc
   porting. mark_heap provides named cell sets ("player_rem_xy",
   "player_spd_xy", "player_dash_effect_time", ...) - port the mark
   traversal or reimplement mark lookup natively via the same paths.
+
+### Per-shape instantiation: gap census v0 design (2026-08-16 night)
+
+Dynamic, not static: import real snapshot lanes (State -> Rt converter;
+interval cells get placeholder scalars - pointer topology is what matters)
+and run frames in the native engine with per-site RECEIVER LOGGING: each
+get_field/get_index/get_global site records its receiver cell id across
+lanes/frames of one shape. Sites with a single receiver per shape =
+columnizable (compiled row program keeps a cheap runtime guard, same
+doctrine as AssertClosure: statically assumed, loudly checked). Sites with
+varying receivers = the gap report = the shape's overlay to-do list.
+Probe grows `--from-checkpoint DIR --frame N --lane L` mode for this and
+for the abstract-oracle runs later. Priority order by inventory lane mass:
+room1 player shape, then room20 fruit+spring+spring+player pair, then
+room00 fake_wall+player.
