@@ -1303,7 +1303,7 @@ fn split_states_by_partition(states: Vec<State>, cells: &[usize]) -> Vec<State> 
 /// Returns (kept_states, lanes_before, lanes_after).
 pub fn subtract_visited(
     states: Vec<State>,
-    visited: &mut crate::interpreter::row_table::RowTable,
+    visited: &mut crate::interpreter::visited::Visited,
 ) -> (Vec<State>, usize, usize) {
     let mut out = Vec::with_capacity(states.len());
     let mut before = 0usize;
@@ -1344,7 +1344,7 @@ pub struct VisitedKeys {
 /// phase is left with only the misses.
 pub fn visited_row_keys(
     state: &State,
-    visited: &crate::interpreter::row_table::RowTable,
+    visited: &crate::interpreter::visited::Visited,
 ) -> Option<VisitedKeys> {
     use crate::interpreter::virtual_merge::{collect_columns_labeled, row_key_hashes, Column};
     let _trace = TraceSpan::new("visited_row_keys", "vectorize");
@@ -1377,12 +1377,16 @@ pub fn visited_row_keys(
     // boundary. The local set holds one chunk's distinct rows, which is
     // small enough to stay in cache - unlike the global table.
     //
-    // Order matters, and not the way it first looks. Probing the small
-    // cache-resident set FIRST to save global misses was measured and is
-    // 4% WORSE: it makes `seen` hold every distinct row in the chunk
-    // instead of only the candidates, and the candidates are ~2% of them.
-    // The global probe is the cheap filter here precisely because it
-    // rejects so much.
+    // Order matters, and it depends on the ENGINE. Under the in-RAM map
+    // the global probe is one cache miss and probing the local set first
+    // was measured 4% WORSE (it makes `seen` hold every distinct row in
+    // the chunk instead of only the candidates, which are ~2% of them).
+    // Under the mmap engine a global probe is an fp-run search plus a
+    // sample-index confirm - several times a map probe - so the trade
+    // flips: dedup locally FIRST and pay the global probe only once per
+    // chunk-distinct key. The candidate set is identical either way
+    // (first-lane-wins is order-independent between the two filters), so
+    // this cannot change any decision, only who does the filtering work.
     // CELESTE_DUMP_ROWS prints each newly-reached row as "ROW <key>
     // <values>" on stderr. It exists to be a SECOND, independent view of
     // the same rows that `visited.bin` records, and that is not idle
@@ -1392,10 +1396,16 @@ pub fn visited_row_keys(
     // against this dump is what caught it, and is what to repeat if the
     // reader is ever touched. Gated, and only reached for candidate lanes.
     let dump_rows = std::env::var_os("CELESTE_DUMP_ROWS").is_some();
+    let local_first = visited.local_dedup_first();
     let mut seen: rustc_hash::FxHashSet<(u64, u64)> = rustc_hash::FxHashSet::default();
     let mut candidates: Vec<(u32, (u64, u64))> = Vec::new();
     for (i, key) in keys.into_iter().enumerate() {
-        if visited.id_of(key).is_none() && seen.insert(key) {
+        let is_candidate = if local_first {
+            seen.insert(key) && !visited.contains_historic(key)
+        } else {
+            !visited.contains_historic(key) && seen.insert(key)
+        };
+        if is_candidate {
             if dump_rows {
                 use std::fmt::Write as _;
                 let mut line = format!("{:016x}{:016x}", key.0, key.1);
@@ -1460,7 +1470,7 @@ pub enum Survivors {
 pub fn subtract_decide(
     state: &State,
     keys: Option<VisitedKeys>,
-    visited: &mut crate::interpreter::row_table::RowTable,
+    visited: &mut crate::interpreter::visited::Visited,
 ) -> (Survivors, usize) {
     let _trace = TraceSpan::new("subtract_visited", "vectorize");
     let before = state.vector_size;
@@ -1474,7 +1484,7 @@ pub fn subtract_decide(
     // on the one phase of the frame that cannot be parallelised.
     let mut survivors: Vec<u32> = Vec::new();
     for (lane, key) in candidates {
-        if visited.insert_new(key).is_some() {
+        if visited.insert_new(key) {
             survivors.push(lane);
         }
     }
@@ -1503,7 +1513,7 @@ pub fn subtract_apply(state: State, survivors: Survivors) -> Option<State> {
 pub fn subtract_precomputed(
     state: State,
     keys: Option<VisitedKeys>,
-    visited: &mut crate::interpreter::row_table::RowTable,
+    visited: &mut crate::interpreter::visited::Visited,
 ) -> (Vec<State>, usize, usize) {
     let (survivors, before) = subtract_decide(&state, keys, visited);
     let after = match &survivors {

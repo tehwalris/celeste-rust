@@ -11,6 +11,7 @@ pub mod local_env;
 mod op;
 pub mod profiling;
 pub mod row_table;
+pub mod visited;
 pub mod state;
 pub mod tracing;
 pub mod value;

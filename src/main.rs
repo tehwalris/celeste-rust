@@ -257,12 +257,13 @@ fn run_game_frames(
     // birthday collision risk at 10^8 rows is negligible. Sound only from a
     // fresh start - on --resume the visited set is empty, which loses dedup
     // but never completeness.
-    let mut visited_rows: Option<crate::interpreter::row_table::RowTable> = if std::env::var_os("CELESTE_FRONTIER_ONLY").is_some() {
-        println!("frontier-only search ENABLED (128-bit hashed visited set)");
-        Some(Default::default())
-    } else {
-        None
-    };
+    let mut visited_rows: Option<crate::interpreter::visited::Visited> =
+        if std::env::var_os("CELESTE_FRONTIER_ONLY").is_some() {
+            println!("frontier-only search ENABLED (128-bit hashed visited set)");
+            Some(crate::interpreter::visited::Visited::in_memory())
+        } else {
+            None
+        };
 
     for frame_num in start_frame..=num_frames {
         print!("Frame {}: ", frame_num);
@@ -302,7 +303,7 @@ fn run_game_frames(
         let new_states = if let Some(visited) = visited_rows.as_mut() {
             let (kept, lanes_before, lanes_after) =
                 crate::interpreter::vectorize::subtract_visited(new_states, visited);
-            visited.end_frame();
+            visited.end_frame().expect("in-memory visited end_frame cannot fail");
             println!(
                 "  (frontier-only: {} -> {} new lanes, visited total {})",
                 lanes_before, lanes_after, visited.len()

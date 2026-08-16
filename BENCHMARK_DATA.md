@@ -1,3 +1,68 @@
+# The visited set left RAM: fp-runs + mmap'd rowkeys, certified identical
+# (2026-08-16, tasks #115-#120; design in plans/visited-redesign.md)
+
+The cross-frame visited set was an `FxHashMap<(u64,u64), u32>` - measured
+~33 B/row, 25 GiB pinned at room (2,0) f073's 814M rows - plus a 12.4 GB
+`visited.bin` duplicated into EVERY checkpoint dir (x19 = 62 GB). It is
+now: sorted fingerprint runs in RAM (10 B/row, only filters), per-frame
+`frames/*.rowkeys` files (sorted 128-bit keys + ids, uncompressed,
+mmap'd), and an INLINE exact confirm behind every fp hit - a pinned
+per-file sample index brackets each confirm to one ~3 KB block, so under
+memory pressure the worst case is one page fault per confirm, and the
+residency that used to be an OOM-kill cliff is now evictable page cache.
+No lossy structure ever decides a drop; the 128-bit guarantee is exactly
+today's.
+
+## Deep frame, room (1,0) f100->f101, fresh post-fix derivation
+## (386M offered lanes -> 6.28M new, 225.3M rows total; single run each,
+## one idle-ish core of background noise, identical for all rows)
+
+| engine | total wall (incl. resume) | fwd.interpret | peak RSS |
+|---|---|---|---|
+| map (old) | 110.4 s | 62.6 s | 17.5 GB |
+| mmap, naive binary search | 133.2 s | 108.6 s | 16.3 GB |
+| + sample index & interpolation search | 108.1 s | 85.2 s | 16.8 GB |
+| + local-first chunk dedup | **95.9 s** | 72.9 s | 16.5 GB |
+
+* The resume half: map loads visited.bin and rebuilds the 225M-entry map
+  (~44 s); mmap scans the already-sorted rowkeys into runs (~22 s). The
+  ladder resumes per horizon, so this recurs.
+* Peak RSS understates the change: the mmap engine's residency INCLUDES
+  ~5 GB of file-backed, evictable pages. The pinned share fell ~7.4 GB
+  -> ~2.3 GB; at room (2,0) f073 scale that is 25 GiB -> 7.6 GiB
+  (+ 72 MB of sample indexes), linear in rows.
+* Local-first dedup: the old measurement ("local set first is 4% worse")
+  was taken when a global probe was one map lookup; with the costlier
+  mmap probe the trade flips, so the filter order is now an engine
+  property (`Visited::local_dedup_first`). Candidates are identical
+  either way.
+
+## Gates (all passed)
+
+* f30 room (1,0), map vs mmap: all 60 frame+rowkeys files, states.bin,
+  meta counts byte-identical; re-proved after each tuning step and after
+  the default flip.
+* Cross-engine resume, both directions, f30->f32: byte-identical.
+* Sweep + pos-graph on a visited.bin-less dir: full bijection asserts
+  pass on the table rebuilt from rowkeys.
+* `migrate-visited` on the old room (1,0) campaign: 212.6M rows, keys
+  from states + ids from visited.bin, rebuilt table equal id-for-id
+  (1:54 wall / 20 GB peak; load 37.3 s, hash 15.9 s, write 17.1 s).
+* Full `cargo test --release`: green (engine landed; the tuned probes
+  additionally carry a differential unit test against reference
+  searches, and the scoped checkpoint/sweep/state-mapping tests were
+  re-run under the new default).
+
+Default engine is now mmap for runs with a checkpoint dir
+(`CELESTE_VISITED_ENGINE=map` selects the old one; dir-less runs keep the
+in-RAM map). Deliberately NOT in the campaign fingerprint - trajectories
+are certified identical and checkpoints interchangeable, like variants.
+
+Note for interpreting older sections: the fresh room (1,0) derivation
+under the post-console-fix tree reaches 219.0M rows and first room-exit
+at LEVEL-0 frame 89 (was 90); the certified optimum of 100 predates the
+fixes and re-certification is the owed B5 ladder campaign.
+
 # The room (0,0) S2 variant is speed-neutral, and the control says why
 # (2026-08-16)
 

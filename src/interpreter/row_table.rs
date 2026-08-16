@@ -39,6 +39,11 @@ pub struct RowTable {
     rows: FxHashMap<(u64, u64), u32>,
     /// Id counter at the end of each completed frame.
     watermarks: Vec<u32>,
+    /// Keys inserted since the last `end_frame`, in id order - what the
+    /// current frame's `.rowkeys` file records (`visited::Visited`).
+    /// Empty on a table rebuilt `from_parts`: a resumed run only ever
+    /// writes rowkeys for the frames it executes itself.
+    recent: Vec<(u64, u64)>,
 }
 
 /// Splitmix64 finalizer - used to mix the shape hash into both key halves
@@ -63,9 +68,16 @@ impl RowTable {
             std::collections::hash_map::Entry::Occupied(_) => None,
             std::collections::hash_map::Entry::Vacant(v) => {
                 v.insert(next as u32);
+                self.recent.push(key);
                 Some(next as u32)
             }
         }
+    }
+
+    /// The keys inserted since the last `end_frame`, in id order. Call
+    /// BEFORE `end_frame` when persisting the frame's `.rowkeys`.
+    pub fn take_recent(&mut self) -> Vec<(u64, u64)> {
+        std::mem::take(&mut self.recent)
     }
 
     pub fn id_of(&self, key: (u64, u64)) -> Option<u32> {
@@ -116,7 +128,7 @@ impl RowTable {
             .enumerate()
             .map(|(id, key)| (key, id as u32))
             .collect();
-        Self { rows, watermarks }
+        Self { rows, watermarks, recent: Vec::new() }
     }
 }
 

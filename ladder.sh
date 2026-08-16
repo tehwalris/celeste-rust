@@ -79,6 +79,15 @@ STAGES=${STAGES:-/tmp/ladder-stages.tsv}
 # MEM=108G. Do not raise it past what `free` leaves after /tmp (a tmpfs):
 # above that the kernel kills the machine instead of the cgroup killing the
 # job, which is the whole point of the cap.
+#
+# Since 2026-08-16 the forward pass's visited set is the mmap engine
+# (fp-runs in RAM + frames/*.rowkeys on disk; see
+# plans/visited-redesign.md): the bench stages pin ~3x less for the
+# visited set and its page-cache share is reclaimable, so memory
+# pressure degrades to I/O instead of an OOM kill. The sweep and the
+# banded levels still rebuild the full key->id map in-process (parity
+# with the old visited.bin path, fed from rowkeys), so THEIR peaks are
+# unchanged - the caps above still stand.
 MEM=${MEM:-100G}
 stage() { # $1 name, $2 logfile, rest: the command
   local name=$1 log=$2 rc=0 t=/tmp/ladder-time.$$

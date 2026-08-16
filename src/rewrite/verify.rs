@@ -280,7 +280,7 @@ pub struct AbstractRun {
     /// Frontier-only search (CELESTE_FRONTIER_ONLY=1): the persistent
     /// cross-frame row table (dense ids + per-frame watermarks; 128-bit
     /// keys - see `vectorize::subtract_visited` for the collision note).
-    visited_rows: Option<crate::interpreter::row_table::RowTable>,
+    visited_rows: Option<crate::interpreter::visited::Visited>,
     /// Use only the historic rem widening at boundaries (for the widen-check,
     /// which applies the conservative widenings post hoc instead).
     rem_only_abstraction: bool,
@@ -424,7 +424,7 @@ fn stream_boundary_one(
     state: State,
     band: Option<&BandFilter>,
     frame: u32,
-    visited: &mut crate::interpreter::row_table::RowTable,
+    visited: &mut crate::interpreter::visited::Visited,
     counters: &mut StreamCounters,
 ) -> Result<Vec<State>> {
     let prepared = stream_boundary_prepare(state, band, frame, counters, visited)?;
@@ -444,7 +444,7 @@ fn stream_boundary_prepare(
     band: Option<&BandFilter>,
     frame: u32,
     counters: &mut StreamCounters,
-    visited: &crate::interpreter::row_table::RowTable,
+    visited: &crate::interpreter::visited::Visited,
 ) -> Result<Vec<PreparedRows>> {
     let mut kept_out = Vec::new();
     for state in crate::interpreter::abstraction::split_rem_straddles(state) {
@@ -583,7 +583,7 @@ struct PreparedRows {
 /// one.
 fn stream_boundary_subtract(
     prepared: Vec<PreparedRows>,
-    visited: &mut crate::interpreter::row_table::RowTable,
+    visited: &mut crate::interpreter::visited::Visited,
     counters: &mut StreamCounters,
 ) -> Vec<State> {
     decided_survivors(prepared, visited, counters)
@@ -603,7 +603,7 @@ fn stream_boundary_subtract(
 /// of copying on the one thread that cannot be parallelised.
 fn decided_survivors(
     prepared: Vec<PreparedRows>,
-    visited: &mut crate::interpreter::row_table::RowTable,
+    visited: &mut crate::interpreter::visited::Visited,
     counters: &mut StreamCounters,
 ) -> Vec<(State, crate::interpreter::vectorize::Survivors)> {
     use crate::interpreter::vectorize::Survivors;
@@ -907,7 +907,7 @@ impl AbstractRun {
         );
         let visited_rows = if std::env::var_os("CELESTE_FRONTIER_ONLY").is_some() {
             println!("frontier-only search ENABLED (128-bit hashed visited set)");
-            Some(Default::default())
+            Some(crate::interpreter::visited::Visited::in_memory())
         } else {
             None
         };
@@ -1005,9 +1005,24 @@ impl AbstractRun {
             .map_or((0, 0, 0), |v| (v.total_events.0, v.total_events.1, v.total_fallbacks))
     }
 
-    /// The frontier row table, when frontier-only search is enabled.
-    pub fn visited_table(&self) -> Option<&crate::interpreter::row_table::RowTable> {
+    /// The frontier visited set, when frontier-only search is enabled.
+    pub fn visited_table(&self) -> Option<&crate::interpreter::visited::Visited> {
         self.visited_rows.as_ref()
+    }
+
+    /// Wire the visited set to the checkpoint dir: `.rowkeys` are written
+    /// there at every boundary, and CELESTE_VISITED_ENGINE=mmap swaps the
+    /// in-RAM map for the fp-run + mmap engine (fresh runs only; resumes
+    /// hand a ready engine to `restore`). Call before the first `step`.
+    pub fn configure_visited_dir(&mut self, dir: &std::path::Path) {
+        let Some(v) = self.visited_rows.as_mut() else { return };
+        if crate::interpreter::visited::mmap_engine_selected() {
+            assert!(v.is_empty(), "engine swap after frames were recorded");
+            *v = crate::interpreter::visited::Visited::mmap_new(dir);
+            println!("visited engine: mmap (fp-runs + rowkeys)");
+        } else {
+            v.set_dir(dir);
+        }
     }
 
     /// Turn frontier subtraction off (regardless of the env flag). The
@@ -1080,7 +1095,7 @@ impl AbstractRun {
     pub fn restore(
         &mut self,
         states: Vec<State>,
-        visited: Option<crate::interpreter::row_table::RowTable>,
+        visited: Option<crate::interpreter::visited::Visited>,
         deopt_events: (usize, usize),
     ) -> Result<()> {
         if visited.is_some() != self.visited_rows.is_some() {
@@ -1205,8 +1220,7 @@ impl AbstractRun {
         }
         self.report_frame_events(&counters);
         if stream {
-            self.finish_streaming_boundary(stream_survivors, &stream_counters);
-            Ok(())
+            self.finish_streaming_boundary(stream_survivors, &stream_counters)
         } else {
             self.finish_phased_boundary(new_states, frame_no)
         }
@@ -1256,7 +1270,7 @@ impl AbstractRun {
             type Prepared = Result<(Vec<PreparedRows>, FrameEventCounters, StreamCounters)>;
             let results: Vec<Prepared> = {
                 let _t = ScopedPhase::new("fwd.interpret");
-                let visited_ro: &crate::interpreter::row_table::RowTable = self
+                let visited_ro: &crate::interpreter::visited::Visited = self
                     .visited_rows
                     .as_ref()
                     .expect("stream implies a visited table");
@@ -1349,8 +1363,7 @@ impl AbstractRun {
             }
         }
         self.report_frame_events(&counters);
-        self.finish_streaming_boundary(stream_survivors, &stream_counters);
-        Ok(())
+        self.finish_streaming_boundary(stream_survivors, &stream_counters)
     }
 
     /// `step_parallel` for the PHASED arrangement - the backward sweep's
@@ -1592,7 +1605,7 @@ impl AbstractRun {
         &mut self,
         stream_survivors: Vec<State>,
         stream_counters: &StreamCounters,
-    ) {
+    ) -> Result<()> {
         self.states_before_merge.push(stream_survivors.len());
         self.states = {
             let _t = ScopedPhase::new("fwd.merge");
@@ -1618,7 +1631,7 @@ impl AbstractRun {
             );
         }
         let visited = self.visited_rows.as_mut().expect("stream implies visited");
-        visited.end_frame();
+        visited.end_frame()?;
         println!(
             "  frontier-only: {} -> {} new lanes, visited total {}",
             stream_counters.sub_before,
@@ -1626,6 +1639,7 @@ impl AbstractRun {
             visited.len()
         );
         self.boundary_gc_if_enabled();
+        Ok(())
     }
 
     /// Phased epilogue: abstract the whole frame's outputs, merge, then
@@ -1656,7 +1670,7 @@ impl AbstractRun {
             vectorize_states(new_states)
         };
         self.apply_band_filter(frame_no)?;
-        self.subtract_frontier();
+        self.subtract_frontier()?;
         self.boundary_gc_if_enabled();
         Ok(())
     }
@@ -1728,18 +1742,19 @@ impl AbstractRun {
 
     /// Frontier-only subtract (phased path): drop lanes whose row was seen
     /// in any earlier frame, and record this frame's rows.
-    fn subtract_frontier(&mut self) {
-        let Some(visited) = self.visited_rows.as_mut() else { return };
+    fn subtract_frontier(&mut self) -> Result<()> {
+        let Some(visited) = self.visited_rows.as_mut() else { return Ok(()) };
         let (kept, before, after) = crate::interpreter::vectorize::subtract_visited(
             std::mem::take(&mut self.states),
             visited,
         );
-        visited.end_frame();
+        visited.end_frame()?;
         println!(
             "  frontier-only: {} -> {} new lanes, visited total {}",
             before, after, visited.len()
         );
         self.states = kept;
+        Ok(())
     }
 
     /// Boundary compaction (env-gated: CELESTE_BOUNDARY_GC). The heap's

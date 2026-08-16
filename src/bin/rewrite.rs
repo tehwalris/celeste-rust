@@ -457,6 +457,20 @@ enum Command {
         #[arg(long)]
         frames: u32,
     },
+    /// Derive `frames/*.rowkeys` for a checkpoint dir written before the
+    /// rowkeys era, so its artifacts work with the mmap visited engine
+    /// (`CELESTE_VISITED_ENGINE=mmap`) and remain loadable once
+    /// checkpoints stop carrying `visited.bin`.
+    ///
+    /// Keys are recomputed from the saved frame batches, ids are read
+    /// out of the dir's own `visited.bin` table (they are NOT positional
+    /// in the batch - the boundary merge reorders lanes), and the result
+    /// is cross-checked by rebuilding the full table from the new files
+    /// and comparing it id-for-id against the original.
+    MigrateVisited {
+        #[arg(long)]
+        checkpoint_dir: String,
+    },
 }
 
 fn peak_rss_kb() -> u64 {
@@ -632,21 +646,38 @@ fn bench(
         run.set_band(band);
     }
     let mut start_frame = 1u32;
+    if let Some(cfg) = checkpoint.as_ref() {
+        // Wire the visited set to the dir: `.rowkeys` land there at every
+        // boundary, and CELESTE_VISITED_ENGINE picks the engine.
+        run.configure_visited_dir(&cfg.dir);
+    }
     if let Some(cfg) = checkpoint.as_ref().filter(|c| c.resume) {
         match checkpoint::latest(&cfg.dir)? {
             Some(frame) if frame <= frames => {
-                let loaded = checkpoint::load(&cfg.dir, frame, &cfg.fingerprint)?;
-                let visited = loaded.visited;
-                let visited = if run.visited_table().is_some() { Some(visited) } else { None };
+                use celeste_rust::interpreter::visited::{mmap_engine_selected, Visited};
+                let frontier = run.visited_table().is_some();
+                let (meta, states, visited) = if frontier && mmap_engine_selected() {
+                    // The mmap engine's keys are the frames/*.rowkeys
+                    // files; no 25 GiB map rebuild on resume.
+                    let (meta, states) =
+                        checkpoint::load_light(&cfg.dir, frame, &cfg.fingerprint)?;
+                    let visited = Visited::mmap_open(&cfg.dir, meta.watermarks.clone())?;
+                    (meta, states, Some(visited))
+                } else {
+                    let loaded = checkpoint::load(&cfg.dir, frame, &cfg.fingerprint)?;
+                    let visited = frontier
+                        .then(|| Visited::map_with_dir(loaded.visited, &cfg.dir));
+                    (loaded.meta, loaded.states, visited)
+                };
                 run.restore(
-                    loaded.states,
+                    states,
                     visited,
-                    (loaded.meta.deopt_states as usize, loaded.meta.deopt_lanes as usize),
+                    (meta.deopt_states as usize, meta.deopt_lanes as usize),
                 )?;
                 start_frame = frame + 1;
                 println!(
                     "resumed from checkpoint f{:03}: {} rows, {} states",
-                    frame, loaded.meta.row_count, loaded.meta.state_count
+                    frame, meta.row_count, meta.state_count
                 );
                 // The restored frontier may contain won lanes (room exited);
                 // they are absorbing and must not be expanded.
@@ -798,13 +829,12 @@ fn bench(
             let overdue = last_checkpoint.elapsed().as_secs() >= checkpoint_seconds;
             if frame % cfg.every == 0 || frame == frames || overdue {
                 let t = std::time::Instant::now();
-                let empty = celeste_rust::interpreter::row_table::RowTable::default();
                 let path = checkpoint::save(
                     &cfg.dir,
                     frame,
                     &cfg.fingerprint,
                     run.states(),
-                    run.visited_table().unwrap_or(&empty),
+                    run.visited_table(),
                     run.deopt_events(),
                 )?;
                 println!(
@@ -3394,6 +3424,85 @@ fn main() -> Result<()> {
             let (program, _) = build(&recipe)?;
             let mapping = StateMapping::from_recipe(&recipe);
             sweep_time::prepare_pos_graph(&dir, frames, &fingerprint, &program, &plain, mapping)?;
+        }
+        Command::MigrateVisited { checkpoint_dir } => {
+            use celeste_rust::interpreter::visited;
+            use celeste_rust::rewrite::checkpoint;
+            let dir = std::path::PathBuf::from(checkpoint_dir);
+            let frame = checkpoint::latest(&dir)?
+                .ok_or_else(|| anyhow!("{} has no checkpoints", dir.display()))?;
+            let (meta, table) = checkpoint::load_meta_and_table_unvalidated(&dir, frame)?;
+            println!(
+                "migrating {}: {} rows over {} frames (from f{:03}'s visited.bin)",
+                dir.display(),
+                meta.row_count,
+                meta.watermarks.len(),
+                frame
+            );
+            let (mut t_load, mut t_hash, mut t_write) = (0.0f64, 0.0f64, 0.0f64);
+            for f in 1..=meta.watermarks.len() as u32 {
+                let t = std::time::Instant::now();
+                let states = checkpoint::load_frame_states(&dir, f)?;
+                t_load += t.elapsed().as_secs_f64();
+                let prev = if f == 1 { 0 } else { meta.watermarks[f as usize - 2] };
+                let end = meta.watermarks[f as usize - 1];
+                let t = std::time::Instant::now();
+                let mut records: Vec<((u64, u64), u32)> = Vec::with_capacity((end - prev) as usize);
+                for state in &states {
+                    if state.vector_size == 0 {
+                        continue;
+                    }
+                    for key in celeste_rust::rewrite::sweep::row_keys(state)? {
+                        let id = table.id_of(key).ok_or_else(|| {
+                            anyhow!("f{:03}: a saved lane's row is not in the table", f)
+                        })?;
+                        if id < prev || id >= end {
+                            return Err(anyhow!(
+                                "f{:03}: row id {} outside this frame's range [{}, {})",
+                                f,
+                                id,
+                                prev,
+                                end
+                            ));
+                        }
+                        records.push((key, id));
+                    }
+                }
+                t_hash += t.elapsed().as_secs_f64();
+                if records.len() as u32 != end - prev {
+                    return Err(anyhow!(
+                        "f{:03}: {} lanes in the batch but the watermarks say {} rows",
+                        f,
+                        records.len(),
+                        end - prev
+                    ));
+                }
+                // save_frame_rowkeys assigns first_id + index over ID ORDER.
+                let t = std::time::Instant::now();
+                records.sort_unstable_by_key(|(_, id)| *id);
+                let keys: Vec<(u64, u64)> = records.iter().map(|(k, _)| *k).collect();
+                visited::save_frame_rowkeys(&dir, f, &keys, prev)?;
+                t_write += t.elapsed().as_secs_f64();
+                if f % 20 == 0 || f == meta.watermarks.len() as u32 {
+                    println!(
+                        "  f{:03}: load {:.1}s, hash {:.1}s, write {:.1}s (cumulative)",
+                        f, t_load, t_hash, t_write
+                    );
+                }
+            }
+            // Cross-check: the files must reproduce the table exactly.
+            let t = std::time::Instant::now();
+            let rebuilt = visited::load_rowkeys_table(&dir, &meta.watermarks)?;
+            if rebuilt.rows_by_id() != table.rows_by_id() {
+                return Err(anyhow!(
+                    "rebuilt table differs from visited.bin - refusing to trust the files"
+                ));
+            }
+            println!(
+                "cross-check OK in {:.1}s: rowkeys reproduce all {} rows id-for-id",
+                t.elapsed().as_secs_f64(),
+                meta.row_count
+            );
         }
         Command::Bisect { frames } => {
             let baseline = Program::compile_executable_from_disk()?;

@@ -7,7 +7,11 @@
 //!   watermarks, per-file byte lengths. Human-readable; everything a reader
 //!   needs to validate before touching a byte of binary.
 //! * `visited.bin` - the row table's 128-bit keys as two columnar u64-LE
-//!   arrays in dense-id order (the id is the array index, so it is implicit).
+//!   arrays in dense-id order (the id is the array index, so it is
+//!   implicit). Only written by the in-RAM map engine; the mmap engine's
+//!   keys live in the shared `frames/*.rowkeys` files instead
+//!   (`interpreter::visited`), so each checkpoint dir stops duplicating
+//!   the full key set (12.4 GB x 19 dirs at room (2,0) f073).
 //! * `states.bin` - the boundary states (serde/bincode).
 //!
 //! Every `.bin` starts with an 16-byte header (magic + format version +
@@ -58,7 +62,14 @@ pub struct Meta {
     pub lane_count: u64,
     pub deopt_states: u64,
     pub deopt_lanes: u64,
-    pub visited_bin_len: u64,
+    /// `Some` = the visited keys are in this dir's `visited.bin` (the
+    /// historic layout). `None` = they are in the shared
+    /// `frames/*.rowkeys` files (see `interpreter::visited`), and this
+    /// dir carries no per-checkpoint copy of them. Old binaries refuse
+    /// new metas (the field is required for them); new binaries read
+    /// both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visited_bin_len: Option<u64>,
     pub states_bin_len: u64,
 }
 
@@ -279,13 +290,67 @@ pub struct Checkpoint {
     pub states: Vec<State>,
 }
 
+/// The meta and the visited TABLE of a checkpoint, without the
+/// fingerprint gate. For `migrate-visited` ONLY: migration derives
+/// per-frame key files from a dir's own data and cross-checks them
+/// against that same dir's table, so a fingerprint (which guards
+/// cross-CONFIGURATION mixing) protects nothing here - and requiring it
+/// would force the campaign env to be reconstructed just to convert old
+/// artifacts. Format version and byte lengths are still refused loudly.
+pub fn load_meta_and_table_unvalidated(dir: &Path, frame: u32) -> Result<(Meta, RowTable)> {
+    let cdir = dir.join(format!("f{:03}", frame));
+    let meta: Meta = serde_json::from_str(
+        &std::fs::read_to_string(cdir.join("meta.json"))
+            .with_context(|| format!("reading {}/meta.json", cdir.display()))?,
+    )?;
+    if meta.format_version != FORMAT_VERSION {
+        return Err(anyhow!(
+            "checkpoint format version {} != expected {}",
+            meta.format_version,
+            FORMAT_VERSION
+        ));
+    }
+    let Some(len) = meta.visited_bin_len else {
+        return Err(anyhow!(
+            "{} has no visited.bin - it is already rowkeys-era",
+            cdir.display()
+        ));
+    };
+    let mut r = read_bin(&cdir.join("visited.bin"), len)?;
+    let mut buf8 = [0u8; 8];
+    r.read_exact(&mut buf8)?;
+    let count = u64::from_le_bytes(buf8) as usize;
+    if count as u64 != meta.row_count {
+        return Err(anyhow!("visited.bin row count {} != meta {}", count, meta.row_count));
+    }
+    let mut lows = vec![0u64; count];
+    let mut highs = vec![0u64; count];
+    let mut buf = vec![0u8; count * 8];
+    r.read_exact(&mut buf)?;
+    for (i, chunk) in buf.chunks_exact(8).enumerate() {
+        lows[i] = u64::from_le_bytes(chunk.try_into().unwrap());
+    }
+    r.read_exact(&mut buf)?;
+    for (i, chunk) in buf.chunks_exact(8).enumerate() {
+        highs[i] = u64::from_le_bytes(chunk.try_into().unwrap());
+    }
+    let rows_by_id: Vec<(u64, u64)> = lows.into_iter().zip(highs).collect();
+    let visited = RowTable::from_parts(rows_by_id, meta.watermarks.clone());
+    Ok((meta, visited))
+}
+
 /// Write a checkpoint for `frame` under `dir` (atomically, via rename).
+///
+/// `visited` is `None` for runs without frontier-only search. With the
+/// map engine, the full key table is serialized as `visited.bin`; with
+/// the mmap engine the keys are already on disk as `frames/*.rowkeys`
+/// and only the counts go into the meta.
 pub fn save(
     dir: &Path,
     frame: u32,
     fingerprint: &str,
     states: &[State],
-    visited: &RowTable,
+    visited: Option<&crate::interpreter::visited::Visited>,
     deopt_events: (usize, usize),
 ) -> Result<PathBuf> {
     let final_dir = dir.join(format!("f{:03}", frame));
@@ -295,19 +360,26 @@ pub fn save(
     }
     std::fs::create_dir_all(&tmp_dir)?;
 
-    let rows = visited.rows_by_id();
-    let visited_bin_len = write_bin(&tmp_dir.join("visited.bin"), |w| {
-        w.write_all(&(rows.len() as u64).to_le_bytes())?;
-        // Columnar: all low halves, then all high halves.
-        for (lo, _) in &rows {
-            w.write_all(&lo.to_le_bytes())?;
+    let visited_bin_len = match visited.and_then(|v| v.row_table()) {
+        Some(table) => {
+            let rows = table.rows_by_id();
+            Some(
+                write_bin(&tmp_dir.join("visited.bin"), |w| {
+                    w.write_all(&(rows.len() as u64).to_le_bytes())?;
+                    // Columnar: all low halves, then all high halves.
+                    for (lo, _) in &rows {
+                        w.write_all(&lo.to_le_bytes())?;
+                    }
+                    for (_, hi) in &rows {
+                        w.write_all(&hi.to_le_bytes())?;
+                    }
+                    Ok(())
+                })
+                .context("writing visited.bin")?,
+            )
         }
-        for (_, hi) in &rows {
-            w.write_all(&hi.to_le_bytes())?;
-        }
-        Ok(())
-    })
-    .context("writing visited.bin")?;
+        None => None,
+    };
 
     let states_bin_len = write_bin(&tmp_dir.join("states.bin"), |w| {
         bincode::serialize_into(w, states).context("serializing states")
@@ -318,8 +390,8 @@ pub fn save(
         format_version: FORMAT_VERSION,
         fingerprint: fingerprint.to_string(),
         frame,
-        row_count: rows.len() as u64,
-        watermarks: visited.watermarks().to_vec(),
+        row_count: visited.map_or(0, |v| v.len() as u64),
+        watermarks: visited.map_or_else(Vec::new, |v| v.watermarks().to_vec()),
         state_count: states.len() as u64,
         lane_count: states.iter().map(|s| s.vector_size as u64).sum(),
         deopt_states: deopt_events.0 as u64,
@@ -382,26 +454,50 @@ pub fn load(dir: &Path, frame: u32, fingerprint: &str) -> Result<Checkpoint> {
         return Err(anyhow!("checkpoint says frame {}, directory says {}", meta.frame, frame));
     }
 
-    let mut r = read_bin(&cdir.join("visited.bin"), meta.visited_bin_len)?;
-    let mut buf8 = [0u8; 8];
-    r.read_exact(&mut buf8)?;
-    let count = u64::from_le_bytes(buf8) as usize;
-    if count as u64 != meta.row_count {
-        return Err(anyhow!("visited.bin row count {} != meta {}", count, meta.row_count));
-    }
-    let mut lows = vec![0u64; count];
-    let mut highs = vec![0u64; count];
-    let mut buf = vec![0u8; count * 8];
-    r.read_exact(&mut buf)?;
-    for (i, chunk) in buf.chunks_exact(8).enumerate() {
-        lows[i] = u64::from_le_bytes(chunk.try_into().unwrap());
-    }
-    r.read_exact(&mut buf)?;
-    for (i, chunk) in buf.chunks_exact(8).enumerate() {
-        highs[i] = u64::from_le_bytes(chunk.try_into().unwrap());
-    }
-    let rows_by_id: Vec<(u64, u64)> = lows.into_iter().zip(highs).collect();
-    let visited = RowTable::from_parts(rows_by_id, meta.watermarks.clone());
+    let visited = match meta.visited_bin_len {
+        Some(len) => {
+            let mut r = read_bin(&cdir.join("visited.bin"), len)?;
+            let mut buf8 = [0u8; 8];
+            r.read_exact(&mut buf8)?;
+            let count = u64::from_le_bytes(buf8) as usize;
+            if count as u64 != meta.row_count {
+                return Err(anyhow!(
+                    "visited.bin row count {} != meta {}",
+                    count,
+                    meta.row_count
+                ));
+            }
+            let mut lows = vec![0u64; count];
+            let mut highs = vec![0u64; count];
+            let mut buf = vec![0u8; count * 8];
+            r.read_exact(&mut buf)?;
+            for (i, chunk) in buf.chunks_exact(8).enumerate() {
+                lows[i] = u64::from_le_bytes(chunk.try_into().unwrap());
+            }
+            r.read_exact(&mut buf)?;
+            for (i, chunk) in buf.chunks_exact(8).enumerate() {
+                highs[i] = u64::from_le_bytes(chunk.try_into().unwrap());
+            }
+            let rows_by_id: Vec<(u64, u64)> = lows.into_iter().zip(highs).collect();
+            RowTable::from_parts(rows_by_id, meta.watermarks.clone())
+        }
+        None if meta.row_count == 0 => RowTable::default(),
+        None => {
+            // The keys live in the shared frames/*.rowkeys files; rebuild
+            // the map for consumers that want one (sweep, bands). Checked
+            // against the meta's counts and each file's checksum inside.
+            let table =
+                crate::interpreter::visited::load_rowkeys_table(dir, &meta.watermarks)?;
+            if table.len() as u64 != meta.row_count {
+                return Err(anyhow!(
+                    "rowkeys files hold {} rows but meta says {}",
+                    table.len(),
+                    meta.row_count
+                ));
+            }
+            table
+        }
+    };
 
     let r = read_bin(&cdir.join("states.bin"), meta.states_bin_len)?;
     let states: Vec<State> = bincode::deserialize_from(r).context("deserializing states")?;
@@ -414,6 +510,47 @@ pub fn load(dir: &Path, frame: u32, fingerprint: &str) -> Result<Checkpoint> {
     }
 
     Ok(Checkpoint { meta, visited, states })
+}
+
+/// `load` without materializing the visited keys: meta + boundary
+/// states only, fully validated. The resume path of the mmap engine
+/// uses this - its membership structure comes from the `.rowkeys` files
+/// directly, and rebuilding a 25 GiB map just to throw it away was the
+/// point of not having one.
+pub fn load_light(dir: &Path, frame: u32, fingerprint: &str) -> Result<(Meta, Vec<State>)> {
+    let cdir = dir.join(format!("f{:03}", frame));
+    let meta: Meta = serde_json::from_str(
+        &std::fs::read_to_string(cdir.join("meta.json"))
+            .with_context(|| format!("reading {}/meta.json", cdir.display()))?,
+    )?;
+    if meta.format_version != FORMAT_VERSION {
+        return Err(anyhow!(
+            "checkpoint format version {} != expected {}",
+            meta.format_version,
+            FORMAT_VERSION
+        ));
+    }
+    if meta.fingerprint != fingerprint {
+        return Err(anyhow!(
+            "checkpoint fingerprint {} != current configuration {} - the recipe, \
+             lua sources or search flags differ from the run that wrote it",
+            meta.fingerprint,
+            fingerprint
+        ));
+    }
+    if meta.frame != frame {
+        return Err(anyhow!("checkpoint says frame {}, directory says {}", meta.frame, frame));
+    }
+    let r = read_bin(&cdir.join("states.bin"), meta.states_bin_len)?;
+    let states: Vec<State> = bincode::deserialize_from(r).context("deserializing states")?;
+    if states.len() as u64 != meta.state_count {
+        return Err(anyhow!("states.bin count {} != meta {}", states.len(), meta.state_count));
+    }
+    let lanes: u64 = states.iter().map(|s| s.vector_size as u64).sum();
+    if lanes != meta.lane_count {
+        return Err(anyhow!("states.bin lanes {} != meta {}", lanes, meta.lane_count));
+    }
+    Ok((meta, states))
 }
 
 #[cfg(test)]
