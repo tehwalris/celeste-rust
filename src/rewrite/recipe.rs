@@ -1181,7 +1181,7 @@ mod checked_in_recipe_tests {
     /// Discovering that by hand, one room later, is the expensive way.
     #[test]
     fn every_checked_in_recipe_replays() {
-        for path in ["rewrites.jsonl", "rewrites-room00.jsonl"] {
+        for path in ["rewrites.jsonl", "rewrites-room00.jsonl", "rewrites-room00-s2.jsonl"] {
             if !std::path::Path::new(path).exists() {
                 // Run from a different working directory; the other tests
                 // that need the tree skip the same way.
