@@ -98,6 +98,15 @@ commit. Read plans/columnar-engine.md for the full engine story.
 5. The morning docs treat the zero-divergence census as state-window-
    scoped evidence, not a global property.
 
+## Late addendum (post-report work)
+
+- Per-op census landed (`CELESTE_OP_CENSUS=1`): WIDEN is 48% of the
+  serial abstract run - the lane-append at expand/split sites copying
+  every live varying column. Eager btn expansion measured out (frame
+  runs 64x wide; reverted with note). The named fix is COW/
+  lane-indirection columns (plans/columnar-engine.md, census section).
+- Final suite run of the night: 527/527.
+
 ## Where the next session starts
 
 plans/columnar-engine.md "Typed columns, measured" bottom: per-op time

@@ -1,3 +1,20 @@
+# Columnar abstract engine v0 (2026-08-18 overnight; plans/columnar-engine.md)
+
+Gate 1 (per-frame lane counts vs `rewrite bench`, room (1,0) level 0,
+f1..f30): EXACT every frame. Timings, f30 = 27,024 boundary lanes
+(~1.7M offered after the btn fan-out):
+
+| config | f30 | 30 frames |
+|---|---|---|
+| interpreter (`rewrite bench`, 1 core) | 0.08 s | 0.22 s |
+| columnar serial (CHUNK=64, typed cols) | 2.1 s | 3.5 s |
+| columnar parallel (30 cores) | 1.22 s | 2.10 s |
+
+Per-op census (serial): widen (lane-append at expand/split sites)
+1.74 s = 48%, map2 0.53 s, select 0.43 s. Named fixes in the plan
+(COW/lane-indirection columns first). Eager frame-start button
+expansion measured OUT (7.0 s serial - the whole frame runs 64x wide).
+
 # Native probe, zero-divergence program (2026-08-18 overnight)
 
 Compile-only recipe (`rewrites-compile.jsonl` with the zr/zs/zt groups:
