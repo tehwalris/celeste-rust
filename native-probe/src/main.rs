@@ -774,22 +774,61 @@ fn run_abstract(num_frames: u32) {
         for sub in ran.iter_mut() {
             sub.drain_census(&mut census_total);
         }
-        // Drop rows already seen this frame, then k-way merge same-shape
-        // blocks in one pass.
-        let mut seen: rustc_hash::FxHashMap<(u64, u64), ()> = Default::default();
-        let mut groups: Vec<(u64, Vec<runtime2::Rt2>)> = Vec::new();
-        for mut sub in ran {
-            let keep: Vec<u32> = (0..sub.width as u32)
-                .filter(|&i| {
-                    let k = sub.row_keys[i as usize];
-                    if seen.contains_key(&k) {
-                        false
-                    } else {
-                        seen.insert(k, ());
-                        true
-                    }
+        // Drop rows already seen this frame (SHARDED parallel dedup: a
+        // row's shard is a function of its key, so shards are
+        // independent; first-occurrence order within the block sequence
+        // is preserved per shard, and the surviving SET - which is all
+        // identity requires - is order-independent), then k-way merge
+        // same-shape blocks.
+        let n_shards = 32usize;
+        let keeps: Vec<Vec<u32>> = {
+            // (block, lane, key) triples grouped by shard, in block order.
+            let mut per_shard_keeps: Vec<Vec<Vec<u32>>> =
+                (0..n_shards).map(|_| vec![Vec::new(); ran.len()]).collect();
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..n_shards)
+                    .map(|shard| {
+                        let ran = &ran;
+                        scope.spawn(move || {
+                            let mut seen: rustc_hash::FxHashMap<(u64, u64), ()> =
+                                Default::default();
+                            let mut keeps: Vec<Vec<u32>> = vec![Vec::new(); ran.len()];
+                            for (bi, sub) in ran.iter().enumerate() {
+                                for (i, &k) in sub.row_keys.iter().enumerate() {
+                                    if (k.0 as usize) % n_shards != shard {
+                                        continue;
+                                    }
+                                    if let std::collections::hash_map::Entry::Vacant(e) =
+                                        seen.entry(k)
+                                    {
+                                        e.insert(());
+                                        keeps[bi].push(i as u32);
+                                    }
+                                }
+                            }
+                            keeps
+                        })
+                    })
+                    .collect();
+                for (shard, h) in handles.into_iter().enumerate() {
+                    per_shard_keeps[shard] = h.join().unwrap();
+                }
+            });
+            // Merge shards' keeps per block, sorted (retain_lanes needs
+            // ascending indices).
+            (0..ran.len())
+                .map(|bi| {
+                    let mut keep: Vec<u32> = per_shard_keeps
+                        .iter()
+                        .flat_map(|s| s[bi].iter().copied())
+                        .collect();
+                    keep.sort_unstable();
+                    keep
                 })
-                .collect();
+                .collect()
+        };
+        let mut groups: Vec<(u64, Vec<runtime2::Rt2>)> = Vec::new();
+        for (mut sub, keep) in ran.into_iter().zip(keeps) {
             sub.retain_lanes(&keep);
             if sub.width == 0 {
                 continue;
