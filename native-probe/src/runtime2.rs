@@ -1932,83 +1932,79 @@ impl Rt2 {
         };
         self.shape_hash = shape_hash;
 
-        // Per-lane 128-bit row hash over the compacted value cells, shape
-        // hash mixed into both halves.
-        fn hash_av(h: &mut rustc_hash::FxHasher, v: AV) {
+        // Per-lane 128-bit row key over the compacted value cells:
+        // ORDER-INDEPENDENT per-cell mixes summed per lane (the
+        // interpreter's row key is order-independent for the same reason).
+        // Uniform cells fold ONCE into a block partial - sound because the
+        // sum is independent of which cells happen to be uniform in this
+        // block, so keys agree across blocks with different splits.
+        #[inline]
+        fn mix64(mut x: u64) -> u64 {
+            x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            x ^ (x >> 31)
+        }
+        #[inline]
+        fn av_code(v: AV) -> u64 {
             match v {
-                AV::Num(n) => {
-                    h.write_u8(1);
-                    h.write_u32(n.to_bits());
-                }
+                AV::Num(n) => 1u64 << 56 | n.to_bits() as u64,
                 AV::Ival(a, b) => {
-                    h.write_u8(2);
-                    h.write_u32(a.to_bits());
-                    h.write_u32(b.to_bits());
+                    2u64 << 56 | (a.to_bits() as u64) << 24 ^ mix64((b.to_bits() as u64) << 1)
                 }
-                AV::Bool(b) => {
-                    h.write_u8(3);
-                    h.write_u8(b as u8);
-                }
-                AV::UBool => h.write_u8(4),
-                AV::Str(s) => {
-                    h.write_u8(5);
-                    h.write_u32(s);
-                }
-                AV::Nil => h.write_u8(6),
-                AV::Ptr(p) => {
-                    h.write_u8(7);
-                    h.write_u32(p);
-                }
-                AV::NilPtr => h.write_u8(8),
+                AV::Bool(b) => 3u64 << 56 | b as u64,
+                AV::UBool => 4u64 << 56,
+                AV::Str(x) => 5u64 << 56 | x as u64,
+                AV::Nil => 6u64 << 56,
+                AV::Ptr(p) => 7u64 << 56 | p as u64,
+                AV::NilPtr => 8u64 << 56,
             }
         }
+        #[inline]
+        fn cell_mix(c: u64, v: AV, seed: u64) -> u64 {
+            mix64(seed ^ c.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ av_code(v))
+        }
         let w = self.width;
-        let mut h1: Vec<rustc_hash::FxHasher> = (0..w)
-            .map(|_| {
-                let mut h = rustc_hash::FxHasher::default();
-                h.write_u64(shape_hash);
-                h
-            })
-            .collect();
-        let mut h2: Vec<rustc_hash::FxHasher> = (0..w)
-            .map(|_| {
-                let mut h = rustc_hash::FxHasher::default();
-                h.write_u64(0xa076_1d64_78bd_642f ^ shape_hash);
-                h
-            })
-            .collect();
+        let mut part1: u64 = shape_hash;
+        let mut part2: u64 = 0xa076_1d64_78bd_642f ^ shape_hash;
+        let mut h1: Vec<u64> = vec![0; w];
+        let mut h2: Vec<u64> = vec![0; w];
         for (c, cell) in self.structure.iter().enumerate() {
             if !matches!(cell, Cell2::Val) {
                 continue;
             }
+            let ci = c as u64;
             match &self.cols[c] {
                 Col::U(v) => {
-                    for i in 0..w {
-                        hash_av(&mut h1[i], *v);
-                        hash_av(&mut h2[i], *v);
-                    }
+                    part1 = part1.wrapping_add(cell_mix(ci, *v, 0x5bf0_3635));
+                    part2 = part2.wrapping_add(cell_mix(ci, *v, 0x27d4_eb2f));
                 }
                 Col::V(vs) => {
                     for i in 0..w {
-                        hash_av(&mut h1[i], vs[i]);
-                        hash_av(&mut h2[i], vs[i]);
+                        h1[i] = h1[i].wrapping_add(cell_mix(ci, vs[i], 0x5bf0_3635));
+                        h2[i] = h2[i].wrapping_add(cell_mix(ci, vs[i], 0x27d4_eb2f));
                     }
                 }
                 Col::N(vs) => {
                     for i in 0..w {
-                        hash_av(&mut h1[i], AV::Num(vs[i]));
-                        hash_av(&mut h2[i], AV::Num(vs[i]));
+                        h1[i] = h1[i].wrapping_add(cell_mix(ci, AV::Num(vs[i]), 0x5bf0_3635));
+                        h2[i] = h2[i].wrapping_add(cell_mix(ci, AV::Num(vs[i]), 0x27d4_eb2f));
                     }
                 }
                 Col::I(vs) => {
                     for i in 0..w {
-                        hash_av(&mut h1[i], AV::Ival(vs[i].0, vs[i].1));
-                        hash_av(&mut h2[i], AV::Ival(vs[i].0, vs[i].1));
+                        let v = AV::Ival(vs[i].0, vs[i].1);
+                        h1[i] = h1[i].wrapping_add(cell_mix(ci, v, 0x5bf0_3635));
+                        h2[i] = h2[i].wrapping_add(cell_mix(ci, v, 0x27d4_eb2f));
                     }
                 }
             }
         }
-        self.row_keys = (0..w).map(|i| (h1[i].finish(), h2[i].finish())).collect();
+        self.row_keys = (0..w)
+            .map(|i| (
+                mix64(part1.wrapping_add(h1[i])),
+                mix64(part2.wrapping_add(h2[i])),
+            ))
+            .collect();
 
         // Dedup within the block, keeping the first lane of each row.
         let mut keep: Vec<u32> = Vec::new();

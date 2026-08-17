@@ -403,3 +403,17 @@ started.
 
 Remaining ladder: (1) boundary/dedup roofline pass, (2) select/map2
 fusion or typed-bool columns, (3) fused loops via the transpiler.
+
+## Final measurements of the night (~08:00)
+
+- Order-independent row keys (per-cell mixes summed per lane; uniform
+  cells fold once per block - split-independent identity, the
+  interpreter's own order-independent-key doctrine). Counts unchanged
+  through f40 at 902k rows - strong collision evidence. Depth timing
+  unchanged: hashing was NOT the depth bottleneck.
+- CHUNK re-sweep at f40 under COW: 64 -> 14.2s, 256 -> 16.5s,
+  1024 -> 20.0s, 4096 -> 25.5s. Cache blocking still rules; per-chunk
+  overhead is not dominant. The remaining depth cost sits in the
+  serial merge/dedup section (k-way merge of ~10k sub-blocks + a
+  serial 902k-entry dedup map) and in per-offered-lane op work -
+  both named for the goal-7 pass (parallel merge, radix dedup).
