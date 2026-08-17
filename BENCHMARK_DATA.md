@@ -8,7 +8,15 @@ out + f37 chase 365,029 (all configs below EXACT). 30 cores.
 |---|---|---|
 | Rt2 columnar (reference) | 2.0 s | 10.6k |
 | Rt3 tiles, concrete buttons x64 variants (CELESTE_TILE=1) | 8.16 s | 43.4k |
-| Rt3 tiles, dynamic in-tile expand (CELESTE_TILE=2) | **1.55 s** | **8.3k** |
+| Rt3 dynamic in-tile expand (CELESTE_TILE=2), first light | 1.55 s | 8.3k |
+| + uniform-cond select pass-through | 1.49 s | 7.9k |
+| + typed panes (N=[P8;64] pool, B=u64 lane mask) | 1.32 s | 7.0k |
+| + per-chunk template, undo-log reset (no clones/row) | **1.26 s** | **6.7k** |
+
+Evening ladder, all steps EXACT + guard + gate-1-f40 gated. Post-panes
+profile: per-op arithmetic is out of the top table; the frontier is
+append_into 12% + boundary 14.5% + generated-code self 15%. TILE=64 +
+panes also took mode 1 to 5.39 s (kept as a control).
 
 CELESTE_TILE=2 = trunk sharing: one boundary row per tile, the input
 fan-out grows the lane axis in-tile (expand doubles width 1 -> 64), so
