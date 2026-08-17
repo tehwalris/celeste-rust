@@ -2184,9 +2184,15 @@ impl Rt2 {
                     }
                 }
                 Col::N(vs) => {
+                    // Same key as cell_mix(ci, AV::Num(v), seed), with
+                    // the per-cell constants hoisted so the loop is a
+                    // flat elementwise xor/mix chain (vectorizable).
+                    let c1 = 0x5bf0_3635u64 ^ ci.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                    let c2 = 0x27d4_eb2fu64 ^ ci.wrapping_mul(0x9e37_79b9_7f4a_7c15);
                     for i in 0..w {
-                        h1[i] = h1[i].wrapping_add(cell_mix(ci, AV::Num(vs[i]), 0x5bf0_3635));
-                        h2[i] = h2[i].wrapping_add(cell_mix(ci, AV::Num(vs[i]), 0x27d4_eb2f));
+                        let code = 1u64 << 56 | vs[i].to_bits() as u64;
+                        h1[i] = h1[i].wrapping_add(mix64(c1 ^ code));
+                        h2[i] = h2[i].wrapping_add(mix64(c2 ^ code));
                     }
                 }
                 Col::I(vs) => {

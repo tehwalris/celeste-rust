@@ -870,7 +870,10 @@ fn frame_step(
     // column's mid-frame buffer (~32k lanes x 16 B = 512 KB) L2-ish.
     // Cross-chunk dedup at the boundary makes chunking invisible
     // (batching invariance is the certified doctrine).
-    const CHUNK: usize = 64;
+    let chunk_rows: usize = std::env::var("CELESTE_CHUNK_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64);
     for block in blocks {
         let freeze_cell = block.globals[g_freeze as usize];
         assert!(freeze_cell != runtime2::NONE);
@@ -883,13 +886,13 @@ fn frame_step(
                 None => vec![sub],
             };
             for part in parts {
-                if part.width <= CHUNK {
+                if part.width <= chunk_rows {
                     pending.push(part);
                 } else {
                     let n = part.width;
                     let mut at = 0;
                     while at < n {
-                        let hi = (at + CHUNK).min(n);
+                        let hi = (at + chunk_rows).min(n);
                         pending.push(part.slice_lanes(at, hi));
                         at = hi;
                     }

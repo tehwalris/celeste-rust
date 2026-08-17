@@ -722,6 +722,49 @@ impl<const BTN: u8> Rt3<BTN> {
         if let (TCol::B(m, e), Some(a), Some(b)) = (c, self.num_src(t), self.num_src(f)) {
             let sh = self.log_w - e;
             let mut o = [P8::from_i16(0); TILE];
+            if sh == 0 {
+                // Aligned mask: branchless per-lane blend over direct
+                // sources (vectorizable - no projection shifts).
+                let pick = |i: usize, av: P8, bv: P8| -> P8 {
+                    if m >> i & 1 == 1 {
+                        av
+                    } else {
+                        bv
+                    }
+                };
+                match (a, b) {
+                    (NumSrc::P(ai, 0), NumSrc::P(bi, 0)) => {
+                        let (ap, bp) =
+                            (&self.tiles_n[ai as usize], &self.tiles_n[bi as usize]);
+                        for (i, slot) in o.iter_mut().enumerate().take(self.width) {
+                            *slot = pick(i, ap[i], bp[i]);
+                        }
+                    }
+                    (NumSrc::P(ai, 0), NumSrc::S(bv)) => {
+                        let ap = &self.tiles_n[ai as usize];
+                        for (i, slot) in o.iter_mut().enumerate().take(self.width) {
+                            *slot = pick(i, ap[i], bv);
+                        }
+                    }
+                    (NumSrc::S(av), NumSrc::P(bi, 0)) => {
+                        let bp = &self.tiles_n[bi as usize];
+                        for (i, slot) in o.iter_mut().enumerate().take(self.width) {
+                            *slot = pick(i, av, bp[i]);
+                        }
+                    }
+                    (NumSrc::S(av), NumSrc::S(bv)) => {
+                        for (i, slot) in o.iter_mut().enumerate().take(self.width) {
+                            *slot = pick(i, av, bv);
+                        }
+                    }
+                    _ => {
+                        for (i, slot) in o.iter_mut().enumerate().take(self.width) {
+                            *slot = pick(i, self.num_at(a, i), self.num_at(b, i));
+                        }
+                    }
+                }
+                return self.put_pane_n(o);
+            }
             for (i, slot) in o.iter_mut().enumerate().take(self.width) {
                 *slot = if m >> (i >> sh) & 1 == 1 {
                     self.num_at(a, i)

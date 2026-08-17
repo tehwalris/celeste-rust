@@ -982,3 +982,48 @@ The (2,0)-engine unit is therefore, precisely:
 
 gen.rs restored to the compile recipe afterwards (byte-identical) and
 the (1,0) bench re-verified green.
+
+## Stage-2 hill-climb, session 1 (2026-08-17 evening)
+
+Target per Philippe: the forward step of one real frame (all rows) as
+fast as possible, profile-driven, static types. Baseline 607 ms
+(187,859 rows, 29 cores, 3.23 us/row). Steps, each gated on bench
+exactness + gate 2 + f40 lane counts + scalar hex + mode 1:
+
+1. Inline/outline op split (all hot ops: arith/compare/min/max/select/
+   load/store/truthy): uniform fast path inline(always) at every call
+   site, pane machinery outlined. Trunk chains become straight scalar
+   code. 608 -> 577 ms.
+2. val_dirty undo log + varying-only load_row (~9 cols vs ~300/row):
+   577 -> 560 ms.
+3. append_into contiguous pane copy / uniform splat: 560 -> 551 ms.
+4. TRANSPILER: block-scoped single-def locals ('let lN = ...' inline;
+   ~10.4k of 12.2k locals) - the fn-scope let-mut scheme kept ~3200
+   E::V temporaries on f_15's 13.6 KB stack frame, and its self time
+   was stack reloads. 551 -> 520 ms, f40 depth 8.93 -> 8.28 s.
+5. Neutral (kept, no cost): boundary hash loop restructure (hoisted
+   cell constants), select blend alignment specialization.
+   CHUNK-rows sweep 64/128/256/512 -> 64 confirmed optimal (128 is
+   already +17%: mid-frame working set leaves cache).
+
+Session total: 607 -> 520 ms (2.77 us/row), f40 depth 9.80 -> 8.28 s.
+Instruction-count ground truth for the "why not 50 ns" question:
+25k instructions retired per scalar frame (measured, IPC 3.48) -
+branch-free executes BOTH arms of every former branch by design; a
+~250-instruction frame is a branchy frame. The payoff is lane
+amortization, still uncollected.
+
+Remaining profile (520 ms): f_15 20% (16-byte TCol moves + real
+scalar trunk work), boundary 17% (row hashing + per-chunk structure),
+append_into 16% (typed extends + bool/AV appends), select_outline 8%.
+The next rungs are each structural, in expected-value order:
+1. Typed 8-byte values in generated code (Nv{U/I/P} instead of TCol) +
+   static per-local types from inference - halves f_15's data traffic
+   and unlocks constant folding through loads (needs cell-type facts
+   + runtime guards at fact sites).
+2. Col::B (bool mask column) through Rt2: append/boundary/hash carry
+   masks instead of 16 B AV::Bool per lane - attacks both append and
+   boundary shares.
+3. Row batching >1 row per tile at low fan-out (plan note exists).
+4. The op count itself: typed constant folding over the uniform trunk
+   (the compile recipe's dead selects fold once types are static).
