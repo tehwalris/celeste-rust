@@ -468,7 +468,22 @@ pub fn describe_objects(state: &State) -> String {
             .unwrap_or_else(|| "?".to_string());
         parts.push(name);
     }
-    format!("objects: {} [{}]", items.len(), parts.join(", "))
+    // The globals that decide which trace class a state is in - premise
+    // failures are diagnosed by exactly these (freeze/restart gates, pm1).
+    let mut globals: Vec<String> = Vec::new();
+    for name in ["freeze", "will_restart", "delay_restart", "has_dashed"] {
+        if let Some(gid) = state.global_env.get(name) {
+            if let HeapValue::Value(v) = helper.load(*gid) {
+                globals.push(format!("{}={:?}", name, v));
+            }
+        }
+    }
+    format!(
+        "objects: {} [{}]; {}",
+        items.len(),
+        parts.join(", "),
+        globals.join(", ")
+    )
 }
 
 // ============================================================================

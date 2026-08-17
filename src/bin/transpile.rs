@@ -656,7 +656,7 @@ impl Gen {
         }
         let mut used_outside: BTreeSet<usize> = BTreeSet::new();
         for (bi, (_, block)) in blocks.iter().enumerate() {
-            let mut mark = |id: LocalId, used_outside: &mut BTreeSet<usize>| {
+            let mark = |id: LocalId, used_outside: &mut BTreeSet<usize>| {
                 let id = usize::from(id);
                 if def_blk.get(&id) != Some(&bi) {
                     used_outside.insert(id);

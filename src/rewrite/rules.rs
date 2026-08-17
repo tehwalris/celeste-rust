@@ -40,6 +40,7 @@ pub mod fold;
 pub mod fold_reflexive;
 pub mod fold_select;
 pub mod fuse_breaks;
+pub mod guard_branch;
 pub mod cse;
 pub mod dce;
 pub mod dedup_guards;

@@ -678,6 +678,33 @@ fn run_branch_census(dir: &str, frame: u32) {
             if n <= 1 { " - SHADOW of an upstream gate" } else { "" }
         );
     }
+    // Ready-to-paste guard_branch recipe entries for the once-executed,
+    // non-divergent sites (seq hash 2 = the true edge every run, 1 = the
+    // false edge). MULTI sites (loops) and divergent sites are skipped -
+    // they need unrolling or a finer dispatch key, not a guard. These are
+    // SUGGESTIONS: the census samples one frame's biggest state, and only
+    // the hosted `rewrite verify` screen (deopt counts over the full run)
+    // certifies them.
+    println!("guard_branch entries (once-executed, non-divergent):");
+    for (i, f) in first.iter().enumerate() {
+        let Some(h) = *f else { continue };
+        if (h == 1 || h == 2) && !div[i] {
+            let taken = h == 2;
+            let (fn_name, label) = gen::BRANCH_INFO[i]
+                .split_once(" @")
+                .expect("BRANCH_INFO is 'fn @label'");
+            println!(
+                "{{\"id\":\"gb_{}_{}\",\"rule\":\"guard_branch\",\"fn\":{:?},\"head\":{:?},\"taken\":{},\"why\":\"branch census f{}: every sampled run takes the {} edge\"}}",
+                fn_name.trim_start_matches('_'),
+                label,
+                fn_name,
+                label,
+                taken,
+                frame,
+                if taken { "true" } else { "false" }
+            );
+        }
+    }
 }
 
 fn main() {

@@ -22,7 +22,7 @@ use super::rules::{
     convert_assert, convert_ternary,
     cse, dce, decompose_branch, dedup_guards,
     decompose_truthy, demote_create, drop_dead_cell,
-    expand_bool, fold, fold_reflexive, fold_select, fuse_breaks, if_convert, inline,
+    expand_bool, fold, fold_reflexive, fold_select, fuse_breaks, guard_branch, if_convert, inline,
     mask_loop, merge_blocks,
     pin_builtin, split_at,
     promote_capture,
@@ -339,6 +339,22 @@ pub enum Rule {
         /// The block whose conditional branch is removed.
         head: String,
     },
+    /// Replace a conditional branch with a premise guard (`assert_true` on
+    /// the condition, behind a `not` when the recorded edge is the false
+    /// one) and an unconditional jump to the recorded side. The premise is
+    /// "every lane takes the recorded edge"; a lane that falsifies it
+    /// deopts to the plain program via the standard `assert_true` capture.
+    /// The workhorse of trace straightening: derived mechanically from the
+    /// branch census, screened at full depth for deopt counts.
+    GuardBranch {
+        #[serde(rename = "fn")]
+        function: String,
+        /// The block whose conditional branch is replaced (`__entry` names
+        /// the entry block).
+        head: String,
+        /// The recorded direction: `true` = every lane takes the true edge.
+        taken: bool,
+    },
     /// Replace an inlined `__assert` failure diamond (`if not cond then
     /// __print(...) ... error(...) end`) with a single `assert_true` on the
     /// condition. Every path through the diamond aborts the run, exactly
@@ -513,6 +529,7 @@ impl Rule {
             Rule::PromoteCell { .. } => "promote_cell",
             Rule::DecomposeBranch { .. } => "decompose_branch",
             Rule::ExpandBool { .. } => "expand_bool",
+            Rule::GuardBranch { .. } => "guard_branch",
             Rule::ConvertAssert { .. } => "convert_assert",
             Rule::CollapseLoop { .. } => "collapse_loop",
             Rule::CollapseBreakLoop { .. } => "collapse_break_loop",
@@ -838,6 +855,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
             decompose_branch::apply(program, function, resolve_cell(&names, function, at)?)
         }
         Rule::ExpandBool { function, head } => expand_bool::apply(program, function, head),
+        Rule::GuardBranch { function, head, taken } => {
+            guard_branch::apply(program, function, head, *taken)
+        }
         Rule::ConvertAssert { function, head } => convert_assert::apply(program, function, head),
         Rule::CollapseLoop { function, head } => collapse_loop::apply(program, function, head),
         Rule::CollapseBreakLoop { function, head } => {
@@ -985,6 +1005,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         }
         Rule::ExpandBool { function, head } => {
             expand_bool::verify(&before, program, function, head)
+        }
+        Rule::GuardBranch { function, head, taken } => {
+            guard_branch::verify(&before, program, function, head, *taken)
         }
         Rule::ConvertAssert { function, head } => {
             convert_assert::verify(&before, program, function, head)
