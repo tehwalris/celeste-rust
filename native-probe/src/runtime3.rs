@@ -422,7 +422,7 @@ impl<const BTN: u8> Rt3<BTN> {
         false
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn tat(&self, c: TCol, lane: usize) -> AV {
         match c {
             TCol::U(a) => a,
@@ -500,7 +500,7 @@ impl<const BTN: u8> Rt3<BTN> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn num_at(&self, s: NumSrc, lane: usize) -> P8 {
         match s {
             NumSrc::S(n) => n,

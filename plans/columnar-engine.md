@@ -767,3 +767,18 @@ Next levers, in order of expected value:
    partial fan-out or TILE=1024 panes; measure before building.
 4. Drop the 4 Rt3<BTN> const variants (mode 1 + variants lost to mode
    2; keep mode 1 as a control until mode 2 has survived a campaign).
+
+## Evening ladder result + the pivot (2026-08-17, end of day)
+
+One-frame bench, all steps EXACT + guard + gate-1-f40 gated:
+8.16 s -> 1.54 (trunk sharing) -> 1.49 (select pass-through) -> 1.32
+(typed panes) -> 1.26 (undo-log reset) -> 1.04 s (typed append).
+Rt2 reference 2.0 s; the morning's engine is 7.8x behind.
+
+Where the next factor is NOT: at depth the kernel no longer matters -
+`--abstract 40` runs the SAME 31 s wall under Rt2, tile mode 1 and
+mode 2, because the serial boundary/merge/dedup dominates from ~f35
+on (902k lanes). The kernel's residual profile (f_15 glue 15%,
+boundary 14%, select 12%, append 10%) says roughly one more 2x is
+available in-frame, but the CAMPAIGN-relevant lever is now goal 7:
+merge/dedup/boundary at roofline. That is the next unit.
