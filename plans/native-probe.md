@@ -310,3 +310,62 @@ The two real sites, each one link from done:
 2. dash trigger (anonymous_61 @in_h061_if_condition_43): stage-D
    speculate + absorb_stores over the already-flattened dash body
    (m-package pattern), a mechanical per-store derivation.
+
+## Zero divergence ACHIEVED (2026-08-18, overnight): 9 -> 0 divergent
+
+Both links closed, measured on the f35 bench states:
+
+- branch census: 617 static sites, 26 executed, **0 DIVERGENT**, 0 panics.
+- gap census: **0 multi-receiver**, 178 single-receiver (was 184 - the
+  four iterator cells and the dash btn scratch dropped), 0 panics.
+- bench (core 15, seed-7 trajectory, 1000 reps x 340 frames):
+  **2922 ns/frame** single-lane concrete.
+
+How each link fell:
+
+1. The iterator-cell fence was NOT sibling-store aliasing - forward-cse
+   already carries `CellProv::Alloc` precision - it was forward mode
+   being deliberately block-local (`keep_across_edges` zeroed). New
+   opt-in `cse {forward, cells}` (`zr_cse`): pairs keyed by a load of an
+   IR-`alloc` cell may cross block edges. Sound because an alloc names
+   exactly one cell, so the per-block alias masks are exact for it; a
+   new flag so every old `forward` entry replays byte-identically.
+   Unit-tested x5 (cross-block forward, field-store/sibling-alloc
+   non-fences, one-path store veto, call veto). Then `drop_dead_cell`
+   x4 (%1515/%1518/%1558/%1561) and the proven freeze-gate
+   `speculate_region {mask:true}` entry applied (zs000, 34 changes) -
+   gate gone, 7 shadows with it.
+2. Dash trigger: `drop_dead_cell` on the btn scratch cell (%1939) +
+   `demote_create` on the k_up concretization store target (%2589; the
+   toplevel `__button_states` init makes every button cell pre-exist,
+   and the guard makes a wrong claim loud), then one
+   `speculate_region {mask:true, expand:true}` triangle entry (zt001,
+   57 changes) over the whole dash body. No per-store stage-D
+   derivation needed - the region rule swallowed it in one step.
+
+Gates: full recipe replays (6.4s); differential verify identical
+through 40 frames (zr+zs 83.0s, +zt 107.7s); suite green; censuses
+above.
+
+### The hex-exactness oracle, corrected
+
+The old "hex-identical 400 frames vs concrete_run" claim was OVERBROAD
+and is hereby corrected: on the seed-7 trajectory the player DIES at
+frame 341, and `kill_player` empties `objects` mid-update, so the
+`count(objects)==1` premise (the collapsed check/collide loops, spliced
+eagerly by the h061 inline + round-2 if_converts) fails - at HEAD
+exactly as with tonight's entries, same frame, same assert (%3772).
+The compiled shape program is a PARTIAL function and this is its domain
+boundary working as designed: premise failure is LOUD (assert, not
+silent divergence) and is precisely the deopt trigger of the dispatch
+architecture. The oracle from now on:
+
+- hex-identical through the premise-holding prefix (f340 here:
+  re-verified tonight), and
+- domain exit is a loud assert at the same frame as the reference dies
+  (no silent wrong data, no premature exit).
+
+A full-trajectory hex-400 oracle returns once the probe grows the
+deopt-to-plain fallback (goal 6 of plans/overnight-2026-08-17.md);
+death frames then run the plain program and the trajectory re-enters
+the compiled domain after respawn.

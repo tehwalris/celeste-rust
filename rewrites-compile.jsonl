@@ -1053,10 +1053,30 @@
 {"id":"zq_mb","rule":"merge_blocks"}
 {"forward":true,"id":"zq_cse","rule":"cse"}
 {"id":"zq_dce","rule":"dce"}
-# The idx/last iterator cells stay alive for now: their loads sit behind
-# stores to sibling scratch cells, which forward-cse treats as fences.
-# Next unit: an opt-in cell-precise forward mode (non-escaping allocs
-# cannot alias), then these four drop and the freeze gate converts.
+# The idx/last iterator cells: cells-mode forward-cse (alloc-cell pairs may
+# cross block edges; an alloc names exactly one cell, so the alias masks are
+# exact) erases their loads, and the cells drop.
+{"cells":true,"forward":true,"id":"zr_cse","rule":"cse"}
+{"cell":"%1515","fn":"__frame","id":"zr000","rule":"drop_dead_cell"}
+{"cell":"%1518","fn":"__frame","id":"zr001","rule":"drop_dead_cell"}
+{"cell":"%1558","fn":"__frame","id":"zr002","rule":"drop_dead_cell"}
+{"cell":"%1561","fn":"__frame","id":"zr003","rule":"drop_dead_cell"}
+{"id":"zr_dce","rule":"dce"}
+# The freeze gate: with the iterator cells gone the whole inlined _draw is
+# alloc- and call-free, so it converts to an unconditional masked region.
+# The 7 shadow branches inside it become uniform with it.
+{"arm":"in_i1_013_if_join_2","fn":"__frame","head":"in_i1_012_cont","id":"zs000","join":"in_i1_013_cont","mask":true,"rule":"speculate_region"}
+{"id":"zs_mb","rule":"merge_blocks"}
+{"forward":true,"id":"zs_cse","rule":"cse"}
+{"id":"zs_dce","rule":"dce"}
+# The dash trigger (djump>0 and dash pressed): the arm is one call-free
+# block once its btn scratch cell drops; expands + masked stores convert it.
+{"cell":"%1939","fn":"anonymous_61","id":"zt000","rule":"drop_dead_cell"}
+{"at":"%2589","fn":"anonymous_61","id":"zt000b","rule":"demote_create"}
+{"arm":"in_h061_if_body_107","expand":true,"fn":"anonymous_61","head":"in_h061_if_condition_43","id":"zt001","mask":true,"rule":"speculate_region"}
+{"id":"zt_mb","rule":"merge_blocks"}
+{"forward":true,"id":"zt_cse","rule":"cse"}
+{"id":"zt_dce","rule":"dce"}
 {"id":"xb_dce","rule":"dce"}
 {"id":"k1","rule":"kill_dead"}
 {"id":"s1","rule":"allocate_slots"}

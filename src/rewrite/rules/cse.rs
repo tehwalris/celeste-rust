@@ -656,12 +656,13 @@ fn apply_barriers(state: &mut Bits, universe: &Universe, instr: &Instruction) {
 fn substitution(
     cfg: &Cfg,
     oblivious: Option<&rustc_hash::FxHashSet<String>>,
+    cells: bool,
 ) -> FxHashMap<LocalId, LocalId> {
     let layout = Layout::of(cfg);
     let fwd = oblivious.map(|o| Fwd::of(cfg, o));
     let mut subst: FxHashMap<LocalId, LocalId> = FxHashMap::default();
     loop {
-        let found = redundancies(&layout, &subst, fwd.as_ref());
+        let found = redundancies(&layout, &subst, fwd.as_ref(), cells);
         let before = subst.len();
         for (from, to) in found {
             subst.entry(from).or_insert(to);
@@ -702,6 +703,7 @@ fn redundancies(
     layout: &Layout,
     subst: &FxHashMap<LocalId, LocalId>,
     fwd: Option<&Fwd>,
+    cells: bool,
 ) -> FxHashMap<LocalId, LocalId> {
     let resolve = |id: LocalId| *subst.get(&id).unwrap_or(&id);
 
@@ -772,8 +774,21 @@ fn redundancies(
     // directly: letting the new folds cross raised `player.update_21` from 33
     // to 47 live slots and was ~2% slower at frame 37 with the same fragment
     // count, eating the win the removed instructions bought.
+    //
+    // The `cells` opt-in carves out one exception: pairs whose key is a load
+    // of an IR-`alloc` cell may cross edges. An alloc names exactly one cell,
+    // so the per-block alias masks are exact for it, and the point of the
+    // flag is to erase such cells entirely (forward every load, then
+    // `drop_dead_cell`), after which nothing is kept live at all.
     if fwd.is_some() {
         universe.keep_across_edges = bits_empty(bits);
+        if cells {
+            for (i, meta) in metas.iter().enumerate() {
+                if matches!(meta, PairMeta::Load(CellProv::Alloc(_))) {
+                    bit_set(&mut universe.keep_across_edges, i);
+                }
+            }
+        }
     }
 
     // Summarise each block as `out = (in & mask) | gen`. Valid because every
@@ -886,11 +901,12 @@ fn redundancies(
     found
 }
 
-pub fn apply(program: &mut Program, forward: bool) -> Result<usize> {
+pub fn apply(program: &mut Program, forward: bool, cells: bool) -> Result<usize> {
+    require(forward || !cells, "cse: `cells` requires `forward`")?;
     let oblivious = if forward { Some(oblivious_globals(program)) } else { None };
     let mut changes = 0;
     for fun in program.functions.values_mut() {
-        let subst = substitution(&fun.cfg, oblivious.as_ref());
+        let subst = substitution(&fun.cfg, oblivious.as_ref(), cells);
         if subst.is_empty() {
             continue;
         }
@@ -925,7 +941,8 @@ fn blocks_mut(cfg: &mut Cfg) -> impl Iterator<Item = &mut Block> {
 /// separately here is everything the applier could get wrong on top of it:
 /// removing an instruction that was not in the substitution, keeping one that
 /// was, failing to substitute a use, reordering, or touching a terminator.
-pub fn verify(before: &Program, after: &Program, forward: bool) -> Result<()> {
+pub fn verify(before: &Program, after: &Program, forward: bool, cells: bool) -> Result<()> {
+    require(forward || !cells, "cse: `cells` requires `forward`")?;
     require(
         before.functions.len() == after.functions.len(),
         "cse changed the set of functions",
@@ -934,7 +951,7 @@ pub fn verify(before: &Program, after: &Program, forward: bool) -> Result<()> {
 
     for (name, before_fun) in &before.functions {
         let after_fun = after.get(name.as_str())?;
-        let subst = substitution(&before_fun.cfg, oblivious.as_ref());
+        let subst = substitution(&before_fun.cfg, oblivious.as_ref(), cells);
         let resolve = |id: LocalId| *subst.get(&id).unwrap_or(&id);
 
         // A removed instruction must be replaced by one that survives, so the
@@ -1062,15 +1079,15 @@ mod tests {
 
     fn run(p: &mut Program) -> String {
         let before = p.clone();
-        apply(p, false).unwrap();
-        verify(&before, p, false).unwrap();
+        apply(p, false, false).unwrap();
+        verify(&before, p, false, false).unwrap();
         format_function(p.get("f").unwrap())
     }
 
     fn run_forward(p: &mut Program) -> String {
         let before = p.clone();
-        apply(p, true).unwrap();
-        verify(&before, p, true).unwrap();
+        apply(p, true, false).unwrap();
+        verify(&before, p, true, false).unwrap();
         format_function(p.get("f").unwrap())
     }
 
@@ -1212,7 +1229,7 @@ mod tests {
         );
         run(&mut p);
         let once = format_function(p.get("f").unwrap());
-        assert_eq!(apply(&mut p, false).unwrap(), 0);
+        assert_eq!(apply(&mut p, false, false).unwrap(), 0);
         assert_eq!(once, format_function(p.get("f").unwrap()));
     }
 
@@ -1450,7 +1467,7 @@ mod tests {
         let fun = p.get_mut("f").unwrap();
         fun.cfg.entry.instructions.retain(|(i, _)| *i != id(12));
         fun.cfg.entry.terminator.1 = Terminator::Return { value: Some(id(10)) };
-        assert!(verify(&before, &p, false).is_err());
+        assert!(verify(&before, &p, false, false).is_err());
     }
 
     // --- forward mode ---
@@ -1710,5 +1727,138 @@ mod tests {
         let text = run_forward(&mut p);
         assert!(!text.contains("%12") && !text.contains("%14"), "{}", text);
         assert!(text.contains("return %9"), "{}", text);
+    }
+
+    // --- cells mode (forward + alloc-cell pairs crossing block edges) ---
+
+    fn run_cells(p: &mut Program) -> String {
+        let before = p.clone();
+        apply(p, true, true).unwrap();
+        verify(&before, p, true, true).unwrap();
+        format_function(p.get("f").unwrap())
+    }
+
+    /// The reason the flag exists: a store to an alloc cell in one block
+    /// forwards to a load in a later block, so the cell's loads can be erased
+    /// and the cell dropped. Plain forward mode must NOT do this - it is
+    /// deliberately block-local - or old entries would change.
+    #[test]
+    fn cells_mode_forwards_an_alloc_store_across_blocks() {
+        let build = || {
+            cfg_of(vec![
+                (
+                    "__entry",
+                    vec![
+                        (id(10), Instruction::Alloc),
+                        (id(11), Instruction::Store { target: id(10), source: id(3) }),
+                    ],
+                    goto("b"),
+                ),
+                ("b", vec![(id(12), Instruction::Load { source: id(10) })], Terminator::Return { value: Some(id(12)) }),
+            ])
+        };
+        let mut p = build();
+        let text = run_cells(&mut p);
+        assert!(!text.contains("%12 ="), "the load should fold to %3:\n{}", text);
+        assert!(text.contains("return %3"), "{}", text);
+        let mut p = build();
+        let text = run_forward(&mut p);
+        assert!(text.contains("%12 = load %10"), "plain forward stays block-local:\n{}", text);
+    }
+
+    /// A store through a field pointer on the path is not a fence for an
+    /// alloc cell's load - distinct provenances cannot alias.
+    #[test]
+    fn cells_mode_ignores_field_stores_on_the_path() {
+        let mut p = cfg_of(vec![
+            (
+                "__entry",
+                vec![
+                    (id(10), Instruction::Alloc),
+                    (id(11), Instruction::Store { target: id(10), source: id(3) }),
+                ],
+                goto("mid"),
+            ),
+            (
+                "mid",
+                vec![
+                    (id(13), field(2, "x", false)),
+                    (id(14), Instruction::Store { target: id(13), source: id(2) }),
+                ],
+                goto("b"),
+            ),
+            ("b", vec![(id(15), Instruction::Load { source: id(10) })], Terminator::Return { value: Some(id(15)) }),
+        ]);
+        let text = run_cells(&mut p);
+        assert!(!text.contains("%15 ="), "{}", text);
+        assert!(text.contains("return %3"), "{}", text);
+    }
+
+    /// A store to a DIFFERENT alloc cell is not a fence either - two allocs
+    /// are two cells. This is exactly the sibling-scratch-cell shape that
+    /// blocked the iterator cells.
+    #[test]
+    fn cells_mode_ignores_sibling_alloc_stores() {
+        let mut p = cfg_of(vec![
+            (
+                "__entry",
+                vec![
+                    (id(10), Instruction::Alloc),
+                    (id(11), Instruction::Store { target: id(10), source: id(3) }),
+                    (id(12), Instruction::Alloc),
+                ],
+                goto("mid"),
+            ),
+            (
+                "mid",
+                vec![(id(13), Instruction::Store { target: id(12), source: id(2) })],
+                goto("b"),
+            ),
+            ("b", vec![(id(14), Instruction::Load { source: id(10) })], Terminator::Return { value: Some(id(14)) }),
+        ]);
+        let text = run_cells(&mut p);
+        assert!(!text.contains("%14 ="), "{}", text);
+        assert!(text.contains("return %3"), "{}", text);
+    }
+
+    /// A store to the SAME cell on one of two converging paths vetoes the
+    /// forward at the join - availability is a must-analysis.
+    #[test]
+    fn cells_mode_respects_a_store_on_one_path() {
+        let mut p = cfg_of(vec![
+            (
+                "__entry",
+                vec![
+                    (id(10), Instruction::Alloc),
+                    (id(11), Instruction::Store { target: id(10), source: id(3) }),
+                ],
+                branch(3, "t", "e"),
+            ),
+            ("t", vec![(id(12), Instruction::Store { target: id(10), source: id(2) })], goto("j")),
+            ("e", vec![], goto("j")),
+            ("j", vec![(id(13), Instruction::Load { source: id(10) })], Terminator::Return { value: Some(id(13)) }),
+        ]);
+        let text = run_cells(&mut p);
+        assert!(text.contains("%13 = load %10"), "{}", text);
+    }
+
+    /// A call on the path kills the pair: a callee can load the cell's
+    /// pointer from anywhere it escaped to.
+    #[test]
+    fn cells_mode_respects_a_call_on_the_path() {
+        let mut p = cfg_of(vec![
+            (
+                "__entry",
+                vec![
+                    (id(10), Instruction::Alloc),
+                    (id(11), Instruction::Store { target: id(10), source: id(3) }),
+                ],
+                goto("mid"),
+            ),
+            ("mid", vec![(id(12), Instruction::Call { closure: id(2), args: vec![] })], goto("b")),
+            ("b", vec![(id(13), Instruction::Load { source: id(10) })], Terminator::Return { value: Some(id(13)) }),
+        ]);
+        let text = run_cells(&mut p);
+        assert!(text.contains("%13 = load %10"), "{}", text);
     }
 }

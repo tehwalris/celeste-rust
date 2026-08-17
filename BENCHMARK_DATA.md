@@ -1,3 +1,21 @@
+# Native probe, zero-divergence program (2026-08-18 overnight)
+
+Compile-only recipe (`rewrites-compile.jsonl` with the zr/zs/zt groups:
+cells-mode forward-cse, 5 dead cells dropped, freeze gate + dash trigger
+converted to masked regions). Censuses at room (1,0) f35 bench states:
+branch census 0 divergent of 26 executed (0 panics), gap census 0
+multi-receiver / 178 single-receiver (0 panics). Single-lane concrete
+replay, core 15, seed-7 trajectory, 1000 reps x 340 frames:
+
+| program | ns/frame |
+|---|---|
+| zero-divergence probe (this) | 2922 |
+
+Hex-identical to `concrete_run` through f340; the trajectory's death
+frame (341) exits the compiled shape's domain with a loud premise assert
+(`count(objects)==1`), identical at HEAD - see plans/native-probe.md
+"The hex-exactness oracle, corrected".
+
 # The visited set left RAM: fp-runs + mmap'd rowkeys, certified identical
 # (2026-08-16, tasks #115-#120; design in plans/visited-redesign.md)
 

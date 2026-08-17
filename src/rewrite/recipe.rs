@@ -61,6 +61,13 @@ pub enum Rule {
         /// byte-identically.
         #[serde(default, skip_serializing_if = "is_false")]
         forward: bool,
+        /// Opt-in (requires `forward`): pairs for loads of IR-`alloc` cells
+        /// may cross block edges, so a store in one block forwards to a load
+        /// in another. Sound because an `alloc` names exactly one cell, so
+        /// the alias mask already computed per block is exact for it; a new
+        /// flag so existing `forward` entries replay byte-identically.
+        #[serde(default, skip_serializing_if = "is_false")]
+        cells: bool,
     },
     /// Repack locals so that values with disjoint live ranges share a slot.
     /// Changes no instructions - only where they are stored.
@@ -778,7 +785,7 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
 
     let changes = match &entry.rule {
         Rule::Dce => dce::apply(program),
-        Rule::Cse { forward } => cse::apply(program, *forward),
+        Rule::Cse { forward, cells } => cse::apply(program, *forward, *cells),
         Rule::AllocateSlots => allocate_slots::apply(program),
         Rule::KillDead => kill_dead::apply(program),
         Rule::MergeBlocks => merge_blocks::apply(program),
@@ -906,7 +913,7 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
     let clock = std::time::Instant::now();
     match &entry.rule {
         Rule::Dce => dce::verify(&before, program),
-        Rule::Cse { forward } => cse::verify(&before, program, *forward),
+        Rule::Cse { forward, cells } => cse::verify(&before, program, *forward, *cells),
         Rule::AllocateSlots => allocate_slots::verify(&before, program),
         Rule::KillDead => kill_dead::verify(&before, program),
         Rule::MergeBlocks => merge_blocks::verify(&before, program),

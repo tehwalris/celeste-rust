@@ -87,7 +87,7 @@
 use anyhow::{anyhow, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::ir::{BinaryOp, Block, FunDef, Instruction, Label, LocalId, Terminator, UnaryOp};
+use crate::ir::{BinaryOp, Block, FunDef, Instruction, Label, LocalId, Terminator};
 
 use super::super::program::Program;
 use super::{blocks_sorted, get_block, predecessors, require, LocalIdAllocator};
@@ -105,8 +105,6 @@ struct Site {
     init: LocalId,
     sentinel: LocalId,
     inc: LocalId,
-    /// The nil check's branch condition.
-    nil_cond: LocalId,
 }
 
 fn flood_avoiding(fun: &FunDef, start: &Label, stop: &Label) -> FxHashSet<Label> {
@@ -464,12 +462,7 @@ fn site(fun: &FunDef, function: &str, head: &Label) -> Result<Site> {
         init,
         sentinel: *sentinel,
         inc,
-        nil_cond,
     })
-}
-
-fn copy_label(rewrite_id: &str, original: &str) -> Label {
-    Label::from(format!("it2_{}_{}", rewrite_id, original))
 }
 
 /// Substitute `from -> to` in every operand of an instruction list and a
@@ -514,7 +507,7 @@ pub fn apply(program: &mut Program, rewrite_id: &str, function: &str, head: &str
         Label::from(format!("it{}_{}_{}", it, rewrite_id, l.as_str()))
     };
     let mut copies: Vec<(Label, Block)> = Vec::new();
-    let mut counter_of_it3 = s.inc; // replaced below by iteration 2's inc
+    let counter_of_it3; // iteration 2's copy of the latch increment
     {
         // --- iteration 2: chain + payload ---
         let mut rename: FxHashMap<LocalId, LocalId> = FxHashMap::default();
