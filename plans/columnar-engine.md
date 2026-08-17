@@ -156,3 +156,35 @@ is the vector-lane loops over ~30-50 live columns. The gap picture
 (goal 4) compares: auto columnar vs hand-tuned SIMD kernel of the
 hottest column ops vs the memory-bandwidth roofline of touching
 (lanes x live columns x 8-16 B) per frame.
+
+## Implementation plan v0 (decided 2026-08-18, in progress)
+
+ONE generated code path for both engines: transpile emits
+`fn f_N<E: Engine>(rt: &mut E, caps: &[E::V], args: &[E::V]) -> E::V`.
+`Engine` trait (defined in runtime.rs) with assoc type `V: Copy`; the
+scalar `Rt` implements it with `V = V` (methods unchanged, moved into
+the impl). The columnar `Rt2` (runtime2.rs) implements it with
+`V = ColId` - a Copy handle into a column arena (`Vec<Option<ColData>>`
++ free list). Generated code additionally emits `rt.kill(&[ids])` at
+IR `kill` instructions: scalar no-op, columnar frees the slots - this
+is what bounds the live-column set that lane-splits must widen.
+
+Lane split cost = O(live varying columns) per appended lane; Uniform
+columns append for free. Heap value cells: `Vec<Col>` beside the shared
+structure heap (282 cells at the room-(1,0) boundary - measured).
+
+Gate 1 reference (rewrite bench --frames 30, level 0, this build):
+f1..f23 = 1 lane (spawn anim), f24=24, f25=204, f26=878, f27=2864,
+f28=7260, f29=15250, f30=27024. Interpreter: 0.22s total, 8.2 us/lane,
+282 heap cells, /tmp/bench-ref30.log.
+No deaths before ~f58 ("states start dying" - bench --deopt doc), so
+v0 needs no deopt path for the gate; non-uniform branch = loud panic.
+
+Driver (--abstract N in probe main.rs): scalar __init once -> convert
+concrete heap to (structure, width-1 columns) -> per frame: run
+f___frame columnar; boundary = rem widening Bits(0) [-0.5,0.5-eps]
+closed + dash_effect_time clamp + timer pins (frames/seconds/minutes/
+deaths -> 0) + straddle split (no-op at Bits(0)); extract rows (value
+columns in cell-id order), dedup 128-bit, next block = survivors.
+Buttons: frame entry stores UBool via __reset_button_states - the
+expands fork them per lane (no set_buttons call - matches the search).
