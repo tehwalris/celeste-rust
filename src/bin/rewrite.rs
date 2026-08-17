@@ -50,6 +50,16 @@ struct VariantOf {
     /// list, e.g. 'fake_wall,player'. Same spelling as `bench --variant`.
     #[arg(long = "variant-shapes")]
     shapes: Option<String>,
+    /// Optional pm1-class conditions extending the dispatch key to
+    /// (shape, pm1 class): comma-separated NAME:VALUE pairs, e.g.
+    /// 'freeze:0,dash_time:0'. NAME is matched like a `partition_merge`
+    /// cell (exact or `.NAME` suffix), VALUE is an integer PICO-8 number.
+    /// The trial program runs only states whose shape matches AND whose
+    /// named cells are per-state scalars equal to VALUE; everything else
+    /// runs the host. Same spelling as the `@PM1` suffix of `bench
+    /// --variant`.
+    #[arg(long = "variant-pm1")]
+    pm1: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -390,11 +400,16 @@ enum Command {
         /// Exact - correct for every rem-ladder level.
         #[arg(long)]
         band_prev_spd_width: Option<u8>,
-        /// Register a shape-dispatched variant: SHAPES=RECIPE_PATH, where
-        /// SHAPES is a |-separated list of object-array shapes and each
-        /// shape is a comma-separated object type-name list. Example:
-        /// --variant 'player|player_spawn=rewrites.jsonl'. A state whose
-        /// object-array shape matches runs its frames under that recipe's
+        /// Register a shape-dispatched variant: SHAPES[@PM1]=RECIPE_PATH,
+        /// where SHAPES is a |-separated list of object-array shapes and
+        /// each shape is a comma-separated object type-name list. Example:
+        /// --variant 'player|player_spawn=rewrites.jsonl'. The optional
+        /// @PM1 suffix keys dispatch on (shape, pm1 class): comma-separated
+        /// NAME:VALUE pairs, e.g. 'player@freeze:0,dash_time:0=steady.jsonl'
+        /// runs only player states whose named cells are per-state scalars
+        /// equal to VALUE. Registry order is dispatch order: list a
+        /// pm1-keyed overlay before a shape-only variant of the same shape.
+        /// A state whose key matches runs its frames under that recipe's
         /// program, through the canonical mapping both ways; every other
         /// state uses the base recipe. Dispatch is semantically invisible
         /// (boundary states are identical with or without variants), so it
@@ -536,6 +551,28 @@ fn parse_shapes(text: &str) -> Result<Vec<Vec<String>>> {
     Ok(shapes)
 }
 
+/// Comma-separated NAME:VALUE pm1-class conditions, as `--variant-pm1` and
+/// the `@PM1` suffix of `--variant` both spell them. Values are integer
+/// PICO-8 numbers; anything else is a loud error, not a silent non-match.
+fn parse_pm1(text: &str) -> Result<Vec<(String, celeste_rust::pico8_num::Pico8Num)>> {
+    text.split(',')
+        .map(|pair| {
+            let (name, value) = pair
+                .split_once(':')
+                .ok_or_else(|| anyhow!("pm1 condition must be NAME:VALUE, got {:?}", pair))?;
+            let name = name.trim();
+            if name.is_empty() {
+                return Err(anyhow!("empty cell name in pm1 condition {:?}", pair));
+            }
+            let value: i16 = value
+                .trim()
+                .parse()
+                .with_context(|| format!("pm1 condition {:?}: integer value expected", pair))?;
+            Ok((name.to_string(), celeste_rust::pico8_num::Pico8Num::from_i16(value)))
+        })
+        .collect()
+}
+
 /// Package a built program as a variant for `shapes`. `host_program` is the
 /// program that will dispatch to it: the partition patterns are
 /// process-global (`vectorize::set_merge_partition_patterns`, installed by
@@ -549,6 +586,7 @@ fn make_variant(
     program: &Program,
     mapping: celeste_rust::rewrite::state_mapping::StateMapping,
     shapes: Vec<Vec<String>>,
+    pm1: Vec<(String, celeste_rust::pico8_num::Pico8Num)>,
     label: String,
     host_program: &Program,
 ) -> Result<celeste_rust::rewrite::verify::Variant> {
@@ -566,6 +604,7 @@ fn make_variant(
     Ok(celeste_rust::rewrite::verify::Variant {
         label,
         shapes,
+        pm1,
         frame_cfg: celeste_rust::interpreter::fixed_env::PreparedCfg::new(
             program.frame_cfg().clone(),
         ),
@@ -575,7 +614,9 @@ fn make_variant(
 }
 
 /// Build the shape-dispatched variant registry from `--variant` specs
-/// (SHAPES=RECIPE_PATH; see the flag's doc comment).
+/// (SHAPES[@PM1]=RECIPE_PATH; see the flag's doc comment). Registry order
+/// is dispatch order, so a (shape, pm1)-keyed overlay must be listed
+/// before a shape-only variant of the same shape or it never runs.
 fn build_variants(
     specs: &[String],
     base_program: &Program,
@@ -583,9 +624,16 @@ fn build_variants(
     use celeste_rust::rewrite::state_mapping::StateMapping;
     let mut out = Vec::new();
     for spec in specs {
-        let (shapes_part, path) = spec
+        let (key_part, path) = spec
             .split_once('=')
-            .ok_or_else(|| anyhow!("--variant must be SHAPES=RECIPE_PATH, got {:?}", spec))?;
+            .ok_or_else(|| anyhow!("--variant must be SHAPES[@PM1]=RECIPE_PATH, got {:?}", spec))?;
+        let (shapes_part, pm1) = match key_part.split_once('@') {
+            None => (key_part, Vec::new()),
+            Some((shapes_part, pm1_part)) => (
+                shapes_part,
+                parse_pm1(pm1_part).with_context(|| format!("--variant {:?}", spec))?,
+            ),
+        };
         let shapes = parse_shapes(shapes_part)
             .with_context(|| format!("--variant {:?}", spec))?;
         let recipe = Recipe::load(path)
@@ -596,7 +644,8 @@ fn build_variants(
             &program,
             StateMapping::from_recipe(&recipe),
             shapes,
-            format!("{}[{}]", path, shapes_part),
+            pm1,
+            format!("{}[{}]", path, key_part),
             base_program,
         )?);
     }
@@ -609,23 +658,38 @@ struct VariantHost {
     program: Program,
     mapping: celeste_rust::rewrite::state_mapping::StateMapping,
     shapes: Vec<Vec<String>>,
+    pm1: Vec<(String, celeste_rust::pico8_num::Pico8Num)>,
     label: String,
 }
 
 fn resolve_variant_host(args: &VariantOf) -> Result<Option<VariantHost>> {
     use celeste_rust::rewrite::state_mapping::StateMapping;
     match (&args.host, &args.shapes) {
-        (None, None) => Ok(None),
+        (None, None) => {
+            if args.pm1.is_some() {
+                return Err(anyhow!("--variant-pm1 requires --variant-of and --variant-shapes"));
+            }
+            Ok(None)
+        }
         (Some(path), Some(shapes)) => {
             let recipe = Recipe::load(path)
                 .with_context(|| format!("--variant-of {:?}: loading recipe", path))?;
             let (program, _) = build(&recipe)
                 .with_context(|| format!("--variant-of {:?}: building program", path))?;
+            let pm1 = match &args.pm1 {
+                None => Vec::new(),
+                Some(text) => parse_pm1(text).context("--variant-pm1")?,
+            };
+            let label = match &args.pm1 {
+                None => format!("[{}]", shapes),
+                Some(text) => format!("[{}@{}]", shapes, text),
+            };
             Ok(Some(VariantHost {
                 mapping: StateMapping::from_recipe(&recipe),
                 program,
                 shapes: parse_shapes(shapes).context("--variant-shapes")?,
-                label: format!("[{}]", shapes),
+                pm1,
+                label,
             }))
         }
         _ => Err(anyhow!("--variant-of and --variant-shapes must be given together")),
@@ -1772,6 +1836,7 @@ fn main() -> Result<()> {
                         &candidate,
                         celeste_rust::rewrite::state_mapping::StateMapping::from_recipe(&recipe),
                         host.shapes.clone(),
+                        host.pm1.clone(),
                         host.label.clone(),
                         &host.program,
                     )?;
@@ -3762,6 +3827,7 @@ fn screen_trial(
                     &trial,
                     variant_mapping.clone(),
                     host.shapes.clone(),
+                    host.pm1.clone(),
                     host.label.clone(),
                     &host.program,
                 )?;

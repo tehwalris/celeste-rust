@@ -385,6 +385,19 @@ pub struct Variant {
     /// The object-array shapes (type-name sequences) this program is
     /// specialized for, e.g. [["player"], ["player_spawn"]].
     pub shapes: Vec<Vec<String>>,
+    /// Partition-class conditions extending the dispatch key from shape to
+    /// (shape, pm1 class): `(cell pattern, required value)` pairs, matched
+    /// with the same name rule as `partition_merge` cells (exact or
+    /// `.<pattern>` suffix). Empty means shape-only dispatch.
+    ///
+    /// A state matches only if every pattern resolves to at least one cell
+    /// and every resolved cell holds a per-state scalar number equal to the
+    /// required value. Boundary states are class-uniform by construction
+    /// (the partitioned merge splits by these very cells), so a vector
+    /// value here means the state straddles classes and soundly falls
+    /// through to the base program. Dispatch stays a pure function of the
+    /// state, so the chunk-parallel path is unaffected.
+    pub pm1: Vec<(String, crate::pico8_num::Pico8Num)>,
     pub frame_cfg: crate::interpreter::fixed_env::PreparedCfg,
     pub fixed_env: crate::interpreter::fixed_env::FixedEnv,
     /// This variant's layout <-> canonical.
@@ -659,6 +672,37 @@ enum VariantOutcome {
     Base(State),
 }
 
+/// Does `state` sit in the pm1 class the conditions describe? Every pattern
+/// must resolve to at least one cell (same name rule as
+/// `vectorize::resolve_partition_cells`: exact match or `.<pattern>` suffix)
+/// and every resolved cell must be a scalar number equal to the required
+/// value. Anything else - missing cell, non-number, per-lane vector - is
+/// simply "not this class": the state takes the base path, which is always
+/// sound. The guards inside a keyed overlay are the certifier; this
+/// predicate only has to be pure and total.
+fn pm1_matches(
+    conditions: &[(String, Pico8Num)],
+    names: &std::collections::HashMap<usize, String>,
+    state: &State,
+) -> bool {
+    use crate::interpreter::heap::HeapId;
+    conditions.iter().all(|(pattern, want)| {
+        let suffix = format!(".{}", pattern);
+        let mut found = false;
+        for (&cell, name) in names.iter() {
+            if name != pattern && !name.ends_with(&suffix) {
+                continue;
+            }
+            found = true;
+            match state.heap.get_opt(HeapId::from_raw(cell)) {
+                Some(HeapValue::Value(Value::Number(MaybeVector::Scalar(n)))) if *n == *want => {}
+                _ => return false,
+            }
+        }
+        found
+    })
+}
+
 /// Run one state's frame under `variant`, through the canonical form both
 /// ways. Any error or panic falls back to the base path with a loud print;
 /// the snapshot clone is what makes that fallback possible.
@@ -684,11 +728,17 @@ fn dispatch_variant_frame(
             return VariantOutcome::Base(state);
         }
     };
-    let Some(idx) = vd
-        .variants
-        .iter()
-        .position(|v| v.shapes.iter().any(|s| *s == shape))
-    else {
+    // The (shape, pm1) key: cell names are only resolved when some
+    // shape-matching candidate actually has a pm1 condition.
+    let mut cell_names: Option<std::collections::HashMap<usize, String>> = None;
+    let Some(idx) = vd.variants.iter().position(|v| {
+        v.shapes.iter().any(|s| *s == shape)
+            && (v.pm1.is_empty() || {
+                let names = cell_names
+                    .get_or_insert_with(|| crate::interpreter::merge_dump::cell_names(&state));
+                pm1_matches(&v.pm1, names, &state)
+            })
+    }) else {
         return VariantOutcome::Base(state);
     };
     let snapshot = state.clone();
@@ -2421,6 +2471,7 @@ mod tests {
                     vec!["player".to_string()],
                     vec!["player_spawn".to_string()],
                 ],
+                pm1: Vec::new(),
                 frame_cfg: crate::interpreter::fixed_env::PreparedCfg::new(
                     rewritten.frame_cfg().clone(),
                 ),

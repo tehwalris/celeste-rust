@@ -1155,3 +1155,41 @@ __frame now: ~2,200 instrs, TWO branches (freeze, dash_time - both
 pm1 key cells). Step 5, the (shape, pm1) dispatch key, closes them:
 per class each is a guard_branch and the overlay is literally
 branch-free.
+
+### Session 2026-08-18b: (shape, pm1) dispatch key - ZERO branches, certified
+
+Step 5 done. The variant dispatch key is now (object-array shape, pm1
+class): `verify::Variant` gained `pm1: Vec<(cell pattern, value)>`,
+matched with the partition_merge name rule; a state matches only if
+every pattern resolves and every resolved cell is a per-state scalar
+equal to the value. Anything else takes the base path (sound). CLI:
+`verify --variant-pm1 'freeze:0,dash_time:0'` and the `@PM1` suffix on
+`--variant` (registry order is dispatch order). A typo'd condition
+fails loudly via the existing "variant never dispatched" check.
+
+`rewrites-trace10-steady.jsonl` = trace10 + guard_branch on the freeze
+gate and the dash gate (both read their cell before anything writes
+it, so the class pins the false edge) + dce + kill_dead. __frame:
+ZERO branches, ZERO phis, 5 straight-line blocks, ~2,150 instrs.
+Hosted verify vs rewrites-compile.jsonl, dispatch
+player@freeze:0,dash_time:0: identical through f40, 129.0s, peak
+43 GB, zero deopts/fallbacks. Kernel recon: 0 branches to if-convert,
+0 unresolved non-intrinsic calls, 8 expand sites, 9 intrinsics
+(6 UBool mints, 2 split_by_flr, 1 split_at).
+
+LESSON - "literally one block" is the wrong shape for the INTERPRETER:
+kills are placed at block ends, so a fully merged __frame keeps the
+whole ~1000-instr prefix's vectors live across the btn expand x64
+fan-out. Measured: the one-block form OOM'd hosted verify at 97 GB
+(vs 43 GB with seams kept, same 129s wall). Block seams are the
+interpreter's liveness boundaries; keep them. The compiled kernel
+does not care (registers die naturally, unconditional jumps are
+free), so the one-block form is derivable by appending a merge_blocks
+entry if an emitter ever wants it - but the CERTIFIED artifact is the
+seamed one.
+
+Ops note (self-inflicted OOMs first): never run two 100G safe-run
+scopes concurrently on the 125G box, and stale perf data in /tmp
+(tmpfs!) had eaten 34 GB of headroom - perf data belongs in
+~/perf-scratch/. Certification runs now use --memory 60G as a
+tripwire: an artifact that needs more is a defect, not a bigger cap.
