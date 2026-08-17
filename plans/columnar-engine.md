@@ -534,3 +534,25 @@ exactly the deferred steps, now priced:
   2. trunk sharing (physics once per tile, 64 tails) - the
      specialization-tree emission, after 1.
 Plus typed tiles (select's 29% is per-lane AV tag dispatch).
+
+## Where the 58 us/input-lane sits (roofline decomposition, for the record)
+
+58 us = 64 (unshared fan-out) x 0.9 us/offered-lane, and 0.9 us itself
+is ~5-10x typed-SIMD headroom (AV tag dispatch) on top of a frame that
+specialization shrinks. Remedies map 1:1: trunk sharing + const-folded
+variants attack the 64x; typed tiles attack the tag dispatch; folding
+shrinks the frame. Target: a few hundred ns per input lane. The
+per-OFFERED-lane number (0.9 vs Rt2's 1.4 vs scalar probe's 1.9) is
+the evidence the tile model is the right substrate.
+
+## Slot compilation (next unit, in progress)
+
+Goal: heap accesses on the kernel path become struct-field/array ops
+LLVM can see through (SROA + const-fold), which is what makes
+per-variant button constants actually fold. Approach: per-shape SLOT
+BINDING - the ~178 single-receiver sites' access paths are static; at
+block-bind time walk each path once to map site -> cell; the kernel
+then reads/writes a dense slot array instead of pointer-chasing
+structure. Guards stay (site's receiver must match the bound cell -
+the census doctrine). Emission: a transpiler pass that rewrites
+get_field/get_index+load/store pairs on bound sites into slot ops.
