@@ -660,3 +660,48 @@ SCALAR import_lane, which still numbers cells in the old name-order
 DFS - align it to the BFS order too (same restructure as import_block)
 OR run the result-cell census through the vectorized path, so the
 emitted slot ids are canonical. Small either way; do it first.
+
+## Slot compilation LANDED end-to-end (2026-08-17)
+
+The full chain is built and gated:
+1. `--emit-slots FILE` on the census (scalar importer restructured to
+   the canonical BFS, cross-checked against import_block on real data:
+   282 cells agree). Room (1,0) f35: 47 slots over 175 of 178
+   single-receiver sites; 3 multi-result; a TAINT set excludes any
+   cell a multi-result site ever produced (0 aliased here).
+2. Transpiler `--site-slots FILE`: whole-program escape analysis - a
+   bound site's result local may be used ONLY as Load source / Store
+   target / Kill hint; anything else escapes the pointer and reverts
+   the CELL (all its sites). 28 of 47 slots eligible, 102 sites
+   compiled. The 73 reverted sites are dominated by the masked-store
+   rewrites (`store(select(mask, a, b), v)` - the pointer feeds a
+   Select). v2 extension: masked slot_set for select-of-two-slots.
+   Emission: `if E::HAS_SLOTS { rt.slot_get(K) } else { generic }` -
+   the branch is a per-monomorphization constant, so Rt/Rt2 keep the
+   generic path at zero cost and site identity is (fn, iid), stable
+   across regenerations.
+3. Rt3: `slots: [TCol; gen::N_SLOTS]`, bind after set_buttons, write
+   back before structure_fp/append. CELESTE_SLOT_GUARD=1 = the runtime
+   guard for what the escape analysis cannot prove (unreached-site
+   aliasing): slot_set mirrors into cols, slot_get compares - an
+   aliased write desyncs them and asserts. PASSES on the whole bench
+   (~3% cost). Exactness: 269,059 out + f37 chase 365,029, both exact.
+
+Result: NEUTRAL on time (8.16 s vs 8.0 s baseline). The profile says
+why, and it REVISES yesterday's attribution for the neutral const
+variants: the hot Engine ops are NOT INLINED into the generated frame
+(`select` 19%, `av_addsub` 17%, `op_add` 8.5%, `av_cmp` 7% - all
+standalone symbols; get_field is <2%). Out-of-line ops mean NO
+constant - from slots or from the const-button variants - ever reaches
+the op bodies; store/load opacity was the second-order effect. The
+pointer chase the slots removed was never the cost.
+
+Consequence: inline-the-ops is the gate to ALL folding wins. First
+attempt (#[inline(always)] on 19 Rt3 op methods) blew compile time
+past 10 min for the 4-variant build - the huge fused frame fn x 4
+variants x fully inlined per-lane loops is too much for one codegen
+unit. Options, in order: (a) fewer inlined ops (select + add/cmp
+only), (b) one variant (drop Rt3<BTN> monomorphization, keep dynamic
+buttons) with full inlining - measures the inlining win in isolation,
+(c) separate codegen crate with per-variant compilation units in
+parallel. Doing (a)/(b) to size the prize before paying (c).
