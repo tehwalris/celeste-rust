@@ -14,6 +14,7 @@ mod gen;
 mod import;
 mod runtime;
 mod runtime2;
+mod runtime3;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -674,7 +675,9 @@ fn boundary_ids() -> runtime2::BoundaryIds {
 fn install_split_hook() {
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if info.payload().downcast_ref::<runtime2::SplitReq>().is_none() {
+        if info.payload().downcast_ref::<runtime2::SplitReq>().is_none()
+            && info.payload().downcast_ref::<runtime3::TileBail>().is_none()
+        {
             prev_hook(info);
         }
     }));
@@ -689,7 +692,8 @@ fn frame_step(
     g_freeze: u32,
     census_total: &mut rustc_hash::FxHashMap<&'static str, (u64, u64, u64)>,
 ) -> Vec<runtime2::Rt2> {
-let mut ran: Vec<runtime2::Rt2> = Vec::new();
+let tile_mode = std::env::var_os("CELESTE_TILE").is_some();
+    let mut ran: Vec<runtime2::Rt2> = Vec::new();
     let mut pending: Vec<runtime2::Rt2> = Vec::new();
     // Chunk cap: mid-frame width is ~64x the input width (the btn
     // fan-out), and per-op column traffic goes through DRAM once the
@@ -746,6 +750,13 @@ let mut ran: Vec<runtime2::Rt2> = Vec::new();
                 scope.spawn(move || {
                     let mut done: Vec<runtime2::Rt2> = Vec::new();
                     while let Some(block) = local.pop() {
+                        if tile_mode {
+                            if let Some(out) = run_chunk_tiled(&block, ids) {
+                                done.push(out);
+                                continue;
+                            }
+                            // bail: fall through to the reference engine
+                        }
                         let snapshot = block.clone_block();
                         let mut sub = block;
                         sub.begin_frame();
@@ -1012,6 +1023,93 @@ fn run_abstract_bench(dir: &str, frame: u32, reps: u32) {
         println!("op census (name, total ms over all reps, calls):");
         for (name, (ns, calls, _)) in rows {
             println!("  {:14} {:9.1} ms  {:>12} calls", name, ns as f64 / 1e6, calls);
+        }
+    }
+    print_bails();
+}
+
+/// Tile-mode chunk executor (plans/columnar-engine.md "Rt3"): split the
+/// chunk into TILE-lane tiles; per tile, loop the 64 input variants with
+/// concrete buttons and the counter-replay tape for straddles; raw-concat
+/// every pass's surviving lanes (structures must agree - checked) and run
+/// ONE boundary per chunk. Returns None if any tile bails or structures
+/// diverge (the caller reruns the whole chunk on the reference engine).
+fn run_chunk_tiled(
+    chunk: &runtime2::Rt2,
+    ids: &runtime2::BoundaryIds,
+) -> Option<runtime2::Rt2> {
+    let g_btn = gen::global_id("__button_states").expect("no __button_states");
+    let mut acc: Option<(runtime2::Rt2, u64)> = None;
+    let mut at = 0usize;
+    while at < chunk.width {
+        let hi = (at + runtime3::TILE).min(chunk.width);
+        let template = runtime3::Rt3::from_rt2(chunk, at, hi);
+        for byte in 0u8..64 {
+            let mut tape: Vec<u8> = Vec::new();
+            loop {
+                let mut rt3 = template.clone();
+                rt3.set_buttons(g_btn, byte);
+                rt3.tape = tape.clone();
+                rt3.begin_pass();
+                let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    gen::call_fn(&mut rt3, gen::FN_FRAME, &[], &[]);
+                }));
+                match ok {
+                    Ok(_) => {
+                        let fp = rt3.structure_fp();
+                        match &mut acc {
+                            None => {
+                                let mut seed = rt3.seed_rt2();
+                                rt3.append_into(&mut seed);
+                                acc = Some((seed, fp));
+                            }
+                            Some((seed, afp)) => {
+                                if *afp != fp {
+                                    return None; // structural divergence
+                                }
+                                rt3.append_into(seed);
+                            }
+                        }
+                        if !rt3.advance_tape() {
+                            break;
+                        }
+                        tape = rt3.tape.clone();
+                    }
+                    Err(payload) => match payload.downcast_ref::<runtime3::TileBail>() {
+                        Some(b) => {
+                            record_bail(b.0);
+                            return None;
+                        }
+                        None => std::panic::resume_unwind(payload),
+                    },
+                }
+            }
+        }
+        at = hi;
+    }
+    let (mut acc, _) = acc?;
+    acc.boundary(ids);
+    Some(acc)
+}
+
+/// Aggregate bail sites (printed by the bench when nonempty).
+static BAILS: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+    std::sync::Mutex::new(None);
+
+fn record_bail(loc: &std::panic::Location) {
+    let mut b = BAILS.lock().unwrap();
+    *b.get_or_insert_with(Default::default)
+        .entry(format!("{}:{}", loc.file(), loc.line()))
+        .or_insert(0) += 1;
+}
+
+fn print_bails() {
+    if let Some(map) = BAILS.lock().unwrap().take() {
+        let mut rows: Vec<_> = map.into_iter().collect();
+        rows.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        println!("tile bails by site:");
+        for (site, n) in rows.iter().take(10) {
+            println!("  {:>10}  {}", n, site);
         }
     }
 }

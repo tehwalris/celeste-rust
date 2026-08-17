@@ -53,7 +53,7 @@ pub enum AV {
 /// A column: one value per lane, or one value for EVERY lane. Uniform is
 /// the load-bearing case - appending lanes to it is free, and ops on two
 /// uniforms cost one scalar op regardless of width.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Col {
     U(AV),
     V(Vec<AV>),
@@ -83,7 +83,7 @@ pub struct ColId(pub u32);
 /// `Rt2::cols` at the same index; the other kinds are uniform by the
 /// shape premise. Closure captures are SNAPSHOTS of the capture columns
 /// (the interpreter copies capture VALUES into the closure).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Cell2 {
     Val,
     Obj(Vec<(u32, u32)>),
@@ -178,7 +178,7 @@ fn av_of_iv(iv: Pico8NumInterval) -> AV {
 }
 
 /// V -> N / I when every lane is a plain number / interval.
-fn compress_num_v(vs: Vec<AV>) -> Col {
+pub(crate) fn compress_num_v(vs: Vec<AV>) -> Col {
     if vs.iter().all(|v| matches!(v, AV::Num(_))) {
         Col::N(
             vs.iter()
@@ -212,7 +212,7 @@ fn compress_num(c: Col) -> Col {
 // ---- per-lane op ports ----
 
 /// Plus/Minus with the Number/Interval lift (op.rs:406-427, 478-505).
-fn av_addsub(l: AV, r: AV, sub: bool) -> AV {
+pub(crate) fn av_addsub(l: AV, r: AV, sub: bool) -> AV {
     match (l, r) {
         (AV::Num(a), AV::Num(b)) => AV::Num(if sub { a - b } else { a + b }),
         (AV::Num(_) | AV::Ival(..), AV::Num(_) | AV::Ival(..)) => {
@@ -224,7 +224,7 @@ fn av_addsub(l: AV, r: AV, sub: bool) -> AV {
 }
 
 /// Star (op.rs:484, 506-516): Number*Number, or Interval * positive scalar.
-fn av_mul(l: AV, r: AV) -> AV {
+pub(crate) fn av_mul(l: AV, r: AV) -> AV {
     match (l, r) {
         (AV::Num(a), AV::Num(b)) => AV::Num(a * b),
         (AV::Ival(..), AV::Num(b)) if b > P8::from_i16(0) => {
@@ -235,7 +235,7 @@ fn av_mul(l: AV, r: AV) -> AV {
 }
 
 /// Slash (op.rs:487, 517-521).
-fn av_div(l: AV, r: AV) -> AV {
+pub(crate) fn av_div(l: AV, r: AV) -> AV {
     match (l, r) {
         (AV::Num(a), AV::Num(b)) => AV::Num(a / b),
         (AV::Ival(..), AV::Num(b)) if b > P8::from_i16(0) => {
@@ -246,13 +246,13 @@ fn av_div(l: AV, r: AV) -> AV {
 }
 
 /// Percent (op.rs:490): numbers only; PICO-8 `%` is total.
-fn av_rem(l: AV, r: AV) -> AV {
+pub(crate) fn av_rem(l: AV, r: AV) -> AV {
     AV::Num(num(l) % num(r))
 }
 
 /// `==` (op.rs:432-467). Intervals can never be equal to anything;
 /// UnknownBool against a bool stays unknown.
-fn av_eq(l: AV, r: AV, strings: &[String]) -> AV {
+pub(crate) fn av_eq(l: AV, r: AV, strings: &[String]) -> AV {
     let b = match (l, r) {
         (AV::Num(a), AV::Num(b)) => a == b,
         (AV::Num(_), _) => false,
@@ -273,7 +273,7 @@ fn av_eq(l: AV, r: AV, strings: &[String]) -> AV {
     AV::Bool(b)
 }
 
-fn av_not(v: AV) -> AV {
+pub(crate) fn av_not(v: AV) -> AV {
     // interpret_not (op.rs:12): bools only.
     match v {
         AV::Bool(b) => AV::Bool(!b),
@@ -283,7 +283,7 @@ fn av_not(v: AV) -> AV {
 }
 
 #[derive(Clone, Copy)]
-enum CmpOp {
+pub(crate) enum CmpOp {
     Lt,
     Le,
     Gt,
@@ -293,7 +293,7 @@ enum CmpOp {
 /// Ordered compares with the tri-state interval judge (op.rs:523-649).
 /// A straddling lane yields UnknownBool - exactly the scalar-state
 /// interpreter's answer (a width-1 MaybeBool collapses to UnknownBool).
-fn av_cmp(op: CmpOp, l: AV, r: AV) -> AV {
+pub(crate) fn av_cmp(op: CmpOp, l: AV, r: AV) -> AV {
     match (l, r) {
         (AV::Num(a), AV::Num(b)) => AV::Bool(match op {
             CmpOp::Lt => a < b,
@@ -352,7 +352,7 @@ fn av_cmp(op: CmpOp, l: AV, r: AV) -> AV {
     }
 }
 
-fn av_neg(v: AV) -> AV {
+pub(crate) fn av_neg(v: AV) -> AV {
     match v {
         AV::Num(n) => AV::Num(-n),
         AV::Ival(a, b) => AV::Ival(-b, -a),
@@ -362,7 +362,7 @@ fn av_neg(v: AV) -> AV {
 
 /// min/max interval extension is exact - monotone in both args
 /// (game_runner.rs builtin_min/builtin_max).
-fn av_min(l: AV, r: AV) -> AV {
+pub(crate) fn av_min(l: AV, r: AV) -> AV {
     match (l, r) {
         (AV::Num(a), AV::Num(b)) => AV::Num(a.min(b)),
         _ => {
@@ -372,7 +372,7 @@ fn av_min(l: AV, r: AV) -> AV {
     }
 }
 
-fn av_max(l: AV, r: AV) -> AV {
+pub(crate) fn av_max(l: AV, r: AV) -> AV {
     match (l, r) {
         (AV::Num(a), AV::Num(b)) => AV::Num(a.max(b)),
         _ => {
@@ -383,7 +383,7 @@ fn av_max(l: AV, r: AV) -> AV {
 }
 
 /// game_runner.rs interval_abs.
-fn av_abs(v: AV) -> AV {
+pub(crate) fn av_abs(v: AV) -> AV {
     match v {
         AV::Num(n) => AV::Num(n.abs()),
         AV::Ival(..) => {
@@ -403,7 +403,7 @@ fn av_abs(v: AV) -> AV {
 
 /// game_runner.rs builtin_flr: an interval must sit on one floor (the
 /// __split_by_flr rewrites are what guarantee it).
-fn av_flr(v: AV) -> AV {
+pub(crate) fn av_flr(v: AV) -> AV {
     match v {
         AV::Num(n) => AV::Num(n.flr()),
         AV::Ival(a, b) => {
@@ -420,7 +420,7 @@ fn av_flr(v: AV) -> AV {
 }
 
 /// game_runner.rs builtin_sin: interval -> the full band [-1, 1].
-fn av_sin(v: AV) -> AV {
+pub(crate) fn av_sin(v: AV) -> AV {
     match v {
         AV::Num(n) => AV::Num(n.pico8_sin()),
         AV::Ival(..) => AV::Ival(P8::from_i16(-1), P8::from_i16(1)),
@@ -431,7 +431,7 @@ fn av_sin(v: AV) -> AV {
 /// Branch truthiness (flow.rs:343-394) for one lane. UnknownBool would
 /// mean a control fork - the compiled shape program has none (0 divergent
 /// census); reaching it is a domain exit, loud.
-fn av_truthy(v: AV) -> bool {
+pub(crate) fn av_truthy(v: AV) -> bool {
     match v {
         AV::Bool(b) => b,
         AV::Nil => false,
@@ -442,7 +442,7 @@ fn av_truthy(v: AV) -> bool {
 }
 
 /// split_interval_by_floor (game_runner.rs:213).
-fn split_iv_by_floor(iv: Pico8NumInterval) -> Vec<Pico8NumInterval> {
+pub(crate) fn split_iv_by_floor(iv: Pico8NumInterval) -> Vec<Pico8NumInterval> {
     let one = P8::from_i16(1);
     let mut results = Vec::new();
     let mut current = iv.low;
@@ -2485,6 +2485,34 @@ impl Rt2 {
         }
         host.width = total;
         host
+    }
+
+    /// Pre-boundary raw concat (the tile executor): structures already
+    /// checked equal by the caller; no shape hash or row keys exist yet.
+    pub fn concat_raw(&mut self, other: &Rt2) {
+        let w = self.width;
+        let ow = other.width;
+        for (c, col) in self.cols.iter_mut().enumerate() {
+            let ocol = &other.cols[c];
+            let same_uniform = matches!((&*col, ocol), (Col::U(a), Col::U(b)) if a == b);
+            if same_uniform {
+                continue;
+            }
+            let mut vs: Vec<AV> = match col {
+                Col::U(a) => vec![*a; w],
+                Col::V(v) => std::mem::take(v),
+                Col::N(v) => v.iter().map(|n| AV::Num(*n)).collect(),
+                Col::I(v) => v.iter().map(|(a, b)| AV::Ival(*a, *b)).collect(),
+            };
+            match ocol {
+                Col::U(b) => vs.extend(std::iter::repeat(*b).take(ow)),
+                Col::V(ov) => vs.extend_from_slice(ov),
+                Col::N(ov) => vs.extend(ov.iter().map(|n| AV::Num(*n))),
+                Col::I(ov) => vs.extend(ov.iter().map(|(a, b)| AV::Ival(*a, *b))),
+            }
+            *col = Col::V(vs);
+        }
+        self.width += ow;
     }
 
     /// Append another block's lanes. Only legal after `boundary` on both:

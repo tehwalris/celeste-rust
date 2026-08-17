@@ -506,3 +506,31 @@ interpreter's at the chased checkpoint, per run. Baseline to beat:
 v1 deliberately defers: trunk-sharing specialization tree, typed tile
 columns / SIMD, const-generic variant folding. Each is a measured step
 on the same bench afterwards.
+
+## Rt3 v1 measured (2026-08-18, midday)
+
+Built: runtime3.rs (the tile Engine impl: 16-lane tiles, concrete
+buttons per variant, counter-replay tape, TileBail -> Rt2 fallback with
+bail-site aggregation), tile-mode chunk executor (CELESTE_TILE=1),
+chunk accumulator (structure-fingerprint checked, no per-variant Rt2
+materialization), TCol slimmed to 16 B (payloads in a tile pool - the
+inline [AV; TILE] enum was 260 B and cloning dominated: 37 -> 12 s).
+
+Result on the one-frame bench (real f35 states, EXACT 269,059 out,
+fallbacks included via 214 non-uniform-branch bails):
+
+    Rt2 (columnar, shares uniform work across fan-out):  2.0 s
+    Rt3 v1 (tiles, NO sharing, NO folding):             10.9 s
+    per OFFERED lane: Rt3 0.9 us vs Rt2 1.4 us
+
+Profile is pure compute now (select 29%, add 9%, av arithmetic, zero
+alloc/clone overhead). Reading: the tile model's per-lane cost already
+beats columnar, but v1 pays the 64x fan-out at full price while Rt2
+amortizes uniform work via Col::U. The two designed remedies are
+exactly the deferred steps, now priced:
+  1. const-specialized variants (buttons fold, tails shrink) - needs
+     slot compilation so LLVM sees through cells: the row-struct
+     emission step, NEXT.
+  2. trunk sharing (physics once per tile, 64 tails) - the
+     specialization-tree emission, after 1.
+Plus typed tiles (select's 29% is per-lane AV tag dispatch).
