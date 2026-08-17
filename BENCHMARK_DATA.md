@@ -1,3 +1,39 @@
+# Goal-7 measurement + slotless tiles at depth (2026-08-17; plans/columnar-engine.md)
+
+Per-phase timing of `frame_step` (`CELESTE_PHASE_TIME=1`), from-scratch
+`--abstract 40`, 30 cores. The goal-7 premise ("serial
+boundary/merge/dedup dominates at depth") is REFUTED: at f40 (673k
+input lanes -> 902,280 out) the serial epilogue (part + dedup + retain
++ merge) is ~650 ms of the 10.3 s frame; the parallel run phase is
+9.66 s = 94%. The 31.5 s wall was Rt2 KERNEL time: the tile shape gate
+(slot binding scoped to the census shape 0xc51b...) rejected all
+48,767 steady-shape chunks because from-scratch runs reach a DIFFERENT
+steady shape (0x893c...), so every engine config fell back to Rt2.
+
+Fix: slots are measured time-neutral, so `gen.rs` is now generated
+WITHOUT `--site-slots` (N_SLOTS=0) and the gate - already conditional
+on `N_SLOTS > 0` - opens. Tiles then carry the whole depth run, spawn
+shape included (0 bails, 0 gate rejects, mode 2):
+
+| from-scratch `--abstract 40`, 30 cores | 40 frames | f40 frame | f40 run phase | f40 serial epilogue |
+|---|---|---|---|---|
+| with-slots gen.rs (all engines = Rt2 past the gate) | 31.57 s | 10.31 s | 9.66 s | 0.65 s |
+| slotless gen.rs, CELESTE_TILE=2 | **17.55 s** | **5.20 s** | 4.84 s | 0.36 s |
+
+EXACT: every frame's lane count equals the Rt2 reference (f40 =
+902,280). Scalar probe stays hex-exact (30f vs concrete_run); suite
+527/527. Slotless bench (below) unchanged: mode 2 min 1040.7 ms vs
+1041 with slots; Rt2 2030 ms; mode 1 4373 ms with 222 truthy_b bails
+(divergent branch truthiness across a concrete-button tile; sound -
+bailed chunks rerun on Rt2, oracle still exact).
+
+Even under tiles the run phase is 93% of a deep frame, so the next
+lever stays the kernel/per-chunk-boundary, not the serial epilogue.
+Re-arming slots (a future typed-slots campaign) means regenerating
+with `--site-slots plans/site-slots-room10-f035.json` - that closes
+the gate to one shape again, so it must come with a census for EVERY
+shape the run visits, or stay off.
+
 # Tile engines on the one-frame dev-loop bench (2026-08-17; plans/columnar-engine.md)
 
 `--abstract-bench room10-newlua-bench 35`: real f35 campaign states,

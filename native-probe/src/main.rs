@@ -848,6 +848,16 @@ fn frame_step(
         Ok(_) => 1,
         Err(_) => 0,
     };
+    // CELESTE_PHASE_TIME=1: print the per-frame wall split across the
+    // serial/parallel phases (goal 7's measurement harness).
+    let phase_time = std::env::var("CELESTE_PHASE_TIME").is_ok();
+    let mut t_mark = std::time::Instant::now();
+    let mut phase = |name: &str| {
+        if phase_time {
+            eprintln!("    phase {:8} {:9.3?}", name, t_mark.elapsed());
+        }
+        t_mark = std::time::Instant::now();
+    };
     let mut ran: Vec<runtime2::Rt2> = Vec::new();
     let mut pending: Vec<runtime2::Rt2> = Vec::new();
     // Chunk cap: mid-frame width is ~64x the input width (the btn
@@ -883,6 +893,7 @@ fn frame_step(
             }
         }
     }
+    phase("part");
     // Chunks are independent (lane independence is the certified
     // batching-invariance property); run them across threads. Each
     // worker owns a local pending stack seeded round-robin.
@@ -954,6 +965,7 @@ fn frame_step(
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
+    phase("run");
     for done in results {
         ran.extend(done);
     }
@@ -1013,6 +1025,7 @@ fn frame_step(
             })
             .collect()
     };
+    phase("dedup");
     let mut groups: Vec<(u64, Vec<runtime2::Rt2>)> = Vec::new();
     for (mut sub, keep) in ran.into_iter().zip(keeps) {
         sub.retain_lanes(&keep);
@@ -1024,10 +1037,13 @@ fn frame_step(
             None => groups.push((sub.shape_hash, vec![sub])),
         }
     }
-    groups
+    phase("retain");
+    let out: Vec<runtime2::Rt2> = groups
         .into_iter()
         .map(|(_, g)| runtime2::Rt2::merge_many(g))
-        .collect()
+        .collect();
+    phase("merge");
+    out
 }
 
 /// The columnar abstract engine (plans/columnar-engine.md): run the level-0

@@ -801,3 +801,39 @@ stated honestly:
   dump a second census from a native steady state (the pipeline is
   shape-generic); the gate now PRINTS rejected shapes, so this is
   observable, not silent.
+
+## Goal 7 opened and re-aimed: the depth wall was the gate, not the boundary (2026-08-17)
+
+Measured first (`CELESTE_PHASE_TIME=1`, per-frame phase split of
+`frame_step`: part / run / dedup / retain / merge). From-scratch
+`--abstract 40`, f40 under the with-slots build: run 9.66 s (94%),
+part 232 ms, merge 218 ms, retain 109 ms, dedup 91 ms. The "serial
+boundary/merge/dedup dominates at depth" hypothesis from the evening
+pivot is REFUTED - the serial epilogue is ~7% of a deep frame. The
+sharded dedup + k-way merge already at roofline enough; the 31.5 s
+wall was Rt2 kernel execution behind the slot shape gate (previous
+section: from-scratch steady shape != census shape, all 48,767
+steady chunks rejected).
+
+The fix fell out of the slot-neutrality measurement: slots buy no
+time, so gen.rs is regenerated WITHOUT --site-slots. N_SLOTS=0 and
+the gate (already conditional on N_SLOTS > 0) opens; the tile path
+is shape-generic without slots (generic get_field/get_index resolve
+by name; anything odd bails to Rt2). Result: mode-2 tiles carry the
+ENTIRE from-scratch depth run, spawn shape included - 0 bails, 0
+gate rejects, every frame's lane count exactly equal to the Rt2
+reference, 31.57 s -> 17.55 s (f40 frame 10.3 -> 5.2 s). Scalar
+oracle hex-exact, suite 527/527, bench unchanged (mode 2 1040.7 ms).
+
+Canonical regen is now `transpile --recipe rewrites-compile.jsonl`
+(no slot map). plans/site-slots-room10-f035.json stays checked in as
+the typed-slots seed; regenerating WITH it re-arms the one-shape gate
+and is only sound to ship together with censuses for every shape a
+run visits.
+
+Standing profile after this: a deep frame is still 93% run phase
+(kernel + per-chunk boundary, parallel). The remaining in-frame ~2x
+is the kernel residual ladder (f_15 glue, select residual, append
+residual, low-depth row batching). Campaign-wise the engine is now
+fast AND shape-open, which unblocks the real integration question:
+crate restructure (#133), wiring gen.rs into the actual runner.
