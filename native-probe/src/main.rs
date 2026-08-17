@@ -312,7 +312,13 @@ fn load_states_any(dir: &str, frame: u32) -> Vec<celeste_rust::interpreter::stat
 /// compiled frame with receiver logging, and report which get_field/
 /// get_index sites resolve to a single cell per shape (columnizable, with
 /// a runtime guard) vs many (the shape's overlay to-do list).
-fn run_census(dir: &str, frame: u32, census_frames: u32, max_lanes: usize) {
+fn run_census(
+    dir: &str,
+    frame: u32,
+    census_frames: u32,
+    max_lanes: usize,
+    emit_slots: Option<&str>,
+) {
     let states = load_states_any(dir, frame);
     let cart_base = if std::path::Path::new("cart").exists() { "cart" } else { "../cart" };
     let (room_x, room_y) = celeste_rust::game_runner::start_room();
@@ -323,8 +329,27 @@ fn run_census(dir: &str, frame: u32, census_frames: u32, max_lanes: usize) {
     );
     let probe = Probe::new();
 
-    // Global receiver lattice + failure counts.
+    // Slot-dump mode: verify the scalar and vectorized importers assign
+    // identical (canonical) cell ids, so result-cell ids ARE slot ids.
+    if emit_slots.is_some() {
+        let s0 = &states[0];
+        let mut rt = Rt::new(cart.clone(), cache.clone(), gen::GLOBAL_NAMES.len(), gen::STRINGS);
+        import::import_lane(&mut rt, s0, 0, true);
+        let block = import::import_block(s0, cart.clone(), cache.clone());
+        import::assert_lane_matches_block(&rt, &block);
+        println!(
+            "emit-slots: scalar/block importer agreement verified ({} cells)",
+            rt.heap.len()
+        );
+    }
+
+    // Global receiver + result-cell lattices, failure counts. `taint`
+    // holds every result code seen at a site that is multi-result in ANY
+    // lane or across lanes - cells in it cannot be slots.
     let mut acc: Vec<u64> = vec![0; gen::SITE_INFO.len()];
+    let mut acc_result: Vec<u64> = vec![0; gen::SITE_INFO.len()];
+    let mut taint: std::collections::HashSet<u64> = Default::default();
+    let mut imported_cells: Option<usize> = None;
     let (mut lanes_run, mut lanes_panicked) = (0usize, 0usize);
     let total_lanes: usize = states.iter().map(|s| s.vector_size).sum();
     let stride = (total_lanes / max_lanes.max(1)).max(1);
@@ -347,7 +372,22 @@ fn run_census(dir: &str, frame: u32, census_frames: u32, max_lanes: usize) {
                 gen::STRINGS,
             );
             rt.site_log = vec![0; gen::SITE_INFO.len()];
+            if emit_slots.is_some() {
+                rt.result_log = vec![0; gen::SITE_INFO.len()];
+            }
             import::import_lane(&mut rt, state, lane, true);
+            // Cells imported at the boundary are the canonical (slot-
+            // eligible) ones; anything alloc'd later (builtin backfill,
+            // mid-frame allocs) is not. Same shape => same count.
+            match imported_cells {
+                None => imported_cells = Some(rt.heap.len()),
+                Some(n) => assert_eq!(
+                    n,
+                    rt.heap.len(),
+                    "states in {} disagree on boundary cell count (mixed shapes?)",
+                    dir
+                ),
+            }
             // Builtin bindings are init-invariants, not state: snapshots
             // saved before a builtin existed (bench-r1-fresh predates
             // __split_at) lack its global; backfill exactly like
@@ -372,8 +412,9 @@ fn run_census(dir: &str, frame: u32, census_frames: u32, max_lanes: usize) {
                 Ok(()) => lanes_run += 1,
                 Err(_) => lanes_panicked += 1,
             }
-            // Join this lane's lattice into the accumulator (panicked lanes
-            // included: sites they DID reach before failing still count).
+            // Join this lane's lattices into the accumulators (panicked
+            // lanes included: sites they DID reach before failing still
+            // count).
             for (a, &s) in acc.iter_mut().zip(rt.site_log.iter()) {
                 if s == 0 {
                     continue;
@@ -384,6 +425,24 @@ fn run_census(dir: &str, frame: u32, census_frames: u32, max_lanes: usize) {
                     _ => u64::MAX,
                 };
             }
+            for (a, &s) in acc_result.iter_mut().zip(rt.result_log.iter()) {
+                if s == 0 {
+                    continue;
+                }
+                *a = match *a {
+                    0 => s,
+                    x if x == s => x,
+                    x => {
+                        // Cross-lane multi-result: both codes are aliased.
+                        if x != u64::MAX {
+                            taint.insert(x);
+                        }
+                        taint.insert(s);
+                        u64::MAX
+                    }
+                };
+            }
+            taint.extend(rt.result_taint.iter().copied());
         }
     }
 
@@ -417,6 +476,84 @@ fn run_census(dir: &str, frame: u32, census_frames: u32, max_lanes: usize) {
         for s in sites {
             println!("    {}", s);
         }
+    }
+
+    // Slot dump (plans/columnar-engine.md "Slot compilation" step 1):
+    // group slot-eligible sites by their result cell. Eligible = single
+    // receiver, single result cell, result cell is a BOUNDARY cell
+    // (imported id < boundary count) - those ids ARE canonical ids
+    // (BFS importer, verified above), so the transpiler and Rt3 can use
+    // them directly.
+    if let Some(path) = emit_slots {
+        let n_boundary = imported_cells.expect("no lanes imported") as u64;
+        let mut by_cell: std::collections::BTreeMap<u64, Vec<usize>> = Default::default();
+        let (mut n_unseen, mut n_multi_recv, mut n_multi_result, mut n_nonboundary) =
+            (0usize, 0usize, 0usize, 0usize);
+        let mut n_aliased = 0usize;
+        for (i, (&recv, &res)) in acc.iter().zip(acc_result.iter()).enumerate() {
+            match (recv, res) {
+                (0, _) | (_, 0) => n_unseen += 1,
+                (u64::MAX, _) => n_multi_recv += 1,
+                (_, u64::MAX) => n_multi_result += 1,
+                (_, res) if res - 1 >= n_boundary => n_nonboundary += 1,
+                // A multi-result site somewhere also produced this cell:
+                // it has an access path outside the binding - no slot.
+                (_, res) if taint.contains(&res) => n_aliased += 1,
+                (_, res) => by_cell.entry(res - 1).or_default().push(i),
+            }
+        }
+        let slots: Vec<serde_json::Value> = by_cell
+            .iter()
+            .enumerate()
+            .map(|(slot, (&cell, sites))| {
+                serde_json::json!({
+                    "slot": slot,
+                    "cell": cell,
+                    "sites": sites
+                        .iter()
+                        .map(|&i| {
+                            let (kind, fn_name, f, iid) = gen::SITE_INFO[i];
+                            serde_json::json!({
+                                "site": i,
+                                "fn": fn_name,
+                                "iid": iid,
+                                "kind": kind,
+                                "field": if kind == "field" {
+                                    serde_json::json!(gen::FIELD_NAMES[f as usize])
+                                } else {
+                                    serde_json::Value::Null
+                                },
+                                "recv_cell": acc[i] - 1,
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        let out = serde_json::json!({
+            "dir": dir,
+            "frame": frame,
+            "census_frames": census_frames,
+            "lanes_run": lanes_run,
+            "boundary_cells": n_boundary,
+            "n_slots": slots.len(),
+            "n_sites_bound": slots.iter().map(|s| s["sites"].as_array().unwrap().len()).sum::<usize>(),
+            "slots": slots,
+            "skipped": {
+                "unseen_or_no_result": n_unseen,
+                "multi_recv": n_multi_recv,
+                "multi_result": n_multi_result,
+                "nonboundary_result": n_nonboundary,
+                "aliased": n_aliased,
+            },
+        });
+        std::fs::write(path, serde_json::to_string_pretty(&out).unwrap())
+            .unwrap_or_else(|e| panic!("write {}: {}", path, e));
+        println!(
+            "emit-slots: {} slots covering {} sites -> {} (skipped: {} multi-recv, {} multi-result, {} non-boundary, {} aliased, {} unseen/no-result)",
+            out["n_slots"], out["n_sites_bound"], path,
+            n_multi_recv, n_multi_result, n_nonboundary, n_aliased, n_unseen
+        );
     }
 }
 
@@ -544,6 +681,7 @@ fn main() {
     let mut reps: u32 = 10;
     let mut census_frames: u32 = 2;
     let mut max_lanes: usize = 256;
+    let mut emit_slots: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -566,6 +704,7 @@ fn main() {
                 census_frames = args.next().expect("value").parse().unwrap()
             }
             "--max-lanes" => max_lanes = args.next().expect("value").parse().unwrap(),
+            "--emit-slots" => emit_slots = Some(args.next().expect("--emit-slots needs FILE")),
             "-i" => {
                 inputs = args
                     .next()
@@ -594,7 +733,7 @@ fn main() {
     let num_frames = frames.unwrap_or(inputs.len() as u32);
 
     if let Some((dir, frame)) = from_checkpoint {
-        run_census(&dir, frame, census_frames, max_lanes);
+        run_census(&dir, frame, census_frames, max_lanes, emit_slots.as_deref());
         return;
     }
 

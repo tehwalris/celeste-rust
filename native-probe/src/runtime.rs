@@ -108,6 +108,11 @@ pub struct Rt {
     /// compiler consumes this (plans/columnar-engine.md "Slot
     /// compilation").
     pub result_log: Vec<u64>,
+    /// Result codes observed at sites that turned multi-result (in this
+    /// lane). Any boundary cell in here has an access path OUTSIDE the
+    /// slot binding, so its slot would be incoherent - the dump excludes
+    /// it (aliased).
+    pub result_taint: Vec<u64>,
     /// Per-branch-site outcome-SEQUENCE hash (empty = off). A site is
     /// SIMD-divergent iff different runs produce different sequences -
     /// a loop head taking true 6x then false is fine as long as every
@@ -149,6 +154,7 @@ impl Rt {
             prints: Vec::new(),
             site_log: Vec::new(),
             result_log: Vec::new(),
+            result_taint: Vec::new(),
             branch_log: Vec::new(),
         }
     }
@@ -167,7 +173,15 @@ impl Rt {
         *slot = match *slot {
             0 => v,
             x if x == v => x,
-            _ => u64::MAX,
+            x => {
+                // Multi-result transition: remember EVERY code seen at
+                // this site so the cells can be excluded from slots.
+                if x != u64::MAX {
+                    self.result_taint.push(x);
+                }
+                self.result_taint.push(v);
+                u64::MAX
+            }
         };
     }
 
