@@ -816,6 +816,10 @@ fn boundary_ids() -> runtime2::BoundaryIds {
         f_x: f("x"),
         f_y: f("y"),
         f_dash_effect_time: f("dash_effect_time"),
+        // The recipe's partition_merge (pm1) key. `has_dashed` and
+        // `freeze` are globals; the rest are player fields.
+        g_pm1: ["has_dashed", "freeze"].iter().map(|n| g(n)).collect(),
+        f_pm1: ["dash_time", "djump", "p_dash", "p_jump"].iter().map(|n| f(n)).collect(),
     }
 }
 
@@ -1026,15 +1030,24 @@ fn frame_step(
             .collect()
     };
     phase("dedup");
-    let mut groups: Vec<(u64, Vec<runtime2::Rt2>)> = Vec::new();
+    // Group for the k-way merge by (shape, pm1 key): blocks stay
+    // partitioned by the recipe's fork-condition cells instead of
+    // densifying into one wide block per shape. This is the
+    // interpreter's fragment representation (its measured 2-3x edge at
+    // depth): key-correlated columns stay Col::U through storage,
+    // merge, and the next frame's boundary hashing.
+    let mut groups: Vec<((u64, u64), Vec<runtime2::Rt2>)> = Vec::new();
     for (mut sub, keep) in ran.into_iter().zip(keeps) {
         sub.retain_lanes(&keep);
         if sub.width == 0 {
             continue;
         }
-        match groups.iter_mut().find(|(h, _)| *h == sub.shape_hash) {
-            Some((_, g)) => g.push(sub),
-            None => groups.push((sub.shape_hash, vec![sub])),
+        for part in sub.partition_pm1(ids) {
+            let key = (part.shape_hash, part.pm1_key_hash(ids));
+            match groups.iter_mut().find(|(h, _)| *h == key) {
+                Some((_, g)) => g.push(part),
+                None => groups.push((key, vec![part])),
+            }
         }
     }
     phase("retain");

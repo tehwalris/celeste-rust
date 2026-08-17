@@ -105,6 +105,10 @@ pub struct BoundaryIds {
     pub f_x: u32,
     pub f_y: u32,
     pub f_dash_effect_time: u32,
+    /// The recipe's partition_merge (pm1) key: globals (has_dashed,
+    /// freeze) and player fields (dash_time, djump, p_dash, p_jump).
+    pub g_pm1: Vec<u32>,
+    pub f_pm1: Vec<u32>,
 }
 
 pub struct Rt2 {
@@ -2401,6 +2405,76 @@ impl Rt2 {
             self.row_keys = keep.iter().map(|&i| self.row_keys[i as usize]).collect();
         }
         self.width = keep.len();
+    }
+
+    /// Resolve the pm1 key cells on this block (canonical ids, so the
+    /// same for every block of a shape). Missing pieces (no player at
+    /// spawn, absent global) just drop out of the key.
+    pub fn pm1_cells(&self, ids: &BoundaryIds) -> Vec<u32> {
+        let mut cells: Vec<u32> = Vec::new();
+        for &g in &ids.g_pm1 {
+            let c = self.globals[g as usize];
+            if c != NONE {
+                cells.push(c);
+            }
+        }
+        if let Some(player) = self.global_target(ids.g_player) {
+            if matches!(self.structure[player as usize], Cell2::Obj(_)) {
+                for &f in &ids.f_pm1 {
+                    if let Some(c) = self.obj_field_cell(player, f) {
+                        cells.push(c);
+                    }
+                }
+            }
+        }
+        cells
+    }
+
+    /// The pm1 partition (the recipe's partition_merge entry, ported to
+    /// the engine's frame boundary): split a post-boundary block so the
+    /// fork-condition cells are per-block UNIFORM. This is the
+    /// interpreter's fragment representation - the measured reason it
+    /// beats one-wide-block-per-shape: key-correlated columns stay
+    /// Col::U through storage, merge and row hashing.
+    pub fn partition_pm1(self, ids: &BoundaryIds) -> Vec<Rt2> {
+        let cells = self.pm1_cells(ids);
+        let mut parts = vec![self];
+        for c in cells {
+            parts = parts.into_iter().flat_map(|b| b.partition_by_cell(c)).collect();
+        }
+        parts
+    }
+
+    /// Group key for same-shape merging under pm1: a hash of the key
+    /// cells' (uniform) values. Call on pm1-partitioned blocks.
+    pub fn pm1_key_hash(&self, ids: &BoundaryIds) -> u64 {
+        use std::hash::Hasher;
+        let mut h = rustc_hash::FxHasher::default();
+        for c in self.pm1_cells(ids) {
+            let v = match &self.cols[c as usize] {
+                Col::U(v) => *v,
+                // Non-uniform key cell: only possible when a caller skips
+                // partition_pm1; fold lane 0 so grouping stays legal
+                // (concat requires identical shapes, not key uniformity).
+                Col::V(vs) => vs[0],
+                Col::N(vs) => AV::Num(vs[0]),
+                Col::I(vs) => AV::Ival(vs[0].0, vs[0].1),
+            };
+            h.write_u32(c);
+            h.write_u64(match v {
+                AV::Num(n) => 1u64 << 56 | n.to_bits() as u64,
+                AV::Ival(a, b) => {
+                    2u64 << 56 | (a.to_bits() as u64) << 24 ^ (b.to_bits() as u64)
+                }
+                AV::Bool(b) => 3u64 << 56 | b as u64,
+                AV::UBool => 4u64 << 56,
+                AV::Str(x) => 5u64 << 56 | x as u64,
+                AV::Nil => 6u64 << 56,
+                AV::Ptr(p) => 7u64 << 56 | p as u64,
+                AV::NilPtr => 8u64 << 56,
+            });
+        }
+        h.finish()
     }
 
     /// Split the block into sub-blocks whose lanes agree on the value in
