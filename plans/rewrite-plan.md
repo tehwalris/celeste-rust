@@ -1067,19 +1067,23 @@ loop-exit self-edge. The census (`--branch-census`) now emits
 ready-to-paste entries with the recorded direction read off the
 sequence hash (2 = true edge, 1 = false).
 
-Pilot: `rewrites-trace10.jsonl` = rewrites-compile.jsonl + 22 guards
+Pilot: `rewrites-trace10.jsonl` = rewrites-compile.jsonl + 23 guards
 + dce + inline(anonymous_61) + merge_blocks + kill_dead.
 CERTIFIED: `rewrite verify --frames 40 --variant-of
 rewrites-compile.jsonl --variant-shapes player` = "identical through
-frame 40", zero deopts, zero fallbacks. Final shape: __frame = 2,006
-instrs, FOUR branches, 0 resolvable calls (9 intrinsic mid-block
+frame 40", zero deopts, zero fallbacks. Final shape: __frame ~2,000
+instrs, THREE branches, 0 resolvable calls (9 intrinsic mid-block
 calls: 6x __new_unknown_boolean, 2x __split_by_flr, 1x __split_at -
 calls do not break blocks). All 617-26 never-executed branch sites
 and their subgraphs are gone from the compiled footprint.
 
-The 4 of the census's 26 sites the screen refused, and why (the
+The 3 of the census's 26 sites the screen refused, and why (the
 census samples one frame's biggest state; the screen is the
-certifier):
+certifier). A 4th removal (anonymous_61 if_join_6) was a
+MISDIAGNOSIS - rounds 2 and 3 failed on the same two frames, and the
+round-2 failure was the dash gate hiding under a merged block label;
+re-adding the guard re-certified green at 40 frames. Trust the
+asserted instruction, never the block label.
 - freeze > 0 gate (__frame in_i1_012_if_join_9): falsified by the
   frozen class. freeze IS a pm1 key cell - this is half the motivation
   for the (shape, pm1) overlay key (step 5).
@@ -1087,11 +1091,17 @@ certifier):
   by mid-dash states (has_dashed=true, dash_time>0). dash_time is
   ALSO a pm1 key cell - the other half. With (shape, pm1) keying both
   gates straighten per class and __frame drops to 2 branches.
-- spd.x~=0 or spd.y~=0 move gate (anonymous_61 __entry) and its
-  downstream shadow (anonymous_61 if_join_6): falsified by
-  standing-still lanes INSIDE a pm1 class (spd is not a key cell).
-  Genuinely divergent - stays a branch, or gets if_convert/masked
-  treatment later.
+- spd.x~=0 or spd.y~=0 move gate (anonymous_61 __entry): falsified
+  by standing-still lanes INSIDE a pm1 class (spd is not a key cell).
+  Genuinely divergent - the treatment is SELECT conversion, not
+  dispatch: the moving arm is already call-free (obj.move was inlined
+  and unrolled by the base campaign; the standalone move_51 FunDef is
+  dead here, its assert_closure a leftover pin) and its interior
+  sites are among the certified guards, so masked-store speculation
+  over the arm + if_convert closes it with existing rules.
+
+End-state ledger per (shape, pm1) overlay: 23 guards + 2 pm1-keyed
+gates (freeze, dash) + 1 select (spd move) = ZERO branches.
 
 Two machinery lessons, both now encoded:
 - Kills are liveness annotations derived on the branched CFG.

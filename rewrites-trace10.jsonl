@@ -1104,6 +1104,7 @@
 {"id":"gb_frame_in_zn001_if_join_6","rule":"guard_branch","fn":"__frame","head":"in_zn001_if_join_6","taken":true,"why":"branch census f35: every sampled run takes the true edge"}
 {"id":"gb_frame_it2_zc000_in_j2_006_if_join_5","rule":"guard_branch","fn":"__frame","head":"it2_zc000_in_j2_006_if_join_5","taken":true,"why":"branch census f35: every sampled run takes the true edge"}
 {"id":"gb_anonymous_61_if_body_5","rule":"guard_branch","fn":"anonymous_61","head":"if_body_5","taken":true,"why":"branch census f35: every sampled run takes the true edge"}
+{"id":"gb_anonymous_61_if_join_6","rule":"guard_branch","fn":"anonymous_61","head":"if_join_6","taken":true,"why":"branch census f35: every sampled run takes the true edge (type.update ~= nil; re-added after the round-2 failure was traced to the dash gate under a merged label)"}
 {"id":"gb_anonymous_61_if_body_8","rule":"guard_branch","fn":"anonymous_61","head":"if_body_8","taken":true,"why":"branch census f35: every sampled run takes the true edge"}
 {"id":"gb_anonymous_61_if_body_8_devirt_54_true","rule":"guard_branch","fn":"anonymous_61","head":"if_body_8_devirt_54_true","taken":false,"why":"branch census f35: every sampled run takes the false edge"}
 {"id":"gb_anonymous_61_in_h061_if_join_154","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_if_join_154","taken":false,"why":"branch census f35: every sampled run takes the false edge"}
