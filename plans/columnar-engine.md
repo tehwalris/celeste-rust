@@ -1060,3 +1060,23 @@ Recon (`transpile --kernel-recon`, compile recipe):
   targets, array lengths), full inlining + unrolling into one DAG,
   if-conversion of ~55+ branches with masked stores, per-lane deopt
   accumulation under the active mask.
+
+Branch census on the steady window (f35, 36k lanes, 64 input runs +
+256 lane runs): 617 branch sites, 26 EXECUTED, 0 DIVERGENT. Philippe's
+read confirmed: the loops/back-edges are room-setup-and-similar paths
+that never run in steady play. Consequence - the kernel is a pure
+TRACE, not a CFG compile:
+1. Record the steady block sequence once (26 resolved branches).
+2. Emit ONE straight line of typed SIMD along it: each branch becomes
+   a per-lane GUARD (condition == recorded direction, else deopt
+   bit); loops never entered are guarded off; calls inline via shape
+   closure cells; loads/stores become row-struct fields; no
+   if-conversion, no unrolling in v1.
+3. Note: branch directions correlate with the pm1 class (blocks are
+   fork-class-uniform), so mode-1's 222 divergence bails were CROSS-
+   class tiles. One trace per (shape, pm1 class) if the single-trace
+   deopt rate warrants it; v1 = dominant trace + deopt.
+Next session: shape-fact dump (cell types, closure targets, array
+lengths, trace) -> kernel emitter -> standalone bench (real f35 rows,
+x64 inputs, per-(row,btn) cell-value gate vs Rt2) -> convince on
+speed, then integrate.
