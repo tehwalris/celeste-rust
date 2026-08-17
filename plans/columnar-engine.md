@@ -248,3 +248,50 @@ columns only in Col::V - the dense-row projection uses the varying
 count (~30-80 at f30), i.e. ~0.5-1.3 KB/row at AV width, ~120-320 B
 typed. Boundary + dedup + compaction cost: included in the numbers
 above (the canonical BFS renumbering runs per chunk per frame).
+
+## The 300m projection (goal 5 of the overnight brief; written 2026-08-18)
+
+Room (2,0) level-0 measured wall (BENCHMARK_DATA.md): frontier 62.9M
+lanes at f070, 347.9 s/frame, 67.6 GB RSS, growth 1.09-1.11x/frame,
+horizon 95; f001..f070 cost 2,773 s, peak 76 GB. The S(1px/2px) rungs
+both OOM'd their humps under the interpreter (2px: 57.6 GB at f36 with
+only 1.66M lanes - the cost is INTRA-frame interpreter machinery, not
+boundary storage).
+
+What the columnar engine changes, from tonight's measured numbers
+(~1.4 us/offered-lane v0, ~5x more expected from typed columns; row
+storage = varying columns only, ~40-80 cols x 4-16 B):
+
+- MEMORY: intra-frame peak becomes chunk-local (MBs per thread) +
+  frontier rows. The 2px S-rung hump (1.66M lanes) is ~0.5-1 GB under
+  the engine vs the 57.6 GB OOM. Boundary storage at the (2,0) f070
+  frontier: ~10-20 GB typed vs 67.6 GB interpreter RSS. The OOM wall
+  disappears for every campaign that fits ~100M lanes.
+- TIME: v0 already ~10x the interpreter per offered lane at width
+  (and parallel chunks scale); typed columns target another ~5x.
+- BUT the level-0 EXACT run stays impossible: 1.10x/frame growth means
+  ~680M lanes by f95 - the lane count itself is the wall ("this is the
+  number of lanes", BENCHMARK_DATA). No engine fixes an exponential.
+
+GO/NO-GO verdict: GO, engine-first, S-rung second. The decision is NOT
+"engine vs rem-banding" - it is: the engine reprices every rung of the
+existing S-rung ladder (the algorithmic answer that already exists and
+OOM'd only on interpreter overhead). Path: port the fruit widenings
+(abstraction.rs:590-704, 748-818) + gate 2 + the death-frame deopt,
+then re-run the S-rung campaign natively. rem-banding stays parked
+unless the repriced S-rung still cannot reach h=95.
+
+## Typed-column plan (the next unit; the 5-10x)
+
+The profile says the remaining single-core cost is per-lane AV tag
+dispatch. Plan, in order, gate 1 re-run after each step:
+1. `Col::N(Vec<P8>)` - an all-Num column stored raw (4 B/lane).
+   Constructors detect it (buf fill already single-site); `at()` maps.
+   Fast paths in map2/map1 for N x N / N x U(Num): arith and compares
+   become branchless i32 loops (P8 add/sub are i32 wrapping ops; mul is
+   (i64 product) >> 16 - all auto-vectorizable).
+2. `Col::Bm(BitVec)` for all-Bool columns if select/compare masks still
+   show in the profile.
+3. Fused loops need the transpiler (emit one lane-loop per straight-line
+   arithmetic run); only reach for it if 1+2 leave a >2x gap to the
+   interpreter per boundary lane.
