@@ -81,3 +81,33 @@ Ground rules for the night: safe-run for anything heavy, ONE heavy job at
 a time, --memory 60G tripwire on certification runs, perf data in
 ~/perf-scratch/ (never /tmp), measure before/after, commit+push at every
 stable point, keep this file and BENCHMARK_DATA.md current.
+
+## K0 results (2026-08-18 night)
+
+Baseline re-measured (f35 bench, 187,859 lanes in, 40 blocks):
+- Rt3 TILE=2 (current best): **518 ms, 2757 ns/input-lane**, exact
+  (gate 2 row-key set equal), 0 splits. The 1.55 s in
+  columnar-engine.md is stale; yesterday's stage-2 work improved it 3x.
+  Per (row x button-variant): ~43 ns. This is the number to beat.
+
+Row census at f35 (new `native-probe --row-census DIR FRAME`):
+- pm1 classes: steady (freeze=0, dash=0) = **60.9%** of lanes;
+  dash=1..4 = 23.4%; freeze=1..2 (all dash=4) = 15.7%. The kernel's
+  steady overlay covers 61% today; dash/freeze classes are future
+  per-class overlays (same guard_branch machinery, different edges).
+- The ENTIRE per-lane state of a steady row is **11 columns**:
+  x, y, spd.x, spd.y, grace, dash_effect_time, dash_accel.x/.y,
+  dash_target.x/.y (all Num) + flip.x (Bool). ~44 B/row.
+  16 rows of full varying state = 11 zmm registers.
+- Uniform-but-abstract cells: __button_states.1-6 = UBool (the fan-out
+  source), objects.1.rem.x/.y = uniform Interval (the widened rem).
+  Everything else is block-uniform plain values.
+
+Kernel consequences: register-resident frame is feasible; value
+classes at emit time are S (block-uniform scalar, computed once) vs
+Z (per-lane: ZNum=[i32;W], ZIval=2x[i32;W], masks); buttons become
+per-suffix compile-time constants (64 monomorphized suffixes, LLVM
+folds each variant's dead selects); per-lane Ival appears mid-frame
+(num + uniform rem interval), flr straddle -> per-lane deopt bit;
+tri-state compares carry (value, known) masks; select on unknown
+cond -> deopt bit (v1).

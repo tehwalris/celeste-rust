@@ -178,6 +178,17 @@ pub fn import_block(
     cart: std::sync::Arc<celeste_rust::cart_data::CartData>,
     cache: std::sync::Arc<celeste_rust::collision_cache::CollisionCache>,
 ) -> Rt2 {
+    import_block_mapped(state, cart, cache).0
+}
+
+/// `import_block` plus the canonical-id -> interpreter `HeapId` map
+/// (index = canonical cell id), for tooling that needs to NAME columns
+/// (the kernel row census). Execution paths use `import_block`.
+pub fn import_block_mapped(
+    state: &State,
+    cart: std::sync::Arc<celeste_rust::cart_data::CartData>,
+    cache: std::sync::Arc<celeste_rust::collision_cache::CollisionCache>,
+) -> (Rt2, Vec<Option<HeapId>>) {
     assert!(
         state.local_env.iter().count() == 0 && state.outer_local_envs.is_empty(),
         "boundary states must have empty local envs"
@@ -212,7 +223,11 @@ pub fn import_block(
     // right away (the slot-binding shape gate reads it).
     rt2.shape_hash = rt2.shape_hash_of();
     let _ = NONE;
-    rt2
+    let mut rev: Vec<Option<HeapId>> = vec![None; rt2.structure.len()];
+    for (heap_id, canon) in memo.iter() {
+        rev[*canon as usize] = Some(*heap_id);
+    }
+    (rt2, rev)
 }
 
 /// Assert the scalar importer (`import_lane`) and the vectorized one

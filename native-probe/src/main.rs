@@ -714,6 +714,7 @@ fn main() {
     let mut from_checkpoint: Option<(String, u32)> = None;
     let mut abstract_frames: Option<u32> = None;
     let mut abstract_bench: Option<(String, u32)> = None;
+    let mut row_census: Option<(String, u32)> = None;
     let mut reps: u32 = 10;
     let mut census_frames: u32 = 2;
     let mut max_lanes: usize = 256;
@@ -760,6 +761,11 @@ fn main() {
                 abstract_bench = Some((dir, frame));
             }
             "--reps" => reps = args.next().expect("value").parse().unwrap(),
+            "--row-census" => {
+                let dir = args.next().expect("--row-census needs DIR FRAME");
+                let frame: u32 = args.next().expect("FRAME").parse().unwrap();
+                row_census = Some((dir, frame));
+            }
             "--bench" => {
                 bench_reps = Some(args.next().expect("--bench needs a value").parse().unwrap())
             }
@@ -778,6 +784,10 @@ fn main() {
         return;
     }
 
+    if let Some((dir, frame)) = row_census {
+        run_row_census(&dir, frame);
+        return;
+    }
     if let Some((dir, frame)) = abstract_bench {
         run_abstract_bench(&dir, frame, reps);
         return;
@@ -1145,6 +1155,143 @@ fn run_abstract(num_frames: u32) {
         println!("op census (name, total ms, calls):");
         for (name, (ns, calls, _)) in rows {
             println!("  {:14} {:9.1} ms  {:>12} calls", name, ns as f64 / 1e6, calls);
+        }
+    }
+}
+
+/// K0 recon for the kernel emitter (plans/kernel-plan.md): per-column
+/// type census over the real boundary blocks of one frame, split by
+/// (shape, pm1 class). Answers: which columns are Num-only / Interval /
+/// mixed across the steady class, how many rows the steady kernel covers,
+/// and which columns are uniform-per-block (broadcast candidates).
+fn run_row_census(dir: &str, frame: u32) {
+    let rt = build_rt();
+    let states = load_states_any(dir, frame);
+    // pm1 class per state, via the interpreter-side cell names (states
+    // are class-uniform at the boundary).
+    let class_of = |st: &celeste_rust::interpreter::state::State| -> (String, String) {
+        use celeste_rust::interpreter::value::{HeapValue, MaybeVector, Value};
+        let names = celeste_rust::interpreter::merge_dump::cell_names(st);
+        let shape = celeste_rust::interpreter::abstraction::object_shape(st)
+            .map(|s| s.join(","))
+            .unwrap_or_else(|_| "?".into());
+        let mut freeze = String::from("?");
+        let mut dash = String::from("?");
+        for (cell, name) in names.iter() {
+            let is_freeze = name == "freeze";
+            let is_dash = name.ends_with(".dash_time");
+            if !is_freeze && !is_dash {
+                continue;
+            }
+            let text = match st
+                .heap
+                .get_opt(celeste_rust::interpreter::heap::HeapId::from_raw(*cell))
+            {
+                Some(HeapValue::Value(Value::Number(MaybeVector::Scalar(n)))) => {
+                    format!("{}", n.whole_part_as_i16())
+                }
+                Some(HeapValue::Value(Value::Number(MaybeVector::Vector(_)))) => "vec".into(),
+                _ => "?".into(),
+            };
+            if is_freeze {
+                freeze = text;
+            } else {
+                dash = text;
+            }
+        }
+        (shape, format!("freeze={} dash={}", freeze, dash))
+    };
+    let mut by_class: std::collections::BTreeMap<(String, String), (usize, usize)> =
+        Default::default();
+    let mut steady_blocks: Vec<runtime2::Rt2> = Vec::new();
+    let mut col_names: Vec<String> = Vec::new();
+    for st in &states {
+        let (shape, class) = class_of(st);
+        let e = by_class.entry((shape.clone(), class.clone())).or_default();
+        e.0 += 1;
+        e.1 += st.vector_size;
+        if shape == "player" && class == "freeze=0 dash=0" {
+            steady_blocks.push(import::import_block(st, rt.cart.clone(), rt.cache.clone()));
+            if col_names.is_empty() {
+                let (_, rev) =
+                    import::import_block_mapped(st, rt.cart.clone(), rt.cache.clone());
+                let names = celeste_rust::interpreter::merge_dump::cell_names(st);
+                col_names = rev
+                    .iter()
+                    .map(|h| {
+                        h.and_then(|h| names.get(&h.raw()).cloned())
+                            .unwrap_or_else(|| "?".into())
+                    })
+                    .collect();
+            }
+        }
+    }
+    let total: usize = states.iter().map(|s| s.vector_size).sum();
+    println!("row census f{:03}: {} states, {} lanes", frame, states.len(), total);
+    for ((shape, class), (n, lanes)) in &by_class {
+        println!(
+            "  [{}] {}: {} state(s), {} lanes ({:.1}%)",
+            shape,
+            class,
+            n,
+            lanes,
+            100.0 * *lanes as f64 / total as f64
+        );
+    }
+    // Column type occupancy across the steady blocks.
+    let ncols = steady_blocks.iter().map(|b| b.cols.len()).max().unwrap_or(0);
+    println!(
+        "steady blocks: {} ({} lanes), {} columns max",
+        steady_blocks.len(),
+        steady_blocks.iter().map(|b| b.width).sum::<usize>(),
+        ncols
+    );
+    println!("cell  uniform varyN varyI varyV  (V content)   <- per steady block counts");
+    for c in 0..ncols {
+        let (mut u, mut n, mut i, mut v) = (0usize, 0usize, 0usize, 0usize);
+        let mut vkinds: std::collections::BTreeSet<&'static str> = Default::default();
+        let mut ukinds: std::collections::BTreeSet<&'static str> = Default::default();
+        let kind = |a: &runtime2::AV| -> &'static str {
+            match a {
+                runtime2::AV::Num(_) => "num",
+                runtime2::AV::Ival(_, _) => "ival",
+                runtime2::AV::Bool(_) => "bool",
+                runtime2::AV::UBool => "ubool",
+                runtime2::AV::Str(_) => "str",
+                runtime2::AV::Nil => "nil",
+                runtime2::AV::Ptr(_) => "ptr",
+                runtime2::AV::NilPtr => "nilptr",
+            }
+        };
+        for b in &steady_blocks {
+            match b.cols.get(c) {
+                None => {}
+                Some(runtime2::Col::U(a)) => {
+                    u += 1;
+                    ukinds.insert(kind(a));
+                }
+                Some(runtime2::Col::N(_)) => n += 1,
+                Some(runtime2::Col::I(_)) => i += 1,
+                Some(runtime2::Col::V(vals)) => {
+                    v += 1;
+                    for a in vals {
+                        vkinds.insert(kind(a));
+                    }
+                }
+            }
+        }
+        if n + i + v > 0 || ukinds.iter().any(|k| *k == "ival" || *k == "ubool") {
+            println!(
+                "{:>4}  {:>7} {:>5} {:>5} {:>5}  V={:?} U={:?}  {}",
+                c,
+                u,
+                n,
+                i,
+                v,
+                vkinds,
+                ukinds,
+                col_names.get(c).map(|s| s.as_str()).unwrap_or("?")
+            );
         }
     }
 }
