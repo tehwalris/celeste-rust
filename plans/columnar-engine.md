@@ -417,3 +417,16 @@ fusion or typed-bool columns, (3) fused loops via the transpiler.
   serial merge/dedup section (k-way merge of ~10k sub-blocks + a
   serial 902k-entry dedup map) and in per-offered-lane op work -
   both named for the goal-7 pass (parallel merge, radix dedup).
+
+## Select fast paths (2026-08-18, ~08:30, last unit of the night)
+
+Typed select (varying-bool cond over Num/interval sides -> raw column):
+f40 14.3 -> 10.1 s, 40 frames 43.7 -> 31.5 s, serial 30f 2.0 -> 0.96 s
+(census on). The win CASCADES: selects now emit typed columns, so
+downstream ops take the bin_num fast paths (map2_generic calls halved).
+Counts exact through f40 re-verified twice. Census now: select 372 ms
+(non-numeric remainder), map2 177 ms, everything else < 40 ms.
+
+Sharded parallel cross-block dedup also landed (neutral today, removes
+a serial ceiling). Remaining depth cost = worker-phase op work; the
+next levers stay as prioritized in the morning report.

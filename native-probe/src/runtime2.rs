@@ -875,6 +875,96 @@ impl Rt2 {
 
 
     fn select_inner(&mut self, c: ColId, t: ColId, f: ColId) -> ColId {
+        // Typed fast path: varying bool condition over two all-Num sides
+        // (the masked select-stores of the compiled program) - branch-poor
+        // loop into a raw N column.
+        {
+            self.resolve(c);
+            self.resolve(t);
+            self.resolve(f);
+            enum NView<'a> {
+                U(P8),
+                N(&'a [P8]),
+            }
+            fn nview(c: &Col) -> Option<NView<'_>> {
+                match c {
+                    Col::U(AV::Num(n)) => Some(NView::U(*n)),
+                    Col::N(v) => Some(NView::N(v)),
+                    _ => None,
+                }
+            }
+            #[inline(always)]
+            fn nat(v: &NView, i: usize) -> P8 {
+                match v {
+                    NView::U(n) => *n,
+                    NView::N(v) => v[i],
+                }
+            }
+            enum IView<'a> {
+                UN(P8),
+                UI(P8, P8),
+                N(&'a [P8]),
+                I(&'a [(P8, P8)]),
+            }
+            fn iview(c: &Col) -> Option<IView<'_>> {
+                match c {
+                    Col::U(AV::Num(n)) => Some(IView::UN(*n)),
+                    Col::U(AV::Ival(a, b)) => Some(IView::UI(*a, *b)),
+                    Col::N(v) => Some(IView::N(v)),
+                    Col::I(v) => Some(IView::I(v)),
+                    _ => None,
+                }
+            }
+            #[inline(always)]
+            fn iat(v: &IView, i: usize) -> AV {
+                match v {
+                    IView::UN(n) => AV::Num(*n),
+                    IView::UI(a, b) => AV::Ival(*a, *b),
+                    IView::N(v) => AV::Num(v[i]),
+                    IView::I(v) => AV::Ival(v[i].0, v[i].1),
+                }
+            }
+            if let Col::V(cv) = self.get(c) {
+                if cv.iter().all(|a| matches!(a, AV::Bool(_))) {
+                    if let (Some(tv), Some(fv)) = (nview(self.get(t)), nview(self.get(f))) {
+                        let cv = match self.get(c) {
+                            Col::V(cv) => cv,
+                            _ => unreachable!(),
+                        };
+                        let out: Vec<P8> = cv
+                            .iter()
+                            .enumerate()
+                            .map(|(i, a)| {
+                                if matches!(a, AV::Bool(true)) {
+                                    nat(&tv, i)
+                                } else {
+                                    nat(&fv, i)
+                                }
+                            })
+                            .collect();
+                        return self.put(Col::N(out));
+                    }
+                    if let (Some(tv), Some(fv)) = (iview(self.get(t)), iview(self.get(f))) {
+                        let cv = match self.get(c) {
+                            Col::V(cv) => cv,
+                            _ => unreachable!(),
+                        };
+                        let out: Vec<AV> = cv
+                            .iter()
+                            .enumerate()
+                            .map(|(i, a)| {
+                                if matches!(a, AV::Bool(true)) {
+                                    iat(&tv, i)
+                                } else {
+                                    iat(&fv, i)
+                                }
+                            })
+                            .collect();
+                        return self.put(compress_num_v(out));
+                    }
+                }
+            }
+        }
         let pick = |cv: AV, tv: AV, fv: AV| -> AV {
             match cv {
                 AV::Bool(true) => tv,
