@@ -13,6 +13,7 @@
 mod gen;
 mod import;
 mod runtime;
+mod runtime2;
 
 use celeste_rust::cart_data::CartData;
 use celeste_rust::collision_cache::CollisionCache;
@@ -521,6 +522,7 @@ fn main() {
     let mut frames: Option<u32> = None;
     let mut bench_reps: Option<u32> = None;
     let mut from_checkpoint: Option<(String, u32)> = None;
+    let mut abstract_frames: Option<u32> = None;
     let mut census_frames: u32 = 2;
     let mut max_lanes: usize = 256;
     let mut args = std::env::args().skip(1);
@@ -554,6 +556,10 @@ fn main() {
                     .collect()
             }
             "-f" => frames = Some(args.next().expect("-f needs a value").parse().unwrap()),
+            "--abstract" => {
+                abstract_frames =
+                    Some(args.next().expect("--abstract needs FRAMES").parse().unwrap())
+            }
             "--bench" => {
                 bench_reps = Some(args.next().expect("--bench needs a value").parse().unwrap())
             }
@@ -564,6 +570,11 @@ fn main() {
 
     if let Some((dir, frame)) = from_checkpoint {
         run_census(&dir, frame, census_frames, max_lanes);
+        return;
+    }
+
+    if let Some(n) = abstract_frames {
+        run_abstract(n);
         return;
     }
 
@@ -612,4 +623,128 @@ fn main() {
         gen::call_fn(&mut rt, gen::FN_FRAME, &[], &[]);
         print_frame(&rt, &probe, frame_num, byte);
     }
+}
+
+/// The columnar abstract engine (plans/columnar-engine.md): run the level-0
+/// abstract search natively for N frames from the room start, printing
+/// per-frame lane counts - gate 1 is exact equality with
+/// `rewrite bench --frames N` (room (1,0), CELESTE_REM_BITS unset).
+///
+/// The frontier is a LIST of blocks (per shape); each block is
+/// pre-partitioned by the freeze global before the frame runs (the
+/// update-side freeze gate is a real per-lane branch - pm1's precedent);
+/// after the boundary's canonical compaction, same-shape blocks merge and
+/// cross-block duplicate rows drop.
+fn run_abstract(num_frames: u32) {
+    let rt = build_rt();
+    let rt2 = runtime2::Rt2::from_scalar(&rt);
+    let g = |name: &str| gen::global_id(name).unwrap_or_else(|| panic!("no global {}", name));
+    let f = |name: &str| gen::field_id(name).unwrap_or_else(|| panic!("no field {}", name));
+    let ids = runtime2::BoundaryIds {
+        g_objects: g("objects"),
+        g_player: g("player"),
+        g_timers: ["frames", "seconds", "minutes", "deaths"].iter().map(|n| g(n)).collect(),
+        f_type: f("type"),
+        f_rem: f("rem"),
+        f_spd: f("spd"),
+        f_x: f("x"),
+        f_y: f("y"),
+        f_dash_effect_time: f("dash_effect_time"),
+    };
+    let g_freeze = g("freeze");
+    // SplitReq panics are control flow, not errors - keep them off stderr.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if info.payload().downcast_ref::<runtime2::SplitReq>().is_none() {
+            prev_hook(info);
+        }
+    }));
+    let mut blocks: Vec<runtime2::Rt2> = vec![rt2];
+    let start = std::time::Instant::now();
+    for frame in 1..=num_frames {
+        let t0 = std::time::Instant::now();
+        // Pre-partition each block by the freeze value (the known
+        // frame-start divergent gate), then run. A block that hits another
+        // genuinely divergent branch throws a SplitReq with the
+        // per-frame-start-lane truth of the condition; partition the
+        // frame-start block by it and rerun both sides.
+        let mut ran: Vec<runtime2::Rt2> = Vec::new();
+        let mut pending: Vec<runtime2::Rt2> = Vec::new();
+        for block in blocks.drain(..) {
+            let freeze_cell = block.globals[g_freeze as usize];
+            assert!(freeze_cell != runtime2::NONE);
+            pending.extend(block.partition_by_cell(freeze_cell));
+        }
+        while let Some(block) = pending.pop() {
+            let snapshot = block.clone_block();
+            let mut sub = block;
+            sub.begin_frame();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                gen::call_fn(&mut sub, gen::FN_FRAME, &[], &[]);
+                sub.boundary(&ids);
+            }));
+            match result {
+                Ok(()) => ran.push(sub),
+                Err(payload) => match payload.downcast::<runtime2::SplitReq>() {
+                    Ok(req) => {
+                        let trues: Vec<u32> = (0..snapshot.width as u32)
+                            .filter(|&i| req.origin_truth[i as usize])
+                            .collect();
+                        let falses: Vec<u32> = (0..snapshot.width as u32)
+                            .filter(|&i| !req.origin_truth[i as usize])
+                            .collect();
+                        assert!(!trues.is_empty() && !falses.is_empty());
+                        let mut a = snapshot.clone_block();
+                        a.retain_lanes(&trues);
+                        let mut b = snapshot;
+                        b.retain_lanes(&falses);
+                        pending.push(a);
+                        pending.push(b);
+                    }
+                    Err(other) => std::panic::resume_unwind(other),
+                },
+            }
+        }
+        // Merge same-shape blocks; drop rows already seen this frame.
+        let mut seen: rustc_hash::FxHashMap<(u64, u64), ()> = Default::default();
+        let mut merged: Vec<runtime2::Rt2> = Vec::new();
+        for mut sub in ran {
+            let keep: Vec<u32> = (0..sub.width as u32)
+                .filter(|&i| {
+                    let k = sub.row_keys[i as usize];
+                    if seen.contains_key(&k) {
+                        false
+                    } else {
+                        seen.insert(k, ());
+                        true
+                    }
+                })
+                .collect();
+            sub.retain_lanes(&keep);
+            if sub.width == 0 {
+                continue;
+            }
+            match merged.iter_mut().find(|b| b.shape_hash == sub.shape_hash) {
+                Some(host) => host.concat(&sub),
+                None => merged.push(sub),
+            }
+        }
+        blocks = merged;
+        let lanes: usize = blocks.iter().map(|b| b.width).sum();
+        let (splits, appended, arena_peak): (u64, u64, usize) = blocks.iter().fold(
+            (0, 0, 0),
+            |(s, a, p), b| (s.max(b.stat_splits), a.max(b.stat_appended), p.max(b.stat_arena_peak)),
+        );
+        println!(
+            "frame {:3}: {:8} lanes in {} block(s)  {:9.3?}  ({} splits, {} appended, arena peak {})",
+            frame,
+            lanes,
+            blocks.len(),
+            t0.elapsed(),
+            splits,
+            appended,
+            arena_peak,
+        );
+    }
+    println!("abstract: {} frames in {:.3?}", num_frames, start.elapsed());
 }
