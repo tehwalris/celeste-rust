@@ -1,3 +1,28 @@
+# Tile engines on the one-frame dev-loop bench (2026-08-17; plans/columnar-engine.md)
+
+`--abstract-bench room10-newlua-bench 35`: real f35 campaign states,
+187,859 boundary lanes in, one frame, exactness oracle 269,059 lanes
+out + f37 chase 365,029 (all configs below EXACT). 30 cores.
+
+| engine | one frame | ns/input-lane |
+|---|---|---|
+| Rt2 columnar (reference) | 2.0 s | 10.6k |
+| Rt3 tiles, concrete buttons x64 variants (CELESTE_TILE=1) | 8.16 s | 43.4k |
+| Rt3 tiles, dynamic in-tile expand (CELESTE_TILE=2) | **1.55 s** | **8.3k** |
+
+CELESTE_TILE=2 = trunk sharing: one boundary row per tile, the input
+fan-out grows the lane axis in-tile (expand doubles width 1 -> 64), so
+the pre-input physics runs once per row for all 64 variants. 5.3x over
+the concrete-button tiles, and no Rt2 fallback fires (0 bails).
+Slot compilation (102 sites -> 28 slot cells) is IN but measured
+neutral; the profile says out-of-line ops (select 19%, av_addsub 17%)
+block all folding, and force-inlining them is a measured LOSS (9.25 s,
+icache). Slot binding is SHAPE-SCOPED (gen::SLOT_SHAPE): off-shape
+blocks (spawn/death/other rooms) deopt to Rt2 - frame 1's spawn shape
+binding steady-state cell ids was a real caught bug. Gate 1 from
+scratch f1..f40 EXACT (902,280 lanes) in both tile modes;
+CELESTE_SLOT_GUARD=1 passes everywhere (~2%).
+
 # Columnar abstract engine v0 (2026-08-18 overnight; plans/columnar-engine.md)
 
 Gate 1 (per-frame lane counts vs `rewrite bench`, room (1,0) level 0,

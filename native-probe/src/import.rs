@@ -208,6 +208,9 @@ pub fn import_block(
     while let Some(id) = queue.pop_front() {
         fill_cell(&mut rt2, id, &mut memo, &mut queue, state);
     }
+    // The BFS order IS the canonical order, so the shape key is valid
+    // right away (the slot-binding shape gate reads it).
+    rt2.shape_hash = rt2.shape_hash_of();
     let _ = NONE;
     rt2
 }

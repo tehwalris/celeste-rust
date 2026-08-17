@@ -705,3 +705,65 @@ only), (b) one variant (drop Rt3<BTN> monomorphization, keep dynamic
 buttons) with full inlining - measures the inlining win in isolation,
 (c) separate codegen crate with per-variant compilation units in
 parallel. Doing (a)/(b) to size the prize before paying (c).
+
+## Dynamic-expand tiles (CELESTE_TILE=2): trunk sharing built (2026-08-17)
+
+The fan-out moves INSIDE the tile - Philippe's "batch of rows in, all
+inputs, bigger batch out" model:
+- Tile = ONE boundary row; the lane axis carries the input variants.
+  Every column starts uniform (width 1), so the whole pre-input trunk
+  (obj.move physics, spikes, collision - the heavy pixel loops run
+  BEFORE update reads buttons) executes as O(1) uniform ops, shared by
+  all 64 variants.
+- `expand` on a uniform UBool doubles the lane axis in-tile: new lane
+  j descends from parent j>>1 with button value j&1. Old tiles are
+  NEVER rewritten - each tile records log2(width) at creation and
+  `tat` projects `lane >> (log_w - tile_log[ix])`. No COW, no remap.
+- TILE 16 -> 64 (the fan-out needs 64; concrete-button mode just runs
+  wider row tiles). Straddle splits keep the counter tape; valid bits
+  duplicate on expand. Re-expanded buttons (per-lane Bool tiles) pass
+  through; a second fan-out of the same button would exceed 64 lanes
+  and bail to Rt2 - sound, not silent.
+- Mode sentinel Rt3<0xFF>: expand_btn const-folds back to the dynamic
+  expand; no set_buttons, no per-variant monomorphization on this path.
+- Exactness argument: fan-out lane ORDER differs from Rt2's appends,
+  but the boundary compares canonical row SETS (order-independent
+  keys + dedup), and the bench oracle gates counts.
+
+## Mode 2 RESULTS: trunk sharing is the win (2026-08-17)
+
+| engine (bench: 187,859 lanes in, one frame, 30 cores) | time | ns/in-lane |
+|---|---|---|
+| Rt2 columnar (reference)                | 2.0 s   | 10.6k |
+| Rt3 concrete-button tiles (TILE=1 mode) | 8.16 s  | 43.4k |
+| Rt3 dynamic-expand tiles (TILE=2 mode)  | 1.55 s  | 8.3k  |
+
+5.3x over the variant tiles, faster than Rt2, EXACT (269,059 +
+f37 chase), zero bails (one row per tile = no cross-row divergence, so
+the fallback never fires), guard passes (+2%).
+
+Bug found by gate 1 from scratch and fixed: SLOT BINDING IS PER-SHAPE.
+Frame 1's spawn-shape block bound steady-state canonical cell ids -
+coherently wrong (the guard cannot see it; slots and cols agreed).
+Fix: the census dump carries the canonical shape hash; gen.rs emits
+SLOT_SHAPE; import_block stamps shape_hash (BFS = canonical); both
+tile drivers deopt to Rt2 off-shape. This also scopes the
+zero-divergence premise to its certified window - the tile kernel is a
+steady-shape fast path BY CONSTRUCTION now. Second bug in the same
+sweep: imported bench blocks had shape_hash unset, silently deopting
+every chunk (mode 2 == Rt2 timing was the tell); import_block now
+computes it.
+
+Next levers, in order of expected value:
+1. The mode-2 profile (redo it): with the trunk uniform, the residual
+   is post-fan-out vectorized AV ops - typed tiles (Num-only [P8;64]
+   panes, real SIMD) attack exactly that.
+2. Slots are now load-bearing scaffolding (neutral on time but the
+   shape-scoped binding + guard machinery is what typed slots build
+   on). Typed slots = the [TCol] array becomes typed fields.
+3. Batch rows per tile at LOW fan-out depth: 1 row/tile wastes lanes
+   1..63 during the trunk (op dispatch amortizes over 1 row). A
+   16-row tile that expands 16->... exceeds 64 - needs valid-masked
+   partial fan-out or TILE=1024 panes; measure before building.
+4. Drop the 4 Rt3<BTN> const variants (mode 1 + variants lost to mode
+   2; keep mode 1 as a control until mode 2 has survived a campaign).

@@ -331,15 +331,23 @@ fn run_census(
 
     // Slot-dump mode: verify the scalar and vectorized importers assign
     // identical (canonical) cell ids, so result-cell ids ARE slot ids.
+    // The census SHAPE (canonical structure hash) goes into the dump:
+    // slot cell ids are meaningless on any other shape, so the tile
+    // path deopts to the reference engine off-shape (spawn/death/other
+    // rooms) - the bug this caught was frame 1's spawn shape binding
+    // steady-state cell ids.
+    let mut census_shape: u64 = 0;
     if emit_slots.is_some() {
         let s0 = &states[0];
         let mut rt = Rt::new(cart.clone(), cache.clone(), gen::GLOBAL_NAMES.len(), gen::STRINGS);
         import::import_lane(&mut rt, s0, 0, true);
         let block = import::import_block(s0, cart.clone(), cache.clone());
         import::assert_lane_matches_block(&rt, &block);
+        census_shape = block.shape_hash_of();
         println!(
-            "emit-slots: scalar/block importer agreement verified ({} cells)",
-            rt.heap.len()
+            "emit-slots: scalar/block importer agreement verified ({} cells, shape {:#018x})",
+            rt.heap.len(),
+            census_shape
         );
     }
 
@@ -536,6 +544,7 @@ fn run_census(
             "census_frames": census_frames,
             "lanes_run": lanes_run,
             "boundary_cells": n_boundary,
+            "shape_hash": census_shape,
             "n_slots": slots.len(),
             "n_sites_bound": slots.iter().map(|s| s["sites"].as_array().unwrap().len()).sum::<usize>(),
             "slots": slots,
@@ -831,7 +840,14 @@ fn frame_step(
     g_freeze: u32,
     census_total: &mut rustc_hash::FxHashMap<&'static str, (u64, u64, u64)>,
 ) -> Vec<runtime2::Rt2> {
-let tile_mode = std::env::var_os("CELESTE_TILE").is_some();
+    // CELESTE_TILE=1: concrete-button tiles (64 variants outside the
+    // kernel). CELESTE_TILE=2: dynamic-expand tiles (one boundary row,
+    // the input fan-out grows the lane axis IN-tile - trunk shared).
+    let tile_mode: u8 = match std::env::var("CELESTE_TILE") {
+        Ok(v) if v == "2" => 2,
+        Ok(_) => 1,
+        Err(_) => 0,
+    };
     let mut ran: Vec<runtime2::Rt2> = Vec::new();
     let mut pending: Vec<runtime2::Rt2> = Vec::new();
     // Chunk cap: mid-frame width is ~64x the input width (the btn
@@ -889,8 +905,12 @@ let tile_mode = std::env::var_os("CELESTE_TILE").is_some();
                 scope.spawn(move || {
                     let mut done: Vec<runtime2::Rt2> = Vec::new();
                     while let Some(block) = local.pop() {
-                        if tile_mode {
-                            if let Some(out) = run_chunk_tiled(&block, ids) {
+                        if tile_mode > 0 {
+                            let out = match tile_mode {
+                                2 => run_chunk_dynexp(&block, ids),
+                                _ => run_chunk_tiled(&block, ids),
+                            };
+                            if let Some(out) = out {
                                 done.push(out);
                                 continue;
                             }
@@ -1186,6 +1206,12 @@ fn run_chunk_tiled(
     chunk: &runtime2::Rt2,
     ids: &runtime2::BoundaryIds,
 ) -> Option<runtime2::Rt2> {
+    // The slot binding (and the zero-divergence premise behind the tile
+    // kernel) is scoped to the census SHAPE. Off-shape blocks (spawn,
+    // death, other rooms) run the reference engine.
+    if gen::N_SLOTS > 0 && chunk.shape_hash != gen::SLOT_SHAPE {
+        return None;
+    }
     let g_btn = gen::global_id("__button_states").expect("no __button_states");
     let mut acc: Option<(runtime2::Rt2, u64)> = None;
     let mut at = 0usize;
@@ -1198,6 +1224,69 @@ fn run_chunk_tiled(
             }
         }
         at = hi;
+    }
+    let (mut acc, _) = acc?;
+    acc.boundary(ids);
+    Some(acc)
+}
+
+/// Dynamic-expand chunk executor (CELESTE_TILE=2): ONE boundary row per
+/// tile; the lane axis carries the input fan-out - `expand` doubles it
+/// in-tile (1 -> 64), so everything before the first button read (the
+/// obj.move physics, spikes, collision) runs ONCE per row as uniform
+/// ops, shared by all 64 input variants. Straddle splits still use the
+/// counter-replay tape. No set_buttons, no per-variant monomorphization.
+fn run_chunk_dynexp(
+    chunk: &runtime2::Rt2,
+    ids: &runtime2::BoundaryIds,
+) -> Option<runtime2::Rt2> {
+    // Slot binding is shape-scoped: deopt off-shape (see run_chunk_tiled).
+    if gen::N_SLOTS > 0 && chunk.shape_hash != gen::SLOT_SHAPE {
+        return None;
+    }
+    let mut acc: Option<(runtime2::Rt2, u64)> = None;
+    for row in 0..chunk.width {
+        let template: runtime3::Rt3<0xFF> = runtime3::Rt3::from_rt2(chunk, row, row + 1);
+        let mut tape: Vec<u8> = Vec::new();
+        loop {
+            let mut rt3 = template.clone();
+            rt3.tape = tape.clone();
+            rt3.begin_pass();
+            rt3.bind_slots();
+            let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                gen::call_fn(&mut rt3, gen::FN_FRAME, &[], &[]);
+            }));
+            match ok {
+                Ok(_) => {
+                    rt3.writeback_slots();
+                    let fp = rt3.structure_fp();
+                    match &mut acc {
+                        None => {
+                            let mut seed = rt3.seed_rt2();
+                            rt3.append_into(&mut seed);
+                            acc = Some((seed, fp));
+                        }
+                        Some((seed, afp)) => {
+                            if *afp != fp {
+                                return None;
+                            }
+                            rt3.append_into(seed);
+                        }
+                    }
+                    if !rt3.advance_tape() {
+                        break;
+                    }
+                    tape = rt3.tape.clone();
+                }
+                Err(payload) => match payload.downcast_ref::<runtime3::TileBail>() {
+                    Some(b) => {
+                        record_bail(b.0);
+                        return None;
+                    }
+                    None => std::panic::resume_unwind(payload),
+                },
+            }
+        }
     }
     let (mut acc, _) = acc?;
     acc.boundary(ids);

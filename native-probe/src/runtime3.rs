@@ -36,8 +36,11 @@ use celeste_rust::pico8_num::{Pico8Num, Pico8NumInterval};
 
 pub type P8 = Pico8Num;
 
-/// Tile width. 16 rows x 16 B AV = 256 B per varying value.
-pub const TILE: usize = 16;
+/// Tile width. 64 lanes x 16 B AV = 1 KB per varying value. 64 so the
+/// dynamic-expand mode (one boundary row fanned out over all 2^6 input
+/// variants IN-TILE, sharing the pre-input trunk) fits; the concrete-
+/// button mode simply runs wider row tiles.
+pub const TILE: usize = 64;
 
 /// Thrown when the tile cannot proceed; the driver falls back to Rt2.
 /// Carries the bail site (file:line) - cheap, static, and the only
@@ -78,6 +81,16 @@ pub struct Rt3<const BTN: u8 = 0> {
     pub ks: Vec<u8>,
     /// Payload pool for TCol::T (per-lane tiles).
     pub tiles: Vec<[AV; TILE]>,
+    /// log2(width) at each tile's creation, parallel to `tiles`. When
+    /// `expand` doubles the lane axis (dynamic-expand mode), OLD tiles
+    /// are never rewritten: lane j of an old tile is read as
+    /// j >> (log_w - tile_log[ix]) - each new lane descends from parent
+    /// lane j>>1, so projection is a shift. In concrete-button mode the
+    /// width never changes and every shift is 0.
+    tile_log: Vec<u8>,
+    /// log2(current width) while widths are powers of two (dynamic-
+    /// expand mode); 0 and unused otherwise.
+    log_w: u8,
     /// Slot compilation (plans/columnar-engine.md): the values of the
     /// gen::SLOT_CELLS boundary cells, bound at pass start
     /// (`bind_slots`) and written back before rows are read off
@@ -105,6 +118,16 @@ impl<const BTN: u8> Rt3<BTN> {
         assert!(w <= TILE);
         let mut tiles: Vec<[AV; TILE]> = Vec::new();
         let mut conv = |c: &Col| -> TCol {
+            // A one-row tile is uniform in EVERY column - the dynamic-
+            // expand mode's trunk sharing rests on this.
+            if w == 1 {
+                return TCol::U(match c {
+                    Col::U(a) => *a,
+                    Col::V(vs) => vs[lo],
+                    Col::N(vs) => AV::Num(vs[lo]),
+                    Col::I(vs) => AV::Ival(vs[lo].0, vs[lo].1),
+                });
+            }
             match c {
                 Col::U(a) => TCol::U(*a),
                 Col::V(vs) => {
@@ -162,7 +185,9 @@ impl<const BTN: u8> Rt3<BTN> {
             tape: Vec::new(),
             cursor: 0,
             ks: Vec::new(),
+            tile_log: vec![0; tiles.len()],
             tiles,
+            log_w: 0,
             slots: [TCol::U(AV::Nil); crate::gen::N_SLOTS],
             guard: slot_guard(),
         }
@@ -233,6 +258,8 @@ impl<const BTN: u8> Rt3<BTN> {
             cursor: self.cursor,
             ks: self.ks,
             tiles: self.tiles,
+            tile_log: self.tile_log,
+            log_w: self.log_w,
             slots: self.slots,
             guard: self.guard,
         }
@@ -268,14 +295,28 @@ impl<const BTN: u8> Rt3<BTN> {
     pub fn tat(&self, c: TCol, lane: usize) -> AV {
         match c {
             TCol::U(a) => a,
-            TCol::T(ix) => self.tiles[ix as usize][lane],
+            TCol::T(ix) => {
+                let shift = self.log_w - self.tile_log[ix as usize];
+                self.tiles[ix as usize][lane >> shift]
+            }
         }
+    }
+
+    /// Materialized copy of a value's first `width` lanes.
+    #[inline]
+    fn tdat(&self, c: TCol) -> [AV; TILE] {
+        let mut o = [AV::Nil; TILE];
+        for i in 0..self.width {
+            o[i] = self.tat(c, i);
+        }
+        o
     }
 
     #[inline]
     fn put_tile(&mut self, t: [AV; TILE]) -> TCol {
         let ix = self.tiles.len() as u32;
         self.tiles.push(t);
+        self.tile_log.push(self.log_w);
         TCol::T(ix)
     }
 
@@ -283,10 +324,9 @@ impl<const BTN: u8> Rt3<BTN> {
         match id {
             TCol::U(AV::Ptr(p)) => p,
             TCol::U(_) => bail(),
-            TCol::T(ix) => {
-                let v = &self.tiles[ix as usize];
-                let AV::Ptr(p) = v[0] else { bail() };
-                if !v[..self.width].iter().all(|a| matches!(a, AV::Ptr(q) if *q == p)) {
+            c @ TCol::T(_) => {
+                let AV::Ptr(p) = self.tat(c, 0) else { bail() };
+                if !(0..self.width).all(|i| matches!(self.tat(c, i), AV::Ptr(q) if q == p)) {
                     bail();
                 }
                 p
@@ -461,9 +501,8 @@ impl<const BTN: u8> Rt3<BTN> {
             };
             match col {
                 TCol::U(a) => vs.extend(std::iter::repeat(*a).take(lanes.len())),
-                TCol::T(ix) => {
-                    let t = &self.tiles[*ix as usize];
-                    vs.extend(lanes.iter().map(|&i| t[i]));
+                c @ TCol::T(_) => {
+                    vs.extend(lanes.iter().map(|&i| self.tat(*c, i)));
                 }
             }
             *acol = Col::V(vs);
@@ -738,17 +777,37 @@ impl<const BTN: u8> Engine for Rt3<BTN> {
         out
     }
 
-    /// Buttons are concrete on this path; a UBool reaching expand means
-    /// the driver forgot set_buttons - bail to the reference engine.
+    /// Concrete-button mode: bools pass through (a UBool means the
+    /// driver forgot set_buttons). Dynamic-expand mode: a uniform UBool
+    /// DOUBLES the lane axis in-tile - new lane j descends from parent
+    /// lane j>>1 and gets button value j&1; existing tiles are read
+    /// through the shift projection (tat), never rewritten. This is the
+    /// trunk-sharing fan-out: everything before the first expand ran
+    /// once, uniformly, for all input variants.
     fn expand(&mut self, v: TCol) -> TCol {
         match v {
             TCol::U(AV::Bool(_)) => v,
-            TCol::T(ix)
-                if self.tiles[ix as usize][..self.width]
-                    .iter()
-                    .all(|a| matches!(a, AV::Bool(_))) =>
+            TCol::U(AV::UBool) => {
+                let nw = self.width * 2;
+                if nw > TILE || !self.width.is_power_of_two() {
+                    bail();
+                }
+                let old_valid = self.valid;
+                for j in 0..nw {
+                    self.valid[j] = old_valid[j >> 1];
+                }
+                self.width = nw;
+                self.log_w += 1;
+                let mut t = [AV::Nil; TILE];
+                for (j, slot) in t.iter_mut().enumerate().take(nw) {
+                    *slot = AV::Bool(j & 1 == 1);
+                }
+                self.put_tile(t)
+            }
+            c @ TCol::T(_)
+                if (0..self.width).all(|i| matches!(self.tat(c, i), AV::Bool(_))) =>
             {
-                v
+                c
             }
             _ => bail(),
         }
@@ -759,6 +818,11 @@ impl<const BTN: u8> Engine for Rt3<BTN> {
     /// it) - disagreement means a mis-resolved site: bail loudly to Rt2.
     #[inline(always)]
     fn expand_btn<const K: u32>(&mut self, v: TCol) -> TCol {
+        // BTN 0xFF = the dynamic-expand mode sentinel: no variant
+        // specialization, every button fans out in-tile.
+        if BTN == 0xFF {
+            return self.expand(v);
+        }
         // Only the bits this variant type is specialized on fold; other
         // buttons pass their (concrete) cell value through.
         if K == 4 || K == 5 {
@@ -775,10 +839,9 @@ impl<const BTN: u8> Engine for Rt3<BTN> {
     fn truthy_b(&mut self, v: TCol, _site: u32) -> bool {
         match v {
             TCol::U(a) => av_truthy(a),
-            TCol::T(ix) => {
-                let vs = &self.tiles[ix as usize];
-                let t = av_truthy(vs[0]);
-                if !vs[..self.width].iter().all(|a| av_truthy(*a) == t) {
+            c @ TCol::T(_) => {
+                let t = av_truthy(self.tat(c, 0));
+                if !(0..self.width).all(|i| av_truthy(self.tat(c, i)) == t) {
                     bail();
                 }
                 t
@@ -820,10 +883,8 @@ impl<const BTN: u8> Engine for Rt3<BTN> {
     fn assert_true(&mut self, v: TCol, _ctx: &str) {
         match v {
             TCol::U(AV::Bool(true)) => {}
-            TCol::T(ix)
-                if self.tiles[ix as usize][..self.width]
-                    .iter()
-                    .all(|a| matches!(a, AV::Bool(true))) => {}
+            c @ TCol::T(_)
+                if (0..self.width).all(|i| matches!(self.tat(c, i), AV::Bool(true))) => {}
             _ => bail(),
         }
     }
@@ -932,13 +993,11 @@ impl<const BTN: u8> Engine for Rt3<BTN> {
                 let needs = match d {
                     TCol::U(AV::Num(_)) => false,
                     TCol::U(AV::Ival(a, b)) => a.flr() != b.flr(),
-                    TCol::T(ix) => {
-                        self.tiles[ix as usize][..self.width].iter().any(|v| match v {
-                            AV::Ival(a, b) => a.flr() != b.flr(),
-                            AV::Num(_) => false,
-                            _ => bail(),
-                        })
-                    }
+                    c @ TCol::T(_) => (0..self.width).any(|i| match self.tat(c, i) {
+                        AV::Ival(a, b) => a.flr() != b.flr(),
+                        AV::Num(_) => false,
+                        _ => bail(),
+                    }),
                     _ => bail(),
                 };
                 if !needs {
@@ -952,10 +1011,7 @@ impl<const BTN: u8> Engine for Rt3<BTN> {
                         _ => Vec::new(),
                     }
                 };
-                let dat: [AV; TILE] = match d {
-                    TCol::U(a) => [a; TILE],
-                    TCol::T(ix) => self.tiles[ix as usize],
-                };
+                let dat: [AV; TILE] = self.tdat(d);
                 self.split_site(
                     |i| match dat[i] {
                         AV::Num(_) => 1,
@@ -1014,17 +1070,14 @@ impl<const BTN: u8> Engine for Rt3<BTN> {
                 };
                 let needs = match d {
                     TCol::U(v) => lane_alts(v).len() > 1,
-                    TCol::T(ix) => self.tiles[ix as usize][..self.width]
-                        .iter()
-                        .any(|v| lane_alts(*v).len() > 1),
+                    c @ TCol::T(_) => {
+                        (0..self.width).any(|i| lane_alts(self.tat(c, i)).len() > 1)
+                    }
                 };
                 if !needs {
                     return self.map1(args[0], |v| lane_alts(v)[0]);
                 }
-                let dat: [AV; TILE] = match d {
-                    TCol::U(a) => [a; TILE],
-                    TCol::T(ix) => self.tiles[ix as usize],
-                };
+                let dat: [AV; TILE] = self.tdat(d);
                 self.split_site(|i| lane_alts(dat[i]).len(), |i, k| lane_alts(dat[i])[k])
             }
             BI_ADD => {

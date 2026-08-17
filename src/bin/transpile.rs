@@ -84,6 +84,9 @@ struct SlotMap {
     dense: Vec<Option<u32>>,
     /// Canonical cell per DENSE slot (what gen.rs SLOT_CELLS emits).
     dense_cells: Vec<u32>,
+    /// Canonical shape hash of the census states: the slot cell ids are
+    /// only meaningful on this shape; runtimes must deopt off-shape.
+    shape_hash: u64,
 }
 
 impl SlotMap {
@@ -110,6 +113,9 @@ impl SlotMap {
             bad: Default::default(),
             dense: Vec::new(),
             dense_cells: Vec::new(),
+            shape_hash: json["shape_hash"]
+                .as_u64()
+                .context("slot map: no shape_hash (regenerate with --emit-slots)")?,
         })
     }
 
@@ -842,8 +848,16 @@ fn main() -> Result<()> {
     );
     out.push_str(&format!("pub const N_SLOTS: usize = {};\n", slot_cells.len()));
     out.push_str(&format!(
-        "pub static SLOT_CELLS: &[u32] = &{:?};\n\n",
+        "pub static SLOT_CELLS: &[u32] = &{:?};\n",
         slot_cells
+    ));
+    out.push_str(
+        "/// Canonical shape hash the slot binding is valid for; slot\n\
+         /// engines must deopt on any other shape.\n",
+    );
+    out.push_str(&format!(
+        "pub const SLOT_SHAPE: u64 = {:#018x};\n\n",
+        gen.slots.as_ref().map(|s| s.shape_hash).unwrap_or(0)
     ));
     out.push_str(
         "pub fn global_id(name: &str) -> Option<u32> {\n    \

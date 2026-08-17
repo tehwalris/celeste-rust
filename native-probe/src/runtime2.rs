@@ -1863,6 +1863,49 @@ impl Rt2 {
     /// Then: reachability BFS from globals over the shared structure (the
     /// per-frame GC + canonical cell order), per-lane 128-bit row hash
     /// over live value cells, dedup, compact columns to survivors.
+    /// The block's shape key: a hash of the (canonical) structure and
+    /// globals. Meaningful for comparison only when the structure is in
+    /// canonical order (post-boundary, or a BFS import). The slot
+    /// binding (gen::SLOT_SHAPE) is scoped to ONE shape by this key.
+    pub fn shape_hash_of(&self) -> u64 {
+        use std::hash::Hasher;
+        let mut h = rustc_hash::FxHasher::default();
+        for cell in &self.structure {
+            match cell {
+                Cell2::Val => h.write_u8(1),
+                Cell2::Obj(fields) => {
+                    h.write_u8(2);
+                    h.write_usize(fields.len());
+                    for (k, t) in fields {
+                        h.write_u32(*k);
+                        h.write_u32(*t);
+                    }
+                }
+                Cell2::Arr(items) => {
+                    h.write_u8(3);
+                    h.write_usize(items.len());
+                    for t in items {
+                        h.write_u32(*t);
+                    }
+                }
+                Cell2::Unk => h.write_u8(4),
+                Cell2::Clo(f, caps) => {
+                    h.write_u8(5);
+                    h.write_u32(*f);
+                    h.write_usize(caps.len());
+                }
+                Cell2::Bi(b) => {
+                    h.write_u8(6);
+                    h.write_u32(*b);
+                }
+            }
+        }
+        for g in self.globals.iter() {
+            h.write_u32(*g);
+        }
+        h.finish()
+    }
+
     pub fn boundary(&mut self, ids: &BoundaryIds) -> usize {
         // Materialize every stale column - the boundary walks whole
         // columns (BFS pointer scan, hashing, compaction).
@@ -2069,44 +2112,7 @@ impl Rt2 {
         self.cols = new_cols;
 
         // Structure hash (uniform across lanes) - the block's shape key.
-        use std::hash::Hasher;
-        let shape_hash = {
-            let mut h = rustc_hash::FxHasher::default();
-            for cell in &self.structure {
-                match cell {
-                    Cell2::Val => h.write_u8(1),
-                    Cell2::Obj(fields) => {
-                        h.write_u8(2);
-                        h.write_usize(fields.len());
-                        for (k, t) in fields {
-                            h.write_u32(*k);
-                            h.write_u32(*t);
-                        }
-                    }
-                    Cell2::Arr(items) => {
-                        h.write_u8(3);
-                        h.write_usize(items.len());
-                        for t in items {
-                            h.write_u32(*t);
-                        }
-                    }
-                    Cell2::Unk => h.write_u8(4),
-                    Cell2::Clo(f, caps) => {
-                        h.write_u8(5);
-                        h.write_u32(*f);
-                        h.write_usize(caps.len());
-                    }
-                    Cell2::Bi(b) => {
-                        h.write_u8(6);
-                        h.write_u32(*b);
-                    }
-                }
-            }
-            for g in self.globals.iter() {
-                h.write_u32(*g);
-            }
-            h.finish()
-        };
+        let shape_hash = self.shape_hash_of();
         self.shape_hash = shape_hash;
 
         // Per-lane 128-bit row key over the compacted value cells:
