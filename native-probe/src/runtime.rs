@@ -639,3 +639,291 @@ impl Rt {
         )
     }
 }
+
+// ---- the Engine trait: one generated program, two runtimes ----
+//
+// The generated code (gen.rs) is emitted against this trait, so the SAME
+// program text runs on the scalar concrete runtime (`Rt`, `V = V` - the
+// hex-exact oracle instrument) and on the columnar abstract runtime
+// (`runtime2::Rt2`, `V = ColId` - lanes as columns, plans/columnar-engine.md).
+// Monomorphization makes the scalar path bit-identical in cost and
+// behavior to the pre-trait code; the 400-frame diff is the gate.
+
+/// What a call target resolves to. Captures are materialized as engine
+/// values (the scalar engine copies `V`s; the columnar engine clones the
+/// capture columns into fresh arena slots).
+pub enum Callee<V> {
+    Fn(u32, Vec<V>),
+    Bi(u32),
+}
+
+pub trait Engine: Sized {
+    type V: Copy + std::fmt::Debug;
+
+    // constants
+    fn c_num(&mut self, hi: i16, lo: u16) -> Self::V;
+    fn c_bool(&mut self, b: bool) -> Self::V;
+    fn c_str(&mut self, s: u32) -> Self::V;
+    fn c_nil(&mut self) -> Self::V;
+
+    // heap
+    fn alloc_nil(&mut self) -> Self::V;
+    fn get_global(&mut self, g: u32, create: bool) -> Self::V;
+    fn load(&mut self, v: Self::V) -> Self::V;
+    fn store(&mut self, t: Self::V, s: Self::V);
+    fn store_empty_table(&mut self, t: Self::V);
+    fn store_closure(&mut self, t: Self::V, f: u32, caps: &[Self::V]);
+    fn get_field(&mut self, recv: Self::V, f: u32, create: bool, site: u32) -> Self::V;
+    fn get_index(&mut self, recv: Self::V, idx: Self::V, create: bool, site: u32) -> Self::V;
+
+    // ops
+    fn op_add(&mut self, l: Self::V, r: Self::V) -> Self::V;
+    fn op_sub(&mut self, l: Self::V, r: Self::V) -> Self::V;
+    fn op_mul(&mut self, l: Self::V, r: Self::V) -> Self::V;
+    fn op_div(&mut self, l: Self::V, r: Self::V) -> Self::V;
+    fn op_rem(&mut self, l: Self::V, r: Self::V) -> Self::V;
+    fn op_pow(&mut self, l: Self::V, r: Self::V) -> Self::V;
+    fn eq(&mut self, l: Self::V, r: Self::V) -> Self::V;
+    fn ne(&mut self, l: Self::V, r: Self::V) -> Self::V;
+    fn lt(&mut self, l: Self::V, r: Self::V) -> Self::V;
+    fn le(&mut self, l: Self::V, r: Self::V) -> Self::V;
+    fn gt(&mut self, l: Self::V, r: Self::V) -> Self::V;
+    fn ge(&mut self, l: Self::V, r: Self::V) -> Self::V;
+    fn concat(&mut self, l: Self::V, r: Self::V) -> Self::V;
+    fn un_minus(&mut self, v: Self::V) -> Self::V;
+    fn un_not(&mut self, v: Self::V) -> Self::V;
+    fn un_hash(&mut self, v: Self::V) -> Self::V;
+    fn select(&mut self, c: Self::V, t: Self::V, f: Self::V) -> Self::V;
+    fn expand(&mut self, v: Self::V) -> Self::V;
+
+    // control / liveness
+    fn truthy_b(&mut self, v: Self::V, site: u32) -> bool;
+    fn kill(&mut self, vs: &[Self::V]);
+
+    // guards
+    fn assert_closure(&mut self, v: Self::V, f: u32, caps: &[Self::V], ctx: &str);
+    fn assert_pointer(&mut self, v: Self::V, ctx: &str);
+    fn assert_value_cell(&mut self, v: Self::V, ctx: &str);
+    fn assert_true(&mut self, v: Self::V, ctx: &str);
+    fn assert_builtin(&mut self, v: Self::V, b: u32);
+
+    // builtins
+    fn bi_min(&mut self, l: Self::V, r: Self::V) -> Self::V;
+    fn bi_max(&mut self, l: Self::V, r: Self::V) -> Self::V;
+    fn bi_abs(&mut self, v: Self::V) -> Self::V;
+    fn bi_flr(&mut self, v: Self::V) -> Self::V;
+    fn bi_sin(&mut self, v: Self::V) -> Self::V;
+    fn bi_mget(&mut self, x: Self::V, y: Self::V) -> Self::V;
+    fn bi_tile_flag_at(
+        &mut self,
+        x: Self::V,
+        y: Self::V,
+        w: Self::V,
+        h: Self::V,
+        f: Self::V,
+    ) -> Self::V;
+    fn call_builtin(&mut self, b: u32, args: &[Self::V]) -> Self::V;
+    fn callee_of(&mut self, c: Self::V, ctx: &str) -> Callee<Self::V>;
+}
+
+impl Engine for Rt {
+    type V = V;
+
+    #[inline(always)]
+    fn c_num(&mut self, hi: i16, lo: u16) -> V {
+        V::Num(P8::from_parts(hi, lo))
+    }
+    #[inline(always)]
+    fn c_bool(&mut self, b: bool) -> V {
+        V::Bool(b)
+    }
+    #[inline(always)]
+    fn c_str(&mut self, s: u32) -> V {
+        V::Str(s)
+    }
+    #[inline(always)]
+    fn c_nil(&mut self) -> V {
+        V::Nil
+    }
+
+    #[inline(always)]
+    fn alloc_nil(&mut self) -> V {
+        Rt::alloc_nil(self)
+    }
+    #[inline(always)]
+    fn get_global(&mut self, g: u32, create: bool) -> V {
+        Rt::get_global(self, g, create)
+    }
+    #[inline(always)]
+    fn load(&mut self, v: V) -> V {
+        Rt::load(self, v)
+    }
+    #[inline(always)]
+    fn store(&mut self, t: V, s: V) {
+        Rt::store(self, t, s)
+    }
+    #[inline(always)]
+    fn store_empty_table(&mut self, t: V) {
+        Rt::store_empty_table(self, t)
+    }
+    #[inline(always)]
+    fn store_closure(&mut self, t: V, f: u32, caps: &[V]) {
+        Rt::store_closure(self, t, f, caps)
+    }
+    #[inline(always)]
+    fn get_field(&mut self, recv: V, f: u32, create: bool, site: u32) -> V {
+        Rt::get_field(self, recv, f, create, site)
+    }
+    #[inline(always)]
+    fn get_index(&mut self, recv: V, idx: V, create: bool, site: u32) -> V {
+        Rt::get_index(self, recv, idx, create, site)
+    }
+
+    #[inline(always)]
+    fn op_add(&mut self, l: V, r: V) -> V {
+        Rt::op_add(self, l, r)
+    }
+    #[inline(always)]
+    fn op_sub(&mut self, l: V, r: V) -> V {
+        Rt::op_sub(self, l, r)
+    }
+    #[inline(always)]
+    fn op_mul(&mut self, l: V, r: V) -> V {
+        Rt::op_mul(self, l, r)
+    }
+    #[inline(always)]
+    fn op_div(&mut self, l: V, r: V) -> V {
+        Rt::op_div(self, l, r)
+    }
+    #[inline(always)]
+    fn op_rem(&mut self, l: V, r: V) -> V {
+        Rt::op_rem(self, l, r)
+    }
+    #[inline(always)]
+    fn op_pow(&mut self, l: V, r: V) -> V {
+        Rt::op_pow(self, l, r)
+    }
+    #[inline(always)]
+    fn eq(&mut self, l: V, r: V) -> V {
+        Rt::eq(self, l, r)
+    }
+    #[inline(always)]
+    fn ne(&mut self, l: V, r: V) -> V {
+        Rt::ne(self, l, r)
+    }
+    #[inline(always)]
+    fn lt(&mut self, l: V, r: V) -> V {
+        Rt::lt(self, l, r)
+    }
+    #[inline(always)]
+    fn le(&mut self, l: V, r: V) -> V {
+        Rt::le(self, l, r)
+    }
+    #[inline(always)]
+    fn gt(&mut self, l: V, r: V) -> V {
+        Rt::gt(self, l, r)
+    }
+    #[inline(always)]
+    fn ge(&mut self, l: V, r: V) -> V {
+        Rt::ge(self, l, r)
+    }
+    #[inline(always)]
+    fn concat(&mut self, l: V, r: V) -> V {
+        Rt::concat(self, l, r)
+    }
+    #[inline(always)]
+    fn un_minus(&mut self, v: V) -> V {
+        Rt::un_minus(self, v)
+    }
+    #[inline(always)]
+    fn un_not(&mut self, v: V) -> V {
+        Rt::un_not(self, v)
+    }
+    #[inline(always)]
+    fn un_hash(&mut self, v: V) -> V {
+        Rt::un_hash(self, v)
+    }
+    #[inline(always)]
+    fn select(&mut self, c: V, t: V, f: V) -> V {
+        if self.sel_bool(c) {
+            t
+        } else {
+            f
+        }
+    }
+    #[inline(always)]
+    fn expand(&mut self, v: V) -> V {
+        Rt::expand(self, v)
+    }
+
+    #[inline(always)]
+    fn truthy_b(&mut self, v: V, site: u32) -> bool {
+        Rt::truthy_b(self, v, site)
+    }
+    #[inline(always)]
+    fn kill(&mut self, _vs: &[V]) {}
+
+    #[inline(always)]
+    fn assert_closure(&mut self, v: V, f: u32, caps: &[V], ctx: &str) {
+        Rt::assert_closure(self, v, f, caps, ctx)
+    }
+    #[inline(always)]
+    fn assert_pointer(&mut self, v: V, ctx: &str) {
+        Rt::assert_pointer(self, v, ctx)
+    }
+    #[inline(always)]
+    fn assert_value_cell(&mut self, v: V, ctx: &str) {
+        Rt::assert_value_cell(self, v, ctx)
+    }
+    #[inline(always)]
+    fn assert_true(&mut self, v: V, ctx: &str) {
+        Rt::assert_true(self, v, ctx)
+    }
+    #[inline(always)]
+    fn assert_builtin(&mut self, v: V, b: u32) {
+        Rt::assert_builtin(self, v, b)
+    }
+
+    #[inline(always)]
+    fn bi_min(&mut self, l: V, r: V) -> V {
+        Rt::bi_min(self, l, r)
+    }
+    #[inline(always)]
+    fn bi_max(&mut self, l: V, r: V) -> V {
+        Rt::bi_max(self, l, r)
+    }
+    #[inline(always)]
+    fn bi_abs(&mut self, v: V) -> V {
+        Rt::bi_abs(self, v)
+    }
+    #[inline(always)]
+    fn bi_flr(&mut self, v: V) -> V {
+        Rt::bi_flr(self, v)
+    }
+    #[inline(always)]
+    fn bi_sin(&mut self, v: V) -> V {
+        Rt::bi_sin(self, v)
+    }
+    #[inline(always)]
+    fn bi_mget(&mut self, x: V, y: V) -> V {
+        Rt::bi_mget(self, x, y)
+    }
+    #[inline(always)]
+    fn bi_tile_flag_at(&mut self, x: V, y: V, w: V, h: V, f: V) -> V {
+        Rt::bi_tile_flag_at(self, x, y, w, h, f)
+    }
+    #[inline(always)]
+    fn call_builtin(&mut self, b: u32, args: &[V]) -> V {
+        Rt::call_builtin(self, b, args)
+    }
+    fn callee_of(&mut self, c: V, ctx: &str) -> Callee<V> {
+        let V::Ptr(p) = c else {
+            panic!("call on a non-pointer at {}: {:?}", ctx, c)
+        };
+        match &self.heap[p as usize] {
+            Cell::Clo(f, caps) => Callee::Fn(*f, caps.to_vec()),
+            Cell::Bi(b) => Callee::Bi(*b),
+            other => panic!("call on a non-callable cell: {:?}", other),
+        }
+    }
+}

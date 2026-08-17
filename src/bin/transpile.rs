@@ -251,19 +251,19 @@ impl Gen {
                 let bits = value.to_bits();
                 writeln!(
                     out,
-                    "{} = V::Num(P8::from_parts({}, {})); // {:?}",
+                    "{} = rt.c_num({}, {}); // {:?}",
                     d,
                     (bits >> 16) as i16,
                     bits as u16,
                     value
                 )?;
             }
-            Instruction::BoolConstant { value } => writeln!(out, "{} = V::Bool({});", d, value)?,
+            Instruction::BoolConstant { value } => writeln!(out, "{} = rt.c_bool({});", d, value)?,
             Instruction::StringConstant { value } => {
                 let s = self.strings.intern(value);
-                writeln!(out, "{} = V::Str({}); // {:?}", d, s, value)?;
+                writeln!(out, "{} = rt.c_str({}); // {:?}", d, s, value)?;
             }
-            Instruction::NilConstant => writeln!(out, "{} = V::Nil;", d)?,
+            Instruction::NilConstant => writeln!(out, "{} = rt.c_nil();", d)?,
             Instruction::Call { closure, args } => {
                 let args: Vec<String> = args.iter().map(|a| l(*a)).collect();
                 writeln!(
@@ -322,14 +322,17 @@ impl Gen {
             Instruction::Select { condition, if_true, if_false } => {
                 writeln!(
                     out,
-                    "{} = if rt.sel_bool({}) {{ {} }} else {{ {} }};",
+                    "{} = rt.select({}, {}, {});",
                     d,
                     l(*condition),
                     l(*if_true),
                     l(*if_false)
                 )?;
             }
-            Instruction::Kill { .. } => {} // deadness annotation; nothing to run
+            Instruction::Kill { .. } => {
+                let used: Vec<String> = instr.get_used_locals().into_iter().map(l).collect();
+                writeln!(out, "rt.kill(&[{}]);", used.join(", "))?;
+            }
             Instruction::AssertClosure { value, fun_def, captures } => {
                 let f = *self
                     .fn_ids
@@ -387,9 +390,9 @@ impl Gen {
 
         let mut out = String::new();
         writeln!(out, "/// `{}`", fn_name)?;
-        writeln!(out, "pub fn f_{}(rt: &mut Rt, caps: &[V], args: &[V]) -> V {{", fn_id)?;
+        writeln!(out, "pub fn f_{}<E: Engine>(rt: &mut E, caps: &[E::V], args: &[E::V]) -> E::V {{", fn_id)?;
         for id in Self::collect_locals(fun) {
-            writeln!(out, "    let mut l{}: V = V::Nil;", id)?;
+            writeln!(out, "    let mut l{}: E::V = rt.c_nil();", id)?;
         }
         for (i, cap) in fun.capture_ids.iter().enumerate() {
             writeln!(out, "    {} = caps[{}];", l(*cap), i)?;
@@ -397,7 +400,7 @@ impl Gen {
         for (i, arg) in fun.arg_ids.iter().enumerate() {
             if let Some(arg) = arg {
                 // Missing arguments pad with Nil (core_interpreter.rs:762).
-                writeln!(out, "    {} = args.get({}).copied().unwrap_or(V::Nil);", l(*arg), i)?;
+                writeln!(out, "    {} = match args.get({}) {{ Some(v) => *v, None => rt.c_nil() }};", l(*arg), i)?;
             }
         }
         writeln!(out, "    let mut b: u32 = 0;")?;
@@ -425,7 +428,7 @@ impl Gen {
             match &block.terminator.1 {
                 Terminator::Return { value } => match value {
                     Some(v) => writeln!(body, "return {};", l(*v))?,
-                    None => writeln!(body, "return V::Nil;")?,
+                    None => writeln!(body, "return rt.c_nil();")?,
                 },
                 Terminator::UnconditionalBranch { target } => {
                     writeln!(body, "{} continue;", edge(target.as_str())?)?;
@@ -571,23 +574,14 @@ fn main() -> Result<()> {
     out.push_str(
         "/// Call through a value: closure cells dispatch on their dense fn id,\n\
          /// builtin cells go to the runtime (core_interpreter.rs:697).\n\
-         pub fn call_value(rt: &mut Rt, c: V, args: &[V], ctx: &str) -> V {\n\
-         \x20   let V::Ptr(p) = c else { panic!(\"call on a non-pointer at {}: {:?}\", ctx, c) };\n\
-         \x20   match &rt.heap[p as usize] {\n\
-         \x20       Cell::Clo(f, caps) => {\n\
-         \x20           let f = *f;\n\
-         \x20           let caps: Box<[V]> = caps.clone();\n\
-         \x20           call_fn(rt, f, &caps, args)\n\
-         \x20       }\n\
-         \x20       Cell::Bi(b) => {\n\
-         \x20           let b = *b;\n\
-         \x20           rt.call_builtin(b, args)\n\
-         \x20       }\n\
-         \x20       other => panic!(\"call on a non-callable cell: {:?}\", other),\n\
+         pub fn call_value<E: Engine>(rt: &mut E, c: E::V, args: &[E::V], ctx: &str) -> E::V {\n\
+         \x20   match rt.callee_of(c, ctx) {\n\
+         \x20       Callee::Fn(f, caps) => call_fn(rt, f, &caps, args),\n\
+         \x20       Callee::Bi(b) => rt.call_builtin(b, args),\n\
          \x20   }\n\
          }\n\n",
     );
-    out.push_str("pub fn call_fn(rt: &mut Rt, f: u32, caps: &[V], args: &[V]) -> V {\n");
+    out.push_str("pub fn call_fn<E: Engine>(rt: &mut E, f: u32, caps: &[E::V], args: &[E::V]) -> E::V {\n");
     out.push_str("    match f {\n");
     out.push_str(&dispatch);
     out.push_str("        _ => panic!(\"unknown fn id {}\", f),\n    }\n}\n\n");
