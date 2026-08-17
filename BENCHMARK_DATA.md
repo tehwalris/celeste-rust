@@ -11,7 +11,8 @@ out + f37 chase 365,029 (all configs below EXACT). 30 cores.
 | Rt3 dynamic in-tile expand (CELESTE_TILE=2), first light | 1.55 s | 8.3k |
 | + uniform-cond select pass-through | 1.49 s | 7.9k |
 | + typed panes (N=[P8;64] pool, B=u64 lane mask) | 1.32 s | 7.0k |
-| + per-chunk template, undo-log reset (no clones/row) | **1.26 s** | **6.7k** |
+| + per-chunk template, undo-log reset (no clones/row) | 1.26 s | 6.7k |
+| + typed append (Col::N stays typed through the boundary) | **1.04 s** | **5.5k** |
 
 Evening ladder, all steps EXACT + guard + gate-1-f40 gated. Post-panes
 profile: per-op arithmetic is out of the top table; the frontier is

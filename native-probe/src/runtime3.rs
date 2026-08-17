@@ -723,6 +723,25 @@ impl<const BTN: u8> Rt3<BTN> {
                     continue;
                 }
             }
+            // Typed numeric fast path: keep the accumulator Col::N when
+            // both sides are numbers (no AV construction, and the
+            // boundary gets its native typed column).
+            if let Some(src) = self.num_src(*col) {
+                let can_n = match &*acol {
+                    Col::N(_) | Col::U(AV::Num(_)) => true,
+                    _ => w == 0,
+                };
+                if can_n {
+                    let mut vs: Vec<P8> = match acol {
+                        Col::N(v) => std::mem::take(v),
+                        Col::U(AV::Num(n)) => vec![*n; w],
+                        _ => Vec::new(),
+                    };
+                    vs.extend(lanes.iter().map(|&i| self.num_at(src, i)));
+                    *acol = Col::N(vs);
+                    continue;
+                }
+            }
             // Materialize the accumulator column and extend.
             let mut vs: Vec<AV> = match acol {
                 Col::U(a) => vec![*a; w],
