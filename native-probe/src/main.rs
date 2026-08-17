@@ -526,6 +526,8 @@ fn main() {
     let mut bench_reps: Option<u32> = None;
     let mut from_checkpoint: Option<(String, u32)> = None;
     let mut abstract_frames: Option<u32> = None;
+    let mut abstract_bench: Option<(String, u32)> = None;
+    let mut reps: u32 = 10;
     let mut census_frames: u32 = 2;
     let mut max_lanes: usize = 256;
     let mut args = std::env::args().skip(1);
@@ -563,6 +565,12 @@ fn main() {
                 abstract_frames =
                     Some(args.next().expect("--abstract needs FRAMES").parse().unwrap())
             }
+            "--abstract-bench" => {
+                let dir = args.next().expect("--abstract-bench needs DIR FRAME");
+                let frame: u32 = args.next().expect("FRAME").parse().unwrap();
+                abstract_bench = Some((dir, frame));
+            }
+            "--reps" => reps = args.next().expect("value").parse().unwrap(),
             "--bench" => {
                 bench_reps = Some(args.next().expect("--bench needs a value").parse().unwrap())
             }
@@ -578,6 +586,11 @@ fn main() {
 
     if let Some(n) = abstract_frames {
         run_abstract(n);
+        return;
+    }
+
+    if let Some((dir, frame)) = abstract_bench {
+        run_abstract_bench(&dir, frame, reps);
         return;
     }
 
@@ -628,6 +641,212 @@ fn main() {
     }
 }
 
+fn boundary_ids() -> runtime2::BoundaryIds {
+    let g = |name: &str| gen::global_id(name).unwrap_or_else(|| panic!("no global {}", name));
+    let f = |name: &str| gen::field_id(name).unwrap_or_else(|| panic!("no field {}", name));
+    runtime2::BoundaryIds {
+        g_objects: g("objects"),
+        g_player: g("player"),
+        g_timers: ["frames", "seconds", "minutes", "deaths"].iter().map(|n| g(n)).collect(),
+        f_type: f("type"),
+        f_rem: f("rem"),
+        f_spd: f("spd"),
+        f_x: f("x"),
+        f_y: f("y"),
+        f_dash_effect_time: f("dash_effect_time"),
+    }
+}
+
+/// Install the panic hook that keeps SplitReq control-flow panics quiet.
+fn install_split_hook() {
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if info.payload().downcast_ref::<runtime2::SplitReq>().is_none() {
+            prev_hook(info);
+        }
+    }));
+}
+
+/// One abstract frame forward: pre-partition (freeze, moving key), chunk,
+/// run tiles across threads (SplitReq -> partition + rerun), boundary,
+/// cross-block dedup, k-way same-shape merge. Rows in -> rows out.
+fn frame_step(
+    blocks: Vec<runtime2::Rt2>,
+    ids: &runtime2::BoundaryIds,
+    g_freeze: u32,
+    census_total: &mut rustc_hash::FxHashMap<&'static str, (u64, u64, u64)>,
+) -> Vec<runtime2::Rt2> {
+let mut ran: Vec<runtime2::Rt2> = Vec::new();
+    let mut pending: Vec<runtime2::Rt2> = Vec::new();
+    // Chunk cap: mid-frame width is ~64x the input width (the btn
+    // fan-out), and per-op column traffic goes through DRAM once the
+    // working set leaves cache. ~512 input lanes keep a varying
+    // column's mid-frame buffer (~32k lanes x 16 B = 512 KB) L2-ish.
+    // Cross-chunk dedup at the boundary makes chunking invisible
+    // (batching invariance is the certified doctrine).
+    const CHUNK: usize = 64;
+    for block in blocks {
+        let freeze_cell = block.globals[g_freeze as usize];
+        assert!(freeze_cell != runtime2::NONE);
+        for sub in block.partition_by_cell(freeze_cell) {
+            let parts = match sub.moving_key(ids) {
+                Some(key) => {
+                    let key = key.clone();
+                    sub.partition_by_key(&key)
+                }
+                None => vec![sub],
+            };
+            for part in parts {
+                if part.width <= CHUNK {
+                    pending.push(part);
+                } else {
+                    let n = part.width;
+                    let mut at = 0;
+                    while at < n {
+                        let hi = (at + CHUNK).min(n);
+                        pending.push(part.slice_lanes(at, hi));
+                        at = hi;
+                    }
+                }
+            }
+        }
+    }
+    // Chunks are independent (lane independence is the certified
+    // batching-invariance property); run them across threads. Each
+    // worker owns a local pending stack seeded round-robin.
+    let n_workers = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(2).max(1))
+        .unwrap_or(1)
+        .min(pending.len().max(1));
+    let queues: Vec<Vec<runtime2::Rt2>> = {
+        let mut qs: Vec<Vec<runtime2::Rt2>> = (0..n_workers).map(|_| Vec::new()).collect();
+        for (i, b) in pending.drain(..).enumerate() {
+            qs[i % n_workers].push(b);
+        }
+        qs
+    };
+    let results: Vec<Vec<runtime2::Rt2>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = queues
+            .into_iter()
+            .map(|mut local| {
+                let ids = &ids;
+                scope.spawn(move || {
+                    let mut done: Vec<runtime2::Rt2> = Vec::new();
+                    while let Some(block) = local.pop() {
+                        let snapshot = block.clone_block();
+                        let mut sub = block;
+                        sub.begin_frame();
+                        let result =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                gen::call_fn(&mut sub, gen::FN_FRAME, &[], &[]);
+                                sub.boundary(ids);
+                            }));
+                        match result {
+                            Ok(()) => done.push(sub),
+                            Err(payload) => {
+                                match payload.downcast::<runtime2::SplitReq>() {
+                                    Ok(req) => {
+                                        let trues: Vec<u32> = (0..snapshot.width as u32)
+                                            .filter(|&i| req.origin_truth[i as usize])
+                                            .collect();
+                                        let falses: Vec<u32> = (0..snapshot.width as u32)
+                                            .filter(|&i| !req.origin_truth[i as usize])
+                                            .collect();
+                                        assert!(!trues.is_empty() && !falses.is_empty());
+                                        let mut a = snapshot.clone_block();
+                                        a.retain_lanes(&trues);
+                                        let mut b = snapshot;
+                                        b.retain_lanes(&falses);
+                                        local.push(a);
+                                        local.push(b);
+                                    }
+                                    Err(other) => std::panic::resume_unwind(other),
+                                }
+                            }
+                        }
+                    }
+                    done
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for done in results {
+        ran.extend(done);
+    }
+    for sub in ran.iter_mut() {
+        sub.drain_census(census_total);
+    }
+    // Drop rows already seen this frame (SHARDED parallel dedup: a
+    // row's shard is a function of its key, so shards are
+    // independent; first-occurrence order within the block sequence
+    // is preserved per shard, and the surviving SET - which is all
+    // identity requires - is order-independent), then k-way merge
+    // same-shape blocks.
+    let n_shards = 32usize;
+    let keeps: Vec<Vec<u32>> = {
+        // (block, lane, key) triples grouped by shard, in block order.
+        let mut per_shard_keeps: Vec<Vec<Vec<u32>>> =
+            (0..n_shards).map(|_| vec![Vec::new(); ran.len()]).collect();
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..n_shards)
+                .map(|shard| {
+                    let ran = &ran;
+                    scope.spawn(move || {
+                        let mut seen: rustc_hash::FxHashMap<(u64, u64), ()> =
+                            Default::default();
+                        let mut keeps: Vec<Vec<u32>> = vec![Vec::new(); ran.len()];
+                        for (bi, sub) in ran.iter().enumerate() {
+                            for (i, &k) in sub.row_keys.iter().enumerate() {
+                                if (k.0 as usize) % n_shards != shard {
+                                    continue;
+                                }
+                                if let std::collections::hash_map::Entry::Vacant(e) =
+                                    seen.entry(k)
+                                {
+                                    e.insert(());
+                                    keeps[bi].push(i as u32);
+                                }
+                            }
+                        }
+                        keeps
+                    })
+                })
+                .collect();
+            for (shard, h) in handles.into_iter().enumerate() {
+                per_shard_keeps[shard] = h.join().unwrap();
+            }
+        });
+        // Merge shards' keeps per block, sorted (retain_lanes needs
+        // ascending indices).
+        (0..ran.len())
+            .map(|bi| {
+                let mut keep: Vec<u32> = per_shard_keeps
+                    .iter()
+                    .flat_map(|s| s[bi].iter().copied())
+                    .collect();
+                keep.sort_unstable();
+                keep
+            })
+            .collect()
+    };
+    let mut groups: Vec<(u64, Vec<runtime2::Rt2>)> = Vec::new();
+    for (mut sub, keep) in ran.into_iter().zip(keeps) {
+        sub.retain_lanes(&keep);
+        if sub.width == 0 {
+            continue;
+        }
+        match groups.iter_mut().find(|(h, _)| *h == sub.shape_hash) {
+            Some((_, g)) => g.push(sub),
+            None => groups.push((sub.shape_hash, vec![sub])),
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(_, g)| runtime2::Rt2::merge_many(g))
+        .collect()
+}
+
 /// The columnar abstract engine (plans/columnar-engine.md): run the level-0
 /// abstract search natively for N frames from the room start, printing
 /// per-frame lane counts - gate 1 is exact equality with
@@ -641,27 +860,9 @@ fn main() {
 fn run_abstract(num_frames: u32) {
     let rt = build_rt();
     let rt2 = runtime2::Rt2::from_scalar(&rt);
-    let g = |name: &str| gen::global_id(name).unwrap_or_else(|| panic!("no global {}", name));
-    let f = |name: &str| gen::field_id(name).unwrap_or_else(|| panic!("no field {}", name));
-    let ids = runtime2::BoundaryIds {
-        g_objects: g("objects"),
-        g_player: g("player"),
-        g_timers: ["frames", "seconds", "minutes", "deaths"].iter().map(|n| g(n)).collect(),
-        f_type: f("type"),
-        f_rem: f("rem"),
-        f_spd: f("spd"),
-        f_x: f("x"),
-        f_y: f("y"),
-        f_dash_effect_time: f("dash_effect_time"),
-    };
-    let g_freeze = g("freeze");
-    // SplitReq panics are control flow, not errors - keep them off stderr.
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        if info.payload().downcast_ref::<runtime2::SplitReq>().is_none() {
-            prev_hook(info);
-        }
-    }));
+    let ids = boundary_ids();
+    let g_freeze = gen::global_id("freeze").expect("no freeze global");
+    install_split_hook();
     let mut blocks: Vec<runtime2::Rt2> = vec![rt2];
     let mut census_total: rustc_hash::FxHashMap<&'static str, (u64, u64, u64)> =
         Default::default();
@@ -673,175 +874,7 @@ fn run_abstract(num_frames: u32) {
         // genuinely divergent branch throws a SplitReq with the
         // per-frame-start-lane truth of the condition; partition the
         // frame-start block by it and rerun both sides.
-        let mut ran: Vec<runtime2::Rt2> = Vec::new();
-        let mut pending: Vec<runtime2::Rt2> = Vec::new();
-        // Chunk cap: mid-frame width is ~64x the input width (the btn
-        // fan-out), and per-op column traffic goes through DRAM once the
-        // working set leaves cache. ~512 input lanes keep a varying
-        // column's mid-frame buffer (~32k lanes x 16 B = 512 KB) L2-ish.
-        // Cross-chunk dedup at the boundary makes chunking invisible
-        // (batching invariance is the certified doctrine).
-        const CHUNK: usize = 64;
-        for block in blocks.drain(..) {
-            let freeze_cell = block.globals[g_freeze as usize];
-            assert!(freeze_cell != runtime2::NONE);
-            for sub in block.partition_by_cell(freeze_cell) {
-                let parts = match sub.moving_key(&ids) {
-                    Some(key) => {
-                        let key = key.clone();
-                        sub.partition_by_key(&key)
-                    }
-                    None => vec![sub],
-                };
-                for part in parts {
-                    if part.width <= CHUNK {
-                        pending.push(part);
-                    } else {
-                        let n = part.width;
-                        let mut at = 0;
-                        while at < n {
-                            let hi = (at + CHUNK).min(n);
-                            pending.push(part.slice_lanes(at, hi));
-                            at = hi;
-                        }
-                    }
-                }
-            }
-        }
-        // Chunks are independent (lane independence is the certified
-        // batching-invariance property); run them across threads. Each
-        // worker owns a local pending stack seeded round-robin.
-        let n_workers = std::thread::available_parallelism()
-            .map(|n| n.get().saturating_sub(2).max(1))
-            .unwrap_or(1)
-            .min(pending.len().max(1));
-        let queues: Vec<Vec<runtime2::Rt2>> = {
-            let mut qs: Vec<Vec<runtime2::Rt2>> = (0..n_workers).map(|_| Vec::new()).collect();
-            for (i, b) in pending.drain(..).enumerate() {
-                qs[i % n_workers].push(b);
-            }
-            qs
-        };
-        let results: Vec<Vec<runtime2::Rt2>> = std::thread::scope(|scope| {
-            let handles: Vec<_> = queues
-                .into_iter()
-                .map(|mut local| {
-                    let ids = &ids;
-                    scope.spawn(move || {
-                        let mut done: Vec<runtime2::Rt2> = Vec::new();
-                        while let Some(block) = local.pop() {
-                            let snapshot = block.clone_block();
-                            let mut sub = block;
-                            sub.begin_frame();
-                            let result =
-                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    gen::call_fn(&mut sub, gen::FN_FRAME, &[], &[]);
-                                    sub.boundary(ids);
-                                }));
-                            match result {
-                                Ok(()) => done.push(sub),
-                                Err(payload) => {
-                                    match payload.downcast::<runtime2::SplitReq>() {
-                                        Ok(req) => {
-                                            let trues: Vec<u32> = (0..snapshot.width as u32)
-                                                .filter(|&i| req.origin_truth[i as usize])
-                                                .collect();
-                                            let falses: Vec<u32> = (0..snapshot.width as u32)
-                                                .filter(|&i| !req.origin_truth[i as usize])
-                                                .collect();
-                                            assert!(!trues.is_empty() && !falses.is_empty());
-                                            let mut a = snapshot.clone_block();
-                                            a.retain_lanes(&trues);
-                                            let mut b = snapshot;
-                                            b.retain_lanes(&falses);
-                                            local.push(a);
-                                            local.push(b);
-                                        }
-                                        Err(other) => std::panic::resume_unwind(other),
-                                    }
-                                }
-                            }
-                        }
-                        done
-                    })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-        for done in results {
-            ran.extend(done);
-        }
-        for sub in ran.iter_mut() {
-            sub.drain_census(&mut census_total);
-        }
-        // Drop rows already seen this frame (SHARDED parallel dedup: a
-        // row's shard is a function of its key, so shards are
-        // independent; first-occurrence order within the block sequence
-        // is preserved per shard, and the surviving SET - which is all
-        // identity requires - is order-independent), then k-way merge
-        // same-shape blocks.
-        let n_shards = 32usize;
-        let keeps: Vec<Vec<u32>> = {
-            // (block, lane, key) triples grouped by shard, in block order.
-            let mut per_shard_keeps: Vec<Vec<Vec<u32>>> =
-                (0..n_shards).map(|_| vec![Vec::new(); ran.len()]).collect();
-            std::thread::scope(|scope| {
-                let handles: Vec<_> = (0..n_shards)
-                    .map(|shard| {
-                        let ran = &ran;
-                        scope.spawn(move || {
-                            let mut seen: rustc_hash::FxHashMap<(u64, u64), ()> =
-                                Default::default();
-                            let mut keeps: Vec<Vec<u32>> = vec![Vec::new(); ran.len()];
-                            for (bi, sub) in ran.iter().enumerate() {
-                                for (i, &k) in sub.row_keys.iter().enumerate() {
-                                    if (k.0 as usize) % n_shards != shard {
-                                        continue;
-                                    }
-                                    if let std::collections::hash_map::Entry::Vacant(e) =
-                                        seen.entry(k)
-                                    {
-                                        e.insert(());
-                                        keeps[bi].push(i as u32);
-                                    }
-                                }
-                            }
-                            keeps
-                        })
-                    })
-                    .collect();
-                for (shard, h) in handles.into_iter().enumerate() {
-                    per_shard_keeps[shard] = h.join().unwrap();
-                }
-            });
-            // Merge shards' keeps per block, sorted (retain_lanes needs
-            // ascending indices).
-            (0..ran.len())
-                .map(|bi| {
-                    let mut keep: Vec<u32> = per_shard_keeps
-                        .iter()
-                        .flat_map(|s| s[bi].iter().copied())
-                        .collect();
-                    keep.sort_unstable();
-                    keep
-                })
-                .collect()
-        };
-        let mut groups: Vec<(u64, Vec<runtime2::Rt2>)> = Vec::new();
-        for (mut sub, keep) in ran.into_iter().zip(keeps) {
-            sub.retain_lanes(&keep);
-            if sub.width == 0 {
-                continue;
-            }
-            match groups.iter_mut().find(|(h, _)| *h == sub.shape_hash) {
-                Some((_, g)) => g.push(sub),
-                None => groups.push((sub.shape_hash, vec![sub])),
-            }
-        }
-        blocks = groups
-            .into_iter()
-            .map(|(_, g)| runtime2::Rt2::merge_many(g))
-            .collect();
+        blocks = frame_step(blocks, &ids, g_freeze, &mut census_total);
         let lanes: usize = blocks.iter().map(|b| b.width).sum();
         let (splits, appended, arena_peak): (u64, u64, usize) = blocks.iter().fold(
             (0, 0, 0),
@@ -863,6 +896,107 @@ fn run_abstract(num_frames: u32) {
         let mut rows: Vec<_> = census_total.into_iter().collect();
         rows.sort_by_key(|(_, (ns, _, _))| std::cmp::Reverse(*ns));
         println!("op census (name, total ms, calls):");
+        for (name, (ns, calls, _)) in rows {
+            println!("  {:14} {:9.1} ms  {:>12} calls", name, ns as f64 / 1e6, calls);
+        }
+    }
+}
+
+/// The dev-loop benchmark (plans/columnar-engine.md): ONE abstract frame
+/// forward from REAL boundary states of an existing checkpoint dir, with
+/// the interpreter's own next-frame lane count as a built-in oracle.
+///
+///   native-probe --abstract-bench ~/celeste-checkpoints/room10-newlua-bench 35 --reps 10
+fn run_abstract_bench(dir: &str, frame: u32, reps: u32) {
+    let rt = build_rt(); // cart + collision cache (the __init run is incidental)
+    let ids = boundary_ids();
+    let g_freeze = gen::global_id("freeze").expect("no freeze global");
+    install_split_hook();
+
+    let t_load = std::time::Instant::now();
+    let states = load_states_any(dir, frame);
+    let blocks: Vec<runtime2::Rt2> = states
+        .iter()
+        .map(|st| import::import_block(st, rt.cart.clone(), rt.cache.clone()))
+        .collect();
+    let lanes_in: usize = blocks.iter().map(|b| b.width).sum();
+    // The interpreter's own answer at the NEXT EXISTING checkpoint (bench
+    // dirs save every few frames): run that many frames once for the
+    // oracle, then time single frames.
+    let next_ckpt = (1..=5u32).find(|k| {
+        let p = std::path::Path::new(dir);
+        p.join("frames").join(format!("f{:03}.bin", frame + k)).exists()
+            || p.join(format!("f{:03}", frame + k)).join("meta.json").exists()
+    });
+    let ref_out: Option<(u32, usize)> = next_ckpt.map(|k| {
+        (
+            k,
+            load_states_any(dir, frame + k).iter().map(|s| s.vector_size).sum(),
+        )
+    });
+    eprintln!(
+        "[abstract-bench] f{:03}: {} lanes in {} block(s), loaded+imported in {:.2?}",
+        frame,
+        lanes_in,
+        blocks.len(),
+        t_load.elapsed()
+    );
+
+    let mut census_total: rustc_hash::FxHashMap<&'static str, (u64, u64, u64)> =
+        Default::default();
+
+    // Oracle: run to the next existing checkpoint once and compare.
+    let check = match ref_out {
+        Some((k, r)) => {
+            let mut chase: Vec<runtime2::Rt2> = blocks.iter().map(|b| b.clone_block()).collect();
+            for _ in 0..k {
+                chase = frame_step(chase, &ids, g_freeze, &mut census_total);
+            }
+            let got: usize = chase.iter().map(|b| b.width).sum();
+            if got == r {
+                format!("f{:03} lanes {} == interpreter OK", frame + k, got)
+            } else {
+                format!(
+                    "MISMATCH at f{:03}: engine {} vs interpreter {}",
+                    frame + k,
+                    got,
+                    r
+                )
+            }
+        }
+        None => "(no later checkpoint to compare against)".to_string(),
+    };
+
+    let mut times: Vec<f64> = Vec::new();
+    let mut lanes_out = 0usize;
+    let mut splits = 0u64;
+    for _ in 0..reps {
+        let run: Vec<runtime2::Rt2> = blocks.iter().map(|b| b.clone_block()).collect();
+        let t0 = std::time::Instant::now();
+        let out = frame_step(run, &ids, g_freeze, &mut census_total);
+        times.push(t0.elapsed().as_secs_f64() * 1e3);
+        lanes_out = out.iter().map(|b| b.width).sum();
+        splits = out.iter().map(|b| b.stat_splits).max().unwrap_or(0);
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let min = times.first().copied().unwrap_or(0.0);
+    let mean = times.iter().sum::<f64>() / times.len().max(1) as f64;
+    println!(
+        "abstract-bench f{:03}: {} -> {} lanes  [{}]\n  {} reps: min {:.2} ms, mean {:.2} ms  ({:.0} ns/input-lane min, {} splits)",
+        frame,
+        lanes_in,
+        lanes_out,
+        check,
+        reps,
+        min,
+        mean,
+        min * 1e6 / lanes_in as f64,
+        splits
+    );
+    if !census_total.is_empty() {
+        let mut rows: Vec<_> = census_total.into_iter().collect();
+        rows.sort_by_key(|(_, (ns, _, _))| std::cmp::Reverse(*ns));
+        println!("op census (name, total ms over all reps, calls):");
         for (name, (ns, calls, _)) in rows {
             println!("  {:14} {:9.1} ms  {:>12} calls", name, ns as f64 / 1e6, calls);
         }

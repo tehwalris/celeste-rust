@@ -456,6 +456,36 @@ fn split_iv_by_floor(iv: Pico8NumInterval) -> Vec<Pico8NumInterval> {
 }
 
 impl Rt2 {
+    /// An empty block shell for the vectorized importer (import.rs).
+    pub fn empty(
+        width: usize,
+        globals_len: usize,
+        static_strings: &[&str],
+        cart: Arc<CartData>,
+        cache: Arc<CollisionCache>,
+    ) -> Rt2 {
+        Rt2 {
+            width,
+            structure: Vec::new(),
+            cols: Vec::new(),
+            arena: Vec::new(),
+            globals: vec![NONE; globals_len],
+            strings: static_strings.iter().map(|s| s.to_string()).collect(),
+            cart,
+            cache,
+            prints: Vec::new(),
+            stat_splits: 0,
+            stat_appended: 0,
+            stat_arena_peak: 0,
+            pool: Vec::new(),
+            census: std::env::var_os("CELESTE_OP_CENSUS").map(|_| FxHashMap::default()),
+            origin: Vec::new(),
+            history: Vec::new(),
+            shape_hash: 0,
+            row_keys: Vec::new(),
+        }
+    }
+
     /// Convert the scalar runtime's concrete heap into a width-1 block.
     pub fn from_scalar(rt: &crate::runtime::Rt) -> Rt2 {
         use crate::runtime::{Cell, V};

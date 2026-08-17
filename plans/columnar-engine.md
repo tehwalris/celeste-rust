@@ -430,3 +430,26 @@ Counts exact through f40 re-verified twice. Census now: select 372 ms
 Sharded parallel cross-block dedup also landed (neutral today, removes
 a serial ceiling). Remaining depth cost = worker-phase op work; the
 next levers stay as prioritized in the morning report.
+
+## The one-frame dev-loop bench (2026-08-18, landed)
+
+    native-probe --abstract-bench ~/celeste-checkpoints/room10-newlua-bench 35 --reps 5
+
+Loads the REAL f35 boundary states (187,859 lanes, 40 pm1/shape
+blocks) via a new vectorized State -> Rt2 importer (intervals -> Col::I,
+vector numbers -> Col::N; reachability-based, drops program-unnamed
+fields like the scalar importer), runs ONE abstract frame repeatedly,
+and self-checks by chasing to the next existing checkpoint: 2 frames
+land EXACTLY on the interpreter's f37 = 365,029 lanes - the engine is
+exact on real mid-campaign states, not just from-scratch runs.
+
+Numbers (30 cores): one frame = 2.0 s, 10.6 us/input-lane - 3x slower
+per lane than the from-scratch gate-1 states, because real states carry
+live dash/freeze/interval variety: more varying columns, so the select
+fast path misses more (census: select 920k executions/frame dominates,
+then load - which clones a full column per call). Dev loop total: ~12 s
+per iteration after a runtime-only rebuild.
+
+This is the baseline the tile kernel is measured against. Design note
+(delegated call): the bench oracle compares LANE COUNTS at the chased
+checkpoint; row-set equality remains gate 2 work.
