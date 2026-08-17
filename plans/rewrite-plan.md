@@ -1015,3 +1015,42 @@ indices constant. After 84 inlines there are many duplicate accessors, so
 `assume_eq` (or a CSE bulk rule) has to come first.
 
 That is the next piece of work, and unlike this stage it should measure.
+
+# Trace-straightening campaign (agreed 2026-08-17 night; feeds the stage-2 SIMD kernel)
+
+Decision (Philippe): trace specialization lives in the REWRITE SYSTEM,
+not the kernel emitter - one source of truth, per-entry differential
+verification, and the existing premise-deopt framework gives the deopt
+semantics for free. Overlay recipes keyed by (shape, pm1 class) - the
+existing --variant shape-dispatch extended with the pm1 key. End state
+per overlay: __frame is LITERALLY ONE CFG BLOCK - no branches (only
+premise guards that deopt), no dead code compiled, callees inlined.
+The kernel emitter then degenerates to a straight walk.
+
+Evidence base (2026-08-17): branch census f35 = 617 sites, 26
+executed, 0 divergent; __frame reachable = 1,512 instrs, 18 calls
+(closure cells static in the shape); back-edge loops are room-setup
+paths that never run in steady play (Philippe's call, confirmed).
+
+Steps, each a screened + verified recipe stage:
+1. NEW RULE `guard_branch` (site, expected direction): replace a
+   ConditionalBranch with a premise guard on the condition (deopt
+   semantics per the speculate/PlannedGuard precedent, verify's
+   premise-violation capture already handles it) + an unconditional
+   edge to the recorded side. Derived mechanically from the branch
+   census (26 sites for the (1,0) steady class).
+2. dce the now-unreachable blocks (dce.rs / block-level reachability).
+3. inline the 18 __frame call sites (inline.rs; closure targets
+   resolvable - devirt asserts or shape facts).
+4. merge_blocks until __frame is one block.
+5. Overlay dispatch: extend the variant registry key from shape to
+   (shape, pm1 class); the (1,0) steady overlay is the pilot.
+6. Then: transpile the overlaid program - the recon should report
+   __frame = 1 block, 0 branches - and START THE KERNEL EMITTER on
+   it (standalone bench first, per the agreed build order).
+
+Note the virtuous cycle: the interpreter ALSO runs the overlaid
+program faster (straight line, no branch splits), and the campaign's
+verification machinery certifies every step against the plain program
+- the kernel inherits a proof-carrying trace instead of trusting a
+recorded one.
