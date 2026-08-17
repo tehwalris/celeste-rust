@@ -1091,6 +1091,9 @@ fn run_abstract(num_frames: u32) {
         );
     }
     println!("abstract: {} frames in {:.3?}", num_frames, start.elapsed());
+    let shapes: Vec<String> =
+        blocks.iter().map(|b| format!("{:#018x}", b.shape_hash)).collect();
+    println!("final shapes: {}", shapes.join(", "));
     print_bails();
     print_gate_rejects();
     if !census_total.is_empty() {
@@ -1155,7 +1158,13 @@ fn run_abstract_bench(dir: &str, frame: u32, reps: u32) {
     let mut census_total: rustc_hash::FxHashMap<&'static str, (u64, u64, u64)> =
         Default::default();
 
-    // Oracle: run to the next existing checkpoint once and compare.
+    // Oracle: run to the next existing checkpoint once and compare -
+    // lane COUNT (gate 1) and canonical row-key SET (gate 2). Both
+    // sides funnel through the SAME canonicalizer: the interpreter's
+    // states are imported and run through `boundary` (its widenings
+    // are idempotent on boundary states), so key equality means the
+    // engine's surviving row set IS the interpreter's, not just the
+    // same size.
     let check = match ref_out {
         Some((k, r)) => {
             let mut chase: Vec<runtime2::Rt2> = blocks.iter().map(|b| b.clone_block()).collect();
@@ -1163,14 +1172,69 @@ fn run_abstract_bench(dir: &str, frame: u32, reps: u32) {
                 chase = frame_step(chase, &ids, g_freeze, &mut census_total);
             }
             let got: usize = chase.iter().map(|b| b.width).sum();
-            if got == r {
-                format!("f{:03} lanes {} == interpreter OK", frame + k, got)
-            } else {
+            let mut ref_keys: rustc_hash::FxHashSet<(u64, u64)> = Default::default();
+            for st in &load_states_any(dir, frame + k) {
+                let mut b = import::import_block(st, rt.cart.clone(), rt.cache.clone());
+                b.boundary(&ids);
+                ref_keys.extend(b.row_keys.iter().copied());
+            }
+            let eng_keys: rustc_hash::FxHashSet<(u64, u64)> = chase
+                .iter()
+                .flat_map(|b| b.row_keys.iter().copied())
+                .collect();
+            let missing = ref_keys.difference(&eng_keys).count();
+            let extra = eng_keys.difference(&ref_keys).count();
+            if got == r && missing == 0 && extra == 0 {
                 format!(
-                    "MISMATCH at f{:03}: engine {} vs interpreter {}",
+                    "f{:03} lanes {} == interpreter, row-key SET EQUAL (gate 2) OK",
+                    frame + k,
+                    got
+                )
+            } else {
+                // Row keys are seeded with the block shape hash, so a
+                // total mismatch with equal counts usually means shape
+                // divergence, not row divergence - print both sides.
+                let eng_shapes: Vec<String> =
+                    chase.iter().map(|b| format!("{:#x} w{}", b.shape_hash, b.width)).collect();
+                let ref_shapes: Vec<String> = load_states_any(dir, frame + k)
+                    .iter()
+                    .map(|st| {
+                        let mut b =
+                            import::import_block(st, rt.cart.clone(), rt.cache.clone());
+                        b.boundary(&ids);
+                        format!("{:#x} w{}", b.shape_hash, b.width)
+                    })
+                    .collect();
+                eprintln!("  engine shapes: {}", eng_shapes.join(", "));
+                eprintln!("  ref shapes:    {}", ref_shapes.join(", "));
+                // Structural diff of the first block on each side: the
+                // Obj field sets, by name.
+                let dump_objs = |b: &runtime2::Rt2, tag: &str| {
+                    for (ci, cell) in b.structure.iter().enumerate() {
+                        if let runtime2::Cell2::Obj(fields) = cell {
+                            let names: Vec<&str> = fields
+                                .iter()
+                                .map(|(f, _)| gen::FIELD_NAMES[*f as usize])
+                                .collect();
+                            eprintln!("  {} cell {}: Obj[{}]", tag, ci, names.join(","));
+                        }
+                    }
+                };
+                if let Some(b) = chase.first() {
+                    dump_objs(b, "engine");
+                }
+                if let Some(st) = load_states_any(dir, frame + k).first() {
+                    let mut b = import::import_block(st, rt.cart.clone(), rt.cache.clone());
+                    b.boundary(&ids);
+                    dump_objs(&b, "ref");
+                }
+                format!(
+                    "MISMATCH at f{:03}: engine {} vs interpreter {} (row keys: {} missing, {} extra)",
                     frame + k,
                     got,
-                    r
+                    r,
+                    missing,
+                    extra
                 )
             }
         }

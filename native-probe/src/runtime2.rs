@@ -1927,6 +1927,18 @@ impl Rt2 {
                 }
             }
         }
+        // Canonical field order. Objects created by the compiled program
+        // carry fields in STORE order; the importer sorts them by name.
+        // Sort here so the canonical BFS (child discovery order) and the
+        // shape hash see ONE order regardless of an object's lineage -
+        // without this an engine-spawned player and an imported one hash
+        // to different shapes and every downstream cell id diverges
+        // (found by gate 2 on the f020 -> f025 spawn transition).
+        for cell in self.structure.iter_mut() {
+            if let Cell2::Obj(fields) = cell {
+                fields.sort_by_key(|(k, _)| crate::gen::FIELD_NAMES[*k as usize]);
+            }
+        }
         self.history.clear();
         let (rem_cells, det_cells) = self.mark_walk(ids);
 

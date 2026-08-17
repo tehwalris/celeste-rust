@@ -861,3 +861,43 @@ the next engine units are structural: #132 row-struct emission,
 Col::B through Rt2, SIMD panes. The next CAMPAIGN unit is #133 -
 linking the generated engine into the real runner, where checkpoint
 chains, visited sets and the position graph live.
+
+## Gate 2 LANDED: row-SET equality, plus the two-shapes mystery solved (2026-08-17)
+
+Gate 2 needed no export machinery: both sides funnel through the SAME
+canonicalizer. The bench oracle now imports the interpreter's
+next-checkpoint states, runs them through `boundary` (its widenings
+are idempotent on boundary states), and compares canonical 128-bit
+row-key SETS against the engine's chased output. Passing means the
+engine's surviving row set IS the interpreter's - not just the same
+count.
+
+First sweep found exactly one mismatch: f020 -> f025, counts equal
+(204 = 204) but ALL keys differing. Diagnosis: row keys are seeded
+with the shape hash, and the engine-spawned player object carries its
+fields in STORE order while the importer sorts them by name - same 25
+fields, different order, different shape, and (since the canonical
+BFS discovers children in field order) different cell numbering
+everywhere downstream. Fix: `boundary` sorts every Obj's fields by
+name before the BFS - one canonical order regardless of an object's
+lineage.
+
+Consequences:
+- Gate 2 GREEN at every (1,0) checkpoint: f005, f010, f015, f020,
+  f025, f030, f035 -> f037, spawn transition included.
+- THE TWO STEADY SHAPES WERE THIS ARTIFACT. From-scratch
+  `--abstract 40` now converges to the census shape
+  0xc51b1bf0e3dba1ac. One steady shape everywhere: the checked-in
+  slot map would be valid for from-scratch runs too, if slots return.
+- All prior gates hold: lane counts exact f1..f40, scalar hex-exact,
+  bench exact, suite green.
+
+Rooms recon (the 300m question): the engine REJECTS rooms (2,0) and
+(0,0) loudly and correctly - `AssertClosure(fn 52) failed at
+anonymous_61` on fruit (fn 42) / (0,0)-object (fn 39) update
+closures. The compiled program's devirtualized update dispatch is
+specialized to the (1,0) steady window; the interpreter survives
+this via lane-granular deopt to the PLAIN program, which the engine
+does not have. Engine-on-(2,0) therefore needs either the deopt
+fallback or a broader devirt in the compile recipe - a named unit,
+not a surprise.
