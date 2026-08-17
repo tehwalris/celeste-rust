@@ -1054,3 +1054,58 @@ program faster (straight line, no branch splits), and the campaign's
 verification machinery certifies every step against the plain program
 - the kernel inherits a proof-carrying trace instead of trusting a
 recorded one.
+
+### Session 2026-08-17: steps 1-4 DONE, pilot CERTIFIED at 40 frames
+
+`guard_branch` landed (src/rewrite/rules/guard_branch.rs, 11 unit
+tests): premise = "every lane takes the recorded edge", stated as
+`assert_true` on the condition (behind a `not` for the false edge), so
+the existing lane-granular deopt capture applies unchanged. The
+not-taken target loses its head-edge phi branch; dce sweeps the dead
+side. Refuses equal-target branches and taken self-edges; handles the
+loop-exit self-edge. The census (`--branch-census`) now emits
+ready-to-paste entries with the recorded direction read off the
+sequence hash (2 = true edge, 1 = false).
+
+Pilot: `rewrites-trace10.jsonl` = rewrites-compile.jsonl + 22 guards
++ dce + inline(anonymous_61) + merge_blocks + kill_dead.
+CERTIFIED: `rewrite verify --frames 40 --variant-of
+rewrites-compile.jsonl --variant-shapes player` = "identical through
+frame 40", zero deopts, zero fallbacks. Final shape: __frame = 2,006
+instrs, FOUR branches, 0 resolvable calls (9 intrinsic mid-block
+calls: 6x __new_unknown_boolean, 2x __split_by_flr, 1x __split_at -
+calls do not break blocks). All 617-26 never-executed branch sites
+and their subgraphs are gone from the compiled footprint.
+
+The 4 of the census's 26 sites the screen refused, and why (the
+census samples one frame's biggest state; the screen is the
+certifier):
+- freeze > 0 gate (__frame in_i1_012_if_join_9): falsified by the
+  frozen class. freeze IS a pm1 key cell - this is half the motivation
+  for the (shape, pm1) overlay key (step 5).
+- dash_time > 0 gate (anonymous_61 in_h061_in_k030_cont): falsified
+  by mid-dash states (has_dashed=true, dash_time>0). dash_time is
+  ALSO a pm1 key cell - the other half. With (shape, pm1) keying both
+  gates straighten per class and __frame drops to 2 branches.
+- spd.x~=0 or spd.y~=0 move gate (anonymous_61 __entry) and its
+  downstream shadow (anonymous_61 if_join_6): falsified by
+  standing-still lanes INSIDE a pm1 class (spd is not a key cell).
+  Genuinely divergent - stays a branch, or gets if_convert/masked
+  treatment later.
+
+Two machinery lessons, both now encoded:
+- Kills are liveness annotations derived on the branched CFG.
+  Straightening resolves single-edge phis to their sources, extending
+  live ranges past stale kills (observed: use-after-kill panic at
+  f25). Any overlay that reshapes the CFG must end with `kill_dead`
+  (it strips and re-derives).
+- Premise-failure diagnosis: block names after merge_blocks are
+  misleading (the dash gate reported under `if_body_8`); trust the
+  asserted instruction, not the block label. AssertTrue failures now
+  print the trace-class globals (freeze, will_restart, delay_restart,
+  has_dashed) ahead of the object list.
+
+NEXT: step 5, (shape, pm1) dispatch key - recovers the freeze and
+dash gates per class; then step 6, the kernel emitter on the overlaid
+program (rows-across-lanes W=16, prefix/suffix split at the button
+read, per-lane deopt).

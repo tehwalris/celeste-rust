@@ -473,16 +473,25 @@ pub fn describe_objects(state: &State) -> String {
     let mut globals: Vec<String> = Vec::new();
     for name in ["freeze", "will_restart", "delay_restart", "has_dashed"] {
         if let Some(gid) = state.global_env.get(name) {
-            if let HeapValue::Value(v) = helper.load(*gid) {
-                globals.push(format!("{}={:?}", name, v));
-            }
+            // Compact: downstream prints truncate hard, so the wrapper enums
+            // are stripped for the scalar cases that matter.
+            let text = match helper.load(*gid) {
+                HeapValue::Value(Value::Number(MaybeVector::Scalar(n))) => format!("{:?}", n),
+                HeapValue::Value(Value::Bool(MaybeVector::Scalar(b))) => format!("{}", b),
+                HeapValue::Value(Value::Nil(_)) => "nil".to_string(),
+                HeapValue::Value(v) => format!("{:?}", v).chars().take(30).collect(),
+                _ => continue,
+            };
+            globals.push(format!("{}={}", name, text));
         }
     }
+    // Globals first: downstream prints truncate, and the class globals are
+    // the diagnosis.
     format!(
-        "objects: {} [{}]; {}",
+        "{}; objects: {} [{}]",
+        globals.join(", "),
         items.len(),
-        parts.join(", "),
-        globals.join(", ")
+        parts.join(", ")
     )
 }
 

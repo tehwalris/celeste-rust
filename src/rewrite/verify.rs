@@ -709,7 +709,7 @@ fn dispatch_variant_frame(
                 "  variant {}: frame FAILED ({}); falling back to the base program - \
                  a registered variant's premises must hold for its shape, fix the registry",
                 vd.variants[idx].label,
-                one_line.chars().take(200).collect::<String>()
+                one_line.chars().take(600).collect::<String>()
             );
             counters.variant_fallbacks += 1;
             VariantOutcome::Base(snapshot)
