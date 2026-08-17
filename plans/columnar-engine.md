@@ -578,3 +578,40 @@ fields in the generated kernel (guarded, census doctrine) before
 per-variant folding or trunk sharing can pay. Everything else is
 scaffolding already in place: bench, tile runtime, variant dispatch,
 counter-replay, fallback, oracles.
+
+## Slot compilation: full design (ready to execute)
+
+The unit that unlocks both remaining factors. A cell is COMPILER-VISIBLE
+when every access to it goes through a constant-indexed slot, so LLVM
+tracks values across the store/load pairs that currently kill folding.
+
+1. SITE -> CELL map (per shape): extend the gap census to record each
+   get_field/get_index site's RESULT cell (it already records the
+   receiver); dump `site-slots-<shape>.json`: groups of sites sharing a
+   result cell -> slot id, plus the access path (global -> fields) for
+   bind-time verification.
+2. TRANSPILER (`--site-slots FILE`): eligibility analysis - a cell is
+   slot-compiled iff ALL its loads/stores flow through def-chain-visible
+   bound sites (no escaped pointers, no phis); partial compilation of a
+   cell is INCOHERENT (slots and cols would diverge) and must not
+   happen. Emit for eligible sites:
+       l = get_field(...); v = load(l)   =>  v = rt.slot_get::<K>()
+       store(l, x)                       =>  rt.slot_set::<K>(x)
+   (K = constant slot index). Report the eligible/ineligible counts -
+   the ineligible remainder stays on the generic path and the two
+   worlds stay coherent because ineligible cells never appear in slots.
+3. RT3: `slots: [TCol; N_SLOTS]` (a plain struct array; constant
+   indices => SROA). Bind at from_rt2: walk each slot's access path,
+   copy cell -> slot; at tile exit write slots back to cells before
+   append_into. Guards: v1 puts the per-site receiver check behind a
+   debug/verify build flag (delegated design call - the doctrine's
+   loud-check lives in the bench oracle + Rt2 fallback in release).
+4. Then re-measure the jump/dash const variants (they should now fold
+   through), then the 64-way question (compile time vs win - consider a
+   separate codegen crate so monomorphization parallelizes), then trunk
+   sharing, then typed slots (the [TCol] array becomes typed fields).
+
+State of scaffolding (all landed and exact on the bench): one-frame
+bench with chased-checkpoint oracle; Rt3 tiles with by-value TCol;
+counter-replay; TileBail->Rt2 fallback with site aggregation; variant
+dispatch + static button resolution; chunk accumulator.
