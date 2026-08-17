@@ -945,3 +945,40 @@ shrinking both streaming and storage) - measure, then re-run this
 table. Prerequisites for (2,0) at all: compile the fruit-clean v9
 recipe (verified on (2,0)) + port fruit widenings + death-frame
 deopt.
+
+## Engine-on-(2,0) recon: compiled, executed, and the exact wall named (2026-08-17)
+
+Recon results, in the order the walls fell:
+1. The v9 recipe (the S16-campaign fruit-clean derivation) does NOT
+   replay on today's Lua (predates the zero-heap __button_states
+   edit: p1_122 promote_cell fails, NotAnAlloc). Dead end, expected.
+2. `rewrites-room20.jsonl` - checked in, covered by the
+   recipe-replay test - transpiles cleanly (same 77 functions; the
+   transpiler emits a full CFG state machine, so branches are fine:
+   Rt2 throws SplitReq on per-lane divergence, Rt3 bails to Rt2).
+3. The compiled room20 program RUNS (2,0) f35 states: the devirt
+   AssertClosure wall is gone. The new wall is real semantics:
+   `branch on UnknownBool - control fork; deopt needed`
+   (runtime2 av_truthy). The room20 program keeps branches whose
+   conditions are genuinely unknown (widened-rem interval compares);
+   the interpreter forks the state and runs BOTH continuations. The
+   engine's SplitReq only partitions existing lanes - it cannot
+   duplicate them.
+
+The (2,0)-engine unit is therefore, precisely:
+1. UBool control forks: a fork tape in Rt2 mirroring Rt3's
+   counter-replay tape (truthy on uniform-UBool consumes a tape slot;
+   mixed Bool/UBool lanes SplitReq-partition first; the driver
+   enumerates outcome combinations exactly like advance_tape). Must
+   mirror the interpreter's flow.rs fork semantics exactly.
+2. Port the fruit widenings (abstraction.rs:590-704) and the
+   death-frame deopt (748-818) into `boundary`.
+3. Gate with the existing machinery - `--abstract-bench
+   ~/celeste-checkpoints/room20 F` under CELESTE_START_ROOM=2,0
+   already runs gates 1+2 against the interpreter's own (2,0)
+   checkpoints once 1+2 land. Engine binaries are per-recipe
+   (gen.rs), so a (2,0) engine build uses rewrites-room20.jsonl and
+   the (1,0) gates keep the compile recipe.
+
+gen.rs restored to the compile recipe afterwards (byte-identical) and
+the (1,0) bench re-verified green.
