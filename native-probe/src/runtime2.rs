@@ -59,6 +59,8 @@ pub enum Col {
     V(Vec<AV>),
     /// An all-Num column stored raw: 4 B/lane, branchless op loops.
     N(Vec<P8>),
+    /// An all-interval column stored raw: (low, high) pairs, 8 B/lane.
+    I(Vec<(P8, P8)>),
 }
 
 impl Col {
@@ -68,6 +70,7 @@ impl Col {
             Col::U(a) => *a,
             Col::V(v) => v[lane],
             Col::N(v) => AV::Num(v[lane]),
+            Col::I(v) => AV::Ival(v[lane].0, v[lane].1),
         }
     }
 }
@@ -164,13 +167,22 @@ fn av_of_iv(iv: Pico8NumInterval) -> AV {
     AV::Ival(iv.low, iv.high)
 }
 
-/// V -> N when every lane is a plain number (4 B/lane, branchless loops).
+/// V -> N / I when every lane is a plain number / interval.
 fn compress_num_v(vs: Vec<AV>) -> Col {
     if vs.iter().all(|v| matches!(v, AV::Num(_))) {
         Col::N(
             vs.iter()
                 .map(|v| match v {
                     AV::Num(n) => *n,
+                    _ => unreachable!(),
+                })
+                .collect(),
+        )
+    } else if vs.iter().all(|v| matches!(v, AV::Ival(..))) {
+        Col::I(
+            vs.iter()
+                .map(|v| match v {
+                    AV::Ival(a, b) => (*a, *b),
                     _ => unreachable!(),
                 })
                 .collect(),
@@ -516,7 +528,7 @@ impl Rt2 {
                 );
                 p
             }
-            Col::N(_) => panic!("expected a pointer column, got numbers"),
+            Col::N(_) | Col::I(_) => panic!("expected a pointer column, got numbers"),
         }
     }
 
@@ -546,6 +558,60 @@ impl Rt2 {
             (NV::U(a), NV::N(b)) => b.iter().map(|y| f(a, *y)).collect(),
         };
         Some(self.put(Col::N(out)))
+    }
+
+    /// Interval add/sub fast path: both operands numeric-or-interval typed
+    /// columns, endpoint-wise loop into a raw I column (op.rs interval
+    /// Plus/Minus with the Number lift).
+    #[inline]
+    fn bin_iv(&mut self, l: ColId, r: ColId, sub: bool) -> Option<ColId> {
+        enum IV<'a> {
+            U(P8, P8),
+            N(&'a [P8]),
+            I(&'a [(P8, P8)]),
+        }
+        fn view(c: &Col) -> Option<IV<'_>> {
+            match c {
+                Col::U(AV::Num(n)) => Some(IV::U(*n, *n)),
+                Col::U(AV::Ival(a, b)) => Some(IV::U(*a, *b)),
+                Col::N(v) => Some(IV::N(v)),
+                Col::I(v) => Some(IV::I(v)),
+                _ => None,
+            }
+        }
+        #[inline(always)]
+        fn get(v: &IV, i: usize) -> (P8, P8) {
+            match v {
+                IV::U(a, b) => (*a, *b),
+                IV::N(v) => (v[i], v[i]),
+                IV::I(v) => v[i],
+            }
+        }
+        let (lv, rv) = (view(self.get(l))?, view(self.get(r))?);
+        // Both uniform or both plain-number columns are handled elsewhere;
+        // here at least one side is interval-typed.
+        let any_interval = matches!(lv, IV::U(a, b) if a != b)
+            || matches!(rv, IV::U(a, b) if a != b)
+            || matches!(lv, IV::I(_))
+            || matches!(rv, IV::I(_));
+        if !any_interval {
+            return None;
+        }
+        let w = self.width;
+        let op = |x: (P8, P8), y: (P8, P8)| -> (P8, P8) {
+            let (a, b) = (
+                Pico8NumInterval::new(x.0, x.1),
+                Pico8NumInterval::new(y.0, y.1),
+            );
+            let r = if sub { a - b } else { a + b };
+            (r.low, r.high)
+        };
+        if let (IV::U(a, b), IV::U(c, d)) = (&lv, &rv) {
+            let r = op((*a, *b), (*c, *d));
+            return Some(self.put(Col::U(AV::Ival(r.0, r.1))));
+        }
+        let out: Vec<(P8, P8)> = (0..w).map(|i| op(get(&lv, i), get(&rv, i))).collect();
+        Some(self.put(Col::I(out)))
     }
 
     /// Numeric compare fast path: bool column out.
@@ -607,6 +673,12 @@ impl Rt2 {
                 out.extend(v.iter().map(|x| f(AV::Num(*x))));
                 self.put(compress_num(Col::V(out)))
             }
+            Col::I(_) => {
+                let mut out = self.buf();
+                let Col::I(v) = self.get(a) else { unreachable!() };
+                out.extend(v.iter().map(|x| f(AV::Ival(x.0, x.1))));
+                self.put(compress_num(Col::V(out)))
+            }
         }
     }
 
@@ -660,10 +732,22 @@ impl Rt2 {
                 }
             }
         };
+        let extend_i = |v: &mut Vec<(P8, P8)>, srcs: &[usize]| {
+            if contiguous {
+                v.extend_from_within(..srcs.len());
+            } else {
+                v.reserve(srcs.len());
+                for &s in srcs {
+                    let x = v[s];
+                    v.push(x);
+                }
+            }
+        };
         for slot in self.arena.iter_mut().flatten() {
             match slot {
                 Col::V(v) => extend(v, srcs),
                 Col::N(v) => extend_n(v, srcs),
+                Col::I(v) => extend_i(v, srcs),
                 Col::U(_) => {}
             }
         }
@@ -671,6 +755,7 @@ impl Rt2 {
             match col {
                 Col::V(v) => extend(v, srcs),
                 Col::N(v) => extend_n(v, srcs),
+                Col::I(v) => extend_i(v, srcs),
                 Col::U(_) => {}
             }
         }
@@ -878,10 +963,16 @@ impl Engine for Rt2 {
         if let Some(out) = self.bin_num(l, r, |a, b| a + b) {
             return out;
         }
+        if let Some(out) = self.bin_iv(l, r, false) {
+            return out;
+        }
         self.map2(l, r, |a, b| av_addsub(a, b, false))
     }
     fn op_sub(&mut self, l: ColId, r: ColId) -> ColId {
         if let Some(out) = self.bin_num(l, r, |a, b| a - b) {
+            return out;
+        }
+        if let Some(out) = self.bin_iv(l, r, true) {
             return out;
         }
         self.map2(l, r, |a, b| av_addsub(a, b, true))
@@ -1022,7 +1113,7 @@ impl Engine for Rt2 {
         let any_unknown = match &d {
             Col::U(a) => matches!(a, AV::UBool),
             Col::V(vs) => vs.iter().any(|a| matches!(a, AV::UBool)),
-            Col::N(_) => panic!("expand on a number column"),
+            Col::N(_) | Col::I(_) => panic!("expand on a number column"),
         };
         if !any_unknown {
             // Identity on concrete bools (validated per lane).
@@ -1033,7 +1124,7 @@ impl Engine for Rt2 {
                         assert!(matches!(a, AV::Bool(_)), "expand on {:?}", a);
                     }
                 }
-                Col::N(_) => unreachable!(),
+                Col::N(_) | Col::I(_) => unreachable!(),
             }
             return self.put(d);
         }
@@ -1055,7 +1146,7 @@ impl Engine for Rt2 {
     fn truthy_b(&mut self, v: ColId, site: u32) -> bool {
         match self.get(v) {
             Col::U(a) => av_truthy(*a),
-            Col::N(_) => true,
+            Col::N(_) | Col::I(_) => true,
             Col::V(vs) => {
                 let t = av_truthy(vs[0]);
                 if vs.iter().all(|a| av_truthy(*a) == t) {
@@ -1260,6 +1351,8 @@ impl Engine for Rt2 {
                         AV::Num(_) => false,
                         other => panic!("__split_by_flr on {:?}", other),
                     }),
+                    Col::N(_) => false,
+                    Col::I(vs) => vs.iter().any(|(a, b)| a.flr() != b.flr()),
                     other => panic!("__split_by_flr on {:?}", other),
                 };
                 if !needs {
@@ -1327,6 +1420,9 @@ impl Engine for Rt2 {
                     Col::U(v) => lane_alts(*v).len() > 1,
                     Col::V(vs) => vs.iter().any(|v| lane_alts(*v).len() > 1),
                     Col::N(_) => false,
+                    Col::I(vs) => vs
+                        .iter()
+                        .any(|(a, b)| lane_alts(AV::Ival(*a, *b)).len() > 1),
                 };
                 if !needs {
                     // Still apply the point-degeneration clip per lane.
@@ -1481,6 +1577,7 @@ impl Rt2 {
                 Col::U(v) => check(*v),
                 Col::V(vs) => vs.iter().for_each(|v| check(*v)),
                 Col::N(vs) => vs.iter().for_each(|n| check(AV::Num(*n))),
+                Col::I(vs) => vs.iter().for_each(|(a, b)| check(AV::Ival(*a, *b))),
             }
             self.cols[c as usize] = Col::U(wide);
         }
@@ -1498,6 +1595,7 @@ impl Rt2 {
                 Col::N(vs) => Col::N(
                     vs.iter().map(|n| if *n < zero { zero } else { *n }).collect(),
                 ),
+                Col::I(_) => panic!("player dash_effect_time is not a number"),
             };
         }
 
@@ -1545,7 +1643,7 @@ impl Rt2 {
                 match &self.structure[c as usize] {
                     Cell2::Val => match &self.cols[c as usize] {
                         Col::U(AV::Ptr(t)) => enqueue(*t, &mut new_id, &mut queue, &mut order),
-                        Col::U(_) | Col::N(_) => {}
+                        Col::U(_) | Col::N(_) | Col::I(_) => {}
                         Col::V(vs) => {
                             for v in vs {
                                 if let AV::Ptr(t) = v {
@@ -1600,6 +1698,7 @@ impl Rt2 {
                 Col::U(v) => Col::U(remap_av(*v, new_id)),
                 Col::V(vs) => Col::V(vs.iter().map(|v| remap_av(*v, new_id)).collect()),
                 Col::N(vs) => Col::N(vs.clone()),
+                Col::I(vs) => Col::I(vs.clone()),
             }
         };
         let mut new_structure: Vec<Cell2> = Vec::with_capacity(order.len());
@@ -1743,6 +1842,12 @@ impl Rt2 {
                         hash_av(&mut h2[i], AV::Num(vs[i]));
                     }
                 }
+                Col::I(vs) => {
+                    for i in 0..w {
+                        hash_av(&mut h1[i], AV::Ival(vs[i].0, vs[i].1));
+                        hash_av(&mut h2[i], AV::Ival(vs[i].0, vs[i].1));
+                    }
+                }
             }
         }
         self.row_keys = (0..w).map(|i| (h1[i].finish(), h2[i].finish())).collect();
@@ -1832,6 +1937,12 @@ impl Rt2 {
                             }
                         }
                     }
+                    // Interval spd: `~= 0` is always true (Ival == _ -> false).
+                    Col::I(_) => {
+                        for k in key.iter_mut() {
+                            *k |= 1 << (bit % 8);
+                        }
+                    }
                 }
             }
         }
@@ -1885,6 +1996,10 @@ impl Rt2 {
                 let nv: Vec<P8> = keep.iter().map(|&i| vs[i as usize]).collect();
                 *col = Col::N(nv);
             }
+            Col::I(vs) => {
+                let nv: Vec<(P8, P8)> = keep.iter().map(|&i| vs[i as usize]).collect();
+                *col = Col::I(nv);
+            }
         };
         for col in self.cols.iter_mut() {
             retain_col(col);
@@ -1923,6 +2038,7 @@ impl Rt2 {
         let groups: Vec<Vec<u32>> = match &self.cols[cell as usize] {
             Col::U(_) => return vec![self],
             Col::N(vs) => by_vals(vs.iter().map(|n| AV::Num(*n)).collect()),
+            Col::I(vs) => by_vals(vs.iter().map(|(a, b)| AV::Ival(*a, *b)).collect()),
             Col::V(vs) => {
                 let mut order: Vec<AV> = Vec::new();
                 let mut groups: Vec<Vec<u32>> = Vec::new();
@@ -1959,6 +2075,7 @@ impl Rt2 {
                 Col::U(a) => Col::U(*a),
                 Col::V(vs) => Col::V(vs[lo..hi].to_vec()),
                 Col::N(vs) => Col::N(vs[lo..hi].to_vec()),
+                Col::I(vs) => Col::I(vs[lo..hi].to_vec()),
             }
         };
         Rt2 {
@@ -2029,7 +2146,7 @@ impl Rt2 {
                 Col::U(a) => blocks
                     .iter()
                     .all(|b| matches!(&b.cols[c], Col::U(x) if x == a)),
-                Col::V(_) | Col::N(_) => false,
+                Col::V(_) | Col::N(_) | Col::I(_) => false,
             };
             if all_same_uniform {
                 continue;
@@ -2039,6 +2156,7 @@ impl Rt2 {
                 Col::U(a) => vs.extend(std::iter::repeat(*a).take(w)),
                 Col::V(v) => vs.extend_from_slice(v),
                 Col::N(v) => vs.extend(v.iter().map(|n| AV::Num(*n))),
+                Col::I(v) => vs.extend(v.iter().map(|(a, b)| AV::Ival(*a, *b))),
             };
             let hw = host.width;
             push_col(&mut vs, col, hw);
@@ -2071,11 +2189,13 @@ impl Rt2 {
                 Col::U(a) => vec![*a; w],
                 Col::V(v) => std::mem::take(v),
                 Col::N(v) => v.iter().map(|n| AV::Num(*n)).collect(),
+                Col::I(v) => v.iter().map(|(a, b)| AV::Ival(*a, *b)).collect(),
             };
             match ocol {
                 Col::U(b) => vs.extend(std::iter::repeat(*b).take(ow)),
                 Col::V(ov) => vs.extend_from_slice(ov),
                 Col::N(ov) => vs.extend(ov.iter().map(|n| AV::Num(*n))),
+                Col::I(ov) => vs.extend(ov.iter().map(|(a, b)| AV::Ival(*a, *b))),
             }
             *col = compress_num_v(vs);
         }

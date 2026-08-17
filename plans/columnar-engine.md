@@ -295,3 +295,23 @@ dispatch. Plan, in order, gate 1 re-run after each step:
 3. Fused loops need the transpiler (emit one lane-loop per straight-line
    arithmetic run); only reach for it if 1+2 leave a >2x gap to the
    interpreter per boundary lane.
+
+## Typed columns, measured (2026-08-18, late)
+
+Col::N (raw P8) + Col::I (raw interval pairs) with numeric/interval
+fast paths in add/sub/compares, compression at boundary + merges.
+Gate 1 stays exact. Serial f30: 2.4 -> 2.12 -> 2.22 s (Num helped 12%,
+Ival neutral). Verdict: blind type-specialization has hit its ceiling -
+the remaining ~2s is spread across compares-to-AV-bool columns, select,
+per-lane builtin closures (tile_flag_at), boundary hashing and the
+long tail of small ops at width. Next lever needs DATA, not guesses:
+
+1. A per-op time census inside the engine (op kind x column kinds x
+   width buckets - the op_census doctrine, ported).
+2. Then either fused loops (transpiler emits one lane-loop per
+   straight-line arithmetic run) or targeted fixes at whatever the
+   census names.
+
+Wall clock at f30: 1.24 s on 30 cores (poor scaling ~1.7x - round-robin
+chunk queues without stealing + serial merge; also unmeasured
+bandwidth ceiling). 30 frames end-to-end: 2.13 s wall.
