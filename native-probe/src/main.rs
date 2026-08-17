@@ -495,6 +495,19 @@ fn run_branch_census(dir: &str, frame: u32) {
         }
     }
     let executed = first.iter().filter(|f| **f != Some(0) && f.is_some()).count();
+    // Which executed sites run more than once per frame? A sequence hash of
+    // a single taken/not-taken outcome is one of two constants; anything
+    // else means the site executed repeatedly - i.e., it sits in a LOOP.
+    // (h(true) = 0*31+2 = 2, h(false) = 1.)
+    eprintln!("executed sites (seq-hash 1/2 = straight-line once; other = loop or multi-visit):");
+    for (i, f) in first.iter().enumerate() {
+        if let Some(h) = f {
+            if *h != 0 {
+                let kind = if *h == 1 || *h == 2 { "once" } else { "MULTI" };
+                eprintln!("  [{}] {} {}", kind, i, gen::BRANCH_INFO[i]);
+            }
+        }
+    }
     let divergent: Vec<usize> = div
         .iter()
         .enumerate()

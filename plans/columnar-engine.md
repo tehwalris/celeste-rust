@@ -453,3 +453,18 @@ per iteration after a runtime-only rebuild.
 This is the baseline the tile kernel is measured against. Design note
 (delegated call): the bench oracle compares LANE COUNTS at the chased
 checkpoint; row-set equality remains gate 2 work.
+
+## Tile-kernel pre-work verified (2026-08-18)
+
+1. STRAIGHT-LINE: the branch census now classifies executed sites by
+   sequence hash - all 26 executed sites run EXACTLY ONCE per frame on
+   the real f35 states (64 inputs x 256 lanes). No loops, no
+   multi-visits in the steady-state frame; the room-load path (which
+   does loop) stays off the kernel. The straight-line SIMD emission
+   premise is verified, not assumed.
+2. STRADDLE RATE: 5 splits per block max at f35 real states - the
+   counter-replay path is rare, as designed.
+
+Both green-light the emission plan: straight-line tree with per-variant
+button constants, SIMD across row tiles, counter-replay for straddles,
+sticky fail-mask -> reference-path rerun.
