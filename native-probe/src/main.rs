@@ -1147,12 +1147,37 @@ fn run_abstract_bench(dir: &str, frame: u32, reps: u32) {
             load_states_any(dir, frame + k).iter().map(|s| s.vector_size).sum(),
         )
     });
+    // Row-storage shape (the 300m projection input): varying columns
+    // and their typed bytes per lane, averaged over blocks.
+    let (mut n_vary, mut bytes_row) = (0usize, 0usize);
+    for b in &blocks {
+        for c in &b.cols {
+            match c {
+                runtime2::Col::U(_) => {}
+                runtime2::Col::N(_) => {
+                    n_vary += 1;
+                    bytes_row += 4;
+                }
+                runtime2::Col::I(_) => {
+                    n_vary += 1;
+                    bytes_row += 8;
+                }
+                runtime2::Col::V(_) => {
+                    n_vary += 1;
+                    bytes_row += 16;
+                }
+            }
+        }
+    }
     eprintln!(
-        "[abstract-bench] f{:03}: {} lanes in {} block(s), loaded+imported in {:.2?}",
+        "[abstract-bench] f{:03}: {} lanes in {} block(s), loaded+imported in {:.2?} \
+         (avg {:.0} varying cols, {:.0} typed B/row)",
         frame,
         lanes_in,
         blocks.len(),
-        t_load.elapsed()
+        t_load.elapsed(),
+        n_vary as f64 / blocks.len().max(1) as f64,
+        bytes_row as f64 / blocks.len().max(1) as f64
     );
 
     let mut census_total: rustc_hash::FxHashMap<&'static str, (u64, u64, u64)> =

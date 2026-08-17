@@ -901,3 +901,47 @@ this via lane-granular deopt to the PLAIN program, which the engine
 does not have. Engine-on-(2,0) therefore needs either the deopt
 fallback or a broader devirt in the compile recipe - a named unit,
 not a surprise.
+
+## 300m RE-projection with same-day measurements (2026-08-17)
+
+All numbers measured today on this machine, cores 0-14/16-30.
+
+| metric | engine (mode-2 tiles) | interpreter (`rewrite bench`) |
+|---|---|---|
+| (1,0) f35 -> f36, 187,859 lanes | 607 ms (3.23 us/lane wall) | ~300 ms (1.6 us/lane) |
+| (1,0) f40 frame, 673k lanes in | 3.08 s (4.6 us/lane) | 0.94 s (1.4 us/lane) |
+| (1,0) f1..f40 total | 10.40 s | 4.02 s, peak 1.6 GB |
+| row storage at f35 | ~9 varying cols, ~50 typed B/row per pm1 block | 354 fragments/frame mean |
+
+Honest revision of the 2026-08-18 projection:
+
+1. TIME: the old "v0 ~10x per offered lane, 5x more coming" does NOT
+   hold against the PRODUCTION interpreter. Today the interpreter is
+   2-3x faster per frame at (1,0) depth. Its edge is representation:
+   pm1/fragment partitioning keeps ~350 mostly-uniform fragments where
+   the engine merges to ONE wide block per shape and then streams
+   every varying column per lane. Same rows (gate 2 proves it), ~4x
+   less core-time per lane.
+2. (2,0) TIME projection: campaign wall was 347.9 s/frame at 62.9M
+   lanes (5.5 us/lane, 16 threads, pos-graph included). Engine at
+   4.6 us/lane x est. 1.3-2x for 4-object rows = 6-9 us/lane -> rough
+   PARITY, not a win - and it cannot run (2,0) yet (devirt asserts;
+   needs the fruit-clean v9 recipe compiled + fruit widenings + death
+   deopt, or an engine deopt-to-plain).
+3. MEMORY - the real prize, unchanged: engine frontier at the (2,0)
+   f70 scale is 62.9M x ~50-100 B = 3-6 GB vs the interpreter's
+   67.6 GB RSS; the S-rung humps that OOM'd (57.6-97 GB for 1.7-2.4M
+   lanes of interpreter INTRA-frame machinery) become ~100-250 MB of
+   boundary rows + chunk-local MBs. The OOM wall that paused the
+   S-rung ladder is gone under the engine.
+
+Refined GO path (unchanged in direction, repriced in reason): the
+engine un-parks the S-RUNG LADDER on (2,0) by removing its memory
+wall; raw per-lane time is at parity until the engine closes the
+representation gap. The named engine unit for that gap: keep pm1-key
+partitions through frame_step instead of merging to one block per
+shape (partition_by_key exists; most columns become Col::U again,
+shrinking both streaming and storage) - measure, then re-run this
+table. Prerequisites for (2,0) at all: compile the fruit-clean v9
+recipe (verified on (2,0)) + port fruit widenings + death-frame
+deopt.
