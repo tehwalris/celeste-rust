@@ -695,6 +695,13 @@ pub trait Engine: Sized {
     fn un_hash(&mut self, v: Self::V) -> Self::V;
     fn select(&mut self, c: Self::V, t: Self::V, f: Self::V) -> Self::V;
     fn expand(&mut self, v: Self::V) -> Self::V;
+    /// An `expand` whose button the transpiler resolved statically (bit
+    /// K of the input byte). Engines without per-variant specialization
+    /// fall through to the dynamic expand.
+    #[inline(always)]
+    fn expand_btn<const K: u32>(&mut self, v: Self::V) -> Self::V {
+        self.expand(v)
+    }
 
     // control / liveness
     fn truthy_b(&mut self, v: Self::V, site: u32) -> bool;

@@ -60,7 +60,7 @@ pub enum TCol {
 }
 
 #[derive(Clone)]
-pub struct Rt3 {
+pub struct Rt3<const BTN: u8 = 0> {
     pub width: usize, // <= TILE (last tile of a chunk may be partial)
     pub structure: Vec<Cell2>,
     pub cols: Vec<TCol>,
@@ -80,10 +80,10 @@ pub struct Rt3 {
     pub tiles: Vec<[AV; TILE]>,
 }
 
-impl Rt3 {
+impl<const BTN: u8> Rt3<BTN> {
     /// Build a tile from lanes `[lo, hi)` of an Rt2 block. The block must
     /// be at a frame boundary (its columns fully materialized).
-    pub fn from_rt2(src: &Rt2, lo: usize, hi: usize) -> Rt3 {
+    pub fn from_rt2(src: &Rt2, lo: usize, hi: usize) -> Rt3<BTN> {
         let w = hi - lo;
         assert!(w <= TILE);
         let mut tiles: Vec<[AV; TILE]> = Vec::new();
@@ -177,6 +177,26 @@ impl Rt3 {
             };
             self.structure[target as usize] = Cell2::Val;
             self.cols[target as usize] = TCol::U(AV::Bool(pressed));
+        }
+    }
+
+    /// Rebind the tile to another input-variant type (fields are
+    /// BTN-independent; the parameter only drives const folding).
+    pub fn into_variant<const B: u8>(self) -> Rt3<B> {
+        Rt3::<B> {
+            width: self.width,
+            structure: self.structure,
+            cols: self.cols,
+            globals: self.globals,
+            strings: self.strings,
+            cart: self.cart,
+            cache: self.cache,
+            prints: self.prints,
+            valid: self.valid,
+            tape: self.tape,
+            cursor: self.cursor,
+            ks: self.ks,
+            tiles: self.tiles,
         }
     }
 
@@ -314,7 +334,7 @@ fn tcol_to_col(t: TCol) -> Col {
     }
 }
 
-impl Rt3 {
+impl<const BTN: u8> Rt3<BTN> {
     /// Fingerprint of the post-frame structure + globals: variants of one
     /// chunk must evolve identically (uniform ops) for their lanes to be
     /// accumulated into one block; checked via this hash.
@@ -414,7 +434,7 @@ impl Rt3 {
     }
 }
 
-impl Engine for Rt3 {
+impl<const BTN: u8> Engine for Rt3<BTN> {
     type V = TCol;
 
     fn c_num(&mut self, hi: i16, lo: u16) -> TCol {
@@ -659,6 +679,24 @@ impl Engine for Rt3 {
                 v
             }
             _ => bail(),
+        }
+    }
+
+    /// The transpiler-resolved button expand: a compile-time constant in
+    /// this variant. The loaded cell value must agree (set_buttons wrote
+    /// it) - disagreement means a mis-resolved site: bail loudly to Rt2.
+    #[inline(always)]
+    fn expand_btn<const K: u32>(&mut self, v: TCol) -> TCol {
+        // Only the bits this variant type is specialized on fold; other
+        // buttons pass their (concrete) cell value through.
+        if K == 4 || K == 5 {
+            let want = (BTN >> K) & 1 == 1;
+            match v {
+                TCol::U(AV::Bool(b)) if b == want => TCol::U(AV::Bool(want)),
+                _ => bail(),
+            }
+        } else {
+            self.expand(v)
         }
     }
 

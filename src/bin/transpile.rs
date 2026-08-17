@@ -67,6 +67,9 @@ fn l(id: LocalId) -> String {
 struct Gen {
     /// Name of the function currently being emitted (assert diagnostics).
     current_fn: String,
+    /// Defining instruction per local of the current function (static
+    /// chain walks, e.g. expand -> button resolution).
+    defs: HashMap<LocalId, Instruction>,
     /// (kind, fn name, interned field id or 0) per get_field/get_index
     /// site, in site-id order - the gap census's site table.
     site_info: Vec<(&'static str, String, u32, usize)>,
@@ -186,6 +189,44 @@ impl Gen {
             write!(out, "{} = __t{}; ", l(*dst), i).unwrap();
         }
         Ok(out)
+    }
+
+    /// Statically resolve which button an `expand` site reads: walk the
+    /// def chain expand <- load <- get_index(_, k_NAME+1) <- ... <-
+    /// get_global "k_NAME". Returns the button BIT (the k_* value the
+    /// harness Lua assigns, which is also the set_buttons array position).
+    fn button_of_expand(defs: &HashMap<LocalId, Instruction>, value: LocalId) -> Option<u32> {
+        const BITS: [(&str, u32); 6] = [
+            ("k_left", 0),
+            ("k_right", 1),
+            ("k_up", 2),
+            ("k_down", 3),
+            ("k_jump", 4),
+            ("k_dash", 5),
+        ];
+        let mut seen = 0;
+        let mut stack = vec![value];
+        while let Some(id) = stack.pop() {
+            seen += 1;
+            if seen > 64 {
+                return None;
+            }
+            match defs.get(&id)? {
+                Instruction::GetGlobal { name, .. } => {
+                    if let Some((_, bit)) = BITS.iter().find(|(n, _)| n == name) {
+                        return Some(*bit);
+                    }
+                }
+                Instruction::Load { source } => stack.push(*source),
+                Instruction::GetIndex { index, .. } => stack.push(*index),
+                Instruction::BinaryOp { left, right, .. } => {
+                    stack.push(*left);
+                    stack.push(*right);
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     fn emit_instruction(&mut self, id: LocalId, instr: &Instruction, out: &mut String) -> Result<()> {
@@ -348,7 +389,16 @@ impl Gen {
                 writeln!(out, "rt.assert_value_cell({}, {:?});", l(*target), format!("{} %{}", self.current_fn, usize::from(id)))?;
             }
             Instruction::AssertTrue { value } => writeln!(out, "rt.assert_true({}, {:?});", l(*value), format!("{} %{}", self.current_fn, usize::from(id)))?,
-            Instruction::Expand { value } => writeln!(out, "{} = rt.expand({});", d, l(*value))?,
+            Instruction::Expand { value } => match Self::button_of_expand(&self.defs, *value) {
+                Some(bit) => writeln!(
+                    out,
+                    "{} = rt.expand_btn::<{}>({});",
+                    d,
+                    bit,
+                    l(*value)
+                )?,
+                None => writeln!(out, "{} = rt.expand({});", d, l(*value))?,
+            },
         }
         Ok(())
     }
@@ -356,6 +406,11 @@ impl Gen {
     fn emit_function(&mut self, fn_id: u32, fun: &FunDef) -> Result<String> {
         let fn_name = fun.name.as_str().to_string();
         self.current_fn = fn_name.clone();
+        self.defs = fun
+            .cfg
+            .iter_blocks()
+            .flat_map(|b| b.instructions.iter().cloned())
+            .collect();
         let blocks = blocks_in_order(&fun.cfg);
         assert!(
             !fun.cfg.named.keys().any(|k| k.as_str() == "__entry"),
@@ -505,6 +560,7 @@ fn main() -> Result<()> {
 
     let mut gen = Gen {
         current_fn: String::new(),
+        defs: HashMap::new(),
         site_info: Vec::new(),
         branch_info: Vec::new(),
         strings: Interner::default(),

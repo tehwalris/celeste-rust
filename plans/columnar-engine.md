@@ -556,3 +556,25 @@ then reads/writes a dense slot array instead of pointer-chasing
 structure. Guards stay (site's receiver must match the bound cell -
 the census doctrine). Emission: a transpiler pass that rewrites
 get_field/get_index+load/store pairs on bound sites into slot ops.
+
+## Variant const-folding: scaffold landed, win blocked on slots (midday)
+
+Built: transpiler resolves all 20 expand sites' buttons statically
+(def-chain walk to the k_* global) and emits `rt.expand_btn::<K>`;
+`Rt3<const BTN>` folds the specialized bits; monomorphic dispatch.
+Results:
+- Full 64-way monomorphization EXPLODES compile time (>10 min, killed).
+  4-way (jump+dash bits only) compiles in ~2 min.
+- Arena removal (Engine::V = TCol by value): 10.9 -> 8.0 s. Real win.
+- Jump/dash const variants: NEUTRAL (8.2 s). Diagnosis: the constants
+  die at the first store/load pair - the program's dataflow runs
+  through heap cell columns (self.cols[p]), opaque to LLVM. SSA-only
+  folding cannot reach past a single instruction.
+
+CONCLUSION (the arc of the day converges): SLOT COMPILATION is
+strictly the critical path for both remaining factors - the ~178
+single-receiver cells must become compiler-visible locals/struct
+fields in the generated kernel (guarded, census doctrine) before
+per-variant folding or trunk sharing can pay. Everything else is
+scaffolding already in place: bench, tile runtime, variant dispatch,
+counter-replay, fallback, oracles.
