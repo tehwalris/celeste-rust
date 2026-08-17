@@ -1120,4 +1120,10 @@
 # ti_kill: the straightening resolves single-edge phis to their sources, which
 # extends source live ranges past kills derived on the branched CFG (observed:
 # use-after-kill panic at f25). Kills are derived annotations - re-derive last.
+{"at":"%2283","fn":"__frame","id":"sd000","rule":"demote_create"}
+{"at":"%2290","fn":"__frame","id":"sd001","rule":"demote_create"}
+{"at":"%2302","fn":"__frame","id":"sd002","rule":"demote_create"}
+{"at":"%2638","fn":"__frame","id":"sd003","rule":"demote_create"}
+{"at":"%2645","fn":"__frame","id":"sd004","rule":"demote_create"}
+{"at":"%2657","fn":"__frame","id":"sd005","rule":"demote_create"}
 {"id":"ti_kill","rule":"kill_dead"}

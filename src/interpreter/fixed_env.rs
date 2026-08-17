@@ -40,6 +40,33 @@ pub fn is_pure_builtin(name: &str) -> bool {
     PURE_BUILTINS.contains(&name)
 }
 
+/// Builtins whose one effect is *refinement*: one state in, one or more
+/// fragments out, whose union represents exactly the input state, with the
+/// result value concretized per fragment (`__split_by_flr` splits by floor
+/// bucket, `__split_at` three-ways around a constant). They read nothing
+/// outside their arguments and write nothing.
+///
+/// NOT pure in `PURE_BUILTINS`' sense - purity there means "exactly one
+/// result, state untouched", and multiplying states is the whole job - so
+/// they cannot be pinned to `CallBuiltin`, whose interpreter channel is
+/// single-value. They stay plain `Call`s, and the claim this list makes is
+/// different: running one *speculatively* (on states that would have
+/// skipped it) is sound, because a refinement is sound on any state - the
+/// fragments jointly stand for the same concrete states, only the state
+/// count changes. That is the same cost-not-correctness bargain `expand`
+/// speculation makes, and the bench answers for it.
+///
+/// `speculate_region`'s `splits` opt-in leans on this list: it accepts a
+/// region-internal `Call` only when the callee is provably
+/// `load(get_global(name))` with `name` here. A rebound global would
+/// miscall equally with or without speculation - the conversion adds no
+/// new failure mode on that axis.
+pub const REFINEMENT_BUILTINS: &[&str] = &["__split_by_flr", "__split_at"];
+
+pub fn is_refinement_builtin(name: &str) -> bool {
+    REFINEMENT_BUILTINS.contains(&name)
+}
+
 /// PreparedCfg holds a CFG along with precomputed analysis data.
 /// This caches the label set to avoid recomputing it on every interpret_cfg call.
 #[derive(Clone)]
