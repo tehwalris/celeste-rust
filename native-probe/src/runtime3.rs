@@ -1260,6 +1260,39 @@ impl<const BTN: u8> Engine for Rt3<BTN> {
             TCol::U(AV::Num(n)) => n.as_i16().unwrap_or_else(|| bail()),
             _ => bail(),
         };
+        // All-Num fast path, fully inline: only IMMUTABLE borrows of
+        // self, so no Arc clones. The previous shape - `self.cache
+        // .clone()` + `self.cart.clone()` per call to satisfy the map2
+        // closure - was ~17% of the bench kernel, and the profile showed
+        // nearly all of it in the `lock incq/decq` refcount traffic (29
+        // threads bouncing the two Arc cache lines), not in the lookup.
+        // The (wi, hi) map dispatch is also hoisted out of the lane loop.
+        if let (Some(a), Some(b)) = (self.num_src(x), self.num_src(y)) {
+            let map = self.cache.solid_map(wi, hi);
+            let eval = |xn: P8, yn: P8| -> bool {
+                let (Some(xi), Some(yi)) = (xn.as_i16(), yn.as_i16()) else {
+                    bail()
+                };
+                if let Some((map, dx, dy)) = &map {
+                    if let Some(v) = map.get(xi + dx, yi + dy) {
+                        return v;
+                    }
+                }
+                self.cache.solid_at(&self.cart, xi, yi, wi, hi).unwrap_or(false)
+            };
+            if let (NumSrc::S(xn), NumSrc::S(yn)) = (a, b) {
+                return TCol::U(AV::Bool(eval(xn, yn)));
+            }
+            let mut m = 0u64;
+            for i in 0..self.width {
+                if eval(self.num_at(a, i), self.num_at(b, i)) {
+                    m |= 1 << i;
+                }
+            }
+            return TCol::B(m, self.log_w);
+        }
+        // Generic fallback (non-Num operands) - cold; the Arc clones for
+        // the closure are fine here.
         let cache = self.cache.clone();
         let cart = self.cart.clone();
         self.map2(x, y, move |a, b| {

@@ -29,6 +29,22 @@ bailed chunks rerun on Rt2, oracle still exact).
 
 Even under tiles the run phase is 93% of a deep frame, so the next
 lever stays the kernel/per-chunk-boundary, not the serial epilogue.
+
+Follow-up the fresh profile found immediately: `bi_tile_flag_at` was
+19% of the kernel, and `perf annotate` put nearly all of it on the
+`lock incq/decq` pair of `self.cache.clone()` + `self.cart.clone()` -
+29 threads bouncing two Arc refcount cache lines once per builtin
+call. Rewritten as an inline all-Num pane->mask loop with only
+immutable borrows (no Arc clones; (wi,hi) map dispatch hoisted out of
+the lane loop): bench **1031 -> 639 ms** (3402 ns/input-lane, exact),
+mode 1 4373 -> 3776 ms, from-scratch `--abstract 40` 17.55 ->
+**10.85 s** (f40 frame 3.17 s), all lane counts exact, scalar
+hex-exact. Post-fix profile: f_15 glue 17%, select 14%, per-chunk
+Rt2::boundary 12.6%, append_into 12.3% - flat memory-bound work, no
+contention pattern left in the top symbols. Lesson recorded: in
+per-call helpers on the hot path, Arc clones are NOT free under
+parallelism - profile attribution showed the cost inside the callee,
+not at the clone site.
 Re-arming slots (a future typed-slots campaign) means regenerating
 with `--site-slots plans/site-slots-room10-f035.json` - that closes
 the gate to one shape again, so it must come with a census for EVERY
