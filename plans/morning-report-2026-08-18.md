@@ -122,10 +122,25 @@ interpreter's single core at f30. At depth (f40) the boundary/dedup
 path is the new measured frontier. plans/columnar-engine.md has the
 full ladder.
 
+## Final numbers (~08:00)
+
+- 30 abstract frames: **0.25 s wall** (f30 = 128 ms on 30 cores) -
+  from 6.6 s/frame naive serial at the first light of the engine.
+- Gate 1 exact f1..f40, twice re-verified after every optimization
+  (typed columns, COW columns, order-independent row keys).
+- Scalar concrete probe: 1933 ns/frame, hex-identical f340.
+- Everything pushed through the order-independent-keys commit.
+
 ## Where the next session starts
 
-plans/columnar-engine.md "Typed columns, measured" bottom: per-op time
-census inside the engine, then fused loops OR the crate restructure
-(goal 3), whichever the morning review prioritizes. The gap picture
-target remains: within ~1.2x of hand-tuned per phase, or a named
-transformation for each remaining gap.
+In priority order, all named with measurements behind them:
+1. Goal-7 pass on the engine's boundary: parallelize the serial
+   merge/dedup section (k-way merge + 900k-entry dedup map at f40),
+   radix/sharded dedup - the measured depth frontier.
+2. Crate restructure (goal 3, Philippe's explicit ask): celeste-core /
+   celeste-engine / celeste-cli.
+3. Gate 2 (row-set equality via State reconstruction) - required
+   before any proof-grade claim from the engine.
+4. select/map2 fusion or typed-bool columns (650+466 ms serial).
+5. Fruit widenings + death deopt -> rooms (2,0)/(0,0) -> re-price the
+   S-rung natively (the 300m go/no-go's GO path).
