@@ -626,11 +626,67 @@ impl Gen {
             }
         }
 
+        // Local scoping: a single-def local used only inside its own
+        // block is declared INLINE (`let lN = ...`) so LLVM can keep it
+        // in a register. The old scheme - fn-scope `let mut` for every
+        // local - put ~3200 temporaries on one huge stack frame, and
+        // the profile showed f_15's self time dominated by stack
+        // reloads of those E::V values. Phi targets/sources, captures
+        // and args stay fn-scope (multi-assigned or cross-block).
+        let mut upfront: BTreeSet<usize> = BTreeSet::new();
+        let mut def_blk: HashMap<usize, usize> = HashMap::new();
+        for id in fun.capture_ids.iter() {
+            upfront.insert(usize::from(*id));
+        }
+        for id in fun.arg_ids.iter().flatten() {
+            upfront.insert(usize::from(*id));
+        }
+        for (bi, (_, block)) in blocks.iter().enumerate() {
+            for (id, instr) in &block.instructions {
+                if let Instruction::Phi { branches } = instr {
+                    upfront.insert(usize::from(*id));
+                    for (_, src) in branches {
+                        upfront.insert(usize::from(*src));
+                    }
+                    continue;
+                }
+                let prev = def_blk.insert(usize::from(*id), bi);
+                assert!(prev.is_none(), "{}: %{} defined twice", fn_name, usize::from(*id));
+            }
+        }
+        let mut used_outside: BTreeSet<usize> = BTreeSet::new();
+        for (bi, (_, block)) in blocks.iter().enumerate() {
+            let mut mark = |id: LocalId, used_outside: &mut BTreeSet<usize>| {
+                let id = usize::from(id);
+                if def_blk.get(&id) != Some(&bi) {
+                    used_outside.insert(id);
+                }
+            };
+            for (_, instr) in &block.instructions {
+                if matches!(instr, Instruction::Phi { .. }) {
+                    continue;
+                }
+                for u in instr.get_used_locals() {
+                    mark(u, &mut used_outside);
+                }
+            }
+            for u in block.terminator.1.get_used_locals() {
+                mark(u, &mut used_outside);
+            }
+        }
+        let inline_locals: BTreeSet<usize> = def_blk
+            .keys()
+            .copied()
+            .filter(|id| !upfront.contains(id) && !used_outside.contains(id))
+            .collect();
+
         let mut out = String::new();
         writeln!(out, "/// `{}`", fn_name)?;
         writeln!(out, "pub fn f_{}<E: Engine>(rt: &mut E, caps: &[E::V], args: &[E::V]) -> E::V {{", fn_id)?;
         for id in Self::collect_locals(fun) {
-            writeln!(out, "    let mut l{}: E::V = rt.c_nil();", id)?;
+            if !inline_locals.contains(&id) {
+                writeln!(out, "    let mut l{}: E::V = rt.c_nil();", id)?;
+            }
         }
         for (i, cap) in fun.capture_ids.iter().enumerate() {
             writeln!(out, "    {} = caps[{}];", l(*cap), i)?;
@@ -650,7 +706,20 @@ impl Gen {
                 if matches!(instr, Instruction::Phi { .. }) {
                     continue;
                 }
-                self.emit_instruction(*id, instr, &mut body)?;
+                if inline_locals.contains(&usize::from(*id)) {
+                    // Block-scoped single-def local: `let lN = ...`.
+                    let mut one = String::new();
+                    self.emit_instruction(*id, instr, &mut one)?;
+                    // Statement instructions (Store/Kill/asserts) carry
+                    // an id but assign nothing - leave those untouched.
+                    let pat = format!("{} = ", l(*id));
+                    if let Some(at) = one.find(&pat) {
+                        one.insert_str(at, "let ");
+                    }
+                    body.push_str(&one);
+                } else {
+                    self.emit_instruction(*id, instr, &mut body)?;
+                }
             }
             let pred_label = if i == 0 { None } else { Some(label.as_str()) };
             let edge = |target: &str| -> Result<String> {
