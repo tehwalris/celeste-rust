@@ -315,3 +315,32 @@ long tail of small ops at width. Next lever needs DATA, not guesses:
 Wall clock at f30: 1.24 s on 30 cores (poor scaling ~1.7x - round-robin
 chunk queues without stealing + serial merge; also unmeasured
 bandwidth ceiling). 30 frames end-to-end: 2.13 s wall.
+
+## Per-op census result (2026-08-18, ~06:30)
+
+`CELESTE_OP_CENSUS=1` on the serial 30-frame run (3.6 s total):
+
+    widen          1740.6 ms   1572 calls   <- 48% of everything
+    map2_generic    526.6 ms  50759 calls
+    select          425.1 ms  73320 calls
+    load             33.7 ms  81578 calls
+    store            32.9 ms  28406 calls
+    map1_generic     16.9 ms  16429 calls
+
+The dominator is WIDEN - the lane-append at expand/split sites copies
+every LIVE VARYING column (hundreds mid-frame) at the current width.
+Eager frame-start button expansion was tried to make widens hit an
+empty arena and is MEASURED OUT: the whole frame then runs 64x wide
+from instruction 0 (f30 serial 2.2 -> 7.0 s; reverted, fn kept dead
+with a note). The interpreter's lazy expansion wins for the same
+reason.
+
+Named next steps for the widen cost, in expected-win order:
+1. COW / lane-indirection columns: a split appends a lane MAP, not
+   data; columns materialize lazily on first write at the new width.
+   Turns the 6 doublings into O(1) each; ops read through the map.
+2. Shrink the live-varying set at expand sites (kill_dead is block-
+   grained; expand-site liveness could be much tighter - measure how
+   many varying columns are live at each of the 20 expand sites).
+3. Fused regions (transpiler) remain the map2/select answer (~950 ms
+   combined) once widen is gone.

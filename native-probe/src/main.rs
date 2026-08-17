@@ -663,6 +663,8 @@ fn run_abstract(num_frames: u32) {
         }
     }));
     let mut blocks: Vec<runtime2::Rt2> = vec![rt2];
+    let mut census_total: rustc_hash::FxHashMap<&'static str, (u64, u64, u64)> =
+        Default::default();
     let start = std::time::Instant::now();
     for frame in 1..=num_frames {
         let t0 = std::time::Instant::now();
@@ -769,6 +771,9 @@ fn run_abstract(num_frames: u32) {
         for done in results {
             ran.extend(done);
         }
+        for sub in ran.iter_mut() {
+            sub.drain_census(&mut census_total);
+        }
         // Drop rows already seen this frame, then k-way merge same-shape
         // blocks in one pass.
         let mut seen: rustc_hash::FxHashMap<(u64, u64), ()> = Default::default();
@@ -815,4 +820,12 @@ fn run_abstract(num_frames: u32) {
         );
     }
     println!("abstract: {} frames in {:.3?}", num_frames, start.elapsed());
+    if !census_total.is_empty() {
+        let mut rows: Vec<_> = census_total.into_iter().collect();
+        rows.sort_by_key(|(_, (ns, _, _))| std::cmp::Reverse(*ns));
+        println!("op census (name, total ms, calls):");
+        for (name, (ns, calls, _)) in rows {
+            println!("  {:14} {:9.1} ms  {:>12} calls", name, ns as f64 / 1e6, calls);
+        }
+    }
 }

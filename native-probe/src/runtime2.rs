@@ -129,6 +129,10 @@ pub struct Rt2 {
     pub origin: Vec<u32>,
     /// Recycled column buffers (killed/overwritten varying columns).
     pool: Vec<Vec<AV>>,
+    /// Per-category time census (CELESTE_OP_CENSUS=1): name -> (ns, calls,
+    /// lanes). The data that decides the next optimization, op_census
+    /// doctrine.
+    pub census: Option<FxHashMap<&'static str, (u64, u64, u64)>>,
     /// Set by `boundary`: the canonical structure hash (the shape key).
     pub shape_hash: u64,
     /// Set by `boundary`: per-lane 128-bit canonical row keys.
@@ -491,6 +495,7 @@ impl Rt2 {
             stat_appended: 0,
             stat_arena_peak: 0,
             pool: Vec::new(),
+            census: std::env::var_os("CELESTE_OP_CENSUS").map(|_| FxHashMap::default()),
             origin: Vec::new(),
             shape_hash: 0,
             row_keys: Vec::new(),
@@ -642,6 +647,37 @@ impl Rt2 {
         Some(self.put(Col::V(out)))
     }
 
+    #[inline]
+    fn rec(&mut self, name: &'static str, t0: Option<std::time::Instant>) {
+        if let (Some(census), Some(t0)) = (self.census.as_mut(), t0) {
+            let e = census.entry(name).or_insert((0, 0, 0));
+            e.0 += t0.elapsed().as_nanos() as u64;
+            e.1 += 1;
+        }
+    }
+
+    #[inline]
+    fn t0(&self) -> Option<std::time::Instant> {
+        if self.census.is_some() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        }
+    }
+
+    /// Merge a sub-block's census into an accumulator map.
+    pub fn drain_census(&mut self, into: &mut FxHashMap<&'static str, (u64, u64, u64)>) {
+        if let Some(census) = self.census.take() {
+            for (k, v) in census {
+                let e = into.entry(k).or_insert((0, 0, 0));
+                e.0 += v.0;
+                e.1 += v.1;
+                e.2 += v.2;
+            }
+            self.census = Some(FxHashMap::default());
+        }
+    }
+
     /// A cleared buffer with capacity for the current width (recycled).
     #[inline]
     fn buf(&mut self) -> Vec<AV> {
@@ -656,6 +692,14 @@ impl Rt2 {
 
     #[inline]
     fn map1(&mut self, a: ColId, f: impl Fn(AV) -> AV) -> ColId {
+        let t = self.t0();
+        let r = self.map1_inner(a, f);
+        self.rec("map1_generic", t);
+        r
+    }
+
+    #[inline]
+    fn map1_inner(&mut self, a: ColId, f: impl Fn(AV) -> AV) -> ColId {
         match self.get(a) {
             Col::U(x) => {
                 let out = Col::U(f(*x));
@@ -684,6 +728,14 @@ impl Rt2 {
 
     #[inline]
     fn map2(&mut self, a: ColId, b: ColId, f: impl Fn(AV, AV) -> AV) -> ColId {
+        let t = self.t0();
+        let r = self.map2_inner(a, b, f);
+        self.rec("map2_generic", t);
+        r
+    }
+
+    #[inline]
+    fn map2_inner(&mut self, a: ColId, b: ColId, f: impl Fn(AV, AV) -> AV) -> ColId {
         if let (Col::U(x), Col::U(y)) = (self.get(a), self.get(b)) {
             let out = Col::U(f(*x, *y));
             return self.put(out);
@@ -695,6 +747,53 @@ impl Rt2 {
         self.put(Col::V(out))
     }
 
+    fn load_inner(&mut self, v: ColId) -> ColId {
+        match self.get(v) {
+            Col::U(AV::Ptr(p)) => {
+                let p = *p as usize;
+                match &self.structure[p] {
+                    Cell2::Val => {
+                        let c = self.cols[p].clone();
+                        self.put(c)
+                    }
+                    _ => self.put(Col::U(AV::Ptr(p as u32))),
+                }
+            }
+            Col::U(AV::NilPtr) => self.put(Col::U(AV::Nil)),
+            _ => {
+                let p = self.uptr(v);
+                match &self.structure[p as usize] {
+                    Cell2::Val => {
+                        let c = self.cols[p as usize].clone();
+                        self.put(c)
+                    }
+                    _ => self.put(Col::U(AV::Ptr(p))),
+                }
+            }
+        }
+    }
+
+
+    fn select_inner(&mut self, c: ColId, t: ColId, f: ColId) -> ColId {
+        let pick = |cv: AV, tv: AV, fv: AV| -> AV {
+            match cv {
+                AV::Bool(true) => tv,
+                AV::Bool(false) => fv,
+                other => panic!("select on a non-bool condition: {:?}", other),
+            }
+        };
+        let out = match (self.get(c), self.get(t), self.get(f)) {
+            (Col::U(cv), Col::U(tv), Col::U(fv)) => Col::U(pick(*cv, *tv, *fv)),
+            (cc, tc, fc) => Col::V(
+                (0..self.width)
+                    .map(|i| pick(cc.at(i), tc.at(i), fc.at(i)))
+                    .collect(),
+            ),
+        };
+        self.put(out)
+    }
+
+
     /// Append lanes: `srcs[k]` is the source lane the k-th appended lane
     /// copies. Uniform columns are untouched (appending a copy preserves
     /// uniformity); varying columns extend. Covers every live local column
@@ -704,6 +803,7 @@ impl Rt2 {
         if srcs.is_empty() {
             return;
         }
+        let t = self.t0();
         self.stat_splits += 1;
         self.stat_appended += srcs.len() as u64;
         // The expand pattern doubles whole blocks: srcs == [0, 1, .., w-1].
@@ -777,6 +877,7 @@ impl Rt2 {
             self.origin.push(o);
         }
         self.width += srcs.len();
+        self.rec("widen", t);
     }
 
     /// Lane-multiplying op, allocation-free per lane: `alt(lane, k)` is
@@ -852,35 +953,18 @@ impl Engine for Rt2 {
     }
 
     fn load(&mut self, v: ColId) -> ColId {
-        match self.get(v) {
-            Col::U(AV::Ptr(p)) => {
-                let p = *p as usize;
-                match &self.structure[p] {
-                    Cell2::Val => {
-                        let c = self.cols[p].clone();
-                        self.put(c)
-                    }
-                    _ => self.put(Col::U(AV::Ptr(p as u32))),
-                }
-            }
-            Col::U(AV::NilPtr) => self.put(Col::U(AV::Nil)),
-            _ => {
-                let p = self.uptr(v);
-                match &self.structure[p as usize] {
-                    Cell2::Val => {
-                        let c = self.cols[p as usize].clone();
-                        self.put(c)
-                    }
-                    _ => self.put(Col::U(AV::Ptr(p))),
-                }
-            }
-        }
+        let t = self.t0();
+        let r = self.load_inner(v);
+        self.rec("load", t);
+        r
     }
 
     fn store(&mut self, t: ColId, s: ColId) {
+        let tm = self.t0();
         let p = self.uptr(t) as usize;
         self.structure[p] = Cell2::Val;
         self.cols[p] = self.get(s).clone();
+        self.rec("store", tm);
     }
 
     fn store_empty_table(&mut self, t: ColId) {
@@ -1087,22 +1171,10 @@ impl Engine for Rt2 {
     /// select on UnknownBool is exactly what rule #96 eliminated; hitting
     /// one is a domain exit.
     fn select(&mut self, c: ColId, t: ColId, f: ColId) -> ColId {
-        let pick = |cv: AV, tv: AV, fv: AV| -> AV {
-            match cv {
-                AV::Bool(true) => tv,
-                AV::Bool(false) => fv,
-                other => panic!("select on a non-bool condition: {:?}", other),
-            }
-        };
-        let out = match (self.get(c), self.get(t), self.get(f)) {
-            (Col::U(cv), Col::U(tv), Col::U(fv)) => Col::U(pick(*cv, *tv, *fv)),
-            (cc, tc, fc) => Col::V(
-                (0..self.width)
-                    .map(|i| pick(cc.at(i), tc.at(i), fc.at(i)))
-                    .collect(),
-            ),
-        };
-        self.put(out)
+        let tm = self.t0();
+        let r = self.select_inner(c, t, f);
+        self.rec("select", tm);
+        r
     }
 
     /// Expand (core_interpreter.rs:545): a concrete bool passes through;
@@ -1980,6 +2052,42 @@ impl Rt2 {
         self.origin = (0..self.width as u32).collect();
     }
 
+    /// Frame-start button expansion (#47). MEASURED OUT (2026-08-18): it
+    /// makes each widen nearly free (empty arena) but the whole frame then
+    /// runs 64x wide from instruction 0 - f30 serial went 2.2s -> 7.0s.
+    /// The interpreter's lazy expansion wins for the same reason. Kept
+    /// (unused) as the measurement's artifact; delete on next cleanup.
+    #[allow(dead_code)]
+    pub fn expand_buttons(&mut self, g_button_states: u32) {
+        let arr = match self.global_target(g_button_states) {
+            Some(a) => a,
+            None => return,
+        };
+        let items = match &self.structure[arr as usize] {
+            Cell2::Arr(items) => items.clone(),
+            _ => return,
+        };
+        for item in items {
+            let target = match &self.structure[item as usize] {
+                Cell2::Val => match self.cols[item as usize] {
+                    Col::U(AV::Ptr(t)) => t,
+                    _ => item,
+                },
+                _ => item,
+            };
+            if !matches!(self.cols[target as usize], Col::U(AV::UBool)) {
+                continue;
+            }
+            let w = self.width;
+            let srcs: Vec<usize> = (0..w).collect();
+            self.widen(&srcs);
+            let mut col: Vec<AV> = Vec::with_capacity(2 * w);
+            col.extend(std::iter::repeat(AV::Bool(true)).take(w));
+            col.extend(std::iter::repeat(AV::Bool(false)).take(w));
+            self.cols[target as usize] = Col::V(col);
+        }
+    }
+
     /// Keep only the given lanes (ascending indices), in every value
     /// column, closure capture and row key.
     pub fn retain_lanes(&mut self, keep: &[u32]) {
@@ -2101,6 +2209,7 @@ impl Rt2 {
             stat_appended: self.stat_appended,
             stat_arena_peak: self.stat_arena_peak,
             pool: Vec::new(),
+            census: self.census.as_ref().map(|_| FxHashMap::default()),
             origin: Vec::new(),
             shape_hash: self.shape_hash,
             row_keys: Vec::new(),
@@ -2123,6 +2232,7 @@ impl Rt2 {
             stat_appended: self.stat_appended,
             stat_arena_peak: self.stat_arena_peak,
             pool: Vec::new(),
+            census: self.census.as_ref().map(|_| FxHashMap::default()),
             origin: self.origin.clone(),
             shape_hash: self.shape_hash,
             row_keys: self.row_keys.clone(),
