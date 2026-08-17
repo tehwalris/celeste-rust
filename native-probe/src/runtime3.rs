@@ -98,6 +98,11 @@ pub struct Rt3<const BTN: u8 = 0> {
     /// Payload pool for TCol::N (all-Num panes) + creation logs.
     pub tiles_n: Vec<[P8; TILE]>,
     tile_log_n: Vec<u8>,
+    /// Undo log: indices of TEMPLATE structure cells whose kind was
+    /// mutated this pass (store on a non-Val cell, store_empty_table,
+    /// store_closure, table growth). `reset_from` restores exactly
+    /// these, so per-row reset needs NO structure clone.
+    dirty: Vec<u32>,
     /// log2(width) at each tile's creation, parallel to `tiles`. When
     /// `expand` doubles the lane axis (dynamic-expand mode), OLD tiles
     /// are never rewritten: lane j of an old tile is read as
@@ -270,6 +275,7 @@ impl<const BTN: u8> Rt3<BTN> {
             tiles,
             tile_log_n: vec![0; tiles_n.len()],
             tiles_n,
+            dirty: Vec::new(),
             log_w: 0,
             slots: [TCol::U(AV::Nil); crate::gen::N_SLOTS],
             guard: slot_guard(),
@@ -290,6 +296,45 @@ impl<const BTN: u8> Rt3<BTN> {
     pub fn writeback_slots(&mut self) {
         for (k, &cell) in crate::gen::SLOT_CELLS.iter().enumerate() {
             self.cols[cell as usize] = self.slots[k];
+        }
+    }
+
+    /// Cheap per-pass reset against a per-CHUNK template: truncate the
+    /// appended cells, restore the dirty-logged structure cells, clear
+    /// the tile pools (capacity retained). Column VALUES are not
+    /// restored here - call `load_row` next. This replaces the
+    /// per-row/per-pass template clone (a full Vec<Cell2> deep clone,
+    /// 7% of the frame).
+    pub fn reset_from(&mut self, template: &Rt3<BTN>) {
+        let base = template.structure.len();
+        self.structure.truncate(base);
+        for &i in &self.dirty {
+            if (i as usize) < base {
+                self.structure[i as usize] = template.structure[i as usize].clone();
+            }
+        }
+        self.dirty.clear();
+        self.cols.truncate(base);
+        self.globals.copy_from_slice(&template.globals);
+        self.tiles.clear();
+        self.tile_log.clear();
+        self.tiles_n.clear();
+        self.tile_log_n.clear();
+        self.width = template.width;
+        self.log_w = template.log_w;
+    }
+
+    /// Fill the base columns with boundary row `row` of the chunk
+    /// (width-1 tile: every column uniform). No allocation.
+    pub fn load_row(&mut self, chunk: &Rt2, row: usize) {
+        debug_assert_eq!(self.cols.len(), chunk.cols.len());
+        for (c, col) in chunk.cols.iter().enumerate() {
+            self.cols[c] = TCol::U(match col {
+                Col::U(a) => *a,
+                Col::V(vs) => vs[row],
+                Col::N(vs) => AV::Num(vs[row]),
+                Col::I(vs) => AV::Ival(vs[row].0, vs[row].1),
+            });
         }
     }
 
@@ -344,6 +389,7 @@ impl<const BTN: u8> Rt3<BTN> {
             tiles_n: self.tiles_n,
             tile_log_n: self.tile_log_n,
             tile_log: self.tile_log,
+            dirty: self.dirty,
             log_w: self.log_w,
             slots: self.slots,
             guard: self.guard,
@@ -783,12 +829,16 @@ impl<const BTN: u8> Engine for Rt3<BTN> {
 
     fn store(&mut self, t: TCol, s: TCol) {
         let p = self.uptr(t) as usize;
-        self.structure[p] = Cell2::Val;
+        if !matches!(self.structure[p], Cell2::Val) {
+            self.dirty.push(p as u32);
+            self.structure[p] = Cell2::Val;
+        }
         self.cols[p] = s;
     }
 
     fn store_empty_table(&mut self, t: TCol) {
         let p = self.uptr(t) as usize;
+        self.dirty.push(p as u32);
         self.structure[p] = Cell2::Unk;
         self.cols[p] = TCol::U(AV::Nil);
     }
@@ -796,6 +846,7 @@ impl<const BTN: u8> Engine for Rt3<BTN> {
     fn store_closure(&mut self, t: TCol, f: u32, caps: &[TCol]) {
         let p = self.uptr(t) as usize;
         let caps: Box<[Col]> = caps.iter().map(|c| tcol_to_col(*c)).collect();
+        self.dirty.push(p as u32);
         self.structure[p] = Cell2::Clo(f, caps);
         self.cols[p] = TCol::U(AV::Nil);
     }
@@ -813,6 +864,7 @@ impl<const BTN: u8> Engine for Rt3<BTN> {
             let cell = self.structure.len() as u32;
             self.structure.push(Cell2::Val);
             self.cols.push(TCol::U(AV::Nil));
+            self.dirty.push(table as u32);
             match &mut self.structure[table] {
                 Cell2::Obj(fields) => fields.push((f, cell)),
                 slot @ Cell2::Unk => *slot = Cell2::Obj(vec![(f, cell)]),
@@ -857,6 +909,7 @@ impl<const BTN: u8> Engine for Rt3<BTN> {
                 tail.push(gap);
             }
             let cell = *tail.last().unwrap();
+            self.dirty.push(table as u32);
             match &mut self.structure[table] {
                 Cell2::Arr(items) => items.extend_from_slice(&tail),
                 slot @ Cell2::Unk => *slot = Cell2::Arr(tail),
@@ -1211,6 +1264,7 @@ impl<const BTN: u8> Engine for Rt3<BTN> {
             BI___WIDEN_REM | BI___NEW_VECTOR | BI_ERROR => bail(),
             BI___ARRAY_TABLE_DROP_LAST => {
                 let p = self.uptr(args[0]) as usize;
+                self.dirty.push(p as u32);
                 match &mut self.structure[p] {
                     Cell2::Arr(items) => {
                         if items.is_empty() {
@@ -1334,6 +1388,7 @@ impl<const BTN: u8> Engine for Rt3<BTN> {
                 let cell = self.structure.len() as u32;
                 self.structure.push(Cell2::Val);
                 self.cols.push(value);
+                self.dirty.push(p as u32);
                 match &mut self.structure[p] {
                     Cell2::Arr(items) => items.push(cell),
                     slot @ Cell2::Unk => *slot = Cell2::Arr(vec![cell]),

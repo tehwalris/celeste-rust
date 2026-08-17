@@ -1246,12 +1246,18 @@ fn run_chunk_dynexp(
         return None;
     }
     let mut acc: Option<(runtime2::Rt2, u64)> = None;
+    // ONE template per chunk (the only structure deep-clone); per row
+    // the working tile is reset via the undo log and refilled with the
+    // row's column values - no allocation, capacities retained.
+    let template: runtime3::Rt3<0xFF> = runtime3::Rt3::from_rt2(chunk, 0, 1);
+    let mut rt3 = template.clone();
     for row in 0..chunk.width {
-        let template: runtime3::Rt3<0xFF> = runtime3::Rt3::from_rt2(chunk, row, row + 1);
         let mut tape: Vec<u8> = Vec::new();
         loop {
-            let mut rt3 = template.clone();
-            rt3.tape = tape.clone();
+            rt3.reset_from(&template);
+            rt3.load_row(chunk, row);
+            rt3.tape.clear();
+            rt3.tape.extend_from_slice(&tape);
             rt3.begin_pass();
             rt3.bind_slots();
             let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
