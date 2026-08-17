@@ -1027,3 +1027,36 @@ The next rungs are each structural, in expected-value order:
 3. Row batching >1 row per tile at low fan-out (plan note exists).
 4. The op count itself: typed constant folding over the uniform trunk
    (the compile recipe's dead selects fold once types are static).
+
+## Stage-2 KERNEL design (agreed with Philippe, 2026-08-17 night) + recon
+
+Architecture (Philippe's model, adopted):
+- OUTER scope: (shape, rows) -> [(shape, rows)] with dedup - this is
+  frame_step + boundary as certified by gate 2. Reference impl = Rt2.
+- INNER scope: a tiny fully-compiled SIMD kernel, no traits, no tags,
+  straight-line; lanes = ROWS (width 16 x i32 = one zmm, decided by
+  measurement); native lane types: Num (i32), Interval (2 x i32
+  planes), Bool/UBool (value+known masks), 16+16 int packing later.
+  Per-lane DEOPT mask instead of bails: weird lanes' input rows go to
+  a deopt list -> Rt2. Fan-out: transpiler splits the program at the
+  first button read - shared prefix once per slice, suffix x64 with
+  baked button constants (keeps the measured 4x trunk sharing).
+  Dynamic splits (straddles) deopt (22/frame at (1,0) - noise).
+  Scalar Rt stays as the concrete hex oracle (test-only).
+- Build order: standalone kernel bench FIRST (real f35 rows, all 64
+  inputs, prove the speed), integration second.
+
+Recon (`transpile --kernel-recon`, compile recipe):
+- __frame itself: 1,512 instrs, 55 branches, 18 calls. All 18 call
+  targets are closures loaded from SHAPE cells (not in-function
+  asserts) - the kernel resolves them from the shape, same as every
+  other static fact. 6 no-arg calls + the object update/move family.
+- __frame is NOT loop-free: the for_head/for_body families (object
+  iteration, zn regions) are real CFG cycles. The fused update
+  (anonymous_61) is the loop-free part. In the steady shape the trip
+  counts are shape constants (object array length), so the kernel
+  emitter UNROLLS them at emit time; bound mismatch -> deopt.
+- The emitter therefore needs: shape facts (cell types, closure
+  targets, array lengths), full inlining + unrolling into one DAG,
+  if-conversion of ~55+ branches with masked stores, per-lane deopt
+  accumulation under the active mask.

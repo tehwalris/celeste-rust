@@ -774,14 +774,145 @@ fn str_array(name: &str, items: &[String]) -> String {
     out
 }
 
+/// Feasibility recon for the SIMD kernel emitter (plans/columnar-engine.md
+/// stage 2): from `__frame`, how much of the program inlines statically?
+/// - calls: resolvable via a dominating AssertClosure (approximated
+///   per-function - the devirt entries assert right before the call)?
+/// - control flow: is every reachable CFG a DAG (if-convertible)?
+/// - size: multiplicity-weighted instruction/branch counts after full
+///   inlining - the straight-line kernel's length.
+fn kernel_recon(program: &celeste_rust::rewrite::program::Program) {
+    use std::collections::VecDeque;
+    struct Info {
+        calls: Vec<String>,
+        unresolved: usize,
+        branches: usize,
+        instrs: usize,
+        cyclic: bool,
+        expands: usize,
+        heap_sites: usize,
+    }
+    let mut infos: HashMap<String, Info> = HashMap::new();
+    for (name, fun) in &program.functions {
+        let blocks = blocks_in_order(&fun.cfg);
+        let index_of: HashMap<&str, usize> =
+            blocks.iter().enumerate().map(|(i, (l, _))| (l.as_str(), i)).collect();
+        // Cycle check: iterative DFS with an on-stack mark.
+        let mut state = vec![0u8; blocks.len()]; // 0 unvisited, 1 on stack, 2 done
+        let mut cyclic = false;
+        let mut stack: Vec<(usize, usize)> = vec![(0, 0)];
+        state[0] = 1;
+        while let Some((b, si)) = stack.pop() {
+            let succs = blocks[b].1.terminator.1.successor_labels();
+            if si < succs.len() {
+                stack.push((b, si + 1));
+                let t = index_of[succs[si].as_str()];
+                match state[t] {
+                    0 => {
+                        state[t] = 1;
+                        stack.push((t, 0));
+                    }
+                    1 => cyclic = true,
+                    _ => {}
+                }
+            } else {
+                state[b] = 2;
+            }
+        }
+        let mut info = Info {
+            calls: Vec::new(),
+            unresolved: 0,
+            branches: 0,
+            instrs: 0,
+            cyclic,
+            expands: 0,
+            heap_sites: 0,
+        };
+        let mut asserted: HashMap<usize, String> = HashMap::new();
+        for (_, block) in &blocks {
+            for (_, instr) in &block.instructions {
+                info.instrs += 1;
+                match instr {
+                    Instruction::AssertClosure { value, fun_def, .. } => {
+                        asserted.insert(usize::from(*value), fun_def.as_str().to_string());
+                    }
+                    Instruction::Call { closure, .. } => {
+                        match asserted.get(&usize::from(*closure)) {
+                            Some(f) => info.calls.push(f.clone()),
+                            None => info.unresolved += 1,
+                        }
+                    }
+                    Instruction::Expand { .. } => info.expands += 1,
+                    Instruction::GetField { .. } | Instruction::GetIndex { .. } => {
+                        info.heap_sites += 1
+                    }
+                    _ => {}
+                }
+            }
+            if matches!(block.terminator.1, Terminator::ConditionalBranch { .. }) {
+                info.branches += 1;
+            }
+        }
+        infos.insert(name.as_str().to_string(), info);
+    }
+    // Reachability + multiplicity-weighted inlined totals from __frame.
+    let mut mult: HashMap<String, u64> = HashMap::new();
+    let mut queue: VecDeque<(String, u64)> = VecDeque::new();
+    queue.push_back(("__frame".to_string(), 1));
+    let mut inline_depth_guard = 0u64;
+    while let Some((f, m)) = queue.pop_front() {
+        inline_depth_guard += 1;
+        assert!(inline_depth_guard < 1_000_000, "runaway inlining (recursion?)");
+        *mult.entry(f.clone()).or_insert(0) += m;
+        let info = &infos[&f];
+        for callee in info.calls.clone() {
+            queue.push_back((callee, m));
+        }
+    }
+    let (mut t_instr, mut t_branch, mut t_unres, mut t_expand, mut t_heap) =
+        (0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut cyclic_reachable: Vec<&str> = Vec::new();
+    println!("kernel recon (reachable from __frame, multiplicity-weighted):");
+    let mut rows: Vec<(&String, &u64)> = mult.iter().collect();
+    rows.sort_by_key(|(_, m)| std::cmp::Reverse(**m));
+    for (f, m) in rows {
+        let i = &infos[f.as_str()];
+        t_instr += m * i.instrs as u64;
+        t_branch += m * i.branches as u64;
+        t_unres += m * i.unresolved as u64;
+        t_expand += m * i.expands as u64;
+        t_heap += m * i.heap_sites as u64;
+        if i.cyclic {
+            cyclic_reachable.push(f);
+        }
+        println!(
+            "  x{:<4} {:30} {:5} instrs, {:3} branches, {:2} calls, {} unresolved{}",
+            m,
+            f,
+            i.instrs,
+            i.branches,
+            i.calls.len(),
+            i.unresolved,
+            if i.cyclic { "  CYCLIC" } else { "" }
+        );
+    }
+    println!(
+        "TOTAL inlined: {} instrs, {} branches to if-convert, {} unresolved calls, \
+         {} expand sites, {} field/index sites; cyclic reachable fns: {:?}",
+        t_instr, t_branch, t_unres, t_expand, t_heap, cyclic_reachable
+    );
+}
+
 fn main() -> Result<()> {
     let mut rewritten = false;
     let mut recipe_path = "rewrites.jsonl".to_string();
     let mut out_path = "native-probe/src/gen.rs".to_string();
     let mut site_slots: Option<String> = None;
+    let mut kernel_recon_flag = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--kernel-recon" => kernel_recon_flag = true,
             "--rewritten" => rewritten = true,
             "--recipe" => {
                 recipe_path = args
@@ -816,6 +947,11 @@ fn main() -> Result<()> {
         Program::compile_executable_from_disk()
             .context("compile the plain executable program (run from the repo root)")?
     };
+
+    if kernel_recon_flag {
+        kernel_recon(&program);
+        return Ok(());
+    }
 
     let slots = match &site_slots {
         Some(path) => {
