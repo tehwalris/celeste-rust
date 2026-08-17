@@ -1373,12 +1373,21 @@ fn run_chunk_dynexp(
     // the working tile is reset via the undo log and refilled with the
     // row's column values - no allocation, capacities retained.
     let template: runtime3::Rt3<0xFF> = runtime3::Rt3::from_rt2(chunk, 0, 1);
+    // The chunk-varying columns (the only ones load_row must refill;
+    // execution's own writes roll back via the val_dirty undo log).
+    let varying: Vec<u32> = chunk
+        .cols
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !matches!(c, runtime2::Col::U(_)))
+        .map(|(i, _)| i as u32)
+        .collect();
     let mut rt3 = template.clone();
     for row in 0..chunk.width {
         let mut tape: Vec<u8> = Vec::new();
         loop {
             rt3.reset_from(&template);
-            rt3.load_row(chunk, row);
+            rt3.load_row(chunk, row, &varying);
             rt3.tape.clear();
             rt3.tape.extend_from_slice(&tape);
             rt3.begin_pass();

@@ -103,6 +103,10 @@ pub struct Rt3<const BTN: u8 = 0> {
     /// store_closure, table growth). `reset_from` restores exactly
     /// these, so per-row reset needs NO structure clone.
     dirty: Vec<u32>,
+    /// Undo log for VALUE writes (cols) - every store site pushes the
+    /// cell id; `reset_from` restores those from the template so
+    /// `load_row` only refills the chunk-varying columns.
+    val_dirty: Vec<u32>,
     /// log2(width) at each tile's creation, parallel to `tiles`. When
     /// `expand` doubles the lane axis (dynamic-expand mode), OLD tiles
     /// are never rewritten: lane j of an old tile is read as
@@ -276,6 +280,7 @@ impl<const BTN: u8> Rt3<BTN> {
             tile_log_n: vec![0; tiles_n.len()],
             tiles_n,
             dirty: Vec::new(),
+            val_dirty: Vec::new(),
             log_w: 0,
             slots: [TCol::U(AV::Nil); crate::gen::N_SLOTS],
             guard: slot_guard(),
@@ -295,6 +300,7 @@ impl<const BTN: u8> Rt3<BTN> {
     /// reads cols off the tile (structure_fp / seed_rt2 / append_into).
     pub fn writeback_slots(&mut self) {
         for (k, &cell) in crate::gen::SLOT_CELLS.iter().enumerate() {
+            self.val_dirty.push(cell);
             self.cols[cell as usize] = self.slots[k];
         }
     }
@@ -311,9 +317,19 @@ impl<const BTN: u8> Rt3<BTN> {
         for &i in &self.dirty {
             if (i as usize) < base {
                 self.structure[i as usize] = template.structure[i as usize].clone();
+                self.cols[i as usize] = template.cols[i as usize];
             }
         }
         self.dirty.clear();
+        // Value writes are undo-logged too (every store site pushes),
+        // so load_row only has to refill the chunk-VARYING columns
+        // (~9 of ~300) instead of every cell.
+        for &c in &self.val_dirty {
+            if (c as usize) < base {
+                self.cols[c as usize] = template.cols[c as usize];
+            }
+        }
+        self.val_dirty.clear();
         self.cols.truncate(base);
         self.globals.copy_from_slice(&template.globals);
         self.tiles.clear();
@@ -324,12 +340,14 @@ impl<const BTN: u8> Rt3<BTN> {
         self.log_w = template.log_w;
     }
 
-    /// Fill the base columns with boundary row `row` of the chunk
-    /// (width-1 tile: every column uniform). No allocation.
-    pub fn load_row(&mut self, chunk: &Rt2, row: usize) {
+    /// Fill the chunk-VARYING columns with boundary row `row` (width-1
+    /// tile: every column uniform). Non-varying columns already hold
+    /// the template's (row-0 == uniform) values, and execution's own
+    /// writes were rolled back by `reset_from`'s val_dirty undo log.
+    pub fn load_row(&mut self, chunk: &Rt2, row: usize, varying: &[u32]) {
         debug_assert_eq!(self.cols.len(), chunk.cols.len());
-        for (c, col) in chunk.cols.iter().enumerate() {
-            self.cols[c] = TCol::U(match col {
+        for &c in varying {
+            self.cols[c as usize] = TCol::U(match &chunk.cols[c as usize] {
                 Col::U(a) => *a,
                 Col::V(vs) => vs[row],
                 Col::N(vs) => AV::Num(vs[row]),
@@ -364,6 +382,8 @@ impl<const BTN: u8> Rt3<BTN> {
                 },
                 _ => *item,
             };
+            self.dirty.push(target);
+            self.val_dirty.push(target);
             self.structure[target as usize] = Cell2::Val;
             self.cols[target as usize] = TCol::U(AV::Bool(pressed));
         }
@@ -390,6 +410,7 @@ impl<const BTN: u8> Rt3<BTN> {
             tile_log_n: self.tile_log_n,
             tile_log: self.tile_log,
             dirty: self.dirty,
+            val_dirty: self.val_dirty,
             log_w: self.log_w,
             slots: self.slots,
             guard: self.guard,
@@ -560,6 +581,175 @@ impl<const BTN: u8> Rt3<BTN> {
             }
             _ => None,
         }
+    }
+
+    // Outlined slow halves of the inlined ops (panes, intervals,
+    // generic AV) - see the comment at the Engine impl's op_add.
+    fn add_outline(&mut self, l: TCol, r: TCol) -> TCol {
+        if let Some(out) = self.map2_num(l, r, |a, b| a + b) {
+            return out;
+        }
+        self.map2(l, r, |a, b| av_addsub(a, b, false))
+    }
+    fn sub_outline(&mut self, l: TCol, r: TCol) -> TCol {
+        if let Some(out) = self.map2_num(l, r, |a, b| a - b) {
+            return out;
+        }
+        self.map2(l, r, |a, b| av_addsub(a, b, true))
+    }
+    fn mul_outline(&mut self, l: TCol, r: TCol) -> TCol {
+        if let Some(out) = self.map2_num(l, r, |a, b| a * b) {
+            return out;
+        }
+        self.map2(l, r, av_mul)
+    }
+    fn div_outline(&mut self, l: TCol, r: TCol) -> TCol {
+        if let Some(out) = self.map2_num(l, r, |a, b| a / b) {
+            return out;
+        }
+        self.map2(l, r, av_div)
+    }
+    fn rem_outline(&mut self, l: TCol, r: TCol) -> TCol {
+        if let Some(out) = self.map2_num(l, r, |a, b| a % b) {
+            return out;
+        }
+        self.map2(l, r, av_rem)
+    }
+    fn eq_outline(&mut self, l: TCol, r: TCol) -> TCol {
+        if let Some(out) = self.map2_cmpb(l, r, |a, b| a == b) {
+            return out;
+        }
+        if let (TCol::U(x), TCol::U(y)) = (l, r) {
+            return TCol::U(av_eq(x, y, &self.strings));
+        }
+        let mut o = [AV::Nil; TILE];
+        for i in 0..self.width {
+            o[i] = av_eq(self.tat(l, i), self.tat(r, i), &self.strings);
+        }
+        self.put_tile(o)
+    }
+    /// `not` of an eq result (Bool-typed by construction).
+    fn not_wrap(&mut self, v: TCol) -> TCol {
+        match v {
+            TCol::U(a) => TCol::U(av_not(a)),
+            TCol::B(m, e) => TCol::B(!m, e),
+            other => self.map1(other, av_not),
+        }
+    }
+    fn neg_outline(&mut self, v: TCol) -> TCol {
+        if let Some(out) = self.map1_num(v, |a| P8::from_i16(0) - a) {
+            return out;
+        }
+        self.map1(v, av_neg)
+    }
+    fn min_outline(&mut self, l: TCol, r: TCol) -> TCol {
+        if let Some(out) = self.map2_num(l, r, |a, b| if a < b { a } else { b }) {
+            return out;
+        }
+        self.map2(l, r, av_min)
+    }
+    fn max_outline(&mut self, l: TCol, r: TCol) -> TCol {
+        if let Some(out) = self.map2_num(l, r, |a, b| if a > b { a } else { b }) {
+            return out;
+        }
+        self.map2(l, r, av_max)
+    }
+    fn abs_outline(&mut self, v: TCol) -> TCol {
+        if let Some(out) = self.map1_num(v, |a| a.abs()) {
+            return out;
+        }
+        self.map1(v, av_abs)
+    }
+    fn lt_outline(&mut self, l: TCol, r: TCol) -> TCol {
+        if let Some(out) = self.map2_cmpb(l, r, |a, b| a < b) {
+            return out;
+        }
+        self.map2(l, r, |a, b| av_cmp(CmpOp::Lt, a, b))
+    }
+    fn le_outline(&mut self, l: TCol, r: TCol) -> TCol {
+        if let Some(out) = self.map2_cmpb(l, r, |a, b| a <= b) {
+            return out;
+        }
+        self.map2(l, r, |a, b| av_cmp(CmpOp::Le, a, b))
+    }
+    fn gt_outline(&mut self, l: TCol, r: TCol) -> TCol {
+        if let Some(out) = self.map2_cmpb(l, r, |a, b| a > b) {
+            return out;
+        }
+        self.map2(l, r, |a, b| av_cmp(CmpOp::Gt, a, b))
+    }
+    fn ge_outline(&mut self, l: TCol, r: TCol) -> TCol {
+        if let Some(out) = self.map2_cmpb(l, r, |a, b| a >= b) {
+            return out;
+        }
+        self.map2(l, r, |a, b| av_cmp(CmpOp::Ge, a, b))
+    }
+    /// Divergent-truthiness check for non-uniform branch conditions
+    /// (a mask or AV tile): uniform-across-lanes or bail.
+    fn truthy_outline(&mut self, c: TCol) -> bool {
+        let t = av_truthy(self.tat(c, 0));
+        if !(0..self.width).all(|i| av_truthy(self.tat(c, i)) == t) {
+            bail();
+        }
+        t
+    }
+    fn load_outline(&mut self, v: TCol) -> TCol {
+        let p = match v {
+            TCol::U(AV::NilPtr) => return TCol::U(AV::Nil),
+            _ => self.uptr(v),
+        };
+        match &self.structure[p as usize] {
+            Cell2::Val => self.cols[p as usize],
+            _ => TCol::U(AV::Ptr(p)),
+        }
+    }
+    fn store_outline(&mut self, t: TCol, s: TCol) {
+        let p = self.uptr(t) as usize;
+        if !matches!(self.structure[p], Cell2::Val) {
+            self.dirty.push(p as u32);
+            self.structure[p] = Cell2::Val;
+        }
+        self.val_dirty.push(p as u32);
+        self.cols[p] = s;
+    }
+    fn select_outline(&mut self, c: TCol, t: TCol, f: TCol) -> TCol {
+        match c {
+            TCol::U(AV::Bool(_)) => unreachable!(),
+            TCol::U(_) | TCol::N(_) => bail(),
+            TCol::T(_) | TCol::B(..) => {}
+        }
+        // Mask condition + numeric arms: a pure blend into a pane.
+        if let (TCol::B(m, e), Some(a), Some(b)) = (c, self.num_src(t), self.num_src(f)) {
+            let sh = self.log_w - e;
+            let mut o = [P8::from_i16(0); TILE];
+            for (i, slot) in o.iter_mut().enumerate().take(self.width) {
+                *slot = if m >> (i >> sh) & 1 == 1 {
+                    self.num_at(a, i)
+                } else {
+                    self.num_at(b, i)
+                };
+            }
+            return self.put_pane_n(o);
+        }
+        // Mask condition + boolean arms: a pure bitwise combine, no
+        // tile materialization.
+        if let (Some(cm), Some(tm), Some(fm)) =
+            (self.mask_src(c), self.mask_src(t), self.mask_src(f))
+        {
+            return TCol::B(cm & tm | !cm & fm, self.log_w);
+        }
+        let pick = |cv: AV, tv: AV, fv: AV| -> AV {
+            match cv {
+                AV::Bool(true) => tv,
+                AV::Bool(false) => fv,
+                _ => bail(),
+            }
+        };
+        let mut o = [AV::Nil; TILE];
+        for i in 0..self.width {
+            o[i] = pick(self.tat(c, i), self.tat(t, i), self.tat(f, i));
+        }
+        self.put_tile(o)
     }
 
     /// Specialized unary numeric op.
@@ -760,7 +950,17 @@ impl<const BTN: u8> Rt3<BTN> {
                         Col::U(AV::Num(n)) => vec![*n; w],
                         _ => Vec::new(),
                     };
-                    vs.extend(lanes.iter().map(|&i| self.num_at(src, i)));
+                    match src {
+                        // Full-width aligned pane, all lanes valid:
+                        // one contiguous copy.
+                        NumSrc::P(ix, 0) if lanes.len() == self.width => {
+                            vs.extend_from_slice(&self.tiles_n[ix as usize][..self.width]);
+                        }
+                        NumSrc::S(n) if lanes.len() == self.width => {
+                            vs.resize(vs.len() + self.width, n);
+                        }
+                        _ => vs.extend(lanes.iter().map(|&i| self.num_at(src, i))),
+                    }
                     *acol = Col::N(vs);
                     continue;
                 }
@@ -814,6 +1014,7 @@ impl<const BTN: u8> Engine for Rt3<BTN> {
         self.slots[k as usize] = x;
         if self.guard {
             let cell = crate::gen::SLOT_CELLS[k as usize] as usize;
+            self.val_dirty.push(cell as u32);
             self.structure[cell] = Cell2::Val;
             self.cols[cell] = x;
         }
@@ -854,28 +1055,30 @@ impl<const BTN: u8> Engine for Rt3<BTN> {
         }
     }
 
+    #[inline(always)]
     fn load(&mut self, v: TCol) -> TCol {
-        let p = match v {
-            TCol::U(AV::Ptr(p)) => p,
-            TCol::U(AV::NilPtr) => return TCol::U(AV::Nil),
-            _ => self.uptr(v),
-        };
-        match &self.structure[p as usize] {
-            Cell2::Val => {
-                let c = self.cols[p as usize];
-                c
+        // Uniform pointer to a value cell: one bounds-checked read.
+        if let TCol::U(AV::Ptr(p)) = v {
+            if matches!(self.structure[p as usize], Cell2::Val) {
+                return self.cols[p as usize];
             }
-            _ => TCol::U(AV::Ptr(p)),
+            return TCol::U(AV::Ptr(p));
         }
+        self.load_outline(v)
     }
 
+    #[inline(always)]
     fn store(&mut self, t: TCol, s: TCol) {
-        let p = self.uptr(t) as usize;
-        if !matches!(self.structure[p], Cell2::Val) {
-            self.dirty.push(p as u32);
-            self.structure[p] = Cell2::Val;
+        // Uniform pointer to an existing value cell: one write plus
+        // the value undo-log push.
+        if let TCol::U(AV::Ptr(p)) = t {
+            if matches!(self.structure[p as usize], Cell2::Val) {
+                self.val_dirty.push(p);
+                self.cols[p as usize] = s;
+                return;
+            }
         }
-        self.cols[p] = s;
+        self.store_outline(t, s)
     }
 
     fn store_empty_table(&mut self, t: TCol) {
@@ -963,99 +1166,113 @@ impl<const BTN: u8> Engine for Rt3<BTN> {
         }
     }
 
+    // Arithmetic and compares: the UNIFORM-Num case is inlined at every
+    // generated call site - the pre-expand trunk is width 1, so whole
+    // physics chains become straight scalar code that LLVM folds and
+    // keeps in registers. Everything else (panes, intervals, generic)
+    // stays outlined - the force-inline-everything experiment (9.25 s,
+    // 10.5 min compile) showed full bodies at every site are an icache
+    // loss; the split keeps the inline part a few instructions.
+    #[inline(always)]
     fn op_add(&mut self, l: TCol, r: TCol) -> TCol {
-        if let Some(out) = self.map2_num(l, r, |a, b| a + b) {
-            return out;
+        if let (TCol::U(AV::Num(a)), TCol::U(AV::Num(b))) = (l, r) {
+            return TCol::U(AV::Num(a + b));
         }
-        self.map2(l, r, |a, b| av_addsub(a, b, false))
+        self.add_outline(l, r)
     }
+    #[inline(always)]
     fn op_sub(&mut self, l: TCol, r: TCol) -> TCol {
-        if let Some(out) = self.map2_num(l, r, |a, b| a - b) {
-            return out;
+        if let (TCol::U(AV::Num(a)), TCol::U(AV::Num(b))) = (l, r) {
+            return TCol::U(AV::Num(a - b));
         }
-        self.map2(l, r, |a, b| av_addsub(a, b, true))
+        self.sub_outline(l, r)
     }
+    #[inline(always)]
     fn op_mul(&mut self, l: TCol, r: TCol) -> TCol {
-        if let Some(out) = self.map2_num(l, r, |a, b| a * b) {
-            return out;
+        if let (TCol::U(AV::Num(a)), TCol::U(AV::Num(b))) = (l, r) {
+            return TCol::U(AV::Num(a * b));
         }
-        self.map2(l, r, av_mul)
+        self.mul_outline(l, r)
     }
+    #[inline(always)]
     fn op_div(&mut self, l: TCol, r: TCol) -> TCol {
-        if let Some(out) = self.map2_num(l, r, |a, b| a / b) {
-            return out;
+        if let (TCol::U(AV::Num(a)), TCol::U(AV::Num(b))) = (l, r) {
+            return TCol::U(AV::Num(a / b));
         }
-        self.map2(l, r, av_div)
+        self.div_outline(l, r)
     }
+    #[inline(always)]
     fn op_rem(&mut self, l: TCol, r: TCol) -> TCol {
-        if let Some(out) = self.map2_num(l, r, |a, b| a % b) {
-            return out;
+        if let (TCol::U(AV::Num(a)), TCol::U(AV::Num(b))) = (l, r) {
+            return TCol::U(AV::Num(a % b));
         }
-        self.map2(l, r, av_rem)
+        self.rem_outline(l, r)
     }
     fn op_pow(&mut self, _l: TCol, _r: TCol) -> TCol {
         bail()
     }
+    #[inline(always)]
     fn eq(&mut self, l: TCol, r: TCol) -> TCol {
-        if let Some(out) = self.map2_cmpb(l, r, |a, b| a == b) {
-            return out;
+        if let (TCol::U(AV::Num(a)), TCol::U(AV::Num(b))) = (l, r) {
+            return TCol::U(AV::Bool(a == b));
         }
-        let (x, y) = ((l), (r));
-        if let (TCol::U(x), TCol::U(y)) = (x, y) {
-            let out = TCol::U(av_eq(x, y, &self.strings));
-            return out;
-        }
-        let mut o = [AV::Nil; TILE];
-        for i in 0..self.width {
-            o[i] = av_eq(self.tat(x, i), self.tat(y, i), &self.strings);
-        }
-        let out = self.put_tile(o);
-        out
+        self.eq_outline(l, r)
     }
+    #[inline(always)]
     fn ne(&mut self, l: TCol, r: TCol) -> TCol {
-        let e = self.eq(l, r);
-        self.map1(e, av_not)
+        if let (TCol::U(AV::Num(a)), TCol::U(AV::Num(b))) = (l, r) {
+            return TCol::U(AV::Bool(a != b));
+        }
+        let e = self.eq_outline(l, r);
+        self.not_wrap(e)
     }
+    #[inline(always)]
     fn lt(&mut self, l: TCol, r: TCol) -> TCol {
-        if let Some(out) = self.map2_cmpb(l, r, |a, b| a < b) {
-            return out;
+        if let (TCol::U(AV::Num(a)), TCol::U(AV::Num(b))) = (l, r) {
+            return TCol::U(AV::Bool(a < b));
         }
-        self.map2(l, r, |a, b| av_cmp(CmpOp::Lt, a, b))
+        self.lt_outline(l, r)
     }
+    #[inline(always)]
     fn le(&mut self, l: TCol, r: TCol) -> TCol {
-        if let Some(out) = self.map2_cmpb(l, r, |a, b| a <= b) {
-            return out;
+        if let (TCol::U(AV::Num(a)), TCol::U(AV::Num(b))) = (l, r) {
+            return TCol::U(AV::Bool(a <= b));
         }
-        self.map2(l, r, |a, b| av_cmp(CmpOp::Le, a, b))
+        self.le_outline(l, r)
     }
+    #[inline(always)]
     fn gt(&mut self, l: TCol, r: TCol) -> TCol {
-        if let Some(out) = self.map2_cmpb(l, r, |a, b| a > b) {
-            return out;
+        if let (TCol::U(AV::Num(a)), TCol::U(AV::Num(b))) = (l, r) {
+            return TCol::U(AV::Bool(a > b));
         }
-        self.map2(l, r, |a, b| av_cmp(CmpOp::Gt, a, b))
+        self.gt_outline(l, r)
     }
+    #[inline(always)]
     fn ge(&mut self, l: TCol, r: TCol) -> TCol {
-        if let Some(out) = self.map2_cmpb(l, r, |a, b| a >= b) {
-            return out;
+        if let (TCol::U(AV::Num(a)), TCol::U(AV::Num(b))) = (l, r) {
+            return TCol::U(AV::Bool(a >= b));
         }
-        self.map2(l, r, |a, b| av_cmp(CmpOp::Ge, a, b))
+        self.ge_outline(l, r)
     }
     fn concat(&mut self, _l: TCol, _r: TCol) -> TCol {
         bail()
     }
+    #[inline(always)]
     fn un_minus(&mut self, v: TCol) -> TCol {
-        if let Some(out) = self.map1_num(v, |a| P8::from_i16(0) - a) {
-            return out;
+        if let TCol::U(AV::Num(a)) = v {
+            return TCol::U(AV::Num(P8::from_i16(0) - a));
         }
-        self.map1(v, av_neg)
+        self.neg_outline(v)
     }
+    #[inline(always)]
     fn un_not(&mut self, v: TCol) -> TCol {
         // The mask's dead high bits invert too; nothing reads past the
         // significant range (tat bit-tests only projected lane indices).
-        if let TCol::B(m, e) = v {
-            return TCol::B(!m, e);
+        match v {
+            TCol::B(m, e) => TCol::B(!m, e),
+            TCol::U(a) => TCol::U(av_not(a)),
+            other => self.map1(other, av_not),
         }
-        self.map1(v, av_not)
     }
     fn un_hash(&mut self, v: TCol) -> TCol {
         let out = match v {
@@ -1072,48 +1289,17 @@ impl<const BTN: u8> Engine for Rt3<BTN> {
         TCol::U(out)
     }
 
+    #[inline(always)]
     fn select(&mut self, c: TCol, t: TCol, f: TCol) -> TCol {
         // Uniform condition: the chosen arm passes through UNTOUCHED
         // (no per-lane pick, no tile copy) - in branch-free code most
-        // select conditions are tile-uniform.
+        // select conditions are tile-uniform. Inlined so trunk selects
+        // are register moves.
         match c {
-            TCol::U(AV::Bool(true)) => return t,
-            TCol::U(AV::Bool(false)) => return f,
-            TCol::U(_) | TCol::N(_) => bail(),
-            TCol::T(_) | TCol::B(..) => {}
+            TCol::U(AV::Bool(true)) => t,
+            TCol::U(AV::Bool(false)) => f,
+            _ => self.select_outline(c, t, f),
         }
-        // Mask condition + numeric arms: a pure blend into a pane.
-        if let (TCol::B(m, e), Some(a), Some(b)) = (c, self.num_src(t), self.num_src(f)) {
-            let sh = self.log_w - e;
-            let mut o = [P8::from_i16(0); TILE];
-            for (i, slot) in o.iter_mut().enumerate().take(self.width) {
-                *slot = if m >> (i >> sh) & 1 == 1 {
-                    self.num_at(a, i)
-                } else {
-                    self.num_at(b, i)
-                };
-            }
-            return self.put_pane_n(o);
-        }
-        // Mask condition + boolean arms: a pure bitwise combine, no
-        // tile materialization.
-        if let (Some(cm), Some(tm), Some(fm)) =
-            (self.mask_src(c), self.mask_src(t), self.mask_src(f))
-        {
-            return TCol::B(cm & tm | !cm & fm, self.log_w);
-        }
-        let pick = |cv: AV, tv: AV, fv: AV| -> AV {
-            match cv {
-                AV::Bool(true) => tv,
-                AV::Bool(false) => fv,
-                _ => bail(),
-            }
-        };
-        let mut o = [AV::Nil; TILE];
-        for i in 0..self.width {
-            o[i] = pick(self.tat(c, i), self.tat(t, i), self.tat(f, i));
-        }
-        self.put_tile(o)
     }
 
     /// Concrete-button mode: bools pass through (a UBool means the
@@ -1175,17 +1361,13 @@ impl<const BTN: u8> Engine for Rt3<BTN> {
         }
     }
 
+    #[inline(always)]
     fn truthy_b(&mut self, v: TCol, _site: u32) -> bool {
         match v {
+            TCol::U(AV::Bool(b)) => b,
             TCol::U(a) => av_truthy(a),
             TCol::N(_) => true, // numbers are always truthy
-            c => {
-                let t = av_truthy(self.tat(c, 0));
-                if !(0..self.width).all(|i| av_truthy(self.tat(c, i)) == t) {
-                    bail();
-                }
-                t
-            }
+            c => self.truthy_outline(c),
         }
     }
 
@@ -1235,23 +1417,26 @@ impl<const BTN: u8> Engine for Rt3<BTN> {
         }
     }
 
+    #[inline(always)]
     fn bi_min(&mut self, l: TCol, r: TCol) -> TCol {
-        if let Some(out) = self.map2_num(l, r, |a, b| if a < b { a } else { b }) {
-            return out;
+        if let (TCol::U(AV::Num(a)), TCol::U(AV::Num(b))) = (l, r) {
+            return TCol::U(AV::Num(if a < b { a } else { b }));
         }
-        self.map2(l, r, av_min)
+        self.min_outline(l, r)
     }
+    #[inline(always)]
     fn bi_max(&mut self, l: TCol, r: TCol) -> TCol {
-        if let Some(out) = self.map2_num(l, r, |a, b| if a > b { a } else { b }) {
-            return out;
+        if let (TCol::U(AV::Num(a)), TCol::U(AV::Num(b))) = (l, r) {
+            return TCol::U(AV::Num(if a > b { a } else { b }));
         }
-        self.map2(l, r, av_max)
+        self.max_outline(l, r)
     }
+    #[inline(always)]
     fn bi_abs(&mut self, v: TCol) -> TCol {
-        if let Some(out) = self.map1_num(v, |a| a.abs()) {
-            return out;
+        if let TCol::U(AV::Num(a)) = v {
+            return TCol::U(AV::Num(a.abs()));
         }
-        self.map1(v, av_abs)
+        self.abs_outline(v)
     }
     fn bi_flr(&mut self, v: TCol) -> TCol {
         if let Some(out) = self.map1_num(v, |a| a.flr()) {
