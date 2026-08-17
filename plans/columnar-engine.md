@@ -468,3 +468,41 @@ checkpoint; row-set equality remains gate 2 work.
 Both green-light the emission plan: straight-line tree with per-variant
 button constants, SIMD across row tiles, counter-replay for straddles,
 sticky fail-mask -> reference-path rerun.
+
+## Rt3: the tile runtime (design, 2026-08-18 mid-morning; building now)
+
+The third Engine impl over the SAME generated program. One tile = a
+fixed small set of input rows (TILE = 16 to start). Key differences
+from Rt2:
+
+- Values live in a bump arena of FIXED-SIZE entries ([AV; TILE] or
+  uniform), reset per frame - no heap Vecs, no allocation in the frame,
+  L1-resident working set.
+- BUTTONS ARE CONCRETE: the driver loops over the 64 input variants
+  OUTSIDE the kernel and writes concrete bools into the button cells
+  before f_frame. In-frame `expand` sees Bool -> identity. Tile width
+  therefore NEVER changes mid-frame (no widen/COW/history machinery at
+  all). This is the "fan-out as outer structure" model; v1 pays physics
+  64x (no trunk sharing yet) - the specialization tree recovers that
+  later, and v1's measurement prices exactly how much the trunk is
+  worth.
+- Straddle splits (__split_by_flr / __split_at) use the COUNTER-REPLAY:
+  the runtime carries a choice tape; pass P gives site j alternative
+  P_j; a lane is VALID on pass P iff P_j < k_j(lane) for every site
+  (cartesian enumeration, lanes mask out on passes beyond their own
+  alternative count). Passes beyond the first only happen for tiles
+  containing straddling lanes (measured: rare).
+- Guards: sticky per-lane fail mask (no panics, no ctx strings on this
+  path); failed lanes rerun on Rt2 (the reference path) for the real
+  message / deopt semantics.
+- Boundary: per-lane widenings inlined at tile exit; rows emitted into
+  the shared dedup (the same row-key scheme as Rt2 so cross-checking is
+  trivial).
+
+Oracle: the one-frame bench - lanes-out must equal Rt2's / the
+interpreter's at the chased checkpoint, per run. Baseline to beat:
+2.0 s / 10.6 us per input lane on real f35 states.
+
+v1 deliberately defers: trunk-sharing specialization tree, typed tile
+columns / SIMD, const-generic variant folding. Each is a measured step
+on the same bench afterwards.
