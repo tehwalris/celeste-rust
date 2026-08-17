@@ -1194,6 +1194,7 @@ fn run_abstract_bench(dir: &str, frame: u32, reps: u32) {
         }
     }
     print_bails();
+    runtime3::TILE_CENSUS.print();
 }
 
 /// Tile-mode chunk executor (plans/columnar-engine.md "Rt3"): split the

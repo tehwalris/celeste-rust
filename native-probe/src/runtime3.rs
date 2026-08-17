@@ -53,13 +53,27 @@ fn bail() -> ! {
     std::panic::panic_any(TileBail(std::panic::Location::caller()))
 }
 
-/// One tile value: uniform, or an index into the tile-data pool. 16 B,
+/// One tile value: uniform, or a reference into a typed pool. 16 B,
 /// so cloning a whole column table is a small flat memcpy (the inline
 /// [AV; TILE] variant made the enum 260 B and cloning dominated v1).
+/// The tile census says 100% of materialized tiles are all-Num or
+/// all-Bool on the steady shape, so the typed variants carry the load:
+/// N = a [P8; TILE] pane (tight integer loops), B = an inline u64 lane
+/// mask (a Bool tile is one word; select against it is a blend). The
+/// u8 on B is the creation log for the expand projection (see tat).
 #[derive(Clone, Copy, Debug)]
 pub enum TCol {
     U(AV),
     T(u32),
+    N(u32),
+    B(u64, u8),
+}
+
+/// Operand view for the specialized numeric paths.
+#[derive(Clone, Copy)]
+enum NumSrc {
+    S(P8),
+    P(u32, u8),
 }
 
 #[derive(Clone)]
@@ -81,6 +95,9 @@ pub struct Rt3<const BTN: u8 = 0> {
     pub ks: Vec<u8>,
     /// Payload pool for TCol::T (per-lane tiles).
     pub tiles: Vec<[AV; TILE]>,
+    /// Payload pool for TCol::N (all-Num panes) + creation logs.
+    pub tiles_n: Vec<[P8; TILE]>,
+    tile_log_n: Vec<u8>,
     /// log2(width) at each tile's creation, parallel to `tiles`. When
     /// `expand` doubles the lane axis (dynamic-expand mode), OLD tiles
     /// are never rewritten: lane j of an old tile is read as
@@ -110,6 +127,71 @@ fn slot_guard() -> bool {
     *GUARD.get_or_init(|| std::env::var("CELESTE_SLOT_GUARD").is_ok_and(|v| v == "1"))
 }
 
+/// CELESTE_TILE_CENSUS=1: classify every materialized tile by content
+/// (sizes the typed-pane prize). Atomic counters, printed by the bench.
+pub struct TileCensus {
+    pub all_num: std::sync::atomic::AtomicU64,
+    pub all_ival: std::sync::atomic::AtomicU64,
+    pub all_bool: std::sync::atomic::AtomicU64,
+    pub num_ival: std::sync::atomic::AtomicU64,
+    pub other: std::sync::atomic::AtomicU64,
+}
+
+pub static TILE_CENSUS: TileCensus = TileCensus {
+    all_num: std::sync::atomic::AtomicU64::new(0),
+    all_ival: std::sync::atomic::AtomicU64::new(0),
+    all_bool: std::sync::atomic::AtomicU64::new(0),
+    num_ival: std::sync::atomic::AtomicU64::new(0),
+    other: std::sync::atomic::AtomicU64::new(0),
+};
+
+impl TileCensus {
+    pub fn enabled(&self) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("CELESTE_TILE_CENSUS").is_ok_and(|v| v == "1"))
+    }
+    fn record(&self, lanes: &[AV]) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (mut n, mut iv, mut b) = (0usize, 0usize, 0usize);
+        for v in lanes {
+            match v {
+                AV::Num(_) => n += 1,
+                AV::Ival(..) => iv += 1,
+                AV::Bool(_) => b += 1,
+                _ => {}
+            }
+        }
+        let w = lanes.len();
+        if n == w {
+            self.all_num.fetch_add(1, Relaxed);
+        } else if iv == w {
+            self.all_ival.fetch_add(1, Relaxed);
+        } else if b == w {
+            self.all_bool.fetch_add(1, Relaxed);
+        } else if n + iv == w {
+            self.num_ival.fetch_add(1, Relaxed);
+        } else {
+            self.other.fetch_add(1, Relaxed);
+        }
+    }
+    pub fn print(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (n, iv, b, ni, o) = (
+            self.all_num.load(Relaxed),
+            self.all_ival.load(Relaxed),
+            self.all_bool.load(Relaxed),
+            self.num_ival.load(Relaxed),
+            self.other.load(Relaxed),
+        );
+        if n + iv + b + ni + o > 0 {
+            println!(
+                "tile census: {} all-num, {} all-ival, {} all-bool, {} num+ival, {} other",
+                n, iv, b, ni, o
+            );
+        }
+    }
+}
+
 impl<const BTN: u8> Rt3<BTN> {
     /// Build a tile from lanes `[lo, hi)` of an Rt2 block. The block must
     /// be at a frame boundary (its columns fully materialized).
@@ -117,6 +199,7 @@ impl<const BTN: u8> Rt3<BTN> {
         let w = hi - lo;
         assert!(w <= TILE);
         let mut tiles: Vec<[AV; TILE]> = Vec::new();
+        let mut tiles_n: Vec<[P8; TILE]> = Vec::new();
         let mut conv = |c: &Col| -> TCol {
             // A one-row tile is uniform in EVERY column - the dynamic-
             // expand mode's trunk sharing rests on this.
@@ -137,12 +220,10 @@ impl<const BTN: u8> Rt3<BTN> {
                     TCol::T(tiles.len() as u32 - 1)
                 }
                 Col::N(vs) => {
-                    let mut t = [AV::Nil; TILE];
-                    for (i, n) in vs[lo..hi].iter().enumerate() {
-                        t[i] = AV::Num(*n);
-                    }
-                    tiles.push(t);
-                    TCol::T(tiles.len() as u32 - 1)
+                    let mut t = [P8::from_i16(0); TILE];
+                    t[..w].copy_from_slice(&vs[lo..hi]);
+                    tiles_n.push(t);
+                    TCol::N(tiles_n.len() as u32 - 1)
                 }
                 Col::I(vs) => {
                     let mut t = [AV::Nil; TILE];
@@ -187,6 +268,8 @@ impl<const BTN: u8> Rt3<BTN> {
             ks: Vec::new(),
             tile_log: vec![0; tiles.len()],
             tiles,
+            tile_log_n: vec![0; tiles_n.len()],
+            tiles_n,
             log_w: 0,
             slots: [TCol::U(AV::Nil); crate::gen::N_SLOTS],
             guard: slot_guard(),
@@ -258,6 +341,8 @@ impl<const BTN: u8> Rt3<BTN> {
             cursor: self.cursor,
             ks: self.ks,
             tiles: self.tiles,
+            tiles_n: self.tiles_n,
+            tile_log_n: self.tile_log_n,
             tile_log: self.tile_log,
             log_w: self.log_w,
             slots: self.slots,
@@ -299,6 +384,11 @@ impl<const BTN: u8> Rt3<BTN> {
                 let shift = self.log_w - self.tile_log[ix as usize];
                 self.tiles[ix as usize][lane >> shift]
             }
+            TCol::N(ix) => {
+                let shift = self.log_w - self.tile_log_n[ix as usize];
+                AV::Num(self.tiles_n[ix as usize][lane >> shift])
+            }
+            TCol::B(m, e) => AV::Bool(m >> (lane >> (self.log_w - e)) & 1 == 1),
         }
     }
 
@@ -312,12 +402,110 @@ impl<const BTN: u8> Rt3<BTN> {
         o
     }
 
+    /// Materialize a tile, CLASSIFYING it: all-Num lanes become an N
+    /// pane, all-Bool lanes an inline B mask, the rest an AV tile. So
+    /// even results of generic (unspecialized) ops end up typed and
+    /// downstream specialized paths fire.
     #[inline]
     fn put_tile(&mut self, t: [AV; TILE]) -> TCol {
+        if TILE_CENSUS.enabled() {
+            TILE_CENSUS.record(&t[..self.width]);
+        }
+        let w = self.width;
+        if t[..w].iter().all(|v| matches!(v, AV::Num(_))) {
+            let mut o = [P8::from_i16(0); TILE];
+            for i in 0..w {
+                let AV::Num(n) = t[i] else { unreachable!() };
+                o[i] = n;
+            }
+            return self.put_pane_n(o);
+        }
+        if t[..w].iter().all(|v| matches!(v, AV::Bool(_))) {
+            let mut m = 0u64;
+            for (i, v) in t[..w].iter().enumerate() {
+                if matches!(v, AV::Bool(true)) {
+                    m |= 1 << i;
+                }
+            }
+            return TCol::B(m, self.log_w);
+        }
         let ix = self.tiles.len() as u32;
         self.tiles.push(t);
         self.tile_log.push(self.log_w);
         TCol::T(ix)
+    }
+
+    #[inline]
+    fn put_pane_n(&mut self, t: [P8; TILE]) -> TCol {
+        let ix = self.tiles_n.len() as u32;
+        self.tiles_n.push(t);
+        self.tile_log_n.push(self.log_w);
+        TCol::N(ix)
+    }
+
+    /// Number source for the specialized numeric paths: a broadcast
+    /// scalar or a pane + projection shift. None = not all-Num.
+    #[inline]
+    fn num_src(&self, c: TCol) -> Option<NumSrc> {
+        match c {
+            TCol::U(AV::Num(n)) => Some(NumSrc::S(n)),
+            TCol::N(ix) => Some(NumSrc::P(ix, self.log_w - self.tile_log_n[ix as usize])),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn num_at(&self, s: NumSrc, lane: usize) -> P8 {
+        match s {
+            NumSrc::S(n) => n,
+            NumSrc::P(ix, sh) => self.tiles_n[ix as usize][lane >> sh],
+        }
+    }
+
+    /// Specialized binary numeric op over panes/scalars; None = operands
+    /// not all-Num (caller falls back to the generic AV path).
+    #[inline]
+    fn map2_num(&mut self, l: TCol, r: TCol, f: impl Fn(P8, P8) -> P8) -> Option<TCol> {
+        let (a, b) = (self.num_src(l)?, self.num_src(r)?);
+        if let (NumSrc::S(x), NumSrc::S(y)) = (a, b) {
+            return Some(TCol::U(AV::Num(f(x, y))));
+        }
+        let mut o = [P8::from_i16(0); TILE];
+        for (i, slot) in o.iter_mut().enumerate().take(self.width) {
+            *slot = f(self.num_at(a, i), self.num_at(b, i));
+        }
+        Some(self.put_pane_n(o))
+    }
+
+    /// Specialized numeric compare producing an inline lane mask.
+    #[inline]
+    fn map2_cmpb(&mut self, l: TCol, r: TCol, f: impl Fn(P8, P8) -> bool) -> Option<TCol> {
+        let (a, b) = (self.num_src(l)?, self.num_src(r)?);
+        if let (NumSrc::S(x), NumSrc::S(y)) = (a, b) {
+            return Some(TCol::U(AV::Bool(f(x, y))));
+        }
+        let mut m = 0u64;
+        for i in 0..self.width {
+            if f(self.num_at(a, i), self.num_at(b, i)) {
+                m |= 1 << i;
+            }
+        }
+        Some(TCol::B(m, self.log_w))
+    }
+
+    /// Specialized unary numeric op.
+    #[inline]
+    fn map1_num(&mut self, v: TCol, f: impl Fn(P8) -> P8) -> Option<TCol> {
+        match self.num_src(v)? {
+            NumSrc::S(n) => Some(TCol::U(AV::Num(f(n)))),
+            s @ NumSrc::P(..) => {
+                let mut o = [P8::from_i16(0); TILE];
+                for (i, slot) in o.iter_mut().enumerate().take(self.width) {
+                    *slot = f(self.num_at(s, i));
+                }
+                Some(self.put_pane_n(o))
+            }
+        }
     }
 
     fn uptr(&self, id: TCol) -> u32 {
@@ -331,23 +519,20 @@ impl<const BTN: u8> Rt3<BTN> {
                 }
                 p
             }
+            TCol::N(_) | TCol::B(..) => bail(),
         }
     }
 
     #[inline]
     fn map1(&mut self, a: TCol, f: impl Fn(AV) -> AV) -> TCol {
         match a {
-            TCol::U(x) => {
-                let out = TCol::U(f(x));
-                out
-            }
-            c @ TCol::T(_) => {
+            TCol::U(x) => TCol::U(f(x)),
+            c => {
                 let mut o = [AV::Nil; TILE];
                 for i in 0..self.width {
                     o[i] = f(self.tat(c, i));
                 }
-                let out = self.put_tile(o);
-                out
+                self.put_tile(o)
             }
         }
     }
@@ -408,7 +593,7 @@ impl<const BTN: u8> Rt3<BTN> {
 fn tcol_to_col(t: TCol) -> Col {
     match t {
         TCol::U(a) => Col::U(a),
-        TCol::T(_) => panic!("closure captures are uniform"),
+        TCol::T(_) | TCol::N(_) | TCol::B(..) => panic!("closure captures are uniform"),
     }
 }
 
@@ -501,9 +686,7 @@ impl<const BTN: u8> Rt3<BTN> {
             };
             match col {
                 TCol::U(a) => vs.extend(std::iter::repeat(*a).take(lanes.len())),
-                c @ TCol::T(_) => {
-                    vs.extend(lanes.iter().map(|&i| self.tat(*c, i)));
-                }
+                c => vs.extend(lanes.iter().map(|&i| self.tat(*c, i))),
             }
             *acol = Col::V(vs);
         }
@@ -686,24 +869,42 @@ impl<const BTN: u8> Engine for Rt3<BTN> {
     }
 
     fn op_add(&mut self, l: TCol, r: TCol) -> TCol {
+        if let Some(out) = self.map2_num(l, r, |a, b| a + b) {
+            return out;
+        }
         self.map2(l, r, |a, b| av_addsub(a, b, false))
     }
     fn op_sub(&mut self, l: TCol, r: TCol) -> TCol {
+        if let Some(out) = self.map2_num(l, r, |a, b| a - b) {
+            return out;
+        }
         self.map2(l, r, |a, b| av_addsub(a, b, true))
     }
     fn op_mul(&mut self, l: TCol, r: TCol) -> TCol {
+        if let Some(out) = self.map2_num(l, r, |a, b| a * b) {
+            return out;
+        }
         self.map2(l, r, av_mul)
     }
     fn op_div(&mut self, l: TCol, r: TCol) -> TCol {
+        if let Some(out) = self.map2_num(l, r, |a, b| a / b) {
+            return out;
+        }
         self.map2(l, r, av_div)
     }
     fn op_rem(&mut self, l: TCol, r: TCol) -> TCol {
+        if let Some(out) = self.map2_num(l, r, |a, b| a % b) {
+            return out;
+        }
         self.map2(l, r, av_rem)
     }
     fn op_pow(&mut self, _l: TCol, _r: TCol) -> TCol {
         bail()
     }
     fn eq(&mut self, l: TCol, r: TCol) -> TCol {
+        if let Some(out) = self.map2_cmpb(l, r, |a, b| a == b) {
+            return out;
+        }
         let (x, y) = ((l), (r));
         if let (TCol::U(x), TCol::U(y)) = (x, y) {
             let out = TCol::U(av_eq(x, y, &self.strings));
@@ -721,24 +922,44 @@ impl<const BTN: u8> Engine for Rt3<BTN> {
         self.map1(e, av_not)
     }
     fn lt(&mut self, l: TCol, r: TCol) -> TCol {
+        if let Some(out) = self.map2_cmpb(l, r, |a, b| a < b) {
+            return out;
+        }
         self.map2(l, r, |a, b| av_cmp(CmpOp::Lt, a, b))
     }
     fn le(&mut self, l: TCol, r: TCol) -> TCol {
+        if let Some(out) = self.map2_cmpb(l, r, |a, b| a <= b) {
+            return out;
+        }
         self.map2(l, r, |a, b| av_cmp(CmpOp::Le, a, b))
     }
     fn gt(&mut self, l: TCol, r: TCol) -> TCol {
+        if let Some(out) = self.map2_cmpb(l, r, |a, b| a > b) {
+            return out;
+        }
         self.map2(l, r, |a, b| av_cmp(CmpOp::Gt, a, b))
     }
     fn ge(&mut self, l: TCol, r: TCol) -> TCol {
+        if let Some(out) = self.map2_cmpb(l, r, |a, b| a >= b) {
+            return out;
+        }
         self.map2(l, r, |a, b| av_cmp(CmpOp::Ge, a, b))
     }
     fn concat(&mut self, _l: TCol, _r: TCol) -> TCol {
         bail()
     }
     fn un_minus(&mut self, v: TCol) -> TCol {
+        if let Some(out) = self.map1_num(v, |a| P8::from_i16(0) - a) {
+            return out;
+        }
         self.map1(v, av_neg)
     }
     fn un_not(&mut self, v: TCol) -> TCol {
+        // The mask's dead high bits invert too; nothing reads past the
+        // significant range (tat bit-tests only projected lane indices).
+        if let TCol::B(m, e) = v {
+            return TCol::B(!m, e);
+        }
         self.map1(v, av_not)
     }
     fn un_hash(&mut self, v: TCol) -> TCol {
@@ -763,8 +984,21 @@ impl<const BTN: u8> Engine for Rt3<BTN> {
         match c {
             TCol::U(AV::Bool(true)) => return t,
             TCol::U(AV::Bool(false)) => return f,
-            TCol::U(_) => bail(),
-            TCol::T(_) => {}
+            TCol::U(_) | TCol::N(_) => bail(),
+            TCol::T(_) | TCol::B(..) => {}
+        }
+        // Mask condition + numeric arms: a pure blend into a pane.
+        if let (TCol::B(m, e), Some(a), Some(b)) = (c, self.num_src(t), self.num_src(f)) {
+            let sh = self.log_w - e;
+            let mut o = [P8::from_i16(0); TILE];
+            for (i, slot) in o.iter_mut().enumerate().take(self.width) {
+                *slot = if m >> (i >> sh) & 1 == 1 {
+                    self.num_at(a, i)
+                } else {
+                    self.num_at(b, i)
+                };
+            }
+            return self.put_pane_n(o);
         }
         let pick = |cv: AV, tv: AV, fv: AV| -> AV {
             match cv {
@@ -801,12 +1035,12 @@ impl<const BTN: u8> Engine for Rt3<BTN> {
                 }
                 self.width = nw;
                 self.log_w += 1;
-                let mut t = [AV::Nil; TILE];
-                for (j, slot) in t.iter_mut().enumerate().take(nw) {
-                    *slot = AV::Bool(j & 1 == 1);
-                }
-                self.put_tile(t)
+                // The fresh button tile: lane j = Bool(j & 1) - the
+                // alternating-bit mask, one word.
+                let m = 0xAAAA_AAAA_AAAA_AAAAu64 & (u64::MAX >> (64 - nw));
+                TCol::B(m, self.log_w)
             }
+            c @ TCol::B(..) => c,
             c @ TCol::T(_)
                 if (0..self.width).all(|i| matches!(self.tat(c, i), AV::Bool(_))) =>
             {
@@ -842,7 +1076,8 @@ impl<const BTN: u8> Engine for Rt3<BTN> {
     fn truthy_b(&mut self, v: TCol, _site: u32) -> bool {
         match v {
             TCol::U(a) => av_truthy(a),
-            c @ TCol::T(_) => {
+            TCol::N(_) => true, // numbers are always truthy
+            c => {
                 let t = av_truthy(self.tat(c, 0));
                 if !(0..self.width).all(|i| av_truthy(self.tat(c, i)) == t) {
                     bail();
@@ -886,7 +1121,7 @@ impl<const BTN: u8> Engine for Rt3<BTN> {
     fn assert_true(&mut self, v: TCol, _ctx: &str) {
         match v {
             TCol::U(AV::Bool(true)) => {}
-            c @ TCol::T(_)
+            c @ (TCol::T(_) | TCol::B(..))
                 if (0..self.width).all(|i| matches!(self.tat(c, i), AV::Bool(true))) => {}
             _ => bail(),
         }
@@ -899,15 +1134,27 @@ impl<const BTN: u8> Engine for Rt3<BTN> {
     }
 
     fn bi_min(&mut self, l: TCol, r: TCol) -> TCol {
+        if let Some(out) = self.map2_num(l, r, |a, b| if a < b { a } else { b }) {
+            return out;
+        }
         self.map2(l, r, av_min)
     }
     fn bi_max(&mut self, l: TCol, r: TCol) -> TCol {
+        if let Some(out) = self.map2_num(l, r, |a, b| if a > b { a } else { b }) {
+            return out;
+        }
         self.map2(l, r, av_max)
     }
     fn bi_abs(&mut self, v: TCol) -> TCol {
+        if let Some(out) = self.map1_num(v, |a| a.abs()) {
+            return out;
+        }
         self.map1(v, av_abs)
     }
     fn bi_flr(&mut self, v: TCol) -> TCol {
+        if let Some(out) = self.map1_num(v, |a| a.flr()) {
+            return out;
+        }
         self.map1(v, av_flr)
     }
     fn bi_sin(&mut self, v: TCol) -> TCol {
@@ -994,7 +1241,7 @@ impl<const BTN: u8> Engine for Rt3<BTN> {
             BI___SPLIT_BY_FLR => {
                 let d = args[0];
                 let needs = match d {
-                    TCol::U(AV::Num(_)) => false,
+                    TCol::U(AV::Num(_)) | TCol::N(_) => false,
                     TCol::U(AV::Ival(a, b)) => a.flr() != b.flr(),
                     c @ TCol::T(_) => (0..self.width).any(|i| match self.tat(c, i) {
                         AV::Ival(a, b) => a.flr() != b.flr(),
@@ -1073,9 +1320,7 @@ impl<const BTN: u8> Engine for Rt3<BTN> {
                 };
                 let needs = match d {
                     TCol::U(v) => lane_alts(v).len() > 1,
-                    c @ TCol::T(_) => {
-                        (0..self.width).any(|i| lane_alts(self.tat(c, i)).len() > 1)
-                    }
+                    c => (0..self.width).any(|i| lane_alts(self.tat(c, i)).len() > 1),
                 };
                 if !needs {
                     return self.map1(args[0], |v| lane_alts(v)[0]);
