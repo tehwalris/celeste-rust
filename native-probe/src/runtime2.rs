@@ -121,6 +121,8 @@ pub struct Rt2 {
     pub stat_arena_peak: usize,
     /// Frame-start lane each current lane derives from (splits append).
     pub origin: Vec<u32>,
+    /// Recycled column buffers (killed/overwritten varying columns).
+    pool: Vec<Vec<AV>>,
     /// Set by `boundary`: the canonical structure hash (the shape key).
     pub shape_hash: u64,
     /// Set by `boundary`: per-lane 128-bit canonical row keys.
@@ -450,6 +452,7 @@ impl Rt2 {
             stat_splits: 0,
             stat_appended: 0,
             stat_arena_peak: 0,
+            pool: Vec::new(),
             origin: Vec::new(),
             shape_hash: 0,
             row_keys: Vec::new(),
@@ -490,22 +493,51 @@ impl Rt2 {
         }
     }
 
+    /// A cleared buffer with capacity for the current width (recycled).
+    #[inline]
+    fn buf(&mut self) -> Vec<AV> {
+        match self.pool.pop() {
+            Some(mut v) => {
+                v.clear();
+                v
+            }
+            None => Vec::with_capacity(self.width + self.width / 2),
+        }
+    }
+
     #[inline]
     fn map1(&mut self, a: ColId, f: impl Fn(AV) -> AV) -> ColId {
-        let out = match self.get(a) {
-            Col::U(x) => Col::U(f(*x)),
-            Col::V(v) => Col::V(v.iter().map(|x| f(*x)).collect()),
-        };
-        self.put(out)
+        match self.get(a) {
+            Col::U(x) => {
+                let out = Col::U(f(*x));
+                self.put(out)
+            }
+            Col::V(_) => {
+                let mut out = self.buf();
+                let Col::V(v) = self.get(a) else { unreachable!() };
+                out.extend(v.iter().map(|x| f(*x)));
+                self.put(Col::V(out))
+            }
+        }
     }
 
     #[inline]
     fn map2(&mut self, a: ColId, b: ColId, f: impl Fn(AV, AV) -> AV) -> ColId {
-        let out = match (self.get(a), self.get(b)) {
-            (Col::U(x), Col::U(y)) => Col::U(f(*x, *y)),
-            (x, y) => Col::V((0..self.width).map(|i| f(x.at(i), y.at(i))).collect()),
-        };
-        self.put(out)
+        if let (Col::U(x), Col::U(y)) = (self.get(a), self.get(b)) {
+            let out = Col::U(f(*x, *y));
+            return self.put(out);
+        }
+        let mut out = self.buf();
+        let (x, y) = (self.get(a), self.get(b));
+        match (x, y) {
+            (Col::V(xv), Col::V(yv)) => {
+                out.extend(xv.iter().zip(yv).map(|(a, b)| f(*a, *b)))
+            }
+            (Col::U(xa), Col::V(yv)) => out.extend(yv.iter().map(|b| f(*xa, *b))),
+            (Col::V(xv), Col::U(yb)) => out.extend(xv.iter().map(|a| f(*a, *yb))),
+            _ => unreachable!(),
+        }
+        self.put(Col::V(out))
     }
 
     /// Append lanes: `srcs[k]` is the source lane the k-th appended lane
@@ -519,22 +551,29 @@ impl Rt2 {
         }
         self.stat_splits += 1;
         self.stat_appended += srcs.len() as u64;
-        for slot in self.arena.iter_mut().flatten() {
-            if let Col::V(v) = slot {
+        // The expand pattern doubles whole blocks: srcs == [0, 1, .., w-1].
+        // That case is one in-place memcpy per column.
+        let contiguous = srcs.len() == self.width
+            && srcs.iter().enumerate().all(|(i, &s)| s == i);
+        let extend = |v: &mut Vec<AV>, srcs: &[usize]| {
+            if contiguous {
+                v.extend_from_within(..srcs.len());
+            } else {
                 v.reserve(srcs.len());
                 for &s in srcs {
                     let x = v[s];
                     v.push(x);
                 }
             }
+        };
+        for slot in self.arena.iter_mut().flatten() {
+            if let Col::V(v) = slot {
+                extend(v, srcs);
+            }
         }
         for col in self.cols.iter_mut() {
             if let Col::V(v) = col {
-                v.reserve(srcs.len());
-                for &s in srcs {
-                    let x = v[s];
-                    v.push(x);
-                }
+                extend(v, srcs);
             }
         }
         // Closure capture snapshots hold columns too.
@@ -557,30 +596,36 @@ impl Rt2 {
         self.width += srcs.len();
     }
 
-    /// Lane-multiplying op: `alts[lane]` = that lane's alternative values
-    /// (non-empty). Lane keeps alternative 0 in place; the rest append in
-    /// (lane, alt) order. Returns the result column.
-    fn split_multi(&mut self, alts: Vec<Vec<AV>>) -> ColId {
+    /// Lane-multiplying op, allocation-free per lane: `alt(lane, k)` is
+    /// the lane's k-th alternative (k < n_alts(lane), n_alts >= 1). Lane
+    /// keeps alternative 0 in place; the rest append in (lane, alt) order.
+    fn split_multi_with(
+        &mut self,
+        n_alts: impl Fn(usize) -> usize,
+        alt: impl Fn(usize, usize) -> AV,
+    ) -> ColId {
         let w = self.width;
-        debug_assert_eq!(alts.len(), w);
         let mut srcs: Vec<usize> = Vec::new();
         let mut appended: Vec<AV> = Vec::new();
-        for (lane, a) in alts.iter().enumerate() {
-            for v in &a[1..] {
+        for lane in 0..w {
+            for k in 1..n_alts(lane) {
                 srcs.push(lane);
-                appended.push(*v);
+                appended.push(alt(lane, k));
             }
         }
         if srcs.is_empty() {
-            // No lane multiplies - uniform result stays possible.
-            if alts.iter().all(|a| a[0] == alts[0][0]) {
-                return self.put(Col::U(alts[0][0]));
+            let first = alt(0, 0);
+            if (1..w).all(|i| alt(i, 0) == first) {
+                return self.put(Col::U(first));
             }
-            return self.put(Col::V(alts.into_iter().map(|a| a[0]).collect()));
+            let mut out = self.buf();
+            out.extend((0..w).map(|i| alt(i, 0)));
+            return self.put(Col::V(out));
         }
         self.widen(&srcs);
-        let mut out: Vec<AV> = alts.into_iter().map(|a| a[0]).collect();
-        out.extend(appended);
+        let mut out = self.buf();
+        out.extend((0..w).map(|i| alt(i, 0)));
+        out.extend_from_slice(&appended);
         self.put(Col::V(out))
     }
 }
@@ -865,14 +910,19 @@ impl Engine for Rt2 {
             }
             return self.put(d);
         }
-        let alts: Vec<Vec<AV>> = (0..w)
-            .map(|i| match d.at(i) {
-                AV::Bool(b) => vec![AV::Bool(b)],
-                AV::UBool => vec![AV::Bool(true), AV::Bool(false)],
+        self.split_multi_with(
+            |i| match d.at(i) {
+                AV::Bool(_) => 1,
+                AV::UBool => 2,
                 other => panic!("expand on {:?}", other),
-            })
-            .collect();
-        self.split_multi(alts)
+            },
+            |i, k| match (d.at(i), k) {
+                (AV::Bool(b), 0) => AV::Bool(b),
+                (AV::UBool, 0) => AV::Bool(true),
+                (AV::UBool, 1) => AV::Bool(false),
+                _ => unreachable!(),
+            },
+        )
     }
 
     fn truthy_b(&mut self, v: ColId, site: u32) -> bool {
@@ -912,7 +962,11 @@ impl Engine for Rt2 {
 
     fn kill(&mut self, vs: &[ColId]) {
         for v in vs {
-            self.arena[v.0 as usize] = None;
+            if let Some(Col::V(vec)) = self.arena[v.0 as usize].take() {
+                if self.pool.len() < 48 {
+                    self.pool.push(vec);
+                }
+            }
         }
     }
 
@@ -1083,17 +1137,24 @@ impl Engine for Rt2 {
                 if !needs {
                     return self.put(d);
                 }
-                let alts: Vec<Vec<AV>> = (0..w)
-                    .map(|i| match d.at(i) {
-                        AV::Num(n) => vec![AV::Num(n)],
-                        v @ AV::Ival(..) => split_iv_by_floor(iv_of(v))
-                            .into_iter()
-                            .map(av_of_iv)
-                            .collect(),
+                let subs = |v: AV| -> Vec<Pico8NumInterval> {
+                    match v {
+                        AV::Ival(..) => split_iv_by_floor(iv_of(v)),
+                        _ => Vec::new(),
+                    }
+                };
+                self.split_multi_with(
+                    |i| match d.at(i) {
+                        AV::Num(_) => 1,
+                        v @ AV::Ival(..) => split_iv_by_floor(iv_of(v)).len(),
                         other => panic!("__split_by_flr on {:?}", other),
-                    })
-                    .collect();
-                self.split_multi(alts)
+                    },
+                    |i, k| match d.at(i) {
+                        AV::Num(n) => AV::Num(n),
+                        v @ AV::Ival(..) => av_of_iv(subs(v)[k]),
+                        _ => unreachable!(),
+                    },
+                )
             }
             BI___SPLIT_AT => {
                 // game_runner.rs:326 - three closed sides around c; the
@@ -1142,8 +1203,10 @@ impl Engine for Rt2 {
                     // Still apply the point-degeneration clip per lane.
                     return self.map1(args[0], |v| lane_alts(v)[0]);
                 }
-                let alts: Vec<Vec<AV>> = (0..w).map(|i| lane_alts(d.at(i))).collect();
-                self.split_multi(alts)
+                self.split_multi_with(
+                    |i| lane_alts(d.at(i)).len(),
+                    |i, k| lane_alts(d.at(i))[k],
+                )
             }
             BI_ADD => {
                 // builtin_add (game_runner.rs:53); dead in practice (the Lua
@@ -1557,11 +1620,101 @@ impl Rt2 {
         }
         self.retain_lanes(&keep);
 
-        // All locals are dead at the boundary.
+        // All locals are dead at the boundary; recycle their buffers.
         self.stat_arena_peak = self.stat_arena_peak.max(self.arena.len());
-        self.arena.clear();
+        for slot in self.arena.drain(..) {
+            if let Some(Col::V(vec)) = slot {
+                if self.pool.len() < 48 {
+                    self.pool.push(vec);
+                }
+            }
+        }
 
         self.width
+    }
+
+    /// Per-lane key of the "is the object moving" gates (anonymous_61
+    /// __entry: `spd.x ~= 0 or spd.y ~= 0`, evaluated on FRAME-START spd -
+    /// obj.move runs before update touches spd). One bit per object in
+    /// walk order. Pre-partitioning by this removes the SplitReq rerun
+    /// for the known divergent gates; novel gates still throw.
+    pub fn moving_key(&self, ids: &BoundaryIds) -> Option<Vec<u8>> {
+        let arr = self.global_target(ids.g_objects)?;
+        let Cell2::Arr(items) = &self.structure[arr as usize] else {
+            return None;
+        };
+        let mut key = vec![0u8; self.width];
+        let zero = P8::from_i16(0);
+        let nonzero = |v: AV| -> bool {
+            match v {
+                AV::Num(n) => n != zero,
+                // An interval counts as nonzero exactly when `~= 0` is true,
+                // which for `Ival == _ -> false` is always.
+                AV::Ival(..) => true,
+                other => panic!("moving_key: spd is not numeric: {:?}", other),
+            }
+        };
+        for (bit, item) in items.iter().enumerate() {
+            let obj = match &self.structure[*item as usize] {
+                Cell2::Val => match self.cols[*item as usize] {
+                    Col::U(AV::Ptr(o)) => o,
+                    _ => continue,
+                },
+                _ => *item,
+            };
+            let Some(spd_cell) = self.obj_field_cell(obj, ids.f_spd) else {
+                continue;
+            };
+            let Col::U(AV::Ptr(spd_obj)) = self.cols[spd_cell as usize] else {
+                continue;
+            };
+            for f in [ids.f_x, ids.f_y] {
+                let Some(c) = self.obj_field_cell(spd_obj, f) else { continue };
+                match &self.cols[c as usize] {
+                    Col::U(v) => {
+                        if nonzero(*v) {
+                            for k in key.iter_mut() {
+                                *k |= 1 << (bit % 8);
+                            }
+                        }
+                    }
+                    Col::V(vs) => {
+                        for (i, v) in vs.iter().enumerate() {
+                            if nonzero(*v) {
+                                key[i] |= 1 << (bit % 8);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Some(key)
+    }
+
+    /// Split into sub-blocks of lanes sharing a key value.
+    pub fn partition_by_key(self, key: &[u8]) -> Vec<Rt2> {
+        let mut order: Vec<u8> = Vec::new();
+        let mut groups: Vec<Vec<u32>> = Vec::new();
+        for (i, k) in key.iter().enumerate() {
+            match order.iter().position(|o| o == k) {
+                Some(g) => groups[g].push(i as u32),
+                None => {
+                    order.push(*k);
+                    groups.push(vec![i as u32]);
+                }
+            }
+        }
+        if groups.len() == 1 {
+            return vec![self];
+        }
+        groups
+            .into_iter()
+            .map(|keep| {
+                let mut b = self.clone_block();
+                b.retain_lanes(&keep);
+                b
+            })
+            .collect()
     }
 
     /// Reset per-frame bookkeeping. Call before `f___frame`.
@@ -1631,6 +1784,44 @@ impl Rt2 {
             .collect()
     }
 
+    /// A copy of just the lanes in `[lo, hi)` - the chunking fast path
+    /// (clone_block + retain_lanes copies the whole block first).
+    pub fn slice_lanes(&self, lo: usize, hi: usize) -> Rt2 {
+        let slice_col = |c: &Col| -> Col {
+            match c {
+                Col::U(a) => Col::U(*a),
+                Col::V(vs) => Col::V(vs[lo..hi].to_vec()),
+            }
+        };
+        Rt2 {
+            width: hi - lo,
+            structure: self
+                .structure
+                .iter()
+                .map(|cell| match cell {
+                    Cell2::Clo(f, caps) => {
+                        Cell2::Clo(*f, caps.iter().map(&slice_col).collect())
+                    }
+                    other => other.clone(),
+                })
+                .collect(),
+            cols: self.cols.iter().map(&slice_col).collect(),
+            arena: Vec::new(),
+            globals: self.globals.clone(),
+            strings: self.strings.clone(),
+            cart: self.cart.clone(),
+            cache: self.cache.clone(),
+            prints: self.prints.clone(),
+            stat_splits: self.stat_splits,
+            stat_appended: self.stat_appended,
+            stat_arena_peak: self.stat_arena_peak,
+            pool: Vec::new(),
+            origin: Vec::new(),
+            shape_hash: self.shape_hash,
+            row_keys: Vec::new(),
+        }
+    }
+
     /// A clone that shares the immutable context (cart/cache Arcs).
     pub fn clone_block(&self) -> Rt2 {
         Rt2 {
@@ -1646,10 +1837,53 @@ impl Rt2 {
             stat_splits: self.stat_splits,
             stat_appended: self.stat_appended,
             stat_arena_peak: self.stat_arena_peak,
+            pool: Vec::new(),
             origin: self.origin.clone(),
             shape_hash: self.shape_hash,
             row_keys: self.row_keys.clone(),
         }
+    }
+
+    /// K-way merge of same-shape blocks (all after `boundary`): one pass
+    /// per column, no repeated re-materialization of uniform columns.
+    pub fn merge_many(mut blocks: Vec<Rt2>) -> Rt2 {
+        if blocks.len() == 1 {
+            return blocks.pop().unwrap();
+        }
+        let total: usize = blocks.iter().map(|b| b.width).sum();
+        let mut host = blocks.swap_remove(0);
+        for b in &blocks {
+            assert_eq!(host.shape_hash, b.shape_hash, "merge of different shapes");
+            assert_eq!(host.structure.len(), b.structure.len());
+        }
+        for (c, col) in host.cols.iter_mut().enumerate() {
+            let all_same_uniform = match col {
+                Col::U(a) => blocks
+                    .iter()
+                    .all(|b| matches!(&b.cols[c], Col::U(x) if x == a)),
+                Col::V(_) => false,
+            };
+            if all_same_uniform {
+                continue;
+            }
+            let mut vs: Vec<AV> = Vec::with_capacity(total);
+            match col {
+                Col::U(a) => vs.extend(std::iter::repeat(*a).take(host.width)),
+                Col::V(v) => vs.append(v),
+            }
+            for b in &blocks {
+                match &b.cols[c] {
+                    Col::U(a) => vs.extend(std::iter::repeat(*a).take(b.width)),
+                    Col::V(v) => vs.extend_from_slice(v),
+                }
+            }
+            *col = Col::V(vs);
+        }
+        for b in &blocks {
+            host.row_keys.extend_from_slice(&b.row_keys);
+        }
+        host.width = total;
+        host
     }
 
     /// Append another block's lanes. Only legal after `boundary` on both:

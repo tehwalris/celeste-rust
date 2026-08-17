@@ -15,6 +15,9 @@ mod import;
 mod runtime;
 mod runtime2;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use celeste_rust::cart_data::CartData;
 use celeste_rust::collision_cache::CollisionCache;
 use celeste_rust::pico8_num::Pico8Num;
@@ -670,44 +673,106 @@ fn run_abstract(num_frames: u32) {
         // frame-start block by it and rerun both sides.
         let mut ran: Vec<runtime2::Rt2> = Vec::new();
         let mut pending: Vec<runtime2::Rt2> = Vec::new();
+        // Chunk cap: mid-frame width is ~64x the input width (the btn
+        // fan-out), and per-op column traffic goes through DRAM once the
+        // working set leaves cache. ~512 input lanes keep a varying
+        // column's mid-frame buffer (~32k lanes x 16 B = 512 KB) L2-ish.
+        // Cross-chunk dedup at the boundary makes chunking invisible
+        // (batching invariance is the certified doctrine).
+        const CHUNK: usize = 64;
         for block in blocks.drain(..) {
             let freeze_cell = block.globals[g_freeze as usize];
             assert!(freeze_cell != runtime2::NONE);
-            pending.extend(block.partition_by_cell(freeze_cell));
-        }
-        while let Some(block) = pending.pop() {
-            let snapshot = block.clone_block();
-            let mut sub = block;
-            sub.begin_frame();
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                gen::call_fn(&mut sub, gen::FN_FRAME, &[], &[]);
-                sub.boundary(&ids);
-            }));
-            match result {
-                Ok(()) => ran.push(sub),
-                Err(payload) => match payload.downcast::<runtime2::SplitReq>() {
-                    Ok(req) => {
-                        let trues: Vec<u32> = (0..snapshot.width as u32)
-                            .filter(|&i| req.origin_truth[i as usize])
-                            .collect();
-                        let falses: Vec<u32> = (0..snapshot.width as u32)
-                            .filter(|&i| !req.origin_truth[i as usize])
-                            .collect();
-                        assert!(!trues.is_empty() && !falses.is_empty());
-                        let mut a = snapshot.clone_block();
-                        a.retain_lanes(&trues);
-                        let mut b = snapshot;
-                        b.retain_lanes(&falses);
-                        pending.push(a);
-                        pending.push(b);
+            for sub in block.partition_by_cell(freeze_cell) {
+                let parts = match sub.moving_key(&ids) {
+                    Some(key) => {
+                        let key = key.clone();
+                        sub.partition_by_key(&key)
                     }
-                    Err(other) => std::panic::resume_unwind(other),
-                },
+                    None => vec![sub],
+                };
+                for part in parts {
+                    if part.width <= CHUNK {
+                        pending.push(part);
+                    } else {
+                        let n = part.width;
+                        let mut at = 0;
+                        while at < n {
+                            let hi = (at + CHUNK).min(n);
+                            pending.push(part.slice_lanes(at, hi));
+                            at = hi;
+                        }
+                    }
+                }
             }
         }
-        // Merge same-shape blocks; drop rows already seen this frame.
+        // Chunks are independent (lane independence is the certified
+        // batching-invariance property); run them across threads. Each
+        // worker owns a local pending stack seeded round-robin.
+        let n_workers = std::thread::available_parallelism()
+            .map(|n| n.get().saturating_sub(2).max(1))
+            .unwrap_or(1)
+            .min(pending.len().max(1));
+        let queues: Vec<Vec<runtime2::Rt2>> = {
+            let mut qs: Vec<Vec<runtime2::Rt2>> = (0..n_workers).map(|_| Vec::new()).collect();
+            for (i, b) in pending.drain(..).enumerate() {
+                qs[i % n_workers].push(b);
+            }
+            qs
+        };
+        let results: Vec<Vec<runtime2::Rt2>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = queues
+                .into_iter()
+                .map(|mut local| {
+                    let ids = &ids;
+                    scope.spawn(move || {
+                        let mut done: Vec<runtime2::Rt2> = Vec::new();
+                        while let Some(block) = local.pop() {
+                            let snapshot = block.clone_block();
+                            let mut sub = block;
+                            sub.begin_frame();
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    gen::call_fn(&mut sub, gen::FN_FRAME, &[], &[]);
+                                    sub.boundary(ids);
+                                }));
+                            match result {
+                                Ok(()) => done.push(sub),
+                                Err(payload) => {
+                                    match payload.downcast::<runtime2::SplitReq>() {
+                                        Ok(req) => {
+                                            let trues: Vec<u32> = (0..snapshot.width as u32)
+                                                .filter(|&i| req.origin_truth[i as usize])
+                                                .collect();
+                                            let falses: Vec<u32> = (0..snapshot.width as u32)
+                                                .filter(|&i| !req.origin_truth[i as usize])
+                                                .collect();
+                                            assert!(!trues.is_empty() && !falses.is_empty());
+                                            let mut a = snapshot.clone_block();
+                                            a.retain_lanes(&trues);
+                                            let mut b = snapshot;
+                                            b.retain_lanes(&falses);
+                                            local.push(a);
+                                            local.push(b);
+                                        }
+                                        Err(other) => std::panic::resume_unwind(other),
+                                    }
+                                }
+                            }
+                        }
+                        done
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for done in results {
+            ran.extend(done);
+        }
+        // Drop rows already seen this frame, then k-way merge same-shape
+        // blocks in one pass.
         let mut seen: rustc_hash::FxHashMap<(u64, u64), ()> = Default::default();
-        let mut merged: Vec<runtime2::Rt2> = Vec::new();
+        let mut groups: Vec<(u64, Vec<runtime2::Rt2>)> = Vec::new();
         for mut sub in ran {
             let keep: Vec<u32> = (0..sub.width as u32)
                 .filter(|&i| {
@@ -724,12 +789,15 @@ fn run_abstract(num_frames: u32) {
             if sub.width == 0 {
                 continue;
             }
-            match merged.iter_mut().find(|b| b.shape_hash == sub.shape_hash) {
-                Some(host) => host.concat(&sub),
-                None => merged.push(sub),
+            match groups.iter_mut().find(|(h, _)| *h == sub.shape_hash) {
+                Some((_, g)) => g.push(sub),
+                None => groups.push((sub.shape_hash, vec![sub])),
             }
         }
-        blocks = merged;
+        blocks = groups
+            .into_iter()
+            .map(|(_, g)| runtime2::Rt2::merge_many(g))
+            .collect();
         let lanes: usize = blocks.iter().map(|b| b.width).sum();
         let (splits, appended, arena_peak): (u64, u64, usize) = blocks.iter().fold(
             (0, 0, 0),

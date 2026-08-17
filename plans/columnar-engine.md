@@ -188,3 +188,63 @@ deaths -> 0) + straddle split (no-op at Bits(0)); extract rows (value
 columns in cell-id order), dedup 128-bit, next block = survivors.
 Buttons: frame entry stores UBool via __reset_button_states - the
 expands fork them per lane (no set_buttons call - matches the search).
+
+## v0 RESULTS (2026-08-18, overnight): gate 1 EXACT, the gap picture
+
+Gate 1 (per-frame lane counts vs `rewrite bench --frames 30`, room (1,0)
+level 0): **EXACT for all 30 frames** (1x23, 24, 204, 878, 2864, 7260,
+15250, 27024), spawn transition, dash/freeze mixing and the btn fan-out
+included. The scalar concrete oracle stays hex-identical (f340) at
+1933 ns/frame after the same runtime changes.
+
+What it took beyond the design doc:
+- TWO genuinely lane-divergent gates exist that the f35 concrete branch
+  census could not see, both deciding on FRAME-START data: the
+  update-side freeze gate (`freeze > 0`; pm1's cell) and the
+  `spd.x ~= 0 or spd.y ~= 0` moving gate at anonymous_61 __entry
+  (obj.move runs before update touches spd). Handled by frame-start
+  pre-partitioning (freeze value, per-object moving bit) plus a GENERIC
+  reactive mechanism: a non-uniform branch throws `SplitReq` with the
+  per-origin condition truth, the driver partitions the frame-start
+  block and reruns both sides. Divergence WITHIN one origin lane would
+  panic (=> deopt work); none observed through f30.
+- The zero-divergence claim is therefore STATE-WINDOW-DEPENDENT: the
+  census certifies (state, input)-uniformity at its window, not
+  cross-state uniformity inside an abstract block. The morning docs
+  should say so.
+
+Performance ladder measured at f30 (27,024 boundary lanes, ~1.7M
+offered after the 64x btn fan-out), single frame:
+- naive columnar (per-op Vec allocs, one block): 6.6 s
+- + alloc-free splits, buffer pool, memcpy widening, mimalloc: 6.4 s
+- + CHUNKED execution, 64 input lanes/chunk (cache blocking - the
+  interpreter's fragments average ~300 lanes for the same reason): 2.4 s
+- + parallel chunks (30 threads): 1.26 s wall; 30 frames in 2.16 s.
+Reference: the interpreter runs the same frame in 0.08 s single-core
+(8.2 us/boundary-lane; 30 frames in 0.22 s).
+
+Honest read (single-core): columnar v0 is ~89 us/boundary-lane =
+~1.4 us/offered-lane - already faster per offered lane than the scalar
+concrete probe (2.0 us) while computing ABSTRACT semantics, but ~11x
+slower than the tuned interpreter per boundary lane. Profile: the
+remaining cost is per-lane AV enum dispatch in map1/map2 (~3-7 ns per
+lane-op x ~200-400 varying ops) - branchy tag matching that the
+compiler cannot vectorize.
+
+The ladder to interpreter-parity and past it (next unit, in order):
+1. TYPED columns: a column knows "all Num" / "all Ival" / "all Bool"
+   (the shape premises make most columns monomorphic); ops become
+   branchless i32-array loops, 4 B/lane instead of 16, auto-SIMD.
+   Expected 4-10x on the varying-op cost.
+2. FUSED loops: the transpiler emits one lane-loop per straight-line
+   run of arithmetic (registers, no intermediate materialization) -
+   kills the per-op read/write traffic that the interpreter pays too.
+   This is where "beat the interpreter" lives.
+3. Chunk-level uniform hoisting: the ~19k uniform ops re-execute per
+   chunk (422 chunks x 5 us = 2 ms - currently noise, matters later).
+
+Bytes/row today (goal-5 input): 282 canonical cells/row; varying
+columns only in Col::V - the dense-row projection uses the varying
+count (~30-80 at f30), i.e. ~0.5-1.3 KB/row at AV width, ~120-320 B
+typed. Boundary + dedup + compaction cost: included in the numbers
+above (the canonical BFS renumbering runs per chunk per frame).
