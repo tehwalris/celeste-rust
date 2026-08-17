@@ -1,3 +1,17 @@
+# Stage-2 hill-climb session 1 (2026-08-17 evening)
+
+Real-frame bench (f35, 187,859 rows, 29 cores): 607 -> **520 ms**
+(2.77 us/row); from-scratch `--abstract 40`: 9.80 -> **8.28 s**. Steps
+and gates in plans/columnar-engine.md (inline/outline op split,
+val_dirty undo log, append memcpy, transpiler block-scoped locals;
+CHUNK=64 confirmed optimal by sweep). Measured ground truth: the
+scalar concrete frame retires 25k instructions at IPC 3.48 (1.37
+us/frame) - branch-free executes both arms of every former branch, so
+the "count the instructions" floor is 25k/frame amortized over lanes,
+not ~250. Remaining profile: f_15 20%, boundary 17%, append 16%,
+select 8% - next rungs are typed 8-byte values, Col::B through Rt2,
+row batching.
+
 # Engine vs production interpreter, same day, same machine (2026-08-17)
 
 CORRECTION of a wrong claim made mid-day ("the interpreter campaign
