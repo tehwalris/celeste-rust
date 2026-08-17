@@ -710,6 +710,24 @@ pub enum Callee<V> {
 pub trait Engine: Sized {
     type V: Copy + std::fmt::Debug;
 
+    /// Slot compilation (plans/columnar-engine.md): engines that bind
+    /// boundary cells to a dense slot array set this true; gen.rs then
+    /// routes eligible load/store sites through slot_get/slot_set
+    /// instead of get_field+load/store. The branch on this const is
+    /// resolved per monomorphization - non-slot engines keep the
+    /// generic path with zero cost and never call the slot ops.
+    const HAS_SLOTS: bool = false;
+    #[inline(always)]
+    fn slot_get(&mut self, k: u32) -> Self::V {
+        let _ = k;
+        unreachable!("slot_get on an engine without slots")
+    }
+    #[inline(always)]
+    fn slot_set(&mut self, k: u32, x: Self::V) {
+        let _ = (k, x);
+        unreachable!("slot_set on an engine without slots")
+    }
+
     // constants
     fn c_num(&mut self, hi: i16, lo: u16) -> Self::V;
     fn c_bool(&mut self, b: bool) -> Self::V;

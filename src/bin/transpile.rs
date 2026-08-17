@@ -64,12 +64,146 @@ fn l(id: LocalId) -> String {
     format!("l{}", usize::from(id))
 }
 
+/// Slot binding loaded from a census `--emit-slots` dump: sites (keyed by
+/// (fn name, instruction id) - stable across regenerations) whose result
+/// is a fixed canonical boundary cell. See plans/columnar-engine.md
+/// "Slot compilation".
+struct SlotMap {
+    /// (fn, iid) -> slot index.
+    of_site: HashMap<(String, usize), u32>,
+    /// Canonical boundary cell id per slot.
+    cells: Vec<u32>,
+    /// Slots disqualified by the escape analysis (any use of a bound
+    /// site's result other than Load/Store/Kill means the pointer
+    /// escapes; the CELL then has an access path outside the slot
+    /// binding, so every site of that cell reverts to the generic path).
+    bad: std::collections::HashSet<u32>,
+    /// Original slot -> dense eligible-slot index. Bad slots get None
+    /// and MUST NOT be bound at runtime: their cells are mutated by the
+    /// generic path mid-tile, so a writeback would clobber them.
+    dense: Vec<Option<u32>>,
+    /// Canonical cell per DENSE slot (what gen.rs SLOT_CELLS emits).
+    dense_cells: Vec<u32>,
+}
+
+impl SlotMap {
+    fn load(path: &str) -> Result<SlotMap> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("read slot map {}", path))?;
+        let json: serde_json::Value = serde_json::from_str(&text)?;
+        let mut of_site = HashMap::new();
+        let mut cells = Vec::new();
+        for slot in json["slots"].as_array().context("slot map: no slots array")? {
+            let k = slot["slot"].as_u64().context("slot id")? as u32;
+            assert_eq!(k as usize, cells.len(), "slot ids must be dense and ordered");
+            cells.push(slot["cell"].as_u64().context("slot cell")? as u32);
+            for site in slot["sites"].as_array().context("slot sites")? {
+                let fn_name = site["fn"].as_str().context("site fn")?.to_string();
+                let iid = site["iid"].as_u64().context("site iid")? as usize;
+                let prev = of_site.insert((fn_name, iid), k);
+                assert!(prev.is_none(), "duplicate site in slot map");
+            }
+        }
+        Ok(SlotMap {
+            of_site,
+            cells,
+            bad: Default::default(),
+            dense: Vec::new(),
+            dense_cells: Vec::new(),
+        })
+    }
+
+    /// After `analyze`: number the surviving slots densely.
+    fn finalize(&mut self) {
+        for (k, &cell) in self.cells.iter().enumerate() {
+            if self.bad.contains(&(k as u32)) {
+                self.dense.push(None);
+            } else {
+                self.dense.push(Some(self.dense_cells.len() as u32));
+                self.dense_cells.push(cell);
+            }
+        }
+    }
+
+    /// Whole-program escape analysis: disqualify the slot of any bound
+    /// site whose result local is used as anything but Load source /
+    /// Store target / Kill hint (Kill is a liveness no-op on every
+    /// probe engine, and slot engines see a nil there). Also checks
+    /// every mapped site exists (stale-map detection).
+    fn analyze(&mut self, program: &Program) {
+        let mut seen = 0usize;
+        for (_, fun) in program.functions.iter() {
+            let fn_name = fun.name.as_str();
+            // Locals defined by bound sites in this function.
+            let mut site_local: HashMap<LocalId, u32> = HashMap::new();
+            for (_, block) in blocks_in_order(&fun.cfg) {
+                for (id, instr) in &block.instructions {
+                    if matches!(
+                        instr,
+                        Instruction::GetField { .. } | Instruction::GetIndex { .. }
+                    ) {
+                        if let Some(&k) =
+                            self.of_site.get(&(fn_name.to_string(), usize::from(*id)))
+                        {
+                            site_local.insert(*id, k);
+                            seen += 1;
+                        }
+                    }
+                }
+            }
+            if site_local.is_empty() {
+                continue;
+            }
+            for (_, block) in blocks_in_order(&fun.cfg) {
+                for (_, instr) in &block.instructions {
+                    match instr {
+                        Instruction::Load { source } => {
+                            let _ = source; // Load through the pointer: fine.
+                        }
+                        Instruction::Store { target, source } => {
+                            // Writing THROUGH the pointer is fine; storing
+                            // the pointer AS A VALUE escapes it.
+                            let _ = target;
+                            if let Some(&k) = site_local.get(source) {
+                                self.bad.insert(k);
+                            }
+                        }
+                        Instruction::Kill { .. } => {}
+                        other => {
+                            for used in other.get_used_locals() {
+                                if let Some(&k) = site_local.get(&used) {
+                                    self.bad.insert(k);
+                                }
+                            }
+                        }
+                    }
+                }
+                for used in block.terminator.1.get_used_locals() {
+                    if let Some(&k) = site_local.get(&used) {
+                        self.bad.insert(k);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            seen,
+            self.of_site.len(),
+            "slot map has sites the program does not (stale map? regenerate with --emit-slots)"
+        );
+    }
+}
+
 struct Gen {
     /// Name of the function currently being emitted (assert diagnostics).
     current_fn: String,
     /// Defining instruction per local of the current function (static
     /// chain walks, e.g. expand -> button resolution).
     defs: HashMap<LocalId, Instruction>,
+    /// Slot binding (None without --site-slots).
+    slots: Option<SlotMap>,
+    /// Locals of the CURRENT function holding an eligible bound site's
+    /// result -> slot index (loads/stores through them become slot ops).
+    local_slot: HashMap<LocalId, u32>,
     /// (kind, fn name, interned field id or 0) per get_field/get_index
     /// site, in site-id order - the gap census's site table.
     site_info: Vec<(&'static str, String, u32, usize)>,
@@ -86,6 +220,14 @@ struct Gen {
 }
 
 impl Gen {
+    /// The DENSE slot for a site of the current function, if bound and
+    /// eligible.
+    fn slot_of(&self, iid: usize) -> Option<u32> {
+        let s = self.slots.as_ref()?;
+        let k = *s.of_site.get(&(self.current_fn.clone(), iid))?;
+        s.dense[k as usize]
+    }
+
     fn builtin_id(name: &str) -> Result<u32> {
         BUILTIN_NAMES
             .iter()
@@ -238,10 +380,27 @@ impl Gen {
                 let g = self.globals.intern(name);
                 writeln!(out, "{} = rt.get_global({}, {}); // {}", d, g, create_if_missing, name)?;
             }
-            Instruction::Load { source } => writeln!(out, "{} = rt.load({});", d, l(*source))?,
-            Instruction::Store { target, source } => {
-                writeln!(out, "rt.store({}, {});", l(*target), l(*source))?;
-            }
+            Instruction::Load { source } => match self.local_slot.get(source) {
+                Some(&k) => writeln!(
+                    out,
+                    "{} = if E::HAS_SLOTS {{ rt.slot_get({}) }} else {{ rt.load({}) }};",
+                    d,
+                    k,
+                    l(*source)
+                )?,
+                None => writeln!(out, "{} = rt.load({});", d, l(*source))?,
+            },
+            Instruction::Store { target, source } => match self.local_slot.get(target) {
+                Some(&k) => writeln!(
+                    out,
+                    "if E::HAS_SLOTS {{ rt.slot_set({}, {}) }} else {{ rt.store({}, {}) }};",
+                    k,
+                    l(*source),
+                    l(*target),
+                    l(*source)
+                )?,
+                None => writeln!(out, "rt.store({}, {});", l(*target), l(*source))?,
+            },
             Instruction::StoreEmptyTable { target } => {
                 writeln!(out, "rt.store_empty_table({});", l(*target))?;
             }
@@ -264,29 +423,46 @@ impl Gen {
                 let f = self.fields.intern(field);
                 let site = self.site_info.len() as u32;
                 self.site_info.push(("field", self.current_fn.clone(), f, usize::from(id)));
-                writeln!(
-                    out,
-                    "{} = rt.get_field({}, {}, {}, {}); // .{}",
-                    d,
+                let generic = format!(
+                    "rt.get_field({}, {}, {}, {})",
                     l(*receiver),
                     f,
                     create_if_missing,
-                    site,
-                    field
-                )?;
+                    site
+                );
+                match self.slot_of(usize::from(id)) {
+                    Some(k) => {
+                        self.local_slot.insert(id, k);
+                        writeln!(
+                            out,
+                            "{} = if E::HAS_SLOTS {{ rt.c_nil() }} else {{ {} }}; // .{} slot {}",
+                            d, generic, field, k
+                        )?;
+                    }
+                    None => writeln!(out, "{} = {}; // .{}", d, generic, field)?,
+                }
             }
             Instruction::GetIndex { receiver, index, create_if_missing } => {
                 let site = self.site_info.len() as u32;
                 self.site_info.push(("index", self.current_fn.clone(), 0, usize::from(id)));
-                writeln!(
-                    out,
-                    "{} = rt.get_index({}, {}, {}, {});",
-                    d,
+                let generic = format!(
+                    "rt.get_index({}, {}, {}, {})",
                     l(*receiver),
                     l(*index),
                     create_if_missing,
                     site
-                )?;
+                );
+                match self.slot_of(usize::from(id)) {
+                    Some(k) => {
+                        self.local_slot.insert(id, k);
+                        writeln!(
+                            out,
+                            "{} = if E::HAS_SLOTS {{ rt.c_nil() }} else {{ {} }}; // slot {}",
+                            d, generic, k
+                        )?;
+                    }
+                    None => writeln!(out, "{} = {};", d, generic)?,
+                }
             }
             Instruction::NumberConstant { value } => {
                 let bits = value.to_bits();
@@ -406,6 +582,7 @@ impl Gen {
     fn emit_function(&mut self, fn_id: u32, fun: &FunDef) -> Result<String> {
         let fn_name = fun.name.as_str().to_string();
         self.current_fn = fn_name.clone();
+        self.local_slot.clear();
         self.defs = fun
             .cfg
             .iter_blocks()
@@ -526,6 +703,7 @@ fn main() -> Result<()> {
     let mut rewritten = false;
     let mut recipe_path = "rewrites.jsonl".to_string();
     let mut out_path = "native-probe/src/gen.rs".to_string();
+    let mut site_slots: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -535,6 +713,12 @@ fn main() -> Result<()> {
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("--recipe needs a path"))?;
                 rewritten = true;
+            }
+            "--site-slots" => {
+                site_slots = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--site-slots needs a path"))?,
+                );
             }
             other => out_path = other.to_string(),
         }
@@ -558,9 +742,34 @@ fn main() -> Result<()> {
             .context("compile the plain executable program (run from the repo root)")?
     };
 
+    let slots = match &site_slots {
+        Some(path) => {
+            let mut map = SlotMap::load(path)?;
+            map.analyze(&program);
+            map.finalize();
+            let n_sites = map.of_site.len();
+            let n_bad_sites = map
+                .of_site
+                .values()
+                .filter(|k| map.bad.contains(k))
+                .count();
+            eprintln!(
+                "site-slots: {} of {} slots eligible ({} sites bound, {} reverted by escape analysis)",
+                map.dense_cells.len(),
+                map.cells.len(),
+                n_sites - n_bad_sites,
+                n_bad_sites
+            );
+            Some(map)
+        }
+        None => None,
+    };
+
     let mut gen = Gen {
         current_fn: String::new(),
         defs: HashMap::new(),
+        slots,
+        local_slot: HashMap::new(),
         site_info: Vec::new(),
         branch_info: Vec::new(),
         strings: Interner::default(),
@@ -620,7 +829,22 @@ fn main() -> Result<()> {
     }
     out.push_str("];\n");
     out.push_str(&format!("pub const FN_INIT: u32 = {};\n", fn_init));
-    out.push_str(&format!("pub const FN_FRAME: u32 = {};\n\n", fn_frame));
+    out.push_str(&format!("pub const FN_FRAME: u32 = {};\n", fn_frame));
+    let slot_cells: &[u32] = gen
+        .slots
+        .as_ref()
+        .map(|s| s.dense_cells.as_slice())
+        .unwrap_or(&[]);
+    out.push_str(
+        "/// Canonical boundary cell per slot (slot compilation; empty\n\
+         /// without --site-slots). Engines with HAS_SLOTS bind these\n\
+         /// cells to a dense array at block entry and write back at exit.\n",
+    );
+    out.push_str(&format!("pub const N_SLOTS: usize = {};\n", slot_cells.len()));
+    out.push_str(&format!(
+        "pub static SLOT_CELLS: &[u32] = &{:?};\n\n",
+        slot_cells
+    ));
     out.push_str(
         "pub fn global_id(name: &str) -> Option<u32> {\n    \
          GLOBAL_NAMES.iter().position(|n| *n == name).map(|i| i as u32)\n}\n\n\

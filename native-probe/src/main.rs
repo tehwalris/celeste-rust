@@ -1260,11 +1260,13 @@ fn run_tile_variant<const B: u8>(
         rt3.set_buttons(g_btn, byte);
         rt3.tape = tape.clone();
         rt3.begin_pass();
+        rt3.bind_slots();
         let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             gen::call_fn(&mut rt3, gen::FN_FRAME, &[], &[]);
         }));
         match ok {
             Ok(_) => {
+                rt3.writeback_slots();
                 let fp = rt3.structure_fp();
                 match acc {
                     None => {

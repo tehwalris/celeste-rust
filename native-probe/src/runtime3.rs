@@ -78,6 +78,23 @@ pub struct Rt3<const BTN: u8 = 0> {
     pub ks: Vec<u8>,
     /// Payload pool for TCol::T (per-lane tiles).
     pub tiles: Vec<[AV; TILE]>,
+    /// Slot compilation (plans/columnar-engine.md): the values of the
+    /// gen::SLOT_CELLS boundary cells, bound at pass start
+    /// (`bind_slots`) and written back before rows are read off
+    /// (`writeback_slots`). Constant indices make the store/load pairs
+    /// on these cells compiler-visible.
+    pub slots: [TCol; crate::gen::N_SLOTS],
+    /// CELESTE_SLOT_GUARD=1: slot_set mirrors into cols and slot_get
+    /// compares against them - an aliased generic access to a slot cell
+    /// desyncs the two and fires the assert (the runtime guard for what
+    /// the escape analysis cannot prove).
+    pub guard: bool,
+}
+
+/// CELESTE_SLOT_GUARD, read once.
+fn slot_guard() -> bool {
+    static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GUARD.get_or_init(|| std::env::var("CELESTE_SLOT_GUARD").is_ok_and(|v| v == "1"))
 }
 
 impl<const BTN: u8> Rt3<BTN> {
@@ -146,6 +163,25 @@ impl<const BTN: u8> Rt3<BTN> {
             cursor: 0,
             ks: Vec::new(),
             tiles,
+            slots: [TCol::U(AV::Nil); crate::gen::N_SLOTS],
+            guard: slot_guard(),
+        }
+    }
+
+    /// Copy the slot cells' current values into the slot array. Call
+    /// AFTER any direct col mutation of the pass setup (set_buttons).
+    pub fn bind_slots(&mut self) {
+        for (k, &cell) in crate::gen::SLOT_CELLS.iter().enumerate() {
+            debug_assert!(matches!(self.structure[cell as usize], Cell2::Val));
+            self.slots[k] = self.cols[cell as usize];
+        }
+    }
+
+    /// Write the slot array back to the cells. Call before anything
+    /// reads cols off the tile (structure_fp / seed_rt2 / append_into).
+    pub fn writeback_slots(&mut self) {
+        for (k, &cell) in crate::gen::SLOT_CELLS.iter().enumerate() {
+            self.cols[cell as usize] = self.slots[k];
         }
     }
 
@@ -197,6 +233,8 @@ impl<const BTN: u8> Rt3<BTN> {
             cursor: self.cursor,
             ks: self.ks,
             tiles: self.tiles,
+            slots: self.slots,
+            guard: self.guard,
         }
     }
 
@@ -436,6 +474,40 @@ impl<const BTN: u8> Rt3<BTN> {
 
 impl<const BTN: u8> Engine for Rt3<BTN> {
     type V = TCol;
+
+    const HAS_SLOTS: bool = true;
+
+    #[inline(always)]
+    fn slot_get(&mut self, k: u32) -> TCol {
+        let v = self.slots[k as usize];
+        if self.guard {
+            let cell = crate::gen::SLOT_CELLS[k as usize] as usize;
+            let c = self.cols[cell];
+            for lane in 0..self.width {
+                assert!(
+                    self.tat(v, lane) == self.tat(c, lane),
+                    "slot {} desynced from cell {} at lane {}: {:?} vs {:?} \
+                     (an access path outside the slot binding wrote this cell)",
+                    k,
+                    cell,
+                    lane,
+                    self.tat(v, lane),
+                    self.tat(c, lane)
+                );
+            }
+        }
+        v
+    }
+
+    #[inline(always)]
+    fn slot_set(&mut self, k: u32, x: TCol) {
+        self.slots[k as usize] = x;
+        if self.guard {
+            let cell = crate::gen::SLOT_CELLS[k as usize] as usize;
+            self.structure[cell] = Cell2::Val;
+            self.cols[cell] = x;
+        }
+    }
 
     fn c_num(&mut self, hi: i16, lo: u16) -> TCol {
         TCol::U(AV::Num(P8::from_parts(hi, lo)))
