@@ -1794,6 +1794,63 @@ impl Rt2 {
         (rem_cells, det_cells)
     }
 
+    /// The canonical BFS order (the boundary's numbering) without
+    /// mutating anything - identity iff the block is already canonical
+    /// (what the BFS-ordered importer guarantees; slot binding relies
+    /// on it, so the bench asserts it per imported block).
+    pub fn is_canonical_order(&self) -> bool {
+        let mut order: Vec<u32> = Vec::new();
+        let mut seen = vec![false; self.structure.len()];
+        let mut queue: std::collections::VecDeque<u32> = Default::default();
+        let mut enqueue = |t: u32, seen: &mut Vec<bool>, queue: &mut std::collections::VecDeque<u32>, order: &mut Vec<u32>| {
+            if !seen[t as usize] {
+                seen[t as usize] = true;
+                order.push(t);
+                queue.push_back(t);
+            }
+        };
+        for &cell in self.globals.iter() {
+            if cell != NONE {
+                enqueue(cell, &mut seen, &mut queue, &mut order);
+            }
+        }
+        while let Some(c) = queue.pop_front() {
+            match &self.structure[c as usize] {
+                Cell2::Val => match &self.cols[c as usize] {
+                    Col::U(AV::Ptr(t)) => enqueue(*t, &mut seen, &mut queue, &mut order),
+                    Col::V(vs) => {
+                        for v in vs {
+                            if let AV::Ptr(t) = v {
+                                enqueue(*t, &mut seen, &mut queue, &mut order);
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                Cell2::Obj(fields) => {
+                    for (_, t) in fields {
+                        enqueue(*t, &mut seen, &mut queue, &mut order);
+                    }
+                }
+                Cell2::Arr(items) => {
+                    for t in items {
+                        enqueue(*t, &mut seen, &mut queue, &mut order);
+                    }
+                }
+                Cell2::Clo(_, caps) => {
+                    for cap in caps.iter() {
+                        if let Col::U(AV::Ptr(t)) = cap {
+                            enqueue(*t, &mut seen, &mut queue, &mut order);
+                        }
+                    }
+                }
+                Cell2::Unk | Cell2::Bi(_) => {}
+            }
+        }
+        order.len() == self.structure.len()
+            && order.iter().enumerate().all(|(i, &o)| o == i as u32)
+    }
+
     /// Boundary abstraction + canonical row dedup + compaction. Returns
     /// the surviving lane count (= next frame's width).
     ///

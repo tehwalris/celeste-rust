@@ -943,6 +943,15 @@ fn run_abstract_bench(dir: &str, frame: u32, reps: u32) {
         .iter()
         .map(|st| import::import_block(st, rt.cart.clone(), rt.cache.clone()))
         .collect();
+    // Slot binding relies on import ids == canonical ids (option b of
+    // the binding design); hold it loudly.
+    for (i, b) in blocks.iter().enumerate() {
+        assert!(
+            b.is_canonical_order(),
+            "imported block {} is not in canonical order",
+            i
+        );
+    }
     let lanes_in: usize = blocks.iter().map(|b| b.width).sum();
     // The interpreter's own answer at the NEXT EXISTING checkpoint (bench
     // dirs save every few frames): run that many frames once for the

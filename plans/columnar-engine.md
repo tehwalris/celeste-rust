@@ -638,3 +638,19 @@ boundary BFS is a small change and makes ids stable everywhere; keep
 Landed groundwork: scalar runtime now logs per-site RESULT cells
 (result_log, same lattice as the receiver log) - the input for the
 site->slot grouping either way.
+
+## Canonical-id stability: option (b) LANDED and verified
+
+import_block now traverses in the boundary BFS order (globals by gen
+index, breadth-first; the old name-order DFS importer deleted). The
+bench asserts `is_canonical_order()` on every imported block - PASSES
+on all 40 real f35 blocks, both engine modes still exact. Slot maps
+can therefore carry raw canonical cell ids; no path walking needed.
+
+Slot-compilation prerequisites now ALL in place:
+  1. per-site result-cell logging (runtime.rs result_log)   [landed]
+  2. canonical-id stability                                  [landed+verified]
+  3. design + eligibility analysis + emission plan           [written]
+Next session: census dump (--emit-slots), transpiler --site-slots
+eligibility + slot_get/slot_set emission, Rt3 slots array, re-measure
+the const variants.

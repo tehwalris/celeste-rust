@@ -151,17 +151,144 @@ pub fn import_lane(rt: &mut Rt, state: &State, lane: usize, placeholder_interval
 
 use crate::runtime2::{Cell2, Col, Rt2, AV, NONE};
 
-fn import_value2(
-    rt2: &mut Rt2,
-    v: &Value,
-    memo: &mut HashMap<HeapId, u32>,
+/// Import a whole interpreter boundary `State` as one columnar block.
+pub fn import_block(
     state: &State,
-) -> Col {
+    cart: std::sync::Arc<celeste_rust::cart_data::CartData>,
+    cache: std::sync::Arc<celeste_rust::collision_cache::CollisionCache>,
+) -> Rt2 {
+    assert!(
+        state.local_env.iter().count() == 0 && state.outer_local_envs.is_empty(),
+        "boundary states must have empty local envs"
+    );
+    let mut rt2 = Rt2::empty(
+        state.vector_size,
+        gen::GLOBAL_NAMES.len(),
+        gen::STRINGS,
+        cart,
+        cache,
+    );
+    rt2.prints = state.prints.clone();
+    // Traverse in the SAME order as the boundary's canonical BFS
+    // (globals by gen index, then breadth-first), so imported cell ids
+    // ARE the canonical ids - the invariant slot binding relies on
+    // (plans/columnar-engine.md "Slot binding subtlety", option b).
+    // import_cell2's recursion is depth-first, so drive it one cell at a
+    // time from an explicit BFS frontier: enqueue a cell, convert it
+    // WITHOUT recursing (children enqueue instead).
+    let mut memo = HashMap::new();
+    let mut queue: std::collections::VecDeque<HeapId> = Default::default();
+    for (gi, name) in gen::GLOBAL_NAMES.iter().enumerate() {
+        if let Some(cell) = state.global_env.get(*name) {
+            let c = reserve_cell(&mut rt2, *cell, &mut memo, &mut queue);
+            rt2.globals[gi] = c;
+        }
+    }
+    while let Some(id) = queue.pop_front() {
+        fill_cell(&mut rt2, id, &mut memo, &mut queue, state);
+    }
+    let _ = NONE;
+    rt2
+}
+
+/// Assign (or return) the slot for a heap cell, enqueueing it for
+/// filling on first sight - the BFS discovery step.
+fn reserve_cell(
+    rt2: &mut Rt2,
+    id: HeapId,
+    memo: &mut HashMap<HeapId, u32>,
+    queue: &mut std::collections::VecDeque<HeapId>,
+) -> u32 {
+    if let Some(&c) = memo.get(&id) {
+        return c;
+    }
+    let slot = rt2.structure.len() as u32;
+    rt2.structure.push(Cell2::Val);
+    rt2.cols.push(Col::U(AV::Nil));
+    memo.insert(id, slot);
+    queue.push_back(id);
+    slot
+}
+
+/// Convert one cell's content, reserving (not recursing into) children.
+fn fill_cell(
+    rt2: &mut Rt2,
+    id: HeapId,
+    memo: &mut HashMap<HeapId, u32>,
+    queue: &mut std::collections::VecDeque<HeapId>,
+    state: &State,
+) {
+    let slot = memo[&id];
+    let conv_value = |rt2: &mut Rt2,
+                      v: &Value,
+                      memo: &mut HashMap<HeapId, u32>,
+                      queue: &mut std::collections::VecDeque<HeapId>|
+     -> Col {
+        match v {
+            Value::Pointer(p) => Col::U(AV::Ptr(reserve_cell(rt2, *p, memo, queue))),
+            other => import_scalar_value(rt2, other, state),
+        }
+    };
+    let (cell, col) = match state.heap.get(id) {
+        HeapValue::Value(v) => {
+            let col = conv_value(rt2, v, memo, queue);
+            (Cell2::Val, col)
+        }
+        HeapValue::ObjectTable(fields) => {
+            let mut sorted: Vec<(&String, &HeapId)> = fields.iter().collect();
+            sorted.sort();
+            let mut out = Vec::with_capacity(sorted.len());
+            for (name, fid) in sorted {
+                let Some(f) = gen::field_id(name) else {
+                    continue;
+                };
+                out.push((f, reserve_cell(rt2, *fid, memo, queue)));
+            }
+            (Cell2::Obj(out), Col::U(AV::Nil))
+        }
+        HeapValue::ArrayTable(items) => (
+            Cell2::Arr(
+                items
+                    .iter()
+                    .map(|i| reserve_cell(rt2, *i, memo, queue))
+                    .collect(),
+            ),
+            Col::U(AV::Nil),
+        ),
+        HeapValue::UnknownTable => (Cell2::Unk, Col::U(AV::Nil)),
+        HeapValue::Closure(fun, caps) => {
+            let f = gen::FN_NAMES
+                .iter()
+                .position(|n| *n == fun.as_str())
+                .unwrap_or_else(|| panic!("closure of unknown fn {:?}", fun))
+                as u32;
+            let caps: Vec<Col> = caps
+                .iter()
+                .map(|v| conv_value(rt2, v, memo, queue))
+                .collect();
+            (Cell2::Clo(f, caps.into_boxed_slice()), Col::U(AV::Nil))
+        }
+        HeapValue::BuiltinFun(name) => (
+            Cell2::Bi(
+                BUILTIN_NAMES
+                    .iter()
+                    .position(|n| *n == name.as_str())
+                    .unwrap_or_else(|| panic!("unknown builtin {:?}", name)) as u32,
+            ),
+            Col::U(AV::Nil),
+        ),
+    };
+    rt2.structure[slot as usize] = cell;
+    rt2.cols[slot as usize] = col;
+}
+
+/// Non-pointer value conversion (shared by cell values and captures).
+fn import_scalar_value(rt2: &mut Rt2, v: &Value, state: &State) -> Col {
     let w = state.vector_size;
     match v {
         Value::Number(MaybeVector::Scalar(n)) => Col::U(AV::Num(*n)),
         Value::Number(MaybeVector::Vector(ns)) => {
-            assert_eq!(ns.len(), w, "vector length != vector_size");
+            assert_eq!(ns.len(), w);
             Col::N(ns.to_vec())
         }
         Value::NumberInterval(MaybeVector::Scalar(iv)) => Col::U(AV::Ival(iv.low, iv.high)),
@@ -181,102 +308,8 @@ fn import_value2(
             Col::U(AV::Str(id))
         }
         Value::Nil(_) => Col::U(AV::Nil),
-        Value::Pointer(id) => Col::U(AV::Ptr(import_cell2(rt2, *id, memo, state))),
+        Value::Pointer(_) => unreachable!("handled by conv_value"),
         Value::NilPointer(_) => Col::U(AV::NilPtr),
         Value::MaybeBool(_) => panic!("MaybeBool must never be stored (value.rs contract)"),
     }
-}
-
-fn import_cell2(rt2: &mut Rt2, id: HeapId, memo: &mut HashMap<HeapId, u32>, state: &State) -> u32 {
-    if let Some(&c) = memo.get(&id) {
-        return c;
-    }
-    // Reserve first: cycles must terminate.
-    let slot = rt2.structure.len() as u32;
-    rt2.structure.push(Cell2::Val);
-    rt2.cols.push(Col::U(AV::Nil));
-    memo.insert(id, slot);
-    let (cell, col) = match state.heap.get(id) {
-        HeapValue::Value(v) => {
-            let col = import_value2(rt2, v, memo, state);
-            (Cell2::Val, col)
-        }
-        HeapValue::ObjectTable(fields) => {
-            let mut sorted: Vec<(&String, &HeapId)> = fields.iter().collect();
-            sorted.sort();
-            let mut out = Vec::with_capacity(sorted.len());
-            for (name, fid) in sorted {
-                let Some(f) = gen::field_id(name) else {
-                    continue; // program never names this field: unreachable
-                };
-                let c = import_cell2(rt2, *fid, memo, state);
-                out.push((f, c));
-            }
-            (Cell2::Obj(out), Col::U(AV::Nil))
-        }
-        HeapValue::ArrayTable(items) => (
-            Cell2::Arr(
-                items
-                    .iter()
-                    .map(|i| import_cell2(rt2, *i, memo, state))
-                    .collect(),
-            ),
-            Col::U(AV::Nil),
-        ),
-        HeapValue::UnknownTable => (Cell2::Unk, Col::U(AV::Nil)),
-        HeapValue::Closure(fun, caps) => {
-            let f = gen::FN_NAMES
-                .iter()
-                .position(|n| *n == fun.as_str())
-                .unwrap_or_else(|| panic!("closure of unknown fn {:?}", fun))
-                as u32;
-            let caps: Vec<Col> = caps
-                .iter()
-                .map(|v| import_value2(rt2, v, memo, state))
-                .collect();
-            (Cell2::Clo(f, caps.into_boxed_slice()), Col::U(AV::Nil))
-        }
-        HeapValue::BuiltinFun(name) => (
-            Cell2::Bi(
-                BUILTIN_NAMES
-                    .iter()
-                    .position(|n| *n == name.as_str())
-                    .unwrap_or_else(|| panic!("unknown builtin {:?}", name)) as u32,
-            ),
-            Col::U(AV::Nil),
-        ),
-    };
-    rt2.structure[slot as usize] = cell;
-    rt2.cols[slot as usize] = col;
-    slot
-}
-
-/// Import a whole interpreter boundary `State` as one columnar block.
-pub fn import_block(
-    state: &State,
-    cart: std::sync::Arc<celeste_rust::cart_data::CartData>,
-    cache: std::sync::Arc<celeste_rust::collision_cache::CollisionCache>,
-) -> Rt2 {
-    assert!(
-        state.local_env.iter().count() == 0 && state.outer_local_envs.is_empty(),
-        "boundary states must have empty local envs"
-    );
-    let mut rt2 = Rt2::empty(
-        state.vector_size,
-        gen::GLOBAL_NAMES.len(),
-        gen::STRINGS,
-        cart,
-        cache,
-    );
-    rt2.prints = state.prints.clone();
-    let mut memo = HashMap::new();
-    for (name, cell) in state.global_env.iter() {
-        let Some(g) = gen::global_id(name) else {
-            continue; // program never names this global
-        };
-        let c = import_cell2(&mut rt2, *cell, &mut memo, state);
-        rt2.globals[g as usize] = c;
-    }
-    let _ = NONE;
-    rt2
 }
