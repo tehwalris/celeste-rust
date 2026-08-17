@@ -1,3 +1,20 @@
+# Engine vs production interpreter, same day, same machine (2026-08-17)
+
+CORRECTION of a wrong claim made mid-day ("the interpreter campaign
+is far behind both"): it is not. `rewrite bench --frames 40` on
+cores 0-14/16-30: **4.02 s total, f40 frame 0.94 s (1.4 us/lane
+wall), peak 1.6 GB** - 2-3x FASTER than the engine's 10.40 s / 3.08 s
+at the same exact lane counts. The interpreter's edge is its
+fragment/pm1 partitioned representation (354 mostly-uniform fragments
+per frame vs the engine's one wide block per shape). The engine's
+measured edge is memory locality (intra-frame peak is chunk-local)
+and its Rt2-relative kernel speed; see the 300m re-projection in
+plans/columnar-engine.md for what this means for room (2,0) - short
+version: the engine un-parks the S-rung ladder by removing the
+57-97 GB intra-frame OOM wall (frontier rows are ~50-100 typed
+B/lane), while raw per-lane time is currently at parity, pending the
+pm1-partition representation fix in frame_step.
+
 # Goal-7 measurement + slotless tiles at depth (2026-08-17; plans/columnar-engine.md)
 
 Per-phase timing of `frame_step` (`CELESTE_PHASE_TIME=1`), from-scratch
