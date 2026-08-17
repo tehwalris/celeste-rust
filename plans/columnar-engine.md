@@ -782,3 +782,22 @@ on (902k lanes). The kernel's residual profile (f_15 glue 15%,
 boundary 14%, select 12%, append 10%) says roughly one more 2x is
 available in-frame, but the CAMPAIGN-relevant lever is now goal 7:
 merge/dedup/boundary at roofline. That is the next unit.
+
+## Shape-gate diagnostic: two steady shapes (late evening)
+
+`--abstract 40` under tile mode rejects 48,767 chunks at the shape
+gate: the NATIVE from-scratch run's steady shape (0x893c9b0ef0d84006)
+differs from the interpreter-campaign checkpoint shape the census was
+taken on (0xc51b1bf0e3dba1ac) - boundary timer pins and the importer's
+unknown-field dropping make both legitimate but distinct. Consequences,
+stated honestly:
+- The tile kernel accelerates the CAMPAIGN path (checkpoint-imported
+  states, which is what the search runs on); the from-scratch
+  `--abstract` harness runs Rt2 and its "both modes exact" claim is
+  really an Rt2 claim post-gate.
+- Tile-mode exactness at scale is certified by the BENCH: real f35
+  states, 187,859 lanes in, exact through f37 (365,029), guard green.
+- If tile acceleration for native from-scratch runs is ever wanted,
+  dump a second census from a native steady state (the pipeline is
+  shape-generic); the gate now PRINTS rejected shapes, so this is
+  observable, not silent.

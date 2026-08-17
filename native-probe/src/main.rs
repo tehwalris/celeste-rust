@@ -1075,6 +1075,8 @@ fn run_abstract(num_frames: u32) {
         );
     }
     println!("abstract: {} frames in {:.3?}", num_frames, start.elapsed());
+    print_bails();
+    print_gate_rejects();
     if !census_total.is_empty() {
         let mut rows: Vec<_> = census_total.into_iter().collect();
         rows.sort_by_key(|(_, (ns, _, _))| std::cmp::Reverse(*ns));
@@ -1194,6 +1196,7 @@ fn run_abstract_bench(dir: &str, frame: u32, reps: u32) {
         }
     }
     print_bails();
+    print_gate_rejects();
     runtime3::TILE_CENSUS.print();
 }
 
@@ -1211,6 +1214,7 @@ fn run_chunk_tiled(
     // kernel) is scoped to the census SHAPE. Off-shape blocks (spawn,
     // death, other rooms) run the reference engine.
     if gen::N_SLOTS > 0 && chunk.shape_hash != gen::SLOT_SHAPE {
+        record_gate_reject(chunk.shape_hash);
         return None;
     }
     let g_btn = gen::global_id("__button_states").expect("no __button_states");
@@ -1243,6 +1247,7 @@ fn run_chunk_dynexp(
 ) -> Option<runtime2::Rt2> {
     // Slot binding is shape-scoped: deopt off-shape (see run_chunk_tiled).
     if gen::N_SLOTS > 0 && chunk.shape_hash != gen::SLOT_SHAPE {
+        record_gate_reject(chunk.shape_hash);
         return None;
     }
     let mut acc: Option<(runtime2::Rt2, u64)> = None;
@@ -1298,6 +1303,33 @@ fn run_chunk_dynexp(
     let (mut acc, _) = acc?;
     acc.boundary(ids);
     Some(acc)
+}
+
+/// Off-shape gate rejections: count + the distinct shapes seen (the
+/// diagnostic for "the tile path silently stopped running").
+static GATE_REJECTS: std::sync::Mutex<Option<std::collections::HashMap<u64, u64>>> =
+    std::sync::Mutex::new(None);
+
+fn record_gate_reject(shape: u64) {
+    *GATE_REJECTS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(Default::default)
+        .entry(shape)
+        .or_insert(0) += 1;
+}
+
+fn print_gate_rejects() {
+    if let Some(map) = GATE_REJECTS.lock().unwrap().take() {
+        let total: u64 = map.values().sum();
+        let shapes: Vec<String> = map.iter().map(|(s, n)| format!("{:#018x} x{}", s, n)).collect();
+        println!(
+            "tile shape-gate rejected {} chunks (SLOT_SHAPE {:#018x}): {}",
+            total,
+            gen::SLOT_SHAPE,
+            shapes.join(", ")
+        );
+    }
 }
 
 /// Aggregate bail sites (printed by the bench when nonempty).
