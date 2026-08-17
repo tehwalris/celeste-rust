@@ -53,22 +53,17 @@ fn bail() -> ! {
 /// One tile value: uniform, or an index into the tile-data pool. 16 B,
 /// so cloning a whole column table is a small flat memcpy (the inline
 /// [AV; TILE] variant made the enum 260 B and cloning dominated v1).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum TCol {
     U(AV),
     T(u32),
 }
-
-/// Handle into the tile arena (what the generated code passes around).
-#[derive(Clone, Copy, Debug)]
-pub struct TId(pub u32);
 
 #[derive(Clone)]
 pub struct Rt3 {
     pub width: usize, // <= TILE (last tile of a chunk may be partial)
     pub structure: Vec<Cell2>,
     pub cols: Vec<TCol>,
-    arena: Vec<TCol>,
     pub globals: Vec<u32>,
     pub strings: std::sync::Arc<Vec<String>>,
     pub cart: std::sync::Arc<celeste_rust::cart_data::CartData>,
@@ -141,7 +136,6 @@ impl Rt3 {
             width: w,
             structure,
             cols,
-            arena: Vec::with_capacity(1 << 14),
             globals: src.globals.clone(),
             strings: std::sync::Arc::new(src.strings.clone()),
             cart: src.cart.clone(),
@@ -186,10 +180,9 @@ impl Rt3 {
         }
     }
 
-    /// Prepare for a (re)run pass: arena reset, valid mask reset, tape
-    /// cursor rewound (the tape itself carries the pass's choices).
+    /// Prepare for a (re)run pass: valid mask reset, tape cursor rewound
+    /// (the tape itself carries the pass's choices).
     pub fn begin_pass(&mut self) {
-        self.arena.clear();
         self.valid = [true; TILE];
         self.cursor = 0;
         self.ks.clear();
@@ -228,20 +221,8 @@ impl Rt3 {
         TCol::T(ix)
     }
 
-    #[inline]
-    fn put(&mut self, c: TCol) -> TId {
-        let id = self.arena.len() as u32;
-        self.arena.push(c);
-        TId(id)
-    }
-
-    #[inline]
-    fn get(&self, id: TId) -> &TCol {
-        &self.arena[id.0 as usize]
-    }
-
-    fn uptr(&self, id: TId) -> u32 {
-        match *self.get(id) {
+    fn uptr(&self, id: TCol) -> u32 {
+        match id {
             TCol::U(AV::Ptr(p)) => p,
             TCol::U(_) => bail(),
             TCol::T(ix) => {
@@ -256,11 +237,11 @@ impl Rt3 {
     }
 
     #[inline]
-    fn map1(&mut self, a: TId, f: impl Fn(AV) -> AV) -> TId {
-        match *self.get(a) {
+    fn map1(&mut self, a: TCol, f: impl Fn(AV) -> AV) -> TCol {
+        match a {
             TCol::U(x) => {
                 let out = TCol::U(f(x));
-                self.put(out)
+                out
             }
             c @ TCol::T(_) => {
                 let mut o = [AV::Nil; TILE];
@@ -268,24 +249,24 @@ impl Rt3 {
                     o[i] = f(self.tat(c, i));
                 }
                 let out = self.put_tile(o);
-                self.put(out)
+                out
             }
         }
     }
 
     #[inline]
-    fn map2(&mut self, a: TId, b: TId, f: impl Fn(AV, AV) -> AV) -> TId {
-        let (x, y) = (*self.get(a), *self.get(b));
+    fn map2(&mut self, a: TCol, b: TCol, f: impl Fn(AV, AV) -> AV) -> TCol {
+        let (x, y) = (a, b);
         if let (TCol::U(x), TCol::U(y)) = (x, y) {
             let out = TCol::U(f(x, y));
-            return self.put(out);
+            return out;
         }
         let mut o = [AV::Nil; TILE];
         for i in 0..self.width {
             o[i] = f(self.tat(x, i), self.tat(y, i));
         }
         let out = self.put_tile(o);
-        self.put(out)
+        out
     }
 
     /// A lane-multiplying op under the counter tape: `n_alts(lane)` and
@@ -297,7 +278,7 @@ impl Rt3 {
         &mut self,
         n_alts: impl Fn(usize) -> usize,
         alt: impl Fn(usize, usize) -> AV,
-    ) -> TId {
+    ) -> TCol {
         let site = self.cursor;
         self.cursor += 1;
         let choice = *self.tape.get(site).unwrap_or(&0) as usize;
@@ -319,10 +300,10 @@ impl Rt3 {
         self.ks[site] = self.ks[site].max(max_k as u8);
         // Uniform result stays uniform.
         if o[..self.width].iter().all(|v| *v == o[0]) {
-            return self.put(TCol::U(o[0]));
+            return TCol::U(o[0]);
         }
         let out = self.put_tile(o);
-        self.put(out)
+        out
     }
 }
 
@@ -434,78 +415,78 @@ impl Rt3 {
 }
 
 impl Engine for Rt3 {
-    type V = TId;
+    type V = TCol;
 
-    fn c_num(&mut self, hi: i16, lo: u16) -> TId {
-        self.put(TCol::U(AV::Num(P8::from_parts(hi, lo))))
+    fn c_num(&mut self, hi: i16, lo: u16) -> TCol {
+        TCol::U(AV::Num(P8::from_parts(hi, lo)))
     }
-    fn c_bool(&mut self, b: bool) -> TId {
-        self.put(TCol::U(AV::Bool(b)))
+    fn c_bool(&mut self, b: bool) -> TCol {
+        TCol::U(AV::Bool(b))
     }
-    fn c_str(&mut self, s: u32) -> TId {
-        self.put(TCol::U(AV::Str(s)))
+    fn c_str(&mut self, s: u32) -> TCol {
+        TCol::U(AV::Str(s))
     }
-    fn c_nil(&mut self) -> TId {
-        self.put(TCol::U(AV::Nil))
+    fn c_nil(&mut self) -> TCol {
+        TCol::U(AV::Nil)
     }
 
-    fn alloc_nil(&mut self) -> TId {
+    fn alloc_nil(&mut self) -> TCol {
         let id = self.structure.len() as u32;
         self.structure.push(Cell2::Val);
         self.cols.push(TCol::U(AV::Nil));
-        self.put(TCol::U(AV::Ptr(id)))
+        TCol::U(AV::Ptr(id))
     }
 
-    fn get_global(&mut self, g: u32, create: bool) -> TId {
+    fn get_global(&mut self, g: u32, create: bool) -> TCol {
         let cell = self.globals[g as usize];
         if cell != NONE {
-            self.put(TCol::U(AV::Ptr(cell)))
+            TCol::U(AV::Ptr(cell))
         } else if create {
             let id = self.structure.len() as u32;
             self.structure.push(Cell2::Val);
             self.cols.push(TCol::U(AV::Nil));
             self.globals[g as usize] = id;
-            self.put(TCol::U(AV::Ptr(id)))
+            TCol::U(AV::Ptr(id))
         } else {
-            self.put(TCol::U(AV::NilPtr))
+            TCol::U(AV::NilPtr)
         }
     }
 
-    fn load(&mut self, v: TId) -> TId {
-        let p = match self.get(v) {
-            TCol::U(AV::Ptr(p)) => *p,
-            TCol::U(AV::NilPtr) => return self.put(TCol::U(AV::Nil)),
+    fn load(&mut self, v: TCol) -> TCol {
+        let p = match v {
+            TCol::U(AV::Ptr(p)) => p,
+            TCol::U(AV::NilPtr) => return TCol::U(AV::Nil),
             _ => self.uptr(v),
         };
         match &self.structure[p as usize] {
             Cell2::Val => {
                 let c = self.cols[p as usize];
-                self.put(c)
+                c
             }
-            _ => self.put(TCol::U(AV::Ptr(p))),
+            _ => TCol::U(AV::Ptr(p)),
         }
     }
 
-    fn store(&mut self, t: TId, s: TId) {
+    fn store(&mut self, t: TCol, s: TCol) {
         let p = self.uptr(t) as usize;
         self.structure[p] = Cell2::Val;
-        self.cols[p] = *self.get(s);
+        self.cols[p] = s;
     }
 
-    fn store_empty_table(&mut self, t: TId) {
+    fn store_empty_table(&mut self, t: TCol) {
         let p = self.uptr(t) as usize;
         self.structure[p] = Cell2::Unk;
         self.cols[p] = TCol::U(AV::Nil);
     }
 
-    fn store_closure(&mut self, t: TId, f: u32, caps: &[TId]) {
+    fn store_closure(&mut self, t: TCol, f: u32, caps: &[TCol]) {
         let p = self.uptr(t) as usize;
-        let caps: Box<[Col]> = caps.iter().map(|c| tcol_to_col(*self.get(*c))).collect();
+        let caps: Box<[Col]> = caps.iter().map(|c| tcol_to_col(*c)).collect();
         self.structure[p] = Cell2::Clo(f, caps);
         self.cols[p] = TCol::U(AV::Nil);
     }
 
-    fn get_field(&mut self, recv: TId, f: u32, create: bool, _site: u32) -> TId {
+    fn get_field(&mut self, recv: TCol, f: u32, create: bool, _site: u32) -> TCol {
         let table = self.uptr(recv) as usize;
         let existing = match &self.structure[table] {
             Cell2::Obj(fields) => fields.iter().find(|(k, _)| *k == f).map(|(_, c)| *c),
@@ -513,7 +494,7 @@ impl Engine for Rt3 {
             _ => bail(),
         };
         if let Some(cell) = existing {
-            self.put(TCol::U(AV::Ptr(cell)))
+            TCol::U(AV::Ptr(cell))
         } else if create {
             let cell = self.structure.len() as u32;
             self.structure.push(Cell2::Val);
@@ -523,15 +504,15 @@ impl Engine for Rt3 {
                 slot @ Cell2::Unk => *slot = Cell2::Obj(vec![(f, cell)]),
                 _ => unreachable!(),
             }
-            self.put(TCol::U(AV::Ptr(cell)))
+            TCol::U(AV::Ptr(cell))
         } else {
-            self.put(TCol::U(AV::NilPtr))
+            TCol::U(AV::NilPtr)
         }
     }
 
-    fn get_index(&mut self, recv: TId, idx: TId, create: bool, _site: u32) -> TId {
+    fn get_index(&mut self, recv: TCol, idx: TCol, create: bool, _site: u32) -> TCol {
         let table = self.uptr(recv) as usize;
-        let index = match self.get(idx) {
+        let index = match idx {
             TCol::U(AV::Num(n)) => match n.as_i16() {
                 Some(i) => i,
                 None => bail(),
@@ -547,7 +528,7 @@ impl Engine for Rt3 {
             _ => bail(),
         };
         if let Some(cell) = existing {
-            self.put(TCol::U(AV::Ptr(cell)))
+            TCol::U(AV::Ptr(cell))
         } else if create {
             let old_len = match &self.structure[table] {
                 Cell2::Arr(items) => items.len(),
@@ -567,71 +548,71 @@ impl Engine for Rt3 {
                 slot @ Cell2::Unk => *slot = Cell2::Arr(tail),
                 _ => unreachable!(),
             }
-            self.put(TCol::U(AV::Ptr(cell)))
+            TCol::U(AV::Ptr(cell))
         } else {
-            self.put(TCol::U(AV::NilPtr))
+            TCol::U(AV::NilPtr)
         }
     }
 
-    fn op_add(&mut self, l: TId, r: TId) -> TId {
+    fn op_add(&mut self, l: TCol, r: TCol) -> TCol {
         self.map2(l, r, |a, b| av_addsub(a, b, false))
     }
-    fn op_sub(&mut self, l: TId, r: TId) -> TId {
+    fn op_sub(&mut self, l: TCol, r: TCol) -> TCol {
         self.map2(l, r, |a, b| av_addsub(a, b, true))
     }
-    fn op_mul(&mut self, l: TId, r: TId) -> TId {
+    fn op_mul(&mut self, l: TCol, r: TCol) -> TCol {
         self.map2(l, r, av_mul)
     }
-    fn op_div(&mut self, l: TId, r: TId) -> TId {
+    fn op_div(&mut self, l: TCol, r: TCol) -> TCol {
         self.map2(l, r, av_div)
     }
-    fn op_rem(&mut self, l: TId, r: TId) -> TId {
+    fn op_rem(&mut self, l: TCol, r: TCol) -> TCol {
         self.map2(l, r, av_rem)
     }
-    fn op_pow(&mut self, _l: TId, _r: TId) -> TId {
+    fn op_pow(&mut self, _l: TCol, _r: TCol) -> TCol {
         bail()
     }
-    fn eq(&mut self, l: TId, r: TId) -> TId {
-        let (x, y) = (*self.get(l), *self.get(r));
+    fn eq(&mut self, l: TCol, r: TCol) -> TCol {
+        let (x, y) = ((l), (r));
         if let (TCol::U(x), TCol::U(y)) = (x, y) {
             let out = TCol::U(av_eq(x, y, &self.strings));
-            return self.put(out);
+            return out;
         }
         let mut o = [AV::Nil; TILE];
         for i in 0..self.width {
             o[i] = av_eq(self.tat(x, i), self.tat(y, i), &self.strings);
         }
         let out = self.put_tile(o);
-        self.put(out)
+        out
     }
-    fn ne(&mut self, l: TId, r: TId) -> TId {
+    fn ne(&mut self, l: TCol, r: TCol) -> TCol {
         let e = self.eq(l, r);
         self.map1(e, av_not)
     }
-    fn lt(&mut self, l: TId, r: TId) -> TId {
+    fn lt(&mut self, l: TCol, r: TCol) -> TCol {
         self.map2(l, r, |a, b| av_cmp(CmpOp::Lt, a, b))
     }
-    fn le(&mut self, l: TId, r: TId) -> TId {
+    fn le(&mut self, l: TCol, r: TCol) -> TCol {
         self.map2(l, r, |a, b| av_cmp(CmpOp::Le, a, b))
     }
-    fn gt(&mut self, l: TId, r: TId) -> TId {
+    fn gt(&mut self, l: TCol, r: TCol) -> TCol {
         self.map2(l, r, |a, b| av_cmp(CmpOp::Gt, a, b))
     }
-    fn ge(&mut self, l: TId, r: TId) -> TId {
+    fn ge(&mut self, l: TCol, r: TCol) -> TCol {
         self.map2(l, r, |a, b| av_cmp(CmpOp::Ge, a, b))
     }
-    fn concat(&mut self, _l: TId, _r: TId) -> TId {
+    fn concat(&mut self, _l: TCol, _r: TCol) -> TCol {
         bail()
     }
-    fn un_minus(&mut self, v: TId) -> TId {
+    fn un_minus(&mut self, v: TCol) -> TCol {
         self.map1(v, av_neg)
     }
-    fn un_not(&mut self, v: TId) -> TId {
+    fn un_not(&mut self, v: TCol) -> TCol {
         self.map1(v, av_not)
     }
-    fn un_hash(&mut self, v: TId) -> TId {
-        let out = match self.get(v) {
-            TCol::U(AV::Str(s)) => AV::Num(P8::from_i16(self.strings[*s as usize].len() as i16)),
+    fn un_hash(&mut self, v: TCol) -> TCol {
+        let out = match v {
+            TCol::U(AV::Str(s)) => AV::Num(P8::from_i16(self.strings[s as usize].len() as i16)),
             _ => {
                 let p = self.uptr(v);
                 match &self.structure[p as usize] {
@@ -641,10 +622,10 @@ impl Engine for Rt3 {
                 }
             }
         };
-        self.put(TCol::U(out))
+        TCol::U(out)
     }
 
-    fn select(&mut self, c: TId, t: TId, f: TId) -> TId {
+    fn select(&mut self, c: TCol, t: TCol, f: TCol) -> TCol {
         let pick = |cv: AV, tv: AV, fv: AV| -> AV {
             match cv {
                 AV::Bool(true) => tv,
@@ -652,23 +633,23 @@ impl Engine for Rt3 {
                 _ => bail(),
             }
         };
-        let (cc, tc, fc) = (*self.get(c), *self.get(t), *self.get(f));
+        let (cc, tc, fc) = ((c), (t), (f));
         if let (TCol::U(cv), TCol::U(tv), TCol::U(fv)) = (cc, tc, fc) {
             let out = TCol::U(pick(cv, tv, fv));
-            return self.put(out);
+            return out;
         }
         let mut o = [AV::Nil; TILE];
         for i in 0..self.width {
             o[i] = pick(self.tat(cc, i), self.tat(tc, i), self.tat(fc, i));
         }
         let out = self.put_tile(o);
-        self.put(out)
+        out
     }
 
     /// Buttons are concrete on this path; a UBool reaching expand means
     /// the driver forgot set_buttons - bail to the reference engine.
-    fn expand(&mut self, v: TId) -> TId {
-        match *self.get(v) {
+    fn expand(&mut self, v: TCol) -> TCol {
+        match v {
             TCol::U(AV::Bool(_)) => v,
             TCol::T(ix)
                 if self.tiles[ix as usize][..self.width]
@@ -681,8 +662,8 @@ impl Engine for Rt3 {
         }
     }
 
-    fn truthy_b(&mut self, v: TId, _site: u32) -> bool {
-        match *self.get(v) {
+    fn truthy_b(&mut self, v: TCol, _site: u32) -> bool {
+        match v {
             TCol::U(a) => av_truthy(a),
             TCol::T(ix) => {
                 let vs = &self.tiles[ix as usize];
@@ -695,15 +676,15 @@ impl Engine for Rt3 {
         }
     }
 
-    fn kill(&mut self, _vs: &[TId]) {}
+    fn kill(&mut self, _vs: &[TCol]) {}
 
-    fn assert_closure(&mut self, v: TId, f: u32, caps: &[TId], _ctx: &str) {
+    fn assert_closure(&mut self, v: TCol, f: u32, caps: &[TCol], _ctx: &str) {
         let p = self.uptr(v);
         match &self.structure[p as usize] {
             Cell2::Clo(cf, cc) if *cf == f && cc.len() == caps.len() => {
                 for (stored, want) in cc.iter().zip(caps) {
-                    let ok = match (stored, self.get(*want)) {
-                        (Col::U(a), TCol::U(b)) => a == b,
+                    let ok = match (stored, (*want)) {
+                        (Col::U(a), TCol::U(b)) => *a == b,
                         _ => false,
                     };
                     if !ok {
@@ -714,20 +695,20 @@ impl Engine for Rt3 {
             _ => bail(),
         }
     }
-    fn assert_pointer(&mut self, v: TId, _ctx: &str) {
-        match self.get(v) {
+    fn assert_pointer(&mut self, v: TCol, _ctx: &str) {
+        match v {
             TCol::U(AV::Ptr(_)) => {}
             _ => bail(),
         }
     }
-    fn assert_value_cell(&mut self, v: TId, _ctx: &str) {
+    fn assert_value_cell(&mut self, v: TCol, _ctx: &str) {
         let p = self.uptr(v);
         if !matches!(self.structure[p as usize], Cell2::Val) {
             bail();
         }
     }
-    fn assert_true(&mut self, v: TId, _ctx: &str) {
-        match *self.get(v) {
+    fn assert_true(&mut self, v: TCol, _ctx: &str) {
+        match v {
             TCol::U(AV::Bool(true)) => {}
             TCol::T(ix)
                 if self.tiles[ix as usize][..self.width]
@@ -736,29 +717,29 @@ impl Engine for Rt3 {
             _ => bail(),
         }
     }
-    fn assert_builtin(&mut self, v: TId, b: u32) {
+    fn assert_builtin(&mut self, v: TCol, b: u32) {
         let p = self.uptr(v);
         if !matches!(&self.structure[p as usize], Cell2::Bi(x) if *x == b) {
             bail();
         }
     }
 
-    fn bi_min(&mut self, l: TId, r: TId) -> TId {
+    fn bi_min(&mut self, l: TCol, r: TCol) -> TCol {
         self.map2(l, r, av_min)
     }
-    fn bi_max(&mut self, l: TId, r: TId) -> TId {
+    fn bi_max(&mut self, l: TCol, r: TCol) -> TCol {
         self.map2(l, r, av_max)
     }
-    fn bi_abs(&mut self, v: TId) -> TId {
+    fn bi_abs(&mut self, v: TCol) -> TCol {
         self.map1(v, av_abs)
     }
-    fn bi_flr(&mut self, v: TId) -> TId {
+    fn bi_flr(&mut self, v: TCol) -> TCol {
         self.map1(v, av_flr)
     }
-    fn bi_sin(&mut self, v: TId) -> TId {
+    fn bi_sin(&mut self, v: TCol) -> TCol {
         self.map1(v, av_sin)
     }
-    fn bi_mget(&mut self, x: TId, y: TId) -> TId {
+    fn bi_mget(&mut self, x: TCol, y: TCol) -> TCol {
         let cart = self.cart.clone();
         self.map2(x, y, move |a, b| match (a, b) {
             (AV::Num(x), AV::Num(y)) => {
@@ -767,8 +748,8 @@ impl Engine for Rt3 {
             _ => bail(),
         })
     }
-    fn bi_tile_flag_at(&mut self, x: TId, y: TId, w: TId, h: TId, f: TId) -> TId {
-        let flag = match self.get(f) {
+    fn bi_tile_flag_at(&mut self, x: TCol, y: TCol, w: TCol, h: TCol, f: TCol) -> TCol {
+        let flag = match f {
             TCol::U(AV::Num(n)) => match n.as_i16() {
                 Some(i) => i,
                 None => bail(),
@@ -776,13 +757,13 @@ impl Engine for Rt3 {
             _ => bail(),
         };
         if flag != 0 {
-            return self.put(TCol::U(AV::Bool(false)));
+            return TCol::U(AV::Bool(false));
         }
-        let wi = match self.get(w) {
+        let wi = match w {
             TCol::U(AV::Num(n)) => n.as_i16().unwrap_or_else(|| bail()),
             _ => bail(),
         };
-        let hi = match self.get(h) {
+        let hi = match h {
             TCol::U(AV::Num(n)) => n.as_i16().unwrap_or_else(|| bail()),
             _ => bail(),
         };
@@ -802,10 +783,10 @@ impl Engine for Rt3 {
         })
     }
 
-    fn call_builtin(&mut self, b: u32, args: &[TId]) -> TId {
+    fn call_builtin(&mut self, b: u32, args: &[TCol]) -> TCol {
         match b {
             BI___PRINT | BI_PRINT => bail(),
-            BI___NEW_UNKNOWN_BOOLEAN => self.put(TCol::U(AV::UBool)),
+            BI___NEW_UNKNOWN_BOOLEAN => TCol::U(AV::UBool),
             BI___WIDEN_REM | BI___NEW_VECTOR | BI_ERROR => bail(),
             BI___ARRAY_TABLE_DROP_LAST => {
                 let p = self.uptr(args[0]) as usize;
@@ -818,7 +799,7 @@ impl Engine for Rt3 {
                     }
                     _ => bail(),
                 }
-                self.put(TCol::U(AV::Nil))
+                TCol::U(AV::Nil)
             }
             BI_MIN => self.bi_min(args[0], args[1]),
             BI_MAX => self.bi_max(args[0], args[1]),
@@ -837,7 +818,7 @@ impl Engine for Rt3 {
             }
             BI_TILE_FLAG_AT => self.bi_tile_flag_at(args[0], args[1], args[2], args[3], args[4]),
             BI___SPLIT_BY_FLR => {
-                let d = *self.get(args[0]);
+                let d = args[0];
                 let needs = match d {
                     TCol::U(AV::Num(_)) => false,
                     TCol::U(AV::Ival(a, b)) => a.flr() != b.flr(),
@@ -851,7 +832,7 @@ impl Engine for Rt3 {
                     _ => bail(),
                 };
                 if !needs {
-                    return self.put(d);
+                    return d;
                 }
                 let subs = |v: AV| -> Vec<Pico8NumInterval> {
                     match v {
@@ -886,8 +867,8 @@ impl Engine for Rt3 {
                 )
             }
             BI___SPLIT_AT => {
-                let c = match self.get(args[1]) {
-                    TCol::U(AV::Num(n)) => *n,
+                let c = match args[1] {
+                    TCol::U(AV::Num(n)) => n,
                     _ => bail(),
                 };
                 let full_low = P8::from_parts(i16::MIN, 0);
@@ -900,7 +881,7 @@ impl Engine for Rt3 {
                 if c < full_high {
                     sides.push(Pico8NumInterval::new(c.next_largest(), full_high));
                 }
-                let d = *self.get(args[0]);
+                let d = args[0];
                 let lane_alts = |v: AV| -> Vec<AV> {
                     match v {
                         AV::Num(n) => vec![AV::Num(n)],
@@ -938,7 +919,7 @@ impl Engine for Rt3 {
             }
             BI_ADD => {
                 let p = self.uptr(args[0]) as usize;
-                let value = *self.get(args[1]);
+                let value = args[1];
                 let cell = self.structure.len() as u32;
                 self.structure.push(Cell2::Val);
                 self.cols.push(value);
@@ -947,13 +928,13 @@ impl Engine for Rt3 {
                     slot @ Cell2::Unk => *slot = Cell2::Arr(vec![cell]),
                     _ => bail(),
                 }
-                self.put(value)
+                value
             }
             _ => bail(),
         }
     }
 
-    fn callee_of(&mut self, c: TId, _ctx: &str) -> Callee<TId> {
+    fn callee_of(&mut self, c: TCol, _ctx: &str) -> Callee<TCol> {
         let p = self.uptr(c);
         match &self.structure[p as usize] {
             Cell2::Clo(f, caps) => {
@@ -965,7 +946,7 @@ impl Engine for Rt3 {
                         _ => bail(),
                     })
                     .collect();
-                Callee::Fn(f, caps.into_iter().map(|c| self.put(c)).collect())
+                Callee::Fn(f, caps.into_iter().map(|c| c).collect())
             }
             Cell2::Bi(b) => Callee::Bi(*b),
             _ => bail(),
