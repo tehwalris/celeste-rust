@@ -615,3 +615,26 @@ State of scaffolding (all landed and exact on the bench): one-frame
 bench with chased-checkpoint oracle; Rt3 tiles with by-value TCol;
 counter-replay; TileBail->Rt2 fallback with site aggregation; variant
 dispatch + static button resolution; chunk accumulator.
+
+## Slot binding subtlety (found while building step 1; groundwork landed)
+
+The census records cells in the IMPORT numbering; Rt3 tiles are built
+from post-boundary blocks in the CANONICAL numbering - the two differ
+(global_env name-order DFS vs global-index BFS). So the slot map cannot
+carry raw cell ids. Two options for the next session:
+  (a) bind by ACCESS PATH: census emits (receiver cell, field/index,
+      result cell) triples per site; reconstruct root->cell paths
+      (get_index sites must also record the concrete index); Rt3 walks
+      the path once per block at bind time. Robust, slightly more code.
+  (b) prove/assert numbering stability: make import_block use the SAME
+      order as the boundary BFS (global-index BFS), so import ids ==
+      canonical ids for boundary states, and the census can emit raw
+      canonical ids. Less code, one invariant to hold (assert both
+      numberings agree on a reference state).
+Recommendation: (b) first - aligning import_block's traversal with the
+boundary BFS is a small change and makes ids stable everywhere; keep
+(a) as fallback if any state disagrees.
+
+Landed groundwork: scalar runtime now logs per-site RESULT cells
+(result_log, same lattice as the receiver log) - the input for the
+site->slot grouping either way.

@@ -103,6 +103,11 @@ pub struct Rt {
     /// Per-site receiver log for the gap census (empty = logging off).
     /// Lattice per site: 0 = unseen, cell+1 = single receiver, MAX = multi.
     pub site_log: Vec<u64>,
+    /// Per-site RESULT cell log (empty = off), same lattice as site_log:
+    /// 0 = unseen, cell+1 = single result cell, MAX = multi. The slot
+    /// compiler consumes this (plans/columnar-engine.md "Slot
+    /// compilation").
+    pub result_log: Vec<u64>,
     /// Per-branch-site outcome-SEQUENCE hash (empty = off). A site is
     /// SIMD-divergent iff different runs produce different sequences -
     /// a loop head taking true 6x then false is fine as long as every
@@ -143,8 +148,27 @@ impl Rt {
             cache,
             prints: Vec::new(),
             site_log: Vec::new(),
+            result_log: Vec::new(),
             branch_log: Vec::new(),
         }
+    }
+
+    /// Join `cell` into the site's result-cell lattice (census mode only).
+    #[inline]
+    fn log_result(&mut self, site: u32, res: V) {
+        if self.result_log.is_empty() {
+            return;
+        }
+        let slot = &mut self.result_log[site as usize];
+        let v = match res {
+            V::Ptr(p) => p as u64 + 1,
+            _ => u64::MAX,
+        };
+        *slot = match *slot {
+            0 => v,
+            x if x == v => x,
+            _ => u64::MAX,
+        };
     }
 
     /// Join `recv` into the site's receiver lattice (census mode only).
@@ -234,6 +258,12 @@ impl Rt {
     /// `Instruction::GetField` (core_interpreter.rs:362).
     pub fn get_field(&mut self, recv: V, f: u32, create: bool, site: u32) -> V {
         self.log_site(site, recv);
+        let r = self.get_field_inner(recv, f, create);
+        self.log_result(site, r);
+        r
+    }
+
+    fn get_field_inner(&mut self, recv: V, f: u32, create: bool) -> V {
         let table = ptr_of(recv);
         let existing = match &self.heap[table as usize] {
             Cell::Obj(fields) => fields.iter().find(|(k, _)| *k == f).map(|(_, c)| *c),
@@ -260,6 +290,12 @@ impl Rt {
     /// explicit nils).
     pub fn get_index(&mut self, recv: V, idx: V, create: bool, site: u32) -> V {
         self.log_site(site, recv);
+        let r = self.get_index_inner(recv, idx, create);
+        self.log_result(site, r);
+        r
+    }
+
+    fn get_index_inner(&mut self, recv: V, idx: V, create: bool) -> V {
         let table = ptr_of(recv);
         let index = num(idx)
             .as_i16()
