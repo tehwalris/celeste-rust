@@ -45,6 +45,20 @@ contention pattern left in the top symbols. Lesson recorded: in
 per-call helpers on the hot path, Arc clones are NOT free under
 parallelism - profile attribution showed the cost inside the callee,
 not at the clone site.
+
+Second step: select with a B-mask condition and Bool/B arms is now a
+pure bitwise combine (`cm&tm | !cm&fm`) instead of the per-lane AV
+pick: bench 639 -> **607 ms** (3230 ns/input-lane), mode 1 3776 ->
+2064 ms, `--abstract 40` 10.42 s. All exact + scalar hex-exact.
+
+Ladder tail (2026-08-17 profile, 607 ms bench): f_15 17% (diffuse
+16-byte TCol stack traffic across the huge straight-line generated
+fn - flat in annotate, max 5% on one instruction; the fix is
+codegen-structural, #132 row-struct emission), Rt2::boundary 13.6% +
+append_into 13.5% (typed streaming loops, real data movement; a
+Col::B bool column through Rt2 would shave some), select residual
+10% (num blends - real work). No cheap wins left in the top table;
+next units are structural.
 Re-arming slots (a future typed-slots campaign) means regenerating
 with `--site-slots plans/site-slots-room10-f035.json` - that closes
 the gate to one shape again, so it must come with a census for EVERY

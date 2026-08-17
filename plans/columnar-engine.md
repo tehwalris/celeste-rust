@@ -837,3 +837,27 @@ is the kernel residual ladder (f_15 glue, select residual, append
 residual, low-depth row batching). Campaign-wise the engine is now
 fast AND shape-open, which unblocks the real integration question:
 crate restructure (#133), wiring gen.rs into the actual runner.
+
+## Afternoon ladder on the reopened kernel (2026-08-17)
+
+With tiles carrying depth, two profile-led steps on the 1.04 s bench:
+1. bi_tile_flag_at 19% -> gone: perf annotate showed ~85% of the
+   symbol on the Arc refcount `lock incq/decq` of the per-call
+   `cache/cart.clone()` pair - 29 threads bouncing two cache lines.
+   Inline all-Num pane->mask path with only immutable borrows of
+   self; (wi,hi) map dispatch hoisted out of the lane loop.
+   1031 -> 639 ms; --abstract 40 17.55 -> 10.85 s. The general
+   lesson: per-call Arc clones in hot helpers are contention under
+   parallelism, and the profile attributes them to the CALLEE body.
+2. select mask-cond + bool-arm bitwise combine (mask_src normalizes
+   U(Bool)/B(m,e) to a width-projected lane mask): 639 -> 607 ms,
+   and mode 1 (select-heavy) 3776 -> 2064 ms.
+
+State at close: bench 607 ms = 3230 ns/input-lane (Rt2 reference
+2030 ms), --abstract 40 = 10.42 s from scratch (was 31.57 s this
+morning), every step exact + scalar hex-exact. The profile tail is
+flat (f_15 diffuse codegen traffic, boundary/append typed streaming);
+the next engine units are structural: #132 row-struct emission,
+Col::B through Rt2, SIMD panes. The next CAMPAIGN unit is #133 -
+linking the generated engine into the real runner, where checkpoint
+chains, visited sets and the position graph live.
