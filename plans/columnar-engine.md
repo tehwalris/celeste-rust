@@ -344,3 +344,35 @@ Named next steps for the widen cost, in expected-win order:
    many varying columns are live at each of the 20 expand sites).
 3. Fused regions (transpiler) remain the map2/select answer (~950 ms
    combined) once widen is gone.
+
+## Gate 1 extended to f40 (2026-08-18, ~07:00)
+
+Interpreter vs columnar, f31..f40: 44566, 66206, 92713, 132153,
+187859, 269059, 365029, 498541, 673479, 902280 - IDENTICAL every
+frame. 902k boundary lanes at f40 with the dash straddle splits
+active. The engine's semantics hold at depth.
+
+## COW/lane-indirection column design (the widen fix, ready to build)
+
+Physical duplication at splits is the 48%. Replace with lazy width:
+
+- Rt2 keeps `history: Vec<(width_before, map)` per frame, where `map`
+  maps CURRENT lanes to the lane space of that width. On widen(srcs):
+  extend every existing history map by `map[src]` per appended lane,
+  then push `(old_width, identity ++ srcs)`. Cost O(epochs x appended)
+  - no column is touched.
+- A varying column keeps its creation-time length. `len == width` =>
+  direct. `len < width` => stale: lane i reads `data[map_i]` where the
+  map is found by matching `len` against history widths (widths
+  strictly increase per frame, so len -> epoch is unique; <=32 entries,
+  binary search).
+- Whole-column ops resolve a stale column once into the op loop (no
+  write-back needed: SSA values are mostly read once; measure).
+- boundary/retain/slice/merge/hash materialize stale columns first
+  (bounded by the live set).
+- begin_frame clears history (boundary compaction materializes
+  everything live).
+
+Expected: kills the 1.74s widen almost entirely; appended-lane cost
+becomes O(epochs) bookkeeping + lazy copies only for columns actually
+read across a split.

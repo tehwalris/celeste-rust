@@ -106,6 +106,11 @@ commit. Read plans/columnar-engine.md for the full engine story.
   runs 64x wide; reverted with note). The named fix is COW/
   lane-indirection columns (plans/columnar-engine.md, census section).
 - Final suite run of the night: 527/527.
+- GATE 1 EXTENDED TO f40: interpreter and columnar lane counts
+  IDENTICAL through 902,280 lanes at f40 (dash straddle splits
+  active). Ten more exact frames on top of the thirty.
+- COW/lane-indirection design for the widen fix written in
+  plans/columnar-engine.md, ready to build.
 
 ## Where the next session starts
 
