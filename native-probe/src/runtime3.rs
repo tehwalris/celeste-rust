@@ -539,6 +539,29 @@ impl<const BTN: u8> Rt3<BTN> {
         Some(TCol::B(m, self.log_w))
     }
 
+    /// Boolean source normalized to the CURRENT width as a lane mask
+    /// (dead high bits arbitrary - nothing reads past the projected
+    /// lane range). None = not all-Bool.
+    #[inline]
+    fn mask_src(&self, c: TCol) -> Option<u64> {
+        match c {
+            TCol::U(AV::Bool(true)) => Some(u64::MAX),
+            TCol::U(AV::Bool(false)) => Some(0),
+            TCol::B(m, e) => {
+                let sh = self.log_w - e;
+                if sh == 0 {
+                    return Some(m);
+                }
+                let mut o = 0u64;
+                for i in 0..self.width {
+                    o |= (m >> (i >> sh) & 1) << i;
+                }
+                Some(o)
+            }
+            _ => None,
+        }
+    }
+
     /// Specialized unary numeric op.
     #[inline]
     fn map1_num(&mut self, v: TCol, f: impl Fn(P8) -> P8) -> Option<TCol> {
@@ -1071,6 +1094,13 @@ impl<const BTN: u8> Engine for Rt3<BTN> {
                 };
             }
             return self.put_pane_n(o);
+        }
+        // Mask condition + boolean arms: a pure bitwise combine, no
+        // tile materialization.
+        if let (Some(cm), Some(tm), Some(fm)) =
+            (self.mask_src(c), self.mask_src(t), self.mask_src(f))
+        {
+            return TCol::B(cm & tm | !cm & fm, self.log_w);
         }
         let pick = |cv: AV, tv: AV, fv: AV| -> AV {
             match cv {
