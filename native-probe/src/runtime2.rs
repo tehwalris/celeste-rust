@@ -57,6 +57,8 @@ pub enum AV {
 pub enum Col {
     U(AV),
     V(Vec<AV>),
+    /// An all-Num column stored raw: 4 B/lane, branchless op loops.
+    N(Vec<P8>),
 }
 
 impl Col {
@@ -65,6 +67,7 @@ impl Col {
         match self {
             Col::U(a) => *a,
             Col::V(v) => v[lane],
+            Col::N(v) => AV::Num(v[lane]),
         }
     }
 }
@@ -159,6 +162,29 @@ fn iv_of(v: AV) -> Pico8NumInterval {
 
 fn av_of_iv(iv: Pico8NumInterval) -> AV {
     AV::Ival(iv.low, iv.high)
+}
+
+/// V -> N when every lane is a plain number (4 B/lane, branchless loops).
+fn compress_num_v(vs: Vec<AV>) -> Col {
+    if vs.iter().all(|v| matches!(v, AV::Num(_))) {
+        Col::N(
+            vs.iter()
+                .map(|v| match v {
+                    AV::Num(n) => *n,
+                    _ => unreachable!(),
+                })
+                .collect(),
+        )
+    } else {
+        Col::V(vs)
+    }
+}
+
+fn compress_num(c: Col) -> Col {
+    match c {
+        Col::V(vs) => compress_num_v(vs),
+        other => other,
+    }
 }
 
 // ---- per-lane op ports ----
@@ -490,7 +516,64 @@ impl Rt2 {
                 );
                 p
             }
+            Col::N(_) => panic!("expected a pointer column, got numbers"),
         }
+    }
+
+    /// Numeric binary fast path: when both operands are all-number
+    /// columns (N or uniform Num), run a branchless P8 loop into a raw
+    /// N column. Returns None when either side is not purely numeric.
+    #[inline]
+    fn bin_num(&mut self, l: ColId, r: ColId, f: impl Fn(P8, P8) -> P8) -> Option<ColId> {
+        enum NV<'a> {
+            U(P8),
+            N(&'a [P8]),
+        }
+        fn view(c: &Col) -> Option<NV<'_>> {
+            match c {
+                Col::U(AV::Num(n)) => Some(NV::U(*n)),
+                Col::N(v) => Some(NV::N(v)),
+                _ => None,
+            }
+        }
+        let out: Vec<P8> = match (view(self.get(l))?, view(self.get(r))?) {
+            (NV::U(a), NV::U(b)) => {
+                let v = f(a, b);
+                return Some(self.put(Col::U(AV::Num(v))));
+            }
+            (NV::N(a), NV::N(b)) => a.iter().zip(b).map(|(x, y)| f(*x, *y)).collect(),
+            (NV::N(a), NV::U(b)) => a.iter().map(|x| f(*x, b)).collect(),
+            (NV::U(a), NV::N(b)) => b.iter().map(|y| f(a, *y)).collect(),
+        };
+        Some(self.put(Col::N(out)))
+    }
+
+    /// Numeric compare fast path: bool column out.
+    #[inline]
+    fn cmp_num(&mut self, l: ColId, r: ColId, f: impl Fn(P8, P8) -> bool) -> Option<ColId> {
+        enum NV<'a> {
+            U(P8),
+            N(&'a [P8]),
+        }
+        fn view(c: &Col) -> Option<NV<'_>> {
+            match c {
+                Col::U(AV::Num(n)) => Some(NV::U(*n)),
+                Col::N(v) => Some(NV::N(v)),
+                _ => None,
+            }
+        }
+        let out: Vec<AV> = match (view(self.get(l))?, view(self.get(r))?) {
+            (NV::U(a), NV::U(b)) => {
+                let v = f(a, b);
+                return Some(self.put(Col::U(AV::Bool(v))));
+            }
+            (NV::N(a), NV::N(b)) => {
+                a.iter().zip(b).map(|(x, y)| AV::Bool(f(*x, *y))).collect()
+            }
+            (NV::N(a), NV::U(b)) => a.iter().map(|x| AV::Bool(f(*x, b))).collect(),
+            (NV::U(a), NV::N(b)) => b.iter().map(|y| AV::Bool(f(a, *y))).collect(),
+        };
+        Some(self.put(Col::V(out)))
     }
 
     /// A cleared buffer with capacity for the current width (recycled).
@@ -518,6 +601,12 @@ impl Rt2 {
                 out.extend(v.iter().map(|x| f(*x)));
                 self.put(Col::V(out))
             }
+            Col::N(_) => {
+                let mut out = self.buf();
+                let Col::N(v) = self.get(a) else { unreachable!() };
+                out.extend(v.iter().map(|x| f(AV::Num(*x))));
+                self.put(compress_num(Col::V(out)))
+            }
         }
     }
 
@@ -528,15 +617,9 @@ impl Rt2 {
             return self.put(out);
         }
         let mut out = self.buf();
+        let w = self.width;
         let (x, y) = (self.get(a), self.get(b));
-        match (x, y) {
-            (Col::V(xv), Col::V(yv)) => {
-                out.extend(xv.iter().zip(yv).map(|(a, b)| f(*a, *b)))
-            }
-            (Col::U(xa), Col::V(yv)) => out.extend(yv.iter().map(|b| f(*xa, *b))),
-            (Col::V(xv), Col::U(yb)) => out.extend(xv.iter().map(|a| f(*a, *yb))),
-            _ => unreachable!(),
-        }
+        out.extend((0..w).map(|i| f(x.at(i), y.at(i))));
         self.put(Col::V(out))
     }
 
@@ -566,14 +649,29 @@ impl Rt2 {
                 }
             }
         };
+        let extend_n = |v: &mut Vec<P8>, srcs: &[usize]| {
+            if contiguous {
+                v.extend_from_within(..srcs.len());
+            } else {
+                v.reserve(srcs.len());
+                for &s in srcs {
+                    let x = v[s];
+                    v.push(x);
+                }
+            }
+        };
         for slot in self.arena.iter_mut().flatten() {
-            if let Col::V(v) = slot {
-                extend(v, srcs);
+            match slot {
+                Col::V(v) => extend(v, srcs),
+                Col::N(v) => extend_n(v, srcs),
+                Col::U(_) => {}
             }
         }
         for col in self.cols.iter_mut() {
-            if let Col::V(v) = col {
-                extend(v, srcs);
+            match col {
+                Col::V(v) => extend(v, srcs),
+                Col::N(v) => extend_n(v, srcs),
+                Col::U(_) => {}
             }
         }
         // Closure capture snapshots hold columns too.
@@ -777,18 +875,33 @@ impl Engine for Rt2 {
     }
 
     fn op_add(&mut self, l: ColId, r: ColId) -> ColId {
+        if let Some(out) = self.bin_num(l, r, |a, b| a + b) {
+            return out;
+        }
         self.map2(l, r, |a, b| av_addsub(a, b, false))
     }
     fn op_sub(&mut self, l: ColId, r: ColId) -> ColId {
+        if let Some(out) = self.bin_num(l, r, |a, b| a - b) {
+            return out;
+        }
         self.map2(l, r, |a, b| av_addsub(a, b, true))
     }
     fn op_mul(&mut self, l: ColId, r: ColId) -> ColId {
+        if let Some(out) = self.bin_num(l, r, |a, b| a * b) {
+            return out;
+        }
         self.map2(l, r, av_mul)
     }
     fn op_div(&mut self, l: ColId, r: ColId) -> ColId {
+        if let Some(out) = self.bin_num(l, r, |a, b| a / b) {
+            return out;
+        }
         self.map2(l, r, av_div)
     }
     fn op_rem(&mut self, l: ColId, r: ColId) -> ColId {
+        if let Some(out) = self.bin_num(l, r, |a, b| a % b) {
+            return out;
+        }
         self.map2(l, r, av_rem)
     }
     fn op_pow(&mut self, _l: ColId, _r: ColId) -> ColId {
@@ -810,15 +923,27 @@ impl Engine for Rt2 {
         self.map1(e, av_not)
     }
     fn lt(&mut self, l: ColId, r: ColId) -> ColId {
+        if let Some(out) = self.cmp_num(l, r, |a, b| a < b) {
+            return out;
+        }
         self.map2(l, r, |a, b| av_cmp(CmpOp::Lt, a, b))
     }
     fn le(&mut self, l: ColId, r: ColId) -> ColId {
+        if let Some(out) = self.cmp_num(l, r, |a, b| a <= b) {
+            return out;
+        }
         self.map2(l, r, |a, b| av_cmp(CmpOp::Le, a, b))
     }
     fn gt(&mut self, l: ColId, r: ColId) -> ColId {
+        if let Some(out) = self.cmp_num(l, r, |a, b| a > b) {
+            return out;
+        }
         self.map2(l, r, |a, b| av_cmp(CmpOp::Gt, a, b))
     }
     fn ge(&mut self, l: ColId, r: ColId) -> ColId {
+        if let Some(out) = self.cmp_num(l, r, |a, b| a >= b) {
+            return out;
+        }
         self.map2(l, r, |a, b| av_cmp(CmpOp::Ge, a, b))
     }
     fn concat(&mut self, l: ColId, r: ColId) -> ColId {
@@ -897,6 +1022,7 @@ impl Engine for Rt2 {
         let any_unknown = match &d {
             Col::U(a) => matches!(a, AV::UBool),
             Col::V(vs) => vs.iter().any(|a| matches!(a, AV::UBool)),
+            Col::N(_) => panic!("expand on a number column"),
         };
         if !any_unknown {
             // Identity on concrete bools (validated per lane).
@@ -907,6 +1033,7 @@ impl Engine for Rt2 {
                         assert!(matches!(a, AV::Bool(_)), "expand on {:?}", a);
                     }
                 }
+                Col::N(_) => unreachable!(),
             }
             return self.put(d);
         }
@@ -928,6 +1055,7 @@ impl Engine for Rt2 {
     fn truthy_b(&mut self, v: ColId, site: u32) -> bool {
         match self.get(v) {
             Col::U(a) => av_truthy(*a),
+            Col::N(_) => true,
             Col::V(vs) => {
                 let t = av_truthy(vs[0]);
                 if vs.iter().all(|a| av_truthy(*a) == t) {
@@ -1198,6 +1326,7 @@ impl Engine for Rt2 {
                 let needs = match &d {
                     Col::U(v) => lane_alts(*v).len() > 1,
                     Col::V(vs) => vs.iter().any(|v| lane_alts(*v).len() > 1),
+                    Col::N(_) => false,
                 };
                 if !needs {
                     // Still apply the point-degeneration clip per lane.
@@ -1351,6 +1480,7 @@ impl Rt2 {
             match col {
                 Col::U(v) => check(*v),
                 Col::V(vs) => vs.iter().for_each(|v| check(*v)),
+                Col::N(vs) => vs.iter().for_each(|n| check(AV::Num(*n))),
             }
             self.cols[c as usize] = Col::U(wide);
         }
@@ -1365,6 +1495,9 @@ impl Rt2 {
             self.cols[c as usize] = match &self.cols[c as usize] {
                 Col::U(v) => Col::U(clamp(*v)),
                 Col::V(vs) => Col::V(vs.iter().map(|v| clamp(*v)).collect()),
+                Col::N(vs) => Col::N(
+                    vs.iter().map(|n| if *n < zero { zero } else { *n }).collect(),
+                ),
             };
         }
 
@@ -1412,7 +1545,7 @@ impl Rt2 {
                 match &self.structure[c as usize] {
                     Cell2::Val => match &self.cols[c as usize] {
                         Col::U(AV::Ptr(t)) => enqueue(*t, &mut new_id, &mut queue, &mut order),
-                        Col::U(_) => {}
+                        Col::U(_) | Col::N(_) => {}
                         Col::V(vs) => {
                             for v in vs {
                                 if let AV::Ptr(t) = v {
@@ -1466,6 +1599,7 @@ impl Rt2 {
             match c {
                 Col::U(v) => Col::U(remap_av(*v, new_id)),
                 Col::V(vs) => Col::V(vs.iter().map(|v| remap_av(*v, new_id)).collect()),
+                Col::N(vs) => Col::N(vs.clone()),
             }
         };
         let mut new_structure: Vec<Cell2> = Vec::with_capacity(order.len());
@@ -1488,7 +1622,7 @@ impl Rt2 {
             };
             new_structure.push(cell);
             new_cols.push(match &self.structure[old as usize] {
-                Cell2::Val => remap_col(&self.cols[old as usize], &new_id),
+                Cell2::Val => compress_num(remap_col(&self.cols[old as usize], &new_id)),
                 _ => Col::U(AV::Nil),
             });
         }
@@ -1603,6 +1737,12 @@ impl Rt2 {
                         hash_av(&mut h2[i], vs[i]);
                     }
                 }
+                Col::N(vs) => {
+                    for i in 0..w {
+                        hash_av(&mut h1[i], AV::Num(vs[i]));
+                        hash_av(&mut h2[i], AV::Num(vs[i]));
+                    }
+                }
             }
         }
         self.row_keys = (0..w).map(|i| (h1[i].finish(), h2[i].finish())).collect();
@@ -1685,6 +1825,13 @@ impl Rt2 {
                             }
                         }
                     }
+                    Col::N(vs) => {
+                        for (i, n) in vs.iter().enumerate() {
+                            if *n != zero {
+                                key[i] |= 1 << (bit % 8);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1728,19 +1875,24 @@ impl Rt2 {
         if keep.len() == self.width {
             return;
         }
-        for col in self.cols.iter_mut() {
-            if let Col::V(vs) = col {
+        let retain_col = |col: &mut Col| match col {
+            Col::U(_) => {}
+            Col::V(vs) => {
                 let nv: Vec<AV> = keep.iter().map(|&i| vs[i as usize]).collect();
                 *col = Col::V(nv);
             }
+            Col::N(vs) => {
+                let nv: Vec<P8> = keep.iter().map(|&i| vs[i as usize]).collect();
+                *col = Col::N(nv);
+            }
+        };
+        for col in self.cols.iter_mut() {
+            retain_col(col);
         }
         for cell in self.structure.iter_mut() {
             if let Cell2::Clo(_, caps) = cell {
                 for cap in caps.iter_mut() {
-                    if let Col::V(vs) = cap {
-                        let nv: Vec<AV> = keep.iter().map(|&i| vs[i as usize]).collect();
-                        *cap = Col::V(nv);
-                    }
+                    retain_col(cap);
                 }
             }
         }
@@ -1754,8 +1906,23 @@ impl Rt2 {
     /// `cell` (the frame-start uniform-branch pre-partition; the freeze
     /// gate is the pm1 precedent). Groups in first-occurrence order.
     pub fn partition_by_cell(self, cell: u32) -> Vec<Rt2> {
+        let by_vals = |vals: Vec<AV>| -> Vec<Vec<u32>> {
+            let mut order: Vec<AV> = Vec::new();
+            let mut groups: Vec<Vec<u32>> = Vec::new();
+            for (i, v) in vals.iter().enumerate() {
+                match order.iter().position(|o| o == v) {
+                    Some(g) => groups[g].push(i as u32),
+                    None => {
+                        order.push(*v);
+                        groups.push(vec![i as u32]);
+                    }
+                }
+            }
+            groups
+        };
         let groups: Vec<Vec<u32>> = match &self.cols[cell as usize] {
             Col::U(_) => return vec![self],
+            Col::N(vs) => by_vals(vs.iter().map(|n| AV::Num(*n)).collect()),
             Col::V(vs) => {
                 let mut order: Vec<AV> = Vec::new();
                 let mut groups: Vec<Vec<u32>> = Vec::new();
@@ -1791,6 +1958,7 @@ impl Rt2 {
             match c {
                 Col::U(a) => Col::U(*a),
                 Col::V(vs) => Col::V(vs[lo..hi].to_vec()),
+                Col::N(vs) => Col::N(vs[lo..hi].to_vec()),
             }
         };
         Rt2 {
@@ -1861,23 +2029,23 @@ impl Rt2 {
                 Col::U(a) => blocks
                     .iter()
                     .all(|b| matches!(&b.cols[c], Col::U(x) if x == a)),
-                Col::V(_) => false,
+                Col::V(_) | Col::N(_) => false,
             };
             if all_same_uniform {
                 continue;
             }
             let mut vs: Vec<AV> = Vec::with_capacity(total);
-            match col {
-                Col::U(a) => vs.extend(std::iter::repeat(*a).take(host.width)),
-                Col::V(v) => vs.append(v),
-            }
+            let push_col = |vs: &mut Vec<AV>, c: &Col, w: usize| match c {
+                Col::U(a) => vs.extend(std::iter::repeat(*a).take(w)),
+                Col::V(v) => vs.extend_from_slice(v),
+                Col::N(v) => vs.extend(v.iter().map(|n| AV::Num(*n))),
+            };
+            let hw = host.width;
+            push_col(&mut vs, col, hw);
             for b in &blocks {
-                match &b.cols[c] {
-                    Col::U(a) => vs.extend(std::iter::repeat(*a).take(b.width)),
-                    Col::V(v) => vs.extend_from_slice(v),
-                }
+                push_col(&mut vs, &b.cols[c], b.width);
             }
-            *col = Col::V(vs);
+            *col = compress_num_v(vs);
         }
         for b in &blocks {
             host.row_keys.extend_from_slice(&b.row_keys);
@@ -1902,12 +2070,14 @@ impl Rt2 {
             let mut vs: Vec<AV> = match col {
                 Col::U(a) => vec![*a; w],
                 Col::V(v) => std::mem::take(v),
+                Col::N(v) => v.iter().map(|n| AV::Num(*n)).collect(),
             };
             match ocol {
                 Col::U(b) => vs.extend(std::iter::repeat(*b).take(ow)),
                 Col::V(ov) => vs.extend_from_slice(ov),
+                Col::N(ov) => vs.extend(ov.iter().map(|n| AV::Num(*n))),
             }
-            *col = Col::V(vs);
+            *col = compress_num_v(vs);
         }
         self.row_keys.extend_from_slice(&other.row_keys);
         self.width += ow;
