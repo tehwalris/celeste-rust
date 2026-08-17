@@ -254,6 +254,23 @@ pub enum Rule {
         /// because lanes that skipped the region still double.
         #[serde(default, skip_serializing_if = "is_false")]
         expand: bool,
+        /// Allow calls to `fixed_env::REFINEMENT_BUILTINS` (`__split_by_flr`,
+        /// `__split_at`) in the region, the callee proven by its
+        /// `load(get_global(..))` def chain. A refinement's fragments
+        /// jointly represent exactly the input state, so running one on
+        /// lanes that skipped the region is sound - the cost is
+        /// fragmentation, priced by the screen. Opt-in so call-free entries
+        /// keep refusing calls loudly.
+        #[serde(default, skip_serializing_if = "is_false")]
+        splits: bool,
+        /// Mask the region's `assert_true`s on the head's condition
+        /// (`assert_true(select(c, cond, true))`): a straightened arm's
+        /// trace guards hold only on lanes that entered it, and unmasked
+        /// they would spuriously deopt every lane that skipped. Opt-in
+        /// because default behavior (asserts accepted unmasked) is what
+        /// existing entries replay.
+        #[serde(default, skip_serializing_if = "is_false")]
+        guards: bool,
     },
     /// Give a loop with a per-lane trip count a uniform constant trip count:
     /// the head branches on a fresh counter against `limit` (per-state
@@ -837,8 +854,18 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::Speculate { function, join, arm, guards } => {
             speculate::apply(program, function, join, arm.as_deref(), &guards_in(&names, function, guards)?)
         }
-        Rule::SpeculateRegion { function, head, arm, join, mask, expand } => {
-            speculate_region::apply(program, function, head, arm, join.as_deref(), *mask, *expand)
+        Rule::SpeculateRegion { function, head, arm, join, mask, expand, splits, guards } => {
+            speculate_region::apply(
+                program,
+                function,
+                head,
+                arm,
+                join.as_deref(),
+                *mask,
+                *expand,
+                *splits,
+                *guards,
+            )
         }
         Rule::MaskLoop { function, head, limit, span, break_to } => {
             mask_loop::apply(program, function, head, *limit, *span, break_to.as_deref())
@@ -973,7 +1000,7 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::Speculate { function, join, arm, guards } => {
             speculate::verify(&before, program, function, join, arm.as_deref(), &guards_in(&names, function, guards)?)
         }
-        Rule::SpeculateRegion { function, head, arm, join, mask, expand } => {
+        Rule::SpeculateRegion { function, head, arm, join, mask, expand, splits, guards } => {
             speculate_region::verify(
                 &before,
                 program,
@@ -983,6 +1010,8 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
                 join.as_deref(),
                 *mask,
                 *expand,
+                *splits,
+                *guards,
             )
         }
         Rule::MaskLoop { function, head, limit, span, break_to } => {

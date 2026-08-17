@@ -241,6 +241,31 @@ struct StoreSite {
     new_on_true: bool,
 }
 
+/// One `assert_true` in a `guards` region: a lane-conditional premise (a
+/// trace guard) that holds only on lanes that entered the region, masked to
+/// vacuous truth on the others.
+struct AssertSite {
+    block: Label,
+    index: usize,
+    /// The asserted local.
+    value: LocalId,
+    /// Same convention as `StoreSite`: the side of the head's condition on
+    /// which the premise must actually hold.
+    new_on_true: bool,
+}
+
+/// One `kill` in the region, deleted outright. A kill is a liveness
+/// annotation, not a computation: deleting one only keeps values alive
+/// longer, which is always sound, and the recipe's trailing `kill_dead`
+/// re-derives the optimal set for the rewritten CFG (the annotation this
+/// rule invalidates - a straightened region changes what is live where).
+/// Unconditional rather than opt-in: regions with kills were refused
+/// before this existed, so no earlier entry's replay can change.
+struct KillSite {
+    block: Label,
+    index: usize,
+}
+
 /// The shape this rule accepts, re-derived identically by `apply`, `verify`
 /// and `candidates`.
 struct Site {
@@ -255,6 +280,11 @@ struct Site {
     /// The region's stores, in region discovery order; non-empty iff the
     /// entry opted in with `mask`.
     stores: Vec<StoreSite>,
+    /// The region's assert_trues, masked; non-empty iff the entry opted in
+    /// with `guards`.
+    masked_asserts: Vec<AssertSite>,
+    /// The region's kills, deleted (see `KillSite`).
+    kills: Vec<KillSite>,
 }
 
 pub(super) fn defining_site(fun: &FunDef, id: LocalId) -> Option<(Option<Label>, usize)> {
@@ -552,6 +582,8 @@ fn site(
     join_override: Option<&Label>,
     mask: bool,
     expand: bool,
+    splits: bool,
+    guards: bool,
 ) -> Result<Site> {
     let head_block = fun.cfg.named.get(head).ok_or_else(|| {
         anyhow!("no block named '{}' in {}", head.as_str(), function)
@@ -674,7 +706,17 @@ fn site(
     };
     let mut bounds: Vec<LoopBound> = Vec::new();
     let mut stores: Vec<StoreSite> = Vec::new();
+    let mut masked_asserts: Vec<AssertSite> = Vec::new();
+    let mut kills: Vec<KillSite> = Vec::new();
     let mut saw_expand = false;
+    let mut saw_split = false;
+    // Region-private allocs, proven by escape analysis over the whole
+    // function (see `region_private_allocs`), pooled across both diamond
+    // regions before the classification pass needs them.
+    let mut private_allocs: FxHashSet<LocalId> = FxHashSet::default();
+    for (blocks, _, _) in &regions {
+        private_allocs.extend(region_private_allocs(fun, blocks));
+    }
     for (blocks, entry, is_arm) in &regions {
         let in_region: FxHashSet<&Label> = blocks.iter().collect();
         for label in *blocks {
@@ -721,6 +763,23 @@ fn site(
                         // whichever way it would have branched.
                         continue;
                     }
+                    // A store into a region-private temp runs unmasked, and
+                    // masking it would even be wrong: the cell was alloc'd
+                    // lines above, so there is no old value to load and
+                    // preserve, and nothing outside the region ever reads
+                    // it - a skip lane's garbage in it is unobservable.
+                    if private_allocs.contains(target) {
+                        continue;
+                    }
+                    // A refinement store-back runs unmasked on every lane -
+                    // see `split_concretization_store`.
+                    if splits
+                        && split_concretization_store(
+                            fun, label, instructions, index, *target, *source,
+                        )?
+                    {
+                        continue;
+                    }
                     if mask {
                         stores.push(StoreSite {
                             block: label.clone(),
@@ -737,6 +796,101 @@ fn site(
                         usize::from(*id),
                         label.as_str()
                     ));
+                }
+                // A kill is deleted, never speculated - see `KillSite`.
+                if matches!(instr, Instruction::Kill { .. }) {
+                    kills.push(KillSite { block: label.clone(), index });
+                    continue;
+                }
+                // An alloc is accepted iff it is region-private (see
+                // `region_private_allocs`): after the conversion EVERY state
+                // allocates it, uniformly, and since nothing outside the
+                // region can reach the cell, the only externally visible
+                // delta is one garbage cell that all states share - shape-
+                // neutral where it could matter (merges see identical
+                // structure) and invisible at the boundary (unreachable
+                // cells are not walked). An alloc anything else can reach
+                // keeps the old refusal: it would change StateShape
+                // differently per path, a silent cost.
+                if matches!(instr, Instruction::Alloc) {
+                    require(
+                        private_allocs.contains(id),
+                        format!(
+                            "%{} in region block '{}' is an alloc that escapes \
+                             the region (or is read in a way the privacy scan \
+                             does not allow), so speculating it would change \
+                             StateShape",
+                            usize::from(*id),
+                            label.as_str()
+                        ),
+                    )?;
+                    continue;
+                }
+                // A refinement-builtin call, under the `splits` opt-in: the
+                // callee must provably be `load(get_global(name))` with the
+                // name in `REFINEMENT_BUILTINS`. Running a refinement on
+                // states that would have skipped the region is sound - its
+                // fragments jointly represent exactly the input state - so
+                // the only cost is fragmentation, which the screen prices.
+                // A rebound global would miscall identically without the
+                // conversion, so no new runtime guard is owed.
+                if let Instruction::Call { closure, .. } = instr {
+                    require(
+                        splits,
+                        format!(
+                            "%{} in region block '{}' is a call; only \
+                             refinement-builtin calls can be speculated, with \
+                             \"splits\":true",
+                            usize::from(*id),
+                            label.as_str()
+                        ),
+                    )?;
+                    let loaded = match defining_instruction(fun, *closure) {
+                        Some(Instruction::Load { source }) => *source,
+                        _ => {
+                            return Err(anyhow!(
+                                "the callee %{} of %{} in region block '{}' is \
+                                 not a load, so it cannot be a refinement \
+                                 builtin",
+                                usize::from(*closure),
+                                usize::from(*id),
+                                label.as_str()
+                            ))
+                        }
+                    };
+                    match defining_instruction(fun, loaded) {
+                        Some(Instruction::GetGlobal { name, create_if_missing: false })
+                            if crate::interpreter::fixed_env::is_refinement_builtin(name) => {}
+                        _ => {
+                            return Err(anyhow!(
+                                "the callee %{} of %{} in region block '{}' is \
+                                 not a load of a refinement-builtin global \
+                                 (REFINEMENT_BUILTINS)",
+                                usize::from(*closure),
+                                usize::from(*id),
+                                label.as_str()
+                            ))
+                        }
+                    }
+                    saw_split = true;
+                    continue;
+                }
+                // A lane-conditional premise, under the `guards` opt-in: the
+                // assert holds only on lanes that entered the region, so it
+                // is masked to vacuous truth on the others. Without the
+                // opt-in the assert stays as-is (`is_speculatable` accepts
+                // it below, the long-standing loud bargain) - existing
+                // entries replay byte-identically.
+                if let Instruction::AssertTrue { value } = instr {
+                    if guards {
+                        masked_asserts.push(AssertSite {
+                            block: label.clone(),
+                            index,
+                            value: *value,
+                            new_on_true: *is_arm == arm_is_true,
+                        });
+                        continue;
+                    }
                 }
                 require(
                     matches!(instr, Instruction::Phi { .. }) || is_speculatable(instr),
@@ -839,6 +993,14 @@ fn site(
         !expand || saw_expand,
         "the region has no expand; drop the expand field",
     )?;
+    require(
+        !splits || saw_split,
+        "the region has no refinement-builtin call; drop the splits field",
+    )?;
+    require(
+        !guards || !masked_asserts.is_empty(),
+        "the region has no assert_true; drop the guards field",
+    )?;
 
     Ok(Site {
         condition: *condition,
@@ -848,7 +1010,140 @@ fn site(
         bounds,
         serialize,
         stores,
+        masked_asserts,
+        kills,
     })
+}
+
+/// Is this store the store-back of a refinement-builtin call on a value
+/// loaded from the very cell being stored - and therefore left unmasked?
+///
+/// The shape mirrors `concretization_store`, with the call in the expand's
+/// place: load, refinement call on the loaded value, store-back into the
+/// loaded cell, all in this block in order with no other store between.
+/// A refinement's per-lane result represents exactly the concrete values
+/// the loaded lane did (clipped to the fragment), so writing it back is a
+/// refinement on EVERY lane, mask or no mask - and masking it would be
+/// actively wrong: a lane that skipped the region would keep the
+/// UNREFINED value while its fragment-mates were refined, and the
+/// downstream reads the split exists to protect (`flr` of a spanning
+/// interval) would fail on exactly those lanes. Observed at f25 of the
+/// screen before this exemption existed.
+///
+/// `Ok(false)` means the source is not a refinement call's result at all -
+/// the store falls through to the usual masking. (A refinement call whose
+/// argument is NOT loaded from the stored cell - `__split_at` on a
+/// computed value - also falls through, and masking is correct there: per
+/// lane the split result equals the computed value, so both select arms
+/// are what the branched program stored.)
+fn split_concretization_store(
+    fun: &FunDef,
+    label: &Label,
+    instructions: &[(LocalId, Instruction)],
+    store_index: usize,
+    target: LocalId,
+    source: LocalId,
+) -> Result<bool> {
+    let Some(Instruction::Call { closure, args }) = defining_instruction(fun, source) else {
+        return Ok(false);
+    };
+    let is_refinement = matches!(
+        defining_instruction(fun, *closure),
+        Some(Instruction::Load { source: g })
+            if matches!(
+                defining_instruction(fun, *g),
+                Some(Instruction::GetGlobal { name, create_if_missing: false })
+                    if crate::interpreter::fixed_env::is_refinement_builtin(name)
+            )
+    );
+    if !is_refinement {
+        return Ok(false);
+    }
+    let [value] = args.as_slice() else {
+        return Ok(false);
+    };
+    let Some(call_index) = instructions[..store_index]
+        .iter()
+        .position(|(id, _)| id == &source)
+    else {
+        return Ok(false);
+    };
+    let Some(load_index) = instructions[..call_index]
+        .iter()
+        .position(|(id, _)| id == value)
+    else {
+        return Ok(false);
+    };
+    let Instruction::Load { source: loaded } = &instructions[load_index].1 else {
+        return Ok(false);
+    };
+    if instructions[load_index + 1..store_index]
+        .iter()
+        .any(|(_, instr)| matches!(instr, Instruction::Store { .. }))
+    {
+        return Ok(false);
+    }
+    if !same_cell(fun, *loaded, target) {
+        return Ok(false);
+    }
+    let _ = label;
+    Ok(true)
+}
+
+/// The region's allocs that provably cannot be observed outside it: every
+/// use of the cell's pointer, over the WHOLE function, is inside the region
+/// and is one of writing into the cell (`store` TARGET), reading it
+/// (`load`), asserting its kind (`assert_value_cell`), or a `kill` (which
+/// this rule deletes anyway). Anything else - the pointer stored as a
+/// VALUE, passed to a call, compared, used by a terminator or a phi, or
+/// touched outside the region - disqualifies it: the cell could then be
+/// reached from a path that never allocated it.
+fn region_private_allocs(fun: &FunDef, blocks: &[Label]) -> Vec<LocalId> {
+    let in_region: FxHashSet<&Label> = blocks.iter().collect();
+    let mut candidates: Vec<LocalId> = Vec::new();
+    for label in blocks {
+        for (id, instr) in &fun.cfg.named[label].instructions {
+            if matches!(instr, Instruction::Alloc) {
+                candidates.push(*id);
+            }
+        }
+    }
+    candidates.retain(|alloc| {
+        let mut keys: Vec<Option<&Label>> = vec![None];
+        keys.extend(fun.cfg.named.keys().map(Some));
+        for key in keys {
+            let (inside, block) = match key {
+                None => (false, &fun.cfg.entry),
+                Some(l) => (in_region.contains(l), &fun.cfg.named[l]),
+            };
+            for (_, instr) in &block.instructions {
+                let used = instr.get_used_locals().contains(alloc);
+                if !used {
+                    continue;
+                }
+                if !inside {
+                    return false;
+                }
+                let allowed = match instr {
+                    Instruction::Store { target, source } => {
+                        target == alloc && source != alloc
+                    }
+                    Instruction::Load { source } => source == alloc,
+                    Instruction::AssertValueCell { target } => target == alloc,
+                    Instruction::Kill { .. } => true,
+                    _ => false,
+                };
+                if !allowed {
+                    return false;
+                }
+            }
+            if block.terminator_kind().get_used_locals().contains(alloc) {
+                return false;
+            }
+        }
+        true
+    });
+    candidates
 }
 
 /// Is this store the concretization store of an `expand` in its block -
@@ -973,6 +1268,24 @@ fn masked_select_for(site: &Site, store: &StoreSite, old: LocalId) -> Instructio
     }
 }
 
+/// The masked form of one region `assert_true`: the premise on the side of
+/// the condition its region owns, vacuous truth on the other.
+fn masked_assert_select_for(site: &Site, a: &AssertSite, true_const: LocalId) -> Instruction {
+    if a.new_on_true {
+        Instruction::Select {
+            condition: site.condition,
+            if_true: a.value,
+            if_false: true_const,
+        }
+    } else {
+        Instruction::Select {
+            condition: site.condition,
+            if_true: true_const,
+            if_false: a.value,
+        }
+    }
+}
+
 /// The select a join phi becomes: the named arm's value on the edge the arm
 /// owns, the other value (head side, or second region) on the other.
 fn select_for(site: &Site, phi: &JoinPhi) -> Instruction {
@@ -1048,12 +1361,14 @@ pub fn apply(
     join: Option<&str>,
     mask: bool,
     expand: bool,
+    splits: bool,
+    guards: bool,
 ) -> Result<usize> {
     let head = &Label::from(head.to_string());
     let arm = &Label::from(arm.to_string());
     let join = join.map(|j| Label::from(j.to_string()));
     let fun = program.get(function)?;
-    let s = site(fun, function, head, arm, join.as_ref(), mask, expand)?;
+    let s = site(fun, function, head, arm, join.as_ref(), mask, expand, splits, guards)?;
     let mut alloc = LocalIdAllocator::for_function(fun);
     let minted: Vec<[LocalId; 3]> = s
         .bounds
@@ -1064,6 +1379,11 @@ pub fn apply(
         .stores
         .iter()
         .map(|_| [alloc.fresh(), alloc.fresh(), alloc.fresh()])
+        .collect();
+    let assert_minted: Vec<[LocalId; 2]> = s
+        .masked_asserts
+        .iter()
+        .map(|_| [alloc.fresh(), alloc.fresh()])
         .collect();
 
     let fun = program.get_mut(function)?;
@@ -1105,6 +1425,12 @@ pub fn apply(
     for (i, store) in s.stores.iter().enumerate() {
         events.push((Some(store.block.clone()), store.index, 1, i));
     }
+    for (i, a) in s.masked_asserts.iter().enumerate() {
+        events.push((Some(a.block.clone()), a.index, 2, i));
+    }
+    for (i, kill) in s.kills.iter().enumerate() {
+        events.push((Some(kill.block.clone()), kill.index, 3, i));
+    }
     events.sort_by(|a, b| {
         (a.0.as_ref().map(|l| l.as_str()), a.1, a.2)
             .cmp(&(b.0.as_ref().map(|l| l.as_str()), b.1, b.2))
@@ -1115,7 +1441,21 @@ pub fn apply(
             None => &mut fun.cfg.entry,
             Some(label) => fun.cfg.named.get_mut(label).unwrap(),
         };
-        if kind == 1 {
+        if kind == 3 {
+            let removed = block.instructions.remove(position);
+            debug_assert!(matches!(removed.1, Instruction::Kill { .. }));
+        } else if kind == 2 {
+            let a = &s.masked_asserts[index];
+            let [true_const, sel] = assert_minted[index];
+            block.instructions[position].1 = Instruction::AssertTrue { value: sel };
+            block.instructions.splice(
+                position..position,
+                [
+                    (true_const, Instruction::BoolConstant { value: true }),
+                    (sel, masked_assert_select_for(&s, a, true_const)),
+                ],
+            );
+        } else if kind == 1 {
             let store = &s.stores[index];
             let [guard, old, sel] = store_minted[index];
             block.instructions[position].1 =
@@ -1143,7 +1483,9 @@ pub fn apply(
         + s.serialize.is_some() as usize
         + s.join_phis.len()
         + 3 * s.bounds.len()
-        + 4 * s.stores.len())
+        + 4 * s.stores.len()
+        + 3 * s.masked_asserts.len()
+        + s.kills.len())
 }
 
 /// Independent check: re-derives the site from the before program, then
@@ -1159,12 +1501,14 @@ pub fn verify(
     join: Option<&str>,
     mask: bool,
     expand: bool,
+    splits: bool,
+    guards: bool,
 ) -> Result<()> {
     let head = &Label::from(head.to_string());
     let arm = &Label::from(arm.to_string());
     let join = join.map(|j| Label::from(j.to_string()));
     let before_fun = before.get(function)?;
-    let s = site(before_fun, function, head, arm, join.as_ref(), mask, expand)?;
+    let s = site(before_fun, function, head, arm, join.as_ref(), mask, expand, splits, guards)?;
     let after_fun = after.get(function)?;
 
     require(
@@ -1227,6 +1571,19 @@ pub fn verify(
     for list in stores_of.values_mut() {
         list.sort_by_key(|st| st.index);
     }
+    // Masked asserts and deleted kills by block, for the same reconstruction.
+    let mut asserts_of: std::collections::BTreeMap<String, Vec<&AssertSite>> = Default::default();
+    for a in &s.masked_asserts {
+        asserts_of
+            .entry(a.block.as_str().to_string())
+            .or_default()
+            .push(a);
+    }
+    let kill_positions: FxHashSet<(String, usize)> = s
+        .kills
+        .iter()
+        .map(|k| (k.block.as_str().to_string(), k.index))
+        .collect();
 
     let keys: Vec<Option<Label>> = std::iter::once(None)
         .chain(before_fun.cfg.named.keys().cloned().map(Some))
@@ -1266,11 +1623,17 @@ pub fn verify(
             .as_ref()
             .and_then(|l| stores_of.get(l))
             .unwrap_or(&empty_stores);
+        let empty_asserts: Vec<&AssertSite> = Vec::new();
+        let asserts = label_str
+            .as_ref()
+            .and_then(|l| asserts_of.get(l))
+            .unwrap_or(&empty_asserts);
         let learn = |at: usize,
-                         minted_seen: &mut FxHashSet<LocalId>|
-         -> Result<[LocalId; 3]> {
-            let mut minted = [LocalId::from(0); 3];
-            for (offset, slot) in minted.iter_mut().enumerate() {
+                     count: usize,
+                     minted_seen: &mut FxHashSet<LocalId>|
+         -> Result<Vec<LocalId>> {
+            let mut minted = Vec::with_capacity(count);
+            for offset in 0..count {
                 let (after_id, _) =
                     after_block.instructions.get(at + offset).ok_or_else(|| {
                         anyhow!("'{}' is too short to hold its insertions", name)
@@ -1291,21 +1654,37 @@ pub fn verify(
                         name
                     ),
                 )?;
-                *slot = *after_id;
+                minted.push(*after_id);
             }
             Ok(minted)
         };
         let mut want: Vec<(LocalId, Instruction)> = Vec::new();
         for position in 0..=before_block.instructions.len() {
             for bound in guards.iter().filter(|b| b.def_index + 1 == position) {
-                let minted = learn(want.len(), &mut minted_seen)?;
-                want.extend(guard_for(bound.bound, &minted));
+                let minted = learn(want.len(), 3, &mut minted_seen)?;
+                want.extend(guard_for(bound.bound, &[minted[0], minted[1], minted[2]]));
             }
             let Some((id, instr)) = before_block.instructions.get(position) else {
                 break;
             };
+            if let Some(l) = &label_str {
+                if kill_positions.contains(&(l.clone(), position)) {
+                    // A deleted kill: nothing lands in the after block, and
+                    // site() already proved the instruction was a kill.
+                    continue;
+                }
+            }
+            if let Some(a) = asserts.iter().find(|a| a.index == position) {
+                let minted = learn(want.len(), 2, &mut minted_seen)?;
+                let (true_const, sel) = (minted[0], minted[1]);
+                want.push((true_const, Instruction::BoolConstant { value: true }));
+                want.push((sel, masked_assert_select_for(&s, a, true_const)));
+                want.push((*id, Instruction::AssertTrue { value: sel }));
+                continue;
+            }
             if let Some(store) = stores.iter().find(|st| st.index == position) {
-                let [guard, old, sel] = learn(want.len(), &mut minted_seen)?;
+                let minted = learn(want.len(), 3, &mut minted_seen)?;
+                let (guard, old, sel) = (minted[0], minted[1], minted[2]);
                 want.push((guard, Instruction::AssertValueCell { target: store.target }));
                 want.push((old, Instruction::Load { source: store.target }));
                 want.push((sel, masked_select_for(&s, store, old)));
@@ -1394,7 +1773,9 @@ pub fn candidates(program: &Program) -> Vec<(String, Label, Label)> {
                 continue;
             }
             for arm in [true_target, false_target] {
-                if site(fun, function.as_str(), label, arm, None, false, false).is_ok() {
+                if site(fun, function.as_str(), label, arm, None, false, false, false, false)
+                    .is_ok()
+                {
                     out.push((
                         function.as_str().to_string(),
                         label.clone(),
@@ -1548,9 +1929,9 @@ mod tests {
     fn speculates_a_pure_loop_region() {
         let mut p = region_program();
         let before = p.clone();
-        let changed = apply(&mut p, "f", "h", "setup", None, false, false).unwrap();
+        let changed = apply(&mut p, "f", "h", "setup", None, false, false, false, false).unwrap();
         assert_eq!(changed, 1 + 1 + 3);
-        verify(&before, &p, "f", "h", "setup", None, false, false).unwrap();
+        verify(&before, &p, "f", "h", "setup", None, false, false, false, false).unwrap();
         let text = format_function(p.get("f").unwrap());
         assert!(text.contains("br setup"), "{}", text);
         assert!(!text.contains("br %10"), "{}", text);
@@ -1579,8 +1960,8 @@ mod tests {
             h.terminator.1 = br_if(10, "join", "setup");
         }
         let before = p.clone();
-        apply(&mut p, "f", "h", "setup", None, false, false).unwrap();
-        verify(&before, &p, "f", "h", "setup", None, false, false).unwrap();
+        apply(&mut p, "f", "h", "setup", None, false, false, false, false).unwrap();
+        verify(&before, &p, "f", "h", "setup", None, false, false, false, false).unwrap();
         let text = format_function(p.get("f").unwrap());
         assert!(
             text.contains("select %10 ? %19 : %17"),
@@ -1600,7 +1981,7 @@ mod tests {
                 Instruction::Store { target: id(13), source: id(16) },
             ));
         }
-        let error = apply(&mut p, "f", "h", "setup", None, false, false)
+        let error = apply(&mut p, "f", "h", "setup", None, false, false, false, false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("is a store; add \"mask\":true"), "{}", error);
@@ -1617,7 +1998,7 @@ mod tests {
                 .named
                 .insert(label("side"), block(vec![], 907, br("cont")));
         }
-        let error = apply(&mut p, "f", "h", "setup", None, false, false)
+        let error = apply(&mut p, "f", "h", "setup", None, false, false, false, false)
             .unwrap_err()
             .to_string();
         assert!(
@@ -1637,7 +2018,7 @@ mod tests {
             body.instructions[0].1 =
                 Instruction::BinaryOp { left: id(13), op: BinaryOp::Minus, right: id(20) };
         }
-        let error = apply(&mut p, "f", "h", "setup", None, false, false)
+        let error = apply(&mut p, "f", "h", "setup", None, false, false, false, false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("counter + step"), "{}", error);
@@ -1654,7 +2035,7 @@ mod tests {
             let body = fun.cfg.named.get_mut(&label("loop_body")).unwrap();
             body.instructions.insert(0, bound);
         }
-        let error = apply(&mut p, "f", "h", "setup", None, false, false)
+        let error = apply(&mut p, "f", "h", "setup", None, false, false, false, false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("defined inside the loop"), "{}", error);
@@ -1670,7 +2051,7 @@ mod tests {
                 .push((id(32), Instruction::BoolConstant { value: true }));
             cont.terminator.1 = br_if(32, "join", "loop_head");
         }
-        let error = apply(&mut p, "f", "h", "setup", None, false, false)
+        let error = apply(&mut p, "f", "h", "setup", None, false, false, false, false)
             .unwrap_err()
             .to_string();
         assert!(
@@ -1691,7 +2072,7 @@ mod tests {
                 .named
                 .insert(label("stray"), block(vec![], 908, br("join")));
         }
-        let error = apply(&mut p, "f", "h", "setup", None, false, false)
+        let error = apply(&mut p, "f", "h", "setup", None, false, false, false, false)
             .unwrap_err()
             .to_string();
         assert!(
@@ -1705,14 +2086,14 @@ mod tests {
     fn verify_rejects_a_kept_branch() {
         let mut p = region_program();
         let before = p.clone();
-        apply(&mut p, "f", "h", "setup", None, false, false).unwrap();
+        apply(&mut p, "f", "h", "setup", None, false, false, false, false).unwrap();
         // Tamper: restore the branch but keep the selects and guards.
         {
             let fun = p.get_mut("f").unwrap();
             let h = fun.cfg.named.get_mut(&label("h")).unwrap();
             h.terminator.1 = br_if(10, "setup", "join");
         }
-        let error = verify(&before, &p, "f", "h", "setup", None, false, false)
+        let error = verify(&before, &p, "f", "h", "setup", None, false, false, false, false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("terminator of 'h'"), "{}", error);
@@ -1722,7 +2103,7 @@ mod tests {
     fn verify_rejects_a_swapped_select() {
         let mut p = region_program();
         let before = p.clone();
-        apply(&mut p, "f", "h", "setup", None, false, false).unwrap();
+        apply(&mut p, "f", "h", "setup", None, false, false, false, false).unwrap();
         {
             let fun = p.get_mut("f").unwrap();
             let join = fun.cfg.named.get_mut(&label("join")).unwrap();
@@ -1732,7 +2113,7 @@ mod tests {
                 if_false: id(17),
             };
         }
-        let error = verify(&before, &p, "f", "h", "setup", None, false, false)
+        let error = verify(&before, &p, "f", "h", "setup", None, false, false, false, false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("changed %18"), "{}", error);
@@ -1742,7 +2123,7 @@ mod tests {
     fn verify_rejects_a_missing_guard() {
         let mut p = region_program();
         let before = p.clone();
-        apply(&mut p, "f", "h", "setup", None, false, false).unwrap();
+        apply(&mut p, "f", "h", "setup", None, false, false, false, false).unwrap();
         {
             let fun = p.get_mut("f").unwrap();
             let setup = fun.cfg.named.get_mut(&label("setup")).unwrap();
@@ -1754,7 +2135,7 @@ mod tests {
         // The guard-position scan now reads pre-existing instructions where
         // the minted triple should be, which fails the freshness check - a
         // loud rejection either way.
-        let error = verify(&before, &p, "f", "h", "setup", None, false, false)
+        let error = verify(&before, &p, "f", "h", "setup", None, false, false, false, false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("'setup'"), "{}", error);
@@ -1818,9 +2199,9 @@ mod tests {
     fn serializes_a_diamond() {
         let mut p = diamond_program();
         let before = p.clone();
-        let changed = apply(&mut p, "f", "h", "a", Some("join"), false, false).unwrap();
+        let changed = apply(&mut p, "f", "h", "a", Some("join"), false, false, false, false).unwrap();
         assert_eq!(changed, 3); // head branch + exit rewire + one phi
-        verify(&before, &p, "f", "h", "a", Some("join"), false, false).unwrap();
+        verify(&before, &p, "f", "h", "a", Some("join"), false, false, false, false).unwrap();
 
         let fun = p.get("f").unwrap();
         assert_eq!(
@@ -1847,8 +2228,8 @@ mod tests {
     fn serializes_a_diamond_from_the_false_arm() {
         let mut p = diamond_program();
         let before = p.clone();
-        apply(&mut p, "f", "h", "b", Some("join"), false, false).unwrap();
-        verify(&before, &p, "f", "h", "b", Some("join"), false, false).unwrap();
+        apply(&mut p, "f", "h", "b", Some("join"), false, false, false, false).unwrap();
+        verify(&before, &p, "f", "h", "b", Some("join"), false, false, false, false).unwrap();
         let fun = p.get("f").unwrap();
         assert_eq!(fun.cfg.named[&label("h")].terminator_kind(), &br("b"));
         assert_eq!(fun.cfg.named[&label("b")].terminator_kind(), &br("a"));
@@ -1867,7 +2248,7 @@ mod tests {
     #[test]
     fn refuses_a_join_that_names_the_triangle() {
         let mut p = region_program();
-        let error = apply(&mut p, "f", "h", "setup", Some("join"), false, false)
+        let error = apply(&mut p, "f", "h", "setup", Some("join"), false, false, false, false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("drop the join field"), "{}", error);
@@ -1888,7 +2269,7 @@ mod tests {
                 ),
             );
         }
-        let error = apply(&mut p, "f", "h", "a", Some("join"), false, false)
+        let error = apply(&mut p, "f", "h", "a", Some("join"), false, false, false, false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("has phis"), "{}", error);
@@ -1899,13 +2280,13 @@ mod tests {
     fn verify_rejects_a_missing_serialization() {
         let mut p = diamond_program();
         let before = p.clone();
-        apply(&mut p, "f", "h", "a", Some("join"), false, false).unwrap();
+        apply(&mut p, "f", "h", "a", Some("join"), false, false, false, false).unwrap();
         {
             let fun = p.get_mut("f").unwrap();
             let a = fun.cfg.named.get_mut(&label("a")).unwrap();
             a.terminator.1 = br("join");
         }
-        let error = verify(&before, &p, "f", "h", "a", Some("join"), false, false)
+        let error = verify(&before, &p, "f", "h", "a", Some("join"), false, false, false, false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("terminator"), "{}", error);
@@ -1926,9 +2307,9 @@ mod tests {
             ));
         }
         let before = p.clone();
-        let changed = apply(&mut p, "f", "h", "setup", None, true, false).unwrap();
+        let changed = apply(&mut p, "f", "h", "setup", None, true, false, false, false).unwrap();
         assert_eq!(changed, 1 + 1 + 3 + 4);
-        verify(&before, &p, "f", "h", "setup", None, true, false).unwrap();
+        verify(&before, &p, "f", "h", "setup", None, true, false, false, false).unwrap();
         let body = &p.get("f").unwrap().cfg.named[&label("loop_body")];
         let n = body.instructions.len();
         let (_, cell_guard) = &body.instructions[n - 4];
@@ -1961,8 +2342,8 @@ mod tests {
             ));
         }
         let before = p.clone();
-        apply(&mut p, "f", "h", "setup", None, true, false).unwrap();
-        verify(&before, &p, "f", "h", "setup", None, true, false).unwrap();
+        apply(&mut p, "f", "h", "setup", None, true, false, false, false).unwrap();
+        verify(&before, &p, "f", "h", "setup", None, true, false, false, false).unwrap();
         let body = &p.get("f").unwrap().cfg.named[&label("loop_body")];
         let n = body.instructions.len();
         let (old, _) = &body.instructions[n - 3];
@@ -1990,8 +2371,8 @@ mod tests {
             ));
         }
         let before = p.clone();
-        apply(&mut p, "f", "h", "a", Some("join"), true, false).unwrap();
-        verify(&before, &p, "f", "h", "a", Some("join"), true, false).unwrap();
+        apply(&mut p, "f", "h", "a", Some("join"), true, false, false, false).unwrap();
+        verify(&before, &p, "f", "h", "a", Some("join"), true, false, false, false).unwrap();
         let fun = p.get("f").unwrap();
         let a_block = &fun.cfg.named[&label("a")];
         let (old_a, _) = &a_block.instructions[a_block.instructions.len() - 3];
@@ -2015,7 +2396,7 @@ mod tests {
     #[test]
     fn refuses_mask_without_stores() {
         let mut p = region_program();
-        let error = apply(&mut p, "f", "h", "setup", None, true, false)
+        let error = apply(&mut p, "f", "h", "setup", None, true, false, false, false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("no stores; drop the mask field"), "{}", error);
@@ -2036,8 +2417,8 @@ mod tests {
             );
         }
         let before = p.clone();
-        apply(&mut p, "f", "h", "setup", None, true, false).unwrap();
-        verify(&before, &p, "f", "h", "setup", None, true, false).unwrap();
+        apply(&mut p, "f", "h", "setup", None, true, false, false, false).unwrap();
+        verify(&before, &p, "f", "h", "setup", None, true, false, false, false).unwrap();
         let setup = &p.get("f").unwrap().cfg.named[&label("setup")];
         // [%11, %12, guard x3, triple x3, %30 store, %20]
         assert_eq!(setup.instructions.len(), 10);
@@ -2070,7 +2451,7 @@ mod tests {
             ));
         }
         let before = p.clone();
-        apply(&mut p, "f", "h", "setup", None, true, false).unwrap();
+        apply(&mut p, "f", "h", "setup", None, true, false, false, false).unwrap();
         {
             let fun = p.get_mut("f").unwrap();
             let body = fun.cfg.named.get_mut(&label("loop_body")).unwrap();
@@ -2082,7 +2463,7 @@ mod tests {
                 if_false: id(16),
             };
         }
-        let error = verify(&before, &p, "f", "h", "setup", None, true, false)
+        let error = verify(&before, &p, "f", "h", "setup", None, true, false, false, false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("changed %"), "{}", error);
@@ -2186,9 +2567,9 @@ mod tests {
     fn speculates_an_expand_region() {
         let mut p = expand_program();
         let before = p.clone();
-        let changed = apply(&mut p, "f", "h", "arm", None, true, true).unwrap();
+        let changed = apply(&mut p, "f", "h", "arm", None, true, true, false, false).unwrap();
         assert_eq!(changed, 1 + 1 + 4); // head branch + one phi + one masked store
-        verify(&before, &p, "f", "h", "arm", None, true, true).unwrap();
+        verify(&before, &p, "f", "h", "arm", None, true, true, false, false).unwrap();
         let fun = p.get("f").unwrap();
         assert_eq!(
             fun.cfg.named[&label("h")].terminator_kind(),
@@ -2218,7 +2599,7 @@ mod tests {
     #[test]
     fn refuses_expand_without_the_flag() {
         let mut p = expand_program();
-        let error = apply(&mut p, "f", "h", "arm", None, true, false)
+        let error = apply(&mut p, "f", "h", "arm", None, true, false, false, false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("add \"expand\":true"), "{}", error);
@@ -2228,7 +2609,7 @@ mod tests {
     #[test]
     fn refuses_the_expand_flag_without_an_expand() {
         let mut p = region_program();
-        let error = apply(&mut p, "f", "h", "setup", None, false, true)
+        let error = apply(&mut p, "f", "h", "setup", None, false, true, false, false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("no expand; drop the expand field"), "{}", error);
@@ -2248,7 +2629,7 @@ mod tests {
                 create_if_missing: false,
             };
         }
-        let error = apply(&mut p, "f", "h", "arm", None, true, true)
+        let error = apply(&mut p, "f", "h", "arm", None, true, true, false, false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("is not the loaded cell"), "{}", error);
@@ -2267,7 +2648,7 @@ mod tests {
                 (id(37), Instruction::Store { target: id(3), source: id(19) }),
             );
         }
-        let error = apply(&mut p, "f", "h", "arm", None, true, true)
+        let error = apply(&mut p, "f", "h", "arm", None, true, true, false, false)
             .unwrap_err()
             .to_string();
         assert!(
@@ -2287,7 +2668,7 @@ mod tests {
             let arm = fun.cfg.named.get_mut(&label("arm")).unwrap();
             arm.instructions[1].1 = Instruction::BoolConstant { value: true };
         }
-        let error = apply(&mut p, "f", "h", "arm", None, true, true)
+        let error = apply(&mut p, "f", "h", "arm", None, true, true, false, false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("is not a load"), "{}", error);
@@ -2299,16 +2680,263 @@ mod tests {
     fn verify_rejects_a_tampered_concretization_store() {
         let mut p = expand_program();
         let before = p.clone();
-        apply(&mut p, "f", "h", "arm", None, true, true).unwrap();
+        apply(&mut p, "f", "h", "arm", None, true, true, false, false).unwrap();
         {
             let fun = p.get_mut("f").unwrap();
             let arm = fun.cfg.named.get_mut(&label("arm")).unwrap();
             arm.instructions[4].1 =
                 Instruction::Store { target: id(33), source: id(31) };
         }
-        let error = verify(&before, &p, "f", "h", "arm", None, true, true)
+        let error = verify(&before, &p, "f", "h", "arm", None, true, true, false, false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("changed %34"), "{}", error);
+    }
+
+    /// A region `assert_true` under `guards` becomes vacuous truth on the
+    /// lanes that skipped the region: bool-const, select on the head's
+    /// condition, assert of the select on the original id.
+    #[test]
+    fn masks_a_guard_in_the_region() {
+        let mut p = region_program();
+        {
+            let fun = p.get_mut("f").unwrap();
+            let body = fun.cfg.named.get_mut(&label("loop_body")).unwrap();
+            body.instructions.push((id(30), Instruction::AssertTrue { value: id(16) }));
+        }
+        let before = p.clone();
+        let changed = apply(&mut p, "f", "h", "setup", None, false, false, false, true).unwrap();
+        assert_eq!(changed, 1 + 1 + 3 + 3);
+        verify(&before, &p, "f", "h", "setup", None, false, false, false, true).unwrap();
+        let body = &p.get("f").unwrap().cfg.named[&label("loop_body")];
+        let n = body.instructions.len();
+        let (true_const, bool_instr) = &body.instructions[n - 3];
+        let (sel, select) = &body.instructions[n - 2];
+        let (assert_id, assert) = &body.instructions[n - 1];
+        assert_eq!(bool_instr, &Instruction::BoolConstant { value: true });
+        assert_eq!(
+            select,
+            &Instruction::Select { condition: id(10), if_true: id(16), if_false: *true_const },
+        );
+        assert_eq!(assert, &Instruction::AssertTrue { value: *sel });
+        assert_eq!(*assert_id, id(30));
+    }
+
+    /// With the arm on the false side the masked select swaps its operands.
+    #[test]
+    fn masks_a_guard_on_the_false_arm() {
+        let mut p = region_program();
+        {
+            let fun = p.get_mut("f").unwrap();
+            fun.cfg.named.get_mut(&label("h")).unwrap().terminator.1 =
+                br_if(10, "join", "setup");
+            let body = fun.cfg.named.get_mut(&label("loop_body")).unwrap();
+            body.instructions.push((id(30), Instruction::AssertTrue { value: id(16) }));
+        }
+        let before = p.clone();
+        apply(&mut p, "f", "h", "setup", None, false, false, false, true).unwrap();
+        verify(&before, &p, "f", "h", "setup", None, false, false, false, true).unwrap();
+        let body = &p.get("f").unwrap().cfg.named[&label("loop_body")];
+        let n = body.instructions.len();
+        let (true_const, _) = &body.instructions[n - 3];
+        let (_, select) = &body.instructions[n - 2];
+        assert_eq!(
+            select,
+            &Instruction::Select { condition: id(10), if_true: *true_const, if_false: id(16) },
+        );
+    }
+
+    /// Without the flag an assert stays exactly as it was - the
+    /// long-standing unmasked bargain, so old entries replay byte-identically.
+    #[test]
+    fn leaves_asserts_unmasked_without_the_flag() {
+        let mut p = region_program();
+        {
+            let fun = p.get_mut("f").unwrap();
+            let body = fun.cfg.named.get_mut(&label("loop_body")).unwrap();
+            body.instructions.push((id(30), Instruction::AssertTrue { value: id(16) }));
+        }
+        let before = p.clone();
+        apply(&mut p, "f", "h", "setup", None, false, false, false, false).unwrap();
+        verify(&before, &p, "f", "h", "setup", None, false, false, false, false).unwrap();
+        let body = &p.get("f").unwrap().cfg.named[&label("loop_body")];
+        assert_eq!(
+            body.instructions.last().unwrap(),
+            &(id(30), Instruction::AssertTrue { value: id(16) })
+        );
+    }
+
+    /// `guards` on an assert-free region is an unjustified premise: refuse.
+    #[test]
+    fn refuses_guards_without_an_assert() {
+        let mut p = region_program();
+        let error = apply(&mut p, "f", "h", "setup", None, false, false, false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("drop the guards field"), "{}", error);
+    }
+
+    /// A call whose callee provably loads a refinement-builtin global is
+    /// accepted under `splits` and left untouched.
+    #[test]
+    fn accepts_a_refinement_call_with_splits() {
+        let mut p = region_program();
+        {
+            let fun = p.get_mut("f").unwrap();
+            let body = fun.cfg.named.get_mut(&label("loop_body")).unwrap();
+            body.instructions.extend([
+                (
+                    id(25),
+                    Instruction::GetGlobal {
+                        name: "__split_by_flr".to_string(),
+                        create_if_missing: false,
+                    },
+                ),
+                (id(26), Instruction::Load { source: id(25) }),
+                (id(27), Instruction::Call { closure: id(26), args: vec![id(16)] }),
+            ]);
+        }
+        let before = p.clone();
+        apply(&mut p, "f", "h", "setup", None, false, false, true, false).unwrap();
+        verify(&before, &p, "f", "h", "setup", None, false, false, true, false).unwrap();
+        let body = &p.get("f").unwrap().cfg.named[&label("loop_body")];
+        assert_eq!(
+            body.instructions.last().unwrap(),
+            &(id(27), Instruction::Call { closure: id(26), args: vec![id(16)] })
+        );
+    }
+
+    /// The same call without the flag is the old categorical refusal.
+    #[test]
+    fn refuses_a_call_without_splits() {
+        let mut p = region_program();
+        {
+            let fun = p.get_mut("f").unwrap();
+            let body = fun.cfg.named.get_mut(&label("loop_body")).unwrap();
+            body.instructions.extend([
+                (
+                    id(25),
+                    Instruction::GetGlobal {
+                        name: "__split_by_flr".to_string(),
+                        create_if_missing: false,
+                    },
+                ),
+                (id(26), Instruction::Load { source: id(25) }),
+                (id(27), Instruction::Call { closure: id(26), args: vec![id(16)] }),
+            ]);
+        }
+        let error = apply(&mut p, "f", "h", "setup", None, false, false, false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("splits"), "{}", error);
+    }
+
+    /// A callee outside REFINEMENT_BUILTINS is refused even with the flag -
+    /// `max` is pure, but purity is not the claim `splits` makes.
+    #[test]
+    fn refuses_a_non_refinement_call_under_splits() {
+        let mut p = region_program();
+        {
+            let fun = p.get_mut("f").unwrap();
+            let body = fun.cfg.named.get_mut(&label("loop_body")).unwrap();
+            body.instructions.extend([
+                (
+                    id(25),
+                    Instruction::GetGlobal {
+                        name: "max".to_string(),
+                        create_if_missing: false,
+                    },
+                ),
+                (id(26), Instruction::Load { source: id(25) }),
+                (id(27), Instruction::Call { closure: id(26), args: vec![id(16)] }),
+            ]);
+        }
+        let error = apply(&mut p, "f", "h", "setup", None, false, false, true, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("refinement"), "{}", error);
+    }
+
+    /// `splits` on a call-free region is an unjustified premise: refuse.
+    #[test]
+    fn refuses_splits_without_a_call() {
+        let mut p = region_program();
+        let error = apply(&mut p, "f", "h", "setup", None, false, false, true, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("drop the splits field"), "{}", error);
+    }
+
+    /// A kill in the region is deleted outright, no flag needed: kills are
+    /// liveness annotations, deleting one is always sound, and regions with
+    /// kills were refused before - no earlier entry can notice.
+    #[test]
+    fn deletes_a_kill_in_the_region() {
+        let mut p = region_program();
+        {
+            let fun = p.get_mut("f").unwrap();
+            let body = fun.cfg.named.get_mut(&label("loop_body")).unwrap();
+            body.instructions.push((id(30), Instruction::Kill { values: vec![id(20)] }));
+        }
+        let before = p.clone();
+        let changed = apply(&mut p, "f", "h", "setup", None, false, false, false, false).unwrap();
+        assert_eq!(changed, 1 + 1 + 3 + 1);
+        verify(&before, &p, "f", "h", "setup", None, false, false, false, false).unwrap();
+        let body = &p.get("f").unwrap().cfg.named[&label("loop_body")];
+        assert!(
+            !body.instructions.iter().any(|(_, i)| matches!(i, Instruction::Kill { .. })),
+            "the kill survived"
+        );
+        let errors = super::super::super::validate::validate_program(&p);
+        assert!(errors.is_empty(), "{:?}", errors);
+    }
+
+    /// A region-private alloc (used only as a store target / load source
+    /// inside the region) is accepted, and its stores stay unmasked: the
+    /// cell has no old value to preserve and nothing outside reads it.
+    #[test]
+    fn accepts_a_region_private_alloc() {
+        let mut p = region_program();
+        {
+            let fun = p.get_mut("f").unwrap();
+            let body = fun.cfg.named.get_mut(&label("loop_body")).unwrap();
+            body.instructions.extend([
+                (id(30), Instruction::Alloc),
+                (id(31), Instruction::Store { target: id(30), source: id(16) }),
+                (id(32), Instruction::Load { source: id(30) }),
+            ]);
+        }
+        let before = p.clone();
+        // No mask flag: the private store is exempt, so no store remains to
+        // justify one.
+        let changed = apply(&mut p, "f", "h", "setup", None, false, false, false, false).unwrap();
+        assert_eq!(changed, 1 + 1 + 3);
+        verify(&before, &p, "f", "h", "setup", None, false, false, false, false).unwrap();
+        let body = &p.get("f").unwrap().cfg.named[&label("loop_body")];
+        assert_eq!(
+            &body.instructions[body.instructions.len() - 2],
+            &(id(31), Instruction::Store { target: id(30), source: id(16) })
+        );
+    }
+
+    /// An alloc whose pointer is stored as a VALUE escapes: refuse.
+    #[test]
+    fn refuses_an_escaping_alloc() {
+        let mut p = region_program();
+        {
+            let fun = p.get_mut("f").unwrap();
+            let body = fun.cfg.named.get_mut(&label("loop_body")).unwrap();
+            body.instructions.extend([
+                (id(30), Instruction::Alloc),
+                (id(31), Instruction::Alloc),
+                // The second cell's pointer is stored INTO the first - it
+                // escapes through the heap.
+                (id(32), Instruction::Store { target: id(30), source: id(31) }),
+            ]);
+        }
+        let error = apply(&mut p, "f", "h", "setup", None, false, false, false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("escapes"), "{}", error);
     }
 }

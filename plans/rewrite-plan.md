@@ -1119,3 +1119,39 @@ NEXT: step 5, (shape, pm1) dispatch key - recovers the freeze and
 dash gates per class; then step 6, the kernel emitter on the overlaid
 program (rows-across-lanes W=16, prefix/suffix split at the button
 read, per-lane deopt).
+
+### Session 2026-08-18: the spd gate is a SELECT - one entry, certified
+
+Per Philippe's call, the intra-class divergent branch was converted
+rather than left: `ti_spd_select` = one speculate_region entry
+(mask + splits + guards) over the single-block moving arm. 267
+changes: 60 masked stores, 10 masked trace guards, 2 refinement
+splits speculated, 2 refinement store-backs, 1 region-private alloc,
+1 dropped kill. Hosted verify: identical through f40, zero deopts.
+
+speculate_region's straightened-arm package, each piece with its own
+independent proof obligation:
+- `splits` opt-in: a region Call is accepted iff its callee provably
+  loads a REFINEMENT_BUILTINS global. Refinements are sound on any
+  state (fragments union to the input); the only cost is
+  fragmentation on skip lanes, priced by the screen.
+- `guards` opt-in: region assert_trues become
+  assert_true(select(c, cond, true)) - trace guards hold only on
+  lanes that entered the arm. Opt-in for replay stability (unmasked
+  asserts are the long-standing accepted default).
+- kills: deleted unconditionally (previously-refused shape, so no
+  replay impact); the overlay's trailing kill_dead re-derives.
+- region-private allocs: accepted via whole-function escape analysis;
+  their stores run UNMASKED (no old value exists to preserve, and the
+  cell is unobservable outside the region).
+- refinement store-backs (split result stored into the loaded cell,
+  the concretization_store shape with a call in the expand's place):
+  UNMASKED, a refinement on every lane. The screen caught the masked
+  version at f25: standing lanes kept their unrefined rem interval
+  and the downstream flr refused it. Masking a refinement is not
+  conservative - it is wrong.
+
+__frame now: ~2,200 instrs, TWO branches (freeze, dash_time - both
+pm1 key cells). Step 5, the (shape, pm1) dispatch key, closes them:
+per class each is a guard_branch and the overlay is literally
+branch-free.

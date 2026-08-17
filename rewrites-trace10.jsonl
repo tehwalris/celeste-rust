@@ -1126,4 +1126,6 @@
 {"at":"%2638","fn":"__frame","id":"sd003","rule":"demote_create"}
 {"at":"%2645","fn":"__frame","id":"sd004","rule":"demote_create"}
 {"at":"%2657","fn":"__frame","id":"sd005","rule":"demote_create"}
+{"id":"ti_spd_select","rule":"speculate_region","fn":"__frame","head":"in_i1_012_if_join_12","arm":"in_ti_anon61_if_body_5","mask":true,"splits":true,"guards":true,"why":"the spd move gate diverges per lane inside a pm1 class (standing vs moving), so it becomes a select: the arm runs masked. 62 masked stores, 10 masked trace guards, 2 refinement splits speculated, 1 stale kill dropped."}
+{"id":"ti_spd_merge","rule":"merge_blocks"}
 {"id":"ti_kill","rule":"kill_dead"}
