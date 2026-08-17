@@ -757,6 +757,15 @@ impl<const BTN: u8> Engine for Rt3<BTN> {
     }
 
     fn select(&mut self, c: TCol, t: TCol, f: TCol) -> TCol {
+        // Uniform condition: the chosen arm passes through UNTOUCHED
+        // (no per-lane pick, no tile copy) - in branch-free code most
+        // select conditions are tile-uniform.
+        match c {
+            TCol::U(AV::Bool(true)) => return t,
+            TCol::U(AV::Bool(false)) => return f,
+            TCol::U(_) => bail(),
+            TCol::T(_) => {}
+        }
         let pick = |cv: AV, tv: AV, fv: AV| -> AV {
             match cv {
                 AV::Bool(true) => tv,
@@ -764,17 +773,11 @@ impl<const BTN: u8> Engine for Rt3<BTN> {
                 _ => bail(),
             }
         };
-        let (cc, tc, fc) = ((c), (t), (f));
-        if let (TCol::U(cv), TCol::U(tv), TCol::U(fv)) = (cc, tc, fc) {
-            let out = TCol::U(pick(cv, tv, fv));
-            return out;
-        }
         let mut o = [AV::Nil; TILE];
         for i in 0..self.width {
-            o[i] = pick(self.tat(cc, i), self.tat(tc, i), self.tat(fc, i));
+            o[i] = pick(self.tat(c, i), self.tat(t, i), self.tat(f, i));
         }
-        let out = self.put_tile(o);
-        out
+        self.put_tile(o)
     }
 
     /// Concrete-button mode: bools pass through (a UBool means the
