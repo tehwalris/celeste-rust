@@ -654,3 +654,9 @@ Slot-compilation prerequisites now ALL in place:
 Next session: census dump (--emit-slots), transpiler --site-slots
 eligibility + slot_get/slot_set emission, Rt3 slots array, re-measure
 the const variants.
+
+One more numbering note for the census dump: run_census uses the
+SCALAR import_lane, which still numbers cells in the old name-order
+DFS - align it to the BFS order too (same restructure as import_block)
+OR run the result-cell census through the vectorized path, so the
+emitted slot ids are canonical. Small either way; do it first.
