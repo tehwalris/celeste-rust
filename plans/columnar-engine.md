@@ -376,3 +376,30 @@ Physical duplication at splits is the 48%. Replace with lazy width:
 Expected: kills the 1.74s widen almost entirely; appended-lane cost
 becomes O(epochs) bookkeeping + lazy copies only for columns actually
 read across a split.
+
+## COW columns LANDED (2026-08-18, ~07:30)
+
+The design above, built and gated. Gate 1 EXACT through f40 (902,280
+lanes). Census after: widen 1740 ms -> 9.8 ms; the profile is now the
+ops themselves (select 650 ms, map2 466 ms serial-with-census).
+
+| f30 (27k lanes) | before COW | after COW |
+|---|---|---|
+| serial | 2.1 s | 1.21 s |
+| 30 cores | 1.22 s | 0.144 s |
+| 30 frames wall | 2.10 s | 0.29 s |
+
+Parallel scaling jumped 1.7x -> 8.5x - the physical widen was the
+scaling bottleneck (memory-bound duplication in every worker).
+Interpreter reference: f30 0.08-0.10 s single-core. The engine's WALL
+CLOCK at f30 now matches the interpreter's single core.
+
+At depth the boundary becomes the frontier: f40 = 14.2 s parallel vs
+interpreter 0.99 s - 902k lanes x 282 cells x 2 hashers + per-chunk
+uniform re-execution + k-way merge. That is goal-7 territory
+(dedup/merge at roofline: hash only varying columns, radix passes,
+parallel merge) plus chunk-size scaling with width. Both named, not
+started.
+
+Remaining ladder: (1) boundary/dedup roofline pass, (2) select/map2
+fusion or typed-bool columns, (3) fused loops via the transpiler.

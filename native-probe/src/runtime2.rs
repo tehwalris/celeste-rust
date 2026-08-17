@@ -127,6 +127,12 @@ pub struct Rt2 {
     pub stat_arena_peak: usize,
     /// Frame-start lane each current lane derives from (splits append).
     pub origin: Vec<u32>,
+    /// COW lane maps (plans/columnar-engine.md "COW/lane-indirection"):
+    /// one entry per widen this frame, (width_before, map current-lane ->
+    /// that width's lane space; identity on 0..width_before). A column
+    /// whose len is smaller than the block width reads appended lanes
+    /// through the matching map instead of being physically widened.
+    history: Vec<(usize, Vec<u32>)>,
     /// Recycled column buffers (killed/overwritten varying columns).
     pool: Vec<Vec<AV>>,
     /// Per-category time census (CELESTE_OP_CENSUS=1): name -> (ns, calls,
@@ -497,6 +503,7 @@ impl Rt2 {
             pool: Vec::new(),
             census: std::env::var_os("CELESTE_OP_CENSUS").map(|_| FxHashMap::default()),
             origin: Vec::new(),
+            history: Vec::new(),
             shape_hash: 0,
             row_keys: Vec::new(),
         }
@@ -527,6 +534,8 @@ impl Rt2 {
                 let AV::Ptr(p) = v[0] else {
                     panic!("expected a pointer, got {:?}", v[0])
                 };
+                // Stale lanes are copies of physical lanes, so scanning the
+                // physical data covers every lane.
                 assert!(
                     v.iter().all(|a| matches!(a, AV::Ptr(q) if *q == p)),
                     "lane-varying pointer column - shape premise broken"
@@ -542,6 +551,8 @@ impl Rt2 {
     /// N column. Returns None when either side is not purely numeric.
     #[inline]
     fn bin_num(&mut self, l: ColId, r: ColId, f: impl Fn(P8, P8) -> P8) -> Option<ColId> {
+        self.resolve(l);
+        self.resolve(r);
         enum NV<'a> {
             U(P8),
             N(&'a [P8]),
@@ -570,6 +581,8 @@ impl Rt2 {
     /// Plus/Minus with the Number lift).
     #[inline]
     fn bin_iv(&mut self, l: ColId, r: ColId, sub: bool) -> Option<ColId> {
+        self.resolve(l);
+        self.resolve(r);
         enum IV<'a> {
             U(P8, P8),
             N(&'a [P8]),
@@ -622,6 +635,8 @@ impl Rt2 {
     /// Numeric compare fast path: bool column out.
     #[inline]
     fn cmp_num(&mut self, l: ColId, r: ColId, f: impl Fn(P8, P8) -> bool) -> Option<ColId> {
+        self.resolve(l);
+        self.resolve(r);
         enum NV<'a> {
             U(P8),
             N(&'a [P8]),
@@ -678,6 +693,90 @@ impl Rt2 {
         }
     }
 
+    /// Length of a column's physical data (width means "not stale").
+    #[inline]
+    fn col_len(c: &Col) -> usize {
+        match c {
+            Col::U(_) => usize::MAX,
+            Col::V(v) => v.len(),
+            Col::N(v) => v.len(),
+            Col::I(v) => v.len(),
+        }
+    }
+
+    /// The physical index a (possibly stale) column uses for `lane`:
+    /// direct below its length, through the COW map above it.
+    #[inline]
+    fn phys(&self, len: usize, lane: usize) -> usize {
+        if lane < len {
+            return lane;
+        }
+        let (_, map) = self
+            .history
+            .iter()
+            .find(|(w, _)| *w == len)
+            .unwrap_or_else(|| panic!("stale column of len {} has no COW map", len));
+        map[lane] as usize
+    }
+
+    /// Lane read through the COW maps.
+    #[inline]
+    fn av_at(&self, c: &Col, lane: usize) -> AV {
+        match c {
+            Col::U(a) => *a,
+            Col::V(v) => v[self.phys(v.len(), lane)],
+            Col::N(v) => AV::Num(v[self.phys(v.len(), lane)]),
+            Col::I(v) => {
+                let (a, b) = v[self.phys(v.len(), lane)];
+                AV::Ival(a, b)
+            }
+        }
+    }
+
+    /// Physically widen a stale column to the block width.
+    fn materialize_col(&self, c: &Col) -> Option<Col> {
+        let len = Self::col_len(c);
+        if len >= self.width {
+            return None;
+        }
+        Some(match c {
+            Col::U(_) => unreachable!(),
+            Col::V(v) => {
+                let mut nv = Vec::with_capacity(self.width);
+                nv.extend_from_slice(v);
+                nv.extend((len..self.width).map(|i| v[self.phys(len, i)]));
+                Col::V(nv)
+            }
+            Col::N(v) => {
+                let mut nv = Vec::with_capacity(self.width);
+                nv.extend_from_slice(v);
+                nv.extend((len..self.width).map(|i| v[self.phys(len, i)]));
+                Col::N(nv)
+            }
+            Col::I(v) => {
+                let mut nv = Vec::with_capacity(self.width);
+                nv.extend_from_slice(v);
+                nv.extend((len..self.width).map(|i| v[self.phys(len, i)]));
+                Col::I(nv)
+            }
+        })
+    }
+
+    /// Materialize an arena column in place and return a reference.
+    fn resolve(&mut self, id: ColId) -> &Col {
+        if let Some(m) = self.materialize_col(self.get(id)) {
+            self.arena[id.0 as usize] = Some(m);
+        }
+        self.get(id)
+    }
+
+    /// Materialize a heap column in place.
+    fn resolve_cell(&mut self, p: usize) {
+        if let Some(m) = self.materialize_col(&self.cols[p]) {
+            self.cols[p] = m;
+        }
+    }
+
     /// A cleared buffer with capacity for the current width (recycled).
     #[inline]
     fn buf(&mut self) -> Vec<AV> {
@@ -700,6 +799,7 @@ impl Rt2 {
 
     #[inline]
     fn map1_inner(&mut self, a: ColId, f: impl Fn(AV) -> AV) -> ColId {
+        self.resolve(a);
         match self.get(a) {
             Col::U(x) => {
                 let out = Col::U(f(*x));
@@ -742,34 +842,34 @@ impl Rt2 {
         }
         let mut out = self.buf();
         let w = self.width;
-        let (x, y) = (self.get(a), self.get(b));
-        out.extend((0..w).map(|i| f(x.at(i), y.at(i))));
+        out.reserve(w);
+        for i in 0..w {
+            let (x, y) = (self.get(a), self.get(b));
+            let v = f(self.av_at_of(x, i), self.av_at_of(y, i));
+            out.push(v);
+        }
         self.put(Col::V(out))
     }
 
+    /// `av_at` without holding the borrow (per-iteration re-borrow).
+    #[inline]
+    fn av_at_of(&self, c: &Col, lane: usize) -> AV {
+        self.av_at(c, lane)
+    }
+
     fn load_inner(&mut self, v: ColId) -> ColId {
-        match self.get(v) {
-            Col::U(AV::Ptr(p)) => {
-                let p = *p as usize;
-                match &self.structure[p] {
-                    Cell2::Val => {
-                        let c = self.cols[p].clone();
-                        self.put(c)
-                    }
-                    _ => self.put(Col::U(AV::Ptr(p as u32))),
-                }
+        let p = match self.get(v) {
+            Col::U(AV::Ptr(p)) => *p,
+            Col::U(AV::NilPtr) => return self.put(Col::U(AV::Nil)),
+            _ => self.uptr(v),
+        };
+        match &self.structure[p as usize] {
+            Cell2::Val => {
+                self.resolve_cell(p as usize);
+                let c = self.cols[p as usize].clone();
+                self.put(c)
             }
-            Col::U(AV::NilPtr) => self.put(Col::U(AV::Nil)),
-            _ => {
-                let p = self.uptr(v);
-                match &self.structure[p as usize] {
-                    Cell2::Val => {
-                        let c = self.cols[p as usize].clone();
-                        self.put(c)
-                    }
-                    _ => self.put(Col::U(AV::Ptr(p))),
-                }
-            }
+            _ => self.put(Col::U(AV::Ptr(p))),
         }
     }
 
@@ -782,15 +882,17 @@ impl Rt2 {
                 other => panic!("select on a non-bool condition: {:?}", other),
             }
         };
-        let out = match (self.get(c), self.get(t), self.get(f)) {
-            (Col::U(cv), Col::U(tv), Col::U(fv)) => Col::U(pick(*cv, *tv, *fv)),
-            (cc, tc, fc) => Col::V(
-                (0..self.width)
-                    .map(|i| pick(cc.at(i), tc.at(i), fc.at(i)))
-                    .collect(),
-            ),
-        };
-        self.put(out)
+        if let (Col::U(cv), Col::U(tv), Col::U(fv)) = (self.get(c), self.get(t), self.get(f)) {
+            let out = Col::U(pick(*cv, *tv, *fv));
+            return self.put(out);
+        }
+        let mut out: Vec<AV> = Vec::with_capacity(self.width);
+        for i in 0..self.width {
+            let (cc, tc, fc) = (self.get(c), self.get(t), self.get(f));
+            let v = pick(self.av_at(cc, i), self.av_at(tc, i), self.av_at(fc, i));
+            out.push(v);
+        }
+        self.put(Col::V(out))
     }
 
 
@@ -806,72 +908,20 @@ impl Rt2 {
         let t = self.t0();
         self.stat_splits += 1;
         self.stat_appended += srcs.len() as u64;
-        // The expand pattern doubles whole blocks: srcs == [0, 1, .., w-1].
-        // That case is one in-place memcpy per column.
-        let contiguous = srcs.len() == self.width
-            && srcs.iter().enumerate().all(|(i, &s)| s == i);
-        let extend = |v: &mut Vec<AV>, srcs: &[usize]| {
-            if contiguous {
-                v.extend_from_within(..srcs.len());
-            } else {
-                v.reserve(srcs.len());
-                for &s in srcs {
-                    let x = v[s];
-                    v.push(x);
-                }
-            }
-        };
-        let extend_n = |v: &mut Vec<P8>, srcs: &[usize]| {
-            if contiguous {
-                v.extend_from_within(..srcs.len());
-            } else {
-                v.reserve(srcs.len());
-                for &s in srcs {
-                    let x = v[s];
-                    v.push(x);
-                }
-            }
-        };
-        let extend_i = |v: &mut Vec<(P8, P8)>, srcs: &[usize]| {
-            if contiguous {
-                v.extend_from_within(..srcs.len());
-            } else {
-                v.reserve(srcs.len());
-                for &s in srcs {
-                    let x = v[s];
-                    v.push(x);
-                }
-            }
-        };
-        for slot in self.arena.iter_mut().flatten() {
-            match slot {
-                Col::V(v) => extend(v, srcs),
-                Col::N(v) => extend_n(v, srcs),
-                Col::I(v) => extend_i(v, srcs),
-                Col::U(_) => {}
+        let old_w = self.width;
+        // COW: no column is touched. Extend every existing map, then
+        // record this width's map (identity below old_w, srcs above).
+        for (_, map) in self.history.iter_mut() {
+            map.reserve(srcs.len());
+            for &s in srcs {
+                let m = map[s];
+                map.push(m);
             }
         }
-        for col in self.cols.iter_mut() {
-            match col {
-                Col::V(v) => extend(v, srcs),
-                Col::N(v) => extend_n(v, srcs),
-                Col::I(v) => extend_i(v, srcs),
-                Col::U(_) => {}
-            }
-        }
-        // Closure capture snapshots hold columns too.
-        for cell in self.structure.iter_mut() {
-            if let Cell2::Clo(_, caps) = cell {
-                for cap in caps.iter_mut() {
-                    if let Col::V(v) = cap {
-                        for &s in srcs {
-                            let x = v[s];
-                            v.push(x);
-                        }
-                    }
-                }
-            }
-        }
+        let mut map: Vec<u32> = Vec::with_capacity(old_w + srcs.len());
+        map.extend(0..old_w as u32);
+        map.extend(srcs.iter().map(|&s| s as u32));
+        self.history.push((old_w, map));
         for &s in srcs {
             let o = self.origin[s];
             self.origin.push(o);
@@ -963,6 +1013,7 @@ impl Engine for Rt2 {
         let tm = self.t0();
         let p = self.uptr(t) as usize;
         self.structure[p] = Cell2::Val;
+        self.resolve(s);
         self.cols[p] = self.get(s).clone();
         self.rec("store", tm);
     }
@@ -975,6 +1026,9 @@ impl Engine for Rt2 {
 
     fn store_closure(&mut self, t: ColId, f: u32, caps: &[ColId]) {
         let p = self.uptr(t) as usize;
+        for c in caps {
+            self.resolve(*c);
+        }
         let caps: Box<[Col]> = caps.iter().map(|c| self.get(*c).clone()).collect();
         self.structure[p] = Cell2::Clo(f, caps);
         self.cols[p] = Col::U(AV::Nil);
@@ -1083,15 +1137,17 @@ impl Engine for Rt2 {
         panic!("^ reached - the interpreter has no arm for it either")
     }
     fn eq(&mut self, l: ColId, r: ColId) -> ColId {
-        let out = match (self.get(l), self.get(r)) {
-            (Col::U(x), Col::U(y)) => Col::U(av_eq(*x, *y, &self.strings)),
-            (x, y) => Col::V(
-                (0..self.width)
-                    .map(|i| av_eq(x.at(i), y.at(i), &self.strings))
-                    .collect(),
-            ),
-        };
-        self.put(out)
+        if let (Col::U(x), Col::U(y)) = (self.get(l), self.get(r)) {
+            let out = Col::U(av_eq(*x, *y, &self.strings));
+            return self.put(out);
+        }
+        let mut out: Vec<AV> = Vec::with_capacity(self.width);
+        for i in 0..self.width {
+            let (x, y) = (self.get(l), self.get(r));
+            let v = av_eq(self.av_at(x, i), self.av_at(y, i), &self.strings);
+            out.push(v);
+        }
+        self.put(Col::V(out))
     }
     fn ne(&mut self, l: ColId, r: ColId) -> ColId {
         let e = self.eq(l, r);
@@ -1180,6 +1236,7 @@ impl Engine for Rt2 {
     /// Expand (core_interpreter.rs:545): a concrete bool passes through;
     /// UnknownBool forks the lane - the k=2 lane split.
     fn expand(&mut self, v: ColId) -> ColId {
+        self.resolve(v);
         let d = self.get(v).clone();
         let w = self.width;
         let any_unknown = match &d {
@@ -1216,6 +1273,7 @@ impl Engine for Rt2 {
     }
 
     fn truthy_b(&mut self, v: ColId, site: u32) -> bool {
+        self.resolve(v);
         match self.get(v) {
             Col::U(a) => av_truthy(*a),
             Col::N(_) | Col::I(_) => true,
@@ -1293,6 +1351,7 @@ impl Engine for Rt2 {
         }
     }
     fn assert_true(&mut self, v: ColId, ctx: &str) {
+        self.resolve(v);
         match self.get(v) {
             Col::U(AV::Bool(true)) => {}
             Col::V(vs) if vs.iter().all(|a| matches!(a, AV::Bool(true))) => {}
@@ -1334,6 +1393,9 @@ impl Engine for Rt2 {
         })
     }
     fn bi_tile_flag_at(&mut self, x: ColId, y: ColId, w: ColId, h: ColId, f: ColId) -> ColId {
+        for a in [x, y, w, h, f] {
+            self.resolve(a);
+        }
         let flag = match self.get(f) {
             Col::U(AV::Num(n)) => n.as_i16().expect("tile_flag_at: flag must be integer"),
             other => panic!("tile_flag_at: lane-varying flag: {:?}", other),
@@ -1365,6 +1427,9 @@ impl Engine for Rt2 {
     }
 
     fn call_builtin(&mut self, b: u32, args: &[ColId]) -> ColId {
+        for a in args {
+            self.resolve(*a);
+        }
         match b {
             BI___PRINT | BI_PRINT => {
                 let printed = match args.first().map(|a| self.get(*a)) {
@@ -1622,6 +1687,27 @@ impl Rt2 {
     /// per-frame GC + canonical cell order), per-lane 128-bit row hash
     /// over live value cells, dedup, compact columns to survivors.
     pub fn boundary(&mut self, ids: &BoundaryIds) -> usize {
+        // Materialize every stale column - the boundary walks whole
+        // columns (BFS pointer scan, hashing, compaction).
+        for p in 0..self.cols.len() {
+            self.resolve_cell(p);
+        }
+        for ci in 0..self.structure.len() {
+            let stale: Vec<(usize, Col)> = match &self.structure[ci] {
+                Cell2::Clo(_, caps) => caps
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, c)| self.materialize_col(c).map(|m| (i, m)))
+                    .collect(),
+                _ => continue,
+            };
+            if let Cell2::Clo(_, caps) = &mut self.structure[ci] {
+                for (i, m) in stale {
+                    caps[i] = m;
+                }
+            }
+        }
+        self.history.clear();
         let (rem_cells, det_cells) = self.mark_walk(ids);
 
         // 1. rem widening, Bits(0).
@@ -2050,6 +2136,7 @@ impl Rt2 {
     /// Reset per-frame bookkeeping. Call before `f___frame`.
     pub fn begin_frame(&mut self) {
         self.origin = (0..self.width as u32).collect();
+        self.history.clear();
     }
 
     /// Frame-start button expansion (#47). MEASURED OUT (2026-08-18): it
@@ -2211,6 +2298,7 @@ impl Rt2 {
             pool: Vec::new(),
             census: self.census.as_ref().map(|_| FxHashMap::default()),
             origin: Vec::new(),
+            history: Vec::new(),
             shape_hash: self.shape_hash,
             row_keys: Vec::new(),
         }
@@ -2234,6 +2322,7 @@ impl Rt2 {
             pool: Vec::new(),
             census: self.census.as_ref().map(|_| FxHashMap::default()),
             origin: self.origin.clone(),
+            history: Vec::new(),
             shape_hash: self.shape_hash,
             row_keys: self.row_keys.clone(),
         }

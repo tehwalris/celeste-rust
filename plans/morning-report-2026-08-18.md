@@ -112,6 +112,16 @@ commit. Read plans/columnar-engine.md for the full engine story.
 - COW/lane-indirection design for the widen fix written in
   plans/columnar-engine.md, ready to build.
 
+## Very late addendum: COW columns landed (~07:30)
+
+The widen fix (COW/lane-indirection) is BUILT and gated, not just
+designed: gate 1 exact through f40 (902k lanes). widen 1740 ms ->
+9.8 ms; parallel scaling 1.7x -> 8.5x. f30 in 144 ms on 30 cores /
+30 frames in 0.29 s wall - the engine's wall clock now matches the
+interpreter's single core at f30. At depth (f40) the boundary/dedup
+path is the new measured frontier. plans/columnar-engine.md has the
+full ladder.
+
 ## Where the next session starts
 
 plans/columnar-engine.md "Typed columns, measured" bottom: per-op time

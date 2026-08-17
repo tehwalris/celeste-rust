@@ -9,6 +9,13 @@ f1..f30): EXACT every frame. Timings, f30 = 27,024 boundary lanes
 | interpreter (`rewrite bench`, 1 core) | 0.08 s | 0.22 s |
 | columnar serial (CHUNK=64, typed cols) | 2.1 s | 3.5 s |
 | columnar parallel (30 cores) | 1.22 s | 2.10 s |
+| + COW lane-indirection columns, serial | 1.21 s | 2.0 s |
+| + COW, 30 cores | **0.144 s** | **0.29 s** |
+
+Gate 1 also EXACT through f40 (902,280 lanes; f31..f40 counts equal
+the interpreter's). f40 wall 14.2 s parallel vs interpreter 0.99 s -
+at depth the boundary/dedup path is the new frontier (see
+plans/columnar-engine.md).
 
 Per-op census (serial): widen (lane-append at expand/split sites)
 1.74 s = 48%, map2 0.53 s, select 0.43 s. Named fixes in the plan
