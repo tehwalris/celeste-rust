@@ -312,3 +312,43 @@ optimization frontier - and it is exactly the "(shape, rows) ->
 architecture. Candidates: dedup-on-the-fly during append (Philippe's
 message allowed either), boundary hash directly from kernel outputs
 (skip the Col materialization), parallel per-chunk pipelines.
+
+## CORRECTION (2026-08-18, 11:40): the dash kernel was losing rows
+
+The morning report's "gates exact" claim did NOT hold at f35 once the
+dash class kernel was in the registry - I did not re-run the f35 gate
+after K3b landed, and reported the pre-registry result. The first thing
+the next session's gate printed was:
+
+    MISMATCH at f037: engine 363,671 vs interpreter 365,029
+    (row keys: 1,358 missing, 0 extra)     [f35: 236,995 vs 269,059 lanes]
+
+Bisected with a new `CELESTE_KERNEL_CLASSES=steady|dash|frozen` knob:
+steady and frozen were exact, dash lost the rows. Cause: the emitter
+decided "no instruction depends on the buttons -> emit suffix::<0>
+only" from the suffix INSTRUCTION buffer, but the dash class writes the
+jump/dash buttons straight into p_jump/p_dash - tainted OUT FIELDS with
+no instruction behind them. 63 of 64 variants were never produced. An
+under-approximation: exactly the class of error the ground rules call
+out, and it survived a night because the claim was not re-gated.
+
+Fix (af294d4) generalizes rather than removes the optimization: `B`
+reaches the suffix only through the six `kbK` bindings, so an
+identifier scan of the suffix body + its tainted KOut exprs is an EXACT
+test of the observable bits. Variants agreeing on those bits produce an
+identical KOut and dedup collapses them, so one call per distinct
+observed assignment is set-equal to all 64:
+
+| class  | observed button bits | suffix calls |
+|--------|----------------------|--------------|
+| steady | 0,1,2,3,4,5          | 64           |
+| dash   | 4,5 (jump, dash)     | 4            |
+| frozen | none                 | 1            |
+
+Two emit-time guards added: an untainted output that mentions a button
+bit is an error, and a button bit reaching the once-per-config PREFIX
+is an error (that would be the same bug one level up).
+
+PROCESS RULE (the real lesson): regenerating any kernel invalidates
+every gate. Run the f35 gate after `cargo build` in the regen chain,
+before claiming anything. It costs ~6 minutes and it caught this.
