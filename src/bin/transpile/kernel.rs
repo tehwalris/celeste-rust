@@ -1655,8 +1655,15 @@ fn render(e: &Emit, out_path: &str) -> Result<()> {
         }
     }
     writeln!(out, "    }};")?;
-    for b in 0..64 {
-        writeln!(out, "    suffix::<{}>(u, g, &p, &osh, out);", b)?;
+    if e.suf.trim().is_empty() {
+        // No instruction depends on the buttons: all 64 variants produce
+        // identical rows (the interpreter's 64 copies dedup to the same
+        // set), so one call carries the class.
+        writeln!(out, "    suffix::<0>(u, g, &p, &osh, out);")?;
+    } else {
+        for b in 0..64 {
+            writeln!(out, "    suffix::<{}>(u, g, &p, &osh, out);", b)?;
+        }
     }
     for _ in 0..e.fork_depth {
         writeln!(out, "    }}")?;

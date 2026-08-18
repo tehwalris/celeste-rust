@@ -10,5 +10,5 @@ serve/
 # native-compile probe (task #124): generated code + build dir
 native-probe/src/gen.rs
 native-probe/target/
-/native-probe/steady-shape.json
-/native-probe/src/kernel_gen.rs
+/native-probe/*-shape.json
+/native-probe/src/kernel_gen*.rs

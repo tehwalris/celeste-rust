@@ -286,3 +286,29 @@ under 300 ms with 100% kernel coverage; the frozen classes' 236-instr
 frame is nearly free). Then Rt3/Rt2 retirement becomes real (K4), and
 the room (2,0) campaign (K5) runs on a fully-kernelized room (1,0)
 precedent.
+
+## K3b: kernel registry LANDS (2026-08-18 ~06:45)
+
+Three class kernels (kernel_gen_steady/_dash/_frozen) emitted from the
+certified overlays + class-filtered witnesses (--emit-shape DIR FRAME
+OUT CLASS); run_chunk_kernel tries them in coverage order (a wrong
+class fails its own gb guard -> bd on slice 0 -> next kernel).
+
+The taint analysis DISCOVERED game semantics: the dash and frozen
+frames have EMPTY button suffixes (mid-dash Celeste ignores input;
+frozen skips the update entirely) - their 64 variants are identical,
+emitted as one call.
+
+Coverage counters (f35 bench, steady rep): steady 114,458 + dash
+43,824 + frozen 29,577 lanes, missed 0 - **100% of player lanes run
+kernel code**, gates 1+2 exact.
+
+Wall: 393 ms (vs 369 steady-only, 518 TILE=2). The flat wall despite
+full coverage is the finding: FRAME COMPUTE IS NOW ESSENTIALLY FREE;
+the residual is the generic row machinery (append_out, boundary
+hashing, cross-block dedup, k-way merge). That is the next
+optimization frontier - and it is exactly the "(shape, rows) ->
+[(shape, rows)]" outer scope, so the work stays inside the
+architecture. Candidates: dedup-on-the-fly during append (Philippe's
+message allowed either), boundary hash directly from kernel outputs
+(skip the Col materialization), parallel per-chunk pipelines.

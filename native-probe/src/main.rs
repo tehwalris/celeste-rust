@@ -16,7 +16,10 @@ mod runtime;
 mod runtime2;
 mod runtime3;
 pub mod kernel;
-mod kernel_gen;
+mod kernel_gen_dash;
+mod kernel_gen_frozen;
+mod kernel_gen_steady;
+use kernel_gen_steady as kernel_gen;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -717,7 +720,7 @@ fn main() {
     let mut abstract_frames: Option<u32> = None;
     let mut abstract_bench: Option<(String, u32)> = None;
     let mut row_census: Option<(String, u32)> = None;
-    let mut emit_shape: Option<(String, u32, String)> = None;
+    let mut emit_shape: Option<(String, u32, String, String)> = None;
     let mut kernel_bench: Option<(String, u32)> = None;
     let mut reps: u32 = 10;
     let mut census_frames: u32 = 2;
@@ -771,10 +774,11 @@ fn main() {
                 row_census = Some((dir, frame));
             }
             "--emit-shape" => {
-                let dir = args.next().expect("--emit-shape needs DIR FRAME OUT");
+                let dir = args.next().expect("--emit-shape needs DIR FRAME OUT [CLASS]");
                 let frame: u32 = args.next().expect("FRAME").parse().unwrap();
                 let out = args.next().expect("OUT");
-                emit_shape = Some((dir, frame, out));
+                let class = args.next().unwrap_or_else(|| "steady".to_string());
+                emit_shape = Some((dir, frame, out, class));
             }
             "--kernel-bench" => {
                 let dir = args.next().expect("--kernel-bench needs DIR FRAME");
@@ -803,8 +807,8 @@ fn main() {
         run_row_census(&dir, frame);
         return;
     }
-    if let Some((dir, frame, out)) = emit_shape {
-        run_emit_shape(&dir, frame, &out);
+    if let Some((dir, frame, out, class)) = emit_shape {
+        run_emit_shape(&dir, frame, &out, &class);
         return;
     }
     if let Some((dir, frame)) = kernel_bench {
@@ -1340,7 +1344,7 @@ fn run_row_census(dir: &str, frame: u32) {
 /// kernel emitter consumes. Topology (globals, object fields, arrays,
 /// closures) is by NAME so the consumer needs no shared interner; the
 /// varying set is the UNION over all steady blocks of the frame.
-fn run_emit_shape(dir: &str, frame: u32, out_path: &str) {
+fn run_emit_shape(dir: &str, frame: u32, out_path: &str, class: &str) {
     use serde_json::json;
     let rt = build_rt();
     let states = load_states_any(dir, frame);
@@ -1352,21 +1356,35 @@ fn run_emit_shape(dir: &str, frame: u32, out_path: &str) {
             let shape_ok = celeste_rust::interpreter::abstraction::object_shape(st)
                 .map(|s| s == vec!["player".to_string()])
                 .unwrap_or(false);
-            shape_ok
-                && names.iter().all(|(cell, name)| {
-                    if name != "freeze" && !name.ends_with(".dash_time") {
-                        return true;
+            let val_of = |want: &str| -> Option<i32> {
+                names.iter().find_map(|(cell, name)| {
+                    if (want == "freeze" && name == "freeze")
+                        || (want == "dash" && name.ends_with(".dash_time"))
+                    {
+                        match st.heap.get_opt(
+                            celeste_rust::interpreter::heap::HeapId::from_raw(*cell),
+                        ) {
+                            Some(HeapValue::Value(Value::Number(MaybeVector::Scalar(n)))) => {
+                                Some(n.as_raw_u32() as i32)
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
                     }
-                    matches!(
-                        st.heap
-                            .get_opt(celeste_rust::interpreter::heap::HeapId::from_raw(*cell)),
-                        Some(HeapValue::Value(Value::Number(MaybeVector::Scalar(n))))
-                            if n.whole_part_as_i16() == 0 && n.fraction_part_as_u16() == 0
-                    )
                 })
+            };
+            let (fz, da) = (val_of("freeze"), val_of("dash"));
+            let class_ok = match class {
+                "steady" => fz == Some(0) && da == Some(0),
+                "dash" => fz == Some(0) && matches!(da, Some(v) if v > 0),
+                "frozen" => matches!(fz, Some(v) if v > 0),
+                other => panic!("unknown class {:?}", other),
+            };
+            shape_ok && class_ok
         })
         .collect();
-    assert!(!steady.is_empty(), "no steady-class blocks at f{}", frame);
+    assert!(!steady.is_empty(), "no {}-class blocks at f{}", class, frame);
     let blocks: Vec<(runtime2::Rt2, Vec<Option<celeste_rust::interpreter::heap::HeapId>>)> =
         steady
             .iter()
@@ -1500,20 +1518,68 @@ fn run_chunk_kernel(
     done: &mut Vec<runtime2::Rt2>,
     local: &mut Vec<(runtime2::Rt2, bool)>,
 ) -> bool {
-    if chunk.shape_hash != kernel_gen::SHAPE_HASH {
+    // The class registry: each kernel's own guards reject wrong-class
+    // chunks (bd on the first slice - cheap), so trying in coverage
+    // order is both sound and fast.
+    if run_class_kernel_steady(chunk, ids, done, local) {
+        KERNEL_HITS[0].fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
+        return true;
+    }
+    if run_class_kernel_dash(chunk, ids, done, local) {
+        KERNEL_HITS[1].fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
+        return true;
+    }
+    if run_class_kernel_frozen(chunk, ids, done, local) {
+        KERNEL_HITS[2].fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
+        return true;
+    }
+    KERNEL_HITS[3].fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
+    false
+}
+
+/// Lanes handled per class kernel [steady, dash, frozen, missed].
+static KERNEL_HITS: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+pub fn print_kernel_hits() {
+    let v: Vec<u64> = KERNEL_HITS
+        .iter()
+        .map(|a| a.swap(0, std::sync::atomic::Ordering::Relaxed))
+        .collect();
+    if v.iter().any(|x| *x > 0) {
+        eprintln!(
+            "kernel lanes: steady {} dash {} frozen {} missed {}",
+            v[0], v[1], v[2], v[3]
+        );
+    }
+}
+
+macro_rules! class_kernel_runner {
+    ($fname:ident, $m:ident) => {
+fn $fname(
+    chunk: &runtime2::Rt2,
+    ids: &runtime2::BoundaryIds,
+    done: &mut Vec<runtime2::Rt2>,
+    local: &mut Vec<(runtime2::Rt2, bool)>,
+) -> bool {
+    if chunk.shape_hash != $m::SHAPE_HASH {
         return false;
     }
-    let Some(uni) = kernel_gen::bind(chunk) else { return false };
-    let g = kernel_gen::G { cart: &chunk.cart, cache: &chunk.cache };
-    let mut acc = kernel_gen::acc_init(chunk);
+    let Some(uni) = $m::bind(chunk) else { return false };
+    let g = $m::G { cart: &chunk.cart, cache: &chunk.cache };
+    let mut acc = $m::acc_init(chunk);
     let mut deopt_rows: std::collections::BTreeSet<u32> = Default::default();
     let mut bd_hit = false;
     let mut lo = 0usize;
     while lo < chunk.width && !bd_hit {
         let n = (chunk.width - lo).min(kernel::W);
         let width_mask: u16 = if n == kernel::W { 0xffff } else { (1u16 << n) - 1 };
-        let Some(rin) = kernel_gen::rows(chunk, lo) else { return false };
-        kernel_gen::frame(&uni, &rin, &g, &mut |_b, osh, kout| {
+        let Some(rin) = $m::rows(chunk, lo) else { return false };
+        $m::frame(&uni, &rin, &g, &mut |_b, osh, kout| {
             if kout.bd {
                 bd_hit = true;
                 return;
@@ -1528,7 +1594,7 @@ fn run_chunk_kernel(
             if live == 0 {
                 return;
             }
-            kernel_gen::append_out(&mut acc, chunk, lo, n, live, osh, kout);
+            $m::append_out(&mut acc, chunk, lo, n, live, osh, kout);
         });
         lo += kernel::W;
     }
@@ -1547,6 +1613,11 @@ fn run_chunk_kernel(
     }
     true
 }
+    };
+}
+class_kernel_runner!(run_class_kernel_steady, kernel_gen_steady);
+class_kernel_runner!(run_class_kernel_dash, kernel_gen_dash);
+class_kernel_runner!(run_class_kernel_frozen, kernel_gen_frozen);
 
 /// Append `src`'s lanes onto `acc` (same structure). Uniform columns
 /// that agree stay uniform; any disagreement materializes per-lane
@@ -1943,6 +2014,7 @@ fn run_abstract_bench(dir: &str, frame: u32, reps: u32) {
         let t0 = std::time::Instant::now();
         let out = frame_step(run, &ids, g_freeze, &mut census_total);
         times.push(t0.elapsed().as_secs_f64() * 1e3);
+        print_kernel_hits();
         lanes_out = out.iter().map(|b| b.width).sum();
         splits = out.iter().map(|b| b.stat_splits).max().unwrap_or(0);
     }
