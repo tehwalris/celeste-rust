@@ -42,6 +42,10 @@ pub fn dump(kind: &str, dir: Option<&std::path::Path>, extra: &[(&str, String)])
     // INSIDE `fwd.interpret`, so it belongs next to the phase totals rather
     // than in them.
     crate::compiled::print_chunk_phase_times();
+    // Kernel coverage, when a compiled run was in play. Which lanes the
+    // class kernels actually took is the difference between "the compiled
+    // engine is slow" and "the compiled engine barely ran".
+    crate::compiled::dispatch::print_kernel_hits();
     crate::rewrite::verify::print_worker_phase_times();
     let phases = PHASES.lock().unwrap();
     if phases.is_empty() {

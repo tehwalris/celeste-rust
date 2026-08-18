@@ -147,13 +147,42 @@ the campaign is the largest single lever in the stage - but it needs a
 new gate, because gate 2 only proves `Rt2` keys equal `Rt2` keys, never
 that they equal `visited_row_keys`.
 
-**3. The deopt machinery costs as much as the engine.** 399,516 of 51M
-lanes (0.8%) fail a specialization premise and re-run under the PLAIN
-(unrewritten) program, and that re-run is 412-430 ns/input-lane amortized
-over every lane - comparable to the entire compiled engine (415) and
-close to the interpreter's own frame (496). The optimistic path the
-compiled run takes pays a further 204 ns for the retry that collect-first
-exists to avoid. Nobody had priced this.
+**3. The deopt machinery costs as much as the engine, and it also starves
+it.** 399,516 of 51M lanes (0.78%) fail a specialization premise and
+re-run under the PLAIN (unrewritten) program. That re-run is 412-430
+ns/input-lane amortized over every lane - comparable to the entire
+compiled engine (415) and close to the interpreter's own frame (496).
+
+It is concentrated and growing, not spread: NOTHING deopts before f58,
+and then f58 costs 0.20 s of plain-program CPU, f62 11.71 s, f68
+**53.68 s - 255% of that frame's own wall**. f58 is where states start
+dying, and the death/restart path is outside what the recipe was verified
+over. A campaign to H=90+ is dominated by this, and no plan has priced
+it.
+
+The starvation is the part nobody would guess. Kernel coverage is
+essentially perfect where the kernel runs - 36,707,603 lanes dispatched
+(steady 35.8M, dash 0.54M, frozen 0.32M) against **43 missed** - but that
+is only **72% of the 51M input lanes**. The other 28% never reach a
+kernel at all: a chunk whose compiled attempt fails is re-run WHOLESALE
+by the interpreter, and f58..f68 hold 66% of the run's input lanes. So
+the compiled engine's 415 ns is amortized over every lane while covering
+under three quarters of them.
+
+For a failing chunk the compiled path runs the frame THREE times:
+
+1. the compiled attempt (kernel) - `run`
+2. the specialized program with a per-lane origin column, over the WHOLE
+   chunk, to find which lanes failed - "deopt retry", 204 ns
+3. the plain program on just the failed lanes - 430 ns
+
+Collect-first does 2 and 3 only, skipping the optimistic attempt by
+paying the origin column on 100% of chunks (496 ns) instead. That is the
+trade, and it is why the interpreter column has no "retry" row. A
+compiled run cannot use collect-first as it stands, because the origin
+column changes the shape hash so no kernel binds (P1 stage 3) - so the
+compiled path is on the wrong side of that trade at exactly the depths
+where deopt matters.
 
 ## The kernel number, chased from microbench to campaign
 
@@ -168,6 +197,16 @@ exists to avoid. Nobody had priced this.
 
 The 1.7x from 198 to 346 is one favourable frame against the whole run.
 Everything after that is not the kernel.
+
+"Rest (drops, moves)" is a RESIDUAL, not a measurement: frame-body
+thread-time minus the compiled engine, the deopt retry, the plain re-run
+and the snapshot. By construction it cannot overlap them, but it does
+absorb any under-measurement in them, so read it as an upper bound. What
+belongs in it: dropping the input `State` and its snapshot at end of
+scope, moving the output `Vec<State>`, the `catch_unwind` guard, and on
+the compiled path the exported states and imported blocks discarded when
+an attempt unwinds. The interpreter's is 55 ns; the compiled path's 169
+ns is consistent with its much larger allocation churn.
 
 Caveats: sub-phase wall figures apply worker thread-time ratios to
 `fwd.interpret`'s wall (the parts run back to back in the same workers,
