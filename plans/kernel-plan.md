@@ -150,3 +150,24 @@ Bench harness detail worth keeping: deopted input rows are re-run
 through frame_step and their keys unioned - that IS the K3
 architecture (kernel front, reference behind), and the gate proves
 the composition exact.
+
+## K2 FORKS LAND (2026-08-18 ~02:50): kernel EXACT with ZERO deopt
+
+zi_fork_flr (<=2-way fork per split site, runtime nested loops in the
+emitted frame(), per-lane VALID masks instead of deopt) lands. Gate on
+f35 steady class: row-key set EQUAL (197,316 keys), 0 missing, 0
+extra, **0 deopt lane-variants**, 0 bd slices - the kernel computes
+100% of the steady class itself, exactly, with the reference touching
+nothing.
+
+Timing (single-threaded, unoptimized): 1347 ms for 114,458 lanes x 64
+inputs = 183.9 ns per row-input-frame, including the 4 fork configs.
+For scale: Rt3's 518 ms was on ~30 cores (~7.7 s single-core-equiv),
+so the kernel is roughly ~6x faster per core already, before any
+hill-climbing (no disasm pass yet, no dead-config pruning, no
+parallelism in the bench).
+
+Hill-climb list (next): disasm the suffix (verify zmm vectorization),
+skip suffixes for all-invalid configs (integer-spd lanes have empty
+fragment 1), parallelize slices across cores in the bench, cross-suffix
+sharing of button-independent Z ops, then K3 integration.

@@ -379,6 +379,45 @@ pub fn zi_split_flr(a: ZI, deopt: &mut u16) -> ZI {
     a
 }
 
+/// __split_by_flr as a <=2-way FORK (plans/kernel-plan.md K2): a
+/// boundary-widened interval has width < 1, so it spans at most two
+/// floors. Fragment 0 is the low-floor part (always non-empty);
+/// fragment 1 is the high-floor part (empty on single-floor lanes).
+/// Returns (fragment `c` per lane, valid mask); a lane with an empty
+/// fragment simply produces no row in this fork configuration.
+/// Lanes spanning >2 floors deopt (cannot happen at width < 1).
+#[inline(always)]
+pub fn zi_fork_flr(a: ZI, c: usize, deopt: &mut u16) -> (ZI, u16) {
+    let mut o = a;
+    let mut valid = 0u16;
+    for i in 0..W {
+        let (fl, fh) = (a.lo[i].flr(), a.hi[i].flr());
+        if fl == fh {
+            if c == 0 {
+                valid |= 1 << i;
+            }
+        } else {
+            if fh != fl + P8::from_i16(1) {
+                // >2 floors: deopt, and stay "valid" in config 0 only so
+                // the driver routes the lane to the reference exactly once.
+                *deopt |= 1 << i;
+                if c == 0 {
+                    valid |= 1 << i;
+                }
+                continue;
+            }
+            valid |= 1 << i;
+            let boundary = fh; // first value of the high floor
+            if c == 0 {
+                o.hi[i] = boundary.next_smallest();
+            } else {
+                o.lo[i] = boundary;
+            }
+        }
+    }
+    (o, valid)
+}
+
 /// __split_at on per-lane intervals: a lane fully on one side of `c` is
 /// identity; a lane exactly [c, c] is the POINT class (its value behaves
 /// as the NUMBER c downstream - the returned mask says which lanes);

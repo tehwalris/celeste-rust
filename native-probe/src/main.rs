@@ -1571,14 +1571,14 @@ fn run_kernel_bench(dir: &str, frame: u32, reps: u32) {
                     }
                     return;
                 }
-                let dead = kout.deopt & width_mask;
+                let dead = kout.deopt & kout.valid & width_mask;
                 deopt_lanes += dead.count_ones() as u64;
                 for i in 0..n {
                     if dead & (1 << i) != 0 {
                         deopt_rows.insert((lo + i) as u32);
                     }
                 }
-                let live = !kout.deopt & width_mask;
+                let live = kout.valid & !kout.deopt & width_mask;
                 if live == 0 {
                     return;
                 }

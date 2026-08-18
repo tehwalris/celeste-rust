@@ -109,6 +109,12 @@ struct Emit {
     /// loaded from one carries that provenance into `expand` even when it
     /// was freshly minted this frame (mint-store-reload strips the tag).
     button_cells: HashMap<u32, u8>,
+    /// Open fork loops (each __split_by_flr on a per-lane interval is a
+    /// <=2-way fork emitted as a runtime loop; the rest of the program
+    /// nests inside). Render closes this many braces at the end.
+    fork_depth: usize,
+    /// Name of the current per-lane validity mask ("ALL" at depth 0).
+    valid_expr: String,
 }
 
 impl Emit {
@@ -311,6 +317,8 @@ pub fn emit_kernel(program: &Program, witness_path: &str, out_path: &str) -> Res
         pin_val: HashMap::new(),
         pins: BTreeSet::new(),
         button_cells: HashMap::new(),
+        fork_depth: 0,
+        valid_expr: "ALL".to_string(),
     };
     load_witness(witness_path, &mut e)?;
 
@@ -943,9 +951,41 @@ fn call_intrinsic(e: &mut Emit, name: &str, args: &[LocalId]) -> Result<K> {
         "__split_by_flr" => {
             let a = &vals[0];
             match a {
-                K::ZI(v) => Ok(K::ZI(e.bind("ZI", &format!("zi_split_flr({}, &mut dp)", v)))),
-                K::ZIP { v, .. } => {
-                    Ok(K::ZI(e.bind("ZI", &format!("zi_split_flr({}, &mut dp)", v))))
+                K::ZI(v) | K::ZIP { v, .. } => {
+                    // A <=2-way FORK: open a runtime loop; everything after
+                    // this instruction nests inside it. dp/bd are shadowed
+                    // so one configuration's failures do not leak into the
+                    // next.
+                    let v = v.clone();
+                    if e.in_suffix {
+                        bail!("fork inside the button suffix is not supported (v1)");
+                    }
+                    let d = e.fork_depth;
+                    e.line(&format!("for c{} in 0..2usize {{", d));
+                    e.line("let mut dp = dp;");
+                    e.line("let mut bd_l: bool = *bd;");
+                    e.line("let bd: &mut bool = &mut bd_l;");
+                    let frag = format!("v{}", e.n);
+                    e.n += 1;
+                    e.line(&format!(
+                        "let ({f}, {f}_fv): (ZI, u16) = zi_fork_flr({v}, c{d}, &mut dp);",
+                        f = frag,
+                        v = v,
+                        d = d
+                    ));
+                    let valid = format!("valid{}", d);
+                    e.line(&format!(
+                        "let {}: u16 = {} & {}_fv;",
+                        valid, e.valid_expr, frag
+                    ));
+                    e.line(&format!("if {} == 0 {{ continue; }}", valid));
+                    e.var_ty.insert(frag.clone(), "ZI");
+                    e.var_ty.insert(valid.clone(), "u16");
+                    e.pre_defs.insert(frag.clone());
+                    e.pre_defs.insert(valid.clone());
+                    e.valid_expr = valid;
+                    e.fork_depth += 1;
+                    Ok(K::ZI(frag))
                 }
                 K::SI(v) => {
                     e.line(&format!(
@@ -1202,6 +1242,8 @@ fn render(e: &Emit, out_path: &str) -> Result<()> {
     }
     writeln!(out, "/// Cells the frame writes, per variant. Everything else is identity.")?;
     writeln!(out, "pub struct KOut {{")?;
+    writeln!(out, "    /// Lanes that EXIST in this fork configuration.")?;
+    writeln!(out, "    pub valid: u16,")?;
     writeln!(out, "    pub deopt: u16,")?;
     writeln!(out, "    pub bd: bool,")?;
     for (id, ty, _) in &out_fields {
@@ -1385,6 +1427,7 @@ fn render(e: &Emit, out_path: &str) -> Result<()> {
             .ok_or_else(|| anyhow!("no type for crossing var {}", name))?;
         writeln!(out, "    {}: {},", name, ty)?;
     }
+    writeln!(out, "    valid: u16,")?;
     writeln!(out, "    dp: u16,")?;
     writeln!(out, "    bd: bool,")?;
     writeln!(out, "}}\n")?;
@@ -1403,11 +1446,15 @@ fn render(e: &Emit, out_path: &str) -> Result<()> {
     for name in &crossing {
         writeln!(out, "        {},", name)?;
     }
+    writeln!(out, "        valid: {},", e.valid_expr)?;
     writeln!(out, "        dp,")?;
     writeln!(out, "        bd: *bd,")?;
     writeln!(out, "    }};")?;
     for b in 0..64 {
         writeln!(out, "    suffix::<{}>(u, g, &p, out);", b)?;
+    }
+    for _ in 0..e.fork_depth {
+        writeln!(out, "    }}")?;
     }
     writeln!(out, "}}\n")?;
 
@@ -1428,6 +1475,7 @@ fn render(e: &Emit, out_path: &str) -> Result<()> {
     }
     out.push_str(&e.suf);
     writeln!(out, "    out(B, &KOut {{")?;
+    writeln!(out, "        valid: p.valid,")?;
     writeln!(out, "        deopt: dp,")?;
     writeln!(out, "        bd: *bd,")?;
     for (id, _, expr) in &out_fields {
