@@ -95,6 +95,73 @@ with `--site-slots plans/site-slots-room10-f035.json` - that closes
 the gate to one shape again, so it must come with a census for EVERY
 shape the run visits, or stay off.
 
+# Top-down campaign cost breakdown (2026-08-18, synthetic win)
+
+The engine numbers below this section are ONE STAGE of the campaign. This
+section costs the whole pipeline, so the engine work can be priced against
+the thing it is supposed to speed up.
+
+Setup: room (1,0), `CELESTE_WIN_AT_XY=64,44` - the witness trajectory's
+position at frame 70, so real wins exist at a horizon reachable in
+minutes instead of the real exit's 90-100 frames. The synthetic win is in
+the campaign fingerprint, so these artifacts can never be confused with a
+real campaign's. 30 cores, `--memory 60G` tripwire, chunk caps 8000.
+Level-0 forward to H=72 leaves 5,136,510 lanes; first win at frame 66.
+
+## Level 0 at H=72
+
+| stage | wall | peak RSS | what dominates it |
+|---|---|---|---|
+| forward bench 0->72 | 248 s | 8.1 GB | `fwd.interpret` 195 s = **79%** |
+| pos-graph (full build) | ~242 s | 5.0 GB | frame replay |
+| sweep | 276 s | 15.1 GB | `bwdt.replay` 190 s = **69%**, keys 34 s, index 25 s |
+| **level 0 total** | **~12.8 min** | 15.1 GB | |
+
+pos-graph is incremental: measured 52 s to reach H=60, +53 s to 65, +92 s
+to 70, +45 s to 72. The ~242 s is the sum, i.e. what a from-scratch build
+at H=72 costs; a ladder that extends by 2 frames pays only the 45 s.
+
+## Banded levels at H=72 (the k ladder)
+
+| k | bench | pos-graph | sweep | total | min(e+g) |
+|---|---|---|---|---|---|
+| 0 | 248 s | ~242 s | 276 s | ~766 s | 64 |
+| 1 | 27 s | 22 s | 86 s | 135 s | 66 |
+| 2 | 18 s | 19 s | 64 s | 101 s | 67 |
+| 3 | 19 s | 19 s | 62 s | 100 s | 68 |
+
+The tube works: a banded level is ~100-135 s against level 0's ~766 s,
+and peaks drop to 1-4.5 GB. Extrapolating k=4..16 at ~100 s, a FULL
+16-level ladder at one horizon is **~40 min**, of which level 0 is a
+third. The ladder also converges as designed - 64, 66, 67, 68 climbing
+toward the true first win (the witness reaches the target at frame 70).
+
+## Scaling with frames
+
+Forward, per frame (level 0): 0.05 s at f30, 0.17 s at f36, 0.57 s at
+f42, 1.65 s at f48, 2.85 s at f54, 5.76 s at f60, 17-24 s at f66-72.
+Lanes 11.7k -> 5.1M. Superlinear until the frontier saturates.
+
+Sweep, whole stage: 20 s at H=60, 39 s at H=65, 160 s at H=70, 276 s at
+H=72 - it grows FASTER than the forward pass and overtakes it (at H=60
+the forward's cumulative cost is ~60 s against the sweep's 20 s; by H=72
+it is 248 s against 276 s). Peak RSS 2.2 -> 15.1 GB over the same range.
+
+## The punchline for the kernel work
+
+Frame execution is ~75-80% of the entire campaign, not just of the
+forward pass: `fwd.interpret` is 79% of the forward stage, `bwdt.replay`
+is 69% of the sweep, and pos-graph is replay end to end. The backward
+sweep re-runs the SAME frames the forward pass ran. So the compiled
+kernel engine - currently wired only into native-probe - is aimed at
+roughly three quarters of campaign wall time, and the sweep is now the
+larger consumer of it. Wiring the kernel into the sweep's replay is
+worth more than any further forward-pass tuning.
+
+Caveat: these are shape-of-curve numbers at a mid-room synthetic target.
+A real room (1,0) campaign runs to H~90-100 where both stages are much
+bigger; the RATIOS are what transfers, not the absolute minutes.
+
 # The kernel engine on the one-frame dev-loop bench (2026-08-18; plans/kernel-plan.md)
 
 Same bench as the tile table below (`--abstract-bench room10-newlua-bench
