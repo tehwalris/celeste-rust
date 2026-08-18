@@ -124,6 +124,16 @@ celeste-rust so both the forward search and the backward sweep can call it;
 `compiled::bridge` is the `State` <-> block translation and is the only
 module that names both.
 
+`FrameEngine::run_frame_chunk` is the same engine as ONE campaign chunk's
+frame body, and `CELESTE_COMPILED_FORWARD=1` puts it there.
+**Default OFF, and that is a measurement, not caution**: it is 1.77x on
+the un-subtracted search and 9-13% SLOWER under `CELESTE_FRONTIER_ONLY`,
+which every ladder run uses. See BENCHMARK_DATA.md, "The compiled engine
+inside the campaign", before doing any more kernel integration work -
+the bottleneck is the per-row fan-out cost, not the plumbing.
+`CELESTE_COMPILED_FORWARD=check` runs both engines and compares row-key
+sets per chunk; that is the gate, and also a test.
+
 The generated code is TWO crates because the engine reads
 `celeste_names::FIELD_NAMES` while the generated kernels read
 `celeste_engine::{Rt2, Col, AV}`; in one crate that is a cycle. Name

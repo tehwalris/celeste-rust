@@ -332,6 +332,9 @@ pub struct AbstractRun {
     /// stay pipeable; a hundred trials' telemetry in the middle of it is
     /// not telemetry, it is corruption. The counters are still tallied.
     quiet: bool,
+    /// The compiled frame body (`CELESTE_COMPILED_FORWARD`); `None` means
+    /// every chunk runs the interpreter. See `CompiledForward`.
+    compiled: Option<&'static CompiledForward>,
 }
 
 /// The previous precision level's result, used to confine this level's
@@ -968,6 +971,153 @@ fn chunk_states(states: Vec<State>) -> Vec<State> {
     out
 }
 
+/// The compiled frame engine (`compiled::FrameEngine`) wired into the
+/// campaign's frame body - P1 stage 3.
+///
+/// Opt-in, because it is not a drop-in: it executes a DIFFERENT program
+/// (`rewrites-compile.jsonl`, the compile-only overlay on top of the
+/// campaign recipe) and returns a different partition of the same rows, so
+/// a compiled run's checkpoints and `g.bin` are isomorphic to an
+/// interpreted run's rather than byte-identical with them. What is claimed,
+/// and what `check` mode verifies chunk by chunk, is that the frame's
+/// output row SET is the same.
+///
+/// * `CELESTE_COMPILED_FORWARD=1` - use it.
+/// * `CELESTE_COMPILED_FORWARD=check` - use it AND run the interpreter on
+///   every chunk as well, comparing canonical row-key sets and aborting on
+///   the first difference. This is the gate; it is roughly 2x the cost of
+///   the interpreted run, so it is for gating and not for campaigns.
+pub struct CompiledForward {
+    engine: crate::compiled::FrameEngine,
+    check: bool,
+}
+
+impl CompiledForward {
+    /// One chunk's frame body. `Ok` carries the compiled engine's output
+    /// states, which are NOT the interpreter's states - see the type doc.
+    fn run_chunk(
+        &self,
+        frame_cfg: &crate::interpreter::fixed_env::PreparedCfg,
+        fixed_env: &crate::interpreter::fixed_env::FixedEnv,
+        state: State,
+    ) -> Result<Vec<State>> {
+        if !self.check {
+            return Ok(self.engine.run_frame_chunk(&state));
+        }
+        let reference: Vec<State> = interpret_prepared_cfg(frame_cfg, state.clone(), fixed_env)
+            .context("frame failed (compiled-forward check: reference side)")?
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        let got = self.engine.run_frame_chunk(&state);
+        let want_keys = self.engine.row_key_set(&reference);
+        let got_keys = self.engine.row_key_set(&got);
+        let missing = want_keys.difference(&got_keys).count();
+        let extra = got_keys.difference(&want_keys).count();
+        if missing != 0 || extra != 0 {
+            anyhow::bail!(
+                "compiled-forward check FAILED on a {}-lane chunk: {} rows the \
+                 interpreter produced are missing from the compiled output, {} \
+                 rows are extra (interpreter {} rows, compiled {} rows)",
+                state.vector_size,
+                missing,
+                extra,
+                want_keys.len(),
+                got_keys.len(),
+            );
+        }
+        Ok(got)
+    }
+}
+
+/// The process's compiled forward engine, if this run opted into one.
+///
+/// Built once - loading and replaying `rewrites-compile.jsonl` compiles the
+/// whole cart, which is seconds. `program` is the CAMPAIGN's program, passed
+/// only so the two can be checked against each other; the engine runs the
+/// compile recipe's.
+fn compiled_forward(program: &Program) -> Result<Option<&'static CompiledForward>> {
+    /// The recipe the kernels and the name tables were generated from. The
+    /// engine MUST execute this program and not the campaign's - see
+    /// `FrameEngine::new`, which carries the story of the afternoon that
+    /// cost.
+    const COMPILE_RECIPE: &str = "rewrites-compile.jsonl";
+
+    let mode = match std::env::var("CELESTE_COMPILED_FORWARD") {
+        Err(_) => return Ok(None),
+        Ok(v) if v == "0" => return Ok(None),
+        Ok(v) => v,
+    };
+    let check = match mode.as_str() {
+        "1" => false,
+        "check" => true,
+        other => anyhow::bail!(
+            "CELESTE_COMPILED_FORWARD={:?}: expected 1, check or 0",
+            other
+        ),
+    };
+
+    // What the compiled path cannot serve, refused up front rather than
+    // silently mis-abstracted. `Rt2::boundary` hardcodes the LEVEL-0 rem
+    // widening and knows nothing about spd buckets, so a refinement rung
+    // running through it would be a DIFFERENT (coarser) abstraction wearing
+    // the rung's name - the exact failure mode the "never widen a field
+    // without a rung that narrows it back" rule exists to prevent.
+    use crate::interpreter::abstraction::{RemPrecision, SpdPrecision};
+    let rem = crate::interpreter::abstraction::rem_precision_from_env();
+    if rem != RemPrecision::Bits(0) {
+        anyhow::bail!(
+            "CELESTE_COMPILED_FORWARD with rem precision {:?}: the compiled \
+             boundary implements level 0 (the full rem widening) only",
+            rem
+        );
+    }
+    let spd = crate::interpreter::abstraction::spd_precision_from_env();
+    if spd != SpdPrecision::Exact {
+        anyhow::bail!(
+            "CELESTE_COMPILED_FORWARD with spd precision {:?}: the compiled \
+             boundary does not implement the spd rung",
+            spd
+        );
+    }
+
+    static ENGINE: std::sync::OnceLock<CompiledForward> = std::sync::OnceLock::new();
+    if ENGINE.get().is_none() {
+        let recipe = super::recipe::Recipe::load(COMPILE_RECIPE)
+            .with_context(|| format!("loading {} (run from the repo root)", COMPILE_RECIPE))?;
+        let (compile_program, _) = super::recipe::build(&recipe)
+            .with_context(|| format!("applying {}", COMPILE_RECIPE))?;
+        // The pm1 partition cells are a PROCESS GLOBAL that
+        // `AbstractRun::start` has already set from the campaign's program,
+        // and `FrameEngine::new` is about to set from the compile one. If
+        // they disagree the second write silently re-merges the campaign's
+        // states by a different key. They agree today because the compile
+        // recipe is the campaign recipe plus a compile-only overlay; hold
+        // it rather than trust it.
+        anyhow::ensure!(
+            compile_program.merge_partition_cells == program.merge_partition_cells,
+            "{} and the campaign recipe disagree on the merge partition cells \
+             ({:?} vs {:?}); the compiled engine would re-key the campaign's merges",
+            COMPILE_RECIPE,
+            compile_program.merge_partition_cells,
+            program.merge_partition_cells,
+        );
+        let engine = crate::compiled::FrameEngine::new_for_start_room(&compile_program)?;
+        let _ = ENGINE.set(CompiledForward { engine, check });
+    }
+    let engine = ENGINE.get().expect("just initialized");
+    anyhow::ensure!(
+        engine.check == check,
+        "CELESTE_COMPILED_FORWARD changed mid-process"
+    );
+    println!(
+        "compiled forward engine ENABLED ({}), program {}",
+        if check { "check mode: both paths, row-key sets compared" } else { "compiled only" },
+        COMPILE_RECIPE
+    );
+    Ok(Some(engine))
+}
+
 impl AbstractRun {
     pub fn start(program: &Program) -> Result<Self> {
         crate::interpreter::vectorize::set_merge_partition_patterns(
@@ -1002,6 +1152,7 @@ impl AbstractRun {
             band: None,
             pos_obs: None,
             quiet: false,
+            compiled: compiled_forward(program)?,
         })
     }
 
@@ -1272,6 +1423,7 @@ impl AbstractRun {
                     state,
                     &mut counters,
                     self.pos_obs.as_ref(),
+                    self.compiled,
                 )?
             };
             if stream {
@@ -1335,6 +1487,7 @@ impl AbstractRun {
         let fixed_env = &self.fixed_env;
         let band = self.band.as_ref();
         let pos_obs = self.pos_obs.as_ref();
+        let compiled = self.compiled;
 
         let mut batch: Vec<State> = Vec::with_capacity(threads);
         let mut queue = input_states.into_iter();
@@ -1365,7 +1518,7 @@ impl AbstractRun {
                                 let mut sc = StreamCounters::default();
                                 let outputs = interpret_state_base(
                                     variants, deopt, frame_cfg, fixed_env, state, &mut ev,
-                                    pos_obs,
+                                    pos_obs, compiled,
                                 )?;
                                 let mut prepared = Vec::new();
                                 for out in outputs {
@@ -1473,6 +1626,7 @@ impl AbstractRun {
         let frame_cfg = &self.frame_cfg;
         let fixed_env = &self.fixed_env;
         let pos_obs = self.pos_obs.as_ref();
+        let compiled = self.compiled;
 
         let mut batch: Vec<State> = Vec::with_capacity(threads);
         let mut queue = input_states.into_iter();
@@ -1496,7 +1650,7 @@ impl AbstractRun {
                                 let mut ev = FrameEventCounters::default();
                                 let outputs = interpret_state_base(
                                     variants, deopt, frame_cfg, fixed_env, state, &mut ev,
-                                    pos_obs,
+                                    pos_obs, compiled,
                                 )?;
                                 Ok((outputs, ev))
                             })
@@ -1545,7 +1699,29 @@ fn interpret_state_base(
     mut state: State,
     counters: &mut FrameEventCounters,
     pos_obs: Option<&super::pos_graph::PosObserver>,
+    compiled: Option<&'static CompiledForward>,
 ) -> Result<Vec<State>> {
+    // What the compiled frame body cannot serve. Refused here rather than
+    // at construction because both are set AFTER `start` and can be turned
+    // on at any point in a run; a check that only ran once would miss
+    // exactly the case it exists for.
+    //
+    // Neither is fundamental. Variants need the compiled path to know the
+    // per-shape program a variant selects; pos-graph recording needs the
+    // kernels to carry the per-lane origin tag, which today just changes
+    // the shape hash so no kernel binds - correct, but worth zero, and
+    // silently worth zero is the worst kind.
+    if compiled.is_some() {
+        if variants.is_some() {
+            anyhow::bail!("CELESTE_COMPILED_FORWARD does not support --variant dispatch");
+        }
+        if pos_obs.is_some() {
+            anyhow::bail!(
+                "CELESTE_COMPILED_FORWARD does not support position-graph recording \
+                 (no kernel binds a tagged shape, so it would be a slow interpreter run)"
+            );
+        }
+    }
     // Tag each input lane with its own cell before the state is consumed.
     // This is the only place that has both sides of a chunk's transition.
     // The variant path sits below the tag and above the record, so a
@@ -1567,16 +1743,27 @@ fn interpret_state_base(
     if let Some(state) = declined {
         match deopt {
             None => {
-                let result = interpret_prepared_cfg(frame_cfg, state, fixed_env)
-                    .context("frame failed")?;
-                new_states.extend(result.into_iter().map(|(s, _)| s));
+                // The compiled engine substitutes for exactly THIS call -
+                // the plain frame body of one chunk, no deopt, no variant
+                // dispatch. Everything around it (the boundary, the
+                // frontier subtract, the band, the row table) stays the
+                // campaign's; see `FrameEngine::run_frame_chunk`.
+                let result = match compiled {
+                    Some(c) => c.run_chunk(frame_cfg, fixed_env, state)?,
+                    None => interpret_prepared_cfg(frame_cfg, state, fixed_env)
+                        .context("frame failed")?
+                        .into_iter()
+                        .map(|(s, _)| s)
+                        .collect(),
+                };
+                new_states.extend(result);
             }
             Some(deopt) if deopt.force => {
                 counters.deopt.0 += 1;
                 counters.deopt.1 += state.vector_size;
                 new_states.extend(run_deopt_frame(deopt, state)?);
             }
-            Some(deopt) if deopt.collect_first => {
+            Some(deopt) if deopt.collect_first && compiled.is_none() => {
                 // Collect-first: every frame runs in collect mode with the
                 // origin column, so a failing state pays one specialized
                 // run instead of two (attempt + retry). The cost is the
@@ -1595,14 +1782,27 @@ fn interpret_state_base(
                 // Panics are caught too - a speculated instruction may
                 // assert on values the verify horizon never showed it
                 // (same failure class `screen_trial` unwinds across).
+                //
+                // The compiled engine takes this arm even when the run
+                // asked for COLLECT-FIRST, because collect-first's whole
+                // mechanism is an origin column injected into the state,
+                // and a per-lane-distinct column changes the shape hash so
+                // that no kernel binds. Collect-first is a bet that
+                // failures are common enough for the retry to cost more
+                // than the column; on a compiled run the column costs the
+                // entire compiled path, so the bet is off. Where the
+                // premises never fire - room (1,0) since task #96 - the
+                // two are the same work anyway.
                 let snapshot = state.clone();
-                let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                    || interpret_prepared_cfg(frame_cfg, state, fixed_env),
-                ));
-                match attempt {
-                    Ok(Ok(result)) => {
-                        new_states.extend(result.into_iter().map(|(s, _)| s))
+                let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    match compiled {
+                        Some(c) => c.run_chunk(frame_cfg, fixed_env, state),
+                        None => interpret_prepared_cfg(frame_cfg, state, fixed_env)
+                            .map(|r| r.into_iter().map(|(s, _)| s).collect()),
                     }
+                }));
+                match attempt {
+                    Ok(Ok(result)) => new_states.extend(result),
                     Ok(Err(err)) => {
                         log_deopt(&mut counters.deopt, &snapshot, &format!("{:#}", err));
                         let (states, plain_lanes) =
@@ -2425,6 +2625,57 @@ mod tests {
         let (states, lanes) = run.deopt_events();
         assert!(states > 0, "the synthetic premise never fired");
         assert!(lanes > 0, "no lanes re-ran under the plain program");
+    }
+
+    /// The compiled frame body produces the interpreter's rows (P1 stage 3).
+    ///
+    /// `CELESTE_COMPILED_FORWARD=check` runs BOTH engines on every chunk and
+    /// compares canonical row-key SETS, failing the step on the first
+    /// difference - so the assertion here is simply that 30 frames run. Set
+    /// equality is the right claim and the only one available: the compiled
+    /// path returns a different PARTITION of the same rows (different block
+    /// count, lane order and heap layout), so `observe_frame` would differ
+    /// for a correct run.
+    ///
+    /// Lane counts are checked against an interpreted baseline on top,
+    /// because a bug that dropped a row from both sides symmetrically would
+    /// pass the key comparison.
+    ///
+    /// Sets a process-global env var and relies on nextest's
+    /// process-per-test isolation, like the other global-state tests here.
+    #[test]
+    fn compiled_forward_reproduces_the_interpreter() {
+        let _partition = crate::interpreter::partition_straddles_test_lock();
+        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
+            || !std::path::Path::new("rewrites.jsonl").exists()
+            || !std::path::Path::new("rewrites-compile.jsonl").exists()
+        {
+            return;
+        }
+        let recipe = crate::rewrite::recipe::Recipe::load("rewrites.jsonl").expect("load recipe");
+        let (program, _) = crate::rewrite::recipe::build(&recipe).expect("build rewritten");
+
+        let frames = 30;
+        let mut baseline = AbstractRun::start(&program).expect("start baseline");
+        let mut want = Vec::new();
+        for _ in 1..=frames {
+            baseline.step().expect("baseline step");
+            want.push(baseline.lane_count());
+        }
+        drop(baseline);
+
+        std::env::set_var("CELESTE_COMPILED_FORWARD", "check");
+        let mut run = AbstractRun::start(&program).expect("start compiled run");
+        assert!(run.compiled.is_some(), "the compiled engine did not engage");
+        for (frame, want) in (1..=frames).zip(want) {
+            run.step().unwrap_or_else(|e| panic!("frame {}: {:#}", frame, e));
+            assert_eq!(
+                run.lane_count(),
+                want,
+                "compiled forward has a different lane count at frame {}",
+                frame
+            );
+        }
     }
 
     /// End-to-end check of the shape-dispatch machinery (`Variant`): run the

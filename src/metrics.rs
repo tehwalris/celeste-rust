@@ -38,6 +38,10 @@ pub fn time<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
 /// "extra": ...}. Failures to write are loud on stderr but never fatal -
 /// metrics must not kill a run that already computed its answer.
 pub fn dump(kind: &str, dir: Option<&std::path::Path>, extra: &[(&str, String)]) {
+    // The compiled frame body's own split, when it was asked for. It sits
+    // INSIDE `fwd.interpret`, so it belongs next to the phase totals rather
+    // than in them.
+    crate::compiled::print_chunk_phase_times();
     let phases = PHASES.lock().unwrap();
     if phases.is_empty() {
         return;

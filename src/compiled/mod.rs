@@ -30,6 +30,130 @@ use crate::rewrite::program::Program;
 pub mod bridge;
 pub mod dispatch;
 
+/// The lane kernels are the compiled engine (plans/kernel-plan.md); chunks
+/// they refuse fall through to the reference. The retired tile engines
+/// (CELESTE_TILE=1 concrete-button tiles, =2 dynamic expand) are gone - the
+/// kernels cover every player class and are ~5x faster
+/// (plans/k4-retirement-plan.md). CELESTE_KERNEL=0 routes everything to the
+/// reference for A/B.
+fn use_kernel() -> bool {
+    std::env::var("CELESTE_KERNEL").map(|v| v != "0").unwrap_or(true)
+}
+
+/// Chunk cap. Cross-chunk dedup at the boundary makes chunking invisible to
+/// the result (batching invariance is the certified doctrine), so this is
+/// purely a cost knob - and pre-dedup INVERTED it. While every emitted row
+/// was materialized, a chunk's mid-frame traffic dominated and small chunks
+/// won; now duplicates die as a hash probe and a bigger chunk simply catches
+/// more of them, so the dedup ratio wins instead. Measured at f35 (min of 5
+/// reps, peak RSS), all gates exact:
+///
+/// ```text
+///   lanes:  64      128     256     512     1024    4096
+///   before: 348 ms  489     584     673     -       -
+///   after:  133 ms  98      91      86      82      85
+///   RSS:    0.99 GB  -      1.12    1.44    2.02    4.82
+/// ```
+///
+/// 256 is the knee: 1.46x over the old default for +13% memory, and the mean
+/// stays as tight as the min (512's does not).
+fn chunk_rows() -> usize {
+    std::env::var("CELESTE_CHUNK_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256)
+}
+
+/// The same cap for `run_frame_chunk`, which has its own knee because its
+/// input is ALREADY a campaign chunk (`CELESTE_MAX_STATE_LANES`, 8,000
+/// under the parallel default) rather than a whole frame. Cutting 8,000
+/// lanes into 256-row pieces pays the kernel's per-chunk fixed costs -
+/// bind, key plan, the `seen` set, `boundary` on the output - 31 times over.
+/// Measured, room (1,0), f50, frontier-only + deopt, wall clock:
+///
+/// ```text
+///   rows:  256     512     1024    2048    8000
+///   wall:  8.71 s  7.81    7.50    7.43    7.89
+/// ```
+///
+/// Flat from 1,024 to 2,048 and up again at the campaign cap itself, where
+/// there is one piece and the dedup no longer sees across pieces.
+fn campaign_chunk_rows() -> usize {
+    std::env::var("CELESTE_CHUNK_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2048)
+}
+
+/// Where `run_frame_chunk`'s time goes, under `CELESTE_CHUNK_PHASE_TIME=1`.
+///
+/// Off by default and gated on a `OnceLock` bool rather than an env read
+/// per chunk, because the chunks are small and there are a lot of them.
+/// Atomics because the campaign runs one chunk per worker thread; the sum
+/// over threads is what the ratios are read off, so contention on five
+/// counters per chunk is acceptable where per-slice counters would not be.
+pub const CHUNK_IMPORT: usize = 0;
+pub const CHUNK_PARTITION: usize = 1;
+pub const CHUNK_RUN: usize = 2;
+pub const CHUNK_MERGE: usize = 3;
+pub const CHUNK_EXPORT: usize = 4;
+const CHUNK_PHASE_NAMES: [&str; 5] = ["import", "partition", "run", "dedup+merge", "export"];
+static CHUNK_NS: [std::sync::atomic::AtomicU64; 5] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+fn chunk_phase_time() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CELESTE_CHUNK_PHASE_TIME").is_some())
+}
+
+struct ChunkTimer(Option<std::time::Instant>);
+
+impl ChunkTimer {
+    fn start() -> Self {
+        ChunkTimer(chunk_phase_time().then(std::time::Instant::now))
+    }
+    fn mark(&mut self, phase: usize) {
+        if let Some(at) = self.0.as_mut() {
+            let now = std::time::Instant::now();
+            CHUNK_NS[phase].fetch_add(
+                (now - *at).as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            *at = now;
+        }
+    }
+}
+
+/// Print and reset the `run_frame_chunk` phase split. A no-op unless
+/// `CELESTE_CHUNK_PHASE_TIME` is set.
+pub fn print_chunk_phase_times() {
+    if !chunk_phase_time() {
+        return;
+    }
+    let ns: Vec<u64> = CHUNK_NS
+        .iter()
+        .map(|a| a.swap(0, std::sync::atomic::Ordering::Relaxed))
+        .collect();
+    let total: u64 = ns.iter().sum();
+    if total == 0 {
+        return;
+    }
+    eprintln!("compiled chunk phases (summed over worker threads):");
+    for (name, n) in CHUNK_PHASE_NAMES.iter().zip(&ns) {
+        eprintln!(
+            "  {:12} {:8.2}s  {:5.1}%",
+            name,
+            *n as f64 / 1e9,
+            100.0 * *n as f64 / total as f64
+        );
+    }
+}
+
 fn boundary_ids() -> runtime2::BoundaryIds {
     let g = |name: &str| gen::global_id(name).unwrap_or_else(|| panic!("no global {}", name));
     let f = |name: &str| gen::field_id(name).unwrap_or_else(|| panic!("no field {}", name));
@@ -133,6 +257,259 @@ impl FrameEngine {
         &self.ids
     }
 
+    /// One frame of ONE campaign chunk: `State -> [State]`.
+    ///
+    /// This is the campaign's entry point (P1 stage 3). `step` owns a whole
+    /// frame - partition, run, boundary, cross-block dedup, k-way merge -
+    /// but the campaign already owns the last three, and they are not
+    /// interchangeable: the campaign's boundary is where the frontier
+    /// subtract, the band filter and the row table's id assignment live,
+    /// and those are proof-critical. So the campaign keeps them, and what
+    /// it hands over is the FRAME BODY - exactly the call this replaces,
+    /// `interpret_prepared_cfg` on one chunk.
+    ///
+    /// Consequences of that boundary, all of which the caller must live
+    /// with:
+    ///
+    /// * The outputs are a MIXTURE. Kernel chunks come back already
+    ///   canonicalized by `Rt2::boundary`; the reference path's come back
+    ///   raw, exactly as the interpreter produced them. That is fine only
+    ///   because the campaign re-applies its own abstraction to everything
+    ///   afterwards and that abstraction is IDEMPOTENT on already-abstract
+    ///   states (the same property gate 2 relies on when it funnels the
+    ///   interpreter's states through `boundary` to compare keys).
+    /// * `Rt2::boundary` hardcodes the LEVEL-0 rem widening, so this path
+    ///   is only valid at `CELESTE_REM_BITS=0`. Checked by the caller, in
+    ///   `AbstractRun::compiled_engine`, and not here, because here there
+    ///   is nothing useful to say if it fails.
+    /// * The output STATES are not the ones the interpreter would have
+    ///   produced - different in number, in lane order and in heap layout.
+    ///   The output row SET is (that is gate 2). So a compiled forward run
+    ///   assigns row ids in a different order than an interpreted one, and
+    ///   its `g.bin` is isomorphic to rather than byte-identical with the
+    ///   interpreted run's.
+    ///
+    /// Serial on purpose: the campaign is already one thread per chunk.
+    pub fn run_frame_chunk(&self, state: &crate::interpreter::state::State) -> Vec<crate::interpreter::state::State> {
+        let mut t = ChunkTimer::start();
+        let block = bridge::import_block(state, self.cart.clone(), self.cache.clone());
+        t.mark(CHUNK_IMPORT);
+        let mut pending: Vec<(runtime2::Rt2, bool)> = self
+            .partition_chunks(vec![block], campaign_chunk_rows())
+            .into_iter()
+            .map(|b| (b, true))
+            .collect();
+        t.mark(CHUNK_PARTITION);
+        let use_kernel = use_kernel();
+        let mut done: Vec<runtime2::Rt2> = Vec::new();
+        let mut out: Vec<crate::interpreter::state::State> = Vec::new();
+        while let Some((block, kernel_ok)) = pending.pop() {
+            if use_kernel && kernel_ok {
+                if dispatch::run_chunk_kernel(&block, &self.ids, &mut done, &mut pending) {
+                    continue;
+                }
+            }
+            // The reference path, but WITHOUT the re-import `step` does:
+            // the campaign wants states, and re-importing only to export
+            // again would be pure loss.
+            out.extend(self.interpret_block(block));
+        }
+        t.mark(CHUNK_RUN);
+        // Dedup and merge the kernel's blocks BEFORE exporting them.
+        //
+        // Not an optimization of the campaign's merge - the campaign merges
+        // again afterwards and would reach the same set either way - but of
+        // the BRIDGE. An 8,000-lane campaign chunk becomes ~31 kernel
+        // chunks of 256 rows, and exporting each one separately builds ~31
+        // whole interpreter heaps where one will do. Measured at f40, 40
+        // frames: exporting per chunk put `fwd.interpret` at 2.17 s, ABOVE
+        // the interpreter's own 1.39 s; the win only appears once the
+        // bridge is crossed once per output group.
+        let keeps = Self::dedup_keeps_serial(&done);
+        let merged = self.regroup_and_merge(done, keeps, &mut |_| {});
+        t.mark(CHUNK_MERGE);
+        out.extend(merged.iter().map(bridge::export_block));
+        t.mark(CHUNK_EXPORT);
+        out
+    }
+
+    /// The canonical row-key SET of some interpreter states, as the
+    /// boundary computes it.
+    ///
+    /// This is gate 2's comparator, exposed: both sides of a comparison
+    /// funnel through the SAME canonicalizer (import, then `boundary`,
+    /// whose widenings are idempotent on already-abstract states), so key
+    /// equality means one engine's surviving row set IS the other's, not
+    /// merely the same size. Set, not sequence: what the search carries
+    /// forward is a set of rows, and neither the order nor the block
+    /// partition is part of the answer.
+    pub fn row_key_set(
+        &self,
+        states: &[crate::interpreter::state::State],
+    ) -> rustc_hash::FxHashSet<(u64, u64)> {
+        // celeste-rust's rustc-hash (1.x), not the engine's (2.x): this is
+        // a comparison set, not one of the row machinery's maps, so the
+        // hasher is an implementation detail and set equality does not
+        // depend on it.
+        let mut keys: rustc_hash::FxHashSet<(u64, u64)> = Default::default();
+        for s in states {
+            if s.vector_size == 0 {
+                continue;
+            }
+            let mut b = bridge::import_block(s, self.cart.clone(), self.cache.clone());
+            b.boundary(&self.ids);
+            keys.extend(b.row_keys.iter().copied());
+        }
+        keys
+    }
+
+    /// Retain each block's surviving lanes, re-partition on the pm1 key and
+    /// k-way merge same-`(shape, pm1)` blocks.
+    ///
+    /// Blocks stay partitioned by the recipe's fork-condition cells instead
+    /// of densifying into one wide block per shape. This is the
+    /// interpreter's fragment representation, and its measured 2-3x edge at
+    /// depth: key-correlated columns stay `Col::U` through storage, merge,
+    /// and the next frame's boundary hashing.
+    fn regroup_and_merge(
+        &self,
+        ran: Vec<runtime2::Rt2>,
+        keeps: Vec<Vec<u32>>,
+        phase: &mut impl FnMut(&str),
+    ) -> Vec<runtime2::Rt2> {
+        let ids = &self.ids;
+        let mut groups: Vec<((u64, u64), Vec<runtime2::Rt2>)> = Vec::new();
+        for (mut sub, keep) in ran.into_iter().zip(keeps) {
+            sub.retain_lanes(&keep);
+            if sub.width == 0 {
+                continue;
+            }
+            for part in sub.partition_pm1(ids) {
+                if std::env::var("CELESTE_KERNEL_MISS").is_ok() {
+                    let mixed = part
+                        .pm1_cells(ids)
+                        .iter()
+                        .filter(|c| !matches!(part.cols[**c as usize], runtime2::Col::U(_)))
+                        .count();
+                    if mixed > 0 {
+                        static ONCE2: std::sync::Once = std::sync::Once::new();
+                        ONCE2.call_once(|| {
+                            eprintln!(
+                                "[partition_pm1] part width {} still has {} mixed pm1 columns; cells {:?}",
+                                part.width,
+                                mixed,
+                                part.pm1_cells(ids)
+                            );
+                            for c in part.pm1_cells(ids) {
+                                let d = match &part.cols[c as usize] {
+                                    runtime2::Col::U(_) => "uniform".to_string(),
+                                    runtime2::Col::N(vs) => {
+                                        let mut s: Vec<String> =
+                                            vs.iter().map(|v| format!("{:?}", v)).collect();
+                                        s.sort();
+                                        s.dedup();
+                                        format!("N {:?}", s)
+                                    }
+                                    runtime2::Col::V(vs) => {
+                                        let mut s: Vec<String> =
+                                            vs.iter().map(|v| format!("{:?}", v)).collect();
+                                        s.sort();
+                                        s.dedup();
+                                        format!("V {:?}", s)
+                                    }
+                                    runtime2::Col::I(_) => "I".to_string(),
+                                };
+                                eprintln!("    cell {}: {}", c, d);
+                            }
+                        });
+                    }
+                }
+                let key = (part.shape_hash, part.pm1_key_hash(ids));
+                match groups.iter_mut().find(|(h, _)| *h == key) {
+                    Some((_, g)) => g.push(part),
+                    None => groups.push((key, vec![part])),
+                }
+            }
+        }
+        phase("retain");
+        let out: Vec<runtime2::Rt2> =
+            groups.into_iter().map(|(_, g)| runtime2::Rt2::merge_many(g)).collect();
+        phase("merge");
+        out
+    }
+
+    /// Cross-block dedup, serial: keep the first occurrence of each row key
+    /// across `ran` in block order. `step`'s 32-shard parallel version is
+    /// the same function - a row's shard is a function of its key, so the
+    /// shards are independent and the surviving SET is the same.
+    fn dedup_keeps_serial(ran: &[runtime2::Rt2]) -> Vec<Vec<u32>> {
+        let mut seen: FxHashMap<(u64, u64), ()> = Default::default();
+        ran.iter()
+            .map(|sub| {
+                let mut keep = Vec::new();
+                for (i, &k) in sub.row_keys.iter().enumerate() {
+                    if let std::collections::hash_map::Entry::Vacant(e) = seen.entry(k) {
+                        e.insert(());
+                        keep.push(i as u32);
+                    }
+                }
+                keep
+            })
+            .collect()
+    }
+
+    /// One frame of `block` through the interpreter, as interpreter states.
+    fn interpret_block(&self, block: runtime2::Rt2) -> Vec<crate::interpreter::state::State> {
+        if std::env::var_os("CELESTE_FALLBACK_ROUNDTRIP").is_some() {
+            bridge::assert_block_round_trips(&block);
+        }
+        let state = bridge::export_block(&block);
+        drop(block);
+        crate::interpreter::glue::interpret_prepared_cfg(&self.frame_cfg, state, &self.fixed_env)
+            .expect("the interpreter fallback failed a frame")
+            .into_iter()
+            .map(|(s, _)| s)
+            .filter(|s| s.vector_size > 0)
+            .collect()
+    }
+
+    /// The pre-partition every path shares: split on `freeze`, then on the
+    /// moving key, then slice to `chunk_rows` lanes.
+    ///
+    /// Splitting on `freeze` up front is what keeps the kernels' premise of
+    /// a class-uniform chunk true - the update-side freeze gate is a real
+    /// per-lane branch (pm1's precedent).
+    fn partition_chunks(&self, blocks: Vec<runtime2::Rt2>, chunk_rows: usize) -> Vec<runtime2::Rt2> {
+        let mut pending = Vec::new();
+        for block in blocks {
+            let freeze_cell = block.globals[self.g_freeze as usize];
+            assert!(freeze_cell != runtime2::NONE);
+            for sub in block.partition_by_cell(freeze_cell) {
+                let parts = match sub.moving_key(&self.ids) {
+                    Some(key) => {
+                        let key = key.clone();
+                        sub.partition_by_key(&key)
+                    }
+                    None => vec![sub],
+                };
+                for part in parts {
+                    if part.width <= chunk_rows {
+                        pending.push(part);
+                    } else {
+                        let n = part.width;
+                        let mut at = 0;
+                        while at < n {
+                            let hi = (at + chunk_rows).min(n);
+                            pending.push(part.slice_lanes(at, hi));
+                            at = hi;
+                        }
+                    }
+                }
+            }
+        }
+        pending
+    }
+
     /// The frame-0 frontier: run `__init` through the interpreter and
     /// import the resulting states as blocks.
     ///
@@ -208,14 +585,7 @@ pub fn step(
     census_total: &mut FxHashMap<&'static str, (u64, u64, u64)>,
 ) -> Vec<runtime2::Rt2> {
     let ids = &self.ids;
-    let g_freeze = self.g_freeze;
-    // The lane kernels are the compiled engine (plans/kernel-plan.md);
-    // chunks they refuse fall through to the reference. The retired tile
-    // engines (CELESTE_TILE=1 concrete-button tiles, =2 dynamic expand)
-    // are gone - the kernels cover every player class and are ~5x faster
-    // (plans/k4-retirement-plan.md). CELESTE_KERNEL=0 routes everything
-    // to the reference for A/B.
-    let use_kernel = std::env::var("CELESTE_KERNEL").map(|v| v != "0").unwrap_or(true);
+    let use_kernel = use_kernel();
     // CELESTE_PHASE_TIME=1: print the per-frame wall split across the
     // serial/parallel phases (goal 7's measurement harness).
     let phase_time = std::env::var("CELESTE_PHASE_TIME").is_ok();
@@ -227,53 +597,7 @@ pub fn step(
         t_mark = std::time::Instant::now();
     };
     let mut ran: Vec<runtime2::Rt2> = Vec::new();
-    let mut pending: Vec<runtime2::Rt2> = Vec::new();
-    // Chunk cap. Cross-chunk dedup at the boundary makes chunking
-    // invisible to the result (batching invariance is the certified
-    // doctrine), so this is purely a cost knob - and pre-dedup INVERTED
-    // it. While every emitted row was materialized, a chunk's mid-frame
-    // traffic dominated and small chunks won; now duplicates die as a
-    // hash probe and a bigger chunk simply catches more of them, so the
-    // dedup ratio wins instead. Measured at f35 (min of 5 reps, peak
-    // RSS), all gates exact:
-    //
-    //   lanes:  64      128     256     512     1024    4096
-    //   before: 348 ms  489     584     673     -       -
-    //   after:  133 ms  98      91      86      82      85
-    //   RSS:    0.99 GB  -      1.12    1.44    2.02    4.82
-    //
-    // 256 is the knee: 1.46x over the old default for +13% memory, and
-    // the mean stays as tight as the min (512's does not).
-    let chunk_rows: usize = std::env::var("CELESTE_CHUNK_ROWS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(256);
-    for block in blocks {
-        let freeze_cell = block.globals[g_freeze as usize];
-        assert!(freeze_cell != runtime2::NONE);
-        for sub in block.partition_by_cell(freeze_cell) {
-            let parts = match sub.moving_key(ids) {
-                Some(key) => {
-                    let key = key.clone();
-                    sub.partition_by_key(&key)
-                }
-                None => vec![sub],
-            };
-            for part in parts {
-                if part.width <= chunk_rows {
-                    pending.push(part);
-                } else {
-                    let n = part.width;
-                    let mut at = 0;
-                    while at < n {
-                        let hi = (at + chunk_rows).min(n);
-                        pending.push(part.slice_lanes(at, hi));
-                        at = hi;
-                    }
-                }
-            }
-        }
-    }
+    let mut pending: Vec<runtime2::Rt2> = self.partition_chunks(blocks, chunk_rows());
     phase("part");
     // Chunks are independent (lane independence is the certified
     // batching-invariance property); run them across threads. Each
@@ -389,71 +713,7 @@ pub fn step(
             .collect()
     };
     phase("dedup");
-    // Group for the k-way merge by (shape, pm1 key): blocks stay
-    // partitioned by the recipe's fork-condition cells instead of
-    // densifying into one wide block per shape. This is the
-    // interpreter's fragment representation (its measured 2-3x edge at
-    // depth): key-correlated columns stay Col::U through storage,
-    // merge, and the next frame's boundary hashing.
-    let mut groups: Vec<((u64, u64), Vec<runtime2::Rt2>)> = Vec::new();
-    for (mut sub, keep) in ran.into_iter().zip(keeps) {
-        sub.retain_lanes(&keep);
-        if sub.width == 0 {
-            continue;
-        }
-        for part in sub.partition_pm1(ids) {
-            if std::env::var("CELESTE_KERNEL_MISS").is_ok() {
-                let mixed = part
-                    .pm1_cells(ids)
-                    .iter()
-                    .filter(|c| !matches!(part.cols[**c as usize], runtime2::Col::U(_)))
-                    .count();
-                if mixed > 0 {
-                    static ONCE2: std::sync::Once = std::sync::Once::new();
-                    ONCE2.call_once(|| {
-                        eprintln!(
-                            "[partition_pm1] part width {} still has {} mixed pm1 columns; cells {:?}",
-                            part.width,
-                            mixed,
-                            part.pm1_cells(ids)
-                        );
-                        for c in part.pm1_cells(ids) {
-                            let d = match &part.cols[c as usize] {
-                                runtime2::Col::U(_) => "uniform".to_string(),
-                                runtime2::Col::N(vs) => {
-                                    let mut s: Vec<String> =
-                                        vs.iter().map(|v| format!("{:?}", v)).collect();
-                                    s.sort();
-                                    s.dedup();
-                                    format!("N {:?}", s)
-                                }
-                                runtime2::Col::V(vs) => {
-                                    let mut s: Vec<String> =
-                                        vs.iter().map(|v| format!("{:?}", v)).collect();
-                                    s.sort();
-                                    s.dedup();
-                                    format!("V {:?}", s)
-                                }
-                                runtime2::Col::I(_) => "I".to_string(),
-                            };
-                            eprintln!("    cell {}: {}", c, d);
-                        }
-                    });
-                }
-            }
-            let key = (part.shape_hash, part.pm1_key_hash(ids));
-            match groups.iter_mut().find(|(h, _)| *h == key) {
-                Some((_, g)) => g.push(part),
-                None => groups.push((key, vec![part])),
-            }
-        }
-    }
-    phase("retain");
-    let out: Vec<runtime2::Rt2> = groups
-        .into_iter()
-        .map(|(_, g)| runtime2::Rt2::merge_many(g))
-        .collect();
-    phase("merge");
+    let out = self.regroup_and_merge(ran, keeps, &mut phase);
     if std::env::var("CELESTE_KERNEL_MISS").is_ok() {
         let mut mixed = 0usize;
         for b in &out {

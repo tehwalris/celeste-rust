@@ -95,7 +95,74 @@ with `--site-slots plans/site-slots-room10-f035.json` - that closes
 the gate to one shape again, so it must come with a census for EVERY
 shape the run visits, or stay off.
 
+# The compiled engine inside the campaign (2026-08-18, P1 stage 3)
+
+`CELESTE_COMPILED_FORWARD=1` replaces the campaign's frame body with
+`compiled::FrameEngine::run_frame_chunk` - kernels where they bind, the
+interpreter where they do not, with the campaign's own boundary, frontier
+subtract, band and row table left in place. `=check` runs both engines on
+every chunk and compares canonical row-key SETS. Room (1,0), 16 threads,
+identical lane counts on every row of every table here.
+
+| f45, NO frontier subtract | wall | peak RSS |
+|---|---|---|
+| campaign, interpreter | 15.64 s | 5.41 GB |
+| campaign, compiled | **8.85 s** | **1.03 GB** |
+| `native-probe --abstract 45`, the engine standalone | 8.74 s | - |
+
+| f55, `CELESTE_FRONTIER_ONLY=1` | interpreter | compiled |
+|---|---|---|
+| chunk cap 4,000 | 13.17 s / 2.09 GB | 12.99 s / 1.77 GB |
+| chunk cap 8,000 (the campaign default) | **11.93 s** / 2.27 GB | 13.44 s / 1.87 GB |
+
+**1.77x on the un-subtracted search, 9-13% SLOWER under the frontier
+subtract - and the ladder runs with the subtract.** The compiled campaign
+at f45 is within 1% of the engine running standalone, so the insertion
+point is not what is costing: the engine is genuinely not faster than the
+interpreter on a frontier-subtracted workload. This refutes the
+`fwd.interpret` 195/248 s projection in the cost breakdown below; do not
+re-plan off that row without re-measuring.
+
+Where the compiled frame body's time goes (f55 frontier-only,
+`CELESTE_CHUNK_PHASE_TIME=1`, summed over worker threads):
+
+```
+  import        0.63s   0.6%      <- the State <-> block bridge is 1.4% total
+  partition     0.31s   0.3%
+  run          85.11s  84.9%
+  dedup+merge  13.31s  13.3%
+  export        0.85s   0.8%
+```
+
+So it is the kernel, and inside the kernel it is the OUTPUT handling, not
+the compute: the compile recipe's `expand_bool` overlay turns the btn
+diamonds into lane expansion, so one row is emitted per (lane, fork
+config, button variant) and pre-deduped. Pre-dedup is load-bearing -
+`CELESTE_PREDEDUP=0` takes that f55 run from 13.4 s to **94.4 s**. Profile
+at f50: `run_class_kernel_steady::{{closure}}` 19.2% of cycles,
+`Rt2::boundary` 6.8%, hashbrown insert 6.1%, `kernel_gen_steady::frame`
+3.1%.
+
+Two real gains, f60 frontier-only: `fwd.merge` 2.47 s -> 1.46 s and
+`fwd.boundary_gather` 0.57 s -> 0.26 s (8,854 fragments over the run vs
+22,193), which is part of P2's prize as a side effect; and peak RSS down
+13-80% depending on mode.
+
+Knobs, both measured: the campaign chunk cap is best at 4,000-8,000 under
+either engine (1M is 2.6x worse - one chunk per frame is no parallelism),
+and the compiled path's INNER chunk defaults to 2,048 rows rather than
+`step`'s 256, because its input is already a campaign chunk (f50: 8.71 s
+at 256, 7.50 at 1024, 7.43 at 2048, 7.89 at 8000).
+
+Refused loudly rather than served wrong: `CELESTE_REM_BITS != 0`, any spd
+rung, `--variant`, and position-graph recording. The first two because
+`Rt2::boundary` implements the level-0 rem widening and nothing else.
+
 # Top-down campaign cost breakdown (2026-08-18, synthetic win)
+
+CAUTION: the `fwd.interpret` share below is what motivated P1, and P1
+stage 3 measured that replacing it with the compiled engine does not help
+under the ladder's configuration. See the section above.
 
 The engine numbers below this section are ONE STAGE of the campaign. This
 section costs the whole pipeline, so the engine work can be priced against

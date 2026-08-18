@@ -40,10 +40,11 @@ queue, because P1's crate split should move only code that survives K4.
 | 3 | **K4 stage 2** block->State exporter + interpreter fallback | DONE | - | one reference, not two; gates f20/25/30/35 exact, cost is noise |
 | 4a | **K4 stage 4 piece 1** stop writing the program body; delete the Engine trait, the scalar runtime, Rt2's execution impl, SplitReq and the concrete probe modes | DONE | - | gen.rs 29,672 -> 3,962 lines; runtime.rs (1,004) gone; name tables byte-identical; gates f20/25/30/35 exact, suite 551/551. Bonus: the crate-wide dead_code allow is gone and `--abstract` now starts from the interpreter's own init |
 | 4b | **K4 stage 4 piece 2 + stage 5** emitter is a pure interning walk; slot subsystem and the consumerless tables deleted | DONE | - | transpile 1,125 -> 449 lines, gen.rs 3,962 -> 236; four name tables byte-identical; gates f20/25/30/35 exact, suite 551/551 |
-| 5 | **P1** crate split + one frame interface (#150) | STAGES 1-2 DONE, stage 3 open | days | the campaign can finally call the kernel; forward AND sweep at once |
-| 5c | **P1 stage 3** actually call `FrameEngine::step` from the forward loop and `bwdt.replay` | | days | the interface exists and is gated, but no campaign code goes through it yet - this is where the 195/248 s and 88/276 s come back |
-| 6 | **K5** kernels for rooms (0,0)/(2,0) | | days | P1's win is room-shaped until this |
-| 7 | **P2** the sweep's merge/regroup third (#151) | | days | 91 s of the sweep's 190 s replay; lands on P1's interface |
+| 5 | **P1** crate split + one frame interface (#150) | DONE | - | the campaign can finally call the kernel; forward AND sweep at once |
+| 5c | **P1 stage 3** the campaign's frame body goes through `FrameEngine::run_frame_chunk` | DONE, and it REFUTES the projection | - | 1.77x / 5.3x less memory without the frontier subtract, **9-13% SLOWER with it** - and the ladder runs with it. Row-key sets equal every chunk, 30-frame test. Default OFF |
+| 5d | **K6** make one emitted row cheaper (the fan-out pre-dedup is 85% of the compiled frame body) | NEW, from 5c's measurement | days | this is what gates every later kernel win; #134's territory |
+| 6 | **K5** kernels for rooms (0,0)/(2,0) | | days | multiplies a factor that 5c measured at ~1.0 under the ladder's own config - do 5d first |
+| 7 | **P2** the sweep's merge/regroup third (#151) | partly free | days | 5c already took `fwd.merge` 2.47 -> 1.46 s at f60 by handing over denser fragments |
 | 8 | **#114** variant dispatch for pos-graph/sweep | | ? | only matters for rooms that use variants - not (1,0) |
 
 Ordering rationale, in one line each:
@@ -55,6 +56,10 @@ Ordering rationale, in one line each:
 - K5 after P1 because the interface is what a new room's kernel plugs
   into; doing it earlier means integrating twice.
 - P2 after P1 for the same reason.
+- **Revised 2026-08-18 by P1 stage 3's measurement:** K5 moved behind a
+  new K6, because a faster kernel for more rooms is worth what the kernel
+  is worth, and under the ladder's real configuration that is currently
+  break-even. See stage 3 below.
 
 ## P0 - pos-graph fusion by default (hours, -46% of level 0)
 
@@ -244,14 +249,99 @@ now builds under celeste-rust's `debug = 1` rather than the probe's
 measures 109.8, i.e. no change. So the interface move itself is free;
 what costs is the ~5% from stage 1's split, already recorded.
 
-### Stage 3: call it from the campaign. NOT STARTED.
+### Stage 3: call it from the campaign. BUILT AND GATED 2026-08-18; the win is NOT where this plan said.
 
-The interface exists and is gated, but nothing in the campaign calls it
-yet. Next: have the forward loop and the sweep's `bwdt.replay` go through
-`FrameEngine::step`, with byte-identical checkpoints and an identical
-`g.bin` as the gates. Coverage stays room-shaped - kernels exist for room
-(1,0)'s player classes only, everything else falls back to the
-interpreter, which is the reference, so that is safe and merely slow.
+`CELESTE_COMPILED_FORWARD=1` puts the compiled engine in the campaign's
+frame body. `=check` runs both engines on every chunk and compares
+canonical row-key sets, aborting on the first difference; that is the
+gate, and it is also a `#[test]`
+(`verify::tests::compiled_forward_reproduces_the_interpreter`, 30 frames).
+
+**The substitution point is the CHUNK, not the frame.** `FrameEngine::step`
+owns partition, run, boundary, dedup and merge, but the campaign already
+owns the last three and they are not interchangeable: the campaign's
+boundary is where the frontier subtract, the band filter and the row
+table's id assignment live, and those are proof-critical. So
+`FrameEngine::run_frame_chunk` is `State -> [State]` and replaces exactly
+`interpret_prepared_cfg` on one chunk. Everything else stays.
+
+Three consequences, all load-bearing:
+
+- The claim is row-SET equality, not state equality. The compiled path
+  returns a different PARTITION of the same rows, so checkpoints are not
+  byte-identical and `g.bin` is isomorphic to rather than equal to an
+  interpreted run's. "Byte-identical checkpoints", which this plan asked
+  for, was never achievable at this insertion point.
+- Kernel blocks are deduped and merged IN BLOCK FORM before export.
+  Without that the bridge is crossed ~31 times per campaign chunk and the
+  frame body costs 2.17 s where the interpreter costs 1.39 s (f40).
+- Collect-first deopt is bypassed on a compiled run in favour of the
+  optimistic arm, because collect-first's mechanism is a per-lane origin
+  column and a per-lane-distinct column changes the shape hash so that no
+  kernel binds.
+
+Still refused, loudly: `--variant`, position-graph recording, and any
+`CELESTE_REM_BITS != 0` or spd rung, because `Rt2::boundary` implements
+the level-0 rem widening and nothing else.
+
+MEASURED, room (1,0), 16 threads, identical lane counts on every row:
+
+| f45, no frontier subtract | wall | peak RSS |
+|---|---|---|
+| campaign, interpreter | 15.64 s | 5.41 GB |
+| campaign, compiled | **8.85 s** | **1.03 GB** |
+| `native-probe --abstract 45` (engine alone, no campaign) | 8.74 s | - |
+
+| f55, `CELESTE_FRONTIER_ONLY=1` | interpreter | compiled |
+|---|---|---|
+| chunk cap 4,000 | 13.17 s / 2.09 GB | 12.99 s / 1.77 GB |
+| chunk cap 8,000 (the campaign default) | **11.93 s** / 2.27 GB | 13.44 s / 1.87 GB |
+
+So: **1.77x and 5.3x less memory on the un-subtracted search, and 9-13%
+SLOWER under the frontier subtract the ladder actually runs.** The
+projected "195 s of 248" does not appear, and the reason is not the
+plumbing. The compiled campaign at f45 lands within 1% of the whole-frame
+engine run standalone, so the chunk-level insertion extracts everything
+the engine has; the engine simply is not faster than the interpreter on a
+frontier-subtracted workload.
+
+Where the time goes, f55 frontier-only, `CELESTE_CHUNK_PHASE_TIME=1`,
+summed over worker threads:
+
+```
+  import        0.63s   0.6%
+  partition     0.31s   0.3%
+  run          85.11s  84.9%
+  dedup+merge  13.31s  13.3%
+  export        0.85s   0.8%
+```
+
+The bridge is 1.4%. The cost is the kernel itself, and inside it the
+OUTPUT handling rather than the compute: the compile recipe's
+`expand_bool` overlay turns the btn diamonds into lane expansion, so the
+kernel materializes one row per (lane, fork config, button variant) and
+pre-dedups. That pre-dedup is not optional - turning it off
+(`CELESTE_PREDEDUP=0`) takes f55 from 13.4 s to 94.4 s - and it is where
+the time is (`run_class_kernel_steady::{{closure}}` 19% of cycles,
+`Rt2::boundary` 6.8%, hashbrown insert 6.1%). The interpreter keeps those
+diamonds as branches and its fragment/COW representation shares structure
+through them.
+
+Two things this DOES buy, visible at f60 frontier-only:
+
+- `fwd.merge` 2.47 s -> 1.46 s and `fwd.boundary_gather` 0.57 s -> 0.26 s,
+  because the compiled path hands the campaign fewer, denser fragments
+  (8,854 vs 22,193 over the run). That is P2's prize, partly realized as
+  a side effect.
+- Peak RSS down 13-80% depending on the mode.
+
+**Conclusion, which re-prices the rest of the queue:** the campaign is not
+kernel-plumbing-bound, it is kernel-throughput-bound, and specifically
+bound by the fan-out the compile recipe deliberately creates. K5 (more
+rooms' kernels) multiplies a factor that is currently ~1.0 under the
+ladder's own configuration. The thing worth doing before K5 is making one
+row cheaper to emit and dedup - which is task #134's territory, not P1's.
+Default stays OFF.
 
 ### Why the split had to happen first
 
