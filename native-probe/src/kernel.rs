@@ -20,6 +20,26 @@ use celeste_rust::pico8_num::{Pico8Num as P8, Pico8NumInterval as IV};
 
 pub const W: usize = 16;
 
+pub use crate::runtime2::{cell_mix, mix64};
+
+/// Which of a kernel's `KEY_CELLS` boundary canonicalizes before hashing,
+/// as bit masks in KEY_CELLS order. Built per chunk from `Rt2::mark_walk`,
+/// because "which cell is the player's rem" is a fact about the heap walk,
+/// not about the shape witness the kernel was emitted against.
+///
+/// - `rem`: boundary replaces the cell with ONE wide interval, so it makes
+///   no per-lane contribution and the key skips it entirely;
+/// - `det`: boundary clamps the value at 0 (dash_effect_time), so the key
+///   clamps before mixing.
+///
+/// Getting these wrong costs dedup ratio, never soundness - a key that
+/// separates two rows boundary would merge just materializes both.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct KeyPlan {
+    pub rem: u64,
+    pub det: u64,
+}
+
 /// One num column slice: 16 rows.
 pub type ZN = [P8; W];
 /// One interval column slice: low/high planes.

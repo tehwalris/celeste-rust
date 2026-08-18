@@ -1540,6 +1540,37 @@ fn run_chunk_kernel(
     false
 }
 
+/// Pre-dedup rows out of the kernel's registers before materializing
+/// them (plans/dedup-on-the-fly-plan.md). `CELESTE_PREDEDUP=0` restores
+/// the materialize-everything path for A/B measurement.
+fn prededup_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CELESTE_PREDEDUP").map(|v| v != "0").unwrap_or(true))
+}
+
+/// Which boundary canonicalizations apply to this chunk's key cells.
+/// `mark_walk` answers it from the heap walk; the kernel only knows cell
+/// ids. Computed on the INPUT block and re-checked against the OUTPUT
+/// block before the boundary, because skipping a cell that is NOT a rem
+/// cell downstream would merge rows that differ.
+fn key_plan(
+    b: &runtime2::Rt2,
+    ids: &runtime2::BoundaryIds,
+    key_cells: &[u32],
+) -> kernel::KeyPlan {
+    let (rem, det) = b.mark_walk(ids);
+    let mut plan = kernel::KeyPlan::default();
+    for (j, c) in key_cells.iter().enumerate() {
+        if rem.contains(c) {
+            plan.rem |= 1 << j;
+        }
+        if det.contains(c) {
+            plan.det |= 1 << j;
+        }
+    }
+    plan
+}
+
 /// Which class kernels are enabled (bit 0 steady, 1 dash, 2 frozen).
 /// Default all; `CELESTE_KERNEL_CLASSES=steady,frozen` restricts, and
 /// the disabled classes fall through to the reference path.
@@ -1574,6 +1605,12 @@ static KERNEL_HITS: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// Kernel rows [materialized by append_out, surviving within-chunk dedup].
+static KROWS: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
 pub fn print_kernel_hits() {
     let v: Vec<u64> = KERNEL_HITS
         .iter()
@@ -1583,6 +1620,18 @@ pub fn print_kernel_hits() {
         eprintln!(
             "kernel lanes: steady {} dash {} frozen {} missed {}",
             v[0], v[1], v[2], v[3]
+        );
+    }
+    let rows: Vec<u64> = KROWS
+        .iter()
+        .map(|a| a.swap(0, std::sync::atomic::Ordering::Relaxed))
+        .collect();
+    if rows[0] > 0 {
+        eprintln!(
+            "kernel rows: materialized {} -> {} after within-chunk dedup ({:.1}:1)",
+            rows[0],
+            rows[1],
+            rows[0] as f64 / rows[1].max(1) as f64
         );
     }
 }
@@ -1601,6 +1650,14 @@ fn $fname(
     let Some(uni) = $m::bind(chunk) else { return false };
     let g = $m::G { cart: &chunk.cart, cache: &chunk.cache };
     let mut acc = $m::acc_init(chunk);
+    let plan = key_plan(chunk, ids, $m::KEY_CELLS);
+    // Pre-dedup: a chunk emits one row per (lane, fork config, button
+    // variant), and at f35 8.3 of every 9 of those are duplicates that
+    // boundary would throw away AFTER they were materialized and hashed.
+    // Key them straight out of the kernel's output registers instead and
+    // materialize only the first occurrence.
+    let mut seen: rustc_hash::FxHashSet<(u64, u64)> = Default::default();
+    let mut keys = [(0u64, 0u64); kernel::W];
     let mut deopt_rows: std::collections::BTreeSet<u32> = Default::default();
     let mut bd_hit = false;
     let mut lo = 0usize;
@@ -1619,9 +1676,20 @@ fn $fname(
                     deopt_rows.insert((lo + i) as u32);
                 }
             }
-            let live = kout.valid & !kout.deopt & width_mask;
+            let mut live = kout.valid & !kout.deopt & width_mask;
             if live == 0 {
                 return;
+            }
+            if prededup_on() {
+                $m::row_keys(chunk, lo, n, osh, kout, &plan, &mut keys);
+                for i in 0..n {
+                    if live & (1 << i) != 0 && !seen.insert(keys[i]) {
+                        live &= !(1 << i);
+                    }
+                }
+                if live == 0 {
+                    return;
+                }
             }
             let mut ug = false; // uniform-output cross-config guard
             $m::append_out(&mut acc, chunk, lo, n, live, osh, kout, &mut ug);
@@ -1635,7 +1703,23 @@ fn $fname(
         return false; // uniform premise failed: whole chunk to the reference
     }
     if acc.width > 0 {
+        // Dedup-census (plans/dedup-on-the-fly-plan.md): how much of the
+        // 45:1 duplication is reachable WITHIN a chunk? That is the
+        // ceiling for deduping before materializing.
+        let before = acc.width as u64;
+        // The key plan was read off the INPUT block; hold that it still
+        // describes the OUTPUT block, since a stale rem bit would merge
+        // rows that boundary keeps apart.
+        let out_plan = key_plan(&acc, ids, $m::KEY_CELLS);
+        assert!(
+            out_plan.rem == plan.rem && out_plan.det == plan.det,
+            "key plan changed across the frame: in {:?} out {:?}",
+            plan,
+            out_plan
+        );
         acc.boundary(ids);
+        KROWS[0].fetch_add(before, std::sync::atomic::Ordering::Relaxed);
+        KROWS[1].fetch_add(acc.width as u64, std::sync::atomic::Ordering::Relaxed);
         done.push(acc);
     }
     if !deopt_rows.is_empty() {

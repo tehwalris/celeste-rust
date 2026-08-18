@@ -35,6 +35,35 @@ use crate::runtime::{
 
 pub type P8 = Pico8Num;
 
+/// Row-key primitives. Shared with the generated kernels, whose per-chunk
+/// pre-dedup keys must collapse exactly what `boundary`'s keys collapse -
+/// so they mix the same way rather than approximating it.
+#[inline]
+pub fn mix64(mut x: u64) -> u64 {
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+#[inline]
+pub fn av_code(v: AV) -> u64 {
+    match v {
+        AV::Num(n) => 1u64 << 56 | n.to_bits() as u64,
+        AV::Ival(a, b) => 2u64 << 56 | (a.to_bits() as u64) << 24 ^ mix64((b.to_bits() as u64) << 1),
+        AV::Bool(b) => 3u64 << 56 | b as u64,
+        AV::UBool => 4u64 << 56,
+        AV::Str(x) => 5u64 << 56 | x as u64,
+        AV::Nil => 6u64 << 56,
+        AV::Ptr(p) => 7u64 << 56 | p as u64,
+        AV::NilPtr => 8u64 << 56,
+    }
+}
+
+#[inline]
+pub fn cell_mix(c: u64, v: AV, seed: u64) -> u64 {
+    mix64(seed ^ c.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ av_code(v))
+}
+
 /// One lane's abstract value. `Copy`, 12 bytes + tag.
 /// Mirrors `interpreter::value::Value` scalar variants plus intervals.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -1753,7 +1782,7 @@ impl Rt2 {
     }
 
     /// The player objects' relevant cells (mark_heap, abstraction.rs:134).
-    fn mark_walk(&self, ids: &BoundaryIds) -> (Vec<u32>, Vec<u32>) {
+    pub fn mark_walk(&self, ids: &BoundaryIds) -> (Vec<u32>, Vec<u32>) {
         let mut rem_cells = Vec::new();
         let mut det_cells = Vec::new();
         let Some(arr) = self.global_target(ids.g_objects) else {
@@ -2137,31 +2166,8 @@ impl Rt2 {
         // Uniform cells fold ONCE into a block partial - sound because the
         // sum is independent of which cells happen to be uniform in this
         // block, so keys agree across blocks with different splits.
-        #[inline]
-        fn mix64(mut x: u64) -> u64 {
-            x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            x ^ (x >> 31)
-        }
-        #[inline]
-        fn av_code(v: AV) -> u64 {
-            match v {
-                AV::Num(n) => 1u64 << 56 | n.to_bits() as u64,
-                AV::Ival(a, b) => {
-                    2u64 << 56 | (a.to_bits() as u64) << 24 ^ mix64((b.to_bits() as u64) << 1)
-                }
-                AV::Bool(b) => 3u64 << 56 | b as u64,
-                AV::UBool => 4u64 << 56,
-                AV::Str(x) => 5u64 << 56 | x as u64,
-                AV::Nil => 6u64 << 56,
-                AV::Ptr(p) => 7u64 << 56 | p as u64,
-                AV::NilPtr => 8u64 << 56,
-            }
-        }
-        #[inline]
-        fn cell_mix(c: u64, v: AV, seed: u64) -> u64 {
-            mix64(seed ^ c.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ av_code(v))
-        }
+        // (mix64/av_code/cell_mix live at module scope: the kernels' own
+        // pre-dedup keys are built from the SAME primitives.)
         let w = self.width;
         let mut part1: u64 = shape_hash;
         let mut part2: u64 = 0xa076_1d64_78bd_642f ^ shape_hash;
