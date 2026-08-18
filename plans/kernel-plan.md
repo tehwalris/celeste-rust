@@ -171,3 +171,38 @@ Hill-climb list (next): disasm the suffix (verify zmm vectorization),
 skip suffixes for all-invalid configs (integer-spd lanes have empty
 fragment 1), parallelize slices across cores in the bench, cross-suffix
 sharing of button-independent Z ops, then K3 integration.
+
+## Continuation state (context boundary ~03:00)
+
+Where things stand exactly:
+- Certified + committed: steady overlay (b4d1060), K0 census (ad2847e),
+  K1 emitter (977e209), K2 gate (c12ab4c), K2 forks (9b6ffa4). All
+  pushed to census. Working tree may carry only this note.
+- Regen chain (after any emitter/recipe change):
+  1. `./native-probe/target/release/native-probe --emit-shape
+     ~/celeste-checkpoints/room10-newlua-bench 35 native-probe/steady-shape.json`
+  2. `./target/release/transpile --recipe rewrites-trace10-steady.jsonl
+     --kernel native-probe/steady-shape.json native-probe/src/kernel_gen.rs`
+  3. `cd native-probe && cargo build --release` (~4 min: 64 suffixes)
+  4. `./target/release/native-probe --kernel-bench
+     ~/celeste-checkpoints/room10-newlua-bench 35 --reps 5`
+- Current numbers: gate EXACT/zero-deopt; 1347 ms single-thread
+  = 183.9 ns/row-input-frame (4 fork configs x 64 suffixes).
+
+NEXT ACTIONS in order:
+1. Hill-climb (K2): profile ONLY the timing loop (add a
+   CELESTE_KERNEL_GATE=0 skip or perf --delay; perf data in
+   ~/perf-scratch/). Expected wins: suffix work for all-invalid
+   configs already skipped - check config-validity distribution;
+   hoist cache.solid_map lookups (24 tile_flag_at sites, uniform w/h);
+   cross-suffix sharing of button-independent Z ops; check ymm vs zmm
+   (znver4 prefer-width) via -C prefer-vector-width=512 experiment.
+2. K3: (shape, rows) -> [(shape, rows)] engine: kernel front on steady
+   class, everything else + deopt rows -> frame_step; wire into the
+   abstract-bench as a third engine mode; gate 2 + timing.
+3. K4: retire Rt2-as-reference ambitions per Philippe (interpreter is
+   THE reference at system level; native-side frame_step stays only as
+   long as the native bench needs it), delete Rt3 TILE=1 variant path
+   if TILE=2 + kernel supersede it. No dead code.
+4. K5 if time: room (2,0) campaign on the new engine.
+Suite + verify gates before any push that touches the main crate.
