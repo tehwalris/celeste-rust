@@ -1200,7 +1200,7 @@ fn render(e: &Emit, out_path: &str) -> Result<()> {
          //\n\
          // The STEADY-CLASS lane kernel: shape (player), pm1 freeze=0 dash_time=0.\n\
          // Shared prefix per 16-row slice, 64 monomorphized button suffixes.\n\
-         #![allow(unused_variables, unused_mut, clippy::all)]\n\
+         #![allow(unused_variables, unused_mut, unused_imports, clippy::all)]\n\
          use crate::kernel::*;\n\
          use celeste_rust::pico8_num::{{Pico8Num as P8, Pico8NumInterval as IV}};\n\
          use celeste_rust::cart_data::CartData;\n\

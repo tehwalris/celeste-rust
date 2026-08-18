@@ -999,10 +999,11 @@ fn frame_step(
                             }
                         }
                         if tile_mode > 0 {
-                            let out = match tile_mode {
-                                2 | 3 => run_chunk_dynexp(&block, ids),
-                                _ => run_chunk_tiled(&block, ids),
-                            };
+                            // TILE=1 (per-variant monomorphized tiles) is
+                            // RETIRED (plans/kernel-plan.md K4): superseded
+                            // by dynexp and the kernel. Every tile mode uses
+                            // the dynexp path as its tile fallback.
+                            let out = run_chunk_dynexp(&block, ids);
                             if let Some(out) = out {
                                 done.push(out);
                                 continue;
@@ -1972,48 +1973,6 @@ fn run_abstract_bench(dir: &str, frame: u32, reps: u32) {
     print_gate_rejects();
     runtime3::TILE_CENSUS.print();
 }
-
-/// Tile-mode chunk executor (plans/columnar-engine.md "Rt3"): split the
-/// chunk into TILE-lane tiles; per tile, loop the 64 input variants with
-/// concrete buttons and the counter-replay tape for straddles; raw-concat
-/// every pass's surviving lanes (structures must agree - checked) and run
-/// ONE boundary per chunk. Returns None if any tile bails or structures
-/// diverge (the caller reruns the whole chunk on the reference engine).
-fn run_chunk_tiled(
-    chunk: &runtime2::Rt2,
-    ids: &runtime2::BoundaryIds,
-) -> Option<runtime2::Rt2> {
-    // The slot binding (and the zero-divergence premise behind the tile
-    // kernel) is scoped to the census SHAPE. Off-shape blocks (spawn,
-    // death, other rooms) run the reference engine.
-    if gen::N_SLOTS > 0 && chunk.shape_hash != gen::SLOT_SHAPE {
-        record_gate_reject(chunk.shape_hash);
-        return None;
-    }
-    let g_btn = gen::global_id("__button_states").expect("no __button_states");
-    let mut acc: Option<(runtime2::Rt2, u64)> = None;
-    let mut at = 0usize;
-    while at < chunk.width {
-        let hi = (at + runtime3::TILE).min(chunk.width);
-        let template: runtime3::Rt3<0> = runtime3::Rt3::from_rt2(chunk, at, hi);
-        for byte in 0u8..64 {
-            if !run_tile_variant_dyn(&template, g_btn, byte, &mut acc) {
-                return None;
-            }
-        }
-        at = hi;
-    }
-    let (mut acc, _) = acc?;
-    acc.boundary(ids);
-    Some(acc)
-}
-
-/// Dynamic-expand chunk executor (CELESTE_TILE=2): ONE boundary row per
-/// tile; the lane axis carries the input fan-out - `expand` doubles it
-/// in-tile (1 -> 64), so everything before the first button read (the
-/// obj.move physics, spikes, collision) runs ONCE per row as uniform
-/// ops, shared by all 64 input variants. Straddle splits still use the
-/// counter-replay tape. No set_buttons, no per-variant monomorphization.
 fn run_chunk_dynexp(
     chunk: &runtime2::Rt2,
     ids: &runtime2::BoundaryIds,
@@ -2132,77 +2091,6 @@ fn print_bails() {
         println!("tile bails by site:");
         for (site, n) in rows.iter().take(10) {
             println!("  {:>10}  {}", n, site);
-        }
-    }
-}
-
-/// Monomorphic dispatch over the JUMP and DASH bits (4 variants): the
-/// two buttons that gate the largest code regions fold to compile-time
-/// constants; the direction buttons stay concrete runtime data (their
-/// expand sites see a concrete Bool - still exact, just unfolded).
-/// The full 64-way monomorphization was measured to explode compile
-/// time (>10 min); revisit with a separate codegen crate if the
-/// 4-variant win says it is worth it.
-fn run_tile_variant_dyn(
-    template: &runtime3::Rt3<0>,
-    g_btn: u32,
-    byte: u8,
-    acc: &mut Option<(runtime2::Rt2, u64)>,
-) -> bool {
-    match byte & 0x30 {
-        0x00 => run_tile_variant::<0x00>(template, g_btn, byte, acc),
-        0x10 => run_tile_variant::<0x10>(template, g_btn, byte, acc),
-        0x20 => run_tile_variant::<0x20>(template, g_btn, byte, acc),
-        0x30 => run_tile_variant::<0x30>(template, g_btn, byte, acc),
-        _ => unreachable!(),
-    }
-}
-
-fn run_tile_variant<const B: u8>(
-    template: &runtime3::Rt3<0>,
-    g_btn: u32,
-    byte: u8,
-    acc: &mut Option<(runtime2::Rt2, u64)>,
-) -> bool {
-    let mut tape: Vec<u8> = Vec::new();
-    loop {
-        let mut rt3: runtime3::Rt3<B> = template.clone().into_variant::<B>();
-        rt3.set_buttons(g_btn, byte);
-        rt3.tape = tape.clone();
-        rt3.begin_pass();
-        rt3.bind_slots();
-        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            gen::call_fn(&mut rt3, gen::FN_FRAME, &[], &[]);
-        }));
-        match ok {
-            Ok(_) => {
-                rt3.writeback_slots();
-                let fp = rt3.structure_fp();
-                match acc {
-                    None => {
-                        let mut seed = rt3.seed_rt2();
-                        rt3.append_into(&mut seed);
-                        *acc = Some((seed, fp));
-                    }
-                    Some((seed, afp)) => {
-                        if *afp != fp {
-                            return false;
-                        }
-                        rt3.append_into(seed);
-                    }
-                }
-                if !rt3.advance_tape() {
-                    return true;
-                }
-                tape = rt3.tape.clone();
-            }
-            Err(payload) => match payload.downcast_ref::<runtime3::TileBail>() {
-                Some(b) => {
-                    record_bail(b.0);
-                    return false;
-                }
-                None => std::panic::resume_unwind(payload),
-            },
         }
     }
 }
