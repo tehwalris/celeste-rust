@@ -211,14 +211,36 @@ Gates: f20/25/30/35 all "row-key SET EQUAL (gate 2) OK"; suite 551/551.
 Times f20 1.44 / f25 1.37 / f30 15.52 / f35 107.2 ms (min of 3), i.e.
 unchanged at depth - f35 was 105.4 before, which is run-to-run noise.
 
-Piece (2) - turning `Gen`'s emitter into a pure interning walk, ~540
-lines of `format!` - is still open, and so is the question piece (2)
-should answer: SITE_INFO, BRANCH_INFO, SLOT_CELLS, SLOT_SHAPE, N_SLOTS,
-FN_INIT and FN_FRAME now have **no consumer at all**. They are emitted
-and read by nobody. Deleting them from the emitter is safe for the
-interning order (they are outputs of the walk, not inputs to it), but it
-changes the gate's baseline, so do it as its own commit and re-snapshot
-the four tables that remain.
+## Stage 4 piece (2) + stage 5: DONE 2026-08-18
+
+`Gen`'s emitter is now `walk_instruction` / `walk_function`: an arm per
+instruction kind that interns what that instruction's emitted form used
+to intern, and nothing else. `src/bin/transpile/main.rs` went 1,125 ->
+449 lines and gen.rs 3,962 -> **236**.
+
+Deleted with it: `SlotMap` and the whole `--site-slots` / `--emit-slots`
+slot-binding subsystem (load, whole-program escape analysis, dense
+numbering - it fed `HAS_SLOTS`, which died with the Engine trait),
+`phi_copies`, `collect_locals`, `button_of_expand`, `l()`, and the
+emission of the tables that had no consumer left: SITE_INFO,
+BRANCH_INFO, SLOT_CELLS, SLOT_SHAPE, N_SLOTS, FN_INIT, FN_FRAME.
+
+Three checks were deliberately KEPT even though nothing is emitted from
+them, because each one catches a program this toolchain cannot
+represent, and here is the cheapest place to say so: a closure targeting
+an unknown function, a builtin outside the ABI or at an arity with no
+lowering, and a program missing `__init` or `__frame`.
+
+The gate held exactly as designed: STRINGS / GLOBAL_NAMES / FIELD_NAMES /
+FN_NAMES came out **byte-identical** (cmp, 224 lines) across both the
+walk rewrite and the table deletion, so the interning order did not move.
+Gates f20/25/30/35 exact; suite 551/551. Times 1.39 / 1.32 / 14.94 /
+110.98 ms - f35 spans 105.4-111.0 ms across the three runs today, which
+is the noise band, not a trend.
+
+Net for stage 4: **~30,300 generated lines and ~2,500 hand-written ones
+deleted**, with the compiled path (kernels) and the reference path
+(interpreter) both untouched and byte-exact throughout.
 
 ## Where this sits in the overall queue
 

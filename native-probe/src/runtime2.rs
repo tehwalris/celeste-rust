@@ -546,8 +546,8 @@ impl Rt2 {
     /// over live value cells, dedup, compact columns to survivors.
     /// The block's shape key: a hash of the (canonical) structure and
     /// globals. Meaningful for comparison only when the structure is in
-    /// canonical order (post-boundary, or a BFS import). The slot
-    /// binding (gen::SLOT_SHAPE) is scoped to ONE shape by this key.
+    /// canonical order (post-boundary, or a BFS import). It is what
+    /// scopes a kernel to the shape it was generated for.
     pub fn shape_hash_of(&self) -> u64 {
         use std::hash::Hasher;
         let mut h = rustc_hash::FxHasher::default();

@@ -1,24 +1,29 @@
-//! IR -> Rust transpiler for the native-compile probe (task #124,
-//! plans/native-probe.md).
+//! The name-table generator, and the kernel emitter.
 //!
-//! Emits `native-probe/src/gen.rs`: one Rust `fn` per `FunDef` of the plain
-//! executable program (the exact program `concrete_run` interprets), lowered
-//! for a single concrete lane. Blocks become a `loop { match b }` state
-//! machine, phis are destructed into parallel copies on the edges, calls
-//! dispatch through a generated `match` on dense function ids. All value
-//! semantics live in `native-probe/src/runtime.rs` (hand-written, with
-//! file:line pointers to the interpreter code each op mirrors).
+//! Writes `native-probe/src/gen.rs`, which is now ~230 lines of TABLES:
+//! `STRINGS`, `GLOBAL_NAMES`, `FIELD_NAMES`, `FN_NAMES` and the two
+//! lookups over them. Their numbering is the side effect of a walk over
+//! every function's blocks in emission order (see `walk_instruction`) -
+//! `FIELD_NAMES`' order in particular is the canonical field ordering the
+//! boundary hashes, so the gate on any change here is that the tables come
+//! out byte-identical.
 //!
-//! The generated crate is the measurement instrument; hex-exactness against
-//! `concrete_run` is the gate that makes its numbers mean anything.
+//! It used to emit a whole PROGRAM as well: one Rust `fn` per `FunDef`,
+//! blocks as a `loop { match b }` state machine, phis destructed on the
+//! edges, calls dispatched through a generated `match` on dense fn ids -
+//! 29,672 lines running over the `Engine` trait. That engine is retired
+//! (plans/k4-retirement-plan.md): the class kernels are the compiled path
+//! and the celeste-rust interpreter is the fallback, so a third executor
+//! was only a third thing to keep in agreement. `kernel_recon` and the
+//! `kernel` module - the actual emitters for the class kernels - are what
+//! survived the deletion, along with this walk.
 
 mod kernel;
 
-use std::collections::{BTreeSet, HashMap};
-use std::fmt::Write as _;
+use std::collections::HashMap;
 
 use anyhow::{anyhow, bail, Context, Result};
-use celeste_rust::ir::{BinaryOp, Block, FunDef, Instruction, LocalId, Terminator, UnaryOp};
+use celeste_rust::ir::{FunDef, Instruction, Terminator};
 use celeste_rust::rewrite::print::blocks_in_order;
 use celeste_rust::rewrite::program::Program;
 
@@ -62,162 +67,9 @@ impl Interner {
     }
 }
 
-fn l(id: LocalId) -> String {
-    format!("l{}", usize::from(id))
-}
-
-/// Slot binding loaded from a census `--emit-slots` dump: sites (keyed by
-/// (fn name, instruction id) - stable across regenerations) whose result
-/// is a fixed canonical boundary cell. See plans/columnar-engine.md
-/// "Slot compilation".
-struct SlotMap {
-    /// (fn, iid) -> slot index.
-    of_site: HashMap<(String, usize), u32>,
-    /// Canonical boundary cell id per slot.
-    cells: Vec<u32>,
-    /// Slots disqualified by the escape analysis (any use of a bound
-    /// site's result other than Load/Store/Kill means the pointer
-    /// escapes; the CELL then has an access path outside the slot
-    /// binding, so every site of that cell reverts to the generic path).
-    bad: std::collections::HashSet<u32>,
-    /// Original slot -> dense eligible-slot index. Bad slots get None
-    /// and MUST NOT be bound at runtime: their cells are mutated by the
-    /// generic path mid-tile, so a writeback would clobber them.
-    dense: Vec<Option<u32>>,
-    /// Canonical cell per DENSE slot (what gen.rs SLOT_CELLS emits).
-    dense_cells: Vec<u32>,
-    /// Canonical shape hash of the census states: the slot cell ids are
-    /// only meaningful on this shape; runtimes must deopt off-shape.
-    shape_hash: u64,
-}
-
-impl SlotMap {
-    fn load(path: &str) -> Result<SlotMap> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("read slot map {}", path))?;
-        let json: serde_json::Value = serde_json::from_str(&text)?;
-        let mut of_site = HashMap::new();
-        let mut cells = Vec::new();
-        for slot in json["slots"].as_array().context("slot map: no slots array")? {
-            let k = slot["slot"].as_u64().context("slot id")? as u32;
-            assert_eq!(k as usize, cells.len(), "slot ids must be dense and ordered");
-            cells.push(slot["cell"].as_u64().context("slot cell")? as u32);
-            for site in slot["sites"].as_array().context("slot sites")? {
-                let fn_name = site["fn"].as_str().context("site fn")?.to_string();
-                let iid = site["iid"].as_u64().context("site iid")? as usize;
-                let prev = of_site.insert((fn_name, iid), k);
-                assert!(prev.is_none(), "duplicate site in slot map");
-            }
-        }
-        Ok(SlotMap {
-            of_site,
-            cells,
-            bad: Default::default(),
-            dense: Vec::new(),
-            dense_cells: Vec::new(),
-            shape_hash: json["shape_hash"]
-                .as_u64()
-                .context("slot map: no shape_hash (regenerate with --emit-slots)")?,
-        })
-    }
-
-    /// After `analyze`: number the surviving slots densely.
-    fn finalize(&mut self) {
-        for (k, &cell) in self.cells.iter().enumerate() {
-            if self.bad.contains(&(k as u32)) {
-                self.dense.push(None);
-            } else {
-                self.dense.push(Some(self.dense_cells.len() as u32));
-                self.dense_cells.push(cell);
-            }
-        }
-    }
-
-    /// Whole-program escape analysis: disqualify the slot of any bound
-    /// site whose result local is used as anything but Load source /
-    /// Store target / Kill hint (Kill is a liveness no-op on every
-    /// probe engine, and slot engines see a nil there). Also checks
-    /// every mapped site exists (stale-map detection).
-    fn analyze(&mut self, program: &Program) {
-        let mut seen = 0usize;
-        for (_, fun) in program.functions.iter() {
-            let fn_name = fun.name.as_str();
-            // Locals defined by bound sites in this function.
-            let mut site_local: HashMap<LocalId, u32> = HashMap::new();
-            for (_, block) in blocks_in_order(&fun.cfg) {
-                for (id, instr) in &block.instructions {
-                    if matches!(
-                        instr,
-                        Instruction::GetField { .. } | Instruction::GetIndex { .. }
-                    ) {
-                        if let Some(&k) =
-                            self.of_site.get(&(fn_name.to_string(), usize::from(*id)))
-                        {
-                            site_local.insert(*id, k);
-                            seen += 1;
-                        }
-                    }
-                }
-            }
-            if site_local.is_empty() {
-                continue;
-            }
-            for (_, block) in blocks_in_order(&fun.cfg) {
-                for (_, instr) in &block.instructions {
-                    match instr {
-                        Instruction::Load { source } => {
-                            let _ = source; // Load through the pointer: fine.
-                        }
-                        Instruction::Store { target, source } => {
-                            // Writing THROUGH the pointer is fine; storing
-                            // the pointer AS A VALUE escapes it.
-                            let _ = target;
-                            if let Some(&k) = site_local.get(source) {
-                                self.bad.insert(k);
-                            }
-                        }
-                        Instruction::Kill { .. } => {}
-                        other => {
-                            for used in other.get_used_locals() {
-                                if let Some(&k) = site_local.get(&used) {
-                                    self.bad.insert(k);
-                                }
-                            }
-                        }
-                    }
-                }
-                for used in block.terminator.1.get_used_locals() {
-                    if let Some(&k) = site_local.get(&used) {
-                        self.bad.insert(k);
-                    }
-                }
-            }
-        }
-        assert_eq!(
-            seen,
-            self.of_site.len(),
-            "slot map has sites the program does not (stale map? regenerate with --emit-slots)"
-        );
-    }
-}
-
 struct Gen {
-    /// Name of the function currently being emitted (assert diagnostics).
+    /// Name of the function being walked (assert diagnostics).
     current_fn: String,
-    /// Defining instruction per local of the current function (static
-    /// chain walks, e.g. expand -> button resolution).
-    defs: HashMap<LocalId, Instruction>,
-    /// Slot binding (None without --site-slots).
-    slots: Option<SlotMap>,
-    /// Locals of the CURRENT function holding an eligible bound site's
-    /// result -> slot index (loads/stores through them become slot ops).
-    local_slot: HashMap<LocalId, u32>,
-    /// (kind, fn name, interned field id or 0) per get_field/get_index
-    /// site, in site-id order - the gap census's site table.
-    site_info: Vec<(&'static str, String, u32, usize)>,
-    /// (fn name, block label) per conditional-branch site (SIMD
-    /// divergence census).
-    branch_info: Vec<String>,
     strings: Interner,
     globals: Interner,
     fields: Interner,
@@ -228,14 +80,6 @@ struct Gen {
 }
 
 impl Gen {
-    /// The DENSE slot for a site of the current function, if bound and
-    /// eligible.
-    fn slot_of(&self, iid: usize) -> Option<u32> {
-        let s = self.slots.as_ref()?;
-        let k = *s.of_site.get(&(self.current_fn.clone(), iid))?;
-        s.dense[k as usize]
-    }
-
     fn builtin_id(name: &str) -> Result<u32> {
         BUILTIN_NAMES
             .iter()
@@ -244,526 +88,94 @@ impl Gen {
             .ok_or_else(|| anyhow!("no builtin id for {:?}", name))
     }
 
-    /// The locals a function mentions anywhere (defs, uses, args, captures).
-    fn collect_locals(fun: &FunDef) -> BTreeSet<usize> {
-        let mut out: BTreeSet<usize> = BTreeSet::new();
-        for id in fun.capture_ids.iter() {
-            out.insert(usize::from(*id));
-        }
-        for id in fun.arg_ids.iter().flatten() {
-            out.insert(usize::from(*id));
-        }
-        for (_, block) in blocks_in_order(&fun.cfg) {
-            for (id, instr) in &block.instructions {
-                out.insert(usize::from(*id));
-                for used in instr.get_used_locals() {
-                    out.insert(usize::from(used));
-                }
-                if let Instruction::Phi { branches } = instr {
-                    for (_, src) in branches {
-                        out.insert(usize::from(*src));
-                    }
-                }
-            }
-            for used in block.terminator.1.get_used_locals() {
-                out.insert(usize::from(used));
-            }
-        }
-        out
-    }
-
-    /// Parallel phi copies for the edge `pred -> target`. `pred_label` is
-    /// None for the entry block, whose label never appears in `named`; the
-    /// matching phi branch is found by elimination against the labels of
-    /// the target's OTHER predecessors.
-    fn phi_copies(
-        target: &Block,
-        pred_label: Option<&str>,
-        named_pred_labels: &BTreeSet<String>,
-        fn_name: &str,
-    ) -> Result<String> {
-        let mut copies: Vec<(LocalId, LocalId)> = Vec::new();
-        for (dst, instr) in &target.instructions {
-            let Instruction::Phi { branches } = instr else {
-                break; // phis lead the block (ir.rs split_block_phi_instructions)
-            };
-            let src = match pred_label {
-                Some(label) => {
-                    let matches: Vec<_> = branches
-                        .iter()
-                        .filter(|(b, _)| b.as_str() == label)
-                        .collect();
-                    match matches.as_slice() {
-                        [(_, src)] => *src,
-                        _ => bail!(
-                            "{}: phi %{} has {} branches for pred {:?}",
-                            fn_name,
-                            usize::from(*dst),
-                            matches.len(),
-                            label
-                        ),
-                    }
-                }
-                None => {
-                    // Entry edge: the one branch whose label is not any
-                    // named predecessor's label.
-                    let candidates: Vec<_> = branches
-                        .iter()
-                        .filter(|(b, _)| !named_pred_labels.contains(b.as_str()))
-                        .collect();
-                    match candidates.as_slice() {
-                        [(_, src)] => *src,
-                        _ => bail!(
-                            "{}: phi %{}: cannot resolve the entry edge \
-                             ({} candidate branches, named preds {:?})",
-                            fn_name,
-                            usize::from(*dst),
-                            candidates.len(),
-                            named_pred_labels
-                        ),
-                    }
-                }
-            };
-            copies.push((*dst, src));
-        }
-        if copies.is_empty() {
-            return Ok(String::new());
-        }
-        // Parallel semantics: all sources read before any destination is
-        // written (a phi's source may be another phi's destination).
-        let mut out = String::new();
-        for (i, (_, src)) in copies.iter().enumerate() {
-            write!(out, "let __t{} = {}; ", i, l(*src)).unwrap();
-        }
-        for (i, (dst, _)) in copies.iter().enumerate() {
-            write!(out, "{} = __t{}; ", l(*dst), i).unwrap();
-        }
-        Ok(out)
-    }
-
-    /// Statically resolve which button an `expand` site reads: walk the
-    /// def chain expand <- load <- get_index(_, k_NAME+1) <- ... <-
-    /// get_global "k_NAME". Returns the button BIT (the k_* value the
-    /// harness Lua assigns, which is also the set_buttons array position).
-    fn button_of_expand(defs: &HashMap<LocalId, Instruction>, value: LocalId) -> Option<u32> {
-        const BITS: [(&str, u32); 6] = [
-            ("k_left", 0),
-            ("k_right", 1),
-            ("k_up", 2),
-            ("k_down", 3),
-            ("k_jump", 4),
-            ("k_dash", 5),
-        ];
-        let mut seen = 0;
-        let mut stack = vec![value];
-        while let Some(id) = stack.pop() {
-            seen += 1;
-            if seen > 64 {
-                return None;
-            }
-            match defs.get(&id)? {
-                Instruction::GetGlobal { name, .. } => {
-                    if let Some((_, bit)) = BITS.iter().find(|(n, _)| n == name) {
-                        return Some(*bit);
-                    }
-                }
-                Instruction::Load { source } => stack.push(*source),
-                Instruction::GetIndex { index, .. } => stack.push(*index),
-                Instruction::BinaryOp { left, right, .. } => {
-                    stack.push(*left);
-                    stack.push(*right);
-                }
-                _ => {}
-            }
-        }
-        None
-    }
-
-    fn emit_instruction(&mut self, id: LocalId, instr: &Instruction, out: &mut String) -> Result<()> {
-        let d = l(id);
+    /// Intern the names one instruction mentions.
+    ///
+    /// This used to emit that instruction as Rust. It does not any more -
+    /// nothing consumes a generated program body - but the WALK has to
+    /// stay, because the name tables are its side effect: `STRINGS`,
+    /// `GLOBAL_NAMES` and `FIELD_NAMES` are numbered in the order this
+    /// traversal first meets each name, and `FIELD_NAMES`' order is the
+    /// canonical field ordering the boundary hashes. Reorder the walk and
+    /// you get a different shape hash, a different row key, a different
+    /// search - silently.
+    ///
+    /// So the shape of the match is deliberate: an arm per instruction
+    /// kind, in the same order, interning exactly what its emitted form
+    /// used to. An arm that interns nothing is still an arm, so that a
+    /// new instruction kind cannot slip through as "nothing to do".
+    fn walk_instruction(&mut self, instr: &Instruction) -> Result<()> {
         match instr {
             Instruction::Phi { .. } => unreachable!("phis are destructed on edges"),
-            Instruction::Alloc => writeln!(out, "{} = rt.alloc_nil();", d)?,
-            Instruction::GetGlobal { name, create_if_missing } => {
-                let g = self.globals.intern(name);
-                writeln!(out, "{} = rt.get_global({}, {}); // {}", d, g, create_if_missing, name)?;
+            Instruction::GetGlobal { name, .. } => {
+                self.globals.intern(name);
             }
-            Instruction::Load { source } => match self.local_slot.get(source) {
-                Some(&k) => writeln!(
-                    out,
-                    "{} = if E::HAS_SLOTS {{ rt.slot_get({}) }} else {{ rt.load({}) }};",
-                    d,
-                    k,
-                    l(*source)
-                )?,
-                None => writeln!(out, "{} = rt.load({});", d, l(*source))?,
-            },
-            Instruction::Store { target, source } => match self.local_slot.get(target) {
-                Some(&k) => writeln!(
-                    out,
-                    "if E::HAS_SLOTS {{ rt.slot_set({}, {}) }} else {{ rt.store({}, {}) }};",
-                    k,
-                    l(*source),
-                    l(*target),
-                    l(*source)
-                )?,
-                None => writeln!(out, "rt.store({}, {});", l(*target), l(*source))?,
-            },
-            Instruction::StoreEmptyTable { target } => {
-                writeln!(out, "rt.store_empty_table({});", l(*target))?;
+            Instruction::GetField { field, .. } => {
+                self.fields.intern(field);
             }
-            Instruction::StoreClosure { target, fun_def, captures } => {
-                let f = *self
-                    .fn_ids
-                    .get(fun_def.as_str())
-                    .ok_or_else(|| anyhow!("StoreClosure of unknown fn {:?}", fun_def))?;
-                let caps: Vec<String> = captures.iter().map(|c| l(*c)).collect();
-                writeln!(
-                    out,
-                    "rt.store_closure({}, {}, &[{}]); // {}",
-                    l(*target),
-                    f,
-                    caps.join(", "),
-                    fun_def.as_str()
-                )?;
-            }
-            Instruction::GetField { receiver, field, create_if_missing } => {
-                let f = self.fields.intern(field);
-                let site = self.site_info.len() as u32;
-                self.site_info.push(("field", self.current_fn.clone(), f, usize::from(id)));
-                let generic = format!(
-                    "rt.get_field({}, {}, {}, {})",
-                    l(*receiver),
-                    f,
-                    create_if_missing,
-                    site
-                );
-                match self.slot_of(usize::from(id)) {
-                    Some(k) => {
-                        self.local_slot.insert(id, k);
-                        writeln!(
-                            out,
-                            "{} = if E::HAS_SLOTS {{ rt.c_nil() }} else {{ {} }}; // .{} slot {}",
-                            d, generic, field, k
-                        )?;
-                    }
-                    None => writeln!(out, "{} = {}; // .{}", d, generic, field)?,
-                }
-            }
-            Instruction::GetIndex { receiver, index, create_if_missing } => {
-                let site = self.site_info.len() as u32;
-                self.site_info.push(("index", self.current_fn.clone(), 0, usize::from(id)));
-                let generic = format!(
-                    "rt.get_index({}, {}, {}, {})",
-                    l(*receiver),
-                    l(*index),
-                    create_if_missing,
-                    site
-                );
-                match self.slot_of(usize::from(id)) {
-                    Some(k) => {
-                        self.local_slot.insert(id, k);
-                        writeln!(
-                            out,
-                            "{} = if E::HAS_SLOTS {{ rt.c_nil() }} else {{ {} }}; // slot {}",
-                            d, generic, k
-                        )?;
-                    }
-                    None => writeln!(out, "{} = {};", d, generic)?,
-                }
-            }
-            Instruction::NumberConstant { value } => {
-                let bits = value.to_bits();
-                writeln!(
-                    out,
-                    "{} = rt.c_num({}, {}); // {:?}",
-                    d,
-                    (bits >> 16) as i16,
-                    bits as u16,
-                    value
-                )?;
-            }
-            Instruction::BoolConstant { value } => writeln!(out, "{} = rt.c_bool({});", d, value)?,
             Instruction::StringConstant { value } => {
-                let s = self.strings.intern(value);
-                writeln!(out, "{} = rt.c_str({}); // {:?}", d, s, value)?;
+                self.strings.intern(value);
             }
-            Instruction::NilConstant => writeln!(out, "{} = rt.c_nil();", d)?,
-            Instruction::Call { closure, args } => {
-                let args: Vec<String> = args.iter().map(|a| l(*a)).collect();
-                writeln!(
-                    out,
-                    "{} = call_value(rt, {}, &[{}], {:?});",
-                    d,
-                    l(*closure),
-                    args.join(", "),
-                    format!("{} %{}", self.current_fn, usize::from(id))
-                )?;
-            }
-            Instruction::CallBuiltin { callee, name, args } => {
-                let bi = Self::builtin_id(name)?;
-                write!(out, "rt.assert_builtin({}, {}); ", l(*callee), bi)?;
-                let a: Vec<String> = args.iter().map(|x| l(*x)).collect();
-                let call = match (name.as_str(), a.as_slice()) {
-                    ("min", [x, y]) => format!("rt.bi_min({}, {})", x, y),
-                    ("max", [x, y]) => format!("rt.bi_max({}, {})", x, y),
-                    ("abs", [x]) => format!("rt.bi_abs({})", x),
-                    ("flr", [x]) => format!("rt.bi_flr({})", x),
-                    ("sin", [x]) => format!("rt.bi_sin({})", x),
-                    ("mget", [x, y]) => format!("rt.bi_mget({}, {})", x, y),
-                    ("tile_flag_at", [x, y, w, h, f]) => {
-                        format!("rt.bi_tile_flag_at({}, {}, {}, {}, {})", x, y, w, h, f)
-                    }
-                    _ => bail!("CallBuiltin {:?} with {} args has no direct lowering", name, a.len()),
-                };
-                writeln!(out, "{} = {};", d, call)?;
-            }
-            Instruction::UnaryOp { op, arg } => {
-                let m = match op {
-                    UnaryOp::Minus => "un_minus",
-                    UnaryOp::Not => "un_not",
-                    UnaryOp::Hash => "un_hash",
-                };
-                writeln!(out, "{} = rt.{}({});", d, m, l(*arg))?;
-            }
-            Instruction::BinaryOp { left, op, right } => {
-                let m = match op {
-                    BinaryOp::Plus => "op_add",
-                    BinaryOp::Minus => "op_sub",
-                    BinaryOp::Star => "op_mul",
-                    BinaryOp::Slash => "op_div",
-                    BinaryOp::Percent => "op_rem",
-                    BinaryOp::Caret => "op_pow",
-                    BinaryOp::TwoEqual => "eq",
-                    BinaryOp::TildeEqual => "ne",
-                    BinaryOp::LessThan => "lt",
-                    BinaryOp::LessThanEqual => "le",
-                    BinaryOp::GreaterThan => "gt",
-                    BinaryOp::GreaterThanEqual => "ge",
-                    BinaryOp::TwoDots => "concat",
-                };
-                writeln!(out, "{} = rt.{}({}, {});", d, m, l(*left), l(*right))?;
-            }
-            Instruction::Select { condition, if_true, if_false } => {
-                writeln!(
-                    out,
-                    "{} = rt.select({}, {}, {});",
-                    d,
-                    l(*condition),
-                    l(*if_true),
-                    l(*if_false)
-                )?;
-            }
-            Instruction::Kill { .. } => {
-                let used: Vec<String> = instr.get_used_locals().into_iter().map(l).collect();
-                writeln!(out, "rt.kill(&[{}]);", used.join(", "))?;
-            }
-            Instruction::AssertClosure { value, fun_def, captures } => {
-                let f = *self
-                    .fn_ids
+            // Not interning, but still checked: a closure target that is
+            // not a known function, or a builtin outside the ABI, is a
+            // program this toolchain cannot represent, and it should say
+            // so here rather than produce tables that look fine.
+            Instruction::StoreClosure { fun_def, .. } | Instruction::AssertClosure { fun_def, .. } => {
+                self.fn_ids
                     .get(fun_def.as_str())
-                    .ok_or_else(|| anyhow!("AssertClosure of unknown fn {:?}", fun_def))?;
-                let caps: Vec<String> = captures.iter().map(|c| l(*c)).collect();
-                writeln!(out, "rt.assert_closure({}, {}, &[{}], {:?});", l(*value), f, caps.join(", "), format!("{} %{}", self.current_fn, usize::from(id)))?;
+                    .ok_or_else(|| anyhow!("closure of unknown fn {:?}", fun_def))?;
             }
-            Instruction::AssertPointer { value } => {
-                writeln!(out, "rt.assert_pointer({}, {:?});", l(*value), format!("{} %{}", self.current_fn, usize::from(id)))?;
+            Instruction::CallBuiltin { name, args, .. } => {
+                Self::builtin_id(name)?;
+                let arity_ok = matches!(
+                    (name.as_str(), args.len()),
+                    ("min", 2) | ("max", 2) | ("abs", 1) | ("flr", 1) | ("sin", 1)
+                        | ("mget", 2) | ("tile_flag_at", 5)
+                );
+                if !arity_ok {
+                    bail!("CallBuiltin {:?} with {} args has no direct lowering", name, args.len());
+                }
             }
-            Instruction::AssertValueCell { target } => {
-                writeln!(out, "rt.assert_value_cell({}, {:?});", l(*target), format!("{} %{}", self.current_fn, usize::from(id)))?;
-            }
-            Instruction::AssertTrue { value } => writeln!(out, "rt.assert_true({}, {:?});", l(*value), format!("{} %{}", self.current_fn, usize::from(id)))?,
-            Instruction::Expand { value } => match Self::button_of_expand(&self.defs, *value) {
-                Some(bit) => writeln!(
-                    out,
-                    "{} = rt.expand_btn::<{}>({});",
-                    d,
-                    bit,
-                    l(*value)
-                )?,
-                None => writeln!(out, "{} = rt.expand({});", d, l(*value))?,
-            },
+            Instruction::Alloc
+            | Instruction::Load { .. }
+            | Instruction::Store { .. }
+            | Instruction::StoreEmptyTable { .. }
+            | Instruction::GetIndex { .. }
+            | Instruction::NumberConstant { .. }
+            | Instruction::BoolConstant { .. }
+            | Instruction::NilConstant
+            | Instruction::Call { .. }
+            | Instruction::UnaryOp { .. }
+            | Instruction::BinaryOp { .. }
+            | Instruction::Select { .. }
+            | Instruction::Kill { .. }
+            | Instruction::AssertPointer { .. }
+            | Instruction::AssertValueCell { .. }
+            | Instruction::AssertTrue { .. }
+            | Instruction::Expand { .. } => {}
         }
         Ok(())
     }
 
-    fn emit_function(&mut self, fn_id: u32, fun: &FunDef) -> Result<String> {
+    /// Walk one function's blocks in emission order, interning as it goes.
+    fn walk_function(&mut self, fun: &FunDef) -> Result<()> {
         let fn_name = fun.name.as_str().to_string();
         self.current_fn = fn_name.clone();
-        self.local_slot.clear();
-        self.defs = fun
-            .cfg
-            .iter_blocks()
-            .flat_map(|b| b.instructions.iter().cloned())
-            .collect();
-        let blocks = blocks_in_order(&fun.cfg);
         assert!(
             !fun.cfg.named.keys().any(|k| k.as_str() == "__entry"),
             "{}: a named block collides with the entry pseudo-label",
             fn_name
         );
-        // Label -> block index ("__entry" is index 0 by construction).
-        let index_of: HashMap<&str, usize> = blocks
-            .iter()
-            .enumerate()
-            .map(|(i, (label, _))| (label.as_str(), i))
-            .collect();
-        // Predecessor labels per target index (named preds only; the entry
-        // block has no label and is handled by elimination in phi_copies).
-        let mut named_pred_labels: Vec<BTreeSet<String>> = vec![BTreeSet::new(); blocks.len()];
-        for (i, (label, block)) in blocks.iter().enumerate() {
-            let mut note = |target: &str| {
-                let t = index_of[target];
-                if i != 0 {
-                    named_pred_labels[t].insert(label.clone());
-                }
-            };
-            match &block.terminator.1 {
-                Terminator::Return { .. } => {}
-                Terminator::UnconditionalBranch { target } => note(target.as_str()),
-                Terminator::ConditionalBranch { true_target, false_target, .. } => {
-                    note(true_target.as_str());
-                    note(false_target.as_str());
-                }
-            }
-        }
-
-        // Local scoping: a single-def local used only inside its own
-        // block is declared INLINE (`let lN = ...`) so LLVM can keep it
-        // in a register. The old scheme - fn-scope `let mut` for every
-        // local - put ~3200 temporaries on one huge stack frame, and
-        // the profile showed f_15's self time dominated by stack
-        // reloads of those E::V values. Phi targets/sources, captures
-        // and args stay fn-scope (multi-assigned or cross-block).
-        let mut upfront: BTreeSet<usize> = BTreeSet::new();
-        let mut def_blk: HashMap<usize, usize> = HashMap::new();
-        for id in fun.capture_ids.iter() {
-            upfront.insert(usize::from(*id));
-        }
-        for id in fun.arg_ids.iter().flatten() {
-            upfront.insert(usize::from(*id));
-        }
-        for (bi, (_, block)) in blocks.iter().enumerate() {
-            for (id, instr) in &block.instructions {
-                if let Instruction::Phi { branches } = instr {
-                    upfront.insert(usize::from(*id));
-                    for (_, src) in branches {
-                        upfront.insert(usize::from(*src));
-                    }
-                    continue;
-                }
-                let prev = def_blk.insert(usize::from(*id), bi);
-                assert!(prev.is_none(), "{}: %{} defined twice", fn_name, usize::from(*id));
-            }
-        }
-        let mut used_outside: BTreeSet<usize> = BTreeSet::new();
-        for (bi, (_, block)) in blocks.iter().enumerate() {
-            let mark = |id: LocalId, used_outside: &mut BTreeSet<usize>| {
-                let id = usize::from(id);
-                if def_blk.get(&id) != Some(&bi) {
-                    used_outside.insert(id);
-                }
-            };
+        // blocks_in_order, not `cfg.named`'s hash order: this is the
+        // traversal the tables are numbered by.
+        for (_, block) in blocks_in_order(&fun.cfg) {
             for (_, instr) in &block.instructions {
                 if matches!(instr, Instruction::Phi { .. }) {
                     continue;
                 }
-                for u in instr.get_used_locals() {
-                    mark(u, &mut used_outside);
-                }
-            }
-            for u in block.terminator.1.get_used_locals() {
-                mark(u, &mut used_outside);
+                self.walk_instruction(instr)?;
             }
         }
-        let inline_locals: BTreeSet<usize> = def_blk
-            .keys()
-            .copied()
-            .filter(|id| !upfront.contains(id) && !used_outside.contains(id))
-            .collect();
-
-        let mut out = String::new();
-        writeln!(out, "/// `{}`", fn_name)?;
-        writeln!(out, "pub fn f_{}<E: Engine>(rt: &mut E, caps: &[E::V], args: &[E::V]) -> E::V {{", fn_id)?;
-        for id in Self::collect_locals(fun) {
-            if !inline_locals.contains(&id) {
-                writeln!(out, "    let mut l{}: E::V = rt.c_nil();", id)?;
-            }
-        }
-        for (i, cap) in fun.capture_ids.iter().enumerate() {
-            writeln!(out, "    {} = caps[{}];", l(*cap), i)?;
-        }
-        for (i, arg) in fun.arg_ids.iter().enumerate() {
-            if let Some(arg) = arg {
-                // Missing arguments pad with Nil (core_interpreter.rs:762).
-                writeln!(out, "    {} = match args.get({}) {{ Some(v) => *v, None => rt.c_nil() }};", l(*arg), i)?;
-            }
-        }
-        writeln!(out, "    let mut b: u32 = 0;")?;
-        writeln!(out, "    loop {{ match b {{")?;
-        for (i, (label, block)) in blocks.iter().enumerate() {
-            writeln!(out, "    {} => {{ // {}", i, label)?;
-            let mut body = String::new();
-            for (id, instr) in &block.instructions {
-                if matches!(instr, Instruction::Phi { .. }) {
-                    continue;
-                }
-                if inline_locals.contains(&usize::from(*id)) {
-                    // Block-scoped single-def local: `let lN = ...`.
-                    let mut one = String::new();
-                    self.emit_instruction(*id, instr, &mut one)?;
-                    // Statement instructions (Store/Kill/asserts) carry
-                    // an id but assign nothing - leave those untouched.
-                    let pat = format!("{} = ", l(*id));
-                    if let Some(at) = one.find(&pat) {
-                        one.insert_str(at, "let ");
-                    }
-                    body.push_str(&one);
-                } else {
-                    self.emit_instruction(*id, instr, &mut body)?;
-                }
-            }
-            let pred_label = if i == 0 { None } else { Some(label.as_str()) };
-            let edge = |target: &str| -> Result<String> {
-                let t = index_of[target];
-                let copies = Self::phi_copies(
-                    blocks[t].1,
-                    pred_label,
-                    &named_pred_labels[t],
-                    &fn_name,
-                )?;
-                Ok(format!("{}b = {};", copies, t))
-            };
-            match &block.terminator.1 {
-                Terminator::Return { value } => match value {
-                    Some(v) => writeln!(body, "return {};", l(*v))?,
-                    None => writeln!(body, "return rt.c_nil();")?,
-                },
-                Terminator::UnconditionalBranch { target } => {
-                    writeln!(body, "{} continue;", edge(target.as_str())?)?;
-                }
-                Terminator::ConditionalBranch { condition, true_target, false_target } => {
-                    let bsite = self.branch_info.len() as u32;
-                    self.branch_info.push(format!("{} @{}", fn_name, label));
-                    writeln!(
-                        body,
-                        "if rt.truthy_b({}, {}) {{ {} }} else {{ {} }} continue;",
-                        l(*condition),
-                        bsite,
-                        edge(true_target.as_str())?,
-                        edge(false_target.as_str())?
-                    )?;
-                }
-            }
-            for line in body.lines() {
-                writeln!(out, "        {}", line)?;
-            }
-            writeln!(out, "    }}")?;
-        }
-        writeln!(out, "    _ => unreachable!(),")?;
-        writeln!(out, "    }} }}")?;
-        writeln!(out, "}}")?;
-        Ok(out)
+        Ok(())
     }
 }
 
@@ -909,7 +321,6 @@ fn main() -> Result<()> {
     let mut rewritten = false;
     let mut recipe_path = "rewrites.jsonl".to_string();
     let mut out_path = "native-probe/src/gen.rs".to_string();
-    let mut site_slots: Option<String> = None;
     let mut kernel_recon_flag = false;
     let mut kernel_out: Option<(String, String)> = None;
     let mut args = std::env::args().skip(1);
@@ -927,12 +338,6 @@ fn main() -> Result<()> {
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("--recipe needs a path"))?;
                 rewritten = true;
-            }
-            "--site-slots" => {
-                site_slots = Some(
-                    args.next()
-                        .ok_or_else(|| anyhow::anyhow!("--site-slots needs a path"))?,
-                );
             }
             other => out_path = other.to_string(),
         }
@@ -964,36 +369,9 @@ fn main() -> Result<()> {
         return kernel::emit_kernel(&program, &witness, &out);
     }
 
-    let slots = match &site_slots {
-        Some(path) => {
-            let mut map = SlotMap::load(path)?;
-            map.analyze(&program);
-            map.finalize();
-            let n_sites = map.of_site.len();
-            let n_bad_sites = map
-                .of_site
-                .values()
-                .filter(|k| map.bad.contains(k))
-                .count();
-            eprintln!(
-                "site-slots: {} of {} slots eligible ({} sites bound, {} reverted by escape analysis)",
-                map.dense_cells.len(),
-                map.cells.len(),
-                n_sites - n_bad_sites,
-                n_bad_sites
-            );
-            Some(map)
-        }
-        None => None,
-    };
 
     let mut gen = Gen {
         current_fn: String::new(),
-        defs: HashMap::new(),
-        slots,
-        local_slot: HashMap::new(),
-        site_info: Vec::new(),
-        branch_info: Vec::new(),
         strings: Interner::default(),
         globals: Interner::default(),
         fields: Interner::default(),
@@ -1015,30 +393,19 @@ fn main() -> Result<()> {
         gen.fields.intern(name);
     }
 
-    // The walk still RUNS, and its output is still thrown away on purpose.
-    //
-    // gen.rs no longer carries a program body - the interpreter is the only
-    // reference implementation of a frame (K4 stage 2) and the kernels are
-    // the only compiled one - but the name tables above are a SIDE EFFECT of
-    // this walk: `emit_function` is what interns strings, globals, fields,
-    // sites and branches, in the order it meets them. FIELD_NAMES in
-    // particular is the canonical field ordering the boundary hashes, so a
-    // walk that visits in a different order silently produces a different
-    // shape hash, a different row key and a different search.
-    //
-    // So: keep the walk, drop the text. Turning the emitter into a pure
-    // interning walk is a separate change with its own gate (regenerate and
-    // require the name-table section byte-identical) - doing it here would
-    // mean two candidate causes for any table that moved.
-    for (i, (_, fun)) in program.functions.iter().enumerate() {
-        let code = gen
-            .emit_function(i as u32, fun)
-            .with_context(|| format!("emit {}", fun.name.as_str()))?;
-        drop(code);
+    // The tables below are the SIDE EFFECT of this walk (see
+    // `walk_instruction`), so the walk stays even though nothing is
+    // emitted from it any more.
+    for (_, fun) in program.functions.iter() {
+        gen.walk_function(fun)
+            .with_context(|| format!("walk {}", fun.name.as_str()))?;
     }
 
-    let fn_init = gen.fn_ids["__init"];
-    let fn_frame = gen.fn_ids["__frame"];
+    // Not emitted any more (nothing dispatches on a dense fn id), but
+    // still looked up: a program without __init or __frame is not the
+    // game, and this is the cheapest place to say so.
+    gen.fn_ids["__init"];
+    gen.fn_ids["__frame"];
 
     let mut out = String::new();
     out.push_str("// GENERATED by `cargo run --release --bin transpile` in the parent repo.\n");
@@ -1063,43 +430,6 @@ fn main() -> Result<()> {
     out.push_str(&str_array("GLOBAL_NAMES", &gen.globals.names));
     out.push_str(&str_array("FIELD_NAMES", &gen.fields.names));
     out.push_str(&str_array("FN_NAMES", &gen.fn_names));
-    out.push_str("/// (kind, fn, interned field id, instruction id) per site.\n");
-    out.push_str("pub static SITE_INFO: &[(&str, &str, u32, u32)] = &[\n");
-    for (kind, fn_name, f, iid) in &gen.site_info {
-        out.push_str(&format!("    ({:?}, {:?}, {}, {}),\n", kind, fn_name, f, iid));
-    }
-    out.push_str("];\n");
-    out.push_str("/// fn name per conditional-branch site.\n");
-    out.push_str("pub static BRANCH_INFO: &[&str] = &[\n");
-    for f in &gen.branch_info {
-        out.push_str(&format!("    {:?},\n", f));
-    }
-    out.push_str("];\n");
-    out.push_str(&format!("pub const FN_INIT: u32 = {};\n", fn_init));
-    out.push_str(&format!("pub const FN_FRAME: u32 = {};\n", fn_frame));
-    let slot_cells: &[u32] = gen
-        .slots
-        .as_ref()
-        .map(|s| s.dense_cells.as_slice())
-        .unwrap_or(&[]);
-    out.push_str(
-        "/// Canonical boundary cell per slot (slot compilation; empty\n\
-         /// without --site-slots). Engines with HAS_SLOTS bind these\n\
-         /// cells to a dense array at block entry and write back at exit.\n",
-    );
-    out.push_str(&format!("pub const N_SLOTS: usize = {};\n", slot_cells.len()));
-    out.push_str(&format!(
-        "pub static SLOT_CELLS: &[u32] = &{:?};\n",
-        slot_cells
-    ));
-    out.push_str(
-        "/// Canonical shape hash the slot binding is valid for; slot\n\
-         /// engines must deopt on any other shape.\n",
-    );
-    out.push_str(&format!(
-        "pub const SLOT_SHAPE: u64 = {:#018x};\n\n",
-        gen.slots.as_ref().map(|s| s.shape_hash).unwrap_or(0)
-    ));
     out.push_str(
         "pub fn global_id(name: &str) -> Option<u32> {\n    \
          GLOBAL_NAMES.iter().position(|n| *n == name).map(|i| i as u32)\n}\n\n\

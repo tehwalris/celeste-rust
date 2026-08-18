@@ -39,7 +39,7 @@ queue, because P1's crate split should move only code that survives K4.
 | 2 | **P0b** one pos-graph for all k levels (#149) | DONE | - | removed 16 stages/horizon; gated at k=1..3 with two controls |
 | 3 | **K4 stage 2** block->State exporter + interpreter fallback | DONE | - | one reference, not two; gates f20/25/30/35 exact, cost is noise |
 | 4a | **K4 stage 4 piece 1** stop writing the program body; delete the Engine trait, the scalar runtime, Rt2's execution impl, SplitReq and the concrete probe modes | DONE | - | gen.rs 29,672 -> 3,962 lines; runtime.rs (1,004) gone; name tables byte-identical; gates f20/25/30/35 exact, suite 551/551. Bonus: the crate-wide dead_code allow is gone and `--abstract` now starts from the interpreter's own init |
-| 4b | **K4 stage 4 piece 2 + stage 5** emitter becomes a pure interning walk; drop the tables that now have no consumer (SITE_INFO, BRANCH_INFO, SLOT_*, FN_INIT/FN_FRAME) | next | ~0.5 d | ~540 lines of `format!`; own commit and its own re-snapshotted gate, so a moved table has one candidate cause |
+| 4b | **K4 stage 4 piece 2 + stage 5** emitter is a pure interning walk; slot subsystem and the consumerless tables deleted | DONE | - | transpile 1,125 -> 449 lines, gen.rs 3,962 -> 236; four name tables byte-identical; gates f20/25/30/35 exact, suite 551/551 |
 | 5 | **P1** crate split + one frame interface (#150) | | days | the campaign can finally call the kernel; forward AND sweep at once |
 | 6 | **K5** kernels for rooms (0,0)/(2,0) | | days | P1's win is room-shaped until this |
 | 7 | **P2** the sweep's merge/regroup third (#151) | | days | 91 s of the sweep's 190 s replay; lands on P1's interface |
