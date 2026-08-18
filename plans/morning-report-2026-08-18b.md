@@ -104,3 +104,24 @@ kernel registry that plugs all three into the engine is task #147 with
 a written plan (kernel-plan.md); with it, 100% of player lanes run
 kernel code and the frozen classes become nearly free. K4's Rt2/Rt3
 retirement unblocks right after.
+
+## Final addendum (~06:50): the registry landed too — 100% kernel coverage
+
+All three class kernels are generated, integrated, and firing:
+coverage counters show steady 114,458 + dash 43,824 + frozen 29,577
+lanes, missed 0 — every player lane at f35 runs compiled kernel code,
+gates exact. Two genuinely pleasing discoveries on the way:
+1. The taint analysis independently rediscovered GAME semantics: the
+   dash and frozen frames have EMPTY button suffixes (Celeste ignores
+   input mid-dash; frozen skips the update) — their 64 variants
+   collapse to a single call.
+2. With compute free, the wall (393 ms) is now ~all generic row
+   machinery (append/boundary-hash/dedup/merge). The next frontier is
+   the outer scope of your architecture — dedup-on-the-fly, hashing
+   straight from kernel outputs — not the frame.
+
+Suite 549/549 green at every step. 15 commits pushed tonight; git log
+from b4d1060 to 758d010 is the full story, kernel-plan.md the design
+record. Sleep-deprived executors retired: TILE=1. Still standing:
+Rt2/Rt3-dynexp (as the probe's deopt fallback), the interpreter (the
+reference, as you specified).
