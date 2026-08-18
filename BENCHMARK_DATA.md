@@ -95,6 +95,61 @@ with `--site-slots plans/site-slots-room10-f035.json` - that closes
 the gate to one shape again, so it must come with a census for EVERY
 shape the run visits, or stay off.
 
+# The kernel engine on the one-frame dev-loop bench (2026-08-18; plans/kernel-plan.md)
+
+Same bench as the tile table below (`--abstract-bench room10-newlua-bench
+35`, 187,859 lanes in, 269,059 out, f37 chase 365,029, 30 cores), so the
+numbers are directly comparable. Every row here is gate-2 EXACT (row-key
+SET EQUAL) at f20/f25/f30/f35.
+
+| engine | one frame | vs Rt2 |
+|---|---|---|
+| Rt2 columnar (reference) | 2.0 s | 1x |
+| Rt3 dynexp, tuned (CELESTE_TILE=2) | 518 ms | 3.9x |
+| kernel, steady class only (2026-08-18 night) | 380 ms | 5.3x |
+| kernel, all three classes (steady/dash/frozen) | 348 ms | 5.7x |
+| + pre-dedup from kernel registers | 134 ms | 14.9x |
+| + chunk 64 -> 256 (the trade-off inverted) | **89 ms** | **22.5x** |
+
+100% of player lanes at f35 run compiled kernel code (steady 114,458 +
+dash 43,824 + frozen 29,577, missed 0). The dash and frozen classes
+ignore the buttons almost entirely - the emitter's taint analysis found
+that on its own - so they enumerate 4 and 1 button variants where steady
+enumerates 64.
+
+Pre-dedup is the lever that mattered, and it is an OUTPUT-side lever,
+not a compute one: a chunk emits one row per (lane, fork config, button
+variant) - 25.1M per f35 frame - and 8.3 of every 9 are duplicates that
+boundary discarded AFTER they were materialized and hashed. Keying rows
+straight out of the kernel's output registers and consulting a per-chunk
+seen-set before `append_out` cut materialized rows to 3.03M and the
+frame to 134 ms. The register-side key mirrors boundary's value
+canonicalizations exactly, which is measurable rather than asserted: the
+residual within-chunk dedup ratio after boundary went 8.3:1 -> 1.0:1.
+
+Chunk size then inverted. It used to trade mid-frame traffic against
+dedup ratio with small chunks winning; with duplicates dying as a hash
+probe, more lanes per chunk simply means more duplicates caught:
+
+| chunk lanes | 64 | 128 | 256 | 512 | 1024 | 4096 |
+|---|---|---|---|---|---|---|
+| before pre-dedup | 348 ms | 489 | 584 | 673 | - | - |
+| after pre-dedup | 133 ms | 98 | 91 | 86 | 82 | 85 |
+| peak RSS | 0.99 GB | - | 1.12 | 1.44 | 2.02 | 4.82 |
+
+256 is the default: 1.46x for +13% memory, mean as tight as the min.
+
+Profile at 89 ms (25 timed reps, chase excluded as far as sampling
+allows): kernel arithmetic 16.6%, append+key callback 17.1%, boundary
+15.1%, the non-kernel fallbacks (Rt3 + Rt2) 21% - those last are the f36
+shapes the gate chases, and they are what K4/K5 address next.
+
+CAUTION, learned the hard way (2026-08-18): regenerating a kernel
+invalidates every gate. The dash kernel shipped overnight emitting ONE
+button variant instead of 64 because a tainted output cell had no
+instruction behind it, and the f35 gate caught it the next morning
+(1,358 rows missing at f37). Re-run the gate after every regen.
+
 # Tile engines on the one-frame dev-loop bench (2026-08-17; plans/columnar-engine.md)
 
 `--abstract-bench room10-newlua-bench 35`: real f35 campaign states,
