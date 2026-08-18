@@ -159,6 +159,39 @@ pub fn config_fingerprint_with_precision(
     config_fingerprint_for(recipe_text, &config)
 }
 
+/// Every fingerprint THIS campaign would have had at a precision level
+/// coarser than or equal to the current one, coarsest first.
+///
+/// For artifacts a coarser level may lawfully share with a finer one (the
+/// position graph; see `sweep_time::borrow_pos_graph`). A fingerprint is a
+/// hash, so "differs only in the precision components" cannot be read off
+/// it - but the level space is 238 entries, so the honest check is to
+/// enumerate them. Everything else the fingerprint covers still has to
+/// match EXACTLY, which is the point: this loosens precision and nothing
+/// else.
+pub fn coarser_precision_fingerprints(
+    recipe_text: &str,
+) -> Vec<(crate::interpreter::abstraction::LadderPrecision, String)> {
+    coarser_precision_fingerprints_for(recipe_text, &CampaignConfig::from_env())
+}
+
+pub fn coarser_precision_fingerprints_for(
+    recipe_text: &str,
+    base: &CampaignConfig,
+) -> Vec<(crate::interpreter::abstraction::LadderPrecision, String)> {
+    use crate::interpreter::abstraction::LadderPrecision;
+    let here = LadderPrecision { spd: base.spd_precision, rem: base.precision };
+    LadderPrecision::all()
+        .filter(|level| level.coarser_or_equal(here))
+        .map(|level| {
+            let mut config = base.clone();
+            config.precision = level.rem;
+            config.spd_precision = level.spd;
+            (level, config_fingerprint_for(recipe_text, &config))
+        })
+        .collect()
+}
+
 pub fn config_fingerprint_for(recipe_text: &str, config: &CampaignConfig) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = rustc_hash::FxHasher::default();
@@ -599,6 +632,67 @@ mod tests {
         // And the same configuration still agrees with itself, or every
         // resume in the campaign would break.
         assert_eq!(a, config_fingerprint_for("recipe", &base()));
+    }
+
+    /// The precision exemption a borrowed position graph runs on
+    /// (`--pos-graph-from`) must loosen PRECISION AND NOTHING ELSE. It is
+    /// stated as an enumeration of levels, so the thing to check is that
+    /// the set contains exactly the coarser-or-equal ones and that no
+    /// other config difference can sneak in through it.
+    #[test]
+    fn the_borrow_exemption_covers_precision_and_only_precision() {
+        use crate::interpreter::abstraction::{LadderPrecision, RemPrecision, SpdPrecision};
+        let mut k4 = base();
+        k4.precision = RemPrecision::Bits(4);
+        let accepted = coarser_precision_fingerprints_for("recipe", &k4);
+        let levels: Vec<LadderPrecision> = accepted.iter().map(|(l, _)| *l).collect();
+
+        // Level 0 - the one the ladder actually shares - and k=4 itself.
+        for rem in [RemPrecision::Bits(0), RemPrecision::Bits(4)] {
+            assert!(
+                levels.contains(&LadderPrecision { spd: SpdPrecision::Exact, rem }),
+                "{:?} must be borrowable at k=4",
+                rem
+            );
+        }
+        // A FINER level is not: its table is a subset, and a missing pair
+        // silently loses predecessors.
+        assert!(!levels.iter().any(|l| l.rem == RemPrecision::Bits(5)));
+        assert!(!levels.iter().any(|l| l.rem == RemPrecision::Exact));
+        // spd Exact is this config's level, so no WidthLog2 rung (all of
+        // which are COARSER in spd) may be excluded... they are coarser, so
+        // they are all in.
+        assert!(levels.contains(&LadderPrecision {
+            spd: SpdPrecision::WidthLog2(16),
+            rem: RemPrecision::Bits(0)
+        }));
+
+        // Nothing else is loosened: a different room, cap or win target
+        // produces no fingerprint in the accepted set at ANY level.
+        let fps: std::collections::HashSet<&str> =
+            accepted.iter().map(|(_, f)| f.as_str()).collect();
+        for mut other in [base(), base(), base(), base()].into_iter().enumerate().map(
+            |(i, mut c)| {
+                match i {
+                    0 => c.start_room = (2, 0),
+                    1 => c.max_state_lanes = 4_000,
+                    2 => c.synthetic_win = Some((64, 44)),
+                    _ => c.frontier_only = false,
+                }
+                c
+            },
+        ) {
+            other.precision = RemPrecision::Bits(0);
+            assert!(
+                !fps.contains(config_fingerprint_for("recipe", &other).as_str()),
+                "a level-0 table from a DIFFERENT search must not be borrowable"
+            );
+        }
+        // ...and a different recipe likewise.
+        let mut l0 = k4.clone();
+        l0.precision = RemPrecision::Bits(0);
+        assert!(!fps.contains(config_fingerprint_for("other recipe", &l0).as_str()));
+        assert!(fps.contains(config_fingerprint_for("recipe", &l0).as_str()));
     }
 
     /// The default cap is a function of the THREAD COUNT (1M serial, 8k

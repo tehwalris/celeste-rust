@@ -199,6 +199,29 @@ pub enum RemPrecision {
     Exact,
 }
 
+impl RemPrecision {
+    /// Does `self` widen rem AT LEAST as much as `finer` - i.e. is every
+    /// `finer` bucket contained in one of `self`'s?
+    ///
+    /// `Bits(k)`'s buckets are floor-aligned at width 2^-k, so `Bits(k)`
+    /// nests inside `Bits(k')` exactly when k >= k', and `Exact` (no
+    /// widening) nests inside every `Bits`.
+    pub fn coarser_or_equal(self, finer: RemPrecision) -> bool {
+        match (self, finer) {
+            (RemPrecision::Exact, _) => finer == RemPrecision::Exact,
+            (RemPrecision::Bits(_), RemPrecision::Exact) => true,
+            (RemPrecision::Bits(a), RemPrecision::Bits(b)) => a <= b,
+        }
+    }
+
+    /// Every rem level this build can be configured for, coarsest first.
+    /// `Bits(16)` and above are read as `Exact` by the env parser, so 0..16
+    /// is the whole `Bits` range.
+    pub fn all() -> impl Iterator<Item = RemPrecision> {
+        (0..16u8).map(RemPrecision::Bits).chain(std::iter::once(RemPrecision::Exact))
+    }
+}
+
 /// The session's rem precision: CELESTE_REM_BITS=k (16 or CELESTE_EXACT_REM
 /// mean exact; unset means the historic Bits(0)). Read once.
 pub fn rem_precision_from_env() -> RemPrecision {
@@ -240,6 +263,25 @@ pub enum SpdPrecision {
     Exact,
 }
 
+impl SpdPrecision {
+    /// Does `self` widen spd AT LEAST as much as `finer`? Buckets are
+    /// floor-aligned at width 2^w on the raw 16.16 value, so they nest for
+    /// w >= w', and `Exact` nests inside every `WidthLog2`.
+    pub fn coarser_or_equal(self, finer: SpdPrecision) -> bool {
+        match (self, finer) {
+            (SpdPrecision::Exact, _) => finer == SpdPrecision::Exact,
+            (SpdPrecision::WidthLog2(_), SpdPrecision::Exact) => true,
+            (SpdPrecision::WidthLog2(a), SpdPrecision::WidthLog2(b)) => a >= b,
+        }
+    }
+
+    /// Every spd level this build can be configured for, coarsest first.
+    /// The env parser asserts 8..=20, so that is the whole range.
+    pub fn all() -> impl Iterator<Item = SpdPrecision> {
+        (8..=20u8).rev().map(SpdPrecision::WidthLog2).chain(std::iter::once(SpdPrecision::Exact))
+    }
+}
+
 /// The session's spd precision: CELESTE_SPD_WIDTH_LOG2=w (unset means
 /// Exact - nothing changes for existing campaigns). Read once.
 pub fn spd_precision_from_env() -> SpdPrecision {
@@ -273,6 +315,28 @@ pub struct LadderPrecision {
 
 pub fn ladder_precision_from_env() -> LadderPrecision {
     LadderPrecision { spd: spd_precision_from_env(), rem: rem_precision_from_env() }
+}
+
+impl LadderPrecision {
+    /// Does `self` over-approximate `finer`?
+    ///
+    /// The PRODUCT order, deliberately, not the ladder's own visiting
+    /// order: `coarsen_to` applies both components independently, so a
+    /// level that widens each coordinate at least as much abstracts every
+    /// state of the finer level into one of its own. That is the property
+    /// anything reusing a coarser level's artifacts needs, and it does not
+    /// depend on how the ladder happens to walk the levels.
+    pub fn coarser_or_equal(self, finer: LadderPrecision) -> bool {
+        self.spd.coarser_or_equal(finer.spd) && self.rem.coarser_or_equal(finer.rem)
+    }
+
+    /// Every level this build can be configured for (238 of them - small
+    /// enough to enumerate, which is how a "coarser than" claim about a
+    /// hashed fingerprint gets checked rather than assumed).
+    pub fn all() -> impl Iterator<Item = LadderPrecision> {
+        SpdPrecision::all()
+            .flat_map(|spd| RemPrecision::all().map(move |rem| LadderPrecision { spd, rem }))
+    }
 }
 
 /// Coarsen a state to `precision` - the band mapping between ladder
@@ -1037,6 +1101,65 @@ mod tests {
             assert_eq!(bucket(lo16, 17), (lo17, hi17));
             assert_eq!(bucket(hi16, 17), (lo17, hi17));
         }
+    }
+
+    /// `coarser_or_equal` is the guard on every artifact one ladder level
+    /// shares with another (the position graph today), so it must mean
+    /// BUCKET CONTAINMENT and not just "a smaller number". Checked against
+    /// the actual widening arithmetic: both ladders are floor-aligned
+    /// power-of-two buckets, rem at raw width 2^(16-k) and spd at 2^w, so
+    /// containment is nesting in the same sense the test above checks.
+    #[test]
+    fn coarser_or_equal_means_the_buckets_nest() {
+        let bucket = |raw: i32, w: u8| -> (i32, i32) {
+            let width = 1i32 << w;
+            let low = raw.div_euclid(width) * width;
+            (low, low + width - 1)
+        };
+        let probes = [-0x2_8000i32, -0x1_0000, -0x4CCC, -1, 0, 0x1234, 0x7FFF, 0x1_2345];
+        for a in RemPrecision::all() {
+            for b in RemPrecision::all() {
+                let (RemPrecision::Bits(ka), RemPrecision::Bits(kb)) = (a, b) else {
+                    // Exact is a point, so it nests in everything and
+                    // contains only itself.
+                    assert_eq!(
+                        a.coarser_or_equal(b),
+                        b == RemPrecision::Exact || a != RemPrecision::Exact
+                    );
+                    continue;
+                };
+                let nests = probes.iter().all(|&r| {
+                    let (loa, hia) = bucket(r, 16 - ka);
+                    let (lob, hib) = bucket(r, 16 - kb);
+                    loa <= lob && hib <= hia
+                });
+                assert_eq!(a.coarser_or_equal(b), nests, "rem {:?} vs {:?}", a, b);
+            }
+        }
+        for a in SpdPrecision::all() {
+            for b in SpdPrecision::all() {
+                let (SpdPrecision::WidthLog2(wa), SpdPrecision::WidthLog2(wb)) = (a, b) else {
+                    continue;
+                };
+                let nests = probes.iter().all(|&r| {
+                    let (loa, hia) = bucket(r, wa);
+                    let (lob, hib) = bucket(r, wb);
+                    loa <= lob && hib <= hia
+                });
+                assert_eq!(a.coarser_or_equal(b), nests, "spd {:?} vs {:?}", a, b);
+            }
+        }
+        // The product order, and the two ends of the ladder.
+        let l0 = LadderPrecision { spd: SpdPrecision::Exact, rem: RemPrecision::Bits(0) };
+        let k16 = LadderPrecision { spd: SpdPrecision::Exact, rem: RemPrecision::Exact };
+        assert!(l0.coarser_or_equal(k16) && !k16.coarser_or_equal(l0));
+        assert_eq!(LadderPrecision::all().count(), 17 * 14);
+        assert!(LadderPrecision::all().all(|l| l.coarser_or_equal(l)));
+        // Incomparable levels exist and must NOT be accepted either way:
+        // coarser in rem but finer in spd is not an over-approximation.
+        let a = LadderPrecision { spd: SpdPrecision::Exact, rem: RemPrecision::Bits(0) };
+        let b = LadderPrecision { spd: SpdPrecision::WidthLog2(16), rem: RemPrecision::Exact };
+        assert!(!a.coarser_or_equal(b) && !b.coarser_or_equal(a));
     }
 
     /// `SpdPrecision::Exact` must leave any state bit-identical (it is the

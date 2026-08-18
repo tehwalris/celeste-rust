@@ -460,6 +460,14 @@ enum Command {
         /// counted rather than treated as a replay divergence.
         #[arg(long)]
         banded: bool,
+        /// Use the position graph in DIR - another PRECISION LEVEL of this
+        /// same campaign, normally level 0 - instead of building this
+        /// level its own. A coarser level's table contains a finer
+        /// level's, and a superset only shrinks the candidate set, so this
+        /// is sound; see `sweep_time::borrow_pos_graph` for what is
+        /// checked. Saves ~20 s x 16 levels per horizon.
+        #[arg(long)]
+        pos_graph_from: Option<String>,
     },
     /// Build (or extend) the position-transition table `pos_graph` on its
     /// own, without sweeping.
@@ -3492,11 +3500,12 @@ fn main() -> Result<()> {
                 byte_seqs.log10()
             );
         }
-        Command::Sweep { checkpoint_dir, frames, horizon, banded } => {
+        Command::Sweep { checkpoint_dir, frames, horizon, banded, pos_graph_from } => {
             use celeste_rust::rewrite::state_mapping::StateMapping;
             use celeste_rust::rewrite::{sweep, sweep_time};
             let horizon = horizon.unwrap_or(frames);
             let dir = std::path::PathBuf::from(checkpoint_dir);
+            let from = pos_graph_from.map(std::path::PathBuf::from);
             let recipe_text = std::fs::read_to_string(&cli.recipe).unwrap_or_default();
             let fingerprint =
                 celeste_rust::rewrite::checkpoint::config_fingerprint(&recipe_text);
@@ -3504,7 +3513,16 @@ fn main() -> Result<()> {
             let (program, _) = build(&recipe)?;
             let mapping = StateMapping::from_recipe(&recipe);
             let result = sweep_time::backward_sweep_time(
-                &dir, frames, horizon, &fingerprint, &program, &plain, mapping, banded,
+                &dir,
+                frames,
+                horizon,
+                &fingerprint,
+                &recipe_text,
+                from.as_deref(),
+                &program,
+                &plain,
+                mapping,
+                banded,
             )?;
             sweep::save_g(&dir, &result.g)?;
             let reachable =
@@ -3554,7 +3572,16 @@ fn main() -> Result<()> {
             let plain = Program::compile_executable_from_disk()?;
             let (program, _) = build(&recipe)?;
             let mapping = StateMapping::from_recipe(&recipe);
-            sweep_time::prepare_pos_graph(&dir, frames, &fingerprint, &program, &plain, mapping)?;
+            sweep_time::prepare_pos_graph(
+                &dir,
+                frames,
+                &fingerprint,
+                &recipe_text,
+                None,
+                &program,
+                &plain,
+                mapping,
+            )?;
         }
         Command::MigrateVisited { checkpoint_dir } => {
             use celeste_rust::interpreter::visited;

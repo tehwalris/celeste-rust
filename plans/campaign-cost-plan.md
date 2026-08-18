@@ -36,7 +36,7 @@ queue, because P1's crate split should move only code that survives K4.
 | # | item | status | effort | why here |
 |---|---|---|---|---|
 | 1 | **P0** fused pos-graph by default | DONE | - | -46% of level 0 (task #109) |
-| 2 | **P0b** one pos-graph for all k levels (#149) | next | hours | removes 16 stages/horizon; subset property measured |
+| 2 | **P0b** one pos-graph for all k levels (#149) | DONE | - | removed 16 stages/horizon; gated at k=1..3 with two controls |
 | 3 | **K4 stage 2** block->State exporter + interpreter fallback | | 1-2 d | unblocks every deletion below; fallback speed no longer matters (spawn shapes only) |
 | 4 | **K4 stages 4-5** delete the Rt2 ENGINE, gen.rs program body, scalar oracle; simplify | | 1-2 d | deletes 30k+ generated lines BEFORE they can be moved |
 | 5 | **P1** crate split + one frame interface (#150) | | days | the campaign can finally call the kernel; forward AND sweep at once |
@@ -101,8 +101,52 @@ Steps:
 2. Let `prepare_pos_graph` accept a table whose fingerprint differs only
    in rem/spd precision, with the level-0 table passed explicitly
    (`--pos-graph-from DIR`), rather than loosening the fingerprint check
-   globally - the check has caught real mistakes.
+   globally - the check has caught real mistakes. **DONE.**
 3. Gate: `g.bin` identical at k=1..3 with the reused table vs rebuilt.
+   **DONE - `posgraphsharecheck.sh`.**
+
+### How the exemption is stated (and why it is not a loosening)
+
+A fingerprint is a hash, so "differs only in precision" cannot be read
+off one. The level space is small (17 rem x 14 spd = 238), so the check
+ENUMERATES it: `checkpoint::coarser_precision_fingerprints` recomputes
+this campaign's fingerprint at every level coarser than or equal to the
+current one and requires the table's to be among them. Everything else -
+recipe, lua sources, room, chunk caps, frontier-only, synthetic win -
+must still match exactly.
+
+"Coarser" is `LadderPrecision::coarser_or_equal`, the PRODUCT order on
+(spd, rem), not the ladder's visiting order: `coarsen_to` applies both
+components independently, so what is needed is that the source widens
+each coordinate at least as much. A unit test ties that predicate to the
+widening arithmetic itself (both ladders are floor-aligned power-of-two
+buckets, rem at raw width 2^(16-k), spd at 2^w) rather than to the
+convention that smaller k means coarser.
+
+### Gate results (room (1,0), H=40, synthetic win at (33,104))
+
+The win is the witness trajectory's position at frame 35, so a concrete
+winning path exists inside the horizon at EVERY level - the banded levels
+have to win too or the comparison is vacuous. The script checks that
+rather than trusting it (level 0 must report an optimum; the first
+attempt at (26,108) correctly aborted as vacuous).
+
+| level | own pairs | level 0's | own-only | g rebuilt vs borrowed |
+|---|---|---|---|---|
+| k=1 | 1,404 | 21,324 | 0 | byte-identical |
+| k=2 | 965 | 21,324 | 0 | byte-identical |
+| k=3 | 640 | 21,324 | 0 | byte-identical |
+
+Byte comparison is right HERE and only here: both sweeps read the same
+checkpoint dir, so row ids are the same assignment (unlike
+posgraphcheck.sh, which compares two forward passes and must join through
+row keys).
+
+Two controls, because a check that only ever passes is not a check:
+* level 0 borrowing k=1's table (the FINER direction, the unsound one) is
+  refused;
+* a table from a different synthetic win is refused at the same
+  precision.
 
 ## P1 - one engine behind one interface (days, the big one)
 

@@ -140,6 +140,30 @@ case "${FUSE:-}" in
   *) echo "FUSE must be 0 or 1" >&2; exit 1 ;;
 esac
 [ -n "$FUSE_ARG" ] && echo "pos-graph: recorded IN the forward pass (fused)"
+# SHARE_POSGRAPH=1 (the default) gives every banded level LEVEL 0's position
+# graph instead of rebuilding one per (k, H) - 16 stages of 19-22 s per
+# horizon, measured on room (1,0) at H=72.
+#
+# Sound because the table is a projection of the reachable transition
+# relation onto whole-pixel position cells, and level 0 over-approximates
+# every level above it: that is the ladder's own soundness argument, the
+# widened coordinates (rem, spd) are SUB-pixel, and a banded level is
+# restricted further still. So level 0's table CONTAINS level k's, and a
+# superset is the safe direction - the table only shrinks the sweep's
+# candidate set, and the expansion is what establishes an edge.
+#
+# Verified on room (1,0) at H=72 rather than assumed: level 0 has 166,455
+# pairs, k=1 34,137 and k=2 21,579, both strict SUBSETS (zero pairs outside
+# level 0's table); and `g` is identical at k=1..3 with the borrowed table
+# (posgraphsharecheck.sh). `--pos-graph-from` re-checks the fingerprint at
+# every coarser precision level, so a table from a different recipe, room,
+# chunk cap or win target is still refused.
+SHARE_POSGRAPH=${SHARE_POSGRAPH:-1}
+case "$SHARE_POSGRAPH" in
+  1) echo "pos-graph: banded levels borrow level 0's table" ;;
+  0) echo "pos-graph: rebuilt per level (SHARE_POSGRAPH=0)" ;;
+  *) echo "SHARE_POSGRAPH must be 0 or 1" >&2; exit 1 ;;
+esac
 for H in $(seq "$FROM" "$TO"); do
   echo "=== horizon $H: level 0 extend + sweep ==="
   # A level-0 tree built past this horizon in one process (which is how a
@@ -211,12 +235,18 @@ for H in $(seq "$FROM" "$TO"); do
       break
     fi
     echo "=== horizon $H: k=$K wins; sweeping level $K ==="
-    stage "k$K-posgraph-h$H" "/tmp/k${K}posgraph-h$H.log" \
-        env CELESTE_REM_BITS=$K ./target/release/rewrite --recipe "$RECIPE" pos-graph \
-        --checkpoint-dir "$KDIR" --frames "$H"
+    if [ "$SHARE_POSGRAPH" = 1 ]; then
+      SHARE_ARGS=(--pos-graph-from "$L0")
+    else
+      SHARE_ARGS=()
+      stage "k$K-posgraph-h$H" "/tmp/k${K}posgraph-h$H.log" \
+          env CELESTE_REM_BITS=$K ./target/release/rewrite --recipe "$RECIPE" pos-graph \
+          --checkpoint-dir "$KDIR" --frames "$H"
+    fi
     stage "k$K-sweep-h$H" "/tmp/k${K}sweep-h$H.log" \
         env CELESTE_REM_BITS=$K ./target/release/rewrite --recipe "$RECIPE" sweep --banded \
-        --checkpoint-dir "$KDIR" --frames "$H" --horizon "$H"
+        --checkpoint-dir "$KDIR" --frames "$H" --horizon "$H" \
+        ${SHARE_ARGS[@]+"${SHARE_ARGS[@]}"}
     grep -E "abstract optimal|win seeds" "/tmp/k${K}sweep-h$H.log"
   done
   if [ "$refuted" -eq 0 ]; then

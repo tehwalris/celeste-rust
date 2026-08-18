@@ -133,7 +133,18 @@ at H=72 costs; a ladder that extends by 2 frames pays only the 45 s.
 The tube works: a banded level is ~100-135 s against level 0's ~766 s,
 and peaks drop to 1-4.5 GB. Extrapolating k=4..16 at ~100 s, a FULL
 16-level ladder at one horizon is **~40 min**, of which level 0 is a
-third. The ladder also converges as designed - 64, 66, 67, 68 climbing
+third.
+
+The `pos-graph` column above is now GONE (P0b, 2026-08-18): every banded
+level borrows level 0's table (`sweep --pos-graph-from`, ladder.sh
+`SHARE_POSGRAPH=1`), which removes 19-22 s x 16 levels ~ **5 min per
+horizon** and leaves a banded level at ~80-115 s. It is not a heuristic:
+level 0 over-approximates every level above it, so its table CONTAINS
+theirs, and a superset only shrinks the sweep's candidate set. Measured
+per level rather than assumed - at H=40 k=1/2/3 have 1,404 / 965 / 640
+pairs against level 0's 21,324, with ZERO pairs outside it, and `g.bin`
+is byte-identical rebuilt vs borrowed (`posgraphsharecheck.sh`, which
+also checks that the finer direction and a different search are refused). The ladder also converges as designed - 64, 66, 67, 68 climbing
 toward the true first win (the witness reaches the target at frame 70).
 
 ## Scaling with frames

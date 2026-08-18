@@ -285,18 +285,23 @@ pub struct TimeSweepResult {
 /// the filter never generates that candidate and nothing notices. So the
 /// covered frame count is stored in the file and checked here.
 ///
-/// It is built PER PRECISION LEVEL, in that level's own directory, and the
-/// fingerprint in the file is what enforces that: sharing a coarser level's
-/// table with a finer one is probably sound, but there is no cheap runtime
-/// guard for the sharing itself, so it is refused rather than assumed.
+/// By default it is built PER PRECISION LEVEL, in that level's own
+/// directory, and the fingerprint in the file enforces that. `from` opts
+/// into sharing a COARSER level's table instead - see `borrow_pos_graph`
+/// for what that costs and what is checked.
 pub fn prepare_pos_graph(
     dir: &Path,
     frames: u32,
     fingerprint: &str,
+    recipe_text: &str,
+    from: Option<&Path>,
     program: &Program,
     plain: &Program,
     mapping: StateMapping,
 ) -> Result<PosGraph> {
+    if let Some(src) = from {
+        return borrow_pos_graph(src, frames, recipe_text);
+    }
     let existing = PosGraph::load(dir)?;
     if let Some(old) = &existing {
         if old.fingerprint() != fingerprint {
@@ -365,6 +370,86 @@ pub fn prepare_pos_graph(
     Ok(graph)
 }
 
+/// Use a position graph recorded by ANOTHER precision level of the same
+/// campaign (`--pos-graph-from`), instead of building this level its own.
+///
+/// Why this is sound. The table is a projection of the reachable
+/// transition relation onto whole-pixel position cells. A coarser ladder
+/// level over-approximates a finer one - that is the ladder's own
+/// soundness argument, and it is what every band already rests on - and
+/// the widened coordinates (rem, spd) are sub-pixel, so a finer level's
+/// lane sits inside a coarser lane occupying the SAME cell. A banded level
+/// is restricted further still. So the coarse table CONTAINS the finer
+/// level's, and a superset is the safe direction: the table only shrinks
+/// the sweep's candidate set, and the expansion is what establishes an
+/// edge. (A subset would silently lose predecessors, which is why this is
+/// one-directional and checked.)
+///
+/// Measured on room (1,0) at H=72: level 0 has 166,455 pairs, k=1 has
+/// 34,137 and k=2 21,579 - both strict SUBSETS, zero pairs outside level
+/// 0's table.
+///
+/// Two things are checked rather than assumed:
+///
+/// * The source's fingerprint must equal this campaign's at SOME precision
+///   coarser than or equal to the current one. Everything else the
+///   fingerprint covers - recipe, lua, room, chunk caps, frontier-only,
+///   synthetic win - must still match EXACTLY. There is no "close enough"
+///   here; the exemption is precision and nothing else.
+/// * It must ALREADY cover `frames`. A borrowed table is never extended:
+///   extending it would replay this level's batches into another level's
+///   file, and a finer level's transitions do not belong in a coarser
+///   level's table. Extend the source level instead.
+fn borrow_pos_graph(src: &Path, frames: u32, recipe_text: &str) -> Result<PosGraph> {
+    let graph = PosGraph::load(src)?.ok_or_else(|| {
+        anyhow!(
+            "--pos-graph-from {} has no posgraph.bin - build that level's \
+             table first (its forward pass with --record-pos-graph, or \
+             `rewrite pos-graph --checkpoint-dir {}`)",
+            src.display(),
+            src.display()
+        )
+    })?;
+    let accepted = crate::rewrite::checkpoint::coarser_precision_fingerprints(recipe_text);
+    let level = accepted
+        .iter()
+        .find(|(_, fp)| fp == graph.fingerprint())
+        .map(|(level, _)| *level)
+        .ok_or_else(|| {
+            anyhow!(
+                "{}/posgraph.bin was recorded from the forward pass {}, which \
+                 is not this campaign at any precision coarser than or equal \
+                 to the current one. Sharing is allowed ACROSS PRECISION \
+                 LEVELS ONLY - a different recipe, room, chunk cap or win \
+                 target is a different search, and its table misses \
+                 transitions this one takes.",
+                src.display(),
+                graph.fingerprint()
+            )
+        })?;
+    if graph.frames() < frames {
+        return Err(anyhow!(
+            "{}/posgraph.bin covers frames 1..{} but this sweep needs 1..{}. \
+             A borrowed table is never extended here - that would replay this \
+             level's batches into another level's file. Extend the source \
+             level instead.",
+            src.display(),
+            graph.frames(),
+            frames
+        ));
+    }
+    println!(
+        "sweep: position graph borrowed from {} at precision {:?} - {} pairs \
+         over {} destination cells, covering frames 1..{}",
+        src.display(),
+        level,
+        graph.pairs(),
+        graph.live_cells(),
+        graph.frames()
+    );
+    Ok(graph)
+}
+
 /// The time-expanded backward sweep. See the module docs.
 #[allow(clippy::too_many_arguments)]
 pub fn backward_sweep_time(
@@ -372,6 +457,8 @@ pub fn backward_sweep_time(
     frames: u32,
     horizon: u32,
     fingerprint: &str,
+    recipe_text: &str,
+    pos_graph_from: Option<&Path>,
     program: &Program,
     plain: &Program,
     mapping: StateMapping,
@@ -385,8 +472,16 @@ pub fn backward_sweep_time(
             frames
         ));
     }
-    let graph =
-        prepare_pos_graph(dir, frames, fingerprint, program, plain, mapping.clone())?;
+    let graph = prepare_pos_graph(
+        dir,
+        frames,
+        fingerprint,
+        recipe_text,
+        pos_graph_from,
+        program,
+        plain,
+        mapping.clone(),
+    )?;
 
     let ck = checkpoint::load(dir, frames, fingerprint).context("loading final checkpoint")?;
     let table = ck.visited;
