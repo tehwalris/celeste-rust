@@ -1748,7 +1748,20 @@ const WORKER_PREPARE: usize = 1;
 const WORKER_ABSTRACT: usize = 2;
 const WORKER_GC: usize = 3;
 const WORKER_KEYS: usize = 4;
-static WORKER_NS: [std::sync::atomic::AtomicU64; 5] = [
+/// The deopt path's input snapshot - a full `State` clone taken on every
+/// chunk so a failing frame can be re-run under the plain program.
+const WORKER_SNAPSHOT: usize = 5;
+/// Time spent re-running lanes under the PLAIN (unrewritten) program
+/// because a specialization premise fired.
+const WORKER_DEOPT: usize = 6;
+/// The origin-tagged run of the SPECIALIZED program inside the deopt
+/// machinery. It is the frame itself under collect-first, and a SECOND
+/// frame under the optimistic path.
+const WORKER_TAGGED: usize = 7;
+static WORKER_NS: [std::sync::atomic::AtomicU64; 8] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -1773,6 +1786,9 @@ pub fn print_worker_phase_times() {
     println!("inside fwd.interpret (thread-seconds, summed over workers):");
     for (name, v) in [
         ("frame body", ns[WORKER_BODY]),
+        ("  ...deopt input snapshot", ns[WORKER_SNAPSHOT]),
+        ("  ...deopt origin-tagged specialized run", ns[WORKER_TAGGED]),
+        ("  ...deopt re-run (plain program)", ns[WORKER_DEOPT]),
         ("boundary prepare", ns[WORKER_PREPARE]),
         ("  ...abstract", ns[WORKER_ABSTRACT]),
         ("  ...gc", ns[WORKER_GC]),
@@ -1889,7 +1905,11 @@ fn interpret_state_base(
                 // entire compiled path, so the bet is off. Where the
                 // premises never fire - room (1,0) since task #96 - the
                 // two are the same work anyway.
+                // Timed because it is not small: this clone happens on
+                // EVERY chunk to serve a deopt that fires on <1% of lanes.
+                let t_snap = std::time::Instant::now();
                 let snapshot = state.clone();
+                add_worker_ns(WORKER_SNAPSHOT, t_snap.elapsed().as_nanos() as u64);
                 let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     match compiled {
                         Some(c) => c.run_chunk(frame_cfg, fixed_env, state),
@@ -2189,6 +2209,17 @@ impl AbstractRun {
     }
 }
 
+/// `run_deopt_frame` with its thread-time attributed to `WORKER_DEOPT`.
+/// The plain program is the UNREWRITTEN one, so a lane that falls back
+/// costs far more than a lane that does not - and until this was timed,
+/// that cost sat inside "frame body" and looked like interpretation.
+fn timed_deopt_frame(deopt: &DeoptTarget, state: State) -> Result<Vec<State>> {
+    let t = std::time::Instant::now();
+    let out = run_deopt_frame(deopt, state);
+    add_worker_ns(WORKER_DEOPT, t.elapsed().as_nanos() as u64);
+    out
+}
+
 /// Lane-granular deopt: retry the failing frame under the specialized program
 /// with a per-lane origin column and the interpreter in collect mode (see
 /// `deopt_collect`), so premise-violating lanes are captured instead of
@@ -2209,12 +2240,23 @@ fn run_deopt_frame_granular(
     use crate::interpreter::state::FILTER_DEOPT;
 
     let n = snapshot.vector_size;
+    // Same clone as the optimistic path's, for the same reason, and timed
+    // the same way - collect-first keeps the input around so a captured
+    // lane can be re-run under the plain program.
+    let t_snap = std::time::Instant::now();
     let mut tagged = snapshot.clone();
+    add_worker_ns(WORKER_SNAPSHOT, t_snap.elapsed().as_nanos() as u64);
     inject_origin(&mut tagged);
     deopt_collect::begin();
+    // The origin-tagged run of the SPECIALIZED program. On the
+    // collect-first path this is the frame; on the optimistic path it is a
+    // second frame after the first one failed, which is what collect-first
+    // exists to avoid.
+    let t_tagged = std::time::Instant::now();
     let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         interpret_prepared_cfg(frame_cfg, tagged, fixed_env)
     }));
+    add_worker_ns(WORKER_TAGGED, t_tagged.elapsed().as_nanos() as u64);
     let captured = deopt_collect::take();
     let result = match attempt {
         // Collect-first mode: no premise fired - the common case. Strip the
@@ -2232,7 +2274,7 @@ fn run_deopt_frame_granular(
             // The first attempt failed but the retry captured nothing and
             // succeeded - nondeterminism somewhere. Ground truth is plain.
             println!("  deopt: retry captured nothing; whole-state fallback");
-            return Ok((run_deopt_frame(deopt, snapshot)?, n));
+            return Ok((timed_deopt_frame(deopt, snapshot)?, n));
         }
         Ok(Err(err)) => {
             let one_line = format!("{:#}", err).replace('\n', " | ");
@@ -2240,14 +2282,14 @@ fn run_deopt_frame_granular(
                 "  deopt: retry failed for a non-premise reason ({}); whole-state fallback",
                 one_line.chars().take(400).collect::<String>()
             );
-            return Ok((run_deopt_frame(deopt, snapshot)?, n));
+            return Ok((timed_deopt_frame(deopt, snapshot)?, n));
         }
         Err(panic) => {
             println!(
                 "  deopt: retry panicked ({}); whole-state fallback",
                 panic_text(&panic).chars().take(400).collect::<String>()
             );
-            return Ok((run_deopt_frame(deopt, snapshot)?, n));
+            return Ok((timed_deopt_frame(deopt, snapshot)?, n));
         }
     };
 
@@ -2296,7 +2338,7 @@ fn run_deopt_frame_granular(
     let plain_mask: Vec<bool> = (0..n).map(|i| failed.contains(&(i as u32))).collect();
     let plain_input = snapshot.filter_by_mask_clone(&plain_mask, FILTER_DEOPT);
     let plain_lanes = plain_input.vector_size;
-    out.extend(run_deopt_frame(deopt, plain_input)?);
+    out.extend(timed_deopt_frame(deopt, plain_input)?);
     Ok((out, plain_lanes))
 }
 
