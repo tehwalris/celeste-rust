@@ -113,7 +113,7 @@ Level-0 forward to H=72 leaves 5,136,510 lanes; first win at frame 66.
 | stage | wall | peak RSS | what dominates it |
 |---|---|---|---|
 | forward bench 0->72 | 248 s | 8.1 GB | `fwd.interpret` 195 s = **79%** |
-| pos-graph (full build) | ~242 s | 5.0 GB | frame replay |
+| pos-graph (full build, UNFUSED - see below) | ~242 s | 5.0 GB | frame replay |
 | sweep | 276 s | 15.1 GB | `bwdt.replay` 190 s = **69%**, keys 34 s, index 25 s |
 | **level 0 total** | **~12.8 min** | 15.1 GB | |
 
@@ -147,16 +147,65 @@ H=72 - it grows FASTER than the forward pass and overtakes it (at H=60
 the forward's cumulative cost is ~60 s against the sweep's 20 s; by H=72
 it is 248 s against 276 s). Peak RSS 2.2 -> 15.1 GB over the same range.
 
-## The punchline for the kernel work
+## What the stages ARE, and what is actually inside them
 
-Frame execution is ~75-80% of the entire campaign, not just of the
-forward pass: `fwd.interpret` is 79% of the forward stage, `bwdt.replay`
-is 69% of the sweep, and pos-graph is replay end to end. The backward
-sweep re-runs the SAME frames the forward pass ran. So the compiled
-kernel engine - currently wired only into native-probe - is aimed at
-roughly three quarters of campaign wall time, and the sweep is now the
-larger consumer of it. Wiring the kernel into the sweep's replay is
-worth more than any further forward-pass tuning.
+Three separate processes, sequenced by ladder.sh through files - not one
+fused pass:
+
+- **forward** (`bench`) - the abstract search. Writes checkpoints, the
+  per-frame boundary batches the other two stages read, and the visited
+  rowkeys.
+- **pos-graph** - a coarse over-approximation of the predecessor
+  relation PROJECTED ONTO PLAYER POSITION and nothing else: ~385k
+  `(dst cell, src cell)` pairs, ~1.5 MB for room (1,0). One node per
+  position cell, never per row. Horizon-INDEPENDENT - a property of the
+  game's geometry, built once per room.
+- **sweep** - the backward pass in time-expanded space. Uses the
+  pos-graph only to SHRINK the candidate set, then re-runs the frame
+  function on those candidates; that expansion is what establishes an
+  edge. Emits `g.bin`.
+
+So "step back along the coarse graph, then step forward exactly to find
+the true back edges" is the sweep, and it is `bwdt.replay`.
+
+Phase attribution, measured (metrics phases are INCLUSIVE, so nested
+ones double-count - `fwd.*` inside the sweep are sub-phases of replay):
+
+| | forward 248 s | sweep 276 s |
+|---|---|---|
+| `bwdt.replay` | - | 190 s (69%) |
+| ...of which `fwd.interpret` | 195 s (79%) | 88 s (32%) |
+| ...of which `fwd.merge` | 8 s (3%) | 91 s (33%) |
+| `bwdt.keys` / `index` | - | 34 s / 25 s |
+| boundary stream + save | 31 s | - |
+
+The correction that matters: the FORWARD pass is interpreter-bound
+(79%), but the SWEEP is only a third interpreter - an equal third is the
+merge/regroup row machinery, because the sweep regroups candidates from
+many discovery frames into different lane groups than the forward used.
+A compiled kernel in the replay therefore addresses ~1/3 of the sweep,
+not ~2/3; the row-machinery work (pre-dedup, keys) addresses another
+third. Earlier text here claimed "~75-80% of the campaign is frame
+execution" - that is right for the forward stage and wrong for the
+backward one.
+
+## pos-graph does not need its own stage
+
+`bench --record-pos-graph` (ladder.sh `FUSE=1`) records the table DURING
+the forward pass. Measured at H=72, same synthetic setup:
+
+| | wall | peak |
+|---|---|---|
+| forward, then pos-graph as a stage | 248 + 242 = 490 s | 8.1 / 5.0 GB |
+| forward with `--record-pos-graph` | **265 s** | 8.2 GB |
+
+Fusing costs 17 s (7%) on top of the forward and removes a 242 s stage:
+**-46% on level 0**. The recorded table is also a strict superset
+(166,456 pairs / 4,189 cells vs the replay's 154,937 / 3,928 - it sees
+the spawn's first move, which a replay starting from the frame-1 batch
+cannot). It is OFF by default because it is gated only on room (2,0)
+(`posgraphcheck.sh`); running that gate on room (1,0) is the cheapest
+campaign-level win available.
 
 Caveat: these are shape-of-curve numbers at a mid-room synthetic target.
 A real room (1,0) campaign runs to H~90-100 where both stages are much
