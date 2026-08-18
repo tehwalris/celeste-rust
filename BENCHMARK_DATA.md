@@ -95,6 +95,44 @@ with `--site-slots plans/site-slots-room10-f035.json` - that closes
 the gate to one shape again, so it must come with a census for EVERY
 shape the run visits, or stay off.
 
+# P2 step 1: the sweep stops merging states it throws away (2026-08-18)
+
+The backward loop replays a frame, reads `(origin, row key)` pairs off
+each output state, and discards the states. The k-way same-shape merge in
+the boundary is therefore work thrown away, and its dedup buys nothing
+there anyway: the sweep's per-lane `SWEEP_ORIGIN` column makes every row
+distinct. `AbstractRun::skip_boundary_merge` stops the boundary after the
+abstraction and the GC; the sweep also now TAKES the output states instead
+of borrowing and cloning each one to strip the origin column.
+
+Room (1,0), synthetic win at (64,44), H=68, 9,383,878 expansions, 16
+threads. `CELESTE_SWEEP_MERGE=1` restores the merge for A/B.
+
+| | merge | no merge |
+|---|---|---|
+| sweep wall (2 runs) | 91.37 / 91.20 s | **85.76 / 85.04 s** |
+| peak RSS | 8.84 GB | 8.49 GB |
+| `bwdt.replay` | 48.28 s | **27.01 s** |
+| ...of which `fwd.merge` | 22.63 s | 1.07 s |
+| `bwdt.keys` | 6.19 s | **21.42 s** |
+| `bwdt.index` | 18.23 s | 18.12 s |
+
+`g.bin` **byte-identical**, optimal win frame 64, `out_of_table` 0 both
+ways.
+
+So the honest reading is not "-44% on the replay" but **-6.5% on the
+sweep**: the merge was doing materialization that `bwdt.keys` then rode on
+cheaply, and most of what the merge stops paying, the per-fragment key
+read starts paying. Taking rather than cloning the states is worth ~1%
+(85.4 vs 86.3 s wall, two runs each) - real but small, and it moves the
+drop INTO `bwdt.keys`, which is why that phase's number looks worse than
+the wall clock does.
+
+The remaining P2 prize is now `bwdt.keys` at 21.4 s (25% of the sweep) and
+`bwdt.index` at 18.1 s (21%) - i.e. option 3 of the plan, the generated-key
+idea that took row hashing off the probe's profile. The merge itself is
+done.
+
 # `--variant` on every replay stage (2026-08-18, task #114)
 
 `pos-graph` and `sweep` now take the same `--variant` set as `bench`, and

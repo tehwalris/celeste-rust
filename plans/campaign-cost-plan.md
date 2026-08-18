@@ -467,12 +467,32 @@ increasing order of ambition:
 3. `bwdt.keys` 34 s + `bwdt.index` 25 s: the same generated-key idea
    that took the probe's row hashing off the profile.
 
+### Step 1 DONE 2026-08-18, and it re-prices the rest
+
+Neither 1 nor 2, but the observation underneath both: **the sweep merges
+states it immediately throws away.** The backward loop reads `(origin,
+row key)` pairs off each output and discards it, and the merge's dedup
+finds nothing anyway because the per-lane origin column makes every row
+distinct. `AbstractRun::skip_boundary_merge` stops the boundary after
+the abstraction and the GC.
+
+Measured at H=68 on room (1,0), `g.bin` byte-identical, 9.4M expansions:
+sweep wall **91.3 -> 85.4 s (-6.5%)**, peak 8.84 -> 8.49 GB,
+`bwdt.replay` 48.3 -> 27.0 s, `fwd.merge` 22.6 -> 1.1 s. But
+`bwdt.keys` 6.2 -> 21.4 s: the merge was doing materialization the key
+read rode on cheaply, so most of the saving moves rather than
+disappears. `CELESTE_SWEEP_MERGE=1` restores the old path for A/B.
+
+What that leaves: `bwdt.keys` 21.4 s (25% of the sweep) and
+`bwdt.index` 18.1 s (21%). Option 3 is now the whole of P2, and options
+1 and 2 are closed - there is no merge left to make cheaper.
+
 ## P3 - ladder-level waste (unmeasured, list only)
 
-- `--variant` is not accepted by `pos-graph`/`sweep` (task #114), so
-  those stages run the base recipe. On room (0,0) pos-graph was the
-  largest stage at 3567 s; P0 removes most of that, but the sweep's
-  replay still cannot use a variant.
+- ~~`--variant` is not accepted by `pos-graph`/`sweep`~~ DONE
+  2026-08-18 (task #114): both take it, ladder.sh passes the same set to
+  all three stages, gated with an identity variant at H=68 to
+  byte-identical `posgraph.bin` and `g.bin`.
 - Each refuted horizon re-runs the sweep from scratch (276 s at H=72,
   and it grows faster in H than the forward does: 20 s at H=60, 160 s at
   H=70). Whether `g` can be extended across horizons instead of rebuilt

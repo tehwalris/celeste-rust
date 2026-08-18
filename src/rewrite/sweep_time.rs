@@ -550,6 +550,18 @@ pub fn backward_sweep_time(
     let mut engine = AbstractRun::start_with_deopt(program, plain, mapping.clone(), false)?;
     register_variants(&mut engine, mapping, variants(program)?)?;
     engine.disable_frontier();
+    // This loop reads (origin, row key) pairs off each output state and
+    // discards the states; merging them by shape first is work thrown
+    // away. See `skip_boundary_merge` for what changes - `out_of_table`
+    // becomes a count with duplicates, and `newly` is idempotent.
+    //
+    // `CELESTE_SWEEP_MERGE=1` puts the merge back, for A/B only. `g.bin`
+    // is byte-identical either way (gated at H=68); what changes is where
+    // the time goes, and the trade is not one-sided - the merge's cost
+    // moves partly into the per-fragment key read.
+    if std::env::var("CELESTE_SWEEP_MERGE").as_deref() != Ok("1") {
+        engine.skip_boundary_merge();
+    }
 
     let mut g: Vec<u16> = vec![G_UNREACHABLE; n_rows];
     // B, grown backward. It holds B(i+1) while frame i is being tested; the
@@ -660,9 +672,11 @@ pub fn backward_sweep_time(
                     .with_context(|| format!("expanding candidates at f{:03}", i))
             })?;
             let t_keys = std::time::Instant::now();
-            for out in engine.states() {
-                let origins = deopt_collect::read_origins_named(out, SWEEP_ORIGIN);
-                let mut stripped = out.clone();
+            // Taken, not borrowed: the states are dropped at the bottom of
+            // this block either way, and stripping the origin column out of
+            // a borrowed state meant cloning it first.
+            for mut stripped in engine.take_states() {
+                let origins = deopt_collect::read_origins_named(&stripped, SWEEP_ORIGIN);
                 stripped.global_env.remove(SWEEP_ORIGIN);
                 stripped.gc();
                 let keys = row_keys(&stripped)?;

@@ -335,6 +335,10 @@ pub struct AbstractRun {
     /// The compiled frame body (`CELESTE_COMPILED_FORWARD`); `None` means
     /// every chunk runs the interpreter. See `CompiledForward`.
     compiled: Option<&'static CompiledForward>,
+    /// Stop the boundary after the abstraction and the GC, leaving the
+    /// frame's output as FRAGMENTS instead of merging them by shape. See
+    /// `skip_boundary_merge`.
+    skip_merge: bool,
 }
 
 /// The previous precision level's result, used to confine this level's
@@ -1153,6 +1157,7 @@ impl AbstractRun {
             pos_obs: None,
             quiet: false,
             compiled: compiled_forward(program)?,
+            skip_merge: false,
         })
     }
 
@@ -1258,6 +1263,32 @@ impl AbstractRun {
     /// Turn frontier subtraction off (regardless of the env flag). The
     /// backward sweep expands saved frontier batches one frame at a time and
     /// must see every successor lane, not just never-seen ones.
+    /// Leave the frame's output as fragments: abstract and GC them, but do
+    /// not group and merge them by shape.
+    ///
+    /// For callers that read something off the boundary rows and then throw
+    /// the states away - the backward sweep, which reads `(origin, row
+    /// key)` pairs per lane and discards everything else. Merging costs
+    /// nearly half of that replay (`fwd.merge` 22.6 s of `bwdt.replay`'s
+    /// 48.3 s at H=68) and buys the sweep nothing: its per-lane origin
+    /// column makes every row distinct, so the dedup inside the merge finds
+    /// almost nothing, and the k-way concatenation it does instead is
+    /// immediately discarded.
+    ///
+    /// NOT for a searching run. The merge is what keeps the frontier from
+    /// fragmenting without bound across frames, and the dedup inside it is
+    /// part of the abstraction. This only makes sense where the states do
+    /// not survive the frame.
+    ///
+    /// One VISIBLE difference: without the merge's dedup, two output lanes
+    /// that are identical rows are read twice instead of once. Every
+    /// consumer of the pairs must therefore be idempotent per (origin, key)
+    /// - the sweep's `newly` bitset is - and pure COUNTS over the pairs
+    /// change. `out_of_table` is the one that does; it is a diagnostic.
+    pub fn skip_boundary_merge(&mut self) {
+        self.skip_merge = true;
+    }
+
     pub fn disable_frontier(&mut self) {
         self.visited_rows = None;
     }
@@ -1946,7 +1977,11 @@ impl AbstractRun {
                 "merge_frame_boundary",
                 "merge_site",
             );
-            vectorize_states(new_states)
+            if self.skip_merge {
+                crate::interpreter::vectorize::gc_states(new_states)
+            } else {
+                vectorize_states(new_states)
+            }
         };
         self.apply_band_filter(frame_no)?;
         self.subtract_frontier()?;
@@ -2060,6 +2095,17 @@ impl AbstractRun {
 
     pub fn states(&self) -> &[State] {
         &self.states
+    }
+
+    /// Take the frame's output states, leaving the run empty.
+    ///
+    /// For a caller that consumes the output and then resets the run
+    /// anyway - the backward sweep, which reads `(origin, row key)` pairs
+    /// and calls `restore` with an empty frontier. Borrowing forced it to
+    /// CLONE every state to strip the origin column, and at H=68 that
+    /// clone was most of `bwdt.keys`.
+    pub fn take_states(&mut self) -> Vec<State> {
+        std::mem::take(&mut self.states)
     }
 
     pub fn lane_count(&self) -> usize {

@@ -1527,6 +1527,35 @@ pub fn subtract_precomputed(
     )
 }
 
+/// GC every state, in parallel. The first half of `vectorize_states`, and
+/// on its own it is what a caller wants when it needs canonical rows but
+/// not merged states - see `AbstractRun::skip_boundary_merge`.
+///
+/// One state's gc cannot see another's, so this is a plain map over
+/// independent work - and at the frame boundary there are hundreds of
+/// survivor fragments. Chunked rather than one task per state so the
+/// thread count does not track the fragment count.
+pub fn gc_states(states: Vec<State>) -> Vec<State> {
+    let _gc_trace = TraceSpan::new("gc_before_vectorize", "gc");
+    let threads = crate::interpreter::virtual_merge::merge_threads();
+    if states.len() < 8 || threads == 1 {
+        states.into_iter().map(|mut s| { s.gc(); s }).collect()
+    } else {
+        let mut states = states;
+        let chunk = states.len().div_ceil(threads);
+        std::thread::scope(|scope| {
+            for part in states.chunks_mut(chunk) {
+                scope.spawn(move || {
+                    for s in part {
+                        s.gc();
+                    }
+                });
+            }
+        });
+        states
+    }
+}
+
 pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
     let _trace = TraceSpan::new("vectorize_states", "vectorize");
     let mut stats = VectorizeTimingStats::default();
@@ -1534,30 +1563,7 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
 
     // GC all states before shape grouping.
     // This removes garbage from heaps, allowing states to match shapes better.
-    let states: Vec<State> = {
-        let _gc_trace = TraceSpan::new("gc_before_vectorize", "gc");
-        // One state's gc cannot see another's, so this is a plain map over
-        // independent work - and at the frame boundary there are hundreds
-        // of survivor fragments. Chunked rather than one task per state so
-        // the thread count does not track the fragment count.
-        let threads = crate::interpreter::virtual_merge::merge_threads();
-        if states.len() < 8 || threads == 1 {
-            states.into_iter().map(|mut s| { s.gc(); s }).collect()
-        } else {
-            let mut states = states;
-            let chunk = states.len().div_ceil(threads);
-            std::thread::scope(|scope| {
-                for part in states.chunks_mut(chunk) {
-                    scope.spawn(move || {
-                        for s in part {
-                            s.gc();
-                        }
-                    });
-                }
-            });
-            states
-        }
-    };
+    let states: Vec<State> = gc_states(states);
 
     if states.is_empty() {
         LAST_VECTORIZE_STATS.with(|s| *s.borrow_mut() = Some(stats));
