@@ -37,8 +37,8 @@ queue, because P1's crate split should move only code that survives K4.
 |---|---|---|---|---|
 | 1 | **P0** fused pos-graph by default | DONE | - | -46% of level 0 (task #109) |
 | 2 | **P0b** one pos-graph for all k levels (#149) | DONE | - | removed 16 stages/horizon; gated at k=1..3 with two controls |
-| 3 | **K4 stage 2** block->State exporter + interpreter fallback | | 1-2 d | unblocks every deletion below; fallback speed no longer matters (spawn shapes only) |
-| 4 | **K4 stages 4-5** delete the Rt2 ENGINE, gen.rs program body, scalar oracle; simplify | | 1-2 d | deletes 30k+ generated lines BEFORE they can be moved |
+| 3 | **K4 stage 2** block->State exporter + interpreter fallback | DONE | - | one reference, not two; gates f20/25/30/35 exact, cost is noise |
+| 4 | **K4 stages 4-5** delete the Rt2 ENGINE, gen.rs program body, scalar oracle; simplify | next | 1-2 d | deletes 30k+ generated lines BEFORE they can be moved. Splits in two - see k4-retirement-plan.md "the constraint the plan missed": the name tables are a side effect of the emission walk, so stop WRITING the body first (mechanical), and turn the emitter into a pure interning walk SECOND, each gated on the tables coming out byte-identical |
 | 5 | **P1** crate split + one frame interface (#150) | | days | the campaign can finally call the kernel; forward AND sweep at once |
 | 6 | **K5** kernels for rooms (0,0)/(2,0) | | days | P1's win is room-shaped until this |
 | 7 | **P2** the sweep's merge/regroup third (#151) | | days | 91 s of the sweep's 190 s replay; lands on P1's interface |

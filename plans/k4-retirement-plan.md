@@ -120,6 +120,46 @@ Interpreter-fallback design notes for stage 2:
   body, then simplify) follow, and stage 2 has removed their last
   blocker.
 
+## Stage 4: the constraint the plan missed (found 2026-08-18)
+
+"transpile emits the name tables plus the kernels" is NOT a deletion,
+because **the name tables are a side effect of the emission walk.**
+`Gen` interns STRINGS / GLOBAL_NAMES / FIELD_NAMES / FN_NAMES /
+SITE_INFO / BRANCH_INFO as it walks the program emitting function
+bodies; delete the walk and the tables lose their source, change the
+walk and they can silently REORDER.
+
+Reordering them is not cosmetic. `FIELD_NAMES` is the canonical field
+ordering the boundary hashes (`Cell2::Obj` holds interned field ids),
+so a different order is a different shape hash, a different row key,
+and a different search. This is the same class of thing as the
+BUILTIN_NAMES ABI already flagged below.
+
+So stage 4 splits into two pieces with very different risk:
+
+1. **Stop WRITING the program body** (`call_value`, `call_fn`, the
+   per-function bodies, `use crate::runtime::*`) - gen.rs 29,672 ->
+   ~300 lines - and delete everything in native-probe that consumed
+   it: the `Engine` trait, runtime.rs's scalar execution, `Rt2`'s
+   Engine impl (keeping the STRUCT + boundary/dedup/merge/retain),
+   `import_lane` + `assert_lane_matches_block`, the concrete `-i/-f`
+   and `--bench` modes, `SplitReq` and its panic hook. Mechanical;
+   compiler errors are the worklist. KEEP `BUILTIN_NAMES` - import.rs
+   needs it for both importers.
+2. **Turn `Gen`'s emitter into a pure interning walk** (~540 lines of
+   `format!` deleted, the recursion kept). Only worth doing after (1),
+   and it needs its own gate.
+
+The gate for BOTH is the same and it is cheap and total: regenerate
+gen.rs and require the name-table section to be **byte-identical** to
+what is checked in. That is exactly the property a reordering would
+break. (It has already paid once: regenerating after the header fix
+changed two comment lines and nothing else, which is what confirmed
+gen.rs was the rewritten program.) Then f20/25/30/35 + the suite.
+
+Do NOT do (2) as part of (1). If the tables move, you want to know
+which change moved them.
+
 ## Where this sits in the overall queue
 
 See plans/campaign-cost-plan.md "ORDER OF WORK": stages 2 and 4-5 of
