@@ -88,3 +88,19 @@ Kernel alone: 108–221 ms single-core for 61% of lanes x 64 inputs.
   typo'd keys fail loudly via the never-dispatched check.
 - steady-shape.json + kernel_gen.rs are gitignored generated artifacts;
   regen chain is documented in kernel-plan.md.
+
+## Addendum (~05:50): per-class overlays landed after the report
+
+All SIX pm1 classes of the player shape now have certified branch-free
+overlays (each: hosted verify vs rewrites-compile, identical through
+f40):
+- steady (61% of lanes): 5 blocks / ~2,150 instrs
+- dash, dash_time 1-4 (23%): 5 blocks / 1,804 instrs (mid-dash arm)
+- frozen, freeze 1-2 (16%): 3 blocks / **236 instrs** (early return -
+  the entire update folds away)
+
+Each overlay cost FOUR recipe lines on the shared trace10 prefix. The
+kernel registry that plugs all three into the engine is task #147 with
+a written plan (kernel-plan.md); with it, 100% of player lanes run
+kernel code and the frozen classes become nearly free. K4's Rt2/Rt3
+retirement unblocks right after.
