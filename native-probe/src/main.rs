@@ -1136,6 +1136,45 @@ fn frame_step(
             continue;
         }
         for part in sub.partition_pm1(ids) {
+            if std::env::var("CELESTE_KERNEL_MISS").is_ok() {
+                let mixed = part
+                    .pm1_cells(ids)
+                    .iter()
+                    .filter(|c| !matches!(part.cols[**c as usize], runtime2::Col::U(_)))
+                    .count();
+                if mixed > 0 {
+                    static ONCE2: std::sync::Once = std::sync::Once::new();
+                    ONCE2.call_once(|| {
+                        eprintln!(
+                            "[partition_pm1] part width {} still has {} mixed pm1 columns; cells {:?}",
+                            part.width,
+                            mixed,
+                            part.pm1_cells(ids)
+                        );
+                        for c in part.pm1_cells(ids) {
+                            let d = match &part.cols[c as usize] {
+                                runtime2::Col::U(_) => "uniform".to_string(),
+                                runtime2::Col::N(vs) => {
+                                    let mut s: Vec<String> =
+                                        vs.iter().map(|v| format!("{:?}", v)).collect();
+                                    s.sort();
+                                    s.dedup();
+                                    format!("N {:?}", s)
+                                }
+                                runtime2::Col::V(vs) => {
+                                    let mut s: Vec<String> =
+                                        vs.iter().map(|v| format!("{:?}", v)).collect();
+                                    s.sort();
+                                    s.dedup();
+                                    format!("V {:?}", s)
+                                }
+                                runtime2::Col::I(_) => "I".to_string(),
+                            };
+                            eprintln!("    cell {}: {}", c, d);
+                        }
+                    });
+                }
+            }
             let key = (part.shape_hash, part.pm1_key_hash(ids));
             match groups.iter_mut().find(|(h, _)| *h == key) {
                 Some((_, g)) => g.push(part),
@@ -1149,6 +1188,21 @@ fn frame_step(
         .map(|(_, g)| runtime2::Rt2::merge_many(g))
         .collect();
     phase("merge");
+    if std::env::var("CELESTE_KERNEL_MISS").is_ok() {
+        let mut mixed = 0usize;
+        for b in &out {
+            for c in b.pm1_cells(ids) {
+                if !matches!(b.cols[c as usize], runtime2::Col::U(_)) {
+                    mixed += 1;
+                }
+            }
+        }
+        eprintln!(
+            "[frame_step] {} out blocks, {} non-uniform pm1 columns",
+            out.len(),
+            mixed
+        );
+    }
     out
 }
 
@@ -1354,6 +1408,23 @@ fn run_row_census(dir: &str, frame: u32) {
 /// kernel emitter consumes. Topology (globals, object fields, arrays,
 /// closures) is by NAME so the consumer needs no shared interner; the
 /// varying set is the UNION over all steady blocks of the frame.
+/// Cells that must be recorded as PER-LANE even if this frame's blocks
+/// happen to hold one value for them. A witness is a sample: a cell the
+/// sampled frame agrees on can still vary in a block the engine produces
+/// a frame later, and the kernel would then refuse to bind (that is
+/// exactly what dash_effect_time did - see plans/kernel-plan.md). Only
+/// the pm1 cells are uniform by CONSTRUCTION, because the partitioner
+/// splits on them; anything else is uniform by luck.
+///
+/// Set CELESTE_FORCE_VARY=name,name to extend the list.
+fn force_vary_names() -> Vec<String> {
+    let mut names: Vec<String> = vec!["dash_effect_time".to_string()];
+    if let Ok(v) = std::env::var("CELESTE_FORCE_VARY") {
+        names.extend(v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+    }
+    names
+}
+
 fn run_emit_shape(dir: &str, frame: u32, out_path: &str, class: &str) {
     use serde_json::json;
     let rt = build_rt();
@@ -1413,6 +1484,14 @@ fn run_emit_shape(dir: &str, frame: u32, out_path: &str, class: &str) {
             if !matches!(col, runtime2::Col::U(_)) {
                 vary[c] = true;
             }
+        }
+    }
+    let forced = force_vary_names();
+    for c in 0..ncells {
+        let name = rev0[c].and_then(|h| names0.get(&h.raw()).cloned()).unwrap_or_default();
+        if forced.iter().any(|f| name == *f || name.ends_with(&format!(".{}", f))) && !vary[c] {
+            eprintln!("[emit-shape] forcing cell {} ({}) to per-lane", c, name);
+            vary[c] = true;
         }
     }
     let av_kind = |a: &runtime2::AV| -> serde_json::Value {
@@ -1594,6 +1673,39 @@ fn note_bind_failure(
     if std::env::var("CELESTE_KERNEL_MISS").is_err() {
         return;
     }
+    // One-shot detail on the first refusal: which cells vary, with the
+    // distinct values, so a "this cell varies" line can be traced back
+    // to a partition that should have split it.
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!("kernel miss detail: chunk width {}", chunk.width);
+        for (cell, want) in uni_cells {
+            let vals: Vec<String> = match &chunk.cols[*cell as usize] {
+                runtime2::Col::N(vs) => {
+                    let mut d: Vec<String> =
+                        vs.iter().map(|n| format!("{:?}", n)).collect();
+                    d.sort();
+                    d.dedup();
+                    d
+                }
+                runtime2::Col::V(vs) => {
+                    let mut d: Vec<String> = vs.iter().map(|v| format!("{:?}", v)).collect();
+                    d.sort();
+                    d.dedup();
+                    d
+                }
+                _ => continue,
+            };
+            eprintln!(
+                "  cell {} (want {}) has {} distinct values: {}",
+                cell,
+                want,
+                vals.len(),
+                vals.iter().take(4).cloned().collect::<Vec<_>>().join(", ")
+            );
+        }
+        eprintln!("  pm1 cells: {:?}", chunk.pm1_cells(ids));
+    });
     let mut fail = BIND_FAIL.lock().unwrap();
     *fail
         .entry((

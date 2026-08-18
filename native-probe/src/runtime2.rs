@@ -2583,7 +2583,15 @@ impl Rt2 {
             }
         };
         if groups.len() == 1 {
-            return vec![self];
+            // Already pure for this cell - but "pure" means UNIFORM, and
+            // saying so in the representation is the whole point (a
+            // constant Col::N does not bind). This early path is the
+            // COMMON one, so skipping the collapse here left nearly every
+            // block unbindable even after it had been partitioned.
+            let mut b = self;
+            let col = std::mem::replace(&mut b.cols[cell as usize], Col::U(AV::Nil));
+            b.cols[cell as usize] = collapse_uniform(col);
+            return vec![b];
         }
         groups
             .into_iter()
