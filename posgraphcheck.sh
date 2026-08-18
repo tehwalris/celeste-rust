@@ -38,6 +38,20 @@ SPLIT=${SPLIT:-30}
 export CELESTE_WIN_AT_XY=${CELESTE_WIN_AT_XY:-26,108}
 export CELESTE_START_ROOM="$ROOM"
 export CELESTE_FRONTIER_ONLY=1 CELESTE_DEOPT_COLLECT_FIRST=1
+# The row-set and `g` comparisons below read f<H>/visited.bin, which the
+# DEFAULT (mmap) visited engine no longer writes - it keeps rowkeys
+# sidecars instead. Without this the two strongest checks in this script
+# die on a missing file and print "*** DIVERGED ***", which is loud but
+# says the wrong thing: they never ran at all. Caught on room (1,0),
+# 2026-08-18. Pin the map engine so they do run.
+#
+# What that costs: the gate then exercises the map engine's forward pass,
+# not the default one. The property under test (recording vs replaying
+# the pos-graph) is independent of how the visited set is stored, so this
+# is sound - but the real fix is to port tools/rowdiff.py and
+# tools/gjoin.py to the rowkeys sidecars, which task #122 needs anyway
+# before the map engine can be deleted.
+export CELESTE_VISITED_ENGINE=map
 export CELESTE_MAX_STATE_LANES=8000 CELESTE_FRUIT_CHUNK_LANES=8000
 D=${D:-/tmp/posgraphcheck}
 rm -rf "$D"; mkdir -p "$D"

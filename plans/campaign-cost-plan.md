@@ -38,13 +38,20 @@ cannot). A larger table is sound by construction: it only shrinks the
 sweep's candidate set, and the EXPANSION is what establishes an edge.
 
 Steps:
-1. Run `posgraphcheck.sh` with `ROOM=1,0` (it is currently gated only on
-   room (2,0)). It checks the three things that matter: the row table is
-   unchanged, `g` is identical as a function of the row, and the table
-   survives `--resume`. [IN PROGRESS]
-2. Flip ladder.sh's `FUSE` default to on, and make the `l0-posgraph`
-   stage a no-op reuse when the table already covers the horizon (that
-   path already exists).
+1. Run `posgraphcheck.sh` with `ROOM=1,0`. **DONE 2026-08-18, all four
+   checks pass**: rows identical (900,028, onlyA=0 onlyB=0), `g`
+   IDENTICAL as a function of the row, table a strict superset (+1
+   pair), resume correct.
+   - The gate was itself broken and said so misleadingly: its row and
+     `g` comparisons read `f<H>/visited.bin`, which the DEFAULT mmap
+     visited engine no longer writes, so both died on a missing file and
+     printed "*** DIVERGED ***" - loud, but for the wrong reason. Fixed
+     by pinning `CELESTE_VISITED_ENGINE=map` in the script; the real fix
+     is porting tools/rowdiff.py + gjoin.py to the rowkeys sidecars,
+     which task #122 needs anyway.
+2. Flip ladder.sh's `FUSE` default to on. **DONE**: on for rooms (1,0)
+   and (2,0) - the gated ones - and the replay elsewhere with a printed
+   reason. FUSE=0/1 still force either path.
 3. Gate room (0,0) the same way before its next campaign.
 4. Only then consider deleting the standalone replay builder. It is the
    conservative path for an ungated room and for extending a table
@@ -61,8 +68,10 @@ superset is sound. Today ladder.sh rebuilds it per (k,H) - measured
 19-22 s x 16 levels x every horizon.
 
 Steps:
-1. Verify the superset claim on real data: build the k=1 and k=2 tables
-   and check `pairs(k) ⊆ pairs(0)`. If it holds, this is free.
+1. Verify the superset claim on real data. **DONE 2026-08-18, it
+   holds exactly**: level 0 has 166,455 pairs, k=1 has 34,137 and k=2
+   has 21,579, and both are strict SUBSETS - zero pairs outside level
+   0's table. So the level-0 table can serve every k level.
 2. Let `prepare_pos_graph` accept a table whose fingerprint differs only
    in rem/spd precision, with the level-0 table passed explicitly
    (`--pos-graph-from DIR`), rather than loosening the fingerprint check

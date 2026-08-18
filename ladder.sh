@@ -109,14 +109,37 @@ stage() { # $1 name, $2 logfile, rest: the command
 # FUSE=1 records the position graph DURING the level-0 forward pass instead
 # of replaying the whole room for it afterwards (`--record-pos-graph`). The
 # l0-posgraph stage below then finds a table that already covers the horizon
-# and reuses it. Gated on room (2,0) at h40: the visited row SETS are
-# identical with and against it, the recorded table is a strict superset (one
-# extra pair - the spawn's first move, which the replay cannot see because it
-# starts from the frame-1 batch), and the sweep's `g` is identical as a
-# function of the row. Off by default: on a room whose forward pass is not
-# already checked this way, the replay is the conservative path.
-FUSE_ARG=""
-[ -n "${FUSE:-}" ] && FUSE_ARG="--record-pos-graph"
+# and reuses it.
+#
+# ON by default for rooms where posgraphcheck.sh has been run, because the
+# replay is not a cheap safety margin - it is HALF of level 0. Measured on
+# room (1,0) at H=72 with a synthetic win: forward 248 s + pos-graph 242 s
+# unfused, against 265 s fused. The recording costs 7% of the forward pass
+# and removes a 242 s stage.
+#
+# Gated at h40 on room (2,0) (2026-08-17) and room (1,0) (2026-08-18): the
+# visited row SETS are identical with and without it (900,028 rows, onlyA=0
+# onlyB=0 on (1,0)), the sweep's `g` is identical as a function of the row,
+# the recorded table is a strict SUPERSET (one extra pair - the spawn's
+# first move, which a replay starting from the frame-1 batch cannot see),
+# and the table survives --resume. A superset is sound by construction: the
+# table only shrinks the sweep's candidate set, and the EXPANSION is what
+# establishes an edge.
+#
+# Room (0,0) is NOT gated yet, so it keeps the replay until someone runs
+# `ROOM=0,0 ./posgraphcheck.sh`. FUSE=0 forces the replay anywhere.
+case "${FUSE:-}" in
+  1) FUSE_ARG="--record-pos-graph" ;;
+  0) FUSE_ARG="" ;;
+  "") case "$ROOM" in
+        1,0|2,0) FUSE_ARG="--record-pos-graph" ;;
+        *) FUSE_ARG=""
+           echo "pos-graph: replay path (room $ROOM is not gated for fused recording;" \
+                "run ROOM=$ROOM ./posgraphcheck.sh, then FUSE=1)" ;;
+      esac ;;
+  *) echo "FUSE must be 0 or 1" >&2; exit 1 ;;
+esac
+[ -n "$FUSE_ARG" ] && echo "pos-graph: recorded IN the forward pass (fused)"
 for H in $(seq "$FROM" "$TO"); do
   echo "=== horizon $H: level 0 extend + sweep ==="
   # A level-0 tree built past this horizon in one process (which is how a
