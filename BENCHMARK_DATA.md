@@ -144,6 +144,30 @@ allows): kernel arithmetic 16.6%, append+key callback 17.1%, boundary
 15.1%, the non-kernel fallbacks (Rt3 + Rt2) 21% - those last are the f36
 shapes the gate chases, and they are what K4/K5 address next.
 
+## The multi-frame number, and why the one-frame bench was flattering
+
+The one-frame bench feeds the engine INTERPRETER checkpoints, which are
+already pm1-partitioned, so they bind and 100% of lanes run kernel code.
+The engine's own output did not bind: at f35 the very next frame ran
+269,059 lanes with ZERO kernel coverage. Two partitioner bugs (see the
+commits): pm1 resolved player fields off the player TYPE table instead
+of the instance, and partitioning left the split cell a constant Col::N
+where bind requires Col::U - including on the early-return path taken
+when a block is ALREADY pure, which is the common one.
+
+`native-probe --abstract 34` (34 frames from the room start, lane counts
+identical throughout - gate 1):
+
+| | 34 frames | frame 34 (132,153 lanes) |
+|---|---|---|
+| before today | 824 ms | 300 ms |
+| pm1 instance + collapse on split | 471 ms | 158 ms |
+| + collapse on the pure path (100% coverage) | **175 ms** | **52 ms** |
+
+The lesson worth keeping: measure the engine on ITS OWN output. A bench
+that replays interpreter states measures a path the campaign never
+takes, and it hid a 100%-fallback frame for a full day.
+
 CAUTION, learned the hard way (2026-08-18): regenerating a kernel
 invalidates every gate. The dash kernel shipped overnight emitting ONE
 button variant instead of 64 because a tainted output cell had no
