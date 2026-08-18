@@ -41,6 +41,9 @@ Three things to read off it before designing anything:
 - **The unit of the problem is 2.9 BILLION rows, not 51 million.** Dedup
   sees 57 offered rows per input lane and keeps one in 52. Any design
   that is not built for a 50:1 kill ratio is solving a different problem.
+- **~28 of the 52 is WITHIN a frame; only ~1.7 is against history**
+  (`CELESTE_DEDUP_CENSUS=1`, measured f50..f64, stable). This decides the
+  architecture, see below.
 - **24.7 ns per offered row is already respectable.** A probe into a
   56M-row visited set is a guaranteed cache miss (~80-100 ns of latency),
   so 25 ns means the existing path already gets real memory-level
@@ -110,6 +113,29 @@ with the mutating insert serialized afterwards.
 
 PRIORITY: **first**, as an isolated study before any integration. See D2.
 
+THE SHAPE IS NOW MEASURED, and it is the favourable one. At f64:
+
+```
+  190,597,048  offered
+   58,154,366  global probes today   (the per-fragment `seen` set: 3.3x)
+    6,827,968  distinct in-frame     (a frame-wide tier would leave this: 8.5x fewer)
+    3,850,608  new                   (history only kills 1.7:1)
+```
+
+So the first tier's working set is ONE FRAME'S DISTINCT ROWS - 6.8M keys,
+109 MB raw, or hash-partitioned across 16 workers 425k keys / 6.8 MB
+each (L3 resident; under 1 MB with 2-byte fingerprints, i.e. L2). Not the
+56M-row global set. And **8.5x of today's global probes are redundant** -
+the same key already probed by another fragment of the same frame -
+because the existing local set is per-FRAGMENT and a frame has ~720 of
+them. Widening that set from fragment to worker-batch or frame is the
+first experiment, and it may be most of the win on its own.
+
+The second tier is then a 6.8M-row stream against a 56M-row mmap'd set
+at a 1.7:1 kill. That is a genuinely memory-bound problem and the place
+for prefetch/MLP batching - but it is 3.6% of the rows, so it is no
+longer the headline.
+
 ### 3. Deferred deopt
 
 WHAT EXISTS: the opposite of the sketch. A chunk whose frame fails a
@@ -171,7 +197,10 @@ preserve that order. Decide before building:
   survivors in a canonical order. The ordered pass is over ~56M
   survivors, not 2.9G probes, so it should be cheap. This is the
   recommended option and it needs its own gate (byte-identical
-  checkpoints against today).
+  checkpoints against today). Philippe's suggestion of core-local ids
+  composes with this: cores can assign local ids freely as long as the
+  local->global renumbering is a deterministic function of a canonical
+  order, which a hash partition gives for free.
 - **(b) Accept isomorphism** and re-gate everything downstream. More
   freedom, much more risk, and it invalidates every byte-comparison gate
   we have.
@@ -205,11 +234,23 @@ worth most of 1,163 ns/input-lane on its own.
 At H=68 the compiled run's visited set has 55,958,766 rows and the
 interpreted run's has 55,958,742. Same final frontier (4,976,277 lanes),
 same first-win frame (64), but **not the same set**. 24 rows out of 56
-million. The likely cause is that the two runs take different deopt
-routes (optimistic vs collect-first, a difference P1 stage 3 introduced),
-and a superset is the sound direction for a forward over-approximation -
-but "likely" and "probably sound" are not what this project runs on, and
-no A/B at depth can be trusted until it is explained.
+million.
+
+The obvious suspect was the deopt route - P1 stage 3 made the compiled
+path take the optimistic arm where the interpreter takes collect-first.
+**That is REFUTED**: running the interpreter with collect-first OFF gives
+55,958,742, exactly the collect-first figure. So the extra 24 rows come
+from the compiled engine itself, not from how failures are handled.
+
+Which makes it worse, not better. Something in `Rt2::boundary`, the
+export, or the compile recipe's own program reaches 24 rows the campaign
+recipe does not, somewhere past f40 - the
+`CELESTE_COMPILED_FORWARD=check` gate runs to f40 and passes, and deopt
+does not start until f58. A superset is the sound direction for a forward
+over-approximation, so this is unlikely to be a wrong ANSWER, but it is
+definitely a different SEARCH, and no A/B at depth can be trusted until
+it is explained. Extend the check gate past f58 first; it is the cheapest
+way to bisect.
 
 ## Order of work
 

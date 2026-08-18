@@ -1333,6 +1333,63 @@ pub struct VisitedKeys {
     lanes: usize,
 }
 
+/// Dedup census (`CELESTE_DEDUP_CENSUS=1`): how much of the frontier's
+/// kill ratio is WITHIN a frame and how much is against earlier frames?
+///
+/// The two want completely different machinery. If most duplicates die
+/// against rows this same frame produced, the working set for that stage
+/// is one frame's DISTINCT rows and a cache-sized tier is realistic; what
+/// reaches the global structure is then a much smaller stream. If instead
+/// most die against history, no local tier helps and the cost is
+/// irreducibly a probe into a set far larger than cache.
+///
+/// Counting distinct keys exactly would need a set the size of the offered
+/// stream - 287M keys, 4.6 GB, at f68. So SAMPLE: keep only keys whose low
+/// bits are zero, count those exactly, and scale. A 1/64 sample estimates a
+/// count in the millions to well under a percent, which is far tighter than
+/// the question needs ("is it 40:1 or 1.2:1"), and it costs 1/64 of the
+/// memory and of the lock traffic.
+pub const DEDUP_CENSUS_SHIFT: u32 = 6;
+static DEDUP_CENSUS: std::sync::Mutex<Option<rustc_hash::FxHashSet<(u64, u64)>>> =
+    std::sync::Mutex::new(None);
+
+pub fn dedup_census_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CELESTE_DEDUP_CENSUS").is_some())
+}
+
+fn dedup_census_sample(keys: &[(u64, u64)]) {
+    let mask = (1u64 << DEDUP_CENSUS_SHIFT) - 1;
+    let mut guard = DEDUP_CENSUS.lock().unwrap();
+    let set = guard.get_or_insert_with(Default::default);
+    for k in keys {
+        if k.0 & mask == 0 {
+            set.insert(*k);
+        }
+    }
+}
+
+/// Estimated distinct keys offered this frame, and reset. `None` if the
+/// census is off or nothing was offered.
+pub fn dedup_census_take() -> Option<u64> {
+    if !dedup_census_on() {
+        return None;
+    }
+    let mut guard = DEDUP_CENSUS.lock().unwrap();
+    let set = guard.take()?;
+    Some((set.len() as u64) << DEDUP_CENSUS_SHIFT)
+}
+
+/// How many keys actually reached the GLOBAL structure this frame - i.e.
+/// survived the local per-fragment `seen` set. The gap between this and
+/// the frame's distinct-key count is what a frame-wide (rather than
+/// fragment-wide) local tier would remove.
+static GLOBAL_PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn global_probes_take() -> u64 {
+    GLOBAL_PROBES.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// PHASE 1 of the frontier subtract: canonicalize the state into columns,
 /// hash each lane into its 128-bit row key, and look each key up read-only.
 ///
@@ -1396,14 +1453,27 @@ pub fn visited_row_keys(
     // against this dump is what caught it, and is what to repeat if the
     // reader is ever touched. Gated, and only reached for candidate lanes.
     let dump_rows = std::env::var_os("CELESTE_DUMP_ROWS").is_some();
+    let census = dedup_census_on();
+    if census {
+        dedup_census_sample(&keys);
+    }
     let local_first = visited.local_dedup_first();
     let mut seen: rustc_hash::FxHashSet<(u64, u64)> = rustc_hash::FxHashSet::default();
     let mut candidates: Vec<(u32, (u64, u64))> = Vec::new();
     for (i, key) in keys.into_iter().enumerate() {
+        // The global probe, counted when the census is on: the gap between
+        // this count and the frame's DISTINCT key count is exactly what a
+        // frame-wide local tier would remove, since `seen` is per-fragment.
+        let probe = |key| {
+            if census {
+                GLOBAL_PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            !visited.contains_historic(key)
+        };
         let is_candidate = if local_first {
-            seen.insert(key) && !visited.contains_historic(key)
+            seen.insert(key) && probe(key)
         } else {
-            !visited.contains_historic(key) && seen.insert(key)
+            probe(key) && seen.insert(key)
         };
         if is_candidate {
             if dump_rows {

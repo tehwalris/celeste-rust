@@ -95,6 +95,57 @@ with `--site-slots plans/site-slots-room10-f035.json` - that closes
 the gate to one shape again, so it must come with a census for EVERY
 shape the run visits, or stay off.
 
+# Where the 52:1 kill ratio comes from (2026-08-19)
+
+`CELESTE_DEDUP_CENSUS=1` splits the frontier's kill ratio into the part
+that dies against rows THIS frame produced and the part that dies against
+history. The two want completely different machinery, and the answer is
+lopsided. Room (1,0), H=64, ladder level-0 env; distinct counts are a
+1/64 sample scaled up (exact would need 4.6 GB of keys at f68).
+
+| frame | offered | ~distinct in-frame | new | within-frame | cross-frame | global probes |
+|---|---|---|---|---|---|---|
+| f60 | 107,694,485 | 3,729,472 | 2,199,846 | 28.9:1 | 1.7:1 | 32,242,294 |
+| f62 | 134,329,805 | 4,958,208 | 2,802,179 | 27.1:1 | 1.8:1 | 41,312,314 |
+| f64 | 190,597,048 | 6,827,968 | 3,850,608 | 27.9:1 | 1.8:1 | 58,154,366 |
+
+**~28:1 of the 52:1 is within-frame; only ~1.7:1 is against history.** The
+ratio is stable from f50 on (31.8:1 at f50 drifting to 27.9:1 at f64), so
+it is a property of the search and not of the depth.
+
+That decides the architecture. The first stage's working set is ONE
+FRAME'S DISTINCT ROWS - 6.8M keys at f64, 109 MB raw, and hash-partitioned
+across 16 workers 425k keys or 6.8 MB each, which is an L3 resident, or
+under 1 MB with 2-byte fingerprints, which is L2. It is not the 56M-row
+global set. Only what survives that stage - 6.8M rows, 3.6% of the
+offered stream - has to touch the mmap'd structure at all, and it dies
+there at a mere 1.7:1.
+
+**The gap is measured, not hypothetical.** A local `seen` set already
+exists in `visited_row_keys`, but it is per-FRAGMENT, and a frame has
+~720 fragments. So it takes 190.6M offered rows down to only 58.2M global
+probes, and **8.5x of those probes are redundant** - the same key, already
+probed by another fragment of the same frame. A frame-wide or worker-wide
+tier removes that 8.5x directly:
+
+```
+  190,597,048  offered
+   58,154,366  global probes today   (per-fragment seen set: 3.3x)
+    6,827,968  distinct in-frame     (<- what a frame-wide tier would leave: 8.5x fewer)
+    3,850,608  new
+```
+
+# Collect-first deopt is a pessimization at depth (2026-08-19)
+
+`CELESTE_DEOPT_COLLECT_FIRST=1`, which ladder.sh sets, runs every frame
+under the origin-tagged specialized program so a failing state pays one
+run instead of an attempt plus a retry. At H=68 on room (1,0) that trade
+is now backwards: optimistic is **154.70 s against collect-first's
+162.17 s (-4.6%)**, with an identical visited set (55,958,742), identical
+final frontier (4,976,277 lanes) and identical first-win frame (64).
+Failures are ~7% of chunks here, so paying the origin column on 100% of
+them costs more than retrying 7%.
+
 # End-to-end forward, per INPUT LANE, and where it goes (2026-08-19)
 
 The frame-body figures in the next section are the compute. This is the

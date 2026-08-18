@@ -2025,6 +2025,27 @@ impl AbstractRun {
                 }
             );
         }
+        // The kill ratio, split: how much of it is against rows this same
+        // frame produced, and how much against history? See
+        // `vectorize::dedup_census_on`.
+        if let Some(distinct) = crate::interpreter::vectorize::dedup_census_take() {
+            let offered = stream_counters.sub_before as u64;
+            let kept = stream_counters.sub_after as u64;
+            let probes = crate::interpreter::vectorize::global_probes_take();
+            println!(
+                "  dedup census: offered {} -> ~{} distinct in-frame -> {} new  \
+                 (within-frame {:.1}:1, cross-frame {:.1}:1, total {:.1}:1); \
+                 {} global probes = {:.1}x the distinct count",
+                offered,
+                distinct,
+                kept,
+                offered as f64 / distinct.max(1) as f64,
+                distinct as f64 / kept.max(1) as f64,
+                offered as f64 / kept.max(1) as f64,
+                probes,
+                probes as f64 / distinct.max(1) as f64,
+            );
+        }
         let visited = self.visited_rows.as_mut().expect("stream implies visited");
         visited.end_frame()?;
         println!(
