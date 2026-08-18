@@ -15,6 +15,7 @@ mod import;
 mod runtime;
 mod runtime2;
 mod runtime3;
+pub mod kernel;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -715,6 +716,7 @@ fn main() {
     let mut abstract_frames: Option<u32> = None;
     let mut abstract_bench: Option<(String, u32)> = None;
     let mut row_census: Option<(String, u32)> = None;
+    let mut emit_shape: Option<(String, u32, String)> = None;
     let mut reps: u32 = 10;
     let mut census_frames: u32 = 2;
     let mut max_lanes: usize = 256;
@@ -766,6 +768,12 @@ fn main() {
                 let frame: u32 = args.next().expect("FRAME").parse().unwrap();
                 row_census = Some((dir, frame));
             }
+            "--emit-shape" => {
+                let dir = args.next().expect("--emit-shape needs DIR FRAME OUT");
+                let frame: u32 = args.next().expect("FRAME").parse().unwrap();
+                let out = args.next().expect("OUT");
+                emit_shape = Some((dir, frame, out));
+            }
             "--bench" => {
                 bench_reps = Some(args.next().expect("--bench needs a value").parse().unwrap())
             }
@@ -786,6 +794,10 @@ fn main() {
 
     if let Some((dir, frame)) = row_census {
         run_row_census(&dir, frame);
+        return;
+    }
+    if let Some((dir, frame, out)) = emit_shape {
+        run_emit_shape(&dir, frame, &out);
         return;
     }
     if let Some((dir, frame)) = abstract_bench {
@@ -1294,6 +1306,159 @@ fn run_row_census(dir: &str, frame: u32) {
             );
         }
     }
+}
+
+/// Emit the KERNEL SHAPE WITNESS (plans/kernel-plan.md K1): the steady
+/// class's cell topology + column classification, as JSON the transpiler's
+/// kernel emitter consumes. Topology (globals, object fields, arrays,
+/// closures) is by NAME so the consumer needs no shared interner; the
+/// varying set is the UNION over all steady blocks of the frame.
+fn run_emit_shape(dir: &str, frame: u32, out_path: &str) {
+    use serde_json::json;
+    let rt = build_rt();
+    let states = load_states_any(dir, frame);
+    let steady: Vec<&celeste_rust::interpreter::state::State> = states
+        .iter()
+        .filter(|st| {
+            use celeste_rust::interpreter::value::{HeapValue, MaybeVector, Value};
+            let names = celeste_rust::interpreter::merge_dump::cell_names(st);
+            let shape_ok = celeste_rust::interpreter::abstraction::object_shape(st)
+                .map(|s| s == vec!["player".to_string()])
+                .unwrap_or(false);
+            shape_ok
+                && names.iter().all(|(cell, name)| {
+                    if name != "freeze" && !name.ends_with(".dash_time") {
+                        return true;
+                    }
+                    matches!(
+                        st.heap
+                            .get_opt(celeste_rust::interpreter::heap::HeapId::from_raw(*cell)),
+                        Some(HeapValue::Value(Value::Number(MaybeVector::Scalar(n))))
+                            if n.whole_part_as_i16() == 0 && n.fraction_part_as_u16() == 0
+                    )
+                })
+        })
+        .collect();
+    assert!(!steady.is_empty(), "no steady-class blocks at f{}", frame);
+    let blocks: Vec<(runtime2::Rt2, Vec<Option<celeste_rust::interpreter::heap::HeapId>>)> =
+        steady
+            .iter()
+            .map(|st| import::import_block_mapped(st, rt.cart.clone(), rt.cache.clone()))
+            .collect();
+    let (b0, rev0) = &blocks[0];
+    // Shape agreement across blocks (same structure => same canonical ids).
+    for (b, _) in &blocks {
+        assert_eq!(b.shape_hash, b0.shape_hash, "steady blocks disagree on shape");
+    }
+    let names0 = celeste_rust::interpreter::merge_dump::cell_names(steady[0]);
+    let ncells = b0.structure.len();
+    let mut vary = vec![false; ncells];
+    for (b, _) in &blocks {
+        for (c, col) in b.cols.iter().enumerate() {
+            if !matches!(col, runtime2::Col::U(_)) {
+                vary[c] = true;
+            }
+        }
+    }
+    let av_kind = |a: &runtime2::AV| -> serde_json::Value {
+        match a {
+            runtime2::AV::Num(_) => json!("num"),
+            runtime2::AV::Ival(_, _) => json!("ival"),
+            runtime2::AV::Bool(_) => json!("bool"),
+            runtime2::AV::UBool => json!("ubool"),
+            runtime2::AV::Str(_) => json!("str"),
+            runtime2::AV::Nil => json!("nil"),
+            runtime2::AV::Ptr(t) => json!({ "ptr": t }),
+            runtime2::AV::NilPtr => json!("nilptr"),
+        }
+    };
+    let cells: Vec<serde_json::Value> = (0..ncells)
+        .map(|c| {
+            let name = rev0[c]
+                .and_then(|h| names0.get(&h.raw()).cloned())
+                .unwrap_or_default();
+            // Uniform num value, when every steady block agrees: the
+            // kernel emitter may FOLD on it, guarded by a bind-time pin.
+            let stable_val: Option<i32> = match &b0.cols[c] {
+                runtime2::Col::U(runtime2::AV::Num(n)) => {
+                    let raw = n.as_raw_u32() as i32;
+                    if blocks.iter().all(|(b, _)| {
+                        matches!(&b.cols[c], runtime2::Col::U(runtime2::AV::Num(m))
+                            if m.as_raw_u32() as i32 == raw)
+                    }) {
+                        Some(raw)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            let mut o = match &b0.structure[c] {
+                runtime2::Cell2::Val => {
+                    let content = match &b0.cols[c] {
+                        runtime2::Col::U(a) => av_kind(a),
+                        runtime2::Col::N(_) => json!("num"),
+                        runtime2::Col::I(_) => json!("ival"),
+                        runtime2::Col::V(vals) => {
+                            // per-lane mixed: report the set
+                            let mut kinds: Vec<serde_json::Value> =
+                                vals.iter().map(av_kind).collect();
+                            kinds.dedup();
+                            if kinds.len() == 1 { kinds.remove(0) } else { json!(kinds) }
+                        }
+                    };
+                    json!({ "k": "val", "content": content })
+                }
+                runtime2::Cell2::Obj(fields) => {
+                    let m: serde_json::Map<String, serde_json::Value> = fields
+                        .iter()
+                        .map(|(f, c)| (gen::FIELD_NAMES[*f as usize].to_string(), json!(c)))
+                        .collect();
+                    json!({ "k": "obj", "fields": m })
+                }
+                runtime2::Cell2::Arr(items) => json!({ "k": "arr", "items": items }),
+                runtime2::Cell2::Unk => json!({ "k": "unk" }),
+                runtime2::Cell2::Clo(f, caps) => json!({
+                    "k": "clo",
+                    "fn": gen::FN_NAMES[*f as usize],
+                    "caps": caps.len(),
+                }),
+                runtime2::Cell2::Bi(b) => {
+                    json!({ "k": "bi", "name": crate::runtime::BUILTIN_NAMES[*b as usize] })
+                }
+            };
+            let obj = o.as_object_mut().unwrap();
+            obj.insert("name".into(), json!(name));
+            if vary[c] {
+                obj.insert("vary".into(), json!(true));
+            }
+            if let (Some(v), false) = (stable_val, vary[c]) {
+                obj.insert("val".into(), json!(v));
+            }
+            o
+        })
+        .collect();
+    let globals: serde_json::Map<String, serde_json::Value> = gen::GLOBAL_NAMES
+        .iter()
+        .enumerate()
+        .filter(|(gi, _)| b0.globals[*gi] != runtime2::NONE)
+        .map(|(gi, name)| (name.to_string(), json!(b0.globals[gi])))
+        .collect();
+    let witness = json!({
+        "frame": frame,
+        "shape_hash": format!("{:x}", b0.shape_hash),
+        "steady_blocks": blocks.len(),
+        "globals": globals,
+        "cells": cells,
+    });
+    std::fs::write(out_path, serde_json::to_string_pretty(&witness).unwrap()).unwrap();
+    println!(
+        "shape witness: {} cells ({} varying) from {} steady blocks -> {}",
+        ncells,
+        vary.iter().filter(|v| **v).count(),
+        blocks.len(),
+        out_path
+    );
 }
 
 /// The dev-loop benchmark (plans/columnar-engine.md): ONE abstract frame

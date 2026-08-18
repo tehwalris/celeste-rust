@@ -55,4 +55,4 @@ debug = 1
 
 [[bin]]
 name = "transpile"
-path = "src/bin/transpile.rs"
+path = "src/bin/transpile/main.rs"

@@ -12,6 +12,8 @@
 //! The generated crate is the measurement instrument; hex-exactness against
 //! `concrete_run` is the gate that makes its numbers mean anything.
 
+mod kernel;
+
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
 
@@ -909,10 +911,16 @@ fn main() -> Result<()> {
     let mut out_path = "native-probe/src/gen.rs".to_string();
     let mut site_slots: Option<String> = None;
     let mut kernel_recon_flag = false;
+    let mut kernel_out: Option<(String, String)> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--kernel-recon" => kernel_recon_flag = true,
+            "--kernel" => {
+                let witness = args.next().ok_or_else(|| anyhow!("--kernel WITNESS OUT"))?;
+                let out = args.next().ok_or_else(|| anyhow!("--kernel WITNESS OUT"))?;
+                kernel_out = Some((witness, out));
+            }
             "--rewritten" => rewritten = true,
             "--recipe" => {
                 recipe_path = args
@@ -951,6 +959,9 @@ fn main() -> Result<()> {
     if kernel_recon_flag {
         kernel_recon(&program);
         return Ok(());
+    }
+    if let Some((witness, out)) = kernel_out {
+        return kernel::emit_kernel(&program, &witness, &out);
     }
 
     let slots = match &site_slots {

@@ -44,6 +44,13 @@ impl Pico8Num {
         Self((v as i32) << 16)
     }
 
+    /// The inverse of `to_bits`: reconstruct from raw fixed-point bits.
+    /// Every bit pattern is a valid value (plain i32, no padding), so this
+    /// is total - the kernel emitter uses it to spell constants.
+    pub const fn from_raw(bits: i32) -> Self {
+        Self(bits)
+    }
+
     /// The raw fixed-point bits. The representation is a plain `i32` with no
     /// padding and no two encodings of one value, so comparing bits is
     /// exactly comparing numbers - which is what lets dedup pack rows of
