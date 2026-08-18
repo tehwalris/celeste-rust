@@ -230,6 +230,198 @@ pub fn import_block_mapped(
     (rt2, rev)
 }
 
+// ---- export: columnar block -> interpreter State ----
+
+/// The inverse of `import_block`: turn a columnar block back into an
+/// interpreter `State`, so the reference interpreter can run a frame the
+/// compiled engine declined (plans/k4-retirement-plan.md stage 2).
+///
+/// Fidelity, stated precisely, because the fallback's whole job is to be
+/// the REFERENCE:
+///
+/// * Cell ids become heap ids in the SAME order, so `import_block` of the
+///   result reproduces this block's canonical numbering exactly. The
+///   round trip is checked by `assert_block_round_trips`.
+/// * Fields the program never names were dropped on import and cannot be
+///   restored here. That is not a new loss - it is the same content the
+///   boundary compares - but it means export is the inverse of import,
+///   not of the original State.
+/// * A block is only exportable at a FRAME BOUNDARY. Mid-frame columns can
+///   hold per-lane values of mixed KIND, which no single interpreter
+///   `Value` can represent, and mid-frame blocks carry a live arena and
+///   COW history this does not read. Both are checked below rather than
+///   assumed: a mixed column is a hard error, not a guess.
+pub fn export_block(rt2: &Rt2) -> State {
+    assert!(
+        rt2.arena.is_empty(),
+        "export_block on a mid-frame block: the local arena is live ({} slots)",
+        rt2.arena.len()
+    );
+    assert!(rt2.width > 0, "export_block on a zero-lane block");
+    let mut state = State::new();
+    let ids: Vec<HeapId> = (0..rt2.structure.len()).map(|_| state.heap.alloc()).collect();
+    for (i, cell) in rt2.structure.iter().enumerate() {
+        let value = match cell {
+            Cell2::Val => HeapValue::Value(export_col(rt2, &rt2.cols[i], &ids, i)),
+            Cell2::Obj(fields) => HeapValue::ObjectTable(
+                fields
+                    .iter()
+                    .map(|(f, c)| (gen::FIELD_NAMES[*f as usize].to_string(), ids[*c as usize]))
+                    .collect(),
+            ),
+            Cell2::Arr(items) => {
+                HeapValue::ArrayTable(items.iter().map(|c| ids[*c as usize]).collect())
+            }
+            Cell2::Unk => HeapValue::UnknownTable,
+            Cell2::Clo(f, caps) => HeapValue::Closure(
+                celeste_rust::ir::GlobalId::from(gen::FN_NAMES[*f as usize].to_string()),
+                caps.iter().map(|c| export_col(rt2, c, &ids, i)).collect(),
+            ),
+            Cell2::Bi(b) => HeapValue::BuiltinFun(BUILTIN_NAMES[*b as usize].to_string()),
+        };
+        state.heap.set(ids[i], value);
+    }
+    for (gi, name) in gen::GLOBAL_NAMES.iter().enumerate() {
+        let slot = rt2.globals[gi];
+        if slot != NONE {
+            state.global_env.insert(name.to_string(), ids[slot as usize]);
+        }
+    }
+    state.vector_size = rt2.width;
+    state.prints = rt2.prints.clone();
+    state
+}
+
+/// One column back to a `Value`. `cell` is only used for error messages.
+fn export_col(rt2: &Rt2, col: &Col, ids: &[HeapId], cell: usize) -> Value {
+    let w = rt2.width;
+    let scalar = |a: &AV| -> Value {
+        match a {
+            AV::Num(n) => Value::Number(MaybeVector::Scalar(*n)),
+            AV::Ival(l, h) => Value::NumberInterval(MaybeVector::Scalar(
+                celeste_rust::pico8_num::Pico8NumInterval::new(*l, *h),
+            )),
+            AV::Bool(b) => Value::Bool(MaybeVector::Scalar(*b)),
+            AV::UBool => Value::UnknownBool,
+            AV::Str(s) => Value::String(rt2.strings[*s as usize].clone()),
+            AV::Nil => Value::Nil(None),
+            AV::Ptr(p) => Value::Pointer(ids[*p as usize]),
+            // Import loses the NilPointer's field name (AV has no room
+            // for it) and nothing reads it, so a placeholder is honest
+            // about what survived rather than inventing a name.
+            AV::NilPtr => Value::NilPointer(String::new()),
+        }
+    };
+    use std::sync::Arc;
+    let iv = |l: &crate::runtime2::P8, h: &crate::runtime2::P8| {
+        celeste_rust::pico8_num::Pico8NumInterval::new(*l, *h)
+    };
+    match col {
+        Col::U(a) => scalar(a),
+        Col::N(v) => {
+            assert_eq!(v.len(), w, "cell {}: short Num column", cell);
+            Value::Number(MaybeVector::Vector(Arc::new(v.clone())))
+        }
+        Col::I(v) => {
+            assert_eq!(v.len(), w, "cell {}: short interval column", cell);
+            Value::NumberInterval(MaybeVector::Vector(Arc::new(
+                v.iter().map(|(l, h)| iv(l, h)).collect(),
+            )))
+        }
+        // A varying column has to become ONE interpreter Value, so every
+        // lane must agree on the KIND. At a frame boundary they do (the
+        // block came from a State, which has the same restriction);
+        // mid-frame they need not, which is why a mixed column is an
+        // error rather than a fallback to an encoding that does not
+        // exist. Dispatching on lane 0 and then requiring every other
+        // lane to match IS the check.
+        Col::V(v) => {
+            assert_eq!(v.len(), w, "cell {}: short varying column", cell);
+            let mixed = |other: &AV, kind: &str| -> ! {
+                panic!(
+                    "cell {}: a varying column mixes {} with {:?} - no single \
+                     interpreter Value can hold that",
+                    cell, kind, other
+                )
+            };
+            match v[0] {
+                AV::Bool(_) => Value::Bool(MaybeVector::Vector(Arc::new(
+                    v.iter()
+                        .map(|a| match a {
+                            AV::Bool(b) => *b,
+                            other => mixed(other, "Bool"),
+                        })
+                        .collect(),
+                ))),
+                AV::Num(_) => Value::Number(MaybeVector::Vector(Arc::new(
+                    v.iter()
+                        .map(|a| match a {
+                            AV::Num(n) => *n,
+                            other => mixed(other, "Num"),
+                        })
+                        .collect(),
+                ))),
+                AV::Ival(_, _) => Value::NumberInterval(MaybeVector::Vector(Arc::new(
+                    v.iter()
+                        .map(|a| match a {
+                            AV::Ival(l, h) => iv(l, h),
+                            other => mixed(other, "Ival"),
+                        })
+                        .collect(),
+                ))),
+                // Everything else is uniform-only in a State: a pointer
+                // column that VARIES would be lane-dependent heap
+                // topology, which the block model forbids outright.
+                other => panic!(
+                    "cell {}: a varying column of {:?} has no interpreter Value \
+                     (pointer topology is lane-uniform by the block's shape premise)",
+                    cell, other
+                ),
+            }
+        }
+    }
+}
+
+/// `import_block(export_block(b))` must reproduce `b`'s structure and
+/// columns exactly. This is the fallback's correctness premise stated as
+/// a check: if export loses or reorders anything, every frame the
+/// interpreter runs for the engine is silently wrong.
+pub fn assert_block_round_trips(rt2: &Rt2) {
+    let state = export_block(rt2);
+    let back = import_block(&state, rt2.cart.clone(), rt2.cache.clone());
+    assert_eq!(back.width, rt2.width, "round trip changed the lane count");
+    assert_eq!(
+        back.structure.len(),
+        rt2.structure.len(),
+        "round trip changed the cell count"
+    );
+    assert_eq!(back.globals, rt2.globals, "round trip changed the globals table");
+    for (i, (a, b)) in rt2.structure.iter().zip(back.structure.iter()).enumerate() {
+        assert_eq!(
+            format!("{:?}", a),
+            format!("{:?}", b),
+            "round trip changed cell {}'s structure",
+            i
+        );
+    }
+    for (i, (a, b)) in rt2.cols.iter().zip(back.cols.iter()).enumerate() {
+        // Uniform vs a materialized all-equal column are the same VALUE;
+        // compare per lane so a legitimate representation change is not
+        // reported as a content change.
+        if matches!(rt2.structure[i], Cell2::Val) {
+            for lane in 0..rt2.width {
+                assert_eq!(
+                    a.at(lane),
+                    b.at(lane),
+                    "round trip changed cell {} lane {}",
+                    i,
+                    lane
+                );
+            }
+        }
+    }
+}
+
 /// Assert the scalar importer (`import_lane`) and the vectorized one
 /// (`import_block`) assign IDENTICAL cell numbers on the same state:
 /// same heap size, same globals table, same per-cell kind and pointer

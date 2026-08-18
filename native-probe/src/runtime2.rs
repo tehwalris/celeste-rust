@@ -93,8 +93,11 @@ pub enum Col {
 }
 
 impl Col {
+    /// The lane's value regardless of how the column is stored - the one
+    /// way to compare two columns by CONTENT rather than representation
+    /// (uniform vs a materialized all-equal vector are the same value).
     #[inline]
-    fn at(&self, lane: usize) -> AV {
+    pub fn at(&self, lane: usize) -> AV {
         match self {
             Col::U(a) => *a,
             Col::V(v) => v[lane],

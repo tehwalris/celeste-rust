@@ -86,12 +86,39 @@ Interpreter-fallback design notes for stage 2:
   remaining job: 34-frame run 175 -> 173 ms, gates exact at
   f20/25/30/35. The kernel is now the DEFAULT path; CELESTE_KERNEL=0
   routes everything to the reference for A/B.
-- Stage 2 (block -> State exporter + interpreter fallback) is now the
-  only thing between here and deleting the Rt2 ENGINE. It got easier
-  and less urgent at the same time: the fallback only runs on spawn
-  shapes now (f20: 0.72 ms), so its speed does not matter at all.
+- **Stage 2 DONE.** `import::export_block` (the inverse of
+  `import_block`) plus `run_chunk_interpreted`: a chunk the kernels
+  decline is exported to a `State`, run through
+  `interpret_prepared_cfg`, re-imported and boundaried by the SAME
+  `Rt2::boundary` the compiled path uses. The `gen::call_fn` worklist
+  and its SplitReq partition-and-rerun dance are deleted with it - the
+  interpreter splits internally and just returns more output states.
+  Gates f20/25/30/35 all "row-key SET EQUAL (gate 2) OK".
+  Cost, measured: f20 (the only frame where the fallback actually
+  runs - every later frame is 100% kernel) 0.58 -> 0.95 ms; f30 15.42
+  -> 14.93 ms and f35 103.0 -> 105.4 ms, i.e. noise. As predicted, the
+  fallback's speed is irrelevant.
+  - **The afternoon this cost, and the lesson.** The first version
+    built the fallback from `Program::compile_executable_from_disk()`,
+    because that is what `gen.rs`'s generated header says its source
+    is. It is not: the canonical regen is `transpile --recipe
+    rewrites-compile.jsonl`, so gen.rs is the REWRITTEN program, and
+    the header line was emitted unconditionally. The plain program
+    boxes a captured `self` where the recipe's `demote_create` does
+    not, so the output heap gained one cell, every later cell id
+    shifted by one, and the gate reported "204 missing, 204 extra" -
+    a total mismatch caused by an aliasing difference in ONE closure
+    capture. Two things came out of it: the emitter now names the
+    actual source program (regenerating gen.rs changed those two
+    comment lines and NOTHING else, which is independent confirmation
+    of the diagnosis), and the gate's structural dump now prints
+    every cell's kind WITH its field/capture targets and only the
+    differing cells - the old Obj-names-only dump showed two
+    identical-looking cell lists next to two different shape hashes,
+    which is worse than no dump.
 - Stages 4-5 (delete the Engine trait / scalar oracle / gen.rs program
-  body, then simplify) follow stage 2 unchanged.
+  body, then simplify) follow, and stage 2 has removed their last
+  blocker.
 
 ## Where this sits in the overall queue
 

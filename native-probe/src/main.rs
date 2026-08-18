@@ -897,6 +897,105 @@ fn install_split_hook() {
     }));
 }
 
+/// The reference frame: the celeste-rust INTERPRETER, on a block exported
+/// back to an interpreter `State` (plans/k4-retirement-plan.md stage 2).
+///
+/// This is what a chunk falls back to when the kernels decline it, and it
+/// is the reference in the strongest sense available: the same `Program`,
+/// the same `interpret_prepared_cfg`, the same code the campaign and
+/// `concrete_run` execute. The compiled engine's own reference path
+/// (`gen::call_fn` over the transpiled program) is a SECOND
+/// implementation of those semantics, which is exactly why it is being
+/// retired - two implementations of a reference is one too many.
+///
+/// It also removes the SplitReq dance: a genuinely lane-divergent branch
+/// used to panic out, partition the frame-start block by the condition's
+/// per-origin truth, and rerun both halves. The interpreter splits
+/// internally and simply returns more than one output state.
+///
+/// Speed does not matter here and that is a measured claim, not a hope:
+/// since the class kernels reached 100% of player lanes, this path runs
+/// on spawn shapes only (0.72 ms at f20).
+struct Fallback {
+    frame_cfg: celeste_rust::interpreter::fixed_env::PreparedCfg,
+    fixed_env: celeste_rust::interpreter::fixed_env::FixedEnv,
+}
+
+/// The recipe `gen.rs` and the kernels were generated from. It MUST be
+/// this one and not the plain program: `transpile --recipe
+/// rewrites-compile.jsonl` is the canonical regen (plans/columnar-engine
+/// .md), so the compiled engine executes the REWRITTEN program, and so
+/// must anything claiming to be its reference.
+///
+/// Cost me an afternoon: gen.rs's generated header says "Source program:
+/// Program::compile_executable_from_disk()" unconditionally, which is
+/// simply false when --recipe was passed. The plain program's frame boxes
+/// a captured `self` where the recipe's `demote_create` does not, so the
+/// output heap gained one cell, every later cell id shifted, and the gate
+/// reported 204 rows missing and 204 extra - a total mismatch produced by
+/// an aliasing difference in ONE closure capture. The header is fixed in
+/// the emitter.
+const COMPILE_RECIPE: &str = "rewrites-compile.jsonl";
+
+/// Built once per process - loading the recipe and applying it compiles
+/// the whole cart, which is seconds, and every worker thread shares the
+/// result by reference (both halves are Sync; verify.rs's parallel frame
+/// already shares exactly these two).
+fn fallback() -> &'static Fallback {
+    static FALLBACK: std::sync::OnceLock<Fallback> = std::sync::OnceLock::new();
+    FALLBACK.get_or_init(|| {
+        let recipe = celeste_rust::rewrite::recipe::Recipe::load(COMPILE_RECIPE)
+            .unwrap_or_else(|e| panic!("loading {} (run from the repo root): {}", COMPILE_RECIPE, e));
+        let (program, _) = celeste_rust::rewrite::recipe::build(&recipe)
+            .unwrap_or_else(|e| panic!("applying {}: {}", COMPILE_RECIPE, e));
+        Fallback {
+            frame_cfg: celeste_rust::interpreter::fixed_env::PreparedCfg::new(
+                program.frame_cfg().clone(),
+            ),
+            fixed_env: program.fixed_env(),
+        }
+    })
+}
+
+/// Run one frame of `block` through the interpreter and return the
+/// boundary blocks. The output goes through the SAME `Rt2::boundary` the
+/// compiled path uses, so the canonical form has one implementation
+/// whichever engine produced the rows.
+fn run_chunk_interpreted(
+    block: runtime2::Rt2,
+    ids: &runtime2::BoundaryIds,
+) -> Vec<runtime2::Rt2> {
+    let (cart, cache) = (block.cart.clone(), block.cache.clone());
+    // CELESTE_FALLBACK_ROUNDTRIP=1 checks export against import on the
+    // way in, which is what separates "the exporter lost something" from
+    // "the frame did something different" when the gate disagrees.
+    if std::env::var_os("CELESTE_FALLBACK_ROUNDTRIP").is_some() {
+        import::assert_block_round_trips(&block);
+    }
+    let state = import::export_block(&block);
+    drop(block);
+    let fb = fallback();
+    let outputs = celeste_rust::interpreter::glue::interpret_prepared_cfg(
+        &fb.frame_cfg,
+        state,
+        &fb.fixed_env,
+    )
+    .expect("the interpreter fallback failed a frame");
+    outputs
+        .into_iter()
+        .map(|(s, _)| s)
+        // A frame can split a chunk into pieces and leave one empty; an
+        // empty block has no rows to contribute and `import_block` has
+        // nothing to build a shape from.
+        .filter(|s| s.vector_size > 0)
+        .map(|s| {
+            let mut b = import::import_block(&s, cart.clone(), cache.clone());
+            b.boundary(ids);
+            b
+        })
+        .collect()
+}
+
 /// One abstract frame forward: pre-partition (freeze, moving key), chunk,
 /// run tiles across threads (SplitReq -> partition + rerun), boundary,
 /// cross-block dedup, k-way same-shape merge. Rows in -> rows out.
@@ -1008,37 +1107,16 @@ fn frame_step(
                                 continue;
                             }
                         }
-                        let snapshot = block.clone_block();
-                        let mut sub = block;
-                        sub.begin_frame();
-                        let result =
-                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                gen::call_fn(&mut sub, gen::FN_FRAME, &[], &[]);
-                                sub.boundary(ids);
-                            }));
-                        match result {
-                            Ok(()) => done.push(sub),
-                            Err(payload) => {
-                                match payload.downcast::<runtime2::SplitReq>() {
-                                    Ok(req) => {
-                                        let trues: Vec<u32> = (0..snapshot.width as u32)
-                                            .filter(|&i| req.origin_truth[i as usize])
-                                            .collect();
-                                        let falses: Vec<u32> = (0..snapshot.width as u32)
-                                            .filter(|&i| !req.origin_truth[i as usize])
-                                            .collect();
-                                        assert!(!trues.is_empty() && !falses.is_empty());
-                                        let mut a = snapshot.clone_block();
-                                        a.retain_lanes(&trues);
-                                        let mut b = snapshot;
-                                        b.retain_lanes(&falses);
-                                        local.push((a, false));
-                                        local.push((b, false));
-                                    }
-                                    Err(other) => std::panic::resume_unwind(other),
-                                }
-                            }
-                        }
+                        // The reference: the interpreter, on the block
+                        // exported back to a State. This replaced the
+                        // transpiled-program path (gen::call_fn over the
+                        // Rt2 Engine impl) and its SplitReq worklist -
+                        // a divergent branch used to panic out so the
+                        // driver could partition the frame-start block
+                        // by the condition's per-origin truth and rerun
+                        // both halves; the interpreter splits internally
+                        // and just returns more than one output state.
+                        done.extend(run_chunk_interpreted(block, ids));
                     }
                     done
                 })
@@ -2305,26 +2383,114 @@ fn run_abstract_bench(dir: &str, frame: u32, reps: u32) {
                     .collect();
                 eprintln!("  engine shapes: {}", eng_shapes.join(", "));
                 eprintln!("  ref shapes:    {}", ref_shapes.join(", "));
-                // Structural diff of the first block on each side: the
-                // Obj field sets, by name.
-                let dump_objs = |b: &runtime2::Rt2, tag: &str| {
-                    for (ci, cell) in b.structure.iter().enumerate() {
-                        if let runtime2::Cell2::Obj(fields) = cell {
-                            let names: Vec<&str> = fields
-                                .iter()
-                                .map(|(f, _)| gen::FIELD_NAMES[*f as usize])
-                                .collect();
-                            eprintln!("  {} cell {}: Obj[{}]", tag, ci, names.join(","));
+                // Structural diff of the first block on each side. Dumping
+                // only the Obj cells was not enough: on the interpreter
+                // fallback's first run the two sides' Obj cells were
+                // IDENTICAL and the shape hashes still differed, which
+                // said nothing about where. Print EVERY cell's kind, and
+                // print only the cells that actually differ.
+                let kinds = |b: &runtime2::Rt2| -> Vec<String> {
+                    b.structure
+                        .iter()
+                        .map(|cell| match cell {
+                            runtime2::Cell2::Val => "Val".to_string(),
+                            // Field TARGETS, not just names: two blocks
+                            // can agree on every field set and still
+                            // differ in heap SHARING, which is what the
+                            // shape hash covers and what a name-only
+                            // dump hides.
+                            runtime2::Cell2::Obj(fields) => format!(
+                                "Obj[{}]",
+                                fields
+                                    .iter()
+                                    .map(|(f, c)| format!(
+                                        "{}->{}",
+                                        gen::FIELD_NAMES[*f as usize], c
+                                    ))
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            ),
+                            runtime2::Cell2::Arr(items) => format!("Arr{:?}", items),
+                            runtime2::Cell2::Unk => "Unk".to_string(),
+                            // Captures can hold POINTERS, so they are part
+                            // of the heap topology too - a cap-only
+                            // difference shifts every later cell id and
+                            // looks like "the objects moved".
+                            runtime2::Cell2::Clo(f, caps) => format!(
+                                "Clo({}, caps {:?})",
+                                gen::FN_NAMES[*f as usize],
+                                caps.iter().map(|c| c.at(0)).collect::<Vec<_>>()
+                            ),
+                            runtime2::Cell2::Bi(b) => format!("Bi({})", b),
+                        })
+                        .collect()
+                };
+                let eng = chase.first().map(kinds).unwrap_or_default();
+                let refk = load_states_any(dir, frame + k)
+                    .first()
+                    .map(|st| {
+                        let mut b =
+                            import::import_block(st, rt.cart.clone(), rt.cache.clone());
+                        b.boundary(&ids);
+                        kinds(&b)
+                    })
+                    .unwrap_or_default();
+                if eng.len() != refk.len() {
+                    eprintln!("  cell COUNT differs: engine {} vs ref {}", eng.len(), refk.len());
+                }
+                let mut shown = 0;
+                for i in 0..eng.len().max(refk.len()) {
+                    let (a, b) = (eng.get(i), refk.get(i));
+                    if a != b {
+                        eprintln!("  cell {}: engine {:?} vs ref {:?}", i, a, b);
+                        shown += 1;
+                        if shown == 40 {
+                            eprintln!("  ... (more differing cells suppressed)");
+                            break;
                         }
                     }
-                };
-                if let Some(b) = chase.first() {
-                    dump_objs(b, "engine");
                 }
-                if let Some(st) = load_states_any(dir, frame + k).first() {
-                    let mut b = import::import_block(st, rt.cart.clone(), rt.cache.clone());
-                    b.boundary(&ids);
-                    dump_objs(&b, "ref");
+                // Who reaches the cells only one side has? A cell count
+                // that differs by one says nothing on its own; its PARENT
+                // names the mechanism.
+                if let Some(b) = chase.first() {
+                    for extra in refk.len()..eng.len() {
+                        let extra = extra as u32;
+                        for (gi, name) in gen::GLOBAL_NAMES.iter().enumerate() {
+                            if b.globals[gi] == extra {
+                                eprintln!("  cell {} is the global {:?}", extra, name);
+                            }
+                        }
+                        for (ci, cell) in b.structure.iter().enumerate() {
+                            match cell {
+                                runtime2::Cell2::Obj(fields) => {
+                                    for (f, c) in fields {
+                                        if *c == extra {
+                                            eprintln!(
+                                                "  cell {} is {}.{}",
+                                                extra, ci, gen::FIELD_NAMES[*f as usize]
+                                            );
+                                        }
+                                    }
+                                }
+                                runtime2::Cell2::Arr(items) => {
+                                    for (i, c) in items.iter().enumerate() {
+                                        if *c == extra {
+                                            eprintln!("  cell {} is {}[{}]", extra, ci, i);
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        eprintln!("  cell {} value: {:?}", extra, b.cols[extra as usize]);
+                    }
+                }
+                if shown == 0 && eng.len() == refk.len() {
+                    eprintln!(
+                        "  structures are IDENTICAL cell for cell - the difference is in \
+                         the COLUMNS or the globals table, not the shape"
+                    );
                 }
                 format!(
                     "MISMATCH at f{:03}: engine {} vs interpreter {} (row keys: {} missing, {} extra)",
