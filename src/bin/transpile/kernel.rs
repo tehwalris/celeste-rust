@@ -1451,6 +1451,141 @@ fn render(e: &Emit, out_path: &str) -> Result<()> {
          }}\n"
     )?;
 
+    // Direct-append output path: one accumulator block per chunk, typed
+    // pushes per (config, variant) - no per-slice block cloning.
+    let out_set: BTreeSet<u32> = out_fields.iter().map(|(id, _, _, _)| *id).collect();
+    writeln!(
+        out,
+        "/// One wide output block per chunk: structure + uniforms cloned\n\
+         /// once, varying/output columns start empty and grow by appends.\n\
+         pub fn acc_init(chunk: &Rt2) -> Rt2 {{\n\
+         \x20   let mut acc = Rt2::empty(0, chunk.globals.len(), &[], chunk.cart.clone(), chunk.cache.clone());\n\
+         \x20   acc.strings = chunk.strings.clone();\n\
+         \x20   acc.globals = chunk.globals.clone();\n\
+         \x20   acc.structure = chunk.structure.clone();\n\
+         \x20   acc.cols = chunk.cols.clone();\n\
+         \x20   acc.shape_hash = chunk.shape_hash;"
+    )?;
+    for (id, ty, _, tainted) in &out_fields {
+        match (*ty, *tainted) {
+            ("ZN", _) | ("P8", true) => writeln!(out, "    acc.cols[{}] = Col::N(Vec::new());", id)?,
+            ("ZI", _) | ("(P8, P8)", true) => {
+                writeln!(out, "    acc.cols[{}] = Col::I(Vec::new());", id)?
+            }
+            ("ZB", _) | ("bool", true) => writeln!(out, "    acc.cols[{}] = Col::V(Vec::new());", id)?,
+            // Untainted scalar outputs stay UNIFORM; append_out
+            // overwrites the value (identical across appends - the
+            // gate-2 oracle certifies that premise).
+            ("P8", false) | ("bool", false) | ("(P8, P8)", false) => {}
+            (other, _) => bail!("acc_init: type {}", other),
+        }
+    }
+    for (id, kind) in &e.vary_in {
+        if out_set.contains(id) {
+            continue;
+        }
+        match *kind {
+            "num" => writeln!(out, "    acc.cols[{}] = Col::N(Vec::new());", id)?,
+            "bool" => writeln!(out, "    acc.cols[{}] = Col::V(Vec::new());", id)?,
+            _ => unreachable!(),
+        }
+    }
+    writeln!(
+        out,
+        "    for cell in OUT_UBOOL_CELLS {{\n\
+         \x20       acc.cols[*cell as usize] = Col::U(AV::UBool);\n\
+         \x20   }}\n\
+         \x20   acc\n\
+         }}\n"
+    )?;
+
+    writeln!(
+        out,
+        "/// Append one (config, variant)'s live lanes onto the accumulator.\n\
+         /// `lo` is the slice base in `chunk` (identity columns read there).\n\
+         #[allow(unused_variables)]\n\
+         pub fn append_out(acc: &mut Rt2, chunk: &Rt2, lo: usize, n: usize, live: u16, sh: &KOutShared, kv: &KOut) {{\n\
+         \x20   for i in 0..n {{\n\
+         \x20       if live & (1 << i) == 0 {{ continue; }}"
+    )?;
+    for (id, ty, _, tainted) in &out_fields {
+        let src = if *tainted { "kv" } else { "sh" };
+        match *ty {
+            "ZN" => writeln!(
+                out,
+                "        if let Col::N(v) = &mut acc.cols[{id}] {{ v.push({src}.c{id}[i]); }}",
+                id = id, src = src
+            )?,
+            "P8" if *tainted => writeln!(
+                out,
+                "        if let Col::N(v) = &mut acc.cols[{id}] {{ v.push({src}.c{id}); }}",
+                id = id, src = src
+            )?,
+            "P8" => writeln!(
+                out,
+                "        acc.cols[{id}] = Col::U(AV::Num({src}.c{id}));",
+                id = id, src = src
+            )?,
+            "ZI" => writeln!(
+                out,
+                "        if let Col::I(v) = &mut acc.cols[{id}] {{ v.push(({src}.c{id}.lo[i], {src}.c{id}.hi[i])); }}",
+                id = id, src = src
+            )?,
+            "(P8, P8)" if *tainted => writeln!(
+                out,
+                "        if let Col::I(v) = &mut acc.cols[{id}] {{ v.push(({src}.c{id}.0, {src}.c{id}.1)); }}",
+                id = id, src = src
+            )?,
+            "(P8, P8)" => writeln!(
+                out,
+                "        acc.cols[{id}] = Col::U(AV::Ival({src}.c{id}.0, {src}.c{id}.1));",
+                id = id, src = src
+            )?,
+            "ZB" => writeln!(
+                out,
+                "        if let Col::V(v) = &mut acc.cols[{id}] {{ v.push(AV::Bool({src}.c{id}.val & (1 << i) != 0)); }}",
+                id = id, src = src
+            )?,
+            "bool" if *tainted => writeln!(
+                out,
+                "        if let Col::V(v) = &mut acc.cols[{id}] {{ v.push(AV::Bool({src}.c{id})); }}",
+                id = id, src = src
+            )?,
+            "bool" => writeln!(
+                out,
+                "        acc.cols[{id}] = Col::U(AV::Bool({src}.c{id}));",
+                id = id, src = src
+            )?,
+            other => bail!("append_out: type {}", other),
+        }
+    }
+    for (id, kind) in &e.vary_in {
+        if out_set.contains(id) {
+            continue;
+        }
+        match *kind {
+            "num" => writeln!(
+                out,
+                "        let val = match &chunk.cols[{id}] {{ Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() }};\n\
+                 \x20       if let Col::N(v) = &mut acc.cols[{id}] {{ v.push(val); }}",
+                id = id
+            )?,
+            "bool" => writeln!(
+                out,
+                "        let val = match &chunk.cols[{id}] {{ Col::V(s) => s[(lo + i).min(chunk.width - 1)], Col::U(a) => *a, _ => unreachable!() }};\n\
+                 \x20       if let Col::V(v) = &mut acc.cols[{id}] {{ v.push(val); }}",
+                id = id
+            )?,
+            _ => unreachable!(),
+        }
+    }
+    writeln!(
+        out,
+        "        acc.width += 1;\n\
+         \x20   }}\n\
+         }}\n"
+    )?;
+
     // Pre struct: prefix values the suffix reads (word-boundary search,
     // so v1 does not match inside v17).
     let word_used = |text: &str, name: &str| -> bool {

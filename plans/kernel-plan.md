@@ -235,3 +235,29 @@ the per-variant copy is minimal. True engine cost lands between 14.8
 and 30.2 depending on K3's output-buffer design - measure there, not
 here. K2 microbench: DONE enough to integrate; further squeezing
 (prefix share, zmm width experiment) is follow-up, not blocker.
+
+## K3 LANDS (2026-08-18 ~04:30): kernel integrated, certified, FASTER
+
+CELESTE_TILE=3 in frame_step: kernel-first on bindable chunks; deopted
+rows re-queue (kernel_ok=false) for the reference paths; bd/off-shape
+chunks fall through whole. Output path: generated acc_init/append_out -
+ONE wide accumulator block per chunk with typed per-lane appends
+(untainted scalar outputs stay uniform - the timer-pin panic taught
+that), boundary once per chunk.
+
+abstract-bench f35, all 40 blocks, gate 1 + gate 2 (f37 chase) EXACT:
+| engine | wall (5-rep min) |
+|---|---|
+| Rt2 columnar          | 2.0 s   |
+| Rt3 TILE=2 (prev best)| 518 ms  |
+| TILE=3 KERNEL         | 380 ms  |
+
+1.36x over the previous best END TO END while the kernel covers only
+the steady class (61% of lanes; the dash/freeze classes still ride
+the old paths inside those 380 ms). Journey: naive per-slice blocks
+12.1 s -> accumulated 8.3 s -> typed appends 380 ms - the lesson is
+the OUTPUT path, not the compute, dominated integration.
+
+Remaining after this: per-class overlay kernels (dash=1..4, freeze)
+to lift coverage past 61%, parallel scaling check, K4 retirement of
+obsoleted executors, then the (2,0) campaign.

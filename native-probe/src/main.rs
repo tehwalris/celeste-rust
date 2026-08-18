@@ -908,6 +908,7 @@ fn frame_step(
     // kernel). CELESTE_TILE=2: dynamic-expand tiles (one boundary row,
     // the input fan-out grows the lane axis IN-tile - trunk shared).
     let tile_mode: u8 = match std::env::var("CELESTE_TILE") {
+        Ok(v) if v == "3" => 3,
         Ok(v) if v == "2" => 2,
         Ok(_) => 1,
         Err(_) => 0,
@@ -968,10 +969,13 @@ fn frame_step(
         .map(|n| n.get().saturating_sub(2).max(1))
         .unwrap_or(1)
         .min(pending.len().max(1));
-    let queues: Vec<Vec<runtime2::Rt2>> = {
-        let mut qs: Vec<Vec<runtime2::Rt2>> = (0..n_workers).map(|_| Vec::new()).collect();
+    // (block, kernel_ok): kernel-deopted leftovers and SplitReq halves
+    // must not re-enter the kernel (a lane the kernel deopted once would
+    // deopt forever - an infinite requeue).
+    let queues: Vec<Vec<(runtime2::Rt2, bool)>> = {
+        let mut qs: Vec<Vec<(runtime2::Rt2, bool)>> = (0..n_workers).map(|_| Vec::new()).collect();
         for (i, b) in pending.drain(..).enumerate() {
-            qs[i % n_workers].push(b);
+            qs[i % n_workers].push((b, true));
         }
         qs
     };
@@ -982,10 +986,21 @@ fn frame_step(
                 let ids = &ids;
                 scope.spawn(move || {
                     let mut done: Vec<runtime2::Rt2> = Vec::new();
-                    while let Some(block) = local.pop() {
+                    while let Some((block, kernel_ok)) = local.pop() {
+                        if tile_mode == 3 && kernel_ok {
+                            // KERNEL mode (plans/kernel-plan.md K3): the
+                            // steady-class lane kernel first; rows it
+                            // deopts re-enter the worklist for the
+                            // reference paths; a chunk it cannot bind or
+                            // whose uniform premise fails falls through
+                            // whole.
+                            if run_chunk_kernel(&block, ids, &mut done, &mut local) {
+                                continue;
+                            }
+                        }
                         if tile_mode > 0 {
                             let out = match tile_mode {
-                                2 => run_chunk_dynexp(&block, ids),
+                                2 | 3 => run_chunk_dynexp(&block, ids),
                                 _ => run_chunk_tiled(&block, ids),
                             };
                             if let Some(out) = out {
@@ -1018,8 +1033,8 @@ fn frame_step(
                                         a.retain_lanes(&trues);
                                         let mut b = snapshot;
                                         b.retain_lanes(&falses);
-                                        local.push(a);
-                                        local.push(b);
+                                        local.push((a, false));
+                                        local.push((b, false));
                                     }
                                     Err(other) => std::panic::resume_unwind(other),
                                 }
@@ -1470,6 +1485,104 @@ fn run_emit_shape(dir: &str, frame: u32, out_path: &str) {
         blocks.len(),
         out_path
     );
+}
+
+/// CELESTE_TILE=3 (plans/kernel-plan.md K3): run one chunk through the
+/// steady-class lane kernel. Returns true if the chunk was handled -
+/// output blocks (boundary applied) pushed to `done`, any deopted input
+/// rows re-queued on `local` for the reference paths. Returns false
+/// (nothing committed) when the chunk cannot bind or a uniform premise
+/// fails (bd): the whole chunk then takes the reference path.
+fn run_chunk_kernel(
+    chunk: &runtime2::Rt2,
+    ids: &runtime2::BoundaryIds,
+    done: &mut Vec<runtime2::Rt2>,
+    local: &mut Vec<(runtime2::Rt2, bool)>,
+) -> bool {
+    if chunk.shape_hash != kernel_gen::SHAPE_HASH {
+        return false;
+    }
+    let Some(uni) = kernel_gen::bind(chunk) else { return false };
+    let g = kernel_gen::G { cart: &chunk.cart, cache: &chunk.cache };
+    let mut acc = kernel_gen::acc_init(chunk);
+    let mut deopt_rows: std::collections::BTreeSet<u32> = Default::default();
+    let mut bd_hit = false;
+    let mut lo = 0usize;
+    while lo < chunk.width && !bd_hit {
+        let n = (chunk.width - lo).min(kernel::W);
+        let width_mask: u16 = if n == kernel::W { 0xffff } else { (1u16 << n) - 1 };
+        let Some(rin) = kernel_gen::rows(chunk, lo) else { return false };
+        kernel_gen::frame(&uni, &rin, &g, &mut |_b, osh, kout| {
+            if kout.bd {
+                bd_hit = true;
+                return;
+            }
+            let dead = kout.deopt & kout.valid & width_mask;
+            for i in 0..n {
+                if dead & (1 << i) != 0 {
+                    deopt_rows.insert((lo + i) as u32);
+                }
+            }
+            let live = kout.valid & !kout.deopt & width_mask;
+            if live == 0 {
+                return;
+            }
+            kernel_gen::append_out(&mut acc, chunk, lo, n, live, osh, kout);
+        });
+        lo += kernel::W;
+    }
+    if bd_hit {
+        return false; // uniform premise failed: whole chunk to the reference
+    }
+    if acc.width > 0 {
+        acc.boundary(ids);
+        done.push(acc);
+    }
+    if !deopt_rows.is_empty() {
+        let keep: Vec<u32> = deopt_rows.iter().copied().collect();
+        let mut sub = chunk.clone_block();
+        sub.retain_lanes(&keep);
+        local.push((sub, false));
+    }
+    true
+}
+
+/// Append `src`'s lanes onto `acc` (same structure). Uniform columns
+/// that agree stay uniform; any disagreement materializes per-lane
+/// values. The kernel path uses this to build ONE wide output block per
+/// chunk so boundary/dedup run once, not per 16-lane slice.
+fn append_lanes(acc: &mut runtime2::Rt2, src: &runtime2::Rt2) {
+    use runtime2::{Col, AV};
+    let old = acc.width;
+    let add = src.width;
+    let lane_at = |c: &Col, i: usize| -> AV {
+        match c {
+            Col::U(a) => *a,
+            Col::N(v) => AV::Num(v[i]),
+            Col::I(v) => AV::Ival(v[i].0, v[i].1),
+            Col::V(v) => v[i],
+        }
+    };
+    for (ci, col) in acc.cols.iter_mut().enumerate() {
+        let s = &src.cols[ci];
+        match (&mut *col, s) {
+            (Col::U(a), Col::U(b)) if *a == *b => {}
+            (Col::N(v), Col::N(w)) => v.extend_from_slice(w),
+            (Col::I(v), Col::I(w)) => v.extend_from_slice(w),
+            _ => {
+                // Materialize acc per-lane, then extend from src per-lane.
+                let mut vals: Vec<AV> = Vec::with_capacity(old + add);
+                for i in 0..old {
+                    vals.push(lane_at(col, i));
+                }
+                for i in 0..add {
+                    vals.push(lane_at(s, i));
+                }
+                *col = runtime2::compress_num_v(vals);
+            }
+        }
+    }
+    acc.width += add;
 }
 
 /// A width-`n` copy of lanes [lo, lo+n) of a block (structure shared by
