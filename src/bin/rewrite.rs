@@ -468,6 +468,17 @@ enum Command {
         /// checked. Saves ~20 s x 16 levels per horizon.
         #[arg(long)]
         pos_graph_from: Option<String>,
+        /// Register a shape-dispatched variant, exactly as `bench
+        /// --variant` spells it (SHAPES[@PM1]=RECIPE_PATH). This stage
+        /// replays the forward pass, so it takes the same set - not
+        /// because correctness needs it (dispatch is semantically
+        /// invisible; a variant-free replay of a variant-recorded forward
+        /// pass is legal) but so that a WRONG variant shows up as a
+        /// disagreement between stages rather than as a campaign whose
+        /// stages quietly disagree. ladder.sh passes the same
+        /// `${VARIANT_ARGS[@]}` to every stage.
+        #[arg(long = "variant")]
+        variants: Vec<String>,
     },
     /// Build (or extend) the position-transition table `pos_graph` on its
     /// own, without sweeping.
@@ -484,6 +495,17 @@ enum Command {
         /// The forward pass's last frame (its checkpoint must exist).
         #[arg(long)]
         frames: u32,
+        /// Register a shape-dispatched variant, exactly as `bench
+        /// --variant` spells it (SHAPES[@PM1]=RECIPE_PATH). This stage
+        /// replays the forward pass, so it takes the same set - not
+        /// because correctness needs it (dispatch is semantically
+        /// invisible; a variant-free replay of a variant-recorded forward
+        /// pass is legal) but so that a WRONG variant shows up as a
+        /// disagreement between stages rather than as a campaign whose
+        /// stages quietly disagree. ladder.sh passes the same
+        /// `${VARIANT_ARGS[@]}` to every stage.
+        #[arg(long = "variant")]
+        variants: Vec<String>,
     },
     /// Derive `frames/*.rowkeys` for a checkpoint dir written before the
     /// rowkeys era, so its artifacts work with the mmap visited engine
@@ -3500,7 +3522,7 @@ fn main() -> Result<()> {
                 byte_seqs.log10()
             );
         }
-        Command::Sweep { checkpoint_dir, frames, horizon, banded, pos_graph_from } => {
+        Command::Sweep { checkpoint_dir, frames, horizon, banded, pos_graph_from, variants } => {
             use celeste_rust::rewrite::state_mapping::StateMapping;
             use celeste_rust::rewrite::{sweep, sweep_time};
             let horizon = horizon.unwrap_or(frames);
@@ -3512,6 +3534,7 @@ fn main() -> Result<()> {
             let plain = Program::compile_executable_from_disk()?;
             let (program, _) = build(&recipe)?;
             let mapping = StateMapping::from_recipe(&recipe);
+            let build = |p: &Program| build_variants(&variants, p);
             let result = sweep_time::backward_sweep_time(
                 &dir,
                 frames,
@@ -3522,6 +3545,7 @@ fn main() -> Result<()> {
                 &program,
                 &plain,
                 mapping,
+                &build,
                 banded,
             )?;
             sweep::save_g(&dir, &result.g)?;
@@ -3562,7 +3586,7 @@ fn main() -> Result<()> {
                 ],
             );
         }
-        Command::PosGraph { checkpoint_dir, frames } => {
+        Command::PosGraph { checkpoint_dir, frames, variants } => {
             use celeste_rust::rewrite::state_mapping::StateMapping;
             use celeste_rust::rewrite::sweep_time;
             let dir = std::path::PathBuf::from(checkpoint_dir);
@@ -3572,6 +3596,7 @@ fn main() -> Result<()> {
             let plain = Program::compile_executable_from_disk()?;
             let (program, _) = build(&recipe)?;
             let mapping = StateMapping::from_recipe(&recipe);
+            let build = |p: &Program| build_variants(&variants, p);
             sweep_time::prepare_pos_graph(
                 &dir,
                 frames,
@@ -3581,6 +3606,7 @@ fn main() -> Result<()> {
                 &program,
                 &plain,
                 mapping,
+                &build,
             )?;
         }
         Command::MigrateVisited { checkpoint_dir } => {

@@ -275,6 +275,43 @@ pub struct TimeSweepResult {
     pub optimal_frame: Option<u32>,
 }
 
+/// Register `variants` on a replay engine, or say why there are none.
+///
+/// The replay stages take the same `--variant` set as `bench` for a reason
+/// that is NOT correctness: dispatch is semantically invisible - the
+/// boundary states are identical with and without it - so a sweep may
+/// legally run variant-free against a variant-recorded forward pass. What
+/// applying the same set everywhere buys is that a variant which turns out
+/// to be WRONG shows up as a disagreement between stages instead of as a
+/// campaign whose stages quietly disagree. See the VARIANTS note in
+/// ladder.sh.
+fn register_variants(
+    engine: &mut AbstractRun,
+    base_mapping: StateMapping,
+    variants: Vec<crate::rewrite::verify::Variant>,
+) -> Result<()> {
+    if variants.is_empty() {
+        return Ok(());
+    }
+    for v in &variants {
+        println!("variant {} registered for shapes {:?}", v.label, v.shapes);
+    }
+    engine.set_variants(base_mapping, variants);
+    Ok(())
+}
+
+/// How a caller builds its variant registry, given the host program.
+///
+/// A BUILDER rather than a built `Vec<Variant>` because the two replay
+/// engines here - the pos-graph recorder and the backward loop - are
+/// created one after the other and each needs its own registry, and
+/// `Variant` owns a `FixedEnv`, which is deliberately not `Clone`: a
+/// cheap-looking clone of the whole function table in a loop is exactly
+/// the mistake that type is refusing to make available. The two builds
+/// are seconds against a sweep measured in minutes, and the pos-graph one
+/// does not happen at all when the table is reused.
+pub type VariantBuilder<'a> = dyn Fn(&Program) -> Result<Vec<crate::rewrite::verify::Variant>> + 'a;
+
 /// Load the level's position graph, extending it over any frames it does
 /// not yet cover.
 ///
@@ -298,6 +335,7 @@ pub fn prepare_pos_graph(
     program: &Program,
     plain: &Program,
     mapping: StateMapping,
+    variants: &VariantBuilder<'_>,
 ) -> Result<PosGraph> {
     if let Some(src) = from {
         return borrow_pos_graph(src, frames, recipe_text);
@@ -333,7 +371,8 @@ pub fn prepare_pos_graph(
         frames - 1
     );
     let t = std::time::Instant::now();
-    let mut engine = AbstractRun::start_with_deopt(program, plain, mapping, false)?;
+    let mut engine = AbstractRun::start_with_deopt(program, plain, mapping.clone(), false)?;
+    register_variants(&mut engine, mapping, variants(program)?)?;
     let fresh = pos_graph::build_from_replay(dir, covered, frames, fingerprint, &mut engine)?;
     drop(engine);
     // The replay's transient is the biggest allocation this process ever
@@ -462,6 +501,7 @@ pub fn backward_sweep_time(
     program: &Program,
     plain: &Program,
     mapping: StateMapping,
+    variants: &VariantBuilder<'_>,
     banded: bool,
 ) -> Result<TimeSweepResult> {
     if horizon > frames {
@@ -481,6 +521,7 @@ pub fn backward_sweep_time(
         program,
         plain,
         mapping.clone(),
+        variants,
     )?;
 
     let ck = checkpoint::load(dir, frames, fingerprint).context("loading final checkpoint")?;
@@ -506,7 +547,8 @@ pub fn backward_sweep_time(
     );
     crate::metrics::record("bwdt.index", t.elapsed());
 
-    let mut engine = AbstractRun::start_with_deopt(program, plain, mapping, false)?;
+    let mut engine = AbstractRun::start_with_deopt(program, plain, mapping.clone(), false)?;
+    register_variants(&mut engine, mapping, variants(program)?)?;
     engine.disable_frontier();
 
     let mut g: Vec<u16> = vec![G_UNREACHABLE; n_rows];

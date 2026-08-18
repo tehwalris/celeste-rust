@@ -31,9 +31,10 @@ RECIPE=${RECIPE:-rewrites.jsonl}
 # to be WRONG shows up as a disagreement rather than as a campaign whose
 # stages quietly disagree with each other.
 #
-# NOTE: only `bench` accepts --variant today. `pos-graph` and `sweep` replay
-# the forward pass too and would benefit - on room (0,0) pos-graph was the
-# largest stage at 3567s - but do not take the flag yet.
+# Every stage that replays the forward pass now takes the flag (task #114):
+# bench, pos-graph and sweep. That matters most where the replay is the
+# expensive part - on room (0,0) pos-graph was the largest stage of the
+# campaign at 3567 s.
 VARIANTS=${VARIANTS:-}
 read -ra VARIANT_SPECS <<< "$VARIANTS"
 VARIANT_ARGS=()
@@ -211,10 +212,12 @@ for H in $(seq "$FROM" "$TO"); do
   # --frames N` extends an existing table, so staging it is just a loop.
   stage "l0-posgraph-h$H" /tmp/l0posgraph-h$H.log \
       ./target/release/rewrite --recipe "$RECIPE" pos-graph \
-      --checkpoint-dir "$L0" --frames "$H"
+      --checkpoint-dir "$L0" --frames "$H" \
+      ${VARIANT_ARGS[@]+"${VARIANT_ARGS[@]}"}
   stage "l0-sweep-h$H" /tmp/l0sweep-h$H.log \
       ./target/release/rewrite --recipe "$RECIPE" sweep \
-      --checkpoint-dir "$L0" --frames "$H" --horizon "$H"
+      --checkpoint-dir "$L0" --frames "$H" --horizon "$H" \
+      ${VARIANT_ARGS[@]+"${VARIANT_ARGS[@]}"}
   grep -E "abstract optimal|win seeds" /tmp/l0sweep-h$H.log
   refuted=0
   for K in $(seq 1 "$MAXK"); do
@@ -241,12 +244,14 @@ for H in $(seq "$FROM" "$TO"); do
       SHARE_ARGS=()
       stage "k$K-posgraph-h$H" "/tmp/k${K}posgraph-h$H.log" \
           env CELESTE_REM_BITS=$K ./target/release/rewrite --recipe "$RECIPE" pos-graph \
-          --checkpoint-dir "$KDIR" --frames "$H"
+          --checkpoint-dir "$KDIR" --frames "$H" \
+          ${VARIANT_ARGS[@]+"${VARIANT_ARGS[@]}"}
     fi
     stage "k$K-sweep-h$H" "/tmp/k${K}sweep-h$H.log" \
         env CELESTE_REM_BITS=$K ./target/release/rewrite --recipe "$RECIPE" sweep --banded \
         --checkpoint-dir "$KDIR" --frames "$H" --horizon "$H" \
-        ${SHARE_ARGS[@]+"${SHARE_ARGS[@]}"}
+        ${SHARE_ARGS[@]+"${SHARE_ARGS[@]}"} \
+        ${VARIANT_ARGS[@]+"${VARIANT_ARGS[@]}"}
     grep -E "abstract optimal|win seeds" "/tmp/k${K}sweep-h$H.log"
   done
   if [ "$refuted" -eq 0 ]; then

@@ -45,7 +45,7 @@ queue, because P1's crate split should move only code that survives K4.
 | 5d | **K6** make one emitted row cheaper (the fan-out pre-dedup is 85% of the compiled frame body) | NEW, from 5c's measurement | days | this is what gates every later kernel win; #134's territory |
 | 6 | **K5** kernels for rooms (0,0)/(2,0) | | days | multiplies a factor that 5c measured at ~1.0 under the ladder's own config - do 5d first |
 | 7 | **P2** the sweep's merge/regroup third (#151) | partly free | days | 5c already took `fwd.merge` 2.47 -> 1.46 s at f60 by handing over denser fragments |
-| 8 | **#114** variant dispatch for pos-graph/sweep | | ? | only matters for rooms that use variants - not (1,0) |
+| 8 | **#114** variant dispatch for pos-graph/sweep | DONE | - | gated with an identity variant at H=68: `posgraph.bin` and `g.bin` both byte-identical, 9.4M expansions on both sides |
 
 Ordering rationale, in one line each:
 - P0b before everything: hours, no new machinery, and it is measured.

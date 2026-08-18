@@ -95,6 +95,40 @@ with `--site-slots plans/site-slots-room10-f035.json` - that closes
 the gate to one shape again, so it must come with a census for EVERY
 shape the run visits, or stay off.
 
+# `--variant` on every replay stage (2026-08-18, task #114)
+
+`pos-graph` and `sweep` now take the same `--variant` set as `bench`, and
+ladder.sh passes `${VARIANT_ARGS[@]}` to all three. Not for correctness -
+dispatch is semantically invisible, so a variant-free replay of a
+variant-recorded forward pass is legal - but so that a WRONG variant shows
+up as a disagreement between stages instead of as a campaign whose stages
+quietly disagree.
+
+GATE, room (1,0), synthetic win at (64,44), H=68, an IDENTITY variant
+(`--variant 'player|player_spawn=rewrites.jsonl'`, i.e. the base recipe
+registered as a variant of itself, so any difference is the dispatch
+machinery and nothing else):
+
+| stage | without | with | result |
+|---|---|---|---|
+| `pos-graph --frames 68` | 141,236 pairs / 3,677 cells, 137.0 s | same, 150.0 s | `posgraph.bin` **byte-identical** |
+| `sweep --frames 68 --horizon 68` | 511,124 of 55,958,742 rows reach the exit, 9,383,878 expansions, optimal 64 | identical | `g.bin` **byte-identical** |
+
+Both sides did real work - this is not a vacuous gate: the sweep's backward
+loop ran 9.4M expansions and the pos-graph was rebuilt from replay in both
+runs. The identity variant also exercised the FALLBACK path: it is the
+recipe's own program, whose `assert_true` premises do not hold on the
+late `will_restart` states, so those frames printed "falling back to the
+base program - a registered variant's premises must hold for its shape,
+fix the registry" and ran the base. Loud, and the artifacts still came out
+identical, which is exactly the behaviour a variant registry is supposed
+to have.
+
+The variant registry is built by a `VariantBuilder` closure rather than
+handed over as a `Vec<Variant>`, because a sweep creates two replay
+engines in sequence (pos-graph recorder, backward loop) and `Variant` owns
+a `FixedEnv`, which is deliberately not `Clone`.
+
 # The compiled engine inside the campaign (2026-08-18, P1 stage 3)
 
 `CELESTE_COMPILED_FORWARD=1` replaces the campaign's frame body with
