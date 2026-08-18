@@ -92,3 +92,11 @@ Interpreter-fallback design notes for stage 2:
   shapes now (f20: 0.72 ms), so its speed does not matter at all.
 - Stages 4-5 (delete the Engine trait / scalar oracle / gen.rs program
   body, then simplify) follow stage 2 unchanged.
+
+## Where this sits in the overall queue
+
+See plans/campaign-cost-plan.md "ORDER OF WORK": stages 2 and 4-5 of
+this plan are items 3 and 4 of the merged queue, and they come BEFORE
+the crate split (P1) deliberately - so the split moves the ~5k lines of
+generated code that survive rather than the ~34k that includes gen.rs's
+program body, which stage 4 deletes.

@@ -28,6 +28,32 @@ Two conclusions drive everything below:
 
 ---
 
+## ORDER OF WORK (merged with the K4 retirement stages)
+
+The K4 stages (plans/k4-retirement-plan.md) and the P items here are one
+queue, because P1's crate split should move only code that survives K4.
+
+| # | item | status | effort | why here |
+|---|---|---|---|---|
+| 1 | **P0** fused pos-graph by default | DONE | - | -46% of level 0 (task #109) |
+| 2 | **P0b** one pos-graph for all k levels (#149) | next | hours | removes 16 stages/horizon; subset property measured |
+| 3 | **K4 stage 2** block->State exporter + interpreter fallback | | 1-2 d | unblocks every deletion below; fallback speed no longer matters (spawn shapes only) |
+| 4 | **K4 stages 4-5** delete the Rt2 ENGINE, gen.rs program body, scalar oracle; simplify | | 1-2 d | deletes 30k+ generated lines BEFORE they can be moved |
+| 5 | **P1** crate split + one frame interface (#150) | | days | the campaign can finally call the kernel; forward AND sweep at once |
+| 6 | **K5** kernels for rooms (0,0)/(2,0) | | days | P1's win is room-shaped until this |
+| 7 | **P2** the sweep's merge/regroup third (#151) | | days | 91 s of the sweep's 190 s replay; lands on P1's interface |
+| 8 | **#114** variant dispatch for pos-graph/sweep | | ? | only matters for rooms that use variants - not (1,0) |
+
+Ordering rationale, in one line each:
+- P0b before everything: hours, no new machinery, and it is measured.
+- K4 stage 2 before 4 because the fallback must exist before the engine
+  it replaces is deleted.
+- K4 before P1 so the crate split moves ~5k lines of generated code
+  instead of ~34k, most of which is scheduled for deletion.
+- K5 after P1 because the interface is what a new room's kernel plugs
+  into; doing it earlier means integrating twice.
+- P2 after P1 for the same reason.
+
 ## P0 - pos-graph fusion by default (hours, -46% of level 0)
 
 `bench --record-pos-graph` records the table DURING the forward pass:
