@@ -1594,7 +1594,11 @@ fn $fname(
             if live == 0 {
                 return;
             }
-            $m::append_out(&mut acc, chunk, lo, n, live, osh, kout);
+            let mut ug = false; // uniform-output cross-config guard
+            $m::append_out(&mut acc, chunk, lo, n, live, osh, kout, &mut ug);
+            if ug {
+                bd_hit = true;
+            }
         });
         lo += kernel::W;
     }

@@ -109,3 +109,15 @@ safe-run for anything heavy, ONE heavy job at a time, --memory 60G on
 certification runs, perf data in ~/perf-scratch/, measure before and
 after, suite (cargo nextest, never bare cargo test) before pushing
 main-crate changes, commit+push at every stable point.
+
+- **Fork-invariant hoisting (Philippe, 2026-08-18 morning)**: sharing
+  across BUTTON variants is done (button-taint). The same should hold
+  across SPLIT configs: an instruction whose operands don't depend on
+  the forked fragment can hoist ABOVE that fork loop. Statically
+  analyzable with the taint machinery generalized to one taint bit per
+  fork site: route each instruction to the SHALLOWEST nesting level
+  its operand taints allow (classic loop-invariant scheduling; the
+  emitter's pre/suf buffer pair becomes a stack of buffers, one per
+  fork depth + the button suffix). Not high priority - the fork loops
+  are cheap after dedup-on-the-fly - but it composes with everything
+  and the emitter already owns the mechanism.

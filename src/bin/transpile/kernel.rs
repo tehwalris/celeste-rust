@@ -1504,7 +1504,10 @@ fn render(e: &Emit, out_path: &str) -> Result<()> {
         "/// Append one (config, variant)'s live lanes onto the accumulator.\n\
          /// `lo` is the slice base in `chunk` (identity columns read there).\n\
          #[allow(unused_variables)]\n\
-         pub fn append_out(acc: &mut Rt2, chunk: &Rt2, lo: usize, n: usize, live: u16, sh: &KOutShared, kv: &KOut) {{\n\
+         pub fn append_out(acc: &mut Rt2, chunk: &Rt2, lo: usize, n: usize, live: u16, sh: &KOutShared, kv: &KOut, bd: &mut bool) {{\n\
+         \x20   // fresh: no fork config has written yet, so a uniform slot\n\
+         \x20   // still holds the chunk's INPUT value (legitimately different).\n\
+         \x20   let fresh = acc.width == 0;\n\
          \x20   for i in 0..n {{\n\
          \x20       if live & (1 << i) == 0 {{ continue; }}"
     )?;
@@ -1523,7 +1526,8 @@ fn render(e: &Emit, out_path: &str) -> Result<()> {
             )?,
             "P8" => writeln!(
                 out,
-                "        acc.cols[{id}] = Col::U(AV::Num({src}.c{id}));",
+                "        if !fresh {{ if let Col::U(AV::Num(prev)) = &acc.cols[{id}] {{ if *prev != {src}.c{id} {{ *bd = true; }} }} }}\n\
+                 \x20       acc.cols[{id}] = Col::U(AV::Num({src}.c{id}));",
                 id = id, src = src
             )?,
             "ZI" => writeln!(
@@ -1538,7 +1542,8 @@ fn render(e: &Emit, out_path: &str) -> Result<()> {
             )?,
             "(P8, P8)" => writeln!(
                 out,
-                "        acc.cols[{id}] = Col::U(AV::Ival({src}.c{id}.0, {src}.c{id}.1));",
+                "        if !fresh {{ if let Col::U(AV::Ival(a, b)) = &acc.cols[{id}] {{ if (*a, *b) != {src}.c{id} {{ *bd = true; }} }} }}\n\
+                 \x20       acc.cols[{id}] = Col::U(AV::Ival({src}.c{id}.0, {src}.c{id}.1));",
                 id = id, src = src
             )?,
             "ZB" => writeln!(
@@ -1553,7 +1558,8 @@ fn render(e: &Emit, out_path: &str) -> Result<()> {
             )?,
             "bool" => writeln!(
                 out,
-                "        acc.cols[{id}] = Col::U(AV::Bool({src}.c{id}));",
+                "        if !fresh {{ if let Col::U(AV::Bool(prev)) = &acc.cols[{id}] {{ if *prev != {src}.c{id} {{ *bd = true; }} }} }}\n\
+                 \x20       acc.cols[{id}] = Col::U(AV::Bool({src}.c{id}));",
                 id = id, src = src
             )?,
             other => bail!("append_out: type {}", other),
