@@ -929,16 +929,26 @@ fn frame_step(
     };
     let mut ran: Vec<runtime2::Rt2> = Vec::new();
     let mut pending: Vec<runtime2::Rt2> = Vec::new();
-    // Chunk cap: mid-frame width is ~64x the input width (the btn
-    // fan-out), and per-op column traffic goes through DRAM once the
-    // working set leaves cache. ~512 input lanes keep a varying
-    // column's mid-frame buffer (~32k lanes x 16 B = 512 KB) L2-ish.
-    // Cross-chunk dedup at the boundary makes chunking invisible
-    // (batching invariance is the certified doctrine).
+    // Chunk cap. Cross-chunk dedup at the boundary makes chunking
+    // invisible to the result (batching invariance is the certified
+    // doctrine), so this is purely a cost knob - and pre-dedup INVERTED
+    // it. While every emitted row was materialized, a chunk's mid-frame
+    // traffic dominated and small chunks won; now duplicates die as a
+    // hash probe and a bigger chunk simply catches more of them, so the
+    // dedup ratio wins instead. Measured at f35 (min of 5 reps, peak
+    // RSS), all gates exact:
+    //
+    //   lanes:  64      128     256     512     1024    4096
+    //   before: 348 ms  489     584     673     -       -
+    //   after:  133 ms  98      91      86      82      85
+    //   RSS:    0.99 GB  -      1.12    1.44    2.02    4.82
+    //
+    // 256 is the knee: 1.46x over the old default for +13% memory, and
+    // the mean stays as tight as the min (512's does not).
     let chunk_rows: usize = std::env::var("CELESTE_CHUNK_ROWS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(64);
+        .unwrap_or(256);
     for block in blocks {
         let freeze_cell = block.globals[g_freeze as usize];
         assert!(freeze_cell != runtime2::NONE);
