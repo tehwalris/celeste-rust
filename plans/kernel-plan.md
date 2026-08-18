@@ -261,3 +261,28 @@ the OUTPUT path, not the compute, dominated integration.
 Remaining after this: per-class overlay kernels (dash=1..4, freeze)
 to lift coverage past 61%, parallel scaling check, K4 retirement of
 obsoleted executors, then the (2,0) campaign.
+
+## Per-class overlays COMPLETE (2026-08-18 ~05:40): 100% class coverage
+
+Every pm1 class of the player shape now has a CERTIFIED branch-free
+overlay (hosted verify vs rewrites-compile, identical through f40,
+~115s each):
+
+| overlay | classes | __frame | certified at |
+|---|---|---|---|
+| rewrites-trace10-steady.jsonl | freeze:0,dash:0 (61%) | 5 blocks, ~2150 instrs | dash_time:0 |
+| rewrites-trace10-dash.jsonl   | dash_time 1..4 (23%)  | 5 blocks, 1804 instrs  | 1, 2, 3, 4 |
+| rewrites-trace10-frozen.jsonl | freeze 1..2 (16%)     | 3 blocks, **236 instrs** | freeze:1, freeze:2 |
+
+Each overlay was FOUR recipe lines on top of the shared trace10 prefix
+(guard_branch entries with the class's pinned edges + dce + kill_dead)
+- the trace-straightening machinery amortized exactly as intended.
+
+NEXT SESSION: the kernel registry - parameterize the emitter by module
+name (kernel_gen_steady / _dash / _frozen), emit witnesses per class
+(--emit-shape needs a class filter argument), try each kernel in
+run_chunk_kernel by bind order, then re-bench TILE=3 (expect well
+under 300 ms with 100% kernel coverage; the frozen classes' 236-instr
+frame is nearly free). Then Rt3/Rt2 retirement becomes real (K4), and
+the room (2,0) campaign (K5) runs on a fully-kernelized room (1,0)
+precedent.
