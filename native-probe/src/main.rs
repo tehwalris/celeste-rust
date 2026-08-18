@@ -14,7 +14,6 @@ mod gen;
 mod import;
 mod runtime;
 mod runtime2;
-mod runtime3;
 pub mod kernel;
 mod kernel_gen_dash;
 mod kernel_gen_frozen;
@@ -892,7 +891,6 @@ fn install_split_hook() {
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         if info.payload().downcast_ref::<runtime2::SplitReq>().is_none()
-            && info.payload().downcast_ref::<runtime3::TileBail>().is_none()
         {
             prev_hook(info);
         }
@@ -908,15 +906,13 @@ fn frame_step(
     g_freeze: u32,
     census_total: &mut rustc_hash::FxHashMap<&'static str, (u64, u64, u64)>,
 ) -> Vec<runtime2::Rt2> {
-    // CELESTE_TILE=1: concrete-button tiles (64 variants outside the
-    // kernel). CELESTE_TILE=2: dynamic-expand tiles (one boundary row,
-    // the input fan-out grows the lane axis IN-tile - trunk shared).
-    let tile_mode: u8 = match std::env::var("CELESTE_TILE") {
-        Ok(v) if v == "3" => 3,
-        Ok(v) if v == "2" => 2,
-        Ok(_) => 1,
-        Err(_) => 0,
-    };
+    // The lane kernels are the compiled engine (plans/kernel-plan.md);
+    // chunks they refuse fall through to the reference. The retired tile
+    // engines (CELESTE_TILE=1 concrete-button tiles, =2 dynamic expand)
+    // are gone - the kernels cover every player class and are ~5x faster
+    // (plans/k4-retirement-plan.md). CELESTE_KERNEL=0 routes everything
+    // to the reference for A/B.
+    let use_kernel = std::env::var("CELESTE_KERNEL").map(|v| v != "0").unwrap_or(true);
     // CELESTE_PHASE_TIME=1: print the per-frame wall split across the
     // serial/parallel phases (goal 7's measurement harness).
     let phase_time = std::env::var("CELESTE_PHASE_TIME").is_ok();
@@ -1001,7 +997,7 @@ fn frame_step(
                 scope.spawn(move || {
                     let mut done: Vec<runtime2::Rt2> = Vec::new();
                     while let Some((block, kernel_ok)) = local.pop() {
-                        if tile_mode == 3 && kernel_ok {
+                        if use_kernel && kernel_ok {
                             // KERNEL mode (plans/kernel-plan.md K3): the
                             // steady-class lane kernel first; rows it
                             // deopts re-enter the worklist for the
@@ -1011,18 +1007,6 @@ fn frame_step(
                             if run_chunk_kernel(&block, ids, &mut done, &mut local) {
                                 continue;
                             }
-                        }
-                        if tile_mode > 0 {
-                            // TILE=1 (per-variant monomorphized tiles) is
-                            // RETIRED (plans/kernel-plan.md K4): superseded
-                            // by dynexp and the kernel. Every tile mode uses
-                            // the dynexp path as its tile fallback.
-                            let out = run_chunk_dynexp(&block, ids);
-                            if let Some(out) = out {
-                                done.push(out);
-                                continue;
-                            }
-                            // bail: fall through to the reference engine
                         }
                         let snapshot = block.clone_block();
                         let mut sub = block;
@@ -1254,8 +1238,6 @@ fn run_abstract(num_frames: u32) {
     let shapes: Vec<String> =
         blocks.iter().map(|b| format!("{:#018x}", b.shape_hash)).collect();
     println!("final shapes: {}", shapes.join(", "));
-    print_bails();
-    print_gate_rejects();
     if !census_total.is_empty() {
         let mut rows: Vec<_> = census_total.into_iter().collect();
         rows.sort_by_key(|(_, (ns, _, _))| std::cmp::Reverse(*ns));
@@ -1595,7 +1577,7 @@ fn run_emit_shape(dir: &str, frame: u32, out_path: &str, class: &str) {
     );
 }
 
-/// CELESTE_TILE=3 (plans/kernel-plan.md K3): run one chunk through the
+/// The compiled engine (plans/kernel-plan.md K3): run one chunk through the
 /// steady-class lane kernel. Returns true if the chunk was handled -
 /// output blocks (boundary applied) pushed to `done`, any deopted input
 /// rows re-queued on `local` for the reference paths. Returns false
@@ -2392,128 +2374,5 @@ fn run_abstract_bench(dir: &str, frame: u32, reps: u32) {
             println!("  {:14} {:9.1} ms  {:>12} calls", name, ns as f64 / 1e6, calls);
         }
     }
-    print_bails();
-    print_gate_rejects();
-    runtime3::TILE_CENSUS.print();
-}
-fn run_chunk_dynexp(
-    chunk: &runtime2::Rt2,
-    ids: &runtime2::BoundaryIds,
-) -> Option<runtime2::Rt2> {
-    // Slot binding is shape-scoped: deopt off-shape (see run_chunk_tiled).
-    if gen::N_SLOTS > 0 && chunk.shape_hash != gen::SLOT_SHAPE {
-        record_gate_reject(chunk.shape_hash);
-        return None;
-    }
-    let mut acc: Option<(runtime2::Rt2, u64)> = None;
-    // ONE template per chunk (the only structure deep-clone); per row
-    // the working tile is reset via the undo log and refilled with the
-    // row's column values - no allocation, capacities retained.
-    let template: runtime3::Rt3<0xFF> = runtime3::Rt3::from_rt2(chunk, 0, 1);
-    // The chunk-varying columns (the only ones load_row must refill;
-    // execution's own writes roll back via the val_dirty undo log).
-    let varying: Vec<u32> = chunk
-        .cols
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| !matches!(c, runtime2::Col::U(_)))
-        .map(|(i, _)| i as u32)
-        .collect();
-    let mut rt3 = template.clone();
-    for row in 0..chunk.width {
-        let mut tape: Vec<u8> = Vec::new();
-        loop {
-            rt3.reset_from(&template);
-            rt3.load_row(chunk, row, &varying);
-            rt3.tape.clear();
-            rt3.tape.extend_from_slice(&tape);
-            rt3.begin_pass();
-            rt3.bind_slots();
-            let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                gen::call_fn(&mut rt3, gen::FN_FRAME, &[], &[]);
-            }));
-            match ok {
-                Ok(_) => {
-                    rt3.writeback_slots();
-                    let fp = rt3.structure_fp();
-                    match &mut acc {
-                        None => {
-                            let mut seed = rt3.seed_rt2();
-                            rt3.append_into(&mut seed);
-                            acc = Some((seed, fp));
-                        }
-                        Some((seed, afp)) => {
-                            if *afp != fp {
-                                return None;
-                            }
-                            rt3.append_into(seed);
-                        }
-                    }
-                    if !rt3.advance_tape() {
-                        break;
-                    }
-                    tape = rt3.tape.clone();
-                }
-                Err(payload) => match payload.downcast_ref::<runtime3::TileBail>() {
-                    Some(b) => {
-                        record_bail(b.0);
-                        return None;
-                    }
-                    None => std::panic::resume_unwind(payload),
-                },
-            }
-        }
-    }
-    let (mut acc, _) = acc?;
-    acc.boundary(ids);
-    Some(acc)
 }
 
-/// Off-shape gate rejections: count + the distinct shapes seen (the
-/// diagnostic for "the tile path silently stopped running").
-static GATE_REJECTS: std::sync::Mutex<Option<std::collections::HashMap<u64, u64>>> =
-    std::sync::Mutex::new(None);
-
-fn record_gate_reject(shape: u64) {
-    *GATE_REJECTS
-        .lock()
-        .unwrap()
-        .get_or_insert_with(Default::default)
-        .entry(shape)
-        .or_insert(0) += 1;
-}
-
-fn print_gate_rejects() {
-    if let Some(map) = GATE_REJECTS.lock().unwrap().take() {
-        let total: u64 = map.values().sum();
-        let shapes: Vec<String> = map.iter().map(|(s, n)| format!("{:#018x} x{}", s, n)).collect();
-        println!(
-            "tile shape-gate rejected {} chunks (SLOT_SHAPE {:#018x}): {}",
-            total,
-            gen::SLOT_SHAPE,
-            shapes.join(", ")
-        );
-    }
-}
-
-/// Aggregate bail sites (printed by the bench when nonempty).
-static BAILS: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
-    std::sync::Mutex::new(None);
-
-fn record_bail(loc: &std::panic::Location) {
-    let mut b = BAILS.lock().unwrap();
-    *b.get_or_insert_with(Default::default)
-        .entry(format!("{}:{}", loc.file(), loc.line()))
-        .or_insert(0) += 1;
-}
-
-fn print_bails() {
-    if let Some(map) = BAILS.lock().unwrap().take() {
-        let mut rows: Vec<_> = map.into_iter().collect();
-        rows.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
-        println!("tile bails by site:");
-        for (site, n) in rows.iter().take(10) {
-            println!("  {:>10}  {}", n, site);
-        }
-    }
-}

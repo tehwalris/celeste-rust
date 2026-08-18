@@ -74,3 +74,21 @@ Interpreter-fallback design notes for stage 2:
   (make_state_abstract etc.) interpreter-side before re-import? No:
   import_block + .boundary(ids) on the imported block reproduces the
   canonical form - mirror what load_states_any + bench do today.
+
+## Progress (2026-08-18)
+
+- Stage 1 DONE (uniform-output guard, commit edeb248).
+- **Stage 3 DONE and moved AHEAD of stage 2**: Rt3 (runtime3.rs, 1,676
+  lines), run_chunk_dynexp, the TILE mode switch and the tile bail /
+  shape-gate-reject counters are deleted. This was safe to do first
+  because the class kernels now cover 100% of player lanes on the
+  engine's OWN blocks (see the partitioner fixes), so dynexp had no
+  remaining job: 34-frame run 175 -> 173 ms, gates exact at
+  f20/25/30/35. The kernel is now the DEFAULT path; CELESTE_KERNEL=0
+  routes everything to the reference for A/B.
+- Stage 2 (block -> State exporter + interpreter fallback) is now the
+  only thing between here and deleting the Rt2 ENGINE. It got easier
+  and less urgent at the same time: the fallback only runs on spawn
+  shapes now (f20: 0.72 ms), so its speed does not matter at all.
+- Stages 4-5 (delete the Engine trait / scalar oracle / gen.rs program
+  body, then simplify) follow stage 2 unchanged.
