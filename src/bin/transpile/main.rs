@@ -1015,15 +1015,26 @@ fn main() -> Result<()> {
         gen.fields.intern(name);
     }
 
-    let mut fns = String::new();
-    let mut dispatch = String::new();
+    // The walk still RUNS, and its output is still thrown away on purpose.
+    //
+    // gen.rs no longer carries a program body - the interpreter is the only
+    // reference implementation of a frame (K4 stage 2) and the kernels are
+    // the only compiled one - but the name tables above are a SIDE EFFECT of
+    // this walk: `emit_function` is what interns strings, globals, fields,
+    // sites and branches, in the order it meets them. FIELD_NAMES in
+    // particular is the canonical field ordering the boundary hashes, so a
+    // walk that visits in a different order silently produces a different
+    // shape hash, a different row key and a different search.
+    //
+    // So: keep the walk, drop the text. Turning the emitter into a pure
+    // interning walk is a separate change with its own gate (regenerate and
+    // require the name-table section byte-identical) - doing it here would
+    // mean two candidate causes for any table that moved.
     for (i, (_, fun)) in program.functions.iter().enumerate() {
         let code = gen
             .emit_function(i as u32, fun)
             .with_context(|| format!("emit {}", fun.name.as_str()))?;
-        fns.push_str(&code);
-        fns.push('\n');
-        writeln!(dispatch, "        {} => f_{}(rt, caps, args),", i, i)?;
+        drop(code);
     }
 
     let fn_init = gen.fn_ids["__init"];
@@ -1048,7 +1059,6 @@ fn main() -> Result<()> {
         out.push_str("// Source program: Program::compile_executable_from_disk() (the exact\n");
         out.push_str("// program concrete_run interprets). Do not edit.\n\n");
     }
-    out.push_str("use crate::runtime::*;\n\n");
     out.push_str(&str_array("STRINGS", &gen.strings.names));
     out.push_str(&str_array("GLOBAL_NAMES", &gen.globals.names));
     out.push_str(&str_array("FIELD_NAMES", &gen.fields.names));
@@ -1096,25 +1106,9 @@ fn main() -> Result<()> {
          pub fn field_id(name: &str) -> Option<u32> {\n    \
          FIELD_NAMES.iter().position(|n| *n == name).map(|i| i as u32)\n}\n\n",
     );
-    out.push_str(
-        "/// Call through a value: closure cells dispatch on their dense fn id,\n\
-         /// builtin cells go to the runtime (core_interpreter.rs:697).\n\
-         pub fn call_value<E: Engine>(rt: &mut E, c: E::V, args: &[E::V], ctx: &str) -> E::V {\n\
-         \x20   match rt.callee_of(c, ctx) {\n\
-         \x20       Callee::Fn(f, caps) => call_fn(rt, f, &caps, args),\n\
-         \x20       Callee::Bi(b) => rt.call_builtin(b, args),\n\
-         \x20   }\n\
-         }\n\n",
-    );
-    out.push_str("pub fn call_fn<E: Engine>(rt: &mut E, f: u32, caps: &[E::V], args: &[E::V]) -> E::V {\n");
-    out.push_str("    match f {\n");
-    out.push_str(&dispatch);
-    out.push_str("        _ => panic!(\"unknown fn id {}\", f),\n    }\n}\n\n");
-    out.push_str(&fns);
-
     std::fs::write(&out_path, out).with_context(|| format!("write {}", out_path))?;
     eprintln!(
-        "wrote {} ({} functions, {} globals, {} fields, {} strings)",
+        "wrote {} ({} functions walked, {} globals, {} fields, {} strings)",
         out_path,
         gen.fn_names.len(),
         gen.globals.names.len(),

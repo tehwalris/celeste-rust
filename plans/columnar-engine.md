@@ -5,6 +5,14 @@ Philippe reviews in the morning). This is the architecture for goals 2+4
 of plans/overnight-2026-08-17.md, fused: the row struct IS the column
 set, and SIMD is the loop over lanes inside each column op.
 
+> **Partly retired 2026-08-18 (K4 stage 4).** The `Engine` trait, `Rt2`'s
+> execution impl (the arena, the ColId ops, the per-lane AV semantics) and
+> the SplitReq partition-and-rerun dance are deleted; the transpiler no
+> longer emits a program body. What survives - and what this file is still
+> the reference for - is the DATA MODEL: `Rt2`'s structure/cols/width, the
+> boundary's canonical compaction, the shape hash, row keys, pm1
+> partitioning, merge/dedup/retain, and the two importers.
+
 ## The insight that zero divergence buys
 
 The zero-divergence census (0 divergent of 26 executed branch sites,

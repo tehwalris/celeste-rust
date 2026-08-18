@@ -1,5 +1,16 @@
 # Native-compile probe (task #124)
 
+> **RETIRED 2026-08-18 (K4 stage 4).** Everything below describes the
+> SCALAR probe: `runtime.rs`, the `-i/-f` concrete mode, `--bench`, the gap
+> and branch censuses, and the hex-exactness gate against `concrete_run`.
+> All of it is deleted. It answered its question (6.2-6.4 us/frame-lane,
+> ~100-180x over the interpreter) and then served as the oracle for the
+> `Engine`-trait emission; when that emission died there was nothing left
+> for it to check. What survives from this file is the MEASUREMENT and the
+> conclusion, not the code. The live engine is the class kernels
+> (plans/kernel-plan.md) with the celeste-rust interpreter as fallback;
+> `runtime.rs` is now `builtins.rs`, 37 lines of builtin ABI.
+
 Question (Philippe, 2026-08-16): take a compiled version of the room and real
 lane data, write the frame as plain Rust "capturing exactly what the IR
 captures without deopts", run it in a tight loop on one isolated core - how

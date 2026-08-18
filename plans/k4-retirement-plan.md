@@ -150,15 +150,75 @@ So stage 4 splits into two pieces with very different risk:
    `format!` deleted, the recursion kept). Only worth doing after (1),
    and it needs its own gate.
 
-The gate for BOTH is the same and it is cheap and total: regenerate
-gen.rs and require the name-table section to be **byte-identical** to
-what is checked in. That is exactly the property a reordering would
+The gate for BOTH is the same and it is cheap and total: snapshot the
+name-table section, regenerate gen.rs, and require the section to be
+**byte-identical**. That is exactly the property a reordering would
 break. (It has already paid once: regenerating after the header fix
 changed two comment lines and nothing else, which is what confirmed
 gen.rs was the rewritten program.) Then f20/25/30/35 + the suite.
 
+Note gen.rs is GITIGNORED, so the snapshot is a local before/after, not
+a diff against the tree - extract it by content, not by line number:
+
+    sed -n '/^pub static STRINGS/,/^pub fn field_id/p' native-probe/src/gen.rs \
+        | head -n -1 > ~/perf-scratch/gen-nametables-before.txt
+
 Do NOT do (2) as part of (1). If the tables move, you want to know
 which change moved them.
+
+## Stage 4 piece (1): DONE 2026-08-18
+
+`transpile` still walks every function - the walk is what interns the
+tables - and throws the emitted text away. gen.rs went **29,672 -> 3,962
+lines**, and the name-table gate passed byte-identical, so nothing
+reordered.
+
+Deleted with it: `runtime.rs` entirely (1,004 lines - the `Engine`
+trait, `Callee`, the scalar `Rt` and its 18 builtin impls, `V`, `Cell`),
+`Rt2`'s Engine impl and its arena (the ColId ops, `put`/`get`/`map1`/
+`map2`/`select_inner`/`split_multi_with`, the `av_*` per-lane op ports),
+`SplitReq` and its panic hook, `import_lane` + `assert_lane_matches_
+block`, `Rt2::from_scalar`, and the probe's concrete modes (`-i/-f`,
+`--bench`, `--from-checkpoint` gap census, `--branch-census`). What was
+`runtime.rs` is now `builtins.rs`: 37 lines, `BUILTIN_NAMES` only, which
+is an ABI in exactly the way FIELD_NAMES is (the index is what
+`Cell2::Bi` stores and what import/export translate through).
+
+Two things this forced that are improvements in their own right:
+
+- **The starting position now comes from the interpreter.** `--abstract`
+  used to begin from `build_rt()`, which ran the transpiled `__init` on
+  the scalar runtime and hand-placed the builtin cells - a second
+  implementation of a starting position. It now runs the program's
+  `init_cfg` through `interpret_cfg` and imports the result, i.e. the
+  same construction as `verify.rs`'s `AbstractRun::start`. Gate: lane
+  counts match the campaign checkpoints exactly - frame 25 = 204, frame
+  26 = 878, frame 30 = 27,024.
+- **The pm1 merge patterns are now set in the probe.** They are a process
+  global that `AbstractRun::start` sets and the probe never did; any
+  frame this process interprets has to run under the same setting or it
+  merges differently from the reference it claims to be.
+
+And the crate-wide `#![allow(unused_variables, unused_assignments,
+unused_mut, unreachable_code, dead_code)]` - which existed for the
+transpiled body - is **gone**, replaced by `#[allow(dead_code)]` on the
+four GENERATED modules only. That surfaced ~60 warnings of real dead
+code, all deleted here. (CLAUDE.md's warning about a crate-wide allow
+hiding ~150 lines was about a different crate; this one was hiding its
+own.)
+
+Gates: f20/25/30/35 all "row-key SET EQUAL (gate 2) OK"; suite 551/551.
+Times f20 1.44 / f25 1.37 / f30 15.52 / f35 107.2 ms (min of 3), i.e.
+unchanged at depth - f35 was 105.4 before, which is run-to-run noise.
+
+Piece (2) - turning `Gen`'s emitter into a pure interning walk, ~540
+lines of `format!` - is still open, and so is the question piece (2)
+should answer: SITE_INFO, BRANCH_INFO, SLOT_CELLS, SLOT_SHAPE, N_SLOTS,
+FN_INIT and FN_FRAME now have **no consumer at all**. They are emitted
+and read by nobody. Deleting them from the emitter is safe for the
+interning order (they are outputs of the walk, not inputs to it), but it
+changes the gate's baseline, so do it as its own commit and re-snapshot
+the four tables that remain.
 
 ## Where this sits in the overall queue
 
