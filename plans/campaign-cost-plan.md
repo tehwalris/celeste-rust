@@ -42,7 +42,14 @@ queue, because P1's crate split should move only code that survives K4.
 | 4b | **K4 stage 4 piece 2 + stage 5** emitter is a pure interning walk; slot subsystem and the consumerless tables deleted | DONE | - | transpile 1,125 -> 449 lines, gen.rs 3,962 -> 236; four name tables byte-identical; gates f20/25/30/35 exact, suite 551/551 |
 | 5 | **P1** crate split + one frame interface (#150) | DONE | - | the campaign can finally call the kernel; forward AND sweep at once |
 | 5c | **P1 stage 3** the campaign's frame body goes through `FrameEngine::run_frame_chunk` | DONE, and it REFUTES the projection | - | 1.77x / 5.3x less memory without the frontier subtract, **9-13% SLOWER with it** - and the ladder runs with it. Row-key sets equal every chunk, 30-frame test. Default OFF |
-| 5d | **K6** make one emitted row cheaper (the fan-out pre-dedup is 85% of the compiled frame body) | NEW, from 5c's measurement | days | this is what gates every later kernel win; #134's territory |
+| 5d | **K6** make one emitted row cheaper | SUPERSEDED by plans/dedup-roofline-plan.md | - | the row cost turned out to be two separate things: dedup (D2 there) and the input fan-out (M1 there) |
+
+**The queue below this row is superseded by `plans/dedup-roofline-plan.md`
+(2026-08-19).** Pricing the whole forward stage per input lane moved the
+target: 44% of it is hashing rows and probing the visited set, over 2.9
+BILLION offered rows at a 52:1 kill ratio, and the deopt path costs as
+much as the compiled engine while starving it of 28% of its lanes. K5 and
+K6 as written are both downstream of numbers that do not exist yet.
 | 6 | **K5** kernels for rooms (0,0)/(2,0) | | days | multiplies a factor that 5c measured at ~1.0 under the ladder's own config - do 5d first |
 | 7 | **P2** the sweep's merge/regroup third (#151) | partly free | days | 5c already took `fwd.merge` 2.47 -> 1.46 s at f60 by handing over denser fragments |
 | 8 | **#114** variant dispatch for pos-graph/sweep | DONE | - | gated with an identity variant at H=68: `posgraph.bin` and `g.bin` both byte-identical, 9.4M expansions on both sides |
