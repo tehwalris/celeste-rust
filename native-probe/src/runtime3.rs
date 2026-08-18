@@ -358,64 +358,9 @@ impl<const BTN: u8> Rt3<BTN> {
 
     /// Write concrete button bools for input `byte` (set_buttons logic on
     /// the tile: __button_states array items point at value cells).
-    pub fn set_buttons(&mut self, g_button_states: u32, byte: u8) {
-        let cell = self.globals[g_button_states as usize];
-        assert!(cell != NONE, "no __button_states global");
-        let arr = match &self.structure[cell as usize] {
-            Cell2::Val => match self.cols[cell as usize] {
-                TCol::U(AV::Ptr(id)) => id,
-                _ => panic!("__button_states shape"),
-            },
-            Cell2::Arr(_) => cell,
-            other => panic!("__button_states shape: {:?}", other),
-        };
-        let items = match &self.structure[arr as usize] {
-            Cell2::Arr(items) => items.clone(),
-            other => panic!("button array shape: {:?}", other),
-        };
-        for (i, item) in items.iter().enumerate() {
-            let pressed = byte >> i & 1 == 1;
-            let target = match &self.structure[*item as usize] {
-                Cell2::Val => match self.cols[*item as usize] {
-                    TCol::U(AV::Ptr(id)) => id,
-                    _ => *item,
-                },
-                _ => *item,
-            };
-            self.dirty.push(target);
-            self.val_dirty.push(target);
-            self.structure[target as usize] = Cell2::Val;
-            self.cols[target as usize] = TCol::U(AV::Bool(pressed));
-        }
-    }
 
     /// Rebind the tile to another input-variant type (fields are
     /// BTN-independent; the parameter only drives const folding).
-    pub fn into_variant<const B: u8>(self) -> Rt3<B> {
-        Rt3::<B> {
-            width: self.width,
-            structure: self.structure,
-            cols: self.cols,
-            globals: self.globals,
-            strings: self.strings,
-            cart: self.cart,
-            cache: self.cache,
-            prints: self.prints,
-            valid: self.valid,
-            tape: self.tape,
-            cursor: self.cursor,
-            ks: self.ks,
-            tiles: self.tiles,
-            tiles_n: self.tiles_n,
-            tile_log_n: self.tile_log_n,
-            tile_log: self.tile_log,
-            dirty: self.dirty,
-            val_dirty: self.val_dirty,
-            log_w: self.log_w,
-            slots: self.slots,
-            guard: self.guard,
-        }
-    }
 
     /// Prepare for a (re)run pass: valid mask reset, tape cursor rewound
     /// (the tape itself carries the pass's choices).
