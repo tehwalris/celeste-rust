@@ -1547,7 +1547,86 @@ fn run_chunk_kernel(
         return true;
     }
     KERNEL_HITS[3].fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
+    // Why did every kernel refuse? A shape hash that matches some kernel
+    // means the CLASS guard rejected it (a pm1 the overlays do not
+    // cover); no match at all means the heap shape itself is new. The
+    // two want completely different work, so record which.
+    if std::env::var("CELESTE_KERNEL_MISS").is_ok() {
+        let known = [
+            ("steady", kernel_gen_steady::SHAPE_HASH),
+            ("dash", kernel_gen_dash::SHAPE_HASH),
+            ("frozen", kernel_gen_frozen::SHAPE_HASH),
+        ];
+        let same_shape: Vec<&str> = known
+            .iter()
+            .filter(|(_, h)| *h == chunk.shape_hash)
+            .map(|(n, _)| *n)
+            .collect();
+        let mut miss = KERNEL_MISS.lock().unwrap();
+        *miss.entry((chunk.shape_hash, same_shape.join("/"))).or_insert(0u64) +=
+            chunk.width as u64;
+    }
     false
+}
+
+/// Missed chunks by (shape hash, which kernels share that shape).
+static KERNEL_MISS: std::sync::Mutex<std::collections::BTreeMap<(u64, String), u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Where a class kernel refused a chunk, by (class, step). Diagnostic
+/// only (CELESTE_KERNEL_MISS=1): "shape" is a different heap, "bind" a
+/// uniform/kind mismatch, "rows" a per-lane kind mismatch, "guard" the
+/// kernel's own class or premise check.
+static KERNEL_MISS_WHY: std::sync::Mutex<
+    std::collections::BTreeMap<(&'static str, &'static str), u64>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Which block-uniform input a kernel could not bind, by cell and by the
+/// column kind that was there instead. Diagnostic only.
+static BIND_FAIL: std::sync::Mutex<std::collections::BTreeMap<(u32, &'static str), u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn note_bind_failure(
+    chunk: &runtime2::Rt2,
+    ids: &runtime2::BoundaryIds,
+    uni_cells: &[(u32, &str)],
+) {
+    if std::env::var("CELESTE_KERNEL_MISS").is_err() {
+        return;
+    }
+    let mut fail = BIND_FAIL.lock().unwrap();
+    *fail
+        .entry((
+            chunk.player_objects(ids).len() as u32,
+            "players; pm1 cells below",
+        ))
+        .or_insert(0) += chunk.width as u64;
+    *fail
+        .entry((chunk.pm1_cells(ids).len() as u32, "pm1 cells"))
+        .or_insert(0) += chunk.width as u64;
+    for (cell, want) in uni_cells {
+        let got: &'static str = match &chunk.cols[*cell as usize] {
+            runtime2::Col::U(runtime2::AV::Num(_)) => "U(num)",
+            runtime2::Col::U(runtime2::AV::Bool(_)) => "U(bool)",
+            runtime2::Col::U(runtime2::AV::Ival(..)) => "U(ival)",
+            runtime2::Col::U(runtime2::AV::UBool) => "U(ubool)",
+            runtime2::Col::U(_) => "U(other)",
+            runtime2::Col::N(_) => "N(varying)",
+            runtime2::Col::I(_) => "I(varying)",
+            runtime2::Col::V(_) => "V(varying)",
+        };
+        let ok = matches!((*want, got), ("num", "U(num)") | ("bool", "U(bool)"));
+        if !ok {
+            *fail.entry((*cell, got)).or_insert(0) += chunk.width as u64;
+        }
+    }
+}
+
+fn note_miss(class: &'static str, step: &'static str, lanes: usize) {
+    if std::env::var("CELESTE_KERNEL_MISS").is_err() {
+        return;
+    }
+    *KERNEL_MISS_WHY.lock().unwrap().entry((class, step)).or_insert(0) += lanes as u64;
 }
 
 /// Pre-dedup rows out of the kernel's registers before materializing
@@ -1632,6 +1711,28 @@ pub fn print_kernel_hits() {
             v[0], v[1], v[2], v[3]
         );
     }
+    {
+        let mut miss = KERNEL_MISS.lock().unwrap();
+        for ((hash, same), lanes) in miss.iter() {
+            eprintln!(
+                "kernel miss: shape {:#x} lanes {} ({})",
+                hash,
+                lanes,
+                if same.is_empty() { "new shape - no kernel has it" } else { same }
+            );
+        }
+        miss.clear();
+        let mut why = KERNEL_MISS_WHY.lock().unwrap();
+        for ((class, step), lanes) in why.iter() {
+            eprintln!("kernel miss: {} refused at {} ({} lanes)", class, step, lanes);
+        }
+        why.clear();
+        let mut fail = BIND_FAIL.lock().unwrap();
+        for ((cell, got), lanes) in fail.iter() {
+            eprintln!("kernel miss: cell {} is {} ({} lanes)", cell, got, lanes);
+        }
+        fail.clear();
+    }
     let rows: Vec<u64> = KROWS
         .iter()
         .map(|a| a.swap(0, std::sync::atomic::Ordering::Relaxed))
@@ -1655,9 +1756,14 @@ fn $fname(
     local: &mut Vec<(runtime2::Rt2, bool)>,
 ) -> bool {
     if chunk.shape_hash != $m::SHAPE_HASH {
+        note_miss(stringify!($m), "shape", chunk.width);
         return false;
     }
-    let Some(uni) = $m::bind(chunk) else { return false };
+    let Some(uni) = $m::bind(chunk) else {
+        note_miss(stringify!($m), "bind", chunk.width);
+        note_bind_failure(chunk, ids, $m::UNI_CELLS);
+        return false;
+    };
     let g = $m::G { cart: &chunk.cart, cache: &chunk.cache };
     let mut acc = $m::acc_init(chunk);
     let plan = key_plan(chunk, ids, $m::KEY_CELLS);
@@ -1674,7 +1780,10 @@ fn $fname(
     while lo < chunk.width && !bd_hit {
         let n = (chunk.width - lo).min(kernel::W);
         let width_mask: u16 = if n == kernel::W { 0xffff } else { (1u16 << n) - 1 };
-        let Some(rin) = $m::rows(chunk, lo) else { return false };
+        let Some(rin) = $m::rows(chunk, lo) else {
+            note_miss(stringify!($m), "rows", chunk.width);
+            return false;
+        };
         $m::frame(&uni, &rin, &g, &mut |_b, osh, kout| {
             if kout.bd {
                 bd_hit = true;
@@ -1710,7 +1819,10 @@ fn $fname(
         lo += kernel::W;
     }
     if bd_hit {
-        return false; // uniform premise failed: whole chunk to the reference
+        // A guard inside the kernel refused: wrong class, or a uniform
+        // premise that did not hold.
+        note_miss(stringify!($m), "guard", chunk.width);
+        return false;
     }
     if acc.width > 0 {
         // Dedup-census (plans/dedup-on-the-fly-plan.md): how much of the

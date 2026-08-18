@@ -242,6 +242,35 @@ fn compress_num(c: Col) -> Col {
     }
 }
 
+/// A column whose lanes all agree IS a uniform column; store it as one.
+///
+/// This is representation-only - `boundary`'s row key folds uniform cells
+/// into the block partial precisely so that keys do not depend on which
+/// cells happen to be uniform - but it is load-bearing twice over. The
+/// interpreter keeps such cells as `MaybeVector::Scalar`, so without this
+/// an imported block and an engine-produced block of the SAME content
+/// have different column kinds, and every kernel `bind` (which requires
+/// `Col::U` for its block-uniform inputs) refuses engine output: at f35
+/// the engine's own next frame ran 269,059 lanes with zero kernel
+/// coverage purely for this reason.
+fn collapse_uniform(c: Col) -> Col {
+    let all_same = match &c {
+        Col::U(_) => return c,
+        Col::N(vs) => vs.first().map_or(false, |f| vs.iter().all(|x| x == f)),
+        Col::I(vs) => vs.first().map_or(false, |f| vs.iter().all(|x| x == f)),
+        Col::V(vs) => vs.first().map_or(false, |f| vs.iter().all(|x| x == f)),
+    };
+    if !all_same {
+        return c;
+    }
+    match c {
+        Col::N(vs) => Col::U(AV::Num(vs[0])),
+        Col::I(vs) => Col::U(AV::Ival(vs[0].0, vs[0].1)),
+        Col::V(vs) => Col::U(vs[0]),
+        Col::U(_) => unreachable!(),
+    }
+}
+
 // ---- per-lane op ports ----
 
 /// Plus/Minus with the Number/Interval lift (op.rs:406-427, 478-505).
@@ -1782,14 +1811,16 @@ impl Rt2 {
     }
 
     /// The player objects' relevant cells (mark_heap, abstraction.rs:134).
-    pub fn mark_walk(&self, ids: &BoundaryIds) -> (Vec<u32>, Vec<u32>) {
-        let mut rem_cells = Vec::new();
-        let mut det_cells = Vec::new();
+    /// The player INSTANCES in `objects`: array entries whose `type`
+    /// field points at the `player` type table. (`g_player` itself is
+    /// that table, not an instance.)
+    pub fn player_objects(&self, ids: &BoundaryIds) -> Vec<u32> {
+        let mut found = Vec::new();
         let Some(arr) = self.global_target(ids.g_objects) else {
-            return (rem_cells, det_cells);
+            return found;
         };
         let Cell2::Arr(items) = &self.structure[arr as usize] else {
-            return (rem_cells, det_cells);
+            return found;
         };
         let player_type = self.global_target(ids.g_player);
         for item in items {
@@ -1808,9 +1839,17 @@ impl Rt2 {
                 Col::U(AV::Ptr(t)) => Some(t) == player_type,
                 _ => false,
             };
-            if !is_player {
-                continue;
+            if is_player {
+                found.push(obj);
             }
+        }
+        found
+    }
+
+    pub fn mark_walk(&self, ids: &BoundaryIds) -> (Vec<u32>, Vec<u32>) {
+        let mut rem_cells = Vec::new();
+        let mut det_cells = Vec::new();
+        for obj in self.player_objects(ids) {
             if let Some(rem_ptr_cell) = self.obj_field_cell(obj, ids.f_rem) {
                 if let Col::U(AV::Ptr(rem_obj)) = self.cols[rem_ptr_cell as usize] {
                     for f in [ids.f_x, ids.f_y] {
@@ -2144,7 +2183,9 @@ impl Rt2 {
             };
             new_structure.push(cell);
             new_cols.push(match &self.structure[old as usize] {
-                Cell2::Val => compress_num(remap_col(&self.cols[old as usize], &new_id)),
+                Cell2::Val => {
+                    collapse_uniform(compress_num(remap_col(&self.cols[old as usize], &new_id)))
+                }
                 _ => Col::U(AV::Nil),
             });
         }
@@ -2430,12 +2471,18 @@ impl Rt2 {
                 cells.push(c);
             }
         }
-        if let Some(player) = self.global_target(ids.g_player) {
-            if matches!(self.structure[player as usize], Cell2::Obj(_)) {
-                for &f in &ids.f_pm1 {
-                    if let Some(c) = self.obj_field_cell(player, f) {
-                        cells.push(c);
-                    }
+        // `g_player` holds the player TYPE table, not the instance - the
+        // instance is the object in `objects` whose `type` points at it,
+        // exactly as mark_walk finds it. Resolving fields off the type
+        // table silently found nothing, so pm1 partitioning only ever
+        // split on the two globals: engine-produced blocks kept mixed
+        // dash_time / p_jump / p_dash and no class kernel could bind them
+        // (at f35 that cost the whole next frame - 269,059 lanes - its
+        // kernel coverage).
+        for obj in self.player_objects(ids) {
+            for &f in &ids.f_pm1 {
+                if let Some(c) = self.obj_field_cell(obj, f) {
+                    cells.push(c);
                 }
             }
         }
@@ -2492,6 +2539,15 @@ impl Rt2 {
     /// Split the block into sub-blocks whose lanes agree on the value in
     /// `cell` (the frame-start uniform-branch pre-partition; the freeze
     /// gate is the pm1 precedent). Groups in first-occurrence order.
+    /// Store every all-equal column as uniform. Representation-only (see
+    /// `collapse_uniform`) and idempotent.
+    pub fn collapse_uniform_cols(&mut self) {
+        for p in 0..self.cols.len() {
+            let col = std::mem::replace(&mut self.cols[p], Col::U(AV::Nil));
+            self.cols[p] = collapse_uniform(col);
+        }
+    }
+
     pub fn partition_by_cell(self, cell: u32) -> Vec<Rt2> {
         let by_vals = |vals: Vec<AV>| -> Vec<Vec<u32>> {
             let mut order: Vec<AV> = Vec::new();
@@ -2534,6 +2590,13 @@ impl Rt2 {
             .map(|keep| {
                 let mut b = self.clone_block();
                 b.retain_lanes(&keep);
+                // A partition exists to make some cell single-valued;
+                // say so in the representation. Without this the split
+                // column stays a constant Col::N, and every kernel bind
+                // (which wants Col::U for its block-uniform inputs)
+                // refuses the very blocks partitioning just made
+                // bindable.
+                b.collapse_uniform_cols();
                 b
             })
             .collect()
