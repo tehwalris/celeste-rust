@@ -111,3 +111,42 @@ folds each variant's dead selects); per-lane Ival appears mid-frame
 (num + uniform rem interval), flr straddle -> per-lane deopt bit;
 tri-state compares carry (value, known) masks; select on unknown
 cond -> deopt bit (v1).
+
+## K2 status (2026-08-18 ~02:30)
+
+GATE PASSES: `--kernel-bench` on f35 steady class (114,458 lanes,
+10 blocks): kernel + deopt-to-reference row-key set EQUAL to the
+certified frame_step pipeline (197,316 keys, 0 missing, 0 extra).
+Speed of the raw v1 emission: 360.5 ms for 114,458 lanes x 64 inputs
+single-threaded = 49.2 ns per row-input-frame - AT the ~50ns bar
+before any hill-climbing.
+
+BUT the deopt rate is 97% (7.13M of 7.33M lane-variants): the
+"straddle -> deopt" v1 decision is wrong at scale. rem is
+boundary-widened to a width-1 interval, so flr(rem+spd+0.5) straddles
+for EVERY fractional spd lane (all falling lanes). The 49.2ns number
+is therefore mostly garbage-computation + the reference doing the
+real work; not yet meaningful.
+
+NEXT (the fork restructure, matching Philippe's "output = a handful
+of SIMD lanes depending on forks"):
+- A width-<1 interval spans AT MOST 2 floors, so each __split_by_flr
+  is a <=2-way fork; __split_at on per-lane Nums is identity (spd.x
+  is Num), so exactly 2 fork sites exist, both in the PREFIX.
+- Emitter restructure: cut segments at fork sites like at the button
+  expand: P0 | fork1 | P1 | fork2 | P2 + 64 suffixes. Forks are
+  RUNTIME loops (for c in 0..2), not monomorphized: fragment c of a
+  lane = intersect with its c-th floor bucket; lanes whose fragment c
+  is empty drop out via a per-lane VALID mask (not deopt) threaded to
+  the output. Segments become fns; crossing-value structs per cut
+  (the existing Pre machinery generalized to a chain).
+- Then re-measure: expected well under 49.2ns/row-btn of real work
+  once 97% of lanes stop being garbage; then disasm + hill-climb.
+- Deopt then remains only for: genuine >2-floor straddles (cannot
+  happen at width<1), split_at on true intervals, unknown-cond
+  selects, guard failures - the rare tail.
+
+Bench harness detail worth keeping: deopted input rows are re-run
+through frame_step and their keys unioned - that IS the K3
+architecture (kernel front, reference behind), and the gate proves
+the composition exact.

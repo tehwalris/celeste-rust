@@ -1224,6 +1224,128 @@ fn render(e: &Emit, out_path: &str) -> Result<()> {
     }
     writeln!(out, "];\n")?;
 
+    // Runtime glue: bind uniforms from a block (kind + pin checked),
+    // gather a 16-row slice, and apply an output back onto a sliced block.
+    writeln!(
+        out,
+        "use crate::runtime2::{{Rt2, Col, AV}};\n\n\
+         /// Bind the block-uniform inputs. None = off-shape / off-kind /\n\
+         /// pin mismatch: the block takes the reference path.\n\
+         pub fn bind(b: &Rt2) -> Option<Uni> {{\n\
+         \x20   if b.shape_hash != SHAPE_HASH {{ return None; }}\n\
+         \x20   for (cell, pin) in PIN_CELLS {{\n\
+         \x20       match &b.cols[*cell as usize] {{\n\
+         \x20           Col::U(AV::Num(n)) if n.as_raw_u32() as i32 == *pin => {{}}\n\
+         \x20           _ => return None,\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         \x20   Some(Uni {{"
+    )?;
+    for (id, kind) in &e.uni {
+        match *kind {
+            "num" => writeln!(
+                out,
+                "        c{id}: match &b.cols[{id}] {{ Col::U(AV::Num(n)) => *n, _ => return None }},",
+                id = id
+            )?,
+            "ival" => writeln!(
+                out,
+                "        c{id}: match &b.cols[{id}] {{ Col::U(AV::Ival(a, b)) => (*a, *b), _ => return None }},",
+                id = id
+            )?,
+            "bool" => writeln!(
+                out,
+                "        c{id}: match &b.cols[{id}] {{ Col::U(AV::Bool(v)) => *v, _ => return None }},",
+                id = id
+            )?,
+            _ => unreachable!(),
+        }
+    }
+    writeln!(out, "    }})\n}}\n")?;
+
+    writeln!(
+        out,
+        "/// Gather rows [lo, lo+16) into lane arrays; short slices pad by\n\
+         /// repeating the last row (padded outputs are ignored by width).\n\
+         pub fn rows(b: &Rt2, lo: usize) -> Option<RowsIn> {{\n\
+         \x20   let at = |i: usize| -> usize {{ (lo + i).min(b.width - 1) }};\n\
+         \x20   Some(RowsIn {{"
+    )?;
+    for (id, kind) in &e.vary_in {
+        match *kind {
+            "num" => writeln!(
+                out,
+                "        c{id}: match &b.cols[{id}] {{\n\
+                 \x20           Col::N(v) => core::array::from_fn(|i| v[at(i)]),\n\
+                 \x20           Col::U(AV::Num(n)) => [*n; W],\n\
+                 \x20           _ => return None,\n\
+                 \x20       }},",
+                id = id
+            )?,
+            "bool" => writeln!(
+                out,
+                "        c{id}: match &b.cols[{id}] {{\n\
+                 \x20           Col::V(v) => {{\n\
+                 \x20               let mut m = 0u16;\n\
+                 \x20               for i in 0..W {{ if matches!(v[at(i)], AV::Bool(true)) {{ m |= 1 << i; }} \
+                 else if !matches!(v[at(i)], AV::Bool(false)) {{ return None; }} }}\n\
+                 \x20               m\n\
+                 \x20           }}\n\
+                 \x20           Col::U(AV::Bool(t)) => if *t {{ 0xffff }} else {{ 0 }},\n\
+                 \x20           _ => return None,\n\
+                 \x20       }},",
+                id = id
+            )?,
+            _ => unreachable!(),
+        }
+    }
+    writeln!(out, "    }})\n}}\n")?;
+
+    writeln!(
+        out,
+        "impl KOut {{\n\
+         \x20   /// Write this variant's outputs onto a width-`n` sliced block\n\
+         \x20   /// (the block already carries the input row values).\n\
+         \x20   pub fn apply(&self, b: &mut Rt2, n: usize) {{"
+    )?;
+    for (id, ty, _) in &out_fields {
+        match *ty {
+            "ZN" => writeln!(
+                out,
+                "        b.cols[{id}] = Col::N(self.c{id}[..n].to_vec());",
+                id = id
+            )?,
+            "ZI" => writeln!(
+                out,
+                "        b.cols[{id}] = Col::I((0..n).map(|i| (self.c{id}.lo[i], self.c{id}.hi[i])).collect());",
+                id = id
+            )?,
+            "ZB" => writeln!(
+                out,
+                "        b.cols[{id}] = Col::V((0..n).map(|i| AV::Bool(self.c{id}.val & (1 << i) != 0)).collect());",
+                id = id
+            )?,
+            "P8" => writeln!(out, "        b.cols[{id}] = Col::U(AV::Num(self.c{id}));", id = id)?,
+            "bool" => {
+                writeln!(out, "        b.cols[{id}] = Col::U(AV::Bool(self.c{id}));", id = id)?
+            }
+            "(P8, P8)" => writeln!(
+                out,
+                "        b.cols[{id}] = Col::U(AV::Ival(self.c{id}.0, self.c{id}.1));",
+                id = id
+            )?,
+            other => bail!("apply: type {}", other),
+        }
+    }
+    writeln!(
+        out,
+        "        for cell in OUT_UBOOL_CELLS {{\n\
+         \x20           b.cols[*cell as usize] = Col::U(AV::UBool);\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         }}\n"
+    )?;
+
     // Pre struct: prefix values the suffix reads (word-boundary search,
     // so v1 does not match inside v17).
     let word_used = |text: &str, name: &str| -> bool {

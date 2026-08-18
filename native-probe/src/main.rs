@@ -16,6 +16,7 @@ mod runtime;
 mod runtime2;
 mod runtime3;
 pub mod kernel;
+mod kernel_gen;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -717,6 +718,7 @@ fn main() {
     let mut abstract_bench: Option<(String, u32)> = None;
     let mut row_census: Option<(String, u32)> = None;
     let mut emit_shape: Option<(String, u32, String)> = None;
+    let mut kernel_bench: Option<(String, u32)> = None;
     let mut reps: u32 = 10;
     let mut census_frames: u32 = 2;
     let mut max_lanes: usize = 256;
@@ -774,6 +776,11 @@ fn main() {
                 let out = args.next().expect("OUT");
                 emit_shape = Some((dir, frame, out));
             }
+            "--kernel-bench" => {
+                let dir = args.next().expect("--kernel-bench needs DIR FRAME");
+                let frame: u32 = args.next().expect("FRAME").parse().unwrap();
+                kernel_bench = Some((dir, frame));
+            }
             "--bench" => {
                 bench_reps = Some(args.next().expect("--bench needs a value").parse().unwrap())
             }
@@ -798,6 +805,10 @@ fn main() {
     }
     if let Some((dir, frame, out)) = emit_shape {
         run_emit_shape(&dir, frame, &out);
+        return;
+    }
+    if let Some((dir, frame)) = kernel_bench {
+        run_kernel_bench(&dir, frame, reps);
         return;
     }
     if let Some((dir, frame)) = abstract_bench {
@@ -1458,6 +1469,191 @@ fn run_emit_shape(dir: &str, frame: u32, out_path: &str) {
         vary.iter().filter(|v| **v).count(),
         blocks.len(),
         out_path
+    );
+}
+
+/// A width-`n` copy of lanes [lo, lo+n) of a block (structure shared by
+/// clone, varying columns sliced) - the canvas kernel outputs land on.
+fn slice_block(b: &runtime2::Rt2, lo: usize, n: usize) -> runtime2::Rt2 {
+    let mut out = runtime2::Rt2::empty(n, b.globals.len(), &[], b.cart.clone(), b.cache.clone());
+    out.strings = b.strings.clone();
+    out.globals = b.globals.clone();
+    out.structure = b.structure.clone();
+    out.cols = b
+        .cols
+        .iter()
+        .map(|c| match c {
+            runtime2::Col::U(_) => c.clone(),
+            runtime2::Col::N(v) => runtime2::Col::N(v[lo..lo + n].to_vec()),
+            runtime2::Col::I(v) => runtime2::Col::I(v[lo..lo + n].to_vec()),
+            runtime2::Col::V(v) => runtime2::Col::V(v[lo..lo + n].to_vec()),
+        })
+        .collect();
+    out.shape_hash = b.shape_hash;
+    out
+}
+
+/// K2 (plans/kernel-plan.md): the standalone kernel microbench.
+/// Gate first - the kernel's boundary row-key SET must equal the
+/// reference engine's on every steady block - then the timing.
+fn run_kernel_bench(dir: &str, frame: u32, reps: u32) {
+    use std::time::Instant;
+    let rt = build_rt();
+    let ids = boundary_ids();
+    install_split_hook();
+    let states = load_states_any(dir, frame);
+    // The kernel's class is (shape, pm1): shape_hash is structural only,
+    // so the pm1 cells are checked on the interpreter side.
+    let is_steady = |st: &celeste_rust::interpreter::state::State| -> bool {
+        use celeste_rust::interpreter::value::{HeapValue, MaybeVector, Value};
+        let names = celeste_rust::interpreter::merge_dump::cell_names(st);
+        names.iter().all(|(cell, name)| {
+            if name != "freeze" && !name.ends_with(".dash_time") {
+                return true;
+            }
+            matches!(
+                st.heap
+                    .get_opt(celeste_rust::interpreter::heap::HeapId::from_raw(*cell)),
+                Some(HeapValue::Value(Value::Number(MaybeVector::Scalar(n))))
+                    if n.whole_part_as_i16() == 0 && n.fraction_part_as_u16() == 0
+            )
+        })
+    };
+    let steady: Vec<runtime2::Rt2> = states
+        .iter()
+        .filter(|st| is_steady(st))
+        .map(|st| import::import_block(st, rt.cart.clone(), rt.cache.clone()))
+        .filter(|b| b.shape_hash == kernel_gen::SHAPE_HASH)
+        .collect();
+    let lanes_in: usize = steady.iter().map(|b| b.width).sum();
+    println!(
+        "[kernel-bench] f{:03}: {} steady blocks, {} lanes (of {} total)",
+        frame,
+        steady.len(),
+        lanes_in,
+        states.iter().map(|s| s.vector_size).sum::<usize>()
+    );
+    let g = kernel_gen::G { cart: &rt.cart, cache: &rt.cache };
+
+    // ---- gate: row-key set equality vs the certified frame pipeline ----
+    let g_freeze = gen::global_id("freeze").expect("no freeze global");
+    let mut census: rustc_hash::FxHashMap<&'static str, (u64, u64, u64)> = Default::default();
+    eprintln!("[gate] running the reference pipeline...");
+    let ref_blocks = frame_step(
+        steady.iter().map(|b| b.clone_block()).collect(),
+        &ids,
+        g_freeze,
+        &mut census,
+    );
+    eprintln!("[gate] reference done; running the kernel...");
+    let mut ref_keys: rustc_hash::FxHashSet<(u64, u64)> = Default::default();
+    for b in &ref_blocks {
+        ref_keys.extend(b.row_keys.iter().copied());
+    }
+    let mut kern_keys: rustc_hash::FxHashSet<(u64, u64)> = Default::default();
+    let (mut deopt_lanes, mut bd_slices) = (0u64, 0u64);
+    for chunk in &steady {
+        let uni = kernel_gen::bind(chunk).expect("bind failed on a steady block");
+        // Input rows any variant deopted on: they take the reference
+        // path afterwards (exactly the integration architecture).
+        let mut deopt_rows: std::collections::BTreeSet<u32> = Default::default();
+        let mut lo = 0usize;
+        while lo < chunk.width {
+            let n = (chunk.width - lo).min(kernel::W);
+            let width_mask: u16 =
+                if n == kernel::W { 0xffff } else { (1u16 << n) - 1 };
+            let rin = kernel_gen::rows(chunk, lo).expect("rows");
+            kernel_gen::frame(&uni, &rin, &g, &mut |_b, kout| {
+                if kout.bd {
+                    bd_slices += 1;
+                    for i in 0..n {
+                        deopt_rows.insert((lo + i) as u32);
+                    }
+                    return;
+                }
+                let dead = kout.deopt & width_mask;
+                deopt_lanes += dead.count_ones() as u64;
+                for i in 0..n {
+                    if dead & (1 << i) != 0 {
+                        deopt_rows.insert((lo + i) as u32);
+                    }
+                }
+                let live = !kout.deopt & width_mask;
+                if live == 0 {
+                    return;
+                }
+                let mut ob = slice_block(chunk, lo, n);
+                kout.apply(&mut ob, n);
+                if dead != 0 {
+                    let keep: Vec<u32> =
+                        (0..n as u32).filter(|i| live & (1 << i) != 0).collect();
+                    ob.retain_lanes(&keep);
+                }
+                ob.boundary(&ids);
+                kern_keys.extend(ob.row_keys.iter().copied());
+            });
+            lo += n;
+        }
+        if !deopt_rows.is_empty() {
+            // Reference re-run of the deopted input rows (all 64 button
+            // variants come from the UBool fan-out; overlap with lanes
+            // the kernel did handle is harmless under set semantics).
+            let keep: Vec<u32> = deopt_rows.iter().copied().collect();
+            let mut sub = chunk.clone_block();
+            sub.retain_lanes(&keep);
+            for b in frame_step(vec![sub], &ids, g_freeze, &mut census) {
+                kern_keys.extend(b.row_keys.iter().copied());
+            }
+        }
+    }
+    let missing: Vec<_> = ref_keys.difference(&kern_keys).collect();
+    let extra: Vec<_> = kern_keys.difference(&ref_keys).collect();
+    println!(
+        "gate: ref {} keys, kernel {} keys, {} missing, {} extra, {} deopt lane-variants, {} bd slices",
+        ref_keys.len(),
+        kern_keys.len(),
+        missing.len(),
+        extra.len(),
+        deopt_lanes,
+        bd_slices
+    );
+    if !missing.is_empty() || !extra.is_empty() {
+        println!("gate: FAILED");
+        std::process::exit(1);
+    }
+    println!("gate: row-key SET EQUAL - kernel + deopt-to-reference EXACT on the steady class");
+
+    // ---- timing: kernel-only (bind + gather + frame), no materialize ----
+    let mut best = f64::INFINITY;
+    for _ in 0..reps {
+        let t0 = Instant::now();
+        let mut sink = 0u64;
+        for chunk in &steady {
+            let uni = kernel_gen::bind(chunk).expect("bind");
+            let mut lo = 0usize;
+            while lo < chunk.width {
+                let rin = kernel_gen::rows(chunk, lo).expect("rows");
+                kernel_gen::frame(&uni, &rin, &g, &mut |b, kout| {
+                    sink = sink
+                        .wrapping_add(kout.deopt as u64)
+                        .wrapping_add(b as u64)
+                        .wrapping_add(kout.c253[0].to_bits() as u64);
+                });
+                lo += kernel::W;
+            }
+        }
+        std::hint::black_box(sink);
+        let dt = t0.elapsed().as_secs_f64();
+        best = best.min(dt);
+    }
+    let row_btns = lanes_in as f64 * 64.0;
+    println!(
+        "kernel: {} lanes x 64 inputs, best of {}: {:.2} ms  ({:.1} ns per row-input-frame, {:.0} ns/input-lane)",
+        lanes_in,
+        reps,
+        best * 1e3,
+        best * 1e9 / row_btns,
+        best * 1e9 / lanes_in as f64
     );
 }
 
