@@ -36,6 +36,13 @@ impl CartData {
         }
     }
 
+    /// The raw 128x64 map grid (row-major), for hot paths that index it
+    /// directly with their own bounds handling (the lane kernel: `mget`
+    /// through the Result machinery was 13.5% of its profile).
+    pub fn map_grid(&self) -> &[u8] {
+        &self.map_data
+    }
+
     pub fn mget(&self, x: Pico8Num, y: Pico8Num) -> Result<u8> {
         let x = Self::as_usize_below(x, "x", 128)?;
         let y = Self::as_usize_below(y, "y", 64)?;

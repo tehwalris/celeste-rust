@@ -1536,8 +1536,12 @@ fn run_kernel_bench(dir: &str, frame: u32, reps: u32) {
     let g = kernel_gen::G { cart: &rt.cart, cache: &rt.cache };
 
     // ---- gate: row-key set equality vs the certified frame pipeline ----
+    // CELESTE_KERNEL_GATE=0 skips it (profiling runs: the perf data
+    // then covers only the timed kernel loop).
+    let run_gate = std::env::var("CELESTE_KERNEL_GATE").map(|v| v != "0").unwrap_or(true);
     let g_freeze = gen::global_id("freeze").expect("no freeze global");
     let mut census: rustc_hash::FxHashMap<&'static str, (u64, u64, u64)> = Default::default();
+    if run_gate {
     eprintln!("[gate] running the reference pipeline...");
     let ref_blocks = frame_step(
         steady.iter().map(|b| b.clone_block()).collect(),
@@ -1622,6 +1626,7 @@ fn run_kernel_bench(dir: &str, frame: u32, reps: u32) {
         std::process::exit(1);
     }
     println!("gate: row-key SET EQUAL - kernel + deopt-to-reference EXACT on the steady class");
+    } // run_gate
 
     // ---- timing: kernel-only (bind + gather + frame), no materialize ----
     let mut best = f64::INFINITY;

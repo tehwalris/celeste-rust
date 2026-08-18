@@ -440,11 +440,21 @@ pub fn zi_split_at(a: ZI, c: P8, deopt: &mut u16) -> (ZI, u16) {
 
 // ---- cart / collision builtins (per-lane; x/y vary, w/h/flag uniform) ----
 
+/// mget, per lane, against the raw grid. Semantics identical to
+/// `CartData::mget(..).expect(..)`: fractional or out-of-range
+/// coordinates panic (the certified trace never produces them).
 #[inline(always)]
 pub fn zn_mget(cart: &CartData, x: ZN, y: ZN) -> ZN {
+    let map = cart.map_grid();
     let mut o = [P8::from_i16(0); W];
     for i in 0..W {
-        o[i] = P8::from_i16(cart.mget(x[i], y[i]).expect("mget failed") as i16);
+        let xi = x[i].as_i16().expect("mget: x is not an integer");
+        let yi = y[i].as_i16().expect("mget: y is not an integer");
+        assert!(
+            (0..128).contains(&xi) && (0..64).contains(&yi),
+            "mget out of range"
+        );
+        o[i] = P8::from_i16(map[xi as usize + yi as usize * 128] as i16);
     }
     o
 }

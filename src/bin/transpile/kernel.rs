@@ -89,7 +89,6 @@ struct Emit {
     dirty: BTreeSet<u32>,
     pre: String,
     suf: String,
-    in_suffix: bool,
     n: usize,
     /// name -> rust type of every generated let (for the Pre struct).
     var_ty: HashMap<String, &'static str>,
@@ -115,11 +114,21 @@ struct Emit {
     fork_depth: usize,
     /// Name of the current per-lane validity mask ("ALL" at depth 0).
     valid_expr: String,
+    /// Button-TAINT tracking (cross-variant sharing): only instructions
+    /// whose value depends on a button land in the x64 suffix; everything
+    /// else is hoisted to the shared per-fork-config prefix, which is
+    /// sound because an untainted op only reads untainted defs (all in
+    /// the prefix) and the emit-time SSA evaluation already captured the
+    /// correct pre/post-store cell values.
+    tainted_vars: BTreeSet<String>,
+    tainted_cells: BTreeSet<u32>,
+    /// Taint of the instruction currently being emitted (routes buffers).
+    cur_tainted: bool,
 }
 
 impl Emit {
     fn buf(&mut self) -> &mut String {
-        if self.in_suffix {
+        if self.cur_tainted {
             &mut self.suf
         } else {
             &mut self.pre
@@ -136,10 +145,24 @@ impl Emit {
         self.n += 1;
         self.line(&format!("let {}: {} = {};", name, ty, expr));
         self.var_ty.insert(name.clone(), ty);
-        if !self.in_suffix {
+        if self.cur_tainted {
+            self.tainted_vars.insert(name.clone());
+        } else {
             self.pre_defs.insert(name.clone());
         }
         name
+    }
+    /// Is this emit-time value button-dependent?
+    fn k_tainted(&self, k: &K) -> bool {
+        match k {
+            K::SN(v) | K::SI(v) | K::SB(v) | K::STri(v) | K::ZN(v) | K::ZI(v) | K::ZB(v) => {
+                self.tainted_vars.contains(v)
+            }
+            K::ZIP { v, pt, .. } => {
+                self.tainted_vars.contains(v) || self.tainted_vars.contains(pt)
+            }
+            _ => false,
+        }
     }
 
     // ---- lifts ----
@@ -308,7 +331,6 @@ pub fn emit_kernel(program: &Program, witness_path: &str, out_path: &str) -> Res
         dirty: BTreeSet::new(),
         pre: String::new(),
         suf: String::new(),
-        in_suffix: false,
         n: 0,
         var_ty: HashMap::new(),
         pre_defs: BTreeSet::new(),
@@ -319,8 +341,14 @@ pub fn emit_kernel(program: &Program, witness_path: &str, out_path: &str) -> Res
         button_cells: HashMap::new(),
         fork_depth: 0,
         valid_expr: "ALL".to_string(),
+        tainted_vars: BTreeSet::new(),
+        tainted_cells: BTreeSet::new(),
+        cur_tainted: false,
     };
     load_witness(witness_path, &mut e)?;
+    for k in 0..6 {
+        e.tainted_vars.insert(format!("kb{}", k));
+    }
 
     let fun = program
         .functions
@@ -363,6 +391,21 @@ pub fn emit_kernel(program: &Program, witness_path: &str, out_path: &str) -> Res
             bail!("control cycle through {:?}", label);
         }
         for (id, instr) in &block.instructions {
+            // Button-taint of this instruction: any tainted operand, a
+            // load through a tainted cell, or the expand itself.
+            let mut t = instr
+                .get_used_locals()
+                .iter()
+                .any(|u| e.env.get(u).map(|k| e.k_tainted(k)).unwrap_or(false));
+            if let Instruction::Load { source } = instr {
+                if let Some(K::Ptr(c)) = e.env.get(source) {
+                    t |= e.tainted_cells.contains(c);
+                }
+            }
+            if matches!(instr, Instruction::Expand { .. }) {
+                t = true;
+            }
+            e.cur_tainted = t;
             let k = eval(&mut e, instr)
                 .with_context(|| format!("{}: %{} = {:?}", label, usize::from(*id), instr))?;
             if let Some(k) = k {
@@ -437,6 +480,11 @@ fn eval(e: &mut Emit, instr: &Instruction) -> Result<Option<K>> {
             let t = e.env.get(target).cloned().ok_or_else(|| anyhow!("store target unset"))?;
             let K::Ptr(c) = t else { bail!("store into {:?}", t) };
             let v = e.env.get(source).cloned().ok_or_else(|| anyhow!("store source unset"))?;
+            if e.cur_tainted || e.k_tainted(&v) {
+                e.tainted_cells.insert(c);
+            } else {
+                e.tainted_cells.remove(&c);
+            }
             e.cells.insert(c, CellT::Val(v));
             e.dirty.insert(c);
             None
@@ -576,12 +624,7 @@ fn eval(e: &mut Emit, instr: &Instruction) -> Result<Option<K>> {
         I::Expand { value } => {
             let v = e.env.get(value).cloned().unwrap();
             match v {
-                K::UBool { btn: Some(k) } => {
-                    if !e.in_suffix {
-                        e.in_suffix = true;
-                    }
-                    Some(K::SB(format!("kb{}", k)))
-                }
+                K::UBool { btn: Some(k) } => Some(K::SB(format!("kb{}", k))),
                 K::UBool { btn: None } => bail!("expand of UBool without button provenance"),
                 K::BoolC(_) | K::SB(_) | K::ZB(_) => Some(v),
                 other => bail!("expand of {:?}", other),
@@ -957,8 +1000,8 @@ fn call_intrinsic(e: &mut Emit, name: &str, args: &[LocalId]) -> Result<K> {
                     // so one configuration's failures do not leak into the
                     // next.
                     let v = v.clone();
-                    if e.in_suffix {
-                        bail!("fork inside the button suffix is not supported (v1)");
+                    if e.cur_tainted {
+                        bail!("fork on a button-dependent value is not supported (v1)");
                     }
                     let d = e.fork_depth;
                     e.line(&format!("for c{} in 0..2usize {{", d));
@@ -1016,7 +1059,10 @@ fn call_intrinsic(e: &mut Emit, name: &str, args: &[LocalId]) -> Result<K> {
                     ));
                     e.var_ty.insert(name.clone(), "ZI");
                     e.var_ty.insert(format!("{}_pt", name), "u16");
-                    if !e.in_suffix {
+                    if e.cur_tainted {
+                        e.tainted_vars.insert(name.clone());
+                        e.tainted_vars.insert(format!("{}_pt", name));
+                    } else {
                         e.pre_defs.insert(name.clone());
                         e.pre_defs.insert(format!("{}_pt", name));
                     }

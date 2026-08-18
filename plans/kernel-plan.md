@@ -206,3 +206,22 @@ NEXT ACTIONS in order:
    if TILE=2 + kernel supersede it. No dead code.
 4. K5 if time: room (2,0) campaign on the new engine.
 Suite + verify gates before any push that touches the main crate.
+
+## K2 hill-climb (2026-08-18 ~03:20)
+
+| step | best of 5 | ns/row-input |
+|---|---|---|
+| forks land (exact, 0 deopt)     | 1347 ms | 183.9 |
+| fast mget (raw grid indexing)   |  898 ms | 122.6 |
+| BUTTON-TAINT HOIST              |  108 ms |  14.8 |
+
+The taint hoist is the Philippe-named lever ("most of the code is
+shared across button inputs - merge across those"): emit-time taint
+analysis routes every instruction by button-dependence; the x64
+suffix shrank 642 -> 166 lines (74% of per-variant work now runs once
+per fork config). Gate stays row-key EXACT with ZERO deopt.
+
+14.8 ns/row-input single-threaded is 3.4x under the ~50ns bar; the
+single-core kernel outruns Rt3 on 30 cores (~2.9x wall, ~85x
+per-core). Remaining: re-profile (prefix likely dominates now),
+then K3 integration.
