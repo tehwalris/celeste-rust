@@ -117,6 +117,13 @@ crates/celeste-kernels   GENERATED per-class lane kernels        deps: core, eng
 native-probe             bench/gate binary for the engine        deps: all
 ```
 
+One frame of the abstract search is `celeste_rust::compiled::FrameEngine`
+`::step` - `(shape, rows) -> [(shape, rows)]`, the generated class kernels
+where they bind and the interpreter where they do not. It lives in
+celeste-rust so both the forward search and the backward sweep can call it;
+`compiled::bridge` is the `State` <-> block translation and is the only
+module that names both.
+
 The generated code is TWO crates because the engine reads
 `celeste_names::FIELD_NAMES` while the generated kernels read
 `celeste_engine::{Rt2, Col, AV}`; in one crate that is a cycle. Name

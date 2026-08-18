@@ -7,6 +7,7 @@ pub mod branch_sites;
 pub mod create_sites;
 pub mod block_flow;
 pub mod builtins;
+pub mod compiled;
 pub mod concrete;
 pub mod frontend;
 pub mod game_runner;

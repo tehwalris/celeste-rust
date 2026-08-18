@@ -14,6 +14,9 @@ edition = "2021"
 
 [dependencies]
 celeste-core = { path = "crates/celeste-core" }
+celeste-engine = { path = "crates/celeste-engine" }
+celeste-kernels = { path = "crates/celeste-kernels" }
+celeste-names = { path = "crates/celeste-names" }
 mimalloc = { version = "0.1", default-features = false }
 anyhow = "1.0.62"
 im = { version = "15.1.0", features = ["serde"] }

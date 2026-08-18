@@ -15,11 +15,11 @@
 
 use std::collections::HashMap;
 
-use celeste_rust::interpreter::heap::HeapId;
-use celeste_rust::interpreter::state::State;
-use celeste_rust::interpreter::value::{HeapValue, MaybeVector, Value};
+use crate::interpreter::heap::HeapId;
+use crate::interpreter::state::State;
+use crate::interpreter::value::{HeapValue, MaybeVector, Value};
 
-use celeste_rust::builtins::BUILTIN_NAMES;
+use crate::builtins::BUILTIN_NAMES;
 use celeste_engine::runtime2::{Cell2, Col, Rt2, AV, NONE};
 use celeste_names as gen;
 
@@ -125,7 +125,7 @@ pub fn export_block(rt2: &Rt2) -> State {
             }
             Cell2::Unk => HeapValue::UnknownTable,
             Cell2::Clo(f, caps) => HeapValue::Closure(
-                celeste_rust::ir::GlobalId::from(gen::FN_NAMES[*f as usize].to_string()),
+                crate::ir::GlobalId::from(gen::FN_NAMES[*f as usize].to_string()),
                 caps.iter().map(|c| export_col(rt2, c, &ids, i)).collect(),
             ),
             Cell2::Bi(b) => HeapValue::BuiltinFun(BUILTIN_NAMES[*b as usize].to_string()),
@@ -164,7 +164,7 @@ fn export_col(rt2: &Rt2, col: &Col, ids: &[HeapId], cell: usize) -> Value {
         }
     };
     use std::sync::Arc;
-    let iv = |l: &crate::runtime2::P8, h: &crate::runtime2::P8| {
+    let iv = |l: &celeste_engine::runtime2::P8, h: &celeste_engine::runtime2::P8| {
         celeste_core::pico8_num::Pico8NumInterval::new(*l, *h)
     };
     match col {

@@ -20,3 +20,11 @@ pub mod kernel;
 pub mod runtime2;
 
 pub use runtime2::{Cell2, Col, Rt2, AV, NONE};
+
+/// The hasher the row machinery keys with, re-exported because it is part
+/// of this crate's ABI rather than an implementation detail: callers that
+/// build the dedup and census maps `runtime2` consumes have to use the
+/// same one, and rustc-hash 1 and 2 hash differently. celeste-rust is on
+/// 1.x for its own maps, so without this the frame interface would quietly
+/// key with the other hasher.
+pub use rustc_hash::FxHashMap;

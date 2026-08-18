@@ -211,12 +211,46 @@ worth 195/248 s of forward and 88/276 s of sweep.
 the same pre-split binary measures 103 ms this afternoon. That is why
 this table is an A/B against a rebuilt baseline and not against the file.)
 
-### Stage 2: the frame interface. NOT STARTED.
+### Stage 2: the frame interface. DONE 2026-08-18.
 
-Still to do: move `frame_step` / `run_chunk_kernel` / the `Fallback` and
-the import-export bridge out of native-probe into celeste-rust behind one
-`(shape, rows) -> [(shape, rows)]` call, then have both the forward loop
-and the sweep's `bwdt.replay` use it.
+`celeste_rust::compiled::FrameEngine` is `(shape, rows) -> [(shape,
+rows)]`, and the campaign can now call it - which is the whole point of
+stage 1. Three modules moved out of native-probe:
+
+- `compiled::mod` - `FrameEngine::{new, initial_blocks, step}`. `step` is
+  the old `frame_step`; `new` takes the caller's `Program` and world
+  instead of loading `rewrites-compile.jsonl` off disk itself, and sets
+  the pm1 process global from that program so the engine cannot be
+  constructed into a state that merges differently from its own reference.
+- `compiled::dispatch` - the class-kernel registry.
+- `compiled::bridge` - the old `import.rs`. It is the one module that
+  names both `State` and `Rt2`, which is exactly why it belongs in
+  celeste-rust and not in celeste-engine.
+
+native-probe went 1,804 -> 986 lines and is now only the harness: run N
+frames and print lane counts, run one frame from a checkpoint and check
+its row-key set against the interpreter, and the kernel-authoring tools.
+
+Gates after the move: suite 539/539, `--abstract 30` still identical to
+the pre-split binary, gate 2 row-key SET EQUAL at f35 with 100% kernel
+coverage.
+
+Timing: 108.2 / 109.3 / 108.6 ms (three runs, 30 reps, min), against
+stage 1's 103.6-108.7 across its own repeats. Inside the spread, and the
+one hypothesis worth testing was tested and refuted - the moved driver
+now builds under celeste-rust's `debug = 1` rather than the probe's
+`debug = false`, but adding celeste-rust to the debug-off overrides
+measures 109.8, i.e. no change. So the interface move itself is free;
+what costs is the ~5% from stage 1's split, already recorded.
+
+### Stage 3: call it from the campaign. NOT STARTED.
+
+The interface exists and is gated, but nothing in the campaign calls it
+yet. Next: have the forward loop and the sweep's `bwdt.replay` go through
+`FrameEngine::step`, with byte-identical checkpoints and an identical
+`g.bin` as the gates. Coverage stays room-shaped - kernels exist for room
+(1,0)'s player classes only, everything else falls back to the
+interpreter, which is the reference, so that is safe and merely slow.
 
 ### Why the split had to happen first
 
