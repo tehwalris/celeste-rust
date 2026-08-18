@@ -80,37 +80,113 @@ Steps:
 
 ## P1 - one engine behind one interface (days, the big one)
 
-"Make the backward pass use the fast forward" is not a small change,
-because of a structural fact: **native-probe depends on celeste-rust,
-not the other way round.** The kernel engine, the (shape, rows) block
-model, import, boundary/dedup/merge and the generated kernels all live
-in the probe. The campaign literally cannot call them.
+"Make the backward pass use the fast forward" is gated on a structural
+fact: **native-probe depends on celeste-rust, not the other way round.**
+The kernel engine, the (shape, rows) block model, import,
+boundary/dedup/merge and the generated kernels all live in the probe.
+The campaign literally cannot call them.
 
-The work, in order:
-1. **Move the engine into the main crate** (or a crate the main crate
-   depends on): runtime2's block model + boundary/dedup/merge, import,
-   kernel.rs, kernel_gen_*. Decide the generated-code story - today
-   `gen.rs` (29k lines) and `kernel_gen_*.rs` are gitignored build
-   artifacts of a manual `transpile` run; the main crate needs either a
-   build.rs or checked-in generated sources. This is the real cost of
-   P1 and it should be scoped before anything else.
-2. **Define the one interface both passes call**: `(shape, rows) ->
-   [(shape, rows)]` for one frame. The forward loop and the sweep's
-   `bwdt.replay` both go through it. Then the kernel benefits BOTH
-   without a second integration - this is the whole point of doing it
-   as one interface rather than "wiring the kernel into the sweep".
-3. **Coverage before speed**: kernels exist for room (1,0)'s player
-   classes only. Spawn shapes and rooms (0,0)/(2,0) fall back to the
-   interpreter, which is fine (the fallback is the reference) but means
-   the win is room-shaped. K5 is the follow-on.
-4. **Gates**: byte-identical checkpoints (task #117's gate), `g.bin`
-   identical (tsweepcheck.sh), row-key set equality per frame, full
-   suite. Nothing here is allowed to change a single row.
+### Topology (Philippe's proposal: a shared crate, generated code apart)
+
+```
+celeste-core      pico8_num, cart_data, collision_cache        deps: -
+celeste-names     GENERATED name tables: STRINGS, GLOBAL_NAMES, deps: -
+                  FIELD_NAMES, FN_NAMES, SITE_INFO, BRANCH_INFO,
+                  global_id/field_id, SLOT_*
+celeste-engine    Rt2 block model, boundary/dedup/merge/retain, deps: core, names
+                  row keys, kernel.rs lane runtime
+celeste-kernels   GENERATED kernel_gen_* + their bind/rows/     deps: core, engine
+                  append glue
+celeste-rust      interpreter, rewrite machinery, transpile,    deps: all
+                  campaign bins, and the import/export BRIDGE
+native-probe      thin bench/gate binary                        deps: all
+```
+
+Two things this gets right, both verified rather than assumed:
+
+- **The engine is interpreter-free.** runtime2, kernel.rs, runtime.rs
+  and all three kernel_gen_* reference ZERO interpreter types - their
+  entire main-crate surface is pico8_num + cart_data + collision_cache,
+  and those three are themselves leaves. `import.rs` is the single
+  module naming State/Value/HeapId, so it is the bridge and it belongs
+  in celeste-rust, above both. celeste-engine can be State-agnostic.
+- **The generated code must be TWO crates, and the graph says so.**
+  Today runtime2 (engine) reads `gen::FIELD_NAMES` (canonical field
+  ordering in boundary) and `gen::BRANCH_INFO`, while the generated
+  kernel_gen_* read `runtime2::{Rt2, Col, AV}`. That is a cycle. Split
+  by direction: name tables BELOW the engine, kernels ABOVE it. This is
+  forced, not aesthetic - and it is an argument for keeping generated
+  code in its own crates rather than folding it into the engine.
+
+### The profile conflict is solved by this shape (VERIFIED)
+
+Task #133 deferred the split on it: a workspace ignores member
+`[profile]` tables, the root wants `debug = 1` (perf line attribution
+for the interpreter), and the probe MUST have `debug = false` because
+rustc's LLVM DWARF variable-DIE pass SIGSEGVs on the fused generated
+functions. `lto`/`codegen-units`/`panic` already agree on both sides;
+`debug` was the only conflict.
+
+A per-package override at the workspace root fixes exactly that, and it
+was listed as untested. Tested 2026-08-18 on a throwaway two-crate
+workspace: with root `debug = 1` and
+
+    [profile.release.package.celeste-generated]
+    debug = false
+
+the generated crate compiles with NO debuginfo flag while the app keeps
+`-C debuginfo=1`. So the generated crates get `debug = false` and
+everything else keeps line tables.
+
+### Sequencing: retire before you move
+
+Do K4 stages 2 and 4 FIRST (interpreter fallback, then delete the Rt2
+ENGINE and gen.rs's program body). Reasons:
+1. `gen.rs` is 29,672 lines of generated program body whose ONLY
+   consumer is native-probe's `gen::call_fn`. Moving it into the shared
+   graph and then deleting it is pure churn.
+2. It shrinks what has to be checked in: the campaign's generated
+   dependency becomes the name tables plus ~4.7k lines of kernels,
+   instead of 34k lines including a program body we are deleting.
+3. runtime2's `BRANCH_INFO`/`SLOT_SHAPE` uses are Engine-execution
+   leftovers and may die with it, leaving only `FIELD_NAMES` - which
+   makes celeste-names smaller still.
+
+### Checked-in vs build.rs
+
+Check the generated sources in, and gate staleness with a test that
+regenerates and compares (the recipe-replay test is the precedent). A
+build.rs would have to run `transpile`, which needs the rewrite
+machinery, in the middle of building a crate the main crate depends on -
+and it would put a ~4 min kernel build in everyone's dev loop. Checked-in
+also means a fresh clone builds. Keep the 29k-line `gen.rs` OUT of this
+by doing the sequencing above; what gets committed is small.
+
+`transpile` itself has no dependency on generated code (it only emits
+text), so there is no bootstrap cycle - it stays in celeste-rust.
+
+### Then the actual point
+
+Define ONE interface, `(shape, rows) -> [(shape, rows)]` for one frame,
+and have both the forward loop and the sweep's `bwdt.replay` call it.
+The kernel then lands in both at once - that is why this is worth doing
+as an interface rather than as "wire the kernel into the sweep".
+
+Coverage stays room-shaped: kernels exist for room (1,0)'s player
+classes only; spawn shapes and rooms (0,0)/(2,0) fall back to the
+interpreter (which is the reference, so that is safe, just not fast).
+
+Gates: byte-identical checkpoints, `g.bin` identical (tsweepcheck.sh),
+row-key set equality per frame, full suite. Nothing here may change a
+row.
+
+Known loose end to keep in view: `BUILTIN_NAMES` order is a
+hand-maintained ABI shared between src/bin/transpile and the engine's
+runtime.rs. The split does not break it but moves the two halves further
+apart - it wants an assert or a generated single source.
 
 Expected value: the forward's `fwd.interpret` 195/248 s and the sweep's
-88/276 s. At the probe's measured 5-20x on covered shapes that is a
-large fraction of level 0 - but note it does NOT touch the sweep's other
-third (P2) or its keys/index (P2b).
+88/276 s. It does NOT touch the sweep's other third (P2).
 
 ## P2 - the sweep's merge third (days)
 
