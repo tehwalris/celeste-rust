@@ -225,3 +225,13 @@ per fork config). Gate stays row-key EXACT with ZERO deopt.
 single-core kernel outruns Rt3 on 30 cores (~2.9x wall, ~85x
 per-core). Remaining: re-profile (prefix likely dominates now),
 then K3 integration.
+
+Measurement honesty note (~03:40): the 108 ms sink read only 2 fields,
+so LLVM DCE'd most output computation - partially fictional. With
+black_box forcing ALL outputs materialized: 221 ms = 30.2 ns/row-input
+(still 1.7x under the bar, single-core). KOut is now split
+KOutShared (per config) / KOut (per variant, tainted cells only), so
+the per-variant copy is minimal. True engine cost lands between 14.8
+and 30.2 depending on K3's output-buffer design - measure there, not
+here. K2 microbench: DONE enough to integrate; further squeezing
+(prefix share, zmm width experiment) is follow-up, not blocker.

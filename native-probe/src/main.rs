@@ -1567,7 +1567,7 @@ fn run_kernel_bench(dir: &str, frame: u32, reps: u32) {
             let width_mask: u16 =
                 if n == kernel::W { 0xffff } else { (1u16 << n) - 1 };
             let rin = kernel_gen::rows(chunk, lo).expect("rows");
-            kernel_gen::frame(&uni, &rin, &g, &mut |_b, kout| {
+            kernel_gen::frame(&uni, &rin, &g, &mut |_b, osh, kout| {
                 if kout.bd {
                     bd_slices += 1;
                     for i in 0..n {
@@ -1587,7 +1587,7 @@ fn run_kernel_bench(dir: &str, frame: u32, reps: u32) {
                     return;
                 }
                 let mut ob = slice_block(chunk, lo, n);
-                kout.apply(&mut ob, n);
+                kernel_gen::apply(osh, kout, &mut ob, n);
                 if dead != 0 {
                     let keep: Vec<u32> =
                         (0..n as u32).filter(|i| live & (1 << i) != 0).collect();
@@ -1638,11 +1638,10 @@ fn run_kernel_bench(dir: &str, frame: u32, reps: u32) {
             let mut lo = 0usize;
             while lo < chunk.width {
                 let rin = kernel_gen::rows(chunk, lo).expect("rows");
-                kernel_gen::frame(&uni, &rin, &g, &mut |b, kout| {
-                    sink = sink
-                        .wrapping_add(kout.deopt as u64)
-                        .wrapping_add(b as u64)
-                        .wrapping_add(kout.c253[0].to_bits() as u64);
+                kernel_gen::frame(&uni, &rin, &g, &mut |b, osh, kout| {
+                    sink = sink.wrapping_add(kout.deopt as u64).wrapping_add(b as u64);
+                    std::hint::black_box(osh);
+                    std::hint::black_box(kout);
                 });
                 lo += kernel::W;
             }

@@ -1257,7 +1257,10 @@ fn render(e: &Emit, out_path: &str) -> Result<()> {
     writeln!(out, "];\n")?;
 
     // Output struct: dirty original cells (scratch cells never escape).
-    let mut out_fields: Vec<(u32, &'static str, String)> = Vec::new(); // (cell, rust ty, expr)
+    // (cell, rust ty, expr, tainted): tainted outputs differ per button
+    // variant; untainted ones are identical across all 64 and are
+    // reported once per fork config in KOutShared.
+    let mut out_fields: Vec<(u32, &'static str, String, bool)> = Vec::new();
     let mut out_ubool: Vec<u32> = Vec::new();
     for id in &e.dirty {
         // Scratch cells (allocated during the frame) are region-private.
@@ -1284,20 +1287,35 @@ fn render(e: &Emit, out_path: &str) -> Result<()> {
             K::Nil => continue, // a cell reset to nil is dropped from rows
             other => bail!("output cell {} holds {:?}", id, other),
         };
-        out_fields.push((*id, ty, expr));
+        let tainted = e
+            .cells
+            .get(id)
+            .map(|c| matches!(c, CellT::Val(k) if e.k_tainted(k)))
+            .unwrap_or(false);
+        out_fields.push((*id, ty, expr, tainted));
     }
-    writeln!(out, "/// Cells the frame writes, per variant. Everything else is identity.")?;
+    writeln!(out, "/// Button-independent outputs: one per fork config.")?;
+    writeln!(out, "pub struct KOutShared {{")?;
+    for (id, ty, _, tainted) in &out_fields {
+        if !*tainted {
+            writeln!(out, "    pub c{}: {},", id, ty)?;
+        }
+    }
+    writeln!(out, "}}\n")?;
+    writeln!(out, "/// Button-dependent outputs: one per (config, variant).")?;
     writeln!(out, "pub struct KOut {{")?;
     writeln!(out, "    /// Lanes that EXIST in this fork configuration.")?;
     writeln!(out, "    pub valid: u16,")?;
     writeln!(out, "    pub deopt: u16,")?;
     writeln!(out, "    pub bd: bool,")?;
-    for (id, ty, _) in &out_fields {
-        writeln!(out, "    pub c{}: {},", id, ty)?;
+    for (id, ty, _, tainted) in &out_fields {
+        if *tainted {
+            writeln!(out, "    pub c{}: {},", id, ty)?;
+        }
     }
     writeln!(out, "}}\n")?;
     writeln!(out, "pub const OUT_CELLS: &[u32] = &[")?;
-    for (id, _, _) in &out_fields {
+    for (id, _, _, _) in &out_fields {
         writeln!(out, "    {},", id)?;
     }
     writeln!(out, "];\n")?;
@@ -1391,45 +1409,44 @@ fn render(e: &Emit, out_path: &str) -> Result<()> {
 
     writeln!(
         out,
-        "impl KOut {{\n\
-         \x20   /// Write this variant's outputs onto a width-`n` sliced block\n\
-         \x20   /// (the block already carries the input row values).\n\
-         \x20   pub fn apply(&self, b: &mut Rt2, n: usize) {{"
+        "/// Write one (config, variant) result onto a width-`n` sliced block\n\
+         /// (the block already carries the input row values).\n\
+         pub fn apply(sh: &KOutShared, kv: &KOut, b: &mut Rt2, n: usize) {{"
     )?;
-    for (id, ty, _) in &out_fields {
+    for (id, ty, _, tainted) in &out_fields {
+        let src = if *tainted { "kv" } else { "sh" };
         match *ty {
             "ZN" => writeln!(
                 out,
-                "        b.cols[{id}] = Col::N(self.c{id}[..n].to_vec());",
-                id = id
+                "    b.cols[{id}] = Col::N({src}.c{id}[..n].to_vec());",
+                id = id, src = src
             )?,
             "ZI" => writeln!(
                 out,
-                "        b.cols[{id}] = Col::I((0..n).map(|i| (self.c{id}.lo[i], self.c{id}.hi[i])).collect());",
-                id = id
+                "    b.cols[{id}] = Col::I((0..n).map(|i| ({src}.c{id}.lo[i], {src}.c{id}.hi[i])).collect());",
+                id = id, src = src
             )?,
             "ZB" => writeln!(
                 out,
-                "        b.cols[{id}] = Col::V((0..n).map(|i| AV::Bool(self.c{id}.val & (1 << i) != 0)).collect());",
-                id = id
+                "    b.cols[{id}] = Col::V((0..n).map(|i| AV::Bool({src}.c{id}.val & (1 << i) != 0)).collect());",
+                id = id, src = src
             )?,
-            "P8" => writeln!(out, "        b.cols[{id}] = Col::U(AV::Num(self.c{id}));", id = id)?,
+            "P8" => writeln!(out, "    b.cols[{id}] = Col::U(AV::Num({src}.c{id}));", id = id, src = src)?,
             "bool" => {
-                writeln!(out, "        b.cols[{id}] = Col::U(AV::Bool(self.c{id}));", id = id)?
+                writeln!(out, "    b.cols[{id}] = Col::U(AV::Bool({src}.c{id}));", id = id, src = src)?
             }
             "(P8, P8)" => writeln!(
                 out,
-                "        b.cols[{id}] = Col::U(AV::Ival(self.c{id}.0, self.c{id}.1));",
-                id = id
+                "    b.cols[{id}] = Col::U(AV::Ival({src}.c{id}.0, {src}.c{id}.1));",
+                id = id, src = src
             )?,
             other => bail!("apply: type {}", other),
         }
     }
     writeln!(
         out,
-        "        for cell in OUT_UBOOL_CELLS {{\n\
-         \x20           b.cols[*cell as usize] = Col::U(AV::UBool);\n\
-         \x20       }}\n\
+        "    for cell in OUT_UBOOL_CELLS {{\n\
+         \x20       b.cols[*cell as usize] = Col::U(AV::UBool);\n\
          \x20   }}\n\
          }}\n"
     )?;
@@ -1460,7 +1477,7 @@ fn render(e: &Emit, out_path: &str) -> Result<()> {
         }
     }
     // The out_fields' exprs referenced from the suffix epilogue also cross.
-    for (_, _, expr) in &out_fields {
+    for (_, _, expr, _) in &out_fields {
         if e.pre_defs.contains(expr) {
             crossing.insert(expr.clone());
         }
@@ -1482,7 +1499,7 @@ fn render(e: &Emit, out_path: &str) -> Result<()> {
     writeln!(
         out,
         "#[inline(never)]\n\
-         pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOut)) {{\n\
+         pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared, &KOut)) {{\n\
          \x20   let mut dp: u16 = 0;\n\
          \x20   let mut bd_flag: bool = false;\n\
          \x20   let bd: &mut bool = &mut bd_flag;"
@@ -1496,8 +1513,15 @@ fn render(e: &Emit, out_path: &str) -> Result<()> {
     writeln!(out, "        dp,")?;
     writeln!(out, "        bd: *bd,")?;
     writeln!(out, "    }};")?;
+    writeln!(out, "    let osh = KOutShared {{")?;
+    for (id, _, expr, tainted) in &out_fields {
+        if !*tainted {
+            writeln!(out, "        c{}: {},", id, expr)?;
+        }
+    }
+    writeln!(out, "    }};")?;
     for b in 0..64 {
-        writeln!(out, "    suffix::<{}>(u, g, &p, out);", b)?;
+        writeln!(out, "    suffix::<{}>(u, g, &p, &osh, out);", b)?;
     }
     for _ in 0..e.fork_depth {
         writeln!(out, "    }}")?;
@@ -1508,7 +1532,7 @@ fn render(e: &Emit, out_path: &str) -> Result<()> {
     writeln!(
         out,
         "#[inline(never)]\n\
-         fn suffix<const B: u8>(u: &Uni, g: &G, p: &Pre, out: &mut impl FnMut(u8, &KOut)) {{"
+         fn suffix<const B: u8>(u: &Uni, g: &G, p: &Pre, osh: &KOutShared, out: &mut impl FnMut(u8, &KOutShared, &KOut)) {{"
     )?;
     for name in &crossing {
         writeln!(out, "    let {} = p.{};", name, name)?;
@@ -1520,12 +1544,14 @@ fn render(e: &Emit, out_path: &str) -> Result<()> {
         writeln!(out, "    let kb{}: bool = (B >> {}) & 1 != 0;", k, k)?;
     }
     out.push_str(&e.suf);
-    writeln!(out, "    out(B, &KOut {{")?;
+    writeln!(out, "    out(B, osh, &KOut {{")?;
     writeln!(out, "        valid: p.valid,")?;
     writeln!(out, "        deopt: dp,")?;
     writeln!(out, "        bd: *bd,")?;
-    for (id, _, expr) in &out_fields {
-        writeln!(out, "        c{}: {},", id, expr)?;
+    for (id, _, expr, tainted) in &out_fields {
+        if *tainted {
+            writeln!(out, "        c{}: {},", id, expr)?;
+        }
     }
     writeln!(out, "    }});")?;
     writeln!(out, "}}")?;
