@@ -238,6 +238,15 @@ SET EQUAL) at f20/f25/f30/f35.
 | + pre-dedup from kernel registers | 134 ms | 14.9x |
 | + chunk 64 -> 256 (the trade-off inverted) | **89 ms** | **22.5x** |
 
+CAUTION on that 89 ms: it does not reproduce. Re-measuring the SAME
+binary (6ea6937) on 2026-08-18 afternoon gives 103.0 ms min / 110.5 mean
+over 30 reps. Machine state, not a code change - but it means the 89 is a
+best-case number and any comparison against it has to rebuild the
+baseline rather than read this row. The P1 crate split was A/B'd that way
+(plans/campaign-cost-plan.md): post-split is 106.8 ms min against a
+rebuilt 103.0 ms baseline, +3.7%, plus a separate +6% if the compiled
+path is built with debuginfo (which is why it is not).
+
 100% of player lanes at f35 run compiled kernel code (steady 114,458 +
 dash 43,824 + frozen 29,577, missed 0). The dash and frozen classes
 ignore the buttons almost entirely - the emitter's taint analysis found

@@ -10,10 +10,16 @@
 //! What is left is an ABI. `BUILTIN_NAMES` is index-to-name, and the index
 //! is what `Cell2::Bi` stores, what the transpiler emits, and what
 //! `import`/`export` translate through in both directions - so the ORDER is
-//! load-bearing in exactly the way `FIELD_NAMES`' order is. It is shared
-//! with `src/bin/transpile/main.rs`'s own BUILTIN_NAMES; the names and
+//! load-bearing in exactly the way `FIELD_NAMES`' order is. The names and
 //! their semantics come from `game_runner.rs`
 //! `create_fixed_env_with_(game_)builtins`.
+//!
+//! It used to be TWO tables that had to be kept in agreement by hand - one
+//! here (then in the probe), one in `src/bin/transpile/main.rs` - which the
+//! P1 plan flagged as a loose end. Both consumers turned out to live in
+//! this crate (the transpiler emits the ids, `compiled::bridge` translates
+//! them), so the fix was to keep one table and delete the other rather than
+//! to assert the two agree.
 
 pub const BUILTIN_NAMES: [&str; 18] = [
     "__print",

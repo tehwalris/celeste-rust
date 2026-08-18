@@ -101,6 +101,54 @@ boundary's memory bound, and chunking without threads is a ~23% loss. See
 `plans/roofline-plan.md` before changing either, and `./parcheck.sh` to
 re-check that the parallel path stays byte-identical to the serial one.
 
+## Crate layout
+
+A cargo workspace since 2026-08-18 (task #150). The dependency order is
+load-bearing, not cosmetic:
+
+```
+crates/celeste-core      pico8_num, cart_data, collision_cache   deps: -
+crates/celeste-names     GENERATED name tables                   deps: -
+crates/celeste-engine    Rt2 block model, boundary/dedup/merge,  deps: core, names
+                         row keys, kernel.rs lane primitives
+crates/celeste-kernels   GENERATED per-class lane kernels        deps: core, engine
+.  (celeste-rust)        interpreter, rewrite machinery,         deps: core (+ the
+                         transpile emitters, campaign bins       rest, as P1 lands)
+native-probe             bench/gate binary for the engine        deps: all
+```
+
+The generated code is TWO crates because the engine reads
+`celeste_names::FIELD_NAMES` while the generated kernels read
+`celeste_engine::{Rt2, Col, AV}`; in one crate that is a cycle. Name
+tables below the engine, kernels above it.
+
+`celeste-rust` re-exports `pico8_num` / `cart_data` / `collision_cache` at
+its own root, so `celeste_rust::pico8_num::...` still resolves everywhere.
+
+### The generated files are CHECKED IN
+
+`crates/celeste-names/src/gen.rs` and
+`crates/celeste-kernels/src/kernel_gen_*.rs`, plus the three shape
+witnesses under `crates/celeste-kernels/witness/` that generation reads.
+Regenerate with:
+
+```bash
+./regen-generated.sh     # then READ THE DIFF, then commit
+```
+
+`transpile::names::tests::generated_is_current` fails until you do.
+Byte-for-byte, on purpose: `FIELD_NAMES`' ORDER is the canonical field
+ordering the boundary hashes, so it feeds the shape hash, the row key, and
+what the search dedups on. A reordering is a different search.
+
+There is a bootstrap to know about: the emitters live in `celeste-rust`,
+which depends on `celeste-kernels`, whose contents they produce. Change
+what the kernel emitter emits and the committed kernels stop compiling,
+which stops `cargo build --bin transpile` from building the tool that
+would fix them. `regen-generated.sh` avoids it by generating into a
+scratch dir and only installing what builds; if you get stuck anyway,
+`git checkout crates/celeste-kernels/src`, build, regenerate.
+
 ## Useful entry points
 
 ```bash

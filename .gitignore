@@ -7,8 +7,21 @@ checkpoints/
 server/
 serve/
 
-# native-compile probe (task #124): generated code + build dir
-native-probe/src/gen.rs
+# Native-compile probe (task #124). The generated code is CHECKED IN now
+# (task #150): `crates/celeste-names/src/gen.rs` and
+# `crates/celeste-kernels/src/kernel_gen_*.rs` are committed and gated by
+# `tests/generated_is_current.rs`, which regenerates them and compares. A
+# build.rs cannot do that job - generating them needs the rewrite machinery
+# from a crate that sits above them - and checking them in is also what
+# makes a fresh clone build.
+#
+# Stale: the probe is a workspace member now, so it builds into /target.
+# Kept so an old checkout's build dir cannot be committed by accident.
 native-probe/target/
+
+# The shape witnesses that generation reads are INPUTS, and they are
+# committed too (crates/celeste-kernels/witness/) - they are dumps of a
+# checkpoint frame, and checkpoints are not in git, so without them the
+# kernels would have no reproducible provenance. ~95 KB, frozen.
+# Scratch dumps written next to the probe are not.
 /native-probe/*-shape.json
-/native-probe/src/kernel_gen*.rs

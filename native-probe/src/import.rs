@@ -19,15 +19,15 @@ use celeste_rust::interpreter::heap::HeapId;
 use celeste_rust::interpreter::state::State;
 use celeste_rust::interpreter::value::{HeapValue, MaybeVector, Value};
 
-use crate::builtins::BUILTIN_NAMES;
-use crate::gen;
-use crate::runtime2::{Cell2, Col, Rt2, AV, NONE};
+use celeste_rust::builtins::BUILTIN_NAMES;
+use celeste_engine::runtime2::{Cell2, Col, Rt2, AV, NONE};
+use celeste_names as gen;
 
 /// Import a whole interpreter boundary `State` as one columnar block.
 pub fn import_block(
     state: &State,
-    cart: std::sync::Arc<celeste_rust::cart_data::CartData>,
-    cache: std::sync::Arc<celeste_rust::collision_cache::CollisionCache>,
+    cart: std::sync::Arc<celeste_core::cart_data::CartData>,
+    cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
 ) -> Rt2 {
     import_block_mapped(state, cart, cache).0
 }
@@ -37,8 +37,8 @@ pub fn import_block(
 /// (the kernel row census). Execution paths use `import_block`.
 pub fn import_block_mapped(
     state: &State,
-    cart: std::sync::Arc<celeste_rust::cart_data::CartData>,
-    cache: std::sync::Arc<celeste_rust::collision_cache::CollisionCache>,
+    cart: std::sync::Arc<celeste_core::cart_data::CartData>,
+    cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
 ) -> (Rt2, Vec<Option<HeapId>>) {
     assert!(
         state.local_env.iter().count() == 0 && state.outer_local_envs.is_empty(),
@@ -150,7 +150,7 @@ fn export_col(rt2: &Rt2, col: &Col, ids: &[HeapId], cell: usize) -> Value {
         match a {
             AV::Num(n) => Value::Number(MaybeVector::Scalar(*n)),
             AV::Ival(l, h) => Value::NumberInterval(MaybeVector::Scalar(
-                celeste_rust::pico8_num::Pico8NumInterval::new(*l, *h),
+                celeste_core::pico8_num::Pico8NumInterval::new(*l, *h),
             )),
             AV::Bool(b) => Value::Bool(MaybeVector::Scalar(*b)),
             AV::UBool => Value::UnknownBool,
@@ -165,7 +165,7 @@ fn export_col(rt2: &Rt2, col: &Col, ids: &[HeapId], cell: usize) -> Value {
     };
     use std::sync::Arc;
     let iv = |l: &crate::runtime2::P8, h: &crate::runtime2::P8| {
-        celeste_rust::pico8_num::Pico8NumInterval::new(*l, *h)
+        celeste_core::pico8_num::Pico8NumInterval::new(*l, *h)
     };
     match col {
         Col::U(a) => scalar(a),

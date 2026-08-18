@@ -1,6 +1,6 @@
 //! The KERNEL EMITTER (plans/kernel-plan.md K1).
 //!
-//! Emits `native-probe/src/kernel_gen.rs`: a fully-typed, straight-line,
+//! Emits `crates/celeste-kernels/src/kernel_gen_CLASS.rs`: fully-typed, straight-line,
 //! branch-free lane program for the STEADY class (player, freeze=0,
 //! dash_time=0), compiled from the certified steady overlay
 //! (`rewrites-trace10-steady.jsonl`) against a SHAPE WITNESS
@@ -28,10 +28,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 
 use anyhow::{anyhow, bail, Context, Result};
-use celeste_rust::ir::{BinaryOp, Instruction, LocalId, Terminator, UnaryOp};
-use celeste_rust::pico8_num::Pico8Num as P8;
-use celeste_rust::rewrite::print::blocks_in_order;
-use celeste_rust::rewrite::program::Program;
+use crate::ir::{BinaryOp, Instruction, LocalId, Terminator, UnaryOp};
+use crate::pico8_num::Pico8Num as P8;
+use crate::rewrite::print::blocks_in_order;
+use crate::rewrite::program::Program;
 
 /// Emit-time value. `S*` strings are generated VARIABLE NAMES (each IR
 /// instruction result is let-bound), never raw expressions.
@@ -341,7 +341,20 @@ fn load_witness(path: &str, e: &mut Emit) -> Result<()> {
     Ok(())
 }
 
+/// Emit one class kernel and write it to `out_path`.
 pub fn emit_kernel(program: &Program, witness_path: &str, out_path: &str) -> Result<()> {
+    let text = emit_kernel_text(program, witness_path)?;
+    std::fs::write(out_path, &text).with_context(|| format!("write {}", out_path))?;
+    eprintln!("wrote {} ({} bytes)", out_path, text.len());
+    Ok(())
+}
+
+/// The same emission, returning the TEXT. This is what the staleness gate
+/// (`transpile::names`'s `generated_is_current`) calls: it regenerates every
+/// checked-in kernel in-process and compares, so a change to the emitter
+/// that nobody re-ran fails a test instead of silently leaving the
+/// committed kernels describing an older frame.
+pub fn emit_kernel_text(program: &Program, witness_path: &str) -> Result<String> {
     let mut e = Emit {
         witness_len: 0,
         cells: HashMap::new(),
@@ -441,7 +454,7 @@ pub fn emit_kernel(program: &Program, witness_path: &str, out_path: &str) -> Res
         }
     }
 
-    render(&e, out_path)
+    render(&e)
 }
 
 /// One instruction of the straight line, evaluated at emit time.
@@ -1214,7 +1227,7 @@ fn call_pure(e: &mut Emit, name: &str, args: &[LocalId]) -> Result<K> {
 }
 
 /// Assemble kernel_gen.rs.
-fn render(e: &Emit, out_path: &str) -> Result<()> {
+fn render(e: &Emit) -> Result<String> {
     let mut out = String::new();
     writeln!(
         out,
@@ -1223,10 +1236,10 @@ fn render(e: &Emit, out_path: &str) -> Result<()> {
          // The STEADY-CLASS lane kernel: shape (player), pm1 freeze=0 dash_time=0.\n\
          // Shared prefix per 16-row slice, 64 monomorphized button suffixes.\n\
          #![allow(unused_variables, unused_mut, unused_imports, clippy::all)]\n\
-         use crate::kernel::*;\n\
-         use celeste_rust::pico8_num::{{Pico8Num as P8, Pico8NumInterval as IV}};\n\
-         use celeste_rust::cart_data::CartData;\n\
-         use celeste_rust::collision_cache::CollisionCache;\n"
+         use celeste_engine::kernel::*;\n\
+         use celeste_core::pico8_num::{{Pico8Num as P8, Pico8NumInterval as IV}};\n\
+         use celeste_core::cart_data::CartData;\n\
+         use celeste_core::collision_cache::CollisionCache;\n"
     )?;
     writeln!(out, "pub const SHAPE_HASH: u64 = 0x{};", e.shape_hash)?;
     writeln!(
@@ -1356,7 +1369,7 @@ fn render(e: &Emit, out_path: &str) -> Result<()> {
     // gather a 16-row slice, and apply an output back onto a sliced block.
     writeln!(
         out,
-        "use crate::runtime2::{{Rt2, Col, AV}};\n\n\
+        "use celeste_engine::runtime2::{{Rt2, Col, AV}};\n\n\
          /// Bind the block-uniform inputs. None = off-shape / off-kind /\n\
          /// pin mismatch: the block takes the reference path.\n\
          pub fn bind(b: &Rt2) -> Option<Uni> {{\n\
@@ -1878,17 +1891,16 @@ fn render(e: &Emit, out_path: &str) -> Result<()> {
     writeln!(out, "    }});")?;
     writeln!(out, "}}")?;
 
-    std::fs::write(out_path, out)?;
     eprintln!(
-        "kernel: {} uniform cells, {} row cells, {} out cells, {} crossing values, prefix {} lines, suffix {} lines -> {}",
+        "kernel: {} uniform cells, {} row cells, {} out cells, {} crossing values, prefix {} lines, suffix {} lines, witness {} facts",
         e.uni.len(),
         e.vary_in.len(),
         out_fields.len(),
         crossing.len(),
         e.pre.lines().count(),
         e.suf.lines().count(),
-        out_path
+        e.witness_len,
     );
-    Ok(())
+    Ok(out)
 }
 

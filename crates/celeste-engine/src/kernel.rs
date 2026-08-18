@@ -14,9 +14,9 @@
 //! limits - a limit is a deopt, not an error; panics are reserved for
 //! contract violations (emitter bugs).
 
-use celeste_rust::cart_data::CartData;
-use celeste_rust::collision_cache::CollisionCache;
-use celeste_rust::pico8_num::{Pico8Num as P8, Pico8NumInterval as IV};
+use celeste_core::cart_data::CartData;
+use celeste_core::collision_cache::CollisionCache;
+use celeste_core::pico8_num::{Pico8Num as P8, Pico8NumInterval as IV};
 
 pub const W: usize = 16;
 

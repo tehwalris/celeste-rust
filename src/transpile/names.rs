@@ -1,6 +1,6 @@
-//! The name-table generator, and the kernel emitter.
+//! The name-table generator.
 //!
-//! Writes `native-probe/src/gen.rs`, which is now ~230 lines of TABLES:
+//! Writes `crates/celeste-names/src/gen.rs`, which is now ~230 lines of TABLES:
 //! `STRINGS`, `GLOBAL_NAMES`, `FIELD_NAMES`, `FN_NAMES` and the two
 //! lookups over them. Their numbering is the side effect of a walk over
 //! every function's blocks in emission order (see `walk_instruction`) -
@@ -18,36 +18,15 @@
 //! `kernel` module - the actual emitters for the class kernels - are what
 //! survived the deletion, along with this walk.
 
-mod kernel;
-
 use std::collections::HashMap;
 
 use anyhow::{anyhow, bail, Context, Result};
-use celeste_rust::ir::{FunDef, Instruction, Terminator};
-use celeste_rust::rewrite::print::blocks_in_order;
-use celeste_rust::rewrite::program::Program;
 
-/// Builtin id ABI. MUST match `native-probe/src/runtime.rs BUILTIN_NAMES`.
-const BUILTIN_NAMES: [&str; 18] = [
-    "__print",
-    "__new_unknown_boolean",
-    "__widen_rem",
-    "__new_vector",
-    "__array_table_drop_last",
-    "error",
-    "min",
-    "max",
-    "abs",
-    "flr",
-    "__split_by_flr",
-    "__split_at",
-    "add",
-    "print",
-    "sin",
-    "mget",
-    "fget",
-    "tile_flag_at",
-];
+use crate::builtins::BUILTIN_NAMES;
+use crate::ir::{FunDef, Instruction, Terminator};
+use crate::rewrite::print::blocks_in_order;
+use crate::rewrite::program::Program;
+
 
 #[derive(Default)]
 struct Interner {
@@ -195,7 +174,7 @@ fn str_array(name: &str, items: &[String]) -> String {
 /// - control flow: is every reachable CFG a DAG (if-convertible)?
 /// - size: multiplicity-weighted instruction/branch counts after full
 ///   inlining - the straight-line kernel's length.
-fn kernel_recon(program: &celeste_rust::rewrite::program::Program) {
+pub fn kernel_recon(program: &crate::rewrite::program::Program) {
     use std::collections::VecDeque;
     struct Info {
         calls: Vec<String>,
@@ -317,59 +296,16 @@ fn kernel_recon(program: &celeste_rust::rewrite::program::Program) {
     );
 }
 
-fn main() -> Result<()> {
-    let mut rewritten = false;
-    let mut recipe_path = "rewrites.jsonl".to_string();
-    let mut out_path = "native-probe/src/gen.rs".to_string();
-    let mut kernel_recon_flag = false;
-    let mut kernel_out: Option<(String, String)> = None;
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--kernel-recon" => kernel_recon_flag = true,
-            "--kernel" => {
-                let witness = args.next().ok_or_else(|| anyhow!("--kernel WITNESS OUT"))?;
-                let out = args.next().ok_or_else(|| anyhow!("--kernel WITNESS OUT"))?;
-                kernel_out = Some((witness, out));
-            }
-            "--rewritten" => rewritten = true,
-            "--recipe" => {
-                recipe_path = args
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("--recipe needs a path"))?;
-                rewritten = true;
-            }
-            other => out_path = other.to_string(),
-        }
-    }
-
-    let program = if rewritten {
-        // The program the abstract search actually executes: plain compile +
-        // the full recipe. Its concrete semantics must equal the plain
-        // program's (each entry is differentially verified), so the same
-        // concrete_run oracle applies - transpiling it exercises the
-        // recipe-planted instructions (Select/Expand/Kill/guards) natively.
-        // `--recipe` selects a different recipe file - the compile-only
-        // overlay recipes (rewrites-compile.jsonl) live here, never in the
-        // runner.
-        let recipe = celeste_rust::rewrite::recipe::Recipe::load(&recipe_path)?;
-        let (program, _) = celeste_rust::rewrite::recipe::build(&recipe)
-            .with_context(|| format!("apply {} (run from the repo root)", recipe_path))?;
-        program
-    } else {
-        Program::compile_executable_from_disk()
-            .context("compile the plain executable program (run from the repo root)")?
-    };
-
-    if kernel_recon_flag {
-        kernel_recon(&program);
-        return Ok(());
-    }
-    if let Some((witness, out)) = kernel_out {
-        return kernel::emit_kernel(&program, &witness, &out);
-    }
-
-
+/// Walk the program and render the name tables as the text of
+/// `crates/celeste-names/src/gen.rs`.
+///
+/// Returns the TEXT rather than writing it, so the staleness gate
+/// (`tests` below) can regenerate and compare in-process instead of
+/// shelling out to the binary. `recipe_path` is `Some` when `program`
+/// came from a recipe - it only names the source in the header, but it
+/// names it CORRECTLY, which cost an afternoon once (see below).
+pub fn emit_names(program: &Program, recipe_path: Option<&str>) -> Result<String> {
+    let rewritten = recipe_path.is_some();
     let mut gen = Gen {
         current_fn: String::new(),
         strings: Interner::default(),
@@ -420,7 +356,7 @@ fn main() -> Result<()> {
         out.push_str(&format!(
             "// Source program: recipe::build(Recipe::load({:?})) - the REWRITTEN\n\
              // program, not the plain one. Do not edit.\n\n",
-            recipe_path
+            recipe_path.unwrap()
         ));
     } else {
         out.push_str("// Source program: Program::compile_executable_from_disk() (the exact\n");
@@ -436,14 +372,70 @@ fn main() -> Result<()> {
          pub fn field_id(name: &str) -> Option<u32> {\n    \
          FIELD_NAMES.iter().position(|n| *n == name).map(|i| i as u32)\n}\n\n",
     );
-    std::fs::write(&out_path, out).with_context(|| format!("write {}", out_path))?;
-    eprintln!(
-        "wrote {} ({} functions walked, {} globals, {} fields, {} strings)",
-        out_path,
-        gen.fn_names.len(),
-        gen.globals.names.len(),
-        gen.fields.names.len(),
-        gen.strings.names.len()
-    );
-    Ok(())
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    /// The gate that makes "checked in" safe.
+    ///
+    /// `crates/celeste-names/src/gen.rs` and
+    /// `crates/celeste-kernels/src/kernel_gen_*.rs` are committed, so
+    /// nothing in the build forces them to match the emitter that claims to
+    /// produce them. This regenerates all four from the same inputs the
+    /// canonical regen uses - the recipes and the frozen shape witnesses,
+    /// both in git - and compares byte for byte.
+    ///
+    /// Byte-for-byte and not "semantically equivalent" on purpose.
+    /// `FIELD_NAMES`' ORDER is the canonical field ordering `Cell2::Obj`
+    /// interns against, so it feeds the shape hash, which feeds the row key,
+    /// which is what the search dedups on. A reordering that a looser
+    /// comparison would pass is a different search.
+    ///
+    /// If this fails, run `./regen-generated.sh` and commit the result -
+    /// after checking the diff is what you meant, because a diff here moves
+    /// the row keys.
+    #[test]
+    fn generated_is_current() {
+        let regen = |recipe: &str| {
+            let r = crate::rewrite::recipe::Recipe::load(recipe)
+                .unwrap_or_else(|e| panic!("load {} (run from the repo root): {}", recipe, e));
+            crate::rewrite::recipe::build(&r)
+                .unwrap_or_else(|e| panic!("apply {}: {}", recipe, e))
+                .0
+        };
+        let check = |path: &str, fresh: String| {
+            let on_disk = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("read {}: {}", path, e));
+            if on_disk != fresh {
+                let (a, b) = (on_disk.lines().count(), fresh.lines().count());
+                let first = on_disk
+                    .lines()
+                    .zip(fresh.lines())
+                    .position(|(x, y)| x != y)
+                    .map(|i| i + 1);
+                panic!(
+                    "{} is STALE: on disk {} lines, emitter says {} lines, \
+                     first differing line {:?}. Run ./regen-generated.sh. \
+                     A diff here moves the row keys - read it before committing.",
+                    path, a, b, first
+                );
+            }
+        };
+
+        let names_program = regen("rewrites-compile.jsonl");
+        check(
+            "crates/celeste-names/src/gen.rs",
+            super::emit_names(&names_program, Some("rewrites-compile.jsonl")).unwrap(),
+        );
+
+        for class in ["steady", "dash", "frozen"] {
+            let recipe = format!("rewrites-trace10-{}.jsonl", class);
+            let program = regen(&recipe);
+            let witness = format!("crates/celeste-kernels/witness/{}-shape.json", class);
+            let fresh = crate::transpile::kernel::emit_kernel_text(&program, &witness)
+                .unwrap_or_else(|e| panic!("emit {} kernel: {:?}", class, e));
+            check(&format!("crates/celeste-kernels/src/kernel_gen_{}.rs", class), fresh);
+        }
+    }
 }

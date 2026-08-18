@@ -1,0 +1,8 @@
+[package]
+name = "celeste-names"
+version = "0.1.0"
+edition = "2021"
+
+# No dependencies, and it should stay that way: this is the bottom of the
+# generated-code half of the workspace.
+[dependencies]

@@ -1,9 +1,19 @@
+[workspace]
+members = [
+    "crates/celeste-core",
+    "crates/celeste-names",
+    "crates/celeste-engine",
+    "crates/celeste-kernels",
+    "native-probe",
+]
+
 [package]
 name = "celeste-rust"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+celeste-core = { path = "crates/celeste-core" }
 mimalloc = { version = "0.1", default-features = false }
 anyhow = "1.0.62"
 im = { version = "15.1.0", features = ["serde"] }
@@ -50,9 +60,30 @@ codegen-units = 1
 # Measured cost of unwinding: 2.2% (10.26 -> 10.48 s at 55 frames).
 panic = "unwind"
 # Frame pointers + line tables so `perf` can attribute cycles to source.
-# Costs nothing measurable and makes the profile readable.
+# Costs nothing measurable for the interpreter and makes the profile
+# readable - but it is NOT free on the compiled path, see below.
 debug = 1
+
+# The compiled path opts out of debuginfo, and this is measured, not
+# inherited superstition. On the f35 one-frame bench (30 reps, min):
+# 103.6 ms with these overrides, 109.9 ms without - +6.1% for line tables
+# over the kernels and the row machinery.
+#
+# The probe used to get this by being outside the workspace with its own
+# `[profile]`; cargo ignores member profiles, which is the conflict that
+# deferred this split under task #133. Per-package overrides at the root
+# are the resolution, and they also keep an escape hatch for the original
+# reason the probe wanted `debug = false`: LLVM's DWARF variable-DIE pass
+# SEGVs on fused generated functions with thousands of locals. That crash
+# is gone with the 29k-line transpiled body (K4 stage 4), so today this is
+# purely the 6%.
+[profile.release.package.celeste-engine]
+debug = false
+[profile.release.package.celeste-kernels]
+debug = false
+[profile.release.package.native-probe]
+debug = false
 
 [[bin]]
 name = "transpile"
-path = "src/bin/transpile/main.rs"
+path = "src/bin/transpile.rs"

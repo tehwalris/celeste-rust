@@ -21,9 +21,9 @@
 
 use std::sync::Arc;
 
-use celeste_rust::cart_data::CartData;
-use celeste_rust::collision_cache::CollisionCache;
-use celeste_rust::pico8_num::Pico8Num;
+use celeste_core::cart_data::CartData;
+use celeste_core::collision_cache::CollisionCache;
+use celeste_core::pico8_num::Pico8Num;
 use rustc_hash::FxHashMap;
 
 pub type P8 = Pico8Num;
@@ -617,7 +617,7 @@ impl Rt2 {
         // (found by gate 2 on the f020 -> f025 spawn transition).
         for cell in self.structure.iter_mut() {
             if let Cell2::Obj(fields) = cell {
-                fields.sort_by_key(|(k, _)| crate::gen::FIELD_NAMES[*k as usize]);
+                fields.sort_by_key(|(k, _)| celeste_names::FIELD_NAMES[*k as usize]);
             }
         }
         self.history.clear();

@@ -47,7 +47,7 @@ Everything stays inside the existing architecture; no new concepts.
 The certification gate for every step is the SAME one used all night:
 
     CELESTE_TILE=3 ./safe-run.sh --memory 60G -- \
-      ./native-probe/target/release/native-probe --abstract-bench \
+      ./target/release/native-probe --abstract-bench \
       ~/celeste-checkpoints/room10-newlua-bench 35 --reps 5
     # must print: row-key SET EQUAL (gate 2) OK
     # also run frames 20, 25, 30 once each

@@ -151,6 +151,75 @@ Two controls, because a check that only ever passes is not a check:
 
 ## P1 - one engine behind one interface (days, the big one)
 
+### Stage 1: the crate split. DONE 2026-08-18.
+
+The topology below is built, and it came out as designed. What is worth
+recording is what the plan got wrong or did not know.
+
+- **`celeste-names` is 236 lines, not the table zoo below.** `SITE_INFO`,
+  `BRANCH_INFO` and `SLOT_*` no longer exist - K4 stage 4 piece 2 deleted
+  them with their last consumer. The crate is STRINGS / GLOBAL_NAMES /
+  FIELD_NAMES / FN_NAMES plus `global_id` / `field_id`.
+- **The profile conflict is resolved twice over.** Per-package overrides
+  (`[profile.release.package.celeste-engine] debug = false`) work at the
+  workspace root, which was the plan's fix. But they are also no longer
+  needed for the reason task #133 recorded: the LLVM DWARF crash was on
+  the 29k-line transpiled body, which no longer exists, and the probe
+  builds clean under the root's `debug = 1`. They are kept for a
+  DIFFERENT, measured reason - see the cost note below.
+- **Generated code is checked in, with the witnesses.** `gen.rs` and the
+  three `kernel_gen_*.rs` are committed and gated by
+  `transpile::names::tests::generated_is_current`, which regenerates all
+  four in-process and compares byte for byte. That forced the three
+  ~31 KB shape witnesses into git too: they are INPUTS to generation, and
+  they are dumps of a checkpoint frame, so without them the kernels have
+  no reproducible provenance. `./regen-generated.sh` is the canonical
+  regen.
+- **The bootstrap is real and needs the script.** The generators live in
+  celeste-rust, which will depend on celeste-kernels, whose contents they
+  produce - so a change to the emitted PREAMBLE breaks the build of the
+  tool that would fix it. It bit once during this work. `regen-generated
+  .sh` generates into a scratch dir and only installs what builds.
+- **The emitter moved into the library** (`src/transpile/`), with
+  `src/bin/transpile.rs` a thin CLI, because the staleness gate has to be
+  a `#[test]` and tests can only call library code.
+
+Gates: full suite 539/539; `--abstract 30` lane counts, block counts and
+final shape hashes IDENTICAL to the pre-split binary; `--abstract-bench
+room10-newlua-bench 35` row-key SET EQUAL (gate 2) with 100% kernel
+coverage (steady 114,458 + dash 43,824 + frozen 29,577, missed 0); all
+four generated files regenerate byte-identically.
+
+COST, measured, one-frame f35 bench (30 reps, min of run):
+
+| build | min | mean |
+|---|---|---|
+| pre-split (6ea6937), same machine, same hour | 103.0 ms | 110.5 ms |
+| post-split, `debug = false` on the compiled path | 106.8 ms | 121 ms |
+| post-split, root `debug = 1` everywhere | 109.9 ms | 119.2 ms |
+
+Two separate things. The +6% from debuginfo is why the per-package
+`debug = false` overrides stayed. The residual +3.7% min is the split
+itself, and it is NOT at the crate boundary you would guess: folding
+`kernel_gen_*` back into `celeste-engine` as `#[path]` modules gives
+106.3 ms, i.e. no change, so fat LTO is inlining across the
+engine/kernels edge fine. The cost is spread, which is what code-layout
+drift looks like. Recorded, not chased: the interface this unblocks is
+worth 195/248 s of forward and 88/276 s of sweep.
+
+(Note the recorded 89 ms in BENCHMARK_DATA is not reproducible today -
+the same pre-split binary measures 103 ms this afternoon. That is why
+this table is an A/B against a rebuilt baseline and not against the file.)
+
+### Stage 2: the frame interface. NOT STARTED.
+
+Still to do: move `frame_step` / `run_chunk_kernel` / the `Fallback` and
+the import-export bridge out of native-probe into celeste-rust behind one
+`(shape, rows) -> [(shape, rows)]` call, then have both the forward loop
+and the sweep's `bwdt.replay` use it.
+
+### Why the split had to happen first
+
 "Make the backward pass use the fast forward" is gated on a structural
 fact: **native-probe depends on celeste-rust, not the other way round.**
 The kernel engine, the (shape, rows) block model, import,

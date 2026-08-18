@@ -10,37 +10,18 @@
 //! DIR FRAME` is the one-frame dev loop and its row-key gate; `--row-census`,
 //! `--emit-shape` and `--kernel-bench` are the kernel-authoring tools.
 
-mod builtins;
 mod import;
-mod runtime2;
-pub mod kernel;
 
-// The GENERATED modules, and the only ones allowed to carry dead code.
-//
-// They emit a complete surface - every name table, every per-cell
-// constant, the `apply` for each class - and any one consumer uses a
-// subset of it, so `dead_code` here means "this build did not need that
-// entry", not "someone forgot to delete something". The allow is scoped
-// to these four modules deliberately: it used to be crate-wide
-// (`#![allow(unused_variables, unused_assignments, unused_mut,
-// unreachable_code, dead_code)]`, for the transpiled program body that no
-// longer exists), and a crate-wide version of this is exactly how ~150
-// lines of hand-written dead code hid here before.
-#[allow(dead_code)]
-mod gen;
-#[allow(dead_code)]
-mod kernel_gen_dash;
-#[allow(dead_code)]
-mod kernel_gen_frozen;
-#[allow(dead_code)]
-mod kernel_gen_steady;
+use celeste_engine::{kernel, runtime2};
+use celeste_kernels::{kernel_gen_dash, kernel_gen_frozen, kernel_gen_steady};
+use celeste_names as gen;
 use kernel_gen_steady as kernel_gen;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use celeste_rust::cart_data::CartData;
-use celeste_rust::collision_cache::CollisionCache;
+use celeste_core::cart_data::CartData;
+use celeste_core::collision_cache::CollisionCache;
 
 /// Load boundary states from either checkpoint layout: `frames/fNNN.bin`
 /// (the campaign frame batches) or `fNNN/states.bin` (`rewrite bench
@@ -918,7 +899,7 @@ fn run_emit_shape(dir: &str, frame: u32, out_path: &str, class: &str) {
                     "caps": caps.len(),
                 }),
                 runtime2::Cell2::Bi(b) => {
-                    json!({ "k": "bi", "name": crate::builtins::BUILTIN_NAMES[*b as usize] })
+                    json!({ "k": "bi", "name": celeste_rust::builtins::BUILTIN_NAMES[*b as usize] })
                 }
             };
             let obj = o.as_object_mut().unwrap();

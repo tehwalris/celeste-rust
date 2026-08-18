@@ -179,7 +179,7 @@ Where things stand exactly:
   K1 emitter (977e209), K2 gate (c12ab4c), K2 forks (9b6ffa4). All
   pushed to census. Working tree may carry only this note.
 - Regen chain (after any emitter/recipe change):
-  1. `./native-probe/target/release/native-probe --emit-shape
+  1. `./target/release/native-probe --emit-shape
      ~/celeste-checkpoints/room10-newlua-bench 35 native-probe/steady-shape.json`
   2. `./target/release/transpile --recipe rewrites-trace10-steady.jsonl
      --kernel native-probe/steady-shape.json native-probe/src/kernel_gen.rs`

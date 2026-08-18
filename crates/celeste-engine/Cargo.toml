@@ -1,0 +1,12 @@
+[package]
+name = "celeste-engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+celeste-core = { path = "../celeste-core" }
+celeste-names = { path = "../celeste-names" }
+# rustc-hash 2.x on purpose, and NOT unified with celeste-rust's 1.1: the
+# two majors hash differently, and this crate's maps sit under gates that
+# are byte-exact against recorded checkpoints.
+rustc-hash = "2.1.3"

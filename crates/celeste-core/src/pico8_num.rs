@@ -24,7 +24,7 @@ pub struct Pico8Num(i32);
 /// `pico8_diff/gen/README.md` for how it was dumped and why 16384 entries
 /// cover all 65536 inputs exactly.
 static SIN_TABLE: [i32; 16384] = {
-    let bytes = *include_bytes!("../cart/pico8_sin_table.bin");
+    let bytes = *include_bytes!("../../../cart/pico8_sin_table.bin");
     let mut table = [0i32; 16384];
     let mut i = 0;
     while i < 16384 {

@@ -1,0 +1,8 @@
+[package]
+name = "celeste-kernels"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+celeste-core = { path = "../celeste-core" }
+celeste-engine = { path = "../celeste-engine" }
