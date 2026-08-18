@@ -95,6 +95,71 @@ with `--site-slots plans/site-slots-room10-f035.json` - that closes
 the gate to one shape again, so it must come with a census for EVERY
 shape the run visits, or stay off.
 
+# End-to-end forward, per INPUT LANE, and where it goes (2026-08-18)
+
+The frame-body figures below this section are the compute. This is the
+whole forward stage on the same scale: `rewrite bench --frames 68 --deopt
+--checkpoint-dir D --save-frames` under the ladder's level-0 environment
+(frontier-only, collect-first deopt, chunk caps 8,000), room (1,0),
+synthetic win, 16 threads.
+
+Normalized per INPUT LANE - one row fed into the system for one frame,
+summed over the run - because that is the unit optimizations trade
+against (sharing work across the 64 inputs changes the per-input figure
+but not this one). 68 frames, **50,976,038 input lanes**, 161.85 s.
+
+## 3,175 ns per input lane
+
+| phase | wall | ns/input-lane | share |
+|---|---|---|---|
+| `fwd.interpret` | 123.70 s | 2,427 | 76.4% |
+| ...frame body | 49.29 s | 967 | 30.5% |
+| ...**row keys + visited probe** | **71.80 s** | **1,408** | **44.4%** |
+| ...abstraction | 1.34 s | 26 | 0.8% |
+| ...gc | 1.26 s | 25 | 0.8% |
+| `fwd.save_frames` | 11.36 s | 223 | 7.0% |
+| `fwd.boundary_stream` (serial subtract) | 10.59 s | 208 | 6.5% |
+| `fwd.merge` | 5.89 s | 116 | 3.6% |
+| `fwd.boundary_gather` | 1.36 s | 27 | 0.8% |
+| checkpoint writes, init, bookkeeping | 8.95 s | 176 | 5.5% |
+
+Against the kernel's compute-only 198 ns/input-lane at 16 threads, the
+whole forward stage is **16x**; against its 141 ns at 30 threads, 22.5x.
+
+**`fwd.interpret` IS NOT THE INTERPRETER.** It is a wall-clock slice that
+wraps the whole worker scope, and each worker runs the frame body AND
+`stream_boundary_prepare`. Split by worker thread-seconds: frame body
+583.11 s (39.8%), boundary prepare 880.35 s (60.2%), of which
+`visited_row_keys` alone is **849.40 s = 58.0%**. That is what the
+"forward pass is 79% interpreter" line in the campaign cost breakdown
+below actually was: about 40% interpreter and about 58% row hashing. The
+sub-phase wall figures in the table apply that thread-time ratio to
+`fwd.interpret`'s wall - the two run back to back in the same workers, so
+the split is proportional, but it is derived rather than measured
+directly.
+
+Caveat on the unit: the frame body's cost scales with INPUT lanes, but
+the keying cost scales with pre-subtract OUTPUT lanes, which is the
+larger number. The ns/input-lane column is a rate for the run, not a cost
+per key.
+
+**The single biggest item in the forward pass is hashing rows and probing
+the visited set - 44% of it.** Two consequences worth acting on:
+
+- It re-prices K6/#134 again. A faster kernel attacks the 30.5%; the
+  keying is 1.4x bigger than the whole frame body.
+- On a compiled run this work is done TWICE. The kernel already computes
+  row keys out of its output registers for its own pre-dedup, and
+  `Rt2::boundary` computes them again; then the campaign exports to a
+  `State` and `visited_row_keys` recomputes them a third time. Handing
+  the engine's keys to the campaign would be worth most of 1,408
+  ns/input-lane - but it needs a gate first, because gate 2 only proves
+  `Rt2` keys equal `Rt2` keys, never that they equal the interpreter's
+  `visited_row_keys`.
+
+The instrumentation is always on and free: 161.85 s here against 162.32 s
+for the same run before it existed.
+
 # Kernel vs interpreter, frame body only, same frame (2026-08-18)
 
 The headline "100-180x" (task #124) is a CONCRETE per-frame-lane figure:

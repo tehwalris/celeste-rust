@@ -496,8 +496,14 @@ fn stream_boundary_prepare(
     visited: &crate::interpreter::visited::Visited,
 ) -> Result<Vec<PreparedRows>> {
     let mut kept_out = Vec::new();
-    for state in crate::interpreter::abstraction::split_precision_straddles(state) {
+    let t_abs = std::time::Instant::now();
+    let split = crate::interpreter::abstraction::split_precision_straddles(state);
+    let mut abs_ns = t_abs.elapsed().as_nanos() as u64;
+    for state in split {
+        let t_abs = std::time::Instant::now();
         let state = make_state_abstract(state);
+        abs_ns += t_abs.elapsed().as_nanos() as u64;
+        add_worker_ns(WORKER_ABSTRACT, std::mem::take(&mut abs_ns));
         let state = if let Some(band) = band {
             counters.band_before += state.vector_size;
             let budget = band.horizon.saturating_sub(frame);
@@ -604,12 +610,16 @@ fn stream_boundary_prepare(
         // arrives under different hashes on different paths and the visited
         // set double-counts (measured: 2x visited, +10% spurious frontier).
         let mut state = state;
+        let t_gc = std::time::Instant::now();
         state.gc();
+        add_worker_ns(WORKER_GC, t_gc.elapsed().as_nanos() as u64);
         // Phase 1 of the frontier subtract - hashing every lane into its
         // 128-bit row key and looking it up read-only. This is where the
         // per-lane cache miss lives, and it needs only `&RowTable`, so it
         // belongs on this side of the parallel/serial line.
+        let t_keys = std::time::Instant::now();
         let keys = crate::interpreter::vectorize::visited_row_keys(&state, visited);
+        add_worker_ns(WORKER_KEYS, t_keys.elapsed().as_nanos() as u64);
         kept_out.push(PreparedRows { state, keys });
     }
     Ok(kept_out)
@@ -1547,16 +1557,23 @@ impl AbstractRun {
                                 crate::interpreter::virtual_merge::set_nested_parallel(true);
                                 let mut ev = FrameEventCounters::default();
                                 let mut sc = StreamCounters::default();
+                                let t0 = std::time::Instant::now();
                                 let outputs = interpret_state_base(
                                     variants, deopt, frame_cfg, fixed_env, state, &mut ev,
                                     pos_obs, compiled,
                                 )?;
+                                let t1 = std::time::Instant::now();
                                 let mut prepared = Vec::new();
                                 for out in outputs {
                                     prepared.extend(stream_boundary_prepare(
                                         out, band, frame_no, &mut sc, visited_ro,
                                     )?);
                                 }
+                                add_worker_ns(WORKER_BODY, (t1 - t0).as_nanos() as u64);
+                                add_worker_ns(
+                                    WORKER_PREPARE,
+                                    t1.elapsed().as_nanos() as u64,
+                                );
                                 Ok((prepared, ev, sc))
                             })
                         })
@@ -1717,6 +1734,54 @@ impl AbstractRun {
 /// fallback of a failing variant frame continues into the base program),
 /// then the configured deopt mode.
 ///
+/// Thread-time inside `fwd.interpret`'s workers, split between the FRAME
+/// BODY and the boundary PREPARE (canonicalize, row keys, visited probe).
+///
+/// `fwd.interpret` is a wall-clock slice of the main thread that wraps the
+/// whole worker scope, so it silently bundles the two - which is how the
+/// campaign cost breakdown came to read as "79% interpreter" when a large
+/// part of it is row keying. These are summed over workers, so they are
+/// thread-seconds and do not compare directly to the wall figure; the
+/// RATIO between them is the point.
+const WORKER_BODY: usize = 0;
+const WORKER_PREPARE: usize = 1;
+const WORKER_ABSTRACT: usize = 2;
+const WORKER_GC: usize = 3;
+const WORKER_KEYS: usize = 4;
+static WORKER_NS: [std::sync::atomic::AtomicU64; 5] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+fn add_worker_ns(which: usize, ns: u64) {
+    WORKER_NS[which].fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Print and reset the worker split. No-op if no streaming frame ran.
+pub fn print_worker_phase_times() {
+    let ns: Vec<u64> = WORKER_NS
+        .iter()
+        .map(|a| a.swap(0, std::sync::atomic::Ordering::Relaxed))
+        .collect();
+    let total = (ns[WORKER_BODY] + ns[WORKER_PREPARE]) as f64;
+    if total == 0.0 {
+        return;
+    }
+    println!("inside fwd.interpret (thread-seconds, summed over workers):");
+    for (name, v) in [
+        ("frame body", ns[WORKER_BODY]),
+        ("boundary prepare", ns[WORKER_PREPARE]),
+        ("  ...abstract", ns[WORKER_ABSTRACT]),
+        ("  ...gc", ns[WORKER_GC]),
+        ("  ...row keys + visited probe", ns[WORKER_KEYS]),
+    ] {
+        println!("  {:<30} {:8.2}s  {:5.1}%", name, v as f64 / 1e9, 100.0 * v as f64 / total);
+    }
+}
+
 /// A free function taking only shared borrows, so a worker thread can run
 /// it - that is the whole point of the split. `run_deopt_frame` and
 /// `run_deopt_frame_granular` already take `&DeoptTarget`; the only
