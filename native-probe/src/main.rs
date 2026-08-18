@@ -1521,20 +1521,49 @@ fn run_chunk_kernel(
     // The class registry: each kernel's own guards reject wrong-class
     // chunks (bd on the first slice - cheap), so trying in coverage
     // order is both sound and fast.
-    if run_class_kernel_steady(chunk, ids, done, local) {
+    // CELESTE_KERNEL_CLASSES=steady,dash (default: all) - diagnostic
+    // knob for bisecting a class kernel against the reference path.
+    let mask = kernel_class_mask();
+    if mask & 1 != 0 && run_class_kernel_steady(chunk, ids, done, local) {
         KERNEL_HITS[0].fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
         return true;
     }
-    if run_class_kernel_dash(chunk, ids, done, local) {
+    if mask & 2 != 0 && run_class_kernel_dash(chunk, ids, done, local) {
         KERNEL_HITS[1].fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
         return true;
     }
-    if run_class_kernel_frozen(chunk, ids, done, local) {
+    if mask & 4 != 0 && run_class_kernel_frozen(chunk, ids, done, local) {
         KERNEL_HITS[2].fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
         return true;
     }
     KERNEL_HITS[3].fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
     false
+}
+
+/// Which class kernels are enabled (bit 0 steady, 1 dash, 2 frozen).
+/// Default all; `CELESTE_KERNEL_CLASSES=steady,frozen` restricts, and
+/// the disabled classes fall through to the reference path.
+fn kernel_class_mask() -> u8 {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static MASK: AtomicU8 = AtomicU8::new(0xff);
+    let m = MASK.load(Ordering::Relaxed);
+    if m != 0xff {
+        return m;
+    }
+    let m = match std::env::var("CELESTE_KERNEL_CLASSES") {
+        Ok(v) => v.split(',').fold(0u8, |acc, s| {
+            acc | match s.trim() {
+                "steady" => 1,
+                "dash" => 2,
+                "frozen" => 4,
+                "" => 0,
+                other => panic!("unknown kernel class {:?}", other),
+            }
+        }),
+        Err(_) => 7,
+    };
+    MASK.store(m, Ordering::Relaxed);
+    m
 }
 
 /// Lanes handled per class kernel [steady, dash, frozen, missed].

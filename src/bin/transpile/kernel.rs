@@ -220,6 +220,28 @@ fn p8(v: &P8) -> String {
     format!("P8::from_raw({}i32)", v.as_raw_u32() as i32)
 }
 
+/// Does `hay` contain `needle` as a whole Rust identifier? Used to decide
+/// which `kbK` button bits a generated suffix can observe, so it must not
+/// match inside a longer name (`kb1` vs `kb12`) - it is a soundness test,
+/// not a formatting nicety.
+fn mentions_ident(hay: &str, needle: &str) -> bool {
+    let ident_char = |c: char| c.is_alphanumeric() || c == '_';
+    let mut from = 0usize;
+    while let Some(rel) = hay[from..].find(needle) {
+        let at = from + rel;
+        let before_ok = hay[..at].chars().next_back().map_or(true, |c| !ident_char(c));
+        let after_ok = hay[at + needle.len()..]
+            .chars()
+            .next()
+            .map_or(true, |c| !ident_char(c));
+        if before_ok && after_ok {
+            return true;
+        }
+        from = at + needle.len();
+    }
+    false
+}
+
 /// Load the shape witness JSON into the emit-time cell map.
 fn load_witness(path: &str, e: &mut Emit) -> Result<()> {
     let text = std::fs::read_to_string(path).with_context(|| format!("witness {}", path))?;
@@ -1661,15 +1683,57 @@ fn render(e: &Emit, out_path: &str) -> Result<()> {
         }
     }
     writeln!(out, "    }};")?;
-    if e.suf.trim().is_empty() {
-        // No instruction depends on the buttons: all 64 variants produce
-        // identical rows (the interpreter's 64 copies dedup to the same
-        // set), so one call carries the class.
-        writeln!(out, "    suffix::<0>(u, g, &p, &osh, out);")?;
-    } else {
-        for b in 0..64 {
-            writeln!(out, "    suffix::<{}>(u, g, &p, &osh, out);", b)?;
+    // Which button bits can the suffix OBSERVE? `B` reaches the suffix
+    // body only through the six `kbK` bindings, so an identifier scan of
+    // everything that body contains - its instructions AND the tainted
+    // KOut exprs it evaluates in the epilogue - is exact, not heuristic.
+    // Variants agreeing on the observed bits compute an identical KOut,
+    // so they append identical rows and dedup collapses them: emitting
+    // one call per distinct observed assignment is set-equal to all 64.
+    //
+    // Testing `e.suf.is_empty()` alone was WRONG and lost rows: the dash
+    // class stores the buttons straight into p_jump/p_dash, which is a
+    // tainted OUT FIELD with no suffix instruction behind it (gate f35,
+    // 2026-08-18: 1358 rows missing at f37).
+    let mut suffix_text = e.suf.clone();
+    for (id, _, expr, tainted) in &out_fields {
+        if *tainted {
+            suffix_text.push('\n');
+            suffix_text.push_str(expr);
+        } else if (0..6).any(|k| mentions_ident(expr, &format!("kb{}", k))) {
+            bail!("output cell {} reads a button bit but is marked untainted", id);
         }
+    }
+    // The prefix runs ONCE per fork config, so a button bit reaching it
+    // would be computed with one arbitrary variant's value - the same
+    // failure one level up. Taint routing should make this impossible;
+    // hold it loudly rather than trust it.
+    for k in 0..6 {
+        if mentions_ident(&e.pre, &format!("kb{}", k)) {
+            bail!("button bit kb{} leaked into the button-independent prefix", k);
+        }
+    }
+    let used: Vec<u32> = (0..6)
+        .filter(|k| mentions_ident(&suffix_text, &format!("kb{}", k)))
+        .collect();
+    let n_variants = 1usize << used.len();
+    eprintln!(
+        "[kernel] suffix observes button bits {:?} -> {} variant call(s)",
+        used, n_variants
+    );
+    writeln!(
+        out,
+        "    // suffix observes button bits {:?}: {} distinct variant(s)",
+        used, n_variants
+    )?;
+    for i in 0..n_variants {
+        let b: u8 = used
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| i >> j & 1 != 0)
+            .map(|(_, k)| 1u8 << k)
+            .sum();
+        writeln!(out, "    suffix::<{}>(u, g, &p, &osh, out);", b)?;
     }
     for _ in 0..e.fork_depth {
         writeln!(out, "    }}")?;
