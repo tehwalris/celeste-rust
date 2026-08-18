@@ -1,3 +1,38 @@
+# Dedup-on-the-fly: DONE 2026-08-18 (348 -> 89 ms at f35)
+
+Landed, gates exact at f20/25/30/35. What shipped differs from the plan
+below in one deliberate way, so read this first:
+
+- The generated key is NOT a bit-exact copy of `Rt2::boundary`'s key.
+  It mixes ORIGINAL cell ids rather than the canonical BFS numbering,
+  which is all a per-chunk seen-set needs, and it removed the whole
+  class of "mirror the canonical numbering" bugs the plan warned about.
+  It does use boundary's own `mix64`/`cell_mix` (hoisted to module
+  scope in runtime2) and mirrors the two VALUE canonicalizations that
+  decide what merges: rem cells (replaced by one wide interval, so they
+  contribute nothing per-lane and are skipped) and dash_effect_time
+  (clamped at 0). Which cells those are comes from `Rt2::mark_walk` per
+  chunk, as a `KeyPlan` mask, re-checked against the OUTPUT block
+  before the boundary - a stale rem bit would merge rows that differ.
+- Step 1's CELESTE_KEYCHECK gate was therefore replaced by a stronger
+  and cheaper check: the within-chunk dedup ratio AFTER boundary. It
+  went 8.3:1 -> 1.0:1, i.e. the register-side key provably collapsed
+  everything boundary would have.
+- Step 4 (boundary_with_keys) is NOT needed and not done: with 8.3x
+  fewer rows reaching it, boundary's re-hash is 15% of a much smaller
+  frame.
+- Chunk size inverted as a consequence and is retuned to 256 (see
+  BENCHMARK_DATA.md).
+
+Knobs: CELESTE_PREDEDUP=0 (old path, for A/B), CELESTE_CHUNK_ROWS,
+CELESTE_KERNEL_CLASSES=steady,dash,frozen (bisect a class kernel).
+
+Remaining ideas from the original plan are still open at the bottom
+("Other ideas"); the cross-chunk 11:1 that pre-dedup does NOT catch
+would need a shared seen-set and is unmeasured.
+
+---
+
 # Dedup-on-the-fly plan (next lever after the kernel night)
 
 Context: plans/kernel-plan.md. The kernel engine (CELESTE_TILE=3) runs
