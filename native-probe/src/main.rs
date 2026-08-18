@@ -14,7 +14,7 @@
 //! something the campaign binaries do.
 
 use celeste_engine::{kernel, runtime2};
-use celeste_kernels::{kernel_gen_dash, kernel_gen_frozen, kernel_gen_steady};
+use celeste_kernels::kernel_gen_steady;
 use celeste_names as gen;
 use kernel_gen_steady as kernel_gen;
 
@@ -94,6 +94,7 @@ fn main() {
     let mut row_census: Option<(String, u32)> = None;
     let mut emit_shape: Option<(String, u32, String, String)> = None;
     let mut kernel_bench: Option<(String, u32)> = None;
+    let mut interp_bench: Option<(String, u32)> = None;
     let mut reps: u32 = 10;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -120,6 +121,11 @@ fn main() {
                 let class = args.next().unwrap_or_else(|| "steady".to_string());
                 emit_shape = Some((dir, frame, out, class));
             }
+            "--interp-bench" => {
+                let dir = args.next().expect("--interp-bench needs DIR FRAME");
+                let f: u32 = args.next().expect("FRAME").parse().unwrap();
+                interp_bench = Some((dir, f));
+            }
             "--kernel-bench" => {
                 let dir = args.next().expect("--kernel-bench needs DIR FRAME");
                 let frame: u32 = args.next().expect("FRAME").parse().unwrap();
@@ -137,6 +143,8 @@ fn main() {
         run_emit_shape(&dir, frame, &out, &class);
     } else if let Some((dir, frame)) = kernel_bench {
         run_kernel_bench(&dir, frame, reps);
+    } else if let Some((dir, frame)) = interp_bench {
+        run_interp_bench(&dir, frame, reps);
     } else if let Some((dir, frame)) = abstract_bench {
         run_abstract_bench(&dir, frame, reps);
     } else {
@@ -577,14 +585,11 @@ fn run_kernel_bench(dir: &str, frame: u32, reps: u32) {
     // CELESTE_KERNEL_GATE=0 skips it (profiling runs: the perf data
     // then covers only the timed kernel loop).
     let run_gate = std::env::var("CELESTE_KERNEL_GATE").map(|v| v != "0").unwrap_or(true);
-    let g_freeze = gen::global_id("freeze").expect("no freeze global");
     let mut census: rustc_hash::FxHashMap<&'static str, (u64, u64, u64)> = Default::default();
     if run_gate {
     eprintln!("[gate] running the reference pipeline...");
     let ref_blocks = eng.step(
         steady.iter().map(|b| b.clone_block()).collect(),
-        &ids,
-        g_freeze,
         &mut census,
     );
     eprintln!("[gate] reference done; running the kernel...");
@@ -667,31 +672,173 @@ fn run_kernel_bench(dir: &str, frame: u32, reps: u32) {
     } // run_gate
 
     // ---- timing: kernel-only (bind + gather + frame), no materialize ----
-    let mut best = f64::INFINITY;
-    for _ in 0..reps {
-        let t0 = Instant::now();
+    //
+    // CELESTE_KERNEL_BENCH_THREADS=T runs the SAME loop on T threads, each
+    // taking every T-th W-row slice. Slices are independent by
+    // construction (the kernel reads its rows and writes to the caller's
+    // callback), so this is the kernel's parallel roofline with none of
+    // the pipeline around it - not a claim about the engine, which also
+    // has to materialize, dedup and merge.
+    let threads: usize = std::env::var("CELESTE_KERNEL_BENCH_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let run_once = |tid: usize| {
         let mut sink = 0u64;
+        let mut slice = 0usize;
         for chunk in &steady {
             let uni = kernel_gen::bind(chunk).expect("bind");
             let mut lo = 0usize;
             while lo < chunk.width {
-                let rin = kernel_gen::rows(chunk, lo).expect("rows");
-                kernel_gen::frame(&uni, &rin, &g, &mut |b, osh, kout| {
-                    sink = sink.wrapping_add(kout.deopt as u64).wrapping_add(b as u64);
-                    std::hint::black_box(osh);
-                    std::hint::black_box(kout);
-                });
+                if slice % threads == tid {
+                    let rin = kernel_gen::rows(chunk, lo).expect("rows");
+                    kernel_gen::frame(&uni, &rin, &g, &mut |b, osh, kout| {
+                        sink = sink.wrapping_add(kout.deopt as u64).wrapping_add(b as u64);
+                        std::hint::black_box(osh);
+                        std::hint::black_box(kout);
+                    });
+                }
+                slice += 1;
                 lo += kernel::W;
             }
         }
         std::hint::black_box(sink);
+    };
+    let mut best = f64::INFINITY;
+    for _ in 0..reps {
+        let t0 = Instant::now();
+        if threads == 1 {
+            run_once(0);
+        } else {
+            std::thread::scope(|scope| {
+                for tid in 0..threads {
+                    let run_once = &run_once;
+                    scope.spawn(move || run_once(tid));
+                }
+            });
+        }
         let dt = t0.elapsed().as_secs_f64();
         best = best.min(dt);
     }
     let row_btns = lanes_in as f64 * 64.0;
     println!(
-        "kernel: {} lanes x 64 inputs, best of {}: {:.2} ms  ({:.1} ns per row-input-frame, {:.0} ns/input-lane)",
+        "kernel: {} lanes x 64 inputs, {} thread(s), best of {}: {:.2} ms  \
+         ({:.2} ns per row-input-frame, {:.0} ns/input-lane)",
         lanes_in,
+        threads,
+        reps,
+        best * 1e3,
+        best * 1e9 / row_btns,
+        best * 1e9 / lanes_in as f64
+    );
+}
+
+
+/// The INTERPRETER's frame body on the same input, for scale.
+///
+/// `--interp-bench DIR FRAME` is `--kernel-bench`'s counterpart: same
+/// checkpoint states, same "frame body only" boundary (no abstraction, no
+/// dedup, no merge), same best-of-N, same normalization. What it runs is
+/// `interpret_prepared_cfg` on the CAMPAIGN's recipe (`rewrites.jsonl`),
+/// not the compile overlay - the overlay's `expand_bool` was measured at
+/// +19% on the interpreter, so this is the interpreter at its best rather
+/// than the interpreter handicapped by the compiled path's program.
+///
+/// Two knobs, both shared with `--kernel-bench` so the two are read off
+/// the same axes: `CELESTE_KERNEL_BENCH_THREADS=T` and
+/// `CELESTE_INTERP_BENCH_LANES=N` (the per-chunk lane cap, which is what
+/// the interpreter's vectorization amortizes over).
+fn run_interp_bench(dir: &str, frame: u32, reps: u32) {
+    use celeste_rust::interpreter::state::State;
+    use std::time::Instant;
+
+    let recipe = celeste_rust::rewrite::recipe::Recipe::load("rewrites.jsonl")
+        .expect("loading rewrites.jsonl (run from the repo root)");
+    let (program, _) = celeste_rust::rewrite::recipe::build(&recipe).expect("building the recipe");
+    celeste_rust::interpreter::vectorize::set_merge_partition_patterns(
+        &program.merge_partition_cells,
+    );
+    let frame_cfg =
+        celeste_rust::interpreter::fixed_env::PreparedCfg::new(program.frame_cfg().clone());
+    let fixed_env = program.fixed_env();
+
+    let states = load_states_any(dir, frame);
+    let lanes_in: usize = states.iter().map(|s| s.vector_size).sum();
+    let cap: usize = std::env::var("CELESTE_INTERP_BENCH_LANES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8000);
+    let chunks: Vec<State> = {
+        use celeste_rust::interpreter::value::KeptLanes;
+        let mut out = Vec::new();
+        for st in &states {
+            let n = st.vector_size;
+            if n <= cap {
+                out.push(st.clone());
+                continue;
+            }
+            for lo in (0..n).step_by(cap) {
+                let hi = (lo + cap).min(n);
+                out.push(st.filter_by_kept_clone(
+                    &KeptLanes::from_range(lo, hi),
+                    celeste_rust::interpreter::state::FILTER_CHUNK,
+                ));
+            }
+        }
+        out
+    };
+    let threads: usize = std::env::var("CELESTE_KERNEL_BENCH_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    eprintln!(
+        "[interp-bench] f{:03}: {} lanes in {} state(s) -> {} chunk(s) of <={} lanes, {} thread(s)",
+        frame,
+        lanes_in,
+        states.len(),
+        chunks.len(),
+        cap,
+        threads
+    );
+
+    let mut best = f64::INFINITY;
+    for _ in 0..reps {
+        // Cloned outside the timer: the interpreter consumes its state.
+        let work: Vec<State> = chunks.clone();
+        let t0 = Instant::now();
+        std::thread::scope(|scope| {
+            for tid in 0..threads {
+                let work = &work;
+                let frame_cfg = &frame_cfg;
+                let fixed_env = &fixed_env;
+                scope.spawn(move || {
+                    celeste_rust::interpreter::virtual_merge::set_nested_parallel(threads > 1);
+                    let mut sink = 0usize;
+                    for (i, st) in work.iter().enumerate() {
+                        if i % threads != tid {
+                            continue;
+                        }
+                        let out = celeste_rust::interpreter::glue::interpret_prepared_cfg(
+                            frame_cfg,
+                            st.clone(),
+                            fixed_env,
+                        )
+                        .expect("frame failed");
+                        sink += out.len();
+                    }
+                    std::hint::black_box(sink);
+                });
+            }
+        });
+        best = best.min(t0.elapsed().as_secs_f64());
+    }
+    let row_btns = lanes_in as f64 * 64.0;
+    println!(
+        "interp: {} lanes x 64 inputs, {} thread(s), cap {}, best of {}: {:.2} ms  \
+         ({:.2} ns per row-input-frame, {:.0} ns/input-lane)",
+        lanes_in,
+        threads,
+        cap,
         reps,
         best * 1e3,
         best * 1e9 / row_btns,
@@ -708,8 +855,6 @@ fn run_abstract_bench(dir: &str, frame: u32, reps: u32) {
     let (cart, cache) = world();
     let eng = engine();
     let ids = eng.ids();
-    let g_freeze = gen::global_id("freeze").expect("no freeze global");
-
     let t_load = std::time::Instant::now();
     let states = load_states_any(dir, frame);
     let blocks: Vec<runtime2::Rt2> = states

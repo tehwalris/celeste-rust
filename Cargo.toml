@@ -6,6 +6,21 @@ members = [
     "crates/celeste-kernels",
     "native-probe",
 ]
+# Without this, a bare `cargo build` in the repo root builds ONLY the root
+# package, because the root is itself a package. native-probe depends on
+# celeste-rust, so it is exactly the member a change to celeste-rust can
+# break - and it broke silently that way once (`FrameEngine::step` lost two
+# parameters and the probe kept its stale binary in target/, so three
+# `cargo build --release`s and a green `nextest` all passed over a member
+# that did not compile). Building it by default costs one extra link.
+default-members = [
+    ".",
+    "crates/celeste-core",
+    "crates/celeste-names",
+    "crates/celeste-engine",
+    "crates/celeste-kernels",
+    "native-probe",
+]
 
 [package]
 name = "celeste-rust"

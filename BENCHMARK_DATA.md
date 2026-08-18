@@ -95,6 +95,54 @@ with `--site-slots plans/site-slots-room10-f035.json` - that closes
 the gate to one shape again, so it must come with a census for EVERY
 shape the run visits, or stay off.
 
+# Kernel vs interpreter, frame body only, same frame (2026-08-18)
+
+The headline "100-180x" (task #124) is a CONCRETE per-frame-lane figure:
+compiled code against the interpreter executing ONE lane at a time. The
+abstract search never runs in that regime - it is a vectorized interpreter
+that runs one instruction across thousands of lanes - so that ratio does
+not transfer, and the number below is what does.
+
+Both sides: real f35 checkpoint states from `room10-newlua-bench`, frame
+BODY only (no abstraction, dedup or merge), best of N, 7950X3D (16 cores /
+32 threads). `--kernel-bench` is bind + gather + `frame` with the output
+callback black-boxed; `--interp-bench` is `interpret_prepared_cfg` on the
+CAMPAIGN recipe (`rewrites.jsonl`, not the compile overlay, so the
+interpreter is at its best). Normalized per ROW-INPUT-FRAME: one abstract
+state advanced one frame under one of the 64 button inputs.
+
+| threads | kernel (114,458 steady lanes) | interpreter (187,859 lanes, best lane cap) |
+|---|---|---|
+| 1 | **31.5 ns** | **39.8 ns** (cap 200k; 43.3 at cap 8k) |
+| 8 | 4.31 ns | 8.29 ns (cap 8k) |
+| 16 | 3.09 ns | **6.35 ns** (cap 8k) |
+| 30 | **2.21 ns** | 7.15 ns |
+| 32 | 2.56 ns | - |
+
+So: **1.26x single-core, 2.06x at equal thread count, 2.87x best against
+best.** Same order of magnitude, not two.
+
+Two caveats, both of which make the kernel look BETTER than it is:
+
+- The kernel number is compute only - the output callback is
+  `black_box`ed, so materializing rows, keying them and pre-deduping them
+  are all excluded. Those are 85% of the compiled frame body in the real
+  engine (see the next section). The interpreter number INCLUDES producing
+  its output states.
+- The kernel figure covers the steady class only (114,458 of 187,859
+  lanes at f35); the interpreter's covers all of them.
+
+Scaling: the kernel gets 10.2x from 16 threads and 14.2x from 30, and
+regresses at 32. The interpreter gets 6.3x at 16 and gets WORSE past that
+- SMT does not help it, and its lane cap matters a lot (cap 32k costs it
+2.4x at 16 threads, because 40 states in 6 chunks cannot fill 16
+workers).
+
+This is the number to quote when asking what a kernel is worth. It also
+explains the campaign A/B below without any appeal to integration
+overhead: a 2x compute engine, whose compute is 3% of its own frame body,
+against an interpreter that amortizes across lanes.
+
 # P2 step 1: the sweep stops merging states it throws away (2026-08-18)
 
 The backward loop replays a frame, reads `(origin, row key)` pairs off
