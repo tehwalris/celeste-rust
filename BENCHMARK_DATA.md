@@ -380,6 +380,38 @@ rows, p_dash twin-block suspicion, chimera-lane theory, "do not trust
 step()-based gates") are all withdrawn; step() and the campaign path
 agree, and the campaign gates were never affected.
 
+### M1 stages 1+2: suffix hoist + support-segment emission (2026-08-19)
+
+Task #152. The fused artifact used to evaluate its whole 120-line
+suffix once per input variant (64x). Stage 1 hoisted the 14
+kb-independent lets into the prefix; stage 2 groups the remaining
+lines by transitive kb-support and emits per-support segment fns
+computed once per ASSIGNMENT of their support (frame() caches
+2/4/4/8/16/32 copies of the 6 segments; only a 15-line full-support
+residual and the epilogue still run per variant). Suffix node evals:
+6,720 -> ~1,638 per 16-lane row (4.1x fewer).
+
+Measured on `--abstract-bench ~/perf-scratch/k2ctl 65` (fused,
+16 threads), same-day A/B at 6 reps, stage-1 emitter (HEAD) vs
+stage-2, identical gate output both ways (engine 8,715,348 =
+4,591,412 ref + 4,123,936 revisited, MODULO VISITED OK):
+
+| | min | mean |
+|---|---|---|
+| stage 1 | 13,405.81 ms | 13,578.92 ms |
+| stage 2 | 13,055.78 ms | 13,160.15 ms |
+| delta | **-2.6%** | **-3.1%** |
+
+Day-to-day drift is LARGER than this effect (the same stage-1 binary
+measured 14.24 s the previous evening), so cross-day bench numbers on
+this workload are not comparable - A/B on the same day or not at all.
+perf (whole process): artifact compute 10.9% -> 4.9% (suffix::<B>
+9.6% -> 3.0%, seg fns 0.7%, frame 1.2%). The `run_fused` closure -
+prededup row hashing, dy rep keying, append_out - is unchanged at
+8.5% and is now the single biggest fused-engine cost; that is M1
+stage 3 (executor-side reuse of per-segment column values in the
+row-key path). Memberchecks ok, suite 553/553.
+
 # K2's pm1 death-partition fix: REFUTED - inert and slightly slower (2026-08-19)
 
 The census's preferred fix (add `will_restart` to the pm1 partition

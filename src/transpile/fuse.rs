@@ -803,26 +803,26 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
     // and flows into every variant's copy of `p.dp_m*`, exactly what 64
     // identical OR-ins produced. Raw lines (guards, bails, splits) are
     // never hoisted, and any name they define is conservatively tainted.
-    let hoisted = {
-        let idents = |s: &str| -> Vec<String> {
-            let mut v = Vec::new();
-            let mut cur = String::new();
-            for ch in s.chars() {
-                if ch.is_ascii_alphanumeric() || ch == '_' {
-                    cur.push(ch);
-                } else if !cur.is_empty() {
-                    if !cur.chars().next().unwrap().is_ascii_digit() {
-                        v.push(std::mem::take(&mut cur));
-                    } else {
-                        cur.clear();
-                    }
+    fn idents(s: &str) -> Vec<String> {
+        let mut v = Vec::new();
+        let mut cur = String::new();
+        for ch in s.chars() {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                cur.push(ch);
+            } else if !cur.is_empty() {
+                if !cur.chars().next().unwrap().is_ascii_digit() {
+                    v.push(std::mem::take(&mut cur));
+                } else {
+                    cur.clear();
                 }
             }
-            if !cur.is_empty() && !cur.chars().next().unwrap().is_ascii_digit() {
-                v.push(cur);
-            }
-            v
-        };
+        }
+        if !cur.is_empty() && !cur.chars().next().unwrap().is_ascii_digit() {
+            v.push(cur);
+        }
+        v
+    }
+    let hoisted = {
         let mut tainted: BTreeSet<String> =
             (0..6).map(|k| format!("kb{}", k)).collect();
         let mut keep: Vec<Line> = Vec::new();
@@ -972,11 +972,11 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
     // Crossing: prefix names the suffix side reads. The suffix side is
     // the fused suffix text plus every epilogue expr (tainted KOut
     // fields, the Dy tuples, the member dp combinations read `p.valid`).
-    let mut suffix_scan = suf_text.clone();
+    let mut epi_text = String::new();
     for (_, _, expr, tainted) in &fused_of.fields {
         if *tainted {
-            suffix_scan.push('\n');
-            suffix_scan.push_str(expr);
+            epi_text.push('\n');
+            epi_text.push_str(expr);
         } else if (0..6).any(|k| mentions_ident(expr, &format!("kb{}", k))) {
             bail!("output cell reads a button bit but is marked untainted");
         }
@@ -986,10 +986,12 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
             // Tuple exprs may read button bits (they are rendered inside
             // the per-variant callback, after the kb bindings) - they are
             // suffix-side by construction.
-            suffix_scan.push('\n');
-            suffix_scan.push_str(&fused_expr(expr));
+            epi_text.push('\n');
+            epi_text.push_str(&fused_expr(expr));
         }
     }
+    let mut suffix_scan = suf_text.clone();
+    suffix_scan.push_str(&epi_text);
     for k in 0..6 {
         if mentions_ident(&pre_text, &format!("kb{}", k)) {
             bail!("button bit kb{} leaked into the fused prefix", k);
@@ -1001,11 +1003,239 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
             crossing.insert(name.clone());
         }
     }
-    for (_, _, expr, _) in &fused_of.fields {
-        if pre_defs.contains(expr) {
-            crossing.insert(expr.clone());
+    // (No special case for bare-name out exprs: a TAINTED bare name is in
+    // suffix_scan via the epilogue exprs, so the word_used loop above
+    // catches it; an UNTAINTED one is consumed by `osh` inside frame(),
+    // where the name is a local. Force-adding untainted ones minted Pre
+    // fields nothing read once the stage-1 hoist moved their last
+    // suffix users into the prefix.)
+
+    // --- M1 stage 2 (task #152): support-segment emission ---
+    // Each remaining suffix line depends on a SUBSET of the button bits
+    // (its "support"): transitively, the kb bits its expr mentions plus
+    // the supports of the suffix names it reads. A line with support S
+    // has only 2^|S| distinct evaluations across the 2^|used| variants,
+    // so lines are grouped by support into segment fns `seg_k::<A>` that
+    // frame() evaluates once per assignment of S, caching the results;
+    // each variant call reads every segment through the variant's
+    // projection onto S, picked at emission time. Soundness: dp
+    // registers and `bd` are write-only OR-accumulators in every lane
+    // primitive (celeste-engine kernel.rs), so a segment accumulates its
+    // own deltas from zero and the variant ORs them in - same lanes as
+    // inline evaluation, in a different (commutative) order. A raw line
+    // that is not a recognized zguard / zi_split_at / `*bd` bail is
+    // forced into the full-support residual and taints its binders,
+    // exactly like the stage-1 hoist.
+    let used_mask: u8 = (0..6)
+        .filter(|k| mentions_ident(&suffix_scan, &format!("kb{}", k)))
+        .map(|k| 1u8 << k)
+        .sum();
+    struct LineInfo {
+        sup: u8,
+        binds: Vec<String>,
+    }
+    let infos: Vec<LineInfo> = {
+        let mut name_sup: HashMap<String, u8> = HashMap::new();
+        let sup_of = |s: &str, name_sup: &HashMap<String, u8>| -> u8 {
+            let mut m = 0u8;
+            for w in idents(s) {
+                if let Some(k) = w.strip_prefix("kb").and_then(|r| r.parse::<u8>().ok()) {
+                    if k < 6 {
+                        m |= 1 << k;
+                        continue;
+                    }
+                }
+                m |= name_sup.get(&w).copied().unwrap_or(0);
+            }
+            m
+        };
+        let mut infos = Vec::new();
+        for line in &suf {
+            let info = match line {
+                Line::Let { name, expr, .. } => {
+                    let sup = sup_of(expr, &name_sup);
+                    name_sup.insert(name.clone(), sup);
+                    LineInfo { sup, binds: vec![name.clone()] }
+                }
+                Line::Raw(text) => {
+                    let t = text.trim_start();
+                    if t.starts_with("zguard(") {
+                        LineInfo { sup: sup_of(t, &name_sup), binds: vec![] }
+                    } else if t.starts_with("if !") && t.ends_with("{ *bd = true; }") {
+                        LineInfo { sup: sup_of(t, &name_sup), binds: vec![] }
+                    } else if t.starts_with("let (") && t.contains("zi_split_at(") {
+                        let sup = sup_of(t.split('=').nth(1).unwrap_or(""), &name_sup);
+                        let binds = idents(
+                            t.strip_prefix("let (").unwrap().split(')').next().unwrap_or(""),
+                        );
+                        for b in &binds {
+                            name_sup.insert(b.clone(), sup);
+                        }
+                        LineInfo { sup, binds }
+                    } else {
+                        // Unrecognized raw: full support, binders tainted.
+                        let mut binds = Vec::new();
+                        if let Some(rest) = t.strip_prefix("let ") {
+                            for w in idents(rest.split('=').next().unwrap_or("")) {
+                                if w != "mut"
+                                    && !matches!(w.as_str(), "ZI" | "ZN" | "ZB" | "u16" | "P8" | "bool")
+                                {
+                                    name_sup.insert(w.clone(), used_mask);
+                                    binds.push(w);
+                                }
+                            }
+                        }
+                        LineInfo { sup: used_mask, binds }
+                    }
+                }
+            };
+            infos.push(info);
+        }
+        infos
+    };
+    let mut seg_groups: BTreeMap<u8, Vec<usize>> = BTreeMap::new();
+    let mut residual_idx: Vec<usize> = Vec::new();
+    for (i, info) in infos.iter().enumerate() {
+        if info.sup == used_mask {
+            residual_idx.push(i);
+        } else {
+            seg_groups.entry(info.sup).or_default().push(i);
         }
     }
+    // A segment below MIN_SEG_LINES folds into the cheapest superset
+    // segment (fewest assignments), or the residual when none exists:
+    // a few extra evaluations of those lines beat a struct + fn + cache
+    // array per tiny group. Sound because the target's support contains
+    // the source's, so every value the source needs is still fixed per
+    // assignment, and relative line order is restored by the sort below.
+    // The target must remain visible to every group that reads the
+    // moved binds: a reader group U necessarily has U ⊇ S (a reading
+    // line's support includes the bind's), and after the merge it reads
+    // from T, which it can only do if T ⊆ U (strict-subset dep) or
+    // T == U (intra-segment). The residual can read any segment but no
+    // group can read the residual, so that fallback needs zero group
+    // readers. Tiny groups with conflicting readers just stay.
+    const MIN_SEG_LINES: usize = 3;
+    let mut unmergeable: BTreeSet<u8> = BTreeSet::new();
+    loop {
+        let texts: BTreeMap<u8, String> = seg_groups
+            .iter()
+            .map(|(s, v)| {
+                let mut ix = v.clone();
+                ix.sort_unstable();
+                (*s, render_lines(&ix.iter().map(|&i| suf[i].clone()).collect::<Vec<_>>()))
+            })
+            .collect();
+        let small = seg_groups
+            .iter()
+            .filter(|(s, v)| v.len() < MIN_SEG_LINES && !unmergeable.contains(s))
+            .map(|(s, v)| (v.len(), *s))
+            .min();
+        let Some((_, s)) = small else { break };
+        let binds: Vec<&String> = seg_groups[&s]
+            .iter()
+            .flat_map(|i| infos[*i].binds.iter())
+            .collect();
+        let readers: Vec<u8> = seg_groups
+            .keys()
+            .copied()
+            .filter(|t| *t != s && binds.iter().any(|n| word_used(&texts[t], n)))
+            .collect();
+        let target = seg_groups
+            .keys()
+            .copied()
+            .filter(|t| *t != s && t & s == s)
+            .filter(|t| readers.iter().all(|u| u == t || u & t == *t))
+            .min_by_key(|t| t.count_ones());
+        if target.is_none() && !readers.is_empty() {
+            unmergeable.insert(s);
+            continue;
+        }
+        let idxs = seg_groups.remove(&s).unwrap();
+        match target {
+            Some(t) => seg_groups.get_mut(&t).unwrap().extend(idxs),
+            None => residual_idx.extend(idxs),
+        }
+    }
+    residual_idx.sort_unstable();
+    let residual_lines: Vec<Line> = residual_idx.iter().map(|&i| suf[i].clone()).collect();
+    let residual_text = render_lines(&residual_lines);
+    let residual_epi = format!("{}\n{}", residual_text, epi_text);
+    struct Seg2 {
+        bits: Vec<u8>,
+        text: String,
+        exports: Vec<(String, &'static str)>,
+        dp: Vec<u8>,
+        bd: bool,
+        deps: Vec<usize>,
+        pass: bool,
+    }
+    let mut seg_order: Vec<u8> = seg_groups.keys().copied().collect();
+    seg_order.sort_by_key(|s| (s.count_ones(), *s));
+    let seg_texts: Vec<String> = seg_order
+        .iter()
+        .map(|s| {
+            let mut idxs = seg_groups[s].clone();
+            idxs.sort_unstable();
+            render_lines(&idxs.iter().map(|&i| suf[i].clone()).collect::<Vec<_>>())
+        })
+        .collect();
+    let mut segs: Vec<Seg2> = Vec::new();
+    for (k, &sup) in seg_order.iter().enumerate() {
+        let mut idxs = seg_groups[&sup].clone();
+        idxs.sort_unstable();
+        let text = seg_texts[k].clone();
+        let outside_uses = |name: &str| -> bool {
+            seg_texts[k + 1..].iter().any(|t| word_used(t, name))
+                || word_used(&residual_epi, name)
+        };
+        let mut exports: Vec<(String, &'static str)> = Vec::new();
+        for i in &idxs {
+            for name in &infos[*i].binds {
+                if outside_uses(name) {
+                    let ty = *var_ty
+                        .get(name)
+                        .ok_or_else(|| anyhow!("no type for segment export {}", name))?;
+                    exports.push((name.clone(), ty));
+                }
+            }
+        }
+        let dp: Vec<u8> = reg_masks
+            .iter()
+            .copied()
+            .filter(|m| word_used(&text, &reg(*m)))
+            .collect();
+        let bd = word_used(&text, "bd");
+        if exports.is_empty() && dp.is_empty() && !bd {
+            bail!("suffix segment {:#08b} has no observable effect", sup);
+        }
+        let deps: Vec<usize> = (0..k)
+            .filter(|&j| segs[j].exports.iter().any(|(n, _)| word_used(&text, n)))
+            .collect();
+        let pass = !dp.is_empty()
+            || bd
+            || exports.iter().any(|(n, _)| word_used(&residual_epi, n));
+        let bits: Vec<u8> = (0..6).filter(|b| sup >> b & 1 != 0).collect();
+        segs.push(Seg2 { bits, text, exports, dp, bd, deps, pass });
+    }
+    eprintln!(
+        "[fused] M1 segments: {} ({:?} lines), residual {} of {} suffix lines",
+        segs.len(),
+        seg_order.iter().map(|s| seg_groups[s].len()).collect::<Vec<_>>(),
+        residual_idx.len(),
+        suf.len()
+    );
+    // Assignment plumbing: `expand` scatters a dense assignment index
+    // over the segment's bit positions (the const A passed to seg fns);
+    // `pack` projects a full 6-bit variant/assignment pattern back to a
+    // cache index. Both resolve at emission time.
+    let expand = |i: usize, bits: &[u8]| -> u8 {
+        bits.iter().enumerate().map(|(j, b)| (((i >> j) & 1) as u8) << b).sum()
+    };
+    let pack = |a: u8, bits: &[u8]| -> usize {
+        bits.iter().enumerate().map(|(j, b)| (((a >> b) & 1) as usize) << j).sum()
+    };
+
     writeln!(out, "pub struct Pre {{")?;
     for name in &crossing {
         let ty = var_ty
@@ -1019,6 +1249,76 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
     }
     writeln!(out, "    bd: bool,")?;
     writeln!(out, "}}\n")?;
+
+    // Segment structs + fns (M1 stage 2). Exported fields are only the
+    // names some LATER segment, the residual, or the epilogue reads;
+    // dp/bd fields are the segment's own deltas, accumulated from zero.
+    for (k, sg) in segs.iter().enumerate() {
+        writeln!(
+            out,
+            "/// Suffix nodes supported by button bits {:?} only: {} distinct\n\
+             /// evaluations, computed once each in frame() and read per variant.",
+            sg.bits,
+            1usize << sg.bits.len()
+        )?;
+        writeln!(out, "struct Seg{} {{", k)?;
+        for (n, ty) in &sg.exports {
+            writeln!(out, "    {}: {},", n, ty)?;
+        }
+        for m in &sg.dp {
+            writeln!(out, "    {}: u16,", reg(*m))?;
+        }
+        if sg.bd {
+            writeln!(out, "    bd: bool,")?;
+        }
+        writeln!(out, "}}")?;
+        write!(
+            out,
+            "#[allow(unused_variables)]\n\
+             #[inline(never)]\n\
+             fn seg_{}<const A: u8>(u: &Uni, g: &G, p: &Pre",
+            k
+        )?;
+        for j in &sg.deps {
+            write!(out, ", s{j}: &Seg{j}", j = j)?;
+        }
+        writeln!(out, ") -> Seg{} {{", k)?;
+        for name in &crossing {
+            if word_used(&sg.text, name) {
+                writeln!(out, "    let {n} = p.{n};", n = name)?;
+            }
+        }
+        for j in &sg.deps {
+            for (n, _) in &segs[*j].exports {
+                if word_used(&sg.text, n) {
+                    writeln!(out, "    let {n} = s{j}.{n};", n = n, j = j)?;
+                }
+            }
+        }
+        for m in &sg.dp {
+            writeln!(out, "    let mut {}: u16 = 0;", reg(*m))?;
+        }
+        if sg.bd {
+            writeln!(out, "    let mut bd_flag: bool = false;")?;
+            writeln!(out, "    let bd: &mut bool = &mut bd_flag;")?;
+        }
+        for b in &sg.bits {
+            writeln!(out, "    let kb{b}: bool = (A >> {b}) & 1 != 0;", b = b)?;
+        }
+        out.push_str(&sg.text);
+        writeln!(out, "    Seg{} {{", k)?;
+        for (n, _) in &sg.exports {
+            writeln!(out, "        {},", n)?;
+        }
+        for m in &sg.dp {
+            writeln!(out, "        {},", reg(*m))?;
+        }
+        if sg.bd {
+            writeln!(out, "        bd: bd_flag,")?;
+        }
+        writeln!(out, "    }}")?;
+        writeln!(out, "}}\n")?;
+    }
 
     // frame()
     writeln!(
@@ -1052,6 +1352,22 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
         }
     }
     writeln!(out, "    }};")?;
+    // Segment caches: one array per support set, one element per
+    // assignment of that set. Dependencies (strict-subset supports) are
+    // read through the assignment's projection, resolved right here.
+    for (k, sg) in segs.iter().enumerate() {
+        let n_asg = 1usize << sg.bits.len();
+        writeln!(out, "    let sc{}: [Seg{}; {}] = [", k, k, n_asg)?;
+        for i in 0..n_asg {
+            let a = expand(i, &sg.bits);
+            write!(out, "        seg_{}::<{}>(u, g, &p", k, a)?;
+            for j in &sg.deps {
+                write!(out, ", &sc{}[{}]", j, pack(a, &segs[*j].bits))?;
+            }
+            writeln!(out, "),")?;
+        }
+        writeln!(out, "    ];")?;
+    }
     let used: Vec<u32> = (0..6)
         .filter(|k| mentions_ident(&suffix_scan, &format!("kb{}", k)))
         .collect();
@@ -1072,31 +1388,76 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
             .filter(|(j, _)| i >> j & 1 != 0)
             .map(|(_, k)| 1u8 << k)
             .sum();
-        writeln!(out, "    suffix::<{}>(u, g, &p, &osh, out);", b)?;
+        write!(out, "    suffix::<{}>(u, g, &p, &osh", b)?;
+        for (k, sg) in segs.iter().enumerate() {
+            if sg.pass {
+                write!(out, ", &sc{}[{}]", k, pack(b, &sg.bits))?;
+            }
+        }
+        writeln!(out, ", out);")?;
     }
     for _ in 0..fork_count {
         writeln!(out, "    }}")?;
     }
     writeln!(out, "}}\n")?;
 
-    // suffix()
-    writeln!(
+    // suffix(): per-variant residual. Crossing/kb/segment-name binds are
+    // emitted only where the residual or the epilogue reads them; each
+    // dp register starts from the shared prefix value OR the passed
+    // segments' deltas at this variant's projections.
+    write!(
         out,
-        "#[inline(never)]\n\
-         fn suffix<const B: u8>(u: &Uni, g: &G, p: &Pre, osh: &KOutShared, out: &mut impl FnMut(u8, &KOutShared, &KOut, &Dy)) {{"
+        "#[allow(unused_variables)]\n\
+         #[inline(never)]\n\
+         fn suffix<const B: u8>(u: &Uni, g: &G, p: &Pre, osh: &KOutShared"
     )?;
+    for (k, sg) in segs.iter().enumerate() {
+        if sg.pass {
+            write!(out, ", s{k}: &Seg{k}", k = k)?;
+        }
+    }
+    writeln!(out, ", out: &mut impl FnMut(u8, &KOutShared, &KOut, &Dy)) {{")?;
     for name in &crossing {
-        writeln!(out, "    let {} = p.{};", name, name)?;
+        if word_used(&residual_epi, name) {
+            writeln!(out, "    let {} = p.{};", name, name)?;
+        }
     }
     for mask in &reg_masks {
-        writeln!(out, "    let mut {r}: u16 = p.{r};", r = reg(*mask))?;
+        let m = if residual_text.contains(&format!("&mut {})", reg(*mask))) {
+            "mut "
+        } else {
+            ""
+        };
+        write!(out, "    let {m}{r}: u16 = p.{r}", m = m, r = reg(*mask))?;
+        for (k, sg) in segs.iter().enumerate() {
+            if sg.pass && sg.dp.contains(mask) {
+                write!(out, " | s{}.{}", k, reg(*mask))?;
+            }
+        }
+        writeln!(out, ";")?;
     }
-    writeln!(out, "    let mut bd_flag: bool = p.bd;")?;
+    write!(out, "    let mut bd_flag: bool = p.bd")?;
+    for (k, sg) in segs.iter().enumerate() {
+        if sg.pass && sg.bd {
+            write!(out, " | s{}.bd", k)?;
+        }
+    }
+    writeln!(out, ";")?;
     writeln!(out, "    let bd: &mut bool = &mut bd_flag;")?;
     for k in 0..6 {
         writeln!(out, "    let kb{}: bool = (B >> {}) & 1 != 0;", k, k)?;
     }
-    out.push_str(&suf_text);
+    for (k, sg) in segs.iter().enumerate() {
+        if !sg.pass {
+            continue;
+        }
+        for (n, _) in &sg.exports {
+            if word_used(&residual_epi, n) {
+                writeln!(out, "    let {n} = s{k}.{n};", n = n, k = k)?;
+            }
+        }
+    }
+    out.push_str(&residual_text);
     for mi in 0..n_members {
         writeln!(out, "    let dp_of_{}: u16 = {};", mi, member_dp(mi))?;
     }

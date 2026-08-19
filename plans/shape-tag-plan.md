@@ -383,15 +383,37 @@ conservative rule (raw-defined names taint dependents; the census's
 73 over-counted tuple-let outputs). Suffix 120 -> 106 lines; expected
 effect ~1% of process - infrastructure, not the win.
 
-**Stage 2 (the actual M1)**: support-segment emission. Group suffix
-nodes by support set S; emit `seg_S<const A: u8>` computing that
-group once per assignment of S (4x for {0,1}, 16x for {0,1,2,3}, ...),
-cache results in per-assignment structs, and have `suffix::<B>` read
-each group via B's projection onto S. The epilogue half needs the
-same treatment at the OUTPUT level: out-cell exprs have supports too,
-so per-variant row hashing can reuse per-segment column values instead
-of re-evaluating every out expr 64x. Do it on the structured node list
-(the Line streams carry name/ty/expr already), not by re-parsing text.
+**Stage 2 LANDED (2026-08-19, night)**: support-segment emission, on
+the structured `Line` streams. Each post-hoist suffix line gets a
+transitive kb-support set; lines group into `seg_k::<A>` fns computed
+once per assignment of their support in frame() (segments read
+strict-subset segments through emission-time projections; dp/`bd` are
+write-only OR-accumulators in every lane primitive, so segments export
+deltas from zero and `suffix::<B>` ORs in its projections). Tiny
+groups (<3 lines) fold into the cheapest superset segment, but only
+where every reading group can still see the moved binds. On the
+current artifact: 6 segments ([13,41,8,7,19,3] lines at
+2/4/4/8/16/32 evals) + a 15-line full-support residual - suffix node
+evals 6,720 -> ~1,638 per 16-lane row (4.1x), exactly the census
+minimum modulo the tiny-group folds. Measured, same-day A/B at 6 reps
+on `--abstract-bench k2ctl 65`: stage 1 min 13.41s / mean 13.58s,
+stage 2 min 13.06s / mean 13.16s = **-2.6% min / -3.1% mean** (note
+day-to-day drift is larger than this - yesterday's stage-1 reading
+was 14.24s - so only same-day A/Bs count here). perf: artifact
+compute 10.9% -> 4.9% of process (suffix 9.6% -> 3.0%, segs 0.7%,
+frame 1.2%); row accounting byte-identical, memberchecks ok, suite
+553/553. En route: killed three dead `Pre` fields minted by a
+redundant bare-name crossing force-add (their last suffix users were
+stage-1-hoisted).
+
+**Stage 3 (the remaining M1 half)**: the `run_fused` closure -
+prededup `row_keys`, dy rep keying, `append_out` - is now the
+dominant fused-engine cost at 8.5% of process (unchanged by stage 2,
+as scoped). Out-cell columns have supports too: rows can only differ
+across variants in columns whose support distinguishes them, so
+per-variant row hashing in dispatch.rs can reuse per-segment column
+hashes/values instead of rehashing every column 64x. This is
+executor-side (correctness-critical row-key path), not emitter-side.
 
 - Fingerprint story for recipe SETS: hash the member list + fusion pass
   version? (Variant list is deliberately un-fingerprinted today;
