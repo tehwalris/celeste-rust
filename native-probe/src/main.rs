@@ -95,6 +95,7 @@ fn main() {
     let mut emit_shape: Option<(String, u32, String, String)> = None;
     let mut kernel_bench: Option<(String, u32)> = None;
     let mut interp_bench: Option<(String, u32)> = None;
+    let mut frame_diff: Option<(String, u32, String)> = None;
     let mut reps: u32 = 10;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -126,6 +127,12 @@ fn main() {
                 let f: u32 = args.next().expect("FRAME").parse().unwrap();
                 interp_bench = Some((dir, f));
             }
+            "--frame-diff" => {
+                let dir = args.next().expect("--frame-diff needs DIR FRAME OUTDIR");
+                let f: u32 = args.next().expect("FRAME").parse().unwrap();
+                let out = args.next().expect("OUTDIR");
+                frame_diff = Some((dir, f, out));
+            }
             "--kernel-bench" => {
                 let dir = args.next().expect("--kernel-bench needs DIR FRAME");
                 let frame: u32 = args.next().expect("FRAME").parse().unwrap();
@@ -145,6 +152,8 @@ fn main() {
         run_kernel_bench(&dir, frame, reps);
     } else if let Some((dir, frame)) = interp_bench {
         run_interp_bench(&dir, frame, reps);
+    } else if let Some((dir, frame, out)) = frame_diff {
+        run_frame_diff(&dir, frame, &out);
     } else if let Some((dir, frame)) = abstract_bench {
         run_abstract_bench(&dir, frame, reps);
     } else {
@@ -1129,3 +1138,190 @@ fn run_abstract_bench(dir: &str, frame: u32, reps: u32) {
     }
 }
 
+
+/// D0's microscope (plans/dedup-roofline-plan.md): run ONE frame from a
+/// checkpoint under BOTH engines and dump every output lane as a readable
+/// canonical-boundary row, so a key divergence can be read as a VALUE
+/// divergence instead of a hash. The rowkeys sidecar diff located the
+/// 24-row divergence at f25; this names the fields.
+///
+/// Both outputs go through the campaign's own canonicalization
+/// (straddle split -> abstraction -> gc), then each lane is rendered by a
+/// heap walk in id order. Writes `interp.rows` / `compiled.rows` (one line
+/// per lane, sorted) and `interp.shapes` / `compiled.shapes` (the full
+/// shape debug per distinct shape hash) into OUTDIR; diff them with
+/// standard tools.
+fn run_frame_diff(dir: &str, frame: u32, outdir: &str) {
+    use celeste_rust::interpreter::state::State;
+    use celeste_rust::interpreter::value::{HeapValue, MaybeVector, Value};
+    use std::fmt::Write as _;
+
+    // Interpreter side: the CAMPAIGN program, exactly as run_interp_bench.
+    let recipe = celeste_rust::rewrite::recipe::Recipe::load("rewrites.jsonl")
+        .expect("loading rewrites.jsonl (run from the repo root)");
+    let (program, _) = celeste_rust::rewrite::recipe::build(&recipe).expect("building the recipe");
+    celeste_rust::interpreter::vectorize::set_merge_partition_patterns(
+        &program.merge_partition_cells,
+    );
+    let frame_cfg =
+        celeste_rust::interpreter::fixed_env::PreparedCfg::new(program.frame_cfg().clone());
+    let fixed_env = program.fixed_env();
+    let eng = engine();
+
+    let inputs = load_states_any(dir, frame - 1);
+    let lanes_in: usize = inputs.iter().map(|s| s.vector_size).sum();
+    eprintln!(
+        "[frame-diff] f{:03} from f{:03}: {} lanes in {} state(s)",
+        frame,
+        frame - 1,
+        lanes_in,
+        inputs.len()
+    );
+
+    let canon = |states: Vec<State>| -> Vec<State> {
+        let mut out = Vec::new();
+        for s in states {
+            for s2 in celeste_rust::interpreter::abstraction::split_precision_straddles(s) {
+                out.push(celeste_rust::interpreter::abstraction::make_state_abstract(s2));
+            }
+        }
+        celeste_rust::interpreter::vectorize::gc_states(out)
+    };
+
+    let mut out_interp = Vec::new();
+    let mut out_compiled = Vec::new();
+    for st in &inputs {
+        out_interp.extend(
+            celeste_rust::interpreter::glue::interpret_prepared_cfg(
+                &frame_cfg,
+                st.clone(),
+                &fixed_env,
+            )
+            .expect("interpreter frame failed")
+            .into_iter()
+            .map(|(s, _)| s),
+        );
+        out_compiled.extend(eng.run_frame_chunk(st));
+    }
+    let a = canon(out_interp);
+    let b = canon(out_compiled);
+
+    // One line per lane: shape hash prefix + heap walk in id order. The
+    // walk renders vectorizable leaves per lane and everything else (the
+    // shape-carried values) inline, so BOTH key channels are visible.
+    fn render_lanes(states: &[State], rows: &mut Vec<String>) {
+        for state in states {
+            let shape = celeste_rust::interpreter::vectorize::shape_hash_of_state(state);
+            for lane in 0..state.vector_size {
+                let mut line = String::new();
+                write!(line, "shape={:016x}", shape).unwrap();
+                for i in 0..state.heap.len() {
+                    let id = celeste_rust::interpreter::heap::HeapId::from_raw(i);
+                    let Some(hv) = state.heap.get_opt(id) else {
+                        write!(line, " h{}=empty", i).unwrap();
+                        continue;
+                    };
+                    match hv {
+                        HeapValue::Value(v) => {
+                            write!(line, " h{}={}", i, render_value(v, lane)).unwrap()
+                        }
+                        HeapValue::ObjectTable(t) => {
+                            let mut fields: Vec<_> =
+                                t.iter().map(|(k, v)| (k.clone(), *v)).collect();
+                            fields.sort();
+                            write!(line, " h{}=obj{{", i).unwrap();
+                            for (k, v) in fields {
+                                write!(line, "{}:h{},", k, v.raw()).unwrap();
+                            }
+                            line.push('}');
+                        }
+                        HeapValue::ArrayTable(items) => {
+                            write!(line, " h{}=arr{:?}", i, items
+                                .iter()
+                                .map(|x| x.raw())
+                                .collect::<Vec<_>>())
+                            .unwrap()
+                        }
+                        HeapValue::UnknownTable => write!(line, " h{}=unknowntable", i).unwrap(),
+                        HeapValue::Closure(gid, caps) => {
+                            write!(line, " h{}=clos({:?}", i, gid).unwrap();
+                            for c in caps {
+                                write!(line, ",{}", render_value(c, lane)).unwrap();
+                            }
+                            line.push(')');
+                        }
+                        HeapValue::BuiltinFun(name) => {
+                            write!(line, " h{}=builtin({})", i, name).unwrap()
+                        }
+                    }
+                }
+                for (k, v) in state.global_env.iter() {
+                    write!(line, " g:{}=h{}", k, v.raw()).unwrap();
+                }
+                if !state.prints.is_empty() {
+                    write!(line, " prints={:?}", state.prints).unwrap();
+                }
+                rows.push(line);
+            }
+        }
+    }
+
+    fn render_value(v: &Value, lane: usize) -> String {
+        match v {
+            Value::Number(MaybeVector::Scalar(x)) => format!("n:{}", x.to_bits()),
+            Value::Number(MaybeVector::Vector(x)) => format!("n:{}", x[lane].to_bits()),
+            Value::NumberInterval(MaybeVector::Scalar(x)) => {
+                format!("iv:{}..{}", x.low.to_bits(), x.high.to_bits())
+            }
+            Value::NumberInterval(MaybeVector::Vector(x)) => {
+                format!("iv:{}..{}", x[lane].low.to_bits(), x[lane].high.to_bits())
+            }
+            Value::Bool(MaybeVector::Scalar(x)) => format!("b:{}", x),
+            Value::Bool(MaybeVector::Vector(x)) => format!("b:{}", x[lane]),
+            Value::UnknownBool => "ubool".to_string(),
+            Value::String(s) => format!("str:{:?}", s),
+            Value::Nil(hint) => format!("nil:{:?}", hint),
+            Value::Pointer(id) => format!("ptr:h{}", id.raw()),
+            Value::NilPointer(s) => format!("nilptr:{:?}", s),
+            other => format!("other:{:?}", other),
+        }
+    }
+
+    fn write_side(outdir: &str, name: &str, states: &[State]) {
+        let mut rows = Vec::new();
+        render_lanes(states, &mut rows);
+        rows.sort();
+        let n = rows.len();
+        std::fs::write(
+            format!("{}/{}.rows", outdir, name),
+            rows.join("\n") + "\n",
+        )
+        .expect("write rows");
+        let mut shapes = String::new();
+        let mut seen = std::collections::BTreeMap::new();
+        for state in states {
+            let h = celeste_rust::interpreter::vectorize::shape_hash_of_state(state);
+            seen.entry(h)
+                .or_insert_with(|| celeste_rust::interpreter::vectorize::shape_of_state(state));
+        }
+        for (h, s) in &seen {
+            writeln!(shapes, "=== shape {:016x} ===\n{:#?}\n", h, s).unwrap();
+        }
+        std::fs::write(format!("{}/{}.shapes", outdir, name), shapes).expect("write shapes");
+        eprintln!(
+            "[frame-diff] {}: {} lanes, {} state(s), {} distinct shape(s)",
+            name,
+            n,
+            states.len(),
+            seen.len()
+        );
+    }
+
+    std::fs::create_dir_all(outdir).expect("create outdir");
+    write_side(outdir, "interp", &a);
+    write_side(outdir, "compiled", &b);
+    eprintln!(
+        "[frame-diff] wrote {}/{{interp,compiled}}.{{rows,shapes}} - diff with comm/diff",
+        outdir
+    );
+}

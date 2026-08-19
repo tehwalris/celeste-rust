@@ -348,10 +348,76 @@ pub fn coarsen_to(state: State, precision: LadderPrecision) -> State {
 }
 
 pub fn make_state_abstract(state: State) -> State {
-    apply_conservative_widenings(make_state_abstract_spd(
+    erase_provenance_hints(apply_conservative_widenings(make_state_abstract_spd(
         make_state_abstract_rem(state, rem_precision_from_env()),
         spd_precision_from_env(),
-    ))
+    )))
+}
+
+/// Canonicalize provenance strings at the frame boundary: `Nil(Some(hint))`
+/// becomes `Nil(None)` and `NilPointer(name)` becomes `NilPointer("")`.
+///
+/// The strings are diagnostic-only: a hint is BORN loading through a
+/// `NilPointer` (core_interpreter's Load arm) and CONSUMED only in error
+/// messages, and a `NilPointer`'s name likewise reaches nothing but
+/// messages and the hint it mints. Game semantics never read either. But
+/// both sit in the SHAPE HASH (`ValueShape::Nil(hint)` /
+/// `ValueShape::NilPointer(name)`), so two states identical in every
+/// gameplay coordinate were explored as two distinct search rows if they
+/// reached the same nil along different paths.
+///
+/// This is a canonicalization, NOT a widening: the states it merges have
+/// bit-identical concrete semantics, so there is nothing a refinement rung
+/// would need to narrow back.
+///
+/// It is also what makes the compiled engine's exports and the
+/// interpreter's states ONE key space. `compiled::bridge` cannot round-trip
+/// the strings (`AV::Nil` and `AV::NilPtr` carry no payload), so its
+/// exports were hint-less while the interpreter's states were not - the
+/// two searches diverged at the first hinted nil (room (1,0) f25: every
+/// row re-keyed, +24 rows against history; see BENCHMARK_DATA.md
+/// "The 24-row divergence"). Erasing at the boundary makes the erased form
+/// canonical on both paths.
+///
+/// Trajectory-changing: row keys differ from the first hinted nil onward,
+/// which is why FORMAT_VERSION moved to 5.
+pub fn erase_provenance_hints(mut state: State) -> State {
+    // Boundary states carry no local envs (asserted by the bridge and true
+    // at every call site); the heap is the whole story.
+    for i in 0..state.heap.len() {
+        let id = HeapId::from_raw(i);
+        let erased = match state.heap.get_opt(id) {
+            Some(HeapValue::Value(Value::Nil(Some(_)))) => {
+                Some(HeapValue::Value(Value::Nil(None)))
+            }
+            Some(HeapValue::Value(Value::NilPointer(s))) if !s.is_empty() => {
+                Some(HeapValue::Value(Value::NilPointer(String::new())))
+            }
+            Some(HeapValue::Closure(gid, caps))
+                if caps.iter().any(|c| {
+                    matches!(c, Value::Nil(Some(_)))
+                        || matches!(c, Value::NilPointer(s) if !s.is_empty())
+                }) =>
+            {
+                let caps = caps
+                    .iter()
+                    .map(|c| match c {
+                        Value::Nil(Some(_)) => Value::Nil(None),
+                        Value::NilPointer(s) if !s.is_empty() => {
+                            Value::NilPointer(String::new())
+                        }
+                        other => other.clone(),
+                    })
+                    .collect();
+                Some(HeapValue::Closure(gid.clone(), caps))
+            }
+            _ => None,
+        };
+        if let Some(v) = erased {
+            state.heap.set(id, v);
+        }
+    }
+    state
 }
 
 /// Split lanes whose boundary rem interval straddles a bucket boundary of

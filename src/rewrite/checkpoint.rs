@@ -45,7 +45,12 @@ const MAGIC: &[u8; 4] = b"C8TB";
 /// folded once instead of once per lane. Every key in every visited set
 /// changes, so a v3 checkpoint must be refused rather than resumed - its
 /// row ids would refer to keys this build can no longer compute.
-pub const FORMAT_VERSION: u32 = 4;
+/// 4 -> 5: provenance hints (`Nil(Some(_))`, `NilPointer(name)`) are
+/// erased at the frame boundary (`erase_provenance_hints`), so row keys
+/// differ from the first hinted nil onward - room (1,0) diverges at f25.
+/// Not a serde change; the bump exists to refuse pre-erasure checkpoints,
+/// whose trajectories are a (very slightly) different search.
+pub const FORMAT_VERSION: u32 = 5;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Meta {

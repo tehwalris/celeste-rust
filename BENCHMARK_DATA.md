@@ -135,16 +135,58 @@ tier removes that 8.5x directly:
     3,850,608  new
 ```
 
-# Collect-first deopt is a pessimization at depth (2026-08-19)
+# The "24-row divergence" was a hint-erasure re-keying; FIXED (2026-08-19)
+
+The compiled and interpreted H=68 runs' visited sets differed by 24 rows
+(55,958,766 vs 55,958,742). The per-frame rowkeys sidecar diff showed the
+truth was much larger and much cleaner: **identical through f24, entirely
+disjoint key sets from f25 on**, with equal per-frame counts everywhere
+except f25 itself (204 vs 180 new rows - the entire +24).
+
+Cause: at f25 the game first mints `Nil(Some("nil pointer to field
+tile"))`. `compiled::bridge` cannot carry the hint (`AV::Nil` has no
+payload), so compiled exports said `Nil(None)` - a different shape hash,
+hence different `visited_row_keys` for every descendant state forever.
+`native-probe --frame-diff` (new: one frame under both engines, every
+output lane dumped as a readable row) showed the engines' f25 outputs
+were **value-identical, 204 = 204**, once the hint was normalized. The
+semantics never disagreed; an error-message string was search state.
+
+Fix: `erase_provenance_hints` at the frame boundary
+(`make_state_abstract`): `Nil(Some(_))` -> `Nil(None)`,
+`NilPointer(name)` -> `NilPointer("")`. Provenance-only (grep-verified:
+born on loads through a NilPointer, consumed only in messages), so it is
+a canonicalization, not a widening. FORMAT_VERSION 4 -> 5 because keys
+change from the first hinted nil onward; pre-fix checkpoints refuse.
+
+Gate: H=68 A/B under FORMAT 5 - totals equal (55,958,742 both, frontier
+4,979,427 both) and **all 68 frames' rowkeys sidecars set-identical**
+between the two engines. The compiled forward is now the SAME search.
+(On room (1,0) the interpreter's own totals did not move - the hint was
+uniform there - so the historical (1,0) numbers in this file remain
+comparable.)
+
+# Collect-first deopt loses at H=68, but do NOT flip the default (2026-08-19)
 
 `CELESTE_DEOPT_COLLECT_FIRST=1`, which ladder.sh sets, runs every frame
 under the origin-tagged specialized program so a failing state pays one
 run instead of an attempt plus a retry. At H=68 on room (1,0) that trade
-is now backwards: optimistic is **154.70 s against collect-first's
+is backwards: optimistic is **154.70 s against collect-first's
 162.17 s (-4.6%)**, with an identical visited set (55,958,742), identical
 final frontier (4,976,277 lanes) and identical first-win frame (64).
 Failures are ~7% of chunks here, so paying the origin column on 100% of
 them costs more than retrying 7%.
+
+That is a statement about H=68, not about depth. At H=90 on the same
+room, collect-first was an **-18% WIN** (737 s vs 898 s, further down
+this file) - the failure share climbs steeply through the kill/respawn
+frames (v1 re-ran ~5M lanes per frame by f74), and past the crossover
+the origin column is cheaper than the retries. (Those H=90 numbers
+predate task #96's deopt elimination, so the exact crossover has moved,
+but the direction is structural.) So ladder.sh keeps collect-first: the
+ladder exists for deep campaigns, and the fix for the whole trade is
+deferred deopt (K1 in plans/dedup-roofline-plan.md), not a flipped
+default tuned at mid-depth.
 
 # End-to-end forward, per INPUT LANE, and where it goes (2026-08-19)
 

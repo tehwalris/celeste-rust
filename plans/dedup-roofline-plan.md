@@ -229,34 +229,53 @@ function, so this has to be established (or made true) first - and if it
 IS true, a compiled run can stop computing keys two extra times, which is
 worth most of 1,163 ns/input-lane on its own.
 
-### A 24-row divergence exists TODAY
+### The 24-row divergence: FOUND and FIXED (2026-08-19, D0 done)
 
-At H=68 the compiled run's visited set has 55,958,766 rows and the
-interpreted run's has 55,958,742. Same final frontier (4,976,277 lanes),
-same first-win frame (64), but **not the same set**. 24 rows out of 56
-million.
+It was never 24 rows. The per-frame `.rowkeys` sidecar diff showed the
+two runs' key sets were **entirely disjoint from f25 onward** - the
+searches were isomorphic (equal counts every frame) but globally
+re-keyed, and the visited totals happened to land 24 apart because f25
+produced 204 new rows under one keying and 180 under the other.
 
-The obvious suspect was the deopt route - P1 stage 3 made the compiled
-path take the optimistic arm where the interpreter takes collect-first.
-**That is REFUTED**: running the interpreter with collect-first OFF gives
-55,958,742, exactly the collect-first figure. So the extra 24 rows come
-from the compiled engine itself, not from how failures are handled.
+Root cause, pinned by `native-probe --frame-diff` (runs one frame under
+both engines from the same checkpoint and dumps every output lane as a
+readable row): at f25 the game first mints a
+`Nil(Some("nil pointer to field tile"))`. The bridge cannot round-trip
+the hint (`AV::Nil` has no payload), so compiled exports carried
+`Nil(None)` - a different SHAPE HASH, hence different `visited_row_keys`
+for every descendant forever. With the hint normalized away, the two
+engines' f25 output row sets were already **identical, 204 = 204**. The
+engines agreed all along; a diagnostic string was distinguishing search
+states.
 
-Which makes it worse, not better. Something in `Rt2::boundary`, the
-export, or the compile recipe's own program reaches 24 rows the campaign
-recipe does not, somewhere past f40 - the
-`CELESTE_COMPILED_FORWARD=check` gate runs to f40 and passes, and deopt
-does not start until f58. A superset is the sound direction for a forward
-over-approximation, so this is unlikely to be a wrong ANSWER, but it is
-definitely a different SEARCH, and no A/B at depth can be trusted until
-it is explained. Extend the check gate past f58 first; it is the cheapest
-way to bisect.
+Fix: `erase_provenance_hints` in `make_state_abstract` - `Nil(Some(_))`
+-> `Nil(None)` and `NilPointer(name)` -> `NilPointer("")` at the frame
+boundary. Both strings are provenance-only (born on loads through a
+`NilPointer`, consumed only by error messages; grep-verified), so this
+is a canonicalization, not a widening - no rung needed. It also
+pre-empts the same bug one step later: the bridge erases `NilPointer`
+names too, and those sit in the shape hash the same way.
+
+Gate: H=68 A/B re-run under FORMAT_VERSION 5 - visited totals equal
+(55,958,742 both) and **all 68 frames' rowkeys sidecars are
+set-identical** between the compiled and interpreted runs. On room
+(1,0) the interpreter's own totals did not move (the hint was uniform
+across states there), so the change is pure re-keying on this room -
+but hint-distinct twins are possible in general, hence the format bump.
+
+Residue: pre-fix checkpoints refuse to load (FORMAT 4 vs 5) and
+certified campaign artifacts need re-derivation before further deep
+gates use them. Also hardened alongside: a `check`-mode row-set
+mismatch is now a typed `CheckMismatch` error that the optimistic deopt
+arm PROPAGATES instead of catching as a premise failure (it was blind
+at exactly f58+, the frames it was needed for), and the mismatch
+message now prints the differing keys.
 
 ## Order of work
 
 | # | item | why here |
 |---|---|---|
-| **D0** | Explain the 24-row divergence | blocks trusting any deep A/B, including this plan's own gates |
+| **D0** | ~~Explain the 24-row divergence~~ **DONE**: bridge erased nil provenance hints; fixed by erasing them at the boundary (FORMAT 5), gated set-identical at H=68 | blocks trusting any deep A/B, including this plan's own gates |
 | **D1** | One key function: gate `Rt2` keys == `visited_row_keys`, or make them equal | prerequisite for a shared dedup; if it holds, a compiled run stops keying 3x |
 | **D2** | **Dedup microbenchmark, isolated** | establish the ns/row roofline the way K2 established the kernel's |
 | **D3** | Determinism design decision (a) vs (b), with a gate | must precede any integration |

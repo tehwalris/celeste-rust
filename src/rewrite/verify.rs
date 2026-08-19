@@ -1006,6 +1006,24 @@ pub struct CompiledForward {
     check: bool,
 }
 
+/// A `check`-mode row-set mismatch, as its own error type so the optimistic
+/// deopt arm can tell it from a premise failure. Without the distinction a
+/// mismatch on a deopt-eligible chunk is CAUGHT by the arm's catch, logged
+/// as a deopt, and the chunk silently re-run by the interpreter - the gate
+/// reports success while the thing it gates just failed. That is exactly
+/// the frame range (f58+) where the 24-row divergence lives, so the gate
+/// was blind precisely where it was needed.
+#[derive(Debug)]
+struct CheckMismatch(String);
+
+impl std::fmt::Display for CheckMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CheckMismatch {}
+
 impl CompiledForward {
     /// One chunk's frame body. `Ok` carries the compiled engine's output
     /// states, which are NOT the interpreter's states - see the type doc.
@@ -1026,19 +1044,32 @@ impl CompiledForward {
         let got = self.engine.run_frame_chunk(&state);
         let want_keys = self.engine.row_key_set(&reference);
         let got_keys = self.engine.row_key_set(&got);
-        let missing = want_keys.difference(&got_keys).count();
-        let extra = got_keys.difference(&want_keys).count();
-        if missing != 0 || extra != 0 {
-            anyhow::bail!(
+        let missing: Vec<_> = want_keys.difference(&got_keys).collect();
+        let extra: Vec<_> = got_keys.difference(&want_keys).collect();
+        if !missing.is_empty() || !extra.is_empty() {
+            // The keys themselves, because "24 rows differ" was exactly the
+            // level of detail that left the divergence unexplained for a
+            // day. A handful is enough to grep for in a rowkeys sidecar.
+            let fmt_keys = |keys: &[&(u64, u64)]| {
+                keys.iter()
+                    .take(8)
+                    .map(|(lo, hi)| format!("{:016x}{:016x}", lo, hi))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            return Err(anyhow::Error::new(CheckMismatch(format!(
                 "compiled-forward check FAILED on a {}-lane chunk: {} rows the \
-                 interpreter produced are missing from the compiled output, {} \
-                 rows are extra (interpreter {} rows, compiled {} rows)",
+                 interpreter produced are missing from the compiled output \
+                 [{}], {} rows are extra [{}] (interpreter {} rows, compiled \
+                 {} rows)",
                 state.vector_size,
-                missing,
-                extra,
+                missing.len(),
+                fmt_keys(&missing),
+                extra.len(),
+                fmt_keys(&extra),
                 want_keys.len(),
                 got_keys.len(),
-            );
+            ))));
         }
         Ok(got)
     }
@@ -1920,6 +1951,12 @@ fn interpret_state_base(
                 match attempt {
                     Ok(Ok(result)) => new_states.extend(result),
                     Ok(Err(err)) => {
+                        // A check-mode row-set mismatch is the GATE failing,
+                        // not a premise failing - propagate it instead of
+                        // deopting over it. See `CheckMismatch`.
+                        if err.downcast_ref::<CheckMismatch>().is_some() {
+                            return Err(err);
+                        }
                         log_deopt(&mut counters.deopt, &snapshot, &format!("{:#}", err));
                         let (states, plain_lanes) =
                             run_deopt_frame_granular(deopt, frame_cfg, fixed_env, snapshot, true)?;
