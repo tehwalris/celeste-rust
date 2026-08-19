@@ -358,7 +358,40 @@ Two implications for Phase C ordering:
    blocker (see BENCHMARK_DATA.md "The plain path for kernel deopt
    sub-chunks"). M1 remains the next performance lever after that.
 
-## Open questions (for Philippe)
+### M1 scoping (2026-08-19, evening): perf split + kb-support census
+
+perf on `--abstract-bench k2ctl 65` (fused, whole process incl. the
+gate's interpreter chase): `suffix::<B>` monomorphizations 9.6%,
+`run_fused` closure (prededup `row_keys`, dy rep keying, `append_out`)
+8.4%, `frame` (prefix) 1.3%. So the fused work is ~19% of samples and
+the 118-ts gap splits ROUGHLY 50/50 between per-variant suffix compute
+and the per-variant epilogue - M1 must attack both, not just the node
+evaluation.
+
+kb-support census over the 178 suffix let-nodes (textual, so an upper
+bound on hoistability): supports {}: 73, {0,1}: 39, {0,1,2,3}: 19,
+full: 15, {5}: 13, {2,3}: 7, rest small - 11 distinct sets. Naive
+evaluations 178x64 = 11,392/row; support-grouped ~1,691 (6.7x fewer),
+over half of it the 15 full-support nodes.
+
+**Stage 1 LANDED in the emitter** (fuse.rs, after the pre/suf streams
+are built): dependency-based hoist of kb-independent suffix lets (plus
+kb-free zguard/zi_split_at raws - none in the current artifact) into
+the prefix, dp effects commute (one OR-in shared by all variants ==
+64 identical OR-ins). Only 14 of the textual 73 hoist under the
+conservative rule (raw-defined names taint dependents; the census's
+73 over-counted tuple-let outputs). Suffix 120 -> 106 lines; expected
+effect ~1% of process - infrastructure, not the win.
+
+**Stage 2 (the actual M1)**: support-segment emission. Group suffix
+nodes by support set S; emit `seg_S<const A: u8>` computing that
+group once per assignment of S (4x for {0,1}, 16x for {0,1,2,3}, ...),
+cache results in per-assignment structs, and have `suffix::<B>` read
+each group via B's projection onto S. The epilogue half needs the
+same treatment at the OUTPUT level: out-cell exprs have supports too,
+so per-variant row hashing can reuse per-segment column values instead
+of re-evaluating every out expr 64x. Do it on the structured node list
+(the Line streams carry name/ty/expr already), not by re-parsing text.
 
 - Fingerprint story for recipe SETS: hash the member list + fusion pass
   version? (Variant list is deliberately un-fingerprinted today;

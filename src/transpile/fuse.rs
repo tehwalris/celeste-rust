@@ -791,6 +791,96 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
     )?;
     emit_interface(&mut out, &primary.e, &fused_of)?;
 
+    // --- M1 stage 1 (task #152): hoist kb-independent suffix lets ---
+    // The member emitters cut prefix/suffix POSITIONALLY (at the first
+    // button-reading line), so the suffix carries nodes whose reads never
+    // reach a kb bit - identical in all 64 variants, recomputed 64 times
+    // (73 of 178 suffix lets in the 2026-08-19 artifact). Hoist them, in
+    // order, to the end of the prefix. Soundness: a hoisted let reads
+    // only prefix names or earlier hoisted lets (anything defined by a
+    // kb-tainted or unparsed line is treated as tainted, which blocks
+    // its dependents); its dp effect enters the shared registers once
+    // and flows into every variant's copy of `p.dp_m*`, exactly what 64
+    // identical OR-ins produced. Raw lines (guards, bails, splits) are
+    // never hoisted, and any name they define is conservatively tainted.
+    let hoisted = {
+        let idents = |s: &str| -> Vec<String> {
+            let mut v = Vec::new();
+            let mut cur = String::new();
+            for ch in s.chars() {
+                if ch.is_ascii_alphanumeric() || ch == '_' {
+                    cur.push(ch);
+                } else if !cur.is_empty() {
+                    if !cur.chars().next().unwrap().is_ascii_digit() {
+                        v.push(std::mem::take(&mut cur));
+                    } else {
+                        cur.clear();
+                    }
+                }
+            }
+            if !cur.is_empty() && !cur.chars().next().unwrap().is_ascii_digit() {
+                v.push(cur);
+            }
+            v
+        };
+        let mut tainted: BTreeSet<String> =
+            (0..6).map(|k| format!("kb{}", k)).collect();
+        let mut keep: Vec<Line> = Vec::new();
+        let mut hoist: Vec<Line> = Vec::new();
+        for line in std::mem::take(&mut suf) {
+            match &line {
+                Line::Let { name, expr, .. } => {
+                    if idents(expr).iter().any(|w| tainted.contains(w)) {
+                        tainted.insert(name.clone());
+                        keep.push(line);
+                    } else {
+                        hoist.push(line);
+                    }
+                }
+                Line::Raw(text) => {
+                    let t = text.trim_start();
+                    // Splits and guards are pure except their dp/bd
+                    // effect, which commutes with the hoist (see above) -
+                    // a kb-free one moves, and its outputs stay clean.
+                    let kb_free_reads = |s: &str| {
+                        idents(s).iter().all(|w| !tainted.contains(w))
+                    };
+                    if (t.starts_with("zguard(") && kb_free_reads(t))
+                        || (t.starts_with("let (")
+                            && t.contains("zi_split_at(")
+                            && kb_free_reads(t.split('=').nth(1).unwrap_or("")))
+                    {
+                        hoist.push(line);
+                        continue;
+                    }
+                    // Any `let`-bound names in an unhoisted raw line are
+                    // tainted - the raw stays in the suffix, so
+                    // dependents must too.
+                    if let Some(rest) = t.strip_prefix("let ") {
+                        if let Some(binders) = rest.split('=').next() {
+                            for w in idents(binders.split(':').next().unwrap_or("")) {
+                                if w != "mut" {
+                                    tainted.insert(w);
+                                }
+                            }
+                        }
+                    }
+                    keep.push(line);
+                }
+            }
+        }
+        suf = keep;
+        let n = hoist.len();
+        for line in hoist {
+            if let Line::Let { name, .. } = &line {
+                pre_defs.insert(name.clone());
+            }
+            pre.push(line);
+        }
+        n
+    };
+    eprintln!("[fused] hoisted {} kb-independent suffix lets into the prefix", hoisted);
+
     let pre_text = render_lines(&pre);
     let suf_text = render_lines(&suf);
 
