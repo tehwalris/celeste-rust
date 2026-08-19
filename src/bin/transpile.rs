@@ -16,10 +16,26 @@ fn main() -> Result<()> {
     let mut out_path = "crates/celeste-names/src/gen.rs".to_string();
     let mut kernel_recon_flag = false;
     let mut kernel_out: Option<(String, String)> = None;
+    let mut fuse_census: Option<(Vec<String>, String)> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--kernel-recon" => kernel_recon_flag = true,
+            // --fuse-census R1,R2,.. WITNESS: lower each recipe as a
+            // specialization-set member and print the sharing census
+            // (transpile::fuse). Ignores --recipe.
+            "--fuse-census" => {
+                let recipes = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--fuse-census R1,R2,.. WITNESS"))?;
+                let witness = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--fuse-census R1,R2,.. WITNESS"))?;
+                fuse_census = Some((
+                    recipes.split(',').map(|s| s.to_string()).collect(),
+                    witness,
+                ));
+            }
             "--kernel" => {
                 let witness = args.next().ok_or_else(|| anyhow!("--kernel WITNESS OUT"))?;
                 let out = args.next().ok_or_else(|| anyhow!("--kernel WITNESS OUT"))?;
@@ -33,6 +49,20 @@ fn main() -> Result<()> {
             }
             other => out_path = other.to_string(),
         }
+    }
+
+    if let Some((recipes, witness)) = fuse_census {
+        let members: Vec<(String, Program)> = recipes
+            .iter()
+            .map(|path| -> Result<(String, Program)> {
+                let recipe = celeste_rust::rewrite::recipe::Recipe::load(path)?;
+                let (program, _) = celeste_rust::rewrite::recipe::build(&recipe)
+                    .with_context(|| format!("apply {}", path))?;
+                Ok((path.clone(), program))
+            })
+            .collect::<Result<_>>()?;
+        let lowered = celeste_rust::transpile::fuse::lower_members(&members, &witness)?;
+        return celeste_rust::transpile::fuse::census(&lowered);
     }
 
     let program = match &recipe_path {

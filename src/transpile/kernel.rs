@@ -398,6 +398,30 @@ pub fn emit_kernel(program: &Program, witness_path: &str, out_path: &str) -> Res
 /// that nobody re-ran fails a test instead of silently leaving the
 /// committed kernels describing an older frame.
 pub fn emit_kernel_text(program: &Program, witness_path: &str) -> Result<String> {
+    Ok(emit_kernel_parts(program, witness_path)?.0)
+}
+
+/// A member's pure expression graph plus the attributes the
+/// specialization-fusion pass needs (plans/shape-tag-plan.md step 3).
+/// Produced by the SAME walk as the emitted text - there is no second
+/// lowering to drift.
+pub struct KernelGraph {
+    /// Button-independent nodes (run once per fork config).
+    pub pre: Vec<Line>,
+    /// Button-dependent nodes (the monomorphized suffix).
+    pub suf: Vec<Line>,
+    /// Output cells: (cell id, rust type, value expr, button-tainted).
+    pub out_fields: Vec<(u32, &'static str, String, bool)>,
+    /// Open fork-loop depth at the end of the prefix.
+    pub fork_depth: usize,
+    /// The per-lane validity mask variable live at the cut.
+    pub valid_expr: String,
+}
+
+pub(crate) fn emit_kernel_parts(
+    program: &Program,
+    witness_path: &str,
+) -> Result<(String, KernelGraph)> {
     let mut e = Emit {
         witness_len: 0,
         cells: HashMap::new(),
@@ -497,7 +521,7 @@ pub fn emit_kernel_text(program: &Program, witness_path: &str) -> Result<String>
         }
     }
 
-    render(&e)
+    render(e)
 }
 
 /// One instruction of the straight line, evaluated at emit time.
@@ -1291,7 +1315,7 @@ fn call_pure(e: &mut Emit, name: &str, args: &[LocalId]) -> Result<K> {
 }
 
 /// Assemble kernel_gen.rs.
-fn render(e: &Emit) -> Result<String> {
+fn render(e: Emit) -> Result<(String, KernelGraph)> {
     let mut out = String::new();
     writeln!(
         out,
@@ -1967,6 +1991,13 @@ fn render(e: &Emit) -> Result<String> {
         suf_text.lines().count(),
         e.witness_len,
     );
-    Ok(out)
+    let graph = KernelGraph {
+        pre: e.pre,
+        suf: e.suf,
+        out_fields,
+        fork_depth: e.fork_depth,
+        valid_expr: e.valid_expr,
+    };
+    Ok((out, graph))
 }
 
