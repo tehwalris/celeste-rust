@@ -17,6 +17,7 @@ fn main() -> Result<()> {
     let mut kernel_recon_flag = false;
     let mut kernel_out: Option<(String, String)> = None;
     let mut fuse_census: Option<(Vec<String>, String)> = None;
+    let mut fuse_out: Option<(Vec<String>, String, String)> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -36,6 +37,21 @@ fn main() -> Result<()> {
                     witness,
                 ));
             }
+            // --fuse R1,R2,.. WITNESS OUT.rs: emit the fused artifact for
+            // the specialization set (member 0 = the primary). The output
+            // is generated per campaign, never committed (feature `fused`).
+            "--fuse" => {
+                let recipes =
+                    args.next().ok_or_else(|| anyhow!("--fuse R1,R2,.. WITNESS OUT"))?;
+                let witness =
+                    args.next().ok_or_else(|| anyhow!("--fuse R1,R2,.. WITNESS OUT"))?;
+                let out = args.next().ok_or_else(|| anyhow!("--fuse R1,R2,.. WITNESS OUT"))?;
+                fuse_out = Some((
+                    recipes.split(',').map(|s| s.to_string()).collect(),
+                    witness,
+                    out,
+                ));
+            }
             "--kernel" => {
                 let witness = args.next().ok_or_else(|| anyhow!("--kernel WITNESS OUT"))?;
                 let out = args.next().ok_or_else(|| anyhow!("--kernel WITNESS OUT"))?;
@@ -51,8 +67,8 @@ fn main() -> Result<()> {
         }
     }
 
-    if let Some((recipes, witness)) = fuse_census {
-        let members: Vec<(String, Program)> = recipes
+    let load_members = |recipes: &[String]| -> Result<Vec<(String, Program)>> {
+        recipes
             .iter()
             .map(|path| -> Result<(String, Program)> {
                 let recipe = celeste_rust::rewrite::recipe::Recipe::load(path)?;
@@ -60,9 +76,18 @@ fn main() -> Result<()> {
                     .with_context(|| format!("apply {}", path))?;
                 Ok((path.clone(), program))
             })
-            .collect::<Result<_>>()?;
-        let lowered = celeste_rust::transpile::fuse::lower_members(&members, &witness)?;
-        return celeste_rust::transpile::fuse::census(&lowered);
+            .collect()
+    };
+    if let Some((recipes, witness)) = fuse_census {
+        let members = load_members(&recipes)?;
+        return celeste_rust::transpile::fuse::fuse_census(&members, &witness);
+    }
+    if let Some((recipes, witness, out)) = fuse_out {
+        let members = load_members(&recipes)?;
+        let text = celeste_rust::transpile::fuse::emit_fused(&members, &witness)?;
+        std::fs::write(&out, &text).with_context(|| format!("write {}", out))?;
+        eprintln!("wrote {} ({} bytes)", out, text.len());
+        return Ok(());
     }
 
     let program = match &recipe_path {

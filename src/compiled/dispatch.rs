@@ -28,6 +28,14 @@ pub(crate) fn run_chunk_kernel(
     // CELESTE_KERNEL_CLASSES=steady,dash (default: all) - diagnostic
     // knob for bisecting a class kernel against the reference path.
     let mask = kernel_class_mask();
+    // The fused specialization-set kernel covers steady AND dying lanes in
+    // one pass (feature `fused`, artifact generated per campaign); it runs
+    // ahead of the steady class kernel because it strictly extends it.
+    #[cfg(feature = "fused")]
+    if fused::enabled() && fused::run_fused(chunk, ids, done, local) {
+        fused::LANES.fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
+        return true;
+    }
     if mask & 1 != 0 && run_class_kernel_steady(chunk, ids, done, local) {
         KERNEL_HITS[0].fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
         return true;
@@ -228,6 +236,8 @@ static KROWS: [std::sync::atomic::AtomicU64; 2] = [
 ];
 
 pub fn print_kernel_hits() {
+    #[cfg(feature = "fused")]
+    fused::print_stats();
     let v: Vec<u64> = KERNEL_HITS
         .iter()
         .map(|a| a.swap(0, std::sync::atomic::Ordering::Relaxed))
@@ -384,6 +394,166 @@ fn $fname(
 class_kernel_runner!(run_class_kernel_steady, kernel_gen_steady);
 class_kernel_runner!(run_class_kernel_dash, kernel_gen_dash);
 class_kernel_runner!(run_class_kernel_frozen, kernel_gen_frozen);
+
+/// The fused specialization-set runner (plans/shape-tag-plan.md). Same
+/// slice loop as the class-kernel macro above, with one addition: the
+/// fused frame reports, per (config, variant), which lanes each DYING
+/// member covers plus that member's block-uniform boundary tuple. Covered
+/// dying lanes are provably interchangeable per tuple (their boundary
+/// rows are identical), so the runner keeps ONE representative lane per
+/// distinct tuple and routes only representatives through the interpreter
+/// deopt path - the row SET is preserved exactly while the deopt
+/// population drops from every dying lane to a handful per chunk. Lanes
+/// no member covers still deopt individually, loudly counted.
+#[cfg(feature = "fused")]
+mod fused {
+    use super::*;
+    use celeste_kernels::fused_gen_player as fg;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub(super) fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("CELESTE_FUSED").map(|v| v != "0").unwrap_or(true))
+    }
+
+    /// Lanes handled by the fused kernel.
+    pub(super) static LANES: AtomicU64 = AtomicU64::new(0);
+    /// [dying-covered lane events, representatives pushed, uncovered lane events]
+    static DY_STATS: [AtomicU64; 3] =
+        [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+    pub(super) fn print_stats() {
+        let lanes = LANES.swap(0, Ordering::Relaxed);
+        let v: Vec<u64> = DY_STATS.iter().map(|a| a.swap(0, Ordering::Relaxed)).collect();
+        if lanes > 0 || v.iter().any(|x| *x > 0) {
+            eprintln!(
+                "fused: lanes {} dying-covered-events {} reps {} UNCOVERED-events {}",
+                lanes, v[0], v[1], v[2]
+            );
+        }
+    }
+
+    pub(super) fn run_fused(
+        chunk: &runtime2::Rt2,
+        ids: &runtime2::BoundaryIds,
+        done: &mut Vec<runtime2::Rt2>,
+        local: &mut Vec<(runtime2::Rt2, bool)>,
+    ) -> bool {
+        if chunk.shape_hash != fg::SHAPE_HASH {
+            note_miss("fused", "shape", chunk.width);
+            return false;
+        }
+        let Some(uni) = fg::bind(chunk) else {
+            note_miss("fused", "bind", chunk.width);
+            note_bind_failure(chunk, ids, fg::UNI_CELLS);
+            return false;
+        };
+        let g = fg::G { cart: &chunk.cart, cache: &chunk.cache };
+        let mut acc = fg::acc_init(chunk);
+        let plan = key_plan(chunk, ids, fg::KEY_CELLS);
+        let mut seen: rustc_hash::FxHashSet<(u64, u64)> = Default::default();
+        let mut keys = [(0u64, 0u64); kernel::W];
+        let mut deopt_rows: std::collections::BTreeSet<u32> = Default::default();
+        // tuple raw-bits key -> representative lane (chunk index).
+        let mut dy_reps: std::collections::BTreeMap<_, u32> = Default::default();
+        let mut dy_covered: u64 = 0;
+        let mut uncovered: u64 = 0;
+        let mut bd_hit = false;
+        let mut lo = 0usize;
+        while lo < chunk.width && !bd_hit {
+            let n = (chunk.width - lo).min(kernel::W);
+            let width_mask: u16 = if n == kernel::W { 0xffff } else { (1u16 << n) - 1 };
+            let Some(rin) = fg::rows(chunk, lo) else {
+                note_miss("fused", "rows", chunk.width);
+                return false;
+            };
+            fg::frame(&uni, &rin, &g, &mut |_b, osh, kout, dy| {
+                if kout.bd {
+                    bd_hit = true;
+                    return;
+                }
+                let mut covered_any: u16 = 0;
+                for m in 0..fg::N_DY {
+                    covered_any |= dy.covered[m];
+                }
+                // Lanes NO member covers: the interpreter runs them whole.
+                let dead = kout.deopt & !covered_any & kout.valid & width_mask;
+                if dead != 0 {
+                    uncovered += dead.count_ones() as u64;
+                    for i in 0..n {
+                        if dead & (1 << i) != 0 {
+                            deopt_rows.insert((lo + i) as u32);
+                        }
+                    }
+                }
+                // Dying members: one representative per distinct tuple.
+                for m in 0..fg::N_DY {
+                    let mask = dy.covered[m] & width_mask;
+                    if mask == 0 {
+                        continue;
+                    }
+                    dy_covered += mask.count_ones() as u64;
+                    dy_reps
+                        .entry(dy.tuples[m].key())
+                        .or_insert((lo + mask.trailing_zeros() as usize) as u32);
+                }
+                // The primary (steady) member: exactly the class path.
+                let mut live = kout.valid & !kout.deopt & width_mask;
+                if live == 0 {
+                    return;
+                }
+                if prededup_on() {
+                    fg::row_keys(chunk, lo, n, osh, kout, &plan, &mut keys);
+                    for i in 0..n {
+                        if live & (1 << i) != 0 && !seen.insert(keys[i]) {
+                            live &= !(1 << i);
+                        }
+                    }
+                    if live == 0 {
+                        return;
+                    }
+                }
+                let mut ug = false;
+                fg::append_out(&mut acc, chunk, lo, n, live, osh, kout, &mut ug);
+                if ug {
+                    bd_hit = true;
+                }
+            });
+            lo += kernel::W;
+        }
+        if bd_hit {
+            note_miss("fused", "guard", chunk.width);
+            return false;
+        }
+        if acc.width > 0 {
+            let before = acc.width as u64;
+            let out_plan = key_plan(&acc, ids, fg::KEY_CELLS);
+            assert!(
+                out_plan.rem == plan.rem && out_plan.det == plan.det,
+                "key plan changed across the frame: in {:?} out {:?}",
+                plan,
+                out_plan
+            );
+            acc.boundary(ids);
+            KROWS[0].fetch_add(before, std::sync::atomic::Ordering::Relaxed);
+            KROWS[1].fetch_add(acc.width as u64, std::sync::atomic::Ordering::Relaxed);
+            done.push(acc);
+        }
+        DY_STATS[0].fetch_add(dy_covered, Ordering::Relaxed);
+        DY_STATS[1].fetch_add(dy_reps.len() as u64, Ordering::Relaxed);
+        DY_STATS[2].fetch_add(uncovered, Ordering::Relaxed);
+        for lane in dy_reps.values() {
+            deopt_rows.insert(*lane);
+        }
+        if !deopt_rows.is_empty() {
+            let keep: Vec<u32> = deopt_rows.iter().copied().collect();
+            let mut sub = chunk.clone_block();
+            sub.retain_lanes(&keep);
+            local.push((sub, false));
+        }
+        true
+    }
+}
 
 /// A width-`n` copy of lanes [lo, lo+n) of a block (structure shared by
 /// clone, varying columns sliced) - the canvas kernel outputs land on.

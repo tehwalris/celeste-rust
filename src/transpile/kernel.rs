@@ -36,7 +36,7 @@ use crate::rewrite::program::Program;
 /// Emit-time value. `S*` strings are generated VARIABLE NAMES (each IR
 /// instruction result is let-bound), never raw expressions.
 #[derive(Clone, Debug, PartialEq)]
-enum K {
+pub(crate) enum K {
     Nil,
     NilPtr,
     /// Pointer to witness/scratch cell.
@@ -64,7 +64,7 @@ enum K {
 
 /// Emit-time cell content.
 #[derive(Clone, Debug)]
-enum CellT {
+pub(crate) enum CellT {
     Val(K),
     Obj(BTreeMap<String, u32>),
     Arr(Vec<u32>),
@@ -95,7 +95,7 @@ pub enum Line {
     },
 }
 
-fn render_lines(lines: &[Line]) -> String {
+pub(crate) fn render_lines(lines: &[Line]) -> String {
     let mut out = String::new();
     for line in lines {
         match line {
@@ -112,57 +112,57 @@ fn render_lines(lines: &[Line]) -> String {
     out
 }
 
-struct Emit {
+pub(crate) struct Emit {
     /// Number of witness cells (ids below this are boundary state; at or
     /// above are frame-local scratch).
-    witness_len: u32,
-    cells: HashMap<u32, CellT>,
-    globals: HashMap<String, u32>,
-    next_cell: u32,
-    env: HashMap<LocalId, K>,
+    pub(crate) witness_len: u32,
+    pub(crate) cells: HashMap<u32, CellT>,
+    pub(crate) globals: HashMap<String, u32>,
+    pub(crate) next_cell: u32,
+    pub(crate) env: HashMap<LocalId, K>,
     /// Uniform cells bound at runtime: cell id -> kind ("num"|"ival"|"bool").
-    uni: BTreeMap<u32, &'static str>,
+    pub(crate) uni: BTreeMap<u32, &'static str>,
     /// Varying input cells: id -> ("num"|"bool").
-    vary_in: BTreeMap<u32, &'static str>,
+    pub(crate) vary_in: BTreeMap<u32, &'static str>,
     /// Cells written by a Store anywhere in the frame.
-    dirty: BTreeSet<u32>,
-    pre: Vec<Line>,
-    suf: Vec<Line>,
-    n: usize,
+    pub(crate) dirty: BTreeSet<u32>,
+    pub(crate) pre: Vec<Line>,
+    pub(crate) suf: Vec<Line>,
+    pub(crate) n: usize,
     /// name -> rust type of every generated let (for the Pre struct).
-    var_ty: HashMap<String, &'static str>,
+    pub(crate) var_ty: HashMap<String, &'static str>,
     /// Names defined in the prefix (crossing detection).
-    pre_defs: BTreeSet<String>,
-    shape_hash: String,
+    pub(crate) pre_defs: BTreeSet<String>,
+    pub(crate) shape_hash: String,
     /// Cross-block-stable uniform num values from the witness. A fold
     /// that CONSUMES one records a pin: bind() then guards the cell's
     /// runtime value against it (mismatch = the block takes the
     /// interpreter path).
-    stable: HashMap<u32, P8>,
+    pub(crate) stable: HashMap<u32, P8>,
     /// var name -> (known value, uniform cells it derives from).
-    pin_val: HashMap<String, (P8, BTreeSet<u32>)>,
+    pub(crate) pin_val: HashMap<String, (P8, BTreeSet<u32>)>,
     /// Cells whose stable value a fold consumed (bind-time guards).
-    pins: BTreeSet<u32>,
+    pub(crate) pins: BTreeSet<u32>,
     /// __button_states cells: cell id -> button index 0..5. An UnknownBool
     /// loaded from one carries that provenance into `expand` even when it
     /// was freshly minted this frame (mint-store-reload strips the tag).
-    button_cells: HashMap<u32, u8>,
+    pub(crate) button_cells: HashMap<u32, u8>,
     /// Open fork loops (each __split_by_flr on a per-lane interval is a
     /// <=2-way fork emitted as a runtime loop; the rest of the program
     /// nests inside). Render closes this many braces at the end.
-    fork_depth: usize,
+    pub(crate) fork_depth: usize,
     /// Name of the current per-lane validity mask ("ALL" at depth 0).
-    valid_expr: String,
+    pub(crate) valid_expr: String,
     /// Button-TAINT tracking (cross-variant sharing): only instructions
     /// whose value depends on a button land in the x64 suffix; everything
     /// else is hoisted to the shared per-fork-config prefix, which is
     /// sound because an untainted op only reads untainted defs (all in
     /// the prefix) and the emit-time SSA evaluation already captured the
     /// correct pre/post-store cell values.
-    tainted_vars: BTreeSet<String>,
-    tainted_cells: BTreeSet<u32>,
+    pub(crate) tainted_vars: BTreeSet<String>,
+    pub(crate) tainted_cells: BTreeSet<u32>,
     /// Taint of the instruction currently being emitted (routes buffers).
-    cur_tainted: bool,
+    pub(crate) cur_tainted: bool,
 }
 
 impl Emit {
@@ -267,7 +267,27 @@ fn p8(v: &P8) -> String {
 /// which `kbK` button bits a generated suffix can observe, so it must not
 /// match inside a longer name (`kb1` vs `kb12`) - it is a soundness test,
 /// not a formatting nicety.
-fn mentions_ident(hay: &str, needle: &str) -> bool {
+/// Word-boundary occurrence of `name` in `text` (so v1 does not match
+/// inside v17). Used for the Pre-struct crossing detection.
+pub(crate) fn word_used(text: &str, name: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(pos) = text[from..].find(name) {
+        let start = from + pos;
+        let end = start + name.len();
+        let pre_ok =
+            start == 0 || !(bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_');
+        let post_ok =
+            end >= bytes.len() || !(bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_');
+        if pre_ok && post_ok {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
+pub(crate) fn mentions_ident(hay: &str, needle: &str) -> bool {
     let ident_char = |c: char| c.is_alphanumeric() || c == '_';
     let mut from = 0usize;
     while let Some(rel) = hay[from..].find(needle) {
@@ -398,30 +418,16 @@ pub fn emit_kernel(program: &Program, witness_path: &str, out_path: &str) -> Res
 /// that nobody re-ran fails a test instead of silently leaving the
 /// committed kernels describing an older frame.
 pub fn emit_kernel_text(program: &Program, witness_path: &str) -> Result<String> {
-    Ok(emit_kernel_parts(program, witness_path)?.0)
+    render(&emit_walk(program, witness_path)?)
 }
 
-/// A member's pure expression graph plus the attributes the
-/// specialization-fusion pass needs (plans/shape-tag-plan.md step 3).
-/// Produced by the SAME walk as the emitted text - there is no second
-/// lowering to drift.
-pub struct KernelGraph {
-    /// Button-independent nodes (run once per fork config).
-    pub pre: Vec<Line>,
-    /// Button-dependent nodes (the monomorphized suffix).
-    pub suf: Vec<Line>,
-    /// Output cells: (cell id, rust type, value expr, button-tainted).
-    pub out_fields: Vec<(u32, &'static str, String, bool)>,
-    /// Open fork-loop depth at the end of the prefix.
-    pub fork_depth: usize,
-    /// The per-lane validity mask variable live at the cut.
-    pub valid_expr: String,
-}
-
-pub(crate) fn emit_kernel_parts(
-    program: &Program,
-    witness_path: &str,
-) -> Result<(String, KernelGraph)> {
+/// The emit-time WALK alone: evaluate `__frame` against the witness and
+/// return the full emitter state - node lists (`pre`/`suf`), the final
+/// cell topology, taint, pins, output facts. `render` turns one walk into
+/// class-kernel text; the fusion pass (`transpile::fuse`) merges several
+/// members' walks into one fused artifact. One lowering, two consumers -
+/// there is no second walk to drift.
+pub(crate) fn emit_walk(program: &Program, witness_path: &str) -> Result<Emit> {
     let mut e = Emit {
         witness_len: 0,
         cells: HashMap::new(),
@@ -521,7 +527,30 @@ pub(crate) fn emit_kernel_parts(
         }
     }
 
-    render(e)
+    Ok(e)
+}
+
+/// Cells REACHABLE from the globals table in the walk's FINAL heap
+/// topology. For a dying member the player was deleted at emit time
+/// (`__array_table_drop_last`), so its `objects.1.*` cells drop out of
+/// this set: what remains is exactly the data the dead boundary state can
+/// depend on. The fusion pass uses that to prove a member's boundary rows
+/// are block-uniform.
+pub(crate) fn reachable_cells(e: &Emit) -> BTreeSet<u32> {
+    let mut seen: BTreeSet<u32> = BTreeSet::new();
+    let mut stack: Vec<u32> = e.globals.values().copied().collect();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        match e.cells.get(&id) {
+            Some(CellT::Obj(fields)) => stack.extend(fields.values().copied()),
+            Some(CellT::Arr(items)) => stack.extend(items.iter().copied()),
+            Some(CellT::Val(K::Ptr(c))) => stack.push(*c),
+            _ => {}
+        }
+    }
+    seen
 }
 
 /// One instruction of the straight line, evaluated at emit time.
@@ -1314,9 +1343,63 @@ fn call_pure(e: &mut Emit, name: &str, args: &[LocalId]) -> Result<K> {
     }
 }
 
-/// Assemble kernel_gen.rs.
-fn render(e: Emit) -> Result<(String, KernelGraph)> {
-    let mut out = String::new();
+/// Output cells of one walk: `fields` = (cell id, rust type, value expr,
+/// button-tainted) for every dirty original cell; `ubool` = cells ending
+/// the frame as fresh UnknownBools (next frame's button inputs).
+pub(crate) struct OutFields {
+    pub(crate) fields: Vec<(u32, &'static str, String, bool)>,
+    pub(crate) ubool: Vec<u32>,
+}
+
+pub(crate) fn compute_out_fields(e: &Emit) -> Result<OutFields> {
+    // Output struct: dirty original cells (scratch cells never escape).
+    // (cell, rust ty, expr, tainted): tainted outputs differ per button
+    // variant; untainted ones are identical across all 64 and are
+    // reported once per fork config in KOutShared.
+    let mut out_fields: Vec<(u32, &'static str, String, bool)> = Vec::new();
+    let mut out_ubool: Vec<u32> = Vec::new();
+    for id in &e.dirty {
+        // Scratch cells (allocated during the frame) are region-private.
+        if *id >= e.witness_len {
+            continue;
+        }
+        // Button cells end the frame holding NEXT frame's fresh unknowns -
+        // a constant fact, not per-lane data.
+        if let Some(CellT::Val(K::UBool { .. })) = e.cells.get(id) {
+            out_ubool.push(*id);
+            continue;
+        }
+        let Some(CellT::Val(k)) = e.cells.get(id) else { continue };
+        let (ty, expr) = match k {
+            K::ZN(v) => ("ZN", v.clone()),
+            K::ZI(v) => ("ZI", v.clone()),
+            K::ZIP { v, .. } => ("ZI", v.clone()),
+            K::ZB(v) => ("ZB", v.clone()),
+            K::SN(v) => ("P8", v.clone()),
+            K::SI(v) => ("(P8, P8)", v.clone()),
+            K::SB(v) => ("bool", v.clone()),
+            K::NumC(c) => ("P8", p8(c)),
+            K::BoolC(b) => ("bool", format!("{}", b)),
+            K::Nil => continue, // a cell reset to nil is dropped from rows
+            other => bail!("output cell {} holds {:?}", id, other),
+        };
+        let tainted = e
+            .cells
+            .get(id)
+            .map(|c| matches!(c, CellT::Val(k) if e.k_tainted(k)))
+            .unwrap_or(false);
+        out_fields.push((*id, ty, expr, tainted));
+    }
+    Ok(OutFields { fields: out_fields, ubool: out_ubool })
+}
+
+/// The kernel's block-facing interface - everything from the file header
+/// through `row_keys()`. Shared byte-for-byte between the class-kernel
+/// renderer and the fused-artifact emitter (transpile::fuse), which is
+/// the point: the fused artifact IS a class kernel to the dispatcher.
+pub(crate) fn emit_interface(out: &mut String, e: &Emit, of: &OutFields) -> Result<()> {
+    let out_fields = &of.fields;
+    let out_ubool = &of.ubool;
     writeln!(
         out,
         "// GENERATED by `transpile --kernel` (plans/kernel-plan.md). Do not edit.\n\
@@ -1379,47 +1462,9 @@ fn render(e: Emit) -> Result<(String, KernelGraph)> {
     }
     writeln!(out, "];\n")?;
 
-    // Output struct: dirty original cells (scratch cells never escape).
-    // (cell, rust ty, expr, tainted): tainted outputs differ per button
-    // variant; untainted ones are identical across all 64 and are
-    // reported once per fork config in KOutShared.
-    let mut out_fields: Vec<(u32, &'static str, String, bool)> = Vec::new();
-    let mut out_ubool: Vec<u32> = Vec::new();
-    for id in &e.dirty {
-        // Scratch cells (allocated during the frame) are region-private.
-        if *id >= e.witness_len {
-            continue;
-        }
-        // Button cells end the frame holding NEXT frame's fresh unknowns -
-        // a constant fact, not per-lane data.
-        if let Some(CellT::Val(K::UBool { .. })) = e.cells.get(id) {
-            out_ubool.push(*id);
-            continue;
-        }
-        let Some(CellT::Val(k)) = e.cells.get(id) else { continue };
-        let (ty, expr) = match k {
-            K::ZN(v) => ("ZN", v.clone()),
-            K::ZI(v) => ("ZI", v.clone()),
-            K::ZIP { v, .. } => ("ZI", v.clone()),
-            K::ZB(v) => ("ZB", v.clone()),
-            K::SN(v) => ("P8", v.clone()),
-            K::SI(v) => ("(P8, P8)", v.clone()),
-            K::SB(v) => ("bool", v.clone()),
-            K::NumC(c) => ("P8", p8(c)),
-            K::BoolC(b) => ("bool", format!("{}", b)),
-            K::Nil => continue, // a cell reset to nil is dropped from rows
-            other => bail!("output cell {} holds {:?}", id, other),
-        };
-        let tainted = e
-            .cells
-            .get(id)
-            .map(|c| matches!(c, CellT::Val(k) if e.k_tainted(k)))
-            .unwrap_or(false);
-        out_fields.push((*id, ty, expr, tainted));
-    }
     writeln!(out, "/// Button-independent outputs: one per fork config.")?;
     writeln!(out, "pub struct KOutShared {{")?;
-    for (id, ty, _, tainted) in &out_fields {
+    for (id, ty, _, tainted) in out_fields {
         if !*tainted {
             writeln!(out, "    pub c{}: {},", id, ty)?;
         }
@@ -1431,14 +1476,14 @@ fn render(e: Emit) -> Result<(String, KernelGraph)> {
     writeln!(out, "    pub valid: u16,")?;
     writeln!(out, "    pub deopt: u16,")?;
     writeln!(out, "    pub bd: bool,")?;
-    for (id, ty, _, tainted) in &out_fields {
+    for (id, ty, _, tainted) in out_fields {
         if *tainted {
             writeln!(out, "    pub c{}: {},", id, ty)?;
         }
     }
     writeln!(out, "}}\n")?;
     writeln!(out, "pub const OUT_CELLS: &[u32] = &[")?;
-    for (id, _, _, _) in &out_fields {
+    for (id, _, _, _) in out_fields {
         writeln!(out, "    {},", id)?;
     }
     writeln!(out, "];\n")?;
@@ -1448,7 +1493,7 @@ fn render(e: Emit) -> Result<(String, KernelGraph)> {
          /// frame's button inputs); the boundary writes UBool, no data."
     )?;
     writeln!(out, "pub const OUT_UBOOL_CELLS: &[u32] = &[")?;
-    for id in &out_ubool {
+    for id in out_ubool {
         writeln!(out, "    {},", id)?;
     }
     writeln!(out, "];\n")?;
@@ -1536,7 +1581,7 @@ fn render(e: Emit) -> Result<(String, KernelGraph)> {
          /// (the block already carries the input row values).\n\
          pub fn apply(sh: &KOutShared, kv: &KOut, b: &mut Rt2, n: usize) {{"
     )?;
-    for (id, ty, _, tainted) in &out_fields {
+    for (id, ty, _, tainted) in out_fields {
         let src = if *tainted { "kv" } else { "sh" };
         match *ty {
             "ZN" => writeln!(
@@ -1589,7 +1634,7 @@ fn render(e: Emit) -> Result<(String, KernelGraph)> {
          \x20   acc.cols = chunk.cols.clone();\n\
          \x20   acc.shape_hash = chunk.shape_hash;"
     )?;
-    for (id, ty, _, tainted) in &out_fields {
+    for (id, ty, _, tainted) in out_fields {
         match (*ty, *tainted) {
             ("ZN", _) | ("P8", true) => writeln!(out, "    acc.cols[{}] = Col::N(Vec::new());", id)?,
             ("ZI", _) | ("(P8, P8)", true) => {
@@ -1634,7 +1679,7 @@ fn render(e: Emit) -> Result<(String, KernelGraph)> {
          \x20   for i in 0..n {{\n\
          \x20       if live & (1 << i) == 0 {{ continue; }}"
     )?;
-    for (id, ty, _, tainted) in &out_fields {
+    for (id, ty, _, tainted) in out_fields {
         let src = if *tainted { "kv" } else { "sh" };
         match *ty {
             "ZN" => writeln!(
@@ -1734,7 +1779,7 @@ fn render(e: Emit) -> Result<(String, KernelGraph)> {
     // KEY_CELLS (built from Rt2::mark_walk) and the generated code
     // checks the types it can handle.
     let mut key_cells: Vec<(u32, &'static str, bool)> = Vec::new();
-    for (id, ty, _, tainted) in &out_fields {
+    for (id, ty, _, tainted) in out_fields {
         key_cells.push((*id, ty, *tainted));
     }
     for (id, kind) in &e.vary_in {
@@ -1825,25 +1870,17 @@ fn render(e: Emit) -> Result<(String, KernelGraph)> {
          }}\n"
     )?;
 
+    Ok(())
+}
+
+/// Assemble kernel_gen.rs.
+fn render(e: &Emit) -> Result<String> {
+    let mut out = String::new();
+    let of = compute_out_fields(e)?;
+    emit_interface(&mut out, e, &of)?;
+    let out_fields = &of.fields;
     // Pre struct: prefix values the suffix reads (word-boundary search,
     // so v1 does not match inside v17).
-    let word_used = |text: &str, name: &str| -> bool {
-        let bytes = text.as_bytes();
-        let mut from = 0;
-        while let Some(pos) = text[from..].find(name) {
-            let start = from + pos;
-            let end = start + name.len();
-            let pre_ok = start == 0
-                || !(bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_');
-            let post_ok =
-                end >= bytes.len() || !(bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_');
-            if pre_ok && post_ok {
-                return true;
-            }
-            from = end;
-        }
-        false
-    };
     let pre_text = render_lines(&e.pre);
     let suf_text = render_lines(&e.suf);
     let mut crossing: BTreeSet<String> = BTreeSet::new();
@@ -1853,7 +1890,7 @@ fn render(e: Emit) -> Result<(String, KernelGraph)> {
         }
     }
     // The out_fields' exprs referenced from the suffix epilogue also cross.
-    for (_, _, expr, _) in &out_fields {
+    for (_, _, expr, _) in out_fields {
         if e.pre_defs.contains(expr) {
             crossing.insert(expr.clone());
         }
@@ -1890,7 +1927,7 @@ fn render(e: Emit) -> Result<(String, KernelGraph)> {
     writeln!(out, "        bd: *bd,")?;
     writeln!(out, "    }};")?;
     writeln!(out, "    let osh = KOutShared {{")?;
-    for (id, _, expr, tainted) in &out_fields {
+    for (id, _, expr, tainted) in out_fields {
         if !*tainted {
             writeln!(out, "        c{}: {},", id, expr)?;
         }
@@ -1909,7 +1946,7 @@ fn render(e: Emit) -> Result<(String, KernelGraph)> {
     // tainted OUT FIELD with no suffix instruction behind it (gate f35,
     // 2026-08-18: 1358 rows missing at f37).
     let mut suffix_text = suf_text.clone();
-    for (id, _, expr, tainted) in &out_fields {
+    for (id, _, expr, tainted) in out_fields {
         if *tainted {
             suffix_text.push('\n');
             suffix_text.push_str(expr);
@@ -1973,7 +2010,7 @@ fn render(e: Emit) -> Result<(String, KernelGraph)> {
     writeln!(out, "        valid: p.valid,")?;
     writeln!(out, "        deopt: dp,")?;
     writeln!(out, "        bd: *bd,")?;
-    for (id, _, expr, tainted) in &out_fields {
+    for (id, _, expr, tainted) in out_fields {
         if *tainted {
             writeln!(out, "        c{}: {},", id, expr)?;
         }
@@ -1991,13 +2028,6 @@ fn render(e: Emit) -> Result<(String, KernelGraph)> {
         suf_text.lines().count(),
         e.witness_len,
     );
-    let graph = KernelGraph {
-        pre: e.pre,
-        suf: e.suf,
-        out_fields,
-        fork_depth: e.fork_depth,
-        valid_expr: e.valid_expr,
-    };
-    Ok((out, graph))
+    Ok(out)
 }
 

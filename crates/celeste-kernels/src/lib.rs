@@ -29,3 +29,11 @@
 pub mod kernel_gen_dash;
 pub mod kernel_gen_frozen;
 pub mod kernel_gen_steady;
+
+/// The fused specialization-set artifact (plans/shape-tag-plan.md): the
+/// steady member plus the dying members in one kernel, per-member deopt.
+/// GENERATED PER CAMPAIGN (`transpile --fuse`), gitignored, feature-gated:
+/// unlike the class kernels above there is no single canonical member
+/// list to check in, and the staleness gate does not cover it.
+#[cfg(feature = "fused")]
+pub mod fused_gen_player;

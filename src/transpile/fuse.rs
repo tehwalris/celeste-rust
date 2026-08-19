@@ -1,69 +1,117 @@
-//! Specialization-set fusion (plans/shape-tag-plan.md, step 3).
+//! Specialization-set FUSION (plans/shape-tag-plan.md, step 3/4).
 //!
-//! v1: the SHARING CENSUS - lower every member of a specialization set
-//! through the kernel emitter's walk (`KernelGraph`), value-number the
-//! `Line::Let` nodes globally, and report how much of the members' work
-//! is shared. This is the measurement that steers the fusion emission
-//! (BENCHMARK_DATA.md "Fusion sharing census": {steady, dying-spikes,
-//! dying-fall} fuse to 919 distinct nodes, +5.5% over steady alone), and
-//! the value-numbering core is the same one the fused-artifact emission
-//! will use.
+//! Input: n members of one specialization set - premise-specialized
+//! recipes over the SAME shape witness (member 0 is the PRIMARY, whose
+//! boundary path materializes rows; the rest are "dying"-style members
+//! whose boundary rows are provably block-uniform). Each member lowers
+//! through the kernel emitter's walk (`kernel::emit_walk`); this module
+//! value-numbers the members' nodes against ONE shared table and emits a
+//! SINGLE fused kernel artifact:
 //!
-//! Numbering is CANONICAL-SEQUENTIAL: an expression's identity is its
-//! operator text with every known variable replaced by its own canonical
-//! id; anything unrecognized (witness field accesses `u.cN`/`rin.cN`,
-//! button bits `kbK`, constants, fork configs `c0`/`c1`) is a leaf shared
-//! across members by construction. The `&mut dp` side-effect argument is
-//! stripped - per-member deopt masks are the fusion output's job, not an
-//! identity. One genuinely divergent leaf therefore poisons its whole
-//! downstream cone, so shared counts are LOWER bounds.
+//!   - shared nodes once; a node reachable from a strict subset of
+//!     members routes its deopt side effects to a MEMBER-SET register
+//!     (`dp_m{bitmask}`), so each member's coverage mask is the OR of
+//!     the registers whose set contains it;
+//!   - guard-as-selector is IMPLICIT: a lane belongs to the first member
+//!     (fixed priority order = argument order) whose own deopt mask is
+//!     clear. Complementary guards (the kill branch pinned false in
+//!     steady, true in dy-spikes) make coverage disjoint where the
+//!     selector value is known; lanes no member covers deopt to the
+//!     interpreter, loudly counted. The plan's static truth-table check
+//!     is subsumed by that runtime count plus the H=68 set-identity gate.
+//!   - non-primary members produce NO materialization code. Their
+//!     boundary rows are proven block-uniform at fuse time (`reachable_
+//!     cells` of the member's final heap topology contains no per-lane
+//!     data - the deleted player's cells dropped out), so the EXECUTOR
+//!     collapses covered lanes to one representative per distinct
+//!     uniform-output tuple and routes only representatives through the
+//!     existing interpreter deopt path. Row sets are preserved exactly:
+//!     dropped lanes' rows are member-certified identical to the
+//!     representative's.
+//!
+//! Anything this pass cannot prove is REFUSED with an error at emission
+//! time - there is no partially-fused output.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt::Write as _;
 
-use anyhow::Result;
+use anyhow::{anyhow, bail, Result};
 
-use super::kernel::{emit_kernel_parts, KernelGraph, Line};
+use super::kernel::{
+    compute_out_fields, emit_interface, emit_walk, mentions_ident, reachable_cells, render_lines,
+    word_used, Emit, Line, OutFields,
+};
 use crate::rewrite::program::Program;
 
-/// One member: a label plus its lowered graph.
-pub struct Member {
-    pub label: String,
-    pub graph: KernelGraph,
+/// Placeholder the renderable form carries where `, &mut dp` sat; the
+/// emitter substitutes the node's member-set register.
+const DP: &str = "__DP__";
+
+/// One value node of the shared graph.
+struct NodeDef {
+    ty: &'static str,
+    /// Canonical renderable expr: operands as `<id>`, dp as `__DP__`.
+    render: String,
+    /// Which members contain this node (bit i = member i).
+    members: u8,
+    has_dp: bool,
 }
 
-/// Lower `(label, program)` members against one shape witness.
-pub fn lower_members(
-    members: &[(String, Program)],
-    witness_path: &str,
-) -> Result<Vec<Member>> {
-    members
-        .iter()
-        .map(|(label, program)| {
-            let (_, graph) = emit_kernel_parts(program, witness_path)?;
-            Ok(Member { label: label.clone(), graph })
-        })
-        .collect()
+/// A structural item of one member's line stream, in stream order.
+enum PItem {
+    Node(u32),
+    /// `zguard(op, &mut dp)` - op by canonical id.
+    Guard(u32),
+    /// A `*bd = true` statement - by canonical text id.
+    Bail(u32),
+    /// `for cK { ... zi_fork_flr ... }` opening group - fork node id.
+    ForkOpen(u32),
+    /// `let (v, v_pt) = zi_split_at(op, at, &mut dp)` - split node id.
+    SplitAt(u32),
 }
 
-/// Canonicalize one member's nodes; returns the set of canonical ids its
-/// `Let` nodes produce (interning into the shared table).
-fn number_member(
-    graph: &KernelGraph,
-    interned: &mut HashMap<String, u32>,
-) -> Vec<u32> {
-    // var name -> its node's canonical id, per member.
-    let mut vn: HashMap<String, u32> = HashMap::new();
-    let mut out = Vec::new();
-    for line in graph.pre.iter().chain(graph.suf.iter()) {
-        let Line::Let { name, expr, .. } = line else { continue };
-        let stripped = expr.replace(", &mut dp", "");
-        let canon = canonicalize(&stripped, &vn);
-        let next = interned.len() as u32;
-        let id = *interned.entry(canon).or_insert(next);
-        vn.insert(name.clone(), id);
-        out.push(id);
+struct ForkDef {
+    depth: usize,
+    op: u32,
+}
+
+struct SplitDef {
+    op: u32,
+    at: String,
+}
+
+/// The shared numbering across all members.
+struct Ctx {
+    intern: HashMap<String, u32>,
+    nodes: BTreeMap<u32, NodeDef>,
+    forks: BTreeMap<u32, ForkDef>,
+    splits: BTreeMap<u32, SplitDef>,
+    /// Guarded operand id -> member set.
+    guards: BTreeMap<u32, u8>,
+    /// Bail canonical text id -> (renderable text, member set).
+    bails: BTreeMap<u32, (String, u8)>,
+}
+
+impl Ctx {
+    fn intern(&mut self, canon: &str) -> u32 {
+        let next = self.intern.len() as u32;
+        *self.intern.entry(canon.to_string()).or_insert(next)
     }
-    out
+}
+
+/// One parsed member.
+struct PMember {
+    label: String,
+    e: Emit,
+    of: OutFields,
+    /// Pre items split into fork segments: segment k = items before the
+    /// k-th fork open; the fork open itself starts segment k+1.
+    pre_segs: Vec<Vec<PItem>>,
+    suf: Vec<PItem>,
+    /// r_cN input-load lines, verbatim (must match across members).
+    loads: Vec<String>,
+    /// member-local var name -> canonical id.
+    vn: HashMap<String, u32>,
 }
 
 /// Replace every whole identifier that has a canonical id with `<id>`.
@@ -97,19 +145,226 @@ fn canonicalize(expr: &str, vn: &HashMap<String, u32>) -> String {
     out
 }
 
-/// The census: per-member node counts, pairwise sharing, and the union.
-pub fn census(members: &[Member]) -> Result<()> {
-    let mut interned: HashMap<String, u32> = HashMap::new();
-    let sets: Vec<(String, std::collections::BTreeSet<u32>, usize)> = members
+/// Substitute `<id>` operand refs with fused names `n{id}`. Strict: only
+/// `<` + digits + `>` is a ref (comparison operators pass through - a
+/// bare `< 123>` cannot occur, constants render as `P8::from_raw(..)`).
+fn fused_expr(render: &str) -> String {
+    let mut out = String::with_capacity(render.len());
+    let bytes = render.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > i + 1 && j < bytes.len() && bytes[j] == b'>' {
+                out.push('n');
+                out.push_str(&render[i + 1..j]);
+                i = j + 1;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// Parse one member's walk into the shared numbering. `mi` = member index.
+fn parse_member(label: &str, e: Emit, mi: usize, ctx: &mut Ctx) -> Result<PMember> {
+    let of = compute_out_fields(&e)?;
+    let mbit = 1u8 << mi;
+    let mut vn: HashMap<String, u32> = HashMap::new();
+    let mut loads: Vec<String> = Vec::new();
+    let mut pre_segs: Vec<Vec<PItem>> = vec![Vec::new()];
+    let mut suf: Vec<PItem> = Vec::new();
+
+    // The fork group is 6 consecutive Raw lines; track how many of the
+    // fixed header lines remain to swallow after a fork opening.
+    for (region, lines) in [(0u8, &e.pre), (1u8, &e.suf)] {
+        let mut iter = lines.iter().peekable();
+        while let Some(line) = iter.next() {
+            let items: &mut Vec<PItem> = if region == 0 {
+                pre_segs.last_mut().unwrap()
+            } else {
+                &mut suf
+            };
+            match line {
+                Line::Let { name, ty, expr } => {
+                    let stripped = expr.replace(", &mut dp", "");
+                    let has_dp = stripped.len() != expr.len();
+                    let canon = canonicalize(&stripped, &vn);
+                    let id = ctx.intern(&canon);
+                    let render = canonicalize(&expr.replace(", &mut dp", &format!(", &mut {}", DP)), &vn);
+                    // The same canonical node may recur across regions
+                    // (constants, untainted CSE); lockstep emission places
+                    // it at its first - pre-most - encounter, which is
+                    // sound: a pre-emitted node the suffix reads becomes a
+                    // crossing var, and an untainted node's dp effect is
+                    // variant-independent.
+                    match ctx.nodes.get_mut(&id) {
+                        Some(def) => {
+                            if def.ty != *ty || def.render != render {
+                                bail!(
+                                    "member {} node {} ({}) conflicts with an earlier member's \
+                                     (ty {} vs {})",
+                                    label, id, name, ty, def.ty
+                                );
+                            }
+                            def.members |= mbit;
+                        }
+                        None => {
+                            ctx.nodes.insert(id, NodeDef { ty, render, members: mbit, has_dp });
+                        }
+                    }
+                    vn.insert(name.clone(), id);
+                    items.push(PItem::Node(id));
+                }
+                Line::Raw(s) => {
+                    if s.starts_with("let r_c") {
+                        loads.push(s.clone());
+                    } else if let Some(rest) = s.strip_prefix("zguard(") {
+                        let opname = rest
+                            .strip_suffix(", &mut dp);")
+                            .ok_or_else(|| anyhow!("unparsed guard {:?}", s))?;
+                        let op = *vn
+                            .get(opname)
+                            .ok_or_else(|| anyhow!("guard on unknown var {:?}", s))?;
+                        *ctx.guards.entry(op).or_insert(0) |= mbit;
+                        items.push(PItem::Guard(op));
+                    } else if s.contains("*bd = true") {
+                        let render = canonicalize(s, &vn);
+                        let id = ctx.intern(&format!("bail:{}", render));
+                        ctx.bails.entry(id).or_insert((render, 0)).1 |= mbit;
+                        items.push(PItem::Bail(id));
+                    } else if s.starts_with("for c") && s.ends_with(" in 0..2usize {") {
+                        if region != 0 {
+                            bail!("member {}: fork in the button suffix", label);
+                        }
+                        // Swallow the fixed header and the three tail lines.
+                        for want in ["let mut dp = dp;", "let mut bd_l: bool = *bd;", "let bd: &mut bool = &mut bd_l;"] {
+                            match iter.next() {
+                                Some(Line::Raw(t)) if t == want => {}
+                                other => bail!("member {}: fork header line {:?}, wanted {:?}", label, other.map(|l| format!("{:?}", l)), want),
+                            }
+                        }
+                        let fork_line = match iter.next() {
+                            Some(Line::Raw(t)) if t.contains("zi_fork_flr(") => t.clone(),
+                            other => bail!("member {}: missing zi_fork_flr after fork open ({:?})", label, other.map(|l| format!("{:?}", l))),
+                        };
+                        // let (vN, vN_fv): (ZI, u16) = zi_fork_flr(vM, cK, &mut dp);
+                        let name = fork_line
+                            .strip_prefix("let (")
+                            .and_then(|t| t.split(',').next())
+                            .ok_or_else(|| anyhow!("unparsed fork {:?}", fork_line))?
+                            .to_string();
+                        let args = fork_line
+                            .split("zi_fork_flr(")
+                            .nth(1)
+                            .and_then(|t| t.strip_suffix(", &mut dp);"))
+                            .ok_or_else(|| anyhow!("unparsed fork {:?}", fork_line))?;
+                        let mut parts = args.split(", ");
+                        let opname = parts.next().unwrap();
+                        let cfg = parts.next().ok_or_else(|| anyhow!("unparsed fork {:?}", fork_line))?;
+                        let depth: usize = cfg
+                            .strip_prefix('c')
+                            .and_then(|d| d.parse().ok())
+                            .ok_or_else(|| anyhow!("unparsed fork config {:?}", fork_line))?;
+                        let op = *vn
+                            .get(opname)
+                            .ok_or_else(|| anyhow!("fork on unknown var {:?}", fork_line))?;
+                        let id = ctx.intern(&format!("fork(c{}, <{}>)", depth, op));
+                        let fv = ctx.intern(&format!("fork_fv(c{}, <{}>)", depth, op));
+                        ctx.forks.entry(id).or_insert(ForkDef { depth, op });
+                        vn.insert(name.clone(), id);
+                        vn.insert(format!("{}_fv", name), fv);
+                        // valid line + continue line.
+                        match iter.next() {
+                            Some(Line::Raw(t)) if t.starts_with(&format!("let valid{}: u16 = ", depth)) => {}
+                            other => bail!("member {}: missing valid after fork ({:?})", label, other.map(|l| format!("{:?}", l))),
+                        }
+                        match iter.next() {
+                            Some(Line::Raw(t)) if t == &format!("if valid{} == 0 {{ continue; }}", depth) => {}
+                            other => bail!("member {}: missing continue after fork ({:?})", label, other.map(|l| format!("{:?}", l))),
+                        }
+                        pre_segs.last_mut().unwrap().push(PItem::ForkOpen(id));
+                        pre_segs.push(Vec::new());
+                    } else if s.contains("zi_split_at(") {
+                        // let (vN, vN_pt): (ZI, u16) = zi_split_at(vM, P8, &mut dp);
+                        let name = s
+                            .strip_prefix("let (")
+                            .and_then(|t| t.split(',').next())
+                            .ok_or_else(|| anyhow!("unparsed split {:?}", s))?
+                            .to_string();
+                        let args = s
+                            .split("zi_split_at(")
+                            .nth(1)
+                            .and_then(|t| t.strip_suffix(", &mut dp);"))
+                            .ok_or_else(|| anyhow!("unparsed split {:?}", s))?;
+                        let (opname, at) = args
+                            .split_once(", ")
+                            .ok_or_else(|| anyhow!("unparsed split {:?}", s))?;
+                        let op = *vn
+                            .get(opname)
+                            .ok_or_else(|| anyhow!("split on unknown var {:?}", s))?;
+                        let id = ctx.intern(&format!("split_at(<{}>, {})", op, at));
+                        let pt = ctx.intern(&format!("split_at_pt(<{}>, {})", op, at));
+                        ctx.splits.entry(id).or_insert(SplitDef { op, at: at.to_string() });
+                        vn.insert(name.clone(), id);
+                        vn.insert(format!("{}_pt", name), pt);
+                        items.push(PItem::SplitAt(id));
+                    } else {
+                        bail!("member {}: unclassified raw line {:?}", label, s);
+                    }
+                }
+            }
+        }
+    }
+    Ok(PMember { label: label.to_string(), e, of, pre_segs, suf, loads, vn })
+}
+
+fn lower(members: &[(String, Program)], witness_path: &str, ctx: &mut Ctx) -> Result<Vec<PMember>> {
+    let mut out = Vec::new();
+    for (mi, (label, program)) in members.iter().enumerate() {
+        if mi >= 8 {
+            bail!("more than 8 members - member sets are u8 bitmasks");
+        }
+        let e = emit_walk(program, witness_path)?;
+        out.push(parse_member(label, e, mi, ctx)?);
+    }
+    Ok(out)
+}
+
+/// The sharing census: per-member node counts, pairwise sharing, union.
+pub fn fuse_census(members: &[(String, Program)], witness_path: &str) -> Result<()> {
+    let mut ctx = Ctx {
+        intern: HashMap::new(),
+        nodes: BTreeMap::new(),
+        forks: BTreeMap::new(),
+        splits: BTreeMap::new(),
+        guards: BTreeMap::new(),
+        bails: BTreeMap::new(),
+    };
+    let pms = lower(members, witness_path, &mut ctx)?;
+    let sets: Vec<(String, BTreeSet<u32>, usize)> = pms
         .iter()
-        .map(|m| {
-            let ids = number_member(&m.graph, &mut interned);
-            let n = ids.len();
-            (m.label.clone(), ids.into_iter().collect(), n)
+        .enumerate()
+        .map(|(mi, pm)| {
+            let mbit = 1u8 << mi;
+            let ids: Vec<u32> = ctx
+                .nodes
+                .iter()
+                .filter(|(_, d)| d.members & mbit != 0)
+                .map(|(id, _)| *id)
+                .collect();
+            let n: usize = pm.pre_segs.iter().map(|s| s.len()).sum::<usize>()
+                + pm.suf.len();
+            (pm.label.clone(), ids.into_iter().collect(), n)
         })
         .collect();
     for (label, set, n) in &sets {
-        println!("{}: {} nodes, {} distinct", label, n, set.len());
+        println!("{}: {} items, {} distinct nodes", label, n, set.len());
     }
     for i in 0..sets.len() {
         for j in i + 1..sets.len() {
@@ -117,8 +372,8 @@ pub fn census(members: &[Member]) -> Result<()> {
             println!("{} n {}: {} shared", sets[i].0, sets[j].0, shared);
         }
     }
-    let mut union = std::collections::BTreeSet::new();
-    let mut all: Option<std::collections::BTreeSet<u32>> = None;
+    let mut union: BTreeSet<u32> = BTreeSet::new();
+    let mut all: Option<BTreeSet<u32>> = None;
     for (_, set, _) in &sets {
         union.extend(set.iter().copied());
         all = Some(match all {
@@ -133,4 +388,586 @@ pub fn census(members: &[Member]) -> Result<()> {
         sets.iter().map(|(_, s, _)| s.len()).sum::<usize>()
     );
     Ok(())
+}
+
+/// Emit the fused artifact. Member 0 is the primary (its boundary path
+/// materializes rows); the rest must have block-uniform boundary rows.
+pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<String> {
+    if members.len() < 2 {
+        bail!("fusion needs at least two members");
+    }
+    let mut ctx = Ctx {
+        intern: HashMap::new(),
+        nodes: BTreeMap::new(),
+        forks: BTreeMap::new(),
+        splits: BTreeMap::new(),
+        guards: BTreeMap::new(),
+        bails: BTreeMap::new(),
+    };
+    let pms = lower(members, witness_path, &mut ctx)?;
+    let n_members = pms.len();
+    let all_mask: u8 = ((1u16 << n_members) - 1) as u8;
+    let primary = &pms[0];
+
+    // --- interface premises: one bind serves every member ---
+    for pm in &pms[1..] {
+        if pm.e.shape_hash != primary.e.shape_hash {
+            bail!("member {} shape hash differs", pm.label);
+        }
+        if pm.e.uni != primary.e.uni {
+            bail!("member {} uniform-cell set differs", pm.label);
+        }
+        if pm.e.vary_in != primary.e.vary_in {
+            bail!("member {} varying-cell set differs", pm.label);
+        }
+        if pm.loads != primary.loads {
+            bail!("member {} input loads differ", pm.label);
+        }
+        if !pm.e.pins.is_subset(&primary.e.pins) {
+            bail!(
+                "member {} pins cells the primary does not ({:?} vs {:?}) - bind would not check them",
+                pm.label, pm.e.pins, primary.e.pins
+            );
+        }
+        for id in &pm.e.pins {
+            if pm.e.stable.get(id) != primary.e.stable.get(id) {
+                bail!("member {} pin {} disagrees on the stable value", pm.label, id);
+            }
+        }
+        if pm.e.fork_depth != primary.e.fork_depth || pm.e.valid_expr != primary.e.valid_expr {
+            bail!("member {} fork structure differs", pm.label);
+        }
+        if pm.pre_segs.len() != primary.pre_segs.len() {
+            bail!("member {} fork segment count differs", pm.label);
+        }
+    }
+    // Fork skeletons: the k-th fork of every member must be the same node.
+    let fork_seq = |pm: &PMember| -> Vec<u32> {
+        pm.pre_segs
+            .iter()
+            .flatten()
+            .filter_map(|it| match it {
+                PItem::ForkOpen(id) => Some(*id),
+                _ => None,
+            })
+            .collect()
+    };
+    let primary_forks = fork_seq(primary);
+    for pm in &pms[1..] {
+        if fork_seq(pm) != primary_forks {
+            bail!("member {} fork skeleton differs from the primary's", pm.label);
+        }
+    }
+
+    // --- non-primary members: prove the boundary rows are block-uniform ---
+    // The member's final heap reachable set must contain no per-lane data:
+    // no varying input cell, and every dirty reachable cell's output value
+    // is an untainted uniform scalar. Those scalars form the member's
+    // TUPLE - the executor's collapse key.
+    let mut tuples: Vec<Vec<(u32, &'static str, String)>> = Vec::new();
+    for pm in &pms[1..] {
+        let reach = reachable_cells(&pm.e);
+        for id in pm.e.vary_in.keys() {
+            if reach.contains(id) {
+                bail!(
+                    "member {}: varying input cell {} survives into the boundary - \
+                     its rows are not block-uniform",
+                    pm.label, id
+                );
+            }
+        }
+        let mut tup: Vec<(u32, &'static str, String)> = Vec::new();
+        for (id, ty, expr, tainted) in &pm.of.fields {
+            if !reach.contains(id) {
+                continue;
+            }
+            if *tainted {
+                bail!("member {}: boundary cell {} is button-tainted", pm.label, id);
+            }
+            match *ty {
+                "P8" | "bool" | "(P8, P8)" => {}
+                other => bail!(
+                    "member {}: boundary cell {} is per-lane ({}) - rows are not block-uniform",
+                    pm.label, id, other
+                ),
+            }
+            tup.push((*id, ty, canonicalize(expr, &pm.vn)));
+        }
+        if let Some(first) = tuples.first() {
+            let a: Vec<u32> = first.iter().map(|(id, _, _)| *id).collect();
+            let b: Vec<u32> = tup.iter().map(|(id, _, _)| *id).collect();
+            if a != b {
+                bail!(
+                    "members disagree on the boundary tuple cells ({:?} vs {:?})",
+                    a, b
+                );
+            }
+        }
+        tuples.push(tup);
+    }
+
+    // --- deopt registers: one per distinct member set with effects ---
+    let mut reg_masks: BTreeSet<u8> = BTreeSet::new();
+    reg_masks.insert(all_mask); // forks/splits and shared guards live here
+    for def in ctx.nodes.values() {
+        if def.has_dp {
+            reg_masks.insert(def.members);
+        }
+    }
+    for set in ctx.guards.values() {
+        reg_masks.insert(*set);
+    }
+    let reg = |mask: u8| format!("dp_m{}", mask);
+
+    // --- fused line streams (lockstep interleave by fork segment) ---
+    let mut pre: Vec<Line> = Vec::new();
+    let mut suf: Vec<Line> = Vec::new();
+    let mut emitted: BTreeSet<u32> = BTreeSet::new();
+    let mut emitted_guards: BTreeSet<u32> = BTreeSet::new();
+    let mut emitted_bails: BTreeSet<u32> = BTreeSet::new();
+    let mut var_ty: HashMap<String, &'static str> = HashMap::new();
+    let mut pre_defs: BTreeSet<String> = BTreeSet::new();
+    for load in &primary.loads {
+        pre.push(Line::Raw(load.clone()));
+    }
+    for (id, kind) in &primary.e.vary_in {
+        let ty = if *kind == "num" { "ZN" } else { "ZB" };
+        var_ty.insert(format!("r_c{}", id), ty);
+        pre_defs.insert(format!("r_c{}", id));
+    }
+
+    // The split's dp effect belongs to the members that CONTAIN the split;
+    // splits/forks are structural raws, so track their member sets from
+    // the per-member streams.
+    let mut split_members: BTreeMap<u32, u8> = BTreeMap::new();
+    let mut fork_members: BTreeMap<u32, u8> = BTreeMap::new();
+    for (mi, pm) in pms.iter().enumerate() {
+        for it in pm.pre_segs.iter().flatten().chain(pm.suf.iter()) {
+            match it {
+                PItem::SplitAt(id) => *split_members.entry(*id).or_insert(0) |= 1 << mi,
+                PItem::ForkOpen(id) => *fork_members.entry(*id).or_insert(0) |= 1 << mi,
+                _ => {}
+            }
+        }
+    }
+    for (id, set) in &fork_members {
+        if *set != all_mask {
+            bail!("fork {} is not shared by all members ({})", id, set);
+        }
+    }
+    for set in split_members.values() {
+        reg_masks.insert(*set);
+    }
+
+    let mut valid_stack: Vec<String> = vec!["ALL".to_string()];
+    let mut fork_count = 0usize;
+    {
+        // Emit one item; returns lines pushed into the right stream.
+        let mut emit_item = |it: &PItem,
+                             region: u8,
+                             out: &mut Vec<Line>,
+                             pre_defs: &mut BTreeSet<String>,
+                             var_ty: &mut HashMap<String, &'static str>,
+                             valid_stack: &mut Vec<String>,
+                             fork_count: &mut usize|
+         -> Result<()> {
+            match it {
+                PItem::Node(id) => {
+                    if !emitted.insert(*id) {
+                        return Ok(());
+                    }
+                    let def = &ctx.nodes[id];
+                    let name = format!("n{}", id);
+                    let expr = fused_expr(&def.render).replace(DP, &reg(def.members));
+                    var_ty.insert(name.clone(), def.ty);
+                    if region == 0 {
+                        pre_defs.insert(name.clone());
+                    }
+                    out.push(Line::Let { name, ty: def.ty, expr });
+                }
+                PItem::Guard(op) => {
+                    if !emitted_guards.insert(*op) {
+                        return Ok(());
+                    }
+                    let set = ctx.guards[op];
+                    out.push(Line::Raw(format!("zguard(n{}, &mut {});", op, reg(set))));
+                }
+                PItem::Bail(id) => {
+                    if !emitted_bails.insert(*id) {
+                        return Ok(());
+                    }
+                    let (render, _) = &ctx.bails[id];
+                    out.push(Line::Raw(fused_expr(render)));
+                }
+                PItem::SplitAt(id) => {
+                    if !emitted.insert(*id) {
+                        return Ok(());
+                    }
+                    let def = &ctx.splits[id];
+                    let set = split_members[id];
+                    let name = format!("n{}", id);
+                    out.push(Line::Raw(format!(
+                        "let ({n}, {n}_pt): (ZI, u16) = zi_split_at(n{op}, {at}, &mut {r});",
+                        n = name,
+                        op = def.op,
+                        at = def.at,
+                        r = reg(set)
+                    )));
+                    var_ty.insert(name.clone(), "ZI");
+                    var_ty.insert(format!("{}_pt", name), "u16");
+                    if region == 0 {
+                        pre_defs.insert(name.clone());
+                        pre_defs.insert(format!("{}_pt", name));
+                    }
+                }
+                PItem::ForkOpen(id) => {
+                    if !emitted.insert(*id) {
+                        return Ok(());
+                    }
+                    let def = &ctx.forks[id];
+                    let name = format!("n{}", id);
+                    out.push(Line::Raw(format!("for c{} in 0..2usize {{", def.depth)));
+                    for mask in reg_masks.iter() {
+                        out.push(Line::Raw(format!("let mut {r} = {r};", r = reg(*mask))));
+                    }
+                    out.push(Line::Raw("let mut bd_l: bool = *bd;".to_string()));
+                    out.push(Line::Raw("let bd: &mut bool = &mut bd_l;".to_string()));
+                    out.push(Line::Raw(format!(
+                        "let ({n}, {n}_fv): (ZI, u16) = zi_fork_flr(n{op}, c{d}, &mut {r});",
+                        n = name,
+                        op = def.op,
+                        d = def.depth,
+                        r = reg(all_mask)
+                    )));
+                    let valid = format!("valid{}", def.depth);
+                    out.push(Line::Raw(format!(
+                        "let {}: u16 = {} & {}_fv;",
+                        valid,
+                        valid_stack.last().unwrap(),
+                        name
+                    )));
+                    out.push(Line::Raw(format!("if {} == 0 {{ continue; }}", valid)));
+                    var_ty.insert(name.clone(), "ZI");
+                    var_ty.insert(format!("{}_fv", name), "u16");
+                    var_ty.insert(valid.clone(), "u16");
+                    pre_defs.insert(name.clone());
+                    pre_defs.insert(format!("{}_fv", name));
+                    pre_defs.insert(valid.clone());
+                    valid_stack.push(valid);
+                    *fork_count += 1;
+                }
+            }
+            Ok(())
+        };
+
+        // Prefix: segment s of every member, then the shared fork open.
+        let n_segs = primary.pre_segs.len();
+        for s in 0..n_segs {
+            // Non-fork items of this segment, member by member.
+            for pm in &pms {
+                for it in &pm.pre_segs[s] {
+                    if matches!(it, PItem::ForkOpen(_)) {
+                        continue;
+                    }
+                    emit_item(it, 0, &mut pre, &mut pre_defs, &mut var_ty, &mut valid_stack, &mut fork_count)?;
+                }
+            }
+            // The fork closing this segment (identical across members).
+            if let Some(PItem::ForkOpen(id)) = primary.pre_segs[s]
+                .iter()
+                .find(|it| matches!(it, PItem::ForkOpen(_)))
+            {
+                emit_item(&PItem::ForkOpen(*id), 0, &mut pre, &mut pre_defs, &mut var_ty, &mut valid_stack, &mut fork_count)?;
+            }
+        }
+        // Suffix: single segment.
+        for pm in &pms {
+            for it in &pm.suf {
+                emit_item(it, 1, &mut suf, &mut pre_defs, &mut var_ty, &mut valid_stack, &mut fork_count)?;
+            }
+        }
+    }
+    if fork_count != primary.e.fork_depth {
+        bail!("fused fork count {} != member fork depth {}", fork_count, primary.e.fork_depth);
+    }
+    let valid_expr = valid_stack.last().unwrap().clone();
+    if valid_expr != primary.e.valid_expr {
+        bail!(
+            "fused validity mask {} != member's {} - fork numbering drifted",
+            valid_expr, primary.e.valid_expr
+        );
+    }
+    let member_dp = |mi: usize| -> String {
+        let terms: Vec<String> = reg_masks
+            .iter()
+            .filter(|m| **m & (1 << mi) != 0)
+            .map(|m| reg(*m))
+            .collect();
+        terms.join(" | ")
+    };
+
+    // --- fused out fields (primary member's, exprs renamed) ---
+    let fused_of = OutFields {
+        fields: primary
+            .of
+            .fields
+            .iter()
+            .map(|(id, ty, expr, tainted)| {
+                (*id, *ty, fused_expr(&canonicalize(expr, &primary.vn)), *tainted)
+            })
+            .collect(),
+        ubool: primary.of.ubool.clone(),
+    };
+
+    // --- assemble the artifact ---
+    let mut out = String::new();
+    writeln!(
+        out,
+        "// GENERATED by `transpile --fuse` (plans/shape-tag-plan.md). Do not\n\
+         // edit, do not commit: the fused artifact is built per campaign\n\
+         // (feature `fused`). Members, in lane-priority order:"
+    )?;
+    for (mi, pm) in pms.iter().enumerate() {
+        writeln!(out, "//   {}: {}", mi, pm.label)?;
+    }
+    writeln!(
+        out,
+        "// Member 0 is the primary: its rows materialize through apply/\n\
+         // append_out as in any class kernel. The rest cover lanes whose\n\
+         // boundary rows are block-uniform; `Dy` reports their coverage\n\
+         // masks and uniform-output tuples, and the executor collapses\n\
+         // covered lanes to one interpreter representative per tuple.\n\
+         //"
+    )?;
+    emit_interface(&mut out, &primary.e, &fused_of)?;
+
+    let pre_text = render_lines(&pre);
+    let suf_text = render_lines(&suf);
+
+    // Dy: coverage masks + tuples for the non-primary members.
+    let tuple_cells = &tuples[0];
+    writeln!(out, "/// Non-primary member count (lane-priority order).")?;
+    writeln!(out, "pub const N_DY: usize = {};", n_members - 1)?;
+    writeln!(out, "/// The block-uniform boundary tuple of a non-primary member.")?;
+    writeln!(out, "#[derive(Clone, Copy, PartialEq, Eq)]")?;
+    writeln!(out, "pub struct DyTuple {{")?;
+    for (id, ty, _) in tuple_cells {
+        writeln!(out, "    pub c{}: {},", id, ty)?;
+    }
+    writeln!(out, "}}\n")?;
+    writeln!(out, "impl DyTuple {{")?;
+    writeln!(out, "    /// Raw-bits collapse key (BTreeMap-friendly).")?;
+    let key_width: usize = tuple_cells
+        .iter()
+        .map(|(_, ty, _)| if *ty == "(P8, P8)" { 2 } else { 1 })
+        .sum();
+    writeln!(out, "    pub fn key(&self) -> [u32; {}] {{", key_width)?;
+    writeln!(out, "        [")?;
+    for (id, ty, _) in tuple_cells {
+        match *ty {
+            "bool" => writeln!(out, "            self.c{} as u32,", id)?,
+            "P8" => writeln!(out, "            self.c{}.as_raw_u32(),", id)?,
+            "(P8, P8)" => {
+                writeln!(out, "            self.c{}.0.as_raw_u32(),", id)?;
+                writeln!(out, "            self.c{}.1.as_raw_u32(),", id)?;
+            }
+            _ => unreachable!(),
+        }
+    }
+    writeln!(out, "        ]")?;
+    writeln!(out, "    }}")?;
+    writeln!(out, "}}\n")?;
+    writeln!(
+        out,
+        "/// Per-(config, variant) coverage of the non-primary members.\n\
+         pub struct Dy {{\n\
+         \x20   /// Lanes covered by member i+1 (valid, primary-deopt, own-\n\
+         \x20   /// coverage clear, earlier members excluded).\n\
+         \x20   pub covered: [u16; N_DY],\n\
+         \x20   pub tuples: [DyTuple; N_DY],\n\
+         }}\n"
+    )?;
+
+    // Crossing: prefix names the suffix side reads. The suffix side is
+    // the fused suffix text plus every epilogue expr (tainted KOut
+    // fields, the Dy tuples, the member dp combinations read `p.valid`).
+    let mut suffix_scan = suf_text.clone();
+    for (_, _, expr, tainted) in &fused_of.fields {
+        if *tainted {
+            suffix_scan.push('\n');
+            suffix_scan.push_str(expr);
+        } else if (0..6).any(|k| mentions_ident(expr, &format!("kb{}", k))) {
+            bail!("output cell reads a button bit but is marked untainted");
+        }
+    }
+    for tup in &tuples {
+        for (_, _, expr) in tup {
+            let fexpr = fused_expr(expr);
+            if (0..6).any(|k| mentions_ident(&fexpr, &format!("kb{}", k))) {
+                bail!("a member tuple expr reads a button bit");
+            }
+            suffix_scan.push('\n');
+            suffix_scan.push_str(&fexpr);
+        }
+    }
+    for k in 0..6 {
+        if mentions_ident(&pre_text, &format!("kb{}", k)) {
+            bail!("button bit kb{} leaked into the fused prefix", k);
+        }
+    }
+    let mut crossing: BTreeSet<String> = BTreeSet::new();
+    for name in &pre_defs {
+        if word_used(&suffix_scan, name) {
+            crossing.insert(name.clone());
+        }
+    }
+    for (_, _, expr, _) in &fused_of.fields {
+        if pre_defs.contains(expr) {
+            crossing.insert(expr.clone());
+        }
+    }
+    writeln!(out, "pub struct Pre {{")?;
+    for name in &crossing {
+        let ty = var_ty
+            .get(name)
+            .ok_or_else(|| anyhow!("no type for crossing var {}", name))?;
+        writeln!(out, "    {}: {},", name, ty)?;
+    }
+    writeln!(out, "    valid: u16,")?;
+    for mask in &reg_masks {
+        writeln!(out, "    {}: u16,", reg(*mask))?;
+    }
+    writeln!(out, "    bd: bool,")?;
+    writeln!(out, "}}\n")?;
+
+    // frame()
+    writeln!(
+        out,
+        "#[inline(never)]\n\
+         pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared, &KOut, &Dy)) {{"
+    )?;
+    for mask in &reg_masks {
+        writeln!(out, "    let mut {}: u16 = 0;", reg(*mask))?;
+    }
+    writeln!(
+        out,
+        "    let mut bd_flag: bool = false;\n\
+         \x20   let bd: &mut bool = &mut bd_flag;"
+    )?;
+    out.push_str(&pre_text);
+    writeln!(out, "    let p = Pre {{")?;
+    for name in &crossing {
+        writeln!(out, "        {},", name)?;
+    }
+    writeln!(out, "        valid: {},", valid_expr)?;
+    for mask in &reg_masks {
+        writeln!(out, "        {},", reg(*mask))?;
+    }
+    writeln!(out, "        bd: *bd,")?;
+    writeln!(out, "    }};")?;
+    writeln!(out, "    let osh = KOutShared {{")?;
+    for (id, _, expr, tainted) in &fused_of.fields {
+        if !*tainted {
+            writeln!(out, "        c{}: {},", id, expr)?;
+        }
+    }
+    writeln!(out, "    }};")?;
+    let used: Vec<u32> = (0..6)
+        .filter(|k| mentions_ident(&suffix_scan, &format!("kb{}", k)))
+        .collect();
+    let n_variants = 1usize << used.len();
+    eprintln!(
+        "[fused] suffix observes button bits {:?} -> {} variant call(s)",
+        used, n_variants
+    );
+    writeln!(
+        out,
+        "    // suffix observes button bits {:?}: {} distinct variant(s)",
+        used, n_variants
+    )?;
+    for i in 0..n_variants {
+        let b: u8 = used
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| i >> j & 1 != 0)
+            .map(|(_, k)| 1u8 << k)
+            .sum();
+        writeln!(out, "    suffix::<{}>(u, g, &p, &osh, out);", b)?;
+    }
+    for _ in 0..fork_count {
+        writeln!(out, "    }}")?;
+    }
+    writeln!(out, "}}\n")?;
+
+    // suffix()
+    writeln!(
+        out,
+        "#[inline(never)]\n\
+         fn suffix<const B: u8>(u: &Uni, g: &G, p: &Pre, osh: &KOutShared, out: &mut impl FnMut(u8, &KOutShared, &KOut, &Dy)) {{"
+    )?;
+    for name in &crossing {
+        writeln!(out, "    let {} = p.{};", name, name)?;
+    }
+    for mask in &reg_masks {
+        writeln!(out, "    let mut {r}: u16 = p.{r};", r = reg(*mask))?;
+    }
+    writeln!(out, "    let mut bd_flag: bool = p.bd;")?;
+    writeln!(out, "    let bd: &mut bool = &mut bd_flag;")?;
+    for k in 0..6 {
+        writeln!(out, "    let kb{}: bool = (B >> {}) & 1 != 0;", k, k)?;
+    }
+    out.push_str(&suf_text);
+    for mi in 0..n_members {
+        writeln!(out, "    let dp_of_{}: u16 = {};", mi, member_dp(mi))?;
+    }
+    for mi in 1..n_members {
+        let earlier: String = (1..mi)
+            .map(|j| format!(" & !cov_{}", j))
+            .collect::<Vec<_>>()
+            .join("");
+        writeln!(
+            out,
+            "    let cov_{m}: u16 = p.valid & dp_of_0 & !dp_of_{m}{e};",
+            m = mi,
+            e = earlier
+        )?;
+    }
+    writeln!(out, "    out(B, osh, &KOut {{")?;
+    writeln!(out, "        valid: p.valid,")?;
+    writeln!(out, "        deopt: dp_of_0,")?;
+    writeln!(out, "        bd: *bd,")?;
+    for (id, _, expr, tainted) in &fused_of.fields {
+        if *tainted {
+            writeln!(out, "        c{}: {},", id, expr)?;
+        }
+    }
+    writeln!(out, "    }}, &Dy {{")?;
+    write!(out, "        covered: [")?;
+    for mi in 1..n_members {
+        write!(out, "cov_{}, ", mi)?;
+    }
+    writeln!(out, "],")?;
+    writeln!(out, "        tuples: [")?;
+    for tup in &tuples {
+        write!(out, "            DyTuple {{ ")?;
+        for (id, _, expr) in tup {
+            write!(out, "c{}: {}, ", id, fused_expr(expr))?;
+        }
+        writeln!(out, "}},")?;
+    }
+    writeln!(out, "        ],")?;
+    writeln!(out, "    }});")?;
+    writeln!(out, "}}")?;
+
+    eprintln!(
+        "fused: {} members, {} nodes ({} shared by all), {} guards, {} dp registers, prefix {} lines, suffix {} lines",
+        n_members,
+        ctx.nodes.len(),
+        ctx.nodes.values().filter(|d| d.members == all_mask).count(),
+        ctx.guards.len(),
+        reg_masks.len(),
+        pre_text.lines().count(),
+        suf_text.lines().count(),
+    );
+    Ok(out)
 }

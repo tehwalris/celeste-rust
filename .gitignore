@@ -25,3 +25,4 @@ native-probe/target/
 # kernels would have no reproducible provenance. ~95 KB, frozen.
 # Scratch dumps written next to the probe are not.
 /native-probe/*-shape.json
+crates/celeste-kernels/src/fused_gen_player.rs
