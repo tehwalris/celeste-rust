@@ -227,6 +227,17 @@ fn kernel_class_mask() -> u8 {
 pub(crate) static PLAIN_ROUTED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// The fused artifact's self-fingerprint, when the fused kernel is compiled
+/// in AND enabled - `None` otherwise. Hashed into the campaign fingerprint
+/// so checkpoints name which fused engine produced them.
+pub fn fused_artifact_fingerprint() -> Option<u64> {
+    #[cfg(feature = "fused")]
+    if fused::enabled() {
+        return Some(celeste_kernels::fused_gen_player::FUSED_FINGERPRINT);
+    }
+    None
+}
+
 static KERNEL_HITS: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),

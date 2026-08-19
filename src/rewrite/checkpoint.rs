@@ -121,6 +121,18 @@ pub struct CampaignConfig {
     /// way it missed things twice before.
     pub max_state_lanes: usize,
     pub fruit_chunk_lanes: usize,
+    /// The compiled-forward engine's identity (CELESTE_COMPILED_FORWARD):
+    /// `None` when the frame body is the interpreter (the legacy
+    /// fingerprint - existing interpreter checkpoints stay valid), else a
+    /// hash of the compile recipe text plus the fused artifact's embedded
+    /// self-fingerprint when the `fused` feature is active. Two runs whose
+    /// frame bodies are different ENGINES must never share checkpoints,
+    /// even though a gated engine's row sets are identical - the gate is
+    /// empirical and per-artifact, not structural. Consequence: gates that
+    /// resume an interpreter checkpoint under the compiled engine now
+    /// re-run from frame 1 instead (2 min at H=68; correctness beats
+    /// convenience).
+    pub compiled_engine: Option<u64>,
     /// A SYNTHETIC win target (CELESTE_WIN_AT_XY), for cheap pipeline tests.
     /// A run that finishes at an arbitrary position is a DIFFERENT SEARCH -
     /// different absorbing set, different B(H) seed, different g - so its
@@ -141,7 +153,29 @@ impl CampaignConfig {
                 .is_some(),
             max_state_lanes: crate::rewrite::verify::effective_chunk_cap(),
             fruit_chunk_lanes: crate::rewrite::verify::effective_fruit_chunk_cap(),
+            compiled_engine: Self::compiled_engine_fingerprint(),
             synthetic_win: crate::interpreter::abstraction::synthetic_win_xy(),
+        }
+    }
+
+    /// See the `compiled_engine` field. Reads the compile recipe TEXT (the
+    /// class kernels are byte-gated against it by `generated_is_current` +
+    /// the suite, so the text is a faithful proxy for them); the fused
+    /// artifact contributes its own embedded hash because it is generated
+    /// per campaign and never checked in.
+    fn compiled_engine_fingerprint() -> Option<u64> {
+        match std::env::var("CELESTE_COMPILED_FORWARD") {
+            Err(_) => None,
+            Ok(v) if v == "0" => None,
+            Ok(_) => {
+                use std::hash::{Hash, Hasher};
+                let mut h = rustc_hash::FxHasher::default();
+                std::fs::read_to_string("rewrites-compile.jsonl")
+                    .unwrap_or_default()
+                    .hash(&mut h);
+                crate::compiled::dispatch::fused_artifact_fingerprint().hash(&mut h);
+                Some(h.finish())
+            }
         }
     }
 }
@@ -212,6 +246,14 @@ pub fn config_fingerprint_for(recipe_text: &str, config: &CampaignConfig) -> Str
     config.deopt_collect_first.hash(&mut h);
     config.max_state_lanes.hash(&mut h);
     config.fruit_chunk_lanes.hash(&mut h);
+    // Conditionally, NOT `Option::hash`: `None` must reproduce the legacy
+    // stream byte-for-byte so every existing interpreter checkpoint stays
+    // valid. (The usual objection to presence-hashing - that two runs can
+    // differ without either naming the setting - does not apply: the
+    // engine is exactly named by the value hashed when it is on.)
+    if let Some(engine) = config.compiled_engine {
+        engine.hash(&mut h);
+    }
     config.synthetic_win.hash(&mut h);
     format!("{:016x}", h.finish())
 }
@@ -611,6 +653,7 @@ mod tests {
             deopt_collect_first: true,
             max_state_lanes: 8_000,
             fruit_chunk_lanes: 8_000,
+            compiled_engine: None,
             synthetic_win: None,
         }
     }

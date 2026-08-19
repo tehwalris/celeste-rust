@@ -1049,6 +1049,24 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
     writeln!(out, "    }});")?;
     writeln!(out, "}}")?;
 
+    // Self-fingerprint: a hash of everything emitted ABOVE this line, so
+    // the artifact compiled into a binary names itself. The campaign
+    // fingerprint hashes this const when the fused engine is active -
+    // change any member recipe, the witness, or this emitter and the
+    // artifact bytes change, so checkpoints from different fused engines
+    // can never be resumed into each other (plans/shape-tag-plan.md).
+    // Hashing the emitted STRING (not the on-disk file at runtime) is
+    // deliberate: it fingerprints what the binary RUNS, not what happens
+    // to be on disk next to it.
+    let fp = {
+        use std::hash::{Hash, Hasher};
+        let mut h = rustc_hash::FxHasher::default();
+        out.hash(&mut h);
+        h.finish()
+    };
+    writeln!(out, "\n/// Hash of this artifact's own bytes above this line.")?;
+    writeln!(out, "pub const FUSED_FINGERPRINT: u64 = {:#018x};", fp)?;
+
     eprintln!(
         "fused: {} members, {} nodes ({} shared by all), {} guards, {} dp registers, prefix {} lines, suffix {} lines",
         n_members,
