@@ -1333,6 +1333,17 @@ pub struct VisitedKeys {
     lanes: usize,
 }
 
+impl VisitedKeys {
+    /// For the partitioned filter (`rewrite::verify`), which computes the
+    /// candidate list outside this module. The contract is the same one
+    /// `visited_row_keys` satisfies: candidates ascend by lane, each is
+    /// not `contains_historic`, and each key appears at most once in the
+    /// scope the caller dedups over (`insert_new` resolves the rest).
+    pub fn from_candidates(candidates: Vec<(u32, (u64, u64))>, lanes: usize) -> Self {
+        Self { candidates, lanes }
+    }
+}
+
 /// Dedup census (`CELESTE_DEDUP_CENSUS=1`): how much of the frontier's
 /// kill ratio is WITHIN a frame and how much is against earlier frames?
 ///
@@ -1472,6 +1483,47 @@ fn offered_dump_fragment(keys: &[(u64, u64)]) {
 
 pub fn global_probes_take() -> u64 {
     GLOBAL_PROBES.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// For the partitioned filter (`rewrite::verify::partition_filter`), whose
+/// probes happen outside this module but belong in the same census line.
+pub fn add_global_probes(n: u64) {
+    GLOBAL_PROBES.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Phase 1a of the PARTITIONED subtract (D4, plans/dedup-roofline-plan.md):
+/// hash every lane into its row key and stop - no seen set, no visited
+/// probe. The filter runs afterwards, hash-partitioned across threads, in
+/// `rewrite::verify`'s partition stage. The census sample and the offered
+/// dump live here because they observe the offered stream, which this
+/// function is the last common view of.
+///
+/// Returns `None` exactly when `visited_row_keys` would (no columns), which
+/// downstream means `Survivors::All`.
+pub fn visited_lane_keys(state: &State) -> Option<Vec<(u64, u64)>> {
+    use crate::interpreter::virtual_merge::{collect_columns_labeled, row_key_hashes, Column};
+    let census = dedup_census_on();
+    let t_hash = census.then(std::time::Instant::now);
+    let shape_hash = shape_hash_of_state(state);
+    let (columns, _origins) = collect_columns_labeled(std::slice::from_ref(state))?;
+    let refs: Vec<&Column> = columns.iter().collect();
+    let keys = row_key_hashes(
+        shape_hash,
+        &refs,
+        state.vector_size,
+        crate::interpreter::row_table::ROW_HASH_SEED2,
+    );
+    if let Some(t) = t_hash {
+        KEYS_HASH_NS.fetch_add(
+            t.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    if census {
+        dedup_census_sample(&keys);
+    }
+    offered_dump_fragment(&keys);
+    Some(keys)
 }
 
 /// PHASE 1 of the frontier subtract: canonicalize the state into columns,

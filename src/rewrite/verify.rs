@@ -476,7 +476,7 @@ fn stream_boundary_one(
     visited: &mut crate::interpreter::visited::Visited,
     counters: &mut StreamCounters,
 ) -> Result<Vec<State>> {
-    let prepared = stream_boundary_prepare(state, band, frame, counters, visited)?;
+    let prepared = stream_boundary_prepare(state, band, frame, counters, visited, true)?;
     Ok(stream_boundary_subtract(prepared, visited, counters))
 }
 
@@ -488,12 +488,20 @@ fn stream_boundary_one(
 ///
 /// The counters it fills are per-call and merged by the caller in input
 /// order, so the aggregate is identical whichever thread did the work.
+/// `filter_now` selects which phase-1 the fragment gets. `true` is the
+/// classic path: `visited_row_keys` filters in the worker with a
+/// per-FRAGMENT seen set. `false` is the partitioned path (D4): only hash,
+/// and leave the filtering to `partition_filter`, whose per-thread seen
+/// sets persist for the whole frame - D2 measured the difference at 218 vs
+/// 6 ns per offered row, because a fragment-scoped set re-probes every new
+/// key ~8x and one mmap probe costs ~700 ns.
 fn stream_boundary_prepare(
     state: State,
     band: Option<&BandFilter>,
     frame: u32,
     counters: &mut StreamCounters,
     visited: &crate::interpreter::visited::Visited,
+    filter_now: bool,
 ) -> Result<Vec<PreparedRows>> {
     let mut kept_out = Vec::new();
     let t_abs = std::time::Instant::now();
@@ -618,19 +626,135 @@ fn stream_boundary_prepare(
         // per-lane cache miss lives, and it needs only `&RowTable`, so it
         // belongs on this side of the parallel/serial line.
         let t_keys = std::time::Instant::now();
-        let keys = crate::interpreter::vectorize::visited_row_keys(&state, visited);
+        let keys = if filter_now {
+            PreparedKeys::Filtered(crate::interpreter::vectorize::visited_row_keys(
+                &state, visited,
+            ))
+        } else {
+            PreparedKeys::Raw(crate::interpreter::vectorize::visited_lane_keys(&state))
+        };
         add_worker_ns(WORKER_KEYS, t_keys.elapsed().as_nanos() as u64);
         kept_out.push(PreparedRows { state, keys });
     }
     Ok(kept_out)
 }
 
-/// A boundary state with its visited-set keys already computed and probed
-/// (`visited_row_keys`). Only the id-assigning insert is left, and that has
-/// to happen in input order.
+/// A boundary state with its visited-set keys computed. Only the
+/// id-assigning insert is left, and that has to happen in input order.
 struct PreparedRows {
     state: State,
-    keys: Option<crate::interpreter::vectorize::VisitedKeys>,
+    keys: PreparedKeys,
+}
+
+enum PreparedKeys {
+    /// Filtered in the worker (`visited_row_keys`): candidates ready for
+    /// `insert_new`. `None` = no columns = every lane new.
+    Filtered(Option<crate::interpreter::vectorize::VisitedKeys>),
+    /// Hash-only (`visited_lane_keys`): one key per lane, filtering
+    /// pending in `partition_filter`. Same `None` meaning.
+    Raw(Option<Vec<(u64, u64)>>),
+}
+
+/// The partitioned filter's default is ON; `CELESTE_PARTITIONED_FILTER=0`
+/// restores the classic in-worker filter. Not in the campaign fingerprint
+/// for the same reason the visited engine choice is not: the outputs are
+/// gated identical (H=68 sidecar set-identity plus byte-identical id
+/// assignment by construction), so checkpoints are interchangeable.
+fn partitioned_filter_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("CELESTE_PARTITIONED_FILTER").map_or(true, |v| v != "0")
+    })
+}
+
+/// D4's filter stage: turn a batch of `Raw` fragments into `Filtered` ones
+/// using per-thread seen sets that PERSIST ACROSS the frame's batches,
+/// with keys hash-partitioned so each thread owns a disjoint slice of key
+/// space and needs no coordination.
+///
+/// Byte-identical to the classic path by this argument: a candidate whose
+/// key `insert_new` would reject can be added or removed freely without
+/// changing survivors or ids, and the two paths' candidate lists differ
+/// ONLY in such entries. The classic path offers first-in-fragment
+/// non-historic occurrences (later fragments re-offer, `insert_new`
+/// rejects); this path offers first-in-frame non-historic occurrences,
+/// scanned in the same fragment-then-lane order the serial phase uses. The
+/// first occurrence of each genuinely-new key is a candidate in both, so
+/// `insert_new` sees it at the same point in the same order - same
+/// survivor set, same ids, byte-identical sidecars (gated at H=68).
+fn partition_filter(
+    prepared: &mut [PreparedRows],
+    seen: &mut [rustc_hash::FxHashSet<(u64, u64)>],
+    visited: &crate::interpreter::visited::Visited,
+) {
+    let frags: Vec<Option<&Vec<(u64, u64)>>> = prepared
+        .iter()
+        .map(|p| match &p.keys {
+            PreparedKeys::Raw(Some(k)) => Some(k),
+            _ => None,
+        })
+        .collect();
+    let threads = seen.len();
+    let census = crate::interpreter::vectorize::dedup_census_on();
+    // out[thread][fragment] = this thread's candidates for that fragment,
+    // in lane order (one thread scans lanes in order, so its own list is
+    // sorted; the per-fragment merge below interleaves the threads').
+    let per_thread: Vec<Vec<Vec<(u32, (u64, u64))>>> = std::thread::scope(|scope| {
+        seen.iter_mut()
+            .enumerate()
+            .map(|(p, seen_p)| {
+                let frags = &frags;
+                scope.spawn(move || {
+                    let mut out: Vec<Vec<(u32, (u64, u64))>> = vec![Vec::new(); frags.len()];
+                    let mut probes = 0u64;
+                    for (fi, frag) in frags.iter().enumerate() {
+                        let Some(keys) = frag else { continue };
+                        for (lane, &key) in keys.iter().enumerate() {
+                            // Owner from the UPPER key bits: the low bits
+                            // of key.0 index the fp-runs and the census
+                            // sample, so they are the one place structure
+                            // could hide.
+                            if ((key.0 >> 32) as usize) % threads != p {
+                                continue;
+                            }
+                            if seen_p.insert(key) {
+                                probes += 1;
+                                if !visited.contains_historic(key) {
+                                    out[fi].push((lane as u32, key));
+                                }
+                            }
+                        }
+                    }
+                    if census {
+                        crate::interpreter::vectorize::add_global_probes(probes);
+                    }
+                    out
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().expect("partition filter worker"))
+            .collect()
+    });
+    for (fi, p) in prepared.iter_mut().enumerate() {
+        if !matches!(&p.keys, PreparedKeys::Raw(Some(_))) {
+            if let PreparedKeys::Raw(None) = p.keys {
+                p.keys = PreparedKeys::Filtered(None);
+            }
+            continue;
+        }
+        let mut candidates: Vec<(u32, (u64, u64))> = Vec::new();
+        for t in &per_thread {
+            candidates.extend_from_slice(&t[fi]);
+        }
+        candidates.sort_unstable_by_key(|(lane, _)| *lane);
+        p.keys = PreparedKeys::Filtered(Some(
+            crate::interpreter::vectorize::VisitedKeys::from_candidates(
+                candidates,
+                p.state.vector_size,
+            ),
+        ));
+    }
 }
 
 /// The SERIAL suffix: subtract the rows this run has already reached.
@@ -668,6 +792,12 @@ fn decided_survivors(
     use crate::interpreter::vectorize::Survivors;
     let mut out = Vec::with_capacity(prepared.len());
     for PreparedRows { state, keys } in prepared {
+        let keys = match keys {
+            PreparedKeys::Filtered(keys) => keys,
+            PreparedKeys::Raw(_) => {
+                unreachable!("a Raw fragment reached the serial phase; partition_filter must run first")
+            }
+        };
         let (survivors, before) =
             crate::interpreter::vectorize::subtract_decide(&state, keys, visited);
         counters.sub_before += before;
@@ -1566,6 +1696,12 @@ impl AbstractRun {
         let pos_obs = self.pos_obs.as_ref();
         let compiled = self.compiled;
 
+        let partitioned = partitioned_filter_on();
+        // One seen set per thread, disjoint by key hash, alive for the
+        // WHOLE frame - this scope is the entire point (D2: fragment- and
+        // worker-scoped sets were measured 8.5x and 1.46x weaker).
+        let mut partition_seen: Vec<rustc_hash::FxHashSet<(u64, u64)>> =
+            (0..threads).map(|_| Default::default()).collect();
         let mut batch: Vec<State> = Vec::with_capacity(threads);
         let mut queue = input_states.into_iter();
         loop {
@@ -1576,6 +1712,13 @@ impl AbstractRun {
             if batch.is_empty() {
                 break;
             }
+            // The partitioned filter (D4): workers only HASH their
+            // fragments; the seen+probe filter runs after the join,
+            // hash-partitioned across threads with sets that persist for
+            // the whole frame. CELESTE_PARTITIONED_FILTER=0 restores the
+            // classic in-worker filter (identical results either way; the
+            // classic path re-probes every new key once per fragment it
+            // appears in, ~8x - see BENCHMARK_DATA.md "Dedup roofline").
             type Prepared = Result<(Vec<PreparedRows>, FrameEventCounters, StreamCounters)>;
             let results: Vec<Prepared> = {
                 let _t = ScopedPhase::new("fwd.interpret");
@@ -1602,7 +1745,12 @@ impl AbstractRun {
                                 let mut prepared = Vec::new();
                                 for out in outputs {
                                     prepared.extend(stream_boundary_prepare(
-                                        out, band, frame_no, &mut sc, visited_ro,
+                                        out,
+                                        band,
+                                        frame_no,
+                                        &mut sc,
+                                        visited_ro,
+                                        !partitioned,
                                     )?);
                                 }
                                 add_worker_ns(WORKER_BODY, (t1 - t0).as_nanos() as u64);
@@ -1630,18 +1778,32 @@ impl AbstractRun {
                         .collect()
                 })
             };
+            // Collect the batch's fragments in input order first: the
+            // partition filter wants the whole batch (its threads scan
+            // fragments in this order, which is what makes its candidate
+            // order the serial order), and the serial phase then walks the
+            // same list.
+            let mut all_prepared: Vec<PreparedRows> = Vec::new();
+            for result in results {
+                let (prepared, ev, sc) = result?;
+                counters.absorb(&ev);
+                stream_counters.absorb(&sc);
+                all_prepared.extend(prepared);
+            }
+            if partitioned {
+                let _t = ScopedPhase::new("fwd.partition_filter");
+                let visited_ro: &crate::interpreter::visited::Visited = self
+                    .visited_rows
+                    .as_ref()
+                    .expect("stream implies a visited table");
+                partition_filter(&mut all_prepared, &mut partition_seen, visited_ro);
+            }
             let _t = ScopedPhase::new("fwd.boundary_stream");
             let visited = self
                 .visited_rows
                 .as_mut()
                 .expect("stream implies a visited table");
-            let mut decided = Vec::new();
-            for result in results {
-                let (prepared, ev, sc) = result?;
-                counters.absorb(&ev);
-                stream_counters.absorb(&sc);
-                decided.extend(decided_survivors(prepared, visited, &mut stream_counters));
-            }
+            let mut decided = decided_survivors(all_prepared, visited, &mut stream_counters);
             drop(_t);
             // Phase 3: gather the survivors. Pure given the decision above,
             // so it goes back on the workers - it copies every column of

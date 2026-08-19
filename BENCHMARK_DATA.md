@@ -135,6 +135,35 @@ tier removes that 8.5x directly:
     3,850,608  new
 ```
 
+# D4 LANDED: hash-partitioned visited filter, -31% forward wall (2026-08-19)
+
+The D2 design, integrated. Workers now only HASH their fragments
+(`visited_lane_keys`); the seen+probe filter runs after each batch's
+join in `partition_filter` - one seen set per thread, disjoint by key
+hash, PERSISTING for the whole frame - and the serial id assignment is
+unchanged. Default ON; `CELESTE_PARTITIONED_FILTER=0` restores the
+classic in-worker filter.
+
+Gate, room (1,0) H=68 ladder level-0 environment, same binary A/B:
+
+| | classic | partitioned |
+|---|---|---|
+| bench wall | 168.56 s | **115.87 s (-31.3%)** |
+| row keys + visited probe, worker CPU | 862.65 s | **20.90 s** (hash only) |
+| `fwd.partition_filter` (the moved filter) | - | 18.61 s |
+| peak RSS | 7.58 GB | 7.93 GB (+4.6%, the seen sets) |
+| visited total | 55,958,742 | 55,958,742 |
+| rowkeys sidecars, all 68 frames | - | **byte-identical, keys AND ids** |
+
+Byte-identity is by construction, not luck: a candidate whose key
+`insert_new` would reject can be added or removed without changing
+survivors or ids, and the classic and partitioned candidate lists
+differ only in such entries (first-in-fragment vs first-in-frame
+occurrences of the same first-in-serial-order keys). Suite 553/553.
+
+The serial phase also shrinks (3.65 s `fwd.boundary_stream`): it now
+receives ~2.2M candidates per deep frame instead of ~17.8M.
+
 # Dedup roofline, isolated (D2): the probe is everything (2026-08-19)
 
 `native-probe --dedup-bench CKPT 60` replays f60's real OFFERED key
