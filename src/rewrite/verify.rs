@@ -1437,6 +1437,10 @@ impl AbstractRun {
     /// on-disk order of visited rows.
     pub fn step(&mut self) -> Result<()> {
         let result = self.step_inner();
+        // Close the offered-key dump if this frame opened one (D2's input
+        // data; see `offered_dump_begin_frame`). After step_inner so every
+        // return path - serial, parallel, phased - is covered.
+        crate::interpreter::vectorize::offered_dump_end_frame();
         // Fold this frame's observations in, so the pending list stays a
         // frame's worth rather than a run's. Done even on failure: what was
         // observed before the error is still true.
@@ -1470,6 +1474,7 @@ impl AbstractRun {
         // rather than argument: the fused run's row table must come out
         // element-wise equal to the unfused one's.
         let frame_no = self.states_before_merge.len() as u32 + 1;
+        crate::interpreter::vectorize::offered_dump_begin_frame(frame_no);
         let input_states = chunk_states(std::mem::take(&mut self.states));
         // Chunk-parallel path. Everything else keeps the serial loop below -
         // one code path per arrangement, and the parallel one is opt-in.
@@ -2081,6 +2086,17 @@ impl AbstractRun {
                 offered as f64 / kept.max(1) as f64,
                 probes,
                 probes as f64 / distinct.max(1) as f64,
+            );
+            // The hash/probe split of visited_row_keys, per offered row -
+            // worker CPU ns, so the two halves sum to roughly the phase
+            // table's WORKER_KEYS row divided by offered lanes.
+            let (hash_ns, probe_ns) = crate::interpreter::vectorize::keys_phase_ns_take();
+            println!(
+                "  keys split: hash {:.1} ns/row, filter+probe {:.1} ns/row \
+                 (worker CPU ns over {} offered)",
+                hash_ns as f64 / offered.max(1) as f64,
+                probe_ns as f64 / offered.max(1) as f64,
+                offered,
             );
         }
         let visited = self.visited_rows.as_mut().expect("stream implies visited");

@@ -96,6 +96,7 @@ fn main() {
     let mut kernel_bench: Option<(String, u32)> = None;
     let mut interp_bench: Option<(String, u32)> = None;
     let mut frame_diff: Option<(String, u32, String)> = None;
+    let mut dedup_bench: Option<(String, u32)> = None;
     let mut reps: u32 = 10;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -127,6 +128,11 @@ fn main() {
                 let f: u32 = args.next().expect("FRAME").parse().unwrap();
                 interp_bench = Some((dir, f));
             }
+            "--dedup-bench" => {
+                let dir = args.next().expect("--dedup-bench needs DIR FRAME");
+                let f: u32 = args.next().expect("FRAME").parse().unwrap();
+                dedup_bench = Some((dir, f));
+            }
             "--frame-diff" => {
                 let dir = args.next().expect("--frame-diff needs DIR FRAME OUTDIR");
                 let f: u32 = args.next().expect("FRAME").parse().unwrap();
@@ -154,6 +160,8 @@ fn main() {
         run_interp_bench(&dir, frame, reps);
     } else if let Some((dir, frame, out)) = frame_diff {
         run_frame_diff(&dir, frame, &out);
+    } else if let Some((dir, frame)) = dedup_bench {
+        run_dedup_bench(&dir, frame, reps.min(3));
     } else if let Some((dir, frame)) = abstract_bench {
         run_abstract_bench(&dir, frame, reps);
     } else {
@@ -1324,4 +1332,315 @@ fn run_frame_diff(dir: &str, frame: u32, outdir: &str) {
         "[frame-diff] wrote {}/{{interp,compiled}}.{{rows,shapes}} - diff with comm/diff",
         outdir
     );
+}
+
+/// D2 (plans/dedup-roofline-plan.md): the dedup roofline, isolated.
+///
+/// Replays one frame's OFFERED key stream (dumped by the campaign with
+/// `CELESTE_DUMP_OFFERED`, fragment-delimited, real probe order) against
+/// the real mmap'd visited structure as it stood entering that frame, and
+/// times the FILTER side of `visited_row_keys` - the local seen set plus
+/// the global `contains_historic` probe - under several designs. Key
+/// COMPUTATION is deliberately absent: the campaign's census now prints
+/// its own hash/filter split, and this harness owns the filter half.
+///
+/// Every variant must produce the same candidate count - the decisions are
+/// identical by construction (first-wins is order-independent), so a
+/// mismatch is a harness bug, not a design result.
+fn run_dedup_bench(dir: &str, frame: u32, reps: u32) {
+    use celeste_rust::interpreter::visited::{FrameKeys, Visited};
+    let dirp = std::path::Path::new(dir);
+
+    // The visited set as of the START of `frame`: frames 1..frame-1.
+    let mut watermarks = Vec::new();
+    let mut total = 0u32;
+    for f in 1..frame {
+        let fk = FrameKeys::open(dirp, f).expect("open rowkeys sidecar");
+        total += fk.count() as u32;
+        watermarks.push(total);
+    }
+    let t0 = std::time::Instant::now();
+    let visited = Visited::mmap_open(dirp, watermarks).expect("open visited");
+    eprintln!(
+        "[dedup-bench] visited as of f{:03}: {} rows, opened in {:.2?}",
+        frame - 1,
+        visited.len(),
+        t0.elapsed()
+    );
+
+    // The offered stream: [u32 len][len * (u64,u64)] fragments.
+    let raw = std::fs::read(
+        dirp.join("offered").join(format!("f{:03}.offered", frame)),
+    )
+    .expect("read offered dump (run the campaign with CELESTE_DUMP_OFFERED)");
+    let mut keys: Vec<(u64, u64)> = Vec::new();
+    let mut frag_lens: Vec<u32> = Vec::new();
+    {
+        let mut off = 0usize;
+        while off < raw.len() {
+            let len = u32::from_le_bytes(raw[off..off + 4].try_into().unwrap());
+            off += 4;
+            frag_lens.push(len);
+            for _ in 0..len {
+                let lo = u64::from_le_bytes(raw[off..off + 8].try_into().unwrap());
+                let hi = u64::from_le_bytes(raw[off + 8..off + 16].try_into().unwrap());
+                keys.push((lo, hi));
+                off += 16;
+            }
+        }
+    }
+    drop(raw);
+    eprintln!(
+        "[dedup-bench] f{:03}: {} offered keys in {} fragments (mean {:.0}/fragment)",
+        frame,
+        keys.len(),
+        frag_lens.len(),
+        keys.len() as f64 / frag_lens.len().max(1) as f64
+    );
+
+    let n = keys.len();
+    let report = |name: &str, secs: f64, candidates: usize| {
+        println!(
+            "  {:<26} {:>8.2} ns/row  ({:.3} s, {} candidates)",
+            name,
+            secs * 1e9 / n as f64,
+            secs,
+            candidates
+        );
+    };
+
+    // What the SERIAL phase would keep: the distinct not-historic keys.
+    // Computed once, untimed - it is also the frame-seen variant's answer,
+    // and today's 8x-duplicated candidate stream collapses to exactly this
+    // in `insert_new`.
+    let want_candidates = {
+        let mut seen: rustc_hash::FxHashSet<(u64, u64)> =
+            rustc_hash::FxHashSet::default();
+        let mut cand = 0usize;
+        for &key in &keys {
+            if seen.insert(key) && !visited.contains_historic(key) {
+                cand += 1;
+            }
+        }
+        cand
+    };
+
+    // Baseline: TODAY. Per-fragment seen set, local-first (the mmap
+    // engine's order), global probe once per fragment-distinct key.
+    // Its candidate count is the DUPLICATED event stream the serial phase
+    // receives - reported, not asserted, because collapsing it is phase
+    // 2's job.
+    for rep in 0..reps {
+        let t = std::time::Instant::now();
+        let mut candidates = 0usize;
+        let mut idx = 0usize;
+        for &len in &frag_lens {
+            let mut seen: rustc_hash::FxHashSet<(u64, u64)> =
+                rustc_hash::FxHashSet::default();
+            for &key in &keys[idx..idx + len as usize] {
+                if seen.insert(key) && !visited.contains_historic(key) {
+                    candidates += 1;
+                }
+            }
+            idx += len as usize;
+        }
+        let secs = t.elapsed().as_secs_f64();
+        if rep == 0 {
+            report("today (fragment seen)", secs, candidates);
+        } else if rep == reps - 1 {
+            report("today (fragment seen) min", secs, candidates);
+        }
+    }
+
+    // Variant: ONE seen set for the whole frame. What the census predicts:
+    // 8.5x fewer global probes than today.
+    for rep in 0..reps {
+        let t = std::time::Instant::now();
+        let mut candidates = 0usize;
+        let mut seen: rustc_hash::FxHashSet<(u64, u64)> =
+            rustc_hash::FxHashSet::default();
+        for &key in &keys {
+            if seen.insert(key) && !visited.contains_historic(key) {
+                candidates += 1;
+            }
+        }
+        let secs = t.elapsed().as_secs_f64();
+        assert_eq!(candidates, want_candidates, "frame-seen changed a decision");
+        if rep == 0 || rep == reps - 1 {
+            report(
+                if rep == 0 { "frame seen" } else { "frame seen min" },
+                secs,
+                candidates,
+            );
+        }
+    }
+
+    // Variant: frame seen, capacity preallocated (measures rehash cost).
+    {
+        let t = std::time::Instant::now();
+        let mut candidates = 0usize;
+        let mut seen: rustc_hash::FxHashSet<(u64, u64)> =
+            rustc_hash::FxHashSet::with_capacity_and_hasher(
+                n / 8,
+                Default::default(),
+            );
+        for &key in &keys {
+            if seen.insert(key) && !visited.contains_historic(key) {
+                candidates += 1;
+            }
+        }
+        assert_eq!(candidates, want_candidates);
+        report("frame seen prealloc", t.elapsed().as_secs_f64(), candidates);
+    }
+
+    // Variant: hash-partitioned frame seen, sequential - the cache story
+    // of the per-worker partition (each partition's set is ~1/16 the
+    // size), without thread-scaling effects. Stream is re-read per
+    // partition, which is the streaming-friendly direction.
+    for parts in [4usize, 16, 64] {
+        let t = std::time::Instant::now();
+        let mut candidates = 0usize;
+        for p in 0..parts {
+            let mut seen: rustc_hash::FxHashSet<(u64, u64)> =
+                rustc_hash::FxHashSet::default();
+            for &key in &keys {
+                if (key.0 as usize) % parts != p {
+                    continue;
+                }
+                if seen.insert(key) && !visited.contains_historic(key) {
+                    candidates += 1;
+                }
+            }
+        }
+        assert_eq!(candidates, want_candidates);
+        report(
+            &format!("partitioned x{} (serial)", parts),
+            t.elapsed().as_secs_f64(),
+            candidates,
+        );
+    }
+
+    // Variant: hash-partitioned across REAL threads. Each thread owns a
+    // disjoint key partition - no coordination, the design the plan
+    // prefers for determinism option (a).
+    for threads in [4usize, 8, 16] {
+        let t = std::time::Instant::now();
+        let candidates: usize = std::thread::scope(|s| {
+            let mut handles = Vec::new();
+            for p in 0..threads {
+                let keys = &keys;
+                let visited = &visited;
+                handles.push(s.spawn(move || {
+                    let mut seen: rustc_hash::FxHashSet<(u64, u64)> =
+                        rustc_hash::FxHashSet::default();
+                    let mut cand = 0usize;
+                    for &key in keys {
+                        if (key.0 as usize) % threads != p {
+                            continue;
+                        }
+                        if seen.insert(key) && !visited.contains_historic(key) {
+                            cand += 1;
+                        }
+                    }
+                    cand
+                }));
+            }
+            handles.into_iter().map(|h| h.join().unwrap()).sum()
+        });
+        assert_eq!(candidates, want_candidates);
+        report(
+            &format!("partitioned {} threads", threads),
+            t.elapsed().as_secs_f64(),
+            candidates,
+        );
+    }
+
+    // Variant: WORKER-persistent seen. 16 threads, each takes every 16th
+    // FRAGMENT (round-robin, like the worker pool) and keeps ONE seen set
+    // across its fragments. This is the drop-in integration: no key
+    // resharding, no ordering questions - the seen filter is sound at any
+    // scope, so decisions are identical to today by construction. Reports
+    // the residual probe count too (between the frame-distinct floor and
+    // today's fragment-distinct count).
+    for threads in [16usize] {
+        let t = std::time::Instant::now();
+        let frag_starts: Vec<usize> = {
+            let mut v = Vec::with_capacity(frag_lens.len());
+            let mut acc = 0usize;
+            for &len in &frag_lens {
+                v.push(acc);
+                acc += len as usize;
+            }
+            v
+        };
+        let (candidates, probes): (usize, usize) = std::thread::scope(|s| {
+            let mut handles = Vec::new();
+            for p in 0..threads {
+                let keys = &keys;
+                let visited = &visited;
+                let frag_lens = &frag_lens;
+                let frag_starts = &frag_starts;
+                handles.push(s.spawn(move || {
+                    let mut seen: rustc_hash::FxHashSet<(u64, u64)> =
+                        rustc_hash::FxHashSet::default();
+                    let (mut cand, mut probes) = (0usize, 0usize);
+                    for f in (p..frag_lens.len()).step_by(threads) {
+                        let lo = frag_starts[f];
+                        let hi = lo + frag_lens[f] as usize;
+                        for &key in &keys[lo..hi] {
+                            if seen.insert(key) {
+                                probes += 1;
+                                if !visited.contains_historic(key) {
+                                    cand += 1;
+                                }
+                            }
+                        }
+                    }
+                    (cand, probes)
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
+        });
+        report(
+            &format!("worker seen {} threads", threads),
+            t.elapsed().as_secs_f64(),
+            candidates,
+        );
+        println!(
+            "    (worker-persistent seen: {} global probes vs today's fragment-level count)",
+            probes
+        );
+    }
+
+    // Reference points without the global probe at all: what the seen-set
+    // machinery itself costs, fragment- and frame-wide.
+    {
+        let t = std::time::Instant::now();
+        let mut acc = 0usize;
+        let mut idx = 0usize;
+        for &len in &frag_lens {
+            let mut seen: rustc_hash::FxHashSet<(u64, u64)> =
+                rustc_hash::FxHashSet::default();
+            for &key in &keys[idx..idx + len as usize] {
+                if seen.insert(key) {
+                    acc += 1;
+                }
+            }
+            idx += len as usize;
+        }
+        report("fragment seen only (no probe)", t.elapsed().as_secs_f64(), acc);
+        let t = std::time::Instant::now();
+        let mut seen: rustc_hash::FxHashSet<(u64, u64)> =
+            rustc_hash::FxHashSet::default();
+        let mut acc = 0usize;
+        for &key in &keys {
+            if seen.insert(key) {
+                acc += 1;
+            }
+        }
+        report("frame seen only (no probe)", t.elapsed().as_secs_f64(), acc);
+    }
 }

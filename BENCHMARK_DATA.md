@@ -135,6 +135,56 @@ tier removes that 8.5x directly:
     3,850,608  new
 ```
 
+# Dedup roofline, isolated (D2): the probe is everything (2026-08-19)
+
+`native-probe --dedup-bench CKPT 60` replays f60's real OFFERED key
+stream (104,953,085 keys in 6,474 fragments, dumped by
+`CELESTE_DUMP_OFFERED`) against the real mmap'd visited structure as of
+f59 (22.8M rows), timing the FILTER half of `visited_row_keys` under
+different designs. Decisions are identical across variants by
+construction; the distinct-candidate count (2,199,846) is asserted.
+
+First, the campaign's own split (census now prints it): **hashing the
+rows is 7 ns/row; the filter+probe is 233-333 ns/row of worker CPU** -
+the hash half of "row keys + visited probe" is nearly free, and one
+mmap `contains_historic` probe costs ~700 ns.
+
+| variant (f60 stream) | ns/offered row | notes |
+|---|---|---|
+| today: per-fragment seen, 1 thread | **218** | validates the campaign figure |
+| frame-wide seen, 1 thread | **37.4** | 8.5x fewer probes, same answers |
+| hash-partitioned, 16 threads | **6.1** | whole frame's filter in 0.64 s |
+| worker-persistent seen, 16 threads | 14.5 | **REFUTED as a shortcut, see below** |
+| seen-set machinery alone (no probe) | 6.0-9.7 | the floor |
+
+Three structural findings:
+
+1. **Today's pipeline hands the serial phase 17,784,200 candidate
+   events for 2,199,846 distinct new rows** - every new key is
+   re-offered ~8x because the seen set is per-fragment. The serial
+   `insert_new` collapses them, but they are hashed, buffered and
+   crossed over a thread boundary first.
+2. **The drop-in fix does not work.** Making each worker's seen set
+   persist across its fragments (no resharding, decisions provably
+   unchanged) only cuts probes 31.8M -> 21.8M (1.46x), because a hot
+   key appears in ~8 fragments that land on ~8 DIFFERENT workers.
+   14.5 ns/row at 16 threads - no better than today's 218/16. The 8.5x
+   only exists if the tier is shared across workers, i.e. keys are
+   HASH-PARTITIONED to owner threads.
+3. **Partition memory is cache-sized, as the census predicted**: 3.74M
+   frame-distinct keys / 16 partitions = ~234k keys = 3.7 MB per
+   thread, L3-resident. That is why partitioned-16 (6.1 ns) beats even
+   the modelled frame-seen-at-16 (37.4/16 = 2.3 would ignore that the
+   single shared set is DRAM-sized; the real win needs the partition).
+
+Roofline projection, H=68 interpreter run: the keys phase is 862 s of
+worker CPU (~55 s of wall). At 7 ns hash + ~6 ns filter per offered
+row, the same work is ~38 s of worker CPU (~2.5 s wall) plus 8x less
+serial-phase input - the 44% headline item of the forward stage drops
+to low single digits. The integration design this implies is in
+plans/dedup-roofline-plan.md D3/D4: partition for membership,
+serial-order id assignment for byte-identical determinism.
+
 # The "24-row divergence" was a hint-erasure re-keying; FIXED (2026-08-19)
 
 The compiled and interpreted H=68 runs' visited sets differed by 24 rows

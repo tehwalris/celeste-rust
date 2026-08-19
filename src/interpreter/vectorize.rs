@@ -1386,6 +1386,90 @@ pub fn dedup_census_take() -> Option<u64> {
 /// fragment-wide) local tier would remove.
 static GLOBAL_PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The hash/probe split of `visited_row_keys`, census-gated: worker
+/// nanoseconds spent COMPUTING keys (columns + row_key_hashes) versus
+/// FILTERING them (local seen + global probe). The 24.7 ns/offered-row
+/// figure has never been split this way, and the dedup roofline study
+/// (plans/dedup-roofline-plan.md, D2) needs the halves separately: the
+/// isolated harness replays the filter half from a dumped key stream, so
+/// only the difference is attributable to hashing.
+static KEYS_HASH_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static KEYS_PROBE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// (hash_ns, probe_ns) accumulated since the last call, and reset.
+pub fn keys_phase_ns_take() -> (u64, u64) {
+    (
+        KEYS_HASH_NS.swap(0, std::sync::atomic::Ordering::Relaxed),
+        KEYS_PROBE_NS.swap(0, std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Dump of the OFFERED key stream (`CELESTE_DUMP_OFFERED=1` + a checkpoint
+/// dir), for the dedup roofline harness (`native-probe --dedup-bench`).
+/// One file per frame, `offered/fNNN.offered`: repeated
+/// `[u32 fragment_len][fragment_len * (u64 lo, u64 hi)]` records, one per
+/// `visited_row_keys` call, in each worker's probe order. Fragment
+/// boundaries are kept because today's local `seen` set is per-fragment -
+/// a harness that wants to reproduce today's behavior needs them, and one
+/// that wants to beat it needs to know what "today" was.
+///
+/// The stream is the real thing, not a model: the sidecar `.rowkeys` hold
+/// only the 52:1 SURVIVORS, which is the wrong distribution to tune a
+/// dedup against.
+static OFFERED_DUMP: std::sync::Mutex<Option<std::io::BufWriter<std::fs::File>>> =
+    std::sync::Mutex::new(None);
+
+/// `CELESTE_DUMP_OFFERED` is the output DIRECTORY;
+/// `CELESTE_DUMP_OFFERED_FRAMES` is `lo-hi` (inclusive) or a single frame,
+/// defaulting to every frame (know the sizes first: f60 offers 120M rows =
+/// 1.9 GB, f68 offers 287M = 4.6 GB).
+pub fn offered_dump_begin_frame(frame: u32) {
+    let Some(dir) = std::env::var_os("CELESTE_DUMP_OFFERED") else {
+        return;
+    };
+    if let Ok(range) = std::env::var("CELESTE_DUMP_OFFERED_FRAMES") {
+        let (lo, hi) = match range.split_once('-') {
+            Some((a, b)) => (a.parse().unwrap(), b.parse().unwrap()),
+            None => {
+                let f: u32 = range.parse().unwrap();
+                (f, f)
+            }
+        };
+        if frame < lo || frame > hi {
+            return;
+        }
+    }
+    let odir = std::path::Path::new(&dir);
+    std::fs::create_dir_all(odir).expect("create offered dump dir");
+    let f = std::fs::File::create(odir.join(format!("f{:03}.offered", frame)))
+        .expect("create offered dump file");
+    *OFFERED_DUMP.lock().unwrap() = Some(std::io::BufWriter::new(f));
+}
+
+pub fn offered_dump_end_frame() {
+    use std::io::Write as _;
+    if let Some(mut w) = OFFERED_DUMP.lock().unwrap().take() {
+        w.flush().expect("flush offered dump");
+    }
+}
+
+fn offered_dump_fragment(keys: &[(u64, u64)]) {
+    use std::io::Write as _;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("CELESTE_DUMP_OFFERED").is_some()) {
+        return;
+    }
+    let mut guard = OFFERED_DUMP.lock().unwrap();
+    let Some(w) = guard.as_mut() else { return };
+    let mut buf = Vec::with_capacity(4 + keys.len() * 16);
+    buf.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+    for (lo, hi) in keys {
+        buf.extend_from_slice(&lo.to_le_bytes());
+        buf.extend_from_slice(&hi.to_le_bytes());
+    }
+    w.write_all(&buf).expect("write offered dump");
+}
+
 pub fn global_probes_take() -> u64 {
     GLOBAL_PROBES.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
@@ -1405,6 +1489,8 @@ pub fn visited_row_keys(
 ) -> Option<VisitedKeys> {
     use crate::interpreter::virtual_merge::{collect_columns_labeled, row_key_hashes, Column};
     let _trace = TraceSpan::new("visited_row_keys", "vectorize");
+    let census = dedup_census_on();
+    let t_hash = census.then(std::time::Instant::now);
     let shape_hash = shape_hash_of_state(state);
     let (columns, _origins) = collect_columns_labeled(std::slice::from_ref(state))?;
     let refs: Vec<&Column> = columns.iter().collect();
@@ -1452,11 +1538,18 @@ pub fn visited_row_keys(
     // (see plans/roofline-plan.md). Cross-checking a checkpoint reader
     // against this dump is what caught it, and is what to repeat if the
     // reader is ever touched. Gated, and only reached for candidate lanes.
+    if let Some(t) = t_hash {
+        KEYS_HASH_NS.fetch_add(
+            t.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
     let dump_rows = std::env::var_os("CELESTE_DUMP_ROWS").is_some();
-    let census = dedup_census_on();
     if census {
         dedup_census_sample(&keys);
     }
+    offered_dump_fragment(&keys);
+    let t_probe = census.then(std::time::Instant::now);
     let local_first = visited.local_dedup_first();
     let mut seen: rustc_hash::FxHashSet<(u64, u64)> = rustc_hash::FxHashSet::default();
     let mut candidates: Vec<(u32, (u64, u64))> = Vec::new();
@@ -1508,6 +1601,12 @@ pub fn visited_row_keys(
             }
             candidates.push((i as u32, key));
         }
+    }
+    if let Some(t) = t_probe {
+        KEYS_PROBE_NS.fetch_add(
+            t.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
     Some(VisitedKeys {
         candidates,

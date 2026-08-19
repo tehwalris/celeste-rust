@@ -277,8 +277,8 @@ message now prints the differing keys.
 |---|---|---|
 | **D0** | ~~Explain the 24-row divergence~~ **DONE**: bridge erased nil provenance hints; fixed by erasing them at the boundary (FORMAT 5), gated set-identical at H=68 | blocks trusting any deep A/B, including this plan's own gates |
 | **D1** | One key function: gate `Rt2` keys == `visited_row_keys`, or make them equal | prerequisite for a shared dedup; if it holds, a compiled run stops keying 3x |
-| **D2** | **Dedup microbenchmark, isolated** | establish the ns/row roofline the way K2 established the kernel's |
-| **D3** | Determinism design decision (a) vs (b), with a gate | must precede any integration |
+| **D2** | ~~Dedup microbenchmark, isolated~~ **DONE** - see BENCHMARK_DATA.md "Dedup roofline, isolated". today 218 ns/row -> partitioned-16 **6.1 ns/row**; hash is 7 ns/row (nearly free); one mmap probe is ~700 ns; worker-persistent seen REFUTED (1.46x, needs the partition) | establish the ns/row roofline the way K2 established the kernel's |
+| **D3** | Determinism design decision (a) vs (b), with a gate. **Decided by D2's data**: (a), hash-partition for membership; phase 2 assigns ids over candidates restored to (fragment, lane) order, which reproduces today's ids BYTE-IDENTICALLY - that is the gate | must precede any integration |
 | **D4** | Integrate the winning design; chase the gap | the kernel precedent: microbench said 198 ns, campaign delivers 346 |
 | **K1** | Deferred deopt: batch failures, one later interpreter pass | 412-430 ns/lane, and unblocks 28% of lanes for the kernel |
 | **K2** | Fallback census, then compiled coverage for those shapes | cut deopt volume at the source, not just defer it |
