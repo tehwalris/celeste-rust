@@ -342,6 +342,58 @@ default OFF pending (a) the fingerprint story for the fused artifact
 provenance) and (b) Philippe's call. CLAUDE.md's "default OFF is a
 measurement" note is now STALE in this configuration.
 
+(Blocker (a) closed the same day: commit 7932d54 hashes
+`compiled_engine = hash(compile recipe text, fused artifact
+self-fingerprint)` into the campaign fingerprint when the engine is
+on, `None` reproducing the legacy stream so interpreter checkpoints
+stay valid. Consequence used below: engines cannot share checkpoints,
+so an A/B pair means two full runs from frame 1.)
+
+## Engine adoption validation at depth (2026-08-20)
+
+The H=68 numbers above are mid-room; the ladder's first real horizon
+on room (1,0) is 94. Full forward passes from frame 1 under the ladder
+env (frontier-only, collect-first, 8000-lane caps, 16 threads,
+`--save-frames`), one binary (`--features fused`, engine toggled by
+`CELESTE_COMPILED_FORWARD=1`), two runs each, back-to-back same night:
+
+- room (1,0), `rewrites.jsonl`, `bench --frames 94 --deopt`:
+  - default engine:      550.65 / 550.87 s   15.42 / 15.33 GB peak
+  - compiled + fused:    424.39 / 424.40 s    9.24 /  9.20 GB peak
+  **-22.9% wall, -40% peak at the production horizon** - the H=68
+  result holds at depth. ALL 94 per-frame rowkey sets identical
+  (178,576,090 rows total on each engine); both engines report first
+  room-exit lanes at frame 89. The fused counters are bit-identical
+  across the two fused runs (lanes 170,292,074, dying-covered
+  248,759,424, reps 56,267) - the engine is deterministic end to end.
+  Known residue: 456,960 UNCOVERED dying lane-events (0.27% of
+  covered events; 0 at H=68, so it is a f69+ death mode), uniform
+  across every kb bit (set 228,480 / clear 228,480 for all six), i.e.
+  input-independent - a fourth dying member nobody has derived. Those
+  lanes re-run whole in the interpreter; at 0.27% it is not worth a
+  member yet.
+
+- room (0,0), `rewrites-room00.jsonl`, `bench --frames 40 --deopt`
+  (first compiled-forward run ever on a foreign-shape room):
+  - default engine:        6.44 s   0.26 GB peak
+  - compiled + fused:     25.72 s   3.13 GB peak
+  All 40 per-frame rowkey sets identical, 387,443 rows - exactly the
+  historical room (0,0) f40 row count, a free cross-check. Every one
+  of the 78,220 lanes MISSED the kernels (steady/dash/frozen 0,
+  fused 0: the witnesses are room (1,0) shapes), so this measures the
+  engine's per-chunk fan-out overhead with zero kernel payoff: 4.0x
+  time, 12x peak.
+
+**The adoption shape that falls out: per-room, not global.** The
+engine is CORRECT everywhere the gates have reached (94 + 40 frames,
+two rooms, ~179M rows, set-identical) but profitable only where its
+kernels bind. Flipping room (1,0) ladder campaigns to
+`CELESTE_COMPILED_FORWARD=1` on a `--features fused` build buys -23%
+wall / -40% peak per level-0 extend; flipping room (0,0) would cost
+4x. A room's campaign should opt in when its shapes have kernel +
+fused coverage (today: room (1,0) only). Decision is Philippe's;
+ladder.sh does not set the env either way.
+
 ### The "step-gate mystery" was a gate bug, not an engine bug (2026-08-19)
 
 `native-probe --abstract-bench` on a frontier-only campaign dir

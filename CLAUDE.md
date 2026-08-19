@@ -125,12 +125,18 @@ celeste-rust so both the forward search and the backward sweep can call it;
 module that names both.
 
 `FrameEngine::run_frame_chunk` is the same engine as ONE campaign chunk's
-frame body, and `CELESTE_COMPILED_FORWARD=1` puts it there.
-**Default OFF, and that is a measurement, not caution**: it is 1.77x on
-the un-subtracted search and 9-13% SLOWER under `CELESTE_FRONTIER_ONLY`,
-which every ladder run uses. See BENCHMARK_DATA.md, "The compiled engine
-inside the campaign", before doing any more kernel integration work -
-the bottleneck is the per-row fan-out cost, not the plumbing.
+frame body, and `CELESTE_COMPILED_FORWARD=1` puts it there. **Default
+OFF, but the right setting is PER ROOM, by measurement** (2026-08-20,
+BENCHMARK_DATA.md "Engine adoption validation at depth"): on room (1,0)
+at the production horizon (f094) the compiled+fused engine is -23% wall
+/ -40% peak with all 94 per-frame rowkey sets identical, while on room
+(0,0) - where no kernel binds, the witnesses being room (1,0) shapes -
+it is 4x SLOWER and 12x the peak, still set-identical. The engine's
+identity is hashed into the campaign fingerprint when it is on, so
+engines never share checkpoints. The fused build needs
+`--features fused` plus a per-campaign generated artifact
+(gitignored); watch out for stale non-fused binaries after
+regen-generated.sh (see the script's NOTE).
 `CELESTE_COMPILED_FORWARD=check` runs both engines and compares row-key
 sets per chunk; that is the gate, and also a test.
 

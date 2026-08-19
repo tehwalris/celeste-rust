@@ -358,6 +358,30 @@ Two implications for Phase C ordering:
    blocker (see BENCHMARK_DATA.md "The plain path for kernel deopt
    sub-chunks"). M1 remains the next performance lever after that.
 
+### Engine adoption VALIDATED AT DEPTH (2026-08-20, after M1)
+
+The fingerprint blocker closed 2026-08-19 (7932d54: compile recipe +
+fused artifact self-hash in the campaign fingerprint; engines cannot
+share checkpoints). Then, full forward passes from frame 1, ladder
+env, two runs each (tools/framesetdiff.py is the set gate):
+
+- Room (1,0) to f094 (the ladder's first real horizon): default
+  550.65/550.87 s, 15.4 GB; compiled+fused 424.39/424.40 s, 9.2 GB =
+  **-23% wall / -40% peak, all 94 per-frame rowkey sets identical**
+  (178,576,090 rows each), first room-exit at f89 on both, fused
+  counters bit-identical across runs. Residue: 456,960 uncovered
+  dying events (0.27%, f69+ only, uniform over every kb bit - an
+  input-independent death mode with no derived member; not worth one
+  yet).
+- Room (0,0), f40 segment, first compiled run on a foreign-shape
+  room: sets identical (387,443 rows, the historical count), but 4.0x
+  slower / 12x peak - zero kernels bind, pure fan-out overhead.
+
+Conclusion recorded in BENCHMARK_DATA.md ("Engine adoption validation
+at depth"): adoption is PER ROOM - flip room (1,0) campaigns on,
+leave rooms without kernel coverage off. The flip itself is
+Philippe's call; ladder.sh does not set the env either way.
+
 ### M1 scoping (2026-08-19, evening): perf split + kb-support census
 
 perf on `--abstract-bench k2ctl 65` (fused, whole process incl. the
