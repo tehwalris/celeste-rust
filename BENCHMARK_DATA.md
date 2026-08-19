@@ -135,6 +135,40 @@ tier removes that 8.5x directly:
     3,850,608  new
 ```
 
+# D1 GATED: engine row keys == interpreter row keys, as an equivalence (2026-08-19)
+
+The two key constructions (`Rt2::boundary`'s cell_mix sums, the
+interpreter's `row_key_hashes`) are different hashes and never
+numerically equal; what a shared dedup needs is that they merge exactly
+the SAME lanes. That is now gated on real data, per lane, both
+directions (`native-probe --key-gate` / `--key-gate-outputs`; each lane
+of a canonical state is keyed by BOTH functions - `boundary_canonicalize`
+is the boundary split before its dedup, so dropped lanes still have keys -
+and the pairs feed two run-global maps whose any conflict is a broken
+bijection):
+
+| gate | data | lanes | distinct keys | result |
+|---|---|---|---|---|
+| frontier f001-f068 | every distinct row of the H=68 room (1,0) run, sidecar-grounded per frame | 55,958,742 | 55,958,742 = 55,958,742 | **BIJECTION HOLDS** |
+| outputs f040 | one frame's raw pre-subtract outputs, both engines' lineages, 26:1 dup | 9,853,518 | 370,077 = 370,077 | **BIJECTION HOLDS** |
+| outputs f058 | death-shape frame, 20:1 dup (dead inputs fed directly; both frame bodies skip the 4 dead-input fragments, ~719k lanes, reported - the campaign deopts exactly those) | 70,946,080 | 3,530,217 = 3,530,217 | **BIJECTION HOLDS** |
+
+The frontier direction kills the live soundness worry: `run_frame_chunk`
+dedups internally with engine keys BEFORE the campaign re-keys (`dedup_
+keeps_serial`, kernel pre-dedup), so an engine-key collision on rows the
+interpreter distinguishes is silent row loss (the #148 class). Zero
+collisions across all 55.9M distinct rows the search ever visited. The
+outputs direction covers the reverse (engine over-splitting what the
+interpreter merges) on dup-heavy real streams.
+
+Repricing the plan's "a compiled run stops keying 3x": D2 measured
+hashing at 7 ns/row - the redundant keying is worth ~nothing in wall
+time, so D1's deliverable is this certificate, not a perf change.
+Numeric unification (one shared key function) would only matter if
+sidecars were to be written straight from blocks, i.e. if the compiled
+engine became the campaign default, which it is not (see "The compiled
+engine inside the campaign"). Not pursued.
+
 # D4 LANDED: hash-partitioned visited filter, -31% forward wall (2026-08-19)
 
 The D2 design, integrated. Workers now only HASH their fragments

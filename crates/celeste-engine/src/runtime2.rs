@@ -588,6 +588,17 @@ impl Rt2 {
     }
 
     pub fn boundary(&mut self, ids: &BoundaryIds) -> usize {
+        self.boundary_canonicalize(ids);
+        self.boundary_dedup()
+    }
+
+    /// The boundary WITHOUT the final within-block dedup: abstraction,
+    /// canonical BFS compaction, and the per-lane row keys for ALL `width`
+    /// lanes, in lane order. Split out for the D1 key gate
+    /// (plans/dedup-roofline-plan.md): the gate pairs each lane's engine
+    /// row key with the interpreter's `visited_row_keys` for the SAME
+    /// lane, which requires the keys of lanes the dedup would drop.
+    pub fn boundary_canonicalize(&mut self, ids: &BoundaryIds) {
         // Materialize every stale column - the boundary walks whole
         // columns (BFS pointer scan, hashing, compaction).
         for p in 0..self.cols.len() {
@@ -866,7 +877,13 @@ impl Rt2 {
                 mix64(part2.wrapping_add(h2[i])),
             ))
             .collect();
+    }
 
+    /// The boundary's tail: dedup within the block (keeping the first lane
+    /// of each row key) and recycle the local arena. `boundary` =
+    /// `boundary_canonicalize` + this.
+    fn boundary_dedup(&mut self) -> usize {
+        let w = self.width;
         // Dedup within the block, keeping the first lane of each row.
         let mut keep: Vec<u32> = Vec::new();
         let mut seen_rows: FxHashMap<(u64, u64), ()> = FxHashMap::default();

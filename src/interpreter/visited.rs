@@ -222,6 +222,13 @@ impl FrameKeys {
         self.count
     }
 
+    /// All `(key, id)` records in file order (ascending by key). For
+    /// gates that cross-check a frame's RECORDED keys against a
+    /// recomputation (native-probe `--key-gate`, D1).
+    pub fn iter(&self) -> impl Iterator<Item = ((u64, u64), u32)> + '_ {
+        (0..self.count).map(|i| self.record(i))
+    }
+
     fn record(&self, i: usize) -> ((u64, u64), u32) {
         let off = HEADER_BYTES + i * RECORD_BYTES;
         let b = &self.mmap[off..off + RECORD_BYTES];
