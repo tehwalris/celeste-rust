@@ -712,25 +712,23 @@ pub fn step(
                         // program's premises by construction - the plain
                         // path, as in `run_frame_chunk`.
                         //
-                        // KNOWN ISSUE (2026-08-19): `native-probe
-                        // --abstract-bench` on THIS path reports 0
-                        // missing / 4.12M EXTRA keys at f066. Ruled OUT
-                        // by measurement so far: the plain path (66k
-                        // lanes cannot make 4.12M keys), the campaign
-                        // path (all-68-frame set identity holds there),
-                        // button widening (p_jump/p_dash are latch STATE
-                        // and deliberately never widened - see the
-                        // 2026-08-06 note in abstraction.rs), and the
-                        // frontier (the bench's new check: 0 of the
-                        // 4,123,936 extras appear anywhere in the f001..
-                        // f065 visited sidecars - the extras are NOVEL
-                        // rows). The engine's step() output at f065->
-                        // f066 is a strict superset of the interpreter's
-                        // with ~90% extra fabricated keys; the twin
-                        // blocks (equal shape+width, p_dash flipped) are
-                        // where to keep digging. Do not trust step()-
-                        // based gates with kernels enabled until this is
-                        // root-caused; the campaign gates stand.
+                        // The 2026-08-19 "step-gate mystery" (0 missing /
+                        // 4.12M extra keys at f065->f066) RESOLVED the
+                        // same day, in this path's favor: the reference
+                        // dir was a FRONTIER-ONLY campaign, whose saved
+                        // frames are the NEW rows of each frame, while
+                        // `step` returns the raw successor set - and all
+                        // 4,123,936 extras are rows visited in f000..
+                        // f065, checked in the engine's own key space
+                        // (import + boundary of every saved frame). An
+                        // earlier check against the frames/*.rowkeys
+                        // sidecars had "refuted" this - wrongly: the
+                        // sidecars hold the INTERPRETER's keys, a
+                        // different key space related to the engine's
+                        // only by the D1 bijection, so that intersection
+                        // is empty by construction. The bench's gate 2 is
+                        // frontier-aware now (extras must be visited
+                        // rows); step() and the campaign path agree.
                         if !kernel_ok {
                             if let Some(plain) = &this.plain {
                                 let (cart, cache) =

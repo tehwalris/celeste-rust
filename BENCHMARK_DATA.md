@@ -342,6 +342,44 @@ default OFF pending (a) the fingerprint story for the fused artifact
 provenance) and (b) Philippe's call. CLAUDE.md's "default OFF is a
 measurement" note is now STALE in this configuration.
 
+### The "step-gate mystery" was a gate bug, not an engine bug (2026-08-19)
+
+`native-probe --abstract-bench` on a frontier-only campaign dir
+(k2ctl, f065->f066) reported 0 missing / 4,123,936 EXTRA row keys from
+`FrameEngine::step`, and a first check against the `frames/*.rowkeys`
+sidecars found 0 of the extras among visited rows - which read as the
+engine fabricating novel states. Both halves of that were wrong, and
+the failure mode is worth recording:
+
+* The extras were REVISITED rows, exactly what a frontier-only
+  reference misses: the saved frames are each frame's NEW rows, while
+  `step` returns the raw successor set. Recomputed in the engine's own
+  key space (import + `boundary` over every saved frame f000..f065:
+  41.6M visited rows), **4,123,936 of 4,123,936 extras are visited
+  rows, 0 unexplained**. An extra-lane autopsy agreed before the count
+  did: each sampled extra differed from its nearest reference row in
+  ONE cell - `objects.1.y` by a pixel, `objects.1.spd.y` by exactly
+  one gravity tick (0.21) - i.e. real game states from earlier in the
+  search, not corruption. A `CELESTE_FUSED=0` bisect produced the
+  byte-identical mismatch, exonerating the fused executor before the
+  frontier result landed.
+* The refuting check intersected keys ACROSS KEY SPACES. The sidecars
+  hold the interpreter's keys (`vectorize::visited_row_keys`,
+  `row_key_hashes` over State columns); the gate compares Rt2
+  `boundary` keys. D1 (#156) established these as a BIJECTION, not an
+  identity - raw-value intersection across the two spaces is empty by
+  construction and refutes nothing. Rule: a key is meaningful only in
+  the space that minted it; any cross-engine set comparison must
+  canonicalize BOTH sides through one keyer first (which is exactly
+  what gate 2 itself already did - the frontier check just didn't).
+
+The bench's gate 2 is frontier-aware now: verdict "row-key set equal
+MODULO VISITED" requires missing == 0 AND every extra to be a visited
+row. Four intermediate wrong conclusions from 2026-08-19 (fabricated
+rows, p_dash twin-block suspicion, chimera-lane theory, "do not trust
+step()-based gates") are all withdrawn; step() and the campaign path
+agree, and the campaign gates were never affected.
+
 # K2's pm1 death-partition fix: REFUTED - inert and slightly slower (2026-08-19)
 
 The census's preferred fix (add `will_restart` to the pm1 partition

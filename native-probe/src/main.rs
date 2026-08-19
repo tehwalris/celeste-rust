@@ -999,31 +999,50 @@ fn run_abstract_bench(dir: &str, frame: u32, reps: u32) {
             // states are the NEW rows of the frame, while `step` returns
             // the raw successor set - so "extra" keys that are simply
             // rows visited in EARLIER frames are not a divergence at
-            // all. Report how many of the extras the visited sidecars
-            // (frames/f001..f{N-1}.rowkeys) account for.
+            // all.
+            //
+            // The visited set is computed IN THE ENGINE'S KEY SPACE, by
+            // importing every saved frame's states and running `boundary`
+            // - the same canonicalizer as both sides of the gate. A first
+            // version of this check read the `frames/*.rowkeys` sidecars
+            // instead, got 0 overlap, and concluded the extras were novel
+            // fabricated rows; that was wrong. The sidecars store the
+            // INTERPRETER's keys (`vectorize::visited_row_keys`:
+            // `row_key_hashes` over State columns), which relate to the
+            // engine's Rt2 boundary keys only by the D1 BIJECTION - raw
+            // value intersection across the two spaces is empty by
+            // construction and refutes nothing.
+            let mut accounted = 0usize;
             if extra > 0 {
                 let mut visited: rustc_hash::FxHashSet<(u64, u64)> = Default::default();
-                for n in 1..=frame {
-                    let p = format!("{}/frames/f{:03}.rowkeys", dir, n);
-                    let Ok(bytes) = std::fs::read(&p) else { continue };
-                    let recs = &bytes[32.min(bytes.len())..];
-                    for rec in recs.chunks_exact(24) {
-                        let lo = u64::from_le_bytes(rec[0..8].try_into().unwrap());
-                        let hi = u64::from_le_bytes(rec[8..16].try_into().unwrap());
-                        visited.insert((lo, hi));
+                let mut frames_seen = 0u32;
+                for n in 0..=frame {
+                    let p = std::path::Path::new(dir);
+                    if !p.join("frames").join(format!("f{:03}.bin", n)).exists()
+                        && !p.join(format!("f{:03}", n)).join("meta.json").exists()
+                    {
+                        continue;
+                    }
+                    frames_seen += 1;
+                    for st in &load_states_any(dir, n) {
+                        let mut b = import::import_block(st, cart.clone(), cache.clone());
+                        b.boundary(&ids);
+                        visited.extend(b.row_keys.iter().copied());
                     }
                 }
                 if !visited.is_empty() {
-                    let accounted = eng_keys
+                    accounted = eng_keys
                         .difference(&ref_keys)
                         .filter(|k| visited.contains(k))
                         .count();
                     eprintln!(
-                        "  frontier check: {} of {} extra keys are rows visited in f001..f{:03} \
-                         ({} truly unexplained)",
+                        "  frontier check: {} of {} extra keys are rows visited in f000..f{:03} \
+                         ({} frames on disk, {} visited rows; {} truly unexplained)",
                         accounted,
                         extra,
                         frame,
+                        frames_seen,
+                        visited.len(),
                         extra - accounted
                     );
                 }
@@ -1033,6 +1052,21 @@ fn run_abstract_bench(dir: &str, frame: u32, reps: u32) {
                     "f{:03} lanes {} == interpreter, row-key SET EQUAL (gate 2) OK",
                     frame + k,
                     got
+                )
+            } else if missing == 0 && extra > 0 && accounted == extra {
+                // The 2026-08-19 "step-gate mystery", resolved: on a
+                // frontier-only campaign dir the saved frame is the NEW
+                // rows only, so the raw successor set is the reference
+                // PLUS re-visited rows. Row-for-row this held on room
+                // (1,0) f065->f066: engine 8,715,348 = 4,591,412 ref +
+                // 4,123,936 all found in f000..f065's visited rows.
+                format!(
+                    "f{:03} engine {} = {} ref + {} revisited, row-key set equal \
+                     MODULO VISITED (frontier-aware gate 2) OK",
+                    frame + k,
+                    got,
+                    r,
+                    accounted
                 )
             } else {
                 // Row keys are seeded with the block shape hash, so a
@@ -1101,6 +1135,139 @@ fn run_abstract_bench(dir: &str, frame: u32, reps: u32) {
                             }
                         }
                         break 'twin;
+                    }
+                }
+                // EXTRA-LANE AUTOPSY: decode a few of the engine's extra
+                // rows against their NEAREST reference lane (fewest
+                // differing cells). The twin diagnosis names the cell two
+                // engine blocks disagree on; this names the cell(s) an
+                // extra row disagrees with the INTERPRETER on - the
+                // fabricated field should pop out, concrete-vs-unknown
+                // included, because `Col::at` compares content.
+                if missing == 0 && extra > 0 {
+                    let ref_blocks: Vec<runtime2::Rt2> = load_states_any(dir, frame + k)
+                        .iter()
+                        .map(|st| {
+                            let mut b = import::import_block(st, cart.clone(), cache.clone());
+                            b.boundary(&ids);
+                            b
+                        })
+                        .collect();
+                    let mut extras: Vec<(u64, u64)> =
+                        eng_keys.difference(&ref_keys).copied().collect();
+                    extras.sort_unstable();
+                    let mut eng_index: rustc_hash::FxHashMap<(u64, u64), (usize, usize)> =
+                        Default::default();
+                    for (bi, b) in chase.iter().enumerate() {
+                        for (i, k) in b.row_keys.iter().enumerate() {
+                            eng_index.entry(*k).or_insert((bi, i));
+                        }
+                    }
+                    // pm1 cells resolve in recipe order: present globals
+                    // first, then the player-object fields.
+                    const PM1_NAMES: [&str; 6] =
+                        ["has_dashed", "freeze", "dash_time", "djump", "p_dash", "p_jump"];
+                    for key in extras.iter().take(3) {
+                        let Some(&(bi, lane)) = eng_index.get(key) else { continue };
+                        let eb = &chase[bi];
+                        let pm1 = eb.pm1_cells(&ids);
+                        let label = |cell: usize| -> String {
+                            for (gi, name) in gen::GLOBAL_NAMES.iter().enumerate() {
+                                if eb.globals.get(gi) == Some(&(cell as u32)) {
+                                    return format!(" (global {})", name);
+                                }
+                            }
+                            if let Some(j) = pm1.iter().position(|&c| c as usize == cell) {
+                                if let Some(n) = PM1_NAMES.get(j) {
+                                    return format!(" (pm1 {})", n);
+                                }
+                            }
+                            String::new()
+                        };
+                        // Nearest ref lane, same-shape blocks preferred.
+                        let mut best: Option<(usize, usize, usize)> = None;
+                        for pass in 0..2 {
+                            for (rbi, rb) in ref_blocks.iter().enumerate() {
+                                let same_shape = rb.shape_hash == eb.shape_hash;
+                                if (pass == 0) != same_shape || rb.cols.len() != eb.cols.len() {
+                                    continue;
+                                }
+                                let mut mism = vec![0u32; rb.width];
+                                for c in 0..eb.cols.len() {
+                                    let ev = eb.cols[c].at(lane);
+                                    match &rb.cols[c] {
+                                        runtime2::Col::U(v) => {
+                                            if *v != ev {
+                                                for m in mism.iter_mut() {
+                                                    *m += 1;
+                                                }
+                                            }
+                                        }
+                                        col => {
+                                            for (l, m) in mism.iter_mut().enumerate() {
+                                                if col.at(l) != ev {
+                                                    *m += 1;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some((l, m)) =
+                                    mism.iter().enumerate().min_by_key(|(_, m)| **m)
+                                {
+                                    if best.is_none() || (*m as usize) < best.unwrap().0 {
+                                        best = Some((*m as usize, rbi, l));
+                                    }
+                                }
+                            }
+                            if best.is_some() {
+                                break;
+                            }
+                        }
+                        match best {
+                            Some((m, rbi, rlane)) => {
+                                let rb = &ref_blocks[rbi];
+                                eprintln!(
+                                    "  AUTOPSY extra {:#018x}:{:#018x} = engine block {} lane {} \
+                                     (shape {:#x}); nearest ref block {} lane {}{}: {} cell(s) differ:",
+                                    key.0,
+                                    key.1,
+                                    bi,
+                                    lane,
+                                    eb.shape_hash,
+                                    rbi,
+                                    rlane,
+                                    if rb.shape_hash == eb.shape_hash {
+                                        ""
+                                    } else {
+                                        " [DIFFERENT SHAPE]"
+                                    },
+                                    m
+                                );
+                                let mut shown = 0;
+                                for c in 0..eb.cols.len() {
+                                    let (ev, rv) = (eb.cols[c].at(lane), rb.cols[c].at(rlane));
+                                    if ev != rv {
+                                        eprintln!(
+                                            "    cell {}{}: engine {:?} vs ref {:?}",
+                                            c,
+                                            label(c),
+                                            ev,
+                                            rv
+                                        );
+                                        shown += 1;
+                                        if shown == 20 {
+                                            eprintln!("    ... (suppressed)");
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            None => eprintln!(
+                                "  AUTOPSY extra {:#018x}:{:#018x}: no comparable ref block",
+                                key.0, key.1
+                            ),
+                        }
                     }
                 }
                 // Structural diff of the first block on each side. Dumping
