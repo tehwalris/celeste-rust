@@ -73,6 +73,45 @@ enum CellT {
     Unk,
 }
 
+/// One line of an emitted kernel body - and, for `Let`, one NODE of the
+/// member's pure expression graph (plans/shape-tag-plan.md step 2b). The
+/// emitter used to stream text; keeping the bindings structured is what the
+/// specialization-fusion pass consumes (value numbering over `Let` nodes),
+/// while `render` reproduces the streamed text byte-for-byte for the
+/// generated crates (`generated_is_current` is the gate on that).
+#[derive(Clone, Debug)]
+pub enum Line {
+    /// A structural or effect statement: fork-loop headers, `zguard`/`*bd`
+    /// guards, comments. Classified by the fusion pass by its (regular,
+    /// machine-generated) text.
+    Raw(String),
+    /// `let name: ty = expr;` - a value node. `expr`'s arguments are
+    /// whole-identifier variable names, witness field accesses (`u.cN`,
+    /// `rin.cN`) or literals, so the graph edges recover by identifier scan.
+    Let {
+        name: String,
+        ty: &'static str,
+        expr: String,
+    },
+}
+
+fn render_lines(lines: &[Line]) -> String {
+    let mut out = String::new();
+    for line in lines {
+        match line {
+            Line::Raw(s) => {
+                out.push_str("    ");
+                out.push_str(s);
+                out.push('\n');
+            }
+            Line::Let { name, ty, expr } => {
+                out.push_str(&format!("    let {}: {} = {};\n", name, ty, expr));
+            }
+        }
+    }
+    out
+}
+
 struct Emit {
     /// Number of witness cells (ids below this are boundary state; at or
     /// above are frame-local scratch).
@@ -87,8 +126,8 @@ struct Emit {
     vary_in: BTreeMap<u32, &'static str>,
     /// Cells written by a Store anywhere in the frame.
     dirty: BTreeSet<u32>,
-    pre: String,
-    suf: String,
+    pre: Vec<Line>,
+    suf: Vec<Line>,
     n: usize,
     /// name -> rust type of every generated let (for the Pre struct).
     var_ty: HashMap<String, &'static str>,
@@ -127,7 +166,7 @@ struct Emit {
 }
 
 impl Emit {
-    fn buf(&mut self) -> &mut String {
+    fn buf(&mut self) -> &mut Vec<Line> {
         if self.cur_tainted {
             &mut self.suf
         } else {
@@ -135,15 +174,19 @@ impl Emit {
         }
     }
     fn line(&mut self, s: &str) {
-        let indent = "    ";
-        let text = format!("{}{}\n", indent, s);
-        self.buf().push_str(&text);
+        self.buf().push(Line::Raw(s.to_string()));
     }
-    /// Let-bind `expr` of rust type `ty`; returns the variable name.
+    /// Let-bind `expr` of rust type `ty`; returns the variable name. The
+    /// binding is kept structured (`Line::Let`) - it is one node of the
+    /// member's expression graph.
     fn bind(&mut self, ty: &'static str, expr: &str) -> String {
         let name = format!("v{}", self.n);
         self.n += 1;
-        self.line(&format!("let {}: {} = {};", name, ty, expr));
+        self.buf().push(Line::Let {
+            name: name.clone(),
+            ty,
+            expr: expr.to_string(),
+        });
         self.var_ty.insert(name.clone(), ty);
         if self.cur_tainted {
             self.tainted_vars.insert(name.clone());
@@ -364,8 +407,8 @@ pub fn emit_kernel_text(program: &Program, witness_path: &str) -> Result<String>
         uni: BTreeMap::new(),
         vary_in: BTreeMap::new(),
         dirty: BTreeSet::new(),
-        pre: String::new(),
-        suf: String::new(),
+        pre: Vec::new(),
+        suf: Vec::new(),
         n: 0,
         var_ty: HashMap::new(),
         pre_defs: BTreeSet::new(),
@@ -1756,9 +1799,11 @@ fn render(e: &Emit) -> Result<String> {
         }
         false
     };
+    let pre_text = render_lines(&e.pre);
+    let suf_text = render_lines(&e.suf);
     let mut crossing: BTreeSet<String> = BTreeSet::new();
     for name in &e.pre_defs {
-        if word_used(&e.suf, name) {
+        if word_used(&suf_text, name) {
             crossing.insert(name.clone());
         }
     }
@@ -1790,7 +1835,7 @@ fn render(e: &Emit) -> Result<String> {
          \x20   let mut bd_flag: bool = false;\n\
          \x20   let bd: &mut bool = &mut bd_flag;"
     )?;
-    out.push_str(&e.pre);
+    out.push_str(&pre_text);
     writeln!(out, "    let p = Pre {{")?;
     for name in &crossing {
         writeln!(out, "        {},", name)?;
@@ -1818,7 +1863,7 @@ fn render(e: &Emit) -> Result<String> {
     // class stores the buttons straight into p_jump/p_dash, which is a
     // tainted OUT FIELD with no suffix instruction behind it (gate f35,
     // 2026-08-18: 1358 rows missing at f37).
-    let mut suffix_text = e.suf.clone();
+    let mut suffix_text = suf_text.clone();
     for (id, _, expr, tainted) in &out_fields {
         if *tainted {
             suffix_text.push('\n');
@@ -1832,7 +1877,7 @@ fn render(e: &Emit) -> Result<String> {
     // failure one level up. Taint routing should make this impossible;
     // hold it loudly rather than trust it.
     for k in 0..6 {
-        if mentions_ident(&e.pre, &format!("kb{}", k)) {
+        if mentions_ident(&pre_text, &format!("kb{}", k)) {
             bail!("button bit kb{} leaked into the button-independent prefix", k);
         }
     }
@@ -1878,7 +1923,7 @@ fn render(e: &Emit) -> Result<String> {
     for k in 0..6 {
         writeln!(out, "    let kb{}: bool = (B >> {}) & 1 != 0;", k, k)?;
     }
-    out.push_str(&e.suf);
+    out.push_str(&suf_text);
     writeln!(out, "    out(B, osh, &KOut {{")?;
     writeln!(out, "        valid: p.valid,")?;
     writeln!(out, "        deopt: dp,")?;
@@ -1897,8 +1942,8 @@ fn render(e: &Emit) -> Result<String> {
         e.vary_in.len(),
         out_fields.len(),
         crossing.len(),
-        e.pre.lines().count(),
-        e.suf.lines().count(),
+        pre_text.lines().count(),
+        suf_text.lines().count(),
         e.witness_len,
     );
     Ok(out)
