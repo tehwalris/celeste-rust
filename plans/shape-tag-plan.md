@@ -406,7 +406,37 @@ frame 1.2%); row accounting byte-identical, memberchecks ok, suite
 redundant bare-name crossing force-add (their last suffix users were
 stage-1-hoisted).
 
-**Stage 3 (the remaining M1 half), design 2026-08-19**: the
+**Stage 3 LANDED (2026-08-20, night)**: implemented as designed below,
+plus two finds the design missed:
+
+- **The fork-combo cache bug**: frame()'s variant sweep runs once per
+  PREFIX FORK COMBINATION, not once per 16-lane group - p/osh/segment
+  caches are all recomputed inside the fork nesting. Executor-side key
+  partials cached "per group" leaked across combos and the gate caught
+  it (1.18M missing / 2.59M extra keys). Fix: the callback now leads
+  with `cfg`, a 1-based fork-combo counter, and run_fused resets its
+  base/class caches whenever cfg changes. `CELESTE_KEYCHECK=1` is a
+  permanent env-gated executor check (factored vs monolithic keys per
+  callback, divergence localized to the stale class) - it verified the
+  fix at zero mismatches over the full f065 bench.
+- **A measurement trap**: regen-generated.sh's final workspace build
+  overwrites target/release/native-probe WITHOUT the fused feature,
+  and a later `-p native-probe --features celeste-rust/fused` can see
+  a fresh fingerprint and skip the relink - the binary stays
+  non-fused, silently 33% slower, with the row accounting still green
+  (fallback preserves rows). `touch native-probe/src/main.rs` before
+  rebuilding. First "stage 3" bench read 17.5s for this reason; a
+  perf profile (no fused symbols at all) exposed it.
+
+Measured, same-night A/B at 6 reps on `--abstract-bench k2ctl 65`:
+stage 2 min 13.17s / mean 13.24s, stage 3 min 12.85s / mean 13.09s =
+**-2.5% min / -1.1% mean**. Cell-mixes per (group x combo):
+64x20 = 1,280 -> 378 as designed. Row accounting byte-identical,
+keycheck clean, memberchecks ok, suite green. The dy_reps
+BTreeMap->FxHashMap side quest measured NEUTRAL (12.94s min vs
+12.85s) and was reverted - the wide-key compares are not hot.
+
+**Stage 3 design (2026-08-19, as landed)**: the
 `run_fused` closure - prededup `row_keys`, dy rep keying,
 `append_out` - is now the dominant fused-engine cost at 8.5% of
 process (unchanged by stage 2, as scoped). Key facts measured/read:

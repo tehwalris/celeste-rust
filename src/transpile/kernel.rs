@@ -1778,25 +1778,13 @@ pub(crate) fn emit_interface(out: &mut String, e: &Emit, of: &OutFields) -> Resu
     // shape witness, so the runner passes them in as masks over
     // KEY_CELLS (built from Rt2::mark_walk) and the generated code
     // checks the types it can handle.
-    let mut key_cells: Vec<(u32, &'static str, bool)> = Vec::new();
-    for (id, ty, _, tainted) in out_fields {
-        key_cells.push((*id, ty, *tainted));
-    }
-    for (id, kind) in &e.vary_in {
-        if out_set.contains(id) {
-            continue;
-        }
-        key_cells.push((*id, if *kind == "num" { "IN_N" } else { "IN_B" }, true));
-    }
+    let key_cells = key_cells(e, of)?;
     writeln!(out, "/// Cells the pre-dedup key covers, in key-bit order.")?;
     writeln!(out, "pub const KEY_CELLS: &[u32] = &[")?;
     for (id, _, _) in &key_cells {
         writeln!(out, "    {},", id)?;
     }
     writeln!(out, "];\n")?;
-    if key_cells.len() > 64 {
-        bail!("more than 64 key cells - the KeyPlan masks are u64");
-    }
     writeln!(
         out,
         "#[allow(unused_variables)]\n\
@@ -1805,62 +1793,7 @@ pub(crate) fn emit_interface(out: &mut String, e: &Emit, of: &OutFields) -> Resu
          \x20   let mut h2 = [0u64; W];"
     )?;
     for (j, (id, ty, tainted)) in key_cells.iter().enumerate() {
-        let src = if *tainted { "kv" } else { "sh" };
-        writeln!(out, "    // cell {} ({})", id, ty)?;
-        writeln!(out, "    if plan.rem & (1 << {}) == 0 {{", j)?;
-        let per_lane_num = |val: &str| {
-            format!(
-                "        let c1 = 0x5bf0_3635u64 ^ ({id}u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);\n\
-                 \x20       let c2 = 0x27d4_eb2fu64 ^ ({id}u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);\n\
-                 \x20       for i in 0..W {{\n\
-                 \x20           let v = {val};\n\
-                 \x20           let v = if plan.det & (1 << {j}) != 0 && v < P8::from_raw(0i32) {{ P8::from_raw(0i32) }} else {{ v }};\n\
-                 \x20           let code = 1u64 << 56 | v.to_bits() as u64;\n\
-                 \x20           h1[i] = h1[i].wrapping_add(mix64(c1 ^ code));\n\
-                 \x20           h2[i] = h2[i].wrapping_add(mix64(c2 ^ code));\n\
-                 \x20       }}",
-                id = id, j = j, val = val
-            )
-        };
-        let per_lane_av = |val: &str| {
-            format!(
-                "        for i in 0..W {{\n\
-                 \x20           let v = {val};\n\
-                 \x20           h1[i] = h1[i].wrapping_add(cell_mix({id}u64, v, 0x5bf0_3635));\n\
-                 \x20           h2[i] = h2[i].wrapping_add(cell_mix({id}u64, v, 0x27d4_eb2f));\n\
-                 \x20       }}",
-                id = id, val = val
-            )
-        };
-        let body = match *ty {
-            "ZN" => per_lane_num(&format!("{}.c{}[i]", src, id)),
-            "P8" => per_lane_num(&format!("{}.c{}", src, id)),
-            "IN_N" => per_lane_num(&format!(
-                "match &chunk.cols[{id}] {{ Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() }}",
-                id = id
-            )),
-            "ZI" => per_lane_av(&format!("AV::Ival({src}.c{id}.lo[i], {src}.c{id}.hi[i])", src = src, id = id)),
-            "(P8, P8)" => per_lane_av(&format!("AV::Ival({src}.c{id}.0, {src}.c{id}.1)", src = src, id = id)),
-            "ZB" => per_lane_av(&format!("AV::Bool({src}.c{id}.val & (1 << i) != 0)", src = src, id = id)),
-            "bool" => per_lane_av(&format!("AV::Bool({src}.c{id})", src = src, id = id)),
-            "IN_B" => per_lane_av(&format!(
-                "match &chunk.cols[{id}] {{ Col::V(s) => s[(lo + i).min(chunk.width - 1)], Col::U(a) => *a, _ => unreachable!() }}",
-                id = id
-            )),
-            other => bail!("row_keys: type {}", other),
-        };
-        // Only numeric cells can carry the dash_effect_time clamp; a
-        // det mask on anything else means the heap walk and the shape
-        // witness disagree, which must not pass silently.
-        if !matches!(*ty, "ZN" | "P8" | "IN_N") {
-            writeln!(
-                out,
-                "        assert!(plan.det & (1 << {}) == 0, \"det clamp on non-numeric cell {}\");",
-                j, id
-            )?;
-        }
-        writeln!(out, "{}", body)?;
-        writeln!(out, "    }}")?;
+        emit_key_cell(out, j, *id, ty, *tainted)?;
     }
     writeln!(
         out,
@@ -1870,6 +1803,101 @@ pub(crate) fn emit_interface(out: &mut String, e: &Emit, of: &OutFields) -> Resu
          }}\n"
     )?;
 
+    Ok(())
+}
+
+/// The pre-dedup key-cell list, in key-bit order: out cells first, then
+/// pass-through vary_in cells. Shared between the monolithic `row_keys`
+/// above and the fused artifact's support-factored partial-key functions
+/// (transpile::fuse) - both must agree on the ORDER, since the runtime
+/// KeyPlan skip masks index into it.
+pub(crate) fn key_cells(e: &Emit, of: &OutFields) -> Result<Vec<(u32, &'static str, bool)>> {
+    let mut cells: Vec<(u32, &'static str, bool)> = Vec::new();
+    let out_set: BTreeSet<u32> = of.fields.iter().map(|(id, _, _, _)| *id).collect();
+    for (id, ty, _, tainted) in &of.fields {
+        cells.push((*id, ty, *tainted));
+    }
+    for (id, kind) in &e.vary_in {
+        if out_set.contains(id) {
+            continue;
+        }
+        cells.push((*id, if *kind == "num" { "IN_N" } else { "IN_B" }, true));
+    }
+    if cells.len() > 64 {
+        bail!("more than 64 key cells - the KeyPlan masks are u64");
+    }
+    Ok(cells)
+}
+
+/// One key cell's hash contribution into local `h1`/`h2` accumulators:
+/// `h[i] += mix64(cell_const ^ code(v))`, guarded by the runtime KeyPlan
+/// skip mask at the cell's ORIGINAL key-bit index `j`. Extracted so the
+/// fused emitter can regroup cells into support-factored partial-key
+/// functions: the whole key is a commutative per-cell SUM, so any
+/// regrouping that preserves `j` produces byte-identical keys.
+pub(crate) fn emit_key_cell(
+    out: &mut String,
+    j: usize,
+    id: u32,
+    ty: &str,
+    tainted: bool,
+) -> Result<()> {
+    let src = if tainted { "kv" } else { "sh" };
+    writeln!(out, "    // cell {} ({})", id, ty)?;
+    writeln!(out, "    if plan.rem & (1 << {}) == 0 {{", j)?;
+    let per_lane_num = |val: &str| {
+        format!(
+            "        let c1 = 0x5bf0_3635u64 ^ ({id}u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);\n\
+             \x20       let c2 = 0x27d4_eb2fu64 ^ ({id}u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);\n\
+             \x20       for i in 0..W {{\n\
+             \x20           let v = {val};\n\
+             \x20           let v = if plan.det & (1 << {j}) != 0 && v < P8::from_raw(0i32) {{ P8::from_raw(0i32) }} else {{ v }};\n\
+             \x20           let code = 1u64 << 56 | v.to_bits() as u64;\n\
+             \x20           h1[i] = h1[i].wrapping_add(mix64(c1 ^ code));\n\
+             \x20           h2[i] = h2[i].wrapping_add(mix64(c2 ^ code));\n\
+             \x20       }}",
+            id = id, j = j, val = val
+        )
+    };
+    let per_lane_av = |val: &str| {
+        format!(
+            "        for i in 0..W {{\n\
+             \x20           let v = {val};\n\
+             \x20           h1[i] = h1[i].wrapping_add(cell_mix({id}u64, v, 0x5bf0_3635));\n\
+             \x20           h2[i] = h2[i].wrapping_add(cell_mix({id}u64, v, 0x27d4_eb2f));\n\
+             \x20       }}",
+            id = id, val = val
+        )
+    };
+    let body = match ty {
+        "ZN" => per_lane_num(&format!("{}.c{}[i]", src, id)),
+        "P8" => per_lane_num(&format!("{}.c{}", src, id)),
+        "IN_N" => per_lane_num(&format!(
+            "match &chunk.cols[{id}] {{ Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() }}",
+            id = id
+        )),
+        "ZI" => per_lane_av(&format!("AV::Ival({src}.c{id}.lo[i], {src}.c{id}.hi[i])", src = src, id = id)),
+        "(P8, P8)" => per_lane_av(&format!("AV::Ival({src}.c{id}.0, {src}.c{id}.1)", src = src, id = id)),
+        "ZB" => per_lane_av(&format!("AV::Bool({src}.c{id}.val & (1 << i) != 0)", src = src, id = id)),
+        "bool" => per_lane_av(&format!("AV::Bool({src}.c{id})", src = src, id = id)),
+        "IN_B" => per_lane_av(&format!(
+            "match &chunk.cols[{id}] {{ Col::V(s) => s[(lo + i).min(chunk.width - 1)], Col::U(a) => *a, _ => unreachable!() }}",
+            id = id
+        )),
+        other => bail!("row_keys: type {}", other),
+    };
+    // Only numeric cells can carry the dash_effect_time clamp; a
+    // det mask on anything else means the heap walk and the shape
+    // witness disagree, which must not pass silently.
+    if !matches!(ty, "ZN" | "P8" | "IN_N") {
+        writeln!(
+            out,
+            "        assert!(plan.det & (1 << {}) == 0, \"det clamp on non-numeric cell {}\");",
+            j, id
+        )?;
+    }
+    writeln!(out, "{}", body)?;
+    writeln!(out, "    }}")?;
     Ok(())
 }
 

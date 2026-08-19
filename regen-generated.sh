@@ -63,3 +63,10 @@ rm -rf "$BACKUP"
 echo
 echo "regenerated. Now read the diff:"
 git --no-pager diff --stat crates/celeste-names/src/gen.rs crates/celeste-kernels/src/
+echo
+echo "NOTE: the build check above rewrote target/release binaries WITHOUT the"
+echo "fused feature, and a later fused rebuild may see a fresh fingerprint and"
+echo "skip the relink (BENCHMARK_DATA.md, M1 stage 3). If you use the fused"
+echo "engine:  touch native-probe/src/main.rs && cargo build --release -p"
+echo "native-probe --features celeste-rust/fused   and check for the"
+echo "'fused: lanes' stderr line before benching."

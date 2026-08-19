@@ -465,6 +465,29 @@ mod fused {
         }
     }
 
+    /// Project variant `b` onto a key-cell class's button-bit support:
+    /// the class's cache index. Mirrors the fuse emitter's `pack`.
+    #[inline]
+    fn pack_sup(b: u8, sup: u8) -> usize {
+        let mut idx = 0usize;
+        let mut j = 0;
+        for bit in 0..6 {
+            if sup >> bit & 1 != 0 {
+                idx |= (((b >> bit) & 1) as usize) << j;
+                j += 1;
+            }
+        }
+        idx
+    }
+
+    /// Two hash accumulators per lane - a partial pre-dedup key.
+    type KeyAcc = ([u64; kernel::W], [u64; kernel::W]);
+
+    fn keycheck_on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("CELESTE_KEYCHECK").is_ok())
+    }
+
     pub(super) fn run_fused(
         chunk: &runtime2::Rt2,
         ids: &runtime2::BoundaryIds,
@@ -487,10 +510,26 @@ mod fused {
         let mut keys = [(0u64, 0u64); kernel::W];
         let mut deopt_rows: std::collections::BTreeSet<u32> = Default::default();
         // tuple raw-bits key -> representative lane (chunk index).
+        // (FxHashMap measured NEUTRAL here, 2026-08-20 - the wide-key
+        // compares are not hot - so this stays a BTreeMap.)
         let mut dy_reps: std::collections::BTreeMap<_, u32> = Default::default();
         let mut dy_covered: u64 = 0;
         let mut uncovered: u64 = 0;
         let mut bd_hit = false;
+        // M1 stage 3: the pre-dedup key is a commutative per-cell sum, so
+        // the artifact factors it by what each cell reads (see the
+        // row_keys_base/_class/_var emission in transpile::fuse). Per
+        // 16-lane group: the base (sh/chunk cells) hashes once, each
+        // class's kv cells hash once per assignment of the class's
+        // button-bit support, and only the full-support cells hash per
+        // variant. Byte-identical to the monolithic fg::row_keys - same
+        // terms, same wrapping sum.
+        let mut base: KeyAcc = ([0; kernel::W], [0; kernel::W]);
+        let mut class_cache: Vec<Vec<KeyAcc>> = fg::KEY_CLASS_SUPS
+            .iter()
+            .map(|s| vec![([0; kernel::W], [0; kernel::W]); 1 << s.count_ones()])
+            .collect();
+        let mut class_filled: Vec<u64> = vec![0; fg::KEY_CLASS_SUPS.len()];
         let mut lo = 0usize;
         while lo < chunk.width && !bd_hit {
             let n = (chunk.width - lo).min(kernel::W);
@@ -499,7 +538,14 @@ mod fused {
                 note_miss("fused", "rows", chunk.width);
                 return false;
             };
-            fg::frame(&uni, &rin, &g, &mut |b, osh, kout, dy| {
+            // Key caches are per (16-lane group x prefix fork combo):
+            // `cfg` counts fork combos inside frame(), and p/osh/segment
+            // state all change per combo, so cached partials must not
+            // survive a combo boundary. last_cfg = 0 forces a reset on
+            // the group's first callback (cfg starts at 1).
+            let mut base_done = false;
+            let mut last_cfg: u32 = 0;
+            fg::frame(&uni, &rin, &g, &mut |cfg, b, osh, kout, dy| {
                 if kout.bd {
                     bd_hit = true;
                     return;
@@ -545,7 +591,58 @@ mod fused {
                     return;
                 }
                 if prededup_on() {
-                    fg::row_keys(chunk, lo, n, osh, kout, &plan, &mut keys);
+                    if cfg != last_cfg {
+                        last_cfg = cfg;
+                        base_done = false;
+                        for f in &mut class_filled {
+                            *f = 0;
+                        }
+                    }
+                    if !base_done {
+                        base = ([0; kernel::W], [0; kernel::W]);
+                        fg::row_keys_base(chunk, lo, n, osh, &plan, &mut base.0, &mut base.1);
+                        base_done = true;
+                    }
+                    let (mut h1, mut h2) = base;
+                    for (jc, sup) in fg::KEY_CLASS_SUPS.iter().enumerate() {
+                        let idx = pack_sup(b, *sup);
+                        if class_filled[jc] & (1 << idx) == 0 {
+                            let mut p: KeyAcc = ([0; kernel::W], [0; kernel::W]);
+                            fg::row_keys_class(jc, kout, &plan, &mut p.0, &mut p.1);
+                            class_cache[jc][idx] = p;
+                            class_filled[jc] |= 1 << idx;
+                        }
+                        let p = &class_cache[jc][idx];
+                        for i in 0..kernel::W {
+                            h1[i] = h1[i].wrapping_add(p.0[i]);
+                            h2[i] = h2[i].wrapping_add(p.1[i]);
+                        }
+                    }
+                    fg::row_keys_var(kout, &plan, &mut h1, &mut h2);
+                    fg::row_keys_fin(&h1, &h2, &mut keys);
+                    // CELESTE_KEYCHECK=1: verify the factored key against
+                    // the monolithic one per callback and localize any
+                    // divergence to a stale class partial. This caught
+                    // the fork-combo cache leak (2026-08-20).
+                    if keycheck_on() {
+                        let mut keys2 = [(0u64, 0u64); kernel::W];
+                        fg::row_keys(chunk, lo, n, osh, kout, &plan, &mut keys2);
+                        if keys[..n] != keys2[..n] {
+                            for (jc, sup) in fg::KEY_CLASS_SUPS.iter().enumerate() {
+                                let idx = pack_sup(b, *sup);
+                                let mut p: KeyAcc = ([0; kernel::W], [0; kernel::W]);
+                                fg::row_keys_class(jc, kout, &plan, &mut p.0, &mut p.1);
+                                let c = &class_cache[jc][idx];
+                                if p != *c {
+                                    eprintln!(
+                                        "KEYCHECK: class {} sup {:#08b} stale at b={:#08b} idx={}",
+                                        jc, sup, b, idx
+                                    );
+                                }
+                            }
+                            panic!("KEYCHECK: key mismatch at b={:#08b} lo={}", b, lo);
+                        }
+                    }
                     for i in 0..n {
                         if live & (1 << i) != 0 && !seen.insert(keys[i]) {
                             live &= !(1 << i);

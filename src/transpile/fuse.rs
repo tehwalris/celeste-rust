@@ -38,8 +38,8 @@ use std::fmt::Write as _;
 use anyhow::{anyhow, bail, Result};
 
 use super::kernel::{
-    compute_out_fields, emit_interface, emit_walk, mentions_ident, reachable_cells, render_lines,
-    word_used, Emit, Line, OutFields,
+    compute_out_fields, emit_interface, emit_key_cell, emit_walk, key_cells, mentions_ident,
+    reachable_cells, render_lines, word_used, Emit, Line, OutFields,
 };
 use crate::rewrite::program::Program;
 
@@ -1034,21 +1034,23 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
         sup: u8,
         binds: Vec<String>,
     }
-    let infos: Vec<LineInfo> = {
-        let mut name_sup: HashMap<String, u8> = HashMap::new();
-        let sup_of = |s: &str, name_sup: &HashMap<String, u8>| -> u8 {
-            let mut m = 0u8;
-            for w in idents(s) {
-                if let Some(k) = w.strip_prefix("kb").and_then(|r| r.parse::<u8>().ok()) {
-                    if k < 6 {
-                        m |= 1 << k;
-                        continue;
-                    }
+    // name_sup outlives the line scan: stage 3 reuses it to compute the
+    // supports of the out-cell EXPRS (the row-key factoring below).
+    let mut name_sup: HashMap<String, u8> = HashMap::new();
+    let sup_of = |s: &str, name_sup: &HashMap<String, u8>| -> u8 {
+        let mut m = 0u8;
+        for w in idents(s) {
+            if let Some(k) = w.strip_prefix("kb").and_then(|r| r.parse::<u8>().ok()) {
+                if k < 6 {
+                    m |= 1 << k;
+                    continue;
                 }
-                m |= name_sup.get(&w).copied().unwrap_or(0);
             }
-            m
-        };
+            m |= name_sup.get(&w).copied().unwrap_or(0);
+        }
+        m
+    };
+    let infos: Vec<LineInfo> = {
         let mut infos = Vec::new();
         for line in &suf {
             let info = match line {
@@ -1321,10 +1323,17 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
     }
 
     // frame()
+    // The callback's leading `cfg` is a 1-based counter of PREFIX FORK
+    // combinations: everything the variant sweep reads (p, osh, segment
+    // caches) is recomputed per combination, so suffix::<B> runs once per
+    // (cfg, B) and any executor-side per-variant caching must key on cfg
+    // too. Missing this was a real bug (2026-08-20): key partials cached
+    // per group leaked across fork combos.
     writeln!(
         out,
         "#[inline(never)]\n\
-         pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared, &KOut, &Dy)) {{"
+         pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u32, u8, &KOutShared, &KOut, &Dy)) {{\n\
+         \x20   let mut cfg: u32 = 0;"
     )?;
     for mask in &reg_masks {
         writeln!(out, "    let mut {}: u16 = 0;", reg(*mask))?;
@@ -1352,6 +1361,7 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
         }
     }
     writeln!(out, "    }};")?;
+    writeln!(out, "    cfg += 1;")?;
     // Segment caches: one array per support set, one element per
     // assignment of that set. Dependencies (strict-subset supports) are
     // read through the assignment's projection, resolved right here.
@@ -1394,7 +1404,7 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
                 write!(out, ", &sc{}[{}]", k, pack(b, &sg.bits))?;
             }
         }
-        writeln!(out, ", out);")?;
+        writeln!(out, ", cfg, out);")?;
     }
     for _ in 0..fork_count {
         writeln!(out, "    }}")?;
@@ -1416,7 +1426,7 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
             write!(out, ", s{k}: &Seg{k}", k = k)?;
         }
     }
-    writeln!(out, ", out: &mut impl FnMut(u8, &KOutShared, &KOut, &Dy)) {{")?;
+    writeln!(out, ", cfg: u32, out: &mut impl FnMut(u32, u8, &KOutShared, &KOut, &Dy)) {{")?;
     for name in &crossing {
         if word_used(&residual_epi, name) {
             writeln!(out, "    let {} = p.{};", name, name)?;
@@ -1473,7 +1483,7 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
             e = earlier
         )?;
     }
-    writeln!(out, "    out(B, osh, &KOut {{")?;
+    writeln!(out, "    out(cfg, B, osh, &KOut {{")?;
     writeln!(out, "        valid: p.valid,")?;
     writeln!(out, "        deopt: dp_of_0,")?;
     writeln!(out, "        bd: *bd,")?;
@@ -1499,6 +1509,122 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
     writeln!(out, "        ],")?;
     writeln!(out, "    }});")?;
     writeln!(out, "}}")?;
+
+    // --- M1 stage 3 (task #152): support-factored row keys ---
+    // The pre-dedup key is a commutative per-cell SUM (kernel.rs
+    // emit_key_cell): h[i] += mix64(cell_const ^ code(v)), finalized by
+    // one mix64. Regrouping the cells therefore yields byte-identical
+    // keys, as long as every cell keeps its KEY_CELLS index j (which the
+    // runtime KeyPlan masks address). Cells split three ways by source:
+    //   base  - sh / chunk only: identical across variants, computed
+    //           once per 16-lane group;
+    //   class - kv cells whose expr has support S below the full mask:
+    //           identical for variants agreeing on S, cached per
+    //           assignment of S (KEY_CLASS_SUPS names the classes);
+    //   var   - full-support kv cells: genuinely per variant.
+    // The executor (dispatch.rs run_fused) assembles
+    //   keys = fin(base + class partials + var)
+    // with wrapping_add, the commutative sum above. The monolithic
+    // row_keys stays as-is for one-shot callers.
+    let cells = key_cells(&primary.e, &fused_of)?;
+    let mut base_cells: Vec<(usize, u32, &'static str, bool)> = Vec::new();
+    let mut class_cells: BTreeMap<u8, Vec<(usize, u32, &'static str, bool)>> = BTreeMap::new();
+    let mut var_cells: Vec<(usize, u32, &'static str, bool)> = Vec::new();
+    for (j, (id, ty, tainted)) in cells.iter().enumerate() {
+        if !*tainted || matches!(*ty, "IN_N" | "IN_B") {
+            // sh- or chunk-sourced: never reads the per-variant KOut.
+            base_cells.push((j, *id, ty, *tainted));
+            continue;
+        }
+        let expr = fused_of
+            .fields
+            .iter()
+            .find(|(fid, _, _, _)| fid == id)
+            .map(|(_, _, e, _)| e.as_str())
+            .ok_or_else(|| anyhow!("tainted key cell {} is not an out field", id))?;
+        let mut sup = sup_of(expr, &name_sup);
+        // dp registers and bd are per-variant accumulations name_sup
+        // does not model; an out expr reading one is full-support.
+        if reg_masks.iter().any(|m| word_used(expr, &reg(*m))) || word_used(expr, "bd") {
+            sup = used_mask;
+        }
+        if sup == used_mask {
+            var_cells.push((j, *id, ty, *tainted));
+        } else {
+            class_cells.entry(sup).or_default().push((j, *id, ty, *tainted));
+        }
+    }
+    eprintln!(
+        "[fused] M1 key cells: {} base, {} class(es) {:?} with {:?} cells, {} full of {}",
+        base_cells.len(),
+        class_cells.len(),
+        class_cells.keys().map(|s| format!("{:#08b}", s)).collect::<Vec<_>>(),
+        class_cells.values().map(|v| v.len()).collect::<Vec<_>>(),
+        var_cells.len(),
+        cells.len()
+    );
+    writeln!(
+        out,
+        "/// Variant-independent key cells (sh/chunk sources): the shared base\n\
+         /// of the support-factored pre-dedup key. ADDS into h1/h2.\n\
+         #[allow(unused_variables)]\n\
+         pub fn row_keys_base(chunk: &Rt2, lo: usize, n: usize, sh: &KOutShared, plan: &KeyPlan, h1: &mut [u64; W], h2: &mut [u64; W]) {{"
+    )?;
+    for (j, id, ty, tainted) in &base_cells {
+        emit_key_cell(&mut out, *j, *id, ty, *tainted)?;
+    }
+    writeln!(out, "}}\n")?;
+    writeln!(
+        out,
+        "/// Button-bit support of each non-full kv key-cell class, in\n\
+         /// `row_keys_class` arm order."
+    )?;
+    write!(out, "pub const KEY_CLASS_SUPS: &[u8] = &[")?;
+    for s in class_cells.keys() {
+        write!(out, "{:#08b}, ", s)?;
+    }
+    writeln!(out, "];")?;
+    writeln!(
+        out,
+        "/// One class's kv cells: identical for variants agreeing on the\n\
+         /// class's support, so the executor caches the result per\n\
+         /// assignment. ADDS into h1/h2.\n\
+         #[allow(unused_variables)]\n\
+         pub fn row_keys_class(class: usize, kv: &KOut, plan: &KeyPlan, h1: &mut [u64; W], h2: &mut [u64; W]) {{\n\
+         \x20   match class {{"
+    )?;
+    for (a, (s, ccells)) in class_cells.iter().enumerate() {
+        writeln!(out, "    {} => {{ // support {:#08b}", a, s)?;
+        for (j, id, ty, tainted) in ccells {
+            emit_key_cell(&mut out, *j, *id, ty, *tainted)?;
+        }
+        writeln!(out, "    }}")?;
+    }
+    writeln!(
+        out,
+        "    _ => unreachable!(),\n\
+         \x20   }}\n\
+         }}\n"
+    )?;
+    writeln!(
+        out,
+        "/// Full-support kv cells: the only per-variant hashing. ADDS into h1/h2.\n\
+         #[allow(unused_variables)]\n\
+         pub fn row_keys_var(kv: &KOut, plan: &KeyPlan, h1: &mut [u64; W], h2: &mut [u64; W]) {{"
+    )?;
+    for (j, id, ty, tainted) in &var_cells {
+        emit_key_cell(&mut out, *j, *id, ty, *tainted)?;
+    }
+    writeln!(out, "}}\n")?;
+    writeln!(
+        out,
+        "/// Finalize a factored key: the same final mix as `row_keys`.\n\
+         pub fn row_keys_fin(h1: &[u64; W], h2: &[u64; W], keys: &mut [(u64, u64); W]) {{\n\
+         \x20   for i in 0..W {{\n\
+         \x20       keys[i] = (mix64(h1[i]), mix64(h2[i]));\n\
+         \x20   }}\n\
+         }}"
+    )?;
 
     // Self-fingerprint: a hash of everything emitted ABOVE this line, so
     // the artifact compiled into a binary names itself. The campaign

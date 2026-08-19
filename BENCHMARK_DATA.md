@@ -412,6 +412,47 @@ prededup row hashing, dy rep keying, append_out - is unchanged at
 stage 3 (executor-side reuse of per-segment column values in the
 row-key path). Memberchecks ok, suite 553/553.
 
+### M1 stage 3: support-factored row keys (2026-08-20)
+
+The pre-dedup key is a commutative per-cell sum, so the artifact now
+emits it factored by what each cell reads (row_keys_base / _class /
+_var + KEY_CLASS_SUPS; the monolithic row_keys stays for one-shot
+callers) and run_fused caches base + per-class partials, hashing only
+the 5 full-support cells per variant. Cell-mixes per (16-lane group x
+fork combo): 1,280 -> 378 (3.4x). Byte-identical keys by
+construction; `CELESTE_KEYCHECK=1` verifies factored == monolithic at
+runtime and localizes divergence to the stale class.
+
+Same-night A/B, 6 reps, same gate output both ways:
+
+| | min | mean |
+|---|---|---|
+| stage 2 | 13,170.73 ms | 13,235.99 ms |
+| stage 3 | 12,847.15 ms | 13,090.04 ms |
+| delta | **-2.5%** | **-1.1%** |
+
+(dy_reps BTreeMap -> FxHashMap: NEUTRAL, 12,938 ms min; reverted.)
+perf: the run_fused closure 8.5% -> 7.8% of process; key hashing
+visible at 0.25% (row_keys_class; base/var/fin inline into the
+closure). What remains in the closure is dy rep keying, the seen-set,
+append_out, and the partial-add loops - diminishing returns from here.
+
+Two traps found en route, both worth remembering:
+
+1. **frame()'s variant sweep runs once per PREFIX FORK COMBINATION.**
+   Executor caches keyed per 16-lane group leaked across combos; the
+   row gate caught it (1.18M missing / 2.59M extra). The fused
+   callback now leads with a fork-combo counter `cfg` and the
+   executor resets its caches when it changes.
+2. **regen-generated.sh clobbers the fused native-probe.** Its final
+   workspace build rewrites target/release/native-probe WITHOUT the
+   fused feature, and a subsequent `cargo build -p native-probe
+   --features celeste-rust/fused` may see a fresh fingerprint and
+   skip the relink - the stale non-fused binary stays on disk, ~33%
+   slower with the row gate still green (fallback preserves rows).
+   `touch native-probe/src/main.rs` before rebuilding, and check the
+   `fused: lanes ...` stderr line actually appears.
+
 # K2's pm1 death-partition fix: REFUTED - inert and slightly slower (2026-08-19)
 
 The census's preferred fix (add `will_restart` to the pm1 partition
