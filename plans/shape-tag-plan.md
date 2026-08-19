@@ -161,6 +161,31 @@ fusion CSE shares) and relying on the pin sweep + dce for straightness
 of the dying tail. Pin directions come from `membercheck --trace-frame`
 on the checked-in death witnesses (the branch census's successor).
 
+### 2b findings (2026-08-19, evening)
+
+Both dying overlays EMIT through the kernel emitter today (after teaching
+it `__array_table_drop_last`, a purely emit-time structural intrinsic -
+the array cell shrinks, no runtime code): 1042-line prefix, 58-line
+suffix, 16 button variants each. The two dying kernels differ in EXACTLY
+the kill-guard lines - `zguard(v817)` vs `zguard(zb_not(v817))` plus the
+y>128 literal - the complementary selector pair, explicit in the
+artifact. Against the steady kernel the emitted text diverges earlier
+(steady blends standing/moving lanes with ti_spd_select's masked
+selects; the dying overlays pinned that gate), so fusion sharing is NOT
+text identity - but steady's masked-select ARMS compute the same
+moved-arm nodes, so value numbering recovers the sharing. Known open
+items for steps 3/4:
+
+- OUT_CELLS of a dying kernel still lists the dead player's cells
+  (boundary-unreachable writes); the boundary materializer must emit the
+  DEAD shape (objects empty, globals only) for selector=dying lanes and
+  ignore those columns.
+- The dying members observe button bits [0,1,4,5] -> 16 variants; the
+  fused artifact's suffix handling must reconcile per-member observed
+  bit sets.
+
+## Verification, layered
+
 1. Each member: existing per-recipe machinery (build, differential
    verify, screen; suite).
 2. Guard-set exhaustiveness: complementary-literal check per pair;

@@ -1150,6 +1150,27 @@ fn call_intrinsic(e: &mut Emit, name: &str, args: &[LocalId]) -> Result<K> {
                 other => bail!("__split_at on {:?}", other),
             }
         }
+        "__array_table_drop_last" => {
+            // Structural: shrink the emit-time array cell. No runtime code -
+            // the heap is folded at emit time, so dropping the last element
+            // only changes the emit-time topology. This is how a DYING
+            // member's `del` tail lowers (plans/shape-tag-plan.md): what
+            // survives is the changed OUTPUT SHAPE, which the boundary
+            // materializer owns, not an op here.
+            let ptr = match e.env.get(&args[0]) {
+                Some(K::Ptr(id)) => *id,
+                other => bail!("__array_table_drop_last on {:?}", other),
+            };
+            match e.cells.get_mut(&ptr) {
+                Some(CellT::Arr(items)) => {
+                    items
+                        .pop()
+                        .ok_or_else(|| anyhow!("__array_table_drop_last on empty array"))?;
+                    Ok(K::Nil)
+                }
+                other => bail!("__array_table_drop_last on cell {:?}", other),
+            }
+        }
         other => bail!("call of builtin {:?} (not a kernel intrinsic)", other),
     }
 }
