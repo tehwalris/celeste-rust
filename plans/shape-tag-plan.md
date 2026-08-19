@@ -243,6 +243,53 @@ Inputs: the n KernelGraphs (c44a231) + the shared value numbering
    then collect-first-off; suite; ladder configs unmixed
    (k2ctl config vs the d4run WIN_AT_XY config - do not compare across).
 
+### Steps 3+4 AS BUILT (2026-08-19, commits 53a63fa + ab97067)
+
+Implemented with two simplifications over the design above, both
+strictly sound (BENCHMARK_DATA.md "Fused specialization-set kernel"):
+
+1. **No explicit selector extraction.** Member coverage = the member's
+   own deopt register set (`dp_m{member-bitmask}`, one register per
+   distinct member set with effects; a member's dp is the OR of the
+   registers naming it). A lane belongs to the FIRST member in priority
+   order whose dp is clear; complementary kill-branch guards make the
+   dying members disjoint wherever the selector is known; uncovered
+   lanes deopt loudly. Static truth-table exhaustiveness is subsumed by
+   the runtime uncovered count + the H=68 set gate.
+2. **No dead-shape materialization.** The fuse pass PROVES each
+   non-primary member's boundary rows block-uniform (`reachable_cells`
+   of the member's final heap: every lane-varying out cell is a
+   deleted-player field; survivors are 4 uniform globals) and the
+   executor keeps ONE representative lane per distinct uniform tuple
+   per chunk, routed through the EXISTING interpreter deopt path.
+   Dropped lanes' rows are member-certified identical to the rep's, so
+   the row SET is preserved by construction - no dead-template, no new
+   boundary code, no new trust base.
+
+Machinery: `kernel::emit_walk`/`render` split (one lowering, two
+consumers; regen byte-identical), `compute_out_fields`/`emit_interface`
+shared so the fused artifact IS a class kernel to the dispatcher,
+`transpile --fuse` (artifact gitignored, feature `fused`),
+`dispatch::fused` runner ahead of the steady kernel (CELESTE_FUSED=0
+opt-out). The fused engine rides the COMPILED-FORWARD path
+(CELESTE_COMPILED_FORWARD=1) - the default campaign never reaches
+kernel dispatch.
+
+Status: H=68 f066-068 rowkey sets IDENTICAL to k2ctl with the fused
+engine live; 5.2M dying-covered events -> 1,385 reps. REMAINING before
+the deopt drop is real: the corpse DASH-START gate (`btn(5) and
+djump>0`, the assert at the merged `in_i1_012_if_join_12`; kb5
+histogram: 100% of uncovered events, kb5=0 coverage complete). Steady
+blends that site; the dying members pin it (witness had no dash press).
+Fix = the same blend pattern that killed the input==0 premise in v5
+(commit 53a63fa): find the pinning entry in the dying lineage (drop-one
+cascades - sd000 anchors shift - so it must be replaced in place, not
+dropped), convert the gate to a select/masked region, re-run the
+membercheck matrix with a dash-press death witness, re-fuse, re-gate.
+Then: deopt 66k/frame -> reps only, collect-first-off pair, and the
+BEFORE/AFTER TIMING of compiled-forward+fused vs the default engine at
+H=68 - the number that decides engine adoption.
+
 ## Open questions (for Philippe)
 
 - Fingerprint story for recipe SETS: hash the member list + fusion pass

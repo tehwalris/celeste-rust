@@ -421,6 +421,9 @@ mod fused {
     /// [dying-covered lane events, representatives pushed, uncovered lane events]
     static DY_STATS: [AtomicU64; 3] =
         [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    /// Uncovered lane events by button variant `B` - which kb bits the
+    /// residual coverage gap is structured on.
+    static DY_UNCOV_BY_B: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
 
     pub(super) fn print_stats() {
         let lanes = LANES.swap(0, Ordering::Relaxed);
@@ -430,6 +433,18 @@ mod fused {
                 "fused: lanes {} dying-covered-events {} reps {} UNCOVERED-events {}",
                 lanes, v[0], v[1], v[2]
             );
+        }
+        let hist: Vec<u64> =
+            DY_UNCOV_BY_B.iter().map(|a| a.swap(0, Ordering::Relaxed)).collect();
+        if hist.iter().any(|x| *x > 0) {
+            // Aggregate per kb bit: events in variants with the bit set.
+            for k in 0..6 {
+                let with: u64 =
+                    (0..64).filter(|b| b >> k & 1 == 1).map(|b| hist[b]).sum();
+                let without: u64 =
+                    (0..64).filter(|b| b >> k & 1 == 0).map(|b| hist[b]).sum();
+                eprintln!("fused uncovered by kb{}: set {} clear {}", k, with, without);
+            }
         }
     }
 
@@ -467,7 +482,7 @@ mod fused {
                 note_miss("fused", "rows", chunk.width);
                 return false;
             };
-            fg::frame(&uni, &rin, &g, &mut |_b, osh, kout, dy| {
+            fg::frame(&uni, &rin, &g, &mut |b, osh, kout, dy| {
                 if kout.bd {
                     bd_hit = true;
                     return;
@@ -480,6 +495,8 @@ mod fused {
                 let dead = kout.deopt & !covered_any & kout.valid & width_mask;
                 if dead != 0 {
                     uncovered += dead.count_ones() as u64;
+                    DY_UNCOV_BY_B[b as usize]
+                        .fetch_add(dead.count_ones() as u64, Ordering::Relaxed);
                     for i in 0..n {
                         if dead & (1 << i) != 0 {
                             deopt_rows.insert((lo + i) as u32);

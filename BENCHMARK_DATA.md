@@ -202,6 +202,56 @@ only ~110 nodes (every post-blend node diverges); keeping the gate as
 steady's ti_spd_select masked select (derivation 3) recovered 626 nodes
 and also covers standing deaths.
 
+# Fused specialization-set kernel: H=68 rowkey sets IDENTICAL, dying lanes collapse to reps (2026-08-19)
+
+Steps 3+4 of plans/shape-tag-plan.md (#163/#164), commits 53a63fa +
+ab97067. `transpile --fuse steady,dy-spikes,dy-fall WITNESS OUT.rs`
+emits ONE kernel (gitignored, feature `fused`) with per-member-set deopt
+registers; the executor (dispatch::fused, ahead of the steady class
+kernel, CELESTE_FUSED=0 opt-out) runs the steady rows exactly as the
+class kernel does and collapses DYING-covered lanes to one interpreter
+representative per distinct uniform-output tuple - sound because the
+fuse pass PROVES the dying boundary rows block-uniform (final-heap
+reachability: every lane-varying out cell is a deleted-player field;
+what survives is will_restart/delay_restart/frames/deaths, all uniform
+scalars), so dropped lanes' rows are member-certified identical to the
+representative's and the row SET is preserved by construction.
+
+Design deltas vs the plan's spec, both simplifications:
+- guard-as-selector is IMPLICIT: member coverage = the member's own dp
+  register set; lane -> first covered member in priority order;
+  uncovered lanes deopt loudly. The static truth-table check is
+  subsumed by the runtime count + the set gate below.
+- no dead-shape materialization: representatives ride the EXISTING
+  deopt path; the interpreter produces the exact dead rows.
+
+Prerequisite fix (v5 dying overlays): the v3 overlays pinned the corpse
+wall-slide gate to the witness's input==0 - in the fused kernel that is
+a kb-dependent scalar *bd firing in every input!=0 variant, refusing
+every chunk. v5 blends it (0-trip pins on the corpse check loops, which
+scan an EMPTY objects table + dce/merge + speculate_region), certified
+by a NEW input=R witness pair (member applies; v3 skipped). Node census
+after v5: union 846 vs steady-alone 842 - the 3-member set now costs
+**+0.5%** over steady alone (was +5.5% python / +1.8% rust at v3).
+
+Gate (compiled-forward campaign CELESTE_COMPILED_FORWARD=1, k2ctl
+config, resume f065->f068):
+- f066/067/068 per-frame rowkey sets IDENTICAL to k2ctl (counts
+  4,591,412 / 4,756,768 / 4,980,465; sorted-set sha256 equal). The
+  fused kernel handled all 5,449,742 former steady-kernel lanes
+  (steady: 0). Control run of the refactored emitter on the default
+  engine: byte-identical rowkey files. Suite 553/553.
+- 5,200,160 dying-covered lane-events collapsed to 1,385 reps.
+- Residual: 449,728 uncovered lane-events at f066, and the per-variant
+  histogram is decisive - **100% are kb5=1 (dash-press) variants;
+  kb5=0 coverage is complete**. Because a lane uncovered in ANY
+  (config, variant) must be interpreted whole, per-frame deopt lane
+  counts are UNCHANGED so far (66,136 / 64,026 / 72,620). The dying
+  members still pin the corpse dash-start gate (`btn(5) and djump>0`,
+  assert %4010 at the merged in_i1_012_if_join_12; steady BLENDS that
+  site) - blending it the same way as the wall-slide gate is the
+  remaining step before the deopt drop and the timing measurement.
+
 # K2's pm1 death-partition fix: REFUTED - inert and slightly slower (2026-08-19)
 
 The census's preferred fix (add `will_restart` to the pm1 partition
