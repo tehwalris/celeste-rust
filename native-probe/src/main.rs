@@ -1018,6 +1018,58 @@ fn run_abstract_bench(dir: &str, frame: u32, reps: u32) {
                     .collect();
                 eprintln!("  engine shapes: {}", eng_shapes.join(", "));
                 eprintln!("  ref shapes:    {}", ref_shapes.join(", "));
+                // TWIN DIAGNOSIS: two ENGINE blocks with the same (shape,
+                // width) that did not merge differ in some column - name
+                // it. This is the signature of a divergence between two
+                // engine paths (kernel vs fallback vs plain) emitting the
+                // same logical rows with one cell disagreeing.
+                'twin: for i in 0..chase.len() {
+                    for j in i + 1..chase.len() {
+                        let (a, b) = (&chase[i], &chase[j]);
+                        if a.shape_hash != b.shape_hash || a.width != b.width || a.width < 100 {
+                            continue;
+                        }
+                        eprintln!(
+                            "  twin blocks {} and {} (shape {:#x}, w{}): differing columns:",
+                            i, j, a.shape_hash, a.width
+                        );
+                        let gname = |cell: usize| -> String {
+                            for (gi, name) in gen::GLOBAL_NAMES.iter().enumerate() {
+                                if a.globals.get(gi) == Some(&(cell as u32)) {
+                                    return format!(" (global {})", name);
+                                }
+                            }
+                            String::new()
+                        };
+                        let mut shown = 0;
+                        for c in 0..a.cols.len().min(b.cols.len()) {
+                            let (ca, cb) = (&a.cols[c], &b.cols[c]);
+                            let same = match (ca, cb) {
+                                (runtime2::Col::U(x), runtime2::Col::U(y)) => x == y,
+                                (runtime2::Col::N(x), runtime2::Col::N(y)) => {
+                                    x.first() == y.first() && x.last() == y.last()
+                                }
+                                _ => format!("{:?}", ca).len() == format!("{:?}", cb).len(),
+                            };
+                            if !same {
+                                let show = |col: &runtime2::Col| -> String {
+                                    let s = format!("{:?}", col);
+                                    s.chars().take(60).collect()
+                                };
+                                eprintln!(
+                                    "    cell {}{}: {} vs {}",
+                                    c, gname(c), show(ca), show(cb)
+                                );
+                                shown += 1;
+                                if shown == 12 {
+                                    eprintln!("    ... (suppressed)");
+                                    break;
+                                }
+                            }
+                        }
+                        break 'twin;
+                    }
+                }
                 // Structural diff of the first block on each side. Dumping
                 // only the Obj cells was not enough: on the interpreter
                 // fallback's first run the two sides' Obj cells were

@@ -712,17 +712,22 @@ pub fn step(
                         // program's premises by construction - the plain
                         // path, as in `run_frame_chunk`.
                         //
-                        // KNOWN ISSUE (2026-08-19): on this `step` path
-                        // the gate (`native-probe --abstract-bench`)
-                        // reports 0 missing but ~64x the plain-routed
-                        // lane count EXTRA keys - the plain outputs
-                        // appear to carry per-variant button data the
-                        // campaign path re-widens and this path does
-                        // not (make_state_abstract does not touch
-                        // button cells). The CAMPAIGN path
-                        // (`run_frame_chunk`) is gated set-identical
-                        // over all 68 frames; fix this before trusting
-                        // step()-based gates with kernels enabled.
+                        // KNOWN ISSUE (2026-08-19, diagnosed further):
+                        // `native-probe --abstract-bench` on this path
+                        // reports 0 missing / 4.12M EXTRA keys at f066.
+                        // The twin diagnosis (see the bench) shows the
+                        // extra rows are HELD-BUTTON variants: engine
+                        // blocks come in (shape, width)-equal pairs and
+                        // quads whose discriminator is cell 246 = p_dash
+                        // (and p_jump), i.e. concrete kb5/kb4 stored in
+                        // the latch fields where the reference has one
+                        // collapsed row. NOT the plain path (66k lanes
+                        // cannot make 4.12M keys) and NOT the campaign
+                        // path (all-68-frame set identity holds there) -
+                        // a bench-harness/pipeline-stage divergence
+                        // around button concretization. Root-cause
+                        // before trusting step()-based gates with
+                        // kernels enabled; the campaign gates stand.
                         if !kernel_ok {
                             if let Some(plain) = &this.plain {
                                 let (cart, cache) =
