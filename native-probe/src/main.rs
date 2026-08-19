@@ -47,7 +47,21 @@ fn engine() -> &'static FrameEngine {
         let (program, _) = celeste_rust::rewrite::recipe::build(&recipe)
             .unwrap_or_else(|e| panic!("applying {}: {}", COMPILE_RECIPE, e));
         let (cart, cache) = world();
-        FrameEngine::new(&program, cart.clone(), cache.clone())
+        let mut engine = FrameEngine::new(&program, cart.clone(), cache.clone());
+        // The plain-program path for kernel deopt sub-chunks (dying
+        // representatives etc.), which fail the specialized program's
+        // premises by construction. Same wiring as the campaign's
+        // `compiled_engine`.
+        let plain_program = celeste_rust::rewrite::program::Program::compile_from_disk()
+            .expect("compiling the plain program for the engine's deopt path");
+        engine.set_plain_path(celeste_rust::compiled::PlainPath {
+            plain_cfg: celeste_rust::interpreter::fixed_env::PreparedCfg::new(
+                plain_program.frame_cfg().clone(),
+            ),
+            plain_env: plain_program.fixed_env(),
+            mapping: celeste_rust::rewrite::state_mapping::StateMapping::from_recipe(&recipe),
+        });
+        engine
     })
 }
 

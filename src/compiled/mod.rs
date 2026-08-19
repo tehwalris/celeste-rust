@@ -305,7 +305,14 @@ impl FrameEngine {
                     .mapping
                     .from_canonical(&mut s)
                     .expect("plain path: mapping a frame output back from canonical");
-                s
+                // The campaign abstraction, applied HERE rather than
+                // trusted to the caller: the plain program does not pin
+                // the timer globals (task #75) or apply the boundary
+                // widenings, so its raw outputs carry different row keys
+                // than the specialized program's for the same states.
+                // The campaign path would re-abstract anyway
+                // (idempotent); `step` boundaries directly and needs it.
+                crate::interpreter::abstraction::make_state_abstract(s)
             })
             .filter(|s| s.vector_size > 0)
             .collect()
@@ -698,6 +705,39 @@ pub fn step(
                             // whose uniform premise fails falls through
                             // whole.
                             if dispatch::run_chunk_kernel(&block, ids, &mut done, &mut local) {
+                                continue;
+                            }
+                        }
+                        // A kernel deopt sub-chunk fails the specialized
+                        // program's premises by construction - the plain
+                        // path, as in `run_frame_chunk`.
+                        //
+                        // KNOWN ISSUE (2026-08-19): on this `step` path
+                        // the gate (`native-probe --abstract-bench`)
+                        // reports 0 missing but ~64x the plain-routed
+                        // lane count EXTRA keys - the plain outputs
+                        // appear to carry per-variant button data the
+                        // campaign path re-widens and this path does
+                        // not (make_state_abstract does not touch
+                        // button cells). The CAMPAIGN path
+                        // (`run_frame_chunk`) is gated set-identical
+                        // over all 68 frames; fix this before trusting
+                        // step()-based gates with kernels enabled.
+                        if !kernel_ok {
+                            if let Some(plain) = &this.plain {
+                                let (cart, cache) =
+                                    (block.cart.clone(), block.cache.clone());
+                                done.extend(
+                                    this.plain_block(plain, block).iter().map(|s| {
+                                        let mut b = bridge::import_block(
+                                            s,
+                                            cart.clone(),
+                                            cache.clone(),
+                                        );
+                                        b.boundary(ids);
+                                        b
+                                    }),
+                                );
                                 continue;
                             }
                         }
