@@ -135,6 +135,50 @@ tier removes that 8.5x directly:
     3,850,608  new
 ```
 
+# K2's pm1 death-partition fix: REFUTED - inert and slightly slower (2026-08-19)
+
+The census's preferred fix (add `will_restart` to the pm1 partition
+cells so dead and alive lanes never share a chunk) was built, verified
+(differential verify 40 identical, suite 553/553) and measured at H=68,
+room (1,0), frontier-only + collect-first, 16 threads, four runs in a
+2x2: {old, new} pm1 x {interpreter, compiled} - and it does NOTHING:
+
+| | old pm1 | new pm1 |
+|---|---|---|
+| interp wall | 110.88 s | 113.31 s (+2.2%) |
+| compiled wall | 112.22 s | 115.85 s (+3.2%) |
+| deopt lanes (both paths) | 399,516 | 399,516 |
+| per-frame rowkey SETS, all 68 frames | = | **= (all four runs identical)** |
+
+The premise was wrong: dead states (empty objects array) already have
+their OWN SHAPE, and fragments are grouped by shape - dead lanes were
+never sharing fragments or chunks with alive ones. `will_restart` never
+varies within a state (alive states are uniformly false, dead uniformly
+true), so the partition is semantically inert - which the four-way
+key-set identity now certifies - and its only effect is partition-key
+overhead. Not landed; the recipes stay at six cells.
+
+Two real findings from the same runs:
+
+* **Deopt machinery is ~94% of frame-body CPU at depth** (old pm1,
+  interp): frame body 581.2 s thread-CPU, of which origin-tagged
+  specialized runs 307.4 s + plain-program re-runs 240.7 s - all to
+  re-run 399,516 dead lanes (0.8% of the run's 50M input lanes). The
+  tagged mode taxes every state; the plain re-runs pay full plain-program
+  cost on tiny dead fragments. That is K1's (deferred deopt) prize, and
+  a death-shape VARIANT program (the countdown dynamics are trivial:
+  delay_restart decrements, everything else frozen; 14 of 15 dead frames
+  are pure countdown) would remove the failures at the source.
+* **Config discipline**: these four runs are mutually comparable but NOT
+  comparable to the D4 gate table above - the D4/D0 reference runs used
+  `CELESTE_WIN_AT_XY=64,44` (synthetic win) WITHOUT collect-first. A
+  first comparison against d4run mis-read the env delta (+1,716 rows by
+  f68) as a pm1 effect. Always re-grep the reference run's exact env
+  from its log before claiming a diff.
+
+(Bonus certificate: the 2x2's key-set identity re-confirms compiled ==
+interpreted row sets at HEAD, both pm1 variants, in this config.)
+
 # D1 GATED: engine row keys == interpreter row keys, as an equivalence (2026-08-19)
 
 The two key constructions (`Rt2::boundary`'s cell_mix sums, the
