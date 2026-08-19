@@ -995,6 +995,39 @@ fn run_abstract_bench(dir: &str, frame: u32, reps: u32) {
                 .collect();
             let missing = ref_keys.difference(&eng_keys).count();
             let extra = eng_keys.difference(&ref_keys).count();
+            // Frontier-aware verdict: a frontier-only campaign's saved
+            // states are the NEW rows of the frame, while `step` returns
+            // the raw successor set - so "extra" keys that are simply
+            // rows visited in EARLIER frames are not a divergence at
+            // all. Report how many of the extras the visited sidecars
+            // (frames/f001..f{N-1}.rowkeys) account for.
+            if extra > 0 {
+                let mut visited: rustc_hash::FxHashSet<(u64, u64)> = Default::default();
+                for n in 1..=frame {
+                    let p = format!("{}/frames/f{:03}.rowkeys", dir, n);
+                    let Ok(bytes) = std::fs::read(&p) else { continue };
+                    let recs = &bytes[32.min(bytes.len())..];
+                    for rec in recs.chunks_exact(24) {
+                        let lo = u64::from_le_bytes(rec[0..8].try_into().unwrap());
+                        let hi = u64::from_le_bytes(rec[8..16].try_into().unwrap());
+                        visited.insert((lo, hi));
+                    }
+                }
+                if !visited.is_empty() {
+                    let accounted = eng_keys
+                        .difference(&ref_keys)
+                        .filter(|k| visited.contains(k))
+                        .count();
+                    eprintln!(
+                        "  frontier check: {} of {} extra keys are rows visited in f001..f{:03} \
+                         ({} truly unexplained)",
+                        accounted,
+                        extra,
+                        frame,
+                        extra - accounted
+                    );
+                }
+            }
             if got == r && missing == 0 && extra == 0 {
                 format!(
                     "f{:03} lanes {} == interpreter, row-key SET EQUAL (gate 2) OK",

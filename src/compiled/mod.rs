@@ -712,22 +712,25 @@ pub fn step(
                         // program's premises by construction - the plain
                         // path, as in `run_frame_chunk`.
                         //
-                        // KNOWN ISSUE (2026-08-19, diagnosed further):
-                        // `native-probe --abstract-bench` on this path
-                        // reports 0 missing / 4.12M EXTRA keys at f066.
-                        // The twin diagnosis (see the bench) shows the
-                        // extra rows are HELD-BUTTON variants: engine
-                        // blocks come in (shape, width)-equal pairs and
-                        // quads whose discriminator is cell 246 = p_dash
-                        // (and p_jump), i.e. concrete kb5/kb4 stored in
-                        // the latch fields where the reference has one
-                        // collapsed row. NOT the plain path (66k lanes
-                        // cannot make 4.12M keys) and NOT the campaign
-                        // path (all-68-frame set identity holds there) -
-                        // a bench-harness/pipeline-stage divergence
-                        // around button concretization. Root-cause
-                        // before trusting step()-based gates with
-                        // kernels enabled; the campaign gates stand.
+                        // KNOWN ISSUE (2026-08-19): `native-probe
+                        // --abstract-bench` on THIS path reports 0
+                        // missing / 4.12M EXTRA keys at f066. Ruled OUT
+                        // by measurement so far: the plain path (66k
+                        // lanes cannot make 4.12M keys), the campaign
+                        // path (all-68-frame set identity holds there),
+                        // button widening (p_jump/p_dash are latch STATE
+                        // and deliberately never widened - see the
+                        // 2026-08-06 note in abstraction.rs), and the
+                        // frontier (the bench's new check: 0 of the
+                        // 4,123,936 extras appear anywhere in the f001..
+                        // f065 visited sidecars - the extras are NOVEL
+                        // rows). The engine's step() output at f065->
+                        // f066 is a strict superset of the interpreter's
+                        // with ~90% extra fabricated keys; the twin
+                        // blocks (equal shape+width, p_dash flipped) are
+                        // where to keep digging. Do not trust step()-
+                        // based gates with kernels enabled until this is
+                        // root-caused; the campaign gates stand.
                         if !kernel_ok {
                             if let Some(plain) = &this.plain {
                                 let (cart, cache) =
