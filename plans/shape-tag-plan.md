@@ -299,6 +299,35 @@ Two expectations from the paragraph above were WRONG, by measurement:
   adoption call is now a wash at H=68 on room (1,0), to be revisited
   where kernels bind more of the population (deeper H, other rooms).
 
+### Phase C scoping measurement (2026-08-19, from the v6 timing pair)
+
+Thread-seconds inside fwd.interpret, full 68-frame production runs:
+
+|                              | default | fused  |
+|------------------------------|---------|--------|
+| frame body                   | 638.7   | 714.4  |
+| ...deopt specialized run     | 138.0   | 110.4  |
+| ...deopt plain re-run        | 238.4   | 224.1  |
+| frame body EXCL deopt        | 262.3   | 379.9  |
+| boundary prepare             | 44.9    | 22.1   |
+
+Two implications for Phase C ordering:
+1. The fused kernel path costs MORE thread-seconds than the
+   interpreter it replaced (380 vs 262 excl deopt) and wins wall time
+   only via halved boundary prepare + parallel shape. That 118-ts gap
+   is M1's direct target (per-variant suffix x64 + append_out; the
+   suffix is 120 lines/variant vs a 792-line shared prefix, and most
+   suffix nodes depend on a SUBSET of kb bits - CSE by kb-support
+   evaluates each node once per distinct support value).
+2. The DEOPT RE-RUNS are ~45% of all interpret thread-seconds in BOTH
+   engines (334-376 ts) - the 66k lanes/frame failing the default
+   program's premises (visible trigger: the wall-slide gate assert at
+   in_h061_if_join_24). This is engine-independent and is exactly what
+   ADDITIONAL MEMBERS attack - the machinery for which is now fully
+   built and gated. A member (or premise-blend, as with the corpse
+   gates) for the dominant premise-failure class may be a bigger,
+   cheaper prize than M1. Census the deopt triggers first.
+
 ## Open questions (for Philippe)
 
 - Fingerprint story for recipe SETS: hash the member list + fusion pass
