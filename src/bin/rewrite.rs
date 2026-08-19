@@ -93,6 +93,30 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         frames: u32,
     },
+    /// Concrete check of a specialization-set MEMBER (plans/shape-tag-plan.md).
+    ///
+    /// A member recipe pins a structurally-divergent branch with
+    /// `guard_branch`, so its asserts state a premise most frames falsify -
+    /// `verify` cannot run it (assert failure is a hard error there). This
+    /// replays a TAS on the plain program and, at every frame, ALSO attempts
+    /// the same frame under `--recipe` from the same pre-state:
+    ///
+    ///   * an `AssertTrue` failure means the premise does not hold on this
+    ///     frame - the attempt is SKIPPED and counted;
+    ///   * any other error is a hard failure;
+    ///   * success means the premise held, and the member's post-frame
+    ///     observation must equal the plain program's exactly.
+    ///
+    /// A run where the member never applies exits nonzero: a vacuous pass
+    /// is a rejection by design (pick a TAS that exercises the premise).
+    Membercheck {
+        /// TAS file: comment lines, then comma-separated input bytes.
+        #[arg(long)]
+        tas: String,
+        /// Frames to run (default: the input count).
+        #[arg(long)]
+        frames: Option<u32>,
+    },
     /// Propose recipe entries. This is the untrusted half of the system: the
     /// output is a suggestion, and only survives if the rule's verifier accepts
     /// it. Pipe it into the recipe and re-run `build`.
@@ -1898,6 +1922,103 @@ fn main() -> Result<()> {
                     return Err(anyhow!("differential verification failed"));
                 }
             }
+        }
+
+        Command::Membercheck { tas, frames } => {
+            use celeste_rust::concrete;
+            use celeste_rust::interpreter::fixed_env::PreparedCfg;
+            use celeste_rust::interpreter::glue::interpret_prepared_cfg;
+            use celeste_rust::interpreter::state::State;
+            use celeste_rust::rewrite::verify::observe_frame;
+
+            let (member, _) = build(&recipe)?;
+            // The member's state layout differs from canonical (promote_capture
+            // etc.); cross-feeding states goes through the same mapping the
+            // campaign's dispatch/deopt uses.
+            let mapping =
+                celeste_rust::rewrite::state_mapping::StateMapping::from_recipe(&recipe);
+            let plain = Program::compile_executable_from_disk()?;
+            let inputs = parse_tas(&tas)?;
+            let n = frames.unwrap_or(inputs.len() as u32);
+
+            let plain_env = plain.fixed_env();
+            let plain_cfg = PreparedCfg::new(plain.frame_cfg().clone());
+            let member_env = member.fixed_env();
+            let member_cfg = PreparedCfg::new(member.frame_cfg().clone());
+
+            let mut state = concrete::initial_state(&plain, &plain_env)?;
+            let mut applied: Vec<u32> = Vec::new();
+            let mut skipped = 0u32;
+            let mut skip_sites: std::collections::BTreeMap<String, u32> =
+                std::collections::BTreeMap::new();
+            let mut mismatches = 0u32;
+
+            for frame in 1..=n {
+                let byte = *inputs.get(frame as usize - 1).unwrap_or(&0);
+
+                // Member attempt from the same pre-state, mapped into the
+                // member's representation.
+                let mut mstate = state.clone();
+                mapping.from_canonical(&mut mstate)?;
+                concrete::set_concrete_buttons(&mut mstate, byte)?;
+                let member_result = interpret_prepared_cfg(&member_cfg, mstate, &member_env);
+
+                // Plain step (the reference trajectory).
+                state = concrete::step_frame(&plain_cfg, state, &plain_env, byte)?;
+
+                match member_result {
+                    Err(e) => {
+                        let text = format!("{:#}", e);
+                        if let Some(pos) = text.find("AssertTrue(") {
+                            let site: String =
+                                text[pos..].chars().take_while(|c| *c != ')').collect();
+                            *skip_sites.entry(format!("{})", site)).or_default() += 1;
+                            skipped += 1;
+                        } else {
+                            return Err(e.context(format!(
+                                "member failed non-assert at frame {}",
+                                frame
+                            )));
+                        }
+                    }
+                    Ok(mstates) => {
+                        applied.push(frame);
+                        let member_states: Vec<_> = mstates
+                            .into_iter()
+                            .map(|(mut s, _)| -> Result<State> {
+                                mapping.to_canonical(&mut s)?;
+                                Ok(s)
+                            })
+                            .collect::<Result<_>>()?;
+                        let mobs = observe_frame(&member_states);
+                        let pobs = observe_frame(std::slice::from_ref(&state));
+                        if mobs != pobs {
+                            mismatches += 1;
+                            println!("frame {}: MISMATCH (member applied, observation differs)", frame);
+                        } else {
+                            println!("frame {}: member applied, observation identical", frame);
+                        }
+                    }
+                }
+            }
+
+            println!();
+            println!(
+                "membercheck: {} frames, member applied on {:?}, skipped {} (premise)",
+                n, applied, skipped
+            );
+            for (site, count) in &skip_sites {
+                println!("  skipped at {}: {} frame(s)", site, count);
+            }
+            if mismatches > 0 {
+                return Err(anyhow!("{} mismatched frame(s)", mismatches));
+            }
+            if applied.is_empty() {
+                return Err(anyhow!(
+                    "member never applied - vacuous pass is a rejection by design"
+                ));
+            }
+            println!("ok");
         }
 
         Command::Suggest { what, prefix } => {

@@ -1,0 +1,8 @@
+# Room (1,0) SPIKE-death witness (task #159/#160, specialization sets).
+# Winning-TAS prefix through the dash at control frame 49, then hold right
+# 26 frames (over the wall, drift right), then release: the player falls
+# onto the up-spikes at x in [64,88), y=104 (map row 13) and dies DURING
+# FRAME 92 (kill_player at celeste-minimal.lua:93, the spikes branch).
+# Replay: ./target/release/concrete_run -i "$(grep -v '^#' tas/room_1_0_death_spikes_frame_92.txt | tr -d '\n')" -f 95
+# Gate:   ./target/release/rewrite --recipe rewrites-dying-spikes.jsonl membercheck --tas tas/room_1_0_death_spikes_frame_92.txt
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,42,0,0,0,0,0,2,18,2,2,18,2,2,2,2,18,1,1,1,0,16,0,0,0,36,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
