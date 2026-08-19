@@ -1,0 +1,7 @@
+# Room (1,0) PIT-death witness WITH A DASH PRESS ON THE DEATH FRAME.
+# Same trajectory as room_1_0_death_fall_frame_101_input_right.txt, but the
+# frame-101 input is R+X (34): kill first (y>128 check), then the CORPSE
+# dash-start gate fires and the blended arm runs masked (freeze=2,
+# has_dashed=true). Regression witness for dyzt_dash_blend in the fall overlay.
+# Gate: ./target/release/rewrite --recipe rewrites-trace10-dying-fall.jsonl membercheck --tas tas/room_1_0_death_fall_frame_101_dash_press.txt --frames 105
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,42,0,0,0,0,0,2,18,2,2,18,2,2,2,2,18,1,1,1,0,16,0,0,0,36,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,34,2,2,2,2

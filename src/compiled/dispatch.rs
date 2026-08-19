@@ -503,16 +503,24 @@ mod fused {
                         }
                     }
                 }
-                // Dying members: one representative per distinct tuple.
+                // Dying members: one representative per distinct
+                // (tuple, per-lane vary) key. The vary part reads boundary
+                // cells the fuse pass proved are the primary's own out
+                // columns (e.g. the corpse dash-start freeze/has_dashed).
                 for m in 0..fg::N_DY {
                     let mask = dy.covered[m] & width_mask;
                     if mask == 0 {
                         continue;
                     }
                     dy_covered += mask.count_ones() as u64;
-                    dy_reps
-                        .entry(dy.tuples[m].key())
-                        .or_insert((lo + mask.trailing_zeros() as usize) as u32);
+                    let tup = dy.tuples[m].key();
+                    for i in 0..n {
+                        if mask & (1 << i) != 0 {
+                            dy_reps
+                                .entry((tup, fg::dy_vary_key(osh, kout, i)))
+                                .or_insert((lo + i) as u32);
+                        }
+                    }
                 }
                 // The primary (steady) member: exactly the class path.
                 let mut live = kout.valid & !kout.deopt & width_mask;

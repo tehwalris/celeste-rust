@@ -252,6 +252,59 @@ config, resume f065->f068):
   site) - blending it the same way as the wall-slide gate is the
   remaining step before the deopt drop and the timing measurement.
 
+## Corpse dash-start blend closes the kb5 gap: UNCOVERED 0, and the engine reaches TIME PARITY (2026-08-19, follow-up)
+
+The pinning entry was `dygb_anonymous_61_in_h061_in_k1039_cont` (the
+dash-gate branch lands at the k1039 cont block in the dying lineage,
+because it 0-trip-pins the k-loops that steady's collapse_loop folds -
+same gate steady blends as zt001). Replaced IN PLACE in both dying
+overlays with `dyzt_dash_blend` (speculate_region, arm
+in_h061_if_body_107, mask+expand). The corpse arm writes only
+deleted-player fields plus TWO live globals - `freeze=2`,
+`has_dashed=true` (the minimal cart strips smoke/shake/psfx, so no
+object creation, no shape change). Certified by two NEW dash-press
+death witnesses (R+X on the death frame; member applies, observation
+identical): tas/room_1_0_death_{spikes_frame_92,fall_frame_101}_dash_press.txt.
+
+Those two globals are per-lane outs (the gate reads the post-grace-
+refill djump, which is position-dependent), so the block-uniformity
+proof got its planned generalization: a per-lane reachable out cell is
+admitted iff its value is THE PRIMARY'S OWN OUT COLUMN for the same
+cell (same fused node after CSE - checked by node identity at emission)
+- then the executor reads it from KOut per lane (`dy_vary_key`,
+N_DY_VARY=2: c20 freeze ZN, c41 has_dashed ZB) and the collapse key
+becomes (uniform tuple, vary-at-lane). Uniform-scalar tuple cells may
+now also be button-tainted (Dy is built inside the per-variant
+callback, so a tainted scalar is still one value per callback).
+
+Node census after the blend: 845 union, **829 shared by all three**
+(was 846/755) - blending the gate ALIGNED the member graphs.
+
+Gate (same k2ctl resume f065->f068, compiled-forward + frontier-only +
+collect-first): f066/067/068 rowkey sets IDENTICAL again (same counts
+and set hashes as k2ctl). **UNCOVERED-events: 1,576,352 -> 0.**
+6,776,512 dying-covered lane-events -> 2,099 representatives.
+
+Deopt-counter clarification (kills a wrong expectation the previous
+section stated): the per-frame "deopt lanes" counts (66,136 / 64,026 /
+72,620) are IDENTICAL in the pure-interpreter control too - that
+counter is the DEFAULT program's premise-failure population (the
+interpreter FORKS on the kill branch rather than deopting), so kernel
+coverage never feeds it. The fused collapse shows up as interpreter
+WORK removed, i.e. in time.
+
+TIMING, full 68-frame runs, frontier-only, no collect-first, 16
+threads, --save-frames (the engine-adoption number), two runs each:
+- default engine:                115.63s / 116.04s   7.66 / 7.85 GB peak
+- compiled-forward + fused:      114.26s / 114.72s   7.44 / 7.44 GB peak
+Fused is **-1.2% time and ~-0.3 GB peak, reproduced** - call it parity
+with a slight edge. The former 9-13% penalty of compiled-forward under
+frontier-only is GONE (the uncovered dying lanes were the fan-out
+cost). Fused runner totals for the full run: 36,054,933 lanes through
+the fused kernel, 11,480,704 dying-covered events -> 3,864 reps,
+uncovered 0. All 68 per-frame rowkey sets identical between the pair
+(sorted-set sha256).
+
 # K2's pm1 death-partition fix: REFUTED - inert and slightly slower (2026-08-19)
 
 The census's preferred fix (add `will_restart` to the pm1 partition

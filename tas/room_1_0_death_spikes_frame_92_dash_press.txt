@@ -1,0 +1,10 @@
+# Room (1,0) SPIKE-death witness WITH A DASH PRESS ON THE DEATH FRAME.
+# Same trajectory as room_1_0_death_spikes_frame_92_input_right.txt, but the
+# frame-92 input is R+X (34): the kill happens first (spikes check at the top
+# of player.update), then the CORPSE dash-start gate fires (djump>0, p_dash=0)
+# and the blended arm runs - freeze=2 and has_dashed=true are the only live
+# effects; everything else it writes is a deleted-player field. This is the
+# regression witness for the dyzt_dash_blend entry (the pre-blend overlays
+# pinned the gate and skipped this death).
+# Gate: ./target/release/rewrite --recipe rewrites-trace10-dying-spikes.jsonl membercheck --tas tas/room_1_0_death_spikes_frame_92_dash_press.txt
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,42,0,0,0,0,0,2,18,2,2,18,2,2,2,2,18,1,1,1,0,16,0,0,0,36,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,0,0,0,0,0,0,0,0,0,0,0,0,0,2,2,2,34,2,2,2,2,2,2,2,2,2,2,2,2,2

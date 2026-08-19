@@ -459,12 +459,23 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
         }
     }
 
-    // --- non-primary members: prove the boundary rows are block-uniform ---
-    // The member's final heap reachable set must contain no per-lane data:
-    // no varying input cell, and every dirty reachable cell's output value
-    // is an untainted uniform scalar. Those scalars form the member's
-    // TUPLE - the executor's collapse key.
+    // --- non-primary members: prove the boundary rows are collapse-keyable ---
+    // The member's final heap reachable set must contain no free per-lane
+    // data. Each reachable dirty cell's output value is either
+    //   - a uniform scalar: it joins the member's TUPLE (one value per
+    //     (config, variant) callback - button-TAINTED scalars are fine,
+    //     `Dy` is built inside the callback after the kb bindings), or
+    //   - a per-lane column (Z*) PROVEN value-identical to the primary's
+    //     own out column for the same cell (same fused node after CSE):
+    //     it joins the VARY set, and the executor reads its per-lane
+    //     value from KOut/KOutShared and extends the collapse key with
+    //     it (e.g. the corpse dash-start effects freeze / has_dashed,
+    //     whose gate reads the post-refill djump - lane-varying, but the
+    //     identical computation the live dash-start blend does).
+    // Two lanes the same callback covers with equal (tuple, vary-at-lane)
+    // keys therefore have identical boundary rows.
     let mut tuples: Vec<Vec<(u32, &'static str, String)>> = Vec::new();
+    let mut varys: Vec<Vec<(u32, &'static str)>> = Vec::new();
     for pm in &pms[1..] {
         let reach = reachable_cells(&pm.e);
         for id in pm.e.vary_in.keys() {
@@ -477,21 +488,50 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
             }
         }
         let mut tup: Vec<(u32, &'static str, String)> = Vec::new();
-        for (id, ty, expr, tainted) in &pm.of.fields {
+        let mut vt: Vec<(u32, &'static str)> = Vec::new();
+        for (id, ty, expr, _tainted) in &pm.of.fields {
             if !reach.contains(id) {
                 continue;
             }
-            if *tainted {
-                bail!("member {}: boundary cell {} is button-tainted", pm.label, id);
-            }
             match *ty {
-                "P8" | "bool" | "(P8, P8)" => {}
+                "P8" | "bool" | "(P8, P8)" => {
+                    tup.push((*id, ty, canonicalize(expr, &pm.vn)));
+                }
+                "ZN" | "ZB" | "ZI" => {
+                    let Some((pty, pexpr)) = primary
+                        .of
+                        .fields
+                        .iter()
+                        .find(|f| f.0 == *id)
+                        .map(|f| (f.1, &f.2))
+                    else {
+                        bail!(
+                            "member {}: per-lane boundary cell {} has no primary out column",
+                            pm.label, id
+                        );
+                    };
+                    if pty != *ty {
+                        bail!(
+                            "member {}: per-lane boundary cell {} is {} but the primary's is {}",
+                            pm.label, id, ty, pty
+                        );
+                    }
+                    let a = canonicalize(expr, &pm.vn);
+                    let b = canonicalize(pexpr, &primary.vn);
+                    if a != b {
+                        bail!(
+                            "member {}: per-lane boundary cell {} is not the primary's value\n  \
+                             member:  {}\n  primary: {}",
+                            pm.label, id, a, b
+                        );
+                    }
+                    vt.push((*id, ty));
+                }
                 other => bail!(
-                    "member {}: boundary cell {} is per-lane ({}) - rows are not block-uniform",
+                    "member {}: boundary cell {} has unkeyable type {}",
                     pm.label, id, other
                 ),
             }
-            tup.push((*id, ty, canonicalize(expr, &pm.vn)));
         }
         if let Some(first) = tuples.first() {
             let a: Vec<u32> = first.iter().map(|(id, _, _)| *id).collect();
@@ -503,8 +543,18 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
                 );
             }
         }
+        if let Some(first) = varys.first() {
+            if *first != vt {
+                bail!(
+                    "members disagree on the per-lane vary cells ({:?} vs {:?})",
+                    first, vt
+                );
+            }
+        }
         tuples.push(tup);
+        varys.push(vt);
     }
+    let vary_cells: Vec<(u32, &'static str)> = varys.first().cloned().unwrap_or_default();
 
     // --- deopt registers: one per distinct member set with effects ---
     let mut reg_masks: BTreeSet<u8> = BTreeSet::new();
@@ -779,6 +829,47 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
     writeln!(out, "}}\n")?;
     writeln!(
         out,
+        "/// Per-lane extension of the collapse key: reachable boundary cells\n\
+         /// of the non-primary members whose per-lane value IS the primary's\n\
+         /// own out column (proven the same fused node at emission time), so\n\
+         /// the executor reads them straight out of KOut/KOutShared."
+    )?;
+    writeln!(out, "pub const N_DY_VARY: usize = {};", vary_cells.len())?;
+    writeln!(
+        out,
+        "#[allow(unused_variables)]\n\
+         pub fn dy_vary_key(sh: &KOutShared, kv: &KOut, lane: usize) -> [u64; N_DY_VARY] {{"
+    )?;
+    writeln!(out, "    [")?;
+    for (id, ty) in &vary_cells {
+        let tainted = fused_of
+            .fields
+            .iter()
+            .find(|f| f.0 == *id)
+            .map(|f| f.3)
+            .unwrap_or(false);
+        let src = if tainted { "kv" } else { "sh" };
+        match *ty {
+            "ZN" => writeln!(out, "        {}.c{}[lane].as_raw_u32() as u64,", src, id)?,
+            "ZB" => writeln!(
+                out,
+                "        ({src}.c{id}.val >> lane & 1) as u64 | (({src}.c{id}.known >> lane & 1) as u64) << 1,",
+                src = src,
+                id = id
+            )?,
+            "ZI" => writeln!(
+                out,
+                "        {src}.c{id}.lo[lane].as_raw_u32() as u64 | ({src}.c{id}.hi[lane].as_raw_u32() as u64) << 32,",
+                src = src,
+                id = id
+            )?,
+            _ => unreachable!(),
+        }
+    }
+    writeln!(out, "    ]")?;
+    writeln!(out, "}}\n")?;
+    writeln!(
+        out,
         "/// Per-(config, variant) coverage of the non-primary members.\n\
          pub struct Dy {{\n\
          \x20   /// Lanes covered by member i+1 (valid, primary-deopt, own-\n\
@@ -802,12 +893,11 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
     }
     for tup in &tuples {
         for (_, _, expr) in tup {
-            let fexpr = fused_expr(expr);
-            if (0..6).any(|k| mentions_ident(&fexpr, &format!("kb{}", k))) {
-                bail!("a member tuple expr reads a button bit");
-            }
+            // Tuple exprs may read button bits (they are rendered inside
+            // the per-variant callback, after the kb bindings) - they are
+            // suffix-side by construction.
             suffix_scan.push('\n');
-            suffix_scan.push_str(&fexpr);
+            suffix_scan.push_str(&fused_expr(expr));
         }
     }
     for k in 0..6 {

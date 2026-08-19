@@ -275,20 +275,29 @@ opt-out). The fused engine rides the COMPILED-FORWARD path
 (CELESTE_COMPILED_FORWARD=1) - the default campaign never reaches
 kernel dispatch.
 
-Status: H=68 f066-068 rowkey sets IDENTICAL to k2ctl with the fused
-engine live; 5.2M dying-covered events -> 1,385 reps. REMAINING before
-the deopt drop is real: the corpse DASH-START gate (`btn(5) and
-djump>0`, the assert at the merged `in_i1_012_if_join_12`; kb5
-histogram: 100% of uncovered events, kb5=0 coverage complete). Steady
-blends that site; the dying members pin it (witness had no dash press).
-Fix = the same blend pattern that killed the input==0 premise in v5
-(commit 53a63fa): find the pinning entry in the dying lineage (drop-one
-cascades - sd000 anchors shift - so it must be replaced in place, not
-dropped), convert the gate to a select/masked region, re-run the
-membercheck matrix with a dash-press death witness, re-fuse, re-gate.
-Then: deopt 66k/frame -> reps only, collect-first-off pair, and the
-BEFORE/AFTER TIMING of compiled-forward+fused vs the default engine at
-H=68 - the number that decides engine adoption.
+Status: **steps 3+4 COMPLETE and gated.** H=68 f066-068 rowkey sets
+IDENTICAL to k2ctl with the fused engine live. The kb5 residual is
+CLOSED: the pinning entry was `dygb_anonymous_61_in_h061_in_k1039_cont`
+(the dash-gate branch, displaced to the k1039 cont block by the dying
+lineage's 0-trip loop pins), replaced in place with `dyzt_dash_blend`
+(the zt001 pattern), certified by two new dash-press death witnesses.
+The corpse dash arm's two live globals (freeze, has_dashed) are
+per-lane, which forced the proof's planned generalization: a per-lane
+reachable out cell is admitted iff it is the PRIMARY'S OWN out column
+(node identity after CSE), and the executor extends the collapse key
+with its per-lane value (`dy_vary_key`). Uncovered events 1.58M -> 0;
+11.5M covered events -> 3,864 reps over a full 68-frame run.
+
+Two expectations from the paragraph above were WRONG, by measurement:
+- "deopt 66k/frame -> reps only" - that counter is the DEFAULT
+  program's premise-failure population (the interpreter FORKS on the
+  kill branch; it never deopted dying lanes), identical in the pure-
+  interpreter control. Coverage shows up as interpreter WORK removed.
+- The timing: full-68-frame pair, frontier-only, no collect-first:
+  default 115.63s vs compiled-forward+fused 114.26s - PARITY (one run
+  each). The former 9-13% compiled-forward penalty is gone; the engine-
+  adoption call is now a wash at H=68 on room (1,0), to be revisited
+  where kernels bind more of the population (deeper H, other rooms).
 
 ## Open questions (for Philippe)
 
