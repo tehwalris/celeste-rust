@@ -333,11 +333,25 @@ Two implications for Phase C ordering:
    frozen-class chunks (~16k/frame); the counter is engine-invariant
    (66,136/64,026/72,620 in pure-interpreter, steady-kernel, and fused
    runs alike), which the current logs cannot fully attribute.
-   FIRST PHASE-C PROBE: instrument the deopt collection with the
-   chunk's pm1 class / kernel-disposition, one run, and see whether
-   {dash, dash-dying-spikes, dash-dying-fall} (the same pipeline on
-   the dash overlay base, a second fused artifact) buys the 45%, or
-   the population is upstream of kernel dispatch entirely.
+   PROBE RESOLVED by reading verify.rs's deopt arms: the population is
+   UPSTREAM of kernel coverage by construction. The compiled attempt
+   (`c.run_chunk`) runs kernels + an interpreter fallback for the
+   deopt sub-chunks (reps, kernel-refused rows) - and that fallback
+   has NO DEOPT CONTEXT: when a rep fails the #objects premise, the
+   fallback errors, the WHOLE ATTEMPT is discarded, and the outer
+   optimistic arm re-runs the ENTIRE 8000-lane state through granular
+   deopt (origin-tagged specialized run + plain re-run of every
+   failing lane). One dying rep = whole-state retry. That is why the
+   counter is engine-invariant, why rep collapse never moved it, and
+   why the kernel's materialized rows for ~450 of ~570 states/frame
+   (any state containing a dying lane) are computed and thrown away.
+   THE PHASE-C FIX, ahead of both M1 and dash-dying members: route the
+   kernel's deopt sub-chunks straight to the PLAIN program (the
+   canonical-state mapping of #78) inside the compiled path, instead
+   of letting the specialized fallback fail the state. Expected: the
+   deopt counter drops to ~reps, the 334-376 ts granular block and
+   the wasted kernel work disappear, and the rep collapse finally
+   pays. Gate: set identity + counter drop + the timing pair.
 
 ## Open questions (for Philippe)
 
