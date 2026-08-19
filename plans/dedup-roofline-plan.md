@@ -20,6 +20,12 @@ then orders the work.
 
 ## The numbers this plan exists to move
 
+> **UPDATE 2026-08-19, post-D4**: the headline moved. The forward stage
+> is now **115.87 s = 2,273 ns/input-lane** (was 162.17 s / 3,181), the
+> keys phase is 20.9 s of worker CPU (was 862.65 s), and the compiled
+> and interpreted searches are byte-identical (D0). The table below is
+> the PRE-D0/D4 baseline this plan was written against.
+
 Room (1,0), H=68, ladder level-0 environment, 16 threads, 50,976,062
 input lanes, 68 frames. Full table in BENCHMARK_DATA.md.
 
