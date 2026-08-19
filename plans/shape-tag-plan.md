@@ -97,6 +97,33 @@ two-member case is the ideal test: tiny divergent tail, huge shared
 prefix. Gate: per-class mechanical check (fused restricted to class i
 == member i, for every i) + the same H=68 set gate.
 
+**Step 1 DONE (2026-08-19, commit 7f0adf0 + BENCHMARK_DATA.md "Dying
+members GATED").** What it settled:
+
+- The kill is TWO branches (spikes at lua:93, y>128 at lua:97), and both
+  deaths are reachable in room (1,0) - so the member set for the player
+  shape is n=3: {alive, dying-spikes, dying-fall}, an exhaustive guard
+  TREE on two literals, not a single complementary pair. The fusion
+  machinery should take n members from the start (n=64 needs it anyway).
+- A dying member is NOT base + guard tail: the base's h010-h019 /
+  h028-h037 premises (count==1 in player.update's collide loops) run
+  post-kill and are falsified - the dying recipes OMIT them and leave
+  those loops real (zero-trip dynamically, uniform branch). No new rule
+  needed: zero-trip collapse for the fusion-facing branch-free form is
+  guard_branch{taken:false} on the loop heads.
+- `verify` cannot run a member (premise fails on most frames, no deopt
+  in verify) - `rewrite membercheck` is the concrete member gate, and a
+  resumed bench with `--variant 'player=<member>'` + rowkey set-identity
+  is the abstract one. Variant dispatch is chunk-granular (mixed chunks
+  fall back whole), so members do not cut deopt by themselves; the
+  per-lane selector of the fused engine is what does.
+- FUSION INPUTS must be branch-free, i.e. overlay-level: the campaign
+  members verified here are the specification; the fusion pilot's
+  members are (steady-class overlay) x {alive, dying-spikes, dying-fall}
+  derived on the rewrites-trace10-steady base - same falsified-entry
+  surgery + flipped kill pins + a branch census run over the DYING
+  witnesses (tas/room_1_0_death_*.txt) to pin the post-kill tail.
+
 **Phase C: n=64 input fusion (M1) + engine adoption decision.** This is
 where the fused engine is expected to finally beat the interpreter
 under CELESTE_FRONTIER_ONLY (the compiled engine currently loses 9-13%

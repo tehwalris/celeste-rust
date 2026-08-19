@@ -135,6 +135,46 @@ tier removes that 8.5x directly:
     3,850,608  new
 ```
 
+# Dying members GATED: spikes + fall specialization recipes (2026-08-19)
+
+Phase B step 1 of plans/shape-tag-plan.md (#159/#160), commit 7f0adf0.
+Two specialization-set members for the [player] shape, each derived as
+rewrites.jsonl minus the death-falsified premises (h010-h019
+collapse_loop + h028-h037 assume_eq, all post-kill in player.update_21)
+plus a guard_branch tail pinning the kill:
+
+| member | guard tail | pinned premise |
+|---|---|---|
+| rewrites-dying-spikes | and_or_join_18 taken | dies on spikes this frame |
+| rewrites-dying-fall | and_or_join_18 not taken + if_join_21 taken | falls out (y>128) this frame |
+
+Both causes are real in room (1,0): up-spikes at x in [64,88) y=104 and
+an open bottom for x>=80 (map row 15 non-solid there). Checked-in TAS
+witnesses die during f92 (spikes) / f101 (fall).
+
+Gates, all passed:
+- `rewrite membercheck` (NEW; `verify` cannot run a member - its guard
+  asserts a premise most frames falsify, and verify has no deopt):
+  concrete TAS replay, member attempted per frame from the plain
+  pre-state through StateMapping. Each member applies on ITS dying frame
+  with an identical observation, and SKIPS the other member's dying frame
+  at the discriminating guard - the complementary-pair exhaustiveness
+  argument observed concretely. 4 runs (2 members x 2 death TASes).
+- Abstract set gate: bench resumed f065->f068 from the k2ctl checkpoints
+  with `--variant 'player=<member>'`, per-frame rowkey sets of f066-f068
+  IDENTICAL to k2ctl for both members (counts 4,591,412 / 4,756,768 /
+  4,980,465; full sorted-set sha256 equal). 43 s per gate run.
+- Suite 553/553 (checked_in_recipe_tests replays both members).
+
+What the gate run also showed: variant dispatch is CHUNK-granular. A
+mixed alive+dying chunk fails the member's guard and falls back to the
+base program whole, where the dying lanes then deopt exactly as before
+(399,516 - unchanged, as expected). The lanes that DID run under the
+members (47,106 over f66-f68) are the premise-trivial frozen chunks.
+Lane-granular member execution - the actual deopt kill - is what the
+fused engine's per-lane selector delivers; these members are its
+verified inputs, not themselves a campaign optimization.
+
 # K2's pm1 death-partition fix: REFUTED - inert and slightly slower (2026-08-19)
 
 The census's preferred fix (add `will_restart` to the pm1 partition
