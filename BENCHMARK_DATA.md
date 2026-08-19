@@ -175,6 +175,33 @@ Lane-granular member execution - the actual deopt kill - is what the
 fused engine's per-lane selector delivers; these members are its
 verified inputs, not themselves a campaign optimization.
 
+# Fusion sharing census: 3 members fuse to +5.5% of steady alone (2026-08-19)
+
+Value-numbering census over the emitted kernels (leaves = u.cN / rin.cN /
+kbK / constants / fork configs; dp side-args stripped; sequential
+canonical numbering, so one divergent leaf poisons its whole cone -
+i.e., these are LOWER bounds on shareable work):
+
+| members | nodes | distinct |
+|---|---|---|
+| steady (checked in) | 1286 | 871 |
+| dying-spikes (aligned, derivation 3) | 1160 | 784 |
+| dying-fall (aligned) | 1160 | 784 |
+
+| intersection | shared |
+|---|---|
+| dying-spikes n dying-fall | 783 of 784 (all but the flipped kill guard) |
+| steady n dying | 736 |
+| union of all three | **919** (vs 2439 run separately) |
+
+So the fused {alive, dying-spikes, dying-fall} program computes ~919
+nodes - **+5.5% over steady alone** - to cover both death causes with a
+per-lane selector instead of chunk deopt. The alignment that unlocked it:
+derivation 2 pinned the spd move gate to the witness direction and shared
+only ~110 nodes (every post-blend node diverges); keeping the gate as
+steady's ti_spd_select masked select (derivation 3) recovered 626 nodes
+and also covers standing deaths.
+
 # K2's pm1 death-partition fix: REFUTED - inert and slightly slower (2026-08-19)
 
 The census's preferred fix (add `will_restart` to the pm1 partition

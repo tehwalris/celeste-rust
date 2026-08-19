@@ -1,40 +1,37 @@
 # Recipe: DYING-SPIKES overlay - the branch-free specialization-set member for
-# lanes that die by spikes (celeste-minimal.lua:93) mid-frame (plans/shape-tag-plan.md, task #159/#161).
+# lanes that die by spikes (celeste-minimal.lua:93) mid-frame (plans/shape-tag-plan.md, task #159/#161/#162).
 #
-# This is the trace10 lineage (the straightening base the class overlays and
-# the kernel emitter consume), derived mechanically:
+# Trace10 lineage, NODE-ALIGNED WITH THE STEADY OVERLAY for fusion CSE
+# (this is the third derivation; the first pinned pre-kill gates steady
+# BLENDS, and the value-numbering census showed only ~110 shared nodes of
+# steady's 871 - the blend divergence cascades. Aligned, the census reads
+# steady-and-dying = 736 shared, union of all three members = 919 nodes
+# vs 2439 separate: covering both death causes costs +5.5% nodes over
+# steady alone). Derivation:
 #   rewrites-trace10.jsonl
-#   MINUS h010-h019 + h028-h037 (collapse_loop/assume_eq premises that a
-#         mid-frame death falsifies - they assert count(objects)==1 in
-#         player.update code that runs AFTER the kill empties the array)
-#   MINUS sp1_facing_x (raw SSA ref; facing is boundary-dead for dying lanes)
-#   MINUS 7 straightening entries that no longer apply with the collide
-#         loops restored (xc015/020/021/040/045/046 if_converts in the
-#         is_solid region + zt001; all optimizations - the pin sweep below
-#         straightens what they would have)
-#   PLUS collapse_break_loop on kill_player's del search (the first recipe
-#        ever to run it live: singleton table, iteration 1 dels,
-#        iteration 2's length check breaks)
-#   PLUS a 38-entry guard_branch pin sweep, every direction TRACED on the
-#        checked-in death witness via `membercheck --trace-frame` (the
-#        branch census's successor), then dce + merge + the ti_anon61
-#        inline + kill_dead.
+#   MINUS h010-h019 + h028-h037 (death-falsified count==1 premises),
+#         sp1_facing_x (raw id), and 7 straightening entries that need
+#         the collapsed loops (xc015/020/021/040/045/046, zt001)
+#   PLUS collapse_break_loop on kill_player's del search
+#   PLUS the STEADY overlay's own tail VERBATIM where premises hold:
+#        its 23-pin gb sweep with kill/post-kill directions overridden by
+#        the death witness's branch trace (membercheck --trace-frame),
+#        dying-only post-kill pins, ti_anon61 inline, the sd demote_create
+#        entries (ids shifted -1 by the removals), ti_spd_select (the spd
+#        move gate stays a MASKED SELECT exactly as in steady - the
+#        witness-direction pin here is what cost the 626 shared nodes),
+#        st_freeze_gate; st_dash_gate does not apply (its branch is
+#        already consumed here) and is dropped.
 #
-# RESULT: __frame has ZERO conditional branches, and under membercheck the
+# RESULT: __frame with ZERO conditional branches; under membercheck the
 # member applies on EXACTLY the witness's dying frame with an identical
-# observation - and on nothing else (even spawn/freeze frames fail a pin).
-#
-# COVERAGE, stated out loud: the pins assert the witness trajectory's
-# branch profile. A dying lane whose profile differs (presses dash the
-# frame it dies, dies while standing still, ...) fails a guard and falls
-# back - loudly counted, never silently wrong. Widening coverage = more
-# members (the set architecture) or select-izing those sites; measure at
-# the fused-engine gate first. Note the ti tail drops sd000-005 and
-# ti_spd_select (raw-id / divergence entries that do not apply here).
+# observation. Coverage: pins assert the witness's branch profile
+# (dash-press-while-dying still falls back loudly; standing deaths are
+# now COVERED via the spd select, unlike derivation 2).
 #
 # Gates: rewrite --recipe <this> membercheck --tas tas/room_1_0_death_spikes_frame_92.txt
-# (applies on [92] only, observation identical), cross-witness run
-# never applies, __frame branch count == 0.
+# (applies on [92] only), __frame branch count == 0, emits via
+# `transpile --kernel` with the steady witness.
 # Recipe: ordered rewrite instructions applied to the compiled program.
 # See plans/rewrite-plan.md. Each entry has a stable, unique id.
 {"id":"r001","rule":"fold"}
@@ -1099,47 +1096,61 @@
 # A lane off the recorded trace deopts to plain via assert_true capture.
 # Certified by the hosted verify screen (deopt counts over the full run),
 # not by the census, which only samples one frame's biggest state.
-{"id":"dygb_frame___entry","rule":"guard_branch","fn":"__frame","head":"__entry","taken":false,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_frame_in_i1_012_if_join_9","rule":"guard_branch","fn":"__frame","head":"in_i1_012_if_join_9","taken":false,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_frame_in_i1_012_if_join_12","rule":"guard_branch","fn":"__frame","head":"in_i1_012_if_join_12","taken":false,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_frame_in_i1_012_if_join_22","rule":"guard_branch","fn":"__frame","head":"in_i1_012_if_join_22","taken":false,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_frame_in_j2_006_if_join_5","rule":"guard_branch","fn":"__frame","head":"in_j2_006_if_join_5","taken":false,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_anonymous_61___entry","rule":"guard_branch","fn":"anonymous_61","head":"__entry","taken":true,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_anonymous_61_if_body_5","rule":"guard_branch","fn":"anonymous_61","head":"if_body_5","taken":true,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_anonymous_61_in_k1000_if_join_14","rule":"guard_branch","fn":"anonymous_61","head":"in_k1000_if_join_14","taken":true,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_anonymous_61_if_join_6","rule":"guard_branch","fn":"anonymous_61","head":"if_join_6","taken":true,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_anonymous_61_if_body_8","rule":"guard_branch","fn":"anonymous_61","head":"if_body_8","taken":true,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_anonymous_61_if_body_8_devirt_54_true","rule":"guard_branch","fn":"anonymous_61","head":"if_body_8_devirt_54_true","taken":false,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_anonymous_61_in_h061_if_join_2","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_if_join_2","taken":true,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_anonymous_61_in_h061_if_body_20","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_if_body_20","taken":false,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_anonymous_61_in_h061_in_j2_039_if_join_8","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_j2_039_if_join_8","taken":true,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_anonymous_61_in_h061_in_j2_039_if_body_10","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_j2_039_if_body_10","taken":true,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_anonymous_61_in_h061_in_j2_039_if_join_14","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_j2_039_if_join_14","taken":false,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_anonymous_61_in_h061_in_j2_039_for_join_23","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_j2_039_for_join_23","taken":true,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_anonymous_61_in_h061_if_join_21","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_if_join_21","taken":false,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_anonymous_61_in_h061_if_join_24","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_if_join_24","taken":true,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_anonymous_61_in_h061_in_k1024_for_head_1","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k1024_for_head_1","taken":false,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_anonymous_61_in_h061_in_k030_and_or_join_4","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k030_and_or_join_4","taken":true,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_anonymous_61_in_h061_in_k1025_for_head_1","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k1025_for_head_1","taken":false,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_anonymous_61_in_h061_in_k030_and_or_join_8","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k030_and_or_join_8","taken":false,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_anonymous_61_in_h061_in_k1026_for_head_1","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k1026_for_head_1","taken":false,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_anonymous_61_in_h061_in_k1027_for_head_1","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k1027_for_head_1","taken":false,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_anonymous_61_in_h061_in_k030_cont","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k030_cont","taken":false,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_anonymous_61_in_h061_if_condition_43","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_if_condition_43","taken":false,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_anonymous_61_in_h061_in_k1034_for_head_1","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k1034_for_head_1","taken":false,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_anonymous_61_in_h061_in_k1035_for_head_1","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k1035_for_head_1","taken":false,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_anonymous_61_in_h061_in_k1038_for_head_1","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k1038_for_head_1","taken":false,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_anonymous_61_in_h061_in_k1039_for_head_1","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k1039_for_head_1","taken":false,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_anonymous_61_in_h061_in_k1039_cont","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k1039_cont","taken":false,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_anonymous_61_in_h061_if_join_154","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_if_join_154","taken":false,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_frame_in_j2_006_if_join_8","rule":"guard_branch","fn":"__frame","head":"in_j2_006_if_join_8","taken":false,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_frame_it2_zc000_in_j2_006_if_join_5","rule":"guard_branch","fn":"__frame","head":"it2_zc000_in_j2_006_if_join_5","taken":true,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_frame_in_j2_006_for_join_10","rule":"guard_branch","fn":"__frame","head":"in_j2_006_for_join_10","taken":false,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_frame_in_i1_012_cont","rule":"guard_branch","fn":"__frame","head":"in_i1_012_cont","taken":true,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_frame_in_j2_008_for_join_10","rule":"guard_branch","fn":"__frame","head":"in_j2_008_for_join_10","taken":true,"why":"dying-spikes overlay: branch direction traced on tas/room_1_0_death_spikes_frame_92.txt frame 92"}
-{"id":"dygb_dce","rule":"dce"}
-{"id":"dygb_merge","rule":"merge_blocks"}
+{"id":"gb_frame___entry","rule":"guard_branch","fn":"__frame","head":"__entry","taken":false,"why":"branch census f35: every sampled run takes the false edge"}
+{"id":"gb_frame_in_i1_012_cont","rule":"guard_branch","fn":"__frame","head":"in_i1_012_cont","taken":true,"why":"dying-spikes: direction flipped vs steady, traced on the death witness"}
+{"id":"gb_frame_in_i1_012_if_join_12","rule":"guard_branch","fn":"__frame","head":"in_i1_012_if_join_12","taken":false,"why":"branch census f35: every sampled run takes the false edge"}
+{"id":"gb_frame_in_i1_012_if_join_22","rule":"guard_branch","fn":"__frame","head":"in_i1_012_if_join_22","taken":false,"why":"branch census f35: every sampled run takes the false edge"}
+{"id":"gb_frame_in_j2_006_for_join_10","rule":"guard_branch","fn":"__frame","head":"in_j2_006_for_join_10","taken":false,"why":"branch census f35: every sampled run takes the false edge"}
+{"id":"gb_frame_in_j2_006_if_join_5","rule":"guard_branch","fn":"__frame","head":"in_j2_006_if_join_5","taken":false,"why":"branch census f35: every sampled run takes the false edge"}
+{"id":"gb_frame_in_j2_006_if_join_8","rule":"guard_branch","fn":"__frame","head":"in_j2_006_if_join_8","taken":false,"why":"dying-spikes: direction flipped vs steady, traced on the death witness"}
+{"id":"gb_frame_in_j2_008_for_join_10","rule":"guard_branch","fn":"__frame","head":"in_j2_008_for_join_10","taken":true,"why":"dying-spikes: direction flipped vs steady, traced on the death witness"}
+{"id":"gb_frame_in_j2_008_if_join_8","rule":"guard_branch","fn":"__frame","head":"in_j2_008_if_join_8","taken":false,"why":"branch census f35: every sampled run takes the false edge"}
+{"id":"gb_frame_in_j2_009_if_join_8","rule":"guard_branch","fn":"__frame","head":"in_j2_009_if_join_8","taken":true,"why":"branch census f35: every sampled run takes the true edge"}
+{"id":"gb_frame_in_zn000_if_join_6","rule":"guard_branch","fn":"__frame","head":"in_zn000_if_join_6","taken":true,"why":"branch census f35: every sampled run takes the true edge"}
+{"id":"gb_frame_in_zn001_if_body_5","rule":"guard_branch","fn":"__frame","head":"in_zn001_if_body_5","taken":true,"why":"branch census f35: every sampled run takes the true edge"}
+{"id":"gb_frame_in_zn001_if_join_6","rule":"guard_branch","fn":"__frame","head":"in_zn001_if_join_6","taken":true,"why":"branch census f35: every sampled run takes the true edge"}
+{"id":"gb_frame_it2_zc000_in_j2_006_if_join_5","rule":"guard_branch","fn":"__frame","head":"it2_zc000_in_j2_006_if_join_5","taken":true,"why":"branch census f35: every sampled run takes the true edge"}
+{"id":"gb_anonymous_61_if_body_5","rule":"guard_branch","fn":"anonymous_61","head":"if_body_5","taken":true,"why":"branch census f35: every sampled run takes the true edge"}
+{"id":"gb_anonymous_61_if_join_6","rule":"guard_branch","fn":"anonymous_61","head":"if_join_6","taken":true,"why":"branch census f35: every sampled run takes the true edge (type.update ~= nil; re-added after the round-2 failure was traced to the dash gate under a merged label)"}
+{"id":"gb_anonymous_61_if_body_8","rule":"guard_branch","fn":"anonymous_61","head":"if_body_8","taken":true,"why":"branch census f35: every sampled run takes the true edge"}
+{"id":"gb_anonymous_61_if_body_8_devirt_54_true","rule":"guard_branch","fn":"anonymous_61","head":"if_body_8_devirt_54_true","taken":false,"why":"branch census f35: every sampled run takes the false edge"}
+{"id":"gb_anonymous_61_in_h061_if_join_154","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_if_join_154","taken":false,"why":"branch census f35: every sampled run takes the false edge"}
+{"id":"gb_anonymous_61_in_h061_if_join_2","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_if_join_2","taken":true,"why":"dying-spikes: direction flipped vs steady, traced on the death witness"}
+{"id":"gb_anonymous_61_in_h061_if_join_21","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_if_join_21","taken":false,"why":"branch census f35: every sampled run takes the false edge"}
+{"id":"gb_anonymous_61_in_h061_if_join_24","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_if_join_24","taken":true,"why":"dying-spikes: direction flipped vs steady, traced on the death witness"}
+{"id":"gb_anonymous_61_in_k1000_if_join_14","rule":"guard_branch","fn":"anonymous_61","head":"in_k1000_if_join_14","taken":true,"why":"branch census f35: every sampled run takes the true edge"}
+{"id":"gb_dce","rule":"dce"}
+{"id":"dygb_anonymous_61_in_h061_if_body_20","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_if_body_20","taken":false,"why":"dying-spikes only: post-kill site traced on the death witness"}
+{"id":"dygb_anonymous_61_in_h061_in_j2_039_if_join_8","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_j2_039_if_join_8","taken":true,"why":"dying-spikes only: post-kill site traced on the death witness"}
+{"id":"dygb_anonymous_61_in_h061_in_j2_039_if_body_10","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_j2_039_if_body_10","taken":true,"why":"dying-spikes only: post-kill site traced on the death witness"}
+{"id":"dygb_anonymous_61_in_h061_in_j2_039_if_join_14","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_j2_039_if_join_14","taken":false,"why":"dying-spikes only: post-kill site traced on the death witness"}
+{"id":"dygb_anonymous_61_in_h061_in_j2_039_for_join_23","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_j2_039_for_join_23","taken":true,"why":"dying-spikes only: post-kill site traced on the death witness"}
+{"id":"dygb_anonymous_61_in_h061_in_k1024_for_head_1","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k1024_for_head_1","taken":false,"why":"dying-spikes only: post-kill site traced on the death witness"}
+{"id":"dygb_anonymous_61_in_h061_in_k030_and_or_join_4","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k030_and_or_join_4","taken":true,"why":"dying-spikes only: post-kill site traced on the death witness"}
+{"id":"dygb_anonymous_61_in_h061_in_k1025_for_head_1","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k1025_for_head_1","taken":false,"why":"dying-spikes only: post-kill site traced on the death witness"}
+{"id":"dygb_anonymous_61_in_h061_in_k030_and_or_join_8","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k030_and_or_join_8","taken":false,"why":"dying-spikes only: post-kill site traced on the death witness"}
+{"id":"dygb_anonymous_61_in_h061_in_k1026_for_head_1","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k1026_for_head_1","taken":false,"why":"dying-spikes only: post-kill site traced on the death witness"}
+{"id":"dygb_anonymous_61_in_h061_in_k1027_for_head_1","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k1027_for_head_1","taken":false,"why":"dying-spikes only: post-kill site traced on the death witness"}
+{"id":"dygb_anonymous_61_in_h061_in_k030_cont","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k030_cont","taken":false,"why":"dying-spikes only: post-kill site traced on the death witness"}
+{"id":"dygb_anonymous_61_in_h061_if_condition_43","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_if_condition_43","taken":false,"why":"dying-spikes only: post-kill site traced on the death witness"}
+{"id":"dygb_anonymous_61_in_h061_in_k1034_for_head_1","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k1034_for_head_1","taken":false,"why":"dying-spikes only: post-kill site traced on the death witness"}
+{"id":"dygb_anonymous_61_in_h061_in_k1035_for_head_1","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k1035_for_head_1","taken":false,"why":"dying-spikes only: post-kill site traced on the death witness"}
+{"id":"dygb_anonymous_61_in_h061_in_k1038_for_head_1","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k1038_for_head_1","taken":false,"why":"dying-spikes only: post-kill site traced on the death witness"}
+{"id":"dygb_anonymous_61_in_h061_in_k1039_for_head_1","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k1039_for_head_1","taken":false,"why":"dying-spikes only: post-kill site traced on the death witness"}
+{"id":"dygb_anonymous_61_in_h061_in_k1039_cont","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k1039_cont","taken":false,"why":"dying-spikes only: post-kill site traced on the death witness"}
+{"id":"gb_merge","rule":"merge_blocks"}
 {"id":"ti_anon61","rule":"inline","fn":"__frame","at":"%1488","callee":"anonymous_61","captures":[]}
 {"id":"ti_dce","rule":"dce"}
 {"id":"ti_merge","rule":"merge_blocks"}
-{"id":"dy_kill","rule":"kill_dead"}
+{"id":"sd000","rule":"demote_create","fn":"__frame","at":"%2282","why":"steady sd entry, id shifted -1 by the dying derivation"}
+{"id":"sd001","rule":"demote_create","fn":"__frame","at":"%2289","why":"steady sd entry, id shifted -1 by the dying derivation"}
+{"id":"sd002","rule":"demote_create","fn":"__frame","at":"%2301","why":"steady sd entry, id shifted -1 by the dying derivation"}
+{"id":"sd003","rule":"demote_create","fn":"__frame","at":"%2637","why":"steady sd entry, id shifted -1 by the dying derivation"}
+{"id":"sd004","rule":"demote_create","fn":"__frame","at":"%2644","why":"steady sd entry, id shifted -1 by the dying derivation"}
+{"id":"sd005","rule":"demote_create","fn":"__frame","at":"%2656","why":"steady sd entry, id shifted -1 by the dying derivation"}
+{"id":"ti_spd_select","rule":"speculate_region","fn":"__frame","head":"in_i1_012_if_join_12","arm":"in_ti_anon61_if_body_5","mask":true,"splits":true,"guards":true,"why":"the spd move gate diverges per lane inside a pm1 class (standing vs moving), so it becomes a select: the arm runs masked. Same handling as the steady overlay - keeps the dying member node-aligned with it for fusion CSE."}
+{"id":"ti_spd_merge","rule":"merge_blocks"}
+{"id":"ti_kill","rule":"kill_dead"}
+{"id":"st_freeze_gate","rule":"guard_branch","fn":"__frame","head":"__entry","taken":false,"why":"steady-class overlay (dispatch key shape=player, pm1 freeze:0,dash_time:0): the freeze early-return gate reads freeze before anything writes it, so freeze==0 at the frame boundary pins the false edge"}
+{"id":"st_dce","rule":"dce"}
+{"id":"st_kill","rule":"kill_dead","why":"straightening extended live ranges past kills derived on the branched CFG; strip and re-derive"}
