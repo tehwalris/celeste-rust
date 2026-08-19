@@ -320,13 +320,24 @@ Two implications for Phase C ordering:
    suffix nodes depend on a SUBSET of kb bits - CSE by kb-support
    evaluates each node once per distinct support value).
 2. The DEOPT RE-RUNS are ~45% of all interpret thread-seconds in BOTH
-   engines (334-376 ts) - the 66k lanes/frame failing the default
-   program's premises (visible trigger: the wall-slide gate assert at
-   in_h061_if_join_24). This is engine-independent and is exactly what
-   ADDITIONAL MEMBERS attack - the machinery for which is now fully
-   built and gated. A member (or premise-blend, as with the corpse
-   gates) for the dominant premise-failure class may be a bigger,
-   cheaper prize than M1. Census the deopt triggers first.
+   engines (334-376 ts), and the trigger census is UNANIMOUS: every
+   collected trigger (1,427/1,427 in the f66-68 collect-first run) is
+   ONE premise - `%3772 = assert_true(#objects == count-at-entry)` at
+   anonymous_61 in_h061_if_join_24, i.e. "no object was deleted or
+   created this frame". The population failing it = every lane where
+   the del fires (deaths) in code the KERNELS DID NOT COVER. Shape
+   census at f066: 100% of lanes are the [player] shape, so this is
+   NOT a shape-coverage gap. Known sub-populations: dying lanes in
+   DASH-class chunks (~26k lanes/frame at f66-68, no dying member for
+   the dash overlay - dashing into the spikes is a common death) and
+   frozen-class chunks (~16k/frame); the counter is engine-invariant
+   (66,136/64,026/72,620 in pure-interpreter, steady-kernel, and fused
+   runs alike), which the current logs cannot fully attribute.
+   FIRST PHASE-C PROBE: instrument the deopt collection with the
+   chunk's pm1 class / kernel-disposition, one run, and see whether
+   {dash, dash-dying-spikes, dash-dying-fall} (the same pipeline on
+   the dash overlay base, a second fused artifact) buys the 45%, or
+   the population is upstream of kernel dispatch entirely.
 
 ## Open questions (for Philippe)
 
