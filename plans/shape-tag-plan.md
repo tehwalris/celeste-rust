@@ -131,7 +131,35 @@ there because per-row fan-out dominates - input fusion attacks exactly
 that). Only after C does "fused engine as campaign default" get
 decided, by measurement, against the then-current interpreter baseline.
 
-## Verification, layered
+## Step 2 working notes (2026-08-19)
+
+The transpiler survey settled HOW the graph form gets built: the kernel
+emitter (src/transpile/kernel.rs) already does everything except keep a
+graph - it folds the heap at emit time, types every value (the K
+lattice), tracks button taint, and streams `let v{n}: TY = op(args);`
+lines through `Emit::bind` with NO memoization. The emitted kernel body
+IS the member's pure branch-free expression graph, in SSA text. So the
+graph IR is a REFACTOR, not a parallel system:
+
+1. `bind()` appends `Node { name, ty, expr }` to a node list; rendering
+   the node list reproduces today's text BYTE-IDENTICALLY (gate:
+   `generated_is_current` + regen diff). Fork loops, the prefix/suffix
+   cut and the pins become node/list attributes.
+2. Exprs get structured (op head + arg names) - the text is
+   machine-generated, so a tiny parser at bind time is safe.
+3. Fusion (step 3) value-numbers across the n members' node lists;
+   the executor (step 4) is an interpreted VM dispatching the same
+   celeste-engine zn_*/zi_*/zb_*/zsel_* primitives per node.
+
+Dying-overlay derivation (step 2a) correction: trace10's straightening
+entries (xc/z families) were derived on the COLLAPSED collide loops, so
+with h010-h019 removed some no longer apply. They are all optimizations
+- a dropped if_convert just leaves a branch the terminal pin sweep pins
+instead - so the derivation is a mechanical DROP LOOP (build, drop the
+failing entry, repeat), keeping the full shared prefix (which is what
+fusion CSE shares) and relying on the pin sweep + dce for straightness
+of the dying tail. Pin directions come from `membercheck --trace-frame`
+on the checked-in death witnesses (the branch census's successor).
 
 1. Each member: existing per-recipe machinery (build, differential
    verify, screen; suite).
