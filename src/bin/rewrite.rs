@@ -116,6 +116,11 @@ enum Command {
         /// Frames to run (default: the input count).
         #[arg(long)]
         frames: Option<u32>,
+        /// Trace every conditional branch DIRECTION of the member attempt on
+        /// this frame and print the guard_branch pin each site implies -
+        /// the input of a dying-overlay pin sweep (plans/shape-tag-plan.md).
+        #[arg(long)]
+        trace_frame: Option<u32>,
     },
     /// Propose recipe entries. This is the untrusted half of the system: the
     /// output is a suggestion, and only survives if the rule's verifier accepts
@@ -1924,7 +1929,7 @@ fn main() -> Result<()> {
             }
         }
 
-        Command::Membercheck { tas, frames } => {
+        Command::Membercheck { tas, frames, trace_frame } => {
             use celeste_rust::concrete;
             use celeste_rust::interpreter::fixed_env::PreparedCfg;
             use celeste_rust::interpreter::glue::interpret_prepared_cfg;
@@ -1961,7 +1966,47 @@ fn main() -> Result<()> {
                 let mut mstate = state.clone();
                 mapping.from_canonical(&mut mstate)?;
                 concrete::set_concrete_buttons(&mut mstate, byte)?;
+                let tracing_this_frame = trace_frame == Some(frame);
+                if tracing_this_frame {
+                    celeste_rust::interpreter::branch_trace::start();
+                }
                 let member_result = interpret_prepared_cfg(&member_cfg, mstate, &member_env);
+                if tracing_this_frame {
+                    let trace = celeste_rust::interpreter::branch_trace::stop_take();
+                    // Group by site: a site whose every execution goes one way
+                    // is pinnable; anything else needs a loop rule instead.
+                    let mut sites: Vec<((String, String), (u32, u32, u32))> = Vec::new();
+                    for (f, b, t, fl) in trace {
+                        let key = (f, b);
+                        let entry = match sites.iter_mut().find(|(k, _)| *k == key) {
+                            Some((_, e)) => e,
+                            None => {
+                                sites.push((key, (0, 0, 0)));
+                                &mut sites.last_mut().unwrap().1
+                            }
+                        };
+                        match (t, fl) {
+                            (true, false) => entry.0 += 1,
+                            (false, true) => entry.1 += 1,
+                            _ => entry.2 += 1, // both edges in one execution
+                        }
+                    }
+                    println!("branch trace of frame {} ({} sites):", frame, sites.len());
+                    for ((f, b), (t, fl, both)) in &sites {
+                        let verdict = match (t, fl, both) {
+                            (_, 0, 0) => "pin taken:true".to_string(),
+                            (0, _, 0) => "pin taken:false".to_string(),
+                            _ => format!("NOT PINNABLE (true {} / false {} / split {})", t, fl, both),
+                        };
+                        println!(
+                            "  {{\"fn\":\"{}\",\"head\":\"{}\"}} x{}  {}",
+                            f,
+                            b,
+                            t + fl + both,
+                            verdict
+                        );
+                    }
+                }
 
                 // Plain step (the reference trajectory).
                 state = concrete::step_frame(&plain_cfg, state, &plain_env, byte)?;

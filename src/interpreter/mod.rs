@@ -1,5 +1,6 @@
 mod core_interpreter;
 pub mod abstraction;
+pub mod branch_trace;
 pub mod deopt_collect;
 pub mod field_census;
 pub mod fixed_env;

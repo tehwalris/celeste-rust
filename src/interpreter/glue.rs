@@ -417,8 +417,16 @@ fn interpret_prepared_cfg_inner(
                 let bound_split = adapter.flow_branch_split(terminator)?;
                 let (true_flow_data, false_flow_data) = bound_split.flow_split(flow_data)?;
                 let took_true = !true_flow_data.is_empty();
-                process_branch(true, true_target, true_flow_data)?;
                 let took_false = !false_flow_data.is_empty();
+                if crate::interpreter::branch_trace::active() {
+                    crate::interpreter::branch_trace::record(
+                        name.as_deref().unwrap_or("__main"),
+                        block_label.as_ref().map_or("__entry", |l| l.as_str()),
+                        took_true,
+                        took_false,
+                    );
+                }
+                process_branch(true, true_target, true_flow_data)?;
                 process_branch(false, false_target, false_flow_data)?;
 
                 // A branch only costs anything when it actually splits: both
