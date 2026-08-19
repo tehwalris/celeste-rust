@@ -1,0 +1,45 @@
+# Recipe: the DEATH shape variant - `[]`, the empty object array.
+#
+# What this is: deliberately EMPTY. The variant program for dead states is
+# the PLAIN program. A dead frame is the restart countdown (_update:
+# frames counter, freeze check, `delay_restart = delay_restart - 1`, and a
+# foreach over zero objects); the 15th frame runs load_room and
+# repopulates the room. None of that needs rewrites to be fast - the
+# whole point is what routing it here REMOVES: the base recipe's
+# trip-count-one premises (collapse_loop/assume_eq on the singleton
+# objects table) are exactly what a zero-object state falsifies, so
+# before this variant every dead state ran the deopt machinery instead
+# (snapshot + origin-tagged specialized run + plain re-run - measured
+# ~94% of frame-body CPU at H=68 depth, for 0.8% of lanes; see
+# BENCHMARK_DATA.md "K2's pm1 death-partition fix" and the K2 census in
+# plans/dedup-roofline-plan.md). The plain program has no premises, so
+# dispatching dead states straight to it can never fail or fall back,
+# including on the reload frame (dispatch keys on the INPUT state, and
+# load_room is just plain-program code).
+#
+# Register with:  --variant '[]=rewrites-death.jsonl'
+# ([] is parse_shapes' spelling of the empty shape; room (1,0)'s dead
+# shape. Room (0,0) dies as [fake_wall] before the wall breaks - a
+# death variant there wants '[]|fake_wall=...' - unscreened so far.)
+#
+# Gate: rewrite verify --variant-of rewrites.jsonl --variant-shapes '[]'
+# at a horizon deep enough that deaths exist (f58+ in room (1,0)) -
+# "never dispatched" is a rejection by design.
+#
+#
+# MEASURED 2026-08-19, H=68 room (1,0): this variant is CORRECT but
+# NEARLY INERT - 19 lanes dispatched, deopt unchanged at 399,516 lanes,
+# per-frame rowkey sets identical to the no-variant run (the contract
+# holds). The census's "empty object array" described the MID-FRAME
+# state: the deopting lanes are ALIVE at frame start and die during the
+# frame (kill_player empties objects, the is_solid premise fires later
+# in the same frame), so input-shape dispatch cannot catch them; the
+# dead-at-boundary frontier collapses to ~2 rows/frame. Kept because the
+# [] spelling and this recipe are the right landing slot for boundary-
+# dead states, but the deopt fix must address the DYING frame: either
+# K1's defer/batch of failing lanes, or a premise-preserving rewrite of
+# the death branch at the assert site (guard instead of assume).
+#
+# Empty recipe = Program::compile_from_disk() unmodified = identity
+# StateMapping (no promote_capture entries) = merge_partition_cells
+# empty, which make_variant treats as "inherit the host's pm1".

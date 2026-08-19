@@ -573,9 +573,17 @@ fn read_status_kb(field: &str) -> u64 {
 fn parse_shapes(text: &str) -> Result<Vec<Vec<String>>> {
     let shapes: Vec<Vec<String>> = text
         .split('|')
-        .map(|shape| shape.split(',').map(|t| t.trim().to_string()).collect())
+        .map(|shape| {
+            // `[]` is the EMPTY object array - the shape of a dead state
+            // (every object destroyed, will_restart counting down). The
+            // runtime side always supported `vec![]`; this is its spelling.
+            if shape.trim() == "[]" {
+                return Vec::new();
+            }
+            shape.split(',').map(|t| t.trim().to_string()).collect()
+        })
         .collect();
-    if shapes.iter().any(|s: &Vec<String>| s.is_empty() || s.iter().any(|t| t.is_empty())) {
+    if shapes.iter().any(|s: &Vec<String>| s.iter().any(|t| t.is_empty())) {
         return Err(anyhow!("empty shape or object type name in {:?}", text));
     }
     Ok(shapes)
