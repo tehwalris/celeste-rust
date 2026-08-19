@@ -69,32 +69,27 @@ existing 1-cut approximation of this and gets subsumed.
 Notes for the fusion pass: `cse`'s Pure keys are deliberately
 BLOCK-LOCAL ("rematerialize, don't carry"), a cost decision tuned for
 the interpreter's LocalEnv that INVERTS for a column executor - the
-fusion CSE must be global. Fork loops (`zi_fork_flr`) and the
+fusion CSE must be global. It is also a DIFFERENT KIND of CSE
+(Philippe): it operates on the new graph IR (value numbering over pure
+nodes), not on the CFG IR - do not extend rules/cse.rs; build it as
+part of the fusion pass. Fork loops (`zi_fork_flr`) and the
 prefix/suffix cut become node attributes rather than emitted control
 structure.
 
-## Phasing - and why there is a Phase A before any fusion
+## Phasing
 
-**Phase A: specialization-set pilot with the EXISTING interpreter as
-the executor of both members. No new representation.** Derive the dying
-recipe (guard_branch{taken:true} on the kill branch + dce + kill_dead;
-verify with existing tooling). Change the deopt TARGET: lanes that fail
-the alive member's premises re-run under the DYING member instead of
-the plain program (lane-granular collection exists, #80). The dying
-member is tiny, so the retry is cheap - which also removes
-collect-first's reason to exist (its tagged-mode tax, 307 s thread-CPU
-at H=68, is a hedge against expensive retries). Expected to capture a
-large slice of the measured ~94%-of-frame-body deopt cost with ~no new
-machinery. Gates: dying-recipe differential verify; H=68 rowkey
-set-identity vs ~/perf-scratch/k2ctl; deopt-to-plain lanes -> ~0;
-collect-first-off pair.
+(A deopt-to-specialization intermediate - re-route failing lanes to the
+dying member instead of the plain program, no new representation - was
+considered and DECLINED by Philippe 2026-08-19: "go for the full thing
+instead, since that's the end state I want." If fusion stalls it
+remains the documented fallback, together with #155.)
 
-Caveat to verify in Phase A: the dying member's premises must hold for
-the LANES routed to it (they die this frame) - the guard pair must be
-checked per-lane exhaustive, and lanes failing BOTH (should not exist)
-still fall to plain, loudly counted.
-
-**Phase B: the graph form + executor + fusion at n=2.** Node arena,
+**Phase B (START HERE): the graph form + executor + fusion at n=2.**
+First derive and verify the dying member (guard_branch{taken:true} on
+the kill branch + dce + kill_dead - the frozen-overlay pattern;
+existing per-recipe tooling). The guard pair must be per-lane
+exhaustive; lanes failing both (should not exist) fall to plain,
+loudly counted. Node arena,
 value-numbering fusion of {alive, dying}, guard pair -> selector,
 boundary materialization by selector value (the split_by_liveness step
 in split_precision_straddles' seam - unchanged from design v1). The
@@ -122,9 +117,6 @@ decided, by measurement, against the then-current interpreter baseline.
 
 ## Open questions (for Philippe)
 
-- Phase A first, or straight to B? A is cheap and captures most of the
-  deopt prize early, but it builds a two-pass structure fusion later
-  deletes.
 - Fingerprint story for recipe SETS: hash the member list + fusion pass
   version? (Variant list is deliberately un-fingerprinted today;
   members that change the executed program are different.)
