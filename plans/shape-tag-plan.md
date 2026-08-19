@@ -184,6 +184,54 @@ items for steps 3/4:
   fused artifact's suffix handling must reconcile per-member observed
   bit sets.
 
+### Fused emission design (2026-08-19, for step 3 completion + step 4)
+
+Inputs: the n KernelGraphs (c44a231) + the shared value numbering
+(transpile::fuse). Emission:
+
+1. **Selector extraction.** Number all members against ONE interned
+   table. Walk each member's Raw guard lines (`zguard(v, ..)`); a
+   guard whose operand's canonical id appears in another member NEGATED
+   (zb_not of it) is a SELECTOR literal; the rest stay member-local
+   guards. For {steady, dy-spikes, dy-fall}: sel_spikes (the spikes ZB)
+   and sel_fall (the y>128 zn_gt). Exhaustiveness check: the members'
+   selector-literal sign patterns must cover the full truth table of the
+   literals mentioned (steady: !s∧!f; spikes: s; fall: !s∧f - covers all
+   four assignments since spikes=s subsumes s∧f and s∧!f... verify per
+   set and REFUSE emission on gaps: uncovered patterns keep deopt).
+2. **One pass, member-tagged nodes.** Emit nodes in interleaved
+   canonical order: shared nodes once; a node reachable from only some
+   members carries their member set. Per-member deopt masks
+   `dp_m: u16`; member-local zguards write their own dp_m. A lane's
+   member id = the first member (fixed priority order) whose selector
+   pattern matches AND whose dp_m bit is clear; lanes matching none
+   deopt to the interpreter (loudly counted).
+3. **Outputs.** Per-member out_fields; the callback gains the per-lane
+   member-id column. Boundary materialization: alive members produce
+   the steady shape as today; DYING members produce the dead shape
+   (objects empty; globals deaths/will_restart/delay_restart/freeze from
+   their out cells; the dead player's OUT_CELLS ignored). The dead-shape
+   Rt2 template can be built once from any dead boundary state (the []
+   shape the campaign already dedups).
+4. **Suffix.** The fused suffix observes the UNION of member kb bit
+   sets; per-member tainted outputs computed under the same B.
+5. **Artifact + executor (step 4).** Fused programs are GENERATED, not
+   checked in. Two execution options, decide by build: (a) render the
+   fused graph as Rust into a scratch module compiled with the workspace
+   (like kernels but git-ignored/OUT_DIR); (b) the interpreted node-list
+   VM over the engine primitives (K4-deleted Rt2 arena shape,
+   `git show 23b96bc^:native-probe/src/runtime2.rs`). (a) reuses the
+   whole existing dispatch plumbing (FrameEngine registry entry with
+   3-member coverage) and is likely the shorter path to the H=68 gate;
+   (b) is the plan-of-record's own representation and avoids build-time
+   codegen; the gate applies to either.
+6. **Gates (step 4).** Per-class replay: fused restricted to member i's
+   selector class == member i's kernel on saved real rows (k2ctl frames
+   have the dying frames f58+); then the campaign H=68 rowkey
+   set-identity vs ~/perf-scratch/k2ctl with the fused engine handling
+   the player shape, deopt 399,516 -> ~0 for covered profiles, fallbacks
+   loudly counted; then collect-first-off pair; suite.
+
 ## Verification, layered
 
 1. Each member: existing per-recipe machinery (build, differential
