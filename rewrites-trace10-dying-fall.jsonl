@@ -1133,12 +1133,17 @@
 {"id":"dygb_anonymous_61_in_h061_in_k1026_for_head_1","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k1026_for_head_1","taken":false,"why":"dying-fall only: post-kill site traced on the death witness"}
 {"id":"dygb_anonymous_61_in_h061_in_k1027_for_head_1","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k1027_for_head_1","taken":false,"why":"dying-fall only: post-kill site traced on the death witness"}
 {"id":"dygb_anonymous_61_in_h061_in_k030_cont","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k030_cont","taken":false,"why":"dying-fall only: post-kill site traced on the death witness"}
-{"id":"dygb_anonymous_61_in_h061_if_condition_43","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_if_condition_43","taken":false,"why":"dying-fall only: post-kill site traced on the death witness"}
 {"id":"dygb_anonymous_61_in_h061_in_k1034_for_head_1","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k1034_for_head_1","taken":false,"why":"dying-fall only: post-kill site traced on the death witness"}
 {"id":"dygb_anonymous_61_in_h061_in_k1035_for_head_1","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k1035_for_head_1","taken":false,"why":"dying-fall only: post-kill site traced on the death witness"}
 {"id":"dygb_anonymous_61_in_h061_in_k1038_for_head_1","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k1038_for_head_1","taken":false,"why":"dying-fall only: post-kill site traced on the death witness"}
 {"id":"dygb_anonymous_61_in_h061_in_k1039_for_head_1","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k1039_for_head_1","taken":false,"why":"dying-fall only: post-kill site traced on the death witness"}
 {"id":"dygb_anonymous_61_in_h061_in_k1039_cont","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k1039_cont","taken":false,"why":"dying-fall only: post-kill site traced on the death witness"}
+{"id":"dygb_k1030","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k1030_for_head_1","taken":false,"why":"dying: the corpse is_solid(input,0) check loop scans an EMPTY objects table (the del removed the player) - zero iterations, same premise as the traced 0-trip pins; this arm was untraced because the witness had input==0"}
+{"id":"dygb_k1031","rule":"guard_branch","fn":"anonymous_61","head":"in_h061_in_k1031_for_head_1","taken":false,"why":"dying: as dygb_k1030, second check loop"}
+{"id":"dy_pin_dce","rule":"dce","why":"the pin sweep + the 0-trip pins above leave dead loop bodies (back-edges) that block merging"}
+{"id":"dy_pin_merge","rule":"merge_blocks","why":"re-merge the straightened chains so the corpse input gate below has single-block arms"}
+{"id":"dy_input_blend","rule":"speculate_region","fn":"anonymous_61","head":"if_join_6","arm":"in_h061_and_or_continue_63","guards":true,"why":"dying: blend the corpse wall-slide input~=0 gate arm (is_solid(input,0), empty-table checks pinned above) - the input direction is NOT a premise of dying"}
+{"id":"dy_input_merge","rule":"merge_blocks"}
 {"id":"gb_merge","rule":"merge_blocks"}
 {"id":"ti_anon61","rule":"inline","fn":"__frame","at":"%1488","callee":"anonymous_61","captures":[]}
 {"id":"ti_dce","rule":"dce"}

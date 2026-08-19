@@ -1,0 +1,7 @@
+# Room (1,0) FALL-death witness WITH INPUT HELD (dying-overlay input-blend gate).
+# The spikes witness's prefix but RIGHT held from frame 75 to the end: the
+# player overshoots the spike strip (x=121 >= 88), falls into the open pit and
+# dies DURING FRAME 101 (y > 128) with input=R. The v5 dying-fall overlay
+# applies here; the v3 overlay skipped it at the witness-specific input==0 pin.
+# Gate: ./target/release/rewrite --recipe rewrites-trace10-dying-fall.jsonl membercheck --tas tas/room_1_0_death_fall_frame_101_input_right.txt
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,42,0,0,0,0,0,2,18,2,2,18,2,2,2,2,18,1,1,1,0,16,0,0,0,36,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2

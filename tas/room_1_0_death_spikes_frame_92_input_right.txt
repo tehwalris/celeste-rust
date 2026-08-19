@@ -1,0 +1,8 @@
+# Room (1,0) SPIKE-death witness WITH INPUT HELD (dying-overlay input-blend gate).
+# Same trajectory as room_1_0_death_spikes_frame_92.txt, but RIGHT is re-held
+# from frame 88: the player lands on the up-spikes at x=83 and dies DURING
+# FRAME 92 with input=R. The v5 dying overlays (corpse input gate BLENDED,
+# not pinned) apply here; the v3 overlays skipped this death at the
+# witness-specific input==0 pin - this file is the regression witness for that.
+# Gate: ./target/release/rewrite --recipe rewrites-trace10-dying-spikes.jsonl membercheck --tas tas/room_1_0_death_spikes_frame_92_input_right.txt
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,42,0,0,0,0,0,2,18,2,2,18,2,2,2,2,18,1,1,1,0,16,0,0,0,36,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,0,0,0,0,0,0,0,0,0,0,0,0,0,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2
