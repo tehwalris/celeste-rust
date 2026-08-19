@@ -348,10 +348,15 @@ Two implications for Phase C ordering:
    THE PHASE-C FIX, ahead of both M1 and dash-dying members: route the
    kernel's deopt sub-chunks straight to the PLAIN program (the
    canonical-state mapping of #78) inside the compiled path, instead
-   of letting the specialized fallback fail the state. Expected: the
-   deopt counter drops to ~reps, the 334-376 ts granular block and
-   the wasted kernel work disappear, and the rep collapse finally
-   pays. Gate: set identity + counter drop + the timing pair.
+   of letting the specialized fallback fail the state.
+   **BUILT AND GATED same day** (`FrameEngine::plain_block`): deopt
+   blocks 334 ts -> 0.00, plain-routed 14,284 lanes TOTAL over 68
+   frames, all 68 rowkey sets identical, suite green, and the engine
+   went from parity to **89.6s / 4.2 GB vs the default's 116s /
+   7.7 GB (-22% time, -45% peak)**. Engine adoption is now a live
+   decision; the fused-artifact fingerprint story is the remaining
+   blocker (see BENCHMARK_DATA.md "The plain path for kernel deopt
+   sub-chunks"). M1 remains the next performance lever after that.
 
 ## Open questions (for Philippe)
 

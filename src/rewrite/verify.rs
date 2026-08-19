@@ -1277,7 +1277,23 @@ fn compiled_forward(program: &Program) -> Result<Option<&'static CompiledForward
             compile_program.merge_partition_cells,
             program.merge_partition_cells,
         );
-        let engine = crate::compiled::FrameEngine::new_for_start_room(&compile_program)?;
+        let mut engine = crate::compiled::FrameEngine::new_for_start_room(&compile_program)?;
+        // The plain-program path for the kernels' deopt sub-chunks (dying
+        // representatives, class-leaving rows). The mapping must be the
+        // COMPILE recipe's - the sub-chunks are in the layout the compile
+        // program produced. Without this, one dying representative fails
+        // the specialized fallback, the whole compiled attempt is
+        // discarded, and the outer deopt arm re-runs the entire state
+        // (plans/shape-tag-plan.md, "Phase C scoping measurement").
+        let plain_program = Program::compile_from_disk()
+            .context("compiling the plain program for the engine's deopt path")?;
+        engine.set_plain_path(crate::compiled::PlainPath {
+            plain_cfg: crate::interpreter::fixed_env::PreparedCfg::new(
+                plain_program.frame_cfg().clone(),
+            ),
+            plain_env: plain_program.fixed_env(),
+            mapping: super::state_mapping::StateMapping::from_recipe(&recipe),
+        });
         let _ = ENGINE.set(CompiledForward { engine, check });
     }
     let engine = ENGINE.get().expect("just initialized");

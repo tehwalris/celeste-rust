@@ -222,6 +222,11 @@ fn kernel_class_mask() -> u8 {
 }
 
 /// Lanes handled per class kernel [steady, dash, frozen, missed].
+/// Lanes the engine routed through the PLAIN program (kernel deopt
+/// sub-chunks; see `FrameEngine::plain_block`).
+pub(crate) static PLAIN_ROUTED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 static KERNEL_HITS: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -242,10 +247,11 @@ pub fn print_kernel_hits() {
         .iter()
         .map(|a| a.swap(0, std::sync::atomic::Ordering::Relaxed))
         .collect();
-    if v.iter().any(|x| *x > 0) {
+    let plain = PLAIN_ROUTED.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if v.iter().any(|x| *x > 0) || plain > 0 {
         eprintln!(
-            "kernel lanes: steady {} dash {} frozen {} missed {}",
-            v[0], v[1], v[2], v[3]
+            "kernel lanes: steady {} dash {} frozen {} missed {} plain-routed {}",
+            v[0], v[1], v[2], v[3], plain
         );
     }
     {

@@ -305,6 +305,43 @@ the fused kernel, 11,480,704 dying-covered events -> 3,864 reps,
 uncovered 0. All 68 per-frame rowkey sets identical between the pair
 (sorted-set sha256).
 
+## The plain path for kernel deopt sub-chunks: -22% time, -45% peak (2026-08-19, same day)
+
+The thread-second profile of the pair above exposed the real sink: the
+per-frame "deopt lanes" counter (66k/frame) was ENGINE-INVARIANT
+because the kernels' deopt sub-chunks (dying representatives, class-
+leaving rows) ran the SPECIALIZED interpreter inside `run_chunk`, which
+has no deopt context - one rep failing the #objects-unchanged premise
+(the census was unanimous: 1,427/1,427 triggers are that single
+assert) errored the attempt, the outer optimistic arm re-ran the
+ENTIRE 8000-lane state through granular deopt, and the kernel's rows
+were computed and thrown away for ~450 of ~570 states per frame.
+
+Fix (`FrameEngine::plain_block` + `PlainPath`): route kernel_ok=false
+sub-chunks straight through to_canonical -> PLAIN program ->
+from_canonical (sound for every lane - it is the reference
+semantics), with the COMPILE recipe's StateMapping. The compiled
+attempt stops failing, so the whole granular block disappears:
+
+- default engine:                115.63s / 116.04s   7.66 / 7.85 GB peak
+- fused + plain path:             89.80s /  89.55s   4.21 / 4.20 GB peak
+**-22% time, -45% peak memory vs the default engine**, two runs each.
+Thread-seconds: frame body 714 -> 525, deopt blocks 334 -> 0.00,
+boundary prepare 22.1 -> 9.4. Plain-routed lanes: 14,284 TOTAL over
+68 frames (vs 66k/frame granular before). Fused totals rose to
+50.0M lanes / 47.5M dying-covered events -> 9,503 reps because
+attempts no longer fail out of the compiled path.
+
+Gates: all 68 per-frame rowkey sets IDENTICAL to the default engine
+(sorted-set sha256); suite 553/553.
+
+**Engine adoption is now a live decision** (was "parity"): the
+compiled-forward+fused engine wins big at H=68 on room (1,0). Still
+default OFF pending (a) the fingerprint story for the fused artifact
+(fingerprint-invisible today - fine for gates, not for ladder
+provenance) and (b) Philippe's call. CLAUDE.md's "default OFF is a
+measurement" note is now STALE in this configuration.
+
 # K2's pm1 death-partition fix: REFUTED - inert and slightly slower (2026-08-19)
 
 The census's preferred fix (add `will_restart` to the pm1 partition

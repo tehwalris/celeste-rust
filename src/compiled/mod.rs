@@ -195,10 +195,26 @@ fn boundary_ids() -> runtime2::BoundaryIds {
 /// Speed of the reference path is a measured non-issue rather than a hope:
 /// since the class kernels reached 100% of player lanes it runs on spawn
 /// shapes only, 0.72 ms at f20.
+/// The plain (unrewritten) program plus the canonical-state mapping of the
+/// recipe this engine runs - the deopt path of plans/shape-tag-plan.md
+/// Phase C. The kernels' deopt sub-chunks (dying representatives, class-
+/// leaving rows) FAIL the specialized program's premises by construction,
+/// and without this path that failure aborts the whole compiled attempt:
+/// the caller's optimistic deopt arm then re-runs the ENTIRE state under
+/// granular deopt and throws the kernel's rows away. Routing the sub-chunks
+/// straight to the plain program (sound for every lane - it is the
+/// reference semantics) keeps the attempt alive.
+pub struct PlainPath {
+    pub plain_cfg: crate::interpreter::fixed_env::PreparedCfg,
+    pub plain_env: crate::interpreter::fixed_env::FixedEnv,
+    pub mapping: crate::rewrite::state_mapping::StateMapping,
+}
+
 pub struct FrameEngine {
     ids: runtime2::BoundaryIds,
     frame_cfg: crate::interpreter::fixed_env::PreparedCfg,
     fixed_env: crate::interpreter::fixed_env::FixedEnv,
+    plain: Option<PlainPath>,
     init_cfg: crate::ir::Cfg,
     /// The freeze global. Every block is pre-partitioned on it before the
     /// frame runs: the update-side freeze gate is a real per-lane branch,
@@ -237,6 +253,7 @@ impl FrameEngine {
                 program.frame_cfg().clone(),
             ),
             fixed_env: program.fixed_env(),
+            plain: None,
             init_cfg: program.init_cfg().clone(),
             g_freeze: gen::global_id("freeze").expect("no freeze global"),
             cart,
@@ -255,6 +272,43 @@ impl FrameEngine {
 
     pub fn ids(&self) -> &runtime2::BoundaryIds {
         &self.ids
+    }
+
+    /// Attach the plain-program deopt path (see `PlainPath`). Without it,
+    /// the kernels' deopt sub-chunks run the specialized interpreter and a
+    /// premise failure aborts the whole frame chunk.
+    pub fn set_plain_path(&mut self, plain: PlainPath) {
+        self.plain = Some(plain);
+    }
+
+    /// One frame of a kernel deopt sub-chunk through the PLAIN program:
+    /// to_canonical -> plain -> from_canonical, sound for every lane.
+    fn plain_block(&self, plain: &PlainPath, block: runtime2::Rt2) -> Vec<crate::interpreter::state::State> {
+        let width = block.width as u64;
+        let mut state = bridge::export_block(&block);
+        drop(block);
+        plain
+            .mapping
+            .to_canonical(&mut state)
+            .expect("plain path: mapping the frame input to canonical");
+        let result = crate::interpreter::glue::interpret_prepared_cfg(
+            &plain.plain_cfg,
+            state,
+            &plain.plain_env,
+        )
+        .expect("plain path: the frame failed under the plain program too");
+        dispatch::PLAIN_ROUTED.fetch_add(width, std::sync::atomic::Ordering::Relaxed);
+        result
+            .into_iter()
+            .map(|(mut s, _)| {
+                plain
+                    .mapping
+                    .from_canonical(&mut s)
+                    .expect("plain path: mapping a frame output back from canonical");
+                s
+            })
+            .filter(|s| s.vector_size > 0)
+            .collect()
     }
 
     /// One frame of ONE campaign chunk: `State -> [State]`.
@@ -306,6 +360,17 @@ impl FrameEngine {
         while let Some((block, kernel_ok)) = pending.pop() {
             if use_kernel && kernel_ok {
                 if dispatch::run_chunk_kernel(&block, &self.ids, &mut done, &mut pending) {
+                    continue;
+                }
+            }
+            // A kernel's deopt sub-chunk (kernel_ok=false: dying
+            // representatives, class-leaving rows) FAILS the specialized
+            // program's premises by construction - run it under the PLAIN
+            // program instead of letting the failure abort the whole
+            // chunk (see `PlainPath`).
+            if !kernel_ok {
+                if let Some(plain) = &self.plain {
+                    out.extend(self.plain_block(plain, block));
                     continue;
                 }
             }
