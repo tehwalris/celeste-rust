@@ -406,14 +406,47 @@ frame 1.2%); row accounting byte-identical, memberchecks ok, suite
 redundant bare-name crossing force-add (their last suffix users were
 stage-1-hoisted).
 
-**Stage 3 (the remaining M1 half)**: the `run_fused` closure -
-prededup `row_keys`, dy rep keying, `append_out` - is now the
-dominant fused-engine cost at 8.5% of process (unchanged by stage 2,
-as scoped). Out-cell columns have supports too: rows can only differ
-across variants in columns whose support distinguishes them, so
-per-variant row hashing in dispatch.rs can reuse per-segment column
-hashes/values instead of rehashing every column 64x. This is
-executor-side (correctness-critical row-key path), not emitter-side.
+**Stage 3 (the remaining M1 half), design 2026-08-19**: the
+`run_fused` closure - prededup `row_keys`, dy rep keying,
+`append_out` - is now the dominant fused-engine cost at 8.5% of
+process (unchanged by stage 2, as scoped). Key facts measured/read:
+
+- The generated `row_keys` hash is a COMMUTATIVE PER-CELL SUM:
+  `h[i] += mix64(cell_const ^ code(v))` per key cell. Factoring by
+  cell groups is therefore byte-identical to the monolithic hash -
+  same terms, same sum - so the gates prove it exactly.
+- The 20 key cells split by source/support on the current artifact:
+  4 variant-independent (`sh`: c84, c254, c278, c279; none read
+  `chunk` here but the general case allows it), 7 with support {5},
+  2 with {4}, 1 with {0,1} (c272=n762), 1 with {0,1,2,3,5}
+  (c270=n831), 5 full-support (c268/269/271/280/281). Per-lane
+  cell-mixes per 16-lane group: 64x20 = 1,280 today -> ~378
+  factored (base once + per-class partials per assignment +
+  5 full cells per variant), a 3.4x cut in hashing work; the full
+  cells again dominate the residue.
+- Emitter side: out-cell supports fall out of the stage-2 partition
+  (name -> support map). Refactor kernel.rs's per-cell hash snippet
+  so fuse.rs can additionally emit `row_keys_base(chunk, lo, n, sh,
+  plan, out)` (variant-independent cells), `row_keys_class(j, kv,
+  plan, out)` (one match arm per non-full support class, ADDING into
+  the accumulator) + `pub const KEY_CLASS_SUPS: &[u8]`, and
+  `row_keys_var(kv, plan, out)` (full-support cells). Keep the
+  monolithic `row_keys` - per-class kernels and any other caller
+  stay untouched.
+- Executor side (dispatch.rs run_fused): per 16-lane group, lazily
+  compute base on the first callback (osh is the same reference all
+  64 calls); keep per-class caches `[Option<partial>; 2^|S_j|]`
+  reset per group, filled on first variant with that projection;
+  per variant, keys = base + Σ class partials (wrapping_add pairs)
+  + row_keys_var. Projection/pack of b onto S_j mirrors the
+  emitter's `pack`.
+- Also try: `dy_reps` BTreeMap -> FxHashMap (reps set is identical -
+  or_insert first-wins by the same insertion order, and values only
+  ever flow into a BTreeSet - so output is unchanged; the map key is
+  a wide ([u32;K],[u64;V]) compare on every covered lane x variant).
+
+Gates: identical row accounting on abstract-bench k2ctl 65,
+memberchecks, suite; same-day A/B for the timing claim.
 
 - Fingerprint story for recipe SETS: hash the member list + fusion pass
   version? (Variant list is deliberately un-fingerprinted today;
