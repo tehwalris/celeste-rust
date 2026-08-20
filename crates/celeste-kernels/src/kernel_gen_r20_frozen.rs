@@ -8,7 +8,7 @@ use celeste_core::pico8_num::{Pico8Num as P8, Pico8NumInterval as IV};
 use celeste_core::cart_data::CartData;
 use celeste_core::collision_cache::CollisionCache;
 
-pub const SHAPE_HASH: u64 = 0x681d925d9110f730;
+pub const SHAPE_HASH: u64 = 0xa9e20c0af79aea86;
 pub struct G<'a> { pub cart: &'a CartData, pub cache: &'a CollisionCache }
 
 /// Block-uniform inputs, bound per block (kind-checked).
@@ -55,26 +55,28 @@ pub struct Uni {
     pub c253: P8,
     pub c254: (P8, P8),
     pub c257: bool,
+    pub c259: P8,
     pub c260: P8,
-    pub c261: P8,
-    pub c269: bool,
+    pub c268: bool,
+    pub c270: P8,
+    pub c272: P8,
     pub c273: P8,
-    pub c274: P8,
-    pub c277: bool,
+    pub c276: bool,
+    pub c278: P8,
     pub c279: P8,
-    pub c280: P8,
-    pub c288: bool,
-    pub c290: P8,
+    pub c287: bool,
+    pub c289: P8,
+    pub c291: P8,
     pub c292: P8,
-    pub c293: P8,
-    pub c296: bool,
+    pub c295: bool,
+    pub c299: P8,
     pub c300: P8,
-    pub c301: P8,
+    pub c309: bool,
     pub c310: bool,
-    pub c311: bool,
-    pub c313: bool,
+    pub c312: bool,
+    pub c364: bool,
     pub c365: bool,
-    pub c366: bool,
+    pub c366: P8,
     pub c367: P8,
     pub c368: P8,
     pub c369: P8,
@@ -82,9 +84,9 @@ pub struct Uni {
     pub c371: P8,
     pub c372: P8,
     pub c373: P8,
-    pub c374: P8,
+    pub c374: bool,
     pub c375: bool,
-    pub c376: bool,
+    pub c376: P8,
     pub c377: P8,
     pub c378: P8,
     pub c379: P8,
@@ -92,9 +94,9 @@ pub struct Uni {
     pub c381: P8,
     pub c382: P8,
     pub c383: P8,
-    pub c384: P8,
+    pub c384: bool,
     pub c385: bool,
-    pub c386: bool,
+    pub c386: P8,
     pub c387: P8,
     pub c388: P8,
     pub c389: P8,
@@ -102,14 +104,13 @@ pub struct Uni {
     pub c391: P8,
     pub c392: P8,
     pub c393: P8,
-    pub c394: P8,
-    pub c400: bool,
+    pub c399: bool,
+    pub c400: P8,
     pub c401: P8,
     pub c402: P8,
     pub c403: P8,
-    pub c404: P8,
+    pub c404: (P8, P8),
     pub c405: (P8, P8),
-    pub c406: (P8, P8),
 }
 
 pub const UNI_CELLS: &[(u32, &str)] = &[
@@ -155,26 +156,28 @@ pub const UNI_CELLS: &[(u32, &str)] = &[
     (253, "num"),
     (254, "ival"),
     (257, "bool"),
+    (259, "num"),
     (260, "num"),
-    (261, "num"),
-    (269, "bool"),
+    (268, "bool"),
+    (270, "num"),
+    (272, "num"),
     (273, "num"),
-    (274, "num"),
-    (277, "bool"),
+    (276, "bool"),
+    (278, "num"),
     (279, "num"),
-    (280, "num"),
-    (288, "bool"),
-    (290, "num"),
+    (287, "bool"),
+    (289, "num"),
+    (291, "num"),
     (292, "num"),
-    (293, "num"),
-    (296, "bool"),
+    (295, "bool"),
+    (299, "num"),
     (300, "num"),
-    (301, "num"),
+    (309, "bool"),
     (310, "bool"),
-    (311, "bool"),
-    (313, "bool"),
+    (312, "bool"),
+    (364, "bool"),
     (365, "bool"),
-    (366, "bool"),
+    (366, "num"),
     (367, "num"),
     (368, "num"),
     (369, "num"),
@@ -182,9 +185,9 @@ pub const UNI_CELLS: &[(u32, &str)] = &[
     (371, "num"),
     (372, "num"),
     (373, "num"),
-    (374, "num"),
+    (374, "bool"),
     (375, "bool"),
-    (376, "bool"),
+    (376, "num"),
     (377, "num"),
     (378, "num"),
     (379, "num"),
@@ -192,9 +195,9 @@ pub const UNI_CELLS: &[(u32, &str)] = &[
     (381, "num"),
     (382, "num"),
     (383, "num"),
-    (384, "num"),
+    (384, "bool"),
     (385, "bool"),
-    (386, "bool"),
+    (386, "num"),
     (387, "num"),
     (388, "num"),
     (389, "num"),
@@ -202,14 +205,13 @@ pub const UNI_CELLS: &[(u32, &str)] = &[
     (391, "num"),
     (392, "num"),
     (393, "num"),
-    (394, "num"),
-    (400, "bool"),
+    (399, "bool"),
+    (400, "num"),
     (401, "num"),
     (402, "num"),
     (403, "num"),
-    (404, "num"),
+    (404, "ival"),
     (405, "ival"),
-    (406, "ival"),
 ];
 
 /// Folds consumed these uniform cells' witness values; bind must
@@ -219,35 +221,31 @@ pub const PIN_CELLS: &[(u32, i32)] = &[
 
 /// Per-lane inputs: 16 rows per slice.
 pub struct RowsIn {
-    pub c258: ZN,
-    pub c271: ZN,
-    pub c298: ZN,
-    pub c303: ZN,
+    pub c297: ZN,
+    pub c302: ZN,
+    pub c316: ZN,
     pub c317: ZN,
-    pub c318: ZN,
+    pub c394: ZN,
     pub c395: ZN,
     pub c396: ZN,
     pub c397: ZN,
-    pub c398: ZN,
-    pub c399: u16,
+    pub c398: u16,
+    pub c406: ZN,
     pub c407: ZN,
-    pub c408: ZN,
 }
 
 pub const VARY_CELLS: &[(u32, &str)] = &[
-    (258, "num"),
-    (271, "num"),
-    (298, "num"),
-    (303, "num"),
+    (297, "num"),
+    (302, "num"),
+    (316, "num"),
     (317, "num"),
-    (318, "num"),
+    (394, "num"),
     (395, "num"),
     (396, "num"),
     (397, "num"),
-    (398, "num"),
-    (399, "bool"),
+    (398, "bool"),
+    (406, "num"),
     (407, "num"),
-    (408, "num"),
 ];
 
 /// Button-independent outputs: one per fork config.
@@ -255,8 +253,8 @@ pub struct KOutShared {
     pub c20: P8,
     pub c84: P8,
     pub c85: P8,
-    pub c317: ZN,
-    pub c407: ZN,
+    pub c316: ZN,
+    pub c406: ZN,
 }
 
 /// Button-dependent outputs: one per (config, variant).
@@ -271,8 +269,8 @@ pub const OUT_CELLS: &[u32] = &[
     20,
     84,
     85,
-    317,
-    407,
+    316,
+    406,
 ];
 
 /// Cells that end every frame as a fresh UnknownBool (the next
@@ -341,26 +339,28 @@ pub fn bind(b: &Rt2) -> Option<Uni> {
         c253: match &b.cols[253] { Col::U(AV::Num(n)) => *n, _ => return None },
         c254: match &b.cols[254] { Col::U(AV::Ival(a, b)) => (*a, *b), _ => return None },
         c257: match &b.cols[257] { Col::U(AV::Bool(v)) => *v, _ => return None },
+        c259: match &b.cols[259] { Col::U(AV::Num(n)) => *n, _ => return None },
         c260: match &b.cols[260] { Col::U(AV::Num(n)) => *n, _ => return None },
-        c261: match &b.cols[261] { Col::U(AV::Num(n)) => *n, _ => return None },
-        c269: match &b.cols[269] { Col::U(AV::Bool(v)) => *v, _ => return None },
+        c268: match &b.cols[268] { Col::U(AV::Bool(v)) => *v, _ => return None },
+        c270: match &b.cols[270] { Col::U(AV::Num(n)) => *n, _ => return None },
+        c272: match &b.cols[272] { Col::U(AV::Num(n)) => *n, _ => return None },
         c273: match &b.cols[273] { Col::U(AV::Num(n)) => *n, _ => return None },
-        c274: match &b.cols[274] { Col::U(AV::Num(n)) => *n, _ => return None },
-        c277: match &b.cols[277] { Col::U(AV::Bool(v)) => *v, _ => return None },
+        c276: match &b.cols[276] { Col::U(AV::Bool(v)) => *v, _ => return None },
+        c278: match &b.cols[278] { Col::U(AV::Num(n)) => *n, _ => return None },
         c279: match &b.cols[279] { Col::U(AV::Num(n)) => *n, _ => return None },
-        c280: match &b.cols[280] { Col::U(AV::Num(n)) => *n, _ => return None },
-        c288: match &b.cols[288] { Col::U(AV::Bool(v)) => *v, _ => return None },
-        c290: match &b.cols[290] { Col::U(AV::Num(n)) => *n, _ => return None },
+        c287: match &b.cols[287] { Col::U(AV::Bool(v)) => *v, _ => return None },
+        c289: match &b.cols[289] { Col::U(AV::Num(n)) => *n, _ => return None },
+        c291: match &b.cols[291] { Col::U(AV::Num(n)) => *n, _ => return None },
         c292: match &b.cols[292] { Col::U(AV::Num(n)) => *n, _ => return None },
-        c293: match &b.cols[293] { Col::U(AV::Num(n)) => *n, _ => return None },
-        c296: match &b.cols[296] { Col::U(AV::Bool(v)) => *v, _ => return None },
+        c295: match &b.cols[295] { Col::U(AV::Bool(v)) => *v, _ => return None },
+        c299: match &b.cols[299] { Col::U(AV::Num(n)) => *n, _ => return None },
         c300: match &b.cols[300] { Col::U(AV::Num(n)) => *n, _ => return None },
-        c301: match &b.cols[301] { Col::U(AV::Num(n)) => *n, _ => return None },
+        c309: match &b.cols[309] { Col::U(AV::Bool(v)) => *v, _ => return None },
         c310: match &b.cols[310] { Col::U(AV::Bool(v)) => *v, _ => return None },
-        c311: match &b.cols[311] { Col::U(AV::Bool(v)) => *v, _ => return None },
-        c313: match &b.cols[313] { Col::U(AV::Bool(v)) => *v, _ => return None },
+        c312: match &b.cols[312] { Col::U(AV::Bool(v)) => *v, _ => return None },
+        c364: match &b.cols[364] { Col::U(AV::Bool(v)) => *v, _ => return None },
         c365: match &b.cols[365] { Col::U(AV::Bool(v)) => *v, _ => return None },
-        c366: match &b.cols[366] { Col::U(AV::Bool(v)) => *v, _ => return None },
+        c366: match &b.cols[366] { Col::U(AV::Num(n)) => *n, _ => return None },
         c367: match &b.cols[367] { Col::U(AV::Num(n)) => *n, _ => return None },
         c368: match &b.cols[368] { Col::U(AV::Num(n)) => *n, _ => return None },
         c369: match &b.cols[369] { Col::U(AV::Num(n)) => *n, _ => return None },
@@ -368,9 +368,9 @@ pub fn bind(b: &Rt2) -> Option<Uni> {
         c371: match &b.cols[371] { Col::U(AV::Num(n)) => *n, _ => return None },
         c372: match &b.cols[372] { Col::U(AV::Num(n)) => *n, _ => return None },
         c373: match &b.cols[373] { Col::U(AV::Num(n)) => *n, _ => return None },
-        c374: match &b.cols[374] { Col::U(AV::Num(n)) => *n, _ => return None },
+        c374: match &b.cols[374] { Col::U(AV::Bool(v)) => *v, _ => return None },
         c375: match &b.cols[375] { Col::U(AV::Bool(v)) => *v, _ => return None },
-        c376: match &b.cols[376] { Col::U(AV::Bool(v)) => *v, _ => return None },
+        c376: match &b.cols[376] { Col::U(AV::Num(n)) => *n, _ => return None },
         c377: match &b.cols[377] { Col::U(AV::Num(n)) => *n, _ => return None },
         c378: match &b.cols[378] { Col::U(AV::Num(n)) => *n, _ => return None },
         c379: match &b.cols[379] { Col::U(AV::Num(n)) => *n, _ => return None },
@@ -378,9 +378,9 @@ pub fn bind(b: &Rt2) -> Option<Uni> {
         c381: match &b.cols[381] { Col::U(AV::Num(n)) => *n, _ => return None },
         c382: match &b.cols[382] { Col::U(AV::Num(n)) => *n, _ => return None },
         c383: match &b.cols[383] { Col::U(AV::Num(n)) => *n, _ => return None },
-        c384: match &b.cols[384] { Col::U(AV::Num(n)) => *n, _ => return None },
+        c384: match &b.cols[384] { Col::U(AV::Bool(v)) => *v, _ => return None },
         c385: match &b.cols[385] { Col::U(AV::Bool(v)) => *v, _ => return None },
-        c386: match &b.cols[386] { Col::U(AV::Bool(v)) => *v, _ => return None },
+        c386: match &b.cols[386] { Col::U(AV::Num(n)) => *n, _ => return None },
         c387: match &b.cols[387] { Col::U(AV::Num(n)) => *n, _ => return None },
         c388: match &b.cols[388] { Col::U(AV::Num(n)) => *n, _ => return None },
         c389: match &b.cols[389] { Col::U(AV::Num(n)) => *n, _ => return None },
@@ -388,14 +388,13 @@ pub fn bind(b: &Rt2) -> Option<Uni> {
         c391: match &b.cols[391] { Col::U(AV::Num(n)) => *n, _ => return None },
         c392: match &b.cols[392] { Col::U(AV::Num(n)) => *n, _ => return None },
         c393: match &b.cols[393] { Col::U(AV::Num(n)) => *n, _ => return None },
-        c394: match &b.cols[394] { Col::U(AV::Num(n)) => *n, _ => return None },
-        c400: match &b.cols[400] { Col::U(AV::Bool(v)) => *v, _ => return None },
+        c399: match &b.cols[399] { Col::U(AV::Bool(v)) => *v, _ => return None },
+        c400: match &b.cols[400] { Col::U(AV::Num(n)) => *n, _ => return None },
         c401: match &b.cols[401] { Col::U(AV::Num(n)) => *n, _ => return None },
         c402: match &b.cols[402] { Col::U(AV::Num(n)) => *n, _ => return None },
         c403: match &b.cols[403] { Col::U(AV::Num(n)) => *n, _ => return None },
-        c404: match &b.cols[404] { Col::U(AV::Num(n)) => *n, _ => return None },
+        c404: match &b.cols[404] { Col::U(AV::Ival(a, b)) => (*a, *b), _ => return None },
         c405: match &b.cols[405] { Col::U(AV::Ival(a, b)) => (*a, *b), _ => return None },
-        c406: match &b.cols[406] { Col::U(AV::Ival(a, b)) => (*a, *b), _ => return None },
     })
 }
 
@@ -404,22 +403,17 @@ pub fn bind(b: &Rt2) -> Option<Uni> {
 pub fn rows(b: &Rt2, lo: usize) -> Option<RowsIn> {
     let at = |i: usize| -> usize { (lo + i).min(b.width - 1) };
     Some(RowsIn {
-        c258: match &b.cols[258] {
+        c297: match &b.cols[297] {
             Col::N(v) => core::array::from_fn(|i| v[at(i)]),
             Col::U(AV::Num(n)) => [*n; W],
             _ => return None,
         },
-        c271: match &b.cols[271] {
+        c302: match &b.cols[302] {
             Col::N(v) => core::array::from_fn(|i| v[at(i)]),
             Col::U(AV::Num(n)) => [*n; W],
             _ => return None,
         },
-        c298: match &b.cols[298] {
-            Col::N(v) => core::array::from_fn(|i| v[at(i)]),
-            Col::U(AV::Num(n)) => [*n; W],
-            _ => return None,
-        },
-        c303: match &b.cols[303] {
+        c316: match &b.cols[316] {
             Col::N(v) => core::array::from_fn(|i| v[at(i)]),
             Col::U(AV::Num(n)) => [*n; W],
             _ => return None,
@@ -429,7 +423,7 @@ pub fn rows(b: &Rt2, lo: usize) -> Option<RowsIn> {
             Col::U(AV::Num(n)) => [*n; W],
             _ => return None,
         },
-        c318: match &b.cols[318] {
+        c394: match &b.cols[394] {
             Col::N(v) => core::array::from_fn(|i| v[at(i)]),
             Col::U(AV::Num(n)) => [*n; W],
             _ => return None,
@@ -450,11 +444,6 @@ pub fn rows(b: &Rt2, lo: usize) -> Option<RowsIn> {
             _ => return None,
         },
         c398: match &b.cols[398] {
-            Col::N(v) => core::array::from_fn(|i| v[at(i)]),
-            Col::U(AV::Num(n)) => [*n; W],
-            _ => return None,
-        },
-        c399: match &b.cols[399] {
             Col::V(v) => {
                 let mut m = 0u16;
                 for i in 0..W { if matches!(v[at(i)], AV::Bool(true)) { m |= 1 << i; } else if !matches!(v[at(i)], AV::Bool(false)) { return None; } }
@@ -463,12 +452,12 @@ pub fn rows(b: &Rt2, lo: usize) -> Option<RowsIn> {
             Col::U(AV::Bool(t)) => if *t { 0xffff } else { 0 },
             _ => return None,
         },
-        c407: match &b.cols[407] {
+        c406: match &b.cols[406] {
             Col::N(v) => core::array::from_fn(|i| v[at(i)]),
             Col::U(AV::Num(n)) => [*n; W],
             _ => return None,
         },
-        c408: match &b.cols[408] {
+        c407: match &b.cols[407] {
             Col::N(v) => core::array::from_fn(|i| v[at(i)]),
             Col::U(AV::Num(n)) => [*n; W],
             _ => return None,
@@ -482,8 +471,8 @@ pub fn apply(sh: &KOutShared, kv: &KOut, b: &mut Rt2, n: usize) {
     b.cols[20] = Col::U(AV::Num(sh.c20));
     b.cols[84] = Col::U(AV::Num(sh.c84));
     b.cols[85] = Col::U(AV::Num(sh.c85));
-    b.cols[317] = Col::N(sh.c317[..n].to_vec());
-    b.cols[407] = Col::N(sh.c407[..n].to_vec());
+    b.cols[316] = Col::N(sh.c316[..n].to_vec());
+    b.cols[406] = Col::N(sh.c406[..n].to_vec());
     for cell in OUT_UBOOL_CELLS {
         b.cols[*cell as usize] = Col::U(AV::UBool);
     }
@@ -498,19 +487,17 @@ pub fn acc_init(chunk: &Rt2) -> Rt2 {
     acc.structure = chunk.structure.clone();
     acc.cols = chunk.cols.clone();
     acc.shape_hash = chunk.shape_hash;
+    acc.cols[316] = Col::N(Vec::new());
+    acc.cols[406] = Col::N(Vec::new());
+    acc.cols[297] = Col::N(Vec::new());
+    acc.cols[302] = Col::N(Vec::new());
     acc.cols[317] = Col::N(Vec::new());
-    acc.cols[407] = Col::N(Vec::new());
-    acc.cols[258] = Col::N(Vec::new());
-    acc.cols[271] = Col::N(Vec::new());
-    acc.cols[298] = Col::N(Vec::new());
-    acc.cols[303] = Col::N(Vec::new());
-    acc.cols[318] = Col::N(Vec::new());
+    acc.cols[394] = Col::N(Vec::new());
     acc.cols[395] = Col::N(Vec::new());
     acc.cols[396] = Col::N(Vec::new());
     acc.cols[397] = Col::N(Vec::new());
-    acc.cols[398] = Col::N(Vec::new());
-    acc.cols[399] = Col::V(Vec::new());
-    acc.cols[408] = Col::N(Vec::new());
+    acc.cols[398] = Col::V(Vec::new());
+    acc.cols[407] = Col::N(Vec::new());
     for cell in OUT_UBOOL_CELLS {
         acc.cols[*cell as usize] = Col::U(AV::UBool);
     }
@@ -532,30 +519,26 @@ pub fn append_out(acc: &mut Rt2, chunk: &Rt2, lo: usize, n: usize, live: u16, sh
         acc.cols[84] = Col::U(AV::Num(sh.c84));
         if !fresh { if let Col::U(AV::Num(prev)) = &acc.cols[85] { if *prev != sh.c85 { *bd = true; } } }
         acc.cols[85] = Col::U(AV::Num(sh.c85));
-        if let Col::N(v) = &mut acc.cols[317] { v.push(sh.c317[i]); }
-        if let Col::N(v) = &mut acc.cols[407] { v.push(sh.c407[i]); }
-        let val = match &chunk.cols[258] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
-        if let Col::N(v) = &mut acc.cols[258] { v.push(val); }
-        let val = match &chunk.cols[271] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
-        if let Col::N(v) = &mut acc.cols[271] { v.push(val); }
-        let val = match &chunk.cols[298] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
-        if let Col::N(v) = &mut acc.cols[298] { v.push(val); }
-        let val = match &chunk.cols[303] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
-        if let Col::N(v) = &mut acc.cols[303] { v.push(val); }
-        let val = match &chunk.cols[318] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
-        if let Col::N(v) = &mut acc.cols[318] { v.push(val); }
+        if let Col::N(v) = &mut acc.cols[316] { v.push(sh.c316[i]); }
+        if let Col::N(v) = &mut acc.cols[406] { v.push(sh.c406[i]); }
+        let val = match &chunk.cols[297] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
+        if let Col::N(v) = &mut acc.cols[297] { v.push(val); }
+        let val = match &chunk.cols[302] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
+        if let Col::N(v) = &mut acc.cols[302] { v.push(val); }
+        let val = match &chunk.cols[317] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
+        if let Col::N(v) = &mut acc.cols[317] { v.push(val); }
+        let val = match &chunk.cols[394] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
+        if let Col::N(v) = &mut acc.cols[394] { v.push(val); }
         let val = match &chunk.cols[395] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
         if let Col::N(v) = &mut acc.cols[395] { v.push(val); }
         let val = match &chunk.cols[396] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
         if let Col::N(v) = &mut acc.cols[396] { v.push(val); }
         let val = match &chunk.cols[397] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
         if let Col::N(v) = &mut acc.cols[397] { v.push(val); }
-        let val = match &chunk.cols[398] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
-        if let Col::N(v) = &mut acc.cols[398] { v.push(val); }
-        let val = match &chunk.cols[399] { Col::V(s) => s[(lo + i).min(chunk.width - 1)], Col::U(a) => *a, _ => unreachable!() };
-        if let Col::V(v) = &mut acc.cols[399] { v.push(val); }
-        let val = match &chunk.cols[408] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
-        if let Col::N(v) = &mut acc.cols[408] { v.push(val); }
+        let val = match &chunk.cols[398] { Col::V(s) => s[(lo + i).min(chunk.width - 1)], Col::U(a) => *a, _ => unreachable!() };
+        if let Col::V(v) = &mut acc.cols[398] { v.push(val); }
+        let val = match &chunk.cols[407] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
+        if let Col::N(v) = &mut acc.cols[407] { v.push(val); }
         acc.width += 1;
     }
 }
@@ -565,19 +548,17 @@ pub const KEY_CELLS: &[u32] = &[
     20,
     84,
     85,
+    316,
+    406,
+    297,
+    302,
     317,
-    407,
-    258,
-    271,
-    298,
-    303,
-    318,
+    394,
     395,
     396,
     397,
     398,
-    399,
-    408,
+    407,
 ];
 
 #[allow(unused_variables)]
@@ -620,154 +601,130 @@ pub fn row_keys(chunk: &Rt2, lo: usize, n: usize, sh: &KOutShared, kv: &KOut, pl
             h2[i] = h2[i].wrapping_add(mix64(c2 ^ code));
         }
     }
-    // cell 317 (ZN)
+    // cell 316 (ZN)
     if plan.rem & (1 << 3) == 0 {
-        let c1 = 0x5bf0_3635u64 ^ (317u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let c2 = 0x27d4_eb2fu64 ^ (317u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c1 = 0x5bf0_3635u64 ^ (316u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c2 = 0x27d4_eb2fu64 ^ (316u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         for i in 0..W {
-            let v = sh.c317[i];
+            let v = sh.c316[i];
             let v = if plan.det & (1 << 3) != 0 && v < P8::from_raw(0i32) { P8::from_raw(0i32) } else { v };
             let code = 1u64 << 56 | v.to_bits() as u64;
             h1[i] = h1[i].wrapping_add(mix64(c1 ^ code));
             h2[i] = h2[i].wrapping_add(mix64(c2 ^ code));
         }
     }
-    // cell 407 (ZN)
+    // cell 406 (ZN)
     if plan.rem & (1 << 4) == 0 {
-        let c1 = 0x5bf0_3635u64 ^ (407u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let c2 = 0x27d4_eb2fu64 ^ (407u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c1 = 0x5bf0_3635u64 ^ (406u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c2 = 0x27d4_eb2fu64 ^ (406u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         for i in 0..W {
-            let v = sh.c407[i];
+            let v = sh.c406[i];
             let v = if plan.det & (1 << 4) != 0 && v < P8::from_raw(0i32) { P8::from_raw(0i32) } else { v };
             let code = 1u64 << 56 | v.to_bits() as u64;
             h1[i] = h1[i].wrapping_add(mix64(c1 ^ code));
             h2[i] = h2[i].wrapping_add(mix64(c2 ^ code));
         }
     }
-    // cell 258 (IN_N)
+    // cell 297 (IN_N)
     if plan.rem & (1 << 5) == 0 {
-        let c1 = 0x5bf0_3635u64 ^ (258u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let c2 = 0x27d4_eb2fu64 ^ (258u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c1 = 0x5bf0_3635u64 ^ (297u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c2 = 0x27d4_eb2fu64 ^ (297u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         for i in 0..W {
-            let v = match &chunk.cols[258] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
+            let v = match &chunk.cols[297] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
             let v = if plan.det & (1 << 5) != 0 && v < P8::from_raw(0i32) { P8::from_raw(0i32) } else { v };
             let code = 1u64 << 56 | v.to_bits() as u64;
             h1[i] = h1[i].wrapping_add(mix64(c1 ^ code));
             h2[i] = h2[i].wrapping_add(mix64(c2 ^ code));
         }
     }
-    // cell 271 (IN_N)
+    // cell 302 (IN_N)
     if plan.rem & (1 << 6) == 0 {
-        let c1 = 0x5bf0_3635u64 ^ (271u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let c2 = 0x27d4_eb2fu64 ^ (271u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c1 = 0x5bf0_3635u64 ^ (302u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c2 = 0x27d4_eb2fu64 ^ (302u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         for i in 0..W {
-            let v = match &chunk.cols[271] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
+            let v = match &chunk.cols[302] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
             let v = if plan.det & (1 << 6) != 0 && v < P8::from_raw(0i32) { P8::from_raw(0i32) } else { v };
             let code = 1u64 << 56 | v.to_bits() as u64;
             h1[i] = h1[i].wrapping_add(mix64(c1 ^ code));
             h2[i] = h2[i].wrapping_add(mix64(c2 ^ code));
         }
     }
-    // cell 298 (IN_N)
+    // cell 317 (IN_N)
     if plan.rem & (1 << 7) == 0 {
-        let c1 = 0x5bf0_3635u64 ^ (298u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let c2 = 0x27d4_eb2fu64 ^ (298u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c1 = 0x5bf0_3635u64 ^ (317u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c2 = 0x27d4_eb2fu64 ^ (317u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         for i in 0..W {
-            let v = match &chunk.cols[298] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
+            let v = match &chunk.cols[317] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
             let v = if plan.det & (1 << 7) != 0 && v < P8::from_raw(0i32) { P8::from_raw(0i32) } else { v };
             let code = 1u64 << 56 | v.to_bits() as u64;
             h1[i] = h1[i].wrapping_add(mix64(c1 ^ code));
             h2[i] = h2[i].wrapping_add(mix64(c2 ^ code));
         }
     }
-    // cell 303 (IN_N)
+    // cell 394 (IN_N)
     if plan.rem & (1 << 8) == 0 {
-        let c1 = 0x5bf0_3635u64 ^ (303u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let c2 = 0x27d4_eb2fu64 ^ (303u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c1 = 0x5bf0_3635u64 ^ (394u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c2 = 0x27d4_eb2fu64 ^ (394u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         for i in 0..W {
-            let v = match &chunk.cols[303] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
+            let v = match &chunk.cols[394] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
             let v = if plan.det & (1 << 8) != 0 && v < P8::from_raw(0i32) { P8::from_raw(0i32) } else { v };
             let code = 1u64 << 56 | v.to_bits() as u64;
             h1[i] = h1[i].wrapping_add(mix64(c1 ^ code));
             h2[i] = h2[i].wrapping_add(mix64(c2 ^ code));
         }
     }
-    // cell 318 (IN_N)
+    // cell 395 (IN_N)
     if plan.rem & (1 << 9) == 0 {
-        let c1 = 0x5bf0_3635u64 ^ (318u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let c2 = 0x27d4_eb2fu64 ^ (318u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c1 = 0x5bf0_3635u64 ^ (395u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c2 = 0x27d4_eb2fu64 ^ (395u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         for i in 0..W {
-            let v = match &chunk.cols[318] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
+            let v = match &chunk.cols[395] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
             let v = if plan.det & (1 << 9) != 0 && v < P8::from_raw(0i32) { P8::from_raw(0i32) } else { v };
             let code = 1u64 << 56 | v.to_bits() as u64;
             h1[i] = h1[i].wrapping_add(mix64(c1 ^ code));
             h2[i] = h2[i].wrapping_add(mix64(c2 ^ code));
         }
     }
-    // cell 395 (IN_N)
+    // cell 396 (IN_N)
     if plan.rem & (1 << 10) == 0 {
-        let c1 = 0x5bf0_3635u64 ^ (395u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let c2 = 0x27d4_eb2fu64 ^ (395u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c1 = 0x5bf0_3635u64 ^ (396u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c2 = 0x27d4_eb2fu64 ^ (396u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         for i in 0..W {
-            let v = match &chunk.cols[395] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
+            let v = match &chunk.cols[396] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
             let v = if plan.det & (1 << 10) != 0 && v < P8::from_raw(0i32) { P8::from_raw(0i32) } else { v };
             let code = 1u64 << 56 | v.to_bits() as u64;
             h1[i] = h1[i].wrapping_add(mix64(c1 ^ code));
             h2[i] = h2[i].wrapping_add(mix64(c2 ^ code));
         }
     }
-    // cell 396 (IN_N)
+    // cell 397 (IN_N)
     if plan.rem & (1 << 11) == 0 {
-        let c1 = 0x5bf0_3635u64 ^ (396u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let c2 = 0x27d4_eb2fu64 ^ (396u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c1 = 0x5bf0_3635u64 ^ (397u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c2 = 0x27d4_eb2fu64 ^ (397u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         for i in 0..W {
-            let v = match &chunk.cols[396] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
+            let v = match &chunk.cols[397] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
             let v = if plan.det & (1 << 11) != 0 && v < P8::from_raw(0i32) { P8::from_raw(0i32) } else { v };
             let code = 1u64 << 56 | v.to_bits() as u64;
             h1[i] = h1[i].wrapping_add(mix64(c1 ^ code));
             h2[i] = h2[i].wrapping_add(mix64(c2 ^ code));
         }
     }
-    // cell 397 (IN_N)
+    // cell 398 (IN_B)
     if plan.rem & (1 << 12) == 0 {
-        let c1 = 0x5bf0_3635u64 ^ (397u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let c2 = 0x27d4_eb2fu64 ^ (397u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        assert!(plan.det & (1 << 12) == 0, "det clamp on non-numeric cell 398");
         for i in 0..W {
-            let v = match &chunk.cols[397] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
-            let v = if plan.det & (1 << 12) != 0 && v < P8::from_raw(0i32) { P8::from_raw(0i32) } else { v };
-            let code = 1u64 << 56 | v.to_bits() as u64;
-            h1[i] = h1[i].wrapping_add(mix64(c1 ^ code));
-            h2[i] = h2[i].wrapping_add(mix64(c2 ^ code));
+            let v = match &chunk.cols[398] { Col::V(s) => s[(lo + i).min(chunk.width - 1)], Col::U(a) => *a, _ => unreachable!() };
+            h1[i] = h1[i].wrapping_add(cell_mix(398u64, v, 0x5bf0_3635));
+            h2[i] = h2[i].wrapping_add(cell_mix(398u64, v, 0x27d4_eb2f));
         }
     }
-    // cell 398 (IN_N)
+    // cell 407 (IN_N)
     if plan.rem & (1 << 13) == 0 {
-        let c1 = 0x5bf0_3635u64 ^ (398u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let c2 = 0x27d4_eb2fu64 ^ (398u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c1 = 0x5bf0_3635u64 ^ (407u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c2 = 0x27d4_eb2fu64 ^ (407u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         for i in 0..W {
-            let v = match &chunk.cols[398] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
+            let v = match &chunk.cols[407] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
             let v = if plan.det & (1 << 13) != 0 && v < P8::from_raw(0i32) { P8::from_raw(0i32) } else { v };
-            let code = 1u64 << 56 | v.to_bits() as u64;
-            h1[i] = h1[i].wrapping_add(mix64(c1 ^ code));
-            h2[i] = h2[i].wrapping_add(mix64(c2 ^ code));
-        }
-    }
-    // cell 399 (IN_B)
-    if plan.rem & (1 << 14) == 0 {
-        assert!(plan.det & (1 << 14) == 0, "det clamp on non-numeric cell 399");
-        for i in 0..W {
-            let v = match &chunk.cols[399] { Col::V(s) => s[(lo + i).min(chunk.width - 1)], Col::U(a) => *a, _ => unreachable!() };
-            h1[i] = h1[i].wrapping_add(cell_mix(399u64, v, 0x5bf0_3635));
-            h2[i] = h2[i].wrapping_add(cell_mix(399u64, v, 0x27d4_eb2f));
-        }
-    }
-    // cell 408 (IN_N)
-    if plan.rem & (1 << 15) == 0 {
-        let c1 = 0x5bf0_3635u64 ^ (408u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let c2 = 0x27d4_eb2fu64 ^ (408u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        for i in 0..W {
-            let v = match &chunk.cols[408] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
-            let v = if plan.det & (1 << 15) != 0 && v < P8::from_raw(0i32) { P8::from_raw(0i32) } else { v };
             let code = 1u64 << 56 | v.to_bits() as u64;
             h1[i] = h1[i].wrapping_add(mix64(c1 ^ code));
             h2[i] = h2[i].wrapping_add(mix64(c2 ^ code));
@@ -794,19 +751,17 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let mut dp: u16 = 0;
     let mut bd_flag: bool = false;
     let bd: &mut bool = &mut bd_flag;
-    let r_c258: ZN = rin.c258;
-    let r_c271: ZN = rin.c271;
-    let r_c298: ZN = rin.c298;
-    let r_c303: ZN = rin.c303;
+    let r_c297: ZN = rin.c297;
+    let r_c302: ZN = rin.c302;
+    let r_c316: ZN = rin.c316;
     let r_c317: ZN = rin.c317;
-    let r_c318: ZN = rin.c318;
+    let r_c394: ZN = rin.c394;
     let r_c395: ZN = rin.c395;
     let r_c396: ZN = rin.c396;
     let r_c397: ZN = rin.c397;
-    let r_c398: ZN = rin.c398;
-    let r_c399: ZB = ZB { val: rin.c399, known: ALL };
+    let r_c398: ZB = ZB { val: rin.c398, known: ALL };
+    let r_c406: ZN = rin.c406;
     let r_c407: ZN = rin.c407;
-    let r_c408: ZN = rin.c408;
     let v0: P8 = P8::from_raw(65536i32);
     let v1: P8 = u.c84 + v0;
     let v2: P8 = P8::from_raw(1966080i32);
@@ -954,19 +909,19 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v107: bool = if v29 { v105 } else { v106 };
     if !v107 { *bd = true; }
     let v108: ZN = zn_splat(P8::from_raw(-65536i32));
-    let v109: ZB = zn_lt(r_c317, v108);
+    let v109: ZB = zn_lt(r_c316, v108);
     let v110: ZN = zn_splat(P8::from_raw(7929856i32));
-    let v111: ZB = zn_gt(r_c317, v110);
+    let v111: ZB = zn_gt(r_c316, v110);
     let v112: ZB = zsel_b(v109, v109, v111, &mut dp);
     let v113: ZN = zn_splat(P8::from_raw(7929856i32));
-    let v114: ZN = zn_min(v113, r_c317);
+    let v114: ZN = zn_min(v113, r_c316);
     let v115: ZN = zn_splat(P8::from_raw(-65536i32));
     let v116: ZN = zn_max(v115, v114);
     let v117: ZN = zn_splat(P8::from_raw(0i32));
-    let v118: ZN = zsel_n(v112, v117, r_c407, &mut dp);
-    let v119: ZN = zsel_n(v112, v116, r_c317, &mut dp);
-    let v120: ZN = if v29 { r_c317 } else { v119 };
-    let v121: ZN = if v29 { r_c407 } else { v118 };
+    let v118: ZN = zsel_n(v112, v117, r_c406, &mut dp);
+    let v119: ZN = zsel_n(v112, v116, r_c316, &mut dp);
+    let v120: ZN = if v29 { r_c316 } else { v119 };
+    let v121: ZN = if v29 { r_c406 } else { v118 };
     let v122: bool = true;
     let v123: bool = true;
     let v124: bool = if v29 { v122 } else { v123 };
@@ -993,8 +948,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
         c20: v27,
         c84: v3,
         c85: v18,
-        c317: v120,
-        c407: v121,
+        c316: v120,
+        c406: v121,
     };
     // suffix observes button bits []: 1 distinct variant(s)
     suffix::<0>(u, g, &p, &osh, out);

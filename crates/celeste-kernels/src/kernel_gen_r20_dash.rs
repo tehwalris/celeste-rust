@@ -8,7 +8,7 @@ use celeste_core::pico8_num::{Pico8Num as P8, Pico8NumInterval as IV};
 use celeste_core::cart_data::CartData;
 use celeste_core::collision_cache::CollisionCache;
 
-pub const SHAPE_HASH: u64 = 0x681d925d9110f730;
+pub const SHAPE_HASH: u64 = 0xa9e20c0af79aea86;
 pub struct G<'a> { pub cart: &'a CartData, pub cache: &'a CollisionCache }
 
 /// Block-uniform inputs, bound per block (kind-checked).
@@ -55,26 +55,28 @@ pub struct Uni {
     pub c253: P8,
     pub c254: (P8, P8),
     pub c257: bool,
+    pub c259: P8,
     pub c260: P8,
-    pub c261: P8,
-    pub c269: bool,
+    pub c268: bool,
+    pub c270: P8,
+    pub c272: P8,
     pub c273: P8,
-    pub c274: P8,
-    pub c277: bool,
+    pub c276: bool,
+    pub c278: P8,
     pub c279: P8,
-    pub c280: P8,
-    pub c288: bool,
-    pub c290: P8,
+    pub c287: bool,
+    pub c289: P8,
+    pub c291: P8,
     pub c292: P8,
-    pub c293: P8,
-    pub c296: bool,
+    pub c295: bool,
+    pub c299: P8,
     pub c300: P8,
-    pub c301: P8,
+    pub c309: bool,
     pub c310: bool,
-    pub c311: bool,
-    pub c313: bool,
+    pub c312: bool,
+    pub c364: bool,
     pub c365: bool,
-    pub c366: bool,
+    pub c366: P8,
     pub c367: P8,
     pub c368: P8,
     pub c369: P8,
@@ -82,9 +84,9 @@ pub struct Uni {
     pub c371: P8,
     pub c372: P8,
     pub c373: P8,
-    pub c374: P8,
+    pub c374: bool,
     pub c375: bool,
-    pub c376: bool,
+    pub c376: P8,
     pub c377: P8,
     pub c378: P8,
     pub c379: P8,
@@ -92,9 +94,9 @@ pub struct Uni {
     pub c381: P8,
     pub c382: P8,
     pub c383: P8,
-    pub c384: P8,
+    pub c384: bool,
     pub c385: bool,
-    pub c386: bool,
+    pub c386: P8,
     pub c387: P8,
     pub c388: P8,
     pub c389: P8,
@@ -102,14 +104,13 @@ pub struct Uni {
     pub c391: P8,
     pub c392: P8,
     pub c393: P8,
-    pub c394: P8,
-    pub c400: bool,
+    pub c399: bool,
+    pub c400: P8,
     pub c401: P8,
     pub c402: P8,
     pub c403: P8,
-    pub c404: P8,
+    pub c404: (P8, P8),
     pub c405: (P8, P8),
-    pub c406: (P8, P8),
 }
 
 pub const UNI_CELLS: &[(u32, &str)] = &[
@@ -155,26 +156,28 @@ pub const UNI_CELLS: &[(u32, &str)] = &[
     (253, "num"),
     (254, "ival"),
     (257, "bool"),
+    (259, "num"),
     (260, "num"),
-    (261, "num"),
-    (269, "bool"),
+    (268, "bool"),
+    (270, "num"),
+    (272, "num"),
     (273, "num"),
-    (274, "num"),
-    (277, "bool"),
+    (276, "bool"),
+    (278, "num"),
     (279, "num"),
-    (280, "num"),
-    (288, "bool"),
-    (290, "num"),
+    (287, "bool"),
+    (289, "num"),
+    (291, "num"),
     (292, "num"),
-    (293, "num"),
-    (296, "bool"),
+    (295, "bool"),
+    (299, "num"),
     (300, "num"),
-    (301, "num"),
+    (309, "bool"),
     (310, "bool"),
-    (311, "bool"),
-    (313, "bool"),
+    (312, "bool"),
+    (364, "bool"),
     (365, "bool"),
-    (366, "bool"),
+    (366, "num"),
     (367, "num"),
     (368, "num"),
     (369, "num"),
@@ -182,9 +185,9 @@ pub const UNI_CELLS: &[(u32, &str)] = &[
     (371, "num"),
     (372, "num"),
     (373, "num"),
-    (374, "num"),
+    (374, "bool"),
     (375, "bool"),
-    (376, "bool"),
+    (376, "num"),
     (377, "num"),
     (378, "num"),
     (379, "num"),
@@ -192,9 +195,9 @@ pub const UNI_CELLS: &[(u32, &str)] = &[
     (381, "num"),
     (382, "num"),
     (383, "num"),
-    (384, "num"),
+    (384, "bool"),
     (385, "bool"),
-    (386, "bool"),
+    (386, "num"),
     (387, "num"),
     (388, "num"),
     (389, "num"),
@@ -202,14 +205,13 @@ pub const UNI_CELLS: &[(u32, &str)] = &[
     (391, "num"),
     (392, "num"),
     (393, "num"),
-    (394, "num"),
-    (400, "bool"),
+    (399, "bool"),
+    (400, "num"),
     (401, "num"),
     (402, "num"),
     (403, "num"),
-    (404, "num"),
+    (404, "ival"),
     (405, "ival"),
-    (406, "ival"),
 ];
 
 /// Folds consumed these uniform cells' witness values; bind must
@@ -223,35 +225,31 @@ pub const PIN_CELLS: &[(u32, i32)] = &[
 
 /// Per-lane inputs: 16 rows per slice.
 pub struct RowsIn {
-    pub c258: ZN,
-    pub c271: ZN,
-    pub c298: ZN,
-    pub c303: ZN,
+    pub c297: ZN,
+    pub c302: ZN,
+    pub c316: ZN,
     pub c317: ZN,
-    pub c318: ZN,
+    pub c394: ZN,
     pub c395: ZN,
     pub c396: ZN,
     pub c397: ZN,
-    pub c398: ZN,
-    pub c399: u16,
+    pub c398: u16,
+    pub c406: ZN,
     pub c407: ZN,
-    pub c408: ZN,
 }
 
 pub const VARY_CELLS: &[(u32, &str)] = &[
-    (258, "num"),
-    (271, "num"),
-    (298, "num"),
-    (303, "num"),
+    (297, "num"),
+    (302, "num"),
+    (316, "num"),
     (317, "num"),
-    (318, "num"),
+    (394, "num"),
     (395, "num"),
     (396, "num"),
     (397, "num"),
-    (398, "num"),
-    (399, "bool"),
+    (398, "bool"),
+    (406, "num"),
     (407, "num"),
-    (408, "num"),
 ];
 
 /// Button-independent outputs: one per fork config.
@@ -260,16 +258,16 @@ pub struct KOutShared {
     pub c85: P8,
     pub c246: (P8, P8),
     pub c254: (P8, P8),
-    pub c298: ZN,
-    pub c300: P8,
-    pub c301: ZN,
-    pub c303: ZN,
+    pub c297: ZN,
+    pub c299: P8,
+    pub c300: ZN,
+    pub c302: ZN,
+    pub c316: ZN,
     pub c317: ZN,
-    pub c318: ZN,
+    pub c404: ZI,
     pub c405: ZI,
-    pub c406: ZI,
+    pub c406: ZN,
     pub c407: ZN,
-    pub c408: ZN,
 }
 
 /// Button-dependent outputs: one per (config, variant).
@@ -278,8 +276,8 @@ pub struct KOut {
     pub valid: u16,
     pub deopt: u16,
     pub bd: bool,
+    pub c309: bool,
     pub c310: bool,
-    pub c311: bool,
 }
 
 pub const OUT_CELLS: &[u32] = &[
@@ -287,18 +285,18 @@ pub const OUT_CELLS: &[u32] = &[
     85,
     246,
     254,
-    298,
+    297,
+    299,
     300,
-    301,
-    303,
+    302,
+    309,
     310,
-    311,
+    316,
     317,
-    318,
+    404,
     405,
     406,
     407,
-    408,
 ];
 
 /// Cells that end every frame as a fresh UnknownBool (the next
@@ -367,26 +365,28 @@ pub fn bind(b: &Rt2) -> Option<Uni> {
         c253: match &b.cols[253] { Col::U(AV::Num(n)) => *n, _ => return None },
         c254: match &b.cols[254] { Col::U(AV::Ival(a, b)) => (*a, *b), _ => return None },
         c257: match &b.cols[257] { Col::U(AV::Bool(v)) => *v, _ => return None },
+        c259: match &b.cols[259] { Col::U(AV::Num(n)) => *n, _ => return None },
         c260: match &b.cols[260] { Col::U(AV::Num(n)) => *n, _ => return None },
-        c261: match &b.cols[261] { Col::U(AV::Num(n)) => *n, _ => return None },
-        c269: match &b.cols[269] { Col::U(AV::Bool(v)) => *v, _ => return None },
+        c268: match &b.cols[268] { Col::U(AV::Bool(v)) => *v, _ => return None },
+        c270: match &b.cols[270] { Col::U(AV::Num(n)) => *n, _ => return None },
+        c272: match &b.cols[272] { Col::U(AV::Num(n)) => *n, _ => return None },
         c273: match &b.cols[273] { Col::U(AV::Num(n)) => *n, _ => return None },
-        c274: match &b.cols[274] { Col::U(AV::Num(n)) => *n, _ => return None },
-        c277: match &b.cols[277] { Col::U(AV::Bool(v)) => *v, _ => return None },
+        c276: match &b.cols[276] { Col::U(AV::Bool(v)) => *v, _ => return None },
+        c278: match &b.cols[278] { Col::U(AV::Num(n)) => *n, _ => return None },
         c279: match &b.cols[279] { Col::U(AV::Num(n)) => *n, _ => return None },
-        c280: match &b.cols[280] { Col::U(AV::Num(n)) => *n, _ => return None },
-        c288: match &b.cols[288] { Col::U(AV::Bool(v)) => *v, _ => return None },
-        c290: match &b.cols[290] { Col::U(AV::Num(n)) => *n, _ => return None },
+        c287: match &b.cols[287] { Col::U(AV::Bool(v)) => *v, _ => return None },
+        c289: match &b.cols[289] { Col::U(AV::Num(n)) => *n, _ => return None },
+        c291: match &b.cols[291] { Col::U(AV::Num(n)) => *n, _ => return None },
         c292: match &b.cols[292] { Col::U(AV::Num(n)) => *n, _ => return None },
-        c293: match &b.cols[293] { Col::U(AV::Num(n)) => *n, _ => return None },
-        c296: match &b.cols[296] { Col::U(AV::Bool(v)) => *v, _ => return None },
+        c295: match &b.cols[295] { Col::U(AV::Bool(v)) => *v, _ => return None },
+        c299: match &b.cols[299] { Col::U(AV::Num(n)) => *n, _ => return None },
         c300: match &b.cols[300] { Col::U(AV::Num(n)) => *n, _ => return None },
-        c301: match &b.cols[301] { Col::U(AV::Num(n)) => *n, _ => return None },
+        c309: match &b.cols[309] { Col::U(AV::Bool(v)) => *v, _ => return None },
         c310: match &b.cols[310] { Col::U(AV::Bool(v)) => *v, _ => return None },
-        c311: match &b.cols[311] { Col::U(AV::Bool(v)) => *v, _ => return None },
-        c313: match &b.cols[313] { Col::U(AV::Bool(v)) => *v, _ => return None },
+        c312: match &b.cols[312] { Col::U(AV::Bool(v)) => *v, _ => return None },
+        c364: match &b.cols[364] { Col::U(AV::Bool(v)) => *v, _ => return None },
         c365: match &b.cols[365] { Col::U(AV::Bool(v)) => *v, _ => return None },
-        c366: match &b.cols[366] { Col::U(AV::Bool(v)) => *v, _ => return None },
+        c366: match &b.cols[366] { Col::U(AV::Num(n)) => *n, _ => return None },
         c367: match &b.cols[367] { Col::U(AV::Num(n)) => *n, _ => return None },
         c368: match &b.cols[368] { Col::U(AV::Num(n)) => *n, _ => return None },
         c369: match &b.cols[369] { Col::U(AV::Num(n)) => *n, _ => return None },
@@ -394,9 +394,9 @@ pub fn bind(b: &Rt2) -> Option<Uni> {
         c371: match &b.cols[371] { Col::U(AV::Num(n)) => *n, _ => return None },
         c372: match &b.cols[372] { Col::U(AV::Num(n)) => *n, _ => return None },
         c373: match &b.cols[373] { Col::U(AV::Num(n)) => *n, _ => return None },
-        c374: match &b.cols[374] { Col::U(AV::Num(n)) => *n, _ => return None },
+        c374: match &b.cols[374] { Col::U(AV::Bool(v)) => *v, _ => return None },
         c375: match &b.cols[375] { Col::U(AV::Bool(v)) => *v, _ => return None },
-        c376: match &b.cols[376] { Col::U(AV::Bool(v)) => *v, _ => return None },
+        c376: match &b.cols[376] { Col::U(AV::Num(n)) => *n, _ => return None },
         c377: match &b.cols[377] { Col::U(AV::Num(n)) => *n, _ => return None },
         c378: match &b.cols[378] { Col::U(AV::Num(n)) => *n, _ => return None },
         c379: match &b.cols[379] { Col::U(AV::Num(n)) => *n, _ => return None },
@@ -404,9 +404,9 @@ pub fn bind(b: &Rt2) -> Option<Uni> {
         c381: match &b.cols[381] { Col::U(AV::Num(n)) => *n, _ => return None },
         c382: match &b.cols[382] { Col::U(AV::Num(n)) => *n, _ => return None },
         c383: match &b.cols[383] { Col::U(AV::Num(n)) => *n, _ => return None },
-        c384: match &b.cols[384] { Col::U(AV::Num(n)) => *n, _ => return None },
+        c384: match &b.cols[384] { Col::U(AV::Bool(v)) => *v, _ => return None },
         c385: match &b.cols[385] { Col::U(AV::Bool(v)) => *v, _ => return None },
-        c386: match &b.cols[386] { Col::U(AV::Bool(v)) => *v, _ => return None },
+        c386: match &b.cols[386] { Col::U(AV::Num(n)) => *n, _ => return None },
         c387: match &b.cols[387] { Col::U(AV::Num(n)) => *n, _ => return None },
         c388: match &b.cols[388] { Col::U(AV::Num(n)) => *n, _ => return None },
         c389: match &b.cols[389] { Col::U(AV::Num(n)) => *n, _ => return None },
@@ -414,14 +414,13 @@ pub fn bind(b: &Rt2) -> Option<Uni> {
         c391: match &b.cols[391] { Col::U(AV::Num(n)) => *n, _ => return None },
         c392: match &b.cols[392] { Col::U(AV::Num(n)) => *n, _ => return None },
         c393: match &b.cols[393] { Col::U(AV::Num(n)) => *n, _ => return None },
-        c394: match &b.cols[394] { Col::U(AV::Num(n)) => *n, _ => return None },
-        c400: match &b.cols[400] { Col::U(AV::Bool(v)) => *v, _ => return None },
+        c399: match &b.cols[399] { Col::U(AV::Bool(v)) => *v, _ => return None },
+        c400: match &b.cols[400] { Col::U(AV::Num(n)) => *n, _ => return None },
         c401: match &b.cols[401] { Col::U(AV::Num(n)) => *n, _ => return None },
         c402: match &b.cols[402] { Col::U(AV::Num(n)) => *n, _ => return None },
         c403: match &b.cols[403] { Col::U(AV::Num(n)) => *n, _ => return None },
-        c404: match &b.cols[404] { Col::U(AV::Num(n)) => *n, _ => return None },
+        c404: match &b.cols[404] { Col::U(AV::Ival(a, b)) => (*a, *b), _ => return None },
         c405: match &b.cols[405] { Col::U(AV::Ival(a, b)) => (*a, *b), _ => return None },
-        c406: match &b.cols[406] { Col::U(AV::Ival(a, b)) => (*a, *b), _ => return None },
     })
 }
 
@@ -430,22 +429,17 @@ pub fn bind(b: &Rt2) -> Option<Uni> {
 pub fn rows(b: &Rt2, lo: usize) -> Option<RowsIn> {
     let at = |i: usize| -> usize { (lo + i).min(b.width - 1) };
     Some(RowsIn {
-        c258: match &b.cols[258] {
+        c297: match &b.cols[297] {
             Col::N(v) => core::array::from_fn(|i| v[at(i)]),
             Col::U(AV::Num(n)) => [*n; W],
             _ => return None,
         },
-        c271: match &b.cols[271] {
+        c302: match &b.cols[302] {
             Col::N(v) => core::array::from_fn(|i| v[at(i)]),
             Col::U(AV::Num(n)) => [*n; W],
             _ => return None,
         },
-        c298: match &b.cols[298] {
-            Col::N(v) => core::array::from_fn(|i| v[at(i)]),
-            Col::U(AV::Num(n)) => [*n; W],
-            _ => return None,
-        },
-        c303: match &b.cols[303] {
+        c316: match &b.cols[316] {
             Col::N(v) => core::array::from_fn(|i| v[at(i)]),
             Col::U(AV::Num(n)) => [*n; W],
             _ => return None,
@@ -455,7 +449,7 @@ pub fn rows(b: &Rt2, lo: usize) -> Option<RowsIn> {
             Col::U(AV::Num(n)) => [*n; W],
             _ => return None,
         },
-        c318: match &b.cols[318] {
+        c394: match &b.cols[394] {
             Col::N(v) => core::array::from_fn(|i| v[at(i)]),
             Col::U(AV::Num(n)) => [*n; W],
             _ => return None,
@@ -476,11 +470,6 @@ pub fn rows(b: &Rt2, lo: usize) -> Option<RowsIn> {
             _ => return None,
         },
         c398: match &b.cols[398] {
-            Col::N(v) => core::array::from_fn(|i| v[at(i)]),
-            Col::U(AV::Num(n)) => [*n; W],
-            _ => return None,
-        },
-        c399: match &b.cols[399] {
             Col::V(v) => {
                 let mut m = 0u16;
                 for i in 0..W { if matches!(v[at(i)], AV::Bool(true)) { m |= 1 << i; } else if !matches!(v[at(i)], AV::Bool(false)) { return None; } }
@@ -489,12 +478,12 @@ pub fn rows(b: &Rt2, lo: usize) -> Option<RowsIn> {
             Col::U(AV::Bool(t)) => if *t { 0xffff } else { 0 },
             _ => return None,
         },
-        c407: match &b.cols[407] {
+        c406: match &b.cols[406] {
             Col::N(v) => core::array::from_fn(|i| v[at(i)]),
             Col::U(AV::Num(n)) => [*n; W],
             _ => return None,
         },
-        c408: match &b.cols[408] {
+        c407: match &b.cols[407] {
             Col::N(v) => core::array::from_fn(|i| v[at(i)]),
             Col::U(AV::Num(n)) => [*n; W],
             _ => return None,
@@ -509,18 +498,18 @@ pub fn apply(sh: &KOutShared, kv: &KOut, b: &mut Rt2, n: usize) {
     b.cols[85] = Col::U(AV::Num(sh.c85));
     b.cols[246] = Col::U(AV::Ival(sh.c246.0, sh.c246.1));
     b.cols[254] = Col::U(AV::Ival(sh.c254.0, sh.c254.1));
-    b.cols[298] = Col::N(sh.c298[..n].to_vec());
-    b.cols[300] = Col::U(AV::Num(sh.c300));
-    b.cols[301] = Col::N(sh.c301[..n].to_vec());
-    b.cols[303] = Col::N(sh.c303[..n].to_vec());
+    b.cols[297] = Col::N(sh.c297[..n].to_vec());
+    b.cols[299] = Col::U(AV::Num(sh.c299));
+    b.cols[300] = Col::N(sh.c300[..n].to_vec());
+    b.cols[302] = Col::N(sh.c302[..n].to_vec());
+    b.cols[309] = Col::U(AV::Bool(kv.c309));
     b.cols[310] = Col::U(AV::Bool(kv.c310));
-    b.cols[311] = Col::U(AV::Bool(kv.c311));
+    b.cols[316] = Col::N(sh.c316[..n].to_vec());
     b.cols[317] = Col::N(sh.c317[..n].to_vec());
-    b.cols[318] = Col::N(sh.c318[..n].to_vec());
+    b.cols[404] = Col::I((0..n).map(|i| (sh.c404.lo[i], sh.c404.hi[i])).collect());
     b.cols[405] = Col::I((0..n).map(|i| (sh.c405.lo[i], sh.c405.hi[i])).collect());
-    b.cols[406] = Col::I((0..n).map(|i| (sh.c406.lo[i], sh.c406.hi[i])).collect());
+    b.cols[406] = Col::N(sh.c406[..n].to_vec());
     b.cols[407] = Col::N(sh.c407[..n].to_vec());
-    b.cols[408] = Col::N(sh.c408[..n].to_vec());
     for cell in OUT_UBOOL_CELLS {
         b.cols[*cell as usize] = Col::U(AV::UBool);
     }
@@ -535,24 +524,22 @@ pub fn acc_init(chunk: &Rt2) -> Rt2 {
     acc.structure = chunk.structure.clone();
     acc.cols = chunk.cols.clone();
     acc.shape_hash = chunk.shape_hash;
-    acc.cols[298] = Col::N(Vec::new());
-    acc.cols[301] = Col::N(Vec::new());
-    acc.cols[303] = Col::N(Vec::new());
+    acc.cols[297] = Col::N(Vec::new());
+    acc.cols[300] = Col::N(Vec::new());
+    acc.cols[302] = Col::N(Vec::new());
+    acc.cols[309] = Col::V(Vec::new());
     acc.cols[310] = Col::V(Vec::new());
-    acc.cols[311] = Col::V(Vec::new());
+    acc.cols[316] = Col::N(Vec::new());
     acc.cols[317] = Col::N(Vec::new());
-    acc.cols[318] = Col::N(Vec::new());
+    acc.cols[404] = Col::I(Vec::new());
     acc.cols[405] = Col::I(Vec::new());
-    acc.cols[406] = Col::I(Vec::new());
+    acc.cols[406] = Col::N(Vec::new());
     acc.cols[407] = Col::N(Vec::new());
-    acc.cols[408] = Col::N(Vec::new());
-    acc.cols[258] = Col::N(Vec::new());
-    acc.cols[271] = Col::N(Vec::new());
+    acc.cols[394] = Col::N(Vec::new());
     acc.cols[395] = Col::N(Vec::new());
     acc.cols[396] = Col::N(Vec::new());
     acc.cols[397] = Col::N(Vec::new());
-    acc.cols[398] = Col::N(Vec::new());
-    acc.cols[399] = Col::V(Vec::new());
+    acc.cols[398] = Col::V(Vec::new());
     for cell in OUT_UBOOL_CELLS {
         acc.cols[*cell as usize] = Col::U(AV::UBool);
     }
@@ -576,33 +563,29 @@ pub fn append_out(acc: &mut Rt2, chunk: &Rt2, lo: usize, n: usize, live: u16, sh
         acc.cols[246] = Col::U(AV::Ival(sh.c246.0, sh.c246.1));
         if !fresh { if let Col::U(AV::Ival(a, b)) = &acc.cols[254] { if (*a, *b) != sh.c254 { *bd = true; } } }
         acc.cols[254] = Col::U(AV::Ival(sh.c254.0, sh.c254.1));
-        if let Col::N(v) = &mut acc.cols[298] { v.push(sh.c298[i]); }
-        if !fresh { if let Col::U(AV::Num(prev)) = &acc.cols[300] { if *prev != sh.c300 { *bd = true; } } }
-        acc.cols[300] = Col::U(AV::Num(sh.c300));
-        if let Col::N(v) = &mut acc.cols[301] { v.push(sh.c301[i]); }
-        if let Col::N(v) = &mut acc.cols[303] { v.push(sh.c303[i]); }
+        if let Col::N(v) = &mut acc.cols[297] { v.push(sh.c297[i]); }
+        if !fresh { if let Col::U(AV::Num(prev)) = &acc.cols[299] { if *prev != sh.c299 { *bd = true; } } }
+        acc.cols[299] = Col::U(AV::Num(sh.c299));
+        if let Col::N(v) = &mut acc.cols[300] { v.push(sh.c300[i]); }
+        if let Col::N(v) = &mut acc.cols[302] { v.push(sh.c302[i]); }
+        if let Col::V(v) = &mut acc.cols[309] { v.push(AV::Bool(kv.c309)); }
         if let Col::V(v) = &mut acc.cols[310] { v.push(AV::Bool(kv.c310)); }
-        if let Col::V(v) = &mut acc.cols[311] { v.push(AV::Bool(kv.c311)); }
+        if let Col::N(v) = &mut acc.cols[316] { v.push(sh.c316[i]); }
         if let Col::N(v) = &mut acc.cols[317] { v.push(sh.c317[i]); }
-        if let Col::N(v) = &mut acc.cols[318] { v.push(sh.c318[i]); }
+        if let Col::I(v) = &mut acc.cols[404] { v.push((sh.c404.lo[i], sh.c404.hi[i])); }
         if let Col::I(v) = &mut acc.cols[405] { v.push((sh.c405.lo[i], sh.c405.hi[i])); }
-        if let Col::I(v) = &mut acc.cols[406] { v.push((sh.c406.lo[i], sh.c406.hi[i])); }
+        if let Col::N(v) = &mut acc.cols[406] { v.push(sh.c406[i]); }
         if let Col::N(v) = &mut acc.cols[407] { v.push(sh.c407[i]); }
-        if let Col::N(v) = &mut acc.cols[408] { v.push(sh.c408[i]); }
-        let val = match &chunk.cols[258] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
-        if let Col::N(v) = &mut acc.cols[258] { v.push(val); }
-        let val = match &chunk.cols[271] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
-        if let Col::N(v) = &mut acc.cols[271] { v.push(val); }
+        let val = match &chunk.cols[394] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
+        if let Col::N(v) = &mut acc.cols[394] { v.push(val); }
         let val = match &chunk.cols[395] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
         if let Col::N(v) = &mut acc.cols[395] { v.push(val); }
         let val = match &chunk.cols[396] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
         if let Col::N(v) = &mut acc.cols[396] { v.push(val); }
         let val = match &chunk.cols[397] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
         if let Col::N(v) = &mut acc.cols[397] { v.push(val); }
-        let val = match &chunk.cols[398] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
-        if let Col::N(v) = &mut acc.cols[398] { v.push(val); }
-        let val = match &chunk.cols[399] { Col::V(s) => s[(lo + i).min(chunk.width - 1)], Col::U(a) => *a, _ => unreachable!() };
-        if let Col::V(v) = &mut acc.cols[399] { v.push(val); }
+        let val = match &chunk.cols[398] { Col::V(s) => s[(lo + i).min(chunk.width - 1)], Col::U(a) => *a, _ => unreachable!() };
+        if let Col::V(v) = &mut acc.cols[398] { v.push(val); }
         acc.width += 1;
     }
 }
@@ -613,25 +596,23 @@ pub const KEY_CELLS: &[u32] = &[
     85,
     246,
     254,
-    298,
+    297,
+    299,
     300,
-    301,
-    303,
+    302,
+    309,
     310,
-    311,
+    316,
     317,
-    318,
+    404,
     405,
     406,
     407,
-    408,
-    258,
-    271,
+    394,
     395,
     396,
     397,
     398,
-    399,
 ];
 
 #[allow(unused_variables)]
@@ -680,217 +661,193 @@ pub fn row_keys(chunk: &Rt2, lo: usize, n: usize, sh: &KOutShared, kv: &KOut, pl
             h2[i] = h2[i].wrapping_add(cell_mix(254u64, v, 0x27d4_eb2f));
         }
     }
-    // cell 298 (ZN)
+    // cell 297 (ZN)
     if plan.rem & (1 << 4) == 0 {
-        let c1 = 0x5bf0_3635u64 ^ (298u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let c2 = 0x27d4_eb2fu64 ^ (298u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c1 = 0x5bf0_3635u64 ^ (297u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c2 = 0x27d4_eb2fu64 ^ (297u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         for i in 0..W {
-            let v = sh.c298[i];
+            let v = sh.c297[i];
             let v = if plan.det & (1 << 4) != 0 && v < P8::from_raw(0i32) { P8::from_raw(0i32) } else { v };
             let code = 1u64 << 56 | v.to_bits() as u64;
             h1[i] = h1[i].wrapping_add(mix64(c1 ^ code));
             h2[i] = h2[i].wrapping_add(mix64(c2 ^ code));
         }
     }
-    // cell 300 (P8)
+    // cell 299 (P8)
     if plan.rem & (1 << 5) == 0 {
-        let c1 = 0x5bf0_3635u64 ^ (300u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let c2 = 0x27d4_eb2fu64 ^ (300u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c1 = 0x5bf0_3635u64 ^ (299u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c2 = 0x27d4_eb2fu64 ^ (299u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         for i in 0..W {
-            let v = sh.c300;
+            let v = sh.c299;
             let v = if plan.det & (1 << 5) != 0 && v < P8::from_raw(0i32) { P8::from_raw(0i32) } else { v };
             let code = 1u64 << 56 | v.to_bits() as u64;
             h1[i] = h1[i].wrapping_add(mix64(c1 ^ code));
             h2[i] = h2[i].wrapping_add(mix64(c2 ^ code));
         }
     }
-    // cell 301 (ZN)
+    // cell 300 (ZN)
     if plan.rem & (1 << 6) == 0 {
-        let c1 = 0x5bf0_3635u64 ^ (301u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let c2 = 0x27d4_eb2fu64 ^ (301u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c1 = 0x5bf0_3635u64 ^ (300u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c2 = 0x27d4_eb2fu64 ^ (300u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         for i in 0..W {
-            let v = sh.c301[i];
+            let v = sh.c300[i];
             let v = if plan.det & (1 << 6) != 0 && v < P8::from_raw(0i32) { P8::from_raw(0i32) } else { v };
             let code = 1u64 << 56 | v.to_bits() as u64;
             h1[i] = h1[i].wrapping_add(mix64(c1 ^ code));
             h2[i] = h2[i].wrapping_add(mix64(c2 ^ code));
         }
     }
-    // cell 303 (ZN)
+    // cell 302 (ZN)
     if plan.rem & (1 << 7) == 0 {
-        let c1 = 0x5bf0_3635u64 ^ (303u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let c2 = 0x27d4_eb2fu64 ^ (303u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c1 = 0x5bf0_3635u64 ^ (302u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c2 = 0x27d4_eb2fu64 ^ (302u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         for i in 0..W {
-            let v = sh.c303[i];
+            let v = sh.c302[i];
             let v = if plan.det & (1 << 7) != 0 && v < P8::from_raw(0i32) { P8::from_raw(0i32) } else { v };
             let code = 1u64 << 56 | v.to_bits() as u64;
             h1[i] = h1[i].wrapping_add(mix64(c1 ^ code));
             h2[i] = h2[i].wrapping_add(mix64(c2 ^ code));
         }
     }
-    // cell 310 (bool)
+    // cell 309 (bool)
     if plan.rem & (1 << 8) == 0 {
-        assert!(plan.det & (1 << 8) == 0, "det clamp on non-numeric cell 310");
+        assert!(plan.det & (1 << 8) == 0, "det clamp on non-numeric cell 309");
+        for i in 0..W {
+            let v = AV::Bool(kv.c309);
+            h1[i] = h1[i].wrapping_add(cell_mix(309u64, v, 0x5bf0_3635));
+            h2[i] = h2[i].wrapping_add(cell_mix(309u64, v, 0x27d4_eb2f));
+        }
+    }
+    // cell 310 (bool)
+    if plan.rem & (1 << 9) == 0 {
+        assert!(plan.det & (1 << 9) == 0, "det clamp on non-numeric cell 310");
         for i in 0..W {
             let v = AV::Bool(kv.c310);
             h1[i] = h1[i].wrapping_add(cell_mix(310u64, v, 0x5bf0_3635));
             h2[i] = h2[i].wrapping_add(cell_mix(310u64, v, 0x27d4_eb2f));
         }
     }
-    // cell 311 (bool)
-    if plan.rem & (1 << 9) == 0 {
-        assert!(plan.det & (1 << 9) == 0, "det clamp on non-numeric cell 311");
-        for i in 0..W {
-            let v = AV::Bool(kv.c311);
-            h1[i] = h1[i].wrapping_add(cell_mix(311u64, v, 0x5bf0_3635));
-            h2[i] = h2[i].wrapping_add(cell_mix(311u64, v, 0x27d4_eb2f));
-        }
-    }
-    // cell 317 (ZN)
+    // cell 316 (ZN)
     if plan.rem & (1 << 10) == 0 {
-        let c1 = 0x5bf0_3635u64 ^ (317u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let c2 = 0x27d4_eb2fu64 ^ (317u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c1 = 0x5bf0_3635u64 ^ (316u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c2 = 0x27d4_eb2fu64 ^ (316u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         for i in 0..W {
-            let v = sh.c317[i];
+            let v = sh.c316[i];
             let v = if plan.det & (1 << 10) != 0 && v < P8::from_raw(0i32) { P8::from_raw(0i32) } else { v };
             let code = 1u64 << 56 | v.to_bits() as u64;
             h1[i] = h1[i].wrapping_add(mix64(c1 ^ code));
             h2[i] = h2[i].wrapping_add(mix64(c2 ^ code));
         }
     }
-    // cell 318 (ZN)
+    // cell 317 (ZN)
     if plan.rem & (1 << 11) == 0 {
-        let c1 = 0x5bf0_3635u64 ^ (318u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let c2 = 0x27d4_eb2fu64 ^ (318u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c1 = 0x5bf0_3635u64 ^ (317u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c2 = 0x27d4_eb2fu64 ^ (317u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         for i in 0..W {
-            let v = sh.c318[i];
+            let v = sh.c317[i];
             let v = if plan.det & (1 << 11) != 0 && v < P8::from_raw(0i32) { P8::from_raw(0i32) } else { v };
             let code = 1u64 << 56 | v.to_bits() as u64;
             h1[i] = h1[i].wrapping_add(mix64(c1 ^ code));
             h2[i] = h2[i].wrapping_add(mix64(c2 ^ code));
         }
     }
-    // cell 405 (ZI)
+    // cell 404 (ZI)
     if plan.rem & (1 << 12) == 0 {
-        assert!(plan.det & (1 << 12) == 0, "det clamp on non-numeric cell 405");
+        assert!(plan.det & (1 << 12) == 0, "det clamp on non-numeric cell 404");
+        for i in 0..W {
+            let v = AV::Ival(sh.c404.lo[i], sh.c404.hi[i]);
+            h1[i] = h1[i].wrapping_add(cell_mix(404u64, v, 0x5bf0_3635));
+            h2[i] = h2[i].wrapping_add(cell_mix(404u64, v, 0x27d4_eb2f));
+        }
+    }
+    // cell 405 (ZI)
+    if plan.rem & (1 << 13) == 0 {
+        assert!(plan.det & (1 << 13) == 0, "det clamp on non-numeric cell 405");
         for i in 0..W {
             let v = AV::Ival(sh.c405.lo[i], sh.c405.hi[i]);
             h1[i] = h1[i].wrapping_add(cell_mix(405u64, v, 0x5bf0_3635));
             h2[i] = h2[i].wrapping_add(cell_mix(405u64, v, 0x27d4_eb2f));
         }
     }
-    // cell 406 (ZI)
-    if plan.rem & (1 << 13) == 0 {
-        assert!(plan.det & (1 << 13) == 0, "det clamp on non-numeric cell 406");
-        for i in 0..W {
-            let v = AV::Ival(sh.c406.lo[i], sh.c406.hi[i]);
-            h1[i] = h1[i].wrapping_add(cell_mix(406u64, v, 0x5bf0_3635));
-            h2[i] = h2[i].wrapping_add(cell_mix(406u64, v, 0x27d4_eb2f));
-        }
-    }
-    // cell 407 (ZN)
+    // cell 406 (ZN)
     if plan.rem & (1 << 14) == 0 {
-        let c1 = 0x5bf0_3635u64 ^ (407u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let c2 = 0x27d4_eb2fu64 ^ (407u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c1 = 0x5bf0_3635u64 ^ (406u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c2 = 0x27d4_eb2fu64 ^ (406u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         for i in 0..W {
-            let v = sh.c407[i];
+            let v = sh.c406[i];
             let v = if plan.det & (1 << 14) != 0 && v < P8::from_raw(0i32) { P8::from_raw(0i32) } else { v };
             let code = 1u64 << 56 | v.to_bits() as u64;
             h1[i] = h1[i].wrapping_add(mix64(c1 ^ code));
             h2[i] = h2[i].wrapping_add(mix64(c2 ^ code));
         }
     }
-    // cell 408 (ZN)
+    // cell 407 (ZN)
     if plan.rem & (1 << 15) == 0 {
-        let c1 = 0x5bf0_3635u64 ^ (408u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let c2 = 0x27d4_eb2fu64 ^ (408u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c1 = 0x5bf0_3635u64 ^ (407u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c2 = 0x27d4_eb2fu64 ^ (407u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         for i in 0..W {
-            let v = sh.c408[i];
+            let v = sh.c407[i];
             let v = if plan.det & (1 << 15) != 0 && v < P8::from_raw(0i32) { P8::from_raw(0i32) } else { v };
             let code = 1u64 << 56 | v.to_bits() as u64;
             h1[i] = h1[i].wrapping_add(mix64(c1 ^ code));
             h2[i] = h2[i].wrapping_add(mix64(c2 ^ code));
         }
     }
-    // cell 258 (IN_N)
+    // cell 394 (IN_N)
     if plan.rem & (1 << 16) == 0 {
-        let c1 = 0x5bf0_3635u64 ^ (258u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let c2 = 0x27d4_eb2fu64 ^ (258u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c1 = 0x5bf0_3635u64 ^ (394u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c2 = 0x27d4_eb2fu64 ^ (394u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         for i in 0..W {
-            let v = match &chunk.cols[258] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
+            let v = match &chunk.cols[394] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
             let v = if plan.det & (1 << 16) != 0 && v < P8::from_raw(0i32) { P8::from_raw(0i32) } else { v };
             let code = 1u64 << 56 | v.to_bits() as u64;
             h1[i] = h1[i].wrapping_add(mix64(c1 ^ code));
             h2[i] = h2[i].wrapping_add(mix64(c2 ^ code));
         }
     }
-    // cell 271 (IN_N)
+    // cell 395 (IN_N)
     if plan.rem & (1 << 17) == 0 {
-        let c1 = 0x5bf0_3635u64 ^ (271u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let c2 = 0x27d4_eb2fu64 ^ (271u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c1 = 0x5bf0_3635u64 ^ (395u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c2 = 0x27d4_eb2fu64 ^ (395u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         for i in 0..W {
-            let v = match &chunk.cols[271] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
+            let v = match &chunk.cols[395] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
             let v = if plan.det & (1 << 17) != 0 && v < P8::from_raw(0i32) { P8::from_raw(0i32) } else { v };
             let code = 1u64 << 56 | v.to_bits() as u64;
             h1[i] = h1[i].wrapping_add(mix64(c1 ^ code));
             h2[i] = h2[i].wrapping_add(mix64(c2 ^ code));
         }
     }
-    // cell 395 (IN_N)
+    // cell 396 (IN_N)
     if plan.rem & (1 << 18) == 0 {
-        let c1 = 0x5bf0_3635u64 ^ (395u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let c2 = 0x27d4_eb2fu64 ^ (395u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c1 = 0x5bf0_3635u64 ^ (396u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c2 = 0x27d4_eb2fu64 ^ (396u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         for i in 0..W {
-            let v = match &chunk.cols[395] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
+            let v = match &chunk.cols[396] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
             let v = if plan.det & (1 << 18) != 0 && v < P8::from_raw(0i32) { P8::from_raw(0i32) } else { v };
             let code = 1u64 << 56 | v.to_bits() as u64;
             h1[i] = h1[i].wrapping_add(mix64(c1 ^ code));
             h2[i] = h2[i].wrapping_add(mix64(c2 ^ code));
         }
     }
-    // cell 396 (IN_N)
+    // cell 397 (IN_N)
     if plan.rem & (1 << 19) == 0 {
-        let c1 = 0x5bf0_3635u64 ^ (396u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let c2 = 0x27d4_eb2fu64 ^ (396u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c1 = 0x5bf0_3635u64 ^ (397u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let c2 = 0x27d4_eb2fu64 ^ (397u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         for i in 0..W {
-            let v = match &chunk.cols[396] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
+            let v = match &chunk.cols[397] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
             let v = if plan.det & (1 << 19) != 0 && v < P8::from_raw(0i32) { P8::from_raw(0i32) } else { v };
             let code = 1u64 << 56 | v.to_bits() as u64;
             h1[i] = h1[i].wrapping_add(mix64(c1 ^ code));
             h2[i] = h2[i].wrapping_add(mix64(c2 ^ code));
         }
     }
-    // cell 397 (IN_N)
+    // cell 398 (IN_B)
     if plan.rem & (1 << 20) == 0 {
-        let c1 = 0x5bf0_3635u64 ^ (397u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let c2 = 0x27d4_eb2fu64 ^ (397u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        assert!(plan.det & (1 << 20) == 0, "det clamp on non-numeric cell 398");
         for i in 0..W {
-            let v = match &chunk.cols[397] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
-            let v = if plan.det & (1 << 20) != 0 && v < P8::from_raw(0i32) { P8::from_raw(0i32) } else { v };
-            let code = 1u64 << 56 | v.to_bits() as u64;
-            h1[i] = h1[i].wrapping_add(mix64(c1 ^ code));
-            h2[i] = h2[i].wrapping_add(mix64(c2 ^ code));
-        }
-    }
-    // cell 398 (IN_N)
-    if plan.rem & (1 << 21) == 0 {
-        let c1 = 0x5bf0_3635u64 ^ (398u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let c2 = 0x27d4_eb2fu64 ^ (398u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        for i in 0..W {
-            let v = match &chunk.cols[398] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
-            let v = if plan.det & (1 << 21) != 0 && v < P8::from_raw(0i32) { P8::from_raw(0i32) } else { v };
-            let code = 1u64 << 56 | v.to_bits() as u64;
-            h1[i] = h1[i].wrapping_add(mix64(c1 ^ code));
-            h2[i] = h2[i].wrapping_add(mix64(c2 ^ code));
-        }
-    }
-    // cell 399 (IN_B)
-    if plan.rem & (1 << 22) == 0 {
-        assert!(plan.det & (1 << 22) == 0, "det clamp on non-numeric cell 399");
-        for i in 0..W {
-            let v = match &chunk.cols[399] { Col::V(s) => s[(lo + i).min(chunk.width - 1)], Col::U(a) => *a, _ => unreachable!() };
-            h1[i] = h1[i].wrapping_add(cell_mix(399u64, v, 0x5bf0_3635));
-            h2[i] = h2[i].wrapping_add(cell_mix(399u64, v, 0x27d4_eb2f));
+            let v = match &chunk.cols[398] { Col::V(s) => s[(lo + i).min(chunk.width - 1)], Col::U(a) => *a, _ => unreachable!() };
+            h1[i] = h1[i].wrapping_add(cell_mix(398u64, v, 0x5bf0_3635));
+            h2[i] = h2[i].wrapping_add(cell_mix(398u64, v, 0x27d4_eb2f));
         }
     }
     for i in 0..W {
@@ -923,19 +880,17 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let mut dp: u16 = 0;
     let mut bd_flag: bool = false;
     let bd: &mut bool = &mut bd_flag;
-    let r_c258: ZN = rin.c258;
-    let r_c271: ZN = rin.c271;
-    let r_c298: ZN = rin.c298;
-    let r_c303: ZN = rin.c303;
+    let r_c297: ZN = rin.c297;
+    let r_c302: ZN = rin.c302;
+    let r_c316: ZN = rin.c316;
     let r_c317: ZN = rin.c317;
-    let r_c318: ZN = rin.c318;
+    let r_c394: ZN = rin.c394;
     let r_c395: ZN = rin.c395;
     let r_c396: ZN = rin.c396;
     let r_c397: ZN = rin.c397;
-    let r_c398: ZN = rin.c398;
-    let r_c399: ZB = ZB { val: rin.c399, known: ALL };
+    let r_c398: ZB = ZB { val: rin.c398, known: ALL };
+    let r_c406: ZN = rin.c406;
     let r_c407: ZN = rin.c407;
-    let r_c408: ZN = rin.c408;
     let v0: P8 = P8::from_raw(65536i32);
     let v1: P8 = u.c84 + v0;
     let v2: P8 = P8::from_raw(1966080i32);
@@ -971,22 +926,22 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v30: bool = !v29;
     if !v30 { *bd = true; }
     let v31: P8 = P8::from_raw(0i32);
-    let v32: bool = u.c373 == v31;
+    let v32: bool = u.c372 == v31;
     let v33: bool = !v32;
     let v34: P8 = P8::from_raw(0i32);
-    let v35: bool = u.c374 == v34;
+    let v35: bool = u.c373 == v34;
     let v36: bool = !v35;
     let v37: bool = if v33 { v33 } else { v36 };
     let v38: bool = !v37;
     if !v38 { *bd = true; }
-    let v39: P8 = u.c253 + u.c369;
-    let v40: P8 = v39 + u.c368;
+    let v39: P8 = u.c253 + u.c368;
+    let v40: P8 = v39 + u.c367;
     let v41: P8 = P8::from_raw(0i32);
     let v42: P8 = v39 + v41;
     let v43: bool = v40 > v42;
-    let v44: (P8, P8) = (u.c370, u.c370);
+    let v44: (P8, P8) = (u.c369, u.c369);
     let v45: (P8, P8) = si_add(u.c254, v44);
-    let v46: (P8, P8) = (u.c367, u.c367);
+    let v46: (P8, P8) = (u.c366, u.c366);
     let v47: (P8, P8) = si_add(v45, v46);
     let v48: (P8, P8) = (P8::from_raw(0i32), P8::from_raw(0i32));
     let v49: (P8, P8) = si_add(v45, v48);
@@ -997,37 +952,37 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v54: (P8, P8) = (P8::from_raw(0i32), P8::from_raw(0i32));
     let v55: (P8, P8) = si_add(v47, v54);
     let v56: Option<bool> = si_cmp(Cmp::Lt, v45, v55);
-    let v57: P8 = u.c273 + u.c379;
-    let v58: P8 = v57 + u.c378;
+    let v57: P8 = u.c272 + u.c378;
+    let v58: P8 = v57 + u.c377;
     let v59: bool = v58 > v42;
-    let v60: P8 = u.c274 + u.c380;
-    let v61: P8 = v60 + u.c377;
+    let v60: P8 = u.c273 + u.c379;
+    let v61: P8 = v60 + u.c376;
     let v62: (P8, P8) = (v61, v61);
     let v63: Option<bool> = si_cmp(Cmp::Gt, v62, v49);
     let v64: bool = v57 < v52;
     let v65: (P8, P8) = (v60, v60);
     let v66: Option<bool> = si_cmp(Cmp::Lt, v65, v55);
-    let v67: P8 = u.c292 + u.c389;
-    let v68: P8 = v67 + u.c388;
+    let v67: P8 = u.c291 + u.c388;
+    let v68: P8 = v67 + u.c387;
     let v69: bool = v68 > v42;
-    let v70: P8 = u.c293 + u.c390;
-    let v71: P8 = v70 + u.c387;
+    let v70: P8 = u.c292 + u.c389;
+    let v71: P8 = v70 + u.c386;
     let v72: (P8, P8) = (v71, v71);
     let v73: Option<bool> = si_cmp(Cmp::Gt, v72, v49);
     let v74: bool = v67 < v52;
     let v75: (P8, P8) = (v70, v70);
     let v76: Option<bool> = si_cmp(Cmp::Lt, v75, v55);
-    let v77: ZN = zn_splat(u.c403);
-    let v78: ZN = zn_add(r_c317, v77);
-    let v79: ZN = zn_splat(u.c402);
+    let v77: ZN = zn_splat(u.c402);
+    let v78: ZN = zn_add(r_c316, v77);
+    let v79: ZN = zn_splat(u.c401);
     let v80: ZN = zn_add(v78, v79);
     let v81: ZN = zn_splat(v42);
     let v82: ZB = zn_gt(v80, v81);
-    let v83: ZB = zb_splat(u.c296);
-    let v84: ZB = if u.c296 { v82 } else { v83 };
-    let v85: ZN = zn_splat(u.c404);
-    let v86: ZN = zn_add(r_c318, v85);
-    let v87: ZN = zn_splat(u.c401);
+    let v83: ZB = zb_splat(u.c295);
+    let v84: ZB = if u.c295 { v82 } else { v83 };
+    let v85: ZN = zn_splat(u.c403);
+    let v86: ZN = zn_add(r_c317, v85);
+    let v87: ZN = zn_splat(u.c400);
     let v88: ZN = zn_add(v86, v87);
     let v89: ZI = zi_of_zn(v88);
     let v90: ZI = zi_splat(v49.0, v49.1);
@@ -1054,41 +1009,41 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v108: (P8, P8) = (u.c251, u.c251);
     let v109: (P8, P8) = si_add(v108, v107);
     let v110: P8 = P8::from_raw(0i32);
-    let v111: bool = u.c383 == v110;
+    let v111: bool = u.c382 == v110;
     let v112: bool = !v111;
     let v113: P8 = P8::from_raw(0i32);
-    let v114: bool = u.c384 == v113;
+    let v114: bool = u.c383 == v113;
     let v115: bool = !v114;
     let v116: bool = if v112 { v112 } else { v115 };
     let v117: bool = !v116;
     if !v117 { *bd = true; }
     let v118: P8 = P8::from_raw(0i32);
-    let v119: bool = u.c260 > v118;
+    let v119: bool = u.c259 > v118;
     let v120: bool = !v119;
     if !v120 { *bd = true; }
-    let v121: ZN = zn_splat(P8::from_raw(1179648i32));
-    let v122: ZB = zn_eq(r_c271, v121);
-    zguard(v122, &mut dp);
-    let v123: P8 = u.c253 + u.c369;
-    let v124: P8 = v123 + u.c368;
-    let v125: P8 = u.c273 + u.c379;
+    let v121: P8 = P8::from_raw(1179648i32);
+    let v122: bool = u.c270 == v121;
+    if !v122 { *bd = true; }
+    let v123: P8 = u.c253 + u.c368;
+    let v124: P8 = v123 + u.c367;
+    let v125: P8 = u.c272 + u.c378;
     let v126: P8 = P8::from_raw(0i32);
     let v127: P8 = v125 + v126;
     let v128: bool = v124 > v127;
-    let v129: (P8, P8) = (u.c370, u.c370);
+    let v129: (P8, P8) = (u.c369, u.c369);
     let v130: (P8, P8) = si_add(v109, v129);
-    let v131: (P8, P8) = (u.c367, u.c367);
+    let v131: (P8, P8) = (u.c366, u.c366);
     let v132: (P8, P8) = si_add(v130, v131);
-    let v133: P8 = u.c274 + u.c380;
+    let v133: P8 = u.c273 + u.c379;
     let v134: P8 = P8::from_raw(0i32);
     let v135: P8 = v133 + v134;
     let v136: (P8, P8) = (v135, v135);
     let v137: Option<bool> = si_cmp(Cmp::Gt, v132, v136);
-    let v138: P8 = v125 + u.c378;
+    let v138: P8 = v125 + u.c377;
     let v139: P8 = P8::from_raw(0i32);
     let v140: P8 = v138 + v139;
     let v141: bool = v123 < v140;
-    let v142: P8 = v133 + u.c377;
+    let v142: P8 = v133 + u.c376;
     let v143: P8 = P8::from_raw(0i32);
     let v144: P8 = v142 + v143;
     let v145: (P8, P8) = (v144, v144);
@@ -1097,25 +1052,25 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v148: bool = v142 > v135;
     let v149: bool = v125 < v140;
     let v150: bool = v133 < v144;
-    let v151: P8 = u.c292 + u.c389;
-    let v152: P8 = v151 + u.c388;
+    let v151: P8 = u.c291 + u.c388;
+    let v152: P8 = v151 + u.c387;
     let v153: bool = v152 > v127;
-    let v154: P8 = u.c293 + u.c390;
-    let v155: P8 = v154 + u.c387;
+    let v154: P8 = u.c292 + u.c389;
+    let v155: P8 = v154 + u.c386;
     let v156: bool = v155 > v135;
     let v157: bool = v151 < v140;
     let v158: bool = v154 < v144;
-    let v159: ZN = zn_splat(u.c403);
-    let v160: ZN = zn_add(r_c317, v159);
-    let v161: ZN = zn_splat(u.c402);
+    let v159: ZN = zn_splat(u.c402);
+    let v160: ZN = zn_add(r_c316, v159);
+    let v161: ZN = zn_splat(u.c401);
     let v162: ZN = zn_add(v160, v161);
     let v163: ZN = zn_splat(v127);
     let v164: ZB = zn_gt(v162, v163);
-    let v165: ZB = zb_splat(u.c296);
-    let v166: ZB = if u.c296 { v164 } else { v165 };
-    let v167: ZN = zn_splat(u.c404);
-    let v168: ZN = zn_add(r_c318, v167);
-    let v169: ZN = zn_splat(u.c401);
+    let v165: ZB = zb_splat(u.c295);
+    let v166: ZB = if u.c295 { v164 } else { v165 };
+    let v167: ZN = zn_splat(u.c403);
+    let v168: ZN = zn_add(r_c317, v167);
+    let v169: ZN = zn_splat(u.c400);
     let v170: ZN = zn_add(v168, v169);
     let v171: ZN = zn_splat(v135);
     let v172: ZB = zn_gt(v170, v171);
@@ -1129,24 +1084,24 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v180: ZB = zb_not(v179);
     zguard(v180, &mut dp);
     let v181: P8 = P8::from_raw(0i32);
-    let v182: bool = u.c261 > v181;
+    let v182: bool = u.c260 > v181;
     let v183: bool = !v182;
     if !v183 { *bd = true; }
     let v184: P8 = P8::from_raw(0i32);
-    let v185: bool = u.c393 == v184;
+    let v185: bool = u.c392 == v184;
     let v186: bool = !v185;
     let v187: P8 = P8::from_raw(0i32);
-    let v188: bool = u.c394 == v187;
+    let v188: bool = u.c393 == v187;
     let v189: bool = !v188;
     let v190: bool = if v186 { v186 } else { v189 };
     let v191: bool = !v190;
     if !v191 { *bd = true; }
     let v192: P8 = P8::from_raw(0i32);
-    let v193: bool = u.c279 > v192;
+    let v193: bool = u.c278 > v192;
     let v194: bool = !v193;
     if !v194 { *bd = true; }
     let v195: P8 = P8::from_raw(1179648i32);
-    let v196: bool = u.c290 == v195;
+    let v196: bool = u.c289 == v195;
     if !v196 { *bd = true; }
     let v197: P8 = P8::from_raw(0i32);
     let v198: P8 = v151 + v197;
@@ -1172,8 +1127,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v218: bool = v154 < v208;
     let v219: ZN = zn_splat(v198);
     let v220: ZB = zn_gt(v162, v219);
-    let v221: ZB = zb_splat(u.c296);
-    let v222: ZB = if u.c296 { v220 } else { v221 };
+    let v221: ZB = zb_splat(u.c295);
+    let v222: ZB = if u.c295 { v220 } else { v221 };
     let v223: ZN = zn_splat(v201);
     let v224: ZB = zn_gt(v170, v223);
     let v225: ZB = zsel_b(v222, v224, v222, &mut dp);
@@ -1186,22 +1141,22 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v232: ZB = zb_not(v231);
     zguard(v232, &mut dp);
     let v233: P8 = P8::from_raw(0i32);
-    let v234: bool = u.c280 > v233;
+    let v234: bool = u.c279 > v233;
     let v235: bool = !v234;
     if !v235 { *bd = true; }
     let v236: ZN = zn_splat(P8::from_raw(0i32));
-    let v237: ZB = zn_eq(r_c407, v236);
+    let v237: ZB = zn_eq(r_c406, v236);
     let v238: ZB = zb_not(v237);
     let v239: ZN = zn_splat(P8::from_raw(0i32));
-    let v240: ZB = zn_eq(r_c408, v239);
+    let v240: ZB = zn_eq(r_c407, v239);
     let v241: ZB = zb_not(v240);
     let v242: ZB = zsel_b(v238, v238, v241, &mut dp);
-    let v243: ZI = zi_splat(u.c405.0, u.c405.1);
-    let v244: ZI = zi_of_zn(r_c407);
+    let v243: ZI = zi_splat(u.c404.0, u.c404.1);
+    let v244: ZI = zi_of_zn(r_c406);
     let v245: ZI = zi_add(v243, v244);
     let v246: ZI = zi_splat(P8::from_raw(32768i32), P8::from_raw(32768i32));
     let v247: ZI = zi_add(v245, v246);
-    let v248: ZI = zi_splat(u.c405.0, u.c405.1);
+    let v248: ZI = zi_splat(u.c404.0, u.c404.1);
     let v249: ZI = zsel_i(v242, v247, v248, &mut dp);
     for c0 in 0..2usize {
     let mut dp = dp;
@@ -1216,7 +1171,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v254: ZI = zi_of_zn(v251);
     let v255: ZI = zi_sub(v253, v254);
     let v256: ZI = zsel_i(v242, v255, v250, &mut dp);
-    let v257: ZB = zb_splat(u.c313);
+    let v257: ZB = zb_splat(u.c312);
     let v258: ZB = zb_splat(true);
     let v259: ZB = zsel_b(v242, v257, v258, &mut dp);
     zguard(v259, &mut dp);
@@ -1238,25 +1193,25 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     zguard(v274, &mut dp);
     let v275: ZN = zn_splat(P8::from_raw(0i32));
     let v276: ZB = zn_le(v275, v270);
-    let v277: ZN = zn_splat(u.c403);
-    let v278: ZN = zn_add(r_c317, v277);
+    let v277: ZN = zn_splat(u.c402);
+    let v278: ZN = zn_add(r_c316, v277);
     let v279: ZN = zn_add(v278, v269);
     let v280: ZN = zn_splat(P8::from_raw(0i32));
     let v281: ZN = zn_add(v168, v280);
     let v282: P8 = P8::from_raw(0i32);
-    let v283: ZB = zn_tile_flag_at(g.cache, g.cart, v279, v281, u.c402, u.c401, v282);
+    let v283: ZB = zn_tile_flag_at(g.cache, g.cart, v279, v281, u.c401, u.c400, v282);
     let v284: ZB = zb_splat(true);
     let v285: ZB = zb_splat(true);
     let v286: ZB = zsel_b(v242, v284, v285, &mut dp);
     zguard(v286, &mut dp);
-    let v287: P8 = u.c253 + u.c369;
-    let v288: P8 = v287 + u.c368;
+    let v287: P8 = u.c253 + u.c368;
+    let v288: P8 = v287 + u.c367;
     let v289: ZN = zn_splat(v288);
     let v290: ZB = zn_gt(v289, v279);
     let v291: ZI = zi_splat(v132.0, v132.1);
     let v292: ZI = zi_of_zn(v281);
     let v293: ZB = zi_cmp(Cmp::Gt, v291, v292);
-    let v294: ZN = zn_splat(u.c402);
+    let v294: ZN = zn_splat(u.c401);
     let v295: ZN = zn_add(v278, v294);
     let v296: ZN = zn_add(v295, v269);
     let v297: ZN = zn_splat(v287);
@@ -1270,8 +1225,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v305: ZB = zb_splat(true);
     let v306: ZB = zsel_b(v242, v304, v305, &mut dp);
     zguard(v306, &mut dp);
-    let v307: P8 = u.c273 + u.c379;
-    let v308: P8 = v307 + u.c378;
+    let v307: P8 = u.c272 + u.c378;
+    let v308: P8 = v307 + u.c377;
     let v309: ZN = zn_splat(v308);
     let v310: ZB = zn_gt(v309, v279);
     let v311: ZN = zn_splat(v142);
@@ -1284,8 +1239,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v318: ZB = zb_splat(true);
     let v319: ZB = zsel_b(v242, v317, v318, &mut dp);
     zguard(v319, &mut dp);
-    let v320: P8 = u.c292 + u.c389;
-    let v321: P8 = v320 + u.c388;
+    let v320: P8 = u.c291 + u.c388;
+    let v321: P8 = v320 + u.c387;
     let v322: ZN = zn_splat(v321);
     let v323: ZB = zn_gt(v322, v279);
     let v324: ZN = zn_splat(v155);
@@ -1330,12 +1285,12 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v357: ZB = zsel_b(v276, v356, v276, &mut dp);
     let v358: ZB = zb_not(v356);
     let v359: ZB = zsel_b(v276, v358, v276, &mut dp);
-    let v360: ZN = zn_add(r_c317, v269);
-    let v361: ZN = zsel_n(v357, v360, r_c317, &mut dp);
-    let v362: ZN = zsel_n(v242, v361, r_c317, &mut dp);
+    let v360: ZN = zn_add(r_c316, v269);
+    let v361: ZN = zsel_n(v357, v360, r_c316, &mut dp);
+    let v362: ZN = zsel_n(v242, v361, r_c316, &mut dp);
     let v363: ZN = zn_splat(P8::from_raw(0i32));
-    let v364: ZN = zsel_n(v359, v363, r_c407, &mut dp);
-    let v365: ZN = zsel_n(v242, v364, r_c407, &mut dp);
+    let v364: ZN = zsel_n(v359, v363, r_c406, &mut dp);
+    let v365: ZN = zsel_n(v242, v364, r_c406, &mut dp);
     let v366: ZI = zi_splat(P8::from_raw(0i32), P8::from_raw(0i32));
     let v367: ZI = zsel_i(v359, v366, v256, &mut dp);
     let v368: ZI = zsel_i(v242, v367, v256, &mut dp);
@@ -1346,16 +1301,16 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v373: ZB = zb_splat(true);
     let v374: ZB = zsel_b(v359, v372, v373, &mut dp);
     let v375: ZB = zn_le(v371, v270);
-    let v376: ZN = zn_splat(u.c403);
+    let v376: ZN = zn_splat(u.c402);
     let v377: ZN = zn_add(v362, v376);
     let v378: ZN = zn_add(v377, v269);
     let v379: P8 = P8::from_raw(0i32);
-    let v380: ZB = zn_tile_flag_at(g.cache, g.cart, v378, v281, u.c402, u.c401, v379);
-    let v381: P8 = u.c253 + u.c369;
-    let v382: P8 = v381 + u.c368;
+    let v380: ZB = zn_tile_flag_at(g.cache, g.cart, v378, v281, u.c401, u.c400, v379);
+    let v381: P8 = u.c253 + u.c368;
+    let v382: P8 = v381 + u.c367;
     let v383: ZN = zn_splat(v382);
     let v384: ZB = zn_gt(v383, v378);
-    let v385: ZN = zn_splat(u.c402);
+    let v385: ZN = zn_splat(u.c401);
     let v386: ZN = zn_add(v377, v385);
     let v387: ZN = zn_add(v386, v269);
     let v388: ZN = zn_splat(v381);
@@ -1364,8 +1319,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v391: ZB = zb_splat(true);
     let v392: ZB = zsel_b(v242, v390, v391, &mut dp);
     zguard(v392, &mut dp);
-    let v393: P8 = u.c273 + u.c379;
-    let v394: P8 = v393 + u.c378;
+    let v393: P8 = u.c272 + u.c378;
+    let v394: P8 = v393 + u.c377;
     let v395: ZN = zn_splat(v394);
     let v396: ZB = zn_gt(v395, v378);
     let v397: ZN = zn_splat(v393);
@@ -1374,8 +1329,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v400: ZB = zb_splat(true);
     let v401: ZB = zsel_b(v242, v399, v400, &mut dp);
     zguard(v401, &mut dp);
-    let v402: P8 = u.c292 + u.c389;
-    let v403: P8 = v402 + u.c388;
+    let v402: P8 = u.c291 + u.c388;
+    let v403: P8 = v402 + u.c387;
     let v404: ZN = zn_splat(v403);
     let v405: ZB = zn_gt(v404, v378);
     let v406: ZN = zn_splat(v402);
@@ -1430,16 +1385,16 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v449: ZB = zb_splat(false);
     let v450: ZB = zsel_b(v436, v449, v374, &mut dp);
     let v451: ZB = zn_le(v448, v270);
-    let v452: ZN = zn_splat(u.c403);
+    let v452: ZN = zn_splat(u.c402);
     let v453: ZN = zn_add(v439, v452);
     let v454: ZN = zn_add(v453, v269);
     let v455: P8 = P8::from_raw(0i32);
-    let v456: ZB = zn_tile_flag_at(g.cache, g.cart, v454, v281, u.c402, u.c401, v455);
-    let v457: P8 = u.c253 + u.c369;
-    let v458: P8 = v457 + u.c368;
+    let v456: ZB = zn_tile_flag_at(g.cache, g.cart, v454, v281, u.c401, u.c400, v455);
+    let v457: P8 = u.c253 + u.c368;
+    let v458: P8 = v457 + u.c367;
     let v459: ZN = zn_splat(v458);
     let v460: ZB = zn_gt(v459, v454);
-    let v461: ZN = zn_splat(u.c402);
+    let v461: ZN = zn_splat(u.c401);
     let v462: ZN = zn_add(v453, v461);
     let v463: ZN = zn_add(v462, v269);
     let v464: ZN = zn_splat(v457);
@@ -1448,8 +1403,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v467: ZB = zb_splat(true);
     let v468: ZB = zsel_b(v242, v466, v467, &mut dp);
     zguard(v468, &mut dp);
-    let v469: P8 = u.c273 + u.c379;
-    let v470: P8 = v469 + u.c378;
+    let v469: P8 = u.c272 + u.c378;
+    let v470: P8 = v469 + u.c377;
     let v471: ZN = zn_splat(v470);
     let v472: ZB = zn_gt(v471, v454);
     let v473: ZN = zn_splat(v469);
@@ -1458,8 +1413,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v476: ZB = zb_splat(true);
     let v477: ZB = zsel_b(v242, v475, v476, &mut dp);
     zguard(v477, &mut dp);
-    let v478: P8 = u.c292 + u.c389;
-    let v479: P8 = v478 + u.c388;
+    let v478: P8 = u.c291 + u.c388;
+    let v479: P8 = v478 + u.c387;
     let v480: ZN = zn_splat(v479);
     let v481: ZB = zn_gt(v480, v454);
     let v482: ZN = zn_splat(v478);
@@ -1514,16 +1469,16 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v525: ZB = zb_splat(false);
     let v526: ZB = zsel_b(v512, v525, v450, &mut dp);
     let v527: ZB = zn_le(v524, v270);
-    let v528: ZN = zn_splat(u.c403);
+    let v528: ZN = zn_splat(u.c402);
     let v529: ZN = zn_add(v515, v528);
     let v530: ZN = zn_add(v529, v269);
     let v531: P8 = P8::from_raw(0i32);
-    let v532: ZB = zn_tile_flag_at(g.cache, g.cart, v530, v281, u.c402, u.c401, v531);
-    let v533: P8 = u.c253 + u.c369;
-    let v534: P8 = v533 + u.c368;
+    let v532: ZB = zn_tile_flag_at(g.cache, g.cart, v530, v281, u.c401, u.c400, v531);
+    let v533: P8 = u.c253 + u.c368;
+    let v534: P8 = v533 + u.c367;
     let v535: ZN = zn_splat(v534);
     let v536: ZB = zn_gt(v535, v530);
-    let v537: ZN = zn_splat(u.c402);
+    let v537: ZN = zn_splat(u.c401);
     let v538: ZN = zn_add(v529, v537);
     let v539: ZN = zn_add(v538, v269);
     let v540: ZN = zn_splat(v533);
@@ -1532,8 +1487,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v543: ZB = zb_splat(true);
     let v544: ZB = zsel_b(v242, v542, v543, &mut dp);
     zguard(v544, &mut dp);
-    let v545: P8 = u.c273 + u.c379;
-    let v546: P8 = v545 + u.c378;
+    let v545: P8 = u.c272 + u.c378;
+    let v546: P8 = v545 + u.c377;
     let v547: ZN = zn_splat(v546);
     let v548: ZB = zn_gt(v547, v530);
     let v549: ZN = zn_splat(v545);
@@ -1542,8 +1497,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v552: ZB = zb_splat(true);
     let v553: ZB = zsel_b(v242, v551, v552, &mut dp);
     zguard(v553, &mut dp);
-    let v554: P8 = u.c292 + u.c389;
-    let v555: P8 = v554 + u.c388;
+    let v554: P8 = u.c291 + u.c388;
+    let v555: P8 = v554 + u.c387;
     let v556: ZN = zn_splat(v555);
     let v557: ZB = zn_gt(v556, v530);
     let v558: ZN = zn_splat(v554);
@@ -1598,16 +1553,16 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v601: ZB = zb_splat(false);
     let v602: ZB = zsel_b(v588, v601, v526, &mut dp);
     let v603: ZB = zn_le(v600, v270);
-    let v604: ZN = zn_splat(u.c403);
+    let v604: ZN = zn_splat(u.c402);
     let v605: ZN = zn_add(v591, v604);
     let v606: ZN = zn_add(v605, v269);
     let v607: P8 = P8::from_raw(0i32);
-    let v608: ZB = zn_tile_flag_at(g.cache, g.cart, v606, v281, u.c402, u.c401, v607);
-    let v609: P8 = u.c253 + u.c369;
-    let v610: P8 = v609 + u.c368;
+    let v608: ZB = zn_tile_flag_at(g.cache, g.cart, v606, v281, u.c401, u.c400, v607);
+    let v609: P8 = u.c253 + u.c368;
+    let v610: P8 = v609 + u.c367;
     let v611: ZN = zn_splat(v610);
     let v612: ZB = zn_gt(v611, v606);
-    let v613: ZN = zn_splat(u.c402);
+    let v613: ZN = zn_splat(u.c401);
     let v614: ZN = zn_add(v605, v613);
     let v615: ZN = zn_add(v614, v269);
     let v616: ZN = zn_splat(v609);
@@ -1616,8 +1571,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v619: ZB = zb_splat(true);
     let v620: ZB = zsel_b(v242, v618, v619, &mut dp);
     zguard(v620, &mut dp);
-    let v621: P8 = u.c273 + u.c379;
-    let v622: P8 = v621 + u.c378;
+    let v621: P8 = u.c272 + u.c378;
+    let v622: P8 = v621 + u.c377;
     let v623: ZN = zn_splat(v622);
     let v624: ZB = zn_gt(v623, v606);
     let v625: ZN = zn_splat(v621);
@@ -1626,8 +1581,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v628: ZB = zb_splat(true);
     let v629: ZB = zsel_b(v242, v627, v628, &mut dp);
     zguard(v629, &mut dp);
-    let v630: P8 = u.c292 + u.c389;
-    let v631: P8 = v630 + u.c388;
+    let v630: P8 = u.c291 + u.c388;
+    let v631: P8 = v630 + u.c387;
     let v632: ZN = zn_splat(v631);
     let v633: ZB = zn_gt(v632, v606);
     let v634: ZN = zn_splat(v630);
@@ -1682,16 +1637,16 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v677: ZB = zb_splat(false);
     let v678: ZB = zsel_b(v664, v677, v602, &mut dp);
     let v679: ZB = zn_le(v676, v270);
-    let v680: ZN = zn_splat(u.c403);
+    let v680: ZN = zn_splat(u.c402);
     let v681: ZN = zn_add(v667, v680);
     let v682: ZN = zn_add(v681, v269);
     let v683: P8 = P8::from_raw(0i32);
-    let v684: ZB = zn_tile_flag_at(g.cache, g.cart, v682, v281, u.c402, u.c401, v683);
-    let v685: P8 = u.c253 + u.c369;
-    let v686: P8 = v685 + u.c368;
+    let v684: ZB = zn_tile_flag_at(g.cache, g.cart, v682, v281, u.c401, u.c400, v683);
+    let v685: P8 = u.c253 + u.c368;
+    let v686: P8 = v685 + u.c367;
     let v687: ZN = zn_splat(v686);
     let v688: ZB = zn_gt(v687, v682);
-    let v689: ZN = zn_splat(u.c402);
+    let v689: ZN = zn_splat(u.c401);
     let v690: ZN = zn_add(v681, v689);
     let v691: ZN = zn_add(v690, v269);
     let v692: ZN = zn_splat(v685);
@@ -1700,8 +1655,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v695: ZB = zb_splat(true);
     let v696: ZB = zsel_b(v242, v694, v695, &mut dp);
     zguard(v696, &mut dp);
-    let v697: P8 = u.c273 + u.c379;
-    let v698: P8 = v697 + u.c378;
+    let v697: P8 = u.c272 + u.c378;
+    let v698: P8 = v697 + u.c377;
     let v699: ZN = zn_splat(v698);
     let v700: ZB = zn_gt(v699, v682);
     let v701: ZN = zn_splat(v697);
@@ -1710,8 +1665,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v704: ZB = zb_splat(true);
     let v705: ZB = zsel_b(v242, v703, v704, &mut dp);
     zguard(v705, &mut dp);
-    let v706: P8 = u.c292 + u.c389;
-    let v707: P8 = v706 + u.c388;
+    let v706: P8 = u.c291 + u.c388;
+    let v707: P8 = v706 + u.c387;
     let v708: ZN = zn_splat(v707);
     let v709: ZB = zn_gt(v708, v682);
     let v710: ZN = zn_splat(v706);
@@ -1766,16 +1721,16 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v753: ZB = zb_splat(false);
     let v754: ZB = zsel_b(v740, v753, v678, &mut dp);
     let v755: ZB = zn_le(v752, v270);
-    let v756: ZN = zn_splat(u.c403);
+    let v756: ZN = zn_splat(u.c402);
     let v757: ZN = zn_add(v743, v756);
     let v758: ZN = zn_add(v757, v269);
     let v759: P8 = P8::from_raw(0i32);
-    let v760: ZB = zn_tile_flag_at(g.cache, g.cart, v758, v281, u.c402, u.c401, v759);
-    let v761: P8 = u.c253 + u.c369;
-    let v762: P8 = v761 + u.c368;
+    let v760: ZB = zn_tile_flag_at(g.cache, g.cart, v758, v281, u.c401, u.c400, v759);
+    let v761: P8 = u.c253 + u.c368;
+    let v762: P8 = v761 + u.c367;
     let v763: ZN = zn_splat(v762);
     let v764: ZB = zn_gt(v763, v758);
-    let v765: ZN = zn_splat(u.c402);
+    let v765: ZN = zn_splat(u.c401);
     let v766: ZN = zn_add(v757, v765);
     let v767: ZN = zn_add(v766, v269);
     let v768: ZN = zn_splat(v761);
@@ -1784,8 +1739,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v771: ZB = zb_splat(true);
     let v772: ZB = zsel_b(v242, v770, v771, &mut dp);
     zguard(v772, &mut dp);
-    let v773: P8 = u.c273 + u.c379;
-    let v774: P8 = v773 + u.c378;
+    let v773: P8 = u.c272 + u.c378;
+    let v774: P8 = v773 + u.c377;
     let v775: ZN = zn_splat(v774);
     let v776: ZB = zn_gt(v775, v758);
     let v777: ZN = zn_splat(v773);
@@ -1794,8 +1749,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v780: ZB = zb_splat(true);
     let v781: ZB = zsel_b(v242, v779, v780, &mut dp);
     zguard(v781, &mut dp);
-    let v782: P8 = u.c292 + u.c389;
-    let v783: P8 = v782 + u.c388;
+    let v782: P8 = u.c291 + u.c388;
+    let v783: P8 = v782 + u.c387;
     let v784: ZN = zn_splat(v783);
     let v785: ZB = zn_gt(v784, v758);
     let v786: ZN = zn_splat(v782);
@@ -1850,16 +1805,16 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v829: ZB = zb_splat(false);
     let v830: ZB = zsel_b(v816, v829, v754, &mut dp);
     let v831: ZB = zn_le(v828, v270);
-    let v832: ZN = zn_splat(u.c403);
+    let v832: ZN = zn_splat(u.c402);
     let v833: ZN = zn_add(v819, v832);
     let v834: ZN = zn_add(v833, v269);
     let v835: P8 = P8::from_raw(0i32);
-    let v836: ZB = zn_tile_flag_at(g.cache, g.cart, v834, v281, u.c402, u.c401, v835);
-    let v837: P8 = u.c253 + u.c369;
-    let v838: P8 = v837 + u.c368;
+    let v836: ZB = zn_tile_flag_at(g.cache, g.cart, v834, v281, u.c401, u.c400, v835);
+    let v837: P8 = u.c253 + u.c368;
+    let v838: P8 = v837 + u.c367;
     let v839: ZN = zn_splat(v838);
     let v840: ZB = zn_gt(v839, v834);
-    let v841: ZN = zn_splat(u.c402);
+    let v841: ZN = zn_splat(u.c401);
     let v842: ZN = zn_add(v833, v841);
     let v843: ZN = zn_add(v842, v269);
     let v844: ZN = zn_splat(v837);
@@ -1868,8 +1823,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v847: ZB = zb_splat(true);
     let v848: ZB = zsel_b(v242, v846, v847, &mut dp);
     zguard(v848, &mut dp);
-    let v849: P8 = u.c273 + u.c379;
-    let v850: P8 = v849 + u.c378;
+    let v849: P8 = u.c272 + u.c378;
+    let v850: P8 = v849 + u.c377;
     let v851: ZN = zn_splat(v850);
     let v852: ZB = zn_gt(v851, v834);
     let v853: ZN = zn_splat(v849);
@@ -1878,8 +1833,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v856: ZB = zb_splat(true);
     let v857: ZB = zsel_b(v242, v855, v856, &mut dp);
     zguard(v857, &mut dp);
-    let v858: P8 = u.c292 + u.c389;
-    let v859: P8 = v858 + u.c388;
+    let v858: P8 = u.c291 + u.c388;
+    let v859: P8 = v858 + u.c387;
     let v860: ZN = zn_splat(v859);
     let v861: ZB = zn_gt(v860, v834);
     let v862: ZN = zn_splat(v858);
@@ -1934,16 +1889,16 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v905: ZB = zb_splat(false);
     let v906: ZB = zsel_b(v892, v905, v830, &mut dp);
     let v907: ZB = zn_le(v904, v270);
-    let v908: ZN = zn_splat(u.c403);
+    let v908: ZN = zn_splat(u.c402);
     let v909: ZN = zn_add(v895, v908);
     let v910: ZN = zn_add(v909, v269);
     let v911: P8 = P8::from_raw(0i32);
-    let v912: ZB = zn_tile_flag_at(g.cache, g.cart, v910, v281, u.c402, u.c401, v911);
-    let v913: P8 = u.c253 + u.c369;
-    let v914: P8 = v913 + u.c368;
+    let v912: ZB = zn_tile_flag_at(g.cache, g.cart, v910, v281, u.c401, u.c400, v911);
+    let v913: P8 = u.c253 + u.c368;
+    let v914: P8 = v913 + u.c367;
     let v915: ZN = zn_splat(v914);
     let v916: ZB = zn_gt(v915, v910);
-    let v917: ZN = zn_splat(u.c402);
+    let v917: ZN = zn_splat(u.c401);
     let v918: ZN = zn_add(v909, v917);
     let v919: ZN = zn_add(v918, v269);
     let v920: ZN = zn_splat(v913);
@@ -1952,8 +1907,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v923: ZB = zb_splat(true);
     let v924: ZB = zsel_b(v242, v922, v923, &mut dp);
     zguard(v924, &mut dp);
-    let v925: P8 = u.c273 + u.c379;
-    let v926: P8 = v925 + u.c378;
+    let v925: P8 = u.c272 + u.c378;
+    let v926: P8 = v925 + u.c377;
     let v927: ZN = zn_splat(v926);
     let v928: ZB = zn_gt(v927, v910);
     let v929: ZN = zn_splat(v925);
@@ -1962,8 +1917,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v932: ZB = zb_splat(true);
     let v933: ZB = zsel_b(v242, v931, v932, &mut dp);
     zguard(v933, &mut dp);
-    let v934: P8 = u.c292 + u.c389;
-    let v935: P8 = v934 + u.c388;
+    let v934: P8 = u.c291 + u.c388;
+    let v935: P8 = v934 + u.c387;
     let v936: ZN = zn_splat(v935);
     let v937: ZB = zn_gt(v936, v910);
     let v938: ZN = zn_splat(v934);
@@ -2012,12 +1967,12 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v975: ZI = zi_splat(P8::from_raw(0i32), P8::from_raw(0i32));
     let v976: ZI = zsel_i(v968, v975, v903, &mut dp);
     let v977: ZI = zsel_i(v242, v976, v903, &mut dp);
-    let v978: ZI = zi_splat(u.c406.0, u.c406.1);
-    let v979: ZI = zi_of_zn(r_c408);
+    let v978: ZI = zi_splat(u.c405.0, u.c405.1);
+    let v979: ZI = zi_of_zn(r_c407);
     let v980: ZI = zi_add(v978, v979);
     let v981: ZI = zi_splat(P8::from_raw(32768i32), P8::from_raw(32768i32));
     let v982: ZI = zi_add(v980, v981);
-    let v983: ZI = zi_splat(u.c406.0, u.c406.1);
+    let v983: ZI = zi_splat(u.c405.0, u.c405.1);
     let v984: ZI = zsel_i(v242, v982, v983, &mut dp);
     for c1 in 0..2usize {
     let mut dp = dp;
@@ -2052,32 +2007,32 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v1008: ZB = zn_le(v1007, v1002);
     let v1009: ZN = zn_splat(P8::from_raw(0i32));
     let v1010: ZB = zn_gt(v1001, v1009);
-    let v1011: P8 = u.c253 + u.c369;
-    let v1012: P8 = v1011 + u.c368;
-    let v1013: ZN = zn_splat(u.c403);
+    let v1011: P8 = u.c253 + u.c368;
+    let v1012: P8 = v1011 + u.c367;
+    let v1013: ZN = zn_splat(u.c402);
     let v1014: ZN = zn_add(v971, v1013);
     let v1015: ZN = zn_splat(P8::from_raw(0i32));
     let v1016: ZN = zn_add(v1014, v1015);
     let v1017: ZN = zn_splat(v1012);
     let v1018: ZB = zn_gt(v1017, v1016);
-    let v1019: (P8, P8) = (u.c370, u.c370);
+    let v1019: (P8, P8) = (u.c369, u.c369);
     let v1020: (P8, P8) = si_add(v109, v1019);
-    let v1021: (P8, P8) = (u.c367, u.c367);
+    let v1021: (P8, P8) = (u.c366, u.c366);
     let v1022: (P8, P8) = si_add(v1020, v1021);
-    let v1023: ZN = zn_splat(u.c404);
-    let v1024: ZN = zn_add(r_c318, v1023);
+    let v1023: ZN = zn_splat(u.c403);
+    let v1024: ZN = zn_add(r_c317, v1023);
     let v1025: ZN = zn_splat(P8::from_raw(0i32));
     let v1026: ZN = zn_add(v1024, v1025);
     let v1027: ZI = zi_splat(v1022.0, v1022.1);
     let v1028: ZI = zi_of_zn(v1026);
     let v1029: ZB = zi_cmp(Cmp::Gt, v1027, v1028);
-    let v1030: ZN = zn_splat(u.c402);
+    let v1030: ZN = zn_splat(u.c401);
     let v1031: ZN = zn_add(v1014, v1030);
     let v1032: ZN = zn_splat(P8::from_raw(0i32));
     let v1033: ZN = zn_add(v1031, v1032);
     let v1034: ZN = zn_splat(v1011);
     let v1035: ZB = zn_lt(v1034, v1033);
-    let v1036: ZN = zn_splat(u.c401);
+    let v1036: ZN = zn_splat(u.c400);
     let v1037: ZN = zn_add(v1024, v1036);
     let v1038: ZN = zn_splat(P8::from_raw(0i32));
     let v1039: ZN = zn_add(v1037, v1038);
@@ -2088,12 +2043,12 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v1044: ZB = zb_splat(true);
     let v1045: ZB = zsel_b(v242, v1043, v1044, &mut dp);
     zguard(v1045, &mut dp);
-    let v1046: P8 = u.c273 + u.c379;
-    let v1047: P8 = v1046 + u.c378;
+    let v1046: P8 = u.c272 + u.c378;
+    let v1047: P8 = v1046 + u.c377;
     let v1048: ZN = zn_splat(v1047);
     let v1049: ZB = zn_gt(v1048, v1016);
-    let v1050: P8 = u.c274 + u.c380;
-    let v1051: P8 = v1050 + u.c377;
+    let v1050: P8 = u.c273 + u.c379;
+    let v1051: P8 = v1050 + u.c376;
     let v1052: ZN = zn_splat(v1051);
     let v1053: ZB = zn_gt(v1052, v1026);
     let v1054: ZN = zn_splat(v1046);
@@ -2104,12 +2059,12 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v1059: ZB = zb_splat(true);
     let v1060: ZB = zsel_b(v242, v1058, v1059, &mut dp);
     zguard(v1060, &mut dp);
-    let v1061: P8 = u.c292 + u.c389;
-    let v1062: P8 = v1061 + u.c388;
+    let v1061: P8 = u.c291 + u.c388;
+    let v1062: P8 = v1061 + u.c387;
     let v1063: ZN = zn_splat(v1062);
     let v1064: ZB = zn_gt(v1063, v1016);
-    let v1065: P8 = u.c293 + u.c390;
-    let v1066: P8 = v1065 + u.c387;
+    let v1065: P8 = u.c292 + u.c389;
+    let v1066: P8 = v1065 + u.c386;
     let v1067: ZN = zn_splat(v1066);
     let v1068: ZB = zn_gt(v1067, v1026);
     let v1069: ZN = zn_splat(v1061);
@@ -2167,7 +2122,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v1115: ZB = zb_splat(false);
     let v1116: ZB = zsel_b(v1084, v1115, v1084, &mut dp);
     let v1117: P8 = P8::from_raw(0i32);
-    let v1118: ZB = zn_tile_flag_at(g.cache, g.cart, v1016, v1085, u.c402, u.c401, v1117);
+    let v1118: ZB = zn_tile_flag_at(g.cache, g.cart, v1016, v1085, u.c401, u.c400, v1117);
     let v1119: ZB = zb_splat(true);
     let v1120: ZB = zb_splat(true);
     let v1121: ZB = zsel_b(v242, v1119, v1120, &mut dp);
@@ -2210,12 +2165,12 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v1150: ZB = zsel_b(v1008, v1149, v1008, &mut dp);
     let v1151: ZB = zb_not(v1149);
     let v1152: ZB = zsel_b(v1008, v1151, v1008, &mut dp);
-    let v1153: ZN = zn_add(r_c318, v1001);
-    let v1154: ZN = zsel_n(v1150, v1153, r_c318, &mut dp);
-    let v1155: ZN = zsel_n(v242, v1154, r_c318, &mut dp);
+    let v1153: ZN = zn_add(r_c317, v1001);
+    let v1154: ZN = zsel_n(v1150, v1153, r_c317, &mut dp);
+    let v1155: ZN = zsel_n(v242, v1154, r_c317, &mut dp);
     let v1156: ZN = zn_splat(P8::from_raw(0i32));
-    let v1157: ZN = zsel_n(v1152, v1156, r_c408, &mut dp);
-    let v1158: ZN = zsel_n(v242, v1157, r_c408, &mut dp);
+    let v1157: ZN = zsel_n(v1152, v1156, r_c407, &mut dp);
+    let v1158: ZN = zsel_n(v242, v1157, r_c407, &mut dp);
     let v1159: ZI = zi_splat(P8::from_raw(0i32), P8::from_raw(0i32));
     let v1160: ZI = zsel_i(v1152, v1159, v991, &mut dp);
     let v1161: ZI = zsel_i(v242, v1160, v991, &mut dp);
@@ -2226,18 +2181,18 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v1166: ZB = zb_splat(true);
     let v1167: ZB = zsel_b(v1152, v1165, v1166, &mut dp);
     let v1168: ZB = zn_le(v1164, v1002);
-    let v1169: (P8, P8) = (u.c370, u.c370);
+    let v1169: (P8, P8) = (u.c369, u.c369);
     let v1170: (P8, P8) = si_add(v109, v1169);
-    let v1171: (P8, P8) = (u.c367, u.c367);
+    let v1171: (P8, P8) = (u.c366, u.c366);
     let v1172: (P8, P8) = si_add(v1170, v1171);
-    let v1173: ZN = zn_splat(u.c404);
+    let v1173: ZN = zn_splat(u.c403);
     let v1174: ZN = zn_add(v1155, v1173);
     let v1175: ZN = zn_splat(P8::from_raw(0i32));
     let v1176: ZN = zn_add(v1174, v1175);
     let v1177: ZI = zi_splat(v1172.0, v1172.1);
     let v1178: ZI = zi_of_zn(v1176);
     let v1179: ZB = zi_cmp(Cmp::Gt, v1177, v1178);
-    let v1180: ZN = zn_splat(u.c401);
+    let v1180: ZN = zn_splat(u.c400);
     let v1181: ZN = zn_add(v1174, v1180);
     let v1182: ZN = zn_splat(P8::from_raw(0i32));
     let v1183: ZN = zn_add(v1181, v1182);
@@ -2248,8 +2203,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v1188: ZB = zb_splat(true);
     let v1189: ZB = zsel_b(v242, v1187, v1188, &mut dp);
     zguard(v1189, &mut dp);
-    let v1190: P8 = u.c274 + u.c380;
-    let v1191: P8 = v1190 + u.c377;
+    let v1190: P8 = u.c273 + u.c379;
+    let v1191: P8 = v1190 + u.c376;
     let v1192: ZN = zn_splat(v1191);
     let v1193: ZB = zn_gt(v1192, v1176);
     let v1194: ZN = zn_splat(v1190);
@@ -2258,8 +2213,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v1197: ZB = zb_splat(true);
     let v1198: ZB = zsel_b(v242, v1196, v1197, &mut dp);
     zguard(v1198, &mut dp);
-    let v1199: P8 = u.c293 + u.c390;
-    let v1200: P8 = v1199 + u.c387;
+    let v1199: P8 = u.c292 + u.c389;
+    let v1200: P8 = v1199 + u.c386;
     let v1201: ZN = zn_splat(v1200);
     let v1202: ZB = zn_gt(v1201, v1176);
     let v1203: ZN = zn_splat(v1199);
@@ -2309,7 +2264,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v1242: ZB = zsel_b(v242, v1240, v1241, &mut dp);
     zguard(v1242, &mut dp);
     let v1243: P8 = P8::from_raw(0i32);
-    let v1244: ZB = zn_tile_flag_at(g.cache, g.cart, v1016, v1213, u.c402, u.c401, v1243);
+    let v1244: ZB = zn_tile_flag_at(g.cache, g.cart, v1016, v1213, u.c401, u.c400, v1243);
     let v1245: ZB = zb_splat(true);
     let v1246: ZB = zb_splat(true);
     let v1247: ZB = zsel_b(v242, v1245, v1246, &mut dp);
@@ -2368,18 +2323,18 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v1292: ZB = zb_splat(false);
     let v1293: ZB = zsel_b(v1279, v1292, v1167, &mut dp);
     let v1294: ZB = zn_le(v1291, v1002);
-    let v1295: (P8, P8) = (u.c370, u.c370);
+    let v1295: (P8, P8) = (u.c369, u.c369);
     let v1296: (P8, P8) = si_add(v109, v1295);
-    let v1297: (P8, P8) = (u.c367, u.c367);
+    let v1297: (P8, P8) = (u.c366, u.c366);
     let v1298: (P8, P8) = si_add(v1296, v1297);
-    let v1299: ZN = zn_splat(u.c404);
+    let v1299: ZN = zn_splat(u.c403);
     let v1300: ZN = zn_add(v1282, v1299);
     let v1301: ZN = zn_splat(P8::from_raw(0i32));
     let v1302: ZN = zn_add(v1300, v1301);
     let v1303: ZI = zi_splat(v1298.0, v1298.1);
     let v1304: ZI = zi_of_zn(v1302);
     let v1305: ZB = zi_cmp(Cmp::Gt, v1303, v1304);
-    let v1306: ZN = zn_splat(u.c401);
+    let v1306: ZN = zn_splat(u.c400);
     let v1307: ZN = zn_add(v1300, v1306);
     let v1308: ZN = zn_splat(P8::from_raw(0i32));
     let v1309: ZN = zn_add(v1307, v1308);
@@ -2390,8 +2345,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v1314: ZB = zb_splat(true);
     let v1315: ZB = zsel_b(v242, v1313, v1314, &mut dp);
     zguard(v1315, &mut dp);
-    let v1316: P8 = u.c274 + u.c380;
-    let v1317: P8 = v1316 + u.c377;
+    let v1316: P8 = u.c273 + u.c379;
+    let v1317: P8 = v1316 + u.c376;
     let v1318: ZN = zn_splat(v1317);
     let v1319: ZB = zn_gt(v1318, v1302);
     let v1320: ZN = zn_splat(v1316);
@@ -2400,8 +2355,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v1323: ZB = zb_splat(true);
     let v1324: ZB = zsel_b(v242, v1322, v1323, &mut dp);
     zguard(v1324, &mut dp);
-    let v1325: P8 = u.c293 + u.c390;
-    let v1326: P8 = v1325 + u.c387;
+    let v1325: P8 = u.c292 + u.c389;
+    let v1326: P8 = v1325 + u.c386;
     let v1327: ZN = zn_splat(v1326);
     let v1328: ZB = zn_gt(v1327, v1302);
     let v1329: ZN = zn_splat(v1325);
@@ -2451,7 +2406,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v1368: ZB = zsel_b(v242, v1366, v1367, &mut dp);
     zguard(v1368, &mut dp);
     let v1369: P8 = P8::from_raw(0i32);
-    let v1370: ZB = zn_tile_flag_at(g.cache, g.cart, v1016, v1339, u.c402, u.c401, v1369);
+    let v1370: ZB = zn_tile_flag_at(g.cache, g.cart, v1016, v1339, u.c401, u.c400, v1369);
     let v1371: ZB = zb_splat(true);
     let v1372: ZB = zb_splat(true);
     let v1373: ZB = zsel_b(v242, v1371, v1372, &mut dp);
@@ -2510,18 +2465,18 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v1418: ZB = zb_splat(false);
     let v1419: ZB = zsel_b(v1405, v1418, v1293, &mut dp);
     let v1420: ZB = zn_le(v1417, v1002);
-    let v1421: (P8, P8) = (u.c370, u.c370);
+    let v1421: (P8, P8) = (u.c369, u.c369);
     let v1422: (P8, P8) = si_add(v109, v1421);
-    let v1423: (P8, P8) = (u.c367, u.c367);
+    let v1423: (P8, P8) = (u.c366, u.c366);
     let v1424: (P8, P8) = si_add(v1422, v1423);
-    let v1425: ZN = zn_splat(u.c404);
+    let v1425: ZN = zn_splat(u.c403);
     let v1426: ZN = zn_add(v1408, v1425);
     let v1427: ZN = zn_splat(P8::from_raw(0i32));
     let v1428: ZN = zn_add(v1426, v1427);
     let v1429: ZI = zi_splat(v1424.0, v1424.1);
     let v1430: ZI = zi_of_zn(v1428);
     let v1431: ZB = zi_cmp(Cmp::Gt, v1429, v1430);
-    let v1432: ZN = zn_splat(u.c401);
+    let v1432: ZN = zn_splat(u.c400);
     let v1433: ZN = zn_add(v1426, v1432);
     let v1434: ZN = zn_splat(P8::from_raw(0i32));
     let v1435: ZN = zn_add(v1433, v1434);
@@ -2532,8 +2487,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v1440: ZB = zb_splat(true);
     let v1441: ZB = zsel_b(v242, v1439, v1440, &mut dp);
     zguard(v1441, &mut dp);
-    let v1442: P8 = u.c274 + u.c380;
-    let v1443: P8 = v1442 + u.c377;
+    let v1442: P8 = u.c273 + u.c379;
+    let v1443: P8 = v1442 + u.c376;
     let v1444: ZN = zn_splat(v1443);
     let v1445: ZB = zn_gt(v1444, v1428);
     let v1446: ZN = zn_splat(v1442);
@@ -2542,8 +2497,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v1449: ZB = zb_splat(true);
     let v1450: ZB = zsel_b(v242, v1448, v1449, &mut dp);
     zguard(v1450, &mut dp);
-    let v1451: P8 = u.c293 + u.c390;
-    let v1452: P8 = v1451 + u.c387;
+    let v1451: P8 = u.c292 + u.c389;
+    let v1452: P8 = v1451 + u.c386;
     let v1453: ZN = zn_splat(v1452);
     let v1454: ZB = zn_gt(v1453, v1428);
     let v1455: ZN = zn_splat(v1451);
@@ -2593,7 +2548,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v1494: ZB = zsel_b(v242, v1492, v1493, &mut dp);
     zguard(v1494, &mut dp);
     let v1495: P8 = P8::from_raw(0i32);
-    let v1496: ZB = zn_tile_flag_at(g.cache, g.cart, v1016, v1465, u.c402, u.c401, v1495);
+    let v1496: ZB = zn_tile_flag_at(g.cache, g.cart, v1016, v1465, u.c401, u.c400, v1495);
     let v1497: ZB = zb_splat(true);
     let v1498: ZB = zb_splat(true);
     let v1499: ZB = zsel_b(v242, v1497, v1498, &mut dp);
@@ -2652,18 +2607,18 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v1544: ZB = zb_splat(false);
     let v1545: ZB = zsel_b(v1531, v1544, v1419, &mut dp);
     let v1546: ZB = zn_le(v1543, v1002);
-    let v1547: (P8, P8) = (u.c370, u.c370);
+    let v1547: (P8, P8) = (u.c369, u.c369);
     let v1548: (P8, P8) = si_add(v109, v1547);
-    let v1549: (P8, P8) = (u.c367, u.c367);
+    let v1549: (P8, P8) = (u.c366, u.c366);
     let v1550: (P8, P8) = si_add(v1548, v1549);
-    let v1551: ZN = zn_splat(u.c404);
+    let v1551: ZN = zn_splat(u.c403);
     let v1552: ZN = zn_add(v1534, v1551);
     let v1553: ZN = zn_splat(P8::from_raw(0i32));
     let v1554: ZN = zn_add(v1552, v1553);
     let v1555: ZI = zi_splat(v1550.0, v1550.1);
     let v1556: ZI = zi_of_zn(v1554);
     let v1557: ZB = zi_cmp(Cmp::Gt, v1555, v1556);
-    let v1558: ZN = zn_splat(u.c401);
+    let v1558: ZN = zn_splat(u.c400);
     let v1559: ZN = zn_add(v1552, v1558);
     let v1560: ZN = zn_splat(P8::from_raw(0i32));
     let v1561: ZN = zn_add(v1559, v1560);
@@ -2674,8 +2629,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v1566: ZB = zb_splat(true);
     let v1567: ZB = zsel_b(v242, v1565, v1566, &mut dp);
     zguard(v1567, &mut dp);
-    let v1568: P8 = u.c274 + u.c380;
-    let v1569: P8 = v1568 + u.c377;
+    let v1568: P8 = u.c273 + u.c379;
+    let v1569: P8 = v1568 + u.c376;
     let v1570: ZN = zn_splat(v1569);
     let v1571: ZB = zn_gt(v1570, v1554);
     let v1572: ZN = zn_splat(v1568);
@@ -2684,8 +2639,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v1575: ZB = zb_splat(true);
     let v1576: ZB = zsel_b(v242, v1574, v1575, &mut dp);
     zguard(v1576, &mut dp);
-    let v1577: P8 = u.c293 + u.c390;
-    let v1578: P8 = v1577 + u.c387;
+    let v1577: P8 = u.c292 + u.c389;
+    let v1578: P8 = v1577 + u.c386;
     let v1579: ZN = zn_splat(v1578);
     let v1580: ZB = zn_gt(v1579, v1554);
     let v1581: ZN = zn_splat(v1577);
@@ -2735,7 +2690,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v1620: ZB = zsel_b(v242, v1618, v1619, &mut dp);
     zguard(v1620, &mut dp);
     let v1621: P8 = P8::from_raw(0i32);
-    let v1622: ZB = zn_tile_flag_at(g.cache, g.cart, v1016, v1591, u.c402, u.c401, v1621);
+    let v1622: ZB = zn_tile_flag_at(g.cache, g.cart, v1016, v1591, u.c401, u.c400, v1621);
     let v1623: ZB = zb_splat(true);
     let v1624: ZB = zb_splat(true);
     let v1625: ZB = zsel_b(v242, v1623, v1624, &mut dp);
@@ -2794,18 +2749,18 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v1670: ZB = zb_splat(false);
     let v1671: ZB = zsel_b(v1657, v1670, v1545, &mut dp);
     let v1672: ZB = zn_le(v1669, v1002);
-    let v1673: (P8, P8) = (u.c370, u.c370);
+    let v1673: (P8, P8) = (u.c369, u.c369);
     let v1674: (P8, P8) = si_add(v109, v1673);
-    let v1675: (P8, P8) = (u.c367, u.c367);
+    let v1675: (P8, P8) = (u.c366, u.c366);
     let v1676: (P8, P8) = si_add(v1674, v1675);
-    let v1677: ZN = zn_splat(u.c404);
+    let v1677: ZN = zn_splat(u.c403);
     let v1678: ZN = zn_add(v1660, v1677);
     let v1679: ZN = zn_splat(P8::from_raw(0i32));
     let v1680: ZN = zn_add(v1678, v1679);
     let v1681: ZI = zi_splat(v1676.0, v1676.1);
     let v1682: ZI = zi_of_zn(v1680);
     let v1683: ZB = zi_cmp(Cmp::Gt, v1681, v1682);
-    let v1684: ZN = zn_splat(u.c401);
+    let v1684: ZN = zn_splat(u.c400);
     let v1685: ZN = zn_add(v1678, v1684);
     let v1686: ZN = zn_splat(P8::from_raw(0i32));
     let v1687: ZN = zn_add(v1685, v1686);
@@ -2816,8 +2771,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v1692: ZB = zb_splat(true);
     let v1693: ZB = zsel_b(v242, v1691, v1692, &mut dp);
     zguard(v1693, &mut dp);
-    let v1694: P8 = u.c274 + u.c380;
-    let v1695: P8 = v1694 + u.c377;
+    let v1694: P8 = u.c273 + u.c379;
+    let v1695: P8 = v1694 + u.c376;
     let v1696: ZN = zn_splat(v1695);
     let v1697: ZB = zn_gt(v1696, v1680);
     let v1698: ZN = zn_splat(v1694);
@@ -2826,8 +2781,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v1701: ZB = zb_splat(true);
     let v1702: ZB = zsel_b(v242, v1700, v1701, &mut dp);
     zguard(v1702, &mut dp);
-    let v1703: P8 = u.c293 + u.c390;
-    let v1704: P8 = v1703 + u.c387;
+    let v1703: P8 = u.c292 + u.c389;
+    let v1704: P8 = v1703 + u.c386;
     let v1705: ZN = zn_splat(v1704);
     let v1706: ZB = zn_gt(v1705, v1680);
     let v1707: ZN = zn_splat(v1703);
@@ -2877,7 +2832,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v1746: ZB = zsel_b(v242, v1744, v1745, &mut dp);
     zguard(v1746, &mut dp);
     let v1747: P8 = P8::from_raw(0i32);
-    let v1748: ZB = zn_tile_flag_at(g.cache, g.cart, v1016, v1717, u.c402, u.c401, v1747);
+    let v1748: ZB = zn_tile_flag_at(g.cache, g.cart, v1016, v1717, u.c401, u.c400, v1747);
     let v1749: ZB = zb_splat(true);
     let v1750: ZB = zb_splat(true);
     let v1751: ZB = zsel_b(v242, v1749, v1750, &mut dp);
@@ -2936,18 +2891,18 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v1796: ZB = zb_splat(false);
     let v1797: ZB = zsel_b(v1783, v1796, v1671, &mut dp);
     let v1798: ZB = zn_le(v1795, v1002);
-    let v1799: (P8, P8) = (u.c370, u.c370);
+    let v1799: (P8, P8) = (u.c369, u.c369);
     let v1800: (P8, P8) = si_add(v109, v1799);
-    let v1801: (P8, P8) = (u.c367, u.c367);
+    let v1801: (P8, P8) = (u.c366, u.c366);
     let v1802: (P8, P8) = si_add(v1800, v1801);
-    let v1803: ZN = zn_splat(u.c404);
+    let v1803: ZN = zn_splat(u.c403);
     let v1804: ZN = zn_add(v1786, v1803);
     let v1805: ZN = zn_splat(P8::from_raw(0i32));
     let v1806: ZN = zn_add(v1804, v1805);
     let v1807: ZI = zi_splat(v1802.0, v1802.1);
     let v1808: ZI = zi_of_zn(v1806);
     let v1809: ZB = zi_cmp(Cmp::Gt, v1807, v1808);
-    let v1810: ZN = zn_splat(u.c401);
+    let v1810: ZN = zn_splat(u.c400);
     let v1811: ZN = zn_add(v1804, v1810);
     let v1812: ZN = zn_splat(P8::from_raw(0i32));
     let v1813: ZN = zn_add(v1811, v1812);
@@ -2958,8 +2913,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v1818: ZB = zb_splat(true);
     let v1819: ZB = zsel_b(v242, v1817, v1818, &mut dp);
     zguard(v1819, &mut dp);
-    let v1820: P8 = u.c274 + u.c380;
-    let v1821: P8 = v1820 + u.c377;
+    let v1820: P8 = u.c273 + u.c379;
+    let v1821: P8 = v1820 + u.c376;
     let v1822: ZN = zn_splat(v1821);
     let v1823: ZB = zn_gt(v1822, v1806);
     let v1824: ZN = zn_splat(v1820);
@@ -2968,8 +2923,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v1827: ZB = zb_splat(true);
     let v1828: ZB = zsel_b(v242, v1826, v1827, &mut dp);
     zguard(v1828, &mut dp);
-    let v1829: P8 = u.c293 + u.c390;
-    let v1830: P8 = v1829 + u.c387;
+    let v1829: P8 = u.c292 + u.c389;
+    let v1830: P8 = v1829 + u.c386;
     let v1831: ZN = zn_splat(v1830);
     let v1832: ZB = zn_gt(v1831, v1806);
     let v1833: ZN = zn_splat(v1829);
@@ -3019,7 +2974,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v1872: ZB = zsel_b(v242, v1870, v1871, &mut dp);
     zguard(v1872, &mut dp);
     let v1873: P8 = P8::from_raw(0i32);
-    let v1874: ZB = zn_tile_flag_at(g.cache, g.cart, v1016, v1843, u.c402, u.c401, v1873);
+    let v1874: ZB = zn_tile_flag_at(g.cache, g.cart, v1016, v1843, u.c401, u.c400, v1873);
     let v1875: ZB = zb_splat(true);
     let v1876: ZB = zb_splat(true);
     let v1877: ZB = zsel_b(v242, v1875, v1876, &mut dp);
@@ -3078,18 +3033,18 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v1922: ZB = zb_splat(false);
     let v1923: ZB = zsel_b(v1909, v1922, v1797, &mut dp);
     let v1924: ZB = zn_le(v1921, v1002);
-    let v1925: (P8, P8) = (u.c370, u.c370);
+    let v1925: (P8, P8) = (u.c369, u.c369);
     let v1926: (P8, P8) = si_add(v109, v1925);
-    let v1927: (P8, P8) = (u.c367, u.c367);
+    let v1927: (P8, P8) = (u.c366, u.c366);
     let v1928: (P8, P8) = si_add(v1926, v1927);
-    let v1929: ZN = zn_splat(u.c404);
+    let v1929: ZN = zn_splat(u.c403);
     let v1930: ZN = zn_add(v1912, v1929);
     let v1931: ZN = zn_splat(P8::from_raw(0i32));
     let v1932: ZN = zn_add(v1930, v1931);
     let v1933: ZI = zi_splat(v1928.0, v1928.1);
     let v1934: ZI = zi_of_zn(v1932);
     let v1935: ZB = zi_cmp(Cmp::Gt, v1933, v1934);
-    let v1936: ZN = zn_splat(u.c401);
+    let v1936: ZN = zn_splat(u.c400);
     let v1937: ZN = zn_add(v1930, v1936);
     let v1938: ZN = zn_splat(P8::from_raw(0i32));
     let v1939: ZN = zn_add(v1937, v1938);
@@ -3100,8 +3055,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v1944: ZB = zb_splat(true);
     let v1945: ZB = zsel_b(v242, v1943, v1944, &mut dp);
     zguard(v1945, &mut dp);
-    let v1946: P8 = u.c274 + u.c380;
-    let v1947: P8 = v1946 + u.c377;
+    let v1946: P8 = u.c273 + u.c379;
+    let v1947: P8 = v1946 + u.c376;
     let v1948: ZN = zn_splat(v1947);
     let v1949: ZB = zn_gt(v1948, v1932);
     let v1950: ZN = zn_splat(v1946);
@@ -3110,8 +3065,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v1953: ZB = zb_splat(true);
     let v1954: ZB = zsel_b(v242, v1952, v1953, &mut dp);
     zguard(v1954, &mut dp);
-    let v1955: P8 = u.c293 + u.c390;
-    let v1956: P8 = v1955 + u.c387;
+    let v1955: P8 = u.c292 + u.c389;
+    let v1956: P8 = v1955 + u.c386;
     let v1957: ZN = zn_splat(v1956);
     let v1958: ZB = zn_gt(v1957, v1932);
     let v1959: ZN = zn_splat(v1955);
@@ -3161,7 +3116,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v1998: ZB = zsel_b(v242, v1996, v1997, &mut dp);
     zguard(v1998, &mut dp);
     let v1999: P8 = P8::from_raw(0i32);
-    let v2000: ZB = zn_tile_flag_at(g.cache, g.cart, v1016, v1969, u.c402, u.c401, v1999);
+    let v2000: ZB = zn_tile_flag_at(g.cache, g.cart, v1016, v1969, u.c401, u.c400, v1999);
     let v2001: ZB = zb_splat(true);
     let v2002: ZB = zb_splat(true);
     let v2003: ZB = zsel_b(v242, v2001, v2002, &mut dp);
@@ -3220,18 +3175,18 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v2048: ZB = zb_splat(false);
     let v2049: ZB = zsel_b(v2035, v2048, v1923, &mut dp);
     let v2050: ZB = zn_le(v2047, v1002);
-    let v2051: (P8, P8) = (u.c370, u.c370);
+    let v2051: (P8, P8) = (u.c369, u.c369);
     let v2052: (P8, P8) = si_add(v109, v2051);
-    let v2053: (P8, P8) = (u.c367, u.c367);
+    let v2053: (P8, P8) = (u.c366, u.c366);
     let v2054: (P8, P8) = si_add(v2052, v2053);
-    let v2055: ZN = zn_splat(u.c404);
+    let v2055: ZN = zn_splat(u.c403);
     let v2056: ZN = zn_add(v2038, v2055);
     let v2057: ZN = zn_splat(P8::from_raw(0i32));
     let v2058: ZN = zn_add(v2056, v2057);
     let v2059: ZI = zi_splat(v2054.0, v2054.1);
     let v2060: ZI = zi_of_zn(v2058);
     let v2061: ZB = zi_cmp(Cmp::Gt, v2059, v2060);
-    let v2062: ZN = zn_splat(u.c401);
+    let v2062: ZN = zn_splat(u.c400);
     let v2063: ZN = zn_add(v2056, v2062);
     let v2064: ZN = zn_splat(P8::from_raw(0i32));
     let v2065: ZN = zn_add(v2063, v2064);
@@ -3242,8 +3197,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v2070: ZB = zb_splat(true);
     let v2071: ZB = zsel_b(v242, v2069, v2070, &mut dp);
     zguard(v2071, &mut dp);
-    let v2072: P8 = u.c274 + u.c380;
-    let v2073: P8 = v2072 + u.c377;
+    let v2072: P8 = u.c273 + u.c379;
+    let v2073: P8 = v2072 + u.c376;
     let v2074: ZN = zn_splat(v2073);
     let v2075: ZB = zn_gt(v2074, v2058);
     let v2076: ZN = zn_splat(v2072);
@@ -3252,8 +3207,8 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v2079: ZB = zb_splat(true);
     let v2080: ZB = zsel_b(v242, v2078, v2079, &mut dp);
     zguard(v2080, &mut dp);
-    let v2081: P8 = u.c293 + u.c390;
-    let v2082: P8 = v2081 + u.c387;
+    let v2081: P8 = u.c292 + u.c389;
+    let v2082: P8 = v2081 + u.c386;
     let v2083: ZN = zn_splat(v2082);
     let v2084: ZB = zn_gt(v2083, v2058);
     let v2085: ZN = zn_splat(v2081);
@@ -3303,7 +3258,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v2124: ZB = zsel_b(v242, v2122, v2123, &mut dp);
     zguard(v2124, &mut dp);
     let v2125: P8 = P8::from_raw(0i32);
-    let v2126: ZB = zn_tile_flag_at(g.cache, g.cart, v1016, v2095, u.c402, u.c401, v2125);
+    let v2126: ZB = zn_tile_flag_at(g.cache, g.cart, v1016, v2095, u.c401, u.c400, v2125);
     let v2127: ZB = zb_splat(true);
     let v2128: ZB = zb_splat(true);
     let v2129: ZB = zsel_b(v242, v2127, v2128, &mut dp);
@@ -3374,16 +3329,16 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     if !v2181 { *bd = true; }
     let v2182: P8 = P8::from_raw(65536i32);
     let v2183: P8 = u.c44 + v2182;
-    let v2184: ZN = zn_splat(u.c403);
+    let v2184: ZN = zn_splat(u.c402);
     let v2185: ZN = zn_add(v971, v2184);
-    let v2186: ZN = zn_splat(u.c404);
+    let v2186: ZN = zn_splat(u.c403);
     let v2187: ZN = zn_add(v2164, v2186);
     let v2188: ZN = zn_splat(P8::from_raw(524288i32));
     let v2189: ZN = zn_div(v2185, v2188);
     let v2190: ZN = zn_flr(v2189);
     let v2191: ZN = zn_splat(P8::from_raw(0i32));
     let v2192: ZN = zn_max(v2191, v2190);
-    let v2193: ZN = zn_splat(u.c402);
+    let v2193: ZN = zn_splat(u.c401);
     let v2194: ZN = zn_add(v2185, v2193);
     let v2195: ZN = zn_splat(P8::from_raw(65536i32));
     let v2196: ZN = zn_sub(v2194, v2195);
@@ -3404,7 +3359,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v2209: ZN = zn_flr(v2208);
     let v2210: ZN = zn_splat(P8::from_raw(0i32));
     let v2211: ZN = zn_max(v2210, v2209);
-    let v2212: ZN = zn_splat(u.c401);
+    let v2212: ZN = zn_splat(u.c400);
     let v2213: ZN = zn_add(v2187, v2212);
     let v2214: ZN = zn_splat(P8::from_raw(65536i32));
     let v2215: ZN = zn_sub(v2213, v2214);
@@ -3641,15 +3596,15 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v2441: ZB = zn_gt(v2164, v2440);
     let v2442: ZB = zb_not(v2441);
     zguard(v2442, &mut dp);
-    let v2443: P8 = u.c253 + u.c369;
-    let v2444: P8 = v2443 + u.c368;
+    let v2443: P8 = u.c253 + u.c368;
+    let v2444: P8 = v2443 + u.c367;
     let v2445: ZN = zn_splat(P8::from_raw(0i32));
     let v2446: ZN = zn_add(v2185, v2445);
     let v2447: ZN = zn_splat(v2444);
     let v2448: ZB = zn_gt(v2447, v2446);
-    let v2449: (P8, P8) = (u.c370, u.c370);
+    let v2449: (P8, P8) = (u.c369, u.c369);
     let v2450: (P8, P8) = si_add(v109, v2449);
-    let v2451: (P8, P8) = (u.c367, u.c367);
+    let v2451: (P8, P8) = (u.c366, u.c366);
     let v2452: (P8, P8) = si_add(v2450, v2451);
     let v2453: ZN = zn_splat(P8::from_raw(0i32));
     let v2454: ZN = zn_add(v2187, v2453);
@@ -3665,38 +3620,38 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v2464: ZI = zi_splat(v2450.0, v2450.1);
     let v2465: ZI = zi_of_zn(v2463);
     let v2466: ZB = zi_cmp(Cmp::Lt, v2464, v2465);
-    let v2467: P8 = u.c273 + u.c379;
-    let v2468: P8 = v2467 + u.c378;
+    let v2467: P8 = u.c272 + u.c378;
+    let v2468: P8 = v2467 + u.c377;
     let v2469: ZN = zn_splat(v2468);
     let v2470: ZB = zn_gt(v2469, v2446);
-    let v2471: P8 = u.c274 + u.c380;
-    let v2472: P8 = v2471 + u.c377;
+    let v2471: P8 = u.c273 + u.c379;
+    let v2472: P8 = v2471 + u.c376;
     let v2473: ZN = zn_splat(v2472);
     let v2474: ZB = zn_gt(v2473, v2454);
     let v2475: ZN = zn_splat(v2467);
     let v2476: ZB = zn_lt(v2475, v2459);
     let v2477: ZN = zn_splat(v2471);
     let v2478: ZB = zn_lt(v2477, v2463);
-    let v2479: P8 = u.c292 + u.c389;
-    let v2480: P8 = v2479 + u.c388;
+    let v2479: P8 = u.c291 + u.c388;
+    let v2480: P8 = v2479 + u.c387;
     let v2481: ZN = zn_splat(v2480);
     let v2482: ZB = zn_gt(v2481, v2446);
-    let v2483: P8 = u.c293 + u.c390;
-    let v2484: P8 = v2483 + u.c387;
+    let v2483: P8 = u.c292 + u.c389;
+    let v2484: P8 = v2483 + u.c386;
     let v2485: ZN = zn_splat(v2484);
     let v2486: ZB = zn_gt(v2485, v2454);
     let v2487: ZN = zn_splat(v2479);
     let v2488: ZB = zn_lt(v2487, v2459);
     let v2489: ZN = zn_splat(v2483);
     let v2490: ZB = zn_lt(v2489, v2463);
-    let v2491: ZN = zn_splat(u.c403);
+    let v2491: ZN = zn_splat(u.c402);
     let v2492: ZN = zn_add(v971, v2491);
-    let v2493: ZN = zn_splat(u.c402);
+    let v2493: ZN = zn_splat(u.c401);
     let v2494: ZN = zn_add(v2492, v2493);
     let v2495: ZB = zn_gt(v2494, v2446);
-    let v2496: ZN = zn_splat(u.c404);
+    let v2496: ZN = zn_splat(u.c403);
     let v2497: ZN = zn_add(v2164, v2496);
-    let v2498: ZN = zn_splat(u.c401);
+    let v2498: ZN = zn_splat(u.c400);
     let v2499: ZN = zn_add(v2497, v2498);
     let v2500: ZB = zn_gt(v2499, v2454);
     let v2501: ZB = zn_lt(v2492, v2459);
@@ -3722,13 +3677,13 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let v2521: ZB = zn_gt(v2499, v2504);
     let v2522: ZB = zn_lt(v2497, v2509);
     let v2523: P8 = P8::from_raw(0i32);
-    let v2524: ZB = zn_tile_flag_at(g.cache, g.cart, v2446, v2504, u.c402, u.c401, v2523);
+    let v2524: ZB = zn_tile_flag_at(g.cache, g.cart, v2446, v2504, u.c401, u.c400, v2523);
     let v2525: ZB = zb_splat(false);
     let v2526: ZB = zsel_b(v2524, v2524, v2525, &mut dp);
     let v2527: ZB = zb_splat(false);
     let v2528: ZB = zsel_b(v2526, v2526, v2527, &mut dp);
     let v2529: P8 = P8::from_raw(262144i32);
-    let v2530: ZB = zn_tile_flag_at(g.cache, g.cart, v2446, v2504, u.c402, u.c401, v2529);
+    let v2530: ZB = zn_tile_flag_at(g.cache, g.cart, v2446, v2504, u.c401, u.c400, v2529);
     let v2531: P8 = P8::from_raw(0i32);
     let v2532: bool = u.c48 >= v2531;
     if !v2532 { *bd = true; }
@@ -3745,36 +3700,36 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     if !v2540 { *bd = true; }
     let v2541: P8 = P8::from_raw(65536i32);
     let v2542: P8 = u.c49 + v2541;
-    let v2543: bool = u.c301 < u.c88;
-    let v2544: P8 = if v2543 { u.c88 } else { u.c301 };
+    let v2543: bool = u.c300 < u.c88;
+    let v2544: P8 = if v2543 { u.c88 } else { u.c300 };
     let v2545: ZN = zn_splat(P8::from_raw(0i32));
-    let v2546: ZB = zn_gt(r_c303, v2545);
+    let v2546: ZB = zn_gt(r_c302, v2545);
     let v2547: ZN = zn_splat(P8::from_raw(65536i32));
-    let v2548: ZN = zn_sub(r_c303, v2547);
-    let v2549: ZN = zsel_n(v2546, v2548, r_c303, &mut dp);
+    let v2548: ZN = zn_sub(r_c302, v2547);
+    let v2549: ZN = zsel_n(v2546, v2548, r_c302, &mut dp);
     let v2550: ZN = zn_splat(P8::from_raw(393216i32));
     let v2551: ZN = zsel_n(v2528, v2550, v2549, &mut dp);
     let v2552: ZN = zn_splat(v2544);
-    let v2553: ZN = zn_splat(u.c301);
+    let v2553: ZN = zn_splat(u.c300);
     let v2554: ZN = zsel_n(v2528, v2552, v2553, &mut dp);
     let v2555: ZN = zn_splat(P8::from_raw(65536i32));
-    let v2556: ZN = zn_sub(r_c298, v2555);
+    let v2556: ZN = zn_sub(r_c297, v2555);
     let v2557: P8 = P8::from_raw(0i32);
-    let v2558: bool = u.c300 > v2557;
+    let v2558: bool = u.c299 > v2557;
     if !v2558 { *bd = true; }
     let v2559: P8 = P8::from_raw(65536i32);
-    let v2560: P8 = u.c300 - v2559;
-    let v2561: ZB = zn_gt(v974, r_c397);
-    let v2562: ZN = zn_sub(v974, r_c395);
-    let v2563: ZN = zn_max(v2562, r_c397);
-    let v2564: ZN = zn_add(v974, r_c395);
-    let v2565: ZN = zn_min(v2564, r_c397);
+    let v2560: P8 = u.c299 - v2559;
+    let v2561: ZB = zn_gt(v974, r_c396);
+    let v2562: ZN = zn_sub(v974, r_c394);
+    let v2563: ZN = zn_max(v2562, r_c396);
+    let v2564: ZN = zn_add(v974, r_c394);
+    let v2565: ZN = zn_min(v2564, r_c396);
     let v2566: ZN = zsel_n(v2561, v2563, v2565, &mut dp);
-    let v2567: ZB = zn_gt(v2167, r_c398);
-    let v2568: ZN = zn_sub(v2167, r_c396);
-    let v2569: ZN = zn_max(v2568, r_c398);
-    let v2570: ZN = zn_add(v2167, r_c396);
-    let v2571: ZN = zn_min(v2570, r_c398);
+    let v2567: ZB = zn_gt(v2167, r_c397);
+    let v2568: ZN = zn_sub(v2167, r_c395);
+    let v2569: ZN = zn_max(v2568, r_c397);
+    let v2570: ZN = zn_add(v2167, r_c395);
+    let v2571: ZN = zn_min(v2570, r_c397);
     let v2572: ZN = zsel_n(v2567, v2569, v2571, &mut dp);
     let v2573: ZN = zn_splat(P8::from_raw(-262144i32));
     let v2574: ZB = zn_lt(v2164, v2573);
@@ -3827,16 +3782,16 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
         c85: v18,
         c246: v102,
         c254: v109,
-        c298: v2556,
-        c300: v2560,
-        c301: v2554,
-        c303: v2551,
-        c317: v2596,
-        c318: v2164,
-        c405: v977,
-        c406: v2170,
-        c407: v2595,
-        c408: v2572,
+        c297: v2556,
+        c299: v2560,
+        c300: v2554,
+        c302: v2551,
+        c316: v2596,
+        c317: v2164,
+        c404: v977,
+        c405: v2170,
+        c406: v2595,
+        c407: v2572,
     };
     // suffix observes button bits [4, 5]: 4 distinct variant(s)
     suffix::<0>(u, g, &p, &osh, out);
@@ -3876,7 +3831,7 @@ fn suffix<const B: u8>(u: &Uni, g: &G, p: &Pre, osh: &KOutShared, out: &mut impl
         valid: p.valid,
         deopt: dp,
         bd: *bd,
-        c310: kb5,
-        c311: kb4,
+        c309: kb5,
+        c310: kb4,
     });
 }

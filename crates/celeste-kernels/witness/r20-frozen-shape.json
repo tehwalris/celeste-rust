@@ -594,7 +594,7 @@
         "update": 157
       },
       "k": "obj",
-      "name": "objects.4.type"
+      "name": "player"
     },
     {
       "fields": {
@@ -748,7 +748,7 @@
         "update": 175
       },
       "k": "obj",
-      "name": "objects.2.type"
+      "name": "spring"
     },
     {
       "caps": 0,
@@ -1012,21 +1012,21 @@
         "ptr": 211
       },
       "k": "val",
-      "name": "objects.4.type.draw"
+      "name": "player.draw"
     },
     {
       "content": {
         "ptr": 212
       },
       "k": "val",
-      "name": "objects.4.type.init"
+      "name": "player.init"
     },
     {
       "content": {
         "ptr": 213
       },
       "k": "val",
-      "name": "objects.4.type.update"
+      "name": "player.update"
     },
     {
       "content": {
@@ -1135,12 +1135,12 @@
         "ptr": 216
       },
       "k": "val",
-      "name": "objects.2.type.init"
+      "name": "spring.init"
     },
     {
       "content": "num",
       "k": "val",
-      "name": "objects.2.type.tile",
+      "name": "spring.tile",
       "val": 1179648
     },
     {
@@ -1148,7 +1148,7 @@
         "ptr": 217
       },
       "k": "val",
-      "name": "objects.2.type.update"
+      "name": "spring.update"
     },
     {
       "content": {
@@ -1379,79 +1379,78 @@
         "check": 255,
         "collide": 256,
         "collideable": 257,
-        "delay": 258,
-        "flip": 259,
-        "hide_for": 260,
-        "hide_in": 261,
-        "hitbox": 262,
-        "is_ice": 263,
-        "is_solid": 264,
-        "move": 265,
-        "move_x": 266,
-        "move_y": 267,
-        "rem": 268,
-        "solids": 269,
-        "spd": 270,
-        "spr": 271,
-        "type": 272,
-        "x": 273,
-        "y": 274
+        "flip": 258,
+        "hide_for": 259,
+        "hide_in": 260,
+        "hitbox": 261,
+        "is_ice": 262,
+        "is_solid": 263,
+        "move": 264,
+        "move_x": 265,
+        "move_y": 266,
+        "rem": 267,
+        "solids": 268,
+        "spd": 269,
+        "spr": 270,
+        "type": 271,
+        "x": 272,
+        "y": 273
       },
       "k": "obj",
       "name": "objects.2"
     },
     {
       "fields": {
-        "check": 275,
-        "collide": 276,
-        "collideable": 277,
-        "flip": 278,
-        "hide_for": 279,
-        "hide_in": 280,
-        "hitbox": 281,
-        "is_ice": 282,
-        "is_solid": 283,
-        "move": 284,
-        "move_x": 285,
-        "move_y": 286,
-        "rem": 287,
-        "solids": 288,
-        "spd": 289,
-        "spr": 290,
-        "type": 291,
-        "x": 292,
-        "y": 293
+        "check": 274,
+        "collide": 275,
+        "collideable": 276,
+        "flip": 277,
+        "hide_for": 278,
+        "hide_in": 279,
+        "hitbox": 280,
+        "is_ice": 281,
+        "is_solid": 282,
+        "move": 283,
+        "move_x": 284,
+        "move_y": 285,
+        "rem": 286,
+        "solids": 287,
+        "spd": 288,
+        "spr": 289,
+        "type": 290,
+        "x": 291,
+        "y": 292
       },
       "k": "obj",
       "name": "objects.3"
     },
     {
       "fields": {
-        "check": 294,
-        "collide": 295,
-        "collideable": 296,
-        "dash_accel": 297,
-        "dash_effect_time": 298,
-        "dash_target": 299,
-        "dash_time": 300,
-        "djump": 301,
-        "flip": 302,
-        "grace": 303,
-        "hitbox": 304,
-        "is_ice": 305,
-        "is_solid": 306,
-        "move": 307,
-        "move_x": 308,
-        "move_y": 309,
-        "p_dash": 310,
-        "p_jump": 311,
-        "rem": 312,
-        "solids": 313,
-        "spd": 314,
-        "spr": 315,
-        "type": 316,
-        "x": 317,
-        "y": 318
+        "check": 293,
+        "collide": 294,
+        "collideable": 295,
+        "dash_accel": 296,
+        "dash_effect_time": 297,
+        "dash_target": 298,
+        "dash_time": 299,
+        "djump": 300,
+        "flip": 301,
+        "grace": 302,
+        "hitbox": 303,
+        "is_ice": 304,
+        "is_solid": 305,
+        "move": 306,
+        "move_x": 307,
+        "move_y": 308,
+        "p_dash": 309,
+        "p_jump": 310,
+        "rem": 311,
+        "solids": 312,
+        "spd": 313,
+        "spr": 314,
+        "type": 315,
+        "x": 316,
+        "y": 317
       },
       "k": "obj",
       "name": "objects.4"
@@ -1460,19 +1459,19 @@
       "caps": 0,
       "fn": "player.draw_22",
       "k": "clo",
-      "name": "objects.4.type.draw"
+      "name": "player.draw"
     },
     {
       "caps": 0,
       "fn": "player.init_20",
       "k": "clo",
-      "name": "objects.4.type.init"
+      "name": "player.init"
     },
     {
       "caps": 0,
       "fn": "player.update_21",
       "k": "clo",
-      "name": "objects.4.type.update"
+      "name": "player.update"
     },
     {
       "caps": 0,
@@ -1490,13 +1489,13 @@
       "caps": 0,
       "fn": "spring.init_25",
       "k": "clo",
-      "name": "objects.2.type.init"
+      "name": "spring.init"
     },
     {
       "caps": 0,
       "fn": "spring.update_26",
       "k": "clo",
-      "name": "objects.2.type.update"
+      "name": "spring.update"
     },
     {
       "caps": 0,
@@ -1608,14 +1607,14 @@
     },
     {
       "content": {
-        "ptr": 319
+        "ptr": 318
       },
       "k": "val",
       "name": "objects.1.check"
     },
     {
       "content": {
-        "ptr": 320
+        "ptr": 319
       },
       "k": "val",
       "name": "objects.1.collide"
@@ -1627,49 +1626,49 @@
     },
     {
       "content": {
-        "ptr": 321
+        "ptr": 320
       },
       "k": "val",
       "name": "objects.1.flip"
     },
     {
       "content": {
-        "ptr": 322
+        "ptr": 321
       },
       "k": "val",
       "name": "objects.1.hitbox"
     },
     {
       "content": {
-        "ptr": 323
+        "ptr": 322
       },
       "k": "val",
       "name": "objects.1.is_ice"
     },
     {
       "content": {
-        "ptr": 324
+        "ptr": 323
       },
       "k": "val",
       "name": "objects.1.is_solid"
     },
     {
       "content": {
-        "ptr": 325
+        "ptr": 324
       },
       "k": "val",
       "name": "objects.1.move"
     },
     {
       "content": {
-        "ptr": 326
+        "ptr": 325
       },
       "k": "val",
       "name": "objects.1.move_x"
     },
     {
       "content": {
-        "ptr": 327
+        "ptr": 326
       },
       "k": "val",
       "name": "objects.1.move_y"
@@ -1681,7 +1680,7 @@
     },
     {
       "content": {
-        "ptr": 328
+        "ptr": 327
       },
       "k": "val",
       "name": "objects.1.rem"
@@ -1693,7 +1692,7 @@
     },
     {
       "content": {
-        "ptr": 329
+        "ptr": 328
       },
       "k": "val",
       "name": "objects.1.spd"
@@ -1730,14 +1729,14 @@
     },
     {
       "content": {
-        "ptr": 330
+        "ptr": 329
       },
       "k": "val",
       "name": "objects.2.check"
     },
     {
       "content": {
-        "ptr": 331
+        "ptr": 330
       },
       "k": "val",
       "name": "objects.2.collide"
@@ -1748,14 +1747,8 @@
       "name": "objects.2.collideable"
     },
     {
-      "content": "num",
-      "k": "val",
-      "name": "objects.2.delay",
-      "vary": true
-    },
-    {
       "content": {
-        "ptr": 332
+        "ptr": 331
       },
       "k": "val",
       "name": "objects.2.flip"
@@ -1774,49 +1767,49 @@
     },
     {
       "content": {
-        "ptr": 333
+        "ptr": 332
       },
       "k": "val",
       "name": "objects.2.hitbox"
     },
     {
       "content": {
-        "ptr": 334
+        "ptr": 333
       },
       "k": "val",
       "name": "objects.2.is_ice"
     },
     {
       "content": {
-        "ptr": 335
+        "ptr": 334
       },
       "k": "val",
       "name": "objects.2.is_solid"
     },
     {
       "content": {
-        "ptr": 336
+        "ptr": 335
       },
       "k": "val",
       "name": "objects.2.move"
     },
     {
       "content": {
-        "ptr": 337
+        "ptr": 336
       },
       "k": "val",
       "name": "objects.2.move_x"
     },
     {
       "content": {
-        "ptr": 338
+        "ptr": 337
       },
       "k": "val",
       "name": "objects.2.move_y"
     },
     {
       "content": {
-        "ptr": 339
+        "ptr": 338
       },
       "k": "val",
       "name": "objects.2.rem"
@@ -1828,7 +1821,7 @@
     },
     {
       "content": {
-        "ptr": 340
+        "ptr": 339
       },
       "k": "val",
       "name": "objects.2.spd"
@@ -1837,7 +1830,7 @@
       "content": "num",
       "k": "val",
       "name": "objects.2.spr",
-      "vary": true
+      "val": 1179648
     },
     {
       "content": {
@@ -1860,14 +1853,14 @@
     },
     {
       "content": {
-        "ptr": 341
+        "ptr": 340
       },
       "k": "val",
       "name": "objects.3.check"
     },
     {
       "content": {
-        "ptr": 342
+        "ptr": 341
       },
       "k": "val",
       "name": "objects.3.collide"
@@ -1879,7 +1872,7 @@
     },
     {
       "content": {
-        "ptr": 343
+        "ptr": 342
       },
       "k": "val",
       "name": "objects.3.flip"
@@ -1898,49 +1891,49 @@
     },
     {
       "content": {
-        "ptr": 344
+        "ptr": 343
       },
       "k": "val",
       "name": "objects.3.hitbox"
     },
     {
       "content": {
-        "ptr": 345
+        "ptr": 344
       },
       "k": "val",
       "name": "objects.3.is_ice"
     },
     {
       "content": {
-        "ptr": 346
+        "ptr": 345
       },
       "k": "val",
       "name": "objects.3.is_solid"
     },
     {
       "content": {
-        "ptr": 347
+        "ptr": 346
       },
       "k": "val",
       "name": "objects.3.move"
     },
     {
       "content": {
-        "ptr": 348
+        "ptr": 347
       },
       "k": "val",
       "name": "objects.3.move_x"
     },
     {
       "content": {
-        "ptr": 349
+        "ptr": 348
       },
       "k": "val",
       "name": "objects.3.move_y"
     },
     {
       "content": {
-        "ptr": 350
+        "ptr": 349
       },
       "k": "val",
       "name": "objects.3.rem"
@@ -1952,7 +1945,7 @@
     },
     {
       "content": {
-        "ptr": 351
+        "ptr": 350
       },
       "k": "val",
       "name": "objects.3.spd"
@@ -1984,14 +1977,14 @@
     },
     {
       "content": {
-        "ptr": 352
+        "ptr": 351
       },
       "k": "val",
       "name": "objects.4.check"
     },
     {
       "content": {
-        "ptr": 353
+        "ptr": 352
       },
       "k": "val",
       "name": "objects.4.collide"
@@ -2003,7 +1996,7 @@
     },
     {
       "content": {
-        "ptr": 354
+        "ptr": 353
       },
       "k": "val",
       "name": "objects.4.dash_accel"
@@ -2016,7 +2009,7 @@
     },
     {
       "content": {
-        "ptr": 355
+        "ptr": 354
       },
       "k": "val",
       "name": "objects.4.dash_target"
@@ -2024,18 +2017,16 @@
     {
       "content": "num",
       "k": "val",
-      "name": "objects.4.dash_time",
-      "val": 262144
+      "name": "objects.4.dash_time"
     },
     {
       "content": "num",
       "k": "val",
-      "name": "objects.4.djump",
-      "val": 0
+      "name": "objects.4.djump"
     },
     {
       "content": {
-        "ptr": 356
+        "ptr": 355
       },
       "k": "val",
       "name": "objects.4.flip"
@@ -2048,42 +2039,42 @@
     },
     {
       "content": {
-        "ptr": 357
+        "ptr": 356
       },
       "k": "val",
       "name": "objects.4.hitbox"
     },
     {
       "content": {
-        "ptr": 358
+        "ptr": 357
       },
       "k": "val",
       "name": "objects.4.is_ice"
     },
     {
       "content": {
-        "ptr": 359
+        "ptr": 358
       },
       "k": "val",
       "name": "objects.4.is_solid"
     },
     {
       "content": {
-        "ptr": 360
+        "ptr": 359
       },
       "k": "val",
       "name": "objects.4.move"
     },
     {
       "content": {
-        "ptr": 361
+        "ptr": 360
       },
       "k": "val",
       "name": "objects.4.move_x"
     },
     {
       "content": {
-        "ptr": 362
+        "ptr": 361
       },
       "k": "val",
       "name": "objects.4.move_y"
@@ -2100,7 +2091,7 @@
     },
     {
       "content": {
-        "ptr": 363
+        "ptr": 362
       },
       "k": "val",
       "name": "objects.4.rem"
@@ -2112,7 +2103,7 @@
     },
     {
       "content": {
-        "ptr": 364
+        "ptr": 363
       },
       "k": "val",
       "name": "objects.4.spd"
@@ -2155,18 +2146,18 @@
     },
     {
       "fields": {
-        "x": 365,
-        "y": 366
+        "x": 364,
+        "y": 365
       },
       "k": "obj",
       "name": "objects.1.flip"
     },
     {
       "fields": {
-        "h": 367,
-        "w": 368,
-        "x": 369,
-        "y": 370
+        "h": 366,
+        "w": 367,
+        "x": 368,
+        "y": 369
       },
       "k": "obj",
       "name": "objects.1.hitbox"
@@ -2203,16 +2194,16 @@
     },
     {
       "fields": {
-        "x": 371,
-        "y": 372
+        "x": 370,
+        "y": 371
       },
       "k": "obj",
       "name": "objects.1.rem"
     },
     {
       "fields": {
-        "x": 373,
-        "y": 374
+        "x": 372,
+        "y": 373
       },
       "k": "obj",
       "name": "objects.1.spd"
@@ -2231,18 +2222,18 @@
     },
     {
       "fields": {
-        "x": 375,
-        "y": 376
+        "x": 374,
+        "y": 375
       },
       "k": "obj",
       "name": "objects.2.flip"
     },
     {
       "fields": {
-        "h": 377,
-        "w": 378,
-        "x": 379,
-        "y": 380
+        "h": 376,
+        "w": 377,
+        "x": 378,
+        "y": 379
       },
       "k": "obj",
       "name": "objects.2.hitbox"
@@ -2279,16 +2270,16 @@
     },
     {
       "fields": {
-        "x": 381,
-        "y": 382
+        "x": 380,
+        "y": 381
       },
       "k": "obj",
       "name": "objects.2.rem"
     },
     {
       "fields": {
-        "x": 383,
-        "y": 384
+        "x": 382,
+        "y": 383
       },
       "k": "obj",
       "name": "objects.2.spd"
@@ -2307,18 +2298,18 @@
     },
     {
       "fields": {
-        "x": 385,
-        "y": 386
+        "x": 384,
+        "y": 385
       },
       "k": "obj",
       "name": "objects.3.flip"
     },
     {
       "fields": {
-        "h": 387,
-        "w": 388,
-        "x": 389,
-        "y": 390
+        "h": 386,
+        "w": 387,
+        "x": 388,
+        "y": 389
       },
       "k": "obj",
       "name": "objects.3.hitbox"
@@ -2355,16 +2346,16 @@
     },
     {
       "fields": {
-        "x": 391,
-        "y": 392
+        "x": 390,
+        "y": 391
       },
       "k": "obj",
       "name": "objects.3.rem"
     },
     {
       "fields": {
-        "x": 393,
-        "y": 394
+        "x": 392,
+        "y": 393
       },
       "k": "obj",
       "name": "objects.3.spd"
@@ -2383,34 +2374,34 @@
     },
     {
       "fields": {
-        "x": 395,
-        "y": 396
+        "x": 394,
+        "y": 395
       },
       "k": "obj",
       "name": "objects.4.dash_accel"
     },
     {
       "fields": {
-        "x": 397,
-        "y": 398
+        "x": 396,
+        "y": 397
       },
       "k": "obj",
       "name": "objects.4.dash_target"
     },
     {
       "fields": {
-        "x": 399,
-        "y": 400
+        "x": 398,
+        "y": 399
       },
       "k": "obj",
       "name": "objects.4.flip"
     },
     {
       "fields": {
-        "h": 401,
-        "w": 402,
-        "x": 403,
-        "y": 404
+        "h": 400,
+        "w": 401,
+        "x": 402,
+        "y": 403
       },
       "k": "obj",
       "name": "objects.4.hitbox"
@@ -2447,16 +2438,16 @@
     },
     {
       "fields": {
-        "x": 405,
-        "y": 406
+        "x": 404,
+        "y": 405
       },
       "k": "obj",
       "name": "objects.4.rem"
     },
     {
       "fields": {
-        "x": 407,
-        "y": 408
+        "x": 406,
+        "y": 407
       },
       "k": "obj",
       "name": "objects.4.spd"
@@ -2717,7 +2708,8 @@
       "vary": true
     }
   ],
-  "frame": 50,
+  "engine_chunk_lanes": 515409,
+  "frame": 0,
   "globals": {
     "__array_table_drop_last": 4,
     "__assert": 24,
@@ -2809,6 +2801,6 @@
     "types": 37,
     "will_restart": 38
   },
-  "shape_hash": "681d925d9110f730",
-  "steady_blocks": 4
+  "shape_hash": "a9e20c0af79aea86",
+  "steady_blocks": 293
 }

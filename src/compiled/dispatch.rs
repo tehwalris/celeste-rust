@@ -89,7 +89,306 @@ pub(crate) fn run_chunk_kernel(
         *miss.entry((chunk.shape_hash, same_shape.join("/"))).or_insert(0u64) +=
             chunk.width as u64;
     }
+    if miss_dump_dir().is_some() {
+        record_miss_dump(chunk);
+    }
     false
+}
+
+// ---------------------------------------------------------------------------
+// Dump-on-miss witness collection (CELESTE_KERNEL_MISS_DUMP=DIR).
+//
+// The r20 binding gap (task #173): witnesses emitted from interpreter-saved
+// reference frames disagree with what the engine actually materializes -
+// column KINDS differ per cell (the #170 fruit widening makes interval-kind
+// columns dominant engine-side while the saved frames lean num-kind), so a
+// reference-frame witness produces a kernel that binds zero engine chunks.
+// The fix is to emit witnesses FROM ENGINE CHUNKS: with the env var set,
+// every chunk all kernels refuse is folded into a per-shape-hash aggregate,
+// and `print_kernel_hits` writes each aggregate as an emit-shape-compatible
+// witness JSON `DIR/miss-<hash>.json` (the format `transpile --kernel`
+// consumes). Aggregating over the whole run rather than snapshotting one
+// chunk is what makes the flags trustworthy: `vary` is true iff ANY chunk
+// showed a per-lane column, the content kind is the lane-dominant one with
+// dropped kinds logged (no silent caps), and a "val" fold pin is emitted
+// only when EVERY chunk agreed on the uniform value.
+
+fn miss_dump_dir() -> Option<&'static str> {
+    static DIR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| std::env::var("CELESTE_KERNEL_MISS_DUMP").ok()).as_deref()
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum StableVal {
+    Unset,
+    Num(i32),
+    Broken,
+}
+
+struct MissAgg {
+    structure: Vec<runtime2::Cell2>,
+    globals: Vec<u32>,
+    /// First-seen pointer target per Val cell - name propagation only.
+    ptrs: Vec<Option<u32>>,
+    chunks: u64,
+    lanes: u64,
+    /// Any chunk had a per-lane (non-uniform) column here.
+    vary: Vec<bool>,
+    /// Serialized content-kind JSON -> lanes seen with that kind.
+    kinds: Vec<std::collections::BTreeMap<String, u64>>,
+    stable: Vec<StableVal>,
+}
+
+static MISS_DUMP: std::sync::Mutex<std::collections::BTreeMap<u64, MissAgg>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn av_kind_json(a: &runtime2::AV) -> serde_json::Value {
+    use serde_json::json;
+    match a {
+        runtime2::AV::Num(_) => json!("num"),
+        runtime2::AV::Ival(_, _) => json!("ival"),
+        runtime2::AV::Bool(_) => json!("bool"),
+        runtime2::AV::UBool => json!("ubool"),
+        runtime2::AV::Str(_) => json!("str"),
+        runtime2::AV::Nil => json!("nil"),
+        runtime2::AV::Ptr(t) => json!({ "ptr": t }),
+        runtime2::AV::NilPtr => json!("nilptr"),
+    }
+}
+
+fn record_miss_dump(chunk: &runtime2::Rt2) {
+    let n = chunk.structure.len();
+    let mut m = MISS_DUMP.lock().unwrap();
+    let agg = m.entry(chunk.shape_hash).or_insert_with(|| MissAgg {
+        structure: chunk.structure.clone(),
+        globals: chunk.globals.clone(),
+        ptrs: vec![None; n],
+        chunks: 0,
+        lanes: 0,
+        vary: vec![false; n],
+        kinds: vec![Default::default(); n],
+        stable: vec![StableVal::Unset; n],
+    });
+    agg.chunks += 1;
+    agg.lanes += chunk.width as u64;
+    for c in 0..n {
+        if !matches!(chunk.structure[c], runtime2::Cell2::Val) {
+            continue;
+        }
+        let col = &chunk.cols[c];
+        if agg.ptrs[c].is_none() {
+            if let runtime2::Col::U(runtime2::AV::Ptr(t)) = col {
+                agg.ptrs[c] = Some(*t);
+            }
+        }
+        match col {
+            runtime2::Col::U(a) => {
+                *agg.kinds[c].entry(av_kind_json(a).to_string()).or_insert(0) +=
+                    chunk.width as u64;
+            }
+            runtime2::Col::N(_) => {
+                agg.vary[c] = true;
+                *agg.kinds[c].entry("\"num\"".to_string()).or_insert(0) += chunk.width as u64;
+            }
+            runtime2::Col::I(_) => {
+                agg.vary[c] = true;
+                *agg.kinds[c].entry("\"ival\"".to_string()).or_insert(0) += chunk.width as u64;
+            }
+            runtime2::Col::V(vs) => {
+                agg.vary[c] = true;
+                for a in vs {
+                    *agg.kinds[c].entry(av_kind_json(a).to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+        agg.stable[c] = match (agg.stable[c], col) {
+            (StableVal::Broken, _) => StableVal::Broken,
+            (s, runtime2::Col::U(runtime2::AV::Num(v))) => {
+                let raw = v.as_raw_u32() as i32;
+                match s {
+                    StableVal::Unset => StableVal::Num(raw),
+                    StableVal::Num(p) if p == raw => StableVal::Num(raw),
+                    _ => StableVal::Broken,
+                }
+            }
+            _ => StableVal::Broken,
+        };
+    }
+}
+
+impl MissAgg {
+    /// Field-path names mirroring `merge_dump::cell_names`: globals seed,
+    /// then several propagation passes through object fields, array
+    /// indices (1-based) and pointer cells, so nesting resolves even when
+    /// a table is visited before its parent is named.
+    fn cell_names(&self) -> Vec<String> {
+        let n = self.structure.len();
+        let mut names: Vec<Option<String>> = vec![None; n];
+        for (gi, cell) in self.globals.iter().enumerate() {
+            if *cell != runtime2::NONE && (*cell as usize) < n && names[*cell as usize].is_none()
+            {
+                names[*cell as usize] = Some(celeste_names::GLOBAL_NAMES[gi].to_string());
+            }
+        }
+        for _ in 0..5 {
+            for i in 0..n {
+                let parent = names[i].clone();
+                let label = |field: &str| match &parent {
+                    Some(p) => format!("{}.{}", p, field),
+                    None => format!("cell{}.{}", i, field),
+                };
+                match &self.structure[i] {
+                    runtime2::Cell2::Obj(fields) => {
+                        for (f, child) in fields {
+                            let l = label(celeste_names::FIELD_NAMES[*f as usize]);
+                            let c = *child as usize;
+                            if c < n && names[c].is_none() {
+                                names[c] = Some(l);
+                            }
+                        }
+                    }
+                    runtime2::Cell2::Arr(items) => {
+                        for (k, child) in items.iter().enumerate() {
+                            let l = label(&format!("{}", k + 1));
+                            let c = *child as usize;
+                            if c < n && names[c].is_none() {
+                                names[c] = Some(l);
+                            }
+                        }
+                    }
+                    runtime2::Cell2::Val => {
+                        if let (Some(p), Some(t)) = (&parent, self.ptrs[i]) {
+                            let t = t as usize;
+                            if t < n && names[t].is_none() {
+                                names[t] = Some(p.clone());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        names.into_iter().map(|o| o.unwrap_or_default()).collect()
+    }
+}
+
+/// Write every aggregate as a witness JSON. Idempotent - called from
+/// `print_kernel_hits` each time metrics dump, overwriting with the
+/// run-so-far aggregate; the aggregate itself is never cleared.
+fn write_miss_dumps(dir: &str) {
+    use serde_json::json;
+    let m = MISS_DUMP.lock().unwrap();
+    if m.is_empty() {
+        return;
+    }
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        eprintln!("kernel miss dump: cannot create {}: {}", dir, e);
+        return;
+    }
+    // The same forced-vary override as emit-shape's `force_vary_names`:
+    // a cell uniform in every OBSERVED chunk but per-lane in chunks the
+    // run did not reach must not be emitted as a uniform input.
+    let mut forced: Vec<String> = vec!["dash_effect_time".to_string()];
+    if let Ok(v) = std::env::var("CELESTE_FORCE_VARY") {
+        forced.extend(v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+    }
+    for (hash, agg) in m.iter() {
+        let names = agg.cell_names();
+        let n = agg.structure.len();
+        let cells: Vec<serde_json::Value> = (0..n)
+            .map(|c| {
+                let name = &names[c];
+                let mut o = match &agg.structure[c] {
+                    runtime2::Cell2::Val => {
+                        // Lane-dominant content kind; log what that drops.
+                        let (kind, dom_lanes) = agg.kinds[c]
+                            .iter()
+                            .max_by_key(|(_, l)| **l)
+                            .map(|(k, l)| (k.clone(), *l))
+                            .unwrap_or(("\"nil\"".to_string(), 0));
+                        if agg.kinds[c].len() > 1 {
+                            let total: u64 = agg.kinds[c].values().sum();
+                            eprintln!(
+                                "kernel miss dump {:x}: cell {} ({}) mixes kinds {:?}; \
+                                 keeping {} ({}/{} lanes)",
+                                hash, c, name, agg.kinds[c], kind, dom_lanes, total
+                            );
+                        }
+                        let content: serde_json::Value =
+                            serde_json::from_str(&kind).expect("kind key round-trips");
+                        json!({ "k": "val", "content": content })
+                    }
+                    runtime2::Cell2::Obj(fields) => {
+                        let map: serde_json::Map<String, serde_json::Value> = fields
+                            .iter()
+                            .map(|(f, c)| {
+                                (celeste_names::FIELD_NAMES[*f as usize].to_string(), json!(c))
+                            })
+                            .collect();
+                        json!({ "k": "obj", "fields": map })
+                    }
+                    runtime2::Cell2::Arr(items) => json!({ "k": "arr", "items": items }),
+                    runtime2::Cell2::Unk => json!({ "k": "unk" }),
+                    runtime2::Cell2::Clo(f, caps) => json!({
+                        "k": "clo",
+                        "fn": celeste_names::FN_NAMES[*f as usize],
+                        "caps": caps.len(),
+                    }),
+                    runtime2::Cell2::Bi(b) => {
+                        json!({ "k": "bi", "name": crate::builtins::BUILTIN_NAMES[*b as usize] })
+                    }
+                };
+                let obj = o.as_object_mut().unwrap();
+                obj.insert("name".into(), json!(name));
+                let vary = agg.vary[c]
+                    || (matches!(agg.structure[c], runtime2::Cell2::Val)
+                        && forced
+                            .iter()
+                            .any(|f| name == f || name.ends_with(&format!(".{}", f))));
+                if vary {
+                    obj.insert("vary".into(), json!(true));
+                }
+                // No fold pins on the pm1/class cells. The missed
+                // population is class-skewed BY CONSTRUCTION (a state
+                // aborts on its first premise-failing chunk, so dispatch
+                // observes only the first-popped partitions), and a "val"
+                // pin on freeze/dash_time from that sample would make the
+                // emitted kernel fold - or refuse at bind - on a value
+                // that merely happened to dominate the observed misses.
+                // Class membership is the overlay guards' job at runtime.
+                let pm1 = ["freeze", "has_dashed"].contains(&name.as_str())
+                    || [".dash_time", ".djump", ".p_dash", ".p_jump"]
+                        .iter()
+                        .any(|f| name.ends_with(f));
+                if let (StableVal::Num(v), false, false) = (agg.stable[c], vary, pm1) {
+                    obj.insert("val".into(), json!(v));
+                }
+                o
+            })
+            .collect();
+        let globals: serde_json::Map<String, serde_json::Value> = celeste_names::GLOBAL_NAMES
+            .iter()
+            .enumerate()
+            .filter(|(gi, _)| *gi < agg.globals.len() && agg.globals[*gi] != runtime2::NONE)
+            .map(|(gi, name)| (name.to_string(), json!(agg.globals[gi])))
+            .collect();
+        let witness = json!({
+            "frame": 0,
+            "shape_hash": format!("{:x}", hash),
+            "steady_blocks": agg.chunks,
+            "engine_chunk_lanes": agg.lanes,
+            "globals": globals,
+            "cells": cells,
+        });
+        let path = format!("{}/miss-{:x}.json", dir, hash);
+        match std::fs::write(&path, serde_json::to_string_pretty(&witness).unwrap()) {
+            Ok(()) => eprintln!(
+                "kernel miss dump: {} ({} chunks, {} lanes, {} cells)",
+                path, agg.chunks, agg.lanes, n
+            ),
+            Err(e) => eprintln!("kernel miss dump: write {} failed: {}", path, e),
+        }
+    }
 }
 
 /// Missed chunks by (shape hash, which kernels share that shape).
@@ -278,6 +577,9 @@ static KROWS: [std::sync::atomic::AtomicU64; 2] = [
 pub fn print_kernel_hits() {
     #[cfg(feature = "fused")]
     fused::print_stats();
+    if let Some(dir) = miss_dump_dir() {
+        write_miss_dumps(dir);
+    }
     let v: Vec<u64> = KERNEL_HITS
         .iter()
         .map(|a| a.swap(0, std::sync::atomic::Ordering::Relaxed))

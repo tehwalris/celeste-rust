@@ -367,12 +367,26 @@ impl FrameEngine {
         let use_kernel = use_kernel();
         let mut done: Vec<runtime2::Rt2> = Vec::new();
         let mut out: Vec<crate::interpreter::state::State> = Vec::new();
+        // DISPATCH EVERY CHUNK BEFORE INTERPRETING ANY. A premise failure
+        // in `interpret_block` panics out of the whole state, and with the
+        // interleaved loop that panic landed before the remaining chunks
+        // were ever OFFERED to the kernels - so kernel coverage (and the
+        // miss-dump census behind CELESTE_KERNEL_MISS_DUMP) observed only
+        // the first-popped partitions of each state, a class-skewed
+        // sample. Chunks are independent and the output is a row SET, so
+        // running the kernel pass to completion first changes no result -
+        // it only moves the abort after the point where every chunk has
+        // been dispatched and counted.
+        let mut misses: Vec<(runtime2::Rt2, bool)> = Vec::new();
         while let Some((block, kernel_ok)) = pending.pop() {
             if use_kernel && kernel_ok {
                 if dispatch::run_chunk_kernel(&block, &self.ids, &mut done, &mut pending) {
                     continue;
                 }
             }
+            misses.push((block, kernel_ok));
+        }
+        for (block, kernel_ok) in misses {
             // A kernel's deopt sub-chunk (kernel_ok=false: dying
             // representatives, class-leaving rows) FAILS the specialized
             // program's premises by construction - run it under the PLAIN
