@@ -71,6 +71,17 @@ use super::super::validate::BlockKey;
 /// Can this value never be falsy, knowing only its defining instruction?
 /// Shared with `decompose_truthy`, which rests on the same fact.
 pub(crate) fn statically_truthy(fun: &FunDef, id: LocalId) -> bool {
+    statically_truthy_inner(fun, id, 0)
+}
+
+/// A select yields one of its sides, so it is truthy when both sides are.
+/// The recursion is depth-capped rather than cycle-checked: a pure select
+/// chain is acyclic in SSA (only phis carry back edges, and phis return
+/// false here), so the cap is a belt on suspenders.
+fn statically_truthy_inner(fun: &FunDef, id: LocalId, depth: usize) -> bool {
+    if depth > 16 {
+        return false;
+    }
     for block in fun.cfg.iter_blocks() {
         for (candidate, instr) in &block.instructions {
             if *candidate != id {
@@ -100,6 +111,13 @@ pub(crate) fn statically_truthy(fun: &FunDef, id: LocalId) -> bool {
                         | crate::ir::BinaryOp::Caret
                         | crate::ir::BinaryOp::TwoDots
                 ),
+                // A select yields exactly one of its sides, so it is truthy
+                // whenever both sides are (e.g. the numeric `b ? -1 : 0`
+                // that an inner `and -1 or 0` converts to).
+                Instruction::Select { if_true, if_false, .. } => {
+                    statically_truthy_inner(fun, *if_true, depth + 1)
+                        && statically_truthy_inner(fun, *if_false, depth + 1)
+                }
                 _ => false,
             };
         }

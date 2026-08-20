@@ -995,6 +995,18 @@
 {"id": "st20_fs0", "rule": "fold_select"}
 {"id": "st20_f0", "rule": "fold"}
 {"id": "steady_dce", "rule": "dce"}
+{"id": "st20_xb000", "rule": "expand_bool", "fn": "__frame", "head": "in_t20i_004_if_join_6", "why": "btn concretization diamond -> lane expansion; trace10 xb004-xb011 mirror (walker-safe: no btn read is deleted)"}
+{"id": "st20_xb001", "rule": "expand_bool", "fn": "__frame", "head": "in_t20i_004_in_h061_and_or_continue_113", "why": "btn concretization diamond -> lane expansion; trace10 xb004-xb011 mirror (walker-safe: no btn read is deleted)"}
+{"id": "st20_xb002", "rule": "expand_bool", "fn": "__frame", "head": "in_t20i_004_in_h061_and_or_continue_8", "why": "btn concretization diamond -> lane expansion; trace10 xb004-xb011 mirror (walker-safe: no btn read is deleted)"}
+{"id": "st20_xb003", "rule": "expand_bool", "fn": "__frame", "head": "in_t20i_004_in_h061_if_body_107", "why": "btn concretization diamond -> lane expansion; trace10 xb004-xb011 mirror (walker-safe: no btn read is deleted)"}
+{"id": "st20_xb004", "rule": "expand_bool", "fn": "__frame", "head": "in_t20i_004_in_h061_in_i1_071_cont", "why": "btn concretization diamond -> lane expansion; trace10 xb004-xb011 mirror (walker-safe: no btn read is deleted)"}
+{"id": "st20_xb005", "rule": "expand_bool", "fn": "__frame", "head": "in_t20i_004_in_h061_in_i1_072_cont", "why": "btn concretization diamond -> lane expansion; trace10 xb004-xb011 mirror (walker-safe: no btn read is deleted)"}
+{"id": "st20_xb006", "rule": "expand_bool", "fn": "__frame", "head": "in_t20i_004_in_h061_in_i1_073_cont", "why": "btn concretization diamond -> lane expansion; trace10 xb004-xb011 mirror (walker-safe: no btn read is deleted)"}
+{"id": "st20_xb007", "rule": "expand_bool", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1027_for_join_35", "why": "btn concretization diamond -> lane expansion; trace10 xb004-xb011 mirror (walker-safe: no btn read is deleted)"}
+{"id": "st20_xm0", "rule": "merge_blocks", "why": "collapse the post-expand_bool arm chains to single blocks (expand + concretization store together); trace10 xm000 mirror"}
+{"id": "st20_dc7", "rule": "demote_create", "fn": "__frame", "at": "%11592", "why": "button cell exists (created by __reset_button_states); drop the create so the or-arm is speculatable"}
+{"id": "st20_xs3", "rule": "speculate_region", "fn": "__frame", "head": "in_t20i_004_if_join_6", "arm": "in_t20i_004_in_h061_and_or_continue_8", "expand": true, "why": "h-input or-arm (btn(k_right) read + concretization) runs eagerly; join phi becomes the truthy root select; trace10 xs002 mirror"}
+{"id": "st20_dt0", "rule": "decompose_truthy", "fn": "__frame", "root": "%11159", "why": "h-input and/or cascade -> (t,n) pairs; mixed bool/number selects defused; u008 mirror"}
 {"id": "st20_mrg1", "rule": "merge_blocks", "why": "second round: pins leave untaken arms as unreachable preds until dce removes them, so edges become mergeable only after steady_dce"}
 {"id": "st20_fs1", "rule": "fold_select"}
 {"id": "st20_f1", "rule": "fold"}
@@ -1010,4 +1022,40 @@
 {"id": "st20_dc6", "rule": "demote_create", "fn": "__frame", "at": "%13037", "why": "rem/dash cells exist from spawn; drop the create so the spd move arm is speculatable"}
 {"id": "st20_xs2", "rule": "speculate_region", "fn": "__frame", "head": "in_t20n_003_in_k027_for_join_35", "arm": "in_t20i_004_if_body_5", "mask": true, "splits": true, "guards": true, "why": "the spd move gate diverges per lane inside a pm1 class (standing vs moving), so it becomes a select: the arm runs masked; ti_spd_select mirror. Head is the mrg1-merged chain tail carrying the old in_t20i_004_entry terminator."}
 {"id": "st20_mrg2", "rule": "merge_blocks"}
+{"id": "st20_u002", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_k2002_for_head_1", "trip": 4, "why": "collide check loop over 4 objects inside the pixel-move body; hit exits already pinned clear; must unroll before the pixel loops so their bodies are loop-free"}
+{"id": "st20_u003", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_k2003_for_head_1", "trip": 4, "why": "collide check loop over 4 objects inside the pixel-move body; hit exits already pinned clear; must unroll before the pixel loops so their bodies are loop-free"}
+{"id": "st20_u004", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_k2004_for_head_1", "trip": 4, "why": "collide check loop over 4 objects inside the pixel-move body; hit exits already pinned clear; must unroll before the pixel loops so their bodies are loop-free"}
+{"id": "st20_u005", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_k2005_for_head_1", "trip": 4, "why": "collide check loop over 4 objects inside the pixel-move body; hit exits already pinned clear; must unroll before the pixel loops so their bodies are loop-free"}
+{"id": "st20_u006", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_k2006_for_head_1", "trip": 4, "why": "collide check loop over 4 objects inside the pixel-move body; hit exits already pinned clear; must unroll before the pixel loops so their bodies are loop-free"}
+{"id": "st20_u007", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_k2007_for_head_1", "trip": 4, "why": "collide check loop over 4 objects inside the pixel-move body; hit exits already pinned clear; must unroll before the pixel loops so their bodies are loop-free"}
+{"id": "st20_u008", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_k1000_for_head_3", "why": "move_x pixel loop, masked form with constant bound 8; h068 mirror"}
+{"id": "st20_u009", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_k1001_for_head_3", "why": "move_y pixel loop; h069 mirror"}
+{"id": "st20_mrg3", "rule": "merge_blocks"}
+{"forward": true, "id": "st20_cse0", "rule": "cse"}
+{"id": "st20_fs2", "rule": "fold_select"}
+{"id": "st20_dce3", "rule": "dce"}
+{"id": "st20_dg0", "rule": "dedup_guards"}
+{"id": "st20_u010", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_i1_068_for_head_4", "why": "spikes_at inner (x) loop, constant tile bounds; h076 mirror"}
+{"id": "st20_u011", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_i1_068_for_head_1", "why": "spikes_at outer (y) loop; h077 mirror"}
+{"id": "st20_mrg4", "rule": "merge_blocks"}
+{"forward": true, "id": "st20_cse1", "rule": "cse"}
+{"id": "st20_dg1", "rule": "dedup_guards"}
+{"id": "st20_fs3", "rule": "fold_select"}
+{"id": "st20_dce4", "rule": "dce"}
+{"id": "st20_u012", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1024_for_head_1", "trip": 4, "why": "player-update check loop over 4 objects; hit exits pinned clear by the shared pins; guarded trip-4 unroll"}
+{"id": "st20_u013", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1025_for_head_1", "trip": 4, "why": "player-update check loop over 4 objects; hit exits pinned clear by the shared pins; guarded trip-4 unroll"}
+{"id": "st20_u014", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1026_for_head_1", "trip": 4, "why": "player-update check loop over 4 objects; hit exits pinned clear by the shared pins; guarded trip-4 unroll"}
+{"id": "st20_u015", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1027_for_head_1", "trip": 4, "why": "player-update check loop over 4 objects; hit exits pinned clear by the shared pins; guarded trip-4 unroll"}
+{"id": "st20_u016", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1030_for_head_1", "trip": 4, "why": "player-update check loop over 4 objects; hit exits pinned clear by the shared pins; guarded trip-4 unroll"}
+{"id": "st20_u017", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1031_for_head_1", "trip": 4, "why": "player-update check loop over 4 objects; hit exits pinned clear by the shared pins; guarded trip-4 unroll"}
+{"id": "st20_u018", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1034_for_head_1", "trip": 4, "why": "player-update check loop over 4 objects; hit exits pinned clear by the shared pins; guarded trip-4 unroll"}
+{"id": "st20_u019", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1035_for_head_1", "trip": 4, "why": "player-update check loop over 4 objects; hit exits pinned clear by the shared pins; guarded trip-4 unroll"}
+{"id": "st20_u020", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1038_for_head_1", "trip": 4, "why": "player-update check loop over 4 objects; hit exits pinned clear by the shared pins; guarded trip-4 unroll"}
+{"id": "st20_u021", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1039_for_head_1", "trip": 4, "why": "player-update check loop over 4 objects; hit exits pinned clear by the shared pins; guarded trip-4 unroll"}
+{"id": "st20_mrg5", "rule": "merge_blocks"}
+{"forward": true, "id": "st20_cse2", "rule": "cse"}
+{"id": "st20_dg2", "rule": "dedup_guards"}
+{"id": "st20_fs4", "rule": "fold_select"}
+{"id": "st20_f2", "rule": "fold"}
+{"id": "st20_dce5", "rule": "dce"}
 {"id": "steady_kd", "rule": "kill_dead"}
