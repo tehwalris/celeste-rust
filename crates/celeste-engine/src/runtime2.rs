@@ -126,6 +126,12 @@ pub struct BoundaryIds {
     pub f_x: u32,
     pub f_y: u32,
     pub f_dash_effect_time: u32,
+    /// Fruit-off widening ids (abstraction.rs:720): the `fruit` type
+    /// global plus the `off`/`start` fields. `f_y` above doubles as the
+    /// bob-band target.
+    pub g_fruit: u32,
+    pub f_off: u32,
+    pub f_start: u32,
     /// The recipe's partition_merge (pm1) key: globals (has_dashed,
     /// freeze) and player fields (dash_time, djump, p_dash, p_jump).
     pub g_pm1: Vec<u32>,
@@ -424,6 +430,13 @@ impl Rt2 {
     /// field points at the `player` type table. (`g_player` itself is
     /// that table, not an instance.)
     pub fn player_objects(&self, ids: &BoundaryIds) -> Vec<u32> {
+        self.objects_of_type(ids, ids.g_player)
+    }
+
+    /// Instances in `objects` whose `type` field points at the type
+    /// table held by global `type_global` (find_objects_by_type,
+    /// interpreter state_helper).
+    pub fn objects_of_type(&self, ids: &BoundaryIds, type_global: u32) -> Vec<u32> {
         let mut found = Vec::new();
         let Some(arr) = self.global_target(ids.g_objects) else {
             return found;
@@ -431,7 +444,7 @@ impl Rt2 {
         let Cell2::Arr(items) = &self.structure[arr as usize] else {
             return found;
         };
-        let player_type = self.global_target(ids.g_player);
+        let type_table = self.global_target(type_global);
         for item in items {
             // Array items are cells holding Ptr(obj).
             let obj = match &self.structure[*item as usize] {
@@ -444,11 +457,11 @@ impl Rt2 {
             let Some(type_cell) = self.obj_field_cell(obj, ids.f_type) else {
                 continue;
             };
-            let is_player = match self.cols[type_cell as usize] {
-                Col::U(AV::Ptr(t)) => Some(t) == player_type,
+            let matches = match self.cols[type_cell as usize] {
+                Col::U(AV::Ptr(t)) => Some(t) == type_table,
                 _ => false,
             };
-            if is_player {
+            if matches {
                 found.push(obj);
             }
         }
@@ -540,6 +553,9 @@ impl Rt2 {
     ///      (abstraction.rs:521; other precisions are follow-up work).
     ///   2. spd: Exact (the default) - nothing.
     ///   3. dash_effect_time clamp at 0 from below (abstraction.rs:713).
+    ///   3b. fruit off/y widening (abstraction.rs:720): off := [0, 39],
+    ///       y := start +/- 2.5, together, growth asserted per lane. A
+    ///       no-op on fruit-free shapes (rooms without a live fruit).
     ///   4. timer globals pinned to 0 (abstraction.rs:837).
     /// Then: reachability BFS from globals over the shared structure (the
     /// per-frame GC + canonical cell order), per-lane 128-bit row hash
@@ -679,6 +695,67 @@ impl Rt2 {
                 ),
                 Col::I(_) => panic!("player dash_effect_time is not a number"),
             };
+        }
+
+        // 3b. Fruit off/y widening (abstraction.rs:720): each live fruit's
+        // bob counter becomes the full period [0, 39] and its y the whole
+        // bob band start +/- 2.5 (sin is in [-1, 1]) - bit for bit the
+        // interpreter's behavior at every NON-EXACT level, which this
+        // boundary is (it implements Bits(0) only, see the doc comment).
+        // `off` and `y` widen TOGETHER (one without the other produces a
+        // row no interpreter level has - room20-plan.md "only half a
+        // widening"), and the widening must only ever grow the value it
+        // replaces (asserted per lane, like the interpreter).
+        for obj in self.objects_of_type(ids, ids.g_fruit) {
+            let field = |rt: &Self, name: &str, f: u32| {
+                rt.obj_field_cell(obj, f).unwrap_or_else(|| {
+                    panic!("fruit-off widening: fruit has no `{}` field", name)
+                })
+            };
+            let off_cell = field(self, "off", ids.f_off);
+            let y_cell = field(self, "y", ids.f_y);
+            let start_cell = field(self, "start", ids.f_start);
+            let numeric = |v: &AV| matches!(v, AV::Num(_) | AV::Ival(..));
+            match &self.cols[off_cell as usize] {
+                Col::U(v) if numeric(v) => {}
+                Col::V(vs) if vs.iter().all(numeric) => {}
+                Col::N(_) | Col::I(_) => {}
+                other => panic!("fruit-off widening: off is not numeric: {:?}", other),
+            }
+            self.cols[off_cell as usize] =
+                Col::U(AV::Ival(P8::from_i16(0), P8::from_i16(39)));
+
+            // sin(off/40) * 2.5, for an unknown phase: the whole bob band.
+            let amplitude = P8::from_parts(2, 0x8000);
+            let band_at = |lane: usize| -> (P8, P8) {
+                match self.cols[start_cell as usize].at(lane) {
+                    AV::Num(s) => (s - amplitude, s + amplitude),
+                    other => {
+                        panic!("fruit-off widening: start is not a number: {:?}", other)
+                    }
+                }
+            };
+            for lane in 0..self.width {
+                let (lo, hi) = band_at(lane);
+                let contained = match self.cols[y_cell as usize].at(lane) {
+                    AV::Num(n) => lo <= n && n <= hi,
+                    AV::Ival(a, b) => lo <= a && b <= hi,
+                    other => panic!("fruit-off widening: y is not numeric: {:?}", other),
+                };
+                assert!(
+                    contained,
+                    "fruit-off widening: lane {} of y {:?} is outside the bob band [{:?}, {:?}]",
+                    lane, self.cols[y_cell as usize].at(lane), lo, hi
+                );
+            }
+            let new_y = match &self.cols[start_cell as usize] {
+                Col::U(_) => {
+                    let (lo, hi) = band_at(0);
+                    Col::U(AV::Ival(lo, hi))
+                }
+                _ => Col::I((0..self.width).map(band_at).collect()),
+            };
+            self.cols[y_cell as usize] = new_y;
         }
 
         // 4. timer pins.

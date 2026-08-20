@@ -167,6 +167,9 @@ fn boundary_ids() -> runtime2::BoundaryIds {
         f_x: f("x"),
         f_y: f("y"),
         f_dash_effect_time: f("dash_effect_time"),
+        g_fruit: g("fruit"),
+        f_off: f("off"),
+        f_start: f("start"),
         // The recipe's partition_merge (pm1) key. `has_dashed` and
         // `freeze` are globals; the rest are player fields.
         g_pm1: ["has_dashed", "freeze"].iter().map(|n| g(n)).collect(),
