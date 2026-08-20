@@ -922,3 +922,40 @@
 {"fn": "fruit.update_34", "head": "in_k019_for_body_start_2_it2", "id": "gb20_053", "rule": "guard_branch", "taken": false, "why": "witness traces f28-f94 (15 frames); interaction/kill/exit/foreach-peel seams excluded"}
 {"id": "t20_dce1", "rule": "dce"}
 {"id": "t20_kd2", "rule": "kill_dead"}
+# Per-object specialization of the update-foreach peels (task #171): inline
+# anonymous_61 at the it1-it4 peel call sites (it5 = lifeup, collect lanes only,
+# stays on the shared anonymous_61), then devirt the generic type.update call
+# in the fruit/spring copies and inline fruit.update_34 / spring.update_26.
+{"id": "t20i_001", "rule": "inline", "fn": "__frame", "at": "%1488", "callee": "anonymous_61", "captures": []}
+{"id": "t20i_002", "rule": "inline", "fn": "__frame", "at": "%1846", "callee": "anonymous_61", "captures": []}
+{"id": "t20i_003", "rule": "inline", "fn": "__frame", "at": "%1874", "callee": "anonymous_61", "captures": []}
+{"id": "t20i_004", "rule": "inline", "fn": "__frame", "at": "%1902", "callee": "anonymous_61", "captures": []}
+{"id": "t20i_dce", "rule": "dce"}
+{"id": "t20i_kd", "rule": "kill_dead"}
+{"id": "t20s_001", "rule": "split_call", "fn": "__frame", "at": "%2528", "on": "%2541", "global": "fruit"}
+{"id": "t20s_002", "rule": "split_call", "fn": "__frame", "at": "%5327", "on": "%5340", "global": "spring"}
+{"id": "t20s_003", "rule": "split_call", "fn": "__frame", "at": "%8126", "on": "%8139", "global": "spring"}
+{"id": "t20n_001", "rule": "inline", "fn": "__frame", "at": "%14399", "callee": "fruit.update_34", "captures": []}
+{"id": "t20n_002", "rule": "inline", "fn": "__frame", "at": "%14407", "callee": "spring.update_26", "captures": []}
+{"id": "t20n_003", "rule": "inline", "fn": "__frame", "at": "%14415", "callee": "spring.update_26", "captures": []}
+{"id": "t20n_dce", "rule": "dce"}
+{"id": "t20n_kd", "rule": "kill_dead"}
+# Per-copy dispatch pins, witness traces f28-f94 (15 frames), weeded by hosted
+# verify counterexamples: the spd move gate on the player copy (standing lanes,
+# r1), the spring in_k027 collide checks (bounce lanes, r2) and the whole spring
+# internal chain (delay/spr state after any bounce, r3) are member seams, as are
+# the fruit overlap (in_k019 it3/cont) and the in_h061 kill/variant sites.
+{"fn": "__frame", "head": "in_t20i_001_entry", "id": "gb20i_000", "rule": "guard_branch", "taken": false, "why": "witness traces f28-f94 (15 frames); per-copy dispatch + spring internals; fruit-overlap and in_h061 kill/variant seams excluded"}
+{"fn": "__frame", "head": "in_t20i_001_if_body_8", "id": "gb20i_001", "rule": "guard_branch", "taken": false, "why": "witness traces f28-f94 (15 frames); per-copy dispatch + spring internals; fruit-overlap and in_h061 kill/variant seams excluded"}
+{"fn": "__frame", "head": "in_t20i_001_if_body_8_devirt_54_false_devirt_1631_false", "id": "gb20i_002", "rule": "guard_branch", "taken": true, "why": "witness traces f28-f94 (15 frames); per-copy dispatch + spring internals; fruit-overlap and in_h061 kill/variant seams excluded"}
+{"fn": "__frame", "head": "in_t20i_002_entry", "id": "gb20i_003", "rule": "guard_branch", "taken": false, "why": "witness traces f28-f94 (15 frames); per-copy dispatch + spring internals; fruit-overlap and in_h061 kill/variant seams excluded"}
+{"fn": "__frame", "head": "in_t20i_002_if_body_8", "id": "gb20i_004", "rule": "guard_branch", "taken": false, "why": "witness traces f28-f94 (15 frames); per-copy dispatch + spring internals; fruit-overlap and in_h061 kill/variant seams excluded"}
+{"fn": "__frame", "head": "in_t20i_002_if_body_8_devirt_54_false_devirt_1631_false", "id": "gb20i_005", "rule": "guard_branch", "taken": true, "why": "witness traces f28-f94 (15 frames); per-copy dispatch + spring internals; fruit-overlap and in_h061 kill/variant seams excluded"}
+{"fn": "__frame", "head": "in_t20i_003_entry", "id": "gb20i_006", "rule": "guard_branch", "taken": false, "why": "witness traces f28-f94 (15 frames); per-copy dispatch + spring internals; fruit-overlap and in_h061 kill/variant seams excluded"}
+{"fn": "__frame", "head": "in_t20i_003_if_body_8", "id": "gb20i_007", "rule": "guard_branch", "taken": false, "why": "witness traces f28-f94 (15 frames); per-copy dispatch + spring internals; fruit-overlap and in_h061 kill/variant seams excluded"}
+{"fn": "__frame", "head": "in_t20i_003_if_body_8_devirt_54_false_devirt_1631_false", "id": "gb20i_008", "rule": "guard_branch", "taken": true, "why": "witness traces f28-f94 (15 frames); per-copy dispatch + spring internals; fruit-overlap and in_h061 kill/variant seams excluded"}
+{"fn": "__frame", "head": "in_t20i_004_if_body_8", "id": "gb20i_010", "rule": "guard_branch", "taken": true, "why": "witness traces f28-f94 (15 frames); per-copy dispatch + spring internals; fruit-overlap and in_h061 kill/variant seams excluded"}
+{"fn": "__frame", "head": "in_t20n_002_entry", "id": "gb20i_011", "rule": "guard_branch", "taken": false, "why": "witness traces f28-f94 (15 frames); per-copy dispatch + spring internals; fruit-overlap and in_h061 kill/variant seams excluded"}
+{"fn": "__frame", "head": "in_t20n_003_entry", "id": "gb20i_017", "rule": "guard_branch", "taken": false, "why": "witness traces f28-f94 (15 frames); per-copy dispatch + spring internals; fruit-overlap and in_h061 kill/variant seams excluded"}
+{"id": "t20p_dce", "rule": "dce"}
+{"id": "t20p_kd", "rule": "kill_dead"}
