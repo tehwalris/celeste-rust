@@ -961,5 +961,75 @@
 {"id": "t20p_kd", "rule": "kill_dead"}
 # FROZEN class overlay (task #172): the freeze early-return gate pinned TRUE - the whole update body is unreachable (the 68-frame sweep shows frozen frames execute no update sites); draw runs as usual.
 {"id": "fz20_000", "rule": "guard_branch", "fn": "__frame", "head": "in_i1_012_if_join_9", "taken": true, "why": "class gate; class-conditioned witness sweep f27-94 (68 frames, 2026-08-20)"}
+{"id": "fz20t_predce", "rule": "dce"}
+{"id": "fz20t_strip", "rule": "strip_kills", "why": "member overlay opens kill-free; steady_kd re-derives on the final CFG"}
+{"id": "fz20t_xs0", "rule": "speculate", "fn": "__frame", "arm": "in_i1_012_and_or_continue_2", "join": "in_i1_012_and_or_join_4", "why": "seconds tick: hoist the pure level_index arm so the and_or join becomes if-convertible"}
+{"id": "fz20t_xc0", "rule": "if_convert", "fn": "__frame", "join": "in_i1_012_and_or_join_4", "why": "seconds tick (frames%30) - frame-uniform but not constant; trace10 xc002 mirror"}
+{"id": "fz20t_dc0", "rule": "demote_create", "fn": "__frame", "at": "%114", "why": "seconds cell exists from __init; drop the create so the tick arm is speculatable"}
+{"id": "fz20t_xs1", "rule": "speculate_region", "fn": "__frame", "head": "in_i1_012_and_or_join_4", "arm": "in_i1_012_if_body_5", "mask": true, "why": "seconds tick arm (seconds store) runs masked - frame-uniform condition, blended for the straight line; guards masked - the seconds~=0 trace assert belongs to the arm", "guards": true}
+{"id": "fz20t_mrg0", "rule": "merge_blocks", "why": "resolve single-edge phis left by the tick blend"}
+{"id": "fz20t_fs0", "rule": "fold_select"}
+{"id": "fz20t_f0", "rule": "fold"}
+{"id": "fz20t_xm0", "rule": "merge_blocks", "why": "collapse the post-expand_bool arm chains to single blocks (expand + concretization store together); trace10 xm000 mirror"}
+{"id": "fz20t_dce0", "rule": "dce"}
+{"id": "fz20t_mrg1", "rule": "merge_blocks", "why": "second round: pins leave untaken arms as unreachable preds until dce removes them, so edges become mergeable only after steady_dce"}
+{"id": "fz20t_fs1", "rule": "fold_select"}
+{"id": "fz20t_f1", "rule": "fold"}
+{"id": "fz20t_dce2", "rule": "dce"}
+{"id": "fz20t_mrg2", "rule": "merge_blocks"}
+{"id": "fz20t_mrg3", "rule": "merge_blocks"}
+{"forward": true, "id": "fz20t_cse0", "rule": "cse"}
+{"id": "fz20t_fs2", "rule": "fold_select"}
+{"id": "fz20t_dce3", "rule": "dce"}
+{"id": "fz20t_dg0", "rule": "dedup_guards"}
+{"id": "fz20t_mrg4", "rule": "merge_blocks"}
+{"forward": true, "id": "fz20t_cse1", "rule": "cse"}
+{"id": "fz20t_dg1", "rule": "dedup_guards"}
+{"id": "fz20t_fs3", "rule": "fold_select"}
+{"id": "fz20t_dce4", "rule": "dce"}
+{"id": "fz20t_mrg5", "rule": "merge_blocks"}
+{"forward": true, "id": "fz20t_cse2", "rule": "cse"}
+{"id": "fz20t_dg2", "rule": "dedup_guards"}
+{"id": "fz20t_fs4", "rule": "fold_select"}
+{"id": "fz20t_f2", "rule": "fold"}
+{"id": "fz20t_dce5", "rule": "dce"}
+{"id": "fz20t_ztm", "rule": "merge_blocks"}
+{"forward": true, "id": "fz20t_ztc", "rule": "cse"}
+{"id": "fz20t_ztd", "rule": "dce"}
+{"id": "fz20t_zn000", "rule": "inline", "fn": "__frame", "at": "%1552", "callee": "anonymous_63", "captures": [], "why": "draw foreach peel it2: inline the draw callback (trace10 zn000/zn002 mirror)"}
+{"id": "fz20t_zn001", "rule": "inline", "fn": "__frame", "at": "%1985", "callee": "anonymous_63", "captures": [], "why": "draw foreach peel it3: inline the draw callback (trace10 zn000/zn002 mirror)"}
+{"id": "fz20t_zn002", "rule": "inline", "fn": "__frame", "at": "%2013", "callee": "anonymous_63", "captures": [], "why": "draw foreach peel it4: inline the draw callback (trace10 zn000/zn002 mirror)"}
+{"id": "fz20t_zn003", "rule": "inline", "fn": "__frame", "at": "%2041", "callee": "anonymous_63", "captures": [], "why": "draw foreach peel it5: inline the draw callback (trace10 zn000/zn002 mirror)"}
+{"id": "fz20t_zn004", "rule": "inline", "fn": "__frame", "at": "%1595", "callee": "anonymous_64", "captures": [], "why": "draw foreach peel it2: inline the draw callback (trace10 zn001/zn003 mirror)"}
+{"id": "fz20t_zn005", "rule": "inline", "fn": "__frame", "at": "%2096", "callee": "anonymous_64", "captures": [], "why": "draw foreach peel it3: inline the draw callback (trace10 zn001/zn003 mirror)"}
+{"id": "fz20t_zn006", "rule": "inline", "fn": "__frame", "at": "%2124", "callee": "anonymous_64", "captures": [], "why": "draw foreach peel it4: inline the draw callback (trace10 zn001/zn003 mirror)"}
+{"id": "fz20t_zn007", "rule": "inline", "fn": "__frame", "at": "%2152", "callee": "anonymous_64", "captures": [], "why": "draw foreach peel it5: inline the draw callback (trace10 zn001/zn003 mirror)"}
+{"forward": true, "id": "fz20t_znc", "rule": "cse"}
+{"id": "fz20t_znd", "rule": "dce"}
+{"id": "fz20t_znm", "rule": "merge_blocks"}
+{"id": "fz20t_zt2", "rule": "drop_dead_cell", "fn": "__frame", "cell": "%175", "why": "anonymous_63 closure cell: all calls inlined, only guard reads remain; trace10 zt000 pattern"}
+{"id": "fz20t_zt3", "rule": "drop_dead_cell", "fn": "__frame", "cell": "%182", "why": "anonymous_64 closure cell: same"}
+{"id": "fz20t_gd0", "rule": "guard_branch", "fn": "__frame", "head": "in_i1_013_if_join_2", "taken": false, "why": "draw dispatch it2: fruit has no draw fn (only player.draw_22 exists), default spr path"}
+{"id": "fz20t_gdd", "rule": "dce"}
+{"id": "fz20t_nid", "rule": "dce"}
+{"id": "fz20t_nim", "rule": "merge_blocks"}
+{"id": "fz20t_fzm", "rule": "merge_blocks"}
+{"forward": true, "id": "fz20t_fzc", "rule": "cse"}
+{"id": "fz20t_fzf", "rule": "fold_select"}
+{"id": "fz20t_fzd", "rule": "dce"}
+{"id": "fz20_gd0", "rule": "guard_branch", "fn": "__frame", "head": "in_i1_013_if_join_2", "taken": false, "why": "draw dispatch it2: fruit has no draw fn"}
+{"id": "fz20_gd1", "rule": "guard_branch", "fn": "__frame", "head": "in_fz20t_zn004_in_i1_020_if_join_2", "taken": false, "why": "draw dispatch it3: spring has no draw fn"}
+{"id": "fz20_gd2", "rule": "guard_branch", "fn": "__frame", "head": "in_fz20t_zn005_in_i1_020_if_join_2", "taken": false, "why": "draw dispatch it4: spring has no draw fn"}
+{"id": "fz20_gd3", "rule": "guard_branch", "fn": "__frame", "head": "it4_zc20_002_in_j2_009_if_join_8", "taken": true, "why": "draw dispatch it5: player.draw_22"}
+{"id": "fz20_gdd", "rule": "dce"}
+{"id": "fz20_ni0", "rule": "inline", "fn": "__frame", "at": "%17130", "callee": "player.draw_22", "captures": [], "why": "the one live draw dispatch: it5 player"}
+{"id": "fz20_nid", "rule": "dce"}
+{"id": "fz20_nim", "rule": "merge_blocks"}
+{"id": "fz20_fz0", "rule": "speculate_region", "fn": "__frame", "head": "__entry", "arm": "in_i1_013_if_join_2", "join": "in_i1_013_cont", "mask": true, "guards": true, "why": "the draw-skip gate on frozen frames: freeze post-decrement is >0 on half the class (boundary freeze=2) and 0 on the other half (freeze=1), so draw runs masked"}
+{"id": "fz20_fzm", "rule": "merge_blocks"}
+{"forward": true, "id": "fz20_fzc", "rule": "cse"}
+{"id": "fz20_fzf", "rule": "fold_select"}
+{"id": "fz20_fzd", "rule": "dce"}
+{"id": "fz20_026", "rule": "guard_branch", "fn": "__frame", "head": "__entry", "taken": false, "why": "draw foreach j2_009 it4 nil-check: 4 objects alive (st20_024/025 family)"}
 {"id": "frozen_dce", "rule": "dce"}
 {"id": "frozen_kd", "rule": "kill_dead"}
