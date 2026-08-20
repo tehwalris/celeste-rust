@@ -477,11 +477,30 @@ fn run_emit_shape(dir: &str, frame: u32, out_path: &str, class: &str, shape: &st
         e.0 += 1;
         e.1 += steady[i].vector_size;
     }
-    let dominant: u64 = *by_hash
-        .iter()
-        .max_by_key(|(_, (_, lanes))| *lanes)
-        .map(|(h, _)| h)
-        .unwrap();
+    // CELESTE_EMIT_SHAPE_HASH overrides the max-lane pick: the ENGINE's
+    // chunk population can be dominated by a hash the reference frames
+    // under-sample (the (2,0) fruit widening makes interval-kind chunks
+    // dominant engine-side while the saved frames lean num-kind), and the
+    // kernel must match what the engine actually sees.
+    let dominant: u64 = match std::env::var("CELESTE_EMIT_SHAPE_HASH") {
+        Ok(h) => {
+            let h = u64::from_str_radix(h.trim_start_matches("0x"), 16)
+                .expect("CELESTE_EMIT_SHAPE_HASH must be a hex shape hash");
+            assert!(
+                by_hash.contains_key(&h),
+                "CELESTE_EMIT_SHAPE_HASH {:x} not among this frame's {}-class hashes: {:?}",
+                h,
+                class,
+                by_hash.keys().map(|k| format!("{:x}", k)).collect::<Vec<_>>()
+            );
+            h
+        }
+        Err(_) => *by_hash
+            .iter()
+            .max_by_key(|(_, (_, lanes))| *lanes)
+            .map(|(h, _)| h)
+            .unwrap(),
+    };
     let (dom_blocks, dom_lanes) = by_hash[&dominant];
     let total_lanes: usize = by_hash.values().map(|(_, l)| *l).sum();
     if by_hash.len() > 1 {
