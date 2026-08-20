@@ -1323,6 +1323,53 @@ pub fn build(recipe: &Recipe) -> Result<(Program, Vec<StepReport>)> {
     Ok((program, reports))
 }
 
+/// `build`, but entries AFTER the marker id are allowed to fail: each such
+/// entry applies against a snapshot, and on any apply/verify error the
+/// snapshot is restored and the failure recorded instead of aborting.
+///
+/// This is the single-pass core of overlay derivation (`derive-overlay`):
+/// a class tail transplanted from a sibling overlay drops exactly the
+/// entries whose sites do not exist under this overlay's gate pins, in one
+/// replay instead of one replay per dropped entry. Entries up to and
+/// including the marker (the shared base) must still apply - a failure
+/// there is a real breakage, not a seam.
+pub fn build_tolerant(
+    recipe: &Recipe,
+    tolerant_after: &str,
+) -> Result<(Program, Vec<(String, String)>)> {
+    let mut program = Program::compile_from_disk()?;
+    let errors = validate_program(&program);
+    if !errors.is_empty() {
+        return Err(anyhow!(
+            "the freshly compiled program has {} structural error(s)",
+            errors.len()
+        ));
+    }
+    let mut tolerant = false;
+    let mut dropped: Vec<(String, String)> = Vec::new();
+    let mut seen_marker = false;
+    for entry in &recipe.entries {
+        if tolerant {
+            let snapshot = program.clone();
+            if let Err(e) = apply_entry(&mut program, entry) {
+                program = snapshot;
+                dropped.push((entry.id.clone(), format!("{:#}", e)));
+            }
+        } else {
+            apply_entry(&mut program, entry)
+                .map_err(|e| anyhow!("base entry {} failed: {:#}", entry.id, e))?;
+        }
+        if entry.id == tolerant_after {
+            seen_marker = true;
+            tolerant = true;
+        }
+    }
+    if !seen_marker {
+        return Err(anyhow!("marker id {:?} is not in the recipe", tolerant_after));
+    }
+    Ok((program, dropped))
+}
+
 #[cfg(test)]
 mod checked_in_recipe_tests {
     /// EVERY checked-in recipe must replay, not just the default one.

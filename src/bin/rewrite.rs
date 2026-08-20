@@ -338,6 +338,40 @@ enum Command {
     /// names a change to the base program actually disturbed - which is the
     /// measurement the whole recipe-stability plan turns on.
     Names {},
+    /// Derive a class-overlay tail by transplanting a sibling overlay's tail
+    /// and pruning what does not apply (the 30-room pipeline, per Philippe
+    /// 2026-08-20). Textual: comments survive, and the id-prefix rename also
+    /// renames the inline-created labels that carry entry ids. The prune is
+    /// ONE tolerant replay (entries after the shared base may fail and are
+    /// recorded), then a confirmation replay of the pruned file. What the
+    /// report lists as dropped is exactly the native-head residue to
+    /// re-derive by probe - the same seams every overlay derivation hits
+    /// (input-chain arms, draw-dispatch labels, gates that pin vs blend).
+    DeriveOverlay {
+        /// The sibling overlay whose tail is transplanted (e.g.
+        /// rewrites-trace20-steady.jsonl).
+        #[arg(long)]
+        source: String,
+        /// First tail entry id in the source (e.g. st20_strip).
+        #[arg(long)]
+        tail_from: String,
+        /// End marker id in the source, exclusive (e.g. steady_kd).
+        #[arg(long)]
+        tail_until: String,
+        /// Id prefix to strip from transplanted entries (e.g. st20_).
+        #[arg(long)]
+        strip_prefix: String,
+        /// Replacement id prefix (e.g. fz20t_).
+        #[arg(long)]
+        add_prefix: String,
+        /// Entry id in `--recipe` before which the tail is inserted
+        /// (e.g. frozen_dce).
+        #[arg(long)]
+        insert_before: String,
+        /// Where to write the derived recipe.
+        #[arg(long)]
+        out: String,
+    },
     /// Print every block as "function<TAB>canonical position<TAB>label".
     /// The position is structural (reverse postorder from the entry), so
     /// joining two builds' dumps on it recovers a label renaming.
@@ -3094,6 +3128,92 @@ fn main() -> Result<()> {
             rows.sort();
             for row in rows {
                 println!("{}", row);
+            }
+        }
+
+        Command::DeriveOverlay {
+            source,
+            tail_from,
+            tail_until,
+            strip_prefix,
+            add_prefix,
+            insert_before,
+            out,
+        } => {
+            let id_line = |id: &str| format!("\"{}\"", id);
+            let src = std::fs::read_to_string(&source)?;
+            let src_lines: Vec<&str> = src.lines().collect();
+            let from = src_lines
+                .iter()
+                .position(|l| l.contains(&id_line(&tail_from)))
+                .ok_or_else(|| anyhow::anyhow!("{} not in {}", tail_from, source))?;
+            let until = src_lines
+                .iter()
+                .position(|l| l.contains(&id_line(&tail_until)))
+                .ok_or_else(|| anyhow::anyhow!("{} not in {}", tail_until, source))?;
+            let tail: Vec<String> = src_lines[from..until]
+                .iter()
+                .map(|l| l.replace(&format!("\"{}", strip_prefix), &format!("\"{}", add_prefix)))
+                .collect();
+
+            let base = std::fs::read_to_string(&cli.recipe)?;
+            let base_lines: Vec<&str> = base.lines().collect();
+            let at = base_lines
+                .iter()
+                .position(|l| l.contains(&id_line(&insert_before)))
+                .ok_or_else(|| anyhow::anyhow!("{} not in {}", insert_before, cli.recipe))?;
+            // The tolerance boundary: the last real entry before the insertion.
+            let marker = base_lines[..at]
+                .iter()
+                .rev()
+                .find_map(|l| {
+                    serde_json::from_str::<serde_json::Value>(l)
+                        .ok()
+                        .and_then(|v| v.get("id").and_then(|i| i.as_str().map(String::from)))
+                })
+                .ok_or_else(|| anyhow::anyhow!("no entry before {}", insert_before))?;
+
+            let merged: Vec<String> = base_lines[..at]
+                .iter()
+                .map(|s| s.to_string())
+                .chain(tail.iter().cloned())
+                .chain(base_lines[at..].iter().map(|s| s.to_string()))
+                .collect();
+            std::fs::write(&out, merged.join("\n") + "\n")?;
+
+            eprintln!("==> tolerant replay ({} tail entries)", until - from);
+            let derived = Recipe::load(&out)?;
+            let (_, dropped) =
+                celeste_rust::rewrite::recipe::build_tolerant(&derived, &marker)?;
+            if !dropped.is_empty() {
+                let drop_ids: std::collections::HashSet<&str> =
+                    dropped.iter().map(|(id, _)| id.as_str()).collect();
+                let pruned: Vec<String> = merged
+                    .iter()
+                    .filter(|l| !drop_ids.iter().any(|id| l.contains(&id_line(id))))
+                    .cloned()
+                    .collect();
+                std::fs::write(&out, pruned.join("\n") + "\n")?;
+                eprintln!("==> confirmation replay");
+                let confirmed = Recipe::load(&out)?;
+                let (_, still) =
+                    celeste_rust::rewrite::recipe::build_tolerant(&confirmed, &marker)?;
+                anyhow::ensure!(
+                    still.is_empty(),
+                    "pruned recipe still drops entries: {:?}",
+                    still.iter().map(|(id, _)| id).collect::<Vec<_>>()
+                );
+            }
+            println!("derived {} ({} entries transplanted, {} dropped)", out, until - from, dropped.len());
+            for (id, why) in &dropped {
+                println!("dropped {}: {}", id, why.lines().next().unwrap_or(""));
+            }
+            if !dropped.is_empty() {
+                println!(
+                    "\nThe dropped entries are the native-head residue: re-derive them \
+                     against this overlay's CFG (probe the emitter, print the program, \
+                     find the same sites under their new labels)."
+                );
             }
         }
 
