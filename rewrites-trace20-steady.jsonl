@@ -995,4 +995,19 @@
 {"id": "st20_fs0", "rule": "fold_select"}
 {"id": "st20_f0", "rule": "fold"}
 {"id": "steady_dce", "rule": "dce"}
+{"id": "st20_mrg1", "rule": "merge_blocks", "why": "second round: pins leave untaken arms as unreachable preds until dce removes them, so edges become mergeable only after steady_dce"}
+{"id": "st20_fs1", "rule": "fold_select"}
+{"id": "st20_f1", "rule": "fold"}
+{"id": "st20_dce2", "rule": "dce"}
+{"id": "st20_b000", "rule": "pin_builtin", "fn": "__frame", "at": "%14485", "name": "sin", "why": "fruit bob: sin(off/40) - the only builtin call the (2,0) inline tail adds over the room00 base pins"}
+{"id": "st20_u000", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20n_002_in_k027_for_head_1", "trip": 4, "why": "spring 1 check loop over 4 objects; hit-exit arm already pinned clear by the shared no-overlap pins, so a pure counted loop; t20_016 mirror"}
+{"id": "st20_u001", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20n_003_in_k027_for_head_1", "trip": 4, "why": "spring 2 check loop; same as st20_u000"}
+{"id": "st20_dc1", "rule": "demote_create", "fn": "__frame", "at": "%10879", "why": "rem cell exists from spawn; drop the create so the spd move arm is speculatable"}
+{"id": "st20_dc2", "rule": "demote_create", "fn": "__frame", "at": "%10886", "why": "rem/dash cells exist from spawn; drop the create so the spd move arm is speculatable"}
+{"id": "st20_dc3", "rule": "demote_create", "fn": "__frame", "at": "%10898", "why": "rem/dash cells exist from spawn; drop the create so the spd move arm is speculatable"}
+{"id": "st20_dc4", "rule": "demote_create", "fn": "__frame", "at": "%13018", "why": "rem/dash cells exist from spawn; drop the create so the spd move arm is speculatable"}
+{"id": "st20_dc5", "rule": "demote_create", "fn": "__frame", "at": "%13025", "why": "rem/dash cells exist from spawn; drop the create so the spd move arm is speculatable"}
+{"id": "st20_dc6", "rule": "demote_create", "fn": "__frame", "at": "%13037", "why": "rem/dash cells exist from spawn; drop the create so the spd move arm is speculatable"}
+{"id": "st20_xs2", "rule": "speculate_region", "fn": "__frame", "head": "in_t20n_003_in_k027_for_join_35", "arm": "in_t20i_004_if_body_5", "mask": true, "splits": true, "guards": true, "why": "the spd move gate diverges per lane inside a pm1 class (standing vs moving), so it becomes a select: the arm runs masked; ti_spd_select mirror. Head is the mrg1-merged chain tail carrying the old in_t20i_004_entry terminator."}
+{"id": "st20_mrg2", "rule": "merge_blocks"}
 {"id": "steady_kd", "rule": "kill_dead"}
