@@ -1,0 +1,23 @@
+# Room (2,0) SPIKE-death witness (task #172, (2,0) member derivation).
+#
+# Input bytes for concrete_run (-i), one per frame starting at frame 1.
+# bit0=left bit1=right bit2=up bit3=down bit4=jump bit5=dash.
+# Frames 1-25 are the spawn prologue. Hold right the whole run: the player
+# walks off the spawn ledge, lands on spring 1 (px 40-47, bounce DURING
+# frame 41, spd.y=-3.6b84), flies up-right, lands on the mid platform
+# (y=72) around f54, runs right and descends, and DURING FRAME 64 at
+# (78,85) falling with spd.y=+1.b98d hits the upward spikes on the y=88
+# platform (tile row y=11, px 56-87) - the spikes kill site fires. The
+# objects table ends frame 64 as [fruit, spring, spring] (3 objects).
+#
+# NOTE the spring bounce at f41: frames 41-51 carry bounced-spring state
+# (spr=19, delay counting down), so this witness also exercises the bounce
+# path. By the death frame 64 the spring has long reset (delay=0, spr=18) -
+# the death frame's boundary state is clean steady-spring.
+#
+# Replay:
+#   CELESTE_START_ROOM=2,0 ./target/release/concrete_run \
+#     -i "$(grep -v '^#' tas/room_2_0_death_spikes_frame_64.txt | tr -d '\n')" -f 64
+# Expect: player present through frame 63, absent from frame 64.
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2

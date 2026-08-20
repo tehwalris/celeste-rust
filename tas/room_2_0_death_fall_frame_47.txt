@@ -1,0 +1,18 @@
+# Room (2,0) FALL-death witness (task #172, (2,0) member derivation).
+#
+# Input bytes for concrete_run (-i), one per frame starting at frame 1.
+# bit0=left bit1=right bit2=up bit3=down bit4=jump bit5=dash.
+# Frames 1-25 are the spawn prologue. Hold right for 8 control frames
+# (f26-f33): the player walks from the spawn at (8,104) to x=24, steps off
+# the floor edge (the bottom-row pit spans px 24-39; the spring at px 40-47
+# is never touched - release avoids drifting onto it), then falls straight
+# down: y=121 f44, y=124 f45, y=127 f46, and DURING FRAME 47 y exceeds 128
+# (the 0x800000 compare) and kill_player fires - the fall-death kill site.
+# The objects table ends frame 47 as [fruit, spring, spring] (3 objects).
+#
+# Replay:
+#   CELESTE_START_ROOM=2,0 ./target/release/concrete_run \
+#     -i "$(grep -v '^#' tas/room_2_0_death_fall_frame_47.txt | tr -d '\n')" -f 47
+# Expect: player present through frame 46 at (24,127), absent from frame 47.
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+2,2,2,2,2,2,2,2,0,0,0,0,0,0,0,0,0,0,0,0,0,0
