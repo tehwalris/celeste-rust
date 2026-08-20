@@ -370,9 +370,12 @@ env, two runs each (tools/framesetdiff.py is the set gate):
   **-23% wall / -40% peak, all 94 per-frame rowkey sets identical**
   (178,576,090 rows each), first room-exit at f89 on both, fused
   counters bit-identical across runs. Residue: 456,960 uncovered
-  dying events (0.27%, f69+ only, uniform over every kb bit - an
-  input-independent death mode with no derived member; not worth one
-  yet).
+  events (0.27%) - DIAGNOSED same day as the WIN-ADJACENT population
+  (y=-4/-3, upward, at the exit notch; the pinned `y<-4` exit branch
+  is reachable, deterministically or through the level-0 rem
+  widening). Covering it = an exit member emitting the room
+  transition (cross-room, cross-shape successors) - multi-room seam
+  design, cost today ~0. See BENCHMARK_DATA.md for the full story.
 - Room (0,0), f40 segment, first compiled run on a foreign-shape
   room: sets identical (387,443 rows, the historical count), but 4.0x
   slower / 12x peak - zero kernels bind, pure fan-out overhead.

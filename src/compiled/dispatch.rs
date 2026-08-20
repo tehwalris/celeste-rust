@@ -488,6 +488,38 @@ mod fused {
         *ON.get_or_init(|| std::env::var("CELESTE_KEYCHECK").is_ok())
     }
 
+    /// CELESTE_FUSED_UNCOV_DUMP=N prints the first N uncovered dying
+    /// lanes as decoded player state (task #168's microscope), so an
+    /// UNCOVERED-events counter can be read as game states instead of a
+    /// number. Returns true while the budget lasts.
+    fn take_uncov_dump() -> bool {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        static USED: AtomicU64 = AtomicU64::new(0);
+        let cap = *CAP.get_or_init(|| {
+            std::env::var("CELESTE_FUSED_UNCOV_DUMP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        });
+        cap > 0 && USED.fetch_add(1, Ordering::Relaxed) < cap
+    }
+
+    /// Cell ids are the steady shape witness's `objects.1.*` value cells
+    /// (crates/celeste-kernels/witness/steady-shape.json); the shape-hash
+    /// gate at the top of `run_fused` is what makes them valid here.
+    const UNCOV_DUMP_CELLS: &[(usize, &str)] = &[
+        (253, "x"),
+        (254, "y"),
+        (280, "spd.x"),
+        (281, "spd.y"),
+        (236, "dash_time"),
+        (234, "dash_effect_time"),
+        (237, "djump"),
+        (239, "grace"),
+        (20, "freeze"),
+    ];
+
     pub(super) fn run_fused(
         chunk: &runtime2::Rt2,
         ids: &runtime2::BoundaryIds,
@@ -563,6 +595,18 @@ mod fused {
                     for i in 0..n {
                         if dead & (1 << i) != 0 {
                             deopt_rows.insert((lo + i) as u32);
+                            if take_uncov_dump() {
+                                let mut line =
+                                    format!("uncov b={:06b} lane={}", b, lo + i);
+                                for (c, nm) in UNCOV_DUMP_CELLS {
+                                    line.push_str(&format!(
+                                        " {}={:?}",
+                                        nm,
+                                        chunk.cols[*c].at(lo + i)
+                                    ));
+                                }
+                                eprintln!("{}", line);
+                            }
                         }
                     }
                 }

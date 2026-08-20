@@ -366,12 +366,21 @@ env (frontier-only, collect-first, 8000-lane caps, 16 threads,
   room-exit lanes at frame 89. The fused counters are bit-identical
   across the two fused runs (lanes 170,292,074, dying-covered
   248,759,424, reps 56,267) - the engine is deterministic end to end.
-  Known residue: 456,960 UNCOVERED dying lane-events (0.27% of
-  covered events; 0 at H=68, so it is a f69+ death mode), uniform
-  across every kb bit (set 228,480 / clear 228,480 for all six), i.e.
-  input-independent - a fourth dying member nobody has derived. Those
-  lanes re-run whole in the interpreter; at 0.27% it is not worth a
-  member yet.
+  Known residue: 456,960 UNCOVERED lane-events (0.27% of covered
+  events; 0 at H=68), uniform across every kb bit. DIAGNOSED
+  2026-08-20 with the CELESTE_FUSED_UNCOV_DUMP microscope: it is NOT
+  a death mode - it is the WIN-ADJACENT population. Every dumped lane
+  sits at y=-4 or y=-3 with upward spd at x=95..113 (the exit notch);
+  the steady overlay pins the `this.y<-4` exit branch FALSE, and that
+  guard's TRUE side is reachable either deterministically (y=-4,
+  moving up) or through the level-0 rem widening (y=-3: the +-0.5
+  interval reaches past the threshold) - input-independent both ways,
+  which is the uniform kb histogram. Covering it means an EXIT MEMBER
+  whose output is the room transition (successors in a DIFFERENT room
+  and shape) - multi-room seam work, not a dying-member derivation.
+  Cost today ~0 (the lanes re-run whole in the interpreter; the
+  campaign's deopt re-run line reads 0.00s), so it waits for the
+  multi-room ladder rather than for a perf need.
 
 - room (0,0), `rewrites-room00.jsonl`, `bench --frames 40 --deopt`
   (first compiled-forward run ever on a foreign-shape room):
