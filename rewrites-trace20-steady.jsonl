@@ -990,7 +990,7 @@
 {"id": "st20_xs0", "rule": "speculate", "fn": "__frame", "arm": "in_i1_012_and_or_continue_2", "join": "in_i1_012_and_or_join_4", "why": "seconds tick: hoist the pure level_index arm so the and_or join becomes if-convertible"}
 {"id": "st20_xc0", "rule": "if_convert", "fn": "__frame", "join": "in_i1_012_and_or_join_4", "why": "seconds tick (frames%30) - frame-uniform but not constant; trace10 xc002 mirror"}
 {"id": "st20_dc0", "rule": "demote_create", "fn": "__frame", "at": "%114", "why": "seconds cell exists from __init; drop the create so the tick arm is speculatable"}
-{"id": "st20_xs1", "rule": "speculate_region", "fn": "__frame", "head": "in_i1_012_and_or_join_4", "arm": "in_i1_012_if_body_5", "mask": true, "why": "seconds tick arm (seconds store) runs masked - frame-uniform condition, blended for the straight line"}
+{"id": "st20_xs1", "rule": "speculate_region", "fn": "__frame", "head": "in_i1_012_and_or_join_4", "arm": "in_i1_012_if_body_5", "mask": true, "why": "seconds tick arm (seconds store) runs masked - frame-uniform condition, blended for the straight line; guards masked - the seconds~=0 trace assert belongs to the arm", "guards": true}
 {"id": "st20_mrg0", "rule": "merge_blocks", "why": "resolve single-edge phis left by the tick blend"}
 {"id": "st20_fs0", "rule": "fold_select"}
 {"id": "st20_f0", "rule": "fold"}
