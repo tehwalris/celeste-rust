@@ -106,7 +106,7 @@ fn main() {
     let mut abstract_frames: Option<u32> = None;
     let mut abstract_bench: Option<(String, u32)> = None;
     let mut row_census: Option<(String, u32)> = None;
-    let mut emit_shape: Option<(String, u32, String, String)> = None;
+    let mut emit_shape: Option<(String, u32, String, String, String)> = None;
     let mut kernel_bench: Option<(String, u32)> = None;
     let mut interp_bench: Option<(String, u32)> = None;
     let mut frame_diff: Option<(String, u32, String)> = None;
@@ -133,11 +133,15 @@ fn main() {
                 row_census = Some((dir, frame));
             }
             "--emit-shape" => {
-                let dir = args.next().expect("--emit-shape needs DIR FRAME OUT [CLASS]");
+                let dir = args.next().expect("--emit-shape needs DIR FRAME OUT [CLASS] [SHAPE]");
                 let frame: u32 = args.next().expect("FRAME").parse().unwrap();
                 let out = args.next().expect("OUT");
                 let class = args.next().unwrap_or_else(|| "steady".to_string());
-                emit_shape = Some((dir, frame, out, class));
+                // Comma-separated object shape to select, e.g.
+                // "fruit,spring,spring,player" for room (2,0). Default is
+                // the room (1,0) [player] shape.
+                let shape = args.next().unwrap_or_else(|| "player".to_string());
+                emit_shape = Some((dir, frame, out, class, shape));
             }
             "--interp-bench" => {
                 let dir = args.next().expect("--interp-bench needs DIR FRAME");
@@ -179,8 +183,8 @@ fn main() {
         run_abstract(n);
     } else if let Some((dir, frame)) = row_census {
         run_row_census(&dir, frame);
-    } else if let Some((dir, frame, out, class)) = emit_shape {
-        run_emit_shape(&dir, frame, &out, &class);
+    } else if let Some((dir, frame, out, class, shape)) = emit_shape {
+        run_emit_shape(&dir, frame, &out, &class, &shape);
     } else if let Some((dir, frame)) = kernel_bench {
         run_kernel_bench(&dir, frame, reps);
     } else if let Some((dir, frame)) = interp_bench {
@@ -414,7 +418,7 @@ fn force_vary_names() -> Vec<String> {
     names
 }
 
-fn run_emit_shape(dir: &str, frame: u32, out_path: &str, class: &str) {
+fn run_emit_shape(dir: &str, frame: u32, out_path: &str, class: &str, shape: &str) {
     use serde_json::json;
     let (cart, cache) = world();
     let states = load_states_any(dir, frame);
@@ -423,8 +427,9 @@ fn run_emit_shape(dir: &str, frame: u32, out_path: &str, class: &str) {
         .filter(|st| {
             use celeste_rust::interpreter::value::{HeapValue, MaybeVector, Value};
             let names = celeste_rust::interpreter::merge_dump::cell_names(st);
+            let want_shape: Vec<String> = shape.split(',').map(|s| s.trim().to_string()).collect();
             let shape_ok = celeste_rust::interpreter::abstraction::object_shape(st)
-                .map(|s| s == vec!["player".to_string()])
+                .map(|s| s == want_shape)
                 .unwrap_or(false);
             let val_of = |want: &str| -> Option<i32> {
                 names.iter().find_map(|(cell, name)| {
@@ -455,16 +460,53 @@ fn run_emit_shape(dir: &str, frame: u32, out_path: &str, class: &str) {
         })
         .collect();
     assert!(!steady.is_empty(), "no {}-class blocks at f{}", class, frame);
-    let blocks: Vec<(runtime2::Rt2, Vec<Option<celeste_rust::interpreter::heap::HeapId>>)> =
+    let all_blocks: Vec<(runtime2::Rt2, Vec<Option<celeste_rust::interpreter::heap::HeapId>>)> =
         steady
             .iter()
             .map(|st| import::import_block_mapped(st, cart.clone(), cache.clone()))
             .collect();
-    let (b0, rev0) = &blocks[0];
-    // Shape agreement across blocks (same structure => same canonical ids).
-    for (b, _) in &blocks {
-        assert_eq!(b.shape_hash, b0.shape_hash, "steady blocks disagree on shape");
+    // Class blocks may come in several structural shapes (e.g. a spring
+    // field nil in some blocks, a number in others). The kernel binds per
+    // shape hash - the slot gate rejects other shapes to the interpreter -
+    // so the witness takes the DOMINANT hash and logs what it drops.
+    // No silent caps: the dropped fraction is deopt population, price it.
+    let mut by_hash: std::collections::BTreeMap<u64, (usize, usize)> =
+        std::collections::BTreeMap::new(); // hash -> (block count, lane count)
+    for (i, (b, _)) in all_blocks.iter().enumerate() {
+        let e = by_hash.entry(b.shape_hash).or_insert((0usize, 0usize));
+        e.0 += 1;
+        e.1 += steady[i].vector_size;
     }
+    let dominant: u64 = *by_hash
+        .iter()
+        .max_by_key(|(_, (_, lanes))| *lanes)
+        .map(|(h, _)| h)
+        .unwrap();
+    let (dom_blocks, dom_lanes) = by_hash[&dominant];
+    let total_lanes: usize = by_hash.values().map(|(_, l)| *l).sum();
+    if by_hash.len() > 1 {
+        eprintln!(
+            "[emit-shape] {} {}-class shape hashes; dominant {:x} = {}/{} blocks, {}/{} lanes ({:.1}%); the rest deopt",
+            by_hash.len(), class, dominant, dom_blocks, all_blocks.len(),
+            dom_lanes, total_lanes, 100.0 * dom_lanes as f64 / total_lanes as f64
+        );
+        for (h, (bc, lc)) in &by_hash {
+            eprintln!("[emit-shape]   hash {:x}: {} blocks, {} lanes", h, bc, lc);
+        }
+    }
+    let keep: Vec<bool> = all_blocks.iter().map(|(b, _)| b.shape_hash == dominant).collect();
+    let steady: Vec<&celeste_rust::interpreter::state::State> = steady
+        .into_iter()
+        .zip(keep.iter())
+        .filter_map(|(s, &k)| if k { Some(s) } else { None })
+        .collect();
+    let blocks: Vec<(runtime2::Rt2, Vec<Option<celeste_rust::interpreter::heap::HeapId>>)> =
+        all_blocks
+            .into_iter()
+            .zip(keep.iter())
+            .filter_map(|(b, &k)| if k { Some(b) } else { None })
+            .collect();
+    let (b0, rev0) = &blocks[0];
     let names0 = celeste_rust::interpreter::merge_dump::cell_names(steady[0]);
     let ncells = b0.structure.len();
     let mut vary = vec![false; ncells];

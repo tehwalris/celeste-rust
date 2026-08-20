@@ -986,5 +986,13 @@
 {"id": "st20_023", "rule": "guard_branch", "fn": "__frame", "head": "it5_zc20_000_in_j2_006_if_join_5", "taken": true, "why": "update foreach: 4 objects, it5 nil-check breaks; class-conditioned witness sweep f27-94 (68 frames, 2026-08-20)"}
 {"id": "st20_024", "rule": "guard_branch", "fn": "__frame", "head": "it4_zc20_001_in_j2_008_if_join_5", "taken": false, "why": "draw foreach: 4 objects alive; class-conditioned witness sweep f27-94 (68 frames, 2026-08-20)"}
 {"id": "st20_025", "rule": "guard_branch", "fn": "__frame", "head": "it4_zc20_002_in_j2_009_if_join_5", "taken": false, "why": "draw foreach: 4 objects alive; class-conditioned witness sweep f27-94 (68 frames, 2026-08-20)"}
+{"id": "st20_strip", "rule": "strip_kills", "why": "member overlay opens kill-free; steady_kd re-derives on the final CFG"}
+{"id": "st20_xs0", "rule": "speculate", "fn": "__frame", "arm": "in_i1_012_and_or_continue_2", "join": "in_i1_012_and_or_join_4", "why": "seconds tick: hoist the pure level_index arm so the and_or join becomes if-convertible"}
+{"id": "st20_xc0", "rule": "if_convert", "fn": "__frame", "join": "in_i1_012_and_or_join_4", "why": "seconds tick (frames%30) - frame-uniform but not constant; trace10 xc002 mirror"}
+{"id": "st20_dc0", "rule": "demote_create", "fn": "__frame", "at": "%114", "why": "seconds cell exists from __init; drop the create so the tick arm is speculatable"}
+{"id": "st20_xs1", "rule": "speculate_region", "fn": "__frame", "head": "in_i1_012_and_or_join_4", "arm": "in_i1_012_if_body_5", "mask": true, "why": "seconds tick arm (seconds store) runs masked - frame-uniform condition, blended for the straight line"}
+{"id": "st20_mrg0", "rule": "merge_blocks", "why": "resolve single-edge phis left by the tick blend"}
+{"id": "st20_fs0", "rule": "fold_select"}
+{"id": "st20_f0", "rule": "fold"}
 {"id": "steady_dce", "rule": "dce"}
 {"id": "steady_kd", "rule": "kill_dead"}

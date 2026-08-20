@@ -87,6 +87,51 @@ fn apply_to_function(fun: &mut FunDef) -> usize {
     usize::from(super::super::print::format_function(fun) != before)
 }
 
+/// `strip_kills` - remove every derived `Kill` annotation, program-wide.
+///
+/// Kills are derived liveness annotations, not semantics. The structural
+/// rules (speculate, if_convert, unroll_loop, ...) refuse to operate around
+/// them because a stale kill after a code motion is a soundness bug; member
+/// overlays therefore open with `strip_kills`, transform freely, and close
+/// with `kill_dead` to re-derive the annotations on the final CFG.
+pub fn strip_apply(program: &mut Program) -> Result<usize> {
+    let mut changes = 0;
+    for fun in program.functions.values_mut() {
+        let before = super::super::print::format_function(fun);
+        strip_kills(fun);
+        changes += usize::from(super::super::print::format_function(fun) != before);
+    }
+    Ok(changes)
+}
+
+/// The stripped program must equal the input modulo kills, and contain none.
+pub fn strip_verify(before: &Program, after: &Program) -> Result<()> {
+    require(
+        before.functions.len() == after.functions.len(),
+        "strip_kills must not add or remove functions",
+    )?;
+    for (name, after_fun) in &after.functions {
+        let before_fun = after_fun_counterpart(before, name)?;
+        require(
+            strip_kills_text(before_fun) == super::super::print::format_function(after_fun),
+            format!(
+                "{}: strip_kills changed something other than kill instructions",
+                name.as_str()
+            ),
+        )?;
+        for (_, block) in all_blocks(&after_fun.cfg) {
+            require(
+                block
+                    .instructions
+                    .iter()
+                    .all(|(_, i)| !matches!(i, Instruction::Kill { .. })),
+                format!("{}: strip_kills left a kill behind", name.as_str()),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn strip_kills(fun: &mut FunDef) {
     for key in blocks_sorted(&fun.cfg) {
         if let Some(block) = get_block_mut(&mut fun.cfg, &key) {

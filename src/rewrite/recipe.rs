@@ -73,6 +73,10 @@ pub enum Rule {
     /// Changes no instructions - only where they are stored.
     AllocateSlots,
     KillDead,
+    /// Remove every derived `Kill` annotation. Member overlays open with
+    /// this so structural rules can move code freely, and close with
+    /// `kill_dead` to re-derive liveness on the final CFG.
+    StripKills,
     /// Merge blocks into single-successor predecessors.
     MergeBlocks,
     /// Local simplifications: constant conditions, degenerate phis.
@@ -546,6 +550,7 @@ impl Rule {
             Rule::Cse { .. } => "cse",
             Rule::AllocateSlots => "allocate_slots",
             Rule::KillDead => "kill_dead",
+            Rule::StripKills => "strip_kills",
             Rule::MergeBlocks => "merge_blocks",
             Rule::Fold => "fold",
             Rule::FoldReflexive { .. } => "fold_reflexive",
@@ -844,6 +849,7 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::Cse { forward, cells } => cse::apply(program, *forward, *cells),
         Rule::AllocateSlots => allocate_slots::apply(program),
         Rule::KillDead => kill_dead::apply(program),
+        Rule::StripKills => kill_dead::strip_apply(program),
         Rule::MergeBlocks => merge_blocks::apply(program),
         Rule::Fold => fold::apply(program),
         Rule::FoldReflexive { pointers } => fold_reflexive::apply(program, *pointers),
@@ -987,6 +993,7 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::Cse { forward, cells } => cse::verify(&before, program, *forward, *cells),
         Rule::AllocateSlots => allocate_slots::verify(&before, program),
         Rule::KillDead => kill_dead::verify(&before, program),
+        Rule::StripKills => kill_dead::strip_verify(&before, program),
         Rule::MergeBlocks => merge_blocks::verify(&before, program),
         Rule::Fold => fold::verify(&before, program),
         Rule::FoldReflexive { pointers } => {
