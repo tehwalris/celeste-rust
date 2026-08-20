@@ -335,11 +335,15 @@ pub fn verify(
     let (closure_id, _args) = call_operands(&before_block.instructions[call_index].1)
         .ok_or_else(|| anyhow!("inline: %{} was not a Call", usize::from(call_id)))?;
 
+    // The original call: the instruction bound to `call_id` must no longer
+    // be a Call. (Checking per-id, not per-block: several calls through the
+    // same closure can share one merged block, and the others legitimately
+    // survive this entry.)
     for block in after_caller.cfg.iter_blocks() {
-        for (_, instr) in &block.instructions {
+        for (i, instr) in &block.instructions {
             require(
-                !matches!(instr, Instruction::Call { closure, .. } if *closure == closure_id
-                          && block.instructions.iter().any(|(i, _)| *i == call_id)),
+                !(*i == call_id
+                    && matches!(instr, Instruction::Call { closure, .. } if *closure == closure_id)),
                 "inline: the original call is still present",
             )?;
         }

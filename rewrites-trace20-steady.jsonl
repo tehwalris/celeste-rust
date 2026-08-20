@@ -1058,4 +1058,30 @@
 {"id": "st20_fs4", "rule": "fold_select"}
 {"id": "st20_f2", "rule": "fold"}
 {"id": "st20_dce5", "rule": "dce"}
+{"id": "st20_xc1", "rule": "if_convert", "fn": "__frame", "join": "in_t20i_004_in_h061_and_or_join_65", "why": "input short-circuit triangle; trace10 xc015 mirror"}
+{"id": "st20_dc8", "rule": "demote_create", "fn": "__frame", "at": "%11903", "why": "cell exists; drop the create so the dash-trigger arm is speculatable"}
+{"id": "st20_dc9", "rule": "demote_create", "fn": "__frame", "at": "%11919", "why": "cell exists; drop the create so the dash-trigger arm is speculatable"}
+{"id": "st20_xs4", "rule": "speculate_region", "fn": "__frame", "head": "in_t20i_004_in_h061_if_body_107", "arm": "in_t20i_004_in_h061_and_or_continue_113", "expand": true, "why": "jump/dash chain or-arm (btn read + concretization) runs eagerly; trace10 xs011 mirror"}
+{"id": "st20_dt1", "rule": "decompose_truthy", "fn": "__frame", "root": "%11062", "why": "jump/dash and/or cascade -> (t,n) pairs after the 113 arm blend"}
+{"id": "st20_zt1", "rule": "speculate_region", "fn": "__frame", "head": "in_t20i_004_in_h061_and_or_join_65", "arm": "in_t20i_004_in_h061_if_body_107", "expand": true, "mask": true, "guards": true, "why": "dash/jump trigger arm (btn reads + masked stores) diverges per lane in-class; trace10 zt001 mirror, guards masked per the f27 lesson"}
+{"id": "st20_ztm", "rule": "merge_blocks"}
+{"forward": true, "id": "st20_ztc", "rule": "cse"}
+{"id": "st20_ztd", "rule": "dce"}
+{"id": "st20_zn000", "rule": "inline", "fn": "__frame", "at": "%1552", "callee": "anonymous_63", "captures": [], "why": "draw foreach peel it2: inline the draw callback (trace10 zn000/zn002 mirror)"}
+{"id": "st20_zn001", "rule": "inline", "fn": "__frame", "at": "%1985", "callee": "anonymous_63", "captures": [], "why": "draw foreach peel it3: inline the draw callback (trace10 zn000/zn002 mirror)"}
+{"id": "st20_zn002", "rule": "inline", "fn": "__frame", "at": "%2013", "callee": "anonymous_63", "captures": [], "why": "draw foreach peel it4: inline the draw callback (trace10 zn000/zn002 mirror)"}
+{"id": "st20_zn003", "rule": "inline", "fn": "__frame", "at": "%2041", "callee": "anonymous_63", "captures": [], "why": "draw foreach peel it5: inline the draw callback (trace10 zn000/zn002 mirror)"}
+{"id": "st20_zn004", "rule": "inline", "fn": "__frame", "at": "%1595", "callee": "anonymous_64", "captures": [], "why": "draw foreach peel it2: inline the draw callback (trace10 zn001/zn003 mirror)"}
+{"id": "st20_zn005", "rule": "inline", "fn": "__frame", "at": "%2096", "callee": "anonymous_64", "captures": [], "why": "draw foreach peel it3: inline the draw callback (trace10 zn001/zn003 mirror)"}
+{"id": "st20_zn006", "rule": "inline", "fn": "__frame", "at": "%2124", "callee": "anonymous_64", "captures": [], "why": "draw foreach peel it4: inline the draw callback (trace10 zn001/zn003 mirror)"}
+{"id": "st20_zn007", "rule": "inline", "fn": "__frame", "at": "%2152", "callee": "anonymous_64", "captures": [], "why": "draw foreach peel it5: inline the draw callback (trace10 zn001/zn003 mirror)"}
+{"forward": true, "id": "st20_znc", "rule": "cse"}
+{"id": "st20_znd", "rule": "dce"}
+{"id": "st20_znm", "rule": "merge_blocks"}
+{"id": "st20_zt2", "rule": "drop_dead_cell", "fn": "__frame", "cell": "%175", "why": "anonymous_63 closure cell: all calls inlined, only guard reads remain; trace10 zt000 pattern"}
+{"id": "st20_zt3", "rule": "drop_dead_cell", "fn": "__frame", "cell": "%182", "why": "anonymous_64 closure cell: same"}
+{"id": "st20_fzm", "rule": "merge_blocks"}
+{"forward": true, "id": "st20_fzc", "rule": "cse"}
+{"id": "st20_fzf", "rule": "fold_select"}
+{"id": "st20_fzd", "rule": "dce"}
 {"id": "steady_kd", "rule": "kill_dead"}

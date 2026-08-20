@@ -585,9 +585,15 @@ fn site(
     splits: bool,
     guards: bool,
 ) -> Result<Site> {
-    let head_block = fun.cfg.named.get(head).ok_or_else(|| {
-        anyhow!("no block named '{}' in {}", head.as_str(), function)
-    })?;
+    // `__entry` names the entry block, the guard_branch convention: after
+    // enough straightening the head's branch ends up in the merged entry.
+    let head_block = if head.as_str() == "__entry" {
+        &fun.cfg.entry
+    } else {
+        fun.cfg.named.get(head).ok_or_else(|| {
+            anyhow!("no block named '{}' in {}", head.as_str(), function)
+        })?
+    };
     let Terminator::ConditionalBranch { condition, true_target, false_target } =
         head_block.terminator_kind()
     else {
@@ -726,7 +732,9 @@ fn site(
                         in_region.contains(pred_label)
                             || (&label == entry && pred_label == head)
                     }
-                    None => false,
+                    // The unnamed entry block as predecessor: allowed exactly
+                    // when it IS the head (addressed as `__entry`).
+                    None => &label == entry && head.as_str() == "__entry",
                 };
                 require(
                     allowed,
@@ -1389,7 +1397,11 @@ pub fn apply(
     let fun = program.get_mut(function)?;
 
     // The head's branch becomes an unconditional jump into the region.
-    let head_block = fun.cfg.named.get_mut(head).unwrap();
+    let head_block = if head.as_str() == "__entry" {
+        &mut fun.cfg.entry
+    } else {
+        fun.cfg.named.get_mut(head).unwrap()
+    };
     head_block.terminator.1 = Terminator::UnconditionalBranch { target: arm.clone() };
 
     // A diamond serializes: the named arm's exit continues into the second
