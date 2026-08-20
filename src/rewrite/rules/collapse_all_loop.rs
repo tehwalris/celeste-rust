@@ -21,9 +21,12 @@
 //! nil check that do, all carried through cells (`idx`, `last`), not SSA.
 //! `collapse_loop`'s `bound == init` guard compares `32767 == 1` and fires
 //! on frame 1; `collapse_break_loop` demands the pre-#112 length check.
-//! This rule states the singleton-table behaviour of the NEW shape: the
-//! payload runs exactly once, and iteration 2's nil check breaks. This is
-//! open task #113's missing rule.
+//! This rule states the small-table behaviour of the NEW shape: the payload
+//! runs at most `trip` times (each peel keeps its REAL nil-check branch, so
+//! smaller tables break early through the shared trampoline), and iteration
+//! `trip`+1's nil check breaks - asserted. `trip` defaults to 2, the rule's
+//! historical shape (task #113's missing rule); room (2,0)'s four-object
+//! table uses `trip: 4`.
 //!
 //! # The shape
 //!
@@ -145,12 +148,22 @@ fn site(fun: &FunDef, function: &str, head: &Label) -> Result<Site> {
         check != exit && check != *head && exit != *head,
         format!("the branch of '{}' must leave to two distinct other blocks", head.as_str()),
     )?;
+    // `kill` instructions are liveness bookkeeping, not semantics: a base
+    // recipe that ran `kill_dead` leaves one in the head (killing the latch
+    // increment the phi just consumed). The head is deleted whole, so they
+    // are simply tolerated; the recipe's own trailing `kill_dead` re-derives
+    // placement afterwards.
+    let non_kill: Vec<&(LocalId, Instruction)> = head_block
+        .instructions
+        .iter()
+        .filter(|(_, i)| !matches!(i, Instruction::Kill { .. }))
+        .collect();
     require(
-        head_block.instructions.len() == 2,
+        non_kill.len() == 2,
         format!("'{}' must hold exactly the counter phi and its compare", head.as_str()),
     )?;
-    let (counter, counter_phi) = &head_block.instructions[0];
-    let (cmp_id, cmp) = &head_block.instructions[1];
+    let (counter, counter_phi) = non_kill[0];
+    let (cmp_id, cmp) = non_kill[1];
     require(cmp_id == condition, format!("'{}' must branch on its own compare", head.as_str()))?;
     let Instruction::Phi { branches } = counter_phi else {
         return Err(anyhow!("'{}' does not start with the counter phi", head.as_str()));
@@ -294,13 +307,16 @@ fn site(fun: &FunDef, function: &str, head: &Label) -> Result<Site> {
         .get(&brk)
         .ok_or_else(|| anyhow!("break block '{}' does not exist", brk.as_str()))?;
     require(
-        brk_block.instructions.is_empty()
+        brk_block
+            .instructions
+            .iter()
+            .all(|(_, i)| matches!(i, Instruction::Kill { .. }))
             && matches!(
                 brk_block.terminator_kind(),
                 Terminator::UnconditionalBranch { target } if *target == exit
             )
             && !brk_block.hint_normalize,
-        format!("'{}' must be empty and branch straight to the exit", brk.as_str()),
+        format!("'{}' must be empty (kills tolerated) and branch straight to the exit", brk.as_str()),
     )?;
     require(
         preds.get(&Some(brk.clone())).map(|p| p.as_slice()) == Some(&[Some(nil_check.clone())][..]),
@@ -365,6 +381,9 @@ fn site(fun: &FunDef, function: &str, head: &Label) -> Result<Site> {
         }
         let block = get_block(&fun.cfg, &key).expect("listed block exists");
         for (_, instr) in &block.instructions {
+            if matches!(instr, Instruction::Kill { .. }) {
+                continue; // liveness bookkeeping, not a semantic use
+            }
             for used in instr.get_used_locals() {
                 require(
                     !chain_defs.contains(&used),
@@ -399,6 +418,9 @@ fn site(fun: &FunDef, function: &str, head: &Label) -> Result<Site> {
         let in_head = key.as_ref() == Some(head);
         let in_body = matches!(&key, Some(l) if body_region.contains(l));
         for (id, instr) in &block.instructions {
+            if matches!(instr, Instruction::Kill { .. }) {
+                continue; // liveness bookkeeping, not a semantic use
+            }
             for used in instr.get_used_locals() {
                 if used == *counter {
                     require(
@@ -424,6 +446,9 @@ fn site(fun: &FunDef, function: &str, head: &Label) -> Result<Site> {
         for (id, instr) in &block.instructions {
             if key.as_ref() == Some(head) && id == counter {
                 continue; // the phi itself
+            }
+            if matches!(instr, Instruction::Kill { .. }) {
+                continue; // liveness bookkeeping, not a semantic use
             }
             require(
                 !instr.get_used_locals().contains(&inc),
@@ -475,7 +500,20 @@ fn substitute(block: &mut Block, map: &FxHashMap<LocalId, LocalId>) {
     block.terminator = (tid, term.map_local_ids(|l| *map.get(&l).unwrap_or(&l)));
 }
 
-pub fn apply(program: &mut Program, rewrite_id: &str, function: &str, head: &str) -> Result<usize> {
+pub fn apply(
+    program: &mut Program,
+    rewrite_id: &str,
+    function: &str,
+    head: &str,
+    trip: Option<usize>,
+) -> Result<usize> {
+    // `trip` = the maximum table size this collapse claims: that many payload
+    // peels, each keeping its REAL nil-check branch (a smaller table breaks
+    // early through the shared trampoline), then an asserted break at
+    // iteration trip+1. The historical shape of this rule is trip 2, so an
+    // absent field replays existing recipes byte-identically.
+    let trip = trip.unwrap_or(2);
+    require(trip >= 1, "trip must be at least 1".to_string())?;
     let head = Label::from(head.to_string());
     let fun = program.get(function)?;
     let s = site(fun, function, &head)?;
@@ -500,18 +538,21 @@ pub fn apply(program: &mut Program, rewrite_id: &str, function: &str, head: &str
     let with_payload =
         [s.check.clone(), s.advance.clone(), s.nil_check.clone(), s.latch.clone()];
 
-    // Build the copies for iterations 2 (chain + payload, real branches) and
-    // 3 (chain only, break asserted). Each iteration's counter value: the
-    // previous payload copy's latch increment.
+    // Build the copies for iterations 2..=trip (chain + payload, real
+    // branches) and trip+1 (chain only, break asserted). Each iteration's
+    // counter value: the previous payload copy's latch increment.
     let it_label = |it: usize, l: &Label| {
         Label::from(format!("it{}_{}_{}", it, rewrite_id, l.as_str()))
     };
     let mut copies: Vec<(Label, Block)> = Vec::new();
-    let counter_of_it3; // iteration 2's copy of the latch increment
-    {
-        // --- iteration 2: chain + payload ---
+    // The counter value entering the iteration being built - iteration 2's
+    // is the original latch increment, each later one the previous copy's
+    // rename of it.
+    let mut prev_counter = s.inc;
+    for it in 2..=trip {
+        // --- iteration `it`: chain + payload ---
         let mut rename: FxHashMap<LocalId, LocalId> = FxHashMap::default();
-        rename.insert(s.counter, s.inc);
+        rename.insert(s.counter, prev_counter);
         for label in &with_payload {
             let block = fun_ref.cfg.named.get(label).expect("loop block exists");
             for (id, _) in &block.instructions {
@@ -519,7 +560,7 @@ pub fn apply(program: &mut Program, rewrite_id: &str, function: &str, head: &str
             }
             rename.insert(block.terminator.0, ids.fresh());
         }
-        counter_of_it3 = rename[&s.inc];
+        let next_counter = rename[&s.inc];
         for label in &with_payload {
             let original = fun_ref.cfg.named.get(label).expect("loop block exists");
             let mut instructions: Vec<(LocalId, Instruction)> = original
@@ -531,14 +572,14 @@ pub fn apply(program: &mut Program, rewrite_id: &str, function: &str, head: &str
                 .collect();
             let terminator = match original.terminator_kind() {
                 Terminator::ConditionalBranch { condition, true_target, false_target } => {
-                    // C -> {A, J} and J -> {B, E}: chain targets map to the
-                    // iteration-2 copies; the break target B stays (it is the
+                    // C -> {A, J} and J -> {B, E}: chain targets map to this
+                    // iteration's copies; the break target B stays (it is the
                     // shared uniform exit trampoline).
                     let map_t = |t: &Label| {
                         if t == &s.brk {
                             s.brk.clone()
                         } else {
-                            it_label(2, t)
+                            it_label(it, t)
                         }
                     };
                     Terminator::ConditionalBranch {
@@ -549,10 +590,12 @@ pub fn apply(program: &mut Program, rewrite_id: &str, function: &str, head: &str
                 }
                 Terminator::UnconditionalBranch { target } => {
                     if label == &s.latch {
-                        // iteration 2's latch continues into iteration 3
-                        Terminator::UnconditionalBranch { target: it_label(3, &s.check) }
+                        // this iteration's latch continues into the next
+                        Terminator::UnconditionalBranch {
+                            target: it_label(it + 1, &s.check),
+                        }
                     } else {
-                        Terminator::UnconditionalBranch { target: it_label(2, target) }
+                        Terminator::UnconditionalBranch { target: it_label(it, target) }
                     }
                 }
                 other => {
@@ -564,12 +607,12 @@ pub fn apply(program: &mut Program, rewrite_id: &str, function: &str, head: &str
                 }
             };
             if label == &s.check {
-                // iteration 2's head test, as a guard at the copy's entry
+                // this iteration's head test, as a guard at the copy's entry
                 let g = ids.fresh();
                 let a = ids.fresh();
                 let mut with_guard = vec![
                     (g, Instruction::BinaryOp {
-                        left: s.inc,
+                        left: prev_counter,
                         op: BinaryOp::LessThanEqual,
                         right: s.sentinel,
                     }),
@@ -580,7 +623,7 @@ pub fn apply(program: &mut Program, rewrite_id: &str, function: &str, head: &str
                 changes += 2;
             }
             copies.push((
-                it_label(2, label),
+                it_label(it, label),
                 Block {
                     instructions,
                     terminator: (
@@ -592,11 +635,13 @@ pub fn apply(program: &mut Program, rewrite_id: &str, function: &str, head: &str
             ));
             changes += 1;
         }
+        prev_counter = next_counter;
     }
+    let counter_of_last = prev_counter;
     {
-        // --- iteration 3: chain only, break asserted ---
+        // --- iteration trip+1: chain only, break asserted ---
         let mut rename: FxHashMap<LocalId, LocalId> = FxHashMap::default();
-        rename.insert(s.counter, counter_of_it3);
+        rename.insert(s.counter, counter_of_last);
         for label in &chain {
             let block = fun_ref.cfg.named.get(label).expect("chain block exists");
             for (id, _) in &block.instructions {
@@ -625,13 +670,13 @@ pub fn apply(program: &mut Program, rewrite_id: &str, function: &str, head: &str
                     } else {
                         Terminator::ConditionalBranch {
                             condition: *rename.get(condition).unwrap_or(condition),
-                            true_target: it_label(3, true_target),
-                            false_target: it_label(3, false_target),
+                            true_target: it_label(trip + 1, true_target),
+                            false_target: it_label(trip + 1, false_target),
                         }
                     }
                 }
                 Terminator::UnconditionalBranch { target } => {
-                    Terminator::UnconditionalBranch { target: it_label(3, target) }
+                    Terminator::UnconditionalBranch { target: it_label(trip + 1, target) }
                 }
                 other => {
                     return Err(anyhow!(
@@ -646,7 +691,7 @@ pub fn apply(program: &mut Program, rewrite_id: &str, function: &str, head: &str
                 let a = ids.fresh();
                 let mut with_guard = vec![
                     (g, Instruction::BinaryOp {
-                        left: counter_of_it3,
+                        left: counter_of_last,
                         op: BinaryOp::LessThanEqual,
                         right: s.sentinel,
                     }),
@@ -657,7 +702,7 @@ pub fn apply(program: &mut Program, rewrite_id: &str, function: &str, head: &str
                 changes += 2;
             }
             copies.push((
-                it_label(3, label),
+                it_label(trip + 1, label),
                 Block {
                     instructions,
                     terminator: (
@@ -738,7 +783,16 @@ pub fn apply(program: &mut Program, rewrite_id: &str, function: &str, head: &str
 /// Independent check: the preconditions held on the before program, and the
 /// after program has the peeled structure - head gone, guards present, the
 /// iteration copies present, everything outside the function untouched.
-pub fn verify(before: &Program, after: &Program, rewrite_id: &str, function: &str, head: &str) -> Result<()> {
+pub fn verify(
+    before: &Program,
+    after: &Program,
+    rewrite_id: &str,
+    function: &str,
+    head: &str,
+    trip: Option<usize>,
+) -> Result<()> {
+    let trip = trip.unwrap_or(2);
+    require(trip >= 1, "trip must be at least 1".to_string())?;
     let head_label = Label::from(head.to_string());
     let before_fun = before.get(function)?;
     let s = site(before_fun, function, &head_label)?;
@@ -762,22 +816,24 @@ pub fn verify(before: &Program, after: &Program, rewrite_id: &str, function: &st
         after_fun.cfg.named.contains_key(&s.brk),
         "the break trampoline must survive".to_string(),
     )?;
-    for original in [&s.check, &s.advance, &s.nil_check, &s.latch] {
-        let copy = Label::from(format!("it2_{}_{}", rewrite_id, original.as_str()));
-        require(
-            after_fun.cfg.named.contains_key(&copy),
-            format!("iteration-2 copy '{}' is missing", copy.as_str()),
-        )?;
+    for it in 2..=trip {
+        for original in [&s.check, &s.advance, &s.nil_check, &s.latch] {
+            let copy = Label::from(format!("it{}_{}_{}", it, rewrite_id, original.as_str()));
+            require(
+                after_fun.cfg.named.contains_key(&copy),
+                format!("iteration-{} copy '{}' is missing", it, copy.as_str()),
+            )?;
+        }
     }
     for original in [&s.check, &s.advance, &s.nil_check] {
-        let copy = Label::from(format!("it3_{}_{}", rewrite_id, original.as_str()));
+        let copy = Label::from(format!("it{}_{}_{}", trip + 1, rewrite_id, original.as_str()));
         require(
             after_fun.cfg.named.contains_key(&copy),
-            format!("iteration-3 copy '{}' is missing", copy.as_str()),
+            format!("iteration-{} copy '{}' is missing", trip + 1, copy.as_str()),
         )?;
     }
-    // The planted guards: preheader head-test, iteration-2 and -3 head
-    // tests, iteration-3 break assert.
+    // The planted guards: preheader head-test, one head test per copied
+    // iteration (2..=trip+1), and the final break assert.
     let count_asserts = |fun: &FunDef| -> usize {
         let mut n = 0;
         for block in fun.cfg.iter_blocks() {
@@ -790,11 +846,11 @@ pub fn verify(before: &Program, after: &Program, rewrite_id: &str, function: &st
         n
     };
     require(
-        count_asserts(after_fun) == count_asserts(before_fun) + 4,
-        "expected exactly four new assert_true guards".to_string(),
+        count_asserts(after_fun) == count_asserts(before_fun) + trip + 2,
+        format!("expected exactly {} new assert_true guards", trip + 2),
     )?;
-    // Iteration 1 and 2 keep REAL nil-check branches; iteration 3's falls
-    // through to the exit.
+    // Iterations 1..=trip keep REAL nil-check branches; iteration trip+1's
+    // falls through to the exit.
     let nil1 = after_fun
         .cfg
         .named
@@ -804,17 +860,28 @@ pub fn verify(before: &Program, after: &Program, rewrite_id: &str, function: &st
         matches!(nil1.terminator_kind(), Terminator::ConditionalBranch { .. }),
         "iteration 1's nil check must stay a real branch".to_string(),
     )?;
-    let nil3 = after_fun
+    for it in 2..=trip {
+        let nil = after_fun
+            .cfg
+            .named
+            .get(&Label::from(format!("it{}_{}_{}", it, rewrite_id, s.nil_check.as_str())))
+            .expect("checked above");
+        require(
+            matches!(nil.terminator_kind(), Terminator::ConditionalBranch { .. }),
+            format!("iteration {}'s nil check must stay a real branch", it),
+        )?;
+    }
+    let nil_last = after_fun
         .cfg
         .named
-        .get(&Label::from(format!("it3_{}_{}", rewrite_id, s.nil_check.as_str())))
+        .get(&Label::from(format!("it{}_{}_{}", trip + 1, rewrite_id, s.nil_check.as_str())))
         .expect("checked above");
     require(
         matches!(
-            nil3.terminator_kind(),
+            nil_last.terminator_kind(),
             Terminator::UnconditionalBranch { target } if *target == s.exit
         ),
-        "iteration 3's nil check must fall through to the exit".to_string(),
+        format!("iteration {}'s nil check must fall through to the exit", trip + 1),
     )?;
     Ok(())
 }

@@ -451,6 +451,13 @@ pub enum Rule {
         function: String,
         /// The sentinel loop header.
         head: String,
+        /// Maximum table size the collapse claims: that many payload peels
+        /// (each keeping its REAL nil-check branch, so smaller tables break
+        /// early through the shared trampoline) and an asserted break at
+        /// iteration `trip`+1. Absent means 2, the rule's historical shape -
+        /// existing recipes replay byte-identically.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trip: Option<usize>,
     },
     /// Replace a counted loop whose trip count is statically known (constant
     /// init, step and bound on the branch-deciding counter - the shape
@@ -905,8 +912,8 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::CollapseBreakLoop { function, head } => {
             collapse_break_loop::apply(program, function, head)
         }
-        Rule::CollapseAllLoop { function, head } => {
-            collapse_all_loop::apply(program, &entry.id, function, head)
+        Rule::CollapseAllLoop { function, head, trip } => {
+            collapse_all_loop::apply(program, &entry.id, function, head, *trip)
         }
         Rule::UnrollLoop { function, head, trip, exits } => {
             unroll_loop::apply(program, function, head, *trip, exits)
@@ -1064,8 +1071,8 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::CollapseBreakLoop { function, head } => {
             collapse_break_loop::verify(&before, program, function, head)
         }
-        Rule::CollapseAllLoop { function, head } => {
-            collapse_all_loop::verify(&before, program, &entry.id, function, head)
+        Rule::CollapseAllLoop { function, head, trip } => {
+            collapse_all_loop::verify(&before, program, &entry.id, function, head, *trip)
         }
         Rule::UnrollLoop { function, head, trip, exits } => {
             unroll_loop::verify(&before, program, function, head, *trip, exits)
