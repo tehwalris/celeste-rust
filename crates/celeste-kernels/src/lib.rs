@@ -30,6 +30,14 @@ pub mod kernel_gen_dash;
 pub mod kernel_gen_frozen;
 pub mod kernel_gen_steady;
 
+// Room (2,0) class kernels: shape (fruit, spring, spring, player), the
+// dominant witness shape hash per class. Same emitter, the trace20
+// overlays; the springs add two per-lane row columns (delay, spr) and
+// the fruit is fully block-uniform (the #170 boundary widening).
+pub mod kernel_gen_r20_dash;
+pub mod kernel_gen_r20_frozen;
+pub mod kernel_gen_r20_steady;
+
 /// The fused specialization-set artifact (plans/shape-tag-plan.md): the
 /// steady member plus the dying members in one kernel, per-member deopt.
 /// GENERATED PER CAMPAIGN (`transpile --fuse`), gitignored, feature-gated:

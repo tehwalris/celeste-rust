@@ -331,6 +331,53 @@ pub fn zi_cmp(op: Cmp, a: ZI, b: ZI) -> ZB {
     ZB { val, known }
 }
 
+/// `zi_cmp`'s scalar sibling: one block-uniform interval pair, tri-state
+/// out. `Some` when every value pair decides the comparison the same way,
+/// `None` when the intervals straddle - the caller (a `K::STri`) deopts
+/// the slice on `None` if the result feeds a branch-like consumer.
+#[inline(always)]
+pub fn si_cmp(op: Cmp, a: (P8, P8), b: (P8, P8)) -> Option<bool> {
+    let (al, ah, bl, bh) = (a.0, a.1, b.0, b.1);
+    match op {
+        Cmp::Lt => {
+            if ah < bl {
+                Some(true)
+            } else if al >= bh {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        Cmp::Le => {
+            if ah <= bl {
+                Some(true)
+            } else if al > bh {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        Cmp::Gt => {
+            if al > bh {
+                Some(true)
+            } else if ah <= bl {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        Cmp::Ge => {
+            if al >= bh {
+                Some(true)
+            } else if ah < bl {
+                Some(false)
+            } else {
+                None
+            }
+        }
+    }
+}
+
 // ---- bool ops ----
 
 #[inline(always)]

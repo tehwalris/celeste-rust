@@ -39,6 +39,16 @@ for class in steady dash frozen; do
         "$SCRATCH/kernel_gen_$class.rs"
 done
 
+# Room (2,0) class kernels: same emitter, (2,0) overlays and witnesses.
+# CELESTE_START_ROOM matters - the recipes replay against the (2,0) compile.
+for class in steady dash frozen; do
+    echo "==> r20 $class kernel"
+    CELESTE_START_ROOM=2,0 ./target/release/transpile \
+        --recipe "rewrites-trace20-$class.jsonl" \
+        --kernel "crates/celeste-kernels/witness/r20-$class-shape.json" \
+        "$SCRATCH/kernel_gen_r20_$class.rs"
+done
+
 echo "==> installing into a scratch checkout of the generated crates"
 BACKUP=$(mktemp -d)
 cp crates/celeste-names/src/gen.rs "$BACKUP/"
@@ -50,6 +60,7 @@ restore() { cp "$BACKUP"/gen.rs crates/celeste-names/src/;
 cp "$SCRATCH/gen.rs" crates/celeste-names/src/gen.rs
 for class in steady dash frozen; do
     cp "$SCRATCH/kernel_gen_$class.rs" "crates/celeste-kernels/src/kernel_gen_$class.rs"
+    cp "$SCRATCH/kernel_gen_r20_$class.rs" "crates/celeste-kernels/src/kernel_gen_r20_$class.rs"
 done
 
 echo "==> checking the workspace still builds with them"

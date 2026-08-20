@@ -438,4 +438,46 @@ mod tests {
             check(&format!("crates/celeste-kernels/src/kernel_gen_{}.rs", class), fresh);
         }
     }
+
+    /// The room (2,0) siblings of `generated_is_current`. A separate test
+    /// because the start room is a process-global OnceLock: under nextest
+    /// (the mandated runner) each test owns its process, so setting the
+    /// env var first pins THIS process to the (2,0) compile.
+    #[test]
+    fn generated_is_current_r20() {
+        std::env::set_var("CELESTE_START_ROOM", "2,0");
+        let regen = |recipe: &str| {
+            let r = crate::rewrite::recipe::Recipe::load(recipe)
+                .unwrap_or_else(|e| panic!("load {} (run from the repo root): {}", recipe, e));
+            crate::rewrite::recipe::build(&r)
+                .unwrap_or_else(|e| panic!("apply {}: {}", recipe, e))
+                .0
+        };
+        let check = |path: &str, fresh: String| {
+            let on_disk = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("read {}: {}", path, e));
+            if on_disk != fresh {
+                let (a, b) = (on_disk.lines().count(), fresh.lines().count());
+                let first = on_disk
+                    .lines()
+                    .zip(fresh.lines())
+                    .position(|(x, y)| x != y)
+                    .map(|i| i + 1);
+                panic!(
+                    "{} is STALE: on disk {} lines, emitter says {} lines, \
+                     first differing line {:?}. Run ./regen-generated.sh. \
+                     A diff here moves the row keys - read it before committing.",
+                    path, a, b, first
+                );
+            }
+        };
+        for class in ["steady", "dash", "frozen"] {
+            let recipe = format!("rewrites-trace20-{}.jsonl", class);
+            let program = regen(&recipe);
+            let witness = format!("crates/celeste-kernels/witness/r20-{}-shape.json", class);
+            let fresh = crate::transpile::kernel::emit_kernel_text(&program, &witness)
+                .unwrap_or_else(|e| panic!("emit r20 {} kernel: {:?}", class, e));
+            check(&format!("crates/celeste-kernels/src/kernel_gen_r20_{}.rs", class), fresh);
+        }
+    }
 }
