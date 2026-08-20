@@ -75,6 +75,12 @@ struct Site {
     exit: Label,
     /// The body chain, entry first, latch last.
     chain: Vec<Label>,
+    /// Per chain block: `None` for the plain unconditional step, or the
+    /// early-exit conditional: (condition id, exit-arm label, true when the
+    /// EXIT is the true target). The arm block is copied per iteration.
+    chain_exits: Vec<Option<(LocalId, Label, bool)>>,
+    /// The distinct exit-arm labels, in first-use order.
+    arms: Vec<Label>,
     /// The head's phis in order: (id, value on the preheader edge, value on
     /// the latch edge).
     phis: Vec<(LocalId, LocalId, LocalId)>,
@@ -82,6 +88,13 @@ struct Site {
     rest: Vec<(LocalId, Instruction)>,
     /// How many times the body runs.
     trip_count: usize,
+    /// Guard mode (recipe `trip`): the bound is not a constant; the premise
+    /// `bound == init + (trip-1)*step` is asserted in the first head copy.
+    /// (Sufficient for the trip count under `<=` and a positive step, the
+    /// collapse_loop doctrine at N > 1: equality makes exactly `trip`
+    /// head tests pass. A lane whose bound differs fails the guard loudly
+    /// and deopts.)
+    guard: Option<(LocalId, crate::pico8_num::Pico8Num)>,
 }
 
 fn number_constant(fun: &FunDef, id: LocalId) -> Option<i32> {
@@ -98,7 +111,13 @@ fn number_constant(fun: &FunDef, id: LocalId) -> Option<i32> {
     None
 }
 
-fn site(fun: &FunDef, function: &str, head: &Label) -> Result<Site> {
+fn site(
+    fun: &FunDef,
+    function: &str,
+    head: &Label,
+    forced_trip: Option<usize>,
+    exits: &[Label],
+) -> Result<Site> {
     let head_block = fun
         .cfg
         .named
@@ -136,10 +155,17 @@ fn site(fun: &FunDef, function: &str, head: &Label) -> Result<Site> {
         }
     }
 
-    // The chain: single unconditional steps from the body entry back to the
-    // head, each block reached only from the previous one.
+    // The chain: single steps from the body entry back to the head, each
+    // block reached only from the previous one. A chain block may end in a
+    // conditional branch IF one side is a recipe-named exit arm (a
+    // single-predecessor, phi-free block that unconditionally leaves the
+    // loop); the other side continues the chain. Arms are copied per
+    // iteration by `apply`, so the early exit keeps its branching structure
+    // - the unroll stays a pure renaming.
     let preds = predecessors(&fun.cfg);
     let mut chain: Vec<Label> = Vec::new();
+    let mut chain_exits: Vec<Option<(LocalId, Label, bool)>> = Vec::new();
+    let mut arms: Vec<Label> = Vec::new();
     let mut current = body_entry.clone();
     loop {
         require(
@@ -169,10 +195,68 @@ fn site(fun: &FunDef, function: &str, head: &Label) -> Result<Site> {
             block_preds == vec![Some(expected_pred)],
             format!("body block '{}' has predecessors outside the chain", current.as_str()),
         )?;
-        let Terminator::UnconditionalBranch { target } = block.terminator_kind() else {
-            return Err(anyhow!("body block '{}' does not branch unconditionally", current.as_str()));
+        let target = match block.terminator_kind() {
+            Terminator::UnconditionalBranch { target } => {
+                chain_exits.push(None);
+                target.clone()
+            }
+            Terminator::ConditionalBranch { condition, true_target, false_target } => {
+                let (arm, cont, exit_on_true) = if exits.contains(true_target) {
+                    (true_target.clone(), false_target.clone(), true)
+                } else if exits.contains(false_target) {
+                    (false_target.clone(), true_target.clone(), false)
+                } else {
+                    return Err(anyhow!(
+                        "body block '{}' branches conditionally and neither target is a recipe-named exit arm",
+                        current.as_str()
+                    ));
+                };
+                require(
+                    !arms.contains(&arm),
+                    format!("exit arm '{}' is reached from two chain blocks", arm.as_str()),
+                )?;
+                let arm_block = fun
+                    .cfg
+                    .named
+                    .get(&arm)
+                    .ok_or_else(|| anyhow!("exit arm '{}' does not exist", arm.as_str()))?;
+                require(
+                    !arm_block.hint_normalize,
+                    format!("exit arm '{}' is a hint_normalize block", arm.as_str()),
+                )?;
+                require(
+                    !arm_block.instructions.iter().any(|(_, i)| matches!(i, Instruction::Phi { .. })),
+                    format!("exit arm '{}' contains a phi", arm.as_str()),
+                )?;
+                let arm_preds = preds.get(&Some(arm.clone())).cloned().unwrap_or_default();
+                require(
+                    arm_preds == vec![Some(current.clone())],
+                    format!("exit arm '{}' has predecessors outside the chain", arm.as_str()),
+                )?;
+                let Terminator::UnconditionalBranch { target: arm_target } =
+                    arm_block.terminator_kind()
+                else {
+                    return Err(anyhow!(
+                        "exit arm '{}' does not branch unconditionally",
+                        arm.as_str()
+                    ));
+                };
+                require(
+                    arm_target != head && arm_target != &current,
+                    format!("exit arm '{}' does not leave the loop", arm.as_str()),
+                )?;
+                chain_exits.push(Some((*condition, arm.clone(), exit_on_true)));
+                arms.push(arm);
+                cont
+            }
+            other => {
+                return Err(anyhow!(
+                    "body block '{}' ends in {:?}, not a branch",
+                    current.as_str(),
+                    other
+                ))
+            }
         };
-        let target = target.clone();
         chain.push(current);
         if target == *head {
             break;
@@ -184,6 +268,27 @@ fn site(fun: &FunDef, function: &str, head: &Label) -> Result<Site> {
         current = target;
     }
     let latch = chain.last().unwrap().clone();
+    require(
+        chain_exits.last() == Some(&None),
+        format!("the latch of '{}' must branch unconditionally", head.as_str()),
+    )?;
+    // Arms must exit the LOOP, which is only fully known now.
+    for arm in &arms {
+        let Terminator::UnconditionalBranch { target } = fun.cfg.named[arm].terminator_kind()
+        else {
+            unreachable!("checked above");
+        };
+        require(
+            target != head && !chain.contains(target) && !arms.contains(target),
+            format!("exit arm '{}' does not leave the loop", arm.as_str()),
+        )?;
+    }
+    for named in exits {
+        require(
+            arms.contains(named),
+            format!("recipe-named exit arm '{}' was not found on the chain", named.as_str()),
+        )?;
+    }
 
     // Nothing else may reach the head.
     let head_preds = preds
@@ -260,8 +365,8 @@ fn site(fun: &FunDef, function: &str, head: &Label) -> Result<Site> {
         format!("the compare of '{}' is not an order compare", head.as_str()),
     )?;
 
-    let bound = number_constant(fun, bound)
-        .ok_or_else(|| anyhow!("the bound of '{}' is not a number constant", head.as_str()))?;
+    let bound_id = bound;
+    let bound_const = number_constant(fun, bound_id);
     let (_, counter_init, counter_next) = *phis
         .iter()
         .find(|(p, _, _)| *p == counter)
@@ -292,19 +397,64 @@ fn site(fun: &FunDef, function: &str, head: &Label) -> Result<Site> {
         .ok_or_else(|| anyhow!("the step of '{}' is not a number constant", head.as_str()))?;
     require(step != 0, format!("the step of '{}' is zero", head.as_str()))?;
 
-    // Simulate the counter, in the same wrapping 16.16 arithmetic the
-    // interpreter uses. This is the whole trip-count argument.
-    let mut value = init;
-    let mut trip_count = 0usize;
-    while test(value, bound) {
-        trip_count += 1;
-        require(
-            trip_count <= MAX_TRIP_COUNT,
-            format!("'{}' runs more than {} times", head.as_str(), MAX_TRIP_COUNT),
-        )?;
-        value = value.wrapping_add(step);
-    }
-    require(trip_count >= 1, format!("'{}' never runs", head.as_str()))?;
+    // The trip count. Constant bound: simulate the counter in the same
+    // wrapping 16.16 arithmetic the interpreter uses - that is the whole
+    // trip-count argument, and no runtime guard is needed. Recipe `trip`:
+    // the bound is dynamic; the premise `bound == init + (trip-1)*step` is
+    // asserted at runtime in the first head copy. Under `<=` and a positive
+    // step that equality makes exactly `trip` head tests pass, so the guard
+    // IS the trip-count argument; a lane with a different bound fails it
+    // loudly and deopts.
+    let (trip_count, guard) = match (forced_trip, bound_const) {
+        (None, Some(bound)) => {
+            let mut value = init;
+            let mut trip_count = 0usize;
+            while test(value, bound) {
+                trip_count += 1;
+                require(
+                    trip_count <= MAX_TRIP_COUNT,
+                    format!("'{}' runs more than {} times", head.as_str(), MAX_TRIP_COUNT),
+                )?;
+                value = value.wrapping_add(step);
+            }
+            require(trip_count >= 1, format!("'{}' never runs", head.as_str()))?;
+            (trip_count, None)
+        }
+        (None, None) => {
+            return Err(anyhow!(
+                "the bound of '{}' is not a number constant (a recipe `trip` would guard it)",
+                head.as_str()
+            ))
+        }
+        (Some(trip), None) => {
+            require(
+                trip >= 1 && trip <= MAX_TRIP_COUNT,
+                format!("`trip` for '{}' must be in 1..={}", head.as_str(), MAX_TRIP_COUNT),
+            )?;
+            require(
+                op == BinaryOp::LessThanEqual,
+                format!(
+                    "`trip` mode for '{}' needs a `<=` compare (the equality premise argument)",
+                    head.as_str()
+                ),
+            )?;
+            require(
+                step > 0,
+                format!("`trip` mode for '{}' needs a positive step", head.as_str()),
+            )?;
+            let mut pinned = init;
+            for _ in 1..trip {
+                pinned = pinned.wrapping_add(step);
+            }
+            (trip, Some((bound_id, crate::pico8_num::Pico8Num::from_raw(pinned))))
+        }
+        (Some(_), Some(_)) => {
+            return Err(anyhow!(
+                "the bound of '{}' is a constant; drop `trip` and let the simulation count",
+                head.as_str()
+            ))
+        }
+    };
 
     // A *head*-defined value used outside the loop always observes the final
     // head execution - every path out passes through the last head visit - so
@@ -313,7 +463,7 @@ fn site(fun: &FunDef, function: &str, head: &Label) -> Result<Site> {
     // the loop (the preheader->head->exit path skips the chain), so an
     // outside use of one is refused.
     let mut chain_defined: FxHashSet<LocalId> = FxHashSet::default();
-    for label in &chain {
+    for label in chain.iter().chain(arms.iter()) {
         let block = &fun.cfg.named[label];
         for (id, _) in &block.instructions {
             chain_defined.insert(*id);
@@ -321,6 +471,7 @@ fn site(fun: &FunDef, function: &str, head: &Label) -> Result<Site> {
     }
     let loop_keys: FxHashSet<Option<Label>> = std::iter::once(Some(head.clone()))
         .chain(chain.iter().map(|l| Some(l.clone())))
+        .chain(arms.iter().map(|l| Some(l.clone())))
         .collect();
     for key in blocks_sorted(&fun.cfg) {
         if loop_keys.contains(&key) {
@@ -328,11 +479,36 @@ fn site(fun: &FunDef, function: &str, head: &Label) -> Result<Site> {
         }
         let block = get_block(&fun.cfg, &key).expect("listed block exists");
         for (_, instr) in &block.instructions {
-            for used in instr.get_used_locals() {
-                require(
-                    !chain_defined.contains(&used),
-                    format!("a chain-defined value of '{}' is used outside it", head.as_str()),
-                )?;
+            match instr {
+                // A phi value on an EXIT-ARM edge may be chain-defined: the
+                // arm is copied per iteration and `apply` renames that value
+                // through each copy's map, so the phi observes exactly what
+                // the taken exit's iteration computed.
+                Instruction::Phi { branches } => {
+                    for (label, value) in branches {
+                        if arms.contains(label) {
+                            continue;
+                        }
+                        require(
+                            !chain_defined.contains(value),
+                            format!(
+                                "a chain-defined value of '{}' is used outside it",
+                                head.as_str()
+                            ),
+                        )?;
+                    }
+                }
+                _ => {
+                    for used in instr.get_used_locals() {
+                        require(
+                            !chain_defined.contains(&used),
+                            format!(
+                                "a chain-defined value of '{}' is used outside it",
+                                head.as_str()
+                            ),
+                        )?;
+                    }
+                }
             }
         }
         for used in block.terminator_kind().get_used_locals() {
@@ -343,7 +519,7 @@ fn site(fun: &FunDef, function: &str, head: &Label) -> Result<Site> {
         }
     }
 
-    Ok(Site { preheader_key, exit, chain, phis, rest, trip_count })
+    Ok(Site { preheader_key, exit, chain, chain_exits, arms, phis, rest, trip_count, guard })
 }
 
 fn copy_label(base: &Label, iteration: usize) -> Label {
@@ -364,15 +540,23 @@ fn seed_map(s: &Site, previous: Option<&FxHashMap<LocalId, LocalId>>) -> FxHashM
     map
 }
 
-pub fn apply(program: &mut Program, function: &str, head: &str) -> Result<usize> {
+pub fn apply(
+    program: &mut Program,
+    function: &str,
+    head: &str,
+    trip: Option<usize>,
+    exits: &[String],
+) -> Result<usize> {
     let head = Label::from(head.to_string());
+    let exits: Vec<Label> = exits.iter().map(|s| Label::from(s.clone())).collect();
     let fun = program.get(function)?;
-    let s = site(fun, function, &head)?;
+    let s = site(fun, function, &head, trip, &exits)?;
 
     // Fresh labels must actually be fresh.
     for j in 0..=s.trip_count {
         let labels: Vec<Label> = std::iter::once(copy_label(&head, j))
             .chain(s.chain.iter().map(|b| copy_label(b, j)))
+            .chain(s.arms.iter().map(|b| copy_label(b, j)))
             .collect();
         for label in labels {
             require(
@@ -388,10 +572,17 @@ pub fn apply(program: &mut Program, function: &str, head: &str) -> Result<usize>
         .iter()
         .map(|l| (l.clone(), fun.cfg.named[l].clone()))
         .collect();
+    let arm_blocks: Vec<(Label, Block)> = s
+        .arms
+        .iter()
+        .map(|l| (l.clone(), fun.cfg.named[l].clone()))
+        .collect();
 
-    // Build the copies.
+    // Build the copies. Every iteration's final map is kept: exit-arm phi
+    // edges in outside joins rename through the map of THEIR iteration.
     let mut new_blocks: Vec<(Label, Block)> = Vec::new();
     let mut previous_map: Option<FxHashMap<LocalId, LocalId>> = None;
+    let mut iter_maps: Vec<FxHashMap<LocalId, LocalId>> = Vec::new();
     let mut last_map: FxHashMap<LocalId, LocalId> = FxHashMap::default();
     for j in 0..=s.trip_count {
         let mut map = seed_map(&s, previous_map.as_ref());
@@ -399,8 +590,22 @@ pub fn apply(program: &mut Program, function: &str, head: &str) -> Result<usize>
             instr.map_local_ids(|id| *map.get(&id).unwrap_or(&id))
         };
 
-        // The head copy: the non-phi instructions, then a fall-through.
+        // The head copy: the trip guard (first copy, guard mode only), the
+        // non-phi instructions, then a fall-through.
         let mut instructions = Vec::new();
+        if j == 0 {
+            if let Some((bound_id, pinned)) = s.guard {
+                let kc = allocator.fresh();
+                instructions.push((kc, Instruction::NumberConstant { value: pinned }));
+                let g = allocator.fresh();
+                instructions.push((
+                    g,
+                    Instruction::BinaryOp { left: bound_id, op: BinaryOp::TwoEqual, right: kc },
+                ));
+                let ga = allocator.fresh();
+                instructions.push((ga, Instruction::AssertTrue { value: g }));
+            }
+        }
         for (id, instr) in &s.rest {
             let renamed = rename(&map, instr);
             let fresh = allocator.fresh();
@@ -426,21 +631,54 @@ pub fn apply(program: &mut Program, function: &str, head: &str) -> Result<usize>
                     map.insert(*id, fresh);
                     instructions.push((fresh, renamed));
                 }
-                let target = match chain_blocks.get(index + 1) {
+                let next = match chain_blocks.get(index + 1) {
                     Some((next_label, _)) => copy_label(next_label, j),
                     None => copy_label(&head, j + 1),
+                };
+                let terminator = match &s.chain_exits[index] {
+                    None => Terminator::UnconditionalBranch { target: next },
+                    Some((condition, arm, exit_on_true)) => {
+                        let cond = *map.get(condition).unwrap_or(condition);
+                        let arm_copy = copy_label(arm, j);
+                        let (true_target, false_target) = if *exit_on_true {
+                            (arm_copy, next)
+                        } else {
+                            (next, arm_copy)
+                        };
+                        Terminator::ConditionalBranch { condition: cond, true_target, false_target }
+                    }
                 };
                 new_blocks.push((
                     copy_label(label, j),
                     Block {
                         instructions,
-                        terminator: (allocator.fresh(), Terminator::UnconditionalBranch { target }),
+                        terminator: (allocator.fresh(), terminator),
+                        hint_normalize: false,
+                    },
+                ));
+            }
+            // The iteration's exit-arm copies: same renaming, terminator
+            // unchanged (it already leaves the loop).
+            for (label, block) in arm_blocks.iter() {
+                let mut instructions = Vec::new();
+                for (id, instr) in &block.instructions {
+                    let renamed = rename(&map, instr);
+                    let fresh = allocator.fresh();
+                    map.insert(*id, fresh);
+                    instructions.push((fresh, renamed));
+                }
+                new_blocks.push((
+                    copy_label(label, j),
+                    Block {
+                        instructions,
+                        terminator: (allocator.fresh(), block.terminator.1.clone()),
                         hint_normalize: false,
                     },
                 ));
             }
         }
         last_map = map.clone();
+        iter_maps.push(map.clone());
         previous_map = Some(map);
     }
 
@@ -453,9 +691,9 @@ pub fn apply(program: &mut Program, function: &str, head: &str) -> Result<usize>
     };
     retarget(&mut preheader.terminator.1, &head, &copy_label(&head, 0));
 
-    // Delete the loop.
+    // Delete the loop, exit arms included.
     fun.cfg.named.remove(&head);
-    for label in &s.chain {
+    for label in s.chain.iter().chain(s.arms.iter()) {
         fun.cfg.named.remove(label);
     }
 
@@ -468,12 +706,22 @@ pub fn apply(program: &mut Program, function: &str, head: &str) -> Result<usize>
     let fix = |block: &mut Block| {
         for (_, instr) in block.instructions.iter_mut() {
             if let Instruction::Phi { branches } = instr {
-                for (label, value) in branches.iter_mut() {
+                let mut new_branches: Vec<(Label, LocalId)> = Vec::new();
+                for (label, value) in branches.iter() {
                     if *label == head {
-                        *label = last_head.clone();
+                        new_branches.push((last_head.clone(), subst(*value)));
+                    } else if s.arms.contains(label) {
+                        // One edge per iteration's arm copy, the value
+                        // renamed through that iteration's map.
+                        for (j, map) in iter_maps.iter().enumerate().take(s.trip_count) {
+                            new_branches
+                                .push((copy_label(label, j), *map.get(value).unwrap_or(value)));
+                        }
+                    } else {
+                        new_branches.push((label.clone(), subst(*value)));
                     }
-                    *value = subst(*value);
                 }
+                *instr = Instruction::Phi { branches: new_branches };
             } else {
                 *instr = instr.map_local_ids(subst);
             }
@@ -520,11 +768,19 @@ fn retarget(terminator: &mut Terminator, from: &Label, to: &Label) {
 /// iteration's values), every copied id fresh and previously unseen, every
 /// terminator wired to exactly the prescribed place. Untouched blocks must be
 /// untouched, up to the preheader retarget and the head-edge phi renames.
-pub fn verify(before: &Program, after: &Program, function: &str, head: &str) -> Result<()> {
+pub fn verify(
+    before: &Program,
+    after: &Program,
+    function: &str,
+    head: &str,
+    trip: Option<usize>,
+    exits: &[String],
+) -> Result<()> {
     let head = Label::from(head.to_string());
+    let exits: Vec<Label> = exits.iter().map(|s| Label::from(s.clone())).collect();
     let before_fun = before.get(function)?;
     let after_fun = after.get(function)?;
-    let s = site(before_fun, function, &head)?;
+    let s = site(before_fun, function, &head, trip, &exits)?;
 
     let before_max = {
         let mut allocator = LocalIdAllocator::for_function(before_fun);
@@ -547,14 +803,16 @@ pub fn verify(before: &Program, after: &Program, function: &str, head: &str) -> 
             "unroll_loop did not remove the body chain",
         )?;
     }
-    let added = (s.trip_count + 1) + s.trip_count * s.chain.len();
+    let added = (s.trip_count + 1) + s.trip_count * (s.chain.len() + s.arms.len());
     require(
-        after_fun.cfg.named.len() == before_fun.cfg.named.len() - 1 - s.chain.len() + added,
+        after_fun.cfg.named.len()
+            == before_fun.cfg.named.len() - 1 - s.chain.len() - s.arms.len() + added,
         "unroll_loop changed the set of blocks beyond the prescription",
     )?;
 
     // Walk the copies, building the bijection.
     let mut previous_map: Option<FxHashMap<LocalId, LocalId>> = None;
+    let mut iter_maps: Vec<FxHashMap<LocalId, LocalId>> = Vec::new();
     let mut last_map: FxHashMap<LocalId, LocalId> = FxHashMap::default();
     for j in 0..=s.trip_count {
         let mut map = seed_map(&s, previous_map.as_ref());
@@ -563,15 +821,16 @@ pub fn verify(before: &Program, after: &Program, function: &str, head: &str) -> 
                           take_fresh: &mut dyn FnMut(LocalId) -> Result<()>,
                           original: &[(LocalId, Instruction)],
                           copy: &Block,
-                          expected_target: &Label|
+                          skip: usize,
+                          expected_term: &dyn Fn(&FxHashMap<LocalId, LocalId>) -> Terminator|
          -> Result<()> {
             require(
-                copy.instructions.len() == original.len(),
+                copy.instructions.len() == original.len() + skip,
                 "a copy has the wrong number of instructions",
             )?;
             require(!copy.hint_normalize, "a copy carries hint_normalize")?;
             for ((id, instr), (copy_id, copy_instr)) in
-                original.iter().zip(copy.instructions.iter())
+                original.iter().zip(copy.instructions.iter().skip(skip))
             {
                 let expected = instr.map_local_ids(|u| *map.get(&u).unwrap_or(&u));
                 require(*copy_instr == expected, "a copied instruction differs from the original")?;
@@ -580,10 +839,7 @@ pub fn verify(before: &Program, after: &Program, function: &str, head: &str) -> 
             }
             take_fresh(copy.terminator.0)?;
             require(
-                matches!(
-                    &copy.terminator.1,
-                    Terminator::UnconditionalBranch { target } if target == expected_target
-                ),
+                copy.terminator.1 == expected_term(map),
                 "a copy is wired to the wrong place",
             )?;
             Ok(())
@@ -594,9 +850,40 @@ pub fn verify(before: &Program, after: &Program, function: &str, head: &str) -> 
             .named
             .get(&copy_label(&head, j))
             .ok_or_else(|| anyhow!("missing head copy {}", j))?;
+        // The trip guard, first copy of guard mode only: exactly
+        // `k = num(pinned); g = bound == k; assert_true g`, fresh ids.
+        let guard_len = if j == 0 && s.guard.is_some() { 3 } else { 0 };
+        if guard_len > 0 {
+            let (bound_id, pinned) = s.guard.unwrap();
+            require(
+                head_copy.instructions.len() >= 3,
+                "the first head copy is missing the trip guard",
+            )?;
+            let (kc, kc_instr) = &head_copy.instructions[0];
+            let (g, g_instr) = &head_copy.instructions[1];
+            let (ga, ga_instr) = &head_copy.instructions[2];
+            require(
+                *kc_instr == Instruction::NumberConstant { value: pinned },
+                "the trip guard's constant is wrong",
+            )?;
+            require(
+                *g_instr
+                    == Instruction::BinaryOp { left: bound_id, op: BinaryOp::TwoEqual, right: *kc },
+                "the trip guard's compare is wrong",
+            )?;
+            require(
+                *ga_instr == Instruction::AssertTrue { value: *g },
+                "the trip guard must be stated with `assert_true`",
+            )?;
+            take_fresh(*kc)?;
+            take_fresh(*g)?;
+            take_fresh(*ga)?;
+        }
         let head_target =
             if j < s.trip_count { copy_label(&s.chain[0], j) } else { s.exit.clone() };
-        check_copy(&mut map, &mut take_fresh, &s.rest, head_copy, &head_target)?;
+        check_copy(&mut map, &mut take_fresh, &s.rest, head_copy, guard_len, &|_| {
+            Terminator::UnconditionalBranch { target: head_target.clone() }
+        })?;
 
         if j < s.trip_count {
             for (index, label) in s.chain.iter().enumerate() {
@@ -606,14 +893,47 @@ pub fn verify(before: &Program, after: &Program, function: &str, head: &str) -> 
                     .named
                     .get(&copy_label(label, j))
                     .ok_or_else(|| anyhow!("missing body copy '{}' {}", label.as_str(), j))?;
-                let target = match s.chain.get(index + 1) {
+                let next = match s.chain.get(index + 1) {
                     Some(next) => copy_label(next, j),
                     None => copy_label(&head, j + 1),
                 };
-                check_copy(&mut map, &mut take_fresh, &original.instructions, copy, &target)?;
+                let exit_spec = s.chain_exits[index].clone();
+                check_copy(
+                    &mut map,
+                    &mut take_fresh,
+                    &original.instructions,
+                    copy,
+                    0,
+                    &|map| match &exit_spec {
+                        None => Terminator::UnconditionalBranch { target: next.clone() },
+                        Some((condition, arm, exit_on_true)) => {
+                            let cond = *map.get(condition).unwrap_or(condition);
+                            let arm_copy = copy_label(arm, j);
+                            let (true_target, false_target) = if *exit_on_true {
+                                (arm_copy, next.clone())
+                            } else {
+                                (next.clone(), arm_copy)
+                            };
+                            Terminator::ConditionalBranch { condition: cond, true_target, false_target }
+                        }
+                    },
+                )?;
+            }
+            for label in s.arms.iter() {
+                let original = &before_fun.cfg.named[label];
+                let copy = after_fun
+                    .cfg
+                    .named
+                    .get(&copy_label(label, j))
+                    .ok_or_else(|| anyhow!("missing exit-arm copy '{}' {}", label.as_str(), j))?;
+                let term = original.terminator.1.clone();
+                check_copy(&mut map, &mut take_fresh, &original.instructions, copy, 0, &|_| {
+                    term.clone()
+                })?;
             }
         }
         last_map = map.clone();
+        iter_maps.push(map.clone());
         previous_map = Some(map);
     }
 
@@ -622,6 +942,7 @@ pub fn verify(before: &Program, after: &Program, function: &str, head: &str) -> 
     let last_head = copy_label(&head, s.trip_count);
     let loop_keys: FxHashSet<Option<Label>> = std::iter::once(Some(head.clone()))
         .chain(s.chain.iter().map(|l| Some(l.clone())))
+        .chain(s.arms.iter().map(|l| Some(l.clone())))
         .collect();
     for key in blocks_sorted(&before_fun.cfg) {
         if loop_keys.contains(&key) {
@@ -641,12 +962,20 @@ pub fn verify(before: &Program, after: &Program, function: &str, head: &str) -> 
         let subst = |id: LocalId| *last_map.get(&id).unwrap_or(&id);
         for (_, instr) in expected.instructions.iter_mut() {
             if let Instruction::Phi { branches } = instr {
-                for (label, value) in branches.iter_mut() {
+                let mut new_branches: Vec<(Label, LocalId)> = Vec::new();
+                for (label, value) in branches.iter() {
                     if *label == head {
-                        *label = last_head.clone();
+                        new_branches.push((last_head.clone(), subst(*value)));
+                    } else if s.arms.contains(label) {
+                        for (j, m) in iter_maps.iter().enumerate().take(s.trip_count) {
+                            new_branches
+                                .push((copy_label(label, j), *m.get(value).unwrap_or(value)));
+                        }
+                    } else {
+                        new_branches.push((label.clone(), subst(*value)));
                     }
-                    *value = subst(*value);
                 }
+                *instr = Instruction::Phi { branches: new_branches };
             } else {
                 *instr = instr.map_local_ids(subst);
             }
@@ -682,7 +1011,7 @@ pub fn candidates(program: &Program) -> Vec<(String, Label, usize)> {
     let mut out = Vec::new();
     for (name, fun) in &program.functions {
         for label in fun.cfg.named.keys() {
-            if let Ok(s) = site(fun, name.as_str(), label) {
+            if let Ok(s) = site(fun, name.as_str(), label, None, &[]) {
                 out.push((name.as_str().to_string(), label.clone(), s.trip_count));
             }
         }
@@ -807,13 +1136,122 @@ mod tests {
         Program { functions, merge_partition_cells: Vec::new() }
     }
 
+    /// The guarded-trip + exit-arm shape: the bound is `1 + 2` (NOT a
+    /// number constant), and the body conditionally exits to `arm`, which
+    /// leaves the loop to `join` (whose phi reads a chain-defined value).
+    fn guarded_loop_program() -> Program {
+        let entry = block(
+            vec![
+                (1, num(1)),
+                (2, num(2)),
+                (3, Instruction::BinaryOp { left: id(1), op: BinaryOp::Plus, right: id(2) }),
+                (4, Instruction::BoolConstant { value: false }),
+                (5, num(0)),
+            ],
+            30,
+            br("head"),
+        );
+        let head = block(
+            vec![
+                (
+                    6,
+                    Instruction::Phi {
+                        branches: vec![(super::super::entry_label(), id(1)), (label("latch"), id(10))],
+                    },
+                ),
+                (
+                    7,
+                    Instruction::Phi {
+                        branches: vec![(super::super::entry_label(), id(5)), (label("latch"), id(12))],
+                    },
+                ),
+                (8, Instruction::BinaryOp { left: id(6), op: BinaryOp::LessThanEqual, right: id(3) }),
+            ],
+            9,
+            br_if(8, "body", "exit"),
+        );
+        let body = block(
+            vec![(11, Instruction::BinaryOp { left: id(7), op: BinaryOp::Plus, right: id(6) })],
+            13,
+            br_if(4, "arm", "latch"),
+        );
+        let arm = block(vec![], 21, br("join"));
+        let latch = block(
+            vec![
+                (10, Instruction::BinaryOp { left: id(6), op: BinaryOp::Plus, right: id(1) }),
+                (12, Instruction::BinaryOp { left: id(11), op: BinaryOp::Plus, right: id(1) }),
+            ],
+            14,
+            br("head"),
+        );
+        let exit = block(
+            vec![(15, Instruction::Phi { branches: vec![(label("head"), id(7))] })],
+            16,
+            Terminator::Return { value: Some(id(15)) },
+        );
+        let join = block(
+            vec![(22, Instruction::Phi { branches: vec![(label("arm"), id(11))] })],
+            23,
+            Terminator::Return { value: Some(id(22)) },
+        );
+
+        let mut named = crate::ir::new_label_map();
+        named.insert(label("head"), head);
+        named.insert(label("body"), body);
+        named.insert(label("arm"), arm);
+        named.insert(label("latch"), latch);
+        named.insert(label("exit"), exit);
+        named.insert(label("join"), join);
+        let fun = FunDef {
+            name: GlobalId::from("f".to_string()),
+            capture_ids: vec![],
+            arg_ids: vec![],
+            cfg: Cfg::new(entry, named),
+            source_span: None,
+        };
+        let mut functions = IndexMap::new();
+        functions.insert(fun.name.clone(), fun);
+        Program { functions, merge_partition_cells: Vec::new() }
+    }
+
+    #[test]
+    fn guarded_trip_with_exit_arm_applies_and_verifies() {
+        let before = guarded_loop_program();
+        // Plain mode refuses: the bound is not a constant.
+        let mut plain = before.clone();
+        let err = apply(&mut plain, "f", "head", None, &[]).unwrap_err();
+        assert!(err.to_string().contains("recipe-named exit arm"), "{}", err);
+
+        let mut after = before.clone();
+        let exits = vec!["arm".to_string()];
+        let n = apply(&mut after, "f", "head", Some(3), &exits).unwrap();
+        assert_eq!(n, 3);
+        verify(&before, &after, "f", "head", Some(3), &exits).unwrap();
+
+        let fun = after.get("f").unwrap();
+        // The first head copy leads with the trip guard.
+        let h0 = &fun.cfg.named[&label("head_it0")];
+        assert_eq!(h0.instructions[0].1, Instruction::NumberConstant { value: Pico8Num::from_i16(3) });
+        assert!(matches!(h0.instructions[2].1, Instruction::AssertTrue { .. }));
+        // One arm copy per iteration, and the join phi has one edge each.
+        for j in 0..3 {
+            assert!(fun.cfg.named.contains_key(&label(&format!("arm_it{}", j))));
+        }
+        let join = &fun.cfg.named[&label("join")];
+        let Instruction::Phi { branches } = &join.instructions[0].1 else { panic!() };
+        assert_eq!(branches.len(), 3);
+        // Each edge's value is that iteration's copy of %11 - all distinct.
+        let values: FxHashSet<LocalId> = branches.iter().map(|(_, v)| *v).collect();
+        assert_eq!(values.len(), 3);
+    }
+
     #[test]
     fn unrolls_three_iterations() {
         let before = loop_program();
         let mut after = before.clone();
-        let n = apply(&mut after, "f", "head").unwrap();
+        let n = apply(&mut after, "f", "head", None, &[]).unwrap();
         assert_eq!(n, 3);
-        verify(&before, &after, "f", "head").unwrap();
+        verify(&before, &after, "f", "head", None, &[]).unwrap();
 
         let fun = after.get("f").unwrap();
         assert!(!fun.cfg.named.contains_key(&label("head")));
@@ -855,7 +1293,7 @@ mod tests {
             fun.cfg.entry.instructions[2].1 =
                 Instruction::BinaryOp { left: id(1), op: BinaryOp::Plus, right: id(2) };
         }
-        let err = apply(&mut program, "f", "head").unwrap_err();
+        let err = apply(&mut program, "f", "head", None, &[]).unwrap_err();
         assert!(err.to_string().contains("bound"), "{}", err);
     }
 
@@ -867,8 +1305,8 @@ mod tests {
             let body = fun.cfg.named.get_mut(&label("body")).unwrap();
             body.terminator.1 = br_if(11, "latch", "exit");
         }
-        let err = apply(&mut program, "f", "head").unwrap_err();
-        assert!(err.to_string().contains("unconditionally"), "{}", err);
+        let err = apply(&mut program, "f", "head", None, &[]).unwrap_err();
+        assert!(err.to_string().contains("recipe-named exit arm"), "{}", err);
     }
 
     #[test]
@@ -881,7 +1319,7 @@ mod tests {
             exit.instructions[0].1 =
                 Instruction::Phi { branches: vec![(label("head"), id(11))] };
         }
-        let err = apply(&mut program, "f", "head").unwrap_err();
+        let err = apply(&mut program, "f", "head", None, &[]).unwrap_err();
         assert!(err.to_string().contains("chain-defined"), "{}", err);
     }
 
@@ -900,8 +1338,8 @@ mod tests {
         }
         let before = program.clone();
         let mut after = program;
-        apply(&mut after, "f", "head").unwrap();
-        verify(&before, &after, "f", "head").unwrap();
+        apply(&mut after, "f", "head", None, &[]).unwrap();
+        verify(&before, &after, "f", "head", None, &[]).unwrap();
         let fun = after.get("f").unwrap();
         let exit = &fun.cfg.named[&label("exit")];
         let Instruction::BinaryOp { left, right, .. } = &exit.instructions[0].1 else { panic!() };
@@ -917,7 +1355,7 @@ mod tests {
             let fun = program.functions.values_mut().next().unwrap();
             fun.cfg.entry.instructions[2].1 = num(0); // bound 0 < init 1
         }
-        let err = apply(&mut program, "f", "head").unwrap_err();
+        let err = apply(&mut program, "f", "head", None, &[]).unwrap_err();
         assert!(err.to_string().contains("never runs"), "{}", err);
     }
 
@@ -925,7 +1363,7 @@ mod tests {
     fn verify_rejects_a_tampered_copy() {
         let before = loop_program();
         let mut after = before.clone();
-        apply(&mut after, "f", "head").unwrap();
+        apply(&mut after, "f", "head", None, &[]).unwrap();
         {
             let fun = after.functions.values_mut().next().unwrap();
             let body1 = fun.cfg.named.get_mut(&label("body_it1")).unwrap();
@@ -935,7 +1373,7 @@ mod tests {
             let Instruction::BinaryOp { left, op, right } = instr else { panic!() };
             body1.instructions[0] = (idx, Instruction::BinaryOp { left: right, op, right: left });
         }
-        let err = verify(&before, &after, "f", "head").unwrap_err();
+        let err = verify(&before, &after, "f", "head", None, &[]).unwrap_err();
         assert!(err.to_string().contains("differs from the original"), "{}", err);
     }
 
@@ -943,12 +1381,12 @@ mod tests {
     fn verify_rejects_a_missing_copy() {
         let before = loop_program();
         let mut after = before.clone();
-        apply(&mut after, "f", "head").unwrap();
+        apply(&mut after, "f", "head", None, &[]).unwrap();
         {
             let fun = after.functions.values_mut().next().unwrap();
             fun.cfg.named.remove(&label("body_it2"));
         }
-        let err = verify(&before, &after, "f", "head").unwrap_err();
+        let err = verify(&before, &after, "f", "head", None, &[]).unwrap_err();
         assert!(err.to_string().contains("prescription") || err.to_string().contains("missing"), "{}", err);
     }
 

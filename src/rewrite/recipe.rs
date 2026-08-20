@@ -462,6 +462,21 @@ pub enum Rule {
         function: String,
         /// The loop header.
         head: String,
+        /// Guard mode: the bound is DYNAMIC (e.g. `#objects`); unroll
+        /// exactly this many iterations and assert the premise
+        /// `bound == init + (trip-1)*step` in the first head copy. The
+        /// collapse_loop doctrine at N > 1: a lane whose bound differs
+        /// fails the guard loudly and deopts. Omitted = the original
+        /// constant-bound mode, no runtime guard.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trip: Option<usize>,
+        /// Early-exit arms: single-predecessor, phi-free blocks a chain
+        /// block may conditionally branch to, leaving the loop (the
+        /// `check`-loop "found" exits). Copied per iteration; outside
+        /// join phis gain one edge per copy. Naming them in the recipe is
+        /// what makes the chain walk deterministic.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        exits: Vec<String>,
     },
     /// Delete any `assert_true`/`assert_pointer`/`assert_closure` that is
     /// dominated by an identical assert on the same SSA operands. Those
@@ -893,7 +908,9 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::CollapseAllLoop { function, head } => {
             collapse_all_loop::apply(program, &entry.id, function, head)
         }
-        Rule::UnrollLoop { function, head } => unroll_loop::apply(program, function, head),
+        Rule::UnrollLoop { function, head, trip, exits } => {
+            unroll_loop::apply(program, function, head, *trip, exits)
+        }
         Rule::DedupGuards => dedup_guards::apply(program),
         Rule::AddHint { function, block } => add_hint::apply(program, function, block),
         Rule::RemoveHint { function, block } => remove_hint::apply(program, function, block),
@@ -1050,8 +1067,8 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::CollapseAllLoop { function, head } => {
             collapse_all_loop::verify(&before, program, &entry.id, function, head)
         }
-        Rule::UnrollLoop { function, head } => {
-            unroll_loop::verify(&before, program, function, head)
+        Rule::UnrollLoop { function, head, trip, exits } => {
+            unroll_loop::verify(&before, program, function, head, *trip, exits)
         }
         Rule::DedupGuards => dedup_guards::verify(&before, program),
         Rule::AddHint { function, block } => add_hint::verify(&before, program, function, block),
