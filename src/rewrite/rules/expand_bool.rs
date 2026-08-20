@@ -83,8 +83,21 @@ struct Site {
     true_arm: Arm,
     false_arm: Arm,
     join: Label,
-    /// The join's phi over the two arm constants.
-    phi_id: LocalId,
+    /// The join's phi over the two arm constants; `None` in the zero-phi
+    /// variant (the value's only consumer is the concretization store).
+    phi_id: Option<LocalId>,
+}
+
+impl Site {
+    /// The id the `expand` is bound to: the phi's when there is one, else
+    /// the dying true arm's constant id - reused, so nothing is minted.
+    fn expand_id(&self) -> LocalId {
+        self.phi_id.unwrap_or(self.true_arm.const_id)
+    }
+    /// How many join instructions the prefix replaces (the phi, if any).
+    fn replaced(&self) -> usize {
+        usize::from(self.phi_id.is_some())
+    }
 }
 
 /// Reads one arm: exactly `<accessor>; bool <value>; store` under an
@@ -208,44 +221,58 @@ fn site(fun: &FunDef, function: &str, head: &Label) -> Result<Site> {
         .iter()
         .filter(|(_, i)| matches!(i, Instruction::Phi { .. }))
         .collect();
-    let [(phi_id, Instruction::Phi { branches })] = phis.as_slice() else {
-        return Err(anyhow!(
-            "'{}' must have exactly one phi - the concretized bool",
-            join.as_str()
-        ));
+    let phi_id = match phis.as_slice() {
+        // Zero-phi variant: the concretized value has no consumer besides
+        // the store back into the cell (a dce'd select downstream). The
+        // expand + store must still happen - lanes fork into both worlds
+        // and later reads of the cell see the per-lane value - there is
+        // just no phi to replace; the expand reuses the dying true arm's
+        // constant id instead.
+        [] => None,
+        [(phi_id, Instruction::Phi { branches })] => {
+            let mut sorted: Vec<(&Label, LocalId)> =
+                branches.iter().map(|(l, v)| (l, *v)).collect();
+            sorted.sort_by_key(|(l, _)| l.as_str().to_string());
+            let mut expected: Vec<(&Label, LocalId)> = vec![
+                (&true_arm.label, true_arm.const_id),
+                (&false_arm.label, false_arm.const_id),
+            ];
+            expected.sort_by_key(|(l, _)| l.as_str().to_string());
+            require(
+                sorted == expected,
+                format!(
+                    "the phi in '{}' does not merge exactly the two arm constants",
+                    join.as_str()
+                ),
+            )?;
+            require(
+                &join_block.instructions[0].0 == phi_id,
+                format!("the phi in '{}' is not its first instruction", join.as_str()),
+            )?;
+            Some(*phi_id)
+        }
+        _ => {
+            return Err(anyhow!(
+                "'{}' must have at most one phi - the concretized bool",
+                join.as_str()
+            ));
+        }
     };
-    let mut sorted: Vec<(&Label, LocalId)> = branches.iter().map(|(l, v)| (l, *v)).collect();
-    sorted.sort_by_key(|(l, _)| l.as_str().to_string());
-    let mut expected: Vec<(&Label, LocalId)> = vec![
-        (&true_arm.label, true_arm.const_id),
-        (&false_arm.label, false_arm.const_id),
-    ];
-    expected.sort_by_key(|(l, _)| l.as_str().to_string());
-    require(
-        sorted == expected,
-        format!(
-            "the phi in '{}' does not merge exactly the two arm constants",
-            join.as_str()
-        ),
-    )?;
-    require(
-        &join_block.instructions[0].0 == phi_id,
-        format!("the phi in '{}' is not its first instruction", join.as_str()),
-    )?;
 
-    Ok(Site { condition: *condition, true_arm, false_arm, join, phi_id: *phi_id })
+    Ok(Site { condition: *condition, true_arm, false_arm, join, phi_id })
 }
 
 /// The instructions the join starts with afterwards. Ids are reused from the
 /// site - the phi's own id and the deleted true arm's accessor and store ids
 /// - so nothing is minted.
 fn expected_join_prefix(s: &Site) -> Vec<(LocalId, Instruction)> {
+    let expand_id = s.expand_id();
     vec![
-        (s.phi_id, Instruction::Expand { value: s.condition }),
+        (expand_id, Instruction::Expand { value: s.condition }),
         (s.true_arm.accessor_id, s.true_arm.accessor.clone()),
         (
             s.true_arm.store_id,
-            Instruction::Store { target: s.true_arm.accessor_id, source: s.phi_id },
+            Instruction::Store { target: s.true_arm.accessor_id, source: expand_id },
         ),
     ]
 }
@@ -265,7 +292,7 @@ pub fn apply(program: &mut Program, function: &str, head: &str) -> Result<usize>
         Terminator::UnconditionalBranch { target: s.join.clone() },
     );
     let join_block = fun.cfg.named.get_mut(&s.join).unwrap();
-    join_block.instructions.splice(0..1, prefix);
+    join_block.instructions.splice(0..s.replaced(), prefix);
 
     // Ids moved blocks and live ranges changed; any slot allocation is stale.
     fun.cfg.slots = std::sync::Arc::new(crate::ir::SlotMap::identity());
@@ -323,7 +350,8 @@ pub fn verify(before: &Program, after: &Program, function: &str, head: &str) -> 
         .ok_or_else(|| anyhow!("expand_bool removed the join block"))?;
     let prefix = expected_join_prefix(&s);
     require(
-        after_join.instructions.len() == before_join.instructions.len() + prefix.len() - 1,
+        after_join.instructions.len()
+            == before_join.instructions.len() + prefix.len() - s.replaced(),
         "the join does not have the prescribed number of instructions",
     )?;
     require(
@@ -331,7 +359,7 @@ pub fn verify(before: &Program, after: &Program, function: &str, head: &str) -> 
         "the join does not start with the prescribed expand + accessor + store",
     )?;
     require(
-        after_join.instructions[prefix.len()..] == before_join.instructions[1..],
+        after_join.instructions[prefix.len()..] == before_join.instructions[s.replaced()..],
         "expand_bool changed the join beyond replacing its phi",
     )?;
     require(
@@ -589,7 +617,7 @@ mod tests {
             ),
         );
         let error = apply(&mut before, "f", "head").unwrap_err().to_string();
-        assert!(error.contains("exactly one phi"), "{}", error);
+        assert!(error.contains("at most one phi"), "{}", error);
     }
 
     /// A join with a predecessor besides the arms would keep an edge the phi

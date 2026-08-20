@@ -986,5 +986,101 @@
 {"id": "da20_023", "rule": "guard_branch", "fn": "__frame", "head": "it5_zc20_000_in_j2_006_if_join_5", "taken": true, "why": "update foreach: 4 objects, it5 nil-check breaks; class-conditioned witness sweep f27-94 (68 frames, 2026-08-20)"}
 {"id": "da20_024", "rule": "guard_branch", "fn": "__frame", "head": "it4_zc20_001_in_j2_008_if_join_5", "taken": false, "why": "draw foreach: 4 objects alive; class-conditioned witness sweep f27-94 (68 frames, 2026-08-20)"}
 {"id": "da20_025", "rule": "guard_branch", "fn": "__frame", "head": "it4_zc20_002_in_j2_009_if_join_5", "taken": false, "why": "draw foreach: 4 objects alive; class-conditioned witness sweep f27-94 (68 frames, 2026-08-20)"}
+{"id": "da20t_strip", "rule": "strip_kills", "why": "member overlay opens kill-free; steady_kd re-derives on the final CFG"}
+{"id": "da20t_xs0", "rule": "speculate", "fn": "__frame", "arm": "in_i1_012_and_or_continue_2", "join": "in_i1_012_and_or_join_4", "why": "seconds tick: hoist the pure level_index arm so the and_or join becomes if-convertible"}
+{"id": "da20t_xc0", "rule": "if_convert", "fn": "__frame", "join": "in_i1_012_and_or_join_4", "why": "seconds tick (frames%30) - frame-uniform but not constant; trace10 xc002 mirror"}
+{"id": "da20t_dc0", "rule": "demote_create", "fn": "__frame", "at": "%114", "why": "seconds cell exists from __init; drop the create so the tick arm is speculatable"}
+{"id": "da20t_xs1", "rule": "speculate_region", "fn": "__frame", "head": "in_i1_012_and_or_join_4", "arm": "in_i1_012_if_body_5", "mask": true, "why": "seconds tick arm (seconds store) runs masked - frame-uniform condition, blended for the straight line; guards masked - the seconds~=0 trace assert belongs to the arm", "guards": true}
+{"id": "da20t_mrg0", "rule": "merge_blocks", "why": "resolve single-edge phis left by the tick blend"}
+{"id": "da20t_fs0", "rule": "fold_select"}
+{"id": "da20t_f0", "rule": "fold"}
+{"id": "steady_dce", "rule": "dce"}
+{"id": "da20t_xb000", "rule": "expand_bool", "fn": "__frame", "head": "in_t20i_004_if_join_6", "why": "btn concretization diamond -> lane expansion; trace10 xb004-xb011 mirror (walker-safe: no btn read is deleted)"}
+{"id": "da20t_xb004", "rule": "expand_bool", "fn": "__frame", "head": "in_t20i_004_in_h061_in_i1_071_cont", "why": "btn concretization diamond -> lane expansion; trace10 xb004-xb011 mirror (walker-safe: no btn read is deleted)"}
+{"id": "da20t_xb006", "rule": "expand_bool", "fn": "__frame", "head": "in_t20i_004_in_h061_in_i1_073_cont", "why": "btn concretization diamond -> lane expansion; trace10 xb004-xb011 mirror (walker-safe: no btn read is deleted)"}
+{"id": "da20t_xm0", "rule": "merge_blocks", "why": "collapse the post-expand_bool arm chains to single blocks (expand + concretization store together); trace10 xm000 mirror"}
+{"id": "da20_xb100", "rule": "expand_bool", "fn": "__frame", "head": "in_t20i_004_in_h061_and_or_continue_8", "why": "btn concretization diamond -> lane expansion (dash-native head, pre-merge position)"}
+{"id": "da20_xb101", "rule": "expand_bool", "fn": "__frame", "head": "in_t20i_004_in_h061_in_i1_071_cont", "why": "btn concretization diamond -> lane expansion (dash-native head, pre-merge position)"}
+{"id": "da20_xb102", "rule": "expand_bool", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1027_for_join_35", "why": "btn concretization diamond -> lane expansion (dash-native head, pre-merge position)"}
+{"id": "da20_xm1", "rule": "merge_blocks", "why": "collapse the expanded 067 arm chain to one block before the or-arm blend"}
+{"id": "da20_dc20", "rule": "demote_create", "fn": "__frame", "at": "%11592", "why": "button cell exists; drop the create so the or-arm is speculatable"}
+{"id": "da20_xs5", "rule": "speculate_region", "fn": "__frame", "head": "in_t20i_004_if_join_6", "arm": "in_t20i_004_in_h061_and_or_continue_8", "expand": true, "why": "h-input or-arm runs eagerly (dash-native xs3 mirror); the or value is dead in dash, only the concretization store matters"}
+{"id": "da20t_mrg1", "rule": "merge_blocks", "why": "second round: pins leave untaken arms as unreachable preds until dce removes them, so edges become mergeable only after steady_dce"}
+{"id": "da20t_fs1", "rule": "fold_select"}
+{"id": "da20t_f1", "rule": "fold"}
+{"id": "da20t_dce2", "rule": "dce"}
+{"id": "da20t_b000", "rule": "pin_builtin", "fn": "__frame", "at": "%14485", "name": "sin", "why": "fruit bob: sin(off/40) - the only builtin call the (2,0) inline tail adds over the room00 base pins"}
+{"id": "da20t_u000", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20n_002_in_k027_for_head_1", "trip": 4, "why": "spring 1 check loop over 4 objects; hit-exit arm already pinned clear by the shared no-overlap pins, so a pure counted loop; t20_016 mirror"}
+{"id": "da20t_u001", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20n_003_in_k027_for_head_1", "trip": 4, "why": "spring 2 check loop; same as st20_u000"}
+{"id": "da20t_dc1", "rule": "demote_create", "fn": "__frame", "at": "%10879", "why": "rem cell exists from spawn; drop the create so the spd move arm is speculatable"}
+{"id": "da20t_dc2", "rule": "demote_create", "fn": "__frame", "at": "%10886", "why": "rem/dash cells exist from spawn; drop the create so the spd move arm is speculatable"}
+{"id": "da20t_dc3", "rule": "demote_create", "fn": "__frame", "at": "%10898", "why": "rem/dash cells exist from spawn; drop the create so the spd move arm is speculatable"}
+{"id": "da20t_dc4", "rule": "demote_create", "fn": "__frame", "at": "%13018", "why": "rem/dash cells exist from spawn; drop the create so the spd move arm is speculatable"}
+{"id": "da20t_dc5", "rule": "demote_create", "fn": "__frame", "at": "%13025", "why": "rem/dash cells exist from spawn; drop the create so the spd move arm is speculatable"}
+{"id": "da20t_dc6", "rule": "demote_create", "fn": "__frame", "at": "%13037", "why": "rem/dash cells exist from spawn; drop the create so the spd move arm is speculatable"}
+{"id": "da20t_xs2", "rule": "speculate_region", "fn": "__frame", "head": "in_t20n_003_in_k027_for_join_35", "arm": "in_t20i_004_if_body_5", "mask": true, "splits": true, "guards": true, "why": "the spd move gate diverges per lane inside a pm1 class (standing vs moving), so it becomes a select: the arm runs masked; ti_spd_select mirror. Head is the mrg1-merged chain tail carrying the old in_t20i_004_entry terminator."}
+{"id": "da20t_mrg2", "rule": "merge_blocks"}
+{"id": "da20t_u002", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_k2002_for_head_1", "trip": 4, "why": "collide check loop over 4 objects inside the pixel-move body; hit exits already pinned clear; must unroll before the pixel loops so their bodies are loop-free"}
+{"id": "da20t_u003", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_k2003_for_head_1", "trip": 4, "why": "collide check loop over 4 objects inside the pixel-move body; hit exits already pinned clear; must unroll before the pixel loops so their bodies are loop-free"}
+{"id": "da20t_u004", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_k2004_for_head_1", "trip": 4, "why": "collide check loop over 4 objects inside the pixel-move body; hit exits already pinned clear; must unroll before the pixel loops so their bodies are loop-free"}
+{"id": "da20t_u005", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_k2005_for_head_1", "trip": 4, "why": "collide check loop over 4 objects inside the pixel-move body; hit exits already pinned clear; must unroll before the pixel loops so their bodies are loop-free"}
+{"id": "da20t_u006", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_k2006_for_head_1", "trip": 4, "why": "collide check loop over 4 objects inside the pixel-move body; hit exits already pinned clear; must unroll before the pixel loops so their bodies are loop-free"}
+{"id": "da20t_u007", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_k2007_for_head_1", "trip": 4, "why": "collide check loop over 4 objects inside the pixel-move body; hit exits already pinned clear; must unroll before the pixel loops so their bodies are loop-free"}
+{"id": "da20t_u008", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_k1000_for_head_3", "why": "move_x pixel loop, masked form with constant bound 8; h068 mirror"}
+{"id": "da20t_u009", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_k1001_for_head_3", "why": "move_y pixel loop; h069 mirror"}
+{"id": "da20t_mrg3", "rule": "merge_blocks"}
+{"forward": true, "id": "da20t_cse0", "rule": "cse"}
+{"id": "da20t_fs2", "rule": "fold_select"}
+{"id": "da20t_dce3", "rule": "dce"}
+{"id": "da20t_dg0", "rule": "dedup_guards"}
+{"id": "da20t_u010", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_i1_068_for_head_4", "why": "spikes_at inner (x) loop, constant tile bounds; h076 mirror"}
+{"id": "da20t_u011", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_i1_068_for_head_1", "why": "spikes_at outer (y) loop; h077 mirror"}
+{"id": "da20t_mrg4", "rule": "merge_blocks"}
+{"forward": true, "id": "da20t_cse1", "rule": "cse"}
+{"id": "da20t_dg1", "rule": "dedup_guards"}
+{"id": "da20t_fs3", "rule": "fold_select"}
+{"id": "da20t_dce4", "rule": "dce"}
+{"id": "da20t_u012", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1024_for_head_1", "trip": 4, "why": "player-update check loop over 4 objects; hit exits pinned clear by the shared pins; guarded trip-4 unroll"}
+{"id": "da20t_u013", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1025_for_head_1", "trip": 4, "why": "player-update check loop over 4 objects; hit exits pinned clear by the shared pins; guarded trip-4 unroll"}
+{"id": "da20t_u014", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1026_for_head_1", "trip": 4, "why": "player-update check loop over 4 objects; hit exits pinned clear by the shared pins; guarded trip-4 unroll"}
+{"id": "da20t_u015", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1027_for_head_1", "trip": 4, "why": "player-update check loop over 4 objects; hit exits pinned clear by the shared pins; guarded trip-4 unroll"}
+{"id": "da20t_mrg5", "rule": "merge_blocks"}
+{"forward": true, "id": "da20t_cse2", "rule": "cse"}
+{"id": "da20t_dg2", "rule": "dedup_guards"}
+{"id": "da20t_fs4", "rule": "fold_select"}
+{"id": "da20t_f2", "rule": "fold"}
+{"id": "da20t_dce5", "rule": "dce"}
+{"id": "da20t_ztm", "rule": "merge_blocks"}
+{"forward": true, "id": "da20t_ztc", "rule": "cse"}
+{"id": "da20t_ztd", "rule": "dce"}
+{"id": "da20t_zn000", "rule": "inline", "fn": "__frame", "at": "%1552", "callee": "anonymous_63", "captures": [], "why": "draw foreach peel it2: inline the draw callback (trace10 zn000/zn002 mirror)"}
+{"id": "da20t_zn001", "rule": "inline", "fn": "__frame", "at": "%1985", "callee": "anonymous_63", "captures": [], "why": "draw foreach peel it3: inline the draw callback (trace10 zn000/zn002 mirror)"}
+{"id": "da20t_zn002", "rule": "inline", "fn": "__frame", "at": "%2013", "callee": "anonymous_63", "captures": [], "why": "draw foreach peel it4: inline the draw callback (trace10 zn000/zn002 mirror)"}
+{"id": "da20t_zn003", "rule": "inline", "fn": "__frame", "at": "%2041", "callee": "anonymous_63", "captures": [], "why": "draw foreach peel it5: inline the draw callback (trace10 zn000/zn002 mirror)"}
+{"id": "da20t_zn004", "rule": "inline", "fn": "__frame", "at": "%1595", "callee": "anonymous_64", "captures": [], "why": "draw foreach peel it2: inline the draw callback (trace10 zn001/zn003 mirror)"}
+{"id": "da20t_zn005", "rule": "inline", "fn": "__frame", "at": "%2096", "callee": "anonymous_64", "captures": [], "why": "draw foreach peel it3: inline the draw callback (trace10 zn001/zn003 mirror)"}
+{"id": "da20t_zn006", "rule": "inline", "fn": "__frame", "at": "%2124", "callee": "anonymous_64", "captures": [], "why": "draw foreach peel it4: inline the draw callback (trace10 zn001/zn003 mirror)"}
+{"id": "da20t_zn007", "rule": "inline", "fn": "__frame", "at": "%2152", "callee": "anonymous_64", "captures": [], "why": "draw foreach peel it5: inline the draw callback (trace10 zn001/zn003 mirror)"}
+{"forward": true, "id": "da20t_znc", "rule": "cse"}
+{"id": "da20t_znd", "rule": "dce"}
+{"id": "da20t_znm", "rule": "merge_blocks"}
+{"id": "da20t_zt2", "rule": "drop_dead_cell", "fn": "__frame", "cell": "%175", "why": "anonymous_63 closure cell: all calls inlined, only guard reads remain; trace10 zt000 pattern"}
+{"id": "da20t_zt3", "rule": "drop_dead_cell", "fn": "__frame", "cell": "%182", "why": "anonymous_64 closure cell: same"}
+{"id": "da20t_gd0", "rule": "guard_branch", "fn": "__frame", "head": "in_i1_013_if_join_2", "taken": false, "why": "draw dispatch it2: fruit has no draw fn (only player.draw_22 exists), default spr path"}
+{"id": "da20t_gdd", "rule": "dce"}
+{"id": "da20t_nid", "rule": "dce"}
+{"id": "da20t_nim", "rule": "merge_blocks"}
+{"id": "da20t_fzm", "rule": "merge_blocks"}
+{"forward": true, "id": "da20t_fzc", "rule": "cse"}
+{"id": "da20t_fzf", "rule": "fold_select"}
+{"id": "da20t_fzd", "rule": "dce"}
+{"id": "da20_gfz", "rule": "guard_branch", "fn": "__frame", "head": "__entry", "taken": false, "why": "draw-skip gate: freeze cannot be set mid-frame in the dash class (the press path is the pinned-dead steady arm), so draw always runs"}
+{"id": "da20_gd1", "rule": "guard_branch", "fn": "__frame", "head": "in_i1_013_if_join_2", "taken": false, "why": "draw dispatch it3: spring has no draw fn"}
+{"id": "da20_gd2", "rule": "guard_branch", "fn": "__frame", "head": "in_da20t_zn005_in_i1_020_if_join_2", "taken": false, "why": "draw dispatch it4: spring has no draw fn"}
+{"id": "da20_gd3", "rule": "guard_branch", "fn": "__frame", "head": "in_da20t_zn006_in_i1_020_if_join_2", "taken": true, "why": "draw dispatch it5: player.draw_22"}
+{"id": "da20_gdd", "rule": "dce"}
+{"id": "da20_ni0", "rule": "inline", "fn": "__frame", "at": "%36266", "callee": "player.draw_22", "captures": [], "why": "the one live draw dispatch: it5 player"}
+{"id": "da20_nid", "rule": "dce"}
+{"id": "da20_nim", "rule": "merge_blocks"}
 {"id": "dash_dce", "rule": "dce"}
 {"id": "dash_kd", "rule": "kill_dead"}
