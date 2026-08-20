@@ -1747,7 +1747,11 @@ pub fn verify(
             before_block.terminator_id() == after_block.terminator_id(),
             format!("speculate_region changed the terminator id of '{}'", name),
         )?;
-        let want_terminator = if key.as_ref() == Some(head) {
+        let is_head = match key.as_ref() {
+            None => head.as_str() == "__entry",
+            Some(k) => k == head,
+        };
+        let want_terminator = if is_head {
             Terminator::UnconditionalBranch { target: arm.clone() }
         } else if let Some(ser) =
             s.serialize.as_ref().filter(|ser| key.as_ref() == Some(&ser.arm_exit))

@@ -1080,6 +1080,15 @@
 {"id": "st20_znm", "rule": "merge_blocks"}
 {"id": "st20_zt2", "rule": "drop_dead_cell", "fn": "__frame", "cell": "%175", "why": "anonymous_63 closure cell: all calls inlined, only guard reads remain; trace10 zt000 pattern"}
 {"id": "st20_zt3", "rule": "drop_dead_cell", "fn": "__frame", "cell": "%182", "why": "anonymous_64 closure cell: same"}
+{"id": "st20_gd0", "rule": "guard_branch", "fn": "__frame", "head": "in_i1_013_if_join_2", "taken": false, "why": "draw dispatch it2: fruit has no draw fn (only player.draw_22 exists), default spr path"}
+{"id": "st20_gd1", "rule": "guard_branch", "fn": "__frame", "head": "in_st20_zn004_in_i1_020_if_join_2", "taken": false, "why": "draw dispatch it3: spring has no draw fn"}
+{"id": "st20_gd2", "rule": "guard_branch", "fn": "__frame", "head": "in_st20_zn005_in_i1_020_if_join_2", "taken": false, "why": "draw dispatch it4: spring has no draw fn"}
+{"id": "st20_gd3", "rule": "guard_branch", "fn": "__frame", "head": "in_st20_zn006_in_i1_020_if_join_2", "taken": true, "why": "draw dispatch it5: player.draw_22"}
+{"id": "st20_gdd", "rule": "dce"}
+{"id": "st20_ni0", "rule": "inline", "fn": "__frame", "at": "%37621", "callee": "player.draw_22", "captures": [], "why": "the one live draw dispatch: it5 player"}
+{"id": "st20_nid", "rule": "dce"}
+{"id": "st20_nim", "rule": "merge_blocks"}
+{"id": "st20_fz0", "rule": "speculate_region", "fn": "__frame", "head": "__entry", "arm": "in_i1_013_if_join_2", "join": "in_i1_013_cont", "mask": true, "guards": true, "why": "the draw-skip gate: freeze set mid-frame by a dash press (4/44 steady frames skip draw) - per-lane mixed in-class, so draw runs masked; freeze-gate mask, the (1,0) #131 pattern"}
 {"id": "st20_fzm", "rule": "merge_blocks"}
 {"forward": true, "id": "st20_fzc", "rule": "cse"}
 {"id": "st20_fzf", "rule": "fold_select"}
