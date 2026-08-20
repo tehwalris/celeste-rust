@@ -14,7 +14,10 @@
 
 use celeste_engine::runtime2;
 use celeste_engine::kernel;
-use celeste_kernels::{kernel_gen_dash, kernel_gen_frozen, kernel_gen_steady};
+use celeste_kernels::{
+    kernel_gen_dash, kernel_gen_frozen, kernel_gen_r20_dash, kernel_gen_r20_frozen,
+    kernel_gen_r20_steady, kernel_gen_steady,
+};
 
 pub(crate) fn run_chunk_kernel(
     chunk: &runtime2::Rt2,
@@ -48,7 +51,22 @@ pub(crate) fn run_chunk_kernel(
         KERNEL_HITS[2].fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
         return true;
     }
-    KERNEL_HITS[3].fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
+    // Room (2,0) class kernels, same class-mask bits: each kernel's shape
+    // guard rejects wrong-shape chunks on the hash compare, so the extra
+    // tries cost one u64 compare per miss.
+    if mask & 1 != 0 && run_class_kernel_r20_steady(chunk, ids, done, local) {
+        KERNEL_HITS[3].fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
+        return true;
+    }
+    if mask & 2 != 0 && run_class_kernel_r20_dash(chunk, ids, done, local) {
+        KERNEL_HITS[4].fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
+        return true;
+    }
+    if mask & 4 != 0 && run_class_kernel_r20_frozen(chunk, ids, done, local) {
+        KERNEL_HITS[5].fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
+        return true;
+    }
+    KERNEL_HITS[6].fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
     // Why did every kernel refuse? A shape hash that matches some kernel
     // means the CLASS guard rejected it (a pm1 the overlays do not
     // cover); no match at all means the heap shape itself is new. The
@@ -58,6 +76,9 @@ pub(crate) fn run_chunk_kernel(
             ("steady", kernel_gen_steady::SHAPE_HASH),
             ("dash", kernel_gen_dash::SHAPE_HASH),
             ("frozen", kernel_gen_frozen::SHAPE_HASH),
+            ("r20-steady", kernel_gen_r20_steady::SHAPE_HASH),
+            ("r20-dash", kernel_gen_r20_dash::SHAPE_HASH),
+            ("r20-frozen", kernel_gen_r20_frozen::SHAPE_HASH),
         ];
         let same_shape: Vec<&str> = known
             .iter()
@@ -238,7 +259,10 @@ pub fn fused_artifact_fingerprint() -> Option<u64> {
     None
 }
 
-static KERNEL_HITS: [std::sync::atomic::AtomicU64; 4] = [
+static KERNEL_HITS: [std::sync::atomic::AtomicU64; 7] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -261,8 +285,9 @@ pub fn print_kernel_hits() {
     let plain = PLAIN_ROUTED.swap(0, std::sync::atomic::Ordering::Relaxed);
     if v.iter().any(|x| *x > 0) || plain > 0 {
         eprintln!(
-            "kernel lanes: steady {} dash {} frozen {} missed {} plain-routed {}",
-            v[0], v[1], v[2], v[3], plain
+            "kernel lanes: steady {} dash {} frozen {} r20-steady {} r20-dash {} \
+             r20-frozen {} missed {} plain-routed {}",
+            v[0], v[1], v[2], v[3], v[4], v[5], v[6], plain
         );
     }
     {
@@ -411,6 +436,9 @@ fn $fname(
 class_kernel_runner!(run_class_kernel_steady, kernel_gen_steady);
 class_kernel_runner!(run_class_kernel_dash, kernel_gen_dash);
 class_kernel_runner!(run_class_kernel_frozen, kernel_gen_frozen);
+class_kernel_runner!(run_class_kernel_r20_steady, kernel_gen_r20_steady);
+class_kernel_runner!(run_class_kernel_r20_dash, kernel_gen_r20_dash);
+class_kernel_runner!(run_class_kernel_r20_frozen, kernel_gen_r20_frozen);
 
 /// The fused specialization-set runner (plans/shape-tag-plan.md). Same
 /// slice loop as the class-kernel macro above, with one addition: the
