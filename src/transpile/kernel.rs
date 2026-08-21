@@ -1034,10 +1034,10 @@ fn eq(e: &mut Emit, l: &K, r: &K) -> Result<K> {
         (NumC(_) | SN(_) | ZN(_), NumC(_) | SN(_) | ZN(_)) => {
             if Emit::is_z(l) || Emit::is_z(r) {
                 let (a, b) = (e.as_zn(l)?, e.as_zn(r)?);
-                K::ZB(e.bind("ZB", &format!("zn_eq({}, {})", a, b)))
+                K::ZB(e.bind_op("ZB", &format!("zn_eq({}, {})", a, b), GOp::Eq, &[a.as_str(), b.as_str()]))
             } else {
                 let (a, b) = (sn(e, l)?, sn(e, r)?);
-                K::SB(e.bind("bool", &format!("{} == {}", a, b)))
+                K::SB(e.bind_op("bool", &format!("{} == {}", a, b), GOp::Eq, &[a.as_str(), b.as_str()]))
             }
         }
         (NumC(_) | SN(_) | ZN(_), _) | (_, NumC(_) | SN(_) | ZN(_)) => K::BoolC(false),
@@ -1049,11 +1049,11 @@ fn eq(e: &mut Emit, l: &K, r: &K) -> Result<K> {
         (SB(_) | BoolC(_) | ZB(_), SB(_) | BoolC(_) | ZB(_)) => {
             if Emit::is_z(l) || Emit::is_z(r) {
                 let (a, b) = (e.as_zb(l)?, e.as_zb(r)?);
-                K::ZB(e.bind("ZB", &format!("zb_eq({}, {})", a, b)))
+                K::ZB(e.bind_op("ZB", &format!("zb_eq({}, {})", a, b), GOp::Eq, &[a.as_str(), b.as_str()]))
             } else {
                 let a = sb(e, l)?;
                 let b = sb(e, r)?;
-                K::SB(e.bind("bool", &format!("{} == {}", a, b)))
+                K::SB(e.bind_op("bool", &format!("{} == {}", a, b), GOp::Eq, &[a.as_str(), b.as_str()]))
             }
         }
         (BoolC(_) | SB(_) | ZB(_) | UBool { .. }, _) | (_, BoolC(_) | SB(_) | ZB(_) | UBool { .. }) => {
@@ -1078,11 +1078,11 @@ fn sb(e: &mut Emit, k: &K) -> Result<String> {
 
 fn cmp(e: &mut Emit, op: BinaryOp, l: &K, r: &K) -> Result<K> {
     use BinaryOp as B;
-    let (zop, sop, jop) = match op {
-        B::LessThan => ("zn_lt", "<", "Lt"),
-        B::LessThanEqual => ("zn_le", "<=", "Le"),
-        B::GreaterThan => ("zn_gt", ">", "Gt"),
-        B::GreaterThanEqual => ("zn_ge", ">=", "Ge"),
+    let (zop, sop, jop, gop) = match op {
+        B::LessThan => ("zn_lt", "<", "Lt", GOp::Lt),
+        B::LessThanEqual => ("zn_le", "<=", "Le", GOp::Le),
+        B::GreaterThan => ("zn_gt", ">", "Gt", GOp::Gt),
+        B::GreaterThanEqual => ("zn_ge", ">=", "Ge", GOp::Ge),
         _ => unreachable!(),
     };
     let ival = Emit::is_ival(l) || Emit::is_ival(r);
@@ -1090,21 +1090,23 @@ fn cmp(e: &mut Emit, op: BinaryOp, l: &K, r: &K) -> Result<K> {
     Ok(match (ival, z) {
         (false, false) => {
             let (a, b) = (sn(e, l)?, sn(e, r)?);
-            K::SB(e.bind("bool", &format!("{} {} {}", a, sop, b)))
+            K::SB(e.bind_op("bool", &format!("{} {} {}", a, sop, b), gop, &[a.as_str(), b.as_str()]))
         }
         (false, true) => {
             let (a, b) = (e.as_zn(l)?, e.as_zn(r)?);
-            K::ZB(e.bind("ZB", &format!("{}({}, {})", zop, a, b)))
+            K::ZB(e.bind_op("ZB", &format!("{}({}, {})", zop, a, b), gop, &[a.as_str(), b.as_str()]))
         }
         (true, true) => {
             let (a, b) = (e.as_zi(l)?, e.as_zi(r)?);
-            K::ZB(e.bind("ZB", &format!("zi_cmp(Cmp::{}, {}, {})", jop, a, b)))
+            K::ZB(e.bind_op("ZB", &format!("zi_cmp(Cmp::{}, {}, {})", jop, a, b), gop, &[a.as_str(), b.as_str()]))
         }
         (true, false) => {
             let (a, b) = (e.as_si(l)?, e.as_si(r)?);
-            K::STri(e.bind(
+            K::STri(e.bind_op(
                 "Option<bool>",
                 &format!("si_cmp(Cmp::{}, {}, {})", jop, a, b),
+                gop,
+                &[a.as_str(), b.as_str()],
             ))
         }
     })
@@ -1122,46 +1124,46 @@ fn select(e: &mut Emit, c: &K, t: &K, f: &K) -> Result<K> {
         K::SB(cv) => Ok(if z {
             if ival {
                 let (a, b) = (e.as_zi(t)?, e.as_zi(f)?);
-                K::ZI(e.bind("ZI", &format!("if {} {{ {} }} else {{ {} }}", cv, a, b)))
+                K::ZI(e.bind_op("ZI", &format!("if {} {{ {} }} else {{ {} }}", cv, a, b), GOp::Sel, &[cv.as_str(), a.as_str(), b.as_str()]))
             } else if matches!(t, K::ZB(_) | K::BoolC(_) | K::SB(_))
                 && matches!(f, K::ZB(_) | K::BoolC(_) | K::SB(_))
                 && (matches!(t, K::ZB(_)) || matches!(f, K::ZB(_)))
             {
                 let (a, b) = (e.as_zb(t)?, e.as_zb(f)?);
-                K::ZB(e.bind("ZB", &format!("if {} {{ {} }} else {{ {} }}", cv, a, b)))
+                K::ZB(e.bind_op("ZB", &format!("if {} {{ {} }} else {{ {} }}", cv, a, b), GOp::Sel, &[cv.as_str(), a.as_str(), b.as_str()]))
             } else {
                 let (a, b) = (e.as_zn(t)?, e.as_zn(f)?);
-                K::ZN(e.bind("ZN", &format!("if {} {{ {} }} else {{ {} }}", cv, a, b)))
+                K::ZN(e.bind_op("ZN", &format!("if {} {{ {} }} else {{ {} }}", cv, a, b), GOp::Sel, &[cv.as_str(), a.as_str(), b.as_str()]))
             }
         } else {
             // scalar sides
             match (t, f) {
                 (K::SN(_) | K::NumC(_), K::SN(_) | K::NumC(_)) => {
                     let (a, b) = (sn(e, t)?, sn(e, f)?);
-                    K::SN(e.bind("P8", &format!("if {} {{ {} }} else {{ {} }}", cv, a, b)))
+                    K::SN(e.bind_op("P8", &format!("if {} {{ {} }} else {{ {} }}", cv, a, b), GOp::Sel, &[cv.as_str(), a.as_str(), b.as_str()]))
                 }
                 (K::SB(_) | K::BoolC(_), K::SB(_) | K::BoolC(_)) => {
                     let (a, b) = (sb(e, t)?, sb(e, f)?);
-                    K::SB(e.bind("bool", &format!("if {} {{ {} }} else {{ {} }}", cv, a, b)))
+                    K::SB(e.bind_op("bool", &format!("if {} {{ {} }} else {{ {} }}", cv, a, b), GOp::Sel, &[cv.as_str(), a.as_str(), b.as_str()]))
                 }
                 (K::SI(_) | K::SN(_) | K::NumC(_), K::SI(_) | K::SN(_) | K::NumC(_)) => {
                     let (a, b) = (e.as_si(t)?, e.as_si(f)?);
-                    K::SI(e.bind("(P8, P8)", &format!("if {} {{ {} }} else {{ {} }}", cv, a, b)))
+                    K::SI(e.bind_op("(P8, P8)", &format!("if {} {{ {} }} else {{ {} }}", cv, a, b), GOp::Sel, &[cv.as_str(), a.as_str(), b.as_str()]))
                 }
                 _ => bail!("select scalar sides {:?} / {:?}", t, f),
             }
         }),
         K::ZB(cv) => Ok(if ival {
             let (a, b) = (e.as_zi(t)?, e.as_zi(f)?);
-            K::ZI(e.bind("ZI", &format!("zsel_i({}, {}, {}, &mut dp)", cv, a, b)))
+            K::ZI(e.bind_op("ZI", &format!("zsel_i({}, {}, {}, &mut dp)", cv, a, b), GOp::Sel, &[cv.as_str(), a.as_str(), b.as_str()]))
         } else if matches!(t, K::ZB(_) | K::BoolC(_) | K::SB(_))
             && matches!(f, K::ZB(_) | K::BoolC(_) | K::SB(_))
         {
             let (a, b) = (e.as_zb(t)?, e.as_zb(f)?);
-            K::ZB(e.bind("ZB", &format!("zsel_b({}, {}, {}, &mut dp)", cv, a, b)))
+            K::ZB(e.bind_op("ZB", &format!("zsel_b({}, {}, {}, &mut dp)", cv, a, b), GOp::Sel, &[cv.as_str(), a.as_str(), b.as_str()]))
         } else {
             let (a, b) = (e.as_zn(t)?, e.as_zn(f)?);
-            K::ZN(e.bind("ZN", &format!("zsel_n({}, {}, {}, &mut dp)", cv, a, b)))
+            K::ZN(e.bind_op("ZN", &format!("zsel_n({}, {}, {}, &mut dp)", cv, a, b), GOp::Sel, &[cv.as_str(), a.as_str(), b.as_str()]))
         }),
         K::STri(cv) => {
             // Uniform tri-state: unknown means the whole slice deopts.
@@ -1302,21 +1304,21 @@ fn call_pure(e: &mut Emit, name: &str, args: &[LocalId]) -> Result<K> {
     match name {
         "flr" => match &vals[0] {
             K::NumC(c) => Ok(K::NumC(c.flr())),
-            K::SN(v) => Ok(K::SN(e.bind("P8", &format!("{}.flr()", v)))),
-            K::ZN(v) => Ok(K::ZN(e.bind("ZN", &format!("zn_flr({})", v)))),
-            K::ZI(v) => Ok(K::ZN(e.bind("ZN", &format!("zi_flr({}, &mut dp)", v)))),
-            K::ZIP { v, .. } => Ok(K::ZN(e.bind("ZN", &format!("zi_flr({}, &mut dp)", v)))),
+            K::SN(v) => Ok(K::SN(e.bind_op("P8", &format!("{}.flr()", v), GOp::Flr, &[v]))),
+            K::ZN(v) => Ok(K::ZN(e.bind_op("ZN", &format!("zn_flr({})", v), GOp::Flr, &[v]))),
+            K::ZI(v) => Ok(K::ZN(e.bind_op("ZN", &format!("zi_flr({}, &mut dp)", v), GOp::Flr, &[v]))),
+            K::ZIP { v, .. } => Ok(K::ZN(e.bind_op("ZN", &format!("zi_flr({}, &mut dp)", v), GOp::Flr, &[v]))),
             K::SI(v) => {
                 e.line(&format!("if {v}.0.flr() != {v}.1.flr() {{ *bd = true; }}", v = v));
-                Ok(K::SN(e.bind("P8", &format!("{}.0.flr()", v))))
+                Ok(K::SN(e.bind_op("P8", &format!("{}.0.flr()", v), GOp::Flr, &[v])))
             }
             other => bail!("flr on {:?}", other),
         },
         "abs" => match &vals[0] {
             K::NumC(c) => Ok(K::NumC(c.abs())),
-            K::SN(v) => Ok(K::SN(e.bind("P8", &format!("{}.abs()", v)))),
-            K::ZN(v) => Ok(K::ZN(e.bind("ZN", &format!("zn_abs({})", v)))),
-            K::ZI(v) | K::ZIP { v, .. } => Ok(K::ZI(e.bind("ZI", &format!("zi_abs({})", v)))),
+            K::SN(v) => Ok(K::SN(e.bind_op("P8", &format!("{}.abs()", v), GOp::Abs, &[v]))),
+            K::ZN(v) => Ok(K::ZN(e.bind_op("ZN", &format!("zn_abs({})", v), GOp::Abs, &[v]))),
+            K::ZI(v) | K::ZIP { v, .. } => Ok(K::ZI(e.bind_op("ZI", &format!("zi_abs({})", v), GOp::Abs, &[v]))),
             other => bail!("abs on {:?}", other),
         },
         "min" | "max" => {
@@ -1330,31 +1332,39 @@ fn call_pure(e: &mut Emit, name: &str, args: &[LocalId]) -> Result<K> {
             Ok(match (ival, z) {
                 (false, false) => {
                     let (a, b) = (sn(e, l)?, sn(e, r)?);
-                    K::SN(e.bind(
+                    K::SN(e.bind_op(
                         "P8",
                         &format!("{}.{}({})", a, if is_min { "min" } else { "max" }, b),
+                        if is_min { GOp::Min } else { GOp::Max },
+                        &[a.as_str(), b.as_str()],
                     ))
                 }
                 (false, true) => {
                     let (a, b) = (e.as_zn(l)?, e.as_zn(r)?);
-                    K::ZN(e.bind(
+                    K::ZN(e.bind_op(
                         "ZN",
                         &format!("{}({}, {})", if is_min { "zn_min" } else { "zn_max" }, a, b),
+                        if is_min { GOp::Min } else { GOp::Max },
+                        &[a.as_str(), b.as_str()],
                     ))
                 }
                 (true, true) => {
                     let (a, b) = (e.as_zi(l)?, e.as_zi(r)?);
-                    K::ZI(e.bind(
+                    K::ZI(e.bind_op(
                         "ZI",
                         &format!("{}({}, {})", if is_min { "zi_min" } else { "zi_max" }, a, b),
+                        if is_min { GOp::Min } else { GOp::Max },
+                        &[a.as_str(), b.as_str()],
                     ))
                 }
                 (true, false) => {
                     let (a, b) = (e.as_si(l)?, e.as_si(r)?);
                     let f = if is_min { "min" } else { "max" };
-                    K::SI(e.bind(
+                    K::SI(e.bind_op(
                         "(P8, P8)",
                         &format!("({a}.0.{f}({b}.0), {a}.1.{f}({b}.1))", a = a, b = b, f = f),
+                        if is_min { GOp::Min } else { GOp::Max },
+                        &[a.as_str(), b.as_str()],
                     ))
                 }
             })
@@ -1363,15 +1373,17 @@ fn call_pure(e: &mut Emit, name: &str, args: &[LocalId]) -> Result<K> {
             let (x, y) = (&vals[0], &vals[1]);
             if Emit::is_z(x) || Emit::is_z(y) {
                 let (a, b) = (e.as_zn(x)?, e.as_zn(y)?);
-                Ok(K::ZN(e.bind("ZN", &format!("zn_mget(g.cart, {}, {})", a, b))))
+                Ok(K::ZN(e.bind_op("ZN", &format!("zn_mget(g.cart, {}, {})", a, b), GOp::Mget, &[a.as_str(), b.as_str()])))
             } else {
                 let (a, b) = (sn(e, x)?, sn(e, y)?);
-                Ok(K::SN(e.bind(
+                Ok(K::SN(e.bind_op(
                     "P8",
                     &format!(
                         "P8::from_i16(g.cart.mget({}, {}).expect(\"mget\") as i16)",
                         a, b
                     ),
+                    GOp::Mget,
+                    &[a.as_str(), b.as_str()],
                 )))
             }
         }
@@ -1399,9 +1411,9 @@ fn call_pure(e: &mut Emit, name: &str, args: &[LocalId]) -> Result<K> {
             }
         }
         "sin" => match &vals[0] {
-            K::SN(v) => Ok(K::SN(e.bind("P8", &format!("{}.pico8_sin()", v)))),
+            K::SN(v) => Ok(K::SN(e.bind_op("P8", &format!("{}.pico8_sin()", v), GOp::Sin, &[v]))),
             K::NumC(c) => Ok(K::NumC(c.pico8_sin())),
-            K::ZN(v) => Ok(K::ZN(e.bind("ZN", &format!("zn_sin({})", v)))),
+            K::ZN(v) => Ok(K::ZN(e.bind_op("ZN", &format!("zn_sin({})", v), GOp::Sin, &[v]))),
             K::SI(_) | K::ZI(_) | K::ZIP { .. } => Ok(K::SI(e.bind(
                 "(P8, P8)",
                 "(P8::from_i16(-1), P8::from_i16(1))",
