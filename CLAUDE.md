@@ -72,9 +72,16 @@ suite. It runs the command in a systemd scope with `MemoryMax=100G` so an
 accidental blowup kills the process rather than the machine.
 
 ```bash
-./safe-run.sh -- cargo nextest run --release
+./safe-run.sh -- cargo nextest run --release                    # fast loop
+./safe-run.sh -- cargo nextest run --release --run-ignored all  # THE GATE
 ./safe-run.sh -- ./target/release/celeste-rust -n 40
 ```
+
+`--run-ignored all` matters: `every_checked_in_recipe_replays` replays
+every recipe end to end, costs ~200 s by itself, and is `#[ignore]`d so
+the edit loop stays usable. It is the only thing that catches a broken
+checked-in recipe, so the PRE-COMMIT run must include it. nextest prints
+ignored tests as skipped, so the skip is visible rather than silent.
 
 Run the suite with NEXTEST, never bare `cargo test --release`: the tests
 are fine (21 s wall for all 515 under nextest, 2026-08-16) but several

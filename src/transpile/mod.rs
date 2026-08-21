@@ -20,5 +20,6 @@
 //! installs files that build.
 
 pub mod fuse;
+pub mod graph;
 pub mod kernel;
 pub mod names;

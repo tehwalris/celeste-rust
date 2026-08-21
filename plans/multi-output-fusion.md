@@ -211,12 +211,19 @@ serious optimization over it (equality saturation included). The "it is
 not really pure, guards and dp are effects" caveat in the original P1
 dissolves - it was an artifact of the representation.
 
-**Caveat, do not leave implicit.** `div_positive` / `scale_positive`
-`assert!(rhs.0 > 0)` - they are PARTIAL. In the emitted code their
-divisor is always a literal, so it is statically dischargeable, but
-"compute everything and filter at the end" panics otherwise. The IR needs
-a stated story: prove the partial ops total by construction, or make them
-total (return top on bad input).
+**Partial ops are an artifact, not a constraint** (Philippe, 2026-08-22).
+`div_positive` / `scale_positive` `assert!(rhs.0 > 0)` only because the
+negative side was never modelled - written without access to a real
+PICO-8 to check against. We have one now, so the fix is to MODEL
+DIVISION CORRECTLY over negatives and drop the assert. Then every op is
+total, and "compute everything, filter at the end" is unconditionally
+safe. Do this as part of stage 1 rather than designing around it.
+
+**So the type story collapses further.** There are two domains, bool and
+number. Everything else - exactness (is this number a singleton?) and
+uniformity (is this the same for every lane?) - is a DERIVED PROPERTY
+propagated over the finished graph, in the same way, by the same kind of
+forward pass. Neither belongs in the node type.
 
 #### Gates: the round trip through Rust is NOT the gate
 

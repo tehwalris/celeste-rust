@@ -1388,7 +1388,20 @@ mod checked_in_recipe_tests {
     /// recipe's, and only the base recipe had been migrated to stable names.
     ///
     /// Discovering that by hand, one room later, is the expensive way.
+    ///
+    /// IGNORED BY DEFAULT because it replays every recipe end to end and
+    /// costs ~200 s on its own - more than the whole rest of the suite.
+    /// It is still a GATE, not an optional extra: run it with
+    ///
+    /// ```text
+    /// ./safe-run.sh -- cargo nextest run --release --run-ignored all
+    /// ```
+    ///
+    /// which is the command CLAUDE.md names for the pre-commit gate.
+    /// `#[ignore]` rather than an env check on purpose: nextest reports it
+    /// as skipped, so a skip is visible instead of silent.
     #[test]
+    #[ignore = "~200 s; run with --run-ignored all (the pre-commit gate does)"]
     fn every_checked_in_recipe_replays() {
         // Glob, don't enumerate: a hardcoded list here silently skipped
         // rewrites-room20.jsonl for a day. Any `rewrites*.jsonl` at the
