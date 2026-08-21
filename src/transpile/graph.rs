@@ -125,16 +125,6 @@ pub enum Op {
     Mget,
     TileFlagAt,
 
-    /// A value the emitter has not been migrated to describe structurally
-    /// yet. A LEAF, so it never dangles, and evaluating a graph that
-    /// contains one is an error rather than a guess.
-    ///
-    /// TEMPORARY AND SELF-RETIRING: `Graph::unmigrated()` counts these, and
-    /// when the count reaches zero for every kernel this variant and the
-    /// `Emit::bind` path that mints it both get deleted. It exists so the
-    /// 71-call-site migration can land in reviewable batches with the tree
-    /// green throughout, instead of as one unreviewable commit.
-    Unmigrated(u32),
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -183,15 +173,6 @@ impl Graph {
 
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
-    }
-
-    /// How many values the emitter has not yet described structurally.
-    /// The migration is done when this is 0; see `Op::Unmigrated`.
-    pub fn unmigrated(&self) -> usize {
-        self.nodes
-            .iter()
-            .filter(|n| matches!(n.op, Op::Unmigrated(_)))
-            .count()
     }
 
     /// Resolve an emitted operand spelling to a node: a name the emitter
@@ -336,12 +317,6 @@ impl Graph {
                 Op::Mget | Op::TileFlagAt => {
                     bail!("{:?} needs the cart; not supported by the pure evaluator yet", node.op)
                 }
-                Op::Unmigrated(k) => bail!(
-                    "node {} is Unmigrated({}): the emitter has not been migrated to describe \
-                     this value structurally, so the graph cannot be evaluated",
-                    i,
-                    k
-                ),
             };
             out.push(v);
         }

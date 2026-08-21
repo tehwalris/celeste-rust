@@ -183,16 +183,6 @@ impl Emit {
     fn line(&mut self, s: &str) {
         self.buf().push(Line::Raw(s.to_string()));
     }
-    /// Let-bind `expr` of rust type `ty`; returns the variable name. The
-    /// binding is kept structured (`Line::Let`) - it is one node of the
-    /// member's expression graph.
-    fn bind(&mut self, ty: &'static str, expr: &str) -> String {
-        // Not yet migrated to describe its structure: record a leaf so the
-        // graph never dangles, and count it. See `Op::Unmigrated`.
-        let k = self.graph.unmigrated() as u32;
-        let node = self.graph.leaf(GOp::Unmigrated(k));
-        self.bind_node(ty, expr, node)
-    }
 
     /// Let-bind `expr`, and record the VALUE it computes as `op(args)` in
     /// the member graph (`plans/multi-output-fusion.md`, P1'). `args` are
@@ -226,6 +216,13 @@ impl Emit {
             .graph
             .operand(arg, &self.node_of)
             .unwrap_or_else(|e| panic!("bind_alias({:?}): {:#}", expr, e));
+        self.bind_node(ty, expr, node)
+    }
+
+    /// Like `bind_op`, but the operands are already node ids - for a site
+    /// whose MEANING needs an inner node the emitted text does not name.
+    fn bind_op_nodes(&mut self, ty: &'static str, expr: &str, op: GOp, ids: Vec<NodeId>) -> String {
+        let node = self.graph.add(op, ids);
         self.bind_node(ty, expr, node)
     }
 
@@ -264,7 +261,7 @@ impl Emit {
     fn as_zn(&mut self, k: &K) -> Result<String> {
         Ok(match k {
             K::ZN(v) => v.clone(),
-            K::NumC(c) => self.bind("ZN", &format!("zn_splat({})", p8(c))),
+            K::NumC(c) => self.bind_op("ZN", &format!("zn_splat({})", p8(c)), GOp::ConstNum(c.as_raw_u32() as i32), &[]),
             K::SN(v) => self.bind_alias("ZN", &format!("zn_splat({})", v), v),
             other => bail!("as_zn on {:?}", other),
         })
@@ -275,7 +272,7 @@ impl Emit {
             K::ZI(v) => v.clone(),
             K::ZIP { v, .. } => v.clone(),
             K::ZN(v) => self.bind_alias("ZI", &format!("zi_of_zn({})", v), v),
-            K::NumC(c) => self.bind("ZI", &format!("zi_splat({}, {})", p8(c), p8(c))),
+            K::NumC(c) => self.bind_op("ZI", &format!("zi_splat({}, {})", p8(c), p8(c)), GOp::ConstNum(c.as_raw_u32() as i32), &[]),
             K::SN(v) => self.bind_alias("ZI", &format!("zi_splat({}, {})", v, v), v),
             K::SI(v) => self.bind_alias("ZI", &format!("zi_splat({}.0, {}.1)", v, v), v),
             other => bail!("as_zi on {:?}", other),
@@ -284,7 +281,7 @@ impl Emit {
     fn as_zb(&mut self, k: &K) -> Result<String> {
         Ok(match k {
             K::ZB(v) => v.clone(),
-            K::BoolC(b) => self.bind("ZB", &format!("zb_splat({})", b)),
+            K::BoolC(b) => self.bind_op("ZB", &format!("zb_splat({})", b), GOp::ConstBool(*b), &[]),
             K::SB(v) => self.bind_alias("ZB", &format!("zb_splat({})", v), v),
             other => bail!("as_zb on {:?}", other),
         })
@@ -294,7 +291,7 @@ impl Emit {
         Ok(match k {
             K::SI(v) => v.clone(),
             K::SN(v) => self.bind_alias("(P8, P8)", &format!("({}, {})", v, v), v),
-            K::NumC(c) => self.bind("(P8, P8)", &format!("({}, {})", p8(&c.clone()), p8(c))),
+            K::NumC(c) => self.bind_op("(P8, P8)", &format!("({}, {})", p8(&c.clone()), p8(c)), GOp::ConstNum(c.as_raw_u32() as i32), &[]),
             other => bail!("as_si on {:?}", other),
         })
     }
@@ -975,13 +972,15 @@ fn arith_mul(e: &mut Emit, l: &K, r: &K) -> Result<K> {
         let a = e.as_si(iv)?;
         let b = sn(e, num)?;
         e.line(&format!("if {} <= P8::from_i16(0) {{ *bd = true; }}", b));
-        Ok(K::SI(e.bind(
+        Ok(K::SI(e.bind_op(
             "(P8, P8)",
             &format!(
                 "{{ let r = IV::new({a}.0, {a}.1).scale_positive({b}); (r.low, r.high) }}",
                 a = a,
                 b = b
             ),
+            GOp::Mul,
+            &[a.as_str(), b.as_str()],
         )))
     }
 }
@@ -1006,13 +1005,15 @@ fn arith_div(e: &mut Emit, l: &K, r: &K) -> Result<K> {
         let a = e.as_si(l)?;
         let b = sn(e, r)?;
         e.line(&format!("if {} <= P8::from_i16(0) {{ *bd = true; }}", b));
-        Ok(K::SI(e.bind(
+        Ok(K::SI(e.bind_op(
             "(P8, P8)",
             &format!(
                 "{{ let r = IV::new({a}.0, {a}.1).div_positive({b}); (r.low, r.high) }}",
                 a = a,
                 b = b
             ),
+            GOp::Div,
+            &[a.as_str(), b.as_str()],
         )))
     }
 }
@@ -1024,7 +1025,7 @@ fn eq(e: &mut Emit, l: &K, r: &K) -> Result<K> {
         // ZIP: point lanes are the NUMBER `at`; interval lanes are never equal.
         (ZIP { pt, at, .. }, NumC(c)) | (NumC(c), ZIP { pt, at, .. }) => {
             if c == at {
-                K::ZB(e.bind("ZB", &format!("ZB {{ val: {}, known: ALL }}", pt)))
+                K::ZB(e.bind_alias("ZB", &format!("ZB {{ val: {}, known: ALL }}", pt), &pt))
             } else {
                 K::BoolC(false)
             }
@@ -1168,7 +1169,14 @@ fn select(e: &mut Emit, c: &K, t: &K, f: &K) -> Result<K> {
         K::STri(cv) => {
             // Uniform tri-state: unknown means the whole slice deopts.
             e.line(&format!("if {}.is_none() {{ *bd = true; }}", cv));
-            let cb = e.bind("bool", &format!("{}.unwrap_or(false)", cv));
+            let cb = {
+                let cn = e
+                    .graph
+                    .operand(&cv, &e.node_of)
+                    .unwrap_or_else(|err| panic!("unwrap_or operand {:?}: {:#}", cv, err));
+                let known = e.graph.add(GOp::Known, vec![cn]);
+                e.bind_op_nodes("bool", &format!("{}.unwrap_or(false)", cv), GOp::And, vec![known, cn])
+            };
             select(e, &K::SB(cb), t, f)
         }
         K::UBool { .. } => {
@@ -1392,21 +1400,25 @@ fn call_pure(e: &mut Emit, name: &str, args: &[LocalId]) -> Result<K> {
             let (wv, hv, fv) = (sn(e, w)?, sn(e, h)?, sn(e, f)?);
             if Emit::is_z(x) || Emit::is_z(y) {
                 let (a, b) = (e.as_zn(x)?, e.as_zn(y)?);
-                Ok(K::ZB(e.bind(
+                Ok(K::ZB(e.bind_op(
                     "ZB",
                     &format!(
                         "zn_tile_flag_at(g.cache, g.cart, {}, {}, {}, {}, {})",
                         a, b, wv, hv, fv
                     ),
+                    GOp::TileFlagAt,
+                    &[a.as_str(), b.as_str(), wv.as_str(), hv.as_str(), fv.as_str()],
                 )))
             } else {
                 let (a, b) = (sn(e, x)?, sn(e, y)?);
-                Ok(K::SB(e.bind(
+                Ok(K::SB(e.bind_op(
                     "bool",
                     &format!(
                         "{{ let z = zn_tile_flag_at(g.cache, g.cart, zn_splat({}), zn_splat({}), {}, {}, {}); z.val & 1 != 0 }}",
                         a, b, wv, hv, fv
                     ),
+                    GOp::TileFlagAt,
+                    &[a.as_str(), b.as_str(), wv.as_str(), hv.as_str(), fv.as_str()],
                 )))
             }
         }
@@ -1414,9 +1426,11 @@ fn call_pure(e: &mut Emit, name: &str, args: &[LocalId]) -> Result<K> {
             K::SN(v) => Ok(K::SN(e.bind_op("P8", &format!("{}.pico8_sin()", v), GOp::Sin, &[v]))),
             K::NumC(c) => Ok(K::NumC(c.pico8_sin())),
             K::ZN(v) => Ok(K::ZN(e.bind_op("ZN", &format!("zn_sin({})", v), GOp::Sin, &[v]))),
-            K::SI(_) | K::ZI(_) | K::ZIP { .. } => Ok(K::SI(e.bind(
+            K::SI(v) | K::ZI(v) | K::ZIP { v, .. } => Ok(K::SI(e.bind_op(
                 "(P8, P8)",
                 "(P8::from_i16(-1), P8::from_i16(1))",
+                GOp::Sin,
+                &[v],
             ))),
             other => bail!("sin on {:?}", other),
         },
@@ -2137,15 +2151,7 @@ fn render(e: &Emit) -> Result<String> {
         suf_text.lines().count(),
         e.witness_len,
     );
-    // P1' migration progress (plans/multi-output-fusion.md): the graph is
-    // complete when `unmigrated` is 0, at which point `Op::Unmigrated` and
-    // the `Emit::bind` path that mints it are deleted.
-    eprintln!(
-        "graph: {} nodes, {} unmigrated ({:.0}% of values described structurally)",
-        e.graph.len(),
-        e.graph.unmigrated(),
-        100.0 * (1.0 - e.graph.unmigrated() as f64 / e.graph.len().max(1) as f64),
-    );
+    eprintln!("graph: {} nodes", e.graph.len());
     Ok(out)
 }
 
