@@ -31,6 +31,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use crate::ir::{BinaryOp, Instruction, LocalId, Terminator, UnaryOp};
 use crate::pico8_num::Pico8Num as P8;
 use crate::rewrite::print::blocks_in_order;
+use super::graph::{Graph, NodeId, Op as GOp};
 use crate::rewrite::program::Program;
 
 /// Emit-time value. `S*` strings are generated VARIABLE NAMES (each IR
@@ -163,6 +164,12 @@ pub(crate) struct Emit {
     pub(crate) tainted_cells: BTreeSet<u32>,
     /// Taint of the instruction currently being emitted (routes buffers).
     pub(crate) cur_tainted: bool,
+    /// The member's value graph (plans/multi-output-fusion.md, P1'). Built
+    /// alongside the emitted lines while the 71 bind sites migrate; every
+    /// value not yet described structurally is an `Op::Unmigrated` leaf.
+    pub(crate) graph: Graph,
+    /// Emitted variable name -> its node in `graph`.
+    pub(crate) node_of: HashMap<String, NodeId>,
 }
 
 impl Emit {
@@ -180,8 +187,52 @@ impl Emit {
     /// binding is kept structured (`Line::Let`) - it is one node of the
     /// member's expression graph.
     fn bind(&mut self, ty: &'static str, expr: &str) -> String {
+        // Not yet migrated to describe its structure: record a leaf so the
+        // graph never dangles, and count it. See `Op::Unmigrated`.
+        let k = self.graph.unmigrated() as u32;
+        let node = self.graph.leaf(GOp::Unmigrated(k));
+        self.bind_node(ty, expr, node)
+    }
+
+    /// Let-bind `expr`, and record the VALUE it computes as `op(args)` in
+    /// the member graph (`plans/multi-output-fusion.md`, P1'). `args` are
+    /// operand spellings as they appear in `expr`: bound names, witness
+    /// cells, or literals.
+    fn bind_op(&mut self, ty: &'static str, expr: &str, op: GOp, args: &[&str]) -> String {
+        let ids: Vec<_> = args
+            .iter()
+            .map(|a| {
+                self.graph
+                    .operand(a, &self.node_of)
+                    .unwrap_or_else(|e| panic!("bind_op({:?}): {:#}", expr, e))
+            })
+            .collect();
+        let node = self.graph.add(op, ids);
+        self.bind_node(ty, expr, node)
+    }
+
+    /// Let-bind a value-preserving REPRESENTATION change: a splat
+    /// (uniform -> per-lane) or a widening (exact -> singleton interval).
+    /// The emitted line still happens; the graph does not gain a node,
+    /// because in a one-lane graph these are the identity. The bound name
+    /// simply aliases the operand's node.
+    ///
+    /// This is where 35% of the emitted kernel's nodes disappear, and with
+    /// them a class of spurious divergence between members (20 of the 31
+    /// divergence roots measured between the steady and pinned-dying
+    /// members were splats and constants).
+    fn bind_alias(&mut self, ty: &'static str, expr: &str, arg: &str) -> String {
+        let node = self
+            .graph
+            .operand(arg, &self.node_of)
+            .unwrap_or_else(|e| panic!("bind_alias({:?}): {:#}", expr, e));
+        self.bind_node(ty, expr, node)
+    }
+
+    fn bind_node(&mut self, ty: &'static str, expr: &str, node: NodeId) -> String {
         let name = format!("v{}", self.n);
         self.n += 1;
+        self.node_of.insert(name.clone(), node);
         self.buf().push(Line::Let {
             name: name.clone(),
             ty,
@@ -214,7 +265,7 @@ impl Emit {
         Ok(match k {
             K::ZN(v) => v.clone(),
             K::NumC(c) => self.bind("ZN", &format!("zn_splat({})", p8(c))),
-            K::SN(v) => self.bind("ZN", &format!("zn_splat({})", v)),
+            K::SN(v) => self.bind_alias("ZN", &format!("zn_splat({})", v), v),
             other => bail!("as_zn on {:?}", other),
         })
     }
@@ -223,10 +274,10 @@ impl Emit {
         Ok(match k {
             K::ZI(v) => v.clone(),
             K::ZIP { v, .. } => v.clone(),
-            K::ZN(v) => self.bind("ZI", &format!("zi_of_zn({})", v)),
+            K::ZN(v) => self.bind_alias("ZI", &format!("zi_of_zn({})", v), v),
             K::NumC(c) => self.bind("ZI", &format!("zi_splat({}, {})", p8(c), p8(c))),
-            K::SN(v) => self.bind("ZI", &format!("zi_splat({}, {})", v, v)),
-            K::SI(v) => self.bind("ZI", &format!("zi_splat({}.0, {}.1)", v, v)),
+            K::SN(v) => self.bind_alias("ZI", &format!("zi_splat({}, {})", v, v), v),
+            K::SI(v) => self.bind_alias("ZI", &format!("zi_splat({}.0, {}.1)", v, v), v),
             other => bail!("as_zi on {:?}", other),
         })
     }
@@ -234,7 +285,7 @@ impl Emit {
         Ok(match k {
             K::ZB(v) => v.clone(),
             K::BoolC(b) => self.bind("ZB", &format!("zb_splat({})", b)),
-            K::SB(v) => self.bind("ZB", &format!("zb_splat({})", v)),
+            K::SB(v) => self.bind_alias("ZB", &format!("zb_splat({})", v), v),
             other => bail!("as_zb on {:?}", other),
         })
     }
@@ -242,7 +293,7 @@ impl Emit {
     fn as_si(&mut self, k: &K) -> Result<String> {
         Ok(match k {
             K::SI(v) => v.clone(),
-            K::SN(v) => self.bind("(P8, P8)", &format!("({}, {})", v, v)),
+            K::SN(v) => self.bind_alias("(P8, P8)", &format!("({}, {})", v, v), v),
             K::NumC(c) => self.bind("(P8, P8)", &format!("({}, {})", p8(&c.clone()), p8(c))),
             other => bail!("as_si on {:?}", other),
         })
@@ -452,6 +503,8 @@ pub(crate) fn emit_walk(program: &Program, witness_path: &str) -> Result<Emit> {
         tainted_vars: BTreeSet::new(),
         tainted_cells: BTreeSet::new(),
         cur_tainted: false,
+        graph: Graph::new(),
+        node_of: HashMap::new(),
     };
     load_witness(witness_path, &mut e)?;
     for k in 0..6 {
@@ -769,17 +822,17 @@ fn eval(e: &mut Emit, instr: &Instruction) -> Result<Option<K>> {
 fn unop(e: &mut Emit, op: UnaryOp, a: &K) -> Result<K> {
     Ok(match (op, a) {
         (UnaryOp::Not, K::BoolC(b)) => K::BoolC(!b),
-        (UnaryOp::Not, K::SB(v)) => K::SB(e.bind("bool", &format!("!{}", v))),
-        (UnaryOp::Not, K::STri(v)) => K::STri(e.bind("Option<bool>", &format!("{}.map(|b| !b)", v))),
-        (UnaryOp::Not, K::ZB(v)) => K::ZB(e.bind("ZB", &format!("zb_not({})", v))),
+        (UnaryOp::Not, K::SB(v)) => K::SB(e.bind_op("bool", &format!("!{}", v), GOp::Not, &[v])),
+        (UnaryOp::Not, K::STri(v)) => K::STri(e.bind_op("Option<bool>", &format!("{}.map(|b| !b)", v), GOp::Not, &[v])),
+        (UnaryOp::Not, K::ZB(v)) => K::ZB(e.bind_op("ZB", &format!("zb_not({})", v), GOp::Not, &[v])),
         (UnaryOp::Not, K::UBool { .. }) => K::UBool { btn: None },
         (UnaryOp::Minus, K::NumC(c)) => K::NumC(-*c),
-        (UnaryOp::Minus, K::SN(v)) => K::SN(e.bind("P8", &format!("-{}", v))),
-        (UnaryOp::Minus, K::ZN(v)) => K::ZN(e.bind("ZN", &format!("zn_neg({})", v))),
+        (UnaryOp::Minus, K::SN(v)) => K::SN(e.bind_op("P8", &format!("-{}", v), GOp::Neg, &[v])),
+        (UnaryOp::Minus, K::ZN(v)) => K::ZN(e.bind_op("ZN", &format!("zn_neg({})", v), GOp::Neg, &[v])),
         (UnaryOp::Minus, K::SI(v)) => {
-            K::SI(e.bind("(P8, P8)", &format!("(-{v}.1, -{v}.0)", v = v)))
+            K::SI(e.bind_op("(P8, P8)", &format!("(-{v}.1, -{v}.0)", v = v), GOp::Neg, &[v]))
         }
-        (UnaryOp::Minus, K::ZI(v)) => K::ZI(e.bind("ZI", &format!("zi_neg({})", v))),
+        (UnaryOp::Minus, K::ZI(v)) => K::ZI(e.bind_op("ZI", &format!("zi_neg({})", v), GOp::Neg, &[v])),
         (UnaryOp::Hash, K::Ptr(c)) => match e.cells.get(c) {
             Some(CellT::Arr(items)) => K::NumC(P8::from_i16(items.len() as i16)),
             other => bail!("# on {:?}", other),
@@ -2055,6 +2108,15 @@ fn render(e: &Emit) -> Result<String> {
         pre_text.lines().count(),
         suf_text.lines().count(),
         e.witness_len,
+    );
+    // P1' migration progress (plans/multi-output-fusion.md): the graph is
+    // complete when `unmigrated` is 0, at which point `Op::Unmigrated` and
+    // the `Emit::bind` path that mints it are deleted.
+    eprintln!(
+        "graph: {} nodes, {} unmigrated ({:.0}% of values described structurally)",
+        e.graph.len(),
+        e.graph.unmigrated(),
+        100.0 * (1.0 - e.graph.unmigrated() as f64 / e.graph.len().max(1) as f64),
     );
     Ok(out)
 }

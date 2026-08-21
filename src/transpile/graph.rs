@@ -82,6 +82,8 @@ pub enum Op {
     /// An input cell. NOT split into uniform/per-lane: that is a derived
     /// property, computed after the graph exists.
     Cell(u32),
+    /// One of the six button bits the suffix is specialized on.
+    Button(u8),
 
     // ---- number -> number ----
     Add,
@@ -118,6 +120,17 @@ pub enum Op {
     // ---- cart lookups ----
     Mget,
     TileFlagAt,
+
+    /// A value the emitter has not been migrated to describe structurally
+    /// yet. A LEAF, so it never dangles, and evaluating a graph that
+    /// contains one is an error rather than a guess.
+    ///
+    /// TEMPORARY AND SELF-RETIRING: `Graph::unmigrated()` counts these, and
+    /// when the count reaches zero for every kernel this variant and the
+    /// `Emit::bind` path that mints it both get deleted. It exists so the
+    /// 71-call-site migration can land in reviewable batches with the tree
+    /// green throughout, instead of as one unreviewable commit.
+    Unmigrated(u32),
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -168,6 +181,63 @@ impl Graph {
         self.nodes.is_empty()
     }
 
+    /// How many values the emitter has not yet described structurally.
+    /// The migration is done when this is 0; see `Op::Unmigrated`.
+    pub fn unmigrated(&self) -> usize {
+        self.nodes
+            .iter()
+            .filter(|n| matches!(n.op, Op::Unmigrated(_)))
+            .count()
+    }
+
+    /// Resolve an emitted operand spelling to a node: a name the emitter
+    /// already bound, a witness field access (`u.cN` / `rin.cN`), or a
+    /// literal. Anything else is an error - silently inventing a node here
+    /// would make the graph disagree with the program it claims to model.
+    pub fn operand(&mut self, s: &str, named: &HashMap<String, NodeId>) -> Result<NodeId> {
+        if let Some(id) = named.get(s) {
+            return Ok(*id);
+        }
+        // Uniform cells read from the witness binding, per-lane columns read
+        // from the row struct, and the `let r_cN = ...` loads the emitter
+        // hoists for them. All three are the same thing to the graph: an
+        // input cell. Which of them is uniform is a DERIVED property.
+        for p in ["u.c", "rin.c", "r_c"] {
+            if let Some(rest) = s.strip_prefix(p) {
+                if let Ok(cell) = rest.parse::<u32>() {
+                    return Ok(self.leaf(Op::Cell(cell)));
+                }
+            }
+        }
+        // kb0..kb5: the button bits the suffix is specialized on.
+        if let Some(rest) = s.strip_prefix("kb") {
+            if let Ok(bit) = rest.parse::<u8>() {
+                return Ok(self.leaf(Op::Button(bit)));
+            }
+        }
+        if let Some(rest) = s.strip_prefix("P8::from_raw(") {
+            if let Some(num) = rest.strip_suffix("i32)") {
+                if let Ok(raw) = num.parse::<i32>() {
+                    return Ok(self.leaf(Op::ConstNum(raw)));
+                }
+            }
+        }
+        if let Some(rest) = s.strip_prefix("P8::from_i16(") {
+            if let Some(num) = rest.strip_suffix(')') {
+                if let Ok(v) = num.parse::<i16>() {
+                    let raw = (v as i32) << 16;
+                    return Ok(self.leaf(Op::ConstNum(raw)));
+                }
+            }
+        }
+        match s {
+            "true" => return Ok(self.leaf(Op::ConstBool(true))),
+            "false" => return Ok(self.leaf(Op::ConstBool(false))),
+            _ => {}
+        }
+        bail!("operand {:?} is not a bound name, a witness cell or a literal", s)
+    }
+
     /// Evaluate `roots` given the input cells, in one pass over the arena.
     /// Nodes are appended after their operands, so a forward sweep is a
     /// valid evaluation order.
@@ -178,6 +248,7 @@ impl Graph {
             let v = match &node.op {
                 Op::ConstNum(raw) => Val::exact_num(Pico8Num::from_raw(*raw)),
                 Op::ConstBool(b) => Val::Bool(Some(*b)),
+                Op::Button(b) => bail!("node {}: button bit {} has no value outside a variant", i, b),
                 Op::Cell(c) => match cells.get(c) {
                     Some(v) => *v,
                     None => bail!("node {}: input cell {} was not supplied", i, c),
@@ -260,6 +331,12 @@ impl Graph {
                 Op::Mget | Op::TileFlagAt => {
                     bail!("{:?} needs the cart; not supported by the pure evaluator yet", node.op)
                 }
+                Op::Unmigrated(k) => bail!(
+                    "node {} is Unmigrated({}): the emitter has not been migrated to describe \
+                     this value structurally, so the graph cannot be evaluated",
+                    i,
+                    k
+                ),
             };
             out.push(v);
         }
