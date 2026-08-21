@@ -84,6 +84,10 @@ pub enum Op {
     Cell(u32),
     /// One of the six button bits the suffix is specialized on.
     Button(u8),
+    /// `Fork(d)` over one operand: the value narrowed to configuration
+    /// `c{d}` of the d-th concretization fork. A value the program could
+    /// not keep symbolic, so it runs once per possible outcome.
+    Fork(u8),
 
     // ---- number -> number ----
     Add,
@@ -249,6 +253,7 @@ impl Graph {
                 Op::ConstNum(raw) => Val::exact_num(Pico8Num::from_raw(*raw)),
                 Op::ConstBool(b) => Val::Bool(Some(*b)),
                 Op::Button(b) => bail!("node {}: button bit {} has no value outside a variant", i, b),
+                Op::Fork(d) => bail!("node {}: fork {} has no value outside a configuration", i, d),
                 Op::Cell(c) => match cells.get(c) {
                     Some(v) => *v,
                     None => bail!("node {}: input cell {} was not supplied", i, c),

@@ -868,10 +868,10 @@ fn binop(e: &mut Emit, op: BinaryOp, l: &K, r: &K) -> Result<K> {
             // nums only (av_rem)
             if Emit::is_z(l) || Emit::is_z(r) {
                 let (a, b) = (e.as_zn(l)?, e.as_zn(r)?);
-                Ok(K::ZN(e.bind("ZN", &format!("zn_rem({}, {})", a, b))))
+                Ok(K::ZN(e.bind_op("ZN", &format!("zn_rem({}, {})", a, b), GOp::Rem, &[a.as_str(), b.as_str()])))
             } else {
                 let (a, b) = (sn(e, l)?, sn(e, r)?);
-                Ok(K::SN(e.bind("P8", &format!("{} % {}", a, b))))
+                Ok(K::SN(e.bind_op("P8", &format!("{} % {}", a, b), GOp::Rem, &[a.as_str(), b.as_str()])))
             }
         }
         B::TwoEqual => eq(e, l, r),
@@ -888,7 +888,7 @@ fn binop(e: &mut Emit, op: BinaryOp, l: &K, r: &K) -> Result<K> {
 fn sn(e: &mut Emit, k: &K) -> Result<String> {
     Ok(match k {
         K::SN(v) => v.clone(),
-        K::NumC(c) => e.bind("P8", &p8(c)),
+        K::NumC(c) => e.bind_op("P8", &p8(c), GOp::ConstNum(c.as_raw_u32() as i32), &[]),
         other => bail!("sn on {:?}", other),
     })
 }
@@ -917,7 +917,7 @@ fn arith_addsub(e: &mut Emit, sub: bool, l: &K, r: &K) -> Result<K> {
                 _ => None,
             };
             let (a, b) = (sn(e, l)?, sn(e, r)?);
-            let var = e.bind("P8", &format!("{} {} {}", a, if sub { "-" } else { "+" }, b));
+            let var = e.bind_op("P8", &format!("{} {} {}", a, if sub { "-" } else { "+" }, b), if sub { GOp::Sub } else { GOp::Add }, &[a.as_str(), b.as_str()]);
             if let Some(k) = known {
                 e.pin_val.insert(var.clone(), k);
             }
@@ -925,23 +925,29 @@ fn arith_addsub(e: &mut Emit, sub: bool, l: &K, r: &K) -> Result<K> {
         }
         (false, true) => {
             let (a, b) = (e.as_zn(l)?, e.as_zn(r)?);
-            K::ZN(e.bind(
+            K::ZN(e.bind_op(
                 "ZN",
                 &format!("{}({}, {})", if sub { "zn_sub" } else { "zn_add" }, a, b),
+                if sub { GOp::Sub } else { GOp::Add },
+                &[a.as_str(), b.as_str()],
             ))
         }
         (true, false) => {
             let (a, b) = (e.as_si(l)?, e.as_si(r)?);
-            K::SI(e.bind(
+            K::SI(e.bind_op(
                 "(P8, P8)",
                 &format!("{}({}, {})", if sub { "si_sub" } else { "si_add" }, a, b),
+                if sub { GOp::Sub } else { GOp::Add },
+                &[a.as_str(), b.as_str()],
             ))
         }
         (true, true) => {
             let (a, b) = (e.as_zi(l)?, e.as_zi(r)?);
-            K::ZI(e.bind(
+            K::ZI(e.bind_op(
                 "ZI",
                 &format!("{}({}, {})", if sub { "zi_sub" } else { "zi_add" }, a, b),
+                if sub { GOp::Sub } else { GOp::Add },
+                &[a.as_str(), b.as_str()],
             ))
         }
     })
@@ -951,10 +957,10 @@ fn arith_mul(e: &mut Emit, l: &K, r: &K) -> Result<K> {
     if !Emit::is_ival(l) && !Emit::is_ival(r) {
         return if Emit::is_z(l) || Emit::is_z(r) {
             let (a, b) = (e.as_zn(l)?, e.as_zn(r)?);
-            Ok(K::ZN(e.bind("ZN", &format!("zn_mul({}, {})", a, b))))
+            Ok(K::ZN(e.bind_op("ZN", &format!("zn_mul({}, {})", a, b), GOp::Mul, &[a.as_str(), b.as_str()])))
         } else {
             let (a, b) = (sn(e, l)?, sn(e, r)?);
-            Ok(K::SN(e.bind("P8", &format!("{} * {}", a, b))))
+            Ok(K::SN(e.bind_op("P8", &format!("{} * {}", a, b), GOp::Mul, &[a.as_str(), b.as_str()])))
         };
     }
     // interval * positive number (av_mul's only interval arm)
@@ -964,7 +970,7 @@ fn arith_mul(e: &mut Emit, l: &K, r: &K) -> Result<K> {
     }
     if Emit::is_z(iv) || Emit::is_z(num) {
         let (a, b) = (e.as_zi(iv)?, e.as_zn(num)?);
-        Ok(K::ZI(e.bind("ZI", &format!("zi_mul_pos({}, {}, &mut dp)", a, b))))
+        Ok(K::ZI(e.bind_op("ZI", &format!("zi_mul_pos({}, {}, &mut dp)", a, b), GOp::Mul, &[a.as_str(), b.as_str()])))
     } else {
         let a = e.as_si(iv)?;
         let b = sn(e, num)?;
@@ -984,10 +990,10 @@ fn arith_div(e: &mut Emit, l: &K, r: &K) -> Result<K> {
     if !Emit::is_ival(l) && !Emit::is_ival(r) {
         return if Emit::is_z(l) || Emit::is_z(r) {
             let (a, b) = (e.as_zn(l)?, e.as_zn(r)?);
-            Ok(K::ZN(e.bind("ZN", &format!("zn_div({}, {})", a, b))))
+            Ok(K::ZN(e.bind_op("ZN", &format!("zn_div({}, {})", a, b), GOp::Div, &[a.as_str(), b.as_str()])))
         } else {
             let (a, b) = (sn(e, l)?, sn(e, r)?);
-            Ok(K::SN(e.bind("P8", &format!("{} / {}", a, b))))
+            Ok(K::SN(e.bind_op("P8", &format!("{} / {}", a, b), GOp::Div, &[a.as_str(), b.as_str()])))
         };
     }
     if !Emit::is_ival(l) || !Emit::is_num(r) {
@@ -995,7 +1001,7 @@ fn arith_div(e: &mut Emit, l: &K, r: &K) -> Result<K> {
     }
     if Emit::is_z(l) || Emit::is_z(r) {
         let (a, b) = (e.as_zi(l)?, e.as_zn(r)?);
-        Ok(K::ZI(e.bind("ZI", &format!("zi_div_pos({}, {}, &mut dp)", a, b))))
+        Ok(K::ZI(e.bind_op("ZI", &format!("zi_div_pos({}, {}, &mut dp)", a, b), GOp::Div, &[a.as_str(), b.as_str()])))
     } else {
         let a = e.as_si(l)?;
         let b = sn(e, r)?;
@@ -1065,7 +1071,7 @@ fn eq(e: &mut Emit, l: &K, r: &K) -> Result<K> {
 fn sb(e: &mut Emit, k: &K) -> Result<String> {
     Ok(match k {
         K::SB(v) => v.clone(),
-        K::BoolC(b) => e.bind("bool", &format!("{}", b)),
+        K::BoolC(b) => e.bind_op("bool", &format!("{}", b), GOp::ConstBool(*b), &[]),
         other => bail!("sb on {:?}", other),
     })
 }
@@ -1206,6 +1212,16 @@ fn call_intrinsic(e: &mut Emit, name: &str, args: &[LocalId]) -> Result<K> {
                         valid, e.valid_expr, frag
                     ));
                     e.line(&format!("if {} == 0 {{ continue; }}", valid));
+                    // The fork mints its own name, so register its node by
+                    // hand: the narrowed value is Fork(depth) over the
+                    // operand. (`valid{d}` stays a plain emitted variable
+                    // until the validity path is migrated.)
+                    let fork_arg = e
+                        .graph
+                        .operand(&v, &e.node_of)
+                        .unwrap_or_else(|err| panic!("fork operand {:?}: {:#}", v, err));
+                    let fork_node = e.graph.add(GOp::Fork(d as u8), vec![fork_arg]);
+                    e.node_of.insert(frag.clone(), fork_node);
                     e.var_ty.insert(frag.clone(), "ZI");
                     e.var_ty.insert(valid.clone(), "u16");
                     e.pre_defs.insert(frag.clone());
