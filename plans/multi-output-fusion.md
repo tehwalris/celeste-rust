@@ -81,7 +81,12 @@ graph you normalize both and structural-hash, and the question disappears.
 
 ## The plan
 
-### P1 - fuse on a normalized pure graph, not on text
+### P1 - REFUTED BY MEASUREMENT 2026-08-21, see "P1 was wrong" below
+
+The original P1 is kept below for the record, then corrected. Do not
+implement it as written.
+
+### P1 (as originally written) - fuse on a normalized pure graph, not on text
 
 Represent each member's lowered body as value nodes (opcode + operand ids),
 not rendered strings. Normalize before hashing: constant-fold to fixpoint,
@@ -102,6 +107,62 @@ What P1 does NOT fix: where a pin genuinely DELETES a computation, the
 graphs really do differ. That is fine - node membership is already a
 bitmask (`NodeDef.members`), so a node present in only one member costs
 only itself.
+
+### P1 was wrong: the divergence CASCADES (measured 2026-08-21)
+
+P1's rationale above - "a member whose IR got more constant propagation
+should still fuse; normalize both and the question disappears" - was
+tested before implementing it, on the exact adversarial pair, and is
+**false**. `/tmp/normspike.py` (analysis only): parse both emitted
+kernels, rebuild each member's DAG, intern into ONE shared table exactly
+as `fuse.rs` `Ctx` does, then apply normalization and re-count. The
+harness reproduces the fuser's own numbers with a constant -10 offset (10
+node forms its regex misses), so it is trustworthy:
+
+| pair | fuse says | harness | + normalization |
+|---|---|---|---|
+| steady + v2 blended | 1396 / 1376 / **1375** shared | 1386 / 1366 / 1365 | 1365 (**+0**) |
+| steady + v1 pinned  | 1396 / 1169 / **271** shared | 1386 / 1159 / 261 | 261 (**+0**) |
+
+Normalization buys **exactly zero**. Why: the difference is not local
+notation, it CASCADES. Of steady's 1125 unshared nodes only **31 are on
+the divergence frontier** (every operand shared); the other 1090 have at
+least one operand that already diverged. Dying-only: 2 frontier, 892
+cascade. **~33 real divergence roots poison ~1982 nodes - 60:1.** Once
+one operand differs, structural hashing can never re-match anything
+downstream of it, however well you normalise.
+
+And the frontier is mostly not notational:
+
+```
+bool   true                                 <- a folded constant
+ZB     zsel_b(<181>, <194>, <194>, &mut dp) <- identical arms, trivially foldable
+ZI     zsel_i(<181>, <186>, <182>, &mut dp) <- steady BLENDS where the member PINNED
+P8     u.c85 + <0>   vs the member's  u.c87 + <0>   <- a DIFFERENT uniform cell
+bool   !u.c310, !u.c309, u.c46 >= <4>       <- uniform-cell comparisons
+```
+
+Unifying the `zsel_*(<181>, ..)` family needs PREMISE reasoning ("under
+this member's guard `<181>` is true, so the select equals its arm"), not
+constant folding - a much larger feature. `u.c85` vs `u.c87` is a
+genuinely different input and must never be unified. Only the
+identical-arms select is a cheap normalization win.
+
+**Consequences.**
+
+1. Derivation discipline is not a workaround for a weak fuser - it is
+   the mechanism. A fuser cannot repair downstream what the derivation
+   destroyed upstream. Build members as "the primary plus one flipped
+   decision" because that is the only thing that works, not as a stopgap.
+2. The recipe-alignment tooling dropped from the first draft comes BACK,
+   in a better form the 60:1 ratio suggests: **a frontier report**. When
+   fusion under-shares, print the ~33 frontier nodes - that is exactly
+   where two derivations parted company, small enough to read, and it
+   replaces a half-day of guessing at recipe entries with a diff. Cheap;
+   `normspike.py` is a working prototype.
+3. A pure-graph node IR may still be worth building for other reasons
+   (readability, the identical-arms fold, P2's needs), but **not** on the
+   promise of recovering sharing. That promise is measured and dead.
 
 ### P2 - per-member validity and per-member outputs
 
