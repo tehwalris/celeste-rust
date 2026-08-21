@@ -72,10 +72,32 @@ suite. It runs the command in a systemd scope with `MemoryMax=100G` so an
 accidental blowup kills the process rather than the machine.
 
 ```bash
-./safe-run.sh -- cargo nextest run --release                    # fast loop
+cargo nextest run <filter>                                      # DEV LOOP, 0.2 s
+./safe-run.sh -- cargo nextest run --release                    # full, 123 s
 ./safe-run.sh -- cargo nextest run --release --run-ignored all  # THE GATE
 ./safe-run.sh -- ./target/release/celeste-rust -n 40
 ```
+
+**Use a debug build AND a filter for the edit loop** (e.g.
+`cargo nextest run transpile::graph`): debug builds in 16 s against
+release's 105 s, and a filtered run is milliseconds. Measured 2026-08-22:
+
+| config | build | run | total |
+|---|---|---|---|
+| release, full | 105 s | 18 s | 123 s |
+| debug, full | 16 s | 153 s | 169 s |
+| debug + filter | 16 s cold | 0.005 s | **0.20 s** |
+
+Do NOT run the full suite in debug: it is compute-bound, and
+`compiled_forward_reproduces_the_interpreter` alone goes 18 s -> 153 s.
+Debug wins only when a filter keeps those tests out of the run.
+
+Three slow tests are `#[ignore]`d so the default run is 18 s rather than
+204 s: `every_checked_in_recipe_replays` (~200 s) and
+`generated_is_current{,_r20}` (~44 s / ~70 s). They are still GATES - the
+pre-commit run must use `--run-ignored all`. `#[ignore]` over an env
+check on purpose: nextest prints them as skipped, so the skip is visible
+rather than silent.
 
 `--run-ignored all` matters: `every_checked_in_recipe_replays` replays
 every recipe end to end, costs ~200 s by itself, and is `#[ignore]`d so

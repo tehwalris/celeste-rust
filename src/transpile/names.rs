@@ -395,7 +395,12 @@ mod tests {
     /// If this fails, run `./regen-generated.sh` and commit the result -
     /// after checking the diff is what you meant, because a diff here moves
     /// the row keys.
+    ///
+    /// IGNORED BY DEFAULT (~44 s): it regenerates and compares. Still a
+    /// GATE - `cargo nextest run --release --run-ignored all`, which is
+    /// CLAUDE.md's pre-commit command.
     #[test]
+    #[ignore = "~44 s regen; run with --run-ignored all (the pre-commit gate does)"]
     fn generated_is_current() {
         let regen = |recipe: &str| {
             let r = crate::rewrite::recipe::Recipe::load(recipe)
@@ -443,7 +448,11 @@ mod tests {
     /// because the start room is a process-global OnceLock: under nextest
     /// (the mandated runner) each test owns its process, so setting the
     /// env var first pins THIS process to the (2,0) compile.
+    ///
+    /// IGNORED BY DEFAULT (~70 s), same as `generated_is_current`: run
+    /// `cargo nextest run --release --run-ignored all`.
     #[test]
+    #[ignore = "~70 s regen; run with --run-ignored all (the pre-commit gate does)"]
     fn generated_is_current_r20() {
         std::env::set_var("CELESTE_START_ROOM", "2,0");
         let regen = |recipe: &str| {
