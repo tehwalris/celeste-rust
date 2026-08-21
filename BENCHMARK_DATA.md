@@ -1,3 +1,48 @@
+# Room (2,0) engine adoption: kernels from engine witnesses + state-level fallback (2026-08-21)
+
+The r20 class kernels now bind for real, and the engine is at parity-plus
+on (2,0) at f42. All runs: `--recipe rewrites-room20.jsonl bench
+--frames 42 --deopt`, `CELESTE_START_ROOM=2,0`, fresh campaigns, this
+machine. THE RECIPE MATTERS: earlier "gates" ran the default (1,0)
+rewrites.jsonl, whose devirt premise fails on fruit.update in every
+unfrozen (2,0) frame - the reference premise-deopted the whole
+steady/dash population and only the frozen slice ever reached dispatch.
+
+| run | wall | peak RSS | us/lane |
+|---|---|---|---|
+| interpreter-only | 11.44 s | 3.02 GB | 6.3 |
+| engine `=1` | **10.94 s** | **2.87 GB** | 6.0 |
+| `=check` (both + per-state set compare) | 19.69 s | 3.26 GB | 10.8 |
+
+The `=check` gate PASSES: row-key sets identical on every checked state,
+42 frames. Kernel lanes over the run: r20-steady 1,786,320 + r20-dash
+682,272 + r20-frozen 515,409 = 2.98 M bound; 1.03 M missed (74%
+coverage of dispatched lanes). The missed tranche is f39+ fruit-touch:
+786,848 lanes are guard/bind refusals ON the covered a9e20c0a shape
+(class-leaving, bounce, dying) and 239,814 are the 409-cell spring-delay
+residual shape 681d - both are the next coverage tranche, recorded by
+CELESTE_KERNEL_MISS_DUMP.
+
+Witness provenance changed: the r20 witnesses are now DUMPED FROM ENGINE
+CHUNKS (dispatch's CELESTE_KERNEL_MISS_DUMP aggregate), not emitted from
+interpreter-saved reference frames - the engine's real shape is 408
+cells (no spring `delay` cell) with ival fruit off/y + player rem, and
+reference-frame witnesses bound zero engine lanes.
+
+Fallback doctrine, learned expensively (three frame-f40 multi-hour
+grinds): a missed chunk must NOT be interpreted in engine-partitioned or
+bridge-roundtripped form - per-chunk compile-program, per-chunk
+campaign-program and re-vectorized-batch fallbacks all collapsed in
+split_by_condition on lane groupings the campaign's own flow never
+forms. The fallback is ALL-OR-NOTHING per state: any miss discards the
+engine's partial work and the ORIGINAL campaign state runs under the
+CAMPAIGN program (run_frame_chunk's `campaign` parameter). Uncovered
+states thus cost interpreter + wasted kernel work; covered states are
+pure engine. Check mode also carries the REFERENCE states forward, so an
+engine partition pathology cannot compound across frames.
+
+Room (1,0) regression: `=check` f42 13.00 s, sets identical.
+
 # Stage-2 hill-climb session 1 (2026-08-17 evening)
 
 Real-frame bench (f35, 187,859 rows, 29 cores): 607 -> **520 ms**

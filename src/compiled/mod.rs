@@ -40,6 +40,20 @@ fn use_kernel() -> bool {
     std::env::var("CELESTE_KERNEL").map(|v| v != "0").unwrap_or(true)
 }
 
+/// Rate-limited stderr note for per-chunk engine deopts: the first few
+/// print in full, the rest only count (dispatch's PLAIN_ROUTED counter
+/// carries the lane totals either way).
+fn deopt_note(msg: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    let n = SEEN.fetch_add(1, Ordering::Relaxed);
+    if n < 40 {
+        eprintln!("  {}", msg);
+    } else if n == 40 {
+        eprintln!("  (further engine fallback notes suppressed)");
+    }
+}
+
 /// Chunk cap. Cross-chunk dedup at the boundary makes chunking invisible to
 /// the result (batching invariance is the certified doctrine), so this is
 /// purely a cost knob - and pre-dedup INVERTED it. While every emitted row
@@ -287,9 +301,17 @@ impl FrameEngine {
     /// One frame of a kernel deopt sub-chunk through the PLAIN program:
     /// to_canonical -> plain -> from_canonical, sound for every lane.
     fn plain_block(&self, plain: &PlainPath, block: runtime2::Rt2) -> Vec<crate::interpreter::state::State> {
-        let width = block.width as u64;
-        let mut state = bridge::export_block(&block);
+        let state = bridge::export_block(&block);
         drop(block);
+        self.plain_state(plain, state)
+    }
+
+    fn plain_state(
+        &self,
+        plain: &PlainPath,
+        mut state: crate::interpreter::state::State,
+    ) -> Vec<crate::interpreter::state::State> {
+        let width = state.vector_size as u64;
         plain
             .mapping
             .to_canonical(&mut state)
@@ -354,7 +376,23 @@ impl FrameEngine {
     ///   interpreted run's.
     ///
     /// Serial on purpose: the campaign is already one thread per chunk.
-    pub fn run_frame_chunk(&self, state: &crate::interpreter::state::State) -> Vec<crate::interpreter::state::State> {
+    pub fn run_frame_chunk(
+        &self,
+        state: &crate::interpreter::state::State,
+        // The CAMPAIGN's frame body, for missed chunks the COMPILE
+        // program cannot run. On room (2,0) the compile overlay is the
+        // (1,0) one, so its premises fail on every fruit-interaction
+        // chunk - and the PLAIN program is not a usable fallback there:
+        // fruit states under plain blow up on UnknownBool branch
+        // doubling (ladder.sh's sweep cap exists for exactly this; the
+        // f39 check gate ground for 7.5h in split_by_condition before
+        // this parameter). The campaign program is certified for its own
+        // room, so the fallback chain is compile -> campaign -> plain.
+        campaign: Option<(
+            &crate::interpreter::fixed_env::PreparedCfg,
+            &crate::interpreter::fixed_env::FixedEnv,
+        )>,
+    ) -> Vec<crate::interpreter::state::State> {
         let mut t = ChunkTimer::start();
         let block = bridge::import_block(state, self.cart.clone(), self.cache.clone());
         t.mark(CHUNK_IMPORT);
@@ -386,22 +424,82 @@ impl FrameEngine {
             }
             misses.push((block, kernel_ok));
         }
-        for (block, kernel_ok) in misses {
-            // A kernel's deopt sub-chunk (kernel_ok=false: dying
-            // representatives, class-leaving rows) FAILS the specialized
-            // program's premises by construction - run it under the PLAIN
-            // program instead of letting the failure abort the whole
-            // chunk (see `PlainPath`).
-            if !kernel_ok {
-                if let Some(plain) = &self.plain {
-                    out.extend(self.plain_block(plain, block));
-                    continue;
+        // FALLBACK IS ALL-OR-NOTHING AT THE STATE LEVEL. When any chunk
+        // misses the kernels and a campaign frame body is available, the
+        // engine's partial work on this state is discarded and the
+        // ORIGINAL state - untouched, exactly as the campaign formed it -
+        // runs under the CAMPAIGN program. Four chunk-granular designs
+        // died on (2,0) f39/f40 before this:
+        // - Whole-state deopt via panic: one bad chunk re-ran the whole
+        //   state at PLAIN-program cost, and plain on fruit states blows
+        //   up on UnknownBool branch doubling (ladder.sh's sweep cap).
+        // - Compile-program per chunk: the (1,0) overlay on a (2,0)
+        //   fruit chunk splits exponentially before failing its premise.
+        // - Campaign-program per chunk, then re-vectorized batches: both
+        //   ground for hours in split_by_condition on states EXPORTED
+        //   from engine blocks - the (freeze, moving-key) partition plus
+        //   the bridge roundtrip yields lane groupings the campaign's own
+        //   flow never forms, and the interpreter's cost model (branch
+        //   uniformity from the campaign's partitioning) collapses on
+        //   them. The reference interprets the SAME lanes as campaign
+        //   states in milliseconds.
+        // The campaign program on the campaign's own state is the one
+        // fallback with a certified cost model. The engine's win on a
+        // partially-covered state is forfeited - at real coverage that is
+        // rare, and the miss dump still records exactly what to cover
+        // next.
+        if !misses.is_empty() {
+            if let Some((cfg, env)) = campaign {
+                let missed_lanes: usize = misses.iter().map(|(b, _)| b.width).sum();
+                dispatch::PLAIN_ROUTED
+                    .fetch_add(missed_lanes as u64, std::sync::atomic::Ordering::Relaxed);
+                match self.interpret_state_with(state.clone(), cfg, env) {
+                    Ok(states) => {
+                        t.mark(CHUNK_RUN);
+                        t.mark(CHUNK_MERGE);
+                        return states;
+                    }
+                    Err(e) => {
+                        // The campaign's own premises fail on this state:
+                        // the caller's deopt machinery (run_deopt_frame,
+                        // canonical mapping, collect-first) is the right
+                        // owner of that case, exactly as it is for the
+                        // interpreter path.
+                        panic!(
+                            "engine fallback: the campaign frame failed on a state \
+                             with {} missed lanes: {:#}",
+                            missed_lanes, e
+                        );
+                    }
                 }
             }
-            // The reference path, but WITHOUT the re-import `step` does:
-            // the campaign wants states, and re-importing only to export
-            // again would be pure loss.
-            out.extend(self.interpret_block(block));
+            for (block, kernel_ok) in misses {
+                if self.plain.is_none() {
+                    // The strict path (no plain program registered): the
+                    // compile program, loudly fatal on a premise failure.
+                    out.extend(self.interpret_block(block));
+                    continue;
+                }
+                let plain = self.plain.as_ref().unwrap();
+                if kernel_ok {
+                    // No campaign cfg (native-probe harnesses): the
+                    // compile program per chunk, plain on failure.
+                    match self.try_interpret_block(&block) {
+                        Ok(states) => out.extend(states),
+                        Err(e) => {
+                            deopt_note(&format!(
+                                "engine chunk -> plain ({} lanes): {:#}",
+                                block.width, e
+                            ));
+                            out.extend(self.plain_block(plain, block));
+                        }
+                    }
+                } else {
+                    // A kernel's deopt sub-chunk fails the compile
+                    // program's premises by construction.
+                    out.extend(self.plain_block(plain, block));
+                }
+            }
         }
         t.mark(CHUNK_RUN);
         // Dedup and merge the kernel's blocks BEFORE exporting them.
@@ -549,17 +647,46 @@ impl FrameEngine {
 
     /// One frame of `block` through the interpreter, as interpreter states.
     fn interpret_block(&self, block: runtime2::Rt2) -> Vec<crate::interpreter::state::State> {
-        if std::env::var_os("CELESTE_FALLBACK_ROUNDTRIP").is_some() {
-            bridge::assert_block_round_trips(&block);
-        }
-        let state = bridge::export_block(&block);
-        drop(block);
-        crate::interpreter::glue::interpret_prepared_cfg(&self.frame_cfg, state, &self.fixed_env)
+        self.try_interpret_block(&block)
             .expect("the interpreter fallback failed a frame")
+    }
+
+    /// `interpret_block`, but a frame failure (a compile-recipe premise
+    /// this chunk falsifies) is returned instead of panicking, so the
+    /// caller can deopt the CHUNK to the plain program.
+    fn try_interpret_block(
+        &self,
+        block: &runtime2::Rt2,
+    ) -> anyhow::Result<Vec<crate::interpreter::state::State>> {
+        if std::env::var_os("CELESTE_FALLBACK_ROUNDTRIP").is_some() {
+            bridge::assert_block_round_trips(block);
+        }
+        self.interpret_block_with(block, &self.frame_cfg, &self.fixed_env)
+    }
+
+    /// One frame of `block` under an arbitrary prepared frame body (the
+    /// engine's own compile program, or the campaign's - see
+    /// `run_frame_chunk`'s fallback chain).
+    fn interpret_block_with(
+        &self,
+        block: &runtime2::Rt2,
+        cfg: &crate::interpreter::fixed_env::PreparedCfg,
+        env: &crate::interpreter::fixed_env::FixedEnv,
+    ) -> anyhow::Result<Vec<crate::interpreter::state::State>> {
+        self.interpret_state_with(bridge::export_block(block), cfg, env)
+    }
+
+    fn interpret_state_with(
+        &self,
+        state: crate::interpreter::state::State,
+        cfg: &crate::interpreter::fixed_env::PreparedCfg,
+        env: &crate::interpreter::fixed_env::FixedEnv,
+    ) -> anyhow::Result<Vec<crate::interpreter::state::State>> {
+        Ok(crate::interpreter::glue::interpret_prepared_cfg(cfg, state, env)?
             .into_iter()
             .map(|(s, _)| s)
             .filter(|s| s.vector_size > 0)
-            .collect()
+            .collect())
     }
 
     /// The pre-partition every path shares: split on `freeze`, then on the

@@ -1553,7 +1553,7 @@ fn run_frame_diff(dir: &str, frame: u32, outdir: &str) {
             .into_iter()
             .map(|(s, _)| s),
         );
-        out_compiled.extend(eng.run_frame_chunk(st));
+        out_compiled.extend(eng.run_frame_chunk(st, None));
     }
     let a = canon(out_interp);
     let b = canon(out_compiled);
@@ -1937,7 +1937,7 @@ fn run_key_gate_outputs(dir: &str, frame: u32) {
             }
         }
         let compiled_out =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| eng.run_frame_chunk(st)));
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| eng.run_frame_chunk(st, None)));
         match compiled_out {
             Ok(outs) => {
                 for (oi, out) in canon(outs).iter().enumerate() {

@@ -1164,14 +1164,14 @@ impl CompiledForward {
         state: State,
     ) -> Result<Vec<State>> {
         if !self.check {
-            return Ok(self.engine.run_frame_chunk(&state));
+            return Ok(self.engine.run_frame_chunk(&state, Some((frame_cfg, fixed_env))));
         }
         let reference: Vec<State> = interpret_prepared_cfg(frame_cfg, state.clone(), fixed_env)
             .context("frame failed (compiled-forward check: reference side)")?
             .into_iter()
             .map(|(s, _)| s)
             .collect();
-        let got = self.engine.run_frame_chunk(&state);
+        let got = self.engine.run_frame_chunk(&state, Some((frame_cfg, fixed_env)));
         let want_keys = self.engine.row_key_set(&reference);
         let got_keys = self.engine.row_key_set(&got);
         let missing: Vec<_> = want_keys.difference(&got_keys).collect();
@@ -1201,7 +1201,19 @@ impl CompiledForward {
                 got_keys.len(),
             ))));
         }
-        Ok(got)
+        // Carry the REFERENCE states forward, not the engine's. The two
+        // partitions carry the same row set (just verified), but the
+        // trajectories they induce differ: the engine's regrouping can
+        // form states the interpreter's own flow never would, and on
+        // room (2,0) f40 the reference side of the NEXT frame ground for
+        // hours in split_by_condition on exactly such states. Check mode
+        // gates "the engine reproduces the interpreter's transition on
+        // the interpreter's own frontier", frame by frame - so the
+        // frontier stays the interpreter's, and an engine-side partition
+        // pathology cannot compound across frames or contaminate the
+        // reference it is being judged against.
+        drop(got);
+        Ok(reference)
     }
 }
 
