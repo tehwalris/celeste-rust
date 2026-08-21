@@ -164,6 +164,88 @@ identical-arms select is a cheap normalization win.
    (readability, the identical-arms fold, P2's needs), but **not** on the
    promise of recovering sharing. That promise is measured and dead.
 
+### P1' - the minimal graph IR (design agreed with Philippe, 2026-08-22)
+
+This replaces the refuted P1. The point is not a better matching
+algorithm; it is a smaller thing to match ON.
+
+```
+Node   = (op, [operand ids])       -- types inferred, not stored
+Leaf   = input cell | literal
+Member = { outputs: cell -> node, valid: node }
+```
+
+No lanes. No `dp`. No effects. No statement order. A member is a mapping
+from input cells to output cells plus one boolean saying whether the
+result counts.
+
+**Types are one lattice, not three kinds of thing.** Two domains - bool
+and number - each carrying an abstraction. A tri-state bool is a set of
+booleans (`ZB { val, known }` is already exactly that, per lane); an
+interval is a set of numbers; an exact number is a singleton interval.
+Keep "exact number" distinct as a REPRESENTATION optimization, because
+most ops preserve exactness and it is worth tracking - not as a third
+base type.
+
+**Lanes are lowering, not semantics.** `zn_splat` + `zb_splat` +
+`zi_splat` = **1150 of the steady kernel's 3236 nodes, 35%**, and they
+carry no meaning at all: they only move a uniform value into vector-land.
+Model one lane and they do not exist. Uniformity recovers afterwards by
+one forward pass from the leaves (`u.cN` uniform, `rin.cN` per-lane).
+This is not only tidiness: **20 of steady's 31 divergence roots were
+splats and constants**, so the lane distinction is actively MANUFACTURING
+divergence between members. Pinning changes what is known, which changes
+what is uniform, which moves the splats, which forks the node identities.
+
+**Validity is a value, not a side channel.** Today `&mut dp` is threaded
+through nearly every op, accumulating a per-lane bitmask; that is what
+makes nodes effectful (`NodeDef.has_dp`) and what forces the
+`dp_m{bitmask}` member-set registers. As ordinary nodes:
+
+* `zguard(c)`            becomes  `valid := valid AND c`
+* select on unknown `c`  becomes  `valid := valid AND known(c)`,
+  with `known` an ordinary operator on the abstract bool
+
+The graph is then PURELY FUNCTIONAL, which is the precondition for any
+serious optimization over it (equality saturation included). The "it is
+not really pure, guards and dp are effects" caveat in the original P1
+dissolves - it was an artifact of the representation.
+
+**Caveat, do not leave implicit.** `div_positive` / `scale_positive`
+`assert!(rhs.0 > 0)` - they are PARTIAL. In the emitted code their
+divisor is always a literal, so it is statically dischargeable, but
+"compute everything and filter at the end" panics otherwise. The IR needs
+a stated story: prove the partial ops total by construction, or make them
+total (return top on bad input).
+
+#### Gates: the round trip through Rust is NOT the gate
+
+Philippe's objection, accepted: lowering CFG -> graph -> Rust and
+demanding byte-identity with the committed kernels would force the new IR
+to reproduce every incidental ordering and naming decision of the current
+emitter, including the splats and the dp threading it exists to delete.
+That fights the design and proves the wrong thing.
+
+The EVALUATOR is the gate; the code generator comes last.
+
+1. **Node IR + lowering from the branch-free CFG + a direct evaluator.**
+   ~30 pure ops whose bodies already exist in
+   `crates/celeste-engine/src/kernel.rs`. Gate: evaluator output ==
+   the existing kernel's output on real witness chunks. **No code
+   generator is needed to validate the IR.**
+2. **Optimization over the graph.** Gate: the same evaluator equality
+   after optimizing. Semantics preservation is checked, not argued.
+3. **graph -> Rust emitter.** Gate: the existing
+   `CELESTE_COMPILED_FORWARD=check` at f42 (row-key sets against the
+   interpreter, which is the reference) plus a perf measurement.
+4. **Fusion on the new IR.** Re-run the pinned-vs-blended pair (271 vs
+   1375 shared) and find out how much derivation-independence the new
+   fuser actually buys. This is the experiment that settles the original
+   disagreement, and it is now CHEAP: `tools/fuse_frontier.py` already
+   reports the divergence frontier, so the answer is a diff.
+
+Stage 1 is self-contained and is the right first commit.
+
 ### P2 - per-member validity and per-member outputs
 
 - Relax the `valid_expr` equality gate: each member carries its own
@@ -218,17 +300,20 @@ and check that dispatch, the bridge and the chunk accounting handle n > 1.
 
 ## Sequencing
 
-0. **Census before P2/P3.** Split room (2,0)'s f42 miss tranche by cause.
+0. **P1' stage 1 (node IR + evaluator) is the first commit** - self-contained,
+   and it does not depend on the census below.
+1. **Census before P2/P3.** Split room (2,0)'s f42 miss tranche by cause.
    It is recorded today as one lump: "f39+ fruit-touch: 786,848 lanes are
    guard/bind refusals ON the covered a9e20c0a shape (class-leaving,
    bounce, dying) and 239,814 are the 409-cell spring-delay residual shape
    681d". Only the shape-change-with-survivors slice is what P2/P3 buys,
    and it is UNMEASURED. `CELESTE_KERNEL_MISS_DUMP` already produces the
    raw material.
-1. P1 alone, gated and measured on the members that exist.
-2. P2 + P3 together (they are one coupled change; splitting them only
+2. P1' stages 2-4 (optimize over the graph; then the emitter; then
+   fusion on the new IR). Stage 4 settles the pinned-vs-blended question.
+3. P2 + P3 together (they are one coupled change; splitting them only
    yields a broken intermediate).
-3. Gates, then measure per room - same discipline as engine adoption
+4. Gates, then measure per room - same discipline as engine adoption
    (BENCHMARK_DATA.md, "Engine adoption validation at depth").
 
 ## What this does NOT solve
