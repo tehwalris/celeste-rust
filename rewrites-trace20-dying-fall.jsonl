@@ -1005,5 +1005,84 @@
 {"id": "dyf20_042", "rule": "guard_branch", "fn": "__frame", "head": "it4_zc20_001_in_j2_008_if_join_5", "taken": true, "why": "dying-fall (2,0): traced on the death witness f47 (tas/room_2_0_death_fall_frame_47.txt)"}
 {"id": "dyf20_043", "rule": "guard_branch", "fn": "anonymous_64", "head": "if_body_5", "taken": false, "why": "dying-fall (2,0): traced on the death witness f47 (tas/room_2_0_death_fall_frame_47.txt)"}
 {"id": "dyf20_044", "rule": "guard_branch", "fn": "__frame", "head": "it4_zc20_002_in_j2_009_if_join_5", "taken": true, "why": "dying-fall (2,0): traced on the death witness f47 (tas/room_2_0_death_fall_frame_47.txt)"}
+{"id": "dyf20t_strip", "rule": "strip_kills", "why": "member overlay opens kill-free; steady_kd re-derives on the final CFG"}
+{"id": "dyf20t_dc0", "rule": "demote_create", "fn": "__frame", "at": "%114", "why": "seconds cell exists from __init; drop the create so the tick arm is speculatable"}
+{"id": "dyf20t_mrg0", "rule": "merge_blocks", "why": "resolve single-edge phis left by the tick blend"}
+{"id": "dyf20t_fs0", "rule": "fold_select"}
+{"id": "dyf20t_f0", "rule": "fold"}
+{"id": "steady_dce", "rule": "dce"}
+{"id": "dyf20t_xm0", "rule": "merge_blocks", "why": "collapse the post-expand_bool arm chains to single blocks (expand + concretization store together); trace10 xm000 mirror"}
+{"id": "dyf20t_mrg1", "rule": "merge_blocks", "why": "second round: pins leave untaken arms as unreachable preds until dce removes them, so edges become mergeable only after steady_dce"}
+{"id": "dyf20t_fs1", "rule": "fold_select"}
+{"id": "dyf20t_f1", "rule": "fold"}
+{"id": "dyf20t_dce2", "rule": "dce"}
+{"id": "dyf20t_b000", "rule": "pin_builtin", "fn": "__frame", "at": "%14485", "name": "sin", "why": "fruit bob: sin(off/40) - the only builtin call the (2,0) inline tail adds over the room00 base pins"}
+{"id": "dyf20t_u000", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20n_002_in_k027_for_head_1", "trip": 4, "why": "spring 1 check loop over 4 objects; hit-exit arm already pinned clear by the shared no-overlap pins, so a pure counted loop; t20_016 mirror"}
+{"id": "dyf20t_u001", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20n_003_in_k027_for_head_1", "trip": 4, "why": "spring 2 check loop; same as st20_u000"}
+{"id": "dyf20t_dc1", "rule": "demote_create", "fn": "__frame", "at": "%10879", "why": "rem cell exists from spawn; drop the create so the spd move arm is speculatable"}
+{"id": "dyf20t_dc2", "rule": "demote_create", "fn": "__frame", "at": "%10886", "why": "rem/dash cells exist from spawn; drop the create so the spd move arm is speculatable"}
+{"id": "dyf20t_dc3", "rule": "demote_create", "fn": "__frame", "at": "%10898", "why": "rem/dash cells exist from spawn; drop the create so the spd move arm is speculatable"}
+{"id": "dyf20t_dc4", "rule": "demote_create", "fn": "__frame", "at": "%13018", "why": "rem/dash cells exist from spawn; drop the create so the spd move arm is speculatable"}
+{"id": "dyf20t_dc5", "rule": "demote_create", "fn": "__frame", "at": "%13025", "why": "rem/dash cells exist from spawn; drop the create so the spd move arm is speculatable"}
+{"id": "dyf20t_dc6", "rule": "demote_create", "fn": "__frame", "at": "%13037", "why": "rem/dash cells exist from spawn; drop the create so the spd move arm is speculatable"}
+{"id": "dyf20t_mrg2", "rule": "merge_blocks"}
+{"id": "dyf20t_u002", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_k2002_for_head_1", "trip": 4, "why": "collide check loop over 4 objects inside the pixel-move body; hit exits already pinned clear; must unroll before the pixel loops so their bodies are loop-free"}
+{"id": "dyf20t_u003", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_k2003_for_head_1", "trip": 4, "why": "collide check loop over 4 objects inside the pixel-move body; hit exits already pinned clear; must unroll before the pixel loops so their bodies are loop-free"}
+{"id": "dyf20t_u004", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_k2004_for_head_1", "trip": 4, "why": "collide check loop over 4 objects inside the pixel-move body; hit exits already pinned clear; must unroll before the pixel loops so their bodies are loop-free"}
+{"id": "dyf20t_u005", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_k2005_for_head_1", "trip": 4, "why": "collide check loop over 4 objects inside the pixel-move body; hit exits already pinned clear; must unroll before the pixel loops so their bodies are loop-free"}
+{"id": "dyf20t_u006", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_k2006_for_head_1", "trip": 4, "why": "collide check loop over 4 objects inside the pixel-move body; hit exits already pinned clear; must unroll before the pixel loops so their bodies are loop-free"}
+{"id": "dyf20t_u007", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_k2007_for_head_1", "trip": 4, "why": "collide check loop over 4 objects inside the pixel-move body; hit exits already pinned clear; must unroll before the pixel loops so their bodies are loop-free"}
+{"id": "dyf20t_u008", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_k1000_for_head_3", "why": "move_x pixel loop, masked form with constant bound 8; h068 mirror"}
+{"id": "dyf20t_u009", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_k1001_for_head_3", "why": "move_y pixel loop; h069 mirror"}
+{"id": "dyf20t_mrg3", "rule": "merge_blocks"}
+{"forward": true, "id": "dyf20t_cse0", "rule": "cse"}
+{"id": "dyf20t_fs2", "rule": "fold_select"}
+{"id": "dyf20t_dce3", "rule": "dce"}
+{"id": "dyf20t_dg0", "rule": "dedup_guards"}
+{"id": "dyf20t_u010", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_i1_068_for_head_4", "why": "spikes_at inner (x) loop, constant tile bounds; h076 mirror"}
+{"id": "dyf20t_u011", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_i1_068_for_head_1", "why": "spikes_at outer (y) loop; h077 mirror"}
+{"id": "dyf20t_mrg4", "rule": "merge_blocks"}
+{"forward": true, "id": "dyf20t_cse1", "rule": "cse"}
+{"id": "dyf20t_dg1", "rule": "dedup_guards"}
+{"id": "dyf20t_fs3", "rule": "fold_select"}
+{"id": "dyf20t_dce4", "rule": "dce"}
+{"id": "dyf20t_u012", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1024_for_head_1", "trip": 3, "why": "player-update check loop over 4 objects; hit exits pinned clear by the shared pins; guarded trip-4 unroll"}
+{"id": "dyf20t_u013", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1025_for_head_1", "trip": 3, "why": "player-update check loop over 4 objects; hit exits pinned clear by the shared pins; guarded trip-4 unroll"}
+{"id": "dyf20t_u014", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1026_for_head_1", "trip": 3, "why": "player-update check loop over 4 objects; hit exits pinned clear by the shared pins; guarded trip-4 unroll"}
+{"id": "dyf20t_u015", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1027_for_head_1", "trip": 3, "why": "player-update check loop over 4 objects; hit exits pinned clear by the shared pins; guarded trip-4 unroll"}
+{"id": "dyf20t_u018", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1034_for_head_1", "trip": 3, "why": "player-update check loop over 4 objects; hit exits pinned clear by the shared pins; guarded trip-4 unroll"}
+{"id": "dyf20t_u019", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1035_for_head_1", "trip": 3, "why": "player-update check loop over 4 objects; hit exits pinned clear by the shared pins; guarded trip-4 unroll"}
+{"id": "dyf20t_u020", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1038_for_head_1", "trip": 3, "why": "player-update check loop over 4 objects; hit exits pinned clear by the shared pins; guarded trip-4 unroll"}
+{"id": "dyf20t_u021", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1039_for_head_1", "trip": 3, "why": "player-update check loop over 4 objects; hit exits pinned clear by the shared pins; guarded trip-4 unroll"}
+{"id": "dyf20t_sp9", "rule": "speculate", "fn": "__frame", "join": "in_t20i_004_in_h061_in_j2_040_if_join_13", "why": "hoist the pure `bool true` out of the del-scan found arm, leaving a bare-store arm for ab9"}
+{"id": "dyf20t_ab9", "rule": "absorb_stores", "fn": "__frame", "head": "in_t20i_004_in_h061_in_j2_040_if_join_8", "why": "flatten the del-scan found diamond (stores found=true, remembered=obj) into select-stores so the loop body is a linear chain for u022"}
+{"id": "dyf20t_u022", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_j2_040_for_head_4", "trip": 4, "invert": true, "why": "the del(objects,player) scan in destroy_object: exit-on-true head (i>#objects); 4 body iterations, player asserted last by the join_13 premise; premise #objects==4 (pre-deletion)"}
+{"id": "dyf20t_mrg5", "rule": "merge_blocks"}
+{"forward": true, "id": "dyf20t_cse2", "rule": "cse"}
+{"id": "dyf20t_dg2", "rule": "dedup_guards"}
+{"id": "dyf20t_fs4", "rule": "fold_select"}
+{"id": "dyf20t_f2", "rule": "fold"}
+{"id": "dyf20t_dce5", "rule": "dce"}
+{"id": "dyf20t_ztm", "rule": "merge_blocks"}
+{"forward": true, "id": "dyf20t_ztc", "rule": "cse"}
+{"id": "dyf20t_ztd", "rule": "dce"}
+{"id": "dyf20t_zn000", "rule": "inline", "fn": "__frame", "at": "%1552", "callee": "anonymous_63", "captures": [], "why": "draw foreach peel it2: inline the draw callback (trace10 zn000/zn002 mirror)"}
+{"id": "dyf20t_zn001", "rule": "inline", "fn": "__frame", "at": "%1985", "callee": "anonymous_63", "captures": [], "why": "draw foreach peel it3: inline the draw callback (trace10 zn000/zn002 mirror)"}
+{"id": "dyf20t_zn002", "rule": "inline", "fn": "__frame", "at": "%2013", "callee": "anonymous_63", "captures": [], "why": "draw foreach peel it4: inline the draw callback (trace10 zn000/zn002 mirror)"}
+{"id": "dyf20t_zn004", "rule": "inline", "fn": "__frame", "at": "%1595", "callee": "anonymous_64", "captures": [], "why": "draw foreach peel it2: inline the draw callback (trace10 zn001/zn003 mirror)"}
+{"id": "dyf20t_zn005", "rule": "inline", "fn": "__frame", "at": "%2096", "callee": "anonymous_64", "captures": [], "why": "draw foreach peel it3: inline the draw callback (trace10 zn001/zn003 mirror)"}
+{"id": "dyf20t_zn006", "rule": "inline", "fn": "__frame", "at": "%2124", "callee": "anonymous_64", "captures": [], "why": "draw foreach peel it4: inline the draw callback (trace10 zn001/zn003 mirror)"}
+{"forward": true, "id": "dyf20t_znc", "rule": "cse"}
+{"id": "dyf20t_znd", "rule": "dce"}
+{"id": "dyf20t_znm", "rule": "merge_blocks"}
+{"id": "dyf20t_zt2", "rule": "drop_dead_cell", "fn": "__frame", "cell": "%175", "why": "anonymous_63 closure cell: all calls inlined, only guard reads remain; trace10 zt000 pattern"}
+{"id": "dyf20t_zt3", "rule": "drop_dead_cell", "fn": "__frame", "cell": "%182", "why": "anonymous_64 closure cell: same"}
+{"id": "dyf20t_gdd", "rule": "dce"}
+{"id": "dyf20t_nid", "rule": "dce"}
+{"id": "dyf20t_nim", "rule": "merge_blocks"}
+{"id": "dyf20t_fzm", "rule": "merge_blocks"}
+{"forward": true, "id": "dyf20t_fzc", "rule": "cse"}
+{"id": "dyf20t_fzf", "rule": "fold_select"}
+{"id": "dyf20t_fzd", "rule": "dce"}
 {"id": "dyf20_dce", "rule": "dce"}
 {"id": "dyf20_kd", "rule": "kill_dead"}

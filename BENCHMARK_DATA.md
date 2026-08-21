@@ -1,3 +1,56 @@
+# (2,0) dying members straightened + kernels wired; fused set blocked on corpse-gate blending (2026-08-21, afternoon)
+
+Both (2,0) dying overlays are now BRANCH-FREE (0 conditional branches,
+0 rolled loops in `__frame`) and membercheck-certified: fall applies on
+[47], spikes on [64], observations identical to the plain program
+(`CELESTE_START_ROOM=2,0` is REQUIRED for these memberchecks - without
+it the (1,0) trajectory replays and the member is vacuous, which cost
+half a morning of false alarm). Yesterday's "label ambiguity" diagnosis
+was wrong: the transplanted unroll bound the RIGHT loop; the trip was 4
+where the post-kill h061 check loops run at 3 (the kill fires at the top
+of player.update and the update continues on the dead object).
+
+Machinery this took, all landed with suite 555/555:
+- `unroll_loop` `invert` flag: exit-on-true heads (`br i>#t ? exit :
+  body`, the inlined-`del` scan), continue-condition = negated compare,
+  and suffix trip-guard placement when the head itself recomputes the
+  bound. Historical prefix layout untouched (committed kernels stay
+  byte-stable).
+- del-scan straightening sequence (both overlays): pin sentinel head
+  true + not-found gate true + shift arm false + found-at-end true,
+  merge, `speculate` the arm's `bool true`, `absorb_stores` the found
+  diamond into select-stores, `dce` the dead shift arm, then
+  `unroll_loop` trip 4 invert. `membercheck --trace-frame` is the
+  derivation tool: it prints the implied pin per site; NOT PINNABLE
+  sites are exactly the per-iteration ones the unroll resolves.
+- Kernels emit from both overlays (126/134 KB, 408 witness facts, the
+  a9e20c0a engine-aggregate witness) and are wired into dispatch as
+  class `dying` (mask bit 8, `CELESTE_KERNEL_CLASSES=dying`);
+  regen-generated.sh covers them (`R20_CLASSES`).
+
+Measured outcome at f42 (`=check`, honest recipe): gate PASSES, 19.34 s
+(vs 19.69 s yesterday), sets identical - but the standalone dying
+kernels bind **0 lanes**, and that is structural, not a bug: chunks are
+partitioned by (shape, pm1), and a chunk mixes lanes that survive the
+frame with lanes that die in it, so no chunk-granular kernel can accept
+it (steady's no-kill guard fails on the dying lanes, dying's kill guard
+fails on the rest). Per-lane death selection is the FUSED kernel's job
+(guard-as-selector, #163/#164). The (2,0) fuse attempt:
+- census: steady 1396 nodes, union {steady, dy-spikes, dy-fall} 2348 =
+  **+68% over steady alone** - the v3-stage number ((1,0) was +5.5% at
+  v3, +0.5% after the v5 corpse-gate blending);
+- `--fuse` refuses outright: "member dying-spikes fork skeleton differs
+  from the primary's" - the spikes suffix observes kb4/kb5 (the corpse
+  jump/dash gates are PINNED, steady BLENDS them), the same kb5 gap the
+  (1,0) campaign closed with the corpse dash-start blend.
+
+So the next tranche is exactly the (1,0) v5 playbook on (2,0): blend
+the corpse gates (dash-start, wall-slide analog, and whatever else the
+fork-skeleton diff names) in both dying overlays, re-certify by
+membercheck, then `--fuse` and gate. Until then the ~787K dying-adjacent
+lanes stay on the all-or-nothing interpreter fallback and the engine's
+f42 numbers are unchanged from the morning's adoption.
+
 # Room (2,0) engine adoption: kernels from engine witnesses + state-level fallback (2026-08-21)
 
 The r20 class kernels now bind for real, and the engine is at parity-plus

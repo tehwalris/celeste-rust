@@ -35,6 +35,8 @@ pub mod kernel_gen_steady;
 // overlays; the springs add two per-lane row columns (delay, spr) and
 // the fruit is fully block-uniform (the #170 boundary widening).
 pub mod kernel_gen_r20_dash;
+pub mod kernel_gen_r20_dying_fall;
+pub mod kernel_gen_r20_dying_spikes;
 pub mod kernel_gen_r20_frozen;
 pub mod kernel_gen_r20_steady;
 

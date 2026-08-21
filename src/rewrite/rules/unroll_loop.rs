@@ -117,6 +117,7 @@ fn site(
     head: &Label,
     forced_trip: Option<usize>,
     exits: &[Label],
+    invert: bool,
 ) -> Result<Site> {
     let head_block = fun
         .cfg
@@ -133,7 +134,16 @@ fn site(
     else {
         return Err(anyhow!("'{}' does not end in a conditional branch", head.as_str()));
     };
-    let (body_entry, exit) = (true_target.clone(), false_target.clone());
+    // Plain sense: continue on true, exit on false. `invert`: the compare
+    // decides the EXIT (`br i > bound ? exit : body`, the inlined-`del`
+    // scan), so the body is the false target and the continue-condition is
+    // the negated compare - normalized below so everything downstream (trip
+    // simulation, the `<=` guard-mode premise) sees the plain sense.
+    let (body_entry, exit) = if invert {
+        (false_target.clone(), true_target.clone())
+    } else {
+        (true_target.clone(), false_target.clone())
+    };
     require(
         body_entry != exit && body_entry != *head && exit != *head,
         format!("the branch of '{}' must leave to two distinct other blocks", head.as_str()),
@@ -350,6 +360,19 @@ fn site(
     } else {
         return Err(anyhow!("the compare of '{}' does not test a phi", head.as_str()));
     };
+    // Inverted sense: the compare is the EXIT condition; the loop continues
+    // while its negation holds.
+    let op = if invert {
+        match op {
+            BinaryOp::LessThanEqual => BinaryOp::GreaterThan,
+            BinaryOp::LessThan => BinaryOp::GreaterThanEqual,
+            BinaryOp::GreaterThanEqual => BinaryOp::LessThan,
+            BinaryOp::GreaterThan => BinaryOp::LessThanEqual,
+            _ => return Err(anyhow!("the compare of '{}' is not an order compare", head.as_str())),
+        }
+    } else {
+        op
+    };
     let test = |v: i32, b: i32| match op {
         BinaryOp::LessThanEqual => v <= b,
         BinaryOp::LessThan => v < b,
@@ -546,11 +569,12 @@ pub fn apply(
     head: &str,
     trip: Option<usize>,
     exits: &[String],
+    invert: bool,
 ) -> Result<usize> {
     let head = Label::from(head.to_string());
     let exits: Vec<Label> = exits.iter().map(|s| Label::from(s.clone())).collect();
     let fun = program.get(function)?;
-    let s = site(fun, function, &head, trip, &exits)?;
+    let s = site(fun, function, &head, trip, &exits, invert)?;
 
     // Fresh labels must actually be fresh.
     for j in 0..=s.trip_count {
@@ -592,18 +616,33 @@ pub fn apply(
 
         // The head copy: the trip guard (first copy, guard mode only), the
         // non-phi instructions, then a fall-through.
+        // The trip guard goes BEFORE the copied head instructions when the
+        // bound is defined outside the loop (the historical layout - kept
+        // byte-stable for existing recipes), and AFTER them when the head
+        // itself computes the bound (`i > #objects` recomputes `#` every
+        // iteration), where it references iteration 0's renamed copy. Either
+        // way it fires before any body copy runs.
+        let bound_in_head =
+            s.guard.map_or(false, |(bound_id, _)| s.rest.iter().any(|(id, _)| *id == bound_id));
         let mut instructions = Vec::new();
-        if j == 0 {
-            if let Some((bound_id, pinned)) = s.guard {
+        let push_guard =
+            |instructions: &mut Vec<(LocalId, Instruction)>,
+             allocator: &mut LocalIdAllocator,
+             bound: LocalId,
+             pinned: crate::pico8_num::Pico8Num| {
                 let kc = allocator.fresh();
                 instructions.push((kc, Instruction::NumberConstant { value: pinned }));
                 let g = allocator.fresh();
                 instructions.push((
                     g,
-                    Instruction::BinaryOp { left: bound_id, op: BinaryOp::TwoEqual, right: kc },
+                    Instruction::BinaryOp { left: bound, op: BinaryOp::TwoEqual, right: kc },
                 ));
                 let ga = allocator.fresh();
                 instructions.push((ga, Instruction::AssertTrue { value: g }));
+            };
+        if j == 0 && !bound_in_head {
+            if let Some((bound_id, pinned)) = s.guard {
+                push_guard(&mut instructions, &mut allocator, bound_id, pinned);
             }
         }
         for (id, instr) in &s.rest {
@@ -611,6 +650,12 @@ pub fn apply(
             let fresh = allocator.fresh();
             map.insert(*id, fresh);
             instructions.push((fresh, renamed));
+        }
+        if j == 0 && bound_in_head {
+            if let Some((bound_id, pinned)) = s.guard {
+                let renamed_bound = *map.get(&bound_id).unwrap_or(&bound_id);
+                push_guard(&mut instructions, &mut allocator, renamed_bound, pinned);
+            }
         }
         let target = if j < s.trip_count { copy_label(&s.chain[0], j) } else { s.exit.clone() };
         new_blocks.push((
@@ -775,12 +820,13 @@ pub fn verify(
     head: &str,
     trip: Option<usize>,
     exits: &[String],
+    invert: bool,
 ) -> Result<()> {
     let head = Label::from(head.to_string());
     let exits: Vec<Label> = exits.iter().map(|s| Label::from(s.clone())).collect();
     let before_fun = before.get(function)?;
     let after_fun = after.get(function)?;
-    let s = site(before_fun, function, &head, trip, &exits)?;
+    let s = site(before_fun, function, &head, trip, &exits, invert)?;
 
     let before_max = {
         let mut allocator = LocalIdAllocator::for_function(before_fun);
@@ -851,24 +897,27 @@ pub fn verify(
             .get(&copy_label(&head, j))
             .ok_or_else(|| anyhow!("missing head copy {}", j))?;
         // The trip guard, first copy of guard mode only: exactly
-        // `k = num(pinned); g = bound == k; assert_true g`, fresh ids.
-        let guard_len = if j == 0 && s.guard.is_some() { 3 } else { 0 };
-        if guard_len > 0 {
-            let (bound_id, pinned) = s.guard.unwrap();
-            require(
-                head_copy.instructions.len() >= 3,
-                "the first head copy is missing the trip guard",
-            )?;
-            let (kc, kc_instr) = &head_copy.instructions[0];
-            let (g, g_instr) = &head_copy.instructions[1];
-            let (ga, ga_instr) = &head_copy.instructions[2];
+        // `k = num(pinned); g = bound == k; assert_true g`, fresh ids. It is
+        // a PREFIX when the bound is defined outside the loop (the historical
+        // layout) and a SUFFIX referencing iteration 0's renamed bound when
+        // the head itself computes the bound - mirroring `apply`.
+        let bound_in_head =
+            s.guard.map_or(false, |(bound_id, _)| s.rest.iter().any(|(id, _)| *id == bound_id));
+        let guard_here = j == 0 && s.guard.is_some();
+        let check_guard = |instrs: &[(LocalId, Instruction)],
+                           bound: LocalId,
+                           pinned: crate::pico8_num::Pico8Num,
+                           take_fresh: &mut dyn FnMut(LocalId) -> Result<()>|
+         -> Result<()> {
+            let [(kc, kc_instr), (g, g_instr), (ga, ga_instr)] = instrs else {
+                return Err(anyhow!("the first head copy is missing the trip guard"));
+            };
             require(
                 *kc_instr == Instruction::NumberConstant { value: pinned },
                 "the trip guard's constant is wrong",
             )?;
             require(
-                *g_instr
-                    == Instruction::BinaryOp { left: bound_id, op: BinaryOp::TwoEqual, right: *kc },
+                *g_instr == Instruction::BinaryOp { left: bound, op: BinaryOp::TwoEqual, right: *kc },
                 "the trip guard's compare is wrong",
             )?;
             require(
@@ -878,12 +927,45 @@ pub fn verify(
             take_fresh(*kc)?;
             take_fresh(*g)?;
             take_fresh(*ga)?;
-        }
+            Ok(())
+        };
         let head_target =
             if j < s.trip_count { copy_label(&s.chain[0], j) } else { s.exit.clone() };
-        check_copy(&mut map, &mut take_fresh, &s.rest, head_copy, guard_len, &|_| {
-            Terminator::UnconditionalBranch { target: head_target.clone() }
-        })?;
+        if guard_here && bound_in_head {
+            let (bound_id, pinned) = s.guard.unwrap();
+            require(
+                head_copy.instructions.len() == s.rest.len() + 3,
+                "the first head copy is missing the trip guard",
+            )?;
+            let trimmed = Block {
+                instructions: head_copy.instructions[..s.rest.len()].to_vec(),
+                terminator: head_copy.terminator.clone(),
+                hint_normalize: head_copy.hint_normalize,
+            };
+            check_copy(&mut map, &mut take_fresh, &s.rest, &trimmed, 0, &|_| {
+                Terminator::UnconditionalBranch { target: head_target.clone() }
+            })?;
+            let renamed_bound = *map.get(&bound_id).unwrap_or(&bound_id);
+            check_guard(
+                &head_copy.instructions[s.rest.len()..],
+                renamed_bound,
+                pinned,
+                &mut take_fresh,
+            )?;
+        } else {
+            let guard_len = if guard_here { 3 } else { 0 };
+            if guard_len > 0 {
+                let (bound_id, pinned) = s.guard.unwrap();
+                require(
+                    head_copy.instructions.len() >= 3,
+                    "the first head copy is missing the trip guard",
+                )?;
+                check_guard(&head_copy.instructions[..3], bound_id, pinned, &mut take_fresh)?;
+            }
+            check_copy(&mut map, &mut take_fresh, &s.rest, head_copy, guard_len, &|_| {
+                Terminator::UnconditionalBranch { target: head_target.clone() }
+            })?;
+        }
 
         if j < s.trip_count {
             for (index, label) in s.chain.iter().enumerate() {
@@ -1011,7 +1093,7 @@ pub fn candidates(program: &Program) -> Vec<(String, Label, usize)> {
     let mut out = Vec::new();
     for (name, fun) in &program.functions {
         for label in fun.cfg.named.keys() {
-            if let Ok(s) = site(fun, name.as_str(), label, None, &[]) {
+            if let Ok(s) = site(fun, name.as_str(), label, None, &[], false) {
                 out.push((name.as_str().to_string(), label.clone(), s.trip_count));
             }
         }
@@ -1219,14 +1301,14 @@ mod tests {
         let before = guarded_loop_program();
         // Plain mode refuses: the bound is not a constant.
         let mut plain = before.clone();
-        let err = apply(&mut plain, "f", "head", None, &[]).unwrap_err();
+        let err = apply(&mut plain, "f", "head", None, &[], false).unwrap_err();
         assert!(err.to_string().contains("recipe-named exit arm"), "{}", err);
 
         let mut after = before.clone();
         let exits = vec!["arm".to_string()];
-        let n = apply(&mut after, "f", "head", Some(3), &exits).unwrap();
+        let n = apply(&mut after, "f", "head", Some(3), &exits, false).unwrap();
         assert_eq!(n, 3);
-        verify(&before, &after, "f", "head", Some(3), &exits).unwrap();
+        verify(&before, &after, "f", "head", Some(3), &exits, false).unwrap();
 
         let fun = after.get("f").unwrap();
         // The first head copy leads with the trip guard.
@@ -1249,9 +1331,9 @@ mod tests {
     fn unrolls_three_iterations() {
         let before = loop_program();
         let mut after = before.clone();
-        let n = apply(&mut after, "f", "head", None, &[]).unwrap();
+        let n = apply(&mut after, "f", "head", None, &[], false).unwrap();
         assert_eq!(n, 3);
-        verify(&before, &after, "f", "head", None, &[]).unwrap();
+        verify(&before, &after, "f", "head", None, &[], false).unwrap();
 
         let fun = after.get("f").unwrap();
         assert!(!fun.cfg.named.contains_key(&label("head")));
@@ -1293,7 +1375,7 @@ mod tests {
             fun.cfg.entry.instructions[2].1 =
                 Instruction::BinaryOp { left: id(1), op: BinaryOp::Plus, right: id(2) };
         }
-        let err = apply(&mut program, "f", "head", None, &[]).unwrap_err();
+        let err = apply(&mut program, "f", "head", None, &[], false).unwrap_err();
         assert!(err.to_string().contains("bound"), "{}", err);
     }
 
@@ -1305,7 +1387,7 @@ mod tests {
             let body = fun.cfg.named.get_mut(&label("body")).unwrap();
             body.terminator.1 = br_if(11, "latch", "exit");
         }
-        let err = apply(&mut program, "f", "head", None, &[]).unwrap_err();
+        let err = apply(&mut program, "f", "head", None, &[], false).unwrap_err();
         assert!(err.to_string().contains("recipe-named exit arm"), "{}", err);
     }
 
@@ -1319,7 +1401,7 @@ mod tests {
             exit.instructions[0].1 =
                 Instruction::Phi { branches: vec![(label("head"), id(11))] };
         }
-        let err = apply(&mut program, "f", "head", None, &[]).unwrap_err();
+        let err = apply(&mut program, "f", "head", None, &[], false).unwrap_err();
         assert!(err.to_string().contains("chain-defined"), "{}", err);
     }
 
@@ -1338,8 +1420,8 @@ mod tests {
         }
         let before = program.clone();
         let mut after = program;
-        apply(&mut after, "f", "head", None, &[]).unwrap();
-        verify(&before, &after, "f", "head", None, &[]).unwrap();
+        apply(&mut after, "f", "head", None, &[], false).unwrap();
+        verify(&before, &after, "f", "head", None, &[], false).unwrap();
         let fun = after.get("f").unwrap();
         let exit = &fun.cfg.named[&label("exit")];
         let Instruction::BinaryOp { left, right, .. } = &exit.instructions[0].1 else { panic!() };
@@ -1355,7 +1437,7 @@ mod tests {
             let fun = program.functions.values_mut().next().unwrap();
             fun.cfg.entry.instructions[2].1 = num(0); // bound 0 < init 1
         }
-        let err = apply(&mut program, "f", "head", None, &[]).unwrap_err();
+        let err = apply(&mut program, "f", "head", None, &[], false).unwrap_err();
         assert!(err.to_string().contains("never runs"), "{}", err);
     }
 
@@ -1363,7 +1445,7 @@ mod tests {
     fn verify_rejects_a_tampered_copy() {
         let before = loop_program();
         let mut after = before.clone();
-        apply(&mut after, "f", "head", None, &[]).unwrap();
+        apply(&mut after, "f", "head", None, &[], false).unwrap();
         {
             let fun = after.functions.values_mut().next().unwrap();
             let body1 = fun.cfg.named.get_mut(&label("body_it1")).unwrap();
@@ -1373,7 +1455,7 @@ mod tests {
             let Instruction::BinaryOp { left, op, right } = instr else { panic!() };
             body1.instructions[0] = (idx, Instruction::BinaryOp { left: right, op, right: left });
         }
-        let err = verify(&before, &after, "f", "head", None, &[]).unwrap_err();
+        let err = verify(&before, &after, "f", "head", None, &[], false).unwrap_err();
         assert!(err.to_string().contains("differs from the original"), "{}", err);
     }
 
@@ -1381,12 +1463,12 @@ mod tests {
     fn verify_rejects_a_missing_copy() {
         let before = loop_program();
         let mut after = before.clone();
-        apply(&mut after, "f", "head", None, &[]).unwrap();
+        apply(&mut after, "f", "head", None, &[], false).unwrap();
         {
             let fun = after.functions.values_mut().next().unwrap();
             fun.cfg.named.remove(&label("body_it2"));
         }
-        let err = verify(&before, &after, "f", "head", None, &[]).unwrap_err();
+        let err = verify(&before, &after, "f", "head", None, &[], false).unwrap_err();
         assert!(err.to_string().contains("prescription") || err.to_string().contains("missing"), "{}", err);
     }
 

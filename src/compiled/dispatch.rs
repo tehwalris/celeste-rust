@@ -15,8 +15,8 @@
 use celeste_engine::runtime2;
 use celeste_engine::kernel;
 use celeste_kernels::{
-    kernel_gen_dash, kernel_gen_frozen, kernel_gen_r20_dash, kernel_gen_r20_frozen,
-    kernel_gen_r20_steady, kernel_gen_steady,
+    kernel_gen_dash, kernel_gen_frozen, kernel_gen_r20_dash, kernel_gen_r20_dying_fall,
+    kernel_gen_r20_dying_spikes, kernel_gen_r20_frozen, kernel_gen_r20_steady, kernel_gen_steady,
 };
 
 pub(crate) fn run_chunk_kernel(
@@ -66,7 +66,18 @@ pub(crate) fn run_chunk_kernel(
         KERNEL_HITS[5].fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
         return true;
     }
-    KERNEL_HITS[6].fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
+    // The (2,0) dying members (kill branch taken; fall = y>128, spikes =
+    // spikes_at). Tried after the live classes because dying lanes are the
+    // rarer population; each kernel's class guards reject non-dying chunks.
+    if mask & 8 != 0 && run_class_kernel_r20_dying_fall(chunk, ids, done, local) {
+        KERNEL_HITS[6].fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
+        return true;
+    }
+    if mask & 8 != 0 && run_class_kernel_r20_dying_spikes(chunk, ids, done, local) {
+        KERNEL_HITS[7].fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
+        return true;
+    }
+    KERNEL_HITS[8].fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
     // Why did every kernel refuse? A shape hash that matches some kernel
     // means the CLASS guard rejected it (a pm1 the overlays do not
     // cover); no match at all means the heap shape itself is new. The
@@ -79,6 +90,8 @@ pub(crate) fn run_chunk_kernel(
             ("r20-steady", kernel_gen_r20_steady::SHAPE_HASH),
             ("r20-dash", kernel_gen_r20_dash::SHAPE_HASH),
             ("r20-frozen", kernel_gen_r20_frozen::SHAPE_HASH),
+            ("r20-dying-fall", kernel_gen_r20_dying_fall::SHAPE_HASH),
+            ("r20-dying-spikes", kernel_gen_r20_dying_spikes::SHAPE_HASH),
         ];
         let same_shape: Vec<&str> = known
             .iter()
@@ -531,11 +544,12 @@ fn kernel_class_mask() -> u8 {
                 "steady" => 1,
                 "dash" => 2,
                 "frozen" => 4,
+                "dying" => 8,
                 "" => 0,
                 other => panic!("unknown kernel class {:?}", other),
             }
         }),
-        Err(_) => 7,
+        Err(_) => 15,
     };
     MASK.store(m, Ordering::Relaxed);
     m
@@ -558,7 +572,9 @@ pub fn fused_artifact_fingerprint() -> Option<u64> {
     None
 }
 
-static KERNEL_HITS: [std::sync::atomic::AtomicU64; 7] = [
+static KERNEL_HITS: [std::sync::atomic::AtomicU64; 9] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -588,8 +604,8 @@ pub fn print_kernel_hits() {
     if v.iter().any(|x| *x > 0) || plain > 0 {
         eprintln!(
             "kernel lanes: steady {} dash {} frozen {} r20-steady {} r20-dash {} \
-             r20-frozen {} missed {} plain-routed {}",
-            v[0], v[1], v[2], v[3], v[4], v[5], v[6], plain
+             r20-frozen {} r20-dying-fall {} r20-dying-spikes {} missed {} plain-routed {}",
+            v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], plain
         );
     }
     {
@@ -741,6 +757,8 @@ class_kernel_runner!(run_class_kernel_frozen, kernel_gen_frozen);
 class_kernel_runner!(run_class_kernel_r20_steady, kernel_gen_r20_steady);
 class_kernel_runner!(run_class_kernel_r20_dash, kernel_gen_r20_dash);
 class_kernel_runner!(run_class_kernel_r20_frozen, kernel_gen_r20_frozen);
+class_kernel_runner!(run_class_kernel_r20_dying_fall, kernel_gen_r20_dying_fall);
+class_kernel_runner!(run_class_kernel_r20_dying_spikes, kernel_gen_r20_dying_spikes);
 
 /// The fused specialization-set runner (plans/shape-tag-plan.md). Same
 /// slice loop as the class-kernel macro above, with one addition: the

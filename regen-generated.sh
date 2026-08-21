@@ -41,11 +41,15 @@ done
 
 # Room (2,0) class kernels: same emitter, (2,0) overlays and witnesses.
 # CELESTE_START_ROOM matters - the recipes replay against the (2,0) compile.
-for class in steady dash frozen; do
+# dying_fall/dying_spikes: module names use underscores, recipe/witness
+# file names use hyphens; ${class//_/-} maps between them.
+R20_CLASSES="steady dash frozen dying_fall dying_spikes"
+for class in $R20_CLASSES; do
+    hy=${class//_/-}
     echo "==> r20 $class kernel"
     CELESTE_START_ROOM=2,0 ./target/release/transpile \
-        --recipe "rewrites-trace20-$class.jsonl" \
-        --kernel "crates/celeste-kernels/witness/r20-$class-shape.json" \
+        --recipe "rewrites-trace20-$hy.jsonl" \
+        --kernel "crates/celeste-kernels/witness/r20-$hy-shape.json" \
         "$SCRATCH/kernel_gen_r20_$class.rs"
 done
 
@@ -60,6 +64,8 @@ restore() { cp "$BACKUP"/gen.rs crates/celeste-names/src/;
 cp "$SCRATCH/gen.rs" crates/celeste-names/src/gen.rs
 for class in steady dash frozen; do
     cp "$SCRATCH/kernel_gen_$class.rs" "crates/celeste-kernels/src/kernel_gen_$class.rs"
+done
+for class in $R20_CLASSES; do
     cp "$SCRATCH/kernel_gen_r20_$class.rs" "crates/celeste-kernels/src/kernel_gen_r20_$class.rs"
 done
 

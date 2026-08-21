@@ -983,5 +983,110 @@
 {"id": "dys20_020", "rule": "guard_branch", "fn": "__frame", "head": "it4_zc20_000_in_j2_006_if_join_5", "taken": false, "why": "dying-spikes (2,0): traced on the death witness f64 (tas/room_2_0_death_spikes_frame_64.txt)"}
 {"id": "dys20_021", "rule": "guard_branch", "fn": "__frame", "head": "in_t20i_004_entry", "taken": true, "why": "dying-spikes (2,0): traced on the death witness f64 (tas/room_2_0_death_spikes_frame_64.txt)"}
 {"id": "dys20_022", "rule": "guard_branch", "fn": "__frame", "head": "in_t20i_004_in_h061_if_join_2", "taken": true, "why": "dying-spikes (2,0): traced on the death witness f64 (tas/room_2_0_death_spikes_frame_64.txt)"}
+{"id": "dys20t_strip", "rule": "strip_kills", "why": "member overlay opens kill-free; steady_kd re-derives on the final CFG"}
+{"id": "dys20t_dc0", "rule": "demote_create", "fn": "__frame", "at": "%114", "why": "seconds cell exists from __init; drop the create so the tick arm is speculatable"}
+{"id": "dys20t_mrg0", "rule": "merge_blocks", "why": "resolve single-edge phis left by the tick blend"}
+{"id": "dys20t_fs0", "rule": "fold_select"}
+{"id": "dys20t_f0", "rule": "fold"}
+{"id": "steady_dce", "rule": "dce"}
+{"id": "dys20t_xb001", "rule": "expand_bool", "fn": "__frame", "head": "in_t20i_004_in_h061_and_or_continue_113", "why": "btn concretization diamond -> lane expansion; trace10 xb004-xb011 mirror (walker-safe: no btn read is deleted)"}
+{"id": "dys20t_xb002", "rule": "expand_bool", "fn": "__frame", "head": "in_t20i_004_in_h061_and_or_continue_8", "why": "btn concretization diamond -> lane expansion; trace10 xb004-xb011 mirror (walker-safe: no btn read is deleted)"}
+{"id": "dys20t_xb003", "rule": "expand_bool", "fn": "__frame", "head": "in_t20i_004_in_h061_if_body_107", "why": "btn concretization diamond -> lane expansion; trace10 xb004-xb011 mirror (walker-safe: no btn read is deleted)"}
+{"id": "dys20t_xb004", "rule": "expand_bool", "fn": "__frame", "head": "in_t20i_004_in_h061_in_i1_071_cont", "why": "btn concretization diamond -> lane expansion; trace10 xb004-xb011 mirror (walker-safe: no btn read is deleted)"}
+{"id": "dys20t_xb005", "rule": "expand_bool", "fn": "__frame", "head": "in_t20i_004_in_h061_in_i1_072_cont", "why": "btn concretization diamond -> lane expansion; trace10 xb004-xb011 mirror (walker-safe: no btn read is deleted)"}
+{"id": "dys20t_xb006", "rule": "expand_bool", "fn": "__frame", "head": "in_t20i_004_in_h061_in_i1_073_cont", "why": "btn concretization diamond -> lane expansion; trace10 xb004-xb011 mirror (walker-safe: no btn read is deleted)"}
+{"id": "dys20t_xb007", "rule": "expand_bool", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1027_for_join_35", "why": "btn concretization diamond -> lane expansion; trace10 xb004-xb011 mirror (walker-safe: no btn read is deleted)"}
+{"id": "dys20t_xm0", "rule": "merge_blocks", "why": "collapse the post-expand_bool arm chains to single blocks (expand + concretization store together); trace10 xm000 mirror"}
+{"id": "dys20t_mrg1", "rule": "merge_blocks", "why": "second round: pins leave untaken arms as unreachable preds until dce removes them, so edges become mergeable only after steady_dce"}
+{"id": "dys20t_fs1", "rule": "fold_select"}
+{"id": "dys20t_f1", "rule": "fold"}
+{"id": "dys20t_dce2", "rule": "dce"}
+{"id": "dys20t_u000", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20n_002_in_k027_for_head_1", "trip": 4, "why": "spring 1 check loop over 4 objects; hit-exit arm already pinned clear by the shared no-overlap pins, so a pure counted loop; t20_016 mirror"}
+{"id": "dys20t_u001", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20n_003_in_k027_for_head_1", "trip": 4, "why": "spring 2 check loop; same as st20_u000"}
+{"id": "dys20t_mrg2", "rule": "merge_blocks"}
+{"id": "dys20t_u002", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_k2002_for_head_1", "trip": 4, "why": "collide check loop over 4 objects inside the pixel-move body; hit exits already pinned clear; must unroll before the pixel loops so their bodies are loop-free"}
+{"id": "dys20t_u003", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_k2003_for_head_1", "trip": 4, "why": "collide check loop over 4 objects inside the pixel-move body; hit exits already pinned clear; must unroll before the pixel loops so their bodies are loop-free"}
+{"id": "dys20t_u004", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_k2004_for_head_1", "trip": 4, "why": "collide check loop over 4 objects inside the pixel-move body; hit exits already pinned clear; must unroll before the pixel loops so their bodies are loop-free"}
+{"id": "dys20t_u005", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_k2005_for_head_1", "trip": 4, "why": "collide check loop over 4 objects inside the pixel-move body; hit exits already pinned clear; must unroll before the pixel loops so their bodies are loop-free"}
+{"id": "dys20t_u006", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_k2006_for_head_1", "trip": 4, "why": "collide check loop over 4 objects inside the pixel-move body; hit exits already pinned clear; must unroll before the pixel loops so their bodies are loop-free"}
+{"id": "dys20t_u007", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_k2007_for_head_1", "trip": 4, "why": "collide check loop over 4 objects inside the pixel-move body; hit exits already pinned clear; must unroll before the pixel loops so their bodies are loop-free"}
+{"id": "dys20t_u008", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_k1000_for_head_3", "why": "move_x pixel loop, masked form with constant bound 8; h068 mirror"}
+{"id": "dys20t_u009", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_k1001_for_head_3", "why": "move_y pixel loop; h069 mirror"}
+{"id": "dys20t_mrg3", "rule": "merge_blocks"}
+{"forward": true, "id": "dys20t_cse0", "rule": "cse"}
+{"id": "dys20t_fs2", "rule": "fold_select"}
+{"id": "dys20t_dce3", "rule": "dce"}
+{"id": "dys20t_dg0", "rule": "dedup_guards"}
+{"id": "dys20t_u010", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_i1_068_for_head_4", "why": "spikes_at inner (x) loop, constant tile bounds; h076 mirror"}
+{"id": "dys20t_u011", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_i1_068_for_head_1", "why": "spikes_at outer (y) loop; h077 mirror"}
+{"id": "dys20t_mrg4", "rule": "merge_blocks"}
+{"forward": true, "id": "dys20t_cse1", "rule": "cse"}
+{"id": "dys20t_dg1", "rule": "dedup_guards"}
+{"id": "dys20t_fs3", "rule": "fold_select"}
+{"id": "dys20t_dce4", "rule": "dce"}
+{"id": "dys20t_u012", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1024_for_head_1", "trip": 3, "why": "player-update check loop over 4 objects; hit exits pinned clear by the shared pins; guarded trip-4 unroll"}
+{"id": "dys20t_u013", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1025_for_head_1", "trip": 3, "why": "player-update check loop over 4 objects; hit exits pinned clear by the shared pins; guarded trip-4 unroll"}
+{"id": "dys20t_u014", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1026_for_head_1", "trip": 3, "why": "player-update check loop over 4 objects; hit exits pinned clear by the shared pins; guarded trip-4 unroll"}
+{"id": "dys20t_u015", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1027_for_head_1", "trip": 3, "why": "player-update check loop over 4 objects; hit exits pinned clear by the shared pins; guarded trip-4 unroll"}
+{"id": "dys20t_u016", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1030_for_head_1", "trip": 3, "why": "player-update check loop over 4 objects; hit exits pinned clear by the shared pins; guarded trip-4 unroll"}
+{"id": "dys20t_u017", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1031_for_head_1", "trip": 3, "why": "player-update check loop over 4 objects; hit exits pinned clear by the shared pins; guarded trip-4 unroll"}
+{"id": "dys20t_u018", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1034_for_head_1", "trip": 3, "why": "player-update check loop over 4 objects; hit exits pinned clear by the shared pins; guarded trip-4 unroll"}
+{"id": "dys20t_u019", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1035_for_head_1", "trip": 3, "why": "player-update check loop over 4 objects; hit exits pinned clear by the shared pins; guarded trip-4 unroll"}
+{"id": "dys20t_u020", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1038_for_head_1", "trip": 3, "why": "player-update check loop over 4 objects; hit exits pinned clear by the shared pins; guarded trip-4 unroll"}
+{"id": "dys20t_u021", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_k1039_for_head_1", "trip": 3, "why": "player-update check loop over 4 objects; hit exits pinned clear by the shared pins; guarded trip-4 unroll"}
+{"id": "dys20t_b900", "rule": "pin_builtin", "fn": "__frame", "at": "%14949", "name": "sin", "why": "fruit bob: sin(off/40) - re-derived at the spikes program's call id (transplanted b000's %14485 does not exist here)"}
+{"id": "dys20t_mrg5", "rule": "merge_blocks"}
+{"forward": true, "id": "dys20t_cse2", "rule": "cse"}
+{"id": "dys20t_dg2", "rule": "dedup_guards"}
+{"id": "dys20t_fs4", "rule": "fold_select"}
+{"id": "dys20t_f2", "rule": "fold"}
+{"id": "dys20t_dce5", "rule": "dce"}
+{"id": "dys20t_xc1", "rule": "if_convert", "fn": "__frame", "join": "in_t20i_004_in_h061_and_or_join_65", "why": "input short-circuit triangle; trace10 xc015 mirror"}
+{"id": "dys20t_ztm", "rule": "merge_blocks"}
+{"forward": true, "id": "dys20t_ztc", "rule": "cse"}
+{"id": "dys20t_ztd", "rule": "dce"}
+{"id": "dys20t_zn000", "rule": "inline", "fn": "__frame", "at": "%1552", "callee": "anonymous_63", "captures": [], "why": "draw foreach peel it2: inline the draw callback (trace10 zn000/zn002 mirror)"}
+{"id": "dys20t_zn001", "rule": "inline", "fn": "__frame", "at": "%1985", "callee": "anonymous_63", "captures": [], "why": "draw foreach peel it3: inline the draw callback (trace10 zn000/zn002 mirror)"}
+{"id": "dys20t_zn002", "rule": "inline", "fn": "__frame", "at": "%2013", "callee": "anonymous_63", "captures": [], "why": "draw foreach peel it4: inline the draw callback (trace10 zn000/zn002 mirror)"}
+{"id": "dys20t_zn003", "rule": "inline", "fn": "__frame", "at": "%2041", "callee": "anonymous_63", "captures": [], "why": "draw foreach peel it5: inline the draw callback (trace10 zn000/zn002 mirror)"}
+{"id": "dys20t_zn004", "rule": "inline", "fn": "__frame", "at": "%1595", "callee": "anonymous_64", "captures": [], "why": "draw foreach peel it2: inline the draw callback (trace10 zn001/zn003 mirror)"}
+{"id": "dys20t_zn005", "rule": "inline", "fn": "__frame", "at": "%2096", "callee": "anonymous_64", "captures": [], "why": "draw foreach peel it3: inline the draw callback (trace10 zn001/zn003 mirror)"}
+{"id": "dys20t_zn006", "rule": "inline", "fn": "__frame", "at": "%2124", "callee": "anonymous_64", "captures": [], "why": "draw foreach peel it4: inline the draw callback (trace10 zn001/zn003 mirror)"}
+{"id": "dys20t_zn007", "rule": "inline", "fn": "__frame", "at": "%2152", "callee": "anonymous_64", "captures": [], "why": "draw foreach peel it5: inline the draw callback (trace10 zn001/zn003 mirror)"}
+{"forward": true, "id": "dys20t_znc", "rule": "cse"}
+{"id": "dys20t_znd", "rule": "dce"}
+{"id": "dys20t_znm", "rule": "merge_blocks"}
+{"id": "dys20t_zt2", "rule": "drop_dead_cell", "fn": "__frame", "cell": "%175", "why": "anonymous_63 closure cell: all calls inlined, only guard reads remain; trace10 zt000 pattern"}
+{"id": "dys20t_zt3", "rule": "drop_dead_cell", "fn": "__frame", "cell": "%182", "why": "anonymous_64 closure cell: same"}
+{"id": "dys20t_gd0", "rule": "guard_branch", "fn": "__frame", "head": "in_i1_013_if_join_2", "taken": true, "why": "draw dispatch it2: fruit has no draw fn (only player.draw_22 exists), default spr path"}
+{"id": "dys20t_gdd", "rule": "dce"}
+{"id": "dys20t_nid", "rule": "dce"}
+{"id": "dys20t_nim", "rule": "merge_blocks"}
+{"id": "dys20t_fzm", "rule": "merge_blocks"}
+{"forward": true, "id": "dys20t_fzc", "rule": "cse"}
+{"id": "dys20t_fzf", "rule": "fold_select"}
+{"id": "dys20t_fzd", "rule": "dce"}
+{"id": "dys20t_gb90", "rule": "guard_branch", "fn": "__frame", "head": "in_t20i_004_in_h061_in_j2_039_for_head_4", "taken": true, "why": "dying-spikes straightening: pinned per membercheck --trace-frame 64 (member applied, observation identical)"}
+{"id": "dys20t_gb91", "rule": "guard_branch", "fn": "__frame", "head": "in_t20i_004_in_h061_in_j2_039_if_join_8", "taken": true, "why": "dying-spikes straightening: pinned per membercheck --trace-frame 64 (member applied, observation identical)"}
+{"id": "dys20t_gb92", "rule": "guard_branch", "fn": "__frame", "head": "in_t20i_004_in_h061_in_j2_039_if_join_14", "taken": false, "why": "dying-spikes straightening: pinned per membercheck --trace-frame 64 (member applied, observation identical)"}
+{"id": "dys20t_gb93", "rule": "guard_branch", "fn": "__frame", "head": "in_t20i_004_in_h061_in_j2_039_for_join_23", "taken": true, "why": "dying-spikes straightening: pinned per membercheck --trace-frame 64 (member applied, observation identical)"}
+{"id": "dys20t_gb94", "rule": "guard_branch", "fn": "__frame", "head": "in_t20i_004_in_h061_in_j2_039_cont", "taken": false, "why": "dying-spikes straightening: pinned per membercheck --trace-frame 64 (member applied, observation identical)"}
+{"id": "dys20t_gb95", "rule": "guard_branch", "fn": "__frame", "head": "in_t20i_004_in_h061_if_join_24", "taken": false, "why": "dying-spikes straightening: pinned per membercheck --trace-frame 64 (member applied, observation identical)"}
+{"id": "dys20t_gb96", "rule": "guard_branch", "fn": "__frame", "head": "in_t20i_004_in_h061_if_condition_43", "taken": false, "why": "dying-spikes straightening: pinned per membercheck --trace-frame 64 (member applied, observation identical)"}
+{"id": "dys20t_gb97", "rule": "guard_branch", "fn": "__frame", "head": "in_t20i_004_in_h061_if_join_154", "taken": false, "why": "dying-spikes straightening: pinned per membercheck --trace-frame 64 (member applied, observation identical)"}
+{"id": "dys20t_gb98", "rule": "guard_branch", "fn": "__frame", "head": "in_t20i_004_in_h061_and_or_join_159", "taken": false, "why": "dying-spikes straightening: pinned per membercheck --trace-frame 64 (member applied, observation identical)"}
+{"id": "dys20t_gb99", "rule": "guard_branch", "fn": "__frame", "head": "it5_zc20_000_in_j2_006_if_join_5", "taken": true, "why": "dying-spikes straightening: pinned per membercheck --trace-frame 64 (member applied, observation identical)"}
+{"id": "dys20t_gb9a", "rule": "guard_branch", "fn": "__frame", "head": "in_j2_006_for_join_10", "taken": false, "why": "dying-spikes straightening: pinned per membercheck --trace-frame 64 (member applied, observation identical)"}
+{"id": "dys20t_gb9b", "rule": "guard_branch", "fn": "__frame", "head": "in_i1_013_if_join_2", "taken": false, "why": "dying-spikes straightening: pinned per membercheck --trace-frame 64 (member applied, observation identical)"}
+{"id": "dys20t_gb9c", "rule": "guard_branch", "fn": "__frame", "head": "__entry", "taken": false, "why": "dying-spikes straightening: pinned per membercheck --trace-frame 64 (member applied, observation identical)"}
+{"id": "dys20t_gb9d", "rule": "guard_branch", "fn": "__frame", "head": "in_dys20t_zn004_in_i1_020_if_join_2", "taken": false, "why": "dying-spikes straightening: pinned per membercheck --trace-frame 64 (member applied, observation identical)"}
+{"id": "dys20t_gb9e", "rule": "guard_branch", "fn": "__frame", "head": "in_dys20t_zn005_in_i1_020_if_join_2", "taken": false, "why": "dying-spikes straightening: pinned per membercheck --trace-frame 64 (member applied, observation identical)"}
+{"id": "dys20t_gb9f", "rule": "guard_branch", "fn": "__frame", "head": "in_dys20t_zn006_in_i1_020_if_join_2", "taken": true, "why": "dying-spikes straightening: pinned per membercheck --trace-frame 64 (member applied, observation identical)"}
+{"id": "dys20t_mg9", "rule": "merge_blocks", "why": "pull for_body_start_5 into the pinned for_head_4 so the head carries the i>#objects exit branch"}
+{"id": "dys20t_sp9", "rule": "speculate", "fn": "__frame", "join": "in_t20i_004_in_h061_in_j2_039_if_join_13", "why": "hoist the pure `bool true` out of the del-scan found arm"}
+{"id": "dys20t_ab9", "rule": "absorb_stores", "fn": "__frame", "head": "in_t20i_004_in_h061_in_j2_039_if_join_8", "why": "flatten the found diamond (stores found=true, remembered=obj) into select-stores"}
+{"id": "dys20t_dc9", "rule": "dce", "why": "collect the pinned-off shift arm if_body_20 so the del-scan chain is single-pred for u922"}
+{"id": "dys20t_u922", "rule": "unroll_loop", "fn": "__frame", "head": "in_t20i_004_in_h061_in_j2_039_for_head_4", "trip": 4, "invert": true, "why": "the del(objects,player) scan at the spikes kill site: exit-on-true head (i>#objects) after the sentinel pin; 4 body iterations, player asserted last; premise #objects==4 (pre-deletion)"}
+{"id": "dys20t_mg9b", "rule": "merge_blocks", "why": "resolve the single-edge phi at and_or_join_159 left after dc9 removed the pinned-off and_or_continue_157 edge"}
 {"id": "dys20_dce", "rule": "dce"}
 {"id": "dys20_kd", "rule": "kill_dead"}

@@ -488,6 +488,13 @@ pub enum Rule {
         /// what makes the chain walk deterministic.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         exits: Vec<String>,
+        /// Inverted head sense: the loop CONTINUES on the false target and
+        /// exits on the true target (`br i > bound ? exit : body`, the
+        /// inlined-`del` scan shape). The continue-condition is the negated
+        /// compare, so trip mode's `<=`-equality premise argument applies
+        /// after negation exactly as in the plain sense.
+        #[serde(default, skip_serializing_if = "is_false")]
+        invert: bool,
     },
     /// Delete any `assert_true`/`assert_pointer`/`assert_closure` that is
     /// dominated by an identical assert on the same SSA operands. Those
@@ -921,8 +928,8 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::CollapseAllLoop { function, head, trip } => {
             collapse_all_loop::apply(program, &entry.id, function, head, *trip)
         }
-        Rule::UnrollLoop { function, head, trip, exits } => {
-            unroll_loop::apply(program, function, head, *trip, exits)
+        Rule::UnrollLoop { function, head, trip, exits, invert } => {
+            unroll_loop::apply(program, function, head, *trip, exits, *invert)
         }
         Rule::DedupGuards => dedup_guards::apply(program),
         Rule::AddHint { function, block } => add_hint::apply(program, function, block),
@@ -1081,8 +1088,8 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
         Rule::CollapseAllLoop { function, head, trip } => {
             collapse_all_loop::verify(&before, program, &entry.id, function, head, *trip)
         }
-        Rule::UnrollLoop { function, head, trip, exits } => {
-            unroll_loop::verify(&before, program, function, head, *trip, exits)
+        Rule::UnrollLoop { function, head, trip, exits, invert } => {
+            unroll_loop::verify(&before, program, function, head, *trip, exits, *invert)
         }
         Rule::DedupGuards => dedup_guards::verify(&before, program),
         Rule::AddHint { function, block } => add_hint::verify(&before, program, function, block),
