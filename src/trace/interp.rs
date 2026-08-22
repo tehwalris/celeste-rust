@@ -705,7 +705,33 @@ impl<'a, D: Domain> Interp<'a, D> {
                             // Concrete, because the heap is. This is why
                             // `for i=1,#t` needs no unrolling heuristic.
                             let Value::Table(t) = v else { bail!("# of a non-table") };
-                            let len = st.heap.tables[&t].arr.len() as i16;
+                            let arr = &st.heap.tables[&t].arr;
+                            // A HOLE-PUNCHED table (`set_key` materialised
+                            // a skipped index as an explicit nil) has no
+                            // length this model can report. Measured in
+                            // real PICO-8: `t={} t[3]=true` gives `#t ==
+                            // 0`, and the dense model would say 3; setting
+                            // t[1] then gives 1 and t[2] gives 3, so the
+                            // border moves in a way densely-stored nils do
+                            // not track. Refuse rather than answer.
+                            //
+                            // The interpreter has the same limitation and
+                            // states it as "no table in the cart is both
+                            // hole-punched and appended to". True today -
+                            // `got_fruit` is the only hole-punched table
+                            // and `title_screen`, which is the only thing
+                            // that `add`s to it, is never run - but a
+                            // grep is not a guarantee, and this makes it
+                            // one. `add(t, v)` is `t[#t+1] = v`, so
+                            // guarding `#` guards the append too.
+                            if arr.iter().any(|x| matches!(x, Value::Nil)) {
+                                bail!(
+                                    "# of a hole-punched {}-element table: PICO-8's length \
+                                     is any border, which a dense array cannot represent",
+                                    arr.len()
+                                );
+                            }
+                            let len = arr.len() as i16;
                             let n = self.d.num(P8::from_i16(len));
                             (st, Value::Num(n))
                         }
@@ -973,16 +999,38 @@ impl<'a, D: Domain> Interp<'a, D> {
                 table.hash.insert(f, v);
             }
             Key::Index(i) => {
-                if i >= 1 && (i as usize) <= table.arr.len() {
-                    table.arr[i as usize - 1] = v;
-                } else if i as usize == table.arr.len() + 1 {
-                    table.arr.push(v);
+                if i < 1 {
+                    bail!("array index {} is not positive", i);
+                }
+                let i = i as usize;
+                // Lua lets an assignment SKIP indices - `t[3] = v` on an
+                // empty table is legal and leaves t[1] and t[2] absent.
+                // Room (2,0) does exactly that: the fruit sets
+                // `got_fruit[1 + level_index()]`, and `level_index()` is
+                // 2 there, while `_init` never fills `got_fruit` (only
+                // `title_screen` does, and the search does not run it).
+                //
+                // Arrays are modelled densely, so the skipped indices
+                // become explicit nils, which read back exactly as Lua's
+                // absent keys do. The interpreter does the same thing for
+                // the same reason (`core_interpreter.rs`, `Instruction::
+                // Index`), which is what makes the oracle agree. What
+                // neither models is `#`/`add` on a hole-punched table,
+                // whose length in PICO-8 is any border; no table in the
+                // cart is both hole-punched and appended to.
+                if i <= table.arr.len() {
+                    table.arr[i - 1] = v;
                 } else {
-                    bail!(
-                        "array index {} is past the end of a {}-element table",
-                        i,
-                        table.arr.len()
-                    );
+                    // A far-out index would materialise the gap, so cap
+                    // it rather than let a symbolic-looking constant
+                    // allocate. The cart's largest array is 30 long.
+                    if i > 4096 {
+                        bail!("array index {} would materialise a {}-element gap", i, i);
+                    }
+                    while table.arr.len() < i - 1 {
+                        table.arr.push(Value::Nil);
+                    }
+                    table.arr.push(v);
                 }
             }
         }

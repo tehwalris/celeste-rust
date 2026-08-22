@@ -191,6 +191,13 @@ mod tests {
         let init = full_moon::parse("_init()\n__reset_button_states()\n").expect("parse init");
         let frame = full_moon::parse("_update()").expect("parse frame");
         let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
+        // A tighter budget than the default. Six free choices held across
+        // forty frames diverge about 3x per frame once the player can
+        // die, so the tail of this probe is a state explosion that costs
+        // minutes and says nothing a kernel needs - one frame is what
+        // gets compiled. Stopping at 100k nodes keeps it in seconds while
+        // still reaching the frames where shapes first diverge.
+        it.max_nodes = 100_000;
         let cart = std::sync::Arc::new(
             celeste_core::cart_data::CartData::load("cart").expect("cart"),
         );
@@ -280,11 +287,11 @@ mod tests {
         // buttons actually reach something.
         let mut cur = vec![st];
         for n in 1..=40 {
-            let mut next = Vec::new();
+            let mut next: crate::trace::interp::Outcome<Symbolic> = Vec::new();
             let mut failed = None;
             for s in cur {
                 match it.exec_block(frame.nodes(), s) {
-                    Ok(out) => next.extend(out.into_iter().map(|(s, _)| s)),
+                    Ok(out) => next.extend(out),
                     Err(e) => {
                         failed = Some(format!("{:#}", e));
                         break;
@@ -295,6 +302,18 @@ mod tests {
                 eprintln!("[trace] frame {} stopped at: {}", n, e);
                 return;
             }
+            // COLLAPSE ACROSS THE WHOLE FRONTIER. `exec_block` collapses
+            // what one state produced, but each state here is a separate
+            // call, so without this two states from different predecessors
+            // are never offered to each other - and after a frame or two
+            // of divergence that is most of the pairs.
+            let next = match it.collapse(next) {
+                Ok(o) => o.into_iter().map(|(s, _)| s).collect::<Vec<_>>(),
+                Err(e) => {
+                    eprintln!("[trace] frame {} collapse stopped at: {:#}", n, e);
+                    return;
+                }
+            };
             eprintln!(
                 "[trace] frame {}: {} state(s), {} nodes | {}",
                 n,
@@ -302,13 +321,24 @@ mod tests {
                 it.d.graph.len(),
                 describe(&it, &next[0])
             );
-            // WHY are there several? Print each state's path literals and
-            // the player fields that actually differ, so "under-merged"
-            // becomes a specific claim rather than an impression.
-            if next.len() > 1 && std::env::var_os("TRACE_SPLIT").is_some() {
+            // WHY are there several? Only a SHAPE difference can keep
+            // two states apart, so if the distinct-shape count is below
+            // the state count, `collapse` is failing to merge and that is
+            // a bug rather than the program branching. Printed every
+            // frame, not behind an env var: this is the check that caught
+            // `intern_body` handing out a fresh id per evaluation, and it
+            // caught it only because someone looked.
+            if next.len() > 1 {
                 let shapes: std::collections::BTreeSet<String> =
                     next.iter().map(|s| format!("{:?}", s.shape().unwrap())).collect();
-                eprintln!("[split]   distinct SHAPES among them: {}", shapes.len());
+                assert_eq!(
+                    shapes.len(),
+                    next.len(),
+                    "frame {}: {} states share only {} shapes - they should have merged",
+                    n,
+                    next.len(),
+                    shapes.len()
+                );
             }
             cur = next;
         }

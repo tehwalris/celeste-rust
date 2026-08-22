@@ -477,6 +477,36 @@ Trace the UN-REWRITTEN `__frame` and diff the resulting graph against the
 one the recipe pipeline produces, per class kernel. Exact, incremental,
 and it localizes a discrepancy to a node.
 
+**What it actually needs, now that T7 exists.** `lower::emit_body` reads
+far less of `Emit` than `Emit` contains: `graph`, `ok`, `live`, `uni`,
+`vary_in`, and `of.fields` (cell id -> node). A traced `Frame` already has
+four of those - `ok`, `live` is `guard`, the graph is the same
+`transpile::graph::Graph`, and the outputs are nodes. The gap is the
+NUMBERING: `of.fields` is keyed by canonical cell id and the tracer's
+outputs are keyed by heap path.
+
+So the missing piece is a `trace` counterpart to `compiled::bridge`, and
+the shape of it is already fixed by the engine:
+
+* `Rt2` is `structure: Vec<Cell2>` (`Val` / `Obj(field ids)` / `Arr` /
+  `Clo` / `Bi`) plus `globals` indexed by `GLOBAL_NAMES`, numbered by a
+  BFS that starts from the globals in `GLOBAL_NAMES` order. The tracer's
+  heap maps onto that almost one-to-one; the only real mismatch is that a
+  tracer `Table` has a hash part AND an array part where `Cell2` picks
+  one, and no table in the cart uses both.
+* Import gives every `Val` cell an `Op::Cell(canonical id)` leaf, which
+  makes the tracer's cell ids the ENGINE's cell ids by construction
+  rather than by a lookup table anyone has to maintain.
+* Export gives `of.fields`, and the output shape falls out of the
+  `structure` the traced state ends with - which is where Stage 3's
+  multi-output-shape item stops being optional, since T7 measured FOUR
+  output shapes for one frame of room (0,0).
+
+Doing the numbering first is deliberate. Emitting a body against
+tracer-local cell ids would produce Rust that compiles and plugs into
+nothing, and the check for it would be `trace::eval`, which already
+exists - so it would cost the work and buy no evidence.
+
 ### T7 - a frame as a FUNCTION, and the check (landed 608995b)
 
 The tracer was a walk: run the cart, look at what came out. A kernel is a
