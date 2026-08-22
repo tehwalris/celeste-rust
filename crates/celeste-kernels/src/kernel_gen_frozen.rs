@@ -577,7 +577,7 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let r_c272: ZB = ZB { val: rin.c272, known: ALL };
     let r_c280: ZN = rin.c280;
     let r_c281: ZN = rin.c281;
-    let n4: P8 = u.c84 + P8::from_raw(65536i32);
+    let n4: P8 = P8::from_raw(65536i32) + u.c84;
     let n6: P8 = n4 % P8::from_raw(1966080i32);
     let n8: bool = n6 == P8::from_raw(0i32);
     let n11: P8 = u.c158 % P8::from_raw(524288i32);
@@ -593,14 +593,14 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let n27: ZB = zn_gt(r_c253, zn_splat(P8::from_raw(7929856i32)));
     let n28: ZB = zsel_b(n25, n25, n27);
     let n29: ZB = ZB { val: n25.known, known: ALL };
-    let n31: ZN = zn_min(zn_splat(P8::from_raw(7929856i32)), r_c253);
+    let n31: ZN = zn_min(r_c253, zn_splat(P8::from_raw(7929856i32)));
     let n32: ZN = zn_max(zn_splat(P8::from_raw(-65536i32)), n31);
     let n34: ZN = zsel_n(n28, zn_splat(P8::from_raw(0i32)), r_c280);
     let n35: ZB = ZB { val: n28.known, known: ALL };
     let n37: ZN = zsel_n(n28, n32, r_c253);
     let n39: ZN = if n22 { r_c253 } else { n37 };
     let n40: ZN = if n22 { r_c280 } else { n34 };
-    let ok_v0: u16 = ALL & zb_holds(n29) & zb_holds(n35);
+    let ok_v0: u16 = ALL & zb_holds(n35) & zb_holds(n29);
     let bd_v0: bool = !n17 || !n19;
     let osh = KOutShared {
         c20: n21,

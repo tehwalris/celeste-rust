@@ -733,8 +733,21 @@ mod tests {
                             roots.push(maps[m][o.ok as usize]);
                             roots.push(maps[m][o.guard as usize]);
                         }
-                        let (_, _, st) =
-                            crate::transpile::bdd::simplify(&sp, &roots, 1 << 22);
+                        let (_, _, sts) = crate::transpile::bdd::simplify_until_stable(
+                            &sp,
+                            &roots,
+                            1 << 22,
+                            4,
+                        );
+                        for (i, p) in sts.iter().enumerate() {
+                            eprintln!(
+                                "[emit]     pass {}: {} -> {} nodes, {} constant, {} to atom, \
+                                 {} equalities proved, {} atoms, capped = {}",
+                                i, p.before, p.after, p.constants, p.to_atom, p.mergeable,
+                                p.atoms, p.overflowed
+                            );
+                        }
+                        let st = *sts.first().unwrap();
                         // THE CONTROL. `simplify` rebuilds through
                         // `fold`, so some of the shrinkage is just
                         // normalization cascading on a second pass and

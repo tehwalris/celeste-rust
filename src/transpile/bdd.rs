@@ -467,6 +467,46 @@ pub fn simplify(g: &Graph, roots: &[NodeId], cap: usize) -> (Graph, Vec<NodeId>,
     (out, map, st)
 }
 
+/// `simplify` until it stops finding anything, composing the node maps.
+///
+/// One pass is not obviously a fixed point, and the reason is the ATOMS.
+/// An atom is an opaque node, and comparisons are atoms - so
+/// `Lt(Sel(c, x, y), z)` and `Lt(x, z)` are two INDEPENDENT variables
+/// even though they may be the same comparison. If a pass proves `c`
+/// constant, the select collapses and the first comparison becomes the
+/// second, literally: one node, one atom. The next pass then has
+/// relational information the previous one could not have had.
+///
+/// So iterating is not "run it again in case", it is following a
+/// specific mechanism. Whether that mechanism fires on any given program
+/// is a measurement; `passes` returns one `Stats` per pass so the answer
+/// is visible rather than assumed.
+pub fn simplify_until_stable(
+    g: &Graph,
+    roots: &[NodeId],
+    cap: usize,
+    max_passes: usize,
+) -> (Graph, Vec<NodeId>, Vec<Stats>) {
+    let mut cur = g.clone();
+    let mut cur_roots: Vec<NodeId> = roots.to_vec();
+    let mut composed: Vec<NodeId> = (0..g.len() as NodeId).collect();
+    let mut all = Vec::new();
+    for _ in 0..max_passes {
+        let (next, map, st) = simplify(&cur, &cur_roots, cap);
+        let progress = st.constants + st.to_atom;
+        all.push(st);
+        for c in composed.iter_mut() {
+            *c = if *c == UNREACHABLE { UNREACHABLE } else { map[*c as usize] };
+        }
+        cur_roots = cur_roots.iter().map(|r| map[*r as usize]).collect();
+        cur = next;
+        if progress == 0 {
+            break;
+        }
+    }
+    (cur, composed, all)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -673,6 +713,47 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_second_pass_can_see_what_the_first_could_not() {
+        // The mechanism iteration exists for. `Lt(Sel(c, x, y), z)` and
+        // `Lt(x, z)` are two atoms while the select stands, so a formula
+        // over both looks contingent. Prove `c` true, the select
+        // collapses to `x`, the two comparisons become ONE node - and
+        // only then is `Lt(..) == Lt(x, z)` visible as a tautology.
+        let mut g = Graph::new();
+        let (x, y, z) = (g.leaf(Op::Cell(1)), g.leaf(Op::Cell(2)), g.leaf(Op::Cell(3)));
+        let b = g.leaf(Op::Cell(4));
+        // `c` is a tautology the FIRST pass can decide, but which is not
+        // syntactically constant.
+        let nb = g.fold(Op::Not, vec![b]);
+        let c = g.fold(Op::Or, vec![b, nb]);
+        let sel = g.fold(Op::Sel, vec![c, x, y]);
+        let lt1 = g.fold(Op::Lt, vec![sel, z]);
+        let lt2 = g.fold(Op::Lt, vec![x, z]);
+        assert_ne!(lt1, lt2, "two atoms, or this proves nothing");
+        let nlt2 = g.fold(Op::Not, vec![lt2]);
+        let same = g.fold(Op::Or, vec![lt1, nlt2]);
+
+        // One pass: the select goes, but the equality was invisible while
+        // it stood.
+        let (one, map1, _) = simplify(&g, &[same], CAP);
+        let after_one = one.get(map1[same as usize]).op.clone();
+
+        let (out, map, passes) = simplify_until_stable(&g, &[same], CAP, 4);
+        assert!(passes.len() >= 2, "it should have taken a second look");
+        assert_eq!(
+            out.get(map[same as usize]).op,
+            Op::ConstBool(true),
+            "after one pass it was {:?}",
+            after_one
+        );
+        assert_eq!(
+            passes.last().unwrap().constants + passes.last().unwrap().to_atom,
+            0,
+            "the last pass is the one that found nothing"
+        );
     }
 
     #[test]

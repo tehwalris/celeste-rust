@@ -266,7 +266,13 @@ impl<'a> Ctx<'a> {
         let (x, y) = (self.at(id, 0, out)?, self.at(id, 1, out)?);
         Ok(match (out.lane, out.wide) {
             (true, _) => format!("{}({}, {})", zop, x, y),
-            (false, false) => format!("({} {} {})", x, sop, y),
+            // No parentheses: `inline` returns Some only for LEAVES, so
+            // every non-leaf node gets its own `let` and both operands
+            // are atomic - a bound name, a literal or a coercion call.
+            // There is therefore no `a || b && c` to misparse, and the
+            // parentheses would only be `unused_parens` warnings in the
+            // generated crate, which has to build clean.
+            (false, false) => format!("{} {} {}", x, sop, y),
             (false, true) => format!(
                 "(if {a} == Some({d}) || {b} == Some({d}) {{ Some({d}) }} \
                  else if {a}.is_some() && {b}.is_some() {{ Some({nd}) }} \
@@ -720,7 +726,8 @@ pub(crate) fn emit_body(e: &mut Emit, of: &mut OutFields) -> Result<()> {
             roots.push(maps[m][e.ok as usize]);
             roots.push(maps[m][e.live as usize]);
         }
-        let (sp2, nodemap, _) = crate::transpile::bdd::simplify(&sp, &roots, 1 << 22);
+        let (sp2, nodemap, _) =
+            crate::transpile::bdd::simplify_until_stable(&sp, &roots, 1 << 22, 4);
         // Only the roots are remapped, because only the roots are read.
         // Anything else would be `UNREACHABLE` and would panic on use,
         // which is the point of that sentinel.
@@ -981,6 +988,72 @@ fn repr_of_ty(ty: &str) -> Result<Repr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_lane_primitives_agree_with_the_folder_about_and_and_or() {
+        // `zb_and` and `zb_or` are what an `And`/`Or` node LOWERS to, and
+        // `Graph::eval` is what the same node means to every analysis
+        // upstream. If those two disagree, a folded graph and the kernel
+        // built from it answer differently, and nothing else in the
+        // pipeline would notice - the graph is never executed and the
+        // kernel is never folded.
+        //
+        // This became load-bearing rather than theoretical when `fold`
+        // started rewriting `Sel(c, x, true)` into `Or(Not c, x)`: the
+        // walk-driven path had never emitted either primitive before, and
+        // the checked-in kernels now contain 18 `zb_and` and 5 `zb_or`.
+        use celeste_engine::kernel::{zb_and, zb_or, ALL, ZB};
+        use std::collections::HashMap;
+
+        let tri = [Some(true), Some(false), None];
+        let as_zb = |b: Option<bool>| match b {
+            Some(true) => ZB { val: ALL, known: ALL },
+            Some(false) => ZB { val: 0, known: ALL },
+            None => ZB { val: 0, known: 0 },
+        };
+        // Lane 0 only; the primitives are bitwise, so one lane decides.
+        let from_zb = |z: ZB| -> Option<bool> {
+            if z.known & 1 == 0 {
+                None
+            } else {
+                Some(z.val & 1 != 0)
+            }
+        };
+
+        let mut g = Graph::new();
+        let (x, y) = (g.leaf(Op::Cell(0)), g.leaf(Op::Cell(1)));
+        // `add`, not `fold`: folding would answer some of these from the
+        // constants and the point is to exercise the OP.
+        let and = g.add(Op::And, vec![x, y]);
+        let or = g.add(Op::Or, vec![x, y]);
+        for a in tri {
+            for b in tri {
+                let cells = HashMap::from([
+                    (0u32, super::super::graph::Val::Bool(a)),
+                    (1u32, super::super::graph::Val::Bool(b)),
+                ]);
+                let out = g.eval(&cells).unwrap();
+                let want = |n: NodeId| match out[n as usize] {
+                    super::super::graph::Val::Bool(v) => v,
+                    other => panic!("not a boolean: {:?}", other),
+                };
+                assert_eq!(
+                    from_zb(zb_and(as_zb(a), as_zb(b))),
+                    want(and),
+                    "zb_and disagrees with the folder at {:?} AND {:?}",
+                    a,
+                    b
+                );
+                assert_eq!(
+                    from_zb(zb_or(as_zb(a), as_zb(b))),
+                    want(or),
+                    "zb_or disagrees with the folder at {:?} OR {:?}",
+                    a,
+                    b
+                );
+            }
+        }
+    }
 
     fn all_reprs() -> Vec<Repr> {
         let mut v = Vec::new();
