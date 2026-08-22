@@ -314,15 +314,11 @@ mod tests {
                     (base + i as u32, *node, if *is_bool { "ZB" } else { "ZN" })
                 })
                 .collect();
-            match super::super::emit::lower_frame(
-                &g,
-                &inputs,
-                &uni,
-                &outputs,
-                o.guard,
-                o.ok,
-            ) {
-                Ok(l) => eprintln!(
+            let lowered = super::super::emit::lower_frame(
+                &g, &inputs, &uni, &outputs, o.guard, o.ok,
+            );
+            match &lowered {
+                Ok(ref l) => eprintln!(
                     "[emit] outcome {}: {} lines, {} variants, {} outputs",
                     n,
                     l.body.len(),
@@ -336,6 +332,10 @@ mod tests {
             // an assignment on (every output, `ok`, `live`) together, so
             // count each key on its own and find out which one splits,
             // rather than telling a story about the guard.
+            let l_variants = match &lowered {
+                Ok(l) => l.variants,
+                Err(_) => 0,
+            };
             {
                 let mut sp = crate::transpile::graph::Graph::new();
                 let maps: Vec<Vec<crate::transpile::graph::NodeId>> =
@@ -365,6 +365,137 @@ mod tests {
                     count(false, false),
                     count(true, false),
                     count(true, true)
+                );
+                // WHICH cells actually differ between assignments? "40
+                // variants" is a count; the question is what the buttons
+                // are still reaching in a state with no objects left.
+                let mut varying: Vec<(String, usize)> = Vec::new();
+                for (p, nd, _) in &o.fields {
+                    if iface::show(p).starts_with("__button_states") {
+                        continue;
+                    }
+                    let vals: std::collections::BTreeSet<_> =
+                        (0..64usize).map(|m| maps[m][*nd as usize]).collect();
+                    if vals.len() > 1 {
+                        varying.push((iface::show(p), vals.len()));
+                    }
+                }
+                // How many DISTINCT SUCCESSOR ROWS can actually come
+                // out? That is the honest meaning of a variant: not "how
+                // many assignments produce structurally different
+                // expressions" (which is what the emitter's dedup key
+                // measures, and which over-counts whenever two
+                // expressions are equal without being identical), but
+                // "how many different rows can the search see". Anything
+                // above this number is generated code that no input can
+                // tell apart.
+                //
+                // Only assignments whose guard holds at the point count -
+                // the others describe a different outcome there - and
+                // only those the trace did not decline, since a declining
+                // lane leaves for the interpreter rather than becoming a
+                // row.
+                // EXACT paths. `ends_with(".y")` finds
+                // `objects[0].dash_accel.y` first, so an earlier version
+                // of this perturbed the dash accelerator instead of the
+                // player and never reached the death or next-room
+                // outcomes at all.
+                let base = iface::show(&player);
+                let idx = |field: &str| {
+                    let want = format!("{}.{}", base, field);
+                    f.iface.slots.iter().position(|q| iface::show(q) == want)
+                };
+                let gidx = |name: &str| {
+                    f.iface.slots.iter().position(|q| iface::show(q) == name)
+                };
+                // A SWEEP, not a nudge. The death, restart and next-room
+                // outcomes are only live where the player actually dies
+                // or leaves, so a handful of one-pixel perturbations
+                // never reaches them and the measurement comes out
+                // vacuously zero.
+                let n16 = crate::pico8_num::Pico8Num::from_i16;
+                let mut points: Vec<Vec<Conc>> = Vec::new();
+                for dx in [-8i16, 0, 8] {
+                    for dy in [-120i16, -8, 0, 8, 24, 64] {
+                        for sy in [None, Some(2i16)] {
+                            let mut p = f.iface.init.clone();
+                            for (field, d) in [("x", dx), ("y", dy)] {
+                                if let Some(i) = idx(field) {
+                                    if let Conc::Num(v) = p[i] {
+                                        p[i] = Conc::Num(v + n16(d));
+                                    }
+                                }
+                            }
+                            if let (Some(v), Some(i)) = (sy, idx("spd.y")) {
+                                p[i] = Conc::Num(n16(v));
+                            }
+                            points.push(p);
+                        }
+                    }
+                }
+                if let (Some(w), Some(d)) = (gidx("will_restart"), gidx("delay_restart")) {
+                    let mut p = f.iface.init.clone();
+                    p[w] = Conc::Bool(true);
+                    p[d] = Conc::Num(n16(1));
+                    points.push(p);
+                }
+                let mut most_rows = 0usize;
+                let mut live_at_most = 0usize;
+                for pt in &points {
+                    let mut rows: std::collections::BTreeSet<Vec<(u8, i32)>> = Default::default();
+                    let mut live_here = 0usize;
+                    for m in 0u8..64 {
+                        let mut bits = [false; 6];
+                        for (i, b) in bits.iter_mut().enumerate() {
+                            *b = m & (1 << i) != 0;
+                        }
+                        let env = super::super::eval::Env {
+                            cells: pt,
+                            frees: &bits,
+                            cart: it.cart.clone(),
+                            cache: it.cache.clone(),
+                        };
+                        let ev = |nd| super::super::eval::eval(&g, nd, &env);
+                        let holds = |nd| matches!(ev(nd), Ok(Conc::Bool(true)));
+                        if !holds(o.guard) || !holds(o.ok) {
+                            continue;
+                        }
+                        live_here += 1;
+                        let mut row = Vec::new();
+                        for (q, nd, _) in &o.fields {
+                            if iface::show(q).starts_with("__button_states") {
+                                continue;
+                            }
+                            match ev(*nd) {
+                                Ok(Conc::Num(v)) => row.push((0u8, v.as_raw_u32() as i32)),
+                                Ok(Conc::Bool(b)) => row.push((1u8, b as i32)),
+                                Err(_) => row.push((2u8, 0)),
+                            }
+                        }
+                        rows.insert(row);
+                    }
+                    if rows.len() > most_rows {
+                        most_rows = rows.len();
+                        live_at_most = live_here;
+                    }
+                }
+                eprintln!(
+                    "[emit]   outcome {}: emitter keeps {} variants; the most DISTINCT ROWS any \
+                     of {} input points produces is {} (from {} live assignments)",
+                    n,
+                    l_variants,
+                    points.len(),
+                    most_rows,
+                    live_at_most
+                );
+
+                varying.sort_by_key(|(_, k)| std::cmp::Reverse(*k));
+                eprintln!(
+                    "[emit]   outcome {}: {} of {} output cells vary; top: {:?}",
+                    n,
+                    varying.len(),
+                    o.fields.len(),
+                    varying.iter().take(6).collect::<Vec<_>>()
                 );
             }
         }
