@@ -389,47 +389,7 @@ fn p8(v: &P8) -> String {
     format!("P8::from_raw({}i32)", v.as_raw_u32() as i32)
 }
 
-/// Does `hay` contain `needle` as a whole Rust identifier? Used to decide
-/// which `kbK` button bits a generated suffix can observe, so it must not
-/// match inside a longer name (`kb1` vs `kb12`) - it is a soundness test,
-/// not a formatting nicety.
-/// Word-boundary occurrence of `name` in `text` (so v1 does not match
-/// inside v17). Used for the Pre-struct crossing detection.
-pub(crate) fn word_used(text: &str, name: &str) -> bool {
-    let bytes = text.as_bytes();
-    let mut from = 0;
-    while let Some(pos) = text[from..].find(name) {
-        let start = from + pos;
-        let end = start + name.len();
-        let pre_ok =
-            start == 0 || !(bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_');
-        let post_ok =
-            end >= bytes.len() || !(bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_');
-        if pre_ok && post_ok {
-            return true;
-        }
-        from = end;
-    }
-    false
-}
 
-pub(crate) fn mentions_ident(hay: &str, needle: &str) -> bool {
-    let ident_char = |c: char| c.is_alphanumeric() || c == '_';
-    let mut from = 0usize;
-    while let Some(rel) = hay[from..].find(needle) {
-        let at = from + rel;
-        let before_ok = hay[..at].chars().next_back().map_or(true, |c| !ident_char(c));
-        let after_ok = hay[at + needle.len()..]
-            .chars()
-            .next()
-            .map_or(true, |c| !ident_char(c));
-        if before_ok && after_ok {
-            return true;
-        }
-        from = at + needle.len();
-    }
-    false
-}
 
 /// Load the shape witness JSON into the emit-time cell map.
 fn load_witness(path: &str, e: &mut Emit) -> Result<()> {
