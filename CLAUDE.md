@@ -72,25 +72,57 @@ suite. It runs the command in a systemd scope with `MemoryMax=100G` so an
 accidental blowup kills the process rather than the machine.
 
 ```bash
-cargo nextest run <filter>                                      # DEV LOOP, 0.2 s
-./safe-run.sh -- cargo nextest run --release                    # full, 123 s
+cargo nextest run <filter>                                      # DEV LOOP, 1.3 s
+./safe-run.sh -- cargo nextest run --cargo-profile quick         # full, 47 s
 ./safe-run.sh -- cargo nextest run --release --run-ignored all  # THE GATE
 ./safe-run.sh -- ./target/release/celeste-rust -n 40
 ```
 
-**Use a debug build AND a filter for the edit loop** (e.g.
-`cargo nextest run transpile::graph`): debug builds in 16 s against
-release's 105 s, and a filtered run is milliseconds. Measured 2026-08-22:
+### Iterating quickly - read this before running anything
 
-| config | build | run | total |
-|---|---|---|---|
-| release, full | 105 s | 18 s | 123 s |
-| debug, full | 16 s | 153 s | 169 s |
-| debug + filter | 16 s cold | 0.005 s | **0.20 s** |
+**Pick the cheapest thing that answers your question.** Three profiles,
+and the mistake is always reaching for the most expensive one out of
+habit. Measured 2026-08-22, after the crate split:
 
-Do NOT run the full suite in debug: it is compute-bound, and
-`compiled_forward_reproduces_the_interpreter` alone goes 18 s -> 153 s.
-Debug wins only when a filter keeps those tests out of the run.
+| what you want | command | cost |
+|---|---|---|
+| "did my edit compile and does its unit test pass" | `cargo nextest run <filter>` (DEBUG) | **1.3 s** after an edit, 0.2 s no-op |
+| "does the whole suite still pass" | `cargo nextest run --cargo-profile quick` | **47 s** build + run |
+| the pre-commit gate, and anything you will quote a number from | `--release --run-ignored all` | ~110 s build + ~250 s |
+
+**Never use `--release` for unit tests.** This is the actual trap. The
+release profile is `lto = "fat"` + `codegen-units = 1`, so a one-line edit
+relinks the whole workspace - ~100 s to run a test that EXECUTES in 6 ms.
+I did this repeatedly on 2026-08-22 before noticing. `[profile.quick]`
+exists for when a test genuinely needs optimization (the compute-bound
+ones: `compiled_forward_reproduces_the_interpreter`,
+`shape_variant_dispatch_reproduces_the_baseline`, `generated_is_current`).
+
+Do NOT run the full suite in plain debug: those same tests are
+compute-bound and `compiled_forward` alone goes 20 s -> 153 s. Debug wins
+when a filter keeps them out; `--cargo-profile quick` wins when it cannot.
+
+**`--release` is for the gate and for benchmarks only.** Every number in
+BENCHMARK_DATA.md was measured under it. Never make `[profile.release]`
+cheaper to speed the loop up - that silently reprices every recorded
+result. Add a profile instead.
+
+**Other things that cost more than they look:**
+
+- **One cargo at a time.** A `cargo build` started while a background
+  `nextest` is still building will contend on the lock and can swap the
+  binary under a running A/B measurement. On 2026-08-22 this invalidated
+  a benchmark side and it had to be re-run. Background long jobs, then
+  leave the build directory alone until they finish.
+- **Background anything over ~30 s** (`run_in_background: true`) and use
+  a Monitor with an until-loop to wait. Do not poll in a loop.
+- **`touch` the file you care about** to measure what an edit really
+  costs: `touch src/transpile/lower.rs && time cargo nextest run transpile`.
+  Guessing at build cost is how the stale table this replaced survived.
+- **`./regen-generated.sh` is ~2 min**, of which ~1m45 is two release
+  builds and only ~29 s is the nine generation jobs (which now run in
+  parallel). If you only need ONE kernel, call `transpile` directly
+  instead of running the whole script.
 
 Three slow tests are `#[ignore]`d so the default run is 18 s rather than
 204 s: `every_checked_in_recipe_replays` (~200 s) and
@@ -138,13 +170,25 @@ load-bearing, not cosmetic:
 ```
 crates/celeste-core      pico8_num, cart_data, collision_cache   deps: -
 crates/celeste-names     GENERATED name tables                   deps: -
+crates/celeste-ir        ir, frontend (Lua -> IR), builtins,     deps: core
+                         print
+crates/celeste-interp    the INTERPRETER (the oracle),           deps: core, ir
+                         game_runner, its instrumentation
 crates/celeste-engine    Rt2 block model, boundary/dedup/merge,  deps: core, names
                          row keys, kernel.rs lane primitives
 crates/celeste-kernels   GENERATED per-class lane kernels        deps: core, engine
-.  (celeste-rust)        interpreter, rewrite machinery,         deps: core (+ the
-                         transpile emitters, campaign bins       rest, as P1 lands)
+.  (celeste-rust)        rewrite machinery, transpile emitters,  deps: all
+                         compiled dispatch, campaign bins
 native-probe             bench/gate binary for the engine        deps: all
 ```
+
+The split is HALF DONE (plans/tracing.md stage 1). Still to come out:
+`celeste-rewrite` (~38k lines, the rules) and `celeste-transpile` (~6k,
+the emitters), which is the pair that actually makes the edit loop small.
+Two cycles block them: `rewrite -> compiled` (4 sites in verify.rs and
+checkpoint.rs, all of which test the COMPILED path and belong upstairs)
+and `compiled -> rewrite` (`Program`, which wants to move down;
+`StateMapping`, which needs a home).
 
 One frame of the abstract search is `celeste_rust::compiled::FrameEngine`
 `::step` - `(shape, rows) -> [(shape, rows)]`, the generated class kernels
