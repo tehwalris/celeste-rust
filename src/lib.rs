@@ -3,6 +3,7 @@ pub mod compiled;
 pub mod concrete;
 pub mod metrics;
 pub mod rewrite;
+pub mod trace;
 pub mod transpile;
 
 // The leaf types moved DOWN to `celeste-core` (task #150) so the engine
