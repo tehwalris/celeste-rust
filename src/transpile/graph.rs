@@ -201,6 +201,80 @@ impl Graph {
         mask
     }
 
+    /// Rebuild this graph into `out` with the button bits replaced by
+    /// constants, folding as it goes. Returns the mapping old -> new.
+    ///
+    /// This is the "duplicate, then fuse again" step: `out` is SHARED
+    /// across all 2^6 specializations and hash-consed, so two button
+    /// combinations that compute the same thing land on the SAME node ids,
+    /// and comparing their output tuples decides whether they are the same
+    /// successor state for every lane. E.g. `input` is
+    /// `Sel(right, 1, Sel(left, -1, 0))`, so with right = true the whole
+    /// thing folds to 1 whatever left is: {left,right} and {right} collapse.
+    pub fn specialize_into(&self, buttons: u8, out: &mut Graph) -> Vec<NodeId> {
+        let mut map: Vec<NodeId> = Vec::with_capacity(self.nodes.len());
+        for node in &self.nodes {
+            let id = match node.op {
+                Op::Button(b) => out.leaf(Op::ConstBool(buttons & (1 << b) != 0)),
+                _ => {
+                    let args: Vec<NodeId> =
+                        node.args.iter().map(|a| map[*a as usize]).collect();
+                    out.fold(node.op.clone(), args)
+                }
+            };
+            map.push(id);
+        }
+        map
+    }
+
+    /// Add `op(args)`, folding the cases a button substitution unlocks.
+    /// Conservative: anything not folded here is still CORRECT, just less
+    /// collapsed, so this understates sharing rather than inventing it.
+    pub fn fold(&mut self, op: Op, args: Vec<NodeId>) -> NodeId {
+        let cbool = |g: &Graph, i: usize| -> Option<bool> {
+            args.get(i).and_then(|a| match g.nodes[*a as usize].op {
+                Op::ConstBool(b) => Some(b),
+                _ => None,
+            })
+        };
+        match op {
+            // The one that matters: a decided condition picks its arm, so
+            // the other arm (and whatever only it used) disappears.
+            Op::Sel => {
+                if let Some(c) = cbool(self, 0) {
+                    return if c { args[1] } else { args[2] };
+                }
+            }
+            Op::Not => {
+                if let Some(b) = cbool(self, 0) {
+                    return self.leaf(Op::ConstBool(!b));
+                }
+            }
+            Op::And | Op::Or => {
+                let (x, y) = (cbool(self, 0), cbool(self, 1));
+                let is_and = matches!(op, Op::And);
+                // Absorbing element decides it even if the other side is
+                // symbolic: false AND anything, true OR anything.
+                if x == Some(!is_and) || y == Some(!is_and) {
+                    return self.leaf(Op::ConstBool(!is_and));
+                }
+                match (x, y) {
+                    (Some(_), Some(_)) => return self.leaf(Op::ConstBool(is_and)),
+                    (Some(_), None) => return args[1],
+                    (None, Some(_)) => return args[0],
+                    _ => {}
+                }
+            }
+            Op::Known => {
+                if cbool(self, 0).is_some() {
+                    return self.leaf(Op::ConstBool(true));
+                }
+            }
+            _ => {}
+        }
+        self.add(op, args)
+    }
+
     /// Resolve an emitted operand spelling to a node: a name the emitter
     /// already bound, a witness field access (`u.cN` / `rin.cN`), or a
     /// literal. Anything else is an error - silently inventing a node here

@@ -2177,12 +2177,35 @@ fn render(e: &Emit) -> Result<String> {
     }
     let out_nodes = n_out;
     let bits: Vec<u8> = (0..6).filter(|b| live & (1 << b) != 0).collect();
+    // How many of the 2^6 button combinations are actually DISTINCT?
+    // Specialize on each mask into one shared hash-consed arena and compare
+    // the output tuples: equal tuples mean the same successor for every
+    // lane, so the variants could collapse.
+    let mut shared = Graph::new();
+    let mut sigs: std::collections::BTreeMap<Vec<NodeId>, Vec<u8>> = Default::default();
+    for m in 0u8..64 {
+        let map = e.graph.specialize_into(m, &mut shared);
+        let mut sig: Vec<NodeId> = Vec::with_capacity(out_fields.len());
+        for (_cell, _ty, expr, _t) in out_fields.iter() {
+            match e.node_of.get(expr.as_str()) {
+                Some(n) => sig.push(map[*n as usize]),
+                None => {
+                    // a raw button bit written through: its VALUE under m
+                    let bit: u8 = expr.strip_prefix("kb").unwrap().parse().unwrap();
+                    sig.push(u32::MAX - ((m >> bit) & 1) as u32);
+                }
+            }
+        }
+        sigs.entry(sig).or_default().push(m);
+    }
     eprintln!(
-        "graph: {} nodes, {} out cells; buttons reaching an output {:?} -> {} variant(s)",
+        "graph: {} nodes, {} out cells; buttons reaching an output {:?} -> {} variant(s); \
+         DISTINCT button combinations: {}/64",
         e.graph.len(),
         out_nodes,
         bits,
         1usize << bits.len(),
+        sigs.len(),
     );
     Ok(out)
 }
