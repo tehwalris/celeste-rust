@@ -1,0 +1,957 @@
+//! Graph -> emitted kernel body (`plans/multi-output-fusion.md`, P1').
+//!
+//! The emitter's walk (`transpile::kernel::emit_walk`) evaluates `__frame`
+//! against the shape witness and, as it goes, records what each value MEANS
+//! as a node in `transpile::graph`. This module turns that graph back into
+//! the lines of a class kernel. The walk decides semantics; this decides
+//! representation and placement, and nothing else.
+//!
+//! Three things the old text-streaming emitter conflated are separate here,
+//! and that separation is the whole point:
+//!
+//! * **Representation is DERIVED, not chosen.** Whether a value is a
+//!   block-uniform `P8` or a 16-lane `ZN`, an exact number or an interval,
+//!   is a fixed point over the graph: uniform until a per-lane input
+//!   reaches it, exact until an interval does. `zn_splat`/`zi_of_zn` and
+//!   friends are then COERCIONS at use sites, not nodes - which is why the
+//!   graph has ~35% fewer nodes than the emitted text had lets.
+//!
+//! * **Placement is DERIVED too.** A node sits at the shallowest scope its
+//!   operands allow: outside the fork loops if it depends on no fork,
+//!   outside the button suffix if it depends on no button. `Graph::
+//!   fork_cones` and `Graph::button_cones` are the same reachability
+//!   computation over the two kinds of specialization, and the old
+//!   "prefix/suffix taint" was one hand-maintained special case of it.
+//!
+//! * **Validity is a VALUE.** Every condition under which the abstract
+//!   domain gave up is a conjunct of the walk's `ok` node. This module
+//!   renders each conjunct as a guard - `*bd` when the condition is
+//!   block-uniform, `dp` when it is per-lane - unless the primitive that
+//!   produced it already carries the deopt (`zi_flr(.., &mut dp)` and
+//!   friends), which the walk records in `Emit::discharge`. A conjunct
+//!   that is neither discharged nor renderable is an ERROR: losing a guard
+//!   is unsound, so the failure has to be loud.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use anyhow::{bail, Result};
+
+use super::graph::{Graph, NodeId, Op};
+use super::kernel::{Emit, Line, OutFields};
+
+/// Which of the two value domains a node lives in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Dom {
+    Num,
+    Bool,
+}
+
+/// A node's runtime representation. Both flags are over-approximations in
+/// the safe direction: `lane` false means the value is PROVABLY the same in
+/// every lane, `wide` false means it is PROVABLY a single element.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Repr {
+    dom: Dom,
+    /// Per-lane (16 rows per slice) rather than block-uniform.
+    lane: bool,
+    /// An interval (numbers) or a tri-state (booleans) rather than exact.
+    wide: bool,
+}
+
+impl Repr {
+    fn num(lane: bool, wide: bool) -> Self {
+        Repr { dom: Dom::Num, lane, wide }
+    }
+    fn boolean(lane: bool, wide: bool) -> Self {
+        Repr { dom: Dom::Bool, lane, wide }
+    }
+    /// The generated Rust type. A per-lane boolean is always `ZB`, which
+    /// carries its own `known` mask, so `wide` does not change the type
+    /// there - only what the guards have to say about it.
+    pub(crate) fn ty(self) -> &'static str {
+        match (self.dom, self.lane, self.wide) {
+            (Dom::Num, false, false) => "P8",
+            (Dom::Num, false, true) => "(P8, P8)",
+            (Dom::Num, true, false) => "ZN",
+            (Dom::Num, true, true) => "ZI",
+            (Dom::Bool, false, false) => "bool",
+            (Dom::Bool, false, true) => "Option<bool>",
+            (Dom::Bool, true, _) => "ZB",
+        }
+    }
+    /// Is `self` at least as coarse as `other` - can an `other` value be
+    /// coerced up to it without losing information?
+    fn admits(self, other: Repr) -> bool {
+        self.dom == other.dom && self.lane >= other.lane && self.wide >= other.wide
+    }
+}
+
+/// Coerce an expression of representation `from` to `to`. Every case here
+/// is a widening: a splat repeats a uniform value across the lanes, an
+/// interval lift makes a singleton interval. There is no narrowing - a
+/// caller that wants one has a derivation bug, and gets an error.
+fn coerce(expr: &str, from: Repr, to: Repr) -> Result<String> {
+    // Same generated type, nothing to do. This is not the same test as
+    // `from == to`: a per-lane boolean carries its own `known` mask, so
+    // `ZB` covers both widths and only the guards can tell them apart.
+    if from.ty() == to.ty() {
+        return Ok(expr.to_string());
+    }
+    if !to.admits(from) {
+        bail!("cannot represent a {} as a {}", from.ty(), to.ty());
+    }
+    Ok(match (to.dom, from.lane, from.wide, to.lane, to.wide) {
+        (Dom::Num, false, false, false, true) => format!("({e}, {e})", e = expr),
+        (Dom::Num, false, false, true, false) => format!("zn_splat({})", expr),
+        (Dom::Num, false, false, true, true) => format!("zi_splat({e}, {e})", e = expr),
+        (Dom::Num, false, true, true, true) => format!("zi_splat({e}.0, {e}.1)", e = expr),
+        (Dom::Num, true, false, true, true) => format!("zi_of_zn({})", expr),
+        (Dom::Bool, false, false, false, true) => format!("Some({})", expr),
+        (Dom::Bool, false, false, true, _) => format!("zb_splat({})", expr),
+        // A block-uniform tri-state broadcast into lanes: undecided becomes
+        // every lane undecided, which is what the guards then act on. No
+        // class kernel needs this today - the walk decides a uniform
+        // tri-state before it reaches a per-lane site - but leaving the
+        // table with a hole in it means the next member that DOES need it
+        // fails at emit time with "no coercion" instead of just working.
+        (Dom::Bool, false, true, true, _) => format!(
+            "ZB {{ val: if {e} == Some(true) {{ ALL }} else {{ 0 }},              known: if {e}.is_some() {{ ALL }} else {{ 0 }} }}",
+            e = expr
+        ),
+        _ => bail!("no coercion from {} to {}", from.ty(), to.ty()),
+    })
+}
+
+struct Ctx<'a> {
+    g: &'a Graph,
+    /// Witness cell kinds, for the leaf representations.
+    uni: &'a BTreeMap<u32, &'static str>,
+    vary: &'a BTreeMap<u32, &'static str>,
+    repr: Vec<Repr>,
+    name: Vec<Option<String>>,
+    expr: Vec<Option<String>>,
+}
+
+impl<'a> Ctx<'a> {
+    fn r(&self, id: NodeId) -> Repr {
+        self.repr[id as usize]
+    }
+    fn args(&self, id: NodeId) -> &'a [NodeId] {
+        &self.g.get(id).args
+    }
+    /// Read operand `k` of `id` at representation `want`.
+    fn at(&self, id: NodeId, k: usize, want: Repr) -> Result<String> {
+        let a = self.args(id)[k];
+        let e = self.expr[a as usize]
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("node {} reads unemitted node {}", id, a))?;
+        coerce(e, self.r(a), want)
+    }
+    /// Read operand `k` at its own representation.
+    fn raw(&self, id: NodeId, k: usize) -> Result<String> {
+        let a = self.args(id)[k];
+        self.expr[a as usize]
+            .as_deref()
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow::anyhow!("node {} reads unemitted node {}", id, a))
+    }
+
+    /// The representation of a node, from its op and its operands'. This is
+    /// the abstract interpreter's own type rule, written once instead of
+    /// once per emit site.
+    fn derive(&self, id: NodeId) -> Result<Repr> {
+        let op = &self.g.get(id).op;
+        let a = self.args(id);
+        // The common numeric shape: per-lane if any operand is, interval if
+        // any operand is.
+        let joined = |dom: Dom| -> Repr {
+            Repr {
+                dom,
+                lane: a.iter().any(|x| self.r(*x).lane),
+                wide: a.iter().any(|x| self.r(*x).wide),
+            }
+        };
+        Ok(match op {
+            Op::Const(lo, hi) => Repr::num(false, lo != hi),
+            Op::ConstBool(_) | Op::Button(_) => Repr::boolean(false, false),
+            Op::Cell(c) => {
+                if let Some(kind) = self.vary.get(c) {
+                    match *kind {
+                        "num" => Repr::num(true, false),
+                        "bool" => Repr::boolean(true, false),
+                        other => bail!("varying cell {} has kind {:?}", c, other),
+                    }
+                } else if let Some(kind) = self.uni.get(c) {
+                    match *kind {
+                        "num" => Repr::num(false, false),
+                        "ival" => Repr::num(false, true),
+                        "bool" => Repr::boolean(false, false),
+                        other => bail!("uniform cell {} has kind {:?}", c, other),
+                    }
+                } else {
+                    bail!("cell {} is neither a uniform nor a varying witness input", c)
+                }
+            }
+            // A fork narrows an interval; the fragment is still an interval.
+            Op::Fork(_) => Repr::num(true, true),
+            Op::ForkValid(_) => Repr::boolean(true, false),
+            Op::ForkOk => Repr::boolean(true, false),
+            Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::Neg | Op::Abs | Op::Min
+            | Op::Max => joined(Dom::Num),
+            // flr of an interval is exact BY GUARD: the lane survives only
+            // where the floor is unique, and that condition is a conjunct
+            // of `ok` (rendered here, or discharged by `zi_flr`). So this
+            // is not an unchecked narrowing - it is the guard's postcondition.
+            Op::Flr => Repr::num(self.r(a[0]).lane, false),
+            // sin over an inexact input never reaches here: the walk
+            // replaces it with sin's RANGE as a constant.
+            Op::Sin => Repr::num(self.r(a[0]).lane, false),
+            Op::Mget => Repr::num(joined(Dom::Num).lane, false),
+            Op::TileFlagAt => {
+                Repr::boolean(self.r(a[0]).lane || self.r(a[1]).lane, false)
+            }
+            Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq => joined(Dom::Bool),
+            Op::Not => self.r(a[0]),
+            // The only AND the walk builds as a VALUE is `Known(x) AND x`,
+            // "x is definitely true", which is decided whatever x is.
+            Op::And => Repr::boolean(
+                a.iter().any(|x| self.r(*x).lane),
+                false,
+            ),
+            Op::Sel => {
+                let (t, f) = (self.r(a[1]), self.r(a[2]));
+                if t.dom != f.dom {
+                    bail!("select arms disagree on domain: {} vs {}", t.ty(), f.ty());
+                }
+                Repr {
+                    dom: t.dom,
+                    lane: self.r(a[0]).lane || t.lane || f.lane,
+                    wide: t.wide || f.wide,
+                }
+            }
+            Op::Known => Repr::boolean(self.r(a[0]).lane, false),
+        })
+    }
+
+    /// The RHS of node `id`'s `let`.
+    fn render(&self, id: NodeId) -> Result<String> {
+        let op = self.g.get(id).op.clone();
+        let out = self.r(id);
+        let lane = out.lane;
+        let a = self.args(id).to_vec();
+        Ok(match op {
+            Op::Add | Op::Sub | Op::Min | Op::Max => {
+                let (x, y) = (self.at(id, 0, out)?, self.at(id, 1, out)?);
+                let (zn, zi, sn, si) = match op {
+                    Op::Add => ("zn_add", "zi_add", "+", "si_add"),
+                    Op::Sub => ("zn_sub", "zi_sub", "-", "si_sub"),
+                    Op::Min => ("zn_min", "zi_min", "min", ""),
+                    Op::Max => ("zn_max", "zi_max", "max", ""),
+                    _ => unreachable!(),
+                };
+                match (lane, out.wide) {
+                    (true, false) => format!("{}({}, {})", zn, x, y),
+                    (true, true) => format!("{}({}, {})", zi, x, y),
+                    (false, false) if si.is_empty() => format!("{}.{}({})", x, sn, y),
+                    (false, false) => format!("{} {} {}", x, sn, y),
+                    (false, true) if si.is_empty() => {
+                        format!("({x}.0.{f}({y}.0), {x}.1.{f}({y}.1))", x = x, y = y, f = sn)
+                    }
+                    (false, true) => format!("{}({}, {})", si, x, y),
+                }
+            }
+            // Multiply and divide have an interval arm only for a POSITIVE
+            // scalar (the interval helpers are monotone only there), which
+            // is why the walk records `scalar > 0` as an ok conjunct.
+            Op::Mul | Op::Div if out.wide => {
+                let iv = Repr::num(lane, true);
+                let num = Repr::num(lane, false);
+                let (x, y) = (self.at(id, 0, iv)?, self.at(id, 1, num)?);
+                let (zf, sf) = if matches!(op, Op::Mul) {
+                    ("zi_mul_pos", "scale_positive")
+                } else {
+                    ("zi_div_pos", "div_positive")
+                };
+                if lane {
+                    format!("{}({}, {}, &mut dp)", zf, x, y)
+                } else {
+                    format!(
+                        "{{ let r = IV::new({x}.0, {x}.1).{f}({y}); (r.low, r.high) }}",
+                        x = x, y = y, f = sf
+                    )
+                }
+            }
+            Op::Mul | Op::Div | Op::Rem => {
+                if out.wide {
+                    bail!("{:?} of intervals has no lowering (only interval * positive num)", op);
+                }
+                let (x, y) = (self.at(id, 0, out)?, self.at(id, 1, out)?);
+                let (zn, sn) = match op {
+                    Op::Mul => ("zn_mul", "*"),
+                    Op::Div => ("zn_div", "/"),
+                    _ => ("zn_rem", "%"),
+                };
+                if lane {
+                    format!("{}({}, {})", zn, x, y)
+                } else {
+                    format!("{} {} {}", x, sn, y)
+                }
+            }
+            Op::Neg => {
+                let x = self.at(id, 0, out)?;
+                match (lane, out.wide) {
+                    (true, false) => format!("zn_neg({})", x),
+                    (true, true) => format!("zi_neg({})", x),
+                    (false, false) => format!("-{}", x),
+                    (false, true) => format!("(-{x}.1, -{x}.0)", x = x),
+                }
+            }
+            Op::Abs => {
+                let x = self.at(id, 0, out)?;
+                match (lane, out.wide) {
+                    (true, false) => format!("zn_abs({})", x),
+                    (true, true) => format!("zi_abs({})", x),
+                    (false, false) => format!("{}.abs()", x),
+                    (false, true) => bail!("abs of a block-uniform interval has no lowering"),
+                }
+            }
+            Op::Flr => {
+                let src = self.r(a[0]);
+                match (src.lane, src.wide) {
+                    // The deopt is inside the call: this IS the guard for
+                    // the `Known(flr)` conjunct (see `Emit::discharge`).
+                    (true, true) => format!("zi_flr({}, &mut dp)", self.raw(id, 0)?),
+                    (true, false) => format!("zn_flr({})", self.raw(id, 0)?),
+                    // The uniform interval's guard is a separate line; here
+                    // the low endpoint's floor IS the floor, given it.
+                    (false, true) => format!("{}.0.flr()", self.raw(id, 0)?),
+                    (false, false) => format!("{}.flr()", self.raw(id, 0)?),
+                }
+            }
+            Op::Sin => {
+                let x = self.at(id, 0, out)?;
+                if lane {
+                    format!("zn_sin({})", x)
+                } else {
+                    format!("{}.pico8_sin()", x)
+                }
+            }
+            Op::Mget => {
+                let n = Repr::num(lane, false);
+                let (x, y) = (self.at(id, 0, n)?, self.at(id, 1, n)?);
+                if lane {
+                    format!("zn_mget(g.cart, {}, {})", x, y)
+                } else {
+                    format!("P8::from_i16(g.cart.mget({}, {}).expect(\"mget\") as i16)", x, y)
+                }
+            }
+            Op::TileFlagAt => {
+                // x/y vary; the box and the flag are always block-uniform
+                // exact numbers (the walk lifts them with `sn`).
+                let u = Repr::num(false, false);
+                let (w, h, f) = (self.at(id, 2, u)?, self.at(id, 3, u)?, self.at(id, 4, u)?);
+                let z = Repr::num(true, false);
+                let (x, y) = (self.at(id, 0, z)?, self.at(id, 1, z)?);
+                if lane {
+                    format!("zn_tile_flag_at(g.cache, g.cart, {}, {}, {}, {}, {})", x, y, w, h, f)
+                } else {
+                    format!(
+                        "{{ let z = zn_tile_flag_at(g.cache, g.cart, {}, {}, {}, {}, {}); \
+                         z.val & 1 != 0 }}",
+                        x, y, w, h, f
+                    )
+                }
+            }
+            Op::Lt | Op::Le | Op::Gt | Op::Ge => {
+                let sub = Repr::num(
+                    self.r(a[0]).lane || self.r(a[1]).lane,
+                    self.r(a[0]).wide || self.r(a[1]).wide,
+                );
+                let (x, y) = (self.at(id, 0, sub)?, self.at(id, 1, sub)?);
+                let (cmp, zn, sym) = match op {
+                    Op::Lt => ("Lt", "zn_lt", "<"),
+                    Op::Le => ("Le", "zn_le", "<="),
+                    Op::Gt => ("Gt", "zn_gt", ">"),
+                    _ => ("Ge", "zn_ge", ">="),
+                };
+                match (sub.lane, sub.wide) {
+                    (true, true) => format!("zi_cmp(Cmp::{}, {}, {})", cmp, x, y),
+                    (true, false) => format!("{}({}, {})", zn, x, y),
+                    (false, true) => format!("si_cmp(Cmp::{}, {}, {})", cmp, x, y),
+                    (false, false) => format!("{} {} {}", x, sym, y),
+                }
+            }
+            Op::Eq => {
+                let da = self.r(a[0]).dom;
+                let sub = Repr {
+                    dom: da,
+                    lane: self.r(a[0]).lane || self.r(a[1]).lane,
+                    wide: self.r(a[0]).wide || self.r(a[1]).wide,
+                };
+                if da == Dom::Num && sub.wide {
+                    // The walk folds interval equality to `false` at emit
+                    // time (two intervals are never EQUAL as abstract
+                    // values), so there is nothing to lower here.
+                    bail!("equality on intervals has no lowering");
+                }
+                let (x, y) = (self.at(id, 0, sub)?, self.at(id, 1, sub)?);
+                match (da, sub.lane) {
+                    (Dom::Num, true) => format!("zn_eq({}, {})", x, y),
+                    (Dom::Bool, true) => format!("zb_eq({}, {})", x, y),
+                    (_, false) => format!("{} == {}", x, y),
+                }
+            }
+            Op::Not => {
+                let x = self.raw(id, 0)?;
+                let src = self.r(a[0]);
+                match (src.lane, src.wide) {
+                    (true, _) => format!("zb_not({})", x),
+                    (false, false) => format!("!{}", x),
+                    (false, true) => format!("{}.map(|b| !b)", x),
+                }
+            }
+            Op::And => {
+                // `Known(x) AND x` - "x is definitely true". Any other AND
+                // is a validity conjunct, flattened rather than rendered.
+                let (k, v) = (a[0], a[1]);
+                let inner = match &self.g.get(k).op {
+                    Op::Known if self.g.get(k).args[0] == v => v,
+                    _ => bail!(
+                        "AND of {} and {} is not the definitely-true idiom",
+                        k, v
+                    ),
+                };
+                let src = self.r(inner);
+                let x = self.expr[inner as usize].as_deref().unwrap();
+                match (src.lane, src.wide) {
+                    (true, _) => format!("ZB {{ val: {x}.val & {x}.known, known: ALL }}", x = x),
+                    (false, true) => format!("{}.unwrap_or(false)", x),
+                    (false, false) => x.to_string(),
+                }
+            }
+            Op::Sel => {
+                let arms = Repr {
+                    dom: out.dom,
+                    lane: out.lane,
+                    wide: out.wide,
+                };
+                let (t, f) = (self.at(id, 1, arms)?, self.at(id, 2, arms)?);
+                let c = self.r(a[0]);
+                if c.lane {
+                    // Deopts an undecided lane, which is the `Known(cond)`
+                    // conjunct the walk discharges against this node.
+                    let cv = self.raw(id, 0)?;
+                    let f_ = match (out.dom, out.lane, out.wide) {
+                        (Dom::Num, true, true) => "zsel_i",
+                        (Dom::Num, true, false) => "zsel_n",
+                        (Dom::Bool, true, _) => "zsel_b",
+                        _ => bail!("per-lane condition with block-uniform arms"),
+                    };
+                    format!("{}({}, {}, {}, &mut dp)", f_, cv, t, f)
+                } else if c.wide {
+                    bail!("select on a block-uniform tri-state: the walk decides it first")
+                } else {
+                    format!("if {} {{ {} }} else {{ {} }}", self.raw(id, 0)?, t, f)
+                }
+            }
+            Op::Known => {
+                let src = self.r(a[0]);
+                let x = self.raw(id, 0)?;
+                match (src.lane, src.dom, src.wide) {
+                    (true, _, _) => format!("ZB {{ val: {}.known, known: ALL }}", x),
+                    (false, Dom::Bool, true) => format!("{}.is_some()", x),
+                    (false, Dom::Num, true) => format!("{x}.0 == {x}.1", x = x),
+                    (false, _, false) => "true".to_string(),
+                }
+            }
+            Op::Const(..) | Op::ConstBool(_) | Op::Cell(_) | Op::Button(_) => {
+                bail!("node {} is an inline leaf and needs no let", id)
+            }
+            Op::Fork(_) | Op::ForkValid(_) => {
+                bail!("node {} is part of a fork group, emitted as one unit", id)
+            }
+            Op::ForkOk => bail!("ForkOk is only ever discharged by zi_fork_flr"),
+        })
+    }
+}
+
+/// The inline reading of a leaf, or None if the node needs a `let`.
+fn inline(g: &Graph, id: NodeId, r: Repr) -> Option<String> {
+    match &g.get(id).op {
+        Op::Const(lo, hi) => Some(if lo == hi {
+            format!("P8::from_raw({}i32)", lo)
+        } else {
+            format!("(P8::from_raw({}i32), P8::from_raw({}i32))", lo, hi)
+        }),
+        Op::ConstBool(b) => Some(format!("{}", b)),
+        Op::Button(b) => Some(format!("kb{}", b)),
+        // A varying cell is loaded once into `r_cN` at the top of the
+        // frame; a uniform one is a field of the bound `Uni`.
+        Op::Cell(c) => Some(if r.lane {
+            format!("r_c{}", c)
+        } else {
+            format!("u.c{}", c)
+        }),
+        _ => None,
+    }
+}
+
+/// Split `ok` into the conditions it is the AND of. `Known(x)` is dropped
+/// when `x` is itself a conjunct: guarding "x is definitely true" already
+/// implies "x is decided", so keeping both would emit the same mask twice.
+fn conjuncts(g: &Graph, ok: NodeId) -> Vec<NodeId> {
+    fn walk(g: &Graph, n: NodeId, out: &mut Vec<NodeId>) {
+        match &g.get(n).op {
+            Op::And => {
+                for a in &g.get(n).args {
+                    walk(g, *a, out);
+                }
+            }
+            // The identity of the chain.
+            Op::ConstBool(true) => {}
+            _ => out.push(n),
+        }
+    }
+    let mut all = Vec::new();
+    walk(g, ok, &mut all);
+    let mut seen = BTreeSet::new();
+    all.retain(|n| seen.insert(*n));
+    let set: BTreeSet<NodeId> = all.iter().copied().collect();
+    all.retain(|n| match &g.get(*n).op {
+        Op::Known => !set.contains(&g.get(*n).args[0]),
+        _ => true,
+    });
+    all
+}
+
+/// Nodes reachable from `roots`, walking operands.
+fn reachable(g: &Graph, roots: &[NodeId]) -> Vec<bool> {
+    let mut live = vec![false; g.len()];
+    let mut stack: Vec<NodeId> = roots.to_vec();
+    while let Some(n) = stack.pop() {
+        if live[n as usize] {
+            continue;
+        }
+        live[n as usize] = true;
+        stack.extend(g.get(n).args.iter().copied());
+    }
+    live
+}
+
+/// Does emitting `carrier` enforce `cond` all by itself? The walk PROPOSES
+/// a carrier per condition; only the representation the carrier ends up
+/// with decides. `zi_flr` takes `&mut dp`, `v.0.flr()` does not, and the
+/// same `Known(flr)` conjunct rides on the first and needs its own line
+/// after the second.
+fn discharges(g: &Graph, repr: &[Repr], cond: NodeId, carrier: NodeId) -> bool {
+    let c = g.get(carrier);
+    match &c.op {
+        // zsel_*(.., &mut dp) deopts undecided lanes.
+        Op::Sel => repr[c.args[0] as usize].lane && matches!(g.get(cond).op, Op::Known),
+        // zi_flr(.., &mut dp) deopts straddling lanes.
+        Op::Flr => repr[c.args[0] as usize].lane && repr[c.args[0] as usize].wide,
+        // zi_mul_pos / zi_div_pos deopt non-positive multiplier lanes.
+        Op::Mul | Op::Div => repr[carrier as usize].lane && repr[carrier as usize].wide,
+        // zi_fork_flr deopts lanes spanning more than two floors.
+        Op::Fork(_) => matches!(g.get(cond).op, Op::ForkOk),
+        _ => false,
+    }
+}
+
+/// The line that enforces one validity conjunct.
+fn guard_line(ctx: &Ctx, cond: NodeId) -> Result<Option<String>> {
+    let g = ctx.g;
+    // "This interval has a unique floor" reads the INTERVAL, not the
+    // (already narrowed) floor value, so it is matched structurally rather
+    // than by the conjunct's own representation.
+    if let Op::Known = &g.get(cond).op {
+        let inner = g.get(cond).args[0];
+        if let Op::Flr = &g.get(inner).op {
+            let src = g.get(inner).args[0];
+            let r = ctx.r(src);
+            if r.wide {
+                let x = ctx.expr[src as usize].as_deref().unwrap();
+                return Ok(Some(if r.lane {
+                    format!("zi_split_flr({}, &mut dp);", x)
+                } else {
+                    format!("if {x}.0.flr() != {x}.1.flr() {{ *bd = true; }}", x = x)
+                }));
+            }
+        }
+    }
+    // "Is this value decided?" of something that is exact by derivation is
+    // vacuously true - the walk asks it uniformly and the graph answers.
+    if let Op::Known = &g.get(cond).op {
+        let src = ctx.r(g.get(cond).args[0]);
+        if !src.wide && !src.lane {
+            return Ok(None);
+        }
+    }
+    let r = ctx.r(cond);
+    if r.dom != Dom::Bool {
+        bail!("validity conjunct {} is a {}, not a condition", cond, r.ty());
+    }
+    let x = ctx.expr[cond as usize]
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("validity conjunct {} was not emitted", cond))?;
+    Ok(Some(match (r.lane, r.wide, &g.get(cond).op) {
+        // A whole-slice impossibility: the kernel has no lowering at all
+        // for this lane, so the block takes the interpreter path.
+        (_, _, Op::ConstBool(false)) => "*bd = true; // the kernel cannot represent this".to_string(),
+        // zguard is exactly `dp |= !(known & val)`.
+        (true, _, _) => format!("zguard({}, &mut dp);", x),
+        (false, false, _) => format!("if !{} {{ *bd = true; }}", x),
+        (false, true, _) => format!("if {} != Some(true) {{ *bd = true; }}", x),
+    }))
+}
+
+/// Emit the whole body of one member: fills `e.pre` / `e.suf` (and the
+/// bookkeeping `render` reads off them) from the graph, and rewrites the
+/// output fields to name graph nodes.
+///
+/// `e.pre` holds everything a button variant does NOT observe, including
+/// the fork loop nest; `e.suf` holds the rest, and is emitted once per
+/// button variant. That two-way split is what stage C replaces with a
+/// per-node one - see the `binary split` line the emitter prints.
+pub(crate) fn emit_body(e: &mut Emit, of: &mut OutFields) -> Result<()> {
+    let n = e.graph.len();
+    let bcone = e.graph.button_cones();
+    let fcone = e.graph.fork_cones();
+
+    // --- representations, for EVERY node ---
+    // Representation is what decides whether a primitive carries its own
+    // deopt, so it has to be known before liveness: a conjunct the carrier
+    // discharges is not a root, one it does not carry IS.
+    let mut ctx = Ctx {
+        g: &e.graph,
+        uni: &e.uni,
+        vary: &e.vary_in,
+        repr: vec![Repr::num(false, false); n],
+        name: vec![None; n],
+        expr: vec![None; n],
+    };
+    for id in 0..n as NodeId {
+        ctx.repr[id as usize] = ctx.derive(id)?;
+    }
+
+    // --- what has to exist ---
+    let conj = conjuncts(&e.graph, e.ok);
+    let discharged: BTreeSet<NodeId> = conj
+        .iter()
+        .copied()
+        .filter(|c| {
+            e.discharge
+                .get(c)
+                .is_some_and(|k| discharges(&e.graph, &ctx.repr, *c, *k))
+        })
+        .collect();
+    let mut roots: Vec<NodeId> = of.fields.iter().map(|f| f.node).collect();
+    for c in &conj {
+        match e.discharge.get(c) {
+            // The carrier is what enforces it, so IT survives DCE - the
+            // condition itself need not be materialized at all.
+            Some(carrier) if discharged.contains(c) => roots.push(*carrier),
+            _ => roots.push(*c),
+        }
+    }
+    // The fork groups: their masks build the live-lane chain.
+    for id in 0..n as NodeId {
+        if matches!(e.graph.get(id).op, Op::Fork(_)) {
+            roots.push(id);
+        }
+    }
+    let live = reachable(&e.graph, &roots);
+
+    // --- names and inline forms ---
+    for id in 0..n as NodeId {
+        if !live[id as usize] {
+            continue;
+        }
+        let r = ctx.repr[id as usize];
+        match inline(ctx.g, id, r) {
+            Some(text) => ctx.expr[id as usize] = Some(text),
+            None => {
+                // The fork group is named by its DEPTH: the loop variable,
+                // the fragment and the mask are one unit, and the mask is
+                // not a value the rest of the body reads.
+                let name = match &ctx.g.get(id).op {
+                    Op::Fork(d) => format!("f{}", d),
+                    Op::ForkValid(d) => format!("f{}_fv", d),
+                    _ => format!("n{}", id),
+                };
+                ctx.expr[id as usize] = Some(name.clone());
+                ctx.name[id as usize] = Some(name);
+            }
+        }
+    }
+
+    // --- placement ---
+    // Level 0 is outside every fork loop; level d+1 is inside loops 0..=d.
+    let level = |id: NodeId| -> usize {
+        let m = fcone[id as usize];
+        if m == 0 {
+            0
+        } else {
+            8 - m.leading_zeros() as usize
+        }
+    };
+    let in_suffix = |id: NodeId| bcone[id as usize] != 0;
+
+    // --- emit ---
+    let depth = e.fork_depth;
+    let mut pre: Vec<Line> = Vec::new();
+    let mut suf: Vec<Line> = Vec::new();
+    let mut var_ty: std::collections::HashMap<String, &'static str> =
+        std::collections::HashMap::new();
+    let mut pre_defs: BTreeSet<String> = BTreeSet::new();
+    let mut tainted_vars: BTreeSet<String> = BTreeSet::new();
+
+    // Per-lane inputs materialize first; the whole body reads them by name.
+    for (id, kind) in &e.vary_in {
+        let (ty, load) = match *kind {
+            "num" => ("ZN", format!("let r_c{}: ZN = rin.c{};", id, id)),
+            "bool" => (
+                "ZB",
+                format!("let r_c{}: ZB = ZB {{ val: rin.c{}, known: ALL }};", id, id),
+            ),
+            other => bail!("varying cell {} has kind {:?}", id, other),
+        };
+        pre.push(Line::Raw(load));
+        var_ty.insert(format!("r_c{}", id), ty);
+        pre_defs.insert(format!("r_c{}", id));
+    }
+    for k in 0..6 {
+        tainted_vars.insert(format!("kb{}", k));
+    }
+
+    let mut valid_expr = "ALL".to_string();
+    for lvl in 0..=depth {
+        // Values, then the guards over them, then the next fork.
+        for id in 0..n as NodeId {
+            if !live[id as usize] || level(id) != lvl || in_suffix(id) {
+                continue;
+            }
+            if matches!(ctx.g.get(id).op, Op::Fork(_) | Op::ForkValid(_)) {
+                continue; // emitted as part of the fork group
+            }
+            emit_node(&ctx, &mut pre, &mut var_ty, id)?;
+        }
+        for c in &conj {
+            if level(*c) != lvl || in_suffix(*c) {
+                continue;
+            }
+            if discharged.contains(c) {
+                continue;
+            }
+            if let Some(line) = guard_line(&ctx, *c)? {
+                pre.push(Line::Raw(line));
+            }
+        }
+        if lvl == depth {
+            break;
+        }
+        // The fork group: open the loop, shadow the deopt channels so one
+        // configuration's failures do not leak into the next, narrow, and
+        // skip the configuration entirely when no lane lives in it.
+        let d = lvl;
+        let fork = (0..n as NodeId)
+            .find(|id| live[*id as usize] && matches!(ctx.g.get(*id).op, Op::Fork(x) if x as usize == d))
+            .ok_or_else(|| anyhow::anyhow!("fork depth {} has no node", d))?;
+        let fname = ctx.name[fork as usize].clone().unwrap();
+        let src = ctx.expr[ctx.g.get(fork).args[0] as usize].clone().unwrap();
+        pre.push(Line::Raw(format!("for c{} in 0..2usize {{", d)));
+        pre.push(Line::Raw("let mut dp = dp;".to_string()));
+        pre.push(Line::Raw("let mut bd_l: bool = *bd;".to_string()));
+        pre.push(Line::Raw("let bd: &mut bool = &mut bd_l;".to_string()));
+        pre.push(Line::Raw(format!(
+            "let ({f}, {f}_fv): (ZI, u16) = zi_fork_flr({s}, c{d}, &mut dp);",
+            f = fname, s = src, d = d
+        )));
+        pre.push(Line::Raw(format!(
+            "let valid{}: u16 = {} & {}_fv;",
+            d, valid_expr, fname
+        )));
+        pre.push(Line::Raw(format!("if valid{} == 0 {{ continue; }}", d)));
+        var_ty.insert(fname.clone(), "ZI");
+        var_ty.insert(format!("valid{}", d), "u16");
+        pre_defs.insert(fname);
+        pre_defs.insert(format!("valid{}", d));
+        valid_expr = format!("valid{}", d);
+    }
+    // Everything a button variant observes, at the innermost fork level.
+    for id in 0..n as NodeId {
+        if !live[id as usize] || !in_suffix(id) {
+            continue;
+        }
+        emit_node(&ctx, &mut suf, &mut var_ty, id)?;
+    }
+    for c in &conj {
+        if !in_suffix(*c) {
+            continue;
+        }
+        if discharged.contains(c) {
+            continue;
+        }
+        if let Some(line) = guard_line(&ctx, *c)? {
+            suf.push(Line::Raw(line));
+        }
+    }
+
+    // --- output fields, read at the representation the boundary wants ---
+    for f in of.fields.iter_mut() {
+        let want = repr_of_ty(f.ty)?;
+        let have = ctx.repr[f.node as usize];
+        if !want.admits(have) {
+            bail!(
+                "output cell {} wants a {} but the graph computes a {}",
+                f.cell, want.ty(), have.ty()
+            );
+        }
+        f.expr = coerce(ctx.expr[f.node as usize].as_deref().unwrap(), have, want)?;
+        // Taint from the CONE, not from where the value happened to be
+        // bound: a splat of a prefix value inside the suffix used to make a
+        // button-independent output look button-dependent.
+        f.tainted = bcone[f.node as usize] != 0;
+    }
+
+    for line in &pre {
+        if let Line::Let { name, .. } = line {
+            pre_defs.insert(name.clone());
+        }
+    }
+    for line in &suf {
+        if let Line::Let { name, .. } = line {
+            tainted_vars.insert(name.clone());
+        }
+    }
+    e.pre = pre;
+    e.suf = suf;
+    e.var_ty = var_ty;
+    e.pre_defs = pre_defs;
+    e.tainted_vars = tainted_vars;
+    e.valid_expr = valid_expr;
+    Ok(())
+}
+
+/// Let-bind one node.
+fn emit_node(
+    ctx: &Ctx,
+    buf: &mut Vec<Line>,
+    var_ty: &mut std::collections::HashMap<String, &'static str>,
+    id: NodeId,
+) -> Result<()> {
+    let Some(name) = ctx.name[id as usize].clone() else {
+        return Ok(()); // an inline leaf
+    };
+    let ty = ctx.r(id).ty();
+    buf.push(Line::Let { name: name.clone(), ty, expr: ctx.render(id)? });
+    var_ty.insert(name, ty);
+    Ok(())
+}
+
+/// The representation a generated Rust type stands for - the inverse of
+/// `Repr::ty`, used to check the boundary's expectation against the graph's
+/// derivation.
+fn repr_of_ty(ty: &str) -> Result<Repr> {
+    Ok(match ty {
+        "P8" => Repr::num(false, false),
+        "(P8, P8)" => Repr::num(false, true),
+        "ZN" => Repr::num(true, false),
+        "ZI" => Repr::num(true, true),
+        "bool" => Repr::boolean(false, false),
+        "Option<bool>" => Repr::boolean(false, true),
+        "ZB" => Repr::boolean(true, false),
+        other => bail!("no representation for the generated type {:?}", other),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn all_reprs() -> Vec<Repr> {
+        let mut v = Vec::new();
+        for dom in [Dom::Num, Dom::Bool] {
+            for lane in [false, true] {
+                for wide in [false, true] {
+                    v.push(Repr { dom, lane, wide });
+                }
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn the_type_table_and_its_inverse_agree() {
+        // `Repr::ty` feeds the generated code; `repr_of_ty` reads the
+        // BOUNDARY's expectation back. If they drift, an output cell can
+        // be written into a column of the wrong kind - which changes the
+        // row key, and a different row key is a different search.
+        for r in all_reprs() {
+            let back = repr_of_ty(r.ty()).unwrap();
+            // ZB is the one lossy entry: a per-lane boolean carries its own
+            // `known` mask, so both widths share a type.
+            if r.dom == Dom::Bool && r.lane {
+                assert_eq!(back.ty(), "ZB");
+            } else {
+                assert_eq!(back, r, "{} did not round-trip", r.ty());
+            }
+        }
+    }
+
+    #[test]
+    fn coercion_only_ever_widens() {
+        for from in all_reprs() {
+            for to in all_reprs() {
+                let out = coerce("x", from, to);
+                if from.ty() == to.ty() {
+                    assert_eq!(out.unwrap(), "x");
+                } else if to.admits(from) {
+                    // Every admitted pair must have a lowering - a hole
+                    // here would be a silent representation mismatch.
+                    assert!(out.is_ok(), "no coercion {} -> {}", from.ty(), to.ty());
+                } else {
+                    assert!(out.is_err(), "{} -> {} is a NARROWING", from.ty(), to.ty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn validity_flattens_and_drops_the_redundant_knownness() {
+        // zguard's condition is `Known(c) AND c`. Guarding "c is definitely
+        // true" already implies "c is decided", so the flattened conjunct
+        // list must not carry both - emitting the same mask twice is the
+        // kind of waste the old hand-placed guards were full of.
+        let mut g = Graph::new();
+        let c = g.leaf(Op::Cell(1));
+        let k = g.add(Op::Known, vec![c]);
+        let both = g.add(Op::And, vec![k, c]);
+        let all = g.leaf(Op::ConstBool(true));
+        let ok = g.add(Op::And, vec![all, both]);
+        assert_eq!(conjuncts(&g, ok), vec![c]);
+
+        // But a Known whose value is NOT itself a conjunct survives: it is
+        // the only thing standing between an undecided lane and a wrong
+        // answer.
+        let d = g.leaf(Op::Cell(2));
+        let kd = g.add(Op::Known, vec![d]);
+        let ok2 = g.add(Op::And, vec![ok, kd]);
+        assert_eq!(conjuncts(&g, ok2), vec![c, kd]);
+    }
+
+    #[test]
+    fn an_impossible_lane_collapses_the_whole_chain() {
+        // `require_never` folds `ok` to false. Every other conjunct then
+        // disappears, and that is correct rather than lossy: a false `ok`
+        // is `*bd = true`, the whole slice goes to the interpreter, and
+        // per-lane deopt bits for a slice nobody executes are noise.
+        let mut g = Graph::new();
+        let c = g.leaf(Op::Cell(1));
+        let all = g.leaf(Op::ConstBool(true));
+        let ok = g.fold(Op::And, vec![all, c]);
+        let never = g.leaf(Op::ConstBool(false));
+        let ok = g.fold(Op::And, vec![ok, never]);
+        assert_eq!(conjuncts(&g, ok), vec![never]);
+    }
+}

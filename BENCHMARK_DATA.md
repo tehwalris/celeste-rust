@@ -571,6 +571,60 @@ prededup row hashing, dy rep keying, append_out - is unchanged at
 stage 3 (executor-side reuse of per-segment column values in the
 row-key path). Memberchecks ok, suite 553/553.
 
+### Graph-driven codegen: -1% wall, and a size drop that is not a speedup (2026-08-22)
+
+Task #176 stage B. The class-kernel BODY is now emitted from the graph IR
+(`transpile::lower`) instead of from the walk's text stream:
+representation, scope placement and guard emission are derived rather than
+chosen per emit site. Same-day A/B, `--abstract-bench ~/perf-scratch/k2ctl
+65` (NON-fused build, 16 threads - the class kernels are what this
+exercises; the fused artifact is a separate path), 3 invocations of 10 reps
+per side:
+
+| | best min | median min | median mean |
+|---|---|---|---|
+| old (text emitter) | 17,584.16 ms | 17,615.73 ms | 17,862.78 ms |
+| new (graph emitter) | 17,358.18 ms | 17,456.29 ms | 17,617.78 ms |
+| delta | **-1.3%** | **-0.9%** | **-1.4%** |
+
+The three new runs all sit below all three old runs (max new min 17,487.95
+< min old min 17,584.16), so the direction is clean - but the effect is
+~1%, which is INSIDE the day-to-day drift this workload is known to have
+(M1 stage 2's note: the same binary moved 13.4 s -> 14.24 s overnight).
+Treat it as "not a regression, plausibly a small win", not as a result.
+Gate output identical on every run: engine 8,715,348 = 4,591,412 ref +
+4,123,936 revisited, MODULO VISITED OK.
+
+**The emitted code got ~50% smaller and that is NOT where the time went.**
+r20_steady 4562 -> 2094 lines, r20_dash 3837 -> 1754, steady 2248 -> 1747.
+Dead lets and duplicate splats were already LLVM's problem, not the CPU's;
+the size drop buys compile time and readability, not throughput. Anyone
+reading the diff should not expect the two numbers to be related.
+
+**What the graph's own census says is still on the table**, and what it
+does not say: a node whose value depends on k of the 6 button bits is
+computed 64 times where 2^k would do, because the prefix/suffix split is
+binary. Per member, node-evaluations per frame under the binary split vs
+exact 2^|cone|: steady 12,740 vs 4,504 (2.8x), r20-steady 19,331 vs 9,401
+(2.1x), frozen 424 vs 52 (8.2x), dash 1,657 vs 1,285 (1.3x). Those ratios
+count evaluations ASSUMING every suffix node runs in every variant, and
+LLVM already dead-codes each monomorphization, so they are not wall-clock
+predictions. The comparable thing that was actually measured is M1 stage 2
+- the same sharing done by hand for the fused artifact - at **-2.6%**.
+Expect that order from the button tree (plans/multi-output-fusion.md,
+"Stage C"), not 2.8x.
+
+Also measured, because it was quoted as a fusion opportunity: the 64
+button variants collapse to **36 distinct** on steady and r20-steady, 4 on
+dash and r20-dying-spikes, 1 on frozen and r20-dying-fall. The signature
+must be (output cells, ok, live), not outputs alone - `dispatch.rs`
+ignores the variant mask but accumulates `deopt_rows` from `kout.deopt &
+kout.valid` and aborts on `kout.bd`, so two variants writing the same
+cells while deopting different lanes are NOT interchangeable. Widening the
+signature turned out to cost nothing here (36/64 both ways), which makes
+the earlier outputs-only number a bound that happened to be tight rather
+than a result.
+
 ### M1 stage 3: support-factored row keys (2026-08-20)
 
 The pre-dedup key is a commutative per-cell sum, so the artifact now

@@ -565,10 +565,6 @@ pub fn row_keys(chunk: &Rt2, lo: usize, n: usize, sh: &KOutShared, kv: &KOut, pl
 }
 
 pub struct Pre {
-    v18: P8,
-    v3: P8,
-    v33: ZN,
-    v34: ZN,
     valid: u16,
     dp: u16,
     bd: bool,
@@ -590,57 +586,39 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let r_c272: ZB = ZB { val: rin.c272, known: ALL };
     let r_c280: ZN = rin.c280;
     let r_c281: ZN = rin.c281;
-    let v0: P8 = P8::from_raw(65536i32);
-    let v1: P8 = u.c84 + v0;
-    let v2: P8 = P8::from_raw(1966080i32);
-    let v3: P8 = v1 % v2;
-    let v4: P8 = P8::from_raw(0i32);
-    let v5: bool = v3 == v4;
-    let v6: P8 = P8::from_raw(524288i32);
-    let v7: P8 = u.c158 % v6;
-    let v8: P8 = P8::from_raw(524288i32);
-    let v9: P8 = u.c159 * v8;
-    let v10: P8 = v7 + v9;
-    let v11: P8 = P8::from_raw(1966080i32);
-    let v12: bool = v10 < v11;
-    let v13: bool = if v5 { v12 } else { v5 };
-    let v14: bool = !v13;
-    if !v14 { *bd = true; }
-    let v15: P8 = P8::from_raw(0i32);
-    let v16: bool = u.c20 > v15;
-    if !v16 { *bd = true; }
-    let v17: P8 = P8::from_raw(65536i32);
-    let v18: P8 = u.c20 - v17;
-    let v19: P8 = P8::from_raw(0i32);
-    let v20: bool = v18 > v19;
-    let v21: ZN = zn_splat(P8::from_raw(-65536i32));
-    let v22: ZB = zn_lt(r_c253, v21);
-    let v23: ZN = zn_splat(P8::from_raw(7929856i32));
-    let v24: ZB = zn_gt(r_c253, v23);
-    let v25: ZB = zsel_b(v22, v22, v24, &mut dp);
-    let v26: ZN = zn_splat(P8::from_raw(7929856i32));
-    let v27: ZN = zn_min(v26, r_c253);
-    let v28: ZN = zn_splat(P8::from_raw(-65536i32));
-    let v29: ZN = zn_max(v28, v27);
-    let v30: ZN = zn_splat(P8::from_raw(0i32));
-    let v31: ZN = zsel_n(v25, v30, r_c280, &mut dp);
-    let v32: ZN = zsel_n(v25, v29, r_c253, &mut dp);
-    let v33: ZN = if v20 { r_c253 } else { v32 };
-    let v34: ZN = if v20 { r_c280 } else { v31 };
+    let n9: P8 = u.c84 + P8::from_raw(65536i32);
+    let n11: P8 = n9 % P8::from_raw(1966080i32);
+    let n13: bool = n11 == P8::from_raw(0i32);
+    let n16: P8 = u.c158 % P8::from_raw(524288i32);
+    let n18: P8 = u.c159 * P8::from_raw(524288i32);
+    let n19: P8 = n16 + n18;
+    let n20: bool = n19 < P8::from_raw(1966080i32);
+    let n21: bool = if n13 { n20 } else { n13 };
+    let n22: bool = !n21;
+    let n24: bool = u.c20 > P8::from_raw(0i32);
+    let n26: P8 = u.c20 - P8::from_raw(65536i32);
+    let n27: bool = n26 > P8::from_raw(0i32);
+    let n30: ZB = zn_lt(r_c253, zn_splat(P8::from_raw(-65536i32)));
+    let n32: ZB = zn_gt(r_c253, zn_splat(P8::from_raw(7929856i32)));
+    let n33: ZB = zsel_b(n30, n30, n32, &mut dp);
+    let n36: ZN = zn_min(zn_splat(P8::from_raw(7929856i32)), r_c253);
+    let n37: ZN = zn_max(zn_splat(P8::from_raw(-65536i32)), n36);
+    let n39: ZN = zsel_n(n33, zn_splat(P8::from_raw(0i32)), r_c280, &mut dp);
+    let n42: ZN = zsel_n(n33, n37, r_c253, &mut dp);
+    let n44: ZN = if n27 { r_c253 } else { n42 };
+    let n45: ZN = if n27 { r_c280 } else { n39 };
+    if !n22 { *bd = true; }
+    if !n24 { *bd = true; }
     let p = Pre {
-        v18,
-        v3,
-        v33,
-        v34,
         valid: ALL,
         dp,
         bd: *bd,
     };
     let osh = KOutShared {
-        c20: v18,
-        c84: v3,
-        c253: v33,
-        c280: v34,
+        c20: n26,
+        c84: n11,
+        c253: n44,
+        c280: n45,
     };
     // suffix observes button bits []: 1 distinct variant(s)
     suffix::<0>(u, g, &p, &osh, out);
@@ -648,10 +626,6 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
 
 #[inline(never)]
 fn suffix<const B: u8>(u: &Uni, g: &G, p: &Pre, osh: &KOutShared, out: &mut impl FnMut(u8, &KOutShared, &KOut)) {
-    let v18 = p.v18;
-    let v3 = p.v3;
-    let v33 = p.v33;
-    let v34 = p.v34;
     let mut dp: u16 = p.dp;
     let mut bd_flag: bool = p.bd;
     let bd: &mut bool = &mut bd_flag;

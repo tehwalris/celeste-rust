@@ -365,6 +365,84 @@ and check that dispatch, the bridge and the chunk accounting handle n > 1.
 4. Gates, then measure per room - same discipline as engine adoption
    (BENCHMARK_DATA.md, "Engine adoption validation at depth").
 
+## Stage C, designed but not built: the button tree
+
+Today the button bits split the body in TWO - a prefix nothing button-
+dependent may touch, and a suffix monomorphized over `2^|used|` values of
+`const B: u8`. A node that depends on ONE button is therefore computed 64
+times instead of 2. Measured per member (`node-evaluations per frame` in
+the emitter's own census, 2026-08-22):
+
+| member | nodes | binary split | exact 2^|cone| | ratio |
+|---|---|---|---|---|
+| steady     | 1526 | 12,740 | 4,504 | 2.8x |
+| r20-steady | 2573 | 19,331 | 9,401 | 2.1x |
+| frozen     |   46 |    424 |    52 | 8.2x |
+| r20-frozen |   93 |    471 |    99 | 4.8x |
+| dash       | 1279 |  1,657 | 1,285 | 1.3x |
+
+Read that ratio carefully. It counts NODE EVALUATIONS assuming every
+suffix node runs in every variant, and LLVM already dead-codes each
+monomorphization, so it is not a wall-clock ratio. The honest claim is
+narrower: a node whose value depends on exactly k buttons is computed 64
+times where 2^k would do. For steady that is 24 nodes at 64-vs-2, 75 at
+64-vs-4, 19 at 64-vs-8, 18 at 64-vs-16, 10 at 64-vs-32, 32 at 64-vs-64.
+`transpile::fuse` already does this by hand for the FUSED artifact (M1
+stage 2, "support segments"), and it measured **-2.6% wall**. Expect the
+same order here, not 2.8x.
+
+### The shape
+
+Order the used bits and give each node a LEVEL: the position of the
+highest-ordered bit in its cone (0 = no button reaches it). Then emit one
+function per level, each computing only its own level's nodes:
+
+```rust
+fn frame(..)                      { <level 0>; s0::<false>(..); s0::<true>(..); }
+fn s0<const K0: bool>(..)         { let kbA = K0; <level 1>; s1::<K0,false>(..); s1::<K0,true>(..); }
+fn s1<const K0: bool, const K1: bool>(..) { .. }
+```
+
+Const generic params can be FORWARDED, which is what makes this work on
+stable: `s1::<K0, true>` needs no const arithmetic, while the more obvious
+`s1::<{B | (1 << 1)}>` would need `generic_const_exprs`. The source stays
+one copy per level; LLVM makes 2, 4, 8, ... of them. Emitting the tree as
+2^k - 1 concrete functions instead would put 127 functions in the file and
+trade a compile-time explosion for the same result.
+
+`out(B, ..)` needs the numeric mask back: `let b: u8 = ((K0 as u8) << bitA)
+| ..;`, a `let` rather than a `const` item, because a const item may not
+name its function's generic parameters. LLVM folds it.
+
+### Variant dedup rides along
+
+Group the 64 masks by the signature `(output cells, ok, live)` and emit
+`out(..)` only for a representative of each group - `if matches!(b, 0 | 1 |
+3 | ..)`, const-foldable, so a pruned leaf's whole cone dead-codes.
+
+The signature MUST include `ok` and `live`, not just the outputs. The
+consumer (`src/compiled/dispatch.rs:684`) ignores the variant mask and
+dedups rows, so equal outputs really are interchangeable rows - but the
+same callback also accumulates `deopt_rows` from `kout.deopt & kout.valid`
+and aborts the chunk on `kout.bd`. Two variants that write the same cells
+while deopting different lanes are NOT interchangeable: dropping one would
+silently keep a lane on the kernel that belongs to the interpreter.
+
+Measured 2026-08-22, both ways: steady 36/64 distinct either way, r20-
+steady 36/64, dash and r20-dying-spikes 4/64, frozen and r20-dying-fall
+1/64. So the wider signature costs nothing here - but it is the correct
+one, and the outputs-only number was an upper bound that happened to be
+tight rather than a result.
+
+### What it collides with
+
+`transpile::fuse` reads `e.pre` / `e.suf` as exactly two regions
+(`parse_member`). An N-level split breaks that model, so stage C either
+lands after stage D (fuse ported onto the graph) or keeps the two-way
+bucketing as a PROJECTION for the fuser. The projection is honest - same
+nodes, same representations, bucketed 2 ways instead of N - but it is a
+second view of one derivation and should not outlive stage D.
+
 ## What this does NOT solve
 
 - **The exit member still needs multi-room handoff on top of this** -

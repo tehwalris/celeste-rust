@@ -38,7 +38,7 @@ use std::fmt::Write as _;
 use anyhow::{anyhow, bail, Result};
 
 use super::kernel::{
-    compute_out_fields, emit_interface, emit_key_cell, emit_walk, key_cells, mentions_ident,
+    emit_interface, emit_key_cell, emit_walk, key_cells, lower_walk, mentions_ident,
     reachable_cells, render_lines, word_used, Emit, Line, OutField, OutFields,
 };
 use crate::rewrite::program::Program;
@@ -173,7 +173,7 @@ fn fused_expr(render: &str) -> String {
 
 /// Parse one member's walk into the shared numbering. `mi` = member index.
 fn parse_member(label: &str, mut e: Emit, mi: usize, ctx: &mut Ctx) -> Result<PMember> {
-    let of = compute_out_fields(&mut e)?;
+    let of = lower_walk(&mut e)?;
     let mbit = 1u8 << mi;
     let mut vn: HashMap<String, u32> = HashMap::new();
     let mut loads: Vec<String> = Vec::new();

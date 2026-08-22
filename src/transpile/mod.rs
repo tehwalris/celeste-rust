@@ -22,4 +22,5 @@
 pub mod fuse;
 pub mod graph;
 pub mod kernel;
+pub(crate) mod lower;
 pub mod names;

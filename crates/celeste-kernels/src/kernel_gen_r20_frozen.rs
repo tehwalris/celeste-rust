@@ -736,11 +736,6 @@ pub fn row_keys(chunk: &Rt2, lo: usize, n: usize, sh: &KOutShared, kv: &KOut, pl
 }
 
 pub struct Pre {
-    v120: ZN,
-    v121: ZN,
-    v18: P8,
-    v27: P8,
-    v3: P8,
     valid: u16,
     dp: u16,
     bd: bool,
@@ -762,194 +757,47 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let r_c398: ZB = ZB { val: rin.c398, known: ALL };
     let r_c406: ZN = rin.c406;
     let r_c407: ZN = rin.c407;
-    let v0: P8 = P8::from_raw(65536i32);
-    let v1: P8 = u.c84 + v0;
-    let v2: P8 = P8::from_raw(1966080i32);
-    let v3: P8 = v1 % v2;
-    let v4: P8 = P8::from_raw(0i32);
-    let v5: bool = v3 == v4;
-    let v6: P8 = P8::from_raw(524288i32);
-    let v7: P8 = u.c161 % v6;
-    let v8: P8 = P8::from_raw(524288i32);
-    let v9: P8 = u.c162 * v8;
-    let v10: P8 = v7 + v9;
-    let v11: P8 = P8::from_raw(1966080i32);
-    let v12: bool = v10 < v11;
-    let v13: bool = if v5 { v12 } else { v5 };
-    let v14: P8 = P8::from_raw(65536i32);
-    let v15: P8 = u.c85 + v14;
-    let v16: P8 = P8::from_raw(3932160i32);
-    let v17: P8 = v15 % v16;
-    let v18: P8 = if v13 { v17 } else { u.c85 };
-    let v19: P8 = P8::from_raw(0i32);
-    let v20: bool = v18 == v19;
-    let v21: bool = !v20;
-    let v22: bool = true;
-    let v23: bool = if v13 { v21 } else { v22 };
-    if !v23 { *bd = true; }
-    let v24: P8 = P8::from_raw(0i32);
-    let v25: bool = u.c20 > v24;
-    if !v25 { *bd = true; }
-    let v26: P8 = P8::from_raw(65536i32);
-    let v27: P8 = u.c20 - v26;
-    let v28: P8 = P8::from_raw(0i32);
-    let v29: bool = v27 > v28;
-    let v30: bool = true;
-    let v31: bool = true;
-    let v32: bool = if v29 { v30 } else { v31 };
-    if !v32 { *bd = true; }
-    let v33: bool = true;
-    let v34: bool = true;
-    let v35: bool = if v29 { v33 } else { v34 };
-    if !v35 { *bd = true; }
-    let v36: bool = true;
-    let v37: bool = true;
-    let v38: bool = if v29 { v36 } else { v37 };
-    if !v38 { *bd = true; }
-    let v39: bool = true;
-    let v40: bool = true;
-    let v41: bool = if v29 { v39 } else { v40 };
-    if !v41 { *bd = true; }
-    let v42: bool = true;
-    let v43: bool = true;
-    let v44: bool = if v29 { v42 } else { v43 };
-    if !v44 { *bd = true; }
-    let v45: bool = true;
-    let v46: bool = true;
-    let v47: bool = if v29 { v45 } else { v46 };
-    if !v47 { *bd = true; }
-    let v48: bool = true;
-    let v49: bool = true;
-    let v50: bool = if v29 { v48 } else { v49 };
-    if !v50 { *bd = true; }
-    let v51: bool = true;
-    let v52: bool = true;
-    let v53: bool = if v29 { v51 } else { v52 };
-    if !v53 { *bd = true; }
-    let v54: bool = true;
-    let v55: bool = true;
-    let v56: bool = if v29 { v54 } else { v55 };
-    if !v56 { *bd = true; }
-    let v57: bool = true;
-    let v58: bool = true;
-    let v59: bool = if v29 { v57 } else { v58 };
-    if !v59 { *bd = true; }
-    let v60: bool = true;
-    let v61: bool = true;
-    let v62: bool = if v29 { v60 } else { v61 };
-    if !v62 { *bd = true; }
-    let v63: bool = true;
-    let v64: bool = true;
-    let v65: bool = if v29 { v63 } else { v64 };
-    if !v65 { *bd = true; }
-    let v66: bool = true;
-    let v67: bool = true;
-    let v68: bool = if v29 { v66 } else { v67 };
-    if !v68 { *bd = true; }
-    let v69: bool = true;
-    let v70: bool = true;
-    let v71: bool = if v29 { v69 } else { v70 };
-    if !v71 { *bd = true; }
-    let v72: bool = true;
-    let v73: bool = true;
-    let v74: bool = if v29 { v72 } else { v73 };
-    if !v74 { *bd = true; }
-    let v75: bool = true;
-    let v76: bool = true;
-    let v77: bool = if v29 { v75 } else { v76 };
-    if !v77 { *bd = true; }
-    let v78: bool = true;
-    let v79: bool = true;
-    let v80: bool = if v29 { v78 } else { v79 };
-    if !v80 { *bd = true; }
-    let v81: bool = true;
-    let v82: bool = true;
-    let v83: bool = if v29 { v81 } else { v82 };
-    if !v83 { *bd = true; }
-    if !v32 { *bd = true; }
-    if !v35 { *bd = true; }
-    let v84: bool = true;
-    let v85: bool = true;
-    let v86: bool = if v29 { v84 } else { v85 };
-    if !v86 { *bd = true; }
-    let v87: bool = true;
-    let v88: bool = true;
-    let v89: bool = if v29 { v87 } else { v88 };
-    if !v89 { *bd = true; }
-    if !v41 { *bd = true; }
-    if !v44 { *bd = true; }
-    if !v47 { *bd = true; }
-    let v90: bool = true;
-    let v91: bool = true;
-    let v92: bool = if v29 { v90 } else { v91 };
-    if !v92 { *bd = true; }
-    let v93: bool = true;
-    let v94: bool = true;
-    let v95: bool = if v29 { v93 } else { v94 };
-    if !v95 { *bd = true; }
-    if !v53 { *bd = true; }
-    if !v56 { *bd = true; }
-    if !v59 { *bd = true; }
-    let v96: bool = true;
-    let v97: bool = true;
-    let v98: bool = if v29 { v96 } else { v97 };
-    if !v98 { *bd = true; }
-    let v99: bool = true;
-    let v100: bool = true;
-    let v101: bool = if v29 { v99 } else { v100 };
-    if !v101 { *bd = true; }
-    if !v65 { *bd = true; }
-    if !v68 { *bd = true; }
-    let v102: bool = true;
-    let v103: bool = true;
-    let v104: bool = if v29 { v102 } else { v103 };
-    if !v104 { *bd = true; }
-    let v105: bool = true;
-    let v106: bool = true;
-    let v107: bool = if v29 { v105 } else { v106 };
-    if !v107 { *bd = true; }
-    let v108: ZN = zn_splat(P8::from_raw(-65536i32));
-    let v109: ZB = zn_lt(r_c316, v108);
-    let v110: ZN = zn_splat(P8::from_raw(7929856i32));
-    let v111: ZB = zn_gt(r_c316, v110);
-    let v112: ZB = zsel_b(v109, v109, v111, &mut dp);
-    let v113: ZN = zn_splat(P8::from_raw(7929856i32));
-    let v114: ZN = zn_min(v113, r_c316);
-    let v115: ZN = zn_splat(P8::from_raw(-65536i32));
-    let v116: ZN = zn_max(v115, v114);
-    let v117: ZN = zn_splat(P8::from_raw(0i32));
-    let v118: ZN = zsel_n(v112, v117, r_c406, &mut dp);
-    let v119: ZN = zsel_n(v112, v116, r_c316, &mut dp);
-    let v120: ZN = if v29 { r_c316 } else { v119 };
-    let v121: ZN = if v29 { r_c406 } else { v118 };
-    let v122: bool = true;
-    let v123: bool = true;
-    let v124: bool = if v29 { v122 } else { v123 };
-    if !v124 { *bd = true; }
-    let v125: bool = true;
-    let v126: bool = true;
-    let v127: bool = if v29 { v125 } else { v126 };
-    if !v127 { *bd = true; }
-    let v128: bool = true;
-    let v129: bool = true;
-    let v130: bool = if v29 { v128 } else { v129 };
-    if !v130 { *bd = true; }
+    let n9: P8 = u.c84 + P8::from_raw(65536i32);
+    let n11: P8 = n9 % P8::from_raw(1966080i32);
+    let n13: bool = n11 == P8::from_raw(0i32);
+    let n16: P8 = u.c161 % P8::from_raw(524288i32);
+    let n18: P8 = u.c162 * P8::from_raw(524288i32);
+    let n19: P8 = n16 + n18;
+    let n20: bool = n19 < P8::from_raw(1966080i32);
+    let n21: bool = if n13 { n20 } else { n13 };
+    let n23: P8 = u.c85 + P8::from_raw(65536i32);
+    let n25: P8 = n23 % P8::from_raw(3932160i32);
+    let n26: P8 = if n21 { n25 } else { u.c85 };
+    let n27: bool = n26 == P8::from_raw(0i32);
+    let n28: bool = !n27;
+    let n29: bool = if n21 { n28 } else { true };
+    let n31: bool = u.c20 > P8::from_raw(0i32);
+    let n33: P8 = u.c20 - P8::from_raw(65536i32);
+    let n34: bool = n33 > P8::from_raw(0i32);
+    let n35: bool = if n34 { true } else { true };
+    let n74: ZB = zn_lt(r_c316, zn_splat(P8::from_raw(-65536i32)));
+    let n76: ZB = zn_gt(r_c316, zn_splat(P8::from_raw(7929856i32)));
+    let n77: ZB = zsel_b(n74, n74, n76, &mut dp);
+    let n80: ZN = zn_min(zn_splat(P8::from_raw(7929856i32)), r_c316);
+    let n81: ZN = zn_max(zn_splat(P8::from_raw(-65536i32)), n80);
+    let n83: ZN = zsel_n(n77, zn_splat(P8::from_raw(0i32)), r_c406, &mut dp);
+    let n86: ZN = zsel_n(n77, n81, r_c316, &mut dp);
+    let n88: ZN = if n34 { r_c316 } else { n86 };
+    let n89: ZN = if n34 { r_c406 } else { n83 };
+    if !n29 { *bd = true; }
+    if !n31 { *bd = true; }
+    if !n35 { *bd = true; }
     let p = Pre {
-        v120,
-        v121,
-        v18,
-        v27,
-        v3,
         valid: ALL,
         dp,
         bd: *bd,
     };
     let osh = KOutShared {
-        c20: v27,
-        c84: v3,
-        c85: v18,
-        c316: v120,
-        c406: v121,
+        c20: n33,
+        c84: n11,
+        c85: n26,
+        c316: n88,
+        c406: n89,
     };
     // suffix observes button bits []: 1 distinct variant(s)
     suffix::<0>(u, g, &p, &osh, out);
@@ -957,11 +805,6 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
 
 #[inline(never)]
 fn suffix<const B: u8>(u: &Uni, g: &G, p: &Pre, osh: &KOutShared, out: &mut impl FnMut(u8, &KOutShared, &KOut)) {
-    let v120 = p.v120;
-    let v121 = p.v121;
-    let v18 = p.v18;
-    let v27 = p.v27;
-    let v3 = p.v3;
     let mut dp: u16 = p.dp;
     let mut bd_flag: bool = p.bd;
     let bd: &mut bool = &mut bd_flag;

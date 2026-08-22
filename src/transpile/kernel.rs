@@ -1649,7 +1649,25 @@ pub(crate) struct OutFields {
     pub(crate) ubool: Vec<u32>,
 }
 
-pub(crate) fn compute_out_fields(e: &mut Emit) -> Result<OutFields> {
+/// Resolve one walk into the LINES a kernel is made of, and the output
+/// fields that read them.
+///
+/// This is the single producer of emitted bodies. `render` (the class
+/// kernels) and `transpile::fuse` (the fused artifact) both go through
+/// it, so there is no second lowering to drift - which nearly happened:
+/// for one commit `render` emitted from the graph while `fuse` still read
+/// the walk's own `Line` pushes, and the two would have diverged silently
+/// the moment the graph learned anything the text stream did not know.
+pub(crate) fn lower_walk(e: &mut Emit) -> Result<OutFields> {
+    let mut of = compute_out_fields(e)?;
+    // Replaces `e.pre`/`e.suf` (and the bookkeeping both consumers read
+    // off them) with lines derived from `e.graph`, and rewrites the output
+    // fields to read graph nodes.
+    super::lower::emit_body(e, &mut of)?;
+    Ok(of)
+}
+
+fn compute_out_fields(e: &mut Emit) -> Result<OutFields> {
     // Output struct: dirty original cells (scratch cells never escape).
     // (cell, rust ty, expr, tainted): tainted outputs differ per button
     // variant; untainted ones are identical across all 64 and are
@@ -2211,7 +2229,7 @@ pub(crate) fn emit_key_cell(
 /// Assemble kernel_gen.rs.
 fn render(e: &mut Emit) -> Result<String> {
     let mut out = String::new();
-    let of = compute_out_fields(e)?;
+    let of = lower_walk(e)?;
     emit_interface(&mut out, e, &of)?;
     let out_fields = &of.fields;
     // Pre struct: prefix values the suffix reads (word-boundary search,
@@ -2224,12 +2242,16 @@ fn render(e: &mut Emit) -> Result<String> {
             crossing.insert(name.clone());
         }
     }
-    // The out_fields' exprs referenced from the suffix epilogue also cross.
-    for OutField { expr, .. } in out_fields {
-        if e.pre_defs.contains(expr) {
+    for OutField { expr, tainted, .. } in out_fields {
+        if *tainted && e.pre_defs.contains(expr) {
             crossing.insert(expr.clone());
         }
     }
+    // A TAINTED out field is evaluated in the suffix epilogue, so a prefix
+    // value it names has to cross. An untainted one is evaluated into
+    // `osh` in frame(), right beside the prefix that defines it, and does
+    // not - copying those through `Pre` was pure overhead (all four of
+    // frozen's crossing values were of that kind).
     writeln!(out, "pub struct Pre {{")?;
     for name in &crossing {
         let ty = e
@@ -2372,13 +2394,24 @@ fn render(e: &mut Emit) -> Result<String> {
     let bits: Vec<u8> = (0..6).filter(|b| reaching & (1 << b) != 0).collect();
     // How many of the 2^6 button combinations are actually DISTINCT?
     // Specialize on each mask into one shared hash-consed arena and compare
-    // the output tuples: equal tuples mean the same successor for every
-    // lane, so the variants could collapse.
+    // the results: equal results mean the same successor for every lane, so
+    // one of the two variants could be dropped and dedup would never know.
+    //
+    // The signature is the output cells PLUS `ok` and `live`. An earlier
+    // version compared outputs alone and reported 36/64 for steady; that
+    // over-counts, because two variants that write the same cells but deopt
+    // DIFFERENT lanes are not interchangeable - dropping one would silently
+    // keep a lane on the kernel that belongs to the interpreter.
     let mut shared = Graph::new();
     let mut sigs: std::collections::BTreeMap<Vec<NodeId>, Vec<u8>> = Default::default();
+    let mut out_only: std::collections::BTreeSet<Vec<NodeId>> = Default::default();
     for m in 0u8..64 {
         let map = e.graph.specialize_into(m, &mut shared);
-        let sig: Vec<NodeId> = out_fields.iter().map(|f| map[f.node as usize]).collect();
+        let outs: Vec<NodeId> = out_fields.iter().map(|f| map[f.node as usize]).collect();
+        out_only.insert(outs.clone());
+        let mut sig = outs;
+        sig.push(map[e.ok as usize]);
+        sig.push(map[e.live as usize]);
         sigs.entry(sig).or_default().push(m);
     }
     // What the BINARY prefix/suffix taint costs. A node truly needs
@@ -2411,12 +2444,13 @@ fn render(e: &mut Emit) -> Result<String> {
     );
     eprintln!(
         "graph: {} nodes, {} out cells; buttons reaching an output {:?} -> {} variant(s); \
-         DISTINCT button combinations: {}/64",
+         DISTINCT button combinations: {}/64 ({}/64 counting outputs alone)",
         e.graph.len(),
         out_fields.len(),
         bits,
         1usize << bits.len(),
         sigs.len(),
+        out_only.len(),
     );
     Ok(out)
 }
