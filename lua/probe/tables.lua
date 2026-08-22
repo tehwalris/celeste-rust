@@ -132,3 +132,45 @@ printh(#n)
 printh(n[1][1])
 printh(n[1][2])
 printh(#n[1])
+
+-- 9. Closure identity, only as far as it is answerable. PICO-8 is Lua
+--    5.2 and CACHES closures on (prototype, upvalue cells), so
+--    `mk() == mk()` is TRUE when the body captures nothing - the two
+--    calls get one object. The tracer approximates the cells by the
+--    enclosing scope and so refuses that comparison (see the note on
+--    `Value::Func`); what it does answer is the case where both sides are
+--    the same object, and that is what is checked here.
+printh("closure-identity")
+function mk() return function() end end
+local ca = mk()
+local cc = ca
+printh(ca == ca)
+printh(ca == cc)
+
+-- 10. Closure CAPTURE in a loop: is the loop variable fresh per
+--     iteration, or is there one shared box? The two answers print
+--     1,2,3 and 3,3,3, and which one a language gives is not guessable.
+printh("closure-capture")
+local fs = {}
+for i=1,3 do fs[i] = function() return i end end
+printh(fs[1]())
+printh(fs[2]())
+printh(fs[3]())
+
+-- 11. A captured LOCAL is shared with whoever else captured it.
+-- Returned in a TABLE rather than as two values: the tracer does not
+-- implement multiple returns, and the cart does not use them.
+printh("closure-shared-upvalue")
+function counter()
+  local n = 0
+  local t = {}
+  t.inc = function() n = n + 1 end
+  t.get = function() return n end
+  return t
+end
+local ct = counter()
+printh(ct.get())
+ct.inc()
+printh(ct.get())
+ct.inc()
+printh(ct.get())

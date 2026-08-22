@@ -303,6 +303,22 @@ mod tests {
                 eprintln!("[trace] frame {} stopped at: {}", n, e);
                 return;
             }
+            // The frontier has no budget of its own - `exec_block`
+            // checks `max_states` for what ONE state produced, and this
+            // loop concatenates across states. Without this check, a
+            // fan-out turns `collapse`, which is quadratic in the
+            // frontier and clones a heap per pair, into a hang instead of
+            // a diagnosis. (Measured: with `intern_body` disabled this
+            // test went from 13s to over 300s and reported nothing.)
+            if next.len() > it.max_states {
+                eprintln!(
+                    "[trace] frame {}: frontier grew to {} states (limit {})",
+                    n,
+                    next.len(),
+                    it.max_states
+                );
+                return;
+            }
             // COLLAPSE ACROSS THE WHOLE FRONTIER. `exec_block` collapses
             // what one state produced, but each state here is a separate
             // call, so without this two states from different predecessors

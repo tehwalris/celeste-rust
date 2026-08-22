@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use anyhow::{bail, Result};
 
 use super::domain::Domain;
-use super::heap::{Heap, Root, ScopeId, Shape, TableId, Value};
+use super::heap::{push_value, Heap, Root, ScopeId, Shape, TableId, Value};
 
 pub struct State<D: Domain> {
     pub heap: Heap<D>,
@@ -168,6 +168,11 @@ pub fn merge<D: Domain>(
                     heap.scopes.get_mut(a).unwrap().vars.insert(k, j);
                 }
             }
+            // A closure has no mutable content - which body it is and
+            // what it captured are both fixed at creation - so pairing
+            // the two sides is all there is to do. It has to be in the
+            // traversal so the scope it captured gets visited.
+            (Root::Closure(_), Root::Closure(_)) => {}
             _ => bail!("merge: canonical orders disagree in kind after equal shapes"),
         }
     }
@@ -196,7 +201,7 @@ fn join<D: Domain>(d: &mut D, cond: &D::Bool, a: &Value<D>, b: &Value<D>) -> Res
         (Value::Bool(x), Value::Bool(y)) => Value::Bool(d.sel_bool(cond, x, y)),
         // The shapes agreed about everything else, and the result keeps
         // the t side's structure, so t's own value is already right.
-        (x, Value::Table(_) | Value::Func { .. } | Value::Nil | Value::Str(_)
+        (x, Value::Table(_) | Value::Func(_) | Value::Nil | Value::Str(_)
             | Value::Builtin(_)) => x.clone(),
         (x, y) => bail!("merge: {:?} and {:?} after equal shapes", x, y),
     })
@@ -223,26 +228,23 @@ fn canonical_order<D: Domain>(s: &State<D>) -> Vec<Root> {
             Root::Table(t) => {
                 if let Some(tab) = s.heap.tables.get(&t) {
                     for v in tab.values() {
-                        match v {
-                            Value::Table(x) => queue.push(Root::Table(*x)),
-                            Value::Func { env, .. } => queue.push(Root::Scope(*env)),
-                            _ => {}
-                        }
+                        push_value(v, &mut queue);
                     }
                 }
             }
             Root::Scope(sc) => {
                 if let Some(scope) = s.heap.scopes.get(&sc) {
                     for v in scope.vars.values() {
-                        match v {
-                            Value::Table(x) => queue.push(Root::Table(*x)),
-                            Value::Func { env, .. } => queue.push(Root::Scope(*env)),
-                            _ => {}
-                        }
+                        push_value(v, &mut queue);
                     }
                     if let Some(p) = scope.parent {
                         queue.push(Root::Scope(p));
                     }
+                }
+            }
+            Root::Closure(c) => {
+                if let Some(cl) = s.heap.closures.get(&c) {
+                    queue.push(Root::Scope(cl.env));
                 }
             }
         }

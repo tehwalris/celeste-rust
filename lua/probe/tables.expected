@@ -136,3 +136,14 @@ nested
 [nil]
 deep
 0
+closure-identity
+true
+true
+closure-capture
+1
+2
+3
+closure-shared-upvalue
+0
+1
+2

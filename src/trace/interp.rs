@@ -266,7 +266,8 @@ impl<'a, D: Domain> Interp<'a, D> {
             ast::Stmt::FunctionDeclaration(f) => {
                 let body = self.intern_body(f.body());
                 let mut s = st;
-                let v = Value::Func { body, env: s.scope };
+                let c = s.heap.new_closure(body, s.scope);
+                let v = Value::Func(c);
                 let name = f.name().to_string().trim().to_string();
                 if name.contains('.') || name.contains(':') {
                     bail!("qualified function names are not supported: {:?}", name);
@@ -754,8 +755,10 @@ impl<'a, D: Domain> Interp<'a, D> {
             ast::Expression::FunctionCall(call) => self.eval_call(call, st),
             ast::Expression::Function((_, body)) => {
                 let id = self.intern_body(body);
+                let mut st = st;
                 let env = st.scope;
-                Ok(vec![(st, Value::Func { body: id, env })])
+                let c = st.heap.new_closure(id, env);
+                Ok(vec![(st, Value::Func(c))])
             }
             ast::Expression::TableConstructor(t) => {
                 let mut cur: Multi<D, TableId> = {
@@ -893,6 +896,26 @@ impl<'a, D: Domain> Interp<'a, D> {
         let op = cmp_op.unwrap();
         let r = match (a, b) {
             (Value::Num(x), Value::Num(y)) => self.d.compare(op, x, y)?,
+            // Two closures. The SAME object is equal in any model, so
+            // that much is answerable; anything else is not. PICO-8 is
+            // Lua 5.2 and caches closures on (prototype, upvalue cells),
+            // so two closures this model calls distinct can be one object
+            // there - `function() end` evaluated twice is cached, because
+            // it captures nothing. This model approximates the cells by
+            // the enclosing scope and so cannot tell. Refuse rather than
+            // answer; the cart never compares two functions (every `==`
+            // and `~=` in the three Lua files was checked, and the only
+            // function comparisons are against nil).
+            (Value::Func(x), Value::Func(y)) if op == Cmp::Eq => {
+                if x != y {
+                    bail!(
+                        "comparing two closures: PICO-8 caches them on (prototype, \
+                         upvalue cells) and this model approximates the cells by the \
+                         enclosing scope, so it cannot tell whether these are one object"
+                    );
+                }
+                self.d.boolean(true)
+            }
             // Everything but numbers and booleans is concrete, so equality
             // on it is decidable right here.
             _ if op == Cmp::Eq => {
@@ -1118,8 +1141,13 @@ impl<'a, D: Domain> Interp<'a, D> {
         st: State<D>,
     ) -> Result<Multi<D, Value<D>>> {
         match f {
-            Value::Func { body, env } => {
+            Value::Func(c) => {
                 let mut st = st;
+                let super::heap::Closure { body, env } = *st
+                    .heap
+                    .closures
+                    .get(&c)
+                    .ok_or_else(|| anyhow!("calling a collected closure #{}", c))?;
                 let frame = st.heap.new_scope(Some(env));
                 let b = self.bodies[body as usize];
                 for (i, p) in b.parameters().iter().enumerate() {

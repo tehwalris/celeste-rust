@@ -29,6 +29,7 @@ use super::domain::Domain;
 
 pub type TableId = u32;
 pub type ScopeId = u32;
+pub type ClosureId = u32;
 /// Index into the interpreter's list of function bodies (the AST outlives
 /// the heap, so the heap stores an index rather than a reference).
 pub type BodyId = u32;
@@ -39,8 +40,44 @@ pub enum Value<D: Domain> {
     Bool(D::Bool),
     Str(Rc<str>),
     Table(TableId),
-    /// A closure: which function body, and the scope it captured.
-    Func { body: BodyId, env: ScopeId },
+    /// A closure. A HEAP OBJECT, like a table, referred to by id.
+    ///
+    /// Not `{ body, env }` inline, which is what this was: a closure has
+    /// an identity of its own, and the old interpreter models it that way
+    /// too (`HeapValue::Closure` sits at a `HeapId` behind a
+    /// `Value::Pointer`, so it has content AND identity). Being in the
+    /// heap also means the existing machinery does the work - GC collects
+    /// one nothing refers to, and `shape`'s canonical BFS renumbers it,
+    /// so two states that each built the same closure have the same
+    /// SHAPE and merge.
+    ///
+    /// ## What PICO-8 actually does, which is not what Lua 5.4 does
+    ///
+    /// PICO-8 is Lua 5.2, which CACHES closures: `OP_CLOSURE` reuses an
+    /// existing one with the same prototype and the same upvalue CELLS.
+    /// (5.4 removed this, which is where the folklore that
+    /// `function() end == function() end` is false comes from.) Measured,
+    /// not assumed - `/tmp` carts run against ~/pico-8/pico8:
+    ///
+    /// ```text
+    /// two calls, body has no upvalues              true   (cached)
+    /// two calls, upvalue is a fresh local          false
+    /// same local captured at two different sites   false  (two prototypes)
+    /// body only reads a GLOBAL, so no upvalues     true
+    /// same site, same upvalue cell                 true
+    /// same site, different frames, equal values    false
+    /// loop capturing i                             false
+    /// loop capturing nothing                       true
+    /// ```
+    ///
+    /// So identity is (prototype, upvalue cells). This model has the
+    /// prototype exactly (`BodyId`, interned by AST node) but approximates
+    /// the cells by the whole enclosing SCOPE, which is exact only when
+    /// every capture comes from that scope. Two closures can therefore be
+    /// distinct here and the same object in PICO-8. `==` on two closures
+    /// is refused for that reason rather than answered - see
+    /// `Interp::eval_binop`.
+    Func(ClosureId),
     Builtin(&'static str),
 }
 
@@ -52,7 +89,7 @@ impl<D: Domain> Clone for Value<D> {
             Value::Bool(b) => Value::Bool(b.clone()),
             Value::Str(s) => Value::Str(s.clone()),
             Value::Table(t) => Value::Table(*t),
-            Value::Func { body, env } => Value::Func { body: *body, env: *env },
+            Value::Func(c) => Value::Func(*c),
             Value::Builtin(n) => Value::Builtin(n),
         }
     }
@@ -66,7 +103,8 @@ impl<D: Domain> PartialEq for Value<D> {
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a == b,
             (Value::Table(a), Value::Table(b)) => a == b,
-            (Value::Func { body: a, env: x }, Value::Func { body: b, env: y }) => a == b && x == y,
+            // Reference equality, which is Lua's.
+            (Value::Func(a), Value::Func(b)) => a == b,
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
             _ => false,
         }
@@ -84,7 +122,7 @@ impl<D: Domain> std::fmt::Debug for Value<D> {
             Value::Bool(b) => write!(f, "bool({:?})", b),
             Value::Str(s) => write!(f, "{:?}", s),
             Value::Table(t) => write!(f, "table#{}", t),
-            Value::Func { body, env } => write!(f, "fn#{}@{}", body, env),
+            Value::Func(c) => write!(f, "closure#{}", c),
             Value::Builtin(n) => write!(f, "builtin:{}", n),
         }
     }
@@ -230,21 +268,41 @@ impl<D: Domain> Clone for Scope<D> {
     }
 }
 
+/// A closure object: which function body, and the scope it captured.
+/// Both are immutable, so unlike a table there is nothing here to merge -
+/// it is in the heap for its IDENTITY.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Closure {
+    pub body: BodyId,
+    pub env: ScopeId,
+}
+
 pub struct Heap<D: Domain> {
     pub tables: BTreeMap<TableId, Table<D>>,
     pub scopes: BTreeMap<ScopeId, Scope<D>>,
+    pub closures: BTreeMap<ClosureId, Closure>,
     next: u32,
 }
 
 impl<D: Domain> Clone for Heap<D> {
     fn clone(&self) -> Self {
-        Heap { tables: self.tables.clone(), scopes: self.scopes.clone(), next: self.next }
+        Heap {
+            tables: self.tables.clone(),
+            scopes: self.scopes.clone(),
+            closures: self.closures.clone(),
+            next: self.next,
+        }
     }
 }
 
 impl<D: Domain> Default for Heap<D> {
     fn default() -> Self {
-        Heap { tables: BTreeMap::new(), scopes: BTreeMap::new(), next: 0 }
+        Heap {
+            tables: BTreeMap::new(),
+            scopes: BTreeMap::new(),
+            closures: BTreeMap::new(),
+            next: 0,
+        }
     }
 }
 
@@ -258,6 +316,12 @@ impl<D: Domain> Heap<D> {
     pub fn new_table(&mut self) -> TableId {
         let id = self.fresh();
         self.tables.insert(id, Table::default());
+        id
+    }
+
+    pub fn new_closure(&mut self, body: BodyId, env: ScopeId) -> ClosureId {
+        let id = self.fresh();
+        self.closures.insert(id, Closure { body, env });
         id
     }
 
@@ -309,9 +373,18 @@ impl<D: Domain> Heap<D> {
     pub fn gc(&mut self, roots: &[Root]) {
         let mut live_t: BTreeSet<TableId> = BTreeSet::new();
         let mut live_s: BTreeSet<ScopeId> = BTreeSet::new();
+        let mut live_c: BTreeSet<ClosureId> = BTreeSet::new();
         let mut stack: Vec<Root> = roots.to_vec();
         while let Some(r) = stack.pop() {
             match r {
+                Root::Closure(c) => {
+                    if !live_c.insert(c) {
+                        continue;
+                    }
+                    if let Some(cl) = self.closures.get(&c) {
+                        stack.push(Root::Scope(cl.env));
+                    }
+                }
                 Root::Table(t) => {
                     if !live_t.insert(t) {
                         continue;
@@ -339,19 +412,25 @@ impl<D: Domain> Heap<D> {
         }
         self.tables.retain(|k, _| live_t.contains(k));
         self.scopes.retain(|k, _| live_s.contains(k));
+        self.closures.retain(|k, _| live_c.contains(k));
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Root {
+    Closure(ClosureId),
     Table(TableId),
     Scope(ScopeId),
 }
 
-fn push_value<D: Domain>(v: &Value<D>, stack: &mut Vec<Root>) {
+/// The objects a value refers to. The ONE place that knows which value
+/// kinds are references, so `gc`, `shape` and `canonical_order` cannot
+/// disagree about it - they each had their own copy, and adding closures
+/// to the heap meant finding all three.
+pub fn push_value<D: Domain>(v: &Value<D>, stack: &mut Vec<Root>) {
     match v {
         Value::Table(t) => stack.push(Root::Table(*t)),
-        Value::Func { env, .. } => stack.push(Root::Scope(*env)),
+        Value::Func(c) => stack.push(Root::Closure(*c)),
         _ => {}
     }
 }
@@ -372,7 +451,10 @@ pub enum Slot {
     Bool,
     Str(String),
     Table(u32),
-    Func { body: BodyId, env: u32 },
+    /// The CANONICAL closure number, exactly as `Table` is the canonical
+    /// table number. Which body it is and what it captured live in
+    /// `Shape::closures`, so identity and content stay separate here too.
+    Func(u32),
     Builtin(&'static str),
 }
 
@@ -384,6 +466,9 @@ pub struct Shape {
     /// whose tables differ there cannot be merged with a select.
     pub tables: Vec<(Vec<(String, Slot)>, Vec<Slot>, Vec<(i16, Slot)>)>,
     pub scopes: Vec<(Vec<(String, Slot)>, Option<u32>)>,
+    /// Canonical (BFS-numbered) closures: their body, and the canonical
+    /// number of the scope they captured.
+    pub closures: Vec<(BodyId, u32)>,
 }
 
 impl<D: Domain> Heap<D> {
@@ -392,6 +477,7 @@ impl<D: Domain> Heap<D> {
     pub fn shape(&self, roots: &[Root]) -> Result<Shape> {
         let mut t_num: BTreeMap<TableId, u32> = BTreeMap::new();
         let mut s_num: BTreeMap<ScopeId, u32> = BTreeMap::new();
+        let mut c_num: BTreeMap<ClosureId, u32> = BTreeMap::new();
         let mut queue: Vec<Root> = roots.to_vec();
         let mut order: Vec<Root> = Vec::new();
         let mut i = 0;
@@ -399,6 +485,16 @@ impl<D: Domain> Heap<D> {
             let r = queue[i];
             i += 1;
             match r {
+                Root::Closure(c) => {
+                    if c_num.contains_key(&c) {
+                        continue;
+                    }
+                    c_num.insert(c, c_num.len() as u32);
+                    order.push(r);
+                    if let Some(cl) = self.closures.get(&c) {
+                        queue.push(Root::Scope(cl.env));
+                    }
+                }
                 Root::Table(t) => {
                     if t_num.contains_key(&t) {
                         continue;
@@ -435,7 +531,7 @@ impl<D: Domain> Heap<D> {
                 Value::Bool(_) => Slot::Bool,
                 Value::Str(s) => Slot::Str(s.to_string()),
                 Value::Table(t) => Slot::Table(t_num[t]),
-                Value::Func { body, env } => Slot::Func { body: *body, env: s_num[env] },
+                Value::Func(c) => Slot::Func(c_num[c]),
                 Value::Builtin(n) => Slot::Builtin(n),
             }
         };
@@ -456,6 +552,10 @@ impl<D: Domain> Heap<D> {
                         sc.vars.iter().map(|(k, v)| (k.clone(), slot(v))).collect(),
                         sc.parent.map(|p| s_num[&p]),
                     ));
+                }
+                Root::Closure(c) => {
+                    let cl = &self.closures[c];
+                    shape.closures.push((cl.body, s_num[&cl.env]));
                 }
             }
         }
