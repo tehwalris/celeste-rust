@@ -569,6 +569,62 @@ program as restricted:
 The multi-frame probe now stops at frame 28 (was 29) on `array index 3 is
 past the end of a 0-element table`. Different merging, different path.
 
+### T8 - a real oracle: differential corpora against PICO-8 (landed f7e9c93, 228a582)
+
+Every oracle this project has had is another MODEL - the Rust interpreter,
+and the OCaml one before it. That catches drift between them and nothing
+at all that they both get wrong. PICO-8 is installed on this machine and
+runs a cart headless (`pico8 -x`, `printh` to stdout), so there is no
+reason for that to stay true.
+
+`lua/probe/*.lua` is a corpus that runs UNCHANGED in both places - it
+talks to the outside world only through `printh`, one value per call,
+because the tracer implements neither `tostr` nor `..`. `*.expected` is
+literally PICO-8's stdout, checked in; `./regen-pico8-golden.sh`
+regenerates it. Two tests: one runs the corpus in the tracer and diffs
+(works anywhere), one regenerates and compares BYTES (skips loudly where
+PICO-8 is absent - not `git status`, since a golden file that is merely
+staged is not stale).
+
+It has already paid for itself twice, and in the same way both times: a
+semantic I was confident about turned out to be wrong.
+
+**`#` on a table with a hole.** Usually described as "undefined", which
+invites picking an answer. It is not undefined - it is a deterministic
+consequence of Lua's array-part/hash-part split, and it depends on how the
+table was BUILT rather than what it holds:
+
+```text
+t={} t[3]="c"           #t == 0     -- dense-with-nils says 3
+t[1]="a"                #t == 1
+t[2]="b"                #t == 3
+{"a",nil,"c"}           #t == 3     -- same contents as line 3, different #
+{"a","b","c"} t[3]=nil  #t == 2
+```
+
+So `Table` has the three parts Lua has and `Table::len` is `luaH_getn`.
+
+**Closure equality.** I argued for moving closures into the heap on the
+grounds that `function() end == function() end` is false in Lua, so
+structural equality answers it wrongly. PICO-8 says **true**: it is Lua
+5.2, which caches closures on (prototype, upvalue cells). 5.4 removed
+that; the folklore did not. The measured table is on `Value::Func`.
+
+The tracer has the prototype exactly and approximates the cells by the
+enclosing SCOPE, so `==` on two distinct closures is refused rather than
+answered. Closures moved into the heap anyway - it matches the
+interpreter, and it is the right shape for per-cell capture later - but
+with the guard in place that move is observationally equivalent for this
+cart, and it is worth saying so rather than dressing it up.
+
+**The generalizable part.** Both of these were places where two models
+agreed with each other and the runtime disagreed with both. The corpus is
+where the next such question goes, and the cost of adding one is a few
+lines of Lua plus a regen.
+
+Known gaps the corpus surfaced rather than fixed: no multiple return
+values (the cart uses none), no string concatenation, no `tostr`.
+
 ## Stage 3 - was "control flow", now folded into Stage 2
 
 Written before Stage 2 had a concrete shape; T3 (control flow), T5 (loops)
