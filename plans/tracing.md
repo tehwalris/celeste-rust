@@ -240,42 +240,146 @@ No behaviour change. Everything here is motivated by build time; see
 
 Exit: editing the tracer crate rebuilds the tracer crate.
 
-## Stage 2 - the tracing value domain, on straight-line input
+## Stage 2 - the tracer
 
-Make the interpreter's op semantics generic over the value payload, and
-add the symbolic payload (a graph node handle plus its type). Heap stays
-exactly as it is.
+### Which interpreter to build it on
 
-Trace the ALREADY-REWRITTEN program - it is straight-line, so there is no
-control flow to handle yet. This isolates the value-domain change
-completely.
+The design says "we have an interpreter; make the heap concrete and the
+values symbolic". There are two interpreters that could mean, and the
+smaller one is the right answer.
 
-Gate: the traced graph equals the graph `emit_walk` produces today, for
-all eight class kernels. Same input, same output, new machinery. If it
-does not match, the difference is in the value domain and nowhere else.
+**`celeste-interp` (16k lines)** has what the tracer needs structurally -
+control flow, calls, closures, a GC heap, merge points (`hint_normalize`
+blocks) - but its value domain is a 14-variant enum matched in ~700
+places, and every one of those is LANE-VECTORIZED (`MaybeVector<T>`). The
+tracer runs ONE state with no lanes, so all of that is dead weight, and
+its merge (vectorize same-shape states into lane vectors) is not the merge
+the tracer wants (insert a `Sel` per cell).
 
-Exit: `emit_walk` is deleted and the tracer feeds `transpile::lower`.
+**`transpile::kernel::emit_walk`** is already a symbolic interpreter over
+the same IR: concrete heap as a cell map, pointer topology resolved at
+trace time, every value a graph node, stores as renames. It is what
+produces the kernels today, so it is gated by the entire pipeline. It
+bails on exactly three things:
 
-## Stage 3 - control flow
+```
+terminator {:?} is not straight-line      (628)
+call of non-builtin cell                  (880)
+phi in the straightened program           (895)
+```
 
-Add, in this order, each gated by graph comparison against the recipe
-pipeline on the un-rewritten program:
+Those three ARE the rewrites' whole contribution. So: extend `emit_walk`.
 
-1. **Joins, same shape.** Per-cell `Sel` merge.
-2. **Joins, differing shape.** Keep both; n output states. This is where
-   P2/P3 arrives - the kernel emitter needs per-member validity and
-   per-member output shapes, which the tracer now supplies naturally.
-3. **Loops.** Unroll under a stopping heuristic, with a predicate
-   asserting the loop had finished. Heuristic wrong -> loud failure, never
-   a wrong graph.
+The counter-argument I made earlier - "op semantics must be single-sourced
+or the tracer drifts from the reference" - does not survive contact with
+the code. `emit_walk` is ALREADY a second implementation of the semantics,
+and the thing that keeps it honest is a differential gate
+(`compiled_forward_reproduces_the_interpreter`), not shared code.
+Extending it adds no new semantics and no new drift surface. Building a
+symbolic domain into `celeste-interp` would add a THIRD.
 
-No speculation, no folding-for-size, no cleverness: complete and correct
-first. Measure graph size against the recipe pipeline's anyway, because
-that number is what says whether a later optimization pass is needed and
-which one.
+### T1 - `K` carries a `NodeId` (prerequisite, not preparation)
 
-Exit: the tracer produces every class kernel's graph from the un-rewritten
-program.
+Today `K` carries emitted variable NAMES, and `Graph::operand` recovers the
+graph's edges by parsing identifiers back out of the emitted text. A
+tracer cannot work that way: merging two traced states means building
+`Sel(cond, node_a, node_b)` from values that were never emitted as text
+next to each other.
+
+So `K`'s `String` payloads become `NodeId`, the walk's `Line` stream and
+`Emit::scratch` are deleted, and `Graph::operand`'s text parsing goes with
+them.
+
+This is also a large simplification rather than a port. `K` has seven
+representation variants (`SN`/`SI`/`SB`/`STri`/`ZN`/`ZI`/`ZB`) and the
+walk's `unop`/`binop`/`cmp`/`select` branch on them to pick an emitted
+form - but `transpile::lower` DERIVES representation now, so all of that
+is redundant. `K` collapses to roughly `Num(NodeId)` / `Bool(NodeId)` plus
+the structural variants (`Ptr`, `Nil`, `Str`, `UBool`), and several
+hundred lines of representation dispatch in kernel.rs go with it.
+
+**One question to settle first, cheaply.** `OutField::ty` comes from the
+`K` variant and decides whether a boundary column is `Col::N` or `Col::I`
+- which feeds the row key, so it is not free to change. `lower` already
+checks `want.admits(have)`, where `have` is the graph's own derivation.
+If `have == want` for every output cell of all eight kernels, the type can
+simply be derived and `K` need not carry it. If any cell differs, `K` must
+keep the boundary representation explicitly. Assert equality, regenerate,
+and find out.
+
+Gate: all eight kernels byte-identical.
+
+### T2 - GC and merge
+
+`reachable_cells` already walks globals -> cells; make it a real GC over
+the trace-time cell map so two states are comparable. Then:
+
+```
+merge(cond, a, b) -> State
+```
+
+Same shape after GC: one state whose every cell is `Sel(cond, a_cell,
+b_cell)`, which `Graph::fold` collapses to `a_cell` wherever the arms
+agree - the overwhelming majority. Different shapes: keep both, and the
+result is n output states rather than one.
+
+Unit-testable without any CFG work.
+
+### T3 - control flow
+
+`ConditionalBranch` on a symbolic condition: trace both targets, merge at
+the branch's IMMEDIATE POST-DOMINATOR, continue from there. Needs a
+post-dominator pass (~80 lines, standard). The two arms' path conditions
+are then exactly `c` and `!c`, which is what makes the merge a plain
+two-arm `Sel` instead of a path-condition algebra.
+
+`Phi { branches: [(Label, LocalId)] }` resolves at the merge: it names
+which local to take from which predecessor, so it becomes the same `Sel`.
+This is `rules::if_convert`, done by the tracer, at zero cost.
+
+A conditional branch whose condition is CONCRETE just takes its arm - no
+merge, no node. That is most of them.
+
+### T4 - calls and closures
+
+`emit_walk` bails on non-builtin calls because the rewrites inlined
+everything. Tracing inlines by construction: save the local env, bind
+arguments, walk the callee's CFG, restore. Closures need real capture
+support - `CellT::Clo(String)` records only the function name today,
+because `promote_capture` had already removed captures.
+
+### T5 - loops
+
+Unroll under a stopping heuristic, emitting a validity predicate that the
+loop had actually finished. Wrong heuristic -> the predicate fails and we
+notice; never a wrong graph. There is no fixpoint to reach for: a node
+handle has no lattice, so merging iteration n with n+1 gives `Sel(Sel(..))`
+and grows without converging.
+
+### T6 - the gate
+
+Trace the UN-REWRITTEN `__frame` and diff the resulting graph against the
+one the recipe pipeline produces, per class kernel. Exact, incremental,
+and it localizes a discrepancy to a node.
+
+## Stage 3 - was "control flow", now folded into Stage 2
+
+Written before Stage 2 had a concrete shape; T3 (control flow), T5 (loops)
+and T6 (the gate) say the same things against the actual code, so this
+stage is gone rather than left standing as a second plan.
+
+The one item that was NOT absorbed, and still has to happen: **the kernel
+emitter emits ONE output shape.** `OutFields` is a single cell set and
+`emit_interface` writes one `KOutShared`/`KOut`; the fused artifact papers
+over it with the block-uniform-collapse trick for dying members. A tracer
+produces n output shapes the moment two branches disagree about the heap,
+which is T2's "different shapes: keep both". So multi-output-shape
+materialization (P2/P3 in plans/multi-output-fusion.md) is a hard
+prerequisite for T6 on any program where a branch kills an object - which
+is every room with a death, a fruit or an exit.
+
+Sequence it after T3 (which is where differing shapes first appear) and
+before T6.
 
 ## Stage 4 - delete
 
