@@ -299,6 +299,51 @@ mod tests {
         }
         let base = inputs.len() as u32;
         let g = std::mem::take(&mut it.d.graph);
+
+        // ONE INPUT SHAPE, N OUTPUT SHAPES. Lowering each outcome on its
+        // own - which is what this probe does - emits four KERNELS, and
+        // the four share the whole frame up to the point where they
+        // diverge. So how much is being duplicated?
+        {
+            let reach = |roots: &[crate::transpile::graph::NodeId]| {
+                let mut seen = std::collections::BTreeSet::new();
+                let mut stack: Vec<_> = roots.to_vec();
+                while let Some(n) = stack.pop() {
+                    if !seen.insert(n) {
+                        continue;
+                    }
+                    stack.extend(g.get(n).args.iter().copied());
+                }
+                seen
+            };
+            let per: Vec<std::collections::BTreeSet<_>> = f
+                .outs
+                .iter()
+                .map(|o| {
+                    let mut r: Vec<_> =
+                        o.fields.iter().map(|(_, nd, _)| *nd).collect();
+                    r.push(o.guard);
+                    r.push(o.ok);
+                    reach(&r)
+                })
+                .collect();
+            let union: std::collections::BTreeSet<_> =
+                per.iter().flat_map(|s| s.iter().copied()).collect();
+            let sum: usize = per.iter().map(|s| s.len()).sum();
+            let shared_by_all: usize = union
+                .iter()
+                .filter(|n| per.iter().all(|s| s.contains(n)))
+                .count();
+            eprintln!(
+                "[emit] reachable nodes: {:?} per outcome, {} summed, {} in the union, \
+                 {} shared by ALL - so lowering separately emits {:.1}x what one body would",
+                per.iter().map(|s| s.len()).collect::<Vec<_>>(),
+                sum,
+                union.len(),
+                shared_by_all,
+                sum as f64 / union.len() as f64
+            );
+        }
         for (n, o) in f.outs.iter().enumerate() {
             // The BUTTON cells are not ordinary outputs. They end the
             // frame holding next frame's free choices, so they are
@@ -340,6 +385,160 @@ mod tests {
                 let mut sp = crate::transpile::graph::Graph::new();
                 let maps: Vec<Vec<crate::transpile::graph::NodeId>> =
                     (0u8..64).map(|m| g.specialize_into(m, &mut sp)).collect();
+                // Emission happens on the SPECIALISED arena, not on the
+                // traced graph: 64 assignments folded into one interned
+                // arena. So the traced node count is not what gets
+                // emitted, and the gap between them is what
+                // specialisation costs.
+                {
+                    let mut seen = std::collections::BTreeSet::new();
+                    let mut stack: Vec<crate::transpile::graph::NodeId> = Vec::new();
+                    for m in 0..64usize {
+                        for (_, nd, _) in &o.fields {
+                            stack.push(maps[m][*nd as usize]);
+                        }
+                        stack.push(maps[m][o.ok as usize]);
+                        stack.push(maps[m][o.guard as usize]);
+                    }
+                    while let Some(x) = stack.pop() {
+                        if !seen.insert(x) {
+                            continue;
+                        }
+                        stack.extend(sp.get(x).args.iter().copied());
+                    }
+                    // HEURISTIC DUPLICATION CENSUS. Fingerprint every
+                    // reachable node by WHAT IT COMPUTES at a handful of
+                    // input points, and bucket. Nodes sharing a fingerprint
+                    // are equal without being identical - exactly the
+                    // candidates the emitter's structural key cannot merge.
+                    // This SIZES the opportunity; it does not authorise the
+                    // merge, since agreeing at K points is necessary and not
+                    // sufficient.
+                    if n == 2 {
+                        // Its own points, and deliberately crude: for a
+                        // FINGERPRINT what matters is that they separate,
+                        // not that they are game-meaningful. Bump one
+                        // numeric input each time.
+                        // MANY points, varying EVERY input. Eight points
+                        // bumping one cell each gave 97 fingerprints with
+                        // buckets of 8,535 - which is not duplication, it
+                        // is collision: two nodes share a fingerprint
+                        // whenever they happen to agree everywhere it
+                        // looks. Deltas stay small so that map lookups
+                        // stay in range and every node still evaluates.
+                        let mut probe_pts: Vec<Vec<Conc>> = vec![f.iface.init.clone()];
+                        let mut rng: u64 = 0x9E3779B97F4A7C15;
+                        for _ in 0..96 {
+                            let mut pt = f.iface.init.clone();
+                            for slot in pt.iter_mut() {
+                                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                                let r = (rng >> 33) as i64;
+                                *slot = match *slot {
+                                    Conc::Num(v) => Conc::Num(
+                                        v + crate::pico8_num::Pico8Num::from_i16(
+                                            (r % 17 - 8) as i16,
+                                        ),
+                                    ),
+                                    Conc::Bool(_) => Conc::Bool(r & 1 == 0),
+                                };
+                            }
+                            probe_pts.push(pt);
+                        }
+                        let mut cols: Vec<Vec<Option<Conc>>> = Vec::new();
+                        for pt in &probe_pts {
+                            let env = super::super::eval::Env {
+                                cells: pt,
+                                frees: &[false; 6],
+                                cart: it.cart.clone(),
+                                cache: it.cache.clone(),
+                            };
+                            cols.push(super::super::eval::eval_all(&sp, &env));
+                        }
+                        let mut buckets: std::collections::HashMap<
+                            Vec<Option<(u8, i32)>>,
+                            Vec<crate::transpile::graph::NodeId>,
+                        > = Default::default();
+                        let mut live_nodes = 0usize;
+                        let mut undecided = 0usize;
+                        for id in seen.iter().copied() {
+                            let fp: Vec<Option<(u8, i32)>> = cols
+                                .iter()
+                                .map(|c| {
+                                    c[id as usize].map(|v| match v {
+                                        Conc::Num(x) => (0u8, x.as_raw_u32() as i32),
+                                        Conc::Bool(b) => (1u8, b as i32),
+                                    })
+                                })
+                                .collect();
+                            if fp.iter().all(|x| x.is_none()) {
+                                undecided += 1;
+                                continue;
+                            }
+                            live_nodes += 1;
+                            buckets.entry(fp).or_default().push(id);
+                        }
+                        let mut sizes: Vec<usize> = buckets.values().map(|v| v.len()).collect();
+                        sizes.sort_unstable_by(|a, b| b.cmp(a));
+                        // WHAT is in the biggest buckets? A bucket of
+                        // 6,000 is either collision or a genuinely
+                        // constant region - those are different problems,
+                        // and the fingerprint says which.
+                        let mut by_size: Vec<_> = buckets.iter().collect();
+                        by_size.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
+                        for (fp, ids) in by_size.iter().take(2) {
+                            let constant = fp.iter().all(|x| *x == fp[0]);
+                            let mut ops: std::collections::BTreeMap<String, usize> =
+                                Default::default();
+                            for id in ids.iter() {
+                                *ops.entry(format!("{:?}", sp.get(*id).op)).or_default() += 1;
+                            }
+                            let mut top: Vec<_> = ops.into_iter().collect();
+                            top.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+                            eprintln!(
+                                "[emit]     bucket of {}: constant over all points = {}, \
+                                 value {:?}, ops {:?}",
+                                ids.len(),
+                                constant,
+                                fp[0],
+                                &top[..top.len().min(5)]
+                            );
+                        }
+                        eprintln!(
+                            "[emit]   DUPLICATION: {} reachable nodes evaluate ({} do not); {} distinct \
+                             fingerprints over {} points, so a perfect semantic dedup would keep {:.0}%. \
+                             Biggest buckets: {:?}",
+                            live_nodes,
+                            undecided,
+                            buckets.len(),
+                            probe_pts.len(),
+                            100.0 * buckets.len() as f64 / live_nodes as f64,
+                            &sizes[..sizes.len().min(6)]
+                        );
+                    }
+
+                    eprintln!(
+                        "[emit]   outcome {}: {} traced nodes reachable -> {} after \
+                         specialising on 64 assignments ({} in the whole arena)",
+                        n,
+                        {
+                            let mut s2 = std::collections::BTreeSet::new();
+                            let mut st2: Vec<crate::transpile::graph::NodeId> = o
+                                .fields
+                                .iter()
+                                .map(|(_, nd, _)| *nd)
+                                .chain([o.ok, o.guard])
+                                .collect();
+                            while let Some(x) = st2.pop() {
+                                if s2.insert(x) {
+                                    st2.extend(g.get(x).args.iter().copied());
+                                }
+                            }
+                            s2.len()
+                        },
+                        seen.len(),
+                        sp.len()
+                    );
+                }
                 let count = |with_ok: bool, with_live: bool| -> usize {
                     let mut seen = std::collections::BTreeSet::new();
                     for m in 0..64usize {

@@ -68,6 +68,24 @@ pub fn eval(g: &Graph, root: NodeId, env: &Env) -> Result<Conc> {
             need[*a as usize] = true;
         }
     }
+    let val = run(g, &need, env, true)?;
+    val[root as usize].ok_or_else(|| anyhow!("root {} was not evaluated", root))
+}
+
+/// Every node in the graph at one point, `None` where it does not
+/// evaluate. For CENSUS work - fingerprinting nodes by what they compute,
+/// to find ones that are equal without being identical - where one root
+/// at a time would be quadratic.
+pub fn eval_all(g: &Graph, env: &Env) -> Vec<Option<Conc>> {
+    let need = vec![true; g.len()];
+    run(g, &need, env, false).expect("lenient run cannot fail")
+}
+
+/// One forward pass. Operands always have smaller ids, so this is linear
+/// and needs no recursion. `strict` decides whether a node that cannot be
+/// evaluated is an error or just a `None` that propagates.
+fn run(g: &Graph, need: &[bool], env: &Env, strict: bool) -> Result<Vec<Option<Conc>>> {
+    let n = need.len();
     let mut val: Vec<Option<Conc>> = vec![None; n];
     let mut c = Concrete;
     for id in 0..n {
@@ -79,6 +97,7 @@ pub fn eval(g: &Graph, root: NodeId, env: &Env) -> Result<Conc> {
             val[node.args[i] as usize]
                 .ok_or_else(|| anyhow!("operand {} of node {} was not evaluated", i, id))
         };
+        let one = || -> Result<Conc> {
         let v = match node.op {
             Op::Const(lo, hi) => {
                 if lo != hi {
@@ -178,9 +197,15 @@ pub fn eval(g: &Graph, root: NodeId, env: &Env) -> Result<Conc> {
                 bail!("node {} is {:?}, which the tracer does not build", id, node.op)
             }
         };
-        val[id] = Some(v);
+        Ok(v)
+        }();
+        match one {
+            Ok(v) => val[id] = Some(v),
+            Err(e) if strict => return Err(e),
+            Err(_) => val[id] = None,
+        }
     }
-    val[root as usize].ok_or_else(|| anyhow!("root {} was not evaluated", root))
+    Ok(val)
 }
 
 #[cfg(test)]
