@@ -625,6 +625,72 @@ lines of Lua plus a regen.
 Known gaps the corpus surfaced rather than fixed: no multiple return
 values (the cart uses none), no string concatenation, no `tostr`.
 
+### T9 - the divergence audit (landed b510784, dec1684, and the ice commit)
+
+An Opus subagent read `src/trace/` against `crates/celeste-ir/src/frontend.rs`
+plus the IR interpreter, construct by construct, settling every question it
+could against real PICO-8. Philippe asked for it as "an extra sanity check";
+it found more than the work it was checking.
+
+**The rule that came out of it, which is now the standard for this
+module:** every path either reproduces PICO-8 EXACTLY or RAISES.
+Approximating is not a third option. Where the cart uses a feature, match
+it; where it does not, make the path refuse. Both are valid; silently
+differing is not.
+
+Reachable, and fixed by MATCHING:
+
+* **`break` was a no-op in `run_for_symbolic`.** `for_body` rewrote
+  `Flow::Break` to `Normal`, so the state went back into the frontier and
+  ran the body again. Reaches `move_x`/`move_y`. Masked in the values -
+  it hits the same `break` next iteration - but it broke `ok`, since a
+  lane that left early still had to satisfy "the loop finished within the
+  bound".
+* **A block was not a scope.** A `local` in an `if` arm landed in the
+  enclosing function's scope. Never a wrong value (nothing in the cart
+  shadows) but a merge failure, since a leaked name is in `Shape::scopes`.
+* **Boolean `==`** compared `NodeId`s. **Assignment** evaluated its
+  right-hand side first, where Lua does the left.
+
+Reachable, and fixed by RAISING:
+
+* **`tile_flag_at` answered `false` for every flag but 0.** Flag 4 is ice
+  and `ice_at` gates acceleration and the wall-slide every frame.
+  Measured over the map: **16 of 32 rooms contain ice**. It now answers
+  only where the room provably has no such tile.
+
+Unreachable, fixed by RAISING: `#` where the answer depends on rehash
+history (see T8), and builtin arity (`min(5)` was a Rust index panic).
+
+**The thing worth carrying forward.** The ice bug was wrong IDENTICALLY in
+both implementations, so the differential machinery this project rests on
+was structurally blind to it - as it was for `#` and for the closure
+cache. Three findings, one shape: the two models agreed with each other
+and the runtime disagreed with both. An oracle that is a second model can
+only ever find drift.
+
+Two of my own predictions were also wrong and were caught by measuring:
+
+* I put the ice guard in the branch where every argument is known. With a
+  symbolic player position `ice_at` has unknown x and y, so the call went
+  straight past it into a graph node. Whether a room contains a flag does
+  not depend on where in the room you look, so the flag has to be decided
+  BEFORE the coordinates - which also folds it to a constant and takes
+  the nodes out of the graph.
+* I predicted the `break` fix would remove nodes and the block-scope fix
+  would remove declines. Exactly backwards:
+
+  ```text
+  one frame of room (0,0)     nodes    declines
+  before both                 4,063         448
+  break fix only              4,060         192
+  both                        3,447         192
+  ```
+
+Still open from the audit, both unreachable: the IR pipeline's
+`local x = <expr mentioning x>` sees the new nil cell (the tracer is
+correct here), and `run_for_symbolic`'s obligation could be more precise.
+
 ## Stage 3 - was "control flow", now folded into Stage 2
 
 Written before Stage 2 had a concrete shape; T3 (control flow), T5 (loops)
