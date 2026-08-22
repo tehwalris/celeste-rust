@@ -23,8 +23,8 @@ use full_moon::tokenizer::{Symbol, TokenType};
 use crate::pico8_num::Pico8Num as P8;
 
 use super::domain::{refuse_unknown, Arith, Cmp, Domain, Fun1, Fun2};
-use super::heap::{BodyId, Value};
-use super::state::{merge, State};
+use super::heap::{BodyId, TableId, Value};
+use super::state::{merge, split_path, State};
 
 pub enum Flow<D: Domain> {
     Normal,
@@ -57,8 +57,15 @@ impl<D: Domain> Flow<D> {
     }
 }
 
-/// A statement's possible outcomes.
-pub type Outcome<D> = Vec<(State<D>, Flow<D>)>;
+/// One or more `(state, thing)` outcomes.
+///
+/// EVERYTHING that can run code returns one of these, expressions
+/// included. An expression is not pure: it can contain a call, the call
+/// can branch on something unknown, and the two arms may disagree about
+/// the heap's shape and so fail to merge. Threading a single state through
+/// expressions was not a simplification, it was wrong.
+pub type Multi<D, T> = Vec<(State<D>, T)>;
+pub type Outcome<D> = Multi<D, Flow<D>>;
 
 pub struct Interp<'a, D: Domain> {
     pub d: D,
@@ -116,17 +123,17 @@ impl<'a, D: Domain> Interp<'a, D> {
         Ok(match last {
             ast::LastStmt::Break(_) => vec![(st, Flow::Break)],
             ast::LastStmt::Return(r) => {
-                let mut s = st;
-                let mut v = Value::Nil;
-                if let Some(e) = r.returns().iter().next() {
-                    let (s2, v2) = self.eval(e, s)?;
-                    s = s2;
-                    v = v2;
-                }
                 if r.returns().len() > 1 {
                     bail!("multiple return values are not supported");
                 }
-                vec![(s, Flow::Return(v))]
+                match r.returns().iter().next() {
+                    Some(e) => self
+                        .eval(e, st)?
+                        .into_iter()
+                        .map(|(s, v)| (s, Flow::Return(v)))
+                        .collect(),
+                    None => vec![(st, Flow::Return(Value::Nil))],
+                }
             }
             other => bail!("unsupported last statement {:?}", other),
         })
@@ -137,22 +144,30 @@ impl<'a, D: Domain> Interp<'a, D> {
     fn exec_stmt(&mut self, stmt: &'a ast::Stmt, st: State<D>) -> Result<Outcome<D>> {
         match stmt {
             ast::Stmt::LocalAssignment(la) => {
-                let mut s = st;
                 let names: Vec<_> = la.names().iter().collect();
                 let exprs: Vec<_> = la.expressions().iter().collect();
+                let mut cur: Vec<State<D>> = vec![st];
                 for (i, name) in names.iter().enumerate() {
-                    let v = match exprs.get(i) {
-                        Some(e) => {
-                            let (s2, v) = self.eval(e, s)?;
-                            s = s2;
-                            v
-                        }
-                        None => Value::Nil,
-                    };
                     let n = ident(name)?;
-                    s.heap.declare(s.scope, &n, v);
+                    let mut next = Vec::new();
+                    for s in cur {
+                        match exprs.get(i) {
+                            Some(e) => {
+                                for (mut s, v) in self.eval(e, s)? {
+                                    s.heap.declare(s.scope, &n, v);
+                                    next.push(s);
+                                }
+                            }
+                            None => {
+                                let mut s = s;
+                                s.heap.declare(s.scope, &n, Value::Nil);
+                                next.push(s);
+                            }
+                        }
+                    }
+                    cur = next;
                 }
-                Ok(vec![(s, Flow::Normal)])
+                Ok(cur.into_iter().map(|s| (s, Flow::Normal)).collect())
             }
             ast::Stmt::Assignment(a) => {
                 let var = a
@@ -168,14 +183,17 @@ impl<'a, D: Domain> Interp<'a, D> {
                     .iter()
                     .next()
                     .ok_or_else(|| anyhow!("assignment with no expression"))?;
-                let (s, v) = self.eval(e, st)?;
-                let s = self.assign_var(var, v, s)?;
-                Ok(vec![(s, Flow::Normal)])
+                let mut out = Vec::new();
+                for (s, v) in self.eval(e, st)? {
+                    out.extend(self.assign_var(var, v, s)?);
+                }
+                Ok(out.into_iter().map(|s| (s, Flow::Normal)).collect())
             }
-            ast::Stmt::FunctionCall(call) => {
-                let (s, _) = self.eval_call(call, st)?;
-                Ok(vec![(s, Flow::Normal)])
-            }
+            ast::Stmt::FunctionCall(call) => Ok(self
+                .eval_call(call, st)?
+                .into_iter()
+                .map(|(s, _)| (s, Flow::Normal))
+                .collect()),
             ast::Stmt::FunctionDeclaration(f) => {
                 let body = self.intern_body(f.body());
                 let mut s = st;
@@ -225,17 +243,39 @@ impl<'a, D: Domain> Interp<'a, D> {
                 None => vec![(st, Flow::Normal)],
             });
         };
-        let (s, cv) = self.eval(cond_e, st)?;
-        let cond = self.truthy(&cv);
-        match self.d.decide(&cond) {
-            Some(true) => self.exec_block(blk, s),
-            Some(false) => self.exec_arms(rest, els, s),
-            None => {
-                let t = self.exec_block(blk, s.clone())?;
-                let f = self.exec_arms(rest, els, s)?;
-                self.merge_outcomes(&cond, t, f)
-            }
+        let mut out: Outcome<D> = Vec::new();
+        for (s, cv) in self.eval(cond_e, st)? {
+            let cond = self.truthy(&cv);
+            out.extend(match self.decide_on_path(&cond, &s) {
+                Some(true) => self.exec_block(blk, s)?,
+                Some(false) => self.exec_arms(rest, els, s)?,
+                None => {
+                    // Each arm only happens under its own condition, so
+                    // record that before running it. A merge puts the
+                    // original back, because either side happening IS the
+                    // original condition.
+                    let path = s.path.clone();
+                    let (ts, fs) = split_path(s, &cond);
+                    let t = match ts {
+                        Some(x) => self.exec_block(blk, x)?,
+                        None => Vec::new(),
+                    };
+                    let f = match fs {
+                        Some(x) => self.exec_arms(rest, els, x)?,
+                        None => Vec::new(),
+                    };
+                    // One side dead means no branch really happened.
+                    if t.is_empty() || f.is_empty() {
+                        let mut both = t;
+                        both.extend(f);
+                        both
+                    } else {
+                        self.merge_outcomes(&cond, &path, t, f)?
+                    }
+                }
+            });
         }
+        Ok(out)
     }
 
     /// Put two arms' outcomes back together where the shapes allow it.
@@ -248,6 +288,7 @@ impl<'a, D: Domain> Interp<'a, D> {
     fn merge_outcomes(
         &mut self,
         cond: &D::Bool,
+        path: &[(D::Bool, bool)],
         t: Outcome<D>,
         f: Outcome<D>,
     ) -> Result<Outcome<D>> {
@@ -256,7 +297,7 @@ impl<'a, D: Domain> Interp<'a, D> {
             let mut f = f;
             let (ts, tf) = t.pop().unwrap();
             let (fs, ff) = f.pop().unwrap();
-            if let Some(m) = merge(&mut self.d, cond, ts.clone(), fs.clone())? {
+            if let Some(m) = merge(&mut self.d, cond, path, ts.clone(), fs.clone())? {
                 let flow = match (&tf, &ff) {
                     (Flow::Return(a), Flow::Return(b)) => match (a, b) {
                         (Value::Num(x), Value::Num(y)) => {
@@ -288,20 +329,41 @@ impl<'a, D: Domain> Interp<'a, D> {
         if f.step().is_some() {
             bail!("numeric for with an explicit step is not supported");
         }
-        let (s, from) = self.eval(f.start(), st)?;
-        let (s, to) = self.eval(f.end(), s)?;
-        let (Value::Num(from), Value::Num(to)) = (&from, &to) else {
-            bail!("numeric for bounds must be numbers");
-        };
-        let from = self
-            .d
-            .as_const(from)
-            .ok_or_else(|| refuse_unknown("a numeric for's start"))?;
-        let to = self
-            .d
-            .as_const(to)
-            .ok_or_else(|| refuse_unknown("a numeric for's limit"))?;
         let name = ident(f.index_variable())?;
+        let mut all: Outcome<D> = Vec::new();
+        // Bounds can themselves fan out (they are expressions), so each
+        // combination is its own loop.
+        let mut bounds: Multi<D, (P8, P8)> = Vec::new();
+        for (s, from) in self.eval(f.start(), st)? {
+            for (s, to) in self.eval(f.end(), s)? {
+                let (Value::Num(a), Value::Num(b)) = (&from, &to) else {
+                    bail!("numeric for bounds must be numbers");
+                };
+                let a = self
+                    .d
+                    .as_const(a)
+                    .ok_or_else(|| refuse_unknown("a numeric for's start"))?;
+                let b = self
+                    .d
+                    .as_const(b)
+                    .ok_or_else(|| refuse_unknown("a numeric for's limit"))?;
+                bounds.push((s, (a, b)));
+            }
+        }
+        for (s, (from, to)) in bounds {
+            all.extend(self.run_for(f, &name, from, to, s)?);
+        }
+        Ok(all)
+    }
+
+    fn run_for(
+        &mut self,
+        f: &'a ast::NumericFor,
+        name: &str,
+        from: P8,
+        to: P8,
+        s: State<D>,
+    ) -> Result<Outcome<D>> {
 
         // A `break` ends the LOOP for that state, not the state: it moves
         // to `done` and carries on after the loop. Getting this wrong the
@@ -309,7 +371,6 @@ impl<'a, D: Domain> Interp<'a, D> {
         // its full 32767 iterations instead of stopping.
         let mut running: Outcome<D> = vec![(s, Flow::Normal)];
         let mut done: Outcome<D> = Vec::new();
-        let name = &name;
         let one = P8::from_i16(1);
         let mut i = from;
         while i <= to && running.iter().any(|(_, f)| f.is_normal()) {
@@ -343,6 +404,16 @@ impl<'a, D: Domain> Interp<'a, D> {
 
     // ------------------------------------------------------- expressions
 
+    /// Decide a condition, consulting what the path already assumed. A
+    /// literal branched on earlier is not unknown any more, and that is
+    /// what stops `a and b or c` fanning out twice on the same question.
+    fn decide_on_path(&self, cond: &D::Bool, st: &State<D>) -> Option<bool> {
+        if let Some(b) = self.d.decide(cond) {
+            return Some(b);
+        }
+        st.path.iter().find(|(l, _)| l == cond).map(|(_, v)| *v)
+    }
+
     fn truthy(&mut self, v: &Value<D>) -> D::Bool {
         // Lua: only nil and false are falsy. So a number condition is
         // statically TRUE, which removes most would-be branches before
@@ -358,7 +429,7 @@ impl<'a, D: Domain> Interp<'a, D> {
         &mut self,
         e: &'a ast::Expression,
         st: State<D>,
-    ) -> Result<(State<D>, Value<D>)> {
+    ) -> Result<Multi<D, Value<D>>> {
         match e {
             ast::Expression::Number(n) => {
                 let TokenType::Number { text } = n.token_type() else {
@@ -366,64 +437,68 @@ impl<'a, D: Domain> Interp<'a, D> {
                 };
                 let v: P8 = text.parse()?;
                 let n = self.d.num(v);
-                Ok((st, Value::Num(n)))
+                Ok(vec![(st, Value::Num(n))])
             }
             ast::Expression::String(s) => {
                 let TokenType::StringLiteral { literal, .. } = s.token_type() else {
                     bail!("expected a string literal");
                 };
-                Ok((st, Value::Str(literal.to_string().into())))
+                Ok(vec![(st, Value::Str(literal.to_string().into()))])
             }
             ast::Expression::Symbol(sym) => {
                 let TokenType::Symbol { symbol } = sym.token_type() else {
                     bail!("expected a symbol");
                 };
-                Ok(match symbol {
-                    Symbol::True => {
-                        let b = self.d.boolean(true);
-                        (st, Value::Bool(b))
-                    }
-                    Symbol::False => {
-                        let b = self.d.boolean(false);
-                        (st, Value::Bool(b))
-                    }
-                    Symbol::Nil => (st, Value::Nil),
+                let v = match symbol {
+                    Symbol::True => Value::Bool(self.d.boolean(true)),
+                    Symbol::False => Value::Bool(self.d.boolean(false)),
+                    Symbol::Nil => Value::Nil,
                     other => bail!("unsupported symbol {:?}", other),
-                })
+                };
+                Ok(vec![(st, v)])
             }
             ast::Expression::Parentheses { expression, .. } => self.eval(expression, st),
             ast::Expression::UnaryOperator { unop, expression } => {
-                let (st, v) = self.eval(expression, st)?;
-                Ok(match unop {
-                    ast::UnOp::Minus(_) => {
-                        let Value::Num(n) = v else { bail!("unary minus on a non-number") };
-                        let r = self.d.fun1(Fun1::Neg, &n)?;
-                        (st, Value::Num(r))
-                    }
-                    ast::UnOp::Hash(_) => {
-                        // Concrete, because the heap is. This is why
-                        // `for i=1,#t` needs no unrolling heuristic.
-                        let Value::Table(t) = v else { bail!("# of a non-table") };
-                        let len = st.heap.tables[&t].arr.len() as i16;
-                        let n = self.d.num(P8::from_i16(len));
-                        (st, Value::Num(n))
-                    }
-                    ast::UnOp::Not(_) => {
-                        let t = self.truthy(&v);
-                        let r = self.d.not(&t);
-                        (st, Value::Bool(r))
-                    }
-                    other => bail!("unsupported unary operator {:?}", other),
-                })
+                let mut out = Vec::new();
+                for (st, v) in self.eval(expression, st)? {
+                    out.push(match unop {
+                        ast::UnOp::Minus(_) => {
+                            let Value::Num(n) = v else { bail!("unary minus on a non-number") };
+                            let r = self.d.fun1(Fun1::Neg, &n)?;
+                            (st, Value::Num(r))
+                        }
+                        ast::UnOp::Hash(_) => {
+                            // Concrete, because the heap is. This is why
+                            // `for i=1,#t` needs no unrolling heuristic.
+                            let Value::Table(t) = v else { bail!("# of a non-table") };
+                            let len = st.heap.tables[&t].arr.len() as i16;
+                            let n = self.d.num(P8::from_i16(len));
+                            (st, Value::Num(n))
+                        }
+                        ast::UnOp::Not(_) => {
+                            let t = self.truthy(&v);
+                            let r = self.d.not(&t);
+                            (st, Value::Bool(r))
+                        }
+                        other => bail!("unsupported unary operator {:?}", other),
+                    });
+                }
+                Ok(out)
             }
             ast::Expression::BinaryOperator { lhs, binop, rhs } => {
-                self.eval_binop(lhs, binop, rhs, st)
+                // Carry the SOURCE TEXT. A type error in an expression is
+                // useless without knowing which expression.
+                self.eval_binop(lhs, binop, rhs, st).map_err(|err| {
+                    let t = e.to_string();
+                    let t = t.trim();
+                    anyhow!("in `{}`: {:#}", &t[..t.len().min(60)], err)
+                })
             }
             ast::Expression::Var(v) => match v {
                 ast::Var::Name(t) => {
                     let n = ident(t)?;
                     let val = self.read_name(&n, &st);
-                    Ok((st, val))
+                    Ok(vec![(st, val)])
                 }
                 ast::Var::Expression(ve) => {
                     let suffixes: Vec<_> = ve.suffixes().collect();
@@ -435,28 +510,37 @@ impl<'a, D: Domain> Interp<'a, D> {
             ast::Expression::Function((_, body)) => {
                 let id = self.intern_body(body);
                 let env = st.scope;
-                Ok((st, Value::Func { body: id, env }))
+                Ok(vec![(st, Value::Func { body: id, env })])
             }
             ast::Expression::TableConstructor(t) => {
-                let mut st = st;
-                let id = st.heap.new_table();
+                let mut cur: Multi<D, TableId> = {
+                    let mut st = st;
+                    let id = st.heap.new_table();
+                    vec![(st, id)]
+                };
                 for field in t.fields() {
-                    match field {
-                        ast::Field::NameKey { key, value, .. } => {
-                            let k = ident(key)?;
-                            let (st2, v) = self.eval(value, st)?;
-                            st = st2;
-                            st.heap.tables.get_mut(&id).unwrap().hash.insert(k, v);
+                    let mut next: Multi<D, TableId> = Vec::new();
+                    for (st, id) in cur {
+                        match field {
+                            ast::Field::NameKey { key, value, .. } => {
+                                let k = ident(key)?;
+                                for (mut st, v) in self.eval(value, st)? {
+                                    st.heap.tables.get_mut(&id).unwrap().hash.insert(k.clone(), v);
+                                    next.push((st, id));
+                                }
+                            }
+                            ast::Field::NoKey(e) => {
+                                for (mut st, v) in self.eval(e, st)? {
+                                    st.heap.tables.get_mut(&id).unwrap().arr.push(v);
+                                    next.push((st, id));
+                                }
+                            }
+                            other => bail!("unsupported table field {:?}", other),
                         }
-                        ast::Field::NoKey(e) => {
-                            let (st2, v) = self.eval(e, st)?;
-                            st = st2;
-                            st.heap.tables.get_mut(&id).unwrap().arr.push(v);
-                        }
-                        other => bail!("unsupported table field {:?}", other),
                     }
+                    cur = next;
                 }
-                Ok((st, Value::Table(id)))
+                Ok(cur.into_iter().map(|(st, id)| (st, Value::Table(id))).collect())
             }
             other => bail!("unsupported expression {:?}", other),
         }
@@ -468,45 +552,64 @@ impl<'a, D: Domain> Interp<'a, D> {
         binop: &ast::BinOp,
         rhs: &'a ast::Expression,
         st: State<D>,
-    ) -> Result<(State<D>, Value<D>)> {
-        // `and`/`or` short-circuit and return VALUES, not booleans.
+    ) -> Result<Multi<D, Value<D>>> {
+        // `and`/`or` short-circuit and return VALUES, not booleans - so
+        // `btn(r) and 1` is either a boolean or a number. Those are
+        // different SHAPES, so an undecided condition fans out here and
+        // the two sides merge again only if they agree on kind. The
+        // enclosing `or` is what collapses the idiom back to a number.
         if matches!(binop, ast::BinOp::And(_) | ast::BinOp::Or(_)) {
             let is_and = matches!(binop, ast::BinOp::And(_));
-            let (st, a) = self.eval(lhs, st)?;
-            let t = self.truthy(&a);
-            return match self.d.decide(&t) {
-                Some(x) if x == is_and => self.eval(rhs, st),
-                Some(_) => Ok((st, a)),
-                None => {
-                    let (st, b) = self.eval(rhs, st)?;
-                    let (kept, other) = if is_and { (b, a) } else { (a, b) };
-                    match (&kept, &other) {
-                        (Value::Num(x), Value::Num(y)) => {
-                            let r = self.d.sel_num(&t, x, y);
-                            Ok((st, Value::Num(r)))
+            let mut out = Vec::new();
+            for (st, a) in self.eval(lhs, st)? {
+                let t = self.truthy(&a);
+                match self.decide_on_path(&t, &st) {
+                    Some(x) if x == is_and => out.extend(self.eval(rhs, st)?),
+                    Some(_) => out.push((st, a)),
+                    None => {
+                        let path = st.path.clone();
+                        let taken_cond = if is_and { t.clone() } else { self.d.not(&t) };
+                        let (ts, fs) = split_path(st, &taken_cond);
+                        let taken = match ts {
+                            Some(x) => self.eval(rhs, x)?,
+                            None => Vec::new(),
+                        };
+                        let kept: Multi<D, Value<D>> = match fs {
+                            Some(x) => vec![(x, a)],
+                            None => Vec::new(),
+                        };
+                        if taken.is_empty() || kept.is_empty() {
+                            out.extend(taken);
+                            out.extend(kept);
+                        } else {
+                            out.extend(self.merge_values(&taken_cond, &path, taken, kept)?);
                         }
-                        (Value::Bool(x), Value::Bool(y)) => {
-                            let r = self.d.sel_bool(&t, x, y);
-                            Ok((st, Value::Bool(r)))
-                        }
-                        _ => bail!(
-                            "and/or on an undecided condition needs both sides to be the \
-                             same kind of value ({:?} and {:?})",
-                            kept, other
-                        ),
                     }
                 }
-            };
+            }
+            return Ok(out);
         }
-        let (st, a) = self.eval(lhs, st)?;
-        let (st, b) = self.eval(rhs, st)?;
-        let arith = |op| -> Option<Arith> { Some(op) };
+        let mut out = Vec::new();
+        for (st, a) in self.eval(lhs, st)? {
+            for (st, b) in self.eval(rhs, st)? {
+                out.push((st, self.binop_values(binop, &a, &b)?));
+            }
+        }
+        Ok(out)
+    }
+
+    fn binop_values(
+        &mut self,
+        binop: &ast::BinOp,
+        a: &Value<D>,
+        b: &Value<D>,
+    ) -> Result<Value<D>> {
         let (num_op, cmp_op) = match binop {
-            ast::BinOp::Plus(_) => (arith(Arith::Add), None),
-            ast::BinOp::Minus(_) => (arith(Arith::Sub), None),
-            ast::BinOp::Star(_) => (arith(Arith::Mul), None),
-            ast::BinOp::Slash(_) => (arith(Arith::Div), None),
-            ast::BinOp::Percent(_) => (arith(Arith::Rem), None),
+            ast::BinOp::Plus(_) => (Some(Arith::Add), None),
+            ast::BinOp::Minus(_) => (Some(Arith::Sub), None),
+            ast::BinOp::Star(_) => (Some(Arith::Mul), None),
+            ast::BinOp::Slash(_) => (Some(Arith::Div), None),
+            ast::BinOp::Percent(_) => (Some(Arith::Rem), None),
             ast::BinOp::LessThan(_) => (None, Some(Cmp::Lt)),
             ast::BinOp::LessThanEqual(_) => (None, Some(Cmp::Le)),
             ast::BinOp::GreaterThan(_) => (None, Some(Cmp::Gt)),
@@ -516,29 +619,60 @@ impl<'a, D: Domain> Interp<'a, D> {
             other => bail!("unsupported binary operator {:?}", other),
         };
         if let Some(op) = num_op {
-            let (Value::Num(x), Value::Num(y)) = (&a, &b) else {
+            let (Value::Num(x), Value::Num(y)) = (a, b) else {
                 bail!("arithmetic on non-numbers: {:?} and {:?}", a, b)
             };
-            let r = self.d.arith(op, x, y)?;
-            return Ok((st, Value::Num(r)));
+            return Ok(Value::Num(self.d.arith(op, x, y)?));
         }
         let op = cmp_op.unwrap();
-        let r = match (&a, &b) {
+        let r = match (a, b) {
             (Value::Num(x), Value::Num(y)) => self.d.compare(op, x, y)?,
-            // Equality on anything else is structural and decidable now,
-            // because everything but numbers and booleans is concrete.
+            // Everything but numbers and booleans is concrete, so equality
+            // on it is decidable right here.
             _ if op == Cmp::Eq => {
                 let same = a == b;
                 self.d.boolean(same)
             }
             _ => bail!("comparison of {:?} and {:?}", a, b),
         };
-        let r = if matches!(binop, ast::BinOp::TildeEqual(_)) {
+        Ok(Value::Bool(if matches!(binop, ast::BinOp::TildeEqual(_)) {
             self.d.not(&r)
         } else {
             r
-        };
-        Ok((st, Value::Bool(r)))
+        }))
+    }
+
+    /// Put two fanned-out value outcomes back together where they agree.
+    /// A number and a boolean do NOT agree - that is the whole reason
+    /// `btn(r) and 1` fans out rather than needing a special value kind.
+    fn merge_values(
+        &mut self,
+        cond: &D::Bool,
+        path: &[(D::Bool, bool)],
+        t: Multi<D, Value<D>>,
+        f: Multi<D, Value<D>>,
+    ) -> Result<Multi<D, Value<D>>> {
+        if t.len() == 1 && f.len() == 1 {
+            let mut t = t;
+            let mut f = f;
+            let (ts, tv) = t.pop().unwrap();
+            let (fs, fv) = f.pop().unwrap();
+            let merged = match (&tv, &fv) {
+                (Value::Num(x), Value::Num(y)) => Some(Value::Num(self.d.sel_num(cond, x, y))),
+                (Value::Bool(x), Value::Bool(y)) => Some(Value::Bool(self.d.sel_bool(cond, x, y))),
+                (x, y) if x == y => Some(x.clone()),
+                _ => None,
+            };
+            if let Some(v) = merged {
+                if let Some(m) = merge(&mut self.d, cond, path, ts.clone(), fs.clone())? {
+                    return Ok(vec![(m, v)]);
+                }
+            }
+            return Ok(vec![(ts, tv), (fs, fv)]);
+        }
+        let mut out = t;
+        out.extend(f);
+        Ok(out)
     }
 
     /// Read a name: the scope chain first, then globals. A name that is
@@ -558,12 +692,12 @@ impl<'a, D: Domain> Interp<'a, D> {
         &mut self,
         p: &'a ast::Prefix,
         st: State<D>,
-    ) -> Result<(State<D>, Value<D>)> {
+    ) -> Result<Multi<D, Value<D>>> {
         match p {
             ast::Prefix::Name(t) => {
                 let n = ident(t)?;
                 let v = self.read_name(&n, &st);
-                Ok((st, v))
+                Ok(vec![(st, v)])
             }
             ast::Prefix::Expression(e) => self.eval(e, st),
             other => bail!("unsupported prefix {:?}", other),
@@ -620,7 +754,11 @@ impl<'a, D: Domain> Interp<'a, D> {
                 } else if i as usize == table.arr.len() + 1 {
                     table.arr.push(v);
                 } else {
-                    bail!("array index {} is past the end of a {}-element table", i, table.arr.len());
+                    bail!(
+                        "array index {} is past the end of a {}-element table",
+                        i,
+                        table.arr.len()
+                    );
                 }
             }
         }
@@ -633,53 +771,77 @@ impl<'a, D: Domain> Interp<'a, D> {
         p: &'a ast::Prefix,
         suffixes: &[&'a ast::Suffix],
         st: State<D>,
-    ) -> Result<(State<D>, Value<D>)> {
-        let (mut st, mut cur) = self.eval_prefix(p, st)?;
+    ) -> Result<Multi<D, Value<D>>> {
         // A readable path, so "calling a non-function: nil" says WHICH
         // nil. Costs a string per suffix at trace time and nothing at run
         // time, and it is the difference between a five-minute diagnosis
         // and an hour of bisecting Lua.
-        let mut path = match p {
+        let base = match p {
             ast::Prefix::Name(t) => ident(t).unwrap_or_else(|_| "?".into()),
             _ => "(expr)".to_string(),
         };
+        let mut cur: Multi<D, (Value<D>, String)> = self
+            .eval_prefix(p, st)?
+            .into_iter()
+            .map(|(s, v)| (s, (v, base.clone())))
+            .collect();
         for suffix in suffixes {
-            match suffix {
-                ast::Suffix::Index(ast::Index::Dot { name, .. }) => {
-                    let k = Key::Field(ident(name)?);
-                    path = format!("{}.{}", path, ident(name)?);
-                    cur = self.get_key(&cur, &k, &st)?;
-                }
-                ast::Suffix::Index(ast::Index::Brackets { expression, .. }) => {
-                    let (st2, iv) = self.eval(expression, st)?;
-                    st = st2;
-                    let k = self.index_key(&iv)?;
-                    cur = self.get_key(&cur, &k, &st)?;
-                }
-                ast::Suffix::Call(ast::Call::AnonymousCall(ast::FunctionArgs::Parentheses {
-                    arguments,
-                    ..
-                })) => {
-                    let mut args = Vec::new();
-                    for a in arguments {
-                        let (st2, v) = self.eval(a, st)?;
-                        st = st2;
-                        args.push(v);
+            let mut next: Multi<D, (Value<D>, String)> = Vec::new();
+            for (st, (val, path)) in cur {
+                match suffix {
+                    ast::Suffix::Index(ast::Index::Dot { name, .. }) => {
+                        let k = Key::Field(ident(name)?);
+                        let p2 = format!("{}.{}", path, ident(name)?);
+                        let v = self
+                            .get_key(&val, &k, &st)
+                            .map_err(|e| anyhow!("reading {}: {:#}", p2, e))?;
+                        next.push((st, (v, p2)));
                     }
-                    let (st2, v) = self
-                        .call_value(cur, args, st)
-                        .map_err(|e| anyhow!("calling {}: {:#}", path, e))?;
-                    st = st2;
-                    cur = v;
-                    path = format!("{}()", path);
+                    ast::Suffix::Index(ast::Index::Brackets { expression, .. }) => {
+                        for (st, iv) in self.eval(expression, st)? {
+                            let k = self.index_key(&iv)?;
+                            let v = self.get_key(&val, &k, &st)?;
+                            next.push((st, (v, format!("{}[..]", path))));
+                        }
+                    }
+                    ast::Suffix::Call(ast::Call::AnonymousCall(
+                        ast::FunctionArgs::Parentheses { arguments, .. },
+                    )) => {
+                        let mut argsets: Multi<D, Vec<Value<D>>> = vec![(st, Vec::new())];
+                        for a in arguments {
+                            let mut grown: Multi<D, Vec<Value<D>>> = Vec::new();
+                            for (st, sofar) in argsets {
+                                for (st, v) in self.eval(a, st)? {
+                                    let mut xs = sofar.clone();
+                                    xs.push(v);
+                                    grown.push((st, xs));
+                                }
+                            }
+                            argsets = grown;
+                        }
+                        for (st, args) in argsets {
+                            let got = self
+                                .call_value(val.clone(), args, st)
+                                .map_err(|e| anyhow!("calling {}: {:#}", path, e))?;
+                            next.extend(
+                                got.into_iter().map(|(s, v)| (s, (v, format!("{}()", path)))),
+                            );
+                        }
+                    }
+                    other => bail!("unsupported suffix {:?}", other),
                 }
-                other => bail!("unsupported suffix {:?}", other),
             }
+            cur = next;
         }
-        Ok((st, cur))
+        Ok(cur.into_iter().map(|(s, (v, _))| (s, v)).collect())
     }
 
-    fn assign_var(&mut self, var: &'a ast::Var, v: Value<D>, st: State<D>) -> Result<State<D>> {
+    fn assign_var(
+        &mut self,
+        var: &'a ast::Var,
+        v: Value<D>,
+        st: State<D>,
+    ) -> Result<Vec<State<D>>> {
         match var {
             ast::Var::Name(t) => {
                 let name = ident(t)?;
@@ -688,25 +850,33 @@ impl<'a, D: Domain> Interp<'a, D> {
                     let g = st.globals;
                     st.heap.tables.get_mut(&g).unwrap().hash.insert(name, v);
                 }
-                Ok(st)
+                Ok(vec![st])
             }
             ast::Var::Expression(e) => {
                 let suffixes: Vec<_> = e.suffixes().collect();
                 let Some((last, init)) = suffixes.split_last() else {
                     bail!("assignment target with no suffixes")
                 };
-                let (mut st, target) = self.walk_suffixes(e.prefix(), init, st)?;
-                let k = match last {
-                    ast::Suffix::Index(ast::Index::Dot { name, .. }) => Key::Field(ident(name)?),
-                    ast::Suffix::Index(ast::Index::Brackets { expression, .. }) => {
-                        let (st2, iv) = self.eval(expression, st)?;
-                        st = st2;
-                        self.index_key(&iv)?
+                let mut out = Vec::new();
+                for (st, target) in self.walk_suffixes(e.prefix(), init, st)? {
+                    match last {
+                        ast::Suffix::Index(ast::Index::Dot { name, .. }) => {
+                            let mut st = st;
+                            let k = Key::Field(ident(name)?);
+                            self.set_key(&target, k, v.clone(), &mut st)?;
+                            out.push(st);
+                        }
+                        ast::Suffix::Index(ast::Index::Brackets { expression, .. }) => {
+                            for (mut st, iv) in self.eval(expression, st)? {
+                                let k = self.index_key(&iv)?;
+                                self.set_key(&target, k, v.clone(), &mut st)?;
+                                out.push(st);
+                            }
+                        }
+                        other => bail!("cannot assign through {:?}", other),
                     }
-                    other => bail!("cannot assign through {:?}", other),
-                };
-                self.set_key(&target, k, v, &mut st)?;
-                Ok(st)
+                }
+                Ok(out)
             }
             other => bail!("unsupported assignment target {:?}", other),
         }
@@ -716,19 +886,20 @@ impl<'a, D: Domain> Interp<'a, D> {
         &mut self,
         call: &'a ast::FunctionCall,
         st: State<D>,
-    ) -> Result<(State<D>, Value<D>)> {
+    ) -> Result<Multi<D, Value<D>>> {
         let suffixes: Vec<_> = call.suffixes().collect();
         self.walk_suffixes(call.prefix(), &suffixes, st)
     }
 
     /// A call is RECURSION - hand the callee the state, get it back. There
-    /// is no inlining because there is nothing to inline into.
+    /// is no inlining because there is nothing to inline into, and a call
+    /// that fans out is just a call that fans out.
     fn call_value(
         &mut self,
         f: Value<D>,
         args: Vec<Value<D>>,
         st: State<D>,
-    ) -> Result<(State<D>, Value<D>)> {
+    ) -> Result<Multi<D, Value<D>>> {
         match f {
             Value::Func { body, env } => {
                 let mut st = st;
@@ -739,28 +910,26 @@ impl<'a, D: Domain> Interp<'a, D> {
                         ast::Parameter::Name(t) => ident(t)?,
                         other => bail!("unsupported parameter {:?}", other),
                     };
-                    st.heap.declare(frame, &name, args.get(i).cloned().unwrap_or(Value::Nil));
+                    st.heap
+                        .declare(frame, &name, args.get(i).cloned().unwrap_or(Value::Nil));
                 }
                 let outer = st.scope;
+                // The caller's scope must stay a GC ROOT while the callee
+                // runs: the frame's parent is the closure's captured
+                // scope, not the caller's.
+                st.stack.push(outer);
                 st.scope = frame;
-                let out = self.exec_block(b.block(), st)?;
-                if out.len() != 1 {
-                    // An expression threads ONE state, so a call that
-                    // ended in several is a shape divergence inside an
-                    // expression. Loud, because the alternative is picking
-                    // one arbitrarily.
-                    bail!(
-                        "a call fanned out into {} states - shape divergence inside an                          expression is not supported yet",
-                        out.len()
-                    );
+                let mut out = Vec::new();
+                for (mut s, flow) in self.exec_block(b.block(), st)? {
+                    s.stack.pop();
+                    s.scope = outer;
+                    out.push(match flow {
+                        Flow::Return(v) => (s, v),
+                        Flow::Normal => (s, Value::Nil),
+                        Flow::Break => bail!("break outside a loop"),
+                    });
                 }
-                let (mut s, flow) = out.into_iter().next().unwrap();
-                s.scope = outer;
-                Ok(match flow {
-                    Flow::Return(v) => (s, v),
-                    Flow::Normal => (s, Value::Nil),
-                    Flow::Break => bail!("break outside a loop"),
-                })
+                Ok(out)
             }
             Value::Builtin(name) => self.call_builtin(name, args, st),
             other => bail!("calling a non-function: {:?}", other),
@@ -772,14 +941,14 @@ impl<'a, D: Domain> Interp<'a, D> {
         name: &'static str,
         args: Vec<Value<D>>,
         st: State<D>,
-    ) -> Result<(State<D>, Value<D>)> {
+    ) -> Result<Multi<D, Value<D>>> {
         let num = |v: &Value<D>| -> Result<D::Num> {
             match v {
                 Value::Num(n) => Ok(n.clone()),
                 other => bail!("{}: expected a number, got {:?}", name, other),
             }
         };
-        Ok(match name {
+        let one = match name {
             "abs" | "flr" | "sin" => {
                 let f = match name {
                     "abs" => Fun1::Abs,
@@ -787,14 +956,11 @@ impl<'a, D: Domain> Interp<'a, D> {
                     _ => Fun1::Sin,
                 };
                 let a = num(&args[0])?;
-                let r = self.d.fun1(f, &a)?;
-                (st, Value::Num(r))
+                (st, Value::Num(self.d.fun1(f, &a)?))
             }
-            // The map is DATA, not code, and it is concrete - so a
-            // lookup with concrete coordinates folds to a constant here
-            // exactly as it would in the interpreter. Only a symbolic
-            // coordinate would need the graph, and that is `zn_mget`'s
-            // job in the emitted kernel rather than the tracer's.
+            // The map is DATA, not code, and it is concrete - so a lookup
+            // with concrete coordinates folds to a constant here exactly
+            // as it would in the interpreter.
             "mget" | "fget" => {
                 let cart = self
                     .cart
@@ -807,33 +973,19 @@ impl<'a, D: Domain> Interp<'a, D> {
                 );
                 if name == "mget" {
                     let t = cart.mget(x, y)?;
-                    let n = self.d.num(P8::from_i16(t as i16));
-                    (st, Value::Num(n))
+                    (st, Value::Num(self.d.num(P8::from_i16(t as i16))))
                 } else {
                     let r = cart.fget(x, y)?;
-                    let b = self.d.boolean(r);
-                    (st, Value::Bool(b))
+                    (st, Value::Bool(self.d.boolean(r)))
                 }
             }
             "print" | "__print" => (st, Value::Nil),
             // A merge HINT. The frontend turns it into a block flag so the
             // interpreter's worklist accumulates states there; the tracer
-            // merges at every join by construction, so there is nothing
-            // for it to do. Kept rather than removed from the Lua because
-            // the IR pipeline still needs it.
+            // merges at every join by construction.
             "_hint_normalize" => (st, Value::Nil),
-            // On an EXACT value the floor is already unique, so there is
-            // one fragment and this is the identity. It only splits once
-            // the value has been widened to an interval - and the tracer
-            // has no widening yet, which is the next real design question
-            // (see plans/tracing.md): the search depends on `rem` being
-            // widened so that states merge, so an exact-semantics graph is
-            // correct but would not merge anything.
-            "__split_by_flr" | "__split_at" => (st, args[0].clone()),
             // Shrinking an array is a SHAPE change, which is exactly what
-            // the tracer is built to let happen: two branches that
-            // disagree about whether an object exists stop being
-            // mergeable and become two output states.
+            // the tracer is built to let happen.
             "__array_table_drop_last" => {
                 let Value::Table(t) = &args[0] else {
                     bail!("__array_table_drop_last on a non-table: {:?}", args[0])
@@ -845,18 +997,20 @@ impl<'a, D: Domain> Interp<'a, D> {
                     .ok_or_else(|| anyhow!("__array_table_drop_last on an empty table"))?;
                 (st, Value::Nil)
             }
-            "__new_unknown_boolean" => {
-                let b = self.d.unknown_bool()?;
-                (st, Value::Bool(b))
-            }
+            // On an EXACT value the floor is unique, so there is one
+            // fragment and this is the identity. It only splits once the
+            // value has been widened to an interval - which the boundary
+            // does, not the frame (see plans/tracing.md).
+            "__split_by_flr" | "__split_at" => (st, args[0].clone()),
+            "__new_unknown_boolean" => (st, Value::Bool(self.d.unknown_bool()?)),
             "min" | "max" => {
                 let f = if name == "min" { Fun2::Min } else { Fun2::Max };
                 let (a, b) = (num(&args[0])?, num(&args[1])?);
-                let r = self.d.fun2(f, &a, &b)?;
-                (st, Value::Num(r))
+                (st, Value::Num(self.d.fun2(f, &a, &b)?))
             }
             other => bail!("unsupported builtin {:?}", other),
-        })
+        };
+        Ok(vec![one])
     }
 }
 
@@ -884,17 +1038,17 @@ mod tests {
         full_moon::parse(src).expect("parse")
     }
 
-    fn fresh<D: Domain>() -> State<D> {
+    fn fresh<D: Domain>(_d: &mut D) -> State<D> {
         let mut heap: Heap<D> = Heap::default();
         let globals = heap.new_table();
         let scope = heap.new_scope(None);
-        State { heap, globals, scope }
+        State { heap, globals, scope, stack: Vec::new(), path: Vec::new() }
     }
 
     /// Run `src` and read back the global `result`.
     fn run<'a, D: Domain>(d: D, ast: &'a full_moon::ast::Ast) -> (Interp<'a, D>, Value<D>) {
         let mut it = Interp::new(d);
-        let st = fresh::<D>();
+        let st = fresh::<D>(&mut it.d);
         let out = it.exec_block(ast.nodes(), st).expect("exec");
         assert_eq!(out.len(), 1, "expected one outcome");
         let s = &out[0].0;
@@ -967,7 +1121,7 @@ mod tests {
         // `input` stands in for game data the tracer cannot know.
         let sym = d.graph.leaf(Op::Cell(1));
         let mut it = Interp::new(d);
-        let mut st = fresh::<Symbolic>();
+        let mut st = fresh::<Symbolic>(&mut it.d);
         let g = st.globals;
         st.heap.tables.get_mut(&g).unwrap().hash.insert("input".into(), Value::Num(sym));
 

@@ -77,8 +77,11 @@ impl<D: Domain> std::fmt::Debug for Value<D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Value::Nil => write!(f, "nil"),
-            Value::Num(n) => write!(f, "{:?}", n),
-            Value::Bool(b) => write!(f, "{:?}", b),
+            // Tag the kind: both domains render a Num and a Bool the same
+            // way (a node id, or a raw number), and "arithmetic on
+            // non-numbers: 201 and 184" says nothing without it.
+            Value::Num(n) => write!(f, "num({:?})", n),
+            Value::Bool(b) => write!(f, "bool({:?})", b),
             Value::Str(s) => write!(f, "{:?}", s),
             Value::Table(t) => write!(f, "table#{}", t),
             Value::Func { body, env } => write!(f, "fn#{}@{}", body, env),

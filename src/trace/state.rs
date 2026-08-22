@@ -27,17 +27,49 @@ pub struct State<D: Domain> {
     pub globals: TableId,
     /// The scope the interpreter is currently executing in.
     pub scope: ScopeId,
+    /// The scopes of the callers waiting on this one - the CALL STACK.
+    ///
+    /// They have to be GC roots. A callee's frame has the closure's
+    /// captured scope as its parent, NOT the caller's, so the caller's
+    /// scope is unreachable from the current one. Without this a merge
+    /// inside a call collects the scope the caller is about to return to,
+    /// and the restored id points at nothing - which showed up as `this`
+    /// being nil in a function whose body had branched.
+    pub stack: Vec<ScopeId>,
+    /// The conditions ASSUMED on the way here - the path condition, as a
+    /// conjunction of literals.
+    ///
+    /// A single opaque `live` node is not enough, and the reason is
+    /// concrete. `btn(up) and -1` fans out; on the branch that kept a
+    /// boolean, `btn(up)` is FALSE, so the enclosing `or` should take its
+    /// right side. With only an opaque conjunction the tracer cannot see
+    /// that, fans out again, and one of the results is a dead state whose
+    /// value is a boolean where the program wants a number - which then
+    /// fails in arithmetic rather than being dropped.
+    ///
+    /// Keeping the literals makes both cheap: a branch whose negation is
+    /// already assumed is DEAD and never explored, and a condition already
+    /// assumed decides immediately.
+    pub path: Vec<(D::Bool, bool)>,
 }
 
 impl<D: Domain> Clone for State<D> {
     fn clone(&self) -> Self {
-        State { heap: self.heap.clone(), globals: self.globals, scope: self.scope }
+        State {
+            heap: self.heap.clone(),
+            globals: self.globals,
+            scope: self.scope,
+            stack: self.stack.clone(),
+            path: self.path.clone(),
+        }
     }
 }
 
 impl<D: Domain> State<D> {
     pub fn roots(&self) -> Vec<Root> {
-        vec![Root::Table(self.globals), Root::Scope(self.scope)]
+        let mut r = vec![Root::Table(self.globals), Root::Scope(self.scope)];
+        r.extend(self.stack.iter().map(|s| Root::Scope(*s)));
+        r
     }
     pub fn gc(&mut self) {
         let r = self.roots();
@@ -54,9 +86,13 @@ impl<D: Domain> State<D> {
 /// Both sides are GC'd first, because two states that did the same thing
 /// by different routes leave different garbage behind and would otherwise
 /// look like different shapes.
+/// Merge two states. `path` is what the two sides were split FROM - the
+/// merged state happens exactly when either side would have, so it drops
+/// back to the common prefix.
 pub fn merge<D: Domain>(
     d: &mut D,
     cond: &D::Bool,
+    path: &[(D::Bool, bool)],
     mut t: State<D>,
     mut f: State<D>,
 ) -> Result<Option<State<D>>> {
@@ -66,11 +102,18 @@ pub fn merge<D: Domain>(
         return Ok(None);
     }
 
-    // Walk both heaps in the same canonical BFS order and rebuild. The ids
-    // in the two heaps are unrelated - each arm allocated its own - so the
-    // merged heap gets fresh ids in canonical order. Tables and scopes
-    // draw from ONE id counter, so canonical index i is literally the id
-    // object i gets, and no second renumbering pass is needed.
+    // Rebuild into the T SIDE'S NUMBERING, not a fresh canonical one.
+    //
+    // Both sides descend from the same pre-branch state, so every id the
+    // CALLER is holding - the scope to return to, a table it is midway
+    // through building - is valid in `t` and unchanged there. Renumbering
+    // into a fresh canonical space invalidated all of them, which showed
+    // up as `this` being nil inside a function whose body had merged: the
+    // caller restored a scope id that no longer existed.
+    //
+    // Canonical order is still what PAIRS the two sides, so allocation
+    // history cannot make equal states look different. It just is not
+    // what the result is numbered by.
     let t_order = canonical_order(&t);
     let f_order = canonical_order(&f);
     if t_order.len() != f_order.len() {
@@ -78,89 +121,66 @@ pub fn merge<D: Domain>(
         // is not describing what merging actually depends on.
         bail!("merge: canonical orders disagree after equal shapes");
     }
-    let t_idx: BTreeMap<Root, u32> = index_of(&t_order);
 
-    let mut heap: Heap<D> = Heap::default();
-    for r in &t_order {
-        match r {
-            Root::Table(_) => {
-                heap.new_table();
-            }
-            Root::Scope(_) => {
-                heap.new_scope(None);
-            }
-        }
-    }
-
-    for (i, (rt, rf)) in t_order.iter().zip(f_order.iter()).enumerate() {
+    let mut heap = t.heap.clone();
+    for (rt, rf) in t_order.iter().zip(f_order.iter()) {
         match (rt, rf) {
             (Root::Table(a), Root::Table(b)) => {
-                let (ta, tb) = (&t.heap.tables[a], &f.heap.tables[b]);
-                let mut hash = BTreeMap::new();
-                for (k, va) in &ta.hash {
-                    let vb = tb.hash.get(k).ok_or_else(|| {
+                let tb = &f.heap.tables[b];
+                let keys: Vec<String> = heap.tables[a].hash.keys().cloned().collect();
+                for k in keys {
+                    let va = heap.tables[a].hash[&k].clone();
+                    let vb = tb.hash.get(&k).ok_or_else(|| {
                         anyhow::anyhow!("merge: key {:?} missing after equal shapes", k)
                     })?;
-                    hash.insert(k.clone(), join(d, cond, va, vb, &t_idx)?);
+                    let j = join(d, cond, &va, vb)?;
+                    heap.tables.get_mut(a).unwrap().hash.insert(k, j);
                 }
-                let mut arr = Vec::with_capacity(ta.arr.len());
-                for (va, vb) in ta.arr.iter().zip(tb.arr.iter()) {
-                    arr.push(join(d, cond, va, vb, &t_idx)?);
+                for i in 0..heap.tables[a].arr.len() {
+                    let va = heap.tables[a].arr[i].clone();
+                    let j = join(d, cond, &va, &tb.arr[i])?;
+                    heap.tables.get_mut(a).unwrap().arr[i] = j;
                 }
-                let tab = heap.tables.get_mut(&(i as u32)).unwrap();
-                tab.hash = hash;
-                tab.arr = arr;
             }
             (Root::Scope(a), Root::Scope(b)) => {
-                let (sa, sb) = (&t.heap.scopes[a], &f.heap.scopes[b]);
-                let mut vars = BTreeMap::new();
-                for (k, va) in &sa.vars {
-                    let vb = sb.vars.get(k).ok_or_else(|| {
+                let sb = &f.heap.scopes[b];
+                let keys: Vec<String> = heap.scopes[a].vars.keys().cloned().collect();
+                for k in keys {
+                    let va = heap.scopes[a].vars[&k].clone();
+                    let vb = sb.vars.get(&k).ok_or_else(|| {
                         anyhow::anyhow!("merge: local {:?} missing after equal shapes", k)
                     })?;
-                    vars.insert(k.clone(), join(d, cond, va, vb, &t_idx)?);
+                    let j = join(d, cond, &va, vb)?;
+                    heap.scopes.get_mut(a).unwrap().vars.insert(k, j);
                 }
-                let parent = sa.parent.map(|p| t_idx[&Root::Scope(p)]);
-                let sc = heap.scopes.get_mut(&(i as u32)).unwrap();
-                sc.vars = vars;
-                sc.parent = parent;
             }
             _ => bail!("merge: canonical orders disagree in kind after equal shapes"),
         }
     }
 
-    // roots() puts the globals table first and the current scope second,
-    // and canonical numbering starts from roots, so these are fixed.
-    Ok(Some(State { heap, globals: t_idx[&Root::Table(t.globals)], scope: t_idx[&Root::Scope(t.scope)] }))
+    Ok(Some(State {
+        heap,
+        globals: t.globals,
+        scope: t.scope,
+        stack: t.stack.clone(),
+        path: path.to_vec(),
+    }))
 }
 
 /// Merge one slot. Only numbers and booleans can actually differ - the
 /// shapes agreed about everything else - so this is where the `Sel` nodes
 /// come from, and `Graph::fold` collapses the ones whose arms are equal,
 /// which is the overwhelming majority.
-fn join<D: Domain>(
-    d: &mut D,
-    cond: &D::Bool,
-    a: &Value<D>,
-    b: &Value<D>,
-    idx: &BTreeMap<Root, u32>,
-) -> Result<Value<D>> {
+fn join<D: Domain>(d: &mut D, cond: &D::Bool, a: &Value<D>, b: &Value<D>) -> Result<Value<D>> {
     Ok(match (a, b) {
         (Value::Num(x), Value::Num(y)) => Value::Num(d.sel_num(cond, x, y)),
         (Value::Bool(x), Value::Bool(y)) => Value::Bool(d.sel_bool(cond, x, y)),
-        (Value::Table(x), Value::Table(_)) => Value::Table(idx[&Root::Table(*x)]),
-        (Value::Func { body, env }, Value::Func { .. }) => {
-            Value::Func { body: *body, env: idx[&Root::Scope(*env)] }
-        }
-        (Value::Nil, Value::Nil) => Value::Nil,
-        (Value::Str(x), Value::Str(_)) => Value::Str(x.clone()),
-        (Value::Builtin(x), Value::Builtin(_)) => Value::Builtin(x),
+        // The shapes agreed about everything else, and the result keeps
+        // the t side's structure, so t's own value is already right.
+        (x, Value::Table(_) | Value::Func { .. } | Value::Nil | Value::Str(_)
+            | Value::Builtin(_)) => x.clone(),
         (x, y) => bail!("merge: {:?} and {:?} after equal shapes", x, y),
     })
-}
-
-fn index_of(order: &[Root]) -> BTreeMap<Root, u32> {
-    order.iter().enumerate().map(|(i, r)| (*r, i as u32)).collect()
 }
 
 /// Canonical BFS order of the reachable objects. `roots()` seeds it with
@@ -227,6 +247,8 @@ mod tests {
             heap: Heap::default(),
             globals: 0,
             scope: 0,
+            stack: Vec::new(),
+            path: Vec::new(),
         };
         s.globals = s.heap.new_table();
         s.scope = s.heap.new_scope(None);
@@ -250,7 +272,7 @@ mod tests {
         let cond = d.compare(Cmp::Gt, &sym, &zero).unwrap();
         assert_eq!(d.decide(&cond), None);
 
-        let m = merge(&mut d, &cond, s, f).unwrap().expect("same shape merges");
+        let m = merge(&mut d, &cond, &[], s, f).unwrap().expect("same shape merges");
         let player_m = match m.heap.tables[&m.globals].hash["p"] {
             Value::Table(t) => t,
             ref v => panic!("expected a table, got {:?}", v),
@@ -273,7 +295,7 @@ mod tests {
     #[test]
     fn differing_shapes_do_not_merge() {
         let mut d = Symbolic::default();
-        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0 };
+        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), path: Vec::new() };
         s.globals = s.heap.new_table();
         s.scope = s.heap.new_scope(None);
         let obj = s.heap.new_table();
@@ -287,7 +309,7 @@ mod tests {
         let sym = d.graph.leaf(Op::Cell(1));
         let zero = d.num(P8::from_i16(0));
         let cond = d.compare(Cmp::Gt, &sym, &zero).unwrap();
-        assert!(merge(&mut d, &cond, s, f).unwrap().is_none());
+        assert!(merge(&mut d, &cond, &[], s, f).unwrap().is_none());
     }
 
     /// GC before comparing: two states that reached the same place by
@@ -296,7 +318,7 @@ mod tests {
     #[test]
     fn garbage_does_not_prevent_a_merge() {
         let mut d = Symbolic::default();
-        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0 };
+        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), path: Vec::new() };
         s.globals = s.heap.new_table();
         s.scope = s.heap.new_scope(None);
         let mut f = s.clone();
@@ -307,6 +329,28 @@ mod tests {
         let sym = d.graph.leaf(Op::Cell(1));
         let zero = d.num(P8::from_i16(0));
         let cond = d.compare(Cmp::Gt, &sym, &zero).unwrap();
-        assert!(merge(&mut d, &cond, s, f).unwrap().is_some());
+        assert!(merge(&mut d, &cond, &[], s, f).unwrap().is_some());
+    }
+}
+
+/// Split a state on `cond`, dropping either side whose assumption
+/// contradicts what the path already holds. A dead branch is never
+/// explored, which is both a precision win and the thing that stops a
+/// value of the wrong KIND surviving into code that cannot use it.
+pub fn split_path<D: Domain>(
+    s: State<D>,
+    cond: &D::Bool,
+) -> (Option<State<D>>, Option<State<D>>) {
+    let known = s.path.iter().find(|(l, _)| l == cond).map(|(_, v)| *v);
+    match known {
+        Some(true) => (Some(s), None),
+        Some(false) => (None, Some(s)),
+        None => {
+            let mut t = s.clone();
+            t.path.push((cond.clone(), true));
+            let mut f = s;
+            f.path.push((cond.clone(), false));
+            (Some(t), Some(f))
+        }
     }
 }

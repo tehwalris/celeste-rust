@@ -51,11 +51,11 @@ pub fn sources() -> Result<String> {
     Ok(format!("{}\n{}\n{}\n", b3, b4, game))
 }
 
-pub fn fresh_state<D: Domain>() -> State<D> {
+pub fn fresh_state<D: Domain>(_d: &mut D) -> State<D> {
     let mut heap: Heap<D> = Heap::default();
     let globals = heap.new_table();
     let scope = heap.new_scope(None);
-    let mut st = State { heap, globals, scope };
+    let mut st = State { heap, globals, scope, stack: Vec::new(), path: Vec::new() };
     for name in NATIVE {
         st.heap
             .tables
@@ -98,7 +98,7 @@ mod tests {
         let src = sources().expect("sources");
         let ast = full_moon::parse(&src).expect("parse");
         let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
-        let st = fresh_state::<Symbolic>();
+        let st = fresh_state::<Symbolic>(&mut it.d);
         match run_chunk(&mut it, &ast, st) {
             Ok(s) => {
                 let g = &s.heap.tables[&s.globals];
@@ -125,7 +125,7 @@ mod tests {
         it.cart = Some(std::sync::Arc::new(
             celeste_core::cart_data::CartData::load("cart").expect("cart"),
         ));
-        let st = fresh_state::<Symbolic>();
+        let st = fresh_state::<Symbolic>(&mut it.d);
         let st = match run_chunk(&mut it, &ast, st) {
             Ok(s) => s,
             Err(e) => {
@@ -165,7 +165,7 @@ mod tests {
         it.cart = Some(std::sync::Arc::new(
             celeste_core::cart_data::CartData::load("cart").expect("cart"),
         ));
-        let st = fresh_state::<Symbolic>();
+        let st = fresh_state::<Symbolic>(&mut it.d);
         let st = match run_chunk(&mut it, &ast, st) {
             Ok(s) => s,
             Err(e) => return eprintln!("[trace] toplevel stopped at: {:#}", e),
