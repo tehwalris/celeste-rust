@@ -988,6 +988,39 @@ different constants on the same expression, and the `Eq`/`Lt`/`Gt`
 triangle) and the obvious next thing to try if emitted size matters
 again.
 
+### Iterating, and the reason it earns its place
+
+`simplify_until_stable` runs the pass until it stops finding anything. I
+built it for a specific mechanism: atoms are opaque nodes and
+comparisons are atoms, so `Lt(Sel(c, x, y), z)` and `Lt(x, z)` are two
+INDEPENDENT variables. Prove `c` constant, the select collapses, and the
+two comparisons become one node - so a later pass has relational
+information an earlier one could not have had.
+
+That mechanism is real (`a_second_pass_can_see_what_the_first_could_not`
+constructs it) and **it does not fire on this cart**. Three of the four
+outcomes find exactly 0 constants in pass 1. The atom merging DOES
+happen - 545 atoms become 401 - it just yields nothing.
+
+The 30 constants pass 1 finds on outcome 2 are a different effect
+entirely, and only the per-PASS `capped` flag distinguishes them: pass 0
+hit the BDD budget there, and pass 1 ran on a graph small enough to
+finish. Capping correlates perfectly with a productive second pass and
+nothing else does. Reported per pass rather than per run because
+CLAUDE.md forbids silent caps - which is the only reason this was not
+written up as the mechanism working.
+
+So iteration's real value is that it makes the BUDGET not matter:
+
+| | pass 0 | pass 1 | pass 2 | final nodes | lines |
+|---|---|---|---|---|---|
+| cap 4M | 180 (capped) | 30 | 0 | 4,641 | 4,454 |
+| cap 32M | 255 (uncapped) | 0 | - | 4,641 | 4,454 |
+
+Same fixed point, identical output, and the 8x cap costs ~18 GB of peak
+memory for it. So: SMALL cap plus iteration, and the analysis is robust
+to a budget that is too small rather than silently truncated by it.
+
 ### Proved and deliberately not acted on
 
 4,357 further equalities on outcome 2: nodes that are provably the same
