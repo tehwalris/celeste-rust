@@ -51,4 +51,5 @@
 
 pub mod domain;
 pub mod heap;
+pub mod interp;
 pub mod state;

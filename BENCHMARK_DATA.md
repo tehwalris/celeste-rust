@@ -571,6 +571,56 @@ prededup row hashing, dy rep keying, append_out - is unchanged at
 stage 3 (executor-side reuse of per-segment column values in the
 row-key path). Memberchecks ok, suite 553/553.
 
+### Free-choice specialization: -2.7% wall, and it is real (2026-08-22)
+
+The buttons stop being a code structure: the graph is rebuilt once per
+free assignment into one interned arena, the body is emitted once, and the
+64 variants collapse to the DISTINCT ones (36 on steady). Same-day A/B,
+`--abstract-bench ~/perf-scratch/k2ctl 65`, non-fused release build, two
+invocations of 5 reps per side, baseline pinned to an explicit SHA:
+
+| | best min | median min | median mean |
+|---|---|---|---|
+| 69fb2a5 (pre-specialization) | 16,937.44 ms | 17,048.59 ms | 17,114.33 ms |
+| 3d7b536 (specialized) | 16,484.64 ms | 16,587.53 ms | 16,659.81 ms |
+| delta | **-2.7%** | **-2.7%** | **-2.7%** |
+
+Clean separation - the worst specialized run (16,690.41) beats the best
+baseline run (16,937.44) - and the three statistics agree to within 0.04
+points, which they did not in any of the contaminated attempts below. Row
+keys identical on every run.
+
+This is the first change in this campaign whose effect is larger than the
+drift. It also lands exactly where predicted: M1 stage 2 measured -2.6%
+for the same idea done by hand over text (support segments), and the
+prediction written down before running this was "expect that order, not
+the 2.8x node-evaluation ratio". The ratio was never a wall-clock claim.
+
+**Three attempts were thrown away before this one, all my own fault**, and
+the failure modes are worth recording because they all LOOKED like results:
+
+1. Concurrent `cargo build` while the bench ran. The min looked fine
+   (16,785) but the means were visibly polluted (17,783 vs a 16,920
+   baseline). Same "one cargo at a time" rule I had written into CLAUDE.md
+   that morning after it cost a measurement earlier the same day.
+2. `HEAD~1` hardcoded as the baseline. HEAD advanced, the fuse-port commit
+   did not touch generated kernels, so both sides ran the IDENTICAL
+   binary. The tell was `Finished in 0.02s` on the second build - cargo
+   had nothing to rebuild. Baselines get explicit SHAs now.
+3. `pkill -f "bash /tmp/ab.sh"` matched its own wrapper's command line and
+   killed the shell before the heredoc that created the next script, so
+   the run never started - and `pgrep -f "ab2.sh"` matched the MONITOR's
+   command line, so it reported "still running" for half an hour of
+   nothing. Sentinel files (`/tmp/ab2.done`) instead of pgrep now.
+
+**Emitted size went UP where the collapse happens**: steady 1925 -> 3472
+lines, r20-steady 2259 -> 3797 (36 variants' distinct nodes materialized
+in source rather than left for LLVM to make 64 copies of); the other six
+kernels shrank slightly. The fused artifact went 122 KB -> 605 KB and
+takes 48 s to compile under `quick`. So this trades source size and build
+time for run time, and the trade is worth it at these numbers - but it is
+a trade, not a free win.
+
 ### Graph-driven codegen: -1% wall, and a size drop that is not a speedup (2026-08-22)
 
 Task #176 stage B. The class-kernel BODY is now emitted from the graph IR
