@@ -17,8 +17,8 @@ use super::{
     state::State,
     value::{HeapValue, MaybeVector, Value},
 };
-use crate::ir::GlobalId;
-use crate::pico8_num::{Pico8Num, Pico8NumInterval};
+use celeste_ir::ir::GlobalId;
+use celeste_core::pico8_num::{Pico8Num, Pico8NumInterval};
 
 /// A "shape" is a state with all vectorizable values normalized to placeholder values.
 /// States with the same shape can be merged by vectorizing their values.
@@ -1062,7 +1062,7 @@ pub fn assert_state_vector_lengths(state: &State) {
 /// Under the identity map occupant and slot are the same number, so the extra
 /// condition changes nothing.
 fn clean_local_envs_for_merging(states: Vec<State>) -> Vec<State> {
-    use crate::ir::LocalId;
+    use celeste_ir::ir::LocalId;
 
     if states.len() <= 1 {
         return states;
@@ -2045,7 +2045,7 @@ mod tests {
         s.local_env = env;
         let mut outer = LocalEnv::new();
         outer.set_by_raw_id(2, Value::NumberInterval(MaybeVector::Scalar(
-            crate::pico8_num::Pico8NumInterval::from_number(Pico8Num::from_i16(7)),
+            celeste_core::pico8_num::Pico8NumInterval::from_number(Pico8Num::from_i16(7)),
         )));
         s.outer_local_envs = vec![outer, LocalEnv::new()];
         shapes.push(s);
@@ -2335,7 +2335,7 @@ mod tests {
     /// column, a non-vectorizable leaf, and locals.
     #[test]
     fn test_virtual_merge_matches_materialized_pipeline() {
-        use crate::ir::LocalId;
+        use celeste_ir::ir::LocalId;
 
         // Deterministic pseudo-random lane values (no RNG in tests).
         let mut seed: u64 = 0x9e3779b97f4a7c15;
@@ -2370,10 +2370,10 @@ mod tests {
                 .set(c1, HeapValue::Value(Value::Bool(MaybeVector::vector(bools))));
 
             // Cell 2: interval column, two distinct intervals.
-            let intervals: Vec<crate::pico8_num::Pico8NumInterval> = (0..lanes)
+            let intervals: Vec<celeste_core::pico8_num::Pico8NumInterval> = (0..lanes)
                 .map(|_| {
                     let w = next(2);
-                    crate::pico8_num::Pico8NumInterval {
+                    celeste_core::pico8_num::Pico8NumInterval {
                         low: Pico8Num::from_i16(w),
                         high: Pico8Num::from_i16(w + 3),
                     }
@@ -2631,7 +2631,7 @@ impl From<StateSet> for Vec<State> {
 mod watermark_tests {
     use super::*;
     use crate::interpreter::value::MaybeVector;
-    use crate::pico8_num::Pico8Num;
+    use celeste_core::pico8_num::Pico8Num;
 
     #[test]
     fn test_watermark_initial_values() {
@@ -2671,7 +2671,7 @@ mod watermark_tests {
             state.heap.set(id, HeapValue::Value(Value::Number(
                 MaybeVector::Scalar(Pico8Num::from_i16(i))
             )));
-            state.local_env.set(crate::ir::LocalId::from(0), Value::Number(
+            state.local_env.set(celeste_ir::ir::LocalId::from(0), Value::Number(
                 MaybeVector::Scalar(Pico8Num::from_i16(i))
             ));
             states.push(state);

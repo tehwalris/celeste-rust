@@ -10,7 +10,7 @@ use super::{
     state::State,
     value::{HeapValue, MaybeVector, Value},
 };
-use crate::ir::{Instruction, LocalId};
+use celeste_ir::ir::{Instruction, LocalId};
 use anyhow::{anyhow, Context, Result};
 
 type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
@@ -599,7 +599,7 @@ impl<'a> CoreInterpreter<'a> {
                 format!(
                     "at %{} = {}",
                     usize::from(local_id),
-                    crate::rewrite::print::format_instruction(instruction)
+                    celeste_ir::print::format_instruction(instruction)
                 )
             })?;
         if let Some(value) = value {
@@ -951,7 +951,7 @@ pub fn partition_maybe_bool(
 #[cfg(test)]
 mod expand_tests {
     use super::*;
-    use crate::pico8_num::Pico8Num;
+    use celeste_core::pico8_num::Pico8Num;
 
     fn id(n: usize) -> LocalId {
         LocalId::from(n)
@@ -1287,8 +1287,8 @@ mod expand_tests {
     #[test]
     fn a_straddling_lane_no_longer_poisons_the_select() {
         use crate::interpreter::op::{interpret_binary_op, interpret_select, set_partition_straddles};
-        use crate::ir::BinaryOp;
-        use crate::pico8_num::Pico8NumInterval;
+        use celeste_ir::ir::BinaryOp;
+        use celeste_core::pico8_num::Pico8NumInterval;
         let _serialised = straddles_lock();
         set_partition_straddles(true);
 
@@ -1356,7 +1356,7 @@ mod expand_tests {
     #[test]
     fn a_mixed_comparison_with_tri_state_off_collapses_instead_of_panicking() {
         use crate::interpreter::op::{interpret_binary_op, set_partition_straddles};
-        use crate::pico8_num::{Pico8Num, Pico8NumInterval};
+        use celeste_core::pico8_num::{Pico8Num, Pico8NumInterval};
         let _serialised = straddles_lock();
 
         let n = |v: i16| Pico8Num::from_i16(v);
@@ -1368,7 +1368,7 @@ mod expand_tests {
         let right = Value::Number(MaybeVector::Scalar(n(5)));
 
         set_partition_straddles(false);
-        let off = interpret_binary_op(&left, crate::ir::BinaryOp::LessThan, &right)
+        let off = interpret_binary_op(&left, celeste_ir::ir::BinaryOp::LessThan, &right)
             .expect("a mixed comparison must not error");
         assert_eq!(
             off,
@@ -1377,7 +1377,7 @@ mod expand_tests {
         );
 
         set_partition_straddles(true);
-        let on = interpret_binary_op(&left, crate::ir::BinaryOp::LessThan, &right)
+        let on = interpret_binary_op(&left, celeste_ir::ir::BinaryOp::LessThan, &right)
             .expect("a mixed comparison must not error");
         assert!(
             matches!(on, Value::MaybeBool(_)),
@@ -1393,8 +1393,8 @@ mod expand_tests {
     #[test]
     fn an_all_straddling_comparison_is_still_unknown_bool() {
         use crate::interpreter::op::{interpret_binary_op, set_partition_straddles};
-        use crate::ir::BinaryOp;
-        use crate::pico8_num::Pico8NumInterval;
+        use celeste_ir::ir::BinaryOp;
+        use celeste_core::pico8_num::Pico8NumInterval;
         let _serialised = straddles_lock();
         set_partition_straddles(true);
 

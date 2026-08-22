@@ -59,8 +59,8 @@ static COVERAGE: Mutex<Option<Coverage>> = Mutex::new(None);
 /// once pointers are specialized, so they are the part of K we expect not to
 /// survive. `call` disappears under inlining. `arith`/`const`/`select` are the
 /// irreducible core that a compiled kernel would actually emit.
-fn instruction_kind(instr: &crate::ir::Instruction) -> &'static str {
-    use crate::ir::Instruction::*;
+fn instruction_kind(instr: &celeste_ir::ir::Instruction) -> &'static str {
+    use celeste_ir::ir::Instruction::*;
     match instr {
         Alloc | Load { .. } | Store { .. } | StoreEmptyTable { .. } | GetField { .. }
         | GetIndex { .. } => "heap",
@@ -95,7 +95,7 @@ pub fn is_enabled() -> bool {
 }
 
 /// Record one execution of a block. `function` is the enclosing CFG's name.
-pub fn record_block(function: &str, label: &str, block: &crate::ir::Block) {
+pub fn record_block(function: &str, label: &str, block: &celeste_ir::ir::Block) {
     if !is_enabled() {
         return;
     }

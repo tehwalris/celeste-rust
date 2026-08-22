@@ -4,7 +4,7 @@ use std::sync::Arc;
 use indexmap::IndexSet;
 use rustc_hash::FxHasher;
 
-use crate::ir::{Cfg, FunDef, GlobalId, Label};
+use celeste_ir::ir::{Cfg, FunDef, GlobalId, Label};
 
 use super::{state::State, value::Value};
 

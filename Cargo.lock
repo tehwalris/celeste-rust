@@ -78,6 +78,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "celeste-interp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "celeste-core",
+ "celeste-ir",
+ "elsa",
+ "hex",
+ "im",
+ "indexmap 2.2.6",
+ "itertools",
+ "lazy_static",
+ "memmap2",
+ "rustc-hash 1.1.0",
+ "serde",
+ "serde_json",
+ "xxhash-rust",
+ "zstd",
+]
+
+[[package]]
+name = "celeste-ir"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "celeste-core",
+ "full_moon",
+ "itertools",
+ "rustc-hash 1.1.0",
+ "serde",
+]
+
+[[package]]
 name = "celeste-kernels"
 version = "0.1.0"
 dependencies = [
@@ -97,6 +131,8 @@ dependencies = [
  "bincode",
  "celeste-core",
  "celeste-engine",
+ "celeste-interp",
+ "celeste-ir",
  "celeste-kernels",
  "celeste-names",
  "clap",

@@ -96,7 +96,7 @@ pub fn read_origins_named(state: &State, name: &str) -> Vec<u32> {
 /// expand / merge carries it; strip it (remove the global) before any row
 /// canonicalization.
 pub fn inject_named(state: &mut State, name: &str, values: &[u32]) {
-    use crate::pico8_num::Pico8Num;
+    use celeste_core::pico8_num::Pico8Num;
     assert_eq!(values.len(), state.vector_size.max(1), "origin count mismatch");
     let lanes: Vec<Pico8Num> = values
         .iter()

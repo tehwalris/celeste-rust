@@ -32,7 +32,7 @@ use super::{
     state::State,
     value::{HeapValue, MaybeVector, Value},
 };
-use crate::pico8_num::{Pico8Num, Pico8NumInterval};
+use celeste_core::pico8_num::{Pico8Num, Pico8NumInterval};
 
 type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
 

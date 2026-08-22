@@ -52,7 +52,7 @@ pub fn interpret_prepared_cfg_with_name(
     initial_state: State,
     fixed_env: &FixedEnv,
     name: Option<String>,
-    source_span: Option<crate::ir::SourceSpan>,
+    source_span: Option<celeste_ir::ir::SourceSpan>,
 ) -> Result<Vec<(State, Option<Value>)>> {
     interpret_prepared_cfg_inner(prepared, initial_state, fixed_env, name, source_span)
 }
@@ -62,7 +62,7 @@ fn interpret_prepared_cfg_inner(
     mut initial_state: State,
     fixed_env: &FixedEnv,
     name: Option<String>,
-    source_span: Option<crate::ir::SourceSpan>,
+    source_span: Option<celeste_ir::ir::SourceSpan>,
 ) -> Result<Vec<(State, Option<Value>)>> {
     // Locals live in slots, and which slot is which is a property of the CFG we
     // are about to run. On a call the caller already built the environment

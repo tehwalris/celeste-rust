@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-use crate::ir::{Block, Cfg, FunDef, Instruction, Label, SourceSpan, Terminator};
+use celeste_ir::ir::{Block, Cfg, FunDef, Instruction, Label, SourceSpan, Terminator};
 
 // ============================================================================
 // CFG Structure Export
@@ -934,7 +934,7 @@ impl SpanGuard {
     }
 
     /// Create a span with source location info
-    pub fn new_with_source(name: &str, category: &str, source_span: Option<&crate::ir::SourceSpan>) -> Self {
+    pub fn new_with_source(name: &str, category: &str, source_span: Option<&celeste_ir::ir::SourceSpan>) -> Self {
         let active = is_profiling_enabled();
         if active {
             with_profiler(|p| p.start_span(name, category));
@@ -952,7 +952,7 @@ impl SpanGuard {
     pub fn new_with_source_lazy(
         name: impl FnOnce() -> String,
         category: &str,
-        source_span: Option<&crate::ir::SourceSpan>,
+        source_span: Option<&celeste_ir::ir::SourceSpan>,
     ) -> Self {
         let active = is_profiling_enabled();
         if !active {

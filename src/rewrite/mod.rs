@@ -31,7 +31,23 @@ pub mod class_dead;
 pub mod liveness;
 pub mod pos_graph;
 pub mod isocheck;
-pub mod print;
+/// Instruction and CFG printing lives in `celeste-ir` - the interpreter
+/// needs it and must not depend on the rewrite machinery for it. Only the
+/// whole-`Program` printer stays here, because only it needs `Program`.
+pub mod print {
+    pub use celeste_ir::print::*;
+
+    use super::program::Program;
+
+    pub fn format_program(program: &Program) -> String {
+        let mut out = String::new();
+        for fun in program.functions.values() {
+            out.push_str(&format_function(fun));
+            out.push('\n');
+        }
+        out
+    }
+}
 pub mod program;
 pub mod recipe;
 pub mod rules;

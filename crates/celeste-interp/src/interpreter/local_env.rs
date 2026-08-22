@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ir::{LocalId, SlotMap};
+use celeste_ir::ir::{LocalId, SlotMap};
 
 use super::value::Value;
 
@@ -329,7 +329,7 @@ impl LocalEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pico8_num::Pico8Num;
+    use celeste_core::pico8_num::Pico8Num;
     use crate::interpreter::value::MaybeVector;
 
     fn num(n: i16) -> Value {

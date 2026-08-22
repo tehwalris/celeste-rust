@@ -13,12 +13,12 @@ use itertools::Itertools;
 
 type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
+use celeste_core::pico8_num::Pico8Num;
 use crate::{
     ir::{
         BinaryOp, Block, Cfg, FunDef, GlobalIdGenerator, Instruction, Label, LabelGenerator,
         LocalId, LocalIdGenerator, SourcePosition, SourceSpan, Terminator, UnaryOp,
     },
-    pico8_num::Pico8Num,
 };
 
 /// Extract a SourceSpan from a full_moon AST node.

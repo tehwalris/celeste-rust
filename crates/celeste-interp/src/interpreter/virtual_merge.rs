@@ -39,7 +39,7 @@
 //! survivor gather produces the same lanes in the same order. A test in
 //! `vectorize.rs` holds the two paths equal.
 
-use crate::pico8_num::{Pico8Num, Pico8NumInterval};
+use celeste_core::pico8_num::{Pico8Num, Pico8NumInterval};
 
 use super::heap::{Heap, HeapId};
 use super::state::State;

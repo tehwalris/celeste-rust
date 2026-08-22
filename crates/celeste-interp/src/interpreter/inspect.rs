@@ -41,7 +41,7 @@ use super::{
     state::State,
     value::{HeapValue, MaybeVector, Value},
 };
-use crate::pico8_num::Pico8Num;
+use celeste_core::pico8_num::Pico8Num;
 
 // ============================================================================
 // State Summary Types (for JSONL dumps)

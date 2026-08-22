@@ -117,7 +117,7 @@ fn column_keys(column: &Column, rows: usize) -> Vec<u64> {
             }
         }
         Column::Intervals(pieces) => {
-            let pack = |v: &crate::pico8_num::Pico8NumInterval| {
+            let pack = |v: &celeste_core::pico8_num::Pico8NumInterval| {
                 (v.low.to_bits() as u64) | ((v.high.to_bits() as u64) << 32)
             };
             for piece in pieces {
@@ -582,7 +582,7 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pico8_num::Pico8Num;
+    use celeste_core::pico8_num::Pico8Num;
 
     /// The census's bucketing must be the SAME function the `rem` ladder
     /// applies (`abstraction::rem_bucket`, which is private), or its "what

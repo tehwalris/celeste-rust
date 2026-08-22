@@ -8,7 +8,6 @@ use std::fmt::Write;
 
 use crate::ir::{BinaryOp, Block, Cfg, FunDef, Instruction, Label, LocalId, Terminator, UnaryOp};
 
-use super::program::Program;
 
 /// How an instruction is addressed by a rewrite instruction.
 ///
@@ -234,15 +233,6 @@ pub fn format_cfg(cfg: &Cfg) -> String {
     let mut out = String::new();
     for (label, block) in blocks_in_order(cfg) {
         write_block(&mut out, &label, block);
-    }
-    out
-}
-
-pub fn format_program(program: &Program) -> String {
-    let mut out = String::new();
-    for fun in program.functions.values() {
-        out.push_str(&format_function(fun));
-        out.push('\n');
     }
     out
 }

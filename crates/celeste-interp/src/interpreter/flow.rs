@@ -437,7 +437,7 @@ impl<'a> BoundSplitBlockFlow<FlowData> for BoundInterpreterFlow<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pico8_num::Pico8Num;
+    use celeste_core::pico8_num::Pico8Num;
 
     /// A lane-mixed vector condition splits the state in one pass: both
     /// edges' states come back from a single flow_split, filtered exactly

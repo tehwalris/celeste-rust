@@ -1,6 +1,8 @@
 [workspace]
 members = [
     "crates/celeste-core",
+    "crates/celeste-ir",
+    "crates/celeste-interp",
     "crates/celeste-names",
     "crates/celeste-engine",
     "crates/celeste-kernels",
@@ -16,6 +18,8 @@ members = [
 default-members = [
     ".",
     "crates/celeste-core",
+    "crates/celeste-ir",
+    "crates/celeste-interp",
     "crates/celeste-names",
     "crates/celeste-engine",
     "crates/celeste-kernels",
@@ -29,6 +33,8 @@ edition = "2021"
 
 [dependencies]
 celeste-core = { path = "crates/celeste-core" }
+celeste-ir = { path = "crates/celeste-ir" }
+celeste-interp = { path = "crates/celeste-interp" }
 celeste-engine = { path = "crates/celeste-engine" }
 celeste-kernels = { path = "crates/celeste-kernels" }
 celeste-names = { path = "crates/celeste-names" }
@@ -72,6 +78,21 @@ path = "src/bin/rewrite.rs"
 [[bin]]
 name = "lua_run"
 path = "src/bin/lua_run.rs"
+
+# The EDIT LOOP profile. Optimized enough that compute-bound tests finish,
+# cheap enough that a one-line change is not a full-workspace relink:
+# `lto = "fat"` + `codegen-units = 1` on the release profile costs ~100 s
+# per edit and buys nothing for a test that runs in milliseconds.
+#
+# Its own target subdir, so release artifacts stay valid - every number in
+# BENCHMARK_DATA.md was measured under `release` and must keep being
+# comparable. Never make the release profile cheaper to speed the loop up;
+# add to this one.
+[profile.quick]
+inherits = "release"
+lto = false
+codegen-units = 16
+debug = false
 
 [profile.release]
 lto = "fat"

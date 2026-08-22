@@ -98,7 +98,11 @@ fn partition_straddles_enabled() -> bool {
 /// Force the partition path on or off, overriding the environment.
 /// For tests, which must be able to exercise both paths regardless of how
 /// the suite was invoked.
-#[cfg(test)]
+///
+/// Not `#[cfg(test)]`, and neither is the lock below: the tests that use
+/// them live in `celeste-rust`, and `cfg(test)` does not cross a crate
+/// boundary - it would configure these out of the dependency exactly when
+/// the dependent's tests want them.
 pub fn set_partition_straddles(on: bool) {
     PARTITION_STRADDLES.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
 }
@@ -111,7 +115,6 @@ pub fn set_partition_straddles(on: bool) {
 /// frame 24" - the baseline ran with partitioning off, the candidate
 /// with it on). Under nextest this lock is uncontended, so it costs
 /// nothing where the suite actually runs.
-#[cfg(test)]
 pub fn partition_straddles_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
@@ -534,7 +537,7 @@ pub fn interpret_binary_op(l: &Value, op: BinaryOp, r: &Value) -> Result<Value> 
                     | BinaryOp::GreaterThanEqual
             ) =>
         {
-            let lift = |v: &Value| -> Result<MaybeVector<crate::pico8_num::Pico8NumInterval>> {
+            let lift = |v: &Value| -> Result<MaybeVector<celeste_core::pico8_num::Pico8NumInterval>> {
                 match v {
                     Value::NumberInterval(iv) => Ok(iv.clone()),
                     Value::Number(n) => Ok(lift_to_interval(n)),
@@ -544,8 +547,8 @@ pub fn interpret_binary_op(l: &Value, op: BinaryOp, r: &Value) -> Result<Value> 
             let l = lift(l)?;
             let r = lift(r)?;
             // tri-state per lane: Some(bool) definite, None straddling.
-            let judge = |l: &crate::pico8_num::Pico8NumInterval,
-                         r: &crate::pico8_num::Pico8NumInterval|
+            let judge = |l: &celeste_core::pico8_num::Pico8NumInterval,
+                         r: &celeste_core::pico8_num::Pico8NumInterval|
              -> Option<bool> {
                 match op {
                     BinaryOp::LessThan => {
@@ -670,7 +673,7 @@ pub fn interpret_binary_op(l: &Value, op: BinaryOp, r: &Value) -> Result<Value> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pico8_num::Pico8Num;
+    use celeste_core::pico8_num::Pico8Num;
 
     // Helper to create a scalar number
     fn num(n: i16) -> Value {
@@ -1298,7 +1301,7 @@ mod select_tests {
 
 #[cfg(test)]
 mod dict_pricing {
-    use crate::pico8_num::Pico8Num;
+    use celeste_core::pico8_num::Pico8Num;
     use rustc_hash::FxHashMap;
 
     /// Prices per-context evaluation against direct per-lane evaluation, at

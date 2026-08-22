@@ -6,9 +6,9 @@ use crate::interpreter::{
     state::State,
     value::{HeapValue, Value, MaybeVector},
 };
-use crate::pico8_num::{Pico8Num, Pico8NumInterval};
-use crate::cart_data;
-use crate::collision_cache::CollisionCache;
+use celeste_core::pico8_num::{Pico8Num, Pico8NumInterval};
+use celeste_core::cart_data;
+use celeste_core::collision_cache::CollisionCache;
 
 fn format_scalar_number(n: &Pico8Num) -> String {
     let whole = n.whole_part_as_i16();
@@ -816,7 +816,7 @@ fn builtin_sin(args: &[Value]) -> Result<Value> {
     match &args[0] {
         Value::Number(nums) => Ok(Value::Number(nums.map(|n| n.pico8_sin()))),
         Value::NumberInterval(ivs) => {
-            let full = crate::pico8_num::Pico8NumInterval::new(
+            let full = celeste_core::pico8_num::Pico8NumInterval::new(
                 Pico8Num::from_i16(-1),
                 Pico8Num::from_i16(1),
             );

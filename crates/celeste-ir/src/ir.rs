@@ -4,7 +4,7 @@ use std::sync::Arc;
 use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
 
-use crate::pico8_num::Pico8Num;
+use celeste_core::pico8_num::Pico8Num;
 
 type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
