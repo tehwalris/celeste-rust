@@ -253,6 +253,37 @@ The EVALUATOR is the gate; the code generator comes last.
 
 Stage 1 is self-contained and is the right first commit.
 
+#### What actually happened, 2026-08-22
+
+Stages 1 and 3 landed; stage 2 was skipped as premature, and the standalone
+evaluator gate was **subsumed rather than skipped**, which is worth being
+precise about.
+
+The graph now DRIVES code generation (`transpile::lower`), so the class
+kernels the search runs are the graph's own output. That makes
+`compiled_forward_reproduces_the_interpreter` and
+`CELESTE_COMPILED_FORWARD=check` gates on the graph itself - strictly
+stronger than "an evaluator agrees with the kernel", because it validates
+the thing production executes rather than a second reading of it. What it
+does NOT gate is `Graph::eval`, which no longer has a production consumer;
+its unit tests are all that stands behind it. If a later stage makes the
+evaluator load-bearing (equality saturation, a proof obligation), it needs
+its own gate at that point.
+
+Two invariants were added along the way that the plan did not anticipate,
+both because the model would otherwise have been quietly incomplete:
+
+* `Emit::ok` accumulates the BLOCK-UNIFORM bails (`*bd = true`) as well as
+  the per-lane ones. Which of `dp` and `*bd` a condition lands in is
+  derived from whether the condition is uniform, so one node replaces both
+  side channels - and a uniform bail that was not in the chain would have
+  made `ok` claim lanes the emitted code gives up on.
+* `Op::ForkOk` records the ">2 floors" case `zi_fork_flr` deopts. It is
+  always discharged by the fork call, so it never renders; it exists so the
+  chain is complete. In today's kernels the same lanes are caught anyway by
+  the `zi_flr` that follows every fork, but that is a coincidence of these
+  programs, not a property of the lowering.
+
 ### P2 - per-member validity and per-member outputs
 
 - Relax the `valid_expr` equality gate: each member carries its own
@@ -307,8 +338,19 @@ and check that dispatch, the bridge and the chunk accounting handle n > 1.
 
 ## Sequencing
 
-0. **P1' stage 1 (node IR + evaluator) is the first commit** - self-contained,
-   and it does not depend on the census below.
+0. **P1' stage 1 (node IR) - DONE.** Followed by stage 3 (the emitter),
+   because implementing the two button fusions in the TEXT emitter would
+   have meant retrofitting the binary prefix/suffix taint machinery that
+   the fusions exist to delete. Order landed:
+   A. graph completeness (validity covers the uniform bails, `live` split
+      from `ok`, button bits are named leaves, the unexercised interval
+      `__split_at` removed). Gate: all 8 kernels byte-identical.
+   B. `transpile::lower` - representation, placement and guards all
+      DERIVED from the graph; `render` emits from it.
+   C. the two button fusions (exact 2^|cone| placement, output-signature
+      dedup), which are consequences of B rather than features.
+   D. `transpile::fuse` ported onto the graph; the `Line` stream and the
+      taint machinery deleted.
 1. **Census before P2/P3.** Split room (2,0)'s f42 miss tranche by cause.
    It is recorded today as one lump: "f39+ fruit-touch: 786,848 lanes are
    guard/bind refusals ON the covered a9e20c0a shape (class-leaving,

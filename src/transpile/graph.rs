@@ -116,8 +116,10 @@ pub enum Op {
 
     // ---- bool -> bool ----
     Not,
+    /// Tri-state AND. There is no OR: the lowering never builds one, and a
+    /// vocabulary entry nothing constructs is a claim the emitter does not
+    /// back up.
     And,
-    Or,
 
     /// `Sel(cond, then, else)` - the former `if`, in every width.
     Sel,
@@ -132,6 +134,13 @@ pub enum Op {
     /// belong to configuration d. The fork primitive returns a (value,
     /// validity) pair, so it is two nodes, not one.
     ForkValid(u8),
+    /// `ForkOk` over the same operand: does this lane's interval span at
+    /// most TWO floors? Below that the fork is exact; above it there is no
+    /// second configuration to put the third fragment in, so the lane
+    /// deopts. Configuration-independent, hence no index. It exists so the
+    /// validity chain accounts for every lane `zi_fork_flr` gives up on -
+    /// without it `ok` would claim lanes the emitted code deopts.
+    ForkOk,
 
     // ---- cart lookups ----
     Mget,
@@ -208,6 +217,26 @@ impl Graph {
         mask
     }
 
+    /// For every node, which FORK depths it depends on - the same
+    /// reachability as `button_cones`, over the other kind of
+    /// specialization. A fork is a runtime loop, so this decides how deep
+    /// in the loop nest a node has to sit: a node whose fork cone is empty
+    /// is computed once for the whole slice, not once per configuration.
+    pub fn fork_cones(&self) -> Vec<u8> {
+        let mut mask = vec![0u8; self.nodes.len()];
+        for (i, node) in self.nodes.iter().enumerate() {
+            let mut m = match node.op {
+                Op::Fork(d) | Op::ForkValid(d) => 1u8 << d,
+                _ => 0,
+            };
+            for a in &node.args {
+                m |= mask[*a as usize];
+            }
+            mask[i] = m;
+        }
+        mask
+    }
+
     /// Rebuild this graph into `out` with the button bits replaced by
     /// constants, folding as it goes. Returns the mapping old -> new.
     ///
@@ -257,16 +286,15 @@ impl Graph {
                     return self.leaf(Op::ConstBool(!b));
                 }
             }
-            Op::And | Op::Or => {
+            Op::And => {
                 let (x, y) = (cbool(self, 0), cbool(self, 1));
-                let is_and = matches!(op, Op::And);
-                // Absorbing element decides it even if the other side is
-                // symbolic: false AND anything, true OR anything.
-                if x == Some(!is_and) || y == Some(!is_and) {
-                    return self.leaf(Op::ConstBool(!is_and));
+                // `false AND anything` is false even when the other side
+                // is symbolic.
+                if x == Some(false) || y == Some(false) {
+                    return self.leaf(Op::ConstBool(false));
                 }
                 match (x, y) {
-                    (Some(_), Some(_)) => return self.leaf(Op::ConstBool(is_and)),
+                    (Some(_), Some(_)) => return self.leaf(Op::ConstBool(true)),
                     (Some(_), None) => return args[1],
                     (None, Some(_)) => return args[0],
                     _ => {}
@@ -347,6 +375,7 @@ impl Graph {
                 Op::Fork(d) | Op::ForkValid(d) => {
                     bail!("node {}: fork {} has no value outside a configuration", i, d)
                 }
+                Op::ForkOk => bail!("node {}: ForkOk needs the interval's floor span", i),
                 Op::Cell(c) => match cells.get(c) {
                     Some(v) => *v,
                     None => bail!("node {}: input cell {} was not supplied", i, c),
@@ -398,23 +427,14 @@ impl Graph {
                     Self::compare(&node.op, a(0), a(1))?
                 }
                 Op::Not => Val::Bool(a(0).as_bool("Not")?.map(|b| !b)),
-                Op::And | Op::Or => {
-                    let (x, y) = (a(0).as_bool("And/Or")?, a(1).as_bool("And/Or")?);
-                    let is_and = matches!(node.op, Op::And);
-                    // Short-circuit on a decided absorbing element, so
-                    // `false AND unknown` is false, not unknown.
+                Op::And => {
+                    let (x, y) = (a(0).as_bool("And")?, a(1).as_bool("And")?);
+                    // Short-circuit on a decided false, so `false AND
+                    // unknown` is false rather than unknown.
                     Val::Bool(match (x, y) {
-                        (Some(p), Some(q)) => Some(if is_and { p && q } else { p || q }),
-                        (Some(p), None) | (None, Some(p)) => {
-                            if is_and && !p {
-                                Some(false)
-                            } else if !is_and && p {
-                                Some(true)
-                            } else {
-                                None
-                            }
-                        }
-                        (None, None) => None,
+                        (Some(p), Some(q)) => Some(p && q),
+                        (Some(false), None) | (None, Some(false)) => Some(false),
+                        (Some(_), None) | (None, Some(_)) | (None, None) => None,
                     })
                 }
                 Op::Sel => match a(0).as_bool("Sel")? {

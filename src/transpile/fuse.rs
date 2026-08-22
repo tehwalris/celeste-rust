@@ -39,7 +39,7 @@ use anyhow::{anyhow, bail, Result};
 
 use super::kernel::{
     compute_out_fields, emit_interface, emit_key_cell, emit_walk, key_cells, mentions_ident,
-    reachable_cells, render_lines, word_used, Emit, Line, OutFields,
+    reachable_cells, render_lines, word_used, Emit, Line, OutField, OutFields,
 };
 use crate::rewrite::program::Program;
 
@@ -172,8 +172,8 @@ fn fused_expr(render: &str) -> String {
 }
 
 /// Parse one member's walk into the shared numbering. `mi` = member index.
-fn parse_member(label: &str, e: Emit, mi: usize, ctx: &mut Ctx) -> Result<PMember> {
-    let of = compute_out_fields(&e)?;
+fn parse_member(label: &str, mut e: Emit, mi: usize, ctx: &mut Ctx) -> Result<PMember> {
+    let of = compute_out_fields(&mut e)?;
     let mbit = 1u8 << mi;
     let mut vn: HashMap<String, u32> = HashMap::new();
     let mut loads: Vec<String> = Vec::new();
@@ -489,7 +489,7 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
         }
         let mut tup: Vec<(u32, &'static str, String)> = Vec::new();
         let mut vt: Vec<(u32, &'static str)> = Vec::new();
-        for (id, ty, expr, _tainted) in &pm.of.fields {
+        for OutField { cell: id, ty, expr, .. } in &pm.of.fields {
             if !reach.contains(id) {
                 continue;
             }
@@ -502,8 +502,8 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
                         .of
                         .fields
                         .iter()
-                        .find(|f| f.0 == *id)
-                        .map(|f| (f.1, &f.2))
+                        .find(|f| f.cell == *id)
+                        .map(|f| (f.ty, &f.expr))
                     else {
                         bail!(
                             "member {}: per-lane boundary cell {} has no primary out column",
@@ -762,8 +762,12 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
             .of
             .fields
             .iter()
-            .map(|(id, ty, expr, tainted)| {
-                (*id, *ty, fused_expr(&canonicalize(expr, &primary.vn)), *tainted)
+            .map(|f| OutField {
+                cell: f.cell,
+                ty: f.ty,
+                expr: fused_expr(&canonicalize(&f.expr, &primary.vn)),
+                tainted: f.tainted,
+                node: f.node,
             })
             .collect(),
         ubool: primary.of.ubool.clone(),
@@ -935,8 +939,8 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
         let tainted = fused_of
             .fields
             .iter()
-            .find(|f| f.0 == *id)
-            .map(|f| f.3)
+            .find(|f| f.cell == *id)
+            .map(|f| f.tainted)
             .unwrap_or(false);
         let src = if tainted { "kv" } else { "sh" };
         match *ty {
@@ -973,7 +977,7 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
     // the fused suffix text plus every epilogue expr (tainted KOut
     // fields, the Dy tuples, the member dp combinations read `p.valid`).
     let mut epi_text = String::new();
-    for (_, _, expr, tainted) in &fused_of.fields {
+    for OutField { expr, tainted, .. } in &fused_of.fields {
         if *tainted {
             epi_text.push('\n');
             epi_text.push_str(expr);
@@ -1355,7 +1359,7 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
     writeln!(out, "        bd: *bd,")?;
     writeln!(out, "    }};")?;
     writeln!(out, "    let osh = KOutShared {{")?;
-    for (id, _, expr, tainted) in &fused_of.fields {
+    for OutField { cell: id, expr, tainted, .. } in &fused_of.fields {
         if !*tainted {
             writeln!(out, "        c{}: {},", id, expr)?;
         }
@@ -1487,7 +1491,7 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
     writeln!(out, "        valid: p.valid,")?;
     writeln!(out, "        deopt: dp_of_0,")?;
     writeln!(out, "        bd: *bd,")?;
-    for (id, _, expr, tainted) in &fused_of.fields {
+    for OutField { cell: id, expr, tainted, .. } in &fused_of.fields {
         if *tainted {
             writeln!(out, "        c{}: {},", id, expr)?;
         }
@@ -1539,8 +1543,8 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
         let expr = fused_of
             .fields
             .iter()
-            .find(|(fid, _, _, _)| fid == id)
-            .map(|(_, _, e, _)| e.as_str())
+            .find(|f| f.cell == *id)
+            .map(|f| f.expr.as_str())
             .ok_or_else(|| anyhow!("tainted key cell {} is not an out field", id))?;
         let mut sup = sup_of(expr, &name_sup);
         // dp registers and bd are per-variant accumulations name_sup

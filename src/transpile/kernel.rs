@@ -58,9 +58,6 @@ pub(crate) enum K {
     ZN(String),
     ZI(String),
     ZB(String),
-    /// __split_at result: per-lane interval + "exactly the split point"
-    /// mask (those lanes behave as the NUMBER `at` under equality).
-    ZIP { v: String, pt: String, at: P8 },
 }
 
 /// Emit-time cell content.
@@ -170,12 +167,27 @@ pub(crate) struct Emit {
     pub(crate) graph: Graph,
     /// Emitted variable name -> its node in `graph`.
     pub(crate) node_of: HashMap<String, NodeId>,
-    /// The member's VALIDITY, as an ordinary boolean node: the AND of
-    /// every condition under which this lane stays on the kernel. Each
-    /// primitive that writes `&mut dp` contributes its exact condition
-    /// (plans/multi-output-fusion.md, P1'). This is what replaces the dp
-    /// side channel; the emitted code is unchanged.
-    pub(crate) valid: NodeId,
+    /// Does this lane BELONG to the fork configuration being emitted?
+    /// The AND of every `ForkValid(d)`. A lane that is not live is not
+    /// wrong - it is computed by a sibling configuration.
+    pub(crate) live: NodeId,
+    /// Did the kernel COMPUTE this lane correctly? The AND of every
+    /// condition under which the abstract domain did not give up: guard
+    /// conditions, "this select's condition is decided", "this interval's
+    /// floor is unique", "this scalar is positive". Its negation is what
+    /// the emitted code spells as `dp` (per-lane) or `*bd` (whole slice) -
+    /// which of the two is DERIVED from whether the condition is uniform,
+    /// so this one node replaces both side channels.
+    pub(crate) ok: NodeId,
+    /// Conjuncts of `ok` that an emitted PRIMITIVE already enforces:
+    /// condition node -> the node whose emission carries the deopt
+    /// (`zsel_*`, `zi_flr`, `zi_mul_pos`, `zi_fork_flr` all take
+    /// `&mut dp`). The lowering skips a discharged conjunct's guard and
+    /// keeps its carrier alive through DCE. It is a hint, not a promise:
+    /// if the carrier's chosen representation turns out not to enforce
+    /// the condition, the lowering emits the guard anyway. Losing a guard
+    /// would be unsound; emitting a redundant one is only slower.
+    pub(crate) discharge: BTreeMap<NodeId, NodeId>,
 }
 
 impl Emit {
@@ -232,23 +244,70 @@ impl Emit {
         self.bind_node(ty, expr, node)
     }
 
-    /// `valid &= cond` - record a condition under which this lane stays
-    /// on the kernel. The emitted code is untouched; this only builds the
-    /// validity node that replaces the dp side channel.
+    /// `ok &= cond` - record a condition under which the abstract domain
+    /// did NOT give up on this lane. The emitted code is untouched; this
+    /// builds the node that replaces the `dp`/`*bd` side channels.
     fn require(&mut self, cond: NodeId) {
-        let v = self.valid;
-        self.valid = self.graph.fold(GOp::And, vec![v, cond]);
+        let v = self.ok;
+        self.ok = self.graph.fold(GOp::And, vec![v, cond]);
+    }
+
+    /// `live &= cond` - record fork-configuration membership. Separate
+    /// from `ok` because the two mean different things to the caller: a
+    /// non-live lane belongs to a sibling configuration, a non-ok lane
+    /// belongs to the interpreter.
+    fn require_live(&mut self, cond: NodeId) {
+        let v = self.live;
+        self.live = self.graph.fold(GOp::And, vec![v, cond]);
+    }
+
+    /// `ok &= cond`, where emitting `carrier` is what enforces it.
+    fn require_by(&mut self, cond: NodeId, carrier: NodeId) {
+        self.discharge.insert(cond, carrier);
+        self.require(cond);
+    }
+
+    /// `ok &= <this scalar is strictly positive>` - the premise the
+    /// interval scale/divide helpers are monotone under.
+    fn require_positive(&mut self, name: &str) -> NodeId {
+        let zero = self.graph.leaf(GOp::Const(0, 0));
+        let n = self
+            .graph
+            .operand(name, &self.node_of.clone())
+            .unwrap_or_else(|e| panic!("require_positive({:?}): {:#}", name, e));
+        let pos = self.graph.fold(GOp::Gt, vec![n, zero]);
+        self.require(pos);
+        pos
+    }
+
+    /// `ok &= <the floor of this interval is unique>`. The guard behind
+    /// every "an interval was consumed where an integer was needed" site.
+    fn require_flr_known(&mut self, name: &str) {
+        let n = self
+            .graph
+            .operand(name, &self.node_of.clone())
+            .unwrap_or_else(|e| panic!("require_flr_known({:?}): {:#}", name, e));
+        let f = self.graph.add(GOp::Flr, vec![n]);
+        let k = self.graph.add(GOp::Known, vec![f]);
+        self.require(k);
+    }
+
+    /// `ok &= false` - the kernel cannot represent this at all.
+    fn require_never(&mut self) {
+        let f = self.graph.leaf(GOp::ConstBool(false));
+        self.require(f);
     }
 
     /// `valid &= <name is determined>` - the condition a select imposes
     /// (it cannot pick on an undecided condition).
-    fn require_known(&mut self, name: &str) {
+    fn require_known(&mut self, name: &str) -> NodeId {
         let n = self
             .graph
             .operand(name, &self.node_of.clone())
             .unwrap_or_else(|e| panic!("require_known({:?}): {:#}", name, e));
         let k = self.graph.add(GOp::Known, vec![n]);
         self.require(k);
+        k
     }
 
     fn bind_node(&mut self, ty: &'static str, expr: &str, node: NodeId) -> String {
@@ -274,9 +333,6 @@ impl Emit {
             K::SN(v) | K::SI(v) | K::SB(v) | K::STri(v) | K::ZN(v) | K::ZI(v) | K::ZB(v) => {
                 self.tainted_vars.contains(v)
             }
-            K::ZIP { v, pt, .. } => {
-                self.tainted_vars.contains(v) || self.tainted_vars.contains(pt)
-            }
             _ => false,
         }
     }
@@ -295,7 +351,6 @@ impl Emit {
     fn as_zi(&mut self, k: &K) -> Result<String> {
         Ok(match k {
             K::ZI(v) => v.clone(),
-            K::ZIP { v, .. } => v.clone(),
             K::ZN(v) => self.bind_alias("ZI", &format!("zi_of_zn({})", v), v),
             K::NumC(c) => self.bind_op("ZI", &format!("zi_splat({}, {})", p8(c), p8(c)), GOp::Const(c.as_raw_u32() as i32, c.as_raw_u32() as i32), &[]),
             K::SN(v) => self.bind_alias("ZI", &format!("zi_splat({}, {})", v, v), v),
@@ -322,10 +377,10 @@ impl Emit {
     }
 
     fn is_z(k: &K) -> bool {
-        matches!(k, K::ZN(_) | K::ZI(_) | K::ZB(_) | K::ZIP { .. })
+        matches!(k, K::ZN(_) | K::ZI(_) | K::ZB(_))
     }
     fn is_ival(k: &K) -> bool {
-        matches!(k, K::SI(_) | K::ZI(_) | K::ZIP { .. })
+        matches!(k, K::SI(_) | K::ZI(_))
     }
     fn is_num(k: &K) -> bool {
         matches!(k, K::NumC(_) | K::SN(_) | K::ZN(_))
@@ -491,7 +546,7 @@ pub fn emit_kernel(program: &Program, witness_path: &str, out_path: &str) -> Res
 /// that nobody re-ran fails a test instead of silently leaving the
 /// committed kernels describing an older frame.
 pub fn emit_kernel_text(program: &Program, witness_path: &str) -> Result<String> {
-    render(&emit_walk(program, witness_path)?)
+    render(&mut emit_walk(program, witness_path)?)
 }
 
 /// The emit-time WALK alone: evaluate `__frame` against the witness and
@@ -526,13 +581,23 @@ pub(crate) fn emit_walk(program: &Program, witness_path: &str) -> Result<Emit> {
         tainted_cells: BTreeSet::new(),
         cur_tainted: false,
         graph: Graph::new(),
+        discharge: BTreeMap::new(),
         node_of: HashMap::new(),
-        valid: 0,
+        live: 0,
+        ok: 0,
     };
-    e.valid = e.graph.leaf(GOp::ConstBool(true));
+    let all = e.graph.leaf(GOp::ConstBool(true));
+    e.live = all;
+    e.ok = all;
     load_witness(witness_path, &mut e)?;
+    // The six button bits are graph LEAVES, and they are also emitted
+    // names (the suffix binds `kbK` from its const generic). Registering
+    // them here is what lets a value written straight through to an output
+    // cell - dash stores kb4/kb5 - resolve like any other name.
     for k in 0..6 {
         e.tainted_vars.insert(format!("kb{}", k));
+        let n = e.graph.leaf(GOp::Button(k as u8));
+        e.node_of.insert(format!("kb{}", k), n);
     }
 
     let fun = program
@@ -782,9 +847,25 @@ fn eval(e: &mut Emit, instr: &Instruction) -> Result<Option<K>> {
             let v = e.env.get(value).cloned().unwrap();
             match v {
                 K::BoolC(true) => {}
-                K::BoolC(false) => e.line("*bd = true; // assert_true of constant false"),
-                K::SB(v) => e.line(&format!("if !{} {{ *bd = true; }}", v)),
-                K::STri(v) => e.line(&format!("if {} != Some(true) {{ *bd = true; }}", v)),
+                K::BoolC(false) => {
+                    e.require_never();
+                    e.line("*bd = true; // assert_true of constant false");
+                }
+                K::SB(ref v) => {
+                    let n = e.graph.operand(v, &e.node_of.clone()).unwrap();
+                    e.require(n);
+                    e.line(&format!("if !{} {{ *bd = true; }}", v));
+                }
+                K::STri(ref v) => {
+                    // `!= Some(true)` fails on unknown AND on known-false,
+                    // so the surviving condition is `Known(c) AND c` - the
+                    // same shape as zguard, one lane wide.
+                    let n = e.graph.operand(v, &e.node_of.clone()).unwrap();
+                    let kn = e.graph.add(GOp::Known, vec![n]);
+                    let both = e.graph.fold(GOp::And, vec![kn, n]);
+                    e.require(both);
+                    e.line(&format!("if {} != Some(true) {{ *bd = true; }}", v));
+                }
                 K::ZB(v) => {
                     // zguard deopts a lane whose condition is unknown OR
                     // known-false, so the surviving condition is exactly
@@ -795,7 +876,10 @@ fn eval(e: &mut Emit, instr: &Instruction) -> Result<Option<K>> {
                     e.require(both);
                     e.line(&format!("zguard({}, &mut dp);", v));
                 }
-                K::UBool { .. } => e.line("*bd = true; // assert_true of UnknownBool"),
+                K::UBool { .. } => {
+                    e.require_never();
+                    e.line("*bd = true; // assert_true of UnknownBool");
+                }
                 other => bail!("assert_true on {:?}", other),
             }
             None
@@ -1003,11 +1087,21 @@ fn arith_mul(e: &mut Emit, l: &K, r: &K) -> Result<K> {
     }
     if Emit::is_z(iv) || Emit::is_z(num) {
         let (a, b) = (e.as_zi(iv)?, e.as_zn(num)?);
-        Ok(K::ZI({ let zero = e.graph.leaf(GOp::Const(0, 0)); let bn = e.graph.operand(b.as_str(), &e.node_of.clone()).unwrap(); let pos = e.graph.fold(GOp::Gt, vec![bn, zero]); e.require(pos); e.bind_op("ZI", &format!("zi_mul_pos({}, {}, &mut dp)", a, b), GOp::Mul, &[a.as_str(), b.as_str()]) }))
+        let v = e.bind_op(
+            "ZI",
+            &format!("zi_mul_pos({}, {}, &mut dp)", a, b),
+            GOp::Mul,
+            &[a.as_str(), b.as_str()],
+        );
+        let pos = e.require_positive(&b);
+        let carrier = e.node_of[&v];
+        e.discharge.insert(pos, carrier);
+        Ok(K::ZI(v))
     } else {
         let a = e.as_si(iv)?;
         let b = sn(e, num)?;
         e.line(&format!("if {} <= P8::from_i16(0) {{ *bd = true; }}", b));
+        e.require_positive(&b);
         Ok(K::SI(e.bind_op(
             "(P8, P8)",
             &format!(
@@ -1036,11 +1130,21 @@ fn arith_div(e: &mut Emit, l: &K, r: &K) -> Result<K> {
     }
     if Emit::is_z(l) || Emit::is_z(r) {
         let (a, b) = (e.as_zi(l)?, e.as_zn(r)?);
-        Ok(K::ZI({ let zero = e.graph.leaf(GOp::Const(0, 0)); let bn = e.graph.operand(b.as_str(), &e.node_of.clone()).unwrap(); let pos = e.graph.fold(GOp::Gt, vec![bn, zero]); e.require(pos); e.bind_op("ZI", &format!("zi_div_pos({}, {}, &mut dp)", a, b), GOp::Div, &[a.as_str(), b.as_str()]) }))
+        let v = e.bind_op(
+            "ZI",
+            &format!("zi_div_pos({}, {}, &mut dp)", a, b),
+            GOp::Div,
+            &[a.as_str(), b.as_str()],
+        );
+        let pos = e.require_positive(&b);
+        let carrier = e.node_of[&v];
+        e.discharge.insert(pos, carrier);
+        Ok(K::ZI(v))
     } else {
         let a = e.as_si(l)?;
         let b = sn(e, r)?;
         e.line(&format!("if {} <= P8::from_i16(0) {{ *bd = true; }}", b));
+        e.require_positive(&b);
         Ok(K::SI(e.bind_op(
             "(P8, P8)",
             &format!(
@@ -1058,15 +1162,6 @@ fn arith_div(e: &mut Emit, l: &K, r: &K) -> Result<K> {
 fn eq(e: &mut Emit, l: &K, r: &K) -> Result<K> {
     use K::*;
     Ok(match (l, r) {
-        // ZIP: point lanes are the NUMBER `at`; interval lanes are never equal.
-        (ZIP { pt, at, .. }, NumC(c)) | (NumC(c), ZIP { pt, at, .. }) => {
-            if c == at {
-                K::ZB(e.bind_alias("ZB", &format!("ZB {{ val: {}, known: ALL }}", pt), &pt))
-            } else {
-                K::BoolC(false)
-            }
-        }
-        (ZIP { .. }, _) | (_, ZIP { .. }) => K::BoolC(false),
         (SI(_) | ZI(_), _) | (_, SI(_) | ZI(_)) => K::BoolC(false),
         (NumC(_) | SN(_) | ZN(_), NumC(_) | SN(_) | ZN(_)) => {
             if Emit::is_z(l) || Emit::is_z(r) {
@@ -1192,19 +1287,57 @@ fn select(e: &mut Emit, c: &K, t: &K, f: &K) -> Result<K> {
         }),
         K::ZB(cv) => Ok(if ival {
             let (a, b) = (e.as_zi(t)?, e.as_zi(f)?);
-            K::ZI({ e.require_known(cv.as_str()); e.bind_op("ZI", &format!("zsel_i({}, {}, {}, &mut dp)", cv, a, b), GOp::Sel, &[cv.as_str(), a.as_str(), b.as_str()]) })
+            K::ZI({
+                let v = e.bind_op(
+                    "ZI",
+                    &format!("zsel_i({}, {}, {}, &mut dp)", cv, a, b),
+                    GOp::Sel,
+                    &[cv.as_str(), a.as_str(), b.as_str()],
+                );
+                let kn = e.require_known(cv.as_str());
+                let carrier = e.node_of[&v];
+                e.discharge.insert(kn, carrier);
+                v
+            })
         } else if matches!(t, K::ZB(_) | K::BoolC(_) | K::SB(_))
             && matches!(f, K::ZB(_) | K::BoolC(_) | K::SB(_))
         {
             let (a, b) = (e.as_zb(t)?, e.as_zb(f)?);
-            K::ZB({ e.require_known(cv.as_str()); e.bind_op("ZB", &format!("zsel_b({}, {}, {}, &mut dp)", cv, a, b), GOp::Sel, &[cv.as_str(), a.as_str(), b.as_str()]) })
+            K::ZB({
+                let v = e.bind_op(
+                    "ZB",
+                    &format!("zsel_b({}, {}, {}, &mut dp)", cv, a, b),
+                    GOp::Sel,
+                    &[cv.as_str(), a.as_str(), b.as_str()],
+                );
+                let kn = e.require_known(cv.as_str());
+                let carrier = e.node_of[&v];
+                e.discharge.insert(kn, carrier);
+                v
+            })
         } else {
             let (a, b) = (e.as_zn(t)?, e.as_zn(f)?);
-            K::ZN({ e.require_known(cv.as_str()); e.bind_op("ZN", &format!("zsel_n({}, {}, {}, &mut dp)", cv, a, b), GOp::Sel, &[cv.as_str(), a.as_str(), b.as_str()]) })
+            K::ZN({
+                let v = e.bind_op(
+                    "ZN",
+                    &format!("zsel_n({}, {}, {}, &mut dp)", cv, a, b),
+                    GOp::Sel,
+                    &[cv.as_str(), a.as_str(), b.as_str()],
+                );
+                let kn = e.require_known(cv.as_str());
+                let carrier = e.node_of[&v];
+                e.discharge.insert(kn, carrier);
+                v
+            })
         }),
         K::STri(cv) => {
             // Uniform tri-state: unknown means the whole slice deopts.
             e.line(&format!("if {}.is_none() {{ *bd = true; }}", cv));
+            {
+                let cn = e.graph.operand(&cv, &e.node_of.clone()).unwrap();
+                let known = e.graph.add(GOp::Known, vec![cn]);
+                e.require(known);
+            }
             let cb = {
                 let cn = e
                     .graph
@@ -1216,6 +1349,7 @@ fn select(e: &mut Emit, c: &K, t: &K, f: &K) -> Result<K> {
             select(e, &K::SB(cb), t, f)
         }
         K::UBool { .. } => {
+            e.require_never();
             e.line("*bd = true; // select on uniform UnknownBool");
             Ok(t.clone())
         }
@@ -1230,7 +1364,7 @@ fn call_intrinsic(e: &mut Emit, name: &str, args: &[LocalId]) -> Result<K> {
         "__split_by_flr" => {
             let a = &vals[0];
             match a {
-                K::ZI(v) | K::ZIP { v, .. } => {
+                K::ZI(v) => {
                     // A <=2-way FORK: open a runtime loop; everything after
                     // this instruction nests inside it. dp/bd are shadowed
                     // so one configuration's failures do not leak into the
@@ -1273,7 +1407,13 @@ fn call_intrinsic(e: &mut Emit, name: &str, args: &[LocalId]) -> Result<K> {
                     // validity exactly as `valid{d} = valid & frag_fv` does
                     // in the emitted code.
                     let fv = e.graph.add(GOp::ForkValid(d as u8), vec![fork_arg]);
-                    e.require(fv);
+                    e.require_live(fv);
+                    // zi_fork_flr also DEOPTS a lane whose interval spans
+                    // more than two floors - there is no third fragment to
+                    // put it in. That is an ok condition, not a liveness
+                    // one, and the fork call is what enforces it.
+                    let fok = e.graph.add(GOp::ForkOk, vec![fork_arg]);
+                    e.require_by(fok, fork_node);
                     e.var_ty.insert(frag.clone(), "ZI");
                     e.var_ty.insert(valid.clone(), "u16");
                     e.pre_defs.insert(frag.clone());
@@ -1287,6 +1427,7 @@ fn call_intrinsic(e: &mut Emit, name: &str, args: &[LocalId]) -> Result<K> {
                         "if {v}.0.flr() != {v}.1.flr() {{ *bd = true; }}",
                         v = v
                     ));
+                    e.require_flr_known(v);
                     Ok(a.clone())
                 }
                 K::ZN(_) | K::SN(_) | K::NumC(_) => Ok(a.clone()),
@@ -1294,34 +1435,25 @@ fn call_intrinsic(e: &mut Emit, name: &str, args: &[LocalId]) -> Result<K> {
             }
         }
         "__split_at" => {
-            let at = match &vals[1] {
-                K::NumC(c) => *c,
+            match &vals[1] {
+                K::NumC(_) => {}
                 other => bail!("__split_at with non-constant threshold {:?}", other),
-            };
+            }
             match &vals[0] {
-                K::ZI(v) => {
-                    let name = format!("v{}", e.n);
-                    e.n += 1;
-                    e.line(&format!(
-                        "let ({}, {}_pt): (ZI, u16) = zi_split_at({}, {}, &mut dp);",
-                        name,
-                        name,
-                        v,
-                        p8(&at)
-                    ));
-                    e.var_ty.insert(name.clone(), "ZI");
-                    e.var_ty.insert(format!("{}_pt", name), "u16");
-                    if e.cur_tainted {
-                        e.tainted_vars.insert(name.clone());
-                        e.tainted_vars.insert(format!("{}_pt", name));
-                    } else {
-                        e.pre_defs.insert(name.clone());
-                        e.pre_defs.insert(format!("{}_pt", name));
-                    }
-                    Ok(K::ZIP { v: name.clone(), pt: format!("{}_pt", name), at })
-                }
+                // On an exact value the split is a no-op: every lane is
+                // already on one side of the threshold.
                 K::ZN(_) | K::SN(_) | K::NumC(_) => Ok(vals[0].clone()),
-                other => bail!("__split_at on {:?}", other),
+                // On an INTERVAL it is a two-way narrowing, and the graph
+                // has no op for it. No checked-in kernel reaches this (no
+                // `zi_split_at` appears in any generated file), so rather
+                // than carry an unexercised lowering that the graph cannot
+                // describe, say so.
+                other => bail!(
+                    "__split_at on {:?}: the interval split is not modelled in the \
+                     graph IR (plans/multi-output-fusion.md). No class kernel has \
+                     needed it; add Op::SplitAt + its rendering if one does.",
+                    other
+                ),
             }
         }
         "__array_table_drop_last" => {
@@ -1356,10 +1488,19 @@ fn call_pure(e: &mut Emit, name: &str, args: &[LocalId]) -> Result<K> {
             K::NumC(c) => Ok(K::NumC(c.flr())),
             K::SN(v) => Ok(K::SN(e.bind_op("P8", &format!("{}.flr()", v), GOp::Flr, &[v]))),
             K::ZN(v) => Ok(K::ZN(e.bind_op("ZN", &format!("zn_flr({})", v), GOp::Flr, &[v]))),
-            K::ZI(v) => Ok(K::ZN({ let r = e.bind_op("ZN", &format!("zi_flr({}, &mut dp)", v), GOp::Flr, &[v]); let rn = e.node_of[&r]; let kn = e.graph.add(GOp::Known, vec![rn]); e.require(kn); r })),
-            K::ZIP { v, .. } => Ok(K::ZN({ let r = e.bind_op("ZN", &format!("zi_flr({}, &mut dp)", v), GOp::Flr, &[v]); let rn = e.node_of[&r]; let kn = e.graph.add(GOp::Known, vec![rn]); e.require(kn); r })),
+            // zi_flr deopts the lanes whose interval straddles an integer,
+            // so the surviving condition is exactly `Known(flr(v))`, and
+            // the RESULT is exact wherever the lane survives.
+            K::ZI(v) => Ok(K::ZN({
+                let r = e.bind_op("ZN", &format!("zi_flr({}, &mut dp)", v), GOp::Flr, &[v]);
+                let rn = e.node_of[&r];
+                let kn = e.graph.add(GOp::Known, vec![rn]);
+                e.require_by(kn, rn);
+                r
+            })),
             K::SI(v) => {
                 e.line(&format!("if {v}.0.flr() != {v}.1.flr() {{ *bd = true; }}", v = v));
+                e.require_flr_known(v);
                 Ok(K::SN(e.bind_op("P8", &format!("{}.0.flr()", v), GOp::Flr, &[v])))
             }
             other => bail!("flr on {:?}", other),
@@ -1368,7 +1509,7 @@ fn call_pure(e: &mut Emit, name: &str, args: &[LocalId]) -> Result<K> {
             K::NumC(c) => Ok(K::NumC(c.abs())),
             K::SN(v) => Ok(K::SN(e.bind_op("P8", &format!("{}.abs()", v), GOp::Abs, &[v]))),
             K::ZN(v) => Ok(K::ZN(e.bind_op("ZN", &format!("zn_abs({})", v), GOp::Abs, &[v]))),
-            K::ZI(v) | K::ZIP { v, .. } => Ok(K::ZI(e.bind_op("ZI", &format!("zi_abs({})", v), GOp::Abs, &[v]))),
+            K::ZI(v) => Ok(K::ZI(e.bind_op("ZI", &format!("zi_abs({})", v), GOp::Abs, &[v]))),
             other => bail!("abs on {:?}", other),
         },
         "min" | "max" => {
@@ -1473,7 +1614,7 @@ fn call_pure(e: &mut Emit, name: &str, args: &[LocalId]) -> Result<K> {
             // that constant: a Sin(v) node would claim a dependency the
             // generated code does not have, and would stop two members from
             // sharing it when they reach this site with different operands.
-            K::SI(_) | K::ZI(_) | K::ZIP { .. } => Ok(K::SI(e.bind_op(
+            K::SI(_) | K::ZI(_) => Ok(K::SI(e.bind_op(
                 "(P8, P8)",
                 "(P8::from_i16(-1), P8::from_i16(1))",
                 GOp::Const(-1 << 16, 1 << 16),
@@ -1485,22 +1626,37 @@ fn call_pure(e: &mut Emit, name: &str, args: &[LocalId]) -> Result<K> {
     }
 }
 
-/// Output cells of one walk: `fields` = (cell id, rust type, value expr,
-/// button-tainted) for every dirty original cell; `ubool` = cells ending
-/// the frame as fresh UnknownBools (next frame's button inputs).
+/// One boundary output of a walk.
+pub(crate) struct OutField {
+    /// Witness cell id this value lands in.
+    pub(crate) cell: u32,
+    pub(crate) ty: &'static str,
+    /// The emitted expression. Legacy: it is what the TEXT fuser reads;
+    /// the graph-driven emitter uses `node`.
+    pub(crate) expr: String,
+    /// Button-dependent (differs between the 64 variants).
+    pub(crate) tainted: bool,
+    /// The graph node this cell ends the frame holding. Every output has
+    /// one: a value the emitter could not describe structurally would have
+    /// failed at its bind site, not here.
+    pub(crate) node: NodeId,
+}
+
+/// Output cells of one walk, plus `ubool` - cells ending the frame as
+/// fresh UnknownBools (next frame's button inputs).
 pub(crate) struct OutFields {
-    pub(crate) fields: Vec<(u32, &'static str, String, bool)>,
+    pub(crate) fields: Vec<OutField>,
     pub(crate) ubool: Vec<u32>,
 }
 
-pub(crate) fn compute_out_fields(e: &Emit) -> Result<OutFields> {
+pub(crate) fn compute_out_fields(e: &mut Emit) -> Result<OutFields> {
     // Output struct: dirty original cells (scratch cells never escape).
     // (cell, rust ty, expr, tainted): tainted outputs differ per button
     // variant; untainted ones are identical across all 64 and are
     // reported once per fork config in KOutShared.
-    let mut out_fields: Vec<(u32, &'static str, String, bool)> = Vec::new();
+    let mut out_fields: Vec<OutField> = Vec::new();
     let mut out_ubool: Vec<u32> = Vec::new();
-    for id in &e.dirty {
+    for id in &e.dirty.clone() {
         // Scratch cells (allocated during the frame) are region-private.
         if *id >= e.witness_len {
             continue;
@@ -1515,7 +1671,6 @@ pub(crate) fn compute_out_fields(e: &Emit) -> Result<OutFields> {
         let (ty, expr) = match k {
             K::ZN(v) => ("ZN", v.clone()),
             K::ZI(v) => ("ZI", v.clone()),
-            K::ZIP { v, .. } => ("ZI", v.clone()),
             K::ZB(v) => ("ZB", v.clone()),
             K::SN(v) => ("P8", v.clone()),
             K::SI(v) => ("(P8, P8)", v.clone()),
@@ -1530,7 +1685,17 @@ pub(crate) fn compute_out_fields(e: &Emit) -> Result<OutFields> {
             .get(id)
             .map(|c| matches!(c, CellT::Val(k) if e.k_tainted(k)))
             .unwrap_or(false);
-        out_fields.push((*id, ty, expr, tainted));
+        // Resolve through `operand`, not `node_of`: an output can be a
+        // bound name, a button bit written straight through (dash keeps
+        // last frame's kb4/kb5 for edge detection), or a literal. Anything
+        // else is a value the graph does not describe, and skipping it
+        // silently is how this measurement once reported a false 4x.
+        let named = e.node_of.clone();
+        let node = e
+            .graph
+            .operand(&expr, &named)
+            .with_context(|| format!("output cell {}", id))?;
+        out_fields.push(OutField { cell: *id, ty, expr, tainted, node });
     }
     Ok(OutFields { fields: out_fields, ubool: out_ubool })
 }
@@ -1606,7 +1771,7 @@ pub(crate) fn emit_interface(out: &mut String, e: &Emit, of: &OutFields) -> Resu
 
     writeln!(out, "/// Button-independent outputs: one per fork config.")?;
     writeln!(out, "pub struct KOutShared {{")?;
-    for (id, ty, _, tainted) in out_fields {
+    for OutField { cell: id, ty, tainted, .. } in out_fields {
         if !*tainted {
             writeln!(out, "    pub c{}: {},", id, ty)?;
         }
@@ -1618,14 +1783,14 @@ pub(crate) fn emit_interface(out: &mut String, e: &Emit, of: &OutFields) -> Resu
     writeln!(out, "    pub valid: u16,")?;
     writeln!(out, "    pub deopt: u16,")?;
     writeln!(out, "    pub bd: bool,")?;
-    for (id, ty, _, tainted) in out_fields {
+    for OutField { cell: id, ty, tainted, .. } in out_fields {
         if *tainted {
             writeln!(out, "    pub c{}: {},", id, ty)?;
         }
     }
     writeln!(out, "}}\n")?;
     writeln!(out, "pub const OUT_CELLS: &[u32] = &[")?;
-    for (id, _, _, _) in out_fields {
+    for OutField { cell: id, .. } in out_fields {
         writeln!(out, "    {},", id)?;
     }
     writeln!(out, "];\n")?;
@@ -1723,7 +1888,7 @@ pub(crate) fn emit_interface(out: &mut String, e: &Emit, of: &OutFields) -> Resu
          /// (the block already carries the input row values).\n\
          pub fn apply(sh: &KOutShared, kv: &KOut, b: &mut Rt2, n: usize) {{"
     )?;
-    for (id, ty, _, tainted) in out_fields {
+    for OutField { cell: id, ty, tainted, .. } in out_fields {
         let src = if *tainted { "kv" } else { "sh" };
         match *ty {
             "ZN" => writeln!(
@@ -1763,7 +1928,7 @@ pub(crate) fn emit_interface(out: &mut String, e: &Emit, of: &OutFields) -> Resu
 
     // Direct-append output path: one accumulator block per chunk, typed
     // pushes per (config, variant) - no per-slice block cloning.
-    let out_set: BTreeSet<u32> = out_fields.iter().map(|(id, _, _, _)| *id).collect();
+    let out_set: BTreeSet<u32> = out_fields.iter().map(|f| f.cell).collect();
     writeln!(
         out,
         "/// One wide output block per chunk: structure + uniforms cloned\n\
@@ -1776,7 +1941,7 @@ pub(crate) fn emit_interface(out: &mut String, e: &Emit, of: &OutFields) -> Resu
          \x20   acc.cols = chunk.cols.clone();\n\
          \x20   acc.shape_hash = chunk.shape_hash;"
     )?;
-    for (id, ty, _, tainted) in out_fields {
+    for OutField { cell: id, ty, tainted, .. } in out_fields {
         match (*ty, *tainted) {
             ("ZN", _) | ("P8", true) => writeln!(out, "    acc.cols[{}] = Col::N(Vec::new());", id)?,
             ("ZI", _) | ("(P8, P8)", true) => {
@@ -1821,7 +1986,7 @@ pub(crate) fn emit_interface(out: &mut String, e: &Emit, of: &OutFields) -> Resu
          \x20   for i in 0..n {{\n\
          \x20       if live & (1 << i) == 0 {{ continue; }}"
     )?;
-    for (id, ty, _, tainted) in out_fields {
+    for OutField { cell: id, ty, tainted, .. } in out_fields {
         let src = if *tainted { "kv" } else { "sh" };
         match *ty {
             "ZN" => writeln!(
@@ -1955,9 +2120,9 @@ pub(crate) fn emit_interface(out: &mut String, e: &Emit, of: &OutFields) -> Resu
 /// KeyPlan skip masks index into it.
 pub(crate) fn key_cells(e: &Emit, of: &OutFields) -> Result<Vec<(u32, &'static str, bool)>> {
     let mut cells: Vec<(u32, &'static str, bool)> = Vec::new();
-    let out_set: BTreeSet<u32> = of.fields.iter().map(|(id, _, _, _)| *id).collect();
-    for (id, ty, _, tainted) in &of.fields {
-        cells.push((*id, ty, *tainted));
+    let out_set: BTreeSet<u32> = of.fields.iter().map(|f| f.cell).collect();
+    for f in &of.fields {
+        cells.push((f.cell, f.ty, f.tainted));
     }
     for (id, kind) in &e.vary_in {
         if out_set.contains(id) {
@@ -2044,7 +2209,7 @@ pub(crate) fn emit_key_cell(
 }
 
 /// Assemble kernel_gen.rs.
-fn render(e: &Emit) -> Result<String> {
+fn render(e: &mut Emit) -> Result<String> {
     let mut out = String::new();
     let of = compute_out_fields(e)?;
     emit_interface(&mut out, e, &of)?;
@@ -2060,7 +2225,7 @@ fn render(e: &Emit) -> Result<String> {
         }
     }
     // The out_fields' exprs referenced from the suffix epilogue also cross.
-    for (_, _, expr, _) in out_fields {
+    for OutField { expr, .. } in out_fields {
         if e.pre_defs.contains(expr) {
             crossing.insert(expr.clone());
         }
@@ -2097,7 +2262,7 @@ fn render(e: &Emit) -> Result<String> {
     writeln!(out, "        bd: *bd,")?;
     writeln!(out, "    }};")?;
     writeln!(out, "    let osh = KOutShared {{")?;
-    for (id, _, expr, tainted) in out_fields {
+    for OutField { cell: id, expr, tainted, .. } in out_fields {
         if !*tainted {
             writeln!(out, "        c{}: {},", id, expr)?;
         }
@@ -2116,7 +2281,7 @@ fn render(e: &Emit) -> Result<String> {
     // tainted OUT FIELD with no suffix instruction behind it (gate f35,
     // 2026-08-18: 1358 rows missing at f37).
     let mut suffix_text = suf_text.clone();
-    for (id, _, expr, tainted) in out_fields {
+    for OutField { cell: id, expr, tainted, .. } in out_fields {
         if *tainted {
             suffix_text.push('\n');
             suffix_text.push_str(expr);
@@ -2180,7 +2345,7 @@ fn render(e: &Emit) -> Result<String> {
     writeln!(out, "        valid: p.valid,")?;
     writeln!(out, "        deopt: dp,")?;
     writeln!(out, "        bd: *bd,")?;
-    for (id, _, expr, tainted) in out_fields {
+    for OutField { cell: id, expr, tainted, .. } in out_fields {
         if *tainted {
             writeln!(out, "        c{}: {},", id, expr)?;
         }
@@ -2198,27 +2363,13 @@ fn render(e: &Emit) -> Result<String> {
         suf_text.lines().count(),
         e.witness_len,
     );
-    // Which output cells exist as graph nodes, and which buttons can
-    // reach them (plans/multi-output-fusion.md; the graph's first use).
-    // An out cell is a bound name OR a button bit written straight through
-    // (dash stores kb4/kb5 - last frame's press, kept for edge detection).
-    // Resolve BOTH: skipping what does not resolve silently understates the
-    // cone, which is how this measurement first reported a false 4x.
+    // Which buttons can reach an OUTPUT (plans/multi-output-fusion.md).
+    // Every output is a graph node, so this is plain reachability.
     let cones = e.graph.button_cones();
-    let mut live = 0u8;
-    let mut n_out = 0usize;
-    for (cell, _ty, expr, _t) in out_fields.iter() {
-        live |= match e.node_of.get(expr.as_str()) {
-            Some(n) => cones[*n as usize],
-            None => match expr.strip_prefix("kb").and_then(|b| b.parse::<u8>().ok()) {
-                Some(bit) => 1u8 << bit,
-                None => panic!("out cell {} has unresolvable expr {:?}", cell, expr),
-            },
-        };
-        n_out += 1;
-    }
-    let out_nodes = n_out;
-    let bits: Vec<u8> = (0..6).filter(|b| live & (1 << b) != 0).collect();
+    let reaching = out_fields
+        .iter()
+        .fold(0u8, |m, f| m | cones[f.node as usize]);
+    let bits: Vec<u8> = (0..6).filter(|b| reaching & (1 << b) != 0).collect();
     // How many of the 2^6 button combinations are actually DISTINCT?
     // Specialize on each mask into one shared hash-consed arena and compare
     // the output tuples: equal tuples mean the same successor for every
@@ -2227,17 +2378,7 @@ fn render(e: &Emit) -> Result<String> {
     let mut sigs: std::collections::BTreeMap<Vec<NodeId>, Vec<u8>> = Default::default();
     for m in 0u8..64 {
         let map = e.graph.specialize_into(m, &mut shared);
-        let mut sig: Vec<NodeId> = Vec::with_capacity(out_fields.len());
-        for (_cell, _ty, expr, _t) in out_fields.iter() {
-            match e.node_of.get(expr.as_str()) {
-                Some(n) => sig.push(map[*n as usize]),
-                None => {
-                    // a raw button bit written through: its VALUE under m
-                    let bit: u8 = expr.strip_prefix("kb").unwrap().parse().unwrap();
-                    sig.push(u32::MAX - ((m >> bit) & 1) as u32);
-                }
-            }
-        }
+        let sig: Vec<NodeId> = out_fields.iter().map(|f| map[f.node as usize]).collect();
         sigs.entry(sig).or_default().push(m);
     }
     // What the BINARY prefix/suffix taint costs. A node truly needs
@@ -2253,20 +2394,13 @@ fn render(e: &Emit) -> Result<String> {
         ideal += 1usize << k;
         binary += if k == 0 { 1 } else { 64 };
     }
-    // The member, in the form P1' calls for: what it writes, and one
-    // boolean saying whether the result counts. No dp side channel.
-    let mut member_outputs: std::collections::BTreeMap<u32, NodeId> = Default::default();
-    for (cell, _ty, expr, _t) in out_fields.iter() {
-        if let Some(n) = e.node_of.get(expr.as_str()) {
-            member_outputs.insert(*cell, *n);
-        }
-    }
-    let vcone = cones[e.valid as usize].count_ones();
     eprintln!(
-        "  member: {} output cells, validity is node {} (button cone {})",
-        member_outputs.len(),
-        e.valid,
-        vcone,
+        "  member: {} output cells, live is node {}, ok is node {} (button cones {}/{})",
+        out_fields.len(),
+        e.live,
+        e.ok,
+        cones[e.live as usize].count_ones(),
+        cones[e.ok as usize].count_ones(),
     );
     eprintln!(
         "  cone sizes {:?}; node-evaluations per frame: binary split {}, exact 2^|cone| {} ({:.1}x)",
@@ -2279,7 +2413,7 @@ fn render(e: &Emit) -> Result<String> {
         "graph: {} nodes, {} out cells; buttons reaching an output {:?} -> {} variant(s); \
          DISTINCT button combinations: {}/64",
         e.graph.len(),
-        out_nodes,
+        out_fields.len(),
         bits,
         1usize << bits.len(),
         sigs.len(),
