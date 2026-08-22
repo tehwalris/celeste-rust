@@ -84,10 +84,10 @@ pub fn trace_frame<'a>(
     reset: &'a ast::Ast,
     frame: &'a ast::Ast,
     st: State<Symbolic>,
-    root: &[Step],
+    roots: &[Path],
 ) -> Result<Frame> {
     let mut st = st;
-    let iface = iface::symbolize(&mut it.d, &mut st, root)?;
+    let iface = iface::symbolize(&mut it.d, &mut st, roots)?;
     let st = run_one(it, reset, st)?;
     let mut outs = Vec::new();
     for (s, f) in it.exec_block(frame.nodes(), st)? {
@@ -272,8 +272,30 @@ mod tests {
         };
         eprintln!("[verify] player at {} after {} warm-up frames", iface::show(&player), warm);
 
+        // The rest of the frame's INPUT state. Everything else reachable
+        // from the globals table is static configuration - the `k_*`
+        // button numbers, each type's `tile`, `room.x/y` - or the button
+        // slots, which `__reset_button_states` makes free choices rather
+        // than cells.
+        let mut roots: Vec<Path> = vec![player.clone()];
+        for g in [
+            "deaths",
+            "delay_restart",
+            "frames",
+            "freeze",
+            "has_dashed",
+            "has_key",
+            "max_djump",
+            "minutes",
+            "pause_player",
+            "seconds",
+            "will_restart",
+        ] {
+            roots.push(vec![iface::key(g)]);
+        }
+
         let before = it.d.graph.len();
-        let f = match trace_frame(&mut it, &reset, &frame, st.clone(), &player) {
+        let f = match trace_frame(&mut it, &reset, &frame, st.clone(), &roots) {
             Ok(f) => f,
             Err(e) => return eprintln!("[verify] symbolic frame stopped at: {:#}", e),
         };
@@ -333,6 +355,38 @@ mod tests {
                 }
             }
         }
+        // The control-flow inputs, one at a time rather than crossed with
+        // the position sweep: each of these changes which BRANCH the
+        // frame takes rather than where it lands, so crossing them would
+        // multiply the run without touching anything new.
+        let g = |k: &str| vec![iface::key(k)];
+        for (name, over) in [
+            ("freeze", vec![(g("freeze"), Conc::Num(n(1)))]),
+            ("pause_player", vec![(g("pause_player"), Conc::Bool(true))]),
+            ("will_restart", vec![(g("will_restart"), Conc::Bool(true))]),
+            (
+                "restarting",
+                vec![
+                    (g("will_restart"), Conc::Bool(true)),
+                    (g("delay_restart"), Conc::Num(n(1))),
+                ],
+            ),
+            ("max_djump", vec![(g("max_djump"), Conc::Num(n(2)))]),
+            ("has_dashed", vec![(g("has_dashed"), Conc::Bool(true))]),
+            ("no djump", vec![(px("djump"), Conc::Num(n(0)))]),
+            ("no grace", vec![(px("grace"), Conc::Num(n(0)))]),
+            ("dashing", vec![(px("dash_time"), Conc::Num(n(3)))]),
+            ("dash effect", vec![(px("dash_effect_time"), Conc::Num(n(5)))]),
+            ("frames", vec![(g("frames"), Conc::Num(n(29)))]),
+            // Out of the TOP of the room (`this.y < -4`), which is
+            // `next_room()` - a whole new object list, and the only way
+            // to reach the largest of the output shapes.
+            ("top edge", vec![(px("y"), Conc::Num(at(&px("y")) - n(120)))]),
+            ("right edge", vec![(px("x"), Conc::Num(at(&px("x")) + n(124)))]),
+            ("left edge", vec![(px("x"), Conc::Num(at(&px("x")) - n(16)))]),
+        ] {
+            perts.push((name.to_string(), over));
+        }
 
         // WHAT are the outcomes? Shape divergence is the only thing that
         // can leave more than one, so two outcomes with the SAME shape
@@ -346,6 +400,19 @@ mod tests {
                 *by_len.entry(o.fields.len()).or_default() += 1;
             }
             eprintln!("[verify] outcomes by scalar count: {:?}", by_len);
+            // The object list is what actually distinguishes them: a
+            // player, a player_spawn, nothing at all, or a whole new
+            // room's worth.
+            for (i, o) in f.outs.iter().enumerate() {
+                let mut objs: std::collections::BTreeSet<String> = Default::default();
+                for (q, _) in &o.fields {
+                    let pre = iface::show(&q[..q.len().saturating_sub(1)].to_vec());
+                    if pre.starts_with("objects") {
+                        objs.insert(pre);
+                    }
+                }
+                eprintln!("[verify]   outcome {}: {} scalars, {:?}", i, o.fields.len(), objs);
+            }
             let mut same = 0;
             for i in 0..f.outs.len() {
                 for j in (i + 1)..f.outs.len() {
@@ -466,8 +533,14 @@ mod tests {
         }
         assert_eq!(checked + declined, perts.len() * 64, "every point should have been checked");
         assert!(compared > 0, "nothing was actually compared");
-        // If one outcome claimed every point, the guards are not
-        // discriminating and the 12-way fan-out means nothing.
-        assert!(used.len() > 1, "only one outcome was ever reached");
+        // Every outcome the tracer produced has to be REACHABLE, or it
+        // is a successor the program does not have. A new one that this
+        // sweep cannot reach is a thing to explain - either extend the
+        // sweep to reach it, or find out why the tracer kept it.
+        assert_eq!(
+            used.len(),
+            f.outs.len(),
+            "some outcome was never reached by the sweep"
+        );
     }
 }

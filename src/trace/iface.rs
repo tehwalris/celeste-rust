@@ -106,6 +106,14 @@ pub fn set<D: Domain>(st: &mut State<D>, p: &[Step], v: Value<D>) -> Result<()> 
 /// is a `Vec`, so the order is a property of the CONTENT and not of the
 /// allocation history - which is the same reason `state::canonical_order`
 /// exists, and the same thing that makes two runs comparable.
+///
+/// A slot gets the FIRST path that reaches it, and the heap is a graph:
+/// `spring.tile` is named `objects[2].type.tile` in a room that contains
+/// a spring, because the object list is walked before the globals that
+/// alias it. So a path names a slot only RELATIVE TO A SHAPE. Comparing
+/// two states of the same shape by path is exact, which is what the
+/// differential check does; comparing across shapes is not, and would
+/// need a canonical name rather than a first-found one.
 pub fn scalars<D: Domain>(st: &State<D>, root: &[Step]) -> Result<Vec<Path>> {
     let v = get(st, root).ok_or_else(|| anyhow!("{}: no such slot", show(&root.to_vec())))?;
     let mut out = Vec::new();
@@ -152,17 +160,27 @@ pub struct Iface {
     pub init: Vec<Conc>,
 }
 
-/// Replace every scalar under `root` with a fresh `Op::Cell` leaf, and
+/// Replace every scalar under `roots` with a fresh `Op::Cell` leaf, and
 /// remember what it used to be.
 ///
-/// Only under `root`, never the whole heap: the tracer's leverage comes
-/// from the heap staying concrete, and `btn(k_left)` indexes a table with
-/// a global that would become a cell if this were applied everywhere.
-/// Which subtree is the right one is a MEASUREMENT, not a principle - a
-/// slot left concrete is a specialization, and the check below is valid
-/// either way because both sides specialize the same.
-pub fn symbolize(d: &mut Symbolic, st: &mut State<Symbolic>, root: &[Step]) -> Result<Iface> {
-    let slots = scalars(st, root)?;
+/// Under the given roots, never the whole heap: the tracer's leverage
+/// comes from the heap staying concrete, and `btn(k_left)` indexes a
+/// table with a global that would become a cell if this were applied
+/// everywhere. Which slots are the right ones is a MEASUREMENT, not a
+/// principle - a slot left concrete is a specialization, and the check
+/// is valid either way because both sides specialize the same.
+///
+/// Overlapping roots are fine: a slot reached twice gets one cell, and
+/// the cell numbering follows the order the roots are given in.
+pub fn symbolize(d: &mut Symbolic, st: &mut State<Symbolic>, roots: &[Path]) -> Result<Iface> {
+    let mut slots: Vec<Path> = Vec::new();
+    for r in roots {
+        for p in scalars(st, r)? {
+            if !slots.contains(&p) {
+                slots.push(p);
+            }
+        }
+    }
     let mut init = Vec::new();
     for (i, p) in slots.iter().enumerate() {
         let cell = d.graph.leaf(Op::Cell(i as u32));
