@@ -736,16 +736,13 @@ pub fn row_keys(chunk: &Rt2, lo: usize, n: usize, sh: &KOutShared, kv: &KOut, pl
 }
 
 pub struct Pre {
+    bd_pre: bool,
+    ok_pre: u16,
     valid: u16,
-    dp: u16,
-    bd: bool,
 }
 
 #[inline(never)]
 pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared, &KOut)) {
-    let mut dp: u16 = 0;
-    let mut bd_flag: bool = false;
-    let bd: &mut bool = &mut bd_flag;
     let r_c297: ZN = rin.c297;
     let r_c302: ZN = rin.c302;
     let r_c316: ZN = rin.c316;
@@ -777,20 +774,23 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let n35: bool = if n34 { true } else { true };
     let n74: ZB = zn_lt(r_c316, zn_splat(P8::from_raw(-65536i32)));
     let n76: ZB = zn_gt(r_c316, zn_splat(P8::from_raw(7929856i32)));
-    let n77: ZB = zsel_b(n74, n74, n76, &mut dp);
+    let n77: ZB = zsel_b(n74, n74, n76);
+    let n78: ZB = ZB { val: n74.known, known: ALL };
     let n80: ZN = zn_min(zn_splat(P8::from_raw(7929856i32)), r_c316);
     let n81: ZN = zn_max(zn_splat(P8::from_raw(-65536i32)), n80);
-    let n83: ZN = zsel_n(n77, zn_splat(P8::from_raw(0i32)), r_c406, &mut dp);
-    let n86: ZN = zsel_n(n77, n81, r_c316, &mut dp);
+    let n83: ZN = zsel_n(n77, zn_splat(P8::from_raw(0i32)), r_c406);
+    let n84: ZB = ZB { val: n77.known, known: ALL };
+    let n86: ZN = zsel_n(n77, n81, r_c316);
     let n88: ZN = if n34 { r_c316 } else { n86 };
     let n89: ZN = if n34 { r_c406 } else { n83 };
-    if !n29 { *bd = true; }
-    if !n31 { *bd = true; }
-    if !n35 { *bd = true; }
+    let ok0: u16 = ALL & zb_holds(n78) & zb_holds(n84);
+    let bd0: bool = false || !n29 || !n31 || !n35;
+    let ok_pre: u16 = ok0;
+    let bd_pre: bool = bd0;
     let p = Pre {
+        bd_pre,
+        ok_pre,
         valid: ALL,
-        dp,
-        bd: *bd,
     };
     let osh = KOutShared {
         c20: n33,
@@ -805,18 +805,19 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
 
 #[inline(never)]
 fn suffix<const B: u8>(u: &Uni, g: &G, p: &Pre, osh: &KOutShared, out: &mut impl FnMut(u8, &KOutShared, &KOut)) {
-    let mut dp: u16 = p.dp;
-    let mut bd_flag: bool = p.bd;
-    let bd: &mut bool = &mut bd_flag;
+    let bd_pre = p.bd_pre;
+    let ok_pre = p.ok_pre;
     let kb0: bool = (B >> 0) & 1 != 0;
     let kb1: bool = (B >> 1) & 1 != 0;
     let kb2: bool = (B >> 2) & 1 != 0;
     let kb3: bool = (B >> 3) & 1 != 0;
     let kb4: bool = (B >> 4) & 1 != 0;
     let kb5: bool = (B >> 5) & 1 != 0;
+    let ok_out: u16 = ok_pre;
+    let bd_out: bool = bd_pre;
     out(B, osh, &KOut {
         valid: p.valid,
-        deopt: dp,
-        bd: *bd,
+        deopt: !ok_out,
+        bd: bd_out,
     });
 }

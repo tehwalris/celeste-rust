@@ -22,14 +22,21 @@
 //!   reach this node", answered once by `Graph::choice_cones`; the old
 //!   "prefix/suffix taint" was one hand-maintained special case of it.
 //!
-//! * **Validity is a VALUE.** Every condition under which the abstract
-//!   domain gave up is a conjunct of the walk's `ok` node. This module
-//!   renders each conjunct as a guard - `*bd` when the condition is
-//!   block-uniform, `dp` when it is per-lane - unless the primitive that
-//!   produced it already carries the deopt (`zi_flr(.., &mut dp)` and
-//!   friends), which the walk records in `Emit::discharge`. A conjunct
-//!   that is neither discharged nor renderable is an ERROR: losing a guard
-//!   is unsound, so the failure has to be loud.
+//! * **Validity is a VALUE, all the way down.** Every condition under
+//!   which the abstract domain gave up is a conjunct of the walk's `ok`
+//!   node, and every conjunct is an ordinary node like any other. There
+//!   is no `&mut dp` and no `*bd` side channel: the member's deopt mask
+//!   is `!(m1 & m2 & ..)` over the per-lane conjuncts and its block-level
+//!   bail is `u1 || u2 || ..` over the uniform ones, both plain
+//!   expressions over emitted values.
+//!
+//!   This is what makes specializing the graph possible at all. A node
+//!   shared between two variants cannot carry a side effect that belongs
+//!   to only one of them, so as long as `zsel_n(.., &mut dp)` existed,
+//!   sharing a select across variants would have merged their deopt
+//!   masks. The engine primitives lost their deopt parameters for exactly
+//!   this reason; the premises they used to enforce internally are now
+//!   conjuncts (`zi_flr_ok`, `zi_span_ok`, `Known(c)`, `b > 0`).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -199,8 +206,10 @@ impl<'a> Ctx<'a> {
             | Op::Max => joined(Dom::Num),
             // flr of an interval is exact BY GUARD: the lane survives only
             // where the floor is unique, and that condition is a conjunct
-            // of `ok` (rendered here, or discharged by `zi_flr`). So this
-            // is not an unchecked narrowing - it is the guard's postcondition.
+            // of `ok`. So this is not an unchecked narrowing - it is the
+            // conjunct's postcondition, and `Known(Flr(x))` is rendered
+            // from the INTERVAL rather than from this result precisely so
+            // that the premise does not answer itself.
             Op::Flr => Repr::num(self.r(a[0]).lane, false),
             // sin over an inexact input never reaches here: the walk
             // replaces it with sin's RANGE as a constant.
@@ -272,7 +281,7 @@ impl<'a> Ctx<'a> {
                     ("zi_div_pos", "div_positive")
                 };
                 if lane {
-                    format!("{}({}, {}, &mut dp)", zf, x, y)
+                    format!("{}({}, {})", zf, x, y)
                 } else {
                     format!(
                         "{{ let r = IV::new({x}.0, {x}.1).{f}({y}); (r.low, r.high) }}",
@@ -317,9 +326,7 @@ impl<'a> Ctx<'a> {
             Op::Flr => {
                 let src = self.r(a[0]);
                 match (src.lane, src.wide) {
-                    // The deopt is inside the call: this IS the guard for
-                    // the `Known(flr)` conjunct (see `Emit::discharge`).
-                    (true, true) => format!("zi_flr({}, &mut dp)", self.raw(id, 0)?),
+                    (true, true) => format!("zi_flr({})", self.raw(id, 0)?),
                     (true, false) => format!("zn_flr({})", self.raw(id, 0)?),
                     // The uniform interval's guard is a separate line; here
                     // the low endpoint's floor IS the floor, given it.
@@ -437,8 +444,9 @@ impl<'a> Ctx<'a> {
                 let (t, f) = (self.at(id, 1, arms)?, self.at(id, 2, arms)?);
                 let c = self.r(a[0]);
                 if c.lane {
-                    // Deopts an undecided lane, which is the `Known(cond)`
-                    // conjunct the walk discharges against this node.
+                    // An undecided lane blends as if false; `Known(cond)`
+                    // is a conjunct of `ok`, so such a lane is filtered
+                    // out rather than trusted.
                     let cv = self.raw(id, 0)?;
                     let f_ = match (out.dom, out.lane, out.wide) {
                         (Dom::Num, true, true) => "zsel_i",
@@ -446,7 +454,7 @@ impl<'a> Ctx<'a> {
                         (Dom::Bool, true, _) => "zsel_b",
                         _ => bail!("per-lane condition with block-uniform arms"),
                     };
-                    format!("{}({}, {}, {}, &mut dp)", f_, cv, t, f)
+                    format!("{}({}, {}, {})", f_, cv, t, f)
                 } else if c.wide {
                     bail!("select on a block-uniform tri-state: the walk decides it first")
                 } else {
@@ -454,7 +462,25 @@ impl<'a> Ctx<'a> {
                 }
             }
             Op::Known => {
-                let src = self.r(a[0]);
+                // "Is this value decided?" of a FLOOR reads the interval it
+                // came from, not the (already narrowed) result: `Flr` is
+                // exact by derivation precisely BECAUSE this conjunct
+                // holds, so asking the result would answer `true` and lose
+                // the guard.
+                let inner = a[0];
+                if let Op::Flr = &self.g.get(inner).op {
+                    let src = self.g.get(inner).args[0];
+                    let r = self.r(src);
+                    if r.wide {
+                        let x = self.expr[src as usize].as_deref().unwrap();
+                        return Ok(if r.lane {
+                            format!("zi_flr_ok({})", x)
+                        } else {
+                            format!("{x}.0.flr() == {x}.1.flr()", x = x)
+                        });
+                    }
+                }
+                let src = self.r(inner);
                 let x = self.raw(id, 0)?;
                 match (src.lane, src.dom, src.wide) {
                     (true, _, _) => format!("ZB {{ val: {}.known, known: ALL }}", x),
@@ -463,13 +489,13 @@ impl<'a> Ctx<'a> {
                     (false, _, false) => "true".to_string(),
                 }
             }
+            Op::SplitOk => format!("zi_span_ok({})", self.raw(id, 0)?),
             Op::Const(..) | Op::ConstBool(_) | Op::Cell(_) | Op::Free(_) => {
                 bail!("node {} is an inline leaf and needs no let", id)
             }
             Op::Split(_) | Op::SplitValid(_) => {
                 bail!("node {} is part of a split group, emitted as one unit", id)
             }
-            Op::SplitOk => bail!("SplitOk is only ever discharged by zi_fork_flr"),
         })
     }
 }
@@ -537,55 +563,38 @@ fn reachable(g: &Graph, roots: &[NodeId]) -> Vec<bool> {
     live
 }
 
-/// Does emitting `carrier` enforce `cond` all by itself? The walk PROPOSES
-/// a carrier per condition; only the representation the carrier ends up
-/// with decides. `zi_flr` takes `&mut dp`, `v.0.flr()` does not, and the
-/// same `Known(flr)` conjunct rides on the first and needs its own line
-/// after the second.
-fn discharges(g: &Graph, repr: &[Repr], cond: NodeId, carrier: NodeId) -> bool {
-    let c = g.get(carrier);
-    match &c.op {
-        // zsel_*(.., &mut dp) deopts undecided lanes.
-        Op::Sel => repr[c.args[0] as usize].lane && matches!(g.get(cond).op, Op::Known),
-        // zi_flr(.., &mut dp) deopts straddling lanes.
-        Op::Flr => repr[c.args[0] as usize].lane && repr[c.args[0] as usize].wide,
-        // zi_mul_pos / zi_div_pos deopt non-positive multiplier lanes.
-        Op::Mul | Op::Div => repr[carrier as usize].lane && repr[carrier as usize].wide,
-        // zi_fork_flr deopts lanes spanning more than two floors.
-        Op::Split(_) => matches!(g.get(cond).op, Op::SplitOk),
-        _ => false,
-    }
+/// What one validity conjunct contributes.
+enum Term {
+    /// A per-lane mask of the lanes on which the condition HOLDS.
+    Lanes(String),
+    /// A block-uniform condition, in the form that says the slice BAILS.
+    Block(String),
 }
 
-/// The line that enforces one validity conjunct.
-fn guard_line(ctx: &Ctx, cond: NodeId) -> Result<Option<String>> {
-    let g = ctx.g;
-    // "This interval has a unique floor" reads the INTERVAL, not the
-    // (already narrowed) floor value, so it is matched structurally rather
-    // than by the conjunct's own representation.
-    if let Op::Known = &g.get(cond).op {
-        let inner = g.get(cond).args[0];
-        if let Op::Flr = &g.get(inner).op {
-            let src = g.get(inner).args[0];
-            let r = ctx.r(src);
-            if r.wide {
-                let x = ctx.expr[src as usize].as_deref().unwrap();
-                return Ok(Some(if r.lane {
-                    format!("zi_split_flr({}, &mut dp);", x)
-                } else {
-                    format!("if {x}.0.flr() != {x}.1.flr() {{ *bd = true; }}", x = x)
-                }));
-            }
+/// Is this conjunct vacuously true? The walk asks `Known(x)` uniformly and
+/// lets the graph answer; where `x` is exact by derivation the answer is
+/// yes and there is nothing to emit.
+///
+/// The exception is the one that matters: `Flr` over an interval is exact
+/// BECAUSE of this very conjunct, so asking the result would let the
+/// premise answer itself. `render` reads the interval behind it instead.
+fn vacuous(ctx: &Ctx, cond: NodeId) -> bool {
+    let Op::Known = &ctx.g.get(cond).op else { return false };
+    let inner = ctx.g.get(cond).args[0];
+    if let Op::Flr = &ctx.g.get(inner).op {
+        if ctx.r(ctx.g.get(inner).args[0]).wide {
+            return false;
         }
     }
-    // "Is this value decided?" of something that is exact by derivation is
-    // vacuously true - the walk asks it uniformly and the graph answers.
-    if let Op::Known = &g.get(cond).op {
-        let src = ctx.r(g.get(cond).args[0]);
-        if !src.wide && !src.lane {
-            return Ok(None);
-        }
-    }
+    let r = ctx.r(inner);
+    !r.wide && !r.lane
+}
+
+/// How one validity conjunct enters the member's validity. The conjunct is
+/// an ordinary emitted node by this point - `render` has already turned
+/// `Known(Flr(x))` into `zi_flr_ok(x)` and `SplitOk(x)` into
+/// `zi_span_ok(x)` - so all that is left is to read it at the right width.
+fn conjunct_term(ctx: &Ctx, cond: NodeId) -> Result<Term> {
     let r = ctx.r(cond);
     if r.dom != Dom::Bool {
         bail!("validity conjunct {} is a {}, not a condition", cond, r.ty());
@@ -593,15 +602,16 @@ fn guard_line(ctx: &Ctx, cond: NodeId) -> Result<Option<String>> {
     let x = ctx.expr[cond as usize]
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("validity conjunct {} was not emitted", cond))?;
-    Ok(Some(match (r.lane, r.wide, &g.get(cond).op) {
-        // A whole-slice impossibility: the kernel has no lowering at all
-        // for this lane, so the block takes the interpreter path.
-        (_, _, Op::ConstBool(false)) => "*bd = true; // the kernel cannot represent this".to_string(),
-        // zguard is exactly `dp |= !(known & val)`.
-        (true, _, _) => format!("zguard({}, &mut dp);", x),
-        (false, false, _) => format!("if !{} {{ *bd = true; }}", x),
-        (false, true, _) => format!("if {} != Some(true) {{ *bd = true; }}", x),
-    }))
+    // A whole-slice impossibility: the kernel has no lowering for this at
+    // all, so the block takes the interpreter path unconditionally.
+    if let Op::ConstBool(false) = &ctx.g.get(cond).op {
+        return Ok(Term::Block("true".to_string()));
+    }
+    Ok(match (r.lane, r.wide) {
+        (true, _) => Term::Lanes(format!("zb_holds({})", x)),
+        (false, false) => Term::Block(format!("!{}", x)),
+        (false, true) => Term::Block(format!("{} != Some(true)", x)),
+    })
 }
 
 /// Emit the whole body of one member: fills `e.pre` / `e.suf` (and the
@@ -636,25 +646,16 @@ pub(crate) fn emit_body(e: &mut Emit, of: &mut OutFields) -> Result<()> {
     }
 
     // --- what has to exist ---
-    let conj = conjuncts(&e.graph, e.ok);
-    let discharged: BTreeSet<NodeId> = conj
-        .iter()
-        .copied()
-        .filter(|c| {
-            e.discharge
-                .get(c)
-                .is_some_and(|k| discharges(&e.graph, &ctx.repr, *c, *k))
-        })
+    // Every conjunct of `ok` is a root: it is a value the member's
+    // validity reads, exactly like an output cell. Nothing enforces a
+    // premise implicitly any more, so nothing has to be kept alive on the
+    // strength of a side effect.
+    let conj: Vec<NodeId> = conjuncts(&e.graph, e.ok)
+        .into_iter()
+        .filter(|c| !vacuous(&ctx, *c))
         .collect();
     let mut roots: Vec<NodeId> = of.fields.iter().map(|f| f.node).collect();
-    for c in &conj {
-        match e.discharge.get(c) {
-            // The carrier is what enforces it, so IT survives DCE - the
-            // condition itself need not be materialized at all.
-            Some(carrier) if discharged.contains(c) => roots.push(*carrier),
-            _ => roots.push(*c),
-        }
-    }
+    roots.extend(conj.iter().copied());
     // The split groups: their masks build the live-lane chain.
     for id in 0..n as NodeId {
         if matches!(e.graph.get(id).op, Op::Split(_)) {
@@ -726,6 +727,47 @@ pub(crate) fn emit_body(e: &mut Emit, of: &mut OutFields) -> Result<()> {
     }
 
     let mut valid_expr = "ALL".to_string();
+    let mut ok_expr = "ALL".to_string();
+    let mut bd_expr = "false".to_string();
+    // Fold the conjuncts available at one scope into the running validity.
+    // Per-lane conditions AND into a mask; block-uniform ones OR into the
+    // slice's bail flag. Which of the two a condition is was decided by
+    // its representation, not by where it was written.
+    let fold_terms = |tag: &str,
+                          buf: &mut Vec<Line>,
+                          var_ty: &mut std::collections::HashMap<String, &'static str>,
+                          terms: Vec<Term>,
+                          ok_expr: &mut String,
+                          bd_expr: &mut String| {
+        let mut lanes: Vec<String> = Vec::new();
+        let mut blocks: Vec<String> = Vec::new();
+        for t in terms {
+            match t {
+                Term::Lanes(m) => lanes.push(m),
+                Term::Block(b) => blocks.push(b),
+            }
+        }
+        if !lanes.is_empty() {
+            let name = format!("ok{}", tag);
+            buf.push(Line::Let {
+                name: name.clone(),
+                ty: "u16",
+                expr: format!("{} & {}", ok_expr, lanes.join(" & ")),
+            });
+            var_ty.insert(name.clone(), "u16");
+            *ok_expr = name;
+        }
+        if !blocks.is_empty() {
+            let name = format!("bd{}", tag);
+            buf.push(Line::Let {
+                name: name.clone(),
+                ty: "bool",
+                expr: format!("{} || {}", bd_expr, blocks.join(" || ")),
+            });
+            var_ty.insert(name.clone(), "bool");
+            *bd_expr = name;
+        }
+    };
     for lvl in 0..=depth {
         // Values, then the guards over them, then the next split.
         for id in 0..n as NodeId {
@@ -737,17 +779,19 @@ pub(crate) fn emit_body(e: &mut Emit, of: &mut OutFields) -> Result<()> {
             }
             emit_node(&ctx, &mut pre, &mut var_ty, id)?;
         }
-        for c in &conj {
-            if level(*c) != lvl || in_suffix(*c) {
-                continue;
-            }
-            if discharged.contains(c) {
-                continue;
-            }
-            if let Some(line) = guard_line(&ctx, *c)? {
-                pre.push(Line::Raw(line));
-            }
-        }
+        let terms = conj
+            .iter()
+            .filter(|c| level(**c) == lvl && !in_suffix(**c))
+            .map(|c| conjunct_term(&ctx, *c))
+            .collect::<Result<Vec<_>>>()?;
+        fold_terms(
+            &format!("{}", lvl),
+            &mut pre,
+            &mut var_ty,
+            terms,
+            &mut ok_expr,
+            &mut bd_expr,
+        );
         if lvl == depth {
             break;
         }
@@ -764,11 +808,8 @@ pub(crate) fn emit_body(e: &mut Emit, of: &mut OutFields) -> Result<()> {
         let fname = ctx.name[split as usize].clone().unwrap();
         let src = ctx.expr[ctx.g.get(split).args[0] as usize].clone().unwrap();
         pre.push(Line::Raw(format!("for c{} in 0..2usize {{", d)));
-        pre.push(Line::Raw("let mut dp = dp;".to_string()));
-        pre.push(Line::Raw("let mut bd_l: bool = *bd;".to_string()));
-        pre.push(Line::Raw("let bd: &mut bool = &mut bd_l;".to_string()));
         pre.push(Line::Raw(format!(
-            "let ({f}, {f}_fv): (ZI, u16) = zi_fork_flr({s}, c{d}, &mut dp);",
+            "let ({f}, {f}_fv): (ZI, u16) = zi_fork_flr({s}, c{d});",
             f = fname, s = src, d = d
         )));
         pre.push(Line::Raw(format!(
@@ -789,17 +830,33 @@ pub(crate) fn emit_body(e: &mut Emit, of: &mut OutFields) -> Result<()> {
         }
         emit_node(&ctx, &mut suf, &mut var_ty, id)?;
     }
-    for c in &conj {
-        if !in_suffix(*c) {
-            continue;
-        }
-        if discharged.contains(c) {
-            continue;
-        }
-        if let Some(line) = guard_line(&ctx, *c)? {
-            suf.push(Line::Raw(line));
-        }
-    }
+    // Close the prefix off under FIXED names, even when nothing narrowed
+    // the validity. Two consumers look these up - `render` puts them in
+    // `Pre`, `transpile::fuse` needs each member's own - and a name that
+    // is sometimes `ok3` and sometimes the literal `ALL` is not something
+    // either can ask for.
+    pre.push(Line::Let { name: "ok_pre".into(), ty: "u16", expr: ok_expr.clone() });
+    pre.push(Line::Let { name: "bd_pre".into(), ty: "bool", expr: bd_expr.clone() });
+    var_ty.insert("ok_pre".into(), "u16");
+    var_ty.insert("bd_pre".into(), "bool");
+
+    // The suffix folds its own conjuncts on top of the prefix's. It names
+    // `ok_pre` rather than reaching for a `Pre` field, so the value
+    // crosses by the ordinary crossing rule - which matters because the
+    // FUSED artifact has one `ok_pre` per member and no single field
+    // could stand for all of them.
+    ok_expr = "ok_pre".to_string();
+    bd_expr = "bd_pre".to_string();
+    let terms = conj
+        .iter()
+        .filter(|c| in_suffix(**c))
+        .map(|c| conjunct_term(&ctx, *c))
+        .collect::<Result<Vec<_>>>()?;
+    fold_terms("_s", &mut suf, &mut var_ty, terms, &mut ok_expr, &mut bd_expr);
+    suf.push(Line::Let { name: "ok_out".into(), ty: "u16", expr: ok_expr.clone() });
+    suf.push(Line::Let { name: "bd_out".into(), ty: "bool", expr: bd_expr.clone() });
+    var_ty.insert("ok_out".into(), "u16");
+    var_ty.insert("bd_out".into(), "bool");
 
     // --- output fields, read at the representation the boundary wants ---
     for f in of.fields.iter_mut() {
@@ -834,6 +891,8 @@ pub(crate) fn emit_body(e: &mut Emit, of: &mut OutFields) -> Result<()> {
     e.pre_defs = pre_defs;
     e.tainted_vars = tainted_vars;
     e.valid_expr = valid_expr;
+    e.ok_expr = "ok_out".to_string();
+    e.bd_expr = "bd_out".to_string();
     Ok(())
 }
 

@@ -188,50 +188,75 @@ pub fn zi_abs(a: ZI) -> ZI {
     o
 }
 
-/// av_mul interval arm: interval * positive num, per lane. A non-positive
-/// multiplier lane has no interpreter arm - it DEOPTS (the reference
-/// engine answers for it).
+/// av_mul interval arm: interval * positive num, per lane.
+///
+/// The multiplier's POSITIVITY is a premise, not a branch: the emitter
+/// records `b > 0` as a conjunct of the member's validity, and a lane
+/// that fails it is filtered out downstream. Lanes that fail it here are
+/// left unchanged rather than scaled, because `scale_positive` asserts
+/// and the value of a filtered lane is never read.
 #[inline(always)]
-pub fn zi_mul_pos(a: ZI, b: ZN, deopt: &mut u16) -> ZI {
+pub fn zi_mul_pos(a: ZI, b: ZN) -> ZI {
     let zero = P8::from_i16(0);
     let mut o = a;
     for i in 0..W {
         if b[i] > zero {
             set(&mut o, i, iv(&a, i).scale_positive(b[i]));
-        } else {
-            *deopt |= 1 << i;
         }
     }
     o
 }
 #[inline(always)]
-pub fn zi_div_pos(a: ZI, b: ZN, deopt: &mut u16) -> ZI {
+pub fn zi_div_pos(a: ZI, b: ZN) -> ZI {
     let zero = P8::from_i16(0);
     let mut o = a;
     for i in 0..W {
         if b[i] > zero {
             set(&mut o, i, iv(&a, i).div_positive(b[i]));
-        } else {
-            *deopt |= 1 << i;
         }
     }
     o
 }
 
-/// av_flr interval arm: single-floor lanes take the exact floor; a
-/// straddling lane deopts (the __split_by_flr rewrites make this rare).
+/// av_flr interval arm. Whether the floor is UNIQUE is a premise
+/// (`zi_flr_ok`), so this just takes the low endpoint's floor - which is
+/// the floor, on every lane that survives the premise.
 #[inline(always)]
-pub fn zi_flr(a: ZI, deopt: &mut u16) -> ZN {
+pub fn zi_flr(a: ZI) -> ZN {
     let mut o = [P8::from_i16(0); W];
     for i in 0..W {
-        let (fl, fh) = (a.lo[i].flr(), a.hi[i].flr());
-        if fl == fh {
-            o[i] = fl;
-        } else {
-            *deopt |= 1 << i;
-        }
+        o[i] = a.lo[i].flr();
     }
     o
+}
+
+/// The premise `zi_flr` is taken under: this lane's interval has ONE
+/// floor. `known: ALL` because the answer is a fact about the interval,
+/// never itself undecided.
+#[inline(always)]
+pub fn zi_flr_ok(a: ZI) -> ZB {
+    let mut val = 0u16;
+    for i in 0..W {
+        if a.lo[i].flr() == a.hi[i].flr() {
+            val |= 1 << i;
+        }
+    }
+    ZB { val, known: ALL }
+}
+
+/// The premise `zi_fork_flr` is taken under: this lane's interval spans
+/// at most TWO floors, so the two fork outcomes can represent it. A
+/// boundary-widened interval has width < 1 and always passes.
+#[inline(always)]
+pub fn zi_span_ok(a: ZI) -> ZB {
+    let mut val = 0u16;
+    for i in 0..W {
+        let (fl, fh) = (a.lo[i].flr(), a.hi[i].flr());
+        if fl == fh || fh == fl + P8::from_i16(1) {
+            val |= 1 << i;
+        }
+    }
+    ZB { val, known: ALL }
 }
 
 // ---- comparisons ----
@@ -392,10 +417,11 @@ pub fn zb_eq(a: ZB, b: ZB) -> ZB {
 
 // ---- select / guard / deopt ----
 
-/// Per-lane blend. An UNKNOWN condition lane cannot pick - it deopts.
+/// Per-lane blend. That the condition is DECIDED is a premise, recorded
+/// as a validity conjunct by the emitter (`Known(c)`), so an undecided
+/// lane blends as if false and is filtered out downstream.
 #[inline(always)]
-pub fn zsel_n(c: ZB, t: ZN, f: ZN, deopt: &mut u16) -> ZN {
-    *deopt |= !c.known;
+pub fn zsel_n(c: ZB, t: ZN, f: ZN) -> ZN {
     let mut o = f;
     for i in 0..W {
         if c.val & (1 << i) != 0 {
@@ -405,8 +431,7 @@ pub fn zsel_n(c: ZB, t: ZN, f: ZN, deopt: &mut u16) -> ZN {
     o
 }
 #[inline(always)]
-pub fn zsel_i(c: ZB, t: ZI, f: ZI, deopt: &mut u16) -> ZI {
-    *deopt |= !c.known;
+pub fn zsel_i(c: ZB, t: ZI, f: ZI) -> ZI {
     let mut o = f;
     for i in 0..W {
         if c.val & (1 << i) != 0 {
@@ -417,44 +442,34 @@ pub fn zsel_i(c: ZB, t: ZI, f: ZI, deopt: &mut u16) -> ZI {
     o
 }
 #[inline(always)]
-pub fn zsel_b(c: ZB, t: ZB, f: ZB, deopt: &mut u16) -> ZB {
-    *deopt |= !c.known;
+pub fn zsel_b(c: ZB, t: ZB, f: ZB) -> ZB {
     ZB {
         val: (c.val & t.val) | (!c.val & f.val),
         known: (c.val & t.known) | (!c.val & f.known),
     }
 }
 
-/// assert_true: a lane fails the guard if it is known-false OR unknown.
+/// The lanes on which `c` is DEFINITELY TRUE - known, and true. Validity
+/// is the AND of these masks, so this is the one place a tri-state
+/// becomes a plain lane mask.
 #[inline(always)]
-pub fn zguard(c: ZB, deopt: &mut u16) {
-    *deopt |= !c.known | (c.known & !c.val);
+pub fn zb_holds(c: ZB) -> u16 {
+    c.val & c.known
 }
 
 // ---- refinement splits ----
-
-/// __split_by_flr on per-lane intervals: a single-floor lane's fragment is
-/// the interval itself (identity); a straddling lane fragments in the
-/// interpreter, so here it deopts.
-#[inline(always)]
-pub fn zi_split_flr(a: ZI, deopt: &mut u16) -> ZI {
-    for i in 0..W {
-        if a.lo[i].flr() != a.hi[i].flr() {
-            *deopt |= 1 << i;
-        }
-    }
-    a
-}
 
 /// __split_by_flr as a <=2-way FORK (plans/kernel-plan.md K2): a
 /// boundary-widened interval has width < 1, so it spans at most two
 /// floors. Fragment 0 is the low-floor part (always non-empty);
 /// fragment 1 is the high-floor part (empty on single-floor lanes).
 /// Returns (fragment `c` per lane, valid mask); a lane with an empty
-/// fragment simply produces no row in this fork configuration.
-/// Lanes spanning >2 floors deopt (cannot happen at width < 1).
+/// fragment simply produces no row in this fork configuration. Lanes
+/// spanning >2 floors cannot be represented by two outcomes - they stay
+/// valid in outcome 0 only, so the driver sees them exactly once, and
+/// `zi_span_ok` is the premise that filters them out.
 #[inline(always)]
-pub fn zi_fork_flr(a: ZI, c: usize, deopt: &mut u16) -> (ZI, u16) {
+pub fn zi_fork_flr(a: ZI, c: usize) -> (ZI, u16) {
     let mut o = a;
     let mut valid = 0u16;
     for i in 0..W {
@@ -465,9 +480,9 @@ pub fn zi_fork_flr(a: ZI, c: usize, deopt: &mut u16) -> (ZI, u16) {
             }
         } else {
             if fh != fl + P8::from_i16(1) {
-                // >2 floors: deopt, and stay "valid" in config 0 only so
-                // the driver routes the lane to the reference exactly once.
-                *deopt |= 1 << i;
+                // >2 floors: stay "valid" in outcome 0 only, so the
+                // driver routes the lane onward exactly once; zi_span_ok
+                // is what takes it off the kernel.
                 if c == 0 {
                     valid |= 1 << i;
                 }
@@ -483,26 +498,6 @@ pub fn zi_fork_flr(a: ZI, c: usize, deopt: &mut u16) -> (ZI, u16) {
         }
     }
     (o, valid)
-}
-
-/// __split_at on per-lane intervals: a lane fully on one side of `c` is
-/// identity; a lane exactly [c, c] is the POINT class (its value behaves
-/// as the NUMBER c downstream - the returned mask says which lanes);
-/// anything spanning sides deopts.
-#[inline(always)]
-pub fn zi_split_at(a: ZI, c: P8, deopt: &mut u16) -> (ZI, u16) {
-    let mut point = 0u16;
-    for i in 0..W {
-        let (lo, hi) = (a.lo[i], a.hi[i]);
-        if lo == c && hi == c {
-            point |= 1 << i;
-        } else if hi < c || lo > c {
-            // one side: identity
-        } else {
-            *deopt |= 1 << i;
-        }
-    }
-    (a, point)
 }
 
 // ---- cart / collision builtins (per-lane; x/y vary, w/h/flag uniform) ----

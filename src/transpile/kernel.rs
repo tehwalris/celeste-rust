@@ -151,6 +151,18 @@ pub(crate) struct Emit {
     pub(crate) fork_depth: usize,
     /// Name of the current per-lane validity mask ("ALL" at depth 0).
     pub(crate) valid_expr: String,
+    /// Names of the member's final VALIDITY: a per-lane mask of the lanes
+    /// the kernel computed correctly, and a flag that sends the whole
+    /// slice to the interpreter. Both are the rendered form of the `ok`
+    /// node, split by whether each conjunct was block-uniform.
+    ///
+    /// `transpile::lower` binds them under fixed names (`ok_pre`/`bd_pre`
+    /// at the end of the prefix, `ok_out`/`bd_out` at the end of the
+    /// suffix) so that both consumers can ask for them - and so the FUSED
+    /// artifact, which has one of each PER MEMBER, can tell them apart by
+    /// the node they interned to rather than by position.
+    pub(crate) ok_expr: String,
+    pub(crate) bd_expr: String,
     /// Free-choice TAINT tracking (cross-variant sharing): only
     /// instructions whose value depends on a button land in the x64
     /// suffix; everything
@@ -180,15 +192,6 @@ pub(crate) struct Emit {
     /// which of the two is DERIVED from whether the condition is uniform,
     /// so this one node replaces both side channels.
     pub(crate) ok: NodeId,
-    /// Conjuncts of `ok` that an emitted PRIMITIVE already enforces:
-    /// condition node -> the node whose emission carries the deopt
-    /// (`zsel_*`, `zi_flr`, `zi_mul_pos`, `zi_fork_flr` all take
-    /// `&mut dp`). The lowering skips a discharged conjunct's guard and
-    /// keeps its carrier alive through DCE. It is a hint, not a promise:
-    /// if the carrier's chosen representation turns out not to enforce
-    /// the condition, the lowering emits the guard anyway. Losing a guard
-    /// would be unsound; emitting a redundant one is only slower.
-    pub(crate) discharge: BTreeMap<NodeId, NodeId>,
 }
 
 impl Emit {
@@ -260,12 +263,6 @@ impl Emit {
     fn require_live(&mut self, cond: NodeId) {
         let v = self.live;
         self.live = self.graph.fold(GOp::And, vec![v, cond]);
-    }
-
-    /// `ok &= cond`, where emitting `carrier` is what enforces it.
-    fn require_by(&mut self, cond: NodeId, carrier: NodeId) {
-        self.discharge.insert(cond, carrier);
-        self.require(cond);
     }
 
     /// `ok &= <this scalar is strictly positive>` - the premise the
@@ -578,11 +575,12 @@ pub(crate) fn emit_walk(program: &Program, witness_path: &str) -> Result<Emit> {
         button_cells: HashMap::new(),
         fork_depth: 0,
         valid_expr: "ALL".to_string(),
+        ok_expr: "ALL".to_string(),
+        bd_expr: "false".to_string(),
         tainted_vars: BTreeSet::new(),
         tainted_cells: BTreeSet::new(),
         cur_tainted: false,
         graph: Graph::new(),
-        discharge: BTreeMap::new(),
         node_of: HashMap::new(),
         live: 0,
         ok: 0,
@@ -1095,9 +1093,7 @@ fn arith_mul(e: &mut Emit, l: &K, r: &K) -> Result<K> {
             GOp::Mul,
             &[a.as_str(), b.as_str()],
         );
-        let pos = e.require_positive(&b);
-        let carrier = e.node_of[&v];
-        e.discharge.insert(pos, carrier);
+        e.require_positive(&b);
         Ok(K::ZI(v))
     } else {
         let a = e.as_si(iv)?;
@@ -1138,9 +1134,7 @@ fn arith_div(e: &mut Emit, l: &K, r: &K) -> Result<K> {
             GOp::Div,
             &[a.as_str(), b.as_str()],
         );
-        let pos = e.require_positive(&b);
-        let carrier = e.node_of[&v];
-        e.discharge.insert(pos, carrier);
+        e.require_positive(&b);
         Ok(K::ZI(v))
     } else {
         let a = e.as_si(l)?;
@@ -1296,9 +1290,7 @@ fn select(e: &mut Emit, c: &K, t: &K, f: &K) -> Result<K> {
                     GOp::Sel,
                     &[cv.as_str(), a.as_str(), b.as_str()],
                 );
-                let kn = e.require_known(cv.as_str());
-                let carrier = e.node_of[&v];
-                e.discharge.insert(kn, carrier);
+                e.require_known(cv.as_str());
                 v
             })
         } else if matches!(t, K::ZB(_) | K::BoolC(_) | K::SB(_))
@@ -1312,9 +1304,7 @@ fn select(e: &mut Emit, c: &K, t: &K, f: &K) -> Result<K> {
                     GOp::Sel,
                     &[cv.as_str(), a.as_str(), b.as_str()],
                 );
-                let kn = e.require_known(cv.as_str());
-                let carrier = e.node_of[&v];
-                e.discharge.insert(kn, carrier);
+                e.require_known(cv.as_str());
                 v
             })
         } else {
@@ -1326,9 +1316,7 @@ fn select(e: &mut Emit, c: &K, t: &K, f: &K) -> Result<K> {
                     GOp::Sel,
                     &[cv.as_str(), a.as_str(), b.as_str()],
                 );
-                let kn = e.require_known(cv.as_str());
-                let carrier = e.node_of[&v];
-                e.discharge.insert(kn, carrier);
+                e.require_known(cv.as_str());
                 v
             })
         }),
@@ -1415,7 +1403,7 @@ fn call_intrinsic(e: &mut Emit, name: &str, args: &[LocalId]) -> Result<K> {
                     // put it in. That is an ok condition, not a liveness
                     // one, and the fork call is what enforces it.
                     let fok = e.graph.add(GOp::SplitOk, vec![fork_arg]);
-                    e.require_by(fok, fork_node);
+                    e.require(fok);
                     e.var_ty.insert(frag.clone(), "ZI");
                     e.var_ty.insert(valid.clone(), "u16");
                     e.pre_defs.insert(frag.clone());
@@ -1497,7 +1485,7 @@ fn call_pure(e: &mut Emit, name: &str, args: &[LocalId]) -> Result<K> {
                 let r = e.bind_op("ZN", &format!("zi_flr({}, &mut dp)", v), GOp::Flr, &[v]);
                 let rn = e.node_of[&r];
                 let kn = e.graph.add(GOp::Known, vec![rn]);
-                e.require_by(kn, rn);
+                e.require(kn);
                 r
             })),
             K::SI(v) => {
@@ -2263,18 +2251,13 @@ fn render(e: &mut Emit) -> Result<String> {
         writeln!(out, "    {}: {},", name, ty)?;
     }
     writeln!(out, "    valid: u16,")?;
-    writeln!(out, "    dp: u16,")?;
-    writeln!(out, "    bd: bool,")?;
     writeln!(out, "}}\n")?;
 
     // frame()
     writeln!(
         out,
         "#[inline(never)]\n\
-         pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared, &KOut)) {{\n\
-         \x20   let mut dp: u16 = 0;\n\
-         \x20   let mut bd_flag: bool = false;\n\
-         \x20   let bd: &mut bool = &mut bd_flag;"
+         pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared, &KOut)) {{"
     )?;
     out.push_str(&pre_text);
     writeln!(out, "    let p = Pre {{")?;
@@ -2282,8 +2265,6 @@ fn render(e: &mut Emit) -> Result<String> {
         writeln!(out, "        {},", name)?;
     }
     writeln!(out, "        valid: {},", e.valid_expr)?;
-    writeln!(out, "        dp,")?;
-    writeln!(out, "        bd: *bd,")?;
     writeln!(out, "    }};")?;
     writeln!(out, "    let osh = KOutShared {{")?;
     for OutField { cell: id, expr, tainted, .. } in out_fields {
@@ -2358,17 +2339,15 @@ fn render(e: &mut Emit) -> Result<String> {
     for name in &crossing {
         writeln!(out, "    let {} = p.{};", name, name)?;
     }
-    writeln!(out, "    let mut dp: u16 = p.dp;")?;
-    writeln!(out, "    let mut bd_flag: bool = p.bd;")?;
-    writeln!(out, "    let bd: &mut bool = &mut bd_flag;")?;
+
     for k in 0..6 {
         writeln!(out, "    let kb{}: bool = (B >> {}) & 1 != 0;", k, k)?;
     }
     out.push_str(&suf_text);
     writeln!(out, "    out(B, osh, &KOut {{")?;
     writeln!(out, "        valid: p.valid,")?;
-    writeln!(out, "        deopt: dp,")?;
-    writeln!(out, "        bd: *bd,")?;
+    writeln!(out, "        deopt: !{},", e.ok_expr)?;
+    writeln!(out, "        bd: {},", e.bd_expr)?;
     for OutField { cell: id, expr, tainted, .. } in out_fields {
         if *tainted {
             writeln!(out, "        c{}: {},", id, expr)?;
@@ -2446,13 +2425,15 @@ fn render(e: &mut Emit) -> Result<String> {
     );
     eprintln!(
         "graph: {} nodes, {} out cells; buttons reaching an output {:?} -> {} variant(s); \
-         DISTINCT button combinations: {}/64 ({}/64 counting outputs alone)",
+         DISTINCT button combinations: {}/64 ({}/64 counting outputs alone); \
+         fully specialized arena {} nodes",
         e.graph.len(),
         out_fields.len(),
         bits,
         1usize << bits.len(),
         sigs.len(),
         out_only.len(),
+        shared.len(),
     );
     Ok(out)
 }
