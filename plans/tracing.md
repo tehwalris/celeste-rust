@@ -106,40 +106,61 @@ it can be as slow as it likes.
 
 ## 4. What does NOT dissolve
 
-**[check]** This is where I think the vision needs additions.
+I claimed three things survived as tracer policy. Philippe pushed back on
+all three and was right about all three; the corrected version is much
+smaller, and the corrections are the interesting part.
 
-**Loop bounds.** Merging handles diamonds. A back-edge needs a fixpoint,
-and there is no widening over graph nodes - a node handle has no lattice,
-so merging iteration n with n+1 yields `Sel(Sel(..))` and grows without
-converging. Loops must be UNROLLED to a chosen bound, with a guard that
-the bound sufficed. That is exactly `mask_loop`'s `LIMIT` plus
-`unroll_loop`. The trip counts survive as tracer policy.
+**Loop bounds - performance only, not correctness.** ~~The trip counts
+survive as policy.~~ They do not need to be per-site recipe content at
+all. The loop handler runs a HEURISTIC that decides when to stop
+unrolling, and emits a validity predicate asserting the loop had actually
+finished by then. Get the heuristic wrong and the predicate fails - a
+crash we notice, not a silently wrong graph. So the heuristic is tuning,
+and correctness is carried by the guard.
 
-**Pins.** "The heap stays concrete" is maintained, not given. `objects[i]`
-with a symbolic `i` breaks it. Today `pin_builtin` (775 entries, the
-largest surviving category) and `assume_eq` (120) are what keep indices
-concrete. The tracer needs the same pins or it refuses.
+(The part of my objection that stands: there is no fixpoint to be had. A
+node handle has no lattice, so merging iteration n with n+1 gives
+`Sel(Sel(..))` and grows without converging. Unrolling is not one option
+among several - it is the only one. But bounded unrolling plus a guard is
+all that needs saying.)
 
-**Merge vs speculate.** Merging is always sound; speculating - assume the
-condition, guard it, take one path - produces a strictly smaller graph.
-Today `speculate` / `speculate_region` / `guard_branch` (1,670 entries)
-make that call. In a tracer the MECHANISM is three lines (`require(cond)`
-and take one arm), so only the POLICY is content. Default to merge;
-speculate where it measures.
+**Pins - not needed.** ~~The tracer needs the same pins or it refuses.~~
+`assume_eq` and `pin_builtin` exist because the REWRITES DO NOT EXECUTE
+ANYTHING. Without running the program they have no visibility into any
+value, so anything they want to rely on has to be assumed and guarded. A
+tracer is executing, in a specific state. Only numbers and booleans are
+ever symbolic; pointers, functions and table identities are concrete
+because the trace put them there. A loop counter is a trace-time value, so
+`objects[i]` has a concrete `i` - which is exactly the case `pin_builtin`
+was invented to recover. Being in a specific state IS the assumption, and
+it needs no rewrite to express.
 
-Rough split of the ~13,000 recipe entries: ~10,000 are mechanical and
-become one-line policy ("inline everything", "promote every cell", "CSE"
-which is just interning). ~3,000 are real decisions and have to be
-addressed to specific program points and justified. They do not vanish;
-they get much smaller and move somewhere better.
+(If an index ever genuinely depends on symbolic data, the tracer refuses
+loudly. That is a refusal, not a policy.)
 
-**Shape divergence.** Step 5 above is not a footnote - it IS the
-multi-output-shape problem (`plans/multi-output-fusion.md` P2/P3). The
-steady / dying-fall / dying-spikes members exist as three hand-written
-recipes precisely because a branch changes the heap shape and today's
-fuser emits one output shape. A tracer produces all of them from ONE
-trace. **The tracer and P2/P3 are the same project**, which is an argument
-for doing the tracer rather than P2/P3.
+**Merge vs speculate - do not optimize in the tracer.** ~~Default to
+merge; speculate where it measures.~~ Wrong principle. The tracer should
+do whatever most simply yields a COMPLETE and CORRECT heap-free graph, and
+nothing else. Optimizing over the finished graph is easier, more reliable
+and far better observable than arranging for the tracer to happen to emit
+something already near-optimal. Speculation is a graph optimization; it
+belongs after the trace, if at all.
+
+**So almost nothing survives.** My "~3,000 of 13,000 recipe entries become
+policy" was wrong in the same way three times over - I kept importing the
+rewrite pipeline's decisions into the tracer because that is where they
+live today. With the corrections above the number is approximately zero:
+loop bounds are a heuristic, pins are unnecessary, speculation is a
+later-stage graph pass.
+
+**Shape divergence - naturally handled.** Different shapes on different
+branches are simply emitted as they need to be. Fusion over shapes is
+implicit rather than a feature to build. This is the multi-output-shape
+problem (`plans/multi-output-fusion.md` P2/P3): the steady / dying-fall /
+dying-spikes members exist as three hand-written recipes precisely because
+a branch changes the heap shape and today's fuser emits one output shape.
+A tracer produces all of them from ONE trace. **The tracer and P2/P3 are
+the same project**, which is an argument for doing the tracer instead.
 
 ## 5. Decisions taken
 
@@ -155,6 +176,15 @@ for doing the tracer rather than P2/P3.
 - **Rewrites go to their own crate first**, which the crate we iterate on
   does not depend on at all. Correctness of the move is trivial; the point
   is build time.
+- **The interpreter is not being deleted.** It stays as the oracle, and
+  eventually gets much simpler rather than removed: plain scalars, no
+  vectorization, no virtual merge - the machinery that exists to make it
+  fast enough to be the RUNTIME fallback. (Integer ranges probably stay;
+  open.) The end state is a small interpreter that exists only to be
+  checked against, and not much else.
+- **The tracer does not optimize.** Complete and correct graph first;
+  every optimization is a pass over the finished graph, where it can be
+  seen and measured.
 
 ## 6. Why now
 
@@ -235,41 +265,28 @@ pipeline on the un-rewritten program:
 2. **Joins, differing shape.** Keep both; n output states. This is where
    P2/P3 arrives - the kernel emitter needs per-member validity and
    per-member output shapes, which the tracer now supplies naturally.
-3. **Loops.** Unroll to a bound, guard that the bound sufficed.
-4. **Speculation.** `require(cond)` and take one arm, where policy says so.
+3. **Loops.** Unroll under a stopping heuristic, with a predicate
+   asserting the loop had finished. Heuristic wrong -> loud failure, never
+   a wrong graph.
 
-Measure graph size against the recipe pipeline's at every step. If merging
-costs more nodes than speculation saved, that shows up here, before any
-codegen.
+No speculation, no folding-for-size, no cleverness: complete and correct
+first. Measure graph size against the recipe pipeline's anyway, because
+that number is what says whether a later optimization pass is needed and
+which one.
 
 Exit: the tracer produces every class kernel's graph from the un-rewritten
 program.
 
-## Stage 4 - move the policy off the recipes
-
-Trip counts, pins, assume_eq, and the merge-vs-speculate choices become
-tracer configuration, addressed to program points. Expect roughly 3,000
-recipe entries to become a few hundred lines of policy.
-
-Gate: unchanged graphs.
-
-Exit: no recipe is needed to build a kernel.
-
-## Stage 5 - delete
+## Stage 4 - delete
 
 - `celeste-rewrite` (38k lines) - the crate nothing depends on any more.
 - The interpreter's vectorization and virtual-merge machinery (~4.1k), but
   ONLY once the compiled path covers every lane. Until then it is the
   deopt fallback and has to stay.
 
-Open, and not to be answered by assertion:
-
-- **What is the oracle after the interpreter goes?** `verify.rs` calls
-  itself "the real safety net ... 30 frames covers 15,250 distinct input
-  sequences". Deleting the rewrites deletes per-rewrite verification,
-  which is fine, but not the need for a fast reference to check the
-  compiled path against. Today that is the interpreter, ultimately
-  anchored to real PICO-8 via `lua_run`. Something has to hold that role.
-- **The tracer is itself an abstract interpreter.** "Delete the
-  interpreter" means delete the CONCRETE, vectorized one. Interpretation
-  does not go away; it moves to build time and gets much simpler.
+The interpreter itself STAYS - it is the oracle. What goes is what makes
+it special: vectorization, virtual merge, the lane machinery. The end
+state is a plain-scalar interpreter that exists to be checked against.
+(Whether it keeps integer ranges is open.) It already runs the
+un-rewritten program, so nothing has to be built for it to hold that role
+- only removed.
