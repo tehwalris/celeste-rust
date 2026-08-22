@@ -452,19 +452,86 @@ outcomes forward and collapsed after every statement. The RULE was.
 `collapse` now merges any two same-kind outcomes with a mergeable shape,
 on `t`'s guard, and `differ_at_one` is gone.
 
-Two numbers from the landing that are explanations rather than
-measurements, and should be checked if they start to matter:
+Two numbers from the landing were explanations rather than measurements,
+and both were flagged as such. One of them was wrong:
 
 * frame 24 went 191 arena nodes to 425. Every split builds not+and+and and
   the arena never collects, so most of that should be guard construction
-  that is dead after the merge - the live count was not taken.
-* frames 25-28 fan out 12 -> 23 -> 38 -> 117 states. Buttons are free, so
-  some sequences kill the player and the states diverge across death and
-  respawn, where shapes genuinely differ and merging correctly refuses.
-  Consistent with real futures rather than a merge failure.
+  that is dead after the merge - the live count was still not taken.
+* frames 25-28 fanned out 12 -> 23 -> 38 -> 117 states, and the note said
+  this was "consistent with real futures rather than a merge failure",
+  since free buttons kill the player on some sequences and shapes then
+  genuinely differ. **It was a merge failure.** See T7: `intern_body`
+  minted a fresh id per evaluation, so two states that had built the same
+  closure had different SHAPES. With that fixed the same frames go
+  3 -> 5 -> 11.
 
-The trace now reaches frame 29 and stops on something new and
-unimplemented: `array index 3 is past the end of a 0-element table`.
+  The tell was available and not looked at: "shapes genuinely differ" is
+  checkable by printing the shapes, and the ten identical-looking outcomes
+  differed in one field of one table. A story that explains a number is
+  not the same as looking at what the number is made of.
+
+## T7 - a frame as a FUNCTION, and the check (landed 608995b)
+
+The tracer was a walk: run the cart, look at what came out. A kernel is a
+function, so a frame needs a BOUNDARY - a fixed list of input cells and a
+fixed list of output cells - and once it has one, the whole thing is
+checkable end to end without any of the emitter existing yet.
+
+`trace::iface` names a slot by its PATH from the globals table
+(`objects[0].spd.x`) rather than by table id, because a frame can replace
+an object and the id would then name nothing; `symbolize` swaps every
+scalar under one subtree for an `Op::Cell` leaf. `trace::eval` evaluates a
+traced graph at a point, delegating every operation to `domain::Concrete`
+so that it is not a third definition of what the program means.
+`trace::verify` runs the frame twice from one state - symbolically with
+the player free, concretely with real numbers - and compares. Both sides
+are the SAME interpreter over the SAME domain (the concrete side is the
+symbolic one with every leaf already a constant, which folds), so a
+disagreement can only be the compilation.
+
+Today, 24 warm-up frames into room (0,0):
+
+    24 input cells, 3 outcomes, 3,928 nodes for one frame
+    6,720 points agree (448 declined), 384,000 field comparisons
+
+Two design points that are load-bearing rather than incidental:
+
+* **Perturb the inputs, and re-trace nothing.** Evaluating the graph only
+  at the values it was traced at would pass for a graph that had folded
+  every input away - the one bug this design is most exposed to. The sweep
+  varies position and speed and crosses it with all 64 button assignments,
+  and ONE graph answers for every point. That is the claim.
+* **Compare every scalar reachable from the globals table, and compare the
+  COUNTS.** Otherwise a missing output is a skipped comparison instead of
+  a failure.
+
+All 448 declines are one column, `spd.y = 8`: `move_y` steps further than
+the unroll bound and the "loop finished" obligation is false. The refusal
+working. Worth keeping one declining column in the sweep so that path
+stays covered.
+
+What it found immediately: `Interp::intern_body` minted a fresh `BodyId`
+per evaluation of a `function ... end`, so two states that had built the
+same closure were structurally different, and since a `Func` slot is part
+of the shape they could not merge. Interning by AST pointer takes the
+traced frame from 12 outcomes to 3. "Two outcomes with equal shapes" is
+now an assertion.
+
+Restrictions to remember, because the numbers above are only about the
+program as restricted:
+
+* only the player subtree is symbolized. Everything else is a
+  specialization - sound for the check, since both sides specialize the
+  same, but not yet a claim about the general frame.
+* the frame is `_update()`; the pipeline's is
+  `_update(); _draw(); __reset_button_states()`.
+* the cell numbering is the tracer's own, not `celeste_names::FIELD_NAMES`.
+  Lining those up is a separate job and doing it first would have meant
+  debugging two things at once.
+
+The multi-frame probe now stops at frame 28 (was 29) on `array index 3 is
+past the end of a 0-element table`. Different merging, different path.
 
 ### T6 - the gate
 
