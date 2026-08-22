@@ -232,12 +232,10 @@ impl<'a> Ctx<'a> {
             }
             Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq => joined(Dom::Bool),
             Op::Not => self.r(a[0]),
-            // The only AND the walk builds as a VALUE is `Known(x) AND x`,
-            // "x is definitely true", which is decided whatever x is.
-            Op::And => Repr::boolean(
-                a.iter().any(|x| self.r(*x).lane),
-                false,
-            ),
+            // Both are DECIDED whatever their operands are: `zb_and` and
+            // `zb_or` resolve the Kleene short-circuit cases, and the
+            // `Known(x) AND x` idiom is decided by construction.
+            Op::And | Op::Or => Repr::boolean(a.iter().any(|x| self.r(*x).lane), false),
             Op::Sel => {
                 let (t, f) = (self.r(a[1]), self.r(a[2]));
                 if t.dom != f.dom {
@@ -250,6 +248,34 @@ impl<'a> Ctx<'a> {
                 }
             }
             Op::Known => Repr::boolean(self.r(a[0]).lane, false),
+        })
+    }
+
+    /// A two-operand tri-state boolean, in all three representations.
+    /// AND and OR differ in exactly one thing: which value DOMINATES -
+    /// decides the result on its own, known or not - so that is the
+    /// parameter and the rest is shared.
+    fn render_bool2(
+        &self,
+        id: NodeId,
+        out: Repr,
+        zop: &str,
+        sop: &str,
+        dominant: bool,
+    ) -> Result<String> {
+        let (x, y) = (self.at(id, 0, out)?, self.at(id, 1, out)?);
+        Ok(match (out.lane, out.wide) {
+            (true, _) => format!("{}({}, {})", zop, x, y),
+            (false, false) => format!("({} {} {})", x, sop, y),
+            (false, true) => format!(
+                "(if {a} == Some({d}) || {b} == Some({d}) {{ Some({d}) }} \
+                 else if {a}.is_some() && {b}.is_some() {{ Some({nd}) }} \
+                 else {{ None }})",
+                a = x,
+                b = y,
+                d = dominant,
+                nd = !dominant
+            ),
         })
     }
 
@@ -431,7 +457,14 @@ impl<'a> Ctx<'a> {
             Op::And => {
                 // `Known(x) AND x` - "x is definitely true". Any other AND
                 // is a validity conjunct, flattened rather than rendered.
-                let (k, v) = (a[0], a[1]);
+                // Either ORDER: `fold` sorts a commutative op's operands
+                // into node-id order, so which side the `Known` lands on
+                // is an accident of when each was interned.
+                let (k, v) = if matches!(self.g.get(a[1]).op, Op::Known) {
+                    (a[1], a[0])
+                } else {
+                    (a[0], a[1])
+                };
                 match &self.g.get(k).op {
                     // `Known(x) AND x` - "x is definitely true".
                     Op::Known if self.g.get(k).args[0] == v => {
@@ -452,24 +485,10 @@ impl<'a> Ctx<'a> {
                     // emitter flattened - but a traced graph builds them
                     // freely: a guard is `g AND c`, and `or` is De Morgan
                     // over two of them.
-                    _ => {
-                        let (x, y) = (self.at(id, 0, out)?, self.at(id, 1, out)?);
-                        match (out.lane, out.wide) {
-                            (true, _) => format!("zb_and({}, {})", x, y),
-                            (false, false) => format!("({} && {})", x, y),
-                            // Uniform tri-state: false wins over unknown,
-                            // exactly as `zb_and` has it.
-                            (false, true) => format!(
-                                "(if {a} == Some(false) || {b} == Some(false) {{ Some(false) }} \
-                                 else if {a}.is_some() && {b}.is_some() {{ Some(true) }} \
-                                 else {{ None }})",
-                                a = x,
-                                b = y
-                            ),
-                        }
-                    }
+                    _ => self.render_bool2(id, out, "zb_and", "&&", false)?,
                 }
             }
+            Op::Or => self.render_bool2(id, out, "zb_or", "||", true)?,
             Op::Sel => {
                 let arms = Repr {
                     dom: out.dom,

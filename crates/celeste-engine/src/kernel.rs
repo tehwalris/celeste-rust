@@ -419,12 +419,19 @@ pub fn zb_not(a: ZB) -> ZB {
 /// The old front end never needed this. Every `And` it built was either
 /// the `Known(x) AND x` idiom or a validity conjunct that the emitter
 /// flattened, so an AND was never rendered as a value. A traced graph
-/// builds them freely - guards are `g AND c`, and `or` is De Morgan over
-/// them - so they have to lower.
+/// builds them freely - a guard is `g AND c` - so they have to lower.
 #[inline(always)]
 pub fn zb_and(a: ZB, b: ZB) -> ZB {
     let known_false = (a.known & !a.val) | (b.known & !b.val);
     ZB { val: a.val & b.val, known: (a.known & b.known) | known_false }
+}
+
+/// Tri-state OR, Kleene - the mirror of `zb_and`. Known where both are
+/// known, and also where either is known TRUE.
+#[inline(always)]
+pub fn zb_or(a: ZB, b: ZB) -> ZB {
+    let known_true = (a.known & a.val) | (b.known & b.val);
+    ZB { val: a.val | b.val, known: (a.known & b.known) | known_true }
 }
 
 /// av_eq bool arm: equal where both known; unknown where either is not.

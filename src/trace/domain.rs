@@ -79,9 +79,10 @@ pub trait Domain {
     fn compare(&mut self, op: Cmp, a: &Self::Num, b: &Self::Num) -> Result<Self::Bool>;
     fn not(&mut self, a: &Self::Bool) -> Self::Bool;
     fn and(&mut self, a: &Self::Bool, b: &Self::Bool) -> Self::Bool;
-    /// Provided via De Morgan, so no domain has to build an OR and the
-    /// graph needs no `Op::Or` - which it deliberately does not have,
-    /// since nothing emits one. Override if that ever stops being true.
+    /// De Morgan by default, which is all `Concrete` needs. `Symbolic`
+    /// overrides it to build `Op::Or` directly: in a GRAPH the difference
+    /// is three nodes against one, and the detour also destroys the
+    /// symmetry, so `a or b` and `b or a` fail to intern together.
     fn or(&mut self, a: &Self::Bool, b: &Self::Bool) -> Self::Bool {
         let (na, nb) = (self.not(a), self.not(b));
         let both = self.and(&na, &nb);
@@ -326,6 +327,9 @@ impl Domain for Symbolic {
     }
     fn and(&mut self, a: &NodeId, b: &NodeId) -> NodeId {
         self.graph.fold(Op::And, vec![*a, *b])
+    }
+    fn or(&mut self, a: &NodeId, b: &NodeId) -> NodeId {
+        self.graph.fold(Op::Or, vec![*a, *b])
     }
     fn decide(&self, c: &NodeId) -> Option<bool> {
         match self.graph.get(*c).op {

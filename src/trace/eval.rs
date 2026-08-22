@@ -150,6 +150,7 @@ fn run(g: &Graph, need: &[bool], env: &Env, strict: bool) -> Result<Vec<Option<C
             }
             Op::Not => Conc::Bool(!boolean(a(0)?)?),
             Op::And => Conc::Bool(boolean(a(0)?)? && boolean(a(1)?)?),
+            Op::Or => Conc::Bool(boolean(a(0)?)? || boolean(a(1)?)?),
             Op::Sel => {
                 if boolean(a(0)?)? {
                     a(1)?

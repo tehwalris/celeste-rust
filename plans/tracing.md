@@ -799,6 +799,76 @@ these are general where the generated ones are specialised per shape class
 - but removing the button cells moved it only 10,943 -> 10,801, so it is
 not the variants. No explanation yet.
 
+## T11 - normalization: half the emitted body was notation
+
+The duplication census (T10) said 58% of outcome 2's emitted nodes were
+boolean guard algebra that never varied over 97 sample points, dominated
+by `Not` x 4,435 and `And` x 3,327. That count is a fingerprint of HOW the
+tracer wrote things down, not of what the frame computes:
+
+- `or` was De Morgan, because `Op::Or` was deliberately absent on the
+  grounds that nothing constructed one. The tracer constructs them, so
+  every `or` cost three nodes plus two operand `Not`s - and, worse, the
+  detour destroyed the symmetry, so `a or b` and `b or a` interned apart.
+- A merge of a boolean at a branch the tracer could not decide is
+  `Sel(c, x, y)`. Where one arm is a constant - which is most of them,
+  since Lua's `and`/`or` hand the enclosing expression a literal `true` or
+  `false` for the short-circuited side - that select IS an `and` or an
+  `or`, written the long way.
+- Nothing put commutative operands in a canonical order, so structural
+  interning, which is the only sharing mechanism there is, could not see
+  that `a + b` and `b + a` are one node.
+
+So `Graph::fold` now normalizes. Every rule is EXACT with respect to
+`Graph::eval` - the folded node evaluates to the same abstract value as
+the unfolded one at every assignment, not merely to a sound one. That
+distinction is the whole discipline here: a rule that REFINED the answer
+would be correct in isolation and would still change which lanes survive
+`ok` and which rows dedup together, so "it can only help" is not a
+defence. `folding_is_exact_not_merely_sound` enumerates 3,300 (folded,
+unfolded) pairs over 243 tri-state assignments - 801,900 comparisons -
+rather than arguing. It is also why `x and not x -> false` is ABSENT:
+Kleene says unknown, `false` is a refinement, and refinements do not go
+in the folder.
+
+The rules: commutative operand ordering (`Add`, `Min`, `Max`, `Eq`,
+`And`, `Or`; `Mul` only one-directionally, because `eval` is monotone
+only with the exact side second); `Op::Or` as a first-class tri-state op
+with `zb_or` to lower it; `Not(Not x) = x`; `Not(Lt) = Ge` and its three
+siblings; `And(x,x) = x`, `Or(x,x) = x`; `Known(Not x) = Known(x)`; and
+the six `Sel`-with-a-constant-arm rewrites.
+
+Measured on the same traced frame, same 51-point sweep:
+
+| | before | after |
+|---|---|---|
+| traced nodes, outcome 2 | 3,198 | 2,007 |
+| specialised arena | 25,142 | 14,085 |
+| emitted lines, outcomes 1/2/3 | 10,801 / 18,576 / 13,267 | 5,661 / 9,482 / 7,435 |
+| constantly-valued nodes | 12,264 of 21,250 (58%) | 5,786 of 10,510 (55%) |
+| distinct assignments, outcome 1 outputs | 36 | 35 |
+
+Half the body, and it also merged variants - which is the cost that
+matters, since a variant is a row the search has to hash and dedup.
+
+What it did NOT do is explain the constant nodes: 55% of the body still
+evaluates the same at every sampled point, now dominated by `And` x 2,980
+and `Or` x 1,150. Two readings, and they call for different work:
+
+- **Globally constant** - dead guard algebra the folder cannot see
+  because the constancy is a fact about the arithmetic, not about the
+  syntax. That would be a real fold, and finding it needs semantic
+  equality rather than normalization.
+- **Locally constant** - the sample is one game state jittered by +-8 on
+  each numeric input, which is far too local to distinguish "always
+  false" from "false everywhere near here". These would be the guards of
+  branches this state does not take.
+
+Do not guess which. The measurement that decides it is a WIDER sample -
+points drawn from genuinely different game states rather than from one
+neighbourhood - and that is the next thing, before any semantic-equality
+work is priced.
+
 ## Stage 3 - was "control flow", now folded into Stage 2
 
 Written before Stage 2 had a concrete shape; T3 (control flow), T5 (loops)

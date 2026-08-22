@@ -166,10 +166,18 @@ pub enum Op {
 
     // ---- bool -> bool ----
     Not,
-    /// Tri-state AND. There is no OR: the lowering never builds one, and a
-    /// vocabulary entry nothing constructs is a claim the emitter does not
-    /// back up.
+    /// Tri-state AND: a decided `false` wins over an unknown.
     And,
+    /// Tri-state OR: a decided `true` wins over an unknown.
+    ///
+    /// This used to be deliberately absent, on the grounds that nothing
+    /// constructed one. The TRACER constructs them: `a or b` is a Lua
+    /// operator, and expressing it as `not (not a and not b)` costs three
+    /// nodes instead of one and - worse - hides the symmetry, so `a or b`
+    /// and `b or a` interned as different subgraphs. Measured on outcome 2
+    /// of a traced frame, `Not` was the single most common op in the
+    /// emitted body.
+    Or,
 
     /// `Sel(cond, then, else)` - the former `if`, in every width.
     Sel,
@@ -313,10 +321,41 @@ impl Graph {
         map
     }
 
-    /// Add `op(args)`, folding the cases a button substitution unlocks.
-    /// Conservative: anything not folded here is still CORRECT, just less
-    /// collapsed, so this understates sharing rather than inventing it.
-    pub fn fold(&mut self, op: Op, args: Vec<NodeId>) -> NodeId {
+    /// Is operand order meaningless for this op? Structural interning is
+    /// the ONLY sharing mechanism, so `a op b` and `b op a` are two nodes
+    /// unless something puts them in a canonical order first.
+    ///
+    /// `Mul` is absent on purpose even though multiplication commutes:
+    /// `arith` below is only monotone with the EXACT side second, so
+    /// swapping can turn a form it evaluates into one it refuses. It gets
+    /// its own one-directional rule instead.
+    fn commutes(op: &Op) -> bool {
+        matches!(op, Op::Add | Op::Min | Op::Max | Op::Eq | Op::And | Op::Or)
+    }
+
+    /// Add `op(args)`, normalizing and folding.
+    ///
+    /// Every rule here is EXACT with respect to `eval`: the node this
+    /// returns evaluates to the same abstract value as the unfolded node
+    /// would have, for every assignment of the leaves. Not "sound" -
+    /// exact. A rule that merely refined the result would still be
+    /// correct in isolation but would change which lanes survive `ok`,
+    /// and `folding_is_exact` enumerates the tri-state assignments to
+    /// keep that honest. Rules that WOULD refine (`x and not x` is false
+    /// concretely but unknown in Kleene) are therefore left out.
+    pub fn fold(&mut self, op: Op, mut args: Vec<NodeId>) -> NodeId {
+        if args.len() == 2 {
+            if Self::commutes(&op) {
+                if args[0] > args[1] {
+                    args.swap(0, 1);
+                }
+            } else if op == Op::Mul {
+                let konst = |g: &Graph, a: NodeId| matches!(g.nodes[a as usize].op, Op::Const(..));
+                if konst(self, args[0]) && !konst(self, args[1]) {
+                    args.swap(0, 1);
+                }
+            }
+        }
         let cbool = |g: &Graph, i: usize| -> Option<bool> {
             args.get(i).and_then(|a| match g.nodes[*a as usize].op {
                 Op::ConstBool(b) => Some(b),
@@ -339,13 +378,72 @@ impl Graph {
                 if args[1] == args[2] {
                     return args[1];
                 }
+                // A select between BOOLEANS with a constant arm is not a
+                // select at all, it is boolean algebra - and this is the
+                // shape the tracer produces at EVERY merge of a boolean
+                // whose branch condition it could not decide, which is
+                // most of the guard algebra in a frame. Each case is
+                // exact in Kleene: with an undecided condition the select
+                // joins its arms, and the join of `true` with x is
+                // precisely `true or x`.
+                let (c, t, f) = (args[0], args[1], args[2]);
+                match (cbool(self, 1), cbool(self, 2)) {
+                    (Some(true), Some(false)) => return c,
+                    (Some(false), Some(true)) => return self.fold(Op::Not, vec![c]),
+                    (Some(true), None) => return self.fold(Op::Or, vec![c, f]),
+                    (Some(false), None) => {
+                        let n = self.fold(Op::Not, vec![c]);
+                        return self.fold(Op::And, vec![n, f]);
+                    }
+                    (None, Some(true)) => {
+                        let n = self.fold(Op::Not, vec![c]);
+                        return self.fold(Op::Or, vec![n, t]);
+                    }
+                    (None, Some(false)) => return self.fold(Op::And, vec![c, t]),
+                    _ => {}
+                }
             }
             Op::Not => {
                 if let Some(b) = cbool(self, 0) {
                     return self.leaf(Op::ConstBool(!b));
                 }
+                let inner = self.nodes[args[0] as usize].clone();
+                // Involution.
+                if inner.op == Op::Not {
+                    return inner.args[0];
+                }
+                // A negated comparison is the opposite comparison. Exact
+                // on intervals as well as on numbers, because both are
+                // decided by the same four corners. This is worth more
+                // than the node it saves: it makes `x < y` and
+                // `not (x >= y)` the SAME node, which structural
+                // interning could never do.
+                let flip = match inner.op {
+                    Op::Lt => Some(Op::Ge),
+                    Op::Le => Some(Op::Gt),
+                    Op::Gt => Some(Op::Le),
+                    Op::Ge => Some(Op::Lt),
+                    _ => None,
+                };
+                if let Some(f) = flip {
+                    return self.fold(f, inner.args);
+                }
+            }
+            Op::Known => {
+                if cbool(self, 0).is_some() {
+                    return self.leaf(Op::ConstBool(true));
+                }
+                // Negation preserves decidedness, so asking of `not x` is
+                // asking of `x`.
+                let inner = self.nodes[args[0] as usize].clone();
+                if inner.op == Op::Not {
+                    return self.fold(Op::Known, inner.args);
+                }
             }
             Op::And => {
+                if args[0] == args[1] {
+                    return args[0];
+                }
                 let (x, y) = (cbool(self, 0), cbool(self, 1));
                 // `false AND anything` is false even when the other side
                 // is symbolic.
@@ -359,9 +457,22 @@ impl Graph {
                     _ => {}
                 }
             }
-            Op::Known => {
-                if cbool(self, 0).is_some() {
+            Op::Or => {
+                if args[0] == args[1] {
+                    return args[0];
+                }
+                let (x, y) = (cbool(self, 0), cbool(self, 1));
+                // `true OR anything` is true even when the other side is
+                // symbolic - the mirror of the AND rule above, and the
+                // reason an OR is worth a node of its own.
+                if x == Some(true) || y == Some(true) {
                     return self.leaf(Op::ConstBool(true));
+                }
+                match (x, y) {
+                    (Some(_), Some(_)) => return self.leaf(Op::ConstBool(false)),
+                    (Some(_), None) => return args[1],
+                    (None, Some(_)) => return args[0],
+                    _ => {}
                 }
             }
             _ => {}
@@ -493,6 +604,15 @@ impl Graph {
                     Val::Bool(match (x, y) {
                         (Some(p), Some(q)) => Some(p && q),
                         (Some(false), None) | (None, Some(false)) => Some(false),
+                        (Some(_), None) | (None, Some(_)) | (None, None) => None,
+                    })
+                }
+                Op::Or => {
+                    let (x, y) = (a(0).as_bool("Or")?, a(1).as_bool("Or")?);
+                    // Short-circuit on a decided true, mirroring And.
+                    Val::Bool(match (x, y) {
+                        (Some(p), Some(q)) => Some(p || q),
+                        (Some(true), None) | (None, Some(true)) => Some(true),
                         (Some(_), None) | (None, Some(_)) | (None, None) => None,
                     })
                 }
@@ -703,6 +823,195 @@ mod tests {
         // because validity is built out of these.
         let cells = HashMap::from([(1u32, Val::Bool(Some(false))), (2u32, Val::Bool(None))]);
         assert_eq!(g.eval(&cells).unwrap()[and as usize], Val::Bool(Some(false)));
+    }
+
+    #[test]
+    fn folding_is_exact_not_merely_sound() {
+        // Every rule in `fold` has to be EXACT: `fold(op, args)` and
+        // `add(op, args)` must evaluate to the SAME abstract value at
+        // every assignment of the leaves. A rule that merely refined the
+        // answer would be correct in isolation and would still change
+        // which lanes survive `ok` and which rows dedup together, so "it
+        // can only help" is not a defence. This enumerates rather than
+        // arguing - it is the reason `x and not x -> false` is absent,
+        // since Kleene says unknown there and `false` would be a
+        // refinement.
+        let mut g = Graph::new();
+        let b: Vec<NodeId> = (0..3).map(|i| g.leaf(Op::Cell(i))).collect();
+        let nums: Vec<NodeId> = (10..12).map(|i| g.leaf(Op::Cell(i))).collect();
+        let tt = g.leaf(Op::ConstBool(true));
+        let ff = g.leaf(Op::ConstBool(false));
+
+        // A pool of boolean subexpressions, built with `add` so that the
+        // pool itself is unfolded and the rules have something to bite
+        // on: a `Not`, a comparison to flip, a nested `Not`.
+        let not0 = g.add(Op::Not, vec![b[0]]);
+        let nn1 = g.add(Op::Not, vec![b[1]]);
+        let notnot1 = g.add(Op::Not, vec![nn1]);
+        let lt = g.add(Op::Lt, vec![nums[0], nums[1]]);
+        let ge = g.add(Op::Ge, vec![nums[0], nums[1]]);
+        let and01 = g.add(Op::And, vec![b[0], b[1]]);
+        let kn = g.add(Op::Known, vec![b[2]]);
+        let bools = vec![b[0], b[1], b[2], tt, ff, not0, notnot1, lt, ge, and01, kn];
+        let numexprs = vec![
+            nums[0],
+            nums[1],
+            g.add(Op::Add, vec![nums[0], nums[1]]),
+            g.leaf(Op::Const(n(3).as_raw_u32() as i32, n(3).as_raw_u32() as i32)),
+        ];
+
+        // (folded, unfolded) pairs to compare.
+        let mut pairs: Vec<(NodeId, NodeId)> = Vec::new();
+        let both = |g: &mut Graph, op: Op, args: Vec<NodeId>| {
+            let f = g.fold(op.clone(), args.clone());
+            let p = g.add(op, args);
+            (f, p)
+        };
+        for x in bools.clone() {
+            for op in [Op::Not, Op::Known] {
+                pairs.push(both(&mut g, op, vec![x]));
+            }
+            for y in bools.clone() {
+                for op in [Op::And, Op::Or, Op::Eq] {
+                    pairs.push(both(&mut g, op, vec![x, y]));
+                }
+                for z in bools.clone() {
+                    pairs.push(both(&mut g, Op::Sel, vec![x, y, z]));
+                }
+            }
+        }
+        for c in bools.clone() {
+            for x in numexprs.clone() {
+                for y in numexprs.clone() {
+                    pairs.push(both(&mut g, Op::Sel, vec![c, x, y]));
+                    for op in [Op::Add, Op::Min, Op::Max, Op::Lt, Op::Le, Op::Gt, Op::Ge, Op::Eq] {
+                        pairs.push(both(&mut g, op, vec![x, y]));
+                    }
+                }
+            }
+        }
+
+        let tri = [Some(true), Some(false), None];
+        let ivals = [
+            Pico8NumInterval::from_number(n(0)),
+            Pico8NumInterval::from_number(n(1)),
+            Pico8NumInterval::new(n(0), n(2)),
+        ];
+        let mut checked = 0usize;
+        for p0 in tri {
+            for p1 in tri {
+                for p2 in tri {
+                    for i0 in ivals {
+                        for i1 in ivals {
+                            let cells = HashMap::from([
+                                (0u32, Val::Bool(p0)),
+                                (1u32, Val::Bool(p1)),
+                                (2u32, Val::Bool(p2)),
+                                (10u32, Val::Num(i0)),
+                                (11u32, Val::Num(i1)),
+                            ]);
+                            let out = g.eval(&cells).expect("every op in the pool evaluates");
+                            for (f, p) in &pairs {
+                                assert_eq!(
+                                    out[*f as usize],
+                                    out[*p as usize],
+                                    "fold changed the value of {:?} at {:?}",
+                                    g.get(*p),
+                                    cells
+                                );
+                                checked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // A guard against the test silently checking nothing, and against
+        // the pool shrinking to the point where no rule fires.
+        assert!(pairs.len() > 1_000, "pool collapsed to {} pairs", pairs.len());
+        let fired = pairs.iter().filter(|(f, p)| f != p).count();
+        assert!(fired > 500, "only {} of {} pairs were folded", fired, pairs.len());
+        eprintln!(
+            "[fold] {} pairs, {} folded, {} value comparisons",
+            pairs.len(),
+            fired,
+            checked
+        );
+    }
+
+    #[test]
+    fn commutative_operands_are_put_in_a_canonical_order() {
+        // Structural interning is the only sharing mechanism, so without
+        // this `a + b` and `b + a` are two nodes and everything built on
+        // them diverges. `add` is the raw constructor and still does not
+        // normalize - that is what makes it usable as the control in
+        // `folding_is_exact_not_merely_sound`.
+        let mut g = Graph::new();
+        let a = g.leaf(Op::Cell(1));
+        let b = g.leaf(Op::Cell(2));
+        for op in [Op::Add, Op::Min, Op::Max, Op::Eq, Op::And, Op::Or] {
+            assert_eq!(
+                g.fold(op.clone(), vec![a, b]),
+                g.fold(op.clone(), vec![b, a]),
+                "{:?} did not normalize its operand order",
+                op
+            );
+        }
+        // Subtraction does not commute, and must not be normalized.
+        assert_ne!(g.fold(Op::Sub, vec![a, b]), g.fold(Op::Sub, vec![b, a]));
+        // Multiplication DOES commute, but `eval` is only monotone with
+        // the exact side second, so the rule is one-directional: a
+        // constant moves right, and two symbolic operands are left alone.
+        let k = g.leaf(Op::Const(0, 0));
+        assert_eq!(g.fold(Op::Mul, vec![k, a]), g.fold(Op::Mul, vec![a, k]));
+        assert_ne!(g.fold(Op::Mul, vec![a, b]), g.fold(Op::Mul, vec![b, a]));
+    }
+
+    #[test]
+    fn a_select_between_boolean_constants_is_boolean_algebra() {
+        // The shape the tracer produces at every merge of a boolean whose
+        // branch condition it could not decide. `if c then true else x`
+        // is `c or x`, and saying so costs one node instead of three.
+        let mut g = Graph::new();
+        let c = g.leaf(Op::Cell(1));
+        let x = g.leaf(Op::Cell(2));
+        let tt = g.leaf(Op::ConstBool(true));
+        let ff = g.leaf(Op::ConstBool(false));
+        assert_eq!(g.fold(Op::Sel, vec![c, tt, ff]), c, "select of true/false is the condition");
+        assert_eq!(
+            g.fold(Op::Sel, vec![c, ff, tt]),
+            g.fold(Op::Not, vec![c]),
+            "select of false/true is its negation"
+        );
+        assert_eq!(g.fold(Op::Sel, vec![c, tt, x]), g.fold(Op::Or, vec![c, x]));
+        assert_eq!(g.fold(Op::Sel, vec![c, x, ff]), g.fold(Op::And, vec![c, x]));
+        let nc = g.fold(Op::Not, vec![c]);
+        assert_eq!(g.fold(Op::Sel, vec![c, ff, x]), g.fold(Op::And, vec![nc, x]));
+        assert_eq!(g.fold(Op::Sel, vec![c, x, tt]), g.fold(Op::Or, vec![nc, x]));
+    }
+
+    #[test]
+    fn a_negated_comparison_is_the_opposite_comparison() {
+        // Worth more than the `Not` it saves: it makes `x < y` and
+        // `not (x >= y)` the SAME node, which structural interning could
+        // never do on its own.
+        let mut g = Graph::new();
+        let (x, y) = (g.leaf(Op::Cell(1)), g.leaf(Op::Cell(2)));
+        for (op, opp) in [
+            (Op::Lt, Op::Ge),
+            (Op::Le, Op::Gt),
+            (Op::Gt, Op::Le),
+            (Op::Ge, Op::Lt),
+        ] {
+            let a = g.fold(op.clone(), vec![x, y]);
+            assert_eq!(g.fold(Op::Not, vec![a]), g.fold(opp.clone(), vec![x, y]));
+        }
+        // Equality has no negation in the vocabulary, so it keeps its Not.
+        let e = g.fold(Op::Eq, vec![x, y]);
+        let ne = g.fold(Op::Not, vec![e]);
+        assert_eq!(g.get(ne).op, Op::Not);
+        // ... and double negation is the identity.
+        assert_eq!(g.fold(Op::Not, vec![ne]), e);
     }
 
     #[test]
