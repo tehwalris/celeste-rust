@@ -122,9 +122,16 @@ pub enum Op {
     /// `Sel(cond, then, else)` - the former `if`, in every width.
     Sel,
 
-    /// `Known(b)`: is this abstract boolean decided? The operator that
-    /// lets validity be an ordinary value instead of a side channel.
+    /// `Known(v)`: is this value DETERMINED - a decided boolean, or a
+    /// number whose interval is a singleton? One op for both domains,
+    /// because it asks the same question of both: is this abstract set a
+    /// single element? It is what lets validity be an ordinary value
+    /// instead of a side channel.
     Known,
+    /// `ForkValid(d)` over the same operand as `Fork(d)`: which lanes
+    /// belong to configuration d. The fork primitive returns a (value,
+    /// validity) pair, so it is two nodes, not one.
+    ForkValid(u8),
 
     // ---- cart lookups ----
     Mget,
@@ -337,7 +344,9 @@ impl Graph {
                 )),
                 Op::ConstBool(b) => Val::Bool(Some(*b)),
                 Op::Button(b) => bail!("node {}: button bit {} has no value outside a variant", i, b),
-                Op::Fork(d) => bail!("node {}: fork {} has no value outside a configuration", i, d),
+                Op::Fork(d) | Op::ForkValid(d) => {
+                    bail!("node {}: fork {} has no value outside a configuration", i, d)
+                }
                 Op::Cell(c) => match cells.get(c) {
                     Some(v) => *v,
                     None => bail!("node {}: input cell {} was not supplied", i, c),
@@ -416,7 +425,10 @@ impl Graph {
                     // The join is the sound one.
                     None => Self::join(a(1), a(2))?,
                 },
-                Op::Known => Val::Bool(Some(a(0).as_bool("Known")?.is_some())),
+                Op::Known => Val::Bool(Some(match a(0) {
+                    Val::Bool(b) => b.is_some(),
+                    Val::Num(i) => i.to_number().is_some(),
+                })),
                 Op::Mget | Op::TileFlagAt => {
                     bail!("{:?} needs the cart; not supported by the pure evaluator yet", node.op)
                 }

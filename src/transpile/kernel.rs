@@ -170,6 +170,12 @@ pub(crate) struct Emit {
     pub(crate) graph: Graph,
     /// Emitted variable name -> its node in `graph`.
     pub(crate) node_of: HashMap<String, NodeId>,
+    /// The member's VALIDITY, as an ordinary boolean node: the AND of
+    /// every condition under which this lane stays on the kernel. Each
+    /// primitive that writes `&mut dp` contributes its exact condition
+    /// (plans/multi-output-fusion.md, P1'). This is what replaces the dp
+    /// side channel; the emitted code is unchanged.
+    pub(crate) valid: NodeId,
 }
 
 impl Emit {
@@ -224,6 +230,25 @@ impl Emit {
     fn bind_op_nodes(&mut self, ty: &'static str, expr: &str, op: GOp, ids: Vec<NodeId>) -> String {
         let node = self.graph.add(op, ids);
         self.bind_node(ty, expr, node)
+    }
+
+    /// `valid &= cond` - record a condition under which this lane stays
+    /// on the kernel. The emitted code is untouched; this only builds the
+    /// validity node that replaces the dp side channel.
+    fn require(&mut self, cond: NodeId) {
+        let v = self.valid;
+        self.valid = self.graph.fold(GOp::And, vec![v, cond]);
+    }
+
+    /// `valid &= <name is determined>` - the condition a select imposes
+    /// (it cannot pick on an undecided condition).
+    fn require_known(&mut self, name: &str) {
+        let n = self
+            .graph
+            .operand(name, &self.node_of.clone())
+            .unwrap_or_else(|e| panic!("require_known({:?}): {:#}", name, e));
+        let k = self.graph.add(GOp::Known, vec![n]);
+        self.require(k);
     }
 
     fn bind_node(&mut self, ty: &'static str, expr: &str, node: NodeId) -> String {
@@ -502,7 +527,9 @@ pub(crate) fn emit_walk(program: &Program, witness_path: &str) -> Result<Emit> {
         cur_tainted: false,
         graph: Graph::new(),
         node_of: HashMap::new(),
+        valid: 0,
     };
+    e.valid = e.graph.leaf(GOp::ConstBool(true));
     load_witness(witness_path, &mut e)?;
     for k in 0..6 {
         e.tainted_vars.insert(format!("kb{}", k));
@@ -758,7 +785,16 @@ fn eval(e: &mut Emit, instr: &Instruction) -> Result<Option<K>> {
                 K::BoolC(false) => e.line("*bd = true; // assert_true of constant false"),
                 K::SB(v) => e.line(&format!("if !{} {{ *bd = true; }}", v)),
                 K::STri(v) => e.line(&format!("if {} != Some(true) {{ *bd = true; }}", v)),
-                K::ZB(v) => e.line(&format!("zguard({}, &mut dp);", v)),
+                K::ZB(v) => {
+                    // zguard deopts a lane whose condition is unknown OR
+                    // known-false, so the surviving condition is exactly
+                    // `Known(c) AND c`.
+                    let n = e.graph.operand(v.as_str(), &e.node_of.clone()).unwrap();
+                    let kn = e.graph.add(GOp::Known, vec![n]);
+                    let both = e.graph.fold(GOp::And, vec![kn, n]);
+                    e.require(both);
+                    e.line(&format!("zguard({}, &mut dp);", v));
+                }
                 K::UBool { .. } => e.line("*bd = true; // assert_true of UnknownBool"),
                 other => bail!("assert_true on {:?}", other),
             }
@@ -967,7 +1003,7 @@ fn arith_mul(e: &mut Emit, l: &K, r: &K) -> Result<K> {
     }
     if Emit::is_z(iv) || Emit::is_z(num) {
         let (a, b) = (e.as_zi(iv)?, e.as_zn(num)?);
-        Ok(K::ZI(e.bind_op("ZI", &format!("zi_mul_pos({}, {}, &mut dp)", a, b), GOp::Mul, &[a.as_str(), b.as_str()])))
+        Ok(K::ZI({ let zero = e.graph.leaf(GOp::Const(0, 0)); let bn = e.graph.operand(b.as_str(), &e.node_of.clone()).unwrap(); let pos = e.graph.fold(GOp::Gt, vec![bn, zero]); e.require(pos); e.bind_op("ZI", &format!("zi_mul_pos({}, {}, &mut dp)", a, b), GOp::Mul, &[a.as_str(), b.as_str()]) }))
     } else {
         let a = e.as_si(iv)?;
         let b = sn(e, num)?;
@@ -1000,7 +1036,7 @@ fn arith_div(e: &mut Emit, l: &K, r: &K) -> Result<K> {
     }
     if Emit::is_z(l) || Emit::is_z(r) {
         let (a, b) = (e.as_zi(l)?, e.as_zn(r)?);
-        Ok(K::ZI(e.bind_op("ZI", &format!("zi_div_pos({}, {}, &mut dp)", a, b), GOp::Div, &[a.as_str(), b.as_str()])))
+        Ok(K::ZI({ let zero = e.graph.leaf(GOp::Const(0, 0)); let bn = e.graph.operand(b.as_str(), &e.node_of.clone()).unwrap(); let pos = e.graph.fold(GOp::Gt, vec![bn, zero]); e.require(pos); e.bind_op("ZI", &format!("zi_div_pos({}, {}, &mut dp)", a, b), GOp::Div, &[a.as_str(), b.as_str()]) }))
     } else {
         let a = e.as_si(l)?;
         let b = sn(e, r)?;
@@ -1156,15 +1192,15 @@ fn select(e: &mut Emit, c: &K, t: &K, f: &K) -> Result<K> {
         }),
         K::ZB(cv) => Ok(if ival {
             let (a, b) = (e.as_zi(t)?, e.as_zi(f)?);
-            K::ZI(e.bind_op("ZI", &format!("zsel_i({}, {}, {}, &mut dp)", cv, a, b), GOp::Sel, &[cv.as_str(), a.as_str(), b.as_str()]))
+            K::ZI({ e.require_known(cv.as_str()); e.bind_op("ZI", &format!("zsel_i({}, {}, {}, &mut dp)", cv, a, b), GOp::Sel, &[cv.as_str(), a.as_str(), b.as_str()]) })
         } else if matches!(t, K::ZB(_) | K::BoolC(_) | K::SB(_))
             && matches!(f, K::ZB(_) | K::BoolC(_) | K::SB(_))
         {
             let (a, b) = (e.as_zb(t)?, e.as_zb(f)?);
-            K::ZB(e.bind_op("ZB", &format!("zsel_b({}, {}, {}, &mut dp)", cv, a, b), GOp::Sel, &[cv.as_str(), a.as_str(), b.as_str()]))
+            K::ZB({ e.require_known(cv.as_str()); e.bind_op("ZB", &format!("zsel_b({}, {}, {}, &mut dp)", cv, a, b), GOp::Sel, &[cv.as_str(), a.as_str(), b.as_str()]) })
         } else {
             let (a, b) = (e.as_zn(t)?, e.as_zn(f)?);
-            K::ZN(e.bind_op("ZN", &format!("zsel_n({}, {}, {}, &mut dp)", cv, a, b), GOp::Sel, &[cv.as_str(), a.as_str(), b.as_str()]))
+            K::ZN({ e.require_known(cv.as_str()); e.bind_op("ZN", &format!("zsel_n({}, {}, {}, &mut dp)", cv, a, b), GOp::Sel, &[cv.as_str(), a.as_str(), b.as_str()]) })
         }),
         K::STri(cv) => {
             // Uniform tri-state: unknown means the whole slice deopts.
@@ -1232,6 +1268,12 @@ fn call_intrinsic(e: &mut Emit, name: &str, args: &[LocalId]) -> Result<K> {
                         .unwrap_or_else(|err| panic!("fork operand {:?}: {:#}", v, err));
                     let fork_node = e.graph.add(GOp::Fork(d as u8), vec![fork_arg]);
                     e.node_of.insert(frag.clone(), fork_node);
+                    // The fork returns (value, validity); the mask is the
+                    // second node, and it narrows this configuration's
+                    // validity exactly as `valid{d} = valid & frag_fv` does
+                    // in the emitted code.
+                    let fv = e.graph.add(GOp::ForkValid(d as u8), vec![fork_arg]);
+                    e.require(fv);
                     e.var_ty.insert(frag.clone(), "ZI");
                     e.var_ty.insert(valid.clone(), "u16");
                     e.pre_defs.insert(frag.clone());
@@ -1314,8 +1356,8 @@ fn call_pure(e: &mut Emit, name: &str, args: &[LocalId]) -> Result<K> {
             K::NumC(c) => Ok(K::NumC(c.flr())),
             K::SN(v) => Ok(K::SN(e.bind_op("P8", &format!("{}.flr()", v), GOp::Flr, &[v]))),
             K::ZN(v) => Ok(K::ZN(e.bind_op("ZN", &format!("zn_flr({})", v), GOp::Flr, &[v]))),
-            K::ZI(v) => Ok(K::ZN(e.bind_op("ZN", &format!("zi_flr({}, &mut dp)", v), GOp::Flr, &[v]))),
-            K::ZIP { v, .. } => Ok(K::ZN(e.bind_op("ZN", &format!("zi_flr({}, &mut dp)", v), GOp::Flr, &[v]))),
+            K::ZI(v) => Ok(K::ZN({ let r = e.bind_op("ZN", &format!("zi_flr({}, &mut dp)", v), GOp::Flr, &[v]); let rn = e.node_of[&r]; let kn = e.graph.add(GOp::Known, vec![rn]); e.require(kn); r })),
+            K::ZIP { v, .. } => Ok(K::ZN({ let r = e.bind_op("ZN", &format!("zi_flr({}, &mut dp)", v), GOp::Flr, &[v]); let rn = e.node_of[&r]; let kn = e.graph.add(GOp::Known, vec![rn]); e.require(kn); r })),
             K::SI(v) => {
                 e.line(&format!("if {v}.0.flr() != {v}.1.flr() {{ *bd = true; }}", v = v));
                 Ok(K::SN(e.bind_op("P8", &format!("{}.0.flr()", v), GOp::Flr, &[v])))
@@ -2211,6 +2253,21 @@ fn render(e: &Emit) -> Result<String> {
         ideal += 1usize << k;
         binary += if k == 0 { 1 } else { 64 };
     }
+    // The member, in the form P1' calls for: what it writes, and one
+    // boolean saying whether the result counts. No dp side channel.
+    let mut member_outputs: std::collections::BTreeMap<u32, NodeId> = Default::default();
+    for (cell, _ty, expr, _t) in out_fields.iter() {
+        if let Some(n) = e.node_of.get(expr.as_str()) {
+            member_outputs.insert(*cell, *n);
+        }
+    }
+    let vcone = cones[e.valid as usize].count_ones();
+    eprintln!(
+        "  member: {} output cells, validity is node {} (button cone {})",
+        member_outputs.len(),
+        e.valid,
+        vcone,
+    );
     eprintln!(
         "  cone sizes {:?}; node-evaluations per frame: binary split {}, exact 2^|cone| {} ({:.1}x)",
         hist,
