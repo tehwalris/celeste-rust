@@ -356,156 +356,115 @@ notice; never a wrong graph. There is no fixpoint to reach for: a node
 handle has no lattice, so merging iteration n with n+1 gives `Sel(Sel(..))`
 and grows without converging.
 
-### T5 note - the four boolean things, and which is which
+### T5b - three boolean things (SETTLED, landed 032f05e)
 
-Four different things in the tracer have type "boolean", and using one
-word for them caused a real design error (see T5a). They are:
+The tracer has exactly three things of boolean type. Two earlier versions
+of this section listed four and then reasoned about a `path` condition;
+both were wrong and the corrections are the useful part, so they are kept
+below rather than overwritten.
 
-| thing | the question it answers | form | who reads it |
-|---|---|---|---|
-| `Value::Bool` | what does the traced program compute? | a heap value | the traced program |
-| `State::guard` | under what condition does this state apply? | one `D::Bool` | `merge` (as the `Sel` condition); its CONJUNCTS drive branch pruning |
-| `State::ok` | what must hold at RUN TIME for this to be correct? | one `D::Bool` | emitted code, as `dp` / `*bd` |
+| thing | the question it answers | form |
+|---|---|---|
+| `Value::Bool` | what does the traced program compute? | a heap value |
+| `State::guard` | WHEN does this state apply? | one `D::Bool` |
+| `State::ok` | what must hold at RUN TIME for this to be right? | one `D::Bool` |
 
-There is no fourth. An earlier version of this note listed `State::path`
-as a peer of `guard`, on the grounds that a merge condition must be
-recoverable syntactically and an opaque node is not. That was wrong, and
-the code says so: `path` has exactly ONE semantic use,
+`guard` and `ok` are opposites, not degrees. A lane where `guard` is false
+is not described by this state and a sibling describes it - nothing is
+wrong. A lane where `ok` is false was computed WRONG and run time must
+deopt. Downstream they are `Emit::live` and `Emit::ok`, and `ok`'s
+negation is what emitted code spells `dp` (per-lane) or `*bd`
+(block-uniform).
 
-```rust
-st.path.iter().find(|(l, _)| l == cond).map(|(_, v)| *v)
-```
+Nothing looks INSIDE either one. `guard` is built as `g and c` / `g and
+not c` at a branch, OR-ed at a merge, and read only as a whole - as a
+`Sel` condition, and eventually as the lane mask. `ok` merges by SELECT,
+not conjunction: obligations are per-case, and conjoining would deopt
+lanes for something incurred on a path they did not take.
 
-in `decide_on_path` and again in `split_path` - "is this exact condition
-node already assumed, and with which polarity?", a lookup on node
-identity. Every other use is `differ_at_one`/`without`, which is the merge
-rule that guards DELETE, or a debug print.
+INVARIANT the merge depends on: the guards of the outcomes in one frontier
+are pairwise DISJOINT. Every fan-out is a split, so it holds by
+construction - but `merge` selects with `t.guard` and would silently drop
+`f`'s value on a lane both claimed, so a new source of outcomes has to
+preserve it.
 
-And `guard` already answers it. A state reached through `P and a and not
-b` has `guard = And(..P, a, Not(b))`; the question becomes "walk the `And`
-spine for `cond` or `Not(cond)`" - same node identities, same linear scan.
-`path` IS the conjunct list of `guard`, kept in a second field. So it
-goes. The ordering is not lost either: only `differ_at_one` cared about
-positions.
+#### What was wrong twice, and why it is worth remembering
 
-`guard` vs `ok` are opposites, not degrees. A lane where `guard` is false
-is not described by this state and some sibling describes it - nothing is
-wrong. A lane where `ok` is false was computed WRONG, the domain gave up,
-and run time must deopt. Downstream they are `Emit::live` and `Emit::ok`,
-and `ok`'s negation is what the emitted code spells `dp` when the
-condition is per-lane or `*bd` when it is block-uniform.
+**First version: a fourth field, `State::path`,** a conjunction of assumed
+literals, justified by "a merge condition must be recoverable
+syntactically and an opaque node is not". The code disagreed: `path` had
+exactly ONE semantic use, `find(|(l,_)| l == cond)` in `decide_on_path`
+and `split_path`. Everything else was `differ_at_one`, the merge rule
+guards replaced.
 
-What deriving the conjuncts needs from the graph is small and mostly
-present. `And` is binary rather than flattened, which is fine - a
-right-nested spine still walks. `Not` exists but folds only constants and
-needs `Not(Not(x)) -> x` so lookups are canonical. `Or` was deleted
-earlier in the campaign and comes back.
+**Second version: derive the literals from the guard's conjuncts** by
+walking the `And` spine. Also wrong, and wrong in a more interesting way -
+it built a lookup to recover something thrown away one step earlier. The
+scenario is `lua/celeste-minimal.lua:194`,
+`v_input=(btn(k_up) and -1 or (btn(k_down) and 1 or 0))`:
 
-The one obligation that matters: **`Or` must factor common conjuncts**,
-`(P and a) or (P and b)` -> `P and (a or b)`. Without it the first merge
-leaves a top-level `Or` with no visible conjuncts and all pruning stops
-there. But that rule is exactly the hand-written "weaken the path to the
-common prefix" from `collapse`, moved into the graph where it is a
-normalisation that applies everywhere - an argument for the change rather
-than a cost of it.
+1. `btn` splits on U and returns a CONCRETE true/false. The cart does this
+   on purpose - `builtin_level_4.lua:31`, "this weird if statement
+   concretizes the button state the first time it is read".
+2. `collapse` merges the two states straight back and `Sel(U,true,false)`
+   folds to `U`. The merge UNDOES the concretization.
+3. `and` splits on U again and handed on `Bool(U)` - the node it had just
+   decided.
+4. The enclosing `or` needed the path to recover what step 1 established.
 
-Getting the factoring incomplete is SAFE in the useful direction: we fail
-to notice a condition is already assumed, so we split where we could have
-decided - more fan-out, never a wrong answer. Bounded to performance. That
-is a better failure mode than two fields holding the same content and
-drifting apart.
+So `path` refereed a fight between `btn` splitting to gain concreteness
+and `collapse` merging to cut states. Fixing step 3 - hand on the
+CONSTANT, `!is_and`, since `and` keeps a falsy left operand and `or` a
+truthy one - removed the need for step 4 entirely.
 
-The original reason `path` existed still stands and is now `guard`'s job:
-`btn(up) and -1` must not fan out into a dead state holding a bool where
-the program wants a number, and it will not, because `btn(up)` is a
-conjunct of the guard on that branch.
+MEASURED, by counting path lookups reached and hit over a 25-frame trace:
 
-Per operation:
+| | frames 1-24 | frame 25 |
+|---|---|---|
+| before | 0 reached, 0 hit | 78 reached, 10 HIT |
+| after | 0 reached, 0 hit | 68 reached, **0 hit** |
 
-* branch on `c` - children get guards `g and c` / `g and not c`. `ok`
-  untouched. A branch whose guard folds to false is dead and not explored;
-  a branch on a `c` already among the guard's conjuncts is decided.
-* merge `s`,`t` - condition is `s.guard`, differing cells become
-  `Sel(s.guard, ..)`, new guard is `s.guard or t.guard` (whose factoring
-  recovers the common conjuncts), new ok is `Sel(s.guard, s.ok, t.ok)` -
-  an obligation applies only in the case that incurred it.
-* call and return - guards ride along untouched. This is the T5a fix: the
-  276 returns that all say `true` merge into one whose guard is their OR.
-* end of tracing - `guard` becomes the lane mask and `ok` becomes
-  `dp`/`*bd`. Both are outputs; both become code.
+Then the field was deleted.
 
-### T5a - the disjunction problem (OPEN, and it blocks the frame)
+The general lesson, since it will come up again: **a mechanism that
+recovers information the tracer already had is a sign the information was
+discarded too early.** Look upstream before building the lookup.
 
-Tracing frame 25 of the real cart hits `spikes_at` and the frontier grows
-past 256 states. The mechanism is exact:
+### T5a - unmergeable returns (RESOLVED by guards, 032f05e)
 
-```lua
-for i=..,..  do for j=..,.. do
-  if  tile==17 and .. then return true
-  elseif tile==27 and .. then return true
-  ... end
-end end
-```
+`spikes_at` is `if .. return true elseif .. return true` inside a 3x3 tile
+scan, and the frontier grew past 256 states. Bucketed by (flow, path
+length) at the bail point: 276 `return` states over path lengths 4..43 and
+53 `normal` ones - accumulation along a CHAIN, one rung per `elseif`, not
+exponential branching. (An earlier note said 2^9; that was reasoned, not
+measured.) All 276 returned the SAME value from a function that mutates
+nothing.
 
-MEASURED, at the bail point, bucketed by (flow, path length): 276
-`return` states spread over path lengths 4..43, and 53 `normal` ones. So
-it is NOT exponential branching - it is accumulation along a CHAIN, one
-state per rung, each assuming every previous condition was false. That is
-the shape of an `elseif` ladder inside a loop, exactly as written. (An
-earlier version of this note said 2^9; that was reasoned, not measured,
-and wrong.)
+Returns are not semantically special - a call gives back a list of
+`(state, value)` and it does not matter which came from an early return.
+`Flow::Return` only means "skip the rest of this body". It has one
+property that matters: **a `return` escapes its join**, so the merge that
+would have fired where the paths differ in exactly one literal never runs,
+and by the function boundary they differ in twelve.
 
-All 276 return the SAME VALUE, `true`, from a function that mutates
-nothing. They are not 276 behaviours. They are one behaviour the merge
-rule cannot recognise.
+Nor was the merge POINT wrong: `exec_block` already carried non-`Normal`
+outcomes forward and collapsed after every statement. The RULE was.
+`collapse` now merges any two same-kind outcomes with a mergeable shape,
+on `t`'s guard, and `differ_at_one` is gone.
 
-Returns are not semantically special - a call takes a state and gives back
-a list of `(state, value)`, and whether one came from an early `return` or
-from falling off the end does not matter to the caller. `Flow::Return`
-only means "skip the remaining statements of this body". It has exactly
-one interesting property: **a `return` escapes its join**. In
-`if c then return true else .. end` the arms never meet, so the merge that
-would have happened there - where the paths differ in exactly one literal
-and the rule fires - never runs. The return floats to the function
-boundary and by then the paths differ in twelve literals.
+Two numbers from the landing that are explanations rather than
+measurements, and should be checked if they start to matter:
 
-Nor is the merge POINT wrong. `exec_block` already carries non-`Normal`
-outcomes forward and calls `collapse` after every statement, so returns
-are already pushed and already re-merged, at both plausible places. The
-RULE is what fails.
+* frame 24 went 191 arena nodes to 425. Every split builds not+and+and and
+  the arena never collects, so most of that should be guard construction
+  that is dead after the merge - the live count was not taken.
+* frames 25-28 fan out 12 -> 23 -> 38 -> 117 states. Buttons are free, so
+  some sequences kill the player and the states diverge across death and
+  respawn, where shapes genuinely differ and merging correctly refuses.
+  Consistent with real futures rather than a merge failure.
 
-(One nuance in favour of merging at the function boundary as well as
-eagerly: inside the loop body the accumulated returns differ in the dead
-locals `i`, `j`, `tile`, so merging there costs a `Sel` on each. After the
-return the callee scope is unreachable and collected, so at the boundary
-those states are literally identical and merge for free. Do both - eager
-to bound the frontier, boundary to get the clean result.)
-
-`collapse` cannot merge them because it only pairs outcomes differing in
-exactly ONE literal, which is what keeps it sound: two such outcomes
-together cover their parent, so the merged state's path can safely drop
-back to the common prefix. Two outcomes differing in MANY literals do not
-cover their parent, and dropping to the common prefix would claim the
-state happens in cases where it does not.
-
-So merging identical states needs the path condition to become a real
-DISJUNCTION rather than a conjunction of literals, and then the two uses
-diverge:
-
-* deciding a branch wants the literal set (`decide_on_path`), which only
-  works for a conjunction;
-* the emitted validity wants an arbitrary boolean.
-
-The likely answer is to carry both - the literal list for trace-time
-decisions, and a `D::Bool` for the state's actual condition, OR-ed on
-merge - and to accept that a disjunctive state can no longer decide
-branches from its path. That is a design decision, not a fix, and it is
-the last thing between the tracer and a complete symbolic frame.
-
-Worth noting what this is NOT: it is not the fan-out from `if` on unknown
-data, which merges fine (frame 24 collapses 12 states to 1). It is
-specifically early `return` inside a loop, where the function boundary is
-the natural merge point and nothing merges there.
+The trace now reaches frame 29 and stops on something new and
+unimplemented: `array index 3 is past the end of a 0-element table`.
 
 ### T6 - the gate
 
