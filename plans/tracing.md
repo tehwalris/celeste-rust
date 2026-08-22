@@ -733,10 +733,17 @@ Three gaps, each found by running it rather than by reading:
 register, so every value is either per-lane (`ZN`, sixteen numbers) or
 block-uniform (`P8`, one). `Ctx::derive` already propagates this as a
 fixed point over the graph - `lane: args.any(|a| r(a).lane)` - so nothing
-has to carry the annotation around. What is missing is only the SEED, and
-the seed is not derivable: whether `hitbox.w` is uniform is a fact about
-how states were grouped into a block, not about the program. So the
-tracer must DECLARE it and the existing bind-time guards must enforce it.
+has to carry the annotation around. What is missing is only the SEED.
+
+*(SUPERSEDED - see "the uniform/per-lane seed was the wrong question"
+under T12. This paragraph claimed the seed is not derivable, on the
+grounds that whether `hitbox.w` is uniform is a fact about how states
+were grouped rather than about the program. Counting the witness says
+otherwise: `hitbox.w` has a KNOWN VALUE, so it is a constant rather than
+a uniform, and under specialize-per-key the classification is mechanical
+- what the key and shape fix is a literal, everything else is per-lane.
+The tracer does not declare anything; `symbolize` stops turning fixed
+slots into cells.)*
 
 **Boundary numbering.** Generated code says "read column 23". Four things
 must agree on which field is which column: the loader, the kernel, the
