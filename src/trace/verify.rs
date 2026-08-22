@@ -433,6 +433,34 @@ mod tests {
                         }
                     }
                 }
+                // The cells `freeze` and `has_dashed` actually depend on
+                // are the DASH AND JUMP state, and a sweep over position
+                // and velocity never touches them - so a row count taken
+                // from position alone is a lower bound measured in the
+                // wrong dimensions.
+                for (field, vals) in [
+                    ("djump", [0i16, 1].as_slice()),
+                    ("dash_time", [0, 1, 3].as_slice()),
+                    ("grace", [0, 1, 6].as_slice()),
+                    ("dash_effect_time", [0, 5].as_slice()),
+                ] {
+                    if let Some(i) = idx(field) {
+                        for v in vals {
+                            let mut p = f.iface.init.clone();
+                            p[i] = Conc::Num(n16(*v));
+                            points.push(p);
+                        }
+                    }
+                }
+                for field in ["p_dash", "p_jump"] {
+                    if let Some(i) = idx(field) {
+                        for v in [false, true] {
+                            let mut p = f.iface.init.clone();
+                            p[i] = Conc::Bool(v);
+                            points.push(p);
+                        }
+                    }
+                }
                 if let (Some(w), Some(d)) = (gidx("will_restart"), gidx("delay_restart")) {
                     let mut p = f.iface.init.clone();
                     p[w] = Conc::Bool(true);
@@ -488,6 +516,61 @@ mod tests {
                     most_rows,
                     live_at_most
                 );
+
+                // WHY do assignments that produce the same VALUE keep
+                // different trees? The emitter's dedup key is structural
+                // node identity after specialisation, so they collapse
+                // exactly when they fold to the same tree. Print the
+                // first two that differ, shallowly.
+                if n == 1 {
+                    let show = |sp: &crate::transpile::graph::Graph,
+                                root: crate::transpile::graph::NodeId,
+                                depth: usize|
+                     -> String {
+                        fn go(
+                            g: &crate::transpile::graph::Graph,
+                            id: crate::transpile::graph::NodeId,
+                            d: usize,
+                        ) -> String {
+                            let nd = g.get(id);
+                            if d == 0 {
+                                return format!("{:?}#{}", nd.op, id);
+                            }
+                            if nd.args.is_empty() {
+                                return format!("{:?}", nd.op);
+                            }
+                            let kids: Vec<String> =
+                                nd.args.iter().map(|a| go(g, *a, d - 1)).collect();
+                            format!("{:?}({})", nd.op, kids.join(", "))
+                        }
+                        go(sp, root, depth)
+                    };
+                    if let Some((fp, fnode, _)) =
+                        o.fields.iter().find(|(q, _, _)| iface::show(q) == "freeze")
+                    {
+                        let mut seen: std::collections::BTreeMap<
+                            crate::transpile::graph::NodeId,
+                            Vec<u8>,
+                        > = Default::default();
+                        for m in 0u8..64 {
+                            seen.entry(maps[m as usize][*fnode as usize])
+                                .or_default()
+                                .push(m);
+                        }
+                        eprintln!(
+                            "[emit]   {} has {} distinct trees over 64 assignments",
+                            iface::show(fp),
+                            seen.len()
+                        );
+                        for (node, ms) in seen.iter().take(3) {
+                            eprintln!(
+                                "[emit]     masks {:?}..: {}",
+                                &ms[..ms.len().min(3)],
+                                show(&sp, *node, 3)
+                            );
+                        }
+                    }
+                }
 
                 varying.sort_by_key(|(_, k)| std::cmp::Reverse(*k));
                 eprintln!(
