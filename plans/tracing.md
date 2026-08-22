@@ -471,7 +471,13 @@ and both were flagged as such. One of them was wrong:
   differed in one field of one table. A story that explains a number is
   not the same as looking at what the number is made of.
 
-## T7 - a frame as a FUNCTION, and the check (landed 608995b)
+### T6 - the gate
+
+Trace the UN-REWRITTEN `__frame` and diff the resulting graph against the
+one the recipe pipeline produces, per class kernel. Exact, incremental,
+and it localizes a discrepancy to a node.
+
+### T7 - a frame as a FUNCTION, and the check (landed 608995b)
 
 The tracer was a walk: run the cart, look at what came out. A kernel is a
 function, so a frame needs a BOUNDARY - a fixed list of input cells and a
@@ -532,12 +538,6 @@ program as restricted:
 
 The multi-frame probe now stops at frame 28 (was 29) on `array index 3 is
 past the end of a 0-element table`. Different merging, different path.
-
-### T6 - the gate
-
-Trace the UN-REWRITTEN `__frame` and diff the resulting graph against the
-one the recipe pipeline produces, per class kernel. Exact, incremental,
-and it localizes a discrepancy to a node.
 
 ## Stage 3 - was "control flow", now folded into Stage 2
 
