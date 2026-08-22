@@ -116,6 +116,17 @@ impl<'a, D: Domain> Interp<'a, D> {
             }
             live = self.collapse(next)?;
             if live.len() > self.max_states {
+                let mut hist: std::collections::BTreeMap<(&str, usize), usize> =
+                    Default::default();
+                for (st, f) in &live {
+                    let k = match f {
+                        Flow::Normal => "normal",
+                        Flow::Break => "break",
+                        Flow::Return(_) => "return",
+                    };
+                    *hist.entry((k, st.path.len())).or_default() += 1;
+                }
+                eprintln!("[trace] frontier by (flow, path len): {:?}", hist);
                 bail!(
                     "frontier grew to {} states (limit {}) - something is fanning out \
                      without merging back",
