@@ -2156,7 +2156,34 @@ fn render(e: &Emit) -> Result<String> {
         suf_text.lines().count(),
         e.witness_len,
     );
-    eprintln!("graph: {} nodes", e.graph.len());
+    // Which output cells exist as graph nodes, and which buttons can
+    // reach them (plans/multi-output-fusion.md; the graph's first use).
+    // An out cell is a bound name OR a button bit written straight through
+    // (dash stores kb4/kb5 - last frame's press, kept for edge detection).
+    // Resolve BOTH: skipping what does not resolve silently understates the
+    // cone, which is how this measurement first reported a false 4x.
+    let cones = e.graph.button_cones();
+    let mut live = 0u8;
+    let mut n_out = 0usize;
+    for (cell, _ty, expr, _t) in out_fields.iter() {
+        live |= match e.node_of.get(expr.as_str()) {
+            Some(n) => cones[*n as usize],
+            None => match expr.strip_prefix("kb").and_then(|b| b.parse::<u8>().ok()) {
+                Some(bit) => 1u8 << bit,
+                None => panic!("out cell {} has unresolvable expr {:?}", cell, expr),
+            },
+        };
+        n_out += 1;
+    }
+    let out_nodes = n_out;
+    let bits: Vec<u8> = (0..6).filter(|b| live & (1 << b) != 0).collect();
+    eprintln!(
+        "graph: {} nodes, {} out cells; buttons reaching an output {:?} -> {} variant(s)",
+        e.graph.len(),
+        out_nodes,
+        bits,
+        1usize << bits.len(),
+    );
     Ok(out)
 }
 

@@ -180,6 +180,27 @@ impl Graph {
         self.nodes.is_empty()
     }
 
+    /// For every node, which button bits can influence it - a bitmask,
+    /// computed bottom-up in one pass (operands always precede their
+    /// node). A button that reaches no OUTPUT cannot affect any lane's
+    /// result, so the 2^6 button variants collapse by a factor of two for
+    /// each such bit. That is a plain reachability fact, decided once for
+    /// the whole kernel, not per lane.
+    pub fn button_cones(&self) -> Vec<u8> {
+        let mut mask = vec![0u8; self.nodes.len()];
+        for (i, node) in self.nodes.iter().enumerate() {
+            let mut m = match node.op {
+                Op::Button(b) => 1u8 << b,
+                _ => 0,
+            };
+            for a in &node.args {
+                m |= mask[*a as usize];
+            }
+            mask[i] = m;
+        }
+        mask
+    }
+
     /// Resolve an emitted operand spelling to a node: a name the emitter
     /// already bound, a witness field access (`u.cN` / `rin.cN`), or a
     /// literal. Anything else is an error - silently inventing a node here
