@@ -13,9 +13,17 @@
 --
 -- Regenerate the golden file with ./regen-pico8-golden.sh (needs PICO-8).
 
+-- Elements only. `#` is a separate function because this model answers
+-- it exactly or raises (see `Table::len`), and the tables with holes in
+-- them are the ones it raises on - those live in `len_*.lua`, where the
+-- golden file records what PICO-8 says and a Rust test records that the
+-- tracer refuses to guess.
 function dump(t)
-  printh(#t)
   printh(t[1]) printh(t[2]) printh(t[3]) printh(t[4]) printh(t[5])
+end
+function dumpn(t)
+  printh(#t)
+  dump(t)
 end
 
 -- The project's shims, as `lua/builtin_level_4.lua` has them, so that the
@@ -44,10 +52,10 @@ function s_foreach(list, f) for i=1,#list do f(list[i]) end end
 --    part, and the array part only absorbs it once the gap is filled.
 printh("sparse-build")
 local t={}
-dump(t)
+dumpn(t)
 t[3]="c" dump(t)
 t[1]="a" dump(t)
-t[2]="b" dump(t)
+t[2]="b" dumpn(t)
 
 -- 2. A CONSTRUCTOR sizes the array part up front, so the same contents
 --    as case 1 step 2 have a different length.
@@ -57,7 +65,7 @@ dump(k)
 
 printh("constructor-dense")
 local k2={"a","b","c"}
-dump(k2)
+dumpn(k2)
 
 -- 3. Punching a hole in a dense table, in the middle and at the end.
 printh("nil-middle")
@@ -68,53 +76,41 @@ dump(r)
 printh("nil-last")
 local r2={"a","b","c"}
 r2[3]=nil
-dump(r2)
+dumpn(r2)
 
 printh("nil-last-then-length")
 local r3={"a","b","c"}
 r3[3]=nil
 r3[#r3+1]="z"
-dump(r3)
+dumpn(r3)
 
 -- 4. Appending.
 printh("append")
 local ap={}
-s_add(ap,"a") dump(ap)
-s_add(ap,"b") dump(ap)
-
-printh("append-to-hole")
-local ah={}
-ah[3]="c"
-s_add(ah,"x")
-dump(ah)
+s_add(ap,"a") dumpn(ap)
+s_add(ap,"b") dumpn(ap)
 
 -- 5. del, which is the shim the cart actually runs.
 printh("del-middle")
-local d1={"a","b","c"} s_del(d1,"b") dump(d1)
+local d1={"a","b","c"} s_del(d1,"b") dumpn(d1)
 printh("del-first")
-local d2={"a","b","c"} s_del(d2,"a") dump(d2)
+local d2={"a","b","c"} s_del(d2,"a") dumpn(d2)
 printh("del-last")
-local d3={"a","b","c"} s_del(d3,"c") dump(d3)
+local d3={"a","b","c"} s_del(d3,"c") dumpn(d3)
 printh("del-absent")
-local d4={"a","b"} s_del(d4,"zz") dump(d4)
+local d4={"a","b"} s_del(d4,"zz") dumpn(d4)
 printh("del-only")
-local d5={"a"} s_del(d5,"a") dump(d5)
+local d5={"a"} s_del(d5,"a") dumpn(d5)
 printh("del-empty")
-local d6={} s_del(d6,"a") dump(d6)
+local d6={} s_del(d6,"a") dumpn(d6)
 
--- 6. Iteration over a hole-punched table: how many times does the body
---    run, and with what?
-printh("foreach-hole")
-local fh={}
-fh[1]="a"
-fh[3]="c"
-s_foreach(fh, function(e) printh(e) end)
-printh(s_count(fh))
-
-printh("for-over-length")
-local fl={"a","b","c"}
-fl[2]=nil
-for i=1,#fl do printh(fl[i]) end
+-- 6. Iteration over a DENSE table, which is all `foreach` ever sees in
+--    the cart. The hole-punched version needs `#`, so it lives in
+--    `len_foreach_hole.lua`.
+printh("foreach-dense")
+local fd={"a","b","c"}
+s_foreach(fd, function(e) printh(e) end)
+printh(s_count(fd))
 
 -- 7. Reads that are not in the array part at all.
 printh("odd-indices")
@@ -131,7 +127,6 @@ n[1][2]="deep"
 printh(#n)
 printh(n[1][1])
 printh(n[1][2])
-printh(#n[1])
 
 -- 9. Closure identity, only as far as it is answerable. PICO-8 is Lua
 --    5.2 and CACHES closures on (prototype, upvalue cells), so
@@ -197,3 +192,24 @@ printh(bx)
 local by=0
 for i=1,2 do for j=1,5 do if j>=2 then break end by=by+1 end end
 printh(by)
+
+-- 14. ORDER OF EVALUATION in an assignment: Lua does the left-hand side
+--     first, so `t[f()] = g()` calls `f` and then `g`. Only observable
+--     when both sides have effects, which in the cart they never do -
+--     `init_object(platform,tx*8,ty*8).dir=-1` has a call on the left and
+--     a literal on the right.
+printh("assign-order")
+function lhs_idx() printh("lhs") return 1 end
+function rhs_val() printh("rhs") return 9 end
+local ao={}
+ao[lhs_idx()]=rhs_val()
+printh(ao[1])
+
+-- 15. Booleans compare by VALUE, not by identity.
+printh("bool-equality")
+local ba=true
+local bb=false
+printh(ba==bb)
+printh(ba==true)
+printh(bb==false)
+printh(ba~=bb)

@@ -174,39 +174,49 @@ impl<D: Domain> Table<D> {
         self.hash.values().chain(self.arr.iter()).chain(self.ints.values())
     }
 
-    /// `#t`, as Lua's `luaH_getn` computes it.
+    /// `#t`, WHEN THIS MODEL CAN ANSWER IT EXACTLY. `None` means raise.
     ///
-    /// Not `arr.len()`: a table is allowed to have holes, and the answer
-    /// is a BORDER - an `i` with `t[i] ~= nil` and `t[i+1] == nil`. Which
-    /// border you get is determined by where the array part ends, which
-    /// is why this is history-dependent and why the golden corpus exists.
-    pub fn len(&self) -> usize {
-        let n = self.arr.len();
-        if n > 0 && matches!(self.arr[n - 1], Value::Nil) {
-            // The array part ends in a hole, so a border is inside it.
-            // Binary search, exactly as Lua does.
-            let (mut i, mut j) = (0usize, n);
-            while j - i > 1 {
-                let m = (i + j) / 2;
-                if matches!(self.arr[m - 1], Value::Nil) {
-                    j = m;
-                } else {
-                    i = m;
-                }
-            }
-            i
-        } else {
-            // The array part is full to the end, so keep walking into the
-            // integer part while the next index is there.
-            let mut i = n;
-            while let Ok(k) = i16::try_from(i + 1) {
-                match self.ints.get(&k) {
-                    Some(v) if !matches!(v, Value::Nil) => i += 1,
-                    _ => break,
-                }
-            }
-            i
+    /// Lua's `luaH_getn` searches the array part's CAPACITY, which grows
+    /// in powers of two at rehash and therefore depends on the table's
+    /// history rather than its contents. Two tables holding the same
+    /// keys can have different lengths:
+    ///
+    /// ```text
+    /// t={} t[1]=1 t[2]=2 t[3]=3 t[2]=nil    #t == 1
+    /// {"a",nil,"c"}                          #t == 3
+    /// t={} t[1]=1 t[2]=2 t[4]=4              #t == 4  (rehash pulled 4 in)
+    /// ```
+    ///
+    /// Line 1 and line 2 hold the same keys. Line 3's answer skips a
+    /// genuine hole at 3, because `computesizes` decided a 4-slot array
+    /// part was worth it. Reproducing any of this means reproducing
+    /// `computesizes` and the node part's occupancy, and then the
+    /// capacity becomes part of the SHAPE - a merge cost paid for
+    /// something the cart cannot reach (`del` shifts left and drops the
+    /// last, and `got_fruit` never has `#` taken of it).
+    ///
+    /// So: answer exactly, or raise. The answer is exact precisely when
+    /// the integer part is empty and the array part has no INTERIOR hole,
+    /// because then the border is the last non-nil index whatever the
+    /// capacity is - Lua's binary search over any capacity at least that
+    /// large lands in the same place, and with a full array part
+    /// `unbound_search` starts past the end and stops immediately.
+    /// Trailing holes are fine, which matters: that is what
+    /// `__array_table_drop_last` leaves behind, and `del` then takes `#`
+    /// of it on the next call.
+    pub fn len(&self) -> Option<usize> {
+        if !self.ints.is_empty() {
+            return None;
         }
+        let last = self
+            .arr
+            .iter()
+            .rposition(|v| !matches!(v, Value::Nil))
+            .map_or(0, |i| i + 1);
+        if self.arr[..last].iter().any(|v| matches!(v, Value::Nil)) {
+            return None;
+        }
+        Some(last)
     }
 
     pub fn get_index(&self, i: i16) -> Option<&Value<D>> {

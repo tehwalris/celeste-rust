@@ -75,15 +75,91 @@ pub fn compare(name: &str) -> Result<usize> {
     Ok(want.len())
 }
 
+/// Corpora the tracer must reproduce EXACTLY.
+pub const MATCHING: &[&str] = &["tables"];
+
+/// Corpora the tracer must REFUSE. Each is a `#` whose value depends on
+/// the array part's capacity, and so on the table's rehash history rather
+/// than on its keys - see `heap::Table::len`. Their golden files record
+/// what PICO-8 actually says, so what we are declining to guess stays
+/// written down and stays checked.
+pub const REFUSED: &[&str] = &[
+    "len_add_to_hole",
+    "len_after_sparse_write",
+    "len_constructor_hole",
+    "len_foreach_hole",
+    "len_for_over_hole",
+    "len_interior_hole",
+    "len_nested_sparse",
+    "len_sparse",
+];
+
+/// Every corpus on disk, so adding one cannot be forgotten by the
+/// currency check.
+pub fn all_corpora() -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir("lua/probe")? {
+        let path = e?.path();
+        if path.extension().and_then(|x| x.to_str()) == Some("lua") {
+            out.push(path.file_stem().unwrap().to_string_lossy().into_owned());
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn table_semantics_match_pico8() {
-        match compare("tables") {
-            Ok(n) => eprintln!("[probe] tables: {} lines agree with real PICO-8", n),
-            Err(e) => panic!("{:#}", e),
+    fn every_corpus_is_classified() {
+        let on_disk = all_corpora().expect("read lua/probe");
+        let mut known: Vec<String> =
+            MATCHING.iter().chain(REFUSED.iter()).map(|s| s.to_string()).collect();
+        known.sort();
+        assert_eq!(
+            on_disk, known,
+            "a corpus file is neither in MATCHING nor in REFUSED - it is not being checked"
+        );
+    }
+
+    #[test]
+    fn corpora_match_pico8() {
+        for name in MATCHING {
+            match compare(name) {
+                Ok(n) => eprintln!("[probe] {}: {} lines agree with real PICO-8", name, n),
+                Err(e) => panic!("{:#}", e),
+            }
+        }
+    }
+
+    /// The other half of "exactly match PICO-8 or raise": these RAISE, and
+    /// that has to be checked, or the rule is just a comment. A silent
+    /// wrong answer and a refusal are very different things, and only one
+    /// of them is allowed.
+    #[test]
+    fn corpora_that_cannot_be_answered_are_refused() {
+        for name in REFUSED {
+            let got = run_probe(name);
+            let want = golden(name).expect("golden");
+            match got {
+                Ok(lines) => panic!(
+                    "{}: the tracer answered {:?}; PICO-8 says {:?}, and this model \
+                     cannot know which - it must refuse",
+                    name, lines, want
+                ),
+                Err(e) => {
+                    let msg = format!("{:#}", e);
+                    assert!(
+                        msg.contains("length") || msg.contains("#"),
+                        "{}: refused, but for the wrong reason: {}",
+                        name,
+                        msg
+                    );
+                    eprintln!("[probe] {}: refused (PICO-8 would say {:?})", name, want);
+                }
+            }
         }
     }
 
@@ -105,7 +181,7 @@ mod tests {
             eprintln!("[probe] no PICO-8 at {} - NOT checking the golden files", p8);
             return;
         }
-        let names = ["tables"];
+        let names = all_corpora().expect("read lua/probe");
         let before: Vec<String> = names
             .iter()
             .map(|n| std::fs::read_to_string(format!("lua/probe/{}.expected", n)).unwrap())

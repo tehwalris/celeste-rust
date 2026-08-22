@@ -1,0 +1,6 @@
+-- `#` here depends on the array part's CAPACITY, which follows from
+-- rehash history rather than from the keys. This model answers exactly
+-- or raises (`Table::len`), and raises on this. The golden file records
+-- what PICO-8 actually says, so the refusal is documented rather than
+-- merely asserted.
+local ah={} ah[3]="c" ah[#ah+1]="x" printh(#ah) printh(ah[1]) printh(ah[3])

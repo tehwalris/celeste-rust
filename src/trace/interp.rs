@@ -284,9 +284,13 @@ impl<'a, D: Domain> Interp<'a, D> {
                     .iter()
                     .next()
                     .ok_or_else(|| anyhow!("assignment with no expression"))?;
+                // TARGET FIRST, then the value.
                 let mut out = Vec::new();
-                for (s, v) in self.eval(e, st)? {
-                    out.extend(self.assign_var(var, v, s)?);
+                for (s, tgt) in self.resolve_target(var, st)? {
+                    for (mut s2, v) in self.eval(e, s)? {
+                        self.store(&tgt, v, &mut s2)?;
+                        out.push(s2);
+                    }
                 }
                 Ok(out.into_iter().map(|s| (s, Flow::Normal)).collect())
             }
@@ -764,7 +768,13 @@ impl<'a, D: Domain> Interp<'a, D> {
                             // It is NOT `arr.len()`: a hole makes the
                             // answer a border, and which border you get
                             // depends on how the table was built.
-                            let len = st.heap.tables[&t].len() as i16;
+                            let len = st.heap.tables[&t].len().ok_or_else(|| {
+                                anyhow!(
+                                    "# of a table this model cannot measure exactly: PICO-8's \
+                                     length searches the array part's CAPACITY, which depends \
+                                     on rehash history, not on the keys"
+                                )
+                            })? as i16;
                             let n = self.d.num(P8::from_i16(len));
                             (st, Value::Num(n))
                         }
@@ -943,6 +953,17 @@ impl<'a, D: Domain> Interp<'a, D> {
         let op = cmp_op.unwrap();
         let r = match (a, b) {
             (Value::Num(x), Value::Num(y)) => self.d.compare(op, x, y)?,
+            // Two booleans compare by VALUE in Lua, so this is
+            // answerable exactly rather than by comparing node ids -
+            // which is what the fallthrough below would do, making two
+            // distinct symbolic booleans unconditionally unequal and
+            // `b == true` unconditionally false.
+            (Value::Bool(x), Value::Bool(y)) if op == Cmp::Eq => {
+                let both = self.d.and(x, y);
+                let (nx, ny) = (self.d.not(x), self.d.not(y));
+                let neither = self.d.and(&nx, &ny);
+                self.d.or(&both, &neither)
+            }
             // Two closures. The SAME object is equal in any model, so
             // that much is answerable; anything else is not. PICO-8 is
             // Lua 5.2 and caches closures on (prototype, upvalue cells),
@@ -1123,22 +1144,18 @@ impl<'a, D: Domain> Interp<'a, D> {
         Ok(cur.into_iter().map(|(s, (v, _))| (s, v)).collect())
     }
 
-    fn assign_var(
+    /// Work out WHERE an assignment will store, without storing. Split
+    /// out from the store itself so the left-hand side can be evaluated
+    /// BEFORE the right-hand side, which is the order Lua uses:
+    /// `t[f()] = g()` calls `f` and then `g`. This model used to do it
+    /// the other way round.
+    fn resolve_target(
         &mut self,
         var: &'a ast::Var,
-        v: Value<D>,
         st: State<D>,
-    ) -> Result<Vec<State<D>>> {
+    ) -> Result<Multi<D, Target<D>>> {
         match var {
-            ast::Var::Name(t) => {
-                let name = ident(t)?;
-                let mut st = st;
-                if !st.heap.assign(st.scope, &name, v.clone()) {
-                    let g = st.globals;
-                    st.heap.tables.get_mut(&g).unwrap().hash.insert(name, v);
-                }
-                Ok(vec![st])
-            }
+            ast::Var::Name(t) => Ok(vec![(st, Target::Name(ident(t)?))]),
             ast::Var::Expression(e) => {
                 let suffixes: Vec<_> = e.suffixes().collect();
                 let Some((last, init)) = suffixes.split_last() else {
@@ -1148,16 +1165,12 @@ impl<'a, D: Domain> Interp<'a, D> {
                 for (st, target) in self.walk_suffixes(e.prefix(), init, st)? {
                     match last {
                         ast::Suffix::Index(ast::Index::Dot { name, .. }) => {
-                            let mut st = st;
-                            let k = Key::Field(ident(name)?);
-                            self.set_key(&target, k, v.clone(), &mut st)?;
-                            out.push(st);
+                            out.push((st, Target::Field(target, Key::Field(ident(name)?))));
                         }
                         ast::Suffix::Index(ast::Index::Brackets { expression, .. }) => {
-                            for (mut st, iv) in self.eval(expression, st)? {
+                            for (st, iv) in self.eval(expression, st)? {
                                 let k = self.index_key(&iv)?;
-                                self.set_key(&target, k, v.clone(), &mut st)?;
-                                out.push(st);
+                                out.push((st, Target::Field(target.clone(), k)));
                             }
                         }
                         other => bail!("cannot assign through {:?}", other),
@@ -1167,6 +1180,19 @@ impl<'a, D: Domain> Interp<'a, D> {
             }
             other => bail!("unsupported assignment target {:?}", other),
         }
+    }
+
+    fn store(&mut self, t: &Target<D>, v: Value<D>, st: &mut State<D>) -> Result<()> {
+        match t {
+            Target::Name(name) => {
+                if !st.heap.assign(st.scope, name, v.clone()) {
+                    let g = st.globals;
+                    st.heap.tables.get_mut(&g).unwrap().hash.insert(name.clone(), v);
+                }
+            }
+            Target::Field(tab, k) => self.set_key(tab, k.clone(), v, st)?,
+        }
+        Ok(())
     }
 
     fn eval_call(
@@ -1234,7 +1260,16 @@ impl<'a, D: Domain> Interp<'a, D> {
         args: Vec<Value<D>>,
         st: State<D>,
     ) -> Result<Multi<D, Value<D>>> {
-        let num = |v: &Value<D>| -> Result<D::Num> {
+        // By INDEX, and bounds-checked. `min(5)` used to be a Rust index
+        // panic on `args[1]`. PICO-8 answers it (`min(5)` is 0, `max(5)`
+        // is 5, treating the absent argument as 0), but the cart always
+        // passes two, and a coercion of nil to 0 is not something to
+        // infer from one measurement - so this raises, which is the other
+        // half of "match exactly or raise".
+        let num = |i: usize| -> Result<D::Num> {
+            let v = args.get(i).ok_or_else(|| {
+                anyhow!("{}: needs at least {} arguments, got {}", name, i + 1, args.len())
+            })?;
             match v {
                 Value::Num(n) => Ok(n.clone()),
                 other => bail!("{}: expected a number, got {:?}", name, other),
@@ -1247,7 +1282,7 @@ impl<'a, D: Domain> Interp<'a, D> {
                     "flr" => Fun1::Flr,
                     _ => Fun1::Sin,
                 };
-                let a = num(&args[0])?;
+                let a = num(0)?;
                 (st, Value::Num(self.d.fun1(f, &a)?))
             }
             // The map is DATA, not code, and it is concrete - so a lookup
@@ -1258,7 +1293,7 @@ impl<'a, D: Domain> Interp<'a, D> {
                     .cart
                     .clone()
                     .ok_or_else(|| anyhow!("{}: no cart loaded", name))?;
-                let (a, b) = (num(&args[0])?, num(&args[1])?);
+                let (a, b) = (num(0)?, num(1)?);
                 match (self.d.as_const(&a), self.d.as_const(&b)) {
                     (Some(x), Some(y)) => {
                         if name == "mget" {
@@ -1280,11 +1315,11 @@ impl<'a, D: Domain> Interp<'a, D> {
             // loop over a symbolic range.
             "tile_flag_at" => {
                 let (x, y, w, h, fl) = (
-                    num(&args[0])?,
-                    num(&args[1])?,
-                    num(&args[2])?,
-                    num(&args[3])?,
-                    num(&args[4])?,
+                    num(0)?,
+                    num(1)?,
+                    num(2)?,
+                    num(3)?,
+                    num(4)?,
                 );
                 let known = |d: &D, v: &D::Num| d.as_const(v);
                 match (
@@ -1358,7 +1393,9 @@ impl<'a, D: Domain> Interp<'a, D> {
                 // shrinking it to `[a]` and then writing t[3] puts 3 in
                 // the integer part and gives `#==1` where leaving the
                 // array part alone gives 3.
-                let n = tab.len();
+                let n = tab.len().ok_or_else(|| {
+                    anyhow!("__array_table_drop_last on a table whose length is not exact")
+                })?;
                 if n == 0 {
                     bail!("__array_table_drop_last on an empty table");
                 }
@@ -1373,7 +1410,7 @@ impl<'a, D: Domain> Interp<'a, D> {
             "__new_unknown_boolean" => (st, Value::Bool(self.d.unknown_bool()?)),
             "min" | "max" => {
                 let f = if name == "min" { Fun2::Min } else { Fun2::Max };
-                let (a, b) = (num(&args[0])?, num(&args[1])?);
+                let (a, b) = (num(0)?, num(1)?);
                 (st, Value::Num(self.d.fun2(f, &a, &b)?))
             }
             other => bail!("unsupported builtin {:?}", other),
@@ -1389,9 +1426,17 @@ enum Bound<D: Domain> {
 }
 
 /// A resolved table key. Concrete by construction - see `index_key`.
+#[derive(Clone)]
 enum Key {
     Field(String),
     Index(i16),
+}
+
+/// A resolved assignment TARGET: where the store will go, worked out
+/// before the right-hand side runs.
+enum Target<D: Domain> {
+    Name(String),
+    Field(Value<D>, Key),
 }
 
 /// Does this block bind a name of its own? Only its OWN statements - a
