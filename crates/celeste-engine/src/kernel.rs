@@ -409,6 +409,24 @@ pub fn si_cmp(op: Cmp, a: (P8, P8), b: (P8, P8)) -> Option<bool> {
 pub fn zb_not(a: ZB) -> ZB {
     ZB { val: !a.val, known: a.known }
 }
+/// Tri-state AND, Kleene. Known where BOTH are known, and also where
+/// either is known FALSE - `false and anything` is false whether or not
+/// the other side is known. That matches `Graph::fold`'s rule for
+/// `Op::And`, which is the point: the emitter and the folder have to
+/// agree about what an AND means or a folded graph and an emitted one
+/// answer differently.
+///
+/// The old front end never needed this. Every `And` it built was either
+/// the `Known(x) AND x` idiom or a validity conjunct that the emitter
+/// flattened, so an AND was never rendered as a value. A traced graph
+/// builds them freely - guards are `g AND c`, and `or` is De Morgan over
+/// them - so they have to lower.
+#[inline(always)]
+pub fn zb_and(a: ZB, b: ZB) -> ZB {
+    let known_false = (a.known & !a.val) | (b.known & !b.val);
+    ZB { val: a.val & b.val, known: (a.known & b.known) | known_false }
+}
+
 /// av_eq bool arm: equal where both known; unknown where either is not.
 #[inline(always)]
 pub fn zb_eq(a: ZB, b: ZB) -> ZB {

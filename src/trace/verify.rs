@@ -34,8 +34,11 @@ use super::state::State;
 pub struct FrameOut {
     pub guard: NodeId,
     pub ok: NodeId,
-    /// Every scalar reachable from the globals table, by path.
-    pub fields: Vec<(Path, NodeId)>,
+    /// Every scalar reachable from the globals table, by path, with the
+    /// KIND the tracer knows it to be. Carrying the kind rather than
+    /// re-deriving it from the node's op matters: `Op::Cell` and `Op::Sel`
+    /// are both, and a guess there is a guess about the boundary.
+    pub fields: Vec<(Path, NodeId, bool)>,
     /// What kept this outcome from merging with its siblings. Only a
     /// shape difference can, so keeping it is what turns "twelve
     /// outcomes" into a statement about the program.
@@ -66,14 +69,15 @@ pub fn run_one<'a, D: Domain>(
 }
 
 /// Every scalar the state ends the frame holding, as graph nodes.
-fn out_fields(st: &State<Symbolic>) -> Result<Vec<(Path, NodeId)>> {
+fn out_fields(st: &State<Symbolic>) -> Result<Vec<(Path, NodeId, bool)>> {
     let mut out = Vec::new();
     for p in iface::scalars(st, &[])? {
-        let n = match iface::get(st, &p).unwrap() {
-            Value::Num(n) | Value::Bool(n) => n,
+        let (n, is_bool) = match iface::get(st, &p).unwrap() {
+            Value::Num(n) => (n, false),
+            Value::Bool(n) => (n, true),
             _ => unreachable!("scalars only yields scalars"),
         };
-        out.push((p, n));
+        out.push((p, n, is_bool));
     }
     Ok(out)
 }
@@ -175,7 +179,7 @@ pub fn check_at(
         let got = o
             .fields
             .iter()
-            .find(|(q, _)| q == p)
+            .find(|(q, _, _)| q == p)
             .ok_or_else(|| anyhow!("{:?}: traced state has no {}", bits, iface::show(p)))?;
         let got = super::eval::eval(g, got.1, &env)?;
         if got != *want {
@@ -215,6 +219,113 @@ mod tests {
             }
         }
         None
+    }
+
+    /// Can the KERNEL EMITTER lower a traced graph?
+    ///
+    /// This is the join the whole campaign is for: `transpile::lower` is
+    /// the emitter the generated crates already use, and it consumes a
+    /// `Graph`. The tracer produces a `Graph` without any of the ~13,000
+    /// rewrites the old front half needed. If the second goes through the
+    /// first, the rewrites have nothing left to do.
+    ///
+    /// A PROBE, not a gate: it reports what the emitter said. Every
+    /// refusal names something the tracer emits that the emitter cannot
+    /// represent, which is the list of work between here and a kernel.
+    #[test]
+    fn the_kernel_emitter_lowers_a_traced_graph() {
+        let src = cart::sources().expect("sources");
+        let top = full_moon::parse(&src).expect("parse");
+        let init = full_moon::parse("_init()").expect("parse _init");
+        let reset = full_moon::parse("__reset_button_states()").expect("parse reset");
+        let frame = full_moon::parse("_update()").expect("parse frame");
+        let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
+        let cd =
+            std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
+        let (rx, ry) = celeste_interp::game_runner::start_room();
+        it.cache = Some(std::sync::Arc::new(
+            celeste_core::collision_cache::CollisionCache::new(&cd, rx, ry).expect("cache"),
+        ));
+        it.cart = Some(cd);
+        let st = cart::fresh_state::<Symbolic>(&mut it.d);
+        let mut st = run_one(&mut it, &top, st).expect("toplevel");
+        cart::inject_tile_flag_at(&mut st);
+        let mut st = run_one(&mut it, &init, st).expect("_init");
+        let mut player = None;
+        for _ in 0..40 {
+            if let Some(p) = find_player(&st) {
+                player = Some(p);
+                break;
+            }
+            st = match run_one(&mut it, &frame, st) {
+                Ok(s) => s,
+                Err(e) => return eprintln!("[emit] warm-up stopped at: {:#}", e),
+            };
+        }
+        let Some(player) = player else { return eprintln!("[emit] no player") };
+        let mut roots: Vec<Path> = vec![player.clone()];
+        for g in ["freeze", "frames", "will_restart", "delay_restart", "max_djump"] {
+            roots.push(vec![iface::key(g)]);
+        }
+        let f = match trace_frame(&mut it, &reset, &frame, st, &roots) {
+            Ok(f) => f,
+            Err(e) => return eprintln!("[emit] trace stopped at: {:#}", e),
+        };
+
+        // The tracer's OWN numbering: input cells are `Op::Cell(i)` in
+        // `Iface` order, and outputs are numbered after them. Not the
+        // engine's - see `trace::emit`.
+        // UNIFORM vs PER-LANE is a boundary decision the tracer does
+        // not model yet, and the emitter needs it: `tile_flag_at` takes
+        // its width and height as block-uniform `P8`, so a per-lane
+        // hitbox is a narrowing it refuses. A hitbox IS uniform - it is
+        // fixed per object type and never written during a frame - so
+        // saying so here is a stand-in for the classification, not a
+        // fudge. Getting it from the boundary is part of the numbering
+        // work still to come.
+        let mut inputs: Vec<(u32, &'static str)> = Vec::new();
+        let mut uni: Vec<(u32, &'static str)> = Vec::new();
+        for (i, c) in f.iface.init.iter().enumerate() {
+            let kind = match c {
+                Conc::Num(_) => "num",
+                Conc::Bool(_) => "bool",
+            };
+            let path = iface::show(&f.iface.slots[i]);
+            if path.contains(".hitbox.") {
+                uni.push((i as u32, kind));
+            } else {
+                inputs.push((i as u32, kind));
+            }
+        }
+        let base = inputs.len() as u32;
+        let g = std::mem::take(&mut it.d.graph);
+        for (n, o) in f.outs.iter().enumerate() {
+            let outputs: Vec<(u32, crate::transpile::graph::NodeId, &'static str)> = o
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(i, (_, node, is_bool))| {
+                    (base + i as u32, *node, if *is_bool { "ZB" } else { "ZN" })
+                })
+                .collect();
+            match super::super::emit::lower_frame(
+                &g,
+                &inputs,
+                &uni,
+                &outputs,
+                o.guard,
+                o.ok,
+            ) {
+                Ok(l) => eprintln!(
+                    "[emit] outcome {}: {} lines, {} variants, {} outputs",
+                    n,
+                    l.body.len(),
+                    l.variants,
+                    outputs.len()
+                ),
+                Err(e) => eprintln!("[emit] outcome {} REFUSED: {:#}", n, e),
+            }
+        }
     }
 
     /// `ice_at` is `tile_flag_at(.., 4)`, and only flag 0 is modelled.
@@ -536,7 +647,7 @@ end
             // room's worth.
             for (i, o) in f.outs.iter().enumerate() {
                 let mut objs: std::collections::BTreeSet<String> = Default::default();
-                for (q, _) in &o.fields {
+                for (q, _, _) in &o.fields {
                     let pre = iface::show(&q[..q.len().saturating_sub(1)].to_vec());
                     if pre.starts_with("objects") {
                         objs.insert(pre);

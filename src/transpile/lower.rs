@@ -151,7 +151,19 @@ impl<'a> Ctx<'a> {
         let e = self.expr[a as usize]
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("node {} reads unemitted node {}", id, a))?;
-        coerce(e, self.r(a), want)
+        coerce(e, self.r(a), want).map_err(|err| {
+            // WHICH node, and which operand. A bare "cannot represent a
+            // ZN as a P8" names neither, and the answer is always a
+            // specific site.
+            anyhow::anyhow!(
+                "{} (operand {} of node {}, {:?}, whose operand is {:?})",
+                err,
+                k,
+                id,
+                self.g.get(id).op,
+                self.g.get(a).op
+            )
+        })
     }
     /// Read operand `k` at its own representation.
     fn raw(&self, id: NodeId, k: usize) -> Result<String> {
@@ -420,19 +432,42 @@ impl<'a> Ctx<'a> {
                 // `Known(x) AND x` - "x is definitely true". Any other AND
                 // is a validity conjunct, flattened rather than rendered.
                 let (k, v) = (a[0], a[1]);
-                let inner = match &self.g.get(k).op {
-                    Op::Known if self.g.get(k).args[0] == v => v,
-                    _ => bail!(
-                        "AND of {} and {} is not the definitely-true idiom",
-                        k, v
-                    ),
-                };
-                let src = self.r(inner);
-                let x = self.expr[inner as usize].as_deref().unwrap();
-                match (src.lane, src.wide) {
-                    (true, _) => format!("ZB {{ val: {x}.val & {x}.known, known: ALL }}", x = x),
-                    (false, true) => format!("{}.unwrap_or(false)", x),
-                    (false, false) => x.to_string(),
+                match &self.g.get(k).op {
+                    // `Known(x) AND x` - "x is definitely true".
+                    Op::Known if self.g.get(k).args[0] == v => {
+                        let inner = v;
+                        let src = self.r(inner);
+                        let x = self.expr[inner as usize].as_deref().unwrap();
+                        match (src.lane, src.wide) {
+                            (true, _) => {
+                                format!("ZB {{ val: {x}.val & {x}.known, known: ALL }}", x = x)
+                            }
+                            (false, true) => format!("{}.unwrap_or(false)", x),
+                            (false, false) => x.to_string(),
+                        }
+                    }
+                    // An ordinary AND. The old front end never produced
+                    // one that had to be RENDERED - every `And` it built
+                    // was the idiom above or a validity conjunct the
+                    // emitter flattened - but a traced graph builds them
+                    // freely: a guard is `g AND c`, and `or` is De Morgan
+                    // over two of them.
+                    _ => {
+                        let (x, y) = (self.at(id, 0, out)?, self.at(id, 1, out)?);
+                        match (out.lane, out.wide) {
+                            (true, _) => format!("zb_and({}, {})", x, y),
+                            (false, false) => format!("({} && {})", x, y),
+                            // Uniform tri-state: false wins over unknown,
+                            // exactly as `zb_and` has it.
+                            (false, true) => format!(
+                                "(if {a} == Some(false) || {b} == Some(false) {{ Some(false) }} \
+                                 else if {a}.is_some() && {b}.is_some() {{ Some(true) }} \
+                                 else {{ None }})",
+                                a = x,
+                                b = y
+                            ),
+                        }
+                    }
                 }
             }
             Op::Sel => {

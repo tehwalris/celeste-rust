@@ -210,7 +210,7 @@ pub struct Node {
 /// nodes are the same node iff they are the same op over the same operand
 /// ids, and operand ids are themselves interned, so identity composes
 /// bottom-up.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Graph {
     nodes: Vec<Node>,
     intern: HashMap<Node, NodeId>,

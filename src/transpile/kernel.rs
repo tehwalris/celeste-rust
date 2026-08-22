@@ -193,6 +193,44 @@ pub(crate) struct Emit {
 }
 
 impl Emit {
+    /// An `Emit` around a graph that some OTHER front end produced - the
+    /// tracer's. Everything the emit-time walk fills in as it goes is
+    /// empty here; `transpile::lower` reads only `graph`, `live`, `ok`,
+    /// `uni`, `vary_in` and the output fields, and writes the rest.
+    pub(crate) fn bare(graph: Graph) -> Self {
+        Emit {
+            witness_len: 0,
+            cells: HashMap::new(),
+            globals: HashMap::new(),
+            next_cell: 0,
+            env: HashMap::new(),
+            uni: BTreeMap::new(),
+            vary_in: BTreeMap::new(),
+            dirty: BTreeSet::new(),
+            body: Vec::new(),
+            variants: Vec::new(),
+            rep_of: [0u8; 64],
+            scratch: Vec::new(),
+            n: 0,
+            var_ty: HashMap::new(),
+            pre_defs: BTreeSet::new(),
+            shape_hash: String::new(),
+            stable: HashMap::new(),
+            pin_val: HashMap::new(),
+            pins: BTreeSet::new(),
+            button_cells: HashMap::new(),
+            fork_depth: 0,
+            valid_expr: "ALL".to_string(),
+            tainted_vars: BTreeSet::new(),
+            tainted_cells: BTreeSet::new(),
+            cur_tainted: false,
+            graph,
+            node_of: HashMap::new(),
+            live: 0,
+            ok: 0,
+        }
+    }
+
     /// Where the WALK's own text goes - and it goes nowhere. `lower`
     /// rebuilds the body from the graph, so this stream is discarded; the
     /// walk still produces it only because `Graph::operand` recovers the
