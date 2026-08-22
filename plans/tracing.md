@@ -1021,6 +1021,132 @@ Same fixed point, identical output, and the 8x cap costs ~18 GB of peak
 memory for it. So: SMALL cap plus iteration, and the analysis is robust
 to a budget that is too small rather than silently truncated by it.
 
+### The variant floor, and what the 4,357 equalities are worth
+
+The emitter dedups 64 button assignments on STRUCTURAL identity, which
+is a sound under-approximation of "the same successor for every input".
+How many are distinguishable AT ALL - fingerprint each assignment by its
+whole output tuple over many points, and count:
+
+| outcome | floor | emitted | |
+|---|---|---|---|
+| 0 | 1 | 1 | at its floor |
+| 1 | 2 | 24 | 12x over |
+| 2 | 2 | 24 | 12x over |
+| 3 | 24 | 24 | at its floor |
+
+Outcome 3 is the player-alive branch, where `spd.x`, `spd.y`,
+`dash_time` and `djump` all move with the buttons; 24 successors is
+correct there. Outcomes 1 and 2 are death/restart, where the buttons
+should not reach the output at all - and they emit 24 for 2. The
+button-dependence that survives is in the GUARD ALGEBRA that reached the
+branch, which is boolean, which is what the BDD already proves equal and
+`simplify` declines to act on. So the 4,357 deferred equalities and the
+variant gap are one item, not two.
+
+Three caveats, because this measurement is easy to over-read:
+
+- The `__button_states` cells must be excluded. They end the frame
+  holding NEXT frame's free choices, so they separate all 64 by
+  construction. Leaving them in reported a floor of 64 against a
+  structural count of 24 - impossible, since structural equality implies
+  semantic equality and the floor can only be LOWER. Pre-registering
+  that impossibility is what caught the bug.
+- Every point is a perturbation of ONE game state. The emitted kernel is
+  specialized on buttons but NOT on the input state, so it runs on every
+  block in the search. "2 successors near this state" does not license
+  deleting variants; it bounds RUNTIME waste at states like this one.
+- Which makes the two remedies different in kind, and they must not be
+  conflated. STATIC: prove two assignments equal at all inputs and emit
+  one - only the BDD can establish that, and only for the boolean part.
+  RUNTIME: notice duplicate rows before hashing them. The measurement
+  argues for the second and only hints at the first.
+
+### Atom implications - the concrete shape
+
+The chains are real and they are the tile scan. `tile_flag_at` walks a
+tile range whose bounds came out symbolic, so the tracer unrolls it and
+each iteration tests the index against a literal:
+
+```
+Abs(Flr(Add#174)) compared against
+  ["Le 0","Gt 0","Le 1","Gt 1","Le 2","Gt 2", ... ,"Le 8","Gt 8"]
+```
+
+Nine variables (the `Gt k`/`Le k` pairs already collapse via the
+complement rule) where the real object is one integer with ten possible
+positions, TOTALLY ORDERED: `Le 0 => Le 1 => ... => Le 8`. So
+`Le 2 and Gt 5` is unsatisfiable and the independent-atom model cannot
+see it. On outcome 2, 214 distinct values are compared against 2+
+literals, 882 such comparisons, against ~545 atoms - so most atoms are
+in a chain.
+
+The fix is a care set: build `C = AND(Le_k -> Le_k+1)` per chain, and
+"constant true" becomes `C and not node == 0`. Before writing it, two
+things need measuring, because the mechanism being real and the
+mechanism being what is happening here are different claims and they
+have come apart three times in one day:
+
+- Do the sample-constant nodes actually LIVE in those chains? The 5,254
+  and the 882 are separate measurements and connecting them is an
+  assumption. Fingerprint only the nodes whose support lies inside one
+  chain and see whether the constants concentrate there.
+- Does `C` stay small? Chain constraints are individually tiny, but the
+  conjunction of 214 of them interleaved with 545 atoms under the
+  current creation-order variable order could blow up worse than the
+  plain analysis, which already capped on outcome 2.
+
+### The uniform/per-lane seed was the wrong question
+
+`lower.rs` derives representation as a fixed point over the graph, and
+the fixed point needs SEEDS: every `Op::Cell` must be declared uniform or
+varying. The walk gets that from the shape witness. The tracer has no
+witness, so the probe stubs it by string-matching `.hitbox.` - hitbox
+fields to `uni`, everything else to `vary_in` - because `tile_flag_at`
+takes width and height as block-uniform `P8` and refuses a per-lane `ZN`.
+
+That stub is solving a problem that does not exist. Counting the
+r20-steady witness, restricted to GENUINE runtime scalars (its cells
+store table and closure references as `k: "val"` too, which inflates
+every naive count):
+
+| | cells |
+|---|---|
+| genuine runtime scalars | 116 |
+| per-lane | 11 |
+| uniform, value KNOWN - already foldable | 65 |
+| uniform, value not known | 40 |
+
+and the hitbox is in the KNOWN group: `objects.4.hitbox.w = 393216`
+(6.0), `.h = 327680` (5.0). It is a constant, not a uniform.
+
+Of the 40 that remain, nearly all are key-like or shape-like: `freeze`
+and `objects.4.dash_time` ARE the pm1 key (the kernel header says
+`pm1 freeze=0 dash_time=0`; they are pinned by `pin_val` rather than by
+the witness `val`), the six `__button_states` are the free choices,
+`collideable` / `solids` / `flip` / `if_not_fruit` are fixed by the
+shape, and `p_dash` / `p_jump` / `rem.x` / `rem.y` are the widenings
+CLAUDE.md already flags. There is no principled third category - there
+is a witness that does not record values it could.
+
+So the tracer should not ask "is this cell uniform or per-lane". It
+should ask "does this slot vary within the block", and under
+specialize-per-key that is mechanical: what the key and shape fix stays
+a CONSTANT folded into the graph, everything else is a per-lane cell.
+`Emit::uni` ends up empty.
+
+The defect is therefore in `iface::symbolize`, which turns EVERY
+reachable slot into an `Op::Cell`. The hitbox should never have become
+one. Fix: `symbolize` takes a predicate for which slots vary; the rest
+keep their traced value as a literal. On this shape that would fold 65
+of 116 scalars instead of feeding them in as inputs, and the
+`.hitbox.` match disappears rather than being replaced.
+
+(`Uni` is not WRONG in the current engine - packing a non-key field that
+happens to be block-uniform as a scalar saves lane storage and enables
+scalar ops. It is an optimization on top of a classification that is
+mechanical, not a category the tracer has to reconstruct.)
+
 ### Proved and deliberately not acted on
 
 4,357 further equalities on outcome 2: nodes that are provably the same

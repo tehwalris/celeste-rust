@@ -719,6 +719,89 @@ mod tests {
                         }
                     }
 
+                    // THE VARIANT FLOOR, for EVERY outcome. The
+                    // emitter dedups the 64 button assignments on
+                    // STRUCTURAL identity, which is a sound
+                    // under-approximation of "the same successor for
+                    // every input". This is how many are distinguishable
+                    // at all: fingerprint each assignment by its whole
+                    // output tuple across many points and count. Per
+                    // outcome because they differ - a single per-point
+                    // number cannot tell an outcome that is at its floor
+                    // from one that is over-specialised twelvefold.
+                    {
+                        let mut rng: u64 = 0xDEADBEEF12345678;
+                        let mut pts: Vec<Vec<Conc>> = vec![f.iface.init.clone()];
+                        for _ in 0..48 {
+                            let mut pt = f.iface.init.clone();
+                            for slot in pt.iter_mut() {
+                                rng =
+                                    rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                                let r = (rng >> 33) as i64;
+                                *slot = match *slot {
+                                    Conc::Num(v) => {
+                                        let d = [0i16, 1, -1, 4, -4, 16, -16, 64, -64]
+                                            [(r as usize) % 9];
+                                        Conc::Num(
+                                            v + crate::pico8_num::Pico8Num::from_i16(d),
+                                        )
+                                    }
+                                    Conc::Bool(_) => Conc::Bool(r & 1 == 0),
+                                };
+                            }
+                            pts.push(pt);
+                        }
+                        let cols: Vec<Vec<Option<Conc>>> = pts
+                            .iter()
+                            .map(|pt| {
+                                super::super::eval::eval_all(
+                                    &sp,
+                                    &super::super::eval::Env {
+                                        cells: pt,
+                                        frees: &[false; 6],
+                                        cart: it.cart.clone(),
+                                        cache: it.cache.clone(),
+                                    },
+                                )
+                            })
+                            .collect();
+                        let mut fps: std::collections::HashSet<Vec<Option<(u8, i32)>>> =
+                            Default::default();
+                        for m in 0..64usize {
+                            let mut fp: Vec<Option<(u8, i32)>> = Vec::new();
+                            // The BUTTON cells are not ordinary outputs -
+                            // they end the frame holding next frame's free
+                            // choices, so they separate all 64 by
+                            // construction, and the emitter keeps them out
+                            // of `fields` too. Leaving them in is how this
+                            // first reported a floor of 64 against a
+                            // structural count of 24, which is impossible:
+                            // structural equality implies semantic
+                            // equality, so the floor can only be lower.
+                            for (_, nd, _) in o.fields.iter().filter(|(p, _, _)| {
+                                !iface::show(p).starts_with("__button_states")
+                            }) {
+                                let node = maps[m][*nd as usize];
+                                for c in cols.iter() {
+                                    fp.push(c[node as usize].map(|v| match v {
+                                        Conc::Num(x) => (0u8, x.as_raw_u32() as i32),
+                                        Conc::Bool(b) => (1u8, b as i32),
+                                    }));
+                                }
+                            }
+                            fps.insert(fp);
+                        }
+                        eprintln!(
+                            "[emit]   outcome {} VARIANT FLOOR: 64 assignments are \
+                             distinguishable {} ways over {} points; the emitter keeps {} \
+                             by structural identity",
+                            n,
+                            fps.len(),
+                            pts.len(),
+                            l_variants
+                        );
+                    }
+
                     // Can the BDD find what the census found by
                     // SAMPLING? The constant algebra lives here, in the
                     // SPECIALISED arena where the buttons are pinned -
@@ -982,10 +1065,58 @@ mod tests {
                 // node identity after specialisation, so they collapse
                 // exactly when they fold to the same tree. Print the
                 // first two that differ, shallowly.
-                if n == 1 {
+                if n == 2 {
+                    // WHAT holds the 24 variants apart. The boolean layer
+                    // is decided now, so whatever distinguishes them is
+                    // numeric - and naming it is the difference between
+                    // "the gap is numeric" and knowing what to do.
+                    let mut cmp: std::collections::BTreeMap<
+                        crate::transpile::graph::NodeId,
+                        Vec<(String, i32)>,
+                    > = Default::default();
+                    for id in 0..sp.len() as crate::transpile::graph::NodeId {
+                        use crate::transpile::graph::Op as O;
+                        let nd = sp.get(id);
+                        if !matches!(nd.op, O::Lt | O::Le | O::Gt | O::Ge | O::Eq) {
+                            continue;
+                        }
+                        // A comparison against a literal: the shape an
+                        // implication between atoms would relate.
+                        let (a, b) = (nd.args[0], nd.args[1]);
+                        let pick = match (&sp.get(a).op, &sp.get(b).op) {
+                            (O::Const(lo, hi), _) if lo == hi => Some((b, *lo)),
+                            (_, O::Const(lo, hi)) if lo == hi => Some((a, *lo)),
+                            _ => None,
+                        };
+                        if let Some((x, k)) = pick {
+                            cmp.entry(x).or_default().push((format!("{:?}", nd.op), k));
+                        }
+                    }
+                    let mut groups: Vec<_> =
+                        cmp.into_iter().filter(|(_, v)| v.len() > 1).collect();
+                    groups.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
+                    eprintln!(
+                        "[emit]   ATOM IMPLICATIONS: {} distinct values are compared against \
+                         2+ literals ({} such comparisons in total)",
+                        groups.len(),
+                        groups.iter().map(|(_, v)| v.len()).sum::<usize>()
+                    );
+                    for (x, ks) in groups.iter().take(3) {
+                        let mut ks = ks.clone();
+                        ks.sort_by_key(|(_, k)| *k);
+                        eprintln!(
+                            "[emit]     {} compared against {:?}",
+                            super::super::emit::show_tree(&sp, *x, 2),
+                            ks.iter()
+                                .map(|(o, k)| format!("{} {}", o, *k as f64 / 65536.0))
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                }
+                if n == 2 {
                     let show = super::super::emit::show_tree;
                     if let Some((fp, fnode, _)) =
-                        o.fields.iter().find(|(q, _, _)| iface::show(q) == "freeze")
+                        o.fields.iter().find(|(q, _, _)| iface::show(q) == "deaths")
                     {
                         let mut seen: std::collections::BTreeMap<
                             crate::transpile::graph::NodeId,
