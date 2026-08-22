@@ -364,13 +364,29 @@ word for them caused a real design error (see T5a). They are:
 | thing | the question it answers | form | who reads it |
 |---|---|---|---|
 | `Value::Bool` | what does the traced program compute? | a heap value | the traced program |
-| `State::guard` | under what condition does this state apply? | one opaque `D::Bool` | `merge`, as the `Sel` condition |
-| `State::path` | which literals did we ASSUME on the way here? | `Vec<(D::Bool, bool)>`, a conjunction | `decide_on_path`, dead-branch pruning |
-| `State::ok` | what must hold at RUN TIME for this to be correct? | conjunction of `D::Bool` | emitted code, as `dp` / `*bd` |
+| `State::guard` | under what condition does this state apply? | one `D::Bool` | `merge` (as the `Sel` condition); its CONJUNCTS drive branch pruning |
+| `State::ok` | what must hold at RUN TIME for this to be correct? | one `D::Bool` | emitted code, as `dp` / `*bd` |
 
-The organising sentence: **`guard` may be any shape, because nothing
-inspects it; `path` stays a conjunction, because everything inspects it.**
-They carry the same information deliberately.
+There is no fourth. An earlier version of this note listed `State::path`
+as a peer of `guard`, on the grounds that a merge condition must be
+recoverable syntactically and an opaque node is not. That was wrong, and
+the code says so: `path` has exactly ONE semantic use,
+
+```rust
+st.path.iter().find(|(l, _)| l == cond).map(|(_, v)| *v)
+```
+
+in `decide_on_path` and again in `split_path` - "is this exact condition
+node already assumed, and with which polarity?", a lookup on node
+identity. Every other use is `differ_at_one`/`without`, which is the merge
+rule that guards DELETE, or a debug print.
+
+And `guard` already answers it. A state reached through `P and a and not
+b` has `guard = And(..P, a, Not(b))`; the question becomes "walk the `And`
+spine for `cond` or `Not(cond)`" - same node identities, same linear scan.
+`path` IS the conjunct list of `guard`, kept in a second field. So it
+goes. The ordering is not lost either: only `differ_at_one` cared about
+positions.
 
 `guard` vs `ok` are opposites, not degrees. A lane where `guard` is false
 is not described by this state and some sibling describes it - nothing is
@@ -379,34 +395,44 @@ and run time must deopt. Downstream they are `Emit::live` and `Emit::ok`,
 and `ok`'s negation is what the emitted code spells `dp` when the
 condition is per-lane or `*bd` when it is block-uniform.
 
-`guard` vs `path` is a deliberate duplication and neither can be dropped.
-An opaque conjunction cannot be pattern-matched - that is the bug that
-made `path` exist, where `btn(up) and -1` fanned out into a dead state
-holding a bool where the program wanted a number. A literal list cannot
-represent a disjunction - that is T5a. So both, under the invariant
-**everything in `path` is implied by `guard`**.
+What deriving the conjuncts needs from the graph is small and mostly
+present. `And` is binary rather than flattened, which is fine - a
+right-nested spine still walks. `Not` exists but folds only constants and
+needs `Not(Not(x)) -> x` so lookups are canonical. `Or` was deleted
+earlier in the campaign and comes back.
+
+The one obligation that matters: **`Or` must factor common conjuncts**,
+`(P and a) or (P and b)` -> `P and (a or b)`. Without it the first merge
+leaves a top-level `Or` with no visible conjuncts and all pruning stops
+there. But that rule is exactly the hand-written "weaken the path to the
+common prefix" from `collapse`, moved into the graph where it is a
+normalisation that applies everywhere - an argument for the change rather
+than a cost of it.
+
+Getting the factoring incomplete is SAFE in the useful direction: we fail
+to notice a condition is already assumed, so we split where we could have
+decided - more fan-out, never a wrong answer. Bounded to performance. That
+is a better failure mode than two fields holding the same content and
+drifting apart.
+
+The original reason `path` existed still stands and is now `guard`'s job:
+`btn(up) and -1` must not fan out into a dead state holding a bool where
+the program wants a number, and it will not, because `btn(up)` is a
+conjunct of the guard on that branch.
 
 Per operation:
 
-* branch on `c` - children get guards `g and c` / `g and not c`, and
-  `(c,true)` / `(c,false)` pushed on the path. `ok` untouched.
+* branch on `c` - children get guards `g and c` / `g and not c`. `ok`
+  untouched. A branch whose guard folds to false is dead and not explored;
+  a branch on a `c` already among the guard's conjuncts is decided.
 * merge `s`,`t` - condition is `s.guard`, differing cells become
-  `Sel(s.guard, ..)`, new guard is `s.guard or t.guard`, new path is the
-  COMMON PREFIX, new ok is `Sel(s.guard, s.ok, t.ok)` (an obligation
-  applies only in the case that incurred it).
+  `Sel(s.guard, ..)`, new guard is `s.guard or t.guard` (whose factoring
+  recovers the common conjuncts), new ok is `Sel(s.guard, s.ok, t.ok)` -
+  an obligation applies only in the case that incurred it.
 * call and return - guards ride along untouched. This is the T5a fix: the
   276 returns that all say `true` merge into one whose guard is their OR.
-* end of tracing - `guard` becomes the lane mask, `ok` becomes `dp`/`*bd`,
-  and `path` EVAPORATES. It has no downstream counterpart.
-
-That last line is the way to hold it: `guard` and `ok` are outputs and
-become code; `path` is scaffolding that keeps the trace from exploring
-nonsense, and nothing survives it.
-
-Soundness of weakening the path on a merge: a common prefix is implied by
-both sides, hence by their disjunction, so the invariant holds. A shorter
-path can only cause FEWER decisions - more fan-out, never a wrong answer.
-The exact condition moved into `guard`.
+* end of tracing - `guard` becomes the lane mask and `ok` becomes
+  `dp`/`*bd`. Both are outputs; both become code.
 
 ### T5a - the disjunction problem (OPEN, and it blocks the frame)
 
