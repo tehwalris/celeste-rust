@@ -289,7 +289,7 @@ impl<'a, D: Domain> Interp<'a, D> {
             bail!("numeric for with an explicit step is not supported");
         }
         let (s, from) = self.eval(f.start(), st)?;
-        let (mut s, to) = self.eval(f.end(), s)?;
+        let (s, to) = self.eval(f.end(), s)?;
         let (Value::Num(from), Value::Num(to)) = (&from, &to) else {
             bail!("numeric for bounds must be numbers");
         };
