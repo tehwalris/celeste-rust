@@ -330,6 +330,15 @@ impl Graph {
                 if let Some(c) = cbool(self, 0) {
                     return if c { args[1] } else { args[2] };
                 }
+                // Both arms the same value: the condition cannot matter,
+                // decided or not. This is the fold that makes MERGING AT A
+                // JOIN affordable - a per-cell merge of two branch outcomes
+                // emits a select for every cell in the heap, and the
+                // overwhelming majority of cells were not touched by either
+                // arm.
+                if args[1] == args[2] {
+                    return args[1];
+                }
             }
             Op::Not => {
                 if let Some(b) = cbool(self, 0) {
@@ -694,6 +703,28 @@ mod tests {
         // because validity is built out of these.
         let cells = HashMap::from([(1u32, Val::Bool(Some(false))), (2u32, Val::Bool(None))]);
         assert_eq!(g.eval(&cells).unwrap()[and as usize], Val::Bool(Some(false)));
+    }
+
+    #[test]
+    fn a_select_between_equal_arms_is_not_a_select() {
+        // The fold that makes merging at a join affordable. A per-cell
+        // merge of two branch outcomes proposes a select for EVERY cell in
+        // the heap; almost none of them were touched by either arm, and
+        // without this each one would cost a node - and, at the emit site,
+        // a `Known(cond)` validity conjunct that would deopt lanes over a
+        // value that cannot depend on the condition.
+        let mut g = Graph::new();
+        let c = g.leaf(Op::Cell(1));
+        let x = g.leaf(Op::Cell(2));
+        assert_eq!(g.fold(Op::Sel, vec![c, x, x]), x);
+        // A genuine difference still costs a node.
+        let y = g.leaf(Op::Cell(3));
+        let sel = g.fold(Op::Sel, vec![c, x, y]);
+        assert_ne!(sel, x);
+        assert_ne!(sel, y);
+        // And a decided condition still picks its arm.
+        let t = g.leaf(Op::ConstBool(true));
+        assert_eq!(g.fold(Op::Sel, vec![t, x, y]), x);
     }
 
     #[test]

@@ -1245,6 +1245,14 @@ fn select(e: &mut Emit, c: &K, t: &K, f: &K) -> Result<K> {
         K::BoolC(b) => return Ok(if *b { t.clone() } else { f.clone() }),
         _ => {}
     }
+    // Identical arms: the value does not depend on the condition, so
+    // neither does its VALIDITY. Returning early matters for more than
+    // node count - the per-lane paths below record `Known(cond)` as a
+    // validity conjunct, and a lane whose condition is undecided would be
+    // sent to the interpreter over a select that could not have used it.
+    if t == f {
+        return Ok(t.clone());
+    }
     // Unify the sides' class.
     let z = Emit::is_z(t) || Emit::is_z(f) || matches!(c, K::ZB(_));
     let ival = Emit::is_ival(t) || Emit::is_ival(f);
