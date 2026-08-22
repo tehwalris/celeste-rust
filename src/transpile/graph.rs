@@ -75,9 +75,14 @@ pub type NodeId = u32;
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Op {
     // ---- leaves ----
-    /// A literal number, as its raw 16.16 bit pattern (so `Op` is `Hash`
-    /// without imposing anything on `Pico8Num`).
-    ConstNum(i32),
+    /// A literal number, as raw 16.16 bit patterns for its low and high
+    /// bound. An EXACT literal is the singleton `Const(x, x)` - exactness
+    /// is a property of the value, not a separate kind of node, so the
+    /// widened literals the emitter produces (e.g. sin of a non-exact
+    /// input, which it emits as the constant [-1, 1]) need no special
+    /// case. Raw bit patterns rather than `Pico8Num` so `Op` is `Hash`
+    /// without imposing anything on the numeric type.
+    Const(i32, i32),
     ConstBool(bool),
     /// An input cell. NOT split into uniform/per-lane: that is a derived
     /// property, computed after the graph exists.
@@ -203,7 +208,7 @@ impl Graph {
         if let Some(rest) = s.strip_prefix("P8::from_raw(") {
             if let Some(num) = rest.strip_suffix("i32)") {
                 if let Ok(raw) = num.parse::<i32>() {
-                    return Ok(self.leaf(Op::ConstNum(raw)));
+                    return Ok(self.leaf(Op::Const(raw, raw)));
                 }
             }
         }
@@ -211,7 +216,7 @@ impl Graph {
             if let Some(num) = rest.strip_suffix(')') {
                 if let Ok(v) = num.parse::<i16>() {
                     let raw = (v as i32) << 16;
-                    return Ok(self.leaf(Op::ConstNum(raw)));
+                    return Ok(self.leaf(Op::Const(raw, raw)));
                 }
             }
         }
@@ -231,7 +236,10 @@ impl Graph {
         for (i, node) in self.nodes.iter().enumerate() {
             let a = |k: usize| -> Val { out[node.args[k] as usize] };
             let v = match &node.op {
-                Op::ConstNum(raw) => Val::exact_num(Pico8Num::from_raw(*raw)),
+                Op::Const(lo, hi) => Val::Num(Pico8NumInterval::new(
+                    Pico8Num::from_raw(*lo),
+                    Pico8Num::from_raw(*hi),
+                )),
                 Op::ConstBool(b) => Val::Bool(Some(*b)),
                 Op::Button(b) => bail!("node {}: button bit {} has no value outside a variant", i, b),
                 Op::Fork(d) => bail!("node {}: fork {} has no value outside a configuration", i, d),
@@ -443,7 +451,7 @@ mod tests {
     fn evaluates_exact_arithmetic() {
         let mut g = Graph::new();
         let a = g.leaf(Op::Cell(1));
-        let k = g.leaf(Op::ConstNum(n(3).as_raw_u32() as i32));
+        let k = g.leaf(Op::Const(n(3).as_raw_u32() as i32, n(3).as_raw_u32() as i32));
         let sum = g.add(Op::Add, vec![a, k]);
         let cells = HashMap::from([(1u32, Val::exact_num(n(4)))]);
         let out = g.eval(&cells).unwrap();
@@ -476,8 +484,8 @@ mod tests {
         // an undecided condition is `valid AND known(c)`. No side channel.
         let mut g = Graph::new();
         let c = g.leaf(Op::Cell(1));
-        let t = g.leaf(Op::ConstNum(n(1).as_raw_u32() as i32));
-        let f = g.leaf(Op::ConstNum(n(2).as_raw_u32() as i32));
+        let t = g.leaf(Op::Const(n(1).as_raw_u32() as i32, n(1).as_raw_u32() as i32));
+        let f = g.leaf(Op::Const(n(2).as_raw_u32() as i32, n(2).as_raw_u32() as i32));
         let sel = g.add(Op::Sel, vec![c, t, f]);
         let known = g.add(Op::Known, vec![c]);
         let all = g.leaf(Op::ConstBool(true));

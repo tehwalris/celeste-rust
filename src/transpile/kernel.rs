@@ -261,7 +261,7 @@ impl Emit {
     fn as_zn(&mut self, k: &K) -> Result<String> {
         Ok(match k {
             K::ZN(v) => v.clone(),
-            K::NumC(c) => self.bind_op("ZN", &format!("zn_splat({})", p8(c)), GOp::ConstNum(c.as_raw_u32() as i32), &[]),
+            K::NumC(c) => self.bind_op("ZN", &format!("zn_splat({})", p8(c)), GOp::Const(c.as_raw_u32() as i32, c.as_raw_u32() as i32), &[]),
             K::SN(v) => self.bind_alias("ZN", &format!("zn_splat({})", v), v),
             other => bail!("as_zn on {:?}", other),
         })
@@ -272,7 +272,7 @@ impl Emit {
             K::ZI(v) => v.clone(),
             K::ZIP { v, .. } => v.clone(),
             K::ZN(v) => self.bind_alias("ZI", &format!("zi_of_zn({})", v), v),
-            K::NumC(c) => self.bind_op("ZI", &format!("zi_splat({}, {})", p8(c), p8(c)), GOp::ConstNum(c.as_raw_u32() as i32), &[]),
+            K::NumC(c) => self.bind_op("ZI", &format!("zi_splat({}, {})", p8(c), p8(c)), GOp::Const(c.as_raw_u32() as i32, c.as_raw_u32() as i32), &[]),
             K::SN(v) => self.bind_alias("ZI", &format!("zi_splat({}, {})", v, v), v),
             K::SI(v) => self.bind_alias("ZI", &format!("zi_splat({}.0, {}.1)", v, v), v),
             other => bail!("as_zi on {:?}", other),
@@ -291,7 +291,7 @@ impl Emit {
         Ok(match k {
             K::SI(v) => v.clone(),
             K::SN(v) => self.bind_alias("(P8, P8)", &format!("({}, {})", v, v), v),
-            K::NumC(c) => self.bind_op("(P8, P8)", &format!("({}, {})", p8(&c.clone()), p8(c)), GOp::ConstNum(c.as_raw_u32() as i32), &[]),
+            K::NumC(c) => self.bind_op("(P8, P8)", &format!("({}, {})", p8(&c.clone()), p8(c)), GOp::Const(c.as_raw_u32() as i32, c.as_raw_u32() as i32), &[]),
             other => bail!("as_si on {:?}", other),
         })
     }
@@ -885,7 +885,7 @@ fn binop(e: &mut Emit, op: BinaryOp, l: &K, r: &K) -> Result<K> {
 fn sn(e: &mut Emit, k: &K) -> Result<String> {
     Ok(match k {
         K::SN(v) => v.clone(),
-        K::NumC(c) => e.bind_op("P8", &p8(c), GOp::ConstNum(c.as_raw_u32() as i32), &[]),
+        K::NumC(c) => e.bind_op("P8", &p8(c), GOp::Const(c.as_raw_u32() as i32, c.as_raw_u32() as i32), &[]),
         other => bail!("sn on {:?}", other),
     })
 }
@@ -1426,11 +1426,16 @@ fn call_pure(e: &mut Emit, name: &str, args: &[LocalId]) -> Result<K> {
             K::SN(v) => Ok(K::SN(e.bind_op("P8", &format!("{}.pico8_sin()", v), GOp::Sin, &[v]))),
             K::NumC(c) => Ok(K::NumC(c.pico8_sin())),
             K::ZN(v) => Ok(K::ZN(e.bind_op("ZN", &format!("zn_sin({})", v), GOp::Sin, &[v]))),
-            K::SI(v) | K::ZI(v) | K::ZIP { v, .. } => Ok(K::SI(e.bind_op(
+            // The emitter gives up on sin over a non-exact input and emits
+            // sin's RANGE as a literal, ignoring the operand. So the node is
+            // that constant: a Sin(v) node would claim a dependency the
+            // generated code does not have, and would stop two members from
+            // sharing it when they reach this site with different operands.
+            K::SI(_) | K::ZI(_) | K::ZIP { .. } => Ok(K::SI(e.bind_op(
                 "(P8, P8)",
                 "(P8::from_i16(-1), P8::from_i16(1))",
-                GOp::Sin,
-                &[v],
+                GOp::Const(-1 << 16, 1 << 16),
+                &[],
             ))),
             other => bail!("sin on {:?}", other),
         },
