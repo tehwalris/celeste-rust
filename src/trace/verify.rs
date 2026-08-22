@@ -300,10 +300,16 @@ mod tests {
         let base = inputs.len() as u32;
         let g = std::mem::take(&mut it.d.graph);
         for (n, o) in f.outs.iter().enumerate() {
+            // The BUTTON cells are not ordinary outputs. They end the
+            // frame holding next frame's free choices, so they are
+            // button-dependent by construction and would distinguish all
+            // 64 assignments on their own - which is why the emitter has
+            // `OutFields::ubool` to keep them out of `fields`.
             let outputs: Vec<(u32, crate::transpile::graph::NodeId, &'static str)> = o
                 .fields
                 .iter()
                 .enumerate()
+                .filter(|(_, (p, _, _))| !iface::show(p).starts_with("__button_states"))
                 .map(|(i, (_, node, is_bool))| {
                     (base + i as u32, *node, if *is_bool { "ZB" } else { "ZN" })
                 })
@@ -324,6 +330,42 @@ mod tests {
                     outputs.len()
                 ),
                 Err(e) => eprintln!("[emit] outcome {} REFUSED: {:#}", n, e),
+            }
+            // WHY 64 variants, where the existing `steady` kernel
+            // collapses 64 button assignments to 36? The emitter dedups
+            // an assignment on (every output, `ok`, `live`) together, so
+            // count each key on its own and find out which one splits,
+            // rather than telling a story about the guard.
+            {
+                let mut sp = crate::transpile::graph::Graph::new();
+                let maps: Vec<Vec<crate::transpile::graph::NodeId>> =
+                    (0u8..64).map(|m| g.specialize_into(m, &mut sp)).collect();
+                let count = |with_ok: bool, with_live: bool| -> usize {
+                    let mut seen = std::collections::BTreeSet::new();
+                    for m in 0..64usize {
+                        let mut k: Vec<crate::transpile::graph::NodeId> = o
+                            .fields
+                            .iter()
+                            .filter(|(p, _, _)| !iface::show(p).starts_with("__button_states"))
+                            .map(|(_, nd, _)| maps[m][*nd as usize])
+                            .collect();
+                        if with_ok {
+                            k.push(maps[m][o.ok as usize]);
+                        }
+                        if with_live {
+                            k.push(maps[m][o.guard as usize]);
+                        }
+                        seen.insert(k);
+                    }
+                    seen.len()
+                };
+                eprintln!(
+                    "[emit]   outcome {} distinct assignments: outputs {}, +ok {}, +live {}",
+                    n,
+                    count(false, false),
+                    count(true, false),
+                    count(true, true)
+                );
             }
         }
     }
