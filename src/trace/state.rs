@@ -36,32 +36,25 @@ pub struct State<D: Domain> {
     /// and the restored id points at nothing - which showed up as `this`
     /// being nil in a function whose body had branched.
     pub stack: Vec<ScopeId>,
-    /// The conditions ASSUMED on the way here - the path condition, as a
-    /// conjunction of literals.
+    /// WHEN does this state apply? One boolean, built up as `g and c` /
+    /// `g and not c` at every branch and OR-ed back together at every
+    /// merge.
     ///
-    /// A single opaque `live` node is not enough, and the reason is
-    /// concrete. `btn(up) and -1` fans out; on the branch that kept a
-    /// boolean, `btn(up)` is FALSE, so the enclosing `or` should take its
-    /// right side. With only an opaque conjunction the tracer cannot see
-    /// that, fans out again, and one of the results is a dead state whose
-    /// value is a boolean where the program wants a number - which then
-    /// fails in arithmetic rather than being dropped.
+    /// This is what a merge SELECTS ON, and downstream it is the emitted
+    /// lane mask (`Emit::live`). Nothing ever looks inside it - there is
+    /// no path condition and no conjunct list. An earlier design carried
+    /// a `Vec<(D::Bool, bool)>` of assumed literals so that a re-tested
+    /// condition could be decided syntactically; measuring showed it
+    /// firing 10 times in 25 frames, and all 10 disappeared once `and`/
+    /// `or` stopped handing on the node they had just split on.
     ///
-    /// Keeping the literals makes both cheap: a branch whose negation is
-    /// already assumed is DEAD and never explored, and a condition already
-    /// assumed decides immediately.
-    pub path: Vec<(D::Bool, bool)>,
-    /// Conditions that must HOLD for this state to be a correct answer.
-    ///
-    /// Unlike `path`, these are not assumptions the tracer made - they are
-    /// obligations it is passing to run time. The unroll bound is the
-    /// case: the tracer stops after N iterations and requires that the
-    /// loop had actually finished, so a bound that is too small fails
-    /// loudly at run time instead of silently truncating the loop. The
-    /// heuristic is then performance-only, which is the whole point.
-    ///
-    /// This is `Emit::ok` in the graph pipeline.
-    pub ok: Vec<D::Bool>,
+    /// INVARIANT: the guards of the outcomes in one frontier are pairwise
+    /// DISJOINT. Every fan-out is a split on some condition, so this holds
+    /// by construction - and `merge` relies on it, since it selects with
+    /// `t.guard` and would otherwise silently drop `f`'s value on a lane
+    /// both claimed.
+    pub guard: D::Bool,
+    pub ok: D::Bool,
 }
 
 impl<D: Domain> Clone for State<D> {
@@ -71,7 +64,7 @@ impl<D: Domain> Clone for State<D> {
             globals: self.globals,
             scope: self.scope,
             stack: self.stack.clone(),
-            path: self.path.clone(),
+            guard: self.guard.clone(),
             ok: self.ok.clone(),
         }
     }
@@ -98,16 +91,16 @@ impl<D: Domain> State<D> {
 /// Both sides are GC'd first, because two states that did the same thing
 /// by different routes leave different garbage behind and would otherwise
 /// look like different shapes.
-/// Merge two states. `path` is what the two sides were split FROM - the
-/// merged state happens exactly when either side would have, so it drops
-/// back to the common prefix.
+/// Merge two states. The condition is `t`'s own guard - the merged state
+/// happens when EITHER side would have, and picks t's value exactly where
+/// t applies. This needs the two guards to be disjoint; see the invariant
+/// on `State::guard`.
 pub fn merge<D: Domain>(
     d: &mut D,
-    cond: &D::Bool,
-    path: &[(D::Bool, bool)],
     mut t: State<D>,
     mut f: State<D>,
 ) -> Result<Option<State<D>>> {
+    let cond = &t.guard.clone();
     t.gc();
     f.gc();
     if t.shape()? != f.shape()? {
@@ -175,18 +168,12 @@ pub fn merge<D: Domain>(
         globals: t.globals,
         scope: t.scope,
         stack: t.stack.clone(),
-        path: path.to_vec(),
-        // Both sides' obligations survive the merge: a lane that took
-        // either arm still has to satisfy whatever that arm required.
-        ok: {
-            let mut v = t.ok.clone();
-            for c in &f.ok {
-                if !v.contains(c) {
-                    v.push(c.clone());
-                }
-            }
-            v
-        },
+        guard: d.or(&t.guard, &f.guard),
+        // Obligations are per-CASE: a lane only has to satisfy what the
+        // arm it actually took required, so this selects rather than
+        // conjoining. Conjoining would be sound but would deopt lanes for
+        // an obligation incurred on a path they did not take.
+        ok: d.sel_bool(cond, &t.ok, &f.ok),
     }))
 }
 
@@ -271,8 +258,8 @@ mod tests {
             globals: 0,
             scope: 0,
             stack: Vec::new(),
-            path: Vec::new(),
-            ok: Vec::new(),
+            guard: d.boolean(true),
+            ok: d.boolean(true),
         };
         s.globals = s.heap.new_table();
         s.scope = s.heap.new_scope(None);
@@ -295,8 +282,11 @@ mod tests {
         let zero = d.num(P8::from_i16(0));
         let cond = d.compare(Cmp::Gt, &sym, &zero).unwrap();
         assert_eq!(d.decide(&cond), None);
+        // A real branch leaves each side guarded by the literal it took.
+        s.guard = cond.clone();
+        f.guard = d.not(&cond);
 
-        let m = merge(&mut d, &cond, &[], s, f).unwrap().expect("same shape merges");
+        let m = merge(&mut d, s, f).unwrap().expect("same shape merges");
         let player_m = match m.heap.tables[&m.globals].hash["p"] {
             Value::Table(t) => t,
             ref v => panic!("expected a table, got {:?}", v),
@@ -319,7 +309,7 @@ mod tests {
     #[test]
     fn differing_shapes_do_not_merge() {
         let mut d = Symbolic::default();
-        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), path: Vec::new(), ok: Vec::new() };
+        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ok: d.boolean(true) };
         s.globals = s.heap.new_table();
         s.scope = s.heap.new_scope(None);
         let obj = s.heap.new_table();
@@ -333,7 +323,9 @@ mod tests {
         let sym = d.graph.leaf(Op::Cell(1));
         let zero = d.num(P8::from_i16(0));
         let cond = d.compare(Cmp::Gt, &sym, &zero).unwrap();
-        assert!(merge(&mut d, &cond, &[], s, f).unwrap().is_none());
+        s.guard = cond.clone();
+        f.guard = d.not(&cond);
+        assert!(merge(&mut d, s, f).unwrap().is_none());
     }
 
     /// GC before comparing: two states that reached the same place by
@@ -342,7 +334,7 @@ mod tests {
     #[test]
     fn garbage_does_not_prevent_a_merge() {
         let mut d = Symbolic::default();
-        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), path: Vec::new(), ok: Vec::new() };
+        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ok: d.boolean(true) };
         s.globals = s.heap.new_table();
         s.scope = s.heap.new_scope(None);
         let mut f = s.clone();
@@ -353,36 +345,37 @@ mod tests {
         let sym = d.graph.leaf(Op::Cell(1));
         let zero = d.num(P8::from_i16(0));
         let cond = d.compare(Cmp::Gt, &sym, &zero).unwrap();
-        assert!(merge(&mut d, &cond, &[], s, f).unwrap().is_some());
+        s.guard = cond.clone();
+        f.guard = d.not(&cond);
+        assert!(merge(&mut d, s, f).unwrap().is_some());
     }
 }
 
-/// Split a state on `cond`, dropping either side whose assumption
-/// contradicts what the path already holds. A dead branch is never
-/// explored, which is both a precision win and the thing that stops a
-/// value of the wrong KIND surviving into code that cannot use it.
-pub fn split_path<D: Domain>(
+/// Split a state on an undecided condition. Each side's guard picks up
+/// the literal; a side whose guard folds to false is DEAD and is not
+/// returned, so the caller never explores it.
+pub fn split<D: Domain>(
+    d: &mut D,
     s: State<D>,
     cond: &D::Bool,
 ) -> (Option<State<D>>, Option<State<D>>) {
-    let known = if std::env::var_os("TRACE_NO_PATH_DECIDE").is_some() {
-        None
+    let ncond = d.not(cond);
+    let gt = d.and(&s.guard, cond);
+    let gf = d.and(&s.guard, &ncond);
+    let live = |d: &D, g: &D::Bool| d.decide(g) != Some(false);
+    let t = if live(d, &gt) {
+        let mut x = s.clone();
+        x.guard = gt;
+        Some(x)
     } else {
-        s.path.iter().find(|(l, _)| l == cond).map(|(_, v)| *v)
+        None
     };
-    super::interp::PATH_ASKED.with(|c| c.set(c.get() + 1));
-    if known.is_some() {
-        super::interp::PATH_HIT.with(|c| c.set(c.get() + 1));
-    }
-    match known {
-        Some(true) => (Some(s), None),
-        Some(false) => (None, Some(s)),
-        None => {
-            let mut t = s.clone();
-            t.path.push((cond.clone(), true));
-            let mut f = s;
-            f.path.push((cond.clone(), false));
-            (Some(t), Some(f))
-        }
-    }
+    let f = if live(d, &gf) {
+        let mut x = s;
+        x.guard = gf;
+        Some(x)
+    } else {
+        None
+    };
+    (t, f)
 }

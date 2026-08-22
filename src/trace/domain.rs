@@ -78,6 +78,15 @@ pub trait Domain {
     fn fun2(&mut self, f: Fun2, a: &Self::Num, b: &Self::Num) -> Result<Self::Num>;
     fn compare(&mut self, op: Cmp, a: &Self::Num, b: &Self::Num) -> Result<Self::Bool>;
     fn not(&mut self, a: &Self::Bool) -> Self::Bool;
+    fn and(&mut self, a: &Self::Bool, b: &Self::Bool) -> Self::Bool;
+    /// Provided via De Morgan, so no domain has to build an OR and the
+    /// graph needs no `Op::Or` - which it deliberately does not have,
+    /// since nothing emits one. Override if that ever stops being true.
+    fn or(&mut self, a: &Self::Bool, b: &Self::Bool) -> Self::Bool {
+        let (na, nb) = (self.not(a), self.not(b));
+        let both = self.and(&na, &nb);
+        self.not(&both)
+    }
 
     /// The value of this condition, if the domain knows it. `None` sends
     /// the interpreter down both arms.
@@ -185,6 +194,9 @@ impl Domain for Concrete {
     }
     fn not(&mut self, a: &bool) -> bool {
         !*a
+    }
+    fn and(&mut self, a: &bool, b: &bool) -> bool {
+        *a && *b
     }
     fn decide(&self, c: &bool) -> Option<bool> {
         Some(*c)
@@ -311,6 +323,9 @@ impl Domain for Symbolic {
     }
     fn not(&mut self, a: &NodeId) -> NodeId {
         self.graph.fold(Op::Not, vec![*a])
+    }
+    fn and(&mut self, a: &NodeId, b: &NodeId) -> NodeId {
+        self.graph.fold(Op::And, vec![*a, *b])
     }
     fn decide(&self, c: &NodeId) -> Option<bool> {
         match self.graph.get(*c).op {

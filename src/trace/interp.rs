@@ -24,15 +24,7 @@ use crate::pico8_num::Pico8Num as P8;
 
 use super::domain::{refuse_unknown, Arith, Cmp, Domain, Fun1, Fun2};
 use super::heap::{BodyId, TableId, Value};
-use super::state::{merge, split_path, State};
-
-thread_local! {
-    /// Is the path lookup ever load-bearing? Counts calls that reached it
-    /// (the domain could not fold the condition) and calls that found the
-    /// literal. See plans/tracing.md T5.
-    pub static PATH_ASKED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    pub static PATH_HIT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
+use super::state::{merge, split, State};
 
 pub enum Flow<D: Domain> {
     Normal,
@@ -54,15 +46,17 @@ impl<D: Domain> Flow<D> {
     fn is_normal(&self) -> bool {
         matches!(self, Flow::Normal)
     }
-    /// Two outcomes can only merge if they are doing the same thing.
-    fn same_kind(&self, other: &Self) -> bool {
-        matches!(
-            (self, other),
-            (Flow::Normal, Flow::Normal)
-                | (Flow::Break, Flow::Break)
-                | (Flow::Return(_), Flow::Return(_))
-        )
-    }
+
+}
+
+/// Can these two values be joined into one? Only numbers and booleans
+/// can differ - everything else is concrete, so it either matches
+/// outright or the two states are genuinely different successors.
+fn joinable<D: Domain>(a: &Value<D>, b: &Value<D>) -> bool {
+    matches!(
+        (a, b),
+        (Value::Num(_), Value::Num(_)) | (Value::Bool(_), Value::Bool(_))
+    ) || a == b
 }
 
 /// One or more `(state, thing)` outcomes.
@@ -124,17 +118,17 @@ impl<'a, D: Domain> Interp<'a, D> {
             }
             live = self.collapse(next)?;
             if live.len() > self.max_states {
-                let mut hist: std::collections::BTreeMap<(&str, usize), usize> =
-                    Default::default();
+                let mut hist: std::collections::BTreeMap<&str, usize> = Default::default();
                 for (st, f) in &live {
                     let k = match f {
                         Flow::Normal => "normal",
                         Flow::Break => "break",
                         Flow::Return(_) => "return",
                     };
-                    *hist.entry((k, st.path.len())).or_default() += 1;
+                    let _ = st;
+                    *hist.entry(k).or_default() += 1;
                 }
-                eprintln!("[trace] frontier by (flow, path len): {:?}", hist);
+                eprintln!("[trace] frontier by flow: {:?}", hist);
                 bail!(
                     "frontier grew to {} states (limit {}) - something is fanning out \
                      without merging back",
@@ -294,7 +288,7 @@ impl<'a, D: Domain> Interp<'a, D> {
         let mut out: Outcome<D> = Vec::new();
         for (s, cv) in self.eval(cond_e, st)? {
             let cond = self.truthy(&cv);
-            out.extend(match self.decide_on_path(&cond, &s) {
+            out.extend(match self.decide(&cond) {
                 Some(true) => self.exec_block(blk, s)?,
                 Some(false) => self.exec_arms(rest, els, s)?,
                 None => {
@@ -302,8 +296,7 @@ impl<'a, D: Domain> Interp<'a, D> {
                     // record that before running it. A merge puts the
                     // original back, because either side happening IS the
                     // original condition.
-                    let path = s.path.clone();
-                    let (ts, fs) = split_path(s, &cond);
+                    let (ts, fs) = split(&mut self.d, s, &cond);
                     let t = match ts {
                         Some(x) => self.exec_block(blk, x)?,
                         None => Vec::new(),
@@ -318,7 +311,11 @@ impl<'a, D: Domain> Interp<'a, D> {
                         both.extend(f);
                         both
                     } else {
-                        self.merge_outcomes(&cond, &path, t, f)?
+                        {
+                            let mut all = t;
+                            all.extend(f);
+                            self.collapse(all)?
+                        }
                     }
                 }
             });
@@ -326,60 +323,39 @@ impl<'a, D: Domain> Interp<'a, D> {
         Ok(out)
     }
 
-    /// Merge any outcomes that differ in exactly one path literal.
+    /// Merge every pair of outcomes that can be merged, to a fixpoint.
     ///
-    /// Merging only where the branch was TAKEN is not enough, and the
-    /// reason is specific. `btn(x) and 86` fans out into a number and a
-    /// boolean - different shapes, so no merge, by design. The enclosing
-    /// `or` then DECIDES on each outcome separately, because the path
-    /// already records whether `btn(x)` held, so it never splits and no
-    /// join for that literal ever runs. The two outcomes only become
-    /// compatible AFTER the whole expression, where the join-tied merge
-    /// is not looking.
+    /// Any two same-kind outcomes with a mergeable shape now merge, on
+    /// `t`'s guard - there is no sibling relation to establish first. The
+    /// rule this replaces could only pair outcomes differing in exactly
+    /// ONE assumed literal, which is sound (two such outcomes cover their
+    /// parent) but far too weak: an `elseif` ladder inside a loop
+    /// accumulates one `return` per rung, each a literal deeper than the
+    /// last, and `spikes_at` reached 276 of them - all returning `true`
+    /// from a function that mutates nothing. One behaviour the rule could
+    /// not see.
     ///
-    /// So the collapse is a fixpoint over the whole frontier instead:
-    /// repeatedly merge any two outcomes that agree on everything but one
-    /// assumption. Run after every statement, it keeps the frontier at the
-    /// number of genuinely different futures rather than the product of
-    /// every branch taken along the way.
+    /// Run after every statement, so the collapse cascades bottom-up and
+    /// the frontier stays at the number of genuinely different futures
+    /// rather than the product of every branch taken to get there.
     pub fn collapse(&mut self, mut outs: Outcome<D>) -> Result<Outcome<D>> {
         'again: loop {
             for i in 0..outs.len() {
                 for j in (i + 1)..outs.len() {
-                    if !outs[i].1.same_kind(&outs[j].1) {
+                    if !self.can_join(&outs[i].1, &outs[j].1) {
                         continue;
                     }
-                    let Some(k) = differ_at_one(&outs[i].0.path, &outs[j].0.path) else {
+                    let (a, b) = (outs[i].0.clone(), outs[j].0.clone());
+                    let Some(m) = merge(&mut self.d, a, b)? else {
                         continue;
                     };
-                    // Merge on the literal, true side first.
-                    let (ti, fi) = if outs[i].0.path[k].1 { (i, j) } else { (j, i) };
-                    let cond = outs[ti].0.path[k].0.clone();
-                    let rest = without(&outs[ti].0.path, k);
-                    let flow = match (&outs[ti].1, &outs[fi].1) {
-                        (Flow::Return(a), Flow::Return(b)) => match (a.clone(), b.clone()) {
-                            (Value::Num(x), Value::Num(y)) => {
-                                Some(Flow::Return(Value::Num(self.d.sel_num(&cond, &x, &y))))
-                            }
-                            (Value::Bool(x), Value::Bool(y)) => {
-                                Some(Flow::Return(Value::Bool(self.d.sel_bool(&cond, &x, &y))))
-                            }
-                            (x, y) if x == y => Some(Flow::Return(x)),
-                            _ => None,
-                        },
-                        (Flow::Break, Flow::Break) => Some(Flow::Break),
-                        (Flow::Normal, Flow::Normal) => Some(Flow::Normal),
-                        _ => None,
-                    };
-                    let Some(fl) = flow else { continue };
-                    let (a, b) = (outs[ti].0.clone(), outs[fi].0.clone());
-                    if let Some(m) = merge(&mut self.d, &cond, &rest, a, b)? {
-                        let (hi, lo) = if ti > fi { (ti, fi) } else { (fi, ti) };
-                        outs.remove(hi);
-                        outs.remove(lo);
-                        outs.push((m, fl));
-                        continue 'again;
-                    }
+                    let cond = outs[i].0.guard.clone();
+                    let fl = self.join_flow(&cond, &outs[i].1, &outs[j].1);
+                    // j > i, so drop the later index first.
+                    outs.remove(j);
+                    outs.remove(i);
+                    outs.push((m, fl));
+                    continue 'again;
                 }
             }
             break;
@@ -387,72 +363,67 @@ impl<'a, D: Domain> Interp<'a, D> {
         Ok(outs)
     }
 
-    /// Put two arms' outcomes back together, PAIRWISE.
-    ///
-    /// Merging only the one-outcome-each case looked like a reasonable
-    /// simplification and was not: branches nest, so by the time control
-    /// reaches a join each side usually has several outcomes already, and
-    /// falling through to concatenation made the state count MULTIPLY per
-    /// frame. Frame 24 of the real cart came out as 12 states that all had
-    /// the SAME SHAPE - 3 horizontal-input outcomes times 4 from a later
-    /// branch, none of which needed to be separate.
-    ///
-    /// Two outcomes pair up when they agree on everything except the
-    /// literal this join is about: same remaining path, same kind of flow,
-    /// mergeable shape. Because each join does this, the collapse cascades
-    /// bottom-up and the inner joins have already tidied up by the time an
-    /// outer one runs.
-    fn merge_outcomes(
+    /// The same fixpoint for a fanned-out EXPRESSION, where the outcomes
+    /// carry a value instead of a flow.
+    pub fn collapse_values(
         &mut self,
-        cond: &D::Bool,
-        path: &[(D::Bool, bool)],
-        t: Outcome<D>,
-        f: Outcome<D>,
-    ) -> Result<Outcome<D>> {
-        let idx = path.len();
-        let mut fs: Vec<Option<(State<D>, Flow<D>)>> = f.into_iter().map(Some).collect();
-        let mut out: Outcome<D> = Vec::new();
-        for (ts, tf) in t {
-            let rest = without(&ts.path, idx);
-            let partner = fs.iter().position(|slot| match slot {
-                Some((s, fl)) => tf.same_kind(fl) && without(&s.path, idx) == rest,
-                None => false,
-            });
-            let Some(i) = partner else {
-                out.push((ts, tf));
-                continue;
-            };
-            let (fst, ff) = fs[i].take().unwrap();
-            let flow = match (&tf, &ff) {
-                (Flow::Return(a), Flow::Return(b)) => match (a, b) {
-                    (Value::Num(x), Value::Num(y)) => {
-                        Some(Flow::Return(Value::Num(self.d.sel_num(cond, x, y))))
+        mut outs: Multi<D, Value<D>>,
+    ) -> Result<Multi<D, Value<D>>> {
+        'again: loop {
+            for i in 0..outs.len() {
+                for j in (i + 1)..outs.len() {
+                    if !joinable(&outs[i].1, &outs[j].1) {
+                        continue;
                     }
-                    (Value::Bool(x), Value::Bool(y)) => {
-                        Some(Flow::Return(Value::Bool(self.d.sel_bool(cond, x, y))))
-                    }
-                    (x, y) if x == y => Some(Flow::Return(x.clone())),
-                    _ => None,
-                },
-                (Flow::Break, Flow::Break) => Some(Flow::Break),
-                (Flow::Normal, Flow::Normal) => Some(Flow::Normal),
-                _ => None,
-            };
-            let merged = match &flow {
-                Some(_) => merge(&mut self.d, cond, &rest, ts.clone(), fst.clone())?,
-                None => None,
-            };
-            match (merged, flow) {
-                (Some(m), Some(fl)) => out.push((m, fl)),
-                _ => {
-                    out.push((ts, tf));
-                    out.push((fst, ff));
+                    let (a, b) = (outs[i].0.clone(), outs[j].0.clone());
+                    let Some(m) = merge(&mut self.d, a, b)? else {
+                        continue;
+                    };
+                    let cond = outs[i].0.guard.clone();
+                    let v = self.join_value(&cond, &outs[i].1.clone(), &outs[j].1.clone());
+                    outs.remove(j);
+                    outs.remove(i);
+                    outs.push((m, v));
+                    continue 'again;
                 }
             }
+            break;
         }
-        out.extend(fs.into_iter().flatten());
-        Ok(out)
+        Ok(outs)
     }
+
+    /// Can these two flows be joined - WITHOUT building any nodes? Asked
+    /// before the merge so a rejected pair costs nothing; `collapse` now
+    /// tries every pair rather than only siblings, so most pairs are
+    /// rejected and building a `Sel` for each would be pure garbage.
+    fn can_join(&self, a: &Flow<D>, b: &Flow<D>) -> bool {
+        match (a, b) {
+            (Flow::Return(x), Flow::Return(y)) => joinable(x, y),
+            (Flow::Break, Flow::Break) | (Flow::Normal, Flow::Normal) => true,
+            _ => false,
+        }
+    }
+
+    fn join_flow(&mut self, cond: &D::Bool, a: &Flow<D>, b: &Flow<D>) -> Flow<D> {
+        match (a, b) {
+            (Flow::Return(x), Flow::Return(y)) => {
+                Flow::Return(self.join_value(cond, &x.clone(), &y.clone()))
+            }
+            (Flow::Break, _) => Flow::Break,
+            _ => Flow::Normal,
+        }
+    }
+
+    /// Only numbers and booleans actually differ; `joinable` has already
+    /// established that this pair is one of those or is equal outright.
+    fn join_value(&mut self, cond: &D::Bool, a: &Value<D>, b: &Value<D>) -> Value<D> {
+        match (a, b) {
+            (Value::Num(x), Value::Num(y)) => Value::Num(self.d.sel_num(cond, x, y)),
+            (Value::Bool(x), Value::Bool(y)) => Value::Bool(self.d.sel_bool(cond, x, y)),
+            (x, _) => x.clone(),
+        }
+    }
+
 
     /// Numeric `for`. The bounds must be CONCRETE, which they are almost
     /// everywhere because the heap is: `for i=1,count(objects)` reads a
@@ -531,14 +502,13 @@ impl<'a, D: Domain> Interp<'a, D> {
                 let off = self.d.num(P8::from_i16(k as i16));
                 let iv = self.d.arith(Arith::Add, &start, &off)?;
                 let cond = self.d.compare(Cmp::Le, &iv, &limit)?;
-                match self.decide_on_path(&cond, &s) {
+                match self.decide(&cond) {
                     // Past the limit on this path: nothing more to do, but
                     // the state carries on after the loop.
                     Some(false) => next.push((s, Flow::Normal)),
                     Some(true) => next.extend(self.for_body(f, name, &iv, s)?),
                     None => {
-                        let path = s.path.clone();
-                        let (ts, fs) = split_path(s, &cond);
+                        let (ts, fs) = split(&mut self.d, s, &cond);
                         let t = match ts {
                             Some(x) => self.for_body(f, name, &iv, x)?,
                             None => Vec::new(),
@@ -551,7 +521,9 @@ impl<'a, D: Domain> Interp<'a, D> {
                             next.extend(t);
                             next.extend(fo);
                         } else {
-                            next.extend(self.merge_outcomes(&cond, &path, t, fo)?);
+                            let mut all = t;
+                            all.extend(fo);
+                            next.extend(self.collapse(all)?);
                         }
                     }
                 }
@@ -563,11 +535,8 @@ impl<'a, D: Domain> Interp<'a, D> {
         let iv = self.d.arith(Arith::Add, &start, &off)?;
         let over = self.d.compare(Cmp::Le, &iv, &limit)?;
         let finished = self.d.not(&over);
-        for (s, fl) in running.iter_mut() {
-            let _ = &fl;
-            if !s.ok.contains(&finished) {
-                s.ok.push(finished.clone());
-            }
+        for (s, _) in running.iter_mut() {
+            s.ok = self.d.and(&s.ok, &finished);
         }
         Ok(running
             .into_iter()
@@ -649,20 +618,14 @@ impl<'a, D: Domain> Interp<'a, D> {
     /// Decide a condition, consulting what the path already assumed. A
     /// literal branched on earlier is not unknown any more, and that is
     /// what stops `a and b or c` fanning out twice on the same question.
-    fn decide_on_path(&self, cond: &D::Bool, st: &State<D>) -> Option<bool> {
-        if let Some(b) = self.d.decide(cond) {
-            return Some(b);
-        }
-        if std::env::var_os("TRACE_NO_PATH_DECIDE").is_some() {
-            return None;
-        }
-        let hit = st.path.iter().find(|(l, _)| l == cond).map(|(_, v)| *v);
-        PATH_ASKED.with(|c| c.set(c.get() + 1));
-        if hit.is_some() {
-            PATH_HIT.with(|c| c.set(c.get() + 1));
-        }
-        hit
+    /// The condition's value, if the domain knows it. There is nothing
+    /// else to consult: a state's guard is opaque by design, and the
+    /// measurement that justified looking inside it stopped firing once
+    /// `and`/`or` handed on the constant they had just split on.
+    fn decide(&self, cond: &D::Bool) -> Option<bool> {
+        self.d.decide(cond)
     }
+
 
     fn truthy(&mut self, v: &Value<D>) -> D::Bool {
         // Lua: only nil and false are falsy. So a number condition is
@@ -813,13 +776,12 @@ impl<'a, D: Domain> Interp<'a, D> {
             let mut out = Vec::new();
             for (st, a) in self.eval(lhs, st)? {
                 let t = self.truthy(&a);
-                match self.decide_on_path(&t, &st) {
+                match self.decide(&t) {
                     Some(x) if x == is_and => out.extend(self.eval(rhs, st)?),
                     Some(_) => out.push((st, a)),
                     None => {
-                        let path = st.path.clone();
                         let taken_cond = if is_and { t.clone() } else { self.d.not(&t) };
-                        let (ts, fs) = split_path(st, &taken_cond);
+                        let (ts, fs) = split(&mut self.d, st, &taken_cond);
                         let taken = match ts {
                             Some(x) => self.eval(rhs, x)?,
                             None => Vec::new(),
@@ -852,7 +814,9 @@ impl<'a, D: Domain> Interp<'a, D> {
                             out.extend(taken);
                             out.extend(kept);
                         } else {
-                            out.extend(self.merge_values(&taken_cond, &path, taken, kept)?);
+                            let mut all = taken;
+                            all.extend(kept);
+                            out.extend(self.collapse_values(all)?);
                         }
                     }
                 }
@@ -912,54 +876,7 @@ impl<'a, D: Domain> Interp<'a, D> {
         }))
     }
 
-    /// Put two fanned-out value outcomes back together where they agree.
-    /// A number and a boolean do NOT agree - that is the whole reason
-    /// `btn(r) and 1` fans out rather than needing a special value kind.
-    /// The same pairwise merge for a value in flight. A number and a
-    /// boolean do NOT agree, which is the whole reason `btn(r) and 1` fans
-    /// out rather than needing a special value kind.
-    fn merge_values(
-        &mut self,
-        cond: &D::Bool,
-        path: &[(D::Bool, bool)],
-        t: Multi<D, Value<D>>,
-        f: Multi<D, Value<D>>,
-    ) -> Result<Multi<D, Value<D>>> {
-        let idx = path.len();
-        let mut fs: Vec<Option<(State<D>, Value<D>)>> = f.into_iter().map(Some).collect();
-        let mut out: Multi<D, Value<D>> = Vec::new();
-        for (ts, tv) in t {
-            let rest = without(&ts.path, idx);
-            let partner = fs.iter().position(|slot| match slot {
-                Some((s, _)) => without(&s.path, idx) == rest,
-                None => false,
-            });
-            let Some(i) = partner else {
-                out.push((ts, tv));
-                continue;
-            };
-            let (fst, fv) = fs[i].take().unwrap();
-            let joined = match (&tv, &fv) {
-                (Value::Num(x), Value::Num(y)) => Some(Value::Num(self.d.sel_num(cond, x, y))),
-                (Value::Bool(x), Value::Bool(y)) => Some(Value::Bool(self.d.sel_bool(cond, x, y))),
-                (x, y) if x == y => Some(x.clone()),
-                _ => None,
-            };
-            let merged = match &joined {
-                Some(_) => merge(&mut self.d, cond, &rest, ts.clone(), fst.clone())?,
-                None => None,
-            };
-            match (merged, joined) {
-                (Some(m), Some(v)) => out.push((m, v)),
-                _ => {
-                    out.push((ts, tv));
-                    out.push((fst, fv));
-                }
-            }
-        }
-        out.extend(fs.into_iter().flatten());
-        Ok(out)
-    }
+
 
     /// Read a name: the scope chain first, then globals. A name that is
     /// nowhere is `nil`, as in Lua.
@@ -1384,39 +1301,6 @@ fn unroll_bound(limit_src: &str) -> Option<u32> {
     }
 }
 
-/// The one index at which two paths disagree, if there is exactly one.
-/// Two outcomes like that are the two sides of a branch - whatever created
-/// them - so they can be merged on that literal.
-fn differ_at_one<B: PartialEq>(a: &[(B, bool)], b: &[(B, bool)]) -> Option<usize> {
-    if a.len() != b.len() {
-        return None;
-    }
-    let mut found = None;
-    for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
-        if x.0 != y.0 {
-            return None;
-        }
-        if x.1 != y.1 {
-            if found.is_some() {
-                return None;
-            }
-            found = Some(i);
-        }
-    }
-    found
-}
-
-/// A path with the literal at `idx` removed - what two outcomes of the
-/// same join must agree on to be paired. Everything after `idx` came from
-/// branches INSIDE the arms, so two outcomes that differ there are
-/// genuinely different and stay apart.
-fn without<B: Clone>(path: &[(B, bool)], idx: usize) -> Vec<(B, bool)> {
-    let mut v = path.to_vec();
-    if idx < v.len() {
-        v.remove(idx);
-    }
-    v
-}
 
 fn ident(t: &full_moon::tokenizer::TokenReference) -> Result<String> {
     match t.token_type() {
@@ -1436,11 +1320,12 @@ mod tests {
         full_moon::parse(src).expect("parse")
     }
 
-    fn fresh<D: Domain>(_d: &mut D) -> State<D> {
+    fn fresh<D: Domain>(d: &mut D) -> State<D> {
         let mut heap: Heap<D> = Heap::default();
         let globals = heap.new_table();
         let scope = heap.new_scope(None);
-        State { heap, globals, scope, stack: Vec::new(), path: Vec::new(), ok: Vec::new() }
+        let t = d.boolean(true);
+        State { heap, globals, scope, stack: Vec::new(), guard: t.clone(), ok: t }
     }
 
     /// Run `src` and read back the global `result`.
