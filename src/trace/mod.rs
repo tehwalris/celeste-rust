@@ -51,6 +51,9 @@
 
 pub mod cart;
 pub mod domain;
+pub mod eval;
 pub mod heap;
+pub mod iface;
 pub mod interp;
 pub mod state;
+pub mod verify;

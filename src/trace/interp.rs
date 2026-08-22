@@ -74,6 +74,16 @@ pub struct Interp<'a, D: Domain> {
     /// Function bodies, referred to by id from closures - the AST outlives
     /// the heap, so the heap stores an index rather than a reference.
     bodies: Vec<&'a ast::FunctionBody>,
+    /// AST node -> its id, so evaluating the same `function ... end`
+    /// twice yields the SAME closure body.
+    ///
+    /// This is not a cache. Minting a fresh id per evaluation made two
+    /// states that had built the same closure structurally different, and
+    /// since a `Func` slot is part of the SHAPE, they then could not
+    /// merge. It cost ten unmergeable outcomes on the first frame that
+    /// was traced as a kernel, all of them the same 110 scalars and
+    /// differing only in these numbers.
+    body_ids: std::collections::HashMap<*const ast::FunctionBody, BodyId>,
     /// The cart and the room's collision cache, for `mget`/`fget` and
     /// `tile_flag_at`. Optional so the unit tests can run programs that
     /// never touch the map.
@@ -91,6 +101,7 @@ impl<'a, D: Domain> Interp<'a, D> {
         Interp {
             d,
             bodies: Vec::new(),
+            body_ids: std::collections::HashMap::new(),
             cart: None,
             cache: None,
             max_states: 256,
@@ -99,8 +110,18 @@ impl<'a, D: Domain> Interp<'a, D> {
     }
 
     fn intern_body(&mut self, b: &'a ast::FunctionBody) -> BodyId {
+        // By POINTER: the AST outlives the interpreter and never moves,
+        // so the address is a stable name for the syntax. Two closures
+        // over the same syntax still differ when they captured different
+        // scopes - that is what `Func::env` is for.
+        let k = b as *const ast::FunctionBody;
+        if let Some(id) = self.body_ids.get(&k) {
+            return *id;
+        }
         self.bodies.push(b);
-        (self.bodies.len() - 1) as BodyId
+        let id = (self.bodies.len() - 1) as BodyId;
+        self.body_ids.insert(k, id);
+        id
     }
 
     // ------------------------------------------------------------ blocks
