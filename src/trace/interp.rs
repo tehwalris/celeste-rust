@@ -99,6 +99,10 @@ pub struct Interp<'a, D: Domain> {
     /// compared line for line (`lua/probe/`), which is the only way to
     /// settle a question like what `#` does to a table with a hole in it.
     pub prints: Vec<String>,
+    /// `(room x, room y, flag bit) -> does any tile in that room carry
+    /// it`. Answering costs 256 map lookups, and `ice_at` asks every
+    /// frame for every object.
+    room_flags: std::collections::HashMap<(i16, i16, i16), bool>,
 }
 
 impl<'a, D: Domain> Interp<'a, D> {
@@ -112,6 +116,7 @@ impl<'a, D: Domain> Interp<'a, D> {
             max_states: 256,
             max_nodes: 2_000_000,
             prints: Vec::new(),
+            room_flags: std::collections::HashMap::new(),
         }
     }
 
@@ -1182,6 +1187,41 @@ impl<'a, D: Domain> Interp<'a, D> {
         }
     }
 
+    /// Does any tile in the loaded room carry this flag bit? The room is
+    /// in the heap (`room.x` / `room.y`), so this needs no plumbing.
+    fn room_has_flag(&mut self, st: &State<D>, flag: i16) -> Result<bool> {
+        let Some(Value::Table(rt)) = st.heap.tables[&st.globals].hash.get("room").cloned() else {
+            bail!("tile_flag_at: no `room` global to check the flag against");
+        };
+        let coord = |k: &str| -> Result<i16> {
+            match st.heap.tables[&rt].hash.get(k) {
+                Some(Value::Num(n)) => self
+                    .d
+                    .as_const(n)
+                    .and_then(|v| v.as_i16())
+                    .ok_or_else(|| anyhow!("tile_flag_at: room.{} is not a known integer", k)),
+                other => bail!("tile_flag_at: room.{} is {:?}", k, other),
+            }
+        };
+        let (rx, ry) = (coord("x")?, coord("y")?);
+        if let Some(v) = self.room_flags.get(&(rx, ry, flag)) {
+            return Ok(*v);
+        }
+        let cart = self.cart.clone().ok_or_else(|| anyhow!("tile_flag_at: no cart"))?;
+        let mut found = false;
+        'scan: for i in 0..16i16 {
+            for j in 0..16i16 {
+                let t = cart.mget(P8::from_i16(rx * 16 + i), P8::from_i16(ry * 16 + j))?;
+                if cart.fget(P8::from_i16(t as i16), P8::from_i16(flag))? {
+                    found = true;
+                    break 'scan;
+                }
+            }
+        }
+        self.room_flags.insert((rx, ry, flag), found);
+        Ok(found)
+    }
+
     fn store(&mut self, t: &Target<D>, v: Value<D>, st: &mut State<D>) -> Result<()> {
         match t {
             Target::Name(name) => {
@@ -1314,41 +1354,66 @@ impl<'a, D: Domain> Interp<'a, D> {
             // graph node, where tracing the Lua would have been a scan
             // loop over a symbolic range.
             "tile_flag_at" => {
-                let (x, y, w, h, fl) = (
-                    num(0)?,
-                    num(1)?,
-                    num(2)?,
-                    num(3)?,
-                    num(4)?,
-                );
-                let known = |d: &D, v: &D::Num| d.as_const(v);
-                match (
-                    known(&self.d, &x),
-                    known(&self.d, &y),
-                    known(&self.d, &w),
-                    known(&self.d, &h),
-                    known(&self.d, &fl),
-                ) {
-                    (Some(x), Some(y), Some(w), Some(h), Some(f)) => {
-                        let cache = self
-                            .cache
-                            .clone()
-                            .ok_or_else(|| anyhow!("tile_flag_at: no collision cache"))?;
-                        let cart = self
-                            .cart
-                            .clone()
-                            .ok_or_else(|| anyhow!("tile_flag_at: no cart"))?;
-                        let r = if f.as_i16() != Some(0) {
-                            false
-                        } else {
-                            let gi = |v: P8| v.as_i16().ok_or_else(|| anyhow!("tile_flag_at: non-integer"));
-                            cache.solid_at(&cart, gi(x)?, gi(y)?, gi(w)?, gi(h)?)?
-                        };
-                        (st, Value::Bool(self.d.boolean(r)))
+                let (x, y, w, h, fl) = (num(0)?, num(1)?, num(2)?, num(3)?, num(4)?);
+                let gi = |v: P8| v.as_i16().ok_or_else(|| anyhow!("tile_flag_at: non-integer"));
+                // THE FLAG DECIDES FIRST, before the coordinates.
+                //
+                // A non-zero flag is ice, and only flag 0 (solid) is
+                // modelled. Returning `false` for every other flag - which
+                // is what this did, and what the interpreter still does
+                // (`game_runner.rs`, with a "not ideal but allows testing"
+                // comment) - is right only where the room contains no such
+                // tile. 16 tiles carry flag 4 across map rows 2 and 3, and
+                // `ice_at` gates acceleration and the wall-slide every
+                // frame, so the first search in one of those rooms gets
+                // silently wrong physics. In BOTH engines at once, which
+                // is why the differential gate cannot see it.
+                //
+                // Checking the flag before the coordinates matters: with a
+                // symbolic player position `ice_at` has unknown x and y,
+                // so an earlier version of this guard sat in the
+                // all-known branch and the call went straight past it into
+                // a graph node. Whether a room contains a flag does not
+                // depend on where in the room you look.
+                let Some(fi) = self.d.as_const(&fl).map(gi).transpose()? else {
+                    bail!("tile_flag_at with an unknown flag");
+                };
+                if fi != 0 {
+                    if self.room_has_flag(&st, fi)? {
+                        bail!(
+                            "tile_flag_at with flag {} in a room that CONTAINS that flag: \
+                             only flag 0 (solid) is modelled",
+                            fi
+                        );
                     }
-                    _ => {
-                        let b = self.d.tile_flag_at(&x, &y, &w, &h, &fl)?;
-                        (st, Value::Bool(b))
+                    // No tile in this room carries it, so the answer is
+                    // false for every rectangle in the room. Exact, and
+                    // it keeps the node out of the graph entirely.
+                    let b = self.d.boolean(false);
+                    (st, Value::Bool(b))
+                } else {
+                    match (
+                        self.d.as_const(&x),
+                        self.d.as_const(&y),
+                        self.d.as_const(&w),
+                        self.d.as_const(&h),
+                    ) {
+                        (Some(x), Some(y), Some(w), Some(h)) => {
+                            let cache = self
+                                .cache
+                                .clone()
+                                .ok_or_else(|| anyhow!("tile_flag_at: no collision cache"))?;
+                            let cart = self
+                                .cart
+                                .clone()
+                                .ok_or_else(|| anyhow!("tile_flag_at: no cart"))?;
+                            let r = cache.solid_at(&cart, gi(x)?, gi(y)?, gi(w)?, gi(h)?)?;
+                            (st, Value::Bool(self.d.boolean(r)))
+                        }
+                        _ => {
+                            let b = self.d.tile_flag_at(&x, &y, &w, &h, &fl)?;
+                            (st, Value::Bool(b))
+                        }
                     }
                 }
             }

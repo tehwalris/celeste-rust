@@ -217,6 +217,73 @@ mod tests {
         None
     }
 
+    /// `ice_at` is `tile_flag_at(.., 4)`, and only flag 0 is modelled.
+    /// Answering `false` for every other flag is right exactly where the
+    /// room has no such tile - so this checks BOTH halves: that it
+    /// answers in a room without ice, and that it RAISES in one with.
+    ///
+    /// The second half is the point. A guard that never fires is
+    /// indistinguishable from no guard, and this one was wrong in the
+    /// interpreter too, so no differential test between the two could
+    /// have found it.
+    #[test]
+    fn ice_answers_without_ice_and_raises_with_it() {
+        let src = cart::sources().expect("sources");
+        let top = full_moon::parse(&src).expect("parse");
+        let init = full_moon::parse("_init()").expect("parse _init");
+        let probe = full_moon::parse("ice_probe = ice_at(0,0,8,8)").expect("parse probe");
+        let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
+        let cd =
+            std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
+        let (rx, ry) = celeste_interp::game_runner::start_room();
+        it.cache = Some(std::sync::Arc::new(
+            celeste_core::collision_cache::CollisionCache::new(&cd, rx, ry).expect("cache"),
+        ));
+        it.cart = Some(cd);
+        let st = cart::fresh_state::<Symbolic>(&mut it.d);
+        let mut st = run_one(&mut it, &top, st).expect("toplevel");
+        cart::inject_tile_flag_at(&mut st);
+        let st = run_one(&mut it, &init, st).expect("_init");
+
+        // The start room has no ice, so the answer is false and exact.
+        let s = run_one(&mut it, &probe, st.clone()).expect("start room should answer");
+        let Some(Value::Bool(b)) = iface::get(&s, &[iface::key("ice_probe")]) else {
+            panic!("ice_at did not return a boolean")
+        };
+        assert_eq!(it.d.decide(&b), Some(false), "the start room has no ice");
+
+        // Somewhere on the map there IS ice, and there it must raise
+        // rather than quietly answer false. Searched rather than
+        // hard-coded, so the test cannot pass by looking in the wrong
+        // place.
+        let mut refused = 0;
+        let mut answered = 0;
+        for rx in 0..8i16 {
+            for ry in 0..4i16 {
+                let mut o = st.clone();
+                for (k, v) in [("x", rx), ("y", ry)] {
+                    let n = it.d.num(crate::pico8_num::Pico8Num::from_i16(v));
+                    iface::set(&mut o, &[iface::key("room"), iface::key(k)], Value::Num(n))
+                        .expect("set room");
+                }
+                match run_one(&mut it, &probe, o) {
+                    Ok(_) => answered += 1,
+                    Err(e) => {
+                        assert!(
+                            format!("{:#}", e).contains("CONTAINS that flag"),
+                            "refused for the wrong reason: {:#}",
+                            e
+                        );
+                        refused += 1;
+                    }
+                }
+            }
+        }
+        eprintln!("[ice] {} rooms answer false, {} raise", answered, refused);
+        assert!(refused > 0, "no room on the map has ice - then this guard is untested");
+        assert!(answered > 0, "every room raised - the guard is too coarse");
+    }
+
     /// `break` in a loop whose bound the tracer CANNOT know.
     ///
     /// The PICO-8 corpus cannot reach this. `run_for_symbolic` only runs

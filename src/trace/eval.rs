@@ -153,10 +153,13 @@ pub fn eval(g: &Graph, root: NodeId, env: &Env) -> Result<Conc> {
                     .clone()
                     .ok_or_else(|| anyhow!("tile_flag_at: no collision cache"))?;
                 let gi = |v: P8| v.as_i16().ok_or_else(|| anyhow!("tile_flag_at: non-integer"));
-                // Same shape as the interpreter's native version: any
-                // flag other than 0 is false, flag 0 is solidity.
+                // Only flag 0 (solid) reaches the graph. A non-zero
+                // flag is decided at TRACE time - it folds to false when
+                // the room provably has no such tile, and raises when it
+                // does - so a node carrying one means something upstream
+                // stopped doing that.
                 let r = if gi(num(a(4)?)?)? != 0 {
-                    false
+                    bail!("tile_flag_at node with a non-zero flag: only flag 0 is modelled")
                 } else {
                     cache.solid_at(
                         &cart,
