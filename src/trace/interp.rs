@@ -65,11 +65,14 @@ pub struct Interp<'a, D: Domain> {
     /// Function bodies, referred to by id from closures - the AST outlives
     /// the heap, so the heap stores an index rather than a reference.
     bodies: Vec<&'a ast::FunctionBody>,
+    /// The cart, for `mget`/`fget`. Optional so the unit tests can run
+    /// programs that never touch the map.
+    pub cart: Option<std::sync::Arc<celeste_core::cart_data::CartData>>,
 }
 
 impl<'a, D: Domain> Interp<'a, D> {
     pub fn new(d: D) -> Self {
-        Interp { d, bodies: Vec::new() }
+        Interp { d, bodies: Vec::new(), cart: None }
     }
 
     fn intern_body(&mut self, b: &'a ast::FunctionBody) -> BodyId {
@@ -300,49 +303,42 @@ impl<'a, D: Domain> Interp<'a, D> {
             .ok_or_else(|| refuse_unknown("a numeric for's limit"))?;
         let name = ident(f.index_variable())?;
 
-        let mut live: Outcome<D> = vec![];
-        let mut i = from;
+        // A `break` ends the LOOP for that state, not the state: it moves
+        // to `done` and carries on after the loop. Getting this wrong the
+        // first time made `break` a no-op, so `foreach`'s bounded walk ran
+        // its full 32767 iterations instead of stopping.
+        let mut running: Outcome<D> = vec![(s, Flow::Normal)];
+        let mut done: Outcome<D> = Vec::new();
+        let name = &name;
         let one = P8::from_i16(1);
-        // A concrete trip count, so this is an ordinary loop and there is
-        // nothing to unroll or guard.
-        while i <= to {
+        let mut i = from;
+        while i <= to && running.iter().any(|(_, f)| f.is_normal()) {
             let mut next: Outcome<D> = Vec::new();
-            let running = if live.is_empty() { vec![(s.clone(), Flow::Normal)] } else { live };
             for (mut cur, fl) in running {
                 if !fl.is_normal() {
-                    // A `break` ends the loop for that state, but the
-                    // state itself carries on after it.
-                    next.push((cur, if matches!(fl, Flow::Break) { Flow::Normal } else { fl }));
+                    done.push((cur, fl));
                     continue;
                 }
                 let body_scope = cur.heap.new_scope(Some(cur.scope));
                 let iv = self.d.num(i);
-                cur.heap.declare(body_scope, &name, Value::Num(iv));
+                cur.heap.declare(body_scope, name, Value::Num(iv));
                 let outer = cur.scope;
                 cur.scope = body_scope;
                 for (mut s2, f2) in self.exec_block(f.block(), cur)? {
                     s2.scope = outer;
-                    next.push((s2, f2));
+                    match f2 {
+                        Flow::Break => done.push((s2, Flow::Normal)),
+                        Flow::Return(v) => done.push((s2, Flow::Return(v))),
+                        Flow::Normal => next.push((s2, Flow::Normal)),
+                    }
                 }
             }
-            live = next;
-            if live.iter().all(|(_, fl)| !fl.is_normal()) {
-                break;
-            }
+            running = next;
             i = i + one;
         }
-        if live.is_empty() {
-            live = vec![(s, Flow::Normal)];
-        } else {
-            s = live[0].0.clone();
-            let _ = &s;
-        }
-        // A `break` has already been turned into Normal above; a `return`
-        // still propagates.
-        Ok(live
-            .into_iter()
-            .map(|(s, fl)| (s, if matches!(fl, Flow::Break) { Flow::Normal } else { fl }))
-            .collect())
+        // Whatever was still going when the bound ran out just continues.
+        done.extend(running.into_iter().map(|(s, _)| (s, Flow::Normal)));
+        Ok(done)
     }
 
     // ------------------------------------------------------- expressions
@@ -639,10 +635,19 @@ impl<'a, D: Domain> Interp<'a, D> {
         st: State<D>,
     ) -> Result<(State<D>, Value<D>)> {
         let (mut st, mut cur) = self.eval_prefix(p, st)?;
+        // A readable path, so "calling a non-function: nil" says WHICH
+        // nil. Costs a string per suffix at trace time and nothing at run
+        // time, and it is the difference between a five-minute diagnosis
+        // and an hour of bisecting Lua.
+        let mut path = match p {
+            ast::Prefix::Name(t) => ident(t).unwrap_or_else(|_| "?".into()),
+            _ => "(expr)".to_string(),
+        };
         for suffix in suffixes {
             match suffix {
                 ast::Suffix::Index(ast::Index::Dot { name, .. }) => {
                     let k = Key::Field(ident(name)?);
+                    path = format!("{}.{}", path, ident(name)?);
                     cur = self.get_key(&cur, &k, &st)?;
                 }
                 ast::Suffix::Index(ast::Index::Brackets { expression, .. }) => {
@@ -661,9 +666,12 @@ impl<'a, D: Domain> Interp<'a, D> {
                         st = st2;
                         args.push(v);
                     }
-                    let (st2, v) = self.call_value(cur, args, st)?;
+                    let (st2, v) = self
+                        .call_value(cur, args, st)
+                        .map_err(|e| anyhow!("calling {}: {:#}", path, e))?;
                     st = st2;
                     cur = v;
+                    path = format!("{}()", path);
                 }
                 other => bail!("unsupported suffix {:?}", other),
             }
@@ -781,6 +789,65 @@ impl<'a, D: Domain> Interp<'a, D> {
                 let a = num(&args[0])?;
                 let r = self.d.fun1(f, &a)?;
                 (st, Value::Num(r))
+            }
+            // The map is DATA, not code, and it is concrete - so a
+            // lookup with concrete coordinates folds to a constant here
+            // exactly as it would in the interpreter. Only a symbolic
+            // coordinate would need the graph, and that is `zn_mget`'s
+            // job in the emitted kernel rather than the tracer's.
+            "mget" | "fget" => {
+                let cart = self
+                    .cart
+                    .clone()
+                    .ok_or_else(|| anyhow!("{}: no cart loaded", name))?;
+                let (a, b) = (num(&args[0])?, num(&args[1])?);
+                let (x, y) = (
+                    self.d.as_const(&a).ok_or_else(|| refuse_unknown("an mget/fget x"))?,
+                    self.d.as_const(&b).ok_or_else(|| refuse_unknown("an mget/fget y"))?,
+                );
+                if name == "mget" {
+                    let t = cart.mget(x, y)?;
+                    let n = self.d.num(P8::from_i16(t as i16));
+                    (st, Value::Num(n))
+                } else {
+                    let r = cart.fget(x, y)?;
+                    let b = self.d.boolean(r);
+                    (st, Value::Bool(b))
+                }
+            }
+            "print" | "__print" => (st, Value::Nil),
+            // A merge HINT. The frontend turns it into a block flag so the
+            // interpreter's worklist accumulates states there; the tracer
+            // merges at every join by construction, so there is nothing
+            // for it to do. Kept rather than removed from the Lua because
+            // the IR pipeline still needs it.
+            "_hint_normalize" => (st, Value::Nil),
+            // On an EXACT value the floor is already unique, so there is
+            // one fragment and this is the identity. It only splits once
+            // the value has been widened to an interval - and the tracer
+            // has no widening yet, which is the next real design question
+            // (see plans/tracing.md): the search depends on `rem` being
+            // widened so that states merge, so an exact-semantics graph is
+            // correct but would not merge anything.
+            "__split_by_flr" | "__split_at" => (st, args[0].clone()),
+            // Shrinking an array is a SHAPE change, which is exactly what
+            // the tracer is built to let happen: two branches that
+            // disagree about whether an object exists stop being
+            // mergeable and become two output states.
+            "__array_table_drop_last" => {
+                let Value::Table(t) = &args[0] else {
+                    bail!("__array_table_drop_last on a non-table: {:?}", args[0])
+                };
+                let mut st = st;
+                let tab = st.heap.tables.get_mut(t).unwrap();
+                tab.arr
+                    .pop()
+                    .ok_or_else(|| anyhow!("__array_table_drop_last on an empty table"))?;
+                (st, Value::Nil)
+            }
+            "__new_unknown_boolean" => {
+                let b = self.d.unknown_bool()?;
+                (st, Value::Bool(b))
             }
             "min" | "max" => {
                 let f = if name == "min" { Fun2::Min } else { Fun2::Max };

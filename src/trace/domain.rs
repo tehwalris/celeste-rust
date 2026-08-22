@@ -28,7 +28,7 @@
 
 use std::fmt::Debug;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 
 use crate::pico8_num::Pico8Num as P8;
 use crate::transpile::graph::{Graph, NodeId, Op};
@@ -87,6 +87,14 @@ pub trait Domain {
     /// reaches these, because `decide` never returns `None` for it.
     fn sel_num(&mut self, c: &Self::Bool, t: &Self::Num, f: &Self::Num) -> Self::Num;
     fn sel_bool(&mut self, c: &Self::Bool, t: &Self::Bool, f: &Self::Bool) -> Self::Bool;
+
+    /// A fresh UNKNOWN boolean - one of the search's free choices.
+    ///
+    /// The oracle has no such thing: to run a frame concretely you supply
+    /// the actual button values, so `Concrete` refuses rather than
+    /// inventing one. That asymmetry is real and worth the loud failure -
+    /// it is the difference between running the game and compiling it.
+    fn unknown_bool(&mut self) -> Result<Self::Bool>;
 
     /// A number this value definitely is, if the domain knows it. The
     /// interpreter needs this for things the HEAP depends on - an array
@@ -162,6 +170,9 @@ impl Domain for Concrete {
             *f
         }
     }
+    fn unknown_bool(&mut self) -> Result<bool> {
+        bail!("the concrete domain has no unknown booleans - supply real inputs")
+    }
     fn as_const(&self, v: &P8) -> Option<P8> {
         Some(*v)
     }
@@ -173,6 +184,10 @@ impl Domain for Concrete {
 #[derive(Default)]
 pub struct Symbolic {
     pub graph: Graph,
+    /// How many free choices have been handed out. `__reset_button_states`
+    /// asks for six, in slot order, which is what makes these line up with
+    /// the kb0..kb5 the kernels already speak.
+    pub frees: u8,
 }
 
 impl Symbolic {
@@ -269,6 +284,14 @@ impl Domain for Symbolic {
     }
     fn sel_bool(&mut self, c: &NodeId, t: &NodeId, f: &NodeId) -> NodeId {
         self.graph.fold(Op::Sel, vec![*c, *t, *f])
+    }
+    fn unknown_bool(&mut self) -> Result<NodeId> {
+        if self.frees >= 6 {
+            bail!("more than six free choices - the kernels only model six buttons");
+        }
+        let b = self.frees;
+        self.frees += 1;
+        Ok(self.graph.leaf(Op::Free(b)))
     }
     fn as_const(&self, v: &NodeId) -> Option<P8> {
         self.as_p8(*v)
