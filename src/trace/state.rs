@@ -365,7 +365,15 @@ pub fn split_path<D: Domain>(
     s: State<D>,
     cond: &D::Bool,
 ) -> (Option<State<D>>, Option<State<D>>) {
-    let known = s.path.iter().find(|(l, _)| l == cond).map(|(_, v)| *v);
+    let known = if std::env::var_os("TRACE_NO_PATH_DECIDE").is_some() {
+        None
+    } else {
+        s.path.iter().find(|(l, _)| l == cond).map(|(_, v)| *v)
+    };
+    super::interp::PATH_ASKED.with(|c| c.set(c.get() + 1));
+    if known.is_some() {
+        super::interp::PATH_HIT.with(|c| c.set(c.get() + 1));
+    }
     match known {
         Some(true) => (Some(s), None),
         Some(false) => (None, Some(s)),

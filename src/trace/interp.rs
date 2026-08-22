@@ -26,6 +26,14 @@ use super::domain::{refuse_unknown, Arith, Cmp, Domain, Fun1, Fun2};
 use super::heap::{BodyId, TableId, Value};
 use super::state::{merge, split_path, State};
 
+thread_local! {
+    /// Is the path lookup ever load-bearing? Counts calls that reached it
+    /// (the domain could not fold the condition) and calls that found the
+    /// literal. See plans/tracing.md T5.
+    pub static PATH_ASKED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub static PATH_HIT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 pub enum Flow<D: Domain> {
     Normal,
     Break,
@@ -645,7 +653,15 @@ impl<'a, D: Domain> Interp<'a, D> {
         if let Some(b) = self.d.decide(cond) {
             return Some(b);
         }
-        st.path.iter().find(|(l, _)| l == cond).map(|(_, v)| *v)
+        if std::env::var_os("TRACE_NO_PATH_DECIDE").is_some() {
+            return None;
+        }
+        let hit = st.path.iter().find(|(l, _)| l == cond).map(|(_, v)| *v);
+        PATH_ASKED.with(|c| c.set(c.get() + 1));
+        if hit.is_some() {
+            PATH_HIT.with(|c| c.set(c.get() + 1));
+        }
+        hit
     }
 
     fn truthy(&mut self, v: &Value<D>) -> D::Bool {
@@ -809,7 +825,27 @@ impl<'a, D: Domain> Interp<'a, D> {
                             None => Vec::new(),
                         };
                         let kept: Multi<D, Value<D>> = match fs {
-                            Some(x) => vec![(x, a)],
+                            // The kept operand is the one whose truthiness
+                            // we JUST decided, so hand on the CONSTANT, not
+                            // the symbolic node we split on. `and` keeps a
+                            // falsy left operand, `or` a truthy one, so the
+                            // constant is `!is_and`.
+                            //
+                            // Without this the idiom leaks: `btn(u) and -1`
+                            // hands `Bool(U)` to the enclosing `or`, which
+                            // splits on U AGAIN and produces a state where
+                            // `v_input` is a bool - and four lines later
+                            // `v_input*d_half` is arithmetic on a boolean.
+                            // Only `Value::Bool` is rewritten; a falsy `Nil`
+                            // or a truthy table is already as concrete as it
+                            // gets.
+                            Some(x) => {
+                                let v = match a {
+                                    Value::Bool(_) => Value::Bool(self.d.boolean(!is_and)),
+                                    other => other,
+                                };
+                                vec![(x, v)]
+                            }
                             None => Vec::new(),
                         };
                         if taken.is_empty() || kept.is_empty() {

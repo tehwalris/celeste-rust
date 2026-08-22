@@ -294,6 +294,11 @@ mod tests {
                 it.d.graph.len(),
                 describe(&it, &next[0])
             );
+            eprintln!(
+                "[trace]   path lookups: {} reached, {} HIT",
+                crate::trace::interp::PATH_ASKED.with(|c| c.get()),
+                crate::trace::interp::PATH_HIT.with(|c| c.get())
+            );
             // WHY are there several? Print each state's path literals and
             // the player fields that actually differ, so "under-merged"
             // becomes a specific claim rather than an impression.
