@@ -19,6 +19,7 @@
 //! `./regen-generated.sh`, which regenerates into a scratch dir and only
 //! installs files that build.
 
+pub mod bdd;
 pub mod fuse;
 pub mod graph;
 pub mod kernel;

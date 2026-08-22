@@ -869,6 +869,146 @@ points drawn from genuinely different game states rather than from one
 neighbourhood - and that is the next thing, before any semantic-equality
 work is priced.
 
+(T12 ran that sample, concluded "not locality - it's real", and was
+WRONG. A wider sample cannot distinguish "constant" from "constant on
+the region the sampler reaches"; only a proof can, and the proof says
+almost none of it is boolean-structural. See T12.)
+
+## T12 - deciding the boolean layer
+
+T11 left a number that needed explaining: 50% of the emitted body
+evaluated to the same value at every one of 193 sampled game states.
+Two readings were open - dead algebra, or a sample too local to tell
+"always false" from "false around here" - and the plan said not to
+guess between them. This is what chasing it found, including two things
+that turned out to be wrong.
+
+### The measurement that killed the plan I had
+
+First, WHERE constancy is created. A false `And` is false because an
+operand is, so counting constant nodes measures how far it spread, not
+what started it. Call a node a SOURCE when it is constant and none of
+its operands is. There are 514, of which 439 are `And` and 34 are `Or`.
+
+Reading four of them suggested three rewrite rules: `a and not a`,
+`a or not a`, and `(a and x) or (not a and x)` - the last being exactly
+what a split-then-merge leaves behind, since `split` builds `g and c`
+and `g and not c` and `merge` ORs them back together. A tidy story.
+Counting how many sources each rule would actually fire on: **23 of
+514**. The other 491 are `And`/`Or` nodes with no shape in common. Four
+examples is an anecdote, and this anecdote was wrong.
+
+So "is this node constant" has to be DECIDED, not pattern-matched.
+
+### `transpile::bdd`
+
+An ROBDD over the graph's boolean layer. `And`, `Or`, `Not`,
+`ConstBool` and boolean `Sel` compose; everything else - comparisons,
+`TileFlagAt`, `Known`, `Free`, boolean input cells - is an opaque ATOM.
+Two nodes are equal exactly when their BDD references are equal, and
+constant is the case where the reference is a terminal.
+
+Atoms are INDEPENDENT free variables. That is where both the
+incompleteness and the guarantee come from: `x < 3` and `x > 5` are two
+atoms, so their conjunction looks satisfiable and the analysis will not
+fold it - but anything constant when the atoms range over ALL
+assignments is constant over the realizable ones, which are a subset.
+Incomplete and sound is the right side to be on.
+
+One exception to independence, and it exists because of T11: `fold`
+rewrites `Not(Lt(x,y))` to `Ge(x,y)`, so normalization is what turns a
+negated atom into a SECOND atom. Comparisons that are exact
+complements over the same operands therefore share one variable, used
+positively and negatively. Without that, T11 would have blinded the
+analysis it was meant to feed - and the effect is not marginal: on
+outcome 2 it took the constants found from 5 to 180 and the proved
+equalities from 1,788 to 4,357.
+
+### Where it goes, and what it is worth
+
+AFTER specialization, not before. The guard algebra only collapses once
+the buttons are constants; the same pass on the traced graph finds 4
+constants where the specialized arena has 180. Outcome 2, specialized:
+
+| | nodes |
+|---|---|
+| specialized arena | 10,510 |
+| rebuilt with the BDD off (control) | 10,510 |
+| rebuilt with it on | 4,714 |
+
+The control matters. `simplify` rebuilds through `fold`, so some of the
+shrinkage could have been normalization cascading on a second pass -
+and the control says it is none of it. All 55% is 183 substitutions
+(180 constants, 3 atom-equalities) cascading through `fold`: a `Sel`
+whose condition is decided drops an arm, and everything only that arm
+used goes with it.
+
+It is behind `Emit::decide`, OFF for the walk-driven path. That path
+produces the checked-in kernels, and a simplification that changes them
+has to be regenerated and read, not slipped in.
+
+End to end on the traced frame, which is what the whole exercise was
+for:
+
+| outcome | lines before T11 | after T11 | after T12 | variants |
+|---|---|---|---|---|
+| 1 | 10,801 | 5,661 | 2,833 | 40 -> 24 |
+| 2 | 18,576 | 9,482 | 4,454 | 40 -> 24 |
+| 3 | 13,267 | 7,435 | 3,577 | 40 -> 24 |
+
+The VARIANT column is the one that matters. T11 halved the emitted text
+and moved variants not at all; T12 moved them 40 -> 24, because two
+button assignments whose guards differed only in provably-dead algebra
+now specialize to identical nodes and dedup. A variant is a row the
+search has to hash and look up, and that is the cost that dominates
+running the frame - so this is the first change in the campaign that
+touches it.
+
+It is still 24 against a measured floor of 2 (the most distinct rows any
+of 51 input points produces, on outcomes 1 and 2). The remaining gap is
+numeric, not boolean: outcome 3's outputs genuinely differ 24 ways,
+and outcomes 1 and 2 are held apart by `deaths`, `delay_restart` and
+`will_restart`, which are numbers.
+
+### What it did NOT find, which is the more useful half
+
+Only 180 of ~10,500 nodes are provably constant. The census said 5,254
+were constant at 193 sampled points. Those two numbers are both right,
+and together they say the sampled constancy is NOT boolean-structural:
+it comes from numeric relationships between atoms that this analysis
+deliberately cannot see, or it is not real constancy at all and 193
+points was still not enough. **T11's "not locality - it's real" was
+overconfident and is hereby withdrawn.** The 193-point result never
+distinguished "constant" from "constant on the region the sampler
+reaches".
+
+Deciding that would need atom implications - `x < 3` implies
+`not (x > 5)` - which is a bounded extension (comparisons against
+different constants on the same expression, and the `Eq`/`Lt`/`Gt`
+triangle) and the obvious next thing to try if emitted size matters
+again.
+
+### Proved and deliberately not acted on
+
+4,357 further equalities on outcome 2: nodes that are provably the same
+boolean function without being the same node. `simplify` COUNTS them
+and leaves them alone, and only substitutes constants and atoms.
+
+The reason is that the graph is also evaluated ABSTRACTLY, in Kleene,
+per lane, and two forms of one function approximate it differently.
+`And(x, y)` decides `false` as soon as either side is known false; a
+select-shaped form of the same function answers `unknown` there.
+Substituting the coarser form is SOUND but makes lanes undecided that
+were decided - and an undecided `live` is not merely slower, it is a
+lane that may fall out of every outcome. Constants and atoms are the
+two cases where the representative is provably the most precise form
+there is: a constant is exact, and an atom's abstract value is its
+input's.
+
+That is a refusal to guess, not a permanent one. The measurement that
+would settle it is deopt volume in an actual search, which needs the
+traced path wired in.
+
 ## Stage 3 - was "control flow", now folded into Stage 2
 
 Written before Stage 2 had a concrete shape; T3 (control flow), T5 (loops)

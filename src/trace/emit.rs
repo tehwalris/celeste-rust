@@ -28,6 +28,23 @@ pub struct Lowered {
     pub variants: usize,
 }
 
+/// A node's subtree, to a bounded depth, as text. For DIAGNOSTICS: the
+/// graph is a DAG with tens of thousands of nodes, so printing one whole
+/// is useless, but three levels around a node says what kind of thing it
+/// is. Nodes past the depth limit print as `Op#id` so they can be looked
+/// up if they matter.
+pub fn show_tree(g: &Graph, root: NodeId, depth: usize) -> String {
+    let nd = g.get(root);
+    if depth == 0 {
+        return format!("{:?}#{}", nd.op, root);
+    }
+    if nd.args.is_empty() {
+        return format!("{:?}", nd.op);
+    }
+    let kids: Vec<String> = nd.args.iter().map(|a| show_tree(g, *a, depth - 1)).collect();
+    format!("{:?}({})", nd.op, kids.join(", "))
+}
+
 pub fn lower_frame(
     graph: &Graph,
     inputs: &[(u32, &'static str)],

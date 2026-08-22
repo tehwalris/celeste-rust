@@ -190,6 +190,14 @@ pub(crate) struct Emit {
     /// which of the two is DERIVED from whether the condition is uniform,
     /// so this one node replaces both side channels.
     pub(crate) ok: NodeId,
+    /// Run `bdd::simplify` on the SPECIALIZED arena before emitting.
+    ///
+    /// Off for the walk-driven path, which produces the checked-in
+    /// kernels: those are generated files, and a simplification that
+    /// changes them has to be regenerated and read, not slipped in. On
+    /// for a TRACED graph, where it is the difference between 10,510 and
+    /// 4,714 nodes.
+    pub(crate) decide: bool,
 }
 
 impl Emit {
@@ -228,6 +236,7 @@ impl Emit {
             node_of: HashMap::new(),
             live: 0,
             ok: 0,
+            decide: true,
         }
     }
 
@@ -582,6 +591,8 @@ pub(crate) fn emit_walk(program: &Program, witness_path: &str) -> Result<Emit> {
         node_of: HashMap::new(),
         live: 0,
         ok: 0,
+        // The checked-in kernels come from here. See the field.
+        decide: false,
     };
     let all = e.graph.leaf(GOp::ConstBool(true));
     e.live = all;

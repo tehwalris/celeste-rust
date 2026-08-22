@@ -700,7 +700,42 @@ pub(crate) struct Variant {
 pub(crate) fn emit_body(e: &mut Emit, of: &mut OutFields) -> Result<()> {
     // --- specialize every free assignment into ONE arena ---
     let mut sp = Graph::new();
-    let maps: Vec<Vec<NodeId>> = (0u8..64).map(|m| e.graph.specialize_into(m, &mut sp)).collect();
+    let mut maps: Vec<Vec<NodeId>> =
+        (0u8..64).map(|m| e.graph.specialize_into(m, &mut sp)).collect();
+
+    // --- decide the boolean layer, if asked ---
+    //
+    // HERE, after specializing, and not on the traced graph: the guard
+    // algebra only collapses once the buttons are constants, so the same
+    // pass applied a step earlier finds a handful of nodes instead of a
+    // fifth of them. Measured on a traced frame's outcome 2: 10,510
+    // specialized nodes -> 4,714, from 183 substitutions cascading
+    // through `fold`. The control - the identical rebuild with the BDD
+    // switched off - removes exactly nothing, so none of that is the
+    // rebuild.
+    if e.decide {
+        let mut roots: Vec<NodeId> = Vec::new();
+        for m in 0..64usize {
+            roots.extend(of.fields.iter().map(|f| maps[m][f.node as usize]));
+            roots.push(maps[m][e.ok as usize]);
+            roots.push(maps[m][e.live as usize]);
+        }
+        let (sp2, nodemap, _) = crate::transpile::bdd::simplify(&sp, &roots, 1 << 22);
+        // Only the roots are remapped, because only the roots are read.
+        // Anything else would be `UNREACHABLE` and would panic on use,
+        // which is the point of that sentinel.
+        for m in 0..64usize {
+            let mut fresh = vec![crate::transpile::bdd::UNREACHABLE; e.graph.len()];
+            for f in of.fields.iter() {
+                fresh[f.node as usize] = nodemap[maps[m][f.node as usize] as usize];
+            }
+            fresh[e.ok as usize] = nodemap[maps[m][e.ok as usize] as usize];
+            fresh[e.live as usize] = nodemap[maps[m][e.live as usize] as usize];
+            maps[m] = fresh;
+        }
+        sp = sp2;
+    }
+    let maps = maps;
     let n = sp.len();
 
     // Two assignments are the same successor iff they agree on every

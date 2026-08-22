@@ -415,24 +415,36 @@ mod tests {
                     // merge, since agreeing at K points is necessary and not
                     // sufficient.
                     if n == 2 {
-                        // Its own points, and deliberately crude: for a
-                        // FINGERPRINT what matters is that they separate,
-                        // not that they are game-meaningful. Bump one
-                        // numeric input each time.
                         // MANY points, varying EVERY input. Eight points
                         // bumping one cell each gave 97 fingerprints with
                         // buckets of 8,535 - which is not duplication, it
                         // is collision: two nodes share a fingerprint
                         // whenever they happen to agree everywhere it
-                        // looks. Deltas stay small so that map lookups
-                        // stay in range and every node still evaluates.
-                        let mut probe_pts: Vec<Vec<Conc>> = vec![f.iface.init.clone()];
+                        // looks.
+                        //
+                        // TWO FAMILIES, because they answer different
+                        // questions. NEAR is one game state jittered by
+                        // +-8, which is what the first census used; it
+                        // reported 58% of the body as never varying, and
+                        // a jitter that small cannot tell "always false"
+                        // from "false in this neighbourhood". WIDE
+                        // resamples each slot across the room - a
+                        // different game situation, not a nudge - so a
+                        // node constant over BOTH families is evidence of
+                        // dead algebra rather than of locality. Wide
+                        // points do make some nodes stop evaluating (a
+                        // map lookup off the room), which `eval_all`
+                        // reports as `None` and the count below carries.
                         let mut rng: u64 = 0x9E3779B97F4A7C15;
+                        let mut roll = |m: i64| -> i64 {
+                            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                            (rng >> 33) as i64 % m
+                        };
+                        let mut near: Vec<Vec<Conc>> = vec![f.iface.init.clone()];
                         for _ in 0..96 {
                             let mut pt = f.iface.init.clone();
                             for slot in pt.iter_mut() {
-                                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-                                let r = (rng >> 33) as i64;
+                                let r = roll(1 << 20);
                                 *slot = match *slot {
                                     Conc::Num(v) => Conc::Num(
                                         v + crate::pico8_num::Pico8Num::from_i16(
@@ -442,8 +454,37 @@ mod tests {
                                     Conc::Bool(_) => Conc::Bool(r & 1 == 0),
                                 };
                             }
-                            probe_pts.push(pt);
+                            near.push(pt);
                         }
+                        let mut wide: Vec<Vec<Conc>> = Vec::new();
+                        for _ in 0..96 {
+                            let mut pt = f.iface.init.clone();
+                            for slot in pt.iter_mut() {
+                                let r = roll(1 << 20);
+                                *slot = match *slot {
+                                    // A spread of magnitudes rather than
+                                    // one range: positions want the whole
+                                    // room, speeds want single digits,
+                                    // timers want zero, and the census
+                                    // does not know which slot is which.
+                                    Conc::Num(v) => {
+                                        let d = [0i16, 1, -1, 4, -4, 16, -16, 64, -64]
+                                            [(r as usize) % 9];
+                                        let base = if r & 0x100 == 0 {
+                                            v
+                                        } else {
+                                            crate::pico8_num::Pico8Num::from_i16(0)
+                                        };
+                                        Conc::Num(base + crate::pico8_num::Pico8Num::from_i16(d))
+                                    }
+                                    Conc::Bool(_) => Conc::Bool(r & 1 == 0),
+                                };
+                            }
+                            wide.push(pt);
+                        }
+                        let n_near = near.len();
+                        let mut probe_pts = near;
+                        probe_pts.extend(wide);
                         let mut cols: Vec<Vec<Option<Conc>>> = Vec::new();
                         for pt in &probe_pts {
                             let env = super::super::eval::Env {
@@ -486,7 +527,6 @@ mod tests {
                         let mut by_size: Vec<_> = buckets.iter().collect();
                         by_size.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
                         for (fp, ids) in by_size.iter().take(2) {
-                            let constant = fp.iter().all(|x| *x == fp[0]);
                             let mut ops: std::collections::BTreeMap<String, usize> =
                                 Default::default();
                             for id in ids.iter() {
@@ -495,24 +535,232 @@ mod tests {
                             let mut top: Vec<_> = ops.into_iter().collect();
                             top.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
                             eprintln!(
-                                "[emit]     bucket of {}: constant over all points = {}, \
-                                 value {:?}, ops {:?}",
+                                "[emit]     bucket of {}: constant near = {}, constant everywhere \
+                                 = {}, value {:?}, ops {:?}",
                                 ids.len(),
-                                constant,
+                                fp[..n_near].iter().all(|x| *x == fp[0]),
+                                fp.iter().all(|x| *x == fp[0]),
                                 fp[0],
                                 &top[..top.len().min(5)]
                             );
                         }
+                        // THE QUESTION the wide family exists to answer.
+                        // A node constant over the near points alone may
+                        // just be one whose branch this state does not
+                        // take; a node constant over both families is a
+                        // candidate for being genuinely dead.
+                        let (mut c_near, mut c_all) = (0usize, 0usize);
+                        for fp in buckets.keys() {
+                            let n = buckets[fp].len();
+                            if fp[..n_near].iter().all(|x| *x == fp[0]) {
+                                c_near += n;
+                                if fp.iter().all(|x| *x == fp[0]) {
+                                    c_all += n;
+                                }
+                            }
+                        }
                         eprintln!(
-                            "[emit]   DUPLICATION: {} reachable nodes evaluate ({} do not); {} distinct \
-                             fingerprints over {} points, so a perfect semantic dedup would keep {:.0}%. \
-                             Biggest buckets: {:?}",
+                            "[emit]   DUPLICATION: {} reachable nodes evaluate somewhere ({} never do); \
+                             {} distinct fingerprints over {} points ({} near + {} wide), so a perfect \
+                             semantic dedup would keep {:.0}%. Biggest buckets: {:?}",
                             live_nodes,
                             undecided,
                             buckets.len(),
                             probe_pts.len(),
+                            n_near,
+                            probe_pts.len() - n_near,
                             100.0 * buckets.len() as f64 / live_nodes as f64,
                             &sizes[..sizes.len().min(6)]
+                        );
+                        eprintln!(
+                            "[emit]   CONSTANCY: {} nodes ({:.0}%) never vary over the NEAR points; \
+                             of those {} ({:.0}% of the body) also never vary over the WIDE ones",
+                            c_near,
+                            100.0 * c_near as f64 / live_nodes as f64,
+                            c_all,
+                            100.0 * c_all as f64 / live_nodes as f64,
+                        );
+
+                        // WHERE constancy is CREATED. A false `And` is
+                        // false because an operand is, so counting the
+                        // constant nodes says how far it spread, not what
+                        // started it. A SOURCE is a node that is constant
+                        // while none of its operands is: that is where an
+                        // analysis would have to look, and its op tells
+                        // which analysis.
+                        let is_const = |id: crate::transpile::graph::NodeId| -> Option<
+                            Option<(u8, i32)>,
+                        > {
+                            let mut it = cols.iter().map(|c| {
+                                c[id as usize].map(|v| match v {
+                                    Conc::Num(x) => (0u8, x.as_raw_u32() as i32),
+                                    Conc::Bool(b) => (1u8, b as i32),
+                                })
+                            });
+                            let first = it.next().unwrap();
+                            if it.all(|x| x == first) {
+                                Some(first)
+                            } else {
+                                None
+                            }
+                        };
+                        let mut src_ops: std::collections::BTreeMap<String, usize> =
+                            Default::default();
+                        let mut examples: Vec<crate::transpile::graph::NodeId> = Vec::new();
+                        for id in seen.iter().copied() {
+                            if is_const(id).is_none() {
+                                continue;
+                            }
+                            if sp.get(id).args.iter().any(|a| is_const(*a).is_some()) {
+                                continue;
+                            }
+                            *src_ops.entry(format!("{:?}", sp.get(id).op)).or_default() += 1;
+                            if examples.len() < 4 && !sp.get(id).args.is_empty() {
+                                examples.push(id);
+                            }
+                        }
+                        let mut top: Vec<_> = src_ops.iter().map(|(k, v)| (k.clone(), *v)).collect();
+                        top.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+                        eprintln!(
+                            "[emit]   SOURCES of constancy: {} nodes are constant with no constant \
+                             operand; ops {:?}",
+                            src_ops.values().sum::<usize>(),
+                            &top[..top.len().min(6)]
+                        );
+                        for id in examples {
+                            eprintln!(
+                                "[emit]     source {:?} = {} (operands vary)",
+                                is_const(id).unwrap(),
+                                super::super::emit::show_tree(&sp, id, 3)
+                            );
+                        }
+                        // WHICH SHAPES. Four examples is an anecdote; a
+                        // rewrite rule needs a count. Everything here is a
+                        // guess about the shape until this prints, and
+                        // "other" is the honest bucket - it is what says
+                        // whether a handful of rules would actually clear
+                        // the sources or only the ones I happened to look
+                        // at.
+                        let compl = |a: crate::transpile::graph::NodeId,
+                                     b: crate::transpile::graph::NodeId|
+                         -> bool {
+                            use crate::transpile::graph::Op as O;
+                            let (na, nb) = (sp.get(a), sp.get(b));
+                            if na.op == O::Not && na.args[0] == b {
+                                return true;
+                            }
+                            if nb.op == O::Not && nb.args[0] == a {
+                                return true;
+                            }
+                            // `fold` rewrites `Not(Lt)` to `Ge`, so a
+                            // complementary PAIR no longer shares a `Not`.
+                            let opposite = matches!(
+                                (&na.op, &nb.op),
+                                (O::Lt, O::Ge)
+                                    | (O::Ge, O::Lt)
+                                    | (O::Le, O::Gt)
+                                    | (O::Gt, O::Le)
+                            );
+                            opposite && na.args == nb.args
+                        };
+                        let mut shapes: std::collections::BTreeMap<&str, usize> =
+                            Default::default();
+                        let mut others: Vec<crate::transpile::graph::NodeId> = Vec::new();
+                        for id in seen.iter().copied() {
+                            if is_const(id).is_none()
+                                || sp.get(id).args.iter().any(|a| is_const(*a).is_some())
+                            {
+                                continue;
+                            }
+                            use crate::transpile::graph::Op as O;
+                            let nd = sp.get(id);
+                            let two = nd.args.len() == 2;
+                            let kind = if two && nd.op == O::And && compl(nd.args[0], nd.args[1]) {
+                                "and(a, not a)"
+                            } else if two && nd.op == O::Or && compl(nd.args[0], nd.args[1]) {
+                                "or(a, not a)"
+                            } else if two
+                                && nd.op == O::Or
+                                && sp.get(nd.args[0]).op == O::And
+                                && sp.get(nd.args[1]).op == O::And
+                                && {
+                                    let (l, r) = (sp.get(nd.args[0]), sp.get(nd.args[1]));
+                                    // The MERGE shape: split gave `g and c`
+                                    // and `g and not c`, and joining them
+                                    // is `g` again.
+                                    (0..2).any(|i: usize| {
+                                        (0..2).any(|j: usize| {
+                                            compl(l.args[i], r.args[j])
+                                                && l.args[1 - i] == r.args[1 - j]
+                                        })
+                                    })
+                                }
+                            {
+                                "or(and(a,x), and(not a,x))"
+                            } else if two && (nd.op == O::And || nd.op == O::Or) {
+                                "other and/or"
+                            } else {
+                                "other"
+                            };
+                            *shapes.entry(kind).or_default() += 1;
+                            if kind.starts_with("other") && others.len() < 3 {
+                                others.push(id);
+                            }
+                        }
+                        let mut sh: Vec<_> = shapes.into_iter().collect();
+                        sh.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+                        eprintln!("[emit]   SOURCE SHAPES: {:?}", sh);
+                        for id in others {
+                            eprintln!(
+                                "[emit]     unclassified {:?} = {}",
+                                is_const(id).unwrap(),
+                                super::super::emit::show_tree(&sp, id, 4)
+                            );
+                        }
+                    }
+
+                    // Can the BDD find what the census found by
+                    // SAMPLING? The constant algebra lives here, in the
+                    // SPECIALISED arena where the buttons are pinned -
+                    // not in the traced graph - so this is the arena the
+                    // question is actually about.
+                    {
+                        let mut roots: Vec<crate::transpile::graph::NodeId> = Vec::new();
+                        for m in 0..64usize {
+                            for (_, nd, _) in &o.fields {
+                                roots.push(maps[m][*nd as usize]);
+                            }
+                            roots.push(maps[m][o.ok as usize]);
+                            roots.push(maps[m][o.guard as usize]);
+                        }
+                        let (_, _, st) =
+                            crate::transpile::bdd::simplify(&sp, &roots, 1 << 22);
+                        // THE CONTROL. `simplify` rebuilds through
+                        // `fold`, so some of the shrinkage is just
+                        // normalization cascading on a second pass and
+                        // has nothing to do with the BDD. A zero-node
+                        // budget makes every boolean an atom, which
+                        // leaves exactly the rebuild - so the difference
+                        // between the two is what deciding actually
+                        // bought.
+                        let (_, _, refold) = crate::transpile::bdd::simplify(&sp, &roots, 0);
+                        eprintln!(
+                            "[emit]   outcome {} REFOLD ONLY (control): {} -> {} nodes",
+                            n, refold.before, refold.after
+                        );
+                        eprintln!(
+                            "[emit]   outcome {} SPECIALISED+DECIDED: {} -> {} nodes; {} atoms, \
+                             {} bdd nodes, capped = {}; {} constant, {} equal to an atom, \
+                             {} more equalities proved",
+                            n,
+                            st.before,
+                            st.after,
+                            st.atoms,
+                            st.bdd_nodes,
+                            st.overflowed,
+                            st.constants,
+                            st.to_atom,
+                            st.mergeable
                         );
                     }
 
@@ -722,28 +970,7 @@ mod tests {
                 // exactly when they fold to the same tree. Print the
                 // first two that differ, shallowly.
                 if n == 1 {
-                    let show = |sp: &crate::transpile::graph::Graph,
-                                root: crate::transpile::graph::NodeId,
-                                depth: usize|
-                     -> String {
-                        fn go(
-                            g: &crate::transpile::graph::Graph,
-                            id: crate::transpile::graph::NodeId,
-                            d: usize,
-                        ) -> String {
-                            let nd = g.get(id);
-                            if d == 0 {
-                                return format!("{:?}#{}", nd.op, id);
-                            }
-                            if nd.args.is_empty() {
-                                return format!("{:?}", nd.op);
-                            }
-                            let kids: Vec<String> =
-                                nd.args.iter().map(|a| go(g, *a, d - 1)).collect();
-                            format!("{:?}({})", nd.op, kids.join(", "))
-                        }
-                        go(sp, root, depth)
-                    };
+                    let show = super::super::emit::show_tree;
                     if let Some((fp, fnode, _)) =
                         o.fields.iter().find(|(q, _, _)| iface::show(q) == "freeze")
                     {
