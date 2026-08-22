@@ -88,6 +88,33 @@ pub trait Domain {
     fn sel_num(&mut self, c: &Self::Bool, t: &Self::Num, f: &Self::Num) -> Self::Num;
     fn sel_bool(&mut self, c: &Self::Bool, t: &Self::Bool, f: &Self::Bool) -> Self::Bool;
 
+    /// `mget(x, y)` with coordinates not known at trace time. The map is
+    /// data and it is concrete, so this only arises inside a tile scan
+    /// whose bounds came out symbolic - and there the emitted kernel does
+    /// it in one instruction (`zn_mget`) rather than a lookup table.
+    fn mget(&mut self, x: &Self::Num, y: &Self::Num) -> Result<Self::Num>;
+
+    /// `tile_flag_at(x, y, w, h, flag)` where the coordinates are NOT
+    /// known at trace time.
+    ///
+    /// This has to be a primitive rather than traced into, for the same
+    /// reason the IR pipeline makes it one (`zn_tile_flag_at`): the Lua
+    /// version scans a tile range with a loop whose bounds are derived
+    /// from x and y, so tracing it with a symbolic x would need the
+    /// unroll machinery for something the emitted kernel does in one
+    /// call. Four of the cart's six symbolic loops are this function.
+    ///
+    /// The caller folds it when everything IS known, so the concrete
+    /// domain never reaches here.
+    fn tile_flag_at(
+        &mut self,
+        x: &Self::Num,
+        y: &Self::Num,
+        w: &Self::Num,
+        h: &Self::Num,
+        flag: &Self::Num,
+    ) -> Result<Self::Bool>;
+
     /// A fresh UNKNOWN boolean - one of the search's free choices.
     ///
     /// The oracle has no such thing: to run a frame concretely you supply
@@ -95,6 +122,12 @@ pub trait Domain {
     /// inventing one. That asymmetry is real and worth the loud failure -
     /// it is the difference between running the game and compiling it.
     fn unknown_bool(&mut self) -> Result<Self::Bool>;
+
+    /// How much graph there is, for the tracer's budget check. Zero for a
+    /// domain that does not build one.
+    fn node_count(&self) -> usize {
+        0
+    }
 
     /// A number this value definitely is, if the domain knows it. The
     /// interpreter needs this for things the HEAP depends on - an array
@@ -169,6 +202,12 @@ impl Domain for Concrete {
         } else {
             *f
         }
+    }
+    fn mget(&mut self, _: &P8, _: &P8) -> Result<P8> {
+        bail!("mget with unknown coordinates cannot happen concretely")
+    }
+    fn tile_flag_at(&mut self, _: &P8, _: &P8, _: &P8, _: &P8, _: &P8) -> Result<bool> {
+        bail!("tile_flag_at with unknown coordinates cannot happen concretely")
     }
     fn unknown_bool(&mut self) -> Result<bool> {
         bail!("the concrete domain has no unknown booleans - supply real inputs")
@@ -285,6 +324,19 @@ impl Domain for Symbolic {
     fn sel_bool(&mut self, c: &NodeId, t: &NodeId, f: &NodeId) -> NodeId {
         self.graph.fold(Op::Sel, vec![*c, *t, *f])
     }
+    fn mget(&mut self, x: &NodeId, y: &NodeId) -> Result<NodeId> {
+        Ok(self.graph.fold(Op::Mget, vec![*x, *y]))
+    }
+    fn tile_flag_at(
+        &mut self,
+        x: &NodeId,
+        y: &NodeId,
+        w: &NodeId,
+        h: &NodeId,
+        flag: &NodeId,
+    ) -> Result<NodeId> {
+        Ok(self.graph.fold(Op::TileFlagAt, vec![*x, *y, *w, *h, *flag]))
+    }
     fn unknown_bool(&mut self) -> Result<NodeId> {
         if self.frees >= 6 {
             bail!("more than six free choices - the kernels only model six buttons");
@@ -292,6 +344,9 @@ impl Domain for Symbolic {
         let b = self.frees;
         self.frees += 1;
         Ok(self.graph.leaf(Op::Free(b)))
+    }
+    fn node_count(&self) -> usize {
+        self.graph.len()
     }
     fn as_const(&self, v: &NodeId) -> Option<P8> {
         self.as_p8(*v)

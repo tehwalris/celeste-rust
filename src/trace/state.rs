@@ -51,6 +51,17 @@ pub struct State<D: Domain> {
     /// already assumed is DEAD and never explored, and a condition already
     /// assumed decides immediately.
     pub path: Vec<(D::Bool, bool)>,
+    /// Conditions that must HOLD for this state to be a correct answer.
+    ///
+    /// Unlike `path`, these are not assumptions the tracer made - they are
+    /// obligations it is passing to run time. The unroll bound is the
+    /// case: the tracer stops after N iterations and requires that the
+    /// loop had actually finished, so a bound that is too small fails
+    /// loudly at run time instead of silently truncating the loop. The
+    /// heuristic is then performance-only, which is the whole point.
+    ///
+    /// This is `Emit::ok` in the graph pipeline.
+    pub ok: Vec<D::Bool>,
 }
 
 impl<D: Domain> Clone for State<D> {
@@ -61,6 +72,7 @@ impl<D: Domain> Clone for State<D> {
             scope: self.scope,
             stack: self.stack.clone(),
             path: self.path.clone(),
+            ok: self.ok.clone(),
         }
     }
 }
@@ -164,6 +176,17 @@ pub fn merge<D: Domain>(
         scope: t.scope,
         stack: t.stack.clone(),
         path: path.to_vec(),
+        // Both sides' obligations survive the merge: a lane that took
+        // either arm still has to satisfy whatever that arm required.
+        ok: {
+            let mut v = t.ok.clone();
+            for c in &f.ok {
+                if !v.contains(c) {
+                    v.push(c.clone());
+                }
+            }
+            v
+        },
     }))
 }
 
@@ -249,6 +272,7 @@ mod tests {
             scope: 0,
             stack: Vec::new(),
             path: Vec::new(),
+            ok: Vec::new(),
         };
         s.globals = s.heap.new_table();
         s.scope = s.heap.new_scope(None);
@@ -295,7 +319,7 @@ mod tests {
     #[test]
     fn differing_shapes_do_not_merge() {
         let mut d = Symbolic::default();
-        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), path: Vec::new() };
+        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), path: Vec::new(), ok: Vec::new() };
         s.globals = s.heap.new_table();
         s.scope = s.heap.new_scope(None);
         let obj = s.heap.new_table();
@@ -318,7 +342,7 @@ mod tests {
     #[test]
     fn garbage_does_not_prevent_a_merge() {
         let mut d = Symbolic::default();
-        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), path: Vec::new() };
+        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), path: Vec::new(), ok: Vec::new() };
         s.globals = s.heap.new_table();
         s.scope = s.heap.new_scope(None);
         let mut f = s.clone();

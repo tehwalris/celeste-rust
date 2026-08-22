@@ -72,14 +72,28 @@ pub struct Interp<'a, D: Domain> {
     /// Function bodies, referred to by id from closures - the AST outlives
     /// the heap, so the heap stores an index rather than a reference.
     bodies: Vec<&'a ast::FunctionBody>,
-    /// The cart, for `mget`/`fget`. Optional so the unit tests can run
-    /// programs that never touch the map.
+    /// The cart and the room's collision cache, for `mget`/`fget` and
+    /// `tile_flag_at`. Optional so the unit tests can run programs that
+    /// never touch the map.
     pub cart: Option<std::sync::Arc<celeste_core::cart_data::CartData>>,
+    pub cache: Option<std::sync::Arc<celeste_core::collision_cache::CollisionCache>>,
+    /// Budgets, so a blow-up is a DIAGNOSIS rather than a hang. A tracer
+    /// that runs forever tells you nothing about where it went wrong; one
+    /// that stops at a limit tells you exactly which construct did it.
+    pub max_states: usize,
+    pub max_nodes: usize,
 }
 
 impl<'a, D: Domain> Interp<'a, D> {
     pub fn new(d: D) -> Self {
-        Interp { d, bodies: Vec::new(), cart: None }
+        Interp {
+            d,
+            bodies: Vec::new(),
+            cart: None,
+            cache: None,
+            max_states: 256,
+            max_nodes: 2_000_000,
+        }
     }
 
     fn intern_body(&mut self, b: &'a ast::FunctionBody) -> BodyId {
@@ -101,6 +115,21 @@ impl<'a, D: Domain> Interp<'a, D> {
                 next.extend(self.exec_stmt(stmt, s)?);
             }
             live = self.collapse(next)?;
+            if live.len() > self.max_states {
+                bail!(
+                    "frontier grew to {} states (limit {}) - something is fanning out \
+                     without merging back",
+                    live.len(),
+                    self.max_states
+                );
+            }
+            if self.d.node_count() > self.max_nodes {
+                bail!(
+                    "graph grew to {} nodes (limit {})",
+                    self.d.node_count(),
+                    self.max_nodes
+                );
+            }
             if live.iter().all(|(_, f)| !f.is_normal()) {
                 break;
             }
@@ -418,27 +447,136 @@ impl<'a, D: Domain> Interp<'a, D> {
         let mut all: Outcome<D> = Vec::new();
         // Bounds can themselves fan out (they are expressions), so each
         // combination is its own loop.
-        let mut bounds: Multi<D, (P8, P8)> = Vec::new();
+        let mut bounds: Multi<D, Bound<D>> = Vec::new();
         for (s, from) in self.eval(f.start(), st)? {
             for (s, to) in self.eval(f.end(), s)? {
                 let (Value::Num(a), Value::Num(b)) = (&from, &to) else {
                     bail!("numeric for bounds must be numbers");
                 };
-                let a = self
-                    .d
-                    .as_const(a)
-                    .ok_or_else(|| refuse_unknown("a numeric for's start"))?;
-                let b = self
-                    .d
-                    .as_const(b)
-                    .ok_or_else(|| refuse_unknown("a numeric for's limit"))?;
-                bounds.push((s, (a, b)));
+                match (self.d.as_const(a), self.d.as_const(b)) {
+                    (Some(a), Some(b)) => bounds.push((s, Bound::Concrete(a, b))),
+                    // Either end unknown: unroll under a heuristic and
+                    // require that the loop had finished. The START can be
+                    // symbolic too - the tile scans begin at
+                    // `max(0, flr(x/8))` - so the loop variable is
+                    // `start + k`, itself a symbolic value.
+                    _ => bounds.push((s, Bound::Symbolic(a.clone(), b.clone()))),
+                }
             }
         }
-        for (s, (from, to)) in bounds {
-            all.extend(self.run_for(f, &name, from, to, s)?);
+        for (s, b) in bounds {
+            all.extend(match b {
+                Bound::Concrete(from, to) => self.run_for(f, &name, from, to, s)?,
+                Bound::Symbolic(start, limit) => {
+                    let limit_src = f.end().to_string().trim().to_string();
+                    let n = unroll_bound(&limit_src).ok_or_else(|| {
+                        anyhow!(
+                            "numeric for with symbolic limit `{}` has no unroll bound - \
+                             add one to `unroll_bound`",
+                            limit_src
+                        )
+                    })?;
+                    self.run_for_symbolic(f, &name, start, limit, s, n)?
+                }
+            });
         }
         Ok(all)
+    }
+
+    /// Unroll a loop whose limit is not known at trace time, masking each
+    /// iteration by `i <= limit` and merging straight away - so the result
+    /// is ONE state whose values are nested selects, which is what
+    /// `mask_loop` produced as a rewrite.
+    ///
+    /// After the bound runs out, the state is REQUIRED to have finished.
+    /// Too small a bound therefore fails at run time rather than silently
+    /// truncating the loop, which is what makes the number above a
+    /// performance choice instead of a correctness one.
+    fn run_for_symbolic(
+        &mut self,
+        f: &'a ast::NumericFor,
+        name: &str,
+        start: D::Num,
+        limit: D::Num,
+        s: State<D>,
+        bound: u32,
+    ) -> Result<Outcome<D>> {
+        let mut running: Outcome<D> = vec![(s, Flow::Normal)];
+        for k in 0..bound {
+            let mut next: Outcome<D> = Vec::new();
+            for (s, fl) in running {
+                if !fl.is_normal() {
+                    next.push((s, fl));
+                    continue;
+                }
+                let off = self.d.num(P8::from_i16(k as i16));
+                let iv = self.d.arith(Arith::Add, &start, &off)?;
+                let cond = self.d.compare(Cmp::Le, &iv, &limit)?;
+                match self.decide_on_path(&cond, &s) {
+                    // Past the limit on this path: nothing more to do, but
+                    // the state carries on after the loop.
+                    Some(false) => next.push((s, Flow::Normal)),
+                    Some(true) => next.extend(self.for_body(f, name, &iv, s)?),
+                    None => {
+                        let path = s.path.clone();
+                        let (ts, fs) = split_path(s, &cond);
+                        let t = match ts {
+                            Some(x) => self.for_body(f, name, &iv, x)?,
+                            None => Vec::new(),
+                        };
+                        let fo: Outcome<D> = match fs {
+                            Some(x) => vec![(x, Flow::Normal)],
+                            None => Vec::new(),
+                        };
+                        if t.is_empty() || fo.is_empty() {
+                            next.extend(t);
+                            next.extend(fo);
+                        } else {
+                            next.extend(self.merge_outcomes(&cond, &path, t, fo)?);
+                        }
+                    }
+                }
+            }
+            running = self.collapse(next)?;
+        }
+        // The obligation: by now the loop must be over.
+        let off = self.d.num(P8::from_i16(bound as i16));
+        let iv = self.d.arith(Arith::Add, &start, &off)?;
+        let over = self.d.compare(Cmp::Le, &iv, &limit)?;
+        let finished = self.d.not(&over);
+        for (s, fl) in running.iter_mut() {
+            let _ = &fl;
+            if !s.ok.contains(&finished) {
+                s.ok.push(finished.clone());
+            }
+        }
+        Ok(running
+            .into_iter()
+            .map(|(s, fl)| (s, if matches!(fl, Flow::Break) { Flow::Normal } else { fl }))
+            .collect())
+    }
+
+    /// One iteration of a numeric `for`, in its own scope.
+    fn for_body(
+        &mut self,
+        f: &'a ast::NumericFor,
+        name: &str,
+        iv: &D::Num,
+        mut cur: State<D>,
+    ) -> Result<Outcome<D>> {
+        let body_scope = cur.heap.new_scope(Some(cur.scope));
+        cur.heap.declare(body_scope, name, Value::Num(iv.clone()));
+        let outer = cur.scope;
+        cur.scope = body_scope;
+        let mut out = Vec::new();
+        for (mut s2, f2) in self.exec_block(f.block(), cur)? {
+            s2.scope = outer;
+            match f2 {
+                Flow::Break => out.push((s2, Flow::Normal)),
+                other => out.push((s2, other)),
+            }
+        }
+        Ok(out)
     }
 
     fn run_for(
@@ -1068,16 +1206,62 @@ impl<'a, D: Domain> Interp<'a, D> {
                     .clone()
                     .ok_or_else(|| anyhow!("{}: no cart loaded", name))?;
                 let (a, b) = (num(&args[0])?, num(&args[1])?);
-                let (x, y) = (
-                    self.d.as_const(&a).ok_or_else(|| refuse_unknown("an mget/fget x"))?,
-                    self.d.as_const(&b).ok_or_else(|| refuse_unknown("an mget/fget y"))?,
+                match (self.d.as_const(&a), self.d.as_const(&b)) {
+                    (Some(x), Some(y)) => {
+                        if name == "mget" {
+                            let t = cart.mget(x, y)?;
+                            (st, Value::Num(self.d.num(P8::from_i16(t as i16))))
+                        } else {
+                            let r = cart.fget(x, y)?;
+                            (st, Value::Bool(self.d.boolean(r)))
+                        }
+                    }
+                    // Inside a tile scan whose bounds came out symbolic.
+                    _ if name == "mget" => (st, Value::Num(self.d.mget(&a, &b)?)),
+                    _ => bail!("fget with unknown arguments is not modelled"),
+                }
+            }
+            // Native, exactly as the IR pipeline makes it. With concrete
+            // coordinates it folds to a constant here; otherwise it is one
+            // graph node, where tracing the Lua would have been a scan
+            // loop over a symbolic range.
+            "tile_flag_at" => {
+                let (x, y, w, h, fl) = (
+                    num(&args[0])?,
+                    num(&args[1])?,
+                    num(&args[2])?,
+                    num(&args[3])?,
+                    num(&args[4])?,
                 );
-                if name == "mget" {
-                    let t = cart.mget(x, y)?;
-                    (st, Value::Num(self.d.num(P8::from_i16(t as i16))))
-                } else {
-                    let r = cart.fget(x, y)?;
-                    (st, Value::Bool(self.d.boolean(r)))
+                let known = |d: &D, v: &D::Num| d.as_const(v);
+                match (
+                    known(&self.d, &x),
+                    known(&self.d, &y),
+                    known(&self.d, &w),
+                    known(&self.d, &h),
+                    known(&self.d, &fl),
+                ) {
+                    (Some(x), Some(y), Some(w), Some(h), Some(f)) => {
+                        let cache = self
+                            .cache
+                            .clone()
+                            .ok_or_else(|| anyhow!("tile_flag_at: no collision cache"))?;
+                        let cart = self
+                            .cart
+                            .clone()
+                            .ok_or_else(|| anyhow!("tile_flag_at: no cart"))?;
+                        let r = if f.as_i16() != Some(0) {
+                            false
+                        } else {
+                            let gi = |v: P8| v.as_i16().ok_or_else(|| anyhow!("tile_flag_at: non-integer"));
+                            cache.solid_at(&cart, gi(x)?, gi(y)?, gi(w)?, gi(h)?)?
+                        };
+                        (st, Value::Bool(self.d.boolean(r)))
+                    }
+                    _ => {
+                        let b = self.d.tile_flag_at(&x, &y, &w, &h, &fl)?;
+                        (st, Value::Bool(b))
+                    }
                 }
             }
             "print" | "__print" => (st, Value::Nil),
@@ -1115,10 +1299,42 @@ impl<'a, D: Domain> Interp<'a, D> {
     }
 }
 
+/// A numeric `for`'s limit: known now, or only at run time.
+enum Bound<D: Domain> {
+    Concrete(P8, P8),
+    Symbolic(D::Num, D::Num),
+}
+
 /// A resolved table key. Concrete by construction - see `index_key`.
 enum Key {
     Field(String),
     Index(i16),
+}
+
+/// How far to unroll a loop whose limit the tracer cannot know.
+///
+/// Keyed by the LIMIT EXPRESSION'S SOURCE TEXT, not a line number: the
+/// chunk concatenates the two builtin files ahead of the cart, so absolute
+/// lines move whenever those change.
+///
+/// This is a PERFORMANCE choice only. Every unrolled loop carries a
+/// run-time predicate that it actually finished, so a bound that is too
+/// small - or a key that stops matching - fails loudly instead of quietly
+/// truncating the loop.
+///
+/// The cart has exactly two such loops, the pixel-steppers in
+/// `obj.move_x` / `obj.move_y`. The other four symbolic loops were inside
+/// `tile_flag_at`, which is a native builtin here.
+fn unroll_bound(limit_src: &str) -> Option<u32> {
+    match limit_src {
+        // `for i=start,abs(amount)` / `for i=0,abs(amount)`: the player
+        // moves well under 8 px in a frame.
+        "abs(amount)" => Some(8),
+        // The tile scans in `spikes_at` / `solid_at`: a range clamped to
+        // [0, 15] but only ever a tile or two wide for these hitboxes.
+        "min(15,(x+w-1)/8)" | "min(15,(y+h-1)/8)" => Some(3),
+        _ => None,
+    }
 }
 
 /// The one index at which two paths disagree, if there is exactly one.
@@ -1177,7 +1393,7 @@ mod tests {
         let mut heap: Heap<D> = Heap::default();
         let globals = heap.new_table();
         let scope = heap.new_scope(None);
-        State { heap, globals, scope, stack: Vec::new(), path: Vec::new() }
+        State { heap, globals, scope, stack: Vec::new(), path: Vec::new(), ok: Vec::new() }
     }
 
     /// Run `src` and read back the global `result`.

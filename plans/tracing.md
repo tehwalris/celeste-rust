@@ -356,6 +356,50 @@ notice; never a wrong graph. There is no fixpoint to reach for: a node
 handle has no lattice, so merging iteration n with n+1 gives `Sel(Sel(..))`
 and grows without converging.
 
+### T5a - the disjunction problem (OPEN, and it blocks the frame)
+
+Tracing frame 25 of the real cart hits `spikes_at` and the frontier grows
+past 256 states. The mechanism is exact:
+
+```lua
+for i=..,..  do for j=..,.. do
+  if  tile==17 and .. then return true
+  elseif tile==27 and .. then return true
+  ... end
+end end
+```
+
+Each iteration of the 3x3 scan yields `{Return(true), Normal}` - a
+`Return` cannot merge with a `Normal`, correctly - so nine iterations give
+2^9. Every one of those `Return(true)` outcomes has an IDENTICAL heap and
+an identical value. They differ only in which path literals they assumed.
+
+`collapse` cannot merge them because it only pairs outcomes differing in
+exactly ONE literal, which is what keeps it sound: two such outcomes
+together cover their parent, so the merged state's path can safely drop
+back to the common prefix. Two outcomes differing in MANY literals do not
+cover their parent, and dropping to the common prefix would claim the
+state happens in cases where it does not.
+
+So merging identical states needs the path condition to become a real
+DISJUNCTION rather than a conjunction of literals, and then the two uses
+diverge:
+
+* deciding a branch wants the literal set (`decide_on_path`), which only
+  works for a conjunction;
+* the emitted validity wants an arbitrary boolean.
+
+The likely answer is to carry both - the literal list for trace-time
+decisions, and a `D::Bool` for the state's actual condition, OR-ed on
+merge - and to accept that a disjunctive state can no longer decide
+branches from its path. That is a design decision, not a fix, and it is
+the last thing between the tracer and a complete symbolic frame.
+
+Worth noting what this is NOT: it is not the fan-out from `if` on unknown
+data, which merges fine (frame 24 collapses 12 states to 1). It is
+specifically early `return` inside a loop, where the function boundary is
+the natural merge point and nothing merges there.
+
 ### T6 - the gate
 
 Trace the UN-REWRITTEN `__frame` and diff the resulting graph against the

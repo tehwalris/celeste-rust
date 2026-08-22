@@ -38,9 +38,24 @@ pub const NATIVE: &[&str] = &[
     "sin",
     "mget",
     "fget",
-    "tile_flag_at",
     "_hint_normalize",
 ];
+
+/// `tile_flag_at` is defined in the CART as Lua, and has to be replaced
+/// AFTER the toplevel runs or the Lua definition overwrites the builtin.
+/// The interpreter does the same thing (`inject_tile_flag_at_builtin`) and
+/// for the same reason: the Lua version reads the `room` global and scans
+/// a tile range, which is both stale-prone and a loop over symbolic
+/// bounds once the coordinates stop being constants.
+pub fn inject_tile_flag_at<D: Domain>(st: &mut State<D>) {
+    let g = st.globals;
+    st.heap
+        .tables
+        .get_mut(&g)
+        .unwrap()
+        .hash
+        .insert("tile_flag_at".to_string(), Value::Builtin("tile_flag_at"));
+}
 
 pub fn sources() -> Result<String> {
     let b3 = std::fs::read_to_string("lua/builtin_level_3.lua")?;
@@ -55,7 +70,7 @@ pub fn fresh_state<D: Domain>(_d: &mut D) -> State<D> {
     let mut heap: Heap<D> = Heap::default();
     let globals = heap.new_table();
     let scope = heap.new_scope(None);
-    let mut st = State { heap, globals, scope, stack: Vec::new(), path: Vec::new() };
+    let mut st = State { heap, globals, scope, stack: Vec::new(), path: Vec::new(), ok: Vec::new() };
     for name in NATIVE {
         st.heap
             .tables
@@ -122,17 +137,23 @@ mod tests {
         let ast = full_moon::parse(&src).expect("parse");
         let init = full_moon::parse("_init()").expect("parse _init");
         let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
-        it.cart = Some(std::sync::Arc::new(
+        let cart = std::sync::Arc::new(
             celeste_core::cart_data::CartData::load("cart").expect("cart"),
+        );
+        let (rx, ry) = celeste_interp::game_runner::start_room();
+        it.cache = Some(std::sync::Arc::new(
+            celeste_core::collision_cache::CollisionCache::new(&cart, rx, ry).expect("cache"),
         ));
+        it.cart = Some(cart);
         let st = fresh_state::<Symbolic>(&mut it.d);
-        let st = match run_chunk(&mut it, &ast, st) {
+        let mut st = match run_chunk(&mut it, &ast, st) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("[trace] toplevel stopped at: {:#}", e);
                 return;
             }
         };
+        inject_tile_flag_at(&mut st);
         match run_chunk(&mut it, &init, st) {
             Ok(s) => {
                 let objs = s.heap.tables[&s.globals].hash.get("objects").cloned();
@@ -162,14 +183,20 @@ mod tests {
         let init = full_moon::parse("_init()\n__reset_button_states()\n").expect("parse init");
         let frame = full_moon::parse("_update()").expect("parse frame");
         let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
-        it.cart = Some(std::sync::Arc::new(
+        let cart = std::sync::Arc::new(
             celeste_core::cart_data::CartData::load("cart").expect("cart"),
+        );
+        let (rx, ry) = celeste_interp::game_runner::start_room();
+        it.cache = Some(std::sync::Arc::new(
+            celeste_core::collision_cache::CollisionCache::new(&cart, rx, ry).expect("cache"),
         ));
+        it.cart = Some(cart);
         let st = fresh_state::<Symbolic>(&mut it.d);
-        let st = match run_chunk(&mut it, &ast, st) {
+        let mut st = match run_chunk(&mut it, &ast, st) {
             Ok(s) => s,
             Err(e) => return eprintln!("[trace] toplevel stopped at: {:#}", e),
         };
+        inject_tile_flag_at(&mut st);
         let st = match run_chunk(&mut it, &init, st) {
             Ok(s) => s,
             Err(e) => return eprintln!("[trace] _init stopped at: {:#}", e),
