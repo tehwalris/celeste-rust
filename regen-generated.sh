@@ -28,30 +28,57 @@ trap 'rm -rf "$SCRATCH"' EXIT
 echo "==> building the generator"
 cargo build --release --bin transpile
 
-echo "==> name tables"
-./target/release/transpile --recipe rewrites-compile.jsonl "$SCRATCH/gen.rs"
+# The nine generation jobs are independent processes writing to distinct
+# scratch files, so they run CONCURRENTLY. Serially this was ~147 s of the
+# script's ~5 min (8.5 s name tables, 3 x ~9 s for room (1,0), 5 x ~22 s
+# for room (2,0)); in parallel it is one r20 kernel, ~22 s. Each peaks at
+# ~48 MB, so nine at once is nothing.
+#
+# Output is captured per job and replayed in a fixed order afterwards -
+# the emitter's census goes to stderr and is worth reading, and nine
+# interleaved streams would not be.
+R20_CLASSES="steady dash frozen dying_fall dying_spikes"
+JOBS=""
+start() {  # start NAME CMD...
+    local name="$1"; shift
+    "$@" >"$SCRATCH/$name.log" 2>&1 &
+    JOBS="$JOBS $!:$name"
+}
 
+echo "==> generating name tables + 8 kernels (parallel)"
+start names ./target/release/transpile --recipe rewrites-compile.jsonl "$SCRATCH/gen.rs"
 for class in steady dash frozen; do
-    echo "==> $class kernel"
-    ./target/release/transpile \
+    start "$class" ./target/release/transpile \
         --recipe "rewrites-trace10-$class.jsonl" \
         --kernel "crates/celeste-kernels/witness/$class-shape.json" \
         "$SCRATCH/kernel_gen_$class.rs"
 done
-
 # Room (2,0) class kernels: same emitter, (2,0) overlays and witnesses.
-# CELESTE_START_ROOM matters - the recipes replay against the (2,0) compile.
-# dying_fall/dying_spikes: module names use underscores, recipe/witness
-# file names use hyphens; ${class//_/-} maps between them.
-R20_CLASSES="steady dash frozen dying_fall dying_spikes"
+# CELESTE_START_ROOM matters - the recipes replay against the (2,0)
+# compile. dying_fall/dying_spikes: module names use underscores, recipe
+# and witness file names use hyphens; ${class//_/-} maps between them.
 for class in $R20_CLASSES; do
     hy=${class//_/-}
-    echo "==> r20 $class kernel"
-    CELESTE_START_ROOM=2,0 ./target/release/transpile \
+    CELESTE_START_ROOM=2,0 start "r20_$class" ./target/release/transpile \
         --recipe "rewrites-trace20-$hy.jsonl" \
         --kernel "crates/celeste-kernels/witness/r20-$hy-shape.json" \
         "$SCRATCH/kernel_gen_r20_$class.rs"
 done
+
+failed=""
+for job in $JOBS; do
+    pid=${job%%:*}; name=${job#*:}
+    wait "$pid" || failed="$failed $name"
+done
+for job in $JOBS; do
+    name=${job#*:}
+    echo "==> $name"
+    sed 's/^/    /' "$SCRATCH/$name.log"
+done
+if [ -n "$failed" ]; then
+    echo "!! generation failed for:$failed" >&2
+    exit 1
+fi
 
 echo "==> installing into a scratch checkout of the generated crates"
 BACKUP=$(mktemp -d)
