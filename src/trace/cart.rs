@@ -267,6 +267,22 @@ mod tests {
                 it.d.graph.len(),
                 describe(&it, &next[0])
             );
+            // WHY are there several? Print each state's path literals and
+            // the player fields that actually differ, so "under-merged"
+            // becomes a specific claim rather than an impression.
+            if next.len() > 1 && std::env::var_os("TRACE_SPLIT").is_some() {
+                for (i, s) in next.iter().enumerate() {
+                    let path: Vec<String> = s
+                        .path
+                        .iter()
+                        .map(|(l, v)| format!("{}{}", if *v { "" } else { "!" }, l))
+                        .collect();
+                    eprintln!("[split]   {}: path [{}]", i, path.join(" "));
+                }
+                let shapes: std::collections::BTreeSet<String> =
+                    next.iter().map(|s| format!("{:?}", s.shape().unwrap())).collect();
+                eprintln!("[split]   distinct SHAPES among them: {}", shapes.len());
+            }
             cur = next;
         }
     }
