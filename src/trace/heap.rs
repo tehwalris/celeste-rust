@@ -90,24 +90,132 @@ impl<D: Domain> std::fmt::Debug for Value<D> {
     }
 }
 
-/// A Lua table: one object with a hash part and an array part, as Lua has
-/// it. The IR splits these into `ObjectTable`/`ArrayTable`; keeping them
-/// together avoids having to decide which a fresh `{}` is before anything
+/// A Lua table: a string part, an ARRAY part and an integer part, which
+/// is the split Lua itself has and the reason `#` behaves the way it
+/// does. The IR collapses this into `ObjectTable`/`ArrayTable`; keeping
+/// all three avoids having to decide what a fresh `{}` is before anything
 /// has been put in it.
+///
+/// ## Why the integer part has to exist
+///
+/// `t[3] = v` on an empty table is legal Lua and puts 3 in the HASH part,
+/// leaving the array part empty - so `#t` is 0, not 3. Modelling arrays
+/// densely and materialising the gap as nils gets the READS right and the
+/// length wrong. Measured in real PICO-8 (`lua/probe/tables.lua`, whose
+/// output is checked in):
+///
+/// ```text
+/// t={}      #t == 0
+/// t[3]="c"  #t == 0     -- dense-with-nils would say 3
+/// t[1]="a"  #t == 1
+/// t[2]="b"  #t == 3     -- the array part absorbs 3 once the gap closes
+/// {"a",nil,"c"}         #t == 3   -- a CONSTRUCTOR sizes the array part
+/// {"a","b","c"} t[3]=nil #t == 2  -- a border search inside the array
+/// ```
+///
+/// The same contents give different lengths depending on how the table
+/// was BUILT, which is why this is a matter for measurement rather than
+/// for reasoning about what "undefined for tables with holes" permits.
 pub struct Table<D: Domain> {
     pub hash: BTreeMap<String, Value<D>>,
+    /// The array part. May contain explicit `Nil`s; Lua does not shrink
+    /// it when one is punched, and `len` finds the border instead.
     pub arr: Vec<Value<D>>,
+    /// Integer keys OUTSIDE the array part - too large, or zero, or
+    /// negative. Absorbed into `arr` when an append closes the gap.
+    pub ints: BTreeMap<i16, Value<D>>,
+}
+
+impl<D: Domain> Table<D> {
+    /// Every value the table holds. The ONE place that knows a table has
+    /// three parts: `gc`, `shape` and `canonical_order` all went through
+    /// their own hand-written `hash.values().chain(arr.iter())`, so
+    /// adding the integer part meant finding all three, and a fourth
+    /// would mean finding them again.
+    pub fn values(&self) -> impl Iterator<Item = &Value<D>> {
+        self.hash.values().chain(self.arr.iter()).chain(self.ints.values())
+    }
+
+    /// `#t`, as Lua's `luaH_getn` computes it.
+    ///
+    /// Not `arr.len()`: a table is allowed to have holes, and the answer
+    /// is a BORDER - an `i` with `t[i] ~= nil` and `t[i+1] == nil`. Which
+    /// border you get is determined by where the array part ends, which
+    /// is why this is history-dependent and why the golden corpus exists.
+    pub fn len(&self) -> usize {
+        let n = self.arr.len();
+        if n > 0 && matches!(self.arr[n - 1], Value::Nil) {
+            // The array part ends in a hole, so a border is inside it.
+            // Binary search, exactly as Lua does.
+            let (mut i, mut j) = (0usize, n);
+            while j - i > 1 {
+                let m = (i + j) / 2;
+                if matches!(self.arr[m - 1], Value::Nil) {
+                    j = m;
+                } else {
+                    i = m;
+                }
+            }
+            i
+        } else {
+            // The array part is full to the end, so keep walking into the
+            // integer part while the next index is there.
+            let mut i = n;
+            while let Ok(k) = i16::try_from(i + 1) {
+                match self.ints.get(&k) {
+                    Some(v) if !matches!(v, Value::Nil) => i += 1,
+                    _ => break,
+                }
+            }
+            i
+        }
+    }
+
+    pub fn get_index(&self, i: i16) -> Option<&Value<D>> {
+        if i >= 1 && (i as usize) <= self.arr.len() {
+            Some(&self.arr[i as usize - 1])
+        } else {
+            self.ints.get(&i)
+        }
+    }
+
+    pub fn set_index(&mut self, i: i16, v: Value<D>) {
+        if i >= 1 && (i as usize) <= self.arr.len() {
+            self.arr[i as usize - 1] = v;
+            return;
+        }
+        if i >= 1 && i as usize == self.arr.len() + 1 {
+            self.arr.push(v);
+            // MIGRATE. The array part absorbs whatever the integer part
+            // has sitting immediately after it, which is what makes
+            // `t={} t[3]=c t[1]=a t[2]=b` end at `#t == 3` while
+            // `t={} t[3]=c` on its own is `#t == 0`.
+            while let Ok(k) = i16::try_from(self.arr.len() + 1) {
+                match self.ints.remove(&k) {
+                    Some(next) => self.arr.push(next),
+                    None => break,
+                }
+            }
+            return;
+        }
+        // Assigning nil to an absent key is not a key.
+        if matches!(v, Value::Nil) {
+            self.ints.remove(&i);
+        } else {
+            self.ints.insert(i, v);
+        }
+    }
 }
 
 impl<D: Domain> Clone for Table<D> {
     fn clone(&self) -> Self {
-        Table { hash: self.hash.clone(), arr: self.arr.clone() }
+        Table { hash: self.hash.clone(), arr: self.arr.clone(), ints: self.ints.clone() }
     }
 }
 
 impl<D: Domain> Default for Table<D> {
     fn default() -> Self {
-        Table { hash: BTreeMap::new(), arr: Vec::new() }
+        Table { hash: BTreeMap::new(), arr: Vec::new(), ints: BTreeMap::new() }
     }
 }
 
@@ -209,7 +317,7 @@ impl<D: Domain> Heap<D> {
                         continue;
                     }
                     if let Some(tab) = self.tables.get(&t) {
-                        for v in tab.hash.values().chain(tab.arr.iter()) {
+                        for v in tab.values() {
                             push_value(v, &mut stack);
                         }
                     }
@@ -270,8 +378,11 @@ pub enum Slot {
 
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Shape {
-    /// Canonical (BFS-numbered) tables: their keys and their slot kinds.
-    pub tables: Vec<(Vec<(String, Slot)>, Vec<Slot>)>,
+    /// Canonical (BFS-numbered) tables: their keys and their slot kinds,
+    /// for all THREE parts - string, array, integer. The integer part is
+    /// part of the shape for the same reason the others are: two states
+    /// whose tables differ there cannot be merged with a select.
+    pub tables: Vec<(Vec<(String, Slot)>, Vec<Slot>, Vec<(i16, Slot)>)>,
     pub scopes: Vec<(Vec<(String, Slot)>, Option<u32>)>,
 }
 
@@ -295,7 +406,7 @@ impl<D: Domain> Heap<D> {
                     t_num.insert(t, t_num.len() as u32);
                     order.push(r);
                     if let Some(tab) = self.tables.get(&t) {
-                        for v in tab.hash.values().chain(tab.arr.iter()) {
+                        for v in tab.values() {
                             push_value(v, &mut queue);
                         }
                     }
@@ -336,6 +447,7 @@ impl<D: Domain> Heap<D> {
                     shape.tables.push((
                         tab.hash.iter().map(|(k, v)| (k.clone(), slot(v))).collect(),
                         tab.arr.iter().map(slot).collect(),
+                        tab.ints.iter().map(|(k, v)| (*k, slot(v))).collect(),
                     ));
                 }
                 Root::Scope(s) => {

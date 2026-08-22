@@ -39,6 +39,7 @@ pub const NATIVE: &[&str] = &[
     "mget",
     "fget",
     "_hint_normalize",
+    "printh",
 ];
 
 /// `tile_flag_at` is defined in the CART as Lua, and has to be replaced

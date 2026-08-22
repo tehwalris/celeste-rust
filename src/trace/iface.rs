@@ -30,7 +30,12 @@ use super::state::State;
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Step {
     Key(String),
+    /// A slot of the ARRAY part, zero-based.
     Idx(usize),
+    /// An integer key outside the array part (`Table::ints`), by its Lua
+    /// key. Separate from `Idx` because they are different places: the
+    /// array part is what `#` measures.
+    Int(i16),
 }
 
 pub type Path = Vec<Step>;
@@ -46,6 +51,7 @@ pub fn show(p: &Path) -> String {
                 s.push_str(k);
             }
             Step::Idx(i) => s.push_str(&format!("[{}]", i)),
+            Step::Int(i) => s.push_str(&format!("[#{}]", i)),
         }
     }
     if s.is_empty() {
@@ -76,6 +82,7 @@ pub fn get<D: Domain>(st: &State<D>, p: &[Step]) -> Option<Value<D>> {
         cur = match step {
             Step::Key(k) => tab.hash.get(k)?.clone(),
             Step::Idx(i) => tab.arr.get(*i)?.clone(),
+            Step::Int(i) => tab.ints.get(i)?.clone(),
         };
     }
     Some(cur)
@@ -95,6 +102,9 @@ pub fn set<D: Domain>(st: &mut State<D>, p: &[Step], v: Value<D>) -> Result<()> 
             *tab.arr
                 .get_mut(*i)
                 .ok_or_else(|| anyhow!("{}: index past the end", show(&p.to_vec())))? = v;
+        }
+        Step::Int(i) => {
+            tab.ints.insert(*i, v);
         }
     }
     Ok(())
@@ -146,6 +156,11 @@ fn collect<D: Domain>(
             for (i, sub) in tab.arr.iter().enumerate() {
                 let mut q = p.clone();
                 q.push(Step::Idx(i));
+                collect(st, q, sub, seen, out);
+            }
+            for (i, sub) in &tab.ints {
+                let mut q = p.clone();
+                q.push(Step::Int(*i));
                 collect(st, q, sub, seen, out);
             }
         }

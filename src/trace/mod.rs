@@ -55,5 +55,6 @@ pub mod eval;
 pub mod heap;
 pub mod iface;
 pub mod interp;
+pub mod probe;
 pub mod state;
 pub mod verify;

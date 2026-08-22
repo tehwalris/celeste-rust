@@ -94,6 +94,11 @@ pub struct Interp<'a, D: Domain> {
     /// that stops at a limit tells you exactly which construct did it.
     pub max_states: usize,
     pub max_nodes: usize,
+    /// What `printh` has printed, in order. This exists so a program can
+    /// be run in the tracer AND in real PICO-8 and the two outputs
+    /// compared line for line (`lua/probe/`), which is the only way to
+    /// settle a question like what `#` does to a table with a hole in it.
+    pub prints: Vec<String>,
 }
 
 impl<'a, D: Domain> Interp<'a, D> {
@@ -106,6 +111,7 @@ impl<'a, D: Domain> Interp<'a, D> {
             cache: None,
             max_states: 256,
             max_nodes: 2_000_000,
+            prints: Vec::new(),
         }
     }
 
@@ -705,33 +711,12 @@ impl<'a, D: Domain> Interp<'a, D> {
                             // Concrete, because the heap is. This is why
                             // `for i=1,#t` needs no unrolling heuristic.
                             let Value::Table(t) = v else { bail!("# of a non-table") };
-                            let arr = &st.heap.tables[&t].arr;
-                            // A HOLE-PUNCHED table (`set_key` materialised
-                            // a skipped index as an explicit nil) has no
-                            // length this model can report. Measured in
-                            // real PICO-8: `t={} t[3]=true` gives `#t ==
-                            // 0`, and the dense model would say 3; setting
-                            // t[1] then gives 1 and t[2] gives 3, so the
-                            // border moves in a way densely-stored nils do
-                            // not track. Refuse rather than answer.
-                            //
-                            // The interpreter has the same limitation and
-                            // states it as "no table in the cart is both
-                            // hole-punched and appended to". True today -
-                            // `got_fruit` is the only hole-punched table
-                            // and `title_screen`, which is the only thing
-                            // that `add`s to it, is never run - but a
-                            // grep is not a guarantee, and this makes it
-                            // one. `add(t, v)` is `t[#t+1] = v`, so
-                            // guarding `#` guards the append too.
-                            if arr.iter().any(|x| matches!(x, Value::Nil)) {
-                                bail!(
-                                    "# of a hole-punched {}-element table: PICO-8's length \
-                                     is any border, which a dense array cannot represent",
-                                    arr.len()
-                                );
-                            }
-                            let len = arr.len() as i16;
+                            // `Table::len` is Lua's `luaH_getn`, checked
+                            // against real PICO-8 by `lua/probe/tables.lua`.
+                            // It is NOT `arr.len()`: a hole makes the
+                            // answer a border, and which border you get
+                            // depends on how the table was built.
+                            let len = st.heap.tables[&t].len() as i16;
                             let n = self.d.num(P8::from_i16(len));
                             (st, Value::Num(n))
                         }
@@ -979,13 +964,7 @@ impl<'a, D: Domain> Interp<'a, D> {
         let table = &st.heap.tables[t];
         Ok(match k {
             Key::Field(f) => table.hash.get(f).cloned().unwrap_or(Value::Nil),
-            Key::Index(i) => {
-                if *i >= 1 && (*i as usize) <= table.arr.len() {
-                    table.arr[*i as usize - 1].clone()
-                } else {
-                    Value::Nil
-                }
-            }
+            Key::Index(i) => table.get_index(*i).cloned().unwrap_or(Value::Nil),
         })
     }
 
@@ -998,41 +977,7 @@ impl<'a, D: Domain> Interp<'a, D> {
             Key::Field(f) => {
                 table.hash.insert(f, v);
             }
-            Key::Index(i) => {
-                if i < 1 {
-                    bail!("array index {} is not positive", i);
-                }
-                let i = i as usize;
-                // Lua lets an assignment SKIP indices - `t[3] = v` on an
-                // empty table is legal and leaves t[1] and t[2] absent.
-                // Room (2,0) does exactly that: the fruit sets
-                // `got_fruit[1 + level_index()]`, and `level_index()` is
-                // 2 there, while `_init` never fills `got_fruit` (only
-                // `title_screen` does, and the search does not run it).
-                //
-                // Arrays are modelled densely, so the skipped indices
-                // become explicit nils, which read back exactly as Lua's
-                // absent keys do. The interpreter does the same thing for
-                // the same reason (`core_interpreter.rs`, `Instruction::
-                // Index`), which is what makes the oracle agree. What
-                // neither models is `#`/`add` on a hole-punched table,
-                // whose length in PICO-8 is any border; no table in the
-                // cart is both hole-punched and appended to.
-                if i <= table.arr.len() {
-                    table.arr[i - 1] = v;
-                } else {
-                    // A far-out index would materialise the gap, so cap
-                    // it rather than let a symbolic-looking constant
-                    // allocate. The cart's largest array is 30 long.
-                    if i > 4096 {
-                        bail!("array index {} would materialise a {}-element gap", i, i);
-                    }
-                    while table.arr.len() < i - 1 {
-                        table.arr.push(Value::Nil);
-                    }
-                    table.arr.push(v);
-                }
-            }
+            Key::Index(i) => table.set_index(i, v),
         }
         Ok(())
     }
@@ -1298,6 +1243,25 @@ impl<'a, D: Domain> Interp<'a, D> {
                 }
             }
             "print" | "__print" => (st, Value::Nil),
+            // Rendered the way PICO-8's `printh` renders a value, because
+            // the golden files in `lua/probe/` are literally its stdout.
+            "printh" => {
+                let text = match args.first() {
+                    None | Some(Value::Nil) => "[nil]".to_string(),
+                    Some(Value::Str(s)) => s.to_string(),
+                    Some(Value::Bool(b)) => match self.d.decide(b) {
+                        Some(v) => v.to_string(),
+                        None => bail!("printh of an undecided boolean"),
+                    },
+                    Some(Value::Num(n)) => match self.d.as_const(n) {
+                        Some(v) => fmt_p8(v),
+                        None => bail!("printh of a symbolic number"),
+                    },
+                    Some(other) => bail!("printh of {:?}", other),
+                };
+                self.prints.push(text);
+                (st, Value::Nil)
+            }
             // A merge HINT. The frontend turns it into a block flag so the
             // interpreter's worklist accumulates states there; the tracer
             // merges at every join by construction.
@@ -1310,9 +1274,20 @@ impl<'a, D: Domain> Interp<'a, D> {
                 };
                 let mut st = st;
                 let tab = st.heap.tables.get_mut(t).unwrap();
-                tab.arr
-                    .pop()
-                    .ok_or_else(|| anyhow!("__array_table_drop_last on an empty table"))?;
+                // Exactly `list[#list] = nil`, which is what the shim it
+                // replaces means (`del` in builtin_level_4). NOT
+                // `arr.pop()`: that removes the last SLOT, and after a
+                // hole has been punched the last slot is not the last
+                // element. Shrinking the array part is not observationally
+                // neutral either - `arr=[a,nil,nil]` has `#==1`, but
+                // shrinking it to `[a]` and then writing t[3] puts 3 in
+                // the integer part and gives `#==1` where leaving the
+                // array part alone gives 3.
+                let n = tab.len();
+                if n == 0 {
+                    bail!("__array_table_drop_last on an empty table");
+                }
+                tab.set_index(n as i16, Value::Nil);
                 (st, Value::Nil)
             }
             // On an EXACT value the floor is unique, so there is one
@@ -1489,4 +1464,17 @@ mod tests {
         assert_eq!(it.d.graph.get(node.args[1]).op, Op::Const(10 << 16, 10 << 16));
         assert_eq!(it.d.graph.get(node.args[2]).op, Op::Const(20 << 16, 20 << 16));
     }
+}
+
+/// A pico-8 number the way `printh` renders it: whole numbers without a
+/// point, fractions to four places with trailing zeros stripped. Four is
+/// not a guess - `printh(1/3)` prints `0.3333`.
+fn fmt_p8(v: P8) -> String {
+    if let Some(i) = v.as_i16() {
+        return format!("{}", i);
+    }
+    let raw = v.as_raw_u32() as i32 as f64 / 65536.0;
+    let s = format!("{:.4}", raw);
+    let s = s.trim_end_matches('0').trim_end_matches('.').to_string();
+    s
 }

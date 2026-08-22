@@ -146,6 +146,15 @@ pub fn merge<D: Domain>(
                     let j = join(d, cond, &va, &tb.arr[i])?;
                     heap.tables.get_mut(a).unwrap().arr[i] = j;
                 }
+                let ikeys: Vec<i16> = heap.tables[a].ints.keys().copied().collect();
+                for k in ikeys {
+                    let va = heap.tables[a].ints[&k].clone();
+                    let vb = tb.ints.get(&k).ok_or_else(|| {
+                        anyhow::anyhow!("merge: index {} missing after equal shapes", k)
+                    })?;
+                    let j = join(d, cond, &va, vb)?;
+                    heap.tables.get_mut(a).unwrap().ints.insert(k, j);
+                }
             }
             (Root::Scope(a), Root::Scope(b)) => {
                 let sb = &f.heap.scopes[b];
@@ -213,7 +222,7 @@ fn canonical_order<D: Domain>(s: &State<D>) -> Vec<Root> {
         match r {
             Root::Table(t) => {
                 if let Some(tab) = s.heap.tables.get(&t) {
-                    for v in tab.hash.values().chain(tab.arr.iter()) {
+                    for v in tab.values() {
                         match v {
                             Value::Table(x) => queue.push(Root::Table(*x)),
                             Value::Func { env, .. } => queue.push(Root::Scope(*env)),
