@@ -2198,6 +2198,26 @@ fn render(e: &Emit) -> Result<String> {
         }
         sigs.entry(sig).or_default().push(m);
     }
+    // What the BINARY prefix/suffix taint costs. A node truly needs
+    // 2^|cone| evaluations; the split rounds that to 1 (cone empty) or 64
+    // (anything else), so a node depending on one button is computed 64
+    // times instead of 2.
+    let mut hist = [0usize; 7];
+    let mut ideal = 0usize;
+    let mut binary = 0usize;
+    for c in &cones {
+        let k = c.count_ones() as usize;
+        hist[k] += 1;
+        ideal += 1usize << k;
+        binary += if k == 0 { 1 } else { 64 };
+    }
+    eprintln!(
+        "  cone sizes {:?}; node-evaluations per frame: binary split {}, exact 2^|cone| {} ({:.1}x)",
+        hist,
+        binary,
+        ideal,
+        binary as f64 / ideal.max(1) as f64,
+    );
     eprintln!(
         "graph: {} nodes, {} out cells; buttons reaching an output {:?} -> {} variant(s); \
          DISTINCT button combinations: {}/64",
