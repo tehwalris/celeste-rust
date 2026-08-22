@@ -132,7 +132,39 @@ impl<'a, D: Domain> Interp<'a, D> {
 
     // ------------------------------------------------------------ blocks
 
+    /// A BLOCK IS A SCOPE. Without this, a `local` declared inside an
+    /// `if` arm lands in the enclosing FUNCTION's scope and outlives the
+    /// arm, which is not what Lua does:
+    ///
+    /// ```text
+    /// local m=1 if true then local m=2 printh(m) end printh(m)   -- 2, then 1
+    /// if true then local leaked=7 end printh(leaked)             -- [nil]
+    /// ```
+    ///
+    /// Nothing in this cart shadows a name, so it was never a wrong
+    /// VALUE. It was a merge failure: a leaked name is part of
+    /// `Shape::scopes`, so the two arms of `if this.dash_time>0 then ..
+    /// else <maxrun, accel, deccel, maxfall, gravity, ..> end` ended with
+    /// different scope key sets and could not merge.
+    ///
+    /// Only when the block actually declares something. A scope object
+    /// per `if` arm would otherwise be allocated, walked by GC and
+    /// canonicalised for every branch in the program, to hold nothing.
     pub fn exec_block(&mut self, block: &'a ast::Block, st: State<D>) -> Result<Outcome<D>> {
+        if !declares_local(block) {
+            return self.exec_block_flat(block, st);
+        }
+        let mut st = st;
+        let outer = st.scope;
+        st.scope = st.heap.new_scope(Some(outer));
+        let mut out = self.exec_block_flat(block, st)?;
+        for (s, _) in out.iter_mut() {
+            s.scope = outer;
+        }
+        Ok(out)
+    }
+
+    fn exec_block_flat(&mut self, block: &'a ast::Block, st: State<D>) -> Result<Outcome<D>> {
         let mut live: Outcome<D> = vec![(st, Flow::Normal)];
         for stmt in block.stmts() {
             let mut next: Outcome<D> = Vec::new();
@@ -519,46 +551,63 @@ impl<'a, D: Domain> Interp<'a, D> {
         s: State<D>,
         bound: u32,
     ) -> Result<Outcome<D>> {
+        // Two lists, exactly as `run_for` keeps them. A state LEAVES the
+        // loop when it goes past the limit, breaks, or returns, and a
+        // state that has left must not re-enter.
+        //
+        // `for_body` used to rewrite `Flow::Break` to `Flow::Normal`, so a
+        // broken-out state went straight back into `running` and ran the
+        // body again - `break` was a no-op on this path. `run_for` has a
+        // comment saying that exact bug was fixed there once; it was
+        // still here.
+        //
+        // Splitting out the states that went PAST the limit matters for a
+        // second reason. They used to be merged back into the frontier
+        // and re-tested at every later k, and since the guard is opaque
+        // the tracer cannot see that `i <= limit` is already false - so it
+        // split again, and explored a body under `g and c and not c`.
+        // `Graph::fold` only collapses a constant `And`, so those states
+        // are built, traced and selected away rather than never existing.
         let mut running: Outcome<D> = vec![(s, Flow::Normal)];
+        let mut done: Outcome<D> = Vec::new();
         for k in 0..bound {
+            if running.is_empty() {
+                break;
+            }
             let mut next: Outcome<D> = Vec::new();
-            for (s, fl) in running {
-                if !fl.is_normal() {
-                    next.push((s, fl));
-                    continue;
-                }
+            for (s, fl) in std::mem::take(&mut running) {
+                debug_assert!(fl.is_normal(), "only a running state re-enters the body");
                 let off = self.d.num(P8::from_i16(k as i16));
                 let iv = self.d.arith(Arith::Add, &start, &off)?;
                 let cond = self.d.compare(Cmp::Le, &iv, &limit)?;
                 match self.decide(&cond) {
-                    // Past the limit on this path: nothing more to do, but
-                    // the state carries on after the loop.
-                    Some(false) => next.push((s, Flow::Normal)),
+                    // Past the limit on this path: out of the loop.
+                    Some(false) => done.push((s, Flow::Normal)),
                     Some(true) => next.extend(self.for_body(f, name, &iv, s)?),
                     None => {
                         let (ts, fs) = split(&mut self.d, s, &cond);
-                        let t = match ts {
-                            Some(x) => self.for_body(f, name, &iv, x)?,
-                            None => Vec::new(),
-                        };
-                        let fo: Outcome<D> = match fs {
-                            Some(x) => vec![(x, Flow::Normal)],
-                            None => Vec::new(),
-                        };
-                        if t.is_empty() || fo.is_empty() {
-                            next.extend(t);
-                            next.extend(fo);
-                        } else {
-                            let mut all = t;
-                            all.extend(fo);
-                            next.extend(self.collapse(all)?);
+                        if let Some(x) = ts {
+                            next.extend(self.for_body(f, name, &iv, x)?);
+                        }
+                        if let Some(x) = fs {
+                            done.push((x, Flow::Normal));
                         }
                     }
                 }
             }
-            running = self.collapse(next)?;
+            for (s, fl) in self.collapse(next)? {
+                match fl {
+                    // A `break` ends the LOOP, not the state.
+                    Flow::Break => done.push((s, Flow::Normal)),
+                    Flow::Return(v) => done.push((s, Flow::Return(v))),
+                    Flow::Normal => running.push((s, Flow::Normal)),
+                }
+            }
         }
-        // The obligation: by now the loop must be over.
+        // The obligation, and it belongs ONLY to the states that never
+        // left: by the time the bound ran out, the loop must be over.
+        // Applying it to a state that broke or returned would deopt a
+        // lane for a bound it never depended on.
         let off = self.d.num(P8::from_i16(bound as i16));
         let iv = self.d.arith(Arith::Add, &start, &off)?;
         let over = self.d.compare(Cmp::Le, &iv, &limit)?;
@@ -566,10 +615,8 @@ impl<'a, D: Domain> Interp<'a, D> {
         for (s, _) in running.iter_mut() {
             s.ok = self.d.and(&s.ok, &finished);
         }
-        Ok(running
-            .into_iter()
-            .map(|(s, fl)| (s, if matches!(fl, Flow::Break) { Flow::Normal } else { fl }))
-            .collect())
+        done.extend(running);
+        self.collapse(done)
     }
 
     /// One iteration of a numeric `for`, in its own scope.
@@ -587,10 +634,10 @@ impl<'a, D: Domain> Interp<'a, D> {
         let mut out = Vec::new();
         for (mut s2, f2) in self.exec_block(f.block(), cur)? {
             s2.scope = outer;
-            match f2 {
-                Flow::Break => out.push((s2, Flow::Normal)),
-                other => out.push((s2, other)),
-            }
+            // `Flow::Break` is passed THROUGH. The caller decides what
+            // leaving the loop means; swallowing it here made `break` a
+            // no-op for the symbolic-bound loop.
+            out.push((s2, f2));
         }
         Ok(out)
     }
@@ -1345,6 +1392,12 @@ enum Bound<D: Domain> {
 enum Key {
     Field(String),
     Index(i16),
+}
+
+/// Does this block bind a name of its own? Only its OWN statements - a
+/// nested block gets its own scope when it runs.
+fn declares_local(block: &ast::Block) -> bool {
+    block.stmts().any(|s| matches!(s, ast::Stmt::LocalAssignment(_)))
 }
 
 /// How far to unroll a loop whose limit the tracer cannot know.

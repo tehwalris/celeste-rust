@@ -217,6 +217,70 @@ mod tests {
         None
     }
 
+    /// `break` in a loop whose bound the tracer CANNOT know.
+    ///
+    /// The PICO-8 corpus cannot reach this. `run_for_symbolic` only runs
+    /// when the limit is unknown, and every program PICO-8 can also run is
+    /// concrete, so the corpus exercises `run_for` and nothing else. That
+    /// is exactly why the bug lived here and not there: `for_body`
+    /// rewrote `Flow::Break` to `Flow::Normal`, the state went back into
+    /// the frontier and ran the body again, and `break` did nothing.
+    ///
+    /// So: trace the loop once with a symbolic limit, then evaluate the
+    /// resulting graph at each concrete limit and compare with the answer
+    /// worked out by hand. One graph, every point - the same discipline as
+    /// the frame check.
+    #[test]
+    fn break_leaves_a_loop_whose_bound_is_symbolic() {
+        // `abs(amount)` because `unroll_bound` is keyed on the limit
+        // expression's SOURCE TEXT, and that is the cart's own spelling
+        // (`move_x`/`move_y`), which is where this actually bites.
+        let src = "
+function f(amount)
+  local n = 0
+  for i=0,abs(amount) do
+    if i >= 2 then break end
+    n = n + 1
+  end
+  return n
+end
+";
+        let top = full_moon::parse(src).expect("parse");
+        let call = full_moon::parse("result = f(amount)").expect("parse call");
+        let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
+        let st = cart::fresh_state::<Symbolic>(&mut it.d);
+        let mut st = run_one(&mut it, &top, st).expect("toplevel");
+        let cell = it.d.graph.leaf(crate::transpile::graph::Op::Cell(0));
+        iface::set(&mut st, &[iface::key("amount")], Value::Num(cell)).expect("set amount");
+        let st = run_one(&mut it, &call, st).expect("call f");
+        let Some(Value::Num(node)) = iface::get(&st, &[iface::key("result")]) else {
+            panic!("f did not return a number")
+        };
+        // 100 is well past the unroll bound of 8 on purpose: once a
+        // `break` is reached the bound stops mattering, so `ok` has to be
+        // true there too. Before the fix the loop ran on and the "it
+        // finished" obligation made this lane deopt.
+        for a in [0i16, 1, 2, 3, 5, 8, 100] {
+            let cells = [Conc::Num(crate::pico8_num::Pico8Num::from_i16(a))];
+            let env = super::super::eval::Env {
+                cells: &cells,
+                frees: &[false; 6],
+                cart: None,
+                cache: None,
+            };
+            let got = super::super::eval::eval(&it.d.graph, node, &env).expect("eval result");
+            let want = (a + 1).min(2);
+            assert_eq!(
+                got,
+                Conc::Num(crate::pico8_num::Pico8Num::from_i16(want)),
+                "amount = {}",
+                a
+            );
+            let ok = super::super::eval::eval(&it.d.graph, st.ok, &env).expect("eval ok");
+            assert_eq!(ok, Conc::Bool(true), "amount = {}: the trace declined", a);
+        }
+    }
+
     /// Trace ONE frame with the player's fields symbolic and the six
     /// buttons free, then check that one graph against the oracle at
     /// every point of a position/speed sweep crossed with all 64 button

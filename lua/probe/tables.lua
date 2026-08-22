@@ -174,3 +174,26 @@ ct.inc()
 printh(ct.get())
 ct.inc()
 printh(ct.get())
+
+-- 12. A BLOCK IS A SCOPE. A `local` inside an `if` arm does not outlive
+--     the arm, and shadows rather than overwrites while it is alive.
+printh("block-scope")
+local m=1
+if true then local m=2 printh(m) end
+printh(m)
+if true then local leaked=7 end
+printh(leaked)
+for bi=1,2 do local inner=bi end
+printh(inner)
+
+-- 13. `break` leaves the loop, and only the innermost one.
+printh("break")
+local bn=0
+for i=1,8 do bn=bn+1 break end
+printh(bn)
+local bx=0
+for i=0,5 do if i>=2 then break end bx=bx+1 end
+printh(bx)
+local by=0
+for i=1,2 do for j=1,5 do if j>=2 then break end by=by+1 end end
+printh(by)
