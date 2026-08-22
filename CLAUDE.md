@@ -102,6 +102,16 @@ Do NOT run the full suite in plain debug: those same tests are
 compute-bound and `compiled_forward` alone goes 20 s -> 153 s. Debug wins
 when a filter keeps them out; `--cargo-profile quick` wins when it cannot.
 
+**Tools get `--profile quick`, not `--release`.** `transpile` prints text;
+no number anyone quotes comes out of it, so fat LTO buys nothing. 15 s to
+build under quick against ~78 s under release, for a generator that runs
+24.6 s instead of 22.3 s. `regen-generated.sh` uses quick throughout and
+no longer refreshes `target/release` - build that yourself before
+benchmarking. (I wrote the rule below and then immediately reached for
+`--release` to build `transpile`, because it is genuinely too slow in
+debug. "Too slow in debug" argues for OPTIMIZATION, not for the gate's
+profile.)
+
 **`--release` is for the gate and for benchmarks only.** Every number in
 BENCHMARK_DATA.md was measured under it. Never make `[profile.release]`
 cheaper to speed the loop up - that silently reprices every recorded

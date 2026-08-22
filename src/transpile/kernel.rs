@@ -124,8 +124,18 @@ pub(crate) struct Emit {
     pub(crate) vary_in: BTreeMap<u32, &'static str>,
     /// Cells written by a Store anywhere in the frame.
     pub(crate) dirty: BTreeSet<u32>,
-    pub(crate) pre: Vec<Line>,
-    pub(crate) suf: Vec<Line>,
+    /// The emitted body, in one piece. There is no prefix/suffix split
+    /// any more: `transpile::lower` eliminates the free choices by
+    /// specializing the graph on all 64 assignments into one interned
+    /// arena, so what two assignments share is one node rather than
+    /// something the compiler has to rediscover per monomorphization.
+    pub(crate) body: Vec<Line>,
+    /// One entry per DISTINCT free assignment (36 of 64 on steady).
+    pub(crate) variants: Vec<super::lower::Variant>,
+    /// Assignment -> the representative it collapsed onto.
+    pub(crate) rep_of: [u8; 64],
+    /// The walk's own discarded line stream; see `Emit::buf`.
+    pub(crate) scratch: Vec<Line>,
     pub(crate) n: usize,
     /// name -> rust type of every generated let (for the Pre struct).
     pub(crate) var_ty: HashMap<String, &'static str>,
@@ -151,18 +161,6 @@ pub(crate) struct Emit {
     pub(crate) fork_depth: usize,
     /// Name of the current per-lane validity mask ("ALL" at depth 0).
     pub(crate) valid_expr: String,
-    /// Names of the member's final VALIDITY: a per-lane mask of the lanes
-    /// the kernel computed correctly, and a flag that sends the whole
-    /// slice to the interpreter. Both are the rendered form of the `ok`
-    /// node, split by whether each conjunct was block-uniform.
-    ///
-    /// `transpile::lower` binds them under fixed names (`ok_pre`/`bd_pre`
-    /// at the end of the prefix, `ok_out`/`bd_out` at the end of the
-    /// suffix) so that both consumers can ask for them - and so the FUSED
-    /// artifact, which has one of each PER MEMBER, can tell them apart by
-    /// the node they interned to rather than by position.
-    pub(crate) ok_expr: String,
-    pub(crate) bd_expr: String,
     /// Free-choice TAINT tracking (cross-variant sharing): only
     /// instructions whose value depends on a button land in the x64
     /// suffix; everything
@@ -195,12 +193,14 @@ pub(crate) struct Emit {
 }
 
 impl Emit {
+    /// Where the WALK's own text goes - and it goes nowhere. `lower`
+    /// rebuilds the body from the graph, so this stream is discarded; the
+    /// walk still produces it only because `Graph::operand` recovers the
+    /// graph's edges by parsing identifiers back out of the text it
+    /// emits. It disappears when `K` carries a `NodeId` instead of a
+    /// `String` (plans/tracing.md).
     fn buf(&mut self) -> &mut Vec<Line> {
-        if self.cur_tainted {
-            &mut self.suf
-        } else {
-            &mut self.pre
-        }
+        &mut self.scratch
     }
     fn line(&mut self, s: &str) {
         self.buf().push(Line::Raw(s.to_string()));
@@ -563,8 +563,10 @@ pub(crate) fn emit_walk(program: &Program, witness_path: &str) -> Result<Emit> {
         uni: BTreeMap::new(),
         vary_in: BTreeMap::new(),
         dirty: BTreeSet::new(),
-        pre: Vec::new(),
-        suf: Vec::new(),
+        body: Vec::new(),
+        variants: Vec::new(),
+        rep_of: [0u8; 64],
+        scratch: Vec::new(),
         n: 0,
         var_ty: HashMap::new(),
         pre_defs: BTreeSet::new(),
@@ -575,8 +577,6 @@ pub(crate) fn emit_walk(program: &Program, witness_path: &str) -> Result<Emit> {
         button_cells: HashMap::new(),
         fork_depth: 0,
         valid_expr: "ALL".to_string(),
-        ok_expr: "ALL".to_string(),
-        bd_expr: "false".to_string(),
         tainted_vars: BTreeSet::new(),
         tainted_cells: BTreeSet::new(),
         cur_tainted: false,
@@ -2230,50 +2230,20 @@ fn render(e: &mut Emit) -> Result<String> {
     let of = lower_walk(e)?;
     emit_interface(&mut out, e, &of)?;
     let out_fields = &of.fields;
-    // Pre struct: prefix values the suffix reads (word-boundary search,
-    // so v1 does not match inside v17).
-    let pre_text = render_lines(&e.pre);
-    let suf_text = render_lines(&e.suf);
-    let mut crossing: BTreeSet<String> = BTreeSet::new();
-    for name in &e.pre_defs {
-        if word_used(&suf_text, name) {
-            crossing.insert(name.clone());
-        }
-    }
-    for OutField { expr, tainted, .. } in out_fields {
-        if *tainted && e.pre_defs.contains(expr) {
-            crossing.insert(expr.clone());
-        }
-    }
-    // A TAINTED out field is evaluated in the suffix epilogue, so a prefix
-    // value it names has to cross. An untainted one is evaluated into
-    // `osh` in frame(), right beside the prefix that defines it, and does
-    // not - copying those through `Pre` was pure overhead (all four of
-    // frozen's crossing values were of that kind).
-    writeln!(out, "pub struct Pre {{")?;
-    for name in &crossing {
-        let ty = e
-            .var_ty
-            .get(name)
-            .ok_or_else(|| anyhow!("no type for crossing var {}", name))?;
-        writeln!(out, "    {}: {},", name, ty)?;
-    }
-    writeln!(out, "    valid: u16,")?;
-    writeln!(out, "}}\n")?;
+    let body_text = render_lines(&e.body);
 
-    // frame()
+    // frame(): one function, one straight line, one `out` call per
+    // DISTINCT free assignment. There is no `Pre` struct and no
+    // `suffix::<const B: u8>` because there is nothing to hand across a
+    // boundary - `transpile::lower` already interned what the assignments
+    // share into single nodes, so the sharing is in the code rather than
+    // something the compiler is asked to rediscover 64 times.
     writeln!(
         out,
         "#[inline(never)]\n\
          pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared, &KOut)) {{"
     )?;
-    out.push_str(&pre_text);
-    writeln!(out, "    let p = Pre {{")?;
-    for name in &crossing {
-        writeln!(out, "        {},", name)?;
-    }
-    writeln!(out, "        valid: {},", e.valid_expr)?;
-    writeln!(out, "    }};")?;
+    out.push_str(&body_text);
     writeln!(out, "    let osh = KOutShared {{")?;
     for OutField { cell: id, expr, tainted, .. } in out_fields {
         if !*tainted {
@@ -2281,97 +2251,37 @@ fn render(e: &mut Emit) -> Result<String> {
         }
     }
     writeln!(out, "    }};")?;
-    // Which button bits can the suffix OBSERVE? `B` reaches the suffix
-    // body only through the six `kbK` bindings, so an identifier scan of
-    // everything that body contains - its instructions AND the tainted
-    // KOut exprs it evaluates in the epilogue - is exact, not heuristic.
-    // Variants agreeing on the observed bits compute an identical KOut,
-    // so they append identical rows and dedup collapses them: emitting
-    // one call per distinct observed assignment is set-equal to all 64.
-    //
-    // Testing `e.suf.is_empty()` alone was WRONG and lost rows: the dash
-    // class stores the buttons straight into p_jump/p_dash, which is a
-    // tainted OUT FIELD with no suffix instruction behind it (gate f35,
-    // 2026-08-18: 1358 rows missing at f37).
-    let mut suffix_text = suf_text.clone();
-    for OutField { cell: id, expr, tainted, .. } in out_fields {
-        if *tainted {
-            suffix_text.push('\n');
-            suffix_text.push_str(expr);
-        } else if (0..6).any(|k| mentions_ident(expr, &format!("kb{}", k))) {
-            bail!("output cell {} reads a button bit but is marked untainted", id);
-        }
-    }
-    // The prefix runs ONCE per fork config, so a button bit reaching it
-    // would be computed with one arbitrary variant's value - the same
-    // failure one level up. Taint routing should make this impossible;
-    // hold it loudly rather than trust it.
-    for k in 0..6 {
-        if mentions_ident(&pre_text, &format!("kb{}", k)) {
-            bail!("button bit kb{} leaked into the button-independent prefix", k);
-        }
-    }
-    let used: Vec<u32> = (0..6)
-        .filter(|k| mentions_ident(&suffix_text, &format!("kb{}", k)))
-        .collect();
-    let n_variants = 1usize << used.len();
-    eprintln!(
-        "[kernel] suffix observes button bits {:?} -> {} variant call(s)",
-        used, n_variants
-    );
     writeln!(
         out,
-        "    // suffix observes button bits {:?}: {} distinct variant(s)",
-        used, n_variants
+        "    // {} of 64 free assignments are distinct successors",
+        e.variants.len()
     )?;
-    for i in 0..n_variants {
-        let b: u8 = used
-            .iter()
-            .enumerate()
-            .filter(|(j, _)| i >> j & 1 != 0)
-            .map(|(_, k)| 1u8 << k)
-            .sum();
-        writeln!(out, "    suffix::<{}>(u, g, &p, &osh, out);", b)?;
+    for v in &e.variants {
+        writeln!(out, "    out({}, &osh, &KOut {{", v.mask)?;
+        writeln!(out, "        valid: {},", e.valid_expr)?;
+        writeln!(out, "        deopt: !{},", v.ok)?;
+        writeln!(out, "        bd: {},", v.bd)?;
+        for OutField { cell: id, tainted, .. } in out_fields {
+            if *tainted {
+                writeln!(out, "        c{}: {},", id, v.outputs[id])?;
+            }
+        }
+        writeln!(out, "    }});")?;
     }
     for _ in 0..e.fork_depth {
         writeln!(out, "    }}")?;
     }
-    writeln!(out, "}}\n")?;
-
-    // suffix()
-    writeln!(
-        out,
-        "#[inline(never)]\n\
-         fn suffix<const B: u8>(u: &Uni, g: &G, p: &Pre, osh: &KOutShared, out: &mut impl FnMut(u8, &KOutShared, &KOut)) {{"
-    )?;
-    for name in &crossing {
-        writeln!(out, "    let {} = p.{};", name, name)?;
-    }
-
-    for k in 0..6 {
-        writeln!(out, "    let kb{}: bool = (B >> {}) & 1 != 0;", k, k)?;
-    }
-    out.push_str(&suf_text);
-    writeln!(out, "    out(B, osh, &KOut {{")?;
-    writeln!(out, "        valid: p.valid,")?;
-    writeln!(out, "        deopt: !{},", e.ok_expr)?;
-    writeln!(out, "        bd: {},", e.bd_expr)?;
-    for OutField { cell: id, expr, tainted, .. } in out_fields {
-        if *tainted {
-            writeln!(out, "        c{}: {},", id, expr)?;
-        }
-    }
-    writeln!(out, "    }});")?;
     writeln!(out, "}}")?;
 
     eprintln!(
-        "kernel: {} uniform cells, {} row cells, {} out cells, {} crossing values, prefix {} lines, suffix {} lines, witness {} facts",
+        "kernel: {} uniform cells, {} row cells, {} out cells ({} per-variant), \
+         {} distinct assignments of 64, body {} lines, witness {} facts",
         e.uni.len(),
         e.vary_in.len(),
         out_fields.len(),
-        crossing.len(),
-        pre_text.lines().count(),
-        suf_text.lines().count(),
+        out_fields.iter().filter(|f| f.tainted).count(),
+        e.variants.len(),
+        body_text.lines().count(),
         e.witness_len,
     );
     // Which buttons can reach an OUTPUT (plans/multi-output-fusion.md).

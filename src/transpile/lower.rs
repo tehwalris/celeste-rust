@@ -614,27 +614,63 @@ fn conjunct_term(ctx: &Ctx, cond: NodeId) -> Result<Term> {
     })
 }
 
-/// Emit the whole body of one member: fills `e.pre` / `e.suf` (and the
-/// bookkeeping `render` reads off them) from the graph, and rewrites the
-/// output fields to name graph nodes.
-///
-/// `e.pre` holds everything a free-choice variant does NOT observe,
-/// including the split loop nest; `e.suf` holds the rest, and is emitted
-/// once per variant. That two-way cut is the last hand-drawn boundary
-/// left: specializing the graph on the free choices and interning the
-/// result replaces it, because then a node shared by several variants IS
-/// one node rather than one the compiler has to re-discover 64 times.
-pub(crate) fn emit_body(e: &mut Emit, of: &mut OutFields) -> Result<()> {
-    let n = e.graph.len();
-    let bcone = e.graph.free_cones();
-    let fcone = e.graph.split_cones();
+/// One free-choice assignment's result: what it writes and whether it
+/// counts. Assignments that agree on all three collapse to one of these,
+/// so `mask` is a REPRESENTATIVE, not an enumeration.
+pub(crate) struct Variant {
+    pub(crate) mask: u8,
+    /// cell -> the expression holding its value under this assignment.
+    pub(crate) outputs: BTreeMap<u32, String>,
+    pub(crate) ok: String,
+    pub(crate) bd: String,
+}
 
-    // --- representations, for EVERY node ---
-    // Representation is what decides whether a primitive carries its own
-    // deopt, so it has to be known before liveness: a conjunct the carrier
-    // discharges is not a root, one it does not carry IS.
+/// Emit the body of one member: fills `e.body` and `e.variants` from the
+/// graph, and rewrites the output fields to name graph nodes.
+///
+/// The free choices - the six buttons - are ELIMINATED here rather than
+/// deferred to the compiler. The graph is rebuilt once per assignment into
+/// one shared hash-consed arena, so a value two assignments compute the
+/// same way IS one node, and the whole body is emitted once, straight
+/// line. What used to be a shared prefix plus a suffix monomorphized 64
+/// times is now just... the body.
+///
+/// Two things fall out that the prefix/suffix split could not express. A
+/// node depending on k of the six bits is computed 2^k times rather than
+/// 64 (and often fewer, because substituting a constant FOLDS: with
+/// `right` held true, `Sel(right, 1, Sel(left, -1, 0))` is 1 whatever
+/// `left` is, so those two assignments intern to the same node). And
+/// assignments whose entire result agrees - outputs, validity and
+/// liveness - collapse to one `Variant`, because they are the same
+/// successor state and dedup would have merged their rows anyway.
+pub(crate) fn emit_body(e: &mut Emit, of: &mut OutFields) -> Result<()> {
+    // --- specialize every free assignment into ONE arena ---
+    let mut sp = Graph::new();
+    let maps: Vec<Vec<NodeId>> = (0u8..64).map(|m| e.graph.specialize_into(m, &mut sp)).collect();
+    let n = sp.len();
+
+    // Two assignments are the same successor iff they agree on every
+    // output, on which lanes are valid, and on which lanes are live. The
+    // last two are not optional: `dispatch.rs` ignores the variant mask
+    // but accumulates `deopt_rows` from `kout.deopt & kout.valid` and
+    // aborts the chunk on `kout.bd`, so two assignments writing the same
+    // cells while deopting different lanes are NOT interchangeable.
+    let mut sigs: BTreeMap<Vec<NodeId>, u8> = BTreeMap::new();
+    for m in 0u8..64 {
+        let mut sig: Vec<NodeId> = of.fields.iter().map(|f| maps[m as usize][f.node as usize]).collect();
+        sig.push(maps[m as usize][e.ok as usize]);
+        sig.push(maps[m as usize][e.live as usize]);
+        sigs.entry(sig).or_insert(m);
+    }
+    let reps: Vec<u8> = {
+        let mut r: Vec<u8> = sigs.values().copied().collect();
+        r.sort_unstable();
+        r
+    };
+
+    // --- representations, for every node in the specialized arena ---
     let mut ctx = Ctx {
-        g: &e.graph,
+        g: &sp,
         uni: &e.uni,
         vary: &e.vary_in,
         repr: vec![Repr::num(false, false); n],
@@ -646,23 +682,25 @@ pub(crate) fn emit_body(e: &mut Emit, of: &mut OutFields) -> Result<()> {
     }
 
     // --- what has to exist ---
-    // Every conjunct of `ok` is a root: it is a value the member's
-    // validity reads, exactly like an output cell. Nothing enforces a
-    // premise implicitly any more, so nothing has to be kept alive on the
-    // strength of a side effect.
-    let conj: Vec<NodeId> = conjuncts(&e.graph, e.ok)
-        .into_iter()
-        .filter(|c| !vacuous(&ctx, *c))
-        .collect();
-    let mut roots: Vec<NodeId> = of.fields.iter().map(|f| f.node).collect();
-    roots.extend(conj.iter().copied());
-    // The split groups: their masks build the live-lane chain.
+    // Per representative: its outputs, and every conjunct of its validity.
+    let mut conj_of: BTreeMap<u8, Vec<NodeId>> = BTreeMap::new();
+    let mut roots: Vec<NodeId> = Vec::new();
+    for r in &reps {
+        let map = &maps[*r as usize];
+        roots.extend(of.fields.iter().map(|f| map[f.node as usize]));
+        let cs: Vec<NodeId> = conjuncts(&sp, map[e.ok as usize])
+            .into_iter()
+            .filter(|c| !vacuous(&ctx, *c))
+            .collect();
+        roots.extend(cs.iter().copied());
+        conj_of.insert(*r, cs);
+    }
     for id in 0..n as NodeId {
-        if matches!(e.graph.get(id).op, Op::Split(_)) {
+        if matches!(sp.get(id).op, Op::Split(_)) {
             roots.push(id);
         }
     }
-    let live = reachable(&e.graph, &roots);
+    let live = reachable(&sp, &roots);
 
     // --- names and inline forms ---
     for id in 0..n as NodeId {
@@ -673,9 +711,6 @@ pub(crate) fn emit_body(e: &mut Emit, of: &mut OutFields) -> Result<()> {
         match inline(ctx.g, id, r) {
             Some(text) => ctx.expr[id as usize] = Some(text),
             None => {
-                // The split group is named by its INDEX: the loop
-                // variable, the fragment and the mask are one unit, and
-                // the mask is not a value the rest of the body reads.
                 let name = match &ctx.g.get(id).op {
                     Op::Split(d) => format!("f{}", d),
                     Op::SplitValid(d) => format!("f{}_fv", d),
@@ -687,28 +722,18 @@ pub(crate) fn emit_body(e: &mut Emit, of: &mut OutFields) -> Result<()> {
         }
     }
 
-    // --- placement ---
-    // Level 0 is outside every split loop; level d+1 is inside loops 0..=d.
+    // --- placement: only the SPLITS scope anything now ---
+    let scone = sp.split_cones();
     let level = |id: NodeId| -> usize {
-        let m = fcone[id as usize];
-        if m == 0 {
-            0
-        } else {
-            8 - m.leading_zeros() as usize
-        }
+        let m = scone[id as usize];
+        if m == 0 { 0 } else { 8 - m.leading_zeros() as usize }
     };
-    let in_suffix = |id: NodeId| bcone[id as usize] != 0;
 
-    // --- emit ---
     let depth = e.fork_depth;
-    let mut pre: Vec<Line> = Vec::new();
-    let mut suf: Vec<Line> = Vec::new();
+    let mut body: Vec<Line> = Vec::new();
     let mut var_ty: std::collections::HashMap<String, &'static str> =
         std::collections::HashMap::new();
-    let mut pre_defs: BTreeSet<String> = BTreeSet::new();
-    let mut tainted_vars: BTreeSet<String> = BTreeSet::new();
 
-    // Per-lane inputs materialize first; the whole body reads them by name.
     for (id, kind) in &e.vary_in {
         let (ty, load) = match *kind {
             "num" => ("ZN", format!("let r_c{}: ZN = rin.c{};", id, id)),
@@ -718,181 +743,117 @@ pub(crate) fn emit_body(e: &mut Emit, of: &mut OutFields) -> Result<()> {
             ),
             other => bail!("varying cell {} has kind {:?}", id, other),
         };
-        pre.push(Line::Raw(load));
+        body.push(Line::Raw(load));
         var_ty.insert(format!("r_c{}", id), ty);
-        pre_defs.insert(format!("r_c{}", id));
-    }
-    for k in 0..6 {
-        tainted_vars.insert(format!("kb{}", k));
     }
 
     let mut valid_expr = "ALL".to_string();
-    let mut ok_expr = "ALL".to_string();
-    let mut bd_expr = "false".to_string();
-    // Fold the conjuncts available at one scope into the running validity.
-    // Per-lane conditions AND into a mask; block-uniform ones OR into the
-    // slice's bail flag. Which of the two a condition is was decided by
-    // its representation, not by where it was written.
-    let fold_terms = |tag: &str,
-                          buf: &mut Vec<Line>,
-                          var_ty: &mut std::collections::HashMap<String, &'static str>,
-                          terms: Vec<Term>,
-                          ok_expr: &mut String,
-                          bd_expr: &mut String| {
-        let mut lanes: Vec<String> = Vec::new();
-        let mut blocks: Vec<String> = Vec::new();
-        for t in terms {
-            match t {
-                Term::Lanes(m) => lanes.push(m),
-                Term::Block(b) => blocks.push(b),
-            }
-        }
-        if !lanes.is_empty() {
-            let name = format!("ok{}", tag);
-            buf.push(Line::Let {
-                name: name.clone(),
-                ty: "u16",
-                expr: format!("{} & {}", ok_expr, lanes.join(" & ")),
-            });
-            var_ty.insert(name.clone(), "u16");
-            *ok_expr = name;
-        }
-        if !blocks.is_empty() {
-            let name = format!("bd{}", tag);
-            buf.push(Line::Let {
-                name: name.clone(),
-                ty: "bool",
-                expr: format!("{} || {}", bd_expr, blocks.join(" || ")),
-            });
-            var_ty.insert(name.clone(), "bool");
-            *bd_expr = name;
-        }
-    };
     for lvl in 0..=depth {
-        // Values, then the guards over them, then the next split.
         for id in 0..n as NodeId {
-            if !live[id as usize] || level(id) != lvl || in_suffix(id) {
+            if !live[id as usize] || level(id) != lvl {
                 continue;
             }
             if matches!(ctx.g.get(id).op, Op::Split(_) | Op::SplitValid(_)) {
                 continue; // emitted as part of the split group
             }
-            emit_node(&ctx, &mut pre, &mut var_ty, id)?;
+            emit_node(&ctx, &mut body, &mut var_ty, id)?;
         }
-        let terms = conj
-            .iter()
-            .filter(|c| level(**c) == lvl && !in_suffix(**c))
-            .map(|c| conjunct_term(&ctx, *c))
-            .collect::<Result<Vec<_>>>()?;
-        fold_terms(
-            &format!("{}", lvl),
-            &mut pre,
-            &mut var_ty,
-            terms,
-            &mut ok_expr,
-            &mut bd_expr,
-        );
         if lvl == depth {
             break;
         }
-        // The split group: open the loop, shadow the deopt channels so
-        // one outcome's failures do not leak into the next, narrow, and
-        // skip the outcome entirely when no lane lives in it. That skip
-        // is why splits stay a runtime loop while free choices get fully
-        // specialized: a split outcome is often EMPTY, and all 64 free
-        // outcomes always happen.
         let d = lvl;
         let split = (0..n as NodeId)
             .find(|id| live[*id as usize] && matches!(ctx.g.get(*id).op, Op::Split(x) if x as usize == d))
             .ok_or_else(|| anyhow::anyhow!("split {} has no node", d))?;
         let fname = ctx.name[split as usize].clone().unwrap();
         let src = ctx.expr[ctx.g.get(split).args[0] as usize].clone().unwrap();
-        pre.push(Line::Raw(format!("for c{} in 0..2usize {{", d)));
-        pre.push(Line::Raw(format!(
+        body.push(Line::Raw(format!("for c{} in 0..2usize {{", d)));
+        body.push(Line::Raw(format!(
             "let ({f}, {f}_fv): (ZI, u16) = zi_fork_flr({s}, c{d});",
             f = fname, s = src, d = d
         )));
-        pre.push(Line::Raw(format!(
+        body.push(Line::Raw(format!(
             "let valid{}: u16 = {} & {}_fv;",
             d, valid_expr, fname
         )));
-        pre.push(Line::Raw(format!("if valid{} == 0 {{ continue; }}", d)));
+        body.push(Line::Raw(format!("if valid{} == 0 {{ continue; }}", d)));
         var_ty.insert(fname.clone(), "ZI");
         var_ty.insert(format!("valid{}", d), "u16");
-        pre_defs.insert(fname);
-        pre_defs.insert(format!("valid{}", d));
         valid_expr = format!("valid{}", d);
     }
-    // Everything a free-choice variant observes, at the innermost split.
-    for id in 0..n as NodeId {
-        if !live[id as usize] || !in_suffix(id) {
-            continue;
+
+    // --- per-representative validity, at the innermost scope ---
+    // Every conjunct is an ordinary node emitted above; all that is left
+    // is to read each at the right width and AND/OR them together. No
+    // per-level accumulation, because validity is a value and nothing
+    // reads it until the end.
+    let mut variants: Vec<Variant> = Vec::new();
+    for r in &reps {
+        let (mut lanes, mut blocks) = (Vec::new(), Vec::new());
+        for c in &conj_of[r] {
+            match conjunct_term(&ctx, *c)? {
+                Term::Lanes(m) => lanes.push(m),
+                Term::Block(b) => blocks.push(b),
+            }
         }
-        emit_node(&ctx, &mut suf, &mut var_ty, id)?;
+        let ok = format!("ok_v{}", r);
+        let bd = format!("bd_v{}", r);
+        body.push(Line::Let {
+            name: ok.clone(),
+            ty: "u16",
+            expr: if lanes.is_empty() { "ALL".into() } else { format!("ALL & {}", lanes.join(" & ")) },
+        });
+        body.push(Line::Let {
+            name: bd.clone(),
+            ty: "bool",
+            expr: if blocks.is_empty() { "false".into() } else { blocks.join(" || ") },
+        });
+        var_ty.insert(ok.clone(), "u16");
+        var_ty.insert(bd.clone(), "bool");
+        let map = &maps[*r as usize];
+        let mut outputs = BTreeMap::new();
+        for f in of.fields.iter() {
+            let want = repr_of_ty(f.ty)?;
+            let node = map[f.node as usize];
+            let have = ctx.repr[node as usize];
+            if !want.admits(have) {
+                bail!(
+                    "output cell {} wants a {} but the graph computes a {}",
+                    f.cell, want.ty(), have.ty()
+                );
+            }
+            outputs.insert(f.cell, coerce(ctx.expr[node as usize].as_deref().unwrap(), have, want)?);
+        }
+        variants.push(Variant { mask: *r, outputs, ok, bd });
     }
-    // Close the prefix off under FIXED names, even when nothing narrowed
-    // the validity. Two consumers look these up - `render` puts them in
-    // `Pre`, `transpile::fuse` needs each member's own - and a name that
-    // is sometimes `ok3` and sometimes the literal `ALL` is not something
-    // either can ask for.
-    pre.push(Line::Let { name: "ok_pre".into(), ty: "u16", expr: ok_expr.clone() });
-    pre.push(Line::Let { name: "bd_pre".into(), ty: "bool", expr: bd_expr.clone() });
-    var_ty.insert("ok_pre".into(), "u16");
-    var_ty.insert("bd_pre".into(), "bool");
 
-    // The suffix folds its own conjuncts on top of the prefix's. It names
-    // `ok_pre` rather than reaching for a `Pre` field, so the value
-    // crosses by the ordinary crossing rule - which matters because the
-    // FUSED artifact has one `ok_pre` per member and no single field
-    // could stand for all of them.
-    ok_expr = "ok_pre".to_string();
-    bd_expr = "bd_pre".to_string();
-    let terms = conj
-        .iter()
-        .filter(|c| in_suffix(**c))
-        .map(|c| conjunct_term(&ctx, *c))
-        .collect::<Result<Vec<_>>>()?;
-    fold_terms("_s", &mut suf, &mut var_ty, terms, &mut ok_expr, &mut bd_expr);
-    suf.push(Line::Let { name: "ok_out".into(), ty: "u16", expr: ok_expr.clone() });
-    suf.push(Line::Let { name: "bd_out".into(), ty: "bool", expr: bd_expr.clone() });
-    var_ty.insert("ok_out".into(), "u16");
-    var_ty.insert("bd_out".into(), "bool");
-
-    // --- output fields, read at the representation the boundary wants ---
+    // A cell is per-variant only if the variants DISAGREE about it. That
+    // is exact, where the old button-cone test was an over-approximation:
+    // a value can depend on a button and still be the same in every
+    // assignment, and such a cell belongs in the shared output.
     for f in of.fields.iter_mut() {
-        let want = repr_of_ty(f.ty)?;
-        let have = ctx.repr[f.node as usize];
-        if !want.admits(have) {
-            bail!(
-                "output cell {} wants a {} but the graph computes a {}",
-                f.cell, want.ty(), have.ty()
-            );
-        }
-        f.expr = coerce(ctx.expr[f.node as usize].as_deref().unwrap(), have, want)?;
-        // Taint from the CONE, not from where the value happened to be
-        // bound: a splat of a prefix value inside the suffix used to make
-        // a choice-independent output look choice-dependent.
-        f.tainted = bcone[f.node as usize] != 0;
+        let first = variants[0].outputs[&f.cell].clone();
+        f.tainted = variants.iter().any(|v| v.outputs[&f.cell] != first);
+        f.expr = first;
     }
 
-    for line in &pre {
-        if let Line::Let { name, .. } = line {
-            pre_defs.insert(name.clone());
-        }
+    // Which representative each of the 64 assignments collapsed onto. The
+    // FUSED artifact needs it: two assignments are interchangeable there
+    // only if EVERY member says so, and a member's own collapse is
+    // coarser than the fused one.
+    let mut rep_of = [0u8; 64];
+    for m in 0u8..64 {
+        let mut sig: Vec<NodeId> = of.fields.iter().map(|f| maps[m as usize][f.node as usize]).collect();
+        sig.push(maps[m as usize][e.ok as usize]);
+        sig.push(maps[m as usize][e.live as usize]);
+        rep_of[m as usize] = sigs[&sig];
     }
-    for line in &suf {
-        if let Line::Let { name, .. } = line {
-            tainted_vars.insert(name.clone());
-        }
-    }
-    e.pre = pre;
-    e.suf = suf;
+
+    e.body = body;
     e.var_ty = var_ty;
-    e.pre_defs = pre_defs;
-    e.tainted_vars = tainted_vars;
     e.valid_expr = valid_expr;
-    e.ok_expr = "ok_out".to_string();
-    e.bd_expr = "bd_out".to_string();
+    e.variants = variants;
+    e.rep_of = rep_of;
     Ok(())
 }
 

@@ -564,12 +564,6 @@ pub fn row_keys(chunk: &Rt2, lo: usize, n: usize, sh: &KOutShared, kv: &KOut, pl
     }
 }
 
-pub struct Pre {
-    bd_pre: bool,
-    ok_pre: u16,
-    valid: u16,
-}
-
 #[inline(never)]
 pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared, &KOut)) {
     let r_c234: ZN = rin.c234;
@@ -583,63 +577,41 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOutShared,
     let r_c272: ZB = ZB { val: rin.c272, known: ALL };
     let r_c280: ZN = rin.c280;
     let r_c281: ZN = rin.c281;
-    let n9: P8 = u.c84 + P8::from_raw(65536i32);
-    let n11: P8 = n9 % P8::from_raw(1966080i32);
-    let n13: bool = n11 == P8::from_raw(0i32);
-    let n16: P8 = u.c158 % P8::from_raw(524288i32);
-    let n18: P8 = u.c159 * P8::from_raw(524288i32);
-    let n19: P8 = n16 + n18;
-    let n20: bool = n19 < P8::from_raw(1966080i32);
-    let n21: bool = if n13 { n20 } else { n13 };
-    let n22: bool = !n21;
-    let n24: bool = u.c20 > P8::from_raw(0i32);
-    let n26: P8 = u.c20 - P8::from_raw(65536i32);
-    let n27: bool = n26 > P8::from_raw(0i32);
-    let n30: ZB = zn_lt(r_c253, zn_splat(P8::from_raw(-65536i32)));
-    let n32: ZB = zn_gt(r_c253, zn_splat(P8::from_raw(7929856i32)));
-    let n33: ZB = zsel_b(n30, n30, n32);
-    let n34: ZB = ZB { val: n30.known, known: ALL };
-    let n36: ZN = zn_min(zn_splat(P8::from_raw(7929856i32)), r_c253);
-    let n37: ZN = zn_max(zn_splat(P8::from_raw(-65536i32)), n36);
-    let n39: ZN = zsel_n(n33, zn_splat(P8::from_raw(0i32)), r_c280);
-    let n40: ZB = ZB { val: n33.known, known: ALL };
-    let n42: ZN = zsel_n(n33, n37, r_c253);
-    let n44: ZN = if n27 { r_c253 } else { n42 };
-    let n45: ZN = if n27 { r_c280 } else { n39 };
-    let ok0: u16 = ALL & zb_holds(n34) & zb_holds(n40);
-    let bd0: bool = false || !n22 || !n24;
-    let ok_pre: u16 = ok0;
-    let bd_pre: bool = bd0;
-    let p = Pre {
-        bd_pre,
-        ok_pre,
-        valid: ALL,
-    };
+    let n4: P8 = u.c84 + P8::from_raw(65536i32);
+    let n6: P8 = n4 % P8::from_raw(1966080i32);
+    let n8: bool = n6 == P8::from_raw(0i32);
+    let n11: P8 = u.c158 % P8::from_raw(524288i32);
+    let n13: P8 = u.c159 * P8::from_raw(524288i32);
+    let n14: P8 = n11 + n13;
+    let n15: bool = n14 < P8::from_raw(1966080i32);
+    let n16: bool = if n8 { n15 } else { n8 };
+    let n17: bool = !n16;
+    let n19: bool = u.c20 > P8::from_raw(0i32);
+    let n21: P8 = u.c20 - P8::from_raw(65536i32);
+    let n22: bool = n21 > P8::from_raw(0i32);
+    let n25: ZB = zn_lt(r_c253, zn_splat(P8::from_raw(-65536i32)));
+    let n27: ZB = zn_gt(r_c253, zn_splat(P8::from_raw(7929856i32)));
+    let n28: ZB = zsel_b(n25, n25, n27);
+    let n29: ZB = ZB { val: n25.known, known: ALL };
+    let n31: ZN = zn_min(zn_splat(P8::from_raw(7929856i32)), r_c253);
+    let n32: ZN = zn_max(zn_splat(P8::from_raw(-65536i32)), n31);
+    let n34: ZN = zsel_n(n28, zn_splat(P8::from_raw(0i32)), r_c280);
+    let n35: ZB = ZB { val: n28.known, known: ALL };
+    let n37: ZN = zsel_n(n28, n32, r_c253);
+    let n39: ZN = if n22 { r_c253 } else { n37 };
+    let n40: ZN = if n22 { r_c280 } else { n34 };
+    let ok_v0: u16 = ALL & zb_holds(n29) & zb_holds(n35);
+    let bd_v0: bool = !n17 || !n19;
     let osh = KOutShared {
-        c20: n26,
-        c84: n11,
-        c253: n44,
-        c280: n45,
+        c20: n21,
+        c84: n6,
+        c253: n39,
+        c280: n40,
     };
-    // suffix observes button bits []: 1 distinct variant(s)
-    suffix::<0>(u, g, &p, &osh, out);
-}
-
-#[inline(never)]
-fn suffix<const B: u8>(u: &Uni, g: &G, p: &Pre, osh: &KOutShared, out: &mut impl FnMut(u8, &KOutShared, &KOut)) {
-    let bd_pre = p.bd_pre;
-    let ok_pre = p.ok_pre;
-    let kb0: bool = (B >> 0) & 1 != 0;
-    let kb1: bool = (B >> 1) & 1 != 0;
-    let kb2: bool = (B >> 2) & 1 != 0;
-    let kb3: bool = (B >> 3) & 1 != 0;
-    let kb4: bool = (B >> 4) & 1 != 0;
-    let kb5: bool = (B >> 5) & 1 != 0;
-    let ok_out: u16 = ok_pre;
-    let bd_out: bool = bd_pre;
-    out(B, osh, &KOut {
-        valid: p.valid,
-        deopt: !ok_out,
-        bd: bd_out,
+    // 1 of 64 free assignments are distinct successors
+    out(0, &osh, &KOut {
+        valid: ALL,
+        deopt: !ok_v0,
+        bd: bd_v0,
     });
 }

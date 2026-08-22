@@ -90,10 +90,12 @@ struct PMember {
     label: String,
     e: Emit,
     of: OutFields,
-    /// Pre items split into fork segments: segment k = items before the
-    /// k-th fork open; the fork open itself starts segment k+1.
-    pre_segs: Vec<Vec<PItem>>,
-    suf: Vec<PItem>,
+    /// Items split into fork segments: segment k = items before the k-th
+    /// fork open; the fork open itself starts segment k+1. There is no
+    /// second region any more - the free choices are eliminated before
+    /// this ever sees the body, so there is no button suffix to keep
+    /// apart from a prefix.
+    segs: Vec<Vec<PItem>>,
     /// r_cN input-load lines, verbatim (must match across members).
     loads: Vec<String>,
     /// member-local var name -> canonical id.
@@ -163,19 +165,12 @@ fn parse_member(label: &str, mut e: Emit, mi: usize, ctx: &mut Ctx) -> Result<PM
     let mbit = 1u8 << mi;
     let mut vn: HashMap<String, u32> = HashMap::new();
     let mut loads: Vec<String> = Vec::new();
-    let mut pre_segs: Vec<Vec<PItem>> = vec![Vec::new()];
-    let mut suf: Vec<PItem> = Vec::new();
+    let mut segs: Vec<Vec<PItem>> = vec![Vec::new()];
 
-    // The fork group is 6 consecutive Raw lines; track how many of the
-    // fixed header lines remain to swallow after a fork opening.
-    for (region, lines) in [(0u8, &e.pre), (1u8, &e.suf)] {
-        let mut iter = lines.iter().peekable();
+    {
+        let mut iter = e.body.iter().peekable();
         while let Some(line) = iter.next() {
-            let items: &mut Vec<PItem> = if region == 0 {
-                pre_segs.last_mut().unwrap()
-            } else {
-                &mut suf
-            };
+            let items: &mut Vec<PItem> = segs.last_mut().unwrap();
             match line {
                 Line::Let { name, ty, expr } => {
                     if expr.contains(", &mut dp") {
@@ -217,9 +212,6 @@ fn parse_member(label: &str, mut e: Emit, mi: usize, ctx: &mut Ctx) -> Result<PM
                     if s.starts_with("let r_c") {
                         loads.push(s.clone());
                     } else if s.starts_with("for c") && s.ends_with(" in 0..2usize {") {
-                        if region != 0 {
-                            bail!("member {}: fork in the button suffix", label);
-                        }
                         let fork_line = match iter.next() {
                             Some(Line::Raw(t)) if t.contains("zi_fork_flr(") => t.clone(),
                             other => bail!("member {}: missing zi_fork_flr after fork open ({:?})", label, other.map(|l| format!("{:?}", l))),
@@ -259,8 +251,8 @@ fn parse_member(label: &str, mut e: Emit, mi: usize, ctx: &mut Ctx) -> Result<PM
                             Some(Line::Raw(t)) if t == &format!("if valid{} == 0 {{ continue; }}", depth) => {}
                             other => bail!("member {}: missing continue after fork ({:?})", label, other.map(|l| format!("{:?}", l))),
                         }
-                        pre_segs.last_mut().unwrap().push(PItem::ForkOpen(id));
-                        pre_segs.push(Vec::new());
+                        segs.last_mut().unwrap().push(PItem::ForkOpen(id));
+                        segs.push(Vec::new());
                     } else {
                         bail!("member {}: unclassified raw line {:?}", label, s);
                     }
@@ -268,7 +260,7 @@ fn parse_member(label: &str, mut e: Emit, mi: usize, ctx: &mut Ctx) -> Result<PM
             }
         }
     }
-    Ok(PMember { label: label.to_string(), e, of, pre_segs, suf, loads, vn })
+    Ok(PMember { label: label.to_string(), e, of, segs, loads, vn })
 }
 
 fn lower(members: &[(String, Program)], witness_path: &str, ctx: &mut Ctx) -> Result<Vec<PMember>> {
@@ -302,8 +294,7 @@ pub fn fuse_census(members: &[(String, Program)], witness_path: &str) -> Result<
                 .filter(|(_, d)| d.members & mbit != 0)
                 .map(|(id, _)| *id)
                 .collect();
-            let n: usize = pm.pre_segs.iter().map(|s| s.len()).sum::<usize>()
-                + pm.suf.len();
+            let n: usize = pm.segs.iter().map(|s| s.len()).sum::<usize>();
             (pm.label.clone(), ids.into_iter().collect(), n)
         })
         .collect();
@@ -378,13 +369,13 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
         if pm.e.fork_depth != primary.e.fork_depth || pm.e.valid_expr != primary.e.valid_expr {
             bail!("member {} fork structure differs", pm.label);
         }
-        if pm.pre_segs.len() != primary.pre_segs.len() {
+        if pm.segs.len() != primary.segs.len() {
             bail!("member {} fork segment count differs", pm.label);
         }
     }
     // Fork skeletons: the k-th fork of every member must be the same node.
     let fork_seq = |pm: &PMember| -> Vec<u32> {
-        pm.pre_segs
+        pm.segs
             .iter()
             .flatten()
             .filter_map(|it| match it {
@@ -523,7 +514,7 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
     // the per-member streams.
     let mut fork_members: BTreeMap<u32, u8> = BTreeMap::new();
     for (mi, pm) in pms.iter().enumerate() {
-        for it in pm.pre_segs.iter().flatten().chain(pm.suf.iter()) {
+        for it in pm.segs.iter().flatten() {
             match it {
                 PItem::ForkOpen(id) => *fork_members.entry(*id).or_insert(0) |= 1 << mi,
                 _ => {}
@@ -596,11 +587,11 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
         };
 
         // Prefix: segment s of every member, then the shared fork open.
-        let n_segs = primary.pre_segs.len();
+        let n_segs = primary.segs.len();
         for s in 0..n_segs {
             // Non-fork items of this segment, member by member.
             for pm in &pms {
-                for it in &pm.pre_segs[s] {
+                for it in &pm.segs[s] {
                     if matches!(it, PItem::ForkOpen(_)) {
                         continue;
                     }
@@ -608,17 +599,11 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
                 }
             }
             // The fork closing this segment (identical across members).
-            if let Some(PItem::ForkOpen(id)) = primary.pre_segs[s]
+            if let Some(PItem::ForkOpen(id)) = primary.segs[s]
                 .iter()
                 .find(|it| matches!(it, PItem::ForkOpen(_)))
             {
                 emit_item(&PItem::ForkOpen(*id), 0, &mut pre, &mut pre_defs, &mut var_ty, &mut valid_stack, &mut fork_count)?;
-            }
-        }
-        // Suffix: single segment.
-        for pm in &pms {
-            for it in &pm.suf {
-                emit_item(it, 1, &mut suf, &mut pre_defs, &mut var_ty, &mut valid_stack, &mut fork_count)?;
             }
         }
     }
@@ -652,6 +637,26 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
             .ok_or_else(|| anyhow!("member {} has no bd_out", pm.label))?;
         Ok(format!("n{}", id))
     };
+
+    // TEMPORARY, and loud on purpose. The free choices are now eliminated
+    // before this code ever sees a body: `transpile::lower` specializes
+    // the graph on all 64 assignments and hands back one flat body plus a
+    // list of DISTINCT variants. Everything below still assumes the old
+    // shape - a shared prefix, a `suffix::<const B: u8>` monomorphized 64
+    // times, and ONE output expression per cell - so it would emit a
+    // single variant's outputs for all 64 assignments and be silently
+    // wrong rather than fail. Refuse instead.
+    //
+    // The port is a deletion: M1 stages 1-3 exist to share work ACROSS the
+    // 64 monomorphizations, which specialization has already done.
+    if pms.iter().any(|pm| pm.e.variants.len() > 1) {
+        bail!(
+            "the fused emitter has not been ported to specialized variants \
+             (members have {:?} distinct assignments). It would emit one \
+             variant's outputs for all 64 - see the comment here.",
+            pms.iter().map(|pm| pm.e.variants.len()).collect::<Vec<_>>()
+        );
+    }
 
     // --- fused out fields (primary member's, exprs renamed) ---
     let fused_of = OutFields {

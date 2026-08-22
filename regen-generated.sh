@@ -25,8 +25,12 @@ cd "$(dirname "$0")"
 SCRATCH=$(mktemp -d)
 trap 'rm -rf "$SCRATCH"' EXIT
 
+# QUICK, not release. `transpile` prints text - no number anyone quotes
+# comes out of it - so `lto = "fat"` + `codegen-units = 1` buys nothing
+# here. Measured 2026-08-22: 15 s to build under quick against ~78 s under
+# release, for a generator that runs 24.6 s instead of 22.3 s.
 echo "==> building the generator"
-cargo build --release --bin transpile
+cargo build --profile quick --bin transpile
 
 # The nine generation jobs are independent processes writing to distinct
 # scratch files, so they run CONCURRENTLY. Serially this was ~147 s of the
@@ -46,9 +50,9 @@ start() {  # start NAME CMD...
 }
 
 echo "==> generating name tables + 8 kernels (parallel)"
-start names ./target/release/transpile --recipe rewrites-compile.jsonl "$SCRATCH/gen.rs"
+start names ./target/quick/transpile --recipe rewrites-compile.jsonl "$SCRATCH/gen.rs"
 for class in steady dash frozen; do
-    start "$class" ./target/release/transpile \
+    start "$class" ./target/quick/transpile \
         --recipe "rewrites-trace10-$class.jsonl" \
         --kernel "crates/celeste-kernels/witness/$class-shape.json" \
         "$SCRATCH/kernel_gen_$class.rs"
@@ -59,7 +63,7 @@ done
 # and witness file names use hyphens; ${class//_/-} maps between them.
 for class in $R20_CLASSES; do
     hy=${class//_/-}
-    CELESTE_START_ROOM=2,0 start "r20_$class" ./target/release/transpile \
+    CELESTE_START_ROOM=2,0 start "r20_$class" ./target/quick/transpile \
         --recipe "rewrites-trace20-$hy.jsonl" \
         --kernel "crates/celeste-kernels/witness/r20-$hy-shape.json" \
         "$SCRATCH/kernel_gen_r20_$class.rs"
@@ -96,8 +100,11 @@ for class in $R20_CLASSES; do
     cp "$SCRATCH/kernel_gen_r20_$class.rs" "crates/celeste-kernels/src/kernel_gen_r20_$class.rs"
 done
 
+# Also quick: this step answers "does the generated code COMPILE", and
+# release answers it no better for ~4x the wall time. It no longer leaves
+# fresh release binaries behind - build those yourself before benching.
 echo "==> checking the workspace still builds with them"
-if ! cargo build --release; then
+if ! cargo build --profile quick; then
     echo "!! the regenerated code does not build - restoring the committed version" >&2
     restore
     exit 1
@@ -108,9 +115,10 @@ echo
 echo "regenerated. Now read the diff:"
 git --no-pager diff --stat crates/celeste-names/src/gen.rs crates/celeste-kernels/src/
 echo
-echo "NOTE: the build check above rewrote target/release binaries WITHOUT the"
-echo "fused feature, and a later fused rebuild may see a fresh fingerprint and"
-echo "skip the relink (BENCHMARK_DATA.md, M1 stage 3). If you use the fused"
-echo "engine:  touch native-probe/src/main.rs && cargo build --release -p"
-echo "native-probe --features celeste-rust/fused   and check for the"
-echo "'fused: lanes' stderr line before benching."
+echo "NOTE: this script builds under [profile.quick] and does NOT refresh"
+echo "target/release. Before benchmarking or running the gate, build release"
+echo "yourself. If you use the fused engine:  touch native-probe/src/main.rs"
+echo "&& cargo build --release -p native-probe --features celeste-rust/fused"
+echo "and check for the 'fused: lanes' stderr line before benching (a fused"
+echo "rebuild can see a fresh fingerprint and skip the relink -"
+echo "BENCHMARK_DATA.md, M1 stage 3)."
