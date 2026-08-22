@@ -698,6 +698,107 @@ Still open from the audit, both unreachable: the IR pipeline's
 `local x = <expr mentioning x>` sees the new nil cell (the tracer is
 correct here), and `run_for_symbolic`'s obligation could be more precise.
 
+### T10 - the emitter join, and what a variant is worth (landed 2d0b65f..da06a33)
+
+`transpile::lower` is the emitter the generated crates already use and it
+consumes a `Graph`. The tracer produces a `Graph` with none of the
+rewrites. They now meet: `trace::emit::lower_frame` builds an `Emit`
+around a traced graph and `emit_body` lowers it.
+
+    outcome            lines   variants   scalar cells
+    0 player died         38          1             53
+    1 no objects      10,801         40             34
+    2 new room        18,576         40            104
+    3 player alive    13,267         40             58
+
+Three gaps, each found by running it rather than by reading:
+
+* **`Op::And` had no general lowering.** Every `And` the old front end
+  built was the `Known(x) AND x` idiom or a validity conjunct that
+  `emit_body` FLATTENS, so an `And` was never rendered as a value, and the
+  engine had no `zb_and`. A traced graph builds them freely - a guard is
+  `g AND c`, `or` is De Morgan over two, and `ok` is a select tree whose
+  arms are conjunctions. `zb_and` is Kleene and matches `Graph::fold`'s
+  rule deliberately: the folder and the emitter must agree about what an
+  AND means or a folded graph and an emitted one answer differently.
+* **No uniform/per-lane classification for inputs.** `tile_flag_at` takes
+  width and height as block-uniform `P8`. Stubbed by string-matching
+  `.hitbox.`; see below.
+* **Output kinds were derived from the node's op**, which is unknowable
+  for `Op::Cell` and `Op::Sel`. `FrameOut` carries the kind now.
+
+#### The two things between here and a kernel that runs
+
+**Uniform vs per-lane.** The search runs a BLOCK of states, 16 to a SIMD
+register, so every value is either per-lane (`ZN`, sixteen numbers) or
+block-uniform (`P8`, one). `Ctx::derive` already propagates this as a
+fixed point over the graph - `lane: args.any(|a| r(a).lane)` - so nothing
+has to carry the annotation around. What is missing is only the SEED, and
+the seed is not derivable: whether `hitbox.w` is uniform is a fact about
+how states were grouped into a block, not about the program. So the
+tracer must DECLARE it and the existing bind-time guards must enforce it.
+
+**Boundary numbering.** Generated code says "read column 23". Four things
+must agree on which field is which column: the loader, the kernel, the
+unloader, and the row-key hash the search dedups on. Today that agreement
+is defined by the IR pipeline, quirks included - a global holding a Lua
+function is a `Val` cell pointing at a `Clo` cell, while a global holding
+a builtin IS the builtin's cell, which is a fact about how the IR heap was
+built and not about the program.
+
+DECISION (Philippe): do not reproduce those quirks. The numbering will be
+the tracer's own, clean. The cost to know going in: it feeds the shape
+hash and the row keys, so switching invalidates checkpoints and makes the
+existing kernels non-comparable. Not a change that can be done halfway.
+
+#### What a variant is worth
+
+The emitter dedups the 64 button assignments on (outputs, `ok`, `live`),
+keyed by structural node identity after specialisation. The HONEST
+question - Philippe's - is how many distinct successor ROWS can actually
+come out; anything above that is code no input can tell apart. Measured
+with `trace::eval` over 51 input points, counting only assignments whose
+guard holds and whose `ok` is true:
+
+    outcome            emitter keeps    rows possible
+    0 player died                  1                1
+    1 no objects                  40                2
+    2 new room                    40                2
+    3 player alive                40               24
+
+**Where that costs.** Not code size, which is what I first said. Every
+variant the kernel keeps is a row that gets HASHED AND LOOKED UP, and the
+dedup is expensive relative to running the frame. 40 where 2 are possible
+is a ~20x hashing overhead. Static dedup is on the critical path; there is
+no such thing as over-specialisation, only under-deduplication.
+
+**Why they do not collapse.** They merge exactly when their expressions
+fold to the same tree. `freeze` keeps 33 distinct trees over 64
+assignments: most fold back to the input cell, while the dash ones become
+`freeze = 2 if a dash starts` and differ because their conditions mix
+button constants with player-state cells.
+
+Two levers, worth keeping apart:
+
+1. **Normalisation** - sound and cheap, makes equal-but-differently-written
+   expressions literally the same node. `Op::Or` is a candidate: the
+   tracer's De Morgan makes every `or` three nodes. (Note this retires the
+   old argument for having no `Op::Or` - "a vocabulary entry nothing
+   constructs" - since something now constructs it.)
+2. **Semantic equality beyond folding** - proving two trees always agree.
+   Not free, and unsound by sampling alone, but affordable at build time.
+
+Do (1) first and re-measure. The 2 and the 24 are LOWER bounds over
+sampled points, so they justify normalisation, which can only merge
+genuinely identical things - they do not justify trusting the count.
+
+#### Open, and not to be guessed at
+
+The SIZES. 18,576 lines against `r20_steady`'s 2,094. Not like-for-like -
+these are general where the generated ones are specialised per shape class
+- but removing the button cells moved it only 10,943 -> 10,801, so it is
+not the variants. No explanation yet.
+
 ## Stage 3 - was "control flow", now folded into Stage 2
 
 Written before Stage 2 had a concrete shape; T3 (control flow), T5 (loops)
