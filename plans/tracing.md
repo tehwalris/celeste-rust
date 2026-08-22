@@ -627,6 +627,13 @@ values (the cart uses none), no string concatenation, no `tostr`.
 
 ### T9 - the divergence audit (landed b510784, dec1684, and the ice commit)
 
+The full report is kept verbatim at
+`plans/audit-2026-08-22-tracer-vs-ir.md`, including the "categories
+checked, nothing found" section. That section is the reason to keep it:
+on a re-audit the useful record is not the bugs, which get fixed, but
+what was LOOKED AT and found clean - which is exactly what a summary
+throws away.
+
 An Opus subagent read `src/trace/` against `crates/celeste-ir/src/frontend.rs`
 plus the IR interpreter, construct by construct, settling every question it
 could against real PICO-8. Philippe asked for it as "an extra sanity check";
