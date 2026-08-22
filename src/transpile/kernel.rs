@@ -151,8 +151,9 @@ pub(crate) struct Emit {
     pub(crate) fork_depth: usize,
     /// Name of the current per-lane validity mask ("ALL" at depth 0).
     pub(crate) valid_expr: String,
-    /// Button-TAINT tracking (cross-variant sharing): only instructions
-    /// whose value depends on a button land in the x64 suffix; everything
+    /// Free-choice TAINT tracking (cross-variant sharing): only
+    /// instructions whose value depends on a button land in the x64
+    /// suffix; everything
     /// else is hoisted to the shared per-fork-config prefix, which is
     /// sound because an untainted op only reads untainted defs (all in
     /// the prefix) and the emit-time SSA evaluation already captured the
@@ -590,13 +591,14 @@ pub(crate) fn emit_walk(program: &Program, witness_path: &str) -> Result<Emit> {
     e.live = all;
     e.ok = all;
     load_witness(witness_path, &mut e)?;
-    // The six button bits are graph LEAVES, and they are also emitted
-    // names (the suffix binds `kbK` from its const generic). Registering
-    // them here is what lets a value written straight through to an output
+    // The six buttons are the graph's FREE CHOICES, and leaves: nothing
+    // computes them, the search does. They are also emitted names (the
+    // suffix binds `kbK` from its const generic), and registering them
+    // here is what lets a value written straight through to an output
     // cell - dash stores kb4/kb5 - resolve like any other name.
     for k in 0..6 {
         e.tainted_vars.insert(format!("kb{}", k));
-        let n = e.graph.leaf(GOp::Button(k as u8));
+        let n = e.graph.leaf(GOp::Free(k as u8));
         e.node_of.insert(format!("kb{}", k), n);
     }
 
@@ -1371,7 +1373,7 @@ fn call_intrinsic(e: &mut Emit, name: &str, args: &[LocalId]) -> Result<K> {
                     // next.
                     let v = v.clone();
                     if e.cur_tainted {
-                        bail!("fork on a button-dependent value is not supported (v1)");
+                        bail!("split of a button-dependent value is not supported (v1)");
                     }
                     let d = e.fork_depth;
                     e.line(&format!("for c{} in 0..2usize {{", d));
@@ -1400,19 +1402,19 @@ fn call_intrinsic(e: &mut Emit, name: &str, args: &[LocalId]) -> Result<K> {
                         .graph
                         .operand(&v, &e.node_of)
                         .unwrap_or_else(|err| panic!("fork operand {:?}: {:#}", v, err));
-                    let fork_node = e.graph.add(GOp::Fork(d as u8), vec![fork_arg]);
+                    let fork_node = e.graph.add(GOp::Split(d as u8), vec![fork_arg]);
                     e.node_of.insert(frag.clone(), fork_node);
                     // The fork returns (value, validity); the mask is the
                     // second node, and it narrows this configuration's
                     // validity exactly as `valid{d} = valid & frag_fv` does
                     // in the emitted code.
-                    let fv = e.graph.add(GOp::ForkValid(d as u8), vec![fork_arg]);
+                    let fv = e.graph.add(GOp::SplitValid(d as u8), vec![fork_arg]);
                     e.require_live(fv);
                     // zi_fork_flr also DEOPTS a lane whose interval spans
                     // more than two floors - there is no third fragment to
                     // put it in. That is an ok condition, not a liveness
                     // one, and the fork call is what enforces it.
-                    let fok = e.graph.add(GOp::ForkOk, vec![fork_arg]);
+                    let fok = e.graph.add(GOp::SplitOk, vec![fork_arg]);
                     e.require_by(fok, fork_node);
                     e.var_ty.insert(frag.clone(), "ZI");
                     e.var_ty.insert(valid.clone(), "u16");
@@ -2387,7 +2389,7 @@ fn render(e: &mut Emit) -> Result<String> {
     );
     // Which buttons can reach an OUTPUT (plans/multi-output-fusion.md).
     // Every output is a graph node, so this is plain reachability.
-    let cones = e.graph.button_cones();
+    let cones = e.graph.free_cones();
     let reaching = out_fields
         .iter()
         .fold(0u8, |m, f| m | cones[f.node as usize]);

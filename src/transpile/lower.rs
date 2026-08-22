@@ -17,10 +17,9 @@
 //!   graph has ~35% fewer nodes than the emitted text had lets.
 //!
 //! * **Placement is DERIVED too.** A node sits at the shallowest scope its
-//!   operands allow: outside the fork loops if it depends on no fork,
-//!   outside the button suffix if it depends on no button. `Graph::
-//!   fork_cones` and `Graph::button_cones` are the same reachability
-//!   computation over the two kinds of specialization, and the old
+//!   operands allow. Both scopes it can sit in - the split loop nest and
+//!   the free-choice suffix - are the SAME question, "which choices
+//!   reach this node", answered once by `Graph::choice_cones`; the old
 //!   "prefix/suffix taint" was one hand-maintained special case of it.
 //!
 //! * **Validity is a VALUE.** Every condition under which the abstract
@@ -173,7 +172,7 @@ impl<'a> Ctx<'a> {
         };
         Ok(match op {
             Op::Const(lo, hi) => Repr::num(false, lo != hi),
-            Op::ConstBool(_) | Op::Button(_) => Repr::boolean(false, false),
+            Op::ConstBool(_) | Op::Free(_) => Repr::boolean(false, false),
             Op::Cell(c) => {
                 if let Some(kind) = self.vary.get(c) {
                     match *kind {
@@ -192,10 +191,10 @@ impl<'a> Ctx<'a> {
                     bail!("cell {} is neither a uniform nor a varying witness input", c)
                 }
             }
-            // A fork narrows an interval; the fragment is still an interval.
-            Op::Fork(_) => Repr::num(true, true),
-            Op::ForkValid(_) => Repr::boolean(true, false),
-            Op::ForkOk => Repr::boolean(true, false),
+            // A split narrows an interval; the fragment is still an interval.
+            Op::Split(_) => Repr::num(true, true),
+            Op::SplitValid(_) => Repr::boolean(true, false),
+            Op::SplitOk => Repr::boolean(true, false),
             Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::Neg | Op::Abs | Op::Min
             | Op::Max => joined(Dom::Num),
             // flr of an interval is exact BY GUARD: the lane survives only
@@ -464,13 +463,13 @@ impl<'a> Ctx<'a> {
                     (false, _, false) => "true".to_string(),
                 }
             }
-            Op::Const(..) | Op::ConstBool(_) | Op::Cell(_) | Op::Button(_) => {
+            Op::Const(..) | Op::ConstBool(_) | Op::Cell(_) | Op::Free(_) => {
                 bail!("node {} is an inline leaf and needs no let", id)
             }
-            Op::Fork(_) | Op::ForkValid(_) => {
-                bail!("node {} is part of a fork group, emitted as one unit", id)
+            Op::Split(_) | Op::SplitValid(_) => {
+                bail!("node {} is part of a split group, emitted as one unit", id)
             }
-            Op::ForkOk => bail!("ForkOk is only ever discharged by zi_fork_flr"),
+            Op::SplitOk => bail!("SplitOk is only ever discharged by zi_fork_flr"),
         })
     }
 }
@@ -484,7 +483,7 @@ fn inline(g: &Graph, id: NodeId, r: Repr) -> Option<String> {
             format!("(P8::from_raw({}i32), P8::from_raw({}i32))", lo, hi)
         }),
         Op::ConstBool(b) => Some(format!("{}", b)),
-        Op::Button(b) => Some(format!("kb{}", b)),
+        Op::Free(b) => Some(format!("kb{}", b)),
         // A varying cell is loaded once into `r_cN` at the top of the
         // frame; a uniform one is a field of the bound `Uni`.
         Op::Cell(c) => Some(if r.lane {
@@ -553,7 +552,7 @@ fn discharges(g: &Graph, repr: &[Repr], cond: NodeId, carrier: NodeId) -> bool {
         // zi_mul_pos / zi_div_pos deopt non-positive multiplier lanes.
         Op::Mul | Op::Div => repr[carrier as usize].lane && repr[carrier as usize].wide,
         // zi_fork_flr deopts lanes spanning more than two floors.
-        Op::Fork(_) => matches!(g.get(cond).op, Op::ForkOk),
+        Op::Split(_) => matches!(g.get(cond).op, Op::SplitOk),
         _ => false,
     }
 }
@@ -609,14 +608,16 @@ fn guard_line(ctx: &Ctx, cond: NodeId) -> Result<Option<String>> {
 /// bookkeeping `render` reads off them) from the graph, and rewrites the
 /// output fields to name graph nodes.
 ///
-/// `e.pre` holds everything a button variant does NOT observe, including
-/// the fork loop nest; `e.suf` holds the rest, and is emitted once per
-/// button variant. That two-way split is what stage C replaces with a
-/// per-node one - see the `binary split` line the emitter prints.
+/// `e.pre` holds everything a free-choice variant does NOT observe,
+/// including the split loop nest; `e.suf` holds the rest, and is emitted
+/// once per variant. That two-way cut is the last hand-drawn boundary
+/// left: specializing the graph on the free choices and interning the
+/// result replaces it, because then a node shared by several variants IS
+/// one node rather than one the compiler has to re-discover 64 times.
 pub(crate) fn emit_body(e: &mut Emit, of: &mut OutFields) -> Result<()> {
     let n = e.graph.len();
-    let bcone = e.graph.button_cones();
-    let fcone = e.graph.fork_cones();
+    let bcone = e.graph.free_cones();
+    let fcone = e.graph.split_cones();
 
     // --- representations, for EVERY node ---
     // Representation is what decides whether a primitive carries its own
@@ -654,9 +655,9 @@ pub(crate) fn emit_body(e: &mut Emit, of: &mut OutFields) -> Result<()> {
             _ => roots.push(*c),
         }
     }
-    // The fork groups: their masks build the live-lane chain.
+    // The split groups: their masks build the live-lane chain.
     for id in 0..n as NodeId {
-        if matches!(e.graph.get(id).op, Op::Fork(_)) {
+        if matches!(e.graph.get(id).op, Op::Split(_)) {
             roots.push(id);
         }
     }
@@ -671,12 +672,12 @@ pub(crate) fn emit_body(e: &mut Emit, of: &mut OutFields) -> Result<()> {
         match inline(ctx.g, id, r) {
             Some(text) => ctx.expr[id as usize] = Some(text),
             None => {
-                // The fork group is named by its DEPTH: the loop variable,
-                // the fragment and the mask are one unit, and the mask is
-                // not a value the rest of the body reads.
+                // The split group is named by its INDEX: the loop
+                // variable, the fragment and the mask are one unit, and
+                // the mask is not a value the rest of the body reads.
                 let name = match &ctx.g.get(id).op {
-                    Op::Fork(d) => format!("f{}", d),
-                    Op::ForkValid(d) => format!("f{}_fv", d),
+                    Op::Split(d) => format!("f{}", d),
+                    Op::SplitValid(d) => format!("f{}_fv", d),
                     _ => format!("n{}", id),
                 };
                 ctx.expr[id as usize] = Some(name.clone());
@@ -686,7 +687,7 @@ pub(crate) fn emit_body(e: &mut Emit, of: &mut OutFields) -> Result<()> {
     }
 
     // --- placement ---
-    // Level 0 is outside every fork loop; level d+1 is inside loops 0..=d.
+    // Level 0 is outside every split loop; level d+1 is inside loops 0..=d.
     let level = |id: NodeId| -> usize {
         let m = fcone[id as usize];
         if m == 0 {
@@ -726,13 +727,13 @@ pub(crate) fn emit_body(e: &mut Emit, of: &mut OutFields) -> Result<()> {
 
     let mut valid_expr = "ALL".to_string();
     for lvl in 0..=depth {
-        // Values, then the guards over them, then the next fork.
+        // Values, then the guards over them, then the next split.
         for id in 0..n as NodeId {
             if !live[id as usize] || level(id) != lvl || in_suffix(id) {
                 continue;
             }
-            if matches!(ctx.g.get(id).op, Op::Fork(_) | Op::ForkValid(_)) {
-                continue; // emitted as part of the fork group
+            if matches!(ctx.g.get(id).op, Op::Split(_) | Op::SplitValid(_)) {
+                continue; // emitted as part of the split group
             }
             emit_node(&ctx, &mut pre, &mut var_ty, id)?;
         }
@@ -750,15 +751,18 @@ pub(crate) fn emit_body(e: &mut Emit, of: &mut OutFields) -> Result<()> {
         if lvl == depth {
             break;
         }
-        // The fork group: open the loop, shadow the deopt channels so one
-        // configuration's failures do not leak into the next, narrow, and
-        // skip the configuration entirely when no lane lives in it.
+        // The split group: open the loop, shadow the deopt channels so
+        // one outcome's failures do not leak into the next, narrow, and
+        // skip the outcome entirely when no lane lives in it. That skip
+        // is why splits stay a runtime loop while free choices get fully
+        // specialized: a split outcome is often EMPTY, and all 64 free
+        // outcomes always happen.
         let d = lvl;
-        let fork = (0..n as NodeId)
-            .find(|id| live[*id as usize] && matches!(ctx.g.get(*id).op, Op::Fork(x) if x as usize == d))
-            .ok_or_else(|| anyhow::anyhow!("fork depth {} has no node", d))?;
-        let fname = ctx.name[fork as usize].clone().unwrap();
-        let src = ctx.expr[ctx.g.get(fork).args[0] as usize].clone().unwrap();
+        let split = (0..n as NodeId)
+            .find(|id| live[*id as usize] && matches!(ctx.g.get(*id).op, Op::Split(x) if x as usize == d))
+            .ok_or_else(|| anyhow::anyhow!("split {} has no node", d))?;
+        let fname = ctx.name[split as usize].clone().unwrap();
+        let src = ctx.expr[ctx.g.get(split).args[0] as usize].clone().unwrap();
         pre.push(Line::Raw(format!("for c{} in 0..2usize {{", d)));
         pre.push(Line::Raw("let mut dp = dp;".to_string()));
         pre.push(Line::Raw("let mut bd_l: bool = *bd;".to_string()));
@@ -778,7 +782,7 @@ pub(crate) fn emit_body(e: &mut Emit, of: &mut OutFields) -> Result<()> {
         pre_defs.insert(format!("valid{}", d));
         valid_expr = format!("valid{}", d);
     }
-    // Everything a button variant observes, at the innermost fork level.
+    // Everything a free-choice variant observes, at the innermost split.
     for id in 0..n as NodeId {
         if !live[id as usize] || !in_suffix(id) {
             continue;
@@ -809,8 +813,8 @@ pub(crate) fn emit_body(e: &mut Emit, of: &mut OutFields) -> Result<()> {
         }
         f.expr = coerce(ctx.expr[f.node as usize].as_deref().unwrap(), have, want)?;
         // Taint from the CONE, not from where the value happened to be
-        // bound: a splat of a prefix value inside the suffix used to make a
-        // button-independent output look button-dependent.
+        // bound: a splat of a prefix value inside the suffix used to make
+        // a choice-independent output look choice-dependent.
         f.tainted = bcone[f.node as usize] != 0;
     }
 

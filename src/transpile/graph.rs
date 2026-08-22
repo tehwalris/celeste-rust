@@ -70,6 +70,54 @@ impl Val {
 
 pub type NodeId = u32;
 
+/// A SPECIALIZATION POINT: something the program could not keep symbolic,
+/// so the whole downstream graph is rebuilt once per possible outcome.
+///
+/// The two kinds are one MECHANISM and two SEMANTICS, and the difference
+/// is exactly why `Split` carries a validity mask and `Free` does not:
+///
+/// * `Free` - a symbolic boolean input, one of the six buttons. Every
+///   outcome is live for every lane; the search enumerates them, and the
+///   frame genuinely has 2^6 successors.
+/// * `Split` - a value the abstract domain could not represent, so the
+///   program enumerates the cases. The outcomes PARTITION the lanes, and
+///   one can be empty.
+///
+/// Both are eliminated by `specialize_into`, and neither survives into
+/// emitted code as a value: a `Free` becomes a constant, a `Split`
+/// becomes a concrete narrowing.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum Choice {
+    Free(u8),
+    Split(u8),
+}
+
+/// A set of choices, as a bitmask. Frees occupy the low 6 bits (one per
+/// button), splits the rest.
+pub type ChoiceSet = u16;
+pub const N_FREE: u8 = 6;
+
+impl Choice {
+    pub fn bit(self) -> ChoiceSet {
+        1 << match self {
+            Choice::Free(b) => b,
+            Choice::Split(d) => N_FREE + d,
+        }
+    }
+    pub fn all_in(set: ChoiceSet) -> Vec<Choice> {
+        (0..16u8)
+            .filter(|i| set & (1 << i) != 0)
+            .map(|i| {
+                if i < N_FREE {
+                    Choice::Free(i)
+                } else {
+                    Choice::Split(i - N_FREE)
+                }
+            })
+            .collect()
+    }
+}
+
 /// The op vocabulary. Semantic, not representational: one variant per
 /// MEANING, however many emitted forms that meaning currently has.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -87,12 +135,14 @@ pub enum Op {
     /// An input cell. NOT split into uniform/per-lane: that is a derived
     /// property, computed after the graph exists.
     Cell(u32),
-    /// One of the six button bits the suffix is specialized on.
-    Button(u8),
-    /// `Fork(d)` over one operand: the value narrowed to configuration
-    /// `c{d}` of the d-th concretization fork. A value the program could
-    /// not keep symbolic, so it runs once per possible outcome.
-    Fork(u8),
+    /// `Free(b)`: the outcome of free choice b - one of the six button
+    /// bits. A leaf, because nothing computes it: the search does.
+    Free(u8),
+    /// `Split(d)` over one operand: that value RESTRICTED to the outcome
+    /// of split choice d. Unlike a free choice this is not a constant -
+    /// the narrowing is a real operation on the operand - but it is
+    /// eliminated by the same specialization step.
+    Split(u8),
 
     // ---- number -> number ----
     Add,
@@ -130,17 +180,19 @@ pub enum Op {
     /// single element? It is what lets validity be an ordinary value
     /// instead of a side channel.
     Known,
-    /// `ForkValid(d)` over the same operand as `Fork(d)`: which lanes
-    /// belong to configuration d. The fork primitive returns a (value,
-    /// validity) pair, so it is two nodes, not one.
-    ForkValid(u8),
-    /// `ForkOk` over the same operand: does this lane's interval span at
-    /// most TWO floors? Below that the fork is exact; above it there is no
-    /// second configuration to put the third fragment in, so the lane
-    /// deopts. Configuration-independent, hence no index. It exists so the
-    /// validity chain accounts for every lane `zi_fork_flr` gives up on -
-    /// without it `ok` would claim lanes the emitted code deopts.
-    ForkOk,
+    /// `SplitValid(d)` over the same operand as `Split(d)`: which lanes
+    /// fall in the chosen outcome. This is what a free choice has no
+    /// analogue of - the outcomes of a split PARTITION the lanes, so the
+    /// primitive returns a (value, validity) pair and it is two nodes.
+    SplitValid(u8),
+    /// `SplitOk` over the same operand: does this lane's interval span at
+    /// most TWO floors? Below that the split is exact; above it there is
+    /// no third outcome to put the remaining fragment in, so the lane
+    /// deopts. OUTCOME-INDEPENDENT, hence no index - and unindexed on
+    /// purpose, so two splits of the same operand share the one node. It
+    /// exists so the validity chain accounts for every lane
+    /// `zi_fork_flr` gives up on.
+    SplitOk,
 
     // ---- cart lookups ----
     Mget,
@@ -196,17 +248,22 @@ impl Graph {
         self.nodes.is_empty()
     }
 
-    /// For every node, which button bits can influence it - a bitmask,
+    /// For every node, which CHOICES can influence it - one bitmask,
     /// computed bottom-up in one pass (operands always precede their
-    /// node). A button that reaches no OUTPUT cannot affect any lane's
-    /// result, so the 2^6 button variants collapse by a factor of two for
-    /// each such bit. That is a plain reachability fact, decided once for
-    /// the whole kernel, not per lane.
-    pub fn button_cones(&self) -> Vec<u8> {
-        let mut mask = vec![0u8; self.nodes.len()];
+    /// node). This used to be two functions over two vocabularies; it is
+    /// one reachability question, and answering it once is what lets
+    /// placement stop distinguishing "the button suffix" from "the fork
+    /// loop nest".
+    ///
+    /// A choice that reaches no OUTPUT cannot affect any lane's result, so
+    /// its outcomes collapse - a plain reachability fact, decided once for
+    /// the whole kernel rather than per lane.
+    pub fn choice_cones(&self) -> Vec<ChoiceSet> {
+        let mut mask = vec![0 as ChoiceSet; self.nodes.len()];
         for (i, node) in self.nodes.iter().enumerate() {
             let mut m = match node.op {
-                Op::Button(b) => 1u8 << b,
+                Op::Free(b) => Choice::Free(b).bit(),
+                Op::Split(d) | Op::SplitValid(d) => Choice::Split(d).bit(),
                 _ => 0,
             };
             for a in &node.args {
@@ -217,24 +274,17 @@ impl Graph {
         mask
     }
 
-    /// For every node, which FORK depths it depends on - the same
-    /// reachability as `button_cones`, over the other kind of
-    /// specialization. A fork is a runtime loop, so this decides how deep
-    /// in the loop nest a node has to sit: a node whose fork cone is empty
-    /// is computed once for the whole slice, not once per configuration.
-    pub fn fork_cones(&self) -> Vec<u8> {
-        let mut mask = vec![0u8; self.nodes.len()];
-        for (i, node) in self.nodes.iter().enumerate() {
-            let mut m = match node.op {
-                Op::Fork(d) | Op::ForkValid(d) => 1u8 << d,
-                _ => 0,
-            };
-            for a in &node.args {
-                m |= mask[*a as usize];
-            }
-            mask[i] = m;
-        }
-        mask
+    /// The cone restricted to FREE choices - the buttons, which every lane
+    /// enumerates. Splits are excluded because their outcomes partition
+    /// lanes rather than multiplying them, so the two answer different
+    /// questions at an emit site even though one pass computes both.
+    pub fn free_cones(&self) -> Vec<u8> {
+        self.choice_cones().iter().map(|m| (*m & 0x3f) as u8).collect()
+    }
+
+    /// The cone restricted to SPLIT choices.
+    pub fn split_cones(&self) -> Vec<u8> {
+        self.choice_cones().iter().map(|m| (*m >> N_FREE) as u8).collect()
     }
 
     /// Rebuild this graph into `out` with the button bits replaced by
@@ -247,11 +297,11 @@ impl Graph {
     /// successor state for every lane. E.g. `input` is
     /// `Sel(right, 1, Sel(left, -1, 0))`, so with right = true the whole
     /// thing folds to 1 whatever left is: {left,right} and {right} collapse.
-    pub fn specialize_into(&self, buttons: u8, out: &mut Graph) -> Vec<NodeId> {
+    pub fn specialize_into(&self, frees: u8, out: &mut Graph) -> Vec<NodeId> {
         let mut map: Vec<NodeId> = Vec::with_capacity(self.nodes.len());
         for node in &self.nodes {
             let id = match node.op {
-                Op::Button(b) => out.leaf(Op::ConstBool(buttons & (1 << b) != 0)),
+                Op::Free(b) => out.leaf(Op::ConstBool(frees & (1 << b) != 0)),
                 _ => {
                     let args: Vec<NodeId> =
                         node.args.iter().map(|a| map[*a as usize]).collect();
@@ -329,10 +379,10 @@ impl Graph {
                 }
             }
         }
-        // kb0..kb5: the button bits the suffix is specialized on.
+        // kb0..kb5: the free choices the suffix is specialized on.
         if let Some(rest) = s.strip_prefix("kb") {
             if let Ok(bit) = rest.parse::<u8>() {
-                return Ok(self.leaf(Op::Button(bit)));
+                return Ok(self.leaf(Op::Free(bit)));
             }
         }
         if let Some(rest) = s.strip_prefix("P8::from_raw(") {
@@ -371,11 +421,11 @@ impl Graph {
                     Pico8Num::from_raw(*hi),
                 )),
                 Op::ConstBool(b) => Val::Bool(Some(*b)),
-                Op::Button(b) => bail!("node {}: button bit {} has no value outside a variant", i, b),
-                Op::Fork(d) | Op::ForkValid(d) => {
-                    bail!("node {}: fork {} has no value outside a configuration", i, d)
+                Op::Free(b) => bail!("node {}: free choice {} has no value outside a variant", i, b),
+                Op::Split(d) | Op::SplitValid(d) => {
+                    bail!("node {}: split {} has no value outside an outcome", i, d)
                 }
-                Op::ForkOk => bail!("node {}: ForkOk needs the interval's floor span", i),
+                Op::SplitOk => bail!("node {}: SplitOk needs the interval's floor span", i),
                 Op::Cell(c) => match cells.get(c) {
                     Some(v) => *v,
                     None => bail!("node {}: input cell {} was not supplied", i, c),
@@ -644,6 +694,54 @@ mod tests {
         // because validity is built out of these.
         let cells = HashMap::from([(1u32, Val::Bool(Some(false))), (2u32, Val::Bool(None))]);
         assert_eq!(g.eval(&cells).unwrap()[and as usize], Val::Bool(Some(false)));
+    }
+
+    #[test]
+    fn one_cone_pass_answers_for_both_kinds_of_choice() {
+        // Free choices and splits used to need two reachability passes over
+        // two vocabularies. They are one question - "which specialization
+        // points reach this node" - and the answer must stay separable,
+        // because the two are emitted differently: frees multiply the
+        // variants, splits partition the lanes.
+        let mut g = Graph::new();
+        let c = g.leaf(Op::Cell(1));
+        let kb = g.leaf(Op::Free(3));
+        let iv = g.add(Op::Split(1), vec![c]);
+        let both = g.add(Op::Sel, vec![kb, iv, c]);
+        let cones = g.choice_cones();
+        assert_eq!(
+            Choice::all_in(cones[both as usize]),
+            vec![Choice::Free(3), Choice::Split(1)]
+        );
+        assert_eq!(g.free_cones()[both as usize], 1 << 3);
+        assert_eq!(g.split_cones()[both as usize], 1 << 1);
+        // A node under neither is under neither.
+        assert_eq!(cones[c as usize], 0);
+    }
+
+    #[test]
+    fn specializing_a_free_choice_collapses_the_variants_that_agree() {
+        // `input` is Sel(right, 1, Sel(left, -1, 0)): with right = true the
+        // whole thing is 1 whatever left is, so {left,right} and {right}
+        // land on the same node and their successor states are the same.
+        let mut g = Graph::new();
+        let right = g.leaf(Op::Free(1));
+        let left = g.leaf(Op::Free(0));
+        let one = g.leaf(Op::Const(n(1).as_raw_u32() as i32, n(1).as_raw_u32() as i32));
+        let neg = g.leaf(Op::Const(n(-1).as_raw_u32() as i32, n(-1).as_raw_u32() as i32));
+        let zero = g.leaf(Op::Const(0, 0));
+        let inner = g.add(Op::Sel, vec![left, neg, zero]);
+        let input = g.add(Op::Sel, vec![right, one, inner]);
+
+        let mut shared = Graph::new();
+        let sig = |m: u8, shared: &mut Graph| g.specialize_into(m, shared)[input as usize];
+        let r_only = sig(0b10, &mut shared);
+        let both = sig(0b11, &mut shared);
+        assert_eq!(r_only, both, "right dominates left; these are one variant");
+        let l_only = sig(0b01, &mut shared);
+        let none = sig(0b00, &mut shared);
+        assert_ne!(l_only, none);
+        assert_ne!(l_only, both);
     }
 
     #[test]
