@@ -1001,7 +1001,18 @@ pub(crate) fn room_shapes_in(
     if !w.refused.is_empty() {
         let why: Vec<String> =
             w.refused.iter().map(|(e, n)| format!("{} x {}", n, e)).collect();
-        bail!("the shape walk could not trace every shape:\n{}", why.join("\n"));
+        // The COUNTS matter as much as the reasons: "1 refusal against 12
+        // traced shapes" is a hole to fill, "1 against 0" is a tracer
+        // that never got started, and the message used to read the same
+        // either way.
+        bail!(
+            "the shape walk could not trace every shape ({} traced, {} left the room, \
+             {} unreachable):\n{}",
+            w.shapes.len(),
+            w.left_room,
+            w.unreachable,
+            why.join("\n")
+        );
     }
     if w.dropped > 0 {
         bail!("the shape walk hit its cap with {} outcomes left", w.dropped);

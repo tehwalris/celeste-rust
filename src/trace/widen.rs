@@ -142,9 +142,10 @@ pub fn widen(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
         // widening that does not contain the value it replaces.
         let Some(s) = d.as_const(&start) else {
             bail!(
-                "{}: fruit `start` is symbolic, so its bob band is not a constant \
-                 interval - the graph has no node for a data-dependent band",
-                iface::show(&ps)
+                "{}: fruit `start` is symbolic ({}), so its bob band is not a \
+                 constant interval - the graph has no node for a data-dependent band",
+                iface::show(&ps),
+                d.describe(&start)
             );
         };
         let Some(Value::Num(old_y)) = iface::get(st, &py) else {

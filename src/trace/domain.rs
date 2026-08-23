@@ -145,6 +145,16 @@ pub trait Domain {
     /// rather than a branch.
     fn as_const(&self, v: &Self::Num) -> Option<P8>;
 
+    /// What this value IS, for an error message.
+    ///
+    /// A refusal that says "`start` is symbolic" leaves the reader
+    /// guessing between an input cell, a fold that did not fire, and a
+    /// genuine expression - three completely different fixes. Costs
+    /// nothing until something refuses.
+    fn describe(&self, _v: &Self::Num) -> String {
+        "<opaque>".to_string()
+    }
+
     /// Is this value an INTERVAL - a set of numbers rather than one?
     ///
     /// Asked before forking, because forking a value that is already a
@@ -259,6 +269,10 @@ impl Domain for Concrete {
     }
     fn as_const(&self, v: &P8) -> Option<P8> {
         Some(*v)
+    }
+
+    fn describe(&self, v: &P8) -> String {
+        format!("{:?}", v)
     }
 }
 
@@ -479,6 +493,19 @@ impl Domain for Symbolic {
 
     fn as_const(&self, v: &NodeId) -> Option<P8> {
         self.as_p8(*v)
+    }
+
+    fn describe(&self, v: &NodeId) -> String {
+        // One level of operands as well as the op. A bare `Sel/3` says
+        // "a select" and leaves open the thing that decides whether a
+        // refusal is easy to lift - whether its ARMS are constants.
+        let n = self.graph.get(*v);
+        let args: Vec<String> = n
+            .args
+            .iter()
+            .map(|a| format!("{:?}", self.graph.get(*a).op))
+            .collect();
+        format!("node {} = {:?}({})", v, n.op, args.join(", "))
     }
 }
 
