@@ -2239,10 +2239,6 @@ impl AbstractRun {
         self.states_before_merge.push(stream_survivors.len());
         self.states = {
             let _t = ScopedPhase::new("fwd.merge");
-            let _trace = crate::interpreter::tracing::TraceSpan::new(
-                "merge_frame_boundary",
-                "merge_site",
-            );
             vectorize_states(stream_survivors)
         };
         if self.band.is_some() {
@@ -2325,10 +2321,6 @@ impl AbstractRun {
         self.states_before_merge.push(new_states.len());
         self.states = {
             let _t = ScopedPhase::new("fwd.merge");
-            let _trace = crate::interpreter::tracing::TraceSpan::new(
-                "merge_frame_boundary",
-                "merge_site",
-            );
             if self.skip_merge {
                 crate::interpreter::vectorize::gc_states(new_states)
             } else {
@@ -2435,10 +2427,6 @@ impl AbstractRun {
     /// checkpoints are unaffected.
     fn boundary_gc_if_enabled(&mut self) {
         if std::env::var_os("CELESTE_BOUNDARY_GC").is_some() {
-            let _trace = crate::interpreter::tracing::TraceSpan::new(
-                "boundary_gc",
-                "gc",
-            );
             for state in &mut self.states {
                 state.gc();
             }
@@ -2627,9 +2615,8 @@ fn inject_origin(state: &mut State) {
 /// An error here is terminal on purpose: the plain program is ground truth, so
 /// a state that fails under it too is a real bug, not a missed specialization.
 fn run_deopt_frame(deopt: &DeoptTarget, state: State) -> Result<Vec<State>> {
-    let started = std::time::Instant::now();
+    let _started = std::time::Instant::now();
     let out = run_deopt_frame_inner(deopt, state);
-    crate::op_census::record_deopt_nanos(started.elapsed().as_nanos() as u64);
     out
 }
 

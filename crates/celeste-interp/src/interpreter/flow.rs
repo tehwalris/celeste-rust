@@ -353,7 +353,6 @@ impl BoundBranchSplit {
                 // into spd.x on the plain program under the spd rung).
                 // Heap copies or aliases of the value stay unknown; only
                 // the branched-on local is refined.
-                crate::op_census::record_unknown_branch_dup(state.vector_size);
                 let mut true_state = state.clone();
                 true_state.local_env.set(
                     self.condition_local_id,

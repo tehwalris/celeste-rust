@@ -43,7 +43,6 @@ use celeste_core::pico8_num::{Pico8Num, Pico8NumInterval};
 
 use super::heap::{Heap, HeapId};
 use super::state::State;
-use super::tracing::TraceSpan;
 use super::value::{HeapValue, MaybeVector, Value};
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -583,7 +582,6 @@ pub fn hash_rows_seeded(columns: &[&Column], total_rows: usize, seed: u64) -> Ve
         }
     }
 
-    let t = crate::op_census::start();
     let mut hashes = vec![0x51_7c_c1_b7_27_22_0a_95u64; total_rows];
     let threads = merge_threads();
     if total_rows < PARALLEL_ROW_THRESHOLD || threads == 1 {
@@ -606,13 +604,7 @@ pub fn hash_rows_seeded(columns: &[&Column], total_rows: usize, seed: u64) -> Ve
             }
         });
     }
-    let col_bytes: usize = columns.iter().map(|c| c.total_bytes()).sum();
-    crate::op_census::record(
-        crate::op_census::Cat::HashRows,
-        total_rows * columns.len(),
-        col_bytes + 16 * total_rows * columns.len(),
-        t,
-    );
+    let _col_bytes: usize = columns.iter().map(|c| c.total_bytes()).sum();
     hashes
 }
 
@@ -709,7 +701,6 @@ pub fn row_key_hashes(
         }
     }
 
-    let t = crate::op_census::start();
     const INIT: u64 = 0x51_7c_c1_b7_27_22_0a_95;
     // Pass 1: the shape and every column that holds one value across the
     // whole virtual concatenation contribute constants, computed once. The
@@ -745,13 +736,7 @@ pub fn row_key_hashes(
             Column::Intervals(p) => add_column(p, *ord, seed2, &mut keys),
         }
     }
-    let col_bytes: usize = varying.iter().map(|(_, c)| c.total_bytes()).sum();
-    crate::op_census::record(
-        crate::op_census::Cat::HashRows,
-        2 * total_rows * varying.len().max(1),
-        col_bytes + 32 * total_rows * varying.len(),
-        t,
-    );
+    let _col_bytes: usize = varying.iter().map(|(_, c)| c.total_bytes()).sum();
     keys
 }
 
@@ -991,7 +976,6 @@ fn partitioned_probe(row_hashes: &[u64], threads: usize) -> Probe {
 fn virtual_unique_mask(key: &[&Column], row_hashes: &[u64]) -> (Vec<bool>, usize) {
     let n = row_hashes.len();
 
-    let _t_probe = TraceSpan::new("vm_probe", "vectorize");
     // The probe is worth partitioning only once its hash map outgrows the
     // cache: below ~512k rows the single map is L3-resident and the
     // partitioned version's extra O(n) passes (scatter, fill, remap) cost
@@ -1008,7 +992,6 @@ fn virtual_unique_mask(key: &[&Column], row_hashes: &[u64]) -> (Vec<bool>, usize
         partitioned_probe(row_hashes, merge_threads())
     };
     let mut mask = mask;
-    drop(_t_probe);
     let mut unique_count = uniq.len();
     if unique_count == n {
         return (mask, unique_count);
@@ -1017,7 +1000,6 @@ fn virtual_unique_mask(key: &[&Column], row_hashes: &[u64]) -> (Vec<bool>, usize
     // 2. Pack the representatives - tiles are disjoint dense ranges, so
     // they pack in parallel, each still an L2-sized destination filled by
     // sorted piece walks.
-    let _t_pack = TraceSpan::new("vm_pack", "vectorize");
     let words_per_row: usize = key.iter().map(|c| c.words()).sum();
     let mut dense = vec![0u32; uniq.len() * words_per_row];
     const DENSE_TILE_BYTES: usize = 192 * 1024;
@@ -1073,7 +1055,6 @@ fn virtual_unique_mask(key: &[&Column], row_hashes: &[u64]) -> (Vec<bool>, usize
         }
     }
 
-    drop(_t_pack);
     // 3. Verify, column-major over contiguous row ranges - one range per
     // thread, each a sorted piece walk, all random access confined to the
     // cache-resident dense table. Within a range, work goes through
@@ -1082,7 +1063,6 @@ fn virtual_unique_mask(key: &[&Column], row_hashes: &[u64]) -> (Vec<bool>, usize
     // buffer against the representatives - equal-length slices, so the
     // compiler drops the bounds checks the per-element closure paid
     // (measured: the closure was the profile's top symbol at ~18% CPU).
-    let _t_verify = TraceSpan::new("vm_verify", "vectorize");
     let mut ok = vec![true; n];
     {
         const VERIFY_CHUNK: usize = 4096;
@@ -1187,10 +1167,8 @@ fn vectorizable(v: &Value) -> bool {
 /// everything.
 pub fn merge_dedup_group(states: &[State]) -> Option<State> {
     debug_assert!(states.len() > 1);
-    let _trace = TraceSpan::new("virtual_merge", "vectorize");
 
     let (columns, origins) = {
-        let _t = TraceSpan::new("vm_collect", "vectorize");
         collect_columns_labeled(states)?
     };
     let total_rows: usize = states.iter().map(|s| s.vector_size).sum();
@@ -1198,7 +1176,6 @@ pub fn merge_dedup_group(states: &[State]) -> Option<State> {
 
     // Uniform columns leave the key and become scalars in the output.
     let uniform: Vec<Option<Value>> = {
-        let _t = TraceSpan::new("vm_uniform", "vectorize");
         columns.iter().map(|c| c.uniform_scalar()).collect()
     };
     let key: Vec<&Column> = columns
@@ -1212,14 +1189,9 @@ pub fn merge_dedup_group(states: &[State]) -> Option<State> {
         (vec![0u32], total_rows - 1)
     } else {
         let hashes = {
-            let _t = TraceSpan::new("vm_hash", "vectorize");
             hash_rows(&key, total_rows)
         };
-        let t_bucket = crate::op_census::start();
-        let _t_mask = TraceSpan::new("vm_mask", "vectorize");
         let (mask, unique_count) = virtual_unique_mask(&key, &hashes);
-        drop(_t_mask);
-        crate::op_census::record(crate::op_census::Cat::DedupBucket, total_rows, 0, t_bucket);
         let kept: Vec<u32> = mask
             .iter()
             .enumerate()
@@ -1232,7 +1204,6 @@ pub fn merge_dedup_group(states: &[State]) -> Option<State> {
     // Gather every non-uniform column's survivors up front, columns in
     // parallel - they are independent, and each gather is a sorted piece
     // walk into a fresh allocation.
-    let _t_gather = TraceSpan::new("vm_gather", "vectorize");
     let mut gathered: Vec<Option<Value>> = {
         let threads = merge_threads().min(columns.len().max(1));
         let mut gathered: Vec<Option<Value>> = (0..columns.len()).map(|_| None).collect();
@@ -1264,8 +1235,6 @@ pub fn merge_dedup_group(states: &[State]) -> Option<State> {
         gathered
     };
 
-    drop(_t_gather);
-    let _t_build = TraceSpan::new("vm_build", "vectorize");
     // Build the merged state, walking the same structure the collection
     // walked and consuming its columns in order. The `Origin` check makes a
     // traversal mismatch a loud panic instead of a silently misplaced

@@ -15,7 +15,6 @@ use super::{
     fixed_env::{FixedEnv, PreparedCfg},
     flow::{FlowData, InterpreterFlowAdapter},
     state::State,
-    tracing::TraceSpan,
     value::Value,
     vectorize::{union_diff_states, vectorize_states},
 };
@@ -72,7 +71,6 @@ fn interpret_prepared_cfg_inner(
         .reslot(&prepared.cfg.slots);
 
     // Lightweight tracing span for CFG execution (low overhead)
-    let _trace = TraceSpan::new(name.as_deref().unwrap_or("__main"), "cfg");
     // Attribute per-instruction time (see `instr_time`) to this function while
     // it runs; a stack, because calls nest cfg executions.
     let _instr_fn = crate::instr_time::enter_function(name.as_deref().unwrap_or("__main"));
@@ -161,7 +159,6 @@ fn interpret_prepared_cfg_inner(
                         // hint_normalize block apart from merging at the frame
                         // boundary; they are the same code but different
                         // problems.
-                        let _trace = TraceSpan::new("merge_hint_normalize", "merge_site");
                         let vectorized_pending = vectorize_states(pending);
                         union_diff_states(
                             std::mem::take(accumulated_states),
@@ -296,12 +293,6 @@ fn interpret_prepared_cfg_inner(
 
                 // Name the conditional for the census, so a filter inside
                 // `filter_by_mask` can be charged to the branch that caused it.
-                if crate::op_census::enabled() {
-                    crate::op_census::set_branch_site(
-                        name.as_deref().unwrap_or("__main"),
-                        block_label.as_ref().map_or("__entry", |l| l.as_str()),
-                    );
-                }
 
                 // Both edges at once: the condition is inspected once per
                 // state and a lane-mixed condition splits the state in a

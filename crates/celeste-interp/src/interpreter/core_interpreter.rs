@@ -624,7 +624,6 @@ impl<'a> CoreInterpreter<'a> {
         instruction: &Instruction,
         condition: LocalId,
     ) -> Result<Option<State>> {
-        crate::op_census::record_select_split();
 
         let mut false_state = self.state.clone();
         false_state

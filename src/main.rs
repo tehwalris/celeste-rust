@@ -42,11 +42,6 @@ struct Args {
     #[arg(long)]
     states_file: Option<String>,
 
-    /// Enable lightweight tracing and save Chrome trace to this file
-    /// (lower overhead than --profile, only tracks CFG execution times)
-    #[arg(long)]
-    trace: Option<String>,
-
     /// Directory for checkpoints (enables checkpoint saving)
     #[arg(long)]
     checkpoint_dir: Option<String>,
@@ -77,11 +72,6 @@ fn main() -> Result<()> {
                 run.lane_count(),
                 t.elapsed()
             );
-            if celeste_rust::op_census::enabled() {
-                eprintln!("--- census for frame {} alone ---", frame);
-                celeste_rust::op_census::report();
-                celeste_rust::op_census::reset();
-            }
         }
         println!(
             "\nTotal: {} states ({} expanded) after {} frames",
@@ -89,7 +79,6 @@ fn main() -> Result<()> {
             run.lane_count(),
             args.frames
         );
-        celeste_rust::op_census::report();
         return Ok(());
     }
     run_game_frames(
@@ -99,7 +88,6 @@ fn main() -> Result<()> {
         args.dump.as_deref(),
         args.dump_states_at,
         args.states_file.as_deref(),
-        args.trace.as_deref(),
         args.checkpoint_dir.as_deref(),
         args.checkpoint_interval,
         args.resume,
@@ -141,7 +129,6 @@ fn run_game_frames(
     dump_path: Option<&str>,
     dump_states_at: Option<u32>,
     states_file: Option<&str>,
-    trace_file: Option<&str>,
     checkpoint_dir: Option<&str>,
     checkpoint_interval: u32,
     resume: bool,
@@ -149,16 +136,10 @@ fn run_game_frames(
     use crate::interpreter::glue::interpret_cfg;
     use crate::interpreter::abstraction::make_state_abstract;
     use crate::interpreter::inspect::{create_frame_dump, write_frame_dump_jsonl, dump_states_to_file, save_checkpoint, load_checkpoint, checkpoint_filename, Checkpoint};
-    use crate::interpreter::tracing::{enable_tracing, get_tracing_json, collect_thread_spans};
     use crate::game_runner::{create_initial_state_with_builtins, inject_tile_flag_at_builtin};
     use std::io::BufWriter;
     use std::fs::File;
 
-    // Enable lightweight tracing if requested
-    if trace_file.is_some() {
-        enable_tracing();
-        println!("Lightweight tracing enabled");
-    }
 
     // Create checkpoint directory if needed
     if let Some(dir) = checkpoint_dir {
@@ -357,33 +338,6 @@ fn run_game_frames(
         states.len(),
         states.iter().map(|s| s.vector_size).sum::<usize>(),
         num_frames);
-    celeste_rust::op_census::report();
-
-    // Save lightweight tracing data if enabled
-    if let Some(trace_file) = trace_file {
-        use std::io::Write;
-
-        // Collect any remaining thread-local spans
-        collect_thread_spans();
-
-        // Get trace JSON
-        let trace_json = get_tracing_json();
-
-        // Check if output should be compressed
-        if trace_file.ends_with(".zst") {
-            // Write zstd-compressed output
-            let file = File::create(trace_file)?;
-            let mut encoder = zstd::stream::Encoder::new(file, 3)?; // Level 3 is a good balance
-            encoder.write_all(trace_json.as_bytes())?;
-            encoder.finish()?;
-            println!("Saved lightweight trace (zstd) to {}", trace_file);
-        } else {
-            // Write uncompressed output
-            let mut file = File::create(trace_file)?;
-            file.write_all(trace_json.as_bytes())?;
-            println!("Saved lightweight trace to {}", trace_file);
-        }
-    }
 
     Ok(())
 }
@@ -2253,7 +2207,7 @@ __reset_button_states()
     fn test_run_celeste_game_frame() {
         // Run 26 frames (enough to see player spawn at frame 25)
         // For longer runs, use the binary: cargo run -- -n 30
-        run_game_frames(26, 25, 26, None, None, None, None, None, 1, false).expect("Game frames should complete");
+        run_game_frames(26, 25, 26, None, None, None, None, 1, false).expect("Game frames should complete");
     }
 
     #[test]

@@ -182,8 +182,8 @@ of those reasons applies. That is the exact mistake behind `a8f4635`.
 
 Run the suite with NEXTEST, never bare `cargo test --release`: the tests
 are fine (21 s wall for all 515 under nextest, 2026-08-16) but several
-of them mutate process-global state (tracing, instr_time, op_census,
-partition toggles), and under cargo test's shared-process harness the
+of them mutate process-global state (instr_time, partition toggles),
+and under cargo test's shared-process harness the
 suite has twice been observed degrading to ~70-85 MINUTES at one core.
 nextest runs each test in its own process, which contains every such
 leak by construction.
@@ -298,8 +298,6 @@ scratch dir and only installing what builds; if you get stuck anyway,
 # basis for differential testing of rewrites
 ./target/release/concrete_run -i 42,0,0,0,0,16,2,2,2,2 -f 10
 
-# Chrome trace of where intra-frame time goes
-./safe-run.sh -- ./target/release/celeste-rust -n 37 --trace /tmp/trace.json
 ```
 
 ## Installing packages
@@ -307,22 +305,14 @@ scratch dir and only installing what builds; if you get stuck anyway,
 Feel free to install pacman packages when needed (e.g., for profiling tools
 like `perf`).
 
-## Serving trace files
+## A note on deleted tooling (2026-08-23)
 
-Trace files (for Chrome's `chrome://tracing` viewer) are served from the
-`server/` directory:
+`--profile`, `--trace`, the op census, the Chrome-trace `server/`
+workflow, `measure_k` and the rewrite-finding half of `bin/rewrite` were
+all deleted with the rewrite campaign (`plans/deletion.md`). They were
+instrumentation for the interpreter and for finding rewrites, and both
+of those jobs are done. They are in git history if a number is ever
+needed again.
 
-```bash
-./safe-run.sh -- ./target/release/celeste-rust -n 37 \
-    --checkpoint-dir checkpoints --resume --trace /tmp/trace.json.zst
-
-cp /tmp/trace.json.zst server/
-cd server && python3 -m http.server 8000 &
-
-# Verify the file is served correctly
-curl -s http://localhost:8000/trace.json.zst | sha256sum
-sha256sum server/trace.json.zst  # Should match
-```
-
-`server/` and `serve/` are gitignored. Never commit generated JSON - a 28 MB
-`cfg_analysis.json` blob used to live in git and dominated the whole diff.
+Never commit generated JSON - a 28 MB `cfg_analysis.json` blob used to
+live in git and dominated the whole diff.

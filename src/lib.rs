@@ -25,5 +25,5 @@ pub use celeste_ir::{builtins, frontend, ir};
 // the same compilation unit (plans/build-time.md). Re-exported at the old
 // paths.
 pub use celeste_interp::{ block_flow, game_runner, instr_time,
-    instruction_flow, interpreter, liveness, op_census,
+    instruction_flow, interpreter, liveness,
 };

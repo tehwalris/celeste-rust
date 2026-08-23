@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use super::{
     heap::{Heap, HeapId},
     local_env::LocalEnv,
-    tracing::TraceSpan,
     value::{HeapValue, MaybeVector, Value},
 };
 
@@ -209,8 +208,6 @@ impl State {
         lanes_before: Option<usize>,
         reason: FilterReason,
     ) {
-        let _trace = TraceSpan::new(reason, "filter");
-        let t_census = crate::op_census::start();
 
         // Filter values in heap - use optimized method that only clones vectors
         self.heap.filter_vectors_in_place(kept);
@@ -226,39 +223,7 @@ impl State {
         self.vector_size = kept.len();
 
         if reason == FILTER_BRANCH {
-            let before = lanes_before.expect("a branch filter always comes from a mask");
-            crate::op_census::record_branch_filter(before, kept.len(), t_census);
-        }
-        if crate::op_census::enabled() {
-            let count_env = |env: &LocalEnv| {
-                env.iter().filter(|(_, v)| is_vector_value(v)).count()
-            };
-            crate::op_census::record_filter_heap_cells(self.heap.len());
-            crate::op_census::record_filter_local_slots(
-                self.local_env.iter().count()
-                    + self.outer_local_envs.iter().map(|e| e.iter().count()).sum::<usize>(),
-            );
-            crate::op_census::record_filter_columns(
-                (0..self.heap.len())
-                    .filter_map(|i| self.heap.get_opt(HeapId::from_raw(i)))
-                    .filter(|hv| match hv {
-                        HeapValue::Value(v) => is_vector_value(v),
-                        HeapValue::Closure(_, caps) => caps.iter().any(is_vector_value),
-                        _ => false,
-                    })
-                    .count(),
-                count_env(&self.local_env),
-                self.outer_local_envs.iter().map(count_env).sum(),
-            );
-        }
-        let reason_index = crate::op_census::REASON_NAMES
-            .iter()
-            .position(|name| *name == reason)
-            .expect("every filter reason must be in the census table");
-        crate::op_census::record_filter_reason(reason_index, kept.len(), t_census);
-        if crate::op_census::enabled() && !kept.is_empty() {
-            // How chunky the gather is: contiguous stretches of kept indices.
-            crate::op_census::record_filter_runs(reason_index, kept.runs());
+            let _before = lanes_before.expect("a branch filter always comes from a mask");
         }
     }
 
@@ -278,8 +243,6 @@ impl State {
         if runs.total_true() == 0 {
             return (None, Some(self));
         }
-        let _trace = TraceSpan::new(FILTER_BRANCH, "filter");
-        let t_census = crate::op_census::start();
 
         let mut state_true = self;
         let mut state_false = state_true.clone();
@@ -301,19 +264,6 @@ impl State {
 
         // Census parity with the two filters this replaces: one branch-
         // filter event and one reason event per side.
-        crate::op_census::record_branch_filter(condition.len(), runs.total_true(), t_census);
-        crate::op_census::record_branch_filter(condition.len(), runs.total_false(), crate::op_census::start());
-        let reason_index = crate::op_census::REASON_NAMES
-            .iter()
-            .position(|name| *name == FILTER_BRANCH)
-            .expect("filter_branch is in the census table");
-        crate::op_census::record_filter_reason(reason_index, runs.total_true(), t_census);
-        crate::op_census::record_filter_reason(reason_index, runs.total_false(), crate::op_census::start());
-        if crate::op_census::enabled() {
-            let (runs_true, runs_false) = runs.runs_per_side();
-            crate::op_census::record_filter_runs(reason_index, runs_true);
-            crate::op_census::record_filter_runs(reason_index, runs_false);
-        }
 
         (Some(state_true), Some(state_false))
     }
@@ -327,8 +277,6 @@ impl State {
     /// second - together they enumerate both values of an unknown bool
     /// without splitting the state.
     pub fn expand_lanes(&mut self) {
-        let _trace = TraceSpan::new("expand_lanes", "expand");
-        let t = crate::op_census::start();
         fn double<T: std::fmt::Debug + Clone + PartialEq + Eq>(
             v: MaybeVector<T>,
         ) -> MaybeVector<T> {
@@ -356,7 +304,6 @@ impl State {
             | Value::NilPointer(_)) => other,
         });
         self.vector_size *= 2;
-        crate::op_census::record(crate::op_census::Cat::Expand, self.vector_size, 0, t);
     }
 
     /// Append a copy of every lane the mask selects, leaving the originals
@@ -371,8 +318,6 @@ impl State {
     /// Scalars are left alone - they broadcast over any lane count, so they
     /// are already correct for the wider state.
     pub fn duplicate_lanes(&mut self, mask: &[bool]) {
-        let _trace = TraceSpan::new("duplicate_lanes", "expand");
-        let t = crate::op_census::start();
         assert_eq!(
             mask.len(),
             self.vector_size,
@@ -420,7 +365,6 @@ impl State {
             | Value::NilPointer(_)) => other,
         });
         self.vector_size += indices.len();
-        crate::op_census::record(crate::op_census::Cat::Expand, self.vector_size, 0, t);
     }
 
     /// Filters all vector values in the state by a mask, cloning first.
@@ -459,18 +403,10 @@ impl State {
     /// never gets one at all). Such a cell has no observable content, but its
     /// identity matters: a later `Store` through that pointer must still work.
     pub fn gc(&mut self) {
-        let t_census = crate::op_census::start();
-        let before = self.heap.len();
-        self.gc_inner(t_census);
-        crate::op_census::record_gc_cells(before, self.heap.len());
+        self.gc_inner();
     }
 
-    // (census guard defined at module scope below)
-
-    fn gc_inner(&mut self, t_census: Option<std::time::Instant>) {
-        let _defer = CensusGcGuard(t_census);
-        let _trace = TraceSpan::new("gc", "gc");
-
+    fn gc_inner(&mut self) {
         let mut old_to_new: FxHashMap<HeapId, HeapId> = FxHashMap::default();
         // `None` means the slot is allocated but holds no value. Also used as
         // the placeholder while recursing, so cycles terminate.
@@ -634,20 +570,3 @@ mod send_tests {
 }
 
 
-/// Records GC time to the op census even on early returns.
-struct CensusGcGuard(Option<std::time::Instant>);
-impl Drop for CensusGcGuard {
-    fn drop(&mut self) {
-        crate::op_census::record(crate::op_census::Cat::Gc, 0, 0, self.0.take());
-    }
-}
-
-/// A value the filter has to gather, as opposed to one it can leave alone.
-fn is_vector_value(value: &Value) -> bool {
-    matches!(
-        value,
-        Value::Number(MaybeVector::Vector(_))
-            | Value::NumberInterval(MaybeVector::Vector(_))
-            | Value::Bool(MaybeVector::Vector(_))
-    )
-}

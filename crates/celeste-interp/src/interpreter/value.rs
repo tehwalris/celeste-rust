@@ -68,14 +68,7 @@ impl<T: std::fmt::Debug + Clone + PartialEq + Eq> MaybeVector<T> {
         match self {
             MaybeVector::Scalar(v) => MaybeVector::Scalar(f(v)),
             MaybeVector::Vector(v) => {
-                let t = crate::op_census::start();
                 let out: Vec<T> = v.iter().map(f).collect();
-                crate::op_census::record(
-                    crate::op_census::Cat::Map,
-                    v.len(),
-                    2 * v.len() * std::mem::size_of::<T>(),
-                    t,
-                );
                 MaybeVector::vector(out)
             }
         }
@@ -89,14 +82,7 @@ impl<T: std::fmt::Debug + Clone + PartialEq + Eq> MaybeVector<T> {
         match self {
             MaybeVector::Scalar(v) => MaybeVector::Scalar(f(v)),
             MaybeVector::Vector(v) => {
-                let t = crate::op_census::start();
                 let out: Vec<O> = v.iter().map(f).collect();
-                crate::op_census::record(
-                    crate::op_census::Cat::Map,
-                    v.len(),
-                    v.len() * (std::mem::size_of::<T>() + std::mem::size_of::<O>()),
-                    t,
-                );
                 MaybeVector::vector(out)
             }
         }
@@ -114,37 +100,16 @@ impl<T: std::fmt::Debug + Clone + PartialEq + Eq> MaybeVector<T> {
                 // element - this is the arithmetic inner loop, and the
                 // per-element branch blocks auto-vectorization.
                 assert_eq!(a.len(), b.len(), "map2 on vectors of different sizes");
-                let t = crate::op_census::start();
                 let out: Vec<O> = a.iter().zip(b.iter()).map(|(a, b)| f(a, b)).collect();
-                crate::op_census::record(
-                    crate::op_census::Cat::Binop,
-                    a.len(),
-                    a.len() * (2 * std::mem::size_of::<T>() + std::mem::size_of::<O>()),
-                    t,
-                );
                 MaybeVector::vector(out)
             }
             // Broadcast scalar to match vector size
             (MaybeVector::Scalar(a), MaybeVector::Vector(b)) => {
-                let t = crate::op_census::start();
                 let out: Vec<O> = b.iter().map(|bi| f(a, bi)).collect();
-                crate::op_census::record(
-                    crate::op_census::Cat::Binop,
-                    b.len(),
-                    b.len() * (std::mem::size_of::<T>() + std::mem::size_of::<O>()),
-                    t,
-                );
                 MaybeVector::vector(out)
             }
             (MaybeVector::Vector(a), MaybeVector::Scalar(b)) => {
-                let t = crate::op_census::start();
                 let out: Vec<O> = a.iter().map(|ai| f(ai, b)).collect();
-                crate::op_census::record(
-                    crate::op_census::Cat::Binop,
-                    a.len(),
-                    a.len() * (std::mem::size_of::<T>() + std::mem::size_of::<O>()),
-                    t,
-                );
                 MaybeVector::vector(out)
             }
         }
@@ -364,19 +329,12 @@ fn split_vec<T>(vec: &[T], runs: &SplitRuns) -> (MaybeVector<T>, MaybeVector<T>)
 where
     T: std::fmt::Debug + Clone + PartialEq + Eq,
 {
-    let t = crate::op_census::start();
     let mut out_true: Vec<T> = Vec::with_capacity(runs.total_true);
     let mut out_false: Vec<T> = Vec::with_capacity(runs.total_false);
     for &(start, end, matches) in &runs.runs {
         let side = if matches { &mut out_true } else { &mut out_false };
         side.extend_from_slice(&vec[start as usize..end as usize]);
     }
-    crate::op_census::record(
-        crate::op_census::Cat::Filter,
-        vec.len(),
-        vec.len() * (2 * std::mem::size_of::<T>() + 4),
-        t,
-    );
     // `vector` collapses uniform or single-lane sides to `Scalar`, matching
     // what two separate filters would have produced.
     (MaybeVector::vector(out_true), MaybeVector::vector(out_false))
@@ -473,20 +431,9 @@ where
         let only = kept.first().expect("total 1 implies a range");
         return MaybeVector::Scalar(vec[only as usize].clone());
     }
-    let t = crate::op_census::start();
     let mut filtered = Vec::with_capacity(kept.total);
     for &(start, end) in &kept.ranges {
         filtered.extend_from_slice(&vec[start as usize..end as usize]);
-    }
-    crate::op_census::record(
-        crate::op_census::Cat::Filter,
-        kept.total,
-        kept.total * (2 * std::mem::size_of::<T>() + 4),
-        t,
-    );
-    if crate::op_census::enabled() {
-        crate::op_census::record_filter_size(kept.total);
-        crate::op_census::record_filter_source(vec.len(), std::mem::size_of::<T>());
     }
     MaybeVector::vector(filtered)
 }

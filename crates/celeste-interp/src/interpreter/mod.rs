@@ -19,7 +19,6 @@ pub use op::{partition_straddles_test_lock, set_partition_straddles};
 pub mod row_table;
 pub mod visited;
 pub mod state;
-pub mod tracing;
 pub mod value;
 pub mod merge_dump;
 pub mod virtual_merge;

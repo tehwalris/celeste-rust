@@ -170,7 +170,7 @@ pub fn interpret_select(condition: &Value, if_true: &Value, if_false: &Value) ->
     // select survive on values it could not otherwise merge - a pointer, say.
     // The census counts what the *discarded* arm cost upstream: a vector arm
     // was per-lane compute this point throws away (class-dead speculation).
-    let discarded_lanes = |v: &Value| -> usize {
+    let _discarded_lanes = |v: &Value| -> usize {
         match v {
             Value::Number(MaybeVector::Vector(x)) => x.len(),
             Value::NumberInterval(MaybeVector::Vector(x)) => x.len(),
@@ -180,33 +180,18 @@ pub fn interpret_select(condition: &Value, if_true: &Value, if_false: &Value) ->
     };
     match &mask {
         MaybeVector::Scalar(true) => {
-            if crate::op_census::enabled() {
-                crate::op_census::record_select_uniform(discarded_lanes(if_false));
-            }
             return Ok(if_true.clone());
         }
         MaybeVector::Scalar(false) => {
-            if crate::op_census::enabled() {
-                crate::op_census::record_select_uniform(discarded_lanes(if_true));
-            }
             return Ok(if_false.clone());
         }
         MaybeVector::Vector(m) if m.iter().all(|b| *b) => {
-            if crate::op_census::enabled() {
-                crate::op_census::record_select_uniform(discarded_lanes(if_false));
-            }
             return Ok(if_true.clone());
         }
         MaybeVector::Vector(m) if m.iter().all(|b| !*b) => {
-            if crate::op_census::enabled() {
-                crate::op_census::record_select_uniform(discarded_lanes(if_true));
-            }
             return Ok(if_false.clone());
         }
         MaybeVector::Vector(_) => {
-            if crate::op_census::enabled() {
-                crate::op_census::record_select_mixed();
-            }
         }
     }
 
@@ -224,7 +209,6 @@ pub fn interpret_select(condition: &Value, if_true: &Value, if_false: &Value) ->
         let MaybeVector::Vector(mask) = mask else {
             unreachable!("uniform conditions are handled above")
         };
-        let t = crate::op_census::start();
         // Specialized per arm representation: select is the largest flat
         // instruction cost at depth (13.4 s at frame 44), and the generic
         // loop paid a per-lane match on each arm. Each specialization is a
@@ -252,12 +236,6 @@ pub fn interpret_select(condition: &Value, if_true: &Value, if_false: &Value) ->
                 .map(|(&take_true, (a, b))| if take_true { a.clone() } else { b.clone() })
                 .collect(),
         };
-        crate::op_census::record(
-            crate::op_census::Cat::Select,
-            mask.len(),
-            mask.len() * (1 + 3 * std::mem::size_of::<T>()),
-            t,
-        );
         MaybeVector::vector(out)
     }
 
@@ -360,10 +338,7 @@ fn value_lanes(v: &Value) -> usize {
 /// Price the cross-fragment op memo (census only): would this vector op's
 /// inputs have been seen before, Arc-identically, this frame?
 fn memo_price(tag: u64, inputs: &[&Value]) {
-    if !crate::op_census::enabled() {
-        return;
-    }
-    use std::hash::{Hash, Hasher};
+    use std::hash::Hash;
     let mut hasher = rustc_hash::FxHasher::default();
     tag.hash(&mut hasher);
     let mut holders = Vec::new();
@@ -393,17 +368,10 @@ fn memo_price(tag: u64, inputs: &[&Value]) {
         }
     }
     if any_vector {
-        crate::op_census::memo_probe(hasher.finish(), elems, holders);
     }
 }
 
 pub fn interpret_binary_op(l: &Value, op: BinaryOp, r: &Value) -> Result<Value> {
-    if crate::op_census::enabled() {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = rustc_hash::FxHasher::default();
-        std::mem::discriminant(&op).hash(&mut hasher);
-        memo_price(hasher.finish(), &[l, r]);
-    }
     let sb = |b| Ok(Value::Bool(MaybeVector::Scalar(b)));
 
     // Handle mixed Number/NumberInterval by lifting Number to NumberInterval
@@ -602,13 +570,12 @@ pub fn interpret_binary_op(l: &Value, op: BinaryOp, r: &Value) -> Result<Value> 
                 // How much precision does collapsing to UnknownBool
                 // actually cost? Partitioning the state instead only helps
                 // where some lane HAS an answer, so count that directly.
-                let (definite, total) = match &tri {
+                let (_definite, _total) = match &tri {
                     MaybeVector::Scalar(t) => (t.is_some() as usize, 1),
                     MaybeVector::Vector(ts) => {
                         (ts.iter().filter(|t| t.is_some()).count(), ts.len())
                     }
                 };
-                crate::op_census::record_unknown_collapse(definite, total);
             }
             if all_unknown || (any_unknown && !partition_straddles_enabled()) {
                 // No lane has an answer, or some lane does not and tri-state

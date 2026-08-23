@@ -765,8 +765,6 @@ fn bench(
         }
     }
     if profile {
-        celeste_rust::interpreter::tracing::reset_tracing();
-        celeste_rust::interpreter::tracing::enable_tracing();
         celeste_rust::instr_time::reset();
         celeste_rust::instr_time::enable();
         if std::env::var("CELESTE_INSTR_CARD").is_ok() {
@@ -799,37 +797,6 @@ fn bench(
     for frame in start_frame..=frames {
         let frame_start = std::time::Instant::now();
         run.step()?;
-        {
-            let splits = celeste_rust::op_census::take_select_splits();
-            if splits > 0 {
-                println!("  select splits f{:03}: {}", frame, splits);
-            }
-            let deopt_nanos = celeste_rust::op_census::take_deopt_nanos();
-            if deopt_nanos > 0 {
-                let frame_nanos = frame_start.elapsed().as_nanos() as u64;
-                println!(
-                    "  deopt f{:03}: {:.2}s of plain-program CPU ({:.1}% of the frame's \
-                     {:.2}s wall, summed over threads)",
-                    frame,
-                    deopt_nanos as f64 / 1e9,
-                    100.0 * deopt_nanos as f64 / frame_nanos.max(1) as f64,
-                    frame_nanos as f64 / 1e9,
-                );
-            }
-            let (calls, mixed, definite, total) =
-                celeste_rust::op_census::take_unknown_collapse();
-            if calls > 0 {
-                println!(
-                    "  collapse f{:03}: {} constructions, {} mixed, {}/{} lanes definite ({:.1}%)",
-                    frame,
-                    calls,
-                    mixed,
-                    definite,
-                    total,
-                    100.0 * definite as f64 / total.max(1) as f64
-                );
-            }
-        }
         if let Some(cfg) = checkpoint.as_ref() {
             if cfg.save_frames {
                 celeste_rust::metrics::time("fwd.save_frames", || {
@@ -968,7 +935,6 @@ fn bench(
     // driver - which is where every search actually runs - never emitted
     // it. This one is unconditional (two atomic adds per construction) and
     // prints only when something was counted.
-    celeste_rust::op_census::report_unknown_collapse();
     let (deopt_states, deopt_lanes) = run.deopt_events();
     if deopt_states > 0 {
         println!(
@@ -1071,218 +1037,6 @@ fn bench(
         "", fragments, mean_fragments, max_fragments
     );
 
-    if profile {
-        let rows = celeste_rust::interpreter::tracing::span_self_time_summary();
-        let measured: u64 = rows.iter().map(|r| r.self_us).sum();
-        println!();
-        println!(
-            "{:<28} {:>9} {:>7} {:>9} {:>12}",
-            "span", "self (s)", "%", "total (s)", "count"
-        );
-        for row in rows.iter().take(20) {
-            println!(
-                "{:<28} {:>9.2} {:>6.1}% {:>9.2} {:>12}",
-                format!("{}:{}", row.category, row.name),
-                row.self_us as f64 / 1e6,
-                100.0 * row.self_us as f64 / measured.max(1) as f64,
-                row.total_us as f64 / 1e6,
-                row.count
-            );
-        }
-        println!(
-            "{:<28} {:>9.2} of {:.2}s wall clock (the rest is outside any span)",
-            "measured", measured as f64 / 1e6, elapsed.as_secs_f64()
-        );
-
-        // Where the program-under-test's own time goes, resolved to blocks
-        // and individual instructions. Timer overhead inflates everything
-        // roughly uniformly; read the shares, not the absolute seconds. A
-        // `call`'s time includes its whole callee.
-        {
-            // (function, local id) -> (block label, instruction text). The
-            // frame driver executes as "__main" and is not one of the
-            // program's functions, so it is indexed separately.
-            let locate: std::collections::HashMap<(String, usize), (String, String)> =
-                std::collections::HashMap::new();
-
-            let rows = celeste_rust::instr_time::report();
-            let total_us: u128 = rows.iter().map(|(_, _, d, _)| d.as_micros()).sum();
-
-            let mut by_block: std::collections::HashMap<(String, String), (u128, u64)> =
-                std::collections::HashMap::new();
-            let mut by_kind: std::collections::HashMap<String, u128> =
-                std::collections::HashMap::new();
-            for (function, id, duration, samples) in &rows {
-                let (block, text) = locate
-                    .get(&(function.clone(), *id))
-                    .cloned()
-                    .unwrap_or_else(|| ("?".to_string(), "?".to_string()));
-                let entry = by_block.entry((function.clone(), block)).or_default();
-                entry.0 += duration.as_micros();
-                entry.1 += samples;
-                let kind = text
-                    .split([' ', '('])
-                    .find(|w| !w.starts_with('%') && !w.is_empty() && *w != "=")
-                    .unwrap_or("?")
-                    .to_string();
-                *by_kind.entry(kind).or_default() += duration.as_micros();
-            }
-
-            println!();
-            println!(
-                "program time under test: {:.2}s measured across {} distinct instructions",
-                total_us as f64 / 1e6,
-                rows.len()
-            );
-
-            let mut kind_rows: Vec<(String, u128)> = by_kind.into_iter().collect();
-            kind_rows.sort_by_key(|(k, us)| (std::cmp::Reverse(*us), k.clone()));
-            println!("{:<24} {:>9} {:>7}", "by instruction kind", "time (s)", "%");
-            for (kind, us) in kind_rows.iter().take(12) {
-                println!(
-                    "{:<24} {:>9.3} {:>6.1}%",
-                    kind,
-                    *us as f64 / 1e6,
-                    100.0 * *us as f64 / total_us.max(1) as f64
-                );
-            }
-
-            let mut block_rows: Vec<((String, String), (u128, u64))> =
-                by_block.into_iter().collect();
-            block_rows.sort_by_key(|(k, (us, _))| (std::cmp::Reverse(*us), k.clone()));
-            println!();
-            println!(
-                "{:<58} {:>9} {:>7} {:>10}",
-                "hottest blocks (function::block)", "time (s)", "%", "samples"
-            );
-            for ((function, block), (us, samples)) in block_rows.iter().take(15) {
-                println!(
-                    "{:<58} {:>9.3} {:>6.1}% {:>10}",
-                    format!("{}::{}", function, block),
-                    *us as f64 / 1e6,
-                    100.0 * *us as f64 / total_us.max(1) as f64,
-                    samples
-                );
-            }
-
-            println!();
-            println!(
-                "{:<7} {:>9} {:>7} {:>9}  {}",
-                "id", "time (s)", "%", "samples", "hottest instructions"
-            );
-            for (function, id, duration, samples) in rows.iter().take(30) {
-                let (block, text) = locate
-                    .get(&(function.clone(), *id))
-                    .cloned()
-                    .unwrap_or_else(|| ("?".to_string(), "?".to_string()));
-                println!(
-                    "%{:<6} {:>9.3} {:>6.1}% {:>9}  {}::{}: {}",
-                    id,
-                    duration.as_secs_f64(),
-                    100.0 * duration.as_micros() as f64 / total_us.max(1) as f64,
-                    samples,
-                    function,
-                    block,
-                    text
-                );
-            }
-
-            // Output-cardinality census (CELESTE_INSTR_CARD=1): how much of
-            // each instruction's time went into lanes whose value already
-            // existed elsewhere in the same output vector. `ideal` is
-            // time x distinct/lanes - what the instruction would cost if it
-            // computed each distinct result once; `waste` is the rest.
-            let card_rows = celeste_rust::instr_time::cardinality_report();
-            if !card_rows.is_empty() {
-                let time_of: std::collections::HashMap<(String, usize), std::time::Duration> = rows
-                    .iter()
-                    .map(|(f, id, d, _)| ((f.clone(), *id), *d))
-                    .collect();
-                struct WasteRow {
-                    function: String,
-                    id: usize,
-                    time: std::time::Duration,
-                    waste_us: f64,
-                    stat: celeste_rust::instr_time::CardStat,
-                    is_call: bool,
-                    text: String,
-                    block: String,
-                }
-                let mut waste_rows: Vec<WasteRow> = Vec::new();
-                for (function, id, stat) in &card_rows {
-                    let Some(&time) = time_of.get(&(function.clone(), *id)) else {
-                        continue;
-                    };
-                    let (block, text) = locate
-                        .get(&(function.clone(), *id))
-                        .cloned()
-                        .unwrap_or_else(|| ("?".to_string(), "?".to_string()));
-                    let density = stat.distinct as f64 / stat.lanes.max(1) as f64;
-                    waste_rows.push(WasteRow {
-                        function: function.clone(),
-                        id: *id,
-                        time,
-                        waste_us: time.as_micros() as f64 * (1.0 - density),
-                        stat: *stat,
-                        is_call: text.starts_with("call") || text.contains("= call"),
-                        text,
-                        block,
-                    });
-                }
-                // Calls nest their callee's instructions, which are counted
-                // themselves - excluding calls keeps the totals flat.
-                let flat: Vec<&WasteRow> = waste_rows.iter().filter(|r| !r.is_call).collect();
-                let flat_time_us: f64 = flat.iter().map(|r| r.time.as_micros() as f64).sum();
-                let flat_waste_us: f64 = flat.iter().map(|r| r.waste_us).sum();
-                println!();
-                println!(
-                    "output-cardinality census (non-call): {:.2}s measured, {:.2}s ({:.0}%) spent on lanes duplicating a value already in the same vector",
-                    flat_time_us / 1e6,
-                    flat_waste_us / 1e6,
-                    100.0 * flat_waste_us / flat_time_us.max(1.0)
-                );
-                let mut ranked: Vec<&WasteRow> = flat.clone();
-                ranked.sort_by(|a, b| b.waste_us.total_cmp(&a.waste_us));
-                println!(
-                    "{:<7} {:>9} {:>9} {:>10} {:>9} {:>8}  {}",
-                    "id", "waste(s)", "time (s)", "lanes/ex", "dist/ex", "maxdist", "instruction"
-                );
-                for r in ranked.iter().take(30) {
-                    println!(
-                        "%{:<6} {:>9.3} {:>9.3} {:>10.0} {:>9.1} {:>8}  {}::{}: {}",
-                        r.id,
-                        r.waste_us / 1e6,
-                        r.time.as_secs_f64(),
-                        r.stat.lanes as f64 / r.stat.execs.max(1) as f64,
-                        r.stat.distinct as f64 / r.stat.execs.max(1) as f64,
-                        r.stat.max_distinct,
-                        r.function,
-                        r.block,
-                        r.text
-                    );
-                }
-            }
-        }
-
-
-        // Spans in the `merge_site` category exist only to bracket other work,
-        // so they have no self time worth reporting - what matters is how much
-        // is under them.
-        let sites: Vec<_> = rows.iter().filter(|r| r.category == "merge_site").collect();
-        if !sites.is_empty() {
-            println!();
-            for row in sites {
-                println!(
-                    "{:<28} {:>9} {:>7} {:>9.2} {:>12}",
-                    format!("{}:{}", row.category, row.name),
-                    "-",
-                    "-",
-                    row.total_us as f64 / 1e6,
-                    row.count
-                );
-            }
-        }
-    }
     Ok(())
 }
 

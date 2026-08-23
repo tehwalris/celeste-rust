@@ -9,7 +9,6 @@
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::tracing::TraceSpan;
 
 use super::{
     heap::{Heap, HeapId},
@@ -398,7 +397,6 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
                 _ => None,
             };
 
-            let t_concat = crate::op_census::start();
             let mut result = Vec::with_capacity(total_size);
             let mut all_same = ref_val.is_some();
             let ref_val = ref_val.unwrap_or(Pico8Num::from_i16(0));
@@ -426,12 +424,6 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
                     _ => panic!("Type mismatch in merge"),
                 }
             }
-            crate::op_census::record(
-                crate::op_census::Cat::Concat,
-                result.len(),
-                result.len() * 2 * 4,
-                t_concat,
-            );
             if result.len() == 1 || (all_same && result.len() > 1) {
                 Value::Number(MaybeVector::Scalar(result[0]))
             } else {
@@ -446,7 +438,6 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
                 _ => None,
             };
 
-            let t_concat = crate::op_census::start();
             let mut result = Vec::with_capacity(total_size);
             let mut all_same = ref_val.is_some();
             let ref_val = ref_val.unwrap_or(Pico8NumInterval::new(Pico8Num::from_i16(0), Pico8Num::from_i16(0)));
@@ -474,12 +465,6 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
                     _ => panic!("Type mismatch in merge"),
                 }
             }
-            crate::op_census::record(
-                crate::op_census::Cat::Concat,
-                result.len(),
-                result.len() * 2 * 8,
-                t_concat,
-            );
             if result.len() == 1 || (all_same && result.len() > 1) {
                 Value::NumberInterval(MaybeVector::Scalar(result[0]))
             } else {
@@ -494,7 +479,6 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
                 _ => None,
             };
 
-            let t_concat = crate::op_census::start();
             let mut result = Vec::with_capacity(total_size);
             let mut all_same = ref_val.is_some();
             let ref_val = ref_val.unwrap_or(false);
@@ -522,12 +506,6 @@ fn merge_values(values: &[(Value, usize)]) -> Value {
                     _ => panic!("Type mismatch in merge"),
                 }
             }
-            crate::op_census::record(
-                crate::op_census::Cat::Concat,
-                result.len(),
-                result.len() * 2 * 1,
-                t_concat,
-            );
             if result.len() == 1 || (all_same && result.len() > 1) {
                 Value::Bool(MaybeVector::Scalar(result[0]))
             } else {
@@ -578,8 +556,7 @@ fn hash_rows(vector_values: &[VectorRef], n: usize) -> Vec<u64> {
     fn fold(row: &mut u64, value: u64) {
         *row = (row.rotate_left(26) ^ value).wrapping_mul(0x9e37_79b9_7f4a_7c15);
     }
-    let t = crate::op_census::start();
-    let col_bytes: usize = vector_values
+    let _col_bytes: usize = vector_values
         .iter()
         .map(|v| match v {
             VectorRef::Numbers(x) => x.len() * 4,
@@ -607,12 +584,6 @@ fn hash_rows(vector_values: &[VectorRef], n: usize) -> Vec<u64> {
             }
         }
     }
-    crate::op_census::record(
-        crate::op_census::Cat::HashRows,
-        n * vector_values.len(),
-        col_bytes + 16 * n * vector_values.len(),
-        t,
-    );
     hashes
 }
 
@@ -808,7 +779,6 @@ fn bucket_unique_mask(vector_values: &[VectorRef], row_hashes: &[u64]) -> (Vec<b
 /// Deduplicate a vectorized state by removing duplicate vector elements.
 /// Returns a new state with unique vector elements.
 fn dedup_vectorized_state(mut state: State) -> State {
-    let _trace = TraceSpan::new("dedup_state", "vectorize");
     if state.vector_size <= 1 {
         return state;
     }
@@ -825,23 +795,8 @@ fn dedup_vectorized_state(mut state: State) -> State {
 
     // Hash every row up front (column-major, see `hash_rows`), then bucket.
     let row_hashes = hash_rows(&vector_values, state.vector_size);
-    let t_bucket = crate::op_census::start();
     let (mask, unique_count) = bucket_unique_mask(&vector_values, &row_hashes);
 
-    crate::op_census::record(
-        crate::op_census::Cat::DedupBucket,
-        state.vector_size,
-        0,
-        t_bucket,
-    );
-    if crate::op_census::enabled() {
-        let verified = (state.vector_size - unique_count) as u64;
-        crate::op_census::record_dedup_detail(
-            verified,
-            verified * vector_values.len() as u64,
-            verified * vector_values.len() as u64,
-        );
-    }
 
     if unique_count == state.vector_size {
         // No duplicates found
@@ -1526,7 +1481,6 @@ pub fn visited_row_keys(
     visited: &crate::interpreter::visited::Visited,
 ) -> Option<VisitedKeys> {
     use crate::interpreter::virtual_merge::{collect_columns_labeled, row_key_hashes, Column};
-    let _trace = TraceSpan::new("visited_row_keys", "vectorize");
     let census = dedup_census_on();
     let t_hash = census.then(std::time::Instant::now);
     let shape_hash = shape_hash_of_state(state);
@@ -1679,7 +1633,6 @@ pub fn subtract_decide(
     keys: Option<VisitedKeys>,
     visited: &mut crate::interpreter::visited::Visited,
 ) -> (Survivors, usize) {
-    let _trace = TraceSpan::new("subtract_visited", "vectorize");
     let before = state.vector_size;
     let Some(VisitedKeys { candidates, lanes }) = keys else {
         return (Survivors::All, before);
@@ -1743,7 +1696,6 @@ pub fn subtract_precomputed(
 /// survivor fragments. Chunked rather than one task per state so the
 /// thread count does not track the fragment count.
 pub fn gc_states(states: Vec<State>) -> Vec<State> {
-    let _gc_trace = TraceSpan::new("gc_before_vectorize", "gc");
     let threads = crate::interpreter::virtual_merge::merge_threads();
     if states.len() < 8 || threads == 1 {
         states.into_iter().map(|mut s| { s.gc(); s }).collect()
@@ -1764,7 +1716,6 @@ pub fn gc_states(states: Vec<State>) -> Vec<State> {
 }
 
 pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
-    let _trace = TraceSpan::new("vectorize_states", "vectorize");
     let mut stats = VectorizeTimingStats::default();
     stats.input_count = states.len();
 
@@ -1804,14 +1755,12 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
     let states = if partition_cells.is_empty() {
         states
     } else {
-        let _trace_split = TraceSpan::new("partition_split", "vectorize");
         split_states_by_partition(states, &partition_cells)
     };
 
     // Group states by shape (and partition class).
     let mut states_by_shape: FxHashMap<(StateShape, u64), Vec<State>> = FxHashMap::default();
     {
-        let _trace_shape = TraceSpan::new("shape_grouping", "vectorize");
         // Deriving a state's (shape, class) walks its whole heap and is a
         // pure function of that state, so at the frame boundary - where
         // there are ~1000 survivor fragments - the derivation is spread
@@ -1867,7 +1816,6 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
     // Vectorize each group
     let t3 = std::time::Instant::now();
     let result: Vec<State> = {
-        let _trace_merge = TraceSpan::new("merge_groups", "vectorize");
         states_by_shape
             .into_iter()
             .map(|(_, group)| {
@@ -1937,7 +1885,6 @@ pub fn union_diff_states(
     accumulated: Vec<State>,
     potentially_new: Vec<State>,
 ) -> (Vec<State>, Vec<State>) {
-    let _trace = TraceSpan::new("union_diff_states", "vectorize");
     assert!(
         accumulated.is_empty(),
         "a hint_normalize fixed point took a second round: union_diff_states \

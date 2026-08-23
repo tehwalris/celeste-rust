@@ -33,4 +33,3 @@ pub mod liveness;
 pub mod game_runner;
 pub mod instr_time;
 pub mod interpreter;
-pub mod op_census;
