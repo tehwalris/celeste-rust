@@ -59,11 +59,21 @@ pub fn inject_tile_flag_at<D: Domain>(st: &mut State<D>) {
 }
 
 pub fn sources() -> Result<String> {
-    let b3 = std::fs::read_to_string("lua/builtin_level_3.lua")?;
-    let b4 = std::fs::read_to_string("lua/builtin_level_4.lua")?;
-    let game = celeste_interp::game_runner::apply_start_room(&std::fs::read_to_string(
-        "lua/celeste-minimal.lua",
-    )?)?;
+    sources_in(std::path::Path::new("."))
+}
+
+/// The cart's Lua, read relative to `root`.
+///
+/// The paths used to be relative to the process's working directory,
+/// which is the repo root for every test in the workspace. The traced
+/// kernel's run check is a crate OUTSIDE the workspace - deliberately,
+/// see its Cargo.toml - so its working directory is not the repo root.
+pub fn sources_in(root: &std::path::Path) -> Result<String> {
+    let read = |p: &str| std::fs::read_to_string(root.join(p));
+    let b3 = read("lua/builtin_level_3.lua")?;
+    let b4 = read("lua/builtin_level_4.lua")?;
+    let game =
+        celeste_interp::game_runner::apply_start_room(&read("lua/celeste-minimal.lua")?)?;
     Ok(format!("{}\n{}\n{}\n", b3, b4, game))
 }
 

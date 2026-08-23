@@ -84,6 +84,10 @@ pub struct Frame {
     /// The canonical cell each `Iface` slot names in the state the frame
     /// STARTS in - the engine's numbering for `Op::Cell(i)`.
     pub in_cells: Vec<u32>,
+    /// The engine's structure for that state. Kept because a kernel is
+    /// RUN against a block of this shape, and the input state is gone by
+    /// then - `celeste_engine::slots::reshape` makes one from it.
+    pub in_rt2: celeste_engine::runtime2::Rt2,
 }
 
 /// Run one chunk and require it to end normally in exactly one state.
@@ -152,10 +156,8 @@ pub fn trace_frame<'a>(
         (Some(a), Some(b)) => (a, b),
         _ => bail!("tracing a frame needs the cart and the room's collision cache"),
     };
-    let in_cells = {
-        let in_rt2 = super::bind::structure_of(&st, cart.clone(), cache.clone())?;
-        super::bind::bind_inputs(&in_rt2, &iface)?
-    };
+    let in_rt2 = super::bind::structure_of(&st, cart.clone(), cache.clone())?;
+    let in_cells = super::bind::bind_inputs(&in_rt2, &iface)?;
     let st = run_one(it, reset, st)?;
     let mut outs = Vec::new();
     for (s, f) in it.exec_block(frame.nodes(), st)? {
@@ -189,7 +191,25 @@ pub fn trace_frame<'a>(
             ubool_cells: ubool_cells.to_vec(),
         });
     }
-    Ok(Frame { iface, outs, in_cells })
+    Ok(Frame { iface, outs, in_cells, in_rt2 })
+}
+
+/// The player is the object with a `djump` field. Naming it by
+/// position would be wrong the moment an object dies: `objects` is a
+/// list and things are deleted from it.
+pub fn find_player(st: &State<Symbolic>) -> Option<Path> {
+    let objs = vec![iface::key("objects")];
+    let Some(Value::Table(t)) = iface::get(st, &objs) else { return None };
+    for i in 0..st.heap.tables[&t].arr.len() {
+        let mut p = objs.clone();
+        p.push(Step::Idx(i));
+        if let Some(Value::Table(o)) = iface::get(st, &p) {
+            if st.heap.tables[&o].hash.contains_key("djump") {
+                return Some(p);
+            }
+        }
+    }
+    None
 }
 
 /// The six cells `Rt2::partition_pm1` splits a block on, as tracer
@@ -339,23 +359,7 @@ mod tests {
     use super::*;
     use crate::trace::cart;
 
-    /// The player is the object with a `djump` field. Naming it by
-    /// position would be wrong the moment an object dies: `objects` is a
-    /// list and things are deleted from it.
-    fn find_player(st: &State<Symbolic>) -> Option<Path> {
-        let objs = vec![iface::key("objects")];
-        let Some(Value::Table(t)) = iface::get(st, &objs) else { return None };
-        for i in 0..st.heap.tables[&t].arr.len() {
-            let mut p = objs.clone();
-            p.push(Step::Idx(i));
-            if let Some(Value::Table(o)) = iface::get(st, &p) {
-                if st.heap.tables[&o].hash.contains_key("djump") {
-                    return Some(p);
-                }
-            }
-        }
-        None
-    }
+    use super::find_player;
 
     /// Can the KERNEL EMITTER lower a traced graph?
     ///

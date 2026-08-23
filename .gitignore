@@ -26,3 +26,8 @@ native-probe/target/
 # Scratch dumps written next to the probe are not.
 /native-probe/*-shape.json
 crates/celeste-kernels/src/fused_gen_player.rs
+
+# The traced kernel run check generates its kernel; see its Cargo.toml.
+traced-kernel-check/src/kernel.rs
+traced-kernel-check/target/
+target/traced-kernel.rs

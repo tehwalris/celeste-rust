@@ -28,79 +28,33 @@
 use anyhow::{anyhow, bail, Result};
 
 use celeste_engine::runtime2::{Cell2, Col, Rt2, AV, NONE};
+use celeste_engine::slots;
 use celeste_names::gen;
 
 use super::iface::{show, Path, Step};
 
-/// Follow a cell that holds a pointer to the cell it points at. A cell
-/// that is already a table is returned unchanged, so this is idempotent.
-fn deref(rt2: &Rt2, cell: u32) -> Result<u32> {
-    match (&rt2.structure[cell as usize], &rt2.cols[cell as usize]) {
-        (Cell2::Val, Col::U(AV::Ptr(t))) => Ok(*t),
-        (Cell2::Val, Col::V(vs)) => {
-            // Pointer topology is lane-uniform in a block by
-            // construction, so a per-lane column of pointers is either
-            // all one target or a broken premise. Say which.
-            let mut it = vs.iter().filter_map(|v| match v {
-                AV::Ptr(t) => Some(*t),
-                _ => None,
-            });
-            let first = it.next().ok_or_else(|| anyhow!("cell {} is not a pointer", cell))?;
-            if it.any(|t| t != first) {
-                bail!("cell {} points at different tables in different lanes", cell);
-            }
-            Ok(first)
-        }
-        (Cell2::Val, _) => bail!("cell {} holds a scalar, not a table", cell),
-        _ => Ok(cell),
-    }
+/// The tracer's path as the engine's.
+///
+/// The two `Step` types are the same three cases; they are separate
+/// because the tracer's is part of its own interface and the engine's is
+/// what generated code parses out of a string. Converting here is what
+/// keeps ONE implementation of the walk - `resolve` below delegates to
+/// `celeste_engine::slots`, which is also what a generated kernel calls
+/// at bind time. Two walks that had to agree forever would be the same
+/// mistake as two numberings that had to agree forever (T17).
+fn steps(p: &[Step]) -> Vec<slots::PathStep> {
+    p.iter()
+        .map(|s| match s {
+            Step::Key(k) => slots::PathStep::Key(k.clone()),
+            Step::Idx(i) => slots::PathStep::Idx(*i),
+            Step::Int(i) => slots::PathStep::Int(*i),
+        })
+        .collect()
 }
 
 /// The canonical cell id a traced path names in this block.
 pub fn resolve(rt2: &Rt2, p: &[Step]) -> Result<u32> {
-    let mut cur: Option<u32> = None;
-    for step in p {
-        cur = Some(match (cur, step) {
-            (None, Step::Key(k)) => {
-                let gi = gen::GLOBAL_NAMES
-                    .iter()
-                    .position(|n| n == k)
-                    .ok_or_else(|| anyhow!("{}: not a global the boundary names", k))?;
-                let c = rt2.globals[gi];
-                if c == NONE {
-                    bail!("{}: global absent from this block", k);
-                }
-                c
-            }
-            (None, s) => bail!("{:?}: the globals table has no such key", s),
-            (Some(c), step) => {
-                let t = deref(rt2, c)?;
-                match (&rt2.structure[t as usize], step) {
-                    (Cell2::Obj(fields), Step::Key(k)) => {
-                        // Fields outside `FIELD_NAMES` were dropped on
-                        // import: no generated code can name them, so a
-                        // kernel asking for one is asking for something
-                        // that provably is not there.
-                        let f = gen::field_id(k)
-                            .ok_or_else(|| anyhow!("{}: not a field the boundary names", k))?;
-                        *fields
-                            .iter()
-                            .find(|(n, _)| *n == f)
-                            .map(|(_, c)| c)
-                            .ok_or_else(|| anyhow!("{}: absent from this shape", k))?
-                    }
-                    (Cell2::Arr(items), Step::Idx(i)) => *items
-                        .get(*i)
-                        .ok_or_else(|| anyhow!("index {} past the end of the array", i))?,
-                    (Cell2::Unk, _) => bail!("cell {} is an unknown table", t),
-                    (s, step) => {
-                        bail!("cannot take {:?} of a {}", step, kind(s))
-                    }
-                }
-            }
-        });
-    }
-    cur.ok_or_else(|| anyhow!("the empty path names the globals table, not a cell"))
+    slots::resolve_steps(rt2, &steps(p)).map_err(|e| anyhow!("{}", e))
 }
 
 fn kind(c: &Cell2) -> &'static str {
@@ -483,7 +437,7 @@ mod tests {
                 }
                 let got = resolve(&rt2, &p)
                     .unwrap_or_else(|e| panic!("{}: {} did not resolve: {:#}", w, name, e));
-                let landed = got == id as u32 || deref(&rt2, got).map(|t| t == id as u32).unwrap_or(false);
+                let landed = got == id as u32 || slots::deref(&rt2, got).map(|t| t == id as u32).unwrap_or(false);
                 assert!(landed, "{}: {} resolved to {} not {}", w, name, got, id);
                 ok += 1;
             }

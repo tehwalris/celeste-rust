@@ -1766,18 +1766,77 @@ guards partition the lanes so a lone outcome claims all of them.
 Anything else stops with an error instead of being silently dropped.
 `generated_is_current{,_r20}` pass unchanged.
 
-### What is left before it RUNS
+## T20 - and it RUNS, and it agrees with the graph
 
-Emitting the structure as generated data, so `build{i}` can make an
-outcome's block; the path-resolving `bind`/`rows`; and then the
-comparison that matters - run it on a real block and check the row-key
-sets against the interpreter, which is what
-`CELESTE_COMPILED_FORWARD=check` already does for the walk's kernels.
+The kernel now has the rest of its interface, and something runs it.
 
-Deferred rather than skipped: the pre-dedup `row_keys`/`KeyPlan`
-machinery. It is a performance mechanism (8.3 emitted rows per surviving
-row at f35), not correctness, and it is easier to add once a kernel runs
-at all.
+**The shape is generated data.** `OUT_SHAPE_{i}` / `OUT_GLOBALS_{i}` /
+`OUT_PTRS_{i}` are each outcome's heap layout as constants, and
+`acc{i}` turns them into an empty block via
+`celeste_engine::slots::build_block`. `append{i}` then pushes the lanes
+that take that outcome and that the kernel is willing to keep. No
+`acc_init` clone, because three outcomes in four do not have the input's
+shape.
+
+**Inputs bind by path.** `bind` resolves `UNI_SLOTS` and `ROW_SLOTS`
+against whatever block it is handed and returns the cell ids;
+`rows(b, &slots, lo)` gathers a 16-lane slice from them. The walk
+implementation moved DOWN into `celeste_engine::slots` so generated code
+can call it, and `trace::bind::resolve` now delegates there. One walk,
+not two that have to agree forever - the same argument T17 made about
+numbering.
+
+**`traced-kernel-check/` runs it**, deliberately outside the workspace:
+the kernel is generated, ~375 KB, and changes on every emitter tweak, so
+in-tree it would sit inside the same bootstrap the checked-in kernels
+have. `./check-traced-kernel.sh` renders, compiles and runs it.
+
+The check is two evaluators of ONE graph. `trace::eval` walks the nodes;
+the kernel is those nodes as compiled Rust. Same inputs, and every
+output cell, liveness bit and deopt bit has to agree.
+
+    rows per outcome [24, 23928, 48, 24]
+    1,393,224 (row, cell) values agree with the graph
+
+The inputs do not have to be reachable game states. Both sides evaluate
+one graph, so any assignment of the input cells is a valid comparison -
+and the unreachable ones are where a bug is most likely to survive.
+
+### Coverage was the hard part, and it failed quietly twice
+
+The first run reported 16,704 agreeing values and passed. Every one of
+them was outcome 1. Three of the four output shapes had no row at all,
+so `acc0/2/3` and `append0/2/3` were compiled and never executed.
+
+The first cause was mundane: lanes perturbed `slots[k % len]` with
+fifteen lanes and twenty-six slots, and the slots are in PATH order, so
+it swept `collideable` through `flip.y` and never touched `x`, `y` or
+`spd` - which are exactly what a shape-changing branch reads. Sweeping
+every slot got three of four.
+
+The fourth needed pairs. Outcome 0's liveness is `will_restart` AND
+`delay_restart > 0` AND `delay_restart - 1 <= 0`, i.e. a flag set and a
+counter at exactly 1. No single displacement satisfies a conjunction:
+setting one loses the other. A pair sweep reaches it.
+
+The lesson is about the assertion, not the sweep. "1.4 million values
+agree" is the kind of number that reads as thorough, and the version of
+it that checked a quarter of the kernel looked exactly the same. What
+made the gap visible was counting rows PER OUTCOME and failing on any
+that were never reached. A coverage claim needs a coverage assertion;
+a volume number is not one.
+
+### Still deferred
+
+The pre-dedup `row_keys`/`KeyPlan` machinery. It is a performance
+mechanism (8.3 emitted rows per surviving row at f35), not correctness.
+
+And the comparison against the INTERPRETER on a real search block, which
+is what `CELESTE_COMPILED_FORWARD=check` does for the walk's kernels.
+What runs today closes the emitter-to-machine-code gap; the tracer's
+agreement with the interpreter is already covered by the oracle test, so
+these two together cover the chain - but not yet in one run, on a block
+the search actually produced.
 
 ## Stage 4 - delete
 

@@ -5,12 +5,15 @@
 # emitted something. Whether those lines are Rust is a separate question
 # and rustc is the only thing that answers it.
 #
-# Deliberately NOT part of the build. The traced kernel is not checked in
-# yet: it changes on every emitter tweak, it is ~300 KB, and putting it
-# under `crates/celeste-kernels` would put it inside the bootstrap the
-# checked-in kernels already have (the emitters live in a crate that
-# depends on the crate they generate). Compiling it out-of-tree keeps
-# that loop out of the way until the kernel is worth keeping.
+# Then it RUNS it, against `trace::eval` on the same inputs - two
+# evaluators of one graph, which is what says the emitted Rust means what
+# the graph means.
+#
+# `traced-kernel-check/` is deliberately outside the workspace. The
+# kernel is generated, ~400 KB, and changes on every emitter tweak;
+# putting it under `crates/celeste-kernels` would put it inside the
+# bootstrap the checked-in kernels already have, where a kernel that
+# fails to compile also stops you rebuilding the tool that would fix it.
 #
 #   ./check-traced-kernel.sh
 #
@@ -19,7 +22,6 @@ set -euo pipefail
 
 repo="$(cd "$(dirname "$0")" && pwd)"
 out="$repo/target/traced-kernel.rs"
-scratch="${SCRATCH:-/tmp/traced-kernel-check}"
 
 if [ -z "${SKIP_RENDER:-}" ]; then
     echo "== rendering (the emit probe writes $out)"
@@ -30,21 +32,8 @@ fi
 
 [ -f "$out" ] || { echo "no $out - did the probe run?" >&2; exit 1; }
 
-mkdir -p "$scratch/src"
-cat > "$scratch/Cargo.toml" <<EOF
-[package]
-name = "traced-kernel-check"
-version = "0.1.0"
-edition = "2021"
+check="$repo/traced-kernel-check"
+cp "$out" "$check/src/kernel.rs"
 
-[dependencies]
-celeste-engine = { path = "$repo/crates/celeste-engine" }
-celeste-core = { path = "$repo/crates/celeste-core" }
-
-[workspace]
-EOF
-cp "$out" "$scratch/src/lib.rs"
-
-echo "== compiling $(wc -l < "$out") lines in $scratch"
-cd "$scratch" && cargo build
-echo "== the traced kernel compiles"
+echo "== compiling and RUNNING $(wc -l < "$out") lines in $check"
+cd "$check" && cargo test --release -- --nocapture

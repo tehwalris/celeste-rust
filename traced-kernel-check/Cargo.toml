@@ -1,0 +1,21 @@
+# The traced kernel's RUN check, deliberately outside the workspace.
+#
+# `src/kernel.rs` is generated (gitignored) and changes on every emitter
+# tweak. Checking it into `crates/celeste-kernels` would put a ~400 KB
+# churning file inside the bootstrap the checked-in kernels already have
+# - the emitters live in a crate that depends on the crate they generate,
+# so a kernel that fails to compile also stops you rebuilding the tool
+# that would fix it. Out here, a bad kernel breaks only this.
+#
+# Run it with ../check-traced-kernel.sh.
+[package]
+name = "traced-kernel-check"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+celeste-rust = { path = ".." }
+celeste-engine = { path = "../crates/celeste-engine" }
+celeste-core = { path = "../crates/celeste-core" }
+
+[workspace]
