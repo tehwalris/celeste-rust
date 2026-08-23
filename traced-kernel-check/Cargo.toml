@@ -17,5 +17,6 @@ edition = "2021"
 celeste-rust = { path = ".." }
 celeste-engine = { path = "../crates/celeste-engine" }
 celeste-core = { path = "../crates/celeste-core" }
+celeste-names = { path = "../crates/celeste-names" }
 
 [workspace]

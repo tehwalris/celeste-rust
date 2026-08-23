@@ -2183,6 +2183,92 @@ tracer freezes as program constants - a kernel never reads those, but
 they are part of the row key and therefore part of what a run is compared
 against.
 
+## T24 - the widened `rem`, and why the tracer stops at frame 25
+
+The frame loop runs 24 frames on kernels alone and stops here:
+
+    frame 25: shape 1 did not bind a block of its own shape:
+    objects[0].rem.x: per-lane num slot holds Ival(-0.5, 0.5-) at lane 0
+
+Philippe, asked whether to sidestep it by running at exact rem: no. The
+kernels should run what the normal runner runs - level 0, widened `rem`,
+and the ladder on top of it. An exact-rem detour was written and
+reverted; what follows is the actual work.
+
+(The detour did produce one number worth keeping: at f30 in room (1,0),
+exact rem is 28,553 lanes against level 0's 27,024, and FASTER per frame
+- 35.9 ms against 66.4 ms, no interval arithmetic. That says the level-0
+`rem` widening is not buying much this early. It says nothing about
+depth, which is where a widening earns its keep.)
+
+### Why it does not already work
+
+The surface gap is representation: the tracer's scalars are
+`Value::Num` - a graph node standing for ONE number - and `Value::Bool`.
+There is no interval, so an `AV::Ival` column binds to nothing.
+
+The real gap is that `flr` of an interval is not a function. The cart:
+
+    obj.rem.x = obj.rem.x + ox + 0.5
+    obj.rem.x = __split_by_flr(obj.rem.x)
+    amount    = flr(obj.rem.x)
+
+With `rem.x` widened, that lane holds points whose floors differ.
+`__split_by_flr` is the cart's own marker for "split the lane here", and
+`Interp::eval_builtin` implements it as the IDENTITY, with a comment
+admitting the punt: "On an EXACT value the floor is unique, so there is
+one fragment and this is the identity."
+
+Forking is not branching. A branch sends a lane to exactly one
+successor, which is all the tracer does and what its outcomes, live
+masks and appends assume. A fork puts one lane in two successors holding
+different values.
+
+### What makes it small
+
+The interval is a CONSTANT. `player.rem` is re-widened to exactly
+`[-0.5, 0.5)` at every boundary, so what reaches `flr` has width < 1 and
+spans at most two floors, always. The engine says so already
+(`zi_span_ok`: "a boundary-widened interval has width < 1 and always
+passes"), and `zi_fork_flr`, `zi_flr_ok` and the `ZI` lane type all
+exist. This is tracer and emitter work, not engine work.
+
+Only the PLAYER's `rem.x`/`rem.y` are widened - `mark_walk` collects
+them from `player_objects` alone - so every other object's `rem` stays a
+number and must NOT fork, or a room with n moving objects gets 2^2n fork
+configurations for nothing.
+
+### The shape of it
+
+The graph already carries the whole vocabulary: `Choice::Split(d)`,
+`Op::Split(d)`, `Op::SplitValid(d)`, `Op::SplitOk`. So the tracer does
+not have to fork its own state at all - it names the fragment
+symbolically and lets specialization enumerate it, exactly as it already
+does for the six buttons:
+
+1. `iface::symbolize` learns which paths are INTERVAL inputs (the
+   player's `rem.x`/`rem.y`, found the same way `mark_walk` finds them),
+   and the emitter declares those cells `ival`.
+2. `__split_by_flr(x)` on an interval-tainted `x` returns `Split(d)(x)`,
+   conjoins `SplitValid(d)(x)` into the state's GUARD (the fragments
+   partition the lane, so this is liveness, not an obligation) and
+   `SplitOk(x)` into `ok` (the <=2-floors premise, which IS an
+   obligation). On an untainted `x` it stays the identity.
+   "Interval-tainted" is a cone query - does this node reach an `ival`
+   cell - memoized per node.
+3. `trace::kernel::render` emits the fork configurations, which is the
+   `fork_depth` machinery its module docs declined to inherit from the
+   walk's renderer. The dimension is the same kind of thing as the 64
+   button assignments it already iterates.
+4. `player.rem` is written out as an interval (`Col::I`), which needs a
+   `ZI` output field kind in the traced renderer.
+
+### Open, and to be checked rather than assumed
+
+`specialize_into` says splits are excluded from what it enumerates
+(graph.rs:299) - so how fork configurations reach the emitted code has
+to be read before step 3 is designed, not after.
+
 ## Doctrine: never deopt to the interpreter (Philippe, 2026-08-23)
 
 **A deopt stops the run. It does not fall back.**

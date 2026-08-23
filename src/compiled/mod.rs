@@ -291,6 +291,16 @@ impl FrameEngine {
         &self.ids
     }
 
+    /// The room this engine was built for. Exposed so a caller comparing
+    /// against it can import a state into a block the same way it does.
+    pub fn cart(&self) -> Arc<CartData> {
+        self.cart.clone()
+    }
+
+    pub fn cache(&self) -> Arc<CollisionCache> {
+        self.cache.clone()
+    }
+
     /// Attach the plain-program deopt path (see `PlainPath`). Without it,
     /// the kernels' deopt sub-chunks run the specialized interpreter and a
     /// premise failure aborts the whole frame chunk.

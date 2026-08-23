@@ -709,6 +709,7 @@ version = "0.1.0"
 dependencies = [
  "celeste-core",
  "celeste-engine",
+ "celeste-names",
  "celeste-rust",
 ]
 
