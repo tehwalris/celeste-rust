@@ -9,6 +9,73 @@ places I think it needs more than was said.
 
 ---
 
+## STATE, end of 2026-08-23
+
+The campaign works end to end for one room. Read this section and the
+three it points at; the T-numbered entries below are the working log and
+are only worth reading when you need the reason for something.
+
+### What runs
+
+`the_room_runs_on_kernels_alone` (traced-kernel-check): room (1,0),
+frames 1-30, on GENERATED KERNELS ONLY - no interpreter anywhere in the
+execution path - and every frame's row key SET is identical to
+`AbstractRun`'s, up to 27,024 rows at frame 30.
+
+Gates, all green: the 609-test suite, `generated_is_current` both
+variants, and the per-frame graph check (1,393,224 values).
+
+### The numbers, all measured today
+
+| | |
+|---|---|
+| speed vs the interpreter | **2.75x slower** (619 ms vs 220 ms, 30 frames, single-threaded) |
+| row amplification | **46x**: 1.25M rows written to keep 27k |
+| ...decomposed | 1.4x static, ~2.7x per-lane, ~2.7x cross-lane, 5.9x only-the-widenings |
+| codegen | **16.3 instructions per graph node**, 48% stack traffic, 6.6% vector |
+| live values | 512 peak - but **493 are OUTPUTS**; the computation's working set is ~19 |
+| build loop | ~55 s (was 25 min until `black_box` on the fork trip count) |
+
+### The design that follows, agreed with Philippe
+
+ONE change, not four: the kernel computes `_update` + `_draw`, dedups AT
+WRITE TIME against a rung-aware key, and stores survivors straight into
+their output columns - emitting per output GROUP rather than per
+variant, which is also what removes the fork's runtime loop.
+
+Each piece has a measurement behind it; see "Where the row amplification
+actually lives" for the derivation, including why the key is nearly free
+(the emitter's shared/tainted split already partitions it) and why
+specialization is a LAYER (shape, then rung, then pm1) rather than a
+redefinition.
+
+**The dangerous part**, kept visible on purpose: the rung-aware key is
+where a mistake is SILENT. A key that erases something the boundary does
+not erase drops real successors with no error. Derive it from the same
+description the boundary widens from.
+
+### Open
+
+* Rust or direct assembly for the restructure. Today's spill numbers were
+  measured on a shape this change dissolves, so re-argue it after.
+  See "Philippe's codegen question".
+* Whether the cross-lane half needs a frame-lifetime table on top of the
+  per-slice dedup. A measurement, once the per-slice part exists.
+* Deletion is still blocked on `gen.rs`, one room, one ladder rung, and
+  the fact that the oracle IS the thing to be deleted. See "What is
+  needed before deleting `celeste-rewrite`".
+
+### Corrections made today, because the wrong versions were plausible
+
+The build loop was never ten minutes (my polling, not a clock). The
+mixed-domain select was not a mixed value. The static dedup is 1.4x, not
+"most of it". The spilling is not inherent - 493 of the 512 live values
+are outputs. Folding the widenings in is not dead-code elimination
+(2.5%). Each is written up where it happened rather than quietly
+replaced.
+
+---
+
 ## 1. The claim
 
 We currently get a pure graph like this:
