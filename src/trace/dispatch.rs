@@ -51,6 +51,10 @@ pub struct Kernel {
     /// `None`: not this kernel's shape. `Some(mask)`: the lanes it
     /// declined, which the doctrine says stops the run.
     pub step: fn(&Rt2, usize, usize, &mut [Rt2]) -> Option<u16>,
+    /// Nanoseconds this kernel has spent APPENDING rows rather than
+    /// computing them, taken and cleared. A diagnostic - see
+    /// `FrameStat::t_append`.
+    pub append_ns: fn() -> u64,
     /// Which slot would stop `bind`, or `None` if it would bind.
     ///
     /// `step` returns an `Option` because it is the hot path. Under the

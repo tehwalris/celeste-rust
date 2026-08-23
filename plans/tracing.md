@@ -2882,7 +2882,36 @@ OUTSIDE `frame` (Vec pushes), not from better codegen inside it.
 Which puts the codegen direction back where it was two corrections ago:
 a hand emitter's advantage is HOW it spills, not spilling less.
 
-### Where the 405 ms goes now - and why dedup is NOT next
+### Where the time goes - dedup IS next (corrected twice)
+
+`FrameStat` splits the frame, and the split within the kernel is the
+part that matters:
+
+    kernel 268 ms (of which APPEND 175 ms), merge 11 ms, boundary 138 ms
+
+Appending rows is 65% of the kernel and the largest single cost in the
+frame. Computing it is only ~93 ms.
+
+I had said "dedup is not next" on the grounds that it targets the
+boundary's 136 ms alone. Wrong: it targets the APPEND path first, and
+the boundary second, because both scale with rows written. Of 418 ms
+(instrumented; 401 without):
+
+    compute    93 ms   ->   93 ms
+    append   ~170 ms   ->  ~23 ms
+    boundary  138 ms   ->  ~18 ms
+    merge      11 ms   ->   ~2 ms
+    -----------------------------
+             418 ms    -> ~135 ms
+
+against the interpreter's 219 ms. Removing even the 7.3x of EXACT
+duplicates plausibly makes the kernels faster than the interpreter
+rather than 1.85x slower.
+
+(The instrumentation costs ~4% - an atomic add per callback - and is a
+development aid, not something to ship in a production kernel.)
+
+### The old note, kept because the reasoning was the trap
 
 `FrameStat` splits the frame three ways. After constant columns:
 

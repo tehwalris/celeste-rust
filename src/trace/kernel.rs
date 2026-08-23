@@ -540,6 +540,17 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
     dispatch(&mut o, "pub fn bd(i: usize, o: &KOuts) -> bool", "o.v#.bd")?;
     dispatch(&mut o, "pub fn out_slots(i: usize) -> &'static [(u32, &'static str)]", "OUT_SLOTS_#")?;
 
+    writeln!(
+        o,
+        "/// Nanoseconds spent APPENDING rows, as opposed to computing\n\
+         /// them. A diagnostic: `trace::run` reads and clears it.\n\
+         pub static APPEND_NS: std::sync::atomic::AtomicU64 =\n\
+         \x20   std::sync::atomic::AtomicU64::new(0);\n\
+         pub fn take_append_ns() -> u64 {{\n\
+         \x20   APPEND_NS.swap(0, std::sync::atomic::Ordering::Relaxed)\n\
+         }}\n"
+    )?;
+
     // ONE uniform entry point per kernel, so a dispatcher can hold
     // kernels for different shapes as plain function pointers. Every
     // shape's `Uni`, `RowsIn` and `KOuts` are different types, so
@@ -556,11 +567,20 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
          \x20   let rin = rows(b, &s, lo)?;\n\
          \x20   let g = G {{ cart: &b.cart, cache: &b.cache }};\n\
          \x20   let mut declined = 0u16;\n\
+         \x20   // `APPEND_NS` splits this kernel's time into COMPUTING\n\
+         \x20   // the frame and WRITING its rows. The two want opposite\n\
+         \x20   // fixes - fewer variant-fork configurations against a\n\
+         \x20   // cheaper write - and the balance moved once constant\n\
+         \x20   // columns stopped being pushed per row, so it is worth\n\
+         \x20   // measuring rather than assuming.\n\
          \x20   frame(&u, &rin, &g, &mut |_mask, o| {{\n\
+         \x20       let t = std::time::Instant::now();\n\
          \x20       for i in 0..OUTCOMES {{\n\
          \x20           declined |= deopt(i, o) & live(i, o);\n\
          \x20           append(i, &mut accs[i], o, n);\n\
          \x20       }}\n\
+         \x20       APPEND_NS.fetch_add(t.elapsed().as_nanos() as u64,\n\
+         \x20           std::sync::atomic::Ordering::Relaxed);\n\
          \x20   }});\n\
          \x20   Some(declined)\n\
          }}\n"
@@ -915,7 +935,7 @@ pub fn write_room_kernels(root: &std::path::Path, dir: &std::path::Path) -> Resu
             table,
             "    Kernel {{ name: \"shape {i}\", shape: k{i}::SHAPE, \
              outcomes: k{i}::OUTCOMES, acc: k{i}::acc, step: k{i}::step, \
-             why: k{i}::bind_why }},",
+             why: k{i}::bind_why, append_ns: k{i}::take_append_ns }},",
             i = i
         )?;
     }
