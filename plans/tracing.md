@@ -2539,6 +2539,52 @@ Four of those five were found by the end-to-end comparison and could not
 have been found by the per-frame oracle test, which runs the same chunk
 on both sides.
 
+### Speed, measured (2026-08-23)
+
+Both engines timed separately in ONE process on the same data, release,
+single-threaded. Room (1,0), 30 frames:
+
+    kernels 619 ms, interpreter 220 ms  ->  2.75x SLOWER
+
+The reason is not the frame computation. It is materialisation:
+
+    frame  25:      24 in ->     2,040 raw ->    204 out  (10x dropped)
+    frame  27:     878 in ->    74,928 raw ->  2,864 out  (26x dropped)
+    frame  30:  15,250 in -> 1,246,632 raw -> 27,024 out  (46x dropped)
+
+A kernel emits one row per (lane, button assignment, fork
+configuration), writes every column of it into an accumulator, and the
+boundary then discards 46 of every 47. The ratio GROWS with depth.
+
+The interpreter avoids this by merging states before materialising them.
+This is the pre-dedup / `KeyPlan` item deferred earlier as "perf, not
+correctness" - it is now the entire gap, which is a good position: 46x
+of provable waste is an easier target than a 2.75x algorithmic deficit.
+
+Caveats, stated so the number is not over-read: one room, one block, no
+chunking, no threads, against an interpreter with a year of tuning.
+
+## What is needed before deleting `celeste-rewrite`
+
+* **`gen.rs`.** `FIELD_NAMES`, `GLOBAL_NAMES` and now `FN_NAMES` (the
+  tracer resolves closure names through it) are generated FROM the
+  rewritten program, and `FIELD_NAMES` ORDER feeds the shape hash and
+  the row key. Freeze as data or reproduce without the rewrite
+  machinery. This is the known blocker and it got slightly bigger today.
+* **One room.** Room exits are terminal in the shape walk and the frame
+  loop stops on a shape with no kernel. Multi-room needs the seam.
+* **One rung.** The traced path runs level 0. Finer rungs narrow `rem`
+  to k bits - a different interval, possibly a different fork arity.
+  `zi_span_ok` is the premise that would say so, loudly.
+* **The oracle is the thing being deleted.** `the_room_runs_on_kernels_alone`
+  checks against `AbstractRun`, which IS the vectorized interpreter.
+  Removing the vectorization removes the oracle, so the scalar-
+  interpreter step has to come first or the check goes with it.
+* **The search is more than a forward loop.** Checkpoints, the backward
+  sweep and position graphs all speak row keys - which is why matching
+  the interpreter's block encoding (T23) was worth doing rather than
+  inventing our own.
+
 ## Philippe's codegen question (2026-08-23)
 
 Inspect the generated assembly, and consider emitting AVX-512 - or

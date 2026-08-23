@@ -50,22 +50,35 @@ fn the_room_runs_on_kernels_alone() {
 
     let mut stopped: Option<String> = None;
     let mut checked = 0usize;
+    // Both sides timed SEPARATELY, in one process, on the same data.
+    // The comparison itself (importing the oracle's states into blocks
+    // and hashing them) is counted on neither - it is the test's cost,
+    // not either engine's.
+    let mut t_kernels = std::time::Duration::ZERO;
+    let mut t_oracle = std::time::Duration::ZERO;
     for frame in 1..=FRAMES {
-        let st = match run.step() {
+        let t0 = std::time::Instant::now();
+        let stepped = run.step();
+        t_kernels += t0.elapsed();
+        let st = match stepped {
             Ok(s) => s,
             Err(e) => {
                 stopped = Some(format!("{:#}", e));
                 break;
             }
         };
+        let t1 = std::time::Instant::now();
         oracle.step().unwrap_or_else(|e| panic!("oracle frame {}: {:#}", frame, e));
+        t_oracle += t1.elapsed();
         let want: BTreeSet<(u64, u64)> = st.keys.iter().copied().collect();
         let got: BTreeSet<(u64, u64)> = engine.row_key_set(oracle.states()).into_iter().collect();
         eprintln!(
-            "[room] frame {:>3}: {:>7} rows in -> {:>7} out in {} block(s); oracle {}",
+            "[room] frame {:>3}: {:>7} in -> {:>9} raw -> {:>7} out ({:>4}x dropped) in {} block(s); oracle {}",
             st.frame,
             st.rows_in,
+            st.rows_raw,
             st.rows_out,
+            st.rows_raw / st.rows_out.max(1),
             st.blocks_out,
             got.len()
         );
@@ -82,6 +95,14 @@ fn the_room_runs_on_kernels_alone() {
         }
         checked += 1;
     }
+
+    eprintln!(
+        "[time] {} frames: kernels {:?}, interpreter {:?} ({:.2}x)",
+        checked,
+        t_kernels,
+        t_oracle,
+        t_oracle.as_secs_f64() / t_kernels.as_secs_f64().max(1e-9)
+    );
 
     if let Some(why) = stopped {
         panic!("{} frames agreed, then frame {} stopped: {}", checked, checked + 1, why);

@@ -44,6 +44,11 @@ pub struct FrameStat {
     /// Lanes surviving the boundary's dedup.
     pub rows_out: usize,
     pub blocks_out: usize,
+    /// Rows APPENDED before the boundary deduped them. A kernel emits one
+    /// row per (lane, button assignment, fork configuration) and only the
+    /// survivors are the answer, so the ratio to `rows_out` is how much
+    /// work the dedup is throwing away - and where a pre-dedup would go.
+    pub rows_raw: usize,
     /// The surviving rows' keys. The row key already carries the shape
     /// hash, so this set is comparable across blocks and across engines -
     /// it is what a run is checked against.
@@ -140,6 +145,7 @@ impl Run {
         }
         let mut keys: Vec<(u64, u64)> = Vec::new();
         let mut rows_out = 0;
+        let rows_raw: usize = by_shape.values().flatten().map(|b| b.width).sum();
         for (_, group) in by_shape {
             let mut b = Rt2::merge_many(group);
             // Representation, not semantics - but two things downstream
@@ -162,6 +168,7 @@ impl Run {
             rows_in,
             rows_out,
             blocks_out: self.blocks.len(),
+            rows_raw,
             keys,
         })
     }
