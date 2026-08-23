@@ -2713,6 +2713,49 @@ is the version worth taking seriously.
 
 MEASUREMENT FIRST, and not before frame 25 runs.
 
+### The measurement (2026-08-23): 16.3 instructions per node
+
+`objdump` of `kernels::k1::frame` in the room test binary, against the
+generated source it came from:
+
+    97,182 instructions
+     5,959 graph nodes emitted as `let nN`
+    ----------------------------------------
+      16.3 instructions per node
+
+Not one. And the composition says why:
+
+| | share |
+|---|---|
+| stack traffic (`mov`/`vmov` touching `%rsp`) | **42.1%** |
+| `mov` overall | 42.3% |
+| vector instructions (zmm 1497 + ymm 934 + xmm 3998) | **6.6%** |
+| scalar mask work (`cmove`/`test`/`or`/`shl`/`setg`/`setle`) | ~30% |
+
+The node types are the explanation:
+
+    ZB 4206,  ZN 1709,  ZI 44
+
+**Two thirds of the graph is BOOLEAN**, and `ZB` is `{val: u16, known:
+u16}` - a pair of 16-bit SCALARS. So every boolean node compiles to
+scalar test/cmove/shift/or sequences. The design intent (16 lanes of
+i32 = one zmm) only ever applied to the `ZN` third, and those spill:
+42% of the function is moving values to and from the stack.
+
+This is not mainly LLVM being dumb. The REPRESENTATION of a boolean
+lane vector is scalar by construction.
+
+Which is the concrete case for emitting directly: put tri-state
+booleans in AVX-512 MASK REGISTERS - `k0`-`k7`, two per value - and a
+`ZB` node becomes one instruction (`kandw`, `korw`, `kandnw`). LLVM
+already touches those registers (`kmovd` and `kshiftrw` appear ~2,500
+times) but does not use them as the representation.
+
+Before any of that is worth building, the cheaper experiment is to
+change `ZB`'s representation in `celeste-engine::kernel` and see what
+LLVM does with it - same emitter, same graph, one type. If two thirds of
+the nodes collapse, the direct emitter has a much smaller job left.
+
 ## Doctrine: never deopt to the interpreter (Philippe, 2026-08-23)
 
 **A deopt stops the run. It does not fall back.**
