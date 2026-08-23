@@ -21,11 +21,17 @@ per heap shape, and it is where the interesting problem is.
 
 **B - THE LOOP (outer).** Drive A over a block, merge the per-shape
 outputs, canonicalize, dedup across slices, feed the result to the next
-frame. The baseline implementation just calls A in a loop.
+frame. The baseline implementation just calls A in a loop over all
+lanes, 16 at a time, PADDING the tail - and padding is free: replicate
+any real lane, and the rows it produces are duplicates of that lane's,
+which A removes by its own postcondition.
 
 ### Task A, precisely
 
     step(block, lo, out) -> declined_mask
+
+Always exactly 16 lanes - B pads the tail, so A never sees a partial
+slice.
 
 * **Input.** `block` is column-major (`Rt2`): one array per heap cell.
   `lo` selects EXACTLY 16 lanes. Every lane is a game state of one known
