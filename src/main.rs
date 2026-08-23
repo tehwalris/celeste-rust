@@ -42,10 +42,6 @@ struct Args {
     #[arg(long)]
     states_file: Option<String>,
 
-    /// Enable profiling and save results to this directory
-    #[arg(long)]
-    profile: Option<String>,
-
     /// Enable lightweight tracing and save Chrome trace to this file
     /// (lower overhead than --profile, only tracks CFG execution times)
     #[arg(long)]
@@ -103,7 +99,6 @@ fn main() -> Result<()> {
         args.dump.as_deref(),
         args.dump_states_at,
         args.states_file.as_deref(),
-        args.profile.as_deref(),
         args.trace.as_deref(),
         args.checkpoint_dir.as_deref(),
         args.checkpoint_interval,
@@ -146,7 +141,6 @@ fn run_game_frames(
     dump_path: Option<&str>,
     dump_states_at: Option<u32>,
     states_file: Option<&str>,
-    profile_dir: Option<&str>,
     trace_file: Option<&str>,
     checkpoint_dir: Option<&str>,
     checkpoint_interval: u32,
@@ -155,17 +149,10 @@ fn run_game_frames(
     use crate::interpreter::glue::interpret_cfg;
     use crate::interpreter::abstraction::make_state_abstract;
     use crate::interpreter::inspect::{create_frame_dump, write_frame_dump_jsonl, dump_states_to_file, save_checkpoint, load_checkpoint, checkpoint_filename, Checkpoint};
-    use crate::interpreter::profiling::{enable_profiling, get_chrome_tracing_json, get_dag_json, get_tree_json, get_cfgs_json, get_profile_summary};
     use crate::interpreter::tracing::{enable_tracing, get_tracing_json, collect_thread_spans};
     use crate::game_runner::{create_initial_state_with_builtins, inject_tile_flag_at_builtin};
     use std::io::BufWriter;
     use std::fs::File;
-
-    // Enable profiling if requested
-    if profile_dir.is_some() {
-        enable_profiling();
-        println!("Profiling enabled");
-    }
 
     // Enable lightweight tracing if requested
     if trace_file.is_some() {
@@ -371,53 +358,6 @@ fn run_game_frames(
         states.iter().map(|s| s.vector_size).sum::<usize>(),
         num_frames);
     celeste_rust::op_census::report();
-
-    // Save profiling data if enabled
-    if let Some(profile_dir) = profile_dir {
-        use std::io::Write;
-        std::fs::create_dir_all(profile_dir)?;
-
-        // Save Chrome tracing JSON
-        let trace_path = format!("{}/trace.json", profile_dir);
-        let mut file = File::create(&trace_path)?;
-        file.write_all(get_chrome_tracing_json().as_bytes())?;
-        println!("Saved Chrome tracing to {}", trace_path);
-
-        // Save DAG JSON
-        let dag_path = format!("{}/dag.json", profile_dir);
-        let mut file = File::create(&dag_path)?;
-        file.write_all(get_dag_json().as_bytes())?;
-        println!("Saved DAG to {}", dag_path);
-
-        // Save tree JSON
-        let tree_path = format!("{}/tree.json", profile_dir);
-        let mut file = File::create(&tree_path)?;
-        file.write_all(get_tree_json().as_bytes())?;
-        println!("Saved tree to {}", tree_path);
-
-        // Save CFGs JSON
-        let cfgs_path = format!("{}/cfgs.json", profile_dir);
-        let mut file = File::create(&cfgs_path)?;
-        file.write_all(get_cfgs_json().as_bytes())?;
-        println!("Saved CFGs to {}", cfgs_path);
-
-        // Save the source code that was compiled (for source mapping)
-        let source_path = format!("{}/source.lua", profile_dir);
-        let mut file = File::create(&source_path)?;
-        file.write_all(sources.init_chunk_text().as_bytes())?;
-        println!("Saved source to {}", source_path);
-
-        // Print summary
-        let summary = get_profile_summary();
-        println!("\nProfiling Summary:");
-        println!("  DAG nodes: {}", summary.total_dag_nodes);
-        println!("  Tree nodes: {}", summary.total_tree_nodes);
-        println!("  Max tree depth: {}", summary.max_tree_depth);
-        println!("  Builtin splits: {}", summary.builtin_splits);
-        println!("  Closure splits: {}", summary.closure_splits);
-        println!("  Conditional splits: {}", summary.conditional_splits);
-        println!("  Vectorizations: {}", summary.vectorizations);
-    }
 
     // Save lightweight tracing data if enabled
     if let Some(trace_file) = trace_file {
@@ -2313,7 +2253,7 @@ __reset_button_states()
     fn test_run_celeste_game_frame() {
         // Run 26 frames (enough to see player spawn at frame 25)
         // For longer runs, use the binary: cargo run -- -n 30
-        run_game_frames(26, 25, 26, None, None, None, None, None, None, 1, false).expect("Game frames should complete");
+        run_game_frames(26, 25, 26, None, None, None, None, None, 1, false).expect("Game frames should complete");
     }
 
     #[test]

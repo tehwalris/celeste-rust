@@ -1,5 +1,4 @@
 use std::hash::BuildHasherDefault;
-use std::time::Instant;
 
 use anyhow::{Context, Result};
 use rustc_hash::FxHasher;
@@ -15,7 +14,6 @@ use crate::{
 use super::{
     fixed_env::{FixedEnv, PreparedCfg},
     flow::{FlowData, InterpreterFlowAdapter},
-    profiling::{with_profiler, DagOperation, FixedPointGuard, SpanGuard},
     state::State,
     tracing::TraceSpan,
     value::Value,
@@ -62,7 +60,7 @@ fn interpret_prepared_cfg_inner(
     mut initial_state: State,
     fixed_env: &FixedEnv,
     name: Option<String>,
-    source_span: Option<celeste_ir::ir::SourceSpan>,
+    _source_span: Option<celeste_ir::ir::SourceSpan>,
 ) -> Result<Vec<(State, Option<Value>)>> {
     // Locals live in slots, and which slot is which is a property of the CFG we
     // are about to run. On a call the caller already built the environment
@@ -79,54 +77,22 @@ fn interpret_prepared_cfg_inner(
     // it runs; a stack, because calls nest cfg executions.
     let _instr_fn = crate::instr_time::enter_function(name.as_deref().unwrap_or("__main"));
 
-    // Create profiling guard for this fixed-point invocation (full profiler)
-    let fp_guard = FixedPointGuard::new(name.clone());
-    let _span = SpanGuard::new_with_source(
-        &name.as_deref().unwrap_or("interpret_cfg"),
-        "fixed_point",
-        source_span.as_ref(),
-    );
-
     let adapter = InterpreterFlowAdapter { fixed_env };
     let cfg = &prepared.cfg;
 
-    // Register CFG for visualization and push onto CFG stack
-    let cfg_name_str = name.as_deref().unwrap_or("__main");
-    with_profiler(|p| {
-        p.register_cfg(cfg, cfg_name_str, source_span);
-        p.push_cfg(cfg_name_str.to_string());
-    });
     let fake_liveness = LivenessAnalysisResult::all_live();
-
-    // Track profiling stats
-    let mut iterations = 0;
-    let mut states_processed = 0;
-    let mut blocks_executed = 0;
-
-    // Create initial DAG node
-    let initial_state_count = 1;
-    let initial_expanded = initial_state.vector_size;
-    let parent_dag_id = with_profiler(|p| {
-        p.create_dag_node(
-            initial_state_count,
-            initial_expanded,
-            DagOperation::Entry,
-            None,
-        )
-    });
 
     // Start with the entry block
     // For hint_normalize blocks, we accumulate states before processing
-    let mut pending_blocks: Vec<(Option<Label>, FlowData, Option<u64>)> = vec![(
+    let mut pending_blocks: Vec<(Option<Label>, FlowData)> = vec![(
         None, // None means entry block
         FlowData::States(vec![initial_state]),
-        Some(parent_dag_id),
     )];
     // Accumulator for hint_normalize blocks - we collect states here before processing
     // The "accumulated" field persists across iterations and contains all states seen so far
     // The "pending" field contains states that arrived since last processing
-    let mut hint_normalize_accumulators: FxHashMap<Label, (Vec<State>, Vec<State>, Vec<Option<u64>>)> = FxHashMap::default();
-    // ^-- (accumulated_states, pending_states, dag_ids)
+    let mut hint_normalize_accumulators: FxHashMap<Label, (Vec<State>, Vec<State>)> = FxHashMap::default();
+    // ^-- (accumulated_states, pending_states)
     let mut results: Vec<(State, Option<Value>)> = vec![];
 
     // Helper to queue states for a target block
@@ -134,9 +100,8 @@ fn interpret_prepared_cfg_inner(
     let queue_for_block = |
         target: &Label,
         flow_data: FlowData,
-        dag_id: Option<u64>,
-        pending: &mut Vec<(Option<Label>, FlowData, Option<u64>)>,
-        accumulators: &mut FxHashMap<Label, (Vec<State>, Vec<State>, Vec<Option<u64>>)>,
+        pending: &mut Vec<(Option<Label>, FlowData)>,
+        accumulators: &mut FxHashMap<Label, (Vec<State>, Vec<State>)>,
         cfg: &Cfg,
     | {
         let target_block = cfg.named.get(target);
@@ -154,30 +119,29 @@ fn interpret_prepared_cfg_inner(
             // Add to pending states in the accumulator
             match accumulators.entry(target.clone()) {
                 std::collections::hash_map::Entry::Occupied(mut e) => {
-                    let (_, pending_states, dag_ids) = e.get_mut();
+                    let (_, pending_states) = e.get_mut();
                     pending_states.extend(new_states);
-                    dag_ids.push(dag_id);
                 }
                 std::collections::hash_map::Entry::Vacant(e) => {
                     // First time seeing this block: accumulated is empty, pending has the new states
-                    e.insert((vec![], new_states, vec![dag_id]));
+                    e.insert((vec![], new_states));
                 }
             }
         } else {
             // Normal blocks go straight to pending
-            pending.push((Some(target.clone()), flow_data, dag_id));
+            pending.push((Some(target.clone()), flow_data));
         }
     };
 
     loop {
         // First, try to pop from pending_blocks
         // If empty, check if there are accumulated states for hint_normalize blocks
-        let (block_label, flow_data, dag_parent_id) = match pending_blocks.pop() {
+        let (block_label, flow_data) = match pending_blocks.pop() {
             Some(item) => item,
             None => {
                 // Check accumulators - find one with pending states
                 let mut found_label: Option<Label> = None;
-                for (label, (_, pending_states, _)) in hint_normalize_accumulators.iter() {
+                for (label, (_, pending_states)) in hint_normalize_accumulators.iter() {
                     if !pending_states.is_empty() {
                         found_label = Some(label.clone());
                         break;
@@ -185,12 +149,11 @@ fn interpret_prepared_cfg_inner(
                 }
 
                 if let Some(label) = found_label {
-                    let (accumulated_states, pending_states, dag_ids) =
+                    let (accumulated_states, pending_states) =
                         hint_normalize_accumulators.get_mut(&label).unwrap();
 
                     // Take pending states
                     let pending = std::mem::take(pending_states);
-                    let dag_ids_copy: Vec<_> = std::mem::take(dag_ids);
 
                     // Vectorize pending states first (to merge compatible shapes)
                     let (new_union, actually_new) = {
@@ -215,48 +178,13 @@ fn interpret_prepared_cfg_inner(
                         continue;
                     }
 
-                    let (state_count, expanded_count) = {
-                        let s: usize = actually_new.len();
-                        let e: usize = actually_new.iter().map(|st| st.vector_size).sum();
-                        (s, e)
-                    };
-
-                    // Create a DAG node for the vectorization/diff operation
-                    let vec_dag_id = with_profiler(|p| {
-                        p.create_dag_node(
-                            state_count,
-                            expanded_count,
-                            DagOperation::Vectorization,
-                            dag_ids_copy.into_iter().flatten().next(), // Use first parent if any
-                        )
-                    });
-
-                    (Some(label), FlowData::States(actually_new), Some(vec_dag_id))
+                    (Some(label), FlowData::States(actually_new))
                 } else {
                     // Nothing left to process
                     break;
                 }
             }
         };
-        iterations += 1;
-        let (state_count, expanded_count) = flow_data.counts();
-        states_processed += state_count;
-        blocks_executed += 1;
-
-        let block_name = block_label.as_ref().map(|l| l.as_str().to_string());
-        let block_start = Instant::now();
-
-        // Create DAG node for this block execution
-        let block_dag_id = with_profiler(|p| {
-            p.create_dag_node(
-                state_count,
-                expanded_count,
-                DagOperation::BlockExecution { block_name: block_name.clone() },
-                dag_parent_id,
-            )
-        });
-        with_profiler(|p| p.set_current_dag_node(Some(block_dag_id)));
-
         let block = match &block_label {
             None => &cfg.entry,
             Some(label) => cfg.named.get(label).ok_or_else(|| {
@@ -266,7 +194,6 @@ fn interpret_prepared_cfg_inner(
 
         // Execute the block's instructions (post-phi flow)
         // Note: For hint_normalize blocks, states were already vectorized when pulled from accumulators
-        let instruction_count = block.instructions.len();
         let bound_post_phi = adapter.flow_block_post_phi(block)?;
         let flow_data = bound_post_phi.flow(flow_data).with_context(|| {
             format!(
@@ -275,16 +202,6 @@ fn interpret_prepared_cfg_inner(
                 block_label.as_ref().map_or("__entry", |l| l.as_str())
             )
         })?;
-
-        // Update DAG node with processing stats
-        with_profiler(|p| {
-            p.update_dag_node(
-                block_dag_id,
-                block_start.elapsed(),
-                instruction_count,
-                0, // call count tracked in flow
-            );
-        });
 
         // Handle the terminator
         let (_, terminator) = &block.terminator;
@@ -334,7 +251,6 @@ fn interpret_prepared_cfg_inner(
                 queue_for_block(
                     target,
                     flow_data,
-                    Some(block_dag_id),
                     &mut pending_blocks,
                     &mut hint_normalize_accumulators,
                     cfg,
@@ -352,23 +268,12 @@ fn interpret_prepared_cfg_inner(
                 });
 
                 // Helper to process a branch
-                let mut process_branch = |is_true_branch: bool, target: &Label, branch_flow_data: FlowData| -> Result<()> {
+                let mut process_branch = |_is_true_branch: bool, target: &Label, branch_flow_data: FlowData| -> Result<()> {
                     let target_block = cfg.named.get(target).ok_or_else(|| {
                         anyhow::anyhow!("Target block not found: {:?}", target)
                     })?;
 
                     if !branch_flow_data.is_empty() {
-                        // Create DAG node for the branch split
-                        let (branch_state_count, branch_expanded) = branch_flow_data.counts();
-                        let branch_dag_id = with_profiler(|p| {
-                            p.create_dag_node(
-                                branch_state_count,
-                                branch_expanded,
-                                DagOperation::ConditionalSplit { branch: is_true_branch },
-                                Some(block_dag_id),
-                            )
-                        });
-
                         // Apply phi instructions
                         let bound_phi = adapter.flow_block_phi(&source_label, target_block)?;
                         let branch_flow_data = bound_phi.flow(branch_flow_data)?;
@@ -381,7 +286,6 @@ fn interpret_prepared_cfg_inner(
                         queue_for_block(
                             target,
                             branch_flow_data,
-                            Some(branch_dag_id),
                             &mut pending_blocks,
                             &mut hint_normalize_accumulators,
                             cfg,
@@ -416,13 +320,6 @@ fn interpret_prepared_cfg_inner(
             }
         }
     }
-
-    // Update fixed-point stats
-    fp_guard.update_stats(iterations, states_processed, blocks_executed);
-    with_profiler(|p| {
-        p.set_current_dag_node(None);
-        p.pop_cfg();
-    });
 
     Ok(results)
 }

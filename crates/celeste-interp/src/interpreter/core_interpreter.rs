@@ -6,7 +6,6 @@ use super::{
     fixed_env::FixedEnv,
     heap::HeapId,
     op::{interpret_binary_op, interpret_select, interpret_unary_op},
-    profiling::{DagOperation, SpanGuard, with_profiler},
     state::State,
     value::{HeapValue, MaybeVector, Value},
 };
@@ -690,8 +689,6 @@ impl<'a> CoreInterpreter<'a> {
 
         match heap_value {
             HeapValue::BuiltinFun(name) => {
-                let _span = SpanGuard::new_lazy(|| format!("builtin:{}", name), "call");
-
                 // Look up the builtin function
                 let builtin_fn = self
                     .fixed_env
@@ -701,19 +698,6 @@ impl<'a> CoreInterpreter<'a> {
 
                 // Call the builtin, which returns multiple (state, return_value) pairs
                 let results = builtin_fn(self.state, arg_values)?;
-
-                // Track if this builtin caused a state split
-                if results.len() > 1 {
-                    let expanded_count: usize = results.iter().map(|(s, _)| s.vector_size).sum();
-                    with_profiler(|p| {
-                        p.create_dag_node(
-                            results.len(),
-                            expanded_count,
-                            DagOperation::BuiltinSplit { builtin_name: name.clone() },
-                            p.current_dag_node(),
-                        )
-                    });
-                }
 
                 // Set the return value in each state's local_env at the local_id
                 let states = results
@@ -733,12 +717,6 @@ impl<'a> CoreInterpreter<'a> {
                     .fun_defs
                     .get(&fun_def_name)
                     .ok_or_else(|| anyhow!("Unknown function: {:?}", fun_def_name))?;
-
-                let _span = SpanGuard::new_with_source_lazy(
-                    || format!("closure:{}", fun_def_name.as_str()),
-                    "call",
-                    fun_def.source_span.as_ref(),
-                );
 
                 // Create a new local_env for the function body, under the
                 // callee's slot map - arguments and captures are written
@@ -790,19 +768,6 @@ impl<'a> CoreInterpreter<'a> {
                     Some(fun_def_name.as_str().to_string()),
                     fun_def.source_span,
                 )?;
-
-                // Track if this closure call caused a state split
-                if result_states.len() > 1 {
-                    let expanded_count: usize = result_states.iter().map(|(s, _)| s.vector_size).sum();
-                    with_profiler(|p| {
-                        p.create_dag_node(
-                            result_states.len(),
-                            expanded_count,
-                            DagOperation::ClosureSplit { function_name: fun_def_name.as_str().to_string() },
-                            p.current_dag_node(),
-                        )
-                    });
-                }
 
                 // NOTE: We intentionally do NOT auto-renormalize here because:
                 // 1. Each state is paired with its specific return value

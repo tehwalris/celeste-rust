@@ -8,7 +8,6 @@ pub mod heap;
 pub mod inspect;
 pub mod local_env;
 mod op;
-pub mod profiling;
 /// The shared lock for everything whose result depends on the
 /// process-global `PARTITION_STRADDLES` toggle (see its doc in op.rs).
 ///
