@@ -3632,3 +3632,56 @@ state is a plain-scalar interpreter that exists to be checked against.
 (Whether it keeps integer ranges is open.) It already runs the
 un-rewritten program, so nothing has to be built for it to hold that role
 - only removed.
+
+## Stage 5 - the traced kernels become a FrameEngine backend
+
+Agreed with Philippe 2026-08-23, and he chose the order: this before the
+boundary and before closing the divide holes, because **the 98 ms number
+is 30 frames of a correctness harness**. Production is f094, 8,000-lane
+chunks, 16 threads, a band filter and a visited set. Tuning the boundary
+against a 30-frame profile is tuning against a workload we have no
+reason to trust - at frame 51 the row count was 9.3 M against frame 30's
+27 k.
+
+### The integration point is small
+
+`compiled::dispatch::run_chunk_kernel(chunk, ids, done, local) -> bool`
+is a chain of "try this kernel, else the next". A traced kernel set is
+one more entry in it. The adapter is ~30 lines: find by shape hash,
+build one accumulator per outcome, walk 16-lane slices, extend `done`.
+
+### The work is that they are not artifacts yet
+
+The traced kernels are generated into `traced-kernel-check/`, which is
+outside the workspace and gitignored, because a churning 400 KB
+generated file inside `celeste-kernels` would sit inside the bootstrap
+(the emitters live in a crate that depends on the crate they generate).
+For `FrameEngine` to call them they have to be checked in, below
+`celeste-rust`, exactly like `celeste-kernels`.
+
+So:
+
+1. **Move `trace::dispatch::Kernel` down to `celeste-engine`.** It names
+   only engine types (`Rt2`, `RowSet`, `CartData`, `CollisionCache`), so
+   it can sit below the emitters that produce values of it.
+2. **Generate the room's traced set into `crates/celeste-kernels`**, as
+   checked-in files plus a table, the way `kernel_gen_*` already are.
+   `regen-generated.sh` grows a job; `generated_is_current` grows a case.
+3. **One entry in the dispatch chain.** A traced-kernel miss falls
+   through to the class kernels, which is NOT a deopt to the interpreter
+   - it is another kernel - but the misses have to be COUNTED and named
+   the way `note_miss` already does for the class kernels, or the
+   coverage gap hides in the wall clock.
+4. **Measure `CELESTE_COMPILED_FORWARD=1` on room (1,0) to f094**
+   against BENCHMARK_DATA's recorded baseline, which is the first
+   profile of these kernels worth optimizing against.
+
+### Two things to decide inside it
+
+* **Which shapes.** The room walk closes at 3 shapes for (1,0); the
+  class kernels are per (room, class) and there are 8 of them. The
+  traced set is per SHAPE and covers more, so the two overlap rather
+  than nest, and the dispatch order between them is a measurement.
+* **Whether the class kernels survive at all.** If a traced set covers
+  every chunk the class kernels do, `kernel_gen_*` and the 8 committed
+  files are deletable - which is Stage 4's other half.
