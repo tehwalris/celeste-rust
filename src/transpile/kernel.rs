@@ -159,6 +159,12 @@ pub(crate) struct Emit {
     /// <=2-way fork emitted as a runtime loop; the rest of the program
     /// nests inside). Render closes this many braces at the end.
     pub(crate) fork_depth: usize,
+    /// Emit fork loops with an OPAQUE trip count (`trace::emit` sets
+    /// this; the walk does not). See the comment at its use in
+    /// `lower.rs` - it is the difference between a 55 s build and a
+    /// 25 minute one for a traced kernel, and a repriced benchmark for
+    /// the walk's.
+    pub(crate) opaque_forks: bool,
     /// Name of the current per-lane validity mask ("ALL" at depth 0).
     pub(crate) valid_expr: String,
     /// Free-choice TAINT tracking (cross-variant sharing): only
@@ -232,6 +238,7 @@ impl Emit {
             pins: BTreeSet::new(),
             button_cells: HashMap::new(),
             fork_depth: 0,
+            opaque_forks: false,
             valid_expr: "ALL".to_string(),
             tainted_vars: BTreeSet::new(),
             tainted_cells: BTreeSet::new(),
@@ -588,6 +595,7 @@ pub(crate) fn emit_walk(program: &Program, witness_path: &str) -> Result<Emit> {
         pins: BTreeSet::new(),
         button_cells: HashMap::new(),
         fork_depth: 0,
+        opaque_forks: false,
         valid_expr: "ALL".to_string(),
         tainted_vars: BTreeSet::new(),
         tainted_cells: BTreeSet::new(),

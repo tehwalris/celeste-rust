@@ -958,7 +958,28 @@ pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("split {} has no node", d))?;
         let fname = ctx.name[split as usize].clone().unwrap();
         let src = ctx.expr[ctx.g.get(split).args[0] as usize].clone().unwrap();
-        body.push(Line::Raw(format!("for c{} in 0..2usize {{", d)));
+        // OPAQUE trip count, for the TRACED path only.
+        //
+        // `for c0 in 0..2` invites LLVM to unroll, and here the loop
+        // body is the rest of the frame - so two forks become four
+        // copies of a 10,000-line function. Measured 2026-08-23 on the
+        // traced room kernels: 55 s to compile with the bound hidden,
+        // over 25 MINUTES with it visible. Same code either way; the
+        // loop runs twice regardless.
+        //
+        // NOT applied to the walk's kernels, and the reason is a rule
+        // rather than caution: those are what the production search
+        // runs and what every number in BENCHMARK_DATA was measured on.
+        // `black_box` blocks optimisation across it, so turning it on
+        // there would reprice recorded results to make MY build loop
+        // shorter. Their fork also sits near the end of the body, so
+        // there is little left to duplicate and they were never slow.
+        let bound = if e.opaque_forks {
+            "std::hint::black_box(2usize)"
+        } else {
+            "2usize"
+        };
+        body.push(Line::Raw(format!("for c{} in 0..{} {{", d, bound)));
         body.push(Line::Raw(format!(
             "let ({f}, {f}_fv): (ZI, u16) = zi_fork_flr({s}, c{d});",
             f = fname, s = src, d = d

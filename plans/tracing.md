@@ -2360,17 +2360,87 @@ What it took, in the order the failures came:
    disagree and lowering fails with "output cell wants a ZN but the
    graph computes a ZI".
 
-### The cost, which is Philippe's codegen question arriving early
+### The cost, and the two-call fix
 
 Adding two forks took the check crate's build from ~50 s to over
 twenty-five minutes. The SOURCE barely grew - 22,170 lines to 22,206,
-because a fork is a loop, not a duplication - so this is LLVM unrolling
+because a fork is a loop, not a duplication - so this was LLVM unrolling
 `for c0 in 0..2` and `for c1 in 0..2` around a 10k-line body and
 compiling four copies of it.
 
-That is the strongest argument yet for looking at the generated
-assembly, and it is worth doing before the fork count grows: the spd
-rung would add more.
+Hiding the trip count behind `std::hint::black_box` takes it back to
+**55 s**. Same code, same two iterations; 27x the build time came from
+LLVM deciding to duplicate. `Emit::opaque_forks` turns it on for the
+TRACED path only - the walk's kernels are what the production search
+runs and what every BENCHMARK_DATA number was measured on, and
+`black_box` blocks optimisation across it, so enabling it there would
+reprice recorded results to shorten my build loop.
+
+### What a fork COSTS at runtime (Philippe, 2026-08-23)
+
+Asked whether the fork is extra graph nodes or real runtime forking,
+wanting to avoid the second. It is both, and the second is what happens.
+
+In the graph it is nodes: `Op::Split(d)` and `Op::SplitValid(d)` over
+one operand, no state fan-out, the fragment a CHOICE like a button. But
+`lower.rs` emits that choice as a runtime loop, and everything after the
+split point - including every per-variant output and the `out()` calls -
+sits inside it. Per 16-lane slice the tail of the frame runs up to
+2^forks = 4 times. That is the walk's design too, inherited rather than
+introduced.
+
+Two ways to make it data instead of control flow:
+
+* **Lane doubling.** A fork doubles the LANES rather than repeating the
+  body: a 16-lane slice becomes two, one per fragment, empties dropped
+  by `f0_fv`. Same arithmetic, one pass, no duplicated code, and the
+  fork becomes a property of the block rather than of the program.
+* **Compile-time specialization.** `Choice::Split` exists alongside
+  `Choice::Free` for exactly this; `specialize_into` currently excludes
+  splits.
+
+Philippe, on being shown the loop: the graph-duplication kind was what
+he wanted, "because we can merge nodes back there and share
+computations". He is right, and I did not weigh the two - `lower.rs`'s
+fork machinery is the WALK's, and setting `fork_depth` is the switch
+that turns it on. I made the existing emitter do its existing thing.
+
+The loop is worse for exactly his reason. Most of a frame does not
+depend on which fragment a lane is in, and the loop re-executes all of
+it four times; under specialization those nodes are ONE node across all
+four configurations, because `specialize_into` writes into a shared
+hash-consed arena ("two button combinations that compute the same thing
+land on the SAME node ids").
+
+### Specializing a split needs NO new op
+
+This was the thing I expected to block it. A `Free` becomes a CONSTANT
+under specialization, which is why buttons collapse so well; a `Split`
+is a narrowing of a runtime value and cannot. But it does not need to be
+a constant - it needs to be ORDINARY ARITHMETIC, and it is.
+
+`zi_fork_flr(a, c)` is two cases: fragment 0 is `a` with its top clamped
+below the next floor boundary and is always valid; fragment 1 is `a`
+with its bottom raised to that boundary, valid only where the interval
+really spans two floors. Min/Max/Flr and a comparison. So under
+specialization `Op::Split(d)` and `Op::SplitValid(d)` rewrite into plain
+nodes that `fold` collapses and interning shares.
+
+The >2-floors lane keeps its behaviour: fragment 0 is valid, fragment 1
+is not, so the lane appears exactly once, and `SplitOk` / `zi_span_ok`
+takes it off the kernel through `ok` - which under the doctrine stops
+the run.
+
+PLAN: enumerate splits in `specialize_into` beside frees, drop the fork
+loop from the traced emitter, let `variants` dedup fork configurations
+as it already dedups the 64 button assignments. Gated to the traced path
+first, so the production kernels and every BENCHMARK_DATA number stay
+untouched.
+
+FIRST, though: the frame-28 discrepancy below is probably semantic -
+where fork validity goes (guard) versus the span premise (`ok`) - so it
+would survive the restructure and be chased through new code instead of
+old.
 
 ### OPEN: frame 28, 8 extra and 4 missing
 
