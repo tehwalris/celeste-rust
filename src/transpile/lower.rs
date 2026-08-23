@@ -697,6 +697,14 @@ pub(crate) struct VarOut {
     pub(crate) outputs: BTreeMap<u32, String>,
     pub(crate) ok: String,
     pub(crate) bd: String,
+    /// The lanes that REACH this outcome, as a `u16` expression.
+    ///
+    /// A frame with several output shapes has to say which lanes take
+    /// which successor, or the caller cannot route a single row. The
+    /// walk path has one outcome and its `live` is `ConstBool(true)`,
+    /// which has no conjuncts - so this is the literal `ALL` there, no
+    /// line is emitted for it, and the checked-in kernels are unchanged.
+    pub(crate) live: String,
 }
 
 /// One output shape: the cells it writes, and the two booleans that say
@@ -830,6 +838,7 @@ pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
     // --- what has to exist ---
     // Per representative: its outputs, and every conjunct of its validity.
     let mut conj_of: BTreeMap<(u8, usize), Vec<NodeId>> = BTreeMap::new();
+    let mut live_of: BTreeMap<(u8, usize), Vec<NodeId>> = BTreeMap::new();
     let mut roots: Vec<NodeId> = Vec::new();
     for r in &reps {
         let map = &maps[*r as usize];
@@ -841,6 +850,12 @@ pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
                 .collect();
             roots.extend(cs.iter().copied());
             conj_of.insert((*r, oi), cs);
+            let ls: Vec<NodeId> = conjuncts(&sp, map[o.live as usize])
+                .into_iter()
+                .filter(|c| !vacuous(&ctx, *c))
+                .collect();
+            roots.extend(ls.iter().copied());
+            live_of.insert((*r, oi), ls);
         }
     }
     for id in 0..n as NodeId {
@@ -967,6 +982,59 @@ pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
             });
             var_ty.insert(ok.clone(), "u16");
             var_ty.insert(bd.clone(), "bool");
+            // Which lanes REACH this outcome. A block-level conjunct
+            // says the whole block does not, which is a `u16` of zero
+            // rather than a deopt - a sibling outcome claims those lanes.
+            //
+            // ONLY WHEN THERE IS MORE THAN ONE. With a single outcome,
+            // "which lanes take this successor" is "which lanes exist in
+            // this fork configuration", which the walk already binds as
+            // `valid{d}` and `render` already emits as `valid` - so
+            // emitting it again would be 36 duplicate lines in every
+            // checked-in kernel.
+            //
+            // That equivalence is CHECKED, not assumed: at one outcome
+            // every live conjunct has to be a `SplitValid`, which is the
+            // only thing `Emit::require_live` ever contributes. A traced
+            // single-outcome frame satisfies it the other way, with no
+            // conjuncts at all, because the frontier's guards partition
+            // the lanes and a lone outcome therefore claims all of them.
+            // Anything else would be a real condition about to be
+            // dropped, so it stops here instead.
+            let live = {
+                let (mut lanes, mut blocks) = (Vec::new(), Vec::new());
+                for c in &live_of[&(*r, oi)] {
+                    if outs.len() == 1 && !matches!(sp.get(*c).op, Op::SplitValid(_)) {
+                        bail!(
+                            "the only outcome's liveness has a conjunct ({:?}) that is not \
+                             fork validity, and a single-outcome kernel has nowhere to put it",
+                            sp.get(*c).op
+                        );
+                    }
+                    match conjunct_term(&ctx, *c)? {
+                        Term::Lanes(m) => lanes.push(m),
+                        Term::Block(b) => blocks.push(b),
+                    }
+                }
+                if outs.len() == 1 || (lanes.is_empty() && blocks.is_empty()) {
+                    "ALL".to_string()
+                } else {
+                    let name = format!("live_v{}{}", r, sfx);
+                    let mask = if lanes.is_empty() {
+                        "ALL".to_string()
+                    } else {
+                        format!("ALL & {}", lanes.join(" & "))
+                    };
+                    let expr = if blocks.is_empty() {
+                        mask
+                    } else {
+                        format!("if {} {{ 0 }} else {{ {} }}", blocks.join(" || "), mask)
+                    };
+                    body.push(Line::Let { name: name.clone(), ty: "u16", expr });
+                    var_ty.insert(name.clone(), "u16");
+                    name
+                }
+            };
             let map = &maps[*r as usize];
             let mut outputs = BTreeMap::new();
             for f in o.of.fields.iter() {
@@ -984,7 +1052,7 @@ pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
                     coerce(ctx.expr[node as usize].as_deref().unwrap(), have, want)?,
                 );
             }
-            per.push(VarOut { outputs, ok, bd });
+            per.push(VarOut { outputs, ok, bd, live });
         }
         variants.push(Variant { mask: *r, per });
     }

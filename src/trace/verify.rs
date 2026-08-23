@@ -637,7 +637,7 @@ mod tests {
             {
                 Ok(l) => {
                     lines = l.body.len();
-                    variants = l.variants;
+                    variants = l.variants.len();
                 }
                 Err(_) => refused += 1,
             }
@@ -754,7 +754,7 @@ mod tests {
             {
                 Ok(l) => {
                     lines = l.body.len();
-                    variants = l.variants;
+                    variants = l.variants.len();
                 }
                 Err(e) => eprintln!("[pos] {} REFUSED: {:#}", label, e),
             }
@@ -942,12 +942,33 @@ mod tests {
             &b.outcomes,
             room.clone(),
         ) {
-            Ok(l) => eprintln!(
-                "[emit] FUSED: {} outcomes in one body, {} lines, {} variants",
-                f.outs.len(),
-                l.body.len(),
-                l.variants
-            ),
+            Ok(l) => {
+                eprintln!(
+                    "[emit] FUSED: {} outcomes in one body, {} lines, {} variants",
+                    f.outs.len(),
+                    l.body.len(),
+                    l.variants.len()
+                );
+                // Render a whole kernel and drop it where it can be
+                // COMPILED. Lowering succeeding only says the emitter
+                // produced lines; whether those lines are Rust is a
+                // different question, and the only way to answer it is
+                // to hand them to rustc.
+                match super::super::kernel::render(&f, &b, &l, "room (0,0) f40, steady pm1") {
+                    Ok(src) => {
+                        let path =
+                            std::path::Path::new("target").join("traced-kernel.rs");
+                        std::fs::write(&path, &src).expect("write");
+                        eprintln!(
+                            "[emit] rendered {} bytes to {} ({} lines)",
+                            src.len(),
+                            path.display(),
+                            src.lines().count()
+                        );
+                    }
+                    Err(e) => eprintln!("[emit] RENDER REFUSED: {:#}", e),
+                }
+            }
             Err(e) => eprintln!("[emit] FUSED REFUSED: {:#}", e),
         }
         for (n, o) in f.outs.iter().enumerate() {
@@ -968,7 +989,7 @@ mod tests {
                     "[emit] outcome {}: {} lines, {} variants, {} outputs",
                     n,
                     l.body.len(),
-                    l.variants,
+                    l.variants.len(),
                     o.fields.len()
                 ),
                 Err(e) => eprintln!("[emit] outcome {} REFUSED: {:#}", n, e),
@@ -979,7 +1000,7 @@ mod tests {
             // count each key on its own and find out which one splits,
             // rather than telling a story about the guard.
             let l_variants = match &lowered {
-                Ok(l) => l.variants,
+                Ok(l) => l.variants.len(),
                 Err(_) => 0,
             };
             {

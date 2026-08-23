@@ -1700,6 +1700,85 @@ move is behaviour-preserving.
 * The partition check P2 calls for: union of member masks plus the
   deopt count equals the lane count.
 
+## T19 - a traced frame becomes a kernel that COMPILES
+
+`trace::kernel::render` turns a traced frame into a whole Rust kernel.
+Room (0,0) f40, pinned to the steady pm1 key: **6,681 lines, four output
+shapes, 24 button assignments, and it compiles.**
+
+That is the piece nobody had evidence for. `lower_frame` succeeding says
+the emitter emitted lines. Whether the lines are Rust is a separate
+question, and rustc is the only thing that answers it.
+`./check-traced-kernel.sh` compiles the rendered file out-of-tree - not
+checked in yet, since it changes on every emitter tweak and would
+otherwise sit inside the same bootstrap the checked-in kernels have.
+
+### Not a generalization of the walk's renderer, on purpose
+
+`transpile::kernel::render` does this job for the recipe pipeline, and
+the plan was to generalize it to n output shapes. Reading it changed my
+mind. It carries `Op::Split`, `SplitValid`, `fork_depth` and
+`valid_expr`, all of which exist because `zi_fork_flr` splits one
+interval lane into two. A tracer's outcomes come from real branches, so
+it never builds any of it. Generalizing would have meant inheriting
+those assumptions and noticing them one at a time.
+
+Two differences are the point rather than an accident.
+
+**Inputs are named by PATH.** The walk binds by canonical cell id
+against a shape witness. This emits `ROW_SLOTS: &[(&str, &str)]` - the
+path each input came from - so the binder resolves against whatever
+block it is handed. The cell ids in the struct field names are just
+names.
+
+**An output block is BUILT, not patched.** The walk's `acc_init` clones
+the chunk's structure and overwrites what the frame wrote, because there
+the output shape is the input shape. Here it is not: of the four
+outcomes, one keeps the input's 282 cells and the others are 274, 229
+and 400. So each outcome carries its own structure and the kernel fills
+it. Nothing passes through from the input block - measured at ~105
+pointer cells the structure carries, ~53 scalars the frame computes.
+
+I had called this a design decision to bring to Philippe. It was not
+one. It only looked like a fork because I was asking how to generalize
+the existing emitter instead of what a traced kernel needs, and the
+answer is *simpler* than what the walk does, not more complicated.
+
+### `live`, and the assumption that was wrong
+
+Several outcomes means the kernel has to say which lanes take which
+successor, so `VarOut` gained a `live` mask alongside `ok` and `bd`.
+
+I asserted the walk path would be unaffected because its `live` is
+`ConstBool(true)`. It is not - `Emit::require_live` accumulates a
+`SplitValid` per fork level - and `generated_is_current` caught it: 36
+duplicate lines, one per variant, in every checked-in kernel. That is
+twice this session I have reasoned about a value instead of reading it,
+and both times the test was what noticed.
+
+The rule is now explicit and CHECKED rather than assumed. With one
+outcome, "which lanes take this successor" is "which lanes exist in this
+fork configuration", which the walk already binds as `valid{d}` and
+`render` already emits - so no mask is emitted, and every live conjunct
+is required to be a `SplitValid`. A traced single-outcome frame passes
+that the other way, with no conjuncts at all, because the frontier's
+guards partition the lanes so a lone outcome claims all of them.
+Anything else stops with an error instead of being silently dropped.
+`generated_is_current{,_r20}` pass unchanged.
+
+### What is left before it RUNS
+
+Emitting the structure as generated data, so `build{i}` can make an
+outcome's block; the path-resolving `bind`/`rows`; and then the
+comparison that matters - run it on a real block and check the row-key
+sets against the interpreter, which is what
+`CELESTE_COMPILED_FORWARD=check` already does for the walk's kernels.
+
+Deferred rather than skipped: the pre-dedup `row_keys`/`KeyPlan`
+machinery. It is a performance mechanism (8.3 emitted rows per surviving
+row at f35), not correctness, and it is easier to add once a kernel runs
+at all.
+
 ## Stage 4 - delete
 
 - `celeste-rewrite` (38k lines) - the crate nothing depends on any more.

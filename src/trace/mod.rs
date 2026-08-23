@@ -56,6 +56,7 @@ pub mod emit;
 pub mod eval;
 pub mod heap;
 pub mod iface;
+pub mod kernel;
 pub mod interp;
 pub mod probe;
 pub mod state;

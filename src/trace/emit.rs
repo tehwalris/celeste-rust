@@ -28,7 +28,13 @@ use crate::transpile::kernel::{Emit, Line, OutField, OutFields};
 /// What a traced frame hands the emitter.
 pub struct Lowered {
     pub body: Vec<Line>,
-    pub variants: usize,
+    /// One entry per DISTINCT button assignment, each carrying its
+    /// result for every outcome.
+    pub(crate) variants: Vec<crate::transpile::lower::Variant>,
+    /// One per output shape, with `expr` and `tainted` filled in by
+    /// `emit_body`: `tainted` cells differ between variants and live in
+    /// the per-variant struct, the rest are computed once.
+    pub(crate) outs: Vec<OutFields>,
 }
 
 /// A node's subtree, to a bounded depth, as text. For DIAGNOSTICS: the
@@ -172,5 +178,9 @@ pub fn lower_frame(
         })
         .collect();
     crate::transpile::lower::emit_body(&mut e, &mut outs)?;
-    Ok(Lowered { body: e.body, variants: e.variants.len() })
+    Ok(Lowered {
+        body: e.body,
+        variants: e.variants,
+        outs: outs.into_iter().map(|o| o.of).collect(),
+    })
 }
