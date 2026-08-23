@@ -2226,13 +2226,30 @@ successor, which is all the tracer does and what its outcomes, live
 masks and appends assume. A fork puts one lane in two successors holding
 different values.
 
-### What makes it small
+### What makes it small - and why the fork is TWO-way
 
-The interval is a CONSTANT. `player.rem` is re-widened to exactly
-`[-0.5, 0.5)` at every boundary, so what reaches `flr` has width < 1 and
-spans at most two floors, always. The engine says so already
-(`zi_span_ok`: "a boundary-widened interval has width < 1 and always
-passes"), and `zi_fork_flr`, `zi_flr_ok` and the `ZI` lane type all
+`__split_by_flr` is N-way in general: the fragment count is
+`floor(hi) - floor(lo) + 1`, unbounded for a wide interval. It is at
+most two exactly when the interval's width is below 1.
+
+That holds here by construction, not by luck. `player.rem` is re-widened
+to `[-0.5, 0.5 - 1ulp]` at every boundary - width `1 - 1ulp` - and it is
+the ONLY interval in the expression: `rem.x + ox + 0.5` adds plain
+numbers, and adding a number shifts an interval without widening it. So
+what reaches the floor spans one or two integers.
+
+It is also not an assumption the code relies on silently. `Op::SplitOk`
+/ `zi_span_ok` IS the premise "this lane spans at most two floors", and
+the engine is explicit about the failure: a lane spanning more stays
+valid in outcome 0 only, is seen exactly once, and is filtered by that
+premise. Under the never-deopt doctrine that stops the run and names it
+rather than dropping successors quietly.
+
+There is a live way for the premise to start failing:
+`plans/spd-rung.md` widens `player.spd` into buckets. The moment `ox` is
+itself an interval the width can exceed 1 - and then we hear about it.
+
+`zi_fork_flr`, `zi_flr_ok`, `zi_span_ok` and the `ZI` lane type all
 exist. This is tracer and emitter work, not engine work.
 
 Only the PLAYER's `rem.x`/`rem.y` are widened - `mark_walk` collects
@@ -2304,6 +2321,31 @@ Three levers tried, none of which helps:
 Left alone. The interesting consequence is Philippe's, below: if the
 generated code did not go through LLVM at all, this cost is not reduced,
 it disappears.
+
+## Philippe's codegen question (2026-08-23)
+
+Inspect the generated assembly, and consider emitting AVX-512 - or
+bytes - directly instead of going through Rust.
+
+It lines up with the build-loop measurement above from the other side:
+LLVM is the entire build cost, and the reason is the same thing that
+might be hurting the output - single enormous straight-line bodies.
+
+The shape is already right. A kernel runs 16 lanes of `i32`
+fixed-point, which is 64 bytes, which is exactly one AVX-512 register.
+So "one instruction per graph node" is a coherent target rather than an
+aspiration, and the first step is cheap: dump one kernel's assembly and
+count instructions against graph nodes. Close to 1:1 means the Rust path
+is fine and only the build is slow; 5:1 with spills everywhere is the
+argument for emitting directly.
+
+The catch is register allocation. A graph with thousands of live nodes
+cannot stay in 32 registers, so a direct emitter needs its own spill
+strategy - which is the part LLVM is actually earning its keep on.
+Emitting into a small hand-written library with an explicit stack frame
+is the version worth taking seriously.
+
+MEASUREMENT FIRST, and not before frame 25 runs.
 
 ## Doctrine: never deopt to the interpreter (Philippe, 2026-08-23)
 
