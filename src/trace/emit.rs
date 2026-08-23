@@ -66,6 +66,8 @@ pub struct FrameOutcome {
 /// needs, with cell ids an `Rt2` has.
 pub struct Bound {
     pub graph: Graph,
+    /// See `Frame::forks`.
+    pub forks: u8,
     pub inputs: Vec<(u32, &'static str)>,
     pub uni: Vec<(u32, &'static str)>,
     pub outcomes: Vec<FrameOutcome>,
@@ -146,6 +148,12 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph) -> Result<Bound> {
     let mut uni: Vec<(u32, &'static str)> = Vec::new();
     for (i, c) in f.iface.init.iter().enumerate() {
         let kind = match c {
+            // An interval slot is still a number to `Conc`, which
+            // records a point because a block has to be built from one.
+            // What makes it an interval is `Iface::ival`, and the
+            // emitter needs to know: an `ival` input is a `ZI` lane and
+            // a `num` one is a `ZN`.
+            _ if f.iface.ival[i] => "ival",
             crate::trace::iface::Conc::Num(_) => "num",
             crate::trace::iface::Conc::Bool(_) => "bool",
         };
@@ -168,14 +176,14 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph) -> Result<Bound> {
             .fields
             .iter()
             .enumerate()
-            .map(|(i, (_, _, is_bool))| {
-                (o.cells[i], roots[at + i], if *is_bool { "ZB" } else { "ZN" })
+            .map(|(i, (_, _, ty))| {
+                (o.cells[i], roots[at + i], *ty)
             })
             .collect();
         outcomes.push(FrameOutcome { outputs, live: roots[at + n], ok: roots[at + n + 1] });
         at += n + 2;
     }
-    Ok(Bound { graph, inputs, uni, outcomes })
+    Ok(Bound { graph, forks: f.forks, inputs, uni, outcomes })
 }
 
 /// Lower a traced frame - ALL of its output shapes into ONE body.
@@ -191,9 +199,11 @@ pub fn lower_frame(
     uni: &[(u32, &'static str)],
     outcomes: &[FrameOutcome],
     room: Option<crate::transpile::graph::Room>,
+    forks: u8,
 ) -> Result<Lowered> {
     let mut e = Emit::bare(graph.clone());
     e.room = room;
+    e.fork_depth = forks as usize;
     // `Emit`'s own `ok`/`live` are the walk path's; the outcomes carry
     // their own, and nothing below reads these two.
     e.live = outcomes.first().map(|o| o.live).unwrap_or(0);

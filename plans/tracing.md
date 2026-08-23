@@ -2322,6 +2322,64 @@ Left alone. The interesting consequence is Philippe's, below: if the
 generated code did not go through LLVM at all, this cost is not reduced,
 it disappears.
 
+### T24 landed: 27 frames, and where it broke on the way
+
+The tracer forks now, and the room runs three frames further than the
+`rem` widening used to allow. Frames 1-27 are ROW-KEY IDENTICAL to the
+interpreter; frame 28 has 7,264 kernel rows against 7,260 - 8 extra and
+4 missing out of seven thousand.
+
+What it took, in the order the failures came:
+
+1. **`Domain::fork_flr` / `span_ok`**, and `__split_by_flr` using them
+   instead of returning its argument. Validity goes in the GUARD (the
+   fragments partition the lane), the span premise in `ok`.
+2. **`Iface::ival`** and `Symbolic::ival_cells`, so a slot can be
+   declared an interval; `shapes::ival_paths` finds the player's
+   `rem.x`/`rem.y` the way `mark_walk` does, by type rather than index.
+3. **`fork_depth` was never set**, so `lower.rs` emitted only fork level
+   0 and silently dropped every node above it. Shape 1 came out at 5,395
+   lines instead of 10,675 and looked like a win. `Frame::forks` carries
+   it now.
+4. **Nobody closed the fork loops.** The walk's renderer closes them at
+   its end; the traced one did not, so the file had unbalanced braces.
+   Everything after the body - shared outputs, per-variant outputs, the
+   `out` calls - is emitted INSIDE the loops, which is the point.
+5. **`SplitValid` rendered as a raw `u16`**, which is all the walk ever
+   needs: its fork validity only reaches the liveness machinery. A
+   traced frame conjoins it into the guard, and a guard is what merges
+   select on, so it also has to be a `ZB`. Emitted on demand, so the
+   checked-in kernels stay byte-identical.
+6. **`is_interval` was a cone query**, which is the wrong question.
+   `dash_effect_time` is a `Sel` whose CONDITION compares a position
+   derived from `rem`; its arms are numbers and so is the result. Typing
+   it as an interval made the kernel write an `AV::Ival` into a column
+   the boundary refused - `player dash_effect_time is not a number`. It
+   is a proper type rule now, deliberately the same one
+   `lower.rs`'s `Repr::wide` applies, and the two check each other:
+   disagree and lowering fails with "output cell wants a ZN but the
+   graph computes a ZI".
+
+### The cost, which is Philippe's codegen question arriving early
+
+Adding two forks took the check crate's build from ~50 s to over
+twenty-five minutes. The SOURCE barely grew - 22,170 lines to 22,206,
+because a fork is a loop, not a duplication - so this is LLVM unrolling
+`for c0 in 0..2` and `for c1 in 0..2` around a 10k-line body and
+compiling four copies of it.
+
+That is the strongest argument yet for looking at the generated
+assembly, and it is worth doing before the fork count grows: the spd
+rung would add more.
+
+### OPEN: frame 28, 8 extra and 4 missing
+
+Small and specific, which is the good kind. The obvious suspect is a
+lane whose interval spans exactly ONE floor, where fragment 1 should be
+empty - if it is ever marked valid the same successor is produced twice.
+That would explain extras; it does not explain the four missing, so
+there is more than one thing here or the guess is wrong.
+
 ## Philippe's codegen question (2026-08-23)
 
 Inspect the generated assembly, and consider emitting AVX-512 - or

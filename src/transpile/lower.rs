@@ -196,6 +196,13 @@ impl<'a> Ctx<'a> {
                 if let Some(kind) = self.vary.get(c) {
                     match *kind {
                         "num" => Repr::num(true, false),
+                        // A per-lane INTERVAL: `player.rem`, which the
+                        // boundary widens. The walk only ever had
+                        // block-uniform ones (below), because its
+                        // widening is the same for every lane of a
+                        // chunk; a traced block's lanes each carry their
+                        // own.
+                        "ival" => Repr::num(true, true),
                         "bool" => Repr::boolean(true, false),
                         other => bail!("varying cell {} has kind {:?}", c, other),
                     }
@@ -896,7 +903,7 @@ pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
             None => {
                 let name = match &ctx.g.get(id).op {
                     Op::Split(d) => format!("f{}", d),
-                    Op::SplitValid(d) => format!("f{}_fv", d),
+                    Op::SplitValid(d) => format!("f{}_v", d),
                     _ => format!("n{}", id),
                 };
                 ctx.expr[id as usize] = Some(name.clone());
@@ -920,6 +927,7 @@ pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
     for (id, kind) in &e.vary_in {
         let (ty, load) = match *kind {
             "num" => ("ZN", format!("let r_c{}: ZN = rin.c{};", id, id)),
+            "ival" => ("ZI", format!("let r_c{}: ZI = rin.c{};", id, id)),
             "bool" => (
                 "ZB",
                 format!("let r_c{}: ZB = ZB {{ val: rin.c{}, known: ALL }};", id, id),
@@ -960,6 +968,34 @@ pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
             d, valid_expr, fname
         )));
         body.push(Line::Raw(format!("if valid{} == 0 {{ continue; }}", d)));
+        // Fork validity in BOTH forms, but the second one only when
+        // something wants it.
+        //
+        // `zi_fork_flr` returns a raw mask, which is what `valid{d}`
+        // wants. Validity is also an ordinary boolean VALUE: a traced
+        // frame conjoins it into the state's guard, and a guard is what
+        // merges select on, so it has to be a `ZB` wherever the boolean
+        // algebra consumes it - emitting only the mask produced
+        // `zb_and(n124, f0_fv)`, a u16 where a ZB was wanted.
+        //
+        // The WALK never consumes one as a value; its fork validity only
+        // ever reaches the liveness machinery, which takes the mask. So
+        // this is emitted on demand, and the checked-in kernels stay
+        // byte-identical rather than gaining a dead binding each.
+        let valid_node = (0..n as NodeId).find(
+            |id| live[*id as usize] && matches!(ctx.g.get(*id).op, Op::SplitValid(x) if x as usize == d),
+        );
+        let wanted = valid_node.is_some_and(|v| {
+            (0..n as NodeId)
+                .any(|id| live[id as usize] && ctx.g.get(id).args.contains(&v))
+        });
+        if wanted {
+            body.push(Line::Raw(format!(
+                "let {f}_v: ZB = ZB {{ val: {f}_fv, known: ALL }};",
+                f = fname
+            )));
+            var_ty.insert(format!("{}_v", fname), "ZB");
+        }
         var_ty.insert(fname.clone(), "ZI");
         var_ty.insert(format!("valid{}", d), "u16");
         valid_expr = format!("valid{}", d);

@@ -1693,10 +1693,32 @@ impl<'a, D: Domain> Interp<'a, D> {
                 (st, Value::Nil)
             }
             // On an EXACT value the floor is unique, so there is one
-            // fragment and this is the identity. It only splits once the
-            // value has been widened to an interval - which the boundary
-            // does, not the frame (see plans/tracing.md).
-            "__split_by_flr" | "__split_at" => (st, args[0].clone()),
+            // fragment and this is the identity. On a WIDENED one the
+            // lane holds points whose floors differ, and this is the
+            // place the cart marks for the program to enumerate the
+            // cases (T24).
+            //
+            // The fork is a CHOICE, not a state fan-out: one node whose
+            // value depends on the fragment, which specialization
+            // enumerates exactly as it does the six buttons. Its
+            // validity goes in the GUARD, because the fragments
+            // partition the lane and a lane in neither is not a lane at
+            // all; its premise goes in `ok`, because a lane spanning
+            // more floors than there are fragments is REAL and this body
+            // cannot run it.
+            "__split_by_flr" | "__split_at" => {
+                let x = num(0)?;
+                if !self.d.is_interval(&x) {
+                    (st, args[0].clone())
+                } else {
+                    let (v, valid) = self.d.fork_flr(&x);
+                    let premise = self.d.span_ok(&x);
+                    let mut st = st;
+                    st.guard = self.d.and(&st.guard, &valid);
+                    st.ok = self.d.and(&st.ok, &premise);
+                    (st, Value::Num(v))
+                }
+            }
             "__new_unknown_boolean" => (st, Value::Bool(self.d.unknown_bool()?)),
             "min" | "max" => {
                 let f = if name == "min" { Fun2::Min } else { Fun2::Max };

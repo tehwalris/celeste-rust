@@ -226,7 +226,8 @@ pub fn walk<'a>(
     while let Some(k) = queue.pop() {
         let st = seen[&k].clone();
         let roots = state_paths(&st)?;
-        let f = match trace_frame(it, reset, frame, st.clone(), &roots, &[]) {
+        let ival = ival_paths(&st);
+        let f = match trace_frame(it, reset, frame, st.clone(), &roots, &[], &ival) {
             Ok(f) => f,
             Err(e) => {
                 *out.refused.entry(format!("{:#}", e)).or_default() += 1;
@@ -258,4 +259,39 @@ pub fn walk<'a>(
         out.shapes.push(Shape { state: st, frame: f });
     }
     Ok(out)
+}
+
+/// The slots the boundary WIDENS to an interval: the player's
+/// `rem.x` and `rem.y`.
+///
+/// Found the way `Rt2::mark_walk` finds them - the objects whose `type`
+/// is the `player` global - rather than by position, because which
+/// object is the player changes within a room and the widening follows
+/// the type, not the index.
+pub fn ival_paths(st: &State<Symbolic>) -> Vec<Path> {
+    let Some(Value::Table(player)) = iface::get(st, &[iface::key("player")]) else {
+        return Vec::new();
+    };
+    let Some(Value::Table(objects)) = iface::get(st, &[iface::key("objects")]) else {
+        return Vec::new();
+    };
+    let n = st.heap.tables[&objects].arr.len();
+    let mut out = Vec::new();
+    for i in 0..n {
+        let base = vec![iface::key("objects"), Step::Idx(i)];
+        let mut ty = base.clone();
+        ty.push(iface::key("type"));
+        if iface::get(st, &ty) != Some(Value::Table(player)) {
+            continue;
+        }
+        for f in ["x", "y"] {
+            let mut p = base.clone();
+            p.push(iface::key("rem"));
+            p.push(iface::key(f));
+            if iface::get(st, &p).is_some() {
+                out.push(p);
+            }
+        }
+    }
+    out
 }

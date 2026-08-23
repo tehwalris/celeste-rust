@@ -38,7 +38,7 @@ pub struct FrameOut {
     /// KIND the tracer knows it to be. Carrying the kind rather than
     /// re-deriving it from the node's op matters: `Op::Cell` and `Op::Sel`
     /// are both, and a guess there is a guess about the boundary.
-    pub fields: Vec<(Path, NodeId, bool)>,
+    pub fields: Vec<(Path, NodeId, &'static str)>,
     /// Slots that are DEAD at the frame boundary: the six button cells.
     ///
     /// `btn(i)` writes as well as reads - it resolves the unknown to a
@@ -84,6 +84,11 @@ pub struct FrameOut {
 
 pub struct Frame {
     pub iface: Iface,
+    /// How many FORK choices this frame made (`__split_by_flr` on a
+    /// widened value). The emitter needs it: a node whose cone contains
+    /// a split lives at fork level 1 or deeper, and a body emitted at
+    /// depth 0 silently drops every one of them.
+    pub forks: u8,
     pub outs: Vec<FrameOut>,
     /// The canonical cell each `Iface` slot names in the state the frame
     /// STARTS in - the engine's numbering for `Op::Cell(i)`.
@@ -115,7 +120,10 @@ pub fn run_one<'a, D: Domain>(
 /// Every scalar the state ends the frame holding, as graph nodes.
 /// Every scalar the frame ends with, split into the ones that carry
 /// data and the ones that are dead at the boundary (`FrameOut::ubool`).
-fn out_fields(st: &State<Symbolic>) -> Result<(Vec<(Path, NodeId, bool)>, Vec<Path>)> {
+fn out_fields(
+    st: &State<Symbolic>,
+    d: &Symbolic,
+) -> Result<(Vec<(Path, NodeId, &'static str)>, Vec<Path>)> {
     let mut out = Vec::new();
     let mut ubool = Vec::new();
     for p in iface::scalars(st, &[])? {
@@ -123,12 +131,21 @@ fn out_fields(st: &State<Symbolic>) -> Result<(Vec<(Path, NodeId, bool)>, Vec<Pa
             ubool.push(p);
             continue;
         }
-        let (n, is_bool) = match iface::get(st, &p).unwrap() {
-            Value::Num(n) => (n, false),
-            Value::Bool(n) => (n, true),
+        // The engine TYPE of the column this slot becomes. Asked of the
+        // graph rather than of the tracer's `Value`, because an interval
+        // is a `Value::Num` too: `player.rem` comes in widened and leaves
+        // as a narrowed fragment, and both are intervals. A slot the
+        // frame computes from one is an interval column, and writing it
+        // as a number would be a narrowing nobody checked.
+        let (n, ty) = match iface::get(st, &p).unwrap() {
+            Value::Num(n) => {
+                let ty = if d.is_interval(&n) { "ZI" } else { "ZN" };
+                (n, ty)
+            }
+            Value::Bool(n) => (n, "ZB"),
             _ => unreachable!("scalars only yields scalars"),
         };
-        out.push((p, n, is_bool));
+        out.push((p, n, ty));
     }
     Ok((out, ubool))
 }
@@ -141,14 +158,20 @@ pub fn trace_frame<'a>(
     st: State<Symbolic>,
     roots: &[Path],
     pin: &[(Path, Conc)],
+    // Slots the boundary WIDENS to an interval - the player's
+    // `rem.x`/`rem.y`. A frame that reads one has to fork at
+    // `__split_by_flr` rather than floor it (T24).
+    ival: &[Path],
 ) -> Result<Frame> {
     let mut st = st;
+    // Fork choices are per FRAME, like the six buttons above.
+    it.d.forks = 0;
     // One frame has exactly six free choices, `Free(0..5)`. The counter
     // is on the domain rather than the frame, so tracing a SECOND frame
     // through one interpreter - which compiling per pm1 key does - would
     // otherwise run out of buttons on the seventh.
     it.d.frees = 0;
-    let iface = iface::symbolize(&mut it.d, &mut st, roots, pin)?;
+    let iface = iface::symbolize(&mut it.d, &mut st, roots, pin, ival)?;
     // Built BEFORE the frame runs, so it names the input cells rather
     // than whatever the frame did to those slots.
     let pin_ok = iface::pin_guard(&mut it.d, &iface);
@@ -174,7 +197,7 @@ pub fn trace_frame<'a>(
         // key disagrees with what this body was compiled for deopts to
         // the interpreter. Folds to `s.ok` when nothing is pinned.
         let ok = it.d.graph.fold(crate::transpile::graph::Op::And, vec![s.ok, pin_ok]);
-        let (fields, ubool) = out_fields(&s)?;
+        let (fields, ubool) = out_fields(&s, &it.d)?;
         // The engine's numbering for THIS outcome's shape. Fields and
         // dead cells are resolved together: they share one cell space,
         // so a collision between the two halves is exactly as wrong as
@@ -197,7 +220,7 @@ pub fn trace_frame<'a>(
             st: s,
         });
     }
-    Ok(Frame { iface, outs, in_cells, in_rt2 })
+    Ok(Frame { iface, forks: it.d.forks, outs, in_cells, in_rt2 })
 }
 
 /// The player is the object with a `djump` field. Naming it by
@@ -505,7 +528,7 @@ mod tests {
             .collect();
         let n_slots = all.len();
         let started = std::time::Instant::now();
-        match trace_frame(&mut it, &reset, &frame, st, &all, &[]) {
+        match trace_frame(&mut it, &reset, &frame, st, &all, &[], &[]) {
             Ok(f) => {
                 let mut by_shape: std::collections::BTreeMap<String, usize> = Default::default();
                 for o in &f.outs {
@@ -600,7 +623,7 @@ mod tests {
                 .filter(|p| !under_frozen(&st, p, &frozen))
                 .collect();
             frames += 1;
-            let f = match trace_frame(&mut it, &reset, &frame, st, &roots, &[]) {
+            let f = match trace_frame(&mut it, &reset, &frame, st, &roots, &[], &[]) {
                 Ok(f) => f,
                 Err(e) => {
                     refused += 1;
@@ -949,7 +972,7 @@ mod tests {
         }
         let key = pm1_key(&player, &st, &it.d).expect("pm1 key");
         assert_eq!(key.len(), 6, "the pm1 key is six cells");
-        let f = trace_frame(&mut it, &reset, &frame, st, &roots, &key).expect("trace");
+        let f = trace_frame(&mut it, &reset, &frame, st, &roots, &key, &[]).expect("trace");
         assert_eq!(f.iface.pins.len(), 6, "all six pinned");
 
         // `ok` of whichever outcome claims this assignment.
@@ -1075,7 +1098,7 @@ mod tests {
         while let Some(key) = queue.pop() {
             let pin: Vec<(Path, Conc)> =
                 paths.iter().cloned().zip(key.iter().copied()).collect();
-            let f = match trace_frame(&mut it, &reset, &frame, st.clone(), &roots, &pin) {
+            let f = match trace_frame(&mut it, &reset, &frame, st.clone(), &roots, &pin, &[]) {
                 Ok(f) => f,
                 Err(e) => {
                     eprintln!("[keys] {} REFUSED: {:#}", show_key(&key), e);
@@ -1172,7 +1195,7 @@ mod tests {
             );
             match super::super::emit::bind(f, &g)
                 .and_then(|b| super::super::emit::lower_frame(
-                    &b.graph, &b.inputs, &b.uni, &b.outcomes, room.clone(),
+                    &b.graph, &b.inputs, &b.uni, &b.outcomes, room.clone(), b.forks,
                 ))
             {
                 Ok(l) => {
@@ -1278,7 +1301,7 @@ mod tests {
             ("pm1 + x,y,rem", extra(&["x", "y", "rem.x", "rem.y"])),
             ("pm1 + x,y,rem,spd", extra(&["x", "y", "rem.x", "rem.y", "spd.x", "spd.y"])),
         ] {
-            let f = match trace_frame(&mut it, &reset, &frame, st.clone(), &roots, &pin) {
+            let f = match trace_frame(&mut it, &reset, &frame, st.clone(), &roots, &pin, &[]) {
                 Ok(f) => f,
                 Err(e) => {
                     eprintln!("[pos] {:<26} REFUSED: {:#}", label, e);
@@ -1289,7 +1312,7 @@ mod tests {
             let (mut lines, mut variants) = (0usize, 0usize);
             match super::super::emit::bind(&f, &g)
                 .and_then(|b| super::super::emit::lower_frame(
-                    &b.graph, &b.inputs, &b.uni, &b.outcomes, room.clone(),
+                    &b.graph, &b.inputs, &b.uni, &b.outcomes, room.clone(), b.forks,
                 ))
             {
                 Ok(l) => {
@@ -1368,7 +1391,7 @@ mod tests {
         )
         .map(|r| r.structure.len())
         .unwrap_or(0);
-        let f = match trace_frame(&mut it, &reset, &frame, st, &roots, &pin) {
+        let f = match trace_frame(&mut it, &reset, &frame, st, &roots, &pin, &[]) {
             Ok(f) => f,
             Err(e) => return eprintln!("[emit] trace stopped at: {:#}", e),
         };
@@ -1481,6 +1504,7 @@ mod tests {
             &b.uni,
             &b.outcomes,
             room.clone(),
+            b.forks,
         ) {
             Ok(l) => {
                 eprintln!(
@@ -1523,6 +1547,7 @@ mod tests {
                 &b.uni,
                 &b.outcomes[n..n + 1],
                 room.clone(),
+                b.forks,
             );
             match &lowered {
                 Ok(ref l) => eprintln!(
@@ -2669,7 +2694,7 @@ end
         }
 
         let before = it.d.graph.len();
-        let f = match trace_frame(&mut it, &reset, &frame, st.clone(), &roots, &[]) {
+        let f = match trace_frame(&mut it, &reset, &frame, st.clone(), &roots, &[], &[]) {
             Ok(f) => f,
             Err(e) => return eprintln!("[verify] symbolic frame stopped at: {:#}", e),
         };

@@ -179,6 +179,14 @@ pub struct Iface {
     pub slots: Vec<Path>,
     pub init: Vec<Conc>,
     pub pins: Vec<(usize, Conc)>,
+    /// Slots that hold an INTERVAL rather than a number, parallel to
+    /// `slots`: the player's `rem.x`/`rem.y`, which the boundary widens.
+    ///
+    /// `init` still records a point, because a block has to be built
+    /// from something and every other consumer wants one. What makes the
+    /// slot an interval is this flag, which the emitter turns into an
+    /// `ival` input and the tracer into a value it will fork on.
+    pub ival: Vec<bool>,
 }
 
 /// Replace every scalar under `roots` with a fresh `Op::Cell` leaf, and
@@ -208,6 +216,7 @@ pub fn symbolize(
     st: &mut State<Symbolic>,
     roots: &[Path],
     pin: &[(Path, Conc)],
+    ival: &[Path],
 ) -> Result<Iface> {
     let mut slots: Vec<Path> = Vec::new();
     for r in roots {
@@ -261,7 +270,14 @@ pub fn symbolize(
         init.push(c);
         set(st, p, new)?;
     }
-    Ok(Iface { slots, init, pins })
+    let ival: Vec<bool> = slots.iter().map(|p| ival.contains(p)).collect();
+    d.ival_cells = ival
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| **b)
+        .map(|(i, _)| i as u32)
+        .collect();
+    Ok(Iface { slots, init, pins, ival })
 }
 
 /// The obligation a pinned body carries: every pinned cell holds the

@@ -53,6 +53,7 @@ fn uni_ty(kind: &str) -> &'static str {
 fn row_ty(kind: &str) -> &'static str {
     match kind {
         "num" => "ZN",
+        "ival" => "ZI",
         _ => "u16",
     }
 }
@@ -271,6 +272,31 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
                  \x20       }},",
                 c = cell
             )?,
+            // A per-lane INTERVAL. `Col::I` is the raw (lo, hi) pair
+            // form; `Col::U(AV::Ival)` is what a block whose lanes all
+            // carry the same widened `rem` collapses to, which is every
+            // block straight out of the boundary - the widening writes
+            // one value for the whole column. A plain number is also
+            // accepted, as the degenerate interval it is: a lane can
+            // reach a kernel with `rem` exact, before the first
+            // boundary widened it.
+            "ival" => writeln!(
+                o,
+                "        c{c}: match &b.cols[s.c{c} as usize] {{\n\
+                 \x20           Col::I(v) => ZI {{\n\
+                 \x20               lo: core::array::from_fn(|i| v[at(i)].0),\n\
+                 \x20               hi: core::array::from_fn(|i| v[at(i)].1),\n\
+                 \x20           }},\n\
+                 \x20           Col::U(AV::Ival(lo, hi)) => ZI {{ lo: [*lo; W], hi: [*hi; W] }},\n\
+                 \x20           Col::N(v) => ZI {{\n\
+                 \x20               lo: core::array::from_fn(|i| v[at(i)]),\n\
+                 \x20               hi: core::array::from_fn(|i| v[at(i)]),\n\
+                 \x20           }},\n\
+                 \x20           Col::U(AV::Num(n)) => ZI {{ lo: [*n; W], hi: [*n; W] }},\n\
+                 \x20           _ => return None,\n\
+                 \x20       }},",
+                c = cell
+            )?,
             other => anyhow::bail!("row input kind {}", other),
         }
     }
@@ -393,6 +419,11 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
             let empty = match *ty {
                 "ZN" => "Col::N(Vec::new())",
                 "ZB" => "Col::V(Vec::new())",
+                // A per-lane interval, in the raw (lo, hi) form.
+                // `player.rem` leaves a frame as the fork fragment it
+                // was narrowed to, which is an interval; the next
+                // boundary widens it back.
+                "ZI" => "Col::I(Vec::new())",
                 other => anyhow::bail!("output type {}", other),
             };
             writeln!(o, "    b.cols[{}] = {};", cell, empty)?;
@@ -437,6 +468,14 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
                      \x20           v.push(if {s}.c{c}.known & (1 << i) != 0 {{\n\
                      \x20               AV::Bool({s}.c{c}.val & (1 << i) != 0)\n\
                      \x20           }} else {{ AV::UBool }});\n\
+                     \x20       }}",
+                    c = cell,
+                    s = src
+                )?,
+                "ZI" => writeln!(
+                    o,
+                    "        if let Col::I(v) = &mut acc.cols[{c}] {{\n\
+                     \x20           v.push(({s}.c{c}.lo[i], {s}.c{c}.hi[i]));\n\
                      \x20       }}",
                     c = cell,
                     s = src
@@ -553,6 +592,16 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
             .collect();
         writeln!(o, "    out({}, &KOuts {{ {} }});", v.mask, args.join(", "))?;
     }
+    // Close the FORK loops the body opened.
+    //
+    // Everything above - the shared outputs, the per-variant outputs and
+    // the `out` calls - is emitted INSIDE them, which is the point: each
+    // fork configuration is a separate set of rows for the same input
+    // lane, exactly as each button assignment is. The walk's renderer
+    // does the same at its own end (`transpile::kernel`).
+    for _ in 0..b.forks {
+        writeln!(o, "    }}")?;
+    }
     writeln!(o, "}}")?;
     Ok(o)
 }
@@ -624,7 +673,7 @@ pub fn reference_frame_in(root: &std::path::Path) -> Result<Reference> {
         roots.push(vec![iface::key(g)]);
     }
     let pin = pm1_key(&player, &st, &it.d)?;
-    let frame = trace_frame(&mut it, &reset, &fr, st, &roots, &pin)?;
+    let frame = trace_frame(&mut it, &reset, &fr, st, &roots, &pin, &[])?;
 
     let graph = std::mem::take(&mut it.d.graph);
     let bound = super::emit::bind(&frame, &graph)?;
@@ -635,6 +684,7 @@ pub fn reference_frame_in(root: &std::path::Path) -> Result<Reference> {
         &bound.uni,
         &bound.outcomes,
         Some(room),
+        bound.forks,
     )?;
     Ok(Reference { frame, graph, bound, lowered, cart: cart_data, cache })
 }
@@ -718,6 +768,7 @@ pub fn room_kernels_in(root: &std::path::Path) -> Result<Vec<Reference>> {
             &bound.uni,
             &bound.outcomes,
             Some(room.clone()),
+            bound.forks,
         )
         .map_err(|e| name_cells(&frame, e))?;
         out.push(Reference {

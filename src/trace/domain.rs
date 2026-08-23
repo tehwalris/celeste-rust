@@ -144,6 +144,38 @@ pub trait Domain {
     /// index, a table key, a loop bound - where an unknown is a refusal
     /// rather than a branch.
     fn as_const(&self, v: &Self::Num) -> Option<P8>;
+
+    /// Is this value an INTERVAL - a set of numbers rather than one?
+    ///
+    /// Asked before forking, because forking a value that is already a
+    /// single number costs an outcome and buys nothing. Every object
+    /// calls `move`, so a room with n moving objects would get 2^2n fork
+    /// configurations for the sake of one player.
+    fn is_interval(&self, _v: &Self::Num) -> bool {
+        false
+    }
+
+    /// Fork at `flr`: the value restricted to a fresh fork choice, and
+    /// which lanes fall in the chosen fragment.
+    ///
+    /// `flr` of an interval is not a function - the lane holds points
+    /// whose floors differ - so the cart marks the place with
+    /// `__split_by_flr` and the program enumerates the cases. This
+    /// returns ONE node, not two states: the fragment is a choice, like
+    /// a button, and specialization enumerates it (`Choice::Split`).
+    ///
+    /// The default is the identity, which is what an exact value needs:
+    /// one fragment, always valid.
+    fn fork_flr(&mut self, v: &Self::Num) -> (Self::Num, Self::Bool) {
+        (v.clone(), self.boolean(true))
+    }
+
+    /// The premise a fork is taken under: this lane's interval spans at
+    /// most as many floors as there are fragments. An obligation, not a
+    /// guard - a lane that fails it is REAL and this body cannot run it.
+    fn span_ok(&mut self, _v: &Self::Num) -> Self::Bool {
+        self.boolean(true)
+    }
 }
 
 // ---------------------------------------------------------------- concrete
@@ -240,6 +272,16 @@ pub struct Symbolic {
     /// asks for six, in slot order, which is what makes these line up with
     /// the kb0..kb5 the kernels already speak.
     pub frees: u8,
+    /// How many FORK choices have been handed out this frame. The other
+    /// half of `ChoiceSet`, above the six buttons.
+    pub forks: u8,
+    /// Input cells that hold an INTERVAL rather than a number - the
+    /// player's `rem.x`/`rem.y`, which the boundary widens.
+    ///
+    /// By CELL, in the tracer's own dense numbering, because that is what
+    /// a graph node names. `is_interval` is a cone query against this
+    /// set: a value is an interval exactly when it was computed from one.
+    pub ival_cells: std::collections::BTreeSet<u32>,
 }
 
 impl Symbolic {
@@ -367,6 +409,71 @@ impl Domain for Symbolic {
     fn node_count(&self) -> usize {
         self.graph.len()
     }
+    /// Is this value an interval?
+    ///
+    /// NOT a cone query. "An interval input is reachable" is the wrong
+    /// question and it was the first thing I wrote: `dash_effect_time`
+    /// is a `Sel` whose CONDITION compares a position derived from
+    /// `rem`, so an interval reaches it - but its arms are numbers and so
+    /// is the result. Typing it as an interval made the kernel write an
+    /// `AV::Ival` into a column the boundary then refused, at
+    /// `player dash_effect_time is not a number`.
+    ///
+    /// So this is a proper type rule, and deliberately the same one
+    /// `transpile::lower`'s `Repr::wide` applies - a select is an
+    /// interval when an ARM is, `flr` never is (it is exact by guard),
+    /// and a cart lookup never is. The two are checked against each
+    /// other by construction: disagree, and lowering fails with "output
+    /// cell wants a ZN but the graph computes a ZI".
+    fn is_interval(&self, v: &NodeId) -> bool {
+        fn go(g: &Graph, ival: &std::collections::BTreeSet<u32>, memo: &mut Vec<Option<bool>>, n: NodeId) -> bool {
+            if let Some(b) = memo[n as usize] {
+                return b;
+            }
+            let node = g.get(n);
+            let a = &node.args;
+            let any = |memo: &mut Vec<Option<bool>>, xs: &[NodeId]| {
+                xs.iter().any(|x| go(g, ival, memo, *x))
+            };
+            let r = match node.op {
+                Op::Cell(c) => ival.contains(&c),
+                Op::Const(lo, hi) => lo != hi,
+                Op::Split(_) => true,
+                Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::Neg | Op::Abs
+                | Op::Min | Op::Max => any(memo, a),
+                // The CONDITION does not make the result an interval.
+                Op::Sel => any(memo, &a[1..]),
+                // Exact by guard - the lane survives only where the floor
+                // is unique, which is a conjunct of `ok`.
+                Op::Flr => false,
+                // The walk replaces `sin` of an inexact input with its
+                // RANGE as a constant, so this follows its operand.
+                Op::Sin => any(memo, a),
+                _ => false,
+            };
+            memo[n as usize] = Some(r);
+            r
+        }
+        if self.ival_cells.is_empty() {
+            return false;
+        }
+        let mut memo = vec![None; self.graph.len()];
+        go(&self.graph, &self.ival_cells, &mut memo, *v)
+    }
+
+    fn fork_flr(&mut self, v: &NodeId) -> (NodeId, NodeId) {
+        let d = self.forks;
+        self.forks += 1;
+        (
+            self.graph.fold(Op::Split(d), vec![*v]),
+            self.graph.fold(Op::SplitValid(d), vec![*v]),
+        )
+    }
+
+    fn span_ok(&mut self, v: &NodeId) -> NodeId {
+        self.graph.fold(Op::SplitOk, vec![*v])
+    }
+
     fn as_const(&self, v: &NodeId) -> Option<P8> {
         self.as_p8(*v)
     }
