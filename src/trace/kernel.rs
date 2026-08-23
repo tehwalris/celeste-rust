@@ -1147,12 +1147,14 @@ pub fn write_room_kernels(root: &std::path::Path, dir: &std::path::Path) -> Resu
     let refs = room_kernels_in(root)?;
     std::fs::create_dir_all(dir)?;
     let mut sizes = Vec::new();
+    let mut sources: Vec<String> = Vec::new();
     let mut decl = String::new();
     let mut table = String::new();
     for (i, r) in refs.iter().enumerate() {
         let src = render(&r.frame, &r.bound, &r.lowered, &format!("shape {}", i))?;
         sizes.push(src.lines().count());
         std::fs::write(dir.join(format!("kernel{}.rs", i)), &src)?;
+        sources.push(src);
         writeln!(decl, "#[path = \"kernel{i}.rs\"]\npub mod k{i};", i = i)?;
         writeln!(
             table,
@@ -1162,6 +1164,21 @@ pub fn write_room_kernels(root: &std::path::Path, dir: &std::path::Path) -> Resu
             i = i
         )?;
     }
+    // The set's own content hash, the way the fused artifact carries
+    // one. The class kernels get away without it because the compile
+    // recipe TEXT is a faithful proxy for them and the campaign
+    // fingerprint hashes that; nothing upstream of a traced kernel is a
+    // file the fingerprint can read, so the kernels hash themselves.
+    // Without it two campaigns with different traced sets would share
+    // checkpoints.
+    let fingerprint = {
+        use std::hash::Hasher;
+        let mut h = rustc_hash::FxHasher::default();
+        for src in &sources {
+            std::hash::Hash::hash(src, &mut h);
+        }
+        h.finish()
+    };
     let mut m = String::new();
     writeln!(
         m,
@@ -1188,9 +1205,15 @@ pub fn write_room_kernels(root: &std::path::Path, dir: &std::path::Path) -> Resu
          \n\
          {decl}\n\
          pub const KERNELS: &[Kernel] = &[\n\
-         {table}];\n",
+         {table}];\n\
+         \n\
+         /// Content hash of every kernel source in this set. Hashed into\n\
+         /// the campaign fingerprint so two different traced sets can\n\
+         /// never share a checkpoint.\n\
+         pub const FINGERPRINT: u64 = {fingerprint};\n",
         decl = decl,
-        table = table
+        table = table,
+        fingerprint = fingerprint
     )?;
     std::fs::write(dir.join("mod.rs"), m)?;
     Ok(sizes)

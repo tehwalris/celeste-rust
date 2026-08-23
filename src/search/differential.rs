@@ -473,6 +473,61 @@ mod tests {
         }
     }
 
+    /// The TRACED kernels produce the interpreter's rows too.
+    ///
+    /// Same machinery as `compiled_forward_reproduces_the_interpreter`
+    /// above - `CELESTE_COMPILED_FORWARD=check` runs both engines on
+    /// every chunk and fails the step on the first row-key set that
+    /// differs - with `CELESTE_TRACED_KERNELS=1` putting the per-shape
+    /// traced set at the FRONT of the kernel chain. Every chunk it
+    /// claims is therefore checked against the interpreter.
+    ///
+    /// The lane-count assertion matters for the same reason it does
+    /// above, and the traced-lane assertion matters more: the traced set
+    /// is indexed by heap SHAPE, so a set generated for shapes this run
+    /// never reaches would miss every chunk, fall through to the class
+    /// kernels, and pass this test having run none of the code it
+    /// names.
+    #[test]
+    fn traced_kernels_reproduce_the_interpreter() {
+        let _partition = crate::interpreter::partition_straddles_test_lock();
+        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
+            || !std::path::Path::new("rewrites.jsonl").exists()
+            || !std::path::Path::new("rewrites-compile.jsonl").exists()
+        {
+            return;
+        }
+        let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
+
+        let frames = 12;
+        let mut baseline = AbstractRun::start(&program).expect("start baseline");
+        let mut want = Vec::new();
+        for _ in 1..=frames {
+            baseline.step().expect("baseline step");
+            want.push(baseline.lane_count());
+        }
+        drop(baseline);
+
+        std::env::set_var("CELESTE_COMPILED_FORWARD", "check");
+        std::env::set_var("CELESTE_TRACED_KERNELS", "1");
+        let mut run = AbstractRun::start(&program).expect("start compiled run");
+        assert!(run.compiled.is_some(), "the compiled engine did not engage");
+        for (frame, want) in (1..=frames).zip(want) {
+            run.step().unwrap_or_else(|e| panic!("frame {}: {:#}", frame, e));
+            assert_eq!(
+                run.lane_count(),
+                want,
+                "the traced kernels have a different lane count at frame {}",
+                frame
+            );
+        }
+        assert!(
+            crate::compiled::dispatch::traced_lanes() > 0,
+            "no chunk ever reached a traced kernel - the set covers no shape this run \
+             produces, so this test checked nothing"
+        );
+    }
+
     /// End-to-end check of the shape-dispatch machinery (`Variant`): run the
     /// plain-compiled program as the base with the full recipe registered as
     /// a variant for the singleton shapes. Every state in room (1,0) is a

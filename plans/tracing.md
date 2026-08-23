@@ -3650,38 +3650,116 @@ is a chain of "try this kernel, else the next". A traced kernel set is
 one more entry in it. The adapter is ~30 lines: find by shape hash,
 build one accumulator per outcome, walk 16-lane slices, extend `done`.
 
-### The work is that they are not artifacts yet
+### The work is that they are not artifacts yet - DONE
 
-The traced kernels are generated into `traced-kernel-check/`, which is
-outside the workspace and gitignored, because a churning 400 KB
-generated file inside `celeste-kernels` would sit inside the bootstrap
-(the emitters live in a crate that depends on the crate they generate).
-For `FrameEngine` to call them they have to be checked in, below
-`celeste-rust`, exactly like `celeste-kernels`.
+The traced kernels were generated into `traced-kernel-check/`, outside
+the workspace and gitignored, because a churning 400 KB generated file
+inside `celeste-kernels` would sit inside the bootstrap (the emitters
+live in a crate that depends on the crate they generate).
 
-So:
+**That argument was priced against a set that took MINUTES to compile,
+and the lane-type change repriced it.** Measured 2026-08-24 on the
+committed set, 24,609 lines, three shapes, as a standalone `rustc`
+against the workspace rlibs:
 
-1. **Move `trace::dispatch::Kernel` down to `celeste-engine`.** It names
-   only engine types (`Rt2`, `RowSet`, `CartData`, `CollisionCache`), so
-   it can sit below the emitters that produce values of it.
-2. **Generate the room's traced set into `crates/celeste-kernels`**, as
-   checked-in files plus a table, the way `kernel_gen_*` already are.
-   `regen-generated.sh` grows a job; `generated_is_current` grows a case.
-3. **One entry in the dispatch chain.** A traced-kernel miss falls
-   through to the class kernels, which is NOT a deopt to the interpreter
-   - it is another kernel - but the misses have to be COUNTED and named
-   the way `note_miss` already does for the class kernels, or the
-   coverage gap hides in the wall clock.
-4. **Measure `CELESTE_COMPILED_FORWARD=1` on room (1,0) to f094**
-   against BENCHMARK_DATA's recorded baseline, which is the first
-   profile of these kernels worth optimizing against.
+| profile | wall | cpu |
+|---|---|---|
+| `opt-level=3 codegen-units=16` (quick) | **4.32 s** | 7.30 s |
+| `opt-level=3 codegen-units=1` (release-like) | **6.67 s** | 6.57 s |
 
-### Two things to decide inside it
+Four seconds is not a bootstrap hazard, so they are checked in, at
+`crates/celeste-kernels/src/traced/`, and the escape hatch is the one
+the class kernels already use: `regen-generated.sh` generates into a
+scratch dir and installs only what builds.
+
+So, all four done:
+
+1. **`trace::dispatch::Kernel` moved down to `celeste-engine`**
+   (`8da0569`). It names only engine types, so it can sit below the
+   emitters that produce values of it.
+2. **The room's traced set is generated into `crates/celeste-kernels`**
+   (`5a158a9`). `transpile --room-kernels DIR` replaces the `#[ignore]`d
+   probe test, `regen-generated.sh` grows a job (the longest at ~6 s, so
+   it starts first), and `trace::kernel::tests::traced_kernels_are_current`
+   is the staleness gate - 8.2 s, NOT ignored, comparing the file LIST
+   both ways as well as the contents so a vanished shape cannot leave a
+   stale `kernelN.rs` behind.
+
+   The change that made it possible is one line: the generated `mod.rs`
+   says `celeste_engine::traced::Kernel`, not
+   `celeste_rust::trace::dispatch::Kernel`. A generated file naming the
+   crate that holds the emitters can only live above them.
+3. **One entry in the dispatch chain.** `CELESTE_TRACED_KERNELS=1` puts
+   the traced set at the FRONT of `run_chunk_kernel`'s chain, `=last`
+   puts it at the back, unset leaves it out. Off by default because the
+   order is a measurement (see below), not a fact about the code. A miss
+   falls through to the class kernels - not a deopt, they are also
+   compiled code - and is counted through the same `note_miss` the class
+   kernels use, plus its own `KERNEL_HITS[9]` lane counter in the
+   `kernel lanes:` line.
+
+   Two things this needed that were not in the sketch:
+
+   * **A declined lane discards the whole chunk.** `step` appends as it
+     goes, so when a later slice declines, the rows already in the
+     accumulators are a PREFIX of the answer. Half a chunk in `done`
+     plus the whole chunk again from the next kernel would double-count
+     it, so the accumulators are dropped and the chain continues.
+   * **The set carries its own content fingerprint.** The campaign
+     fingerprint proxies the class kernels through the compile recipe
+     TEXT, but nothing it reads determines which traced kernels ran, so
+     `write_room_kernels` emits `FINGERPRINT` (a hash of every rendered
+     source) the way `transpile --fuse` already does, and
+     `compiled_engine_fingerprint` hashes it - XORed with 1 for
+     traced-LAST, because traced-first and traced-last are different
+     engines even with identical kernels. Without it two campaigns with
+     different traced sets would share checkpoints.
+
+   Adding `FINGERPRINT` walked straight into the documented bootstrap:
+   `celeste-rust` stopped compiling because the committed `mod.rs` had
+   no such constant, which stopped `cargo build --bin transpile` from
+   building the tool that would add it. Recovery was the documented one
+   - hand-patch a placeholder into the committed file, build, regenerate.
+
+   **The shapes match, which was the open risk.**
+   `search::differential::tests::traced_kernels_reproduce_the_interpreter`
+   runs 12 frames under `CELESTE_COMPILED_FORWARD=check` with the traced
+   set first, so both engines run every chunk and the row-key SETS are
+   compared - and it asserts `traced_lanes() > 0`, because a set
+   generated for shapes the run never reaches would miss every chunk,
+   fall through, and pass having run none of the code it names.
+4. **Measure against BENCHMARK_DATA's baseline** - next.
+
+### Two things to decide inside it - ANSWERED, 2026-08-24
 
 * **Which shapes.** The room walk closes at 3 shapes for (1,0); the
   class kernels are per (room, class) and there are 8 of them. The
-  traced set is per SHAPE and covers more, so the two overlap rather
-  than nest, and the dispatch order between them is a measurement.
-* **Whether the class kernels survive at all.** If a traced set covers
-  every chunk the class kernels do, `kernel_gen_*` and the 8 committed
-  files are deletable - which is Stage 4's other half.
+  traced set is per SHAPE, so the two overlap rather than nest, and the
+  dispatch order between them was expected to be a measurement.
+
+  It is not. Room (1,0), `rewrites.jsonl`, `bench --frames 40 --deopt`
+  under the ladder env, traced set FIRST:
+
+  ```
+  kernel lanes: steady 0 dash 0 frozen 0 r20-steady 0 r20-dash 0
+                r20-frozen 0 r20-dying-fall 0 r20-dying-spikes 0
+                traced 673503 missed 0 plain-routed 0
+  ```
+
+  **The traced set took 100% of the lanes, and no class kernel took
+  any.** Nothing fell through, so there is no order to tune: the two
+  populations are not overlapping, one contains the other.
+
+* **Whether the class kernels survive at all.** On this evidence, on
+  this room, to this depth: no. Three per-shape kernels cover
+  everything the three (1,0) class kernels cover, and the 5 room (2,0)
+  kernels are a different room's business.
+
+  Not deleted yet, and the reason is the depth. 40 frames is not 94,
+  and the class kernels' whole design point is the pm1 population the
+  overlays pin - a lane class that first appears deeper than this run
+  goes would miss the traced set, fall through, and be caught by a
+  class kernel that is still there. The deletion is safe once a f94
+  run reports `missed 0` with the class kernels DISABLED
+  (`CELESTE_KERNEL_CLASSES=`), which is a measurement, not an
+  argument.

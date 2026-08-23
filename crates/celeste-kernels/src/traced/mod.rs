@@ -32,3 +32,8 @@ pub const KERNELS: &[Kernel] = &[
     Kernel { name: "shape 2", shape: k2::SHAPE, outcomes: k2::OUTCOMES, acc: k2::acc, step: k2::step, why: k2::bind_why },
 ];
 
+/// Content hash of every kernel source in this set. Hashed into
+/// the campaign fingerprint so two different traced sets can
+/// never share a checkpoint.
+pub const FINGERPRINT: u64 = 5275427222478147621;
+

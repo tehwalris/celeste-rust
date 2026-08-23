@@ -39,6 +39,10 @@ pub(crate) fn run_chunk_kernel(
         fused::LANES.fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
         return true;
     }
+    if traced_order() == TracedOrder::First && run_traced_kernel(chunk, ids, done) {
+        KERNEL_HITS[9].fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
+        return true;
+    }
     if mask & 1 != 0 && run_class_kernel_steady(chunk, ids, done, local) {
         KERNEL_HITS[0].fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
         return true;
@@ -75,6 +79,10 @@ pub(crate) fn run_chunk_kernel(
     }
     if mask & 8 != 0 && run_class_kernel_r20_dying_spikes(chunk, ids, done, local) {
         KERNEL_HITS[7].fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
+        return true;
+    }
+    if traced_order() == TracedOrder::Last && run_traced_kernel(chunk, ids, done) {
+        KERNEL_HITS[9].fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
         return true;
     }
     KERNEL_HITS[8].fetch_add(chunk.width as u64, std::sync::atomic::Ordering::Relaxed);
@@ -564,6 +572,21 @@ pub(crate) static PLAIN_ROUTED: std::sync::atomic::AtomicU64 =
 /// The fused artifact's self-fingerprint, when the fused kernel is compiled
 /// in AND enabled - `None` otherwise. Hashed into the campaign fingerprint
 /// so checkpoints name which fused engine produced them.
+/// The traced set's content hash, when it is IN the chain - `None` when
+/// `CELESTE_TRACED_KERNELS` is off. Same job as the fused artifact's
+/// below: nothing the campaign fingerprint already reads determines
+/// which traced kernels ran, so they name themselves.
+pub fn traced_set_fingerprint() -> Option<u64> {
+    match traced_order() {
+        TracedOrder::Off => None,
+        // The ORDER is in the hash too. Traced-first and traced-last are
+        // different engines even with identical kernels: which one runs
+        // a chunk decides which one's row keys land in the checkpoint.
+        TracedOrder::First => Some(celeste_kernels::traced::FINGERPRINT),
+        TracedOrder::Last => Some(celeste_kernels::traced::FINGERPRINT ^ 1),
+    }
+}
+
 pub fn fused_artifact_fingerprint() -> Option<u64> {
     #[cfg(feature = "fused")]
     if fused::enabled() {
@@ -572,7 +595,11 @@ pub fn fused_artifact_fingerprint() -> Option<u64> {
     None
 }
 
-static KERNEL_HITS: [std::sync::atomic::AtomicU64; 9] = [
+/// Lanes per kernel, in chain order, then [8] missed and [9] traced.
+/// The traced counter is last so the eight class slots keep the indices
+/// every campaign log already prints.
+static KERNEL_HITS: [std::sync::atomic::AtomicU64; 10] = [
+    std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -590,6 +617,16 @@ static KROWS: [std::sync::atomic::AtomicU64; 2] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// Lanes the traced set has run so far, WITHOUT resetting the counter.
+///
+/// `print_kernel_hits` swaps every counter to zero, so a test that wants
+/// to assert the traced kernels actually engaged cannot use it - and an
+/// engine differential that passes because nothing ran is the failure
+/// this exists to prevent.
+pub fn traced_lanes() -> u64 {
+    KERNEL_HITS[9].load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn print_kernel_hits() {
     #[cfg(feature = "fused")]
     fused::print_stats();
@@ -604,8 +641,9 @@ pub fn print_kernel_hits() {
     if v.iter().any(|x| *x > 0) || plain > 0 {
         eprintln!(
             "kernel lanes: steady {} dash {} frozen {} r20-steady {} r20-dash {} \
-             r20-frozen {} r20-dying-fall {} r20-dying-spikes {} missed {} plain-routed {}",
-            v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], plain
+             r20-frozen {} r20-dying-fall {} r20-dying-spikes {} traced {} missed {} \
+             plain-routed {}",
+            v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[9], v[8], plain
         );
     }
     {
@@ -642,6 +680,101 @@ pub fn print_kernel_hits() {
             rows[0] as f64 / rows[1].max(1) as f64
         );
     }
+}
+
+/// The TRACED kernel set (`celeste_kernels::traced`): one kernel per heap
+/// SHAPE room (1,0) reaches, rather than one per player class.
+///
+/// Off unless `CELESTE_TRACED_KERNELS` says otherwise, because where it
+/// belongs in the chain is a MEASUREMENT and not a fact about the code:
+/// the traced set indexes by shape and the class kernels index by
+/// (room, class), so the two overlap rather than nest.
+///
+///   CELESTE_TRACED_KERNELS=1      try it BEFORE the class kernels
+///   CELESTE_TRACED_KERNELS=last   try it AFTER them
+///
+/// A miss here is not a deopt. It falls through to the class kernels,
+/// which are also compiled code - but it is still counted and named,
+/// through the same `note_miss` the class kernels use, because a
+/// coverage gap that only shows up as wall clock is the failure mode
+/// this whole campaign is trying to avoid.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum TracedOrder {
+    Off,
+    First,
+    Last,
+}
+
+pub(crate) fn traced_order() -> TracedOrder {
+    static ORDER: std::sync::OnceLock<TracedOrder> = std::sync::OnceLock::new();
+    *ORDER.get_or_init(|| match std::env::var("CELESTE_TRACED_KERNELS").as_deref() {
+        Ok("1") | Ok("first") => TracedOrder::First,
+        Ok("last") => TracedOrder::Last,
+        _ => TracedOrder::Off,
+    })
+}
+
+/// The shape index over the checked-in traced set, built once.
+///
+/// `Dispatch::new` REFUSES two kernels for one shape rather than picking
+/// by hash order, so a generator bug is a panic here at startup instead
+/// of a run that depends on which duplicate a map happened to keep.
+fn traced_dispatch() -> &'static crate::trace::dispatch::Dispatch {
+    static D: std::sync::OnceLock<crate::trace::dispatch::Dispatch> =
+        std::sync::OnceLock::new();
+    D.get_or_init(|| {
+        crate::trace::dispatch::Dispatch::new(celeste_kernels::traced::KERNELS)
+            .expect("the checked-in traced kernel set indexes by shape")
+    })
+}
+
+fn run_traced_kernel(
+    chunk: &runtime2::Rt2,
+    ids: &runtime2::BoundaryIds,
+    done: &mut Vec<runtime2::Rt2>,
+) -> bool {
+    // `chunk.shape_hash` is the cached hash the boundary wrote, and every
+    // chunk reaching here came off the frontier through one.
+    let Some(k) = traced_dispatch().find_by_shape(chunk.shape_hash) else {
+        note_miss("traced", "shape", chunk.width);
+        return false;
+    };
+    // One row set per outcome, made once per chunk: the kernel dedups its
+    // own output, and allocating the table per slice cost more than the
+    // dedup saved (244 MB a frame, trace::run).
+    let mut seen: Vec<kernel::RowSet> =
+        (0..k.outcomes).map(|_| kernel::RowSet::new()).collect();
+    let mut accs: Vec<runtime2::Rt2> = (0..k.outcomes)
+        .map(|i| (k.acc)(i, chunk.cart.clone(), chunk.cache.clone()))
+        .collect();
+    let mut lo = 0usize;
+    while lo < chunk.width {
+        let n = kernel::W.min(chunk.width - lo);
+        let Some(declined) = (k.step)(chunk, lo, n, &mut accs, &mut seen) else {
+            note_miss("traced", "bind", chunk.width);
+            return false;
+        };
+        if declined != 0 {
+            // A lane whose `ok` the kernel could not discharge. Drop
+            // everything and let the chain try the class kernels: the
+            // rows already in `accs` are a PREFIX of the answer, and
+            // half a chunk in `done` plus the whole chunk again from the
+            // next kernel would double-count it.
+            note_miss("traced", "declined", chunk.width);
+            return false;
+        }
+        lo += n;
+    }
+    for mut acc in accs {
+        if acc.width > 0 {
+            let before = acc.width as u64;
+            acc.boundary(ids);
+            KROWS[0].fetch_add(before, std::sync::atomic::Ordering::Relaxed);
+            KROWS[1].fetch_add(acc.width as u64, std::sync::atomic::Ordering::Relaxed);
+            done.push(acc);
+        }
+    }
+    true
 }
 
 macro_rules! class_kernel_runner {
