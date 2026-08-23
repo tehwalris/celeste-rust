@@ -280,7 +280,6 @@ fn vectorize_same_shape_states(states: Vec<State>) -> State {
 
     let total_vector_size: usize = states.iter().map(|s| s.vector_size).sum();
     let first_state = &states[0];
-    crate::merge_stats::record_concat(states.len(), first_state.heap.len());
 
     // Build vectorized heap
     let mut new_heap = Heap::new();
@@ -811,7 +810,6 @@ fn bucket_unique_mask(vector_values: &[VectorRef], row_hashes: &[u64]) -> (Vec<b
 fn dedup_vectorized_state(mut state: State) -> State {
     let _trace = TraceSpan::new("dedup_state", "vectorize");
     if state.vector_size <= 1 {
-        crate::merge_stats::record_dedup(state.vector_size, 0, state.heap.len(), 0);
         return state;
     }
 
@@ -821,12 +819,6 @@ fn dedup_vectorized_state(mut state: State) -> State {
     if vector_values.is_empty() {
         // No vectors means all vectorizable values were identical, so
         // all "rows" are duplicates. Reduce to just one.
-        crate::merge_stats::record_dedup(
-            state.vector_size,
-            0,
-            state.heap.len(),
-            state.vector_size - 1,
-        );
         state.vector_size = 1;
         return state;
     }
@@ -850,12 +842,6 @@ fn dedup_vectorized_state(mut state: State) -> State {
             verified * vector_values.len() as u64,
         );
     }
-    crate::merge_stats::record_dedup(
-        state.vector_size,
-        vector_values.len(),
-        state.heap.len(),
-        state.vector_size - unique_count,
-    );
 
     if unique_count == state.vector_size {
         // No duplicates found
@@ -1914,7 +1900,6 @@ pub fn vectorize_states(states: Vec<State>) -> Vec<State> {
     stats.output_validation_ns = t4.elapsed().as_nanos() as u64;
     stats.output_count = result.len();
 
-    crate::merge_stats::record_vectorize(stats.input_count, stats.group_count, result.len());
     LAST_VECTORIZE_STATS.with(|s| *s.borrow_mut() = Some(stats));
     result
 }

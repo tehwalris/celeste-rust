@@ -92,11 +92,6 @@ enum Command {
         /// Frames to run (default: the input count).
         #[arg(long)]
         frames: Option<u32>,
-        /// Trace every conditional branch DIRECTION of the member attempt on
-        /// this frame and print the guard_branch pin each site implies -
-        /// the input of a dying-overlay pin sweep (plans/shape-tag-plan.md).
-        #[arg(long)]
-        trace_frame: Option<u32>,
     },
     /// Print a digest of the canonical observation after each frame.
     ///
@@ -237,28 +232,6 @@ enum Command {
         checkpoint_dir: String,
         #[arg(long)]
         frame: u32,
-    },
-    /// Which FIELD carries the lane multiplicity at a frame boundary?
-    /// Per lane-varying field: distinct values, and how many rows survive
-    /// if that field is collapsed to one value (an upper bound on what a
-    /// ladder rung abstracting it could merge). See
-    /// `interpreter::field_census`.
-    FieldCensus {
-        /// Checkpoint dir with saved frames (bench --save-frames).
-        #[arg(long)]
-        checkpoint_dir: String,
-        #[arg(long)]
-        frame: u32,
-        /// Collapse these fields together as one rung would, e.g.
-        /// `--collapse player.spd.x,player.spd.y`. A bare field is ERASED
-        /// (the upper bound on abstracting it); `field:n` keeps n fraction
-        /// bits, exactly as `CELESTE_REM_BITS` means it for `rem`.
-        /// Repeatable; each set also gets a joint per-position CSV column.
-        #[arg(long = "collapse")]
-        collapse_sets: Vec<String>,
-        /// Write per-position distinct-value counts to this CSV.
-        #[arg(long)]
-        out: Option<String>,
     },
     Bench {
         #[arg(long, default_value_t = 34)]
@@ -793,15 +766,12 @@ fn bench(
     }
     if profile {
         celeste_rust::interpreter::tracing::reset_tracing();
-        celeste_rust::branch_sites::reset();
-        celeste_rust::create_sites::reset();
         celeste_rust::interpreter::tracing::enable_tracing();
         celeste_rust::instr_time::reset();
         celeste_rust::instr_time::enable();
         if std::env::var("CELESTE_INSTR_CARD").is_ok() {
             celeste_rust::instr_time::enable_cardinality();
         }
-        celeste_rust::merge_stats::reset();
     }
     // Per-coordinate saturation dump (analysis): one CSV line per occupied
     // player pixel per frame, counting the frontier lanes there. With
@@ -1124,66 +1094,6 @@ fn bench(
             "measured", measured as f64 / 1e6, elapsed.as_secs_f64()
         );
 
-        // The merge machinery's actual data volume, so its span times can be
-        // read as throughput. `dedup elements` is rows x vector columns - the
-        // row-key material actually hashed; `heap cells` counts every cell of
-        // every merged state that the concatenation cloned.
-        {
-            let m = celeste_rust::merge_stats::snapshot();
-            let span_s = |name: &str| -> f64 {
-                rows.iter()
-                    .find(|r| r.name == name)
-                    .map(|r| r.self_us as f64 / 1e6)
-                    .unwrap_or(0.0)
-            };
-            let dedup_s = span_s("dedup_state");
-            let merge_self_s = span_s("merge_groups");
-            println!();
-            println!(
-                "merge data volume: {} vectorize calls, {} states in -> {} out ({} groups)",
-                m.vectorize_calls, m.states_in, m.states_out, m.groups
-            );
-            println!(
-                "  concatenate: {} states x ~{} heap cells = {:.1}M cell clones ({:.2}s merge_groups self, {:.0} ns/cell)",
-                m.concat_states,
-                m.concat_cells.checked_div(m.concat_states).unwrap_or(0),
-                m.concat_cells as f64 / 1e6,
-                merge_self_s,
-                merge_self_s * 1e9 / m.concat_cells.max(1) as f64
-            );
-            println!(
-                "  dedup: {} calls, {:.2}M rows x {:.1} row-weighted vector columns = {:.1}M elements, {:.2}M rows removed ({:.0}%)",
-                m.dedup_calls,
-                m.dedup_rows as f64 / 1e6,
-                m.dedup_elems as f64 / m.dedup_rows.max(1) as f64,
-                m.dedup_elems as f64 / 1e6,
-                m.dedup_rows_removed as f64 / 1e6,
-                100.0 * m.dedup_rows_removed as f64 / m.dedup_rows.max(1) as f64
-            );
-            println!(
-                "  dedup throughput: {:.2}s dedup_state self = {:.1} ns/element ({:.1} ns/row)",
-                dedup_s,
-                dedup_s * 1e9 / m.dedup_elems.max(1) as f64,
-                dedup_s * 1e9 / m.dedup_rows.max(1) as f64
-            );
-        }
-
-        let (splits, executions, distinct) = celeste_rust::branch_sites::totals();
-        println!();
-        println!(
-            "branches: {} of {} executions split the state, across {} distinct sites",
-            splits, executions, distinct
-        );
-        println!("{:<34} {:<32} {:>9} {:>9}", "function", "block", "splits", "uniform");
-        for (function, block, site) in
-            celeste_rust::branch_sites::report().into_iter().take(15)
-        {
-            println!(
-                "{:<34} {:<32} {:>9} {:>9}",
-                function, block, site.splits, site.uniform
-            );
-        }
-
         // Where the program-under-test's own time goes, resolved to blocks
         // and individual instructions. Timer overhead inflates everything
         // roughly uniformly; read the shares, not the absolute seconds. A
@@ -1192,31 +1102,8 @@ fn bench(
             // (function, local id) -> (block label, instruction text). The
             // frame driver executes as "__main" and is not one of the
             // program's functions, so it is indexed separately.
-            let mut locate: std::collections::HashMap<(String, usize), (String, String)> =
+            let locate: std::collections::HashMap<(String, usize), (String, String)> =
                 std::collections::HashMap::new();
-            {
-                let mut index = |name: &str, cfg: &celeste_rust::ir::Cfg| {
-                    let mut visit = |label: &str, block: &celeste_rust::ir::Block| {
-                        for (id, instr) in &block.instructions {
-                            locate.insert(
-                                (name.to_string(), usize::from(*id)),
-                                (
-                                    label.to_string(),
-                                    celeste_rust::rewrite::print::format_instruction(instr),
-                                ),
-                            );
-                        }
-                    };
-                    visit("__entry", &cfg.entry);
-                    for (label, block) in &cfg.named {
-                        visit(label.as_str(), block);
-                    }
-                };
-                for (name, fun) in &program.functions {
-                    index(name.as_str(), &fun.cfg);
-                }
-                index("__main", program.frame_cfg());
-            }
 
             let rows = celeste_rust::instr_time::report();
             let total_us: u128 = rows.iter().map(|(_, _, d, _)| d.as_micros()).sum();
@@ -1377,26 +1264,6 @@ fn bench(
             }
         }
 
-        // A `create` accessor that never creates is a read wearing a mutation's
-        // clothes, and it is the mutation that blocks if-conversion.
-        println!();
-        println!(
-            "{:<20} {:>12} {:>12} {:>10}",
-            "create accessor", "found", "created", "create rate"
-        );
-        for (site, found, created) in celeste_rust::create_sites::summary() {
-            let total = found + created;
-            if total == 0 {
-                continue;
-            }
-            println!(
-                "{:<20} {:>12} {:>12} {:>9.2}%",
-                site.name(),
-                found,
-                created,
-                100.0 * created as f64 / total as f64
-            );
-        }
 
         // Spans in the `merge_site` category exist only to bracket other work,
         // so they have no self time worth reporting - what matters is how much
@@ -1574,7 +1441,7 @@ fn main() -> Result<()> {
             }
         }
 
-        Command::Membercheck { tas, frames, trace_frame } => {
+        Command::Membercheck { tas, frames } => {
             use celeste_rust::concrete;
             use celeste_rust::interpreter::fixed_env::PreparedCfg;
             use celeste_rust::interpreter::glue::interpret_prepared_cfg;
@@ -1611,47 +1478,7 @@ fn main() -> Result<()> {
                 let mut mstate = state.clone();
                 mapping.from_canonical(&mut mstate)?;
                 concrete::set_concrete_buttons(&mut mstate, byte)?;
-                let tracing_this_frame = trace_frame == Some(frame);
-                if tracing_this_frame {
-                    celeste_rust::interpreter::branch_trace::start();
-                }
                 let member_result = interpret_prepared_cfg(&member_cfg, mstate, &member_env);
-                if tracing_this_frame {
-                    let trace = celeste_rust::interpreter::branch_trace::stop_take();
-                    // Group by site: a site whose every execution goes one way
-                    // is pinnable; anything else needs a loop rule instead.
-                    let mut sites: Vec<((String, String), (u32, u32, u32))> = Vec::new();
-                    for (f, b, t, fl) in trace {
-                        let key = (f, b);
-                        let entry = match sites.iter_mut().find(|(k, _)| *k == key) {
-                            Some((_, e)) => e,
-                            None => {
-                                sites.push((key, (0, 0, 0)));
-                                &mut sites.last_mut().unwrap().1
-                            }
-                        };
-                        match (t, fl) {
-                            (true, false) => entry.0 += 1,
-                            (false, true) => entry.1 += 1,
-                            _ => entry.2 += 1, // both edges in one execution
-                        }
-                    }
-                    println!("branch trace of frame {} ({} sites):", frame, sites.len());
-                    for ((f, b), (t, fl, both)) in &sites {
-                        let verdict = match (t, fl, both) {
-                            (_, 0, 0) => "pin taken:true".to_string(),
-                            (0, _, 0) => "pin taken:false".to_string(),
-                            _ => format!("NOT PINNABLE (true {} / false {} / split {})", t, fl, both),
-                        };
-                        println!(
-                            "  {{\"fn\":\"{}\",\"head\":\"{}\"}} x{}  {}",
-                            f,
-                            b,
-                            t + fl + both,
-                            verdict
-                        );
-                    }
-                }
 
                 // Plain step (the reference trajectory).
                 state = concrete::step_frame(&plain_cfg, state, &plain_env, byte)?;
@@ -2035,18 +1862,6 @@ fn main() -> Result<()> {
                     max
                 );
             }
-        }
-
-        Command::FieldCensus { checkpoint_dir, frame, collapse_sets, out } => {
-            use celeste_rust::interpreter::field_census::{self, CollapseSet};
-            use celeste_rust::rewrite::checkpoint;
-            let dir = std::path::PathBuf::from(&checkpoint_dir);
-            let states = checkpoint::load_frame_states(&dir, frame)?;
-            let sets: Vec<CollapseSet> = collapse_sets
-                .iter()
-                .map(|s| CollapseSet::parse(s))
-                .collect::<Result<Vec<_>>>()?;
-            field_census::run(states, frame, &sets, out.as_ref().map(std::path::Path::new))?;
         }
 
         Command::Bench {

@@ -267,11 +267,6 @@ fn interpret_prepared_cfg_inner(
         // Execute the block's instructions (post-phi flow)
         // Note: For hint_normalize blocks, states were already vectorized when pulled from accumulators
         let instruction_count = block.instructions.len();
-        crate::block_coverage::record_block(
-            name.as_deref().unwrap_or("__main"),
-            block_label.as_ref().map_or("__entry", |l| l.as_str()),
-            block,
-        );
         let bound_post_phi = adapter.flow_block_post_phi(block)?;
         let flow_data = bound_post_phi.flow(flow_data).with_context(|| {
             format!(
@@ -280,13 +275,6 @@ fn interpret_prepared_cfg_inner(
                 block_label.as_ref().map_or("__entry", |l| l.as_str())
             )
         })?;
-        if let FlowData::States(states) = &flow_data {
-            super::would_dedup::record(
-                name.as_deref().unwrap_or("__main"),
-                block_label.as_ref().map_or("__entry", |l| l.as_str()),
-                states,
-            );
-        }
 
         // Update DAG node with processing stats
         with_profiler(|p| {
@@ -416,16 +404,6 @@ fn interpret_prepared_cfg_inner(
                 // single pass instead of filtering a clone per edge.
                 let bound_split = adapter.flow_branch_split(terminator)?;
                 let (true_flow_data, false_flow_data) = bound_split.flow_split(flow_data)?;
-                let took_true = !true_flow_data.is_empty();
-                let took_false = !false_flow_data.is_empty();
-                if crate::interpreter::branch_trace::active() {
-                    crate::interpreter::branch_trace::record(
-                        name.as_deref().unwrap_or("__main"),
-                        block_label.as_ref().map_or("__entry", |l| l.as_str()),
-                        took_true,
-                        took_false,
-                    );
-                }
                 process_branch(true, true_target, true_flow_data)?;
                 process_branch(false, false_target, false_flow_data)?;
 
@@ -435,11 +413,6 @@ fn interpret_prepared_cfg_inner(
                 // conditionals are worth rewriting - `if_convert` removed 81
                 // branches and only 4.6% of the splits, because most `and`/`or`
                 // conditions are uniform across lanes and never split at all.
-                crate::branch_sites::record(
-                    name.as_deref().unwrap_or("__main"),
-                    block_label.as_ref().map_or("__entry", |l| l.as_str()),
-                    took_true && took_false,
-                );
             }
         }
     }

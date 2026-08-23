@@ -1195,7 +1195,6 @@ pub fn merge_dedup_group(states: &[State]) -> Option<State> {
     };
     let total_rows: usize = states.iter().map(|s| s.vector_size).sum();
     let first = &states[0];
-    crate::merge_stats::record_concat(states.len(), first.heap.len());
 
     // Uniform columns leave the key and become scalars in the output.
     let uniform: Vec<Option<Value>> = {
@@ -1208,7 +1207,7 @@ pub fn merge_dedup_group(states: &[State]) -> Option<State> {
         .filter_map(|(c, u)| u.is_none().then_some(c))
         .collect();
 
-    let (kept, removed) = if key.is_empty() {
+    let (kept, _removed) = if key.is_empty() {
         // No column tells any two rows apart: every row is the same row.
         (vec![0u32], total_rows - 1)
     } else {
@@ -1229,7 +1228,6 @@ pub fn merge_dedup_group(states: &[State]) -> Option<State> {
         debug_assert_eq!(kept.len(), unique_count);
         (kept, total_rows - unique_count)
     };
-    crate::merge_stats::record_dedup(total_rows, key.len(), first.heap.len(), removed);
 
     // Gather every non-uniform column's survivors up front, columns in
     // parallel - they are independent, and each gather is a sorted piece

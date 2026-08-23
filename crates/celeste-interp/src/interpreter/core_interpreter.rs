@@ -283,11 +283,9 @@ impl<'a> CoreInterpreter<'a> {
                 let heap_id = self.state.global_env.get(name);
                 if let Some(&heap_id) = heap_id {
                     if *create_if_missing {
-                        crate::create_sites::record(crate::create_sites::Site::Global, false);
                     }
                     Ok(Some(Value::Pointer(heap_id)))
                 } else if *create_if_missing {
-                    crate::create_sites::record(crate::create_sites::Site::Global, true);
                     let heap_id = self.state.heap.alloc();
                     self.state.global_env.insert(name.clone(), heap_id);
                     Ok(Some(Value::Pointer(heap_id)))
@@ -377,11 +375,9 @@ impl<'a> CoreInterpreter<'a> {
                 };
                 if let Some(field_heap_id) = field_heap_id {
                     if *create_if_missing {
-                        crate::create_sites::record(crate::create_sites::Site::Field, false);
                     }
                     Ok(Some(Value::Pointer(field_heap_id)))
                 } else if *create_if_missing {
-                    crate::create_sites::record(crate::create_sites::Site::Field, true);
                     let field_heap_id = self.state.heap.alloc();
                     self.state
                         .heap
@@ -441,11 +437,9 @@ impl<'a> CoreInterpreter<'a> {
                 };
                 if let Some(field_heap_id) = field_heap_id {
                     if *create_if_missing {
-                        crate::create_sites::record(crate::create_sites::Site::Index, false);
                     }
                     Ok(Some(Value::Pointer(field_heap_id)))
                 } else if *create_if_missing {
-                    crate::create_sites::record(crate::create_sites::Site::Index, true);
                     let field_heap_id = self.state.heap.alloc();
                     self.state
                         .heap

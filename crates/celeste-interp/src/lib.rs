@@ -27,14 +27,10 @@ extern crate anyhow;
 pub use celeste_core::{cart_data, collision_cache, pico8_num};
 pub use celeste_ir::{builtins, ir, print};
 
-pub mod block_coverage;
 pub mod block_flow;
 pub mod instruction_flow;
 pub mod liveness;
-pub mod branch_sites;
-pub mod create_sites;
 pub mod game_runner;
 pub mod instr_time;
 pub mod interpreter;
-pub mod merge_stats;
 pub mod op_census;

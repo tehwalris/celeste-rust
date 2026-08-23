@@ -68,10 +68,6 @@ name = "concrete_run"
 path = "src/bin/concrete_run.rs"
 
 [[bin]]
-name = "measure_k"
-path = "src/bin/measure_k.rs"
-
-[[bin]]
 name = "rewrite"
 path = "src/bin/rewrite.rs"
 
