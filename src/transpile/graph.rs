@@ -28,7 +28,12 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use std::sync::Arc;
+
 use anyhow::{anyhow, bail, Result};
+
+use celeste_core::cart_data::CartData;
+use celeste_core::collision_cache::CollisionCache;
 
 use celeste_core::pico8_num::{Pico8Num, Pico8NumInterval};
 
@@ -116,6 +121,14 @@ impl Choice {
             })
             .collect()
     }
+}
+
+/// The map, for the evaluator. `CollisionCache` already carries which
+/// room it is for, so this is just the pair the cart queries need.
+#[derive(Clone)]
+pub struct Room {
+    pub cart: Arc<CartData>,
+    pub cache: Arc<CollisionCache>,
 }
 
 /// The op vocabulary. Semantic, not representational: one variant per
@@ -532,7 +545,7 @@ impl Graph {
     /// Nodes are appended after their operands, so a forward sweep is a
     /// valid evaluation order.
     pub fn eval(&self, cells: &HashMap<u32, Val>) -> Result<Vec<Val>> {
-        self.eval_inner(cells, false)
+        self.eval_inner(cells, false, None)
     }
 
     /// The same evaluator, but a node it cannot model becomes TOP for its
@@ -549,10 +562,26 @@ impl Graph {
     /// evaluator: two implementations of `Abs` over intervals is exactly
     /// the kind of divergence that is impossible to notice.
     pub fn eval_lenient(&self, cells: &HashMap<u32, Val>) -> Result<Vec<Val>> {
-        self.eval_inner(cells, true)
+        self.eval_inner(cells, true, None)
     }
 
-    fn eval_inner(&self, cells: &HashMap<u32, Val>, lenient: bool) -> Result<Vec<Val>> {
+    /// `eval_lenient` WITH the map, so `TileFlagAt` is decided instead of
+    /// becoming top.
+    ///
+    /// The map is a constant. A collision test is only unknown because
+    /// the evaluator was never given the room, not because the answer
+    /// depends on anything it cannot see - and `TileFlagAt` is one of the
+    /// two ops through which TOP enters a traced graph at all.
+    pub fn eval_lenient_in(&self, cells: &HashMap<u32, Val>, room: &Room) -> Result<Vec<Val>> {
+        self.eval_inner(cells, true, Some(room))
+    }
+
+    fn eval_inner(
+        &self,
+        cells: &HashMap<u32, Val>,
+        lenient: bool,
+        room: Option<&Room>,
+    ) -> Result<Vec<Val>> {
         let full = Val::Num(Pico8NumInterval::new(
             Pico8Num::from_raw(i32::MIN),
             Pico8Num::from_raw(i32::MAX),
@@ -678,6 +707,9 @@ impl Graph {
                     Val::Bool(b) => b.is_some(),
                     Val::Num(i) => i.to_number().is_some(),
                 })),
+                Op::TileFlagAt if room.is_some() => {
+                    Self::tile_flag_over(room.unwrap(), a(0), a(1), a(2), a(3), a(4))?
+                }
                 Op::Mget | Op::TileFlagAt => {
                     bail!("{:?} needs the cart; not supported by the pure evaluator yet", node.op)
                 }
@@ -726,6 +758,65 @@ impl Graph {
             },
             _ => full,
         }
+    }
+
+    /// `tile_flag_at` over INTERVALS of x and y.
+    ///
+    /// For one concrete (x, y) the answer is "does any tile in the
+    /// w-by-h rectangle carry the flag". Over a BOX of positions there
+    /// are two sound one-sided tests, and unknown lies between them.
+    ///
+    /// FALSE everywhere, if the UNION of all those rectangles holds no
+    /// flagged tile. That union is itself one rectangle: start at the
+    /// lowest corner, grow by how far the box spans.
+    ///
+    /// TRUE everywhere, if the INTERSECTION holds a flagged tile. That
+    /// is also one rectangle: start at the highest corner, shrink by the
+    /// span. It is empty once the box spans further than the rectangle
+    /// is wide, which is why the size check comes first.
+    ///
+    /// Each test is one ordinary `solid_at` call on a derived rectangle,
+    /// so this costs two map queries and introduces no new machinery.
+    fn tile_flag_over(room: &Room, x: Val, y: Val, w: Val, h: Val, flag: Val) -> Result<Val> {
+        // The size and flag must be exact. A symbolic hitbox is a
+        // different question, and only flag 0 (solid) ever reaches the
+        // graph - `trace::eval` raises on anything else.
+        let ex = |v: Val, what: &str| -> Result<i32> {
+            v.as_exact()
+                .and_then(|n| n.as_i16())
+                .map(|n| n as i32)
+                .ok_or_else(|| anyhow!("tile_flag_at: {} is not an exact integer", what))
+        };
+        let (w, h) = (ex(w, "w")?, ex(h, "h")?);
+        if ex(flag, "flag")? != 0 {
+            bail!("tile_flag_at: only flag 0 (solid) is modelled");
+        }
+        // An interval covers every integer from floor(low) to
+        // floor(high). Non-integer coordinates fail concretely, so
+        // covering them here is conservative rather than wrong.
+        let span = |v: Val, what: &str| -> Result<(i32, i32)> {
+            let i = v.as_num(what)?;
+            let lo = i.low.flr().as_i16().ok_or_else(|| anyhow!("{}: unbounded", what))? as i32;
+            let hi = i.high.flr().as_i16().ok_or_else(|| anyhow!("{}: unbounded", what))? as i32;
+            Ok((lo, hi))
+        };
+        let (xlo, xhi) = span(x, "x")?;
+        let (ylo, yhi) = span(y, "y")?;
+        // A room is 16 tiles across and `solid_at` clamps to it, so any
+        // span past the room edge is the whole room. Clamping also keeps
+        // the derived rectangle inside i16 when an input is at TOP.
+        let cap = |n: i32| -> i16 { n.clamp(-4096, 4096) as i16 };
+        let (dx, dy) = (xhi - xlo, yhi - ylo);
+        let solid = |px: i32, py: i32, pw: i32, ph: i32| -> Result<bool> {
+            room.cache.solid_at(&room.cart, cap(px), cap(py), cap(pw), cap(ph))
+        };
+        if !solid(xlo, ylo, w + dx, h + dy)? {
+            return Ok(Val::Bool(Some(false)));
+        }
+        if dx < w && dy < h && solid(xhi, yhi, w - dx, h - dy)? {
+            return Ok(Val::Bool(Some(true)));
+        }
+        Ok(Val::Bool(None))
     }
 
     fn arith(op: &Op, x: Val, y: Val) -> Result<Val> {

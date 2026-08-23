@@ -732,12 +732,14 @@ pub(crate) fn emit_body(e: &mut Emit, of: &mut OutFields) -> Result<()> {
         // and each one's constants are the other's input, so the second
         // interval pass sees comparisons that only collapsed because the
         // BDD folded a select away.
-        let (g1, m1, _) = crate::transpile::ival::fold(&sp, &roots).expect("interval fold");
+        let (g1, m1, _) =
+            crate::transpile::ival::fold(&sp, &roots, e.room.as_ref()).expect("interval fold");
         let r1: Vec<NodeId> = roots.iter().map(|r| m1[*r as usize]).collect();
         let (g2, m2, _) =
             crate::transpile::bdd::simplify_until_stable(&g1, &r1, 1 << 22, 4);
         let r2: Vec<NodeId> = r1.iter().map(|r| m2[*r as usize]).collect();
-        let (sp2, m3, _) = crate::transpile::ival::fold(&g2, &r2).expect("interval fold 2");
+        let (sp2, m3, _) =
+            crate::transpile::ival::fold(&g2, &r2, e.room.as_ref()).expect("interval fold 2");
         let nodemap = |x: NodeId| -> NodeId { m3[m2[m1[x as usize] as usize] as usize] };
         // Only the roots are remapped, because only the roots are read.
         // Anything else would be `UNREACHABLE` and would panic on use,

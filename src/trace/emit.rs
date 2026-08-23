@@ -52,8 +52,10 @@ pub fn lower_frame(
     outputs: &[(u32, NodeId, &'static str)],
     live: NodeId,
     ok: NodeId,
+    room: Option<crate::transpile::graph::Room>,
 ) -> Result<Lowered> {
     let mut e = Emit::bare(graph.clone());
+    e.room = room;
     e.live = live;
     e.ok = ok;
     for (cell, kind) in inputs {

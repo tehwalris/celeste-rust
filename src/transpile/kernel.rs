@@ -198,6 +198,9 @@ pub(crate) struct Emit {
     /// for a TRACED graph, where it is the difference between 10,510 and
     /// 4,714 nodes.
     pub(crate) decide: bool,
+    /// The map, when the caller has it. `Some` makes the interval pass
+    /// decide collision tests instead of treating them as unknown.
+    pub(crate) room: Option<crate::transpile::graph::Room>,
 }
 
 impl Emit {
@@ -225,6 +228,7 @@ impl Emit {
             shape_hash: String::new(),
             stable: HashMap::new(),
             pin_val: HashMap::new(),
+            room: None,
             pins: BTreeSet::new(),
             button_cells: HashMap::new(),
             fork_depth: 0,
@@ -562,6 +566,7 @@ pub fn emit_kernel_text(program: &Program, witness_path: &str) -> Result<String>
 /// there is no second walk to drift.
 pub(crate) fn emit_walk(program: &Program, witness_path: &str) -> Result<Emit> {
     let mut e = Emit {
+        room: None,
         witness_len: 0,
         cells: HashMap::new(),
         globals: HashMap::new(),

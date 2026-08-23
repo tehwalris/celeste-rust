@@ -524,6 +524,12 @@ mod tests {
         );
         assert_eq!(dropped, 0, "the key walk hit its cap - raise CAP or the set is not closed");
 
+        // The map, so the interval pass can decide collision tests
+        // rather than treating every one of them as unknown.
+        let room = match (it.cart.clone(), it.cache.clone()) {
+            (Some(cart), Some(cache)) => Some(crate::transpile::graph::Room { cart, cache }),
+            _ => None,
+        };
         let g = std::mem::take(&mut it.d.graph);
         let mut inputs: Vec<(u32, &'static str)> = Vec::new();
         let mut uni: Vec<(u32, &'static str)> = Vec::new();
@@ -558,7 +564,7 @@ mod tests {
                     })
                     .collect();
                 match super::super::emit::lower_frame(
-                    &g, &inputs, &uni, &outputs, o.guard, o.ok,
+                    &g, &inputs, &uni, &outputs, o.guard, o.ok, room.clone(),
                 ) {
                     Ok(l) => {
                         lines += l.body.len();
@@ -668,6 +674,12 @@ mod tests {
             }
         }
         let base = inputs.len() as u32;
+        // The map, so the interval pass can decide collision tests
+        // rather than treating every one of them as unknown.
+        let room = match (it.cart.clone(), it.cache.clone()) {
+            (Some(cart), Some(cache)) => Some(crate::transpile::graph::Room { cart, cache }),
+            _ => None,
+        };
         let g = std::mem::take(&mut it.d.graph);
 
         // ONE INPUT SHAPE, N OUTPUT SHAPES. Lowering each outcome on its
@@ -730,7 +742,7 @@ mod tests {
                 })
                 .collect();
             let lowered = super::super::emit::lower_frame(
-                &g, &inputs, &uni, &outputs, o.guard, o.ok,
+                &g, &inputs, &uni, &outputs, o.guard, o.ok, room.clone(),
             );
             match &lowered {
                 Ok(ref l) => eprintln!(
@@ -1108,7 +1120,7 @@ mod tests {
                             // sees the comparisons that collapsed as a
                             // result.
                             let (g1, m1, si1) =
-                                crate::transpile::ival::fold(&sp, &rts).expect("ival");
+                                crate::transpile::ival::fold(&sp, &rts, room.as_ref()).expect("ival");
                             let r1: Vec<crate::transpile::graph::NodeId> =
                                 rts.iter().map(|r| m1[*r as usize]).collect();
                             let (g2, m2, _) = crate::transpile::bdd::simplify_until_stable(
@@ -1120,7 +1132,7 @@ mod tests {
                             let r2: Vec<crate::transpile::graph::NodeId> =
                                 r1.iter().map(|r| m2[*r as usize]).collect();
                             let (sp2, m3, si2) =
-                                crate::transpile::ival::fold(&g2, &r2).expect("ival 2");
+                                crate::transpile::ival::fold(&g2, &r2, room.as_ref()).expect("ival 2");
                             eprintln!(
                                 "[emit]   IVAL+BDD: {} -> {} (ival: {} bools, {} nums) -> {} \
                                  (bdd) -> {} (ival again: {} bools, {} nums)",

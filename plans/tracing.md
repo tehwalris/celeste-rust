@@ -1405,14 +1405,45 @@ printed rather than counted.
 * **232 nodes, always TRUE**, led by
   `Not(Eq(Const(17), Mget(Add(..), Add(..))))`.
 
-Both are the MAP. `Mget` and `TileFlagAt` are the two ops the interval
-evaluator refuses, so they are the two places TOP enters the graph - and
-the map is a CONSTANT that we have in hand. `Mget` over an interval of
-positions is the set of tile values in that rectangle; `TileFlagAt` over
-an interval span is whether any tile in it carries the flag. Deciding
-those exactly would take 890 of the 975 remaining constant nodes, and it
-needs no new theory - only giving the evaluator the cart it already
-refuses to look at. **That is the next mechanism.**
+Both are the MAP, and I predicted that giving the evaluator the cart
+would take 890 of the 975. **It took zero. The prediction was wrong and
+wrong in a way I have been wrong before.**
+
+The mechanism itself works. `Graph::eval_lenient_in` takes a `Room` and
+decides `TileFlagAt` over intervals with two one-sided rectangle tests:
+false everywhere if the UNION of the possible rectangles holds no solid
+tile, true everywhere if their INTERSECTION holds one, unknown between.
+`a_collision_test_is_decided_at_a_known_position_and_not_at_an_unknown_one`
+checks all 256 tile-aligned positions in room (0,0) against the concrete
+`solid_at` and they agree.
+
+It changes NOTHING on the traced graph, because the player's position is
+an unconstrained input. With x and y at TOP the player could be anywhere,
+so "is there a wall here" genuinely can go either way - the union is the
+whole room (solid) and the intersection is empty. Unknown is the correct
+answer.
+
+So those 658 nodes are not constant. They are **constant around one
+game state**, which is what a census over 193 points near that state can
+see and cannot distinguish from constancy. This is the third time in
+this campaign that a sampled-constant population has turned out to be
+locality; the rule that keeps being violated is that a sample near one
+state cannot tell "always" from "always around here", and the fix is to
+stop treating census buckets as an estimate of what a decision procedure
+will find.
+
+**What would actually decide them: bounds on the position inputs.** A
+player is not anywhere - it is in the room, and its speed is bounded by
+the physics. Narrowing an input is a SPECIALIZATION exactly like a pin,
+so it carries the same obligation: `pin_guard` generalized from
+`cell == value` to `cell` in an interval, conjoined into `ok`, and a lane
+outside the assumed range deopts. That is a real design, it reuses the
+machinery T14 already built, and it is not the free win I claimed the
+cart would be.
+
+The cart-aware evaluation stays regardless: it is exact, tested, and
+costs two map queries. It just does not pay until the positions are
+bounded.
 
 * **462 + 63 nodes that are NOT constant** - genuine duplication, many
   copies of `Gt(Sel(..), Const(8388608))`. Same item as the deferred
