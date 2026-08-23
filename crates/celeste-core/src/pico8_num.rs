@@ -423,13 +423,51 @@ impl Pico8NumInterval {
     /// under wrapping arithmetic is the full interval - add that as an
     /// explicit, deliberate case then.)
     fn from_i64_endpoints(low: i64, high: i64) -> Self {
-        assert!(
-            low >= i32::MIN as i64 && high <= i32::MAX as i64,
-            "interval arithmetic wrapped: endpoints [{}, {}] leave the 16.16 range",
-            low,
-            high
-        );
-        Self::new(Pico8Num(low as i32), Pico8Num(high as i32))
+        Self::try_from_i64_endpoints(low, high).unwrap_or_else(|| {
+            panic!(
+                "interval arithmetic wrapped: endpoints [{}, {}] leave the 16.16 range",
+                low, high
+            )
+        })
+    }
+
+    /// The same, for callers that have a sound answer for the wrap case
+    /// rather than a bug. The evaluator in `transpile::graph` is one: it
+    /// runs with inputs at TOP on purpose, where a wrap is expected and
+    /// the sound result is `full()`.
+    fn try_from_i64_endpoints(low: i64, high: i64) -> Option<Self> {
+        if low >= i32::MIN as i64 && high <= i32::MAX as i64 {
+            Some(Self::new(Pico8Num(low as i32), Pico8Num(high as i32)))
+        } else {
+            None
+        }
+    }
+
+    /// Every representable 16.16 value. Closed under wrapping arithmetic,
+    /// which is what makes it the sound answer when endpoint arithmetic
+    /// leaves the range.
+    pub fn full() -> Self {
+        Self::new(Pico8Num(i32::MIN), Pico8Num(i32::MAX))
+    }
+
+    /// `+` and `-` that report a wrap instead of panicking on it.
+    pub fn checked_add(self, rhs: Self) -> Option<Self> {
+        Self::try_from_i64_endpoints(
+            self.low.0 as i64 + rhs.low.0 as i64,
+            self.high.0 as i64 + rhs.high.0 as i64,
+        )
+    }
+
+    pub fn checked_sub(self, rhs: Self) -> Option<Self> {
+        Self::try_from_i64_endpoints(
+            self.low.0 as i64 - rhs.high.0 as i64,
+            self.high.0 as i64 - rhs.low.0 as i64,
+        )
+    }
+
+    /// Negation, which wraps on exactly one input: `i32::MIN`.
+    pub fn checked_neg(self) -> Option<Self> {
+        Self::try_from_i64_endpoints(-(self.high.0 as i64), -(self.low.0 as i64))
     }
 }
 
@@ -459,17 +497,29 @@ impl Pico8NumInterval {
     /// Scale by a POSITIVE scalar (monotone, so endpoint images bound the
     /// set), with the same loud wrap detection as `Add`/`Sub`.
     pub fn scale_positive(&self, rhs: Pico8Num) -> Self {
+        self.checked_scale_positive(rhs)
+            .unwrap_or_else(|| panic!("interval scale wrapped by {:?}", rhs))
+    }
+
+    /// `scale_positive` that reports a wrap instead of panicking on it.
+    pub fn checked_scale_positive(&self, rhs: Pico8Num) -> Option<Self> {
         assert!(rhs.0 > 0, "scale_positive needs a positive scalar");
         let mul = |a: i32| -> i64 { ((a as i64) * (rhs.0 as i64)) >> 16 };
-        Self::from_i64_endpoints(mul(self.low.0), mul(self.high.0))
+        Self::try_from_i64_endpoints(mul(self.low.0), mul(self.high.0))
     }
 
     /// Divide by a POSITIVE scalar (monotone), loud on wrap. Mirrors the
     /// concrete `Div` (i64 shifted dividend, truncating division).
     pub fn div_positive(&self, rhs: Pico8Num) -> Self {
+        self.checked_div_positive(rhs)
+            .unwrap_or_else(|| panic!("interval divide wrapped by {:?}", rhs))
+    }
+
+    /// `div_positive` that reports a wrap instead of panicking on it.
+    pub fn checked_div_positive(&self, rhs: Pico8Num) -> Option<Self> {
         assert!(rhs.0 > 0, "div_positive needs a positive scalar");
         let div = |a: i32| -> i64 { ((a as i64) << 16).wrapping_div(rhs.0 as i64) };
-        Self::from_i64_endpoints(div(self.low.0), div(self.high.0))
+        Self::try_from_i64_endpoints(div(self.low.0), div(self.high.0))
     }
 }
 

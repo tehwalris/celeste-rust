@@ -1275,6 +1275,150 @@ running the traced path in a real search.
   output shape, so it does not make P2/P3 smaller or optional. The four
   shapes on this frame are not a pm1 artifact.
 
+## T14 - one body per pm1 key, and the key set is discovered not declared
+
+T13 pinned the key the warm-up state happened to be in. Compiling for
+the OTHERS needs three things, all of which now exist.
+
+**Say the key, don't read it.** `symbolize` takes `pin: &[(Path, Conc)]`
+- slot AND value - so one state compiles for any key. Pinned slots stay
+input cells; nothing in the body reads them, because the constant was
+folded in.
+
+**Make the specialization self-checking.** `iface::pin_guard` builds
+`AND over pins of (cell == value)` and `trace_frame` conjoins it into
+`ok`, never into `guard`. `ok` is the deopt obligation, so a lane whose
+key disagrees goes to the interpreter; `guard` is lane liveness, so
+putting it there would drop the lane from every outcome, which is the
+missing-successor failure. `a_body_pinned_to_a_pm1_key_refuses_any_other_key`
+perturbs each of the six pins in turn and requires the body to decline.
+
+**Discover the key set.** Not the ~1300-entry cross product of the six
+cells' ranges, and not a hand-written list either: trace a frame for a
+key, read the six pm1 slots off each outcome under each of the 64 button
+assignments, and those are the successors. Iterate to a fixpoint.
+
+**It closes at 24 keys.** Same answer at a cap of 64 as at 24 - so the
+walk terminated on its own rather than hitting my limit. 24 bodies,
+102,559 lines, 390 variants total.
+
+Be careful with that sentence: 24 is the fixpoint OF THE SAMPLED
+OPERATOR, and "not the cap" and "not more keys" are different claims. The
+successor of a key depends on the whole input state, not just on the key
+- whether `djump` resets depends on standing on ground, which depends on
+position, which is an ordinary input cell. Step 3 of the walk evaluates
+the six successor nodes at ONE value of those cells (the warm-up state's)
+while varying only the 64 button assignments. So what it computes is the
+keys reachable FROM THIS ONE STATE, and the true set can only be bigger.
+
+A key it is known to miss: `max_djump` is 1 in room (0,0) and 2 later in
+the mountain, and it is an input cell held at 1 throughout the walk - so
+`djump = 2` never appears, and indeed all 24 keys have `djump` in {0, 1}.
+Every block with `djump = 2` in a later room would find no body.
+
+That is affordable only because of `pin_guard`: a key with no body fails
+`ok` and deopts to the interpreter. Missing keys cost speed, not
+correctness. **The key list is a performance decision**, which is the
+only reason a sampled answer stands in for a proved one here.
+
+**How to make it exact, now cheaply.** Evaluate the successor nodes
+ABSTRACTLY instead of at a point: pinned cells at their key values, every
+other cell at TOP, and read each pm1 output's interval - which is exactly
+what `transpile::ival` (T15) does. Enumerating the integers in those
+intervals gives an OVER-approximation: possibly some keys that cannot
+occur (a dead body, harmless) but provably none missed, which is the
+direction that makes the claim worth something. The risk to watch is that
+TOP on position widens `freeze`/`dash_time` enough to enumerate uselessly
+many keys; the answer to that is to bound a few more cells, not to fall
+back to sampling.
+
+### What the per-key sizes say
+
+| key | outcomes | lines | variants |
+|---|---|---|---|
+| steady (`dash_time=0 p_dash=false p_jump=false`) | 4 | 10,261 | 73 |
+| `p_dash=true p_jump=true` | 4 | 4,572 | 19 |
+| `p_dash=true p_jump=false` | 4 | 4,877 | 25 |
+| `p_dash=false p_jump=true` | 4 | 7,420 | 49 |
+| any `dash_time > 0` | 4 | ~4,115 | **7** |
+| any `freeze > 0` | 1 | ~35 | 1 |
+
+The variant count - the thing that costs the search a row to hash and
+dedup - collapses from 73 to 7 the moment the player is mid-dash, and to
+1 while frozen. So pm1 specialization is worth far more on the keys that
+are NOT steady, and T13's -6.3% was measured on the one key where it is
+worth least. Both numbers are right; the -6.3% was the unrepresentative
+one, and I should have said so when I reported it.
+
+## T15 - `transpile::ival`: the interval evaluator was only ever a test
+
+`Graph::eval` evaluates the graph over `Pico8NumInterval` with a
+tri-state Kleene boolean, and it models `Abs` with its sign case split -
+so it has always known that `0 > abs(x)` is false whatever `x` is.
+Nothing folded with it. Every use was in a test.
+
+That gap was visible in the census once it was pointed at the graph that
+SURVIVES the BDD rather than the one that enters it: 1,141 of 2,916
+surviving nodes still evaluated to one value at all 193 probe points, and
+printing the biggest buckets' representatives showed them led by
+`Gt(Const(0), Abs(Flr(..)))` and `Le(Const(0), Abs(Flr(..)))`. The BDD
+cannot see this by construction - a comparison is an opaque atom, so both
+are free variables that could go either way.
+
+**`transpile::ival::fold`** runs the interval evaluator with every input
+at TOP and replaces every node it pins down: booleans it decides, and
+numbers whose interval is a single point. This is EXACT, not merely
+sound - the interval domain over-approximates, so a node reported
+`Bool(Some(b))` under TOP inputs is `b` under every assignment - and
+unlike the equality substitutions in `bdd` it can only IMPROVE abstract
+precision downstream, so the Kleene hazard does not apply.
+
+Two supporting changes it needed:
+
+* `Graph::eval_lenient`: a node the evaluator cannot model becomes TOP
+  for its kind instead of an error. Exact-or-nothing is right for a
+  check and useless for a transformation - one `TileFlagAt` made the
+  whole graph unevaluable, and every traced graph has hundreds. The
+  fallback is in ONE place rather than one per arm, so a new unmodelled
+  op cannot forget to be sound.
+* Checked interval arithmetic (`checked_add`/`checked_sub`/`checked_neg`/
+  `checked_scale_positive`/`checked_div_positive`). At TOP the endpoints
+  wrap, and `from_i64_endpoints` panicked on that by design. Its own
+  comment invited the fix: "if a full-range interval ever becomes
+  legitimate, its closure under wrapping arithmetic is the full interval
+  - add that as an explicit, deliberate case then." The panicking
+  entry points keep panicking; the evaluator uses the checked ones and
+  turns a wrap into TOP.
+
+**Worth, measured on room (0,0) f40 with pm1 pinned:** emitted lines
+10,213 -> 9,304 (-8.9%); surviving nodes 2,916 -> 2,679; still-constant
+1,141 -> 975. The pipeline is interval, then BDD, then interval again,
+because each pass's constants are the other's input.
+
+### What is left, and it is now specific
+
+The residue stopped being a mystery the moment the representatives were
+printed rather than counted.
+
+* **658 nodes, always FALSE**, led by
+  `And(.., TileFlagAt(Add(..), Add(..), Cell(12), Cell(11), Const(0)))`.
+* **232 nodes, always TRUE**, led by
+  `Not(Eq(Const(17), Mget(Add(..), Add(..))))`.
+
+Both are the MAP. `Mget` and `TileFlagAt` are the two ops the interval
+evaluator refuses, so they are the two places TOP enters the graph - and
+the map is a CONSTANT that we have in hand. `Mget` over an interval of
+positions is the set of tile values in that rectangle; `TileFlagAt` over
+an interval span is whether any tile in it carries the flag. Deciding
+those exactly would take 890 of the 975 remaining constant nodes, and it
+needs no new theory - only giving the evaluator the cart it already
+refuses to look at. **That is the next mechanism.**
+
+* **462 + 63 nodes that are NOT constant** - genuine duplication, many
+  copies of `Gt(Sel(..), Const(8388608))`. Same item as the deferred
+  equalities: provably equal, structurally distinct, still blocked on
+  the Kleene-precision question rather than on the ability to prove it.
+
 ## Stage 4 - delete
 
 - `celeste-rewrite` (38k lines) - the crate nothing depends on any more.

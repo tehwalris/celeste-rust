@@ -22,6 +22,7 @@
 pub mod bdd;
 pub mod fuse;
 pub mod graph;
+pub mod ival;
 pub mod kernel;
 pub(crate) mod lower;
 pub mod names;

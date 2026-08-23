@@ -89,10 +89,18 @@ pub fn trace_frame<'a>(
     frame: &'a ast::Ast,
     st: State<Symbolic>,
     roots: &[Path],
-    pin: &[Path],
+    pin: &[(Path, Conc)],
 ) -> Result<Frame> {
     let mut st = st;
+    // One frame has exactly six free choices, `Free(0..5)`. The counter
+    // is on the domain rather than the frame, so tracing a SECOND frame
+    // through one interpreter - which compiling per pm1 key does - would
+    // otherwise run out of buttons on the seventh.
+    it.d.frees = 0;
     let iface = iface::symbolize(&mut it.d, &mut st, roots, pin)?;
+    // Built BEFORE the frame runs, so it names the input cells rather
+    // than whatever the frame did to those slots.
+    let pin_ok = iface::pin_guard(&mut it.d, &iface);
     let st = run_one(it, reset, st)?;
     let mut outs = Vec::new();
     for (s, f) in it.exec_block(frame.nodes(), st)? {
@@ -101,14 +109,58 @@ pub fn trace_frame<'a>(
         }
         let mut s = s;
         s.gc();
+        // The specialization's obligation rides on `ok`: a lane whose
+        // key disagrees with what this body was compiled for deopts to
+        // the interpreter. Folds to `s.ok` when nothing is pinned.
+        let ok = it.d.graph.fold(crate::transpile::graph::Op::And, vec![s.ok, pin_ok]);
         outs.push(FrameOut {
             guard: s.guard,
-            ok: s.ok,
+            ok,
             fields: out_fields(&s)?,
             shape: s.shape()?,
         });
     }
     Ok(Frame { iface, outs })
+}
+
+/// The six cells `Rt2::partition_pm1` splits a block on, as tracer
+/// paths: globals `has_dashed` and `freeze`, and player fields
+/// `dash_time`, `djump`, `p_dash`, `p_jump` (`src/compiled/mod.rs`).
+///
+/// This list is the CONTRACT between the two sides. A body compiled for
+/// a key is dispatchable only to blocks the engine has partitioned on
+/// exactly these cells; drop one here and the guard on `ok` still
+/// catches the mismatch, but every such block deopts instead of running.
+pub fn pm1_paths(player: &Path) -> Vec<Path> {
+    let mut v: Vec<Path> = vec![vec![iface::key("has_dashed")], vec![iface::key("freeze")]];
+    for f in ["dash_time", "djump", "p_dash", "p_jump"] {
+        let mut q = player.clone();
+        q.push(iface::key(f));
+        v.push(q);
+    }
+    v
+}
+
+/// The pm1 key a state is IN: the six paths at the values it holds.
+/// Compiling for a different key means handing `trace_frame` a different
+/// value list, not a different state.
+pub fn pm1_key(player: &Path, st: &State<Symbolic>, d: &Symbolic) -> Result<Vec<(Path, Conc)>> {
+    let mut out = Vec::new();
+    for p in pm1_paths(player) {
+        let c = match iface::get(st, &p) {
+            Some(Value::Num(n)) => Conc::Num(
+                d.as_const(&n)
+                    .ok_or_else(|| anyhow!("pm1 cell {} is symbolic", iface::show(&p)))?,
+            ),
+            Some(Value::Bool(b)) => Conc::Bool(
+                d.decide(&b)
+                    .ok_or_else(|| anyhow!("pm1 cell {} is symbolic", iface::show(&p)))?,
+            ),
+            other => bail!("pm1 cell {} is {:?}, not a scalar", iface::show(&p), other),
+        };
+        out.push((p, c));
+    }
+    Ok(out)
 }
 
 /// Write a concrete button assignment, for the oracle side.
@@ -233,6 +285,307 @@ mod tests {
     /// A PROBE, not a gate: it reports what the emitter said. Every
     /// refusal names something the tracer emits that the emitter cannot
     /// represent, which is the list of work between here and a kernel.
+    /// A body compiled for one pm1 key must REFUSE a state in another.
+    ///
+    /// The pin folds the key's values into the body, so nothing in it
+    /// reads those cells any more - which is exactly how a specialization
+    /// silently runs the wrong physics if the obligation is left implicit.
+    /// `pin_guard` puts it on `ok`, and this is the test that it bites:
+    /// perturb one pinned cell and the frame declines the lane.
+    #[test]
+    fn a_body_pinned_to_a_pm1_key_refuses_any_other_key() {
+        let src = cart::sources().expect("sources");
+        let top = full_moon::parse(&src).expect("parse");
+        let init = full_moon::parse("_init()").expect("parse _init");
+        let reset = full_moon::parse("__reset_button_states()").expect("parse reset");
+        let frame = full_moon::parse("_update()").expect("parse frame");
+        let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
+        let cd =
+            std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
+        let (rx, ry) = celeste_interp::game_runner::start_room();
+        it.cache = Some(std::sync::Arc::new(
+            celeste_core::collision_cache::CollisionCache::new(&cd, rx, ry).expect("cache"),
+        ));
+        it.cart = Some(cd);
+        let st = cart::fresh_state::<Symbolic>(&mut it.d);
+        let mut st = run_one(&mut it, &top, st).expect("toplevel");
+        cart::inject_tile_flag_at(&mut st);
+        let mut st = run_one(&mut it, &init, st).expect("_init");
+        let mut player = None;
+        for _ in 0..40 {
+            if let Some(p) = find_player(&st) {
+                player = Some(p);
+                break;
+            }
+            st = run_one(&mut it, &frame, st).expect("warm-up");
+        }
+        let player = player.expect("a player");
+        let mut roots: Vec<Path> = vec![player.clone()];
+        for g in ["freeze", "has_dashed", "frames", "will_restart", "delay_restart", "max_djump"] {
+            roots.push(vec![iface::key(g)]);
+        }
+        let key = pm1_key(&player, &st, &it.d).expect("pm1 key");
+        assert_eq!(key.len(), 6, "the pm1 key is six cells");
+        let f = trace_frame(&mut it, &reset, &frame, st, &roots, &key).expect("trace");
+        assert_eq!(f.iface.pins.len(), 6, "all six pinned");
+
+        // `ok` of whichever outcome claims this assignment.
+        let bits = [false; 6];
+        let ok_at = |cells: &[Conc]| -> bool {
+            let env = super::super::eval::Env {
+                cells,
+                frees: &bits,
+                cart: it.cart.clone(),
+                cache: it.cache.clone(),
+            };
+            let g = &it.d.graph;
+            let live: Vec<&FrameOut> = f
+                .outs
+                .iter()
+                .filter(|o| super::super::eval::eval(g, o.guard, &env).expect("guard") == Conc::Bool(true))
+                .collect();
+            assert_eq!(live.len(), 1, "exactly one outcome claims a lane");
+            super::super::eval::eval(g, live[0].ok, &env).expect("ok") == Conc::Bool(true)
+        };
+
+        assert!(ok_at(&f.iface.init), "the key it was compiled for is accepted");
+
+        for (i, c) in &f.iface.pins {
+            let mut cells = f.iface.init.clone();
+            cells[*i] = match c {
+                Conc::Num(v) => Conc::Num(*v + crate::pico8_num::Pico8Num::from_parts(1, 0)),
+                Conc::Bool(b) => Conc::Bool(!*b),
+            };
+            assert!(
+                !ok_at(&cells),
+                "{} moved off its pin and the body still accepted the lane",
+                iface::show(&f.iface.slots[*i])
+            );
+        }
+    }
+
+    /// COMPILE FOR EVERY KEY, not just the one the warm-up state is in.
+    ///
+    /// The key set is not declared, it is DISCOVERED: trace a frame for a
+    /// key, read the six pm1 slots off each outcome under each of the 64
+    /// button assignments, and those are the successor keys. Iterate to a
+    /// fixpoint. That is the set of keys the game can actually be in, as
+    /// opposed to the ~1300-entry cross product of the six cells' ranges,
+    /// almost all of which never occur.
+    ///
+    /// It is an UNDER-approximation twice over - successors are read at
+    /// one input point per key, and the walk starts from one state - and
+    /// that is affordable precisely because of `pin_guard`. A key that is
+    /// missed has no body, so its blocks deopt to the interpreter: slower,
+    /// never wrong. The key list is a performance decision, not a
+    /// correctness one, and that is the whole reason it is allowed to be
+    /// discovered by sampling.
+    /// ~4 min: it traces and lowers one frame per key. `#[ignore]`d so
+    /// the edit loop stays usable; still a gate under `--run-ignored all`.
+    #[test]
+    #[ignore]
+    fn every_reachable_pm1_key_gets_its_own_body() {
+        const CAP: usize = 64;
+        let src = cart::sources().expect("sources");
+        let top = full_moon::parse(&src).expect("parse");
+        let init = full_moon::parse("_init()").expect("parse _init");
+        let reset = full_moon::parse("__reset_button_states()").expect("parse reset");
+        let frame = full_moon::parse("_update()").expect("parse frame");
+        let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
+        let cd =
+            std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
+        let (rx, ry) = celeste_interp::game_runner::start_room();
+        it.cache = Some(std::sync::Arc::new(
+            celeste_core::collision_cache::CollisionCache::new(&cd, rx, ry).expect("cache"),
+        ));
+        it.cart = Some(cd);
+        let st = cart::fresh_state::<Symbolic>(&mut it.d);
+        let mut st = run_one(&mut it, &top, st).expect("toplevel");
+        cart::inject_tile_flag_at(&mut st);
+        let mut st = run_one(&mut it, &init, st).expect("_init");
+        let mut player = None;
+        for _ in 0..40 {
+            if let Some(p) = find_player(&st) {
+                player = Some(p);
+                break;
+            }
+            st = match run_one(&mut it, &frame, st) {
+                Ok(s) => s,
+                Err(e) => return eprintln!("[keys] warm-up stopped at: {:#}", e),
+            };
+        }
+        let Some(player) = player else { return eprintln!("[keys] no player") };
+        let paths = pm1_paths(&player);
+        let mut roots: Vec<Path> = vec![player.clone()];
+        for g in ["freeze", "has_dashed", "frames", "will_restart", "delay_restart", "max_djump"] {
+            roots.push(vec![iface::key(g)]);
+        }
+
+        let k0: Vec<Conc> = match pm1_key(&player, &st, &it.d) {
+            Ok(k) => k.into_iter().map(|(_, c)| c).collect(),
+            Err(e) => return eprintln!("[keys] pm1 key: {:#}", e),
+        };
+        let show_key = |k: &[Conc]| -> String {
+            paths
+                .iter()
+                .zip(k)
+                .map(|(p, c)| {
+                    let name = iface::show(p);
+                    let name = name.rsplit('.').next().unwrap().to_string();
+                    match c {
+                        Conc::Num(v) => format!("{}={}", name, v.as_i16_or_err().unwrap_or(-999)),
+                        Conc::Bool(b) => format!("{}={}", name, b),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+
+        // The fixpoint. `frames` holds one traced body per key, all into
+        // ONE graph so they share subexpressions - which is also what
+        // makes lowering them comparable.
+        let mut queue: Vec<Vec<Conc>> = vec![k0.clone()];
+        let mut seen: Vec<Vec<Conc>> = vec![k0];
+        let mut bodies: Vec<(Vec<Conc>, Frame)> = Vec::new();
+        let mut dropped = 0usize;
+        let mut unresolved = 0usize;
+        while let Some(key) = queue.pop() {
+            let pin: Vec<(Path, Conc)> =
+                paths.iter().cloned().zip(key.iter().copied()).collect();
+            let f = match trace_frame(&mut it, &reset, &frame, st.clone(), &roots, &pin) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("[keys] {} REFUSED: {:#}", show_key(&key), e);
+                    continue;
+                }
+            };
+            // Successors: where does a frame from this key land?
+            for m in 0u8..64 {
+                let bits = [
+                    m & 1 != 0,
+                    m & 2 != 0,
+                    m & 4 != 0,
+                    m & 8 != 0,
+                    m & 16 != 0,
+                    m & 32 != 0,
+                ];
+                let env = super::super::eval::Env {
+                    cells: &f.iface.init,
+                    frees: &bits,
+                    cart: it.cart.clone(),
+                    cache: it.cache.clone(),
+                };
+                for o in &f.outs {
+                    if super::super::eval::eval(&it.d.graph, o.guard, &env).ok()
+                        != Some(Conc::Bool(true))
+                    {
+                        continue;
+                    }
+                    let mut next = Vec::new();
+                    for p in &paths {
+                        match o.fields.iter().find(|(q, _, _)| q == p) {
+                            Some((_, nd, _)) => {
+                                match super::super::eval::eval(&it.d.graph, *nd, &env) {
+                                    Ok(c) => next.push(c),
+                                    Err(_) => break,
+                                }
+                            }
+                            // Death replaces the player, so a pm1 field
+                            // can simply not be there. That successor is
+                            // a SHAPE change, not a key change.
+                            None => break,
+                        }
+                    }
+                    if next.len() != paths.len() {
+                        unresolved += 1;
+                        continue;
+                    }
+                    if seen.contains(&next) {
+                        continue;
+                    }
+                    if seen.len() >= CAP {
+                        dropped += 1;
+                        continue;
+                    }
+                    seen.push(next.clone());
+                    queue.push(next);
+                }
+            }
+            bodies.push((key, f));
+        }
+
+        eprintln!(
+            "[keys] {} keys reached from {} traced bodies ({} successors unresolved by shape,              {} dropped at the cap of {})",
+            seen.len(),
+            bodies.len(),
+            unresolved,
+            dropped,
+            CAP
+        );
+        assert_eq!(dropped, 0, "the key walk hit its cap - raise CAP or the set is not closed");
+
+        let g = std::mem::take(&mut it.d.graph);
+        let mut inputs: Vec<(u32, &'static str)> = Vec::new();
+        let mut uni: Vec<(u32, &'static str)> = Vec::new();
+        let sample = &bodies[0].1.iface;
+        for (i, c) in sample.init.iter().enumerate() {
+            let kind = match c {
+                Conc::Num(_) => "num",
+                Conc::Bool(_) => "bool",
+            };
+            if iface::show(&sample.slots[i]).contains(".hitbox.") {
+                uni.push((i as u32, kind));
+            } else {
+                inputs.push((i as u32, kind));
+            }
+        }
+        let base = inputs.len() as u32;
+
+        let mut total_lines = 0usize;
+        let mut total_variants = 0usize;
+        let mut refused = 0usize;
+        for (key, f) in &bodies {
+            let mut lines = 0usize;
+            let mut variants = 0usize;
+            for o in &f.outs {
+                let outputs: Vec<(u32, crate::transpile::graph::NodeId, &'static str)> = o
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (p, _, _))| !iface::show(p).starts_with("__button_states"))
+                    .map(|(i, (_, node, is_bool))| {
+                        (base + i as u32, *node, if *is_bool { "ZB" } else { "ZN" })
+                    })
+                    .collect();
+                match super::super::emit::lower_frame(
+                    &g, &inputs, &uni, &outputs, o.guard, o.ok,
+                ) {
+                    Ok(l) => {
+                        lines += l.body.len();
+                        variants += l.variants;
+                    }
+                    Err(_) => refused += 1,
+                }
+            }
+            eprintln!(
+                "[keys] {:<64} {} outcomes, {} lines, {} variants",
+                show_key(key),
+                f.outs.len(),
+                lines,
+                variants
+            );
+            total_lines += lines;
+            total_variants += variants;
+        }
+        eprintln!(
+            "[keys] TOTAL {} bodies, {} lines, {} variants, {} outcomes refused by the emitter",
+            bodies.len(),
+            total_lines,
+            total_variants,
+            refused
+        );
+    }
+
     #[test]
     fn the_kernel_emitter_lowers_a_traced_graph() {
         let src = cart::sources().expect("sources");
@@ -272,25 +625,21 @@ mod tests {
         for g in ["freeze", "has_dashed", "frames", "will_restart", "delay_restart", "max_djump"] {
             roots.push(vec![iface::key(g)]);
         }
-        // The pm1 CLASS specialization, said in the tracer's vocabulary.
-        // `partition_pm1` guarantees every lane of a block agrees on
-        // these six cells, so pinning them is exact for the block the
-        // kernel binds to - and the dispatcher's class guard is what
-        // rejects a block that disagrees. This is the same constant
-        // injection the recipe pipeline does via the certified overlay;
-        // here it is six paths.
-        let mut pin: Vec<Path> = vec![vec![iface::key("freeze")], vec![iface::key("has_dashed")]];
-        for f in ["dash_time", "djump", "p_dash", "p_jump"] {
-            let mut q = player.clone();
-            q.push(iface::key(f));
-            pin.push(q);
-        }
+        // The pm1 CLASS specialization. `partition_pm1` makes every lane
+        // of a block agree on these six cells, so a body compiled for one
+        // key is exact for the blocks that hold it - and `pin_guard` puts
+        // the check on `ok`, so a block that disagrees deopts instead of
+        // running the wrong physics.
+        let pin = match pm1_key(&player, &st, &it.d) {
+            Ok(k) => k,
+            Err(e) => return eprintln!("[emit] pm1 key: {:#}", e),
+        };
         let f = match trace_frame(&mut it, &reset, &frame, st, &roots, &pin) {
             Ok(f) => f,
             Err(e) => return eprintln!("[emit] trace stopped at: {:#}", e),
         };
-        for (p, c) in &f.iface.pinned {
-            eprintln!("[emit] pinned {} = {:?}", iface::show(p), c);
+        for (i, c) in &f.iface.pins {
+            eprintln!("[emit] pinned {} = {:?}", iface::show(&f.iface.slots[*i]), c);
         }
 
         // The tracer's OWN numbering: input cells are `Op::Cell(i)` in
@@ -731,6 +1080,150 @@ mod tests {
                         let mut sh: Vec<_> = shapes.into_iter().collect();
                         sh.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
                         eprintln!("[emit]   SOURCE SHAPES: {:?}", sh);
+
+                        // WHAT SURVIVES THE DECISION PROCEDURE.
+                        //
+                        // Everything above is measured on the graph
+                        // BEFORE the BDD pass, so it sizes the
+                        // opportunity, not the residue. Re-fingerprinting
+                        // the SIMPLIFIED graph at the same points says
+                        // how much the decision procedure actually took -
+                        // and printing the biggest surviving buckets says
+                        // what a next mechanism would have to understand,
+                        // which is the only way to choose one.
+                        {
+                            let mut rts: Vec<crate::transpile::graph::NodeId> = Vec::new();
+                            for m in 0..64usize {
+                                for (_, nd, _) in &o.fields {
+                                    rts.push(maps[m][*nd as usize]);
+                                }
+                                rts.push(maps[m][o.ok as usize]);
+                                rts.push(maps[m][o.guard as usize]);
+                            }
+                            // THE PIPELINE, in the order the two passes
+                            // feed each other: interval folding decides
+                            // value-range facts the BDD cannot see (`0 >
+                            // abs(x)`), the BDD propagates them through
+                            // boolean algebra, and a second interval pass
+                            // sees the comparisons that collapsed as a
+                            // result.
+                            let (g1, m1, si1) =
+                                crate::transpile::ival::fold(&sp, &rts).expect("ival");
+                            let r1: Vec<crate::transpile::graph::NodeId> =
+                                rts.iter().map(|r| m1[*r as usize]).collect();
+                            let (g2, m2, _) = crate::transpile::bdd::simplify_until_stable(
+                                &g1,
+                                &r1,
+                                1 << 22,
+                                4,
+                            );
+                            let r2: Vec<crate::transpile::graph::NodeId> =
+                                r1.iter().map(|r| m2[*r as usize]).collect();
+                            let (sp2, m3, si2) =
+                                crate::transpile::ival::fold(&g2, &r2).expect("ival 2");
+                            eprintln!(
+                                "[emit]   IVAL+BDD: {} -> {} (ival: {} bools, {} nums) -> {} \
+                                 (bdd) -> {} (ival again: {} bools, {} nums)",
+                                si1.before, si1.after, si1.bools, si1.nums,
+                                g2.len(), si2.after, si2.bools, si2.nums
+                            );
+                            let nm: Vec<crate::transpile::graph::NodeId> = (0..sp.len())
+                                .map(|i| {
+                                    let a = m1[i];
+                                    if a == crate::transpile::bdd::UNREACHABLE {
+                                        return a;
+                                    }
+                                    let b = m2[a as usize];
+                                    if b == crate::transpile::bdd::UNREACHABLE {
+                                        return b;
+                                    }
+                                    m3[b as usize]
+                                })
+                                .collect();
+                            let mut seen2 = std::collections::BTreeSet::new();
+                            let mut stack2: Vec<crate::transpile::graph::NodeId> =
+                                rts.iter().map(|r| nm[*r as usize]).collect();
+                            while let Some(x) = stack2.pop() {
+                                if !seen2.insert(x) {
+                                    continue;
+                                }
+                                stack2.extend(sp2.get(x).args.iter().copied());
+                            }
+                            let mut cols2: Vec<Vec<Option<Conc>>> = Vec::new();
+                            for pt in &probe_pts {
+                                let env = super::super::eval::Env {
+                                    cells: pt,
+                                    frees: &[false; 6],
+                                    cart: it.cart.clone(),
+                                    cache: it.cache.clone(),
+                                };
+                                cols2.push(super::super::eval::eval_all(&sp2, &env));
+                            }
+                            let mut b2: std::collections::HashMap<
+                                Vec<Option<(u8, i32)>>,
+                                Vec<crate::transpile::graph::NodeId>,
+                            > = Default::default();
+                            let (mut live2, mut const2) = (0usize, 0usize);
+                            for id in seen2.iter().copied() {
+                                let fp: Vec<Option<(u8, i32)>> = cols2
+                                    .iter()
+                                    .map(|c| {
+                                        c[id as usize].map(|v| match v {
+                                            Conc::Num(x) => (0u8, x.as_raw_u32() as i32),
+                                            Conc::Bool(b) => (1u8, b as i32),
+                                        })
+                                    })
+                                    .collect();
+                                if fp.iter().all(|x| x.is_none()) {
+                                    continue;
+                                }
+                                live2 += 1;
+                                if fp.iter().all(|x| *x == fp[0]) {
+                                    const2 += 1;
+                                }
+                                b2.entry(fp).or_default().push(id);
+                            }
+                            eprintln!(
+                                "[emit]   SURVIVING: {} nodes evaluate somewhere, {} distinct \
+                                 fingerprints ({:.0}% of them), {} ({:.0}%) STILL constant over \
+                                 all {} points after the BDD had its say",
+                                live2,
+                                b2.len(),
+                                100.0 * b2.len() as f64 / live2.max(1) as f64,
+                                const2,
+                                100.0 * const2 as f64 / live2.max(1) as f64,
+                                probe_pts.len()
+                            );
+                            let mut big: Vec<_> = b2.iter().collect();
+                            big.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
+                            for (fp, ids) in big.iter().take(4) {
+                                let mut ops: std::collections::BTreeMap<String, usize> =
+                                    Default::default();
+                                for id in ids.iter() {
+                                    *ops.entry(format!("{:?}", sp2.get(*id).op)).or_default() += 1;
+                                }
+                                let mut top: Vec<_> = ops.into_iter().collect();
+                                top.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+                                eprintln!(
+                                    "[emit]     SURVIVING bucket of {}: value {:?}, constant = {}, \
+                                     ops {:?}",
+                                    ids.len(),
+                                    fp[0],
+                                    fp.iter().all(|x| *x == fp[0]),
+                                    &top[..top.len().min(4)]
+                                );
+                                // The thing itself. Two representatives,
+                                // because one example of a 3,000-node
+                                // bucket says nothing about the bucket.
+                                for id in ids.iter().take(2) {
+                                    eprintln!(
+                                        "[emit]       #{} = {}",
+                                        id,
+                                        super::super::emit::show_tree(&sp2, *id, 4)
+                                    );
+                                }
+                            }
+                        }
                         for id in others {
                             eprintln!(
                                 "[emit]     unclassified {:?} = {}",

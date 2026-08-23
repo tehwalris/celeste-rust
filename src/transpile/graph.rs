@@ -28,7 +28,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 
 use celeste_core::pico8_num::{Pico8Num, Pico8NumInterval};
 
@@ -532,16 +532,49 @@ impl Graph {
     /// Nodes are appended after their operands, so a forward sweep is a
     /// valid evaluation order.
     pub fn eval(&self, cells: &HashMap<u32, Val>) -> Result<Vec<Val>> {
+        self.eval_inner(cells, false)
+    }
+
+    /// The same evaluator, but a node it cannot model becomes TOP for its
+    /// kind instead of an error.
+    ///
+    /// `eval` is exact-or-nothing, which is right for a check and useless
+    /// for a transformation: one `TileFlagAt` anywhere makes the whole
+    /// graph unevaluable, and every real traced graph has hundreds. Top
+    /// is the sound answer - "this node could be anything" - so every
+    /// value derived from one stays sound, and the nodes that do NOT
+    /// depend on it are still decided.
+    ///
+    /// Deliberately the same match arm-for-arm rather than a second
+    /// evaluator: two implementations of `Abs` over intervals is exactly
+    /// the kind of divergence that is impossible to notice.
+    pub fn eval_lenient(&self, cells: &HashMap<u32, Val>) -> Result<Vec<Val>> {
+        self.eval_inner(cells, true)
+    }
+
+    fn eval_inner(&self, cells: &HashMap<u32, Val>, lenient: bool) -> Result<Vec<Val>> {
+        let full = Val::Num(Pico8NumInterval::new(
+            Pico8Num::from_raw(i32::MIN),
+            Pico8Num::from_raw(i32::MAX),
+        ));
         let mut out: Vec<Val> = Vec::with_capacity(self.nodes.len());
         for (i, node) in self.nodes.iter().enumerate() {
             let a = |k: usize| -> Val { out[node.args[k] as usize] };
-            let v = match &node.op {
+            let computed = (|| -> Result<Val> {
+                Ok(match &node.op {
                 Op::Const(lo, hi) => Val::Num(Pico8NumInterval::new(
                     Pico8Num::from_raw(*lo),
                     Pico8Num::from_raw(*hi),
                 )),
                 Op::ConstBool(b) => Val::Bool(Some(*b)),
                 Op::Free(b) => bail!("node {}: free choice {} has no value outside a variant", i, b),
+                // A split RESTRICTS its operand, so under `lenient` the
+                // operand's own range still contains the result - which
+                // is strictly better than top and costs nothing.
+                Op::Split(d) if lenient => {
+                    let _ = d;
+                    a(0)
+                }
                 Op::Split(d) | Op::SplitValid(d) => {
                     bail!("node {}: split {} has no value outside an outcome", i, d)
                 }
@@ -550,12 +583,29 @@ impl Graph {
                     Some(v) => *v,
                     None => bail!("node {}: input cell {} was not supplied", i, c),
                 },
-                Op::Add => Val::Num(a(0).as_num("Add")? + a(1).as_num("Add")?),
-                Op::Sub => Val::Num(a(0).as_num("Sub")? - a(1).as_num("Sub")?),
-                Op::Neg => {
-                    let x = a(0).as_num("Neg")?;
-                    Val::Num(Pico8NumInterval::new(-x.high, -x.low))
-                }
+                // CHECKED, because this evaluator runs with inputs at
+                // TOP on purpose (`transpile::ival`) and a wrap there is
+                // expected rather than a modeling bug. An evaluator that
+                // panics on its own intended input is not usable as a
+                // transformation.
+                Op::Add => Val::Num(
+                    a(0)
+                        .as_num("Add")?
+                        .checked_add(a(1).as_num("Add")?)
+                        .ok_or_else(|| anyhow!("node {}: Add wrapped", i))?,
+                ),
+                Op::Sub => Val::Num(
+                    a(0)
+                        .as_num("Sub")?
+                        .checked_sub(a(1).as_num("Sub")?)
+                        .ok_or_else(|| anyhow!("node {}: Sub wrapped", i))?,
+                ),
+                Op::Neg => Val::Num(
+                    a(0)
+                        .as_num("Neg")?
+                        .checked_neg()
+                        .ok_or_else(|| anyhow!("node {}: Neg wrapped", i))?,
+                ),
                 Op::Mul | Op::Div | Op::Rem => Self::arith(&node.op, a(0), a(1))?,
                 Op::Abs => {
                     let x = a(0).as_num("Abs")?;
@@ -631,10 +681,51 @@ impl Graph {
                 Op::Mget | Op::TileFlagAt => {
                     bail!("{:?} needs the cart; not supported by the pure evaluator yet", node.op)
                 }
+                })
+            })();
+            // ONE place where `lenient` acts, rather than one per arm:
+            // whatever the reason a node cannot be modelled, TOP for its
+            // kind is the sound answer, and centralizing it means a new
+            // unmodelled case cannot forget to be sound.
+            let v = match computed {
+                Ok(v) => v,
+                Err(e) => {
+                    if !lenient {
+                        return Err(e);
+                    }
+                    Self::top_of(&node.op, &node.args, &out, full)
+                }
             };
             out.push(v);
         }
         Ok(out)
+    }
+
+    /// The weakest value a node of this op could have: `Bool(None)` for
+    /// the ops that produce booleans, the full numeric range otherwise.
+    /// `Sel` follows its branches, since it produces whatever they do.
+    fn top_of(op: &Op, args: &[NodeId], out: &[Val], full: Val) -> Val {
+        match op {
+            Op::ConstBool(_)
+            | Op::Free(_)
+            | Op::SplitValid(_)
+            | Op::SplitOk
+            | Op::Lt
+            | Op::Le
+            | Op::Gt
+            | Op::Ge
+            | Op::Eq
+            | Op::Not
+            | Op::And
+            | Op::Or
+            | Op::Known
+            | Op::TileFlagAt => Val::Bool(None),
+            Op::Sel => match args.get(1).map(|x| out[*x as usize]) {
+                Some(Val::Bool(_)) => Val::Bool(None),
+                _ => full,
+            },
+            _ => full,
+        }
     }
 
     fn arith(op: &Op, x: Val, y: Val) -> Result<Val> {
@@ -656,9 +747,15 @@ impl Graph {
         if scalar <= Pico8Num::from_i16(0) {
             bail!("{:?} by a non-positive scalar is not modelled", op);
         }
+        // Checked for the same reason as `Add`: at TOP a scale wraps,
+        // and the caller that wants that has a sound answer for it.
         Ok(Val::Num(match op {
-            Op::Mul => xi.scale_positive(scalar),
-            Op::Div => xi.div_positive(scalar),
+            Op::Mul => xi
+                .checked_scale_positive(scalar)
+                .ok_or_else(|| anyhow!("Mul over an interval wrapped"))?,
+            Op::Div => xi
+                .checked_div_positive(scalar)
+                .ok_or_else(|| anyhow!("Div over an interval wrapped"))?,
             Op::Rem => bail!("Rem over an interval is not modelled"),
             _ => unreachable!(),
         }))

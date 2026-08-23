@@ -21,7 +21,7 @@ use std::collections::BTreeSet;
 use anyhow::{anyhow, bail, Result};
 
 use crate::pico8_num::Pico8Num as P8;
-use crate::transpile::graph::Op;
+use crate::transpile::graph::{NodeId, Op};
 
 use super::domain::{Domain, Symbolic};
 use super::heap::Value;
@@ -171,15 +171,14 @@ fn collect<D: Domain>(
 /// The input cells of one traced frame: cell `i` lives at `slots[i]` and
 /// held `init[i]` before it was replaced by a graph leaf.
 ///
-/// `pinned` is the other half of the same decision: slots under `roots`
-/// that were left CONCRETE, and the value they were left at. A pin is a
-/// specialization - the resulting graph is only valid for states that
-/// agree with it - so it is recorded rather than implied, and a caller
-/// that pins has to say what guards the pin at runtime.
+/// `pins` is the specialization: `(cell index, value)` for inputs whose
+/// value was BAKED INTO the body instead of being read from the cell.
+/// The cell still exists and is still an input - that is what lets
+/// `pin_guard` build the runtime check that the state actually agrees.
 pub struct Iface {
     pub slots: Vec<Path>,
     pub init: Vec<Conc>,
-    pub pinned: Vec<(Path, Conc)>,
+    pub pins: Vec<(usize, Conc)>,
 }
 
 /// Replace every scalar under `roots` with a fresh `Op::Cell` leaf, and
@@ -195,67 +194,101 @@ pub struct Iface {
 /// Overlapping roots are fine: a slot reached twice gets one cell, and
 /// the cell numbering follows the order the roots are given in.
 ///
-/// `pin` names slots to leave concrete even though a root reaches them,
-/// by PATH PREFIX: pinning `objects[0].hitbox` pins `.w` and `.h`. This
-/// is how a class specialization is expressed - the recipe pipeline's
-/// steady kernel is "freeze = 0, dash_time = 0" folded in at emit time,
-/// and the tracer says the same thing by pinning those two slots.
+/// `pin` is a KEY: slots to hold at a stated value rather than read from
+/// a cell, so the trace folds through the constant. This is how a class
+/// specialization is expressed - "compile this frame for freeze = 0,
+/// dash_time = 0" is six entries. The value is the CALLER's, not the
+/// state's, so one state can be compiled for several keys.
+///
+/// A pinned slot is still an input cell. Nothing in the body reads it -
+/// the constant was folded in - but `pin_guard` reads it, which is what
+/// turns "this body assumes freeze = 0" from a comment into a check.
 pub fn symbolize(
     d: &mut Symbolic,
     st: &mut State<Symbolic>,
     roots: &[Path],
-    pin: &[Path],
+    pin: &[(Path, Conc)],
 ) -> Result<Iface> {
     let mut slots: Vec<Path> = Vec::new();
-    let mut pinned_paths: Vec<Path> = Vec::new();
     for r in roots {
         for p in scalars(st, r)? {
-            if pin.iter().any(|q| p.starts_with(q)) {
-                if !pinned_paths.contains(&p) {
-                    pinned_paths.push(p);
-                }
-            } else if !slots.contains(&p) {
+            if !slots.contains(&p) {
                 slots.push(p);
             }
         }
     }
-    let mut pinned = Vec::new();
-    for p in pinned_paths {
-        let c = match get(st, &p).unwrap() {
-            Value::Num(n) => Conc::Num(
-                d.as_const(&n)
-                    .ok_or_else(|| anyhow!("pinned {} was already symbolic", show(&p)))?,
-            ),
-            Value::Bool(b) => Conc::Bool(
-                d.decide(&b)
-                    .ok_or_else(|| anyhow!("pinned {} was already symbolic", show(&p)))?,
-            ),
-            other => bail!("pinned {} is {:?}, not a scalar", show(&p), other),
-        };
-        pinned.push((p, c));
+    let mut pins: Vec<(usize, Conc)> = Vec::new();
+    for (p, c) in pin {
+        let i = slots
+            .iter()
+            .position(|q| q == p)
+            .ok_or_else(|| anyhow!("pinned {} is not an input slot", show(p)))?;
+        if pins.iter().any(|(j, _)| *j == i) {
+            bail!("{} pinned twice", show(p));
+        }
+        pins.push((i, *c));
     }
     let mut init = Vec::new();
     for (i, p) in slots.iter().enumerate() {
+        let pinned = pins.iter().find(|(j, _)| *j == i).map(|(_, c)| *c);
         let cell = d.graph.leaf(Op::Cell(i as u32));
-        let (c, new) = match get(st, p).unwrap() {
-            Value::Num(n) => {
-                let k = d
-                    .as_const(&n)
-                    .ok_or_else(|| anyhow!("{} was already symbolic", show(p)))?;
-                (Conc::Num(k), Value::Num(cell))
-            }
-            Value::Bool(b) => {
-                let k = d
-                    .decide(&b)
-                    .ok_or_else(|| anyhow!("{} was already symbolic", show(p)))?;
-                (Conc::Bool(k), Value::Bool(cell))
-            }
+        let held = match get(st, p).unwrap() {
+            Value::Num(n) => Conc::Num(
+                d.as_const(&n)
+                    .ok_or_else(|| anyhow!("{} was already symbolic", show(p)))?,
+            ),
+            Value::Bool(b) => Conc::Bool(
+                d.decide(&b)
+                    .ok_or_else(|| anyhow!("{} was already symbolic", show(p)))?,
+            ),
             other => bail!("{} is {:?}, not a scalar", show(p), other),
+        };
+        let (c, new) = match (pinned, held) {
+            // Pinned: keep it concrete, at the KEY's value.
+            (Some(Conc::Num(v)), Conc::Num(_)) => {
+                let n = d.num(v);
+                (Conc::Num(v), Value::Num(n))
+            }
+            (Some(Conc::Bool(v)), Conc::Bool(_)) => {
+                let b = d.boolean(v);
+                (Conc::Bool(v), Value::Bool(b))
+            }
+            (Some(v), h) => bail!("{}: pinned {:?} but the slot holds {:?}", show(p), v, h),
+            // Not pinned: the slot becomes the cell.
+            (None, Conc::Num(v)) => (Conc::Num(v), Value::Num(cell)),
+            (None, Conc::Bool(v)) => (Conc::Bool(v), Value::Bool(cell)),
         };
         init.push(c);
         set(st, p, new)?;
     }
-    Ok(Iface { slots, init, pinned })
+    Ok(Iface { slots, init, pins })
+}
+
+/// The obligation a pinned body carries: every pinned cell holds the
+/// value the body was compiled for.
+///
+/// Conjoin this into `ok`, not into `guard`. A lane whose key disagrees
+/// is a REAL lane that this body cannot run - the interpreter has to
+/// take it - and that is what `ok` means. Putting it in `guard` would
+/// silently drop the lane from every outcome, which is the missing-
+/// successor failure the whole boolean split exists to prevent.
+///
+/// Returns `ConstBool(true)` when nothing is pinned, which folds away.
+pub fn pin_guard(d: &mut Symbolic, iface: &Iface) -> NodeId {
+    let mut acc = d.graph.leaf(Op::ConstBool(true));
+    for (i, c) in &iface.pins {
+        let cell = d.graph.leaf(Op::Cell(*i as u32));
+        let t = match c {
+            Conc::Num(v) => {
+                let k = d.num(*v);
+                d.graph.fold(Op::Eq, vec![cell, k])
+            }
+            Conc::Bool(true) => cell,
+            Conc::Bool(false) => d.graph.fold(Op::Not, vec![cell]),
+        };
+        acc = d.graph.fold(Op::And, vec![acc, t]);
+    }
+    acc
 }
 
 /// Read every scalar under `root` as a CONCRETE value. This is what the

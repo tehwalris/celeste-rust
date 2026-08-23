@@ -73,8 +73,8 @@ accidental blowup kills the process rather than the machine.
 
 ```bash
 cargo nextest run <filter>                                      # DEV LOOP, 1.3 s
-./safe-run.sh -- cargo nextest run --cargo-profile quick         # full, 47 s
-./safe-run.sh -- cargo nextest run --release --run-ignored all  # THE GATE
+./safe-run.sh -- cargo nextest run --cargo-profile quick         # PRE-COMMIT, 47 s
+./safe-run.sh -- cargo nextest run --cargo-profile quick --run-ignored all  # rare, ~6 min
 ./safe-run.sh -- ./target/release/celeste-rust -n 40
 ```
 
@@ -88,7 +88,9 @@ habit. Measured 2026-08-22, after the crate split:
 |---|---|---|
 | "did my edit compile and does its unit test pass" | `cargo nextest run <filter>` (DEBUG) | **1.3 s** after an edit, 0.2 s no-op |
 | "does the whole suite still pass" | `cargo nextest run --cargo-profile quick` | **47 s** build + run |
-| the pre-commit gate, and anything you will quote a number from | `--release --run-ignored all` | ~110 s build + ~250 s |
+| the pre-commit run | `cargo nextest run --cargo-profile quick` | **47 s**, same as above |
+| anything you will quote a NUMBER from | `--release` | ~110 s build + run |
+| deliberately re-checking the generated files / recipes | `--cargo-profile quick --run-ignored all` | ~6 min |
 
 **Never use `--release` for unit tests.** This is the actual trap. The
 release profile is `lto = "fat"` + `codegen-units = 1`, so a one-line edit
@@ -134,18 +136,34 @@ result. Add a profile instead.
   parallel). If you only need ONE kernel, call `transpile` directly
   instead of running the whole script.
 
-Three slow tests are `#[ignore]`d so the default run is 18 s rather than
-204 s: `every_checked_in_recipe_replays` (~200 s) and
-`generated_is_current{,_r20}` (~44 s / ~70 s). They are still GATES - the
-pre-commit run must use `--run-ignored all`. `#[ignore]` over an env
-check on purpose: nextest prints them as skipped, so the skip is visible
-rather than silent.
+**The pre-commit run is `--cargo-profile quick`, and it does NOT include
+the ignored tests.** `--release` is for numbers only; gating correctness
+under fat LTO costs ~110 s of relink to run tests that execute in
+milliseconds, and it contradicts "never use `--release` for unit tests"
+three lines above.
 
-`--run-ignored all` matters: `every_checked_in_recipe_replays` replays
-every recipe end to end, costs ~200 s by itself, and is `#[ignore]`d so
-the edit loop stays usable. It is the only thing that catches a broken
-checked-in recipe, so the PRE-COMMIT run must include it. nextest prints
-ignored tests as skipped, so the skip is visible rather than silent.
+Three slow tests are `#[ignore]`d: `every_checked_in_recipe_replays`
+(~200 s), and `generated_is_current{,_r20}` (~44 s / ~70 s), plus
+`every_reachable_pm1_key_gets_its_own_body` (~240 s). `#[ignore]` over an
+env check on purpose: nextest prints them as skipped, so the skip is
+visible rather than silent.
+
+**They are not run on every commit** (Philippe, 2026-08-23): they cost
+~6 min, and the expected cost of occasionally breaking one and bisecting
+back to it is lower than paying that on every commit. Run them when you
+have a REASON to think they will fire:
+
+- touched an emitter, `transpile::names`, or anything feeding the
+  generated files -> `generated_is_current` (this one has already caught
+  a real stale-kernel commit, `a8f4635`, so treat any emitter change as
+  a reason);
+- touched the rewrite rules or a checked-in recipe ->
+  `every_checked_in_recipe_replays`, the only thing that replays them;
+- touched the tracer's pinning or key walk ->
+  `every_reachable_pm1_key_gets_its_own_body`.
+
+Do NOT read past the "N skipped" line and call the suite green when one
+of those reasons applies. That is the exact mistake behind `a8f4635`.
 
 Run the suite with NEXTEST, never bare `cargo test --release`: the tests
 are fine (21 s wall for all 515 under nextest, 2026-08-16) but several

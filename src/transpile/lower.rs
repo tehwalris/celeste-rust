@@ -726,18 +726,29 @@ pub(crate) fn emit_body(e: &mut Emit, of: &mut OutFields) -> Result<()> {
             roots.push(maps[m][e.ok as usize]);
             roots.push(maps[m][e.live as usize]);
         }
-        let (sp2, nodemap, _) =
-            crate::transpile::bdd::simplify_until_stable(&sp, &roots, 1 << 22, 4);
+        // INTERVAL, then BOOLEAN, then INTERVAL. The two decide disjoint
+        // things - `ival` knows `abs` is non-negative and the BDD does
+        // not; the BDD knows `x and not x` is false and `ival` does not -
+        // and each one's constants are the other's input, so the second
+        // interval pass sees comparisons that only collapsed because the
+        // BDD folded a select away.
+        let (g1, m1, _) = crate::transpile::ival::fold(&sp, &roots).expect("interval fold");
+        let r1: Vec<NodeId> = roots.iter().map(|r| m1[*r as usize]).collect();
+        let (g2, m2, _) =
+            crate::transpile::bdd::simplify_until_stable(&g1, &r1, 1 << 22, 4);
+        let r2: Vec<NodeId> = r1.iter().map(|r| m2[*r as usize]).collect();
+        let (sp2, m3, _) = crate::transpile::ival::fold(&g2, &r2).expect("interval fold 2");
+        let nodemap = |x: NodeId| -> NodeId { m3[m2[m1[x as usize] as usize] as usize] };
         // Only the roots are remapped, because only the roots are read.
         // Anything else would be `UNREACHABLE` and would panic on use,
         // which is the point of that sentinel.
         for m in 0..64usize {
             let mut fresh = vec![crate::transpile::bdd::UNREACHABLE; e.graph.len()];
             for f in of.fields.iter() {
-                fresh[f.node as usize] = nodemap[maps[m][f.node as usize] as usize];
+                fresh[f.node as usize] = nodemap(maps[m][f.node as usize]);
             }
-            fresh[e.ok as usize] = nodemap[maps[m][e.ok as usize] as usize];
-            fresh[e.live as usize] = nodemap[maps[m][e.live as usize] as usize];
+            fresh[e.ok as usize] = nodemap(maps[m][e.ok as usize]);
+            fresh[e.live as usize] = nodemap(maps[m][e.live as usize]);
             maps[m] = fresh;
         }
         sp = sp2;
