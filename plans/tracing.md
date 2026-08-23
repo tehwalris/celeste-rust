@@ -1194,6 +1194,87 @@ is every room with a death, a fruit or an exit.
 Sequence it after T3 (which is where differing shapes first appear) and
 before T6.
 
+## T13 - pm1 class specialization, and why it is worth much less here
+
+The recipe pipeline's class kernels ARE pm1 specializations. `steady` is
+`freeze = 0, dash_time = 0` folded in at emit time - the two cells do not
+appear anywhere in `kernel_gen_steady.rs`, because the certified overlay
+injected them as constants and everything downstream folded. The pm1 key
+is six cells (`compiled/mod.rs`): globals `has_dashed`, `freeze`, and
+player fields `dash_time`, `djump`, `p_dash`, `p_jump`.
+`Rt2::partition_pm1` makes every block uniform in all six, which is what
+makes pinning them exact rather than approximate: the dispatcher's class
+guard rejects a block that disagrees, so no lane ever runs a body pinned
+to a value it does not hold.
+
+The tracer had no notion of this. `iface::symbolize` turned every scalar
+under `roots` into a free `Op::Cell`, so all six were unconstrained -
+and `has_dashed`, which the emit probe's roots happened not to reach,
+stayed concrete WITHOUT being declared. That is the same folding with
+nothing saying so and nothing guarding it, which is worse than either
+choice made on purpose.
+
+**The mechanism.** `symbolize` now takes a `pin: &[Path]` of prefixes to
+leave concrete, and `Iface` carries `pinned: Vec<(Path, Conc)>` so a
+specialization is recorded rather than implied. The emit probe pins the
+six pm1 paths and prints them. That is the whole feature - a slot left
+concrete is a specialization, which `iface.rs` already said; all that was
+missing was a way to say which slots on purpose.
+
+**What it bought, measured on room (0,0) f40, post-BDD (2026-08-23).**
+Matching outcomes by output count, because pinning reorders them:
+
+| outputs | unpinned | pinned | delta |
+|---|---|---|---|
+| 53 | 32 | 27 | -16% |
+| 34 | 2,833 | 2,762 | -2.5% |
+| 104 | 4,454 | 4,343 | -2.5% |
+| 58 | 3,577 | 3,081 | -14% |
+| **total** | **10,896** | **10,213** | **-6.3%** |
+
+Reachable nodes 5,584 -> 5,418 summed, 2,159 -> 2,058 in the union.
+Output shapes: 4 either way. Variants: 1/24/24/24 either way.
+
+**Six percent, and no variants. That is the finding.** The expectation
+going in - mine and Philippe's - was that pm1 specialization is a big
+lever, because in the recipe pipeline it is the difference between having
+a branch-free kernel and not having one. It is much smaller here, and the
+reason is structural rather than incidental:
+
+* The recipe path had no guards. A program that must be branch-free
+  cannot express "freeze is 0 or it is not", so freeze had to be a
+  CONSTANT, and a separate `kernel_gen_frozen.rs` had to exist for the
+  other value. Specialization was load-bearing because it was the only
+  mechanism.
+* The tracer has guards (T5b). An unknown `freeze` produces guard algebra
+  in one body rather than a second body. Pinning deletes that algebra -
+  which is real, and is the 6% - but it deletes a term, not a program.
+
+So pm1 specialization in the tracer is a **correctness requirement with a
+small size dividend**, not an optimization. It has to be on, and it has
+to be declared, because a body the dispatcher hands a steady block must
+agree with steady. It is not where the emitted size lives.
+
+**Where the size actually lives, again: the buttons.** 24 of the 64
+assignments survive as variants on three of four outcomes, and pm1 is not
+a button, so pinning cannot touch them. The variant floor is unchanged by
+this work: outcome 0 at 1/1, the 34- and 104-output outcomes at 2/24, the
+58-output one at 24/24. That gap - and the 4,357 proved-but-unapplied
+equalities behind it - is still the item, and it is still blocked on
+running the traced path in a real search.
+
+**Interaction with the other two items.**
+
+* With `symbolize` over-symbolizing (the 65 uniform-known scalars,
+  `hitbox.w = 393216` and friends): SAME mechanism, different paths. Those
+  are pins too - shape-fixed rather than class-fixed. The `pin` argument
+  is what they need; what is missing is the list, and the honest way to
+  get it is the shape witness rather than a hand-written census.
+* With multi-output shapes (P2/P3): pinning shrinks the union by 5% and
+  the shared-by-all prefix from 49 nodes to 46. It does not collapse any
+  output shape, so it does not make P2/P3 smaller or optional. The four
+  shapes on this frame are not a pm1 artifact.
+
 ## Stage 4 - delete
 
 - `celeste-rewrite` (38k lines) - the crate nothing depends on any more.

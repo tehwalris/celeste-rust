@@ -89,9 +89,10 @@ pub fn trace_frame<'a>(
     frame: &'a ast::Ast,
     st: State<Symbolic>,
     roots: &[Path],
+    pin: &[Path],
 ) -> Result<Frame> {
     let mut st = st;
-    let iface = iface::symbolize(&mut it.d, &mut st, roots)?;
+    let iface = iface::symbolize(&mut it.d, &mut st, roots, pin)?;
     let st = run_one(it, reset, st)?;
     let mut outs = Vec::new();
     for (s, f) in it.exec_block(frame.nodes(), st)? {
@@ -264,13 +265,33 @@ mod tests {
         }
         let Some(player) = player else { return eprintln!("[emit] no player") };
         let mut roots: Vec<Path> = vec![player.clone()];
-        for g in ["freeze", "frames", "will_restart", "delay_restart", "max_djump"] {
+        // `has_dashed` is here to be PINNED, not to become a cell. Left
+        // out of the roots it stayed concrete anyway - an undeclared
+        // specialization, which is the same folding with nothing saying
+        // so and nothing to guard it.
+        for g in ["freeze", "has_dashed", "frames", "will_restart", "delay_restart", "max_djump"] {
             roots.push(vec![iface::key(g)]);
         }
-        let f = match trace_frame(&mut it, &reset, &frame, st, &roots) {
+        // The pm1 CLASS specialization, said in the tracer's vocabulary.
+        // `partition_pm1` guarantees every lane of a block agrees on
+        // these six cells, so pinning them is exact for the block the
+        // kernel binds to - and the dispatcher's class guard is what
+        // rejects a block that disagrees. This is the same constant
+        // injection the recipe pipeline does via the certified overlay;
+        // here it is six paths.
+        let mut pin: Vec<Path> = vec![vec![iface::key("freeze")], vec![iface::key("has_dashed")]];
+        for f in ["dash_time", "djump", "p_dash", "p_jump"] {
+            let mut q = player.clone();
+            q.push(iface::key(f));
+            pin.push(q);
+        }
+        let f = match trace_frame(&mut it, &reset, &frame, st, &roots, &pin) {
             Ok(f) => f,
             Err(e) => return eprintln!("[emit] trace stopped at: {:#}", e),
         };
+        for (p, c) in &f.iface.pinned {
+            eprintln!("[emit] pinned {} = {:?}", iface::show(p), c);
+        }
 
         // The tracer's OWN numbering: input cells are `Op::Cell(i)` in
         // `Iface` order, and outputs are numbered after them. Not the
@@ -1363,7 +1384,7 @@ end
         }
 
         let before = it.d.graph.len();
-        let f = match trace_frame(&mut it, &reset, &frame, st.clone(), &roots) {
+        let f = match trace_frame(&mut it, &reset, &frame, st.clone(), &roots, &[]) {
             Ok(f) => f,
             Err(e) => return eprintln!("[verify] symbolic frame stopped at: {:#}", e),
         };
