@@ -76,10 +76,10 @@ use crate::interpreter::value::KeptLanes;
 
 use super::checkpoint;
 use super::pos_graph::{self, PosGraph, CELL_WORDS, NO_CELL};
-use super::program::Program;
+use crate::program::Program;
 use super::state_mapping::StateMapping;
 use super::sweep::{row_keys, G_UNREACHABLE, SWEEP_ORIGIN};
-use super::verify::AbstractRun;
+use super::run::AbstractRun;
 
 /// Every saved boundary state, plus where each row id lives in them.
 ///
@@ -288,7 +288,7 @@ pub struct TimeSweepResult {
 fn register_variants(
     engine: &mut AbstractRun,
     base_mapping: StateMapping,
-    variants: Vec<crate::rewrite::verify::Variant>,
+    variants: Vec<crate::search::run::Variant>,
 ) -> Result<()> {
     if variants.is_empty() {
         return Ok(());
@@ -310,7 +310,7 @@ fn register_variants(
 /// the mistake that type is refusing to make available. The two builds
 /// are seconds against a sweep measured in minutes, and the pos-graph one
 /// does not happen at all when the table is reused.
-pub type VariantBuilder<'a> = dyn Fn(&Program) -> Result<Vec<crate::rewrite::verify::Variant>> + 'a;
+pub type VariantBuilder<'a> = dyn Fn(&Program) -> Result<Vec<crate::search::run::Variant>> + 'a;
 
 /// Load the level's position graph, extending it over any frames it does
 /// not yet cover.
@@ -449,7 +449,7 @@ fn borrow_pos_graph(src: &Path, frames: u32, recipe_text: &str) -> Result<PosGra
             src.display()
         )
     })?;
-    let accepted = crate::rewrite::checkpoint::coarser_precision_fingerprints(recipe_text);
+    let accepted = crate::search::checkpoint::coarser_precision_fingerprints(recipe_text);
     let level = accepted
         .iter()
         .find(|(_, fp)| fp == graph.fingerprint())
@@ -758,10 +758,10 @@ pub fn backward_sweep_time(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rewrite::pos_graph::PosGraphBuilder;
+    use crate::search::pos_graph::PosGraphBuilder;
 
     fn cells(bits: &[u64]) -> Vec<u32> {
-        (0..crate::rewrite::pos_graph::CELL_COUNT)
+        (0..crate::search::pos_graph::CELL_COUNT)
             .filter(|&c| get_bit(bits, c))
             .map(|c| c as u32)
             .collect()

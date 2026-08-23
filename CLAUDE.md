@@ -220,18 +220,27 @@ crates/celeste-interp    the INTERPRETER (the oracle),           deps: core, ir
 crates/celeste-engine    Rt2 block model, boundary/dedup/merge,  deps: core, names
                          row keys, kernel.rs lane primitives
 crates/celeste-kernels   GENERATED per-class lane kernels        deps: core, engine
-.  (celeste-rust)        rewrite machinery, transpile emitters,  deps: all
+.  (celeste-rust)        search driver, program assembly,        deps: all
+                         AST tracer, transpile emitters,
                          compiled dispatch, campaign bins
 native-probe             bench/gate binary for the engine        deps: all
 ```
 
-The split is HALF DONE (plans/tracing.md stage 1). Still to come out:
-`celeste-rewrite` (~38k lines, the rules) and `celeste-transpile` (~6k,
-the emitters), which is the pair that actually makes the edit loop small.
-Two cycles block them: `rewrite -> compiled` (4 sites in verify.rs and
-checkpoint.rs, all of which test the COMPILED path and belong upstairs)
-and `compiled -> rewrite` (`Program`, which wants to move down;
-`StateMapping`, which needs a home).
+The split is HALF DONE (plans/tracing.md stage 1). The 38k lines of
+rewrite rules that used to be the next thing to extract are DELETED
+(`plans/deletion.md`); what is left in `celeste-rust` is laid out as:
+
+```
+src/program/   Program assembly, recipes, and the frozen artifacts
+src/search/    the abstract forward search: run, differential, checkpoint,
+               sweep, sweep_time, pos_graph, state_mapping
+src/trace/     the AST tracer (Lua -> transpile::graph::Graph)
+src/transpile/ the emitters and the graph IR
+src/compiled/  FrameEngine dispatch and the State <-> block bridge
+```
+
+`src/search` was called `src/rewrite` until 2026-08-23, which was a lie by
+then - only the `program` half was ever about rewriting.
 
 One frame of the abstract search is `celeste_rust::compiled::FrameEngine`
 `::step` - `(shape, rows) -> [(shape, rows)]`, the generated class kernels

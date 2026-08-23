@@ -60,8 +60,8 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     if args.rewritten {
-        let program = celeste_rust::rewrite::frozen::rewritten("rewrites.jsonl")?;
-        let mut run = celeste_rust::rewrite::verify::AbstractRun::start(&program)?;
+        let program = celeste_rust::program::frozen::rewritten("rewrites.jsonl")?;
+        let mut run = celeste_rust::search::run::AbstractRun::start(&program)?;
         for frame in 1..=args.frames {
             let t = std::time::Instant::now();
             run.step()?;
@@ -148,10 +148,10 @@ fn run_game_frames(
 
     // The program is the shared, derived one - the same assembly every
     // other tool runs (sources + start-room substitution + init/frame
-    // chunks); see rewrite::program.
-    let sources = celeste_rust::rewrite::program::Sources::load_from_disk()
+    // chunks); see the program module.
+    let sources = celeste_rust::program::Sources::load_from_disk()
         .expect("Failed to load game sources");
-    let mut program = celeste_rust::rewrite::program::Program::compile(&sources)
+    let mut program = celeste_rust::program::Program::compile(&sources)
         .expect("Failed to compile game program");
     program
         .pin_native_builtins()

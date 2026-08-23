@@ -46,7 +46,7 @@ pub fn dump(kind: &str, dir: Option<&std::path::Path>, extra: &[(&str, String)])
     // class kernels actually took is the difference between "the compiled
     // engine is slow" and "the compiled engine barely ran".
     crate::compiled::dispatch::print_kernel_hits();
-    crate::rewrite::verify::print_worker_phase_times();
+    crate::search::run::print_worker_phase_times();
     let phases = PHASES.lock().unwrap();
     if phases.is_empty() {
         return;

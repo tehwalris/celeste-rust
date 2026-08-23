@@ -2,7 +2,7 @@
 //!
 //! A `Program` is normally *derived*: compile the Lua, then replay a
 //! recipe of ~1000 rewrite instructions through the 40 rules in
-//! `rewrite::rules`. That derivation is the only thing keeping ~28k lines
+//! the (now deleted) rewrite rules. That derivation is the only thing keeping ~28k lines
 //! of rules alive (`plans/deletion.md`), and it is pure - same Lua, same
 //! recipe, same program, no cart, no clock, no RNG.
 //!
@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use celeste_ir::ir::{FunDef, GlobalId};
 
-use super::program::Program;
+use crate::program::Program;
 
 /// Bumped whenever the encoding changes in a way that makes an existing
 /// artifact unreadable. A mismatch is an error rather than a silent

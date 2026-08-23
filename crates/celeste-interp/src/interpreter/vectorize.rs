@@ -1275,7 +1275,7 @@ pub struct VisitedKeys {
 }
 
 impl VisitedKeys {
-    /// For the partitioned filter (`rewrite::verify`), which computes the
+    /// For the partitioned filter (`search::run`), which computes the
     /// candidate list outside this module. The contract is the same one
     /// `visited_row_keys` satisfies: candidates ascend by lane, each is
     /// not `contains_historic`, and each key appears at most once in the
@@ -1426,7 +1426,7 @@ pub fn global_probes_take() -> u64 {
     GLOBAL_PROBES.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// For the partitioned filter (`rewrite::verify::partition_filter`), whose
+/// For the partitioned filter (`search::run::partition_filter`), whose
 /// probes happen outside this module but belong in the same census line.
 pub fn add_global_probes(n: u64) {
     GLOBAL_PROBES.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
@@ -1435,7 +1435,7 @@ pub fn add_global_probes(n: u64) {
 /// Phase 1a of the PARTITIONED subtract (D4, plans/dedup-roofline-plan.md):
 /// hash every lane into its row key and stop - no seen set, no visited
 /// probe. The filter runs afterwards, hash-partitioned across threads, in
-/// `rewrite::verify`'s partition stage. The census sample and the offered
+/// `search::run`'s partition stage. The census sample and the offered
 /// dump live here because they observe the offered stream, which this
 /// function is the last common view of.
 ///

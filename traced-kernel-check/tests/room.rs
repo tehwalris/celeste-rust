@@ -40,12 +40,12 @@ fn the_room_runs_on_kernels_alone() {
     // Collecting one side first and comparing afterwards checks nothing
     // at all when the fast side stops early, which is exactly the case
     // this is for.
-    let program = celeste_rust::rewrite::frozen::rewritten("rewrites.jsonl")
+    let program = celeste_rust::program::frozen::rewritten("rewrites.jsonl")
         .expect("the frozen rewritten program");
     let engine = celeste_rust::compiled::FrameEngine::new_for_start_room(&program)
         .expect("build the reference engine");
     let mut oracle =
-        celeste_rust::rewrite::verify::AbstractRun::start(&program).expect("start the oracle");
+        celeste_rust::search::run::AbstractRun::start(&program).expect("start the oracle");
 
     let mut stopped: Option<String> = None;
     let mut checked = 0usize;
@@ -209,7 +209,7 @@ fn the_room_runs_on_kernels_alone() {
 /// unmatched and prints their scalars by path.
 fn explain(
     run: &celeste_rust::trace::run::Run,
-    oracle: &celeste_rust::rewrite::verify::AbstractRun,
+    oracle: &celeste_rust::search::run::AbstractRun,
     engine: &celeste_rust::compiled::FrameEngine,
 ) {
     let theirs: Vec<celeste_engine::Rt2> = oracle

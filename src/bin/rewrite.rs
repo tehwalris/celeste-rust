@@ -10,9 +10,9 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 
-use celeste_rust::rewrite::program::Program;
-use celeste_rust::rewrite::recipe::Recipe;
-use celeste_rust::rewrite::verify::differential_abstract;
+use celeste_rust::program::Program;
+use celeste_rust::program::recipe::Recipe;
+use celeste_rust::search::differential::differential_abstract;
 
 const DEFAULT_RECIPE: &str = "rewrites.jsonl";
 
@@ -328,7 +328,7 @@ enum Command {
         #[arg(long = "variant")]
         variants: Vec<String>,
     },
-    /// The backward pass (`rewrite::sweep_time`): for each row, g(row) =
+    /// The backward pass (`search::sweep_time`): for each row, g(row) =
     /// min frames to the room exit, swept backward in time-expanded space
     /// with the position graph as a predecessor filter. Prints min(e+g)
     /// (must equal the forward first-win frame) and per-frame band sizes
@@ -511,12 +511,12 @@ fn parse_pm1(text: &str) -> Result<Vec<(String, celeste_rust::pico8_num::Pico8Nu
 /// and candidates are applied before it.
 fn make_variant(
     program: &Program,
-    mapping: celeste_rust::rewrite::state_mapping::StateMapping,
+    mapping: celeste_rust::search::state_mapping::StateMapping,
     shapes: Vec<Vec<String>>,
     pm1: Vec<(String, celeste_rust::pico8_num::Pico8Num)>,
     label: String,
     host_program: &Program,
-) -> Result<celeste_rust::rewrite::verify::Variant> {
+) -> Result<celeste_rust::search::run::Variant> {
     if !program.merge_partition_cells.is_empty()
         && program.merge_partition_cells != host_program.merge_partition_cells
     {
@@ -528,7 +528,7 @@ fn make_variant(
             host_program.merge_partition_cells
         ));
     }
-    Ok(celeste_rust::rewrite::verify::Variant {
+    Ok(celeste_rust::search::run::Variant {
         label,
         shapes,
         pm1,
@@ -547,8 +547,8 @@ fn make_variant(
 fn build_variants(
     specs: &[String],
     base_program: &Program,
-) -> Result<Vec<celeste_rust::rewrite::verify::Variant>> {
-    use celeste_rust::rewrite::state_mapping::StateMapping;
+) -> Result<Vec<celeste_rust::search::run::Variant>> {
+    use celeste_rust::search::state_mapping::StateMapping;
     let mut out = Vec::new();
     for spec in specs {
         let (key_part, path) = spec
@@ -565,7 +565,7 @@ fn build_variants(
             .with_context(|| format!("--variant {:?}", spec))?;
         let recipe = Recipe::load(path)
             .with_context(|| format!("--variant {:?}: loading recipe", spec))?;
-        let program = celeste_rust::rewrite::frozen::rewritten(path)
+        let program = celeste_rust::program::frozen::rewritten(path)
             .with_context(|| format!("--variant {:?}: the frozen program", spec))?;
         out.push(make_variant(
             &program,
@@ -583,14 +583,14 @@ fn build_variants(
 /// under test, and the shapes that recipe claims.
 struct VariantHost {
     program: Program,
-    mapping: celeste_rust::rewrite::state_mapping::StateMapping,
+    mapping: celeste_rust::search::state_mapping::StateMapping,
     shapes: Vec<Vec<String>>,
     pm1: Vec<(String, celeste_rust::pico8_num::Pico8Num)>,
     label: String,
 }
 
 fn resolve_variant_host(args: &VariantOf) -> Result<Option<VariantHost>> {
-    use celeste_rust::rewrite::state_mapping::StateMapping;
+    use celeste_rust::search::state_mapping::StateMapping;
     match (&args.host, &args.shapes) {
         (None, None) => {
             if args.pm1.is_some() {
@@ -601,7 +601,7 @@ fn resolve_variant_host(args: &VariantOf) -> Result<Option<VariantHost>> {
         (Some(path), Some(shapes)) => {
             let recipe = Recipe::load(path)
                 .with_context(|| format!("--variant-of {:?}: loading recipe", path))?;
-            let program = celeste_rust::rewrite::frozen::rewritten(path)
+            let program = celeste_rust::program::frozen::rewritten(path)
                 .with_context(|| format!("--variant-of {:?}: the frozen program", path))?;
             let pm1 = match &args.pm1 {
                 None => Vec::new(),
@@ -638,19 +638,19 @@ fn bench(
     program: &Program,
     frames: u32,
     profile: bool,
-    deopt: Option<(&Program, celeste_rust::rewrite::state_mapping::StateMapping)>,
+    deopt: Option<(&Program, celeste_rust::search::state_mapping::StateMapping)>,
     checkpoint: Option<CheckpointCfg>,
-    band: Option<celeste_rust::rewrite::verify::BandFilter>,
-    variants: Vec<celeste_rust::rewrite::verify::Variant>,
-    variant_base_mapping: Option<celeste_rust::rewrite::state_mapping::StateMapping>,
+    band: Option<celeste_rust::search::run::BandFilter>,
+    variants: Vec<celeste_rust::search::run::Variant>,
+    variant_base_mapping: Option<celeste_rust::search::state_mapping::StateMapping>,
     record_pos_graph: bool,
 ) -> Result<()> {
-    use celeste_rust::rewrite::checkpoint;
+    use celeste_rust::search::checkpoint;
     let mut run = match deopt {
-        Some((plain, mapping)) => celeste_rust::rewrite::verify::AbstractRun::start_with_deopt(
+        Some((plain, mapping)) => celeste_rust::search::run::AbstractRun::start_with_deopt(
             program, plain, mapping, false,
         )?,
-        None => celeste_rust::rewrite::verify::AbstractRun::start(program)?,
+        None => celeste_rust::search::run::AbstractRun::start(program)?,
     };
     if !variants.is_empty() {
         let base_mapping = variant_base_mapping
@@ -716,7 +716,7 @@ fn bench(
     // to cover them and does not.
     if record_pos_graph {
         let existing = match checkpoint.as_ref() {
-            Some(cfg) => celeste_rust::rewrite::pos_graph::PosGraph::load(&cfg.dir)?
+            Some(cfg) => celeste_rust::search::pos_graph::PosGraph::load(&cfg.dir)?
                 .filter(|g| {
                     if g.fingerprint() == cfg.fingerprint {
                         true
@@ -1080,7 +1080,7 @@ fn load_level(
     k: u8,
     g_required: bool,
 ) -> Result<LoadedLevel> {
-    use celeste_rust::rewrite::{checkpoint, sweep};
+    use celeste_rust::search::{checkpoint, sweep};
     let precision = precision_for_level(k);
     let dir = level_checkpoint_dir(base_dir, k);
     let recipe_text = std::fs::read_to_string(recipe_path).unwrap_or_default();
@@ -1124,7 +1124,7 @@ fn widened_row_key(
     let mut a = make_state_abstract_rem(canon, precision);
     a = apply_conservative_widenings(a);
     a.gc();
-    Ok(celeste_rust::rewrite::sweep::row_keys(&a)?[0])
+    Ok(celeste_rust::search::sweep::row_keys(&a)?[0])
 }
 
 /// Parse a TAS file: comment lines start with '#', the rest is
@@ -1146,7 +1146,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Verify { frames, variant_of } => {
-            let candidate = celeste_rust::rewrite::frozen::rewritten(&cli.recipe)?;
+            let candidate = celeste_rust::program::frozen::rewritten(&cli.recipe)?;
             let host = resolve_variant_host(&variant_of)?;
             let start = std::time::Instant::now();
             let divergence = match host.as_ref() {
@@ -1161,19 +1161,19 @@ fn main() -> Result<()> {
                          {} to {:?}...",
                         frames, cli.recipe, host.shapes
                     );
-                    let trace = celeste_rust::rewrite::verify::observation_trace(
+                    let trace = celeste_rust::search::differential::observation_trace(
                         &host.program,
                         frames,
                     )?;
                     let variant = make_variant(
                         &candidate,
-                        celeste_rust::rewrite::state_mapping::StateMapping::from_recipe(&recipe),
+                        celeste_rust::search::state_mapping::StateMapping::from_recipe(&recipe),
                         host.shapes.clone(),
                         host.pm1.clone(),
                         host.label.clone(),
                         &host.program,
                     )?;
-                    celeste_rust::rewrite::verify::differential_variant_against_trace(
+                    celeste_rust::search::differential::differential_variant_against_trace(
                         &trace,
                         &host.program,
                         host.mapping.clone(),
@@ -1200,14 +1200,14 @@ fn main() -> Result<()> {
             use celeste_rust::interpreter::fixed_env::PreparedCfg;
             use celeste_rust::interpreter::glue::interpret_prepared_cfg;
             use celeste_rust::interpreter::state::State;
-            use celeste_rust::rewrite::verify::observe_frame;
+            use celeste_rust::search::run::observe_frame;
 
-            let member = celeste_rust::rewrite::frozen::rewritten(&cli.recipe)?;
+            let member = celeste_rust::program::frozen::rewritten(&cli.recipe)?;
             // The member's state layout differs from canonical (promote_capture
             // etc.); cross-feeding states goes through the same mapping the
             // campaign's dispatch/deopt uses.
             let mapping =
-                celeste_rust::rewrite::state_mapping::StateMapping::from_recipe(&recipe);
+                celeste_rust::search::state_mapping::StateMapping::from_recipe(&recipe);
             let plain = Program::compile_executable_from_disk()?;
             let inputs = parse_tas(&tas)?;
             let n = frames.unwrap_or(inputs.len() as u32);
@@ -1293,8 +1293,8 @@ fn main() -> Result<()> {
         }
 
         Command::Observe { frames } => {
-            let program = celeste_rust::rewrite::frozen::rewritten(&cli.recipe)?;
-            let trace = celeste_rust::rewrite::verify::observation_trace(&program, frames)?;
+            let program = celeste_rust::program::frozen::rewritten(&cli.recipe)?;
+            let trace = celeste_rust::search::differential::observation_trace(&program, frames)?;
             println!("{:>6} {:>8} {:>20}", "frame", "states", "digest");
             for (frame, observation) in trace.iter().enumerate() {
                 use std::hash::{Hash, Hasher};
@@ -1312,8 +1312,8 @@ fn main() -> Result<()> {
         Command::Widencheck { frames } => {
             use celeste_rust::interpreter::abstraction::apply_conservative_widenings;
             use celeste_rust::interpreter::vectorize::vectorize_states;
-            use celeste_rust::rewrite::verify::{observe_frame, AbstractRun};
-            let program = celeste_rust::rewrite::frozen::rewritten(&cli.recipe)?;
+            use celeste_rust::search::run::{observe_frame, AbstractRun};
+            let program = celeste_rust::program::frozen::rewritten(&cli.recipe)?;
             let mut widened = AbstractRun::start(&program)?;
             let mut exact = AbstractRun::start_rem_only(&program)?;
             for frame in 1..=frames {
@@ -1355,9 +1355,9 @@ fn main() -> Result<()> {
         }
         Command::Simdcheck { frames, max_lanes } => {
             use celeste_rust::interpreter::state::State;
-            use celeste_rust::rewrite::state_mapping::StateMapping;
-            use celeste_rust::rewrite::sweep;
-            use celeste_rust::rewrite::verify::AbstractRun;
+            use celeste_rust::search::state_mapping::StateMapping;
+            use celeste_rust::search::sweep;
+            use celeste_rust::search::run::AbstractRun;
             use std::collections::BTreeSet;
 
             // The frontier subtract must be off for the PROBE runs - a
@@ -1385,7 +1385,7 @@ fn main() -> Result<()> {
                 );
             }
 
-            let program = celeste_rust::rewrite::frozen::rewritten(&cli.recipe)?;
+            let program = celeste_rust::program::frozen::rewritten(&cli.recipe)?;
             let plain = Program::compile_executable_from_disk()?;
             let mapping = StateMapping::from_recipe(&recipe);
 
@@ -1495,10 +1495,10 @@ fn main() -> Result<()> {
             }
         }
         Command::Deoptcheck { frames } => {
-            use celeste_rust::rewrite::state_mapping::StateMapping;
-            use celeste_rust::rewrite::verify::{observe_frame, AbstractRun};
+            use celeste_rust::search::state_mapping::StateMapping;
+            use celeste_rust::search::run::{observe_frame, AbstractRun};
             let plain = Program::compile_executable_from_disk()?;
-            let program = celeste_rust::rewrite::frozen::rewritten(&cli.recipe)?;
+            let program = celeste_rust::program::frozen::rewritten(&cli.recipe)?;
             let mapping = StateMapping::from_recipe(&recipe);
             println!(
                 "canonical-state mapping: {} (function, capture) pair(s)",
@@ -1547,7 +1547,7 @@ fn main() -> Result<()> {
             use celeste_rust::interpreter::abstraction::object_shape;
             use celeste_rust::interpreter::inspect::StateHelper;
             use celeste_rust::interpreter::value::{HeapValue, MaybeVector, Value};
-            use celeste_rust::rewrite::checkpoint;
+            use celeste_rust::search::checkpoint;
             let dir = std::path::PathBuf::from(&checkpoint_dir);
             let states = checkpoint::load_frame_states(&dir, frame)?;
             // shape -> (states, lanes)
@@ -1637,11 +1637,11 @@ fn main() -> Result<()> {
             if baseline {
                 bench("original", &Program::compile_executable_from_disk()?, frames, profile, None, None, None, vec![], None, false)?;
             }
-            let program = celeste_rust::rewrite::frozen::rewritten(&cli.recipe)?;
+            let program = celeste_rust::program::frozen::rewritten(&cli.recipe)?;
             let deopt_setup = if deopt {
                 Some((
                     Program::compile_executable_from_disk()?,
-                    celeste_rust::rewrite::state_mapping::StateMapping::from_recipe(&recipe),
+                    celeste_rust::search::state_mapping::StateMapping::from_recipe(&recipe),
                 ))
             } else {
                 None
@@ -1650,7 +1650,7 @@ fn main() -> Result<()> {
             let variant_base_mapping = if built_variants.is_empty() {
                 None
             } else {
-                Some(celeste_rust::rewrite::state_mapping::StateMapping::from_recipe(&recipe))
+                Some(celeste_rust::search::state_mapping::StateMapping::from_recipe(&recipe))
             };
             let checkpoint_cfg = match checkpoint_dir {
                 Some(dir) => {
@@ -1660,7 +1660,7 @@ fn main() -> Result<()> {
                         every: checkpoint_every,
                         resume,
                         save_frames,
-                        fingerprint: celeste_rust::rewrite::checkpoint::config_fingerprint(
+                        fingerprint: celeste_rust::search::checkpoint::config_fingerprint(
                             &recipe_text,
                         ),
                     })
@@ -1675,8 +1675,8 @@ fn main() -> Result<()> {
                     use celeste_rust::interpreter::abstraction::{
                         LadderPrecision, RemPrecision, SpdPrecision,
                     };
-                    use celeste_rust::rewrite::checkpoint;
-                    use celeste_rust::rewrite::sweep;
+                    use celeste_rust::search::checkpoint;
+                    use celeste_rust::search::sweep;
                     let prev_precision = LadderPrecision {
                         spd: match band_prev_spd_width {
                             Some(w) => SpdPrecision::WidthLog2(w),
@@ -1718,7 +1718,7 @@ fn main() -> Result<()> {
                         ck.visited.len(),
                         horizon
                     );
-                    Some(celeste_rust::rewrite::verify::BandFilter {
+                    Some(celeste_rust::search::run::BandFilter {
                         prev_table: ck.visited,
                         g_prev,
                         horizon,
@@ -1747,8 +1747,8 @@ fn main() -> Result<()> {
         }
 
         Command::TraceWitness { tas, horizon, levels, base_dir } => {
-            use celeste_rust::rewrite::state_mapping::StateMapping;
-            use celeste_rust::rewrite::sweep;
+            use celeste_rust::search::state_mapping::StateMapping;
+            use celeste_rust::search::sweep;
 
             let inputs = parse_tas(&tas)?;
             println!("witness: {} input bytes, horizon {}", inputs.len(), horizon);
@@ -1843,8 +1843,8 @@ fn main() -> Result<()> {
             use celeste_rust::interpreter::glue::interpret_prepared_cfg;
             use celeste_rust::interpreter::abstraction::count_win_lanes;
             use celeste_rust::interpreter::state::State;
-            use celeste_rust::rewrite::state_mapping::StateMapping;
-            use celeste_rust::rewrite::sweep;
+            use celeste_rust::search::state_mapping::StateMapping;
+            use celeste_rust::search::sweep;
 
             let reference: Option<Vec<u8>> = match &tas {
                 Some(path) => Some(parse_tas(path)?),
@@ -1986,7 +1986,7 @@ fn main() -> Result<()> {
                 count_win_lanes, player_xy_per_lane,
             };
             use celeste_rust::interpreter::state::State;
-            use celeste_rust::rewrite::state_mapping::StateMapping;
+            use celeste_rust::search::state_mapping::StateMapping;
             use std::collections::HashMap;
 
             let loaded = load_level(&cli.recipe, &base_dir, level, true)?;
@@ -2155,16 +2155,16 @@ fn main() -> Result<()> {
             );
         }
         Command::Sweep { checkpoint_dir, frames, horizon, banded, pos_graph_from, variants } => {
-            use celeste_rust::rewrite::state_mapping::StateMapping;
-            use celeste_rust::rewrite::{sweep, sweep_time};
+            use celeste_rust::search::state_mapping::StateMapping;
+            use celeste_rust::search::{sweep, sweep_time};
             let horizon = horizon.unwrap_or(frames);
             let dir = std::path::PathBuf::from(checkpoint_dir);
             let from = pos_graph_from.map(std::path::PathBuf::from);
             let recipe_text = std::fs::read_to_string(&cli.recipe).unwrap_or_default();
             let fingerprint =
-                celeste_rust::rewrite::checkpoint::config_fingerprint(&recipe_text);
+                celeste_rust::search::checkpoint::config_fingerprint(&recipe_text);
             let plain = Program::compile_executable_from_disk()?;
-            let program = celeste_rust::rewrite::frozen::rewritten(&cli.recipe)?;
+            let program = celeste_rust::program::frozen::rewritten(&cli.recipe)?;
             let mapping = StateMapping::from_recipe(&recipe);
             let build = |p: &Program| build_variants(&variants, p);
             let result = sweep_time::backward_sweep_time(
@@ -2199,7 +2199,7 @@ fn main() -> Result<()> {
                 None => println!("no row reaches the exit - the horizon is too short"),
             }
             // Band sizes for the horizon: the k=1 forward pass's budget.
-            let ck = celeste_rust::rewrite::checkpoint::load(&dir, frames, &fingerprint)?;
+            let ck = celeste_rust::search::checkpoint::load(&dir, frames, &fingerprint)?;
             println!("band sizes for horizon {} (frame, rows):", horizon);
             for (f, size) in sweep::band_sizes(&ck.visited, &result.g, horizon) {
                 if size > 0 || f % 10 == 0 {
@@ -2219,14 +2219,14 @@ fn main() -> Result<()> {
             );
         }
         Command::PosGraph { checkpoint_dir, frames, variants } => {
-            use celeste_rust::rewrite::state_mapping::StateMapping;
-            use celeste_rust::rewrite::sweep_time;
+            use celeste_rust::search::state_mapping::StateMapping;
+            use celeste_rust::search::sweep_time;
             let dir = std::path::PathBuf::from(checkpoint_dir);
             let recipe_text = std::fs::read_to_string(&cli.recipe).unwrap_or_default();
             let fingerprint =
-                celeste_rust::rewrite::checkpoint::config_fingerprint(&recipe_text);
+                celeste_rust::search::checkpoint::config_fingerprint(&recipe_text);
             let plain = Program::compile_executable_from_disk()?;
-            let program = celeste_rust::rewrite::frozen::rewritten(&cli.recipe)?;
+            let program = celeste_rust::program::frozen::rewritten(&cli.recipe)?;
             let mapping = StateMapping::from_recipe(&recipe);
             let build = |p: &Program| build_variants(&variants, p);
             sweep_time::prepare_pos_graph(
@@ -2243,7 +2243,7 @@ fn main() -> Result<()> {
         }
         Command::MigrateVisited { checkpoint_dir } => {
             use celeste_rust::interpreter::visited;
-            use celeste_rust::rewrite::checkpoint;
+            use celeste_rust::search::checkpoint;
             let dir = std::path::PathBuf::from(checkpoint_dir);
             let frame = checkpoint::latest(&dir)?
                 .ok_or_else(|| anyhow!("{} has no checkpoints", dir.display()))?;
@@ -2268,7 +2268,7 @@ fn main() -> Result<()> {
                     if state.vector_size == 0 {
                         continue;
                     }
-                    for key in celeste_rust::rewrite::sweep::row_keys(state)? {
+                    for key in celeste_rust::search::sweep::row_keys(state)? {
                         let id = table.id_of(key).ok_or_else(|| {
                             anyhow!("f{:03}: a saved lane's row is not in the table", f)
                         })?;
@@ -2321,7 +2321,7 @@ fn main() -> Result<()> {
             );
         }
         Command::LeadingEdge { checkpoint_dir, frames } => {
-            use celeste_rust::rewrite::checkpoint;
+            use celeste_rust::search::checkpoint;
             let dir = std::path::PathBuf::from(checkpoint_dir);
             println!("frame\tmin_x\tmax_x\tlanes");
             for f in 1..=frames {
@@ -2349,7 +2349,7 @@ fn main() -> Result<()> {
         Command::ShapeInventory { checkpoint_dir } => {
             use celeste_rust::interpreter::inspect::StateHelper;
             use celeste_rust::interpreter::value::{HeapValue, Value};
-            use celeste_rust::rewrite::checkpoint;
+            use celeste_rust::search::checkpoint;
             for dir_str in &checkpoint_dir {
                 let dir = std::path::PathBuf::from(dir_str);
                 let frames_dir = dir.join("frames");

@@ -4,7 +4,7 @@
 //! `measure_k`, the TAS walks in the `rewrite` binary) goes through this
 //! plumbing. The concrete path runs the same interpreter as the abstract
 //! search - there is no separate "simple" interpreter to drift out of
-//! sync - and the same program assembly (`rewrite::program::Program`), so
+//! sync - and the same program assembly (`program::Program`), so
 //! a tool can never end up with a franken-room or a frame chunk that
 //! forgets the button-state reset (both happened when each binary
 //! hand-assembled its own copy).
@@ -15,7 +15,7 @@ use crate::interpreter::fixed_env::{FixedEnv, PreparedCfg};
 use crate::interpreter::glue::{interpret_cfg, interpret_prepared_cfg};
 use crate::interpreter::state::State;
 use crate::interpreter::value::{HeapValue, MaybeVector, Value};
-use crate::rewrite::program::Program;
+use crate::program::Program;
 
 /// Button flags of an input byte:
 /// bit 0 = left, 1 = right, 2 = up, 3 = down, 4 = jump, 5 = dash.

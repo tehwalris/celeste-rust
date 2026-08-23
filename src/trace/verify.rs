@@ -54,7 +54,7 @@ pub struct FrameOut {
     /// `fields` would make every row carry this frame's button values and
     /// stop converged lanes from deduping.
     ///
-    /// Soundness is the same premise `rewrite::rules::widen_buttons`
+    /// Soundness is the same premise the deleted `widen_buttons` rewrite
     /// documents: the cells are dead until the next frame's reset
     /// overwrites them, so overwriting them changes nothing observable.
     /// That is a property of the whole program rather than of this

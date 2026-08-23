@@ -43,7 +43,7 @@ use crate::interpreter::heap::HeapId;
 use crate::interpreter::state::State;
 use crate::interpreter::value::{HeapValue, Value};
 
-use super::recipe::{Recipe, Rule};
+use crate::program::recipe::{Recipe, Rule};
 
 /// The representation difference between a rewritten program's state and the
 /// canonical (plain-program) state. Derived from a recipe; see module docs.
@@ -180,8 +180,8 @@ mod tests {
     use super::*;
     use crate::game_runner::create_initial_state_with_builtins;
     use crate::interpreter::glue::interpret_cfg;
-    use crate::rewrite::program::Program;
-    use crate::rewrite::verify::observe_state;
+    use crate::program::Program;
+    use crate::search::run::observe_state;
 
     /// The tests need the checked-in Lua and recipe next to the cwd. When they
     /// are present, any later failure is a real failure - a silent skip on,

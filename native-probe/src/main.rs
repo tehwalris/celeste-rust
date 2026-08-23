@@ -44,10 +44,10 @@ fn engine() -> &'static FrameEngine {
         // The RECIPE is still parsed - `StateMapping::from_recipe` below
         // reads the instruction list as DATA - but it is not replayed:
         // the program comes from the frozen artifact next to it.
-        let recipe = celeste_rust::rewrite::recipe::Recipe::load(COMPILE_RECIPE).unwrap_or_else(
+        let recipe = celeste_rust::program::recipe::Recipe::load(COMPILE_RECIPE).unwrap_or_else(
             |e| panic!("loading {} (run from the repo root): {}", COMPILE_RECIPE, e),
         );
-        let program = celeste_rust::rewrite::frozen::rewritten(COMPILE_RECIPE)
+        let program = celeste_rust::program::frozen::rewritten(COMPILE_RECIPE)
             .unwrap_or_else(|e| panic!("loading the frozen {}: {}", COMPILE_RECIPE, e));
         let (cart, cache) = world();
         let mut engine = FrameEngine::new(&program, cart.clone(), cache.clone());
@@ -55,14 +55,14 @@ fn engine() -> &'static FrameEngine {
         // representatives etc.), which fail the specialized program's
         // premises by construction. Same wiring as the campaign's
         // `compiled_engine`.
-        let plain_program = celeste_rust::rewrite::program::Program::compile_from_disk()
+        let plain_program = celeste_rust::program::Program::compile_from_disk()
             .expect("compiling the plain program for the engine's deopt path");
         engine.set_plain_path(celeste_rust::compiled::PlainPath {
             plain_cfg: celeste_rust::interpreter::fixed_env::PreparedCfg::new(
                 plain_program.frame_cfg().clone(),
             ),
             plain_env: plain_program.fixed_env(),
-            mapping: celeste_rust::rewrite::state_mapping::StateMapping::from_recipe(&recipe),
+            mapping: celeste_rust::search::state_mapping::StateMapping::from_recipe(&recipe),
         });
         engine
     })
@@ -89,7 +89,7 @@ fn world() -> &'static (std::sync::Arc<CartData>, std::sync::Arc<CollisionCache>
 /// self-supplied from meta.json - the census wants states, not resume
 /// safety.
 fn load_states_any(dir: &str, frame: u32) -> Vec<celeste_rust::interpreter::state::State> {
-    use celeste_rust::rewrite::checkpoint;
+    use celeste_rust::search::checkpoint;
     let path = std::path::Path::new(dir);
     if path.join("frames").join(format!("f{:03}.bin", frame)).exists() {
         return checkpoint::load_frame_states(path, frame).expect("load frame states");
@@ -865,7 +865,7 @@ fn run_interp_bench(dir: &str, frame: u32, reps: u32) {
     use std::time::Instant;
 
     let program =
-        celeste_rust::rewrite::frozen::rewritten("rewrites.jsonl").expect("the frozen program");
+        celeste_rust::program::frozen::rewritten("rewrites.jsonl").expect("the frozen program");
     celeste_rust::interpreter::vectorize::set_merge_partition_patterns(
         &program.merge_partition_cells,
     );
@@ -1512,7 +1512,7 @@ fn run_frame_diff(dir: &str, frame: u32, outdir: &str) {
 
     // Interpreter side: the CAMPAIGN program, exactly as run_interp_bench.
     let program =
-        celeste_rust::rewrite::frozen::rewritten("rewrites.jsonl").expect("the frozen program");
+        celeste_rust::program::frozen::rewritten("rewrites.jsonl").expect("the frozen program");
     celeste_rust::interpreter::vectorize::set_merge_partition_patterns(
         &program.merge_partition_cells,
     );
@@ -1858,7 +1858,7 @@ fn run_key_gate_outputs(dir: &str, frame: u32) {
     use celeste_rust::interpreter::state::State;
 
     let program =
-        celeste_rust::rewrite::frozen::rewritten("rewrites.jsonl").expect("the frozen program");
+        celeste_rust::program::frozen::rewritten("rewrites.jsonl").expect("the frozen program");
     celeste_rust::interpreter::vectorize::set_merge_partition_patterns(
         &program.merge_partition_cells,
     );

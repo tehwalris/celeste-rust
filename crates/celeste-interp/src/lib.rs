@@ -7,7 +7,7 @@
 //! on none of them.
 //!
 //! That direction used to be violated by exactly one call - the
-//! interpreter formatting an instruction through `rewrite::print` - which
+//! interpreter formatting an instruction through `program::print` - which
 //! is why the printer now lives in `celeste-ir`.
 //!
 //! The instrumentation modules travel with it because they instrument it:

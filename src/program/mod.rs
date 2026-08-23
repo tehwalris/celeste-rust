@@ -1,4 +1,10 @@
-//! The unit that rewrites operate on.
+//! The program under search: how it is assembled, and how it is frozen.
+//!
+//! A `Program` is a pure function of the Lua sources and a recipe of rewrite
+//! instructions - no cart data, no clock, no RNG - so it is serialized once
+//! and checked in, exactly like the generated name tables. `frozen::rewritten`
+//! is what every caller actually uses; `Program::compile` is the slow path
+//! that produces the artifact.
 //!
 //! A `Program` is everything needed to run the game: the toplevel chunk (which
 //! defines all the functions and calls `_init()`), the per-frame chunk, and
@@ -8,6 +14,28 @@
 //!
 //! The toplevel and frame chunks are stored as `FunDef`s under reserved names
 //! so that rewrites can address them exactly like any other function.
+
+pub mod frozen;
+pub mod recipe;
+
+/// Instruction and CFG printing lives in `celeste-ir` - the interpreter
+/// needs it and must not depend on this module for it. Only the whole-
+/// `Program` printer stays here, because only it needs `Program`.
+pub mod print {
+    pub use celeste_ir::print::*;
+
+    use super::Program;
+
+    pub fn format_program(program: &Program) -> String {
+        let mut out = String::new();
+        for fun in program.functions.values() {
+            out.push_str(&format_function(fun));
+            out.push('\n');
+        }
+        out
+    }
+}
+
 
 use anyhow::{anyhow, Result};
 use indexmap::IndexMap;

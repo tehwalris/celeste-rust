@@ -151,8 +151,8 @@ impl CampaignConfig {
             frontier_only: std::env::var_os("CELESTE_FRONTIER_ONLY").is_some(),
             deopt_collect_first: std::env::var_os("CELESTE_DEOPT_COLLECT_FIRST")
                 .is_some(),
-            max_state_lanes: crate::rewrite::verify::effective_chunk_cap(),
-            fruit_chunk_lanes: crate::rewrite::verify::effective_fruit_chunk_cap(),
+            max_state_lanes: crate::search::run::effective_chunk_cap(),
+            fruit_chunk_lanes: crate::search::run::effective_fruit_chunk_cap(),
             compiled_engine: Self::compiled_engine_fingerprint(),
             synthetic_win: crate::interpreter::abstraction::synthetic_win_xy(),
         }

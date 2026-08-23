@@ -41,7 +41,7 @@ use super::kernel::{
     emit_interface, emit_key_cell, emit_walk, key_cells, lower_walk, reachable_cells,
     render_lines, Emit, Line, OutField, OutFields,
 };
-use crate::rewrite::program::Program;
+use crate::program::Program;
 
 
 /// One value node of the shared graph.

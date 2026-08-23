@@ -229,10 +229,10 @@ mod capture_probe {
         if !std::path::Path::new("rewrites.jsonl").exists() {
             return;
         }
-        let program = crate::rewrite::frozen::rewritten("rewrites.jsonl").expect("frozen");
+        let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
         let engine =
             crate::compiled::FrameEngine::new_for_start_room(&program).expect("engine");
-        let mut run = crate::rewrite::verify::AbstractRun::start(&program).expect("start");
+        let mut run = crate::search::run::AbstractRun::start(&program).expect("start");
 
         let mut varying = 0usize;
         let mut distinct: std::collections::BTreeSet<String> = Default::default();
@@ -365,10 +365,10 @@ mod encoding {
         if !std::path::Path::new("rewrites.jsonl").exists() {
             return;
         }
-        let program = crate::rewrite::frozen::rewritten("rewrites.jsonl").expect("frozen");
+        let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
         let engine =
             crate::compiled::FrameEngine::new_for_start_room(&program).expect("engine");
-        let run = crate::rewrite::verify::AbstractRun::start(&program).expect("start");
+        let run = crate::search::run::AbstractRun::start(&program).expect("start");
         let states = run.states();
         assert_eq!(states.len(), 1, "_init should leave exactly one state");
         let mut theirs =

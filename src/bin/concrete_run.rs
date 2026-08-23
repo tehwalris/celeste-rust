@@ -2,7 +2,7 @@
 //!
 //! This is for debugging and validation: run a known TAS input sequence
 //! and observe the resulting player positions. The program and the
-//! per-frame plumbing come from `rewrite::program` / `concrete`, so this
+//! per-frame plumbing come from `program` / `concrete`, so this
 //! runs exactly what the abstract search runs.
 
 use anyhow::Result;
@@ -13,7 +13,7 @@ use celeste_rust::interpreter::heap::HeapId;
 use celeste_rust::interpreter::state::State;
 use celeste_rust::interpreter::value::{HeapValue, MaybeVector, Value};
 use celeste_rust::pico8_num::Pico8Num;
-use celeste_rust::rewrite::program::Program;
+use celeste_rust::program::Program;
 use clap::Parser;
 
 #[derive(Parser)]

@@ -2,7 +2,8 @@
 pub mod compiled;
 pub mod concrete;
 pub mod metrics;
-pub mod rewrite;
+pub mod program;
+pub mod search;
 pub mod trace;
 pub mod transpile;
 

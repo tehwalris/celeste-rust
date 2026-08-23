@@ -25,7 +25,7 @@ use celeste_engine::runtime2;
 use celeste_engine::FxHashMap;
 use celeste_names as gen;
 
-use crate::rewrite::program::Program;
+use crate::program::Program;
 
 pub mod bridge;
 pub mod dispatch;
@@ -224,7 +224,7 @@ pub(crate) fn boundary_ids() -> runtime2::BoundaryIds {
 pub struct PlainPath {
     pub plain_cfg: crate::interpreter::fixed_env::PreparedCfg,
     pub plain_env: crate::interpreter::fixed_env::FixedEnv,
-    pub mapping: crate::rewrite::state_mapping::StateMapping,
+    pub mapping: crate::search::state_mapping::StateMapping,
 }
 
 pub struct FrameEngine {

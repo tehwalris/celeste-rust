@@ -24,8 +24,8 @@ use anyhow::{anyhow, bail, Context, Result};
 
 use crate::builtins::BUILTIN_NAMES;
 use crate::ir::{FunDef, Instruction, Terminator};
-use crate::rewrite::print::blocks_in_order;
-use crate::rewrite::program::Program;
+use crate::program::print::blocks_in_order;
+use crate::program::Program;
 
 
 #[derive(Default)]
@@ -174,7 +174,7 @@ fn str_array(name: &str, items: &[String]) -> String {
 /// - control flow: is every reachable CFG a DAG (if-convertible)?
 /// - size: multiplicity-weighted instruction/branch counts after full
 ///   inlining - the straight-line kernel's length.
-pub fn kernel_recon(program: &crate::rewrite::program::Program) {
+pub fn kernel_recon(program: &crate::program::Program) {
     use std::collections::VecDeque;
     struct Info {
         calls: Vec<String>,
@@ -404,7 +404,7 @@ mod tests {
     #[test]
     fn generated_is_current() {
         let regen = |recipe: &str| {
-            let program = crate::rewrite::frozen::rewritten(recipe)
+            let program = crate::program::frozen::rewritten(recipe)
                 .unwrap_or_else(|e| panic!("load {} (run from the repo root): {}", recipe, e));
             program
         };
@@ -455,7 +455,7 @@ mod tests {
     fn generated_is_current_r20() {
         std::env::set_var("CELESTE_START_ROOM", "2,0");
         let regen = |recipe: &str| {
-            let program = crate::rewrite::frozen::rewritten(recipe)
+            let program = crate::program::frozen::rewritten(recipe)
                 .unwrap_or_else(|e| panic!("load {} (run from the repo root): {}", recipe, e));
             program
         };

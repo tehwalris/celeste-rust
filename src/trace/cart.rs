@@ -1,7 +1,7 @@
 //! Tracing the actual game.
 //!
 //! The sources and the chunk layout are the pipeline's
-//! (`rewrite::program::Sources`): the builtin Lua, then the cart, then
+//! (`program::Sources`): the builtin Lua, then the cart, then
 //! `_init()`. What differs is that nothing is compiled to IR and nothing
 //! is rewritten - the interpreter walks the AST.
 //!
@@ -65,7 +65,7 @@ pub fn sources() -> Result<String> {
 
 /// What ONE FRAME is, for the tracer.
 ///
-/// The same chunk `rewrite::program::FRAME_CODE` gives the interpreter,
+/// The same chunk `program::FRAME_CODE` gives the interpreter,
 /// minus the button reset - `trace_frame` runs that itself, at the same
 /// boundary, before the frame rather than after.
 ///

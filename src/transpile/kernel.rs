@@ -30,9 +30,9 @@ use std::fmt::Write as _;
 use anyhow::{anyhow, bail, Context, Result};
 use crate::ir::{BinaryOp, Instruction, LocalId, Terminator, UnaryOp};
 use crate::pico8_num::Pico8Num as P8;
-use crate::rewrite::print::blocks_in_order;
+use crate::program::print::blocks_in_order;
 use super::graph::{Graph, NodeId, Op as GOp};
-use crate::rewrite::program::Program;
+use crate::program::Program;
 
 /// Emit-time value. `S*` strings are generated VARIABLE NAMES (each IR
 /// instruction result is let-bound), never raw expressions.

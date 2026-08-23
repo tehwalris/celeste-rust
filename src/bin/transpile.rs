@@ -8,7 +8,7 @@
 //! everything is `./regen-generated.sh`.
 
 use anyhow::{anyhow, Context, Result};
-use celeste_rust::rewrite::program::Program;
+use celeste_rust::program::Program;
 use celeste_rust::transpile::{kernel, names};
 
 fn main() -> Result<()> {
@@ -71,7 +71,7 @@ fn main() -> Result<()> {
         recipes
             .iter()
             .map(|path| -> Result<(String, Program)> {
-                let program = celeste_rust::rewrite::frozen::rewritten(path)
+                let program = celeste_rust::program::frozen::rewritten(path)
                     .with_context(|| format!("apply {}", path))?;
                 Ok((path.clone(), program))
             })
@@ -99,7 +99,7 @@ fn main() -> Result<()> {
         // overlay recipes (rewrites-compile.jsonl) live here, never in the
         // runner.
         Some(path) => {
-            let program = celeste_rust::rewrite::frozen::rewritten(path)
+            let program = celeste_rust::program::frozen::rewritten(path)
                 .with_context(|| format!("apply {} (run from the repo root)", path))?;
             program
         }

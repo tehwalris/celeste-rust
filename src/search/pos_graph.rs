@@ -376,11 +376,11 @@ pub fn build_from_replay(
     from: u32,
     frames: u32,
     fingerprint: &str,
-    engine: &mut crate::rewrite::verify::AbstractRun,
+    engine: &mut crate::search::run::AbstractRun,
 ) -> Result<PosGraph> {
     use crate::interpreter::abstraction::win_lane_mask;
     use crate::interpreter::state::FILTER_BAND;
-    use crate::rewrite::checkpoint;
+    use crate::search::checkpoint;
 
     engine.disable_frontier();
     engine.record_pos_graph();
