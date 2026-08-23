@@ -3531,6 +3531,31 @@ rather than mysterious:
 So the next lever is not more vectorization of the kernel. It is the
 BOUNDARY, which is now 22% of a much smaller total.
 
+> **That conclusion did not survive contact with the campaign** (added
+> 2026-08-24, Stage 5). The 22% is this 30-frame standalone harness. The
+> same kernels inside `run_chunk_kernel`, room (1,0), `bench --frames 40
+> --deopt` under the ladder env, report:
+>
+> ```
+> inside fwd.interpret (thread-seconds, summed over workers):
+>   frame body                         5.19s   95.7%
+>   boundary prepare                   0.24s    4.3%
+> ```
+>
+> **4.3%, not 22%.** Amdahl's cap is 1.045x of over-approximation, not
+> 1.35x - the boundary is not the binding constraint on the workload
+> that matters, and the whole "the boundary is the next lever" paragraph
+> above is priced off a harness that does not resemble production.
+>
+> The two are not measuring the same thing (the campaign's per-chunk
+> `acc.boundary(ids)` is inside "frame body", and the frontier's
+> `fwd.boundary_stream`/`_gather` are outside `fwd.interpret`
+> altogether), so this does not say the earlier number was wrong. It
+> says it was the wrong number to plan from. Philippe's call to do the
+> FrameEngine integration before the boundary is what surfaced this,
+> and it is the general lesson from `BENCHMARK_DATA.md`'s 25x-stale
+> episode restated: measure the workload you are going to run.
+
 **Holes that remain**, with counts rather than adjectives: 4 `zn_div`,
 4 `zn_rem`, 4 `zi_div_pos`, 9 `zn_mget`, 22 `zn_tile_flag_at`, against
 ~13,700 nodes. Philippe is right that divide is reachable - `f64` holds
