@@ -56,6 +56,11 @@ fn the_room_runs_on_kernels_alone() {
     // and hashing them) is counted on neither - it is the test's cost,
     // not either engine's.
     let mut t_kernels = std::time::Duration::ZERO;
+    let mut t_phase = (
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+    );
     let mut t_oracle = std::time::Duration::ZERO;
     for frame in 1..=FRAMES {
         let t0 = std::time::Instant::now();
@@ -68,6 +73,9 @@ fn the_room_runs_on_kernels_alone() {
                 break;
             }
         };
+        t_phase.0 += st.t_kernel;
+        t_phase.1 += st.t_merge;
+        t_phase.2 += st.t_boundary;
         let t1 = std::time::Instant::now();
         oracle.step().unwrap_or_else(|e| panic!("oracle frame {}: {:#}", frame, e));
         t_oracle += t1.elapsed();
@@ -178,6 +186,10 @@ fn the_room_runs_on_kernels_alone() {
     }
 
     eprintln!(
+        "[phase] kernel {:?}, merge {:?}, boundary {:?}",
+        t_phase.0, t_phase.1, t_phase.2
+    );
+    eprintln!(
         "[time] {} frames: kernels {:?}, interpreter {:?} ({:.2}x)",
         checked,
         t_kernels,
@@ -201,7 +213,7 @@ fn explain(
     oracle: &celeste_rust::rewrite::verify::AbstractRun,
     engine: &celeste_rust::compiled::FrameEngine,
 ) {
-    let mut theirs: Vec<celeste_engine::Rt2> = oracle
+    let theirs: Vec<celeste_engine::Rt2> = oracle
         .states()
         .iter()
         .filter(|s| s.vector_size > 0)

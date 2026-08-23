@@ -2863,6 +2863,29 @@ total time, from one change, and it attacks both measured problems at
 once - the per-row column writes AND the output values that were living
 across the variant sequence.
 
+### Where the 405 ms goes now - and why dedup is NOT next
+
+`FrameStat` splits the frame three ways. After constant columns:
+
+    kernel 252 ms,  merge 11 ms,  boundary 136 ms   (401 ms total)
+
+The kernel is 63%, the boundary 34%, merging is noise.
+
+That reorders the plan. A write-time dedup attacks the BOUNDARY's share,
+and the boundary is 136 ms against the interpreter's entire 219 ms frame
+budget - eliminating it outright would leave 1.2x, and it cannot be
+eliminated, because it still has to canonicalize and merge across
+blocks.
+
+The bigger half is the kernel, and after constant columns that is no
+longer dominated by writes (outcome 0 pushes 4 values per row, not 52).
+What is left is COMPUTATION over 96 variant-fork combinations per
+slice - which is exactly what per-group emission and fork specialization
+reduce.
+
+So: **per-group emission first**, dedup after, judged on what remains.
+The order I proposed before this measurement was wrong.
+
 ### Specialization is a LAYER, not a redefinition (Philippe)
 
 A kernel specific to a ladder rung is fine, "similar to what we did with

@@ -57,6 +57,16 @@ pub struct FrameStat {
     /// merge. Which of the two dominates decides whether a pre-dedup is
     /// a hash set or a whole `KeyPlan`.
     pub rows_distinct: usize,
+    /// Where the frame's time went: running the kernels, merging the
+    /// per-shape accumulators, and the boundary (widen-check, canonical
+    /// renumber, row hashing, dedup).
+    ///
+    /// Split because the fix for each is different, and the balance
+    /// moves: before constant columns were written once, the kernel half
+    /// was dominated by per-row pushes.
+    pub t_kernel: std::time::Duration,
+    pub t_merge: std::time::Duration,
+    pub t_boundary: std::time::Duration,
     /// The surviving rows' keys. The row key already carries the shape
     /// hash, so this set is comparable across blocks and across engines -
     /// it is what a run is checked against.
@@ -103,6 +113,9 @@ impl Run {
         self.frame += 1;
         let rows_in: usize = self.blocks.iter().map(|b| b.width).sum();
 
+        let mut t_kernel = std::time::Duration::ZERO;
+        let mut t_merge = std::time::Duration::ZERO;
+        let mut t_boundary = std::time::Duration::ZERO;
         let mut produced: Vec<Rt2> = Vec::new();
         for b in std::mem::take(&mut self.blocks) {
             let k = self.dispatch.find(&b).ok_or_else(|| {
@@ -118,6 +131,7 @@ impl Run {
             let mut accs: Vec<Rt2> =
                 (0..k.outcomes).map(|i| (k.acc)(i, self.cart.clone(), self.cache.clone())).collect();
             let mut declined = 0usize;
+            let t0 = std::time::Instant::now();
             let mut lo = 0;
             while lo < b.width {
                 let n = SLICE.min(b.width - lo);
@@ -145,6 +159,7 @@ impl Run {
                     b.width
                 );
             }
+            t_kernel += t0.elapsed();
             produced.extend(accs.into_iter().filter(|a| a.width > 0));
         }
 
@@ -180,6 +195,7 @@ impl Run {
             rows_distinct = seen.len();
         }
         for (_, group) in by_shape {
+            let t1 = std::time::Instant::now();
             let mut b = Rt2::merge_many(group);
             // Representation, not semantics - but two things downstream
             // insist on it. The boundary's timer pin accepts a uniform
@@ -189,7 +205,10 @@ impl Run {
             // not the lanes agree, so nothing else would ever collapse
             // one.
             b.collapse_uniform_cols();
+            t_merge += t1.elapsed();
+            let t2 = std::time::Instant::now();
             b.boundary(&self.ids);
+            t_boundary += t2.elapsed();
             rows_out += b.width;
             keys.extend(b.row_keys.iter().copied());
             self.blocks.push(b);
@@ -203,6 +222,9 @@ impl Run {
             blocks_out: self.blocks.len(),
             rows_raw,
             rows_distinct,
+            t_kernel,
+            t_merge,
+            t_boundary,
             keys,
         })
     }
