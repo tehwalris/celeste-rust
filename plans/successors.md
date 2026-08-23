@@ -13,32 +13,41 @@ GENERATED KERNELS - Rust compiled from a graph obtained by symbolically
 tracing the cart's Lua - so the interpreter can be deleted. The kernels
 work and agree with the interpreter exactly; they are 1.55x too slow.
 
-## The task
+## Two tasks, and this doc is about the first
 
-> Given a block of N game states, produce the SET of distinct successor
-> states, at least as fast as the interpreter produces it.
+**A - THE KERNEL (inner).** Given one slice of exactly 16 lanes, append
+its distinct successors to the output arrays. This is generated code,
+per heap shape, and it is where the interesting problem is.
 
-## What a kernel does now
+**B - THE LOOP (outer).** Drive A over a block, merge the per-shape
+outputs, canonicalize, dedup across slices, feed the result to the next
+frame. The baseline implementation just calls A in a loop.
 
-A block is column-major (`Rt2`): one array per heap cell, N lanes. The
-kernel processes it in slices of 16 lanes, and for each slice it runs the
-frame body once, then enumerates every way the frame can branch on
-something the search does not fix:
+### Task A, precisely
 
-* **64 button assignments.** Six buttons, free per frame. The emitter
-  folds these to **24 distinct** ones at emit time (many assignments
-  compute the same thing).
-* **Up to 4 fork configurations.** `player.rem` is widened to the
-  interval `[-0.5, 0.5)` by the level-0 abstraction, so `flr(rem + spd +
-  0.5)` can take two values; the cart marks the split with
-  `__split_by_flr`, and there are two such calls per frame (x and y).
+    step(block, lo, out) -> declined_mask
 
-So **96 configurations per slice**, each producing up to 16 rows, in up
-to 4 different output shapes ("outcomes" - a frame that kills an object
-ends in a different heap shape than one that does not).
+* **Input.** `block` is column-major (`Rt2`): one array per heap cell.
+  `lo` selects EXACTLY 16 lanes. Every lane is a game state of one known
+  heap shape - the kernel is generated for that shape and refuses any
+  other.
+* **Output.** Append rows to `out[i]`, one array per OUTCOME - per heap
+  shape a frame can end in (a frame that kills an object ends in a
+  different shape than one that does not). Appending means pushing one
+  value per cell onto that outcome's columns.
+* **What must be appended.** For each of the 16 input states, every
+  distinct successor it has. A successor exists per free choice the
+  search does not fix: the 6 button bits, and the <=2-way splits of the
+  widened `player.rem` where `flr` is ambiguous.
+* **Postcondition.** No two appended rows are equal. "Equal" means what
+  the boundary means: same outcome, and equal values in every cell.
+* **May assume.** All 16 lanes have the same heap shape. Values are
+  Pico-8 fixed point, booleans (tri-state), or intervals.
+* **Must not.** Drop a successor. A lane the kernel cannot handle is
+  reported in `declined_mask`, which stops the run - there is no
+  interpreter to fall back to.
 
-Each row is then written into an accumulator, same-shape accumulators
-are merged, and the engine's boundary canonicalizes and dedups them.
+Duplicates BETWEEN slices are task B's problem, not A's.
 
 ## The numbers (room (1,0), frame 30, single thread)
 
@@ -87,23 +96,21 @@ body, so rows from different fork configurations are generally distinct.
 ## Constraints
 
 1. **The successor SET must be exactly the interpreter's.** Checked per
-   frame by row-key set equality (`the_room_runs_on_kernels_alone`), not
-   by count. A missing successor is a wrong answer, not a slow one.
-2. **The row key is fixed.** A 128-bit hash over canonical cell values,
-   summed per cell so that block-uniform cells fold once. It is what
-   every checkpoint, the backward sweep and the position graph speak, so
-   it cannot be redefined.
+   frame by row-key set equality, not by count. A missing successor is a
+   wrong answer, not a slow one.
+2. **"Same row" must mean what the boundary means.** The kernel may
+   decide two rows are duplicates only if the boundary would too -
+   equal values, cell by cell, after the widenings (which the kernel
+   applies itself). Deciding it on less risks dropping a real
+   successor; deciding it on more just leaves work for the boundary.
 3. **Never deopt.** A lane the kernel cannot handle stops the run with a
-   reason; there is no interpreter fallback. (CLAUDE.md.)
-4. **The generated code must compile in reasonable time.** One frame is
-   ~6,000 graph nodes emitted as one function. Anything that lengthens
-   live ranges across the variant sequence is dangerous: unioning masks
-   across 24 variants took the build from 70 s to 20+ minutes, and
-   letting LLVM see the fork loop's trip count did the same.
-5. **16 lanes, `u16` masks.** Liveness, validity and deopt are all
-   16-bit masks; the lane width is not a tuning parameter.
-6. **Widening happens inside the kernel**, so a row is hashed on the
-   value it stores. Every boundary widening is a per-row function.
+   reason. There is no interpreter fallback (CLAUDE.md).
+4. **16 lanes, `u16` masks.** Liveness, validity and deopt are all
+   16-bit masks.
+5. **It has to compile.** One frame is ~6,000 graph nodes in one
+   function, and the generated code is already ~10k lines per shape.
+   Solutions that multiply the emitted code have a real cost - see the
+   two build blow-ups under "what has been tried".
 
 ## What has been tried
 
@@ -116,8 +123,14 @@ body, so rows from different fork configurations are generally distinct.
 * **A `std::HashSet` for that dedup.** Hashes the key a second time;
   append 175 -> 279 ms. REPLACED.
 * **Static grouping as a bolt-on** - give one variant the union of its
-  group's take masks. Correct, but it keeps 48 mask variables live
-  across the whole function: build 70 s -> 20+ minutes. REVERTED.
+  group's take masks. Correct, but it made the build 70 s -> 20+
+  minutes: the union references every variant's masks, so 48 values that
+  used to die immediately stayed live across the whole function and the
+  register allocator drowned. REVERTED. (The same thing happened when
+  LLVM could see the fork loop's trip count and unrolled a 10k-line body
+  four times; `black_box` on the bound fixed that one.) Both are the
+  same lesson: in a function this size, anything that reaches backwards
+  across the variant sequence is expensive.
 
 ## The question
 
