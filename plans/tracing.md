@@ -42,6 +42,7 @@ variants, and the per-frame graph check (1,393,224 values).
 | live values | ~486 peak in the body, inherent to the dependency graph (the "493 are OUTPUTS" reading was an artifact - see the CORRECTION below) |
 | build loop | ~55 s (was 25 min until `black_box` on the fork trip count) |
 | lane primitives | already vectorized by LLVM - forcing AVX-512 by hand costs 27% ("REFUTED" below) |
+| fork specialization | 3.92x the nodes for identical work, so REFUTED - the four configurations share 1.9% |
 
 ### The design that follows, agreed with Philippe
 
@@ -3261,33 +3262,59 @@ said it: 47% stack traffic against 6.6% vector, with ~486 values live in
 the body. The function's problem is that it cannot hold what it already
 has. Moving more of it into 32 zmm registers is not the direction.
 
-### Before building fork specialization: measure what it would cost
+### REFUTED: fork as specialization (2026-08-23)
 
-The codegen table above changes how this should be judged. `frame` is
-SPILL-bound - 47% stack traffic against 6.6% vector, ~486 values live in
-the body - and specialization trades runtime for code size: nodes
-downstream of the split that genuinely depend on the fragment are
-emitted once per configuration, where the loop emitted them once and
-executed them up to four times.
+The section above ("Specializing a split needs NO new op") is right that
+it CAN be done, and Philippe's reason for wanting it - "because we can
+merge nodes back there and share computations" - is the right reason to
+want it. It does not hold for this graph, and one cheap measurement says
+so before anything is built.
 
-So it is not obviously a win, and which way it goes is a reachability
-fact about the traced graph rather than an argument. The measurement is
-`trace::kernel::tests::what_specializing_the_fork_would_cost`: build the
-specialized arena both ways - 64 assignments with `Op::Split` left
-standing, and 64 x 2^forks with the fragments resolved - and compare the
-live node counts. Hash-consing is what decides the ratio: every node the
-configurations agree on is one node in both arenas.
+`trace::kernel::tests::what_specializing_the_fork_would_cost` builds the
+specialized arena both ways and counts live nodes. Room (1,0):
 
-Two things to keep in mind when reading it:
+| shape | forks | traced nodes | loop | specialized | ratio | max | shared |
+|---|---|---|---|---|---|---|---|
+| 0 | 0 | 2130 | 11760 | 11760 | 1.00x | 1x | - |
+| **1** | **2** | 2220 | **13700** | **53761** | **3.92x** | 4x | **1.9%** |
+| 2 | 0 | 78 | 78 | 78 | 1.00x | 1x | - |
 
-* **A 1.0x ratio is a pure win** and anything under ~1.3x probably is
-  too, since the loop is paying 2-4x in EXECUTION for the same nodes.
-* **The lost early-out is not in this number.** `if valid{d} == 0 {
-  continue; }` skips the whole tail for a slice in which no lane
-  straddles a floor boundary. If that is the common case, the loop is
-  nearly free today and specialization is a straight loss whatever the
-  node count says. That needs a second measurement - how often the fork
-  actually fires - and it is the one that would kill the idea.
+53,761 / 4 = 13,440 against the loop's 13,700. The four configurations
+are four separate copies of the frame.
+
+**And the work is identical either way.** The loop evaluates its tail up
+to 2^forks times; specialization evaluates 2^forks copies once each.
+Same node-evaluations. So the ratio is PURE code size - 3.92x the
+emitted kernel, in a function that is already 47% stack traffic with
+~486 values live - and specialization additionally gives up
+`if valid{d} == 0 { continue; }`, which skips the tail entirely for a
+slice in which no lane straddles a floor boundary.
+
+The only thing specialization could win is folding: a concrete fragment
+makes `zi_fork_flr` cheap and might collapse constants downstream. The
+1.9% is that win, measured.
+
+**Why there is nothing to share.** The fork is on `player.rem`. `rem`
+feeds position, position feeds collision, collision feeds essentially
+the whole frame. A fork this early in the dependency order has almost
+nothing downstream of it that does not depend on the fragment.
+
+**What survives.** `Op::Frag` / `Op::FragOk` and
+`Graph::specialize_config_into` are kept, with `eval` arms, the
+`FragOk(0) -> true` fold and the measurement test - but NOT an emitter
+arm, which would be dead code. The ops exist so the measurement can be
+re-run: a tracer whose fork sat somewhere less load-bearing than `rem`
+would show a different ratio, and this is how you would find out rather
+than re-arguing it.
+
+**The option that is still open** is the other one that section listed:
+LANE DOUBLING. A fork doubles the LANES rather than repeating the body -
+a 16-lane slice becomes two, one per fragment, empties dropped by
+`f0_fv`. The body is emitted ONCE and, unlike both alternatives here,
+the half-empty configurations can be PACKED against other slices'
+fragments instead of each running 16 lanes wide to keep three. That is a
+change to the driver rather than to the emitter, and it is the only one
+of the three that attacks the work rather than moving it.
 
 ## Doctrine: never deopt to the interpreter (Philippe, 2026-08-23)
 

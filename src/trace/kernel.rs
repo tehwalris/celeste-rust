@@ -1238,4 +1238,94 @@ mod tests {
             );
         }
     }
+
+    /// What specializing the fork WOULD cost, in nodes - the measurement
+    /// that refuted it (2026-08-23).
+    ///
+    /// The runtime loop runs the tail of the frame once per fork
+    /// configuration; specialization runs each configuration's nodes
+    /// once, sharing everything the configurations agree on. Which is
+    /// cheaper is entirely a question of how much of the frame is
+    /// downstream of the split, and that is a reachability fact this
+    /// answers before anything is built.
+    ///
+    /// Reported per shape: the specialized arena's live node count with
+    /// the splits left standing (what is emitted today, inside a loop)
+    /// against the same count with all 2^forks configurations resolved.
+    ///
+    /// The answer on room (1,0) is **3.92x on shape 1**, against a
+    /// theoretical maximum of 4.00x - so the configurations share 1.9%
+    /// of their nodes and specialization is four separate copies of the
+    /// frame. Kept as a test rather than deleted with the idea, because
+    /// it is what makes the refutation re-checkable: a future tracer
+    /// whose fork sits somewhere less load-bearing than `player.rem`
+    /// would show a different ratio, and this is how you would find out.
+    #[test]
+    #[ignore]
+    fn what_specializing_the_fork_would_cost() {
+        use crate::transpile::graph::{Graph, NodeId};
+        let refs = match super::room_kernels_in(std::path::Path::new(".")) {
+            Ok(r) => r,
+            Err(e) => panic!("{:#}", e),
+        };
+        for (si, r) in refs.iter().enumerate() {
+            let g = &r.bound.graph;
+            let forks = r.bound.forks;
+            let base: Vec<NodeId> = {
+                let mut v = Vec::new();
+                for o in r.bound.outcomes.iter() {
+                    v.extend(o.outputs.iter().map(|(_, n, _)| *n));
+                    v.push(o.live);
+                    v.push(o.ok);
+                }
+                v
+            };
+            let live_count = |arena: &Graph, roots: &[NodeId]| -> usize {
+                crate::transpile::bdd::reachable(arena, roots)
+                    .iter()
+                    .filter(|b| **b)
+                    .count()
+            };
+            // Today: 64 assignments, splits left as nodes.
+            let mut loop_arena = Graph::new();
+            let mut loop_roots: Vec<NodeId> = Vec::new();
+            for m in 0u8..64 {
+                let map = g.specialize_config_into(m, None, &mut loop_arena);
+                loop_roots.extend(base.iter().map(|x| map[*x as usize]));
+            }
+            // Specialized: 64 assignments x 2^forks configurations.
+            let ns: u8 = 1 << forks;
+            let mut flat_arena = Graph::new();
+            let mut flat_roots: Vec<NodeId> = Vec::new();
+            for m in 0u8..64 {
+                for c in 0..ns {
+                    let map = g.specialize_config_into(m, Some(c), &mut flat_arena);
+                    flat_roots.extend(base.iter().map(|x| map[*x as usize]));
+                }
+            }
+            let (a, b) = (
+                live_count(&loop_arena, &loop_roots),
+                live_count(&flat_arena, &flat_roots),
+            );
+            // The two are equal in WORK - the loop evaluates its tail
+            // up to 2^forks times, specialization evaluates 2^forks
+            // copies once each - so the ratio is pure code size, and
+            // anything near 2^forks means the configurations share
+            // nothing and the trade is all cost.
+            eprintln!(
+                "[fork] shape {}: {} forks, traced graph {} nodes; \
+                 emitted live nodes {} (loop) -> {} (specialized), {:.2}x \
+                 of a maximum {:.2}x, so {:.1}% shared.",
+                si,
+                forks,
+                g.len(),
+                a,
+                b,
+                b as f64 / a.max(1) as f64,
+                ns as f64,
+                100.0 * (1.0 - b as f64 / (ns as f64 * a.max(1) as f64)),
+            );
+        }
+    }
+
 }

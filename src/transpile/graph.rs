@@ -206,6 +206,17 @@ pub enum Op {
     /// analogue of - the outcomes of a split PARTITION the lanes, so the
     /// primitive returns a (value, validity) pair and it is two nodes.
     SplitValid(u8),
+    /// `Split(d)` after specialization: fragment `c` of an interval,
+    /// `c` being a CONCRETE fork configuration rather than a runtime
+    /// loop variable. `Frag` narrows, `FragOk` says whether the fragment
+    /// is non-empty - together they are exactly `zi_fork_flr(x, c)`.
+    ///
+    /// Ordinary unary ops, which is the whole point: they intern and
+    /// fold like anything else, so the configurations SHARE every node
+    /// they agree on instead of the emitter running the tail of the
+    /// frame once per configuration. See `specialize_into`.
+    Frag(u8),
+    FragOk(u8),
     /// `SplitOk` over the same operand: does this lane's interval span at
     /// most TWO floors? Below that the split is exact; above it there is
     /// no third outcome to put the remaining fragment in, so the lane
@@ -343,10 +354,47 @@ impl Graph {
     /// `Sel(right, 1, Sel(left, -1, 0))`, so with right = true the whole
     /// thing folds to 1 whatever left is: {left,right} and {right} collapse.
     pub fn specialize_into(&self, frees: u8, out: &mut Graph) -> Vec<NodeId> {
+        self.specialize_config_into(frees, None, out)
+    }
+
+    /// As `specialize_into`, and ALSO resolve the splits.
+    ///
+    /// `splits` is one bit per fork level, or `None` to leave
+    /// `Op::Split`/`Op::SplitValid` standing - which is what the walk's
+    /// kernels do, because they emit a fork as a runtime loop and their
+    /// generated form is checked in byte-for-byte.
+    ///
+    /// Resolving a split here rather than at runtime is the same trade
+    /// as resolving a button. A `Free` becomes a CONSTANT, which is why
+    /// button assignments collapse so well; a `Split` cannot - it is a
+    /// narrowing of a runtime value, not a constant - but it does not
+    /// need to be. It needs to be ORDINARY ARITHMETIC, and `Frag` /
+    /// `FragOk` are. They intern, they fold, and every node the
+    /// configurations agree on is therefore ONE node, where the runtime
+    /// loop re-executed the whole tail of the frame per configuration.
+    ///
+    /// The cost is the nodes that genuinely differ: those are emitted
+    /// once per configuration, so a fork early in a frame duplicates
+    /// whatever downstream of it actually depends on the fragment.
+    /// That is the trade, and it is a measurement rather than an
+    /// argument - see `plans/tracing.md`.
+    pub fn specialize_config_into(
+        &self,
+        frees: u8,
+        splits: Option<u8>,
+        out: &mut Graph,
+    ) -> Vec<NodeId> {
         let mut map: Vec<NodeId> = Vec::with_capacity(self.nodes.len());
         for node in &self.nodes {
-            let id = match node.op {
-                Op::Free(b) => out.leaf(Op::ConstBool(frees & (1 << b) != 0)),
+            let arg = |map: &Vec<NodeId>, k: usize| map[node.args[k] as usize];
+            let id = match (node.op.clone(), splits) {
+                (Op::Free(b), _) => out.leaf(Op::ConstBool(frees & (1 << b) != 0)),
+                (Op::Split(d), Some(s)) => {
+                    out.fold(Op::Frag((s >> d) & 1), vec![arg(&map, 0)])
+                }
+                (Op::SplitValid(d), Some(s)) => {
+                    out.fold(Op::FragOk((s >> d) & 1), vec![arg(&map, 0)])
+                }
                 _ => {
                     let args: Vec<NodeId> =
                         node.args.iter().map(|a| map[*a as usize]).collect();
@@ -400,6 +448,17 @@ impl Graph {
             })
         };
         match op {
+            // Fragment 0 of any interval is non-empty, always: a single
+            // floor keeps the whole interval, two floors keep the lower
+            // one, and more than two floors also route the lane through
+            // configuration 0 (`zi_span_ok` is what takes it off the
+            // kernel). So `FragOk(0)` is a constant, and folding it is
+            // what makes configuration 0 as cheap as no fork at all.
+            //
+            // EXACT, not a refinement: `eval`'s `FragOk(0)` arm returns
+            // `Some(true)` for every operand, and the two are checked
+            // against each other by `folding_is_exact`.
+            Op::FragOk(0) => return self.leaf(Op::ConstBool(true)),
             // The one that matters: a decided condition picks its arm, so
             // the other arm (and whatever only it used) disappears.
             Op::Sel => {
@@ -632,6 +691,29 @@ impl Graph {
                     bail!("node {}: split {} has no value outside an outcome", i, d)
                 }
                 Op::SplitOk => bail!("node {}: SplitOk needs the interval's floor span", i),
+                // The RESOLVED fork: `zi_fork_flr`'s three cases, on one
+                // interval instead of sixteen lanes. Exact, and it is
+                // the definition `fold`'s `FragOk(0)` rule is checked
+                // against.
+                Op::Frag(c) | Op::FragOk(c) => {
+                    let iv = a(0).as_num("Frag")?;
+                    let (fl, fh) = (iv.low.flr(), iv.high.flr());
+                    let two = fh == fl + Pico8Num::from_i16(1);
+                    match (&node.op, *c) {
+                        // Exactly two floors: fragment 0 is everything
+                        // below the boundary, fragment 1 everything from
+                        // it up. One floor, or more than two, leaves the
+                        // interval alone in both fragments - fragment 1
+                        // is simply not valid there.
+                        (Op::Frag(_), 0) if two => {
+                            Val::Num(Pico8NumInterval::new(iv.low, fh.next_smallest()))
+                        }
+                        (Op::Frag(_), _) if two => Val::Num(Pico8NumInterval::new(fh, iv.high)),
+                        (Op::Frag(_), _) => a(0),
+                        (_, 0) => Val::Bool(Some(true)),
+                        _ => Val::Bool(Some(two)),
+                    }
+                }
                 Op::Cell(c) => match cells.get(c) {
                     Some(v) => *v,
                     None => bail!("node {}: input cell {} was not supplied", i, c),
@@ -775,6 +857,7 @@ impl Graph {
             | Op::Free(_)
             | Op::SplitValid(_)
             | Op::SplitOk
+            | Op::FragOk(_)
             | Op::Lt
             | Op::Le
             | Op::Gt

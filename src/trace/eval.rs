@@ -194,7 +194,7 @@ fn run(g: &Graph, need: &[bool], env: &Env, strict: bool) -> Result<Vec<Option<C
             // The specialization ops. The tracer never builds one - a
             // split is a branch to it, not a node - so reaching here
             // means the graph came from somewhere else.
-            Op::Split(_) | Op::SplitValid(_) | Op::SplitOk => {
+            Op::Split(_) | Op::SplitValid(_) | Op::SplitOk | Op::Frag(_) | Op::FragOk(_) => {
                 bail!("node {} is {:?}, which the tracer does not build", id, node.op)
             }
             // Likewise the row-key layer: `lower` builds the fold, in

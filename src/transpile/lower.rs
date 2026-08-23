@@ -228,8 +228,8 @@ impl<'a> Ctx<'a> {
                 }
             }
             // A split narrows an interval; the fragment is still an interval.
-            Op::Split(_) => Repr::num(true, true),
-            Op::SplitValid(_) => Repr::boolean(true, false),
+            Op::Split(_) | Op::Frag(_) => Repr::num(true, true),
+            Op::SplitValid(_) | Op::FragOk(_) => Repr::boolean(true, false),
             Op::SplitOk => Repr::boolean(true, false),
             Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::Neg | Op::Abs | Op::Min
             | Op::Max => joined(Dom::Num),
@@ -596,6 +596,18 @@ impl<'a> Ctx<'a> {
                 }
             }
             Op::SplitOk => format!("zi_span_ok({})", self.raw(id, 0)?),
+            // The resolved fork does not lower, because nothing emits
+            // one: specializing the fork was MEASURED and refuted -
+            // 3.92x the nodes for identical work, see
+            // `what_specializing_the_fork_would_cost`. The ops stay so
+            // that measurement can be re-run; the emitter arm would be
+            // dead code, so it is this instead.
+            Op::Frag(_) | Op::FragOk(_) => bail!(
+                "node {} is a resolved fork fragment. The emitter does not lower one - \
+                 fork specialization was refuted (plans/tracing.md); the kernels emit \
+                 `Op::Split` inside a runtime loop.",
+                id
+            ),
             // ---- row key ----
             Op::Bits => {
                 let src = self.r(a[0]);
