@@ -65,11 +65,25 @@ pub struct FrameOut {
     /// shape difference can, so keeping it is what turns "twelve
     /// outcomes" into a statement about the program.
     pub shape: super::heap::Shape,
+    /// The ENGINE's structure for the state this outcome ends in, and
+    /// the canonical cell each of `fields` / `ubool` lands on in it.
+    ///
+    /// Per outcome, not once per frame: an outcome that allocates - a
+    /// death making a new player - or that frees one shifts every cell
+    /// after the change, so the ids here are only meaningful against
+    /// `rt2`. They are NOT comparable with `Frame::in_cells` unless the
+    /// outcome kept the input shape.
+    pub rt2: celeste_engine::runtime2::Rt2,
+    pub cells: Vec<u32>,
+    pub ubool_cells: Vec<u32>,
 }
 
 pub struct Frame {
     pub iface: Iface,
     pub outs: Vec<FrameOut>,
+    /// The canonical cell each `Iface` slot names in the state the frame
+    /// STARTS in - the engine's numbering for `Op::Cell(i)`.
+    pub in_cells: Vec<u32>,
 }
 
 /// Run one chunk and require it to end normally in exactly one state.
@@ -130,6 +144,18 @@ pub fn trace_frame<'a>(
     // Built BEFORE the frame runs, so it names the input cells rather
     // than whatever the frame did to those slots.
     let pin_ok = iface::pin_guard(&mut it.d, &iface);
+    // The engine's numbering for the INPUT shape. Here rather than in a
+    // later pass because this is the last moment the input state exists;
+    // `symbolize` changed the values in it and not the shape, so the
+    // structure this describes is the one the boundary handed us.
+    let (cart, cache) = match (it.cart.clone(), it.cache.clone()) {
+        (Some(a), Some(b)) => (a, b),
+        _ => bail!("tracing a frame needs the cart and the room's collision cache"),
+    };
+    let in_cells = {
+        let in_rt2 = super::bind::structure_of(&st, cart.clone(), cache.clone())?;
+        super::bind::bind_inputs(&in_rt2, &iface)?
+    };
     let st = run_one(it, reset, st)?;
     let mut outs = Vec::new();
     for (s, f) in it.exec_block(frame.nodes(), st)? {
@@ -143,15 +169,27 @@ pub fn trace_frame<'a>(
         // the interpreter. Folds to `s.ok` when nothing is pinned.
         let ok = it.d.graph.fold(crate::transpile::graph::Op::And, vec![s.ok, pin_ok]);
         let (fields, ubool) = out_fields(&s)?;
+        // The engine's numbering for THIS outcome's shape. Fields and
+        // dead cells are resolved together: they share one cell space,
+        // so a collision between the two halves is exactly as wrong as
+        // one within either, and only resolving them together sees it.
+        let rt2 = super::bind::structure_of(&s, cart.clone(), cache.clone())?;
+        let paths: Vec<Path> =
+            fields.iter().map(|(p, _, _)| p.clone()).chain(ubool.iter().cloned()).collect();
+        let all = super::bind::resolve_all(&rt2, &paths)?;
+        let (cells, ubool_cells) = all.split_at(fields.len());
         outs.push(FrameOut {
             guard: s.guard,
             ok,
             fields,
             ubool,
             shape: s.shape()?,
+            rt2,
+            cells: cells.to_vec(),
+            ubool_cells: ubool_cells.to_vec(),
         });
     }
-    Ok(Frame { iface, outs })
+    Ok(Frame { iface, outs, in_cells })
 }
 
 /// The six cells `Rt2::partition_pm1` splits a block on, as tracer
@@ -192,30 +230,6 @@ pub fn pm1_key(player: &Path, st: &State<Symbolic>, d: &Symbolic) -> Result<Vec<
         out.push((p, c));
     }
     Ok(out)
-}
-
-/// Every outcome of a traced frame as emitter outcomes, ready to lower
-/// into ONE body. `base` is where output cell numbering starts (after
-/// the inputs), and the button cells are excluded: they end the frame
-/// holding NEXT frame's free choices, so they are button-dependent by
-/// construction and would distinguish all 64 assignments on their own.
-#[cfg(test)]
-fn frame_outcomes(f: &Frame, base: u32) -> Vec<super::emit::FrameOutcome> {
-    f.outs
-        .iter()
-        .map(|o| super::emit::FrameOutcome {
-            outputs: o
-                .fields
-                .iter()
-                .enumerate()
-                .map(|(i, (_, node, is_bool))| {
-                    (base + i as u32, *node, if *is_bool { "ZB" } else { "ZN" })
-                })
-                .collect(),
-            live: o.guard,
-            ok: o.ok,
-        })
-        .collect()
 }
 
 /// Write a concrete button assignment, for the oracle side.
@@ -600,34 +614,27 @@ mod tests {
             _ => None,
         };
         let g = std::mem::take(&mut it.d.graph);
-        let mut inputs: Vec<(u32, &'static str)> = Vec::new();
-        let mut uni: Vec<(u32, &'static str)> = Vec::new();
-        let sample = &bodies[0].1.iface;
-        for (i, c) in sample.init.iter().enumerate() {
-            let kind = match c {
-                Conc::Num(_) => "num",
-                Conc::Bool(_) => "bool",
-            };
-            if iface::show(&sample.slots[i]).contains(".hitbox.") {
-                uni.push((i as u32, kind));
-            } else {
-                inputs.push((i as u32, kind));
-            }
-        }
-        let base = inputs.len() as u32;
 
         let mut total_lines = 0usize;
         let mut total_variants = 0usize;
         let mut refused = 0usize;
         for (key, f) in &bodies {
             let (mut lines, mut variants) = (0usize, 0usize);
-            match super::super::emit::lower_frame(
-                &g,
-                &inputs,
-                &uni,
-                &frame_outcomes(f, base),
-                room.clone(),
-            ) {
+            // Every key was traced from the same state, so they share an
+            // input shape and the binding is the same one 24 times over.
+            // Doing it per body anyway is what would SAY SO if a key ever
+            // came from a different shape, instead of silently emitting
+            // one body's cell ids for another body's slots.
+            assert_eq!(
+                f.in_cells, bodies[0].1.in_cells,
+                "{}: a different input numbering than the first key",
+                show_key(key)
+            );
+            match super::super::emit::bind(f, &g)
+                .and_then(|b| super::super::emit::lower_frame(
+                    &b.graph, &b.inputs, &b.uni, &b.outcomes, room.clone(),
+                ))
+            {
                 Ok(l) => {
                     lines = l.body.len();
                     variants = l.variants;
@@ -739,28 +746,12 @@ mod tests {
                 }
             };
             let g = it.d.graph.clone();
-            let mut inputs: Vec<(u32, &'static str)> = Vec::new();
-            let mut uni: Vec<(u32, &'static str)> = Vec::new();
-            for (i, c) in f.iface.init.iter().enumerate() {
-                let kind = match c {
-                    Conc::Num(_) => "num",
-                    Conc::Bool(_) => "bool",
-                };
-                if iface::show(&f.iface.slots[i]).contains(".hitbox.") {
-                    uni.push((i as u32, kind));
-                } else {
-                    inputs.push((i as u32, kind));
-                }
-            }
-            let cellbase = inputs.len() as u32;
             let (mut lines, mut variants) = (0usize, 0usize);
-            match super::super::emit::lower_frame(
-                &g,
-                &inputs,
-                &uni,
-                &frame_outcomes(&f, cellbase),
-                room.clone(),
-            ) {
+            match super::super::emit::bind(&f, &g)
+                .and_then(|b| super::super::emit::lower_frame(
+                    &b.graph, &b.inputs, &b.uni, &b.outcomes, room.clone(),
+                ))
+            {
                 Ok(l) => {
                     lines = l.body.len();
                     variants = l.variants;
@@ -834,32 +825,6 @@ mod tests {
             eprintln!("[emit] pinned {} = {:?}", iface::show(&f.iface.slots[*i]), c);
         }
 
-        // The tracer's OWN numbering: input cells are `Op::Cell(i)` in
-        // `Iface` order, and outputs are numbered after them. Not the
-        // engine's - see `trace::emit`.
-        // UNIFORM vs PER-LANE is a boundary decision the tracer does
-        // not model yet, and the emitter needs it: `tile_flag_at` takes
-        // its width and height as block-uniform `P8`, so a per-lane
-        // hitbox is a narrowing it refuses. A hitbox IS uniform - it is
-        // fixed per object type and never written during a frame - so
-        // saying so here is a stand-in for the classification, not a
-        // fudge. Getting it from the boundary is part of the numbering
-        // work still to come.
-        let mut inputs: Vec<(u32, &'static str)> = Vec::new();
-        let mut uni: Vec<(u32, &'static str)> = Vec::new();
-        for (i, c) in f.iface.init.iter().enumerate() {
-            let kind = match c {
-                Conc::Num(_) => "num",
-                Conc::Bool(_) => "bool",
-            };
-            let path = iface::show(&f.iface.slots[i]);
-            if path.contains(".hitbox.") {
-                uni.push((i as u32, kind));
-            } else {
-                inputs.push((i as u32, kind));
-            }
-        }
-        let base = inputs.len() as u32;
         // The map, so the interval pass can decide collision tests
         // rather than treating every one of them as unknown.
         let room = match (it.cart.clone(), it.cache.clone()) {
@@ -867,6 +832,17 @@ mod tests {
             _ => None,
         };
         let g = std::mem::take(&mut it.d.graph);
+        // The ENGINE's cell ids, resolved from the tracer's paths.
+        let b = match super::super::emit::bind(&f, &g) {
+            Ok(b) => b,
+            Err(e) => return eprintln!("[emit] BIND REFUSED: {:#}", e),
+        };
+        eprintln!(
+            "[emit] bound {} row inputs + {} uniform inputs; outcome shapes {:?} cells",
+            b.inputs.len(),
+            b.uni.len(),
+            f.outs.iter().map(|o| o.rt2.structure.len()).collect::<Vec<_>>()
+        );
 
         // ONE INPUT SHAPE, N OUTPUT SHAPES. Lowering each outcome on its
         // own - which is what this probe does - emits four KERNELS, and
@@ -917,10 +893,10 @@ mod tests {
         // numbers are printed per outcome below; this is the total they
         // are compared against.
         match super::super::emit::lower_frame(
-            &g,
-            &inputs,
-            &uni,
-            &frame_outcomes(&f, base),
+            &b.graph,
+            &b.inputs,
+            &b.uni,
+            &b.outcomes,
             room.clone(),
         ) {
             Ok(l) => eprintln!(
@@ -937,23 +913,11 @@ mod tests {
             // button-dependent by construction and would distinguish all
             // 64 assignments on their own - which is why the emitter has
             // `OutFields::ubool` to keep them out of `fields`.
-            let outputs: Vec<(u32, crate::transpile::graph::NodeId, &'static str)> = o
-                .fields
-                .iter()
-                .enumerate()
-                .map(|(i, (_, node, is_bool))| {
-                    (base + i as u32, *node, if *is_bool { "ZB" } else { "ZN" })
-                })
-                .collect();
             let lowered = super::super::emit::lower_frame(
-                &g,
-                &inputs,
-                &uni,
-                &[super::super::emit::FrameOutcome {
-                    outputs: outputs.clone(),
-                    live: o.guard,
-                    ok: o.ok,
-                }],
+                &b.graph,
+                &b.inputs,
+                &b.uni,
+                &b.outcomes[n..n + 1],
                 room.clone(),
             );
             match &lowered {
@@ -962,7 +926,7 @@ mod tests {
                     n,
                     l.body.len(),
                     l.variants,
-                    outputs.len()
+                    o.fields.len()
                 ),
                 Err(e) => eprintln!("[emit] outcome {} REFUSED: {:#}", n, e),
             }

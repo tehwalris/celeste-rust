@@ -1492,17 +1492,7 @@ regression gate is exact rather than a judgement call.
 
 ### What is still missing before this is T6
 
-This is the EMITTER half. Still to come, and they are the plumbing
-rather than the compiler:
-
-* `Variant::per` is a `Vec`, but `render` and `transpile::fuse` read
-  `per[0]`. Emitting a kernel with n > 1 needs the generated interface
-  to declare n output shapes and write n row sets.
-* `FrameEngine::step` is already `(shape, rows) -> [(shape, rows)]` and
-  nothing has ever populated more than one entry; dispatch, the bridge
-  and the chunk accounting need checking at n > 1.
-* The partition check P2 calls for: union of member masks plus the deopt
-  count equals the lane count, so no lane is lost or double-counted.
+This is the EMITTER half; the numbering half is T18 below.
 
 ## T17 - the boundary numbering, done the other way round
 
@@ -1608,6 +1598,89 @@ unnameable.
 Two things it refuses rather than guesses: a table with both a hash and
 an array part (no table in the cart has one, and the engine's `Cell2`
 picks one), and integer keys outside the array part.
+
+## T18 - the numbering, applied (and the bug it was hiding)
+
+T17 built the resolver. This wires it in: `trace::emit::bind` takes a
+traced frame and hands the emitter cell ids an `Rt2` actually has.
+
+Three pieces.
+
+`trace_frame` now resolves as it goes. It builds the engine structure
+for the input state and for each outcome's state, and resolves every
+path against the right one. `Frame` carries `in_rt2` / `in_cells`;
+`FrameOut` carries `rt2` / `cells` / `ubool_cells`. Resolving at trace
+time is not an optimization - it is the only moment the states exist.
+
+`bind::renumber_cells` rewrites the graph. The tracer numbers input
+cells `Op::Cell(0..n)` densely, in `Iface` order, because its own
+evaluator and every perturbation test index that array directly. The
+emitter needs the engine's sparse canonical ids. So the graph is rebuilt
+once at the join, and the tracer keeps its dense names - the same choice
+T17 made about paths, applied to nodes.
+
+`emit::bind` puts them together and replaces the ad-hoc numbering three
+probes were each doing by hand.
+
+**Inputs and outputs are two numbering spaces, and that is not a
+defect.** An outcome that allocates or frees an object shifts every
+canonical id past the change. Measured on room (0,0) f40: one input
+shape, four outcomes, structures of 274 / 282 / 229 / 400 cells. The
+generated code reads inputs off the chunk and writes outputs onto an
+accumulator built from the outcome's structure - different blocks, so
+the two spaces never meet. An id is only meaningful against the
+structure it came from.
+
+The body did not change: 4,419 lines and 24 variants before and after.
+Renumbering cells cannot change what the graph computes, and this says
+it did not.
+
+### `structure_of` was not producing canonical ids
+
+T17 wrote that `structure_of` "follows the engine's numbering rule". It
+did not. It allocated a table's cell inside the slot that pointed at it,
+so a table-valued global put its pointee between itself and the next
+global. Every id from global 12 onwards was off by a growing amount.
+
+Nothing caught it, and it is worth being precise about why. The T17
+tests check that every path RESOLVES and that no two paths land on one
+cell. Both pass on a consistently wrong numbering: the structure is
+internally coherent, just not the one the engine builds. The failure it
+would have caused is the same one `resolve_all` guards against - a
+kernel writing cells the engine reads back as different fields, with a
+well-formed block coming out and nothing downstream noticing.
+
+**The fix is to check against the rule, not to restate it.**
+`Rt2::boundary_canonicalize` had the BFS, the compaction and the
+canonical field sort inline. Those three are now
+`Rt2::canonicalize_ids`, and `boundary_canonicalize` calls it after its
+widenings. `the_structure_a_traced_state_becomes_is_already_canonical`
+then requires `canonicalize_ids` to be the IDENTITY on what
+`structure_of` builds.
+
+That is the strongest form available here. There is one implementation
+of the numbering rule, in the crate that owns it, and the tracer's
+producer is checked against it rather than against a second copy of it.
+A restatement of the rule inside a test would have been written from the
+same misreading that produced the bug.
+
+The field sort moved into `canonicalize_ids` for the same reason: field
+order determines child discovery order, so it is part of the numbering
+rule, and leaving it outside would have left that part unchecked.
+Nothing between the old sort site and the BFS reads fields positionally
+(`mark_walk` and the widenings all go through `obj_field_cell`), so the
+move is behaviour-preserving.
+
+### What is still missing
+
+* `render` and `transpile::fuse` still read `Variant::per[0]`. Emitting
+  a kernel with n > 1 needs the generated interface to declare n output
+  shapes, and `acc_init` to build each accumulator from that outcome's
+  structure rather than from the chunk's.
+* `FrameEngine::step` is already `(shape, rows) -> [(shape, rows)]` and
+  nothing has ever populated more than one entry.
+* The partition check P2 calls for: union of member masks plus the
+  deopt count equals the lane count.
 
 ## Stage 4 - delete
 

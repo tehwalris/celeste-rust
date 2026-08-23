@@ -130,6 +130,12 @@ fn kind(c: &Cell2) -> &'static str {
 /// ids the kernel writes and the ids the engine reads are the same ids
 /// by construction rather than by a lookup table.
 ///
+/// That is a CLAIM about agreeing with code in another crate, so it is
+/// checked rather than asserted: `Rt2::canonicalize_ids` is the one
+/// implementation of the rule, and
+/// `the_structure_a_traced_state_becomes_is_already_canonical` requires
+/// it to be the identity on what this builds.
+///
 /// Structure only: `cols` carries pointers, because the resolver follows
 /// them, and `AV::Nil` everywhere else. The VALUES are what the kernel
 /// computes; this says where they go.
@@ -143,88 +149,163 @@ pub fn structure_of(
     let mut rt2 = Rt2::empty(1, gen::GLOBAL_NAMES.len(), gen::STRINGS, cart, cache);
     rt2.structure = Vec::new();
     rt2.cols = Vec::new();
-    // What each traced table/closure became, and the cells still owing a
-    // body. Breadth-first, so `queue` is drained in order.
-    let mut table_cell: std::collections::HashMap<u32, u32> = Default::default();
-    let mut queue: std::collections::VecDeque<(u32, bool)> = Default::default();
 
-    let new_cell = |rt2: &mut Rt2, c: Cell2, col: Col| -> u32 {
-        rt2.structure.push(c);
-        rt2.cols.push(col);
-        (rt2.structure.len() - 1) as u32
-    };
-
-    // A slot holding `v` becomes one `Val` cell; if `v` is a table or a
-    // closure, that cell points at the cell for the object, which is
-    // discovered here and filled later.
-    macro_rules! slot {
-        ($rt2:expr, $v:expr) => {{
-            let col = match $v {
-                Value::Table(t) => {
-                    let id = match table_cell.get(t) {
-                        Some(c) => *c,
-                        None => {
-                            let c = new_cell($rt2, Cell2::Unk, Col::U(AV::Nil));
-                            table_cell.insert(*t, c);
-                            queue.push_back((*t, false));
-                            c
-                        }
-                    };
-                    Col::U(AV::Ptr(id))
-                }
-                Value::Func(_) => {
-                    // A closure is a heap object with an identity, like a
-                    // table. Its BODY is what the engine names, and no
-                    // kernel reads through one, so the cell exists to
-                    // keep the shape honest rather than to be used.
-                    let c = new_cell($rt2, Cell2::Clo(0, Box::new([])), Col::U(AV::Nil));
-                    Col::U(AV::Ptr(c))
-                }
-                _ => Col::U(AV::Nil),
-            };
-            new_cell($rt2, Cell2::Val, col)
-        }};
+    // What each cell still owes. A `Val` cell owes the pointer to
+    // whatever its value is; a placeholder object cell owes its body.
+    type V = Value<super::domain::Symbolic>;
+    enum Todo {
+        Val(V),
+        Table(u32),
+        Done,
     }
+    let mut todo: Vec<Todo> = Vec::new();
+    let mut table_cell: std::collections::HashMap<u32, u32> = Default::default();
 
-    // Globals, in the boundary's order - which is what makes the rest of
-    // the numbering deterministic.
-    let groot = &st.heap.tables[&st.globals];
+    // Cells are created in DISCOVERY order and never reordered, so
+    // walking the array from 0 upwards IS the breadth-first walk: every
+    // cell a step discovers is appended past the cursor, and the cursor
+    // reaches it later. That is the same rule `Rt2::canonicalize_ids`
+    // applies, which is what makes these ids canonical by construction -
+    // and `the_structure_a_traced_state_becomes_is_already_canonical`
+    // checks it against that one implementation rather than restating it.
+    //
+    // The order is load-bearing and easy to get subtly wrong: an earlier
+    // version created a table's cell INSIDE the slot that points at it,
+    // which put the pointee between two globals and shifted every id
+    // from the first table-valued global onwards.
     let mut globals = vec![NONE; gen::GLOBAL_NAMES.len()];
+    let groot = &st.heap.tables[&st.globals];
     for (gi, name) in gen::GLOBAL_NAMES.iter().enumerate() {
         if let Some(v) = groot.hash.get(*name) {
-            globals[gi] = slot!(&mut rt2, v);
+            rt2.structure.push(Cell2::Val);
+            rt2.cols.push(Col::U(AV::Nil));
+            todo.push(Todo::Val(v.clone()));
+            globals[gi] = (rt2.structure.len() - 1) as u32;
         }
     }
     rt2.globals = globals;
 
-    while let Some((t, _)) = queue.pop_front() {
-        let cell = table_cell[&t];
-        let tab = &st.heap.tables[&t];
-        // A table is an object OR an array to the engine, never both.
-        // No table in the cart uses both parts, and a table that did
-        // could not be described at all - so say so rather than pick.
-        if !tab.hash.is_empty() && !tab.arr.is_empty() {
-            bail!("table {} has both a hash and an array part", t);
-        }
-        if !tab.ints.is_empty() {
-            bail!("table {} has integer keys outside the array part", t);
-        }
-        let body = if tab.arr.is_empty() {
-            // Fields the boundary does not name are dropped, exactly as
-            // `import_block` drops them: no generated code can access
-            // one, so it is unreachable weight.
-            let mut fields: Vec<(u32, u32)> = Vec::new();
-            for (k, v) in tab.hash.iter() {
-                let Some(f) = gen::field_id(k) else { continue };
-                fields.push((f, slot!(&mut rt2, v)));
+    let mut c = 0usize;
+    while c < rt2.structure.len() {
+        match std::mem::replace(&mut todo[c], Todo::Done) {
+            Todo::Val(Value::Table(t)) => {
+                let target = match table_cell.get(&t) {
+                    Some(x) => *x,
+                    None => {
+                        rt2.structure.push(Cell2::Unk);
+                        rt2.cols.push(Col::U(AV::Nil));
+                        todo.push(Todo::Table(t));
+                        let x = (rt2.structure.len() - 1) as u32;
+                        table_cell.insert(t, x);
+                        x
+                    }
+                };
+                rt2.cols[c] = Col::U(AV::Ptr(target));
             }
-            Cell2::Obj(fields)
-        } else {
-            Cell2::Arr(tab.arr.iter().map(|v| slot!(&mut rt2, v)).collect())
-        };
-        rt2.structure[cell as usize] = body;
+            Todo::Val(Value::Func(_)) => {
+                // A closure is a heap object with an identity, like a
+                // table. Its BODY is what the engine names, and no kernel
+                // reads through one, so the cell exists to keep the shape
+                // honest rather than to be used.
+                rt2.structure.push(Cell2::Clo(0, Box::new([])));
+                rt2.cols.push(Col::U(AV::Nil));
+                todo.push(Todo::Done);
+                rt2.cols[c] = Col::U(AV::Ptr((rt2.structure.len() - 1) as u32));
+            }
+            Todo::Val(_) => {}
+            Todo::Table(t) => {
+                let tab = &st.heap.tables[&t];
+                // A table is an object OR an array to the engine, never
+                // both. No table in the cart uses both parts, and a table
+                // that did could not be described at all - so say so
+                // rather than pick.
+                if !tab.hash.is_empty() && !tab.arr.is_empty() {
+                    bail!("table {} has both a hash and an array part", t);
+                }
+                if !tab.ints.is_empty() {
+                    bail!("table {} has integer keys outside the array part", t);
+                }
+                let slot = |rt2: &mut Rt2, todo: &mut Vec<Todo>, v: &V| -> u32 {
+                    rt2.structure.push(Cell2::Val);
+                    rt2.cols.push(Col::U(AV::Nil));
+                    todo.push(Todo::Val(v.clone()));
+                    (rt2.structure.len() - 1) as u32
+                };
+                let body = if tab.arr.is_empty() {
+                    // Fields the boundary does not name are dropped,
+                    // exactly as `import_block` drops them: no generated
+                    // code can access one, so it is unreachable weight.
+                    let mut fields: Vec<(u32, u32)> = Vec::new();
+                    for (k, v) in tab.hash.iter() {
+                        let Some(f) = gen::field_id(k) else { continue };
+                        fields.push((f, slot(&mut rt2, &mut todo, v)));
+                    }
+                    Cell2::Obj(fields)
+                } else {
+                    let items: Vec<u32> =
+                        tab.arr.iter().map(|v| slot(&mut rt2, &mut todo, v)).collect();
+                    Cell2::Arr(items)
+                };
+                rt2.structure[c] = body;
+            }
+            Todo::Done => {}
+        }
+        c += 1;
     }
     Ok(rt2)
+}
+
+/// Rebuild a traced graph with the ENGINE's cell ids.
+///
+/// The tracer numbers its input cells `Op::Cell(0..n)` in `Iface` order,
+/// because that is a dense numbering its own evaluator and differential
+/// tests index directly. The engine numbers the same slots canonically,
+/// sparsely, and not in that order. The emitter reads `Op::Cell(id)` and
+/// writes `rin.c{id}`, so the graph handed to it has to already speak
+/// the engine's numbering.
+///
+/// Done HERE and not in `symbolize` on purpose. Numbering the graph
+/// canonically from the start would make `Op::Cell` ids sparse, and the
+/// tracer's own checking machinery - `trace::eval`'s `Env::cells`, and
+/// every perturbation test built on it - indexes them densely. The
+/// tracer keeps its dense names; the consumer accepts them and maps
+/// once, which is the same choice `resolve` makes about paths.
+///
+/// `canon` must be INJECTIVE, or two input slots become one cell and the
+/// graph silently starts reading one where it meant two. `resolve_all`
+/// guarantees that, but this is a public entry point and the check costs
+/// one pass, so it is checked rather than assumed.
+pub fn renumber_cells(
+    g: &crate::transpile::graph::Graph,
+    canon: &[u32],
+    roots: &[crate::transpile::graph::NodeId],
+) -> Result<(crate::transpile::graph::Graph, Vec<crate::transpile::graph::NodeId>)> {
+    use crate::transpile::graph::{Graph, NodeId, Op};
+    let mut seen: std::collections::HashMap<u32, usize> = Default::default();
+    for (i, c) in canon.iter().enumerate() {
+        if let Some(j) = seen.insert(*c, i) {
+            bail!("input slots {} and {} both map to cell {}", j, i, c);
+        }
+    }
+    let mut out = Graph::new();
+    let mut map: Vec<NodeId> = Vec::with_capacity(g.len());
+    for id in 0..g.len() {
+        let node = g.get(id as NodeId);
+        let new = match node.op {
+            Op::Cell(i) => {
+                let c = *canon.get(i as usize).ok_or_else(|| {
+                    anyhow!("Op::Cell({}) is not an interface slot ({} slots)", i, canon.len())
+                })?;
+                out.leaf(Op::Cell(c))
+            }
+            _ => {
+                let args: Vec<NodeId> = node.args.iter().map(|a| map[*a as usize]).collect();
+                out.fold(node.op.clone(), args)
+            }
+        };
+        map.push(new);
+    }
+    Ok((out, roots.iter().map(|r| map[*r as usize]).collect()))
 }
 
 /// Resolve a traced frame's INPUT interface against a block.
@@ -267,6 +348,12 @@ pub fn resolve_all(rt2: &Rt2, paths: &[Path]) -> Result<Vec<u32>> {
         .collect::<Result<_>>()?;
     let mut seen: std::collections::HashMap<u32, usize> = Default::default();
     for (i, c) in cells.iter().enumerate() {
+        // A slot holds a VALUE. A path that lands on an object cell
+        // names the table itself, and a kernel writing there would
+        // overwrite the pointer topology rather than a field.
+        if !matches!(rt2.structure[*c as usize], Cell2::Val) {
+            bail!("{} resolves to a {}, not a value cell", show(&paths[i]), kind(&rt2.structure[*c as usize]));
+        }
         if let Some(j) = seen.insert(*c, i) {
             bail!(
                 "{} and {} both resolve to cell {} - the structure merged two slots",
@@ -412,6 +499,70 @@ mod tests {
     /// slots would resolve both paths happily and make the kernel write
     /// one cell twice - a silent corruption, and the only symptom would
     /// be a wrong search result much later.
+    /// `structure_of` claims to emit the engine's numbering directly.
+    /// This is that claim, checked against the ONE implementation of the
+    /// rule rather than against a second copy of it: canonicalizing the
+    /// structure it produces must be the IDENTITY.
+    ///
+    /// It matters because the two numberings are never compared at
+    /// runtime. A kernel writes `cols[resolve(path)]` on a block built
+    /// from this structure, and the engine reads it back by its own ids.
+    /// If the two disagreed, every cell after the first divergence would
+    /// be read as a different field - and the block would still be
+    /// well-formed, so nothing downstream would say so.
+    #[test]
+    fn the_structure_a_traced_state_becomes_is_already_canonical() {
+        use crate::trace::{cart, domain::Symbolic, interp::Interp, verify::run_one};
+
+        let src = cart::sources().expect("sources");
+        let top = full_moon::parse(&src).expect("parse");
+        let init = full_moon::parse("_init()").expect("parse _init");
+        let frame = full_moon::parse("_update()").expect("parse frame");
+        let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
+        let cd = std::sync::Arc::new(
+            celeste_core::cart_data::CartData::load("cart").expect("cart"),
+        );
+        let (rx, ry) = celeste_interp::game_runner::start_room();
+        let cache = std::sync::Arc::new(
+            celeste_core::collision_cache::CollisionCache::new(&cd, rx, ry).expect("cache"),
+        );
+        it.cache = Some(cache.clone());
+        it.cart = Some(cd.clone());
+        let st = cart::fresh_state::<Symbolic>(&mut it.d);
+        let mut st = run_one(&mut it, &top, st).expect("toplevel");
+        cart::inject_tile_flag_at(&mut st);
+        let mut st = run_one(&mut it, &init, st).expect("_init");
+        for _ in 0..12 {
+            st = run_one(&mut it, &frame, st).expect("warm-up");
+        }
+
+        let rt2 = structure_of(&st, cd.clone(), cache.clone()).expect("structure");
+        // Built twice rather than cloned: `Rt2` is deliberately not
+        // `Clone` (a block is big and copying one is usually a mistake),
+        // and `structure_of` is a pure function of the state.
+        let mut canon = structure_of(&st, cd, cache).expect("structure");
+        canon.canonicalize_ids();
+        assert_eq!(
+            rt2.globals, canon.globals,
+            "the globals point at different cells after canonicalizing"
+        );
+        assert_eq!(
+            rt2.structure.len(),
+            canon.structure.len(),
+            "canonicalizing dropped {} cells as unreachable",
+            rt2.structure.len() as i64 - canon.structure.len() as i64
+        );
+        let first = (0..rt2.structure.len())
+            .find(|i| format!("{:?}", rt2.structure[*i]) != format!("{:?}", canon.structure[*i]));
+        assert!(
+            first.is_none(),
+            "cell {} differs: {:?} vs canonical {:?}",
+            first.unwrap(),
+            rt2.structure[first.unwrap()],
+            canon.structure[first.unwrap()]
+        );
+    }
+
     #[test]
     fn a_traced_state_becomes_a_structure_every_path_can_walk() {
         use crate::trace::{cart, domain::Symbolic, interp::Interp, verify::run_one};

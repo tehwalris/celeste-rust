@@ -6,16 +6,19 @@
 //! the rewrites the old front half needed. If the second graph goes
 //! through the first emitter, the rewrites have nothing left to do.
 //!
-//! What is deliberately NOT here yet: the boundary numbering. The cell
-//! ids below are the tracer's own, not the engine's, so the lines this
-//! produces do not yet plug into `Rt2`. Matching the engine's numbering
-//! would mean reproducing artifacts of the IR heap - a global holding a
-//! Lua function is a `Val` cell pointing at a `Clo` cell, while a global
-//! holding a builtin IS the builtin's cell, which is a fact about how the
-//! IR lowering built its heap and not about the program. Since that
-//! pipeline is what this campaign deletes, the numbering will be the
-//! tracer's; this module exists to find out whether the graph is
-//! emittable at all, which is the part nobody knows.
+//! The BOUNDARY NUMBERING is `bind` below. The cell ids the emitter sees
+//! are the engine's canonical ones, resolved from the tracer's paths by
+//! `trace::bind` - so the lines this produces name cells an `Rt2` has.
+//! The tracer's own dense slot numbering never leaves the tracer.
+//!
+//! Inputs and outputs are two numbering spaces, and keeping them apart
+//! is the thing to get right. An outcome that allocates or frees an
+//! object shifts every canonical id after the change, so its output
+//! cells are ids in ITS structure, not in the input block's. The
+//! generated code reads inputs off the chunk and writes outputs onto an
+//! accumulator built from the outcome's structure, which are different
+//! blocks - so the two spaces coexist, and an id is only meaningful
+//! against the structure it came from.
 
 use anyhow::Result;
 
@@ -51,6 +54,71 @@ pub struct FrameOutcome {
     pub outputs: Vec<(u32, NodeId, &'static str)>,
     pub live: NodeId,
     pub ok: NodeId,
+}
+
+/// A traced frame in the ENGINE's numbering: everything `lower_frame`
+/// needs, with cell ids an `Rt2` has.
+pub struct Bound {
+    pub graph: Graph,
+    pub inputs: Vec<(u32, &'static str)>,
+    pub uni: Vec<(u32, &'static str)>,
+    pub outcomes: Vec<FrameOutcome>,
+}
+
+/// Resolve a traced frame against the engine's numbering.
+///
+/// `g` is passed separately because the tracer's graph lives on the
+/// interpreter's domain and a frame only holds node ids into it. Several
+/// frames traced through one interpreter share that graph - which is how
+/// per-pm1-key bodies share subexpressions - so this renumbers the whole
+/// arena and remaps the frame's roots through it.
+///
+/// UNIFORM vs PER-LANE is a boundary decision the tracer does not model
+/// yet, and the emitter needs it: `tile_flag_at` takes its width and
+/// height as block-uniform `P8`, so a per-lane hitbox is a narrowing it
+/// refuses. A hitbox IS uniform - it is fixed per object type and never
+/// written during a frame - so saying so here is a stand-in for the
+/// classification, not a fudge.
+pub fn bind(f: &crate::trace::verify::Frame, g: &Graph) -> Result<Bound> {
+    let mut roots: Vec<NodeId> = Vec::new();
+    for o in &f.outs {
+        roots.extend(o.fields.iter().map(|(_, nd, _)| *nd));
+        roots.push(o.guard);
+        roots.push(o.ok);
+    }
+    let (graph, roots) = crate::trace::bind::renumber_cells(g, &f.in_cells, &roots)?;
+
+    let mut inputs: Vec<(u32, &'static str)> = Vec::new();
+    let mut uni: Vec<(u32, &'static str)> = Vec::new();
+    for (i, c) in f.iface.init.iter().enumerate() {
+        let kind = match c {
+            crate::trace::iface::Conc::Num(_) => "num",
+            crate::trace::iface::Conc::Bool(_) => "bool",
+        };
+        let cell = f.in_cells[i];
+        if crate::trace::iface::show(&f.iface.slots[i]).contains(".hitbox.") {
+            uni.push((cell, kind));
+        } else {
+            inputs.push((cell, kind));
+        }
+    }
+
+    let mut at = 0usize;
+    let mut outcomes = Vec::new();
+    for o in &f.outs {
+        let n = o.fields.len();
+        let outputs = o
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(i, (_, _, is_bool))| {
+                (o.cells[i], roots[at + i], if *is_bool { "ZB" } else { "ZN" })
+            })
+            .collect();
+        outcomes.push(FrameOutcome { outputs, live: roots[at + n], ok: roots[at + n + 1] });
+        at += n + 2;
+    }
+    Ok(Bound { graph, inputs, uni, outcomes })
 }
 
 /// Lower a traced frame - ALL of its output shapes into ONE body.
