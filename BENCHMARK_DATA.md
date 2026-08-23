@@ -447,6 +447,50 @@ on, `None` reproducing the legacy stream so interpreter checkpoints
 stay valid. Consequence used below: engines cannot share checkpoints,
 so an A/B pair means two full runs from frame 1.)
 
+## The TRACED kernels at the production horizon (2026-08-24)
+
+Stage 5 of plans/tracing.md: the per-shape kernels the AST tracer emits,
+checked in at `crates/celeste-kernels/src/traced/`, wired into
+`run_chunk_kernel`. Room (1,0), `rewrites.jsonl`, `bench --frames 94
+--deopt`, ladder env (frontier-only, collect-first, 8000-lane caps, 16
+threads, `--save-frames`), ONE release binary, no `--features fused`,
+the three sides an env var apart:
+
+| side | wall | peak | us/lane | deopt lanes | coverage |
+|---|---|---|---|---|---|
+| plain (interpreter) | 512.21 s | 14.76 GB | 86.1 | 4,400,724 | - |
+| classes (8 committed `kernel_gen_*`) | 608.44 s | 14.60 GB | 102.3 | 4,138,311 | 56 missed, 1,809,074 plain-routed |
+| **traced (3 per-shape)** | **340.91 s** | **8.18 GB** | **57.3** | **0** | **0 missed, 0 plain-routed** |
+
+All three report **5,949,326 lanes**, identical - the cross-check that
+these are the same search. **-33.4% wall and -44.6% peak against the
+interpreter**, 1.50x.
+
+Three things worth more than the headline:
+
+* **Zero deopt, at 172,626,763 lanes.** Nothing routed to the
+  interpreter. The recorded fused engine below still had 456,960
+  uncovered lane-events; three checked-in files have none. The shape
+  walk closes to a FIXPOINT, which is why this is a property rather
+  than a sample - a shape the room reaches is a shape the set has.
+* **The class kernels are a net LOSS without `fused`.** 608.44 s
+  against the interpreter's 512.21 s. The -22.9% recorded below was
+  compiled **+fused**; compiled-without-fused was never measured, and
+  it is negative. The fused artifact is generated per campaign and
+  never checked in, so what the repository actually ships as its
+  compiled engine was, until tonight, slower than the interpreter.
+* **Fragments before merge fell 160,656 -> 48,144**, which is where
+  the 6.6 GB of peak went.
+
+Not directly comparable to the 424.39 s below - that was fused, on
+another night. Tonight's interpreter side ran 512.21 s against that
+night's 550.65 s, so conditions differ by ~7%.
+
+Two caveats on the numbers, stated because they bound what they claim:
+the traced set is room **(1,0)** only (`transpile --room-kernels` walks
+`CELESTE_START_ROOM`), and the five `kernel_gen_r20_*` kernels are room
+(2,0)'s, still the only kernels that room has.
+
 ## Engine adoption validation at depth (2026-08-20)
 
 The H=68 numbers above are mid-room; the ladder's first real horizon
