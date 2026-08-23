@@ -955,4 +955,61 @@ mod tests {
     }
 
 
+
+    /// How much of the row amplification is STATICALLY removable?
+    ///
+    /// `variants` dedups on the whole `(outputs, live, ok)` tuple, so two
+    /// button assignments that write identical values and differ only in
+    /// which lanes they claim stay separate - and each appends its own
+    /// copy of the same row. Grouping PER OUTCOME on `(outputs, ok, bd)`
+    /// and unioning the live masks would remove those before they are
+    /// written.
+    ///
+    /// This counts what that would save, from the expressions alone, so
+    /// the restructuring is sized before it is built rather than after.
+    #[test]
+    #[ignore]
+    fn how_many_variants_write_the_same_row() {
+        let refs = match super::room_kernels_in(std::path::Path::new(".")) {
+            Ok(r) => r,
+            Err(e) => panic!("{:#}", e),
+        };
+        for (si, r) in refs.iter().enumerate() {
+            let n = r.lowered.variants.len();
+            let outcomes = r.lowered.outs.len();
+            let mut per: Vec<usize> = Vec::new();
+            for oi in 0..outcomes {
+                // OUTPUTS only. `ok` is a per-variant variable NAME
+                // (`ok_v{mask}`), so including it groups nothing - it
+                // was 1.0x on the first attempt for exactly that reason.
+                //
+                // Dropping it is not a shortcut: the rows a variant
+                // appends are `live & !deopt`, and two variants with
+                // identical output VALUES append identical rows, so the
+                // union of their take masks is exact whatever their `ok`
+                // says. Deopt REPORTING still ORs per variant, which is
+                // a separate quantity.
+                let mut groups: std::collections::BTreeSet<String> = Default::default();
+                for v in &r.lowered.variants {
+                    let p = &v.per[oi];
+                    let outs: Vec<String> =
+                        p.outputs.iter().map(|(c, e)| format!("{}={}", c, e)).collect();
+                    groups.insert(outs.join(";"));
+                }
+                per.push(groups.len());
+            }
+            let total: usize = per.iter().sum();
+            eprintln!(
+                "[dedup] shape {}: {} variants x {} outcomes = {} appends; \
+                 grouped {:?} = {} ({:.1}x fewer)",
+                si,
+                n,
+                outcomes,
+                n * outcomes,
+                per,
+                total,
+                (n * outcomes) as f64 / total.max(1) as f64
+            );
+        }
+    }
 }

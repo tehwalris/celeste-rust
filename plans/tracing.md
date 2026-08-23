@@ -2590,7 +2590,7 @@ constants - 44 of outcome 0's 52 shared fields in kernel1 are
 `zn_splat(...)` of a literal - so a key over only the non-constant cells
 is ~8 mixes instead of ~100.
 
-### But most of it is removable STATICALLY, with no hashing at all
+### How much is removable statically: 1.4x, not 7.8x (CORRECTED)
 
 Per-variant field counts in kernel1, which is the real story:
 
@@ -2605,13 +2605,35 @@ they differ in WHICH LANES ARE LIVE. So a lane live in five of them
 appends five identical rows - by construction, not by coincidence.
 
 `variants` dedups on the whole `(outputs, live, ok)` tuple. Deduping
-PER OUTCOME on the outputs alone, and unioning the live masks of the
-variants that agree, removes those duplicates before they are ever
-written, statically, from expressions the emitter already has. No hash,
-no set, no per-row cost.
+PER OUTCOME on the outputs alone, and unioning each variant's TAKE mask
+(`live & !deopt` - exact whatever their `ok` says, since the values are
+identical), removes those before they are written.
 
-That is the first thing to build. A hash-based pre-dedup only earns its
-keep on what survives it.
+MEASURED, from the expressions:
+
+    shape 0: 24 variants x 4 outcomes = 96 appends -> [19, 24, 24, 1] = 68
+    shape 1: 24 variants x 4 outcomes = 96 appends -> [1, 19, 24, 24] = 68
+
+**1.4x, not 7.8x.** The zero-tainted outcome does collapse 24 -> 1,
+exactly as its field count predicted, but two of the four do not
+collapse at all.
+
+I claimed "most of it is removable statically" on the strength of that
+one outcome. It is not. Per input lane at frame 30 the picture is 82
+rows appended against 10.4 distinct, and static grouping accounts for
+1.4 of the 7.8 - the rest is variants that write DIFFERENT values on
+some lanes and the same value on this one, which is per-lane and
+invisible to the emitter.
+
+(The first attempt at this measurement said 1.0x, because it grouped on
+`(outputs, ok, bd)` and `ok` is a per-variant variable NAME. Grouping on
+strings that are distinct by construction measures nothing.)
+
+So the order is: static grouping for 1.4x because it is free, then a
+per-lane runtime key for the remaining ~5.6x, then a `KeyPlan` for the
+5.9x of widening merges. The cheap-key finding is what makes the middle
+one affordable - 44 of outcome 0's 52 shared fields are constant splats,
+so the key is ~8 mixes, not ~100.
 
 Caveats, stated so the number is not over-read: one room, one block, no
 chunking, no threads, against an interpreter with a year of tuning.
