@@ -2506,6 +2506,39 @@ against the interpreter's own notion of a frame exposed it - which is an
 argument for the end-to-end room test existing at all, not just the
 per-frame one.
 
+## T25 - the room runs, end to end, 30 frames
+
+`the_room_runs_on_kernels_alone` passes. Room (1,0), frames 1-30, on
+generated kernels only - no interpreter anywhere in the execution path -
+and every frame's ROW KEY SET is identical to `AbstractRun`'s:
+
+    frame  24:       1 rows in ->      24 out; oracle 24
+    frame  25:      24 rows in ->     204 out; oracle 204
+    frame  26:     204 rows in ->     878 out; oracle 878
+    frame  27:     878 rows in ->    2864 out; oracle 2864
+    frame  28:    2864 rows in ->    7260 out; oracle 7260
+    frame  29:    7260 rows in ->   15250 out; oracle 15250
+    frame  30:   15250 rows in ->   27024 out; oracle 27024
+
+Set equality per frame, not counts: two engines can agree on how many
+rows survived and disagree about which, and the count is the weaker
+claim.
+
+This is what Philippe asked for at the start of the campaign's
+end-to-end stage - "can we actually run rooms end to end now" - and the
+answer is now yes for one room at level 0, with the widened `rem`, the
+real boundary, and the real abstraction.
+
+### What it took, in order
+
+T22 a kernel per shape; T23 the stale `guard`/`ok` and the block
+encoding; T24 the interval fork; and finally the frame being a THIRD of
+a frame (`_update` without `_draw`).
+
+Four of those five were found by the end-to-end comparison and could not
+have been found by the per-frame oracle test, which runs the same chunk
+on both sides.
+
 ## Philippe's codegen question (2026-08-23)
 
 Inspect the generated assembly, and consider emitting AVX-512 - or
