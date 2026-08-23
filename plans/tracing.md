@@ -2757,12 +2757,24 @@ its keep on. What it CAN do is pick a better strategy than a general
 allocator fighting 6,000 live ranges: a flat frame with values streamed
 in graph order.
 
-And there is a lever upstream of codegen entirely: SCHEDULE the emitted
-graph for locality so fewer values are live at once. That is a change to
-our emitter, it would help LLVM today, and it would help a hand emitter
-later. Measure the live-set profile of the current emission order first
-- if the peak is 6,000 because of the order rather than the graph, that
-is the cheapest win available anywhere in this section.
+I then guessed the peak live set might be ~6,000 because of the emission
+ORDER, making scheduling the cheapest win. Measured instead:
+
+    5,959 nodes   PEAK live 511   mean live 247
+
+So no. 511 is not 6,000, and it is still ~30x the register file. Even a
+perfect schedule leaves hundreds of values live, because the frame
+genuinely computes a wide dependency graph.
+
+That is the honest ceiling on this line of attack: **~250 values must
+live in memory at any moment whoever emits the code**. LLVM's 48% stack
+traffic is not far off what the problem demands.
+
+So a hand emitter's win is in HOW it spills - a flat frame indexed in
+graph order with predictable streaming access, rather than a general
+allocator reconciling 511 live ranges - and not in spilling less.
+Scheduling for locality might still shave the peak, but it is a smaller
+prize than it looked before the measurement.
 
 ## Doctrine: never deopt to the interpreter (Philippe, 2026-08-23)
 
