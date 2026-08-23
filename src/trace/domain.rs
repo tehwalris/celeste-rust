@@ -454,9 +454,12 @@ impl Domain for Symbolic {
             memo[n as usize] = Some(r);
             r
         }
-        if self.ival_cells.is_empty() {
-            return false;
-        }
+        // NO early-out on an empty `ival_cells`. A value can be an
+        // interval without any interval INPUT reaching it: the widening
+        // writes `Op::Const(lo, hi)` with `lo != hi`, a literal
+        // interval. Returning false for those typed a widened `rem` as
+        // a `ZN` and the lowering refused it - "output cell 278 wants a
+        // ZN but the graph computes a (P8, P8)".
         let mut memo = vec![None; self.graph.len()];
         go(&self.graph, &self.ival_cells, &mut memo, *v)
     }

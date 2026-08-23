@@ -673,7 +673,7 @@ pub fn reference_frame_in(root: &std::path::Path) -> Result<Reference> {
         roots.push(vec![iface::key(g)]);
     }
     let pin = pm1_key(&player, &st, &it.d)?;
-    let frame = trace_frame(&mut it, &reset, &fr, st, &roots, &pin, &[])?;
+    let frame = trace_frame(&mut it, &reset, &fr, st, &roots, &pin, &[], false)?;
 
     let graph = std::mem::take(&mut it.d.graph);
     let bound = super::emit::bind(&frame, &graph)?;

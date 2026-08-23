@@ -64,3 +64,4 @@ pub mod shapes;
 pub mod probe;
 pub mod state;
 pub mod verify;
+pub mod widen;

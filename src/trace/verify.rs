@@ -162,6 +162,16 @@ pub fn trace_frame<'a>(
     // `rem.x`/`rem.y`. A frame that reads one has to fork at
     // `__split_by_flr` rather than floor it (T24).
     ival: &[Path],
+    // Apply the boundary's widenings INSIDE the frame (`trace::widen`),
+    // so the graph knows about them and a row is hashed on the value it
+    // stores.
+    //
+    // Off for the differential check against the CONCRETE oracle, whose
+    // job is frame semantics: it runs the same chunk with real numbers
+    // and has no interval to compare a widened `rem` against. The
+    // abstraction is checked by the end-to-end room run instead, against
+    // the interpreter, which widens too.
+    widen: bool,
 ) -> Result<Frame> {
     let mut st = st;
     // Fork choices are per FRAME, like the six buttons above.
@@ -193,9 +203,22 @@ pub fn trace_frame<'a>(
         }
         let mut s = s;
         s.gc();
+        // THE WIDENINGS, here rather than at the boundary a moment
+        // later, so the graph knows about them and the value a row is
+        // hashed on is the value it stores (`trace::widen`). Before
+        // `out_fields`, which reads the values off the state.
+        //
+        // After `gc`, because it walks the object list to find the
+        // player and the fruit, and a dead object is not one.
+        if widen {
+            super::widen::widen(&mut s, &mut it.d)?;
+        }
         // The specialization's obligation rides on `ok`: a lane whose
         // key disagrees with what this body was compiled for deopts to
         // the interpreter. Folds to `s.ok` when nothing is pinned.
+        //
+        // `widen` conjoins its own containment checks into `s.ok` above,
+        // which is why this reads `s.ok` after it rather than before.
         let ok = it.d.graph.fold(crate::transpile::graph::Op::And, vec![s.ok, pin_ok]);
         let (fields, ubool) = out_fields(&s, &it.d)?;
         // The engine's numbering for THIS outcome's shape. Fields and
@@ -528,7 +551,7 @@ mod tests {
             .collect();
         let n_slots = all.len();
         let started = std::time::Instant::now();
-        match trace_frame(&mut it, &reset, &frame, st, &all, &[], &[]) {
+        match trace_frame(&mut it, &reset, &frame, st, &all, &[], &[], false) {
             Ok(f) => {
                 let mut by_shape: std::collections::BTreeMap<String, usize> = Default::default();
                 for o in &f.outs {
@@ -623,7 +646,7 @@ mod tests {
                 .filter(|p| !under_frozen(&st, p, &frozen))
                 .collect();
             frames += 1;
-            let f = match trace_frame(&mut it, &reset, &frame, st, &roots, &[], &[]) {
+            let f = match trace_frame(&mut it, &reset, &frame, st, &roots, &[], &[], false) {
                 Ok(f) => f,
                 Err(e) => {
                     refused += 1;
@@ -972,7 +995,7 @@ mod tests {
         }
         let key = pm1_key(&player, &st, &it.d).expect("pm1 key");
         assert_eq!(key.len(), 6, "the pm1 key is six cells");
-        let f = trace_frame(&mut it, &reset, &frame, st, &roots, &key, &[]).expect("trace");
+        let f = trace_frame(&mut it, &reset, &frame, st, &roots, &key, &[], false).expect("trace");
         assert_eq!(f.iface.pins.len(), 6, "all six pinned");
 
         // `ok` of whichever outcome claims this assignment.
@@ -1098,7 +1121,7 @@ mod tests {
         while let Some(key) = queue.pop() {
             let pin: Vec<(Path, Conc)> =
                 paths.iter().cloned().zip(key.iter().copied()).collect();
-            let f = match trace_frame(&mut it, &reset, &frame, st.clone(), &roots, &pin, &[]) {
+            let f = match trace_frame(&mut it, &reset, &frame, st.clone(), &roots, &pin, &[], false) {
                 Ok(f) => f,
                 Err(e) => {
                     eprintln!("[keys] {} REFUSED: {:#}", show_key(&key), e);
@@ -1301,7 +1324,7 @@ mod tests {
             ("pm1 + x,y,rem", extra(&["x", "y", "rem.x", "rem.y"])),
             ("pm1 + x,y,rem,spd", extra(&["x", "y", "rem.x", "rem.y", "spd.x", "spd.y"])),
         ] {
-            let f = match trace_frame(&mut it, &reset, &frame, st.clone(), &roots, &pin, &[]) {
+            let f = match trace_frame(&mut it, &reset, &frame, st.clone(), &roots, &pin, &[], false) {
                 Ok(f) => f,
                 Err(e) => {
                     eprintln!("[pos] {:<26} REFUSED: {:#}", label, e);
@@ -1391,7 +1414,7 @@ mod tests {
         )
         .map(|r| r.structure.len())
         .unwrap_or(0);
-        let f = match trace_frame(&mut it, &reset, &frame, st, &roots, &pin, &[]) {
+        let f = match trace_frame(&mut it, &reset, &frame, st, &roots, &pin, &[], false) {
             Ok(f) => f,
             Err(e) => return eprintln!("[emit] trace stopped at: {:#}", e),
         };
@@ -2694,7 +2717,7 @@ end
         }
 
         let before = it.d.graph.len();
-        let f = match trace_frame(&mut it, &reset, &frame, st.clone(), &roots, &[], &[]) {
+        let f = match trace_frame(&mut it, &reset, &frame, st.clone(), &roots, &[], &[], false) {
             Ok(f) => f,
             Err(e) => return eprintln!("[verify] symbolic frame stopped at: {:#}", e),
         };

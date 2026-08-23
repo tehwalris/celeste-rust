@@ -2800,6 +2800,47 @@ are produced in different slices. That needs a table living for a FRAME,
 keyed on the ~19 varying cells rather than the ~100 live ones - still
 far cheaper than the boundary's.
 
+### DONE: the widenings moved into the graph
+
+Philippe, on the key-only variant I proposed: "we shouldn't be storing
+something that might then get widened in a different way later. That's
+not great." He is right, and the refinement is retracted. Hashing a
+value you do not store is sound ONLY while every widening is a per-row
+function - true today, unchecked anywhere, and silently wrong the day
+someone adds a block-dependent one. The version with no invariant to
+violate is: widen, then hash what you stored.
+
+`trace::widen` applies all four inside the traced frame, so they are
+graph nodes: player `rem` becomes the constant interval, the four timers
+pin to zero, `dash_effect_time` clamps, a live fruit's `off`/`y` become
+its bob band. `trace_frame` takes a `widen` flag - ON for the shape walk
+and the room kernels, OFF for the differential check against the
+CONCRETE oracle, whose job is frame semantics and which has no interval
+to compare a widened `rem` against.
+
+**The boundary's assertions came with it.** It does not only widen, it
+checks that `rem` was inside the interval and the fruit's `y` inside the
+band. Widening earlier would have retired those silently - the boundary
+would then be handed the widened value and pass trivially - so each is
+an `ok` conjunct now: a violating lane is refused and the run stops.
+
+**One case refused rather than approximated.** The fruit band is
+`start +- 2.5`, and the graph has no node for an interval built from two
+values, only the literal `Op::Const(lo, hi)`. So it works when `start`
+is concrete and bails loudly otherwise. Room (1,0) has no fruit, so this
+is untested in anger - but a band computed from the wrong `start` is a
+widening that does not contain the value it replaces, which is exactly
+the failure that must not be silent.
+
+A bug it exposed: `is_interval` had an early-out when no interval INPUT
+existed, which was fine until a widening could CREATE one from a
+literal. A widened `rem` was typed as a plain number and the lowering
+refused it.
+
+All 30 frames still match the interpreter, so the boundary's own
+widening pass is now a no-op on those cells - which makes it a free
+check that the two agree.
+
 ### Specialization is a LAYER, not a redefinition (Philippe)
 
 A kernel specific to a ladder rung is fine, "similar to what we did with

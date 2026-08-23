@@ -227,7 +227,7 @@ pub fn walk<'a>(
         let st = seen[&k].clone();
         let roots = state_paths(&st)?;
         let ival = ival_paths(&st);
-        let f = match trace_frame(it, reset, frame, st.clone(), &roots, &[], &ival) {
+        let f = match trace_frame(it, reset, frame, st.clone(), &roots, &[], &ival, true) {
             Ok(f) => f,
             Err(e) => {
                 *out.refused.entry(format!("{:#}", e)).or_default() += 1;
