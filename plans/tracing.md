@@ -2732,29 +2732,37 @@ Not one. And the composition says why:
 | vector instructions (zmm 1497 + ymm 934 + xmm 3998) | **6.6%** |
 | scalar mask work (`cmove`/`test`/`or`/`shl`/`setg`/`setle`) | ~30% |
 
-The node types are the explanation:
+My first reading of this was that `ZB` - two thirds of the nodes, and
+`{val: u16, known: u16}` - was the culprit, being a pair of scalars
+rather than a vector. THAT IS WRONG and the numbers say so.
 
-    ZB 4206,  ZN 1709,  ZI 44
+A Kleene AND on 16 lanes really is two `and` instructions on `u16`, one
+per component, which is about optimal. The 3,412 boolean nodes account
+for roughly 6,800 instructions. The booleans are fine.
 
-**Two thirds of the graph is BOOLEAN**, and `ZB` is `{val: u16, known:
-u16}` - a pair of 16-bit SCALARS. So every boolean node compiles to
-scalar test/cmove/shift/or sequences. The design intent (16 lanes of
-i32 = one zmm) only ever applied to the `ZN` third, and those spill:
-42% of the function is moving values to and from the stack.
+The cost is SPILLING, and it is scalar:
 
-This is not mainly LLVM being dumb. The REPRESENTATION of a boolean
-lane vector is scalar by construction.
+    46,755 instructions touch (%rsp)   -- 48% of the function
+       mov             34,362
+       of which vector-register:  2,093  (4%)
 
-Which is the concrete case for emitting directly: put tri-state
-booleans in AVX-512 MASK REGISTERS - `k0`-`k7`, two per value - and a
-`ZB` node becomes one instruction (`kandw`, `korw`, `kandnw`). LLVM
-already touches those registers (`kmovd` and `kshiftrw` appear ~2,500
-times) but does not use them as the representation.
+96% of the stack traffic is plain scalar `mov`. The function has ~6,000
+simultaneously live values and the machine has 16 general-purpose
+registers, so masks and `P8` values shuttle to and from the stack
+constantly. It is not the type. It is graph size against register count.
 
-Before any of that is worth building, the cheaper experiment is to
-change `ZB`'s representation in `celeste-engine::kernel` and see what
-LLVM does with it - same emitter, same graph, one type. If two thirds of
-the nodes collapse, the direct emitter has a much smaller job left.
+Which cuts both ways for a direct emitter. It cannot avoid the traffic
+either - this is the register allocation problem LLVM genuinely earns
+its keep on. What it CAN do is pick a better strategy than a general
+allocator fighting 6,000 live ranges: a flat frame with values streamed
+in graph order.
+
+And there is a lever upstream of codegen entirely: SCHEDULE the emitted
+graph for locality so fewer values are live at once. That is a change to
+our emitter, it would help LLVM today, and it would help a hand emitter
+later. Measure the live-set profile of the current emission order first
+- if the peak is 6,000 because of the order rather than the graph, that
+is the cheapest win available anywhere in this section.
 
 ## Doctrine: never deopt to the interpreter (Philippe, 2026-08-23)
 
