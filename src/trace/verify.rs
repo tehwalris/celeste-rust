@@ -713,6 +713,18 @@ mod tests {
     /// The `objects` list by type name, as a histogram. Types are named
     /// by finding the global whose table IS the object's `type`, which
     /// is how the cart names them too.
+    ///
+    /// Counts the LUA border (`#objects`), not `arr.len()`. The two
+    /// differ, and on purpose: `del` ends in
+    /// `__array_table_drop_last`, which nils the last slot and leaves
+    /// it in the array part rather than shrinking it (see
+    /// `heap::Table::len` for why shrinking is not observationally
+    /// neutral). So the post-death heap holds `arr == [nil]` with
+    /// `#objects == 0`. Counting SLOTS reported that hole as an object
+    /// whose type could not be named - a `1x?` line that read like a
+    /// modelling bug and was only ever this.
+    ///
+    /// Whatever still cannot be named now says WHY instead of `?`.
     fn objects_by_type(st: &State<Symbolic>) -> String {
         let mut name_of: std::collections::BTreeMap<u32, String> = Default::default();
         let groot = &st.heap.tables[&st.globals];
@@ -721,29 +733,64 @@ mod tests {
                 name_of.insert(*t, k.clone());
             }
         }
-        let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
-        let objs = vec![iface::key("objects")];
-        let n = match iface::get(st, &objs) {
-            Some(Value::Table(t)) => st.heap.tables[&t].arr.len(),
-            _ => 0,
+        let tag = |v: &Value<Symbolic>| match v {
+            Value::Nil => "nil",
+            Value::Num(_) => "a number",
+            Value::Bool(_) => "a boolean",
+            Value::Str(_) => "a string",
+            Value::Table(_) => "a table",
+            _ => "a non-table",
         };
+        let objs = vec![iface::key("objects")];
+        let Some(Value::Table(list)) = iface::get(st, &objs) else {
+            return "<no objects list>".to_string();
+        };
+        let tab = &st.heap.tables[&list];
+        // `len()` is `None` when the border is not exact - an interior
+        // hole, or an integer part. Neither happens in this room, but
+        // falling back to every slot keeps the census honest if one
+        // ever does, and says so rather than quietly counting fewer.
+        let (n, exact) = match tab.len() {
+            Some(n) => (n, true),
+            None => (tab.arr.len(), false),
+        };
+        let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
         for i in 0..n {
             let mut p = objs.clone();
             p.push(Step::Idx(i));
-            p.push(iface::key("type"));
             let name = match iface::get(st, &p) {
-                Some(Value::Table(t)) => {
-                    name_of.get(&t).cloned().unwrap_or_else(|| "?".to_string())
-                }
-                _ => "?".to_string(),
+                None => "<past the end>".to_string(),
+                Some(Value::Table(o)) => match st.heap.tables[&o].hash.get("type") {
+                    None => "<no type field>".to_string(),
+                    Some(Value::Table(t)) => name_of
+                        .get(t)
+                        .cloned()
+                        .unwrap_or_else(|| format!("<type T{}, not a global>", t)),
+                    Some(v) => format!("<type is {}>", tag(v)),
+                },
+                Some(v) => format!("<{}>", tag(&v)),
             };
             *counts.entry(name).or_default() += 1;
         }
-        counts
-            .into_iter()
-            .map(|(k, v)| format!("{}x{}", v, k))
-            .collect::<Vec<_>>()
-            .join(" ")
+        let mut out = if counts.is_empty() {
+            "(empty)".to_string()
+        } else {
+            counts
+                .into_iter()
+                .map(|(k, v)| format!("{}x{}", v, k))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        // The slots `del` nil'd out. Not objects, but not nothing
+        // either: the tracer keeps them, so they are part of the heap
+        // the shape is taken of.
+        if exact && tab.arr.len() > n {
+            out.push_str(&format!(" (+{} nil slot(s))", tab.arr.len() - n));
+        }
+        if !exact {
+            out.push_str(" (border not exact - counted every slot)");
+        }
+        out
     }
 
     /// Snapshot every scalar, throw the graph away, and write them back
