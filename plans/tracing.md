@@ -3316,6 +3316,207 @@ fragments instead of each running 16 lanes wide to keep three. That is a
 change to the driver rather than to the emitter, and it is the only one
 of the three that attacks the work rather than moving it.
 
+### Where the 5-minute build actually goes (2026-08-23)
+
+Philippe, twice, on being told the build was slow: "there's no way that's
+how long this should be taking" and "are you sure something isn't holding
+a lock?" Both worth asking; the answer is neither.
+
+**It was not a lock.** `/usr/bin/time -v` over the whole build:
+**629.74 s of user CPU over 259.75 s of wall, 243% CPU**, and no
+`Blocking waiting for file lock` line anywhere. Sampling the compiler
+process during the run agrees - it sits between 2 and 3 cores throughout.
+It is genuinely ~630 CPU-seconds of compiling.
+
+**It was also not always five minutes.** The first time I reported it as
+slow, the build had already FINISHED - the command piped cargo through
+`tail`, which buffers to EOF, so an empty output file looked like a
+stalled build. Never pipe a long build through `tail`; redirect to a file
+and grep it.
+
+**Where it goes**, from `cargo build --timings` after touching
+`celeste-engine/src/kernel.rs`:
+
+| unit | seconds |
+|---|---|
+| **traced-kernel-check** | **304.6** |
+| celeste-rust | 21.3 |
+| celeste-kernels | 1.6 |
+| celeste-engine | 0.7 |
+| total wall | 308.9 |
+
+98% of it is ONE crate: 35,834 lines of generated kernel at opt-level 3,
+in which `kernel1::frame` alone is a **163,098-instruction function**.
+LLVM is superlinear in function size.
+
+And ~2.9 cores is the ceiling, not a coincidence: the crate is three big
+`frame` functions, and a codegen unit cannot split one function. More
+CGUs, or three separate crates, would not move the wall clock - it is
+already the largest single function's compile time.
+
+**And it is not the optimizer.** `opt-level = 1` was tried as an escape
+hatch for probe builds and is **607.85 s CPU against opt-level 3's
+629.74 s - 3.5% cheaper**, so the expensive passes are not where the
+time is. What LLVM is doing at every optimization level is instruction
+selection and register allocation over 7,758 SSA values in one function,
+and both are superlinear. The profile was removed again; there is no
+cheap-build knob to reach for.
+
+**Which makes this the same problem as the codegen section above.** The
+47% stack traffic and the 5-minute build are both "one function with
+~486 live values and 163k instructions". Anything that makes `frame`
+smaller pays twice - and a direct emitter does exactly the two things
+LLVM is spending all of that on, in a linear pass, with the domain
+knowledge that every value is a 16-lane column.
+
+### The traced runner has no chunking - and that, not coverage, is the wall
+
+A coverage probe (`ROOM_FRAMES=200 ROOM_UNCHECKED=1`) ran the kernels
+alone as far as they would go. **51 frames, and NOT ONE coverage gap** -
+no missing kernel, no unbound block, no declined lane. What stopped it
+was memory: 40 GB and climbing.
+
+| frame | rows in | raw | out |
+|---|---|---|---|
+| 20 | 1 | 1 | 1 |
+| 30 | 15,250 | 197,611 | 27,024 |
+| 40 | 673,479 | 14,236,296 | 902,280 |
+| 51 | 8,033,929 | 193,177,092 | 9,349,381 |
+
+~1.17x per frame at the end. The production search does not do this: it
+has an 8,000-lane chunk cap, the band filter and the partition filter,
+and `trace::run::Run` has none of them - it was written to check the
+kernels, not to run a campaign.
+
+So "kernel coverage" is not the next blocker at this horizon. The shape
+walk closes, the kernels cover what the room reaches, and the thing
+standing between the traced path and a campaign is that the runner
+materialises every successor at once.
+
+### ...and the fix is NOT to grow a search inside the runner
+
+My first reading was "port chunking into `trace::run::Run`". That is
+wrong, or at least not the main thing. Chunking bounds the TRANSIENT -
+193 M raw rows in flight at frame 51 - but the 9.3 M rows that came OUT
+of that frame are the frontier, and chunking does not touch a frontier.
+
+What keeps `AbstractRun`'s frontier bounded is PRUNING, and there are two
+of them: the `visited` set, and `BandFilter`, which drops any row that
+can no longer reach the exit within the horizon using `g_prev` from a
+backward sweep. Both are the refinement ladder of `plans/strategy.md` -
+SEARCH STRATEGY, not engine. `trace::run::Run` has neither, and should
+not: it exists to check kernels against the oracle.
+
+So the direction is the other one. The traced kernels should become an
+ENGINE the existing search drives, exactly as `compiled::FrameEngine` is
+today - which is also what CLAUDE.md already says the architecture is:
+"one frame of the abstract search is `compiled::FrameEngine::step`... it
+lives in celeste-rust so both the forward search and the backward sweep
+can call it". Doing that inherits chunking, threading, checkpointing,
+the campaign fingerprint and `parcheck` rather than reimplementing four
+of them, and it IS the Stage 4 transition.
+
+The work in it is that the two kernel surfaces are different generations:
+
+| | walk (`celeste-kernels`) | traced (`trace::dispatch`) |
+|---|---|---|
+| shape test | `SHAPE_HASH` const | `Kernel::shape` field |
+| bind | `bind(chunk) -> Uni` | inside `step` |
+| output | `frame(u, rin, g, &mut FnMut(u8, &KOutShared, &KOut))` | `step(b, lo, n, &mut [Rt2], &mut [RowSet]) -> Option<u16>` |
+| dedup | caller, `row_keys` + `FxHashSet` | in-kernel, `RowSet`, keys folded by the graph |
+| outcomes | one | many |
+| deopt | `kout.deopt` / `kout.bd` | declined mask, run stops |
+
+The traced surface is the better one on every row, so this means
+teaching the engine the new surface - not squeezing the new kernels into
+`class_kernel_runner`.
+
+### THE REPRESENTATION WAS THE PROBLEM (2026-08-23)
+
+Philippe, asked what the kernels were: "were you using explicit vector
+types... or were you just like using fixed width constant lists and kind
+of hoping it gets vectorized?"
+
+The second one. `ZN = [Pico8Num; 16]`, a plain array of a newtype over
+`i32`, and 28 of the 34 lane primitives are a `for i in 0..W` loop over
+scalar operators. There is no explicit vector type anywhere in the
+engine. That is the single decision behind everything measured above -
+the 61% scalar instructions, the 47% stack traffic, AND the 630-CPU-second
+build.
+
+**Measured on a synthetic kernel with the real one's shape** - the op mix
+from `kernel1`'s census, 4,000 nodes, a 400-wide live set, the same
+generated program emitted twice with only the lane type changed:
+
+| | `[P8; 16]` + scalar loops | `__m512i` + intrinsics |
+|---|---|---|
+| build | 120.3 s | **5.2 s** (23x) |
+| runtime | 19.2 us/frame | **1.0 us/frame** (19x) |
+| `frame` instructions | 123,601 | **6,323** (20x) |
+| checksum | `006f0a8f` | `006f0a8f` |
+
+Same answer, twenty times less of everything. The scalar build's
+mnemonic census is 77,213 `mov` out of 123,601 instructions; the vector
+one does not have a comparable pile.
+
+**This reframes the two refutations above rather than contradicting
+them.** Forcing ONE primitive to AVX-512 cost 27% because its neighbours
+were still arrays and the column had to be assembled and taken apart
+around it - which is the same fact from the other side. Being vector is
+a property of the REPRESENTATION, and it is all-or-nothing.
+
+**It retired the direct machine-code emitter before it was written.**
+The emitter was justified by two numbers - the 630-second build and the
+61% scalar instructions - and changing the lane type takes both. LLVM
+was not doing badly here; it was being handed sixteen-element loops and
+asked to guess. The `src/transpile/asm` prototype and its `iced-x86`
+dependency were deleted rather than left sitting unused; git history has
+them if the measurement below ever argues for going back.
+
+### DONE: the conversion (2026-08-23)
+
+`ZN` is `__m512i`. Every primitive is register-to-register: the
+arithmetic, the multiply (an even/odd `vpmuldq` weave), `flr` as a
+single `vpandd`, all five comparisons, the blend, the intervals, the
+fork, and the row-key fold. `ZB` stays a pair of `u16` on purpose - 16
+bits IS a mask register, and `zsel_n` is one `vpblendmd` because of it.
+
+Twelve tests in `celeste-engine` check each primitive against the scalar
+operator it replaced, which is the strongest oracle available: that code
+had been running for months. One of them earned its keep immediately -
+the vector `mix64` had murmur3's finalizer constants instead of
+splitmix64's, and a wrong row key does not crash, it silently changes
+which successors count as distinct.
+
+Two things that had to survive and did:
+
+* **The wrap guard.** `Pico8NumInterval`'s `Add`/`Sub` panic when an
+  endpoint leaves `i32`; a bare `vpaddd` drops that silently. The vector
+  arms compute the signed-overflow predicate (`((a^r)&(b^r))<0`) and hand
+  the column to the scalar implementation when any lane trips it - four
+  instructions on a path never taken, with a `#[should_panic]` test.
+* **`generated_is_current`.** The committed kernels had to be edited by
+  hand to break the bootstrap (the emitter lives in a crate that depends
+  on the kernels it generates, so a kernel that will not compile stops
+  you building the tool that would fix it). The gate then confirmed the
+  hand edit is BYTE-IDENTICAL to what the emitter produces.
+
+**Holes that remain**, with counts rather than adjectives: 4 `zn_div`,
+4 `zn_rem`, 4 `zi_div_pos`, 9 `zn_mget`, 22 `zn_tile_flag_at`, against
+~13,700 nodes. Philippe is right that divide is reachable - `f64` holds
+an `i32` and a 47-bit shifted numerator exactly, so it is a divide plus
+a correction step for round-to-nearest, plus masks for the saturating
+zero-divisor case. `tile_flag_at` is the genuinely awkward one: its
+fallback path COMPUTES on a cache miss, which is not a vector operation
+at any width.
+
+**What the synthetic does NOT cover**, and where the real number will be
+worse: multiply (an even/odd `vpmuldq` split), divide and remainder (no
+vector integer divide, and PICO-8 saturates on a zero divisor - these
+stay scalar), `sin` (a 16,384-entry table), `mget`/`tile_flag_at` (cart
+lookups), and the row-key fold, whose `ZW` is `[u64; 16]` and therefore
+two registers per column rather than one.
+
 ## Doctrine: never deopt to the interpreter (Philippe, 2026-08-23)
 
 **A deopt stops the run. It does not fall back.**

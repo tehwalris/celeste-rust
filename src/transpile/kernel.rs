@@ -1920,8 +1920,8 @@ pub(crate) fn emit_interface(out: &mut String, e: &Emit, of: &OutFields) -> Resu
             "num" => writeln!(
                 out,
                 "        c{id}: match &b.cols[{id}] {{\n\
-                 \x20           Col::N(v) => core::array::from_fn(|i| v[at(i)]),\n\
-                 \x20           Col::U(AV::Num(n)) => [*n; W],\n\
+                 \x20           Col::N(v) => ZN::from_array(core::array::from_fn(|i| v[at(i)])),\n\
+                 \x20           Col::U(AV::Num(n)) => zn_splat(*n),\n\
                  \x20           _ => return None,\n\
                  \x20       }},",
                 id = id
@@ -1956,12 +1956,12 @@ pub(crate) fn emit_interface(out: &mut String, e: &Emit, of: &OutFields) -> Resu
         match *ty {
             "ZN" => writeln!(
                 out,
-                "    b.cols[{id}] = Col::N({src}.c{id}[..n].to_vec());",
+                "    b.cols[{id}] = Col::N({src}.c{id}.to_array()[..n].to_vec());",
                 id = id, src = src
             )?,
             "ZI" => writeln!(
                 out,
-                "    b.cols[{id}] = Col::I((0..n).map(|i| ({src}.c{id}.lo[i], {src}.c{id}.hi[i])).collect());",
+                "    b.cols[{id}] = Col::I((0..n).map(|i| ({src}.c{id}.lo.lane(i), {src}.c{id}.hi.lane(i))).collect());",
                 id = id, src = src
             )?,
             "ZB" => writeln!(
@@ -2054,7 +2054,7 @@ pub(crate) fn emit_interface(out: &mut String, e: &Emit, of: &OutFields) -> Resu
         match *ty {
             "ZN" => writeln!(
                 out,
-                "        if let Col::N(v) = &mut acc.cols[{id}] {{ v.push({src}.c{id}[i]); }}",
+                "        if let Col::N(v) = &mut acc.cols[{id}] {{ v.push({src}.c{id}.lane(i)); }}",
                 id = id, src = src
             )?,
             "P8" if *tainted => writeln!(
@@ -2070,7 +2070,7 @@ pub(crate) fn emit_interface(out: &mut String, e: &Emit, of: &OutFields) -> Resu
             )?,
             "ZI" => writeln!(
                 out,
-                "        if let Col::I(v) = &mut acc.cols[{id}] {{ v.push(({src}.c{id}.lo[i], {src}.c{id}.hi[i])); }}",
+                "        if let Col::I(v) = &mut acc.cols[{id}] {{ v.push(({src}.c{id}.lo.lane(i), {src}.c{id}.hi.lane(i))); }}",
                 id = id, src = src
             )?,
             "(P8, P8)" if *tainted => writeln!(
@@ -2240,13 +2240,13 @@ pub(crate) fn emit_key_cell(
         )
     };
     let body = match ty {
-        "ZN" => per_lane_num(&format!("{}.c{}[i]", src, id)),
+        "ZN" => per_lane_num(&format!("{}.c{}.lane(i)", src, id)),
         "P8" => per_lane_num(&format!("{}.c{}", src, id)),
         "IN_N" => per_lane_num(&format!(
             "match &chunk.cols[{id}] {{ Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() }}",
             id = id
         )),
-        "ZI" => per_lane_av(&format!("AV::Ival({src}.c{id}.lo[i], {src}.c{id}.hi[i])", src = src, id = id)),
+        "ZI" => per_lane_av(&format!("AV::Ival({src}.c{id}.lo.lane(i), {src}.c{id}.hi.lane(i))", src = src, id = id)),
         "(P8, P8)" => per_lane_av(&format!("AV::Ival({src}.c{id}.0, {src}.c{id}.1)", src = src, id = id)),
         "ZB" => per_lane_av(&format!("AV::Bool({src}.c{id}.val & (1 << i) != 0)", src = src, id = id)),
         "bool" => per_lane_av(&format!("AV::Bool({src}.c{id})", src = src, id = id)),

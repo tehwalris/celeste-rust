@@ -247,8 +247,8 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
             "num" => writeln!(
                 o,
                 "        c{c}: match &b.cols[s.c{c} as usize] {{\n\
-                 \x20           Col::N(v) => core::array::from_fn(|i| v[at(i)]),\n\
-                 \x20           Col::U(AV::Num(n)) => [*n; W],\n\
+                 \x20           Col::N(v) => ZN::from_array(core::array::from_fn(|i| v[at(i)])),\n\
+                 \x20           Col::U(AV::Num(n)) => zn_splat(*n),\n\
                  \x20           _ => return None,\n\
                  \x20       }},",
                 c = cell
@@ -289,10 +289,10 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
                  \x20           }},\n\
                  \x20           Col::U(AV::Ival(lo, hi)) => ZI {{ lo: [*lo; W], hi: [*hi; W] }},\n\
                  \x20           Col::N(v) => ZI {{\n\
-                 \x20               lo: core::array::from_fn(|i| v[at(i)]),\n\
-                 \x20               hi: core::array::from_fn(|i| v[at(i)]),\n\
+                 \x20               lo: ZN::from_array(core::array::from_fn(|i| v[at(i)])),\n\
+                 \x20               hi: ZN::from_array(core::array::from_fn(|i| v[at(i)])),\n\
                  \x20           }},\n\
-                 \x20           Col::U(AV::Num(n)) => ZI {{ lo: [*n; W], hi: [*n; W] }},\n\
+                 \x20           Col::U(AV::Num(n)) => ZI {{ lo: zn_splat(*n), hi: zn_splat(*n) }},\n\
                  \x20           _ => return None,\n\
                  \x20       }},",
                 c = cell
@@ -509,7 +509,7 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
             match *ty {
                 "ZN" => writeln!(
                     o,
-                    "        if let Col::N(v) = &mut acc.cols[{c}] {{ v.push({s}.c{c}[i]); }}",
+                    "        if let Col::N(v) = &mut acc.cols[{c}] {{ v.push({s}.c{c}.lane(i)); }}",
                     c = cell,
                     s = src
                 )?,
@@ -529,7 +529,7 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
                 "ZI" => writeln!(
                     o,
                     "        if let Col::I(v) = &mut acc.cols[{c}] {{\n\
-                     \x20           v.push(({s}.c{c}.lo[i], {s}.c{c}.hi[i]));\n\
+                     \x20           v.push(({s}.c{c}.lo.lane(i), {s}.c{c}.hi.lane(i)));\n\
                      \x20       }}",
                     c = cell,
                     s = src

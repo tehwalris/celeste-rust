@@ -19,6 +19,24 @@ use traced_kernel_check::kernels;
 /// into real play, which is where the shapes stop being trivial.
 const FRAMES: usize = 30;
 
+/// How many frames to run, and whether to check them.
+///
+/// `ROOM_FRAMES` raises the horizon for a COVERAGE probe - "how far do
+/// the kernels get before a shape has no kernel or a lane declines" is
+/// a different question from "are they right", and the answer to the
+/// first is what says which kernel to write next. `ROOM_UNCHECKED`
+/// drops the oracle, which is the expensive side; a run with it set
+/// says so in its output and proves nothing about correctness.
+///
+/// Both default to the gate's behaviour: 30 frames, checked.
+fn horizon() -> (usize, bool) {
+    let n = std::env::var("ROOM_FRAMES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(FRAMES);
+    (n, std::env::var_os("ROOM_UNCHECKED").is_none())
+}
+
 #[test]
 fn the_room_runs_on_kernels_alone() {
     // From the REPO ROOT, because the oracle side reads `rewrites.jsonl`,
@@ -40,6 +58,7 @@ fn the_room_runs_on_kernels_alone() {
     // Collecting one side first and comparing afterwards checks nothing
     // at all when the fast side stops early, which is exactly the case
     // this is for.
+    let (frames, checked_run) = horizon();
     let program = celeste_rust::program::frozen::rewritten("rewrites.jsonl")
         .expect("the frozen rewritten program");
     let engine = celeste_rust::compiled::FrameEngine::new_for_start_room(&program)
@@ -61,7 +80,7 @@ fn the_room_runs_on_kernels_alone() {
         std::time::Duration::ZERO,
     );
     let mut t_oracle = std::time::Duration::ZERO;
-    for frame in 1..=FRAMES {
+    for frame in 1..=frames {
         let t0 = std::time::Instant::now();
         let stepped = run.step();
         t_kernels += t0.elapsed();
@@ -76,10 +95,16 @@ fn the_room_runs_on_kernels_alone() {
         t_phase.1 += st.t_merge;
         t_phase.2 += st.t_boundary;
         let t1 = std::time::Instant::now();
-        oracle.step().unwrap_or_else(|e| panic!("oracle frame {}: {:#}", frame, e));
+        if checked_run {
+            oracle.step().unwrap_or_else(|e| panic!("oracle frame {}: {:#}", frame, e));
+        }
         t_oracle += t1.elapsed();
         let want: BTreeSet<(u64, u64)> = st.keys.iter().copied().collect();
-        let got: BTreeSet<(u64, u64)> = engine.row_key_set(oracle.states()).into_iter().collect();
+        let got: BTreeSet<(u64, u64)> = if checked_run {
+            engine.row_key_set(oracle.states()).into_iter().collect()
+        } else {
+            want.clone()
+        };
         eprintln!(
             "[room] frame {:>3}: {:>7} in -> {:>9} raw -> {:>7} out ({:>4}x dropped) in {} block(s); oracle {}",
             st.frame,
@@ -196,8 +221,21 @@ fn the_room_runs_on_kernels_alone() {
         t_oracle.as_secs_f64() / t_kernels.as_secs_f64().max(1e-9)
     );
 
+    if !checked_run {
+        eprintln!(
+            "[room] ROOM_UNCHECKED was set: the oracle did not run, so these {} frames \
+             are a COVERAGE probe and say nothing about correctness.",
+            checked
+        );
+    }
     if let Some(why) = stopped {
-        panic!("{} frames agreed, then frame {} stopped: {}", checked, checked + 1, why);
+        panic!(
+            "{} frames {}, then frame {} stopped: {}",
+            checked,
+            if checked_run { "agreed" } else { "ran" },
+            checked + 1,
+            why
+        );
     }
 }
 

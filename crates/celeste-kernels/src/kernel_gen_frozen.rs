@@ -249,43 +249,43 @@ pub fn rows(b: &Rt2, lo: usize) -> Option<RowsIn> {
     let at = |i: usize| -> usize { (lo + i).min(b.width - 1) };
     Some(RowsIn {
         c234: match &b.cols[234] {
-            Col::N(v) => core::array::from_fn(|i| v[at(i)]),
-            Col::U(AV::Num(n)) => [*n; W],
+            Col::N(v) => ZN::from_array(core::array::from_fn(|i| v[at(i)])),
+            Col::U(AV::Num(n)) => zn_splat(*n),
             _ => return None,
         },
         c239: match &b.cols[239] {
-            Col::N(v) => core::array::from_fn(|i| v[at(i)]),
-            Col::U(AV::Num(n)) => [*n; W],
+            Col::N(v) => ZN::from_array(core::array::from_fn(|i| v[at(i)])),
+            Col::U(AV::Num(n)) => zn_splat(*n),
             _ => return None,
         },
         c253: match &b.cols[253] {
-            Col::N(v) => core::array::from_fn(|i| v[at(i)]),
-            Col::U(AV::Num(n)) => [*n; W],
+            Col::N(v) => ZN::from_array(core::array::from_fn(|i| v[at(i)])),
+            Col::U(AV::Num(n)) => zn_splat(*n),
             _ => return None,
         },
         c254: match &b.cols[254] {
-            Col::N(v) => core::array::from_fn(|i| v[at(i)]),
-            Col::U(AV::Num(n)) => [*n; W],
+            Col::N(v) => ZN::from_array(core::array::from_fn(|i| v[at(i)])),
+            Col::U(AV::Num(n)) => zn_splat(*n),
             _ => return None,
         },
         c268: match &b.cols[268] {
-            Col::N(v) => core::array::from_fn(|i| v[at(i)]),
-            Col::U(AV::Num(n)) => [*n; W],
+            Col::N(v) => ZN::from_array(core::array::from_fn(|i| v[at(i)])),
+            Col::U(AV::Num(n)) => zn_splat(*n),
             _ => return None,
         },
         c269: match &b.cols[269] {
-            Col::N(v) => core::array::from_fn(|i| v[at(i)]),
-            Col::U(AV::Num(n)) => [*n; W],
+            Col::N(v) => ZN::from_array(core::array::from_fn(|i| v[at(i)])),
+            Col::U(AV::Num(n)) => zn_splat(*n),
             _ => return None,
         },
         c270: match &b.cols[270] {
-            Col::N(v) => core::array::from_fn(|i| v[at(i)]),
-            Col::U(AV::Num(n)) => [*n; W],
+            Col::N(v) => ZN::from_array(core::array::from_fn(|i| v[at(i)])),
+            Col::U(AV::Num(n)) => zn_splat(*n),
             _ => return None,
         },
         c271: match &b.cols[271] {
-            Col::N(v) => core::array::from_fn(|i| v[at(i)]),
-            Col::U(AV::Num(n)) => [*n; W],
+            Col::N(v) => ZN::from_array(core::array::from_fn(|i| v[at(i)])),
+            Col::U(AV::Num(n)) => zn_splat(*n),
             _ => return None,
         },
         c272: match &b.cols[272] {
@@ -298,13 +298,13 @@ pub fn rows(b: &Rt2, lo: usize) -> Option<RowsIn> {
             _ => return None,
         },
         c280: match &b.cols[280] {
-            Col::N(v) => core::array::from_fn(|i| v[at(i)]),
-            Col::U(AV::Num(n)) => [*n; W],
+            Col::N(v) => ZN::from_array(core::array::from_fn(|i| v[at(i)])),
+            Col::U(AV::Num(n)) => zn_splat(*n),
             _ => return None,
         },
         c281: match &b.cols[281] {
-            Col::N(v) => core::array::from_fn(|i| v[at(i)]),
-            Col::U(AV::Num(n)) => [*n; W],
+            Col::N(v) => ZN::from_array(core::array::from_fn(|i| v[at(i)])),
+            Col::U(AV::Num(n)) => zn_splat(*n),
             _ => return None,
         },
     })
@@ -315,8 +315,8 @@ pub fn rows(b: &Rt2, lo: usize) -> Option<RowsIn> {
 pub fn apply(sh: &KOutShared, kv: &KOut, b: &mut Rt2, n: usize) {
     b.cols[20] = Col::U(AV::Num(sh.c20));
     b.cols[84] = Col::U(AV::Num(sh.c84));
-    b.cols[253] = Col::N(sh.c253[..n].to_vec());
-    b.cols[280] = Col::N(sh.c280[..n].to_vec());
+    b.cols[253] = Col::N(sh.c253.to_array()[..n].to_vec());
+    b.cols[280] = Col::N(sh.c280.to_array()[..n].to_vec());
     for cell in OUT_UBOOL_CELLS {
         b.cols[*cell as usize] = Col::U(AV::UBool);
     }
@@ -361,8 +361,8 @@ pub fn append_out(acc: &mut Rt2, chunk: &Rt2, lo: usize, n: usize, live: u16, sh
         acc.cols[20] = Col::U(AV::Num(sh.c20));
         if !fresh { if let Col::U(AV::Num(prev)) = &acc.cols[84] { if *prev != sh.c84 { *bd = true; } } }
         acc.cols[84] = Col::U(AV::Num(sh.c84));
-        if let Col::N(v) = &mut acc.cols[253] { v.push(sh.c253[i]); }
-        if let Col::N(v) = &mut acc.cols[280] { v.push(sh.c280[i]); }
+        if let Col::N(v) = &mut acc.cols[253] { v.push(sh.c253.lane(i)); }
+        if let Col::N(v) = &mut acc.cols[280] { v.push(sh.c280.lane(i)); }
         let val = match &chunk.cols[234] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
         if let Col::N(v) = &mut acc.cols[234] { v.push(val); }
         let val = match &chunk.cols[239] { Col::N(s) => s[(lo + i).min(chunk.width - 1)], Col::U(AV::Num(u)) => *u, _ => unreachable!() };
@@ -435,7 +435,7 @@ pub fn row_keys(chunk: &Rt2, lo: usize, n: usize, sh: &KOutShared, kv: &KOut, pl
         let c1 = 0x5bf0_3635u64 ^ (253u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         let c2 = 0x27d4_eb2fu64 ^ (253u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         for i in 0..W {
-            let v = sh.c253[i];
+            let v = sh.c253.lane(i);
             let v = if plan.det & (1 << 2) != 0 && v < P8::from_raw(0i32) { P8::from_raw(0i32) } else { v };
             let code = 1u64 << 56 | v.to_bits() as u64;
             h1[i] = h1[i].wrapping_add(mix64(c1 ^ code));
@@ -447,7 +447,7 @@ pub fn row_keys(chunk: &Rt2, lo: usize, n: usize, sh: &KOutShared, kv: &KOut, pl
         let c1 = 0x5bf0_3635u64 ^ (280u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         let c2 = 0x27d4_eb2fu64 ^ (280u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         for i in 0..W {
-            let v = sh.c280[i];
+            let v = sh.c280.lane(i);
             let v = if plan.det & (1 << 3) != 0 && v < P8::from_raw(0i32) { P8::from_raw(0i32) } else { v };
             let code = 1u64 << 56 | v.to_bits() as u64;
             h1[i] = h1[i].wrapping_add(mix64(c1 ^ code));
