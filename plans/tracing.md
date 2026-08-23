@@ -2667,6 +2667,72 @@ one enormous function and everything is a live range.
 Caveats, stated so the number is not over-read: one room, one block, no
 chunking, no threads, against an interpreter with a year of tuning.
 
+## Where the row amplification actually lives (2026-08-23, with Philippe)
+
+Measured on one block (frame 30's output, 27,024 lanes) so the factors
+compose rather than being compared across frames:
+
+    WHOLE block: 27,024 in -> 2,165,112 appended -> 296,765 distinct (7.3x)
+    per-lane distinct extrapolates to 799,964     ->  2.7x is CROSS-LANE
+
+So 7.3x = ~2.7x per-lane x ~2.7x cross-lane. I had said a slice-local
+dedup would catch "nearly all of it". It catches about HALF. Different
+input lanes converging on the same successor is the other half, and only
+a table that outlives one 16-lane slice sees it.
+
+The per-lane half is also not uniform. Sampling 201 lanes:
+
+       1x duplication:   70 lanes    <- a third duplicate NOTHING
+       6x duplication:   43 lanes
+      12x duplication:   16 lanes
+      24x duplication:   43 lanes
+      96x duplication:   25 lanes    <- every combination identical
+
+A 96x lane ignores the buttons AND the fork - a frozen or dead player.
+The value of a dedup is concentrated there, not spread evenly.
+
+### Philippe: fold the widenings INTO the kernel
+
+"The boundary erasing thing should just not be a boundary at all... they
+will just get immediately widened afterwards anyway, so we might as well
+move it into the kernel now."
+
+My first argument for it was dead-code elimination, and that was wrong.
+Measured:
+
+    shape 0: 2,138 nodes from all outputs, 2,085 without the erased
+             cells -> 53 nodes (2.5%) exist only for discarded values
+
+`rem` is not dead as a COMPUTATION - it feeds `amount`, which feeds the
+position. Only the final store is dead. 2.5%, not a chunk.
+
+The real mechanism is different and better: if the kernel applies the
+widenings, its rows are CANONICAL, and that is what lets dedup-at-write
+reach the full 46x instead of 7.3x. Two rows differing only in a `rem`
+about to be erased look different to a kernel that has not widened yet;
+after widening they compare equal - and so do rows from DIFFERENT lanes,
+which is the cross-lane half. The two proposals compose exactly.
+
+Cost to name: it makes a kernel specific to a LADDER RUNG. Today the
+kernel is rung-agnostic and the boundary applies the abstraction, so
+`CELESTE_REM_BITS` changes no generated code. Fold it in and every rung
+needs its own kernels. They are already per-room and per-shape, so this
+may be fine - but it changes what a kernel IS, and the ladder is the
+whole optimality argument.
+
+### Why write-time is the right place for dedup (Philippe, agreed)
+
+"That's where we have the smallest working set and can statically know
+the most stuff and do the most efficient comparisons." Plus a fourth
+reason: at write time you know the DESTINATION, so a duplicate costs
+nothing - you simply do not reserve a row. Detecting it later means the
+columns are already paid for.
+
+What write-time dedup cannot do alone is the cross-lane half, whose rows
+are produced in different slices. That needs a table living for a FRAME,
+keyed on the ~19 varying cells rather than the ~100 live ones - still
+far cheaper than the boundary's.
+
 ## What is needed before deleting `celeste-rewrite`
 
 * **`gen.rs`.** `FIELD_NAMES`, `GLOBAL_NAMES` and now `FN_NAMES` (the

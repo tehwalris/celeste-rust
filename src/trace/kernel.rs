@@ -1012,4 +1012,68 @@ mod tests {
             );
         }
     }
+
+    /// How much of a frame exists only to compute values the boundary
+    /// ERASES a moment later?
+    ///
+    /// `player.rem.x/y` are overwritten with the widened constant, and
+    /// the four timers are pinned to 0. The frame computes all of them -
+    /// through the fork, in `rem`'s case - writes them into the output
+    /// block, and the boundary discards them.
+    ///
+    /// Philippe's proposal is to compile the widenings INTO the kernel,
+    /// at which point those chains are dead and can be deleted. This
+    /// counts what that would remove.
+    #[test]
+    #[ignore]
+    fn how_much_of_a_frame_is_erased_immediately() {
+        use crate::transpile::graph::NodeId;
+        let refs = match super::room_kernels_in(std::path::Path::new(".")) {
+            Ok(r) => r,
+            Err(e) => panic!("{:#}", e),
+        };
+        let erased = ["rem.x", "rem.y", "frames", "seconds", "minutes", "deaths"];
+        for (si, r) in refs.iter().enumerate() {
+            let g = &r.bound.graph;
+            let reach = |roots: &[NodeId]| -> usize {
+                let mut seen = vec![false; g.len()];
+                let mut st = roots.to_vec();
+                let mut n = 0;
+                while let Some(x) = st.pop() {
+                    if seen[x as usize] {
+                        continue;
+                    }
+                    seen[x as usize] = true;
+                    n += 1;
+                    st.extend(g.get(x).args.iter().copied());
+                }
+                n
+            };
+            let mut all: Vec<NodeId> = Vec::new();
+            let mut kept: Vec<NodeId> = Vec::new();
+            let mut dropped = 0;
+            for (oi, o) in r.bound.outcomes.iter().enumerate() {
+                for (k, (cell, node, _)) in o.outputs.iter().enumerate() {
+                    let _ = cell;
+                    all.push(*node);
+                    let path = crate::trace::iface::show(&r.frame.outs[oi].fields[k].0);
+                    if erased.iter().any(|e| path.ends_with(e)) {
+                        dropped += 1;
+                    } else {
+                        kept.push(*node);
+                    }
+                }
+                all.push(o.live);
+                all.push(o.ok);
+                kept.push(o.live);
+                kept.push(o.ok);
+            }
+            let (a, k) = (reach(&all), reach(&kept));
+            eprintln!(
+                "[erase] shape {}: {} nodes reachable from all outputs, {} without the {} \
+                 erased cells -> {} nodes ({:.1}%) exist only for values the boundary discards",
+                si, a, k, dropped, a - k, 100.0 * (a - k) as f64 / a as f64
+            );
+        }
+    }
 }

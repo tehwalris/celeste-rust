@@ -97,6 +97,86 @@ fn the_room_runs_on_kernels_alone() {
         checked += 1;
     }
 
+    // PER-LANE duplication, which is what decides whether a
+    // slice-local dedup is worth building. A one-lane block gives
+    // exactly one input lane's candidate rows: `Run::step` passes
+    // `n = 1`, so `append` writes only lane 0.
+    //
+    // The aggregate figure (82 appended, 10.4 distinct per lane at
+    // frame 30) assumes rows from DIFFERENT lanes never coincide. This
+    // does not assume it.
+    if std::env::var_os("ROOM_LANE_CENSUS").is_some() {
+        let width = run.blocks().first().map(|b| b.width).unwrap_or(0);
+        let step = (width / 200).max(1);
+        let mut hist: std::collections::BTreeMap<usize, usize> = Default::default();
+        let mut tot_raw = 0usize;
+        let mut tot_dist = 0usize;
+        for lane in (0..width).step_by(step) {
+            let Some(b) = run.blocks().first() else { break };
+            if lane >= b.width {
+                continue;
+            }
+            let one = b.slice_lanes(lane, lane + 1);
+            let mut probe = celeste_rust::trace::run::Run::new(
+                kernels::KERNELS,
+                one,
+                engine.cart(),
+                engine.cache(),
+            )
+            .expect("one-lane run");
+            probe.census = true;
+            match probe.step() {
+                Ok(st) => {
+                    tot_raw += st.rows_raw;
+                    tot_dist += st.rows_distinct;
+                    let f = st.rows_raw / st.rows_distinct.max(1);
+                    *hist.entry(f).or_default() += 1;
+                }
+                Err(e) => eprintln!("[lane] lane {}: {:#}", lane, e),
+            }
+        }
+        // The SAME block, whole: aggregate duplication against the sum
+        // of per-lane duplication. The gap between them is rows that
+        // coincide ACROSS lanes, which a slice-local dedup cannot see
+        // and a global one can.
+        if let Some(b) = run.blocks().first() {
+            let mut whole = celeste_rust::trace::run::Run::new(
+                kernels::KERNELS,
+                b.clone_block(),
+                engine.cart(),
+                engine.cache(),
+            )
+            .expect("whole-block run");
+            whole.census = true;
+            if let Ok(st) = whole.step() {
+                let per_lane_distinct = (tot_dist as f64 / hist.values().sum::<usize>() as f64)
+                    * st.rows_in as f64;
+                eprintln!(
+                    "[lane] WHOLE block: {} in -> {} appended -> {} distinct ({:.1}x); \
+                     per-lane distinct extrapolates to {:.0} ({:.1}x cross-lane)",
+                    st.rows_in,
+                    st.rows_raw,
+                    st.rows_distinct,
+                    st.rows_raw as f64 / st.rows_distinct.max(1) as f64,
+                    per_lane_distinct,
+                    per_lane_distinct / st.rows_distinct.max(1) as f64
+                );
+            }
+        }
+
+        eprintln!(
+            "[lane] {} lanes sampled of {}: {} appended -> {} distinct ({:.1}x overall)",
+            hist.values().sum::<usize>(),
+            width,
+            tot_raw,
+            tot_dist,
+            tot_raw as f64 / tot_dist.max(1) as f64
+        );
+        for (f, n) in &hist {
+            eprintln!("[lane]   {:>3}x duplication: {:>4} lanes", f, n);
+        }
+    }
+
     eprintln!(
         "[time] {} frames: kernels {:?}, interpreter {:?} ({:.2}x)",
         checked,
