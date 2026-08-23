@@ -1624,8 +1624,14 @@ probes were each doing by hand.
 
 **Inputs and outputs are two numbering spaces, and that is not a
 defect.** An outcome that allocates or frees an object shifts every
-canonical id past the change. Measured on room (0,0) f40: one input
-shape, four outcomes, structures of 274 / 282 / 229 / 400 cells. The
+canonical id past the change. Measured on room (0,0) f40: an input
+shape of 282 cells, and four outcomes of 274 / 282 / 229 / 400.
+
+Note which way that falls. Exactly ONE of the four keeps the input
+shape. Two are smaller (something freed) and one is much larger
+(something allocated). So the generated `acc_init`, which today clones
+the chunk's structure and overwrites the output columns, is only correct
+for one outcome in four - see below. The
 generated code reads inputs off the chunk and writes outputs onto an
 accumulator built from the outcome's structure - different blocks, so
 the two spaces never meet. An id is only meaningful against the
@@ -1674,9 +1680,21 @@ move is behaviour-preserving.
 ### What is still missing
 
 * `render` and `transpile::fuse` still read `Variant::per[0]`. Emitting
-  a kernel with n > 1 needs the generated interface to declare n output
-  shapes, and `acc_init` to build each accumulator from that outcome's
-  structure rather than from the chunk's.
+  a kernel with n > 1 means suffixing the whole output half of the
+  generated interface - `KOutShared`, `KOut`, `OUT_CELLS`, `apply`,
+  `acc_init`, `append_out`, `KEY_CELLS`, `row_keys` - once per outcome,
+  with the suffix empty at n = 1 so the checked-in kernels stay
+  byte-identical. The input half (`bind`, `rows`) is unaffected.
+
+  **This has a design decision in it, and it is not cosmetic.**
+  `acc_init` clones the chunk's structure. Three outcomes in four do not
+  have the chunk's structure, so a suffixed-but-otherwise-unchanged
+  `acc_init` would compile and produce a block with the input shape and
+  the outcome's values - well-formed, silently wrong, exactly the
+  failure class `resolve_all`'s distinctness guard exists to prevent.
+  Doing this properly means the kernel carrying each outcome's structure
+  as generated data, which is new emitted content rather than a
+  suffixing pass.
 * `FrameEngine::step` is already `(shape, rows) -> [(shape, rows)]` and
   nothing has ever populated more than one entry.
 * The partition check P2 calls for: union of member masks plus the

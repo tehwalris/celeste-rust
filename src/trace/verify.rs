@@ -817,6 +817,17 @@ mod tests {
             Ok(k) => k,
             Err(e) => return eprintln!("[emit] pm1 key: {:#}", e),
         };
+        // The INPUT structure, for comparison with the outcomes' below:
+        // whether a traced outcome keeps the shape it started in decides
+        // whether a generated `acc_init` may clone the chunk's structure
+        // or has to carry the outcome's own.
+        let in_cells = super::super::bind::structure_of(
+            &st,
+            it.cart.clone().unwrap(),
+            it.cache.clone().unwrap(),
+        )
+        .map(|r| r.structure.len())
+        .unwrap_or(0);
         let f = match trace_frame(&mut it, &reset, &frame, st, &roots, &pin) {
             Ok(f) => f,
             Err(e) => return eprintln!("[emit] trace stopped at: {:#}", e),
@@ -838,9 +849,11 @@ mod tests {
             Err(e) => return eprintln!("[emit] BIND REFUSED: {:#}", e),
         };
         eprintln!(
-            "[emit] bound {} row inputs + {} uniform inputs; outcome shapes {:?} cells",
+            "[emit] bound {} row inputs + {} uniform inputs; input shape {} cells, \
+             outcome shapes {:?}",
             b.inputs.len(),
             b.uni.len(),
+            in_cells,
             f.outs.iter().map(|o| o.rt2.structure.len()).collect::<Vec<_>>()
         );
 
