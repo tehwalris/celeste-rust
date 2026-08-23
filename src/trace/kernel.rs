@@ -381,9 +381,13 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
         writeln!(o, "];\n")?;
 
         writeln!(o, "/// Outcome {}'s button-INDEPENDENT values.", i)?;
+        writeln!(o, "/// Values shared by every button assignment.\n\
+                 /// COMPILE-TIME CONSTANTS are absent: their column is\n\
+                 /// written once when the block is built, so there is\n\
+                 /// nothing to carry per lane.")?;
         writeln!(o, "pub struct KShared{} {{", i)?;
-        for OutField { cell, ty, tainted, .. } in &out.fields {
-            if !*tainted {
+        for OutField { cell, ty, tainted, konst, .. } in &out.fields {
+            if !*tainted && konst.is_none() {
                 writeln!(o, "    pub c{}: {},", cell, ty)?;
             }
         }
@@ -415,7 +419,14 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
              \x20   let mut b = build_block(OUT_SHAPE_{i}, OUT_GLOBALS_{i}, OUT_PTRS_{i}, 0, cart, cache);",
             i = i
         )?;
-        for OutField { cell, ty, .. } in &out.fields {
+        for OutField { cell, ty, konst, .. } in &out.fields {
+            // A constant column holds one value for the whole
+            // accumulator, so it is written HERE, once, instead of being
+            // pushed per row. 44 of outcome 0's 52 fields are like this.
+            if let Some(av) = konst {
+                writeln!(o, "    b.cols[{}] = Col::U({});", cell, av)?;
+                continue;
+            }
             let empty = match *ty {
                 "ZN" => "Col::N(Vec::new())",
                 "ZB" => "Col::V(Vec::new())",
@@ -450,7 +461,10 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
              \x20       if take & (1 << i) == 0 {{ continue; }}",
             i = i
         )?;
-        for OutField { cell, ty, tainted, .. } in &out.fields {
+        for OutField { cell, ty, tainted, konst, .. } in &out.fields {
+            if konst.is_some() {
+                continue; // written once by `acc`, not per row
+            }
             let src = if *tainted { "kv" } else { "sh" };
             match *ty {
                 "ZN" => writeln!(
@@ -561,8 +575,8 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
     o.push_str(&render_lines(&l.body));
     for (i, out) in l.outs.iter().enumerate() {
         writeln!(o, "    let sh{} = KShared{} {{", i, i)?;
-        for OutField { cell, expr, tainted, .. } in &out.fields {
-            if !*tainted {
+        for OutField { cell, expr, tainted, konst, .. } in &out.fields {
+            if !*tainted && konst.is_none() {
                 writeln!(o, "        c{}: {},", cell, expr)?;
             }
         }

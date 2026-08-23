@@ -29,7 +29,7 @@ variants, and the per-frame graph check (1,393,224 values).
 
 | | |
 |---|---|
-| speed vs the interpreter | **2.75x slower** (619 ms vs 220 ms, 30 frames, single-threaded) |
+| speed vs the interpreter | **1.85x slower** (405 ms vs 219 ms, 30 frames, single-threaded) - was 2.75x before constant columns |
 | row amplification | **46x**: 1.25M rows written to keep 27k |
 | ...decomposed | 1.4x static, ~2.7x per-lane, ~2.7x cross-lane, 5.9x only-the-widenings |
 | codegen | **16.3 instructions per graph node**, 48% stack traffic, 6.6% vector |
@@ -2840,6 +2840,28 @@ refused it.
 All 30 frames still match the interpreter, so the boundary's own
 widening pass is now a no-op on those cells - which makes it a free
 check that the two agree.
+
+### DONE: constant columns are written ONCE - 2.75x -> 1.85x
+
+The first increment of the restructure, and the biggest single win so
+far. 44 of outcome 0's 52 output fields are compile-time constants; the
+kernel was pushing each into a `Vec` once per row.
+
+A constant that every variant agrees on holds the same value in EVERY
+row of that outcome's accumulator, so its column is written once as
+`Col::U` when the block is built, and skipped in `append` and in
+`KShared` entirely. Detected from the specialized graph (`Op::Const` /
+`Op::ConstBool`) rather than by matching emitted text, whose form varies
+with the coercion the field's type asked for.
+
+    KShared0 fields:  53 -> 4
+    pushes per row:   52 -> 4
+    30 frames:       604 ms -> 405 ms   (2.75x behind -> 1.85x)
+
+All 30 frames still row-key identical; 609 tests pass. A third of the
+total time, from one change, and it attacks both measured problems at
+once - the per-row column writes AND the output values that were living
+across the variant sequence.
 
 ### Specialization is a LAYER, not a redefinition (Philippe)
 

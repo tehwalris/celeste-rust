@@ -231,6 +231,7 @@ pub fn lower_frame(
                         expr: String::new(),
                         tainted: false,
                         node: *node,
+                        konst: None,
                     })
                     .collect(),
                 ubool: Vec::new(),

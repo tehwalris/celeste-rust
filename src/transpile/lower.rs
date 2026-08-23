@@ -1142,6 +1142,32 @@ pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
         for f in o.of.fields.iter_mut() {
             let first = variants[0].per[oi].outputs[&f.cell].clone();
             f.tainted = variants.iter().any(|v| v.per[oi].outputs[&f.cell] != first);
+            // A COMPILE-TIME CONSTANT that every variant agrees on holds
+            // the same value in every row of this outcome's accumulator,
+            // so the column can be written once as `Col::U` rather than
+            // pushed per row.
+            //
+            // Read off the specialized graph rather than by matching the
+            // emitted text: a literal is `Op::Const` / `Op::ConstBool`
+            // there, and the rendered form varies with the coercion the
+            // field's type asked for (`zn_splat(P8::from_raw(..))` and
+            // friends).
+            f.konst = if f.tainted {
+                None
+            } else {
+                let node = maps[reps[0] as usize][f.node as usize];
+                match sp.get(node).op {
+                    Op::Const(lo, hi) if lo == hi => {
+                        Some(format!("AV::Num(P8::from_raw({}i32))", lo))
+                    }
+                    Op::Const(lo, hi) => Some(format!(
+                        "AV::Ival(P8::from_raw({}i32), P8::from_raw({}i32))",
+                        lo, hi
+                    )),
+                    Op::ConstBool(b) => Some(format!("AV::Bool({})", b)),
+                    _ => None,
+                }
+            };
             f.expr = first;
         }
     }

@@ -1660,6 +1660,16 @@ pub(crate) struct OutField {
     /// one: a value the emitter could not describe structurally would have
     /// failed at its bind site, not here.
     pub(crate) node: NodeId,
+    /// The `AV` literal this cell holds in EVERY row, when it is a
+    /// compile-time constant and every variant agrees.
+    ///
+    /// Such a column has one value for the whole accumulator, so it can
+    /// be written ONCE as `Col::U` when the block is built rather than
+    /// pushed per row. Measured on the traced room kernels: 44 of
+    /// outcome 0's 52 output fields are `zn_splat` of a literal, so this
+    /// removes most of the per-row column writes - and most of the
+    /// output values that were living across the variant sequence.
+    pub(crate) konst: Option<String>,
 }
 
 /// Output cells of one walk, plus `ubool` - cells ending the frame as
@@ -1737,7 +1747,7 @@ fn compute_out_fields(e: &mut Emit) -> Result<OutFields> {
             .graph
             .operand(&expr, &named)
             .with_context(|| format!("output cell {}", id))?;
-        out_fields.push(OutField { cell: *id, ty, expr, tainted, node });
+        out_fields.push(OutField { cell: *id, ty, expr, tainted, node, konst: None });
     }
     Ok(OutFields { fields: out_fields, ubool: out_ubool })
 }

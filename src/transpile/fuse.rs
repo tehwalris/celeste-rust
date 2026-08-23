@@ -628,6 +628,7 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
                 expr: fused_expr(&canonicalize(&f.expr, &primary.vn)),
                 tainted: f.tainted,
                 node: f.node,
+                konst: f.konst.clone(),
             })
             .collect(),
         ubool: primary.of.ubool.clone(),
