@@ -244,3 +244,71 @@ only buys 78 ms of 356.
 Accept 1.55x and spend the time on coverage, since deleting the
 interpreter is blocked on the kernels covering more than one room and
 one ladder rung - not on speed.
+
+## Where the time actually goes (measured 2026-08-23)
+
+`perf record` on the 30-frame room test, release build, group-driven
+emission in place. Phase timing: kernel 327 ms, merge 2 ms, boundary
+24 ms; interpreter oracle 230 ms on the same data.
+
+Symbol breakdown *within* the kernel phase:
+
+| symbol | % of whole profile |
+|---|---|
+| `k1::append3` | 2.49 |
+| `k1::frame` (the entire arithmetic graph) | 0.82 |
+| `k1::append0/1/2` | 0.02 each |
+
+So **75% of kernel time is one append, and the arithmetic graph is the
+other 25%.** Every earlier plan aimed at the graph. The graph is not the
+problem.
+
+### It is the hash, not the stores
+
+`perf annotate` on `append3` shows the heat spread uniformly across a
+straight-line block of `imul`/`shr`/`xor` - the row hash. Instruction mix
+of the function body: 192 `imul`, 213 `shr`, 271 `xor`, 674 `mov`, 2008
+instructions total for ONE row.
+
+The hash is 29 cells x 2 accumulators, written as
+
+```rust
+h1 = mix64(h1 ^ mix64(v ^ c));            // NESTED - order-dependent
+h2 = h2.wrapping_add(mix64(v.wrapping_mul((c << 1) | 1)));
+```
+
+`h1`'s form is a serial dependency chain: ~190 `imul`s at 3-cycle latency
+that cannot overlap. ~500 cycles per candidate row.
+
+### The cost model, confirmed two ways
+
+- 82 candidate rows appended per input lane (lane census, frame 30),
+  26,504 input lanes over 30 frames -> ~2.17M candidate rows hashed.
+- 2.17M x ~500 cycles = 1.09e9 cycles = ~270 ms at 4 GHz.
+- `perf` attributes 2.49% of 43.9e9 cycles = 1.09e9 cycles to `append3`.
+
+Same number from the static instruction count and from the sampler. Also
+note 87% of those 2.17M rows are duplicates thrown away *after* paying the
+full hash.
+
+### Three fixes, in size order
+
+1. **Commutative fold.** Of the 29 hashed cells in `append3`, 13 come
+   from `KShared` - identical across all 24 button assignments - and 16
+   from `KOut`. The nested `h1` form forces all 29 to be recomputed for
+   each of the ~82 candidates. If both accumulators combine
+   commutatively (xor/add of independently mixed terms), the 13 shared
+   cells are hashed ONCE per lane and reused. ~45% off the hash. Safe:
+   each term already mixes the cell index, so position stays encoded.
+2. **Vectorise across lanes.** The hash is scalar, one lane at a time,
+   and the 16 lanes are independent. Because this is a latency chain and
+   not a throughput limit, SIMD across lanes is close to free.
+3. **Cheaper primitive.** `_mm_crc32_u64` (3-cycle latency, 1/cycle
+   throughput) instead of two 64-bit multiplies per cell.
+
+### What did NOT help
+
+Group-driven emission (96 sink calls -> 68) is correct - 30 frames
+row-key identical - and worth **nothing**: 353 ms vs 356 ms, inside the
+noise. The sink call count was never the cost. Keep it for the smaller
+generated code, not for speed.

@@ -393,13 +393,18 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
         }
         writeln!(o, "}}\n")?;
         writeln!(o, "/// Outcome {}'s per-assignment values and lane masks.", i)?;
+        writeln!(
+            o,
+            "/// The cells of outcome {i} that DIFFER between button\n\
+             /// assignments. Everything else is either constant (written\n\
+             /// once when the block is built) or shared (`KShared{i}`).\n\
+             ///\n\
+             /// No `live`/`deopt` here: which lanes a group writes is its\n\
+             /// `take` argument, and declined lanes are accumulated by\n\
+             /// `frame` itself.",
+            i = i
+        )?;
         writeln!(o, "pub struct KOut{} {{", i)?;
-        writeln!(o, "    /// Lanes that take THIS successor.")?;
-        writeln!(o, "    pub live: u16,")?;
-        writeln!(o, "    /// Lanes the kernel declines - they go to the interpreter.")?;
-        writeln!(o, "    pub deopt: u16,")?;
-        writeln!(o, "    /// The whole block is undecidable here.")?;
-        writeln!(o, "    pub bd: bool,")?;
         for OutField { cell, ty, tainted, .. } in &out.fields {
             if *tainted {
                 writeln!(o, "    pub c{}: {},", cell, ty)?;
@@ -466,10 +471,15 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
              /// 128-bit like the boundary's own key, because a collision\n\
              /// DROPS a successor rather than merely costing time.\n\
              pub fn append{i}(\n\
-             \x20   acc: &mut Rt2, sh: &KShared{i}, kv: &KOut{i}, n: usize,\n\
-             \x20   seen: &mut RowSet,\n\
-             ) {{\n\
-             \x20   let take = kv.live & !kv.deopt;\n\
+             \x20   acc: &mut Rt2, sh: &KShared{i}, kv: &KOut{i}, take: u16,\n\
+             \x20   n: usize, seen: &mut RowSet,\n\
+             ) -> u16 {{\n\
+             \x20   // Returns the lanes actually WRITTEN, which is `take`\n\
+             \x20   // minus the ones another configuration already wrote.\n\
+             \x20   // A caller that needs to know which (assignment, lane)\n\
+             \x20   // produced row k cannot infer it from `take`.\n\
+             \x20   let mut wrote: u16 = 0;\n\
+             \x20   let take = take & ((1u32 << n) - 1) as u16;\n\
              \x20   for i in 0..n {{\n\
              \x20       if take & (1 << i) == 0 {{ continue; }}",
             i = i
@@ -537,23 +547,13 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
                 other => anyhow::bail!("output type {}", other),
             }
         }
-        writeln!(o, "        acc.width += 1;\n    }}\n}}\n")?;
+        writeln!(o, "        wrote |= 1 << i;\n        acc.width += 1;\n    }}\n    wrote\n}}\n")?;
     }
-
-    // One struct so `frame` has a fixed arity whatever the outcome count.
-    writeln!(o, "/// Every outcome's result for one button assignment.")?;
-    writeln!(o, "pub struct KOuts<'a> {{")?;
-    for i in 0..l.outs.len() {
-        writeln!(o, "    pub sh{i}: &'a KShared{i},", i = i)?;
-        writeln!(o, "    pub v{i}: &'a KOut{i},", i = i)?;
-    }
-    writeln!(o, "}}\n")?;
 
     // A small dynamic layer over the per-outcome items above. Rust
     // cannot index a struct or a function name by a runtime `usize`, and
-    // a caller that loops over outcomes - the dispatcher, and the check
-    // harness - needs to. Generated rather than written by hand so it
-    // cannot fall out of step with the outcome count.
+    // a caller that loops over outcomes needs to. Generated rather than
+    // written by hand so it cannot fall out of step with the count.
     writeln!(o, "pub const OUTCOMES: usize = {};\n", l.outs.len())?;
     let dispatch = |o: &mut String, sig: &str, arm: &str| -> Result<()> {
         writeln!(o, "{} {{", sig)?;
@@ -570,26 +570,29 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
         "pub fn acc(i: usize, cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2",
         "acc#(cart, cache)",
     )?;
-    dispatch(
-        &mut o,
-        "pub fn append(i: usize, a: &mut Rt2, o: &KOuts, n: usize, \
-         seen: &mut RowSet)",
-        "append#(a, o.sh#, o.v#, n, seen)",
-    )?;
-    dispatch(&mut o, "pub fn live(i: usize, o: &KOuts) -> u16", "o.v#.live")?;
-    dispatch(&mut o, "pub fn deopt(i: usize, o: &KOuts) -> u16", "o.v#.deopt")?;
-    dispatch(&mut o, "pub fn bd(i: usize, o: &KOuts) -> bool", "o.v#.bd")?;
     dispatch(&mut o, "pub fn out_slots(i: usize) -> &'static [(u32, &'static str)]", "OUT_SLOTS_#")?;
 
     // ONE uniform entry point per kernel, so a dispatcher can hold
     // kernels for different shapes as plain function pointers. Every
-    // shape's `Uni`, `RowsIn` and `KOuts` are different types, so
+    // shape's `Uni`, `RowsIn` and `KShared` are different types, so
     // anything that exposed them could not be uniform.
     //
     // `None` means this kernel is not for this block - a path that does
     // not resolve, or a slot at the wrong kind. `Some(mask)` is the
-    // lanes some (variant, outcome) DECLINED; under the never-deopt
-    // doctrine a non-zero mask stops the run rather than falling back.
+    // lanes DECLINED; under the never-deopt doctrine a non-zero mask
+    // stops the run rather than falling back.
+    writeln!(o, "struct Append<'a> {{ accs: &'a mut [Rt2], seen: &'a mut [RowSet], n: usize }}\n")?;
+    writeln!(o, "impl<'a> Sink for Append<'a> {{")?;
+    for i in 0..l.outs.len() {
+        writeln!(
+            o,
+            "    fn o{i}(&mut self, _mask: u8, take: u16, sh: &KShared{i}, v: &KOut{i}) {{\n\
+             \x20       append{i}(&mut self.accs[{i}], sh, v, take, self.n, &mut self.seen[{i}]);\n\
+             \x20   }}",
+            i = i
+        )?;
+    }
+    writeln!(o, "}}\n")?;
     writeln!(
         o,
         "pub fn step(\n\
@@ -598,29 +601,111 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
          \x20   let (u, s) = bind(b)?;\n\
          \x20   let rin = rows(b, &s, lo)?;\n\
          \x20   let g = G {{ cart: &b.cart, cache: &b.cache }};\n\
-         \x20   let mut declined = 0u16;\n\
-         \x20   // One set per OUTCOME, owned by the CALLER and reset in\n\
-         \x20   // O(1) here. Slice-local because that is where the\n\
-         \x20   // duplication is: it comes from different button/fork\n\
-         \x20   // configurations agreeing on one lane, and a lane lives\n\
-         \x20   // in one slice. Allocating them per slice instead cost\n\
-         \x20   // more than the dedup saved.\n\
+         \x20   // The row sets are the CALLER's and reset in O(1) here.\n\
+         \x20   // Slice-local because that is where the duplication is:\n\
+         \x20   // it comes from configurations agreeing on one lane, and\n\
+         \x20   // a lane lives in one slice.\n\
          \x20   seen.iter_mut().for_each(|s| s.next_slice());\n\
-         \x20   frame(&u, &rin, &g, &mut |_mask, o| {{\n\
-         \x20       for i in 0..OUTCOMES {{\n\
-         \x20           declined |= deopt(i, o) & live(i, o);\n\
-         \x20           append(i, &mut accs[i], o, n, &mut seen[i]);\n\
-         \x20       }}\n\
-         \x20   }});\n\
-         \x20   Some(declined)\n\
+         \x20   let mut sink = Append {{ accs, seen, n }};\n\
+         \x20   Some(frame(&u, &rin, &g, &mut sink))\n\
          }}\n"
     )?;
 
     // ---- the body ----
+    //
+    // GROUP-DRIVEN. Variants that write the same values to an outcome
+    // append ONCE, with the union of their lanes, instead of appending
+    // identical rows that a dedup then throws away. Outcome 0 has no
+    // per-variant cells at all, so its 24 button assignments are one
+    // group and produce one row per lane rather than 24.
+    //
+    // The union is accumulated INCREMENTALLY (`take |= ...` after each
+    // variant) and the append is emitted at the group's LAST member, so
+    // nothing has to stay live: a variant's masks die immediately, and
+    // the group's values are computed once, at the end, from
+    // expressions every member shares by definition. Building the union
+    // as one expression instead kept 48 masks alive at once and took
+    // the build from 70 s to 20+ minutes.
+    // A block-undecidable condition zeroes `live`, which would drop
+    // every lane of that outcome SILENTLY - the missing-successor
+    // failure the whole boolean split exists to prevent. Nothing
+    // consumes `bd` today because it is always the literal `false` here;
+    // this refuses to emit a kernel where that stops being true, rather
+    // than letting it become a quiet hole.
+    {
+        use crate::transpile::kernel::Line;
+        for line in &l.body {
+            if let Line::Let { name, expr, .. } = line {
+                if name.starts_with("bd_v") && expr != "false" {
+                    anyhow::bail!(
+                        "{} is `{}`, not `false`: a block-undecidable condition zeroes \
+                         `live` and would drop every lane of that outcome silently. It \
+                         has to be routed as a deopt instead.",
+                        name,
+                        expr
+                    );
+                }
+            }
+        }
+    }
+
+    let mut groups: Vec<Vec<usize>> = Vec::new(); // per outcome: variant -> group
+    let mut last: Vec<Vec<bool>> = Vec::new();    // per outcome: is last of its group
+    let mut n_groups: Vec<usize> = Vec::new();
+    for oi in 0..l.outs.len() {
+        let key = |v: &crate::transpile::lower::Variant| -> String {
+            let p = &v.per[oi];
+            l.outs[oi]
+                .fields
+                .iter()
+                .filter(|f| f.tainted)
+                .map(|f| p.outputs[&f.cell].clone())
+                .collect::<Vec<_>>()
+                .join(";")
+        };
+        let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+        let mut g = Vec::new();
+        for v in &l.variants {
+            let k = key(v);
+            let n = seen.len();
+            g.push(*seen.entry(k).or_insert(n));
+        }
+        let ng = seen.len();
+        let mut is_last = vec![false; g.len()];
+        for gi in 0..ng {
+            if let Some(pos) = g.iter().rposition(|x| *x == gi) {
+                is_last[pos] = true;
+            }
+        }
+        groups.push(g);
+        last.push(is_last);
+        n_groups.push(ng);
+    }
+
     writeln!(
         o,
-        "#[inline(never)]\n\
-         pub fn frame(u: &Uni, rin: &RowsIn, g: &G, out: &mut impl FnMut(u8, &KOuts)) {{"
+        "/// Where a frame's rows go. One call per (outcome, GROUP), not\n\
+         /// per outcome per variant: variants that write identical\n\
+         /// values are one call whose `take` is the union of their\n\
+         /// lanes. `mask` is the group's REPRESENTATIVE assignment -\n\
+         /// every member computes the same values, so any of them\n\
+         /// identifies the row for a caller that wants to check it\n\
+         /// against the graph.\n\
+         pub trait Sink {{"
+    )?;
+    for i in 0..l.outs.len() {
+        writeln!(o, "    fn o{i}(&mut self, mask: u8, take: u16, sh: &KShared{i}, v: &KOut{i});", i = i)?;
+    }
+    writeln!(o, "}}\n")?;
+
+    writeln!(
+        o,
+        "/// Run one frame over 16 lanes. Returns the lanes DECLINED -\n\
+         /// live but not `ok` - which the never-deopt doctrine turns\n\
+         /// into a stopped run.\n\
+         #[inline(never)]\n\
+         pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {{\n\
+         \x20   let mut declined: u16 = 0;"
     )?;
     o.push_str(&render_lines(&l.body));
     for (i, out) in l.outs.iter().enumerate() {
@@ -632,40 +717,50 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
         }
         writeln!(o, "    }};")?;
     }
+    for (i, ng) in n_groups.iter().enumerate() {
+        for gi in 0..*ng {
+            writeln!(o, "    let mut take_{}_{}: u16 = 0;", i, gi)?;
+        }
+    }
     writeln!(
         o,
-        "    // {} of 64 button assignments are distinct successors",
-        l.variants.len()
+        "    // {} distinct button assignments; per outcome they fall\n\
+         \x20   // into {:?} groups that write identical values.",
+        l.variants.len(),
+        n_groups
     )?;
-    for v in &l.variants {
+    for (vi, v) in l.variants.iter().enumerate() {
         for (i, out) in l.outs.iter().enumerate() {
             let p = &v.per[i];
+            let gi = groups[i][vi];
+            writeln!(o, "    declined |= {} & !{};", p.live, p.ok)?;
+            writeln!(o, "    take_{}_{} |= {} & {};", i, gi, p.live, p.ok)?;
+            if !last[i][vi] {
+                continue;
+            }
             writeln!(o, "    let o{} = KOut{} {{", i, i)?;
-            writeln!(o, "        live: {},", p.live)?;
-            writeln!(o, "        deopt: !{},", p.ok)?;
-            writeln!(o, "        bd: {},", p.bd)?;
             for OutField { cell, tainted, .. } in &out.fields {
                 if *tainted {
                     writeln!(o, "        c{}: {},", cell, p.outputs[cell])?;
                 }
             }
             writeln!(o, "    }};")?;
+            writeln!(
+                o,
+                "    sink.o{i}({m}, take_{i}_{gi}, &sh{i}, &o{i});",
+                i = i,
+                gi = gi,
+                m = v.mask
+            )?;
         }
-        let args: Vec<String> = (0..l.outs.len())
-            .map(|i| format!("sh{i}: &sh{i}, v{i}: &o{i}", i = i))
-            .collect();
-        writeln!(o, "    out({}, &KOuts {{ {} }});", v.mask, args.join(", "))?;
     }
-    // Close the FORK loops the body opened.
-    //
-    // Everything above - the shared outputs, the per-variant outputs and
-    // the `out` calls - is emitted INSIDE them, which is the point: each
-    // fork configuration is a separate set of rows for the same input
-    // lane, exactly as each button assignment is. The walk's renderer
-    // does the same at its own end (`transpile::kernel`).
+    // Close the FORK loops the body opened. Everything above is inside
+    // them, which is the point: each fork configuration is its own set
+    // of rows for the same input lane.
     for _ in 0..b.forks {
         writeln!(o, "    }}")?;
     }
+    writeln!(o, "    declined")?;
     writeln!(o, "}}")?;
     Ok(o)
 }

@@ -85,37 +85,50 @@ mod tests {
             .collect();
         let mut from: Vec<Vec<(u8, usize)>> = vec![Vec::new(); kernel::OUTCOMES];
         // The kernel skips a row whose values another configuration
-        // already wrote, so the harness has to track the same set or its
+        // already wrote, so the harness tracks the same set or its
         // "which (assignment, lane) produced this row" bookkeeping
         // drifts from what was actually appended.
         let mut seen: Vec<celeste_engine::kernel::RowSet> =
             (0..kernel::OUTCOMES).map(|_| celeste_engine::kernel::RowSet::new()).collect();
         seen.iter_mut().for_each(|s| s.next_slice());
-        kernel::frame(&u, &rin, &g, &mut |mask, outs| {
-            for i in 0..kernel::OUTCOMES {
-                // Exactly one outcome may claim a lane. A lane in none is
-                // a successor that vanished and a lane in two is one
-                // counted twice; neither shows up as a wrong value, so
-                // checking it here is the only place it would be caught.
-                let take = kernel::live(i, outs) & !kernel::deopt(i, outs);
-                for lane in 0..n {
-                    if take & (1 << lane) != 0 {
-                        from[i].push((mask, lane));
+
+        // The kernel calls this once per (outcome, GROUP), where a group
+        // is a set of button assignments that write identical values.
+        // `mask` is any member, which is enough to evaluate the graph at
+        // the point that produced the row.
+        struct H<'a> {
+            accs: &'a mut Vec<celeste_engine::Rt2>,
+            seen: &'a mut Vec<celeste_engine::kernel::RowSet>,
+            from: &'a mut Vec<Vec<(u8, usize)>>,
+            n: usize,
+        }
+        macro_rules! sink_arm {
+            ($name:ident, $idx:expr, $sh:ty, $ko:ty, $app:path) => {
+                fn $name(&mut self, mask: u8, take: u16, sh: &$sh, v: &$ko) {
+                    // `append` REPORTS the lanes it wrote. It skips some
+                    // of `take` as duplicates, and which ones cannot be
+                    // inferred - assuming the first N bits of `take`
+                    // were written is wrong and produced a spurious
+                    // mismatch.
+                    let wrote =
+                        $app(&mut self.accs[$idx], sh, v, take, self.n, &mut self.seen[$idx]);
+                    for lane in 0..16 {
+                        if wrote & (1 << lane) != 0 {
+                            self.from[$idx].push((mask, lane));
+                        }
                     }
                 }
-                kernel::append(i, &mut accs[i], outs, n, &mut seen[i]);
-            }
-            for lane in 0..n {
-                let claims = (0..kernel::OUTCOMES)
-                    .filter(|i| kernel::live(*i, outs) & (1 << lane) != 0)
-                    .count();
-                assert_eq!(
-                    claims, 1,
-                    "assignment {:#08b} lane {}: {} outcomes claim it",
-                    mask, lane, claims
-                );
-            }
-        });
+            };
+        }
+        impl<'a> kernel::Sink for H<'a> {
+            sink_arm!(o0, 0, kernel::KShared0, kernel::KOut0, kernel::append0);
+            sink_arm!(o1, 1, kernel::KShared1, kernel::KOut1, kernel::append1);
+            sink_arm!(o2, 2, kernel::KShared2, kernel::KOut2, kernel::append2);
+            sink_arm!(o3, 3, kernel::KShared3, kernel::KOut3, kernel::append3);
+        }
+        let mut h = H { accs: &mut accs, seen: &mut seen, from: &mut from, n };
+        kernel::frame(&u, &rin, &g, &mut h);
+
         (accs, from)
     }
 
