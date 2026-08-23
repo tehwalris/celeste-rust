@@ -43,6 +43,12 @@ Rust equivalents.
   field census 2026-08-16), so: the cost of a new abstraction is the
   abstraction PLUS its refinement ladder, and anything advertised as a free
   merge is mispriced.
+- **Never deopt to the interpreter.** A deopt is a coverage gap, not a
+  degraded mode. The search checkpoints every frame; a deopt confirms the
+  checkpoint, reports every distinct reason with lane counts, and exits
+  with a distinct status. Fix the gap and resume. Once Stage 4 removes
+  the interpreter's vectorization, absorbing a deopt costs orders of
+  magnitude more than fixing it. See `plans/tracing.md` "Doctrine".
 - **Measure before and after.** Any change that claims a performance effect
   needs numbers from an actual run, not reasoning.
 - Do not leave dead code behind. The build is warning-free; keep it that way.

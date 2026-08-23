@@ -1838,6 +1838,78 @@ agreement with the interpreter is already covered by the oracle test, so
 these two together cover the chain - but not yet in one run, on a block
 the search actually produced.
 
+## Doctrine: never deopt to the interpreter (Philippe, 2026-08-23)
+
+**A deopt stops the run. It does not fall back.**
+
+The reasoning is a cost argument, not a purity one. The interpreter is
+the oracle and it is about to get slower on purpose - Stage 4 removes
+its vectorization, virtual merge and lane machinery, leaving a plain
+scalar interpreter. Running deopted lanes through that is not a
+degraded mode, it is a different order of magnitude. Fixing the gap and
+resuming is faster than absorbing it, and it is faster the FIRST time,
+because a deopt is one lane costing thousands of lanes' worth of time.
+
+So the shape of it is:
+
+1. checkpoint every frame;
+2. on any deopt, confirm the checkpoint is on disk, say exactly why, and
+   exit with a distinct status;
+3. someone reads the reason, adds the kernel or raises the bound;
+4. resume from the checkpoint.
+
+A deopt becomes a BUILD-TIME task instead of a runtime cost. That is the
+whole idea.
+
+### What does not change
+
+`ok` stays, and it stays sound. It is still the lane-level obligation
+the kernel cannot discharge; the only difference is what happens next.
+Exiting is strictly safer than the alternative - nothing silently
+continues on a lane the kernel could not compute.
+
+The interpreter stays too. It is the differential oracle. It is just not
+on the search path any more.
+
+### Two refinements this needs
+
+**Aggregate before exiting, do not stop at the first.** One exit should
+yield every fix available, not one. The frame should finish classifying:
+each distinct deopt reason, how many lanes hit it, and one example lane
+per reason. Otherwise the loop is exit-fix-resume once per reason, which
+is the same grind with extra steps.
+
+**Checkpoint-before-exit is an invariant, not a hope.** The exit path
+verifies the checkpoint is written and readable before it exits, and
+uses a status code distinct from a crash, so tooling can tell "coverage
+gap, resumable" from "something broke".
+
+### Why this looks tractable, measured
+
+The traced kernel's whole deopt surface is two things, and the generated
+code says so:
+
+* the pm1 pin guard - six `ok` conjuncts (`!has_dashed`, `freeze == 0`,
+  `dash_time == 0`, `djump == 1`, `!p_dash`, `!p_jump`). Gone entirely
+  if a kernel is specialized per shape and not per key.
+* loop-bound exhaustion - `Interp::exec_for` unrolls a numeric `for`
+  `bound` times and narrows `ok` on the lanes whose loop was not over.
+  A knob: raise the bound, pay in body size.
+
+There are ZERO interval-split deopts. `zi_flr_ok`, `zi_span_ok` and
+`zi_fork_flr` do not appear in a traced kernel at all, because the
+tracer never forks an interval - the walk's `Op::Split` machinery has no
+tracer counterpart. That is a large part of the old path's deopt surface
+that simply does not exist here.
+
+### The one thing that would break it
+
+A deopt reason that is genuinely irreducible - a lane that really needs
+unbounded iteration, say - would turn "fix and resume" into an infinite
+loop. Nothing observed so far looks like that, and the loop bound is the
+only candidate. If one appears, the doctrine needs an escape hatch and
+this section needs revisiting rather than working around.
+
 ## Stage 4 - delete
 
 - `celeste-rewrite` (38k lines) - the crate nothing depends on any more.
