@@ -586,6 +586,8 @@ mod tests {
         queue.push(k0);
 
         let (mut frames, mut refused, mut dropped) = (0usize, 0usize, 0usize);
+        let mut poisoned_outcomes = 0usize;
+        let mut kept_arena = 0usize;
         let mut reasons: std::collections::BTreeMap<String, usize> = Default::default();
         while let Some(k) = queue.pop() {
             let st = seen[&k].clone();
@@ -605,6 +607,13 @@ mod tests {
                 }
             };
             for o in f.outs {
+                // An outcome whose `ok` is statically false is reached
+                // only along poisoned paths - no legal run gets there,
+                // so its shape is not one any kernel needs.
+                if it.d.decide(&o.ok) == Some(false) {
+                    poisoned_outcomes += 1;
+                    continue;
+                }
                 let k = key(&o.st);
                 if seen.contains_key(&k) {
                     continue;
@@ -618,26 +627,129 @@ mod tests {
                 seen.insert(k.clone(), next);
                 queue.push(k);
             }
+            // Release this frame's arena, IF every state is concrete.
+            //
+            // Blanking makes the globals-reachable scalars constants,
+            // but the heap can hold a symbolic value it does not reach -
+            // a scope variable, or a table the walk does not name. One
+            // stale id is an out-of-bounds index into the new arena, so
+            // this is all-or-nothing and the skips are counted.
+            if !rebase(seen.values_mut().collect(), &mut it.d) {
+                kept_arena += 1;
+            }
         }
 
         eprintln!(
             "[fix] {} shapes from {} traced frames in {:.1}s ({} refused, {} dropped at the cap of {}), \
-             {} graph nodes",
+             {} graph nodes, {} outcomes dropped as unreachable, {} frames could not release the arena",
             seen.len(),
             frames,
             started.elapsed().as_secs_f64(),
             refused,
             dropped,
             CAP,
-            it.d.graph.len()
+            it.d.graph.len(),
+            poisoned_outcomes,
+            kept_arena
         );
         for (why, n) in &reasons {
             eprintln!("[fix]   {} x REFUSED: {}", n, why);
+        }
+        // Paths no legal run takes. Reported, not swallowed: these are
+        // over-approximation, and a growing list is the tracer losing an
+        // invariant the game holds rather than the game getting harder.
+        for (why, n) in &it.illegal {
+            eprintln!("[fix]   {} x path poisoned: {}", n, why);
         }
         let mut sizes: Vec<usize> = seen.values().map(|s| s.heap.tables.len()).collect();
         sizes.sort_unstable();
         eprintln!("[fix] tables per shape: min {:?} max {:?}", sizes.first(), sizes.last());
         assert_eq!(dropped, 0, "the shape walk hit its cap - raise CAP or it is not closed");
+    }
+
+    /// Snapshot every scalar, throw the graph away, and write them back
+    /// as fresh constants.
+    ///
+    /// The walk traces one frame per shape into a shared arena, and each
+    /// trace is tens of thousands of nodes. Sixteen of them reached two
+    /// million and the walk stopped - not because the shape set is that
+    /// big, but because nothing was releasing the previous frame's work.
+    ///
+    /// Releasing it is safe here precisely because the values do not
+    /// matter: a blanked state holds constants, and a constant is the
+    /// same constant in any arena. Only the SHAPE has to survive, and
+    /// that is the heap's topology, which this does not touch.
+    fn rebase(states: Vec<&mut State<Symbolic>>, d: &mut Symbolic) -> bool {
+        // Every scalar in the WHOLE heap, not the ones a path reaches.
+        // Walking from the globals misses the state's own `guard` and
+        // `ok`, and it misses scope variables - and one stale id
+        // anywhere is an out-of-bounds index into the new arena, which
+        // is how the first two attempts at this failed.
+        let read = |d: &Symbolic, v: &Value<Symbolic>| -> Option<Conc> {
+            match v {
+                Value::Num(n) => d.as_const(n).map(Conc::Num),
+                Value::Bool(b) => d.decide(b).map(Conc::Bool),
+                _ => None,
+            }
+        };
+        let scalar = |v: &Value<Symbolic>| matches!(v, Value::Num(_) | Value::Bool(_));
+        let mut snaps: Vec<Vec<Option<Conc>>> = Vec::new();
+        for st in states.iter() {
+            let mut snap = Vec::new();
+            for t in st.heap.tables.values() {
+                for v in t.hash.values().chain(t.arr.iter()).chain(t.ints.values()) {
+                    if scalar(v) && read(d, v).is_none() {
+                        return false;
+                    }
+                    snap.push(read(d, v));
+                }
+            }
+            for sc in st.heap.scopes.values() {
+                for v in sc.vars.values() {
+                    if scalar(v) && read(d, v).is_none() {
+                        return false;
+                    }
+                    snap.push(read(d, v));
+                }
+            }
+            snaps.push(snap);
+        }
+        d.graph = crate::transpile::graph::Graph::new();
+        for (st, snap) in states.into_iter().zip(snaps) {
+            // A state to be traced from is unconditional, so these are
+            // simply true. They live on the state rather than in the
+            // heap, which is what makes them easy to forget.
+            st.guard = d.boolean(true);
+            st.ok = d.boolean(true);
+            let mut it = snap.into_iter();
+            let mut put = |d: &mut Symbolic, v: &mut Value<Symbolic>| {
+                let c = it.next().expect("snapshot and heap disagree about size");
+                match (v, c) {
+                    (Value::Num(n), Some(Conc::Num(x))) => *n = d.num(x),
+                    (Value::Bool(b), Some(Conc::Bool(x))) => *b = d.boolean(x),
+                    // A value that was not a constant cannot be carried
+                    // across arenas. Nothing should be symbolic in a
+                    // blanked state, so this says so rather than
+                    // silently substituting something.
+                    (_, _) => {}
+                }
+            };
+            let mut tables = std::mem::take(&mut st.heap.tables);
+            for t in tables.values_mut() {
+                for v in t.hash.values_mut().chain(t.arr.iter_mut()).chain(t.ints.values_mut()) {
+                    put(d, v);
+                }
+            }
+            st.heap.tables = tables;
+            let mut scopes = std::mem::take(&mut st.heap.scopes);
+            for sc in scopes.values_mut() {
+                for v in sc.vars.values_mut() {
+                    put(d, v);
+                }
+            }
+            st.heap.scopes = scopes;
+        }
+        true
     }
 
     /// Erase every non-frozen scalar. See the fixpoint above: the values

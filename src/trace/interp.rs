@@ -84,6 +84,11 @@ pub struct Interp<'a, D: Domain> {
     /// was traced as a kernel, all of them the same 110 scalars and
     /// differing only in these numbers.
     body_ids: std::collections::HashMap<*const ast::FunctionBody, BodyId>,
+    /// Paths poisoned by `poison`: a Lua type error means no legal run
+    /// takes that path, so its lanes deopt rather than aborting the
+    /// trace. Counted by reason, because turning an error into a deopt
+    /// would otherwise hide a modelling gap at build time.
+    pub illegal: std::collections::BTreeMap<String, usize>,
     /// The cart and the room's collision cache, for `mget`/`fget` and
     /// `tile_flag_at`. Optional so the unit tests can run programs that
     /// never touch the map.
@@ -111,6 +116,7 @@ impl<'a, D: Domain> Interp<'a, D> {
             d,
             bodies: Vec::new(),
             body_ids: std::collections::HashMap::new(),
+            illegal: Default::default(),
             cart: None,
             cache: None,
             max_states: 256,
@@ -175,6 +181,17 @@ impl<'a, D: Domain> Interp<'a, D> {
             let mut next: Outcome<D> = Vec::new();
             for (s, f) in live {
                 if !f.is_normal() {
+                    next.push((s, f));
+                    continue;
+                }
+                // A POISONED path executes no further. `ok` is already
+                // false, so every lane on it deopts and nothing it goes
+                // on to compute can be read - but it would still intern
+                // nodes, and on the shape walk that was most of a
+                // two-million-node graph. Carried rather than dropped:
+                // dropping is `guard`'s direction, and a successor that
+                // vanishes is the one failure nothing downstream sees.
+                if self.d.decide(&s.ok) == Some(false) {
                     next.push((s, f));
                     continue;
                 }
@@ -922,19 +939,58 @@ impl<'a, D: Domain> Interp<'a, D> {
         }
         let mut out = Vec::new();
         for (st, a) in self.eval(lhs, st)? {
-            for (st, b) in self.eval(rhs, st)? {
-                out.push((st, self.binop_values(binop, &a, &b)?));
+            for (mut st, b) in self.eval(rhs, st)? {
+                let (v, illegal) = self.binop_values(binop, &a, &b)?;
+                if let Some(why) = illegal {
+                    // The source text, built only when it is needed: a
+                    // type error is useless without knowing which
+                    // expression, and `to_string` on every binop is not.
+                    let t = format!("{}{}{}", lhs, binop, rhs);
+                    let t = t.trim();
+                    self.poison(&mut st, format!("`{}`: {}", &t[..t.len().min(48)], why));
+                }
+                out.push((st, v));
             }
         }
         Ok(out)
     }
 
+    /// Mark this path as one no legal run takes, and keep going.
+    ///
+    /// PICO-8 raises on `nil > 0`, so a path that does it is not a game
+    /// execution at all - it is a path the tracer reached only because
+    /// it over-approximated a branch. The real game holds an invariant
+    /// the tracer cannot see; `spring.init` never sets `delay`, and
+    /// `spring.update` reads it only in a branch that a prior branch
+    /// assigns it in first.
+    ///
+    /// `ok`, NOT `guard`. Those mean different things and only one is
+    /// safe here. Clearing `guard` would say "no lane takes this
+    /// path", and if that were ever wrong the successor would silently
+    /// vanish. Clearing `ok` says "the kernel declines these lanes",
+    /// which is the direction that fails loudly - and under the
+    /// never-deopt doctrine a lane that really got here stops the run
+    /// and names itself, so a wrong invariant is reported rather than
+    /// assumed.
+    ///
+    /// Counted in `illegal` rather than swallowed. Turning an error into
+    /// a deopt hides modelling gaps at BUILD time - the shape walk would
+    /// happily include shapes only reachable through impossible paths -
+    /// so the count is what keeps that visible.
+    fn poison(&mut self, st: &mut State<D>, why: String) {
+        st.ok = self.d.boolean(false);
+        *self.illegal.entry(why).or_default() += 1;
+    }
+
+    /// The value, and - if Lua itself would have raised - why this path
+    /// is not a legal run. The caller poisons, because it is the caller
+    /// that knows which expression this was.
     fn binop_values(
         &mut self,
         binop: &ast::BinOp,
         a: &Value<D>,
         b: &Value<D>,
-    ) -> Result<Value<D>> {
+    ) -> Result<(Value<D>, Option<String>)> {
         let (num_op, cmp_op) = match binop {
             ast::BinOp::Plus(_) => (Some(Arith::Add), None),
             ast::BinOp::Minus(_) => (Some(Arith::Sub), None),
@@ -951,9 +1007,12 @@ impl<'a, D: Domain> Interp<'a, D> {
         };
         if let Some(op) = num_op {
             let (Value::Num(x), Value::Num(y)) = (a, b) else {
-                bail!("arithmetic on non-numbers: {:?} and {:?}", a, b)
+                // Lua raises here, so this path is not a legal run.
+                let zero = Value::Num(self.d.num(P8::from_i16(0)));
+                let why = format!("arithmetic on {} and {}", kind_of(a), kind_of(b));
+                return Ok((zero, Some(why)));
             };
-            return Ok(Value::Num(self.d.arith(op, x, y)?));
+            return Ok((Value::Num(self.d.arith(op, x, y)?), None));
         }
         let op = cmp_op.unwrap();
         let r = match (a, b) {
@@ -995,13 +1054,19 @@ impl<'a, D: Domain> Interp<'a, D> {
                 let same = a == b;
                 self.d.boolean(same)
             }
-            _ => bail!("comparison of {:?} and {:?}", a, b),
+            // Lua raises when an ordered comparison gets a non-number,
+            // so this path is not a legal run either.
+            _ => {
+                let why = format!("comparison of {} and {}", kind_of(a), kind_of(b));
+                return Ok((Value::Bool(self.d.boolean(false)), Some(why)));
+            }
         };
-        Ok(Value::Bool(if matches!(binop, ast::BinOp::TildeEqual(_)) {
+        let v = Value::Bool(if matches!(binop, ast::BinOp::TildeEqual(_)) {
             self.d.not(&r)
         } else {
             r
-        }))
+        });
+        Ok((v, None))
     }
 
 
@@ -1668,4 +1733,19 @@ fn fmt_p8(v: P8) -> String {
     let s = format!("{:.4}", raw);
     let s = s.trim_end_matches('0').trim_end_matches('.').to_string();
     s
+}
+
+/// A value's Lua type name, for the messages `poison` records. The
+/// VALUE is deliberately not included: two paths that fail the same way
+/// on different symbolic operands are one modelling gap, not two.
+fn kind_of<D: Domain>(v: &Value<D>) -> &'static str {
+    match v {
+        Value::Nil => "nil",
+        Value::Num(_) => "number",
+        Value::Bool(_) => "boolean",
+        Value::Str(_) => "string",
+        Value::Table(_) => "table",
+        Value::Func(_) => "function",
+        Value::Builtin(_) => "builtin",
+    }
 }

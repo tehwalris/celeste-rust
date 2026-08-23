@@ -1838,17 +1838,16 @@ agreement with the interpreter is already covered by the oracle test, so
 these two together cover the chain - but not yet in one run, on a block
 the search actually produced.
 
-## T21 - the shape set is a fixpoint, and it is FOUR
+## T21 - the shape fixpoint, and why it is the wrong question
 
 Covering a room without ever deopting means a kernel per input shape,
 which means knowing every shape the room reaches. Philippe: is that not
 just a fixpoint from the spawn shape? It is.
 
-**Room (0,0): 4 shapes, from 4 traced frames, in 0.3 seconds.**
-
-The same four the emit probe sees at f40 - 274 / 229 / 400 / 282 cells -
-reached from `_init` instead of from a warm-up. Between 19 and 40 tables
-each.
+**It is a fixpoint. It just does not converge to anything useful.**
+The first run said four shapes, matching the emit probe's 274 / 229 /
+400 / 282 at f40. That number was an artifact of traces aborting early;
+see the end of this section.
 
 **The concrete values do not matter, and that is what makes it a
 fixpoint over SHAPES rather than over states.** Every non-frozen scalar
@@ -1902,19 +1901,75 @@ answer T13 gave from the other direction (-6.3%).
 So: one kernel per shape, covering every pm1 key. Four kernels for room
 (0,0), not four times twenty-four.
 
-### Not closed yet: one refusal
+### The refusal, chased - and "four" was wrong
 
-One of the four shapes cannot be stepped from:
+One of the four shapes could not be stepped from:
 
-    calling _update: calling foreach: calling func: calling
-    obj.type.update: in `this.delay>0`: comparison of nil and num(8)
+    obj.type.update: in `this.delay>0`: comparison of nil and number
 
-A field that is nil rather than a number. `iface::scalars` yields only
-Num and Bool, so a nil slot is never symbolized and stays nil - the same
-residue as the 16-17 "value cells with no source" in T20. So **4 is a
-lower bound, not the answer**: that shape's successors are unexplored.
-Chasing it is the next step, and under the doctrine it has to be chased
-rather than absorbed.
+**The cause is an invariant the tracer cannot see.** `spring.init` sets
+`hide_in` and `hide_for` and NOT `delay`, so a fresh spring's `delay` is
+nil. `spring.update` then reads it only in a third branch, and the two
+branches before it assign it first - `spr` starts at the tile value 18,
+so the `spr==18` branch runs and sets `delay=10` before `spr` can ever
+differ. In a real run `delay` is always a number by the time it is read.
+Symbolize `spr` and that ordering is invisible, so the tracer walks into
+the branch while `delay` is still nil.
+
+PICO-8 raises on `nil > 0`. So this is not a modelling gap: it is a path
+that IS NOT A LEGAL RUN.
+
+**The fix is to poison the path, not to abort the trace.**
+`Interp::poison` sets `ok` to false for that state and records why.
+
+`ok`, not `guard`, and the choice is the whole point. Clearing `guard`
+would say "no lane takes this path" - and if that were ever wrong the
+successor would silently vanish, which is the one failure nothing
+downstream sees. Clearing `ok` says "the kernel declines these lanes",
+and under the never-deopt doctrine a lane that really got there stops
+the run and names itself. The unsafe reading of the invariant is
+reported rather than assumed.
+
+Counted by reason, with the source expression, because turning an error
+into a deopt hides modelling gaps at BUILD time. On the walk it is one
+cause, exactly:
+
+    768 x `this.delay - (1)`: arithmetic on nil and number
+      6 x `this.delay>0`:     comparison of nil and number
+
+`compiled_forward_reproduces_the_interpreter` and the oracle test still
+pass, so no legal path the oracle takes is poisoned.
+
+### "Four shapes" was an undercount, and the fixpoint does not converge
+
+Fixing the abort changed the answer. The traces that used to die now
+finish, and the walk finds **16 shapes and keeps going** - it stops on a
+node limit, not on closure. Shapes reach 90 tables, against 19-40 for
+the ones the search really produces.
+
+That is over-approximation compounding. With every scalar symbolic, both
+sides of every branch are explored, including the ones that SPAWN
+objects; the outcomes feed back in, and the object count grows. One
+frame on a 90-table state is over two million graph nodes - against
+2,341 for the 41-slot spawn state. A kernel for such a shape would be
+about a million lines.
+
+Releasing the arena between frames (`rebase`: snapshot the heap's
+constants, throw the graph away, re-intern) was worth doing and is not
+the fix. Only 2 frames of 16 could not release, and the graph still hit
+the limit inside a SINGLE trace.
+
+**So full symbolization is the wrong source for the shape set.** It
+answers "what shapes are reachable if every branch is taken", and the
+question is "what shapes does the search actually produce" - which
+BENCHMARK_DATA answers with two per room for (2,0). The shapes should
+come from a real run. Philippe suggested that first; I talked us out of
+it on the grounds that the fixpoint was cheap and exact, and it is
+neither.
+
+What full symbolization IS good for is the thing it just did: finding
+the places where the tracer loses an invariant the game holds. Three
+frozen-constant classes and one poisoned field, all in one afternoon.
 
 ## Doctrine: never deopt to the interpreter (Philippe, 2026-08-23)
 
