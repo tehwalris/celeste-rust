@@ -2185,7 +2185,9 @@ against.
 
 ## T24 - the widened `rem`, and why the tracer stops at frame 25
 
-The frame loop runs 24 frames on kernels alone and stops here:
+The frame loop runs 24 frames on kernels alone - all 24 ROW-KEY
+IDENTICAL to the interpreter, including frame 24, where the player
+appears and one row becomes 24 - and stops here:
 
     frame 25: shape 1 did not bind a block of its own shape:
     objects[0].rem.x: per-lane num slot holds Ival(-0.5, 0.5-) at lane 0
