@@ -71,6 +71,17 @@ impl Dispatch {
 
     /// The kernel for this block, by its canonical shape.
     pub fn find(&self, b: &Rt2) -> Option<&'static Kernel> {
-        self.by_shape.get(&b.shape_hash_of()).map(|i| &self.kernels[*i])
+        self.find_by_shape(b.shape_hash_of())
+    }
+
+    /// The kernel for a shape hash that has ALREADY been computed.
+    ///
+    /// `Rt2::shape_hash` is the cached copy `boundary_canonicalize`
+    /// wrote, so a block that came off the frontier has it and need not
+    /// walk its structure again. `find` above is for a block that has
+    /// not been through a boundary - the traced runner's own loop
+    /// builds blocks straight out of a kernel accumulator.
+    pub fn find_by_shape(&self, shape: u64) -> Option<&'static Kernel> {
+        self.by_shape.get(&shape).map(|i| &self.kernels[*i])
     }
 }

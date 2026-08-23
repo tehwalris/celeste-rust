@@ -3,6 +3,7 @@
 //!   transpile [--recipe R] [OUT]              name tables -> OUT
 //!   transpile [--recipe R] --kernel W OUT     class kernel from witness W
 //!   transpile [--recipe R] --kernel-recon     the emitter's own recon dump
+//!   transpile --room-kernels DIR              the TRACED per-shape set
 //!
 //! Defaults land in the checked-in generated crates. The canonical regen of
 //! everything is `./regen-generated.sh`.
@@ -18,6 +19,7 @@ fn main() -> Result<()> {
     let mut kernel_out: Option<(String, String)> = None;
     let mut fuse_census: Option<(Vec<String>, String)> = None;
     let mut fuse_out: Option<(Vec<String>, String, String)> = None;
+    let mut room_kernels: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -51,6 +53,14 @@ fn main() -> Result<()> {
                     witness,
                     out,
                 ));
+            }
+            // --room-kernels DIR: the TRACED kernel set - one module per
+            // heap shape the start room reaches, plus the `KERNELS`
+            // table a dispatcher indexes. Nothing to do with `--recipe`
+            // or a witness: the tracer walks the room itself.
+            "--room-kernels" => {
+                room_kernels =
+                    Some(args.next().ok_or_else(|| anyhow!("--room-kernels DIR"))?);
             }
             "--kernel" => {
                 let witness = args.next().ok_or_else(|| anyhow!("--kernel WITNESS OUT"))?;
@@ -86,6 +96,23 @@ fn main() -> Result<()> {
         let text = celeste_rust::transpile::fuse::emit_fused(&members, &witness)?;
         std::fs::write(&out, &text).with_context(|| format!("write {}", out))?;
         eprintln!("wrote {} ({} bytes)", out, text.len());
+        return Ok(());
+    }
+
+    if let Some(dir) = room_kernels {
+        let dir = std::path::Path::new(&dir);
+        let sizes = celeste_rust::trace::kernel::write_room_kernels(
+            std::path::Path::new("."),
+            dir,
+        )
+        .with_context(|| format!("write the room kernel set to {}", dir.display()))?;
+        eprintln!(
+            "wrote {} shapes -> {:?} lines, {} total, in {}",
+            sizes.len(),
+            sizes,
+            sizes.iter().sum::<usize>(),
+            dir.display()
+        );
         return Ok(());
     }
 

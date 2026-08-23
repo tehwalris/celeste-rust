@@ -10,10 +10,13 @@
 # the graph means.
 #
 # `traced-kernel-check/` is deliberately outside the workspace. The
-# kernel is generated, ~400 KB, and changes on every emitter tweak;
-# putting it under `crates/celeste-kernels` would put it inside the
-# bootstrap the checked-in kernels already have, where a kernel that
-# fails to compile also stops you rebuilding the tool that would fix it.
+# SINGLE-FRAME kernel below is generated, ~400 KB, and changes on every
+# emitter tweak; putting it under `crates/celeste-kernels` would put it
+# inside the bootstrap the checked-in kernels already have, where a
+# kernel that fails to compile also stops you rebuilding the tool that
+# would fix it. (The ROOM set is checked in - `regen-generated.sh`
+# installs it only if the workspace still builds, which is the same
+# escape by a different route.)
 #
 #   ./check-traced-kernel.sh
 #
@@ -29,28 +32,16 @@ if [ -z "${SKIP_RENDER:-}" ]; then
         the_kernel_emitter_lowers_a_traced_graph --no-capture 2>&1 |
         grep -E '^\[emit\] (FUSED|rendered|RENDER)' || true
 
-    # And the ROOM's set - one kernel per shape the room reaches, plus
-    # the table the dispatcher indexes. Same reason as above: rendering
-    # them says nothing about whether they are Rust, and the end-to-end
-    # room test cannot run until they are.
-    echo "== rendering the room's kernel set"
-    cargo nextest run --cargo-profile quick --run-ignored all \
-        renders_a_kernel_for_every_shape --no-capture 2>&1 |
-        grep -E '^\[kernels\]' || true
+    # The ROOM's set is no longer rendered here. It is CHECKED IN, in
+    # `crates/celeste-kernels/src/traced`, so the workspace build
+    # compiles it and `traced_kernels_are_current` catches it going
+    # stale. Regenerate it with ./regen-generated.sh.
 fi
 
 [ -f "$out" ] || { echo "no $out - did the probe run?" >&2; exit 1; }
 
 check="$repo/traced-kernel-check"
 cp "$out" "$check/src/kernel.rs"
-
-rooms="$repo/target/traced-kernels"
-if [ -d "$rooms" ]; then
-    rm -rf "$check/src/kernels"
-    cp -r "$rooms" "$check/src/kernels"
-    echo "== room kernels: $(ls "$check/src/kernels" | grep -c '^kernel') shapes, \
-$(cat "$check/src/kernels"/kernel*.rs | wc -l) lines"
-fi
 
 echo "== compiling and RUNNING $(wc -l < "$out") lines in $check"
 cd "$check" && cargo test --release -- --nocapture

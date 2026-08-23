@@ -27,8 +27,10 @@ native-probe/target/
 /native-probe/*-shape.json
 crates/celeste-kernels/src/fused_gen_player.rs
 
-# The traced kernel run check generates its kernel; see its Cargo.toml.
+# The traced kernel run check generates its SINGLE-FRAME kernel; see its
+# Cargo.toml. (The room's per-shape set is checked in, in
+# crates/celeste-kernels/src/traced - it has to be, for FrameEngine to
+# call it.)
 traced-kernel-check/src/kernel.rs
 traced-kernel-check/target/
 target/traced-kernel.rs
-traced-kernel-check/src/kernels/

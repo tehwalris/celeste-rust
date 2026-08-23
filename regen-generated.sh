@@ -3,6 +3,7 @@
 #
 #   crates/celeste-names/src/gen.rs          the interned name tables
 #   crates/celeste-kernels/src/kernel_gen_*  the per-class lane kernels
+#   crates/celeste-kernels/src/traced/       the per-SHAPE traced kernels
 #
 # Run this after any change to src/transpile/, then read the diff and commit
 # it. `transpile::names::tests::generated_is_current` fails until you do.
@@ -49,7 +50,11 @@ start() {  # start NAME CMD...
     JOBS="$JOBS $!:$name"
 }
 
-echo "==> generating name tables + 8 kernels (parallel)"
+echo "==> generating name tables + 8 class kernels + the traced set (parallel)"
+# The TRACED set: one kernel per heap shape room (1,0) reaches. No recipe
+# and no witness - the tracer walks the room itself - so it is its own
+# kind of job. ~6 s, which is the longest of the nine, so it starts first.
+start traced ./target/quick/transpile --room-kernels "$SCRATCH/traced"
 start names ./target/quick/transpile --recipe rewrites-compile.jsonl "$SCRATCH/gen.rs"
 for class in steady dash frozen; do
     start "$class" ./target/quick/transpile \
@@ -88,8 +93,11 @@ echo "==> installing into a scratch checkout of the generated crates"
 BACKUP=$(mktemp -d)
 cp crates/celeste-names/src/gen.rs "$BACKUP/"
 cp crates/celeste-kernels/src/kernel_gen_*.rs "$BACKUP/"
+cp -r crates/celeste-kernels/src/traced "$BACKUP/traced"
 restore() { cp "$BACKUP"/gen.rs crates/celeste-names/src/;
             cp "$BACKUP"/kernel_gen_*.rs crates/celeste-kernels/src/;
+            rm -rf crates/celeste-kernels/src/traced;
+            cp -r "$BACKUP/traced" crates/celeste-kernels/src/traced;
             rm -rf "$BACKUP"; }
 
 cp "$SCRATCH/gen.rs" crates/celeste-names/src/gen.rs
@@ -99,6 +107,10 @@ done
 for class in $R20_CLASSES; do
     cp "$SCRATCH/kernel_gen_r20_$class.rs" "crates/celeste-kernels/src/kernel_gen_r20_$class.rs"
 done
+# rm before cp, not cp over: one shape FEWER than last time would
+# otherwise leave a stale kernelN.rs that still compiles.
+rm -rf crates/celeste-kernels/src/traced
+cp -r "$SCRATCH/traced" crates/celeste-kernels/src/traced
 
 # Also quick: this step answers "does the generated code COMPILE", and
 # release answers it no better for ~4x the wall time. It no longer leaves
@@ -114,6 +126,7 @@ rm -rf "$BACKUP"
 echo
 echo "regenerated. Now read the diff:"
 git --no-pager diff --stat crates/celeste-names/src/gen.rs crates/celeste-kernels/src/
+git --no-pager status --short crates/celeste-kernels/src/traced
 echo
 echo "NOTE: this script builds under [profile.quick] and does NOT refresh"
 echo "target/release. Before benchmarking or running the gate, build release"

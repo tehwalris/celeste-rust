@@ -1174,12 +1174,17 @@ pub fn write_room_kernels(root: &std::path::Path, dir: &std::path::Path) -> Resu
          // dispatcher can hold as function pointers.\n\
          //\n\
          // `Kernel` is NOT declared here. It lives in\n\
-         // `celeste_rust::trace::dispatch`, with the frame loop that\n\
-         // consumes it - a generated copy would have to be kept in step\n\
-         // with that loop by hand, and regenerating is not a good moment\n\
-         // to discover a signature changed.\n\
+         // `celeste_engine::traced` - a generated copy would have to be\n\
+         // kept in step with the frame loops that consume it by hand,\n\
+         // and regenerating is not a good moment to discover a\n\
+         // signature changed.\n\
+         //\n\
+         // Naming the ENGINE\'s copy and not `celeste_rust`\'s re-export\n\
+         // is what lets this set be checked in below `celeste-rust`: a\n\
+         // kernel set that mentions the crate holding the emitters can\n\
+         // only live above them.\n\
          #![allow(clippy::all)]\n\
-         pub use celeste_rust::trace::dispatch::Kernel;\n\
+         pub use celeste_engine::traced::Kernel;\n\
          \n\
          {decl}\n\
          pub const KERNELS: &[Kernel] = &[\n\
@@ -1193,22 +1198,63 @@ pub fn write_room_kernels(root: &std::path::Path, dir: &std::path::Path) -> Resu
 
 #[cfg(test)]
 mod tests {
-    /// Generate the room's whole kernel set. A PROBE and a generator:
-    /// it writes what `check-traced-kernel.sh` compiles and runs.
+    /// The gate that makes the CHECKED-IN traced set safe.
+    ///
+    /// `crates/celeste-kernels/src/traced/` is committed, so nothing in
+    /// the build forces it to match the tracer that claims to produce
+    /// it - and a stale kernel there does not fail to compile, it
+    /// computes a frame the tracer no longer agrees with. This
+    /// regenerates the whole set from the cart, the same way
+    /// `regen-generated.sh` does, and compares byte for byte.
+    ///
+    /// Not `#[ignore]`d. It costs ~6 s, against the ~200 s and ~44 s
+    /// that put the other regeneration tests behind `--ignored`, and it
+    /// guards exactly what `generated_is_current` guards for the class
+    /// kernels - which runs on every commit.
     #[test]
-    #[ignore]
-    fn renders_a_kernel_for_every_shape() {
-        let dir = std::path::Path::new("target").join("traced-kernels");
-        match super::write_room_kernels(std::path::Path::new("."), &dir) {
-            Ok(sizes) => eprintln!(
-                "[kernels] {} shapes -> {:?} lines, {} total, in {}",
-                sizes.len(),
-                sizes,
-                sizes.iter().sum::<usize>(),
-                dir.display()
-            ),
-            Err(e) => panic!("{:#}", e),
+    fn traced_kernels_are_current() {
+        let dir = std::env::temp_dir().join(format!("celeste-traced-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sizes = super::write_room_kernels(std::path::Path::new("."), &dir)
+            .unwrap_or_else(|e| panic!("regenerate the room kernel set (run from the repo root): {:#}", e));
+
+        let committed = std::path::Path::new("crates/celeste-kernels/src/traced");
+        let listing = |d: &std::path::Path| -> std::collections::BTreeSet<String> {
+            std::fs::read_dir(d)
+                .unwrap_or_else(|e| panic!("read {}: {}", d.display(), e))
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect()
+        };
+        // Both directions. One shape FEWER than last time leaves a
+        // stale `kernelN.rs` behind that still compiles and is still
+        // reachable through nothing - comparing only the files the
+        // tracer just wrote would pass over it.
+        let (fresh_files, on_disk_files) = (listing(&dir), listing(committed));
+        assert_eq!(
+            fresh_files,
+            on_disk_files,
+            "the traced kernel set has a different FILE LIST than what is committed \
+             ({} shapes now). Run ./regen-generated.sh.",
+            sizes.len()
+        );
+
+        for name in &fresh_files {
+            let a = std::fs::read_to_string(committed.join(name)).unwrap();
+            let b = std::fs::read_to_string(dir.join(name)).unwrap();
+            if a != b {
+                let first = a.lines().zip(b.lines()).position(|(x, y)| x != y).map(|i| i + 1);
+                panic!(
+                    "crates/celeste-kernels/src/traced/{} is STALE: on disk {} lines, \
+                     tracer says {} lines, first differing line {:?}. Run \
+                     ./regen-generated.sh and read the diff.",
+                    name,
+                    a.lines().count(),
+                    b.lines().count(),
+                    first
+                );
+            }
         }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
 
