@@ -163,6 +163,31 @@ pub fn pm1_key(player: &Path, st: &State<Symbolic>, d: &Symbolic) -> Result<Vec<
     Ok(out)
 }
 
+/// Every outcome of a traced frame as emitter outcomes, ready to lower
+/// into ONE body. `base` is where output cell numbering starts (after
+/// the inputs), and the button cells are excluded: they end the frame
+/// holding NEXT frame's free choices, so they are button-dependent by
+/// construction and would distinguish all 64 assignments on their own.
+#[cfg(test)]
+fn frame_outcomes(f: &Frame, base: u32) -> Vec<super::emit::FrameOutcome> {
+    f.outs
+        .iter()
+        .map(|o| super::emit::FrameOutcome {
+            outputs: o
+                .fields
+                .iter()
+                .enumerate()
+                .filter(|(_, (p, _, _))| !iface::show(p).starts_with("__button_states"))
+                .map(|(i, (_, node, is_bool))| {
+                    (base + i as u32, *node, if *is_bool { "ZB" } else { "ZN" })
+                })
+                .collect(),
+            live: o.guard,
+            ok: o.ok,
+        })
+        .collect()
+}
+
 /// Write a concrete button assignment, for the oracle side.
 pub fn set_buttons(d: &mut Symbolic, st: &mut State<Symbolic>, bits: &[bool; 6]) -> Result<()> {
     for (i, b) in bits.iter().enumerate() {
@@ -551,27 +576,19 @@ mod tests {
         let mut total_variants = 0usize;
         let mut refused = 0usize;
         for (key, f) in &bodies {
-            let mut lines = 0usize;
-            let mut variants = 0usize;
-            for o in &f.outs {
-                let outputs: Vec<(u32, crate::transpile::graph::NodeId, &'static str)> = o
-                    .fields
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, (p, _, _))| !iface::show(p).starts_with("__button_states"))
-                    .map(|(i, (_, node, is_bool))| {
-                        (base + i as u32, *node, if *is_bool { "ZB" } else { "ZN" })
-                    })
-                    .collect();
-                match super::super::emit::lower_frame(
-                    &g, &inputs, &uni, &outputs, o.guard, o.ok, room.clone(),
-                ) {
-                    Ok(l) => {
-                        lines += l.body.len();
-                        variants += l.variants;
-                    }
-                    Err(_) => refused += 1,
+            let (mut lines, mut variants) = (0usize, 0usize);
+            match super::super::emit::lower_frame(
+                &g,
+                &inputs,
+                &uni,
+                &frame_outcomes(f, base),
+                room.clone(),
+            ) {
+                Ok(l) => {
+                    lines = l.body.len();
+                    variants = l.variants;
                 }
+                Err(_) => refused += 1,
             }
             eprintln!(
                 "[keys] {:<64} {} outcomes, {} lines, {} variants",
@@ -693,25 +710,18 @@ mod tests {
             }
             let cellbase = inputs.len() as u32;
             let (mut lines, mut variants) = (0usize, 0usize);
-            for o in &f.outs {
-                let outputs: Vec<(u32, crate::transpile::graph::NodeId, &'static str)> = o
-                    .fields
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, (p, _, _))| !iface::show(p).starts_with("__button_states"))
-                    .map(|(i, (_, node, is_bool))| {
-                        (cellbase + i as u32, *node, if *is_bool { "ZB" } else { "ZN" })
-                    })
-                    .collect();
-                match super::super::emit::lower_frame(
-                    &g, &inputs, &uni, &outputs, o.guard, o.ok, room.clone(),
-                ) {
-                    Ok(l) => {
-                        lines += l.body.len();
-                        variants += l.variants;
-                    }
-                    Err(e) => eprintln!("[pos] {} outcome REFUSED: {:#}", label, e),
+            match super::super::emit::lower_frame(
+                &g,
+                &inputs,
+                &uni,
+                &frame_outcomes(&f, cellbase),
+                room.clone(),
+            ) {
+                Ok(l) => {
+                    lines = l.body.len();
+                    variants = l.variants;
                 }
+                Err(e) => eprintln!("[pos] {} REFUSED: {:#}", label, e),
             }
             eprintln!(
                 "[pos] {:<26} {} pins, {} outcomes, {} lines, {} variants",
@@ -858,6 +868,25 @@ mod tests {
                 sum as f64 / union.len() as f64
             );
         }
+        // THE A/B THIS EXISTS FOR: all outcomes lowered into ONE body,
+        // against the same outcomes lowered one at a time. The separate
+        // numbers are printed per outcome below; this is the total they
+        // are compared against.
+        match super::super::emit::lower_frame(
+            &g,
+            &inputs,
+            &uni,
+            &frame_outcomes(&f, base),
+            room.clone(),
+        ) {
+            Ok(l) => eprintln!(
+                "[emit] FUSED: {} outcomes in one body, {} lines, {} variants",
+                f.outs.len(),
+                l.body.len(),
+                l.variants
+            ),
+            Err(e) => eprintln!("[emit] FUSED REFUSED: {:#}", e),
+        }
         for (n, o) in f.outs.iter().enumerate() {
             // The BUTTON cells are not ordinary outputs. They end the
             // frame holding next frame's free choices, so they are
@@ -874,7 +903,15 @@ mod tests {
                 })
                 .collect();
             let lowered = super::super::emit::lower_frame(
-                &g, &inputs, &uni, &outputs, o.guard, o.ok, room.clone(),
+                &g,
+                &inputs,
+                &uni,
+                &[super::super::emit::FrameOutcome {
+                    outputs: outputs.clone(),
+                    live: o.guard,
+                    ok: o.ok,
+                }],
+                room.clone(),
             );
             match &lowered {
                 Ok(ref l) => eprintln!(

@@ -45,19 +45,34 @@ pub fn show_tree(g: &Graph, root: NodeId, depth: usize) -> String {
     format!("{:?}({})", nd.op, kids.join(", "))
 }
 
+/// One output shape of a traced frame: the cells it writes, and the two
+/// booleans that say which lanes reach it and which it may keep.
+pub struct FrameOutcome {
+    pub outputs: Vec<(u32, NodeId, &'static str)>,
+    pub live: NodeId,
+    pub ok: NodeId,
+}
+
+/// Lower a traced frame - ALL of its output shapes into ONE body.
+///
+/// A frame that kills an object ends in a different heap shape than one
+/// that does not, and both are real successors. Lowering them separately
+/// emits the whole frame up to the branch once per outcome. Lowering
+/// them together emits it once, because they are nodes in one graph and
+/// the emitter binds a node once.
 pub fn lower_frame(
     graph: &Graph,
     inputs: &[(u32, &'static str)],
     uni: &[(u32, &'static str)],
-    outputs: &[(u32, NodeId, &'static str)],
-    live: NodeId,
-    ok: NodeId,
+    outcomes: &[FrameOutcome],
     room: Option<crate::transpile::graph::Room>,
 ) -> Result<Lowered> {
     let mut e = Emit::bare(graph.clone());
     e.room = room;
-    e.live = live;
-    e.ok = ok;
+    // `Emit`'s own `ok`/`live` are the walk path's; the outcomes carry
+    // their own, and nothing below reads these two.
+    e.live = outcomes.first().map(|o| o.live).unwrap_or(0);
+    e.ok = outcomes.first().map(|o| o.ok).unwrap_or(0);
     for (cell, kind) in inputs {
         e.vary_in.insert(*cell, *kind);
     }
@@ -67,19 +82,27 @@ pub fn lower_frame(
     for (cell, kind) in uni {
         e.uni.insert(*cell, *kind);
     }
-    let mut of = OutFields {
-        fields: outputs
-            .iter()
-            .map(|(cell, node, ty)| OutField {
-                cell: *cell,
-                ty,
-                expr: String::new(),
-                tainted: false,
-                node: *node,
-            })
-            .collect(),
-        ubool: Vec::new(),
-    };
-    crate::transpile::lower::emit_body(&mut e, &mut of)?;
+    let mut outs: Vec<crate::transpile::lower::Outcome> = outcomes
+        .iter()
+        .map(|o| crate::transpile::lower::Outcome {
+            of: OutFields {
+                fields: o
+                    .outputs
+                    .iter()
+                    .map(|(cell, node, ty)| OutField {
+                        cell: *cell,
+                        ty,
+                        expr: String::new(),
+                        tainted: false,
+                        node: *node,
+                    })
+                    .collect(),
+                ubool: Vec::new(),
+            },
+            ok: o.ok,
+            live: o.live,
+        })
+        .collect();
+    crate::transpile::lower::emit_body(&mut e, &mut outs)?;
     Ok(Lowered { body: e.body, variants: e.variants.len() })
 }

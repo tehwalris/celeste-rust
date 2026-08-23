@@ -1671,12 +1671,16 @@ pub(crate) struct OutFields {
 /// the walk's own `Line` pushes, and the two would have diverged silently
 /// the moment the graph learned anything the text stream did not know.
 pub(crate) fn lower_walk(e: &mut Emit) -> Result<OutFields> {
-    let mut of = compute_out_fields(e)?;
+    let of = compute_out_fields(e)?;
     // Replaces `e.pre`/`e.suf` (and the bookkeeping both consumers read
     // off them) with lines derived from `e.graph`, and rewrites the output
     // fields to read graph nodes.
-    super::lower::emit_body(e, &mut of)?;
-    Ok(of)
+    //
+    // ONE outcome: a walk-driven kernel has a single output shape by
+    // construction. The multi-outcome path is the tracer's.
+    let mut outs = vec![super::lower::Outcome { of, ok: e.ok, live: e.live }];
+    super::lower::emit_body(e, &mut outs)?;
+    Ok(outs.pop().unwrap().of)
 }
 
 fn compute_out_fields(e: &mut Emit) -> Result<OutFields> {
@@ -2273,11 +2277,11 @@ fn render(e: &mut Emit) -> Result<String> {
     for v in &e.variants {
         writeln!(out, "    out({}, &osh, &KOut {{", v.mask)?;
         writeln!(out, "        valid: {},", e.valid_expr)?;
-        writeln!(out, "        deopt: !{},", v.ok)?;
-        writeln!(out, "        bd: {},", v.bd)?;
+        writeln!(out, "        deopt: !{},", v.per[0].ok)?;
+        writeln!(out, "        bd: {},", v.per[0].bd)?;
         for OutField { cell: id, tainted, .. } in out_fields {
             if *tainted {
-                writeln!(out, "        c{}: {},", id, v.outputs[id])?;
+                writeln!(out, "        c{}: {},", id, v.per[0].outputs[id])?;
             }
         }
         writeln!(out, "    }});")?;

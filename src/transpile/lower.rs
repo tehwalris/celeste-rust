@@ -679,10 +679,33 @@ fn conjunct_term(ctx: &Ctx, cond: NodeId) -> Result<Term> {
 /// so `mask` is a REPRESENTATIVE, not an enumeration.
 pub(crate) struct Variant {
     pub(crate) mask: u8,
+    /// One entry per OUTCOME - per output shape the frame can end in.
+    ///
+    /// A frame that kills an object ends in a different heap shape than
+    /// one that does not, and both are real successors. Lowering them
+    /// separately emits the whole frame up to the branch once per
+    /// outcome; lowering them together emits it once, because they are
+    /// nodes in the same graph and the emitter binds a node once.
+    ///
+    /// Length 1 is the checked-in kernels, and that path is unchanged.
+    pub(crate) per: Vec<VarOut>,
+}
+
+/// What one assignment produces FOR ONE OUTCOME.
+pub(crate) struct VarOut {
     /// cell -> the expression holding its value under this assignment.
     pub(crate) outputs: BTreeMap<u32, String>,
     pub(crate) ok: String,
     pub(crate) bd: String,
+}
+
+/// One output shape: the cells it writes, and the two booleans that say
+/// which lanes reach it (`live`) and which of those the kernel may keep
+/// (`ok`).
+pub(crate) struct Outcome {
+    pub(crate) of: OutFields,
+    pub(crate) ok: NodeId,
+    pub(crate) live: NodeId,
 }
 
 /// Emit the body of one member: fills `e.body` and `e.variants` from the
@@ -703,7 +726,7 @@ pub(crate) struct Variant {
 /// assignments whose entire result agrees - outputs, validity and
 /// liveness - collapse to one `Variant`, because they are the same
 /// successor state and dedup would have merged their rows anyway.
-pub(crate) fn emit_body(e: &mut Emit, of: &mut OutFields) -> Result<()> {
+pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
     // --- specialize every free assignment into ONE arena ---
     let mut sp = Graph::new();
     let mut maps: Vec<Vec<NodeId>> =
@@ -722,9 +745,11 @@ pub(crate) fn emit_body(e: &mut Emit, of: &mut OutFields) -> Result<()> {
     if e.decide {
         let mut roots: Vec<NodeId> = Vec::new();
         for m in 0..64usize {
-            roots.extend(of.fields.iter().map(|f| maps[m][f.node as usize]));
-            roots.push(maps[m][e.ok as usize]);
-            roots.push(maps[m][e.live as usize]);
+            for o in outs.iter() {
+                roots.extend(o.of.fields.iter().map(|f| maps[m][f.node as usize]));
+                roots.push(maps[m][o.ok as usize]);
+                roots.push(maps[m][o.live as usize]);
+            }
         }
         // INTERVAL, then BOOLEAN, then INTERVAL. The two decide disjoint
         // things - `ival` knows `abs` is non-negative and the BDD does
@@ -746,11 +771,13 @@ pub(crate) fn emit_body(e: &mut Emit, of: &mut OutFields) -> Result<()> {
         // which is the point of that sentinel.
         for m in 0..64usize {
             let mut fresh = vec![crate::transpile::bdd::UNREACHABLE; e.graph.len()];
-            for f in of.fields.iter() {
-                fresh[f.node as usize] = nodemap(maps[m][f.node as usize]);
+            for o in outs.iter() {
+                for f in o.of.fields.iter() {
+                    fresh[f.node as usize] = nodemap(maps[m][f.node as usize]);
+                }
+                fresh[o.ok as usize] = nodemap(maps[m][o.ok as usize]);
+                fresh[o.live as usize] = nodemap(maps[m][o.live as usize]);
             }
-            fresh[e.ok as usize] = nodemap(maps[m][e.ok as usize]);
-            fresh[e.live as usize] = nodemap(maps[m][e.live as usize]);
             maps[m] = fresh;
         }
         sp = sp2;
@@ -764,12 +791,22 @@ pub(crate) fn emit_body(e: &mut Emit, of: &mut OutFields) -> Result<()> {
     // but accumulates `deopt_rows` from `kout.deopt & kout.valid` and
     // aborts the chunk on `kout.bd`, so two assignments writing the same
     // cells while deopting different lanes are NOT interchangeable.
+    //
+    // With several outcomes the signature spans ALL of them: two
+    // assignments are interchangeable only if they agree about every
+    // successor, not just about one.
+    let signature = |m: u8, maps: &Vec<Vec<NodeId>>, outs: &[Outcome]| -> Vec<NodeId> {
+        let mut sig: Vec<NodeId> = Vec::new();
+        for o in outs {
+            sig.extend(o.of.fields.iter().map(|f| maps[m as usize][f.node as usize]));
+            sig.push(maps[m as usize][o.ok as usize]);
+            sig.push(maps[m as usize][o.live as usize]);
+        }
+        sig
+    };
     let mut sigs: BTreeMap<Vec<NodeId>, u8> = BTreeMap::new();
     for m in 0u8..64 {
-        let mut sig: Vec<NodeId> = of.fields.iter().map(|f| maps[m as usize][f.node as usize]).collect();
-        sig.push(maps[m as usize][e.ok as usize]);
-        sig.push(maps[m as usize][e.live as usize]);
-        sigs.entry(sig).or_insert(m);
+        sigs.entry(signature(m, &maps, outs)).or_insert(m);
     }
     let reps: Vec<u8> = {
         let mut r: Vec<u8> = sigs.values().copied().collect();
@@ -792,17 +829,19 @@ pub(crate) fn emit_body(e: &mut Emit, of: &mut OutFields) -> Result<()> {
 
     // --- what has to exist ---
     // Per representative: its outputs, and every conjunct of its validity.
-    let mut conj_of: BTreeMap<u8, Vec<NodeId>> = BTreeMap::new();
+    let mut conj_of: BTreeMap<(u8, usize), Vec<NodeId>> = BTreeMap::new();
     let mut roots: Vec<NodeId> = Vec::new();
     for r in &reps {
         let map = &maps[*r as usize];
-        roots.extend(of.fields.iter().map(|f| map[f.node as usize]));
-        let cs: Vec<NodeId> = conjuncts(&sp, map[e.ok as usize])
-            .into_iter()
-            .filter(|c| !vacuous(&ctx, *c))
-            .collect();
-        roots.extend(cs.iter().copied());
-        conj_of.insert(*r, cs);
+        for (oi, o) in outs.iter().enumerate() {
+            roots.extend(o.of.fields.iter().map(|f| map[f.node as usize]));
+            let cs: Vec<NodeId> = conjuncts(&sp, map[o.ok as usize])
+                .into_iter()
+                .filter(|c| !vacuous(&ctx, *c))
+                .collect();
+            roots.extend(cs.iter().copied());
+            conj_of.insert((*r, oi), cs);
+        }
     }
     for id in 0..n as NodeId {
         if matches!(sp.get(id).op, Op::Split(_)) {
@@ -898,52 +937,68 @@ pub(crate) fn emit_body(e: &mut Emit, of: &mut OutFields) -> Result<()> {
     // reads it until the end.
     let mut variants: Vec<Variant> = Vec::new();
     for r in &reps {
-        let (mut lanes, mut blocks) = (Vec::new(), Vec::new());
-        for c in &conj_of[r] {
-            match conjunct_term(&ctx, *c)? {
-                Term::Lanes(m) => lanes.push(m),
-                Term::Block(b) => blocks.push(b),
+        let mut per: Vec<VarOut> = Vec::new();
+        for (oi, o) in outs.iter().enumerate() {
+            let (mut lanes, mut blocks) = (Vec::new(), Vec::new());
+            for c in &conj_of[&(*r, oi)] {
+                match conjunct_term(&ctx, *c)? {
+                    Term::Lanes(m) => lanes.push(m),
+                    Term::Block(b) => blocks.push(b),
+                }
             }
-        }
-        let ok = format!("ok_v{}", r);
-        let bd = format!("bd_v{}", r);
-        body.push(Line::Let {
-            name: ok.clone(),
-            ty: "u16",
-            expr: if lanes.is_empty() { "ALL".into() } else { format!("ALL & {}", lanes.join(" & ")) },
-        });
-        body.push(Line::Let {
-            name: bd.clone(),
-            ty: "bool",
-            expr: if blocks.is_empty() { "false".into() } else { blocks.join(" || ") },
-        });
-        var_ty.insert(ok.clone(), "u16");
-        var_ty.insert(bd.clone(), "bool");
-        let map = &maps[*r as usize];
-        let mut outputs = BTreeMap::new();
-        for f in of.fields.iter() {
-            let want = repr_of_ty(f.ty)?;
-            let node = map[f.node as usize];
-            let have = ctx.repr[node as usize];
-            if !want.admits(have) {
-                bail!(
-                    "output cell {} wants a {} but the graph computes a {}",
-                    f.cell, want.ty(), have.ty()
+            // One outcome keeps the original names, so a single-outcome
+            // body is byte-identical to what this emitted before.
+            let sfx = if outs.len() == 1 { String::new() } else { format!("_o{}", oi) };
+            let ok = format!("ok_v{}{}", r, sfx);
+            let bd = format!("bd_v{}{}", r, sfx);
+            body.push(Line::Let {
+                name: ok.clone(),
+                ty: "u16",
+                expr: if lanes.is_empty() {
+                    "ALL".into()
+                } else {
+                    format!("ALL & {}", lanes.join(" & "))
+                },
+            });
+            body.push(Line::Let {
+                name: bd.clone(),
+                ty: "bool",
+                expr: if blocks.is_empty() { "false".into() } else { blocks.join(" || ") },
+            });
+            var_ty.insert(ok.clone(), "u16");
+            var_ty.insert(bd.clone(), "bool");
+            let map = &maps[*r as usize];
+            let mut outputs = BTreeMap::new();
+            for f in o.of.fields.iter() {
+                let want = repr_of_ty(f.ty)?;
+                let node = map[f.node as usize];
+                let have = ctx.repr[node as usize];
+                if !want.admits(have) {
+                    bail!(
+                        "output cell {} wants a {} but the graph computes a {}",
+                        f.cell, want.ty(), have.ty()
+                    );
+                }
+                outputs.insert(
+                    f.cell,
+                    coerce(ctx.expr[node as usize].as_deref().unwrap(), have, want)?,
                 );
             }
-            outputs.insert(f.cell, coerce(ctx.expr[node as usize].as_deref().unwrap(), have, want)?);
+            per.push(VarOut { outputs, ok, bd });
         }
-        variants.push(Variant { mask: *r, outputs, ok, bd });
+        variants.push(Variant { mask: *r, per });
     }
 
     // A cell is per-variant only if the variants DISAGREE about it. That
     // is exact, where the old button-cone test was an over-approximation:
     // a value can depend on a button and still be the same in every
     // assignment, and such a cell belongs in the shared output.
-    for f in of.fields.iter_mut() {
-        let first = variants[0].outputs[&f.cell].clone();
-        f.tainted = variants.iter().any(|v| v.outputs[&f.cell] != first);
-        f.expr = first;
+    for (oi, o) in outs.iter_mut().enumerate() {
+        for f in o.of.fields.iter_mut() {
+            let first = variants[0].per[oi].outputs[&f.cell].clone();
+            f.tainted = variants.iter().any(|v| v.per[oi].outputs[&f.cell] != first);
+            f.expr = first;
+        }
     }
 
     // Which representative each of the 64 assignments collapsed onto. The
@@ -952,10 +1007,7 @@ pub(crate) fn emit_body(e: &mut Emit, of: &mut OutFields) -> Result<()> {
     // coarser than the fused one.
     let mut rep_of = [0u8; 64];
     for m in 0u8..64 {
-        let mut sig: Vec<NodeId> = of.fields.iter().map(|f| maps[m as usize][f.node as usize]).collect();
-        sig.push(maps[m as usize][e.ok as usize]);
-        sig.push(maps[m as usize][e.live as usize]);
-        rep_of[m as usize] = sigs[&sig];
+        rep_of[m as usize] = sigs[&signature(m, &maps, outs)];
     }
 
     e.body = body;

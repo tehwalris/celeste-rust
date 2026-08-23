@@ -1450,6 +1450,60 @@ bounded.
   equalities: provably equal, structurally distinct, still blocked on
   the Kleene-precision question rather than on the ability to prove it.
 
+## T16 - one body, every output shape (the first half of T6's blocker)
+
+`emit_body` took ONE `OutFields` plus `Emit`'s single `ok`/`live`, so a
+traced frame's four output shapes were four separate lowerings. It now
+takes `&mut [Outcome]`, where an `Outcome` is one shape's fields plus its
+own `ok` and `live`, and emits one body over the union of their roots.
+
+Two things follow from the nodes being in one graph.
+
+The BODY is shared. A node is bound once no matter how many outcomes
+read it, so the whole frame up to the first branch that disagrees about
+the heap is emitted once instead of four times.
+
+The VARIANT COUNT is a max, not a sum. Two button assignments are
+interchangeable only if they agree about every outcome, so the signature
+spans all of them - and the result is the largest outcome's variant
+count, not the total.
+
+**Measured on room (0,0) f40, pm1-pinned, post-ival+BDD:**
+
+| | lines | variants |
+|---|---|---|
+| four separate lowerings | 9,304 | 73 (1 + 24 + 24 + 24) |
+| one fused body | **4,419** | **24** |
+
+-52.5% of the body and -67% of the variants. That is better than the
+"2.6x" the reachability census suggested, and my caveat about it was
+wrong in an instructive way: I read "only 63 nodes are shared by ALL
+four" as evidence the shared prefix was small. Sharing between PAIRS of
+outcomes is what the fused body captures, and it is much larger than the
+four-way intersection. A four-way intersection is the wrong statistic
+for a fusion that is not four-way.
+
+**The single-outcome path is untouched.** `lower_walk` wraps its one
+`OutFields` in a one-element slice, and the emitted names keep their
+original spelling when there is exactly one outcome, so the checked-in
+kernels are BYTE-IDENTICAL - `generated_is_current{,_r20}` pass
+unchanged. That was the point of doing the refactor this way round: the
+regression gate is exact rather than a judgement call.
+
+### What is still missing before this is T6
+
+This is the EMITTER half. Still to come, and they are the plumbing
+rather than the compiler:
+
+* `Variant::per` is a `Vec`, but `render` and `transpile::fuse` read
+  `per[0]`. Emitting a kernel with n > 1 needs the generated interface
+  to declare n output shapes and write n row sets.
+* `FrameEngine::step` is already `(shape, rows) -> [(shape, rows)]` and
+  nothing has ever populated more than one entry; dispatch, the bridge
+  and the chunk accounting need checking at n > 1.
+* The partition check P2 calls for: union of member masks plus the deopt
+  count equals the lane count, so no lane is lost or double-counted.
+
 ## Stage 4 - delete
 
 - `celeste-rewrite` (38k lines) - the crate nothing depends on any more.
