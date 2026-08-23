@@ -43,7 +43,7 @@ are merged, and the engine's boundary canonicalizes and dedups them.
 ## The numbers (room (1,0), frame 30, single thread)
 
     15,250 input lanes
-     x 96 configurations
+     x 96 configurations (24 distinct assignments x 4 fork configs)
     = 1,246,632 candidate rows
     ->  197,612 written   (after the kernel's own dedup)
     ->   27,024 distinct  (after the boundary)
@@ -60,20 +60,26 @@ makes the boundary cost 23 ms. The two are nearly a wash.
 
 ## What is static and what is not
 
-The emitter knows, per outcome, which output cells can differ between
-button assignments. Measured on the room's kernels:
+The emitter knows, per outcome, which output cells are compile-time
+constants (one value for the whole accumulator) and which can differ
+between button assignments. Measured on the room's kernels:
 
-    outcome 0:   0 per-variant cells   <- all 24 assignments agree, always
-    outcome 1:   2
-    outcome 2:   4
-    outcome 3:  16                     (of 493 output cells total)
+                per-variant   shared, non-constant   constant   total
+    outcome 0        0                4                 50        54
+    outcome 1        2                3                 30        35
+    outcome 2        3                2                100       105
+    outcome 3       16               13                 30        59
 
 Outcome 0's 24 assignments produce a BYTE-IDENTICAL row for every lane,
-knowably at emit time. No runtime comparison can ever say otherwise.
+knowably at emit time - it has no per-variant cells at all. No runtime
+comparison can ever say otherwise.
 
 For the others, two assignments may agree on one lane and differ on
 another, so per-lane equality is genuinely dynamic - but it depends on
-at most 16 cells, not 493.
+at most 16 cells, and on 2 or 3 for two of the four outcomes.
+
+Note the ratio: of 253 output cells across the four outcomes, 210 are
+constants that are already written once, and 43 vary per row.
 
 Fork configurations are different: they change values through the frame
 body, so rows from different fork configurations are generally distinct.
