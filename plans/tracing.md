@@ -2635,6 +2635,35 @@ per-lane runtime key for the remaining ~5.6x, then a `KeyPlan` for the
 one affordable - 44 of outcome 0's 52 shared fields are constant splats,
 so the key is ~8 mixes, not ~100.
 
+### The static grouping is NOT free the obvious way - ATTEMPTED, REVERTED
+
+The cheap implementation looked ideal: keep emitting one `out()` per
+variant, add a `take` mask to `KOut` that is `live & ok` for the first
+variant of each output group and `0` for the rest, and append from
+`take` instead of `live & !deopt`. No interface change, `live` and
+`deopt` keep their meaning for deopt reporting, and 28 of the traced
+kernels' variants came out taking nothing.
+
+It made the build **over 20 minutes**, against 73 s. Killed and
+reverted.
+
+The reason is the shape of the union. Variant 0's `take` is
+`(live_v0 & ok_v0) | (live_v1 & ok_v1) | ... ` over its whole group, so
+48 mask variables that used to die immediately after their own `out()`
+now stay live across the entire variant sequence. In a function this
+size that is a register allocation problem, and LLVM pays for it in
+compile time - and would presumably pay in spills at run time too.
+
+The right form is GROUP-DRIVEN EMISSION: one `out()` per output group
+with the union, and the duplicate variants' `KOut` never built at all.
+That REMOVES code rather than extending live ranges. It is a bigger
+change because `out()` passes all outcomes together and the grouping
+differs per outcome, so the callback has to become per-outcome.
+
+Worth recording as a general lesson for this emitter: adding a value
+that references many earlier variants is not a local change. The body is
+one enormous function and everything is a live range.
+
 Caveats, stated so the number is not over-read: one room, one block, no
 chunking, no threads, against an interpreter with a year of tuning.
 
