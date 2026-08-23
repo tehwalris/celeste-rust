@@ -482,7 +482,7 @@ mod tests {
         let top = full_moon::parse(&src).expect("parse");
         let init = full_moon::parse("_init()").expect("parse _init");
         let reset = full_moon::parse("__reset_button_states()").expect("parse reset");
-        let frame = full_moon::parse("_update()").expect("parse frame");
+        let frame = full_moon::parse(cart::FRAME_CODE).expect("parse frame");
         let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
         let cd =
             std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
@@ -586,7 +586,7 @@ mod tests {
         let top = full_moon::parse(&src).expect("parse");
         let init = full_moon::parse("_init()").expect("parse _init");
         let reset = full_moon::parse("__reset_button_states()").expect("parse reset");
-        let frame = full_moon::parse("_update()").expect("parse frame");
+        let frame = full_moon::parse(cart::FRAME_CODE).expect("parse frame");
         let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
         let cd =
             std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
@@ -944,7 +944,7 @@ mod tests {
         let top = full_moon::parse(&src).expect("parse");
         let init = full_moon::parse("_init()").expect("parse _init");
         let reset = full_moon::parse("__reset_button_states()").expect("parse reset");
-        let frame = full_moon::parse("_update()").expect("parse frame");
+        let frame = full_moon::parse(cart::FRAME_CODE).expect("parse frame");
         let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
         let cd =
             std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
@@ -1036,7 +1036,7 @@ mod tests {
         let top = full_moon::parse(&src).expect("parse");
         let init = full_moon::parse("_init()").expect("parse _init");
         let reset = full_moon::parse("__reset_button_states()").expect("parse reset");
-        let frame = full_moon::parse("_update()").expect("parse frame");
+        let frame = full_moon::parse(cart::FRAME_CODE).expect("parse frame");
         let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
         let cd =
             std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
@@ -1237,7 +1237,7 @@ mod tests {
         let top = full_moon::parse(&src).expect("parse");
         let init = full_moon::parse("_init()").expect("parse _init");
         let reset = full_moon::parse("__reset_button_states()").expect("parse reset");
-        let frame = full_moon::parse("_update()").expect("parse frame");
+        let frame = full_moon::parse(cart::FRAME_CODE).expect("parse frame");
         let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
         let cd =
             std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
@@ -1338,7 +1338,7 @@ mod tests {
         let top = full_moon::parse(&src).expect("parse");
         let init = full_moon::parse("_init()").expect("parse _init");
         let reset = full_moon::parse("__reset_button_states()").expect("parse reset");
-        let frame = full_moon::parse("_update()").expect("parse frame");
+        let frame = full_moon::parse(cart::FRAME_CODE).expect("parse frame");
         let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
         let cd =
             std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
@@ -2636,7 +2636,7 @@ end
         let top = full_moon::parse(&src).expect("parse");
         let init = full_moon::parse("_init()").expect("parse _init");
         let reset = full_moon::parse("__reset_button_states()").expect("parse reset");
-        let frame = full_moon::parse("_update()").expect("parse frame");
+        let frame = full_moon::parse(cart::FRAME_CODE).expect("parse frame");
 
         let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
         let cd = std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));

@@ -62,6 +62,33 @@ pub fn sources() -> Result<String> {
     sources_in(std::path::Path::new("."))
 }
 
+
+/// What ONE FRAME is, for the tracer.
+///
+/// The same chunk `rewrite::program::FRAME_CODE` gives the interpreter,
+/// minus the button reset - `trace_frame` runs that itself, at the same
+/// boundary, before the frame rather than after.
+///
+/// `_draw()` is NOT cosmetic and leaving it out was a real bug. The
+/// player's screen clamp lives there:
+///
+/// ```lua
+/// draw=function(this)
+///   if this.x<-1 or this.x>121 then
+///     this.x=clamp(this.x,-1,121)
+///     this.spd.x=0
+///   end
+/// end
+/// ```
+///
+/// so a lane that walks off the left edge is stopped by `_draw`, not by
+/// `_update`. Tracing `_update()` alone let four lanes drift to x=-2 and
+/// x=-3 at frame 28 of room (1,0), which the widened `rem` then doubled
+/// into eight rows the interpreter did not have. The oracle test could
+/// not catch it: both sides ran the same chunk, so both were wrong the
+/// same way.
+pub const FRAME_CODE: &str = "_update()\n_draw()";
+
 /// The cart's Lua, read relative to `root`.
 ///
 /// The paths used to be relative to the process's working directory,
@@ -200,7 +227,7 @@ mod tests {
         let src = sources().expect("sources");
         let ast = full_moon::parse(&src).expect("parse");
         let init = full_moon::parse("_init()\n__reset_button_states()\n").expect("parse init");
-        let frame = full_moon::parse("_update()").expect("parse frame");
+        let frame = full_moon::parse(super::FRAME_CODE).expect("parse frame");
         let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
         // A tighter budget than the default. Six free choices held across
         // forty frames diverge about 3x per frame once the player can

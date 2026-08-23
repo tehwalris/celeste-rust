@@ -2477,12 +2477,34 @@ Ruled out:
   a `break` there fans the state out (`Flow::Break => done.push`) rather
   than being masked, so a lane that stopped really does stop.
 
-Where to look next: the four disputed lanes all sit at the room's LEFT
-EDGE, and `is_solid` there reaches `tile_flag_at` with a negative x,
-whose Lua clamps with `max(0, flr(x/8))`. The 28 agreeing lanes are at
-the same x. So the difference is not position alone - it is position
-together with whatever distinguishes those four, which the histogram
-does not show and the row dump says is dash state.
+RESOLVED, and it was not the fork.
+
+The player's screen clamp lives in `player.draw`, not `player.update`:
+
+    draw=function(this)
+      if this.x<-1 or this.x>121 then
+        this.x=clamp(this.x,-1,121)
+        this.spd.x=0
+      end
+    end
+
+which IS the four missing rows - x = -1, spd.x = 0. The tracer was
+tracing `_update()` alone, so a lane that walked off the left edge was
+never stopped; it drifted to x = -2 and -3, and the widened `rem`
+doubled each into two rows. The fork was working correctly on lanes that
+should never have existed.
+
+The interpreter's frame is `_update()` then `_draw()` then the button
+reset (`rewrite::program::FRAME_CODE`). The tracer had ELEVEN scattered
+`parse("_update()")` calls; it now has one `cart::FRAME_CODE` mirroring
+the interpreter's, minus the reset, which `trace_frame` runs itself at
+the same boundary.
+
+Worth noting WHY the oracle test did not catch this: it runs the same
+chunk on both sides, so both were wrong in the same way. Only comparing
+against the interpreter's own notion of a frame exposed it - which is an
+argument for the end-to-end room test existing at all, not just the
+per-frame one.
 
 ## Philippe's codegen question (2026-08-23)
 

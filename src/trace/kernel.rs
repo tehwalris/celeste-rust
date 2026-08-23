@@ -643,7 +643,7 @@ pub fn reference_frame_in(root: &std::path::Path) -> Result<Reference> {
     let init = full_moon::parse("_init()").map_err(|e| anyhow!("parse _init: {:?}", e))?;
     let reset = full_moon::parse("__reset_button_states()")
         .map_err(|e| anyhow!("parse reset: {:?}", e))?;
-    let fr = full_moon::parse("_update()").map_err(|e| anyhow!("parse frame: {:?}", e))?;
+    let fr = full_moon::parse(cart::FRAME_CODE).map_err(|e| anyhow!("parse frame: {:?}", e))?;
 
     let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
     let cart_data = std::sync::Arc::new(celeste_core::cart_data::CartData::load(root.join("cart"))?);
@@ -724,7 +724,7 @@ pub(crate) fn room_shapes_in(
     let init = full_moon::parse("_init()").map_err(|e| anyhow!("parse _init: {:?}", e))?;
     let reset = full_moon::parse("__reset_button_states()")
         .map_err(|e| anyhow!("parse reset: {:?}", e))?;
-    let fr = full_moon::parse("_update()").map_err(|e| anyhow!("parse frame: {:?}", e))?;
+    let fr = full_moon::parse(cart::FRAME_CODE).map_err(|e| anyhow!("parse frame: {:?}", e))?;
 
     let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
     let cart_data = std::sync::Arc::new(celeste_core::cart_data::CartData::load(root.join("cart"))?);
