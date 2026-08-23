@@ -196,3 +196,50 @@ program keeps it meaningful - it becomes "`gen.rs` is consistent with
 the frozen program" instead of "with the rules' output". What we DO lose
 is `every_checked_in_recipe_replays`, which is the rules' own test and
 goes with them.
+
+## Final tally (2026-08-23)
+
+| step | lines |
+|---|---|
+| 4 unused rules | 933 |
+| `rules/` + validate + isocheck + slots + class_dead + liveness + recipe's replay half + 14 CLI subcommands | 31,676 |
+| campaign instrumentation (field_census, block_coverage, would_dedup, merge_stats, branch_sites, create_sites, branch_trace, measure_k) | 1,871 |
+| the state-flow profiler + `--profile` | 1,523 |
+| Chrome tracing spans + the op census + `--trace` | 1,692 |
+| **total** | **~37,700** |
+
+Hand-written Rust after: **58,180** lines (plus 18,959 generated).
+`src/rewrite` went 37,894 -> 6,989, and only ~1,000 of what remains is
+about rewrites at all: the rest is `verify.rs` (the abstract search
+driver, 3,178), checkpoints, sweeps and position graphs. **That module
+should be renamed** - the search does not belong under `rewrite/`.
+
+The tracer (11,096) is now the largest thing in the repo, which is the
+right shape: it is what replaces all of the above.
+
+### What the checks were
+
+- Every deletion: the full suite, warning-free build.
+- The rules: `every_checked_in_recipe_replays` over all 20 recipes
+  before deleting them; `generated_is_current{,_r20}` after, which
+  regenerates `gen.rs` and all 8 kernels from the frozen program and
+  compares byte-for-byte.
+- The interpreter edits (213 op-census sites, 37 span sites, the
+  profiler's DAG-id threading): the ROOM TEST. The kernels are
+  untouched, so an interpreter that still yields identical row-key sets
+  for 30 frames is an interpreter whose behaviour did not change. That
+  is a stronger check than the unit tests for this kind of edit.
+
+### Still standing, and why
+
+- **Interpreter core + set machinery, ~12.5k.** Oracle for the room
+  test, and `FrameEngine`'s fallback for shapes with no kernel. Cutting
+  it is not a cleanup - room (0,0) would stop working rather than run
+  slowly, and the kernels would lose their independent check. Needs
+  kernel coverage first.
+- **`merge_dump::cell_names`** - `compiled::dispatch` uses it.
+- **`interpreter::inspect`** - houses the search's checkpoint save/load.
+- **The 18 unreferenced recipes** and the 8 checked-in kernels they
+  built: inert data now. `regen-generated.sh` no longer works, which is
+  fine while the tracer replaces the walk kernels, but say it out loud
+  rather than letting someone discover it.
