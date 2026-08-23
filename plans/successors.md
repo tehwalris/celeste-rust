@@ -195,12 +195,52 @@ in advance.
 
 Candidate directions, none chosen:
 
-1. **Group-driven emission.** Emit one output group per outcome instead
-   of 24 variants whose rows are then discarded. Kills the static
-   duplication outright and removes the fork's runtime loop. Bigger
-   change; must avoid constraint 4.
-2. **A cheaper dynamic check** over only the distinguishing cells,
-   vectorized across 16 lanes rather than scalar per lane.
-3. **Neither** - accept 1.55x and spend the time on coverage instead,
-   since deleting the interpreter is blocked on the kernels covering
-   more than one room and one ladder rung, not on speed.
+### 1. Group-driven emission
+
+What the kernel emits today, inside the fork loops, per configuration:
+
+    let sh0 = KShared0 { /* cells shared by all assignments */ };
+    // then 24 times, once per distinct button assignment:
+    let o0 = KOut0 { live: live_v0, deopt: !ok_v0, /* per-variant cells */ };
+    let o1 = KOut1 { ... }; let o2 = ...; let o3 = ...;
+    out(0b000000, &KOuts { sh0: &sh0, v0: &o0, ... });
+
+24 `out()` calls, each carrying all four outcomes. Outcome 0 has ZERO
+per-variant cells, so all 24 `KOut0`s are identical but for `live` and
+`deopt` - the driver appends its row 24 times per lane and the runtime
+dedup discards 23.
+
+Group-driven: group variants PER OUTCOME by their per-variant cell
+expressions, and emit one append per group with the union of that
+group's lanes.
+
+    let mut take0: u16 = 0;
+    // ... variant 0's masks computed here
+    take0 |= live_v0 & ok_v0;
+    // ... variant 1's masks
+    take0 |= live_v1 & ok_v1;
+    //  ... 24 times
+    append0(acc, &sh0, take0);        // ONE append for outcome 0
+
+The duplicate rows are never produced, so never checked either.
+
+**Why this is not the thing that blew up the build.** The failed attempt
+built the union as ONE expression - `(live_v0 & ok_v0) | (live_v1 &
+ok_v1) | ...` - which needs all 48 masks alive at once. Accumulating
+incrementally keeps one `u16` alive and lets each variant's masks die
+immediately. Same result, opposite register pressure.
+
+**Expected size.** Groups per outcome measure `[1, 19, 24, 24]`, so 96
+appends per fork configuration become 68: ~29% fewer candidates, hence
+~29% off both the check and the append. Kernel ~329 -> ~270 ms, total
+~356 -> ~300 ms. Real and simpler, but ~15%, not a breakthrough.
+### 2. A cheaper dynamic check
+
+Over only the distinguishing cells, vectorized across 16 lanes rather
+than scalar per lane. Bounded by the economics above: even a FREE check
+only buys 78 ms of 356.
+### 3. Neither
+
+Accept 1.55x and spend the time on coverage, since deleting the
+interpreter is blocked on the kernels covering more than one room and
+one ladder rung - not on speed.
