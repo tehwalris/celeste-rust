@@ -2586,11 +2586,32 @@ hashes 159k - roughly 1.8x, not 7.8x, because hashing a row costs about
 what pushing it costs.
 
 The way to get the rest is a CHEAPER KEY. Most output cells are folded
-constants - fixed by the shape, identical in every row - and hashing
-them contributes nothing. The emitter already knows which outputs are
-constant expressions, so a key over only the non-constant cells would
-cost a handful of mixes instead of a hundred. That is the version worth
-building.
+constants - 44 of outcome 0's 52 shared fields in kernel1 are
+`zn_splat(...)` of a literal - so a key over only the non-constant cells
+is ~8 mixes instead of ~100.
+
+### But most of it is removable STATICALLY, with no hashing at all
+
+Per-variant field counts in kernel1, which is the real story:
+
+    outcome 0:   0 per-variant fields,  53 shared
+    outcome 1:   2 per-variant fields,  32 shared
+    outcome 2:   4 per-variant fields, 100 shared
+    outcome 3:  16 per-variant fields,  42 shared
+
+Outcome 0 has ZERO. All 24 distinct button assignments write
+byte-identical values there; they remain separate variants only because
+they differ in WHICH LANES ARE LIVE. So a lane live in five of them
+appends five identical rows - by construction, not by coincidence.
+
+`variants` dedups on the whole `(outputs, live, ok)` tuple. Deduping
+PER OUTCOME on the outputs alone, and unioning the live masks of the
+variants that agree, removes those duplicates before they are ever
+written, statically, from expressions the emitter already has. No hash,
+no set, no per-row cost.
+
+That is the first thing to build. A hash-based pre-dedup only earns its
+keep on what survives it.
 
 Caveats, stated so the number is not over-read: one room, one block, no
 chunking, no threads, against an interpreter with a year of tuning.
