@@ -88,13 +88,12 @@ fn the_room_runs_on_kernels_alone() {
     }
 }
 
-/// Where two blocks of the same frame disagree, cell by cell.
+/// The rows one side has and the other does not, DECODED.
 ///
-/// A row-key difference says only that they disagree. The keys are
-/// hashes over every live cell, so recovering WHICH cell from them is
-/// impossible - and the interesting failures ("the shape is the same but
-/// one scalar differs" versus "the structures differ at all") look
-/// identical until someone walks both.
+/// A row key is a hash, so "8 extra, 4 missing" names nothing. But the
+/// key belongs to a lane, and a lane is a column index into a block, so
+/// the values are all there - this finds the lanes whose keys are
+/// unmatched and prints their scalars by path.
 fn explain(
     run: &celeste_rust::trace::run::Run,
     oracle: &celeste_rust::rewrite::verify::AbstractRun,
@@ -115,92 +114,132 @@ fn explain(
         })
         .collect();
     let mine = run.blocks();
-    eprintln!("[diff] kernels: {} block(s), interpreter: {}", mine.len(), theirs.len());
-    for (i, a) in mine.iter().enumerate() {
-        eprintln!(
-            "[diff] kernel block {}: shape {:#x}, {} lanes, {} cells",
-            i,
-            a.shape_hash_of(),
-            a.width,
-            a.structure.len()
-        );
-    }
-    for (i, b) in theirs.iter().enumerate() {
-        eprintln!(
-            "[diff] interp block {}: shape {:#x}, {} lanes, {} cells",
-            i,
-            b.shape_hash_of(),
-            b.width,
-            b.structure.len()
-        );
-    }
-    // Pair by shape where possible, else by index. A shape that appears
-    // on one side only is itself the answer, but "the hashes differ" is
-    // not - the hash is over the whole structure plus the globals, so the
-    // useful report is the FIRST place they diverge.
-    for (i, a) in mine.iter().enumerate() {
-        let b = match theirs.iter_mut().find(|b| b.shape_hash_of() == a.shape_hash_of()) {
-            Some(b) => b,
-            None => {
-                eprintln!(
-                    "[diff] no interpreter block has shape {:#x}; comparing with block {} anyway",
-                    a.shape_hash_of(),
-                    i
-                );
-                match theirs.get_mut(i) {
-                    Some(b) => b,
-                    None => continue,
-                }
-            }
-        };
-        if a.globals != b.globals {
-            for (g, (x, y)) in a.globals.iter().zip(b.globals.iter()).enumerate() {
-                if x != y {
-                    eprintln!(
-                        "[diff] global {} ({:?}): cell {:?} vs {:?}",
-                        g,
-                        celeste_names::gen::GLOBAL_NAMES.get(g),
-                        x,
-                        y
-                    );
-                }
+
+    // key -> (which block, which lane), both sides.
+    let index = |bs: &[celeste_engine::Rt2]| {
+        let mut m: std::collections::HashMap<(u64, u64), (usize, usize)> = Default::default();
+        for (bi, b) in bs.iter().enumerate() {
+            for (lane, k) in b.row_keys.iter().enumerate() {
+                m.insert(*k, (bi, lane));
             }
         }
-        if a.structure.len() != b.structure.len() {
-            eprintln!(
-                "[diff] {} cells vs {}",
-                a.structure.len(),
-                b.structure.len()
-            );
-        }
-        let mut shown = 0;
-        for c in 0..a.structure.len().min(b.structure.len()) {
-            if a.structure[c] != b.structure[c] {
-                if shown < 10 {
-                    eprintln!(
-                        "[diff] cell {}: structure {:?} vs {:?}",
-                        c, a.structure[c], b.structure[c]
-                    );
-                }
-                shown += 1;
+        m
+    };
+    let a = index(mine);
+    let b = index(&theirs);
+
+    let show = |bs: &[celeste_engine::Rt2], at: (usize, usize), what: &str| {
+        let blk = &bs[at.0];
+        let path = cell_paths(blk);
+        let mut fields: Vec<String> = Vec::new();
+        for c in 0..blk.structure.len() {
+            if !matches!(blk.structure[c], celeste_engine::runtime2::Cell2::Val) {
                 continue;
             }
-            for lane in 0..a.width.min(b.width) {
-                if a.cols[c].at(lane) != b.cols[c].at(lane) {
-                    if shown < 10 {
-                        eprintln!(
-                            "[diff] cell {} lane {}: {:?} vs {:?}",
-                            c,
-                            lane,
-                            a.cols[c].at(lane),
-                            b.cols[c].at(lane)
-                        );
-                    }
-                    shown += 1;
-                    break;
-                }
+            let Some(name) = path.get(&(c as u32)) else { continue };
+            // Only what varies between rows is worth printing; a
+            // constant is the same on both sides by construction.
+            let v = blk.cols[c].at(at.1);
+            let uniform = (0..blk.width).all(|l| blk.cols[c].at(l) == v);
+            if uniform {
+                continue;
+            }
+            fields.push(format!("{}={:?}", name, v));
+        }
+        eprintln!("[row] {} block {} lane {}: {}", what, at.0, at.1, fields.join(" "));
+    };
+
+    // Where the two sides put the player, as a histogram. A row-level
+    // diff shows which rows differ; this shows whether the DISTRIBUTION
+    // differs, which is what says a movement rule disagreed rather than
+    // a few lanes being mislabelled.
+    let hist = |bs: &[celeste_engine::Rt2], what: &str| {
+        let mut h: std::collections::BTreeMap<(i32, i32), usize> = Default::default();
+        for blk in bs {
+            let path = cell_paths(blk);
+            let cell = |name: &str| {
+                (0..blk.structure.len() as u32).find(|c| path.get(c).map(|s| s.as_str()) == Some(name))
+            };
+            let (Some(cx), Some(cs)) = (cell("objects[0].x"), cell("objects[0].spd.x")) else {
+                continue;
+            };
+            for lane in 0..blk.width {
+                let g = |c: u32| match blk.cols[c as usize].at(lane) {
+                    celeste_engine::runtime2::AV::Num(n) => n.as_raw_u32() as i32 >> 16,
+                    _ => i32::MIN,
+                };
+                *h.entry((g(cx), g(cs))).or_default() += 1;
             }
         }
-        eprintln!("[diff] {} cells differ in block {}", shown, i);
+        let neg: Vec<String> = h
+            .iter()
+            .filter(|((x, _), _)| *x < 0)
+            .map(|((x, s), n)| format!("x={} spd={} : {}", x, s, n))
+            .collect();
+        eprintln!("[hist] {} rows at negative x: {}", what, neg.join(", "));
+    };
+    hist(mine, "KERNELS");
+    hist(&theirs, "INTERP ");
+
+    let mut extra: Vec<_> = a.iter().filter(|(k, _)| !b.contains_key(*k)).collect();
+    let mut missing: Vec<_> = b.iter().filter(|(k, _)| !a.contains_key(*k)).collect();
+    extra.sort();
+    missing.sort();
+    eprintln!("[row] {} extra (kernels only), {} missing (interpreter only)", extra.len(), missing.len());
+    for (_, at) in extra.iter().take(8) {
+        show(mine, **at, "EXTRA");
     }
+    for (_, at) in missing.iter().take(8) {
+        show(&theirs, **at, "MISSING");
+    }
+}
+
+/// The first path from the globals to each cell. A cell reported as a
+/// number is a puzzle; reported as `objects[0].spd.x` it is an answer.
+fn cell_paths(b: &celeste_engine::Rt2) -> std::collections::HashMap<u32, String> {
+    use celeste_engine::runtime2::{Cell2, Col, AV};
+    let mut out: std::collections::HashMap<u32, String> = Default::default();
+    let mut queue: Vec<(u32, String)> = Vec::new();
+    for (g, cell) in b.globals.iter().enumerate() {
+        if *cell == celeste_engine::runtime2::NONE {
+            continue;
+        }
+        let name = celeste_names::gen::GLOBAL_NAMES
+            .get(g)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("g{}", g));
+        queue.push((*cell, name));
+    }
+    let mut i = 0;
+    while i < queue.len() {
+        let (c, p) = queue[i].clone();
+        i += 1;
+        if out.contains_key(&c) {
+            continue;
+        }
+        out.insert(c, p.clone());
+        match &b.structure[c as usize] {
+            Cell2::Val => {
+                if let Col::U(AV::Ptr(t)) = &b.cols[c as usize] {
+                    queue.push((*t, p.clone()));
+                }
+            }
+            Cell2::Obj(fields) => {
+                for (f, t) in fields {
+                    let name = celeste_names::gen::FIELD_NAMES
+                        .get(*f as usize)
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| format!("f{}", f));
+                    queue.push((*t, format!("{}.{}", p, name)));
+                }
+            }
+            Cell2::Arr(items) => {
+                for (k, t) in items.iter().enumerate() {
+                    queue.push((*t, format!("{}[{}]", p, k)));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }

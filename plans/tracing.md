@@ -2442,13 +2442,47 @@ where fork validity goes (guard) versus the span premise (`ok`) - so it
 would survive the restructure and be chased through new code instead of
 old.
 
-### OPEN: frame 28, 8 extra and 4 missing
+### OPEN: frame 28, 8 extra and 4 missing - CHARACTERISED
 
-Small and specific, which is the good kind. The obvious suspect is a
-lane whose interval spans exactly ONE floor, where fragment 1 should be
-empty - if it is ever marked valid the same successor is produced twice.
-That would explain extras; it does not explain the four missing, so
-there is more than one thing here or the guess is wrong.
+Decoded by lane rather than guessed at. Row keys are hashes, but a key
+belongs to a lane and a lane is a column, so the values are all there;
+`tests/room.rs` now prints the unmatched rows and a position histogram.
+
+Player positions at negative x, frame 28:
+
+| | x=-3 spd=-2 | x=-2 spd=-2 | x=-1 spd=-2 | x=-1 spd=0 |
+|---|---|---|---|---|
+| kernels     | 4 | 4 | 28 | 0 |
+| interpreter | 0 | 0 | 28 | **4** |
+
+Twenty-eight rows agree exactly. Four lanes disagree, and the eight
+extras are FOUR PAIRS - each pair identical except `x = -2` against
+`x = -3`.
+
+So on those four lanes the interpreter's `move_x` hits a solid and stops
+at `x = -1` with `spd.x = 0`; the traced kernel keeps moving, and the
+widened `rem` leaves `amount` ambiguous by one, so each lane emits two
+rows where the interpreter emits none.
+
+The pairing is the fork working correctly on a lane that should not have
+got that far. So the fork is downstream of the bug, not the bug.
+
+Ruled out:
+
+* NOT a deopt. `Run::step` bails on any declined lane and did not, so
+  these lanes were not routed off the kernel.
+* NOT `break` mis-masking in the unrolled loop, which was the obvious
+  suspect: `for i=start,abs(amount)` has a symbolic limit, so it goes
+  through `run_for_symbolic` (unroll bound 8, from `unroll_bound`) - but
+  a `break` there fans the state out (`Flow::Break => done.push`) rather
+  than being masked, so a lane that stopped really does stop.
+
+Where to look next: the four disputed lanes all sit at the room's LEFT
+EDGE, and `is_solid` there reaches `tile_flag_at` with a negative x,
+whose Lua clamps with `max(0, flr(x/8))`. The 28 agreeing lanes are at
+the same x. So the difference is not position alone - it is position
+together with whatever distinguishes those four, which the histogram
+does not show and the row dump says is dash state.
 
 ## Philippe's codegen question (2026-08-23)
 
