@@ -556,7 +556,19 @@ pub fn reference_frame_in(root: &std::path::Path) -> Result<Reference> {
 /// trace, or one it dropped at the cap, is a kernel that will not exist,
 /// and under the never-deopt doctrine that is a run that stops. Better
 /// to fail here, where the reason is in hand.
-pub fn room_kernels_in(root: &std::path::Path) -> Result<Vec<Reference>> {
+/// Every shape's traced frame, BOUND to the engine's numbering, plus the
+/// arena they share. The half of `room_kernels_in` that does not lower -
+/// separate so a diagnostic can look at the traced graph itself, which
+/// is where the question "did the tracer build this node or did a fold"
+/// gets answered.
+pub(crate) fn room_shapes_in(
+    root: &std::path::Path,
+) -> Result<(
+    Vec<super::shapes::Shape>,
+    crate::transpile::graph::Graph,
+    std::sync::Arc<celeste_core::cart_data::CartData>,
+    std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
+)> {
     use super::domain::Symbolic;
     use super::interp::Interp;
     use super::verify::run_one;
@@ -595,19 +607,27 @@ pub fn room_kernels_in(root: &std::path::Path) -> Result<Vec<Reference>> {
     }
 
     let graph = std::mem::take(&mut it.d.graph);
+    Ok((w.shapes, graph, cart_data, cache))
+}
+
+/// One kernel per heap shape the room reaches.
+pub fn room_kernels_in(root: &std::path::Path) -> Result<Vec<Reference>> {
+    let (shapes, graph, cart_data, cache) = room_shapes_in(root)?;
     let room = crate::transpile::graph::Room { cart: cart_data.clone(), cache: cache.clone() };
     let mut out = Vec::new();
-    for sh in w.shapes {
-        let bound = super::emit::bind(&sh.frame, &graph)?;
+    for sh in shapes {
+        let frame = sh.frame;
+        let bound = super::emit::bind(&frame, &graph)?;
         let lowered = super::emit::lower_frame(
             &bound.graph,
             &bound.inputs,
             &bound.uni,
             &bound.outcomes,
             Some(room.clone()),
-        )?;
+        )
+        .map_err(|e| name_cells(&frame, e))?;
         out.push(Reference {
-            frame: sh.frame,
+            frame,
             // Every shape was traced into ONE arena so they share
             // subexpressions; each reference keeps a copy because the
             // check harness evaluates against it. Cheap - the whole
@@ -688,6 +708,38 @@ pub fn input_block(r: &Reference, rows: &[Vec<super::iface::Conc>]) -> Result<ce
 ///
 /// Into a directory rather than a file because each shape's `Uni`,
 /// `RowsIn` and `KOuts` are different types with the same names - they
+
+/// Restate a lowering failure with its `Cell(n)`s NAMED.
+///
+/// The emitter works on the bound graph, where an input is a canonical
+/// engine cell number and nothing downstream of the tracer knows what a
+/// cell means. The interface does, so translating the numbers back is a
+/// lookup - and the difference between "arms disagree in Sel(.., Cell(272))"
+/// and knowing 272 is a particular object's field is the whole diagnosis.
+fn name_cells(f: &super::verify::Frame, e: anyhow::Error) -> anyhow::Error {
+    let msg = format!("{:#}", e);
+    let mut seen: std::collections::BTreeSet<u32> = Default::default();
+    let mut at = msg.as_str();
+    while let Some(i) = at.find("Cell(") {
+        at = &at[i + 5..];
+        let end = at.find(')').unwrap_or(0);
+        if let Ok(n) = at[..end].parse::<u32>() {
+            seen.insert(n);
+        }
+    }
+    let mut lines = Vec::new();
+    for c in seen {
+        let name = f
+            .in_cells
+            .iter()
+            .position(|x| *x == c)
+            .map(|i| super::iface::show(&f.iface.slots[i]))
+            .unwrap_or_else(|| "not an input of this frame".to_string());
+        lines.push(format!("  Cell({}) = {}", c, name));
+    }
+    anyhow::anyhow!("{}\nwhere\n{}", msg, lines.join("\n"))
+}
+
 /// coexist only as separate modules.
 pub fn write_room_kernels(root: &std::path::Path, dir: &std::path::Path) -> Result<Vec<usize>> {
     let refs = room_kernels_in(root)?;
@@ -764,4 +816,6 @@ mod tests {
             Err(e) => panic!("{:#}", e),
         }
     }
+
+
 }

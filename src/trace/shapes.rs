@@ -139,6 +139,24 @@ pub fn blank(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
         };
         iface::set(st, &p, v)?;
     }
+    // The path condition and the obligation belong to the frame that
+    // produced this state, not to the one about to be traced from it.
+    //
+    // Carrying them is not a small inaccuracy. `guard` is what a merge
+    // SELECTS ON, so a stale one puts the previous frame's input cells
+    // inside this frame's output values - and those cells are that
+    // frame's dense slot indices, which this frame's interface does not
+    // name. That is how "Op::Cell(18) is not an interface slot (17
+    // slots)" and a select with a numeric arm and a boolean arm both
+    // arrived: neither is a mixed VALUE, both are one frame's expression
+    // read in another frame's numbering.
+    //
+    // Dropping `ok` is not dropping the obligation. A lane only reaches
+    // this state by satisfying the previous kernel's `ok`, which that
+    // kernel checks. Re-checking it here would deopt a lane twice for
+    // one obligation, and it would need cells this frame does not have.
+    st.guard = d.boolean(true);
+    st.ok = d.boolean(true);
     Ok(())
 }
 

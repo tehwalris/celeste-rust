@@ -71,6 +71,25 @@ pub struct Bound {
     pub outcomes: Vec<FrameOutcome>,
 }
 
+
+/// What each root index passed to `renumber_cells` is: the roots are
+/// every outcome's fields then its `live` and `ok`, flattened, and a
+/// failure that says "root #58" means nothing without that key.
+fn root_legend(f: &crate::trace::verify::Frame) -> String {
+    let mut out = Vec::new();
+    let mut k = 0usize;
+    for (i, o) in f.outs.iter().enumerate() {
+        for (p, _, _) in &o.fields {
+            out.push(format!("  #{} outcome {} field {}", k, i, crate::trace::iface::show(p)));
+            k += 1;
+        }
+        out.push(format!("  #{} outcome {} live", k, i));
+        out.push(format!("  #{} outcome {} ok", k + 1, i));
+        k += 2;
+    }
+    out.join("\n")
+}
+
 /// Resolve a traced frame against the engine's numbering.
 ///
 /// `g` is passed separately because the tracer's graph lives on the
@@ -92,7 +111,8 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph) -> Result<Bound> {
         roots.push(o.guard);
         roots.push(o.ok);
     }
-    let (graph, roots) = crate::trace::bind::renumber_cells(g, &f.in_cells, &roots)?;
+    let (graph, roots) = crate::trace::bind::renumber_cells(g, &f.in_cells, &roots)
+        .map_err(|e| anyhow::anyhow!("{:#}\nwhere the roots are\n{}", e, root_legend(f)))?;
 
     let mut inputs: Vec<(u32, &'static str)> = Vec::new();
     let mut uni: Vec<(u32, &'static str)> = Vec::new();

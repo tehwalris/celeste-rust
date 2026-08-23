@@ -209,6 +209,53 @@ pub fn structure_of(
     Ok(rt2)
 }
 
+
+/// How a root reaches `target`, as a chain of ops.
+///
+/// A foreign cell in a frame's expression is always the same question -
+/// which output carries it, and through what - and the node id alone
+/// answers neither. This walks back from the first root that reaches the
+/// node so the failure names a path instead of a number.
+fn why_reached(
+    g: &crate::transpile::graph::Graph,
+    roots: &[crate::transpile::graph::NodeId],
+    target: crate::transpile::graph::NodeId,
+) -> String {
+    use crate::transpile::graph::NodeId;
+    for (k, r) in roots.iter().enumerate() {
+        let mut parent: std::collections::HashMap<NodeId, NodeId> = Default::default();
+        let mut seen: std::collections::HashSet<NodeId> = Default::default();
+        let mut stack = vec![*r];
+        seen.insert(*r);
+        let mut hit = false;
+        while let Some(n) = stack.pop() {
+            if n == target {
+                hit = true;
+                break;
+            }
+            for a in g.get(n).args.iter().copied() {
+                if seen.insert(a) {
+                    parent.insert(a, n);
+                    stack.push(a);
+                }
+            }
+        }
+        if !hit {
+            continue;
+        }
+        let mut chain = vec![target];
+        let mut at = target;
+        while let Some(p) = parent.get(&at) {
+            chain.push(*p);
+            at = *p;
+        }
+        chain.reverse();
+        let ops: Vec<String> = chain.iter().map(|n| format!("{:?}", g.get(*n).op)).collect();
+        return format!("root #{}: {}", k, ops.join(" -> "));
+    }
+    "no root".to_string()
+}
+
 /// Rebuild a traced graph with the ENGINE's cell ids.
 ///
 /// The tracer numbers its input cells `Op::Cell(0..n)` in `Iface` order,
@@ -269,7 +316,12 @@ pub fn renumber_cells(
         let new = match node.op {
             Op::Cell(i) => {
                 let c = *canon.get(i as usize).ok_or_else(|| {
-                    anyhow!("Op::Cell({}) is not an interface slot ({} slots)", i, canon.len())
+                    anyhow!(
+                        "Op::Cell({}) is not an interface slot ({} slots), reached by {}",
+                        i,
+                        canon.len(),
+                        why_reached(g, roots, id as NodeId)
+                    )
                 })?;
                 out.leaf(Op::Cell(c))
             }
