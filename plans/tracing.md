@@ -1838,6 +1838,84 @@ agreement with the interpreter is already covered by the oracle test, so
 these two together cover the chain - but not yet in one run, on a block
 the search actually produced.
 
+## T21 - the shape set is a fixpoint, and it is FOUR
+
+Covering a room without ever deopting means a kernel per input shape,
+which means knowing every shape the room reaches. Philippe: is that not
+just a fixpoint from the spawn shape? It is.
+
+**Room (0,0): 4 shapes, from 4 traced frames, in 0.3 seconds.**
+
+The same four the emit probe sees at f40 - 274 / 229 / 400 / 282 cells -
+reached from `_init` instead of from a warm-up. Between 19 and 40 tables
+each.
+
+**The concrete values do not matter, and that is what makes it a
+fixpoint over SHAPES rather than over states.** Every non-frozen scalar
+is symbolized at the start of each frame, so whatever a slot held is
+erased before it can decide anything: two states with the same shape
+trace identically. Stepping forward only needs a state with the right
+shape, so the walk blanks the values rather than carrying ones that look
+meaningful and are not.
+
+### "Everything symbolic" is not every number in the heap
+
+Full symbolization refused three times before it ran, and each refusal
+was the same mistake in a different place: a PROGRAM CONSTANT treated as
+state.
+
+**`types` and the object prototypes.** `balloon.tile` is 22 in the
+source and stays 22. Symbolized, `type.tile == tile` in `load_room`'s
+scan becomes undecidable, so the tracer explores every object type for
+every tile - including a balloon, whose `init` calls `rnd`, which the
+minimal cart does not define. Room (0,0)'s tile map contains no balloon
+at all. The trace had wandered into a room that does not exist. Frozen
+structurally, from `types` itself, rather than by listing names.
+
+**`room`.** `load_room` does `mget(room.x*16+tx, ...)`. Same failure,
+one level up: a symbolic room is every room. Freezing it states an
+existing specialization rather than adding one - a kernel is per room by
+construction, since `G` carries that room's collision cache.
+
+**The button indices.** `btn(k)` asserts its argument is one of the six,
+so a symbolic `k_right` makes every `btn` call fail.
+
+Note what is NOT frozen: `freeze`, `will_restart`, `delay_restart`,
+`has_dashed` and `has_key` are also assigned at the cart's toplevel, and
+they are state. "Set up at toplevel" is therefore not the rule. The rule
+is "no frame writes it", and the frozen list is the part of that
+discovered so far - by refusal, which is worth saying plainly.
+
+**The risk direction is the safe one, and the doctrine is why.**
+Freezing something that is really state would make the walk MISS a
+shape, hence a kernel, hence a deopt at runtime - and a deopt now stops
+the run and names itself. An over-freeze is therefore loud rather than
+silent. That is the first thing the doctrine has bought.
+
+### It also confirms skipping the pm1 tier
+
+The fully symbolic frame - no pm1 pin, 41 slots - is **2,341 graph
+nodes**. The pinned trace's reachable set was about 1,720 for its
+largest outcome alone. Un-pinning costs very little, which is the same
+answer T13 gave from the other direction (-6.3%).
+
+So: one kernel per shape, covering every pm1 key. Four kernels for room
+(0,0), not four times twenty-four.
+
+### Not closed yet: one refusal
+
+One of the four shapes cannot be stepped from:
+
+    calling _update: calling foreach: calling func: calling
+    obj.type.update: in `this.delay>0`: comparison of nil and num(8)
+
+A field that is nil rather than a number. `iface::scalars` yields only
+Num and Bool, so a nil slot is never symbolized and stays nil - the same
+residue as the 16-17 "value cells with no source" in T20. So **4 is a
+lower bound, not the answer**: that shape's successors are unexplored.
+Chasing it is the next step, and under the doctrine it has to be chased
+rather than absorbed.
+
 ## Doctrine: never deopt to the interpreter (Philippe, 2026-08-23)
 
 **A deopt stops the run. It does not fall back.**

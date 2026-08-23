@@ -76,6 +76,10 @@ pub struct FrameOut {
     pub rt2: celeste_engine::runtime2::Rt2,
     pub cells: Vec<u32>,
     pub ubool_cells: Vec<u32>,
+    /// The state itself. Kept so a shape walk can step FORWARD: a new
+    /// heap shape only appears by actually advancing a frame, and the
+    /// state an outcome ends in is the only thing that has that shape.
+    pub st: State<Symbolic>,
 }
 
 pub struct Frame {
@@ -180,15 +184,17 @@ pub fn trace_frame<'a>(
             fields.iter().map(|(p, _, _)| p.clone()).chain(ubool.iter().cloned()).collect();
         let all = super::bind::resolve_all(&rt2, &paths)?;
         let (cells, ubool_cells) = all.split_at(fields.len());
+        let (guard, shape) = (s.guard.clone(), s.shape()?);
         outs.push(FrameOut {
-            guard: s.guard,
+            guard,
             ok,
             fields,
             ubool,
-            shape: s.shape()?,
+            shape,
             rt2,
             cells: cells.to_vec(),
             ubool_cells: ubool_cells.to_vec(),
+            st: s,
         });
     }
     Ok(Frame { iface, outs, in_cells, in_rt2 })
@@ -360,6 +366,298 @@ mod tests {
     use crate::trace::cart;
 
     use super::find_player;
+
+    /// Globals that are PROGRAM CONSTANTS rather than state.
+    ///
+    /// The button INDICES. `btn(k)` asserts its argument is one of the
+    /// six, so a symbolic `k_right` makes every `btn` call fail. They are
+    /// `k_left=0 .. k_dash=5` in the source and nothing writes them.
+    ///
+    /// Note what is NOT here: `freeze`, `will_restart`, `delay_restart`,
+    /// `has_dashed` and `has_key` are also assigned at the cart's
+    /// toplevel, and they are state. "Set up at toplevel" is therefore
+    /// not the rule; "no frame writes it" is, and this list is the part
+    /// of it discovered so far.
+    const FROZEN_GLOBALS: &[&str] =
+        &["k_left", "k_right", "k_up", "k_down", "k_jump", "k_dash"];
+
+    /// The tables that hold PROGRAM CONSTANTS rather than state: the
+    /// object prototypes in `types`, everything reachable from them, and
+    /// `room`.
+    ///
+    /// Identified structurally, from `types`, rather than by listing
+    /// names - the cart's type list is the cart's own answer to "what is
+    /// a prototype".
+    fn frozen_tables(st: &State<Symbolic>) -> std::collections::BTreeSet<u32> {
+        let mut out = std::collections::BTreeSet::new();
+        let mut stack: Vec<u32> = Vec::new();
+        for name in ["types", "room"] {
+            if let Some(Value::Table(t)) = iface::get(st, &[iface::key(name)]) {
+                stack.push(t);
+            }
+        }
+        while let Some(t) = stack.pop() {
+            if !out.insert(t) {
+                continue;
+            }
+            let tab = &st.heap.tables[&t];
+            for v in tab.hash.values().chain(tab.arr.iter()) {
+                if let Value::Table(u) = v {
+                    stack.push(*u);
+                }
+            }
+        }
+        out
+    }
+
+    /// Does this path pass through a frozen table on its way to a scalar?
+    fn under_frozen(
+        st: &State<Symbolic>,
+        p: &Path,
+        frozen: &std::collections::BTreeSet<u32>,
+    ) -> bool {
+        if let Some(Step::Key(k)) = p.first() {
+            if FROZEN_GLOBALS.contains(&k.as_str()) {
+                return true;
+            }
+        }
+        for k in 0..p.len() {
+            if let Some(Value::Table(t)) = iface::get(st, &p[..k]) {
+                if frozen.contains(&t) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// IS THE SHAPE SET A FIXPOINT? The first experiment, before the
+    /// walk that would depend on it.
+    ///
+    /// A kernel is specialized to one INPUT SHAPE. Covering a room
+    /// without ever deopting therefore means knowing every shape the
+    /// room reaches, and the natural way to get that is a fixpoint:
+    /// start at the spawn shape, trace, collect the outcomes' shapes,
+    /// repeat.
+    ///
+    /// The step this checks first is whether the trace works at all with
+    /// EVERYTHING symbolic. It has to be everything: a branch on a cell
+    /// left concrete is decided, so a shape behind it never appears and
+    /// the fixpoint looks converged when it is not. Today's probes
+    /// symbolize seven roots.
+    ///
+    /// The VALUES do not matter, only the shape. Every scalar becomes a
+    /// fresh cell immediately, so what a slot held before is erased -
+    /// which is why this can step forward without evaluating anything.
+    /// The shapes that come out are therefore a SUPERSET of the
+    /// reachable ones, which is the safe direction: a shape that cannot
+    /// really occur costs a kernel nobody dispatches to.
+    #[test]
+    #[ignore]
+    fn tracing_a_frame_with_everything_symbolic() {
+        let src = cart::sources().expect("sources");
+        let top = full_moon::parse(&src).expect("parse");
+        let init = full_moon::parse("_init()").expect("parse _init");
+        let reset = full_moon::parse("__reset_button_states()").expect("parse reset");
+        let frame = full_moon::parse("_update()").expect("parse frame");
+        let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
+        let cd =
+            std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
+        let (rx, ry) = celeste_interp::game_runner::start_room();
+        it.cache = Some(std::sync::Arc::new(
+            celeste_core::collision_cache::CollisionCache::new(&cd, rx, ry).expect("cache"),
+        ));
+        it.cart = Some(cd);
+        let st = cart::fresh_state::<Symbolic>(&mut it.d);
+        let mut st = run_one(&mut it, &top, st).expect("toplevel");
+        cart::inject_tile_flag_at(&mut st);
+        let mut st = run_one(&mut it, &init, st).expect("_init");
+        for _ in 0..40 {
+            if find_player(&st).is_some() {
+                break;
+            }
+            st = match run_one(&mut it, &frame, st) {
+                Ok(s) => s,
+                Err(e) => return eprintln!("[shapes] warm-up stopped at: {:#}", e),
+            };
+        }
+
+        // "Everything" has to mean every scalar that is STATE, not
+        // every number in the heap.
+        //
+        // `types` and the object prototypes it holds are program
+        // constants: `balloon.tile` is 22 in the source and stays 22.
+        // Symbolizing them makes `type.tile == tile` undecidable in
+        // `load_room`'s scan, so the tracer explores EVERY object type
+        // for every tile - including a balloon, whose `init` calls
+        // `rnd`, which the minimal cart does not define. Room (0,0)'s
+        // tile map has no balloon at all; the trace had wandered into a
+        // room that does not exist.
+        //
+        // `room` goes with them. A kernel is per room by construction -
+        // `G` carries that room's collision cache - so pinning the room
+        // states an existing specialization rather than adding one.
+        let frozen = frozen_tables(&st);
+        let all: Vec<Path> = iface::scalars(&st, &[])
+            .expect("scalars")
+            .into_iter()
+            .filter(|p| !under_frozen(&st, p, &frozen))
+            .collect();
+        let n_slots = all.len();
+        let started = std::time::Instant::now();
+        match trace_frame(&mut it, &reset, &frame, st, &all, &[]) {
+            Ok(f) => {
+                let mut by_shape: std::collections::BTreeMap<String, usize> = Default::default();
+                for o in &f.outs {
+                    *by_shape.entry(format!("{:?}", o.shape)).or_default() += 1;
+                }
+                eprintln!(
+                    "[shapes] {} slots symbolized -> {} outcomes in {} distinct shapes, \
+                     {} graph nodes, {:.1}s",
+                    n_slots,
+                    f.outs.len(),
+                    by_shape.len(),
+                    it.d.graph.len(),
+                    started.elapsed().as_secs_f64()
+                );
+                for o in &f.outs {
+                    eprintln!(
+                        "[shapes]   outcome: {} cells, {} scalars",
+                        o.rt2.structure.len(),
+                        o.cells.len()
+                    );
+                }
+            }
+            // A REFUSAL is the result here, not a failure of the test.
+            // Full symbolization is strictly harder than what the tracer
+            // does today, and where it stops is the next thing to fix.
+            Err(e) => eprintln!(
+                "[shapes] {} slots symbolized: REFUSED after {:.1}s: {:#}",
+                n_slots,
+                started.elapsed().as_secs_f64(),
+                e
+            ),
+        }
+    }
+
+    /// THE SHAPE FIXPOINT. Start at the spawn shape, trace, collect the
+    /// outcomes' shapes, repeat until nothing new appears.
+    ///
+    /// A kernel is specialized to one INPUT SHAPE, so covering a room
+    /// without ever deopting means knowing every shape it reaches. This
+    /// is that set.
+    ///
+    /// The CONCRETE VALUES DO NOT MATTER, which is what makes this a
+    /// fixpoint over shapes alone rather than over states. Every
+    /// non-frozen scalar is symbolized at the start of each frame, so
+    /// whatever a slot held is erased before it can decide anything -
+    /// two states with the same shape trace identically. Stepping
+    /// forward therefore only needs a state with the right SHAPE, and
+    /// this blanks the values to make that explicit rather than carrying
+    /// values that look meaningful and are not.
+    #[test]
+    #[ignore]
+    fn the_rooms_shape_set_is_a_fixpoint() {
+        const CAP: usize = 400;
+        let src = cart::sources().expect("sources");
+        let top = full_moon::parse(&src).expect("parse");
+        let init = full_moon::parse("_init()").expect("parse _init");
+        let reset = full_moon::parse("__reset_button_states()").expect("parse reset");
+        let frame = full_moon::parse("_update()").expect("parse frame");
+        let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
+        let cd =
+            std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
+        let (rx, ry) = celeste_interp::game_runner::start_room();
+        it.cache = Some(std::sync::Arc::new(
+            celeste_core::collision_cache::CollisionCache::new(&cd, rx, ry).expect("cache"),
+        ));
+        it.cart = Some(cd);
+        let st = cart::fresh_state::<Symbolic>(&mut it.d);
+        let mut st = run_one(&mut it, &top, st).expect("toplevel");
+        cart::inject_tile_flag_at(&mut st);
+        let st = run_one(&mut it, &init, st).expect("_init");
+
+        let started = std::time::Instant::now();
+        let mut seen: std::collections::BTreeMap<String, State<Symbolic>> = Default::default();
+        let mut queue: Vec<String> = Vec::new();
+        let key = |s: &State<Symbolic>| format!("{:?}", s.shape().expect("shape"));
+        let k0 = key(&st);
+        seen.insert(k0.clone(), st);
+        queue.push(k0);
+
+        let (mut frames, mut refused, mut dropped) = (0usize, 0usize, 0usize);
+        let mut reasons: std::collections::BTreeMap<String, usize> = Default::default();
+        while let Some(k) = queue.pop() {
+            let st = seen[&k].clone();
+            let frozen = frozen_tables(&st);
+            let roots: Vec<Path> = iface::scalars(&st, &[])
+                .expect("scalars")
+                .into_iter()
+                .filter(|p| !under_frozen(&st, p, &frozen))
+                .collect();
+            frames += 1;
+            let f = match trace_frame(&mut it, &reset, &frame, st, &roots, &[]) {
+                Ok(f) => f,
+                Err(e) => {
+                    refused += 1;
+                    *reasons.entry(format!("{:#}", e)).or_default() += 1;
+                    continue;
+                }
+            };
+            for o in f.outs {
+                let k = key(&o.st);
+                if seen.contains_key(&k) {
+                    continue;
+                }
+                if seen.len() >= CAP {
+                    dropped += 1;
+                    continue;
+                }
+                let mut next = o.st;
+                blank(&mut next, &mut it.d);
+                seen.insert(k.clone(), next);
+                queue.push(k);
+            }
+        }
+
+        eprintln!(
+            "[fix] {} shapes from {} traced frames in {:.1}s ({} refused, {} dropped at the cap of {}), \
+             {} graph nodes",
+            seen.len(),
+            frames,
+            started.elapsed().as_secs_f64(),
+            refused,
+            dropped,
+            CAP,
+            it.d.graph.len()
+        );
+        for (why, n) in &reasons {
+            eprintln!("[fix]   {} x REFUSED: {}", n, why);
+        }
+        let mut sizes: Vec<usize> = seen.values().map(|s| s.heap.tables.len()).collect();
+        sizes.sort_unstable();
+        eprintln!("[fix] tables per shape: min {:?} max {:?}", sizes.first(), sizes.last());
+        assert_eq!(dropped, 0, "the shape walk hit its cap - raise CAP or it is not closed");
+    }
+
+    /// Erase every non-frozen scalar. See the fixpoint above: the values
+    /// are about to be symbolized anyway, and carrying the ones an
+    /// outcome happened to compute would suggest they mean something.
+    fn blank(st: &mut State<Symbolic>, d: &mut Symbolic) {
+        let frozen = frozen_tables(st);
+        let paths: Vec<Path> = iface::scalars(st, &[])
+            .expect("scalars")
+            .into_iter()
+            .filter(|p| !under_frozen(st, p, &frozen))
+            .collect();
+        for p in paths {
+            let v = match iface::get(st, &p) {
+                Some(Value::Bool(_)) => Value::Bool(d.boolean(false)),
+                _ => Value::Num(d.num(celeste_core::pico8_num::Pico8Num::from_i16(0))),
+            };
+            iface::set(st, &p, v).expect("set");
+        }
+    }
 
     /// Can the KERNEL EMITTER lower a traced graph?
     ///
