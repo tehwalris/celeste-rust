@@ -2758,23 +2758,47 @@ allocator fighting 6,000 live ranges: a flat frame with values streamed
 in graph order.
 
 I then guessed the peak live set might be ~6,000 because of the emission
-ORDER, making scheduling the cheapest win. Measured instead:
+ORDER, making scheduling the cheapest win. Measured 511, and concluded
+that spilling was therefore INHERENT and scheduling could only shave it.
 
-    5,959 nodes   PEAK live 511   mean live 247
+Philippe: "I don't see where 500 temporaries would come from. if you
+analyze the graph there's no way the min cut is 500." Correct, and my
+conclusion did not follow from my measurement - I measured the live set
+under the CURRENT ORDER and asserted it was near-minimal.
 
-So no. 511 is not 6,000, and it is still ~30x the register file. Even a
-perfect schedule leaves hundreds of values live, because the frame
-genuinely computes a wide dependency graph.
+Measured properly, against a greedy min-pressure schedule of the actual
+dependency graph:
 
-That is the honest ceiling on this line of attack: **~250 values must
-live in memory at any moment whoever emits the code**. LLVM's 48% stack
-traffic is not far off what the problem demands.
+    nodes 5959,  live-to-end (used by outputs) 493
+    peak under EMISSION order: 512
+    peak under GREEDY order:   508
 
-So a hand emitter's win is in HOW it spills - a flat frame indexed in
-graph order with predictable streaming access, rather than a general
-allocator reconciling 511 live ranges - and not in spilling less.
-Scheduling for locality might still shave the peak, but it is a smaller
-prize than it looked before the measurement.
+**493 of the 512 are OUTPUTS, not temporaries.** The computation's
+working set is about NINETEEN values. Rescheduling moves the peak by 4,
+because no topological order helps: all 493 are needed at the same
+moment, when the output structs are built at the end.
+
+There is no 500-wide cut in the computation DAG. What there is: the
+frame computes 493 output cells and holds every one live across the 24
+button-assignment variants, because they are shared by all of them.
+
+That reframes the spilling entirely:
+
+* It is not register pressure from computing, so no allocator and no
+  scheduler can fix it.
+* Those 493 values ARE conceptually a small array - one slot per output
+  cell - but they are expressed as 493 named locals, so LLVM sees 493
+  live ranges and spills each individually with scalar `mov`s. That is
+  the 34,362 movs.
+* A direct emitter would hold them in an explicit frame slot indexed by
+  cell: the same memory traffic in principle, but structured array
+  access instead of 34,000 individually allocated spills.
+
+And a cheaper version exists inside the current emitter: write each
+shared output to the accumulator AS SOON AS IT IS COMPUTED, so it dies
+immediately instead of waiting for the variant loop. That is the same
+restructuring the row dedup wants (group-driven emission), which makes
+the two one job.
 
 ## Doctrine: never deopt to the interpreter (Philippe, 2026-08-23)
 
