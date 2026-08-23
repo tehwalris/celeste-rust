@@ -35,12 +35,13 @@ variants, and the per-frame graph check (1,393,224 values).
 
 | | |
 |---|---|
-| speed vs the interpreter | **1.55x slower** (356 ms vs 230 ms, 30 frames, single-threaded) - 2.75x before constant columns, 1.85x before write-time dedup |
+| speed vs the interpreter | **1.26x FASTER** (177 ms vs 223 ms, 30 frames, single-threaded) - 1.55x slower before the row key moved into the graph, 1.85x before write-time dedup, 2.75x before constant columns |
 | row amplification | **46x**: 1.25M rows written to keep 27k |
 | ...decomposed | 1.4x static, ~2.7x per-lane, ~2.7x cross-lane, 5.9x only-the-widenings |
 | codegen | **16.3 instructions per graph node**, 48% stack traffic, 6.6% vector |
-| live values | 512 peak - but **493 are OUTPUTS**; the computation's working set is ~19 |
+| live values | ~486 peak in the body, inherent to the dependency graph (the "493 are OUTPUTS" reading was an artifact - see the CORRECTION below) |
 | build loop | ~55 s (was 25 min until `black_box` on the fork trip count) |
+| lane primitives | already vectorized by LLVM - forcing AVX-512 by hand costs 27% ("REFUTED" below) |
 
 ### The design that follows, agreed with Philippe
 
@@ -3186,6 +3187,107 @@ shared output to the accumulator AS SOON AS IT IS COMPUTED, so it dies
 immediately instead of waiting for the variant loop. That is the same
 restructuring the row dedup wants (group-driven emission), which makes
 the two one job.
+
+### REFUTED: hand-vectorizing the lane primitives (2026-08-23)
+
+I proposed this as the next win and it is wrong twice over. Recorded in
+full because the reasoning looked sound and the measurement is the only
+thing that caught it.
+
+**The proposal.** "`zn_lt` and friends build their 16-bit lane mask with
+a scalar loop - compare, shift, or, sixteen times, ~60 instructions each
+- and `kernel1` has ~690 of them, about a third of all instructions in
+`frame`. On this machine `_mm512_cmp_epi32_mask` is one instruction."
+
+**The result.** 30 frames of room (1,0), traced kernels, release:
+
+| | kernels | vs interpreter |
+|---|---|---|
+| baseline | **177.3 ms** | 1.26x |
+| `_mm512_cmp_epi32_mask`, column loaded via `&ZN` | 224.4 ms | 1.01x |
+| same, transmuted register-to-register | 225.2 ms | 0.98x |
+| after reverting | 190.3, 198.5, 181.9, 178.8 ms | 1.15-1.22x |
+
+A 27% LOSS.
+
+**The noise floor here is ~10%**, which the four post-revert runs of one
+unchanged binary establish and which I did not know when I started: two
+earlier runs happened to land 1.5% apart and I took that for the
+variance. Nothing under about 15% should be believed from a single run
+of this test. The 27% is comfortably outside it; a 7% "regression" I
+briefly saw after reverting was not. My first explanation was the load - taking `&ZN` forces the
+column into memory - so I rewrote it as a value transmute. Identical.
+That explanation was also wrong.
+
+**What the disassembly says.** `kernel1::frame`, 163,098 instructions,
+with the intrinsic version in place:
+
+| | count | sites in the source |
+|---|---|---|
+| `vpcmpltd`/`gtd`/`led`/`eqd` | 355 | 629 comparisons |
+| `vpblendmd` | 1229 | 1442 `zsel_n` |
+| `setg` / `setl` / `setle` | **0** | - |
+| `vpextrd` / `vpinsrd` | 2514 / 981 | - |
+| `kmovw` / `kmovd` | 4259 / 1591 | - |
+
+There is no scalar mask building anywhere in the function. LLVM already
+vectorizes both the comparison loop and the blend loop; the sixty
+instructions I was going to replace do not exist, and `zsel_n` - which
+the census says is the bigger target at 1,442 sites against 629 - is
+already 1,229 `vpblendmd`.
+
+What the intrinsic removed was LLVM's freedom to choose PER SITE. Where
+a column is built or consumed scalar-wise, the cheap thing is to keep
+the compare scalar rather than assemble a vector to extract a mask from;
+forcing the vector form pays `vpinsrd` and `kmovw` for the privilege.
+The 2,514 `vpextrd` are that boundary being crossed.
+
+**The census I should have taken first.** `kernel1` by call site:
+`zb_and` 1832, `zsel_n` 1442, `zn_splat` 1370, `zb_or` 1081, the row-key
+`zw_mix1`/`zw_mix2` 960, `zb_not` 498, all five comparisons 629,
+`zb_holds` 354, `zn_*` arithmetic ~230. The "~30% scalar mask work" line
+in the codegen table above counts `cmove` - which is `zsel_n` - next to
+`setg`/`shl`/`or`. I attributed that whole share to the comparisons.
+
+**Kept from the attempt:** `zn_cmp` now defines a `mask_*` alongside
+each `zn_*`, and `zi_cmp` is four of those masks and an OR instead of
+forty lines of nested branches (4 call sites in `kernel1`, 0 in
+`kernel0`, so this is legibility and not speed). Three tests in
+`celeste-engine` check the comparisons and the tri-state judge against
+independently written oracles, which did not exist before.
+
+**The standing conclusion.** The codegen table two sections up already
+said it: 47% stack traffic against 6.6% vector, with ~486 values live in
+the body. The function's problem is that it cannot hold what it already
+has. Moving more of it into 32 zmm registers is not the direction.
+
+### Before building fork specialization: measure what it would cost
+
+The codegen table above changes how this should be judged. `frame` is
+SPILL-bound - 47% stack traffic against 6.6% vector, ~486 values live in
+the body - and specialization trades runtime for code size: nodes
+downstream of the split that genuinely depend on the fragment are
+emitted once per configuration, where the loop emitted them once and
+executed them up to four times.
+
+So it is not obviously a win, and which way it goes is a reachability
+fact about the traced graph rather than an argument. The measurement is
+`trace::kernel::tests::what_specializing_the_fork_would_cost`: build the
+specialized arena both ways - 64 assignments with `Op::Split` left
+standing, and 64 x 2^forks with the fragments resolved - and compare the
+live node counts. Hash-consing is what decides the ratio: every node the
+configurations agree on is one node in both arenas.
+
+Two things to keep in mind when reading it:
+
+* **A 1.0x ratio is a pure win** and anything under ~1.3x probably is
+  too, since the loop is paying 2-4x in EXECUTION for the same nodes.
+* **The lost early-out is not in this number.** `if valid{d} == 0 {
+  continue; }` skips the whole tail for a slice in which no lane
+  straddles a floor boundary. If that is the common case, the loop is
+  nearly free today and specialization is a straight loss whatever the
+  node count says. That needs a second measurement - how often the fork
+  actually fires - and it is the one that would kill the idea.
 
 ## Doctrine: never deopt to the interpreter (Philippe, 2026-08-23)
 

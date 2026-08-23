@@ -330,39 +330,58 @@ pub fn zi_span_ok(a: ZI) -> ZB {
 }
 
 // ---- comparisons ----
+//
+// SCALAR ON PURPOSE, and this is the second time it has been measured.
+//
+// `Pico8Num` wraps an `i32` and derives `Ord` from it, so an abstract
+// comparison IS a signed 32-bit compare and the 16-lane result is
+// exactly the bitmask `ZB` wants - which reads like a standing
+// invitation to write `_mm512_cmp_epi32_mask` and delete sixteen
+// iterations. It was written that way on 2026-08-23 and the room went
+// from 177 ms to 225 ms, a 27% LOSS, identical whether the column was
+// loaded through a pointer or transmuted register-to-register.
+//
+// The reason is in the disassembly: LLVM ALREADY vectorizes these. The
+// forced version emitted 355 `vpcmp*` for 629 call sites and zero
+// `setg`/`setl` anywhere in `frame` - so the "sixteen compare-shift-or
+// sequences" the intrinsic was meant to replace did not exist. What the
+// intrinsic removed was LLVM's freedom to decide PER SITE: where a
+// column is being built or consumed scalar-wise, keeping the compare
+// scalar avoids assembling a vector only to extract a mask from it, and
+// forcing the vector form pays `vpinsrd` + `kmovw` instead. The same
+// disassembly shows 1,229 `vpblendmd` for 1,442 `zsel_n` sites, so the
+// blends are already vectorized too.
+//
+// Write these as plain loops over `Pico8Num`'s own operators and leave
+// the choice to the compiler. See `plans/tracing.md`.
 
+/// Defines `$name`, the `ZB`-returning primitive the kernels call, and
+/// `$mask`, the raw lane mask `zi_cmp` combines.
 macro_rules! zn_cmp {
-    ($name:ident, $op:tt) => {
+    ($name:ident, $mask:ident, $op:tt) => {
         #[inline(always)]
-        pub fn $name(a: ZN, b: ZN) -> ZB {
+        fn $mask(a: ZN, b: ZN) -> u16 {
             let mut val = 0u16;
             for i in 0..W {
                 if a[i] $op b[i] {
                     val |= 1 << i;
                 }
             }
-            ZB { val, known: ALL }
+            val
+        }
+        #[inline(always)]
+        pub fn $name(a: ZN, b: ZN) -> ZB {
+            ZB { val: $mask(a, b), known: ALL }
         }
     };
 }
-zn_cmp!(zn_lt, <);
-zn_cmp!(zn_le, <=);
-zn_cmp!(zn_gt, >);
-zn_cmp!(zn_ge, >=);
+zn_cmp!(zn_lt, mask_lt, <);
+zn_cmp!(zn_le, mask_le, <=);
+zn_cmp!(zn_gt, mask_gt, >);
+zn_cmp!(zn_ge, mask_ge, >=);
+zn_cmp!(zn_eq, mask_eq, ==);
 
-#[inline(always)]
-pub fn zn_eq(a: ZN, b: ZN) -> ZB {
-    let mut val = 0u16;
-    for i in 0..W {
-        if a[i] == b[i] {
-            val |= 1 << i;
-        }
-    }
-    ZB { val, known: ALL }
-}
-
-/// The av_cmp tri-state judge, per lane, on intervals (degenerate
-/// intervals give the same answers as plain numbers for ORDERED compares).
+/// The comparison the tri-state interval judge is performing.
 #[derive(Clone, Copy)]
 pub enum Cmp {
     Lt,
@@ -370,61 +389,26 @@ pub enum Cmp {
     Gt,
     Ge,
 }
+
+/// The av_cmp tri-state judge, per lane, on intervals (degenerate
+/// intervals give the same answers as plain numbers for ORDERED compares).
+///
+/// Each arm is two of the number masks above. `t` is "definitely true"
+/// and `f` is "definitely false"; a lane in neither is unknown. The two
+/// are disjoint by construction - for `Lt`, `ah < bl` and `al >= bh`
+/// together give `bh <= al <= ah < bl <= bh` - so `val = t` needs no
+/// masking against `f`.
 #[inline(always)]
 pub fn zi_cmp(op: Cmp, a: ZI, b: ZI) -> ZB {
-    let mut val = 0u16;
-    let mut known = 0u16;
-    for i in 0..W {
-        let (al, ah, bl, bh) = (a.lo[i], a.hi[i], b.lo[i], b.hi[i]);
-        let t = match op {
-            Cmp::Lt => {
-                if ah < bl {
-                    Some(true)
-                } else if al >= bh {
-                    Some(false)
-                } else {
-                    None
-                }
-            }
-            Cmp::Le => {
-                if ah <= bl {
-                    Some(true)
-                } else if al > bh {
-                    Some(false)
-                } else {
-                    None
-                }
-            }
-            Cmp::Gt => {
-                if al > bh {
-                    Some(true)
-                } else if ah <= bl {
-                    Some(false)
-                } else {
-                    None
-                }
-            }
-            Cmp::Ge => {
-                if al >= bh {
-                    Some(true)
-                } else if ah < bl {
-                    Some(false)
-                } else {
-                    None
-                }
-            }
-        };
-        match t {
-            Some(true) => {
-                val |= 1 << i;
-                known |= 1 << i;
-            }
-            Some(false) => known |= 1 << i,
-            None => {}
-        }
-    }
-    ZB { val, known }
+    let (t, f) = match op {
+        Cmp::Lt => (mask_lt(a.hi, b.lo), mask_ge(a.lo, b.hi)),
+        Cmp::Le => (mask_le(a.hi, b.lo), mask_gt(a.lo, b.hi)),
+        Cmp::Gt => (mask_gt(a.lo, b.hi), mask_le(a.hi, b.lo)),
+        Cmp::Ge => (mask_ge(a.lo, b.hi), mask_lt(a.hi, b.lo)),
+    };
+    ZB { val: t, known: t | f }
 }
+
 
 /// `zi_cmp`'s scalar sibling: one block-uniform interval pair, tri-state
 /// out. `Some` when every value pair decides the comparison the same way,
@@ -771,5 +755,141 @@ impl RowSet {
             i = (i + 1) & self.mask;
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A deterministic spread of raw 16.16 patterns: zero, both signs,
+    /// the fractional boundaries `flr` cares about, and the extremes -
+    /// because a comparison that only ever sees small positive numbers
+    /// would not notice a sign or an overflow bug in either direction.
+    fn spread() -> Vec<P8> {
+        let mut v: Vec<P8> = vec![
+            P8::from_raw(0),
+            P8::from_raw(1),
+            P8::from_raw(-1),
+            P8::from_raw(0x0000_ffff),
+            P8::from_raw(0x0001_0000),
+            P8::from_raw(-0x0001_0000),
+            P8::from_raw(i32::MAX),
+            P8::from_raw(i32::MIN),
+        ];
+        // A few more, from a fixed LCG so the set is wide but the test is
+        // not flaky.
+        let mut s: u32 = 0x1234_5678;
+        for _ in 0..24 {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            v.push(P8::from_raw(s as i32));
+        }
+        v
+    }
+
+    /// Sixteen lanes drawn from `spread` at a fixed stride, so successive
+    /// columns are not correlated with each other.
+    fn column(seed: usize) -> ZN {
+        let s = spread();
+        let mut o = [P8::from_i16(0); W];
+        for i in 0..W {
+            o[i] = s[(seed * 7 + i * 5) % s.len()];
+        }
+        o
+    }
+
+    /// The oracle, written independently of the primitives: build the mask
+    /// one lane at a time out of `Pico8Num`'s own operators.
+    fn oracle(a: ZN, b: ZN, f: impl Fn(P8, P8) -> bool) -> u16 {
+        let mut m = 0u16;
+        for i in 0..W {
+            if f(a[i], b[i]) {
+                m |= 1 << i;
+            }
+        }
+        m
+    }
+
+    #[test]
+    fn number_comparisons_match_a_scalar_oracle() {
+        for seed in 0..64 {
+            let (a, b) = (column(seed), column(seed + 31));
+            assert_eq!(zn_lt(a, b).val, oracle(a, b, |x, y| x < y), "lt {}", seed);
+            assert_eq!(zn_le(a, b).val, oracle(a, b, |x, y| x <= y), "le {}", seed);
+            assert_eq!(zn_gt(a, b).val, oracle(a, b, |x, y| x > y), "gt {}", seed);
+            assert_eq!(zn_ge(a, b).val, oracle(a, b, |x, y| x >= y), "ge {}", seed);
+            assert_eq!(zn_eq(a, b).val, oracle(a, b, |x, y| x == y), "eq {}", seed);
+            // `known` is unconditional for numbers; a regression that
+            // dropped it would make every comparison unknown and deopt.
+            assert_eq!(zn_lt(a, b).known, ALL);
+        }
+        // Same column against itself: every ordered predicate is decided
+        // by reflexivity, which no random spread is likely to cover.
+        for seed in 0..8 {
+            let a = column(seed);
+            assert_eq!(zn_lt(a, a).val, 0);
+            assert_eq!(zn_gt(a, a).val, 0);
+            assert_eq!(zn_le(a, a).val, ALL);
+            assert_eq!(zn_ge(a, a).val, ALL);
+            assert_eq!(zn_eq(a, a).val, ALL);
+        }
+    }
+
+    /// The interval judge is now four number masks and an OR. Check it
+    /// against the tri-state definition it replaced, spelled out here
+    /// rather than shared with the implementation.
+    #[test]
+    fn interval_comparisons_match_the_tristate_definition() {
+        let ops = [Cmp::Lt, Cmp::Le, Cmp::Gt, Cmp::Ge];
+        for seed in 0..64 {
+            // Build intervals that are genuinely ordered, and let some of
+            // them be degenerate - a degenerate interval must give the
+            // same answer as the plain number comparison.
+            let (p, q) = (column(seed), column(seed + 13));
+            let (r, s) = (column(seed + 29), column(seed + 41));
+            let a = ZI { lo: zn_min(p, q), hi: zn_max(p, q) };
+            let b = ZI { lo: zn_min(r, s), hi: zn_max(r, s) };
+            for op in ops {
+                let got = zi_cmp(op, a, b);
+                let mut val = 0u16;
+                let mut known = 0u16;
+                for i in 0..W {
+                    let (al, ah, bl, bh) = (a.lo[i], a.hi[i], b.lo[i], b.hi[i]);
+                    // Enumerate the definition: the comparison is decided
+                    // iff every pair drawn from the two intervals agrees.
+                    let (t, f) = match op {
+                        Cmp::Lt => (ah < bl, al >= bh),
+                        Cmp::Le => (ah <= bl, al > bh),
+                        Cmp::Gt => (al > bh, ah <= bl),
+                        Cmp::Ge => (al >= bh, ah < bl),
+                    };
+                    assert!(!(t && f), "seed {} lane {}: both arms fired", seed, i);
+                    if t {
+                        val |= 1 << i;
+                        known |= 1 << i;
+                    } else if f {
+                        known |= 1 << i;
+                    }
+                }
+                assert_eq!(got.val, val, "seed {} val", seed);
+                assert_eq!(got.known, known, "seed {} known", seed);
+            }
+        }
+    }
+
+    /// A degenerate interval must judge exactly like the number.
+    #[test]
+    fn degenerate_intervals_agree_with_numbers() {
+        for seed in 0..32 {
+            let (a, b) = (column(seed), column(seed + 17));
+            let (ia, ib) = (zi_of_zn(a), zi_of_zn(b));
+            assert_eq!(zi_cmp(Cmp::Lt, ia, ib).val, zn_lt(a, b).val);
+            assert_eq!(zi_cmp(Cmp::Le, ia, ib).val, zn_le(a, b).val);
+            assert_eq!(zi_cmp(Cmp::Gt, ia, ib).val, zn_gt(a, b).val);
+            assert_eq!(zi_cmp(Cmp::Ge, ia, ib).val, zn_ge(a, b).val);
+            for op in [Cmp::Lt, Cmp::Le, Cmp::Gt, Cmp::Ge] {
+                assert_eq!(zi_cmp(op, ia, ib).known, ALL, "a point is always decided");
+            }
+        }
     }
 }
