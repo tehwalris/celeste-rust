@@ -27,11 +27,8 @@
 //! because the verifier checks the result.
 
 pub mod checkpoint;
-pub mod class_dead;
 pub mod frozen;
-pub mod liveness;
 pub mod pos_graph;
-pub mod isocheck;
 /// Instruction and CFG printing lives in `celeste-ir` - the interpreter
 /// needs it and must not depend on the rewrite machinery for it. Only the
 /// whole-`Program` printer stays here, because only it needs `Program`.
@@ -51,10 +48,7 @@ pub mod print {
 }
 pub mod program;
 pub mod recipe;
-pub mod rules;
-pub mod slots;
 pub mod state_mapping;
 pub mod sweep;
 pub mod sweep_time;
-pub mod validate;
 pub mod verify;

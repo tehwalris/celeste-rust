@@ -106,10 +106,67 @@ impl Program {
     /// from the list (native only after init); its pins stay in the
     /// recipe.
     pub fn pin_native_builtins(&mut self) -> Result<usize> {
-        super::rules::pin_builtin::pin_all(
-            self,
-            &["min", "max", "abs", "flr", "sin", "mget"],
-        )
+        /// The pure builtins that have a native implementation. NOT
+        /// `tile_flag_at`, which is native only after init - pinning it
+        /// program-wide would break the init-time calls.
+        const NATIVE: [&str; 6] = ["min", "max", "abs", "flr", "sin", "mget"];
+
+        // Re-homed from `rules::pin_builtin::pin_all` when the rules were
+        // deleted (`plans/deletion.md`). This is the only part of that
+        // rule anything outside the campaign needed: the plain executable
+        // program is compiled with these pinned, so the interpreter takes
+        // the native path for them.
+        let mut pinned = 0usize;
+        for (_, fun) in self.functions.iter_mut() {
+            // Which locals hold a LOADED pure builtin. A `get_global`'s
+            // cell is trusted only within its block; the loaded value
+            // anywhere in the function.
+            let mut builtin_of: std::collections::HashMap<crate::ir::LocalId, String> =
+                Default::default();
+            for block in fun.cfg.iter_blocks() {
+                let mut cell_of: std::collections::HashMap<crate::ir::LocalId, String> =
+                    Default::default();
+                for (id, instr) in &block.instructions {
+                    match instr {
+                        crate::ir::Instruction::GetGlobal { name, create_if_missing: false }
+                            if NATIVE.contains(&name.as_str()) =>
+                        {
+                            cell_of.insert(*id, name.clone());
+                        }
+                        crate::ir::Instruction::Load { source } => {
+                            if let Some(name) = cell_of.get(source) {
+                                builtin_of.insert(*id, name.clone());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if builtin_of.is_empty() {
+                continue;
+            }
+            let pin_block = |block: &mut crate::ir::Block, pinned: &mut usize| {
+                for (_, instr) in block.instructions.iter_mut() {
+                    let crate::ir::Instruction::Call { closure, args } = instr else {
+                        continue;
+                    };
+                    let Some(name) = builtin_of.get(closure) else {
+                        continue;
+                    };
+                    *instr = crate::ir::Instruction::CallBuiltin {
+                        callee: *closure,
+                        name: name.clone(),
+                        args: args.clone(),
+                    };
+                    *pinned += 1;
+                }
+            };
+            pin_block(&mut fun.cfg.entry, &mut pinned);
+            for block in fun.cfg.named.values_mut() {
+                pin_block(block, &mut pinned);
+            }
+        }
+        Ok(pinned)
     }
 
     pub fn compile_from_disk() -> Result<Self> {

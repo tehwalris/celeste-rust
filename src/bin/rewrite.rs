@@ -10,10 +10,8 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 
-use celeste_rust::rewrite::print::{format_function, format_program};
 use celeste_rust::rewrite::program::Program;
-use celeste_rust::rewrite::recipe::{apply_entry, build, Recipe};
-use celeste_rust::rewrite::validate::validate_program;
+use celeste_rust::rewrite::recipe::Recipe;
 use celeste_rust::rewrite::verify::differential_abstract;
 
 const DEFAULT_RECIPE: &str = "rewrites.jsonl";
@@ -64,34 +62,12 @@ struct VariantOf {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Replay the recipe and report what each entry did.
-    Build,
-    /// Print the textual IR of the rewritten program.
-    Print {
-        /// Only this function.
-        #[arg(long)]
-        r#fn: Option<String>,
-    },
-    /// Show what one recipe entry changed, as a textual diff.
-    Diff {
-        #[arg(long)]
-        id: String,
-        #[arg(long)]
-        r#fn: Option<String>,
-    },
-    /// Structural validation of the rewritten program.
-    Check,
     /// Differentially run the rewritten program against the original.
     Verify {
         #[arg(long, default_value_t = 30)]
         frames: u32,
         #[command(flatten)]
         variant_of: VariantOf,
-    },
-    /// Find the first recipe entry after which the differential run fails.
-    Bisect {
-        #[arg(long, default_value_t = 30)]
-        frames: u32,
     },
     /// Concrete check of a specialization-set MEMBER (plans/shape-tag-plan.md).
     ///
@@ -122,47 +98,6 @@ enum Command {
         #[arg(long)]
         trace_frame: Option<u32>,
     },
-    /// Propose recipe entries. This is the untrusted half of the system: the
-    /// output is a suggestion, and only survives if the rule's verifier accepts
-    /// it. Pipe it into the recipe and re-run `build`.
-    Suggest {
-        /// What to look for: "promote-cell", "promote-capture", "inline",
-        /// "if-convert", "demote-create", "pin-builtin", "convert-ternary",
-        /// "decompose-truthy", "speculate", "speculate-region", "sink-store",
-        /// "absorb-stores", "expand-bool", "convert-assert",
-        /// "collapse-loop", "collapse-break-loop" or "unroll-loop".
-        #[arg(default_value = "promote-cell")]
-        what: String,
-        /// Prefix for the generated ids.
-        #[arg(long, default_value = "p")]
-        prefix: String,
-    },
-    /// Report how many LocalEnv slots each function needs now versus how many
-    /// it would need if values with disjoint live ranges shared a slot.
-    Slots {
-        /// Only show functions needing at least this many slots today.
-        #[arg(long, default_value_t = 40)]
-        min: usize,
-    },
-    /// Try each candidate entry on top of the recipe, keep the ones that
-    /// verify, and print them.
-    ///
-    /// For rules that are *expected* to fail at some sites. `if_convert` is the
-    /// motivating case: its transformation is always structurally valid, but
-    /// the resulting `select` may be asked to combine values the representation
-    /// cannot hold per lane, and the only way to find out is to run it.
-    Screen {
-        /// File of candidate entries, one JSON object per line, as `suggest`
-        /// emits.
-        #[arg(long)]
-        candidates: String,
-        /// Frames to run when screening. Lower is faster and less thorough;
-        /// re-verify the accepted set at full length afterwards.
-        #[arg(long, default_value_t = 20)]
-        frames: u32,
-        #[command(flatten)]
-        variant_of: VariantOf,
-    },
     /// Print a digest of the canonical observation after each frame.
     ///
     /// `verify` compares two programs built from the same sources, so it cannot
@@ -174,14 +109,6 @@ enum Command {
     /// deliberately blind to how lanes are distributed across states.
     Observe {
         #[arg(long, default_value_t = 30)]
-        frames: u32,
-    },
-    /// Estimate the per-class specialization prize: instructions whose
-    /// value the merge-partition cells determine, and the speculated
-    /// select arms they discard per class, weighted by a measured
-    /// per-instruction time profile.
-    Classdead {
-        #[arg(long, default_value_t = 40)]
         frames: u32,
     },
     /// Run the rewritten program and report time, memory and lane counts.
@@ -332,80 +259,6 @@ enum Command {
         /// Write per-position distinct-value counts to this CSV.
         #[arg(long)]
         out: Option<String>,
-    },
-    /// Print every stable name bound to a rewrite-created local, as
-    /// "function<TAB>name". Sorted, so two runs can be diffed to see which
-    /// names a change to the base program actually disturbed - which is the
-    /// measurement the whole recipe-stability plan turns on.
-    Names {},
-    /// Derive a class-overlay tail by transplanting a sibling overlay's tail
-    /// and pruning what does not apply (the 30-room pipeline, per Philippe
-    /// 2026-08-20). Textual: comments survive, and the id-prefix rename also
-    /// renames the inline-created labels that carry entry ids. The prune is
-    /// ONE tolerant replay (entries after the shared base may fail and are
-    /// recorded), then a confirmation replay of the pruned file. What the
-    /// report lists as dropped is exactly the native-head residue to
-    /// re-derive by probe - the same seams every overlay derivation hits
-    /// (input-chain arms, draw-dispatch labels, gates that pin vs blend).
-    DeriveOverlay {
-        /// The sibling overlay whose tail is transplanted (e.g.
-        /// rewrites-trace20-steady.jsonl).
-        #[arg(long)]
-        source: String,
-        /// First tail entry id in the source (e.g. st20_strip).
-        #[arg(long)]
-        tail_from: String,
-        /// End marker id in the source, exclusive (e.g. steady_kd).
-        #[arg(long)]
-        tail_until: String,
-        /// Id prefix to strip from transplanted entries (e.g. st20_).
-        #[arg(long)]
-        strip_prefix: String,
-        /// Replacement id prefix (e.g. fz20t_).
-        #[arg(long)]
-        add_prefix: String,
-        /// Entry id in `--recipe` before which the tail is inserted
-        /// (e.g. frozen_dce).
-        #[arg(long)]
-        insert_before: String,
-        /// Where to write the derived recipe.
-        #[arg(long)]
-        out: String,
-    },
-    /// Print every block as "function<TAB>canonical position<TAB>label".
-    /// The position is structural (reverse postorder from the entry), so
-    /// joining two builds' dumps on it recovers a label renaming.
-    Labels {
-        /// Dump the freshly compiled program instead of the rewritten one.
-        /// Needed when the recipe cannot replay - which is exactly the case
-        /// while a label renaming is being migrated.
-        #[arg(long)]
-        base: bool,
-    },
-    /// Re-address the recipe's cells from `%N` to the stable name of whatever
-    /// rewrite created the local. Replays the recipe to do it, because `%N`
-    /// only means anything against the program as that entry finds it. Cells
-    /// pointing at SOURCE locals stay `%N` - those are already stable.
-    /// Verify with `rewrite isocheck` afterwards: the program must not move.
-    MigrateNames {
-        /// Write the migrated recipe back over the input. Without this, the
-        /// counts are printed and nothing is touched.
-        #[arg(long)]
-        write: bool,
-    },
-    /// Is the compiled program the SAME program, up to renaming its locals?
-    /// The gate for plans/recipe-stability-plan.md: that refactor changes how
-    /// LocalIds are assigned, not what program comes out, so it must leave
-    /// the final program isomorphic AND slot-identical. Slot identity is not
-    /// cosmetic - row keys are computed from slots, so a permutation
-    /// invalidates every checkpoint and every certified g.
-    Isocheck {
-        /// Write the baseline instead of checking against it.
-        #[arg(long)]
-        save: bool,
-        /// Where the baseline lives.
-        #[arg(long, default_value = "baseline/isocheck")]
-        dir: String,
     },
     Bench {
         #[arg(long, default_value_t = 34)]
@@ -739,8 +592,8 @@ fn build_variants(
             .with_context(|| format!("--variant {:?}", spec))?;
         let recipe = Recipe::load(path)
             .with_context(|| format!("--variant {:?}: loading recipe", spec))?;
-        let (program, _) = build(&recipe)
-            .with_context(|| format!("--variant {:?}: building program", spec))?;
+        let program = celeste_rust::rewrite::frozen::rewritten(path)
+            .with_context(|| format!("--variant {:?}: the frozen program", spec))?;
         out.push(make_variant(
             &program,
             StateMapping::from_recipe(&recipe),
@@ -775,8 +628,8 @@ fn resolve_variant_host(args: &VariantOf) -> Result<Option<VariantHost>> {
         (Some(path), Some(shapes)) => {
             let recipe = Recipe::load(path)
                 .with_context(|| format!("--variant-of {:?}: loading recipe", path))?;
-            let (program, _) = build(&recipe)
-                .with_context(|| format!("--variant-of {:?}: building program", path))?;
+            let program = celeste_rust::rewrite::frozen::rewritten(path)
+                .with_context(|| format!("--variant-of {:?}: the frozen program", path))?;
             let pm1 = match &args.pm1 {
                 None => Vec::new(),
                 Some(text) => parse_pm1(text).context("--variant-pm1")?,
@@ -1524,102 +1377,6 @@ fn bench(
             }
         }
 
-        // Which convertible triangles are actually worth converting.
-        //
-        // The blocker analysis says which triangles *can* be converted. That is
-        // a different question from whether they *cost* anything, and the two
-        // have already been confused once: the first 81 conversions were chosen
-        // on convertibility alone, removed 4.6% of splits, and made the frame
-        // slower. A branch is free when its condition is uniform across lanes,
-        // and converting a free branch is worse than leaving it - the arm stops
-        // being skipped and runs on every execution instead.
-        {
-            let mut rows: Vec<(bool, String, String, celeste_rust::branch_sites::BranchSite)> =
-                Vec::new();
-            for (name, fun) in &program.functions {
-                for join in fun.cfg.named.keys() {
-                    use celeste_rust::rewrite::rules::if_convert;
-                    let convertible = if_convert::triangle_at(&fun.cfg, join).is_some();
-                    let Some(t) = if_convert::triangle_shaped(&fun.cfg, join) else { continue };
-                    let head = t
-                        .head
-                        .as_ref()
-                        .map_or("__entry".to_string(), |l| l.as_str().to_string());
-                    let site = celeste_rust::branch_sites::lookup(name.as_str(), &head);
-                    rows.push((
-                        convertible,
-                        name.as_str().to_string(),
-                        join.as_str().to_string(),
-                        site,
-                    ));
-                }
-            }
-            rows.sort_by_key(|(_, f, j, s)| (std::cmp::Reverse(s.splits), f.clone(), j.clone()));
-            let (all_splits, _, _) = celeste_rust::branch_sites::totals();
-            println!();
-            println!(
-                "{:<14} {:>10} {:>10} {:>10} {:>10}",
-                "triangles", "count", "ever split", "splits", "% of all"
-            );
-            for (label, want) in [("convertible", true), ("blocked", false)] {
-                let group: Vec<_> = rows.iter().filter(|(c, ..)| *c == want).collect();
-                let splits: u64 = group.iter().map(|(_, _, _, s)| s.splits).sum();
-                println!(
-                    "{:<14} {:>10} {:>10} {:>10} {:>9.1}%",
-                    label,
-                    group.len(),
-                    group.iter().filter(|(_, _, _, s)| s.splits > 0).count(),
-                    splits,
-                    100.0 * splits as f64 / all_splits.max(1) as f64
-                );
-            }
-            println!(
-                "{:<14} {:>10} {:>10} {:>10} {:>9.1}%",
-                "all branches", "-", "-", all_splits, 100.0
-            );
-            println!();
-            // What is in the way, for the ones that are worth clearing. The
-            // blocked triangles that never split do not matter however easy
-            // they look; these are the whole of the prize.
-            let mut why: std::collections::BTreeMap<(String, String), String> = Default::default();
-            for (name, fun) in &program.functions {
-                for (join, reasons) in celeste_rust::rewrite::rules::if_convert::blockers(fun) {
-                    let mut kinds: Vec<String> = reasons
-                        .iter()
-                        .map(|r| {
-                            let mut k = r.split_whitespace().next().unwrap_or("?").to_string();
-                            if r.ends_with(" create") {
-                                k.push_str(" create");
-                            }
-                            k
-                        })
-                        .collect();
-                    kinds.sort();
-                    kinds.dedup();
-                    why.insert(
-                        (name.as_str().to_string(), join.as_str().to_string()),
-                        kinds.join(" + "),
-                    );
-                }
-            }
-            println!(
-                "{:<8} {:<20} {:<30} {:>7} {:>7}  {}",
-                "state", "function", "join", "splits", "uniform", "in the way"
-            );
-            for (convertible, function, join, site) in rows.iter().take(12) {
-                println!(
-                    "{:<8} {:<20} {:<30} {:>7} {:>7}  {}",
-                    if *convertible { "ready" } else { "blocked" },
-                    function,
-                    join,
-                    site.splits,
-                    site.uniform,
-                    why.get(&(function.clone(), join.clone()))
-                        .map_or("-", |s| s.as_str())
-                );
-            }
-        }
-
         // A `create` accessor that never creates is a read wearing a mutation's
         // clothes, and it is the mutation that blocks if-conversion.
         println!();
@@ -1761,160 +1518,14 @@ fn parse_tas(path: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
-/// Re-emit a recipe file with `entries`' current contents, keeping comments,
-/// blank lines and the untouched entries' exact original text.
-///
-/// The recipe is documentation as much as data - a third of the file is
-/// comments explaining why a group of entries exists - so a rewrite that
-/// dropped them, or that reflowed all 905 lines through serde, would make the
-/// migration's diff unreadable and unreviewable. Only lines whose entry
-/// actually changed are re-serialized.
-fn recipe_text_with_header(path: &str, recipe: &Recipe) -> Result<String> {
-    let original = std::fs::read_to_string(path)?;
-    let mut out = String::new();
-    let mut next = 0usize;
-    for line in original.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") {
-            out.push_str(line);
-            out.push('\n');
-            continue;
-        }
-        let entry = recipe
-            .entries
-            .get(next)
-            .ok_or_else(|| anyhow!("recipe has more lines than parsed entries"))?;
-        let before: celeste_rust::rewrite::recipe::RewriteEntry = serde_json::from_str(trimmed)?;
-        if before.id != entry.id {
-            return Err(anyhow!(
-                "recipe line/entry mismatch: file has {:?} where entry {} is {:?}",
-                before.id,
-                next,
-                entry.id
-            ));
-        }
-        let re_emitted = serde_json::to_string(entry)?;
-        if re_emitted == serde_json::to_string(&before)? {
-            out.push_str(trimmed);
-        } else {
-            out.push_str(&re_emitted);
-        }
-        out.push('\n');
-        next += 1;
-    }
-    if next != recipe.entries.len() {
-        return Err(anyhow!(
-            "recipe has {} entries but the file only had {} entry lines",
-            recipe.entries.len(),
-            next
-        ));
-    }
-    Ok(out)
-}
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let recipe = Recipe::load(&cli.recipe)?;
 
     match cli.command {
-        Command::Build => {
-            let (program, reports) = build(&recipe)?;
-            if reports.is_empty() {
-                println!("recipe is empty; program is as compiled");
-            }
-            for r in &reports {
-                println!(
-                    "{:<10} {:<14} {:>5} change(s)   {:>6} -> {:<6} instrs   {:>4} -> {:<4} blocks",
-                    r.id,
-                    r.rule,
-                    r.changes,
-                    r.instructions_before,
-                    r.instructions_after,
-                    r.blocks_before,
-                    r.blocks_after
-                );
-            }
-            println!();
-            let named: usize = program
-                .functions
-                .values()
-                .map(|f| f.cfg.names.iter().count())
-                .sum();
-            println!("stable names bound to rewrite-created locals: {}", named);
-            println!(
-                "final: {} functions, {} blocks, {} instructions",
-                program.functions.len(),
-                program.block_count(),
-                program.instruction_count()
-            );
-
-            // Replaying the recipe is the prefix of every command in this tool,
-            // so it decides how fast the project is to work on. Print the split
-            // so that it stays visible instead of quietly growing.
-            let mut total = celeste_rust::rewrite::recipe::StepTiming::default();
-            for r in &reports {
-                total.add(&r.timing);
-            }
-            println!(
-                "replay: {:.1}s total - clone {:.1}s, apply {:.1}s, validate {:.1}s, verify {:.1}s",
-                total.total().as_secs_f64(),
-                total.clone.as_secs_f64(),
-                total.apply.as_secs_f64(),
-                total.validate.as_secs_f64(),
-                total.verify.as_secs_f64(),
-            );
-        }
-
-        Command::Print { r#fn } => {
-            let (program, _) = build(&recipe)?;
-            match r#fn {
-                Some(name) => print!("{}", format_function(program.get(&name)?)),
-                None => print!("{}", format_program(&program)),
-            }
-        }
-
-        Command::Diff { id, r#fn } => {
-            let index = recipe
-                .entries
-                .iter()
-                .position(|e| e.id == id)
-                .ok_or_else(|| anyhow!("no recipe entry with id {:?}", id))?;
-
-            let mut program = Program::compile_from_disk()?;
-            for entry in &recipe.entries[..index] {
-                apply_entry(&mut program, entry)?;
-            }
-            let before = render(&program, &r#fn)?;
-            let report = apply_entry(&mut program, &recipe.entries[index])?;
-            let after = render(&program, &r#fn)?;
-
-            println!(
-                "# {} ({}) - {} change(s)",
-                report.id, report.rule, report.changes
-            );
-            print!("{}", unified_diff(&before, &after));
-        }
-
-        Command::Check => {
-            let (program, _) = build(&recipe)?;
-            let errors = validate_program(&program);
-            if errors.is_empty() {
-                println!(
-                    "ok: {} functions, {} blocks, {} instructions",
-                    program.functions.len(),
-                    program.block_count(),
-                    program.instruction_count()
-                );
-            } else {
-                for e in errors.iter().take(40) {
-                    println!("{}", e);
-                }
-                return Err(anyhow!("{} structural error(s)", errors.len()));
-            }
-        }
-
         Command::Verify { frames, variant_of } => {
-            let (candidate, _) = build(&recipe)?;
+            let candidate = celeste_rust::rewrite::frozen::rewritten(&cli.recipe)?;
             let host = resolve_variant_host(&variant_of)?;
             let start = std::time::Instant::now();
             let divergence = match host.as_ref() {
@@ -1970,7 +1581,7 @@ fn main() -> Result<()> {
             use celeste_rust::interpreter::state::State;
             use celeste_rust::rewrite::verify::observe_frame;
 
-            let (member, _) = build(&recipe)?;
+            let member = celeste_rust::rewrite::frozen::rewritten(&cli.recipe)?;
             // The member's state layout differs from canonical (promote_capture
             // etc.); cross-feeding states goes through the same mapping the
             // campaign's dispatch/deopt uses.
@@ -2100,602 +1711,8 @@ fn main() -> Result<()> {
             println!("ok");
         }
 
-        Command::Suggest { what, prefix } => {
-            // Suggestions are made against the program as the recipe leaves it,
-            // so running suggest / append / build repeatedly converges.
-            let (program, _) = build(&recipe)?;
-            let mut n = 0;
-            match what.as_str() {
-                "promote-cell" => {
-                    let mut total_loads = 0;
-                    for (name, fun) in &program.functions {
-                        for (cell, loads) in
-                            celeste_rust::rewrite::rules::promote_cell::candidates(fun)
-                        {
-                            println!(
-                                "{}",
-                                serde_json::json!({
-                                    "id": format!("{}{:03}", prefix, n),
-                                    "rule": "promote_cell",
-                                    "fn": name.as_str(),
-                                    "cell": format!("%{}", usize::from(cell)),
-                                })
-                            );
-                            n += 1;
-                            total_loads += loads;
-                        }
-                    }
-                    eprintln!(
-                        "# {} promotable cell(s), {} load(s) they would remove",
-                        n, total_loads
-                    );
-                }
-                "inline" => {
-                    for (name, fun) in &program.functions {
-                        for (at, callee, captures) in
-                            celeste_rust::rewrite::rules::inline::candidates(&program, fun)
-                        {
-                            let captures: Vec<String> = captures
-                                .iter()
-                                .map(|c| format!("%{}", usize::from(*c)))
-                                .collect();
-                            let mut entry = serde_json::json!({
-                                "id": format!("{}{:03}", prefix, n),
-                                "rule": "inline",
-                                "fn": name.as_str(),
-                                "at": format!("%{}", usize::from(at)),
-                                "callee": callee,
-                            });
-                            if !captures.is_empty() {
-                                entry["captures"] = serde_json::json!(captures);
-                            }
-                            println!("{}", entry);
-                            n += 1;
-                        }
-                    }
-                    eprintln!("# {} inlinable call site(s)", n);
-                }
-                "if-convert" => {
-                    for (name, fun) in &program.functions {
-                        for join in
-                            celeste_rust::rewrite::rules::if_convert::candidates(fun)
-                        {
-                            println!(
-                                "{}",
-                                serde_json::json!({
-                                    "id": format!("{}{:03}", prefix, n),
-                                    "rule": "if_convert",
-                                    "fn": name.as_str(),
-                                    "join": join.as_str(),
-                                })
-                            );
-                            n += 1;
-                        }
-                    }
-                    // What is blocking the rest matters as much as what is
-                    // convertible: it says which earlier stage to work on.
-                    let mut blocked = 0;
-                    let mut by_kind: std::collections::BTreeMap<String, usize> =
-                        Default::default();
-                    for (_, fun) in &program.functions {
-                        for (_, reasons) in
-                            celeste_rust::rewrite::rules::if_convert::blockers(fun)
-                        {
-                            blocked += 1;
-                            for reason in reasons {
-                                // `create` accessors are kept separate: they are
-                                // blocked because they *mutate*, which a
-                                // different rule has to discharge than a plain
-                                // read that might fault.
-                                let mut kind = reason
-                                    .split_whitespace()
-                                    .next()
-                                    .unwrap_or("?")
-                                    .to_string();
-                                if reason.ends_with(" create") {
-                                    kind.push_str(" create");
-                                }
-                                *by_kind.entry(kind).or_default() += 1;
-                            }
-                        }
-                    }
-                    // Per-triangle blocker *sets*, not per-instruction counts.
-                    // A triangle is unblocked only when its last blocker goes,
-                    // so the counts above say what work exists while this says
-                    // what would actually pay: 46 `create` accessors were
-                    // demoted and not one triangle came free, because each
-                    // still had the `store` that followed it.
-                    let mut by_set: std::collections::BTreeMap<String, usize> =
-                        Default::default();
-                    for (_, fun) in &program.functions {
-                        for (_, reasons) in
-                            celeste_rust::rewrite::rules::if_convert::blockers(fun)
-                        {
-                            let mut kinds: Vec<String> = reasons
-                                .iter()
-                                .map(|r| {
-                                    let mut k = r
-                                        .split_whitespace()
-                                        .next()
-                                        .unwrap_or("?")
-                                        .to_string();
-                                    if r.ends_with(" create") {
-                                        k.push_str(" create");
-                                    }
-                                    k
-                                })
-                                .collect();
-                            kinds.sort();
-                            kinds.dedup();
-                            *by_set.entry(kinds.join(" + ")).or_default() += 1;
-                        }
-                    }
-                    eprintln!("#");
-                    eprintln!("# blocked triangles by the *set* of things in the way:");
-                    let mut sets: Vec<_> = by_set.into_iter().collect();
-                    sets.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
-                    for (set, count) in sets {
-                        eprintln!("#   {:>6}  {}", count, set);
-                    }
-                    eprintln!("# {} if-convertible join(s)", n);
-                    eprintln!(
-                        "# {} more triangle(s) blocked by unspeculatable arms:",
-                        blocked
-                    );
-                    let mut kinds: Vec<_> = by_kind.into_iter().collect();
-                    kinds.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
-                    for (kind, count) in kinds {
-                        eprintln!("#   {:>6}  {}", count, kind);
-                    }
-                }
-                "pin-builtin" => {
-                    let candidates =
-                        celeste_rust::rewrite::rules::pin_builtin::candidates(&program);
-                    for (i, (function, at, name)) in candidates.iter().enumerate() {
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "id": format!("{}{:03}", prefix, i),
-                                "rule": "pin_builtin",
-                                "fn": function,
-                                "at": format!("%{}", usize::from(*at)),
-                                "name": name,
-                            })
-                        );
-                    }
-                    eprintln!(
-                        "# {} call(s) to a pure builtin blocking an if_convert triangle.",
-                        candidates.len()
-                    );
-                }
-                "demote-create" => {
-                    let candidates =
-                        celeste_rust::rewrite::rules::demote_create::candidates(&program);
-                    for (i, (function, at)) in candidates.iter().enumerate() {
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "id": format!("{}{:03}", prefix, i),
-                                "rule": "demote_create",
-                                "fn": function,
-                                "at": format!("%{}", usize::from(*at)),
-                            })
-                        );
-                    }
-                    eprintln!(
-                        "# {} creating accessor(s) blocking an if_convert triangle.",
-                        candidates.len()
-                    );
-                    eprintln!(
-                        "# Each is a claim about the run, not a theorem. Screen at the depth \
-                         the result will be used at:"
-                    );
-                    eprintln!("#   the field creations that do happen fall in 2 frames out of 34.");
-                }
-                "convert-ternary" => {
-                    let candidates =
-                        celeste_rust::rewrite::rules::convert_ternary::candidates(&program);
-                    for (i, (function, join)) in candidates.iter().enumerate() {
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "id": format!("{}{:03}", prefix, i),
-                                "rule": "convert_ternary",
-                                "fn": function,
-                                "join": join.as_str(),
-                            })
-                        );
-                    }
-                    eprintln!(
-                        "# {} and/or pair(s) whose and-arm value is statically truthy.",
-                        candidates.len()
-                    );
-                    eprintln!(
-                        "# Apply only where the pair actually splits - see bench --profile."
-                    );
-                }
-                "decompose-truthy" => {
-                    let candidates =
-                        celeste_rust::rewrite::rules::decompose_truthy::candidates(&program);
-                    for (i, (function, root)) in candidates.iter().enumerate() {
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "id": format!("{}{:03}", prefix, i),
-                                "rule": "decompose_truthy",
-                                "fn": function,
-                                "root": format!("%{}", usize::from(*root)),
-                            })
-                        );
-                    }
-                    eprintln!(
-                        "# {} always-truthy and/or cascade(s), mixed selects and all.",
-                        candidates.len()
-                    );
-                    eprintln!(
-                        "# Free on select-only chains; phi chains pay off once the \
-                         triangle is if-converted."
-                    );
-                }
-                "speculate" => {
-                    let candidates =
-                        celeste_rust::rewrite::rules::speculate::candidates(&program);
-                    for (i, (function, join, arm)) in candidates.iter().enumerate() {
-                        let mut entry = serde_json::json!({
-                            "id": format!("{}{:03}", prefix, i),
-                            "rule": "speculate",
-                            "fn": function,
-                            "join": join.as_str(),
-                        });
-                        if let Some(arm) = arm {
-                            entry["arm"] = serde_json::json!(arm.as_str());
-                        }
-                        println!("{}", entry);
-                    }
-                    eprintln!(
-                        "# {} arm(s) blocked by nothing but stores, hoists commuting; \
-                         entries with \"arm\" are diamond arms.",
-                        candidates.len()
-                    );
-                    eprintln!(
-                        "# Triangles: follow with sink_store per store, then if_convert. \
-                         Diamonds: absorb_stores once both arms are bare."
-                    );
-                }
-                "speculate-region" => {
-                    let candidates =
-                        celeste_rust::rewrite::rules::speculate_region::candidates(&program);
-                    for (i, (function, head, arm)) in candidates.iter().enumerate() {
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "id": format!("{}{:03}", prefix, i),
-                                "rule": "speculate_region",
-                                "fn": function,
-                                "head": head.as_str(),
-                                "arm": arm.as_str(),
-                            })
-                        );
-                    }
-                    eprintln!(
-                        "# {} branch(es) skipping a pure single-entry single-exit region.",
-                        candidates.len()
-                    );
-                    eprintln!(
-                        "# Convert splitting heads only - an eager region that never \
-                         split is pure cost."
-                    );
-                }
-                "absorb-stores" => {
-                    let candidates =
-                        celeste_rust::rewrite::rules::absorb_stores::candidates(&program);
-                    for (i, (function, head)) in candidates.iter().enumerate() {
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "id": format!("{}{:03}", prefix, i),
-                                "rule": "absorb_stores",
-                                "fn": function,
-                                "head": head.as_str(),
-                            })
-                        );
-                    }
-                    eprintln!(
-                        "# {} head(s) whose arms are bare stores.",
-                        candidates.len()
-                    );
-                }
-                "sink-store" => {
-                    let candidates =
-                        celeste_rust::rewrite::rules::sink_store::candidates(&program);
-                    for (i, (function, at)) in candidates.iter().enumerate() {
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "id": format!("{}{:03}", prefix, i),
-                                "rule": "sink_store",
-                                "fn": function,
-                                "at": format!("%{}", usize::from(*at)),
-                            })
-                        );
-                    }
-                    eprintln!(
-                        "# {} trailing store(s) of a triangle arm, target defined outside it.",
-                        candidates.len()
-                    );
-                    eprintln!(
-                        "# Each plants an assert_value_cell: a cell that ever holds a \
-                         closure or table fails loudly. Screen at full depth."
-                    );
-                }
-                "expand-bool" => {
-                    let candidates =
-                        celeste_rust::rewrite::rules::expand_bool::candidates(&program);
-                    for (i, (function, head)) in candidates.iter().enumerate() {
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "id": format!("{}{:03}", prefix, i),
-                                "rule": "expand_bool",
-                                "fn": function,
-                                "head": head.as_str(),
-                            })
-                        );
-                    }
-                    eprintln!(
-                        "# {} bool-concretization diamond(s) - branch on an unknown \
-                         bool, arms storing constants back.",
-                        candidates.len()
-                    );
-                    eprintln!(
-                        "# Each becomes lane expansion. Convert together with masking \
-                         its consumers; expansion alone just moves the split. Screen \
-                         at full depth."
-                    );
-                }
-                "convert-assert" => {
-                    let candidates =
-                        celeste_rust::rewrite::rules::convert_assert::candidates(&program);
-                    for (i, (function, head)) in candidates.iter().enumerate() {
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "id": format!("{}{:03}", prefix, i),
-                                "rule": "convert_assert",
-                                "fn": function,
-                                "head": head.as_str(),
-                            })
-                        );
-                    }
-                    eprintln!(
-                        "# {} inlined `__assert` failure diamond(s) - uniform \
-                         never-taken branches into print + error.",
-                        candidates.len()
-                    );
-                    eprintln!(
-                        "# Each becomes a straight-line `assert_true`. Safe to apply \
-                         everywhere; screen at full depth anyway."
-                    );
-                }
-                "collapse-loop" => {
-                    let candidates =
-                        celeste_rust::rewrite::rules::collapse_loop::candidates(&program);
-                    for (i, (function, head)) in candidates.iter().enumerate() {
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "id": format!("{}{:03}", prefix, i),
-                                "rule": "collapse_loop",
-                                "fn": function,
-                                "head": head.as_str(),
-                            })
-                        );
-                    }
-                    eprintln!(
-                        "# {} counted loop(s) whose shape allows the singleton \
-                         collapse.",
-                        candidates.len()
-                    );
-                    eprintln!(
-                        "# Each claims `bound == init` at runtime - only sound for \
-                         loops over `objects` while the room holds one object. Check \
-                         the bound's provenance before applying; screen at full depth."
-                    );
-                }
-                "collapse-all-loop" => {
-                    let candidates =
-                        celeste_rust::rewrite::rules::collapse_all_loop::candidates(&program);
-                    for (i, (function, head)) in candidates.iter().enumerate() {
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "id": format!("{}{:03}", prefix, i),
-                                "rule": "collapse_all_loop",
-                                "fn": function,
-                                "head": head.as_str(),
-                            })
-                        );
-                    }
-                    eprintln!(
-                        "# {} all()-iterator sentinel loop(s) - advance diamond + nil check \
-                         through cells. Sound for singleton tables; every premise is a \
-                         runtime assert. Screen at full depth.",
-                        candidates.len()
-                    );
-                }
-                "collapse-break-loop" => {
-                    let candidates =
-                        celeste_rust::rewrite::rules::collapse_break_loop::candidates(&program);
-                    for (i, (function, head)) in candidates.iter().enumerate() {
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "id": format!("{}{:03}", prefix, i),
-                                "rule": "collapse_break_loop",
-                                "fn": function,
-                                "head": head.as_str(),
-                            })
-                        );
-                    }
-                    eprintln!(
-                        "# {} sentinel loop(s) with an in-body `#tbl < i` break - \
-                         the inlined foreach/del shape.",
-                        candidates.len()
-                    );
-                    eprintln!(
-                        "# Each claims the break fires on iteration 2 - the singleton \
-                         table premise again. Apply only where the loop executes \
-                         (measure_k --blocks); screen at full depth."
-                    );
-                }
-                "unroll-loop" => {
-                    let candidates =
-                        celeste_rust::rewrite::rules::unroll_loop::candidates(&program);
-                    for (i, (function, head, trip_count)) in candidates.iter().enumerate() {
-                        eprintln!("# {} runs {} time(s)", head.as_str(), trip_count);
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "id": format!("{}{:03}", prefix, i),
-                                "rule": "unroll_loop",
-                                "fn": function,
-                                "head": head.as_str(),
-                            })
-                        );
-                    }
-                    eprintln!(
-                        "# {} counted loop(s) with a statically known trip count.",
-                        candidates.len()
-                    );
-                    eprintln!(
-                        "# Semantically neutral (the trip count is simulated, not \
-                         assumed), but each multiplies its body's instruction count; \
-                         apply only where the loop is hot and follow with \
-                         merge_blocks + cse forward + dce."
-                    );
-                }
-                "promote-capture" => {
-                    let mut total_sites = 0;
-                    for (function, index, sites) in
-                        celeste_rust::rewrite::rules::promote_capture::candidates(&program)
-                    {
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "id": format!("{}{:03}", prefix, n),
-                                "rule": "promote_capture",
-                                "fn": function,
-                                "index": index,
-                            })
-                        );
-                        n += 1;
-                        total_sites += sites;
-                    }
-                    eprintln!(
-                        "# {} promotable capture(s) over {} creation site(s)",
-                        n, total_sites
-                    );
-                }
-                other => return Err(anyhow!("unknown suggestion kind {:?}", other)),
-            }
-        }
-
-        Command::Slots { min } => {
-            let (program, _) = build(&recipe)?;
-            let mut reports: Vec<_> = program
-                .functions
-                .values()
-                .map(celeste_rust::rewrite::liveness::slot_report)
-                .filter(|r| r.env_slots_now >= min)
-                .collect();
-            reports.sort_by_key(|r| std::cmp::Reverse(r.env_slots_now));
-            println!(
-                "{:<34} {:>10} {:>10} {:>8}  {}",
-                "function", "slots now", "if packed", "defs", "saving"
-            );
-            let mut total_now = 0;
-            let mut total_packed = 0;
-            for r in &reports {
-                total_now += r.env_slots_now;
-                total_packed += r.env_slots_packed;
-                println!(
-                    "{:<34} {:>10} {:>10} {:>8}  {:.1}x",
-                    r.name,
-                    r.env_slots_now,
-                    r.env_slots_packed,
-                    r.definitions,
-                    r.env_slots_now as f64 / r.env_slots_packed.max(1) as f64
-                );
-            }
-            println!();
-            println!(
-                "total over shown functions: {} -> {} ({:.1}x)",
-                total_now,
-                total_packed,
-                total_now as f64 / total_packed.max(1) as f64
-            );
-        }
-
-        Command::Screen { candidates, frames, variant_of } => {
-            let (program, _) = build(&recipe)?;
-            let host = resolve_variant_host(&variant_of)?;
-            let trace = match host.as_ref() {
-                None => {
-                    let baseline = Program::compile_executable_from_disk()?;
-                    celeste_rust::rewrite::verify::observation_trace(&baseline, frames)?
-                }
-                // The host's own trace, not the plain program's: see
-                // `differential_variant_against_trace`.
-                Some(host) => {
-                    celeste_rust::rewrite::verify::observation_trace(&host.program, frames)?
-                }
-            };
-
-            let text = std::fs::read_to_string(&candidates)?;
-            let candidates = Recipe::parse(&text)?;
-            let total = candidates.entries.len();
-            // The variant's canonical mapping comes from the recipe, and only
-            // `promote_capture` contributes to it. A candidate carrying one
-            // would make the mapping depend on which trial accepted it, so
-            // refuse rather than screen against a mapping that is wrong for
-            // half the runs.
-            if host.is_some() {
-                if let Some(bad) = candidates
-                    .entries
-                    .iter()
-                    .find(|e| matches!(e.rule, celeste_rust::rewrite::recipe::Rule::PromoteCapture { .. }))
-                {
-                    return Err(anyhow!(
-                        "{}: promote_capture changes the cross-frame representation, so it \
-                         cannot be screened as a variant candidate; put it in the host recipe",
-                        bad.id
-                    ));
-                }
-            }
-            let variant_mapping =
-                celeste_rust::rewrite::state_mapping::StateMapping::from_recipe(&recipe);
-            let (accepted, runs) = screen_group(
-                &program,
-                &candidates.entries,
-                &trace,
-                frames,
-                host.as_ref(),
-                &variant_mapping,
-            );
-            for entry in &accepted {
-                println!("{}", serde_json::to_string(entry)?);
-            }
-            eprintln!(
-                "# kept {} of {} candidate(s), screened over {} frames in {} run(s)",
-                accepted.len(),
-                total,
-                frames,
-                runs
-            );
-        }
-
         Command::Observe { frames } => {
-            let (program, _) = build(&recipe)?;
+            let program = celeste_rust::rewrite::frozen::rewritten(&cli.recipe)?;
             let trace = celeste_rust::rewrite::verify::observation_trace(&program, frames)?;
             println!("{:>6} {:>8} {:>20}", "frame", "states", "digest");
             for (frame, observation) in trace.iter().enumerate() {
@@ -2711,91 +1728,11 @@ fn main() -> Result<()> {
             }
         }
 
-        Command::Classdead { frames } => {
-            let (program, _) = build(&recipe)?;
-            // Measure per-instruction time on the partitioned program.
-            celeste_rust::instr_time::reset();
-            celeste_rust::instr_time::enable();
-            let mut run = celeste_rust::rewrite::verify::AbstractRun::start(&program)?;
-            for _ in 1..=frames {
-                run.step()?;
-            }
-            let rows = celeste_rust::instr_time::report();
-            let total_us: f64 = rows.iter().map(|(_, _, d, _)| d.as_micros() as f64).sum();
-
-            let analysis = celeste_rust::rewrite::class_dead::analyze(&program);
-            let fwd_class = celeste_rust::rewrite::class_dead::analyze_forwarding(&program, false);
-            let fwd_buttons = celeste_rust::rewrite::class_dead::analyze_forwarding(&program, true);
-            let mut determined_us = 0.0f64;
-            let mut at_risk_us = 0.0f64;
-            let mut at_risk_count = 0usize;
-            let mut determined_count = 0usize;
-            for (function, id, duration, _) in &rows {
-                let Some(fun) = analysis.get(function) else { continue };
-                let local = celeste_rust::ir::LocalId::from(*id);
-                if fun.determined.contains(&local) {
-                    determined_us += duration.as_micros() as f64;
-                    determined_count += 1;
-                } else if fun.at_risk.contains(&local) {
-                    at_risk_us += duration.as_micros() as f64;
-                    at_risk_count += 1;
-                }
-            }
-            println!(
-                "class-dead analysis over {} frames ({:.2}s measured instruction time), partition cells {:?}:",
-                frames,
-                total_us / 1e6,
-                program.merge_partition_cells,
-            );
-            println!(
-                "  class-determined: {} instructions, {:.2}s ({:.1}%) - scalar per state today;                  zero under per-class folding",
-                determined_count,
-                determined_us / 1e6,
-                100.0 * determined_us / total_us.max(1.0),
-            );
-            println!(
-                "  at-risk (exclusive select-arm chains): {} instructions, {:.2}s ({:.1}%) -                  one arm's share dies per class under specialization",
-                at_risk_count,
-                at_risk_us / 1e6,
-                100.0 * at_risk_us / total_us.max(1.0),
-            );
-            for (label, fwd) in [
-                ("cell-forwarding, class only", &fwd_class),
-                ("cell-forwarding + buttons (per input-combo variants)", &fwd_buttons),
-            ] {
-                let mut det_us = 0.0f64;
-                let mut det_n = 0usize;
-                let mut risk_us = 0.0f64;
-                let mut risk_n = 0usize;
-                for (function, id, duration, _) in &rows {
-                    let Some(fun) = fwd.per_function.get(function) else { continue };
-                    let local = celeste_rust::ir::LocalId::from(*id);
-                    if fun.determined.contains(&local) {
-                        det_us += duration.as_micros() as f64;
-                        det_n += 1;
-                    } else if fun.at_risk.contains(&local) {
-                        risk_us += duration.as_micros() as f64;
-                        risk_n += 1;
-                    }
-                }
-                println!(
-                    "  [{}] determined: {} instrs, {:.2}s ({:.1}%); at-risk: {} instrs, {:.2}s ({:.1}%); determined cells: {}",
-                    label,
-                    det_n,
-                    det_us / 1e6,
-                    100.0 * det_us / total_us.max(1.0),
-                    risk_n,
-                    risk_us / 1e6,
-                    100.0 * risk_us / total_us.max(1.0),
-                    fwd.determined_cells.len(),
-                );
-            }
-        }
         Command::Widencheck { frames } => {
             use celeste_rust::interpreter::abstraction::apply_conservative_widenings;
             use celeste_rust::interpreter::vectorize::vectorize_states;
             use celeste_rust::rewrite::verify::{observe_frame, AbstractRun};
-            let (program, _) = build(&recipe)?;
+            let program = celeste_rust::rewrite::frozen::rewritten(&cli.recipe)?;
             let mut widened = AbstractRun::start(&program)?;
             let mut exact = AbstractRun::start_rem_only(&program)?;
             for frame in 1..=frames {
@@ -2867,7 +1804,7 @@ fn main() -> Result<()> {
                 );
             }
 
-            let (program, _) = build(&recipe)?;
+            let program = celeste_rust::rewrite::frozen::rewritten(&cli.recipe)?;
             let plain = Program::compile_executable_from_disk()?;
             let mapping = StateMapping::from_recipe(&recipe);
 
@@ -2980,7 +1917,7 @@ fn main() -> Result<()> {
             use celeste_rust::rewrite::state_mapping::StateMapping;
             use celeste_rust::rewrite::verify::{observe_frame, AbstractRun};
             let plain = Program::compile_executable_from_disk()?;
-            let (program, _) = build(&recipe)?;
+            let program = celeste_rust::rewrite::frozen::rewritten(&cli.recipe)?;
             let mapping = StateMapping::from_recipe(&recipe);
             println!(
                 "canonical-state mapping: {} (function, capture) pair(s)",
@@ -3112,174 +2049,6 @@ fn main() -> Result<()> {
             field_census::run(states, frame, &sets, out.as_ref().map(std::path::Path::new))?;
         }
 
-        Command::Names {} => {
-            let (program, _) = build(&recipe)?;
-            let mut rows: Vec<String> = Vec::new();
-            for (global, fun) in program.functions.iter() {
-                for (id, name) in fun.cfg.names.iter() {
-                    rows.push(format!(
-                        "{}\t{}\t%{}",
-                        global.as_str(),
-                        name,
-                        usize::from(id)
-                    ));
-                }
-            }
-            rows.sort();
-            for row in rows {
-                println!("{}", row);
-            }
-        }
-
-        Command::DeriveOverlay {
-            source,
-            tail_from,
-            tail_until,
-            strip_prefix,
-            add_prefix,
-            insert_before,
-            out,
-        } => {
-            let id_line = |id: &str| format!("\"{}\"", id);
-            let src = std::fs::read_to_string(&source)?;
-            let src_lines: Vec<&str> = src.lines().collect();
-            let from = src_lines
-                .iter()
-                .position(|l| l.contains(&id_line(&tail_from)))
-                .ok_or_else(|| anyhow::anyhow!("{} not in {}", tail_from, source))?;
-            let until = src_lines
-                .iter()
-                .position(|l| l.contains(&id_line(&tail_until)))
-                .ok_or_else(|| anyhow::anyhow!("{} not in {}", tail_until, source))?;
-            let tail: Vec<String> = src_lines[from..until]
-                .iter()
-                .map(|l| l.replace(&format!("\"{}", strip_prefix), &format!("\"{}", add_prefix)))
-                .collect();
-
-            let base = std::fs::read_to_string(&cli.recipe)?;
-            let base_lines: Vec<&str> = base.lines().collect();
-            let at = base_lines
-                .iter()
-                .position(|l| l.contains(&id_line(&insert_before)))
-                .ok_or_else(|| anyhow::anyhow!("{} not in {}", insert_before, cli.recipe))?;
-            // The tolerance boundary: the last real entry before the insertion.
-            let marker = base_lines[..at]
-                .iter()
-                .rev()
-                .find_map(|l| {
-                    serde_json::from_str::<serde_json::Value>(l)
-                        .ok()
-                        .and_then(|v| v.get("id").and_then(|i| i.as_str().map(String::from)))
-                })
-                .ok_or_else(|| anyhow::anyhow!("no entry before {}", insert_before))?;
-
-            let merged: Vec<String> = base_lines[..at]
-                .iter()
-                .map(|s| s.to_string())
-                .chain(tail.iter().cloned())
-                .chain(base_lines[at..].iter().map(|s| s.to_string()))
-                .collect();
-            std::fs::write(&out, merged.join("\n") + "\n")?;
-
-            eprintln!("==> tolerant replay ({} tail entries)", until - from);
-            let derived = Recipe::load(&out)?;
-            let (_, dropped) =
-                celeste_rust::rewrite::recipe::build_tolerant(&derived, &marker)?;
-            if !dropped.is_empty() {
-                let drop_ids: std::collections::HashSet<&str> =
-                    dropped.iter().map(|(id, _)| id.as_str()).collect();
-                let pruned: Vec<String> = merged
-                    .iter()
-                    .filter(|l| !drop_ids.iter().any(|id| l.contains(&id_line(id))))
-                    .cloned()
-                    .collect();
-                std::fs::write(&out, pruned.join("\n") + "\n")?;
-                eprintln!("==> confirmation replay");
-                let confirmed = Recipe::load(&out)?;
-                let (_, still) =
-                    celeste_rust::rewrite::recipe::build_tolerant(&confirmed, &marker)?;
-                anyhow::ensure!(
-                    still.is_empty(),
-                    "pruned recipe still drops entries: {:?}",
-                    still.iter().map(|(id, _)| id).collect::<Vec<_>>()
-                );
-            }
-            println!("derived {} ({} entries transplanted, {} dropped)", out, until - from, dropped.len());
-            for (id, why) in &dropped {
-                println!("dropped {}: {}", id, why.lines().next().unwrap_or(""));
-            }
-            if !dropped.is_empty() {
-                println!(
-                    "\nThe dropped entries are the native-head residue: re-derive them \
-                     against this overlay's CFG (probe the emitter, print the program, \
-                     find the same sites under their new labels)."
-                );
-            }
-        }
-
-        Command::Labels { base } => {
-            let program = if base {
-                celeste_rust::rewrite::program::Program::compile_from_disk()?
-            } else {
-                build(&recipe)?.0
-            };
-            for (function, position, label) in
-                celeste_rust::rewrite::isocheck::label_positions(&program)
-            {
-                println!("{}\t{}\t{}", function, position, label);
-            }
-        }
-
-        Command::MigrateNames { write } => {
-            let mut recipe = recipe;
-            let report = celeste_rust::rewrite::recipe::migrate_to_names(&mut recipe)?;
-            println!(
-                "{} cell(s) re-addressed to stable names, {} left as %N (source \
-                 locals, already stable), {} already named",
-                report.migrated, report.source, report.already
-            );
-            if write {
-                std::fs::write(&cli.recipe, recipe_text_with_header(&cli.recipe, &recipe)?)?;
-                println!("wrote {}", cli.recipe);
-            } else {
-                println!("(dry run - pass --write to apply)");
-            }
-        }
-
-        Command::Isocheck { save, dir } => {
-            use celeste_rust::rewrite::isocheck;
-            let (program, _) = build(&recipe)?;
-            let dir = std::path::PathBuf::from(dir);
-            // Blocks the canonical walk could not reach have no
-            // reverse-postorder position, so the gate's insensitivity to
-            // label NAMING does not cover them. Say so rather than let the
-            // check quietly mean less than it claims.
-            let orphans = isocheck::unreachable_blocks(&program);
-            if orphans > 0 {
-                println!(
-                    "WARNING: {} unreachable block(s); their canonical names fall \
-                     back to label order, so a renaming WOULD show up as a diff",
-                    orphans
-                );
-            }
-            if save {
-                isocheck::save_baseline(&program, &dir)?;
-                println!(
-                    "baseline written to {} (digest {})",
-                    dir.display(),
-                    isocheck::canonical(&program).digest()
-                );
-            } else {
-                let lines = isocheck::check_against_baseline(&program, &dir)?;
-                println!(
-                    "isocheck OK: {} lines identical up to a renaming of locals \
-                     AND block labels, and slot-identical (digest {})",
-                    lines,
-                    isocheck::canonical(&program).digest()
-                );
-            }
-        }
-
         Command::Bench {
             frames,
             baseline,
@@ -3299,7 +2068,7 @@ fn main() -> Result<()> {
             if baseline {
                 bench("original", &Program::compile_executable_from_disk()?, frames, profile, None, None, None, vec![], None, false)?;
             }
-            let (program, _) = build(&recipe)?;
+            let program = celeste_rust::rewrite::frozen::rewritten(&cli.recipe)?;
             let deopt_setup = if deopt {
                 Some((
                     Program::compile_executable_from_disk()?,
@@ -3826,7 +2595,7 @@ fn main() -> Result<()> {
             let fingerprint =
                 celeste_rust::rewrite::checkpoint::config_fingerprint(&recipe_text);
             let plain = Program::compile_executable_from_disk()?;
-            let (program, _) = build(&recipe)?;
+            let program = celeste_rust::rewrite::frozen::rewritten(&cli.recipe)?;
             let mapping = StateMapping::from_recipe(&recipe);
             let build = |p: &Program| build_variants(&variants, p);
             let result = sweep_time::backward_sweep_time(
@@ -3888,7 +2657,7 @@ fn main() -> Result<()> {
             let fingerprint =
                 celeste_rust::rewrite::checkpoint::config_fingerprint(&recipe_text);
             let plain = Program::compile_executable_from_disk()?;
-            let (program, _) = build(&recipe)?;
+            let program = celeste_rust::rewrite::frozen::rewritten(&cli.recipe)?;
             let mapping = StateMapping::from_recipe(&recipe);
             let build = |p: &Program| build_variants(&variants, p);
             sweep_time::prepare_pos_graph(
@@ -4115,210 +2884,12 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::Bisect { frames } => {
-            let baseline = Program::compile_executable_from_disk()?;
-            let mut program = Program::compile_from_disk()?;
-            for entry in &recipe.entries {
-                apply_entry(&mut program, entry)?;
-                print!("after {:<10} ... ", entry.id);
-                use std::io::Write;
-                std::io::stdout().flush().ok();
-                match differential_abstract(&baseline, &program, frames)? {
-                    None => println!("ok"),
-                    Some(d) => {
-                        println!("DIVERGED at frame {}", d.frame);
-                        println!("  {}", d.detail);
-                        return Err(anyhow!("first bad entry: {}", entry.id));
-                    }
-                }
-            }
-            println!("all {} entries verify", recipe.entries.len());
-        }
     }
 
     Ok(())
 }
 
-/// One screening trial: apply `entries` to a copy of `base` and check the
-/// result against the baseline observation trace.
-///
-/// A candidate may not merely diverge - it may panic. Speculating an arm runs it
-/// on lanes that would have skipped it, and the interpreter's arithmetic asserts
-/// on values it should never have seen (`Pico8Num::rem` on a negative number,
-/// say). That is the loud failure the design accepts, but it must not take the
-/// screener down with it: the trial program is discarded either way, so
-/// unwinding across it is safe.
-///
-/// In variant mode `variant_mapping` is the VARIANT recipe's canonical
-/// mapping, not `host.mapping` - a dispatched frame needs both, base ->
-/// canonical with the host's and canonical -> variant with this one.
-fn screen_trial(
-    base: &Program,
-    entries: &[celeste_rust::rewrite::recipe::RewriteEntry],
-    trace: &[std::collections::BTreeSet<celeste_rust::rewrite::verify::StateObservation>],
-    frames: u32,
-    host: Option<&VariantHost>,
-    variant_mapping: &celeste_rust::rewrite::state_mapping::StateMapping,
-) -> std::result::Result<Program, String> {
-    let mut trial = base.clone();
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        for entry in entries {
-            apply_entry(&mut trial, entry)?;
-        }
-        match host {
-            None => {
-                celeste_rust::rewrite::verify::differential_against_trace(trace, &trial, frames)
-            }
-            Some(host) => {
-                let variant = make_variant(
-                    &trial,
-                    variant_mapping.clone(),
-                    host.shapes.clone(),
-                    host.pm1.clone(),
-                    host.label.clone(),
-                    &host.program,
-                )?;
-                celeste_rust::rewrite::verify::differential_variant_against_trace(
-                    trace,
-                    &host.program,
-                    host.mapping.clone(),
-                    variant,
-                    frames,
-                )
-            }
-        }
-    }));
-    match outcome {
-        Ok(Ok(None)) => Ok(trial),
-        Ok(Ok(Some(d))) => Err(format!("frame {}: {}", d.frame, first_line(&d.detail))),
-        // `{}` on an anyhow error shows only the outermost context, which for a
-        // rule failure is just "verifying b000 (pin_builtin)" - true, and no
-        // help at all. The root cause is the interesting line.
-        Ok(Err(e)) => Err(first_line(
-            &e.chain().last().map_or_else(|| e.to_string(), |c| c.to_string()),
-        )),
-        Err(_) => Err("panicked - see the message above".to_string()),
-    }
-}
 
-/// Screen candidates by group testing rather than one at a time.
-///
-/// A screening run costs a full differential execution - about 14 seconds at 34
-/// frames - and candidate sets are usually almost all good. Trying them one at a
-/// time therefore spends N runs to learn something that one run would usually
-/// settle: 38 `if_convert` candidates took 9 minutes to accept all 38, and 48
-/// `demote_create` candidates would have taken 11 minutes to reject 2.
-///
-/// So try the whole group at once. If it passes, every entry in it is accepted
-/// together. If it fails, split it in half and try each half on top of what has
-/// been accepted so far, recursively, until a failing group is a single entry -
-/// which is then the one to drop. That is `bisect` applied to a set rather than
-/// to a recipe, and it costs roughly `k * log(N/k)` runs for `k` bad entries out
-/// of `N`, against `N` for the sequential version. All good is one run.
-///
-/// Two properties are worth being explicit about, because this is a *trusted*
-/// check and a faster trusted check is only worth having if it is still trusted:
-///
-/// * **The accepted set is always one that has actually been run.** Every
-///   acceptance runs the differential on the cumulative program, not on the
-///   group in isolation, so the program returned here is exactly the one the
-///   last passing run verified. No separate confirmation pass is needed.
-/// * **Interaction between candidates is handled the same way as before.** Two
-///   entries that conflict - structurally, or by diverging only together - make
-///   their group fail, and the split then tries the second on top of the first,
-///   which is precisely what the sequential version did.
-fn screen_group(
-    base: &Program,
-    entries: &[celeste_rust::rewrite::recipe::RewriteEntry],
-    trace: &[std::collections::BTreeSet<celeste_rust::rewrite::verify::StateObservation>],
-    frames: u32,
-    host: Option<&VariantHost>,
-    variant_mapping: &celeste_rust::rewrite::state_mapping::StateMapping,
-) -> (Vec<celeste_rust::rewrite::recipe::RewriteEntry>, usize) {
-    let mut program = base.clone();
-    let mut accepted = Vec::new();
-    let mut runs = 0;
-    // Groups still to try, in recipe order. `push_front` keeps a split group's
-    // halves ahead of everything queued behind it.
-    let mut queue: std::collections::VecDeque<Vec<_>> = std::collections::VecDeque::new();
-    if !entries.is_empty() {
-        queue.push_back(entries.to_vec());
-    }
-    while let Some(group) = queue.pop_front() {
-        runs += 1;
-        let ids = |g: &[celeste_rust::rewrite::recipe::RewriteEntry]| match g {
-            [one] => one.id.clone(),
-            _ => format!("{}..{} ({})", g[0].id, g[g.len() - 1].id, g.len()),
-        };
-        match screen_trial(&program, &group, trace, frames, host, variant_mapping) {
-            Ok(next) => {
-                eprintln!("run {:>3}  keep {}", runs, ids(&group));
-                program = next;
-                accepted.extend(group);
-            }
-            Err(why) if group.len() == 1 => {
-                eprintln!("run {:>3}  DROP {} - {}", runs, group[0].id, why);
-            }
-            Err(why) => {
-                eprintln!("run {:>3}  split {} - {}", runs, ids(&group), why);
-                let second = group[group.len() / 2..].to_vec();
-                let first = group[..group.len() / 2].to_vec();
-                queue.push_front(second);
-                queue.push_front(first);
-            }
-        }
-    }
-    (accepted, runs)
-}
 
-fn first_line(s: &str) -> String {
-    s.lines().next().unwrap_or("").chars().take(140).collect()
-}
 
-fn render(program: &Program, only: &Option<String>) -> Result<String> {
-    Ok(match only {
-        Some(name) => format_function(program.get(name)?),
-        None => format_program(program),
-    })
-}
 
-/// Minimal unified-ish diff. Good enough for eyeballing what a rewrite did;
-/// pipe through a real differ if you want more.
-fn unified_diff(before: &str, after: &str) -> String {
-    let a: Vec<&str> = before.lines().collect();
-    let b: Vec<&str> = after.lines().collect();
-
-    // Longest common subsequence over lines. CFG dumps are small.
-    let mut lcs = vec![vec![0usize; b.len() + 1]; a.len() + 1];
-    for i in (0..a.len()).rev() {
-        for j in (0..b.len()).rev() {
-            lcs[i][j] = if a[i] == b[j] {
-                lcs[i + 1][j + 1] + 1
-            } else {
-                lcs[i + 1][j].max(lcs[i][j + 1])
-            };
-        }
-    }
-
-    let mut out = String::new();
-    let (mut i, mut j) = (0, 0);
-    while i < a.len() && j < b.len() {
-        if a[i] == b[j] {
-            i += 1;
-            j += 1;
-        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
-            out.push_str(&format!("-{}\n", a[i]));
-            i += 1;
-        } else {
-            out.push_str(&format!("+{}\n", b[j]));
-            j += 1;
-        }
-    }
-    for line in &a[i..] {
-        out.push_str(&format!("-{}\n", line));
-    }
-    for line in &b[j..] {
-        out.push_str(&format!("+{}\n", line));
-    }
-    out
-}
