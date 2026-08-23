@@ -455,12 +455,52 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
              /// that the kernel is willing to keep. A lane in `deopt` is\n\
              /// dropped here and belongs to the interpreter - the caller\n\
              /// has `kv.deopt` and must account for it.\n\
-             pub fn append{i}(acc: &mut Rt2, sh: &KShared{i}, kv: &KOut{i}, n: usize) {{\n\
+             /// SKIPS a row whose values another configuration already\n\
+             /// wrote. The key is over the non-constant cells only - the\n\
+             /// rest are one value for the whole accumulator and cannot\n\
+             /// tell two rows apart - so it is a handful of mixes rather\n\
+             /// than a hundred, computed from values already in\n\
+             /// registers. A duplicate caught here costs nothing; one\n\
+             /// caught at the boundary has already been written.\n\
+             ///\n\
+             /// 128-bit like the boundary's own key, because a collision\n\
+             /// DROPS a successor rather than merely costing time.\n\
+             pub fn append{i}(\n\
+             \x20   acc: &mut Rt2, sh: &KShared{i}, kv: &KOut{i}, n: usize,\n\
+             \x20   seen: &mut RowSet,\n\
+             ) {{\n\
              \x20   let take = kv.live & !kv.deopt;\n\
              \x20   for i in 0..n {{\n\
              \x20       if take & (1 << i) == 0 {{ continue; }}",
             i = i
         )?;
+        writeln!(o, "        let mut h1: u64 = 0x9e37_79b9_7f4a_7c15;")?;
+        writeln!(o, "        let mut h2: u64 = 0xa076_1d64_78bd_642f;")?;
+        for OutField { cell, ty, tainted, konst, .. } in &out.fields {
+            if konst.is_some() {
+                continue;
+            }
+            let src = if *tainted { "kv" } else { "sh" };
+            let raw = match *ty {
+                "ZN" => format!("{s}.c{c}[i].as_raw_u32() as u64", c = cell, s = src),
+                "ZI" => format!(
+                    "(({s}.c{c}.lo[i].as_raw_u32() as u64) << 32) | ({s}.c{c}.hi[i].as_raw_u32() as u64)",
+                    c = cell, s = src
+                ),
+                "ZB" => format!(
+                    "((({s}.c{c}.val >> i) & 1) as u64) | (((({s}.c{c}.known >> i) & 1) as u64) << 1)",
+                    c = cell, s = src
+                ),
+                other => anyhow::bail!("row key over a {}", other),
+            };
+            writeln!(
+                o,
+                "        {{ let v = {raw}; h1 = mix64(h1 ^ mix64(v ^ {c}u64)); \
+                 h2 = h2.wrapping_add(mix64(v.wrapping_mul(({c}u64 << 1) | 1))); }}",
+                raw = raw, c = cell
+            )?;
+        }
+        writeln!(o, "        if !seen.insert((h1, h2)) {{ continue; }}")?;
         for OutField { cell, ty, tainted, konst, .. } in &out.fields {
             if konst.is_some() {
                 continue; // written once by `acc`, not per row
@@ -532,24 +572,14 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
     )?;
     dispatch(
         &mut o,
-        "pub fn append(i: usize, a: &mut Rt2, o: &KOuts, n: usize)",
-        "append#(a, o.sh#, o.v#, n)",
+        "pub fn append(i: usize, a: &mut Rt2, o: &KOuts, n: usize, \
+         seen: &mut RowSet)",
+        "append#(a, o.sh#, o.v#, n, seen)",
     )?;
     dispatch(&mut o, "pub fn live(i: usize, o: &KOuts) -> u16", "o.v#.live")?;
     dispatch(&mut o, "pub fn deopt(i: usize, o: &KOuts) -> u16", "o.v#.deopt")?;
     dispatch(&mut o, "pub fn bd(i: usize, o: &KOuts) -> bool", "o.v#.bd")?;
     dispatch(&mut o, "pub fn out_slots(i: usize) -> &'static [(u32, &'static str)]", "OUT_SLOTS_#")?;
-
-    writeln!(
-        o,
-        "/// Nanoseconds spent APPENDING rows, as opposed to computing\n\
-         /// them. A diagnostic: `trace::run` reads and clears it.\n\
-         pub static APPEND_NS: std::sync::atomic::AtomicU64 =\n\
-         \x20   std::sync::atomic::AtomicU64::new(0);\n\
-         pub fn take_append_ns() -> u64 {{\n\
-         \x20   APPEND_NS.swap(0, std::sync::atomic::Ordering::Relaxed)\n\
-         }}\n"
-    )?;
 
     // ONE uniform entry point per kernel, so a dispatcher can hold
     // kernels for different shapes as plain function pointers. Every
@@ -562,25 +592,25 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
     // doctrine a non-zero mask stops the run rather than falling back.
     writeln!(
         o,
-        "pub fn step(b: &Rt2, lo: usize, n: usize, accs: &mut [Rt2]) -> Option<u16> {{\n\
+        "pub fn step(\n\
+         \x20   b: &Rt2, lo: usize, n: usize, accs: &mut [Rt2], seen: &mut [RowSet],\n\
+         ) -> Option<u16> {{\n\
          \x20   let (u, s) = bind(b)?;\n\
          \x20   let rin = rows(b, &s, lo)?;\n\
          \x20   let g = G {{ cart: &b.cart, cache: &b.cache }};\n\
          \x20   let mut declined = 0u16;\n\
-         \x20   // `APPEND_NS` splits this kernel's time into COMPUTING\n\
-         \x20   // the frame and WRITING its rows. The two want opposite\n\
-         \x20   // fixes - fewer variant-fork configurations against a\n\
-         \x20   // cheaper write - and the balance moved once constant\n\
-         \x20   // columns stopped being pushed per row, so it is worth\n\
-         \x20   // measuring rather than assuming.\n\
+         \x20   // One set per OUTCOME, owned by the CALLER and reset in\n\
+         \x20   // O(1) here. Slice-local because that is where the\n\
+         \x20   // duplication is: it comes from different button/fork\n\
+         \x20   // configurations agreeing on one lane, and a lane lives\n\
+         \x20   // in one slice. Allocating them per slice instead cost\n\
+         \x20   // more than the dedup saved.\n\
+         \x20   seen.iter_mut().for_each(|s| s.next_slice());\n\
          \x20   frame(&u, &rin, &g, &mut |_mask, o| {{\n\
-         \x20       let t = std::time::Instant::now();\n\
          \x20       for i in 0..OUTCOMES {{\n\
          \x20           declined |= deopt(i, o) & live(i, o);\n\
-         \x20           append(i, &mut accs[i], o, n);\n\
+         \x20           append(i, &mut accs[i], o, n, &mut seen[i]);\n\
          \x20       }}\n\
-         \x20       APPEND_NS.fetch_add(t.elapsed().as_nanos() as u64,\n\
-         \x20           std::sync::atomic::Ordering::Relaxed);\n\
          \x20   }});\n\
          \x20   Some(declined)\n\
          }}\n"
@@ -935,7 +965,7 @@ pub fn write_room_kernels(root: &std::path::Path, dir: &std::path::Path) -> Resu
             table,
             "    Kernel {{ name: \"shape {i}\", shape: k{i}::SHAPE, \
              outcomes: k{i}::OUTCOMES, acc: k{i}::acc, step: k{i}::step, \
-             why: k{i}::bind_why, append_ns: k{i}::take_append_ns }},",
+             why: k{i}::bind_why }},",
             i = i
         )?;
     }

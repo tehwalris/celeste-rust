@@ -67,9 +67,6 @@ pub struct FrameStat {
     pub t_kernel: std::time::Duration,
     pub t_merge: std::time::Duration,
     pub t_boundary: std::time::Duration,
-    /// Of `t_kernel`, how much was spent WRITING rows rather than
-    /// computing them.
-    pub t_append: std::time::Duration,
     /// The surviving rows' keys. The row key already carries the shape
     /// hash, so this set is comparable across blocks and across engines -
     /// it is what a run is checked against.
@@ -117,7 +114,6 @@ impl Run {
         let rows_in: usize = self.blocks.iter().map(|b| b.width).sum();
 
         let mut t_kernel = std::time::Duration::ZERO;
-        let mut t_append = std::time::Duration::ZERO;
         let mut t_merge = std::time::Duration::ZERO;
         let mut t_boundary = std::time::Duration::ZERO;
         let mut produced: Vec<Rt2> = Vec::new();
@@ -132,6 +128,12 @@ impl Run {
                     b.structure.len()
                 )
             })?;
+            // One row set per outcome, made ONCE per block and reset
+            // per slice: the kernel dedups its own output, and
+            // allocating its table per slice cost more than the dedup
+            // saved (244 MB of allocation a frame).
+            let mut seen: Vec<celeste_engine::kernel::RowSet> =
+                (0..k.outcomes).map(|_| celeste_engine::kernel::RowSet::new()).collect();
             let mut accs: Vec<Rt2> =
                 (0..k.outcomes).map(|i| (k.acc)(i, self.cart.clone(), self.cache.clone())).collect();
             let mut declined = 0usize;
@@ -139,7 +141,7 @@ impl Run {
             let mut lo = 0;
             while lo < b.width {
                 let n = SLICE.min(b.width - lo);
-                let mask = (k.step)(&b, lo, n, &mut accs).ok_or_else(|| {
+                let mask = (k.step)(&b, lo, n, &mut accs, &mut seen).ok_or_else(|| {
                     anyhow::anyhow!(
                         "frame {}: {} did not bind a block of its own shape {:#x}: {}",
                         self.frame,
@@ -164,7 +166,6 @@ impl Run {
                 );
             }
             t_kernel += t0.elapsed();
-            t_append += std::time::Duration::from_nanos((k.append_ns)());
             produced.extend(accs.into_iter().filter(|a| a.width > 0));
         }
 
@@ -228,7 +229,6 @@ impl Run {
             rows_raw,
             rows_distinct,
             t_kernel,
-            t_append,
             t_merge,
             t_boundary,
             keys,

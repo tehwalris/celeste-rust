@@ -77,7 +77,6 @@ fn the_room_runs_on_kernels_alone() {
         t_phase.0 += st.t_kernel;
         t_phase.1 += st.t_merge;
         t_phase.2 += st.t_boundary;
-        t_phase.3 += st.t_append;
         let t1 = std::time::Instant::now();
         oracle.step().unwrap_or_else(|e| panic!("oracle frame {}: {:#}", frame, e));
         t_oracle += t1.elapsed();
@@ -188,8 +187,8 @@ fn the_room_runs_on_kernels_alone() {
     }
 
     eprintln!(
-        "[phase] kernel {:?} (of which append {:?}), merge {:?}, boundary {:?}",
-        t_phase.0, t_phase.3, t_phase.1, t_phase.2
+        "[phase] kernel {:?}, merge {:?}, boundary {:?}",
+        t_phase.0, t_phase.1, t_phase.2
     );
     eprintln!(
         "[time] {} frames: kernels {:?}, interpreter {:?} ({:.2}x)",

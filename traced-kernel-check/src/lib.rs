@@ -84,6 +84,13 @@ mod tests {
             .map(|i| kernel::acc(i, r.cart.clone(), r.cache.clone()))
             .collect();
         let mut from: Vec<Vec<(u8, usize)>> = vec![Vec::new(); kernel::OUTCOMES];
+        // The kernel skips a row whose values another configuration
+        // already wrote, so the harness has to track the same set or its
+        // "which (assignment, lane) produced this row" bookkeeping
+        // drifts from what was actually appended.
+        let mut seen: Vec<celeste_engine::kernel::RowSet> =
+            (0..kernel::OUTCOMES).map(|_| celeste_engine::kernel::RowSet::new()).collect();
+        seen.iter_mut().for_each(|s| s.next_slice());
         kernel::frame(&u, &rin, &g, &mut |mask, outs| {
             for i in 0..kernel::OUTCOMES {
                 // Exactly one outcome may claim a lane. A lane in none is
@@ -96,7 +103,7 @@ mod tests {
                         from[i].push((mask, lane));
                     }
                 }
-                kernel::append(i, &mut accs[i], outs, n);
+                kernel::append(i, &mut accs[i], outs, n, &mut seen[i]);
             }
             for lane in 0..n {
                 let claims = (0..kernel::OUTCOMES)

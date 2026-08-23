@@ -50,11 +50,7 @@ pub struct Kernel {
     pub acc: fn(usize, Arc<CartData>, Arc<CollisionCache>) -> Rt2,
     /// `None`: not this kernel's shape. `Some(mask)`: the lanes it
     /// declined, which the doctrine says stops the run.
-    pub step: fn(&Rt2, usize, usize, &mut [Rt2]) -> Option<u16>,
-    /// Nanoseconds this kernel has spent APPENDING rows rather than
-    /// computing them, taken and cleared. A diagnostic - see
-    /// `FrameStat::t_append`.
-    pub append_ns: fn() -> u64,
+    pub step: fn(&Rt2, usize, usize, &mut [Rt2], &mut [celeste_engine::kernel::RowSet]) -> Option<u16>,
     /// Which slot would stop `bind`, or `None` if it would bind.
     ///
     /// `step` returns an `Option` because it is the hot path. Under the

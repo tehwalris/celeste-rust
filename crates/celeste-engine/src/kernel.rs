@@ -636,3 +636,70 @@ pub fn si_sub(a: (P8, P8), b: (P8, P8)) -> (P8, P8) {
     let r = IV::new(a.0, a.1) - IV::new(b.0, b.1);
     (r.low, r.high)
 }
+
+/// A slice-local set of row keys, for a kernel deduping its own output.
+///
+/// Open-addressed, because the key IS already a 128-bit hash: a
+/// `HashSet` would hash it a second time, and std's SipHash costs far
+/// more than the handful of column pushes the dedup exists to avoid.
+/// Measured 2026-08-23: with `HashSet` the append phase went from 175 ms
+/// to 279 ms - the dedup paid for itself downstream (boundary 138 -> 24
+/// ms) and lost it all again at the door.
+///
+/// GENERATION-STAMPED rather than cleared. The set is per 16-lane slice,
+/// and a room frame has hundreds of slices; allocating or zeroing a
+/// table each time cost more than everything else put together
+/// (`RowSet::new()` per slice was ~244 MB of allocation per frame, and
+/// the append phase sat at 212 ms because of it). `next_slice` bumps a
+/// counter instead, so a stale slot is simply one whose stamp is old.
+///
+/// Sized for one slice: at most 16 lanes x 64 assignments x 2^f fork
+/// configurations, and in practice far fewer, so linear probing
+/// terminates quickly. A full table degrades to "no dedup" rather than
+/// to wrongness - `insert` reports NEW, which appends a row that would
+/// have been a duplicate, and the boundary still removes it.
+pub struct RowSet {
+    slots: Vec<(u64, u64, u32)>,
+    mask: usize,
+    gen: u32,
+}
+
+impl Default for RowSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RowSet {
+    pub fn new() -> Self {
+        RowSet { slots: vec![(0, 0, 0); 4096], mask: 4095, gen: 1 }
+    }
+
+    /// Forget everything, in O(1).
+    #[inline(always)]
+    pub fn next_slice(&mut self) {
+        self.gen = self.gen.wrapping_add(1);
+        if self.gen == 0 {
+            self.slots.iter_mut().for_each(|s| s.2 = 0);
+            self.gen = 1;
+        }
+    }
+
+    /// True if `k` was not already present in this slice.
+    #[inline(always)]
+    pub fn insert(&mut self, k: (u64, u64)) -> bool {
+        let mut i = (k.0 as usize) & self.mask;
+        for _ in 0..8 {
+            let s = self.slots[i];
+            if s.2 != self.gen {
+                self.slots[i] = (k.0, k.1, self.gen);
+                return true;
+            }
+            if s.0 == k.0 && s.1 == k.1 {
+                return false;
+            }
+            i = (i + 1) & self.mask;
+        }
+        true
+    }
+}

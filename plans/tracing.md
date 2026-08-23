@@ -29,7 +29,7 @@ variants, and the per-frame graph check (1,393,224 values).
 
 | | |
 |---|---|
-| speed vs the interpreter | **1.85x slower** (405 ms vs 219 ms, 30 frames, single-threaded) - was 2.75x before constant columns |
+| speed vs the interpreter | **1.55x slower** (356 ms vs 230 ms, 30 frames, single-threaded) - 2.75x before constant columns, 1.85x before write-time dedup |
 | row amplification | **46x**: 1.25M rows written to keep 27k |
 | ...decomposed | 1.4x static, ~2.7x per-lane, ~2.7x cross-lane, 5.9x only-the-widenings |
 | codegen | **16.3 instructions per graph node**, 48% stack traffic, 6.6% vector |
@@ -2882,7 +2882,48 @@ OUTSIDE `frame` (Vec pushes), not from better codegen inside it.
 Which puts the codegen direction back where it was two corrections ago:
 a hand emitter's advantage is HOW it spills, not spilling less.
 
-### Where the time goes - dedup IS next (corrected twice)
+### DONE: dedup at write time - 1.85x -> 1.55x, and where it fell short
+
+Implemented as agreed: the kernel keys each candidate row on its
+non-constant cells and skips one another configuration already wrote.
+`RowSet` (celeste-engine) is open-addressed and generation-stamped,
+because the key IS already a 128-bit hash and a `HashSet` would hash it
+again - std's SipHash cost more than the pushes it saved (append went
+175 -> 279 ms before that was fixed).
+
+Rows written fell **1,246,632 -> 197,612** (6.3x), and the downstream
+collapsed exactly as projected:
+
+    boundary  138 ms -> 23 ms
+    merge      11 ms ->  2 ms
+
+But the total only went 401 -> 356 ms (1.85x -> 1.55x behind), because
+the kernel phase ROSE 252 -> 329 ms. Checking 1.25M candidates costs
+about what writing the million avoided rows did.
+
+**The theory** (Philippe saw it first, asking why there is a hash table
+at all): the runtime is answering, 1.25 million times, a question the
+EMITTER can answer once. Whether two configurations produce the same row
+is static - outcome 0 has ZERO per-variant cells, so all 24 button
+assignments write a byte-identical row within a fork configuration, and
+no runtime comparison could ever say otherwise. The others differ in 2,
+4 and 16 cells.
+
+Three options, PHILIPPE'S CALL (he asked to make strategy decisions
+after a theory, so we do not go in circles):
+
+1. **Static grouping in the emitter** - group variants by their
+   tainted-cell expressions, OR the take masks, append once per group.
+   Removes most of the 1.25M candidates outright. This is what blew up
+   the build as a bolt-on; done properly it is group-DRIVEN emission,
+   which also removes the fork's runtime loop.
+2. **Cheapen the runtime check** - keep it dynamic but compare only
+   distinguishing cells, vectorised across 16 lanes instead of scalar
+   per lane.
+3. **Stop** - 1.55x on one thread, correctness intact, and go do
+   coverage, which is what actually blocks deletion.
+
+### Where the time went before the dedup (corrected twice)
 
 `FrameStat` splits the frame, and the split within the kernel is the
 part that matters:
