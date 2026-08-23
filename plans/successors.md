@@ -45,8 +45,17 @@ slice.
   distinct successor it has. A successor exists per free choice the
   search does not fix: the 6 button bits, and the <=2-way splits of the
   widened `player.rem` where `flr` is ambiguous.
-* **Postcondition.** No two appended rows are equal. "Equal" means what
-  the boundary means: same outcome, and equal values in every cell.
+* **Postcondition.** Ideally no two appended rows are equal, where
+  "equal" means what the boundary means: same outcome, equal values in
+  every cell. This is a TARGET, not a hard requirement - the boundary
+  dedups anyway, so letting a duplicate through is slow, not wrong. See
+  "when is removing a duplicate worth it" below.
+* **Self-contained.** One call sees one slice and nothing else. No
+  state carried between calls, deliberately: cross-slice duplicates are
+  B's problem, and statelessness keeps A simple while it is still slow.
+* **Scratch is fine.** A may use private scratch memory; the caller does
+  not need to know. It is handed arrays and must append to them.
+* **Row order does not matter.**
 * **May assume.** All 16 lanes have the same heap shape. Values are
   Pico-8 fixed point, booleans (tri-state), or intervals.
 * **Must not.** Drop a successor. A lane the kernel cannot handle is
@@ -137,6 +146,40 @@ body, so rows from different fork configurations are generally distinct.
   four times; `black_box` on the bound fixed that one.) Both are the
   same lesson: in a function this size, anything that reaches backwards
   across the variant sequence is expensive.
+
+## When is removing a duplicate worth it
+
+Philippe's rule: if dropping a duplicate inside the kernel saves more
+than it costs the outer system to drop it, do it in the kernel.
+
+Measured, from the runs with and without the kernel's dedup:
+
+    downstream cost of one written row   ~120 ns
+        (merge + boundary, 149 ms / 1.25M rows before dedup,
+         25 ms / 197k rows after - consistent)
+
+    kernel cost of one dedup CHECK        ~62 ns
+        (kernel phase 252 -> 329 ms over 1.25M candidates)
+
+    duplicate rate                         84%
+        (1.25M candidates -> 197k written)
+
+So the budget for a check is `120 ns x 0.84 = ~100 ns`, and the current
+check costs 62 ns. That predicts a saving of
+`1.25M x (100 - 62) ns = ~48 ms`; the observed total went 401 -> 356 ms,
+a saving of 45 ms. The model holds.
+
+Which says the current dedup is worth keeping and NOT worth tuning: even
+a free check would only buy the remaining 62 ns x 1.25M = 78 ms. The
+prize is not a cheaper check - it is not generating the duplicate
+candidates in the first place.
+
+## The bar
+
+As fast as possible. Beating the interpreter (230 ms for these 30
+frames) is the floor, not the goal - "we're very far away from as fast
+as possible, so measure and iterate". Simplicity counts too: the current
+state is complicated AND slow, which is the worst quadrant to linger in.
 
 ## The question
 
