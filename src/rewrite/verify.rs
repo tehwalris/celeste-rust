@@ -1270,10 +1270,13 @@ fn compiled_forward(program: &Program) -> Result<Option<&'static CompiledForward
 
     static ENGINE: std::sync::OnceLock<CompiledForward> = std::sync::OnceLock::new();
     if ENGINE.get().is_none() {
+        // The RECIPE is still parsed - `StateMapping::from_recipe` reads
+        // the instruction list as DATA - but it is no longer replayed:
+        // the program itself comes from the frozen artifact next to it.
         let recipe = super::recipe::Recipe::load(COMPILE_RECIPE)
             .with_context(|| format!("loading {} (run from the repo root)", COMPILE_RECIPE))?;
-        let (compile_program, _) = super::recipe::build(&recipe)
-            .with_context(|| format!("applying {}", COMPILE_RECIPE))?;
+        let compile_program = super::frozen::rewritten(COMPILE_RECIPE)
+            .with_context(|| format!("loading the frozen {}", COMPILE_RECIPE))?;
         // The pm1 partition cells are a PROCESS GLOBAL that
         // `AbstractRun::start` has already set from the campaign's program,
         // and `FrameEngine::new` is about to set from the compile one. If
@@ -2970,7 +2973,7 @@ mod tests {
             return;
         }
         let recipe = crate::rewrite::recipe::Recipe::load("rewrites.jsonl").expect("load recipe");
-        let (program, _) = crate::rewrite::recipe::build(&recipe).expect("build rewritten");
+        let program = crate::rewrite::frozen::rewritten("rewrites.jsonl").expect("frozen");
         let plain = Program::compile_from_disk().expect("compile plain");
         let mapping = crate::rewrite::state_mapping::StateMapping::from_recipe(&recipe);
         assert!(!mapping.is_identity());
@@ -2995,10 +2998,21 @@ mod tests {
             .max()
             .unwrap_or(0)
             + 1;
+        // Entry first, then the named blocks BY LABEL. `named` is an
+        // `FxHashMap`, so `values_mut()` visits it in an order that
+        // depends on how the map was BUILT - and the program is loaded
+        // from a frozen artifact now, i.e. `collect()`ed in one go
+        // rather than grown one rule at a time. That changed which three
+        // comparisons got corrupted, the new three happened to hold on
+        // every lane, and the premise never fired - while the program
+        // under test was identical. Sorting is what `blocks_in_order`
+        // does for printing, for exactly this reason.
+        let mut order: Vec<crate::ir::Label> = fun.cfg.named.keys().cloned().collect();
+        order.sort();
         let mut inserted = 0;
-        for block in std::iter::once(&mut fun.cfg.entry).chain(fun.cfg.named.values_mut()) {
+        let corrupt = |block: &mut crate::ir::Block, next_id: &mut usize, n: &mut usize| {
             let mut index = 0;
-            while index < block.instructions.len() && inserted < 3 {
+            while index < block.instructions.len() && *n < 3 {
                 if matches!(
                     block.instructions[index].1,
                     Instruction::BinaryOp {
@@ -3010,19 +3024,24 @@ mod tests {
                     block.instructions.insert(
                         index + 1,
                         (
-                            crate::ir::LocalId::from(next_id),
+                            crate::ir::LocalId::from(*next_id),
                             Instruction::AssertTrue { value: target },
                         ),
                     );
-                    next_id += 1;
-                    inserted += 1;
+                    *next_id += 1;
+                    *n += 1;
                     index += 1;
                 }
                 index += 1;
             }
+        };
+        corrupt(&mut fun.cfg.entry, &mut next_id, &mut inserted);
+        for label in &order {
             if inserted >= 3 {
                 break;
             }
+            let block = fun.cfg.named.get_mut(label).expect("label came from the map");
+            corrupt(block, &mut next_id, &mut inserted);
         }
         assert!(inserted > 0, "no comparison found to corrupt");
 
@@ -3069,8 +3088,7 @@ mod tests {
         {
             return;
         }
-        let recipe = crate::rewrite::recipe::Recipe::load("rewrites.jsonl").expect("load recipe");
-        let (program, _) = crate::rewrite::recipe::build(&recipe).expect("build rewritten");
+        let program = crate::rewrite::frozen::rewritten("rewrites.jsonl").expect("frozen");
 
         let frames = 30;
         let mut baseline = AbstractRun::start(&program).expect("start baseline");
@@ -3118,7 +3136,7 @@ mod tests {
         }
         let plain = Program::compile_from_disk().expect("compile plain");
         let recipe = crate::rewrite::recipe::Recipe::load("rewrites.jsonl").expect("load recipe");
-        let (rewritten, _) = crate::rewrite::recipe::build(&recipe).expect("build rewritten");
+        let rewritten = crate::rewrite::frozen::rewritten("rewrites.jsonl").expect("frozen");
         let mapping = crate::rewrite::state_mapping::StateMapping::from_recipe(&recipe);
         assert!(!mapping.is_identity());
 

@@ -71,8 +71,7 @@ fn main() -> Result<()> {
         recipes
             .iter()
             .map(|path| -> Result<(String, Program)> {
-                let recipe = celeste_rust::rewrite::recipe::Recipe::load(path)?;
-                let (program, _) = celeste_rust::rewrite::recipe::build(&recipe)
+                let program = celeste_rust::rewrite::frozen::rewritten(path)
                     .with_context(|| format!("apply {}", path))?;
                 Ok((path.clone(), program))
             })
@@ -100,8 +99,7 @@ fn main() -> Result<()> {
         // overlay recipes (rewrites-compile.jsonl) live here, never in the
         // runner.
         Some(path) => {
-            let recipe = celeste_rust::rewrite::recipe::Recipe::load(path)?;
-            let (program, _) = celeste_rust::rewrite::recipe::build(&recipe)
+            let program = celeste_rust::rewrite::frozen::rewritten(path)
                 .with_context(|| format!("apply {} (run from the repo root)", path))?;
             program
         }

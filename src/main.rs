@@ -69,8 +69,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     if args.rewritten {
-        let recipe = celeste_rust::rewrite::recipe::Recipe::load("rewrites.jsonl")?;
-        let (program, _) = celeste_rust::rewrite::recipe::build(&recipe)?;
+        let program = celeste_rust::rewrite::frozen::rewritten("rewrites.jsonl")?;
         let mut run = celeste_rust::rewrite::verify::AbstractRun::start(&program)?;
         for frame in 1..=args.frames {
             let t = std::time::Instant::now();

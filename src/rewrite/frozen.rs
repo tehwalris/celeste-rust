@@ -99,3 +99,13 @@ pub fn load(recipe: &Path) -> Result<Program> {
 pub fn exists(recipe: &Path) -> bool {
     artifact_path(recipe).exists()
 }
+
+/// The rewritten program for a recipe, read from the frozen artifact.
+///
+/// This is what every caller that used to say
+/// `recipe::build(&Recipe::load(p)?)?` says instead. The recipe file
+/// itself is no longer read - it stays checked in as the provenance of
+/// the artifact next to it, not as an input.
+pub fn rewritten(recipe: &str) -> Result<Program> {
+    load(Path::new(recipe))
+}

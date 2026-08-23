@@ -41,11 +41,14 @@ const COMPILE_RECIPE: &str = "rewrites-compile.jsonl";
 fn engine() -> &'static FrameEngine {
     static ENGINE: std::sync::OnceLock<FrameEngine> = std::sync::OnceLock::new();
     ENGINE.get_or_init(|| {
+        // The RECIPE is still parsed - `StateMapping::from_recipe` below
+        // reads the instruction list as DATA - but it is not replayed:
+        // the program comes from the frozen artifact next to it.
         let recipe = celeste_rust::rewrite::recipe::Recipe::load(COMPILE_RECIPE).unwrap_or_else(
             |e| panic!("loading {} (run from the repo root): {}", COMPILE_RECIPE, e),
         );
-        let (program, _) = celeste_rust::rewrite::recipe::build(&recipe)
-            .unwrap_or_else(|e| panic!("applying {}: {}", COMPILE_RECIPE, e));
+        let program = celeste_rust::rewrite::frozen::rewritten(COMPILE_RECIPE)
+            .unwrap_or_else(|e| panic!("loading the frozen {}: {}", COMPILE_RECIPE, e));
         let (cart, cache) = world();
         let mut engine = FrameEngine::new(&program, cart.clone(), cache.clone());
         // The plain-program path for kernel deopt sub-chunks (dying
@@ -861,9 +864,8 @@ fn run_interp_bench(dir: &str, frame: u32, reps: u32) {
     use celeste_rust::interpreter::state::State;
     use std::time::Instant;
 
-    let recipe = celeste_rust::rewrite::recipe::Recipe::load("rewrites.jsonl")
-        .expect("loading rewrites.jsonl (run from the repo root)");
-    let (program, _) = celeste_rust::rewrite::recipe::build(&recipe).expect("building the recipe");
+    let program =
+        celeste_rust::rewrite::frozen::rewritten("rewrites.jsonl").expect("the frozen program");
     celeste_rust::interpreter::vectorize::set_merge_partition_patterns(
         &program.merge_partition_cells,
     );
@@ -1509,9 +1511,8 @@ fn run_frame_diff(dir: &str, frame: u32, outdir: &str) {
     use std::fmt::Write as _;
 
     // Interpreter side: the CAMPAIGN program, exactly as run_interp_bench.
-    let recipe = celeste_rust::rewrite::recipe::Recipe::load("rewrites.jsonl")
-        .expect("loading rewrites.jsonl (run from the repo root)");
-    let (program, _) = celeste_rust::rewrite::recipe::build(&recipe).expect("building the recipe");
+    let program =
+        celeste_rust::rewrite::frozen::rewritten("rewrites.jsonl").expect("the frozen program");
     celeste_rust::interpreter::vectorize::set_merge_partition_patterns(
         &program.merge_partition_cells,
     );
@@ -1856,9 +1857,8 @@ fn run_key_gate(dir: &str, lo: u32, hi: u32) {
 fn run_key_gate_outputs(dir: &str, frame: u32) {
     use celeste_rust::interpreter::state::State;
 
-    let recipe = celeste_rust::rewrite::recipe::Recipe::load("rewrites.jsonl")
-        .expect("loading rewrites.jsonl (run from the repo root)");
-    let (program, _) = celeste_rust::rewrite::recipe::build(&recipe).expect("building the recipe");
+    let program =
+        celeste_rust::rewrite::frozen::rewritten("rewrites.jsonl").expect("the frozen program");
     celeste_rust::interpreter::vectorize::set_merge_partition_patterns(
         &program.merge_partition_cells,
     );

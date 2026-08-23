@@ -40,10 +40,8 @@ fn the_room_runs_on_kernels_alone() {
     // Collecting one side first and comparing afterwards checks nothing
     // at all when the fast side stops early, which is exactly the case
     // this is for.
-    let recipe = celeste_rust::rewrite::recipe::Recipe::load("rewrites.jsonl")
-        .expect("load the recipe");
-    let (program, _) =
-        celeste_rust::rewrite::recipe::build(&recipe).expect("build the rewritten program");
+    let program = celeste_rust::rewrite::frozen::rewritten("rewrites.jsonl")
+        .expect("the frozen rewritten program");
     let engine = celeste_rust::compiled::FrameEngine::new_for_start_room(&program)
         .expect("build the reference engine");
     let mut oracle =

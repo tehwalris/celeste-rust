@@ -102,10 +102,11 @@ fn main() -> Result<()> {
         // native builtins pinned).
         program.pin_native_builtins()?;
     } else {
-        let recipe = celeste_rust::rewrite::recipe::Recipe::load(&cli.recipe)?;
-        for entry in &recipe.entries {
-            celeste_rust::rewrite::recipe::apply_entry(&mut program, entry)?;
-        }
+        // From the FROZEN artifact, not by replaying the recipe. Only the
+        // two live recipes have one (`plans/deletion.md`); a recipe that
+        // was never frozen fails here with the path it looked for, which
+        // is the honest answer now that the rules are going.
+        program = celeste_rust::rewrite::frozen::rewritten(&cli.recipe)?;
     }
     let fixed_env = program.fixed_env();
     // `Program`'s frame chunk already ends with `__reset_button_states()`, so

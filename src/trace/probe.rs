@@ -229,8 +229,7 @@ mod capture_probe {
         if !std::path::Path::new("rewrites.jsonl").exists() {
             return;
         }
-        let recipe = crate::rewrite::recipe::Recipe::load("rewrites.jsonl").expect("recipe");
-        let (program, _) = crate::rewrite::recipe::build(&recipe).expect("build");
+        let program = crate::rewrite::frozen::rewritten("rewrites.jsonl").expect("frozen");
         let engine =
             crate::compiled::FrameEngine::new_for_start_room(&program).expect("engine");
         let mut run = crate::rewrite::verify::AbstractRun::start(&program).expect("start");
@@ -366,8 +365,7 @@ mod encoding {
         if !std::path::Path::new("rewrites.jsonl").exists() {
             return;
         }
-        let recipe = crate::rewrite::recipe::Recipe::load("rewrites.jsonl").expect("recipe");
-        let (program, _) = crate::rewrite::recipe::build(&recipe).expect("build");
+        let program = crate::rewrite::frozen::rewritten("rewrites.jsonl").expect("frozen");
         let engine =
             crate::compiled::FrameEngine::new_for_start_room(&program).expect("engine");
         let run = crate::rewrite::verify::AbstractRun::start(&program).expect("start");

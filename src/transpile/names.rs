@@ -397,17 +397,16 @@ mod tests {
     /// the row keys.
     ///
     /// IGNORED BY DEFAULT (~44 s): it regenerates and compares. Still a
-    /// GATE - `cargo nextest run --release --run-ignored all`, which is
-    /// CLAUDE.md's pre-commit command.
+    /// GATE, and it runs on EVERY commit now. It used to cost ~44 s
+    /// because it replayed ~1000 rewrite instructions to rebuild the
+    /// program; the program is frozen data now, so it costs ~40 ms and
+    /// there is no reason to hide it behind `--ignored`.
     #[test]
-    #[ignore = "~44 s regen; run with --run-ignored all (the pre-commit gate does)"]
     fn generated_is_current() {
         let regen = |recipe: &str| {
-            let r = crate::rewrite::recipe::Recipe::load(recipe)
+            let program = crate::rewrite::frozen::rewritten(recipe)
                 .unwrap_or_else(|e| panic!("load {} (run from the repo root): {}", recipe, e));
-            crate::rewrite::recipe::build(&r)
-                .unwrap_or_else(|e| panic!("apply {}: {}", recipe, e))
-                .0
+            program
         };
         let check = |path: &str, fresh: String| {
             let on_disk = std::fs::read_to_string(path)
@@ -449,18 +448,16 @@ mod tests {
     /// (the mandated runner) each test owns its process, so setting the
     /// env var first pins THIS process to the (2,0) compile.
     ///
-    /// IGNORED BY DEFAULT (~70 s), same as `generated_is_current`: run
-    /// `cargo nextest run --release --run-ignored all`.
+    /// Runs on every commit, same as `generated_is_current`, and for the
+    /// same reason: the (2,0) program is frozen data, so this is ~50 ms
+    /// rather than the ~70 s it cost when it replayed the recipe.
     #[test]
-    #[ignore = "~70 s regen; run with --run-ignored all (the pre-commit gate does)"]
     fn generated_is_current_r20() {
         std::env::set_var("CELESTE_START_ROOM", "2,0");
         let regen = |recipe: &str| {
-            let r = crate::rewrite::recipe::Recipe::load(recipe)
+            let program = crate::rewrite::frozen::rewritten(recipe)
                 .unwrap_or_else(|e| panic!("load {} (run from the repo root): {}", recipe, e));
-            crate::rewrite::recipe::build(&r)
-                .unwrap_or_else(|e| panic!("apply {}: {}", recipe, e))
-                .0
+            program
         };
         let check = |path: &str, fresh: String| {
             let on_disk = std::fs::read_to_string(path)
