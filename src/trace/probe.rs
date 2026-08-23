@@ -204,3 +204,85 @@ mod tests {
         eprintln!("[probe] golden files match real PICO-8");
     }
 }
+
+#[cfg(test)]
+mod capture_probe {
+    /// Does the interpreter's row key ever distinguish two rows by a
+    /// CLOSURE CAPTURE?
+    ///
+    /// It can: `import_block` gives every closure its captured values as
+    /// columns, and the boundary hashes them into the row key. The
+    /// tracer models none of that - `structure_of` writes
+    /// `Cell2::Clo(0, [])` - so if a capture ever varies, the two
+    /// engines dedup differently and no amount of agreeing on game state
+    /// would make their row keys match.
+    ///
+    /// The cart's captures are `init_object`'s `obj`, `type`, `x` and
+    /// `y`, and the last two are spawn coordinates, so the expectation is
+    /// that nothing varies. That is a claim about a program, which is
+    /// what a measurement is for.
+    #[test]
+    #[ignore]
+    fn do_closure_captures_ever_vary() {
+        use celeste_engine::runtime2::{Cell2, Col};
+
+        if !std::path::Path::new("rewrites.jsonl").exists() {
+            return;
+        }
+        let recipe = crate::rewrite::recipe::Recipe::load("rewrites.jsonl").expect("recipe");
+        let (program, _) = crate::rewrite::recipe::build(&recipe).expect("build");
+        let engine =
+            crate::compiled::FrameEngine::new_for_start_room(&program).expect("engine");
+        let mut run = crate::rewrite::verify::AbstractRun::start(&program).expect("start");
+
+        let mut varying = 0usize;
+        let mut distinct: std::collections::BTreeSet<String> = Default::default();
+        let mut closures = 0usize;
+        for frame in 1..=30 {
+            run.step().unwrap_or_else(|e| panic!("frame {}: {:#}", frame, e));
+            for s in run.states() {
+                if s.vector_size == 0 {
+                    continue;
+                }
+                let mut b = crate::compiled::bridge::import_block(
+                    s,
+                    engine.cart(),
+                    engine.cache(),
+                );
+                b.boundary(engine.ids());
+                for cell in &b.structure {
+                    let Cell2::Clo(f, caps) = cell else { continue };
+                    closures += 1;
+                    for (i, c) in caps.iter().enumerate() {
+                        let vals: Vec<_> = (0..b.width).map(|l| c.at(l)).collect();
+                        if vals.windows(2).any(|w| w[0] != w[1]) {
+                            varying += 1;
+                        }
+                        // Uniform within a block is not the whole story:
+                        // two blocks whose captures differ are two rows
+                        // to the interpreter and one to the tracer.
+                        distinct.insert(format!("{}:{}:{:?}", f, i, vals[0]));
+                        let _ = matches!(c, Col::U(_));
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "[captures] {} closure cells over 30 frames; {} capture columns vary WITHIN a block; \
+             {} distinct (fn, slot, value) triples",
+            closures, varying, distinct.len()
+        );
+        let mut by_slot: std::collections::BTreeMap<String, usize> = Default::default();
+        for d in &distinct {
+            let mut it = d.splitn(3, ':');
+            let k = format!("{}:{}", it.next().unwrap(), it.next().unwrap());
+            *by_slot.entry(k).or_default() += 1;
+        }
+        for (k, n) in by_slot.iter().filter(|(_, n)| **n > 1) {
+            eprintln!("[captures] (fn, slot) {} takes {} distinct values", k, n);
+        }
+        for d in &distinct {
+            eprintln!("[captures] triple {}", d);
+        }
+    }
+}
