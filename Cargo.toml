@@ -64,6 +64,10 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 fused = ["celeste-kernels/fused"]
 
 [[bin]]
+name = "freeze"
+path = "src/bin/freeze.rs"
+
+[[bin]]
 name = "concrete_run"
 path = "src/bin/concrete_run.rs"
 

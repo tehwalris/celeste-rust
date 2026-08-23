@@ -28,6 +28,7 @@
 
 pub mod checkpoint;
 pub mod class_dead;
+pub mod frozen;
 pub mod liveness;
 pub mod pos_graph;
 pub mod isocheck;

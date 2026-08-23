@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use super::program::Program;
 use super::rules::{
-    absorb_stores, add_hint, allocate_slots, assume_eq, collapse_break_loop, collapse_loop,
+    absorb_stores, allocate_slots, assume_eq, collapse_break_loop, collapse_loop,
     collapse_all_loop, kill_dead,
     convert_assert, convert_ternary,
     cse, dce, decompose_branch, dedup_guards,
@@ -26,7 +26,7 @@ use super::rules::{
     mask_loop, merge_blocks,
     pin_builtin, split_at,
     promote_capture,
-    promote_cell, sink_store, speculate, speculate_region, split_call, unroll_loop, partition_merge, remove_hint, widen_buttons, widen_rem,
+    promote_cell, sink_store, speculate, speculate_region, split_call, unroll_loop, partition_merge,
 };
 use crate::ir::LocalId;
 use super::validate::{validate_function, validate_program};
@@ -502,52 +502,9 @@ pub enum Rule {
     /// dominated copy can never be the first to fire. `assert_value_cell`
     /// reads a heap cell and is excluded.
     DedupGuards,
-    /// Mark a block as an early normalize point: states arriving there are
-    /// accumulated, vectorized by shape, and row-deduped before execution
-    /// continues - the same merge the frame boundary performs, scheduled
-    /// earlier. Reduces fragments, not lanes; see the rule's docs.
-    AddHint {
-        #[serde(rename = "fn")]
-        function: String,
-        /// The block to flag.
-        block: String,
-    },
     /// Designate the merge-partition cells (field-path patterns).
     #[serde(rename = "partition_merge")]
     PartitionMerge { cells: Vec<String> },
-    /// Unmark a block as an early normalize point (inverse of `add_hint`).
-    #[serde(rename = "remove_hint")]
-    RemoveHint {
-        #[serde(rename = "fn")]
-        function: String,
-        /// The block to unflag.
-        block: String,
-    },
-    /// Insert the in-place equivalent of `__reset_button_states()` at the
-    /// head of a block: store a fresh unknown boolean into each of the six
-    /// `__button_states` cells. Sound only if every `btn` read of the frame
-    /// precedes the block - claimed, not proven; a violated claim diverges
-    /// from the original program and the differential screen catches it.
-    WidenButtons {
-        #[serde(rename = "fn")]
-        function: String,
-        /// The block whose head widens the cells.
-        block: String,
-    },
-    /// Insert `make_state_abstract`'s rem widening at the head of a block:
-    /// `player.rem.x/.y` each pass through the `__widen_rem` builtin (assert
-    /// containment in [-0.5, 0.5), return the whole interval) and store
-    /// back. Sound only where rem is dead (inside the update body - `move`
-    /// runs before `type.update` and is rem's only reader). Claimed, not
-    /// proven; screened.
-    WidenRem {
-        #[serde(rename = "fn")]
-        function: String,
-        /// The block whose head widens rem.
-        block: String,
-        /// The player instance (the update body's `this`), as `%N`.
-        object: String,
-    },
 }
 
 impl Rule {
@@ -587,11 +544,7 @@ impl Rule {
             Rule::CollapseAllLoop { .. } => "collapse_all_loop",
             Rule::UnrollLoop { .. } => "unroll_loop",
             Rule::DedupGuards => "dedup_guards",
-            Rule::AddHint { .. } => "add_hint",
-            Rule::RemoveHint { .. } => "remove_hint",
             Rule::PartitionMerge { .. } => "partition_merge",
-            Rule::WidenButtons { .. } => "widen_buttons",
-            Rule::WidenRem { .. } => "widen_rem",
             Rule::AssumeEq { .. } => "assume_eq",
             Rule::SplitCall { .. } => "split_call",
         }
@@ -623,7 +576,6 @@ impl Rule {
             Rule::DecomposeTruthy { function, root } => (function, vec![root]),
             Rule::PromoteCell { function, cell } => (function, vec![cell]),
             Rule::DropDeadCell { function, cell } => (function, vec![cell]),
-            Rule::WidenRem { function, object, .. } => (function, vec![object]),
             Rule::AssumeEq { function, a, b } => (function, vec![a, b]),
             Rule::SplitCall { function, at, on, .. } => (function, vec![at, on]),
             Rule::Speculate { function, guards, .. } => {
@@ -932,13 +884,7 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
             unroll_loop::apply(program, function, head, *trip, exits, *invert)
         }
         Rule::DedupGuards => dedup_guards::apply(program),
-        Rule::AddHint { function, block } => add_hint::apply(program, function, block),
-        Rule::RemoveHint { function, block } => remove_hint::apply(program, function, block),
         Rule::PartitionMerge { cells } => partition_merge::apply(program, cells),
-        Rule::WidenButtons { function, block } => widen_buttons::apply(program, function, block),
-        Rule::WidenRem { function, block, object } => {
-            widen_rem::apply(program, function, block, resolve_cell(&names, function, object)?)
-        }
         Rule::AssumeEq { function, a, b } => {
             assume_eq::apply(program, function, resolve_cell(&names, function, a)?, resolve_cell(&names, function, b)?)
         }
@@ -1092,17 +1038,7 @@ pub fn apply_entry(program: &mut Program, entry: &RewriteEntry) -> Result<StepRe
             unroll_loop::verify(&before, program, function, head, *trip, exits, *invert)
         }
         Rule::DedupGuards => dedup_guards::verify(&before, program),
-        Rule::AddHint { function, block } => add_hint::verify(&before, program, function, block),
-        Rule::RemoveHint { function, block } => {
-            remove_hint::verify(&before, program, function, block)
-        }
         Rule::PartitionMerge { cells } => partition_merge::verify(&before, program, cells),
-        Rule::WidenButtons { function, block } => {
-            widen_buttons::verify(&before, program, function, block)
-        }
-        Rule::WidenRem { function, block, object } => {
-            widen_rem::verify(&before, program, function, block, resolve_cell(&names, function, object)?)
-        }
         Rule::AssumeEq { function, a, b } => {
             assume_eq::verify(&before, program, function, resolve_cell(&names, function, a)?, resolve_cell(&names, function, b)?)
         }

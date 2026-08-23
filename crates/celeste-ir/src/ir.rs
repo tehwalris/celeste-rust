@@ -94,7 +94,7 @@ impl From<String> for GlobalId {
 
 pub type GlobalIdGenerator = UniqueStringGenerator<GlobalId>;
 
-#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug)]
+#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug, Serialize, Deserialize)]
 pub struct Label(String);
 
 impl Label {
@@ -111,14 +111,14 @@ impl From<String> for Label {
 
 pub type LabelGenerator = UniqueStringGenerator<Label>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UnaryOp {
     Minus,
     Not,
     Hash,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BinaryOp {
     Caret,
     GreaterThan,
@@ -135,7 +135,7 @@ pub enum BinaryOp {
     TwoEqual,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Instruction {
     Alloc,
     GetGlobal {
@@ -556,7 +556,7 @@ impl Instruction {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Terminator {
     Return {
         value: Option<LocalId>,
@@ -629,7 +629,7 @@ impl Terminator {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Block {
     pub instructions: Vec<(LocalId, Instruction)>,
     pub terminator: (LocalId, Terminator),
@@ -698,7 +698,7 @@ pub fn new_label_map() -> FxHashMap<Label, Block> {
 /// it cost `max LocalId + 1` slots, and every `filter_by_mask` clones it. After
 /// inlining, `player.update_21` reached 3206 ids - but never more than 18
 /// simultaneously live values. See `plans/inline.md`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotMap {
     /// Slot for each `LocalId`. Empty means the identity map, i.e. exactly the
     /// old behaviour, which is what an un-allocated CFG gets.
@@ -756,7 +756,7 @@ impl SlotMap {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Cfg {
     pub entry: Block,
     pub named: FxHashMap<Label, Block>,
@@ -857,7 +857,7 @@ impl Cfg {
 /// works around for `slots` by resetting the map before every rule. The
 /// `isocheck` gate is what actually checks the program did not change, and
 /// it is name-blind by construction.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Names {
     of_local: FxHashMap<LocalId, String>,
     by_name: FxHashMap<String, LocalId>,
@@ -928,7 +928,7 @@ impl Names {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FunDef {
     pub name: GlobalId,
     pub capture_ids: Vec<LocalId>,

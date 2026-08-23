@@ -154,3 +154,45 @@ Reachable total: **~35,000 lines**, versus ~2,900 without step 2.
   in the frozen artifact's header.
 - **Keep the program CHECKS that live in the names generator** rather
   than losing them with it.
+
+## Progress (2026-08-23)
+
+**Step 1 done: the four unused rules are gone.** `add_hint`,
+`remove_hint`, `widen_buttons`, `widen_rem` - 933 lines with their
+`Rule` variants and dispatch. Note `__widen_rem` the BUILTIN stays; it
+is in `gen.rs` and `builtins.rs` and has nothing to do with the rule.
+
+**Step 2 in progress: the freeze works.** `src/rewrite/frozen.rs` +
+`src/bin/freeze.rs`. Both live recipes build, freeze, and read back
+equal to what the rules produced (the tool refuses to report success
+otherwise):
+
+    rewrites.jsonl          -> rewrites.program.zst          77 fns, 293 KiB
+    rewrites-compile.jsonl  -> rewrites-compile.program.zst  77 fns, 284 KiB
+
+Prerequisite done: serde derives on `Label`, `UnaryOp`, `BinaryOp`,
+`Instruction`, `Terminator`, `Block`, `SlotMap`, `Names`, `Cfg`,
+`FunDef`. The artifact stores functions as an ordered `Vec` of pairs,
+not a map - `Program::functions` insertion order is what `FN_NAMES` and
+every deterministic print depend on, and a `HashMap` round-trip does not
+promise to give it back.
+
+**Only the two live recipes get frozen** (Philippe, 2026-08-23). The
+other 18 `rewrites*.jsonl` exist only to regenerate kernels that are
+themselves already checked in, so they are covered by the same argument
+that covers `gen.rs`. Consequences to be explicit about:
+
+- `regen-generated.sh` stops working once the rules are gone.
+  `crates/celeste-kernels/src/kernel_gen_*.rs` and `gen.rs` become
+  frozen artifacts in the same sense the program now is. The tracer is
+  replacing the walk kernels anyway.
+- Those 18 recipes become inert data. Left in place for now; deleting
+  checked-in data is a separate decision.
+
+**A gate that survives, unexpectedly.** I expected freezing to cost us
+`generated_is_current`. It does not: that test regenerates `gen.rs` from
+the program and compares byte-for-byte, so pointing it at the frozen
+program keeps it meaningful - it becomes "`gen.rs` is consistent with
+the frozen program" instead of "with the rules' output". What we DO lose
+is `every_checked_in_recipe_replays`, which is the rules' own test and
+goes with them.
