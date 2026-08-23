@@ -856,6 +856,36 @@ mod tests {
             in_cells,
             f.outs.iter().map(|o| o.rt2.structure.len()).collect::<Vec<_>>()
         );
+        // Does the kernel compute the WHOLE output block, or only part
+        // of it? Every VALUE cell in an outcome's structure has to get a
+        // value from somewhere. If the frame's outputs cover all of
+        // them, the block is (constant structure + computed columns) and
+        // nothing passes through from the input block.
+        for (n, o) in f.outs.iter().enumerate() {
+            use celeste_engine::runtime2::{Cell2, Col, AV};
+            let covered: std::collections::BTreeSet<u32> =
+                o.cells.iter().chain(o.ubool_cells.iter()).copied().collect();
+            let (mut ptr, mut left) = (0usize, Vec::new());
+            for (c, cell) in o.rt2.structure.iter().enumerate() {
+                if !matches!(cell, Cell2::Val) {
+                    continue;
+                }
+                if matches!(&o.rt2.cols[c], Col::U(AV::Ptr(_))) {
+                    ptr += 1;
+                } else if !covered.contains(&(c as u32)) {
+                    left.push(c as u32);
+                }
+            }
+            eprintln!(
+                "[emit] outcome {}: {} pointer cells (in the structure) + {} computed \
+                 + {} dead, leaving {} value cells with no source",
+                n,
+                ptr,
+                o.cells.len(),
+                o.ubool_cells.len(),
+                left.len()
+            );
+        }
 
         // ONE INPUT SHAPE, N OUTPUT SHAPES. Lowering each outcome on its
         // own - which is what this probe does - emits four KERNELS, and
