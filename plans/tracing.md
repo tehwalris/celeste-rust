@@ -2733,6 +2733,75 @@ are produced in different slices. That needs a table living for a FRAME,
 keyed on the ~19 varying cells rather than the ~100 live ones - still
 far cheaper than the boundary's.
 
+### Specialization is a LAYER, not a redefinition (Philippe)
+
+A kernel specific to a ladder rung is fine, "similar to what we did with
+PM1": the most generic kernel is for one input SHAPE, and rung or pm1
+specialization is an optimization on top. `trace_frame` already takes a
+`pin` and `room_kernels_in` passes none, so the machinery exists.
+
+That also shrinks the change. The dedup benefit comes from rows
+COMPARING equal after widening, not from the kernel WRITING widened
+values - so the minimal version is a rung-aware KEY over exact rows.
+Sound because widening is a function of the row: whichever
+representative survives, widening maps it to the same place. Folding the
+output widening in as well saves writing ~6 cells of 493, which is
+noise.
+
+Three levels, then:
+
+* **shape only** - today. Correct, rung-agnostic, dedups nothing.
+* **shape + rung-aware key** - writes exact rows, dedups as if widened,
+  reaches the full factor. This is where the performance is, and where a
+  mistake is SILENT: a key that erases something the boundary does not
+  erase drops real successors. Derive it from the same description the
+  boundary widens from rather than writing it twice.
+* **shape + rung + pm1** - the existing pin machinery.
+
+### The key computation dedups ITSELF (Philippe)
+
+"Most fields are identical in most of our outputs, and they're identical
+because they were computed on the same path, so their hash would be
+computed on the same path as well."
+
+Right, and the emitter already has the partition to hang it on. Split
+the per-cell mixes by what it knows:
+
+* **constant cells** - 44 of outcome 0's 52 shared fields are
+  `zn_splat` of a literal. A literal's mix is a literal: it folds at
+  GENERATION time into one constant in the key. Zero runtime cost.
+* **shared cells** - one expression across all 24 variants, so one mix
+  per lane serves all of them.
+* **tainted cells** - genuinely per-variant, one mix each.
+
+Measured tainted counts: outcome 0 has **ZERO**, then 2, 4 and 16. So
+outcome 0's whole key is constant-plus-shared, computed once per lane,
+and the dedup finds all 24 variants identical without hashing anything
+per row.
+
+Implementation note: this belongs at the EXPRESSION level in the
+emitter, not as new graph nodes. The graph IR is typed over Pico-8
+fixed-point and booleans; a 64-bit accumulator is neither. The sharing
+that matters is across variants for one cell, which the emitter already
+tracks (`KShared` vs `KOut`).
+
+### A note on the row hash, as asked
+
+Philippe: "if they're invariant to which value is in which field,
+that's not great... probably good enough for now, but worth a note."
+
+The specific worry does not apply: `cell_mix(c, v, seed)` takes the CELL
+INDEX, so swapping values between fields changes both terms.
+
+The weaker property is the COMBINER. The per-lane key is a
+`wrapping_add` sum, order-independent by design - that is what lets
+uniform cells fold once into a block partial regardless of which cells
+happen to be uniform in a given block. Sums are the collision-friendly
+combiner: `a + b = c + d` is easy to arrange deliberately and hard to
+hit by accident. At 128 bits, and with the search already staking
+correctness on it, "good enough for now" is right. What is being relied
+on is ACCIDENTAL collision resistance, not adversarial.
+
 ## What is needed before deleting `celeste-rewrite`
 
 * **`gen.rs`.** `FIELD_NAMES`, `GLOBAL_NAMES` and now `FN_NAMES` (the
