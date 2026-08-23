@@ -320,8 +320,27 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
                     let items: Vec<String> = items.iter().map(|c| c.to_string()).collect();
                     writeln!(o, "    SCell::Arr(&[{}]),", items.join(", "))?
                 }
-                Cell2::Clo(..) => writeln!(o, "    SCell::Clo,")?,
-                other => anyhow::bail!("outcome {} has a {:?} cell, which has no static form", i, other),
+                Cell2::Clo(fid, caps) => {
+                    // The captures are pointers by construction (a
+                    // capture holds the object that owns the closure),
+                    // and a shape can only carry what is fixed - so a
+                    // capture that is not a pointer has no static form
+                    // and is refused rather than dropped.
+                    let mut ts = Vec::new();
+                    for cap in caps.iter() {
+                        match cap {
+                            Col::U(AV::Ptr(t)) => ts.push(t.to_string()),
+                            other => anyhow::bail!(
+                                "outcome {} has a closure capture {:?}, which is not a pointer",
+                                i,
+                                other
+                            ),
+                        }
+                    }
+                    writeln!(o, "    SCell::Clo({}, &[{}]),", fid, ts.join(", "))?
+                }
+                Cell2::Bi(b) => writeln!(o, "    SCell::Bi({}),", b)?,
+                Cell2::Unk => writeln!(o, "    SCell::Unk,")?,
             }
         }
         writeln!(o, "];\n")?;

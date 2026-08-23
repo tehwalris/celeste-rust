@@ -281,10 +281,35 @@ impl<D: Domain> Clone for Scope<D> {
 /// A closure object: which function body, and the scope it captured.
 /// Both are immutable, so unlike a table there is nothing here to merge -
 /// it is in the heap for its IDENTITY.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Closure {
     pub body: BodyId,
     pub env: ScopeId,
+    /// This function's index in `celeste_names::gen::FN_NAMES` - the
+    /// engine's name for it, which `Cell2::Clo` carries.
+    ///
+    /// Resolved AT CREATION, where the declaration or assignment that
+    /// names the function is in hand, because nothing downstream can
+    /// recover it: a heap closure is a body id and a scope, and a body
+    /// id is a pointer into the AST.
+    ///
+    /// `None` is an anonymous function. Four exist in the cart, all
+    /// `foreach` callbacks, and none outlives the frame that makes it -
+    /// so one reaching a block is worth refusing rather than numbering.
+    pub fn_id: Option<u32>,
+    /// The names this closure CAPTURES: the free variables of its body
+    /// that resolve to a local of the defining scope.
+    ///
+    /// Names rather than values, so the state stays the single source of
+    /// what a capture holds - `Closure` is not generic over the domain
+    /// and should not become so to store one pointer.
+    ///
+    /// The engine's block carries captures as columns and hashes them
+    /// into the row key, so this exists to agree with `import_block`.
+    /// Measured over 30 frames of room (1,0): every closure captures
+    /// exactly one thing, the object that owns it, and no capture column
+    /// ever varies.
+    pub captures: Vec<String>,
 }
 
 pub struct Heap<D: Domain> {
@@ -329,9 +354,15 @@ impl<D: Domain> Heap<D> {
         id
     }
 
-    pub fn new_closure(&mut self, body: BodyId, env: ScopeId) -> ClosureId {
+    pub fn new_closure(
+        &mut self,
+        body: BodyId,
+        env: ScopeId,
+        fn_id: Option<u32>,
+        captures: Vec<String>,
+    ) -> ClosureId {
         let id = self.fresh();
-        self.closures.insert(id, Closure { body, env });
+        self.closures.insert(id, Closure { body, env, fn_id, captures });
         id
     }
 

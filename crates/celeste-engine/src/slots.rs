@@ -176,9 +176,17 @@ pub enum SCell {
     Val,
     Obj(&'static [(u32, u32)]),
     Arr(&'static [u32]),
-    /// A closure cell. Kept so the shape matches what the boundary
-    /// builds; no generated code reads through one.
-    Clo,
+    /// A closure cell: its index in `FN_NAMES`, and the cells its
+    /// captures point at. No generated code reads through one, but both
+    /// parts are hashed into the shape - so a `Clo` that forgot them
+    /// would be a different shape from the one the importer builds.
+    Clo(u32, &'static [u32]),
+    /// A builtin cell, by index into `BUILTIN_NAMES`. Stored IN PLACE at
+    /// the slot, not behind a pointer, which is what the importer does.
+    Bi(u32),
+    /// A table with no kind yet - an empty constructor, which is neither
+    /// an object nor an array until something is put in it.
+    Unk,
 }
 
 /// Build an empty block with a kernel's static output shape.
@@ -208,7 +216,12 @@ pub fn build_block(
             SCell::Val => Cell2::Val,
             SCell::Obj(fields) => Cell2::Obj(fields.to_vec()),
             SCell::Arr(items) => Cell2::Arr(items.to_vec()),
-            SCell::Clo => Cell2::Clo(0, Box::new([])),
+            SCell::Clo(f, caps) => Cell2::Clo(
+                *f,
+                caps.iter().map(|t| Col::U(AV::Ptr(*t))).collect::<Vec<_>>().into_boxed_slice(),
+            ),
+            SCell::Bi(b) => Cell2::Bi(*b),
+            SCell::Unk => Cell2::Unk,
         })
         .collect();
     rt2.cols = vec![Col::U(AV::Nil); shape.len()];

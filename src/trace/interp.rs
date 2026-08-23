@@ -84,6 +84,8 @@ pub struct Interp<'a, D: Domain> {
     /// was traced as a kernel, all of them the same 110 scalars and
     /// differing only in these numbers.
     body_ids: std::collections::HashMap<*const ast::FunctionBody, BodyId>,
+    /// See `hint_name`.
+    hint: Vec<String>,
     /// Paths poisoned by `poison`: a Lua type error means no legal run
     /// takes that path, so its lanes deopt rather than aborting the
     /// trace. Counted by reason, because turning an error into a deopt
@@ -116,6 +118,7 @@ impl<'a, D: Domain> Interp<'a, D> {
             d,
             bodies: Vec::new(),
             body_ids: std::collections::HashMap::new(),
+            hint: Vec::new(),
             illegal: Default::default(),
             cart: None,
             cache: None,
@@ -124,6 +127,141 @@ impl<'a, D: Domain> Interp<'a, D> {
             prints: Vec::new(),
             room_flags: std::collections::HashMap::new(),
         }
+    }
+
+    /// The engine's index for a function named `name`.
+    ///
+    /// `FN_NAMES` spells a function as `base_N`, where `N` is a counter
+    /// the IR frontend assigns in compile order. Reproducing that
+    /// counter here would mean reproducing the frontend's traversal and
+    /// keeping the two in step forever, so this matches on the BASE and
+    /// requires the match to be unique. It is, for all 74 named
+    /// functions; the only ambiguous base is `anonymous`, which has four
+    /// and which this refuses by construction.
+    fn fn_id_of(name: &str) -> Option<u32> {
+        let mut found = None;
+        for (i, n) in celeste_names::gen::FN_NAMES.iter().enumerate() {
+            let base = match n.rfind('_') {
+                Some(k) if n[k + 1..].chars().all(|c| c.is_ascii_digit()) => &n[..k],
+                _ => *n,
+            };
+            if base == name {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(i as u32);
+            }
+        }
+        found
+    }
+
+    /// The name a function expression is being stored under, as the IR
+    /// frontend would spell it: the enclosing assignment target, extended
+    /// by each table-constructor field on the way in. `player = { init =
+    /// function ... }` is `player.init`, which is `player.init_20`.
+    ///
+    /// A STACK rather than a parameter threaded through `eval`: the hint
+    /// is syntactic, so pushing it around the sub-evaluation is exact,
+    /// and `eval`'s signature is on every expression in the tracer.
+    fn hint_name(&self) -> Option<String> {
+        if self.hint.is_empty() {
+            return None;
+        }
+        Some(self.hint.join("."))
+    }
+
+    /// The free variables of a body that resolve to a LOCAL of the
+    /// defining scope - which is what the IR frontend captures, and what
+    /// `Cell2::Clo` carries as columns.
+    ///
+    /// Free is decided syntactically, by visiting the variable and prefix
+    /// positions only: a field name after a dot is not a variable, and
+    /// `obj.x` must not capture a local `x` that happens to be in scope.
+    /// `init_object` has exactly that shape - locals `obj`, `type`, `x`,
+    /// `y`, and a body full of `obj.x` - so a text scan would capture
+    /// three things the interpreter does not.
+    ///
+    /// Names the scope chain does not have are globals, which are not
+    /// captured. Parameters and body-locals are not in the DEFINING
+    /// scope, so the same filter removes them.
+    fn captures_of(
+        &self,
+        body: &'a ast::FunctionBody,
+        env: super::heap::ScopeId,
+        st: &State<D>,
+    ) -> Vec<String> {
+        // `Visit::visit`, not the `visit_function_body` HOOK. Calling
+        // the hook by name runs that one method and recurses into
+        // nothing, which looks like a body with no free variables at all
+        // - every closure came out with an empty capture list.
+        use full_moon::visitors::{Visit, Visitor};
+
+        #[derive(Default)]
+        struct Names {
+            order: Vec<String>,
+            seen: std::collections::HashSet<String>,
+            /// Names BOUND inside the body: its parameters, every
+            /// `local`, and every loop variable - including nested
+            /// functions', which over-subtracts. A capture missed that
+            /// way is a difference
+            /// `the_tracer_encodes_a_block_the_way_the_importer_does`
+            /// reports, which is the reason to prefer this to a
+            /// scope-accurate walk that would have to agree with the IR
+            /// frontend's by inspection.
+            bound: std::collections::HashSet<String>,
+        }
+        impl Names {
+            fn push(&mut self, n: String) {
+                if self.seen.insert(n.clone()) {
+                    self.order.push(n);
+                }
+            }
+        }
+        impl Visitor for Names {
+            fn visit_var(&mut self, v: &ast::Var) {
+                if let ast::Var::Name(t) = v {
+                    self.push(t.token().to_string().trim().to_string());
+                }
+            }
+            fn visit_prefix(&mut self, p: &ast::Prefix) {
+                if let ast::Prefix::Name(t) = p {
+                    self.push(t.token().to_string().trim().to_string());
+                }
+            }
+            fn visit_function_body(&mut self, b: &ast::FunctionBody) {
+                for p in b.parameters() {
+                    if let ast::Parameter::Name(t) = p {
+                        self.bound.insert(t.token().to_string().trim().to_string());
+                    }
+                }
+            }
+            fn visit_local_assignment(&mut self, la: &ast::LocalAssignment) {
+                for n in la.names() {
+                    self.bound.insert(n.token().to_string().trim().to_string());
+                }
+            }
+            fn visit_local_function(&mut self, lf: &ast::LocalFunction) {
+                self.bound.insert(lf.name().token().to_string().trim().to_string());
+            }
+            fn visit_numeric_for(&mut self, f: &ast::NumericFor) {
+                self.bound
+                    .insert(f.index_variable().token().to_string().trim().to_string());
+            }
+            fn visit_generic_for(&mut self, f: &ast::GenericFor) {
+                for n in f.names() {
+                    self.bound.insert(n.token().to_string().trim().to_string());
+                }
+            }
+        }
+        let mut names = Names::default();
+        body.visit(&mut names);
+        names
+            .order
+            .iter()
+            .filter(|n| !names.bound.contains(*n))
+            .filter(|n| st.heap.lookup(env, n).is_some())
+            .cloned()
+            .collect()
     }
 
     fn intern_body(&mut self, b: &'a ast::FunctionBody) -> BodyId {
@@ -276,7 +414,10 @@ impl<'a, D: Domain> Interp<'a, D> {
                     for s in cur {
                         match exprs.get(i) {
                             Some(e) => {
-                                for (mut s, v) in self.eval(e, s)? {
+                                self.hint.push(n.clone());
+                                let vs = self.eval(e, s);
+                                self.hint.pop();
+                                for (mut s, v) in vs? {
                                     s.heap.declare(s.scope, &n, v);
                                     next.push(s);
                                 }
@@ -307,9 +448,17 @@ impl<'a, D: Domain> Interp<'a, D> {
                     .next()
                     .ok_or_else(|| anyhow!("assignment with no expression"))?;
                 // TARGET FIRST, then the value.
+                let hint = target_hint(var);
                 let mut out = Vec::new();
                 for (s, tgt) in self.resolve_target(var, st)? {
-                    for (mut s2, v) in self.eval(e, s)? {
+                    if let Some(h) = &hint {
+                        self.hint.push(h.clone());
+                    }
+                    let vs = self.eval(e, s);
+                    if hint.is_some() {
+                        self.hint.pop();
+                    }
+                    for (mut s2, v) in vs? {
                         self.store(&tgt, v, &mut s2)?;
                         out.push(s2);
                     }
@@ -324,12 +473,13 @@ impl<'a, D: Domain> Interp<'a, D> {
             ast::Stmt::FunctionDeclaration(f) => {
                 let body = self.intern_body(f.body());
                 let mut s = st;
-                let c = s.heap.new_closure(body, s.scope);
-                let v = Value::Func(c);
                 let name = f.name().to_string().trim().to_string();
                 if name.contains('.') || name.contains(':') {
                     bail!("qualified function names are not supported: {:?}", name);
                 }
+                let caps = self.captures_of(f.body(), s.scope, &s);
+                let c = s.heap.new_closure(body, s.scope, Self::fn_id_of(&name), caps);
+                let v = Value::Func(c);
                 if !s.heap.assign(s.scope, &name, v.clone()) {
                     let g = s.globals;
                     s.heap.tables.get_mut(&g).unwrap().hash.insert(name, v);
@@ -834,9 +984,12 @@ impl<'a, D: Domain> Interp<'a, D> {
             ast::Expression::FunctionCall(call) => self.eval_call(call, st),
             ast::Expression::Function((_, body)) => {
                 let id = self.intern_body(body);
-                let mut st = st;
+                let fn_id = self.hint_name().and_then(|n| Self::fn_id_of(&n));
+                let st = st;
                 let env = st.scope;
-                let c = st.heap.new_closure(id, env);
+                let caps = self.captures_of(body, env, &st);
+                let mut st = st;
+                let c = st.heap.new_closure(id, env, fn_id, caps);
                 Ok(vec![(st, Value::Func(c))])
             }
             ast::Expression::TableConstructor(t) => {
@@ -851,7 +1004,14 @@ impl<'a, D: Domain> Interp<'a, D> {
                         match field {
                             ast::Field::NameKey { key, value, .. } => {
                                 let k = ident(key)?;
-                                for (mut st, v) in self.eval(value, st)? {
+                                // `player = { init = function ... }` is
+                                // `player.init` to the IR frontend, so the
+                                // field name extends the hint for exactly
+                                // this sub-evaluation.
+                                self.hint.push(k.clone());
+                                let vs = self.eval(value, st);
+                                self.hint.pop();
+                                for (mut st, v) in vs? {
                                     st.heap.tables.get_mut(&id).unwrap().hash.insert(k.clone(), v);
                                     next.push((st, id));
                                 }
@@ -1321,7 +1481,7 @@ impl<'a, D: Domain> Interp<'a, D> {
         match f {
             Value::Func(c) => {
                 let mut st = st;
-                let super::heap::Closure { body, env } = *st
+                let super::heap::Closure { body, env, .. } = *st
                     .heap
                     .closures
                     .get(&c)
@@ -1573,6 +1733,32 @@ enum Target<D: Domain> {
 /// nested block gets its own scope when it runs.
 fn declares_local(block: &ast::Block) -> bool {
     block.stmts().any(|s| matches!(s, ast::Stmt::LocalAssignment(_)))
+}
+
+/// An assignment target as the IR frontend spells it: a bare name, or a
+/// dotted path (`obj.is_solid`). `None` for anything else - an index
+/// expression names nothing a function could be looked up by.
+fn target_hint(var: &ast::Var) -> Option<String> {
+    match var {
+        ast::Var::Name(t) => Some(t.token().to_string().trim().to_string()),
+        ast::Var::Expression(ve) => {
+            let mut out = match ve.prefix() {
+                ast::Prefix::Name(t) => t.token().to_string().trim().to_string(),
+                _ => return None,
+            };
+            for suffix in ve.suffixes() {
+                match suffix {
+                    ast::Suffix::Index(ast::Index::Dot { name, .. }) => {
+                        out.push('.');
+                        out.push_str(name.token().to_string().trim());
+                    }
+                    _ => return None,
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
 }
 
 /// How far to unroll a loop whose limit the tracer cannot know.

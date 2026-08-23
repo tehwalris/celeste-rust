@@ -286,3 +286,160 @@ mod capture_probe {
         }
     }
 }
+
+#[cfg(test)]
+mod encoding {
+    /// The first path from the globals to each cell. A structural
+    /// difference reported as a number is a puzzle; reported as
+    /// `objects[0].hitbox` it is an answer.
+    fn cell_paths(
+        b: &celeste_engine::Rt2,
+    ) -> std::collections::HashMap<u32, String> {
+        use celeste_engine::runtime2::{Cell2, AV};
+        let mut out: std::collections::HashMap<u32, String> = Default::default();
+        let mut queue: Vec<(u32, String)> = Vec::new();
+        for (g, cell) in b.globals.iter().enumerate() {
+            if *cell == celeste_engine::runtime2::NONE {
+                continue;
+            }
+            let name = celeste_names::gen::GLOBAL_NAMES
+                .get(g)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("g{}", g));
+            queue.push((*cell, name));
+        }
+        let mut i = 0;
+        while i < queue.len() {
+            let (c, p) = queue[i].clone();
+            i += 1;
+            if out.contains_key(&c) {
+                continue;
+            }
+            out.insert(c, p.clone());
+            match &b.structure[c as usize] {
+                Cell2::Val => {
+                    if let celeste_engine::runtime2::Col::U(AV::Ptr(t)) = &b.cols[c as usize] {
+                        queue.push((*t, p.clone()));
+                    }
+                }
+                Cell2::Obj(fields) => {
+                    for (f, t) in fields {
+                        let name = celeste_names::gen::FIELD_NAMES
+                            .get(*f as usize)
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| format!("f{}", f));
+                        queue.push((*t, format!("{}.{}", p, name)));
+                    }
+                }
+                Cell2::Arr(items) => {
+                    for (k, t) in items.iter().enumerate() {
+                        queue.push((*t, format!("{}[{}]", p, k)));
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// `structure_of` and `bridge::import_block` are two encoders of one
+    /// thing, and they have to agree.
+    ///
+    /// The engine's cell numbering, its shape hash and its row key are
+    /// all functions of the block's structure, so an encoding difference
+    /// makes two runs incomparable even when they agree about every
+    /// value in the game. That is not hypothetical: the traced frame
+    /// loop's first row-key mismatch was 87 of 274 cells disagreeing at
+    /// frame 1 with no game state in dispute at all.
+    ///
+    /// Checked on the state after `_init`, where both sides can be
+    /// produced from nothing, so a divergence is reported at its source
+    /// rather than twenty frames downstream.
+    #[test]
+    #[ignore]
+    fn the_tracer_encodes_a_block_the_way_the_importer_does() {
+        use crate::trace::domain::Symbolic;
+        use crate::trace::interp::Interp;
+        use crate::trace::verify::run_one;
+        use crate::trace::cart;
+
+        if !std::path::Path::new("rewrites.jsonl").exists() {
+            return;
+        }
+        let recipe = crate::rewrite::recipe::Recipe::load("rewrites.jsonl").expect("recipe");
+        let (program, _) = crate::rewrite::recipe::build(&recipe).expect("build");
+        let engine =
+            crate::compiled::FrameEngine::new_for_start_room(&program).expect("engine");
+        let run = crate::rewrite::verify::AbstractRun::start(&program).expect("start");
+        let states = run.states();
+        assert_eq!(states.len(), 1, "_init should leave exactly one state");
+        let mut theirs =
+            crate::compiled::bridge::import_block(&states[0], engine.cart(), engine.cache());
+        // CANONICAL on both sides. `import_block` numbers cells in its
+        // own discovery order and the boundary renumbers them; comparing
+        // the raw outputs compares two orderings, not two encodings.
+        theirs.canonicalize_ids();
+
+        let root = std::path::Path::new(".");
+        let src = cart::sources_in(root).expect("sources");
+        let top = full_moon::parse(&src).expect("parse cart");
+        let init = full_moon::parse("_init()").expect("parse _init");
+        let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
+        it.cart = Some(engine.cart());
+        it.cache = Some(engine.cache());
+        let st = cart::fresh_state::<Symbolic>(&mut it.d);
+        let mut st = run_one(&mut it, &top, st).expect("toplevel");
+        cart::inject_tile_flag_at(&mut st);
+        let st = run_one(&mut it, &init, st).expect("_init");
+        let mut mine = crate::trace::bind::structure_of(&st, engine.cart(), engine.cache())
+            .expect("structure_of");
+        // A no-op if `structure_of` is right about the rule
+        // (`the_structure_a_traced_state_becomes_is_already_canonical`),
+        // applied anyway so that this test compares encodings only.
+        mine.canonicalize_ids();
+
+        let mut bad = Vec::new();
+        if mine.structure.len() != theirs.structure.len() {
+            bad.push(format!(
+                "{} cells vs {}",
+                mine.structure.len(),
+                theirs.structure.len()
+            ));
+        }
+        let path = cell_paths(&mine);
+        for c in 0..mine.structure.len().min(theirs.structure.len()) {
+            if mine.structure[c] != theirs.structure[c] {
+                bad.push(format!(
+                    "cell {} ({}): {:?} vs {:?}",
+                    c,
+                    path.get(&(c as u32)).map(|s| s.as_str()).unwrap_or("?"),
+                    mine.structure[c],
+                    theirs.structure[c]
+                ));
+            }
+        }
+        if mine.globals != theirs.globals {
+            for (g, (x, y)) in mine.globals.iter().zip(theirs.globals.iter()).enumerate() {
+                if x != y {
+                    bad.push(format!(
+                        "global {} ({:?}): {:?} vs {:?}",
+                        g,
+                        celeste_names::gen::GLOBAL_NAMES.get(g),
+                        x,
+                        y
+                    ));
+                }
+            }
+        }
+        if !bad.is_empty() {
+            let n = bad.len();
+            bad.truncate(20);
+            panic!(
+                "the tracer and the importer encode the post-_init state differently \
+                 ({} differences):\n{}",
+                n,
+                bad.join("\n")
+            );
+        }
+    }
+}

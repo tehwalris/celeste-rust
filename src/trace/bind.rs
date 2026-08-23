@@ -156,15 +156,68 @@ pub fn structure_of(
                 };
                 rt2.cols[c] = Col::U(AV::Ptr(target));
             }
-            Todo::Val(Value::Func(_)) => {
+            Todo::Val(Value::Func(f)) => {
                 // A closure is a heap object with an identity, like a
-                // table. Its BODY is what the engine names, and no kernel
-                // reads through one, so the cell exists to keep the shape
-                // honest rather than to be used.
-                rt2.structure.push(Cell2::Clo(0, Box::new([])));
+                // table, and the engine names it by index into
+                // `FN_NAMES` - which the tracer resolved when the
+                // declaration or assignment that named it was in hand
+                // (`Interp::fn_id_of`).
+                //
+                // An unnamed one is refused rather than numbered 0. The
+                // cart's four anonymous functions are `foreach`
+                // callbacks that do not outlive their frame, so one
+                // reaching a block means something is wrong with the
+                // hint, not with the cart.
+                let cl = st.heap.closures[&f].clone();
+                let id = cl
+                    .fn_id
+                    .ok_or_else(|| anyhow!("closure {} has no name for FN_NAMES", f))?;
+                // The captures are COLUMNS on the closure cell, which the
+                // boundary hashes into the row key - so they are part of
+                // the encoding whether or not any kernel reads one.
+                let mut caps: Vec<Col> = Vec::new();
+                for name in &cl.captures {
+                    let v = st
+                        .heap
+                        .lookup(cl.env, name)
+                        .ok_or_else(|| anyhow!("capture {:?} is not in scope", name))?;
+                    caps.push(Col::U(match v {
+                        Value::Table(t) => {
+                            // The pointee already has a cell whenever the
+                            // capture is the object that owns the closure,
+                            // which is every capture in this cart. One
+                            // that does not is a cell this walk has not
+                            // reached, and inventing it here would put it
+                            // at the wrong place in the canonical order.
+                            AV::Ptr(*table_cell.get(t).ok_or_else(|| {
+                                anyhow!("capture {:?} points at an unvisited table", name)
+                            })?)
+                        }
+                        other => bail!("capture {:?} holds {:?}", name, other),
+                    }));
+                }
+                rt2.structure.push(Cell2::Clo(id, caps.into_boxed_slice()));
                 rt2.cols.push(Col::U(AV::Nil));
                 todo.push(Todo::Done);
                 rt2.cols[c] = Col::U(AV::Ptr((rt2.structure.len() - 1) as u32));
+            }
+            Todo::Val(Value::Builtin(name)) => {
+                // IN PLACE, not behind a pointer. The engine names a
+                // builtin by index into `BUILTIN_NAMES` - the ABI
+                // `compiled::bridge` translates - and the importer puts
+                // that cell AT the slot rather than adding an
+                // indirection, unlike a table or a closure.
+                //
+                // Writing a plain `Val` here instead made every builtin
+                // structurally identical to every other AND added 16
+                // cells, which shifted every id past the first one:
+                // 290 cells against the importer's 274, and 151
+                // differences produced by one unfinished match arm.
+                let i = celeste_ir::builtins::BUILTIN_NAMES
+                    .iter()
+                    .position(|n| *n == name)
+                    .ok_or_else(|| anyhow!("unknown builtin {:?}", name))?;
+                rt2.structure[c] = Cell2::Bi(i as u32);
             }
             Todo::Val(_) => {}
             Todo::Table(t) => {
@@ -185,7 +238,17 @@ pub fn structure_of(
                     todo.push(Todo::Val(v.clone()));
                     (rt2.structure.len() - 1) as u32
                 };
-                let body = if tab.arr.is_empty() {
+                // An EMPTY table has no kind yet. `got_fruit = {}` is
+                // neither an object nor an array until something is put
+                // in it, and the interpreter says so with
+                // `HeapValue::UnknownTable`. Calling it an object with
+                // no fields is the same thing operationally - no path
+                // can traverse either - but it is a different cell to
+                // the shape hash, which is what makes it worth matching
+                // rather than reasoning about.
+                let body = if tab.hash.is_empty() && tab.arr.is_empty() {
+                    Cell2::Unk
+                } else if tab.arr.is_empty() {
                     // Fields the boundary does not name are dropped,
                     // exactly as `import_block` drops them: no generated
                     // code can access one, so it is unreachable weight.
