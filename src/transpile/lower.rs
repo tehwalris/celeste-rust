@@ -156,12 +156,12 @@ impl<'a> Ctx<'a> {
             // ZN as a P8" names neither, and the answer is always a
             // specific site.
             anyhow::anyhow!(
-                "{} (operand {} of node {}, {:?}, whose operand is {:?})",
+                "{} (operand {} of node {}, {:?}, whose operand is {})",
                 err,
                 k,
                 id,
                 self.g.get(id).op,
-                self.g.get(a).op
+                crate::trace::emit::show_tree(self.g, a, 3)
             )
         })
     }
@@ -227,9 +227,10 @@ impl<'a> Ctx<'a> {
             // replaces it with sin's RANGE as a constant.
             Op::Sin => Repr::num(self.r(a[0]).lane, false),
             Op::Mget => Repr::num(joined(Dom::Num).lane, false),
-            Op::TileFlagAt => {
-                Repr::boolean(self.r(a[0]).lane || self.r(a[1]).lane, false)
-            }
+            Op::TileFlagAt => Repr::boolean(
+                a.iter().take(4).any(|x| self.r(*x).lane),
+                false,
+            ),
             Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq => joined(Dom::Bool),
             Op::Not => self.r(a[0]),
             // Both are DECIDED whatever their operands are: `zb_and` and
@@ -239,7 +240,12 @@ impl<'a> Ctx<'a> {
             Op::Sel => {
                 let (t, f) = (self.r(a[1]), self.r(a[2]));
                 if t.dom != f.dom {
-                    bail!("select arms disagree on domain: {} vs {}", t.ty(), f.ty());
+                    bail!(
+                        "select arms disagree on domain: {} vs {} in {}",
+                        t.ty(),
+                        f.ty(),
+                        crate::trace::emit::show_tree(self.g, id, 4)
+                    );
                 }
                 Repr {
                     dom: t.dom,
@@ -396,19 +402,33 @@ impl<'a> Ctx<'a> {
                 }
             }
             Op::TileFlagAt => {
-                // x/y vary; the box and the flag are always block-uniform
-                // exact numbers (the walk lifts them with `sn`).
+                // x/y vary. The BOX is block-uniform in almost every
+                // frame - a hitbox is fixed per object type - and the
+                // walk lifts it with `sn`. It is not uniform in the frame
+                // an object is CREATED: `init_object` gives it a default
+                // 8x8 which `type.init` may or may not replace, so the
+                // width arrives as a select on a per-lane condition.
+                //
+                // Decided from the operands rather than assumed, and the
+                // uniform form is kept because `solid_map` is keyed by
+                // (w, h) and a per-lane box cannot use it.
                 let u = Repr::num(false, false);
-                let (w, h, f) = (self.at(id, 2, u)?, self.at(id, 3, u)?, self.at(id, 4, u)?);
                 let z = Repr::num(true, false);
+                let f = self.at(id, 4, u)?;
                 let (x, y) = (self.at(id, 0, z)?, self.at(id, 1, z)?);
+                let box_lane = self.r(self.args(id)[2]).lane || self.r(self.args(id)[3]).lane;
+                let (call, w, h) = if box_lane {
+                    ("zn_tile_flag_at_lanes", self.at(id, 2, z)?, self.at(id, 3, z)?)
+                } else {
+                    ("zn_tile_flag_at", self.at(id, 2, u)?, self.at(id, 3, u)?)
+                };
                 if lane {
-                    format!("zn_tile_flag_at(g.cache, g.cart, {}, {}, {}, {}, {})", x, y, w, h, f)
+                    format!("{}(g.cache, g.cart, {}, {}, {}, {}, {})", call, x, y, w, h, f)
                 } else {
                     format!(
-                        "{{ let z = zn_tile_flag_at(g.cache, g.cart, {}, {}, {}, {}, {}); \
+                        "{{ let z = {}(g.cache, g.cart, {}, {}, {}, {}, {}); \
                          z.val & 1 != 0 }}",
-                        x, y, w, h, f
+                        call, x, y, w, h, f
                     )
                 }
             }

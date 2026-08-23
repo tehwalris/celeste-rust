@@ -241,9 +241,30 @@ pub fn renumber_cells(
             bail!("input slots {} and {} both map to cell {}", j, i, c);
         }
     }
+    // Only what the ROOTS reach. Several frames are traced into one
+    // arena so they share subexpressions, and their `Op::Cell` ids are
+    // each frame's own dense slot indices - so the arena holds cells
+    // this frame's interface does not name, and rebuilding all of it
+    // would fail on someone else's.
+    let mut live = vec![false; g.len()];
+    let mut stack: Vec<NodeId> = roots.to_vec();
+    while let Some(n) = stack.pop() {
+        if live[n as usize] {
+            continue;
+        }
+        live[n as usize] = true;
+        stack.extend(g.get(n).args.iter().copied());
+    }
+
     let mut out = Graph::new();
     let mut map: Vec<NodeId> = Vec::with_capacity(g.len());
     for id in 0..g.len() {
+        if !live[id] {
+            // Never read: an arg of a live node is live, and args have
+            // smaller ids, so nothing maps through this.
+            map.push(0);
+            continue;
+        }
         let node = g.get(id as NodeId);
         let new = match node.op {
             Op::Cell(i) => {

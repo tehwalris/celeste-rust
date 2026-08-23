@@ -58,6 +58,7 @@ pub mod heap;
 pub mod iface;
 pub mod kernel;
 pub mod interp;
+pub mod shapes;
 pub mod probe;
 pub mod state;
 pub mod verify;

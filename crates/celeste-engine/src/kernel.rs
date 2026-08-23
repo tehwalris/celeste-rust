@@ -588,6 +588,45 @@ pub fn zn_tile_flag_at(
 
 /// Scalar interval + interval (the uniform twin of zi_add).
 #[inline(always)]
+/// `tile_flag_at` with a PER-LANE box.
+///
+/// The box is block-uniform in almost every frame - a hitbox is fixed
+/// per object type - but not in the frame an object is CREATED, because
+/// `init_object` gives it a default 8x8 and `type.init` may or may not
+/// replace it. Whether a given lane's object was just created is a
+/// per-lane fact, so the width arrives as a select over it.
+///
+/// Slower than the uniform form on purpose: `CollisionCache::solid_map`
+/// is keyed by (w, h), so a per-lane box cannot use it and every lane
+/// takes the general path. Callers should use `zn_tile_flag_at` whenever
+/// the box is uniform, which the emitter decides from the operands'
+/// representation.
+pub fn zn_tile_flag_at_lanes(
+    cache: &CollisionCache,
+    cart: &CartData,
+    x: ZN,
+    y: ZN,
+    w: ZN,
+    h: ZN,
+    flag: P8,
+) -> ZB {
+    let f = flag.as_i16().expect("tile_flag_at: flag must be integer");
+    if f != 0 {
+        return zb_splat(false);
+    }
+    let mut val = 0u16;
+    for i in 0..W {
+        let xi = x[i].as_i16().expect("tile_flag_at: x must be an integer");
+        let yi = y[i].as_i16().expect("tile_flag_at: y must be an integer");
+        let wi = w[i].as_i16().expect("tile_flag_at: w must be an integer");
+        let hi = h[i].as_i16().expect("tile_flag_at: h must be an integer");
+        if cache.solid_at(cart, xi, yi, wi, hi).unwrap_or(false) {
+            val |= 1 << i;
+        }
+    }
+    ZB { val, known: ALL }
+}
+
 pub fn si_add(a: (P8, P8), b: (P8, P8)) -> (P8, P8) {
     let r = IV::new(a.0, a.1) + IV::new(b.0, b.1);
     (r.low, r.high)

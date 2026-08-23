@@ -393,6 +393,32 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
     dispatch(&mut o, "pub fn bd(i: usize, o: &KOuts) -> bool", "o.v#.bd")?;
     dispatch(&mut o, "pub fn out_slots(i: usize) -> &'static [(u32, &'static str)]", "OUT_SLOTS_#")?;
 
+    // ONE uniform entry point per kernel, so a dispatcher can hold
+    // kernels for different shapes as plain function pointers. Every
+    // shape's `Uni`, `RowsIn` and `KOuts` are different types, so
+    // anything that exposed them could not be uniform.
+    //
+    // `None` means this kernel is not for this block - a path that does
+    // not resolve, or a slot at the wrong kind. `Some(mask)` is the
+    // lanes some (variant, outcome) DECLINED; under the never-deopt
+    // doctrine a non-zero mask stops the run rather than falling back.
+    writeln!(
+        o,
+        "pub fn step(b: &Rt2, lo: usize, n: usize, accs: &mut [Rt2]) -> Option<u16> {{\n\
+         \x20   let (u, s) = bind(b)?;\n\
+         \x20   let rin = rows(b, &s, lo)?;\n\
+         \x20   let g = G {{ cart: &b.cart, cache: &b.cache }};\n\
+         \x20   let mut declined = 0u16;\n\
+         \x20   frame(&u, &rin, &g, &mut |_mask, o| {{\n\
+         \x20       for i in 0..OUTCOMES {{\n\
+         \x20           declined |= deopt(i, o) & live(i, o);\n\
+         \x20           append(i, &mut accs[i], o, n);\n\
+         \x20       }}\n\
+         \x20   }});\n\
+         \x20   Some(declined)\n\
+         }}\n"
+    )?;
+
     // ---- the body ----
     writeln!(
         o,
@@ -519,6 +545,83 @@ pub fn reference_frame_in(root: &std::path::Path) -> Result<Reference> {
     Ok(Reference { frame, graph, bound, lowered, cart: cart_data, cache })
 }
 
+/// One kernel per SHAPE the room reaches.
+///
+/// No pm1 pin: a kernel covers every key of its shape. The pin is worth
+/// -6.3% (T13) and costs a kernel per key, and a fully symbolic frame is
+/// 2,341 graph nodes against ~1,720 for the largest single outcome of a
+/// pinned one - so un-pinning is close to free.
+///
+/// REFUSES rather than returns a partial set. A shape the walk could not
+/// trace, or one it dropped at the cap, is a kernel that will not exist,
+/// and under the never-deopt doctrine that is a run that stops. Better
+/// to fail here, where the reason is in hand.
+pub fn room_kernels_in(root: &std::path::Path) -> Result<Vec<Reference>> {
+    use super::domain::Symbolic;
+    use super::interp::Interp;
+    use super::verify::run_one;
+    use super::{cart, shapes};
+    use anyhow::{anyhow, bail};
+
+    let src = cart::sources_in(root)?;
+    let top = full_moon::parse(&src).map_err(|e| anyhow!("parse: {:?}", e))?;
+    let init = full_moon::parse("_init()").map_err(|e| anyhow!("parse _init: {:?}", e))?;
+    let reset = full_moon::parse("__reset_button_states()")
+        .map_err(|e| anyhow!("parse reset: {:?}", e))?;
+    let fr = full_moon::parse("_update()").map_err(|e| anyhow!("parse frame: {:?}", e))?;
+
+    let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
+    let cart_data = std::sync::Arc::new(celeste_core::cart_data::CartData::load(root.join("cart"))?);
+    let (rx, ry) = celeste_interp::game_runner::start_room();
+    let cache = std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(
+        &cart_data, rx, ry,
+    )?);
+    it.cache = Some(cache.clone());
+    it.cart = Some(cart_data.clone());
+
+    let st = cart::fresh_state::<Symbolic>(&mut it.d);
+    let mut st = run_one(&mut it, &top, st)?;
+    cart::inject_tile_flag_at(&mut st);
+    let st = run_one(&mut it, &init, st)?;
+
+    let w = shapes::walk(&mut it, &reset, &fr, st, 400)?;
+    if !w.refused.is_empty() {
+        let why: Vec<String> =
+            w.refused.iter().map(|(e, n)| format!("{} x {}", n, e)).collect();
+        bail!("the shape walk could not trace every shape:\n{}", why.join("\n"));
+    }
+    if w.dropped > 0 {
+        bail!("the shape walk hit its cap with {} outcomes left", w.dropped);
+    }
+
+    let graph = std::mem::take(&mut it.d.graph);
+    let room = crate::transpile::graph::Room { cart: cart_data.clone(), cache: cache.clone() };
+    let mut out = Vec::new();
+    for sh in w.shapes {
+        let bound = super::emit::bind(&sh.frame, &graph)?;
+        let lowered = super::emit::lower_frame(
+            &bound.graph,
+            &bound.inputs,
+            &bound.uni,
+            &bound.outcomes,
+            Some(room.clone()),
+        )?;
+        out.push(Reference {
+            frame: sh.frame,
+            // Every shape was traced into ONE arena so they share
+            // subexpressions; each reference keeps a copy because the
+            // check harness evaluates against it. Cheap - the whole
+            // room's traced graph is a few thousand nodes.
+            graph: graph.clone(),
+            bound,
+            lowered,
+            cart: cart_data.clone(),
+            cache: cache.clone(),
+        });
+    }
+    Ok(out)
+}
+
 /// A block holding `rows` concrete input assignments, one per lane.
 ///
 /// The kernel reads its inputs off a block by path, so checking it
@@ -579,4 +682,86 @@ pub fn input_block(r: &Reference, rows: &[Vec<super::iface::Conc>]) -> Result<ce
         b.cols[*cell as usize] = col;
     }
     Ok(b)
+}
+
+/// Write a kernel per shape, plus the table a dispatcher indexes.
+///
+/// Into a directory rather than a file because each shape's `Uni`,
+/// `RowsIn` and `KOuts` are different types with the same names - they
+/// coexist only as separate modules.
+pub fn write_room_kernels(root: &std::path::Path, dir: &std::path::Path) -> Result<Vec<usize>> {
+    let refs = room_kernels_in(root)?;
+    std::fs::create_dir_all(dir)?;
+    let mut sizes = Vec::new();
+    let mut decl = String::new();
+    let mut table = String::new();
+    for (i, r) in refs.iter().enumerate() {
+        let src = render(&r.frame, &r.bound, &r.lowered, &format!("shape {}", i))?;
+        sizes.push(src.lines().count());
+        std::fs::write(dir.join(format!("kernel{}.rs", i)), &src)?;
+        writeln!(decl, "#[path = \"kernel{i}.rs\"]\npub mod k{i};", i = i)?;
+        writeln!(
+            table,
+            "    Kernel {{ name: \"shape {i}\", outcomes: k{i}::OUTCOMES, \
+             acc: k{i}::acc, step: k{i}::step }},",
+            i = i
+        )?;
+    }
+    let mut m = String::new();
+    writeln!(
+        m,
+        "// GENERATED by `trace::kernel::write_room_kernels`. Do not edit.\n\
+         //\n\
+         // One module per heap SHAPE the room reaches. Each shape's\n\
+         // `Uni`, `RowsIn` and `KOuts` are different types with the same\n\
+         // names, so they coexist only as separate modules - which is\n\
+         // why `step` and `acc` exist: they are the uniform surface a\n\
+         // dispatcher can hold as function pointers.\n\
+         #![allow(clippy::all)]\n\
+         use celeste_core::cart_data::CartData;\n\
+         use celeste_core::collision_cache::CollisionCache;\n\
+         use celeste_engine::runtime2::Rt2;\n\
+         use std::sync::Arc;\n\
+         \n\
+         {decl}\n\
+         /// One shape's kernel, behind a shape-independent surface.\n\
+         pub struct Kernel {{\n\
+         \x20   pub name: &'static str,\n\
+         \x20   /// How many output shapes one frame can end in.\n\
+         \x20   pub outcomes: usize,\n\
+         \x20   /// An empty accumulator with outcome `i`'s shape.\n\
+         \x20   pub acc: fn(usize, Arc<CartData>, Arc<CollisionCache>) -> Rt2,\n\
+         \x20   /// `None`: not this kernel's shape. `Some(mask)`: the\n\
+         \x20   /// lanes it declined, which the doctrine says stops the run.\n\
+         \x20   pub step: fn(&Rt2, usize, usize, &mut [Rt2]) -> Option<u16>,\n\
+         }}\n\
+         \n\
+         pub const KERNELS: &[Kernel] = &[\n\
+         {table}];\n",
+        decl = decl,
+        table = table
+    )?;
+    std::fs::write(dir.join("mod.rs"), m)?;
+    Ok(sizes)
+}
+
+#[cfg(test)]
+mod tests {
+    /// Generate the room's whole kernel set. A PROBE and a generator:
+    /// it writes what `check-traced-kernel.sh` compiles and runs.
+    #[test]
+    #[ignore]
+    fn renders_a_kernel_for_every_shape() {
+        let dir = std::path::Path::new("target").join("traced-kernels");
+        match super::write_room_kernels(std::path::Path::new("."), &dir) {
+            Ok(sizes) => eprintln!(
+                "[kernels] {} shapes -> {:?} lines, {} total, in {}",
+                sizes.len(),
+                sizes,
+                sizes.iter().sum::<usize>(),
+                dir.display()
+            ),
+            Err(e) => panic!("{:#}", e),
+        }
+    }
 }
