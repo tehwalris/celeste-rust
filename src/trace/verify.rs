@@ -1552,6 +1552,14 @@ mod tests {
                             path.display(),
                             src.lines().count()
                         );
+                        // And HAND IT TO RUSTC, which is the only thing
+                        // that can say whether those lines are Rust.
+                        // Type-check only - see `typecheck_rendered`,
+                        // and see its doc for the green gate this
+                        // omission let through.
+                        super::super::kernel::typecheck_rendered(&src)
+                            .unwrap_or_else(|e| panic!("{:#}", e));
+                        eprintln!("[emit] and it TYPE-CHECKS");
                     }
                     Err(e) => eprintln!("[emit] RENDER REFUSED: {:#}", e),
                 }

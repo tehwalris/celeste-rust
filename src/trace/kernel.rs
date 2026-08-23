@@ -773,6 +773,96 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
     Ok(o)
 }
 
+/// TYPE-CHECK a rendered kernel, by handing it to rustc.
+///
+/// `render` returning 6,000 lines only says the emitter emitted
+/// something. Whether those lines are Rust - whether they use an engine
+/// API that still exists, with the types it still has - is a separate
+/// question, and rustc is the only thing that answers it.
+///
+/// That gap was not theoretical. On 2026-08-23 the lane type became a
+/// register, the walk's emitter was updated, `generated_is_current`
+/// passed, the whole 279-test gate went green - and the TRACED emitter
+/// was still building intervals out of arrays and indexing the row-key
+/// columns per lane. Nothing noticed until `check-traced-kernel.sh` ran
+/// by hand, because that script is the only thing that compiled it and
+/// it is not in the gate.
+///
+/// `--emit=metadata` so this is type-checking and not codegen: the
+/// point is the API surface, and codegen of a 6,000-line body is the
+/// expensive part we cannot afford on every commit.
+///
+/// Links against the rlibs the TEST BINARY was built with, found next to
+/// it in `deps/`. Not finding them is a hard failure, not a skip - a
+/// check that silently does nothing is worse than no check, because it
+/// reads as green.
+pub fn typecheck_rendered(src: &str) -> Result<()> {
+    use anyhow::Context;
+    let exe = std::env::current_exe().context("locating the test binary")?;
+    let deps = exe.parent().ok_or_else(|| anyhow::anyhow!("test binary has no parent dir"))?;
+
+    // The newest matching rlib: a `target/` accumulates stale ones, and
+    // linking an old `celeste-engine` would check against an API that is
+    // no longer there - which is the exact thing this exists to catch.
+    let newest = |stem: &str| -> Result<std::path::PathBuf> {
+        let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+        let entries =
+            std::fs::read_dir(deps).with_context(|| format!("reading {}", deps.display()))?;
+        for e in entries {
+            let p = e?.path();
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.starts_with(&format!("lib{}-", stem)) && name.ends_with(".rlib") {
+                let t = p.metadata()?.modified()?;
+                if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
+                    best = Some((t, p));
+                }
+            }
+        }
+        best.map(|(_, p)| p).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no lib{}-*.rlib in {} - the type-check cannot run, and skipping it \
+                 would read as a pass",
+                stem,
+                deps.display()
+            )
+        })
+    };
+
+    let dir = std::env::temp_dir().join(format!("celeste-typecheck-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let file = dir.join("kernel.rs");
+    std::fs::write(&file, src)?;
+
+    let mut cmd = std::process::Command::new("rustc");
+    cmd.arg("--edition=2021")
+        .arg("--crate-type=lib")
+        .arg("--crate-name=traced_kernel")
+        .arg("--emit=metadata")
+        .arg("-o")
+        .arg(dir.join("kernel.rmeta"))
+        .arg("-L")
+        .arg(format!("dependency={}", deps.display()));
+    for stem in ["celeste_engine", "celeste_core", "celeste_names"] {
+        cmd.arg("--extern").arg(format!("{}={}", stem, newest(stem)?.display()));
+    }
+    cmd.arg(&file);
+
+    let out = cmd.output().context("running rustc on the rendered kernel")?;
+    let _ = std::fs::remove_dir_all(&dir);
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        // The first few diagnostics; the whole thing is thousands of
+        // lines when a template is wrong in every cell.
+        let head: Vec<&str> = err.lines().take(40).collect();
+        anyhow::bail!(
+            "the rendered kernel does not type-check ({} lines of it):\n{}",
+            src.lines().count(),
+            head.join("\n")
+        );
+    }
+    Ok(())
+}
+
 /// One traced frame, everything owned, ready to render or to run.
 ///
 /// The tracer's `Interp` borrows the parsed ASTs, so a caller outside
