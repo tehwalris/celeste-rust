@@ -1550,16 +1550,39 @@ field taken off a scalar. That refusal is what makes binding by path
 safe: handed the wrong shape, a kernel declines to bind, which is the
 all-or-nothing behaviour the kernels already have.
 
-### Inputs only, and why the other half is blocked
+### Inputs, and then the shape an outcome ends in
 
 `bind_inputs` resolves `Iface::slots`, giving "canonical cell for
-`Op::Cell(i)`". Outputs are NOT resolved, on purpose: each outcome ends
-in its own heap shape, and an outcome that allocates - a death making a
-new player, a fruit leaving - names cells the input block does not have.
-Binding those needs a shape descriptor per outcome, which is the T16
-multi-output work. Resolving them against the input block would succeed
-for the outcomes that happen not to allocate and fail confusingly for
-the rest, which is worse than not doing it.
+`Op::Cell(i)`".
+
+Outputs need more, because each outcome ends in its OWN heap shape and
+one that allocates - a death making a new player, a fruit leaving -
+names cells the input block does not have. So there has to be something
+to resolve against, and `structure_of` builds it: the engine's structure
+for a traced state, the mirror of `compiled::bridge::import_block` over
+the tracer's heap instead of the interpreter's.
+
+It follows the engine's numbering rule - breadth-first from the globals
+in `GLOBAL_NAMES` order, object fields sorted by name, array items in
+order - not because the tracer must agree with anything, but because the
+block it describes gets handed to the engine, which renumbers by that
+rule anyway. Producing it directly makes the ids the kernel writes and
+the ids the engine reads the same ids by construction.
+
+Structure only: `cols` carries pointers, because the resolver follows
+them, and nothing else. The values are what the kernel computes.
+
+The check that matters is DISTINCTNESS, not resolvability. A structure
+that merged two slots would resolve both paths happily and make the
+kernel write one cell twice - a silent corruption whose only symptom is
+a wrong search result much later. `a_traced_state_becomes_a_structure_every_path_can_walk`
+takes every scalar in a warmed-up traced state, resolves it, and
+requires 59 paths to land on 59 DISTINCT `Val` cells, with none dropped
+as unnameable.
+
+Two things it refuses rather than guesses: a table with both a hash and
+an array part (no table in the cart has one, and the engine's `Cell2`
+picks one), and integer keys outside the array part.
 
 ## Stage 4 - delete
 

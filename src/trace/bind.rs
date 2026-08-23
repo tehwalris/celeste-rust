@@ -114,6 +114,119 @@ fn kind(c: &Cell2) -> &'static str {
     }
 }
 
+/// Build the ENGINE's structure for a traced state.
+///
+/// The mirror of `compiled::bridge::import_block`, over the tracer's
+/// heap instead of the interpreter's. It exists because an outcome that
+/// allocates ends in a shape the input block does not have, so its
+/// output paths have nothing to resolve against until someone builds
+/// that shape.
+///
+/// The numbering is the engine's own rule - breadth-first from the
+/// globals in `GLOBAL_NAMES` order, object fields sorted by name, array
+/// items in order - not because the tracer needs to agree with anything,
+/// but because the block this describes will be handed to the engine,
+/// which renumbers by that rule anyway. Producing it directly means the
+/// ids the kernel writes and the ids the engine reads are the same ids
+/// by construction rather than by a lookup table.
+///
+/// Structure only: `cols` carries pointers, because the resolver follows
+/// them, and `AV::Nil` everywhere else. The VALUES are what the kernel
+/// computes; this says where they go.
+pub fn structure_of(
+    st: &super::state::State<super::domain::Symbolic>,
+    cart: std::sync::Arc<celeste_core::cart_data::CartData>,
+    cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
+) -> Result<Rt2> {
+    use super::heap::Value;
+
+    let mut rt2 = Rt2::empty(1, gen::GLOBAL_NAMES.len(), gen::STRINGS, cart, cache);
+    rt2.structure = Vec::new();
+    rt2.cols = Vec::new();
+    // What each traced table/closure became, and the cells still owing a
+    // body. Breadth-first, so `queue` is drained in order.
+    let mut table_cell: std::collections::HashMap<u32, u32> = Default::default();
+    let mut queue: std::collections::VecDeque<(u32, bool)> = Default::default();
+
+    let new_cell = |rt2: &mut Rt2, c: Cell2, col: Col| -> u32 {
+        rt2.structure.push(c);
+        rt2.cols.push(col);
+        (rt2.structure.len() - 1) as u32
+    };
+
+    // A slot holding `v` becomes one `Val` cell; if `v` is a table or a
+    // closure, that cell points at the cell for the object, which is
+    // discovered here and filled later.
+    macro_rules! slot {
+        ($rt2:expr, $v:expr) => {{
+            let col = match $v {
+                Value::Table(t) => {
+                    let id = match table_cell.get(t) {
+                        Some(c) => *c,
+                        None => {
+                            let c = new_cell($rt2, Cell2::Unk, Col::U(AV::Nil));
+                            table_cell.insert(*t, c);
+                            queue.push_back((*t, false));
+                            c
+                        }
+                    };
+                    Col::U(AV::Ptr(id))
+                }
+                Value::Func(_) => {
+                    // A closure is a heap object with an identity, like a
+                    // table. Its BODY is what the engine names, and no
+                    // kernel reads through one, so the cell exists to
+                    // keep the shape honest rather than to be used.
+                    let c = new_cell($rt2, Cell2::Clo(0, Box::new([])), Col::U(AV::Nil));
+                    Col::U(AV::Ptr(c))
+                }
+                _ => Col::U(AV::Nil),
+            };
+            new_cell($rt2, Cell2::Val, col)
+        }};
+    }
+
+    // Globals, in the boundary's order - which is what makes the rest of
+    // the numbering deterministic.
+    let groot = &st.heap.tables[&st.globals];
+    let mut globals = vec![NONE; gen::GLOBAL_NAMES.len()];
+    for (gi, name) in gen::GLOBAL_NAMES.iter().enumerate() {
+        if let Some(v) = groot.hash.get(*name) {
+            globals[gi] = slot!(&mut rt2, v);
+        }
+    }
+    rt2.globals = globals;
+
+    while let Some((t, _)) = queue.pop_front() {
+        let cell = table_cell[&t];
+        let tab = &st.heap.tables[&t];
+        // A table is an object OR an array to the engine, never both.
+        // No table in the cart uses both parts, and a table that did
+        // could not be described at all - so say so rather than pick.
+        if !tab.hash.is_empty() && !tab.arr.is_empty() {
+            bail!("table {} has both a hash and an array part", t);
+        }
+        if !tab.ints.is_empty() {
+            bail!("table {} has integer keys outside the array part", t);
+        }
+        let body = if tab.arr.is_empty() {
+            // Fields the boundary does not name are dropped, exactly as
+            // `import_block` drops them: no generated code can access
+            // one, so it is unreachable weight.
+            let mut fields: Vec<(u32, u32)> = Vec::new();
+            for (k, v) in tab.hash.iter() {
+                let Some(f) = gen::field_id(k) else { continue };
+                fields.push((f, slot!(&mut rt2, v)));
+            }
+            Cell2::Obj(fields)
+        } else {
+            Cell2::Arr(tab.arr.iter().map(|v| slot!(&mut rt2, v)).collect())
+        };
+        rt2.structure[cell as usize] = body;
+    }
+    Ok(rt2)
+}
+
 /// Resolve a traced frame's INPUT interface against a block.
 ///
 /// `Iface::slots` is the tracer's input list, in the order its cells
@@ -263,6 +376,75 @@ mod tests {
             eprintln!("[bind] {}: {} paths resolved, {} skipped", w, ok, skipped);
             assert!(ok > 100, "{}: only {} paths checked", w, ok);
         }
+    }
+
+    /// The structure the tracer builds must be one the resolver can walk:
+    /// every scalar the boundary can name lands on a distinct `Val` cell.
+    ///
+    /// Distinctness is the real content. A structure that merged two
+    /// slots would resolve both paths happily and make the kernel write
+    /// one cell twice - a silent corruption, and the only symptom would
+    /// be a wrong search result much later.
+    #[test]
+    fn a_traced_state_becomes_a_structure_every_path_can_walk() {
+        use crate::trace::{cart, domain::Symbolic, interp::Interp, verify::run_one};
+
+        let src = cart::sources().expect("sources");
+        let top = full_moon::parse(&src).expect("parse");
+        let init = full_moon::parse("_init()").expect("parse _init");
+        let frame = full_moon::parse("_update()").expect("parse frame");
+        let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
+        let cd = std::sync::Arc::new(
+            celeste_core::cart_data::CartData::load("cart").expect("cart"),
+        );
+        let (rx, ry) = celeste_interp::game_runner::start_room();
+        let cache = std::sync::Arc::new(
+            celeste_core::collision_cache::CollisionCache::new(&cd, rx, ry).expect("cache"),
+        );
+        it.cache = Some(cache.clone());
+        it.cart = Some(cd.clone());
+        let st = cart::fresh_state::<Symbolic>(&mut it.d);
+        let mut st = run_one(&mut it, &top, st).expect("toplevel");
+        cart::inject_tile_flag_at(&mut st);
+        let mut st = run_one(&mut it, &init, st).expect("_init");
+        for _ in 0..12 {
+            st = run_one(&mut it, &frame, st).expect("warm-up");
+        }
+
+        let rt2 = structure_of(&st, cd, cache).expect("structure");
+        let mut seen: std::collections::HashMap<u32, Path> = Default::default();
+        let (mut ok, mut unnameable) = (0usize, 0usize);
+        for p in crate::trace::iface::scalars(&st, &[]).expect("scalars") {
+            // A slot the boundary cannot name was dropped on purpose.
+            let nameable = p.iter().enumerate().all(|(i, s)| match s {
+                Step::Key(k) if i == 0 => gen::GLOBAL_NAMES.contains(&k.as_str()),
+                Step::Key(k) => gen::field_id(k).is_some(),
+                _ => true,
+            });
+            if !nameable {
+                unnameable += 1;
+                continue;
+            }
+            let c = resolve(&rt2, &p)
+                .unwrap_or_else(|e| panic!("{} did not resolve: {:#}", show(&p), e));
+            assert!(
+                matches!(rt2.structure[c as usize], Cell2::Val),
+                "{} resolved to a {}",
+                show(&p),
+                kind(&rt2.structure[c as usize])
+            );
+            if let Some(other) = seen.insert(c, p.clone()) {
+                panic!("{} and {} are the same cell {}", show(&other), show(&p), c);
+            }
+            ok += 1;
+        }
+        eprintln!(
+            "[bind] traced state: {} paths -> {} distinct cells ({} not nameable by the boundary)",
+            ok,
+            seen.len(),
+            unnameable
+        );
+        assert!(ok > 50, "only {} paths checked", ok);
     }
 
     /// A path that is not in the shape is a REFUSAL, not a panic and not
