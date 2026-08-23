@@ -127,11 +127,20 @@ result. Add a profile instead.
 
 **Other things that cost more than they look:**
 
-- **One cargo at a time.** A `cargo build` started while a background
-  `nextest` is still building will contend on the lock and can swap the
-  binary under a running A/B measurement. On 2026-08-22 this invalidated
-  a benchmark side and it had to be re-run. Background long jobs, then
-  leave the build directory alone until they finish.
+- **One cargo at a time - use `./one-cargo.sh`.** A `cargo build`
+  started while a background `nextest` is still building will contend on
+  the lock and can swap the binary under a running A/B measurement. On
+  2026-08-22 this invalidated a benchmark side and it had to be re-run.
+
+  The failure mode is not an error. Cargo prints `Blocking waiting for
+  file lock on build directory` ONCE, into a log nobody is tailing, and
+  the second build then appears to take as long as the first one has
+  left. On 2026-08-23 that cost hours: builds "taking 25 minutes" were a
+  70-second build queued behind another of mine, and it also produced a
+  false alarm about a hung test and a bogus theory about the emitter.
+
+  `./one-cargo.sh cargo ...` takes an flock on the build directory, so a
+  second invocation WAITS and says so instead of silently queueing.
 - **Background anything over ~30 s** (`run_in_background: true`) and use
   a Monitor with an until-loop to wait. Do not poll in a loop.
 - **`touch` the file you care about** to measure what an edit really

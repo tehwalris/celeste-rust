@@ -2863,6 +2863,25 @@ total time, from one change, and it attacks both measured problems at
 once - the per-row column writes AND the output values that were living
 across the variant sequence.
 
+### CORRECTION: the outputs were not what the registers were holding
+
+Constant columns took the shared output fields from **227 to 22** across
+the four outcomes. The peak live set moved from **512 to 486**.
+
+So the earlier reading - "493 of the 512 live values are outputs" - was
+an artifact of measuring last use TEXTUALLY: a value's final mention is
+in the output struct, which made it look live to the end even when the
+real pressure was elsewhere. Remove the outputs and the pressure stays.
+
+The genuine pressure is ~486 values in the body, inherent to the
+dependency graph. And the assembly is unchanged by the constant-column
+work - still 16.3 instructions per node, still 47% stack traffic - even
+though the runtime dropped 33%. The win came from doing less work
+OUTSIDE `frame` (Vec pushes), not from better codegen inside it.
+
+Which puts the codegen direction back where it was two corrections ago:
+a hand emitter's advantage is HOW it spills, not spilling less.
+
 ### Where the 405 ms goes now - and why dedup is NOT next
 
 `FrameStat` splits the frame three ways. After constant columns:
