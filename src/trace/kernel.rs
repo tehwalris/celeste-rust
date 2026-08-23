@@ -284,10 +284,10 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
                 o,
                 "        c{c}: match &b.cols[s.c{c} as usize] {{\n\
                  \x20           Col::I(v) => ZI {{\n\
-                 \x20               lo: core::array::from_fn(|i| v[at(i)].0),\n\
-                 \x20               hi: core::array::from_fn(|i| v[at(i)].1),\n\
+                 \x20               lo: ZN::from_array(core::array::from_fn(|i| v[at(i)].0)),\n\
+                 \x20               hi: ZN::from_array(core::array::from_fn(|i| v[at(i)].1)),\n\
                  \x20           }},\n\
-                 \x20           Col::U(AV::Ival(lo, hi)) => ZI {{ lo: [*lo; W], hi: [*hi; W] }},\n\
+                 \x20           Col::U(AV::Ival(lo, hi)) => ZI {{ lo: zn_splat(*lo), hi: zn_splat(*hi) }},\n\
                  \x20           Col::N(v) => ZI {{\n\
                  \x20               lo: ZN::from_array(core::array::from_fn(|i| v[at(i)])),\n\
                  \x20               hi: ZN::from_array(core::array::from_fn(|i| v[at(i)])),\n\
@@ -491,6 +491,11 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
              \x20   // produced row k cannot infer it from `take`.\n\
              \x20   let mut wrote: u16 = 0;\n\
              \x20   let take = take & ((1u32 << n) - 1) as u16;\n\
+             \x20   // The key columns come out of their registers ONCE.\n\
+             \x20   // `ZW::lane` is a store plus a load, so calling it\n\
+             \x20   // inside the loop would do that sixteen times for a\n\
+             \x20   // value that does not change.\n\
+             \x20   let (h1, h2) = (kv.h1.to_array(), kv.h2.to_array());\n\
              \x20   for i in 0..n {{\n\
              \x20       if take & (1 << i) == 0 {{ continue; }}",
             i = i
@@ -500,7 +505,7 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
         // shared across every assignment. All that is left here is the
         // table probe, which is inherently scalar: a hash table cannot
         // be vectorized, and at ~2M probes it does not need to be.
-        writeln!(o, "        if !seen.insert((kv.h1[i], kv.h2[i])) {{ continue; }}")?;
+        writeln!(o, "        if !seen.insert((h1[i], h2[i])) {{ continue; }}")?;
         for OutField { cell, ty, tainted, konst, .. } in &out.fields {
             if konst.is_some() {
                 continue; // written once by `acc`, not per row

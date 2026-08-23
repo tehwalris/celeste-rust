@@ -3501,6 +3501,36 @@ Two things that had to survive and did:
   you building the tool that would fix it). The gate then confirmed the
   hand edit is BYTE-IDENTICAL to what the emitter produces.
 
+### The REAL number (2026-08-23)
+
+Room (1,0), 30 frames, traced kernels, all frames row-key identical to
+the interpreter:
+
+| | array lanes | register lanes | |
+|---|---|---|---|
+| kernels, 30 frames | 177.3 ms | **98.0 ms** | 1.81x |
+| ...of which the kernel phase | ~154 ms | **72.8 ms** | 2.1x |
+| ...boundary | ~23 ms | 21.9 ms | unchanged |
+| vs the interpreter | 1.26x | **2.27x** | |
+| build, wall | 259.8 s | **46.6 s** | 5.6x |
+| build, CPU | 629.7 s | **154.5 s** | 4.1x |
+
+**1.81x, not the synthetic's 17.5x**, and the gap is accounted for
+rather than mysterious:
+
+* Only **74% of the time is kernel code at all** (72.8 of 98.0 ms). The
+  boundary is 21.9 ms and did not change - it is engine code operating
+  on materialised rows, not lane arithmetic. Amdahl caps the whole thing
+  at 1.35x once the kernel is free.
+* The **holes** are still there: 22 `tile_flag_at`, 9 `mget`, 12
+  divide-family sites, each of which takes its operands out of the
+  register file and puts them back.
+* `append` is inherently scalar - it pushes into `Vec` columns one row
+  at a time - and the synthetic had no `append` at all.
+
+So the next lever is not more vectorization of the kernel. It is the
+BOUNDARY, which is now 22% of a much smaller total.
+
 **Holes that remain**, with counts rather than adjectives: 4 `zn_div`,
 4 `zn_rem`, 4 `zi_div_pos`, 9 `zn_mget`, 22 `zn_tile_flag_at`, against
 ~13,700 nodes. Philippe is right that divide is reachable - `f64` holds
