@@ -608,6 +608,154 @@ impl Rt2 {
         self.boundary_dedup()
     }
 
+    /// Renumber every cell into CANONICAL order, and compact.
+    ///
+    /// Breadth-first from the globals in global-index order, children in
+    /// stored order - the discovery order IS the numbering. Two blocks
+    /// with isomorphic heaps therefore compact to identical structures,
+    /// which is what makes them concatenable and the row hash
+    /// block-independent, so cross-block dedup is exact.
+    ///
+    /// Separate from `boundary_canonicalize` so that a producer which
+    /// claims to emit canonical ids already can be CHECKED against the
+    /// one implementation of the rule, rather than against a second copy
+    /// of it (`trace::bind::structure_of` is such a producer).
+    pub fn canonicalize_ids(&mut self) {
+        // Canonical field order. Objects created by the compiled program
+        // carry fields in STORE order; the importer sorts them by name.
+        // Sort here so the canonical BFS (child discovery order) and the
+        // shape hash see ONE order regardless of an object's lineage -
+        // without this an engine-spawned player and an imported one hash
+        // to different shapes and every downstream cell id diverges
+        // (found by gate 2 on the f020 -> f025 spawn transition).
+        for cell in self.structure.iter_mut() {
+            if let Cell2::Obj(fields) = cell {
+                fields.sort_by_key(|(k, _)| celeste_names::FIELD_NAMES[*k as usize]);
+            }
+        }
+        // Canonical reachability BFS from globals in GLOBAL-INDEX order,
+        // fields/items in stored order - the discovery order IS the
+        // canonical cell numbering, so two blocks with isomorphic heaps
+        // compact to IDENTICAL structures and can be concatenated, and the
+        // row hash is block-independent (cross-block dedup is exact).
+        let mut order: Vec<u32> = Vec::new();
+        let mut new_id = vec![u32::MAX; self.structure.len()];
+        {
+            let mut queue: std::collections::VecDeque<u32> = Default::default();
+            fn enqueue(
+                t: u32,
+                new_id: &mut [u32],
+                queue: &mut std::collections::VecDeque<u32>,
+                order: &mut Vec<u32>,
+            ) {
+                if new_id[t as usize] == u32::MAX {
+                    new_id[t as usize] = order.len() as u32;
+                    order.push(t);
+                    queue.push_back(t);
+                }
+            }
+            for &cell in self.globals.iter() {
+                if cell != NONE {
+                    enqueue(cell, &mut new_id, &mut queue, &mut order);
+                }
+            }
+            while let Some(c) = queue.pop_front() {
+                match &self.structure[c as usize] {
+                    Cell2::Val => match &self.cols[c as usize] {
+                        Col::U(AV::Ptr(t)) => enqueue(*t, &mut new_id, &mut queue, &mut order),
+                        Col::U(_) | Col::N(_) | Col::I(_) => {}
+                        Col::V(vs) => {
+                            for v in vs {
+                                if let AV::Ptr(t) = v {
+                                    enqueue(*t, &mut new_id, &mut queue, &mut order);
+                                }
+                            }
+                        }
+                    },
+                    Cell2::Obj(fields) => {
+                        for (_, t) in fields {
+                            enqueue(*t, &mut new_id, &mut queue, &mut order);
+                        }
+                    }
+                    Cell2::Arr(items) => {
+                        for t in items {
+                            enqueue(*t, &mut new_id, &mut queue, &mut order);
+                        }
+                    }
+                    Cell2::Clo(_, caps) => {
+                        for cap in caps.iter() {
+                            match cap {
+                                Col::U(AV::Ptr(t)) => {
+                                    enqueue(*t, &mut new_id, &mut queue, &mut order)
+                                }
+                                Col::V(vs) => {
+                                    for v in vs {
+                                        if let AV::Ptr(t) = v {
+                                            enqueue(*t, &mut new_id, &mut queue, &mut order);
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Cell2::Unk | Cell2::Bi(_) => {}
+                }
+            }
+        }
+
+        // Compact: rebuild structure and columns over the live cells in
+        // canonical order, remapping every pointer (structural and
+        // per-lane value pointers).
+        let remap_av = |v: AV, new_id: &[u32]| -> AV {
+            match v {
+                AV::Ptr(t) => AV::Ptr(new_id[t as usize]),
+                other => other,
+            }
+        };
+        let remap_col = |c: &Col, new_id: &[u32]| -> Col {
+            match c {
+                Col::U(v) => Col::U(remap_av(*v, new_id)),
+                Col::V(vs) => Col::V(vs.iter().map(|v| remap_av(*v, new_id)).collect()),
+                Col::N(vs) => Col::N(vs.clone()),
+                Col::I(vs) => Col::I(vs.clone()),
+            }
+        };
+        let mut new_structure: Vec<Cell2> = Vec::with_capacity(order.len());
+        let mut new_cols: Vec<Col> = Vec::with_capacity(order.len());
+        for &old in &order {
+            let cell = match &self.structure[old as usize] {
+                Cell2::Val => Cell2::Val,
+                Cell2::Obj(fields) => Cell2::Obj(
+                    fields.iter().map(|(k, t)| (*k, new_id[*t as usize])).collect(),
+                ),
+                Cell2::Arr(items) => {
+                    Cell2::Arr(items.iter().map(|t| new_id[*t as usize]).collect())
+                }
+                Cell2::Unk => Cell2::Unk,
+                Cell2::Clo(f, caps) => Cell2::Clo(
+                    *f,
+                    caps.iter().map(|c| remap_col(c, &new_id)).collect(),
+                ),
+                Cell2::Bi(b) => Cell2::Bi(*b),
+            };
+            new_structure.push(cell);
+            new_cols.push(match &self.structure[old as usize] {
+                Cell2::Val => {
+                    collapse_uniform(compress_num(remap_col(&self.cols[old as usize], &new_id)))
+                }
+                _ => Col::U(AV::Nil),
+            });
+        }
+        for g in self.globals.iter_mut() {
+            if *g != NONE {
+                *g = new_id[*g as usize];
+            }
+        }
+        self.structure = new_structure;
+        self.cols = new_cols;
+    }
+
     /// The boundary WITHOUT the final within-block dedup: abstraction,
     /// canonical BFS compaction, and the per-lane row keys for ALL `width`
     /// lanes, in lane order. Split out for the D1 key gate
@@ -633,18 +781,6 @@ impl Rt2 {
                 for (i, m) in stale {
                     caps[i] = m;
                 }
-            }
-        }
-        // Canonical field order. Objects created by the compiled program
-        // carry fields in STORE order; the importer sorts them by name.
-        // Sort here so the canonical BFS (child discovery order) and the
-        // shape hash see ONE order regardless of an object's lineage -
-        // without this an engine-spawned player and an imported one hash
-        // to different shapes and every downstream cell id diverges
-        // (found by gate 2 on the f020 -> f025 spawn transition).
-        for cell in self.structure.iter_mut() {
-            if let Cell2::Obj(fields) = cell {
-                fields.sort_by_key(|(k, _)| celeste_names::FIELD_NAMES[*k as usize]);
             }
         }
         self.history.clear();
@@ -772,127 +908,7 @@ impl Rt2 {
 
         assert!(self.prints.is_empty(), "prints at a frame boundary: {:?}", self.prints);
 
-        // Canonical reachability BFS from globals in GLOBAL-INDEX order,
-        // fields/items in stored order - the discovery order IS the
-        // canonical cell numbering, so two blocks with isomorphic heaps
-        // compact to IDENTICAL structures and can be concatenated, and the
-        // row hash is block-independent (cross-block dedup is exact).
-        let mut order: Vec<u32> = Vec::new();
-        let mut new_id = vec![u32::MAX; self.structure.len()];
-        {
-            let mut queue: std::collections::VecDeque<u32> = Default::default();
-            fn enqueue(
-                t: u32,
-                new_id: &mut [u32],
-                queue: &mut std::collections::VecDeque<u32>,
-                order: &mut Vec<u32>,
-            ) {
-                if new_id[t as usize] == u32::MAX {
-                    new_id[t as usize] = order.len() as u32;
-                    order.push(t);
-                    queue.push_back(t);
-                }
-            }
-            for &cell in self.globals.iter() {
-                if cell != NONE {
-                    enqueue(cell, &mut new_id, &mut queue, &mut order);
-                }
-            }
-            while let Some(c) = queue.pop_front() {
-                match &self.structure[c as usize] {
-                    Cell2::Val => match &self.cols[c as usize] {
-                        Col::U(AV::Ptr(t)) => enqueue(*t, &mut new_id, &mut queue, &mut order),
-                        Col::U(_) | Col::N(_) | Col::I(_) => {}
-                        Col::V(vs) => {
-                            for v in vs {
-                                if let AV::Ptr(t) = v {
-                                    enqueue(*t, &mut new_id, &mut queue, &mut order);
-                                }
-                            }
-                        }
-                    },
-                    Cell2::Obj(fields) => {
-                        for (_, t) in fields {
-                            enqueue(*t, &mut new_id, &mut queue, &mut order);
-                        }
-                    }
-                    Cell2::Arr(items) => {
-                        for t in items {
-                            enqueue(*t, &mut new_id, &mut queue, &mut order);
-                        }
-                    }
-                    Cell2::Clo(_, caps) => {
-                        for cap in caps.iter() {
-                            match cap {
-                                Col::U(AV::Ptr(t)) => {
-                                    enqueue(*t, &mut new_id, &mut queue, &mut order)
-                                }
-                                Col::V(vs) => {
-                                    for v in vs {
-                                        if let AV::Ptr(t) = v {
-                                            enqueue(*t, &mut new_id, &mut queue, &mut order);
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    Cell2::Unk | Cell2::Bi(_) => {}
-                }
-            }
-        }
-
-        // Compact: rebuild structure and columns over the live cells in
-        // canonical order, remapping every pointer (structural and
-        // per-lane value pointers).
-        let remap_av = |v: AV, new_id: &[u32]| -> AV {
-            match v {
-                AV::Ptr(t) => AV::Ptr(new_id[t as usize]),
-                other => other,
-            }
-        };
-        let remap_col = |c: &Col, new_id: &[u32]| -> Col {
-            match c {
-                Col::U(v) => Col::U(remap_av(*v, new_id)),
-                Col::V(vs) => Col::V(vs.iter().map(|v| remap_av(*v, new_id)).collect()),
-                Col::N(vs) => Col::N(vs.clone()),
-                Col::I(vs) => Col::I(vs.clone()),
-            }
-        };
-        let mut new_structure: Vec<Cell2> = Vec::with_capacity(order.len());
-        let mut new_cols: Vec<Col> = Vec::with_capacity(order.len());
-        for &old in &order {
-            let cell = match &self.structure[old as usize] {
-                Cell2::Val => Cell2::Val,
-                Cell2::Obj(fields) => Cell2::Obj(
-                    fields.iter().map(|(k, t)| (*k, new_id[*t as usize])).collect(),
-                ),
-                Cell2::Arr(items) => {
-                    Cell2::Arr(items.iter().map(|t| new_id[*t as usize]).collect())
-                }
-                Cell2::Unk => Cell2::Unk,
-                Cell2::Clo(f, caps) => Cell2::Clo(
-                    *f,
-                    caps.iter().map(|c| remap_col(c, &new_id)).collect(),
-                ),
-                Cell2::Bi(b) => Cell2::Bi(*b),
-            };
-            new_structure.push(cell);
-            new_cols.push(match &self.structure[old as usize] {
-                Cell2::Val => {
-                    collapse_uniform(compress_num(remap_col(&self.cols[old as usize], &new_id)))
-                }
-                _ => Col::U(AV::Nil),
-            });
-        }
-        for g in self.globals.iter_mut() {
-            if *g != NONE {
-                *g = new_id[*g as usize];
-            }
-        }
-        self.structure = new_structure;
-        self.cols = new_cols;
+        self.canonicalize_ids();
 
         // Structure hash (uniform across lanes) - the block's shape key.
         let shape_hash = self.shape_hash_of();
