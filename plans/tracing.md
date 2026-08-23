@@ -2561,6 +2561,37 @@ This is the pre-dedup / `KeyPlan` item deferred earlier as "perf, not
 correctness" - it is now the entire gap, which is a good position: 46x
 of provable waste is an easier target than a 2.75x algorithmic deficit.
 
+### The 46x splits in two, and they want different fixes
+
+`FrameStat::rows_distinct` (behind `Run::census`, since it hashes every
+candidate row - the very work a pre-dedup avoids) counts DISTINCT raw
+rows before the boundary widens anything. Frame 30:
+
+    1,246,632 raw  ->  158,993 distinct  ->  27,024 out
+
+* **87% are EXACT duplicates** (7.8x). Two button assignments that agree
+  on a given lane produce byte-identical rows; the emitter's `variants`
+  dedup only removes assignments that agree on EVERY lane.
+* The remaining **5.9x** only the widenings can merge - rows that differ
+  in `rem`, in a pinned timer, in a clamped `dash_effect_time`.
+
+A plain hash set in `append` gets the first factor; the second needs a
+key that knows what the boundary is about to erase, which is the
+`KeyPlan`.
+
+But the first is NOT free, and the arithmetic matters before building
+it. Today: push 1.25M rows x ~100 columns, then the boundary hashes all
+1.25M. With an exact-duplicate filter: hash 1.25M, push 159k, boundary
+hashes 159k - roughly 1.8x, not 7.8x, because hashing a row costs about
+what pushing it costs.
+
+The way to get the rest is a CHEAPER KEY. Most output cells are folded
+constants - fixed by the shape, identical in every row - and hashing
+them contributes nothing. The emitter already knows which outputs are
+constant expressions, so a key over only the non-constant cells would
+cost a handful of mixes instead of a hundred. That is the version worth
+building.
+
 Caveats, stated so the number is not over-read: one room, one block, no
 chunking, no threads, against an interpreter with a year of tuning.
 

@@ -33,6 +33,7 @@ fn the_room_runs_on_kernels_alone() {
         celeste_rust::trace::run::start_block(root).expect("the block after _init");
     let mut run = celeste_rust::trace::run::Run::new(kernels::KERNELS, start, cart, cache)
         .expect("index the kernels by shape");
+    run.census = std::env::var_os("ROOM_CENSUS").is_some();
 
     // The oracle, IN LOCKSTEP. Built before the loop and stepped inside
     // it, so a run that stops at frame 25 has still checked 24 frames.
@@ -79,7 +80,7 @@ fn the_room_runs_on_kernels_alone() {
             st.rows_raw,
             st.rows_out,
             st.rows_raw / st.rows_out.max(1),
-            st.blocks_out,
+            st.rows_distinct,
             got.len()
         );
         if want != got {

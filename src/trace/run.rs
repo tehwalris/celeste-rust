@@ -49,6 +49,14 @@ pub struct FrameStat {
     /// survivors are the answer, so the ratio to `rows_out` is how much
     /// work the dedup is throwing away - and where a pre-dedup would go.
     pub rows_raw: usize,
+    /// DISTINCT raw rows, before the boundary widens anything.
+    ///
+    /// The gap between `rows_raw` and this is what a plain
+    /// exact-duplicate filter in `append` would remove; the gap between
+    /// this and `rows_out` is what only the boundary's widenings can
+    /// merge. Which of the two dominates decides whether a pre-dedup is
+    /// a hash set or a whole `KeyPlan`.
+    pub rows_distinct: usize,
     /// The surviving rows' keys. The row key already carries the shape
     /// hash, so this set is comparable across blocks and across engines -
     /// it is what a run is checked against.
@@ -62,6 +70,9 @@ pub struct Run {
     cache: Arc<CollisionCache>,
     blocks: Vec<Rt2>,
     frame: usize,
+    /// Count distinct raw rows per frame. A DIAGNOSTIC - it hashes every
+    /// candidate row, which is the very work a pre-dedup exists to avoid.
+    pub census: bool,
 }
 
 impl Run {
@@ -78,6 +89,7 @@ impl Run {
             cache,
             blocks: vec![start],
             frame: 0,
+            census: false,
         })
     }
 
@@ -146,6 +158,27 @@ impl Run {
         let mut keys: Vec<(u64, u64)> = Vec::new();
         let mut rows_out = 0;
         let rows_raw: usize = by_shape.values().flatten().map(|b| b.width).sum();
+        let mut rows_distinct = 0usize;
+        if self.census {
+            let mut seen: std::collections::HashSet<u64> = Default::default();
+            for b in by_shape.values().flatten() {
+                for lane in 0..b.width {
+                    let mut h: u64 = 0;
+                    for (c, cell) in b.structure.iter().enumerate() {
+                        if !matches!(cell, celeste_engine::runtime2::Cell2::Val) {
+                            continue;
+                        }
+                        h = h.wrapping_add(celeste_engine::runtime2::cell_mix(
+                            c as u64,
+                            b.cols[c].at(lane),
+                            0x9e37_79b9_7f4a_7c15,
+                        ));
+                    }
+                    seen.insert(h);
+                }
+            }
+            rows_distinct = seen.len();
+        }
         for (_, group) in by_shape {
             let mut b = Rt2::merge_many(group);
             // Representation, not semantics - but two things downstream
@@ -169,6 +202,7 @@ impl Run {
             rows_out,
             blocks_out: self.blocks.len(),
             rows_raw,
+            rows_distinct,
             keys,
         })
     }
