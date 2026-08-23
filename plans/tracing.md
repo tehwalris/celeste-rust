@@ -2026,6 +2026,76 @@ places where the tracer loses an invariant the game holds: three
 frozen-constant classes, one poisoned field, and one branch that leaves
 the room.
 
+## T22 - a kernel per SHAPE, and the three gaps generating it found
+
+Stage 1 of the end-to-end run Philippe asked for: a room (0,0)-style
+forward run compared against BENCHMARK_DATA's 6.44 s / 0.26 GB /
+387,443 rows. Three stages - a kernel per shape, a dispatcher, a frame
+loop - and this is the first.
+
+`trace::shapes` is the shape walk as production code rather than a test
+helper. `trace::kernel::room_kernels_in` traces one frame per shape with
+NO pm1 pin, so one kernel covers every key of its shape;
+`write_room_kernels` emits a module per shape plus the table a
+dispatcher indexes. It REFUSES rather than returning a partial set,
+because a shape the walk could not trace is a kernel that will not
+exist, and under the doctrine that is a run that stops.
+
+Each kernel gained a uniform `step(b, lo, n, accs) -> Option<u16>`.
+Every shape's `Uni`, `RowsIn` and `KOuts` are different types with the
+same names, so anything that exposed them could not be
+shape-independent; `step` and `acc` are the surface a dispatcher can
+hold as function pointers. `None` is "not my shape". `Some(mask)` is the
+lanes declined, which the doctrine turns into a stopped run.
+
+### The gaps, which is what generating is for
+
+**`renumber_cells` rebuilt the whole arena.** Shapes are traced into one
+graph so they share subexpressions, but `Op::Cell` ids are each frame's
+own dense slot indices - so the arena holds cells this frame's interface
+does not name, and rebuilding all of it fails on someone else's. Now it
+rebuilds only what the roots reach.
+
+**`tile_flag_at` assumed a block-uniform box.** It is uniform in almost
+every frame - a hitbox is fixed per object type - but not in the frame an
+object is CREATED: `init_object` gives it a default 8x8 which
+`type.init` may or may not replace, so the width arrives as a select on
+a per-lane condition. `zn_tile_flag_at_lanes` added; the emitter picks
+by the operands' representation, and the uniform form stays because
+`CollisionCache::solid_map` is keyed by (w, h) and a per-lane box cannot
+use it. `generated_is_current{,_r20}` pass, so the checked-in kernels
+are byte-identical.
+
+### OPEN: a select whose arms are a number and a boolean
+
+The generator currently stops here:
+
+    select arms disagree on domain: P8 vs ZB in
+    Sel(And(And(Le(Cell(20), Const(0)), And(...)),
+            Le(Sub(Cell(39), Const(1)), Const(0))),
+        Const(0, 0), Cell(272))
+
+`Cell(20)` is `freeze` and `Cell(39)` is `delay_restart`, so this is the
+RESTART path - `will_restart and delay_restart>0` then
+`delay_restart<=0`, which runs `load_room`. The true arm is a numeric
+zero; the false arm is an input cell the emitter types as a boolean.
+
+What is NOT the explanation: `joinable` already refuses to merge `Num`
+with `Bool`, and `heap::Slot` distinguishes them, so two states that
+disagree about a slot's type have different SHAPES and never merge.
+Where the mixed select comes from is not established.
+
+The next step is one diagnostic: which path is cell 272? `Iface::slots`
+has it, so printing the interface next to the failure names the slot,
+and the slot names the assignment.
+
+Two candidates worth holding in mind, neither checked. Lua's `and`/`or`
+genuinely return mixed types (`x and 0` is `false` or `0`), and
+`eval_binop` hands on `Value::Bool` for the kept operand - so the idiom
+can produce a value that is a number on one path and a boolean on the
+other without any heap merge. Or `shapes::blank` writes `Value::Num(0)`
+into a slot whose type it read wrong.
+
 ## Doctrine: never deopt to the interpreter (Philippe, 2026-08-23)
 
 **A deopt stops the run. It does not fall back.**
