@@ -28,12 +28,29 @@ if [ -z "${SKIP_RENDER:-}" ]; then
     cargo nextest run --cargo-profile quick \
         the_kernel_emitter_lowers_a_traced_graph --no-capture 2>&1 |
         grep -E '^\[emit\] (FUSED|rendered|RENDER)' || true
+
+    # And the ROOM's set - one kernel per shape the room reaches, plus
+    # the table the dispatcher indexes. Same reason as above: rendering
+    # them says nothing about whether they are Rust, and the end-to-end
+    # room test cannot run until they are.
+    echo "== rendering the room's kernel set"
+    cargo nextest run --cargo-profile quick --run-ignored all \
+        renders_a_kernel_for_every_shape --no-capture 2>&1 |
+        grep -E '^\[kernels\]' || true
 fi
 
 [ -f "$out" ] || { echo "no $out - did the probe run?" >&2; exit 1; }
 
 check="$repo/traced-kernel-check"
 cp "$out" "$check/src/kernel.rs"
+
+rooms="$repo/target/traced-kernels"
+if [ -d "$rooms" ]; then
+    rm -rf "$check/src/kernels"
+    cp -r "$rooms" "$check/src/kernels"
+    echo "== room kernels: $(ls "$check/src/kernels" | grep -c '^kernel') shapes, \
+$(cat "$check/src/kernels"/kernel*.rs | wc -l) lines"
+fi
 
 echo "== compiling and RUNNING $(wc -l < "$out") lines in $check"
 cd "$check" && cargo test --release -- --nocapture

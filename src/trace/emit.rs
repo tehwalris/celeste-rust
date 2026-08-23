@@ -114,6 +114,34 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph) -> Result<Bound> {
     let (graph, roots) = crate::trace::bind::renumber_cells(g, &f.in_cells, &roots)
         .map_err(|e| anyhow::anyhow!("{:#}\nwhere the roots are\n{}", e, root_legend(f)))?;
 
+    // Only the cells the graph actually READS.
+    //
+    // `symbolize` turns every scalar under the roots into a cell, and
+    // some of them are dead by construction: `__reset_button_states`
+    // runs before the frame body, so the six button cells are
+    // overwritten before anything looks at them. Declaring one anyway is
+    // not merely wasteful - the kernel's row gather demands a DECIDED
+    // boolean, and a button cell at a frame boundary is `AV::UBool`, so
+    // a dead input is a block the kernel refuses for a value it was
+    // never going to read.
+    //
+    // Dropping it costs no check. What a kernel must agree with a block
+    // about is its SHAPE, and that is the dispatcher's hash, not this
+    // list.
+    let mut used = vec![false; graph.len()];
+    let mut stack: Vec<NodeId> = roots.clone();
+    let mut reads: std::collections::BTreeSet<u32> = Default::default();
+    while let Some(n) = stack.pop() {
+        if used[n as usize] {
+            continue;
+        }
+        used[n as usize] = true;
+        if let crate::transpile::graph::Op::Cell(c) = graph.get(n).op {
+            reads.insert(c);
+        }
+        stack.extend(graph.get(n).args.iter().copied());
+    }
+
     let mut inputs: Vec<(u32, &'static str)> = Vec::new();
     let mut uni: Vec<(u32, &'static str)> = Vec::new();
     for (i, c) in f.iface.init.iter().enumerate() {
@@ -122,6 +150,9 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph) -> Result<Bound> {
             crate::trace::iface::Conc::Bool(_) => "bool",
         };
         let cell = f.in_cells[i];
+        if !reads.contains(&cell) {
+            continue;
+        }
         if crate::trace::iface::show(&f.iface.slots[i]).contains(".hitbox.") {
             uni.push((cell, kind));
         } else {

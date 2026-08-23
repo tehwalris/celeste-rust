@@ -31,3 +31,4 @@ crates/celeste-kernels/src/fused_gen_player.rs
 traced-kernel-check/src/kernel.rs
 traced-kernel-check/target/
 target/traced-kernel.rs
+traced-kernel-check/src/kernels/

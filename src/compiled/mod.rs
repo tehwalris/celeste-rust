@@ -168,7 +168,7 @@ pub fn print_chunk_phase_times() {
     }
 }
 
-fn boundary_ids() -> runtime2::BoundaryIds {
+pub(crate) fn boundary_ids() -> runtime2::BoundaryIds {
     let g = |name: &str| gen::global_id(name).unwrap_or_else(|| panic!("no global {}", name));
     let f = |name: &str| gen::field_id(name).unwrap_or_else(|| panic!("no field {}", name));
     runtime2::BoundaryIds {

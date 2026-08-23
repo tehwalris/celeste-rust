@@ -2085,16 +2085,103 @@ with `Bool`, and `heap::Slot` distinguishes them, so two states that
 disagree about a slot's type have different SHAPES and never merge.
 Where the mixed select comes from is not established.
 
-The next step is one diagnostic: which path is cell 272? `Iface::slots`
-has it, so printing the interface next to the failure names the slot,
-and the slot names the assignment.
+RESOLVED, T23. It was neither arm's type. See below.
 
-Two candidates worth holding in mind, neither checked. Lua's `and`/`or`
-genuinely return mixed types (`x and 0` is `false` or `0`), and
-`eval_binop` hands on `Value::Bool` for the kept operand - so the idiom
-can produce a value that is a number on one path and a boolean on the
-other without any heap merge. Or `shapes::blank` writes `Value::Num(0)`
-into a slot whose type it read wrong.
+## T23 - the mixed select was a STALE expression, and the room runs
+
+### The bug
+
+`shapes::blank` erased every non-frozen scalar between frames and left
+`State::guard` and `State::ok` alone. Those two belong to the frame that
+PRODUCED the state, not to the one about to be traced from it.
+
+`guard` is what a merge selects on. A stale one therefore puts the
+PREVIOUS frame's input cells inside THIS frame's output values - and cell
+ids are each frame's own dense slot indices, so cell 39 is
+`delay_restart` in one frame and something else in the other. Every
+symptom follows:
+
+- "select arms disagree on domain: P8 vs ZB" - a numeric arm and
+  `objects[0].flip.x`, assembled under a condition from a finished trace.
+- "Op::Cell(18) is not an interface slot (17 slots)" - the same stale
+  expression seen from the shape whose interface is 17 globals because
+  its object list is empty. This one only appeared after binding ALL
+  shapes rather than stopping at the first, which is why it looked like a
+  second bug.
+
+Neither candidate from T22 was it. Lua's `and`/`or` do return mixed
+types, but `eval_binop` FANS OUT on them, and two states that disagree
+about a slot's type have different shapes, so they never reach `join`.
+Philippe asked whether to just allow the mixed merge; the answer is no,
+and not because it would be hard - it would have needed a tagged column
+in the block model to compile an expression that should not have existed.
+
+Dropping `ok` is not dropping an obligation: a lane only reaches this
+state by satisfying the previous kernel's `ok`, which that kernel checks.
+Re-checking it would deopt a lane twice for one obligation, and would
+need cells this frame does not have.
+
+Three diagnostics stayed, one per round trip the hunt cost: a lowering
+failure names its cells by path (`trace::kernel::name_cells`), a foreign
+cell prints the chain of ops that reached it
+(`trace::bind::why_reached`), and that chain's root index gets a legend
+saying which outcome and field it is (`trace::emit::root_legend`).
+
+### What the probe also found, and what it means
+
+The blanked states carry two closure-captured locals - `init_object`'s
+`x` and `y`, held by the seven closures it stores on every object. They
+are STATE the engine does not model at all: `structure_of` emits
+`Cell2::Clo(0, [])`, dropping captures, exactly as the importer does.
+
+That is sound only while nothing reads one, and that is checked rather
+than assumed: a captured local's value is an expression over the previous
+frame's cells, so a traced output that read one would reach a cell this
+frame's interface does not name - which is the refusal above, now with a
+chain that names the field. Nothing reads them today (`obj.collide` and
+friends use `obj.x`, not `x`).
+
+The check has a hole worth stating: it only fires when the captured value
+is SYMBOLIC. In a state reached by concrete execution the value is a
+constant, and a read would silently fold it in. The shape walk reaches
+every shape from a blanked state, so every shape's frame is checked; the
+hole is the reference frame, which is a probe.
+
+### Stage 2 - the dispatcher
+
+`trace::dispatch`. The key is the SHAPE HASH, not whether `bind`
+succeeds: binding is by path, and the empty-object-list shape's slots are
+a SUBSET of the shape with a player in it, so its `bind` succeeds against
+a block it was not traced for and then computes a frame that assumed no
+objects. `Rt2::shape_hash_of` hashes the whole canonical structure, so it
+separates them, and dispatch is a map lookup with no candidate run to
+find out it was wrong.
+
+Each kernel gained `pub const SHAPE: u64`. `Kernel` itself moved OUT of
+the generated `mod.rs` into `trace::dispatch`, next to the loop that
+consumes it - a generated copy of a struct the loop must agree with is a
+signature mismatch waiting for a regeneration.
+
+### Stage 3 - the frame loop
+
+`trace::run::Run`, a new loop rather than `compiled::FrameEngine`. That
+engine is a pair of paths and a policy for choosing between them, and the
+second path is the interpreter. What carried over is the mechanical part:
+16-lane slices (the kernels' declined-lane mask is a `u16`, so that width
+is the mask's and not a tuning knob), one accumulator per output shape,
+merge-by-shape BEFORE the boundary because dedup is exact only within a
+block, and the boundary itself, which is the engine's and is not
+reimplemented.
+
+A block with no kernel and a kernel that declines lanes both STOP the
+run, with the shape hash or the lane count in the message. That is the
+doctrine, not a limitation.
+
+`trace::bind::concrete_block` is where a run starts: the state after
+`_init` with every scalar at its real value, including the ones the
+tracer freezes as program constants - a kernel never reads those, but
+they are part of the row key and therefore part of what a run is compared
+against.
 
 ## Doctrine: never deopt to the interpreter (Philippe, 2026-08-23)
 

@@ -51,6 +51,7 @@
 
 pub mod bind;
 pub mod cart;
+pub mod dispatch;
 pub mod domain;
 pub mod emit;
 pub mod eval;
@@ -58,6 +59,7 @@ pub mod heap;
 pub mod iface;
 pub mod kernel;
 pub mod interp;
+pub mod run;
 pub mod shapes;
 pub mod probe;
 pub mod state;

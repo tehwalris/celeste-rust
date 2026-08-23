@@ -1,0 +1,200 @@
+//! The frame loop, over TRACED kernels.
+//!
+//! One frame is: dispatch each block to its shape's kernel, run every
+//! 16-lane slice of it, collect the outcome accumulators, merge the ones
+//! that agree on shape, and put the result through the engine's boundary.
+//! Repeat.
+//!
+//! This is deliberately NOT `compiled::FrameEngine`. That engine is a
+//! pair of paths and a policy for choosing between them, and the second
+//! path is the interpreter - the thing this campaign exists to stop
+//! depending on. What is worth carrying over from it is the mechanical
+//! part, and that is what is here: 16-lane slices, one accumulator per
+//! output shape, merge before the boundary rather than after, and the
+//! boundary itself, which is the engine's and is not reimplemented.
+//!
+//! ## A frame that cannot run stops the run
+//!
+//! Two ways it happens, and neither is a degraded mode (CLAUDE.md):
+//! a block whose shape has no kernel, and a kernel that declines lanes.
+//! Both report what they saw - the shape hash, the lane count - and
+//! return an error, so the caller checkpoints and exits rather than
+//! absorbing the gap at a thousand times the cost.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use anyhow::{bail, Context, Result};
+
+use celeste_core::cart_data::CartData;
+use celeste_core::collision_cache::CollisionCache;
+use celeste_engine::runtime2::{BoundaryIds, Rt2};
+
+use super::dispatch::{Dispatch, Kernel};
+
+/// The width one `step` call covers. The kernels report declined lanes
+/// as a `u16`, so this is the mask's width and not a tuning parameter.
+const SLICE: usize = 16;
+
+/// What one frame did.
+pub struct FrameStat {
+    pub frame: usize,
+    /// Lanes entering the frame, over all blocks.
+    pub rows_in: usize,
+    /// Lanes surviving the boundary's dedup.
+    pub rows_out: usize,
+    pub blocks_out: usize,
+    /// The surviving rows' keys. The row key already carries the shape
+    /// hash, so this set is comparable across blocks and across engines -
+    /// it is what a run is checked against.
+    pub keys: Vec<(u64, u64)>,
+}
+
+pub struct Run {
+    dispatch: Dispatch,
+    ids: BoundaryIds,
+    cart: Arc<CartData>,
+    cache: Arc<CollisionCache>,
+    blocks: Vec<Rt2>,
+    frame: usize,
+}
+
+impl Run {
+    pub fn new(
+        kernels: &'static [Kernel],
+        start: Rt2,
+        cart: Arc<CartData>,
+        cache: Arc<CollisionCache>,
+    ) -> Result<Self> {
+        Ok(Run {
+            dispatch: Dispatch::new(kernels)?,
+            ids: crate::compiled::boundary_ids(),
+            cart,
+            cache,
+            blocks: vec![start],
+            frame: 0,
+        })
+    }
+
+    pub fn blocks(&self) -> &[Rt2] {
+        &self.blocks
+    }
+
+    /// One frame. Errors are coverage gaps, and the caller is expected to
+    /// treat them as a stop.
+    pub fn step(&mut self) -> Result<FrameStat> {
+        self.frame += 1;
+        let rows_in: usize = self.blocks.iter().map(|b| b.width).sum();
+
+        let mut produced: Vec<Rt2> = Vec::new();
+        for b in std::mem::take(&mut self.blocks) {
+            let k = self.dispatch.find(&b).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "frame {}: no kernel for shape {:#x} ({} lanes, {} cells); \
+                     the shape walk did not reach it",
+                    self.frame,
+                    b.shape_hash_of(),
+                    b.width,
+                    b.structure.len()
+                )
+            })?;
+            let mut accs: Vec<Rt2> =
+                (0..k.outcomes).map(|i| (k.acc)(i, self.cart.clone(), self.cache.clone())).collect();
+            let mut declined = 0usize;
+            let mut lo = 0;
+            while lo < b.width {
+                let n = SLICE.min(b.width - lo);
+                let mask = (k.step)(&b, lo, n, &mut accs).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "frame {}: {} did not bind a block of its own shape {:#x}: {}",
+                        self.frame,
+                        k.name,
+                        k.shape,
+                        (k.why)(&b).unwrap_or_else(|| {
+                            "every slot resolves - `bind` and `bind_why` disagree".into()
+                        })
+                    )
+                })?;
+                declined += mask.count_ones() as usize;
+                lo += n;
+            }
+            if declined > 0 {
+                bail!(
+                    "frame {}: {} declined {} of {} lanes - a lane whose `ok` \
+                     the kernel could not discharge",
+                    self.frame,
+                    k.name,
+                    declined,
+                    b.width
+                );
+            }
+            produced.extend(accs.into_iter().filter(|a| a.width > 0));
+        }
+
+        // Merge before the boundary, not after: dedup is exact only over
+        // rows in one block, and two lanes that agree came from different
+        // outcomes of different blocks as often as not.
+        let mut by_shape: BTreeMap<u64, Vec<Rt2>> = BTreeMap::new();
+        for b in produced {
+            by_shape.entry(b.shape_hash_of()).or_default().push(b);
+        }
+        let mut keys: Vec<(u64, u64)> = Vec::new();
+        let mut rows_out = 0;
+        for (_, group) in by_shape {
+            let mut b = Rt2::merge_many(group);
+            // Representation, not semantics - but two things downstream
+            // insist on it. The boundary's timer pin accepts a uniform
+            // number or a value column and panics on a per-lane one, and
+            // a kernel's block-uniform inputs (the hitboxes) bind only
+            // against `Col::U`. A kernel writes a lane vector whether or
+            // not the lanes agree, so nothing else would ever collapse
+            // one.
+            b.collapse_uniform_cols();
+            b.boundary(&self.ids);
+            rows_out += b.width;
+            keys.extend(b.row_keys.iter().copied());
+            self.blocks.push(b);
+        }
+        keys.sort_unstable();
+
+        Ok(FrameStat {
+            frame: self.frame,
+            rows_in,
+            rows_out,
+            blocks_out: self.blocks.len(),
+            keys,
+        })
+    }
+}
+
+/// The block a traced room's run starts from: the state after `_init`,
+/// with every scalar at its real value.
+pub fn start_block(
+    root: &std::path::Path,
+) -> Result<(Rt2, Arc<CartData>, Arc<CollisionCache>)> {
+    use super::domain::Symbolic;
+    use super::interp::Interp;
+    use super::verify::run_one;
+    use super::cart;
+    use anyhow::anyhow;
+
+    let src = cart::sources_in(root)?;
+    let top = full_moon::parse(&src).map_err(|e| anyhow!("parse: {:?}", e))?;
+    let init = full_moon::parse("_init()").map_err(|e| anyhow!("parse _init: {:?}", e))?;
+
+    let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
+    let cart_data = Arc::new(CartData::load(root.join("cart"))?);
+    let (rx, ry) = celeste_interp::game_runner::start_room();
+    let cache = Arc::new(CollisionCache::new(&cart_data, rx, ry)?);
+    it.cache = Some(cache.clone());
+    it.cart = Some(cart_data.clone());
+
+    let st = cart::fresh_state::<Symbolic>(&mut it.d);
+    let mut st = run_one(&mut it, &top, st)?;
+    cart::inject_tile_flag_at(&mut st);
+    let st = run_one(&mut it, &init, st)?;
+
+    let b = super::bind::concrete_block(&st, &it.d, cart_data.clone(), cache.clone())
+        .context("the state after _init is not a concrete block")?;
+    Ok((b, cart_data, cache))
+}

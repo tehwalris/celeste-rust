@@ -256,6 +256,44 @@ fn why_reached(
     "no root".to_string()
 }
 
+
+/// A ONE-LANE block holding a traced state's actual values.
+///
+/// `structure_of` describes where things go; this also puts them there.
+/// It is how a run STARTS: the state after `_init` is fully concrete, and
+/// the first block has to hold the values of every scalar - including the
+/// ones the tracer froze as program constants, which a kernel never reads
+/// but which are part of the row key and therefore part of what a run is
+/// compared against.
+///
+/// Refuses a scalar the domain cannot decide, because a block has no
+/// representation for one. The caller wanted a concrete state.
+pub fn concrete_block(
+    st: &super::state::State<super::domain::Symbolic>,
+    d: &super::domain::Symbolic,
+    cart: std::sync::Arc<celeste_core::cart_data::CartData>,
+    cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
+) -> Result<Rt2> {
+    use super::domain::Domain;
+    use super::heap::Value;
+
+    let mut rt2 = structure_of(st, cart, cache)?;
+    for p in super::iface::scalars(st, &[])? {
+        let cell = resolve(&rt2, &p)? as usize;
+        let v = match super::iface::get(st, &p) {
+            Some(Value::Num(n)) => AV::Num(
+                d.as_const(&n).ok_or_else(|| anyhow!("{}: not a constant", show(&p)))?,
+            ),
+            Some(Value::Bool(b)) => AV::Bool(
+                d.decide(&b).ok_or_else(|| anyhow!("{}: not a constant", show(&p)))?,
+            ),
+            other => bail!("{}: {:?} is not a scalar", show(&p), other.is_some()),
+        };
+        rt2.cols[cell] = Col::U(v);
+    }
+    Ok(rt2)
+}
+
 /// Rebuild a traced graph with the ENGINE's cell ids.
 ///
 /// The tracer numbers its input cells `Op::Cell(0..n)` in `Iface` order,

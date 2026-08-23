@@ -89,6 +89,23 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
         l.variants.len()
     )?;
 
+    // The block this kernel is FOR, as the engine hashes it.
+    //
+    // Binding by path is not a shape test: shape 2's paths are a subset
+    // of shape 0's - it is the same room with an empty object list - so
+    // its `bind` succeeds against a shape-0 block and then computes a
+    // frame that assumed no objects. The hash is the whole canonical
+    // structure, so it distinguishes them, and it is what the dispatcher
+    // keys on. `structure_of` builds this block in canonical order
+    // already, which is what makes the hash comparable with one taken
+    // after the boundary.
+    writeln!(
+        o,
+        "/// The canonical shape this kernel was traced for.\n\
+         pub const SHAPE: u64 = {};\n",
+        f.in_rt2.shape_hash_of()
+    )?;
+
     // ---- inputs ----
     let slot_list = |o: &mut String, name: &str, cells: &[(u32, &'static str)]| -> Result<()> {
         writeln!(o, "/// (path, kind) - resolved against a block at bind time.")?;
@@ -157,6 +174,64 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
     }
     writeln!(o, "    }};")?;
     writeln!(o, "    Some((u, s))\n}}\n")?;
+
+    // The SAME walk, reporting instead of refusing.
+    //
+    // `bind` returns `Option` because it is on the hot path and the
+    // caller only has one thing to do with a failure. But under the
+    // never-deopt doctrine that failure STOPS the run, and "did not
+    // bind" is not a report anyone can act on - which slot, and holding
+    // what, is. Kept in step by construction: both are generated from
+    // the same two slot lists.
+    writeln!(
+        o,
+        "/// Which slot stopped `bind`. `None` means it would have bound.\n\
+         pub fn bind_why(b: &Rt2) -> Option<String> {{\n\
+         \x20   for (p, kind) in UNI_SLOTS {{\n\
+         \x20       let Ok(c) = resolve_path(b, p) else {{\n\
+         \x20           return Some(format!(\"{{}}: no such slot\", p));\n\
+         \x20       }};\n\
+         \x20       let col = &b.cols[c as usize];\n\
+         \x20       let ok = matches!(\n\
+         \x20           (*kind, col),\n\
+         \x20           (\"num\", Col::U(AV::Num(_))) | (\"bool\", Col::U(AV::Bool(_)))\n\
+         \x20       );\n\
+         \x20       if !ok {{\n\
+         \x20           return Some(format!(\n\
+         \x20               \"{{}}: block-uniform {{}} slot holds {{:?}}\",\n\
+         \x20               p, kind, col\n\
+         \x20           ));\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         \x20   for (p, kind) in ROW_SLOTS {{\n\
+         \x20       let Ok(c) = resolve_path(b, p) else {{\n\
+         \x20           return Some(format!(\"{{}}: no such slot\", p));\n\
+         \x20       }};\n\
+         \x20       let col = &b.cols[c as usize];\n\
+         \x20       let lanes = (0..b.width).map(|i| col.at(i));\n\
+         \x20       let ok = match *kind {{\n\
+         \x20           \"num\" => lanes.clone().all(|v| matches!(v, AV::Num(_))),\n\
+         \x20           _ => lanes.clone().all(|v| matches!(v, AV::Bool(_))),\n\
+         \x20       }};\n\
+         \x20       if !ok {{\n\
+         \x20           let bad = lanes.enumerate().find(|(_, v)| match *kind {{\n\
+         \x20               \"num\" => !matches!(v, AV::Num(_)),\n\
+         \x20               _ => !matches!(v, AV::Bool(_)),\n\
+         \x20           }});\n\
+         \x20           return Some(format!(\n\
+         \x20               \"{{}}: per-lane {{}} slot holds {{:?}} at lane {{:?}}\",\n\
+         \x20               p, kind, bad.map(|(_, v)| v), bad.map(|(i, _)| i)\n\
+         \x20           ));\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         \x20   // Every slot resolves and every lane is the right kind, so\n\
+         \x20   // what stopped `rows` is REPRESENTATION: a column whose\n\
+         \x20   // values are right but whose storage the gather does not\n\
+         \x20   // accept (a `Col::V` of numbers where it wants `Col::N`).\n\
+         \x20   // `collapse_uniform_cols` is the usual missing step.\n\
+         \x20   None\n\
+         }}\n"
+    )?;
 
     writeln!(
         o,
@@ -754,8 +829,9 @@ pub fn write_room_kernels(root: &std::path::Path, dir: &std::path::Path) -> Resu
         writeln!(decl, "#[path = \"kernel{i}.rs\"]\npub mod k{i};", i = i)?;
         writeln!(
             table,
-            "    Kernel {{ name: \"shape {i}\", outcomes: k{i}::OUTCOMES, \
-             acc: k{i}::acc, step: k{i}::step }},",
+            "    Kernel {{ name: \"shape {i}\", shape: k{i}::SHAPE, \
+             outcomes: k{i}::OUTCOMES, acc: k{i}::acc, step: k{i}::step, \
+             why: k{i}::bind_why }},",
             i = i
         )?;
     }
@@ -769,25 +845,16 @@ pub fn write_room_kernels(root: &std::path::Path, dir: &std::path::Path) -> Resu
          // names, so they coexist only as separate modules - which is\n\
          // why `step` and `acc` exist: they are the uniform surface a\n\
          // dispatcher can hold as function pointers.\n\
+         //\n\
+         // `Kernel` is NOT declared here. It lives in\n\
+         // `celeste_rust::trace::dispatch`, with the frame loop that\n\
+         // consumes it - a generated copy would have to be kept in step\n\
+         // with that loop by hand, and regenerating is not a good moment\n\
+         // to discover a signature changed.\n\
          #![allow(clippy::all)]\n\
-         use celeste_core::cart_data::CartData;\n\
-         use celeste_core::collision_cache::CollisionCache;\n\
-         use celeste_engine::runtime2::Rt2;\n\
-         use std::sync::Arc;\n\
+         pub use celeste_rust::trace::dispatch::Kernel;\n\
          \n\
          {decl}\n\
-         /// One shape's kernel, behind a shape-independent surface.\n\
-         pub struct Kernel {{\n\
-         \x20   pub name: &'static str,\n\
-         \x20   /// How many output shapes one frame can end in.\n\
-         \x20   pub outcomes: usize,\n\
-         \x20   /// An empty accumulator with outcome `i`'s shape.\n\
-         \x20   pub acc: fn(usize, Arc<CartData>, Arc<CollisionCache>) -> Rt2,\n\
-         \x20   /// `None`: not this kernel's shape. `Some(mask)`: the\n\
-         \x20   /// lanes it declined, which the doctrine says stops the run.\n\
-         \x20   pub step: fn(&Rt2, usize, usize, &mut [Rt2]) -> Option<u16>,\n\
-         }}\n\
-         \n\
          pub const KERNELS: &[Kernel] = &[\n\
          {table}];\n",
         decl = decl,
