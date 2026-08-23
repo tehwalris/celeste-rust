@@ -75,6 +75,76 @@ pub fn zi_of_zn(v: ZN) -> ZI {
     ZI { lo: v, hi: v }
 }
 
+/// One machine-word column slice: the row-key fold's accumulator, and the
+/// bits of one cell's value, 16 lanes at a time.
+///
+/// The ONLY lane type here that is not an abstract game value. It exists
+/// so the fold can be part of the graph instead of a scalar loop inside
+/// `append`. The fold stays sequential over CELLS - each step depends on
+/// the last - while every step is 16 lanes wide, and the lanes are the
+/// axis the parallelism actually lives on. Measured 2026-08-23, the
+/// scalar-per-lane version was 75% of ALL kernel time: ~190 `imul`s per
+/// row in one dependency chain, over 2.17M candidate rows, 87% of which
+/// were then dropped as duplicates.
+pub type ZW = [u64; W];
+
+#[inline(always)]
+pub fn zw_splat(v: u64) -> ZW {
+    [v; W]
+}
+
+/// The representation BITS of one cell's value - not a hash, just the bit
+/// pattern the fold consumes, packed so that two abstract values which
+/// differ differ here too.
+#[inline(always)]
+pub fn zw_bits_n(x: ZN) -> ZW {
+    let mut o = [0u64; W];
+    for i in 0..W {
+        o[i] = x[i].as_raw_u32() as u64;
+    }
+    o
+}
+#[inline(always)]
+pub fn zw_bits_i(x: ZI) -> ZW {
+    let mut o = [0u64; W];
+    for i in 0..W {
+        o[i] = ((x.lo[i].as_raw_u32() as u64) << 32) | (x.hi[i].as_raw_u32() as u64);
+    }
+    o
+}
+/// Two bits per lane: the value where it is known, and whether it is.
+#[inline(always)]
+pub fn zw_bits_b(x: ZB) -> ZW {
+    let mut o = [0u64; W];
+    for i in 0..W {
+        o[i] = (((x.val >> i) & 1) as u64) | ((((x.known >> i) & 1) as u64) << 1);
+    }
+    o
+}
+
+/// One step of the row-key fold, over the accumulator and one cell's
+/// bits. TWO accumulators mixed differently, so the pair is 128 bits: a
+/// collision here DROPS a successor rather than merely costing time.
+///
+/// The cell id goes in as well as the value, so the key is not invariant
+/// under moving a value from one field to another.
+#[inline(always)]
+pub fn zw_mix1(h: ZW, v: ZW, c: u64) -> ZW {
+    let mut o = [0u64; W];
+    for i in 0..W {
+        o[i] = mix64(h[i] ^ mix64(v[i] ^ c));
+    }
+    o
+}
+#[inline(always)]
+pub fn zw_mix2(h: ZW, v: ZW, c: u64) -> ZW {
+    let mut o = [0u64; W];
+    for i in 0..W {
+        o[i] = h[i].wrapping_add(mix64(v[i].wrapping_mul((c << 1) | 1)));
+    }
+    o
+}
+
 macro_rules! zn_map2 {
     ($name:ident, $op:expr) => {
         #[inline(always)]

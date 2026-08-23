@@ -312,3 +312,108 @@ Group-driven emission (96 sink calls -> 68) is correct - 30 frames
 row-key identical - and worth **nothing**: 353 ms vs 356 ms, inside the
 noise. The sink call count was never the cost. Keep it for the smaller
 generated code, not for speed.
+
+## The fix: fold the row key IN THE GRAPH (2026-08-23)
+
+Philippe's call, and it subsumes both hand-rolled fixes above.
+
+The insight I had missed: the fold being sequential over CELLS is not the
+problem. The 16 LANES are the axis the parallelism lives on, and a graph
+node is already 16 lanes wide. So the chain stays exactly as long while
+every link does sixteen rows at once - and hash-consing shares the
+button-independent PREFIX across all 24 assignments for free, which is
+fix 1 without having to weaken the hash to a commutative combine. The
+hash function itself is unchanged.
+
+Verified before building it: `mix64` written as plain Rust over a
+`[u64; 16]`, compiled with the `target-cpu=native` the repo already
+passes, emits 8 `vpmullq` and ZERO scalar `imul`. AVX-512 with `avx512dq`
+is present on this machine. No intrinsics needed.
+
+### What it added
+
+- `celeste-engine`: `ZW = [u64; W]` plus `zw_splat`, `zw_bits_{n,i,b}`,
+  `zw_mix{1,2}`. The only lane type here that is not an abstract game
+  value.
+- `transpile::graph`: `Op::Word(u64)` (the seed), `Op::Bits` (the
+  representation bits of one value), `Op::Mix(cell, half)` (one fold
+  step). A separated layer: it reads the value layer and nothing feeds
+  back, so the value layer is still exactly what the interpreter checks.
+- `transpile::lower`: `Dom::Word`, its `Repr`/coercion/render arms, and
+  the fold construction in `emit_body` - built in the SPECIALIZED arena,
+  after `ival::fold`, with the agreed cells ordered FIRST so the shared
+  part is a prefix.
+- `Emit::row_key`, ON for the tracer and OFF for the walk. The walk's
+  kernels have no write-time dedup, so a key there would be dead lets in
+  a CHECKED-IN generated file. The checked-in kernels are byte-identical.
+- `trace::kernel`: `KOut{i}` carries `h1`/`h2`; `append{i}` does one
+  table probe and no mixing at all.
+
+### Sharing, measured on the emitted code
+
+| | mix1 steps |
+|---|---|
+| no sharing (29 cells x 24 variants, 4 outcomes) | 1032 |
+| perfect prefix sharing (predicted) | 526 |
+| actually emitted | **506** |
+
+Generated code grew ~14% in lines (3 shapes: 21,743 -> 24,559).
+
+### What is NOT in the graph, on purpose
+
+The `RowSet` probe. A hash table is sequential and scalar; only the
+mixing moved. So the ceiling on this change is removing the ~270 ms of
+mixing, not removing `append`.
+
+## Build time: measured, and it is 90 s (2026-08-23)
+
+I claimed the room-test loop was ~25 minutes and used that to argue
+against emitting more code. Measured in isolation, with nothing else
+holding the build lock: **1:29.68 wall**, touching `src/trace/kernel.rs`.
+Per unit, from `cargo build --timings`:
+
+| unit | s |
+|---|---|
+| `traced-kernel-check` lib (the ~24k generated lines) | 84.0 |
+| `traced-kernel-check` lib (test) | 30.1 |
+| `celeste-rust` | 22.4 |
+| everything else | < 2 |
+
+(Those overlap; 90 s is the wall clock.)
+
+The 25-minute figure was my own cargo contention - the exact failure
+CLAUDE.md documents, where a 70-second build queued behind another one
+looks like a hung build. `./one-cargo.sh` exists to prevent it and I was
+not using it. **Route every cargo invocation through it.**
+
+Two consequences:
+
+- The build-time objection to emitting the row-key fold was mispriced.
+  There is a lot of headroom at 90 s.
+- Dropping the interpreter oracle out of `traced-kernel-check` would
+  save 22 s of 90, not the bulk. Not worth doing yet. The generated
+  kernel code itself is the cost, and that is the code we want.
+
+### Result (2026-08-23)
+
+| | before | after |
+|---|---|---|
+| kernel | 327 ms | **154 ms** |
+| merge | 2.0 ms | 2.0 ms |
+| boundary | 23.9 ms | 23.9 ms |
+| **total** | **356 ms** | **182 ms** |
+| interpreter, same data | 230 ms | 226 ms |
+| ratio | 0.65x (slower) | **1.24x (faster)** |
+
+Both checks green: the per-frame graph check (every node against the
+emitted Rust on the same inputs) and the 30-frame room run (row-key
+identical to the interpreter on every frame). Merge and boundary did not
+move, which is the control - only the fold was touched.
+
+**The kernels beat the interpreter for the first time.**
+
+Honest about the size of it: I predicted ~16x on the fold (2x sharing x
+8x SIMD) and got ~3.5x. The scalar version only paid for lanes it
+actually wrote; the vector version computes the key for all 16 lanes and
+all 24 assignments whether or not those rows are taken. Density won
+anyway, but that is where the remaining headroom is.

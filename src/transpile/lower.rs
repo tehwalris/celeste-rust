@@ -50,6 +50,10 @@ use super::kernel::{Emit, Line, OutFields};
 pub(crate) enum Dom {
     Num,
     Bool,
+    /// Machine words - the row-key fold. Not an abstract game value: see
+    /// `Op::Word` / `Op::Bits` / `Op::Mix`. `wide` is meaningless here
+    /// and is always false.
+    Word,
 }
 
 /// A node's runtime representation. Both flags are over-approximations in
@@ -71,6 +75,9 @@ impl Repr {
     fn boolean(lane: bool, wide: bool) -> Self {
         Repr { dom: Dom::Bool, lane, wide }
     }
+    fn word(lane: bool) -> Self {
+        Repr { dom: Dom::Word, lane, wide: false }
+    }
     /// The generated Rust type. A per-lane boolean is always `ZB`, which
     /// carries its own `known` mask, so `wide` does not change the type
     /// there - only what the guards have to say about it.
@@ -83,6 +90,8 @@ impl Repr {
             (Dom::Bool, false, false) => "bool",
             (Dom::Bool, false, true) => "Option<bool>",
             (Dom::Bool, true, _) => "ZB",
+            (Dom::Word, false, _) => "u64",
+            (Dom::Word, true, _) => "ZW",
         }
     }
     /// Is `self` at least as coarse as `other` - can an `other` value be
@@ -112,6 +121,7 @@ fn coerce(expr: &str, from: Repr, to: Repr) -> Result<String> {
         (Dom::Num, false, false, true, true) => format!("zi_splat({e}, {e})", e = expr),
         (Dom::Num, false, true, true, true) => format!("zi_splat({e}.0, {e}.1)", e = expr),
         (Dom::Num, true, false, true, true) => format!("zi_of_zn({})", expr),
+        (Dom::Word, false, _, true, _) => format!("zw_splat({})", expr),
         (Dom::Bool, false, false, false, true) => format!("Some({})", expr),
         (Dom::Bool, false, false, true, _) => format!("zb_splat({})", expr),
         // A block-uniform tri-state broadcast into lanes: undecided becomes
@@ -261,6 +271,13 @@ impl<'a> Ctx<'a> {
                 }
             }
             Op::Known => Repr::boolean(self.r(a[0]).lane, false),
+            // The row-key layer. `Bits` is per-lane exactly when the
+            // value it reads is: a block-uniform cell contributes the
+            // same word to every row, which costs one scalar mix instead
+            // of sixteen.
+            Op::Word(_) => Repr::word(false),
+            Op::Bits => Repr::word(self.r(a[0]).lane),
+            Op::Mix(_, _) => Repr::word(a.iter().any(|x| self.r(*x).lane)),
         })
     }
 
@@ -475,6 +492,7 @@ impl<'a> Ctx<'a> {
                 match (da, sub.lane) {
                     (Dom::Num, true) => format!("zn_eq({}, {})", x, y),
                     (Dom::Bool, true) => format!("zb_eq({}, {})", x, y),
+                    (Dom::Word, true) => bail!("equality on row-key words"),
                     (_, false) => format!("{} == {}", x, y),
                 }
             }
@@ -573,10 +591,45 @@ impl<'a> Ctx<'a> {
                     (true, _, _) => format!("ZB {{ val: {}.known, known: ALL }}", x),
                     (false, Dom::Bool, true) => format!("{}.is_some()", x),
                     (false, Dom::Num, true) => format!("{x}.0 == {x}.1", x = x),
+                    (false, Dom::Word, true) => bail!("Known of a row-key word"),
                     (false, _, false) => "true".to_string(),
                 }
             }
             Op::SplitOk => format!("zi_span_ok({})", self.raw(id, 0)?),
+            // ---- row key ----
+            Op::Bits => {
+                let src = self.r(a[0]);
+                let x = self.raw(id, 0)?;
+                match (src.lane, src.dom, src.wide) {
+                    (true, Dom::Num, false) => format!("zw_bits_n({})", x),
+                    (true, Dom::Num, true) => format!("zw_bits_i({})", x),
+                    (true, Dom::Bool, _) => format!("zw_bits_b({})", x),
+                    (false, Dom::Num, false) => format!("{}.as_raw_u32() as u64", x),
+                    (false, Dom::Bool, false) => format!("{} as u64", x),
+                    // A block-uniform interval or tri-state output. No
+                    // outcome has one today; the hole is left open on
+                    // purpose so the first one that does fails here with
+                    // a name rather than silently hashing something else.
+                    (false, d, true) => {
+                        bail!("no row-key bits for a block-uniform wide {:?}", d)
+                    }
+                    (_, Dom::Word, _) => bail!("Bits of a machine word"),
+                }
+            }
+            Op::Mix(c, half) => {
+                let w = Repr::word(lane);
+                let (h, v) = (self.at(id, 0, w)?, self.at(id, 1, w)?);
+                match (lane, half) {
+                    (true, 0) => format!("zw_mix1({}, {}, {}u64)", h, v, c),
+                    (true, _) => format!("zw_mix2({}, {}, {}u64)", h, v, c),
+                    (false, 0) => format!("mix64({} ^ mix64({} ^ {}u64))", h, v, c),
+                    (false, _) => format!(
+                        "{}.wrapping_add(mix64({}.wrapping_mul(({}u64 << 1) | 1)))",
+                        h, v, c
+                    ),
+                }
+            }
+            Op::Word(_) => bail!("node {} is an inline leaf and needs no let", id),
             Op::Const(..) | Op::ConstBool(_) | Op::Cell(_) | Op::Free(_) => {
                 bail!("node {} is an inline leaf and needs no let", id)
             }
@@ -604,6 +657,10 @@ fn inline(g: &Graph, id: NodeId, r: Repr) -> Option<String> {
         } else {
             format!("u.c{}", c)
         }),
+        // The fold's seed. Always block-uniform, so it never needs the
+        // splat - the first `Mix` against a per-lane cell produces the
+        // per-lane accumulator.
+        Op::Word(w) => Some(format!("{}u64", w)),
         _ => None,
     }
 }
@@ -732,6 +789,13 @@ pub(crate) struct VarOut {
     /// which has no conjuncts - so this is the literal `ALL` there, no
     /// line is emitted for it, and the checked-in kernels are unchanged.
     pub(crate) live: String,
+    /// The two halves of this successor's row key, as `ZW` expressions -
+    /// the fold `append` used to run per lane, now 16 lanes wide and
+    /// sharing its whole button-independent prefix across variants.
+    ///
+    /// `None` on the walk-driven path, which has no write-time dedup to
+    /// spend a key on (`Emit::row_key`).
+    pub(crate) key: Option<(String, String)>,
 }
 
 /// One output shape: the cells it writes, and the two booleans that say
@@ -818,7 +882,6 @@ pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
         sp = sp2;
     }
     let maps = maps;
-    let n = sp.len();
 
     // Two assignments are the same successor iff they agree on every
     // output, on which lanes are valid, and on which lanes are live. The
@@ -849,6 +912,72 @@ pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
         r
     };
 
+    // --- the row key, as graph nodes ---
+    //
+    // `append` used to fold this itself, one lane at a time, and that
+    // was 75% of ALL kernel time (plans/successors.md, 2026-08-23). Two
+    // things are wrong with a scalar fold and the graph fixes both.
+    //
+    // The fold is sequential over CELLS - each step needs the last - but
+    // the 16 LANES are independent, and a graph node is already 16 lanes
+    // wide. So the chain stays exactly as long while every link does
+    // sixteen rows at once.
+    //
+    // And the cells that no button affects can be folded ONCE for all 24
+    // representatives instead of once per candidate row, because a
+    // sequential fold shares a PREFIX and hash-consing interns that
+    // prefix to a single chain. That is why the order below puts the
+    // agreed cells first: it is what makes the sharing possible at all.
+    let mut hash_of: BTreeMap<(u8, usize), (NodeId, NodeId)> = BTreeMap::new();
+    if e.row_key {
+        // Node-identity across the representatives, not text equality.
+        // Coarser than the `tainted` computed later from the rendered
+        // strings - two different nodes can render alike - and coarser
+        // in the SAFE direction: a field this calls button-dependent is
+        // merely folded later in the chain, never dropped.
+        let agreed = |node: NodeId| -> bool {
+            let first = maps[reps[0] as usize][node as usize];
+            !reps.iter().any(|r| maps[*r as usize][node as usize] != first)
+        };
+        for (oi, o) in outs.iter().enumerate() {
+            // A cell every variant agrees on AND that is a literal holds
+            // one value for the whole accumulator - `konst` writes it
+            // once as `Col::U` rather than per row - so it cannot tell
+            // two rows apart and is not folded. This test implies the
+            // `konst` test below (node equality implies text equality),
+            // so nothing that stays a per-row column is skipped here.
+            let mut order: Vec<(u32, NodeId)> = o
+                .of
+                .fields
+                .iter()
+                .filter(|f| {
+                    !(agreed(f.node)
+                        && matches!(
+                            sp.get(maps[reps[0] as usize][f.node as usize]).op,
+                            Op::Const(..) | Op::ConstBool(_)
+                        ))
+                })
+                .map(|f| (f.cell, f.node))
+                .collect();
+            // Agreed cells first, then by cell id - a total order, so
+            // the emitted kernel does not depend on iteration order.
+            order.sort_by_key(|(cell, node)| (!agreed(*node), *cell));
+            let seed1 = sp.leaf(Op::Word(0x9e37_79b9_7f4a_7c15));
+            let seed2 = sp.leaf(Op::Word(0xa076_1d64_78bd_642f));
+            for r in &reps {
+                let (mut h1, mut h2) = (seed1, seed2);
+                for (cell, node) in &order {
+                    let v = maps[*r as usize][*node as usize];
+                    let b = sp.add(Op::Bits, vec![v]);
+                    h1 = sp.add(Op::Mix(*cell, 0), vec![h1, b]);
+                    h2 = sp.add(Op::Mix(*cell, 1), vec![h2, b]);
+                }
+                hash_of.insert((*r, oi), (h1, h2));
+            }
+        }
+    }
+    let n = sp.len();
+
     // --- representations, for every node in the specialized arena ---
     let mut ctx = Ctx {
         g: &sp,
@@ -871,6 +1000,10 @@ pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
         let map = &maps[*r as usize];
         for (oi, o) in outs.iter().enumerate() {
             roots.extend(o.of.fields.iter().map(|f| map[f.node as usize]));
+            if let Some((h1, h2)) = hash_of.get(&(*r, oi)) {
+                roots.push(*h1);
+                roots.push(*h2);
+            }
             let cs: Vec<NodeId> = conjuncts(&sp, map[o.ok as usize])
                 .into_iter()
                 .filter(|c| !vacuous(&ctx, *c))
@@ -1129,7 +1262,20 @@ pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
                     coerce(ctx.expr[node as usize].as_deref().unwrap(), have, want)?,
                 );
             }
-            per.push(VarOut { outputs, ok, bd, live });
+            // The key is always `ZW`: the fold reaches a per-lane value
+            // at its first per-lane cell, and an outcome whose every
+            // output is block-uniform has no rows to tell apart anyway.
+            let w = Repr::word(true);
+            let key = match hash_of.get(&(*r, oi)) {
+                None => None,
+                Some((h1, h2)) => {
+                    let f = |h: NodeId| -> Result<String> {
+                        coerce(ctx.expr[h as usize].as_deref().unwrap(), ctx.repr[h as usize], w)
+                    };
+                    Some((f(*h1)?, f(*h2)?))
+                }
+            };
+            per.push(VarOut { outputs, ok, bd, live, key });
         }
         variants.push(Variant { mask: *r, per });
     }

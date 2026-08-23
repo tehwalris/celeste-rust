@@ -204,6 +204,15 @@ pub(crate) struct Emit {
     /// for a TRACED graph, where it is the difference between 10,510 and
     /// 4,714 nodes.
     pub(crate) decide: bool,
+    /// Fold each successor's ROW KEY in the graph, and hand it to
+    /// `append` instead of making `append` fold it per lane.
+    ///
+    /// On for the TRACER, whose kernels dedup as they write - that fold
+    /// was 75% of all kernel time, see `plans/successors.md`. Off for
+    /// the walk-driven path: those kernels have no write-time dedup, so
+    /// the key would be so many dead lets in a CHECKED-IN generated
+    /// file.
+    pub(crate) row_key: bool,
     /// The map, when the caller has it. `Some` makes the interval pass
     /// decide collision tests instead of treating them as unknown.
     pub(crate) room: Option<crate::transpile::graph::Room>,
@@ -248,6 +257,7 @@ impl Emit {
             live: 0,
             ok: 0,
             decide: true,
+            row_key: true,
         }
     }
 
@@ -604,8 +614,9 @@ pub(crate) fn emit_walk(program: &Program, witness_path: &str) -> Result<Emit> {
         node_of: HashMap::new(),
         live: 0,
         ok: 0,
-        // The checked-in kernels come from here. See the field.
+        // The checked-in kernels come from here. See the fields.
         decide: false,
+        row_key: false,
     };
     let all = e.graph.leaf(GOp::ConstBool(true));
     e.live = all;

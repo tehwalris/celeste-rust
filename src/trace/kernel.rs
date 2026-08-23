@@ -410,6 +410,17 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
                 writeln!(o, "    pub c{}: {},", cell, ty)?;
             }
         }
+        writeln!(
+            o,
+            "    /// This successor's ROW KEY, both halves, 16 lanes at\n\
+             \x20   /// once. Folded by the graph rather than by `append`:\n\
+             \x20   /// the fold is sequential over cells but every step is\n\
+             \x20   /// a vector, and its button-independent prefix is one\n\
+             \x20   /// shared chain across all the assignments instead of\n\
+             \x20   /// being recomputed per candidate row.\n\
+             \x20   pub h1: ZW,\n\
+             \x20   pub h2: ZW,"
+        )?;
         writeln!(o, "}}\n")?;
     }
 
@@ -484,33 +495,12 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
              \x20       if take & (1 << i) == 0 {{ continue; }}",
             i = i
         )?;
-        writeln!(o, "        let mut h1: u64 = 0x9e37_79b9_7f4a_7c15;")?;
-        writeln!(o, "        let mut h2: u64 = 0xa076_1d64_78bd_642f;")?;
-        for OutField { cell, ty, tainted, konst, .. } in &out.fields {
-            if konst.is_some() {
-                continue;
-            }
-            let src = if *tainted { "kv" } else { "sh" };
-            let raw = match *ty {
-                "ZN" => format!("{s}.c{c}[i].as_raw_u32() as u64", c = cell, s = src),
-                "ZI" => format!(
-                    "(({s}.c{c}.lo[i].as_raw_u32() as u64) << 32) | ({s}.c{c}.hi[i].as_raw_u32() as u64)",
-                    c = cell, s = src
-                ),
-                "ZB" => format!(
-                    "((({s}.c{c}.val >> i) & 1) as u64) | (((({s}.c{c}.known >> i) & 1) as u64) << 1)",
-                    c = cell, s = src
-                ),
-                other => anyhow::bail!("row key over a {}", other),
-            };
-            writeln!(
-                o,
-                "        {{ let v = {raw}; h1 = mix64(h1 ^ mix64(v ^ {c}u64)); \
-                 h2 = h2.wrapping_add(mix64(v.wrapping_mul(({c}u64 << 1) | 1))); }}",
-                raw = raw, c = cell
-            )?;
-        }
-        writeln!(o, "        if !seen.insert((h1, h2)) {{ continue; }}")?;
+        // The key is FOLDED BY THE GRAPH now (`Op::Bits` / `Op::Mix`),
+        // 16 lanes at a time and with its button-independent prefix
+        // shared across every assignment. All that is left here is the
+        // table probe, which is inherently scalar: a hash table cannot
+        // be vectorized, and at ~2M probes it does not need to be.
+        writeln!(o, "        if !seen.insert((kv.h1[i], kv.h2[i])) {{ continue; }}")?;
         for OutField { cell, ty, tainted, konst, .. } in &out.fields {
             if konst.is_some() {
                 continue; // written once by `acc`, not per row
@@ -652,6 +642,15 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
     let mut groups: Vec<Vec<usize>> = Vec::new(); // per outcome: variant -> group
     let mut last: Vec<Vec<bool>> = Vec::new();    // per outcome: is last of its group
     let mut n_groups: Vec<usize> = Vec::new();
+    // The group signature is the TAINTED cells only, and that is also
+    // what makes it sound to emit ONE member's row key for the whole
+    // group. A row is (const cells, shared cells, tainted cells); the
+    // first two are identical across every assignment by construction,
+    // so two assignments with textually equal tainted cells write equal
+    // rows - and the key is a pure function of exactly those, folded by
+    // the graph. Equal rows, equal key. The last member's key
+    // expression names different nodes than the first member's might,
+    // but they evaluate to the same word.
     for oi in 0..l.outs.len() {
         let key = |v: &crate::transpile::lower::Variant| -> String {
             let p = &v.per[oi];
@@ -744,6 +743,10 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
                     writeln!(o, "        c{}: {},", cell, p.outputs[cell])?;
                 }
             }
+            let (h1, h2) = p.key.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("the traced emitter needs `Emit::row_key`, which was off")
+            })?;
+            writeln!(o, "        h1: {}, h2: {},", h1, h2)?;
             writeln!(o, "    }};")?;
             writeln!(
                 o,

@@ -197,6 +197,14 @@ fn run(g: &Graph, need: &[bool], env: &Env, strict: bool) -> Result<Vec<Option<C
             Op::Split(_) | Op::SplitValid(_) | Op::SplitOk => {
                 bail!("node {} is {:?}, which the tracer does not build", id, node.op)
             }
+            // Likewise the row-key layer: `lower` builds the fold, in
+            // the SPECIALIZED arena, long after this evaluator has run.
+            // A concrete value has no row key - the key is over the
+            // abstract representation, which a `Conc` has already thrown
+            // away.
+            Op::Word(_) | Op::Bits | Op::Mix(..) => {
+                bail!("node {} is {:?}, a row-key node with no concrete value", id, node.op)
+            }
         };
         Ok(v)
         }();
