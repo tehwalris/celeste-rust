@@ -1569,16 +1569,41 @@ block it describes gets handed to the engine, which renumbers by that
 rule anyway. Producing it directly makes the ids the kernel writes and
 the ids the engine reads the same ids by construction.
 
+**OPEN, noted not resolved (Philippe, 2026-08-23): is the renumbering
+pass needed at all?** `Rt2::boundary_canonicalize` re-derives every cell
+id at every frame boundary so that two isomorphic heaps compact to
+identical structures - which is what makes the row hash block-
+independent and cross-block dedup exact. But if every producer emitted
+canonical numbering in the first place, the pass would be the identity
+everywhere and could go. `structure_of` is one producer that now does.
+The others are `import_block` (which already walks in canonical order)
+and the frame body itself, which allocates during execution and is the
+one that would have to change. Unverified either way; the reason to
+write it down is that the pass is on the per-frame path, so if it is
+redundant it is redundant 40 times per search step.
+
 Structure only: `cols` carries pointers, because the resolver follows
 them, and nothing else. The values are what the kernel computes.
 
 The check that matters is DISTINCTNESS, not resolvability. A structure
 that merged two slots would resolve both paths happily and make the
-kernel write one cell twice - a silent corruption whose only symptom is
-a wrong search result much later. `a_traced_state_becomes_a_structure_every_path_can_walk`
-takes every scalar in a warmed-up traced state, resolves it, and
-requires 59 paths to land on 59 DISTINCT `Val` cells, with none dropped
-as unnameable.
+kernel write one cell twice: last write wins, one field silently wrong,
+the other's value gone. The block that comes out is still well-formed -
+right cells, right kinds, hashes fine - so nothing downstream notices,
+and the symptom is a wrong search result far from the cause.
+
+It is a GUARD, not just a test. `resolve_all` refuses when two paths
+land on one cell and names both, so the failure is a loud bind-time
+refusal rather than a silent overwrite. It costs one hash set per bind,
+not per lane. It cannot be a legitimate case: `iface::scalars` yields
+one path per distinct slot, aliases collapsing to the first path that
+reaches them, so a collision means the structure merged two slots that
+are not the same slot.
+
+`a_traced_state_becomes_a_structure_every_path_can_walk` then checks the
+positive direction on real data: every scalar in a warmed-up traced
+state resolves, 59 paths to 59 distinct `Val` cells, none dropped as
+unnameable.
 
 Two things it refuses rather than guesses: a table with both a hash and
 an array part (no table in the cart has one, and the engine's `Cell2`

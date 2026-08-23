@@ -244,12 +244,39 @@ pub fn bind_inputs(rt2: &Rt2, iface: &super::iface::Iface) -> Result<Vec<u32>> {
     resolve_all(rt2, &iface.slots)
 }
 
-/// Resolve a whole interface, naming the path that failed.
+/// Resolve a whole interface, naming the path that failed - and REFUSE
+/// if two paths land on one cell.
+///
+/// The distinctness check is the important half. A kernel writes an
+/// output by doing `cols[resolve(path)] = value`, so two paths sharing a
+/// cell means two values written to one column: last write wins, one
+/// field silently wrong, the other's value gone. The block that comes
+/// out is still well-formed - right cells, right kinds, hashes fine - so
+/// nothing downstream notices, and the symptom is a wrong search result
+/// far from the cause.
+///
+/// It cannot be a legitimate case. `iface::scalars` yields one path per
+/// distinct slot (aliases collapse to the first path that reaches them),
+/// so a collision here means the STRUCTURE merged two slots that are
+/// not the same slot. That is a bug in whoever built it, and this is
+/// where it is cheap to say so: once per bind, not once per lane.
 pub fn resolve_all(rt2: &Rt2, paths: &[Path]) -> Result<Vec<u32>> {
-    paths
+    let cells: Vec<u32> = paths
         .iter()
         .map(|p| resolve(rt2, p).map_err(|e| anyhow!("{}: {:#}", show(p), e)))
-        .collect()
+        .collect::<Result<_>>()?;
+    let mut seen: std::collections::HashMap<u32, usize> = Default::default();
+    for (i, c) in cells.iter().enumerate() {
+        if let Some(j) = seen.insert(*c, i) {
+            bail!(
+                "{} and {} both resolve to cell {} - the structure merged two slots",
+                show(&paths[j]),
+                show(&paths[i]),
+                c
+            );
+        }
+    }
+    Ok(cells)
 }
 
 #[cfg(test)]
@@ -445,6 +472,20 @@ mod tests {
             unnameable
         );
         assert!(ok > 50, "only {} paths checked", ok);
+    }
+
+    /// The guard against writing two outputs into one column, checked by
+    /// asking for the same slot twice - which is what a merged structure
+    /// looks like from the binder's side.
+    #[test]
+    fn two_paths_landing_on_one_cell_are_refused() {
+        let rt2 = block_from_witness("crates/celeste-kernels/witness/steady-shape.json");
+        let p: Path = vec![key("objects"), Step::Idx(0)];
+        assert!(resolve_all(&rt2, &[p.clone()]).is_ok(), "one path is fine");
+        let e = resolve_all(&rt2, &[p.clone(), p])
+            .expect_err("the same cell twice must be refused")
+            .to_string();
+        assert!(e.contains("merged two slots"), "unexpected error: {}", e);
     }
 
     /// A path that is not in the shape is a REFUSAL, not a panic and not
