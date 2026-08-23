@@ -2271,6 +2271,40 @@ does for the six buttons:
 (graph.rs:299) - so how fork configurations reach the emitted code has
 to be read before step 3 is designed, not after.
 
+### The build loop, measured rather than guessed
+
+I claimed it was "ten minutes a cycle". It is not, and the number came
+from my own polling latency rather than a clock. Measured 2026-08-23 in
+`traced-kernel-check`:
+
+| | |
+|---|---|
+| true no-op | 0.06 s |
+| after a `celeste-rust` edit | 57 s |
+| generated code only (touch a kernel) | 49 s |
+| the room test itself | 8 s |
+
+So ~50 s of that is compiling THIS package - three kernels, 22k lines,
+each essentially one enormous function - and celeste-rust is 8 s of it.
+
+Three levers tried, none of which helps:
+
+* `opt-level = 1` for the package: **63 s**, worse than 49. Huge
+  straight-line functions cost more in codegen and register allocation
+  than optimisation saves, so lowering the level makes rustc do more
+  work, not less.
+* `incremental = true`: **58 s** on a real code change, plus an 88 s
+  priming build. The change is inside the one giant function, so the
+  whole codegen unit recompiles anyway and the bookkeeping is pure loss.
+  (Beware measuring this with `touch` or a trailing comment - rustc
+  hashes post-parse, so both come back in 0.4 s having done nothing.)
+* splitting `kernel.rs` (380 KB) into its own crate: saves **4 s of 49**.
+  The room kernels are the cost, not the reference kernel.
+
+Left alone. The interesting consequence is Philippe's, below: if the
+generated code did not go through LLVM at all, this cost is not reduced,
+it disappears.
+
 ## Doctrine: never deopt to the interpreter (Philippe, 2026-08-23)
 
 **A deopt stops the run. It does not fall back.**
