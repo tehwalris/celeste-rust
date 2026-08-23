@@ -9,6 +9,12 @@ places I think it needs more than was said.
 
 ---
 
+## THE PROBLEM: see `plans/successors.md`
+
+Standalone, ~130 lines, no history needed. Everything below is the
+working log - read it when you want the reason for something, not to
+find out what we are doing.
+
 ## STATE, end of 2026-08-23
 
 The campaign works end to end for one room. Read this section and the
