@@ -1504,6 +1504,63 @@ rather than the compiler:
 * The partition check P2 calls for: union of member masks plus the deopt
   count equals the lane count, so no lane is lost or double-counted.
 
+## T17 - the boundary numbering, done the other way round
+
+T6 needs the tracer's slots and the engine's cells to be the same
+things. The plan said to give the tracer the engine's numbering: a BFS
+from the globals in `GLOBAL_NAMES` order, reproduced inside the tracer.
+
+**Philippe's call, 2026-08-23: do not reproduce it. Make the consumer
+accept the tracer's names instead.** That is strictly better and the
+reason is not effort:
+
+* Reproducing the BFS means two implementations of one numbering that
+  must stay in step forever, and nothing checks that they do.
+* Any change to the tracer's numbering changes the shape hash, hence the
+  row key, hence what the search dedups on, hence every checkpoint.
+  CLAUDE.md flags this as "the disruptive one".
+
+`trace::bind` does neither. The kernel says which slots it wants BY
+PATH, and the binder resolves them against whatever block it is handed,
+once, at bind time. The engine's numbering is untouched, no checkpoint
+is invalidated, and the shape hash is unchanged.
+
+**The one thing to get right** is that a pointer is a cell of its own: a
+global holding a table is a `Cell2::Val` whose column is `AV::Ptr(t)`,
+and `t` is the `Obj`. Walking a path dereferences BETWEEN steps but not
+at the end - the last step lands on the `Val` cell holding the scalar,
+which is the cell a kernel reads and writes.
+
+**Ground truth without running the search.** The shape witnesses under
+`crates/celeste-kernels/witness/` are real boundary shapes a real search
+produced, recorded with the canonical cell ids they had AND with the
+path the boundary reached each cell by. Rebuilding a witness as a block
+and resolving every recorded path back gives an exact check:
+
+    steady-shape.json     282 paths resolved, 0 skipped
+    r20-steady-shape.json 408 paths resolved, 0 skipped
+
+"Resolved to" is "landed on", not "equalled", because the global slot
+`objects` and the array it points at both carry the name `objects`. A
+path names the SLOT, which is also what a kernel reads.
+
+A path outside the shape is a REFUSAL - `a_path_outside_the_shape_is_refused`
+covers an absent global, an index past the end, an absent field and a
+field taken off a scalar. That refusal is what makes binding by path
+safe: handed the wrong shape, a kernel declines to bind, which is the
+all-or-nothing behaviour the kernels already have.
+
+### Inputs only, and why the other half is blocked
+
+`bind_inputs` resolves `Iface::slots`, giving "canonical cell for
+`Op::Cell(i)`". Outputs are NOT resolved, on purpose: each outcome ends
+in its own heap shape, and an outcome that allocates - a death making a
+new player, a fruit leaving - names cells the input block does not have.
+Binding those needs a shape descriptor per outcome, which is the T16
+multi-output work. Resolving them against the input block would succeed
+for the outcomes that happen not to allocate and fail confusingly for
+the rest, which is worse than not doing it.
+
 ## Stage 4 - delete
 
 - `celeste-rewrite` (38k lines) - the crate nothing depends on any more.
