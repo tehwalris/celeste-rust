@@ -39,6 +39,28 @@ pub struct FrameOut {
     /// re-deriving it from the node's op matters: `Op::Cell` and `Op::Sel`
     /// are both, and a guess there is a guess about the boundary.
     pub fields: Vec<(Path, NodeId, bool)>,
+    /// Slots that are DEAD at the frame boundary: the six button cells.
+    ///
+    /// `btn(i)` writes as well as reads - it resolves the unknown to a
+    /// definite value and stores it back, which is what keeps the choice
+    /// consistent within a frame - so at the end of a traced frame these
+    /// hold this frame's resolved choices rather than fresh unknowns.
+    ///
+    /// The PRODUCTION frame chunk ends with `__reset_button_states()`,
+    /// so at its boundary they are fresh unknowns and cannot distinguish
+    /// two rows. The tracer runs the reset at the START, so its boundary
+    /// sits one step earlier in the same cycle. Recording these paths as
+    /// dead is what makes the two boundaries agree; leaving them in
+    /// `fields` would make every row carry this frame's button values and
+    /// stop converged lanes from deduping.
+    ///
+    /// Soundness is the same premise `rewrite::rules::widen_buttons`
+    /// documents: the cells are dead until the next frame's reset
+    /// overwrites them, so overwriting them changes nothing observable.
+    /// That is a property of the whole program rather than of this
+    /// frame, and it is CLAIMED here, not proven - the differential
+    /// screen is what would catch a `btn` read that outlived it.
+    pub ubool: Vec<Path>,
     /// What kept this outcome from merging with its siblings. Only a
     /// shape difference can, so keeping it is what turns "twelve
     /// outcomes" into a statement about the program.
@@ -69,9 +91,16 @@ pub fn run_one<'a, D: Domain>(
 }
 
 /// Every scalar the state ends the frame holding, as graph nodes.
-fn out_fields(st: &State<Symbolic>) -> Result<Vec<(Path, NodeId, bool)>> {
+/// Every scalar the frame ends with, split into the ones that carry
+/// data and the ones that are dead at the boundary (`FrameOut::ubool`).
+fn out_fields(st: &State<Symbolic>) -> Result<(Vec<(Path, NodeId, bool)>, Vec<Path>)> {
     let mut out = Vec::new();
+    let mut ubool = Vec::new();
     for p in iface::scalars(st, &[])? {
+        if p.first() == Some(&iface::key("__button_states")) {
+            ubool.push(p);
+            continue;
+        }
         let (n, is_bool) = match iface::get(st, &p).unwrap() {
             Value::Num(n) => (n, false),
             Value::Bool(n) => (n, true),
@@ -79,7 +108,7 @@ fn out_fields(st: &State<Symbolic>) -> Result<Vec<(Path, NodeId, bool)>> {
         };
         out.push((p, n, is_bool));
     }
-    Ok(out)
+    Ok((out, ubool))
 }
 
 /// Symbolize `root`, free the buttons, and trace one frame.
@@ -113,10 +142,12 @@ pub fn trace_frame<'a>(
         // key disagrees with what this body was compiled for deopts to
         // the interpreter. Folds to `s.ok` when nothing is pinned.
         let ok = it.d.graph.fold(crate::transpile::graph::Op::And, vec![s.ok, pin_ok]);
+        let (fields, ubool) = out_fields(&s)?;
         outs.push(FrameOut {
             guard: s.guard,
             ok,
-            fields: out_fields(&s)?,
+            fields,
+            ubool,
             shape: s.shape()?,
         });
     }
@@ -177,7 +208,6 @@ fn frame_outcomes(f: &Frame, base: u32) -> Vec<super::emit::FrameOutcome> {
                 .fields
                 .iter()
                 .enumerate()
-                .filter(|(_, (p, _, _))| !iface::show(p).starts_with("__button_states"))
                 .map(|(i, (_, node, is_bool))| {
                     (base + i as u32, *node, if *is_bool { "ZB" } else { "ZN" })
                 })
@@ -254,6 +284,19 @@ pub fn check_at(
     }
     let mut n = 0;
     for (p, want) in oracle {
+        // The button cells are DEAD at the boundary (`FrameOut::ubool`),
+        // so the trace does not compute them and there is nothing to
+        // compare. Skipped rather than dropped from the count: the total
+        // below still has to account for every scalar the oracle has, so
+        // a slot cannot go missing unnoticed.
+        //
+        // What this does NOT check is the deadness claim itself. The
+        // oracle knows the resolved value and the trace declines to; if
+        // a `btn` read ever outlived the boundary, this comparison would
+        // stay silent. That premise lives in `FrameOut::ubool`.
+        if o.ubool.contains(p) {
+            continue;
+        }
         let got = o
             .fields
             .iter()
@@ -265,11 +308,12 @@ pub fn check_at(
         }
         n += 1;
     }
-    if o.fields.len() != oracle.len() {
+    if o.fields.len() + o.ubool.len() != oracle.len() {
         bail!(
-            "{:?}: traced state has {} scalars, oracle has {}",
+            "{:?}: traced state has {} scalars + {} dead, oracle has {}",
             bits,
             o.fields.len(),
+            o.ubool.len(),
             oracle.len()
         );
     }
@@ -897,7 +941,6 @@ mod tests {
                 .fields
                 .iter()
                 .enumerate()
-                .filter(|(_, (p, _, _))| !iface::show(p).starts_with("__button_states"))
                 .map(|(i, (_, node, is_bool))| {
                     (base + i as u32, *node, if *is_bool { "ZB" } else { "ZN" })
                 })
@@ -2266,7 +2309,16 @@ end
                         declined += 1;
                         *declined_at.entry(label.to_string()).or_default() += 1;
                     }
-                    Err(e) => return eprintln!("[verify] MISMATCH {} {:#}", label, e),
+                    // A MISMATCH is a WRONG ANSWER, not a refusal - the
+                    // refusals are counted above and are a measurement.
+                    // This used to `return eprintln!`, so the test passed
+                    // while printing the failure, and a change that broke
+                    // the comparison outright went green (2026-08-23: the
+                    // button cells moved to `FrameOut::ubool` and every
+                    // point started failing with "traced state has no
+                    // __button_states[0]"). A check that cannot fail is
+                    // not a check.
+                    Err(e) => panic!("[verify] MISMATCH {} {:#}", label, e),
                 }
             }
         }
