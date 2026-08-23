@@ -592,6 +592,138 @@ mod tests {
         );
     }
 
+    /// WHAT DOES PINNING THE POSITION BUY? A direct A/B.
+    ///
+    /// The interval pass can decide a collision test only when it knows
+    /// where the player is, and at TOP it does not. A room is 128x128
+    /// pixels, so specialising per position is a real option rather than
+    /// a thought experiment - this measures what one position costs and
+    /// what it saves, before anyone builds the 16k-body version of it.
+    #[test]
+    #[ignore]
+    fn specialising_to_one_player_position() {
+        let src = cart::sources().expect("sources");
+        let top = full_moon::parse(&src).expect("parse");
+        let init = full_moon::parse("_init()").expect("parse _init");
+        let reset = full_moon::parse("__reset_button_states()").expect("parse reset");
+        let frame = full_moon::parse("_update()").expect("parse frame");
+        let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
+        let cd =
+            std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
+        let (rx, ry) = celeste_interp::game_runner::start_room();
+        it.cache = Some(std::sync::Arc::new(
+            celeste_core::collision_cache::CollisionCache::new(&cd, rx, ry).expect("cache"),
+        ));
+        it.cart = Some(cd);
+        let st = cart::fresh_state::<Symbolic>(&mut it.d);
+        let mut st = run_one(&mut it, &top, st).expect("toplevel");
+        cart::inject_tile_flag_at(&mut st);
+        let mut st = run_one(&mut it, &init, st).expect("_init");
+        let mut player = None;
+        for _ in 0..40 {
+            if let Some(p) = find_player(&st) {
+                player = Some(p);
+                break;
+            }
+            st = match run_one(&mut it, &frame, st) {
+                Ok(s) => s,
+                Err(e) => return eprintln!("[pos] warm-up stopped at: {:#}", e),
+            };
+        }
+        let Some(player) = player else { return eprintln!("[pos] no player") };
+        let mut roots: Vec<Path> = vec![player.clone()];
+        for g in ["freeze", "has_dashed", "frames", "will_restart", "delay_restart", "max_djump"] {
+            roots.push(vec![iface::key(g)]);
+        }
+        let base = match pm1_key(&player, &st, &it.d) {
+            Ok(k) => k,
+            Err(e) => return eprintln!("[pos] pm1 key: {:#}", e),
+        };
+        // The extra pins, at whatever the state holds. `rem` too: `x` is
+        // the integer part and `rem.x` the sub-pixel remainder, and the
+        // NEXT position is `flr(x + rem.x + spd.x + 0.5)` - pinning one
+        // without the other leaves the move amount just as unknown.
+        let extra = |names: &[&str]| -> Vec<(Path, Conc)> {
+            let mut v = base.clone();
+            for n in names {
+                let mut q = player.clone();
+                for seg in n.split('.') {
+                    q.push(iface::key(seg));
+                }
+                match iface::get(&st, &q) {
+                    Some(Value::Num(nv)) => {
+                        v.push((q, Conc::Num(it.d.as_const(&nv).expect("concrete"))))
+                    }
+                    other => panic!("{} is {:?}", n, other),
+                }
+            }
+            v
+        };
+        let room = match (it.cart.clone(), it.cache.clone()) {
+            (Some(cart), Some(cache)) => Some(crate::transpile::graph::Room { cart, cache }),
+            _ => None,
+        };
+
+        for (label, pin) in [
+            ("pm1 only", base.clone()),
+            ("pm1 + x,y", extra(&["x", "y"])),
+            ("pm1 + x,y,rem", extra(&["x", "y", "rem.x", "rem.y"])),
+            ("pm1 + x,y,rem,spd", extra(&["x", "y", "rem.x", "rem.y", "spd.x", "spd.y"])),
+        ] {
+            let f = match trace_frame(&mut it, &reset, &frame, st.clone(), &roots, &pin) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("[pos] {:<26} REFUSED: {:#}", label, e);
+                    continue;
+                }
+            };
+            let g = it.d.graph.clone();
+            let mut inputs: Vec<(u32, &'static str)> = Vec::new();
+            let mut uni: Vec<(u32, &'static str)> = Vec::new();
+            for (i, c) in f.iface.init.iter().enumerate() {
+                let kind = match c {
+                    Conc::Num(_) => "num",
+                    Conc::Bool(_) => "bool",
+                };
+                if iface::show(&f.iface.slots[i]).contains(".hitbox.") {
+                    uni.push((i as u32, kind));
+                } else {
+                    inputs.push((i as u32, kind));
+                }
+            }
+            let cellbase = inputs.len() as u32;
+            let (mut lines, mut variants) = (0usize, 0usize);
+            for o in &f.outs {
+                let outputs: Vec<(u32, crate::transpile::graph::NodeId, &'static str)> = o
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (p, _, _))| !iface::show(p).starts_with("__button_states"))
+                    .map(|(i, (_, node, is_bool))| {
+                        (cellbase + i as u32, *node, if *is_bool { "ZB" } else { "ZN" })
+                    })
+                    .collect();
+                match super::super::emit::lower_frame(
+                    &g, &inputs, &uni, &outputs, o.guard, o.ok, room.clone(),
+                ) {
+                    Ok(l) => {
+                        lines += l.body.len();
+                        variants += l.variants;
+                    }
+                    Err(e) => eprintln!("[pos] {} outcome REFUSED: {:#}", label, e),
+                }
+            }
+            eprintln!(
+                "[pos] {:<26} {} pins, {} outcomes, {} lines, {} variants",
+                label,
+                f.iface.pins.len(),
+                f.outs.len(),
+                lines,
+                variants
+            );
+        }
+    }
+
     #[test]
     fn the_kernel_emitter_lowers_a_traced_graph() {
         let src = cart::sources().expect("sources");
