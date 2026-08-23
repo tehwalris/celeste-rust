@@ -26,39 +26,16 @@
 //! frame a thousand times slower and hide the gap in the wall clock.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use anyhow::{bail, Result};
 
-use celeste_core::cart_data::CartData;
-use celeste_core::collision_cache::CollisionCache;
 use celeste_engine::runtime2::Rt2;
 
-/// One shape's kernel, behind a shape-independent surface.
-///
-/// The generated `mod.rs` builds a `&'static [Kernel]` of these. The
-/// struct lives here rather than in the generated file so that the frame
-/// loop, which is not generated, can be written against it.
-pub struct Kernel {
-    pub name: &'static str,
-    /// The canonical shape this kernel was traced for
-    /// (`Rt2::shape_hash_of`).
-    pub shape: u64,
-    /// How many output shapes one frame can end in.
-    pub outcomes: usize,
-    /// An empty accumulator with outcome `i`'s shape.
-    pub acc: fn(usize, Arc<CartData>, Arc<CollisionCache>) -> Rt2,
-    /// `None`: not this kernel's shape. `Some(mask)`: the lanes it
-    /// declined, which the doctrine says stops the run.
-    pub step: fn(&Rt2, usize, usize, &mut [Rt2], &mut [celeste_engine::kernel::RowSet]) -> Option<u16>,
-    /// Which slot would stop `bind`, or `None` if it would bind.
-    ///
-    /// `step` returns an `Option` because it is the hot path. Under the
-    /// never-deopt doctrine a failure there stops the run, and "did not
-    /// bind" is not something anyone can act on - which slot, holding
-    /// what, is.
-    pub why: fn(&Rt2) -> Option<String>,
-}
+/// The kernel surface itself lives in `celeste-engine`, below the
+/// emitters, because `compiled::FrameEngine` consumes kernel sets and
+/// `trace` produces them - a type naming both would have to sit above
+/// both. Re-exported here so the frame loop below reads unchanged.
+pub use celeste_engine::traced::Kernel;
 
 pub struct Dispatch {
     kernels: &'static [Kernel],
