@@ -581,6 +581,7 @@ mod tests {
         let mut seen: std::collections::BTreeMap<String, State<Symbolic>> = Default::default();
         let mut queue: Vec<String> = Vec::new();
         let key = |s: &State<Symbolic>| format!("{:?}", s.shape().expect("shape"));
+        let room0 = room_of(&st, &mut it.d);
         let k0 = key(&st);
         seen.insert(k0.clone(), st);
         queue.push(k0);
@@ -588,6 +589,7 @@ mod tests {
         let (mut frames, mut refused, mut dropped) = (0usize, 0usize, 0usize);
         let mut poisoned_outcomes = 0usize;
         let mut kept_arena = 0usize;
+        let mut left_room = 0usize;
         let mut reasons: std::collections::BTreeMap<String, usize> = Default::default();
         while let Some(k) = queue.pop() {
             let st = seen[&k].clone();
@@ -612,6 +614,24 @@ mod tests {
                 // so its shape is not one any kernel needs.
                 if it.d.decide(&o.ok) == Some(false) {
                     poisoned_outcomes += 1;
+                    continue;
+                }
+                // A ROOM TRANSITION is a terminal, not a step.
+                //
+                // This is what made the walk diverge. With the player's
+                // position symbolic the tracer takes the room-exit
+                // branch, `next_room` calls `load_room(room.x+1, ...)`,
+                // and a DIFFERENT room's objects appear - room (1,0) has
+                // only `player_spawn` and `fake_wall` tiles, and the walk
+                // was finding twelve `fall_floor`s and a `fly_fruit`.
+                // Then those fed the next iteration.
+                //
+                // Nothing needs to be made concrete to stop it. The exit
+                // is a real successor; it just belongs to another room's
+                // kernel set, which is the multi-room seam BENCHMARK_DATA
+                // already parks. Recorded and not stepped.
+                if room_of(&o.st, &mut it.d) != room0 {
+                    left_room += 1;
                     continue;
                 }
                 let k = key(&o.st);
@@ -641,7 +661,7 @@ mod tests {
 
         eprintln!(
             "[fix] {} shapes from {} traced frames in {:.1}s ({} refused, {} dropped at the cap of {}), \
-             {} graph nodes, {} outcomes dropped as unreachable, {} frames could not release the arena",
+             {} graph nodes, {} outcomes dropped as unreachable, {} left the room, {} frames could not release the arena",
             seen.len(),
             frames,
             started.elapsed().as_secs_f64(),
@@ -650,6 +670,7 @@ mod tests {
             CAP,
             it.d.graph.len(),
             poisoned_outcomes,
+            left_room,
             kept_arena
         );
         for (why, n) in &reasons {
@@ -661,10 +682,68 @@ mod tests {
         for (why, n) in &it.illegal {
             eprintln!("[fix]   {} x path poisoned: {}", n, why);
         }
-        let mut sizes: Vec<usize> = seen.values().map(|s| s.heap.tables.len()).collect();
-        sizes.sort_unstable();
-        eprintln!("[fix] tables per shape: min {:?} max {:?}", sizes.first(), sizes.last());
+        // WHAT is accumulating? A shape is a heap, and a heap grows by
+        // objects, so name them: the object list, by type.
+        let mut census: Vec<(usize, String)> = seen
+            .values()
+            .map(|st| (st.heap.tables.len(), objects_by_type(st)))
+            .collect();
+        census.sort();
+        for (tables, types) in &census {
+            eprintln!("[fix] {:>3} tables: {}", tables, types);
+        }
         assert_eq!(dropped, 0, "the shape walk hit its cap - raise CAP or it is not closed");
+    }
+
+    /// Which room a state is in. Concrete: `room` is frozen as an input
+    /// and `load_room` only ever writes it a constant.
+    fn room_of(st: &State<Symbolic>, d: &mut Symbolic) -> (i16, i16) {
+        let at = |k: &str| -> i16 {
+            match iface::get(st, &[iface::key("room"), iface::key(k)]) {
+                Some(Value::Num(n)) => d
+                    .as_const(&n)
+                    .and_then(|v| v.as_i16_or_err().ok())
+                    .unwrap_or(-1),
+                _ => -1,
+            }
+        };
+        (at("x"), at("y"))
+    }
+
+    /// The `objects` list by type name, as a histogram. Types are named
+    /// by finding the global whose table IS the object's `type`, which
+    /// is how the cart names them too.
+    fn objects_by_type(st: &State<Symbolic>) -> String {
+        let mut name_of: std::collections::BTreeMap<u32, String> = Default::default();
+        let groot = &st.heap.tables[&st.globals];
+        for (k, v) in groot.hash.iter() {
+            if let Value::Table(t) = v {
+                name_of.insert(*t, k.clone());
+            }
+        }
+        let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+        let objs = vec![iface::key("objects")];
+        let n = match iface::get(st, &objs) {
+            Some(Value::Table(t)) => st.heap.tables[&t].arr.len(),
+            _ => 0,
+        };
+        for i in 0..n {
+            let mut p = objs.clone();
+            p.push(Step::Idx(i));
+            p.push(iface::key("type"));
+            let name = match iface::get(st, &p) {
+                Some(Value::Table(t)) => {
+                    name_of.get(&t).cloned().unwrap_or_else(|| "?".to_string())
+                }
+                _ => "?".to_string(),
+            };
+            *counts.entry(name).or_default() += 1;
+        }
+        counts
+            .into_iter()
+            .map(|(k, v)| format!("{}x{}", v, k))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// Snapshot every scalar, throw the graph away, and write them back
@@ -1368,7 +1447,7 @@ mod tests {
                 // produced lines; whether those lines are Rust is a
                 // different question, and the only way to answer it is
                 // to hand them to rustc.
-                match super::super::kernel::render(&f, &b, &l, "room (0,0) f40, steady pm1") {
+                match super::super::kernel::render(&f, &b, &l, "room (1,0) f40, steady pm1") {
                     Ok(src) => {
                         let path =
                             std::path::Path::new("target").join("traced-kernel.rs");

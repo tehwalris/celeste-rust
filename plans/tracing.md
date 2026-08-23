@@ -1838,7 +1838,7 @@ agreement with the interpreter is already covered by the oracle test, so
 these two together cover the chain - but not yet in one run, on a block
 the search actually produced.
 
-## T21 - the shape fixpoint, and why it is the wrong question
+## T21 - the shape fixpoint: 3 shapes, once the walk stays in the room
 
 Covering a room without ever deopting means a kernel per input shape,
 which means knowing every shape the room reaches. Philippe: is that not
@@ -1940,6 +1940,22 @@ cause, exactly:
 `compiled_forward_reproduces_the_interpreter` and the oracle test still
 pass, so no legal path the oracle takes is poisoned.
 
+### Correction: every traced measurement labelled "room (0,0)" is room (1,0)
+
+`_init` calls `load_room(1, 0)` and `apply_start_room` rewrites it from
+`CELESTE_START_ROOM`, which defaults to **(1,0)**. So every number in
+T13-T21 that says room (0,0) was measured on room (1,0). I wrote the
+label myself and then repeated it.
+
+It changes no measurement - the same runs, the same room, the wrong
+name - but it matters for what comes next, because BENCHMARK_DATA's
+6.44 s / 0.26 GB / 387,443 rows baseline IS room (0,0), reached with
+`CELESTE_START_ROOM=0,0`. Comparing against it means tracing that room,
+not this one.
+
+The code labels are fixed. The section headings above are left as
+written so the correction is visible rather than tidied away.
+
 ### "Four shapes" was an undercount, and the fixpoint does not converge
 
 Fixing the abort changed the answer. The traces that used to die now
@@ -1959,17 +1975,56 @@ constants, throw the graph away, re-intern) was worth doing and is not
 the fix. Only 2 frames of 16 could not release, and the graph still hit
 the limit inside a SINGLE trace.
 
-**So full symbolization is the wrong source for the shape set.** It
-answers "what shapes are reachable if every branch is taken", and the
-question is "what shapes does the search actually produce" - which
-BENCHMARK_DATA answers with two per room for (2,0). The shapes should
-come from a real run. Philippe suggested that first; I talked us out of
-it on the grounds that the fixpoint was cheap and exact, and it is
-neither.
+### The divergence was ONE branch: the room exit
 
-What full symbolization IS good for is the thing it just did: finding
-the places where the tracer loses an invariant the game holds. Three
-frozen-constant classes and one poisoned field, all in one afternoon.
+Philippe asked which branches spawn the objects, and what would have to
+be concrete to stop it. The answer is neither of the obvious ones.
+
+The census names what accumulated:
+
+     19 tables: 1x?
+     25 tables: 1xplayer_spawn
+     26 tables: 1xplayer
+     34 tables: 1x? 1xfruit 2xspring      (x4)
+     40 tables: 1xfruit 1xplayer_spawn 2xspring  (x4)
+     41 tables: 1xfruit 1xplayer 2xspring (x4)
+     90 tables: 12xfall_floor 1xfly_fruit 1xplayer_spawn
+
+Room (1,0) has exactly ONE object tile, `player_spawn`. Springs,
+fruit, fall floors and fly fruit are not in it. Those are **other
+rooms'** objects.
+
+With the player's position symbolic the tracer takes the room-exit
+branch. `next_room` calls `load_room(room.x+1, room.y)`, which loads a
+different room's entire object set - and that state feeds the next
+iteration, which exits again. The walk was not accumulating spawns; it
+was walking through the game.
+
+**Nothing needs to be made concrete.** The exit is a real successor - it
+just belongs to another room's kernel set, which is the multi-room seam
+BENCHMARK_DATA already parks as future work. Recording it as a terminal
+and not stepping through it is the whole fix.
+
+| | shapes | frames | time | graph |
+|---|---|---|---|---|
+| stepping through the exit | 16, not closed | 16 (14 refused) | 155 s | 2,000,008 nodes |
+| exit as a terminal | **3, closed** | **3** | **0.2 s** | **4,423** |
+
+So full symbolization IS usable for the shape set, on one condition: the
+walk has to stay in the room the kernels are for. My "it is the wrong
+question" was written one experiment too early.
+
+Two things it is still worth being careful about. The three shapes are
+an over-approximation - every branch is explored, so a shape the search
+never produces costs a kernel nobody dispatches to, which is the safe
+direction. And one of the three reports its object as `1x?`: the type
+table is not any global's, which is either a naming gap in the census or
+a hole in the `objects` array. Unchased.
+
+What full symbolization has been good for either way is finding the
+places where the tracer loses an invariant the game holds: three
+frozen-constant classes, one poisoned field, and one branch that leaves
+the room.
 
 ## Doctrine: never deopt to the interpreter (Philippe, 2026-08-23)
 

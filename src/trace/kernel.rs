@@ -23,7 +23,7 @@
 //! AN OUTPUT BLOCK IS BUILT, NOT PATCHED. The walk's `acc_init` clones
 //! the chunk's structure and overwrites the columns the frame wrote,
 //! because in that pipeline the output shape IS the input shape. A
-//! traced frame ends in several shapes - room (0,0) f40 has four, and
+//! traced frame ends in several shapes - room (1,0) f40 has four, and
 //! only one of them is the input's - so each outcome carries its own
 //! structure and the kernel fills it. Measured there: about 105 pointer
 //! cells that the structure carries, ~53 scalars the frame computes, and
@@ -453,7 +453,7 @@ pub struct Reference {
     pub cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
 }
 
-/// Trace the frame this kernel is rendered from: room (0,0), warmed up
+/// Trace the frame this kernel is rendered from: room (1,0), warmed up
 /// to the first frame that has a player, pinned to its pm1 key.
 pub fn reference_frame() -> Result<Reference> {
     reference_frame_in(std::path::Path::new("."))
