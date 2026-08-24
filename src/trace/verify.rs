@@ -176,6 +176,7 @@ pub fn trace_frame<'a>(
     let mut st = st;
     // Fork choices are per FRAME, like the six buttons above.
     it.d.forks = 0;
+    it.d.fork_memo.clear();
     // One frame has exactly six free choices, `Free(0..5)`. The counter
     // is on the domain rather than the frame, so tracing a SECOND frame
     // through one interpreter - which compiling per pm1 key does - would

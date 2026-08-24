@@ -1461,22 +1461,44 @@ mod tests {
                     .filter(|b| **b)
                     .count()
             };
-            // Today: 64 assignments, splits left as nodes.
+            // Today: ONE assignment, splits left as nodes. One rather
+            // than all 64, because the question is what the FORK
+            // configurations share, and holding the buttons fixed is
+            // what isolates it - mixing both makes the ratio a blend of
+            // two effects.
             let mut loop_arena = Graph::new();
             let mut loop_roots: Vec<NodeId> = Vec::new();
-            for m in 0u8..64 {
-                let map = g.specialize_config_into(m, None, &mut loop_arena);
+            {
+                let map = g.specialize_config_into(0, None, &mut loop_arena);
                 loop_roots.extend(base.iter().map(|x| map[*x as usize]));
             }
-            // Specialized: 64 assignments x 2^forks configurations.
-            let ns: u8 = 1 << forks;
+            // Specialized: ONE assignment x 2^forks configurations.
+            //
+            // `let ns: u8 = 1 << forks` was the third member of today's
+            // shift-overflow family (see `ChoiceSet`): at 8 forks it
+            // wraps to 0 and the inner loop does not run, so the test
+            // would have reported perfect sharing for the shapes that
+            // share least. It only ever ran on room (1,0), where forks
+            // is 2, so it was never wrong in practice - which is
+            // exactly how the ChoiceSet one survived too.
+            //
+            // Enumeration is 2^forks, so it is capped and the cap is
+            // ANNOUNCED. A silent skip here would read as "measured and
+            // fine" for precisely the shapes the question is about.
+            const MAX_FORKS: u8 = 9;
+            if forks > MAX_FORKS {
+                eprintln!(
+                    "[fork] shape {}: {} forks - SKIPPED, 2^{} configurations is past                      the {} cap. Not measured, not zero.",
+                    si, forks, forks, MAX_FORKS
+                );
+                continue;
+            }
+            let ns: u32 = 1u32 << forks;
             let mut flat_arena = Graph::new();
             let mut flat_roots: Vec<NodeId> = Vec::new();
-            for m in 0u8..64 {
-                for c in 0..ns {
-                    let map = g.specialize_config_into(m, Some(c), &mut flat_arena);
-                    flat_roots.extend(base.iter().map(|x| map[*x as usize]));
-                }
+            for c in 0..ns {
+                let map = g.specialize_config_into(0, Some(c as u8), &mut flat_arena);
+                flat_roots.extend(base.iter().map(|x| map[*x as usize]));
             }
             let (a, b) = (
                 live_count(&loop_arena, &loop_roots),

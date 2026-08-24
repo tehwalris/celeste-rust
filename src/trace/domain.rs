@@ -289,6 +289,22 @@ pub struct Symbolic {
     /// How many FORK choices have been handed out this frame. The other
     /// half of `ChoiceSet`, above the six buttons.
     pub forks: u8,
+    /// Fork choices already handed out THIS FRAME, by the value forked.
+    ///
+    /// Two call sites that floor the same value do not need two choice
+    /// dimensions: forking one value twice yields the same fragments,
+    /// so the second choice is determined by the first and every
+    /// configuration where they disagree is empty. The runtime masks
+    /// prune those, so it was never wrong - it was two extra levels of
+    /// loop nest and a block of emitted nodes each.
+    ///
+    /// Measured on room (2,0) before this existed: `kernel1` and
+    /// `kernel4` forked 16 times over 14 distinct values, which is
+    /// ~10,600 of their 83,710 nodes (12.7%) and 65,536 runtime
+    /// configurations instead of 16,384.
+    ///
+    /// Per frame, like `forks` itself - cleared beside it.
+    pub fork_memo: std::collections::HashMap<NodeId, (NodeId, NodeId)>,
     /// Input cells that hold an INTERVAL rather than a number - the
     /// player's `rem.x`/`rem.y`, which the boundary widens.
     ///
@@ -488,12 +504,21 @@ impl Domain for Symbolic {
     }
 
     fn fork_flr(&mut self, v: &NodeId) -> (NodeId, NodeId) {
+        // Already forked this exact value this frame? Reuse the choice.
+        // See `fork_memo`. Hash-consing is what makes this sound and
+        // also what makes it FIRE: two `move` calls on values that are
+        // structurally the same expression are the same node id.
+        if let Some(hit) = self.fork_memo.get(v) {
+            return *hit;
+        }
         let d = self.forks;
         self.forks += 1;
-        (
+        let out = (
             self.graph.fold(Op::Split(d), vec![*v]),
             self.graph.fold(Op::SplitValid(d), vec![*v]),
-        )
+        );
+        self.fork_memo.insert(*v, out);
+        out
     }
 
     fn span_ok(&mut self, v: &NodeId) -> NodeId {

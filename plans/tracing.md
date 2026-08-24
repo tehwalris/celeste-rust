@@ -3262,59 +3262,70 @@ said it: 47% stack traffic against 6.6% vector, with ~486 values live in
 the body. The function's problem is that it cannot hold what it already
 has. Moving more of it into 32 zmm registers is not the direction.
 
-### REFUTED: fork as specialization (2026-08-23)
+## REFUTED: fork as specialization - THE REFUTATION WAS WRONG (2026-08-24)
 
-The section above ("Specializing a split needs NO new op") is right that
-it CAN be done, and Philippe's reason for wanting it - "because we can
-merge nodes back there and share computations" - is the right reason to
-want it. It does not hold for this graph, and one cheap measurement says
-so before anything is built.
+The original measurement stands as a fact about room (1,0) and is
+worthless as a general one. Re-measured on room (2,0), which has shapes
+forking 2, 4, 8 and 14 times instead of only 2:
 
-`trace::kernel::tests::what_specializing_the_fork_would_cost` builds the
-specialized arena both ways and counts live nodes. Room (1,0):
+| forks | configs | loop nodes | flat nodes | ratio | max | shared |
+|---|---|---|---|---|---|---|
+| 2 | 4 | 3,270 | 7,766 | 2.37x | 4x | 40.6% |
+| 4 | 16 | ~6,000 | ~15,000 | 2.32-2.83x | 16x | 82-86% |
+| 8 | 256 | ~10,000 | ~29,000 | 2.59-2.95x | 256x | **98.7-99.0%** |
 
-| shape | forks | traced nodes | loop | specialized | ratio | max | shared |
-|---|---|---|---|---|---|---|---|
-| 0 | 0 | 2130 | 11760 | 11760 | 1.00x | 1x | - |
-| **1** | **2** | 2220 | **13700** | **53761** | **3.92x** | 4x | **1.9%** |
-| 2 | 0 | 78 | 78 | 78 | 1.00x | 1x | - |
+**The ratio is flat at ~2.3-3x while the configuration count goes
+4 -> 16 -> 256.** Specialization is nearly free at high fork counts:
+later forks operate on values almost every configuration agrees on, so
+hash-consing collapses them. Philippe predicted exactly this ("maybe in
+this case it will be much better than neutral because there is more
+sharing going on").
 
-53,761 / 4 = 13,440 against the loop's 13,700. The four configurations
-are four separate copies of the frame.
+Two things made the original wrong, and both are process lessons:
 
-**And the work is identical either way.** The loop evaluates its tail up
-to 2^forks times; specialization evaluates 2^forks copies once each.
-Same node-evaluations. So the ratio is PURE code size - 3.92x the
-emitted kernel, in a function that is already 47% stack traffic with
-~486 values live - and specialization additionally gives up
-`if valid{d} == 0 { continue; }`, which skips the tail entirely for a
-slice in which no lane straddles a floor boundary.
+* **It ran on the only room available, which was the weakest point on
+  the curve.** Room (1,0) forks twice. A one-point measurement of a
+  quantity that varies by 60 percentage points across its range was
+  presented as a general refutation.
+* **It blended 64 button assignments into the arena**, so button
+  divergence dominated and fork sharing read as 1.9%. The same shape,
+  with the buttons held fixed, is 40.6%. The measurement was answering
+  a different question than the one asked.
 
-The only thing specialization could win is folding: a concrete fragment
-makes `zi_fork_flr` cheap and might collapse constants downstream. The
-1.9% is that win, measured.
+The test now holds the buttons fixed and varies only the fork
+configuration, and its `let ns: u8 = 1 << forks` is fixed - it was the
+third member of the day's shift-overflow family and would have reported
+PERFECT sharing for any shape with 8 or more forks, i.e. for exactly
+the shapes that motivated the re-measurement.
 
-**Why there is nothing to share.** The fork is on `player.rem`. `rem`
-feeds position, position feeds collision, collision feeds essentially
-the whole frame. A fork this early in the dependency order has almost
-nothing downstream of it that does not depend on the fragment.
+### What is still not established
 
-**What survives.** `Op::Frag` / `Op::FragOk` and
-`Graph::specialize_config_into` are kept, with `eval` arms, the
-`FragOk(0) -> true` fold and the measurement test - but NOT an emitter
-arm, which would be dead code. The ops exist so the measurement can be
-re-run: a tracer whose fork sat somewhere less load-bearing than `rem`
-would show a different ratio, and this is how you would find out rather
-than re-arguing it.
+* **14 forks is unmeasured.** The two biggest shapes skip the 9-fork
+  enumeration cap, loudly. If the ratio holds, an 83,662-node loop
+  kernel becomes ~250k flat with no loop nest at all.
+* **The runtime win is unmeasured**, and it is the one that decides.
+  The loop body runs up to 2^forks times with validity masks pruning
+  empty configurations early; if pruning already removes almost
+  everything, flattening buys less than the node ratio suggests. Needs
+  room (2,0) running, which is blocked on where its artifact lives.
 
-**The option that is still open** is the other one that section listed:
-LANE DOUBLING. A fork doubles the LANES rather than repeating the body -
-a 16-lane slice becomes two, one per fragment, empties dropped by
-`f0_fv`. The body is emitted ONCE and, unlike both alternatives here,
-the half-empty configurations can be PACKED against other slices'
-fragments instead of each running 16 lanes wide to keep three. That is a
-change to the driver rather than to the emitter, and it is the only one
-of the three that attacks the work rather than moving it.
+### DONE: fork choices are memoised on the value forked
+
+`Symbolic::fork_flr` handed out a fresh choice index per CALL, so one
+value forked at two sites became two choice dimensions. Room (2,0)'s
+two biggest shapes forked 16 times over 14 distinct values.
+
+Memoised per frame (cleared beside `forks`). Room (1,0) byte-identical.
+Room (2,0): 16 -> 14 forks, and **the node count barely moved** -
+83,710 -> 83,662, 0.06%.
+
+That last number corrects a claim made when the redundancy was found:
+"~10,600 nodes, 12.7% of the kernel", inferred from the level histogram
+without checking it. Fork level is where a node is PLACED, not whether
+it exists; removing a fork moves its block up a level rather than
+deleting it. Only the Split/SplitValid pairs go. The real win is the
+runtime configuration space, 65,536 -> 16,384, and that is unmeasured
+for the same reason as above.
 
 ### Where the 5-minute build actually goes (2026-08-23)
 
