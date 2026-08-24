@@ -3298,9 +3298,86 @@ third member of the day's shift-overflow family and would have reported
 PERFECT sharing for any shape with 8 or more forks, i.e. for exactly
 the shapes that motivated the re-measurement.
 
+### MEASURED at 14 forks, and the forks are a SUM not a PRODUCT (2026-08-24)
+
+Room (2,0), shape 1, 14 forks. The size ratio holds all the way out:
+**3.19x for 16,384 configurations**, against 2.37x for 4. Flat at 14
+forks is 57,145 nodes where the loop is 17,892.
+
+But the size ratio is not the finding. This is:
+
+| | |
+|---|---|
+| outcomes depending on 2 of 14 forks | 16 |
+| outcomes depending on 8 of 14 forks | 2 |
+| outcomes depending on 0 forks | 1 |
+| **sum of 2^k over outcomes** | **577** |
+| what the emitted nest actually does (19 x 2^14) | **311,296** |
+
+Every outcome's dependence, taken over its values AND its `live` and
+`ok` masks, is a SMALL subset of the forks - almost always exactly one
+`(x, y)` pair. The 14 forks are seven MUTUALLY EXCLUSIVE branches, each
+with its own `obj.move`, not seven objects moving at once.
+
+`transpile::lower` emits ONE nest of depth `forks` and puts every
+outcome at its innermost level. So outcome 13, whose values are a
+function of forks 12 and 13 alone, is computed and pushed 16,384 times
+to produce FOUR distinct rows - 4,096 identical pushes per row, which
+the boundary dedup then collapses, having done all the work first.
+
+**540x, and it is a structural error rather than a tuning one:** the
+fork dimensions are being multiplied when they should be summed.
+
+The level histogram says the same thing from the other side:
+
+```
+level 0    1     2     3     4     5     6     7     8     9    10    11    12    13    14
+     4627  243  1411  243  1415  243  1411  458  2831  243  1422  243  1426  243  1433
+```
+
+Periodic with period two, one period per `move`: ~243 nodes for the
+x-move, ~1,420 for the y-move. A node's level is `1 + its highest fork
+bit`, so those 1,433 level-14 nodes run up to 16,384 times to take two
+distinct values. Loop work <= 34,304,813 node-evals against flat's
+57,145 - **600x**, upper bound, no pruning.
+
+#### What this retires
+
+Two claims made EARLIER THE SAME DAY, both mine, both wrong:
+
+* **"0 of 16,384 configurations fold away; 16,384 distinct successors,
+  so a flat kernel needs 16,384 write sites."** The measurement was
+  right and the AGGREGATION was wrong: the tuple spanned every outcome
+  at once, so flipping fork 12 changed outcome 13's slot and the whole
+  tuple counted as new, while outcomes 1-12 were bit-identical. Per
+  outcome it is four. 577 write sites is nothing, and the ceiling I
+  claimed does not exist.
+* **"14 forks means seven moving objects."** Room (2,0) has FOUR
+  objects and exactly one of them (`objects[3]`, the player) has
+  interval inputs. Seven branches, not seven objects. Inferred from a
+  histogram again, which is the same mistake as the 12.7% claim.
+
+The read-side cone cannot tell these apart - twelve of the fourteen
+forks read 37-52 input cells spanning every object, because every
+object's motion is guarded by the same globals. The WRITE cone can,
+and that is what the diagnostic reports now.
+
+#### The design this points at, NOT YET BUILT
+
+One nest per outcome over that outcome's own forks, instead of one
+nest of depth `forks` for all of them. 16 four-configuration nests and
+2 of 256 rather than 19 passes through 16,384. Flat specialization
+then becomes affordable at the same time and for the same reason,
+which is the fusion Philippe asked for.
+
+Not started. It is a real change to `transpile::lower`'s placement and
+it wants a decision first.
+
 ### What is still not established
 
-* **14 forks is unmeasured.** The two biggest shapes skip the 9-fork
+* ~~**14 forks is unmeasured.**~~ Measured, above.
+
+* **14 forks, superseded.** The two biggest shapes skip the 9-fork
   enumeration cap, loudly. If the ratio holds, an 83,662-node loop
   kernel becomes ~250k flat with no loop nest at all.
 * **The runtime win is unmeasured**, and it is the one that decides.

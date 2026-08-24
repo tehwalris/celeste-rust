@@ -1428,13 +1428,26 @@ mod tests {
     /// the splits left standing (what is emitted today, inside a loop)
     /// against the same count with all 2^forks configurations resolved.
     ///
-    /// The answer on room (1,0) is **3.92x on shape 1**, against a
-    /// theoretical maximum of 4.00x - so the configurations share 1.9%
-    /// of their nodes and specialization is four separate copies of the
-    /// frame. Kept as a test rather than deleted with the idea, because
-    /// it is what makes the refutation re-checkable: a future tracer
-    /// whose fork sits somewhere less load-bearing than `player.rem`
-    /// would show a different ratio, and this is how you would find out.
+    /// The room (1,0) answer - 3.92x of a maximum 4.00x, 1.9% shared -
+    /// was WRONG TWICE, and the wrongness is the reason this prints as
+    /// much as it does now. It ran on the only room that existed, which
+    /// forks twice and is the weakest point on the curve; and it blended
+    /// all 64 button assignments into the arena, so button divergence
+    /// dominated and the fork question was never actually asked.
+    ///
+    /// Holding the buttons fixed and running room (2,0), the ratio is
+    /// flat at ~2.3-3.2x while the configuration count goes 4 -> 16 ->
+    /// 256, i.e. sharing goes 40.6% -> 82-86% -> 98.7-99.0%.
+    /// Specialization gets CHEAPER, relatively, the more forks there
+    /// are.
+    ///
+    /// Node counts alone do not decide it, so this also reports the
+    /// runtime comparison. The loop re-executes every node above its
+    /// fork level once per configuration, so its work is
+    /// `sum_l count_l * 2^l`; the flat form executes each node once, so
+    /// its work IS its node count. Those two are the numbers that
+    /// matter, and the level histogram says where a shape sits between
+    /// them.
     #[test]
     #[ignore]
     fn what_specializing_the_fork_would_cost() {
@@ -1485,24 +1498,249 @@ mod tests {
             // Enumeration is 2^forks, so it is capped and the cap is
             // ANNOUNCED. A silent skip here would read as "measured and
             // fine" for precisely the shapes the question is about.
-            const MAX_FORKS: u8 = 9;
+            const MAX_FORKS: u8 = 14;
             if forks > MAX_FORKS {
                 eprintln!(
-                    "[fork] shape {}: {} forks - SKIPPED, 2^{} configurations is past                      the {} cap. Not measured, not zero.",
+                    "[fork] shape {}: {} forks - SKIPPED, 2^{} configurations is past \
+                     the {} cap. Not measured, not zero.",
                     si, forks, forks, MAX_FORKS
                 );
                 continue;
             }
-            let ns: u32 = 1u32 << forks;
+            let ns: u64 = 1u64 << forks;
             let mut flat_arena = Graph::new();
             let mut flat_roots: Vec<NodeId> = Vec::new();
+            // Configurations that FOLD AWAY. Resolving a split turns
+            // `FragOk` into ordinary arithmetic, and arithmetic folds:
+            // a configuration whose every outcome is statically dead is
+            // one the flat form never emits, while the runtime loop
+            // still enters it and discovers `valid == 0`. So this is
+            // both a discount on the flat size and a count of trips the
+            // loop takes for nothing.
+            let mut dead = 0u64;
+            let mut live_roots: Vec<NodeId> = Vec::new();
+            // How many DISTINCT successors the configurations produce.
+            //
+            // Sharing the compute is only half a flat kernel: each
+            // configuration also has to WRITE its row, and the write
+            // does not hash-cons - it is emitted code. But two
+            // configurations that land on the same output tuple are the
+            // same successor for every lane (the same argument
+            // `specialize_into` makes for buttons), so they need ONE
+            // write between them. This counts the tuples, which is the
+            // number of write sites a flat kernel actually needs, as
+            // against `ns` if none of them coincide.
+            let mut tuples: std::collections::HashSet<Vec<NodeId>> =
+                std::collections::HashSet::new();
             for c in 0..ns {
-                let map = g.specialize_config_into(0, Some(c as u8), &mut flat_arena);
+                let map = g.specialize_config_into(0, Some(c), &mut flat_arena);
+                let alive = r.bound.outcomes.iter().any(|o| {
+                    !matches!(
+                        flat_arena.get(map[o.live as usize]).op,
+                        crate::transpile::graph::Op::ConstBool(false)
+                    )
+                });
+                if alive {
+                    live_roots.extend(base.iter().map(|x| map[*x as usize]));
+                    tuples.insert(base.iter().map(|x| map[*x as usize]).collect());
+                } else {
+                    dead += 1;
+                }
                 flat_roots.extend(base.iter().map(|x| map[*x as usize]));
             }
             let (a, b) = (
                 live_count(&loop_arena, &loop_roots),
                 live_count(&flat_arena, &flat_roots),
+            );
+            let b_live = live_count(&flat_arena, &live_roots);
+            eprintln!(
+                "[fork]   shape {}: {} of {} configurations fold away \
+                 ({:.1}%); flat nodes {} -> {} once they are dropped",
+                si,
+                dead,
+                ns,
+                100.0 * dead as f64 / ns as f64,
+                b,
+                b_live,
+            );
+            eprintln!(
+                "[fork]   shape {}: {} distinct successors from {} configurations \
+                 ({} write sites, not {})",
+                si,
+                tuples.len(),
+                ns,
+                tuples.len(),
+                ns,
+            );
+
+            // WHERE each fork comes from.
+            //
+            // `Iface::ival` says the only INTERVAL input is the player's
+            // `rem.x`/`rem.y`, so a shape forking 14 times is forking on
+            // twelve values that became intervals during the frame. That
+            // is either six more objects whose motion genuinely inherits
+            // the player's uncertainty, or an imprecision worth
+            // narrowing - and the difference is the difference between
+            // 16,384 real successors and 16,384 spurious ones. Naming
+            // the cells under each fork is what tells them apart.
+            let mut in_path: std::collections::BTreeMap<u32, String> =
+                std::collections::BTreeMap::new();
+            for (i, cell) in r.frame.in_cells.iter().enumerate() {
+                in_path.insert(*cell, crate::trace::iface::show(&r.frame.iface.slots[i]));
+            }
+            let ivals: Vec<String> = r
+                .frame
+                .iface
+                .ival
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| **b)
+                .map(|(i, _)| crate::trace::iface::show(&r.frame.iface.slots[i]))
+                .collect();
+            eprintln!("[fork]   shape {}: interval INPUTS are {:?}", si, ivals);
+            for d in 0..forks {
+                let split = (0..g.len() as NodeId)
+                    .find(|id| matches!(g.get(*id).op, crate::transpile::graph::Op::Split(x) if x == d));
+                let Some(split) = split else {
+                    eprintln!("[fork]   shape {} fork {}: no Split node (folded away)", si, d);
+                    continue;
+                };
+                let operand = g.get(split).args[0];
+                let reach = crate::transpile::bdd::reachable(g, &[operand]);
+                let mut objs: Vec<String> = Vec::new();
+                let mut n_cells = 0usize;
+                for id in 0..g.len() as NodeId {
+                    if !reach[id as usize] {
+                        continue;
+                    }
+                    if let crate::transpile::graph::Op::Cell(c) = g.get(id).op {
+                        if let Some(p) = in_path.get(&c) {
+                            n_cells += 1;
+                            // "objects[3].spd.y" -> "objects[3]"
+                            let head = match p.find(']') {
+                                Some(k) => p[..=k].to_string(),
+                                None => p.clone(),
+                            };
+                            objs.push(head);
+                        }
+                    }
+                }
+                objs.sort();
+                objs.dedup();
+                eprintln!(
+                    "[fork]   shape {} fork {}: {} input cells under it, from {:?}",
+                    si, d, n_cells, objs
+                );
+            }
+
+            // The other direction, which is the one that names an
+            // object: not "what does this fork read" but "whose
+            // position does it write". A fork reads most of the state
+            // (every object's motion is guarded by the same globals),
+            // so the read cone identifies nothing; the WRITE cone does,
+            // because `objects[k].rem.x` is written by exactly the
+            // `move` call on object k.
+            //
+            // `bound.outcomes` and `frame.outs` are the same list in the
+            // same order - `bind` renumbers cells, not roots - so the
+            // node ids come from the first and the paths from the
+            // second.
+            let cones = g.split_cones();
+            for (oi, o) in r.bound.outcomes.iter().enumerate() {
+                let paths = &r.frame.outs[oi].fields;
+                assert_eq!(
+                    paths.len(),
+                    o.outputs.len(),
+                    "outcome {} has {} paths but {} outputs - the two lists are \
+                     supposed to be the same roots in the same order",
+                    oi,
+                    paths.len(),
+                    o.outputs.len()
+                );
+                let mut by_obj: std::collections::BTreeMap<String, u64> =
+                    std::collections::BTreeMap::new();
+                for ((path, _, _), (_, node, _)) in paths.iter().zip(o.outputs.iter()) {
+                    let p = crate::trace::iface::show(path);
+                    let head = match p.find(']') {
+                        Some(k) => p[..=k].to_string(),
+                        None => p.clone(),
+                    };
+                    *by_obj.entry(head).or_insert(0) |= cones[*node as usize];
+                }
+                for (obj, mask) in by_obj {
+                    if mask == 0 {
+                        continue;
+                    }
+                    let which: Vec<u8> = (0..forks).filter(|d| mask & (1 << d) != 0).collect();
+                    eprintln!(
+                        "[fork]   shape {} outcome {}: {} depends on forks {:?}",
+                        si, oi, obj, which
+                    );
+                }
+                // The whole outcome, VALUES AND MASKS. `live` and `ok`
+                // matter as much as the fields: an outcome whose values
+                // ignore every fork can still be gated on fork
+                // validity, and an outcome is only cheap to specialize
+                // if the mask is cheap too.
+                let whole = o
+                    .outputs
+                    .iter()
+                    .map(|(_, n, _)| cones[*n as usize])
+                    .chain([cones[o.live as usize], cones[o.ok as usize]])
+                    .fold(0u64, |a, b| a | b);
+                let which: Vec<u8> = (0..forks).filter(|d| whole & (1 << d) != 0).collect();
+                eprintln!(
+                    "[fork]   OUTCOME shape {} outcome {}: {} of {} forks {:?} \
+                     -> {} configurations",
+                    si,
+                    oi,
+                    which.len(),
+                    forks,
+                    which,
+                    1u64 << which.len()
+                );
+            }
+
+            // WHERE the loop's nodes sit, which is what decides its
+            // runtime: a node whose split cone's highest bit is `d`
+            // lives inside loops 0..=d and is therefore executed up to
+            // 2^(d+1) times. Same `level` the emitter places by
+            // (`transpile::lower`), so this histogram is literally the
+            // shape of the emitted loop nest.
+            let live_loop = crate::transpile::bdd::reachable(&loop_arena, &loop_roots);
+            let scone = loop_arena.split_cones();
+            let mut per_level = vec![0usize; forks as usize + 1];
+            for id in 0..loop_arena.len() as NodeId {
+                if !live_loop[id as usize] {
+                    continue;
+                }
+                let m = scone[id as usize];
+                let lvl = if m == 0 {
+                    0
+                } else {
+                    (crate::transpile::graph::ChoiceSet::BITS - m.leading_zeros()) as usize
+                };
+                per_level[lvl.min(forks as usize)] += 1;
+            }
+            // The loop's WORK, with no pruning: each level's nodes run
+            // once per configuration of the forks below them. This is an
+            // upper bound - `if valid == 0 { continue }` skips
+            // configurations no lane reaches - so a flat form cheaper
+            // than this is not yet proof, but a flat form cheaper than
+            // the loop's SIZE times a handful is a strong hint.
+            let loop_work: u64 = per_level
+                .iter()
+                .enumerate()
+                .map(|(l, n)| *n as u64 * (1u64 << l))
+                .sum();
+            eprintln!(
+                "[fork]   shape {} levels {:?}; loop work <= {} node-evals, \
+                 flat work = {} ({:.2}x cheaper at most)",
+                si,
+                per_level,
+                loop_work,
+                b,
+                loop_work as f64 / b.max(1) as f64,
             );
             // The two are equal in WORK - the loop evaluates its tail
             // up to 2^forks times, specialization evaluates 2^forks

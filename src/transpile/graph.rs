@@ -434,7 +434,7 @@ impl Graph {
     pub fn specialize_config_into(
         &self,
         frees: u8,
-        splits: Option<u8>,
+        splits: Option<u64>,
         out: &mut Graph,
     ) -> Vec<NodeId> {
         let mut map: Vec<NodeId> = Vec::with_capacity(self.nodes.len());
@@ -442,11 +442,20 @@ impl Graph {
             let arg = |map: &Vec<NodeId>, k: usize| map[node.args[k] as usize];
             let id = match (node.op.clone(), splits) {
                 (Op::Free(b), _) => out.leaf(Op::ConstBool(frees & (1 << b) != 0)),
+                // `d` indexes a fork, and `splits` is one bit per fork.
+                // It is a `u64` rather than a `u8` because room (2,0)
+                // forks 14 times and `(s >> 13) & 1` on a `u8` is
+                // always 0 - which would have silently measured 16,384
+                // configurations as 256 distinct ones and reported the
+                // collapse as sharing. Fourth member of the
+                // shift-overflow family; see `ChoiceSet`.
                 (Op::Split(d), Some(s)) => {
-                    out.fold(Op::Frag((s >> d) & 1), vec![arg(&map, 0)])
+                    debug_assert!((d as u32) < u64::BITS, "fork {} past a u64 split mask", d);
+                    out.fold(Op::Frag(((s >> d) & 1) as u8), vec![arg(&map, 0)])
                 }
                 (Op::SplitValid(d), Some(s)) => {
-                    out.fold(Op::FragOk((s >> d) & 1), vec![arg(&map, 0)])
+                    debug_assert!((d as u32) < u64::BITS, "fork {} past a u64 split mask", d);
+                    out.fold(Op::FragOk(((s >> d) & 1) as u8), vec![arg(&map, 0)])
                 }
                 _ => {
                     let args: Vec<NodeId> =

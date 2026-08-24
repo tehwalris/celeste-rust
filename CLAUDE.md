@@ -180,6 +180,31 @@ have a REASON to think they will fire:
 Do NOT read past the "N skipped" line and call the suite green when one
 of those reasons applies. That is the exact mistake behind `a8f4635`.
 
+### Diagnostics are not tests (Philippe, 2026-08-24)
+
+A `#[test] #[ignore]` that asserts NOTHING and only `eprintln!`s a table
+is a diagnostic wearing a test's clothes. It is the wrong shape twice:
+nothing fails when its answer changes, and the next person running
+`--run-ignored all` pays its full cost for output nobody reads. Five of
+these exist today, all zero-assertion:
+
+| | |
+|---|---|
+| `trace::kernel::what_specializing_the_fork_would_cost` | ~120 s |
+| `trace::kernel::how_many_variants_write_the_same_row` | |
+| `trace::kernel::how_much_of_a_frame_is_erased_immediately` | |
+| `trace::verify::tracing_a_frame_with_everything_symbolic` | |
+| `trace::verify::specialising_to_one_player_position` | |
+
+They belong behind ONE binary - `src/bin/probe.rs` with a subcommand
+each - not in the test harness. `#[ignore]` is for tests that assert
+something and are slow (`generated_is_current`,
+`every_checked_in_recipe_replays`), not for a hiding place.
+
+Until that binary exists: do not add a new zero-assertion `#[test]`.
+Write it as a subcommand, or give it an assertion that states the
+finding it exists to defend.
+
 Run the suite with NEXTEST, never bare `cargo test --release`: the tests
 are fine (21 s wall for all 515 under nextest, 2026-08-16) but several
 of them mutate process-global state (instr_time, partition toggles),
