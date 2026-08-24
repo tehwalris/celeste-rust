@@ -423,71 +423,27 @@ mod tests {
         assert!(lanes > 0, "no lanes re-ran under the plain program");
     }
 
-    /// The compiled frame body produces the interpreter's rows (P1 stage 3).
+    /// The compiled frame body - the TRACED kernels - produces the
+    /// interpreter's rows (P1 stage 3, tracing.md stage 5).
     ///
-    /// `CELESTE_COMPILED_FORWARD=check` runs BOTH engines on every chunk and
-    /// compares canonical row-key SETS, failing the step on the first
-    /// difference - so the assertion here is simply that 30 frames run. Set
-    /// equality is the right claim and the only one available: the compiled
-    /// path returns a different PARTITION of the same rows (different block
-    /// count, lane order and heap layout), so `observe_frame` would differ
-    /// for a correct run.
+    /// `CELESTE_COMPILED_FORWARD=check` runs BOTH engines on every chunk
+    /// and compares canonical row-key SETS, failing the step on the first
+    /// difference. Set equality is the right claim and the only one
+    /// available: the compiled path returns a different PARTITION of the
+    /// same rows (different block count, lane order and heap layout), so
+    /// `observe_frame` would differ for a correct run. Every chunk the
+    /// traced set claims is therefore checked against the interpreter.
     ///
     /// Lane counts are checked against an interpreted baseline on top,
-    /// because a bug that dropped a row from both sides symmetrically would
-    /// pass the key comparison.
+    /// because a bug that dropped a row from both sides symmetrically
+    /// would pass the key comparison. The traced-lane assertion matters
+    /// more: the traced set is indexed by heap SHAPE, so a set generated
+    /// for shapes this run never reaches would miss every chunk, fall
+    /// through to the interpreter, and pass this test having run none of
+    /// the code it names.
     ///
     /// Sets a process-global env var and relies on nextest's
     /// process-per-test isolation, like the other global-state tests here.
-    #[test]
-    fn compiled_forward_reproduces_the_interpreter() {
-        let _partition = crate::interpreter::partition_straddles_test_lock();
-        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
-            || !std::path::Path::new("rewrites.jsonl").exists()
-            || !std::path::Path::new("rewrites-compile.jsonl").exists()
-        {
-            return;
-        }
-        let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
-
-        let frames = 30;
-        let mut baseline = AbstractRun::start(&program).expect("start baseline");
-        let mut want = Vec::new();
-        for _ in 1..=frames {
-            baseline.step().expect("baseline step");
-            want.push(baseline.lane_count());
-        }
-        drop(baseline);
-
-        std::env::set_var("CELESTE_COMPILED_FORWARD", "check");
-        let mut run = AbstractRun::start(&program).expect("start compiled run");
-        assert!(run.compiled.is_some(), "the compiled engine did not engage");
-        for (frame, want) in (1..=frames).zip(want) {
-            run.step().unwrap_or_else(|e| panic!("frame {}: {:#}", frame, e));
-            assert_eq!(
-                run.lane_count(),
-                want,
-                "compiled forward has a different lane count at frame {}",
-                frame
-            );
-        }
-    }
-
-    /// The TRACED kernels produce the interpreter's rows too.
-    ///
-    /// Same machinery as `compiled_forward_reproduces_the_interpreter`
-    /// above - `CELESTE_COMPILED_FORWARD=check` runs both engines on
-    /// every chunk and fails the step on the first row-key set that
-    /// differs - with `CELESTE_TRACED_KERNELS=1` putting the per-shape
-    /// traced set at the FRONT of the kernel chain. Every chunk it
-    /// claims is therefore checked against the interpreter.
-    ///
-    /// The lane-count assertion matters for the same reason it does
-    /// above, and the traced-lane assertion matters more: the traced set
-    /// is indexed by heap SHAPE, so a set generated for shapes this run
-    /// never reaches would miss every chunk, fall through to the class
-    /// kernels, and pass this test having run none of the code it
-    /// names.
     #[test]
     fn traced_kernels_reproduce_the_interpreter() {
         let _partition = crate::interpreter::partition_straddles_test_lock();
@@ -509,7 +465,6 @@ mod tests {
         drop(baseline);
 
         std::env::set_var("CELESTE_COMPILED_FORWARD", "check");
-        std::env::set_var("CELESTE_TRACED_KERNELS", "1");
         let mut run = AbstractRun::start(&program).expect("start compiled run");
         assert!(run.compiled.is_some(), "the compiled engine did not engage");
         for (frame, want) in (1..=frames).zip(want) {
