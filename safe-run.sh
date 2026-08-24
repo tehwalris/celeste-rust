@@ -1,8 +1,8 @@
 #!/bin/bash
-# Run commands with memory limit using cgroups (default 100G)
+# Run commands with memory limit using cgroups (default 60G)
 # Usage: ./safe-run.sh [--memory LIMIT] -- COMMAND...
 
-MEMORY_LIMIT="100G"
+MEMORY_LIMIT="60G"
 
 while [[ $# -gt 0 ]]; do
     case $1 in

@@ -73,9 +73,19 @@ which is deliberately not merged - see BENCHMARK_DATA.md.
 
 ## Running safely
 
-Use `./safe-run.sh` for anything that runs the forward search or the test
-suite. It runs the command in a systemd scope with `MemoryMax=100G` so an
+Use `./safe-run.sh` for EVERYTHING that builds or runs - `cargo build`,
+`cargo check`, nextest, `transpile`, benches, the forward search - and
+that includes commands issued by subagents. It runs the command in a
+systemd scope with `MemoryMax=60G` (Philippe's default, 2026-08-25) so an
 accidental blowup kills the process rather than the machine.
+
+Why "everything" and not "the expensive things": on 2026-08-24 a process
+that ran OUTSIDE the wrapper reached 120 GB twice (system-wide OOM,
+`CONSTRAINT_NONE` in the kernel log), and the second time it took the
+whole Claude session and a background deletion agent with it. The
+agent's hour of work was uncommitted and is gone. The wrapper costs
+nothing; the judgment call about which command is "cheap enough" is
+exactly the thing that fails.
 
 ```bash
 cargo nextest run <filter>                                      # DEV LOOP, 1.3 s
@@ -213,7 +223,7 @@ suite has twice been observed degrading to ~70-85 MINUTES at one core.
 nextest runs each test in its own process, which contains every such
 leak by construction.
 
-Exit code 137 means OOM. One job needs MORE than the 100 GB default:
+Exit code 137 means OOM. One job needs MORE than the 60 GB default:
 room (0,0)'s level-0 position-graph replay peaks at 101.08 GB on its last
 frame, so that campaign runs `ladder.sh` with `MEM=108G` and builds the
 graph a few frames per process. See BENCHMARK_DATA.md; do not raise the cap
