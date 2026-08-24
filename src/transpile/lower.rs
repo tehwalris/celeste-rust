@@ -233,6 +233,12 @@ impl<'a> Ctx<'a> {
             Op::SplitOk => Repr::boolean(true, false),
             Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::Neg | Op::Abs | Op::Min
             | Op::Max => joined(Dom::Num),
+            // Always an interval, whatever the bounds are: a `Span` of
+            // two exact values is still a set of numbers, and the whole
+            // reason it exists is that the two are not the same node.
+            // (`fold` turns a span of two LITERALS back into a `Const`,
+            // so the degenerate case never reaches here.)
+            Op::Span => Repr { dom: Dom::Num, lane: joined(Dom::Num).lane, wide: true },
             // flr of an interval is exact BY GUARD: the lane survives only
             // where the floor is unique, and that condition is a conjunct
             // of `ok`. So this is not an unchecked narrowing - it is the
@@ -322,6 +328,21 @@ impl<'a> Ctx<'a> {
         let lane = out.lane;
         let a = self.args(id).to_vec();
         Ok(match op {
+            // Both operands coerced to the OUTPUT (interval) repr, then
+            // one bound taken from each. Going through `at` rather than
+            // reading the operands raw is what makes an exact operand
+            // work: the existing widening coercions (`zi_of_zn`,
+            // `zi_splat`, `(e, e)`) already turn a number into the
+            // singleton interval, and taking a bound off that is the
+            // number back again.
+            Op::Span => {
+                let (x, y) = (self.at(id, 0, out)?, self.at(id, 1, out)?);
+                if lane {
+                    format!("ZI {{ lo: {}.lo, hi: {}.hi }}", x, y)
+                } else {
+                    format!("({}.0, {}.1)", x, y)
+                }
+            }
             Op::Add | Op::Sub | Op::Min | Op::Max => {
                 let (x, y) = (self.at(id, 0, out)?, self.at(id, 1, out)?);
                 let (zn, zi, sn, si) = match op {
@@ -1059,9 +1080,16 @@ pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
 
     // --- placement: only the SPLITS scope anything now ---
     let scone = sp.split_cones();
+    // The loop level a node belongs at: one past its highest fork bit.
+    // Width taken from the mask type rather than written as a literal -
+    // an `8` here was half of the fork-mask truncation bug.
     let level = |id: NodeId| -> usize {
         let m = scone[id as usize];
-        if m == 0 { 0 } else { 8 - m.leading_zeros() as usize }
+        if m == 0 {
+            0
+        } else {
+            (crate::transpile::graph::ChoiceSet::BITS - m.leading_zeros()) as usize
+        }
     };
 
     let depth = e.fork_depth;

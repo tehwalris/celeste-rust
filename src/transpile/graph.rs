@@ -99,18 +99,47 @@ pub enum Choice {
 
 /// A set of choices, as a bitmask. Frees occupy the low 6 bits (one per
 /// button), splits the rest.
-pub type ChoiceSet = u16;
+///
+/// `u64`, not `u16`. Room (1,0) forks at most a handful of times and 10
+/// split bits looked like plenty; room (2,0) has a fruit and two
+/// springs and forks SIXTEEN times, and `1u16 << (6 + 15)` does not
+///error - Rust masks the shift amount in release, so
+/// `Split(15).bit()` came back as bit 5, which is a BUTTON. The cones
+/// were then silently wrong and the emitter placed fork-dependent nodes
+/// in the shared prologue, where they referred to loop variables that
+/// did not exist yet. 48 undefined names in a million lines of
+/// generated Rust, and nothing upstream complained.
+///
+/// 58 splits is not obviously enough either, which is what `bit`'s
+/// assertion below is for: the next room that needs more gets a panic
+/// naming the limit rather than a corrupt mask.
+pub type ChoiceSet = u64;
 pub const N_FREE: u8 = 6;
+/// Split choices representable in a `ChoiceSet`.
+pub const N_SPLIT: u8 = (ChoiceSet::BITS as u8) - N_FREE;
 
 impl Choice {
     pub fn bit(self) -> ChoiceSet {
-        1 << match self {
-            Choice::Free(b) => b,
-            Choice::Split(d) => N_FREE + d,
-        }
+        let i = match self {
+            Choice::Free(b) => {
+                assert!(b < N_FREE, "free choice {} but only {} buttons", b, N_FREE);
+                b
+            }
+            Choice::Split(d) => {
+                // The one that actually fired. See the type's note.
+                assert!(
+                    d < N_SPLIT,
+                    "fork {} but a ChoiceSet holds only {} - widen ChoiceSet",
+                    d,
+                    N_SPLIT
+                );
+                N_FREE + d
+            }
+        };
+        1 << i
     }
     pub fn all_in(set: ChoiceSet) -> Vec<Choice> {
-        (0..16u8)
+        (0..ChoiceSet::BITS as u8)
             .filter(|i| set & (1 << i) != 0)
             .map(|i| {
                 if i < N_FREE {
@@ -169,6 +198,25 @@ pub enum Op {
     Sin,
     Min,
     Max,
+    /// `Span(lo, hi)` - the interval running from `lo`'s low bound to
+    /// `hi`'s high bound.
+    ///
+    /// The graph could always REPRESENT an interval (every number node
+    /// is one), but the only way to BUILD one was the literal
+    /// `Const(lo, hi)`. That is enough for a widening whose bounds are
+    /// known at trace time - `player.rem` := [-0.5, 0.5) - and not
+    /// enough for one whose bounds are computed: a fruit's bob band is
+    /// `start +- 2.5`, and `start` is an input column, so the band is a
+    /// different interval in every lane. Without this op the tracer
+    /// refused room (2,0) at its first shape.
+    ///
+    /// Sound because it is exactly the hull: whatever concrete values
+    /// the operands take, the result contains the band around them.
+    /// The premise that the widened field was INSIDE the band is a
+    /// separate conjunct of `ok`, built by the caller from ordinary
+    /// comparisons, so nothing here has to decide anything at trace
+    /// time.
+    Span,
 
     // ---- number -> bool ----
     Lt,
@@ -339,8 +387,13 @@ impl Graph {
     }
 
     /// The cone restricted to SPLIT choices.
-    pub fn split_cones(&self) -> Vec<u8> {
-        self.choice_cones().iter().map(|m| (*m >> N_FREE) as u8).collect()
+    ///
+    /// As wide as `ChoiceSet`, not `u8`. This used to truncate, which
+    /// was a second copy of the same bug the type's note describes:
+    /// even with a wide enough mask, `as u8` threw away every fork past
+    /// the eighth.
+    pub fn split_cones(&self) -> Vec<ChoiceSet> {
+        self.choice_cones().iter().map(|m| *m >> N_FREE).collect()
     }
 
     /// Rebuild this graph into `out` with the button bits replaced by
@@ -459,6 +512,20 @@ impl Graph {
             // `Some(true)` for every operand, and the two are checked
             // against each other by `folding_is_exact`.
             Op::FragOk(0) => return self.leaf(Op::ConstBool(true)),
+            // A span of two literals IS a literal interval, and folding
+            // it back to one is what keeps a `Span` built over constant
+            // bounds identical to the `Const` the caller would have
+            // written by hand. EXACT: `eval`'s arm takes operand 0's low
+            // and operand 1's high, which is precisely these two fields.
+            Op::Span => {
+                let lit = |g: &Graph, i: usize| match g.nodes[args[i] as usize].op {
+                    Op::Const(lo, hi) => Some((lo, hi)),
+                    _ => None,
+                };
+                if let (Some((lo, _)), Some((_, hi))) = (lit(self, 0), lit(self, 1)) {
+                    return self.leaf(Op::Const(lo, hi));
+                }
+            }
             // The one that matters: a decided condition picks its arm, so
             // the other arm (and whatever only it used) disappears.
             Op::Sel => {
@@ -679,6 +746,12 @@ impl Graph {
                     Pico8Num::from_raw(*hi),
                 )),
                 Op::ConstBool(b) => Val::Bool(Some(*b)),
+                // The hull, and the definition `fold`'s two-constant
+                // rule below is checked against.
+                Op::Span => Val::Num(Pico8NumInterval::new(
+                    a(0).as_num("Span")?.low,
+                    a(1).as_num("Span")?.high,
+                )),
                 Op::Free(b) => bail!("node {}: free choice {} has no value outside a variant", i, b),
                 // A split RESTRICTS its operand, so under `lenient` the
                 // operand's own range still contains the result - which

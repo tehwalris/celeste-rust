@@ -229,9 +229,54 @@ pub fn structure_of(
                 if !tab.hash.is_empty() && !tab.arr.is_empty() {
                     bail!("table {} has both a hash and an array part", t);
                 }
-                if !tab.ints.is_empty() {
-                    bail!("table {} has integer keys outside the array part", t);
-                }
+                // Integer keys past the end of the array: `t[3] = v` on
+                // an empty table, which is legal Lua and exactly what
+                // room (2,0)'s fruit does
+                // (`got_fruit[1 + level_index()]`, level_index() == 2).
+                //
+                // The INTERPRETER materialises the gap as explicit nils
+                // and keeps one dense `ArrayTable`
+                // (`core_interpreter`'s index-assignment arm, and
+                // `test_interpret_index_assignment_past_the_end`). The
+                // tracer's heap models the same table as a sparse
+                // `ints` map instead, which is a finer model - and a
+                // DIFFERENT one, so a block bound from it would have a
+                // structure `import_block` never produces and a shape
+                // hash no kernel matches.
+                //
+                // So flatten here, the interpreter's way. Not a choice
+                // between two representations: `bind`'s whole contract
+                // is to produce what the importer produces.
+                let arr: Vec<V> = if tab.ints.is_empty() {
+                    tab.arr.clone()
+                } else {
+                    if !tab.hash.is_empty() {
+                        bail!(
+                            "table {} has integer keys AND named fields - the engine's \
+                             Cell2 is an object or an array, never both",
+                            t
+                        );
+                    }
+                    // 1-based and dense. A zero or negative key has no
+                    // position in a Lua array part, so there is nothing
+                    // to flatten it into - refused rather than guessed.
+                    let Some(&top) = tab.ints.keys().next_back() else {
+                        unreachable!("checked non-empty")
+                    };
+                    if *tab.ints.keys().next().unwrap() < 1 {
+                        bail!(
+                            "table {} has a non-positive integer key - it has no place \
+                             in a dense array part",
+                            t
+                        );
+                    }
+                    let mut arr = tab.arr.clone();
+                    arr.resize(top as usize, Value::Nil);
+                    for (k, v) in tab.ints.iter() {
+                        arr[*k as usize - 1] = v.clone();
+                    }
+                    arr
+                };
                 let slot = |rt2: &mut Rt2, todo: &mut Vec<Todo>, v: &V| -> u32 {
                     rt2.structure.push(Cell2::Val);
                     rt2.cols.push(Col::U(AV::Nil));
@@ -246,9 +291,9 @@ pub fn structure_of(
                 // can traverse either - but it is a different cell to
                 // the shape hash, which is what makes it worth matching
                 // rather than reasoning about.
-                let body = if tab.hash.is_empty() && tab.arr.is_empty() {
+                let body = if tab.hash.is_empty() && arr.is_empty() {
                     Cell2::Unk
-                } else if tab.arr.is_empty() {
+                } else if arr.is_empty() {
                     // Fields the boundary does not name are dropped,
                     // exactly as `import_block` drops them: no generated
                     // code can access one, so it is unreachable weight.
@@ -260,7 +305,7 @@ pub fn structure_of(
                     Cell2::Obj(fields)
                 } else {
                     let items: Vec<u32> =
-                        tab.arr.iter().map(|v| slot(&mut rt2, &mut todo, v)).collect();
+                        arr.iter().map(|v| slot(&mut rt2, &mut todo, v)).collect();
                     Cell2::Arr(items)
                 };
                 rt2.structure[c] = body;

@@ -106,6 +106,17 @@ fn run(g: &Graph, need: &[bool], env: &Env, strict: bool) -> Result<Vec<Option<C
                 Conc::Num(P8::from_raw(lo))
             }
             Op::ConstBool(b) => Conc::Bool(b),
+            // This evaluator is CONCRETE - one number per node - so a
+            // span is a value only when it is degenerate, exactly as an
+            // interval literal is. Same refusal, for the same reason:
+            // there is no single number to return.
+            Op::Span => {
+                let (lo, hi) = (num(a(0)?)?, num(a(1)?)?);
+                if lo != hi {
+                    bail!("node {} is the interval [{:?}, {:?}], not a value", id, lo, hi);
+                }
+                Conc::Num(lo)
+            }
             Op::Cell(i) => *env
                 .cells
                 .get(i as usize)

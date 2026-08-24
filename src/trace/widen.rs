@@ -134,31 +134,33 @@ pub fn widen(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
         let Some(Value::Num(start)) = iface::get(st, &ps) else {
             bail!("{}: fruit has no numeric `start`", iface::show(&ps));
         };
-        // The band's bounds are expressions of `start`, and the graph
-        // has no node for "an interval from these two values" - only the
-        // literal `Op::Const(lo, hi)`. So this needs `start` concrete,
-        // which it is whenever the fruit has not moved. Refused rather
-        // than approximated: a band computed from the wrong `start` is a
-        // widening that does not contain the value it replaces.
-        let Some(s) = d.as_const(&start) else {
-            bail!(
-                "{}: fruit `start` is symbolic ({}), so its bob band is not a \
-                 constant interval - the graph has no node for a data-dependent band",
-                iface::show(&ps),
-                d.describe(&start)
-            );
-        };
+        // The band's bounds are EXPRESSIONS of `start`, and `start` is
+        // an input column in every room that has a fruit - room (2,0)'s
+        // is `Sel(Or, Sel, Cell(28))` - so a constant band would be a
+        // band around the wrong value, which is a widening that does not
+        // contain what it replaces.
+        //
+        // `Op::Span` is the node for it: the interval from one computed
+        // value to another. Built here rather than approximated, so the
+        // band is per-lane exactly as `start` is. When `start` DOES fold
+        // to a literal (a room whose fruit has not moved), `Span` of two
+        // literals folds back to `Op::Const`, so those rooms emit
+        // exactly the constant band they did before.
         let Some(Value::Num(old_y)) = iface::get(st, &py) else {
             bail!("{}: fruit `y` is not a number", iface::show(&py));
         };
-        let (lo, hi) = (s - amplitude, s + amplitude);
-        let l = d.num(lo);
-        let h = d.num(hi);
+        let amp = d.num(amplitude);
+        let l = d.arith(super::domain::Arith::Sub, &start, &amp)?;
+        let h = d.arith(super::domain::Arith::Add, &start, &amp)?;
+        // The premise, unchanged in meaning: `y` was inside the band
+        // before the widening replaced it. Symbolic bounds are fine -
+        // `require` conjoins into `st.ok`, which is the runtime
+        // obligation the kernel checks per lane and declines on.
         let a = d.compare(super::domain::Cmp::Ge, &old_y, &l)?;
         let b = d.compare(super::domain::Cmp::Le, &old_y, &h)?;
         let inside = d.and(&a, &b);
         require(st, d, inside);
-        let band = ival(d, lo, hi);
+        let band = d.graph.fold(Op::Span, vec![l, h]);
         iface::set(st, &py, Value::Num(band))?;
         let all = ival(d, P8::from_i16(0), P8::from_i16(39));
         iface::set(st, &po, Value::Num(all))?;

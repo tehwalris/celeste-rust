@@ -33,7 +33,15 @@ pub enum PathStep {
     Key(String),
     /// A slot of the ARRAY part, zero-based.
     Idx(usize),
-    /// An integer key outside the array part, by its Lua key.
+    /// An integer key, by its LUA key (1-based), rather than by array
+    /// position.
+    ///
+    /// Written `[#n]`. Both this and `Idx` land in the array part - the
+    /// interpreter materialises `t[3] = v` on an empty table as a dense
+    /// array with explicit nils, and `compiled::bridge` and
+    /// `trace::bind` both follow it - so the difference is only which
+    /// numbering the path text uses. `[#3]` and `[2]` name the same
+    /// cell.
     Int(i16),
 }
 
@@ -138,6 +146,19 @@ pub fn resolve_steps(rt2: &Rt2, p: &[PathStep]) -> Result<u32, String> {
                     (Cell2::Arr(items), PathStep::Idx(i)) => *items
                         .get(*i)
                         .ok_or_else(|| format!("[{}]: past the end of a {}-item array", i, items.len()))?,
+                    // A Lua integer key is array slot k-1. This arm was
+                    // missing for as long as an integer key outside the
+                    // array part could not be represented at all; both
+                    // importers flatten now, so the only thing left of
+                    // the distinction is the 1-based numbering.
+                    (Cell2::Arr(items), PathStep::Int(k)) => {
+                        if *k < 1 {
+                            return Err(format!("[#{}]: not a Lua array key", k));
+                        }
+                        *items.get(*k as usize - 1).ok_or_else(|| {
+                            format!("[#{}]: past the end of a {}-item array", k, items.len())
+                        })?
+                    }
                     (cell, step) => {
                         return Err(format!("{:?}: no such step in a {}", step, kind(cell)))
                     }

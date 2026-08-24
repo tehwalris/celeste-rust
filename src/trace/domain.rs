@@ -453,6 +453,15 @@ impl Domain for Symbolic {
                 Op::Cell(c) => ival.contains(&c),
                 Op::Const(lo, hi) => lo != hi,
                 Op::Split(_) => true,
+                // Unconditionally, like a non-degenerate `Const`: a
+                // span exists precisely because its two bounds are
+                // different nodes. (`fold` collapses a span of two
+                // literals to a `Const`, so the degenerate case is
+                // already gone by the time anything asks.) The literal
+                // interval and the computed one are the same kind of
+                // value, and this is the sibling of `Op::Const(lo, hi)
+                // if lo != hi` above.
+                Op::Span => true,
                 Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::Neg | Op::Abs
                 | Op::Min | Op::Max => any(memo, a),
                 // The CONDITION does not make the result an interval.
