@@ -204,11 +204,6 @@ pub fn lower_frame(
     let mut e = Emit::bare(graph.clone());
     e.room = room;
     e.fork_depth = forks as usize;
-    e.opaque_forks = true;
-    // `Emit`'s own `ok`/`live` are the walk path's; the outcomes carry
-    // their own, and nothing below reads these two.
-    e.live = outcomes.first().map(|o| o.live).unwrap_or(0);
-    e.ok = outcomes.first().map(|o| o.ok).unwrap_or(0);
     for (cell, kind) in inputs {
         e.vary_in.insert(*cell, *kind);
     }
@@ -234,7 +229,6 @@ pub fn lower_frame(
                         konst: None,
                     })
                     .collect(),
-                ubool: Vec::new(),
             },
             ok: o.ok,
             live: o.live,
