@@ -24,6 +24,7 @@
 //! emit-time error - the witness IS the domain, and silence would hide a
 //! soundness hole.
 
+use crate::transpile::lower::WALK_WRITES_EVERY_OUTCOME;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 
@@ -204,6 +205,22 @@ pub(crate) struct Emit {
     /// for a TRACED graph, where it is the difference between 10,510 and
     /// 4,714 nodes.
     pub(crate) decide: bool,
+    /// Resolve every fork at COMPILE time instead of emitting a runtime
+    /// loop nest.
+    ///
+    /// On for the TRACED path, off for the walk. The walk's kernels are
+    /// checked in byte-for-byte, and this changes every line of a
+    /// forking one - so it is a flag rather than a replacement until
+    /// those kernels are deleted.
+    ///
+    /// What it is worth, measured on room (2,0) shape 1 (14 forks, 19
+    /// outcomes): the nest walks 2^14 configurations and pushes every
+    /// outcome at its innermost level, 311,296 outcome-pushes, to
+    /// produce 65 distinct bodies. Each outcome depends on a small
+    /// subset of the forks - usually one (x, y) pair - and the
+    /// combinations across subsets collapse once `decide` runs on the
+    /// resolved graph. See `plans/tracing.md`.
+    pub(crate) flat_forks: bool,
     /// Fold each successor's ROW KEY in the graph, and hand it to
     /// `append` instead of making `append` fold it per lane.
     ///
@@ -257,6 +274,7 @@ impl Emit {
             live: 0,
             ok: 0,
             decide: true,
+            flat_forks: true,
             row_key: true,
         }
     }
@@ -616,6 +634,7 @@ pub(crate) fn emit_walk(program: &Program, witness_path: &str) -> Result<Emit> {
         ok: 0,
         // The checked-in kernels come from here. See the fields.
         decide: false,
+        flat_forks: false,
         row_key: false,
     };
     let all = e.graph.leaf(GOp::ConstBool(true));
@@ -2306,11 +2325,11 @@ fn render(e: &mut Emit) -> Result<String> {
     for v in &e.variants {
         writeln!(out, "    out({}, &osh, &KOut {{", v.mask)?;
         writeln!(out, "        valid: {},", e.valid_expr)?;
-        writeln!(out, "        deopt: !{},", v.per[0].ok)?;
-        writeln!(out, "        bd: {},", v.per[0].bd)?;
+        writeln!(out, "        deopt: !{},", v.per[0].as_ref().expect(WALK_WRITES_EVERY_OUTCOME).ok)?;
+        writeln!(out, "        bd: {},", v.per[0].as_ref().expect(WALK_WRITES_EVERY_OUTCOME).bd)?;
         for OutField { cell: id, tainted, .. } in out_fields {
             if *tainted {
-                writeln!(out, "        c{}: {},", id, v.per[0].outputs[id])?;
+                writeln!(out, "        c{}: {},", id, v.per[0].as_ref().expect(WALK_WRITES_EVERY_OUTCOME).outputs[id])?;
             }
         }
         writeln!(out, "    }});")?;

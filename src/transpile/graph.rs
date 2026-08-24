@@ -437,8 +437,37 @@ impl Graph {
         splits: Option<u64>,
         out: &mut Graph,
     ) -> Vec<NodeId> {
+        self.specialize_subset_into(frees, splits, None, out)
+    }
+
+    /// As `specialize_config_into`, over a SUBSET of the nodes.
+    ///
+    /// `need[i]` false means node `i`'s image is never read, so it is
+    /// not built. The flat fork path specializes once per (button, fork
+    /// configuration) PER OUTCOME, and an outcome reaches a fraction of
+    /// the graph - so mapping the whole arena every time is most of the
+    /// work and none of the answer. Ids only ever refer downward
+    /// (`add` appends), so a needed node's arguments are needed too and
+    /// one forward pass is enough.
+    ///
+    /// Entries for unbuilt nodes are `UNBUILT`, which is not a valid id
+    /// - reading one is a bug, and it should look like one.
+    pub fn specialize_subset_into(
+        &self,
+        frees: u8,
+        splits: Option<u64>,
+        need: Option<&[bool]>,
+        out: &mut Graph,
+    ) -> Vec<NodeId> {
+        const UNBUILT: NodeId = NodeId::MAX;
         let mut map: Vec<NodeId> = Vec::with_capacity(self.nodes.len());
-        for node in &self.nodes {
+        for (i, node) in self.nodes.iter().enumerate() {
+            if let Some(need) = need {
+                if !need[i] {
+                    map.push(UNBUILT);
+                    continue;
+                }
+            }
             let arg = |map: &Vec<NodeId>, k: usize| map[node.args[k] as usize];
             let id = match (node.op.clone(), splits) {
                 (Op::Free(b), _) => out.leaf(Op::ConstBool(frees & (1 << b) != 0)),

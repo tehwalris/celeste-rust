@@ -644,7 +644,7 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
         }
     }
 
-    let mut groups: Vec<Vec<usize>> = Vec::new(); // per outcome: variant -> group
+    let mut groups: Vec<Vec<Option<usize>>> = Vec::new(); // per outcome: variant -> group
     let mut last: Vec<Vec<bool>> = Vec::new();    // per outcome: is last of its group
     let mut n_groups: Vec<usize> = Vec::new();
     // The group signature is the TAINTED cells only, and that is also
@@ -657,27 +657,33 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
     // expression names different nodes than the first member's might,
     // but they evaluate to the same word.
     for oi in 0..l.outs.len() {
-        let key = |v: &crate::transpile::lower::Variant| -> String {
-            let p = &v.per[oi];
-            l.outs[oi]
-                .fields
-                .iter()
-                .filter(|f| f.tainted)
-                .map(|f| p.outputs[&f.cell].clone())
-                .collect::<Vec<_>>()
-                .join(";")
+        let key = |v: &crate::transpile::lower::Variant| -> Option<String> {
+            let p = v.per[oi].as_ref()?;
+            Some(
+                l.outs[oi]
+                    .fields
+                    .iter()
+                    .filter(|f| f.tainted)
+                    .map(|f| p.outputs[&f.cell].clone())
+                    .collect::<Vec<_>>()
+                    .join(";"),
+            )
         };
+        // `None` where a variant does not write this outcome, so the
+        // vector stays parallel to `l.variants` and the indices below
+        // still line up.
         let mut seen: BTreeMap<String, usize> = BTreeMap::new();
-        let mut g = Vec::new();
+        let mut g: Vec<Option<usize>> = Vec::new();
         for v in &l.variants {
-            let k = key(v);
-            let n = seen.len();
-            g.push(*seen.entry(k).or_insert(n));
+            g.push(key(v).map(|k| {
+                let n = seen.len();
+                *seen.entry(k).or_insert(n)
+            }));
         }
         let ng = seen.len();
         let mut is_last = vec![false; g.len()];
         for gi in 0..ng {
-            if let Some(pos) = g.iter().rposition(|x| *x == gi) {
+            if let Some(pos) = g.iter().rposition(|x| *x == Some(gi)) {
                 is_last[pos] = true;
             }
         }
@@ -735,8 +741,10 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
     )?;
     for (vi, v) in l.variants.iter().enumerate() {
         for (i, out) in l.outs.iter().enumerate() {
-            let p = &v.per[i];
-            let gi = groups[i][vi];
+            let Some(p) = v.per[i].as_ref() else {
+                continue;
+            };
+            let gi = groups[i][vi].expect("a variant that writes an outcome has a group");
             writeln!(o, "    declined |= {} & !{};", p.live, p.ok)?;
             writeln!(o, "    take_{}_{} |= {} & {};", i, gi, p.live, p.ok)?;
             if !last[i][vi] {
@@ -755,19 +763,28 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
             writeln!(o, "    }};")?;
             writeln!(
                 o,
-                "    sink.o{i}({m}, take_{i}_{gi}, &sh{i}, &o{i});",
+                "    // body {b}: buttons {m:#04x}, forks {fk:#x}\n\
+                 \x20   sink.o{i}({m}, take_{i}_{gi}, &sh{i}, &o{i});",
+                b = vi,
+                fk = v.fork,
                 i = i,
                 gi = gi,
                 m = v.mask
             )?;
         }
     }
-    // Close the FORK loops the body opened. Everything above is inside
-    // them, which is the point: each fork configuration is its own set
-    // of rows for the same input lane.
-    for _ in 0..b.forks {
-        writeln!(o, "    }}")?;
-    }
+    // Nothing to close. The traced emitter resolves every fork at
+    // compile time (`Emit::flat_forks`), so a fork configuration is a
+    // BODY here rather than a trip through a nest, and the function is
+    // straight-line from `let mut declined` to the last `sink.o*`.
+    //
+    // It used to close `b.forks` loop braces the body had opened.
+    debug_assert!(
+        !l.body.iter().any(|line| matches!(
+            line, crate::transpile::kernel::Line::Raw(r) if r.starts_with("for c")
+        )),
+        "the traced body opened a fork loop, but nothing closes one any more"
+    );
     writeln!(o, "    declined")?;
     writeln!(o, "}}")?;
     Ok(o)
@@ -1328,7 +1345,9 @@ mod tests {
                 // a separate quantity.
                 let mut groups: std::collections::BTreeSet<String> = Default::default();
                 for v in &r.lowered.variants {
-                    let p = &v.per[oi];
+                    let Some(p) = v.per[oi].as_ref() else {
+                        continue;
+                    };
                     let outs: Vec<String> =
                         p.outputs.iter().map(|(c, e)| format!("{}={}", c, e)).collect();
                     groups.insert(outs.join(";"));
@@ -1698,6 +1717,246 @@ mod tests {
                     forks,
                     which,
                     1u64 << which.len()
+                );
+
+                // The number that decides whether flat is BUILDABLE.
+                //
+                // `emit_body` already specializes 64 button assignments
+                // into one arena and dedups them by SIGNATURE into
+                // representatives, and each representative becomes an
+                // emitted body. Resolving forks the same way makes them
+                // another variant dimension - but the existing
+                // signature spans EVERY outcome at once, and that is
+                // exactly the aggregation that made 16,384
+                // configurations look distinct this morning. Per
+                // outcome, over only that outcome's own forks, is the
+                // version that can collapse.
+                //
+                // So: 64 buttons x 2^(this outcome's forks), deduped by
+                // this outcome's signature alone. That count is how
+                // many bodies a flat kernel emits for this outcome.
+                // Philippe: "if an outcome is involved in a loop that
+                // is irrelevant for its values, I'd expect all the
+                // redundant copies the loop creates to collapse."
+                //
+                // Right, and the enumeration above already only walks
+                // an outcome's OWN forks, so there is no such redundancy
+                // left to collapse. The question that remains is
+                // whether the forks it DOES depend on are in its VALUES
+                // or only in its MASK - because those want completely
+                // different treatment. 256 distinct value tuples is 256
+                // rows and there is nothing to be done. 256 distinct
+                // masks over ONE value tuple is one row whose lane mask
+                // is an OR, which is a single body.
+                let fields_cone = o
+                    .outputs
+                    .iter()
+                    .map(|(_, n, _)| cones[*n as usize])
+                    .fold(0u64, |a, b| a | b);
+                let pop = |m: u64| -> u32 { m.count_ones() };
+                let nc = 1u64 << which.len();
+                // The 64-button body count is the expensive half (64 x
+                // 2^k specializations of a 20k-node graph); the
+                // contradiction count below needs one button. Shape 1
+                // is the 14-fork case the question is about, so the
+                // expensive half runs there and the cheap half runs
+                // everywhere.
+                let full = si == 1;
+                let mut sigs: std::collections::HashSet<Vec<NodeId>> =
+                    std::collections::HashSet::new();
+                let mut vals: std::collections::HashSet<Vec<NodeId>> =
+                    std::collections::HashSet::new();
+                let mut lives: std::collections::HashSet<NodeId> =
+                    std::collections::HashSet::new();
+                let mut oks: std::collections::HashSet<NodeId> =
+                    std::collections::HashSet::new();
+                let mut arena = Graph::new();
+                for m in 0u8..if full { 64 } else { 1 } {
+                    for k in 0..nc {
+                        let mut sm = 0u64;
+                        for (i, d) in which.iter().enumerate() {
+                            if k & (1 << i) != 0 {
+                                sm |= 1u64 << d;
+                            }
+                        }
+                        let map = g.specialize_config_into(m, Some(sm), &mut arena);
+                        let v: Vec<NodeId> =
+                            o.outputs.iter().map(|(_, n, _)| map[*n as usize]).collect();
+                        let mut sig = v.clone();
+                        sig.push(map[o.ok as usize]);
+                        sig.push(map[o.live as usize]);
+                        vals.insert(v);
+                        lives.insert(map[o.live as usize]);
+                        oks.insert(map[o.ok as usize]);
+                        sigs.insert(sig);
+                    }
+                }
+                // The GRAPH itself, for the outcomes the question is
+                // about. Summary statistics have been wrong six times
+                // today; this prints what `live` and `ok` are actually
+                // made of - the AND-conjuncts, each with its op and the
+                // forks its cone touches - so the structure can be read
+                // rather than inferred.
+                if si == 1 && which.len() > 2 {
+                    fn conj(g: &Graph, n: NodeId, out: &mut Vec<NodeId>) {
+                        match &g.get(n).op {
+                            crate::transpile::graph::Op::And => {
+                                for a in g.get(n).args.clone() {
+                                    conj(g, a, out);
+                                }
+                            }
+                            crate::transpile::graph::Op::ConstBool(true) => {}
+                            _ => out.push(n),
+                        }
+                    }
+                    for (label, root) in [("live", o.live), ("ok", o.ok)] {
+                        let mut cs = Vec::new();
+                        conj(g, root, &mut cs);
+                        eprintln!(
+                            "[fork]   GRAPH shape {} outcome {} {}: {} conjuncts",
+                            si,
+                            oi,
+                            label,
+                            cs.len()
+                        );
+                        for c in cs.iter().take(24) {
+                            let m = cones[*c as usize];
+                            let f: Vec<u8> =
+                                (0..forks).filter(|d| m & (1 << d) != 0).collect();
+                            let kids: Vec<String> = g
+                                .get(*c)
+                                .args
+                                .iter()
+                                .map(|a| format!("{:?}", g.get(*a).op))
+                                .collect();
+                            eprintln!(
+                                "[fork]     {} {:?}({}) forks {:?}",
+                                label,
+                                g.get(*c).op,
+                                kids.join(", "),
+                                f
+                            );
+                        }
+                    }
+                }
+
+                // The count above is PRE-SIMPLIFICATION, and the real
+                // emitter does not stop there. `Emit::bare` sets
+                // `decide: true` for the traced path, so `emit_body`
+                // runs ival -> bdd -> ival over the SPECIALIZED arena
+                // before it computes any signature - the pass whose own
+                // doc records 10,510 nodes going to 4,714 on a traced
+                // frame, and whose whole point is that guard algebra
+                // only collapses once the choices are constants.
+                //
+                // Resolving a fork makes it a constant exactly as
+                // resolving a button does. So the honest body count is
+                // the one taken AFTER that pass, and every number I
+                // have reported so far skipped it.
+                if si == 1 && !which.is_empty() {
+                    let room = crate::transpile::graph::Room {
+                        cart: r.cart.clone(),
+                        cache: r.cache.clone(),
+                    };
+                    let mut a3 = Graph::new();
+                    let mut roots: Vec<NodeId> = Vec::new();
+                    let per = o.outputs.len() + 2;
+                    for k in 0..nc {
+                        let mut sm = 0u64;
+                        for (i, d) in which.iter().enumerate() {
+                            if k & (1 << i) != 0 {
+                                sm |= 1u64 << d;
+                            }
+                        }
+                        let map = g.specialize_config_into(0, Some(sm), &mut a3);
+                        roots.extend(o.outputs.iter().map(|(_, n, _)| map[*n as usize]));
+                        roots.push(map[o.ok as usize]);
+                        roots.push(map[o.live as usize]);
+                    }
+                    let raw: std::collections::HashSet<&[NodeId]> =
+                        roots.chunks(per).collect();
+                    let (g1, m1, _) = crate::transpile::ival::fold(&a3, &roots, Some(&room))
+                        .expect("interval fold");
+                    let r1: Vec<NodeId> = roots.iter().map(|x| m1[*x as usize]).collect();
+                    let (g2, m2, _) =
+                        crate::transpile::bdd::simplify_until_stable(&g1, &r1, 1 << 22, 4);
+                    let r2: Vec<NodeId> = r1.iter().map(|x| m2[*x as usize]).collect();
+                    let (_g3, m3, _) = crate::transpile::ival::fold(&g2, &r2, Some(&room))
+                        .expect("interval fold 2");
+                    let r3: Vec<NodeId> = r2.iter().map(|x| m3[*x as usize]).collect();
+                    let decided: std::collections::HashSet<&[NodeId]> =
+                        r3.chunks(per).collect();
+                    eprintln!(
+                        "[fork]   DECIDED shape {} outcome {}: {} configs, {} distinct \
+                         raw -> {} distinct after ival/bdd/ival",
+                        si,
+                        oi,
+                        nc,
+                        raw.len(),
+                        decided.len()
+                    );
+                }
+
+                // Philippe: "10,000 of anything seems wrong. There is
+                // no way to get 10,000 distinct outcomes from one input
+                // frame. My prior is that none of this explosion is
+                // real. Strong prior."
+                //
+                // The test of that: an outcome reachable on ONE control
+                // flow path cannot have two paths' forks both live, so
+                // most of its 2^k configurations should be
+                // CONTRADICTORY - `live` folds to false. Count them. If
+                // the count is high the explosion is an artifact of
+                // enumerating combinations that cannot co-occur; if it
+                // is zero, either they really can co-occur or the
+                // folder cannot see that they cannot, and those want
+                // very different fixes.
+                let mut dead_here = 0u64;
+                let mut ok_false = 0u64;
+                {
+                    let mut a2 = Graph::new();
+                    for k in 0..nc {
+                        let mut sm = 0u64;
+                        for (i, d) in which.iter().enumerate() {
+                            if k & (1 << i) != 0 {
+                                sm |= 1u64 << d;
+                            }
+                        }
+                        let map = g.specialize_config_into(0, Some(sm), &mut a2);
+                        if matches!(
+                            a2.get(map[o.live as usize]).op,
+                            crate::transpile::graph::Op::ConstBool(false)
+                        ) {
+                            dead_here += 1;
+                        }
+                        if matches!(
+                            a2.get(map[o.ok as usize]).op,
+                            crate::transpile::graph::Op::ConstBool(false)
+                        ) {
+                            ok_false += 1;
+                        }
+                    }
+                }
+                eprintln!(
+                    "[fork]   CONTRADICTORY shape {} outcome {}: {} of {} configurations \
+                     have live=false, {} have ok=false",
+                    si, oi, dead_here, nc, ok_false
+                );
+                eprintln!(
+                    "[fork]   BODIES shape {} outcome {}: 64 buttons x {} configs = {} \
+                     -> {} bodies; VALUES {} (cone {} forks), live {} (cone {}), \
+                     ok {} (cone {})",
+                    si,
+                    oi,
+                    nc,
+                    64 * nc,
+                    sigs.len(),
+                    vals.len(),
+                    pop(fields_cone),
+                    lives.len(),
+                    pop(cones[o.live as usize]),
+                    oks.len(),
+                    pop(cones[o.ok as usize]),
                 );
             }
 

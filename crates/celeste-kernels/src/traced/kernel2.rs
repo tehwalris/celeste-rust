@@ -1,6 +1,6 @@
 // GENERATED from a TRACED frame (shape 2). Do not edit.
 //
-// One input shape, 2 output shapes, 1 distinct button
+// One input shape, 2 output shapes, 2 distinct button
 // assignments. See `trace::kernel` for what this interface is
 // and why it is not the walk's.
 #![allow(unused_variables, unused_mut, unused_imports, clippy::all)]
@@ -1413,33 +1413,33 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
     let r_c84: ZN = rin.c84;
     let r_c85: ZN = rin.c85;
     let r_c88: ZN = rin.c88;
-    let n26: ZB = zn_gt(r_c20, zn_splat(P8::from_raw(0i32)));
-    let n27: ZB = zn_le(r_c20, zn_splat(P8::from_raw(0i32)));
-    let n28: ZN = zn_sub(r_c20, zn_splat(P8::from_raw(65536i32)));
-    let n29: ZB = zn_gt(r_c39, zn_splat(P8::from_raw(0i32)));
-    let n30: ZN = zn_sub(r_c39, zn_splat(P8::from_raw(65536i32)));
-    let n31: ZB = zn_le(n30, zn_splat(P8::from_raw(0i32)));
-    let n32: ZB = zn_gt(n30, zn_splat(P8::from_raw(0i32)));
-    let n34: ZB = zb_and(r_c38, n27);
-    let n35: ZB = zb_and(n29, n34);
-    let n36: ZB = zb_not(n35);
-    let n37: ZB = zb_and(n27, n35);
-    let n38: ZB = zb_and(n27, n36);
-    let n40: ZB = zb_and(n32, n37);
-    let n41: ZN = zsel_n(n40, n30, r_c39);
-    let n42: ZB = zb_or(n38, n40);
-    let n43: ZN = zsel_n(n26, r_c39, n41);
-    let n44: ZN = zsel_n(n26, n28, r_c20);
-    let n45: ZB = zb_or(n26, n42);
-    let n47: ZB = zn_gt(n44, zn_splat(P8::from_raw(0i32)));
-    let n48: ZB = zn_le(n44, zn_splat(P8::from_raw(0i32)));
-    let n49: ZB = zb_and(n45, n47);
-    let n50: ZB = zb_and(n45, n48);
+    let n24: ZB = zn_gt(r_c20, zn_splat(P8::from_raw(0i32)));
+    let n25: ZB = zn_le(r_c20, zn_splat(P8::from_raw(0i32)));
+    let n26: ZB = zn_gt(r_c39, zn_splat(P8::from_raw(0i32)));
+    let n27: ZN = zn_sub(r_c39, zn_splat(P8::from_raw(65536i32)));
+    let n28: ZB = zn_le(n27, zn_splat(P8::from_raw(0i32)));
+    let n30: ZB = zb_and(r_c38, n25);
+    let n31: ZB = zb_and(n26, n30);
+    let n32: ZB = zb_and(n25, n31);
+    let n37: ZN = zn_sub(r_c20, zn_splat(P8::from_raw(65536i32)));
+    let n38: ZB = zn_gt(n27, zn_splat(P8::from_raw(0i32)));
+    let n39: ZB = zb_not(n31);
+    let n40: ZB = zb_and(n25, n39);
+    let n41: ZB = zb_and(n32, n38);
+    let n42: ZN = zsel_n(n41, n27, r_c39);
+    let n43: ZB = zb_or(n40, n41);
+    let n44: ZN = zsel_n(n24, r_c39, n42);
+    let n45: ZN = zsel_n(n24, n37, r_c20);
+    let n46: ZB = zb_or(n24, n43);
+    let n47: ZB = zn_gt(n45, zn_splat(P8::from_raw(0i32)));
+    let n48: ZB = zn_le(n45, zn_splat(P8::from_raw(0i32)));
+    let n49: ZB = zb_and(n46, n47);
+    let n50: ZB = zb_and(n46, n48);
     let n51: ZB = zb_or(n49, n50);
     let n54: ZW = zw_bits_n(r_c20);
     let n55: ZW = zw_mix1(zw_splat(11400714819323198485u64), n54, 20u64);
     let n56: ZW = zw_mix2(zw_splat(11562461410679940143u64), n54, 20u64);
-    let n57: ZW = zw_bits_n(n30);
+    let n57: ZW = zw_bits_n(n27);
     let n58: ZW = zw_mix1(n55, n57, 39u64);
     let n59: ZW = zw_mix2(n56, n57, 39u64);
     let n60: ZW = zw_bits_b(r_c43);
@@ -1448,13 +1448,13 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
     let n63: ZW = zw_bits_n(r_c88);
     let n64: ZW = zw_mix1(n61, n63, 88u64);
     let n65: ZW = zw_mix2(n62, n63, 88u64);
-    let n66: ZW = zw_bits_n(n44);
+    let n66: ZW = zw_bits_n(n45);
     let n67: ZW = zw_mix1(zw_splat(11400714819323198485u64), n66, 20u64);
     let n68: ZW = zw_mix2(zw_splat(11562461410679940143u64), n66, 20u64);
     let n69: ZW = zw_bits_b(r_c38);
     let n70: ZW = zw_mix1(n67, n69, 38u64);
     let n71: ZW = zw_mix2(n68, n69, 38u64);
-    let n72: ZW = zw_bits_n(n43);
+    let n72: ZW = zw_bits_n(n44);
     let n73: ZW = zw_mix1(n70, n72, 39u64);
     let n74: ZW = zw_mix2(n71, n72, 39u64);
     let n75: ZW = zw_bits_b(r_c41);
@@ -1467,21 +1467,21 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
     let n82: ZW = zw_mix2(n80, n60, 43u64);
     let n83: ZW = zw_mix1(n81, n63, 88u64);
     let n84: ZW = zw_mix2(n82, n63, 88u64);
-    let ok_v0_o0: u16 = ALL;
-    let bd_v0_o0: bool = false;
-    let live_v0_o0: u16 = ALL & zb_holds(n27) & zb_holds(n31) & zb_holds(n29) & zb_holds(r_c38);
-    let ok_v0_o1: u16 = ALL;
-    let bd_v0_o1: bool = false;
-    let live_v0_o1: u16 = ALL & zb_holds(n51);
+    let ok_v0_b0: u16 = ALL;
+    let bd_v0_b0: bool = false;
+    let live_v0_b0: u16 = ALL & zb_holds(n25) & zb_holds(n28) & zb_holds(n26) & zb_holds(r_c38);
+    let ok_v0_b1: u16 = ALL;
+    let bd_v0_b1: bool = false;
+    let live_v0_b1: u16 = ALL & zb_holds(n51);
     let sh0 = KShared0 {
-        c39: n30,
+        c39: n27,
         c20: r_c20,
         c88: r_c88,
         c43: r_c43,
     };
     let sh1 = KShared1 {
-        c39: n43,
-        c20: n44,
+        c39: n44,
+        c20: n45,
         c41: r_c41,
         c42: r_c42,
         c88: r_c88,
@@ -1490,19 +1490,21 @@ pub fn frame(u: &Uni, rin: &RowsIn, g: &G, sink: &mut dyn Sink) -> u16 {
     };
     let mut take_0_0: u16 = 0;
     let mut take_1_0: u16 = 0;
-    // 1 distinct button assignments; per outcome they fall
+    // 2 distinct button assignments; per outcome they fall
     // into [1, 1] groups that write identical values.
-    declined |= live_v0_o0 & !ok_v0_o0;
-    take_0_0 |= live_v0_o0 & ok_v0_o0;
+    declined |= live_v0_b0 & !ok_v0_b0;
+    take_0_0 |= live_v0_b0 & ok_v0_b0;
     let o0 = KOut0 {
         h1: n64, h2: n65,
     };
+    // body 0: buttons 0x00, forks 0x0
     sink.o0(0, take_0_0, &sh0, &o0);
-    declined |= live_v0_o1 & !ok_v0_o1;
-    take_1_0 |= live_v0_o1 & ok_v0_o1;
+    declined |= live_v0_b1 & !ok_v0_b1;
+    take_1_0 |= live_v0_b1 & ok_v0_b1;
     let o1 = KOut1 {
         h1: n83, h2: n84,
     };
+    // body 1: buttons 0x00, forks 0x0
     sink.o1(0, take_1_0, &sh1, &o1);
     declined
 }

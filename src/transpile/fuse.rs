@@ -32,6 +32,7 @@
 //! Anything this pass cannot prove is REFUSED with an error at emission
 //! time - there is no partially-fused output.
 
+use crate::transpile::lower::WALK_WRITES_EVERY_OUTCOME;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 
@@ -832,7 +833,7 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
         let pv = var_of(0, *m)?;
         for OutField { cell: id, tainted, .. } in &fused_of.fields {
             if *tainted {
-                writeln!(out, "        c{}: {},", id, renamed(0, &pv.per[0].outputs[id]))?;
+                writeln!(out, "        c{}: {},", id, renamed(0, &pv.per[0].as_ref().expect(WALK_WRITES_EVERY_OUTCOME).outputs[id]))?;
             }
         }
         writeln!(out, "    }}, &Dy {{")?;
@@ -846,7 +847,7 @@ pub fn emit_fused(members: &[(String, Program)], witness_path: &str) -> Result<S
             let mv = var_of(mi, *m)?;
             write!(out, "            DyTuple {{ ")?;
             for (id, _, _) in tuple_cells {
-                write!(out, "c{}: {}, ", id, renamed(mi, &mv.per[0].outputs[id]))?;
+                write!(out, "c{}: {}, ", id, renamed(mi, &mv.per[0].as_ref().expect(WALK_WRITES_EVERY_OUTCOME).outputs[id]))?;
             }
             writeln!(out, "}},")?;
         }

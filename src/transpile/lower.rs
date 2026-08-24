@@ -617,18 +617,18 @@ impl<'a> Ctx<'a> {
                 }
             }
             Op::SplitOk => format!("zi_span_ok({})", self.raw(id, 0)?),
-            // The resolved fork does not lower, because nothing emits
-            // one: specializing the fork was MEASURED and refuted -
-            // 3.92x the nodes for identical work, see
-            // `what_specializing_the_fork_would_cost`. The ops stay so
-            // that measurement can be re-run; the emitter arm would be
-            // dead code, so it is this instead.
-            Op::Frag(_) | Op::FragOk(_) => bail!(
-                "node {} is a resolved fork fragment. The emitter does not lower one - \
-                 fork specialization was refuted (plans/tracing.md); the kernels emit \
-                 `Op::Split` inside a runtime loop.",
-                id
-            ),
+            // The resolved fork. `zi_fork_flr` is the same primitive
+            // the loop nest calls; the only difference is that `c` is a
+            // literal here rather than a loop variable, which is what
+            // lets the two fragments intern, fold, and share.
+            //
+            // This arm used to `bail!` on the grounds that fork
+            // specialization was refuted. That refutation was measured
+            // on the only room that existed - which forks twice - with
+            // all 64 button assignments blended into one arena, and it
+            // was wrong twice over. See `plans/tracing.md`.
+            Op::Frag(c) => format!("zi_fork_flr({}, {}).0", self.raw(id, 0)?, c),
+            Op::FragOk(c) => format!("zi_fork_flr({}, {}).1", self.raw(id, 0)?, c),
             // ---- row key ----
             Op::Bits => {
                 let src = self.r(a[0]);
@@ -794,6 +794,11 @@ fn conjunct_term(ctx: &Ctx, cond: NodeId) -> Result<Term> {
 /// One free-choice assignment's result: what it writes and whether it
 /// counts. Assignments that agree on all three collapse to one of these,
 /// so `mask` is a REPRESENTATIVE, not an enumeration.
+/// A walk-path variant writes every outcome, so `per[i]` is always
+/// `Some` there. Only the flat fork path leaves holes.
+pub(crate) const WALK_WRITES_EVERY_OUTCOME: &str =
+    "a walk-path variant writes every outcome; only the flat fork path leaves holes";
+
 pub(crate) struct Variant {
     pub(crate) mask: u8,
     /// One entry per OUTCOME - per output shape the frame can end in.
@@ -805,7 +810,18 @@ pub(crate) struct Variant {
     /// nodes in the same graph and the emitter binds a node once.
     ///
     /// Length 1 is the checked-in kernels, and that path is unchanged.
-    pub(crate) per: Vec<VarOut>,
+    ///
+    /// `None` means this variant does not write that outcome at all.
+    /// The walk path never produces one - a button assignment writes
+    /// every successor - but the FLAT fork path does: a variant there
+    /// is a (button, fork configuration) pair, and a fork configuration
+    /// is only meaningful for the outcomes whose cone contains those
+    /// forks. Outcome 13 varying over forks 12 and 13 has nothing to
+    /// say about a variant that resolved forks 0 and 1.
+    pub(crate) per: Vec<Option<VarOut>>,
+    /// The fork configuration this variant resolved, for diagnostics.
+    /// Zero on the walk path, which resolves none.
+    pub(crate) fork: u64,
 }
 
 /// What one assignment produces FOR ONE OUTCOME.
@@ -858,7 +874,396 @@ pub(crate) struct Outcome {
 /// assignments whose entire result agrees - outputs, validity and
 /// liveness - collapse to one `Variant`, because they are the same
 /// successor state and dedup would have merged their rows anyway.
+/// The FLAT fork path: every fork resolved at COMPILE time, so the
+/// emitted body is straight-line and every node is bound once.
+///
+/// ## Why this exists
+///
+/// The loop path places a node at `1 + its highest fork bit` and wraps
+/// the whole frame - every outcome - in one nest of that depth. The
+/// dependency structure is not a chain, though: measured on room (2,0)
+/// shape 1 (14 forks, 19 outcomes), each outcome depends on a SMALL
+/// subset of the forks, usually one `(x, y)` pair from one `obj.move`,
+/// and the pairs belong to mutually exclusive paths. So the nest walks
+/// 2^14 configurations and performs 311,296 outcome-pushes to produce
+/// **65** distinct bodies.
+///
+/// Three things collapse it, and all three are needed:
+///
+/// * **Per outcome.** A fork configuration is only meaningful for the
+///   outcomes whose cone contains those forks, so each outcome is
+///   enumerated over its OWN forks. Nothing here ever builds the
+///   product across outcomes - that product is what made 16,384
+///   configurations look distinct.
+/// * **Resolved, not looped.** `Frag`/`FragOk` are ordinary unary ops,
+///   so they intern and fold, and the configurations share every node
+///   they agree on.
+/// * **`decide`, afterwards.** Guard algebra only collapses once the
+///   choices are constants. Skipping it reports 256 bodies where there
+///   are 16, because structural node identity is not semantic identity.
+fn emit_body_flat(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
+    let forks = e.fork_depth as u8;
+
+    // --- 1. which forks each outcome actually depends on ---
+    let cones = e.graph.split_cones();
+    let bits_of = |o: &Outcome| -> Vec<u8> {
+        let mut m = cones[o.ok as usize] | cones[o.live as usize];
+        for f in o.of.fields.iter() {
+            m |= cones[f.node as usize];
+        }
+        (0..forks).filter(|d| m & (1u64 << d) != 0).collect()
+    };
+
+    // --- 2. specialize, per outcome, over (button, its own forks) ---
+    let mut sp = Graph::new();
+    // (outcome, button, fork configuration, roots) where roots is the
+    // outcome's fields in order, then `ok`, then `live`.
+    let mut cands: Vec<(usize, u8, u64, Vec<NodeId>)> = Vec::new();
+    for (oi, o) in outs.iter().enumerate() {
+        let mut want: Vec<NodeId> = o.of.fields.iter().map(|f| f.node).collect();
+        want.push(o.ok);
+        want.push(o.live);
+        // An outcome reaches a fraction of the graph, and mapping the
+        // whole arena once per (button, configuration) is most of the
+        // work and none of the answer.
+        let need = reachable(&e.graph, &want);
+        let bits = bits_of(o);
+        // Buttons first, with the forks left standing. If two
+        // assignments agree before the forks are resolved they agree
+        // after - resolving is substitution, and substitution preserves
+        // equality - so this prunes the product soundly, and cheaply
+        // enough to be worth a separate pass.
+        let reps: Vec<u8> = {
+            let mut probe = Graph::new();
+            let mut seen: BTreeMap<Vec<NodeId>, u8> = BTreeMap::new();
+            for m in 0u8..64 {
+                let map = e.graph.specialize_subset_into(m, None, Some(&need), &mut probe);
+                let sig: Vec<NodeId> = want.iter().map(|r| map[*r as usize]).collect();
+                seen.entry(sig).or_insert(m);
+            }
+            let mut v: Vec<u8> = seen.into_values().collect();
+            v.sort_unstable();
+            v
+        };
+        for m in reps {
+            for k in 0..(1u64 << bits.len()) {
+                let mut sm = 0u64;
+                for (i, d) in bits.iter().enumerate() {
+                    if k & (1 << i) != 0 {
+                        sm |= 1u64 << d;
+                    }
+                }
+                let map = e.graph.specialize_subset_into(m, Some(sm), Some(&need), &mut sp);
+                let roots: Vec<NodeId> = want.iter().map(|r| map[*r as usize]).collect();
+                cands.push((oi, m, sm, roots));
+            }
+        }
+    }
+
+    // --- 3. decide the boolean layer, on the RESOLVED graph ---
+    if e.decide {
+        let all: Vec<NodeId> = cands.iter().flat_map(|c| c.3.iter().copied()).collect();
+        let (g1, m1, _) =
+            crate::transpile::ival::fold(&sp, &all, e.room.as_ref()).expect("interval fold");
+        let r1: Vec<NodeId> = all.iter().map(|x| m1[*x as usize]).collect();
+        let (g2, m2, _) = crate::transpile::bdd::simplify_until_stable(&g1, &r1, 1 << 22, 4);
+        let r2: Vec<NodeId> = r1.iter().map(|x| m2[*x as usize]).collect();
+        let (g3, m3, _) =
+            crate::transpile::ival::fold(&g2, &r2, e.room.as_ref()).expect("interval fold 2");
+        let mut it = r2.iter().map(|x| m3[*x as usize]);
+        for c in cands.iter_mut() {
+            for r in c.3.iter_mut() {
+                *r = it.next().expect("one decided root per root");
+            }
+        }
+        sp = g3;
+    }
+
+    // --- 4. identical roots are the same body ---
+    let bodies: Vec<(usize, u8, u64, Vec<NodeId>)> = {
+        let mut seen: BTreeSet<(usize, Vec<NodeId>)> = BTreeSet::new();
+        cands
+            .into_iter()
+            .filter(|c| seen.insert((c.0, c.3.clone())))
+            .collect()
+    };
+
+    // --- 5. the row key, as graph nodes ---
+    let mut hash_of: Vec<Option<(NodeId, NodeId)>> = vec![None; bodies.len()];
+    if e.row_key {
+        for (oi, o) in outs.iter().enumerate() {
+            let mine: Vec<usize> = bodies
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| b.0 == oi)
+                .map(|(i, _)| i)
+                .collect();
+            let Some(&first_body) = mine.first() else {
+                continue;
+            };
+            let agreed = |fi: usize| -> bool {
+                let first = bodies[first_body].3[fi];
+                !mine.iter().any(|b| bodies[*b].3[fi] != first)
+            };
+            let mut order: Vec<(u32, usize)> = o
+                .of
+                .fields
+                .iter()
+                .enumerate()
+                .filter(|(fi, _)| {
+                    !(agreed(*fi)
+                        && matches!(
+                            sp.get(bodies[first_body].3[*fi]).op,
+                            Op::Const(..) | Op::ConstBool(_)
+                        ))
+                })
+                .map(|(fi, f)| (f.cell, fi))
+                .collect();
+            order.sort_by_key(|(cell, fi)| (!agreed(*fi), *cell));
+            let seed1 = sp.leaf(Op::Word(0x9e37_79b9_7f4a_7c15));
+            let seed2 = sp.leaf(Op::Word(0xa076_1d64_78bd_642f));
+            for bi in mine {
+                let (mut h1, mut h2) = (seed1, seed2);
+                for (cell, fi) in &order {
+                    let v = bodies[bi].3[*fi];
+                    let b = sp.add(Op::Bits, vec![v]);
+                    h1 = sp.add(Op::Mix(*cell, 0), vec![h1, b]);
+                    h2 = sp.add(Op::Mix(*cell, 1), vec![h2, b]);
+                }
+                hash_of[bi] = Some((h1, h2));
+            }
+        }
+    }
+
+    let n = sp.len();
+    let mut ctx = Ctx {
+        g: &sp,
+        uni: &e.uni,
+        vary: &e.vary_in,
+        repr: vec![Repr::num(false, false); n],
+        name: vec![None; n],
+        expr: vec![None; n],
+    };
+    for id in 0..n as NodeId {
+        ctx.repr[id as usize] = ctx.derive(id)?;
+    }
+
+    // --- what has to exist ---
+    let mut conj_of: Vec<Vec<NodeId>> = Vec::with_capacity(bodies.len());
+    let mut live_of: Vec<Vec<NodeId>> = Vec::with_capacity(bodies.len());
+    let mut roots: Vec<NodeId> = Vec::new();
+    for (bi, b) in bodies.iter().enumerate() {
+        let nf = outs[b.0].of.fields.len();
+        roots.extend(b.3[..nf].iter().copied());
+        if let Some((h1, h2)) = hash_of[bi] {
+            roots.push(h1);
+            roots.push(h2);
+        }
+        let cs: Vec<NodeId> = conjuncts(&sp, b.3[nf])
+            .into_iter()
+            .filter(|c| !vacuous(&ctx, *c))
+            .collect();
+        roots.extend(cs.iter().copied());
+        conj_of.push(cs);
+        let ls: Vec<NodeId> = conjuncts(&sp, b.3[nf + 1])
+            .into_iter()
+            .filter(|c| !vacuous(&ctx, *c))
+            .collect();
+        roots.extend(ls.iter().copied());
+        live_of.push(ls);
+    }
+    let live = reachable(&sp, &roots);
+
+    // --- names and inline forms ---
+    for id in 0..n as NodeId {
+        if !live[id as usize] {
+            continue;
+        }
+        let r = ctx.repr[id as usize];
+        match inline(ctx.g, id, r) {
+            Some(text) => ctx.expr[id as usize] = Some(text),
+            None => {
+                let name = format!("n{}", id);
+                ctx.expr[id as usize] = Some(name.clone());
+                ctx.name[id as usize] = Some(name);
+            }
+        }
+    }
+
+    // --- the body: input loads, then every live node, in id order ---
+    //
+    // No placement and no nest. Ids only refer downward, so id order is
+    // a topological order, and there is no scope for a node to be in
+    // any more.
+    let mut body: Vec<Line> = Vec::new();
+    let mut var_ty: std::collections::HashMap<String, &'static str> =
+        std::collections::HashMap::new();
+    for (id, kind) in &e.vary_in {
+        let (ty, load) = match *kind {
+            "num" => ("ZN", format!("let r_c{}: ZN = rin.c{};", id, id)),
+            "ival" => ("ZI", format!("let r_c{}: ZI = rin.c{};", id, id)),
+            "bool" => (
+                "ZB",
+                format!("let r_c{}: ZB = ZB {{ val: rin.c{}, known: ALL }};", id, id),
+            ),
+            other => bail!("varying cell {} has kind {:?}", id, other),
+        };
+        body.push(Line::Raw(load));
+        var_ty.insert(format!("r_c{}", id), ty);
+    }
+    for id in 0..n as NodeId {
+        if !live[id as usize] {
+            continue;
+        }
+        emit_node(&ctx, &mut body, &mut var_ty, id)?;
+    }
+
+    // --- one variant per body ---
+    let mut variants: Vec<Variant> = Vec::new();
+    for (bi, b) in bodies.iter().enumerate() {
+        let (oi, mask, fork) = (b.0, b.1, b.2);
+        let sfx = format!("_b{}", bi);
+        let (mut lanes, mut blocks) = (Vec::new(), Vec::new());
+        for c in &conj_of[bi] {
+            match conjunct_term(&ctx, *c)? {
+                Term::Lanes(m) => lanes.push(m),
+                Term::Block(x) => blocks.push(x),
+            }
+        }
+        let ok = format!("ok_v{}{}", mask, sfx);
+        let bd = format!("bd_v{}{}", mask, sfx);
+        body.push(Line::Let {
+            name: ok.clone(),
+            ty: "u16",
+            expr: if lanes.is_empty() {
+                "ALL".into()
+            } else {
+                format!("ALL & {}", lanes.join(" & "))
+            },
+        });
+        body.push(Line::Let {
+            name: bd.clone(),
+            ty: "bool",
+            expr: if blocks.is_empty() { "false".into() } else { blocks.join(" || ") },
+        });
+        var_ty.insert(ok.clone(), "u16");
+        var_ty.insert(bd.clone(), "bool");
+        // ALWAYS emitted, even at one outcome. The loop path can fall
+        // back on `valid{d}` because its `continue` has already taken
+        // the invalid lanes off; here nothing has, so a body's fork
+        // validity has to reach `take` through `live` or the rows of a
+        // configuration a lane is not in would be written anyway.
+        let live_s = {
+            let (mut lanes, mut blocks) = (Vec::new(), Vec::new());
+            for c in &live_of[bi] {
+                match conjunct_term(&ctx, *c)? {
+                    Term::Lanes(m) => lanes.push(m),
+                    Term::Block(x) => blocks.push(x),
+                }
+            }
+            if lanes.is_empty() && blocks.is_empty() {
+                "ALL".to_string()
+            } else {
+                let name = format!("live_v{}{}", mask, sfx);
+                let m = if lanes.is_empty() {
+                    "ALL".to_string()
+                } else {
+                    format!("ALL & {}", lanes.join(" & "))
+                };
+                let expr = if blocks.is_empty() {
+                    m
+                } else {
+                    format!("if {} {{ 0 }} else {{ {} }}", blocks.join(" || "), m)
+                };
+                body.push(Line::Let { name: name.clone(), ty: "u16", expr });
+                var_ty.insert(name.clone(), "u16");
+                name
+            }
+        };
+        let mut outputs: BTreeMap<u32, String> = BTreeMap::new();
+        for (fi, f) in outs[oi].of.fields.iter().enumerate() {
+            let node = b.3[fi];
+            let have = ctx.repr[node as usize];
+            let want = repr_of_ty(f.ty)?;
+            outputs.insert(
+                f.cell,
+                coerce(ctx.expr[node as usize].as_deref().unwrap(), have, want)?,
+            );
+        }
+        let w = Repr::word(true);
+        let key = match hash_of[bi] {
+            None => None,
+            Some((h1, h2)) => {
+                let f = |h: NodeId| -> Result<String> {
+                    coerce(ctx.expr[h as usize].as_deref().unwrap(), ctx.repr[h as usize], w)
+                };
+                Some((f(h1)?, f(h2)?))
+            }
+        };
+        let mut per: Vec<Option<VarOut>> = (0..outs.len()).map(|_| None).collect();
+        per[oi] = Some(VarOut { outputs, ok, bd, live: live_s, key });
+        variants.push(Variant { mask, per, fork });
+    }
+
+    // --- which cells actually vary, per outcome ---
+    let first_body: Vec<Option<usize>> =
+        (0..outs.len()).map(|oi| bodies.iter().position(|b| b.0 == oi)).collect();
+    for (oi, o) in outs.iter_mut().enumerate() {
+        let Some(fb) = first_body[oi] else {
+            continue;
+        };
+        for (fi, f) in o.of.fields.iter_mut().enumerate() {
+            let first = variants[fb].per[oi]
+                .as_ref()
+                .expect("the first body of an outcome writes it")
+                .outputs[&f.cell]
+                .clone();
+            f.tainted = variants
+                .iter()
+                .filter_map(|v| v.per[oi].as_ref())
+                .any(|p| p.outputs[&f.cell] != first);
+            f.konst = if f.tainted {
+                None
+            } else {
+                match sp.get(bodies[fb].3[fi]).op {
+                    Op::Const(lo, hi) if lo == hi => {
+                        Some(format!("AV::Num(P8::from_raw({}i32))", lo))
+                    }
+                    Op::Const(lo, hi) => Some(format!(
+                        "AV::Ival(P8::from_raw({}i32), P8::from_raw({}i32))",
+                        lo, hi
+                    )),
+                    Op::ConstBool(b) => Some(format!("AV::Bool({})", b)),
+                    _ => None,
+                }
+            };
+            f.expr = first;
+        }
+    }
+
+    e.body = body;
+    e.var_ty = var_ty;
+    // Nothing left to thread: validity is an ordinary conjunct of each
+    // body's `live` now, not a mask accumulated down a nest.
+    e.valid_expr = "ALL".to_string();
+    e.variants = variants;
+    // The flat path dedups PER OUTCOME, so there is no one
+    // representative a button assignment collapses onto. Identity
+    // claims nothing, which is the only honest answer here; the fused
+    // artifact that reads this is walk-only.
+    let mut rep_of = [0u8; 64];
+    for (m, slot) in rep_of.iter_mut().enumerate() {
+        *slot = m as u8;
+    }
+    e.rep_of = rep_of;
+    Ok(())
+}
+
+
 pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
+    if e.flat_forks {
+        return emit_body_flat(e, outs);
+    }
     // --- specialize every free assignment into ONE arena ---
     let mut sp = Graph::new();
     let mut maps: Vec<Vec<NodeId>> =
@@ -1202,7 +1607,7 @@ pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
     // reads it until the end.
     let mut variants: Vec<Variant> = Vec::new();
     for r in &reps {
-        let mut per: Vec<VarOut> = Vec::new();
+        let mut per: Vec<Option<VarOut>> = Vec::new();
         for (oi, o) in outs.iter().enumerate() {
             let (mut lanes, mut blocks) = (Vec::new(), Vec::new());
             for c in &conj_of[&(*r, oi)] {
@@ -1315,9 +1720,9 @@ pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
                     Some((f(*h1)?, f(*h2)?))
                 }
             };
-            per.push(VarOut { outputs, ok, bd, live, key });
+            per.push(Some(VarOut { outputs, ok, bd, live, key }));
         }
-        variants.push(Variant { mask: *r, per });
+        variants.push(Variant { mask: *r, per, fork: 0 });
     }
 
     // A cell is per-variant only if the variants DISAGREE about it. That
@@ -1326,8 +1731,15 @@ pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
     // assignment, and such a cell belongs in the shared output.
     for (oi, o) in outs.iter_mut().enumerate() {
         for f in o.of.fields.iter_mut() {
-            let first = variants[0].per[oi].outputs[&f.cell].clone();
-            f.tainted = variants.iter().any(|v| v.per[oi].outputs[&f.cell] != first);
+            let mut writers = variants.iter().filter_map(|v| v.per[oi].as_ref());
+            let Some(first_v) = writers.next() else {
+                continue;
+            };
+            let first = first_v.outputs[&f.cell].clone();
+            f.tainted = variants
+                .iter()
+                .filter_map(|v| v.per[oi].as_ref())
+                .any(|p| p.outputs[&f.cell] != first);
             // A COMPILE-TIME CONSTANT that every variant agrees on holds
             // the same value in every row of this outcome's accumulator,
             // so the column can be written once as `Col::U` rather than
