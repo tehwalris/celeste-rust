@@ -1,7 +1,7 @@
 //! ONE frame of the abstract search, behind one interface.
 //!
 //! `FrameEngine::step` is `(shape, rows) -> [(shape, rows)]`: the compiled
-//! class kernels where they bind, the celeste-rust interpreter where they
+//! traced kernels where they bind, the celeste-rust interpreter where they
 //! do not, with the boundary abstraction, cross-block dedup and the k-way
 //! same-shape merge around both. `bridge` translates an interpreter `State`
 //! into a block and back - the one place in the codebase that names both
@@ -200,14 +200,14 @@ pub(crate) fn boundary_ids() -> runtime2::BoundaryIds {
 /// replay can both go through `step`, and a kernel that lands lands in both.
 ///
 /// The engine is a pair of paths and a policy for choosing between them.
-/// The compiled path is the generated class kernels
+/// The compiled path is the generated traced kernels
 /// (`dispatch::run_chunk_kernel`). The reference path is the celeste-rust
 /// INTERPRETER, on the block exported back to a `State` - the same
 /// `Program`, the same `interpret_prepared_cfg`, the same code the campaign
 /// and `concrete_run` execute (plans/k4-retirement-plan.md stage 2). A
 /// chunk no kernel binds takes the reference, so a coverage gap is slow and
-/// never wrong. Coverage is room-shaped today: room (1,0)'s player classes
-/// have kernels, spawn shapes and rooms (0,0)/(2,0) do not.
+/// never wrong. Coverage is room-shaped today: room (1,0)'s shapes have
+/// traced kernels, rooms (0,0)/(2,0) do not.
 ///
 /// Speed of the reference path is a measured non-issue rather than a hope:
 /// since the class kernels reached 100% of player lanes it runs on spawn
@@ -813,11 +813,9 @@ pub fn step(
                     while let Some((block, kernel_ok)) = local.pop() {
                         if use_kernel && kernel_ok {
                             // KERNEL mode (plans/kernel-plan.md K3): the
-                            // steady-class lane kernel first; rows it
-                            // deopts re-enter the worklist for the
-                            // reference paths; a chunk it cannot bind or
-                            // whose uniform premise fails falls through
-                            // whole.
+                            // traced kernel for the chunk's shape; a
+                            // chunk it cannot bind or declines falls
+                            // through whole.
                             if dispatch::run_chunk_kernel(&block, ids, &mut done) {
                                 continue;
                             }

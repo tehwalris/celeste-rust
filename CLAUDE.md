@@ -113,11 +113,13 @@ release profile is `lto = "fat"` + `codegen-units = 1`, so a one-line edit
 relinks the whole workspace - ~100 s to run a test that EXECUTES in 6 ms.
 I did this repeatedly on 2026-08-22 before noticing. `[profile.quick]`
 exists for when a test genuinely needs optimization (the compute-bound
-ones: `compiled_forward_reproduces_the_interpreter`,
-`shape_variant_dispatch_reproduces_the_baseline`, `generated_is_current`).
+ones: `traced_kernels_reproduce_the_interpreter`,
+`shape_variant_dispatch_reproduces_the_baseline`,
+`traced_kernels_are_current`).
 
 Do NOT run the full suite in plain debug: those same tests are
-compute-bound and `compiled_forward` alone goes 20 s -> 153 s. Debug wins
+compute-bound (`compiled_forward_reproduces_the_interpreter`, since
+deleted, went 20 s -> 153 s). Debug wins
 when a filter keeps them out; `--cargo-profile quick` wins when it cannot.
 
 **Tools get `--profile quick`, not `--release`.** `transpile` prints text;
@@ -156,10 +158,11 @@ result. Add a profile instead.
 - **`touch` the file you care about** to measure what an edit really
   costs: `touch src/transpile/lower.rs && time cargo nextest run transpile`.
   Guessing at build cost is how the stale table this replaced survived.
-- **`./regen-generated.sh` is ~2 min**, of which ~1m45 is two release
-  builds and only ~29 s is the nine generation jobs (which now run in
-  parallel). If you only need ONE kernel, call `transpile` directly
-  instead of running the whole script.
+- **`./regen-generated.sh`** is a quick build of `transpile`, ONE
+  generation job (the traced set, `--room-kernels`) and a quick
+  workspace build to prove the result compiles; no release build. It
+  used to be ~2 min for nine jobs; the other eight went with the walk
+  kernels.
 
 **The pre-commit run is `--cargo-profile quick`, and it does NOT include
 the ignored tests.** `--release` is for numbers only; gating correctness
@@ -167,9 +170,11 @@ under fat LTO costs ~110 s of relink to run tests that execute in
 milliseconds, and it contradicts "never use `--release` for unit tests"
 three lines above.
 
-Three slow tests are `#[ignore]`d: `every_checked_in_recipe_replays`
-(~200 s), and `generated_is_current{,_r20}` (~44 s / ~70 s), plus
-`every_reachable_pm1_key_gets_its_own_body` (~240 s). `#[ignore]` over an
+The slow test that is `#[ignore]`d is
+`every_reachable_pm1_key_gets_its_own_body` (~240 s).
+(`every_checked_in_recipe_replays` went with the rewrite rules,
+`generated_is_current{,_r20}` with the walk kernels - their successor
+`traced_kernels_are_current` is ~8 s and NOT ignored.) `#[ignore]` over an
 env check on purpose: nextest prints them as skipped, so the skip is
 visible rather than silent.
 
@@ -178,12 +183,10 @@ visible rather than silent.
 back to it is lower than paying that on every commit. Run them when you
 have a REASON to think they will fire:
 
-- touched an emitter, `transpile::names`, or anything feeding the
-  generated files -> `generated_is_current` (this one has already caught
-  a real stale-kernel commit, `a8f4635`, so treat any emitter change as
-  a reason);
-- touched the rewrite rules or a checked-in recipe ->
-  `every_checked_in_recipe_replays`, the only thing that replays them;
+- touched an emitter or anything feeding the traced kernels ->
+  `traced_kernels_are_current` runs on every commit, but READ ITS DIFF
+  after `./regen-generated.sh` (its predecessor `generated_is_current`
+  caught a real stale-kernel commit, `a8f4635`);
 - touched the tracer's pinning or key walk ->
   `every_reachable_pm1_key_gets_its_own_body`.
 
@@ -208,8 +211,8 @@ these exist today, all zero-assertion:
 
 They belong behind ONE binary - `src/bin/probe.rs` with a subcommand
 each - not in the test harness. `#[ignore]` is for tests that assert
-something and are slow (`generated_is_current`,
-`every_checked_in_recipe_replays`), not for a hiding place.
+something and are slow (`every_reachable_pm1_key_gets_its_own_body`),
+not for a hiding place.
 
 Until that binary exists: do not add a new zero-assertion `#[test]`.
 Write it as a subcommand, or give it an assertion that states the
@@ -254,7 +257,7 @@ crates/celeste-interp    the INTERPRETER (the oracle),           deps: core, ir
                          game_runner, its instrumentation
 crates/celeste-engine    Rt2 block model, boundary/dedup/merge,  deps: core, names
                          row keys, kernel.rs lane primitives
-crates/celeste-kernels   GENERATED per-class lane kernels        deps: core, engine
+crates/celeste-kernels   GENERATED per-shape TRACED kernels     deps: core, engine
 .  (celeste-rust)        search driver, program assembly,        deps: all
                          AST tracer, transpile emitters,
                          compiled dispatch, campaign bins
@@ -278,7 +281,7 @@ src/compiled/  FrameEngine dispatch and the State <-> block bridge
 then - only the `program` half was ever about rewriting.
 
 One frame of the abstract search is `celeste_rust::compiled::FrameEngine`
-`::step` - `(shape, rows) -> [(shape, rows)]`, the generated class kernels
+`::step` - `(shape, rows) -> [(shape, rows)]`, the generated traced kernels
 where they bind and the interpreter where they do not. It lives in
 celeste-rust so both the forward search and the backward sweep can call it;
 `compiled::bridge` is the `State` <-> block translation and is the only
@@ -290,13 +293,15 @@ OFF, but the right setting is PER ROOM, by measurement** (2026-08-20,
 BENCHMARK_DATA.md "Engine adoption validation at depth"): on room (1,0)
 at the production horizon (f094) the compiled+fused engine is -23% wall
 / -40% peak with all 94 per-frame rowkey sets identical, while on room
-(0,0) - where no kernel binds, the witnesses being room (1,0) shapes -
+(0,0) - where no kernel binds, the kernels being room (1,0) shapes -
 it is 4x SLOWER and 12x the peak, still set-identical. The engine's
-identity is hashed into the campaign fingerprint when it is on, so
-engines never share checkpoints. The fused build needs
-`--features fused` plus a per-campaign generated artifact
-(gitignored); watch out for stale non-fused binaries after
-regen-generated.sh (see the script's NOTE).
+identity (the traced set's content hash) is hashed into the campaign
+fingerprint when it is on, so engines never share checkpoints. The
+kernel set is the TRACED set, `crates/celeste-kernels/src/traced`, in
+ONE binary with no cargo features: the per-class "walk" kernels and the
+`fused` artifact were deleted 2026-08-25 (plans/delete-the-interpreter.md
+Phase 1) after the traced set took every lane at f94 (BENCHMARK_DATA.md
+2026-08-24: missed 0, plain-routed 0).
 `CELESTE_COMPILED_FORWARD=check` runs both engines and compares row-key
 sets per chunk; that is the gate, and also a test.
 
@@ -310,22 +315,27 @@ its own root, so `celeste_rust::pico8_num::...` still resolves everywhere.
 
 ### The generated files are CHECKED IN
 
-`crates/celeste-names/src/gen.rs` and
-`crates/celeste-kernels/src/kernel_gen_*.rs`, plus the three shape
-witnesses under `crates/celeste-kernels/witness/` that generation reads.
-Regenerate with:
+`crates/celeste-kernels/src/traced/` - the traced kernel set, one module
+per heap shape the start room reaches. Regenerate with:
 
 ```bash
 ./regen-generated.sh     # then READ THE DIFF, then commit
 ```
 
-`transpile::names::tests::generated_is_current` fails until you do.
-Byte-for-byte, on purpose: `FIELD_NAMES`' ORDER is the canonical field
-ordering the boundary hashes, so it feeds the shape hash, the row key, and
-what the search dedups on. A reordering is a different search.
+`trace::kernel::tests::traced_kernels_are_current` fails until you do.
+Byte-for-byte, on purpose: a diff there is a change to what the kernels
+compute, and the gate on THAT is `traced_kernels_reproduce_the_interpreter`
+plus a `CELESTE_COMPILED_FORWARD=check` run.
 
-There is a bootstrap to know about: the emitters live in `celeste-rust`,
-which depends on `celeste-kernels`, whose contents they produce. Change
+`crates/celeste-names/src/gen.rs` is FROZEN, not generated. Its generator
+(`transpile::names`) walked the rewritten IR and was deleted with the walk
+kernels; `FIELD_NAMES`' ORDER is the canonical field ordering the boundary
+hashes, so it feeds the shape hash, the row key, and what the search
+dedups on. A reordering is a different search. New names (only possible
+if the Lua changes) may be APPENDED by hand, never inserted.
+
+There is a bootstrap to know about: the emitter lives in `celeste-rust`,
+which depends on `celeste-kernels`, whose contents it produces. Change
 what the kernel emitter emits and the committed kernels stop compiling,
 which stops `cargo build --bin transpile` from building the tool that
 would fix them. `regen-generated.sh` avoids it by generating into a
