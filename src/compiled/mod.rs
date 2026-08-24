@@ -418,9 +418,8 @@ impl FrameEngine {
         // DISPATCH EVERY CHUNK BEFORE INTERPRETING ANY. A premise failure
         // in `interpret_block` panics out of the whole state, and with the
         // interleaved loop that panic landed before the remaining chunks
-        // were ever OFFERED to the kernels - so kernel coverage (and the
-        // miss-dump census behind CELESTE_KERNEL_MISS_DUMP) observed only
-        // the first-popped partitions of each state, a class-skewed
+        // were ever OFFERED to the kernels - so kernel coverage observed
+        // only the first-popped partitions of each state, a class-skewed
         // sample. Chunks are independent and the output is a row SET, so
         // running the kernel pass to completion first changes no result -
         // it only moves the abort after the point where every chunk has
@@ -428,7 +427,7 @@ impl FrameEngine {
         let mut misses: Vec<(runtime2::Rt2, bool)> = Vec::new();
         while let Some((block, kernel_ok)) = pending.pop() {
             if use_kernel && kernel_ok {
-                if dispatch::run_chunk_kernel(&block, &self.ids, &mut done, &mut pending) {
+                if dispatch::run_chunk_kernel(&block, &self.ids, &mut done) {
                     continue;
                 }
             }
@@ -582,45 +581,6 @@ impl FrameEngine {
                 continue;
             }
             for part in sub.partition_pm1(ids) {
-                if std::env::var("CELESTE_KERNEL_MISS").is_ok() {
-                    let mixed = part
-                        .pm1_cells(ids)
-                        .iter()
-                        .filter(|c| !matches!(part.cols[**c as usize], runtime2::Col::U(_)))
-                        .count();
-                    if mixed > 0 {
-                        static ONCE2: std::sync::Once = std::sync::Once::new();
-                        ONCE2.call_once(|| {
-                            eprintln!(
-                                "[partition_pm1] part width {} still has {} mixed pm1 columns; cells {:?}",
-                                part.width,
-                                mixed,
-                                part.pm1_cells(ids)
-                            );
-                            for c in part.pm1_cells(ids) {
-                                let d = match &part.cols[c as usize] {
-                                    runtime2::Col::U(_) => "uniform".to_string(),
-                                    runtime2::Col::N(vs) => {
-                                        let mut s: Vec<String> =
-                                            vs.iter().map(|v| format!("{:?}", v)).collect();
-                                        s.sort();
-                                        s.dedup();
-                                        format!("N {:?}", s)
-                                    }
-                                    runtime2::Col::V(vs) => {
-                                        let mut s: Vec<String> =
-                                            vs.iter().map(|v| format!("{:?}", v)).collect();
-                                        s.sort();
-                                        s.dedup();
-                                        format!("V {:?}", s)
-                                    }
-                                    runtime2::Col::I(_) => "I".to_string(),
-                                };
-                                eprintln!("    cell {}: {}", c, d);
-                            }
-                        });
-                    }
-                }
                 let key = (part.shape_hash, part.pm1_key_hash(ids));
                 match groups.iter_mut().find(|(h, _)| *h == key) {
                     Some((_, g)) => g.push(part),
@@ -858,7 +818,7 @@ pub fn step(
                             // reference paths; a chunk it cannot bind or
                             // whose uniform premise fails falls through
                             // whole.
-                            if dispatch::run_chunk_kernel(&block, ids, &mut done, &mut local) {
+                            if dispatch::run_chunk_kernel(&block, ids, &mut done) {
                                 continue;
                             }
                         }
@@ -979,21 +939,6 @@ pub fn step(
     };
     phase("dedup");
     let out = self.regroup_and_merge(ran, keeps, &mut phase);
-    if std::env::var("CELESTE_KERNEL_MISS").is_ok() {
-        let mut mixed = 0usize;
-        for b in &out {
-            for c in b.pm1_cells(ids) {
-                if !matches!(b.cols[c as usize], runtime2::Col::U(_)) {
-                    mixed += 1;
-                }
-            }
-        }
-        eprintln!(
-            "[frame_step] {} out blocks, {} non-uniform pm1 columns",
-            out.len(),
-            mixed
-        );
-    }
     out
 }
 }
