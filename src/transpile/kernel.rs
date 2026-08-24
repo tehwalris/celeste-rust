@@ -724,29 +724,6 @@ pub(crate) fn emit_walk(program: &Program, witness_path: &str) -> Result<Emit> {
     Ok(e)
 }
 
-/// Cells REACHABLE from the globals table in the walk's FINAL heap
-/// topology. For a dying member the player was deleted at emit time
-/// (`__array_table_drop_last`), so its `objects.1.*` cells drop out of
-/// this set: what remains is exactly the data the dead boundary state can
-/// depend on. The fusion pass uses that to prove a member's boundary rows
-/// are block-uniform.
-pub(crate) fn reachable_cells(e: &Emit) -> BTreeSet<u32> {
-    let mut seen: BTreeSet<u32> = BTreeSet::new();
-    let mut stack: Vec<u32> = e.globals.values().copied().collect();
-    while let Some(id) = stack.pop() {
-        if !seen.insert(id) {
-            continue;
-        }
-        match e.cells.get(&id) {
-            Some(CellT::Obj(fields)) => stack.extend(fields.values().copied()),
-            Some(CellT::Arr(items)) => stack.extend(items.iter().copied()),
-            Some(CellT::Val(K::Ptr(c))) => stack.push(*c),
-            _ => {}
-        }
-    }
-    seen
-}
-
 /// One instruction of the straight line, evaluated at emit time.
 fn eval(e: &mut Emit, instr: &Instruction) -> Result<Option<K>> {
     use Instruction as I;
