@@ -3753,7 +3753,74 @@ So, all four done:
    compared - and it asserts `traced_lanes() > 0`, because a set
    generated for shapes the run never reaches would miss every chunk,
    fall through, and pass having run none of the code it names.
-4. **Measure against BENCHMARK_DATA's baseline** - next.
+4. **Measured.** Room (1,0), `bench --frames 94 --deopt`, ladder env,
+   one release binary, no fused, three sides an env var apart:
+
+   | side | wall | peak | us/lane | deopt lanes | coverage |
+   |---|---|---|---|---|---|
+   | plain (interpreter) | 512.21 s | 14.76 GB | 86.1 | 4,400,724 | - |
+   | classes | 608.44 s | 14.60 GB | 102.3 | 4,138,311 | 56 missed, 1.81 M plain-routed |
+   | **traced** | **340.91 s** | **8.18 GB** | **57.3** | **0** | **0 missed, 0 plain-routed** |
+
+   All three report 5,949,326 lanes. **1.50x and -44.6% peak**, and the
+   result that matters more: **zero deopt at 172,626,763 lanes**. The
+   recorded fused engine still had 456,960 uncovered lane-events;
+   three checked-in files have none, because the shape walk closes to
+   a FIXPOINT rather than sampling.
+
+   The class kernels are a net LOSS without `fused` - 608 s against
+   the interpreter's 512 s. What the repository shipped as its
+   compiled engine was slower than the interpreter, because the -22.9%
+   on record was measured with a per-campaign artifact that is not in
+   git. See BENCHMARK_DATA.md, 2026-08-24.
+
+### The second room, and what it costs
+
+Room (2,0) could not be traced at all until 2026-08-24; `e2faa99` has
+the five fixes. It traces now - 36 shapes - and the set compiles. It
+cannot be CHECKED IN:
+
+| | room (1,0) | room (2,0) |
+|---|---|---|
+| shapes | 3 | 36 |
+| lines | 24,609 | 1,064,829 |
+| on disk | 1.0 MB | 44 MB |
+| generate | 5.9 s | 119.5 s |
+| compile | 4.3 s wall | **296 s wall, 1033 s cpu, 14.7 GB** |
+
+43x the lines, 69x the compile, and not only shape count: room (2,0)
+averages ~30k lines per shape against room (1,0)'s ~8k, because every
+extra object multiplies the body.
+
+**The checked-in artifact model works at 24k lines and does not
+survive the second room.** 5 minutes on every `cargo build`, 44 MB in
+git, and ~30 rooms would be 2.5 hours and 1.3 GB. The `fused` pattern -
+generated per campaign, gitignored, feature-gated, its own fingerprint
+hashed into the campaign - is the shape that fits, and it is already
+built for exactly this reason. DECISION PENDING (Philippe).
+
+Which also splits the class-kernel deletion in two: room (1,0)'s three
+can go now, room (2,0)'s five only once the above is settled or that
+room drops to interpreter-only.
+
+### The fork mask was a latent silent-corruption bug
+
+Worth keeping separate from the room (2,0) story, because it was not a
+missing feature. `ChoiceSet` was a `u16`: six button bits, ten fork
+bits. Room (2,0) forks sixteen times, and `1u16 << (6 + 15)` does not
+error - Rust masks the shift amount in release - so `Split(15).bit()`
+returned bit 5, a BUTTON. The choice cones were then wrong and the
+emitter placed fork-dependent nodes in the shared prologue, naming
+loop variables that do not exist there. `split_cones` truncating to
+`u8` was a second copy of the same mistake.
+
+It surfaced only as 48 undefined names in a million lines of generated
+Rust, i.e. only because `typecheck_rendered` (`5d1a1a4`, the same day)
+compiles what the emitter renders. Before that gate existed, every one
+of the five fixes in `e2faa99` would have been silent.
+
+`Choice::bit` asserts its index fits now. `u64` is a bigger number, not
+a guarantee.
 
 ### Two things to decide inside it - ANSWERED, 2026-08-24
 
