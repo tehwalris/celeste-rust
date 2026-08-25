@@ -621,3 +621,46 @@ compile to Rust, or (b) room (2,0) interpreter-only for now. Both are
 strategy calls for you; I did not build either, since I had just refuted
 the stated direction and did not want to build on an unconfirmed pivot.
 Nothing in production changed; 280 tests green; tree clean.
+
+## The complete fork mechanism (the "understand the nodes" deliverable)
+
+`obj.move(ox,oy)` calls `__split_by_flr(rem.x)` and `__split_by_flr(rem.y)`
+- exactly 2 forks per move call, on `rem.x + ox + 0.5` and
+`rem.y + oy + 0.5`. So room (1,0)'s player = 2 forks. Room (2,0)'s 8 =
+the player's move traced in 4 distinct velocity contexts x 2 axes.
+
+The 4 velocity contexts come from, in order of how I peeled them:
+* **input velocity** (`spd`): pinning it 8 -> 4 forks. The player arrives
+  with different velocities; velocity-sign branches in the physics.
+* **spring STATE** (`spr`, `hide_for`): the remaining 4. Even with ALL
+  object geometry concrete (positions + hitboxes), the forks stay at 8 -
+  because the bounce is gated on whether each spring is ACTIVE
+  (`spr==18`, `hide_for<=0`), which is per-lane (a spring gets hit and
+  hides). Pinning spring `spr`/`hide_for` (+ spd) -> 2 forks.
+
+So the 8 forks decompose as: `rem` (2, real) x input-velocity-branch (2)
+x spring-active-state (2) = 8. Every factor is a genuine per-lane
+distinction:
+* input velocity varies per lane (continuous),
+* each spring is independently active-or-hidden per lane.
+
+None is a static constant or a decidable-by-position fact. The
+"both springs bounce is impossible" mutual exclusivity does NOT help,
+because the branching is on spring STATE (both springs CAN be active at
+once - the player just is not on both), not on simultaneous collision.
+
+This is why nothing enumerable collapses it: the forks encode real,
+independent, per-lane game state (velocity + two springs' activity), and
+the emitted 2^8 is the honest cross product of those. It is large because
+room (2,0), mid-play, genuinely has that many live independent per-lane
+degrees of freedom around the player. Room (1,0) has none of them.
+
+### Final answer to "iterate until the graph is as simple as we expect"
+
+It does not get simpler by specialization, and now we know WHY at the
+node level: the fork count is `2 (rem) x 2 (velocity) x 2 (each active
+spring)`, all genuine per-lane. The graph is as simple as it is going to
+be for a 14-object mid-play frame. The size lever, if any, is not
+specialization but a different BACKEND for the base kernel (interpret the
+graph rather than compile 2^8 configs to Rust), or accepting room (2,0)
+on the interpreter until then.
