@@ -27,6 +27,12 @@ pub mod kernel;
 /// own copy, and 24,000 lines are compiled once instead of twice.
 pub use celeste_kernels::traced as kernels;
 
+/// The room-(2,0) CONSTANT-LATTICE kernel set, generated (gitignored) by
+/// `transpile --room-kernels-lattice traced-kernel-check/src/lattice`.
+/// One module per lattice shape; validates plans/specialize.md.
+#[path = "lattice/mod.rs"]
+pub mod lattice;
+
 #[cfg(test)]
 mod tests {
     use super::kernel;
