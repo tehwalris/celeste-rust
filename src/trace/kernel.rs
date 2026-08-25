@@ -631,7 +631,9 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
         use crate::transpile::kernel::Line;
         for line in &l.body {
             if let Line::Let { name, expr, .. } = line {
-                if name.starts_with("bd_v") && expr != "false" {
+                if name.starts_with("bd_v") && expr != "false"
+                    && std::env::var("CELESTE_ALLOW_BLOCK_DEOPT").is_err()
+                {
                     anyhow::bail!(
                         "{} is `{}`, not `false`: a block-undecidable condition zeroes \
                          `live` and would drop every lane of that outcome silently. It \
@@ -1184,12 +1186,21 @@ pub fn write_room_kernels_lattice(root: &std::path::Path, dir: &std::path::Path)
     let mut lw = room_constant_lattice(root)?;
     let room = crate::transpile::graph::Room { cart: lw.cart.clone(), cache: lw.cache.clone() };
     let mut refs: Vec<Reference> = Vec::new();
-    for (_k, f) in std::mem::take(&mut lw.frames) {
-        let bound = super::emit::bind(&f, &lw.graph)?;
-        let lowered = super::emit::lower_frame(&bound.graph, &bound.inputs, &bound.uni, &bound.outcomes, Some(room.clone()), bound.forks)
-            .map_err(|e| name_cells(&f, e))?;
+    let (mut ok_n, mut fail_n) = (0, 0);
+    for (i, (_k, f)) in std::mem::take(&mut lw.frames).into_iter().enumerate() {
+        let bound = match super::emit::bind(&f, &lw.graph) {
+            Ok(b) => b, Err(e) => { fail_n += 1; eprintln!("shape {} bind FAILED: {}", i, format!("{:#}", e).lines().next().unwrap_or("")); continue }
+        };
+        let lowered = match super::emit::lower_frame(&bound.graph, &bound.inputs, &bound.uni, &bound.outcomes, Some(room.clone()), bound.forks) {
+            Ok(l) => l, Err(e) => { fail_n += 1; eprintln!("shape {} lower FAILED: {}", i, format!("{:#}", name_cells(&f, e)).lines().next().unwrap_or("")); continue }
+        };
+        if let Err(e) = render(&f, &bound, &lowered, &format!("shape {}", i)) {
+            fail_n += 1; eprintln!("shape {} render FAILED: {}", i, format!("{:#}", e).lines().next().unwrap_or("")); continue;
+        }
         refs.push(Reference { frame: f, graph: lw.graph.clone(), bound, lowered, cart: lw.cart.clone(), cache: lw.cache.clone() });
+        ok_n += 1;
     }
+    eprintln!("lattice render: {} ok, {} failed", ok_n, fail_n);
     write_kernels_from_refs(&refs, dir)
 }
 

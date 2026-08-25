@@ -880,3 +880,40 @@ truly constant, so the 18 shapes are complete and the kernels are sound.
 This is believed (springs never write spd) but UNVERIFIED by the
 differential gate. Do not check in or default-enable the lattice kernels
 until gate 2 passes.
+
+## The block-deopt (bd) integration point (2026-08-25)
+
+All 18 lattice kernels fail the render's `bd_v0_b0 != false` guard: the
+`pin_guard` for BLOCK-UNIFORM pinned fields (8-12 of them) becomes a
+block-level deopt condition, which the render refuses because there is no
+fallback wired. This is not a bug - it is exactly where a SPECIALIZED
+kernel should route the whole block to the BASE kernel.
+
+And it is CLEANER than per-lane routing: the pinned fields are
+block-uniform (same across all 16 lanes), so `bd` is a single block-level
+test - "does this block's uniform state match my baked constants?" - and
+if not, the ENTIRE block takes the base. No per-lane mask needed.
+
+### The feature to build (next)
+
+1. **Emitter**: allow `bd != false` when a kernel is marked "has a base
+   fallback" (a flag on the render/Emit). The generated `frame`/`step`
+   already computes `bd`; expose it so the caller sees "block declined".
+2. **Dispatch**: base + specialized. For a block, try the lattice kernel;
+   if its `bd` fires, run the block on the base (abstract) kernel for the
+   same shape. This is the `run_chunk_kernel` fall-through pattern, at
+   block granularity.
+3. Then the differential gate (lattice+base vs interpreter) can run.
+
+CELESTE_ALLOW_BLOCK_DEOPT env added to bypass the refusal for SIZE
+MEASUREMENT only - the kernels it produces would silently drop a
+non-matching block, so they must NOT be run until the dispatch above
+routes bd to base. Measurement-only, flagged.
+
+### Note on avoiding bd for provably-constant fields
+
+A field PROVABLY never written (springs' spd) has a redundant pin_guard
+(always true). If a later pass proves "never written", we can bake it in
+with NO guard (no bd). That removes the block-deopt for the safe
+constants and leaves guards only for heuristic ones. Deferred; the
+bd->base routing is the general answer and is needed regardless.
