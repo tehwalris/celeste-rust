@@ -584,3 +584,40 @@ live for every button and every object geometry - i.e. genuinely per-
 lane-velocity, not a specialization artifact. This is why the fork count,
 and thus the emitted 2^fork size, is inherent to the room's complexity
 rather than removable by pinning static facts.
+
+## Probe validated against room (1,0) (2026-08-25)
+
+Sanity-checked the probe on room (1,0), which we understand:
+
+| shape | nodes | forks | is |
+|---|---|---|---|
+| 0 | 1,973 | 0 | spawn/exit state |
+| 1 | 2,089 | **2** | the player (rem.x, rem.y) - exactly the known 2 forks |
+| 2 | 78 | 0 | respawn animation |
+
+The probe reproduces room (1,0)'s known 2-fork player shape and its tiny
+sizes, so its room-(2,0) numbers (8 forks, ~15k nodes, no specialization
+axis helps) are trustworthy. Room 2 shape 3 is genuinely 7x room 1's
+node count and 4x its fork count - a real difference, the player in a
+14-object room vs alone.
+
+## SESSION END
+
+Investigation complete and validated. Deliverables:
+* `transpile --spec-probe SHAPE` + `CELESTE_SPEC_*` - a validated probe
+  for pinning fields and measuring the traced graph (flag-gated, not in
+  production).
+* A comprehensive, honest map (this file) of what does and does not
+  collapse room (2,0)'s graph: NOTHING enumerable does. Position, pm1,
+  geometry, collideable, buttons - all no effect; only continuous
+  velocity, which is not enumerable.
+* Two hypotheses raised and retracted with their refutations (collide
+  bug; SUM-not-product) - the trail is kept honest.
+
+Recommendation for Philippe: the position/pm1/velocity specialization
+direction we discussed will not shrink room (2,0). The realistic paths
+are (a) an interpret-the-graph base backend so the big kernel need not
+compile to Rust, or (b) room (2,0) interpreter-only for now. Both are
+strategy calls for you; I did not build either, since I had just refuted
+the stated direction and did not want to build on an unconfirmed pivot.
+Nothing in production changed; 280 tests green; tree clean.
