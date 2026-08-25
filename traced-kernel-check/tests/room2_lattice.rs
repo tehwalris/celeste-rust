@@ -149,11 +149,17 @@ fn room2_lattice_runs_and_covers() {
         }
     } }
 
+    let mut t_kernel = std::time::Duration::ZERO;
+    let mut t_interp = std::time::Duration::ZERO;
     for frame in 1..=frames {
+        let __t0 = std::time::Instant::now();
         let st = run.step().unwrap_or_else(|e| panic!("lattice frame {}: {:#}\n(a declined block or an uncovered shape means the lattice over-claimed a constant)", frame, e));
+        t_kernel += __t0.elapsed();
         eprintln!("[r2-lattice] frame {:>3}: {:>7} in -> {:>7} out, {} blocks", st.frame, st.rows_in, st.rows_out, st.blocks_out);
         if let (Some(oracle), Some(engine)) = (oracle.as_mut(), engine.as_ref()) {
+            let __t1 = std::time::Instant::now();
             oracle.step().unwrap_or_else(|e| panic!("oracle frame {}: {:#}", frame, e));
+            t_interp += __t1.elapsed();
             // Row-key equality is confounded by closure-upvalue BOXING (the
             // compiled interp boxes each object in an extra cell; the AST
             // tracer captures it directly). So compare the REACHABLE state
@@ -190,4 +196,6 @@ fn room2_lattice_runs_and_covers() {
         }
     }
     eprintln!("[r2-lattice] {} frames clean{}", frames, if oracle_on { " and matching the interpreter" } else { " (coverage + no declines)" });
+    eprintln!("[r2-timing] {} kernel frames: {:.3} s total ({:.2} ms/frame)", frames, t_kernel.as_secs_f64(), t_kernel.as_secs_f64()*1000.0/frames as f64);
+    if oracle_on { eprintln!("[r2-timing] {} interpreter frames: {:.3} s total ({:.2} ms/frame); kernel is {:.2}x the interpreter's wall", frames, t_interp.as_secs_f64(), t_interp.as_secs_f64()*1000.0/frames as f64, t_interp.as_secs_f64()/t_kernel.as_secs_f64().max(1e-9)); }
 }
