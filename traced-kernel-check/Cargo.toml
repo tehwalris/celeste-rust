@@ -26,3 +26,9 @@ celeste-names = { path = "../crates/celeste-names" }
 inherits = "release"
 lto = false
 codegen-units = 16
+
+[features]
+# Enables the room-(2,0) constant-lattice kernels. The kernel set is
+# generated (gitignored) with:
+#   CELESTE_START_ROOM=2,0 transpile --room-kernels-lattice traced-kernel-check/src/lattice
+lattice = []

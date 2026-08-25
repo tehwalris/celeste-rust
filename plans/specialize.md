@@ -1076,3 +1076,78 @@ lattice and abstract room-2 kernels bind and render. Then re-run gate 2
   with `off` as `num`. Gate 2 is blocked ONLY by interval-trig above.
 - Room 1 unaffected throughout (`traced_kernels_are_current` +
   full 280-test suite green).
+
+## Parked future idea: dedup on flr(rem+spd), not on rem (Philippe, 2026-08-25)
+
+The move applies `step = flr(rem + spd)` then carries `rem' = rem+spd - step`
+forward. So two states equal in everything but `rem`, with the SAME
+`flr(rem+spd)`, produce identical VISIBLE successors (x, y, spd) and differ
+only in the invisible `rem'`. `rem` is "basically invisible except in a
+very small way" - it only touches the world through that floor.
+
+Consequence not yet exploited: instead of forking on `rem` and widening it
+back (the current rem ladder), we could DEDUP states by `flr(rem+spd)` and
+treat `rem` as a don't-care carried forward - collapsing the rem fork at the
+dedup layer rather than the fork layer. Not used today; revisit as a
+possible refinement of the rem handling once room 2 runs.
+
+## Room 2 runs 30 frames clean; oracle differential blocked by an oracle artifact (2026-08-25)
+
+Interval `sin` fix (domain.rs `fun1`: `sin` of an interval folds to `[-1,1]`,
+matching `builtin_sin`) + `ival_paths` including a live fruit's `off`/`y`
+(the boundary widens them) makes the room-2 constant-lattice kernels
+RENDER (18/18), BIND real blocks, and run the FIRST 30 FRAMES CLEAN -
+full coverage, zero declines (`traced-kernel-check` test
+`room2_lattice_runs_and_covers`, default = coverage-only, PASSES). Frame
+30: 2864 rows in -> 7364 out. This is the "good place" for room 2 (the
+30-frame first pass).
+
+### The oracle differential (ROOM2_ORACLE) still fails at frame 1 - and it
+### is the ORACLE, not the kernel.
+
+Traced with a field/cell-level differ (in the test, on mismatch). After
+fixing two harness bugs (the oracle was running room (1,0) because the
+frozen `rewrites.jsonl` bakes room 1 - switched to
+`Program::compile_from_disk()` which applies `apply_start_room` from the
+env), the two blocks are IDENTICAL at frame 1 except:
+  - lattice = 400 cells, interp = 404 cells; the only kind that differs is
+    `Val` (254 vs 258) - FOUR extra scalar cells in the interpreter.
+  - The four are a SECOND reference to each of the four objects (Ptr 207-210
+    appear as a `Val` twice in interp, once in lattice). off/y widen
+    correctly on BOTH sides (the boundary finds the fruit, `g_fruit=60`,
+    and writes `[0,39]`/band - verified with a debug print), every scalar
+    field matches.
+  - The extra interp cell (e.g. 358 -> Ptr(207)) has NO Obj/Arr/global/Clo
+    parent: it is UNREACHABLE yet present in the "canonicalized" interp
+    block. That is cruft the raw-compiled program's `bridge::import_block`
+    carries and the clean traced kernel does not produce.
+
+So the raw `compile_from_disk` oracle is the wrong reference: the room-1
+traced kernels are validated against the REWRITTEN (DCE'd) program via the
+in-search `CELESTE_COMPILED_FORWARD=check`, not the raw compiled one, and
+DCE removes exactly these redundant/unreachable references. The right
+oracle here is the rewritten room-2 program (`rewrites-room20.jsonl`), but
+its frozen artifact does not exist and the `freeze`/recipe-apply tooling
+was deleted (nothing calls `frozen::freeze`; `frozen::rewritten` only
+`load`s a `.zst`). Options to finish the differential, for review:
+  1. Restore a compile+apply-recipe+freeze path for room (2,0), or
+  2. Compare against the rewritten program built in-memory (find/rebuild
+     the recipe-apply entry point), or
+  3. Canonicalize away unreachable cells in `bridge::import_block` / the
+     boundary so the raw oracle is comparable (verify this is sound - an
+     unreachable cell in a canonical block is arguably a bridge bug worth
+     fixing regardless).
+
+### Infra: lattice kernels are gitignored + feature-gated
+
+The generated set (`traced-kernel-check/src/lattice/`, ~401k lines, 18
+shapes) is NOT committed (fixed the `.gitignore` - it had a doubled path
+that never matched, so kernel0-8+mod.rs had been committed stale). The
+`lattice` module and the `room2_lattice` test are behind a `lattice`
+cargo feature (off by default) so the workspace builds without the
+generated files. To run the gate:
+```
+CELESTE_START_ROOM=2,0 ./target/quick/transpile --room-kernels-lattice traced-kernel-check/src/lattice
+cargo test --profile quick --features lattice --manifest-path traced-kernel-check/Cargo.toml room2_lattice_runs_and_covers   # coverage
+ROOM2_ORACLE=1 ... same    # differential (currently blocked, see above)
+```

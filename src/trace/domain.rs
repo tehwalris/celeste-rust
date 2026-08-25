@@ -360,6 +360,16 @@ impl Domain for Symbolic {
             let mut c = Concrete;
             return Ok(self.konst(c.fun1(f, &x)?));
         }
+        // `sin` of an interval is its full range [-1, 1], matching the
+        // interpreter's `builtin_sin` (game_runner.rs) exactly. Emit the
+        // constant range so the emitter never has to lower a `Sin` over a
+        // ZI (it cannot). This is the fruit bob's `sin((1+off)/40)` once
+        // the boundary has widened `off` - see plans/specialize.md.
+        if matches!(f, Fun1::Sin) && self.is_interval(a) {
+            let lo = self.konst(P8::from_i16(-1));
+            let hi = self.konst(P8::from_i16(1));
+            return Ok(self.graph.fold(Op::Span, vec![lo, hi]));
+        }
         let g = match f {
             Fun1::Neg => Op::Neg,
             Fun1::Abs => Op::Abs,

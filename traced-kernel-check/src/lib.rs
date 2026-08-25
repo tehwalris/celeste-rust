@@ -30,6 +30,7 @@ pub use celeste_kernels::traced as kernels;
 /// The room-(2,0) CONSTANT-LATTICE kernel set, generated (gitignored) by
 /// `transpile --room-kernels-lattice traced-kernel-check/src/lattice`.
 /// One module per lattice shape; validates plans/specialize.md.
+#[cfg(feature = "lattice")]
 #[path = "lattice/mod.rs"]
 pub mod lattice;
 
