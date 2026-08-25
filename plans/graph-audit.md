@@ -161,3 +161,60 @@ asks for; it belongs in the emitted `frame` regardless of the answer.
 button-independent in its prefix but per-body in its suffix, and 134
 bodies x ~20 mixes is most of it. Inherent to keying at write time per
 body; not today's problem, noted so the number is on record.
+
+## Room (2,0): the explosion is a fork CROSS-PRODUCT over independent objects (2026-08-25)
+
+Generated with the post-select-fix emitter. 36 shapes, **909,660 nodes /
+1,633,094 lines**. Three 14-object shapes hold 52%: shape 3 (190,915
+nodes, 7,965 bodies), shape 8 (175,039 / 4,382), shape 4 (107,981 /
+3,990).
+
+Shape 3 has 14 objects and **8 forks** - 4 moving objects x (x, y), each
+on a widened `rem` interval. Its worst outcomes:
+
+| outcome | bodies | = |
+|---|---|---|
+| 9 (death: freeze/will_restart/delay_restart) | 3,584 | 14 buttons x 2^8 forks |
+| 10 (exit) | 3,584 | 14 x 256 |
+
+**The per-cell fork cones say the product is nearly all waste.** Outcome
+9 has ~275 output cells; the cone histogram is `{0 forks: 272, 8 forks:
+3}`. So 272 cells do not depend on any fork (written once at
+`acc_init`), and only THREE - the death flags - depend on all 8. Yet the
+emitter specializes the whole outcome over the full 2^8 cross-product,
+emitting 256 bodies per button to capture the behaviour of 3 boolean-ish
+cells.
+
+Those 3 cells depend on all 8 forks because "did the room restart" =
+"did the player die", and the player dies against ANY of the 4 moving
+objects or its own fall: `will_restart = die_on_A(forkA) | die_on_B(forkB)
+| die_on_C(forkC) | fall(forkP)`. That is a **disjunction of per-object
+terms - a SUM of 4** - enumerated as a **product of 256**. Each fork
+config writes the same 272 position values and differs only in the death
+triple and its `live`/`ok` mask, so the boundary collapses 256 -> a
+handful of rows at runtime; the 256 survive only in the emitted CODE.
+
+Concentration, across the whole room's 283 outcomes: union of fork cone
+is 0 for **177**, 2 for **94**, 4 for **8**, 8 for **4**. The blow-up is
+those 12 death/exit outcomes in the big shapes, nothing else.
+
+### The shape of a fix (NOT built, for discussion)
+
+An outcome should not be specialized over the union of its cells' fork
+cones. Options, cheapest first:
+1. **Cone-0 cells cost nothing already** (acc_init), so the waste is
+   purely the fork-dependent cells' compute + key + plumbing, duplicated
+   2^union times. Emit the outcome body ONCE and specialize only the
+   fork-dependent cells - a per-config tail over 3 cells, not 275.
+2. **Keep the death disjunction symbolic over forks** rather than
+   enumerating: `will_restart` stays a function of the `Frag` nodes,
+   lowered to `zi_fork_flr` inline, one body. Turns 2^8 into the 4-term
+   OR it already is. This is a per-cell "do not specialize this fork"
+   decision, the inverse of the flat-fork default.
+3. Per-object row assembly (product built at write time, compute kept as
+   a sum) - the biggest change, matches the room-1 win's spirit.
+
+Open number still worth getting: how many DISTINCT (will_restart, freeze,
+delay_restart) value-triples the 256 configs actually produce - a `bdd`
+distinct-reference count on the 256 roots. If it is small, option 2 is
+clearly right.
