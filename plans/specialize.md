@@ -789,3 +789,42 @@ flagged for review:
   lane not matching the pins falls to base.
 - **Open**: the true fixpoint (trace from the lattice, which changes
   reachability) is deferred; Phase A/B is the first, guard-safe cut.
+
+## Phase A result + Phase B soundness notes (2026-08-25)
+
+Phase A (measurement) is a decisive win, room (2,0):
+- The constant-lattice fixpoint reaches **18 shapes** (vs 36 abstract) -
+  half the abstract shapes were spurious (spring-moved states that cannot
+  actually occur, since springs never write their own spd).
+- Fork counts: **10 shapes at 0, 2 at 2, 6 at 4, none at 8.** Shape 3
+  (was 8 forks / 190k nodes) is now 0 forks. `objects[k].spd` captured as
+  constant is the load-bearing piece.
+
+### Soundness of USING the lattice (Phase B) - to review
+
+The fixpoint is OPTIMISTIC: it traces with the current lattice pinned,
+which prunes branches, so a field it calls constant might in truth vary
+along a pruned branch. Two protections, both already available:
+
+1. **pin_guard (automatic).** `trace_frame` with the lattice pins puts
+   each pin equality into the frame's `ok`. A lane whose field disagrees
+   with the baked constant is DECLINED - it must go to a fallback, never
+   wrong. This handles field-value mismatches within a covered shape.
+2. **Shape coverage.** If an over-claimed constant prunes a branch to a
+   shape the lattice never generates, a real lane reaching that shape has
+   no kernel -> the traced `Run` errors (coverage gap, per the doctrine:
+   stop and report, not silently wrong). If the constants are TRULY
+   constant (springs' spd provably is), the 18 shapes are complete and
+   this never fires.
+
+So the safe deployment is base+specialized: keep the abstract kernels for
+full coverage, add the lattice kernels as the guarded fast path; a lane
+takes the lattice kernel iff its fields match, else the abstract base.
+For springs specifically the lattice is provably sound (spd never
+written), so in practice the abstract base may be unnecessary - but that
+needs the differential gate (lattice kernels vs the interpreter row-key
+sets) before trusting it, which room (2,0) does not have wired yet.
+
+ASSUMPTION for the size measurement below: correctness is validated
+separately; the numbers show what the lattice kernels WOULD cost, which
+is what decides whether room (2,0) becomes checkable-in.
