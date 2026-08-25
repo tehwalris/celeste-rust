@@ -64,3 +64,12 @@ of rooms 0, 1, 2 end to end. Requirements (Philippe, explicit):
   position-graph replay peaks ~101 GB) - see BENCHMARK_DATA.md; use
   ladder.sh's room-0 handling. Rooms 1,2 fit the 60G default.
 - Write the numbers into BENCHMARK_DATA.md (keep it current) and report.
+
+## Progress + obstacles (2026-08-26, overnight)
+
+- STEP 1 (origin) DONE + merged (665a2a4): sweep/pos-graph/fused all on kernels, byte-identical vs interpreter, 287/287.
+- STEP 2 (latticeify + delete old) DONE + merged (a876469/38c25d5/6732033): lattice is the SOLE generator, 3 variants x 3 rooms, one SETS registry per rung, old sets deleted, CELESTE_KERNEL_STRICT default-ON, 289 green, missed-0, origin intact, no shape-hash collision. Size: 1.34M lines / 62 MB (room20 = 77%); cold quick build ~11 min. Validating merge now.
+
+Obstacles for STEP 3/4 (benchmark + whole runs):
+1. **Release build is pathological.** Fat-LTO link of the 1.34M-line crate is >34 min (subagent killed it). For the release benchmark, apply the subagent's proposed `lto="thin"` override for the `celeste-kernels` PACKAGE only (not the global release profile - do NOT reprice recorded results), label the number accordingly.
+2. **STEP 4 rooms (0,0) & (2,0) are BLOCKED in-search.** No frozen rewritten artifacts and `bin/freeze` was deleted; the raw `compile_from_disk` program's closure-boxing cells shape-miss the kernels. So a full forward+backward campaign can only run ROOM (1,0) (has `rewrites.jsonl` frozen). Rooms 0/2 kernels ARE validated for 30 frames by the new in-suite gates (`room00/room20_lattice_kernels_match_the_interpreter`), but the whole-campaign runs Philippe asked for need either restored freeze tooling or a kernel-shaped frozen program. Report as a gap; do room (1,0) fully.
