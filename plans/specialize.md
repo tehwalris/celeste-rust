@@ -441,3 +441,37 @@ the axes we picked (a real result - saves us building the wrong thing),
 and they point back at the emitter's fork-product enumeration as the
 actual size lever. The probe (`transpile --spec-probe`) stays as the
 tool that established this.
+
+## The fork structure, and the concrete "SUM not product" lever (2026-08-25)
+
+The 8 forks are not 8 independent choices. They pair by axis (forks
+0,2,4,6 are x-moves; 1,3,5,7 are y-moves), and the 4 pairs are the SAME
+player move `floor(0.5 + rem + spd_eff)` under 4 different conditional
+forms of `spd_eff` (dash / jump / spring-bounce / normal). fork_memo does
+not share them because the operand includes `spd_eff`, which differs.
+
+Crucially, a single lane takes ONE spd condition, so it is live in only
+ONE pair (its x and y) - the other 6 forks belong to lanes in other
+branches. The emitter, however, enumerates 2^8 = 256 fork configs as if
+all 8 were simultaneously live. If the 4 spd-condition branches are
+mutually exclusive (a frame either dashes, jumps, bounces, or does
+neither), the honest count is ~4 branches x 2^2 = 16 configs - a **16x
+over-enumeration**.
+
+This is the concrete form of the "SUM not product" idea, and it is the
+single most promising size lever found this session:
+
+* It attacks the 2^forks emitted-size explosion directly (the thing that
+  makes room 2 190k+ nodes).
+* It needs no state specialization - it is an EMITTER change: recognise
+  that forks born in mutually-exclusive branches do not combine into a
+  product, and enumerate per branch (a sum) instead.
+* NOT YET VERIFIED that the 4 branches are mutually exclusive - that is
+  the thing to check first (trace the 4 fork-pairs' branch guards and
+  test pairwise `guard_i AND guard_j == false`). If they are, the
+  emitter's fork enumeration is provably over-counting and the fix is
+  well-defined.
+
+This supersedes position/pm1/geometry specialization (all refuted) as the
+room-(2,0) direction. It is also consistent with room (1,0) being fine:
+room 1's player has fewer conditional spd forms, so fewer fork pairs.
