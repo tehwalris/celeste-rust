@@ -154,8 +154,11 @@ fn room2_lattice_runs_and_covers() {
     for frame in 1..=frames {
         let __t0 = std::time::Instant::now();
         let st = run.step().unwrap_or_else(|e| panic!("lattice frame {}: {:#}\n(a declined block or an uncovered shape means the lattice over-claimed a constant)", frame, e));
-        t_kernel += __t0.elapsed();
-        eprintln!("[r2-lattice] frame {:>3}: {:>7} in -> {:>7} out, {} blocks", st.frame, st.rows_in, st.rows_out, st.blocks_out);
+        let __dt = __t0.elapsed();
+        t_kernel += __dt;
+        let ms = |d: std::time::Duration| d.as_secs_f64()*1000.0;
+        eprintln!("[r2-lattice] frame {:>3}: {:>7} in -> raw {:>8} -> distinct {:>7} -> out {:>7} | kernel {:.2} merge {:.2} boundary(dedup) {:.2} ms  [{:.3} ms tot]",
+            st.frame, st.rows_in, st.rows_raw, st.rows_distinct, st.rows_out, ms(st.t_kernel), ms(st.t_merge), ms(st.t_boundary), __dt.as_secs_f64()*1000.0);
         if let (Some(oracle), Some(engine)) = (oracle.as_mut(), engine.as_ref()) {
             let __t1 = std::time::Instant::now();
             oracle.step().unwrap_or_else(|e| panic!("oracle frame {}: {:#}", frame, e));
