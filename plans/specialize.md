@@ -710,3 +710,54 @@ Isolate in a minimal 2-object (player + spring) trace: call the spring's
 captured self) reads the live spring table or a stale/other one. The
 `--spec-probe` evidence points at the bounce's collide obj not being the
 pinned objects[k]; a unit-level trace will name the exact divergence.
+
+## RESOLVED: the spring forks are spurious, from unknown spring SPEED (2026-08-25)
+
+Root cause found and confirmed. The frame's per-object `foreach` does
+`if obj.spd.x~=0 or obj.spd.y~=0 then obj.move(...)`. The SPRINGS' `spd`
+is symbolic in the base kernel (unpinned), so the tracer cannot decide
+`spring.spd~=0` and must trace the branch where the spring MOVES - which
+makes the spring's own position symbolic. The spring's `collide(player)`
+then compares the player against a SYMBOLIC spring position, so the box
+test never folds, and the bounce cannot be pruned even for a concretely
+far player. That is why pinning the spring POSITION did nothing: the
+position it reads is `pinned_x + spurious_move`, not `pinned_x`.
+
+Confirmed by instrumenting `compare`: the box test logged as
+`Gt(47, symbolic)` - player side exact (40+7), spring side symbolic.
+
+### The fix, and it validates Philippe's whole model
+
+Pin the springs' `spd` to 0 (they are static - they never move) and a
+concretely-far player's bounce prunes completely. With EVERYTHING
+concrete except the player's rem, and the player moving (spd=2) far from
+the springs:
+
+  **2 live forks** - exactly `floor(0.5 + 2 + rem.x)` and
+  `floor(0.5 + 2 + rem.y)`. Zero spring forks. 2,678 nodes vs 15,425.
+
+So Philippe was right on every point: at runtime x/y/spd are concrete,
+only rem is unknown, and the only genuine forks are the 2 rem forks.
+There is NO inherent complexity and NO deep collide bug - the spring
+forks were spurious, caused by the compiler not knowing the springs'
+speed.
+
+### Corrected strategy (this supersedes the whole negative-result arc)
+
+1. **Constant-lattice, applied to STATIC FURNITURE'S SPEED, not just
+   position.** Springs (and other static objects) have `spd = {0,0}`
+   constant across all reachable states, and a constant position. Bake
+   BOTH in. I dismissed the constant-lattice earlier ("geometry pinning
+   did nothing") because I pinned spring POSITION but not spring SPEED -
+   and the spurious move from symbolic speed defeated the position pin.
+   Speed is the load-bearing constant.
+2. **Then position-specialize the player** - with the springs baked to
+   constants, a concrete player position folds the collide -> 2 rem
+   forks (step 1).
+3. **Interval speed (step 2)** drops the same forks with a compile-time
+   speed range instead of a concrete value.
+
+The earlier "no lever" conclusion is fully retracted. The lever is
+baking in static objects' constant SPEED (and position), which the
+per-field-constant-across-reachable-states analysis produces
+automatically. That is the concrete next build.

@@ -2087,6 +2087,29 @@ pub fn specialize_probe(
         }
         out
     };
+    // Object-identity check: for each spring, does its `collide`
+    // closure's captured `obj` point to the same table as the live
+    // spring? (CELESTE_SPEC_OBJID)
+    if std::env::var("CELESTE_SPEC_OBJID").is_ok() {
+        let springs_ck = objects_of(&st, "spring");
+        for (i, sp) in springs_ck.iter().enumerate() {
+            let live_tid = match iface::get(&st, sp) { Some(Value::Table(t)) => t, _ => { eprintln!("spring {} not a table", i); continue } };
+            // the collide closure
+            let mut cp = sp.clone(); cp.push(iface::key("collide"));
+            let cl = match iface::get(&st, &cp) { Some(Value::Func(c)) => c, other => { eprintln!("spring {} collide = {:?}", i, other); continue } };
+            let env = st.heap.closures.get(&cl).map(|c| c.env);
+            let cap_obj = env.and_then(|e| st.heap.scopes.get(&e)).and_then(|sc| sc.vars.get("obj")).cloned();
+            let cap_tid = match cap_obj { Some(Value::Table(t)) => Some(t), _ => None };
+            eprintln!("spring {}: live table {}, collide.env captured obj = {:?} (match: {})",
+                i, live_tid, cap_tid, cap_tid == Some(live_tid));
+            // also print the captured obj's x vs live x
+            if let Some(ct) = cap_tid {
+                let cap_x = st.heap.tables.get(&ct).and_then(|t| t.hash.get("x")).cloned();
+                let live_x = st.heap.tables.get(&live_tid).and_then(|t| t.hash.get("x")).cloned();
+                eprintln!("    captured obj.x node = {:?}, live obj.x node = {:?}", cap_x.map(|v| format!("{:?}", v)), live_x.map(|v| format!("{:?}", v)));
+            }
+        }
+    }
     let players = objects_of(&st, "player");
     let springs = objects_of(&st, "spring");
     let fld = |base: &[Step], f: &[&str]| -> Vec<Step> {
@@ -2159,12 +2182,14 @@ pub fn specialize_probe(
             // trailing "=1" pins a bool to true.
             let want_true = spec.ends_with("=1");
             if want_true { spec = &spec[..spec.len()-2]; }
+            let mut numval = 0i16;
+            if let Some((f, v)) = spec.split_once(':') { spec = f; numval = v.parse().unwrap_or(0); }
             let parts: Vec<&str> = spec.split('.').collect();
             let path = fld(pl, &parts);
             if super::shapes::state_paths(&st).unwrap_or_default().iter().any(|r| r == &path) && !pin.iter().any(|(q,_)| q==&path) {
                 match iface::get(&st, &path) {
                     Some(Value::Bool(_)) => pin.push((path, Conc::Bool(want_true))),
-                    Some(Value::Num(_)) => pin.push((path, num(0))),
+                    Some(Value::Num(_)) => pin.push((path, num(numval))),
                     _ => {}
                 }
             }
@@ -2194,19 +2219,16 @@ pub fn specialize_probe(
             }
             v
         };
+        let player_bases: Vec<Vec<Step>> = players.clone();
         for (i, ob) in all.iter().enumerate() {
+            if player_bases.iter().any(|pb| pb == ob) { continue; }
             for (f, v) in [("x", (i as i16) * 12 + 4), ("y", 40)] {
                 let path = fld(ob, &[f]);
                 if super::shapes::state_paths(&st).unwrap_or_default().iter().any(|r| r==&path) && !pin.iter().any(|(q,_)| q==&path) {
                     pin.push((path, num(v)));
                 }
             }
-            for (f, v) in [("x", 0), ("y", 0), ("w", 8), ("h", 8)] {
-                let path = fld(ob, &["hitbox", f]);
-                if super::shapes::state_paths(&st).unwrap_or_default().iter().any(|r| r==&path) && !pin.iter().any(|(q,_)| q==&path) {
-                    pin.push((path, num(v)));
-                }
-            }
+            // hitboxes are pinned by CELESTE_SPEC_HITBOX, not here.
         }
     }
     // CELESTE_SPEC_HITBOX: pin player hitbox (1,3,6,5) and spring
