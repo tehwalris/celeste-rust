@@ -499,7 +499,13 @@ mod tests {
         }
         let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
 
-        let frames = 12;
+        // 30, not 12. The spawn animation holds the search at ONE lane
+        // until about frame 24, and the first `rem` straddle - the first
+        // frame where a fork actually splits a lane - is frame 25. At 12
+        // frames this test was green on a kernel set that lost 38 rows at
+        // frame 25 (the flat-fork set of 6a2672c, found by the 30-frame
+        // CELESTE_COMPILED_FORWARD=check run in the Phase 1 gate).
+        let frames = 30;
         let mut baseline = AbstractRun::start(&program).expect("start baseline");
         let mut want = Vec::new();
         for _ in 1..=frames {

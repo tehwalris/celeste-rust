@@ -810,6 +810,29 @@ impl Graph {
                     let iv = a(0).as_num("Frag")?;
                     let (fl, fh) = (iv.low.flr(), iv.high.flr());
                     let two = fh == fl + Pico8Num::from_i16(1);
+                    // Under `lenient` the operand is a HULL over many lanes,
+                    // not one lane's interval, and `two` is not a property
+                    // a hull inherits: a lane inside a 40-floor hull can
+                    // still span exactly two floors. Deciding `FragOk(1)`
+                    // from the hull said "fragment 1 is never valid" for
+                    // every lane of room (1,0), `ival::fold` made that a
+                    // constant, and the flat-fork kernels silently wrote
+                    // no fragment-1 row at the first straddle (frame 25,
+                    // 38 rows lost; found by the 30-frame check run,
+                    // 2026-08-25). The only hull that decides it is one
+                    // inside a single floor, where no lane can straddle.
+                    // The fragment VALUE is the hull itself: fragment 0
+                    // of a lane that sits entirely in the hull's upper
+                    // floor is that lane's whole interval, which the
+                    // "exactly two floors" split below would exclude.
+                    if lenient {
+                        return Ok(match (&node.op, *c) {
+                            (Op::Frag(_), _) => a(0),
+                            (_, 0) => Val::Bool(Some(true)),
+                            _ if fl == fh => Val::Bool(Some(false)),
+                            _ => Val::Bool(None),
+                        });
+                    }
                     match (&node.op, *c) {
                         // Exactly two floors: fragment 0 is everything
                         // below the boundary, fragment 1 everything from

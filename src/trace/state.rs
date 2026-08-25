@@ -40,21 +40,89 @@ pub struct State<D: Domain> {
     /// `g and not c` at every branch and OR-ed back together at every
     /// merge.
     ///
-    /// This is what a merge SELECTS ON, and downstream it is the emitted
-    /// lane mask (`Emit::live`). Nothing ever looks inside it - there is
-    /// no path condition and no conjunct list. An earlier design carried
-    /// a `Vec<(D::Bool, bool)>` of assumed literals so that a re-tested
-    /// condition could be decided syntactically; measuring showed it
-    /// firing 10 times in 25 frames, and all 10 disappeared once `and`/
-    /// `or` stopped handing on the node they had just split on.
+    /// Downstream it is the emitted lane mask (`Emit::live`). Nothing
+    /// decides anything by looking inside it - an earlier design carried
+    /// a list of assumed literals so that a re-tested condition could be
+    /// decided syntactically; measuring showed it firing 10 times in 25
+    /// frames, and all 10 disappeared once `and`/`or` stopped handing on
+    /// the node they had just split on.
+    ///
+    /// It is NOT what a merge selects on. It used to be, and that put the
+    /// whole path guard inside every merged value: `freeze' = Sel(guard,
+    /// 2, freeze)` where `guard` was three levels of `(A & p) | (A & !p)`
+    /// from the dash block's direction arms, a different node per button
+    /// combination, so one value that only ever takes two forms was 37
+    /// distinct nodes and 37 emitted bodies (plans/graph-audit.md). The
+    /// merge now selects on the one decision in `path` that separates
+    /// the two arms.
     ///
     /// INVARIANT: the guards of the outcomes in one frontier are pairwise
     /// DISJOINT. Every fan-out is a split on some condition, so this holds
-    /// by construction - and `merge` relies on it, since it selects with
-    /// `t.guard` and would otherwise silently drop `f`'s value on a lane
-    /// both claimed.
+    /// by construction - and `merge` relies on it: on a lane where the
+    /// merged guard holds, exactly one side's guard holds, and the
+    /// separating decision is KNOWN there, so the select picks that side.
     pub guard: D::Bool,
     pub ok: D::Bool,
+    /// The branch decisions this state took since the frame started, in
+    /// order: `(condition, which way)`. `split` pushes one; `merge` keeps
+    /// the common prefix of the two sides.
+    ///
+    /// Its one job is to find the condition a merge should select on.
+    /// Two states being merged diverged at exactly one split, and
+    /// everything before it is common to both, so the first entry where
+    /// their paths differ IS that split: the same condition, taken both
+    /// ways. Selecting on it, rather than on the full guard, keeps the
+    /// guard algebra out of the value layer - on the lanes where the
+    /// merged state applies the two choices agree everywhere else.
+    ///
+    /// The conjunction of the path's literals is NOT the guard: a fork
+    /// (`__split_by_flr`) narrows `guard` by its validity without a
+    /// split, and merging ORs two guards together. The guard stays the
+    /// authority on WHEN; the path only says WHICH WAY.
+    pub path: Vec<(D::Bool, bool)>,
+}
+
+/// How many leading decisions two states share.
+pub fn common_prefix<D: Domain>(a: &State<D>, b: &State<D>) -> usize {
+    a.path.iter().zip(b.path.iter()).take_while(|(x, y)| x == y).count()
+}
+
+/// The order in which `collapse` should TRY to merge pairs: every
+/// joinable `(i, j)` with `i < j`, siblings first.
+///
+/// Two states that diverged at the most recent split share the longest
+/// decision prefix, and merging them first is what lets `merge` find a
+/// single separating decision to select on. Merging a state with its
+/// cousin before its sibling leaves a pair whose paths do not split at
+/// one shared condition, and that pair has to fall back to the full
+/// guard. Ties break on `(i, j)` so the order - and the graph - is
+/// deterministic.
+pub fn merge_order<D: Domain>(
+    states: &[&State<D>],
+    joinable: impl Fn(usize, usize) -> bool,
+) -> Vec<(usize, usize)> {
+    let mut pairs: Vec<(usize, usize, usize)> = Vec::new();
+    for i in 0..states.len() {
+        for j in (i + 1)..states.len() {
+            if joinable(i, j) {
+                pairs.push((common_prefix(states[i], states[j]), i, j));
+            }
+        }
+    }
+    pairs.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    pairs.into_iter().map(|(_, i, j)| (i, j)).collect()
+}
+
+/// What `merge` produced.
+pub struct Merged<D: Domain> {
+    pub state: State<D>,
+    /// The condition every merged value selects on - true on `t`'s lanes.
+    pub cond: D::Bool,
+    /// The two paths did not diverge at one shared decision (they can
+    /// fail to when `collapse` pairs two states that are not siblings),
+    /// so `cond` is `t.guard`, the always-correct choice the merge used
+    /// to make unconditionally. Counted so its frequency is a number.
+    pub fell_back: bool,
 }
 
 impl<D: Domain> Clone for State<D> {
@@ -66,6 +134,7 @@ impl<D: Domain> Clone for State<D> {
             stack: self.stack.clone(),
             guard: self.guard.clone(),
             ok: self.ok.clone(),
+            path: self.path.clone(),
         }
     }
 }
@@ -99,13 +168,23 @@ pub fn merge<D: Domain>(
     d: &mut D,
     mut t: State<D>,
     mut f: State<D>,
-) -> Result<Option<State<D>>> {
-    let cond = &t.guard.clone();
+) -> Result<Option<Merged<D>>> {
     t.gc();
     f.gc();
     if t.shape()? != f.shape()? {
         return Ok(None);
     }
+
+    // The decision that separates the two sides - see `State::path`.
+    let l = common_prefix(&t, &f);
+    let (cond, fell_back) = match (t.path.get(l), f.path.get(l)) {
+        (Some((ct, pt)), Some((cf, pf))) if ct == cf && pt != pf => {
+            (if *pt { ct.clone() } else { d.not(ct) }, false)
+        }
+        _ => (t.guard.clone(), true),
+    };
+    let cond = &cond;
+    let path: Vec<(D::Bool, bool)> = t.path[..l].to_vec();
 
     // Rebuild into the T SIDE'S NUMBERING, not a fresh canonical one.
     //
@@ -177,7 +256,7 @@ pub fn merge<D: Domain>(
         }
     }
 
-    Ok(Some(State {
+    let state = State {
         heap,
         globals: t.globals,
         scope: t.scope,
@@ -188,7 +267,9 @@ pub fn merge<D: Domain>(
         // conjoining. Conjoining would be sound but would deopt lanes for
         // an obligation incurred on a path they did not take.
         ok: d.sel_bool(cond, &t.ok, &f.ok),
-    }))
+        path,
+    };
+    Ok(Some(Merged { state, cond: cond.clone(), fell_back }))
 }
 
 /// Merge one slot. Only numbers and booleans can actually differ - the
@@ -271,6 +352,7 @@ mod tests {
             stack: Vec::new(),
             guard: d.boolean(true),
             ok: d.boolean(true),
+            path: Vec::new(),
         };
         s.globals = s.heap.new_table();
         s.scope = s.heap.new_scope(None);
@@ -297,7 +379,7 @@ mod tests {
         s.guard = cond.clone();
         f.guard = d.not(&cond);
 
-        let m = merge(&mut d, s, f).unwrap().expect("same shape merges");
+        let m = merge(&mut d, s, f).unwrap().expect("same shape merges").state;
         let player_m = match m.heap.tables[&m.globals].hash["p"] {
             Value::Table(t) => t,
             ref v => panic!("expected a table, got {:?}", v),
@@ -316,11 +398,60 @@ mod tests {
         assert_eq!(d.graph.get(x).args, vec![cond, a, b]);
     }
 
+    /// The merge selects on the DECISION that separates the two sides,
+    /// not on their full guards. Here both sides sit under an outer
+    /// guard `g`; the select must name `c`, and the merged guard must
+    /// still be the OR of the two guards.
+    #[test]
+    fn a_merge_selects_on_the_separating_decision_not_the_guard() {
+        let mut d = Symbolic::default();
+        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ok: d.boolean(true), path: Vec::new() };
+        s.globals = s.heap.new_table();
+        s.scope = s.heap.new_scope(None);
+        let a = d.num(P8::from_i16(1));
+        let b = d.num(P8::from_i16(2));
+        s.heap.tables.get_mut(&s.globals).unwrap().hash.insert("x".into(), Value::Num(a));
+        let zero = d.num(P8::from_i16(0));
+        let cell1 = d.graph.leaf(Op::Cell(1));
+        let cell2 = d.graph.leaf(Op::Cell(2));
+        let g = d.compare(Cmp::Gt, &cell1, &zero).unwrap();
+        let c = d.compare(Cmp::Gt, &cell2, &zero).unwrap();
+        s.guard = g;
+        s.path.push((g, true));
+        let (t, f) = split(&mut d, s, &c);
+        let (mut t, f) = (t.unwrap(), f.unwrap());
+        t.heap.tables.get_mut(&t.globals).unwrap().hash.insert("x".into(), Value::Num(b));
+        let (tg, fg) = (t.guard, f.guard);
+
+        let m = merge(&mut d, t, f).unwrap().expect("same shape merges");
+        assert!(!m.fell_back, "siblings share a split, so no fallback");
+        assert_eq!(m.cond, c, "the select condition is the branch condition");
+        let x = match m.state.heap.tables[&m.state.globals].hash["x"] {
+            Value::Num(n) => n,
+            ref v => panic!("expected a number, got {:?}", v),
+        };
+        assert_eq!(d.graph.get(x).args, vec![c, b, a]);
+        assert_eq!(m.state.guard, d.or(&tg, &fg), "the guard is still the OR of both sides");
+        assert_eq!(m.state.path, vec![(g, true)], "the merged path is the common prefix");
+
+        // Two states whose paths do not diverge at one shared decision
+        // fall back to the full guard, which is always correct.
+        let mut p: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: g, ok: d.boolean(true), path: vec![(g, true)] };
+        p.globals = p.heap.new_table();
+        p.scope = p.heap.new_scope(None);
+        let mut q = p.clone();
+        q.guard = c;
+        q.path = vec![(c, false)];
+        let m = merge(&mut d, p, q).unwrap().expect("same shape merges");
+        assert!(m.fell_back);
+        assert_eq!(m.cond, g);
+    }
+
     /// Different shapes are different successors, not a merge failure.
     #[test]
     fn differing_shapes_do_not_merge() {
         let mut d = Symbolic::default();
-        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ok: d.boolean(true) };
+        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ok: d.boolean(true), path: Vec::new() };
         s.globals = s.heap.new_table();
         s.scope = s.heap.new_scope(None);
         let obj = s.heap.new_table();
@@ -345,7 +476,7 @@ mod tests {
     #[test]
     fn garbage_does_not_prevent_a_merge() {
         let mut d = Symbolic::default();
-        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ok: d.boolean(true) };
+        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ok: d.boolean(true), path: Vec::new() };
         s.globals = s.heap.new_table();
         s.scope = s.heap.new_scope(None);
         let mut f = s.clone();
@@ -377,6 +508,7 @@ pub fn split<D: Domain>(
     let t = if live(d, &gt) {
         let mut x = s.clone();
         x.guard = gt;
+        x.path.push((cond.clone(), true));
         Some(x)
     } else {
         None
@@ -384,6 +516,7 @@ pub fn split<D: Domain>(
     let f = if live(d, &gf) {
         let mut x = s;
         x.guard = gf;
+        x.path.push((cond.clone(), false));
         Some(x)
     } else {
         None

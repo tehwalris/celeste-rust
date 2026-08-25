@@ -110,6 +110,11 @@ pub struct Interp<'a, D: Domain> {
     /// it`. Answering costs 256 map lookups, and `ice_at` asks every
     /// frame for every object.
     room_flags: std::collections::HashMap<(i16, i16, i16), bool>,
+    /// Merges whose two sides did not diverge at one shared decision, so
+    /// the select condition was the full guard (`state::Merged::fell_back`).
+    /// A count, because whether `collapse`'s pairing ever produces this
+    /// case is a number and not an argument.
+    pub merge_fallbacks: usize,
 }
 
 impl<'a, D: Domain> Interp<'a, D> {
@@ -126,6 +131,7 @@ impl<'a, D: Domain> Interp<'a, D> {
             max_nodes: 2_000_000,
             prints: Vec::new(),
             room_flags: std::collections::HashMap::new(),
+            merge_fallbacks: 0,
         }
     }
 
@@ -576,23 +582,26 @@ impl<'a, D: Domain> Interp<'a, D> {
     /// rather than the product of every branch taken to get there.
     pub fn collapse(&mut self, mut outs: Outcome<D>) -> Result<Outcome<D>> {
         'again: loop {
-            for i in 0..outs.len() {
-                for j in (i + 1)..outs.len() {
-                    if !self.can_join(&outs[i].1, &outs[j].1) {
-                        continue;
-                    }
-                    let (a, b) = (outs[i].0.clone(), outs[j].0.clone());
-                    let Some(m) = merge(&mut self.d, a, b)? else {
-                        continue;
-                    };
-                    let cond = outs[i].0.guard.clone();
-                    let fl = self.join_flow(&cond, &outs[i].1, &outs[j].1);
-                    // j > i, so drop the later index first.
-                    outs.remove(j);
-                    outs.remove(i);
-                    outs.push((m, fl));
-                    continue 'again;
-                }
+            // Siblings first (longest shared decision prefix), so that a
+            // merge selects on the decision that separates its two sides
+            // rather than falling back to the full guard - see
+            // `State::path` and `merge_order`.
+            let states: Vec<&State<D>> = outs.iter().map(|o| &o.0).collect();
+            let pairs = super::state::merge_order(&states, |i, j| {
+                self.can_join(&outs[i].1, &outs[j].1)
+            });
+            for (i, j) in pairs {
+                let (a, b) = (outs[i].0.clone(), outs[j].0.clone());
+                let Some(m) = merge(&mut self.d, a, b)? else {
+                    continue;
+                };
+                self.merge_fallbacks += m.fell_back as usize;
+                let fl = self.join_flow(&m.cond, &outs[i].1, &outs[j].1);
+                // j > i, so drop the later index first.
+                outs.remove(j);
+                outs.remove(i);
+                outs.push((m.state, fl));
+                continue 'again;
             }
             break;
         }
@@ -606,22 +615,19 @@ impl<'a, D: Domain> Interp<'a, D> {
         mut outs: Multi<D, Value<D>>,
     ) -> Result<Multi<D, Value<D>>> {
         'again: loop {
-            for i in 0..outs.len() {
-                for j in (i + 1)..outs.len() {
-                    if !joinable(&outs[i].1, &outs[j].1) {
-                        continue;
-                    }
-                    let (a, b) = (outs[i].0.clone(), outs[j].0.clone());
-                    let Some(m) = merge(&mut self.d, a, b)? else {
-                        continue;
-                    };
-                    let cond = outs[i].0.guard.clone();
-                    let v = self.join_value(&cond, &outs[i].1.clone(), &outs[j].1.clone());
-                    outs.remove(j);
-                    outs.remove(i);
-                    outs.push((m, v));
-                    continue 'again;
-                }
+            let states: Vec<&State<D>> = outs.iter().map(|o| &o.0).collect();
+            let pairs = super::state::merge_order(&states, |i, j| joinable(&outs[i].1, &outs[j].1));
+            for (i, j) in pairs {
+                let (a, b) = (outs[i].0.clone(), outs[j].0.clone());
+                let Some(m) = merge(&mut self.d, a, b)? else {
+                    continue;
+                };
+                self.merge_fallbacks += m.fell_back as usize;
+                let v = self.join_value(&m.cond, &outs[i].1.clone(), &outs[j].1.clone());
+                outs.remove(j);
+                outs.remove(i);
+                outs.push((m.state, v));
+                continue 'again;
             }
             break;
         }
@@ -1833,7 +1839,7 @@ mod tests {
         let globals = heap.new_table();
         let scope = heap.new_scope(None);
         let t = d.boolean(true);
-        State { heap, globals, scope, stack: Vec::new(), guard: t.clone(), ok: t }
+        State { heap, globals, scope, stack: Vec::new(), guard: t.clone(), ok: t, path: Vec::new() }
     }
 
     /// Run `src` and read back the global `result`.

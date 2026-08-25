@@ -125,6 +125,25 @@ a lane is in no outcome's `live` anyway - see the open question below.
    because the duplicated compute under each fork configuration is
    largely this same unmerged guard algebra.
 
+## Decided with Philippe (2026-08-25)
+
+* The select condition becomes the LOCAL branch decision, not the path
+  guard. Selecting on the guard "unnecessarily selects the false branch
+  in cases where the value is entirely irrelevant" - on lanes outside
+  the merged state's guard the value is never read, so the only thing
+  the select has to get right is which side, and the branch decision
+  says that. Implemented as `State::path` + `Merged::cond`; merges are
+  paired siblings-first so the separating decision exists.
+* The BDD subterm merge is NOT done yet. Measure what the select change
+  alone does to the graph first.
+* Side idea, parked: some booleans are known never to be UNKNOWN at
+  runtime (constants, comparisons of always-known numbers, anything
+  built only from those). Propagating "cannot be unknown" down the
+  graph marks whole subgraphs where two-valued reasoning is exact and
+  the Kleene precision caveat does not apply at all - more aggressive
+  rewriting is safe there. Worth doing once the two-valued/three-valued
+  boundary is a property the graph carries rather than an argument.
+
 ## Open question found on the way (verify, do not assume)
 
 A lane whose branch condition is UNKNOWN at runtime satisfies neither

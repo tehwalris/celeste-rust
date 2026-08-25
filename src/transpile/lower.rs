@@ -628,7 +628,13 @@ impl<'a> Ctx<'a> {
             // all 64 button assignments blended into one arena, and it
             // was wrong twice over. See `plans/tracing.md`.
             Op::Frag(c) => format!("zi_fork_flr({}, {}).0", self.raw(id, 0)?, c),
-            Op::FragOk(c) => format!("zi_fork_flr({}, {}).1", self.raw(id, 0)?, c),
+            // A per-lane boolean like any other guard atom - `zi_fork_flr`
+            // reports validity as a bare mask, and it is always known.
+            Op::FragOk(c) => format!(
+                "ZB {{ val: zi_fork_flr({}, {}).1, known: ALL }}",
+                self.raw(id, 0)?,
+                c
+            ),
             // ---- row key ----
             Op::Bits => {
                 let src = self.r(a[0]);

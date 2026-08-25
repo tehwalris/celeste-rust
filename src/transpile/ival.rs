@@ -247,6 +247,33 @@ mod tests {
         assert_eq!(out.get(map[both as usize]).op, Op::TileFlagAt);
     }
 
+    /// Fork validity is a per-LANE fact, and the interval pass sees a
+    /// hull over every lane. A hull that spans many floors contains lanes
+    /// that span exactly two, so `FragOk(1)` must stay undecided there -
+    /// deciding it false from the hull deleted every fragment-1 path from
+    /// the flat-fork kernels' `live` and lost 38 rows at room (1,0)'s
+    /// first straddle (2026-08-25). A hull inside ONE floor is the one
+    /// case that decides it: no lane in it can straddle.
+    #[test]
+    fn fragment_validity_is_not_decided_from_a_wide_hull() {
+        let mut g = Graph::new();
+        let x = g.leaf(Op::Cell(0));
+        let ok1 = g.fold(Op::FragOk(1), vec![x]);
+        let frag1 = g.fold(Op::Frag(1), vec![x]);
+        let (out, map, _) = fold(&g, &[ok1, frag1], None).expect("folds");
+        assert_eq!(out.get(map[ok1 as usize]).op, Op::FragOk(1), "wide hull: undecided");
+        assert_eq!(out.get(map[frag1 as usize]).op, Op::Frag(1), "the fragment stays a fragment");
+
+        // Inside one floor nothing straddles, so fragment 1 is never valid.
+        let mut g = Graph::new();
+        let lo = g.leaf(Op::Const(65536 * 3 + 1000, 65536 * 3 + 1000));
+        let hi = g.leaf(Op::Const(65536 * 3 + 50000, 65536 * 3 + 50000));
+        let x = g.fold(Op::Span, vec![lo, hi]);
+        let ok1 = g.fold(Op::FragOk(1), vec![x]);
+        let (out, map, _) = fold(&g, &[ok1], None).expect("folds");
+        assert_eq!(out.get(map[ok1 as usize]).op, Op::ConstBool(false));
+    }
+
     /// Folding must not change what the graph computes. Sampled, because
     /// the property is universal quantification over inputs and the
     /// point of the pass is that it holds at all of them.
