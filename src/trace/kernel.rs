@@ -1173,6 +1173,27 @@ fn name_cells(f: &super::verify::Frame, e: anyhow::Error) -> anyhow::Error {
 /// coexist only as separate modules.
 pub fn write_room_kernels(root: &std::path::Path, dir: &std::path::Path) -> Result<Vec<usize>> {
     let refs = room_kernels_in(root)?;
+    write_kernels_from_refs(&refs, dir)
+}
+
+/// As `write_room_kernels`, but the kernels come from the CONSTANT-LATTICE
+/// fixpoint (static objects baked in). Fewer, smaller kernels; each
+/// carries the lattice's `pin_guard` in its `ok`, so a lane whose baked
+/// fields disagree is declined to a fallback. plans/specialize.md.
+pub fn write_room_kernels_lattice(root: &std::path::Path, dir: &std::path::Path) -> Result<Vec<usize>> {
+    let mut lw = room_constant_lattice(root)?;
+    let room = crate::transpile::graph::Room { cart: lw.cart.clone(), cache: lw.cache.clone() };
+    let mut refs: Vec<Reference> = Vec::new();
+    for (_k, f) in std::mem::take(&mut lw.frames) {
+        let bound = super::emit::bind(&f, &lw.graph)?;
+        let lowered = super::emit::lower_frame(&bound.graph, &bound.inputs, &bound.uni, &bound.outcomes, Some(room.clone()), bound.forks)
+            .map_err(|e| name_cells(&f, e))?;
+        refs.push(Reference { frame: f, graph: lw.graph.clone(), bound, lowered, cart: lw.cart.clone(), cache: lw.cache.clone() });
+    }
+    write_kernels_from_refs(&refs, dir)
+}
+
+fn write_kernels_from_refs(refs: &[Reference], dir: &std::path::Path) -> Result<Vec<usize>> {
     std::fs::create_dir_all(dir)?;
     let mut sizes = Vec::new();
     let mut sources: Vec<String> = Vec::new();
@@ -2412,6 +2433,7 @@ pub fn room_constant_lattice(root: &std::path::Path) -> Result<LatticeWalk> {
     let mut reps: std::collections::BTreeMap<String, super::state::State<Symbolic>> = Default::default();
     let mut forks: std::collections::BTreeMap<String, usize> = Default::default();
     let mut frames: std::collections::BTreeMap<String, super::verify::Frame> = Default::default();
+    let mut forkops: std::collections::BTreeMap<String, Vec<String>> = Default::default();
 
     let sk = key(&start)?;
     lattice.insert(sk.clone(), shapes::field_constants(&start, &it.d)?);
@@ -2446,6 +2468,16 @@ pub fn room_constant_lattice(root: &std::path::Path) -> Result<LatticeWalk> {
             let mut fs = std::collections::BTreeSet::new();
             for id in 0..it.d.graph.len() { if reach[id] { if let Op::Split(d) = it.d.graph.get(id as u32).op { fs.insert(d); } } }
             forks.insert(k.clone(), fs.len());
+            if fs.len() > 2 {
+                let mut ops = Vec::new();
+                for id in 0..it.d.graph.len() {
+                    if reach[id] { if let Op::Split(_) = it.d.graph.get(id as u32).op {
+                        let operand = it.d.graph.get(id as u32).args[0];
+                        ops.push(super::emit::show_tree(&it.d.graph, operand, 5));
+                    } }
+                }
+                forkops.insert(k.clone(), ops);
+            }
         }
         // Keep the converged frame for generation (last trace wins).
         for o in &f.outs {
@@ -2472,7 +2504,7 @@ pub fn room_constant_lattice(root: &std::path::Path) -> Result<LatticeWalk> {
         frames.insert(k.clone(), f);
     }
     let graph = std::mem::take(&mut it.d.graph);
-    Ok(LatticeWalk { lattice, reps, forks, frames, graph, cart: cart_data, cache })
+    Ok(LatticeWalk { lattice, reps, forks, frames, graph, cart: cart_data, cache, forkops })
 }
 
 /// The output of `room_constant_lattice`.
@@ -2484,11 +2516,12 @@ pub struct LatticeWalk {
     pub graph: crate::transpile::graph::Graph,
     pub cart: std::sync::Arc<celeste_core::cart_data::CartData>,
     pub cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
+    pub forkops: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 /// Report the constant lattice for `transpile --room-consts`.
 pub fn room_constants(root: &std::path::Path) -> Result<String> {
-    let LatticeWalk { lattice, forks, mut frames, graph, cart, cache, .. } = room_constant_lattice(root)?;
+    let LatticeWalk { lattice, forks, mut frames, graph, cart, cache, forkops, .. } = room_constant_lattice(root)?;
     let room = crate::transpile::graph::Room { cart: cart.clone(), cache: cache.clone() };
     // Bind+lower each converged frame to get the emitted size.
     let mut lines_by_shape: std::collections::BTreeMap<String, usize> = Default::default();
@@ -2506,6 +2539,9 @@ pub fn room_constants(root: &std::path::Path) -> Result<String> {
             .filter(|s| s.contains("objects[") && s.contains(".spd")).collect();
         out.push_str(&format!("shape {}: {} const fields, {} forks, {} body lines\n",
             i, cm.len(), forks.get(k).copied().unwrap_or(999), lines_by_shape.get(k).copied().unwrap_or(0)));
+        if let Some(ops) = forkops.get(k) {
+            for o in ops.iter().take(4) { out.push_str(&format!("    fork: {}\n", o)); }
+        }
         let _ = spd;
     }
     out.push_str(&format!("total body lines (lattice): {}\n", lines_by_shape.values().sum::<usize>()));

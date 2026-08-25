@@ -856,3 +856,27 @@ So the decomposition is clean:
 range once the player-speed forks come out, and the fixpoint's 18 shapes
 (vs 36) means far fewer kernels. This is the path to a checkable-in
 room (2,0).
+
+## Lattice kernel generation built (2026-08-25)
+
+`write_room_kernels_lattice` + `transpile --room-kernels-lattice DIR`
+render the 18 constant-lattice kernels (each with the lattice's
+`pin_guard` baked into `ok`). This is the artifact path; the abstract
+`write_room_kernels` is unchanged so room (1,0) is unaffected.
+
+Validation ladder before this can be trusted/used (in order):
+1. **Compiles** (emitter correctness) - the rendered kernels type-check.
+2. **Differential** (semantic correctness) - lattice kernels vs the
+   interpreter's row-key sets on room (2,0). Needs the kernels wired into
+   `compiled::dispatch` behind `CELESTE_COMPILED_FORWARD=check`, which
+   room (2,0) does not have yet. THIS is the gate that matters and is not
+   done - until it passes, the lattice is a measurement, not a shipping
+   kernel set.
+3. **Coverage** - confirm the 18 shapes cover every reachable shape (the
+   fixpoint's optimism, guarded by pin_guard + base fallback).
+
+ASSUMPTION carried: the lattice's constants (esp. springs' spd=0) are
+truly constant, so the 18 shapes are complete and the kernels are sound.
+This is believed (springs never write spd) but UNVERIFIED by the
+differential gate. Do not check in or default-enable the lattice kernels
+until gate 2 passes.
