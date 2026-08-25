@@ -2098,9 +2098,9 @@ pub fn specialize_probe(
 
     let mut pin: Vec<(Vec<Step>, Conc)> = Vec::new();
     // The player position.
+    let nopos = std::env::var("CELESTE_SPEC_NOPOS").is_ok();
     if let Some(pl) = players.first() {
-        pin.push((fld(pl, &["x"]), num(player_xy.0)));
-        pin.push((fld(pl, &["y"]), num(player_xy.1)));
+        if !nopos { pin.push((fld(pl, &["x"]), num(player_xy.0))); pin.push((fld(pl, &["y"]), num(player_xy.1))); }
         // pm1 key on the player, canonical "steady" values.
         pin.push((fld(pl, &["dash_time"]), num(0)));
         pin.push((fld(pl, &["p_dash"]), Conc::Bool(false)));
@@ -2117,6 +2117,22 @@ pub fn specialize_probe(
         if let Some((x, y)) = spring_xy.get(i) {
             pin.push((fld(sp, &["x"]), num(*x)));
             pin.push((fld(sp, &["y"]), num(*y)));
+        }
+        // CELESTE_SPEC_SFIELDS: dotted spring field paths to pin, e.g.
+        // "spr,hide_for,hide_in,delay". spr defaults to 18 (active).
+        for spec in std::env::var("CELESTE_SPEC_SFIELDS").unwrap_or_default().split(',') {
+            let spec = spec.trim();
+            if spec.is_empty() { continue; }
+            let parts: Vec<&str> = spec.split('.').collect();
+            let path = fld(sp, &parts);
+            let v = if spec == "spr" { num(18) } else { num(0) };
+            if super::shapes::state_paths(&st).unwrap_or_default().iter().any(|r| r == &path) && !pin.iter().any(|(q,_)| q==&path) {
+                match iface::get(&st, &path) {
+                    Some(Value::Bool(_)) => pin.push((path, Conc::Bool(false))),
+                    Some(Value::Num(_)) => pin.push((path, v)),
+                    _ => {}
+                }
+            }
         }
         if groups.contains("springall") {
             for f in super::shapes::state_paths(&st).unwrap_or_default() {
@@ -2160,6 +2176,21 @@ pub fn specialize_probe(
                         _ => {}
                     }
                 }
+            }
+        }
+    }
+    // CELESTE_SPEC_HITBOX: pin player hitbox (1,3,6,5) and spring
+    // hitbox (0,0,8,8) - the type-fixed values - to test whether the
+    // symbolic hitbox is what blocks collide from folding.
+    if std::env::var("CELESTE_SPEC_HITBOX").is_ok() {
+        if let Some(pl) = players.first() {
+            for (f, v) in [("x", 1), ("y", 3), ("w", 6), ("h", 5)] {
+                pin.push((fld(pl, &["hitbox", f]), num(v)));
+            }
+        }
+        for sp in &springs {
+            for (f, v) in [("x", 0), ("y", 0), ("w", 8), ("h", 8)] {
+                pin.push((fld(sp, &["hitbox", f]), num(v)));
             }
         }
     }

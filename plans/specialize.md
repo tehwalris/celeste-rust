@@ -151,3 +151,46 @@ That is harder - velocity is not a small enumerable set the way reachable
 positions are. But FIRST resolve the collide question: a large part of
 the blow-up may be the spurious spring coupling, which is a correctness
 bug to fix rather than an abstraction to specialize around.
+
+## Result 2: the spring bounce is UNCONDITIONAL - a collide bug (2026-08-25)
+
+Chased the position-blindness to a definite conclusion. Traced room
+(2,0) shape 3 with the player position SYMBOLIC and everything else
+concrete (spd=0, spring spr=18/hide_for=0/active, hitboxes at their
+type values). Result: the player's `spd.y` becomes **-3 (the spring
+bounce, line 307) as a CONSTANT** - not gated on the player position,
+not gated on the collide box test, not gated on anything but the
+spring being active.
+
+Tested across player positions (10,20), (40,40), (60,40), (1000,1000):
+byte-identical bounce. Tested with hitboxes pinned to their real values
+(player {1,3,6,5}, spring {0,0,8,8}): still unconditional. So
+`this.collide(player,0,0)` in `spring.update` returns the player
+**regardless of position** - the box-overlap test is not being
+evaluated against the player's coordinates at all.
+
+This is a real bug/over-approximation in the tracer's `collide`, and it
+is significant on two fronts:
+
+* **Correctness.** A spring bounces the player every frame it is active,
+  even when the player is nowhere near it. Room (2,0)'s traced kernels
+  are not differentially tested at depth (only room (1,0) is), so this
+  has gone uncaught. If the concrete oracle shares the bug it is a
+  tracer bug; if only the symbolic path has it, it is a domain bug.
+* **Size.** This spurious coupling is a big part of why room (2,0)
+  explodes: the player's move is forked/duplicated across every active
+  spring's (nonexistent) bounce, and the death/exit flags inherit the
+  coupling. Fixing collide to actually read positions likely collapses
+  much of the room-(2,0) blow-up on its own - BEFORE any specialization.
+
+### This reframes the whole task
+
+The room-(2,0) node explosion is not (mainly) an abstraction-granularity
+problem to solve with position specialization. A large part of it is a
+COLLIDE BUG. The order of work should be:
+1. Root-cause and fix `collide` (find why it ignores position).
+2. Re-measure room (2,0) - the explosion may largely vanish.
+3. THEN decide whether specialization is still needed, and on what axis.
+
+Position specialization was the wrong first lever (Result 1); the collide
+bug is the real one.
