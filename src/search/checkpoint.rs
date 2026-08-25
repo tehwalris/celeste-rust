@@ -159,11 +159,9 @@ impl CampaignConfig {
     }
 
     /// See the `compiled_engine` field. Reads the compile recipe TEXT (the
-    /// class kernels are byte-gated against it by `generated_is_current` +
-    /// the suite, so the text is a faithful proxy for them); the fused
-    /// artifact contributes its own embedded hash because it is generated
-    /// per campaign and never checked in, and the traced set contributes
-    /// one because no file the fingerprint reads determines it.
+    /// program the compiled path's boundary was ported from), and the
+    /// traced kernel set contributes its own content hash because no file
+    /// the fingerprint reads determines it.
     fn compiled_engine_fingerprint() -> Option<u64> {
         match std::env::var("CELESTE_COMPILED_FORWARD") {
             Err(_) => None,
@@ -174,7 +172,6 @@ impl CampaignConfig {
                 std::fs::read_to_string("rewrites-compile.jsonl")
                     .unwrap_or_default()
                     .hash(&mut h);
-                crate::compiled::dispatch::fused_artifact_fingerprint().hash(&mut h);
                 crate::compiled::dispatch::traced_set_fingerprint().hash(&mut h);
                 Some(h.finish())
             }

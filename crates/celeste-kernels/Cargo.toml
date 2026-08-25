@@ -7,8 +7,3 @@ edition = "2021"
 celeste-core = { path = "../celeste-core" }
 celeste-engine = { path = "../celeste-engine" }
 
-[features]
-# Compile the fused specialization-set artifact (fused_gen_player.rs).
-# That file is GENERATED PER CAMPAIGN by `transpile --fuse` and is
-# gitignored - building with this feature requires generating it first.
-fused = []

@@ -7,16 +7,14 @@
 //! run N frames and print lane counts (`--abstract`), run ONE frame from a
 //! real checkpoint and check its row-key set against the interpreter's
 //! (`--abstract-bench`, gate 2), and the kernel-authoring tools
-//! (`--row-census`, `--emit-shape`, `--kernel-bench`).
+//! (`--row-census`, `--emit-shape`).
 //!
 //! It stays a separate binary on purpose: the gates drive the engine
 //! directly, one frame at a time, from checkpoint states, which is not
 //! something the campaign binaries do.
 
-use celeste_engine::{kernel, runtime2};
-use celeste_kernels::kernel_gen_steady;
+use celeste_engine::runtime2;
 use celeste_names as gen;
-use kernel_gen_steady as kernel_gen;
 
 use celeste_rust::compiled::bridge as import;
 use celeste_rust::compiled::dispatch;
@@ -110,7 +108,6 @@ fn main() {
     let mut abstract_bench: Option<(String, u32)> = None;
     let mut row_census: Option<(String, u32)> = None;
     let mut emit_shape: Option<(String, u32, String, String, String)> = None;
-    let mut kernel_bench: Option<(String, u32)> = None;
     let mut interp_bench: Option<(String, u32)> = None;
     let mut frame_diff: Option<(String, u32, String)> = None;
     let mut dedup_bench: Option<(String, u32)> = None;
@@ -173,11 +170,6 @@ fn main() {
                 let f: u32 = args.next().expect("FRAME").parse().unwrap();
                 key_gate_outputs = Some((dir, f));
             }
-            "--kernel-bench" => {
-                let dir = args.next().expect("--kernel-bench needs DIR FRAME");
-                let frame: u32 = args.next().expect("FRAME").parse().unwrap();
-                kernel_bench = Some((dir, frame));
-            }
             other => panic!("unknown argument {:?}", other),
         }
     }
@@ -188,8 +180,6 @@ fn main() {
         run_row_census(&dir, frame);
     } else if let Some((dir, frame, out, class, shape)) = emit_shape {
         run_emit_shape(&dir, frame, &out, &class, &shape);
-    } else if let Some((dir, frame)) = kernel_bench {
-        run_kernel_bench(&dir, frame, reps);
     } else if let Some((dir, frame)) = interp_bench {
         run_interp_bench(&dir, frame, reps);
     } else if let Some((dir, frame, out)) = frame_diff {
@@ -203,7 +193,7 @@ fn main() {
     } else if let Some((dir, frame)) = abstract_bench {
         run_abstract_bench(&dir, frame, reps);
     } else {
-        panic!("nothing to do - pass --abstract N, --abstract-bench DIR FRAME, --row-census, --emit-shape, --kernel-bench, --interp-bench, --frame-diff, --dedup-bench, --key-gate DIR LO HI or --key-gate-outputs DIR FRAME");
+        panic!("nothing to do - pass --abstract N, --abstract-bench DIR FRAME, --row-census, --emit-shape, --interp-bench, --frame-diff, --dedup-bench, --key-gate DIR LO HI or --key-gate-outputs DIR FRAME");
     }
 }
 
@@ -648,216 +638,18 @@ fn run_emit_shape(dir: &str, frame: u32, out_path: &str, class: &str, shape: &st
     );
 }
 
-/// The compiled engine (plans/kernel-plan.md K3): run one chunk through the
-/// steady-class lane kernel. Returns true if the chunk was handled -
-/// output blocks (boundary applied) pushed to `done`, any deopted input
-/// rows re-queued on `local` for the reference paths. Returns false
-/// (nothing committed) when the chunk cannot bind or a uniform premise
-/// fails (bd): the whole chunk then takes the reference path.
-fn run_kernel_bench(dir: &str, frame: u32, reps: u32) {
-    use std::time::Instant;
-    let (cart, cache) = world();
-    let eng = engine();
-    let ids = eng.ids();
-    let states = load_states_any(dir, frame);
-    // The kernel's class is (shape, pm1): shape_hash is structural only,
-    // so the pm1 cells are checked on the interpreter side.
-    let is_steady = |st: &celeste_rust::interpreter::state::State| -> bool {
-        use celeste_rust::interpreter::value::{HeapValue, MaybeVector, Value};
-        let names = celeste_rust::interpreter::merge_dump::cell_names(st);
-        names.iter().all(|(cell, name)| {
-            if name != "freeze" && !name.ends_with(".dash_time") {
-                return true;
-            }
-            matches!(
-                st.heap
-                    .get_opt(celeste_rust::interpreter::heap::HeapId::from_raw(*cell)),
-                Some(HeapValue::Value(Value::Number(MaybeVector::Scalar(n))))
-                    if n.whole_part_as_i16() == 0 && n.fraction_part_as_u16() == 0
-            )
-        })
-    };
-    let steady: Vec<runtime2::Rt2> = states
-        .iter()
-        .filter(|st| is_steady(st))
-        .map(|st| import::import_block(st, cart.clone(), cache.clone()))
-        .filter(|b| b.shape_hash == kernel_gen::SHAPE_HASH)
-        .collect();
-    let lanes_in: usize = steady.iter().map(|b| b.width).sum();
-    println!(
-        "[kernel-bench] f{:03}: {} steady blocks, {} lanes (of {} total)",
-        frame,
-        steady.len(),
-        lanes_in,
-        states.iter().map(|s| s.vector_size).sum::<usize>()
-    );
-    let g = kernel_gen::G { cart, cache };
-
-    // ---- gate: row-key set equality vs the certified frame pipeline ----
-    // CELESTE_KERNEL_GATE=0 skips it (profiling runs: the perf data
-    // then covers only the timed kernel loop).
-    let run_gate = std::env::var("CELESTE_KERNEL_GATE").map(|v| v != "0").unwrap_or(true);
-    let mut census: rustc_hash::FxHashMap<&'static str, (u64, u64, u64)> = Default::default();
-    if run_gate {
-    eprintln!("[gate] running the reference pipeline...");
-    let ref_blocks = eng.step(
-        steady.iter().map(|b| b.clone_block()).collect(),
-        &mut census,
-    );
-    eprintln!("[gate] reference done; running the kernel...");
-    let mut ref_keys: rustc_hash::FxHashSet<(u64, u64)> = Default::default();
-    for b in &ref_blocks {
-        ref_keys.extend(b.row_keys.iter().copied());
-    }
-    let mut kern_keys: rustc_hash::FxHashSet<(u64, u64)> = Default::default();
-    let (mut deopt_lanes, mut bd_slices) = (0u64, 0u64);
-    for chunk in &steady {
-        let uni = kernel_gen::bind(chunk).expect("bind failed on a steady block");
-        // Input rows any variant deopted on: they take the reference
-        // path afterwards (exactly the integration architecture).
-        let mut deopt_rows: std::collections::BTreeSet<u32> = Default::default();
-        let mut lo = 0usize;
-        while lo < chunk.width {
-            let n = (chunk.width - lo).min(kernel::W);
-            let width_mask: u16 =
-                if n == kernel::W { 0xffff } else { (1u16 << n) - 1 };
-            let rin = kernel_gen::rows(chunk, lo).expect("rows");
-            kernel_gen::frame(&uni, &rin, &g, &mut |_b, osh, kout| {
-                if kout.bd {
-                    bd_slices += 1;
-                    for i in 0..n {
-                        deopt_rows.insert((lo + i) as u32);
-                    }
-                    return;
-                }
-                let dead = kout.deopt & kout.valid & width_mask;
-                deopt_lanes += dead.count_ones() as u64;
-                for i in 0..n {
-                    if dead & (1 << i) != 0 {
-                        deopt_rows.insert((lo + i) as u32);
-                    }
-                }
-                let live = kout.valid & !kout.deopt & width_mask;
-                if live == 0 {
-                    return;
-                }
-                let mut ob = dispatch::slice_block(chunk, lo, n);
-                kernel_gen::apply(osh, kout, &mut ob, n);
-                if dead != 0 {
-                    let keep: Vec<u32> =
-                        (0..n as u32).filter(|i| live & (1 << i) != 0).collect();
-                    ob.retain_lanes(&keep);
-                }
-                ob.boundary(&ids);
-                kern_keys.extend(ob.row_keys.iter().copied());
-            });
-            lo += n;
-        }
-        if !deopt_rows.is_empty() {
-            // Reference re-run of the deopted input rows (all 64 button
-            // variants come from the UBool fan-out; overlap with lanes
-            // the kernel did handle is harmless under set semantics).
-            let keep: Vec<u32> = deopt_rows.iter().copied().collect();
-            let mut sub = chunk.clone_block();
-            sub.retain_lanes(&keep);
-            for b in eng.step(vec![sub], &mut census) {
-                kern_keys.extend(b.row_keys.iter().copied());
-            }
-        }
-    }
-    let missing: Vec<_> = ref_keys.difference(&kern_keys).collect();
-    let extra: Vec<_> = kern_keys.difference(&ref_keys).collect();
-    println!(
-        "gate: ref {} keys, kernel {} keys, {} missing, {} extra, {} deopt lane-variants, {} bd slices",
-        ref_keys.len(),
-        kern_keys.len(),
-        missing.len(),
-        extra.len(),
-        deopt_lanes,
-        bd_slices
-    );
-    if !missing.is_empty() || !extra.is_empty() {
-        println!("gate: FAILED");
-        std::process::exit(1);
-    }
-    println!("gate: row-key SET EQUAL - kernel + deopt-to-reference EXACT on the steady class");
-    } // run_gate
-
-    // ---- timing: kernel-only (bind + gather + frame), no materialize ----
-    //
-    // CELESTE_KERNEL_BENCH_THREADS=T runs the SAME loop on T threads, each
-    // taking every T-th W-row slice. Slices are independent by
-    // construction (the kernel reads its rows and writes to the caller's
-    // callback), so this is the kernel's parallel roofline with none of
-    // the pipeline around it - not a claim about the engine, which also
-    // has to materialize, dedup and merge.
-    let threads: usize = std::env::var("CELESTE_KERNEL_BENCH_THREADS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1);
-    let run_once = |tid: usize| {
-        let mut sink = 0u64;
-        let mut slice = 0usize;
-        for chunk in &steady {
-            let uni = kernel_gen::bind(chunk).expect("bind");
-            let mut lo = 0usize;
-            while lo < chunk.width {
-                if slice % threads == tid {
-                    let rin = kernel_gen::rows(chunk, lo).expect("rows");
-                    kernel_gen::frame(&uni, &rin, &g, &mut |b, osh, kout| {
-                        sink = sink.wrapping_add(kout.deopt as u64).wrapping_add(b as u64);
-                        std::hint::black_box(osh);
-                        std::hint::black_box(kout);
-                    });
-                }
-                slice += 1;
-                lo += kernel::W;
-            }
-        }
-        std::hint::black_box(sink);
-    };
-    let mut best = f64::INFINITY;
-    for _ in 0..reps {
-        let t0 = Instant::now();
-        if threads == 1 {
-            run_once(0);
-        } else {
-            std::thread::scope(|scope| {
-                for tid in 0..threads {
-                    let run_once = &run_once;
-                    scope.spawn(move || run_once(tid));
-                }
-            });
-        }
-        let dt = t0.elapsed().as_secs_f64();
-        best = best.min(dt);
-    }
-    let row_btns = lanes_in as f64 * 64.0;
-    println!(
-        "kernel: {} lanes x 64 inputs, {} thread(s), best of {}: {:.2} ms  \
-         ({:.2} ns per row-input-frame, {:.0} ns/input-lane)",
-        lanes_in,
-        threads,
-        reps,
-        best * 1e3,
-        best * 1e9 / row_btns,
-        best * 1e9 / lanes_in as f64
-    );
-}
-
-
 /// The INTERPRETER's frame body on the same input, for scale.
 ///
-/// `--interp-bench DIR FRAME` is `--kernel-bench`'s counterpart: same
-/// checkpoint states, same "frame body only" boundary (no abstraction, no
-/// dedup, no merge), same best-of-N, same normalization. What it runs is
+/// `--interp-bench DIR FRAME` was the class-kernel `--kernel-bench`'s
+/// counterpart (that mode went with the class kernels): same checkpoint
+/// states, "frame body only" boundary (no abstraction, no dedup, no
+/// merge), best-of-N, normalization. What it runs is
 /// `interpret_prepared_cfg` on the CAMPAIGN's recipe (`rewrites.jsonl`),
 /// not the compile overlay - the overlay's `expand_bool` was measured at
 /// +19% on the interpreter, so this is the interpreter at its best rather
 /// than the interpreter handicapped by the compiled path's program.
 ///
-/// Two knobs, both shared with `--kernel-bench` so the two are read off
-/// the same axes: `CELESTE_KERNEL_BENCH_THREADS=T` and
+/// Two knobs: `CELESTE_KERNEL_BENCH_THREADS=T` and
 /// `CELESTE_INTERP_BENCH_LANES=N` (the per-chunk lane cap, which is what
 /// the interpreter's vectorization amortizes over).
 fn run_interp_bench(dir: &str, frame: u32, reps: u32) {

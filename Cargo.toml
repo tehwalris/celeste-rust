@@ -56,13 +56,6 @@ elsa = "1.10"
 memmap2 = "0.9"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
-[features]
-# The fused specialization-set kernel (plans/shape-tag-plan.md). The
-# artifact is generated per campaign by `transpile --fuse` (gitignored in
-# celeste-kernels); building with this feature requires generating it
-# first. Runtime opt-out: CELESTE_FUSED=0.
-fused = ["celeste-kernels/fused"]
-
 [[bin]]
 name = "concrete_run"
 path = "src/bin/concrete_run.rs"
