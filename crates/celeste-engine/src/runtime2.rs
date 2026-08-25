@@ -156,7 +156,22 @@ pub struct Rt2 {
     pub stat_splits: u64,
     pub stat_appended: u64,
     pub stat_arena_peak: usize,
-    /// Frame-start lane each current lane derives from (splits append).
+    /// OPTIONAL per-lane origin metadata (empty = untracked; else
+    /// `len == width`). Two users:
+    ///
+    /// * `expand_buttons` tracks the frame-start lane each current lane
+    ///   derives from (splits append).
+    /// * The engine-carried origin column (plans/kernel-ladder.md "the
+    ///   passthrough column"): the backward sweep and the pos-graph
+    ///   replay attribute each output row to the input lane that
+    ///   produced it. The kernels write it per appended row, every lane
+    ///   permutation (retain/slice/merge) carries it, and
+    ///   `boundary_finish` MIXES it into the per-lane row key - so a
+    ///   dedup never collapses two rows with different origins, exactly
+    ///   the semantics the interpreter path gets from carrying the
+    ///   origin as a per-lane heap global. It is engine METADATA: it is
+    ///   not part of the heap, the shape hash, or any column, so the
+    ///   kernels bind tagged blocks like any other.
     pub origin: Vec<u32>,
     /// COW lane maps (plans/columnar-engine.md "COW/lane-indirection"):
     /// one entry per widen this frame, (width_before, map current-lane ->
@@ -296,9 +311,11 @@ impl Rt2 {
         map.extend(0..old_w as u32);
         map.extend(srcs.iter().map(|&s| s as u32));
         self.history.push((old_w, map));
-        for &s in srcs {
-            let o = self.origin[s];
-            self.origin.push(o);
+        if !self.origin.is_empty() {
+            for &s in srcs {
+                let o = self.origin[s];
+                self.origin.push(o);
+            }
         }
         self.width += srcs.len();
         self.rec("widen", t);
@@ -1003,6 +1020,24 @@ impl Rt2 {
                 mix64(part2.wrapping_add(h2[i])),
             ))
             .collect();
+
+        // Engine-carried origin (see the `origin` field): mix each lane's
+        // origin into its row key, so no dedup - the in-block one below,
+        // the cross-block one, or a later merge's - ever collapses two
+        // rows that came from different origins. That is exactly what the
+        // interpreter path gets from carrying the origin as a per-lane
+        // heap global, and it is what makes the (origin, row key) pair
+        // set the kernels hand back equal to the interpreter's. `mix64`
+        // is a bijection, so for a fixed row two distinct origins can
+        // never produce the same mixed key.
+        if !self.origin.is_empty() {
+            assert_eq!(self.origin.len(), w, "origin column length at the boundary");
+            for (key, &o) in self.row_keys.iter_mut().zip(&self.origin) {
+                let m = mix64(0x517c_c1b7_2722_0a95 ^ o as u64);
+                key.0 = mix64(key.0 ^ m);
+                key.1 = mix64(key.1 ^ m);
+            }
+        }
     }
 
     /// The boundary's tail: dedup within the block (keeping the first lane
@@ -1203,6 +1238,9 @@ impl Rt2 {
         if !self.row_keys.is_empty() {
             self.row_keys = keep.iter().map(|&i| self.row_keys[i as usize]).collect();
         }
+        if !self.origin.is_empty() {
+            self.origin = keep.iter().map(|&i| self.origin[i as usize]).collect();
+        }
         self.width = keep.len();
     }
 
@@ -1391,7 +1429,11 @@ impl Rt2 {
             stat_arena_peak: self.stat_arena_peak,
             pool: Vec::new(),
             census: self.census.as_ref().map(|_| FxHashMap::default()),
-            origin: Vec::new(),
+            origin: if self.origin.is_empty() {
+                Vec::new()
+            } else {
+                self.origin[lo..hi].to_vec()
+            },
             history: Vec::new(),
             shape_hash: self.shape_hash,
             row_keys: Vec::new(),
@@ -1460,6 +1502,14 @@ impl Rt2 {
         }
         for b in &blocks {
             host.row_keys.extend_from_slice(&b.row_keys);
+            // Origin metadata is all-or-nothing across a merge: a mixed
+            // merge would silently mis-attribute the untracked lanes.
+            assert_eq!(
+                host.origin.is_empty(),
+                b.origin.is_empty(),
+                "merge of origin-tracked and untracked blocks"
+            );
+            host.origin.extend_from_slice(&b.origin);
         }
         host.width = total;
         host

@@ -550,7 +550,9 @@ pub fn backward_sweep_time(
     let mut engine = AbstractRun::start_with_deopt(program, plain, mapping.clone(), false)?;
     register_variants(&mut engine, mapping, variants(program)?)?;
     engine.disable_frontier();
-    engine.interpret_origin_replays();
+    // The origin column rides the compiled engine as block METADATA
+    // (`Rt2::origin`, plans/kernel-ladder.md "the passthrough column"),
+    // so this replay runs on the kernels whenever the forward pass does.
     // This loop reads (origin, row key) pairs off each output state and
     // discards the states; merging them by shape first is work thrown
     // away. See `skip_boundary_merge` for what changes - `out_of_table`

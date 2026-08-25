@@ -1512,9 +1512,6 @@ impl AbstractRun {
         }
     }
 
-    /// Turn frontier subtraction off (regardless of the env flag). The
-    /// backward sweep expands saved frontier batches one frame at a time and
-    /// must see every successor lane, not just never-seen ones.
     /// Leave the frame's output as fragments: abstract and GC them, but do
     /// not group and merge them by shape.
     ///
@@ -1537,34 +1534,13 @@ impl AbstractRun {
     /// consumer of the pairs must therefore be idempotent per (origin, key)
     /// - the sweep's `newly` bitset is - and pure COUNTS over the pairs
     /// change. `out_of_table` is the one that does; it is a diagnostic.
-    /// Drop the compiled engine for an ORIGIN-TAGGED replay (the backward
-    /// sweep, the pos-graph replay), loudly.
-    ///
-    /// Those replays attribute outputs to inputs by injecting a per-lane
-    /// u32 column as a global (`__sweep_origin` / the pos tag);
-    /// `bridge::import_block` drops globals outside `GLOBAL_NAMES`, and no
-    /// kernel carries the column through to its outputs - so a
-    /// kernel-served chunk would come back with the origins GONE and the
-    /// replay would fail its origin/key length check on every such chunk.
-    /// Until the passthrough exists (plans/kernel-ladder.md "the
-    /// passthrough column"), these replays run on the interpreter, and
-    /// this says so rather than failing mid-sweep. Sound: the per-chunk
-    /// check gate is exactly the claim that both engines produce the same
-    /// row sets from the same chunks.
-    pub fn interpret_origin_replays(&mut self) {
-        if self.compiled.take().is_some() {
-            println!(
-                "origin-tagged replay: the compiled engine is DISABLED (no origin \
-                 passthrough yet - plans/kernel-ladder.md); this replay runs on \
-                 the interpreter"
-            );
-        }
-    }
-
     pub fn skip_boundary_merge(&mut self) {
         self.skip_merge = true;
     }
 
+    /// Turn frontier subtraction off (regardless of the env flag). The
+    /// backward sweep expands saved frontier batches one frame at a time and
+    /// must see every successor lane, not just never-seen ones.
     pub fn disable_frontier(&mut self) {
         self.visited_rows = None;
     }
@@ -2117,25 +2093,18 @@ fn interpret_state_base(
     compiled: Option<&'static CompiledForward>,
 ) -> Result<Vec<State>> {
     // What the compiled frame body cannot serve. Refused here rather than
-    // at construction because both are set AFTER `start` and can be turned
+    // at construction because it is set AFTER `start` and can be turned
     // on at any point in a run; a check that only ran once would miss
     // exactly the case it exists for.
     //
-    // Neither is fundamental. Variants need the compiled path to know the
-    // per-shape program a variant selects; pos-graph recording needs the
-    // kernels to carry the per-lane origin tag, which today just changes
-    // the shape hash so no kernel binds - correct, but worth zero, and
-    // silently worth zero is the worst kind.
-    if compiled.is_some() {
-        if variants.is_some() {
-            anyhow::bail!("CELESTE_COMPILED_FORWARD does not support --variant dispatch");
-        }
-        if pos_obs.is_some() {
-            anyhow::bail!(
-                "CELESTE_COMPILED_FORWARD does not support position-graph recording \
-                 (no kernel binds a tagged shape, so it would be a slow interpreter run)"
-            );
-        }
+    // Not fundamental: variants need the compiled path to know the
+    // per-shape program a variant selects. (Pos-graph recording used to
+    // be refused here too; the engine carries the per-lane origin as
+    // block metadata now - `Rt2::origin`, plans/kernel-ladder.md "the
+    // passthrough column" - so tagged chunks bind their kernels like any
+    // other.)
+    if compiled.is_some() && variants.is_some() {
+        anyhow::bail!("CELESTE_COMPILED_FORWARD does not support --variant dispatch");
     }
     // Tag each input lane with its own cell before the state is consumed.
     // This is the only place that has both sides of a chunk's transition.

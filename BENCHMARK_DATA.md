@@ -1,3 +1,52 @@
+# The origin passthrough: sweep + pos-graph on kernels (2026-08-26)
+
+The backward sweep and the pos-graph recording were the ladder's last
+interpreter dependency: their per-lane origin column (a heap global) kept
+every kernel from binding, so `KERNELS=1` dropped the engine for those
+stages. The origin is engine METADATA now (`Rt2::origin`,
+plans/kernel-ladder.md "the passthrough column"): the bridge moves the tag
+global into block metadata on import and back on export, the generated
+`append{i}` records each row's input-lane origin, and the origin is mixed
+into every dedup key so distinct origins never collapse - the exact
+semantics the injected global had. `interpret_origin_replays` is deleted;
+`ladder.sh KERNELS=1` no longer forces `FUSE=0`.
+
+GATE (room (1,0), synthetic win (64,44), H=68, 16 threads; ONE
+kernel-strict forward pass as the fixture, then each replay stage run
+twice on copies - interpreter (`CELESTE_KERNEL=0`) vs kernels (strict,
+missed 0)):
+
+| stage | interpreter | kernels | artifact |
+|---|---|---|---|
+| `pos-graph --frames 68` | 141,236 pairs, 136 s wall | same pairs, 167 s | `posgraph.bin` **byte-identical** |
+| `sweep --frames 68 --horizon 68` | 511,124 of 55,958,742 reach the exit, optimal 64, 75 s | identical, 64 s | `g.bin` **byte-identical** |
+| `bench --record-pos-graph` (fused, kernels) | - | 174 s | row table **identical** (onlyA=0 onlyB=0), table = replay's + the 1 spawn pair |
+
+Walls are single runs, not claims - the point of this campaign is the
+interpreter OUT of the ladder, not speed. Two honest observations:
+
+* The kernel pos-graph replay is ~1.2x SLOWER than the interpreter path
+  here. Origin-tagged chunks dedup per (origin, row), so the in-kernel
+  dedup - the engine's main lever - finds almost nothing, while the
+  bridge (import + export + tag re-injection) is paid in full. The sweep
+  is ~1.2x faster on kernels. Nobody should quote either without a
+  proper A/B.
+* `out_of_table`: 7,972,684 on the interpreter replay of this
+  KERNEL-BUILT forward pass, 0 on the kernel replay. The interpreter's
+  UnknownBool handling is lane-grouping-sensitive, and the sweep's
+  candidate gather groups lanes differently from the engine's forward
+  partition, so the interpreter replay reaches (widened) rows the
+  engine's table never contained - the documented benign direction, and
+  `g.bin` identity shows no qualifier was affected. The kernels are
+  lane-wise, so their replay lands exactly in the table.
+
+Unit gates: `kernel_replays_carry_origins_like_the_interpreter`
+((origin, row key) pair-set identity against the interpreter, both the
+sweep's distinct-id tagging and the recorder's repeating-cell tagging,
+strict + coverage asserted) and
+`check_mode_compares_origin_pairs_without_false_alarms` (check mode now
+compares pair sets when a tag is present).
+
 # (2,0) dying members straightened + kernels wired; fused set blocked on corpse-gate blending (2026-08-21, afternoon)
 
 Both (2,0) dying overlays are now BRANCH-FREE (0 conditional branches,

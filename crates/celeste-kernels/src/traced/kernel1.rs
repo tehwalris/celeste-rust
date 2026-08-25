@@ -2702,9 +2702,15 @@ pub fn acc0(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
 ///
 /// 128-bit like the boundary's own key, because a collision
 /// DROPS a successor rather than merely costing time.
+///
+/// `org` is the engine-carried origin metadata of this
+/// slice's input lanes (empty = untracked): each written
+/// row records its input lane's origin, and the origin is
+/// mixed into the dedup key so two rows from different
+/// origins never collapse (`Rt2::origin`).
 pub fn append0(
     acc: &mut Rt2, sh: &KShared0, kv: &KOut0, take: u16,
-    n: usize, seen: &mut RowSet,
+    n: usize, seen: &mut RowSet, org: &[u32],
 ) -> u16 {
     // Returns the lanes actually WRITTEN, which is `take`
     // minus the ones another configuration already wrote.
@@ -2719,7 +2725,12 @@ pub fn append0(
     let (h1, h2) = (kv.h1.to_array(), kv.h2.to_array());
     for i in 0..n {
         if take & (1 << i) == 0 { continue; }
-        if !seen.insert((h1[i], h2[i])) { continue; }
+        let key = if org.is_empty() { (h1[i], h2[i]) } else {
+            // mix64 is a bijection: same row, different
+            // origins can never collide.
+            (mix64(h1[i] ^ mix64(0x517c_c1b7_2722_0a95 ^ org[i] as u64)), h2[i])
+        };
+        if !seen.insert(key) { continue; }
         if let Col::N(v) = &mut acc.cols[39] { v.push(sh.c39.lane(i)); }
         if let Col::N(v) = &mut acc.cols[20] { v.push(sh.c20.lane(i)); }
         if let Col::N(v) = &mut acc.cols[88] { v.push(sh.c88.lane(i)); }
@@ -2728,6 +2739,7 @@ pub fn append0(
                 AV::Bool(sh.c43.val & (1 << i) != 0)
             } else { AV::UBool });
         }
+        if !org.is_empty() { acc.origin.push(org[i]); }
         wrote |= 1 << i;
         acc.width += 1;
     }
@@ -2793,9 +2805,15 @@ pub fn acc1(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
 ///
 /// 128-bit like the boundary's own key, because a collision
 /// DROPS a successor rather than merely costing time.
+///
+/// `org` is the engine-carried origin metadata of this
+/// slice's input lanes (empty = untracked): each written
+/// row records its input lane's origin, and the origin is
+/// mixed into the dedup key so two rows from different
+/// origins never collapse (`Rt2::origin`).
 pub fn append1(
     acc: &mut Rt2, sh: &KShared1, kv: &KOut1, take: u16,
-    n: usize, seen: &mut RowSet,
+    n: usize, seen: &mut RowSet, org: &[u32],
 ) -> u16 {
     // Returns the lanes actually WRITTEN, which is `take`
     // minus the ones another configuration already wrote.
@@ -2810,7 +2828,12 @@ pub fn append1(
     let (h1, h2) = (kv.h1.to_array(), kv.h2.to_array());
     for i in 0..n {
         if take & (1 << i) == 0 { continue; }
-        if !seen.insert((h1[i], h2[i])) { continue; }
+        let key = if org.is_empty() { (h1[i], h2[i]) } else {
+            // mix64 is a bijection: same row, different
+            // origins can never collide.
+            (mix64(h1[i] ^ mix64(0x517c_c1b7_2722_0a95 ^ org[i] as u64)), h2[i])
+        };
+        if !seen.insert(key) { continue; }
         if let Col::N(v) = &mut acc.cols[20] { v.push(kv.c20.lane(i)); }
         if let Col::V(v) = &mut acc.cols[41] {
             v.push(if kv.c41.known & (1 << i) != 0 {
@@ -2828,6 +2851,7 @@ pub fn append1(
                 AV::Bool(sh.c43.val & (1 << i) != 0)
             } else { AV::UBool });
         }
+        if !org.is_empty() { acc.origin.push(org[i]); }
         wrote |= 1 << i;
         acc.width += 1;
     }
@@ -2963,9 +2987,15 @@ pub fn acc2(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
 ///
 /// 128-bit like the boundary's own key, because a collision
 /// DROPS a successor rather than merely costing time.
+///
+/// `org` is the engine-carried origin metadata of this
+/// slice's input lanes (empty = untracked): each written
+/// row records its input lane's origin, and the origin is
+/// mixed into the dedup key so two rows from different
+/// origins never collapse (`Rt2::origin`).
 pub fn append2(
     acc: &mut Rt2, sh: &KShared2, kv: &KOut2, take: u16,
-    n: usize, seen: &mut RowSet,
+    n: usize, seen: &mut RowSet, org: &[u32],
 ) -> u16 {
     // Returns the lanes actually WRITTEN, which is `take`
     // minus the ones another configuration already wrote.
@@ -2980,7 +3010,12 @@ pub fn append2(
     let (h1, h2) = (kv.h1.to_array(), kv.h2.to_array());
     for i in 0..n {
         if take & (1 << i) == 0 { continue; }
-        if !seen.insert((h1[i], h2[i])) { continue; }
+        let key = if org.is_empty() { (h1[i], h2[i]) } else {
+            // mix64 is a bijection: same row, different
+            // origins can never collide.
+            (mix64(h1[i] ^ mix64(0x517c_c1b7_2722_0a95 ^ org[i] as u64)), h2[i])
+        };
+        if !seen.insert(key) { continue; }
         if let Col::N(v) = &mut acc.cols[39] { v.push(kv.c39.lane(i)); }
         if let Col::N(v) = &mut acc.cols[20] { v.push(kv.c20.lane(i)); }
         if let Col::N(v) = &mut acc.cols[88] { v.push(sh.c88.lane(i)); }
@@ -2994,6 +3029,7 @@ pub fn append2(
                 AV::Bool(kv.c38.val & (1 << i) != 0)
             } else { AV::UBool });
         }
+        if !org.is_empty() { acc.origin.push(org[i]); }
         wrote |= 1 << i;
         acc.width += 1;
     }
@@ -3083,9 +3119,15 @@ pub fn acc3(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Rt2 {
 ///
 /// 128-bit like the boundary's own key, because a collision
 /// DROPS a successor rather than merely costing time.
+///
+/// `org` is the engine-carried origin metadata of this
+/// slice's input lanes (empty = untracked): each written
+/// row records its input lane's origin, and the origin is
+/// mixed into the dedup key so two rows from different
+/// origins never collapse (`Rt2::origin`).
 pub fn append3(
     acc: &mut Rt2, sh: &KShared3, kv: &KOut3, take: u16,
-    n: usize, seen: &mut RowSet,
+    n: usize, seen: &mut RowSet, org: &[u32],
 ) -> u16 {
     // Returns the lanes actually WRITTEN, which is `take`
     // minus the ones another configuration already wrote.
@@ -3100,7 +3142,12 @@ pub fn append3(
     let (h1, h2) = (kv.h1.to_array(), kv.h2.to_array());
     for i in 0..n {
         if take & (1 << i) == 0 { continue; }
-        if !seen.insert((h1[i], h2[i])) { continue; }
+        let key = if org.is_empty() { (h1[i], h2[i]) } else {
+            // mix64 is a bijection: same row, different
+            // origins can never collide.
+            (mix64(h1[i] ^ mix64(0x517c_c1b7_2722_0a95 ^ org[i] as u64)), h2[i])
+        };
+        if !seen.insert(key) { continue; }
         if let Col::N(v) = &mut acc.cols[39] { v.push(sh.c39.lane(i)); }
         if let Col::N(v) = &mut acc.cols[20] { v.push(kv.c20.lane(i)); }
         if let Col::V(v) = &mut acc.cols[41] {
@@ -3170,6 +3217,7 @@ pub fn append3(
                 AV::Bool(sh.c38.val & (1 << i) != 0)
             } else { AV::UBool });
         }
+        if !org.is_empty() { acc.origin.push(org[i]); }
         wrote |= 1 << i;
         acc.width += 1;
     }
@@ -3198,20 +3246,20 @@ pub fn out_slots(i: usize) -> &'static [(u32, &'static str)] {
     }
 }
 
-struct Append<'a> { accs: &'a mut [Rt2], seen: &'a mut [RowSet], n: usize }
+struct Append<'a> { accs: &'a mut [Rt2], seen: &'a mut [RowSet], n: usize, org: &'a [u32] }
 
 impl<'a> Sink for Append<'a> {
     fn o0(&mut self, _mask: u8, take: u16, sh: &KShared0, v: &KOut0) {
-        append0(&mut self.accs[0], sh, v, take, self.n, &mut self.seen[0]);
+        append0(&mut self.accs[0], sh, v, take, self.n, &mut self.seen[0], self.org);
     }
     fn o1(&mut self, _mask: u8, take: u16, sh: &KShared1, v: &KOut1) {
-        append1(&mut self.accs[1], sh, v, take, self.n, &mut self.seen[1]);
+        append1(&mut self.accs[1], sh, v, take, self.n, &mut self.seen[1], self.org);
     }
     fn o2(&mut self, _mask: u8, take: u16, sh: &KShared2, v: &KOut2) {
-        append2(&mut self.accs[2], sh, v, take, self.n, &mut self.seen[2]);
+        append2(&mut self.accs[2], sh, v, take, self.n, &mut self.seen[2], self.org);
     }
     fn o3(&mut self, _mask: u8, take: u16, sh: &KShared3, v: &KOut3) {
-        append3(&mut self.accs[3], sh, v, take, self.n, &mut self.seen[3]);
+        append3(&mut self.accs[3], sh, v, take, self.n, &mut self.seen[3], self.org);
     }
 }
 
@@ -3226,7 +3274,10 @@ pub fn step(
     // it comes from configurations agreeing on one lane, and
     // a lane lives in one slice.
     seen.iter_mut().for_each(|s| s.next_slice());
-    let mut sink = Append { accs, seen, n };
+    // Engine-carried origin metadata for this slice's lanes
+    // (empty = untracked); see `Rt2::origin`.
+    let org: &[u32] = if b.origin.is_empty() { &[] } else { &b.origin[lo..lo + n] };
+    let mut sink = Append { accs, seen, n, org };
     Some(frame(&u, &rin, &g, &mut sink))
 }
 

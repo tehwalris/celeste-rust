@@ -107,24 +107,20 @@ stage() { # $1 name, $2 logfile, rest: the command
   # `set -e`), but only after its cost has been recorded.
   return $rc
 }
-# KERNELS=1 drives every FORWARD pass on the traced kernel sets
+# KERNELS=1 drives every pass on the traced kernel sets
 # (plans/kernel-ladder.md): level 0 runs the checked-in level-0 set,
 # the banded rungs k=1..15 the rung-agnostic set, and k=16 (exact rem)
 # the exact set - selected automatically from CELESTE_REM_BITS - and
 # STRICT, so a chunk with no kernel stops the run
 # with its reasons instead of falling through to the interpreter. The
-# sweep and pos-graph replays disable the engine themselves (they inject
-# an origin column no kernel can carry yet - "the passthrough column" in
-# the plan) and say so; they are the ladder's remaining interpreter use.
+# sweep and pos-graph stages (fused or replayed) run on the kernels too:
+# their per-lane origin column rides the engine as block metadata
+# (`Rt2::origin` - "the passthrough column" in the plan).
 # Checkpoint fingerprints include the engine identity, so kernel and
 # interpreter campaigns never share checkpoint trees.
 case "${KERNELS:-}" in
   1) export CELESTE_COMPILED_FORWARD=1 CELESTE_KERNEL_STRICT=1
-     # Fused pos-graph recording rides the forward pass and needs the
-     # same passthrough; force the replay path.
-     FUSE=0
-     echo "frame engine: TRACED KERNELS, strict (interpreter reference-only" \
-          "in the forward passes; sweep/pos-graph replays interpret)" ;;
+     echo "frame engine: TRACED KERNELS, strict (interpreter reference-only)" ;;
   ""|0) ;;
   *) echo "KERNELS must be 0 or 1" >&2; exit 1 ;;
 esac
