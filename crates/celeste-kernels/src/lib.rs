@@ -25,3 +25,22 @@
 //! Phase 1) after taking 0 lanes at the production horizon.
 
 pub mod traced;
+
+/// The RUNG-AGNOSTIC set (plans/kernel-ladder.md): the same shapes,
+/// traced with the boundary widenings left OUT of the graph, so a kernel
+/// hands back the frame's EXACT rows and the campaign boundary applies
+/// whichever precision rung is configured (`CELESTE_REM_BITS`). Its
+/// accumulators go through `Rt2::boundary_exact`, never `boundary`.
+/// Regenerate with `transpile --room-kernels-ladder
+/// crates/celeste-kernels/src/ladder`; staleness is caught by
+/// `ladder_kernels_are_current`.
+pub mod ladder;
+
+/// The EXACT-REM set, for the ladder's top rung (k = 16, rem `Exact`):
+/// the interval slots are plain per-lane numbers, so `__split_by_flr`
+/// is the identity and the set has NO rem forks - which is why it is
+/// far smaller than the other two. Exact rows through
+/// `Rt2::boundary_exact`. Regenerate with `transpile
+/// --room-kernels-exact crates/celeste-kernels/src/exact`; staleness is
+/// caught by `exact_kernels_are_current`.
+pub mod exact;

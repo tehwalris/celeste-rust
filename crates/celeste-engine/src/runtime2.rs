@@ -763,8 +763,31 @@ impl Rt2 {
     /// row key with the interpreter's `visited_row_keys` for the SAME
     /// lane, which requires the keys of lanes the dedup would drop.
     pub fn boundary_canonicalize(&mut self, ids: &BoundaryIds) {
-        // Materialize every stale column - the boundary walks whole
-        // columns (BFS pointer scan, hashing, compaction).
+        self.boundary_prepare();
+        self.boundary_widen(ids);
+        self.boundary_finish();
+    }
+
+    /// The boundary WITHOUT the widenings: materialize, canonicalize,
+    /// hash, dedup - and nothing else. For the rung-agnostic kernel path
+    /// (plans/kernel-ladder.md): kernels generated with `widen = false`
+    /// hand the campaign EXACT rows, and the campaign applies the
+    /// precision rung's own abstraction downstream. Widening here would
+    /// pre-empt it with Bits(0)'s, which is exactly the refusal
+    /// `compiled_forward` used to make.
+    ///
+    /// Dedup on exact rows is sound at every rung: two byte-identical
+    /// rows are the same state under any widening.
+    pub fn boundary_exact(&mut self) -> usize {
+        self.boundary_prepare();
+        self.boundary_finish();
+        self.boundary_dedup()
+    }
+
+    /// Shared boundary head: materialize every stale column (the
+    /// boundary walks whole columns - BFS pointer scan, hashing,
+    /// compaction) and clear the widen history.
+    fn boundary_prepare(&mut self) {
         for p in 0..self.cols.len() {
             self.resolve_cell(p);
         }
@@ -784,6 +807,11 @@ impl Rt2 {
             }
         }
         self.history.clear();
+    }
+
+    /// The Bits(0) boundary widenings (see `boundary`'s doc for the list
+    /// and the abstraction.rs line references).
+    fn boundary_widen(&mut self, ids: &BoundaryIds) {
         let (rem_cells, det_cells) = self.mark_walk(ids);
 
         // 1. rem widening, Bits(0).
@@ -906,6 +934,11 @@ impl Rt2 {
             }
         }
 
+    }
+
+    /// Shared boundary tail: canonical ids, the shape hash, and the
+    /// per-lane row keys.
+    fn boundary_finish(&mut self) {
         assert!(self.prints.is_empty(), "prints at a frame boundary: {:?}", self.prints);
 
         self.canonicalize_ids();

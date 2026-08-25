@@ -457,6 +457,25 @@ impl FrameEngine {
         // partially-covered state is forfeited - at real coverage that is
         // rare, and the miss dump still records exactly what to cover
         // next.
+        if !misses.is_empty() && dispatch::kernel_strict() {
+            // The doctrine (plans/tracing.md "Doctrine"): a chunk the
+            // kernels cannot take is a COVERAGE GAP, not a degraded mode.
+            // Every chunk of this state was dispatched before this point,
+            // so the census is complete; report every distinct reason
+            // with lane counts and stop. The search checkpoints per
+            // completed frame, so the run resumes from the previous
+            // frame once the gap is fixed.
+            let missed_lanes: usize = misses.iter().map(|(b, _)| b.width).sum();
+            panic!(
+                "KERNEL COVERAGE GAP (CELESTE_KERNEL_STRICT=1): {} lanes in {} \
+                 chunks have no kernel; reasons:\n{}\nfix the gap (trace the \
+                 missing shape / raise the bound) and resume from the last \
+                 checkpoint",
+                missed_lanes,
+                misses.len(),
+                dispatch::miss_report(),
+            );
+        }
         if !misses.is_empty() {
             if let Some((cfg, env)) = campaign {
                 let missed_lanes: usize = misses.iter().map(|(b, _)| b.width).sum();
@@ -772,6 +791,20 @@ pub fn step(
 ) -> Vec<runtime2::Rt2> {
     let ids = &self.ids;
     let use_kernel = use_kernel();
+    // `step`'s output rows are FINAL - no campaign abstraction runs
+    // after it, unlike `run_frame_chunk`'s. The rung-agnostic set hands
+    // back exact, unwidened rows on purpose (plans/kernel-ladder.md),
+    // so under this entry point they would leak out as boundary rows
+    // that no interpreter level produces. Loud, because the mix would
+    // otherwise only show as a row-count anomaly far downstream.
+    assert!(
+        !use_kernel
+            || matches!(dispatch::traced_mode(), dispatch::TracedMode::Level0),
+        "FrameEngine::step emits final boundary rows and supports the \
+         level-0 traced set only; the rung-agnostic (ladder) set runs \
+         through run_frame_chunk, whose caller re-applies the campaign's \
+         abstraction"
+    );
     // CELESTE_PHASE_TIME=1: print the per-frame wall split across the
     // serial/parallel phases (goal 7's measurement harness).
     let phase_time = std::env::var("CELESTE_PHASE_TIME").is_ok();

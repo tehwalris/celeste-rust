@@ -118,6 +118,14 @@ debug = false
 debug = false
 [profile.release.package.native-probe]
 debug = false
+# The DWARF crash above is NOT gone for celeste-kernels in dev: adding the
+# rung-agnostic `ladder` set (2026-08-25, plans/kernel-ladder.md) - a second
+# ~20k-line generated `frame` beside the traced one - overflows rustc's
+# stack in LLVM's DwarfCompileUnit::createAndAddScopeChildren at
+# debuginfo=2 (SIGSEGV, "rustc unexpectedly overflowed its stack"). Nobody
+# debugs generated kernels source-level, so debuginfo buys nothing there.
+[profile.dev.package.celeste-kernels]
+debug = false
 
 [[bin]]
 name = "transpile"
