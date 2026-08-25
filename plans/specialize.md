@@ -3,6 +3,41 @@
 Autonomous session, 2026-08-25. Philippe asked me to build this end to
 end while away, making and recording assumptions. This is the record.
 
+## EXECUTIVE SUMMARY (read this first)
+
+I built a probe (`transpile --spec-probe SHAPE`, env `CELESTE_SPEC_*`)
+and measured, on room (2,0) shape 3 (the 190k-node monster), what
+collapses the traced graph. **The headline: none of the enumerable
+specialization axes we agreed on help.** Position, all-object geometry,
+the pm1 key, `collideable`, and resolving any button assignment ALL leave
+the graph at ~15k traced nodes and its full 8-way fork. Only pinning the
+player's continuous velocity/dynamic-state collapses it - and that is not
+an enumerable axis. The emitted 2^8-fork x ~145-button explosion reflects
+a REAL 8-way fork inherent to a 14-object, velocity-widened frame, not an
+over-enumeration.
+
+So: **position/pm1/geometry specialization is refuted as a room-(2,0)
+size lever; do not build it for that purpose.** The session's value is
+this negative result (it saves building the wrong thing) plus the probe
+tool. I also chased and RETRACTED a "collide bug" and a "SUM-not-product
+16x" idea - both wrong, both documented below with their refutations so
+the trail is honest.
+
+Two wrong turns I want to flag honestly: I first hypothesised a collide
+closure-capture bug (Result 2/3) and then a fork over-enumeration
+(SUM-not-product) - both refuted by further measurement in the same
+session. The final table (in "TRULY FINAL conclusion") is the trustworthy
+part.
+
+Remaining honest options for room (2,0): accept it via an
+interpret-the-graph base backend (the base need not be fast, only
+correct), a velocity abstraction (hard), or interpreter-only until one is
+worth it. Nothing in the checked-in kernels or production path was
+changed; the probe is a flag-gated diagnostic.
+
+---
+
+
 ## The goal, agreed over several turns
 
 Room (2,0)'s kernels explode to ~900k nodes because a monolithic per-
