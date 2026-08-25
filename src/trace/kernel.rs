@@ -2301,6 +2301,29 @@ pub fn specialize_probe(
             }
         }
     }
+    // CELESTE_SPEC_BTNFORKS: for each of the 64 button assignments,
+    // resolve the buttons (specialize_config_into) and count how many
+    // forks remain LIVE. If per-button the count is ~2 (rem x,y), the
+    // emitter's 2^fork_depth enumeration is over-counting per config.
+    if std::env::var("CELESTE_SPEC_BTNFORKS").is_ok() {
+        use crate::transpile::graph::{Graph, Op};
+        let g = &it.d.graph;
+        let mut roots_n: Vec<crate::transpile::graph::NodeId> = Vec::new();
+        for o in &f.outs { for (_, nd, _) in &o.fields { roots_n.push(*nd); } roots_n.push(o.guard); roots_n.push(o.ok); }
+        let mut hist: std::collections::BTreeMap<usize, usize> = Default::default();
+        for m in 0u8..64 {
+            let mut sp = Graph::new();
+            let mapped = g.specialize_config_into(m, None, &mut sp);
+            let sroots: Vec<_> = roots_n.iter().map(|r| mapped[*r as usize]).collect();
+            let reach = crate::transpile::bdd::reachable(&sp, &sroots);
+            let mut forks = std::collections::BTreeSet::new();
+            for id in 0..sp.len() {
+                if reach[id] { if let Op::Split(d) = sp.get(id as u32).op { forks.insert(d); } }
+            }
+            *hist.entry(forks.len()).or_default() += 1;
+        }
+        out.push_str(&format!("  live forks per button assignment (fork_depth {}): {:?}\n", f.forks, hist));
+    }
     // What each LIVE fork forks on.
     {
         use crate::transpile::graph::Op;
