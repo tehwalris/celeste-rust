@@ -559,6 +559,65 @@ mod tests {
         );
     }
 
+    /// The TOP rung (k = 16, rem `Exact`) on the exact-rem kernel set:
+    /// the ladder's "concrete optimum" claim rests on this rung being
+    /// exact in every coordinate, so it is the one rung that most needs
+    /// to run on kernels rather than be the interpreter exception.
+    /// Auto-selected from `CELESTE_REM_BITS=16` (parsed as Exact);
+    /// compared at the rung's abstraction, strict, coverage asserted.
+    #[test]
+    fn exact_kernels_reproduce_the_interpreter_at_k16() {
+        let _partition = crate::interpreter::partition_straddles_test_lock();
+        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
+            || !std::path::Path::new("rewrites.jsonl").exists()
+            || !std::path::Path::new("rewrites-compile.jsonl").exists()
+        {
+            return;
+        }
+        std::env::set_var("CELESTE_REM_BITS", "16");
+        std::env::set_var("CELESTE_KERNEL_STRICT", "1");
+        assert_eq!(
+            crate::interpreter::abstraction::rem_precision_from_env(),
+            crate::interpreter::abstraction::RemPrecision::Exact,
+            "the precision env was read before this test set it; the run \
+             below would gate the wrong rung"
+        );
+        let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
+
+        let frames = 28;
+        let mut baseline = AbstractRun::start(&program).expect("start baseline");
+        let mut want = Vec::new();
+        for _ in 1..=frames {
+            baseline.step().expect("baseline step");
+            want.push(baseline.lane_count());
+        }
+        drop(baseline);
+
+        std::env::set_var("CELESTE_COMPILED_FORWARD", "check");
+        let mut run = AbstractRun::start(&program).expect("start compiled run");
+        assert!(run.compiled.is_some(), "the compiled engine did not engage");
+        for (frame, want) in (1..=frames).zip(want) {
+            run.step().unwrap_or_else(|e| panic!("frame {}: {:#}", frame, e));
+            assert_eq!(
+                run.lane_count(),
+                want,
+                "the exact kernels have a different lane count at frame {}",
+                frame
+            );
+        }
+        assert!(
+            crate::compiled::dispatch::traced_lanes() > 0,
+            "no chunk ever reached an exact kernel - the set covers no shape this run \
+             produces, so this test checked nothing"
+        );
+        assert_eq!(
+            crate::compiled::dispatch::missed_lanes(),
+            0,
+            "some chunks fell through to the reference path - those chunks were \
+             checked interpreter-against-interpreter, which gates nothing"
+        );
+    }
+
     /// The rung-agnostic set at LEVEL 0 (`CELESTE_TRACED_SET=ladder`,
     /// rem Bits(0)): exercises `Rt2::boundary_exact` plus the campaign's
     /// full Bits(0) widening downstream, compared with the level-0

@@ -53,6 +53,24 @@ fn main() -> Result<()> {
                 );
                 return Ok(());
             }
+            // --room-kernels-exact DIR: the EXACT-REM set for the
+            // ladder's top rung (k = 16) - interval slots as plain
+            // numbers, no rem forks. Target:
+            // crates/celeste-kernels/src/exact.
+            "--room-kernels-exact" => {
+                let d = args.next().ok_or_else(|| anyhow!("--room-kernels-exact DIR"))?;
+                let sizes = celeste_rust::trace::kernel::write_room_kernels_exact(
+                    std::path::Path::new("."),
+                    std::path::Path::new(&d),
+                )?;
+                eprintln!(
+                    "exact: {} kernels -> {:?} lines, {} total",
+                    sizes.len(),
+                    sizes,
+                    sizes.iter().sum::<usize>()
+                );
+                return Ok(());
+            }
             "--room-kernels-lattice" => {
                 let d = args.next().ok_or_else(|| anyhow!("--room-kernels-lattice DIR"))?;
                 let sizes = celeste_rust::trace::kernel::write_room_kernels_lattice(std::path::Path::new("."), std::path::Path::new(&d))?;

@@ -978,7 +978,7 @@ pub fn reference_frame_in(root: &std::path::Path) -> Result<Reference> {
 /// gets answered.
 pub(crate) fn room_shapes_in(
     root: &std::path::Path,
-    widen: bool,
+    opts: super::shapes::WalkOpts,
 ) -> Result<(
     Vec<super::shapes::Shape>,
     crate::transpile::graph::Graph,
@@ -1012,7 +1012,7 @@ pub(crate) fn room_shapes_in(
     cart::inject_tile_flag_at(&mut st);
     let st = run_one(&mut it, &init, st)?;
 
-    let w = shapes::walk(&mut it, &reset, &fr, st, 400, widen)?;
+    let w = shapes::walk(&mut it, &reset, &fr, st, 400, opts)?;
     if !w.refused.is_empty() {
         let why: Vec<String> =
             w.refused.iter().map(|(e, n)| format!("{} x {}", n, e)).collect();
@@ -1039,14 +1039,18 @@ pub(crate) fn room_shapes_in(
 
 /// One kernel per heap shape the room reaches.
 pub fn room_kernels_in(root: &std::path::Path) -> Result<Vec<Reference>> {
-    room_kernels_widened_in(root, true)
+    room_kernels_with(root, super::shapes::WalkOpts::LEVEL0)
 }
 
-/// `room_kernels_in`, with the in-graph widenings selectable. `false`
-/// produces the RUNG-AGNOSTIC kernels (plans/kernel-ladder.md): exact
-/// frame outputs, every widening left to the campaign boundary.
-pub fn room_kernels_widened_in(root: &std::path::Path, widen: bool) -> Result<Vec<Reference>> {
-    let (shapes, graph, cart_data, cache) = room_shapes_in(root, widen)?;
+/// `room_kernels_in` for any walk mode (plans/kernel-ladder.md):
+/// `LADDER` produces the rung-agnostic kernels (exact frame outputs,
+/// widenings left to the campaign boundary), `EXACT` the exact-rem set
+/// (interval slots as plain numbers, no rem forks).
+pub fn room_kernels_with(
+    root: &std::path::Path,
+    opts: super::shapes::WalkOpts,
+) -> Result<Vec<Reference>> {
+    let (shapes, graph, cart_data, cache) = room_shapes_in(root, opts)?;
     let room = crate::transpile::graph::Room { cart: cart_data.clone(), cache: cache.clone() };
     let mut out = Vec::new();
     for sh in shapes {
@@ -1192,7 +1196,20 @@ pub fn write_room_kernels_ladder(
     root: &std::path::Path,
     dir: &std::path::Path,
 ) -> Result<Vec<usize>> {
-    let refs = room_kernels_widened_in(root, false)?;
+    let refs = room_kernels_with(root, super::shapes::WalkOpts::LADDER)?;
+    write_kernels_from_refs(&refs, dir)
+}
+
+/// The EXACT-REM kernel set, for the ladder's top rung (k = 16, rem
+/// `Exact`): traced with the interval slots as plain per-lane numbers,
+/// so `__split_by_flr` is the identity and the set has no rem forks.
+/// Binds only blocks whose rem is a number - which is every block of an
+/// exact-rem campaign, and no block of any other rung.
+pub fn write_room_kernels_exact(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+) -> Result<Vec<usize>> {
+    let refs = room_kernels_with(root, super::shapes::WalkOpts::EXACT)?;
     write_kernels_from_refs(&refs, dir)
 }
 
@@ -1397,6 +1414,55 @@ mod tests {
                     "crates/celeste-kernels/src/ladder/{} is STALE: on disk {} lines, \
                      tracer says {} lines, first differing line {:?}. Regenerate with \
                      `transpile --room-kernels-ladder crates/celeste-kernels/src/ladder` \
+                     and read the diff.",
+                    name,
+                    a.lines().count(),
+                    b.lines().count(),
+                    first
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The EXACT-REM set's staleness gate - same contract, for
+    /// `crates/celeste-kernels/src/exact` (plans/kernel-ladder.md).
+    #[test]
+    fn exact_kernels_are_current() {
+        let dir = std::env::temp_dir().join(format!("celeste-exact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sizes = super::write_room_kernels_exact(std::path::Path::new("."), &dir)
+            .unwrap_or_else(|e| {
+                panic!("regenerate the exact kernel set (run from the repo root): {:#}", e)
+            });
+
+        let committed = std::path::Path::new("crates/celeste-kernels/src/exact");
+        let listing = |d: &std::path::Path| -> std::collections::BTreeSet<String> {
+            std::fs::read_dir(d)
+                .unwrap_or_else(|e| panic!("read {}: {}", d.display(), e))
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect()
+        };
+        let (fresh_files, on_disk_files) = (listing(&dir), listing(committed));
+        assert_eq!(
+            fresh_files,
+            on_disk_files,
+            "the exact kernel set has a different FILE LIST than what is committed \
+             ({} shapes now). Regenerate with `transpile --room-kernels-exact \
+             crates/celeste-kernels/src/exact`.",
+            sizes.len()
+        );
+
+        for name in &fresh_files {
+            let a = std::fs::read_to_string(committed.join(name)).unwrap();
+            let b = std::fs::read_to_string(dir.join(name)).unwrap();
+            if a != b {
+                let first =
+                    a.lines().zip(b.lines()).position(|(x, y)| x != y).map(|i| i + 1);
+                panic!(
+                    "crates/celeste-kernels/src/exact/{} is STALE: on disk {} lines, \
+                     tracer says {} lines, first differing line {:?}. Regenerate with \
+                     `transpile --room-kernels-exact crates/celeste-kernels/src/exact` \
                      and read the diff.",
                     name,
                     a.lines().count(),
@@ -2165,7 +2231,7 @@ pub fn specialize_probe(
     let mut st0 = st0;
     cart::inject_tile_flag_at(&mut st0);
     let st0 = run_one(&mut it, &init, st0)?;
-    let w = shapes::walk(&mut it, &reset, &fr, st0, 400, true)?;
+    let w = shapes::walk(&mut it, &reset, &fr, st0, 400, shapes::WalkOpts::LEVEL0)?;
 
     if shape_idx >= w.shapes.len() {
         bail!("shape {} out of range ({} shapes)", shape_idx, w.shapes.len());

@@ -109,8 +109,9 @@ stage() { # $1 name, $2 logfile, rest: the command
 }
 # KERNELS=1 drives every FORWARD pass on the traced kernel sets
 # (plans/kernel-ladder.md): level 0 runs the checked-in level-0 set,
-# every banded rung the rung-agnostic set - selected automatically from
-# CELESTE_REM_BITS - and STRICT, so a chunk with no kernel stops the run
+# the banded rungs k=1..15 the rung-agnostic set, and k=16 (exact rem)
+# the exact set - selected automatically from CELESTE_REM_BITS - and
+# STRICT, so a chunk with no kernel stops the run
 # with its reasons instead of falling through to the interpreter. The
 # sweep and pos-graph replays disable the engine themselves (they inject
 # an origin column no kernel can carry yet - "the passthrough column" in

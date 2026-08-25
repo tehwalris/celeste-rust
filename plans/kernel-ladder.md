@@ -104,16 +104,18 @@ Considered and REJECTED as the first step, kept as the optimization:
 
 ### The rungs still refused, and what each needs
 
-* **Exact rem (k=16, the top rung).** An exact-rem block carries rem as
-  `Col::N` (plain numbers); the agnostic set's rem slot is `ival`, so
-  bind refuses. Needs a THIRD set traced with `ival_paths = []` (rem a
-  plain symbolic num, `__split_by_flr` the identity, no forks). Cheap
-  to generate; not done yet purely for scope. Until then the k=16 rung
-  runs on the interpreter, which weakens "interpreter never in the
-  search path" to "…except the top rung" - named, not hidden. NOTE:
-  `make_state_abstract` also skips the fruit off/y widening at Exact,
-  which the exact set must also not bake (moot for room (1,0), no
-  fruit).
+* **Exact rem (k=16, the top rung) - DONE later the same session.** An
+  exact-rem block carries rem as `Col::N` (plain numbers); the agnostic
+  set's rem slot is `ival`, so bind refuses. The THIRD set
+  (`celeste_kernels::exact`, `WalkOpts::EXACT`: `widen = false`,
+  `ival_paths = []`) traces rem as a plain symbolic num, so
+  `__split_by_flr` is the identity and the set has NO rem forks -
+  which is why it is 16,043 lines against the ladder set's 28,407
+  (kernel1: 7,702 vs 20,066; the fork dimension gone). Auto-selected at
+  `RemPrecision::Exact`, `boundary_exact`, gated by
+  `exact_kernels_reproduce_the_interpreter_at_k16`. NOTE that
+  `make_state_abstract` skips the fruit off/y widening at Exact, which
+  the exact set also does not bake (moot for room (1,0), no fruit).
 * **Spd rungs (`CELESTE_SPD_WIDTH_LOG2`).** Bucketed spd makes
   `player.spd.x/y` interval INPUTS, which the kernels type as num.
   Needs `ival_paths += spd` plus emitter support for whatever spd
@@ -227,11 +229,13 @@ orthogonal to the engine and untouched here.
 
 ## Not done, in honesty order
 
-* The k=16 exact-rem set (design above; generation flag is the same
-  machinery with `ival_paths = []`).
-* The origin passthrough (both designs above; decision needed).
+* The origin passthrough (both designs above; decision needed). Until it
+  lands, the backward sweep's expansion and the pos-graph replay are the
+  ladder's remaining interpreter use.
 * Spd rungs.
-* Per-rung baked kernels (the optimization layer).
-* A full ladder campaign run on kernels end to end - needs release
-  builds and hours; the per-rung differential gate is the evidence
-  offered instead.
+* Per-rung baked kernels (the optimization layer: a rung-aware in-kernel
+  dedup key, worth pricing only if the agnostic set's weaker dedup shows
+  up in a campaign measurement).
+* A full ladder campaign run on kernels end to end, and any performance
+  number - needs release builds and hours; the per-rung differential
+  gates are the evidence offered instead, and no perf claim is made.

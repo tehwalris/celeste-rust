@@ -254,20 +254,42 @@ pub fn field_constants(
     Ok(out)
 }
 
+/// Which kernel set a walk is for (plans/kernel-ladder.md). The SHAPE
+/// fixpoint is the same in every mode - `blank` erases the values that
+/// would differ - so the modes differ only in what each traced frame
+/// assumes and emits.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct WalkOpts {
+    /// Apply the Bits(0) boundary widenings inside each traced frame
+    /// (`trace::widen`). `true` is the production level-0 set; `false`
+    /// hands back exact rows and leaves every widening to the campaign
+    /// boundary.
+    pub widen: bool,
+    /// Declare the boundary's interval slots (the player's `rem`, a
+    /// live fruit's `off`/`y`) as interval INPUTS (`ival_paths`).
+    /// `true` matches every rung whose blocks carry them as intervals
+    /// (rem Bits(0..=15)); `false` is the EXACT-rem set, whose blocks
+    /// carry them as plain per-lane numbers, so `__split_by_flr` is the
+    /// identity and the set has no rem forks at all.
+    pub ival: bool,
+}
+
+impl WalkOpts {
+    /// The checked-in level-0 set.
+    pub const LEVEL0: WalkOpts = WalkOpts { widen: true, ival: true };
+    /// The rung-agnostic set for rem Bits(0..=15).
+    pub const LADDER: WalkOpts = WalkOpts { widen: false, ival: true };
+    /// The exact-rem set for the top rung (k = 16).
+    pub const EXACT: WalkOpts = WalkOpts { widen: false, ival: false };
+}
+
 pub fn walk<'a>(
     it: &mut Interp<'a, Symbolic>,
     reset: &'a ast::Ast,
     frame: &'a ast::Ast,
     start: State<Symbolic>,
     cap: usize,
-    // Apply the Bits(0) boundary widenings inside each traced frame
-    // (`trace::widen`). `true` is the production room-kernel set;
-    // `false` is the RUNG-AGNOSTIC set (plans/kernel-ladder.md), whose
-    // frames hand back exact rows and leave every widening to the
-    // campaign boundary, so one set serves every rem rung whose blocks
-    // carry rem as an interval. The SHAPE fixpoint is the same either
-    // way - `blank` erases the values that would differ.
-    widen: bool,
+    opts: WalkOpts,
 ) -> Result<Walk> {
     let room0 = room_of(&start, &it.d);
     let key = |st: &State<Symbolic>| -> Result<String> { Ok(format!("{:?}", st.shape()?)) };
@@ -286,8 +308,8 @@ pub fn walk<'a>(
     while let Some(k) = queue.pop() {
         let st = seen[&k].clone();
         let roots = state_paths(&st)?;
-        let ival = ival_paths(&st);
-        let f = match trace_frame(it, reset, frame, st.clone(), &roots, &[], &ival, widen) {
+        let ival = if opts.ival { ival_paths(&st) } else { Vec::new() };
+        let f = match trace_frame(it, reset, frame, st.clone(), &roots, &[], &ival, opts.widen) {
             Ok(f) => f,
             Err(e) => {
                 *out.refused.entry(format!("{:#}", e)).or_default() += 1;

@@ -28,6 +28,11 @@ pub(crate) enum TracedMode {
     /// `Rt2::boundary_exact`; the campaign boundary applies whichever
     /// precision rung is configured. Serves rem Bits(0..=15).
     Level0Agnostic,
+    /// The exact-rem set (`celeste_kernels::exact`), for the top rung
+    /// (k = 16): interval slots as plain numbers, no rem forks, exact
+    /// rows through `Rt2::boundary_exact`. Binds only blocks whose rem
+    /// is a number, which is every block of an exact-rem campaign.
+    ExactRem,
 }
 
 /// The mode, decided once per process: `CELESTE_TRACED_SET=traced|ladder`
@@ -39,12 +44,16 @@ pub(crate) fn traced_mode() -> TracedMode {
     *MODE.get_or_init(|| match std::env::var("CELESTE_TRACED_SET").as_deref() {
         Ok("traced") => TracedMode::Level0,
         Ok("ladder") => TracedMode::Level0Agnostic,
-        Ok(other) => panic!("CELESTE_TRACED_SET={:?}: expected traced or ladder", other),
+        Ok("exact") => TracedMode::ExactRem,
+        Ok(other) => {
+            panic!("CELESTE_TRACED_SET={:?}: expected traced, ladder or exact", other)
+        }
         Err(_) => {
             use crate::interpreter::abstraction::RemPrecision;
             match crate::interpreter::abstraction::rem_precision_from_env() {
                 RemPrecision::Bits(0) => TracedMode::Level0,
-                _ => TracedMode::Level0Agnostic,
+                RemPrecision::Bits(_) => TracedMode::Level0Agnostic,
+                RemPrecision::Exact => TracedMode::ExactRem,
             }
         }
     })
@@ -109,10 +118,10 @@ pub(crate) static PLAIN_ROUTED: std::sync::atomic::AtomicU64 =
 pub fn traced_set_fingerprint() -> u64 {
     match traced_mode() {
         TracedMode::Level0 => celeste_kernels::traced::FINGERPRINT,
-        // Tagged so a rung-agnostic engine never shares checkpoints with
-        // a level-0 one, even in the unlikely event the rendered sources
-        // hashed equal.
+        // Tagged so the modes never share checkpoints, even in the
+        // unlikely event two sets' rendered sources hashed equal.
         TracedMode::Level0Agnostic => celeste_kernels::ladder::FINGERPRINT ^ 0x6c61_6464_6572,
+        TracedMode::ExactRem => celeste_kernels::exact::FINGERPRINT ^ 0x6578_6163_74,
     }
 }
 
@@ -191,6 +200,7 @@ fn traced_dispatch() -> &'static crate::trace::dispatch::Dispatch {
         let set = match traced_mode() {
             TracedMode::Level0 => celeste_kernels::traced::KERNELS,
             TracedMode::Level0Agnostic => celeste_kernels::ladder::KERNELS,
+            TracedMode::ExactRem => celeste_kernels::exact::KERNELS,
         };
         crate::trace::dispatch::Dispatch::new(set)
             .expect("the checked-in traced kernel set indexes by shape")
@@ -243,9 +253,10 @@ fn run_traced_kernel(
                 TracedMode::Level0 => {
                     acc.boundary(ids);
                 }
-                // The rung-agnostic set hands back EXACT rows; widening
-                // here would pre-empt the campaign's rung with Bits(0).
-                TracedMode::Level0Agnostic => {
+                // The rung-agnostic and exact sets hand back EXACT rows;
+                // widening here would pre-empt the campaign's rung with
+                // Bits(0).
+                TracedMode::Level0Agnostic | TracedMode::ExactRem => {
                     acc.boundary_exact();
                 }
             }

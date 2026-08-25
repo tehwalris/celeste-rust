@@ -1278,9 +1278,10 @@ fn compiled_forward(program: &Program) -> Result<Option<&'static CompiledForward
     // mode the "never widen a field without a rung that narrows it back"
     // rule exists to prevent. The RUNG-AGNOSTIC set hands back exact rows
     // and the campaign boundary applies the rung, so it serves every rem
-    // rung whose blocks carry rem as an interval - Bits(0..=15). Exact
-    // rem carries rem as a plain number, which the agnostic set's ival
-    // slot refuses at bind; that rung needs its own num-rem set.
+    // rung whose blocks carry rem as an interval - Bits(0..=15) - and the
+    // EXACT set serves the top rung, whose blocks carry rem as a plain
+    // number. The refusals left are the cross-matches an explicit
+    // CELESTE_TRACED_SET override can produce, and the spd rungs.
     use crate::compiled::dispatch::{traced_mode, TracedMode};
     use crate::interpreter::abstraction::{RemPrecision, SpdPrecision};
     let rem = crate::interpreter::abstraction::rem_precision_from_env();
@@ -1289,16 +1290,24 @@ fn compiled_forward(program: &Program) -> Result<Option<&'static CompiledForward
         (TracedMode::Level0, other) => anyhow::bail!(
             "CELESTE_TRACED_SET=traced with rem precision {:?}: the level-0 \
              set implements Bits(0) only; unset CELESTE_TRACED_SET to let \
-             the rung pick the rung-agnostic set",
+             the rung pick the set",
             other
         ),
-        (TracedMode::Level0Agnostic, RemPrecision::Exact) => anyhow::bail!(
-            "CELESTE_COMPILED_FORWARD with exact rem: an exact block \
-             carries rem as a plain number, which the rung-agnostic set's \
-             interval slot refuses at bind; the exact-rem kernel set is \
-             not generated yet (plans/kernel-ladder.md)"
-        ),
         (TracedMode::Level0Agnostic, RemPrecision::Bits(_)) => {}
+        (TracedMode::Level0Agnostic, RemPrecision::Exact) => anyhow::bail!(
+            "CELESTE_TRACED_SET=ladder with exact rem: an exact block \
+             carries rem as a plain number, which the rung-agnostic set's \
+             interval slot refuses at bind; unset CELESTE_TRACED_SET to \
+             let the rung pick the exact set"
+        ),
+        (TracedMode::ExactRem, RemPrecision::Exact) => {}
+        (TracedMode::ExactRem, other) => anyhow::bail!(
+            "CELESTE_TRACED_SET=exact with rem precision {:?}: that rung's \
+             blocks carry rem as an interval, which the exact set's number \
+             slot refuses at bind; unset CELESTE_TRACED_SET to let the \
+             rung pick the set",
+            other
+        ),
     }
     let spd = crate::interpreter::abstraction::spd_precision_from_env();
     if spd != SpdPrecision::Exact {
