@@ -42,17 +42,25 @@ echo "==> building the generator"
 echo "==> generating the traced set"
 ./safe-run.sh -- ./target/quick/transpile --room-kernels "$SCRATCH/traced"
 
+# The rung-agnostic set (plans/kernel-ladder.md): the same walk with the
+# widenings left OUT of the graph, gated by `ladder_kernels_are_current`.
+echo "==> generating the ladder set"
+./safe-run.sh -- ./target/quick/transpile --room-kernels-ladder "$SCRATCH/ladder"
+
 echo "==> installing into the generated crate"
 BACKUP=$(mktemp -d)
 cp -r crates/celeste-kernels/src/traced "$BACKUP/traced"
-restore() { rm -rf crates/celeste-kernels/src/traced;
+cp -r crates/celeste-kernels/src/ladder "$BACKUP/ladder"
+restore() { rm -rf crates/celeste-kernels/src/traced crates/celeste-kernels/src/ladder;
             cp -r "$BACKUP/traced" crates/celeste-kernels/src/traced;
+            cp -r "$BACKUP/ladder" crates/celeste-kernels/src/ladder;
             rm -rf "$BACKUP"; }
 
 # rm before cp, not cp over: one shape FEWER than last time would
 # otherwise leave a stale kernelN.rs that still compiles.
-rm -rf crates/celeste-kernels/src/traced
+rm -rf crates/celeste-kernels/src/traced crates/celeste-kernels/src/ladder
 cp -r "$SCRATCH/traced" crates/celeste-kernels/src/traced
+cp -r "$SCRATCH/ladder" crates/celeste-kernels/src/ladder
 
 # Also quick: this step answers "does the generated code COMPILE", and
 # release answers it no better for ~4x the wall time. It does not leave

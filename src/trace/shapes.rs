@@ -260,6 +260,14 @@ pub fn walk<'a>(
     frame: &'a ast::Ast,
     start: State<Symbolic>,
     cap: usize,
+    // Apply the Bits(0) boundary widenings inside each traced frame
+    // (`trace::widen`). `true` is the production room-kernel set;
+    // `false` is the RUNG-AGNOSTIC set (plans/kernel-ladder.md), whose
+    // frames hand back exact rows and leave every widening to the
+    // campaign boundary, so one set serves every rem rung whose blocks
+    // carry rem as an interval. The SHAPE fixpoint is the same either
+    // way - `blank` erases the values that would differ.
+    widen: bool,
 ) -> Result<Walk> {
     let room0 = room_of(&start, &it.d);
     let key = |st: &State<Symbolic>| -> Result<String> { Ok(format!("{:?}", st.shape()?)) };
@@ -279,7 +287,7 @@ pub fn walk<'a>(
         let st = seen[&k].clone();
         let roots = state_paths(&st)?;
         let ival = ival_paths(&st);
-        let f = match trace_frame(it, reset, frame, st.clone(), &roots, &[], &ival, true) {
+        let f = match trace_frame(it, reset, frame, st.clone(), &roots, &[], &ival, widen) {
             Ok(f) => f,
             Err(e) => {
                 *out.refused.entry(format!("{:#}", e)).or_default() += 1;

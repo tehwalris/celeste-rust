@@ -34,6 +34,25 @@ fn main() -> Result<()> {
                         .context("--spec-probe SHAPE index")?,
                 );
             }
+            // --room-kernels-ladder DIR: the RUNG-AGNOSTIC set
+            // (plans/kernel-ladder.md) - the same walk with the boundary
+            // widenings left OUT of the graph, so the campaign boundary
+            // applies whichever precision rung is configured. Target:
+            // crates/celeste-kernels/src/ladder.
+            "--room-kernels-ladder" => {
+                let d = args.next().ok_or_else(|| anyhow!("--room-kernels-ladder DIR"))?;
+                let sizes = celeste_rust::trace::kernel::write_room_kernels_ladder(
+                    std::path::Path::new("."),
+                    std::path::Path::new(&d),
+                )?;
+                eprintln!(
+                    "ladder: {} kernels -> {:?} lines, {} total",
+                    sizes.len(),
+                    sizes,
+                    sizes.iter().sum::<usize>()
+                );
+                return Ok(());
+            }
             "--room-kernels-lattice" => {
                 let d = args.next().ok_or_else(|| anyhow!("--room-kernels-lattice DIR"))?;
                 let sizes = celeste_rust::trace::kernel::write_room_kernels_lattice(std::path::Path::new("."), std::path::Path::new(&d))?;
