@@ -15,6 +15,65 @@
 use celeste_engine::kernel;
 use celeste_engine::runtime2;
 
+/// Which traced set runs, and which boundary its accumulators take
+/// (plans/kernel-ladder.md).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TracedMode {
+    /// The checked-in level-0 set (`celeste_kernels::traced`): the
+    /// Bits(0) widenings are in the graph, accumulators go through
+    /// `Rt2::boundary`. Valid ONLY at rem Bits(0) / spd Exact -
+    /// `compiled_forward` refuses anything else.
+    Level0,
+    /// The rung-agnostic set (`celeste_kernels::ladder`): exact rows,
+    /// `Rt2::boundary_exact`; the campaign boundary applies whichever
+    /// precision rung is configured. Serves rem Bits(0..=15).
+    Level0Agnostic,
+}
+
+/// The mode, decided once per process: `CELESTE_TRACED_SET=traced|ladder`
+/// overrides; otherwise the rem rung picks (Bits(0) -> the level-0 set,
+/// every other rung -> the rung-agnostic set). `compiled_forward`
+/// validates the (mode, precision) combination before any chunk runs.
+pub(crate) fn traced_mode() -> TracedMode {
+    static MODE: std::sync::OnceLock<TracedMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("CELESTE_TRACED_SET").as_deref() {
+        Ok("traced") => TracedMode::Level0,
+        Ok("ladder") => TracedMode::Level0Agnostic,
+        Ok(other) => panic!("CELESTE_TRACED_SET={:?}: expected traced or ladder", other),
+        Err(_) => {
+            use crate::interpreter::abstraction::RemPrecision;
+            match crate::interpreter::abstraction::rem_precision_from_env() {
+                RemPrecision::Bits(0) => TracedMode::Level0,
+                _ => TracedMode::Level0Agnostic,
+            }
+        }
+    })
+}
+
+/// `CELESTE_KERNEL_STRICT=1`: a chunk the kernel set cannot take is a
+/// FATAL coverage gap (CLAUDE.md "Never deopt to the interpreter"), not
+/// a fall-through to the reference path. Off by default because `check`
+/// mode and the differential gates need the reference path to exist.
+pub(crate) fn kernel_strict() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CELESTE_KERNEL_STRICT").is_ok_and(|v| v != "0"))
+}
+
+/// Every distinct miss reason with its lane count, for the strict-mode
+/// abort. Does NOT clear the census (`print_kernel_hits` does).
+pub(crate) fn miss_report() -> String {
+    let why = KERNEL_MISS_WHY.lock().unwrap();
+    if why.is_empty() {
+        return "  (no misses recorded)".to_string();
+    }
+    why.iter()
+        .map(|((class, step), lanes)| {
+            format!("  {} refused at {} ({} lanes)", class, step, lanes)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub(crate) fn run_chunk_kernel(
     chunk: &runtime2::Rt2,
     ids: &runtime2::BoundaryIds,
@@ -48,7 +107,13 @@ pub(crate) static PLAIN_ROUTED: std::sync::atomic::AtomicU64 =
 /// whenever the compiled engine is on: nothing the fingerprint already
 /// reads determines which traced kernels ran, so they name themselves.
 pub fn traced_set_fingerprint() -> u64 {
-    celeste_kernels::traced::FINGERPRINT
+    match traced_mode() {
+        TracedMode::Level0 => celeste_kernels::traced::FINGERPRINT,
+        // Tagged so a rung-agnostic engine never shares checkpoints with
+        // a level-0 one, even in the unlikely event the rendered sources
+        // hashed equal.
+        TracedMode::Level0Agnostic => celeste_kernels::ladder::FINGERPRINT ^ 0x6c61_6464_6572,
+    }
 }
 
 /// Lanes [0] the traced set ran, [1] missed.
@@ -71,6 +136,14 @@ static KROWS: [std::sync::atomic::AtomicU64; 2] = [
 /// this exists to prevent.
 pub fn traced_lanes() -> u64 {
     KERNEL_HITS[0].load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Lanes the traced set has MISSED so far, without resetting the counter.
+/// The ladder differential tests assert this is zero: a run where chunks
+/// quietly fell through to the reference path would otherwise pass while
+/// checking interpreter against interpreter.
+pub fn missed_lanes() -> u64 {
+    KERNEL_HITS[1].load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn print_kernel_hits() {
@@ -115,7 +188,11 @@ fn traced_dispatch() -> &'static crate::trace::dispatch::Dispatch {
     static D: std::sync::OnceLock<crate::trace::dispatch::Dispatch> =
         std::sync::OnceLock::new();
     D.get_or_init(|| {
-        crate::trace::dispatch::Dispatch::new(celeste_kernels::traced::KERNELS)
+        let set = match traced_mode() {
+            TracedMode::Level0 => celeste_kernels::traced::KERNELS,
+            TracedMode::Level0Agnostic => celeste_kernels::ladder::KERNELS,
+        };
+        crate::trace::dispatch::Dispatch::new(set)
             .expect("the checked-in traced kernel set indexes by shape")
     })
 }
@@ -160,7 +237,18 @@ fn run_traced_kernel(
     for mut acc in accs {
         if acc.width > 0 {
             let before = acc.width as u64;
-            acc.boundary(ids);
+            match traced_mode() {
+                // The level-0 set pre-widened in the graph; the boundary's
+                // own widening pass is then a free check that they agree.
+                TracedMode::Level0 => {
+                    acc.boundary(ids);
+                }
+                // The rung-agnostic set hands back EXACT rows; widening
+                // here would pre-empt the campaign's rung with Bits(0).
+                TracedMode::Level0Agnostic => {
+                    acc.boundary_exact();
+                }
+            }
             KROWS[0].fetch_add(before, std::sync::atomic::Ordering::Relaxed);
             KROWS[1].fetch_add(acc.width as u64, std::sync::atomic::Ordering::Relaxed);
             done.push(acc);

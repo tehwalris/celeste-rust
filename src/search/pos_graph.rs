@@ -383,6 +383,7 @@ pub fn build_from_replay(
     use crate::search::checkpoint;
 
     engine.disable_frontier();
+    engine.interpret_origin_replays();
     engine.record_pos_graph();
     for f in from.max(1)..frames {
         let t = std::time::Instant::now();

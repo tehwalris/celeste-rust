@@ -1154,8 +1154,30 @@ impl CompiledForward {
             .map(|(s, _)| s)
             .collect();
         let got = self.engine.run_frame_chunk(&state, Some((frame_cfg, fixed_env)));
-        let want_keys = self.engine.row_key_set(&reference);
-        let got_keys = self.engine.row_key_set(&got);
+        // The comparator must compare AT THE CONFIGURED RUNG's
+        // abstraction. `FrameEngine::row_key_set` funnels through
+        // `Rt2::boundary`, which widens at Bits(0) - fine (and cheap)
+        // when the rung IS Bits(0), but at a finer rung two
+        // rung-distinct row sets can coarsen equal, so the level-0 keys
+        // are too weak a claim there. The rung comparator abstracts both
+        // sides with the campaign's own `split_precision_straddles` +
+        // `make_state_abstract` and compares `sweep::row_keys` sets -
+        // sound to compare across the two engines' different lane
+        // groupings because every step is a per-lane function of the
+        // lane's values and its state's (identical) heap structure.
+        let level0 =
+            crate::interpreter::abstraction::rem_precision_from_env()
+                == crate::interpreter::abstraction::RemPrecision::Bits(0);
+        let (want_keys, got_keys) = if level0 {
+            (self.engine.row_key_set(&reference), self.engine.row_key_set(&got))
+        } else {
+            (
+                rung_row_key_set(&reference)
+                    .context("rung-abstracting the reference side of the check")?,
+                rung_row_key_set(&got)
+                    .context("rung-abstracting the compiled side of the check")?,
+            )
+        };
         let missing: Vec<_> = want_keys.difference(&got_keys).collect();
         let extra: Vec<_> = got_keys.difference(&want_keys).collect();
         if !missing.is_empty() || !extra.is_empty() {
@@ -1199,6 +1221,28 @@ impl CompiledForward {
     }
 }
 
+/// The canonical row-key set of some raw frame-output states at the
+/// CONFIGURED ladder rung: the campaign's own boundary abstraction
+/// (`split_precision_straddles` + `make_state_abstract`), then
+/// `sweep::row_keys` per surviving state. This is check mode's comparator
+/// at every rung above Bits(0) - see the call site.
+fn rung_row_key_set(
+    states: &[State],
+) -> Result<rustc_hash::FxHashSet<(u64, u64)>> {
+    let mut keys: rustc_hash::FxHashSet<(u64, u64)> = Default::default();
+    for s in states {
+        if s.vector_size == 0 {
+            continue;
+        }
+        for st in crate::interpreter::abstraction::split_precision_straddles(s.clone()) {
+            let mut st = make_state_abstract(st);
+            st.gc();
+            keys.extend(super::sweep::row_keys(&st)?);
+        }
+    }
+    Ok(keys)
+}
+
 /// The process's compiled forward engine, if this run opted into one.
 ///
 /// Built once - loading and replaying `rewrites-compile.jsonl` compiles the
@@ -1227,19 +1271,34 @@ fn compiled_forward(program: &Program) -> Result<Option<&'static CompiledForward
     };
 
     // What the compiled path cannot serve, refused up front rather than
-    // silently mis-abstracted. `Rt2::boundary` hardcodes the LEVEL-0 rem
-    // widening and knows nothing about spd buckets, so a refinement rung
-    // running through it would be a DIFFERENT (coarser) abstraction wearing
-    // the rung's name - the exact failure mode the "never widen a field
-    // without a rung that narrows it back" rule exists to prevent.
+    // silently mis-abstracted (plans/kernel-ladder.md). The LEVEL-0 set
+    // bakes the Bits(0) widenings into the graph and its boundary
+    // re-applies them, so any other rung through it would be a DIFFERENT
+    // (coarser) abstraction wearing the rung's name - the exact failure
+    // mode the "never widen a field without a rung that narrows it back"
+    // rule exists to prevent. The RUNG-AGNOSTIC set hands back exact rows
+    // and the campaign boundary applies the rung, so it serves every rem
+    // rung whose blocks carry rem as an interval - Bits(0..=15). Exact
+    // rem carries rem as a plain number, which the agnostic set's ival
+    // slot refuses at bind; that rung needs its own num-rem set.
+    use crate::compiled::dispatch::{traced_mode, TracedMode};
     use crate::interpreter::abstraction::{RemPrecision, SpdPrecision};
     let rem = crate::interpreter::abstraction::rem_precision_from_env();
-    if rem != RemPrecision::Bits(0) {
-        anyhow::bail!(
-            "CELESTE_COMPILED_FORWARD with rem precision {:?}: the compiled \
-             boundary implements level 0 (the full rem widening) only",
-            rem
-        );
+    match (traced_mode(), rem) {
+        (TracedMode::Level0, RemPrecision::Bits(0)) => {}
+        (TracedMode::Level0, other) => anyhow::bail!(
+            "CELESTE_TRACED_SET=traced with rem precision {:?}: the level-0 \
+             set implements Bits(0) only; unset CELESTE_TRACED_SET to let \
+             the rung pick the rung-agnostic set",
+            other
+        ),
+        (TracedMode::Level0Agnostic, RemPrecision::Exact) => anyhow::bail!(
+            "CELESTE_COMPILED_FORWARD with exact rem: an exact block \
+             carries rem as a plain number, which the rung-agnostic set's \
+             interval slot refuses at bind; the exact-rem kernel set is \
+             not generated yet (plans/kernel-ladder.md)"
+        ),
+        (TracedMode::Level0Agnostic, RemPrecision::Bits(_)) => {}
     }
     let spd = crate::interpreter::abstraction::spd_precision_from_env();
     if spd != SpdPrecision::Exact {
@@ -1469,6 +1528,30 @@ impl AbstractRun {
     /// consumer of the pairs must therefore be idempotent per (origin, key)
     /// - the sweep's `newly` bitset is - and pure COUNTS over the pairs
     /// change. `out_of_table` is the one that does; it is a diagnostic.
+    /// Drop the compiled engine for an ORIGIN-TAGGED replay (the backward
+    /// sweep, the pos-graph replay), loudly.
+    ///
+    /// Those replays attribute outputs to inputs by injecting a per-lane
+    /// u32 column as a global (`__sweep_origin` / the pos tag);
+    /// `bridge::import_block` drops globals outside `GLOBAL_NAMES`, and no
+    /// kernel carries the column through to its outputs - so a
+    /// kernel-served chunk would come back with the origins GONE and the
+    /// replay would fail its origin/key length check on every such chunk.
+    /// Until the passthrough exists (plans/kernel-ladder.md "the
+    /// passthrough column"), these replays run on the interpreter, and
+    /// this says so rather than failing mid-sweep. Sound: the per-chunk
+    /// check gate is exactly the claim that both engines produce the same
+    /// row sets from the same chunks.
+    pub fn interpret_origin_replays(&mut self) {
+        if self.compiled.take().is_some() {
+            println!(
+                "origin-tagged replay: the compiled engine is DISABLED (no origin \
+                 passthrough yet - plans/kernel-ladder.md); this replay runs on \
+                 the interpreter"
+            );
+        }
+    }
+
     pub fn skip_boundary_merge(&mut self) {
         self.skip_merge = true;
     }
