@@ -917,3 +917,18 @@ A field PROVABLY never written (springs' spd) has a redundant pin_guard
 with NO guard (no bd). That removes the block-deopt for the safe
 constants and leaves guards only for heuristic ones. Deferred; the
 bd->base routing is the general answer and is needed regardless.
+
+## Realizable size, and gate 1 (2026-08-25)
+
+Lattice kernels rendered (bd bypassed for measurement): **401,120 lines
+on disk** across 18 kernels, vs the abstract room-(2,0) at 1,064,829 -
+**~2.65x smaller** for the FULL kernel (body + structs/acc/append). Per
+shape: the 10 zero-fork shapes are 2.3-7k lines each; the 8 moving-player
+shapes are 19-81k (shape 17 the largest at 81k). So the lattice halves-
+plus the shape count and cuts the total ~2.65x; player position/speed
+specialization would take the 8 big shapes down toward room-1 scale.
+
+Gate ladder status:
+- Gate 1 (compiles): checking now.
+- Gate 2 (differential vs interpreter): needs bd->base dispatch, not yet.
+- Gate 3 (coverage): follows gate 2.
