@@ -194,3 +194,45 @@ COLLIDE BUG. The order of work should be:
 
 Position specialization was the wrong first lever (Result 1); the collide
 bug is the real one.
+
+## Result 2, CORRECTED: collide gates on collideable, but the box test does not fold
+
+Refined the "unconditional bounce" claim - it was overstated. Pinning
+the player's `collideable = false` removes the bounce entirely (shape 3
+drops to 3,071 nodes, 0 forks). So `collide` DOES respect `collideable`
+correctly; it is not returning the player unconditionally.
+
+The narrower, real problem: the **box-overlap comparison does not fold to
+false** when the player is pinned far from the spring. Pinning the player
+at (1000,1000) with springs active at (60,40) still leaves the `spd.y=-3`
+bounce present (as a branch/fork, gated on `collideable AND boxtest`,
+whose `boxtest` never decides false). A concrete AABB test of
+non-overlapping boxes should decide false and prune the branch; it does
+not. There IS a small position dependence in the node count (9,982 at
+(1000,1000) vs 10,319 at valid in-room positions), so the position is not
+wholly ignored - but the specific box comparison that should prune the
+bounce is not folding.
+
+So: not a blatant "bounce everyone" bug, but a box-test-folding gap that
+keeps every active spring's bounce branch live for every player,
+inflating the fork/branch count. Root-causing the exact reason the AABB
+comparison stays symbolic needs a read of the interp's `collide` loop /
+comparison lowering that I have not finished; time-boxing it here and
+recording the reproduction (`transpile --spec-probe 3` with
+`CELESTE_SPEC_NOPOS`, `CELESTE_SPEC_SFIELDS`, `CELESTE_SPEC_PFIELDS`).
+
+### Net so far
+
+1. Position specialization does not shrink the graph (Result 1).
+2. The player's dynamic state (spd + collideable + dash state) is the
+   lever; pinning it all -> 2,597-3,071 nodes / 0 forks.
+3. The spring bounce keeps a branch alive per active spring per player
+   because the box test does not fold - a real inefficiency, possibly a
+   correctness-relevant over-approximation, worth a proper interp fix and
+   independent of specialization.
+
+Next: (a) leave the collide box-fold for a focused interp session; (b)
+build the per-field constant-across-reachable-states measurement (the
+other half of the ask), since that is concrete and tells us which fields
+(spring position, hitbox, tile flags) SHOULD be constants and are being
+carried per-lane.
