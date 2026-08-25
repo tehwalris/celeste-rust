@@ -1151,3 +1151,24 @@ CELESTE_START_ROOM=2,0 ./target/quick/transpile --room-kernels-lattice traced-ke
 cargo test --profile quick --features lattice --manifest-path traced-kernel-check/Cargo.toml room2_lattice_runs_and_covers   # coverage
 ROOM2_ORACLE=1 ... same    # differential (currently blocked, see above)
 ```
+
+## CORRECTNESS CONFIRMED: reachable-state match, 30 frames, 7364 states (2026-08-25)
+
+Philippe's insight: the row-key mismatch is closure-upvalue BOXING, not a
+kernel bug - the compiled interpreter boxes each object's `this` upvalue in
+an extra cell; the AST tracer captures the object pointer directly. That is
+the entire 400-vs-404 cell difference (4 objects x 1 boxing cell). Every
+reachable SCALAR value is identical.
+
+His validation: compare the REACHABLE state (field-path -> value) ignoring
+those cells. Implemented lane-aware as a SET of per-lane signatures
+(`room2_lattice`, ROOM2_ORACLE). Result:
+
+    frame  1: 1 state ... frame 25: 1 ... frame 26: 24 ... frame 27: 204
+    frame 28: 878 ... frame 29: 2864 ... frame 30: 7364 reachable states
+    MATCH the interpreter (row-key differs only by closure-boxing)
+
+So the constant-lattice room-2 kernels compute the interpreter's exact game
+states for 30 frames across all 7364 branched states. The differential is
+GREEN under the reachable-state criterion; the raw row-key differential is
+confounded only by boxing (a representation artifact, not a coverage gap).
