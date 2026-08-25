@@ -555,3 +555,32 @@ The session's concrete deliverable is this map of what does and does not
 work, plus the `transpile --spec-probe` tool that produced it. The
 strategy conversation that motivated position-specialization is answered:
 it would not have helped.
+
+## Confirmed across all three big shapes (2026-08-25)
+
+The negative result is not shape-3-specific. Same probe, shapes 8 and 4:
+
+| shape | base + pm1 | player fully pinned |
+|---|---|---|
+| 3 | 15,104 nodes, 8 forks | 2,597, 0 |
+| 8 | 15,110 nodes, 8 forks | 2,601, 0 |
+| 4 |  9,261 nodes, 8 forks | 2,027, 0 |
+
+Identical pattern: the pm1/position pins do nothing; only pinning the
+player's full dynamic state collapses the graph and kills all forks. The
+8-way fork is a property of every big (14-object) shape in room (2,0),
+driven by the player's velocity-dependent physics, and none of the
+enumerable axes touch it. Conclusion stands and generalises.
+
+## Why room 1 forks 2x and room 2 forks 8x (the remaining mechanism note)
+
+Room (1,0) shape 1 (player alone) forks twice: `rem.x`, `rem.y`. Room
+(2,0)'s big shapes fork eight times. Pinning the player's `spd` takes
+room 2 from 8 to 4 forks, so 4 of the 6 extra forks are velocity-
+dependent branches the room-1 player does not have (spring bounces set
+`spd.y=-3` conditionally; velocity-sign branches in the physics). The
+extra forks are the player interacting with a busier room, and they are
+live for every button and every object geometry - i.e. genuinely per-
+lane-velocity, not a specialization artifact. This is why the fork count,
+and thus the emitted 2^fork size, is inherent to the room's complexity
+rather than removable by pinning static facts.
