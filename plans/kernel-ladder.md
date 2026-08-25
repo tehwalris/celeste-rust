@@ -221,7 +221,23 @@ orthogonal to the engine and untouched here.
 8. `ladder.sh KERNELS=1`: exports `CELESTE_COMPILED_FORWARD=1` +
    `CELESTE_KERNEL_STRICT=1` and forces the pos-graph replay path
    (fused recording needs the passthrough too).
-9. Gates, all green: `ladder_kernels_reproduce_the_interpreter_at_bits1`
+9. **The engine fingerprint is per precision level** - found by the
+   first end-to-end `KERNELS=1` smoke, not by review. The kernel set
+   now varies with the rung, so `traced_set_fingerprint()` does too -
+   and the k=1 band loader recomputed LEVEL 0's checkpoint fingerprint
+   with k=1's own set and refused the checkpoints level 0 had just
+   written. `compiled_engine_fingerprint(rem)` /
+   `dispatch::traced_mode_for(rem)` compute each level's fingerprint
+   with THAT level's engine; a level-0 process's fingerprint is
+   byte-identical to what it was before this campaign (the traced
+   set's), so recorded campaigns stay valid.
+10. End-to-end smoke through the real driver (`KERNELS=1 L0=... KROOT=...
+   ./ladder.sh 40 40 1`, room (1,0), release): level-0 forward 40 frames
+   entirely on kernels (`kernel lanes: traced 673503 missed 0
+   plain-routed 0`, strict), pos-graph and sweep replays print the
+   disable notice and run, k=1 banded loads level 0's band and refutes
+   (h40 has no win, so an empty band is the correct answer).
+11. Gates, all green: `ladder_kernels_reproduce_the_interpreter_at_bits1`
    (28 frames, room (1,0), check mode at `CELESTE_REM_BITS=1` with
    strict on, kernel engagement AND zero missed lanes asserted - frames
    25-28 cover the fork/straddle region), the same at Bits(0) with

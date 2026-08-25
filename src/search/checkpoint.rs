@@ -153,7 +153,9 @@ impl CampaignConfig {
                 .is_some(),
             max_state_lanes: crate::search::run::effective_chunk_cap(),
             fruit_chunk_lanes: crate::search::run::effective_fruit_chunk_cap(),
-            compiled_engine: Self::compiled_engine_fingerprint(),
+            compiled_engine: Self::compiled_engine_fingerprint(
+                crate::interpreter::abstraction::rem_precision_from_env(),
+            ),
             synthetic_win: crate::interpreter::abstraction::synthetic_win_xy(),
         }
     }
@@ -162,7 +164,15 @@ impl CampaignConfig {
     /// program the compiled path's boundary was ported from), and the
     /// traced kernel set contributes its own content hash because no file
     /// the fingerprint reads determines it.
-    fn compiled_engine_fingerprint() -> Option<u64> {
+    ///
+    /// PER PRECISION LEVEL, because the kernel set is: dispatch selects
+    /// the set by the rem rung (plans/kernel-ladder.md), so the
+    /// fingerprint a level-0 process stamps its checkpoints with names
+    /// the level-0 set, and a banded rung recomputing that level's
+    /// fingerprint must name the same set - not its own.
+    fn compiled_engine_fingerprint(
+        rem: crate::interpreter::abstraction::RemPrecision,
+    ) -> Option<u64> {
         match std::env::var("CELESTE_COMPILED_FORWARD") {
             Err(_) => None,
             Ok(v) if v == "0" => None,
@@ -172,7 +182,10 @@ impl CampaignConfig {
                 std::fs::read_to_string("rewrites-compile.jsonl")
                     .unwrap_or_default()
                     .hash(&mut h);
-                crate::compiled::dispatch::traced_set_fingerprint().hash(&mut h);
+                crate::compiled::dispatch::set_fingerprint_for(
+                    crate::compiled::dispatch::traced_mode_for(rem),
+                )
+                .hash(&mut h);
                 Some(h.finish())
             }
         }
@@ -194,6 +207,7 @@ pub fn config_fingerprint_with_precision(
     let mut config = CampaignConfig::from_env();
     config.precision = precision.rem;
     config.spd_precision = precision.spd;
+    config.compiled_engine = CampaignConfig::compiled_engine_fingerprint(precision.rem);
     config_fingerprint_for(recipe_text, &config)
 }
 
@@ -225,6 +239,14 @@ pub fn coarser_precision_fingerprints_for(
             let mut config = base.clone();
             config.precision = level.rem;
             config.spd_precision = level.spd;
+            // The engine is a function of the level too - see
+            // `compiled_engine_fingerprint`. `base` may carry a synthetic
+            // config whose `compiled_engine` was set by a test; only
+            // recompute when the base took it from the env.
+            if config.compiled_engine.is_some() {
+                config.compiled_engine =
+                    CampaignConfig::compiled_engine_fingerprint(level.rem);
+            }
             (level, config_fingerprint_for(recipe_text, &config))
         })
         .collect()

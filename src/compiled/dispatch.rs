@@ -41,22 +41,36 @@ pub(crate) enum TracedMode {
 /// validates the (mode, precision) combination before any chunk runs.
 pub(crate) fn traced_mode() -> TracedMode {
     static MODE: std::sync::OnceLock<TracedMode> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("CELESTE_TRACED_SET").as_deref() {
+    *MODE.get_or_init(|| {
+        traced_mode_for(crate::interpreter::abstraction::rem_precision_from_env())
+    })
+}
+
+/// The mode a process AT `rem` would select - the same env override,
+/// else the rung picks. Public within the crate because the checkpoint
+/// fingerprint of a COARSER precision level must be computed with THAT
+/// level's engine, not the current process's: a banded rung validates
+/// the level below it against the fingerprint that level itself wrote
+/// (found by the h40 KERNELS=1 smoke, where k=1 computed level 0's
+/// fingerprint with the ladder set and refused the level-0 checkpoints
+/// the level-0-set process had written).
+pub(crate) fn traced_mode_for(
+    rem: crate::interpreter::abstraction::RemPrecision,
+) -> TracedMode {
+    use crate::interpreter::abstraction::RemPrecision;
+    match std::env::var("CELESTE_TRACED_SET").as_deref() {
         Ok("traced") => TracedMode::Level0,
         Ok("ladder") => TracedMode::Level0Agnostic,
         Ok("exact") => TracedMode::ExactRem,
         Ok(other) => {
             panic!("CELESTE_TRACED_SET={:?}: expected traced, ladder or exact", other)
         }
-        Err(_) => {
-            use crate::interpreter::abstraction::RemPrecision;
-            match crate::interpreter::abstraction::rem_precision_from_env() {
-                RemPrecision::Bits(0) => TracedMode::Level0,
-                RemPrecision::Bits(_) => TracedMode::Level0Agnostic,
-                RemPrecision::Exact => TracedMode::ExactRem,
-            }
-        }
-    })
+        Err(_) => match rem {
+            RemPrecision::Bits(0) => TracedMode::Level0,
+            RemPrecision::Bits(_) => TracedMode::Level0Agnostic,
+            RemPrecision::Exact => TracedMode::ExactRem,
+        },
+    }
 }
 
 /// `CELESTE_KERNEL_STRICT=1`: a chunk the kernel set cannot take is a
@@ -116,7 +130,13 @@ pub(crate) static PLAIN_ROUTED: std::sync::atomic::AtomicU64 =
 /// whenever the compiled engine is on: nothing the fingerprint already
 /// reads determines which traced kernels ran, so they name themselves.
 pub fn traced_set_fingerprint() -> u64 {
-    match traced_mode() {
+    set_fingerprint_for(traced_mode())
+}
+
+/// `traced_set_fingerprint` for an explicit mode (the checkpoint
+/// fingerprint of another precision level - see `traced_mode_for`).
+pub(crate) fn set_fingerprint_for(mode: TracedMode) -> u64 {
+    match mode {
         TracedMode::Level0 => celeste_kernels::traced::FINGERPRINT,
         // Tagged so the modes never share checkpoints, even in the
         // unlikely event two sets' rendered sources hashed equal.
