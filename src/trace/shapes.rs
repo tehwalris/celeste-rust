@@ -345,5 +345,20 @@ pub fn ival_paths(st: &State<Symbolic>) -> Vec<Path> {
             }
         }
     }
+    // A live fruit's `off` and `y` are widened to intervals by the runtime
+    // boundary (widen.rs), so they arrive at a kernel as intervals, not
+    // numbers. They must be ival INPUTS or a mid-game block will not bind
+    // (room 1 has no fruit, so this is a no-op there).
+    if let Some(Value::Table(fruit)) = iface::get(st, &[iface::key("fruit")]) {
+        for i in 0..n {
+            let base = vec![iface::key("objects"), Step::Idx(i)];
+            let mut ty = base.clone(); ty.push(iface::key("type"));
+            if iface::get(st, &ty) != Some(Value::Table(fruit)) { continue; }
+            for f in ["off", "y"] {
+                let mut p = base.clone(); p.push(iface::key(f));
+                if iface::get(st, &p).is_some() { out.push(p); }
+            }
+        }
+    }
     out
 }
