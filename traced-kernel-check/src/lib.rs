@@ -114,8 +114,19 @@ mod tests {
                     // inferred - assuming the first N bits of `take`
                     // were written is wrong and produced a spurious
                     // mismatch.
-                    let wrote =
-                        $app(&mut self.accs[$idx], sh, v, take, self.n, &mut self.seen[$idx]);
+                    // `&[]` for the origin metadata: the harness checks
+                    // an untagged frame, and `append` treats an empty
+                    // slice as "no origins tracked" (the same contract
+                    // the engine uses for untagged blocks).
+                    let wrote = $app(
+                        &mut self.accs[$idx],
+                        sh,
+                        v,
+                        take,
+                        self.n,
+                        &mut self.seen[$idx],
+                        &[],
+                    );
                     for lane in 0..16 {
                         if wrote & (1 << lane) != 0 {
                             self.from[$idx].push((mask, lane));
