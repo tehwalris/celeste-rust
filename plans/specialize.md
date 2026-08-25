@@ -664,3 +664,49 @@ be for a 14-object mid-play frame. The size lever, if any, is not
 specialization but a different BACKEND for the base kernel (interpret the
 graph rather than compile 2^8 configs to Rust), or accepting room (2,0)
 on the interpreter until then.
+
+## RE-OPENED: Philippe was right - collide has a real position-blindness bug (2026-08-25)
+
+Philippe disagreed with the "inherent" conclusion, correctly. His model:
+at runtime x/y/spd are concrete per-lane, only rem is widened, so the
+ONLY genuine forks are the 2 rem forks. A far player at a known velocity
+cannot be bounced, so room (2,0) far from a spring should fork like room
+(1,0). Two-step plan he wants: (1) compile with concrete position+speed
+-> only rem forks, fix this first; (2) later, compile with a compile-time
+INTERVAL assumption on speed (still concrete at runtime) -> should drop
+the same spring forks.
+
+Chased step 1's failure to root. CONFIRMED it is a bug, not inherent:
+
+* `Graph::fold` does NOT constant-fold arithmetic (Add/Sub/Flr) or
+  comparisons - they fall to `_ => {}`. `decide` only recognises literal
+  `ConstBool`. BUT `Symbolic::arith` and `Symbolic::compare` DO fold when
+  both operands are exact `Const` (`as_p8` requires lo==hi). So a box test
+  of exact-constant positions SHOULD fold.
+* Yet with the player pinned at (40,40) and the springs pinned FAR at
+  (999,40)/(888,40), hitbox+spd+collideable all concrete, the spring
+  bounce `spd.y=-3` still fires - 4 forks, gated only on the springs'
+  `hide_for`, with NO position term. The collide box test folded to TRUE
+  for a player 950px from the spring.
+* `Gt(47, 999)` folds to false correctly (verified in the code path). So
+  the box test's spring-position operand is NOT the pinned (999) value -
+  the bounce's `collide` reads the spring position through a path the pin
+  on `objects[1].x` does not reach. (A box test that DID use the pin,
+  `player.x vs 999`, appears elsewhere with the player symbolic - so SOME
+  collide uses the live cell, but the bounce's does not.)
+
+So: the spring's `collide(player)` that drives the bounce is comparing
+against a spring position that is not the live, pinnable `objects[k].x` -
+a closure/object-identity or stale-read bug in the object-collide path.
+Fixing it makes a concretely-far player prune the bounce, which is
+exactly step 1. This RETRACTS the "no lever / inherent" conclusion: the
+lever is fixing collide, and Philippe's prior ("it's not real") was
+right.
+
+### Next concrete step
+
+Isolate in a minimal 2-object (player + spring) trace: call the spring's
+`collide(player)` at known positions and confirm whether its `obj` (the
+captured self) reads the live spring table or a stale/other one. The
+`--spec-probe` evidence points at the bounce's collide obj not being the
+pinned objects[k]; a unit-level trace will name the exact divergence.
