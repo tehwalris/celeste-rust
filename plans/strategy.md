@@ -234,3 +234,16 @@ Goal: Keep tooling separate from core interpreter logic so that:
 - How to structure the state viewer? (CLI? TUI? Web?)
 - How to handle the "abstract states contain unreachable concrete states" problem when debugging? (False positives are expected but confusing)
 - Should we invest in making OCaml faster, or focus entirely on Rust?
+
+## Target architecture note (Philippe, 2026-08-25)
+
+The forward / backward-sweep / pos-graph / precision-refinement logic
+should EVENTUALLY live in ONE binary, not a shell wrapper (`ladder.sh`
+today stitches separate `rewrite` sub-commands together via checkpoints
+on disk). Keep checkpoint/resume around each stage - these ops are
+expensive and resumability is load-bearing - but the orchestration
+itself belongs in Rust, not bash. Not urgent; recorded so it is not
+lost. (Context: the kernel-driven ladder is being built now; the
+interpreter ladder's forward=`bench`, backward=`sweep`, refine=banded
+`bench`+`sweep` are distinct binaries today - see the 2026-08-25 code
+audit in the session log.)
