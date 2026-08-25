@@ -2364,3 +2364,130 @@ pub fn specialize_probe(
     }
     Ok(out)
 }
+
+/// The per-shape constant lattice by FIXPOINT (plans/specialize.md D1).
+///
+/// Seeds from the concrete spawn state (all fields constant) and traces
+/// forward keeping each shape's known-constant fields CONCRETE (pinned)
+/// rather than abstracting them - so a field the frame never changes
+/// (spring `spd`, static positions) stays a constant and folds the
+/// collisions that depend on it. On reaching a shape, the outcome's
+/// constant fields are INTERSECTED into that shape's lattice; a shape
+/// whose lattice shrinks is re-processed. Monotone (fields only go
+/// constant->abstract), so it terminates.
+///
+/// Returns `(shape key -> constant field map)` plus a blanked
+/// representative state per shape for later re-tracing.
+pub fn room_constant_lattice(
+    root: &std::path::Path,
+) -> Result<(
+    std::collections::BTreeMap<String, std::collections::BTreeMap<super::iface::Path, super::iface::Conc>>,
+    std::collections::BTreeMap<String, super::state::State<super::domain::Symbolic>>,
+    std::collections::BTreeMap<String, usize>,
+)> {
+    use super::domain::Symbolic;
+    use super::interp::Interp;
+    use super::verify::{run_one, trace_frame};
+    use super::domain::Domain;
+    use super::{cart, shapes};
+    use anyhow::{anyhow, bail};
+    type Cmap = std::collections::BTreeMap<super::iface::Path, super::iface::Conc>;
+
+    let src = cart::sources_in(root)?;
+    let top = full_moon::parse(&src).map_err(|e| anyhow!("parse: {:?}", e))?;
+    let init = full_moon::parse("_init()").map_err(|e| anyhow!("parse _init: {:?}", e))?;
+    let reset = full_moon::parse("__reset_button_states()").map_err(|e| anyhow!("reset: {:?}", e))?;
+    let fr = full_moon::parse(cart::FRAME_CODE).map_err(|e| anyhow!("frame: {:?}", e))?;
+
+    let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
+    let cart_data = std::sync::Arc::new(celeste_core::cart_data::CartData::load(root.join("cart"))?);
+    let (rx, ry) = celeste_interp::game_runner::start_room();
+    let cache = std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(&cart_data, rx, ry)?);
+    it.cache = Some(cache.clone());
+    it.cart = Some(cart_data.clone());
+
+    let st = cart::fresh_state::<Symbolic>(&mut it.d);
+    let st = run_one(&mut it, &top, st)?;
+    let mut st = st;
+    cart::inject_tile_flag_at(&mut st);
+    let start = run_one(&mut it, &init, st)?;
+
+    let key = |st: &super::state::State<Symbolic>| -> Result<String> { Ok(format!("{:?}", st.shape()?)) };
+
+    let mut lattice: std::collections::BTreeMap<String, Cmap> = Default::default();
+    let mut reps: std::collections::BTreeMap<String, super::state::State<Symbolic>> = Default::default();
+    let mut forks: std::collections::BTreeMap<String, usize> = Default::default();
+
+    let sk = key(&start)?;
+    lattice.insert(sk.clone(), shapes::field_constants(&start, &it.d)?);
+    reps.insert(sk.clone(), start.clone());
+    let mut work: Vec<String> = vec![sk];
+    let room0 = shapes::room_of(&start, &it.d);
+    let mut guard = 0usize;
+
+    while let Some(k) = work.pop() {
+        guard += 1;
+        if guard > 20000 { bail!("constant-lattice fixpoint did not converge"); }
+        let st = reps[&k].clone();
+        let roots = shapes::state_paths(&st)?;
+        let ival = shapes::ival_paths(&st);
+        // Pin the shape's known constants (only those that are real scalar
+        // inputs here), everything else abstract.
+        let pin: Vec<(super::iface::Path, super::iface::Conc)> = lattice[&k]
+            .iter()
+            .filter(|(p, _)| roots.iter().any(|r| r == *p))
+            .map(|(p, c)| (p.clone(), *c))
+            .collect();
+        let f = match trace_frame(&mut it, &reset, &fr, st, &roots, &pin, &ival, true) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        // Live forks of THIS (converged-so-far) trace of shape k.
+        {
+            use crate::transpile::graph::Op;
+            let mut rn: Vec<crate::transpile::graph::NodeId> = Vec::new();
+            for o in &f.outs { for (_, nd, _) in &o.fields { rn.push(*nd); } rn.push(o.guard); rn.push(o.ok); }
+            let reach = crate::transpile::bdd::reachable(&it.d.graph, &rn);
+            let mut fs = std::collections::BTreeSet::new();
+            for id in 0..it.d.graph.len() { if reach[id] { if let Op::Split(d) = it.d.graph.get(id as u32).op { fs.insert(d); } } }
+            forks.insert(k.clone(), fs.len());
+        }
+        for o in &f.outs {
+            if it.d.decide(&o.ok) == Some(false) { continue; }
+            if shapes::room_of(&o.st, &it.d) != room0 { continue; }
+            let tk = key(&o.st)?;
+            let fc = shapes::field_constants(&o.st, &it.d)?;
+            let changed = match lattice.get_mut(&tk) {
+                None => {
+                    lattice.insert(tk.clone(), fc);
+                    let mut rep = o.st.clone();
+                    shapes::blank(&mut rep, &mut it.d)?;
+                    reps.insert(tk.clone(), rep);
+                    true
+                }
+                Some(m) => {
+                    let before = m.len();
+                    m.retain(|p, v| fc.get(p) == Some(v));
+                    m.len() != before
+                }
+            };
+            if changed && !work.contains(&tk) { work.push(tk); }
+        }
+    }
+    Ok((lattice, reps, forks))
+}
+
+/// Report the constant lattice for `transpile --room-consts`.
+pub fn room_constants(root: &std::path::Path) -> Result<String> {
+    let (lattice, _, forks) = room_constant_lattice(root)?;
+    let mut out = String::new();
+    out.push_str(&format!("{} shapes reached (constant-lattice fixpoint)\n", lattice.len()));
+    for (i, (k, cm)) in lattice.iter().enumerate() {
+        let spd: Vec<String> = cm.keys().map(super::iface::show)
+            .filter(|s| s.contains("objects[") && s.contains(".spd")).collect();
+        out.push_str(&format!("shape {}: {} const fields, {} LIVE FORKS; object spd consts: {}\n",
+            i, cm.len(), forks.get(k).copied().unwrap_or(999),
+            if spd.is_empty() { "none".into() } else { spd.join(", ") }));
+    }
+    Ok(out)
+}

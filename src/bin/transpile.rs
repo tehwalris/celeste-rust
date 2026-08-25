@@ -34,6 +34,11 @@ fn main() -> Result<()> {
                         .context("--spec-probe SHAPE index")?,
                 );
             }
+            "--room-consts" => {
+                let report = celeste_rust::trace::kernel::room_constants(std::path::Path::new("."))?;
+                print!("{}", report);
+                return Ok(());
+            }
             other => return Err(anyhow!("unknown argument {:?}", other)),
         }
     }

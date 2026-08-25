@@ -202,6 +202,34 @@ pub struct Walk {
 ///
 /// `start` must be a state in the room the kernels are for; the walk
 /// stays in it.
+/// The scalar fields of `st` that are compile-time constants: their value
+/// node is an exact `Const(v,v)` (numbers) or `ConstBool` (booleans).
+/// These are the fields the per-shape constant lattice can bake in.
+pub fn field_constants(
+    st: &State<Symbolic>,
+    d: &Symbolic,
+) -> Result<std::collections::BTreeMap<Path, super::iface::Conc>> {
+    use super::domain::Domain;
+    use super::iface::Conc;
+    let mut out = std::collections::BTreeMap::new();
+    for p in state_paths(st)? {
+        match iface::get(st, &p) {
+            Some(Value::Num(n)) => {
+                if let Some(v) = d.as_const(&n) {
+                    out.insert(p, Conc::Num(v));
+                }
+            }
+            Some(Value::Bool(b)) => {
+                if let Some(v) = d.decide(&b) {
+                    out.insert(p, Conc::Bool(v));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
 pub fn walk<'a>(
     it: &mut Interp<'a, Symbolic>,
     reset: &'a ast::Ast,
