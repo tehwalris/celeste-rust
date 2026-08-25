@@ -1,0 +1,237 @@
+# The ladder on kernels: forward + backward + refinement without the interpreter
+
+Autonomous session, 2026-08-25 (worktree). Task: run the SAME full
+precision ladder (`ladder.sh`: level-0 forward + backward sweep + banded
+k=1..16 forward passes + horizon climbing) with the TRACED KERNELS as the
+frame engine, interpreter as reference only.
+
+## What the ladder actually is (mapped from the code)
+
+One horizon H of `ladder.sh` runs, per precision level:
+
+| stage | binary | primitive |
+|---|---|---|
+| level-0 forward extend | `rewrite bench --frames H` | `AbstractRun::step`, one frame = chunks through the frame body |
+| position graph | `rewrite pos-graph` (or fused `--record-pos-graph`) | the SAME forward replay, with `PosObserver` tagging each lane (`inject_named(POS_ORIGIN)`) |
+| backward sweep | `rewrite sweep --horizon H` | `sweep_time::backward_sweep_time`: candidate rows re-expanded through **`AbstractRun::step`** with a `__sweep_origin` column injected per lane |
+| banded level k | `CELESTE_REM_BITS=k rewrite bench --band-dir <k-1>` | `AbstractRun::step` again, plus `BandFilter` (coarsen each output row to level k-1, look it up in k-1's row table + g) |
+
+So there is exactly ONE frame primitive in the whole ladder -
+`AbstractRun::step` - and it already dispatches per chunk to
+`compiled::FrameEngine::run_frame_chunk` when `CELESTE_COMPILED_FORWARD`
+is set. The backward pass, the band, the refinement mapping
+(`coarsen_to` + row-table lookup), checkpoints, the visited set and the
+horizon loop are all SEARCH machinery layered on that primitive; none of
+them names the interpreter. Driving the ladder with kernels therefore
+means making `run_chunk_kernel` serve every rung, not rebuilding any
+pass.
+
+## Why it does not already work: precision
+
+Three places hardcode the level-0 abstraction:
+
+1. **The kernels themselves.** `trace::widen` bakes the boundary
+   widenings into the traced graph (rem := `[-0.5, 0.5)`, timer pins,
+   `dash_effect_time` clamp, fruit band). Sound ONLY at Bits(0); at
+   Bits(k) the full-interval rem has already destroyed the bucket, and
+   no downstream pass can narrow it back. This is the "never widen
+   without a rung that narrows it back" rule showing up as compiled
+   code.
+2. **`Rt2::boundary_canonicalize`** re-applies the same Bits(0)
+   widenings (with containment asserts) to every kernel accumulator.
+3. **`compiled_forward()`** therefore refuses `CELESTE_REM_BITS != 0`
+   and any spd rung, up front.
+
+## The design: rung-agnostic kernels, rung applied by the campaign
+
+The key observation (already latent in `run_frame_chunk`'s contract):
+the campaign re-applies its OWN abstraction to every frame output -
+`stream_boundary_prepare` runs `split_precision_straddles` +
+`make_state_abstract` on every state either engine produces, and THOSE
+are already parameterized over `LadderPrecision`. So the kernels do not
+need to know the rung at all; they need to stop pre-empting it:
+
+* **Generate a second kernel set with `widen = false`** - the flag
+  `trace_frame` already has (the concrete-oracle differential uses it).
+  The kernel computes the frame's EXACT outputs; rem comes out as the
+  computed interval (input width preserved: rem_in + const shifts, the
+  flr fork splits), not the constant.
+* **The engine boundary gets an exact variant** (`Rt2::boundary_exact`):
+  materialize + canonicalize + hash + dedup, NO widening. Dedup of
+  exact-identical rows is sound at every rung. The campaign boundary
+  then applies the rung: bucket-straddle splitting and bucket widening
+  for Bits(k), exactly as the interpreter path does, in the same code.
+* **Dispatch selects the set by rung**: Bits(0) keeps the checked-in
+  widened set (`celeste_kernels::traced` - faster, its in-kernel dedup
+  key is rung-0-canonical); Bits(1..=15) uses the rung-agnostic set
+  (`celeste_kernels::ladder`); `CELESTE_TRACED_SET=ladder` forces the
+  agnostic set at Bits(0) for gating. Exact (k=16) and spd rungs stay
+  refused for now (below).
+
+Correctness argument, per rung k in 0..=15: the traced set is gated
+row-key-identical against the interpreter per chunk
+(`CELESTE_COMPILED_FORWARD=check`); with no widening on either side of
+the bridge, both engines hand the campaign the same exact row set, and
+the campaign applies the identical rung abstraction to both. The check
+comparator must compare at the RUNG's abstraction, not at Bits(0) -
+`FrameEngine::row_key_set` funnels through `Rt2::boundary`, which
+widens at Bits(0), and two rung-k-distinct sets can coarsen equal. So
+check mode at rem != Bits(0) abstracts both sides with the campaign's
+`make_state_abstract` and compares `sweep::row_keys` sets (a strictly
+stronger comparator at the rung).
+
+### Why not kernels-per-precision-level?
+
+Considered and REJECTED as the first step, kept as the optimization:
+
+* Bits(k) baked in means the widening becomes `flr(rem * 2^k)/2^k`
+  bucket arithmetic in the graph plus a SECOND fork (the output bucket
+  straddle - a width-2^-k interval crosses at most one bucket boundary,
+  the same <=2-fragment structure as the flr fork). Buildable with the
+  existing `Op::Split` vocabulary, but it is 16 kernel sets, a
+  per-rung staleness gate, and a per-rung differential - and what it
+  buys is only the in-kernel dedup catching rows that differ in
+  soon-to-be-widened bits (the 5.9x factor of the 46x analysis at
+  level 0; MUCH smaller at high rungs, where rows genuinely differ).
+  tracing.md already frames this: "shape only - correct, rung-agnostic,
+  dedups nothing" -> "shape + rung-aware key" is a LAYER on top. Build
+  the correct rung-agnostic base first, specialize per rung when a
+  measurement says the dedup loss matters.
+* The banded rungs are TUBE-CONFINED (band filter) and empirically
+  cheap next to level 0 (`ladder.sh`: "Level>=1 runs are tube-confined
+  and cheap"), so the performance case for per-rung baking is weakest
+  exactly where it would be used.
+
+### The rungs still refused, and what each needs
+
+* **Exact rem (k=16, the top rung).** An exact-rem block carries rem as
+  `Col::N` (plain numbers); the agnostic set's rem slot is `ival`, so
+  bind refuses. Needs a THIRD set traced with `ival_paths = []` (rem a
+  plain symbolic num, `__split_by_flr` the identity, no forks). Cheap
+  to generate; not done yet purely for scope. Until then the k=16 rung
+  runs on the interpreter, which weakens "interpreter never in the
+  search path" to "…except the top rung" - named, not hidden. NOTE:
+  `make_state_abstract` also skips the fruit off/y widening at Exact,
+  which the exact set must also not bake (moot for room (1,0), no
+  fruit).
+* **Spd rungs (`CELESTE_SPD_WIDTH_LOG2`).** Bucketed spd makes
+  `player.spd.x/y` interval INPUTS, which the kernels type as num.
+  Needs `ival_paths += spd` plus emitter support for whatever spd
+  feeds that cannot take an interval yet (cf. the interval-sin fix for
+  room 2's fruit). Room (1,0)'s ladder does not use spd rungs; still
+  refused.
+
+## The interpreter out of the search path: strict mode
+
+`run_frame_chunk` today falls through to the campaign program on any
+missed chunk. That is a silent interpreter dependency, so:
+
+* `CELESTE_KERNEL_STRICT=1`: a chunk the kernel set cannot take
+  (shape miss, bind refusal, declined lane) is FATAL. The failure
+  aggregates every distinct miss reason with lane counts
+  (`KERNEL_MISS_WHY` already collects them) and panics with a
+  distinct message after the frame's chunks have all been dispatched
+  (the dispatch-all-before-interpreting order already guarantees the
+  census is complete). Checkpoints are per completed frame, so the run
+  resumes at frame f-1 after the gap is fixed - the doctrine's shape.
+* Default (unset) keeps today's fall-through, because `check` mode and
+  the differential tests NEED the reference path.
+
+## The backward sweep and pos-graph: the passthrough column
+
+Both the sweep and the position graph attribute outputs to inputs by
+injecting a per-lane u32 column as a global (`__sweep_origin`,
+`POS_ORIGIN`) and reading it back after the frame. The kernels cannot
+carry it today, and the failure is at least loud: `import_block` drops
+globals outside `GLOBAL_NAMES`, so the sweep's origin/key length check
+fails rather than silently mis-attributing.
+
+Two workable designs, NEITHER done in this session:
+
+1. **Origin-shape kernels.** Append `__origin` to `GLOBAL_NAMES` and
+   let the shape walk also trace each shape with the origin global
+   present (a symbolic per-lane num nothing reads: the kernel passes it
+   through, it participates in the row key, so dedup keeps distinct
+   origins apart - exactly the interpreter's semantics). Dispatch by
+   shape hash separates tagged from untagged blocks by construction.
+   COST: growing `GLOBAL_NAMES` changes `Rt2::shape_hash_of` (it
+   hashes the whole globals vec) and therefore every baked `SHAPE`
+   const, the row keys (seeded from the shape hash), every checkpoint
+   and visited table. CLAUDE.md flags exactly this as "not a change
+   that can be done halfway". It is the clean design, and it is
+   Philippe's call to take the invalidation.
+2. **Engine-carried origin column.** Teach the generated interface an
+   optional origin column: `rows` gathers it, `append{i}` writes it
+   into the accumulator, the RowSet key and the boundary row key mix it
+   in. No shape change, no checkpoint invalidation, but it is emitter
+   + generated-code surface (bind/rows/append/keys) and a regeneration.
+
+Until one lands, the sweep and the pos-graph replay run with the
+compiled engine OFF (their stages set `CELESTE_COMPILED_FORWARD=0`).
+Soundness is unaffected - the sweep's expansion is gated to produce the
+same row sets as the kernels (that is the per-chunk check gate's
+claim), and the pos graph is a positional over-approximation that only
+filters sweep COST. The honest statement: the interpreter remains in
+the backward pass until the passthrough exists; the forward passes -
+which dominate the campaign - do not need it.
+
+## Refinement mapping: nothing to do
+
+`BandFilter` coarsens level-k output rows with `coarsen_to` (State
+domain, campaign side of the bridge) and looks them up in level k-1's
+row table. The kernels never see it. The band-miss soundness TODO in
+`run.rs` (a miss against an unbanded previous level must be fatal) is
+orthogonal to the engine and untouched here.
+
+## Work done in this session
+
+1. `Rt2::boundary_exact` in celeste-engine (`boundary_prepare` +
+   `boundary_finish` shared with `boundary_canonicalize`; the widenings
+   are `boundary_widen`, which the exact path skips).
+2. `widen` threaded through `shapes::walk` -> `room_shapes_in` ->
+   `room_kernels_widened_in` -> `write_room_kernels_ladder`; `transpile
+   --room-kernels-ladder DIR` generates the rung-agnostic set;
+   `regen-generated.sh` regenerates both sets.
+3. The room (1,0) rung-agnostic set checked in at
+   `crates/celeste-kernels/src/ladder/` (3 shapes, 28,407 lines), with
+   `FINGERPRINT`, and a staleness gate `ladder_kernels_are_current`
+   (byte-for-byte, like `traced_kernels_are_current`; ~2 s under quick).
+   Checking it in re-triggered the known rustc DWARF stack-overflow
+   SEGV on huge generated functions, this time in the DEV profile -
+   `[profile.dev.package.celeste-kernels] debug = false` beside the
+   existing release override.
+4. `compiled::dispatch::TracedMode`: registry + boundary selected once
+   per process from the rem rung (`CELESTE_TRACED_SET=traced|ladder`
+   overrides); `compiled_forward()` now admits Bits(1..=15) via the
+   ladder set and refuses Level0-set overrides off Bits(0), Exact rem,
+   and spd rungs, each with the reason; `traced_set_fingerprint()`
+   returns the ACTIVE set's fingerprint, mode-tagged, so engines never
+   share checkpoints.
+5. Check mode at rem != Bits(0) compares rung-abstracted
+   `sweep::row_keys` sets (`rung_row_key_set`: both sides through the
+   campaign's own `split_precision_straddles` + `make_state_abstract`).
+6. `CELESTE_KERNEL_STRICT=1` as above (`run_frame_chunk` panics with
+   `dispatch::miss_report()` before the fallback would run).
+7. `AbstractRun::interpret_origin_replays()`, called by
+   `backward_sweep_time` and `pos_graph::build_from_replay`: drops the
+   compiled engine for origin-tagged replays with a printed notice
+   instead of failing mid-sweep on the length check.
+8. `ladder.sh KERNELS=1`: exports `CELESTE_COMPILED_FORWARD=1` +
+   `CELESTE_KERNEL_STRICT=1` and forces the pos-graph replay path
+   (fused recording needs the passthrough too).
+9. Gates, all green: `ladder_kernels_reproduce_the_interpreter_at_bits1`
+   (28 frames, room (1,0), check mode at `CELESTE_REM_BITS=1` with
+   strict on, kernel engagement AND zero missed lanes asserted - frames
+   25-28 cover the fork/straddle region), the same at Bits(0) with
+   `CELESTE_TRACED_SET=ladder`, and `ladder_kernels_are_current`.
+
+## Not done, in honesty order
+
+* The k=16 exact-rem set (design above; generation flag is the same
+  machinery with `ival_paths = []`).
+* The origin passthrough (both designs above; decision needed).
+* Spd rungs.
+* Per-rung baked kernels (the optimization layer).
+* A full ladder campaign run on kernels end to end - needs release
+  builds and hours; the per-rung differential gate is the evidence
+  offered instead.
