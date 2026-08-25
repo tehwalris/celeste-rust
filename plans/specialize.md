@@ -761,3 +761,31 @@ The earlier "no lever" conclusion is fully retracted. The lever is
 baking in static objects' constant SPEED (and position), which the
 per-field-constant-across-reachable-states analysis produces
 automatically. That is the concrete next build.
+
+## Building it: per-field constant lattice (2026-08-25, decisions to review)
+
+Building the constant-lattice detection + baking. Decisions/assumptions,
+flagged for review:
+
+- **D1. Two phases.** Phase A: run the existing (fully-abstract) shape
+  walk and, as a side effect, accumulate per shape the constant lattice -
+  for each scalar field, the single constant it holds across every state
+  that reaches the shape, or "abstract" if it ever varies / is symbolic.
+  Phase B: regenerate each shape's kernel tracing with the constant fields
+  PINNED (via the existing `pin`), so they fold. Start with the
+  measurement (Phase A) to see the constant set before wiring Phase B.
+- **D2. Soundness via pin_guard, so detection can be heuristic.** A pinned
+  constant becomes an `ok` conjunct (`pin_guard`); a lane whose field
+  disagrees is DECLINED to the base kernel, never wrong. So the lattice
+  need not be a fully sound fixpoint - if it over-claims a constant, the
+  guard catches it. This is exactly the base+guard design agreed earlier.
+- **D3. Constants read from the pre-blank outcome states** (`o.st` in the
+  walk), where a field is a constant iff its value node is `Const(v,v)` /
+  `ConstBool`. The blanked representative is useless (all zeros), so the
+  lattice is merged over every ARRIVAL at a shape, including the ones the
+  walk currently skips as already-seen.
+- **D4. Phase B shape set = Phase A's** (fully abstract), which is a sound
+  superset; the const-pinned trace may reach fewer output shapes, and any
+  lane not matching the pins falls to base.
+- **Open**: the true fixpoint (trace from the lattice, which changes
+  reachability) is deferred; Phase A/B is the first, guard-safe cut.
