@@ -168,6 +168,49 @@ pub fn print_chunk_phase_times() {
     }
 }
 
+/// The per-lane origin tags the engine carries as METADATA rather than
+/// state (plans/kernel-ladder.md "the passthrough column"): the backward
+/// sweep's row-id column and the pos-graph recorder's cell column. At most
+/// one is ever present - they belong to different replay modes.
+///
+/// Outside the engine the tag stays what it always was, a per-lane heap
+/// global (`deopt_collect::inject_named`), because that is what the
+/// interpreter path executes and what the observers read. The bridge is
+/// where the representations meet: `run_frame_chunk` strips the global
+/// into `Rt2::origin` on import (import drops unknown globals anyway, so
+/// the kernels bind the untagged shape) and re-injects it on export.
+const ORIGIN_TAGS: [&str; 2] = [
+    crate::search::sweep::SWEEP_ORIGIN,
+    crate::search::pos_graph::POS_ORIGIN,
+];
+
+/// The origin tag `state` carries, if any.
+fn origin_tag_of(state: &crate::interpreter::state::State) -> Option<&'static str> {
+    let mut found = None;
+    for tag in ORIGIN_TAGS {
+        if state.global_env.contains_key(tag) {
+            assert!(found.is_none(), "a state with two origin tags");
+            found = Some(tag);
+        }
+    }
+    found
+}
+
+/// `bridge::export_block`, plus the origin metadata back as the named
+/// global so the interpreter path (and the observers) see the same state
+/// the interpreter itself would have carried.
+fn export_block_tagged(block: &runtime2::Rt2, tag: Option<&str>) -> crate::interpreter::state::State {
+    let mut state = bridge::export_block(block);
+    if let Some(tag) = tag {
+        assert!(
+            !block.origin.is_empty(),
+            "an origin-tagged chunk lost its origin metadata in the engine"
+        );
+        crate::interpreter::deopt_collect::inject_named(&mut state, tag, &block.origin);
+    }
+    state
+}
+
 pub(crate) fn boundary_ids() -> runtime2::BoundaryIds {
     let g = |name: &str| gen::global_id(name).unwrap_or_else(|| panic!("no global {}", name));
     let f = |name: &str| gen::field_id(name).unwrap_or_else(|| panic!("no field {}", name));
@@ -310,8 +353,13 @@ impl FrameEngine {
 
     /// One frame of a kernel deopt sub-chunk through the PLAIN program:
     /// to_canonical -> plain -> from_canonical, sound for every lane.
-    fn plain_block(&self, plain: &PlainPath, block: runtime2::Rt2) -> Vec<crate::interpreter::state::State> {
-        let state = bridge::export_block(&block);
+    fn plain_block(
+        &self,
+        plain: &PlainPath,
+        block: runtime2::Rt2,
+        tag: Option<&str>,
+    ) -> Vec<crate::interpreter::state::State> {
+        let state = export_block_tagged(&block, tag);
         drop(block);
         self.plain_state(plain, state)
     }
@@ -404,7 +452,18 @@ impl FrameEngine {
         )>,
     ) -> Vec<crate::interpreter::state::State> {
         let mut t = ChunkTimer::start();
-        let block = bridge::import_block(state, self.cart.clone(), self.cache.clone());
+        // An origin-tagged chunk (the backward sweep, the pos-graph
+        // recorder): the per-lane tag global becomes engine metadata for
+        // the duration of the frame. `import_block` drops the global (it
+        // is outside GLOBAL_NAMES), so the block's shape is the untagged
+        // one and the kernels bind it; the metadata rides `Rt2::origin`
+        // through partition, kernel appends, dedup and merge, and is
+        // re-injected as the global on every exit back to `State`.
+        let origin_tag = origin_tag_of(state);
+        let mut block = bridge::import_block(state, self.cart.clone(), self.cache.clone());
+        if let Some(tag) = origin_tag {
+            block.origin = crate::interpreter::deopt_collect::read_origins_named(state, tag);
+        }
         t.mark(CHUNK_IMPORT);
         let mut pending: Vec<(runtime2::Rt2, bool)> = self
             .partition_chunks(vec![block], campaign_chunk_rows())
@@ -505,27 +564,27 @@ impl FrameEngine {
                 if self.plain.is_none() {
                     // The strict path (no plain program registered): the
                     // compile program, loudly fatal on a premise failure.
-                    out.extend(self.interpret_block(block));
+                    out.extend(self.interpret_block(block, origin_tag));
                     continue;
                 }
                 let plain = self.plain.as_ref().unwrap();
                 if kernel_ok {
                     // No campaign cfg (native-probe harnesses): the
                     // compile program per chunk, plain on failure.
-                    match self.try_interpret_block(&block) {
+                    match self.try_interpret_block(&block, origin_tag) {
                         Ok(states) => out.extend(states),
                         Err(e) => {
                             deopt_note(&format!(
                                 "engine chunk -> plain ({} lanes): {:#}",
                                 block.width, e
                             ));
-                            out.extend(self.plain_block(plain, block));
+                            out.extend(self.plain_block(plain, block, origin_tag));
                         }
                     }
                 } else {
                     // A kernel's deopt sub-chunk fails the compile
                     // program's premises by construction.
-                    out.extend(self.plain_block(plain, block));
+                    out.extend(self.plain_block(plain, block, origin_tag));
                 }
             }
         }
@@ -543,7 +602,7 @@ impl FrameEngine {
         let keeps = Self::dedup_keeps_serial(&done);
         let merged = self.regroup_and_merge(done, keeps, &mut |_| {});
         t.mark(CHUNK_MERGE);
-        out.extend(merged.iter().map(bridge::export_block));
+        out.extend(merged.iter().map(|b| export_block_tagged(b, origin_tag)));
         t.mark(CHUNK_EXPORT);
         out
     }
@@ -572,6 +631,15 @@ impl FrameEngine {
                 continue;
             }
             let mut b = bridge::import_block(s, self.cart.clone(), self.cache.clone());
+            // Origin-tagged states (the sweep / pos-graph replays under
+            // check mode): compare (origin, row) PAIRS, not the row
+            // projection - `boundary` mixes `Rt2::origin` into the keys.
+            // Import drops the tag global, so without this the comparator
+            // would pass on outputs whose rows match but whose
+            // attributions do not.
+            if let Some(tag) = origin_tag_of(s) {
+                b.origin = crate::interpreter::deopt_collect::read_origins_named(s, tag);
+            }
             b.boundary(&self.ids);
             keys.extend(b.row_keys.iter().copied());
         }
@@ -635,8 +703,12 @@ impl FrameEngine {
     }
 
     /// One frame of `block` through the interpreter, as interpreter states.
-    fn interpret_block(&self, block: runtime2::Rt2) -> Vec<crate::interpreter::state::State> {
-        self.try_interpret_block(&block)
+    fn interpret_block(
+        &self,
+        block: runtime2::Rt2,
+        tag: Option<&str>,
+    ) -> Vec<crate::interpreter::state::State> {
+        self.try_interpret_block(&block, tag)
             .expect("the interpreter fallback failed a frame")
     }
 
@@ -646,23 +718,12 @@ impl FrameEngine {
     fn try_interpret_block(
         &self,
         block: &runtime2::Rt2,
+        tag: Option<&str>,
     ) -> anyhow::Result<Vec<crate::interpreter::state::State>> {
         if std::env::var_os("CELESTE_FALLBACK_ROUNDTRIP").is_some() {
             bridge::assert_block_round_trips(block);
         }
-        self.interpret_block_with(block, &self.frame_cfg, &self.fixed_env)
-    }
-
-    /// One frame of `block` under an arbitrary prepared frame body (the
-    /// engine's own compile program, or the campaign's - see
-    /// `run_frame_chunk`'s fallback chain).
-    fn interpret_block_with(
-        &self,
-        block: &runtime2::Rt2,
-        cfg: &crate::interpreter::fixed_env::PreparedCfg,
-        env: &crate::interpreter::fixed_env::FixedEnv,
-    ) -> anyhow::Result<Vec<crate::interpreter::state::State>> {
-        self.interpret_state_with(bridge::export_block(block), cfg, env)
+        self.interpret_state_with(export_block_tagged(block, tag), &self.frame_cfg, &self.fixed_env)
     }
 
     fn interpret_state_with(
@@ -879,7 +940,7 @@ pub fn step(
                                 let (cart, cache) =
                                     (block.cart.clone(), block.cache.clone());
                                 done.extend(
-                                    this.plain_block(plain, block).iter().map(|s| {
+                                    this.plain_block(plain, block, None).iter().map(|s| {
                                         let mut b = bridge::import_block(
                                             s,
                                             cart.clone(),

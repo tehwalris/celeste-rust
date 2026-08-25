@@ -735,6 +735,186 @@ mod tests {
         assert_eq!(fallbacks, 0, "variant frames fell back to the base program");
     }
 
+    /// The engine-carried origin column (plans/kernel-ladder.md "the
+    /// passthrough column"): an origin-tagged replay - the frame
+    /// primitive of the backward sweep and of the pos-graph recorder -
+    /// produces the SAME (origin, row key) pair set on the traced
+    /// kernels as on the interpreter. Two taggings, because they stress
+    /// different parts of the dedup:
+    ///
+    /// * distinct per-lane ids (the sweep's `SWEEP_ORIGIN`), where no
+    ///   dedup across origins is legal at all;
+    /// * position cells (the recorder's `POS_ORIGIN`), where origins
+    ///   REPEAT across lanes and same-origin duplicates may collapse.
+    ///
+    /// 26 frames of forward pass so the batch is past the first rem
+    /// straddle (frame 25) - the same rationale as
+    /// `traced_kernels_reproduce_the_interpreter`'s 30. Strict, with
+    /// coverage asserted, so a run where every tagged chunk quietly fell
+    /// through to the reference would fail rather than gate nothing.
+    #[test]
+    fn kernel_replays_carry_origins_like_the_interpreter() {
+        use crate::interpreter::deopt_collect;
+        use crate::search::pos_graph::POS_ORIGIN;
+        use crate::search::sweep::SWEEP_ORIGIN;
+
+        let _partition = crate::interpreter::partition_straddles_test_lock();
+        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
+            || !std::path::Path::new("rewrites.jsonl").exists()
+            || !std::path::Path::new("rewrites-compile.jsonl").exists()
+        {
+            return;
+        }
+        let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
+
+        let frames = 26;
+        let mut fwd = AbstractRun::start(&program).expect("start forward");
+        for _ in 1..=frames {
+            fwd.step().expect("forward step");
+        }
+        let batch = fwd.take_states();
+        drop(fwd);
+        let lanes: usize = batch.iter().map(|s| s.vector_size).sum();
+        assert!(lanes > 16, "the batch is too small to exercise the passthrough");
+
+        // Tag a clone of the batch: distinct ids per lane, or each
+        // lane's own position cell (exactly what the sweep / recorder
+        // inject).
+        let tagged = |tag: &str, cells: bool| -> Vec<crate::interpreter::state::State> {
+            let mut next = 0u32;
+            batch
+                .iter()
+                .map(|s| {
+                    let mut s = s.clone();
+                    let values: Vec<u32> = if cells {
+                        crate::search::pos_graph::state_cells(&s).expect("state cells")
+                    } else {
+                        let ids = (next..next + s.vector_size as u32).collect();
+                        next += s.vector_size as u32;
+                        ids
+                    };
+                    deopt_collect::inject_named(&mut s, tag, &values);
+                    s
+                })
+                .collect()
+        };
+
+        // One origin-tagged frame, exactly as `backward_sweep_time`
+        // reads it back: strip the tag, gc, key, pair.
+        let pairs_of = |mut run: AbstractRun,
+                        tag: &str,
+                        input: Vec<crate::interpreter::state::State>|
+         -> std::collections::BTreeSet<(u32, (u64, u64))> {
+            run.disable_frontier();
+            run.skip_boundary_merge();
+            let deopt_events = run.deopt_events();
+            run.restore(input, None, deopt_events).expect("restore");
+            run.step().expect("replay step");
+            let mut pairs = std::collections::BTreeSet::new();
+            for mut s in run.take_states() {
+                let origins = deopt_collect::read_origins_named(&s, tag);
+                s.global_env.remove(tag);
+                s.gc();
+                let keys = crate::search::sweep::row_keys(&s).expect("row keys");
+                assert_eq!(keys.len(), origins.len(), "origin/key length mismatch");
+                pairs.extend(origins.into_iter().zip(keys));
+            }
+            pairs
+        };
+
+        // Interpreter references FIRST, while the engine env is unset.
+        let want_ids = pairs_of(
+            AbstractRun::start(&program).expect("start"),
+            SWEEP_ORIGIN,
+            tagged(SWEEP_ORIGIN, false),
+        );
+        let want_cells = pairs_of(
+            AbstractRun::start(&program).expect("start"),
+            POS_ORIGIN,
+            tagged(POS_ORIGIN, true),
+        );
+
+        std::env::set_var("CELESTE_COMPILED_FORWARD", "1");
+        std::env::set_var("CELESTE_KERNEL_STRICT", "1");
+        let run = AbstractRun::start(&program).expect("start compiled");
+        assert!(run.compiled.is_some(), "the compiled engine did not engage");
+        let got_ids = pairs_of(run, SWEEP_ORIGIN, tagged(SWEEP_ORIGIN, false));
+        assert!(
+            crate::compiled::dispatch::traced_lanes() > 0,
+            "no tagged chunk ever reached a traced kernel - the passthrough was \
+             never exercised"
+        );
+        assert_eq!(
+            crate::compiled::dispatch::missed_lanes(),
+            0,
+            "tagged chunks fell through to the reference path - those pairs were \
+             checked interpreter-against-interpreter, which gates nothing"
+        );
+        assert_eq!(
+            got_ids, want_ids,
+            "the kernel replay's (origin id, row key) pairs differ from the \
+             interpreter's"
+        );
+
+        let run = AbstractRun::start(&program).expect("start compiled");
+        let got_cells = pairs_of(run, POS_ORIGIN, tagged(POS_ORIGIN, true));
+        assert_eq!(
+            got_cells, want_cells,
+            "the kernel replay's (cell, row key) pairs differ from the \
+             interpreter's"
+        );
+    }
+
+    /// Check mode on an origin-tagged replay: `row_key_set` mixes
+    /// `Rt2::origin` into the keys on both sides, so the per-chunk gate
+    /// compares (origin, row) PAIR sets - and must come out equal, not
+    /// cry wolf, on a tagged frame the kernels and the interpreter both
+    /// run. Its own test (= its own nextest process) because the
+    /// engine's check flag is decided once per process.
+    #[test]
+    fn check_mode_compares_origin_pairs_without_false_alarms() {
+        use crate::interpreter::deopt_collect;
+        use crate::search::sweep::SWEEP_ORIGIN;
+
+        let _partition = crate::interpreter::partition_straddles_test_lock();
+        if !std::path::Path::new("lua/celeste-minimal.lua").exists()
+            || !std::path::Path::new("rewrites.jsonl").exists()
+            || !std::path::Path::new("rewrites-compile.jsonl").exists()
+        {
+            return;
+        }
+        let program = crate::program::frozen::rewritten("rewrites.jsonl").expect("frozen");
+
+        let frames = 26;
+        let mut fwd = AbstractRun::start(&program).expect("start forward");
+        for _ in 1..=frames {
+            fwd.step().expect("forward step");
+        }
+        let mut batch = fwd.take_states();
+        drop(fwd);
+        let mut next = 0u32;
+        for s in batch.iter_mut() {
+            let ids: Vec<u32> = (next..next + s.vector_size as u32).collect();
+            next += s.vector_size as u32;
+            deopt_collect::inject_named(s, SWEEP_ORIGIN, &ids);
+        }
+
+        std::env::set_var("CELESTE_COMPILED_FORWARD", "check");
+        std::env::set_var("CELESTE_KERNEL_STRICT", "1");
+        let mut run = AbstractRun::start(&program).expect("start check run");
+        assert!(run.compiled.is_some(), "the compiled engine did not engage");
+        run.disable_frontier();
+        run.skip_boundary_merge();
+        let deopt_events = run.deopt_events();
+        run.restore(batch, None, deopt_events).expect("restore");
+        run.step().expect("an origin-tagged frame failed the check-mode pair gate");
+        assert!(
+            crate::compiled::dispatch::traced_lanes() > 0,
+            "no tagged chunk ever reached a traced kernel - check mode compared \
+             nothing"
+        );
+    }
+
     /// And it must not cry wolf: the program compared against itself is equal.
     #[test]
     fn differential_run_accepts_an_identical_program() {

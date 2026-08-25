@@ -383,7 +383,9 @@ pub fn build_from_replay(
     use crate::search::checkpoint;
 
     engine.disable_frontier();
-    engine.interpret_origin_replays();
+    // The POS_ORIGIN column rides the compiled engine as block metadata
+    // (`Rt2::origin`), so a kernel-driven forward pass replays on the
+    // kernels too.
     engine.record_pos_graph();
     for f in from.max(1)..frames {
         let t = std::time::Instant::now();
@@ -471,13 +473,13 @@ pub const POS_ORIGIN: &str = "__pos_origin";
 /// because an 8,000-lane chunk spans thousands of cells and the cross
 /// product squares that. See BENCHMARK_DATA.md.
 ///
-/// The column is why recording belongs in the REPLAY and not in the forward
-/// pass. A per-lane column is per-lane distinct, so it forbids the boundary
-/// dedup that decides how coarse the whole over-approximation is: a tagged
-/// forward pass would be a DIFFERENT SEARCH from the certified one. The
-/// replay runs with `disable_frontier` and so has no boundary dedup to
-/// lose, which is exactly why the cost lands there. `AbstractRun::step`
-/// refuses to record on a streaming run rather than trusting that.
+/// The tag never reaches the boundary: `interpret_state_base` strips it
+/// off every output right after `record`, which is what lets recording
+/// FUSE into a streaming forward pass without becoming a different
+/// search (see the history in `AbstractRun::step_inner`'s comment). On
+/// the compiled engine the tag rides `Rt2::origin` as block metadata
+/// through the kernels and comes back as the global on export
+/// (`compiled::run_frame_chunk`), so recording runs on kernels too.
 ///
 /// The tag is a cell, not a row id, on purpose: ~8,000 distinct values
 /// instead of 213M, so what lane dedup remains inside a frame still fires.

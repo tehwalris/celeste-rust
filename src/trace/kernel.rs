@@ -481,9 +481,15 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
              ///\n\
              /// 128-bit like the boundary's own key, because a collision\n\
              /// DROPS a successor rather than merely costing time.\n\
+             ///\n\
+             /// `org` is the engine-carried origin metadata of this\n\
+             /// slice's input lanes (empty = untracked): each written\n\
+             /// row records its input lane's origin, and the origin is\n\
+             /// mixed into the dedup key so two rows from different\n\
+             /// origins never collapse (`Rt2::origin`).\n\
              pub fn append{i}(\n\
              \x20   acc: &mut Rt2, sh: &KShared{i}, kv: &KOut{i}, take: u16,\n\
-             \x20   n: usize, seen: &mut RowSet,\n\
+             \x20   n: usize, seen: &mut RowSet, org: &[u32],\n\
              ) -> u16 {{\n\
              \x20   // Returns the lanes actually WRITTEN, which is `take`\n\
              \x20   // minus the ones another configuration already wrote.\n\
@@ -505,7 +511,15 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
         // shared across every assignment. All that is left here is the
         // table probe, which is inherently scalar: a hash table cannot
         // be vectorized, and at ~2M probes it does not need to be.
-        writeln!(o, "        if !seen.insert((h1[i], h2[i])) {{ continue; }}")?;
+        writeln!(
+            o,
+            "        let key = if org.is_empty() {{ (h1[i], h2[i]) }} else {{\n\
+             \x20           // mix64 is a bijection: same row, different\n\
+             \x20           // origins can never collide.\n\
+             \x20           (mix64(h1[i] ^ mix64(0x517c_c1b7_2722_0a95 ^ org[i] as u64)), h2[i])\n\
+             \x20       }};\n\
+             \x20       if !seen.insert(key) {{ continue; }}"
+        )?;
         for OutField { cell, ty, tainted, konst, .. } in &out.fields {
             if konst.is_some() {
                 continue; // written once by `acc`, not per row
@@ -542,7 +556,15 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
                 other => anyhow::bail!("output type {}", other),
             }
         }
-        writeln!(o, "        wrote |= 1 << i;\n        acc.width += 1;\n    }}\n    wrote\n}}\n")?;
+        writeln!(
+            o,
+            "        if !org.is_empty() {{ acc.origin.push(org[i]); }}\n\
+             \x20       wrote |= 1 << i;\n\
+             \x20       acc.width += 1;\n\
+             \x20   }}\n\
+             \x20   wrote\n\
+             }}\n"
+        )?;
     }
 
     // A small dynamic layer over the per-outcome items above. Rust
@@ -576,13 +598,16 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
     // not resolve, or a slot at the wrong kind. `Some(mask)` is the
     // lanes DECLINED; under the never-deopt doctrine a non-zero mask
     // stops the run rather than falling back.
-    writeln!(o, "struct Append<'a> {{ accs: &'a mut [Rt2], seen: &'a mut [RowSet], n: usize }}\n")?;
+    writeln!(
+        o,
+        "struct Append<'a> {{ accs: &'a mut [Rt2], seen: &'a mut [RowSet], n: usize, org: &'a [u32] }}\n"
+    )?;
     writeln!(o, "impl<'a> Sink for Append<'a> {{")?;
     for i in 0..l.outs.len() {
         writeln!(
             o,
             "    fn o{i}(&mut self, _mask: u8, take: u16, sh: &KShared{i}, v: &KOut{i}) {{\n\
-             \x20       append{i}(&mut self.accs[{i}], sh, v, take, self.n, &mut self.seen[{i}]);\n\
+             \x20       append{i}(&mut self.accs[{i}], sh, v, take, self.n, &mut self.seen[{i}], self.org);\n\
              \x20   }}",
             i = i
         )?;
@@ -601,7 +626,10 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
          \x20   // it comes from configurations agreeing on one lane, and\n\
          \x20   // a lane lives in one slice.\n\
          \x20   seen.iter_mut().for_each(|s| s.next_slice());\n\
-         \x20   let mut sink = Append {{ accs, seen, n }};\n\
+         \x20   // Engine-carried origin metadata for this slice's lanes\n\
+         \x20   // (empty = untracked); see `Rt2::origin`.\n\
+         \x20   let org: &[u32] = if b.origin.is_empty() {{ &[] }} else {{ &b.origin[lo..lo + n] }};\n\
+         \x20   let mut sink = Append {{ accs, seen, n, org }};\n\
          \x20   Some(frame(&u, &rin, &g, &mut sink))\n\
          }}\n"
     )?;

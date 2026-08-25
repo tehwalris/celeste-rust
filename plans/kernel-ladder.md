@@ -143,39 +143,72 @@ missed chunk. That is a silent interpreter dependency, so:
 
 Both the sweep and the position graph attribute outputs to inputs by
 injecting a per-lane u32 column as a global (`__sweep_origin`,
-`POS_ORIGIN`) and reading it back after the frame. The kernels cannot
-carry it today, and the failure is at least loud: `import_block` drops
-globals outside `GLOBAL_NAMES`, so the sweep's origin/key length check
-fails rather than silently mis-attributing.
+`POS_ORIGIN`) and reading it back after the frame. Two designs were on
+the table: (1) origin-shape kernels - append `__origin` to
+`GLOBAL_NAMES` and trace tagged shapes, clean but it re-keys every
+shape hash, row key, checkpoint and visited table; (2) an
+engine-carried origin column - metadata beside the block, no shape
+change. Philippe chose (2), and it is DONE (2026-08-25, worktree):
 
-Two workable designs, NEITHER done in this session:
+* **`Rt2::origin`** (celeste-engine) is the carrier: optional per-lane
+  u32 metadata, empty = untracked, else `len == width`. Not part of
+  the heap, the shape hash, or any column - a tagged block binds the
+  same kernel as an untagged one. Every lane permutation carries it
+  (`retain_lanes`, `slice_lanes`, `partition_*` via clone+retain,
+  `merge_many` concatenates it and asserts all-or-nothing presence,
+  `widen` copies the source lane's).
+* **The bridge is where the representations meet**
+  (`compiled::run_frame_chunk`): outside the engine the tag stays what
+  it always was - a per-lane heap global the interpreter path executes
+  natively and the observers read. On entry the chunk's tag global
+  (`ORIGIN_TAGS`: `SWEEP_ORIGIN` / `POS_ORIGIN`) is read into
+  `block.origin` (import drops the global itself, so the shape is the
+  untagged one); on every exit back to `State` - the merged kernel
+  output, and each miss path's export before interpreting - the
+  metadata is re-injected as the global (`export_block_tagged`). The
+  campaign-program fallback runs the ORIGINAL state, tag intact.
+* **The generated `append{i}` writes provenance**: `step` slices
+  `&b.origin[lo..lo+n]` into the sink, and each written row pushes its
+  input lane's origin into `acc.origin`. The kernel mechanically knows
+  which lane produced each row - that knowledge just goes into
+  metadata now instead of being lost.
+* **Origin participates in EVERY dedup key when present.** The
+  in-kernel `seen` key mixes it (`mix64`, a bijection, so same row +
+  different origins can never collide), and `Rt2::boundary_finish`
+  mixes it into the per-lane row key, which the in-block dedup, the
+  cross-block dedup and `merge_many` all key on.
 
-1. **Origin-shape kernels.** Append `__origin` to `GLOBAL_NAMES` and
-   let the shape walk also trace each shape with the origin global
-   present (a symbolic per-lane num nothing reads: the kernel passes it
-   through, it participates in the row key, so dedup keeps distinct
-   origins apart - exactly the interpreter's semantics). Dispatch by
-   shape hash separates tagged from untagged blocks by construction.
-   COST: growing `GLOBAL_NAMES` changes `Rt2::shape_hash_of` (it
-   hashes the whole globals vec) and therefore every baked `SHAPE`
-   const, the row keys (seeded from the shape hash), every checkpoint
-   and visited table. CLAUDE.md flags exactly this as "not a change
-   that can be done halfway". It is the clean design, and it is
-   Philippe's call to take the invalidation.
-2. **Engine-carried origin column.** Teach the generated interface an
-   optional origin column: `rows` gathers it, `append{i}` writes it
-   into the accumulator, the RowSet key and the boundary row key mix it
-   in. No shape change, no checkpoint invalidation, but it is emitter
-   + generated-code surface (bind/rows/append/keys) and a regeneration.
+**The soundness wrinkle, resolved AGAINST the "any survivor is fine"
+relaxation.** The tempting design was to keep origin out of the dedup
+keys and let a deduped row keep any one origin. That is wrong for both
+consumers: the sweep marks candidate `src` rows whose successors land
+in B, so if lanes from candidates A and B produce the SAME successor
+row and only A's survives dedup, B never qualifies at that frame - its
+`g` comes out too large, silently, in the direction that loses winning
+paths. The pos graph loses the pair the same way, and a too-small
+table under-generates sweep candidates with nothing to notice. The
+injected GLOBAL got this right for free - a per-lane column is part of
+the state, so dedup kept distinct origins apart - and the metadata
+design must reproduce exactly that, which is what mixing the origin
+into the keys does. What IS legal (and happens): two lanes with the
+same origin and the same row dedup to one, and the kernel path can
+drop (origin, row) DUPLICATES the interpreter's unmerged fragments
+keep - the pair SET is identical, and both consumers are idempotent
+per pair (the sweep's `newly` bitset, the recorder's `sort+dedup`).
 
-Until one lands, the sweep and the pos-graph replay run with the
-compiled engine OFF (their stages set `CELESTE_COMPILED_FORWARD=0`).
-Soundness is unaffected - the sweep's expansion is gated to produce the
-same row sets as the kernels (that is the per-chunk check gate's
-claim), and the pos graph is a positional over-approximation that only
-filters sweep COST. The honest statement: the interpreter remains in
-the backward pass until the passthrough exists; the forward passes -
-which dominate the campaign - do not need it.
+Wired through: `backward_sweep_time` and `pos_graph::build_from_replay`
+no longer disable the engine (`interpret_origin_replays` is deleted),
+`interpret_state_base` no longer refuses pos-graph recording under the
+compiled engine (the FUSED recording runs on kernels), `ladder.sh
+KERNELS=1` no longer forces `FUSE=0`, and check mode's
+`row_key_set` mixes origins too, so a check-mode replay compares
+(origin, row) PAIR sets rather than the row projection. Gated by
+`kernel_replays_carry_origins_like_the_interpreter` (pair-set identity
+against the interpreter for both taggings, strict, coverage asserted)
+and by the g.bin / posgraph.bin A/B (BENCHMARK_DATA.md "The origin
+passthrough", 2026-08-26: both byte-identical across engines on room
+(1,0) at H=68, fused row table identical, fused table = replay + the
+1 spawn pair).
 
 ## Refinement mapping: nothing to do
 
@@ -270,9 +303,6 @@ orthogonal to the engine and untouched here.
 
 ## Not done, in honesty order
 
-* The origin passthrough (both designs above; decision needed). Until it
-  lands, the backward sweep's expansion and the pos-graph replay are the
-  ladder's remaining interpreter use.
 * Spd rungs.
 * Per-rung baked kernels (the optimization layer: a rung-aware in-kernel
   dedup key, worth pricing only if the agnostic set's weaker dedup shows
