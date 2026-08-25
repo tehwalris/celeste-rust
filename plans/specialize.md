@@ -236,3 +236,75 @@ build the per-field constant-across-reachable-states measurement (the
 other half of the ask), since that is concrete and tells us which fields
 (spring position, hitbox, tile flags) SHOULD be constants and are being
 carried per-lane.
+
+## Result 3: the box test is position-INDEPENDENT-true - a closure-capture bug (leading hypothesis)
+
+Dumped the symbolic comparisons in a fully-concrete trace: the collide
+box test is NOT among them - it FOLDED. But the bounce is still present,
+so it folded to TRUE. And it folds to true INDEPENDENT of both positions:
+
+* player at (10,20), (64,80), (1000,1000): identical -3 bounce.
+* springs at (60,40), (200,100): identical.
+
+A correct AABB test `other.x + hb.w > obj.x` depends on both positions.
+One that is true regardless of both is a **self-comparison**: `x + w > x`
+(w>0, always true). That happens when `other` and `obj` are the SAME
+object - i.e. `spring.collide(player)`'s captured `obj` is not the
+spring.
+
+### Leading hypothesis: closure `obj` capture corrupted by blank/GC/renumber
+
+`obj.collide` is a closure created in `init_object`, capturing `obj`
+(that object's table). The shape walk BLANKS state and GCs/renumbers
+tables between frames (`shapes::walk` -> `blank`; the boundary
+canonicalizes ids). If a closure's captured `obj` reference is not
+remapped through a renumber - or blank rebinds it - then deep in a room
+`spring.collide`'s `obj` points at the wrong table (plausibly the player,
+or a shared one), the box test degenerates to `x+w > x` = always true,
+and every active spring bounces every player.
+
+This is consistent with room (1,0) being correct (differentially tested,
+shallow, few objects) while room (2,0) - reached after a long walk with
+many GC/renumber cycles and 14 objects - is wrong. It would also explain
+the node explosion broadly: `is_solid`/`check` also go through `collide`,
+so the player would spuriously collide with everything.
+
+### What would confirm it
+
+Trace `spring.collide` and check whether the captured `obj` table id
+equals the spring's table id or is aliased. Or: trace the SPAWN frame
+(no blank/GC yet) and check whether collide there is position-dependent
+(if spawn is correct but a deep shape is not, the corruption is the
+walk's blank/GC). This needs interp instrumentation, a focused session.
+
+### If confirmed, this is the room-(2,0) fix
+
+Not specialization - a closure-capture correctness fix. Room (2,0)'s
+900k-node blowup would largely dissolve, because the spurious
+spring/solid coupling is a big multiplier. Specialization (position/pm1)
+was the wrong lever (Result 1); this is the right one, and it is a BUG,
+not an abstraction choice.
+
+## Handoff (autonomous session end)
+
+Built: `transpile --spec-probe SHAPE` + `CELESTE_SPEC_*` envs, a probe
+that re-traces one shape with fields pinned and reports nodes/forks (in
+`trace::kernel::specialize_probe`). It is a diagnostic, not wired into
+anything; kept for chasing this down. Nothing in the checked-in kernels
+or production path changed.
+
+Findings, in order of importance:
+1. **collide box test is position-independent-true in room (2,0)** -
+   almost certainly a closure-capture bug from the walk's blank/GC.
+   This is the likely root cause of the room-(2,0) explosion AND a
+   correctness issue (room 2 is not differentially tested at depth).
+   FIX THIS FIRST, then re-measure - the explosion may vanish.
+2. **Position specialization does not shrink the graph** (15,425 ->
+   15,104). If specialization is needed after the bug fix, the lever is
+   the player's dynamic state, not position.
+3. The pin machinery (`trace_frame` `pin` + `pin_guard`) is the ready-
+   made base+specialized mechanism if we still want it later.
+
+Assumptions A1-A4 from the top still hold; A2 ("pin springs to decide
+collide") turned out irrelevant because collide ignores the pinned
+positions - which is how the bug was found.

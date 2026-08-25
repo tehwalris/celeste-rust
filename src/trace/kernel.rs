@@ -2254,6 +2254,23 @@ pub fn specialize_probe(
     out.push_str(&format!("  BASE   : {} nodes, {} live forks {:?}, counter {}\n", bn, bf.len(), bf, base_forks));
     out.push_str(&format!("  PINNED : {} nodes, {} live forks {:?}, counter {}\n", pn, pf.len(), pf, f.forks));
     out.push_str(&format!("  pinned op census: {}\n", ptop.join(", ")));
+    // CELESTE_SPEC_CMPS: dump symbolic comparison nodes (box tests etc).
+    if std::env::var("CELESTE_SPEC_CMPS").is_ok() {
+        use crate::transpile::graph::Op;
+        let g = &it.d.graph;
+        let mut roots_n: Vec<crate::transpile::graph::NodeId> = Vec::new();
+        for o in &f.outs { for (_, nd, _) in &o.fields { roots_n.push(*nd); } roots_n.push(o.guard); roots_n.push(o.ok); }
+        let reach = crate::transpile::bdd::reachable(g, &roots_n);
+        let mut seen = std::collections::BTreeSet::new();
+        for id in 0..g.len() {
+            if reach[id] {
+                if matches!(g.get(id as u32).op, Op::Gt|Op::Ge|Op::Lt|Op::Le) {
+                    let t = super::emit::show_tree(g, id as u32, 4);
+                    if seen.insert(t.clone()) { out.push_str(&format!("  cmp: {}\n", t)); }
+                }
+            }
+        }
+    }
     // What each LIVE fork forks on.
     {
         use crate::transpile::graph::Op;
