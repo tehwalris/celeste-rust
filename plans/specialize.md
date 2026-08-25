@@ -308,3 +308,72 @@ Findings, in order of importance:
 Assumptions A1-A4 from the top still hold; A2 ("pin springs to decide
 collide") turned out irrelevant because collide ignores the pinned
 positions - which is how the bug was found.
+
+## Result 3 RETRACTED, and the honest state (2026-08-25)
+
+The self-comparison / closure-aliasing hypothesis is WRONG. With the
+player position symbolic, the collide box test IS present and DOES
+reference the player position:
+
+    Gt( player.x + player.hb.x + player.hb.w ,  objects[0].x + objects[0].hb.x + ox )
+    = Gt( Cell(87) + 1 + 6 , Cell(29) + Cell(19) + ... )
+
+So collide compares real positions. What I got wrong: I pinned the TWO
+springs (objects[1], objects[2], found by type) and the player, but the
+box test that keeps the bounce alive references **objects[0]** - which I
+never pinned. objects[0] is another object (its `.hitbox`/`.x` are slots
+17-30); the frame has 14 objects and I only pinned 3 of them.
+
+So the bounce branch stays live simply because the shape has MANY
+objects and the player's collision cone touches objects I did not pin,
+not because of any aliasing bug. Pinning 3 of 14 objects was never going
+to fold the collision graph.
+
+### Corrected conclusion
+
+There is (probably) no collide bug. The room-(2,0) complexity is what it
+looks like: a 14-object frame where the player can interact (bounce,
+collide, stand on) with many objects, and each interaction is a branch.
+The graph is large because the SITUATION is genuinely 14 objects, most
+per-lane.
+
+This puts us back on the ORIGINAL framing, and Result 1 stands as the
+real finding: **pinning the player alone (position OR full state) does
+not shrink the graph, because the OTHER 13 objects are the bulk.** The
+2,597-node floor came from pinning ALL player scalars, which removes the
+player's contribution - but the other objects remain per-lane and are
+most of the frame.
+
+### What this means for the strategy
+
+To actually shrink room (2,0), the constant-lattice idea is the right
+one AFTER ALL - but applied to ALL objects, not just the player: the
+static furniture (spring positions, hitboxes, fall_floor/fake_wall
+positions, tile flags) is constant across reachable states and should be
+BAKED IN, which folds the many collision box tests. That is the
+"per-field constant across reachable states" measurement I deferred, and
+it is now clearly the highest-value next step - it attacks the 13 objects
+the player-pin experiments left untouched.
+
+The specialization-by-player-state lever is real but secondary; the
+constant-baking of the whole object set is primary. Neither is position-
+specialization, which remains refuted (Result 1).
+
+## Corrected handoff
+
+Solid findings:
+1. **Position specialization does not shrink the room-(2,0) graph.**
+   (Result 1, unretracted.) The player is a small part of a 14-object
+   frame.
+2. **The lever is baking in per-field constants across ALL objects**
+   (spring/furniture positions, hitboxes, tile flags), which folds the
+   collision box tests. This is the constant-lattice idea, applied to
+   the whole object set, not just the player. NEXT STEP.
+3. No collide bug (Result 3 retracted). The graph size reflects a
+   genuinely 14-object situation carried per-lane.
+
+Tooling left in place: `transpile --spec-probe` + `CELESTE_SPEC_*` (in
+`trace::kernel::specialize_probe`), a diagnostic for pinning fields and
+measuring the graph. Not wired into production. The three earlier
+Result sections above are kept with this retraction so the reasoning
+trail (and the two wrong turns) is visible.
