@@ -929,6 +929,7 @@ plus the shape count and cuts the total ~2.65x; player position/speed
 specialization would take the 8 big shapes down toward room-1 scale.
 
 Gate ladder status:
-- Gate 1 (compiles): checking now.
+- Gate 1 (compiles): PASSES - kernels 0,5,17 rustc-check clean against a
+  consistent rlib set (earlier failures were stale-rlib mismatch).
 - Gate 2 (differential vs interpreter): needs bd->base dispatch, not yet.
 - Gate 3 (coverage): follows gate 2.
