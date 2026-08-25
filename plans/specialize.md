@@ -1172,3 +1172,37 @@ So the constant-lattice room-2 kernels compute the interpreter's exact game
 states for 30 frames across all 7364 branched states. The differential is
 GREEN under the reachable-state criterion; the raw row-key differential is
 confounded only by boxing (a representation artifact, not a coverage gap).
+
+## Spec: latticeify everything, all rooms, one table (Philippe, 2026-08-25)
+
+Decision locked. The constant-lattice specialization (bake static object
+positions/speeds -> kill spurious forks, fewer/smaller shapes) is the SOLE
+kernel-generation path going forward. Apply it to ALL widening variants and
+ALL early rooms, retire every non-lattice generator.
+
+Axes to cover (lattice x widening x room):
+- **widening variants** (orthogonal to the lattice; the lattice bakes the
+  same constants in each):
+  - base: Bits(0) widened (rem -> interval, fruit off/y band) - today's
+    `write_room_kernels_lattice`.
+  - rung-agnostic: `widen = false` - rem is the computed interval, campaign
+    applies the rung (the ladder's `ladder` set, but lattice-specialized).
+  - exact (k=16): `widen = false` + `ival_paths = []` - rem a plain num, NO
+    rem forks (the ladder's `exact` set, but lattice-specialized).
+- **rooms**: (0,0), (1,0), (2,0) now; a generation path that scales to all
+  rooms ("really not so hard" per Philippe).
+- **one dispatch table**: all rooms' + all variants' shapes coexist in a
+  single `KERNELS` registry, keyed by shape hash (Dispatch refuses hash
+  collisions - rooms have distinct object composition so they won't
+  collide). Multi-room requires a MERGE step in the generator
+  (`write_kernels_from_refs` overwrites single-room today) - build it.
+
+Retire after: the plain `crates/celeste-kernels/src/traced` set, and the
+non-lattice `ladder`/`exact` sets the ladder work just added (replaced by
+their lattice-specialized equivalents). Dispatch selects variant by rung
+(the ladder's `TracedMode` already does this - repoint it at the lattice
+sets). Per-room + per-variant staleness gates + differential gates, as the
+traced/ladder sets have today.
+
+This is a follow-up task, QUEUED behind the origin-metadata work (both touch
+the kernel generator + engine dispatch; sequence to avoid conflict).
