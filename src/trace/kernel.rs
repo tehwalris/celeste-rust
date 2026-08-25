@@ -627,24 +627,10 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
     // consumes `bd` today because it is always the literal `false` here;
     // this refuses to emit a kernel where that stops being true, rather
     // than letting it become a quiet hole.
-    {
-        use crate::transpile::kernel::Line;
-        for line in &l.body {
-            if let Line::Let { name, expr, .. } = line {
-                if name.starts_with("bd_v") && expr != "false"
-                    && std::env::var("CELESTE_ALLOW_BLOCK_DEOPT").is_err()
-                {
-                    anyhow::bail!(
-                        "{} is `{}`, not `false`: a block-undecidable condition zeroes \
-                         `live` and would drop every lane of that outcome silently. It \
-                         has to be routed as a deopt instead.",
-                        name,
-                        expr
-                    );
-                }
-            }
-        }
-    }
+    // A non-false `bd` (block-level obligation) is now WIRED to `declined`
+    // above, so a firing block is reported as a coverage gap rather than
+    // silently dropped. The abstract kernels have `bd == false` and are
+    // unchanged; the lattice kernels carry real block guards.
 
     let mut groups: Vec<Vec<Option<usize>>> = Vec::new(); // per outcome: variant -> group
     let mut last: Vec<Vec<bool>> = Vec::new();    // per outcome: is last of its group
@@ -747,8 +733,17 @@ pub fn render(f: &Frame, b: &Bound, l: &Lowered, title: &str) -> Result<String> 
                 continue;
             };
             let gi = groups[i][vi].expect("a variant that writes an outcome has a group");
-            writeln!(o, "    declined |= {} & !{};", p.live, p.ok)?;
-            writeln!(o, "    take_{}_{} |= {} & {};", i, gi, p.live, p.ok)?;
+            if let Some(bd) = &p.bd {
+                // Block-level deopt: if `bd` holds, this block is out of the
+                // kernel's domain, so every lane it would take is DECLINED
+                // (reported by the caller), not silently dropped, and none
+                // is taken. plans/specialize.md.
+                writeln!(o, "    declined |= {} & (if {} {{ ALL }} else {{ !{} }});", p.live, bd, p.ok)?;
+                writeln!(o, "    take_{}_{} |= {} & {} & (if {} {{ 0 }} else {{ ALL }});", i, gi, p.live, p.ok, bd)?;
+            } else {
+                writeln!(o, "    declined |= {} & !{};", p.live, p.ok)?;
+                writeln!(o, "    take_{}_{} |= {} & {};", i, gi, p.live, p.ok)?;
+            }
             if !last[i][vi] {
                 continue;
             }

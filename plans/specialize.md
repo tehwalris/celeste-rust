@@ -933,3 +933,30 @@ Gate ladder status:
   consistent rlib set (earlier failures were stale-rlib mismatch).
 - Gate 2 (differential vs interpreter): needs bd->base dispatch, not yet.
 - Gate 3 (coverage): follows gate 2.
+
+## bd wired to declined - lattice kernels now emit safely (2026-08-25)
+
+`VarOut` carries `bd: Option<String>`; the render wires a non-trivial `bd`
+into `declined` (block-level obligation fails -> every live lane of the
+block is DECLINED and reported, never silently dropped) and takes none.
+This is doctrine-compliant (a deopt stops and reports). Abstract kernels
+have `bd == None` (their block conjuncts are always false), so their
+output is UNCHANGED - `traced_kernels_are_current` gates that. Removed the
+render refusal and the CELESTE_ALLOW_BLOCK_DEOPT bypass; bd is handled.
+
+So the lattice kernels now render without the bypass and DECLINE a block
+whose baked constants do not hold, rather than dropping it. If the
+lattice is sound (springs' spd provably 0), bd never fires and no block
+is ever declined.
+
+### Validation path (next)
+
+Wire the lattice kernel set into a room-(2,0) runner (like
+traced-kernel-check does for room 1) and:
+- run it: bd must NEVER fire (no declined blocks) - that is the lattice's
+  soundness, checked empirically frame by frame;
+- compare its per-frame row-key SETS to the interpreter's (the
+  differential gate). Equal sets = the lattice kernels are correct.
+If bd fires or sets differ, the lattice over-claimed a constant; the
+declined block tells us which shape, and pin_guard kept it from being
+wrong.

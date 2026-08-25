@@ -825,6 +825,14 @@ pub(crate) struct VarOut {
     /// cell -> the expression holding its value under this assignment.
     pub(crate) outputs: BTreeMap<u32, String>,
     pub(crate) ok: String,
+    /// The block-level deopt: `Some(var)` names a `bool` that, when true,
+    /// means a block-uniform obligation this body cannot discharge holds -
+    /// the WHOLE block is out of the kernel's domain and every live lane is
+    /// DECLINED (reported), never silently dropped. `None` when the body
+    /// has no block-level obligation (the abstract kernels: their `bd` is
+    /// always the literal `false`, so nothing is wired and their output is
+    /// unchanged).
+    pub(crate) bd: Option<String>,
     /// The lanes that REACH this outcome, as a `u16` expression.
     ///
     /// A frame with several output shapes has to say which lanes take
@@ -1128,10 +1136,11 @@ pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
                 format!("ALL & {}", lanes.join(" & "))
             },
         });
+        let bd_trivial = blocks.is_empty();
         body.push(Line::Let {
             name: bd.clone(),
             ty: "bool",
-            expr: if blocks.is_empty() { "false".into() } else { blocks.join(" || ") },
+            expr: if bd_trivial { "false".into() } else { blocks.join(" || ") },
         });
         // ALWAYS emitted, even at one outcome. The loop path can fall
         // back on `valid{d}` because its `continue` has already taken
@@ -1185,7 +1194,7 @@ pub(crate) fn emit_body(e: &mut Emit, outs: &mut [Outcome]) -> Result<()> {
             }
         };
         let mut per: Vec<Option<VarOut>> = (0..outs.len()).map(|_| None).collect();
-        per[oi] = Some(VarOut { outputs, ok, live: live_s, key });
+        per[oi] = Some(VarOut { outputs, ok, bd: if bd_trivial { None } else { Some(bd) }, live: live_s, key });
         variants.push(Variant { mask, per, fork });
     }
 
