@@ -1001,3 +1001,78 @@ Re-checking shape/fork counts, then re-running gate 2. The deeper
 soundness (fixpoint pruning could still miss states via OTHER baked
 fields) remains why the base+specialized fallback is the ultimate safety;
 this fix removes the one class the boundary is responsible for.
+
+## Gate 2 finding: room 2 traced kernels need interval `sin`/`cos` (2026-08-25)
+
+Running the constant-lattice kernels for room (2,0) through gate 2
+(traced-kernel-check `room2_lattice_runs_and_covers`, coverage + no
+declines, optional `ROOM2_ORACLE` differential) surfaced a blocker that
+is NOT lattice-specific - it hits the abstract room-2 traced kernels the
+same way, and has simply never been exercised because room 2 traced
+kernels have never been run (only room 1's are, and room 1 has no fruit).
+
+### What happened, in order
+
+1. Frame 2 bind failure: `objects[0].off` arrived as `Ival([0,39])` but
+   the kernel's input slot was `num`. The fixpoint had baked `off`/`y` as
+   constants. Fixed by excluding boundary-widened fields from
+   `field_constants` (`boundary_widened_paths`: player `rem` + every live
+   fruit's `off`/`y`). Still failed to bind: the exclusion stops BAKING
+   them but they were still `num` INPUTS.
+2. Root of the bind failure: the runtime boundary widens a live fruit's
+   `off := [0,39]` and `y := start +- 2.5` (widen.rs 3b), so a mid-game
+   block carries `off` as an interval. But `blank` + `symbolize` made the
+   kernel's input `off` a `num` (ival_paths declared only player `rem`).
+   Input schema `num` vs runtime `ival` -> no bind.
+3. Adding fruit `off`/`y` to `ival_paths` (so the input schema is `ival`)
+   fixed the bind but broke RENDERING: 9 of 18 shapes failed to lower
+   with "cannot represent a ZI as a ZN" at a `Sin` node whose operand is
+   `Div(Add(1, Cell(off)), 40)` - the fruit's bob, `sin((1+off)/40)`.
+   The emitter cannot take `sin` of an interval.
+
+### Why this is fundamental (both kernel sets, not just the lattice)
+
+The fruit update computes `this.y = start + sin((1+off)/40)*2.5` and the
+collision that decides fruit pickup reads `this.y`. So `sin(off)` is
+genuinely LIVE (feeds `got_fruit` -> row key), not dead draw code. And
+`off` is `[0,39]` at runtime by the boundary. So a room-2 traced kernel
+must either:
+  - take `off` as `num` -> cannot bind the widened runtime block, or
+  - take `off` as `ival` -> cannot lower `sin(ival)`.
+The abstract set (`write_room_kernels`) takes `off` as `num` and so hits
+the first horn; it renders but would fail to bind exactly like the
+lattice did at step 2. Room 2 traced kernels have never bound a real
+mid-game block; gate 2 is the first thing that tried.
+
+### The fix (proposed, NOT built - for review)
+
+Add `sin`/`cos` over an interval to the emitter + kernel primitives. It
+is SOUND and in fact EXACT for the row key here: `off = [0,39]` spans a
+near-full period, so `sin((1+off)/40)` ranges over `[-1,1]`, and
+`start + [-1,1]*2.5 = start +- 2.5` = precisely the band that widen.rs 3b
+independently assigns to `y`. The collision then reads `y = band`, the
+same interval `y` the interpreter's collision reads (widen.rs is shared),
+so the pickup decision - and the row key - match. Pieces:
+  1. graph `ival`/`eval`: fold `Sin`/`Cos` over a `ZI` to the sin/cos
+     image of that interval (coarse `[-1,1]` is sound; a tighter image
+     is better if the interpreter's is tighter - CHECK the OCaml/interp
+     sin-over-interval to match gate-2 row keys, though the boundary
+     re-widening `y` to the band means the exact sin image may not even
+     reach the key, only the collision does).
+  2. `lower.rs`: emit a `zi_sin`/`zi_cos` call when the `Sin`/`Cos`
+     operand is a `ZI` instead of bailing to ZN.
+  3. `celeste-engine` kernel.rs: a `zi_sin`/`zi_cos` lane primitive.
+Once it lands, `off`/`y` go into `ival_paths` (step 3 above) and both the
+lattice and abstract room-2 kernels bind and render. Then re-run gate 2
+(coverage, then `ROOM2_ORACLE=1`).
+
+### State right now
+
+- `ival_paths` change REVERTED (it broke rendering without the emitter
+  support above). `field_constants` boundary-widened exclusion KEPT (it
+  is correct regardless: never bake a field the boundary widens).
+- Lattice approach validated through GATE 1: 36 -> 18 shapes, forks
+  8 -> {10x0, 2x2, 6x4}, ~1.06M -> ~401k lines (2.65x), renders 18/18
+  with `off` as `num`. Gate 2 is blocked ONLY by interval-trig above.
+- Room 1 unaffected throughout (`traced_kernels_are_current` +
+  full 280-test suite green).

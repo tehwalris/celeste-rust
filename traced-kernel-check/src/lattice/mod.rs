@@ -37,24 +37,6 @@ pub mod k6;
 pub mod k7;
 #[path = "kernel8.rs"]
 pub mod k8;
-#[path = "kernel9.rs"]
-pub mod k9;
-#[path = "kernel10.rs"]
-pub mod k10;
-#[path = "kernel11.rs"]
-pub mod k11;
-#[path = "kernel12.rs"]
-pub mod k12;
-#[path = "kernel13.rs"]
-pub mod k13;
-#[path = "kernel14.rs"]
-pub mod k14;
-#[path = "kernel15.rs"]
-pub mod k15;
-#[path = "kernel16.rs"]
-pub mod k16;
-#[path = "kernel17.rs"]
-pub mod k17;
 
 pub const KERNELS: &[Kernel] = &[
     Kernel { name: "shape 0", shape: k0::SHAPE, outcomes: k0::OUTCOMES, acc: k0::acc, step: k0::step, why: k0::bind_why },
@@ -66,19 +48,10 @@ pub const KERNELS: &[Kernel] = &[
     Kernel { name: "shape 6", shape: k6::SHAPE, outcomes: k6::OUTCOMES, acc: k6::acc, step: k6::step, why: k6::bind_why },
     Kernel { name: "shape 7", shape: k7::SHAPE, outcomes: k7::OUTCOMES, acc: k7::acc, step: k7::step, why: k7::bind_why },
     Kernel { name: "shape 8", shape: k8::SHAPE, outcomes: k8::OUTCOMES, acc: k8::acc, step: k8::step, why: k8::bind_why },
-    Kernel { name: "shape 9", shape: k9::SHAPE, outcomes: k9::OUTCOMES, acc: k9::acc, step: k9::step, why: k9::bind_why },
-    Kernel { name: "shape 10", shape: k10::SHAPE, outcomes: k10::OUTCOMES, acc: k10::acc, step: k10::step, why: k10::bind_why },
-    Kernel { name: "shape 11", shape: k11::SHAPE, outcomes: k11::OUTCOMES, acc: k11::acc, step: k11::step, why: k11::bind_why },
-    Kernel { name: "shape 12", shape: k12::SHAPE, outcomes: k12::OUTCOMES, acc: k12::acc, step: k12::step, why: k12::bind_why },
-    Kernel { name: "shape 13", shape: k13::SHAPE, outcomes: k13::OUTCOMES, acc: k13::acc, step: k13::step, why: k13::bind_why },
-    Kernel { name: "shape 14", shape: k14::SHAPE, outcomes: k14::OUTCOMES, acc: k14::acc, step: k14::step, why: k14::bind_why },
-    Kernel { name: "shape 15", shape: k15::SHAPE, outcomes: k15::OUTCOMES, acc: k15::acc, step: k15::step, why: k15::bind_why },
-    Kernel { name: "shape 16", shape: k16::SHAPE, outcomes: k16::OUTCOMES, acc: k16::acc, step: k16::step, why: k16::bind_why },
-    Kernel { name: "shape 17", shape: k17::SHAPE, outcomes: k17::OUTCOMES, acc: k17::acc, step: k17::step, why: k17::bind_why },
 ];
 
 /// Content hash of every kernel source in this set. Hashed into
 /// the campaign fingerprint so two different traced sets can
 /// never share a checkpoint.
-pub const FINGERPRINT: u64 = 44746980209835590;
+pub const FINGERPRINT: u64 = 5965982507613529449;
 
