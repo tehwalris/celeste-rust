@@ -186,7 +186,11 @@ have a REASON to think they will fire:
 - touched an emitter or anything feeding the traced kernels ->
   `traced_kernels_are_current` runs on every commit, but READ ITS DIFF
   after `./regen-generated.sh` (its predecessor `generated_is_current`
-  caught a real stale-kernel commit, `a8f4635`);
+  caught a real stale-kernel commit, `a8f4635`), and run the
+  `#[ignore]`d `room00_kernels_are_current` /
+  `room20_kernels_are_current` (the fast gates only regenerate room
+  (1,0); the fingerprint check catches hand-edits to the other rooms
+  but not generator drift there);
 - touched the tracer's pinning or key walk ->
   `every_reachable_pm1_key_gets_its_own_body`.
 
@@ -292,16 +296,21 @@ frame body, and `CELESTE_COMPILED_FORWARD=1` puts it there. **Default
 OFF, but the right setting is PER ROOM, by measurement** (2026-08-20,
 BENCHMARK_DATA.md "Engine adoption validation at depth"): on room (1,0)
 at the production horizon (f094) the compiled+fused engine is -23% wall
-/ -40% peak with all 94 per-frame rowkey sets identical, while on room
-(0,0) - where no kernel binds, the kernels being room (1,0) shapes -
-it is 4x SLOWER and 12x the peak, still set-identical. The engine's
-identity (the traced set's content hash) is hashed into the campaign
+/ -40% peak with all 94 per-frame rowkey sets identical. (The old room
+(0,0) "4x SLOWER" number was measured when no kernel bound there - the
+kernels were room (1,0) shapes; since 2026-08-26 every set carries rooms
+(0,0), (1,0) and (2,0), and that number needs remeasuring.) The engine's
+identity (the active set's content hash) is hashed into the campaign
 fingerprint when it is on, so engines never share checkpoints. The
-kernel set is the TRACED set, `crates/celeste-kernels/src/traced`, in
-ONE binary with no cargo features: the per-class "walk" kernels and the
-`fused` artifact were deleted 2026-08-25 (plans/delete-the-interpreter.md
-Phase 1) after the traced set took every lane at f94 (BENCHMARK_DATA.md
-2026-08-24: missed 0, plain-routed 0).
+kernel sets are the CONSTANT-LATTICE sets,
+`crates/celeste-kernels/src/{traced,ladder,exact}`, in ONE binary with
+no cargo features: the per-class "walk" kernels and the `fused` artifact
+were deleted 2026-08-25 (plans/delete-the-interpreter.md Phase 1) after
+the traced set took every lane at f94 (BENCHMARK_DATA.md 2026-08-24:
+missed 0, plain-routed 0), and the non-lattice sets were replaced by the
+lattice-specialized ones 2026-08-26 (plans/specialize.md). When the
+engine is on, a missed chunk is FATAL by default
+(`CELESTE_KERNEL_STRICT=0` opts back into the counted fall-through).
 `CELESTE_COMPILED_FORWARD=check` runs both engines and compares row-key
 sets per chunk; that is the gate, and also a test.
 
@@ -315,17 +324,24 @@ its own root, so `celeste_rust::pico8_num::...` still resolves everywhere.
 
 ### The generated files are CHECKED IN
 
-`crates/celeste-kernels/src/traced/` - the traced kernel set, one module
-per heap shape the start room reaches. Regenerate with:
+`crates/celeste-kernels/src/{traced,ladder,exact}/` - the three
+CONSTANT-LATTICE kernel sets (base / rung-agnostic / exact-rem), each
+with one `room<x><y>/` subdirectory per generated room ((0,0), (1,0),
+(2,0)) and a merged `mod.rs` whose `SETS` table the dispatcher flattens
+(plans/specialize.md "Spec: latticeify everything"). Regenerate with:
 
 ```bash
 ./regen-generated.sh     # then READ THE DIFF, then commit
 ```
 
-`trace::kernel::tests::traced_kernels_are_current` fails until you do.
-Byte-for-byte, on purpose: a diff there is a change to what the kernels
-compute, and the gate on THAT is `traced_kernels_reproduce_the_interpreter`
-plus a `CELESTE_COMPILED_FORWARD=check` run.
+`trace::kernel::tests::{traced,ladder,exact}_kernels_are_current` fail
+until you do (they regenerate room (1,0) and re-check every room's
+fingerprint; the `#[ignore]`d `room00_kernels_are_current` /
+`room20_kernels_are_current` regenerate the other rooms). Byte-for-byte,
+on purpose: a diff there is a change to what the kernels compute, and
+the gate on THAT is `traced_kernels_reproduce_the_interpreter` (plus the
+per-rung and per-room differentials) plus a
+`CELESTE_COMPILED_FORWARD=check` run.
 
 `crates/celeste-names/src/gen.rs` is FROZEN, not generated. Its generator
 (`transpile::names`) walked the rewritten IR and was deleted with the walk

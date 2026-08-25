@@ -310,3 +310,81 @@ orthogonal to the engine and untouched here.
 * A full ladder campaign run on kernels end to end, and any performance
   number - needs release builds and hours; the per-rung differential
   gates are the evidence offered instead, and no perf claim is made.
+
+## Latticeified, all rooms, one table (2026-08-26, worktree)
+
+Philippe's spec (plans/specialize.md "Spec: latticeify everything, all
+rooms, one table") is implemented; the non-lattice generators are gone.
+
+* **Every checked-in set is now CONSTANT-LATTICE specialized.** The three
+  entry points (`write_room_kernels{,_ladder,_exact}`) all run
+  `room_constant_lattice(root, WalkOpts)` - the fixpoint and every traced
+  frame under the variant's own widening options - then emit. The walk
+  generator (`shapes::walk`-based `room_kernels_with`/`room_shapes_in`)
+  is deleted; `shapes::walk` itself survives only inside
+  `specialize_probe`. A shape the fixpoint cannot trace, bind, lower or
+  render is FATAL at generation (a missing kernel is a runtime coverage
+  gap, not a smaller set).
+* **Layout: one `room<x><y>/` subdirectory per room per variant.** Rooms
+  are generated one PROCESS at a time (`CELESTE_START_ROOM` feeds
+  OnceLocks in game_runner), so the multi-room merge is file-level:
+  `transpile --merge-kernels DIR` writes the top-level `mod.rs` with
+  `SETS: &[&[Kernel]]` (every room's `KERNELS` table) and a
+  `FINGERPRINT` re-hashed over every room's kernel sources.
+  `Dispatch::new_multi` flattens `SETS` into the one shape-hash
+  registry and REFUSES any collision - rooms have distinct object
+  composition, so a collision is a generator/hash bug to surface. (The
+  base and ladder variants of one room share shape hashes - pinning
+  changes values, not structure - which is why variants stay separate
+  registries selected by `TracedMode`, never one table.)
+* **Rooms (0,0), (1,0), (2,0) generated for all three variants.**
+  Sizes: traced 532,098 lines / 26 MB, ladder 558,725 / 27 MB, exact
+  244,819 / 9.7 MB - 1.34 M generated lines total. Generation cost
+  (quick build): room (1,0) ~2 s per variant, (0,0) ~3-9 s, (2,0)
+  ~13-34 s; the whole 3x3 matrix ~1.8 min.
+* **The block-uniform interval row-key hole is filled.** The fruit
+  rooms' rung-agnostic kernels compute the fruit's `y` from the
+  boundary-widened (block-uniform) `off`, and that interval feeds the
+  in-kernel dedup key; `lower.rs` `Op::Bits` now packs the two u32
+  endpoints as `(lo << 32) | hi`, injective, the same packing
+  `zw_bits_i` uses per lane. The tri-state-uniform-bool hole stays open
+  and named.
+* **Strict is the DEFAULT.** `CELESTE_KERNEL_STRICT` unset means a
+  missed chunk is fatal with the full reason census;
+  `CELESTE_KERNEL_STRICT=0` restores the counted fall-through for
+  diagnosing. `check` mode is unaffected in the covered configs (the
+  comparison runs the interpreter as the reference, not as a fallback).
+* **Gates.** Per-variant staleness gates regenerate room (1,0) and
+  re-check every room's fingerprint via `merged_mod_rs` (so hand-edits
+  to ANY room fail fast); `room00_kernels_are_current` /
+  `room20_kernels_are_current` (#[ignore]) regenerate the other rooms
+  byte-for-byte. The room-1 differentials (`traced_kernels_reproduce_
+  the_interpreter` - now also asserting `missed_lanes() == 0` -,
+  bits1, k16, level0-agnostic, the origin pair-set gate) run against
+  the frozen DCE'd program as before. Rooms (0,0)/(2,0) get
+  `room00_lattice_kernels_match_the_interpreter` /
+  `room20_lattice_kernels_match_the_interpreter` in the main suite:
+  kernel-only `trace::run::Run` vs `AbstractRun` on the room-aware
+  `compile_from_disk` program, comparing per-frame REACHABLE-STATE sets
+  (row keys are confounded by the raw program's closure-upvalue boxing;
+  the frozen artifacts for those rooms do not exist and `bin/freeze` is
+  deleted, so this is the strongest per-room oracle available).
+* **traced-kernel-check reconciliation.** The feature-gated, gitignored
+  room-(2,0) `lattice` module and its test are DELETED; the checked-in
+  `traced::room20` set plus the main-suite gate replace them.
+  `traced_kernel_check::kernels` now re-exports
+  `celeste_kernels::traced::room10`.
+
+### Still not done, in honesty order
+
+* Spd rungs (unchanged).
+* In-search campaigns for rooms (0,0)/(2,0) on kernels: blocked on the
+  missing frozen rewritten artifacts (`rewrites-room00.jsonl` /
+  `rewrites-room20.jsonl` have no `.program.zst` and the freeze tooling
+  was deleted). The kernels are ready; the campaign reference program is
+  not. Restoring a freeze path (or bridging the raw program's boxing
+  cells) is its own task.
+* A ladder/exact differential for the fruit rooms at their rungs (the
+  variant semantics are gated on room (1,0), the lattice constants on
+  the base variant per room; the cross term - e.g. room (2,0) at
+  Bits(1) - has no oracle until the campaign artifact exists).

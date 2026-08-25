@@ -1206,3 +1206,29 @@ traced/ladder sets have today.
 
 This is a follow-up task, QUEUED behind the origin-metadata work (both touch
 the kernel generator + engine dispatch; sequence to avoid conflict).
+
+## IMPLEMENTED: the spec above is built (2026-08-26, worktree)
+
+The "latticeify everything, all rooms, one table" spec is implemented;
+see plans/kernel-ladder.md "Latticeified, all rooms, one table" for the
+full record. Summary of what changed against this file's vocabulary:
+
+* `write_room_kernels_lattice` no longer exists as a separate path - it
+  IS `write_room_kernels`, and the ladder/exact entry points are the
+  same lattice generator under `WalkOpts::LADDER` / `WalkOpts::EXACT`
+  (`room_constant_lattice(root, opts)` threads the widening axis through
+  the fixpoint and every traced frame).
+* The layout is `crates/celeste-kernels/src/{traced,ladder,exact}/
+  room<x><y>/`, merged per variant by `transpile --merge-kernels` into
+  `SETS` + a whole-set `FINGERPRINT`; `Dispatch::new_multi` refuses
+  cross-room shape collisions (none exist today).
+* Gate 2's successor is IN THE MAIN SUITE:
+  `room20_lattice_kernels_match_the_interpreter` (and the room-0
+  equivalent) run the checked-in base sets against the room-aware
+  `compile_from_disk` oracle on the reachable-state criterion this file
+  validated (the closure-boxing confound is documented above). The
+  feature-gated `traced-kernel-check` lattice module and
+  `room2_lattice_runs_and_covers` are deleted.
+* The oracle options list above ("Restore a freeze path / in-memory
+  recipe / bridge canonicalization") is still open - it now gates the
+  IN-SEARCH campaigns for rooms (0,0)/(2,0), not the kernels.
