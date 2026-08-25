@@ -92,3 +92,62 @@ walk, pick the pin values, and measure."
 ## Results
 
 (filled in as I go)
+
+## Result 1: position does NOT simplify the graph (2026-08-25)
+
+Built a probe (`transpile --spec-probe SHAPE`, env `CELESTE_SPEC_*`) that
+re-traces one room-(2,0) shape with fields pinned and reports reachable
+nodes + live forks. Room (2,0) shape 3 (the 190k-node monster, 14
+objects, 1 player + 2 springs):
+
+| pins | nodes | live forks |
+|---|---|---|
+| base (nothing) | 15,425 | 8 |
+| player XY + springs XY + pm1 | 15,104 | 8 |
+| + player `spd.x/spd.y` = 0 | 13,378 | 4 |
+| ALL player scalars except `rem` | **2,597** | **0** |
+
+(Node counts are the raw traced-frame cone, pre button/fork
+specialization - much smaller than the 190k lowered kernel, but the
+RATIOS are what matter.)
+
+**Position specialization buys almost nothing** (15,425 -> 15,104). The
+graph's size and its forks are driven by the player's DYNAMIC state -
+velocity above all. This contradicts the position-first plan we agreed on
+over the previous turns; recording it as the headline result so we can
+re-decide. The lever that works is the full player scalar state (down to
+2,597 nodes, no forks), which is not enumerable the way position is.
+
+### Where the 8 forks come from
+
+Every fork is `floor(0.5 + rem + spd_effective)` - the player's pixel
+move. `spd_effective` is a `Sel` chain:
+
+* 4 forks vanish when input `spd` is pinned: the player arriving with
+  different velocities.
+* The other 4 are the SPRING BOUNCE. `spd.y = Sel(Gt(objects[2].hide_for,0),
+  Sel(Gt(objects[1].hide_for,0), 0, -3), -3)`: the springs set the
+  player's `spd.y = -3` gated ONLY on each spring's `hide_for` (its
+  hidden-timer), NOT on collision.
+
+### The suspicious part: collide folds to "always colliding"
+
+The bounce should be gated on `collide(player,spring)` too. It is not -
+pinning the player and springs to positions 100+ px apart leaves the
+`-3` bounce fully present, gated only on `hide_for`. So `collide` is
+being decided TRUE (or dropped) regardless of position. Either the
+tracer over-approximates `collide` to "the player is always on every
+spring" - a real spurious-coupling BUG that would inflate room (2,0) on
+its own - or the pins are not reaching the collide box test. This is the
+next thing to pin down, and it matters independently of the
+specialization strategy: if the player is being coupled to every spring
+unconditionally, that is wrong, not just expensive.
+
+### Strategy implication (for discussion)
+
+If position does not help and velocity is the lever, the specialization
+axis is a player MODE (velocity band + dash/jump state), not a position.
+That is harder - velocity is not a small enumerable set the way reachable
+positions are. But FIRST resolve the collide question: a large part of
+the blow-up may be the spurious spring coupling, which is a correctness
+bug to fix rather than an abstraction to specialize around.

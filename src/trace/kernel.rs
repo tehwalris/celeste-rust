@@ -2023,3 +2023,221 @@ mod tests {
     }
 
 }
+
+// ---------------------------------------------------------------------------
+// Specialization probe (plans/specialize.md). NOT production: it re-traces one
+// shape with the player position, the springs, and a pm1 key pinned, and
+// reports how far the graph collapses. Driven by `transpile --spec-probe`.
+// ---------------------------------------------------------------------------
+
+/// Pin the player XY, the springs' XY, and a pm1 key on one shape, re-trace,
+/// and report the node/fork/body collapse against the unpinned base.
+pub fn specialize_probe(
+    root: &std::path::Path,
+    shape_idx: usize,
+    player_xy: (i16, i16),
+    spring_xy: &[(i16, i16)],
+) -> Result<String> {
+    use super::domain::Symbolic;
+    use super::interp::Interp;
+    use super::iface::{self, Conc, Step};
+    use super::verify::{run_one, trace_frame};
+    use super::heap::Value;
+    use super::{cart, shapes};
+    use anyhow::{anyhow, bail};
+    use celeste_core::pico8_num::Pico8Num as P8;
+
+    let src = cart::sources_in(root)?;
+    let top = full_moon::parse(&src).map_err(|e| anyhow!("parse: {:?}", e))?;
+    let init = full_moon::parse("_init()").map_err(|e| anyhow!("parse _init: {:?}", e))?;
+    let reset = full_moon::parse("__reset_button_states()").map_err(|e| anyhow!("reset: {:?}", e))?;
+    let fr = full_moon::parse(cart::FRAME_CODE).map_err(|e| anyhow!("frame: {:?}", e))?;
+
+    let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
+    let cart_data = std::sync::Arc::new(celeste_core::cart_data::CartData::load(root.join("cart"))?);
+    let (rx, ry) = celeste_interp::game_runner::start_room();
+    let cache = std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(&cart_data, rx, ry)?);
+    it.cache = Some(cache.clone());
+    it.cart = Some(cart_data.clone());
+
+    let st0 = cart::fresh_state::<Symbolic>(&mut it.d);
+    let st0 = run_one(&mut it, &top, st0)?;
+    let mut st0 = st0;
+    cart::inject_tile_flag_at(&mut st0);
+    let st0 = run_one(&mut it, &init, st0)?;
+    let w = shapes::walk(&mut it, &reset, &fr, st0, 400)?;
+
+    if shape_idx >= w.shapes.len() {
+        bail!("shape {} out of range ({} shapes)", shape_idx, w.shapes.len());
+    }
+    let st = w.shapes[shape_idx].state.clone();
+    let base_forks = w.shapes[shape_idx].frame.forks;
+
+    // Locate the player and the spring objects by type.
+    let objects_of = |st: &super::state::State<Symbolic>, name: &str| -> Vec<Vec<Step>> {
+        let mut out = Vec::new();
+        let Some(Value::Table(want)) = iface::get(st, &[iface::key(name)]) else { return out };
+        let Some(Value::Table(objects)) = iface::get(st, &[iface::key("objects")]) else { return out };
+        let n = st.heap.tables[&objects].arr.len();
+        for i in 0..n {
+            let base = vec![iface::key("objects"), Step::Idx(i)];
+            let mut ty = base.clone();
+            ty.push(iface::key("type"));
+            if iface::get(st, &ty) == Some(Value::Table(want)) { out.push(base); }
+        }
+        out
+    };
+    let players = objects_of(&st, "player");
+    let springs = objects_of(&st, "spring");
+    let fld = |base: &[Step], f: &[&str]| -> Vec<Step> {
+        let mut p = base.to_vec();
+        for x in f { p.push(iface::key(x)); }
+        p
+    };
+    let num = |v: i16| Conc::Num(P8::from_i16(v));
+
+    let mut pin: Vec<(Vec<Step>, Conc)> = Vec::new();
+    // The player position.
+    if let Some(pl) = players.first() {
+        pin.push((fld(pl, &["x"]), num(player_xy.0)));
+        pin.push((fld(pl, &["y"]), num(player_xy.1)));
+        // pm1 key on the player, canonical "steady" values.
+        pin.push((fld(pl, &["dash_time"]), num(0)));
+        pin.push((fld(pl, &["p_dash"]), Conc::Bool(false)));
+        pin.push((fld(pl, &["p_jump"]), Conc::Bool(false)));
+    }
+    // Optional extra pin groups, so the graph's fork sources can be
+    // isolated without recompiling. CELESTE_SPEC_GROUPS is a comma list:
+    //   spd        - pin the player spd.x/spd.y to 0
+    //   springall  - pin every spring scalar (freeze the springs)
+    //   playerall  - pin every player scalar except rem (the fork input)
+    let groups: std::collections::HashSet<String> = std::env::var("CELESTE_SPEC_GROUPS")
+        .unwrap_or_default().split(',').map(|s| s.trim().to_string()).collect();
+    for (i, sp) in springs.iter().enumerate() {
+        if let Some((x, y)) = spring_xy.get(i) {
+            pin.push((fld(sp, &["x"]), num(*x)));
+            pin.push((fld(sp, &["y"]), num(*y)));
+        }
+        if groups.contains("springall") {
+            for f in super::shapes::state_paths(&st).unwrap_or_default() {
+                if f.starts_with(sp) && !pin.iter().any(|(q, _)| q == &f) {
+                    match iface::get(&st, &f) {
+                        Some(Value::Bool(_)) => pin.push((f, Conc::Bool(false))),
+                        Some(Value::Num(_)) => pin.push((f, num(0))),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    if let Some(pl) = players.first() {
+        if groups.contains("spd") {
+            pin.push((fld(pl, &["spd", "x"]), num(0)));
+            pin.push((fld(pl, &["spd", "y"]), num(0)));
+        }
+        // CELESTE_SPEC_PFIELDS: dotted player field paths to pin to 0,
+        // e.g. "spd.x,spd.y,djump,grace,dash_effect_time".
+        for spec in std::env::var("CELESTE_SPEC_PFIELDS").unwrap_or_default().split(',') {
+            let spec = spec.trim();
+            if spec.is_empty() { continue; }
+            let parts: Vec<&str> = spec.split('.').collect();
+            let path = fld(pl, &parts);
+            if super::shapes::state_paths(&st).unwrap_or_default().iter().any(|r| r == &path) && !pin.iter().any(|(q,_)| q==&path) {
+                match iface::get(&st, &path) {
+                    Some(Value::Bool(_)) => pin.push((path, Conc::Bool(false))),
+                    Some(Value::Num(_)) => pin.push((path, num(0))),
+                    _ => {}
+                }
+            }
+        }
+        if groups.contains("playerall") {
+            for f in super::shapes::state_paths(&st).unwrap_or_default() {
+                let is_rem = f.starts_with(pl) && f.iter().any(|s| format!("{:?}", s).contains("rem"));
+                if f.starts_with(pl) && !is_rem && !pin.iter().any(|(q, _)| q == &f) {
+                    match iface::get(&st, &f) {
+                        Some(Value::Bool(_)) => pin.push((f, Conc::Bool(false))),
+                        Some(Value::Num(_)) => pin.push((f, num(0))),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    // pm1 globals.
+    pin.push((vec![iface::key("freeze")], num(0)));
+    pin.push((vec![iface::key("has_dashed")], Conc::Bool(false)));
+
+    // Only keep pins whose path is actually a scalar in this state.
+    let roots = shapes::state_paths(&st)?;
+    let ival = shapes::ival_paths(&st);
+    pin.retain(|(p, _)| roots.iter().any(|r| r == p));
+
+    let pinned_paths: Vec<String> = pin.iter().map(|(p, _)| iface::show(p)).collect();
+
+    // Measure one traced frame: reachable node count, distinct LIVE
+    // forks (Op::Split still referenced), and an op census.
+    fn measure(g: &crate::transpile::graph::Graph, f: &super::verify::Frame) -> (usize, std::collections::BTreeSet<u8>, Vec<String>) {
+        use crate::transpile::graph::Op;
+        let mut roots_n: Vec<crate::transpile::graph::NodeId> = Vec::new();
+        for o in &f.outs {
+            for (_, nd, _) in &o.fields { roots_n.push(*nd); }
+            roots_n.push(o.guard);
+            roots_n.push(o.ok);
+        }
+        let reach = crate::transpile::bdd::reachable(g, &roots_n);
+        let nodes = reach.iter().filter(|b| **b).count();
+        let mut forks = std::collections::BTreeSet::new();
+        let mut census: std::collections::BTreeMap<String, usize> = Default::default();
+        for id in 0..g.len() {
+            if reach[id] {
+                let op = &g.get(id as u32).op;
+                if let Op::Split(d) | Op::SplitValid(d) = op { forks.insert(*d); }
+                *census.entry(format!("{:?}", op).split('(').next().unwrap().to_string()).or_default() += 1;
+            }
+        }
+        let mut v: Vec<_> = census.into_iter().collect();
+        v.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        let top = v.into_iter().take(12).map(|(k, n)| format!("{} {}", k, n)).collect();
+        (nodes, forks, top)
+    }
+
+    // Base: same shape, NO pins.
+    let base = trace_frame(&mut it, &reset, &fr, st.clone(), &roots, &[], &ival, true)
+        .map_err(|e| anyhow!("base trace of shape {}: {:#}", shape_idx, e))?;
+    let (bn, bf, _) = measure(&it.d.graph, &base);
+
+    // Pinned.
+    let f = trace_frame(&mut it, &reset, &fr, st, &roots, &pin, &ival, true)
+        .map_err(|e| anyhow!("pinned trace of shape {}: {:#}", shape_idx, e))?;
+    let (pn, pf, ptop) = measure(&it.d.graph, &f);
+
+    // Slot -> path, so Cell(i) in the dump can be read.
+    if std::env::var("CELESTE_SPEC_SLOTS").is_ok() {
+        for (i, sp) in f.iface.slots.iter().enumerate() {
+            eprintln!("  slot {} = {}", i, iface::show(sp));
+        }
+    }
+    let mut out = String::new();
+    out.push_str(&format!("shape {}: {} outcomes, {} players, {} springs\n", shape_idx, f.outs.len(), players.len(), springs.len()));
+    out.push_str(&format!("  pinned: {}\n", pinned_paths.join(", ")));
+    out.push_str(&format!("  BASE   : {} nodes, {} live forks {:?}, counter {}\n", bn, bf.len(), bf, base_forks));
+    out.push_str(&format!("  PINNED : {} nodes, {} live forks {:?}, counter {}\n", pn, pf.len(), pf, f.forks));
+    out.push_str(&format!("  pinned op census: {}\n", ptop.join(", ")));
+    // What each LIVE fork forks on.
+    {
+        use crate::transpile::graph::Op;
+        let g = &it.d.graph;
+        let mut roots_n: Vec<crate::transpile::graph::NodeId> = Vec::new();
+        for o in &f.outs { for (_, nd, _) in &o.fields { roots_n.push(*nd); } roots_n.push(o.guard); roots_n.push(o.ok); }
+        let reach = crate::transpile::bdd::reachable(g, &roots_n);
+        for id in 0..g.len() {
+            if reach[id] {
+                if let Op::Split(d) = g.get(id as u32).op {
+                    let operand = g.get(id as u32).args[0];
+                    out.push_str(&format!("  fork {}: {}\n", d, super::emit::show_tree(g, operand, 8)));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
