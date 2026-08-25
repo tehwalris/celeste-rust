@@ -974,3 +974,30 @@ piece.
 then rebuild before any manual rustc of a generated kernel - duplicate
 rlibs from intervening builds otherwise give spurious "two versions of
 celeste_core" type errors.)
+
+## Gate 2 caught a real over-claim: boundary-widened fields (2026-08-25)
+
+Wired the room-2 lattice kernels into a runner (traced-kernel-check,
+`room2_lattice_runs_and_covers`). It compiled (401k lines) and ran -
+frame 1 clean, then frame 2 FAILED to bind shape 15: `objects[0].off`
+held an interval [0,39] but the kernel expected a number. The runtime
+BOUNDARY widens a live fruit's `off`/`y` to intervals (widen.rs), so they
+are never compile-time constants - but the lattice fixpoint had baked
+`off` as a constant (it pinned it from a state where the fruit was
+inactive, and the pin then suppressed the widening for that shape).
+
+This is exactly the fixpoint-optimism failure D2/D4 warned about, and
+gate 2 caught it - which is the point of gate 2. Notably it surfaced as a
+BIND failure (num vs ival), before pin_guard could run, because the
+kind mismatch is structural, not a value mismatch.
+
+Fix: `boundary_widened_paths` (player rem + every live fruit's off/y),
+excluded from `field_constants`, so the lattice never bakes a field the
+runtime boundary makes an interval. This is the principled rule: bake a
+field only if it is constant AFTER the boundary, not merely in some
+traced subset.
+
+Re-checking shape/fork counts, then re-running gate 2. The deeper
+soundness (fixpoint pruning could still miss states via OTHER baked
+fields) remains why the base+specialized fallback is the ultimate safety;
+this fix removes the one class the boundary is responsible for.

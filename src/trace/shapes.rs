@@ -205,14 +205,38 @@ pub struct Walk {
 /// The scalar fields of `st` that are compile-time constants: their value
 /// node is an exact `Const(v,v)` (numbers) or `ConstBool` (booleans).
 /// These are the fields the per-shape constant lattice can bake in.
+/// The scalar fields the runtime BOUNDARY widens to intervals, so they are
+/// never compile-time constants no matter what a trace computes: the
+/// player's `rem` (ival_paths) and every live fruit's `off`/`y`
+/// (widen.rs). The lattice must not bake these, or a mid-game block whose
+/// `off` is an interval will not bind a kernel that expects a number.
+pub fn boundary_widened_paths(st: &State<Symbolic>) -> std::collections::BTreeSet<Path> {
+    let mut out: std::collections::BTreeSet<Path> = ival_paths(st).into_iter().collect();
+    let Some(Value::Table(fruit)) = iface::get(st, &[iface::key("fruit")]) else { return out };
+    let Some(Value::Table(objects)) = iface::get(st, &[iface::key("objects")]) else { return out };
+    let n = st.heap.tables[&objects].arr.len();
+    for i in 0..n {
+        let base = vec![iface::key("objects"), Step::Idx(i)];
+        let mut ty = base.clone(); ty.push(iface::key("type"));
+        if iface::get(st, &ty) != Some(Value::Table(fruit)) { continue; }
+        for f in ["off", "y"] {
+            let mut p = base.clone(); p.push(iface::key(f));
+            if iface::get(st, &p).is_some() { out.insert(p); }
+        }
+    }
+    out
+}
+
 pub fn field_constants(
     st: &State<Symbolic>,
     d: &Symbolic,
 ) -> Result<std::collections::BTreeMap<Path, super::iface::Conc>> {
     use super::domain::Domain;
     use super::iface::Conc;
+    let widened = boundary_widened_paths(st);
     let mut out = std::collections::BTreeMap::new();
     for p in state_paths(st)? {
+        if widened.contains(&p) { continue; }
         match iface::get(st, &p) {
             Some(Value::Num(n)) => {
                 if let Some(v) = d.as_const(&n) {
