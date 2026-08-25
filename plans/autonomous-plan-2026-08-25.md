@@ -44,3 +44,23 @@ workload; a contended run is meaningless).
 - If a merge has a semantic conflict (e.g. origin rewiring references a set
   the lattice task deleted), reconcile then REGENERATE the lattice kernels
   with the merged (origin-aware) emitter so they inherit origin support.
+
+## 4. Whole real runs for rooms (0,0), (1,0), (2,0) - the final deliverable
+
+After steps 1-3, on an IDLE machine, run the FULL ladder campaign for each
+of rooms 0, 1, 2 end to end. Requirements (Philippe, explicit):
+- **Fully lattice FORWARD and BACKWARD** - the new kernels drive both
+  directions; interpreter is reference-only, never in the runtime path.
+- **Side-effect-derived position graph** - the FUSED `record_pos_graph`
+  path (pos graph recorded as a byproduct of the forward pass), NOT the
+  dedicated replay pass. This is the mode Philippe wants to be the only
+  mode; the origin work (step 1) is what unblocks it on kernels.
+- Collect ALL counts and timings: per-stage wall + peak RSS, us/lane,
+  frontier funnel (raw -> self-dedup -> frontier-dedup -> new lanes),
+  kernel coverage (missed/plain-routed must be 0 under strict), the win
+  frame / optimum per room, and the row-key/g.bin identity vs the
+  interpreter reference.
+- Room (0,0) needs MEM=108G and few-frames-per-process (its level-0
+  position-graph replay peaks ~101 GB) - see BENCHMARK_DATA.md; use
+  ladder.sh's room-0 handling. Rooms 1,2 fit the 60G default.
+- Write the numbers into BENCHMARK_DATA.md (keep it current) and report.
