@@ -487,6 +487,17 @@ mod tests {
             "no chunk ever reached a traced kernel - the set covers no shape this run \
              produces, so this test checked nothing"
         );
+        // Since the lattice campaign the base set carries pin_guard
+        // obligations, so a miss here can also mean a DECLINED lane -
+        // a lattice constant the real run disagrees with. In check mode
+        // a missed chunk falls through to the interpreter on both sides
+        // and the comparison passes vacuously, which is exactly the
+        // silent coverage collapse this assert exists to catch.
+        assert_eq!(
+            crate::compiled::dispatch::missed_lanes(),
+            0,
+            "the base lattice set missed lanes on room (1,0)"
+        );
     }
 
     /// The kernel-driven LADDER gate (plans/kernel-ladder.md): at rem

@@ -38,8 +38,7 @@ use celeste_engine::runtime2::Rt2;
 pub use celeste_engine::traced::Kernel;
 
 pub struct Dispatch {
-    kernels: &'static [Kernel],
-    by_shape: HashMap<u64, usize>,
+    by_shape: HashMap<u64, &'static Kernel>,
 }
 
 impl Dispatch {
@@ -51,22 +50,30 @@ impl Dispatch {
     /// hash order. So it is refused here, once, rather than tolerated
     /// every frame.
     pub fn new(kernels: &'static [Kernel]) -> Result<Self> {
-        let mut by_shape = HashMap::new();
-        for (i, k) in kernels.iter().enumerate() {
-            if let Some(j) = by_shape.insert(k.shape, i) {
-                bail!(
-                    "{} and {} are both for shape {:#x}",
-                    kernels[j].name,
-                    k.name,
-                    k.shape
-                );
-            }
-        }
-        Ok(Dispatch { kernels, by_shape })
+        Self::new_multi(&[kernels])
     }
 
-    pub fn kernels(&self) -> &'static [Kernel] {
-        self.kernels
+    /// One registry over SEVERAL kernel tables - the multi-room sets
+    /// (`celeste_kernels::*::SETS`, one table per room). Rooms have
+    /// distinct object composition, so their shapes should never
+    /// collide; if two rooms' kernels ever hash to one shape, that is a
+    /// real generator/hash bug to surface, not a tie to break, and it
+    /// is refused exactly like a within-room duplicate.
+    pub fn new_multi(sets: &[&'static [Kernel]]) -> Result<Self> {
+        let mut by_shape: HashMap<u64, &'static Kernel> = HashMap::new();
+        for set in sets {
+            for k in set.iter() {
+                if let Some(prev) = by_shape.insert(k.shape, k) {
+                    bail!(
+                        "{} and {} are both for shape {:#x}",
+                        prev.name,
+                        k.name,
+                        k.shape
+                    );
+                }
+            }
+        }
+        Ok(Dispatch { by_shape })
     }
 
     /// The kernel for this block, by its canonical shape.
@@ -82,6 +89,6 @@ impl Dispatch {
     /// not been through a boundary - the traced runner's own loop
     /// builds blocks straight out of a kernel accumulator.
     pub fn find_by_shape(&self, shape: u64) -> Option<&'static Kernel> {
-        self.by_shape.get(&shape).map(|i| &self.kernels[*i])
+        self.by_shape.get(&shape).copied()
     }
 }

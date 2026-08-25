@@ -71,10 +71,16 @@ fn main() -> Result<()> {
                 );
                 return Ok(());
             }
-            "--room-kernels-lattice" => {
-                let d = args.next().ok_or_else(|| anyhow!("--room-kernels-lattice DIR"))?;
-                let sizes = celeste_rust::trace::kernel::write_room_kernels_lattice(std::path::Path::new("."), std::path::Path::new(&d))?;
-                eprintln!("lattice: {} kernels -> {:?} lines, {} total", sizes.len(), sizes, sizes.iter().sum::<usize>());
+            // --merge-kernels DIR: write DIR/mod.rs from the per-room
+            // subdirectories the three generators above produced. Rooms
+            // are generated one process each (CELESTE_START_ROOM feeds
+            // a OnceLock); this is the file-level step that puts them
+            // all into one dispatch registry (`SETS`).
+            "--merge-kernels" => {
+                let d = args.next().ok_or_else(|| anyhow!("--merge-kernels DIR"))?;
+                let rooms =
+                    celeste_rust::trace::kernel::merge_kernel_sets(std::path::Path::new(&d))?;
+                eprintln!("merged {} rooms: {:?} in {}", rooms.len(), rooms, d);
                 return Ok(());
             }
             "--room-consts" => {

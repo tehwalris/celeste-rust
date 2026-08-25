@@ -645,12 +645,23 @@ impl<'a> Ctx<'a> {
                     (true, Dom::Bool, _) => format!("zw_bits_b({})", x),
                     (false, Dom::Num, false) => format!("{}.as_raw_u32() as u64", x),
                     (false, Dom::Bool, false) => format!("{} as u64", x),
-                    // A block-uniform interval or tri-state output. No
-                    // outcome has one today; the hole is left open on
-                    // purpose so the first one that does fails here with
-                    // a name rather than silently hashing something else.
-                    (false, d, true) => {
-                        bail!("no row-key bits for a block-uniform wide {:?}", d)
+                    // A block-uniform INTERVAL output: the fruit rooms'
+                    // rung-agnostic kernels compute e.g. the fruit's `y`
+                    // from the boundary-widened (uniform) `off`, and the
+                    // result feeds the row key. Pack both endpoints the
+                    // way `zw_bits_i` does per lane - (lo << 32) | hi is
+                    // injective on the u32 raw pair, so the dedup key
+                    // distinguishes exactly by interval value.
+                    (false, Dom::Num, true) => format!(
+                        "({x}.0.as_raw_u32() as u64) << 32 | {x}.1.as_raw_u32() as u64",
+                        x = x
+                    ),
+                    // A block-uniform TRI-STATE bool output. No outcome
+                    // has one today; the hole is left open on purpose so
+                    // the first one that does fails here with a name
+                    // rather than silently hashing something else.
+                    (false, Dom::Bool, true) => {
+                        bail!("no row-key bits for a block-uniform wide Bool")
                     }
                     (_, Dom::Word, _) => bail!("Bits of a machine word"),
                 }

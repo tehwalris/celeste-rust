@@ -988,125 +988,23 @@ pub fn reference_frame_in(root: &std::path::Path) -> Result<Reference> {
     Ok(Reference { frame, graph, bound, lowered, cart: cart_data, cache })
 }
 
-/// One kernel per SHAPE the room reaches.
+/// One kernel per heap SHAPE the room reaches - the CONSTANT-LATTICE
+/// level-0 references (the production base set). The walk-based
+/// generator this used to name was retired with the non-lattice sets
+/// (plans/specialize.md "Spec: latticeify everything, all rooms, one
+/// table").
 ///
-/// No pm1 pin: a kernel covers every key of its shape. The pin is worth
-/// -6.3% (T13) and costs a kernel per key, and a fully symbolic frame is
-/// 2,341 graph nodes against ~1,720 for the largest single outcome of a
-/// pinned one - so un-pinning is close to free.
+/// No pm1 pin: a kernel covers every key of its shape (the pin is worth
+/// -6.3% (T13) and costs a kernel per key). The LATTICE pins are a
+/// different thing: fields constant across the room's reachable states,
+/// guarded by `pin_guard` in `ok`.
 ///
-/// REFUSES rather than returns a partial set. A shape the walk could not
-/// trace, or one it dropped at the cap, is a kernel that will not exist,
-/// and under the never-deopt doctrine that is a run that stops. Better
-/// to fail here, where the reason is in hand.
-/// Every shape's traced frame, BOUND to the engine's numbering, plus the
-/// arena they share. The half of `room_kernels_in` that does not lower -
-/// separate so a diagnostic can look at the traced graph itself, which
-/// is where the question "did the tracer build this node or did a fold"
-/// gets answered.
-pub(crate) fn room_shapes_in(
-    root: &std::path::Path,
-    opts: super::shapes::WalkOpts,
-) -> Result<(
-    Vec<super::shapes::Shape>,
-    crate::transpile::graph::Graph,
-    std::sync::Arc<celeste_core::cart_data::CartData>,
-    std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
-)> {
-    use super::domain::Symbolic;
-    use super::interp::Interp;
-    use super::verify::run_one;
-    use super::{cart, shapes};
-    use anyhow::{anyhow, bail};
-
-    let src = cart::sources_in(root)?;
-    let top = full_moon::parse(&src).map_err(|e| anyhow!("parse: {:?}", e))?;
-    let init = full_moon::parse("_init()").map_err(|e| anyhow!("parse _init: {:?}", e))?;
-    let reset = full_moon::parse("__reset_button_states()")
-        .map_err(|e| anyhow!("parse reset: {:?}", e))?;
-    let fr = full_moon::parse(cart::FRAME_CODE).map_err(|e| anyhow!("parse frame: {:?}", e))?;
-
-    let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
-    let cart_data = std::sync::Arc::new(celeste_core::cart_data::CartData::load(root.join("cart"))?);
-    let (rx, ry) = celeste_interp::game_runner::start_room();
-    let cache = std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(
-        &cart_data, rx, ry,
-    )?);
-    it.cache = Some(cache.clone());
-    it.cart = Some(cart_data.clone());
-
-    let st = cart::fresh_state::<Symbolic>(&mut it.d);
-    let mut st = run_one(&mut it, &top, st)?;
-    cart::inject_tile_flag_at(&mut st);
-    let st = run_one(&mut it, &init, st)?;
-
-    let w = shapes::walk(&mut it, &reset, &fr, st, 400, opts)?;
-    if !w.refused.is_empty() {
-        let why: Vec<String> =
-            w.refused.iter().map(|(e, n)| format!("{} x {}", n, e)).collect();
-        // The COUNTS matter as much as the reasons: "1 refusal against 12
-        // traced shapes" is a hole to fill, "1 against 0" is a tracer
-        // that never got started, and the message used to read the same
-        // either way.
-        bail!(
-            "the shape walk could not trace every shape ({} traced, {} left the room, \
-             {} unreachable):\n{}",
-            w.shapes.len(),
-            w.left_room,
-            w.unreachable,
-            why.join("\n")
-        );
-    }
-    if w.dropped > 0 {
-        bail!("the shape walk hit its cap with {} outcomes left", w.dropped);
-    }
-
-    let graph = std::mem::take(&mut it.d.graph);
-    Ok((w.shapes, graph, cart_data, cache))
-}
-
-/// One kernel per heap shape the room reaches.
+/// REFUSES rather than returns a partial set. A shape the fixpoint could
+/// not trace is a kernel that will not exist, and under the never-deopt
+/// doctrine that is a run that stops. Better to fail here, where the
+/// reason is in hand.
 pub fn room_kernels_in(root: &std::path::Path) -> Result<Vec<Reference>> {
-    room_kernels_with(root, super::shapes::WalkOpts::LEVEL0)
-}
-
-/// `room_kernels_in` for any walk mode (plans/kernel-ladder.md):
-/// `LADDER` produces the rung-agnostic kernels (exact frame outputs,
-/// widenings left to the campaign boundary), `EXACT` the exact-rem set
-/// (interval slots as plain numbers, no rem forks).
-pub fn room_kernels_with(
-    root: &std::path::Path,
-    opts: super::shapes::WalkOpts,
-) -> Result<Vec<Reference>> {
-    let (shapes, graph, cart_data, cache) = room_shapes_in(root, opts)?;
-    let room = crate::transpile::graph::Room { cart: cart_data.clone(), cache: cache.clone() };
-    let mut out = Vec::new();
-    for sh in shapes {
-        let frame = sh.frame;
-        let bound = super::emit::bind(&frame, &graph)?;
-        let lowered = super::emit::lower_frame(
-            &bound.graph,
-            &bound.inputs,
-            &bound.uni,
-            &bound.outcomes,
-            Some(room.clone()),
-            bound.forks,
-        )
-        .map_err(|e| name_cells(&frame, e))?;
-        out.push(Reference {
-            frame,
-            // Every shape was traced into ONE arena so they share
-            // subexpressions; each reference keeps a copy because the
-            // check harness evaluates against it. Cheap - the whole
-            // room's traced graph is a few thousand nodes.
-            graph: graph.clone(),
-            bound,
-            lowered,
-            cart: cart_data.clone(),
-            cache: cache.clone(),
-        });
-    }
-    Ok(out)
+    lattice_kernel_refs(root, super::shapes::WalkOpts::LEVEL0)
 }
 
 /// A block holding `rows` concrete input assignments, one per lane.
@@ -1208,9 +1106,25 @@ fn name_cells(f: &super::verify::Frame, e: anyhow::Error) -> anyhow::Error {
 }
 
 /// coexist only as separate modules.
+///
+/// Every checked-in set is CONSTANT-LATTICE specialized
+/// (plans/specialize.md "Spec: latticeify everything, all rooms, one
+/// table"): the per-shape fixpoint bakes the fields that are constant
+/// across the room's reachable states (static object positions, speeds,
+/// hitboxes) into the kernel, and `pin_guard` puts the check that a
+/// lane actually holds those constants into `ok` - a lane that
+/// disagrees is DECLINED, which is fatal under CELESTE_KERNEL_STRICT,
+/// never silently wrong. The three variants share the lattice and
+/// differ only in the widening axis (`WalkOpts`).
+///
+/// This writes ONE room's set - the configured `CELESTE_START_ROOM` -
+/// into `dir/room<x><y>/`. Rooms are generated one process at a time
+/// (the start room is a process global that feeds `_init`, the
+/// collision cache and the `sin` builtin), and `merge_kernel_sets`
+/// then writes the top-level `mod.rs` that puts every generated room
+/// into one dispatch registry.
 pub fn write_room_kernels(root: &std::path::Path, dir: &std::path::Path) -> Result<Vec<usize>> {
-    let refs = room_kernels_in(root)?;
-    write_kernels_from_refs(&refs, dir)
+    write_lattice_set(root, dir, super::shapes::WalkOpts::LEVEL0)
 }
 
 /// The RUNG-AGNOSTIC kernel set (plans/kernel-ladder.md): traced with
@@ -1224,8 +1138,7 @@ pub fn write_room_kernels_ladder(
     root: &std::path::Path,
     dir: &std::path::Path,
 ) -> Result<Vec<usize>> {
-    let refs = room_kernels_with(root, super::shapes::WalkOpts::LADDER)?;
-    write_kernels_from_refs(&refs, dir)
+    write_lattice_set(root, dir, super::shapes::WalkOpts::LADDER)
 }
 
 /// The EXACT-REM kernel set, for the ladder's top rung (k = 16, rem
@@ -1237,34 +1150,150 @@ pub fn write_room_kernels_exact(
     root: &std::path::Path,
     dir: &std::path::Path,
 ) -> Result<Vec<usize>> {
-    let refs = room_kernels_with(root, super::shapes::WalkOpts::EXACT)?;
-    write_kernels_from_refs(&refs, dir)
+    write_lattice_set(root, dir, super::shapes::WalkOpts::EXACT)
 }
 
-/// As `write_room_kernels`, but the kernels come from the CONSTANT-LATTICE
-/// fixpoint (static objects baked in). Fewer, smaller kernels; each
-/// carries the lattice's `pin_guard` in its `ok`, so a lane whose baked
-/// fields disagree is declined to a fallback. plans/specialize.md.
-pub fn write_room_kernels_lattice(root: &std::path::Path, dir: &std::path::Path) -> Result<Vec<usize>> {
-    let mut lw = room_constant_lattice(root)?;
+/// The directory/module name of the configured start room's kernels.
+pub fn kernel_room_mod() -> String {
+    let (x, y) = celeste_interp::game_runner::start_room();
+    format!("room{}{}", x, y)
+}
+
+/// The constant-lattice `Reference`s for the configured start room, in
+/// the (deterministic) shape-key order of the fixpoint. A shape that
+/// fails to bind, lower or render is FATAL: this is the sole production
+/// generator, and a missing kernel is a runtime coverage gap under
+/// strict mode, not a fallback.
+pub(crate) fn lattice_kernel_refs(
+    root: &std::path::Path,
+    opts: super::shapes::WalkOpts,
+) -> Result<Vec<Reference>> {
+    let mut lw = room_constant_lattice(root, opts)?;
     let room = crate::transpile::graph::Room { cart: lw.cart.clone(), cache: lw.cache.clone() };
     let mut refs: Vec<Reference> = Vec::new();
-    let (mut ok_n, mut fail_n) = (0, 0);
     for (i, (_k, f)) in std::mem::take(&mut lw.frames).into_iter().enumerate() {
-        let bound = match super::emit::bind(&f, &lw.graph) {
-            Ok(b) => b, Err(e) => { fail_n += 1; eprintln!("shape {} bind FAILED: {}", i, format!("{:#}", e).lines().next().unwrap_or("")); continue }
-        };
-        let lowered = match super::emit::lower_frame(&bound.graph, &bound.inputs, &bound.uni, &bound.outcomes, Some(room.clone()), bound.forks) {
-            Ok(l) => l, Err(e) => { fail_n += 1; eprintln!("shape {} lower FAILED: {}", i, format!("{:#}", name_cells(&f, e)).lines().next().unwrap_or("")); continue }
-        };
-        if let Err(e) = render(&f, &bound, &lowered, &format!("shape {}", i)) {
-            fail_n += 1; eprintln!("shape {} render FAILED: {}", i, format!("{:#}", e).lines().next().unwrap_or("")); continue;
-        }
-        refs.push(Reference { frame: f, graph: lw.graph.clone(), bound, lowered, cart: lw.cart.clone(), cache: lw.cache.clone() });
-        ok_n += 1;
+        let bound = super::emit::bind(&f, &lw.graph)
+            .map_err(|e| anyhow::anyhow!("lattice shape {} bind: {:#}", i, e))?;
+        let lowered = super::emit::lower_frame(
+            &bound.graph,
+            &bound.inputs,
+            &bound.uni,
+            &bound.outcomes,
+            Some(room.clone()),
+            bound.forks,
+        )
+        .map_err(|e| anyhow::anyhow!("lattice shape {} lower: {:#}", i, name_cells(&f, e)))?;
+        render(&f, &bound, &lowered, &format!("shape {}", i))
+            .map_err(|e| anyhow::anyhow!("lattice shape {} render: {:#}", i, e))?;
+        refs.push(Reference {
+            frame: f,
+            graph: lw.graph.clone(),
+            bound,
+            lowered,
+            cart: lw.cart.clone(),
+            cache: lw.cache.clone(),
+        });
     }
-    eprintln!("lattice render: {} ok, {} failed", ok_n, fail_n);
-    write_kernels_from_refs(&refs, dir)
+    Ok(refs)
+}
+
+fn write_lattice_set(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    opts: super::shapes::WalkOpts,
+) -> Result<Vec<usize>> {
+    let refs = lattice_kernel_refs(root, opts)?;
+    write_kernels_from_refs(&refs, &dir.join(kernel_room_mod()))
+}
+
+/// Write the top-level `mod.rs` of a MULTI-ROOM kernel set: one
+/// `pub mod room<x><y>` per generated room plus `SETS`, the list of
+/// every room's `KERNELS` table, which `Dispatch::new_multi` flattens
+/// into the one shape-hash registry (a cross-room hash collision is
+/// refused there, at startup). The rooms are generated one process
+/// each (`write_room_kernels*`), so the merge is a separate, file-level
+/// step.
+///
+/// `FINGERPRINT` re-hashes every room's kernel sources in directory
+/// order, so it changes whenever any room's set does and two campaigns
+/// with different sets can never share a checkpoint.
+pub fn merge_kernel_sets(dir: &std::path::Path) -> Result<Vec<String>> {
+    let (rooms, m) = merged_mod_rs(dir)?;
+    std::fs::write(dir.join("mod.rs"), m)?;
+    Ok(rooms)
+}
+
+/// What `merge_kernel_sets` would write for the room directories under
+/// `dir`, without writing it. The staleness gates compare this against
+/// the committed `mod.rs`, which catches ANY room's kernel sources
+/// drifting from the recorded fingerprint - including the rooms the
+/// fast gates do not regenerate.
+pub fn merged_mod_rs(dir: &std::path::Path) -> Result<(Vec<String>, String)> {
+    let mut rooms: Vec<String> = std::fs::read_dir(dir)?
+        .filter_map(|e| {
+            let e = e.ok()?;
+            let name = e.file_name().to_string_lossy().into_owned();
+            (e.path().is_dir() && name.starts_with("room")).then_some(name)
+        })
+        .collect();
+    rooms.sort();
+    anyhow::ensure!(
+        !rooms.is_empty(),
+        "no room*/ kernel directories under {} - generate per-room sets first",
+        dir.display()
+    );
+    let fingerprint = {
+        use std::hash::{Hash, Hasher};
+        let mut h = rustc_hash::FxHasher::default();
+        for room in &rooms {
+            room.hash(&mut h);
+            let mut files: Vec<(usize, std::path::PathBuf)> = std::fs::read_dir(dir.join(room))?
+                .filter_map(|e| {
+                    let p = e.ok()?.path();
+                    let name = p.file_name()?.to_string_lossy().into_owned();
+                    let idx: usize =
+                        name.strip_prefix("kernel")?.strip_suffix(".rs")?.parse().ok()?;
+                    Some((idx, p))
+                })
+                .collect();
+            files.sort();
+            for (_, p) in files {
+                std::fs::read_to_string(&p)?.hash(&mut h);
+            }
+        }
+        h.finish()
+    };
+    let mut m = String::new();
+    writeln!(
+        m,
+        "// GENERATED by `trace::kernel::merge_kernel_sets`. Do not edit.\n\
+         //\n\
+         // One submodule per generated ROOM; each holds one kernel per\n\
+         // heap shape that room reaches, and `SETS` is what\n\
+         // `Dispatch::new_multi` flattens into the one shape-hash\n\
+         // registry. Every kernel here is CONSTANT-LATTICE specialized\n\
+         // (plans/specialize.md): baked constants are guarded by the\n\
+         // kernel's `ok`, so a lane that disagrees declines loudly.\n\
+         #![allow(clippy::all)]\n\
+         pub use celeste_engine::traced::Kernel;\n"
+    )?;
+    for room in &rooms {
+        writeln!(m, "pub mod {};", room)?;
+    }
+    writeln!(m, "\npub const SETS: &[&[Kernel]] = &[")?;
+    for room in &rooms {
+        writeln!(m, "    {}::KERNELS,", room)?;
+    }
+    writeln!(
+        m,
+        "];\n\n\
+         /// Content hash of every kernel source in every room of this\n\
+         /// set. Hashed into the campaign fingerprint so two different\n\
+         /// kernel sets can never share a checkpoint.\n\
+         pub const FINGERPRINT: u64 = {};",
+        fingerprint
+    )?;
+    Ok((rooms, m))
 }
 
 fn write_kernels_from_refs(refs: &[Reference], dir: &std::path::Path) -> Result<Vec<usize>> {
@@ -1344,27 +1373,42 @@ fn write_kernels_from_refs(refs: &[Reference], dir: &std::path::Path) -> Result<
 
 #[cfg(test)]
 mod tests {
-    /// The gate that makes the CHECKED-IN traced set safe.
+    /// Byte-for-byte staleness for one variant's checked-in set.
     ///
-    /// `crates/celeste-kernels/src/traced/` is committed, so nothing in
-    /// the build forces it to match the tracer that claims to produce
-    /// it - and a stale kernel there does not fail to compile, it
-    /// computes a frame the tracer no longer agrees with. This
-    /// regenerates the whole set from the cart, the same way
-    /// `regen-generated.sh` does, and compares byte for byte.
+    /// The checked-in sets are committed, so nothing in the build forces
+    /// them to match the generator that claims to produce them - and a
+    /// stale kernel does not fail to compile, it computes a frame the
+    /// tracer no longer agrees with.
     ///
-    /// Not `#[ignore]`d. It costs ~6 s, against the ~200 s and ~44 s
-    /// that put the other regeneration tests behind `--ignored`, and it
-    /// guards exactly what `generated_is_current` guards for the class
-    /// kernels - which runs on every commit.
-    #[test]
-    fn traced_kernels_are_current() {
-        let dir = std::env::temp_dir().join(format!("celeste-traced-{}", std::process::id()));
+    /// Two checks, sized so the gate stays on every commit:
+    ///
+    /// 1. Regenerate the DEFAULT room's ((1,0)) subset and compare byte
+    ///    for byte, both directions. Regenerating every room costs
+    ///    minutes (room (2,0)'s lattice fixpoint alone is ~35 s per
+    ///    variant); the emitter is shared across rooms, so generator
+    ///    drift shows up in room (1,0)'s bytes. The other rooms' own
+    ///    gates are `room00_kernels_are_current` /
+    ///    `room20_kernels_are_current` (#[ignore], run them when
+    ///    touching the tracer or the emitters).
+    /// 2. Recompute the top-level `mod.rs` from the COMMITTED room
+    ///    directories and compare. `FINGERPRINT` re-hashes every room's
+    ///    sources, so hand-editing ANY room's kernels - including the
+    ///    ones this gate does not regenerate - fails here.
+    fn variant_set_is_current(
+        set: &str,
+        regen: fn(&std::path::Path, &std::path::Path) -> anyhow::Result<Vec<usize>>,
+    ) {
+        let dir = std::env::temp_dir()
+            .join(format!("celeste-{}-{}", set, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let sizes = super::write_room_kernels(std::path::Path::new("."), &dir)
-            .unwrap_or_else(|e| panic!("regenerate the room kernel set (run from the repo root): {:#}", e));
-
-        let committed = std::path::Path::new("crates/celeste-kernels/src/traced");
+        regen(std::path::Path::new("."), &dir).unwrap_or_else(|e| {
+            panic!("regenerate the {} kernel set (run from the repo root): {:#}", set, e)
+        });
+        let room = super::kernel_room_mod();
+        let committed_root =
+            std::path::PathBuf::from("crates/celeste-kernels/src").join(set);
+        let committed = committed_root.join(&room);
+        let fresh = dir.join(&room);
         let listing = |d: &std::path::Path| -> std::collections::BTreeSet<String> {
             std::fs::read_dir(d)
                 .unwrap_or_else(|e| panic!("read {}: {}", d.display(), e))
@@ -1375,24 +1419,26 @@ mod tests {
         // stale `kernelN.rs` behind that still compiles and is still
         // reachable through nothing - comparing only the files the
         // tracer just wrote would pass over it.
-        let (fresh_files, on_disk_files) = (listing(&dir), listing(committed));
         assert_eq!(
-            fresh_files,
-            on_disk_files,
-            "the traced kernel set has a different FILE LIST than what is committed \
-             ({} shapes now). Run ./regen-generated.sh.",
-            sizes.len()
+            listing(&fresh),
+            listing(&committed),
+            "the {} kernel set has a different FILE LIST for {} than what is \
+             committed. Run ./regen-generated.sh.",
+            set,
+            room
         );
-
-        for name in &fresh_files {
-            let a = std::fs::read_to_string(committed.join(name)).unwrap();
-            let b = std::fs::read_to_string(dir.join(name)).unwrap();
+        for name in listing(&fresh) {
+            let a = std::fs::read_to_string(committed.join(&name)).unwrap();
+            let b = std::fs::read_to_string(fresh.join(&name)).unwrap();
             if a != b {
-                let first = a.lines().zip(b.lines()).position(|(x, y)| x != y).map(|i| i + 1);
+                let first =
+                    a.lines().zip(b.lines()).position(|(x, y)| x != y).map(|i| i + 1);
                 panic!(
-                    "crates/celeste-kernels/src/traced/{} is STALE: on disk {} lines, \
-                     tracer says {} lines, first differing line {:?}. Run \
-                     ./regen-generated.sh and read the diff.",
+                    "{}/{}/{} is STALE: on disk {} lines, tracer says {} lines, \
+                     first differing line {:?}. Run ./regen-generated.sh and read \
+                     the diff.",
+                    committed_root.display(),
+                    room,
                     name,
                     a.lines().count(),
                     b.lines().count(),
@@ -1400,109 +1446,63 @@ mod tests {
                 );
             }
         }
+        let (_, want) = super::merged_mod_rs(&committed_root)
+            .unwrap_or_else(|e| panic!("recompute {}/mod.rs: {:#}", set, e));
+        let got = std::fs::read_to_string(committed_root.join("mod.rs")).unwrap();
+        assert_eq!(
+            got,
+            want,
+            "{}/mod.rs does not match its room directories (room list or \
+             FINGERPRINT drift). Run ./regen-generated.sh.",
+            committed_root.display()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The RUNG-AGNOSTIC set's staleness gate - the same byte-for-byte
-    /// contract as `traced_kernels_are_current`, for
-    /// `crates/celeste-kernels/src/ladder` (plans/kernel-ladder.md).
+    /// The gate that makes the CHECKED-IN base (level-0) set safe.
+    /// Not `#[ignore]`d - it costs a few seconds for room (1,0) and it
+    /// guards what runs on every campaign frame.
+    #[test]
+    fn traced_kernels_are_current() {
+        variant_set_is_current("traced", super::write_room_kernels);
+    }
+
+    /// The RUNG-AGNOSTIC set's staleness gate (plans/kernel-ladder.md).
     #[test]
     fn ladder_kernels_are_current() {
-        let dir = std::env::temp_dir().join(format!("celeste-ladder-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let sizes = super::write_room_kernels_ladder(std::path::Path::new("."), &dir)
-            .unwrap_or_else(|e| {
-                panic!("regenerate the ladder kernel set (run from the repo root): {:#}", e)
-            });
-
-        let committed = std::path::Path::new("crates/celeste-kernels/src/ladder");
-        let listing = |d: &std::path::Path| -> std::collections::BTreeSet<String> {
-            std::fs::read_dir(d)
-                .unwrap_or_else(|e| panic!("read {}: {}", d.display(), e))
-                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-                .collect()
-        };
-        let (fresh_files, on_disk_files) = (listing(&dir), listing(committed));
-        assert_eq!(
-            fresh_files,
-            on_disk_files,
-            "the ladder kernel set has a different FILE LIST than what is committed \
-             ({} shapes now). Regenerate with `transpile --room-kernels-ladder \
-             crates/celeste-kernels/src/ladder`.",
-            sizes.len()
-        );
-
-        for name in &fresh_files {
-            let a = std::fs::read_to_string(committed.join(name)).unwrap();
-            let b = std::fs::read_to_string(dir.join(name)).unwrap();
-            if a != b {
-                let first =
-                    a.lines().zip(b.lines()).position(|(x, y)| x != y).map(|i| i + 1);
-                panic!(
-                    "crates/celeste-kernels/src/ladder/{} is STALE: on disk {} lines, \
-                     tracer says {} lines, first differing line {:?}. Regenerate with \
-                     `transpile --room-kernels-ladder crates/celeste-kernels/src/ladder` \
-                     and read the diff.",
-                    name,
-                    a.lines().count(),
-                    b.lines().count(),
-                    first
-                );
-            }
-        }
-        let _ = std::fs::remove_dir_all(&dir);
+        variant_set_is_current("ladder", super::write_room_kernels_ladder);
     }
 
-    /// The EXACT-REM set's staleness gate - same contract, for
-    /// `crates/celeste-kernels/src/exact` (plans/kernel-ladder.md).
+    /// The EXACT-REM set's staleness gate (plans/kernel-ladder.md).
     #[test]
     fn exact_kernels_are_current() {
-        let dir = std::env::temp_dir().join(format!("celeste-exact-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let sizes = super::write_room_kernels_exact(std::path::Path::new("."), &dir)
-            .unwrap_or_else(|e| {
-                panic!("regenerate the exact kernel set (run from the repo root): {:#}", e)
-            });
-
-        let committed = std::path::Path::new("crates/celeste-kernels/src/exact");
-        let listing = |d: &std::path::Path| -> std::collections::BTreeSet<String> {
-            std::fs::read_dir(d)
-                .unwrap_or_else(|e| panic!("read {}: {}", d.display(), e))
-                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-                .collect()
-        };
-        let (fresh_files, on_disk_files) = (listing(&dir), listing(committed));
-        assert_eq!(
-            fresh_files,
-            on_disk_files,
-            "the exact kernel set has a different FILE LIST than what is committed \
-             ({} shapes now). Regenerate with `transpile --room-kernels-exact \
-             crates/celeste-kernels/src/exact`.",
-            sizes.len()
-        );
-
-        for name in &fresh_files {
-            let a = std::fs::read_to_string(committed.join(name)).unwrap();
-            let b = std::fs::read_to_string(dir.join(name)).unwrap();
-            if a != b {
-                let first =
-                    a.lines().zip(b.lines()).position(|(x, y)| x != y).map(|i| i + 1);
-                panic!(
-                    "crates/celeste-kernels/src/exact/{} is STALE: on disk {} lines, \
-                     tracer says {} lines, first differing line {:?}. Regenerate with \
-                     `transpile --room-kernels-exact crates/celeste-kernels/src/exact` \
-                     and read the diff.",
-                    name,
-                    a.lines().count(),
-                    b.lines().count(),
-                    first
-                );
-            }
-        }
-        let _ = std::fs::remove_dir_all(&dir);
+        variant_set_is_current("exact", super::write_room_kernels_exact);
     }
 
+    /// Regenerate ONE non-default room across all three variants and
+    /// compare byte for byte. `#[ignore]` for cost (the room (2,0)
+    /// fixpoint is ~35 s per variant); run when touching the tracer,
+    /// the emitters, or anything feeding the kernels. Room selection is
+    /// per PROCESS (`CELESTE_START_ROOM` feeds a OnceLock), which is
+    /// why this is one test per room rather than a loop.
+    fn room_set_is_current(room_env: &str) {
+        std::env::set_var("CELESTE_START_ROOM", room_env);
+        variant_set_is_current("traced", super::write_room_kernels);
+        variant_set_is_current("ladder", super::write_room_kernels_ladder);
+        variant_set_is_current("exact", super::write_room_kernels_exact);
+    }
 
+    #[test]
+    #[ignore]
+    fn room00_kernels_are_current() {
+        room_set_is_current("0,0");
+    }
+
+    #[test]
+    #[ignore]
+    fn room20_kernels_are_current() {
+        room_set_is_current("2,0");
+    }
 
     /// How much of the row amplification is STATICALLY removable?
     ///
@@ -2572,7 +2572,18 @@ pub fn specialize_probe(
 ///
 /// Returns `(shape key -> constant field map)` plus a blanked
 /// representative state per shape for later re-tracing.
-pub fn room_constant_lattice(root: &std::path::Path) -> Result<LatticeWalk> {
+///
+/// `opts` is the widening axis (plans/kernel-ladder.md): the fixpoint
+/// and every traced frame run under the variant's own options, so the
+/// shape set and the emitted frames are self-consistent per variant.
+/// The baked constants come out the same either way - a field the
+/// boundary widens is excluded from `field_constants` regardless - but
+/// EXACT's shapes differ (rem as a plain number), so the fixpoint must
+/// see the variant it generates for.
+pub fn room_constant_lattice(
+    root: &std::path::Path,
+    opts: super::shapes::WalkOpts,
+) -> Result<LatticeWalk> {
     use super::domain::Symbolic;
     use super::interp::Interp;
     use super::verify::{run_one, trace_frame};
@@ -2607,6 +2618,7 @@ pub fn room_constant_lattice(root: &std::path::Path) -> Result<LatticeWalk> {
     let mut forks: std::collections::BTreeMap<String, usize> = Default::default();
     let mut frames: std::collections::BTreeMap<String, super::verify::Frame> = Default::default();
     let mut forkops: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    let mut refused: std::collections::BTreeMap<String, String> = Default::default();
 
     let sk = key(&start)?;
     lattice.insert(sk.clone(), shapes::field_constants(&start, &it.d)?);
@@ -2620,7 +2632,7 @@ pub fn room_constant_lattice(root: &std::path::Path) -> Result<LatticeWalk> {
         if guard > 20000 { bail!("constant-lattice fixpoint did not converge"); }
         let st = reps[&k].clone();
         let roots = shapes::state_paths(&st)?;
-        let ival = shapes::ival_paths(&st);
+        let ival = if opts.ival { shapes::ival_paths(&st) } else { Vec::new() };
         // Pin the shape's known constants (only those that are real scalar
         // inputs here), everything else abstract.
         let pin: Vec<(super::iface::Path, super::iface::Conc)> = lattice[&k]
@@ -2628,10 +2640,20 @@ pub fn room_constant_lattice(root: &std::path::Path) -> Result<LatticeWalk> {
             .filter(|(p, _)| roots.iter().any(|r| r == *p))
             .map(|(p, c)| (p.clone(), *c))
             .collect();
-        let f = match trace_frame(&mut it, &reset, &fr, st, &roots, &pin, &ival, true) {
+        let f = match trace_frame(&mut it, &reset, &fr, st, &roots, &pin, &ival, opts.widen) {
             Ok(f) => f,
-            Err(_) => continue,
+            Err(e) => {
+                // Remember the refusal instead of silently skipping: a
+                // shape that never traces is a MISSING KERNEL, and the
+                // post-fixpoint check below turns that into a hard
+                // error. (A refusal on an early pass that a later
+                // re-trace of the same shape survives is fine - the
+                // successful frame lands in `frames`.)
+                refused.insert(k.clone(), format!("{:#}", e));
+                continue;
+            }
         };
+        refused.remove(&k);
         // Live forks of THIS (converged-so-far) trace of shape k.
         {
             use crate::transpile::graph::Op;
@@ -2676,6 +2698,29 @@ pub fn room_constant_lattice(root: &std::path::Path) -> Result<LatticeWalk> {
         }
         frames.insert(k.clone(), f);
     }
+    // Every reachable shape must have a frame. A shape whose every
+    // trace refused would otherwise just be MISSING from the generated
+    // set - a silent runtime coverage gap, fatal under strict mode and
+    // invisible until then.
+    let missing: Vec<String> = lattice
+        .keys()
+        .filter(|k| !frames.contains_key(*k))
+        .map(|k| {
+            format!(
+                "shape {}: {}",
+                k,
+                refused.get(k).map(String::as_str).unwrap_or("never traced")
+            )
+        })
+        .collect();
+    if !missing.is_empty() {
+        bail!(
+            "the constant-lattice fixpoint could not trace {} of {} shapes:\n{}",
+            missing.len(),
+            lattice.len(),
+            missing.join("\n")
+        );
+    }
     let graph = std::mem::take(&mut it.d.graph);
     Ok(LatticeWalk { lattice, reps, forks, frames, graph, cart: cart_data, cache, forkops })
 }
@@ -2694,7 +2739,8 @@ pub struct LatticeWalk {
 
 /// Report the constant lattice for `transpile --room-consts`.
 pub fn room_constants(root: &std::path::Path) -> Result<String> {
-    let LatticeWalk { lattice, forks, mut frames, graph, cart, cache, forkops, .. } = room_constant_lattice(root)?;
+    let LatticeWalk { lattice, forks, mut frames, graph, cart, cache, forkops, .. } =
+        room_constant_lattice(root, super::shapes::WalkOpts::LEVEL0)?;
     let room = crate::transpile::graph::Room { cart: cart.clone(), cache: cache.clone() };
     // Bind+lower each converged frame to get the emitted size.
     let mut lines_by_shape: std::collections::BTreeMap<String, usize> = Default::default();

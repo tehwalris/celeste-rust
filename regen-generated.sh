@@ -1,17 +1,28 @@
 #!/usr/bin/env bash
-# Regenerate the CHECKED-IN traced kernel set:
+# Regenerate the CHECKED-IN kernel sets:
 #
-#   crates/celeste-kernels/src/traced/    one kernel per heap SHAPE the
-#                                         start room reaches
+#   crates/celeste-kernels/src/traced/   the BASE (level-0) lattice set
+#   crates/celeste-kernels/src/ladder/   the RUNG-AGNOSTIC lattice set
+#   crates/celeste-kernels/src/exact/    the EXACT-REM lattice set
 #
-# Run this after any change to src/transpile/ or src/trace/, then read the
-# diff and commit it. `trace::kernel::tests::traced_kernels_are_current`
-# fails until you do.
+# each holding one room<x><y>/ subdirectory per generated room (rooms
+# (0,0), (1,0), (2,0) today - extend ROOMS below to add one) plus a
+# merged mod.rs whose SETS table is what the dispatcher flattens. Every
+# set is CONSTANT-LATTICE specialized (plans/specialize.md "Spec:
+# latticeify everything, all rooms, one table").
+#
+# Run this after any change to src/transpile/ or src/trace/, then read
+# the diff and commit it. `trace::kernel::tests::{traced,ladder,exact}
+# _kernels_are_current` fail until you do (they regenerate room (1,0)
+# and re-check every room's fingerprint); the `#[ignore]`d
+# `room00_kernels_are_current` / `room20_kernels_are_current` regenerate
+# the other rooms.
 #
 # READ THE DIFF. The expected diff for a pure refactor is EMPTY; anything
 # else is a change to what the kernels compute, and the gate on that is
-# `traced_kernels_reproduce_the_interpreter` plus a
-# CELESTE_COMPILED_FORWARD=check run, not this script.
+# `traced_kernels_reproduce_the_interpreter` (and the per-rung and
+# per-room differentials) plus a CELESTE_COMPILED_FORWARD=check run, not
+# this script.
 #
 # (`crates/celeste-names/src/gen.rs` is NOT regenerated any more. It is
 # FROZEN - its generator walked the rewritten IR and was deleted with the
@@ -29,6 +40,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+ROOMS="0,0 1,0 2,0"
+VARIANTS="traced ladder exact"
+
 SCRATCH=$(mktemp -d)
 trap 'rm -rf "$SCRATCH"' EXIT
 
@@ -38,38 +52,44 @@ trap 'rm -rf "$SCRATCH"' EXIT
 echo "==> building the generator"
 ./safe-run.sh -- ./one-cargo.sh cargo build --profile quick --bin transpile
 
-# No recipe and no witness - the tracer walks the room itself.
-echo "==> generating the traced set"
-./safe-run.sh -- ./target/quick/transpile --room-kernels "$SCRATCH/traced"
-
-# The rung-agnostic set (plans/kernel-ladder.md): the same walk with the
-# widenings left OUT of the graph, gated by `ladder_kernels_are_current`.
-echo "==> generating the ladder set"
-./safe-run.sh -- ./target/quick/transpile --room-kernels-ladder "$SCRATCH/ladder"
-
-# The exact-rem set (the k=16 rung), gated by `exact_kernels_are_current`.
-echo "==> generating the exact set"
-./safe-run.sh -- ./target/quick/transpile --room-kernels-exact "$SCRATCH/exact"
+# One process per (room, variant): the start room is a process global
+# (it feeds `_init`, the collision cache and the `sin` builtin), so the
+# generator cannot switch rooms mid-process. The tracer walks each
+# room's constant-lattice fixpoint itself - no recipe, no witness.
+for variant in $VARIANTS; do
+    case "$variant" in
+        traced) flag=--room-kernels ;;
+        ladder) flag=--room-kernels-ladder ;;
+        exact)  flag=--room-kernels-exact ;;
+    esac
+    for room in $ROOMS; do
+        echo "==> generating $variant for room ($room)"
+        CELESTE_START_ROOM="$room" ./safe-run.sh -- \
+            ./target/quick/transpile "$flag" "$SCRATCH/$variant"
+    done
+    echo "==> merging $variant"
+    ./safe-run.sh -- ./target/quick/transpile --merge-kernels "$SCRATCH/$variant"
+done
 
 echo "==> installing into the generated crate"
 BACKUP=$(mktemp -d)
-cp -r crates/celeste-kernels/src/traced "$BACKUP/traced"
-cp -r crates/celeste-kernels/src/ladder "$BACKUP/ladder"
-cp -r crates/celeste-kernels/src/exact "$BACKUP/exact"
-restore() { rm -rf crates/celeste-kernels/src/traced crates/celeste-kernels/src/ladder \
-                   crates/celeste-kernels/src/exact;
-            cp -r "$BACKUP/traced" crates/celeste-kernels/src/traced;
-            cp -r "$BACKUP/ladder" crates/celeste-kernels/src/ladder;
-            cp -r "$BACKUP/exact" crates/celeste-kernels/src/exact;
-            rm -rf "$BACKUP"; }
+for variant in $VARIANTS; do
+    cp -r "crates/celeste-kernels/src/$variant" "$BACKUP/$variant"
+done
+restore() {
+    for variant in $VARIANTS; do
+        rm -rf "crates/celeste-kernels/src/$variant"
+        cp -r "$BACKUP/$variant" "crates/celeste-kernels/src/$variant"
+    done
+    rm -rf "$BACKUP"
+}
 
 # rm before cp, not cp over: one shape FEWER than last time would
 # otherwise leave a stale kernelN.rs that still compiles.
-rm -rf crates/celeste-kernels/src/traced crates/celeste-kernels/src/ladder \
-       crates/celeste-kernels/src/exact
-cp -r "$SCRATCH/traced" crates/celeste-kernels/src/traced
-cp -r "$SCRATCH/ladder" crates/celeste-kernels/src/ladder
-cp -r "$SCRATCH/exact" crates/celeste-kernels/src/exact
+for variant in $VARIANTS; do
+    rm -rf "crates/celeste-kernels/src/$variant"
+    cp -r "$SCRATCH/$variant" "crates/celeste-kernels/src/$variant"
+done
 
 # Also quick: this step answers "does the generated code COMPILE", and
 # release answers it no better for ~4x the wall time. It does not leave
@@ -84,8 +104,8 @@ rm -rf "$BACKUP"
 
 echo
 echo "regenerated. Now read the diff:"
-git --no-pager diff --stat crates/celeste-kernels/src/traced
-git --no-pager status --short crates/celeste-kernels/src/traced
+git --no-pager diff --stat crates/celeste-kernels/src
+git --no-pager status --short crates/celeste-kernels/src
 echo
 echo "NOTE: this script builds under [profile.quick] and does NOT refresh"
 echo "target/release. Before benchmarking or running the gate, build release"

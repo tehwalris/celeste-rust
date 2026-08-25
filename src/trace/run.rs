@@ -267,3 +267,171 @@ pub fn start_block(
         .context("the state after _init is not a concrete block")?;
     Ok((b, cart_data, cache))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use celeste_engine::runtime2::{Cell2, Rt2, AV, NONE};
+    use celeste_names::FIELD_NAMES;
+
+    /// Flat map of every SCALAR leaf field of one lane, keyed by dotted
+    /// path. Follows pointers (depth-guarded) and records only scalars,
+    /// so shared type tables cancel between two blocks and a diff
+    /// isolates the field that actually differs. Ported from the
+    /// traced-kernel-check room-(2,0) gate, where it was validated
+    /// against 7,364 branched states (plans/specialize.md "CORRECTNESS
+    /// CONFIRMED").
+    fn scalar_fields_lane(b: &Rt2, lane: usize) -> BTreeMap<String, String> {
+        fn nm(id: u32) -> String {
+            FIELD_NAMES
+                .get(id as usize)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("#{}", id))
+        }
+        fn walk(
+            b: &Rt2,
+            cell: u32,
+            path: &str,
+            depth: u32,
+            lane: usize,
+            out: &mut BTreeMap<String, String>,
+        ) {
+            if cell == NONE || depth > 16 {
+                return;
+            }
+            match &b.structure[cell as usize] {
+                Cell2::Val => match b.cols[cell as usize].at(lane) {
+                    AV::Ptr(t) => walk(b, t, path, depth + 1, lane, out),
+                    AV::NilPtr | AV::Nil => {}
+                    scalar => {
+                        out.insert(path.to_string(), format!("{:?}", scalar));
+                    }
+                },
+                Cell2::Obj(fields) => {
+                    for (fid, c) in fields {
+                        walk(b, *c, &format!("{}.{}", path, nm(*fid)), depth + 1, lane, out);
+                    }
+                }
+                Cell2::Arr(items) => {
+                    for (i, it) in items.iter().enumerate() {
+                        walk(b, *it, &format!("{}[{}]", path, i), depth + 1, lane, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = BTreeMap::new();
+        for gi in 0..b.globals.len() {
+            let cell = b.globals[gi];
+            if cell != NONE {
+                walk(b, cell, &nm(gi as u32), 0, lane, &mut out);
+            }
+        }
+        out
+    }
+
+    /// The per-room differential for the non-default rooms: run the
+    /// checked-in BASE (level-0) lattice set on the kernel-only frame
+    /// loop, the interpreter on the room-aware raw program
+    /// (`compile_from_disk`), and compare the per-frame REACHABLE state
+    /// set (per-lane field-path -> value signatures).
+    ///
+    /// Why not row keys: the raw compiled program boxes each object's
+    /// `this` upvalue in an extra heap cell that the AST tracer does not
+    /// produce, so row keys differ by representation while every
+    /// reachable scalar matches (plans/specialize.md, the room-2 oracle
+    /// investigation). The reachable-state set is boxing- and
+    /// lane-order-independent, and it is what Philippe validated the
+    /// room-2 lattice against. Room (1,0) has the stronger row-key-set
+    /// gates against the frozen DCE'd program
+    /// (`traced_kernels_reproduce_the_interpreter` etc.); the frozen
+    /// artifacts for rooms (0,0)/(2,0) do not exist (`bin/freeze` is
+    /// deleted), so this is the strongest oracle available per room.
+    ///
+    /// Any `run.step()` error - an uncovered shape or a DECLINED lane
+    /// (a lattice constant the runtime disagrees with) - fails the test.
+    fn lattice_room_matches_the_interpreter(
+        room: &str,
+        kernels: &'static [super::Kernel],
+        frames: usize,
+    ) {
+        std::env::set_var("CELESTE_START_ROOM", room);
+        for f in ["lua/celeste-minimal.lua", "cart"] {
+            if !std::path::Path::new(f).exists() {
+                eprintln!("skipping: {} not found (run from the repo root)", f);
+                return;
+            }
+        }
+        let root = std::path::Path::new(".");
+        let (start, cart, cache) =
+            super::start_block(root).expect("start block for the room");
+        let mut run = super::Run::new(kernels, start, cart.clone(), cache.clone())
+            .expect("index the room's kernels by shape");
+
+        let program = crate::program::Program::compile_from_disk()
+            .expect("compile the room-aware reference program");
+        let mut oracle =
+            crate::search::run::AbstractRun::start(&program).expect("start the oracle");
+        let ids = crate::compiled::boundary_ids();
+
+        let sig_of = |b: &Rt2| -> BTreeSet<Vec<(String, String)>> {
+            (0..b.width)
+                .map(|l| scalar_fields_lane(b, l).into_iter().collect::<Vec<_>>())
+                .collect()
+        };
+        for frame in 1..=frames {
+            run.step().unwrap_or_else(|e| {
+                panic!(
+                    "kernel frame {}: {:#}\n(a declined block or an uncovered shape \
+                     means the lattice over-claimed a constant)",
+                    frame, e
+                )
+            });
+            oracle.step().unwrap_or_else(|e| panic!("oracle frame {}: {:#}", frame, e));
+            let mut lat: BTreeSet<Vec<(String, String)>> = BTreeSet::new();
+            for b in run.blocks() {
+                lat.extend(sig_of(b));
+            }
+            let mut inp: BTreeSet<Vec<(String, String)>> = BTreeSet::new();
+            for st in oracle.states() {
+                if st.vector_size == 0 {
+                    continue;
+                }
+                let mut ib =
+                    crate::compiled::bridge::import_block(st, cart.clone(), cache.clone());
+                ib.boundary(&ids);
+                inp.extend(sig_of(&ib));
+            }
+            assert_eq!(
+                lat,
+                inp,
+                "frame {}: reachable STATE-SET differs (not just boxing): \
+                 {} lattice-only, {} interp-only (lattice {}, interp {})",
+                frame,
+                lat.difference(&inp).count(),
+                inp.difference(&lat).count(),
+                lat.len(),
+                inp.len()
+            );
+        }
+    }
+
+    #[test]
+    fn room00_lattice_kernels_match_the_interpreter() {
+        lattice_room_matches_the_interpreter(
+            "0,0",
+            celeste_kernels::traced::room00::KERNELS,
+            30,
+        );
+    }
+
+    #[test]
+    fn room20_lattice_kernels_match_the_interpreter() {
+        lattice_room_matches_the_interpreter(
+            "2,0",
+            celeste_kernels::traced::room20::KERNELS,
+            30,
+        );
+    }
+}

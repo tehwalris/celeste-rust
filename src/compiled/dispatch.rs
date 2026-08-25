@@ -1,11 +1,14 @@
 //! Kernel DISPATCH: which kernel, if any, runs a chunk.
 //!
-//! The registry is the TRACED kernel set (`celeste_kernels::traced`): one
-//! kernel per heap SHAPE the start room reaches, indexed by the chunk's
-//! shape hash. A chunk no kernel takes returns `false` and takes the
-//! interpreter reference path - counted and named, because a coverage gap
-//! that only shows up as wall clock is the failure mode this campaign is
-//! trying to avoid (CLAUDE.md "Never deopt to the interpreter").
+//! The registry is the active CONSTANT-LATTICE kernel set
+//! (`celeste_kernels::{traced,ladder,exact}`, selected by rung): one
+//! kernel per (room, heap SHAPE) pair across every generated room,
+//! indexed by the chunk's shape hash. A chunk no kernel takes returns
+//! `false`, which is FATAL under the default strict mode - a coverage
+//! gap that only shows up as wall clock is the failure mode this
+//! campaign is trying to avoid (CLAUDE.md "Never deopt to the
+//! interpreter"). `CELESTE_KERNEL_STRICT=0` restores the counted,
+//! named fall-through to the interpreter reference path.
 //!
 //! This module was the probe's; it moved into celeste-rust with the rest of
 //! the frame interface (task #150) so the campaign can reach it. What is
@@ -73,13 +76,17 @@ pub(crate) fn traced_mode_for(
     }
 }
 
-/// `CELESTE_KERNEL_STRICT=1`: a chunk the kernel set cannot take is a
-/// FATAL coverage gap (CLAUDE.md "Never deopt to the interpreter"), not
-/// a fall-through to the reference path. Off by default because `check`
-/// mode and the differential gates need the reference path to exist.
+/// A chunk the kernel set cannot take is a FATAL coverage gap (CLAUDE.md
+/// "Never deopt to the interpreter"), not a fall-through to the
+/// reference path. ON BY DEFAULT since the lattice campaign
+/// (plans/specialize.md "Spec: latticeify everything"): the runtime
+/// search is purely kernels, and the interpreter exists only as the
+/// reference - `check` mode still runs it FOR THE COMPARISON, which is
+/// unaffected by strictness. `CELESTE_KERNEL_STRICT=0` restores the
+/// fall-through, for diagnosing a coverage gap without stopping at it.
 pub(crate) fn kernel_strict() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CELESTE_KERNEL_STRICT").is_ok_and(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var("CELESTE_KERNEL_STRICT").map_or(true, |v| v != "0"))
 }
 
 /// Every distinct miss reason with its lane count, for the strict-mode
@@ -126,15 +133,12 @@ fn note_miss(class: &'static str, step: &'static str, lanes: usize) {
 pub(crate) static PLAIN_ROUTED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// The traced set's content hash. Hashed into the campaign fingerprint
-/// whenever the compiled engine is on: nothing the fingerprint already
-/// reads determines which traced kernels ran, so they name themselves.
-pub fn traced_set_fingerprint() -> u64 {
-    set_fingerprint_for(traced_mode())
-}
-
-/// `traced_set_fingerprint` for an explicit mode (the checkpoint
+/// The active set's content hash for an explicit mode (the checkpoint
 /// fingerprint of another precision level - see `traced_mode_for`).
+/// Hashed into the campaign fingerprint whenever the compiled engine is
+/// on: nothing the fingerprint already reads determines which kernels
+/// ran, so the sets name themselves. Since the multi-room merge, each
+/// `FINGERPRINT` covers every room's sources in the set.
 pub(crate) fn set_fingerprint_for(mode: TracedMode) -> u64 {
     match mode {
         TracedMode::Level0 => celeste_kernels::traced::FINGERPRINT,
@@ -217,13 +221,16 @@ fn traced_dispatch() -> &'static crate::trace::dispatch::Dispatch {
     static D: std::sync::OnceLock<crate::trace::dispatch::Dispatch> =
         std::sync::OnceLock::new();
     D.get_or_init(|| {
-        let set = match traced_mode() {
-            TracedMode::Level0 => celeste_kernels::traced::KERNELS,
-            TracedMode::Level0Agnostic => celeste_kernels::ladder::KERNELS,
-            TracedMode::ExactRem => celeste_kernels::exact::KERNELS,
+        // Every room's table of the active set, in ONE registry. A
+        // cross-room shape collision is refused at startup
+        // (`Dispatch::new_multi`), not resolved.
+        let sets = match traced_mode() {
+            TracedMode::Level0 => celeste_kernels::traced::SETS,
+            TracedMode::Level0Agnostic => celeste_kernels::ladder::SETS,
+            TracedMode::ExactRem => celeste_kernels::exact::SETS,
         };
-        crate::trace::dispatch::Dispatch::new(set)
-            .expect("the checked-in traced kernel set indexes by shape")
+        crate::trace::dispatch::Dispatch::new_multi(sets)
+            .expect("the checked-in kernel sets index by shape")
     })
 }
 

@@ -17,22 +17,20 @@
 #[path = "kernel.rs"]
 pub mod kernel;
 
-/// The ROOM's kernel set - one module per heap shape, plus the table the
-/// dispatcher indexes.
+/// Room (1,0)'s kernel set - one module per heap shape, plus the table
+/// the dispatcher indexes.
 ///
 /// It used to be installed here as generated source, like `kernel.rs`
-/// above. It is CHECKED IN now, in `crates/celeste-kernels/src/traced`,
-/// because `compiled::FrameEngine` has to be able to call it - so this
-/// crate reads the same artifact the workspace builds rather than its
-/// own copy, and 24,000 lines are compiled once instead of twice.
-pub use celeste_kernels::traced as kernels;
-
-/// The room-(2,0) CONSTANT-LATTICE kernel set, generated (gitignored) by
-/// `transpile --room-kernels-lattice traced-kernel-check/src/lattice`.
-/// One module per lattice shape; validates plans/specialize.md.
-#[cfg(feature = "lattice")]
-#[path = "lattice/mod.rs"]
-pub mod lattice;
+/// above. It is CHECKED IN now, in
+/// `crates/celeste-kernels/src/traced/room10` (the base variant of the
+/// multi-room constant-lattice sets, plans/specialize.md), because
+/// `compiled::FrameEngine` has to be able to call it - so this crate
+/// reads the same artifact the workspace builds rather than its own
+/// copy. The feature-gated room-(2,0) `lattice` module that used to sit
+/// beside it is gone: the room-(2,0) set is checked in as
+/// `traced::room20` and gated in the main workspace
+/// (`room20_lattice_kernels_match_the_interpreter`).
+pub use celeste_kernels::traced::room10 as kernels;
 
 #[cfg(test)]
 mod tests {
