@@ -960,3 +960,17 @@ traced-kernel-check does for room 1) and:
 If bd fires or sets differ, the lattice over-claimed a constant; the
 declined block tells us which shape, and pin_guard kept it from being
 wrong.
+
+## Gate 1 fully passes (2026-08-25)
+
+With the bd-wiring (no bypass), all 18 lattice kernels render; kernels
+0, 5, 8, 14, 17 (incl. the 81k-line largest) rustc-check with 0 errors
+against a consistent rlib set. Room 1 unchanged. So the lattice kernel
+set is valid, safe (declines mismatched blocks), and ~2.65x smaller.
+Gate 2 (differential vs interpreter, via a room-2 runner) is the next
+piece.
+
+(Reminder: `cargo clean -p celeste-core -p celeste-engine -p celeste-names`
+then rebuild before any manual rustc of a generated kernel - duplicate
+rlibs from intervening builds otherwise give spurious "two versions of
+celeste_core" type errors.)
