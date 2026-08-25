@@ -2378,13 +2378,7 @@ pub fn specialize_probe(
 ///
 /// Returns `(shape key -> constant field map)` plus a blanked
 /// representative state per shape for later re-tracing.
-pub fn room_constant_lattice(
-    root: &std::path::Path,
-) -> Result<(
-    std::collections::BTreeMap<String, std::collections::BTreeMap<super::iface::Path, super::iface::Conc>>,
-    std::collections::BTreeMap<String, super::state::State<super::domain::Symbolic>>,
-    std::collections::BTreeMap<String, usize>,
-)> {
+pub fn room_constant_lattice(root: &std::path::Path) -> Result<LatticeWalk> {
     use super::domain::Symbolic;
     use super::interp::Interp;
     use super::verify::{run_one, trace_frame};
@@ -2417,6 +2411,7 @@ pub fn room_constant_lattice(
     let mut lattice: std::collections::BTreeMap<String, Cmap> = Default::default();
     let mut reps: std::collections::BTreeMap<String, super::state::State<Symbolic>> = Default::default();
     let mut forks: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut frames: std::collections::BTreeMap<String, super::verify::Frame> = Default::default();
 
     let sk = key(&start)?;
     lattice.insert(sk.clone(), shapes::field_constants(&start, &it.d)?);
@@ -2452,6 +2447,7 @@ pub fn room_constant_lattice(
             for id in 0..it.d.graph.len() { if reach[id] { if let Op::Split(d) = it.d.graph.get(id as u32).op { fs.insert(d); } } }
             forks.insert(k.clone(), fs.len());
         }
+        // Keep the converged frame for generation (last trace wins).
         for o in &f.outs {
             if it.d.decide(&o.ok) == Some(false) { continue; }
             if shapes::room_of(&o.st, &it.d) != room0 { continue; }
@@ -2473,21 +2469,45 @@ pub fn room_constant_lattice(
             };
             if changed && !work.contains(&tk) { work.push(tk); }
         }
+        frames.insert(k.clone(), f);
     }
-    Ok((lattice, reps, forks))
+    let graph = std::mem::take(&mut it.d.graph);
+    Ok(LatticeWalk { lattice, reps, forks, frames, graph, cart: cart_data, cache })
+}
+
+/// The output of `room_constant_lattice`.
+pub struct LatticeWalk {
+    pub lattice: std::collections::BTreeMap<String, std::collections::BTreeMap<super::iface::Path, super::iface::Conc>>,
+    pub reps: std::collections::BTreeMap<String, super::state::State<super::domain::Symbolic>>,
+    pub forks: std::collections::BTreeMap<String, usize>,
+    pub frames: std::collections::BTreeMap<String, super::verify::Frame>,
+    pub graph: crate::transpile::graph::Graph,
+    pub cart: std::sync::Arc<celeste_core::cart_data::CartData>,
+    pub cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
 }
 
 /// Report the constant lattice for `transpile --room-consts`.
 pub fn room_constants(root: &std::path::Path) -> Result<String> {
-    let (lattice, _, forks) = room_constant_lattice(root)?;
+    let LatticeWalk { lattice, forks, mut frames, graph, cart, cache, .. } = room_constant_lattice(root)?;
+    let room = crate::transpile::graph::Room { cart: cart.clone(), cache: cache.clone() };
+    // Bind+lower each converged frame to get the emitted size.
+    let mut lines_by_shape: std::collections::BTreeMap<String, usize> = Default::default();
+    for (k, f) in frames.iter_mut() {
+        if let Ok(bound) = super::emit::bind(f, &graph) {
+            if let Ok(low) = super::emit::lower_frame(&bound.graph, &bound.inputs, &bound.uni, &bound.outcomes, Some(room.clone()), bound.forks) {
+                lines_by_shape.insert(k.clone(), low.body.len());
+            }
+        }
+    }
     let mut out = String::new();
     out.push_str(&format!("{} shapes reached (constant-lattice fixpoint)\n", lattice.len()));
     for (i, (k, cm)) in lattice.iter().enumerate() {
         let spd: Vec<String> = cm.keys().map(super::iface::show)
             .filter(|s| s.contains("objects[") && s.contains(".spd")).collect();
-        out.push_str(&format!("shape {}: {} const fields, {} LIVE FORKS; object spd consts: {}\n",
-            i, cm.len(), forks.get(k).copied().unwrap_or(999),
-            if spd.is_empty() { "none".into() } else { spd.join(", ") }));
+        out.push_str(&format!("shape {}: {} const fields, {} forks, {} body lines\n",
+            i, cm.len(), forks.get(k).copied().unwrap_or(999), lines_by_shape.get(k).copied().unwrap_or(0)));
+        let _ = spd;
     }
+    out.push_str(&format!("total body lines (lattice): {}\n", lines_by_shape.values().sum::<usize>()));
     Ok(out)
 }

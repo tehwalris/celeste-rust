@@ -828,3 +828,31 @@ sets) before trusting it, which room (2,0) does not have wired yet.
 ASSUMPTION for the size measurement below: correctness is validated
 separately; the numbers show what the lattice kernels WOULD cost, which
 is what decides whether room (2,0) becomes checkable-in.
+
+## Phase B measurement: lattice cuts room (2,0) ~4.5x (2026-08-25)
+
+Bound + lowered every converged lattice frame and summed the body lines:
+
+- **Total body: 233,554 lines** (18 shapes), vs the current abstract
+  room-(2,0) set at **1,064,829** (loop-fork) / ~2.27M (flat-fork). So
+  **~4.5x smaller than loop, ~10x smaller than flat.**
+- The 0-fork shapes are tiny (117-1,329 lines each). ALL the size is in
+  the 8 shapes with 2-4 forks (12k-50k lines each). Those forks are the
+  PLAYER'S move under a symbolic player velocity: the lattice bakes in
+  the STATIC objects (springs), which removes the spring forks (8->4),
+  but the player's own speed is not constant, so its velocity-direction
+  branches remain (the 4 = 2 rem x 2 velocity).
+
+So the decomposition is clean:
+- **Constant lattice (static objects) -> removes spring forks, 8->4,
+  1.06M->233k.** DONE, validated by measurement.
+- **Player position/speed specialization (steps 1/2) -> removes the
+  velocity forks, 4->2 (rem only).** NEXT - and it is exactly the
+  concrete/interval-speed compile Philippe described. On the 0-fork
+  shapes there is nothing left to do; on the 8 moving-player shapes it
+  would take them from ~12-50k lines toward the room-(1,0) scale.
+
+233k is still above room (1,0)'s 24k checked-in threshold, but it is in
+range once the player-speed forks come out, and the fixpoint's 18 shapes
+(vs 36) means far fewer kernels. This is the path to a checkable-in
+room (2,0).
