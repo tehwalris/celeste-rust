@@ -475,3 +475,48 @@ single most promising size lever found this session:
 This supersedes position/pm1/geometry specialization (all refuted) as the
 room-(2,0) direction. It is also consistent with room (1,0) being fine:
 room 1's player has fewer conditional spd forms, so fewer fork pairs.
+
+## The SUM-not-product claim REFUTED too (2026-08-25)
+
+Tested it directly: for each of the 64 button assignments, resolve the
+buttons and count live forks. Result: `{8 forks: all 64 assignments}`.
+Every button leaves all 8 forks live. So the 8 forks are NOT a per-button
+artifact and do NOT collapse to 2 per config - the "mutually exclusive
+spd-condition branches / 16x over-enumeration" idea is wrong. Retracting
+it.
+
+The 8 forks are genuinely, simultaneously live. Only pinning the player's
+velocity (`spd`) reduces them (8 -> 4), and velocity is continuous.
+
+## TRULY FINAL conclusion for room (2,0) shape 3
+
+Everything tried, and its effect on the graph:
+
+| lever | forks | verdict |
+|---|---|---|
+| player position | 8 | no effect |
+| all object geometry | 8 | no effect |
+| pm1 key | 8 | no effect |
+| collideable = true | 8 | no effect |
+| resolve any button | 8 | no effect |
+| player spd = 0 | 4 | halves - but velocity is continuous |
+| all player dynamic state | 0 | not enumerable |
+
+**No enumerable specialization axis collapses room (2,0) shape 3's
+graph.** The 8-way fork and ~15k-node cone are inherent to a 14-object
+frame with a velocity-widened player. The emitted 2^8 x ~145-button
+explosion reflects a real 8-way fork, not an over-enumeration.
+
+This is a comprehensive NEGATIVE result, and it is the useful kind: it
+rules out position, pm1, geometry, and the SUM-not-product emitter change
+as room-(2,0) size levers, so none of them should be built for that
+purpose. The remaining honest options for room (2,0) are:
+1. Accept it (interpret-the-graph backend, don't compile to Rust - the
+   base kernel does not have to be fast, only correct), OR
+2. A velocity abstraction (hard, continuous), OR
+3. Live with room (2,0) at interpreter-only until 1 or 2 is worth it.
+
+The session's concrete deliverable is this map of what does and does not
+work, plus the `transpile --spec-probe` tool that produced it. The
+strategy conversation that motivated position-specialization is answered:
+it would not have helped.
