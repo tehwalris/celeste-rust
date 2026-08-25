@@ -237,7 +237,32 @@ orthogonal to the engine and untouched here.
    plain-routed 0`, strict), pos-graph and sweep replays print the
    disable notice and run, k=1 banded loads level 0's band and refutes
    (h40 has no win, so an empty band is the correct answer).
-11. Gates, all green: `ladder_kernels_reproduce_the_interpreter_at_bits1`
+11. **A full ladder horizon at production depth, on kernels**
+   (`KERNELS=1 ./ladder.sh 94 94 3`, room (1,0), release, scratch
+   dirs). Every forward stage strict and kernel-served, `missed 0
+   plain-routed 0` throughout:
+
+   | stage | wall | peak | result |
+   |---|---|---|---|
+   | l0 bench f94 | 350 s | 8.30 GB | win at f89; traced 172,626,763 lanes (the Stage-5 lane count exactly) |
+   | l0 pos-graph (interpreter replay, notice printed) | 775 s | 6.48 GB | - |
+   | l0 sweep (interpreter replay, notice printed) | 184 s | 22.0 GB | 178.6 M rows, 2 win seeds, e+g optimum 89 |
+   | k1 bench (LADDER set, banded) | 16 s | 9.10 GB | win at f93; traced 1,163,134 lanes |
+   | k1 sweep | 26 s | 1.5 GB | 1 win seed, e+g optimum 93 |
+   | k2 bench (LADDER set, banded) | 1 s | 0.18 GB | no win -> horizon 94 REFUTED at k=2; traced 69,008 lanes |
+
+   These wall times are a smoke run sharing the machine with a test
+   build, not benchmark numbers. The banded rungs cost SECONDS against
+   level 0's minutes, which is the tube-confinement working and the
+   reason per-rung kernel specialization was deferred. The k=1/k=2
+   stages were then re-run under `CELESTE_COMPILED_FORWARD=check`
+   (per-chunk row-set comparison at the rung's abstraction) - a
+   spurious refutation is the failure that matters most, so the
+   refuting rung is the one that got the differential treatment.
+   RESULT: both rc 0 with no mismatch over all 94 frames; k=1 wins at
+   93 on both engines, k=2 wins on neither. The h94 refutation stands
+   on the interpreter's own authority, chunk by chunk.
+12. Gates, all green: `ladder_kernels_reproduce_the_interpreter_at_bits1`
    (28 frames, room (1,0), check mode at `CELESTE_REM_BITS=1` with
    strict on, kernel engagement AND zero missed lanes asserted - frames
    25-28 cover the fork/straddle region), the same at Bits(0) with
