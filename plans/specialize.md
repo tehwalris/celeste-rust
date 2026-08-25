@@ -377,3 +377,67 @@ Tooling left in place: `transpile --spec-probe` + `CELESTE_SPEC_*` (in
 measuring the graph. Not wired into production. The three earlier
 Result sections above are kept with this retraction so the reasoning
 trail (and the two wrong turns) is visible.
+
+## DEFINITIVE SUMMARY (autonomous session, 2026-08-25)
+
+Exhaustively probed what specialization collapses room (2,0) shape 3's
+traced graph. Full table (raw traced-frame cone / live forks):
+
+| pins | nodes | forks |
+|---|---|---|
+| base | 15,425 | 8 |
+| player XY + pm1 | 15,104 | 8 |
+| ALL object positions + hitboxes | 15,115 | 8 |
+| player collideable = true (its real value) | 15,080 | 8 |
+| player spd = 0 | 13,378 | 4 |
+| player collideable = false | 3,071 | 0 |
+| ALL player scalars except rem | 2,597 | 0 |
+
+### What is and isn't the lever
+
+* **NOT position** (player or all objects): no change. Refutes the whole
+  position-specialization plan.
+* **NOT geometry** (all hitboxes + positions): no change. Refutes the
+  "bake in furniture, fold collisions" idea too - the collisions are not
+  what dominates.
+* **NOT collideable-as-constant**: pinning it true (its real value) does
+  nothing; only false helps, and only because false disables all
+  collision (an unreal state).
+* **The forks are the player's MOVE**, `floor(0.5 + rem + spd_eff)`,
+  forked once per distinct conditional form of `spd_eff`. Pinning `spd`
+  removes the input-velocity forms (8 -> 4 forks); the residual 4 are the
+  conditional spring-bounce `spd.y = -3`.
+* **Only pinning the player's whole dynamic state collapses it** (to
+  2,597 nodes / 0 forks), which is not an enumerable specialization axis.
+
+### The honest conclusion
+
+Room (2,0)'s per-shape graph is INHERENTLY complex. Its ~15k traced
+nodes are the player's velocity/dash/jump physics (Sel chains over spd,
+buttons, and object interactions), and its 8 forks are the move forked
+over the conditional forms of the player's velocity. None of the cheap,
+enumerable specialization axes we hypothesized (position, pm1, geometry)
+touch it. The emitted-kernel explosion (190k nodes = 2^8 forks x ~145
+buttons over the cone) is driven by the FORK COUNT, and the only thing
+that reduces the fork count is pinning the player's velocity - which is
+continuous, not a small enumerable set.
+
+### Where this leaves the room-(2,0) size problem
+
+1. **Position/pm1/geometry specialization is refuted as a size lever.**
+   Do not pursue it for room (2,0).
+2. **The fork count is the emitted-size driver** (2^forks). Velocity is
+   what sets it. If room (2,0) is to shrink, it is via reducing the fork
+   multiplicity - either by not enumerating independent forks as a
+   product (the earlier "SUM not product" idea, still valid and NOT yet
+   built), or by a velocity abstraction, which is hard.
+3. **The "SUM not product" emitter change is the most promising untried
+   lever** - it attacks the 2^forks enumeration directly, independent of
+   any state specialization, and Result 1-3's experiments do not touch
+   it. That is where I would go next.
+
+Net for Philippe: the specialization experiments came back negative for
+the axes we picked (a real result - saves us building the wrong thing),
+and they point back at the emitter's fork-product enumeration as the
+actual size lever. The probe (`transpile --spec-probe`) stays as the
+tool that established this.

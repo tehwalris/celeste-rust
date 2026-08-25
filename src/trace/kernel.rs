@@ -2154,13 +2154,16 @@ pub fn specialize_probe(
         // CELESTE_SPEC_PFIELDS: dotted player field paths to pin to 0,
         // e.g. "spd.x,spd.y,djump,grace,dash_effect_time".
         for spec in std::env::var("CELESTE_SPEC_PFIELDS").unwrap_or_default().split(',') {
-            let spec = spec.trim();
+            let mut spec = spec.trim();
             if spec.is_empty() { continue; }
+            // trailing "=1" pins a bool to true.
+            let want_true = spec.ends_with("=1");
+            if want_true { spec = &spec[..spec.len()-2]; }
             let parts: Vec<&str> = spec.split('.').collect();
             let path = fld(pl, &parts);
             if super::shapes::state_paths(&st).unwrap_or_default().iter().any(|r| r == &path) && !pin.iter().any(|(q,_)| q==&path) {
                 match iface::get(&st, &path) {
-                    Some(Value::Bool(_)) => pin.push((path, Conc::Bool(false))),
+                    Some(Value::Bool(_)) => pin.push((path, Conc::Bool(want_true))),
                     Some(Value::Num(_)) => pin.push((path, num(0))),
                     _ => {}
                 }
@@ -2175,6 +2178,33 @@ pub fn specialize_probe(
                         Some(Value::Num(_)) => pin.push((f, num(0))),
                         _ => {}
                     }
+                }
+            }
+        }
+    }
+    // CELESTE_SPEC_ALLGEOM: pin EVERY object's x,y and hitbox to
+    // constants (spread positions, default hitbox) - tests whether
+    // baking in the static object geometry folds the collision graph.
+    if std::env::var("CELESTE_SPEC_ALLGEOM").is_ok() {
+        let all: Vec<Vec<Step>> = {
+            let mut v = Vec::new();
+            if let Some(Value::Table(objs)) = iface::get(&st, &[iface::key("objects")]) {
+                let n = st.heap.tables[&objs].arr.len();
+                for i in 0..n { v.push(vec![iface::key("objects"), Step::Idx(i)]); }
+            }
+            v
+        };
+        for (i, ob) in all.iter().enumerate() {
+            for (f, v) in [("x", (i as i16) * 12 + 4), ("y", 40)] {
+                let path = fld(ob, &[f]);
+                if super::shapes::state_paths(&st).unwrap_or_default().iter().any(|r| r==&path) && !pin.iter().any(|(q,_)| q==&path) {
+                    pin.push((path, num(v)));
+                }
+            }
+            for (f, v) in [("x", 0), ("y", 0), ("w", 8), ("h", 8)] {
+                let path = fld(ob, &["hitbox", f]);
+                if super::shapes::state_paths(&st).unwrap_or_default().iter().any(|r| r==&path) && !pin.iter().any(|(q,_)| q==&path) {
+                    pin.push((path, num(v)));
                 }
             }
         }
