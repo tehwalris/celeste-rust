@@ -83,7 +83,23 @@ representative might be the less decided one. T12 recorded 4,357 such
 equalities on one outcome and deferred the decision until the traced
 path was in the search. It is in the search now.
 
-## The precision worry is unfounded in the case that matters
+## CORRECTION (2026-08-26): the claim below is WRONG, and the gate caught it
+
+The proof in this section writes `N = F(M, v)` and lets `M` range
+independently of `v`, which fails when `v` shares atoms with `M`.
+Counterexample: `A = (a AND NOT a) OR (d AND e)` (concretely `d AND e`),
+`N = A AND (d AND e)`: at `a` unknown, `d = false`, Kleene gives
+`N = false` (decided) while `A` is unknown - `false AND unknown = false`
+MANUFACTURES decidedness, so an ancestor is NOT always at-least-as-
+decided. The general in-cone merge was implemented and
+`simplifying_preserves_what_the_graph_evaluates_to` failed on it. What
+IS sound, and is implemented (e960ee8), is the cone-free COMMON-FACTOR
+collapse: `OR of (C AND P_i)` with a shared post-map factor set `C` and
+the BDD proving `OR of (AND P_i)` a tautology rewrites to `AND C`. See
+`plans/graph-simplify.md` for the proof and the measured result (-28%
+of all generated lines, -83% of room-20 boolean nodes).
+
+## The precision worry is unfounded in the case that matters (WRONG - see above)
 
 **Claim.** If boolean node `N` is proved concretely equal to node `M`
 and `M` lies in `N`'s own cone, then on every lane `M` is at least as
