@@ -52,3 +52,29 @@ pos-graph, all counts+timings; benchmark only on an idle machine.
 - **Peak memory up** (~11-19 GB vs 8 GB baseline) - partly the origin vector;
   attribute + measure before pricing it to the lattice.
 - Spd precision rungs still refused (unchanged).
+
+## Post-report: A/B validation + a perf flag (2026-08-26, later)
+
+Ran the origin A/B on the LATTICE sets (H=68, synthetic win (64,44), room (1,0)):
+- **Lattice pos-graph produces the CERTIFIED numbers: 141,236 pairs over 3,677
+  destination cells** - byte-for-the-count identical to the interpreter's
+  certified pos-graph. Strong correctness confirmation for the lattice backward
+  input, ON TOP of: the full H=94 campaign found the correct optimum
+  (89/93/refute-94) matching the interpreter, and the in-suite per-frame origin
+  gates pass. So the lattice backward pass is well-validated for correctness.
+- The final g.bin/posgraph.bin BYTE-compare did NOT complete: the INTERPRETER
+  sweep exited early in my adapted A/B script (a harness issue - the script was
+  written for the subagent's worktree; my main-tree adaptation has a flag/path
+  mismatch on the interp-sweep stage). NOT a lattice defect. Re-run needs the
+  harness fixed. Given the correctness evidence above, this is a loose end, not
+  a risk.
+
+**PERF FLAG (investigate):** the DEDICATED pos-graph pass on the lattice kernels
+took ~16-20 min at H=68 (interp side 16m45s, kernel side 20m25s), vs the
+CERTIFIED ~137-150 s. Two candidate causes, unseparated: (a) the synthetic-win
+(64,44) forward explores far more than the real search (50,976,014 lanes at
+f67), so the replay is over a much bigger frame set; (b) a real regression from
+the origin attribution + lattice. Needs a clean apples-to-apples measurement
+(same lane counts, origin on vs off). Combined with the fused-pos-graph forward
+cost (489 s vs 175 s pure) already recorded, the BACKWARD/pos-graph side is
+where the perf attention should go next - the FORWARD is already ~1.9x up.
