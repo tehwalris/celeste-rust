@@ -196,6 +196,74 @@ parked in the audit "for discussion", and it is Philippe's call, not a
 peephole. The numbers above say it is worth roughly half of what
 remains in the big room-20 shapes (rowkey+mask scale with bodies).
 
+## Step 3 (2026-08-26): the fork cross-product RE-MEASURED - the lever is mostly spent
+
+The section above (and the task built on it) claimed kernel17's ~600
+bodies come from death/exit outcomes specialized over their full fork
+cross-product, with the death triple constant under each outcome's own
+guard. Before implementing guard-conditioned simplification, that
+picture was verified against the checked-in `traced/room20/kernel17.rs`
+(census @ 6f497be). It does not hold, in either half, and per the
+task's own stop rule the fix was NOT forced in. What was measured:
+
+### Where kernel17's 688 bodies / 607 value-groups actually are
+
+The generated header states it outright: "per outcome they fall into
+[96, 96, 96, 96, 2, 2, 2, 2, 96, 2, 5, 8, 8, 96] groups that write
+identical values."
+
+| outcomes | kind (KOut cells) | bodies | value-groups |
+|---|---|---|---|
+| 0,1,2,3,8,13 | ALIVE (17 player cells) | 96 each = 576 | 96 each - ZERO value duplication |
+| 4,5,6,7,9 | death (freeze, has_dashed) | 8 each = 40 | 2 each (per dash button) |
+| 10 | exit-ish | 8 | 5 |
+| 11,12 | restart triple (will_restart, delay_restart, freeze) | 32 each | 8 each |
+
+The mass is the six ALIVE outcomes: 24 button-reps x 4 fork configs,
+and same-button/different-fork bodies differ in `flip.x`, `grace`,
+`spd.x`, `spd.y`, `x`, `y` (verified on outcome 0 bodies 0/1 and
+outcome 8 bodies 416/417) - genuinely fork-dependent player state, six
+cells per pair, NOT the death triple. Both rem forks change the move's
+outcome; a lane whose interval spans both floors takes both successor
+rows. That is the search's branching, not waste.
+
+### The triple is NOT guard-constant where it does vary
+
+Outcome 11 decoded (per button, forks 0x3/7/b/f families):
+`live = zb_holds(n9224)` with `n9224 = n8648 | n9221` - TWO merged
+sub-events. Under the guard, `will_restart = n9227 = !n9221 | !n9224
+== !n9221` and `delay_restart = zsel_n(n9224, n9229, 15)` with
+`n9229 = zsel_n(n9221, r_c39, 15)` - i.e. the triple SELECTS which
+sub-event fired, and `n9221`/`n8648` are fork-resolved die conditions.
+Conditioning on `live & ok` does not make it constant; the four
+value-groups per button are genuinely distinct. The 2026-08-25 audit's
+2^8 cross-product (shape 3, 3,584 bodies/outcome) described the
+PRE-flat-fork, pre-factor-collapse generation; `bits_of` cone-limiting
+plus the e960ee8 collapse already reduced it to what is listed above.
+
+### What guard-conditioning WOULD still buy (measured ceiling)
+
+Whole traced set: 3,604 bodies, 3,395 value-groups, **209** redundant
+bodies (kernel17: 81, kernel8: 39, kernel14/16: 21 each, rest single
+digits). The mechanism is real at that scale: outcome 11's
+within-family bodies 528-531 share fields AND `live` and differ in ONE
+ok conjunct each - `n9228/n9232/n9234/n9236`, all
+`zsel_b(n9224, n9225, nX)` with the outcome's own `live` as condition
+and the same true-arm - so conditioning `ok` on `live` collapses each
+family 4 -> 1 (outcomes 11/12: 32 -> 8 bodies; death outcomes
+8 -> 2). But a redundant body already shares its values and key chain
+and costs only ~5 mask/take lines, so the ceiling is roughly 1,000 of
+340k generated lines (~0.3%), not "half of what remains in the big
+room-20 shapes". That claim above is corrected: rowkey chains scale
+with value-GROUPS (identical-value bodies intern to the same hash
+nodes), and the groups are almost all genuinely distinct successors.
+
+Soundness note for whoever picks up the 0.3%: conditioning `ok` on
+`live` is the sound direction (`ok` is only observed where `live`
+holds: `take = live & ok`, `declined = live & !ok`); conditioning
+output cells on `live & ok` likewise (values only written where
+taken); `live` itself must NOT be conditioned on anything.
+
 ## Judgment calls (complete list)
 
 1. Factor collapse in `bdd::simplify`, not `Graph::fold` (exactness
