@@ -1,3 +1,36 @@
+# WHOLE room (1,0) campaign on LATTICE kernels, fwd+bwd+FUSED pos-graph (2026-08-26, idle, KERNELS=1 ladder.sh 94 94 2)
+
+Step 4 of the overnight plan, room (1,0), the full precision ladder on the
+lattice kernels: forward + backward sweep + the FUSED (side-effect) position
+graph - `pos-graph: recorded IN the forward pass`, NOT the dedicated pass, as
+Philippe asked. Every stage on lattice kernels, strict, MISSED 0. Scratch
+checkpoints, MEM=60G.
+
+| stage | wall | peak | note |
+|---|---|---|---|
+| level-0 forward (+save-frames +fused pos-graph) | 489 s | 9.28 GB | win seed at f89 |
+| level-0 backward sweep | 161 s | 19.17 GB | 178,576,090 rows, 2 win seeds in B(94), e+g optimum 89 |
+| k=1 banded forward | 16 s | 9.10 GB | k=1 WINS |
+| k=1 backward sweep | 9 s | 1.04 GB | 1,163,134 rows, e+g optimum 93 |
+| k=2 banded forward | 1 s | 0.16 GB | H=94 REFUTED at k=2 |
+
+Result: level 0 wins at f89, k=1 wins at f93, k=2 refutes H=94 - BYTE-for-the-
+answer identical to the ladder subagent's earlier non-lattice run and to the
+interpreter (the per-chunk check gate proved that chunk by chunk). So the
+whole forward+backward+fused campaign runs correctly on the lattice kernels
+with the interpreter reference-only.
+
+FINDING - the fused pos-graph is currently EXPENSIVE, not cheap. The level-0
+forward is 489 s here vs 175 s for pure `bench --frames 94` (no pos-graph, no
+save-frames). Part is `--save-frames` I/O, but the origin-attributed
+pos-observation on kernels carries real overhead (the origin subagent measured
+the kernel pos-graph replay ~1.2x the interpreter's). The dedicated pass was
+~137 s as a SEPARATE stage, so fused-forward (489) vs forward(175)+dedicated
+(137)=312 currently favors the DEDICATED split on wall clock. Fused is the
+right architecture (one pass, Philippe's call) and it is CORRECT here; it just
+needs perf work before it is also cheaper. Not a soundness issue - a perf TODO.
+The level-0 sweep peak (19 GB) is also the campaign's high-water mark.
+
 # LATTICE kernels vs plain traced, room (1,0) forward @ f94 (2026-08-26, idle machine, fat-LTO release)
 
 The constant-lattice kernels are now the SOLE runtime set (all rooms/variants,
