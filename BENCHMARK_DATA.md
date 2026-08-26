@@ -1,3 +1,33 @@
+# LATTICE kernels vs plain traced, room (1,0) forward @ f94 (2026-08-26, idle machine, fat-LTO release)
+
+The constant-lattice kernels are now the SOLE runtime set (all rooms/variants,
+strict-by-default). First fair benchmark of them: room (1,0) forward, the
+production horizon, ladder env (frontier-only, collect-first, 8000-lane caps),
+`bench --frames 94 --deopt`, `CELESTE_COMPILED_FORWARD=1`, idle machine.
+
+| set | wall | us/lane | peak | missed | lanes |
+|---|---|---|---|---|---|
+| plain traced (baseline 2026-08-24) | 340.91 s | 57.3 | 8.18 GB | 0 | 5,949,326 |
+| **LATTICE (this run)** | **175.73 s** | **29.5** | 11.45 GB | 0 | 5,949,326 |
+
+**~1.9x FASTER** (29.5 vs 57.3 us/lane), IDENTICAL search (172,626,763 kernel
+lanes both, win at f94, missed 0, plain-routed 0 - pure lattice, no
+interpreter). And this is a LOWER BOUND on the lattice speedup: the run also
+carries the new per-lane origin metadata (mixed into dedup + row keys), which
+ADDS work vs the baseline. So the constant-lattice specialization roughly
+halves the per-lane forward cost on room (1,0) - a room that had no spurious
+forks to begin with (the win is from baking constants + smaller kernels, not
+fork elimination).
+
+Tradeoff: peak RSS is HIGHER, 11.45 vs 8.18 GB (+40%). Partly the origin vector
+(a per-lane u32 + wider dedup/row keys, added since the baseline); a plain-set
+run at current HEAD also showed ~11.5 GB, so it is NOT lattice-specific.
+Attribute + measure separately before calling it a lattice cost.
+
+Caveat: the fat-LTO release LINK of the 1.34M-line kernels crate is the cost of
+this set (>30 min); see plans/kernel-ladder.md - crate-per-room split proposed
+if it starts hurting the loop.
+
 # The origin passthrough: sweep + pos-graph on kernels (2026-08-26)
 
 The backward sweep and the pos-graph recording were the ladder's last
